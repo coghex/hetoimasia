@@ -199,10 +199,9 @@ module Hetoimasia.Scripting.Lua.Lease
 
 import Control.Concurrent.STM (STM, atomically)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, mask, rethrowIO, throwIO, tryWithContext)
-import Control.Monad (forM_)
+import Control.Monad (forM, forM_)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Text (Text)
-import qualified Data.Text as Text
 import Data.Typeable (Typeable, gcast)
 import Data.Word (Word64)
 import GHC.Stack (HasCallStack)
@@ -316,11 +315,12 @@ acquireWith leases ownership build = do
         -- to supervision, and is kept for the instance's settlement beside whatever else
         -- failed, in the step that gives the reservation back. The constructor's own
         -- exception is rethrown as it was.
+        notes ← forM (cleanupFailuresInContext context) $ \cleanup → do
+          rendered ← renderCaught (cleanupFailureException cleanup)
+          pure ("a rollback release failed: " <> cleanupFailureLabel cleanup <> ": " <> rendered)
         atomically $ do
           abandon leases key
-          forM_ (cleanupFailuresInContext context) $ \cleanup →
-            noteScope leases number $
-              "a rollback release failed: " <> cleanupFailureLabel cleanup <> ": " <> renderRaised (cleanupFailureException cleanup)
+          forM_ notes (noteScope leases number)
         rethrowIO failure
 
 -- | What the release of a lease's parts is given to record a retirement with.
@@ -402,8 +402,9 @@ releaseLease leases key = do
             ended ← atomically (endRelease leases key (Left failure))
             case ended of
               EndedFailed retained → do
+                rendered ← renderCaught retained
                 forM_ caller $ \number →
-                  atomically (noteScope leases number ("an early release failed: " <> renderRaised retained))
+                  atomically (noteScope leases number ("an early release failed: " <> rendered))
                 rethrowIO retained
               _ → rethrowIO failure
   where
@@ -425,10 +426,6 @@ leaseCapabilityType leases name = capabilityType name (leaseLive leases)
 -- | One instance's leases at a glance, in one transaction.
 instanceLeases ∷ Leases → InstanceId → STM ScopeSummary
 instanceLeases leases identity = summarize leases (instanceLocal identity)
-
--- | What an exception said, as one line.
-renderRaised ∷ ExceptionWithContext SomeException → Text
-renderRaised (ExceptionWithContext _ raised) = Text.pack (show raised)
 
 -- | Refuse the call, as the engine: a fault of the call and not a failure of the
 -- application's code.

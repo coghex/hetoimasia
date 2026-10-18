@@ -104,6 +104,7 @@ module Hetoimasia.Scripting.Lua.Lease.State
   , Disposals (..)
   , finishDisposals
   , retirementsReady
+  , renderCaught
   , anyPending
   , noteScope
   , readScope
@@ -113,13 +114,15 @@ import Control.Concurrent.STM
   ( STM
   , TVar
   , atomically
+  , catchSTM
   , modifyTVar'
   , newTVarIO
+  , orElse
   , readTVar
   , retry
   , writeTVar
   )
-import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, mask_, someExceptionContext, tryWithContext)
+import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, evaluate, fromException, mask_, someExceptionContext, throwIO, try, tryWithContext)
 import Control.Monad (forM, when)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List.NonEmpty (NonEmpty)
@@ -692,19 +695,39 @@ serviceRetirements leases = do
       _ → False
     sweepList obligations = do
       polled ← forM obligations $ \obligation → do
-        reading ← obligationState obligation
+        reading ← pollObligation obligation
         pure $ case reading of
           ProviderPending → Left obligation
           ProviderComplete → Right (obligationLabel obligation, Nothing)
           ProviderFailed failure → Right (obligationLabel obligation, Just (ExceptionWithContext (someExceptionContext failure) failure))
       pure ([obligation | Left obligation ← polled], [ended | Right ended ← polled])
 
+-- | Ask a provider where its retirement has got to, as a retirement and nothing else can
+-- fail it. The provider's reading is application code and may throw: that is the
+-- retirement failing, and is how it is retained, as cleanup evidence, while the others
+-- go on being served and awaited. A reading that retries says it is not done.
+pollObligation ∷ Obligation → STM RetirementState
+pollObligation obligation =
+  (obligationState obligation `catchSTM` \failure → pure (ProviderFailed (failure ∷ SomeException)))
+    `orElse` pure ProviderPending
+
+-- | An exception as the bounded line a settlement keeps. Rendering is the exception's
+-- own code, which may throw as well: that is rendered too, not raised.
+renderCaught ∷ ExceptionWithContext SomeException → IO Text
+renderCaught (ExceptionWithContext _ raised) = do
+  rendered ← try @SomeException (evaluate (let text = Text.take noteWidth (Text.pack (show raised)) in Text.length text `seq` text))
+  case rendered of
+    Right text → pure text
+    Left failure
+      | Just (async ∷ SomeAsyncException) ← fromException failure → throwIO async
+      | otherwise → pure "an exception that could not be rendered"
+
 -- | Retry until some pending retirement has been finished by its provider.
 retirementsReady ∷ Leases → STM ()
 retirementsReady leases = do
   state ← readTVar (leasesState leases)
   let pending = concatMap slotObligations (Map.elems (lsSlots state)) <> lsOrphans state
-  readings ← forM pending obligationState
+  readings ← forM pending pollObligation
   when (null [() | reading ← readings, finished reading]) retry
   where
     finished = \case

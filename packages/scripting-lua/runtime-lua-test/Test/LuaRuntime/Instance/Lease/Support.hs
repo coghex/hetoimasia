@@ -16,6 +16,7 @@ module Test.LuaRuntime.Instance.Lease.Support
     -- * The fake world
   , breakRelease
   , blockRelease
+  , throwQuery
   , awaitReleaseEntered
   , proceedRelease
   , completeRetirement
@@ -72,7 +73,7 @@ module Test.LuaRuntime.Instance.Lease.Support
 
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
-import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, retry, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, retry, throwSTM, writeTVar)
 import Control.Exception (SomeException, finally, throwIO, toException, try)
 import Control.Monad (forM_, void)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
@@ -124,6 +125,8 @@ data LFix = LFix
     -- ^ Opened when a release has reached its gate.
   , lfProceed ∷ !(MVar ())
     -- ^ Opened by the example to let a release at its gate go on.
+  , lfThrowing ∷ !(TVar (Set Text))
+    -- ^ The resources whose provider's query of where its retirement has got to throws.
   }
 
 -- | A fixture whose instances may each have this much charged.
@@ -132,7 +135,7 @@ newLFix capacity = do
   base ← newIFixture
   lending ← newLending
   leases ← newLeases lending capacity
-  LFix base lending leases <$> newIORef Set.empty <*> newIORef Map.empty <*> newIORef Map.empty <*> newIORef Set.empty <*> newEmptyMVar <*> newEmptyMVar
+  LFix base lending leases <$> newIORef Set.empty <*> newIORef Map.empty <*> newIORef Map.empty <*> newIORef Set.empty <*> newEmptyMVar <*> newEmptyMVar <*> newTVarIO Set.empty
 
 -- | Record that something happened, in the order the hooks and the fakes share.
 note ∷ LFix → Text → IO ()
@@ -159,6 +162,10 @@ breakRelease fixture name = atomicModifyIORef' (lfBreaking fixture) (\held → (
 -- | Make this resource's release wait at a gate, inside the release, before it goes on.
 blockRelease ∷ LFix → Text → IO ()
 blockRelease fixture name = atomicModifyIORef' (lfBlocking fixture) (\held → (Set.insert name held, ()))
+
+-- | From now on the query of where this resource's retirement has got to throws.
+throwQuery ∷ LFix → Text → IO ()
+throwQuery fixture name = atomically (modifyTVar' (lfThrowing fixture) (Set.insert name))
 
 -- | Wait until a release has reached its gate.
 awaitReleaseEntered ∷ LFix → IO ()
@@ -245,7 +252,9 @@ asynchronous fixture name retirements = do
       )
       ( \tv → do
           note fixture ("retire " <> name)
-          retireAsynchronously retirements name (readTVar tv)
+          retireAsynchronously retirements name $ do
+            throwing ← readTVar (lfThrowing fixture)
+            if Set.member name throwing then throwSTM (Broken ("query " <> name)) else readTVar tv
       )
   pure name
 

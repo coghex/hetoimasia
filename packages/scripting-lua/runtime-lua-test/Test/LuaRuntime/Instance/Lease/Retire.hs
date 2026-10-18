@@ -188,6 +188,40 @@ spec = describe "retained retirement" $ do
     fmap (leasesDrained . resultLeases) settled `shouldBe` Just 1
     summaryOf fixture "a" >>= (`shouldBe` ScopeSummary 0 0 0 0 4 0)
 
+  it "retains a provider's query that throws as that retirement failing, and goes on awaiting the independent one until its provider completes it" $ bounded $ do
+    fixture ← newLFix 4
+    let base = lfBase fixture
+    ExceptionWithContext context _ ← expectFatal $ \control runtime → providersFinish fixture $ do
+      owner ← startLeased fixture runtime "query throws" [asyncNamed] leaseConfig requiredPolicy
+      _ ← admit base owner "a" (moduleNamed "asyncnamed")
+      _ ← admit base owner "b" (moduleNamed "asyncnamed")
+      awaitPhase base owner "a" Active
+      awaitPhase base owner "b" Active
+      expectDelivered base owner "a" 1
+      expectDelivered base owner "b" 1
+      awaitPending fixture "a" 1
+      awaitPending fixture "b" 1
+      retireScheduled owner
+      awaitPhase base owner "a" Stopping
+      awaitPhase base owner "b" Stopping
+      readMVar (sfOwnerThread (sf base)) >>= awaitBlockedOnSTM
+      -- The first provider's query throws from now on; the second provider is still working.
+      throwQuery fixture "named-1"
+      a ← tickOf base "a"
+      _ ← waitInstance a
+      -- The failed one has settled, as failed at its release; the other is still awaited, and
+      -- the owner is live with it.
+      tickOf base "b" >>= pollInstance >>= (`shouldSatisfy` \case Nothing → True; Just _ → False)
+      atomically (scheduledStatus owner) >>= (`shouldSatisfy` isLive)
+      summaryOf fixture "b" >>= \summary → summaryPending summary `shouldBe` 1
+      completeRetirement fixture "named-2"
+      awaitScheduledTerminal control owner
+    map cleanupFailureLabel (cleanupFailuresInContext context) `shouldSatisfy` any (Text.isInfixOf "lua lease retirement")
+    settledA ← tickOf base "a" >>= pollInstance
+    fmap resultPhase settledA `shouldBe` Just Failed
+    settledB ← tickOf base "b" >>= pollInstance
+    fmap (leasesAwaited . resultLeases) settledB `shouldBe` Just 1
+
   it "settles every ending that is ready when settling one raises the application's escalation as the owner retires, and does not wait for what has already completed" $ bounded $ do
     fixture ← newLFix 4
     let base = lfBase fixture

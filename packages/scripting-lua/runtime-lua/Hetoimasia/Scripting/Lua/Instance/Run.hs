@@ -88,7 +88,6 @@ import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Sequence (ViewL (EmptyL, (:<)), viewl, (<|))
 import qualified Data.Set as Set
 import Data.Text (Text)
-import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Scripting.Lua.Instance.State
 import Hetoimasia.Scripting.Lua.Instance.Types
@@ -106,6 +105,7 @@ import Hetoimasia.Scripting.Lua.Lease.State
   , openScope
   , pendingFor
   , readScope
+  , renderCaught
   , retirementsReady
   , serviceRetirements
   )
@@ -1281,9 +1281,10 @@ parkOrSettle ih cell = do
 drainInstance ∷ InstanceHost → ICell → IO ()
 drainInstance ih cell = forM_ (ihLeases ih) $ \lh → mask_ $ do
   report ← drainScope lh (icId cell)
-  forM_ (drainFailures report) $ \failure@(ExceptionWithContext _ raised) → do
+  forM_ (drainFailures report) $ \failure → do
+    note ← renderCaught failure
     modifyIORef' (ihExtra ih) (<> [("lua instance lease", failure)])
-    atomically (noteScope (lhLeases lh) (icId cell) (failureText (Text.pack (show raised))))
+    atomically (noteScope (lhLeases lh) (icId cell) note)
   unless (null (drainFailures report)) (endOwner ih)
 
 -- | A cleanup failure of the leases ends the owner at once, through supervision, with
@@ -1315,33 +1316,40 @@ serviceRetirementsOf ih = case ihLeases ih of
     let leases = lhLeases lh
     done ← mask_ $ do
       (ended, disposals) ← atomically (serviceRetirements leases)
-      forM_ ended $ \finished → forM_ (endedFailure finished) $ \failure@(ExceptionWithContext _ raised) → do
+      forM_ ended $ \finished → forM_ (endedFailure finished) $ \failure → do
+        rendered ← renderCaught failure
         modifyIORef' (ihExtra ih) (<> [("lua lease retirement", failure)])
         forM_ (endedInstance finished) $ \number →
           atomically . noteScope leases number . failureText $
-            "the provider's retirement of " <> endedLabel finished <> " failed: " <> Text.pack (show raised)
+            "the provider's retirement of " <> endedLabel finished <> " failed: " <> rendered
         endOwner ih
       -- What the retirements needed is disposed of now that every one has completed, as a
       -- release is: uninterruptibly, one at a time, a failure of one not stopping the rest.
       forM_ disposals $ \Disposals {disposalsKey = key, disposalsInstance = number, disposalsActions = actions} → do
         failures ← forM actions $ \dispose →
           either Just (const Nothing) <$> tryWithContext @SomeException (uninterruptibleMask_ dispose)
-        forM_ [failure | Just failure ← failures] $ \failure@(ExceptionWithContext _ raised) → do
+        forM_ [failure | Just failure ← failures] $ \failure → do
+          rendered ← renderCaught failure
           modifyIORef' (ihExtra ih) (<> [("lua lease dependency", failure)])
-          atomically . noteScope leases number . failureText $ "disposing what a retirement needed failed: " <> Text.pack (show raised)
+          atomically . noteScope leases number . failureText $ "disposing what a retirement needed failed: " <> rendered
           endOwner ih
         -- The lease keeps the first failure, which every later release of it answers.
         atomically (finishDisposals leases key (case [failure | Just failure ← failures] of first : _ → Just first; [] → Nothing))
       pure (not (null ended && null disposals))
     parked ← Set.toList <$> readIORef (ihParked ih)
-    settled ← forM parked $ \number → do
+    -- Every ending that is ready settles, whatever settling another raises (the application's
+    -- escalation, a failure of the host): the first of the failures is raised once the
+    -- others have been settled.
+    settledEach ← forM parked $ \number → do
       pending ← atomically (pendingFor leases number)
       if pending > 0
-        then pure False
+        then pure (False, Nothing)
         else do
           modifyIORef' (ihParked ih) (Set.delete number)
-          withCell ih number (settleEnding ih)
-          pure True
+          outcome ← tryWithContext @SomeException (withCell ih number (settleEnding ih))
+          pure (True, either Just (const Nothing) outcome)
+    forM_ (take 1 [failure | (_, Just failure) ← settledEach]) rethrowIO
+    let settled = map fst settledEach
     pure (done || or settled)
 
 -- | Run an action as the instance whose invocation a task is: closing its coroutine
