@@ -2904,13 +2904,22 @@ replaces one that was visible at an earlier tick. An ordered event that is accep
 delivery failure it is, exactly as `feedFail` is, and is counted; a refused fill of replaceable state is counted and fails
 nothing, since only the newest value of a state matters.
 
-The grant that reached the tick is the claim on the tick of the callbacks it admitted: it is held for as long as the instance's
-invocation in flight is ready to run a segment, whether it has begun or not and whatever is behind it (a callback that yields
-and then waits for a tick waits for the same tick however the grants behind it were queued), and when nothing is in flight, until
-what was admitted has begun. It is let go when the instance is paused, stopping, ended or still initializing, when the invocation
-in flight has begun and suspended on a wait or ended with nothing unstarted behind it, and when nothing at all is ready to run.
-So the next tick's deliveries are not admitted while this tick's are unstarted and can still run, and queued grants give the same
-admissions and effects as grants served one at a time.
+**The tick's claim.** A tick whose grant is applied is held, by the owner's one watch, for as long as any instance has a
+delivery of a subscription that is admitted and unfinished (waiting in its queue, selected for its next invocation, or being
+run by the invocation in flight) *and* can make progress in that tick: it is serving, and the invocation in flight is ready to
+run a segment (it yields and goes on, or it has just ended and the next is about to be given a place), or nothing is in flight
+and the next delivery waits its turn and something is ready to run. An instance whose work is suspended on a wait (a tick, a
+deadline, a request) cannot, and neither can one that is paused, stopping, ended or still initializing: the tick does not wait
+for it, and it claims the tick it is woken at, and later ones, as it becomes able, by the same rule. While any instance has such
+work the owner also asks to be held at the next tick, so every grant it applies is looked at before any task it woke is chosen.
+
+The claim is computed in one place from the instances' state as it is, and never from a flag set when a delivery was admitted,
+so no path that changes a delivery's state can leave a tick claimed that nothing needs, or unclaimed that something does:
+admission, selection for an invocation, a yield, a wait and the grant that resumes it, a coalesce, an unsubscribe, an epoch
+change, a pause and a resume, a stop, and a failure each change what that function reads. So the next tick's deliveries are not
+admitted while this tick's can still run, a callback that yields or waits for a tick waits for the same tick however the grants
+behind it were queued, several deliveries admitted at one tick each start at the tick their predecessor ended at, and queued
+grants give the same admissions and effects as grants served one at a time.
 
 ### Epochs
 
@@ -2922,8 +2931,9 @@ new epoch (an identity carries its epoch and a generation that is never reissued
 somewhere new to land), and the places stay charged until the providers prove their retirements over. Instances are not
 invalidated: the same instance subscribes again. The instance's VM is not left holding what it captured for the subscriptions
 the engine ended: the owner has the driver let go of their callbacks and handles at its next boundary, without the script
-unsubscribing them (the driver's creation entry on a slot that is live is that cleanup point, and it asks the engine which
-numbers ended), so repeated subscribe, epoch-change and retirement cycles do not grow the VM.
+unsubscribing them (the driver's creation entry on a slot that is live is that cleanup point, and it asks the engine for the numbers that
+ended one at a time, so the answer fits any limits however many ended; an epoch wakes the owner once for an instance, however
+often it changes before the owner gets there), so repeated subscribe, epoch-change and retirement cycles do not grow the VM.
 
 ### Retirement and the bound
 
