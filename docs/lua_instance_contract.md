@@ -108,6 +108,9 @@ it safe. The engine retains pending retirement obligations and dependencies,
 reports native cleanup failures, and never reports complete reclamation merely
 because Lua stopped. A release that fails is recorded, not silently retried.
 
+Delivery note: LUA-22 (#473) implements the automatic resource ownership rules above;
+the binding author's view of it is `packages/scripting-lua/README.md`, "Instance leases".
+
 ## Initialization and failure rules
 
 1. Reserve instance/result capacity and create fresh `self` before `init`.
