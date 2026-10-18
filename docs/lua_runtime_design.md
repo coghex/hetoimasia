@@ -175,7 +175,7 @@ concrete precondition
 - [x] LUA-24. Run instance updates on logical and elapsed cadences — [#475]
 - [x] LUA-25. Lend a resource collection's ownership to synchronous Lua callbacks — [#476]
 - [x] LUA-7. Add bounded asynchronous Lua requests with reserved result slots — [#482]
-- [ ] LUA-26. Deliver provider events through owned Lua subscriptions
+- [x] LUA-26. Deliver provider events through owned Lua subscriptions — [#483]
 - [ ] LUA-19. Run script instances through a headless command-line entry — [deferred]: contract accepted; renew slice readiness
 - [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly — [deferred]: owner renews trusted-path readiness for this slice
 - [ ] LUA-9. Add bounded child-process transport and owned process lifetime — [deferred]: Q-5 successful Linux and macOS confinement verdicts
