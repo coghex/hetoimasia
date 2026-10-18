@@ -5,6 +5,7 @@
 -- place while a provider's retirement is pending.
 module Test.LuaRuntime.Subscription.Epochs (spec) where
 
+import Control.Exception (finally)
 import Control.Monad (forM_, void, when)
 import Data.IORef (writeIORef)
 import Data.Text (Text)
@@ -14,6 +15,7 @@ import Hetoimasia.Scripting.Lua.Owner (ModuleSource)
 import Hetoimasia.Scripting.Lua.Provider
 import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
+import Hetoimasia.Scripting.Lua.Value (valueLimits)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support (awaitLine, refusalOf)
@@ -210,6 +212,38 @@ spec = describe "epochs" $ do
       -- Each cycle's provider is told once and holds its place until it says it is done.
       awaitCancelledSubs fake 3
       (sdCharged <$> subDiagnostics owner) >>= (`shouldBe` 3)
+
+  it "wakes the owner once for an instance's cleanup however often the epoch changes while the owner cannot drain its inbox" $ bounded $ do
+    fixture ← newIFixture
+    fake ← newFakeEvents
+    withBoundary $ \_ runtime → (`finally` releaseOwner fixture) $ eventsFinish fake $ do
+      owner ← ownerOf fixture fake runtime "repeated" [subscriber, holder] 4
+      admitSubscriber fixture owner "i" "subscriber"
+      subscribeTo' fixture owner "i" "a" "ticks"
+      holdOwner fixture owner
+      forM_ [1 .. 20 ∷ Int] (const (advance owner))
+      (sdCleanupJobs <$> subDiagnostics owner) >>= (`shouldBe` 1)
+      releaseOwner fixture
+      sync fixture owner "i" 1
+      -- It is served once it can be, and an instance that subscribes and is invalidated again gains another.
+      subscribeTo' fixture owner "i" "b" "ticks"
+      void (advance owner)
+      (sdCleanupJobs <$> subDiagnostics owner) >>= (`shouldSatisfy` (>= 2))
+
+  it "lets go of more callbacks than one result could carry under the owner's limits, and the instance goes on" $ bounded $ do
+    fixture ← newIFixture
+    fake ← newFakeEvents
+    withBoundary $ \_ runtime → eventsFinish fake $ do
+      owner ←
+        startWith fixture runtime . withLimits (either (error . show) id (valueLimits 512 8 64)) $
+          subscriptionSpec fixture "many" [subscriber] subConfig SettleOnArrival (SubscriptionGrant (allEndpoints fake) 64 16) requiredPolicy
+      admitSubscriber fixture owner "i" "subscriber"
+      forM_ [1 .. 60 ∷ Int] $ \n → subscribeTo' fixture owner "i" (Text.pack ("k" <> show n)) "ticks"
+      void (advance owner)
+      sync fixture owner "i" 1
+      phaseOf fixture owner "i" >>= (`shouldBe` Just Active)
+      command fixture owner "i" "weak_count" "w"
+      awaitLine fixture "cmd weak_count w 0"
 
   it "discards the events an owner on logical time held for ticks the old subscriptions were to be served at" $ bounded $ do
     fixture ← newIFixture

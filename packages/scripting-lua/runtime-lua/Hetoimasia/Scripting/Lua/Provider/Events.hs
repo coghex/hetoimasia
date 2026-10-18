@@ -435,7 +435,7 @@ deliverChecked service identity slot checked = do
       EventUnfit → counted (\c → c {evRefusedValue = evRefusedValue c + 1}) EventRefusedValue
       EventChecked payload → case (logical, slot) of
         (False, Nothing) → do
-          (st', answer) ← admitDelivery service False now identity sub payload st
+          (st', answer) ← admitDelivery service now identity sub payload st
           answer <$ writeTVar (psVar service) st'
         (False, Just _) → counted (\c → c {evNotLogical = evNotLogical c + 1}) EventNotLogical
         (True, Nothing) → counted (\c → c {evUnassigned = evUnassigned c + 1}) EventUnassigned
@@ -456,16 +456,15 @@ deliverChecked service identity slot checked = do
 
 -- | Admit a delivery of a live subscription: the one place the queue's bound, the overload
 -- policy and the counters are decided, whether the delivery arrived or was held for a tick.
--- The tick is what the delivery is stamped with, kept unchanged until its callback runs, and
--- @boundary@ says it is admitted at a logical boundary, whose grant then waits for it to begin.
+-- The tick is what the delivery is stamped with, kept unchanged until its callback runs.
 --
 -- * Ordered events take a place in the instance's queue, and are refused, counted and never
 --   evicted, when there is none.
 -- * Replaceable state with an unstarted delivery replaces its value and its tick in place: no
 --   place is taken and its place in the queue is kept, and the value it replaced is counted as
 --   coalesced and never delivered. With none, it takes a place as an ordered event does.
-admitDelivery ∷ ProviderState → Bool → Word64 → SubscriptionId → Sub → Payload Value → PState → STM (PState, EventAnswer)
-admitDelivery service boundary stamp identity sub payload st = do
+admitDelivery ∷ ProviderState → Word64 → SubscriptionId → Sub → Payload Value → PState → STM (PState, EventAnswer)
+admitDelivery service stamp identity sub payload st = do
   found ← cellOf service (subInstance sub)
   case found of
     Nothing → ended
@@ -495,7 +494,6 @@ admitDelivery service boundary stamp identity sub payload st = do
                   pure (st {pSession = session, pEvents = (pEvents st) {evRefusedValue = evRefusedValue (pEvents st) + 1}}, EventRefusedValue)
                 _ → pure (st {pSession = session, pEvents = (pEvents st) {evRefusedEnded = evRefusedEnded (pEvents st) + 1}}, EventEnded)
               isRef event = queuedSubscription event == Just identity
-              awaited = isAwaited state || boundary
               -- A new place in the queue, with the next sequence.
               append = do
                 let sequenceNumber = isNextSequence state
@@ -505,7 +503,6 @@ admitDelivery service boundary stamp identity sub payload st = do
                   , isNextSequence = sequenceNumber + 1
                   , isDelivered = isDelivered state + 1
                   , isDispatchQueued = True
-                  , isAwaited = awaited
                   }
                 unless (isDispatchQueued state) $
                   modifyTVar' (insInbox instances) (|> JobDispatch (icId cell))
@@ -514,9 +511,9 @@ admitDelivery service boundary stamp identity sub payload st = do
               (session, Right _) → do
                 -- The reference keeps its place and its sequence; its tick is the new value's.
                 case Seq.findIndexL isRef (isQueue state) of
-                  Just index → writeTVar (icState cell) state {isQueue = Seq.adjust' (\event → event {queuedTick = stamp}) index (isQueue state), isAwaited = awaited}
+                  Just index → writeTVar (icState cell) state {isQueue = Seq.adjust' (\event → event {queuedTick = stamp}) index (isQueue state)}
                   Nothing → case isPending state of
-                    Just pending | isRef pending → writeTVar (icState cell) state {isPending = Just pending {queuedTick = stamp}, isAwaited = awaited}
+                    Just pending | isRef pending → writeTVar (icState cell) state {isPending = Just pending {queuedTick = stamp}}
                     -- The two agree, so this is not reached; were it, the delivery is not lost.
                     _ → append
                 pure
@@ -573,7 +570,7 @@ serveEvents service tick = do
       step (current, touched, lost) (slot, held) = case Map.lookup (stagedSubscription held) (pSubs current) of
         Nothing → pure (current {pEvents = (pEvents current) {evRefusedEnded = evRefusedEnded (pEvents current) + 1}}, touched, lost)
         Just sub → do
-          (next, answer) ← admitDelivery service True (dueTick slot) (stagedSubscription held) sub (stagedPayload held) current
+          (next, answer) ← admitDelivery service (dueTick slot) (stagedSubscription held) sub (stagedPayload held) current
           pure $ case answer of
             EventAdmitted → (next, subInstance sub : touched, lost)
             EventCoalesced → (next, subInstance sub : touched, lost)
@@ -621,14 +618,14 @@ startDelivery service identity = do
           }
         pure (Just (DeliveryStart (subNumber sub) value))
 
--- | Take the numbers of the subscriptions an epoch change ended whose callbacks an instance's VM still
--- holds, once.
-takeForgotten ∷ ProviderState → Word64 → STM [Word64]
+-- | Take the number of one subscription an epoch change ended whose callback an instance's VM still
+-- holds, once. One at a time: the answer is a scalar that fits any limits, however many ended.
+takeForgotten ∷ ProviderState → Word64 → STM (Maybe Word64)
 takeForgotten service instanceNumber = do
   st ← readTVar (psVar service)
   case Map.lookup instanceNumber (pForget st) of
-    Nothing → pure []
-    Just numbers → numbers <$ writeTVar (psVar service) st {pForget = Map.delete instanceNumber (pForget st)}
+    Just (number : rest) → Just number <$ writeTVar (psVar service) st {pForget = if null rest then Map.delete instanceNumber (pForget st) else Map.insert instanceNumber rest (pForget st)}
+    _ → pure Nothing
 
 -- Failure ---------------------------------------------------------------------------------------
 
@@ -699,6 +696,7 @@ subscriptionDiagnosticsSTM service = do
       , sdRefusedFull = evRefusedFull counts
       , sdDiscarded = evDiscarded counts
       , sdFailures = evFailures counts
+      , sdCleanupJobs = evCleanupJobs counts
       , sdCoalesced = countCoalescedEvents counters
       , sdInvalidated = countInvalidatedSubscriptions counters
       , sdDiscardedEvents = countDiscardedEvents counters

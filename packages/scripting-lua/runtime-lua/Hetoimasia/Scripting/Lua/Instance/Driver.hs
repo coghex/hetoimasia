@@ -43,7 +43,7 @@ import Hetoimasia.Scripting.Lua.Instance.Types (EventSource (..), Instances)
 import Hetoimasia.Scripting.Lua.Owner (EntryPoint (..), ModuleRef (..), ModuleSource (..), Requirement (..))
 import Hetoimasia.Scripting.Lua.Provider.Subscribe (forgottenBy, subscribeTo, unsubscribeFrom)
 import Hetoimasia.Scripting.Lua.Registration (Namespace, asynchronousNativeRequestIn, namespace, stateOperation)
-import Hetoimasia.Scripting.Lua.Value (Schema (..), Value (VBoolean, VFloat, VInteger, VList, VText))
+import Hetoimasia.Scripting.Lua.Value (Schema (..), Value (VBoolean, VFloat, VInteger, VText))
 
 -- | The driver's module.
 driverRef ∷ ModuleRef
@@ -93,10 +93,10 @@ connectNamespace instances =
         _ → pure [VInteger (-1)]
     , -- The numbers of the subscriptions the engine ended without the script, taken once: the
       -- driver lets go of the callbacks it holds for them.
-      asynchronousNativeRequestIn "forgotten" [SInteger] [SList SInteger] $ \context → \case
+      asynchronousNativeRequestIn "forgotten" [SInteger] [SInteger] $ \context → \case
         [VInteger slot] | slot >= 0 →
-          (\numbers → [VList [VInteger (fromIntegral number) | number ← numbers]]) <$> forgottenBy context (fromIntegral slot)
-        _ → pure [VList []]
+          (\found → [VInteger (maybe (-1) fromIntegral found)]) <$> forgottenBy context (fromIntegral slot)
+        _ → pure [VInteger (-1)]
     , asynchronousNativeRequestIn "unsubscribe" [SInteger, SInteger] [SBoolean] $ \context → \case
         [VInteger slot, VInteger number] | slot >= 0 && number >= 0 →
           (\ended → [VBoolean ended]) <$> unsubscribeFrom context (fromIntegral slot) (fromIntegral number)
@@ -189,7 +189,9 @@ luaBody =
   , "-- Let go of the callbacks of subscriptions the engine ended without the script, and of the handles"
   , "-- that named them."
   , "local function sweep(slot, record)"
-  , "  for _, number in ipairs(host.forgotten(slot)) do"
+  , "  while true do"
+  , "    local number = host.forgotten(slot)"
+  , "    if number < 0 then break end"
   , "    record.subscriptions[number] = nil"
   , "  end"
   , "  for handle, number in pairs(record.handles) do"

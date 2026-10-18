@@ -729,9 +729,6 @@ data IState = IState
   , isBaseline ∷ !ElapsedBaseline
     -- ^ An elapsed instance's baseline: the instant its last update began, or its
     -- @init@ succeeded, or it resumed, which is what its @dt@ is measured from.
-  , isAwaited ∷ !Bool
-    -- ^ Deliveries were admitted to this instance at a logical boundary, and the grant that
-    -- reached that boundary waits for them to begin, or to be unable to.
   , isDeliveryFailure ∷ !(Maybe (Text, Text))
     -- ^ The endpoint and why: a provider surfaced that it could not preserve an authoritative event of one of this
     -- instance's subscriptions: the owner fails the instance with it, once.
@@ -777,7 +774,7 @@ unstartedCount kind state =
 
 -- | A fresh instance's state.
 initialState ∷ IState
-initialState = IState Initializing False Set.empty Seq.empty 0 0 0 Nothing False False False Nothing UpdateNone False noBaseline False Nothing
+initialState = IState Initializing False Set.empty Seq.empty 0 0 0 Nothing False False False Nothing UpdateNone False noBaseline Nothing
 
 -- | What the owner's thread is asked to do, in the order the application asked.
 data Job

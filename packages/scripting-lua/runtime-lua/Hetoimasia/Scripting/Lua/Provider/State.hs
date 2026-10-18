@@ -1013,10 +1013,14 @@ advanceEpochSTM service = do
           let current = committed session
           ended ← endSubs service EndByEpoch (Map.keys (pSubs current)) current
           -- The owner is woken for each instance whose VM holds a callback that is no use now.
+          -- Only an instance that did not have a cleanup waiting is woken for one: the owner takes
+          -- everything that is named when it gets there, so the inbox holds one job per instance
+          -- however often the epoch changes while the owner cannot drain it.
+          let woken = Map.keys (Map.difference (pForget ended) (pForget current))
           case psInstances service of
             Nothing → pure ()
-            Just instances → forM_ (Map.keys (pForget ended)) $ \number → modifyTVar' (insInbox instances) (|> JobForget number)
-          writeTVar (psVar service) ended
+            Just instances → forM_ woken $ \number → modifyTVar' (insInbox instances) (|> JobForget number)
+          writeTVar (psVar service) ended {pEvents = (pEvents ended) {evCleanupJobs = evCleanupJobs (pEvents ended) + length woken}}
           pure (Just (EpochReport change cancelled discarded))
   where
     cancelOne (st, kept, cancelled, discarded) record

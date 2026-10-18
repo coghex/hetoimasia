@@ -129,9 +129,9 @@ subscribeTo context slot name = do
         raiseAmong "lua subscription cancel" =<< tellProviders service
         pure number
 
--- | The numbers of the subscriptions the engine ended without the script, which the calling instance's
--- VM still holds a callback for, taken once.
-forgottenBy ∷ HasCallStack ⇒ RequestContext → Word64 → IO [Word64]
+-- | The number of a subscription the engine ended without the script, which the calling instance's
+-- VM still holds a callback for, taken once; one at a time.
+forgottenBy ∷ HasCallStack ⇒ RequestContext → Word64 → IO (Maybe Word64)
 forgottenBy context slot = do
   service ← serviceFromContext context
   instanceNumber ← subscriberIn service slot

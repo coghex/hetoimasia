@@ -88,7 +88,6 @@ import Data.Foldable (toList, traverse_)
 import Hetoimasia.Scripting.Lua.Lifecycle.State (abandonIssued)
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Sequence (ViewL (EmptyL, (:<)), viewl, (<|))
-import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Word (Word64)
@@ -179,6 +178,7 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , setWatch
   , takeNextCadenceFiring
   , tasksReady
+  , watchHeld
   , watchKey
   , watchTick
   , BehaviorId (BehaviorId)
@@ -222,6 +222,8 @@ data Live = Live
     -- ^ The sequence of the event an invocation was made for, to know it again.
   , liveWithdrawn ∷ !Bool
     -- ^ The instance took the invocation back before it began.
+  , liveDelivery ∷ !Bool
+    -- ^ The invocation is a subscription's callback, handed a delivery.
   }
 
 -- | Why an instance is ending.
@@ -793,7 +795,7 @@ admitNext ih cell = do
       then do
         modifyIORef' (ihLive ih) (Map.adjust (\live → live {liveWithdrawn = False}) task)
         modifyIORef' (ihGhosts ih) (Map.delete (icId cell))
-      else modifyIORef' (ihLive ih) (Map.insert task (Live (icId cell) stage (fmap queuedSequence event) False))
+      else modifyIORef' (ihLive ih) (Map.insert task (Live (icId cell) stage (fmap queuedSequence event) False (maybe False (isJust . queuedSubscription) event)))
   where
     record event =
       VRecord
@@ -1095,8 +1097,8 @@ serviceCadence ih = go []
           -- A tick just served has had no chance to run its update yet: it is looked at the
           -- next time round, which the answer below makes the boundary do.
           released ← settleHolds ih served
-          awaited ← settleEventHolds ih
-          pure (not (null served) || released || awaited)
+          claimed ← settleClaims ih
+          pure (not (null served) || released || claimed)
 
 -- | The tick the owner asked to be held at has been reached, and the grant that reached it is
 -- held, so no later one is applied until this is done: the controls the application assigned to
@@ -1108,7 +1110,7 @@ serviceCadence ih = go []
 --
 -- The events a provider delivered to the tick are admitted after the controls, in the order of
 -- their places, and the grant is not let go until the instances they were admitted to have begun
--- them or cannot ('settleEventHolds'): the next tick's events are not admitted while this tick's
+-- them or cannot ('settleClaims'): the next tick's events are not admitted while this tick's
 -- are unstarted, so a value is never replaced before it was seen at its own tick, and a queue
 -- that is full is full of what the logical sequence put in it, however fast the owner served.
 serveWatch ∷ InstanceHost → CadenceFiring → IO ()
@@ -1132,7 +1134,7 @@ serveWatch ih = \case
     -- queues, and the grant waits for them.
     served ← mask_ (maybe (pure []) (\service → servedInstances <$> atomically (serveEvents service tick)) (ihProvider ih))
     forM_ served $ \number → withCell ih number (dispatch ih)
-    void (settleEventHolds ih)
+    void (settleClaims ih)
   _ → atomically (releaseWatch (scheduler' ih))
 
 -- | The earlier of two ticks that may not be there.
@@ -1229,56 +1231,69 @@ settleHold ih cell = do
       when release (atomically (releaseCadenceHold (scheduler' ih) (cadenceKey cell)))
       pure release
 
--- | Let go of the grant the owner's watch holds when the deliveries admitted at its tick can no
--- longer begin in it, or have. Answers whether it let any instance go.
+-- | The one place a tick is claimed for the deliveries of subscriptions and given back.
 --
--- An instance is waited for while deliveries admitted at the boundary are unstarted and can
--- still begin: the instance is serving, and what is ahead of them, or they, is ready to run
--- segments. It is let go when it is paused, stopping or ended, when an invocation ahead of them
--- has begun and suspended on a wait, when everything admitted has begun, and when nothing at all
--- is ready to run, so what it waits for can never happen: a tick never waits on a delivery that
--- cannot start. The grant itself is given back once no instance is waited for.
-settleEventHolds ∷ InstanceHost → IO Bool
-settleEventHolds ih = do
+-- __The invariant.__ A tick whose grant is applied is held, by the owner's watch, for as long as
+-- any instance has a subscription's delivery that is admitted and unfinished (waiting in its queue,
+-- selected for its next invocation, or being run by the invocation in flight) /and/ can make
+-- progress in that tick: it is serving, and the invocation in flight is ready to run a segment, or
+-- is about to be accounted for or given a place, or nothing is in flight and the next delivery waits
+-- its turn, and something is ready to run. An instance whose work is suspended on a wait (a tick, a
+-- deadline, a request), or that is paused, stopping, ended or still initializing, cannot, and a tick
+-- never waits on it: it claims the ticks it is woken at and later ones, as it becomes able, by
+-- the same rule. The claim is computed here from the instances' state as it is, never from a
+-- flag set when a delivery was admitted, so no path that changes a delivery's state (admission,
+-- dispatch, a yield, a wait, the resume that ends it, a coalesce, an unsubscribe, an epoch change,
+-- a pause or a stop, a failure) can leave a tick claimed that nothing needs or unclaimed that
+-- something does: each of them changes the state this reads.
+--
+-- While any instance has such work, the owner also asks to be held at the next tick, so the next
+-- grant that is applied finds this function at the boundary that follows it, before any task it woke
+-- is chosen. The grant held is given back when no instance can make progress. Answers whether it
+-- gave one back.
+settleClaims ∷ InstanceHost → IO Bool
+settleClaims ih = do
   cells ← Map.elems <$> readTVarIO (insCells (ihInstances ih))
-  letGo ← forM cells $ \cell → do
-    state ← readTVarIO (icState cell)
-    if not (isAwaited state)
-      then pure False
-      else do
-        release ← eventHoldReleasable ih state
-        when release (atomically (modifyTVar' (icState cell) (\current → current {isAwaited = False})))
-        pure release
-  remaining ← or . map isAwaited <$> mapM (readTVarIO . icState) cells
-  unless remaining (atomically (releaseWatch (scheduler' ih)))
-  pure (or letGo)
+  claims ← forM cells (instanceClaim ih)
+  let watching = any fst claims
+      progressing = any snd claims
+  atomically $ do
+    held ← watchHeld (scheduler' ih)
+    tick ← readTick (scheduler' ih)
+    unless progressing (releaseWatch (scheduler' ih))
+    when (watching && tick < maxBound) (watchTick (scheduler' ih) (tick + 1))
+    pure (held && not progressing)
 
--- | Whether the deliveries admitted to an instance at a boundary can no longer begin in the tick
--- that is waiting for them. See 'settleEventHolds'.
-eventHoldReleasable ∷ InstanceHost → IState → IO Bool
-eventHoldReleasable ih state
-  | isTerminal (isPhase state) || isStopped state || isPhase state /= Active = pure True
-  | otherwise = do
-      stuck ← not <$> atomically (tasksReady (scheduler' ih))
-      case isActive state of
-        -- Nothing in flight: all that is left is the next delivery, waiting for its turn to be
-        -- given a place, and with nothing unstarted there is nothing to wait for.
-        Nothing → pure (nothingUnstarted || stuck)
-        -- The invocation in flight is what the tick waits for, whether or not anything is behind
-        -- it: while it is ready to run a segment, after it began and yielded as much as before it
-        -- did, the grant that reached the tick is its claim on the tick, and only its completion or
-        -- its suspension on a wait gives it back.
-        Just task →
-          atomically (taskPhase (scheduler' ih) task) <&> \case
-            Just PhaseReady → False
-            Just PhaseRunning → False
-            Just PhaseQueued → stuck
-            -- An invocation that ended is accounted for, and the next one begun, at the
-            -- boundary that sees it.
-            Just (PhaseEnded _) → False
-            _ → True
+-- | What an instance's deliveries of subscriptions claim: whether it has any admitted and
+-- unfinished, and whether it can make progress with them in the tick it is at. See 'settleClaims'.
+instanceClaim ∷ InstanceHost → ICell → IO (Bool, Bool)
+instanceClaim ih cell = do
+  state ← readTVarIO (icState cell)
+  live ← readIORef (ihLive ih)
+  if isTerminal (isPhase state) || isStopped state || isPhase state /= Active
+    then pure (False, False)
+    else do
+      let delivery = isJust . queuedSubscription
+          queued = any delivery (toList (isQueue state)) || maybe False delivery (isPending state)
+          inFlight = maybe False liveDelivery (isActive state >>= \task → Map.lookup task live)
+      if not (queued || inFlight)
+        then pure (False, False)
+        else do
+          stuck ← not <$> atomically (tasksReady (scheduler' ih))
+          progress ← case isActive state of
+            -- Nothing in flight, so what is queued waits for its turn to be given a place.
+            Nothing → pure (not stuck)
+            Just task →
+              atomically (taskPhase (scheduler' ih) task) <&> \case
+                Just PhaseReady → True
+                Just PhaseRunning → True
+                Just PhaseQueued → not stuck
+                -- An invocation that ended is accounted for, and the next one begun, at the
+                -- boundary that sees it.
+                Just (PhaseEnded _) → True
+                _ → False
+          pure (True, progress)
   where
-    nothingUnstarted = Seq.null (isQueue state) && isNothing (isPending state)
     (<&>) = flip fmap
 
 -- | Whether a due update can no longer run in the tick that is waiting for it. A tick

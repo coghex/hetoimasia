@@ -350,6 +350,34 @@ spec = describe "on an owner on logical time" $ do
       queued `shouldBe` single
       queued `shouldBe` ["got a n=1 seq=1 t=1", "yielded a", "resumed a at 2"]
 
+    -- Several deliveries admitted at one tick, each suspended on a wait in turn: every one starts at the
+    -- tick its predecessor ended at, however the grants behind them were queued.
+    it "claims every tick that a delivery admitted at an earlier one can still run in, across suspensions" $ bounded $ do
+      let run queued = do
+            fixture ← newIFixture
+            fake ← newFakeEvents
+            withBoundary $ \control runtime → eventsFinish fake $ do
+              owner ← logicalOwner fixture fake runtime "several" [subscriber] 16
+              admitSubscriber fixture owner "i" "subscriber"
+              subscribeTo' fixture owner "i" "a" "ticks" (Just "waitresume")
+              forM_ [0 .. 2] $ \place → deliverTo fake 0 (at 1 place) (place + 1) >>= (`shouldBe` EventStaged)
+              if queued then stepsQueued control owner 4 else forM_ [1 .. 4 ∷ Int] (const (grantOne control owner))
+              awaitLine fixture "done a n=3 at 4"
+              lines' ← linesOf fixture
+              d ← subDiagnostics owner
+              pure (filter (\line → Text.isPrefixOf "got " line || Text.isPrefixOf "done " line) lines', sdFailures d)
+      queued ← run True
+      single ← run False
+      queued `shouldBe` single
+      fst queued
+        `shouldBe` [ "got a n=1 seq=1 t=1"
+                   , "done a n=1 at 2"
+                   , "got a n=2 seq=2 t=1"
+                   , "done a n=2 at 3"
+                   , "got a n=3 seq=3 t=1"
+                   , "done a n=3 at 4"
+                   ]
+
     it "does not wait for events behind an invocation that is suspended waiting for a tick" $ bounded $ do
       fixture ← newIFixture
       fake ← newFakeEvents

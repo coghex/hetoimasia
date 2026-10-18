@@ -328,7 +328,7 @@ settleInstance instances cell settlement =
     Just _ → pure False
     Nothing → do
       writeTVar (icResult cell) (Just settlement)
-      modifyTVar' (icState cell) (\state → state {isPhase = resultPhase settlement, isStopped = True, isActive = Nothing, isConnections = Set.empty, isQueue = Seq.empty, isPending = Nothing, isUpdate = UpdateNone, isAwaited = False})
+      modifyTVar' (icState cell) (\state → state {isPhase = resultPhase settlement, isStopped = True, isActive = Nothing, isConnections = Set.empty, isQueue = Seq.empty, isPending = Nothing, isUpdate = UpdateNone})
       modifyTVar' (insLive instances) (subtract 1)
       forgotten ← readTVar (icForgotten cell)
       when forgotten (releaseResult instances cell)
@@ -444,7 +444,6 @@ beginEnding cell = do
           , isPending = Nothing
           , isUpdate = UpdateNone
           , isDispatchQueued = False
-          , isAwaited = False
           }
       pure (Set.size (isConnections state), unstartedCount (icKind cell) state, False)
 

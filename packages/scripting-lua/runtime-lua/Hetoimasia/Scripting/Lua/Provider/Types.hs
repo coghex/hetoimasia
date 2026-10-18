@@ -678,12 +678,15 @@ data EventCounts = EventCounts
     -- ^ Staged events discarded when their subscription or instance ended before their tick.
   , evFailures ∷ !Int
     -- ^ Delivery failures surfaced.
+  , evCleanupJobs ∷ !Int
+    -- ^ Times the owner was woken to have an instance's VM let go of callbacks an epoch change
+    -- ended: once for each instance that gained a cleanup it had not been woken for.
   }
   deriving (Eq, Show)
 
 -- | Nothing happened yet.
 noEventCounts ∷ EventCounts
-noEventCounts = EventCounts 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+noEventCounts = EventCounts 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
 
 -- | A reading of one live subscription.
 data SubscriptionReading = SubscriptionReading
@@ -724,6 +727,7 @@ data SubscriptionDiagnostics = SubscriptionDiagnostics
   , sdRefusedFull ∷ !Int
   , sdDiscarded ∷ !Int
   , sdFailures ∷ !Int
+  , sdCleanupJobs ∷ !Int
   , sdCoalesced ∷ !Int
     -- ^ The model's count of values replaced before they started.
   , sdInvalidated ∷ !Int
