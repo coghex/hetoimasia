@@ -2642,9 +2642,14 @@ and verified policy, with adversarial regression coverage.
   Logical admission is the target's `instanceControlAdmission`: a request carries a
   `ControlSlot` the application's `AssignControl` gives it, is queued by (tick,
   sequence) in the same transaction that reads the tick, and is applied at that tick's
-  boundary ahead of its cadence point and any task it wakes; a request for a tick that
+  boundary ahead of its cadence point and any task it wakes, the scheduler holding the
+  grant that reaches the tick (an owner's watch, a point of its own beside the cadence
+  points) until the controls are applied, and the points the tick reached staying the
+  scheduler's while they are, so a pause and a resume at that tick invalidate a point due
+  at it; a request for a tick that
   has begun, or a place that is taken, is refused, and one waiting for its tick settles
-  as no longer applicable when its instance ends or its owner exits. The application's
+  as no longer applicable when its instance ends or its owner exits, its place staying
+  taken, within a bound on what is queued, until its tick begins. The application's
   own `requestInstanceControl` is unchanged and admitted on arrival.
 
 ### LUA-24. Run instance updates on logical and elapsed cadences

@@ -2529,7 +2529,8 @@ An accepted request settles exactly once: `applied`, `already_in_state`, or `no_
 first, a stop superseded it, or its owner stopped, failed or was cancelled first). A receipt is held until it is read
 once settled (reading consumes it and gives the reservation back; any later read answers `unknown_receipt`), forgotten
 (the reservation comes back when the request settles), or abandoned: when the instance that made the request ends, when
-a task that made it ends, and when the caller's owner exits. Only the instance or task that made a request reads its
+a task that made it ends, and when the caller's owner exits. A closing handler a script defined runs as the instance or task
+whose coroutine is being closed, so it asks and reads as that caller and what it asked is abandoned with it. Only the instance or task that made a request reads its
 receipt. Abandoning interest never undoes a request already accepted: it is still applied, or settled, by its target.
 The engine keeps no other history of results; what is held is bounded by `grantReceiptBound`.
 
@@ -2553,11 +2554,16 @@ and sequence the application assigned each (D-23). The grant carries an `AssignC
 calls for every request that passes the grant, telling it the calling owner, the calling instance, the target and the
 operation, all of them the engine's own knowledge; it answers a `ControlSlot` or declines. The request is applied at the
 logical boundary of its tick, before that tick's ordinary work and cadence point, in the order of (tick, sequence), whatever order
-requests arrived in and whichever VM sent them. One assigned a tick the owner has begun is refused as `late`, one assigned
+requests arrived in and whichever VM sent them. The scheduler holds the grant that reaches such a tick, as it holds one a
+cadence point or a woken task owes work for, and applies no later grant, until the owner has applied the tick's controls, so
+grants queued together act exactly as grants served one by one; and the cadence points the tick reached are still the
+scheduler's while the controls are applied, so a pause and a resume assigned to a tick invalidate a point due at it, and the
+next update is a full interval after the resume. One assigned a tick the owner has begun is refused as `late`, one assigned
 a place another request holds as `duplicate`, and one given no place as `unassigned`; none is ever applied at another
 boundary. Admission reads the tick and enqueues in one transaction, so a request accepted for a tick is always queued before that
 tick is visible. A request waiting for its tick holds its reservation, and settles as no longer applicable if its instance
-ends or its owner exits first. The application's own `requestInstanceControl` is admitted on arrival whatever the owner admits,
+ends or its owner exits first; its place stays taken until its tick begins whatever became of the request, and the places
+queued are bounded as the reservations are (a request is refused as `full` when the queue holds that many). The application's own `requestInstanceControl` is admitted on arrival whatever the owner admits,
 and `requestInstanceControlAt` takes a place from the Haskell API.
 
 ### Determinism
