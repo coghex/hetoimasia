@@ -2400,7 +2400,9 @@ A release failure is a cleanup failure:
   is fatal under every policy, an `Optional` owner whose classifier recognizes every exception
   included. At once means at the boundary where it was observed: admission, grants and control close
   and the scheduler is asked to stop, so no queued invocation or `init` begins after it, and the owner
-  exits as a failure, settling or awaiting what is left as any exit does;
+  exits as a failure from that moment: the instances still to end have no `shutdown` run and no Lua
+  entered, and their holdings are drained all the same, settling or awaiting what is left as any exit
+  does;
 * it is never retried and never reported as reclaimed. `resultLeases` counts what the end released,
   waited for and saw fail.
 
@@ -2422,7 +2424,8 @@ the collection, in its own protected lifetime:
   once every retirement the lease has recorded has completed, uninterruptibly on the owner's thread and
   before the stop completion settles (at once, inside the release, if none is pending), so a dependency is
   never disposed under a retirement still using it. If a provider reports its retirement failed the disposal
-  never runs: the dependency is retained, as the resource is. A disposal that fails is cleanup evidence;
+  never runs: the dependency is retained, as the resource is. A disposal that fails is cleanup evidence
+  and is retained on the lease, whose every later release answers that failure and runs nothing again;
 * a retirement the provider reports failed is retained as cleanup evidence and is fatal, and the lease
   it belonged to answers that failure and never success;
 * a stage rolled back whose provider has not finished keeps its charge, and the owner's life, though the
