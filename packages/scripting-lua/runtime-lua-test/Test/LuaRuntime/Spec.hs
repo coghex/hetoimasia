@@ -12,6 +12,7 @@ import qualified Test.LuaRuntime.Instance.Spec
 import qualified Test.LuaRuntime.Lifecycle.Spec
 import qualified Test.LuaRuntime.Readiness
 import qualified Test.LuaRuntime.Request.Spec
+import qualified Test.LuaRuntime.Retention.Spec
 import qualified Test.LuaRuntime.Subscription.Spec
 import qualified Test.LuaRuntime.Scheduled.Spec
 import qualified Test.LuaRuntime.Scheduler.Spec
@@ -36,4 +37,5 @@ spec = describe "the Lua runtime adapter" $ do
   Test.LuaRuntime.Instance.Spec.spec
   Test.LuaRuntime.Lifecycle.Spec.spec
   Test.LuaRuntime.Request.Spec.spec
+  Test.LuaRuntime.Retention.Spec.spec
   Test.LuaRuntime.Subscription.Spec.spec
