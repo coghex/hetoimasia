@@ -8,10 +8,11 @@ failure evidence, and lifetime. This is the canonical continuation of
 
 Design state: `ready for issue processing`
 
-Current readiness scope: **LUA-18 only** (D-30), which now spans LUA-18, LUA-22,
-LUA-23 and LUA-24 (D-31), with LUA-25 as LUA-22's prerequisite (D-32). LUA-6 (with LUA-20 and LUA-21, D-28/D-29) is delivered. Other
-unchecked slices retain their explicit deferrals; this state does not release
-the confinement gate.
+Current readiness scope: **LUA-7 only** (D-37), with D-36 fixing when a
+deterministic owner's Lua sees an asynchronous result. LUA-6 (with LUA-20 and
+LUA-21, D-28/D-29) and LUA-18 (with LUA-22, LUA-23, LUA-24 and LUA-25,
+D-30 to D-32) are delivered. Other unchecked slices retain their explicit
+deferrals; this state does not release the confinement gate.
 
 Owner: `coghex/hetoimasia`. Epic #145 and children #146–#149 have been
 created; those children are merged. The owner accepted the two-domain direction,
@@ -172,7 +173,7 @@ concrete precondition
 - [x] LUA-23. Grant Lua lifecycle controls and inspection across owners — [#474]
 - [x] LUA-24. Run instance updates on logical and elapsed cadences — [#475]
 - [x] LUA-25. Lend a resource collection's ownership to synchronous Lua callbacks — [#476]
-- [ ] LUA-7. Add bounded asynchronous requests and owned subscriptions — [deferred]: owner renews trusted-path readiness for this slice
+- [ ] LUA-7. Add bounded asynchronous requests and owned subscriptions
 - [ ] LUA-19. Run script instances through a headless command-line entry — [deferred]: contract accepted; renew slice readiness
 - [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly — [deferred]: owner renews trusted-path readiness for this slice
 - [ ] LUA-9. Add bounded child-process transport and owned process lifetime — [deferred]: Q-5 successful Linux and macOS confinement verdicts
@@ -980,6 +981,63 @@ Owner decisions, 2026-10-18, in the hetoimasia manager pane, on two choices
   A resumed instance's first update therefore receives about one interval of
   `dt`, not the whole pause. Rejected: counting paused ticks, which makes a
   resumed instance integrate the whole pause in one update.
+
+### D-36. A gameplay request's result reaches Lua at its assigned due tick
+
+Owner decision, 2026-10-18, in the hetoimasia manager pane ("Assigned due
+tick"), on the one open product choice the LUA-7 readiness check found: at which
+logical tick a deterministic owner's Lua sees an asynchronous request's
+settlement. D-23 requires deterministic incorporation of asynchronous results,
+and arrival time depends on real CPU and provider delays.
+
+- When a request is admitted on an owner driven by logical time, the
+  application's policy, through the binding that admits it, assigns the logical
+  tick at which its settlement is due. The default is the next tick.
+- The settlement (result, failure or cancellation) reaches Lua at that tick's
+  boundary, in canonical (tick, sequence) order, and never earlier. A settlement
+  that arrives earlier stays in its reserved result slot without resuming Lua.
+- That tick does not begin until the request has settled: the scheduler holds the
+  grant that reaches it, as LUA-23 holds a tick for its tick-assigned controls. A
+  slow provider stalls gameplay only at the due tick. Real delays change when a
+  tick completes, never what it computes. A provider that never settles stalls
+  gameplay at that tick until its own stop or failure contract ends the request.
+- A readiness query from Lua on that owner answers from logical state: pending
+  before the due tick, settled from it on.
+- Events a provider delivers to that owner's connections are admitted by
+  application-assigned tick and sequence, as LUA-23 admits controls, never in
+  arrival order.
+- Owners on elapsed time (UI) take settlements and events on arrival, at their
+  next safe boundary.
+
+Rejected: holding every tick from the moment a gameplay script waits on a
+request (one slow provider stalls the whole owner at once, and it departs from
+D-33, where ticks advance through waits); and forbidding waits on requests in
+gameplay, so results arrive only as later tick-assigned events (a script could
+not await its own request).
+
+### D-37. Renew LUA-7 readiness and delegate it through merge
+
+Owner request, 2026-10-18, in the hetoimasia manager pane: "pick the logical next
+slice for me, help me continue", then "Through merged" (request
+`user-het-next-slice-20261018-1235`). The readiness check at `master@9ae8c867`:
+
+- LUA-7 is the only unprocessed trusted slice whose dependencies are delivered:
+  LUA-18 (#472, PR #478, `d8afb442`) and LUA-22 (#473, PR #480, `9ae8c867`).
+  LUA-23 (#474), LUA-24 (#475) and LUA-25 (#476) are merged too. LUA-19 depends
+  on LUA-7, and LUA-8 on LUA-19.
+- P-7, the accepted contract (D-26/D-27) and D-36 fix its behavior; D-36 settles
+  the one open product choice the check found. It builds on delivered seams:
+  LUA-18's per-instance invocation FIFO and instance-owned connections, LUA-22's
+  retained retirement obligations (`retireAsynchronously`) and LUA-23's
+  tick-assigned admission (`instanceControlAdmission`).
+- The open tracker holds epic #145 and the unrelated #446, with no LUA-7 child or
+  duplicate.
+
+D-37 renews trusted readiness for LUA-7 only. The owner asks for it to be
+processed into issues, canonically approved, solved and merged. Splitting it, if
+the drafted issue is too large for one PR, is delegated (D-25) and adds no scope.
+LUA-19 and LUA-8 stay `[deferred]` on their own renewal, and the confined branch
+stays on Q-5. Readiness is not implementation approval beyond that request.
 
 ## Design
 
@@ -2738,7 +2796,8 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-7. Add bounded asynchronous requests and owned subscriptions
 
-> Deferred: owner renews trusted-path readiness for this slice. The 2026-10-15 narrow renewal covers LUA-2 and LUA-3 only.
+> Ready for issue processing under D-37. Its dependencies are delivered, and D-36
+> fixes the tick at which a deterministic owner's Lua sees a request's result.
 
 - **Outcome:** scripts can wait for an engine operation or event without
   blocking the owner or invoking Lua from a producer thread.
@@ -2752,7 +2811,7 @@ and verified policy, with adversarial regression coverage.
 - **Phase:** component integration protocol.
 - **Depends on:** LUA-18, LUA-22; consumes LUA-3/LUA-4/LUA-5 boundaries.
 - **Ordering:** after instance ownership and engine-held leases; independent of Q-5.
-- **Relevant decisions:** D-1, D-2, D-3, D-4, D-12, D-13, D-14, D-22, D-23, D-24, D-25.
+- **Relevant decisions:** D-1, D-2, D-3, D-4, D-12, D-13, D-14, D-22, D-23, D-24, D-25, D-36, D-37.
 - **Acceptance signals:** full output paths never block provider completion;
   duplicate/late results harmless; unsubscribe and stop races settle once;
   provider dependency lifetime extends to actual completion, not cancellation
@@ -2760,7 +2819,8 @@ and verified policy, with adversarial regression coverage.
 - **Out of scope:** actual pathfinding/assets/graphics services, general RPC or
   broadcast, automatic restart, mandatory draining of infinite subscriptions.
 - **Open questions:** None; paused delivery/overflow are accepted by D-26;
-  D-27 requires engine-owned provider interest/retirement. Readiness remains pending.
+  D-27 requires engine-owned provider interest/retirement; D-36 fixes result
+  admission on a deterministic owner. Readiness renewed by D-37.
 
 ### LUA-19. Run script instances through a headless command-line entry
 

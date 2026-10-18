@@ -5,8 +5,8 @@ Design contract, 2026-10-17. Owner: `coghex/hetoimasia`.
 **Status: accepted design contract (D-26), with the owner's automatic-cleanup
 requirement (D-27).** This refines [the Lua design](lua_runtime_design.md),
 D-16 through D-27. It describes intended behavior, not implemented APIs.
-The parent design is ready for issue processing for LUA-18 only under D-30
-(LUA-18, LUA-22, LUA-23 and LUA-24; LUA-6 is delivered); other slices retain their
+The parent design is ready for issue processing for LUA-7 only under D-37
+(LUA-6 and LUA-18 with its carved slices are delivered); other slices retain their
 readiness gates. Contract approval does not itself
 create issues or qualify implementation.
 
@@ -169,6 +169,9 @@ simulation cannot continue as though delivery succeeded. No generic automatic
 retry or unbounded secondary queue is implied. Gameplay admission/overflow
 decisions must be tied to logical boundaries so wall-time service speed alone
 does not decide which inputs are accepted.
+On an owner driven by logical time, a request's settlement reaches Lua at the
+tick the application assigned at admission (by default the next), and that tick
+does not begin until the request has settled (D-36).
 
 On resume, finish any previously suspended invocation before starting another.
 Then process retained events in admission order under ordinary service quotas;
