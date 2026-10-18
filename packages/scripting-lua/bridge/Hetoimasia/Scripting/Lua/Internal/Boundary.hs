@@ -193,6 +193,11 @@ data FaultReason
     EntryNotAFunction
   | -- | A call to a binding of a kind this slice does not deliver (decision A1).
     NotYetSupported !BindingKind
+  | -- | The engine refused the call from inside a binding's action, through its
+    -- own API ('Hetoimasia.Scripting.Lua.Internal.Fault.CallRefusal'), before the
+    -- action changed anything: why. A fault of the call, never a failure of the
+    -- host, whatever the script does with the error it sees.
+    BindingRefused !Text
   | -- | A task handle was refused before anything ran.
     TaskRefused !TaskProblem
   | -- | A scheduler operation called where it cannot reach the scheduler.

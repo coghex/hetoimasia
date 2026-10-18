@@ -84,6 +84,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Failure (ReasonCode (ScriptFau
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (TaskId)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Task (TaskFailure (TaskFailure))
 import Hetoimasia.Scripting.Lua.Internal.Vm (vmIdentity)
+import Hetoimasia.Scripting.Lua.Lease.State (LeaseHost (LeaseHost), Leases)
 import Hetoimasia.Scripting.Lua.Lending.Loan (Lending, lendingScope)
 import Hetoimasia.Scripting.Lua.Owner
   ( BoundaryFault (..)
@@ -115,6 +116,7 @@ import Hetoimasia.Scripting.Lua.Instance.Run
   ( ExitMode (Unorderly)
   , InstanceHost (ihMode)
   , awaitInstanceWork
+  , closingAs
   , instanceClosed
   , instanceSegment
   , newInstanceHost
@@ -153,27 +155,31 @@ runScheduledOwner
   → (SegmentContext → IO ())
   → Maybe (InstanceFailure → IO Escalation)
   → Maybe Lending
+  → Maybe Leases
   → Int
   → VmConfig
   → IO ()
-runScheduledOwner stopping control handoff observe escalate lending members config = mask $ \restore → do
+runScheduledOwner stopping control handoff observe escalate lending leases members config = mask $ \restore → do
   let body = serve stopping control handoff observe escalate config
   outcome ←
     tryWithContext @SomeException . restore $ case lending of
-      Nothing → withVmOwnerScoped noCallbackScope config body
+      Nothing → withVmOwnerScoped noCallbackScope config (body Nothing)
       -- The collection is allocated first and so released last: after the VM's
       -- close, which is the last thing 'withVmOwnerScoped' does.
       Just handle →
         withScoped (allocOwnedCollection members) $ \(collection, capability) →
-          withVmOwnerScoped (lendingScope handle collection capability) config body
+          withVmOwnerScoped (lendingScope handle collection capability) config
+            -- The owner's thread holds the capability, and with the leases it drains an
+            -- instance's holdings through it when the instance ends.
+            (body (LeaseHost <$> leases <*> pure collection <*> pure capability))
   -- An exit before the body, or a failure of the close itself: nothing of the
   -- tasks is left to settle then, and this records how the owner ended.
   atomically (settleAll control (either exitOf (const ExitStopped) outcome))
   either rethrowIO pure outcome
 
 -- | The body of the owner's lifetime.
-serve ∷ STM Bool → Control → TVar (Maybe Control) → (SegmentContext → IO ()) → Maybe (InstanceFailure → IO Escalation) → VmConfig → OwnedVm → IO ()
-serve stopping control handoff observe escalate config owned = mask $ \restore → do
+serve ∷ STM Bool → Control → TVar (Maybe Control) → (SegmentContext → IO ()) → Maybe (InstanceFailure → IO Escalation) → VmConfig → Maybe LeaseHost → OwnedVm → IO ()
+serve stopping control handoff observe escalate config leaseHost owned = mask $ \restore → do
   tasks ← newIORef Map.empty
   handlesRef ← newIORef Map.empty
   instanceRef ← newIORef Nothing
@@ -191,8 +197,10 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
             -- close was not interrupted, which an exit settles as discarded.
             hostClose = \task → do
               began ← Map.member task <$> readIORef tasks
-              closed ← try @SomeException (closeSuspended owned tasks kept task)
               instances ← readIORef instanceRef
+              -- A to-be-closed handler the script defined runs as the instance whose
+              -- invocation this is.
+              closed ← try @SomeException (maybe id (\ih → closingAs ih task) instances (closeSuspended owned tasks kept task))
               let interrupted = case closed of
                     Left failure | Just (_ ∷ SomeAsyncException) ← fromException failure → True
                     _ → False
@@ -212,7 +220,7 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
     writeIORef handlesRef handles
     forM_ ((,) <$> controlInstances control <*> escalate) $ \(instances, decide) →
       forM_ (Map.lookup driverRef handles) $ \driver →
-        newInstanceHost control instances decide host owned driver handlesRef tasks extra >>= writeIORef instanceRef . Just
+        newInstanceHost control instances decide host owned driver handlesRef tasks extra leaseHost >>= writeIORef instanceRef . Just
     atomically (writeTVar handoff (Just control))
     loop host kept extra instanceRef
   -- The owner is exiting, however it was asked to or made to. Admission, grants
@@ -253,7 +261,7 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
   -- cleanup a script asked for.
   held ← Map.keys <$> readIORef tasks
   swept ← forM held $ \held' → do
-    closed ← try @SomeException (closeSuspended owned tasks kept held')
+    closed ← try @SomeException (maybe id (\ih → closingAs ih held') heldInstances (closeSuspended owned tasks kept held'))
     -- Counted for its instance, which the exit then ends; an interruption of the close
     -- is a cancellation, as it is in the scheduler's stop.
     forM_ heldInstances $ \ih → do

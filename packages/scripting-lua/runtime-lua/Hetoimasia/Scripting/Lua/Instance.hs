@@ -190,6 +190,25 @@
 -- phase and execution detail of an instance, and of the owner's instances. They never
 -- borrow a Lua table.
 --
+-- = Leases
+--
+-- An owner that is given 'Hetoimasia.Scripting.Lua.Lease.Leases' ('scheduledLeases')
+-- gives each instance a scope before its first hook, and the bindings the application
+-- writes acquire resources through it for the instance that is running
+-- ("Hetoimasia.Scripting.Lua.Lease", LUA-22). What the instance still holds when it ends,
+-- on any of the paths above, is released on the owner's thread after its @shutdown@ has
+-- run or been skipped, newest acquisition first, whatever the script did or did not do
+-- with the handles it was given. A release that fails does not stop the others, is kept
+-- beside the instance's primary failure ('failureSecondary', stage 'StageRelease') and
+-- is cleanup evidence on the owner's outcome: fatal under any policy, whatever the
+-- application's escalation answers.
+--
+-- What a provider has yet to retire after that holds the instance's /stop completion/: the
+-- instance's end has run its hook and released its holdings and is parked, 'Stopping', and
+-- it settles once every retirement the provider was asked for has completed. The owner
+-- stays live until then, through a stop and through a cancellation. A settlement says what
+-- the end did with the leases ('resultLeases').
+--
 -- = Idle
 --
 -- Everything an instance's owner does is a response to something: an admission, an
@@ -249,6 +268,7 @@ module Hetoimasia.Scripting.Lua.Instance
   , awaitInstance
   , forgetInstance
   , InstanceSettlement (..)
+  , LeaseOutcome (..)
   , InstanceOutcome (..)
   , Termination (..)
   , ShutdownDisposition (..)

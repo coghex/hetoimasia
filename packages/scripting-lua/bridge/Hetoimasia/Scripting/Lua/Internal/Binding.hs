@@ -41,7 +41,7 @@ module Hetoimasia.Scripting.Lua.Internal.Binding
   , ensureValues
   ) where
 
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, evaluate, fromException, toException)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, catch, evaluate, fromException, toException)
 import Control.Monad (foldM, forM_, unless, when)
 import Data.List (nub)
 import Data.Maybe (fromMaybe)
@@ -53,7 +53,7 @@ import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure, withOp
 import Hetoimasia.Scripting.Lua.Internal.Boundary
 import Hetoimasia.Scripting.Lua.Internal.Call (reportFault)
 import Hetoimasia.Scripting.Lua.Internal.Callback (Handler, installBinding)
-import Hetoimasia.Scripting.Lua.Internal.Fault (classify, fromApplication, luaComponent, raisedByApplication, renderFailure)
+import Hetoimasia.Scripting.Lua.Internal.Fault (CallRefusal (CallRefusal), classify, fromApplication, luaComponent, raisedByApplication, renderFailure)
 import Hetoimasia.Scripting.Lua.Internal.Marshal
 import Hetoimasia.Scripting.Lua.Internal.Registration
 import Hetoimasia.Scripting.Lua.Internal.Value
@@ -200,12 +200,16 @@ valueHandler boundary vm space binding state restore = do
             Right value → pure value
         )
         (zip3 [1 ..] declared found)
-      forM_ (zip [1 ..] values) $ \(index, value) → do
-        -- The application's own check is application code, like the action: it
-        -- runs unmasked.
-        retired ← restore (retiredIn boundary value)
-        forM_ retired $ \(path, typeName) →
-          refuseArguments index path (RuleRetiredHandle typeName) visited
+      -- Every handle is checked for having ended before the action, except the one an
+      -- explicit release is given: it was checked above for being this VM's, of the
+      -- declared type, and its binding's only argument, and ending is what it answers.
+      unless (acceptsRetired binding) $
+        forM_ (zip [1 ..] values) $ \(index, value) → do
+          -- The application's own check is application code, like the action: it
+          -- runs unmasked.
+          retired ← restore (retiredIn boundary value)
+          forM_ retired $ \(path, typeName) →
+            refuseArguments index path (RuleRetiredHandle typeName) visited
       let runAction ∷ IO [Value] → IO NumResults
           runAction compute = do
               -- Counted before it starts, so a fault of anything the action does is
@@ -215,7 +219,11 @@ valueHandler boundary vm space binding state restore = do
               -- (C1), and an action is about to run after it: what it reports as having
               -- happened has to include that.
               amendEscape vm upgradeEffect
-              produced ← compute
+              -- The engine's own refusal of this call, raised by its API from inside
+              -- the action, is a fault of the call and not the application's failure.
+              -- It is caught outside the mark the action's failures get, so the mark
+              -- never reaches it.
+              produced ← compute `catch` \(CallRefusal why) → faulted (BindingRefused why) BindingRan
               let expected = bindingResults binding
               -- Bounded first: an action that built far more than the limits allow is
               -- refused after visiting what the limits allow, plus one.
@@ -255,6 +263,10 @@ valueHandler boundary vm space binding state restore = do
         -- The bounded check reaches every part of a result that can cross, and
         -- stops at a limit, so an endless result costs no more than a large one.
         ValuesAction run →
+          runAction . fromApplication $ do
+            returned ← restore (run values)
+            returned <$ evaluate (checkLimits limits returned)
+        ReleaseAction run →
           runAction . fromApplication $ do
             returned ← restore (run values)
             returned <$ evaluate (checkLimits limits returned)

@@ -42,6 +42,7 @@ module Hetoimasia.Scripting.Lua.Lending.Loan
   ( Lending
   , newLending
   , bindLending
+  , sameLending
   , currentLoan
   , LentCollection (..)
   , LendingRefused (..)
@@ -115,6 +116,10 @@ bindLending ∷ HasCallStack ⇒ Lending → IO ()
 bindLending lending = do
   taken ← atomicModifyIORef' (lendingBound lending) (\held → (True, held))
   if taken then refuse "bind-lending" LendingInUse else pure ()
+
+-- | Whether two handles are the same one.
+sameLending ∷ Lending → Lending → Bool
+sameLending a b = lendingBound a == lendingBound b
 
 -- | What the handle's owner is lending right now, if its VM is running a callback.
 currentLoan ∷ Lending → IO (Maybe LentCollection)

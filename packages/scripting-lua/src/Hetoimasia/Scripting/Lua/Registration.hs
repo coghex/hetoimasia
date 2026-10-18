@@ -28,6 +28,18 @@
 -- whose action never runs. The asynchronous kind can never be eligible to run
 -- from a Lua finalizer during a VM's close.
 --
+-- = Releasing a handle
+--
+-- Every binding refuses a capability whose application check reports it retired,
+-- before its action runs: using what has ended is a fault of the call. An explicit
+-- release is the one operation that is run for such a handle, because answering
+-- that it has ended is its job ('releaseOperation'). It is declared with the one
+-- capability type it releases and takes that handle as its only argument, so what
+-- reaches it is never any other value, and the handle is still checked for being
+-- authentic: issued by the VM that is calling and of that type. A retired handle
+-- given to any other binding, or a retired handle of any other type, is refused as
+-- before.
+--
 -- = Scheduler operations
 --
 -- A task's code gives control back to whatever resumes it through a scheduler
@@ -79,6 +91,7 @@ module Hetoimasia.Scripting.Lua.Registration
   , commandIntention
   , asynchronousNativeRequest
   , lifecycleOperation
+  , releaseOperation
   , yieldOperation
   , waitOperation
   , WaitKind (..)

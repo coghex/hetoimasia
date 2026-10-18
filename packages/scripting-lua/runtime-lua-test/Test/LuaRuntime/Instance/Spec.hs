@@ -13,6 +13,7 @@ import qualified Test.LuaRuntime.Instance.Control
 import qualified Test.LuaRuntime.Instance.Determinism
 import qualified Test.LuaRuntime.Instance.Events
 import qualified Test.LuaRuntime.Instance.Failure
+import qualified Test.LuaRuntime.Instance.Lease.Spec
 import qualified Test.LuaRuntime.Instance.Stop
 import Test.Hspec (Spec, describe)
 
@@ -28,4 +29,5 @@ spec = describe "the script instances" $ do
   Test.LuaRuntime.Instance.Determinism.spec
   Test.LuaRuntime.Instance.Events.spec
   Test.LuaRuntime.Instance.Failure.spec
+  Test.LuaRuntime.Instance.Lease.Spec.spec
   Test.LuaRuntime.Instance.Stop.spec

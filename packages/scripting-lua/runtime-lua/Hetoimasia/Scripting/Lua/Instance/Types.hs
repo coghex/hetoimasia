@@ -29,6 +29,8 @@ module Hetoimasia.Scripting.Lua.Instance.Types
     -- * What an instance settles as
   , InstanceOutcome (..)
   , InstanceSettlement (..)
+  , LeaseOutcome (..)
+  , noLeases
   , Termination (..)
   , ShutdownDisposition (..)
   , HookStage (..)
@@ -306,6 +308,8 @@ data HookStage
   | -- | A callback, by the source it was connected to.
     StageEvent !Text
   | StageShutdown
+  | -- | Releasing what the instance held, as it ended.
+    StageRelease
   deriving (Eq, Show)
 
 -- | What went wrong, as the host reports it.
@@ -320,6 +324,10 @@ data InstanceError
   | -- | The scheduler refused what an invocation asked for (a wait for no ticks or
     -- no time) and failed it.
     ErrorRefusedWait !TaskFailure
+  | -- | Releasing a holding failed, or a provider's retirement of one: a bounded
+    -- rendering of what failed. The failure itself is cleanup evidence on the
+    -- owner.
+    ErrorRelease !Text
   deriving (Show)
 
 -- | A bounded diagnostic and inspection result: the instance, its owner, its
@@ -610,8 +618,27 @@ data InstanceSettlement = InstanceSettlement
     -- ^ The terminal phase.
   , resultOutcome ∷ !InstanceOutcome
   , resultTermination ∷ !Termination
+  , resultLeases ∷ !LeaseOutcome
+    -- ^ What the end did with the leases the instance held.
   }
   deriving (Show)
+
+-- | What an instance's end did with its leases ("Hetoimasia.Scripting.Lua.Lease").
+data LeaseOutcome = LeaseOutcome
+  { leasesDrained ∷ !Int
+    -- ^ Holdings the end released.
+  , leasesAwaited ∷ !Int
+    -- ^ Provider retirements the end waited for, and saw complete: the ones still
+    -- pending when the instance's holdings were released.
+  , leasesFailed ∷ !Int
+    -- ^ Releases and retirements that failed. Each is kept beside the instance's
+    -- primary failure, and as cleanup evidence on the owner.
+  }
+  deriving (Eq, Show)
+
+-- | An instance that held no leases.
+noLeases ∷ LeaseOutcome
+noLeases = LeaseOutcome 0 0 0
 
 -- | Everything one owner's instances share across its two sides.
 data Instances = Instances
@@ -657,6 +684,7 @@ renderError = failureText . \case
   ErrorFault fault → Text.pack (show fault)
   ErrorMissingEntry entry → "the module defines no " <> entry <> " entry point"
   ErrorRefusedWait failure → Text.pack (show failure)
+  ErrorRelease released → "a release failed: " <> released
 
 -- | A bounded rendering.
 failureText ∷ Text → Text

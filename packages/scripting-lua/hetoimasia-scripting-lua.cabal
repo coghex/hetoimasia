@@ -200,6 +200,7 @@ library runtime-lua
     visibility: public
     hs-source-dirs: runtime-lua
     exposed-modules:
+        Hetoimasia.Scripting.Lua.Lease
         Hetoimasia.Scripting.Lua.Lending
         Hetoimasia.Scripting.Lua.Runtime
         Hetoimasia.Scripting.Lua.Instance
@@ -210,6 +211,7 @@ library runtime-lua
         Hetoimasia.Scripting.Lua.Instance.Run
         Hetoimasia.Scripting.Lua.Instance.State
         Hetoimasia.Scripting.Lua.Instance.Types
+        Hetoimasia.Scripting.Lua.Lease.State
         Hetoimasia.Scripting.Lua.Lending.Loan
         Hetoimasia.Scripting.Lua.Runtime.Admission
         Hetoimasia.Scripting.Lua.Runtime.Dispatch
@@ -285,6 +287,7 @@ test-suite lua-host-tests
         Test.Lua.Boundary.Installation
         Test.Lua.Boundary.Modules
         Test.Lua.Boundary.Registration
+        Test.Lua.Boundary.Release
         Test.Lua.Boundary.Spec
         Test.Lua.Boundary.Support
         Test.Lua.Boundary.Tasks
@@ -379,6 +382,12 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Instance.Determinism
         Test.LuaRuntime.Instance.Events
         Test.LuaRuntime.Instance.Failure
+        Test.LuaRuntime.Instance.Lease.Acquire
+        Test.LuaRuntime.Instance.Lease.Configure
+        Test.LuaRuntime.Instance.Lease.Release
+        Test.LuaRuntime.Instance.Lease.Retire
+        Test.LuaRuntime.Instance.Lease.Spec
+        Test.LuaRuntime.Instance.Lease.Support
         Test.LuaRuntime.Instance.Spec
         Test.LuaRuntime.Instance.Stop
         Test.LuaRuntime.Instance.Support
