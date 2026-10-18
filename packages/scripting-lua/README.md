@@ -2385,12 +2385,17 @@ failure of a closing handler, a one-shot's completion, the owner's retirement or
 thread after its `shutdown` has run or been skipped, newest acquisition first and each one's parts in
 the order its assembly declared. Handles stay usable inside `shutdown`. A release that fails does not
 stop the others from being attempted. Draining runs no Lua, so it also runs when Lua is no longer safe
-to enter.
+to enter, and when a failure of the host in `shutdown` is what ends the owner: the instance is drained
+and, if a provider has yet to retire something, parked all the same, so nothing is left live for the
+collection's own close, where nothing would wait for its provider.
 
 A release failure is a cleanup failure:
 
 * it is kept beside the instance's primary failure, which stays primary, in the settlement
-  (`failureSecondary`, stage `StageRelease`), and is the instance's failure when there is none;
+  (`failureSecondary`, stage `StageRelease`), and is the instance's failure when there is none. That
+  includes a rollback release that failed while a constructor was failing: the constructor's exception
+  stays the owner's failure, as an application failure, and the rollback failure is kept for the
+  instance beside it;
 * it is cleanup evidence on the owner's outcome, so it ends the owner at once through supervision and
   is fatal under every policy, an `Optional` owner whose classifier recognizes every exception
   included;
@@ -2410,6 +2415,12 @@ the collection, in its own protected lifetime:
   `Stopping`, and nothing is reported as reclaimed merely because Lua stopped;
 * the owner stays live, with everything its exit keeps, through a stop and through a cancellation, as a
   stuck segment keeps it, until the provider has proved completion;
+* what a retirement needs is handed to it, not disposed: the release of the part that owns a dependency
+  calls `afterRetirement disposal`, ranked after the parts being retired, and the engine runs the disposal
+  once every retirement the lease has recorded has completed, uninterruptibly on the owner's thread and
+  before the stop completion settles (at once, inside the release, if none is pending), so a dependency is
+  never disposed under a retirement still using it. If a provider reports its retirement failed the disposal
+  never runs: the dependency is retained, as the resource is. A disposal that fails is cleanup evidence;
 * a retirement the provider reports failed is retained as cleanup evidence and is fatal, and the lease
   it belonged to answers that failure and never success;
 * a stage rolled back whose provider has not finished keeps its charge, and the owner's life, though the
