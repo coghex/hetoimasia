@@ -44,7 +44,10 @@ lifecycle the application controls. See [Script instances](#script-instances).
 of the owners the application grants them, and nothing else. See
 [Lifecycle services](#lifecycle-services). **Asynchronous requests** (LUA-7) let a script ask a provider for something it
 will answer later, with a reserved result slot, settled exactly once and, on a logical owner, delivered at the tick the
-application assigned. See [Asynchronous requests](#asynchronous-requests). Any
+application assigned. See [Asynchronous requests](#asynchronous-requests). **Provider events** (LUA-26) let an
+instance subscribe a function to a provider's events: owned by the instance, delivered into its bounded queue by
+producers that never call Lua, and, on a logical owner, admitted at the tick and place the application assigned. See
+[Provider events](#provider-events). Any
 concrete game namespace and the confined path are later slices of
 [the Lua runtime design](../../docs/lua_runtime_design.md). What is here is the
 boundary they will be built on, and the evidence that it holds.
@@ -1922,8 +1925,8 @@ optional entry points (`hookEntries`). Periodic update cadence (LUA-24) is descr
 [Cadence](#cadence). What an instance acquires through the application's bindings is owned by the
 engine (LUA-22, [Instance leases](#instance-leases)); control and inspection a script is granted across
 owners (LUA-23) are described under [Lifecycle services](#lifecycle-services); the requests a script makes of
-providers (LUA-7) are described under [Asynchronous requests](#asynchronous-requests), and real event providers
-(LUA-26) are a later slice.
+providers (LUA-7) are described under [Asynchronous requests](#asynchronous-requests), and the events a provider
+delivers to functions an instance subscribed (LUA-26) under [Provider events](#provider-events).
 
 ### Instances and identity
 
@@ -2006,8 +2009,9 @@ taken at the next boundary, whenever it was released: the application chose when
 
 ### Events
 
-An owner offers named event sources (`EventSource`: a name and the shape of the payload). In this
-slice they are a seam for tests: only the application's own threads deliver. `deliverEvent` answers at
+An owner offers named event sources (`EventSource`: a name and the shape of the payload). They are a seam
+for tests and for the application's own threads, which deliver in arrival order (a provider's events are
+[Provider events](#provider-events), which a logical owner admits by assigned place). `deliverEvent` answers at
 once, from any thread, without blocking: `DeliveryAccepted` with a sequence, `DeliveryQueueFull`,
 `DeliveryClosed`, `DeliveryUnknownTarget` (no live instance of this owner, or none with a connection to
 the source) or `DeliveryRefused` (the payload is over the owner's limits or not what the source
@@ -2240,8 +2244,8 @@ the same order of invocations and of effects recorded through a binding, however
 whenever timers fire and whether budgets expire. It holds for logical-time workloads: elapsed waits
 legitimately change readiness, as do elapsed-interval updates, which depend on real time and are tested
 against the injected clock. The order of logical updates among an instance's other invocations, and the
-`dt` each receives, are among what is the same. An event or an arrival-admitted request that arrives in the middle of
-a step is not ordered logically. A control admitted logically is: see [Logical admission](#logical-admission).
+`dt` each receives, are among what is the same. An event delivered to a connection, or an arrival-admitted request, that arrives in the middle of
+a step is not ordered logically (a provider's event is: see [Provider events](#provider-events)). A control admitted logically is: see [Logical admission](#logical-admission).
 
 ### What proves it
 
@@ -2790,6 +2794,187 @@ and the cancel came first, the order of the places, holds shared between request
 determinism across arrival orders; and epochs. The protocol model's holders are pinned in `lua-host-tests`. The
 cancellation and cleanup windows are the kind an asynchronous-exception race can hide on one platform, so CI, which runs
 them on Linux, is the evidence for them and a local pass is not.
+
+## Provider events
+
+`Hetoimasia.Scripting.Lua.Provider` (LUA-26, in `runtime-lua`) lets an instance subscribe a function to the events
+a provider delivers, without a provider's thread ever entering Lua. It follows P-7 of [the Lua runtime
+design](../../docs/lua_runtime_design.md): a subscription is an owned record with bounded delivery, unsubscribe and
+invalidation; a producer never invokes a Lua closure on its own thread, and the owner looks up the still-live callback
+when it services an event; overload is stated per endpoint, and there is no universal lossy stream. It is built on the
+granted provider service, the one guard and the epoch operation of [Asynchronous requests](#asynchronous-requests),
+used unchanged, on the shared retained-obligation primitive of the instance leases, and on the protocol model's
+subscription records ([The protocol model](#the-protocol-model)).
+
+### Granting the subscriptions
+
+A scheduled owner that is granted the request service (`scheduledRequests`) and hosts instances can also be granted
+subscriptions, with `scheduledSubscriptions ∷ Maybe SubscriptionGrant`. A `SubscriptionGrant` names the providers' event
+endpoints (`EventEndpoint`: a name, the schema every delivery must conform to, the endpoint's `OverloadPolicy` and how a
+subscription is handed to the provider), the bound on the subscriptions the owner holds, and the bound on the events a
+logical owner holds for ticks it has not reached. The grant is the whole of the authority: an instance's `api` can
+subscribe only to an endpoint the grant names *and* the instance was granted (`instanceGrants` names endpoints beside event
+sources). An owner created with no grant leaves `api.subscribe` refused as not yet supported, with its action never run.
+A grant that does not make sense (a bound below one, no endpoint, an invalid or repeated endpoint name, a payload that
+names a capability, more endpoints than the driver module can declare entry points for beside the owner's sources, an
+owner with no request service or no instances) is refused before anything starts as `SubscriptionGrantRefused`, naming
+every reason. The owner's kind of time is the request grant's (`RequestTiming`): an owner that settles at assigned ticks
+admits events at assigned ticks, and one that settles on arrival admits them on arrival.
+
+### What a provider implements
+
+An endpoint's `eventSubscribe` is handed an `EventSubscription`: an `EventFeed` and the subscription's identity
+(`SubscriptionInfo`: the owner, the instance, the endpoint and the subscription's number). It answers a `ProviderWork`, as
+a request's provider does: `workCancel` withdraws the engine's interest (called once, on any path that ends the
+subscription) and `workRetirement` reads where the provider's own retirement of it has got to (a transaction that must not
+retry). The provider delivers through the feed, from any thread, now or later:
+
+* `feedDeliver place value` delivers one value. It never blocks and never waits for the owner, the queue or Lua. On an owner
+  on elapsed time the place is `Nothing` and the value is admitted on arrival. On an owner on logical time the application
+  assigns the place, `Just (DueSlot tick sequence)` (D-36); the delivery is held until that tick's boundary.
+* `feedFail reason` surfaces a delivery failure: the provider cannot preserve an authoritative event. The instance fails with
+  it (`ErrorDelivery`), once, and the application's escalation (`instanceEscalate`) decides what that means for its peers; the
+  simulation cannot go on as though the event had been delivered.
+
+The answer says what became of a delivery (`EventAnswer`), and none is an error: `EventAdmitted`, `EventCoalesced`,
+`EventStaged`, `EventQueueFull`, `EventStagingFull`, `EventEnded`, `EventRefusedValue`, `EventLate`, `EventDuplicate`,
+`EventUnassigned` and `EventNotLogical`. A refusal is evidence about the provider: it is counted, and the value is not kept.
+A delivery is checked before anything is retained, against the owner's value limits and the endpoint's schema. What is
+measured is what the callback's entry point is handed: the instance's number and the record naming the endpoint and the
+subscription, which the host checks together (so a payload that fits the record alone and not the record with the number is
+refused to the producer, and never accepted and then fails the instance). It is copied to buffers of its own, so a small slice
+of a large text or byte string does not keep the whole buffer alive while the delivery waits, which the limits do not count, and
+it is fully evaluated, all inside the guard: a value that throws when it is first looked at is a refused delivery and not an
+exception loose on the producer's thread. The reason of a `feedFail` is bounded (512 characters) and copied the same way.
+
+### What a script sees
+
+`api.subscribe(endpoint, callback)` subscribes a function to an endpoint and answers a handle; `api.unsubscribe(handle)`
+ends the subscription and answers whether it ended a live one (`false` for one that had ended already: unsubscribe settles
+once). A callback is handed the instance's `self` and a record `{source, sequence, tick, subscription, payload}`: `source`
+is the endpoint, `sequence` is the place admission gave the delivery among the instance's invocations, `tick` is the
+logical tick it was admitted at and `subscription` is the subscription's number. Subscribing is allowed in `init` and in
+any invocation of an instance that is taking subscriptions, and is refused, as a fault of the call and never a failure of the
+host, when the instance is stopping (a `shutdown` hook is past taking them), when the endpoint is not one the instance was
+granted, and when every place is held. The provider is asked nothing of a refused subscription. A provider that raises when
+it is handed one is a failure of the host, unconverted, and the subscription is taken back as though it had never been
+admitted.
+
+### Whose a subscription is, and where deliveries wait
+
+An instance owns its subscriptions, not the invocation that made them: they survive that invocation's end and every callback
+after it, until the instance unsubscribes them, an epoch changes, or the instance ends. This is the protocol model's
+*holder* (the same one the instance's requests use): the model's subscription records are owned by an identity the session
+issues for the instance, ended through the revocation a retiring task goes through.
+
+A producer's delivery takes a place in the instance's one bounded queue of invocations (`boundInvocationQueue`), shared with
+its events and its due update, as a *reference* to the subscription: the payload stays in the model's record for the
+subscription, and is taken as the callback's first segment is about to run. A delivery keeps its sequence, its logical tick
+and its place in the queue until then, whatever happens, paused included (D-26): a paused instance's deliveries are retained
+in order and run after the resume.
+
+* **Ordered events** take a place of their own and are refused, counted (`readingRefused`, `snapshotQueueFull`) and never
+  evicted when the queue has none. A provider whose event is authoritative surfaces the refusal with `feedFail`.
+* **Replaceable state** keeps at most one unstarted delivery per subscription. A later value replaces that delivery's payload
+  and tick *in place*, keeping its place in the queue and taking no further place; the value it replaced is counted as
+  coalesced and was never delivered. Filling an empty slot needs a place in the queue, as an ordered event does; replacing
+  needs none. "Unstarted" lasts through the callback's first segment, including the time after the owner selected the
+  delivery for its next invocation and before that segment runs; once the segment begins the payload is the callback's and
+  immutable, and a later value is a delivery of its own behind it.
+* A delivery to a subscription that has ended (unsubscribed, invalidated, or ended with its instance or its owner), or whose
+  instance is stopping, is refused and counted (`EventEnded`), never run, and on a logical owner never held for a tick the
+  instance will not reach. One accepted and not yet begun when its subscription ends is discarded, counted by
+  the model, and never run; an invocation already selected for it completes without entering Lua.
+
+### Logical event admission
+
+On an owner driven by logical time, provider events are admitted by application-assigned tick and sequence (D-36), as
+LUA-23 admits controls, and never in arrival order. A delivery with a place is held, in a store bounded by the grant
+(`grantStagingBound`, refused and counted as `EventStagingFull` past it) and keyed by its place (a place that is taken is
+`EventDuplicate`, a tick the owner has begun `EventLate`, and one with no place `EventUnassigned`). The owner asks to be held at
+the earliest tick it holds an event for, in the same transaction as the delivery, so the grant that reaches the tick is held
+until the owner has served it.
+
+At that boundary, after the controls the tick holds and before any task the tick woke, the owner admits the events due, in the
+order of their places, through the one function that applies the queue's bound and the endpoint's overload policy. That is
+where an ordered event is refused for want of a place, or replaceable state coalesces, so which input is accepted and which
+value a callback sees follow the logical sequence and not how fast the owner served; a value assigned to a later tick never
+replaces one that was visible at an earlier tick. An ordered event that is accepted for a tick and cannot be admitted at it
+(the queue is full) cannot be reported to the provider that is no longer waiting for an answer, so it is surfaced as the
+delivery failure it is, exactly as `feedFail` is, and is counted; a refused fill of replaceable state is counted and fails
+nothing, since only the newest value of a state matters.
+
+**The tick's claim.** A tick whose grant is applied is held, by the owner's one watch, for as long as any instance has a
+delivery of a subscription that is admitted and unfinished (waiting in its queue, selected for its next invocation, or being
+run by the invocation in flight) *and* can make progress in that tick: it is serving, and the invocation in flight is ready to
+run a segment (it yields and goes on, or it has just ended and the next is about to be given a place), or nothing is in flight
+and the next delivery waits its turn and something is ready to run. An instance whose work is suspended on a wait (a tick, a
+deadline, a request) cannot, and neither can one that is paused, stopping, ended or still initializing: the tick does not wait
+for it, and it claims the tick it is woken at, and later ones, as it becomes able, by the same rule. While any instance has such
+work the owner also asks to be held at the next tick, so every grant it applies is looked at before any task it woke is chosen.
+
+The claim is computed in one place from the instances' state as it is, and never from a flag set when a delivery was admitted,
+so no path that changes a delivery's state can leave a tick claimed that nothing needs, or unclaimed that something does:
+admission, selection for an invocation, a yield, a wait and the grant that resumes it, a coalesce, an unsubscribe, an epoch
+change, a pause and a resume, a stop, and a failure each change what that function reads. So the next tick's deliveries are not
+admitted while this tick's can still run, a callback that yields or waits for a tick waits for the same tick however the grants
+behind it were queued, several deliveries admitted at one tick each start at the tick their predecessor ended at, and queued
+grants give the same admissions and effects as grants served one at a time.
+
+### Epochs
+
+`advanceRequestEpoch` replaces the generation of an owner's records, and invalidates every subscription with them, as the
+model's `advanceEpoch` does: each subscription ends once, the events held for it and its unstarted deliveries are discarded
+and counted, and the providers are told by the owner at its next boundary. The accounting of their work is retained under the
+identities it was issued under, so a late delivery from an old producer finds nothing, cannot reach a subscription made in the
+new epoch (an identity carries its epoch and a generation that is never reissued, so the same local number does not give it
+somewhere new to land), and the places stay charged until the providers prove their retirements over. Instances are not
+invalidated: the same instance subscribes again. The instance's VM is not left holding what it captured for the subscriptions
+the engine ended: the owner has the driver let go of their callbacks and handles at its next boundary, without the script
+unsubscribing them (the driver's creation entry on a slot that is live is that cleanup point, and it asks the engine for the numbers that
+ended one at a time, so the answer fits any limits however many ended; an epoch wakes the owner once for an instance, however
+often it changes before the owner gets there), so repeated subscribe, epoch-change and retirement cycles do not grow the VM.
+
+### Retirement and the bound
+
+Outstanding provider work is a retained retirement obligation, the one the instance leases and the request service keep, and it
+is charged to the subscription's place in the owner's bound until the provider proves it over. A subscription that ended still
+holds its place while its provider's retirement is pending, so subscribing and unsubscribing over and over cannot reclaim
+capacity. An instance's settlement waits for the providers of its subscriptions, as it waits for a lease's retirement:
+nothing is reported as stopped merely because Lua stopped, and the owner's exit waits, uninterruptibly, through a stop and a
+cancellation, until each has said it is done.
+
+### The guard, and what a failure is
+
+Every call into provider code for a subscription goes through the one guard and is fully evaluated inside it: subscribing,
+withdrawing interest, reading a retirement and reading a delivery. Where failures arise together the first is raised and the
+others are kept whole as cleanup evidence; nothing is dropped.
+
+* Provider code raising when the engine calls it (handing it a subscription, telling it interest was withdrawn) is a failure of
+  application code: a failure of the host under the owner's `WorkerPolicy`, unconverted.
+* A provider's retirement that fails is a cleanup failure: retained on the work, never retried, fatal under every policy.
+* A provider that cannot preserve an authoritative event surfaces a delivery failure, which fails the instance (above).
+
+### Determinism
+
+On one logical owner, identical inputs give identical event admission order and recorded effects, however the producers'
+arrivals, the grants' pacing (queued or served one at a time) and the segment delays vary. The inputs are the events with their
+assigned ticks and places, and the grants.
+
+### What proves it
+
+`Test.LuaRuntime.Subscription.*`, in `lua-runtime-tests`, run real instances on real supervised scheduled owners with a fake
+provider the examples drive by hand, an injected clock and gates, never a sleep: a producer from other threads that never blocks
+and never calls Lua; ordered events and their refusal at capacity; replaceable state coalescing in place, at capacity, through
+the delivery the owner selected for its next invocation, and not once a callback has begun; unsubscribe and stop settling once,
+in either order; every way an instance can end revoking its subscriptions and its stop waiting for the provider; a subscription
+made in `init` surviving every callback after it; a paused instance retaining its deliveries; a refused subscribe; logical
+admission by assigned place under reversed and permuted arrivals, late, duplicate and unassigned places and a full store, the
+queue's overflow decided at the boundary, queued and individually served grants, and the tick not waiting on what cannot start;
+epochs, generations and the bound that churn cannot reclaim; a provider that raises, a retirement that fails and failures
+arising together; unfit and throwing deliveries; and every grant that is refused. The protocol model's holders of
+subscriptions are pinned in `lua-host-tests`. The cancellation and cleanup windows are the kind an asynchronous-exception race
+can hide on one platform, so CI, which runs them on Linux, is the evidence for them and a local pass is not.
 
 ## The protocol model
 
