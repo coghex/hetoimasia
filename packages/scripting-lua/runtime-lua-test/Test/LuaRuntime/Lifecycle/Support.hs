@@ -13,43 +13,47 @@ module Test.LuaRuntime.Lifecycle.Support
     lifeRegistration
   , commander
   , commanderFailing
+  , taskCaller
   , cmdSource
   , cmdConfig
     -- * Owners
   , lifeSpec
   , startTarget
   , startCaller
+  , startCallerWith
   , grantOver
   , bothPermits
   , target
   , admitCommander
     -- * Commanding
   , ask
-  , askAs
+  , tell
+  , notYetSupported
   , cmdLines
   , tidValue
+  , renderTid
   , awaitCmd
-  , expectLine
-  , Ids
+  , receiptResult
+  , reserveAll
+  , lineCount
   ) where
 
 import Control.Concurrent (yield)
 import Control.Exception (throwIO)
+import Control.Monad (replicateM)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Lifecycle
 import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Registration
-import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
+import Hetoimasia.Scripting.Lua.Runtime (CallFault (BoundaryFailed), LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value
 import Test.LuaRuntime.Instance.Support
+import qualified Data.Text.Encoding as Text
 import Test.LuaRuntime.Scheduled.Support (defaultSchedulerBounds)
 import Test.LuaRuntime.Support (requiredPolicy)
-
--- | What a test names owners and instances by.
-type Ids = IFixture
 
 -- | The registration of the instance examples, with the lifecycle bindings in @life@:
 -- registered once, and shared by every owner of an example whatever it is granted.
@@ -85,6 +89,7 @@ prelude =
   , "  end"
   , "  return '{' .. table.concat(out, ',') .. '}'"
   , "end"
+  , "local WAITED = {}"
   , "local function run(p)"
   , "  if p.op == 'result' or p.op == 'forget' then return life[p.op](p.n) end"
   , "  if p.op == 'owners' or p.op == 'self' then return life[p.op]() end"
@@ -92,6 +97,25 @@ prelude =
   , "  if p.op == 'pause_self' then return life.pause(life.self()) end"
   , "  if p.op == 'resume_self' then return life.resume(life.self()) end"
   , "  if p.op == 'stop_self' then return life.stop(life.self()) end"
+  , "  if p.op == 'pause_self_inspect' then"
+  , "    local r = life.pause(life.self())"
+  , "    local seen = life.inspect(life.self())"
+  , "    return fmt(r) .. ' ' .. seen.snapshot.status"
+  , "  end"
+  , "  if p.op == 'pause_self_wait' then"
+  , "    local r = life.pause(life.self())"
+  , "    " <> record <> "('cmd pause_self_wait ' .. fmt(r))"
+  , "    sched.wait_ticks(1)"
+  , "    " <> record <> "('post woke')"
+  , "    return WAITED"
+  , "  end"
+  , "  if p.op == 'stop_self_wait' then"
+  , "    local r = life.stop(life.self())"
+  , "    " <> record <> "('cmd stop_self_wait ' .. fmt(r))"
+  , "    sched.wait_ticks(1)"
+  , "    " <> record <> "('post woke')"
+  , "    return WAITED"
+  , "  end"
   , "  return life[p.op](p.tid)"
   , "end"
   ]
@@ -107,7 +131,7 @@ commander =
          , "  api.connect('cmd', function(self, event)"
          , "    local p = event.payload"
          , "    local r = run(p)"
-         , "    " <> record <> "('cmd ' .. p.op .. ' ' .. fmt(r))"
+         , "    if r ~= WAITED then " <> record <> "('cmd ' .. p.op .. ' ' .. fmt(r)) end"
          , "    " <> record <> "('post ' .. p.op)"
          , "  end)"
          , "end"
@@ -128,11 +152,26 @@ commanderFailing =
          , "end"
          ]
 
--- | The registration, the lifecycle policy and the grant, for an owner of this label.
-lifeSpec ∷ IFixture → Text → [ModuleSource] → InstanceConfig → Maybe LifecycleGrant → ScheduledSpec
-lifeSpec fixture label modules config grant =
+-- | Tasks that call the lifecycle bindings, for an owner whose scripts are not instances: a
+-- task has no instance to name, so what it holds is its owner's.
+taskCaller ∷ ModuleSource
+taskCaller =
+  ModuleSource
+    (ModuleRef "taskcaller" "1")
+    (Text.encodeUtf8 (Text.unlines (take 14 prelude <> body)))
+    [EntryPoint "who" Required [] [], EntryPoint "pause" Required [tidSchema'] [], EntryPoint "result" Required [SInteger] []]
+  where
+    body =
+      [ "function who() " <> record <> "('cmd who ' .. fmt(life.self())) end"
+      , "function pause(tid) " <> record <> "('cmd pause ' .. fmt(life.pause(tid))) end"
+      , "function result(n) " <> record <> "('cmd result ' .. fmt(life.result(n))) end"
+      ]
+
+-- | The given registration, the lifecycle policy and the grant, for an owner of this label.
+lifeSpec ∷ IFixture → Registration → Text → [ModuleSource] → InstanceConfig → Maybe LifecycleGrant → ScheduledSpec
+lifeSpec fixture given label modules config grant =
   base
-    { scheduledVm = (scheduledVm base) {vmRegistration = lifeRegistration fixture, vmPolicy = vmPolicy (scheduledVm base) <> ["life"]}
+    { scheduledVm = (scheduledVm base) {vmRegistration = given, vmPolicy = vmPolicy (scheduledVm base) <> ["life"]}
     , scheduledLifecycle = grant
     }
   where
@@ -141,12 +180,16 @@ lifeSpec fixture label modules config grant =
 -- | An owner of instances other owners' commanders are granted.
 startTarget ∷ IFixture → LuaRuntime → Text → [ModuleSource] → InstanceConfig → IO ScheduledOwner
 startTarget fixture runtime label modules config =
-  startWith fixture runtime (lifeSpec fixture label modules config Nothing)
+  startWith fixture runtime (lifeSpec fixture (lifeRegistration fixture) label modules config Nothing)
 
--- | An owner of commanders, granted this.
+-- | An owner of commanders and the task module, granted this.
 startCaller ∷ IFixture → LuaRuntime → Text → Maybe LifecycleGrant → IO ScheduledOwner
-startCaller fixture runtime label grant =
-  startWith fixture runtime (lifeSpec fixture label [commander, commanderFailing] cmdConfig grant)
+startCaller fixture runtime = startCallerWith fixture (lifeRegistration fixture) runtime
+
+-- | The same, from a registration built once and given to several owners.
+startCallerWith ∷ IFixture → Registration → LuaRuntime → Text → Maybe LifecycleGrant → IO ScheduledOwner
+startCallerWith fixture given runtime label grant =
+  startWith fixture runtime (lifeSpec fixture given label [commander, commanderFailing, taskCaller] cmdConfig grant)
 
 -- | A grant over this owner, permitting these things, assigning nothing.
 grantOver ∷ ScheduledOwner → [Permit] → GrantTarget
@@ -166,6 +209,27 @@ admitCommander fixture owner name = do
   _ ← admitWith fixture owner name (InstanceRequest (moduleNamed "commander") EventOnly (Just name) OrdinaryClass ["cmd"])
   awaitPhase fixture owner name Active
 
+-- | The numbers of a value a script holds, as the script's own rendering shows them.
+renderTid ∷ Value → Text
+renderTid = \case
+  VRecord [("runtime", VInteger runtime), ("owner", VInteger owner), ("id", VInteger local)] →
+    "{id=" <> Text.pack (show local) <> ",owner=" <> Text.pack (show owner) <> ",runtime=" <> Text.pack (show runtime) <> "}"
+  other → Text.pack (show other)
+
+-- | Read a receipt until it is no longer pending.
+receiptResult ∷ IFixture → ScheduledOwner → Text → Int → IO Text
+receiptResult fixture owner name number = do
+  answer ← ask fixture owner name "result" Nothing (Just number)
+  if answer == "pending" then yield >> receiptResult fixture owner name number else pure answer
+
+-- | Ask, this many times, that the instance be paused: every answer, in order.
+reserveAll ∷ IFixture → ScheduledOwner → Text → Value → Int → IO [Text]
+reserveAll fixture owner name tid count = replicateM count (ask fixture owner name "pause" (Just tid) Nothing)
+
+-- | How many lines the commanders have recorded that start with this.
+lineCount ∷ IFixture → Text → IO Int
+lineCount fixture prefix = length . filter (Text.isPrefixOf prefix) <$> logged fixture
+
 -- | The value a script holds for the instance admitted under this name.
 tidValue ∷ IFixture → Text → IO Value
 tidValue fixture name = instanceIdValue <$> idOf fixture name
@@ -180,16 +244,9 @@ awaitCmd fixture wanted = do
   seen ← length <$> cmdLines fixture
   if seen >= wanted then pure () else yield >> awaitCmd fixture wanted
 
--- | Tell the commander of this name to call this operation, naming the instance
--- admitted under another name in the fixture of the target, and answer what it recorded
--- for the call: the answer's text.
-ask ∷ IFixture → ScheduledOwner → Text → Text → Maybe Value → Maybe Int → IO Text
-ask fixture = askAs fixture fixture
-
--- | The same, where the instance named is of the other fixture.
-askAs ∷ IFixture → IFixture → ScheduledOwner → Text → Text → Maybe Value → Maybe Int → IO Text
-askAs fixture _ owner name op tid n = do
-  before ← length <$> cmdLines fixture
+-- | Tell the commander of this name to call this operation, without waiting for it.
+tell ∷ IFixture → ScheduledOwner → Text → Text → Maybe Value → Maybe Int → IO ()
+tell fixture owner name op tid n = do
   identity ← idOf fixture name
   let payload =
         VRecord $
@@ -199,12 +256,22 @@ askAs fixture _ owner name op tid n = do
   deliverEvent (scheduledEndpoint owner) identity "cmd" payload >>= \case
     DeliveryAccepted _ → pure ()
     other → throwIO (userError ("expected the command delivered, found " <> show other))
+
+-- | Tell the commander of this name to call this operation, naming this instance and
+-- this number when it takes them, and answer what it recorded for the call: the
+-- answer's text, as the script rendered it.
+ask ∷ IFixture → ScheduledOwner → Text → Text → Maybe Value → Maybe Int → IO Text
+ask fixture owner name op tid n = do
+  before ← length <$> cmdLines fixture
+  tell fixture owner name op tid n
   awaitCmd fixture (before + 1)
   line ← (!! before) <$> cmdLines fixture
   pure (Text.drop (Text.length ("cmd " <> op <> " ")) line)
 
--- | Fail unless the answer is this.
-expectLine ∷ Text → Text → IO ()
-expectLine wanted found
-  | wanted == found = pure ()
-  | otherwise = throwIO (userError ("expected " <> show wanted <> ", found " <> show found))
+-- | Whether an instance's settlement is its failure with a call refused as not yet supported.
+notYetSupported ∷ InstanceSettlement → Bool
+notYetSupported settlement = case failureOf' settlement of
+  Just failure → case failureError failure of
+    ErrorFault (BoundaryFailed fault) → boundaryReason fault == NotYetSupported LifecycleOperation
+    _ → False
+  Nothing → False

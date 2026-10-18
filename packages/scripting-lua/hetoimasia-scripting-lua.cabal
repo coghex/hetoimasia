@@ -386,6 +386,7 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Instance.Spec
         Test.LuaRuntime.Instance.Stop
         Test.LuaRuntime.Instance.Support
+        Test.LuaRuntime.Lifecycle.Authority
         Test.LuaRuntime.Lifecycle.Control
         Test.LuaRuntime.Lifecycle.Spec
         Test.LuaRuntime.Lifecycle.Support

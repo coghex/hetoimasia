@@ -12,7 +12,7 @@ module Test.Lua.Boundary.Finalizers (spec) where
 import Control.Exception (ExceptionWithContext, SomeException, tryWithContext)
 import Data.Text (Text)
 import Hetoimasia.Scripting.Lua.Owner
-import Hetoimasia.Scripting.Lua.Registration (BindingKind (LifecycleOperation))
+import Hetoimasia.Scripting.Lua.Registration (BindingKind (LifecycleOperation), lifecycleContext)
 import Hetoimasia.Scripting.Lua.Value
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 import Test.Lua.Boundary.Support
@@ -92,6 +92,20 @@ spec = describe "the finalizer allowlist" $ do
   it "keeps an allowlisted lifecycle binding from executing anything, under the settled decision" $ do
     fixture ← newFixture
     outcome ← closing fixture ["sample"] (guard' "sample.lifecycle_gc()")
+    case outcome of
+      Right () → expectationFailure "the unsupported call was dropped"
+      Left failure → case causeOf failure of
+        Just fault → boundaryReason fault `shouldBe` NotYetSupported LifecycleOperation
+        Nothing → expectationFailure ("not a boundary fault: " <> show failure)
+    logged fixture >>= (`shouldBe` [])
+
+  it "keeps an allowlisted lifecycle binding from executing even for an owner configured to deliver lifecycle operations" $ do
+    fixture ← newFixture
+    outcome ←
+      tryWithContext @SomeException $
+        withOwnerOf
+          (sampleConfig fixture ["sample"]) {vmInitialChunks = [(chunkName "guard", chunk (guard' "sample.lifecycle_gc()"))], vmLifecycle = Just (lifecycleContext ())}
+          (\_ → pure ())
     case outcome of
       Right () → expectationFailure "the unsupported call was dropped"
       Left failure → case causeOf failure of
