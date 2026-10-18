@@ -78,9 +78,10 @@ driverSource sources =
         , entry "release" [SInteger]
         , entry "init" [SInteger]
         , -- The one entry point both a one-shot's @run@ and a periodic @update@ go
-          -- through: the instance's number, and the delta an update is handed, or a
-          -- negative one for a @run@, which is handed the instance's api instead.
-          entry "run" [SInteger, SInteger]
+          -- through: the instance's number, and the delta in seconds an update is
+          -- handed, or a negative one for a @run@, which is handed the instance's api
+          -- instead.
+          entry "run" [SInteger, SFloat]
         , entry "shutdown" [SInteger, SText]
         ]
           <> [ entry (eventEntry (sourceName source)) [SInteger, eventSchema source]

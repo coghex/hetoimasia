@@ -197,11 +197,14 @@ data TaskInfo = TaskInfo
   }
 
 -- | A logical cadence an owner registered: the tick it is next due at, the logical
--- duration granted since its accrual began, and the grant it holds while its point
--- is being served.
+-- duration granted since its accrual began, whether it is accruing, and the grant it
+-- holds while its point is being served.
 data LogicalCadence = LogicalCadence
   { lcTarget ∷ !(Maybe Word64)
   , lcAccrued ∷ !Duration
+  , lcAccruing ∷ !Bool
+    -- ^ Whether the grants applied are added to what it has accrued: not while the
+    -- owner has disarmed it.
   , lcHold ∷ !(Maybe GrantId)
   }
 
@@ -887,7 +890,10 @@ wake identity earned cause state = case Map.lookup identity (ssInfo state) of
 advanceCadences ∷ Grant → GrantId → Word64 → SchedState v → SchedState v
 advanceCadences grant held tick state = foldl' one state (Map.toAscList (ssCadenceLogical state))
   where
-    one current (key, cadence) = case addDurations (lcAccrued cadence) (grantDuration grant) of
+    one current (key, cadence)
+      | not (lcAccruing cadence) = current
+      | otherwise = accruing current key cadence
+    accruing current key cadence = case addDurations (lcAccrued cadence) (grantDuration grant) of
       Left _ → reach current key cadence {lcTarget = Nothing} (FiredFault CadenceAccrualOverflow)
       Right accrued → case lcTarget cadence of
         Just target | tick >= target → reach current key cadence {lcAccrued = accrued, lcTarget = Nothing} (FiredLogical tick)
@@ -917,7 +923,7 @@ reachElapsedCadences now state = foldl' reach state due
 cadenceStartLogical ∷ CadenceKey → Word64 → SchedState v → Maybe (SchedState v)
 cadenceStartLogical key target state
   | registered key state = Nothing
-  | otherwise = Just state {ssCadenceLogical = Map.insert key (LogicalCadence (Just target) zeroDuration Nothing) (ssCadenceLogical state)}
+  | otherwise = Just state {ssCadenceLogical = Map.insert key (LogicalCadence (Just target) zeroDuration True Nothing) (ssCadenceLogical state)}
 
 -- | Register an elapsed cadence due at a deadline. Refused for a key already registered.
 cadenceStartElapsed ∷ CadenceKey → Instant → SchedState v → Maybe (SchedState v)
@@ -928,19 +934,21 @@ cadenceStartElapsed key deadline state
 registered ∷ CadenceKey → SchedState v → Bool
 registered key state = Map.member key (ssCadenceLogical state) || Map.member key (ssCadenceElapsed state)
 
--- | Arm a registered logical cadence for a tick, keeping what it has accrued.
+-- | Arm a registered logical cadence for a tick, keeping what it has accrued, and
+-- accruing again from the grants applied after this.
 cadenceArmLogical ∷ CadenceKey → Word64 → SchedState v → SchedState v
-cadenceArmLogical key target state = state {ssCadenceLogical = Map.adjust (\cadence → cadence {lcTarget = Just target}) key (ssCadenceLogical state)}
+cadenceArmLogical key target state = state {ssCadenceLogical = Map.adjust (\cadence → cadence {lcTarget = Just target, lcAccruing = True}) key (ssCadenceLogical state)}
 
 -- | Arm a registered elapsed cadence for a deadline.
 cadenceArmElapsed ∷ CadenceKey → Instant → SchedState v → SchedState v
 cadenceArmElapsed key deadline state = state {ssCadenceElapsed = Map.adjust (const (ElapsedCadence (Just deadline))) key (ssCadenceElapsed state)}
 
--- | Disarm a cadence: it is due at nothing, and keeps what it has accrued.
+-- | Disarm a cadence: it is due at nothing, and keeps what it has accrued. A logical
+-- one accrues nothing from the grants applied until it is armed again.
 cadenceDisarm ∷ CadenceKey → SchedState v → SchedState v
 cadenceDisarm key state =
   state
-    { ssCadenceLogical = Map.adjust (\cadence → cadence {lcTarget = Nothing}) key (ssCadenceLogical state)
+    { ssCadenceLogical = Map.adjust (\cadence → cadence {lcTarget = Nothing, lcAccruing = False}) key (ssCadenceLogical state)
     , ssCadenceElapsed = Map.adjust (const (ElapsedCadence Nothing)) key (ssCadenceElapsed state)
     }
 

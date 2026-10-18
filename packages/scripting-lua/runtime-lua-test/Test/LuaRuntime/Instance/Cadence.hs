@@ -37,10 +37,11 @@ ticker ∷ ModuleSource
 ticker =
   hooksModule
     "ticker"
-    [ "function init(self, api)"
+    [ "local function ns(x) return math.floor(x * 1e9 + 0.5) end"
+    , "function init(self, api)"
     , "  api.connect('tick', function(self, event) " <> record <> "('event ' .. event.payload.n) end)"
     , "end"
-    , "function update(self, dt) " <> record <> "('update ' .. dt) end"
+    , "function update(self, dt) " <> record <> "('update ' .. ns(dt)) end"
     , "function shutdown(self, reason) " <> record <> "('shutdown ' .. reason) end"
     ]
 
@@ -51,11 +52,12 @@ longUpdate ∷ ModuleSource
 longUpdate =
   hooksModule
     "longupdate"
-    [ "function update(self, dt)"
-    , "  " <> record <> "('update ' .. dt .. ' begin')"
+    [ "local function ns(x) return math.floor(x * 1e9 + 0.5) end"
+    , "function update(self, dt)"
+    , "  " <> record <> "('update ' .. ns(dt) .. ' begin')"
     , "  sched.wait_ticks(5)"
     , "  local kind, tick, granted = fx.resume()"
-    , "  " <> record <> "('update ' .. dt .. ' end tick=' .. tick .. ' waited=' .. granted)"
+    , "  " <> record <> "('update ' .. ns(dt) .. ' end tick=' .. tick .. ' waited=' .. granted)"
     , "end"
     ]
 
@@ -64,13 +66,14 @@ pacedUpdate ∷ ModuleSource
 pacedUpdate =
   hooksModule
     "pacedupdate"
-    [ "function update(self, dt)"
+    [ "local function ns(x) return math.floor(x * 1e9 + 0.5) end"
+    , "function update(self, dt)"
     , "  fx.delay()"
-    , "  " <> record <> "('update ' .. dt .. ' begin')"
+    , "  " <> record <> "('update ' .. ns(dt) .. ' begin')"
     , "  sched.wait_ticks(5)"
     , "  fx.delay()"
     , "  local kind, tick, granted = fx.resume()"
-    , "  " <> record <> "('update ' .. dt .. ' end tick=' .. tick .. ' waited=' .. granted)"
+    , "  " <> record <> "('update ' .. ns(dt) .. ' end tick=' .. tick .. ' waited=' .. granted)"
     , "end"
     ]
 
@@ -79,7 +82,8 @@ callbackWaiter ∷ ModuleSource
 callbackWaiter =
   hooksModule
     "callbackwaiter"
-    [ "function init(self, api)"
+    [ "local function ns(x) return math.floor(x * 1e9 + 0.5) end"
+    , "function init(self, api)"
     , "  api.connect('tick', function(self, event)"
     , "    " <> record <> "('callback ' .. event.payload.n .. ' begin')"
     , "    sched.wait_ticks(5)"
@@ -87,7 +91,7 @@ callbackWaiter =
     , "    " <> record <> "('callback ' .. event.payload.n .. ' end tick=' .. tick .. ' waited=' .. granted)"
     , "  end)"
     , "end"
-    , "function update(self, dt) " <> record <> "('update ' .. dt) end"
+    , "function update(self, dt) " <> record <> "('update ' .. ns(dt)) end"
     ]
 
 -- | An event callback that waits one tick, and an update.
@@ -95,14 +99,15 @@ slowTicker ∷ ModuleSource
 slowTicker =
   hooksModule
     "slowticker"
-    [ "function init(self, api)"
+    [ "local function ns(x) return math.floor(x * 1e9 + 0.5) end"
+    , "function init(self, api)"
     , "  api.connect('tick', function(self, event)"
     , "    " <> record <> "('callback ' .. event.payload.n .. ' begin')"
     , "    sched.wait_ticks(1)"
     , "    " <> record <> "('callback ' .. event.payload.n .. ' end')"
     , "  end)"
     , "end"
-    , "function update(self, dt) " <> record <> "('update ' .. dt) end"
+    , "function update(self, dt) " <> record <> "('update ' .. ns(dt)) end"
     ]
 
 -- | A callback that waits two ticks and then holds the owner at a gate, so that what an
@@ -127,14 +132,25 @@ gatedTicker ∷ ModuleSource
 gatedTicker =
   hooksModule
     "gatedticker"
-    [ "function init(self, api)"
+    [ "local function ns(x) return math.floor(x * 1e9 + 0.5) end"
+    , "function init(self, api)"
     , "  api.connect('tick', function(self, event)"
     , "    " <> record <> "('event ' .. event.payload.n .. ' begin')"
     , "    if event.payload.n == 1 then fx.block('gate') end"
     , "    " <> record <> "('event ' .. event.payload.n .. ' end')"
     , "  end)"
     , "end"
-    , "function update(self, dt) " <> record <> "('update ' .. dt) end"
+    , "function update(self, dt) " <> record <> "('update ' .. ns(dt)) end"
+    ]
+
+-- | An update that reports what Lua is handed: the type of @dt@, and @dt@ itself.
+floatTicker ∷ ModuleSource
+floatTicker =
+  hooksModule
+    "floatticker"
+    [ "function update(self, dt)"
+    , "  " <> record <> "(math.type(dt) .. ' ' .. dt .. ' ' .. tostring(dt == 1e-9))"
+    , "end"
     ]
 
 -- | No update at all.
@@ -467,12 +483,50 @@ pauseSpec = describe "pausing" $ do
       grantEach control owner [1, 1, 1, 1]
       logged fixture >>= (`shouldBe` [])
       settleControl fixture owner "ticker" InstanceResume >>= (`shouldBe` ControlApplied)
-      -- Resumed at tick 5: the first update is at tick 7, not 6; every tick granted is
-      -- accounted, the paused ones included.
+      -- Resumed at tick 5: the first update is at tick 7, not 6. Its dt counts the tick
+      -- before the pause and the two after the resume, once each, and not the four granted
+      -- while it was paused.
       grantEach control owner [1]
       logged fixture >>= (`shouldBe` [])
       grantEach control owner [1]
-      logged fixture >>= (`shouldBe` ["update 7"])
+      logged fixture >>= (`shouldBe` ["update 3"])
+  it "hands a resumed instance about one interval of dt: the duration granted while it was intentionally paused is left out, and the ticks before the pause and after the resume are each counted once" $ bounded $
+    withOwner [ticker] (testConfig instanceBounds') $ \fixture control owner → do
+      _ ← periodic fixture owner "ticker" (LogicalTicks 3)
+      awaitPhase fixture owner "ticker" Active
+      grantEach control owner [10, 20]
+      settleControl fixture owner "ticker" InstancePause >>= (`shouldBe` ControlApplied)
+      -- Four ticks granted while paused, of very different sizes.
+      grantEach control owner [100, 200, 300, 400]
+      settleControl fixture owner "ticker" InstanceResume >>= (`shouldBe` ControlApplied)
+      -- The first update newly due is three ticks after the resume, at tick 9: the 30
+      -- granted before the pause and the 1, 2 and 4 after the resume.
+      grantEach control owner [1, 2]
+      logged fixture >>= (`shouldBe` [])
+      grantEach control owner [4]
+      logged fixture >>= (`shouldBe` ["update 37"])
+  it "counts the ticks that pass while an invocation is active and the instance is not paused" $ bounded $
+    withOwner [longUpdate] (testConfig instanceBounds') $ \fixture control owner → do
+      _ ← admitWith fixture owner "longupdate" (InstanceRequest (moduleNamed "longupdate") (Periodic (LogicalTicks 2)) (Just "u") OrdinaryClass [])
+      awaitPhase fixture owner "longupdate" Active
+      grantEach control owner [1, 1]
+      awaitWaits owner 1
+      -- The update waits through five granted ticks: all of them are the instance's, and
+      -- the wait's own is the five told to the granted binding.
+      grantEach control owner [1, 1, 1, 1, 1]
+      logged fixture >>= (`shouldBe` ["update 2 begin", "update 2 end tick=7 waited=5"])
+  it "hands dt to Lua as a float number of seconds, the exact duration converted once, for a logical interval" $ bounded $
+    withOwner [floatTicker] (testConfig instanceBounds') $ \fixture control owner → do
+      _ ← periodic fixture owner "floatticker" (LogicalTicks 2)
+      awaitPhase fixture owner "floatticker" Active
+      grantEach control owner [250000000, 250000000]
+      logged fixture >>= (`shouldBe` ["float 0.5 false"])
+  it "hands one nanosecond as the float nearest 1e-9: converted once, from the exact count" $ bounded $
+    withOwner [floatTicker] (testConfig instanceBounds') $ \fixture control owner → do
+      _ ← periodic fixture owner "floatticker" (LogicalTicks 1)
+      awaitPhase fixture owner "floatticker" Active
+      grantEach control owner [1]
+      logged fixture >>= (`shouldBe` ["float 1e-09 true"])
   it "lets the tick complete when a due update is paused before it starts, retains it, and runs it after the resume" $ bounded $
     withGatedOwner [ticker, gatedWaiter] (testConfig instanceBounds') $ \fixture control owner → do
       _ ← periodic fixture owner "ticker" (LogicalTicks 2)
@@ -555,17 +609,6 @@ arithmeticSpec = describe "the cadence's arithmetic" $ do
         `shouldSatisfy` maybe False (\(stage, message) → stage == StageUpdate && "cadence" `Text.isInfixOf` message)
       -- Ticks go on completing.
       grantEach control owner [1, 1]
-  it "fails the instance when the duration an update would be handed is more nanoseconds than an integer holds, and the tick does not wait on it" $ bounded $
-    withOwner [ticker] (testConfig instanceBounds') $ \fixture control owner → do
-      _ ← periodic fixture owner "ticker" (LogicalTicks 3)
-      awaitPhase fixture owner "ticker" Active
-      grantEach control owner [9223372036854775808, 1, 1]
-      settled ← awaitSettled fixture "ticker"
-      resultPhase settled `shouldBe` Failed
-      fmap failureStage (failureOf' settled) `shouldBe` Just StageUpdate
-      -- Its update never ran; only its shutdown did, told why.
-      logged fixture >>= (`shouldBe` ["shutdown failed"])
-      grantEach control owner [1]
 
 -- Determinism -----------------------------------------------------------------------
 

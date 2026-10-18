@@ -27,10 +27,11 @@ uiTicker ∷ ModuleSource
 uiTicker =
   hooksModule
     "uiticker"
-    [ "function init(self, api)"
+    [ "local function ns(x) return math.floor(x * 1e9 + 0.5) end"
+    , "function init(self, api)"
     , "  api.connect('tick', function(self, event) " <> record <> "('event ' .. event.payload.n) end)"
     , "end"
-    , "function update(self, dt) " <> record <> "('update ' .. dt) end"
+    , "function update(self, dt) " <> record <> "('update ' .. ns(dt)) end"
     , "function shutdown(self, reason) " <> record <> "('shutdown ' .. reason) end"
     ]
 
@@ -39,14 +40,23 @@ uiWaiter ∷ ModuleSource
 uiWaiter =
   hooksModule
     "uiwaiter"
-    [ "function init(self, api)"
+    [ "local function ns(x) return math.floor(x * 1e9 + 0.5) end"
+    , "function init(self, api)"
     , "  api.connect('tick', function(self, event)"
     , "    " <> record <> "('callback ' .. event.payload.n .. ' begin')"
     , "    sched.wait_ticks(1)"
     , "    " <> record <> "('callback ' .. event.payload.n .. ' end')"
     , "  end)"
     , "end"
-    , "function update(self, dt) " <> record <> "('update ' .. dt) end"
+    , "function update(self, dt) " <> record <> "('update ' .. ns(dt)) end"
+    ]
+
+-- | An update that reports the type and the value of the @dt@ Lua is handed.
+floatReporter ∷ ModuleSource
+floatReporter =
+  hooksModule
+    "floatreporter"
+    [ "function update(self, dt) " <> record <> "(math.type(dt) .. ' ' .. dt) end"
     ]
 
 -- | An ordinary elapsed waiter: a one-shot whose @run@ waits nine milliseconds.
@@ -170,6 +180,18 @@ spec = describe "elapsed cadence" $ do
         void (awaitTicksComplete control owner)
         awaitEffect (sf fixture) "callback 2 begin"
         logged fixture >>= (`shouldBe` ["callback 1 begin", "callback 1 end", "update 1950", "callback 2 begin"])
+  describe "its dt for Lua" $ do
+    it "is a float number of seconds, the exact elapsed duration converted once" $ bounded $
+      withOwner [floatReporter] $ \fixture _ owner → do
+        setClock (sf fixture) 1000
+        _ ← elapsed fixture owner "floatreporter" 100
+        awaitPhase fixture owner "floatreporter" Active
+        awaitRegistrations (sf fixture) 1
+        -- A second and a half after init, on a cadence of a hundred nanoseconds.
+        setClock (sf fixture) 1500001000
+        fireLive fixture
+        awaitEffect (sf fixture) "float 1.5"
+        logged fixture >>= (`shouldBe` ["float 1.5"])
   describe "the owner's one timer" $ do
     it "is shared by instances and an ordinary waiter: pausing or stopping the earliest preserves the rest and recomputes the earliest deadline, and a stale wake revives nothing" $ bounded $
       withOwner [uiTicker, sleeper] $ \fixture _ owner → do

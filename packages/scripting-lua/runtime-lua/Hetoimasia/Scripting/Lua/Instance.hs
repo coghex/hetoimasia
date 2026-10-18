@@ -40,7 +40,7 @@
 --   instance was granted: @api.connect(source, callback)@ connects a function to an
 --   event source ('instanceGrants'), and is a script error for any other source.
 -- * @update(self, dt)@ runs when a periodic instance's interval makes one due (see
---   "Cadence" below), handed @dt@ as an integer number of nanoseconds. An instance
+--   "Cadence" below), handed @dt@ as a float number of seconds. An instance
 --   admitted without an interval never has one. It may wait and yield, as @run@ and the
 --   callbacks may.
 -- * @run(self, api)@ is a one-shot's body ('RunOnce'). It runs to completion after
@@ -128,9 +128,13 @@
 -- never has more than one unstarted update.
 --
 -- The update's @dt@ is the logical duration granted since the previous update
--- finished (since @init@ succeeded, for the first), as nanoseconds, from grants alone.
--- It is fixed as the update begins and is unchanged by its own waits, by later grants and
--- by real delays. What an invocation's wait was granted is told to the application on
+-- finished (since @init@ succeeded, for the first), less any granted while the instance
+-- was intentionally paused, from grants alone (D-35). Ticks that pass while an invocation
+-- is active and the instance is not paused still count, so every tick granted while the
+-- instance is live is accounted to it once. It reaches Lua as a float number of seconds:
+-- the exact 'Duration' is converted once at the boundary, which is the only rounding. It
+-- is fixed as the update begins and is unchanged by its own waits, by later grants and by
+-- real delays. What an invocation's wait was granted is told to the application on
 -- the owner's thread ('Hetoimasia.Scripting.Lua.Scheduled.scheduledObserve'); a resumed
 -- coroutine receives no value, so a script learns it only through a binding the
 -- application grants. That duration overlaps the next update's @dt@ and is no further
@@ -158,9 +162,9 @@
 -- An update already due or admitted and not begun is retained, in its place in the
 -- queue, and holds no tick. After a resume the first update newly due is one full
 -- interval later: that many ticks after the tick the resume was applied at, or that much
--- time after the instant it was, with an elapsed instance's baseline rebased to that
--- instant so its @dt@ excludes the pause. A logical instance's @dt@ still counts every
--- tick granted, the paused ones included.
+-- time after the instant it was. An elapsed instance's baseline is rebased to that
+-- instant, and a logical instance accrues nothing toward its @dt@ from the grants
+-- applied while it is paused, so either @dt@ excludes the pause.
 --
 -- __Queue.__ A due update takes its place in the instance's one queue when it falls
 -- due: behind the events accepted before it, ahead of those accepted after it, so a
@@ -171,9 +175,8 @@
 -- update, counted with the other unstarted invocations, and lets go of any tick it held.
 --
 -- __Arithmetic.__ Accrued durations, ticks and deadlines are checked: one that is not
--- representable, or a @dt@ of more nanoseconds than an integer holds, fails the instance
--- ('ErrorCadence', at 'StageUpdate'), without wrapping, and leaves no demand and no tick
--- held.
+-- representable fails the instance ('ErrorCadence', at 'StageUpdate'), without wrapping,
+-- and leaves no demand and no tick held.
 --
 -- = Failure
 --

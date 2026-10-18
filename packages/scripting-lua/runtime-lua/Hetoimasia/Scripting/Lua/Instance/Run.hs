@@ -71,7 +71,6 @@ import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Sequence (ViewL (EmptyL, (:<)), viewl, (<|))
 import qualified Data.Set as Set
 import Data.Text (Text)
-import Data.Int (Int64)
 import Data.Word (Word64)
 import Hetoimasia.Scripting.Lua.Instance.State
 import Hetoimasia.Scripting.Lua.Instance.Types
@@ -154,7 +153,7 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , schedulerClosed
   , taskPhase
   )
-import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VRecord, VText))
+import Hetoimasia.Scripting.Lua.Value (Value (VFloat, VInteger, VRecord, VText))
 import Hetoimasia.Scripting.Lua.Instance.Driver (eventEntry)
 
 -- | Whether the owner may still enter Lua for its instances.
@@ -715,7 +714,7 @@ instanceSegment ih run number starting = do
           handles ← readIORef (ihHandles ih)
           case Map.lookup (icModule cell) handles of
             Nothing → pure (Left (ErrorFault (ModuleNotLoaded (icModule cell))))
-            Just handle → begin $ withRunning ih number (startTaskVia (ownedHost (ihOwned ih)) (ihDriver ih) "run" handle "run" [slot, VInteger (-1)])
+            Just handle → begin $ withRunning ih number (startTaskVia (ownedHost (ihOwned ih)) (ihDriver ih) "run" handle "run" [slot, VFloat (-1)])
         Just InvokeUpdate → do
           handles ← readIORef (ihHandles ih)
           case Map.lookup (icModule cell) handles of
@@ -725,7 +724,7 @@ instanceSegment ih run number starting = do
               -- or is delayed by changes it.
               updateDelta ih cell >>= \case
                 Left why → pure (Left (ErrorCadence why))
-                Right nanoseconds → begin $ withRunning ih number (startTaskVia (ownedHost (ihOwned ih)) (ihDriver ih) "run" handle "update" [slot, VInteger nanoseconds])
+                Right seconds → begin $ withRunning ih number (startTaskVia (ownedHost (ihOwned ih)) (ihDriver ih) "run" handle "update" [slot, VFloat seconds])
         Nothing → do
           held ← Map.lookup (runTask run) <$> readIORef (ihTasks ih)
           case held of
@@ -873,11 +872,13 @@ resumeCadence ih cell = case icCadence cell of
         pure Nothing
   Nothing → pure Nothing
 
--- | The @dt@ an update begins with, in nanoseconds: for a logical interval the
--- duration granted since the previous update finished (since @init@ succeeded, for the
--- first), and for an elapsed one the time between update starts (from @init@, rebased
--- at a resume). Fixed as the update begins.
-updateDelta ∷ InstanceHost → ICell → IO (Either Text Int64)
+-- | The @dt@ an update begins with, in seconds: for a logical interval the duration
+-- granted since the previous update finished (since @init@ succeeded, for the first)
+-- less what was granted while the instance was intentionally paused, and for an
+-- elapsed one the time between update starts (from @init@, rebased at a resume). The
+-- exact duration is converted once, here, which is the only rounding. Fixed as the
+-- update begins.
+updateDelta ∷ InstanceHost → ICell → IO (Either Text Double)
 updateDelta ih cell = case icCadence cell of
   Just (CadenceTicks _) →
     maybe (Left "the instance's logical accrual is gone") fits <$> atomically (cadenceAccrued (scheduler' ih) (cadenceKey cell))
@@ -891,9 +892,12 @@ updateDelta ih cell = case icCadence cell of
     pure (fits sampled)
   Nothing → pure (Left "the instance has no interval")
   where
-    fits duration
-      | durationNanoseconds duration > fromIntegral (maxBound ∷ Int64) = Left "the dt is more nanoseconds than an integer holds"
-      | otherwise = Right (fromIntegral (durationNanoseconds duration))
+    fits duration = Right (secondsOf duration)
+
+-- | A duration as a number of seconds, correctly rounded once from its exact count of
+-- nanoseconds.
+secondsOf ∷ Duration → Double
+secondsOf duration = fromRational (toRational (durationNanoseconds duration) / 1000000000)
 
 -- | The first point on a cadence, from this deadline and interval, that is strictly
 -- after this reading: ordinary lateness moves the next deadline here, with no burst of
