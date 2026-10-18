@@ -7,8 +7,15 @@
 -- replaces none of them. The sweep crosses what ended the owner first (a failure of the
 -- host, a failure of a script that its escalation made the owner's, a stop, a
 -- cancellation) with what happens to the teardown afterwards (a suspended coroutine whose
--- close is interrupted, a hook cut short as a cancellation is, nothing but an idle peer
--- to discard), and holds the instances, the exit record and supervision to one cause.
+-- close is interrupted, a hook that a cancellation cuts short, or that the cancellation
+-- that ended the owner skips, nothing but an idle peer to discard), and holds the
+-- instances, the exit record and supervision to one cause.
+--
+-- A cancellation ends the owner first only if it is delivered before the owner reaches its
+-- orderly stop check: a cancel request is also a stop request, recorded at once, and the
+-- cancellation itself is raised in the owner's thread later, by a helper thread, so an
+-- owner that gets to its stop check first exits in order as a stop. The cells that cancel
+-- therefore hold the owner where the cancellation can reach it, see 'holdForCancellation'.
 module Test.LuaRuntime.Instance.ExitKind (spec) where
 
 import Control.Concurrent.STM (atomically)
@@ -22,7 +29,7 @@ import Hetoimasia.Scripting.Lua.Owner (ModuleSource)
 import Hetoimasia.Scripting.Lua.Scheduled
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
-import Test.LuaRuntime.Scheduled.Support (SFixture (sfObserver), awaitScheduledTerminal)
+import Test.LuaRuntime.Scheduled.Support (SFixture (sfObserver), awaitEntered, awaitScheduledTerminal, blockOn)
 import Test.LuaRuntime.Support (Broken (Broken), bounded, brokenIs, requiredPolicy, withBoundary)
 
 -- | What ends the owner first.
@@ -121,6 +128,22 @@ failHookHost =
     , "function shutdown(self, reason) fx.fail('shutdown host') end"
     ]
 
+-- | Hold the owner where a cancellation reaches it, and where it cannot go on: the
+-- application's observer, which runs on the owner's thread before every segment, waits at a
+-- gate that nothing opens, as the first event delivered to the idle peer @p@ makes the owner
+-- start a segment. The owner's thread is then blocked in Haskell, which a cancellation
+-- interrupts, and the cancellation is the only way out of it, so it lands before the owner
+-- can reach its stop check, however late the helper that delivers it is.
+--
+-- A hold inside a Lua call would not do: a callback blocked at a gate is a safe foreign call,
+-- which no cancellation reaches, and the delivery does not complete until it returns, so
+-- releasing the hold after the request would leave the order of the two to the scheduler.
+holdForCancellation ∷ IFixture → ScheduledOwner → IO ()
+holdForCancellation fixture owner = do
+  writeIORef (sfObserver (sf fixture)) (\_ → blockOn (sf fixture) "hold")
+  expectDelivered fixture owner "p" 0
+  awaitEntered (sf fixture) "hold"
+
 cell ∷ Cause → Later → IO ()
 cell cause later = do
   fixture ← newIFixture
@@ -128,20 +151,21 @@ cell cause later = do
   let config = (testConfig instanceBounds') {instanceEscalate = \_ → pure (if cause == CauseLua then Escalate else Isolate)}
       laterModule = case later of
         LaterClose → [("k", closeKilled, "closekilled")]
+        -- Retained to the end: a cancellation that ended the owner leaves its @shutdown@
+        -- hook, which would fail the host, unrun; a stop that its own teardown cancels
+        -- cuts that hook short.
         LaterKill → [("k", killShutdown, "killshutdown")]
         LaterDiscard → []
       trigger = case cause of
         CauseHost → [("t", hostFailing, "hostfailing")]
         CauseLua → [("t", failCallback, "failcallback")]
-        -- Cancelled while the owner is inside a segment, held at a gate: where a cancellation
-        -- lands is then not left to when it is delivered.
-        CauseCancel → [("holder", holder, "holder")]
+        CauseCancel → []
         CauseStop → []
       members = laterModule <> [("p", echoer, "echoer")] <> trigger
   ended ← tryWithContext @SomeException . withBoundary $ \control runtime → do
     owner ← startInstances fixture runtime "exit" [source | (_, source, _) ← members] config requiredPolicy
-    forM_ [member | member@(name, _, _) ← members, name /= "holder"] $ \(name, _, identity) → void (admit fixture owner name (moduleNamed identity))
-    forM_ [name | (name, _, _) ← members, name /= "holder"] $ \name → awaitPhase fixture owner name Active
+    forM_ members $ \(name, _, identity) → void (admit fixture owner name (moduleNamed identity))
+    forM_ [name | (name, _, _) ← members] $ \name → awaitPhase fixture owner name Active
     -- A suspended coroutine whose close the teardown will interrupt.
     when (later == LaterClose) $ do
       expectDelivered fixture owner "k" 1
@@ -150,7 +174,7 @@ cell cause later = do
       CauseHost → expectDelivered fixture owner "t" 1
       CauseLua → expectDelivered fixture owner "t" 1
       CauseStop → retireScheduled owner
-      CauseCancel → holdOwner fixture owner >> cancelScheduled owner >> releaseOwner fixture
+      CauseCancel → holdForCancellation fixture owner >> cancelScheduled owner
     -- A failing owner ends the boundary the example runs in, so the record is read after it.
     writeIORef exitRecord (Just owner)
     void (awaitScheduledTerminal control owner)
