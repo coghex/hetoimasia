@@ -72,7 +72,7 @@ import Data.Either (isLeft)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, isJust)
+import Data.Maybe (catMaybes, fromMaybe, isJust)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -112,13 +112,14 @@ import Hetoimasia.Scripting.Lua.Runtime.Types
   )
 import Hetoimasia.Scripting.Lua.Instance.Driver (driverRef)
 import Hetoimasia.Scripting.Lua.Instance.Run
-  ( ExitMode (Orderly, Unorderly)
+  ( ExitMode (Unorderly)
   , InstanceHost (ihMode)
   , awaitInstanceWork
   , instanceClosed
   , instanceSegment
   , newInstanceHost
   , retireInstances
+  , recordExit
   , serviceBoundary
   , serviceInstances
   , settleEnded
@@ -202,7 +203,7 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
               -- no hook runs for any instance after it, and what the close had done is
               -- still counted.
               forM_ instances $ \ih → do
-                when interrupted (writeIORef (ihMode ih) (Unorderly ExitCancelled))
+                when interrupted (recordExit ih (Just ExitCancelled))
                 instanceClosed ih task began
               either throwIO pure closed
           }
@@ -224,20 +225,22 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
   atomically (writeTVar (controlClosing control) True)
   -- Whether Lua may be entered for an instance again: only after an orderly stop.
   heldInstances ← readIORef instanceRef
-  forM_ heldInstances $ \ih →
-    writeIORef (ihMode ih) $ case served of
-      Left failure → Unorderly (exitOf failure)
-      Right True → Unorderly ExitFailed
-      Right False → Orderly
-  atomically . settleAll control $ case served of
-    Left failure → exitOf failure
-    Right True → ExitFailed
-    Right False → ExitStopped
+  let cause = case served of
+        Left failure → Just (exitOf failure)
+        Right True → Just ExitFailed
+        Right False → Nothing
+  forM_ heldInstances (`recordExit` cause)
+  -- The owner's exit record says how it exited, and it is what the instances left are
+  -- discarded as: both read the first way recorded, never one apart from the other.
+  firstExit ← traverse (readIORef . ihMode) heldInstances
+  atomically . settleAll control $ case firstExit of
+    Just (Unorderly kind) → kind
+    _ → fromMaybe ExitStopped cause
   stopped ← tryWithContext @SomeException (stopScheduler scheduler host)
   -- A stop that was interrupted is a cancellation however the owner came to exit: the
   -- hooks of the instances that are left do not run.
   forM_ heldInstances $ \ih → case stopped of
-    Left (ExceptionWithContext _ raised) | Just (_ ∷ SomeAsyncException) ← fromException raised → writeIORef (ihMode ih) (Unorderly ExitCancelled)
+    Left (ExceptionWithContext _ raised) | Just (_ ∷ SomeAsyncException) ← fromException raised → recordExit ih (Just ExitCancelled)
     _ → pure ()
   -- A stop that raised, because a close was interrupted or the timer's
   -- cancellation threw, completed first: asking again answers what it recorded.
@@ -255,7 +258,7 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
     -- is a cancellation, as it is in the scheduler's stop.
     forM_ heldInstances $ \ih → do
       when (either (isJust . (fromException ∷ SomeException → Maybe SomeAsyncException)) (const False) closed) $
-        writeIORef (ihMode ih) (Unorderly ExitCancelled)
+        recordExit ih (Just ExitCancelled)
       instanceClosed ih held' True
     pure (either (\failure → [(held', failure)]) (const []) closed)
   -- What instances are still live ends now, with every coroutine closed and before

@@ -57,6 +57,7 @@ module Hetoimasia.Scripting.Lua.Instance.Run
   , settleEnded
   , reapInvocations
   , retireInstances
+  , recordExit
   ) where
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', orElse, readTVar, readTVarIO, retry, swapTVar, writeTVar)
@@ -248,6 +249,18 @@ newInstanceHost control instances escalate host owned driver handles tasks extra
     <*> newIORef Map.empty
     <*> pure host
     <*> newIORef []
+
+-- | Record how the owner exits, for the instances it leaves: the one place that writes it.
+-- The first failure or cancellation recorded is how the owner exits, and nothing later (a
+-- close interrupted while the owner was already failing, a hook cut short, a cancellation
+-- of the retirement) replaces it: what happened afterwards is cleanup evidence on the
+-- owner's outcome, not its exit. An orderly exit is no failure, so it gives way to the
+-- first one that is. @Nothing@ is an exit in order.
+recordExit ∷ InstanceHost → Maybe ExitKind → IO ()
+recordExit ih how = modifyIORef' (ihMode ih) $ \held → case (held, how) of
+  (Unorderly _, _) → held
+  (_, Just kind) → Unorderly kind
+  (_, Nothing) → Orderly
 
 -- | What the scheduler answers the instance layer's transactions.
 gateOf ∷ Control → Gate
@@ -1013,11 +1026,7 @@ retireInstances ih = do
       Left failure@(ExceptionWithContext _ raised) → do
         -- What an instance's end raised is a failure of the host, or a cancellation:
         -- the owner is failing, and no hook runs for the instances after it.
-        -- The first way the owner exited is the way it exited: what an ending raised
-        -- after that does not rewrite it for the instances that are left.
-        modifyIORef' (ihMode ih) $ \held → case held of
-          Unorderly _ → held
-          _ → Unorderly (if isJust (fromException raised ∷ Maybe SomeAsyncException) then ExitCancelled else ExitFailed)
+        recordExit ih (Just (if isJust (fromException raised ∷ Maybe SomeAsyncException) then ExitCancelled else ExitFailed))
         -- Settled from what its ending recorded, which the failure of the host did not
         -- replace; what telling the application raises is kept beside it.
         again ← tryWithContext @SomeException (discardUnsettled ih cell)
