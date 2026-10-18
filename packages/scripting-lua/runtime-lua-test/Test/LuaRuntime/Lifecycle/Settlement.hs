@@ -57,7 +57,7 @@ spec = describe "settlement" $ do
     targetFx ← newIFixture
     callerFx ← newIFixture
     withBoundary $ \_ runtime → do
-      owner ← startTarget targetFx runtime "target" [gateInit, gateFail] (testConfig instanceBounds')
+      owner ← startTarget targetFx runtime "target" [gateInit, gateFailAt "gatefailheld" "badinit"] (testConfig instanceBounds')
       caller ← startCaller callerFx runtime "caller" (Just (target owner))
       admitCommander callerFx caller "cmdr"
       -- Held inside @init@: initializing, and a live target.
@@ -69,11 +69,16 @@ spec = describe "settlement" $ do
       releaseGate (sf targetFx) "init"
       awaitPhase targetFx owner "ok" Paused
       receiptResult callerFx caller "cmdr" 0 >>= (`shouldBe` "applied")
-      -- The same owner, a second instance whose @init@ fails once it is released.
-      _ ← admit targetFx owner "bad" (moduleNamed "gatefail")
-      awaitPhase targetFx owner "bad" Initializing
+      -- The same owner, a second instance whose @init@ fails once it is released. It waits at a gate
+      -- of its own: @init@ was opened for @ok@ and stays open, so a second instance waiting there
+      -- would fail at once, and the request could find it ended.
+      _ ← admit targetFx owner "bad" (moduleNamed "gatefailheld")
+      -- Inside @init@, not merely admitted: only the gate's own entry mark says so.
+      awaitEntered (sf targetFx) "badinit"
       badTid ← tidValue targetFx "bad"
+      ask callerFx caller "cmdr" "inspect" (Just badTid) Nothing >>= (`shouldSatisfy` Text.isInfixOf "status=initializing")
       ask callerFx caller "cmdr" "pause" (Just badTid) Nothing >>= (`shouldBe` takenAs 1)
+      releaseGate (sf targetFx) "badinit"
       awaitPhase targetFx owner "bad" Failed
       receiptResult callerFx caller "cmdr" 1 >>= (`shouldBe` "no_longer_applicable")
 

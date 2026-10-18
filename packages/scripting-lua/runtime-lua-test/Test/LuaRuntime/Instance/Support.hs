@@ -31,6 +31,7 @@ module Test.LuaRuntime.Instance.Support
   , gateInit
   , gateShutdown
   , gateFail
+  , gateFailAt
   , shared
   , sharedState
   , noHooks
@@ -407,14 +408,20 @@ gateShutdown =
     , "end"
     ]
 
--- | @init@ connects, waits at a gate, and then fails.
+-- | @init@ connects, waits at the @init@ gate, and then fails.
 gateFail ∷ ModuleSource
-gateFail =
+gateFail = gateFailAt "gatefail" "init"
+
+-- | @init@ connects, waits at a gate of its own naming, and then fails. A gate once released stays
+-- open, so an example that has released the @init@ gate for another instance names a different one
+-- here to hold this instance inside @init@. Takes the module's name, then the gate's.
+gateFailAt ∷ Text → Text → ModuleSource
+gateFailAt name gate =
   hooksModule
-    "gatefail"
+    name
     [ "function init(self, api)"
     , "  api.connect('tick', function(self, event) " <> record <> "('tick') end)"
-    , "  fx.block('init')"
+    , "  fx.block('" <> gate <> "')"
     , "  error('init boom')"
     , "end"
     , "function shutdown(self, reason) " <> record <> "('shutdown') end"
