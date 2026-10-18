@@ -163,7 +163,9 @@
 -- live instance through the path above with reason @\"stopped\"@ before the VM is
 -- closed. When the owner instead fails or is cancelled, Lua is not entered for the
 -- instances again: no @shutdown@ runs, which the settlement reports
--- ('ShutdownSkippedUnsafe'), and each unended instance settles as discarded.
+-- ('ShutdownSkippedUnsafe'), and each unended instance settles as discarded; one that
+-- had failed already settles as failed, with its first failure, which nothing later
+-- replaces, and the disposition its @shutdown@ came to when that was decided.
 --
 -- A lifecycle-operation binding a script calls still answers a typed
 -- @NotYetSupported@ fault: Lua's own controls and inspection are LUA-23.

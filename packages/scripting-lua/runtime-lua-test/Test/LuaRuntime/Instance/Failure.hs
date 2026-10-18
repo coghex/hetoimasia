@@ -4,7 +4,7 @@
 module Test.LuaRuntime.Instance.Failure (spec) where
 
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException)
-import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, retry)
 import Data.Maybe (isJust)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Resource (cleanupFailureLabel, cleanupFailuresInContext)
@@ -96,8 +96,8 @@ spec = describe "failure" $ do
 
   it "fails an instance whose callback raised, suppresses its remaining work, runs its shutdown, and leaves its peer running" $ bounded $ do
     fixture ← newIFixture
-    told ← newIORef []
-    let config = (testConfig instanceBounds') {instanceEscalate = \failure → atomicModifyIORef' told (\held → (failure : held, Isolate))}
+    told ← newTVarIO []
+    let config = (testConfig instanceBounds') {instanceEscalate = \failure → atomically (modifyTVar' told (failure :)) >> pure Isolate}
     withBoundary $ \_ runtime → do
       owner ← startInstances fixture runtime "callback failure" [failCallback, echoer] config requiredPolicy
       _ ← admit fixture owner "a" (moduleNamed "failcallback")
@@ -112,9 +112,11 @@ spec = describe "failure" $ do
       failureMessage failure `shouldSatisfy` Text.isInfixOf "callback boom"
       terminationShutdown (resultTermination settled) `shouldBe` ShutdownRan
       logged fixture >>= (`shouldSatisfy` elem "shutdown 1 failed")
-      -- The application is told once, after the instance ended.
+      -- The application is told once, after the instance ended: the settlement is
+      -- published first, so the notification is waited for, not assumed.
       identity ← idOf fixture "a"
-      readIORef told >>= (`shouldSatisfy` \held → map failureInstance held == [identity])
+      held ← atomically (readTVar told >>= \seen → if null seen then retry else pure seen)
+      map failureInstance held `shouldBe` [identity]
       awaitEffect (sf fixture) "init 2"
       expectDelivered fixture owner "b" 1
       awaitEffect (sf fixture) "tick 2 n=1 seq=0 t=0 count=1"

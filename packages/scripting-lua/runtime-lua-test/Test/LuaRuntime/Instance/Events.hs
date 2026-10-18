@@ -5,7 +5,7 @@ module Test.LuaRuntime.Instance.Events (spec) where
 
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Monad (forM, forM_, replicateM_)
+import Control.Monad (forM, forM_)
 import Data.List (sort)
 import Data.Maybe (mapMaybe)
 import qualified Data.Text as Text
@@ -65,7 +65,8 @@ spec = describe "events" $ do
       snapshotOf fixture owner "a" >>= (`shouldSatisfy` \held → fmap snapshotQueueFull held == Just 2)
       snapshotOf fixture owner "a" >>= (`shouldSatisfy` \held → fmap snapshotDelivered held == Just 3)
       -- Everything that was accepted runs, in order, and nothing else does.
-      replicateM_ 3 (grantOne control owner)
+      -- Each is granted the step of its own wait, once it has reached it.
+      forM_ [1 .. 3] (grantWhenWaiting control owner)
       awaitEffect (sf fixture) "end 1 3"
       logged fixture
         >>= ( `shouldBe`

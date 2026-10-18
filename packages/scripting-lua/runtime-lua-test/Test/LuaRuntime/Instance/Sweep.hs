@@ -359,11 +359,12 @@ unstartedAt base pausing ending events = do
     forM_ [1 .. events] (expectDelivered fixture owner "a")
     releaseGate (sf fixture) "init"
     awaitPhase fixture owner "a" Active
-    awaitDiagnosticsWaiting owner
+    -- The owner has tried to place its run, and it is queued or was refused: waited for as
+    -- the scheduler counts it, not assumed.
+    awaitDiagnostics owner $ \counts → if base == RunQueued then diagQueued counts >= 1 else diagRejected counts >= 1
     when (pausing /= Untouched) $ settleControl fixture owner "a" InstancePause >>= (`shouldBe` ControlApplied)
-    when (pausing == WasResumed) $ do
-      settleControl fixture owner "a" InstanceResume >>= (`shouldBe` ControlApplied)
-      awaitDiagnosticsWaiting owner
+    -- A resume is applied, and the run looked for again, before its request settles.
+    when (pausing == WasResumed) $ settleControl fixture owner "a" InstanceResume >>= (`shouldBe` ControlApplied)
     case ending of
       ByStop → settleControl fixture owner "a" InstanceStop >>= (`shouldBe` ControlApplied)
       ByRetire → retireScheduled owner >> void (awaitScheduledTerminal control owner)

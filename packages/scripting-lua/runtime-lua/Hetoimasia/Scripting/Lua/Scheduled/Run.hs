@@ -68,6 +68,7 @@ import Control.Exception
   , tryWithContext
   )
 import Control.Monad (forM, forM_, void, when)
+import Data.Either (isLeft)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -279,12 +280,16 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
         , show raised `notElem` recorded
         ]
       primary = either Just (const Nothing) served <|> either Just (const Nothing) retired
+      -- What retiring the instances raised, when the owner had failed already: the owner's
+      -- failure is the primary, and this is evidence beside it, not lost.
+      retirement = [("lua instance retirement", failure) | Left failure ← [retired], isLeft served]
   composed ←
     composeCleanup
       primary
       ( interruption
           <> timerEvidence
           <> others
+          <> retirement
           <> [("lua task close", ExceptionWithContext (someExceptionContext failure) failure) | (_, failure) ← closeFailures]
       )
   maybe (pure ()) rethrowIO composed

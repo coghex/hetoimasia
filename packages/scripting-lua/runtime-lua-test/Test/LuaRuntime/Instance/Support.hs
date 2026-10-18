@@ -35,6 +35,8 @@ module Test.LuaRuntime.Instance.Support
   , sharedState
   , noHooks
   , hostFailing
+  , hooksModule
+  , record
   , hostShutdown
   , closeKilled
   , delayedEcho
@@ -84,6 +86,7 @@ module Test.LuaRuntime.Instance.Support
   , holdOwner
   , releaseOwner
   , grantOne
+  , grantWhenWaiting
   , awaitDiagnosticsWaiting
   , phaseOf
   , snapshotOf
@@ -839,6 +842,14 @@ grantOne control owner = do
   _ ← grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1)
   _ ← awaitTicksComplete control owner
   pure ()
+
+-- | Grant one logical step to the wait that is the n-th the scheduler has taken in all,
+-- once it has taken it: a grant is made to a wait that is registered, never to one the
+-- owner has yet to reach, which would let the step pass and leave that wait for ever.
+grantWhenWaiting ∷ RuntimeControl → ScheduledOwner → Int → IO ()
+grantWhenWaiting control owner n = do
+  awaitDiagnostics owner (\counts → diagWaiting counts >= n)
+  grantOne control owner
 
 -- | Hold the owner inside a segment, so that what an example does meanwhile is
 -- accepted before the owner serves any of it: an instance of the @holder@ module is

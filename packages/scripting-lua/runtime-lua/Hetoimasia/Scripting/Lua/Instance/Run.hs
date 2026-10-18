@@ -66,7 +66,7 @@ import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Foldable (toList)
-import Data.Maybe (isJust, isNothing)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Sequence (ViewL (EmptyL, (:<)), viewl, (<|))
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -163,7 +163,39 @@ data Ending = Ending
   , endClosed ∷ !Int
     -- ^ Coroutines closed so far: kept as they are counted, so an ending that raised
     -- can still be settled with what it did.
+  , endShutdown ∷ !ShutdownRecord
+    -- ^ What became of the @shutdown@ hook, recorded when it was decided.
   }
+
+-- | What became of an instance's @shutdown@, recorded once, when it is decided, and read
+-- by every path that settles or reports the ending: none recomputes it.
+data ShutdownRecord
+  = -- | Not decided yet.
+    ShutdownUndecided
+  | -- | The hook was entered and has not answered: a failure of the host that left it
+    -- raised it, and it is not started again.
+    ShutdownBegun
+  | -- | Decided: what became of it, and the error it raised, if it raised one the
+    -- instance can report.
+    ShutdownDecided !ShutdownDisposition !(Maybe InstanceError)
+
+-- | The disposition and the failure of the hook a record stands for, for an instance that
+-- is, or is not, initialized.
+recordedShutdown ∷ Bool → ShutdownRecord → (ShutdownDisposition, Maybe InstanceError)
+recordedShutdown initialized = \case
+  ShutdownUndecided
+    | initialized → (ShutdownSkippedUnsafe, Nothing)
+    | otherwise → (ShutdownSkippedNoInit, Nothing)
+  ShutdownBegun → (ShutdownRaised, Nothing)
+  ShutdownDecided disposition failure → (disposition, failure)
+
+-- | Whether the hook was started: it is not started again, and Lua is not entered for the
+-- release of what the instance held after it was cut short.
+hookStarted ∷ ShutdownRecord → Bool
+hookStarted = \case
+  ShutdownBegun → True
+  ShutdownDecided disposition _ → disposition == ShutdownRan || disposition == ShutdownRaised
+  ShutdownUndecided → False
 
 -- | What the owner's thread holds for its instances, besides what the application
 -- shares: the VM, the driver, the coroutines, and how each instance is ending.
@@ -192,8 +224,6 @@ data InstanceHost = InstanceHost
   , ihBacklog ∷ !(IORef [Job])
     -- ^ The jobs of the batch being serviced that have not begun: if servicing one
     -- raises, the owner's exit still finds the rest, and settles their receipts.
-  , ihShutdownTried ∷ !(IORef (Set.Set Word64))
-    -- ^ Instances whose @shutdown@ was started: once, even if it raised.
   }
 
 -- | The host of an owner's instances.
@@ -218,7 +248,6 @@ newInstanceHost control instances escalate host owned driver handles tasks extra
     <*> newIORef Map.empty
     <*> pure host
     <*> newIORef []
-    <*> newIORef Set.empty
 
 -- | What the scheduler answers the instance layer's transactions.
 gateOf ∷ Control → Gate
@@ -802,17 +831,21 @@ beginEnding' ih cell reason primary = mask_ $ do
   -- cancellation cannot land between them and leave the counts unwritten.
   (connections, unstarted, already) ← atomically (beginEnding cell)
   unless already $
-    modifyIORef' (ihEndings ih) (Map.insert (icId cell) (Ending reason primary connections unstarted 0))
+    modifyIORef' (ihEndings ih) (Map.insert (icId cell) (Ending reason primary connections unstarted 0 ShutdownUndecided))
 
 -- | Finish ending an instance: its @shutdown@ hook, once, the release of its
 -- record in the VM, and its settlement, once. The application is then told if it
 -- failed.
+--
+-- What the ending came to is kept in the instance's 'Ending' as it is decided, and
+-- 'settleEnding' reads it: coming back to an ending that a failure of the host
+-- interrupted finds the hook started, and the primary failure, where they were left.
 finishEnding ∷ InstanceHost → ICell → Int → IO ()
 finishEnding ih cell closed = do
   settled ← isJust <$> readTVarIO (icResult cell)
   unless settled $ do
-    modifyIORef' (ihEndings ih) (Map.adjust (\held → held {endClosed = max (endClosed held) closed}) (icId cell))
-    ending ← Map.findWithDefault (Ending EndStopped Nothing 0 0 closed) (icId cell) <$> readIORef (ihEndings ih)
+    modifyIORef' (ihEndings ih) . Map.alter (Just . maybe (Ending EndStopped Nothing 0 0 closed ShutdownUndecided) (\held → held {endClosed = max (endClosed held) closed})) $ icId cell
+    ending ← Map.findWithDefault (Ending EndStopped Nothing 0 0 closed ShutdownUndecided) (icId cell) <$> readIORef (ihEndings ih)
     state ← readTVarIO (icState cell)
     mode ← readIORef (ihMode ih)
     handles ← readIORef (ihHandles ih)
@@ -826,25 +859,31 @@ finishEnding ih cell closed = do
           EndStopped → "stopped"
           EndCompleted → "completed"
           EndFailed → "failed"
-    -- A @shutdown@ that was started and raised a failure of the host is not started
-    -- again when the owner's exit comes back to the instance.
-    interrupted ← Set.member (icId cell) <$> readIORef (ihShutdownTried ih)
-    (disposition, shutdownFailure) ←
-      case handle of
-        _ | not (isInitialized state) → pure (ShutdownSkippedNoInit, Nothing)
-        _ | interrupted → pure (ShutdownSkippedUnsafe, Nothing)
-        Just module' | safe → do
-          available ← hookAvailable ih module' "shutdown"
-          if not available
-            then pure (ShutdownAbsent, Nothing)
-            else do
-              modifyIORef' (ihShutdownTried ih) (Set.insert (icId cell))
-              ran ← settledOrRaise (ihExtra ih) (withRunning ih (icId cell) (callEntryVia (ownedHost (ihOwned ih)) (ihDriver ih) "shutdown" module' "shutdown" [slot, VText reasonText]))
-              pure $ case ran of
-                Left fault → (ShutdownRaised, Just (ErrorFault fault))
-                Right _ → (ShutdownRan, Nothing)
-        _ → pure (ShutdownSkippedUnsafe, Nothing)
-    when (created && safe && not interrupted) $ do
+        record = recordShutdown ih cell
+        -- Decided once, here, and recorded: a @shutdown@ that was started and raised a
+        -- failure of the host is not started again when the owner's exit comes back to
+        -- the instance, and is settled as the hook that raised.
+        decide
+          | not (isInitialized state) = record (ShutdownDecided ShutdownSkippedNoInit Nothing)
+          | otherwise = case handle of
+              Just module' | safe → do
+                available ← hookAvailable ih module' "shutdown"
+                if not available
+                  then record (ShutdownDecided ShutdownAbsent Nothing)
+                  else do
+                    record ShutdownBegun
+                    -- A cancellation lands inside the hook, and leaves it recorded as started,
+                    -- or after what it answered is recorded: never between the two.
+                    mask $ \restore → do
+                      ran ← restore (settledOrRaise (ihExtra ih) (withRunning ih (icId cell) (callEntryVia (ownedHost (ihOwned ih)) (ihDriver ih) "shutdown" module' "shutdown" [slot, VText reasonText])))
+                      record $ case ran of
+                        Left fault → ShutdownDecided ShutdownRaised (Just (ErrorFault fault))
+                        Right _ → ShutdownDecided ShutdownRan Nothing
+              _ → record (ShutdownDecided ShutdownSkippedUnsafe Nothing)
+    case endShutdown ending of
+      ShutdownUndecided → decide
+      _ → pure ()
+    when (created && safe && not (hookStarted (endShutdown ending))) $ do
       -- A release that fails is cleanup evidence, kept for the owner's end: nothing
       -- the application's escalation answers can hide it.
       released ← tryWithContext @SomeException (withRunning ih (icId cell) (callEntry (ihOwned ih) (ihDriver ih) "release" [slot]))
@@ -854,53 +893,92 @@ finishEnding ih cell closed = do
           | isJust (fromException raised ∷ Maybe SomeAsyncException) → rethrowIO failure
           | raisedByApplication context → rethrowIO failure
           | otherwise → modifyIORef' (ihExtra ih) (<> [("lua instance release", failure)])
-    let failure = case (endPrimary ending, shutdownFailure) of
-          (Just (Primary phase stage err), secondary) → Just (describe phase stage err [(StageShutdown, e) | Just e ← [secondary]])
-          (Nothing, Just err) → Just (describe Stopping StageShutdown err [])
-          (Nothing, Nothing) → Nothing
-        describe phase stage err secondary =
-          InstanceFailure
-            { failureInstance = InstanceId (controlOwner (ihControl ih)) (icId cell)
-            , failureOwner = controlLabel (ihControl ih)
-            , failureName = icName cell
-            , failureSource = icModule cell
-            , failurePhase = phase
-            , failureStage = stage
-            , failureError = err
-            , failureMessage = renderError err
-            , failureTraceback = case err of
-                ErrorFault (BoundaryFailed fault) → boundaryTraceback fault
-                _ → Nothing
-            , failureSecondary = secondary
-            }
-        (terminal, outcome) = case (mode, failure) of
-          _ | interrupted → (Stopped, InstanceDiscarded (Discard (case mode of Unorderly kind → kind; _ → ExitFailed) Started))
-          (Unorderly kind, _) → (Stopped, InstanceDiscarded (Discard kind (if isInitialized state || created then Started else NotStarted)))
-          (_, Just failed) → (Failed, InstanceFailed failed)
-          (_, Nothing) → case endReason ending of
-            EndCompleted → (Completed, InstanceCompleted)
-            _ → (Stopped, InstanceStopped)
-        settlement =
-          InstanceSettlement
-            { resultInstance = InstanceId (controlOwner (ihControl ih)) (icId cell)
-            , resultOwner = controlLabel (ihControl ih)
-            , resultName = icName cell
-            , resultModule = icModule cell
-            , resultPhase = terminal
-            , resultOutcome = outcome
-            , resultTermination = Termination (endConnections ending) (endUnstarted ending) (endClosed ending) disposition
-            }
+    settleEnding ih cell
+
+-- | Record what became of an instance's @shutdown@ in its ending.
+recordShutdown ∷ InstanceHost → ICell → ShutdownRecord → IO ()
+recordShutdown ih cell record =
+  modifyIORef' (ihEndings ih) (Map.adjust (\held → held {endShutdown = record}) (icId cell))
+
+-- | Settle an instance from its ending, once, and tell the application if it failed.
+--
+-- This is the one place an ending is settled or reported, whether its hooks ran to
+-- their ends or a failure of the host cut them short: what failed first, the traceback
+-- with it, and what became of the hook are read from the ending's record, and nothing
+-- that came after them (the owner's exit, a hook that raised a failure of the host)
+-- replaces them. A failure the ending holds settles the instance as failed, whatever
+-- the owner's exit was; an owner that exited without one discards it.
+settleEnding ∷ InstanceHost → ICell → IO ()
+settleEnding ih cell = do
+  state ← readTVarIO (icState cell)
+  mode ← readIORef (ihMode ih)
+  created ← Set.member (icId cell) <$> readIORef (ihCreated ih)
+  held ← Map.lookup (icId cell) <$> readIORef (ihEndings ih)
+  let ending = fromMaybe (Ending EndStopped Nothing 0 0 0 ShutdownUndecided) held
+      (disposition, shutdownFailure) = recordedShutdown (isInitialized state) (endShutdown ending)
+      -- An ending that never began has counted nothing: what the state still holds is
+      -- what is discarded, counted as an ending counts it.
+      counted = case held of
+        Just _ → Termination (endConnections ending) (endUnstarted ending) (endClosed ending) disposition
+        Nothing → Termination (Set.size (isConnections state)) (unstartedCount (icKind cell) state) 0 disposition
+      cutShort = case endShutdown ending of
+        ShutdownBegun → True
+        _ → False
+      exitKind = case mode of
+        Unorderly kind → kind
+        _ → ExitFailed
+      reached = if isInitialized state || created || hookStarted (endShutdown ending) then Started else NotStarted
+      failure = case (endPrimary ending, shutdownFailure) of
+        (Just (Primary phase stage err), secondary) → Just (describe phase stage err [(StageShutdown, e) | Just e ← [secondary]])
+        (Nothing, Just err) → Just (describe Stopping StageShutdown err [])
+        (Nothing, Nothing) → Nothing
+      describe phase stage err secondary =
+        InstanceFailure
+          { failureInstance = InstanceId (controlOwner (ihControl ih)) (icId cell)
+          , failureOwner = controlLabel (ihControl ih)
+          , failureName = icName cell
+          , failureSource = icModule cell
+          , failurePhase = phase
+          , failureStage = stage
+          , failureError = err
+          , failureMessage = renderError err
+          , failureTraceback = case err of
+              ErrorFault (BoundaryFailed fault) → boundaryTraceback fault
+              _ → Nothing
+          , failureSecondary = secondary
+          }
+      (terminal, outcome) = case (failure, mode) of
+        (Just failed, _) → (Failed, InstanceFailed failed)
+        (Nothing, Unorderly _) → (Stopped, InstanceDiscarded (Discard exitKind reached))
+        (Nothing, _) | cutShort → (Stopped, InstanceDiscarded (Discard exitKind Started))
+        (Nothing, _) → case endReason ending of
+          EndCompleted → (Completed, InstanceCompleted)
+          _ → (Stopped, InstanceStopped)
+      settlement =
+        InstanceSettlement
+          { resultInstance = InstanceId (controlOwner (ihControl ih)) (icId cell)
+          , resultOwner = controlLabel (ihControl ih)
+          , resultName = icName cell
+          , resultModule = icModule cell
+          , resultPhase = terminal
+          , resultOutcome = outcome
+          , resultTermination = counted
+          }
+  -- Settling, and the decision that the application is told, are one step a cancellation
+  -- cannot cut between: an instance settled as failed is told of, once. The telling is
+  -- application code and is interruptible.
+  mask $ \restore → do
     won ← atomically (settleInstance (ihInstances ih) cell settlement)
     modifyIORef' (ihEndings ih) (Map.delete (icId cell))
     modifyIORef' (ihCreated ih) (Set.delete (icId cell))
-    modifyIORef' (ihShutdownTried ih) (Set.delete (icId cell))
-    -- The application is told of a failure after the instance has ended, so what it
-    -- decides cannot undo the settlement.
-    case (won, failure, mode) of
-      (True, Just _, Unorderly _) → pure ()
-      (True, Just failed, _) → do
-        decision ← ihEscalate ih failed
-        when (decision == Escalate) $ throwIO (InstanceEscalated failed)
+    tell restore mode won failure
+  where
+    tell restore mode won failure = case (won, failure) of
+      (True, Just failed) → do
+        decision ← restore (ihEscalate ih failed)
+        case mode of
+          Unorderly _ → pure ()
+          _ → when (decision == Escalate) $ throwIO (InstanceEscalated failed)
       _ → pure ()
 
 -- Exit ---------------------------------------------------------------------------------------
@@ -910,8 +988,9 @@ finishEnding ih cell closed = do
 -- Called once the scheduler has stopped and has closed every coroutine it held,
 -- each of which ended its instance through 'instanceClosed'. In order, an
 -- instance still live is stopped through the ordinary path, with reason @stopped@;
--- after a failure or a cancellation no hook runs, and it settles as discarded. A
--- request the owner never applied settles as no longer applicable.
+-- after a failure or a cancellation no hook runs, and it settles as discarded, unless
+-- it had failed already, which settles it as failed with that failure. A request the
+-- owner never applied settles as no longer applicable.
 retireInstances ∷ InstanceHost → IO ()
 retireInstances ih = do
   jobs ← atomically (takeJobs (ihInstances ih))
@@ -934,9 +1013,15 @@ retireInstances ih = do
       Left failure@(ExceptionWithContext _ raised) → do
         -- What an instance's end raised is a failure of the host, or a cancellation:
         -- the owner is failing, and no hook runs for the instances after it.
-        writeIORef (ihMode ih) . Unorderly $
-          if isJust (fromException raised ∷ Maybe SomeAsyncException) then ExitCancelled else ExitFailed
-        [failure] <$ discardUnsettled ih cell
+        -- The first way the owner exited is the way it exited: what an ending raised
+        -- after that does not rewrite it for the instances that are left.
+        modifyIORef' (ihMode ih) $ \held → case held of
+          Unorderly _ → held
+          _ → Unorderly (if isJust (fromException raised ∷ Maybe SomeAsyncException) then ExitCancelled else ExitFailed)
+        -- Settled from what its ending recorded, which the failure of the host did not
+        -- replace; what telling the application raises is kept beside it.
+        again ← tryWithContext @SomeException (discardUnsettled ih cell)
+        pure (failure : [telling | Left telling ← [again]])
       Right () → pure []
   -- The first failure is the one raised; every other is cleanup evidence, whole, so
   -- supervision receives each of them and none is chosen over the rest.
@@ -946,35 +1031,7 @@ retireInstances ih = do
       rethrowIO failure
     [] → pure ()
 
--- | Settle an instance that is still unsettled as discarded, because its end could
--- not be carried through.
+-- | Settle an instance that is still unsettled, because its end could not be carried
+-- through: from what its ending recorded, as any other ending is.
 discardUnsettled ∷ InstanceHost → ICell → IO ()
-discardUnsettled ih cell = do
-  state ← readTVarIO (icState cell)
-  -- What the ending had done before it raised is kept as it was counted.
-  ending ← Map.lookup (icId cell) <$> readIORef (ihEndings ih)
-  mode ← readIORef (ihMode ih)
-  tried ← Set.member (icId cell) <$> readIORef (ihShutdownTried ih)
-  -- How the owner exited, and whether its hook was started and cut short or never was.
-  let kind = case mode of
-        Unorderly how → how
-        _ → ExitFailed
-      disposition = if tried then ShutdownRaised else ShutdownSkippedUnsafe
-      -- An ending that never began has counted nothing: what the state still holds is
-      -- what is discarded, counted as an ending counts it.
-      counted =
-        maybe
-          (Termination (Set.size (isConnections state)) (unstartedCount (icKind cell) state) 0 disposition)
-          (\held → Termination (endConnections held) (endUnstarted held) (endClosed held) disposition)
-          ending
-      settlement =
-        InstanceSettlement
-          { resultInstance = InstanceId (controlOwner (ihControl ih)) (icId cell)
-          , resultOwner = controlLabel (ihControl ih)
-          , resultName = icName cell
-          , resultModule = icModule cell
-          , resultPhase = Stopped
-          , resultOutcome = InstanceDiscarded (Discard kind (if isInitialized state then Started else NotStarted))
-          , resultTermination = counted
-          }
-  void (atomically (settleInstance (ihInstances ih) cell settlement))
+discardUnsettled = settleEnding

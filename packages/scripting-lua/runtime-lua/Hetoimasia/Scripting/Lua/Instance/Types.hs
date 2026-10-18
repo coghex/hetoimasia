@@ -267,6 +267,8 @@ data InstanceOutcome
   | -- | The owner exited without retiring the instance in order: after a host
     -- failure or a cancellation, no hook ran for it and Lua was not entered for it
     -- again. How the owner exited, and whether a hook of the instance had begun.
+    -- An instance that had failed already settles as failed instead, with its first
+    -- failure.
     InstanceDiscarded !Discard
   deriving (Show)
 

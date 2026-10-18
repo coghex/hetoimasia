@@ -3,7 +3,7 @@
 -- hook, repeated and contradictory requests, and every refusal.
 module Test.LuaRuntime.Instance.Control (spec) where
 
-import Control.Monad (forM, forM_, replicateM_)
+import Control.Monad (forM, forM_)
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Scheduled
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
@@ -26,7 +26,7 @@ spec = describe "control" $ do
       snapshotOf fixture owner "a"
         >>= (`shouldSatisfy` \held → fmap snapshotPhase held == Just Paused && fmap snapshotExecution held == Just ExecWaiting)
       -- The wait ends, and nothing runs: the continuation is frozen where it is.
-      grantOne control owner
+      grantWhenWaiting control owner 1
       expectDelivered fixture owner "a" 4
       awaitIdle (sf fixture)
       logged fixture >>= (`shouldBe` ["begin 1 1"])
@@ -36,7 +36,8 @@ spec = describe "control" $ do
       settleControl fixture owner "a" InstanceResume >>= (`shouldBe` ControlApplied)
       awaitEffect (sf fixture) "begin 1 2"
       expectDelivered fixture owner "a" 5
-      replicateM_ 4 (grantOne control owner)
+      -- Each is granted the step of its own wait, once it has reached it.
+      forM_ [2 .. 5] (grantWhenWaiting control owner)
       awaitEffect (sf fixture) "end 1 5"
       logged fixture
         >>= ( `shouldBe`
