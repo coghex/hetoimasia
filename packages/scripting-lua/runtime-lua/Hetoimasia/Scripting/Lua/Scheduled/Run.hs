@@ -259,9 +259,13 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
     _ → pure ()
   -- A stop that raised, because a close was interrupted or the timer's
   -- cancellation threw, completed first: asking again answers what it recorded.
-  report ← case stopped of
-    Right done → pure (Just done)
-    Left _ → either (const Nothing) Just <$> tryWithContext @SomeException (stopScheduler scheduler host)
+  stoppedAgain ← case stopped of
+    Right done → pure (Right done)
+    Left _ → tryWithContext @SomeException (stopScheduler scheduler host)
+  let report = either (const Nothing) Just stoppedAgain
+      -- What asking again raised is kept too: the first ask's failure is evidence, and so is
+      -- this one's, unless it is that same failure.
+      askedAgain = [("lua scheduler stop retry", failure) | Left failure@(ExceptionWithContext _ raised) ← [stoppedAgain], Left (ExceptionWithContext _ first) ← [stopped], show raised /= show first]
   -- A coroutine the scheduler did not close, because its task was inside a
   -- segment when the owner ended (the application's observer raised before it
   -- resumed, say), is closed here, before the VM is, where closing it can run the
@@ -291,7 +295,7 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
       recorded = map (show . snd) closeFailures <> [show failure | Just failure ← [timerFailure]]
       -- What cancelling the timer raised: the stop went on, and the report keeps it
       -- even when a close's interruption is what the stop raised.
-      timerEvidence = [("lua timer cancel", ExceptionWithContext (someExceptionContext failure) failure) | Just failure ← [timerFailure]]
+      timerEvidence = askedAgain <> [("lua timer cancel", ExceptionWithContext (someExceptionContext failure) failure) | Just failure ← [timerFailure]]
       interruption =
         [ ("lua scheduler stop", failure)
         | Left failure@(ExceptionWithContext _ raised) ← [stopped]

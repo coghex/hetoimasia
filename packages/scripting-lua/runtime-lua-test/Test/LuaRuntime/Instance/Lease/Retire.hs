@@ -10,7 +10,7 @@ import Control.Concurrent.STM (atomically, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), toException)
 import Control.Monad (forM_)
 import qualified Data.Text as Text
-import Hetoimasia.Foundation.Resource (cleanupFailureLabel, cleanupFailuresInContext)
+import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailureLabel, cleanupFailuresInContext)
 import Hetoimasia.Runtime.Supervision (WorkerStatus (WorkerUnavailable))
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Lease
@@ -188,39 +188,116 @@ spec = describe "retained retirement" $ do
     fmap (leasesDrained . resultLeases) settled `shouldBe` Just 1
     summaryOf fixture "a" >>= (`shouldBe` ScopeSummary 0 0 0 0 4 0)
 
-  it "retains a provider's query that throws as that retirement failing, and goes on awaiting the independent one until its provider completes it" $ bounded $ do
-    fixture ← newLFix 4
-    let base = lfBase fixture
-    ExceptionWithContext context _ ← expectFatal $ \control runtime → providersFinish fixture $ do
-      owner ← startLeased fixture runtime "query throws" [asyncNamed] leaseConfig requiredPolicy
-      _ ← admit base owner "a" (moduleNamed "asyncnamed")
-      _ ← admit base owner "b" (moduleNamed "asyncnamed")
-      awaitPhase base owner "a" Active
-      awaitPhase base owner "b" Active
-      expectDelivered base owner "a" 1
-      expectDelivered base owner "b" 1
-      awaitPending fixture "a" 1
-      awaitPending fixture "b" 1
-      retireScheduled owner
-      awaitPhase base owner "a" Stopping
-      awaitPhase base owner "b" Stopping
-      readMVar (sfOwnerThread (sf base)) >>= awaitBlockedOnSTM
-      -- The first provider's query throws from now on; the second provider is still working.
-      throwQuery fixture "named-1"
-      a ← tickOf base "a"
-      _ ← waitInstance a
-      -- The failed one has settled, as failed at its release; the other is still awaited, and
-      -- the owner is live with it.
-      tickOf base "b" >>= pollInstance >>= (`shouldSatisfy` \case Nothing → True; Just _ → False)
-      atomically (scheduledStatus owner) >>= (`shouldSatisfy` isLive)
-      summaryOf fixture "b" >>= \summary → summaryPending summary `shouldBe` 1
-      completeRetirement fixture "named-2"
-      awaitScheduledTerminal control owner
-    map cleanupFailureLabel (cleanupFailuresInContext context) `shouldSatisfy` any (Text.isInfixOf "lua lease retirement")
-    settledA ← tickOf base "a" >>= pollInstance
-    fmap resultPhase settledA `shouldBe` Just Failed
-    settledB ← tickOf base "b" >>= pollInstance
-    fmap (leasesAwaited . resultLeases) settledB `shouldBe` Just 1
+  it "retains a provider's query that fails as that retirement failing, whether it throws when run or answers a value that throws when first inspected, while the owner waits in STM, and goes on awaiting the independent one until its provider completes it" $ bounded $ do
+    forM_ [QueryThrows, QueryLazy, QueryLazyFailure] $ \fault → do
+      fixture ← newLFix 4
+      let base = lfBase fixture
+      ExceptionWithContext context _ ← expectFatal $ \control runtime → providersFinish fixture $ do
+        owner ← startLeased fixture runtime "query fails" [asyncNamed] leaseConfig requiredPolicy
+        _ ← admit base owner "a" (moduleNamed "asyncnamed")
+        _ ← admit base owner "b" (moduleNamed "asyncnamed")
+        awaitPhase base owner "a" Active
+        awaitPhase base owner "b" Active
+        expectDelivered base owner "a" 1
+        expectDelivered base owner "b" 1
+        awaitPending fixture "a" 1
+        awaitPending fixture "b" 1
+        retireScheduled owner
+        awaitPhase base owner "a" Stopping
+        awaitPhase base owner "b" Stopping
+        readMVar (sfOwnerThread (sf base)) >>= awaitBlockedOnSTM
+        -- The first provider's query fails from now on; the second provider is still working.
+        faultQuery fixture "named-1" fault
+        a ← tickOf base "a"
+        _ ← waitInstance a
+        -- The failed one has settled, as failed at its release; the other is still awaited, and
+        -- the owner is live with it.
+        tickOf base "b" >>= pollInstance >>= (`shouldSatisfy` \case Nothing → True; Just _ → False)
+        atomically (scheduledStatus owner) >>= (`shouldSatisfy` isLive)
+        summaryOf fixture "b" >>= \summary → summaryPending summary `shouldBe` 1
+        completeRetirement fixture "named-2"
+        awaitScheduledTerminal control owner
+      map cleanupFailureLabel (cleanupFailuresInContext context) `shouldSatisfy` any (Text.isInfixOf "lua lease retirement")
+      settledA ← tickOf base "a" >>= pollInstance
+      fmap resultPhase settledA `shouldBe` Just Failed
+      settledB ← tickOf base "b" >>= pollInstance
+      fmap (leasesAwaited . resultLeases) settledB `shouldBe` Just 1
+
+  it "retains a provider's query that fails at the owner's next boundary, where the retirements are serviced and not awaited, the same way, and goes on awaiting the independent one" $ bounded $ do
+    forM_ [QueryThrows, QueryLazy, QueryLazyFailure] $ \fault → do
+      fixture ← newLFix 4
+      let base = lfBase fixture
+      ExceptionWithContext context _ ← expectFatal $ \control runtime → providersFinish fixture $ do
+        owner ← startLeased fixture runtime "query fails when serviced" [asyncNamed, marker, holder] leaseConfig requiredPolicy
+        _ ← admit base owner "a" (moduleNamed "asyncnamed")
+        _ ← admit base owner "b" (moduleNamed "asyncnamed")
+        _ ← admit base owner "m" (moduleNamed "marker")
+        awaitPhase base owner "a" Active
+        awaitPhase base owner "b" Active
+        awaitPhase base owner "m" Active
+        expectDelivered base owner "a" 1
+        expectDelivered base owner "b" 1
+        awaitPending fixture "a" 1
+        awaitPending fixture "b" 1
+        -- The owner is held inside a segment while the query starts to fail, so that the
+        -- first reading of it is the boundary's.
+        holdOwner base owner
+        expectDelivered base owner "m" 1
+        faultQuery fixture "named-1" fault
+        releaseOwner base
+        a ← tickOf base "a"
+        _ ← waitInstance a
+        tickOf base "b" >>= pollInstance >>= (`shouldSatisfy` \case Nothing → True; Just _ → False)
+        atomically (scheduledStatus owner) >>= (`shouldSatisfy` isLive)
+        completeRetirement fixture "named-2"
+        awaitScheduledTerminal control owner
+      map cleanupFailureLabel (cleanupFailuresInContext context) `shouldSatisfy` any (Text.isInfixOf "lua lease retirement")
+      settledA ← tickOf base "a" >>= pollInstance
+      fmap resultPhase settledA `shouldBe` Just Failed
+      settledB ← tickOf base "b" >>= pollInstance
+      fmap (leasesAwaited . resultLeases) settledB `shouldBe` Just 1
+
+  it "treats every way a call into provider code can fail the same, with one provider still pending or none: a query that throws, a query that answers a value that throws, an answer whose failure throws, and a disposal that throws" $ bounded $ do
+    forM_ [(Just QueryThrows, "query throws"), (Just QueryLazy, "query answers a throwing value"), (Just QueryLazyFailure, "answer's failure throws"), (Nothing, "disposal throws")] $ \(fault, label) →
+      forM_ [True, False] $ \others → do
+        fixture ← newLFix 4
+        let base = lfBase fixture
+            first = maybe "dependentholder" (const "asyncnamed") fault
+        forM_ (maybe [breakRelease fixture "dep-res.device"] (const []) fault) id
+        ExceptionWithContext context _ ← expectFatal $ \control runtime → providersFinish fixture $ do
+          owner ← startLeased fixture runtime ("sweep " <> label) [asyncNamed, dependentHolder] leaseConfig requiredPolicy
+          _ ← admit base owner "a" (moduleNamed first)
+          if others then () <$ admit base owner "b" (moduleNamed "asyncnamed") else pure ()
+          awaitPhase base owner "a" Active
+          if others then awaitPhase base owner "b" Active else pure ()
+          expectDelivered base owner "a" 1
+          if others then expectDelivered base owner "b" 1 >> awaitPending fixture "b" 1 else pure ()
+          awaitPending fixture "a" 1
+          retireScheduled owner
+          awaitPhase base owner "a" Stopping
+          readMVar (sfOwnerThread (sf base)) >>= awaitBlockedOnSTM
+          case fault of
+            Just queryFault → faultQuery fixture "named-1" queryFault
+            Nothing → completeRetirement fixture "dep-res"
+          a ← tickOf base "a"
+          _ ← waitInstance a
+          -- What was pending independently is still awaited, and the owner is live with it.
+          if others
+            then do
+              tickOf base "b" >>= pollInstance >>= (`shouldSatisfy` \case Nothing → True; Just _ → False)
+              atomically (scheduledStatus owner) >>= (`shouldSatisfy` isLive)
+              completeRetirement fixture "named-2"
+            else pure ()
+          awaitScheduledTerminal control owner
+        map cleanupFailureLabel (cleanupFailuresInContext context)
+          `shouldSatisfy` any (Text.isInfixOf (maybe "lua lease dependency" (const "lua lease retirement") fault))
+        settledA ← tickOf base "a" >>= pollInstance
+        fmap resultPhase settledA `shouldBe` Just Failed
+        if others
+          then do
+            settledB ← tickOf base "b" >>= pollInstance
+            fmap (leasesAwaited . resultLeases) settledB `shouldBe` Just 1
+          else pure ()
 
   it "settles every ending that is ready when settling one raises the application's escalation as the owner retires, and does not wait for what has already completed" $ bounded $ do
     fixture ← newLFix 4
@@ -251,6 +328,35 @@ spec = describe "retained retirement" $ do
     settledB ← tickOf base "b" >>= pollInstance
     fmap resultPhase settledA `shouldBe` Just Failed
     fmap resultPhase settledB `shouldSatisfy` (/= Nothing)
+
+  it "keeps every escalation that throws when several endings settle together as the owner retires: the first is raised, and each of the others reaches supervision as cleanup evidence" $ bounded $ do
+    fixture ← newLFix 4
+    let base = lfBase fixture
+    ExceptionWithContext context raised ← expectFatal $ \control runtime → providersFinish fixture $ do
+      owner ← startLeased fixture runtime "two escalations" [asyncNamed] twoEscalating requiredPolicy
+      _ ← admit base owner "a" (moduleNamed "asyncnamed")
+      _ ← admit base owner "b" (moduleNamed "asyncnamed")
+      awaitPhase base owner "a" Active
+      awaitPhase base owner "b" Active
+      expectDelivered base owner "a" 1
+      expectDelivered base owner "b" 1
+      awaitPending fixture "a" 1
+      awaitPending fixture "b" 1
+      retireScheduled owner
+      awaitPhase base owner "a" Stopping
+      awaitPhase base owner "b" Stopping
+      readMVar (sfOwnerThread (sf base)) >>= awaitBlockedOnSTM
+      -- Both providers fail together: both endings settle as failed in one pass, and the
+      -- application's callback throws a different exception for each.
+      first ← provided fixture "named-1"
+      second ← provided fixture "named-2"
+      atomically $ do
+        writeTVar first (ProviderFailed (toException (Broken "retire named-1")))
+        writeTVar second (ProviderFailed (toException (Broken "retire named-2")))
+      awaitScheduledTerminal control owner
+    let seen = show raised : [show (cleanupFailureException found) | found ← cleanupFailuresInContext context]
+    seen `shouldSatisfy` any (Text.isInfixOf "escalation a" . Text.pack)
+    seen `shouldSatisfy` any (Text.isInfixOf "escalation b" . Text.pack)
 
   it "begins nothing once a provider's failed retirement is observed: work queued behind it never starts, and the owner exits as a failure" $ bounded $ do
     fixture ← newLFix 4

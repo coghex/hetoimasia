@@ -105,6 +105,7 @@ module Hetoimasia.Scripting.Lua.Lease.State
   , finishDisposals
   , retirementsReady
   , renderCaught
+  , guarded
   , anyPending
   , noteScope
   , readScope
@@ -602,7 +603,7 @@ drainScope host number = mask_ $ do
     started ← atomically (beginRelease leases (Just number) key)
     case started of
       StartLive (Holding member) → do
-        outcome ← tryWithContext @SomeException (retireOwnedMember (lhCollection host) (lhCapability host) member)
+        outcome ← guarded (retireOwnedMember (lhCollection host) (lhCapability host) member)
         ended ← atomically (endRelease leases key (() <$ outcome))
         pure $ case ended of
           EndedFailed failure → Left failure
@@ -703,13 +704,35 @@ serviceRetirements leases = do
       pure ([obligation | Left obligation ← polled], [ended | Right ended ← polled])
 
 -- | Ask a provider where its retirement has got to, as a retirement and nothing else can
--- fail it. The provider's reading is application code and may throw: that is the
--- retirement failing, and is how it is retained, as cleanup evidence, while the others
--- go on being served and awaited. A reading that retries says it is not done.
+-- fail it. The provider's reading is application code and may throw, when it is run or
+-- when what it answered is evaluated: either is the retirement failing, and is how it is
+-- retained, as cleanup evidence, while the others go on being served and awaited. The
+-- reading is evaluated, as far as anything later inspects it, inside the guard that
+-- catches what it throws. A reading that retries says it is not done.
+--
+-- This is the one place a provider's reading is run: servicing and the wait for readiness
+-- both read through it.
 pollObligation ∷ Obligation → STM RetirementState
 pollObligation obligation =
-  (obligationState obligation `catchSTM` \failure → pure (ProviderFailed (failure ∷ SomeException)))
+  (reading `catchSTM` \failure → pure (ProviderFailed (failure ∷ SomeException)))
     `orElse` pure ProviderPending
+  where
+    reading = obligationState obligation >>= evaluated
+    -- The constructor is evaluated here, with the failure it carries (a strict field): all
+    -- that servicing and readiness go on to inspect.
+    evaluated state = case state of
+      ProviderPending → pure state
+      ProviderComplete → pure state
+      ProviderFailed failure → failure `seq` pure state
+
+-- | Run a call into provider or application code during retirement or teardown, answering
+-- the failure it raised, with its context, instead of raising it, and evaluating what it
+-- answered inside the same guard: a value that throws when it is first inspected is the
+-- call failing, not an exception loose in whatever inspects it. Every such call that is
+-- run on the owner's behalf goes through here, so that a failure is evidence and not a
+-- reason to stop serving the others.
+guarded ∷ IO a → IO (Either (ExceptionWithContext SomeException) a)
+guarded action = tryWithContext @SomeException (action >>= evaluate)
 
 -- | An exception as the bounded line a settlement keeps. Rendering is the exception's
 -- own code, which may throw as well: that is rendered too, not raised.

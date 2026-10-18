@@ -16,7 +16,10 @@ module Test.LuaRuntime.Instance.Lease.Support
     -- * The fake world
   , breakRelease
   , blockRelease
+  , QueryFault (..)
+  , faultQuery
   , throwQuery
+  , twoEscalating
   , awaitReleaseEntered
   , proceedRelease
   , completeRetirement
@@ -74,10 +77,11 @@ module Test.LuaRuntime.Instance.Lease.Support
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, retry, throwSTM, writeTVar)
-import Control.Exception (SomeException, finally, throwIO, toException, try)
+import Control.Exception (SomeException, finally, throw, throwIO, toException, try)
 import Control.Monad (forM_, void)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
+import Data.Maybe (fromMaybe)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -125,8 +129,8 @@ data LFix = LFix
     -- ^ Opened when a release has reached its gate.
   , lfProceed ∷ !(MVar ())
     -- ^ Opened by the example to let a release at its gate go on.
-  , lfThrowing ∷ !(TVar (Set Text))
-    -- ^ The resources whose provider's query of where its retirement has got to throws.
+  , lfThrowing ∷ !(TVar (Map Text QueryFault))
+    -- ^ The resources whose provider's query of where its retirement has got to fails, and how.
   }
 
 -- | A fixture whose instances may each have this much charged.
@@ -135,7 +139,7 @@ newLFix capacity = do
   base ← newIFixture
   lending ← newLending
   leases ← newLeases lending capacity
-  LFix base lending leases <$> newIORef Set.empty <*> newIORef Map.empty <*> newIORef Map.empty <*> newIORef Set.empty <*> newEmptyMVar <*> newEmptyMVar <*> newTVarIO Set.empty
+  LFix base lending leases <$> newIORef Set.empty <*> newIORef Map.empty <*> newIORef Map.empty <*> newIORef Set.empty <*> newEmptyMVar <*> newEmptyMVar <*> newTVarIO Map.empty
 
 -- | Record that something happened, in the order the hooks and the fakes share.
 note ∷ LFix → Text → IO ()
@@ -163,9 +167,24 @@ breakRelease fixture name = atomicModifyIORef' (lfBreaking fixture) (\held → (
 blockRelease ∷ LFix → Text → IO ()
 blockRelease fixture name = atomicModifyIORef' (lfBlocking fixture) (\held → (Set.insert name held, ()))
 
+-- | How a provider's query of where a retirement has got to fails.
+data QueryFault
+  = -- | It throws when it is run.
+    QueryThrows
+  | -- | It answers, and what it answered throws when it is first inspected.
+    QueryLazy
+  | -- | It answers that the retirement failed, with a failure that throws when it is first
+    -- inspected.
+    QueryLazyFailure
+  deriving (Eq, Show)
+
+-- | From now on the query of where this resource's retirement has got to fails this way.
+faultQuery ∷ LFix → Text → QueryFault → IO ()
+faultQuery fixture name fault = atomically (modifyTVar' (lfThrowing fixture) (Map.insert name fault))
+
 -- | From now on the query of where this resource's retirement has got to throws.
 throwQuery ∷ LFix → Text → IO ()
-throwQuery fixture name = atomically (modifyTVar' (lfThrowing fixture) (Set.insert name))
+throwQuery fixture name = faultQuery fixture name QueryThrows
 
 -- | Wait until a release has reached its gate.
 awaitReleaseEntered ∷ LFix → IO ()
@@ -253,8 +272,12 @@ asynchronous fixture name retirements = do
       ( \tv → do
           note fixture ("retire " <> name)
           retireAsynchronously retirements name $ do
-            throwing ← readTVar (lfThrowing fixture)
-            if Set.member name throwing then throwSTM (Broken ("query " <> name)) else readTVar tv
+            faulted ← Map.lookup name <$> readTVar (lfThrowing fixture)
+            case faulted of
+              Just QueryThrows → throwSTM (Broken ("query " <> name))
+              Just QueryLazy → pure (throw (Broken ("lazy query " <> name)))
+              Just QueryLazyFailure → pure (ProviderFailed (throw (Broken ("lazy failure " <> name))))
+              Nothing → readTVar tv
       )
   pure name
 
@@ -297,6 +320,11 @@ dependentNow fixture name retirements = do
 -- | The same, with every failure of an instance escalated to the owner.
 escalating ∷ InstanceConfig
 escalating = leaseConfig {instanceEscalate = \_ → pure Escalate}
+
+-- | Every failure of an instance is told to the application, whose callback throws a
+-- distinct exception of its own for each instance, named for it, and escalates nothing.
+twoEscalating ∷ InstanceConfig
+twoEscalating = leaseConfig {instanceEscalate = \failure → throwIO (Broken ("escalation " <> fromMaybe "" (failureName failure)))}
 
 -- | The bindings: @lease.open@ and its variants acquire, @lease.use@ borrows, and
 -- @lease.release@ is the explicit release. All of them are the binding author's view of

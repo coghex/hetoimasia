@@ -198,7 +198,7 @@ module Hetoimasia.Scripting.Lua.Lease
   ) where
 
 import Control.Concurrent.STM (STM, atomically)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, mask, rethrowIO, throwIO, tryWithContext)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), mask, rethrowIO, throwIO)
 import Control.Monad (forM, forM_)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Text (Text)
@@ -302,7 +302,7 @@ acquireWith leases ownership build = do
     -- Nothing between the reservation and its end may leave it charged: whatever
     -- ends the acquisition without a registered lease gives the reservation back.
     outcome ←
-      tryWithContext @SomeException . restore $
+      guarded . restore $
         acquireLentThen loan (build (retirementsFor leases key)) $ \member → do
           -- Masked, in the step that registered the member, and with nothing
           -- interruptible before it: the member and its record come to exist together.
@@ -385,7 +385,7 @@ releaseLease leases key = do
       StartFailed failure → rethrowIO failure
       StartRefused refusal → refuse refusal
       StartLive (Holding member) → do
-        outcome ← tryWithContext @SomeException (retireLent loan member)
+        outcome ← guarded (retireLent loan member)
         status ← memberStatus member
         case (outcome, status) of
           -- The collection refused before it released anything: nothing of the lease

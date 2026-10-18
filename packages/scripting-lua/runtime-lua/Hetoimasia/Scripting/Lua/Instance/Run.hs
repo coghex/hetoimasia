@@ -78,7 +78,7 @@ module Hetoimasia.Scripting.Lua.Instance.Run
   ) where
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', orElse, readTVar, readTVarIO, retry, swapTVar, writeTVar)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, finally, fromException, mask, mask_, onException, rethrowIO, throwIO, tryWithContext, uninterruptibleMask_)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, finally, fromException, mask, mask_, onException, rethrowIO, throwIO, uninterruptibleMask_)
 import Control.Monad (forM, forM_, unless, void, when)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
@@ -107,6 +107,7 @@ import Hetoimasia.Scripting.Lua.Lease.State
   , pendingFor
   , readScope
   , renderCaught
+  , guarded
   , retirementsReady
   , serviceRetirements
   )
@@ -1329,7 +1330,7 @@ finishEnding ih cell closed = do
     when (created && safe && safeStill && not (hookStarted (endShutdown ending))) $ do
       -- A release that fails is cleanup evidence, kept for the owner's end: nothing
       -- the application's escalation answers can hide it.
-      released ← tryWithContext @SomeException (withRunning ih (icId cell) (callEntry (ihOwned ih) (ihDriver ih) "release" [slot]))
+      released ← guarded (withRunning ih (icId cell) (callEntry (ihOwned ih) (ihDriver ih) "release" [slot]))
       case released of
         Right _ → pure ()
         Left failure@(ExceptionWithContext context raised)
@@ -1406,7 +1407,7 @@ serviceRetirementsOf ih = case ihLeases ih of
       -- release is: uninterruptibly, one at a time, a failure of one not stopping the rest.
       forM_ disposals $ \Disposals {disposalsKey = key, disposalsInstance = number, disposalsActions = actions} → do
         failures ← forM actions $ \dispose →
-          either Just (const Nothing) <$> tryWithContext @SomeException (uninterruptibleMask_ dispose)
+          either Just (const Nothing) <$> guarded (uninterruptibleMask_ dispose)
         forM_ [failure | Just failure ← failures] $ \failure → do
           rendered ← renderCaught failure
           modifyIORef' (ihExtra ih) (<> [("lua lease dependency", failure)])
@@ -1425,9 +1426,15 @@ serviceRetirementsOf ih = case ihLeases ih of
         then pure (False, Nothing)
         else do
           modifyIORef' (ihParked ih) (Set.delete number)
-          outcome ← tryWithContext @SomeException (withCell ih number (settleEnding ih))
+          outcome ← guarded (withCell ih number (settleEnding ih))
           pure (True, either Just (const Nothing) outcome)
-    forM_ (take 1 [failure | (_, Just failure) ← settledEach]) rethrowIO
+    -- None is dropped: the first is raised, and every other is cleanup evidence for the
+    -- owner's end, whole, so that supervision receives each of them.
+    case [failure | (_, Just failure) ← settledEach] of
+      failure : others → do
+        modifyIORef' (ihExtra ih) (<> [("lua instance settlement", other) | other ← others])
+        rethrowIO failure
+      [] → pure ()
     let settled = map fst settledEach
     pure (done || or settled)
 
@@ -1569,7 +1576,7 @@ retireInstances ih = do
   -- the application's escalation) is kept for the owner's outcome and does not leave
   -- another unended, and none is left unsettled whatever was raised.
   failures ← forM cells $ \cell → do
-    ended ← tryWithContext @SomeException $ do
+    ended ← guarded $ do
       settled ← isJust <$> readTVarIO (icResult cell)
       -- The way it ends, in order or as discarded, is the owner's exit mode, which
       -- 'finishEnding' reads.
@@ -1581,7 +1588,7 @@ retireInstances ih = do
         recordExit ih (Just (if isJust (fromException raised ∷ Maybe SomeAsyncException) then ExitCancelled else ExitFailed))
         -- Settled from what its ending recorded, which the failure of the host did not
         -- replace; what telling the application raises is kept beside it.
-        again ← tryWithContext @SomeException (discardUnsettled ih cell)
+        again ← guarded (discardUnsettled ih cell)
         pure (failure : [telling | Left telling ← [again]])
       Right () → pure []
   -- An instance whose provider has not finished retiring what it released is parked,
@@ -1606,7 +1613,7 @@ awaitRetirements ih = case ihLeases ih of
   Just lh → uninterruptibleMask_ (loop lh [])
   where
     loop lh raised = do
-      served ← tryWithContext @SomeException (serviceRetirementsOf ih)
+      served ← guarded (serviceRetirementsOf ih)
       let raised' = raised <> [failure | Left failure ← [served]]
       parked ← Set.toList <$> readIORef (ihParked ih)
       -- An ending whose retirements have all been taken is ready to settle whether or not
