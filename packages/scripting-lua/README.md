@@ -2618,7 +2618,8 @@ how a request is handed to it), the bound on the requests the owner holds, and w
 was given; the finalizer refusals do not change (an asynchronous binding still cannot be declared finalizer-eligible,
 and a call made while the VM closes is still refused with `FinalizerRefused` before dispatch). A grant that does not
 make sense (a bound below one, no endpoint, an invalid or repeated endpoint name, a result schema that names a
-capability) is refused before anything starts as `RequestGrantRefused`, naming every reason. One registration serves
+capability, or value limits too small to hold the smallest failure or cancellation record a script is handed:
+`SettlementsDoNotFit`) is refused before anything starts as `RequestGrantRefused`, naming every reason. One registration serves
 any number of owners with different grants, because the binding's action is handed the *owner's own* `RequestContext`,
 read from the owner's configuration and never from a value a script supplied (`asynchronousNativeRequestIn`).
 
@@ -2639,9 +2640,11 @@ A reply is bounded before it is retained, against the owner's value limits and t
 measured is the record a script is handed when it takes the result, not the bare value, so a result that is
 retained is a result that can be delivered. A result over the limits settles an unsettled request as a failure, its
 value never kept, and retires the provider's accounting, as the model's `applyReplyIn` does; so does a result that is
-not what the endpoint declares. Taking a settlement retires its handle, so it never loses one to a fault: a result
-that the taking operation itself cannot hold (its declared schema is not the endpoint's) is delivered as a failure
-that says so.
+not what the endpoint declares. The same holds for a failure: a provider's failure reason is bounded, and one whose
+record would not fit the limits is retained as a failure that says so. Every record a script is handed (result,
+failure, cancellation) fits the owner's limits. Taking a settlement retires its handle, so it never loses one to a
+fault: a result that the taking operation itself cannot hold (its declared schema is not the endpoint's) is
+delivered as a failure that says so.
 
 ### What a script sees
 
@@ -2741,9 +2744,12 @@ that ended long before the request settled (a completion held for its tick) neve
 ### Epochs
 
 `advanceRequestEpoch` (P-9) replaces the generation of an owner's records at a moment the application chooses.
-Every outstanding request settles, once, as cancelled by the epoch change, and its script can take that; a settled
-result nobody had taken is discarded with the epoch's records, as the model discards it; the ticks the requests held
-are let go; and the providers whose work that was are told. The accounting for work that is not over is retained under
+Every outstanding request settles, once, as cancelled by the epoch change, and its script can take that; a cancellation
+nobody has taken is still a place held, charged to the bound until it is taken, so repeated epochs cannot accumulate
+more than the bound; a settled result nobody had taken is discarded with the epoch's records, as the model discards
+it; the ticks the requests held are let go; and the providers whose work that was are told by the owner at its next
+boundary, as for every other withdrawal of interest, so one that raises is a failure of the host under the owner's
+policy and nothing is raised on the application's thread. The accounting for work that is not over is retained under
 the identities it was issued under, so a late reply retires it without reaching anything the new epoch issues.
 Instances and tasks are not invalidated by it.
 
@@ -2759,7 +2765,9 @@ is dropped: where failures arise together the first is raised and the others are
   a failure of application code: a failure of the host under the owner's `WorkerPolicy`, unconverted. A request
   whose handoff raised is taken back as though it had never been admitted.
 * A provider's retirement that fails, and the disposal of what its work needed that raises, are cleanup failures:
-  retained on the work, never retried, fatal under every policy.
+  retained on the work, never retried, fatal under every policy. Servicing answers each once, and recording it is
+  the same masked step, so a cancellation of the owner cannot come between and lose it; the same holds for a tell
+  that was claimed.
 
 ### Determinism
 
