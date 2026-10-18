@@ -72,8 +72,8 @@ module Hetoimasia.Scripting.Lua.Instance.Run
   , settleEnded
   , reapInvocations
   , retireInstances
+  , runningTask
   , recordExit
-  , closingAs
   , cleanupEndedOwner
   ) where
 
@@ -83,7 +83,8 @@ import Control.Monad (forM, forM_, unless, void, when)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Foldable (toList)
+import Data.Foldable (toList, traverse_)
+import Hetoimasia.Scripting.Lua.Lifecycle.State (abandonIssued)
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Sequence (ViewL (EmptyL, (:<)), viewl, (<|))
 import qualified Data.Set as Set
@@ -166,8 +167,12 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , startElapsedCadence
   , startLogicalCadence
   , stopCadence
-  , takeCadenceFirings
+  , releaseWatch
+  , setWatch
+  , takeNextCadenceFiring
   , tasksReady
+  , watchKey
+  , watchTick
   , BehaviorId (BehaviorId)
   , ControlRequest (RequestPause, RequestResume, RequestStop)
   , ControlResult (ControlAlreadyInState, ControlApplied, ControlNoLongerApplicable)
@@ -296,6 +301,9 @@ data InstanceHost = InstanceHost
   , ihFailed ∷ !(IORef Bool)
     -- ^ Whether a cleanup failure of the leases ended the owner: it is how the owner exits,
     -- as a failure and not an order, whatever stopped its loop.
+  , ihDue ∷ !(IORef [(ControlSlot, LogicalControl)])
+    -- ^ The requests assigned to a tick the owner has reached that have not begun, in
+    -- the order of their places: the same, for logical admission.
   }
 
 -- | The host of an owner's instances.
@@ -324,6 +332,7 @@ newInstanceHost control instances escalate host owned driver handles tasks extra
     <*> pure leases
     <*> newIORef Set.empty
     <*> newIORef False
+    <*> newIORef []
 
 -- | Record how the owner exits, for the instances it leaves: the one place that writes it.
 -- The first failure or cancellation recorded is how the owner exits, and nothing later (a
@@ -346,6 +355,7 @@ gateOf control =
         stopping ← controlStopping control
         pure (not closed && not stopping)
     , gateTick = readTick scheduler
+    , gateWatch = watchTick scheduler
     , gateExecution = \task →
         taskPhase scheduler task <&> \case
           Just PhaseRunning → ExecRunning
@@ -402,7 +412,7 @@ serviceInstances ih = do
   mask_ $ do
     jobs ← atomically (takeJobs (ihInstances ih))
     modifyIORef' (ihBacklog ih) (<> toList jobs)
-  mask (\restore → drainBacklog restore)
+  mask (drainBacklog ih)
   halting ← halted
   unless halting dispatchAll
   where
@@ -412,18 +422,22 @@ serviceInstances ih = do
     -- An owner that was asked to stop begins nothing more: what is left is settled by
     -- its exit, not started now.
     halted = atomically (controlStopping (ihControl ih))
-    -- A job leaves the backlog as it begins, with the handler that settles a request
-    -- it raised on already installed, so no cancellation lands between. A halt is
-    -- looked at before each job, so a batch the owner was asked to stop in the middle
-    -- of is not carried on with.
-    drainBacklog restore = do
-      halting ← halted
-      readIORef (ihBacklog ih) >>= \case
-        job : rest | not halting → do
-          writeIORef (ihBacklog ih) rest
-          restore (run job) `onException` abandon job
-          drainBacklog restore
-        _ → pure ()
+
+-- | Begin the jobs of the backlog, in order. A job leaves the backlog as it begins, with
+-- the handler that settles a request it raised on already installed, so no cancellation
+-- lands between. A halt is looked at before each job, so a batch the owner was asked to
+-- stop in the middle of is not carried on with: what is left stays where the owner's exit
+-- finds it.
+drainBacklog ∷ InstanceHost → (∀ a. IO a → IO a) → IO ()
+drainBacklog ih restore = do
+  halting ← atomically (controlStopping (ihControl ih))
+  readIORef (ihBacklog ih) >>= \case
+    job : rest | not halting → do
+      writeIORef (ihBacklog ih) rest
+      restore (run job) `onException` abandon job
+      drainBacklog ih restore
+    _ → pure ()
+  where
     run = \case
       JobStart number → withCell ih number (startInstance ih)
       JobDispatch number → withCell ih number $ \cell → do
@@ -625,6 +639,16 @@ withRunning ∷ InstanceHost → Word64 → IO a → IO a
 withRunning ih number action = do
   atomically (writeTVar (insRunning (ihInstances ih)) (Just number))
   action `finally` atomically (writeTVar (insRunning (ihInstances ih)) Nothing)
+
+-- | Run this on behalf of the instance whose invocation the task is, if it is one: what the
+-- scheduler runs of a task that is no segment of it (closing its coroutine, which runs the
+-- script's closing handlers) is still the instance's code, and a binding it calls must be told
+-- so.
+runningTask ∷ InstanceHost → TaskId → IO a → IO a
+runningTask ih task action =
+  Map.lookup task <$> readIORef (ihLive ih) >>= \case
+    Just live → withRunning ih (liveSlot live) action
+    Nothing → action
 
 -- | Whether a module has a hook, as an entry point it declares and has. One that is
 -- there and is not a function is a hook: running it raises the host's fault for it.
@@ -980,13 +1004,68 @@ nextFuture deadline interval now =
 -- any task that grant woke is chosen: an instance's invocation in flight is in flight
 -- here, and a callback the grant resumes is still active.
 serviceCadence ∷ InstanceHost → IO Bool
-serviceCadence ih = do
-  firings ← atomically (takeCadenceFirings (scheduler' ih))
-  forM_ firings (serveFiring ih)
-  -- A tick just served has had no chance to run its update yet: it is looked at the
-  -- next time round, which the answer below makes the boundary do.
-  released ← settleHolds ih (map fst firings)
-  pure (not (null firings) || released)
+serviceCadence ih = go []
+  where
+    -- The points are taken one at a time, so those behind the one being served are still the
+    -- scheduler's, where a pause, a resume or an ending that comes first can invalidate them.
+    go served =
+      atomically (takeNextCadenceFiring (scheduler' ih)) >>= \case
+        Just (key, firing)
+          | key == watchKey → serveWatch ih firing >> go (key : served)
+          | otherwise → serveFiring ih (key, firing) >> go (key : served)
+        Nothing → do
+          -- A tick just served has had no chance to run its update yet: it is looked at the
+          -- next time round, which the answer below makes the boundary do.
+          released ← settleHolds ih served
+          pure (not (null served) || released)
+
+-- | The tick the owner asked to be held at has been reached, and the grant that reached it is
+-- held, so no later one is applied until this is done: the controls the application assigned to
+-- it, and to any earlier tick, are applied, in the order of their places, and then the grant is
+-- let go. It is the first point of its grant, so they are applied before any cadence point of
+-- the tick, which then finds the instance as they left it, and so before any task the tick woke.
+-- What is queued for a later tick is what the owner next asks to be held at, in the step that
+-- takes these, so no request can be queued between.
+serveWatch ∷ InstanceHost → CadenceFiring → IO ()
+serveWatch ih = \case
+  FiredLogical tick → do
+    -- The controls are taken and kept where the owner's exit settles them in one masked step.
+    mask_ $ do
+      taken ← atomically $ do
+        due ← takeDueControls (ihInstances ih) tick
+        later ← readTVar (insLogical (ihInstances ih))
+        setWatch (scheduler' ih) (fst <$> Map.lookupMin (Map.mapKeys controlTick later))
+        pure due
+      modifyIORef' (ihDue ih) (<> taken)
+    applyDue ih (const True)
+    atomically (releaseWatch (scheduler' ih))
+  _ → atomically (releaseWatch (scheduler' ih))
+
+-- | Apply the controls held for this boundary, from the front, for as long as the places
+-- they were assigned satisfy the test. Each leaves the list as it begins, with the handler
+-- that settles it if applying it raised already installed, so no cancellation lands between:
+-- whatever is not begun stays where the owner's exit settles it, and a halt stops the
+-- batch as it stops the jobs'.
+applyDue ∷ InstanceHost → (ControlSlot → Bool) → IO ()
+applyDue ih wanted = mask loop
+  where
+    loop ∷ (∀ a. IO a → IO a) → IO ()
+    loop restore = do
+      halting ← atomically (controlStopping (ihControl ih))
+      readIORef (ihDue ih) >>= \case
+        (slot, control) : rest | wanted slot && not halting → do
+          writeIORef (ihDue ih) rest
+          restore (applyLogical ih control) `onException` atomically (settleReceipt (logicalReceipt control) ControlNoLongerApplicable)
+          loop restore
+        _ → pure ()
+
+-- | One request the application assigned to a tick, at that tick's boundary.
+applyLogical ∷ InstanceHost → LogicalControl → IO ()
+applyLogical ih (LogicalControl number request receipt) = do
+  found ← lookupCell ih number
+  case found of
+    Just cell → applyControl ih cell request receipt
+    Nothing → atomically (settleReceipt receipt ControlNoLongerApplicable)
 
 -- | One cadence point.
 serveFiring ∷ InstanceHost → (CadenceKey, CadenceFiring) → IO ()
@@ -1352,16 +1431,6 @@ serviceRetirementsOf ih = case ihLeases ih of
     let settled = map fst settledEach
     pure (done || or settled)
 
--- | Run an action as the instance whose invocation a task is: closing its coroutine
--- runs the to-be-closed handlers the script defined, and what they call is told which
--- instance is calling, so that a handler may release a handle it holds.
-closingAs ∷ InstanceHost → TaskId → IO a → IO a
-closingAs ih task action = do
-  held ← Map.lookup task <$> readIORef (ihLive ih)
-  case held of
-    Just live → withRunning ih (liveSlot live) action
-    Nothing → action
-
 -- | Record what became of an instance's @shutdown@ in its ending.
 recordShutdown ∷ InstanceHost → ICell → ShutdownRecord → IO ()
 recordShutdown ih cell record =
@@ -1445,7 +1514,14 @@ settleEnding ih cell = do
   -- cannot cut between: an instance settled as failed is told of, once. The telling is
   -- application code and is interruptible.
   mask $ \restore → do
-    won ← atomically (settleInstance (ihInstances ih) cell settlement)
+    -- The instance's end is also the end of its interest in what it asked of other
+    -- instances: the receipts it held are abandoned in the step that settles it, so none
+    -- is left that nothing can read, and none of what it asked is undone.
+    won ← atomically $ do
+      settled ← settleInstance (ihInstances ih) cell settlement
+      overtakeLogical (ihInstances ih) (icId cell)
+      traverse_ (`abandonIssued` icId cell) (controlLifecycle (ihControl ih))
+      pure settled
     -- The instance has settled: its scope is dissolved, whatever the application's
     -- decision about its failure comes to.
     forM_ (ihLeases ih) $ \lh → atomically (dissolveScope (lhLeases lh) (icId cell))
@@ -1479,6 +1555,15 @@ retireInstances ih = do
   forM_ (backlog <> toList jobs) $ \case
     JobControl _ _ receipt → atomically (settleReceipt receipt ControlNoLongerApplicable)
     _ → pure ()
+  -- A request assigned to a tick the owner never reached, or one it had taken for a
+  -- boundary and not begun, is overtaken by the owner's end like any other: it settles
+  -- as no longer applicable, once, and is never applied at a boundary that does not
+  -- come.
+  held ← readIORef (ihDue ih)
+  writeIORef (ihDue ih) []
+  waiting ← atomically (takeAllLogical (ihInstances ih))
+  forM_ (map snd held <> waiting) $ \control →
+    atomically (settleReceipt (logicalReceipt control) ControlNoLongerApplicable)
   cells ← Map.elems <$> readTVarIO (insCells (ihInstances ih))
   -- Each instance ends on its own: what one raises (a host failure from its hook, or
   -- the application's escalation) is kept for the owner's outcome and does not leave

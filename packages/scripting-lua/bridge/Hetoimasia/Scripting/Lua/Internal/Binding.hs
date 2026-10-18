@@ -168,8 +168,19 @@ valueHandler boundary vm space binding state restore = do
         lua_settop state entry
         effect ← current
         faulted (ScriptFailed (classify status) value) effect
-  case bindingAction binding of
+  -- A lifecycle operation is delivered only by an owner configured with the context
+  -- that delivers it, and that context is handed to its action; one a finalizer may
+  -- call is never delivered, whatever the owner has, since nothing a finalizer runs
+  -- may reach the application's lifecycle. Anything else of a reserved kind is
+  -- refused as not yet supported, with its action never run.
+  let delivered = case (bindingAction binding, boundaryLifecycle boundary) of
+        (LifecycleAction run, Just lifecycle) | not (bindingFinalizer binding) → ValuesAction (run lifecycle)
+        (other, _) → other
+  case delivered of
     ReservedAction _ → do
+      effect ← current
+      faulted (NotYetSupported (bindingKind binding)) effect
+    LifecycleAction _ → do
       effect ← current
       faulted (NotYetSupported (bindingKind binding)) effect
     action → do

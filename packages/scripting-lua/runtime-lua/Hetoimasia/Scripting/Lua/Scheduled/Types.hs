@@ -33,6 +33,7 @@ module Hetoimasia.Scripting.Lua.Scheduled.Types
 import Control.Concurrent.STM (STM, TVar, modifyTVar', readTVar, writeTVar)
 import Control.DeepSeq (NFData (rnf))
 import Control.Monad (forM, when)
+import Data.Foldable (traverse_)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
@@ -40,6 +41,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Word (Word64)
 import Hetoimasia.Scripting.Lua.Instance.Types (Instances)
+import Hetoimasia.Scripting.Lua.Lifecycle.State (LifecycleState, abandonAll, sweepEndedTasks)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (TaskId)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits (ServiceClass)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Task (TaskFailure)
@@ -202,6 +204,9 @@ data Control = Control
     -- ^ Whether the owner has been asked to stop, or has begun to exit.
   , controlInstances ∷ !(Maybe Instances)
     -- ^ The owner's script instances, when it hosts any.
+  , controlLifecycle ∷ !(Maybe LifecycleState)
+    -- ^ What the owner's lifecycle services hold, when it was granted them: the receipts of
+    -- what its scripts asked, which its exit abandons.
   }
 
 -- | Where an owner's tasks are admitted. Any thread may hold and use it.
@@ -239,6 +244,9 @@ forgetCell control cell = do
 -- Answers whether it gave any back.
 sweepForgotten ∷ Control → STM Bool
 sweepForgotten control = do
+  -- The receipts of the tasks that ended are abandoned here, as the tickets of forgotten
+  -- tasks are given back: on the owner's own thread, as it accounts for what ended.
+  lifecycle ← maybe (pure False) (sweepEndedTasks (controlScheduler control)) (controlLifecycle control)
   cells ← readTVar (controlCells control)
   mapM_
     ( \cell → do
@@ -247,7 +255,7 @@ sweepForgotten control = do
     )
     (Map.elems cells)
   remaining ← readTVar (controlCells control)
-  pure (Map.size remaining < Map.size cells)
+  pure (lifecycle || Map.size remaining < Map.size cells)
 
 settlementOf ∷ Control → TaskId → Maybe CallFault → TerminalResult Cursor → ScheduledSettlement
 settlementOf control identity fault terminal =
@@ -274,6 +282,9 @@ settleAll control kind =
   readTVar (controlExit control) >>= \case
     Just _ → pure ()
     Nothing → do
+      -- Nobody will read a receipt the owner's scripts held: each is abandoned, so a
+      -- request still waiting gives its reservation back as it settles, and none is undone.
+      traverse_ abandonAll (controlLifecycle control)
       cells ← readTVar (controlCells control)
       started ← readTVar (controlStarted control)
       counts ← forM (Map.toList cells) $ \(identity, cell) →

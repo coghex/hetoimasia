@@ -237,7 +237,12 @@ module Hetoimasia.Scripting.Lua.Scheduler
   , disarmCadence
   , stopCadence
   , takeCadenceFirings
+  , takeNextCadenceFiring
   , cadenceFiringsPending
+  , watchKey
+  , watchTick
+  , setWatch
+  , releaseWatch
   , releaseCadenceHold
   , cadenceHeld
   , cadenceAccrued
@@ -580,6 +585,31 @@ takeCadenceFirings scheduler = do
   let (taken, next) = cadenceTake state
   writeTVar (schedState scheduler) next
   pure taken
+
+-- | The first cadence point reached and not taken. A point taken one at a time leaves the
+-- ones behind it where a pause, a resume or an ending can still invalidate them.
+takeNextCadenceFiring ∷ Scheduler v → STM (Maybe (CadenceKey, CadenceFiring))
+takeNextCadenceFiring scheduler = do
+  state ← readTVar (schedState scheduler)
+  let (taken, next) = cadenceTakeNext state
+  writeTVar (schedState scheduler) next
+  pure taken
+
+-- | Ask to be held at a tick, if it is earlier than the one already asked for. A grant that
+-- reaches it is held, and not finished, and no later one is applied, until the owner releases
+-- it ('releaseWatch'), exactly as a cadence point holds one: the point is first among those the
+-- grant reached, under 'watchKey', and is taken on the owner's thread at the boundary that
+-- follows, before any task the grant woke is chosen. A scheduler that has stopped keeps nothing.
+watchTick ∷ Scheduler v → Word64 → STM ()
+watchTick scheduler tick = modifyTVar' (schedState scheduler) (watchTickIn tick)
+
+-- | Set the tick the owner asks to be held at, replacing any.
+setWatch ∷ Scheduler v → Maybe Word64 → STM ()
+setWatch scheduler target = modifyTVar' (schedState scheduler) (setWatchIn target)
+
+-- | Give back the grant the watch holds, once the owner has done what the tick asked of it.
+releaseWatch ∷ Scheduler v → STM ()
+releaseWatch scheduler = modifyTVar' (schedState scheduler) releaseWatchIn
 
 -- | Whether a cadence point has been reached and not taken.
 cadenceFiringsPending ∷ Scheduler v → STM Bool
@@ -1113,6 +1143,8 @@ stopScheduler scheduler host = mask_ $ do
           , ssCadenceLogical = Map.empty
           , ssCadenceElapsed = Map.empty
           , ssFirings = Seq.empty
+          , ssWatch = Nothing
+          , ssWatchHold = Nothing
           , ssControl = Seq.empty
           , ssToClose = Set.empty
           , ssEvidence = Seq.empty

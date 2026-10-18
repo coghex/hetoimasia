@@ -51,6 +51,9 @@ module Hetoimasia.Scripting.Lua.Instance.Types
   , InstanceControlAnswer (..)
   , InstanceControlReceipt (..)
   , InstanceControl (..)
+  , ControlAdmission (..)
+  , ControlSlot (..)
+  , LogicalControl (..)
 
     -- * Bounds
   , InstanceBounds (..)
@@ -487,7 +490,45 @@ data InstanceControlAnswer
   | -- | No live instance of this owner has this identity: it is another owner's,
     -- ended, or never issued.
     InstanceControlUnknown
+  | -- | The request was assigned a tick the owner has already begun: it is refused,
+    -- never applied at a later boundary. Nothing changed.
+    InstanceControlLate
+  | -- | Another request already holds this tick and sequence on this owner. Nothing
+    -- changed, and nothing was ordered by arrival.
+    InstanceControlDuplicate
+  | -- | The request was assigned a tick and a sequence, and this owner does not admit
+    -- controls logically. Nothing changed.
+    InstanceControlNotLogical
   deriving (Show)
+
+-- | How an owner admits the control requests made of its instances through a grant
+-- (LUA-23).
+data ControlAdmission
+  = -- | At the owner's next safe boundary, in the order the requests were accepted: the
+    -- way requests were always admitted.
+    AdmitOnArrival
+  | -- | By the tick and sequence the application assigned each request (D-23): a request
+    -- is applied at the logical boundary of its tick, before that tick's other work, in
+    -- the order of (tick, sequence), whatever order the requests arrived in and whichever
+    -- VM sent them. One assigned a tick the owner has begun is refused as late.
+    AdmitLogically
+  deriving (Eq, Show)
+
+-- | Where a control request belongs in a logically admitting owner's input sequence,
+-- as the application assigned it: the tick whose boundary applies it, and its place
+-- among the requests assigned to that tick. The pair is unique on an owner.
+data ControlSlot = ControlSlot
+  { controlTick ∷ !Word64
+  , controlSequence ∷ !Word64
+  }
+  deriving (Eq, Ord, Show)
+
+-- | An accepted request waiting for its tick's boundary.
+data LogicalControl = LogicalControl
+  { logicalInstance ∷ !Word64
+  , logicalRequest ∷ !InstanceControl
+  , logicalReceipt ∷ !InstanceControlReceipt
+  }
 
 -- | The place an accepted request's settlement is read. Reading it is observing
 -- it: the first read that finds it gives the reservation back, and every later
@@ -533,6 +574,10 @@ data InstanceConfig = InstanceConfig
     -- ^ The logical duration one tick stands for, which an interval given as a
     -- duration is converted by. No production rate is hard-coded: without it, an
     -- interval given as a duration is refused, and one given as ticks needs none.
+  , instanceControlAdmission ∷ !ControlAdmission
+    -- ^ How the requests made of this owner's instances through a grant are admitted
+    -- (LUA-23). The application's own 'Hetoimasia.Scripting.Lua.Instance.requestInstanceControl'
+    -- is admitted on arrival whatever this is.
   , instanceEscalate ∷ InstanceFailure → IO Escalation
     -- ^ Told, on the owner's thread, of each instance's failure after the instance
     -- has ended. It decides, and its default keeps the failure isolated. What it
@@ -540,10 +585,10 @@ data InstanceConfig = InstanceConfig
     -- evidence of the owner, which is fatal whatever it answers.
   }
 
--- | The default bounds, no event source, and an escalation that keeps every failure
--- isolated.
+-- | The default bounds, no event source, controls admitted on arrival, and an
+-- escalation that keeps every failure isolated.
 defaultInstanceConfig ∷ InstanceConfig
-defaultInstanceConfig = InstanceConfig defaultInstanceBounds [] Nothing (const (pure Isolate))
+defaultInstanceConfig = InstanceConfig defaultInstanceBounds [] Nothing AdmitOnArrival (const (pure Isolate))
 
 -- | A configuration problem.
 data InstanceViolation
@@ -783,6 +828,12 @@ data Instances = Instances
     -- ^ The @dt@, in seconds, of the update about to begin, and the instance it is
     -- for: the driver's entry point takes it through the one binding built for the
     -- purpose, so an update's boundary footprint is a one-shot's.
+  , insAdmission ∷ !ControlAdmission
+    -- ^ How the owner admits controls made through a grant.
+  , insLogical ∷ !(TVar (Map ControlSlot LogicalControl))
+    -- ^ The accepted requests assigned a tick the owner has not begun, by their place
+    -- in the input sequence, which is their order: each holds a reservation like any
+    -- accepted request, so they are bounded by 'boundInstanceControls'.
   }
 
 -- | Make an owner's instance state.
@@ -799,6 +850,8 @@ newInstances config =
     <*> newTVarIO Set.empty
     <*> newTVarIO False
     <*> newTVarIO Nothing
+    <*> pure (instanceControlAdmission config)
+    <*> newTVarIO Map.empty
 
 -- | An error as one line of text, at most 'failureTextLimit' characters.
 renderError ∷ InstanceError → Text
