@@ -33,6 +33,12 @@ module Test.LuaRuntime.Instance.Lease.Support
   , cachesHandle
   , asyncHolder
   , asyncRollback
+  , asyncShutdownFails
+  , asyncNamed
+  , escalating
+  , dependentHolder
+  , dependentNowHolder
+  , dependentRollback
   , cycler
   , overCapacity
   , breaker
@@ -216,6 +222,46 @@ asynchronous fixture name retirements = do
       )
   pure name
 
+-- A resource retired by a provider that finishes later, over a device it needs: the
+-- device is acquired first and ranked last, so its release comes after the resource's,
+-- and hands its disposal to the retirement instead of disposing the device itself.
+dependent ∷ LFix → Text → Retirements → Assembly Text
+dependent fixture name retirements = do
+  _ ←
+    acquirePart
+      (name <> ".device")
+      (releaseRank 1)
+      (note fixture ("acquire " <> name <> ".device"))
+      ( \_ → afterRetirement retirements $ do
+          note fixture ("dispose " <> name <> ".device")
+          breaking ← readIORef (lfBreaking fixture)
+          if Set.member (name <> ".device") breaking then throwIO (Broken ("dispose " <> name)) else pure ()
+      )
+  _ ← asynchronous fixture name retirements
+  pure name
+
+-- A resource released at once, over a device whose disposal is handed over all the same:
+-- nothing is pending, so it is disposed of inside the release.
+dependentNow ∷ LFix → Text → Retirements → Assembly Text
+dependentNow fixture name retirements = do
+  _ ←
+    acquirePart
+      (name <> ".device")
+      (releaseRank 1)
+      (note fixture ("acquire " <> name <> ".device"))
+      (\_ → afterRetirement retirements (note fixture ("dispose " <> name <> ".device")))
+  _ ←
+    acquirePart
+      name
+      (releaseRank 0)
+      (note fixture ("acquire " <> name))
+      (\_ → note fixture ("release " <> name))
+  pure name
+
+-- | The same, with every failure of an instance escalated to the owner.
+escalating ∷ InstanceConfig
+escalating = leaseConfig {instanceEscalate = \_ → pure Escalate}
+
 -- | The bindings: @lease.open@ and its variants acquire, @lease.use@ borrows, and
 -- @lease.release@ is the explicit release. All of them are the binding author's view of
 -- the API, and none of them does any cleanup of its own.
@@ -226,6 +272,12 @@ leaseNamespace fixture =
     [ opening "open" (\name _ → twoParts fixture name)
     , opening "open_failing" (\name _ → failingStages fixture name)
     , opening "open_async" (\name retirements → asynchronous fixture name retirements)
+    , opening "open_dependent" (dependent fixture)
+    , opening "open_dependent_now" (dependentNow fixture)
+    , opening "open_dependent_failing" $ \name retirements → do
+        _ ← dependent fixture name retirements
+        restoredStep (throwIO (Broken "constructor"))
+        pure name
     , -- An asynchronously retired first stage, then a stage that fails: the rollback hands
       -- the first over to its provider.
       opening "open_async_failing" $ \name retirements → do
@@ -523,6 +575,78 @@ asyncHolder =
     , "  end)"
     , "end"
     , "function shutdown(self, reason) " <> record <> "('shutdown ' .. self.id .. ' ' .. reason) end"
+    ]
+
+-- | Holds an asynchronously retired resource over a device, and releases it on a tick.
+dependentHolder ∷ ModuleSource
+dependentHolder =
+  hooksModule
+    "dependentholder"
+    [ "function init(self, api)"
+    , "  self.id = inst.next()"
+    , "  self.h = lease.open_dependent('dep-res')"
+    , "  api.connect('tick', function(self, event)"
+    , "    " <> record <> "('release ' .. lease.release(self.h))"
+    , "  end)"
+    , "end"
+    , "function shutdown(self, reason) " <> record <> "('shutdown ' .. self.id .. ' ' .. reason) end"
+    ]
+
+-- | Holds a resource released at once over a device whose disposal it hands over, and
+-- releases it on a tick.
+dependentNowHolder ∷ ModuleSource
+dependentNowHolder =
+  hooksModule
+    "dependentnowholder"
+    [ "function init(self, api)"
+    , "  self.id = inst.next()"
+    , "  self.h = lease.open_dependent_now('now-res')"
+    , "  api.connect('tick', function(self, event)"
+    , "    " <> record <> "('release ' .. lease.release(self.h))"
+    , "  end)"
+    , "end"
+    ]
+
+-- | Holds an asynchronously retired resource and a @shutdown@ that fails the way the host
+-- fails.
+asyncShutdownFails ∷ ModuleSource
+asyncShutdownFails =
+  hooksModule
+    "asyncshutdownfails"
+    [ "function init(self, api)"
+    , "  self.id = inst.next()"
+    , "  self.h = lease.open_async('async-hook')"
+    , "  api.connect('tick', function(self, event) end)"
+    , "end"
+    , "function shutdown(self, reason) fx.fail('boom') end"
+    ]
+
+-- | Holds an asynchronously retired resource named for the instance, and releases it on a
+-- tick.
+asyncNamed ∷ ModuleSource
+asyncNamed =
+  hooksModule
+    "asyncnamed"
+    [ "function init(self, api)"
+    , "  self.id = inst.next()"
+    , "  self.h = lease.open_async('named-' .. self.id)"
+    , "  api.connect('tick', function(self, event)"
+    , "    " <> record <> "('release ' .. lease.release(self.h))"
+    , "  end)"
+    , "end"
+    ]
+
+-- | A constructor that rolls back an asynchronously retired stage with a device.
+dependentRollback ∷ ModuleSource
+dependentRollback =
+  hooksModule
+    "dependentrollback"
+    [ "function init(self, api)"
+    , "  self.id = inst.next()"
+    , "  api.connect('tick', function(self, event)"
+    , "    local ok = pcall(lease.open_dependent_failing, 'dep-rolled')"
+    , "  end)"
+    , "end"
     ]
 
 -- | A constructor that rolls back an asynchronously retired stage.

@@ -144,6 +144,11 @@
 -- * a retirement the provider reports failed is retained as cleanup evidence and is
 --   fatal, and the lease it belonged to answers that failure and never success.
 --
+-- What a retirement needs is handed to it the same way ('afterRetirement'): the release of
+-- the part that owns a dependency defers its disposal, and the engine runs it once the
+-- provider has proved the retirement complete, so a dependency is never disposed under a
+-- retirement still using it.
+--
 -- Rolling back a failed constructor is no exception: a stage it rolled back
 -- whose provider has not finished keeps its charge and its owner's life until it has.
 --
@@ -173,6 +178,7 @@ module Hetoimasia.Scripting.Lua.Lease
   , acquireShared
   , Retirements
   , retireAsynchronously
+  , afterRetirement
   , RetirementState (..)
 
     -- * Using
@@ -192,14 +198,16 @@ module Hetoimasia.Scripting.Lua.Lease
   ) where
 
 import Control.Concurrent.STM (STM, atomically)
-import Control.Exception (SomeException, mask, rethrowIO, throwIO, tryWithContext)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, mask, rethrowIO, throwIO, tryWithContext)
+import Control.Monad (forM_)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Text (Text)
+import qualified Data.Text as Text
 import Data.Typeable (Typeable, gcast)
 import Data.Word (Word64)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (operation, throwFailure)
-import Hetoimasia.Foundation.Resource (Assembly, acquirePart, releaseRank)
+import Hetoimasia.Foundation.Resource (Assembly, acquirePart, cleanupFailureException, cleanupFailureLabel, cleanupFailuresInContext, releaseRank)
 import Hetoimasia.Foundation.Resource.OwnedCollection (MemberStatus (MemberLive), Retirement (AlreadyRetired, Retired, RetirementInUse), memberStatus)
 import Hetoimasia.Scripting.Lua.Instance.Types (InstanceId (instanceLocal))
 import Hetoimasia.Scripting.Lua.Internal.Fault (CallRefusal (CallRefusal))
@@ -245,13 +253,21 @@ newLeases lending capacity
 
 -- | What a release hands the engine when its resource is retired by a provider that
 -- finishes later.
-newtype Retirements = Retirements
+data Retirements = Retirements
   { retireAsynchronously ∷ Text → STM RetirementState → IO ()
     -- ^ Record that the release has handed the resource to its provider, under a
     -- label that names it in evidence, and say how to ask the provider where it has
     -- got to. Called from the part's release: it never waits, and the reading
     -- must not retry. The lease keeps its charge, and its owner stays live, until
     -- the reading says 'ProviderComplete' or 'ProviderFailed'.
+  , afterRetirement ∷ IO () → IO ()
+    -- ^ Hand over a dependency the retirements need. Called from the release of the
+    -- part that owns the dependency, which must be ranked after the parts being
+    -- retired: the disposal is run once every retirement the lease has recorded has
+    -- completed, uninterruptibly on the owner's thread and before the instance's stop
+    -- completion settles, and never before. At once, inside the release, if none is
+    -- pending. If a provider reports its retirement failed the disposal never runs: the
+    -- dependency is retained, as the resource is, and the failure is the evidence.
   }
 
 -- | Acquire a resource the instance owns, through a staged assembly. See the module
@@ -288,16 +304,32 @@ acquireWith leases ownership build = do
     -- ends the acquisition without a registered lease gives the reservation back.
     outcome ←
       tryWithContext @SomeException . restore $
-        acquireLentThen loan (build (Retirements (\label poll → atomically (recordRetirement leases key label poll)))) $ \member → do
+        acquireLentThen loan (build (retirementsFor leases key)) $ \member → do
           -- Masked, in the step that registered the member, and with nothing
           -- interruptible before it: the member and its record come to exist together.
           atomically (register leases key (Holding member))
           pure (Lease key ownership)
     case outcome of
       Right lease → pure lease
-      Left failure → do
-        atomically (abandon leases key)
+      Left failure@(ExceptionWithContext context _) → do
+        -- A stage whose rollback release failed is a cleanup failure the exception carries
+        -- to supervision, and is kept for the instance's settlement beside whatever else
+        -- failed, in the step that gives the reservation back. The constructor's own
+        -- exception is rethrown as it was.
+        atomically $ do
+          abandon leases key
+          forM_ (cleanupFailuresInContext context) $ \cleanup →
+            noteScope leases number $
+              "a rollback release failed: " <> cleanupFailureLabel cleanup <> ": " <> renderRaised (cleanupFailureException cleanup)
         rethrowIO failure
+
+-- | What the release of a lease's parts is given to record a retirement with.
+retirementsFor ∷ Leases → Word64 → Retirements
+retirementsFor leases key =
+  Retirements
+    { retireAsynchronously = \label poll → atomically (recordRetirement leases key label poll)
+    , afterRetirement = \disposal → atomically (deferDisposal leases key disposal) >>= mapM_ id
+    }
 
 -- | Borrow the resource a lease holds, for the duration of the action.
 --
@@ -370,7 +402,8 @@ releaseLease leases key = do
             ended ← atomically (endRelease leases key (Left failure))
             case ended of
               EndedFailed retained → do
-                atomically (noteScope leases (maybe 0 id caller) "an early release failed")
+                forM_ caller $ \number →
+                  atomically (noteScope leases number ("an early release failed: " <> renderRaised retained))
                 rethrowIO retained
               _ → rethrowIO failure
   where
@@ -392,6 +425,10 @@ leaseCapabilityType leases name = capabilityType name (leaseLive leases)
 -- | One instance's leases at a glance, in one transaction.
 instanceLeases ∷ Leases → InstanceId → STM ScopeSummary
 instanceLeases leases identity = summarize leases (instanceLocal identity)
+
+-- | What an exception said, as one line.
+renderRaised ∷ ExceptionWithContext SomeException → Text
+renderRaised (ExceptionWithContext _ raised) = Text.pack (show raised)
 
 -- | Refuse the call, as the engine: a fault of the call and not a failure of the
 -- application's code.

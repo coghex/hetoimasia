@@ -960,14 +960,20 @@ finishEnding ih cell closed = do
           | isJust (fromException raised ∷ Maybe SomeAsyncException) → rethrowIO failure
           | raisedByApplication context → rethrowIO failure
           | otherwise → modifyIORef' (ihExtra ih) (<> [("lua instance release", failure)])
-    -- It settles when a provider has proved every retirement it asked for complete: not
-    -- before, whatever Lua did.
-    waiting ← case ihLeases ih of
-      Nothing → pure 0
-      Just lh → atomically (pendingFor (lhLeases lh) (icId cell))
-    if waiting > 0
-      then modifyIORef' (ihParked ih) (Set.insert (icId cell))
-      else settleEnding ih cell
+    parkOrSettle ih cell
+
+-- | Settle an ending whose hook has run or been skipped and whose holdings are released,
+-- unless a provider has yet to retire something it released: then the ending is parked,
+-- and settles when every retirement it asked for has completed, not before, whatever Lua
+-- did.
+parkOrSettle ∷ InstanceHost → ICell → IO ()
+parkOrSettle ih cell = do
+  waiting ← case ihLeases ih of
+    Nothing → pure 0
+    Just lh → atomically (pendingFor (lhLeases lh) (icId cell))
+  if waiting > 0
+    then modifyIORef' (ihParked ih) (Set.insert (icId cell))
+    else settleEnding ih cell
 
 -- | Release what an instance still holds, newest first, whatever the instance's end
 -- was and whatever its hook did. A release that fails does not stop another, is
@@ -989,13 +995,20 @@ serviceRetirementsOf ih = case ihLeases ih of
   Just lh → do
     let leases = lhLeases lh
     done ← mask_ $ do
-      ended ← atomically (serviceRetirements leases)
+      (ended, disposals) ← atomically (serviceRetirements leases)
       forM_ ended $ \finished → forM_ (endedFailure finished) $ \failure@(ExceptionWithContext _ raised) → do
         modifyIORef' (ihExtra ih) (<> [("lua lease retirement", failure)])
         forM_ (endedInstance finished) $ \number →
           atomically . noteScope leases number . failureText $
             "the provider's retirement of " <> endedLabel finished <> " failed: " <> Text.pack (show raised)
-      pure ended
+      -- What the retirements needed is disposed of now that every one has completed, as a
+      -- release is: uninterruptibly, one at a time, a failure of one not stopping the rest.
+      forM_ disposals $ \(number, dispose) → do
+        disposed ← tryWithContext @SomeException (uninterruptibleMask_ dispose)
+        forM_ (either Just (const Nothing) disposed) $ \failure@(ExceptionWithContext _ raised) → do
+          modifyIORef' (ihExtra ih) (<> [("lua lease dependency", failure)])
+          atomically . noteScope leases number . failureText $ "disposing what a retirement needed failed: " <> Text.pack (show raised)
+      pure (not (null ended && null disposals))
     parked ← Set.toList <$> readIORef (ihParked ih)
     settled ← forM parked $ \number → do
       pending ← atomically (pendingFor leases number)
@@ -1005,7 +1018,7 @@ serviceRetirementsOf ih = case ihLeases ih of
           modifyIORef' (ihParked ih) (Set.delete number)
           withCell ih number (settleEnding ih)
           pure True
-    pure (not (null done) || or settled)
+    pure (done || or settled)
 
 -- | Run an action as the instance whose invocation a task is: closing its coroutine
 -- runs the to-be-closed handlers the script defined, and what they call is told which
@@ -1178,15 +1191,28 @@ awaitRetirements ih = case ihLeases ih of
     loop lh raised = do
       served ← tryWithContext @SomeException (serviceRetirementsOf ih)
       let raised' = raised <> [failure | Left failure ← [served]]
-      parked ← readIORef (ihParked ih)
+      parked ← Set.toList <$> readIORef (ihParked ih)
+      -- An ending whose retirements have all been taken is ready to settle whether or not
+      -- anything is left to wait for: the settling that raised, for the application's
+      -- escalation or a failure of the host, left the others as they were, and nothing
+      -- else will wake the owner for them.
+      ready ← or <$> traverse (\number → (== 0) <$> atomically (pendingFor (lhLeases lh) number)) parked
       outstanding ← atomically (anyPending (lhLeases lh))
-      if Set.null parked && not outstanding
-        then pure raised'
-        else do
-          atomically (retirementsReady (lhLeases lh))
-          loop lh raised'
+      if ready
+        then loop lh raised'
+        else
+          if null parked && not outstanding
+            then pure raised'
+            else do
+              atomically (retirementsReady (lhLeases lh))
+              loop lh raised'
 
 -- | Settle an instance that is still unsettled, because its end could not be carried
--- through: from what its ending recorded, as any other ending is.
+-- through: from what its ending recorded, as any other ending is. What it still holds is
+-- released first, and an ending whose provider has yet to retire something is parked like
+-- any other: a failure of the host in its hook is no reason to leave a resource live under
+-- the collection's own close, where nothing would wait for its provider.
 discardUnsettled ∷ InstanceHost → ICell → IO ()
-discardUnsettled = settleEnding
+discardUnsettled ih cell = do
+  drainInstance ih cell
+  parkOrSettle ih cell

@@ -79,6 +79,7 @@ module Hetoimasia.Scripting.Lua.Lease.State
   , register
   , abandon
   , recordRetirement
+  , deferDisposal
 
     -- * Reading
   , liveKey
@@ -227,6 +228,10 @@ data Slot = Slot
   , slotPhase ∷ !SlotPhase
   , slotHolding ∷ !(Maybe Holding)
   , slotObligations ∷ ![Obligation]
+  , slotDeferred ∷ ![IO ()]
+    -- ^ Disposals of what the pending retirements need, handed over by the assembly's
+    -- releases: run, in order, once every one of them has completed, and never if one
+    -- fails.
   }
 
 -- | An instance's scope.
@@ -343,7 +348,7 @@ reserve leases number ownership = do
           let key = lsNext state
           writeTVar (leasesState leases) state
             { lsNext = key + 1
-            , lsSlots = Map.insert key (Slot number ownership SlotConstructing Nothing []) (lsSlots state)
+            , lsSlots = Map.insert key (Slot number ownership SlotConstructing Nothing [] []) (lsSlots state)
             }
           pure (Right key)
       where
@@ -381,6 +386,20 @@ recordRetirement leases key label poll =
           Just slot →
             state {lsSlots = Map.insert key slot {slotObligations = slotObligations slot <> [obligation]} (lsSlots state)}
           Nothing → state {lsOrphans = lsOrphans state <> [obligation]}
+
+-- | Hand a disposal to the slot's pending retirements: it is kept until every one of
+-- them has completed. A slot with none pending has nothing to wait for, and the
+-- disposal is handed back to be run now.
+deferDisposal ∷ Leases → Word64 → IO () → STM (Maybe (IO ()))
+deferDisposal leases key disposal = do
+  state ← readTVar (leasesState leases)
+  case Map.lookup key (lsSlots state) of
+    Just slot | not (null (slotObligations slot)) → do
+      writeTVar (leasesState leases) state
+        { lsSlots = Map.insert key slot {slotDeferred = slotDeferred slot <> [disposal]} (lsSlots state)
+        }
+      pure Nothing
+    _ → pure (Just disposal)
 
 -- Reading ------------------------------------------------------------------------------
 
@@ -603,11 +622,13 @@ data RetirementEnd = RetirementEnd
 
 -- | Read every pending retirement and take away the ones the providers have
 -- finished: a completed one gives its charge back, and a failed one is retained on
--- its slot and reported. Answers what ended.
+-- its slot and reported. Answers what ended, and the disposals of the slots whose last
+-- retirement has completed, to be run: the disposals of a slot with a failed retirement
+-- are kept with it and never run.
 --
 -- Run on the owner's thread. It never waits: a provider's reading is a transaction
 -- that must not retry.
-serviceRetirements ∷ Leases → STM [RetirementEnd]
+serviceRetirements ∷ Leases → STM ([RetirementEnd], [(Word64, IO ())])
 serviceRetirements leases = do
   state ← readTVar (leasesState leases)
   swept ← forM (Map.toList (lsSlots state)) $ \(key, slot) → do
@@ -620,15 +641,18 @@ serviceRetirements leases = do
         slot' = slot {slotObligations = remaining, slotPhase = phase'}
         finished = null remaining && isReleased phase'
         completions = [RetirementEnd (Just (slotInstance slot)) label failure | (label, failure) ← ended]
-    pure ((key, if finished then Nothing else Just slot'), completions)
+        -- A slot with nothing left to wait for and no failure gives its disposals up.
+        disposals = [(slotInstance slot, disposal) | null remaining, null failed, not (isFailed (slotPhase slot)), disposal ← slotDeferred slot]
+        slot'' = if null disposals then slot' else slot' {slotDeferred = []}
+    pure ((key, if finished then Nothing else Just slot''), completions, disposals)
   (orphans, endedOrphans) ← sweepList (lsOrphans state)
-  let ended = concatMap snd swept <> [RetirementEnd Nothing label failure | (label, failure) ← endedOrphans]
+  let ended = concat [completions | (_, completions, _) ← swept] <> [RetirementEnd Nothing label failure | (label, failure) ← endedOrphans]
   writeTVar (leasesState leases) state
-    { lsSlots = Map.fromList [(key, slot) | ((key, Just slot), _) ← swept]
+    { lsSlots = Map.fromList [(key, slot) | ((key, Just slot), _, _) ← swept]
     , lsOrphans = orphans
     , lsScopes = foldr bumpScope (lsScopes state) ended
     }
-  pure ended
+  pure (ended, concat [disposals | (_, _, disposals) ← swept])
   where
     -- Counted when the end was already waiting for it: a retirement that completed while
     -- the instance still lived was never waited for.
@@ -637,6 +661,9 @@ serviceRetirements leases = do
       _ → scopes
     isReleased = \case
       SlotReleased → True
+      _ → False
+    isFailed = \case
+      SlotFailed _ → True
       _ → False
     sweepList obligations = do
       polled ← forM obligations $ \obligation → do

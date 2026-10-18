@@ -168,6 +168,19 @@ spec = describe "acquiring" $ do
       raised `shouldSatisfy` brokenIs "constructor"
       map cleanupFailureLabel (cleanupFailuresInContext context) `shouldSatisfy` any (Text.isInfixOf "doomed.first")
       summaryOf fixture "a" >>= (`shouldBe` ScopeSummary 0 0 0 0 4 0)
+      -- The rollback failure is kept in the instance's outcome as well, beside the
+      -- constructor's exception, which stays the owner's failure: the instance is failed at the release.
+      settled ← tickOf base "a" >>= pollInstance
+      case settled of
+        Just result → do
+          resultPhase result `shouldBe` Failed
+          leasesFailed (resultLeases result) `shouldBe` 1
+          case failureOf' result of
+            Just failure → do
+              failureStage failure `shouldBe` StageRelease
+              failureMessage failure `shouldSatisfy` Text.isInfixOf "a rollback release failed: doomed.first"
+            Nothing → fail "expected the instance to have failed at the release"
+        Nothing → fail "expected the instance to have settled"
 
   it "refuses an acquisition over the instance's capacity as the engine, before any stage runs, and a script that catches the error is still faulted and not made a host failure" $ bounded $ do
     fixture ← newLFix 2
