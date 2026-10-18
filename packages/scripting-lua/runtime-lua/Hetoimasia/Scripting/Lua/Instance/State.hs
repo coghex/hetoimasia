@@ -60,10 +60,17 @@ admitInstance instances gate owner request = do
   live ← readTVar (insLive instances)
   retained ← readTVar (insRetained instances)
   let bounds = insBounds instances
+      -- A periodic instance's interval is resolved here, exactly or not at all, and
+      -- before a place is taken for it.
+      resolved = case instanceKind request of
+        Periodic interval → Just <$> resolveInterval (insTickDuration instances) interval
+        _ → Right Nothing
   if not open
     then pure InstanceAdmissionClosed
-    else
-      if live >= boundLiveInstances bounds || retained >= boundRetainedInstances bounds
+    else case resolved of
+      Left refusal → pure (InstanceIntervalRefused refusal)
+      Right cadence →
+        if live >= boundLiveInstances bounds || retained >= boundRetainedInstances bounds
         then pure InstanceFull
         else do
           number ← readTVar (insNext instances)
@@ -77,6 +84,7 @@ admitInstance instances gate owner request = do
                   { icId = number
                   , icModule = instanceModule request
                   , icKind = instanceKind request
+                  , icCadence = cadence
                   , icName = instanceName request
                   , icClass = instanceClass request
                   , icGrants = Set.fromList (instanceGrants request)
@@ -244,7 +252,7 @@ settleInstance instances cell settlement =
     Just _ → pure False
     Nothing → do
       writeTVar (icResult cell) (Just settlement)
-      modifyTVar' (icState cell) (\state → state {isPhase = resultPhase settlement, isStopped = True, isActive = Nothing, isConnections = Set.empty, isQueue = Seq.empty, isPending = Nothing})
+      modifyTVar' (icState cell) (\state → state {isPhase = resultPhase settlement, isStopped = True, isActive = Nothing, isConnections = Set.empty, isQueue = Seq.empty, isPending = Nothing, isUpdate = UpdateNone})
       modifyTVar' (insLive instances) (subtract 1)
       forgotten ← readTVar (icForgotten cell)
       when forgotten (releaseResult instances cell)
@@ -271,6 +279,7 @@ snapshotOf instances gate owner label cell = do
       , snapshotQueueFull = isQueueFull state
       , snapshotDelivered = isDelivered state
       , snapshotConnections = Set.size (isConnections state)
+      , snapshotUpdateOwed = updateOwed state
       }
 
 -- | One instance, live or ended and not yet observed. 'Nothing' for another
@@ -346,6 +355,7 @@ beginEnding cell = do
           , isConnections = Set.empty
           , isQueue = Seq.empty
           , isPending = Nothing
+          , isUpdate = UpdateNone
           , isDispatchQueued = False
           }
       pure (Set.size (isConnections state), unstartedCount (icKind cell) state, False)

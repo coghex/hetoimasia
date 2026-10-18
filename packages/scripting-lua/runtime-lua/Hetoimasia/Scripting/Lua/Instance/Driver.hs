@@ -48,7 +48,7 @@ eventEntry ∷ Text → Text
 eventEntry source = "event_" <> source
 
 -- | The hooks a module that hosts instances declares, each optional: @init@ runs
--- once, @update@ is part of the authoring model and is never due in this slice,
+-- once, @update@ runs when a periodic instance's interval makes one due,
 -- @shutdown@ runs once on the way out, and @run@ is a one-shot's body. Declared
 -- with no arguments: the driver hands each its @self@ and what else it takes.
 hookEntries ∷ [EntryPoint]
@@ -78,6 +78,7 @@ driverSource sources =
         , entry "release" [SInteger]
         , entry "init" [SInteger]
         , entry "run" [SInteger]
+        , entry "update" [SInteger, SInteger]
         , entry "shutdown" [SInteger, SText]
         ]
           <> [ entry (eventEntry (sourceName source)) [SInteger, eventSchema source]
@@ -152,6 +153,11 @@ luaBody =
   , "function run(hook, slot)"
   , "  local record = find(slot)"
   , "  hook(record.self, record.api)"
+  , "end"
+  , ""
+  , "function update(hook, slot, dt)"
+  , "  local record = find(slot)"
+  , "  hook(record.self, dt)"
   , "end"
   , ""
   , "function shutdown(hook, slot, reason)"

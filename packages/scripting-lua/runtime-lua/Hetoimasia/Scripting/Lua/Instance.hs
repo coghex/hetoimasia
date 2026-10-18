@@ -220,6 +220,10 @@ module Hetoimasia.Scripting.Lua.Instance
 
     -- * Admitting instances
   , InstanceKind (..)
+  , Interval (..)
+  , IntervalRefusal (..)
+  , Cadence (..)
+  , resolveInterval
   , InstanceRequest (..)
   , InstanceAdmission (..)
   , InstanceId (..)

@@ -13,6 +13,10 @@ module Hetoimasia.Scripting.Lua.Instance.Types
 
     -- * What an application admits
   , InstanceKind (..)
+  , Interval (..)
+  , IntervalRefusal (..)
+  , Cadence (..)
+  , resolveInterval
   , InstanceRequest (..)
   , EventSource (..)
 
@@ -59,8 +63,10 @@ module Hetoimasia.Scripting.Lua.Instance.Types
   , Instances (..)
   , ICell (..)
   , IState (..)
+  , UpdateSlot (..)
   , pendingEvents
   , runOwed
+  , updateOwed
   , unstartedCount
   , Job (..)
   , QueuedEvent (..)
@@ -71,6 +77,7 @@ module Hetoimasia.Scripting.Lua.Instance.Types
   ) where
 
 import Control.Concurrent.STM (TVar, newTVarIO)
+import Hetoimasia.Foundation.Time (Duration, ElapsedBaseline, durationNanoseconds, noBaseline, zeroDuration)
 import Control.Exception (Exception)
 import Data.List (nub)
 import Data.List.NonEmpty (NonEmpty)
@@ -114,11 +121,70 @@ data InstanceId = InstanceId
 -- | What an instance does after it initializes.
 data InstanceKind
   = -- | It only reacts: events delivered to the callbacks it connected run, and it
-    -- lives until it is stopped. No update is due in this slice, so it has none.
+    -- lives until it is stopped. It has no periodic interval, so no update is ever
+    -- due.
     EventOnly
-  | -- | It runs its module's @run@ hook to completion, and then ends.
+  | -- | It runs its module's @run@ hook to completion, and then ends. It has no
+    -- periodic interval.
     RunOnce
+  | -- | It reacts to events as an event-only instance does, and its module's
+    -- @update(self, dt)@ hook falls due on this interval, chosen at admission and
+    -- fixed for the instance's life. See "Hetoimasia.Scripting.Lua.Instance" for the
+    -- cadence rules.
+    Periodic !Interval
   deriving (Eq, Show)
+
+-- | How often an instance's update falls due, as an application states it.
+data Interval
+  = -- | Gameplay's logical time: this many ticks. It must be positive and fit a
+    -- tick count.
+    LogicalTicks !Integer
+  | -- | Gameplay's logical time, as a duration: it converts to ticks only when it
+    -- is an exact multiple of the owner's configured tick duration
+    -- ('instanceTickDuration'), and is refused otherwise. Nothing is rounded.
+    LogicalDuration !Duration
+  | -- | The UI's elapsed time: a positive duration on the owner's monotonic source.
+    ElapsedEvery !Duration
+  deriving (Eq, Show)
+
+-- | Why an interval was refused at admission. Each names the input.
+data IntervalRefusal
+  = -- | Zero ticks, a non-positive number of ticks, or a zero duration.
+    IntervalNotPositive !Interval
+  | -- | A tick count too large to be one.
+    IntervalUnrepresentable !Interval
+  | -- | A duration that is not an exact multiple of the owner's tick duration: the
+    -- interval and the tick duration.
+    IntervalNotExact !Interval !Duration
+  | -- | A logical duration, and the owner was given no tick duration to convert it by.
+    IntervalNoTickDuration !Interval
+  deriving (Eq, Show)
+
+-- | An interval as admission resolved it.
+data Cadence
+  = -- | Every this many ticks, a positive number.
+    CadenceTicks !Word64
+  | -- | Every this much elapsed time, a positive duration.
+    CadenceElapsed !Duration
+  deriving (Eq, Show)
+
+-- | Resolve an interval against the owner's tick duration, exactly or not at all.
+resolveInterval ∷ Maybe Duration → Interval → Either IntervalRefusal Cadence
+resolveInterval tick interval = case interval of
+  LogicalTicks count
+    | count < 1 → Left (IntervalNotPositive interval)
+    | count > fromIntegral (maxBound ∷ Word64) → Left (IntervalUnrepresentable interval)
+    | otherwise → Right (CadenceTicks (fromIntegral count))
+  LogicalDuration duration
+    | duration == zeroDuration → Left (IntervalNotPositive interval)
+    | otherwise → case tick of
+        Nothing → Left (IntervalNoTickDuration interval)
+        Just per
+          | durationNanoseconds duration `mod` durationNanoseconds per /= 0 → Left (IntervalNotExact interval per)
+          | otherwise → Right (CadenceTicks (fromIntegral (durationNanoseconds duration `div` durationNanoseconds per)))
+  ElapsedEvery duration
+    | duration == zeroDuration → Left (IntervalNotPositive interval)
+    | otherwise → Right (CadenceElapsed duration)
 
 -- | What an application admits as one instance.
 data InstanceRequest = InstanceRequest
@@ -213,6 +279,9 @@ data InstanceSnapshot = InstanceSnapshot
   , snapshotDelivered ∷ !Int
     -- ^ Deliveries accepted.
   , snapshotConnections ∷ !Int
+  , snapshotUpdateOwed ∷ !Bool
+    -- ^ A periodic update is due or admitted and has not begun: at most one, and it is
+    -- not counted in 'snapshotQueued', which it never competes with.
   }
   deriving (Eq, Show)
 
@@ -303,6 +372,8 @@ data ShutdownDisposition
 data HookStage
   = StageInit
   | StageRun
+  | -- | A periodic update.
+    StageUpdate
   | -- | A callback, by the source it was connected to.
     StageEvent !Text
   | StageShutdown
@@ -320,6 +391,10 @@ data InstanceError
   | -- | The scheduler refused what an invocation asked for (a wait for no ticks or
     -- no time) and failed it.
     ErrorRefusedWait !TaskFailure
+  | -- | The cadence's own arithmetic could not be represented: a tick or a deadline
+    -- past what a tick or an instant can be, or a logical duration granted that
+    -- overflowed. Nothing wrapped; this is what happened.
+    ErrorCadence !Text
   deriving (Show)
 
 -- | A bounded diagnostic and inspection result: the instance, its owner, its
@@ -373,6 +448,8 @@ data InstanceAdmission
     InstanceFull
   | -- | The owner has stopped admitting. Nothing changed.
     InstanceAdmissionClosed
+  | -- | The periodic interval was refused, naming the input. Nothing changed.
+    InstanceIntervalRefused !IntervalRefusal
   deriving (Show)
 
 -- | The place an accepted instance's settlement is read.
@@ -444,6 +521,10 @@ data InstanceConfig = InstanceConfig
   { instanceBounds ∷ !InstanceBounds
   , instanceSources ∷ ![EventSource]
     -- ^ The event sources the owner offers, by name.
+  , instanceTickDuration ∷ !(Maybe Duration)
+    -- ^ The logical duration one tick stands for, which an interval given as a
+    -- duration is converted by. No production rate is hard-coded: without it, an
+    -- interval given as a duration is refused, and one given as ticks needs none.
   , instanceEscalate ∷ InstanceFailure → IO Escalation
     -- ^ Told, on the owner's thread, of each instance's failure after the instance
     -- has ended. It decides, and its default keeps the failure isolated. What it
@@ -454,7 +535,7 @@ data InstanceConfig = InstanceConfig
 -- | The default bounds, no event source, and an escalation that keeps every failure
 -- isolated.
 defaultInstanceConfig ∷ InstanceConfig
-defaultInstanceConfig = InstanceConfig defaultInstanceBounds [] (const (pure Isolate))
+defaultInstanceConfig = InstanceConfig defaultInstanceBounds [] Nothing (const (pure Isolate))
 
 -- | A configuration problem.
 data InstanceViolation
@@ -475,6 +556,8 @@ data InstanceViolation
   | -- | More sources than the driver module can declare an entry point for: how many
     -- were given, and how many fit.
     TooManySources !Int !Int
+  | -- | The configured tick duration is zero.
+    TickDurationNotPositive
   | -- | The application's registration could not take the instance layer's
     -- namespace beside its own: what the registration refused.
     RegistrationRefused !Text
@@ -500,6 +583,7 @@ validateInstanceConfig schedulerRetained schedulerQueued config =
     <> [TooManySources (length sources) sourceLimit | length sources > sourceLimit]
     <> [DuplicateSource name | name ← duplicated names]
     <> [SourceCapability (sourceName source) | source ← sources, hasCapability (sourcePayload source)]
+    <> [TickDurationNotPositive | instanceTickDuration config == Just zeroDuration]
   where
     b = instanceBounds config
     sources = instanceSources config
@@ -528,6 +612,9 @@ data ICell = ICell
   { icId ∷ !Word64
   , icModule ∷ !ModuleRef
   , icKind ∷ !InstanceKind
+  , icCadence ∷ !(Maybe Cadence)
+    -- ^ The interval a periodic instance was admitted with, resolved, and fixed for its
+    -- life.
   , icName ∷ !(Maybe Text)
   , icClass ∷ !ServiceClass
   , icGrants ∷ !(Set Text)
@@ -566,7 +653,36 @@ data IState = IState
     -- ^ The event whose callback is in flight, until that callback's first segment
     -- runs: it is still an unstarted invocation, and holds its place against the
     -- queue's bound.
+  , isUpdate ∷ !UpdateSlot
+    -- ^ Where the instance's one periodic update is. It is never in 'isQueue' and never
+    -- competes with events for the queue's bound: it keeps its place among them by the
+    -- sequence the next event would have been given when it fell due.
+  , isUpdateRunning ∷ !Bool
+    -- ^ An update began and has not finished: it is the invocation in flight.
+  , isBaseline ∷ !ElapsedBaseline
+    -- ^ An elapsed instance's baseline: the instant its last update began, or its
+    -- @init@ succeeded, or it resumed, which is what its @dt@ is measured from.
   }
+
+-- | Where an instance's periodic update is.
+data UpdateSlot
+  = -- | None is owed.
+    UpdateNone
+  | -- | It fell due and waits its turn: events accepted before it (with a sequence below
+    -- this one) run first, events accepted after it run after it.
+    UpdateDue !Word64
+  | -- | It was admitted as the invocation in flight and has not run a segment: still an
+    -- unstarted invocation, which a pause takes back and a stop discards.
+    UpdateAdmitted !Word64
+  deriving (Eq, Show)
+
+-- | Whether an update is owed, as an unstarted invocation: due, or admitted and not
+-- begun.
+updateOwed ∷ IState → Bool
+updateOwed state = case isUpdate state of
+  UpdateDue _ → True
+  UpdateAdmitted _ → True
+  _ → False
 
 -- | How many places of the queue an unstarted invocation in flight holds: an event's,
 -- as it would in the queue. A one-shot's run is no event and holds none.
@@ -584,11 +700,11 @@ runOwed kind state = kind == RunOnce && isInitialized state && not (isRunBegun s
 -- count of them, whichever way the instance ends.
 unstartedCount ∷ InstanceKind → IState → Int
 unstartedCount kind state =
-  Seq.length (isQueue state) + pendingEvents state + (if runOwed kind state then 1 else 0)
+  Seq.length (isQueue state) + pendingEvents state + (if runOwed kind state then 1 else 0) + (if updateOwed state then 1 else 0)
 
 -- | A fresh instance's state.
 initialState ∷ IState
-initialState = IState Initializing False Set.empty Seq.empty 0 0 0 Nothing False False False Nothing
+initialState = IState Initializing False Set.empty Seq.empty 0 0 0 Nothing False False False Nothing UpdateNone False noBaseline
 
 -- | What the owner's thread is asked to do, in the order the application asked.
 data Job
@@ -617,6 +733,7 @@ data InstanceSettlement = InstanceSettlement
 data Instances = Instances
   { insBounds ∷ !InstanceBounds
   , insSources ∷ !(Map Text Schema)
+  , insTickDuration ∷ !(Maybe Duration)
   , insNext ∷ !(TVar Word64)
     -- ^ The next number to issue. Never rewinds.
   , insCells ∷ !(TVar (Map Word64 ICell))
@@ -640,7 +757,7 @@ data Instances = Instances
 -- | Make an owner's instance state.
 newInstances ∷ InstanceConfig → IO Instances
 newInstances config =
-  Instances (instanceBounds config) (Map.fromList [(sourceName source, sourcePayload source) | source ← instanceSources config])
+  Instances (instanceBounds config) (Map.fromList [(sourceName source, sourcePayload source) | source ← instanceSources config]) (instanceTickDuration config)
     <$> newTVarIO 1
     <*> newTVarIO Map.empty
     <*> newTVarIO Seq.empty
@@ -657,6 +774,7 @@ renderError = failureText . \case
   ErrorFault fault → Text.pack (show fault)
   ErrorMissingEntry entry → "the module defines no " <> entry <> " entry point"
   ErrorRefusedWait failure → Text.pack (show failure)
+  ErrorCadence what → "cadence: " <> what
 
 -- | A bounded rendering.
 failureText ∷ Text → Text

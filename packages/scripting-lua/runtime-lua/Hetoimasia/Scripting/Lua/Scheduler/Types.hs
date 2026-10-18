@@ -30,6 +30,11 @@ module Hetoimasia.Scripting.Lua.Scheduler.Types
   , GrantId (..)
   , GrantAnswer (..)
 
+    -- * Cadences
+  , CadenceKey (..)
+  , CadenceFault (..)
+  , CadenceFiring (..)
+
     -- * Control
   , ControlRequest (..)
   , ControlAnswer (..)
@@ -60,7 +65,7 @@ import Data.List.NonEmpty (NonEmpty)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Text (Text)
 import Data.Word (Word64)
-import Hetoimasia.Foundation.Time (Duration, MonotonicSource)
+import Hetoimasia.Foundation.Time (Duration, Instant, MonotonicSource)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (BehaviorId, Ordinal, SessionKey, TaskId)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits (LimitName, LimitViolation, Quanta, ServiceClass)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Session (ExitRecord)
@@ -262,6 +267,32 @@ data GrantAnswer
     GrantClosed
   | -- | The duration was zero. A step is a positive logical duration.
     GrantNotPositive
+  deriving (Eq, Show)
+
+-- Cadences ---------------------------------------------------------------------
+
+-- | A periodic demand an owner registers with the scheduler, by the number the owner
+-- gives it. The scheduler attaches no meaning to the number.
+newtype CadenceKey = CadenceKey {cadenceNumber ∷ Word64}
+  deriving (Eq, Ord, Show)
+
+-- | What went wrong with a cadence's own arithmetic. Nothing wraps.
+data CadenceFault
+  = -- | The logical duration granted since the cadence's accrual began is not
+    -- representable.
+    CadenceAccrualOverflow
+  deriving (Eq, Show)
+
+-- | A cadence point that was reached and has not yet been taken.
+data CadenceFiring
+  = -- | A logical cadence point: the tick of the grant that was applied. The grant
+    -- is held, and is not finished, until the owner releases the hold.
+    FiredLogical !Word64
+  | -- | An elapsed cadence point: the deadline that was found reached, and the
+    -- reading it was found at.
+    FiredElapsed !Instant !Instant
+  | -- | The cadence's arithmetic failed, on the grant that is now held.
+    FiredFault !CadenceFault
   deriving (Eq, Show)
 
 -- Control ----------------------------------------------------------------------
