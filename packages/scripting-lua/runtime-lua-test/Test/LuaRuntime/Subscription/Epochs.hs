@@ -190,6 +190,27 @@ spec = describe "epochs" $ do
       d ← subDiagnostics owner
       sdDiscardedEvents d `shouldBe` 1
 
+  it "lets the VM go of the callbacks an epoch change ended, without the script unsubscribing them, while the instance goes on" $ bounded $ do
+    fixture ← newIFixture
+    fake ← newFakeEvents
+    withBoundary $ \_ runtime → eventsFinish fake $ do
+      owner ← ownerOf fixture fake runtime "collected" [subscriber] 4
+      admitSubscriber fixture owner "i" "subscriber"
+      forM_ [1 .. 3 ∷ Int] $ \cycle' → do
+        let key = Text.pack ("t" <> show cycle')
+        commandWith fixture owner "i" "subscribe_tracked" key (Just "ticks") Nothing
+        awaitLine fixture ("cmd subscribe_tracked " <> key <> " ok")
+        command fixture owner "i" "weak_count" key
+        awaitLine fixture ("cmd weak_count " <> key <> " 1")
+        void (advance owner)
+        -- Nothing unsubscribed: the owner has the driver let go at its next boundary.
+        command fixture owner "i" "weak_count" (key <> "after")
+        awaitLine fixture ("cmd weak_count " <> key <> "after 0")
+      phaseOf fixture owner "i" >>= (`shouldBe` Just Active)
+      -- Each cycle's provider is told once and holds its place until it says it is done.
+      awaitCancelledSubs fake 3
+      (sdCharged <$> subDiagnostics owner) >>= (`shouldBe` 3)
+
   it "discards the events an owner on logical time held for ticks the old subscriptions were to be served at" $ bounded $ do
     fixture ← newIFixture
     fake ← newFakeEvents

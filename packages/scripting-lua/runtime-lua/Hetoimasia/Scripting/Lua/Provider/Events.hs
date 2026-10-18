@@ -53,6 +53,7 @@ module Hetoimasia.Scripting.Lua.Provider.Events
   , SubEnd (..)
   , endSubs
   , chargedSubs
+  , takeForgotten
 
     -- * Delivering
   , CheckedEvent (..)
@@ -124,6 +125,9 @@ import Hetoimasia.Scripting.Lua.Internal.Value
   , valuesFootprint
   )
 import Hetoimasia.Scripting.Lua.Provider.Types
+import Hetoimasia.Scripting.Lua.Runtime.Shared (compact)
+import qualified Hetoimasia.Scripting.Lua.Runtime.Types as Call
+import Hetoimasia.Foundation.Messaging.Payload (prepare, preparedValue)
 import Hetoimasia.Scripting.Lua.Retention (Obligation (Obligation), Retained (..), RetirementState (ProviderPending), guarded, noRetained, retain)
 
 -- Who may subscribe -----------------------------------------------------------------
@@ -298,10 +302,15 @@ unsubscribeOf service instanceNumber number = do
 -- | Who ended a subscription, which decides whether the model has already forgotten it.
 data SubEnd
   = -- | The script unsubscribed (or a handoff failed): the model is told, and counts the
-    -- backlog it discards.
+    -- backlog it discards. The script's own references are its to drop.
     EndByUnsubscribe
-  | -- | The model already ended it, with its holder, in an epoch change or the owner's stop.
-    EndByModel
+  | -- | The model already ended it, with its holder: the instance's end, or the owner's stop.
+    -- The VM lets go of everything when the instance is released.
+    EndByOwner
+  | -- | The model already ended it in an epoch change. The instance goes on, and the callback it
+    -- subscribed is of no use to anyone: its number is kept for the owner to have the driver let
+    -- go of it.
+    EndByEpoch
 
 -- | End subscriptions, each once, wherever they are held: the model's record (counting what it
 -- discards), the service's record, the events held for them, and the references to them in
@@ -318,7 +327,11 @@ endSubs service how identities st = do
       gone = Set.fromList (map subIdentity live)
       session = case how of
         EndByUnsubscribe → foldl' (\current sub → fst (unsubscribeIn (subIdentity sub) current)) (pSession st) live
-        EndByModel → pSession st
+        EndByOwner → pSession st
+        EndByEpoch → pSession st
+      forgotten = case how of
+        EndByEpoch → Map.unionWith (<>) (pForget st) (Map.fromListWith (flip (<>)) [(subInstance sub, [subNumber sub]) | sub ← live])
+        _ → pForget st
       (discarded, kept) = Map.partition ((`Set.member` gone) . stagedSubscription) (pStaged st)
   forM_ (Set.toList (Set.fromList (map subInstance live))) (dropReferences service gone)
   pure
@@ -327,6 +340,7 @@ endSubs service how identities st = do
       , pSubs = foldr Map.delete (pSubs st) (Set.toList gone)
       , pSubNumbers = Map.filter (`Set.notMember` gone) (pSubNumbers st)
       , pStaged = kept
+      , pForget = forgotten
       , pWork = foldr (Map.adjust withdrawn . workIdOf) (pWork st) (Set.toList gone)
       , pEvents = (pEvents st) {evDiscarded = evDiscarded (pEvents st) + Map.size discarded}
       }
@@ -364,24 +378,32 @@ eventRecord endpoint sequenceNumber tick number payload =
     , ("payload", payload)
     ]
 
--- | Check a delivery against the owner's value limits and the endpoint's schema, evaluating it
--- fully inside the one guard, so a value that throws when it is first looked at is an unfit
--- delivery and not an exception loose on the producer's thread. What is measured is the record
--- a callback is handed, so a delivery that is retained is one that can be delivered.
+-- | Check a delivery against the owner's value limits and the endpoint's schema, copy what is kept
+-- to buffers of its own and evaluate it fully, all inside the one guard, so a value that throws when
+-- it is first looked at is an unfit delivery and not an exception loose on the producer's thread.
+--
+-- What is measured is what the callback's entry point is handed: the instance's number and the record,
+-- which the host checks together, so a delivery that is retained is one that can be delivered. What is
+-- kept is a copy: a string that is a slice of a larger one would otherwise keep all of it alive for as
+-- long as the delivery waits, which the limits do not count.
 checkEvent ∷ ValueLimits → EventEndpoint → Value → IO CheckedEvent
 checkEvent limits endpoint value = do
-  judged ← guarded (pure judge)
+  judged ← guarded judge
   case judged of
     Right verdict → pure verdict
     Left (ExceptionWithContext _ raised)
       | Just (async ∷ SomeAsyncException) ← fromException raised → throwIO async
       | otherwise → pure EventUnfit
   where
-    judge = case valuesFootprint limits [eventRecord (eventName endpoint) 0 0 0 value] of
-      Left _ → EventUnfit
+    judge = case valuesFootprint limits [VInteger 0, eventRecord (eventName endpoint) 0 0 0 value] of
+      Left _ → pure EventUnfit
       Right bytes → case conformValue plainContext (eventPayload endpoint) value of
-        Left _ → EventUnfit
-        Right () → EventChecked (Payload bytes value)
+        Left _ → pure EventUnfit
+        Right () → do
+          prepared ← prepare (Call.WithinBounds [compact value])
+          pure $ case preparedValue prepared of
+            Call.WithinBounds [kept] → EventChecked (Payload bytes kept)
+            _ → EventUnfit
 
 -- | A payload carries no capability, so nothing of a VM is consulted.
 plainContext ∷ Context
@@ -402,8 +424,14 @@ deliverChecked service identity slot checked = do
       logical = case psTiming service of
         SettleAtAssignedTick _ → True
         SettleOnArrival → False
+  -- The instance is asked once, before anything else is decided, whether it is still taking events:
+  -- an instance that is stopping, or ended, takes none, whether the delivery would be admitted now or
+  -- held for a tick. Both paths are this one.
+  closed ← case Map.lookup identity (pSubs st) of
+    Just sub → requesterClosed service (RequesterInstance (subInstance sub))
+    Nothing → pure True
   case Map.lookup identity (pSubs st) of
-    Just sub | not (pClosed st) && open → case checked of
+    Just sub | not (pClosed st) && open && not closed → case checked of
       EventUnfit → counted (\c → c {evRefusedValue = evRefusedValue c + 1}) EventRefusedValue
       EventChecked payload → case (logical, slot) of
         (False, Nothing) → do
@@ -593,6 +621,15 @@ startDelivery service identity = do
           }
         pure (Just (DeliveryStart (subNumber sub) value))
 
+-- | Take the numbers of the subscriptions an epoch change ended whose callbacks an instance's VM still
+-- holds, once.
+takeForgotten ∷ ProviderState → Word64 → STM [Word64]
+takeForgotten service instanceNumber = do
+  st ← readTVar (psVar service)
+  case Map.lookup instanceNumber (pForget st) of
+    Nothing → pure []
+    Just numbers → numbers <$ writeTVar (psVar service) st {pForget = Map.delete instanceNumber (pForget st)}
+
 -- Failure ---------------------------------------------------------------------------------------
 
 -- | A delivery failure is surfaced for a subscription: its provider could not preserve an
@@ -612,7 +649,7 @@ failDelivery service identity reason = do
         then pure ()
         else do
           writeTVar (icState cell) state
-            { isDeliveryFailure = Just (subEndpoint sub, Text.take 512 reason)
+            { isDeliveryFailure = Just (subEndpoint sub, reason)
             , isDispatchQueued = True
             }
           unless (isDispatchQueued state) $

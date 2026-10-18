@@ -1,3 +1,6 @@
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE UnboxedTuples #-}
+
 -- | Owned subscriptions on an owner on elapsed time (LUA-26): a producer delivers from any thread
 -- without blocking and never calls Lua; the owner looks up the live callback when it services a
 -- delivery; overload is stated per endpoint (ordered events are refused and counted when the
@@ -6,7 +9,7 @@
 module Test.LuaRuntime.Subscription.Basics (spec) where
 
 import Control.Concurrent (forkIO)
-import Control.Exception (SomeException, try)
+import Control.Exception (SomeException, evaluate, try)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Monad (forM, forM_, void, when)
 import Data.List (elemIndex, sort)
@@ -18,7 +21,13 @@ import Hetoimasia.Scripting.Lua.Owner (ModuleSource)
 import Hetoimasia.Scripting.Lua.Provider
 import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
+import Hetoimasia.Scripting.Lua.Value
 import Data.Text (Text)
+import qualified Data.Text.Array as Array
+import GHC.Exts (Weak#, deRefWeak#, isTrue#, mkWeakNoFinalizer#)
+import GHC.IO (IO (IO))
+import qualified Data.Text.Internal as Internal
+import System.Mem (performMajorGC)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support (awaitLine, linesOf, refusalOf)
@@ -142,14 +151,18 @@ spec = describe "on an owner on elapsed time" $ do
         admitSubscriber fixture owner "peer" "subscriber"
         subscribeTo' fixture owner "i" "a" "ticks" Nothing
         found ← subscribedAt fake 0
-        feedFail (ssFeed found) "the producer's backlog was lost"
+        -- The reason is a producer's, however long it is: the instance fails with a bounded copy of it.
+        feedFail (ssFeed found) ("the producer's backlog was lost" <> Text.replicate 2000 "!")
         -- Its end withdraws interest in the subscription, and waits for the provider to prove it over.
         awaitCancelledSubs fake 1
         finishSubscription fake 0
         settled ← awaitSettled fixture "i"
         case resultOutcome settled of
           InstanceFailed failure → case failureError failure of
-            ErrorDelivery endpoint why → (endpoint, why) `shouldBe` ("ticks", "the producer's backlog was lost")
+            ErrorDelivery endpoint why → do
+              endpoint `shouldBe` "ticks"
+              Text.length why `shouldBe` 512
+              why `shouldSatisfy` Text.isPrefixOf "the producer's backlog was lost"
             other → fail ("expected a delivery failure, found " <> show other)
           other → fail ("expected the instance failed, found " <> show other)
         -- Its peer is isolated from it.
@@ -409,6 +422,65 @@ spec = describe "on an owner on elapsed time" $ do
         -- It ran after init had finished.
         lines' `shouldSatisfy` \recorded → indexOf "init subscribed" recorded < indexOf "got t n=5 seq=0 t=0" recorded
 
+  describe "a delivery's measure" $ do
+    -- What a callback is handed is the instance's number and the record, which the host checks
+    -- together: a record that fits alone and does not fit with the number would be accepted and then
+    -- fail the instance before its callback ran. A record is 108 bytes and five elements around its
+    -- payload, and the instance's number is nine bytes and one element more.
+    it "counts the instance's number with the record: the largest payload that fits is admitted and runs, and one more is refused" $ bounded $ do
+      fixture ← newIFixture
+      fake ← newFakeEvents
+      withBoundary $ \_ runtime → eventsFinish fake $ do
+        let wordy = (fakeEventEndpoint fake "text" OrderedEvents) {eventPayload = SText}
+        owner ←
+          startWith fixture runtime . withLimits (either (error . show) id (valueLimits 512 8 64)) $
+            subscriptionSpec fixture "bytes" [subscriber] subConfig SettleOnArrival (SubscriptionGrant [wordy] 4 16) requiredPolicy
+        _ ← admitWith fixture owner "i" (InstanceRequest (moduleNamed "subscriber") EventOnly (Just "i") OrdinaryClass ["cmd", "text"])
+        awaitPhase fixture owner "i" Active
+        commandWith fixture owner "i" "subscribe_size" "a" (Just "text") Nothing
+        awaitLine fixture "cmd subscribe_size a ok"
+        deliverRaw fake 0 Nothing (VText (Text.replicate (512 - 117) "x")) >>= (`shouldBe` EventAdmitted)
+        awaitLine fixture "size a 395"
+        deliverRaw fake 0 Nothing (VText (Text.replicate (512 - 116) "x")) >>= (`shouldBe` EventRefusedValue)
+        phaseOf fixture owner "i" >>= (`shouldBe` Just Active)
+
+    it "counts the instance's number among the elements too" $ bounded $ do
+      fixture ← newIFixture
+      fake ← newFakeEvents
+      withBoundary $ \_ runtime → eventsFinish fake $ do
+        let numbers = (fakeEventEndpoint fake "numbers" OrderedEvents) {eventPayload = SList SInteger}
+        owner ←
+          startWith fixture runtime . withLimits (either (error . show) id (valueLimits 4096 8 12)) $
+            subscriptionSpec fixture "elements" [subscriber] subConfig SettleOnArrival (SubscriptionGrant [numbers] 4 16) requiredPolicy
+        _ ← admitWith fixture owner "i" (InstanceRequest (moduleNamed "subscriber") EventOnly (Just "i") OrdinaryClass ["cmd", "numbers"])
+        awaitPhase fixture owner "i" Active
+        commandWith fixture owner "i" "subscribe_size" "a" (Just "numbers") Nothing
+        awaitLine fixture "cmd subscribe_size a ok"
+        deliverRaw fake 0 Nothing (VList (replicate 5 (VInteger 1))) >>= (`shouldBe` EventAdmitted)
+        awaitLine fixture "size a 5"
+        deliverRaw fake 0 Nothing (VList (replicate 6 (VInteger 1))) >>= (`shouldBe` EventRefusedValue)
+        phaseOf fixture owner "i" >>= (`shouldBe` Just Active)
+
+  describe "a retained delivery" $ do
+    it "is a copy of its own: a small slice of a large buffer does not keep the buffer alive while the instance is paused" $ bounded $ do
+      fixture ← newIFixture
+      fake ← newFakeEvents
+      withBoundary $ \_ runtime → eventsFinish fake $ do
+        let wordy = (fakeEventEndpoint fake "text" OrderedEvents) {eventPayload = SText}
+        owner ← startSubscriber fixture runtime "copy" [subscriber] subConfig SettleOnArrival (SubscriptionGrant [wordy] 4 16) requiredPolicy
+        _ ← admitWith fixture owner "i" (InstanceRequest (moduleNamed "subscriber") EventOnly (Just "i") OrdinaryClass ["cmd", "text"])
+        awaitPhase fixture owner "i" Active
+        commandWith fixture owner "i" "subscribe_size" "a" (Just "text") Nothing
+        awaitLine fixture "cmd subscribe_size a ok"
+        void (settleControl fixture owner "i" InstancePause)
+        weak ← deliverSliceOfLargeText fake
+        performMajorGC
+        -- The delivery waits in the paused instance's backlog, and the buffer it was sliced from is gone.
+        (snapshotQueued <$$> snapshotOf fixture owner "i") >>= (`shouldBe` Just 1)
+        bufferAlive weak >>= (`shouldBe` False)
+        void (settleControl fixture owner "i" InstanceResume)
+        awaitLine fixture "size a 5"
+
   describe "a refused subscribe" $ do
     it "is a fault of the call: an endpoint the instance was not granted, one the owner does not offer, and a full owner" $ bounded $ do
       fixture ← newIFixture
@@ -462,3 +534,29 @@ indexOf wanted recorded = fromMaybe maxBound (elemIndex wanted recorded)
 infixl 4 <$$>
 (<$$>) ∷ (a → b) → IO (Maybe a) → IO (Maybe b)
 (<$$>) f action = fmap f <$> action
+
+-- | Deliver a five-character slice of a large text to the first subscription, and answer a weak
+-- pointer to the large text's buffer, holding nothing of either: the buffer is alive only as long as
+-- something that was kept still refers to it.
+deliverSliceOfLargeText ∷ FakeEvents → IO BufferWeak
+deliverSliceOfLargeText fake = do
+  -- The size is not a constant, so the text is not one the program keeps for itself.
+  size ← evaluate (1000000 + length (show (Text.length (Text.pack "a size"))))
+  large ← evaluate (Text.replicate size "x")
+  weak ← bufferWeak large
+  deliverRaw fake 0 Nothing (VText (Text.take 5 large)) >>= (`shouldBe` EventAdmitted)
+  pure weak
+
+-- | A weak pointer to a text's buffer, which is shared by every slice of the text that was not copied.
+data BufferWeak = BufferWeak (Weak# ())
+
+bufferWeak ∷ Text → IO BufferWeak
+bufferWeak (Internal.Text (Array.ByteArray buffer) _ _) =
+  IO $ \s → case mkWeakNoFinalizer# buffer () s of
+    (# s', weak #) → (# s', BufferWeak weak #)
+
+-- | Whether the buffer is still alive.
+bufferAlive ∷ BufferWeak → IO Bool
+bufferAlive (BufferWeak weak) =
+  IO $ \s → case deRefWeak# weak s of
+    (# s', alive, _ #) → (# s', isTrue# alive #)

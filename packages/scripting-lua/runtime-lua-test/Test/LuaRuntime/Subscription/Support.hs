@@ -41,6 +41,7 @@ module Test.LuaRuntime.Subscription.Support
   , oneShotSubscriber
   , failingInitSubscriber
   , periodicSubscriber
+  , gatedShutdownSubscriber
 
     -- * Owners
   , dummyRequests
@@ -229,7 +230,8 @@ subConfig = (testConfig instanceBounds') {instanceSources = [subSource, tickSour
 -- | Lua every subscriber shares: the callback a subscription is given, and what a command does.
 prelude ∷ [Text]
 prelude =
-  [ "local function make(key, mode)"
+  [ "local weak = setmetatable({}, { __mode = 'k' })"
+  , "local function make(key, mode)"
   , "  return function(self, ev)"
   , "    fx.record('got ' .. key .. ' n=' .. ev.payload.n .. ' seq=' .. ev.sequence .. ' t=' .. ev.tick)"
   , "    if mode == 'gate' then"
@@ -238,6 +240,12 @@ prelude =
   , "    elseif mode == 'wait' then"
   , "      sched.wait_ticks(1)"
   , "      fx.record('done ' .. key .. ' n=' .. ev.payload.n)"
+  , "    elseif mode == 'yieldwait' then"
+  , "      sched.yield()"
+  , "      fx.record('yielded ' .. key)"
+  , "      sched.wait_ticks(1)"
+  , "      local kind, tick = fx.resume()"
+  , "      fx.record('resumed ' .. key .. ' at ' .. tick)"
   , "    elseif mode == 'fail' then"
   , "      error('callback boom')"
   , "    end"
@@ -252,6 +260,20 @@ prelude =
   , "  elseif p.op == 'try_subscribe' then"
   , "    local ok, err = pcall(self.api.subscribe, p.endpoint, make(key, p.mode))"
   , "    if ok then self.hs[key] = err out = 'ok' else out = 'refused ' .. tostring(err) end"
+  , "  elseif p.op == 'subscribe_size' then"
+  , "    self.hs[key] = self.api.subscribe(p.endpoint, function(self, ev) fx.record('size ' .. key .. ' ' .. #ev.payload) end)"
+  , "    out = 'ok'"
+  , "  elseif p.op == 'subscribe_tracked' then"
+  , "    local token = {}"
+  , "    weak[token] = true"
+  , "    self.hs[key] = self.api.subscribe(p.endpoint, function(self, ev) local seen = token end)"
+  , "    out = 'ok'"
+  , "  elseif p.op == 'weak_count' then"
+  , "    collectgarbage()"
+  , "    collectgarbage()"
+  , "    local n = 0"
+  , "    for _ in pairs(weak) do n = n + 1 end"
+  , "    out = tostring(n)"
   , "  elseif p.op == 'unsubscribe' then"
   , "    out = tostring(self.api.unsubscribe(self.hs[key]))"
   , "  elseif p.op == 'noop' then"
@@ -340,6 +362,20 @@ failingInitSubscriber =
          , "  api.subscribe('ticks', make('f', nil))"
          , "  fx.record('init subscribed')"
          , "  error('init boom')"
+         , "end"
+         ]
+
+-- | An instance whose @shutdown@ hook holds the owner at a gate, so a test can act after its stop was
+-- applied and before it ends.
+gatedShutdownSubscriber ∷ ModuleSource
+gatedShutdownSubscriber =
+  hooksModule "gatedshutdownsubscriber" $
+    prelude
+      <> [ "function init(self, api) connect(self, api) end"
+         , "function shutdown(self, reason)"
+         , "  fx.record('shutdown ' .. reason)"
+         , "  fx.block('shutdown')"
+         , "  fx.record('shutdown done')"
          , "end"
          ]
 

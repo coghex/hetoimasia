@@ -461,6 +461,7 @@ drainBacklog ih restore = do
         case found of
           Just cell → applyControl ih cell request receipt
           Nothing → atomically (settleReceipt receipt ControlNoLongerApplicable)
+      JobForget number → withCell ih number (forgetStale ih)
     abandon = \case
       JobControl _ _ receipt → atomically (settleReceipt receipt ControlNoLongerApplicable)
       _ → pure ()
@@ -669,6 +670,23 @@ hookAvailable ∷ InstanceHost → ModuleHandle → Text → IO Bool
 hookAvailable ih handle name
   | name `notElem` map entryName (handleEntries handle) = pure False
   | otherwise = entryPresent (ownedHost (ihOwned ih)) handle name
+
+-- | Have the driver let go of the callbacks of subscriptions that ended without the script (an
+-- epoch change), on the owner's thread at a safe boundary: the script does not have to unsubscribe
+-- a subscription the engine ended, and a VM that holds one holds whatever it captured for as long
+-- as the instance lives. The driver's creation entry on a slot that is live is this cleanup, and
+-- asks the engine for the numbers itself; an instance that has not been created has nothing to let
+-- go of.
+forgetStale ∷ InstanceHost → ICell → IO ()
+forgetStale ih cell = do
+  created ← Set.member (icId cell) <$> readIORef (ihCreated ih)
+  state ← readTVarIO (icState cell)
+  unless (not created || isTerminal (isPhase state)) $ do
+    let slot = VInteger (fromIntegral (icId cell))
+    released ← settledOrRaise (ihExtra ih) (withRunning ih (icId cell) (callEntry (ihOwned ih) (ihDriver ih) "create" [slot]))
+    case released of
+      Left fault → failInstance ih cell (isPhase state) StageRelease (ErrorFault fault)
+      Right _ → pure ()
 
 -- Invocations ----------------------------------------------------------------------------
 
@@ -1240,12 +1258,16 @@ settleEventHolds ih = do
 eventHoldReleasable ∷ InstanceHost → IState → IO Bool
 eventHoldReleasable ih state
   | isTerminal (isPhase state) || isStopped state || isPhase state /= Active = pure True
-  | Seq.null (isQueue state) && isNothing (isPending state) = pure True
   | otherwise = do
       stuck ← not <$> atomically (tasksReady (scheduler' ih))
       case isActive state of
-        -- Nothing in flight and the next delivery waits for its turn to be given a place.
-        Nothing → pure stuck
+        -- Nothing in flight: all that is left is the next delivery, waiting for its turn to be
+        -- given a place, and with nothing unstarted there is nothing to wait for.
+        Nothing → pure (nothingUnstarted || stuck)
+        -- The invocation in flight is what the tick waits for, whether or not anything is behind
+        -- it: while it is ready to run a segment, after it began and yielded as much as before it
+        -- did, the grant that reached the tick is its claim on the tick, and only its completion or
+        -- its suspension on a wait gives it back.
         Just task →
           atomically (taskPhase (scheduler' ih) task) <&> \case
             Just PhaseReady → False
@@ -1256,6 +1278,7 @@ eventHoldReleasable ih state
             Just (PhaseEnded _) → False
             _ → True
   where
+    nothingUnstarted = Seq.null (isQueue state) && isNothing (isPending state)
     (<&>) = flip fmap
 
 -- | Whether a due update can no longer run in the tick that is waiting for it. A tick

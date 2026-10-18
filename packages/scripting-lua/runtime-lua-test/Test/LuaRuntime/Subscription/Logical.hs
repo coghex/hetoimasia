@@ -6,6 +6,7 @@
 -- admissions and recorded effects however the producers' arrivals and the grants' pacing vary.
 module Test.LuaRuntime.Subscription.Logical (spec) where
 
+import Control.Exception (finally)
 import Control.Monad (forM_, void)
 import Data.List (permutations)
 import Data.Text (Text)
@@ -19,6 +20,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
 import Test.Hspec (Spec, describe, it, shouldBe)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support (awaitLine, linesOf, tickReached)
+import Test.LuaRuntime.Scheduled.Support (awaitEntered, releaseGate)
 import Test.LuaRuntime.Subscription.Support
 import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
 
@@ -184,6 +186,28 @@ spec = describe "on an owner on logical time" $ do
         gotLines fixture >>= (`shouldBe` ["got s n=1 seq=1 t=1", "got s n=2 seq=2 t=2"])
         (sdCoalesced <$> subDiagnostics owner) >>= (`shouldBe` 0)
 
+  describe "an instance that is stopping" $ do
+    it "takes no event for a tick it will not reach: a delivery after its stop was applied is refused, not held, and takes no place in the store" $ bounded $ do
+      fixture ← newIFixture
+      fake ← newFakeEvents
+      -- The gate is let go however the example ends, so a failing one fails and does not hold the owner.
+      withBoundary $ \_ runtime → (`finally` releaseGate (ifBase fixture) "shutdown") $ eventsFinish fake $ do
+        owner ← logicalOwner fixture fake runtime "stopping" [gatedShutdownSubscriber] 2
+        admitSubscriber fixture owner "i" "gatedshutdownsubscriber"
+        subscribeTo' fixture owner "i" "a" "ticks" Nothing
+        receipt ← expectControl fixture owner "i" InstanceStop
+        -- The stop has been applied and the shutdown hook holds the owner: the instance has not ended.
+        awaitEntered (ifBase fixture) "shutdown"
+        deliverTo fake 0 (at 5 0) 1 >>= (`shouldBe` EventEnded)
+        deliverTo fake 0 (at 5 1) 2 >>= (`shouldBe` EventEnded)
+        d ← subDiagnostics owner
+        (sdStaged d, sdRefusedEnded d, sdStagingFull d) `shouldBe` (0, 2, 0)
+        releaseGate (ifBase fixture) "shutdown"
+        _ ← waitInstanceControl receipt
+        awaitCancelledSubs fake 1
+        finishSubscription fake 0
+        void (awaitSettled fixture "i")
+
   describe "an instance that ends" $ do
     it "has the events held for it discarded and counted, and the places they held given back" $ bounded $ do
       fixture ← newIFixture
@@ -304,6 +328,28 @@ spec = describe "on an owner on logical time" $ do
         gotLines fixture >>= (`shouldBe` ["got a n=1 seq=1 t=1", "got a n=2 seq=2 t=1"])
 
   describe "the tick" $ do
+    -- A started callback is the tick's claim for as long as it can run a segment: a callback that
+    -- yields and then waits for a tick must wait for the same tick whether the grants behind its
+    -- tick were queued or served one at a time.
+    it "stays held while a started callback is still ready, so queued and individually served grants give the same effects" $ bounded $ do
+      let run queued = do
+            fixture ← newIFixture
+            fake ← newFakeEvents
+            withBoundary $ \control runtime → eventsFinish fake $ do
+              owner ← logicalOwner fixture fake runtime "yielding" [subscriber] 16
+              admitSubscriber fixture owner "i" "subscriber"
+              subscribeTo' fixture owner "i" "a" "ticks" (Just "yieldwait")
+              deliverTo fake 0 (at 1 0) 1 >>= (`shouldBe` EventStaged)
+              if queued then stepsQueued control owner 2 else forM_ [1, 2 ∷ Int] (const (grantOne control owner))
+              grantOne control owner
+              awaitLine fixture "resumed a at 2"
+              lines' ← linesOf fixture
+              pure (filter (\line → Text.isPrefixOf "got " line || Text.isPrefixOf "yielded " line || Text.isPrefixOf "resumed " line) lines')
+      queued ← run True
+      single ← run False
+      queued `shouldBe` single
+      queued `shouldBe` ["got a n=1 seq=1 t=1", "yielded a", "resumed a at 2"]
+
     it "does not wait for events behind an invocation that is suspended waiting for a tick" $ bounded $ do
       fixture ← newIFixture
       fake ← newFakeEvents

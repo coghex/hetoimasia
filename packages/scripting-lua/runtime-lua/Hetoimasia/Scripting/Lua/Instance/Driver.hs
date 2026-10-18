@@ -41,9 +41,9 @@ import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Instance.State (connectSource, takeDelta)
 import Hetoimasia.Scripting.Lua.Instance.Types (EventSource (..), Instances)
 import Hetoimasia.Scripting.Lua.Owner (EntryPoint (..), ModuleRef (..), ModuleSource (..), Requirement (..))
-import Hetoimasia.Scripting.Lua.Provider.Subscribe (subscribeTo, unsubscribeFrom)
+import Hetoimasia.Scripting.Lua.Provider.Subscribe (forgottenBy, subscribeTo, unsubscribeFrom)
 import Hetoimasia.Scripting.Lua.Registration (Namespace, asynchronousNativeRequestIn, namespace, stateOperation)
-import Hetoimasia.Scripting.Lua.Value (Schema (..), Value (VBoolean, VFloat, VInteger, VText))
+import Hetoimasia.Scripting.Lua.Value (Schema (..), Value (VBoolean, VFloat, VInteger, VList, VText))
 
 -- | The driver's module.
 driverRef ∷ ModuleRef
@@ -91,6 +91,12 @@ connectNamespace instances =
         [VInteger slot, VText endpoint] | slot >= 0 →
           (\number → [VInteger (fromIntegral number)]) <$> subscribeTo context (fromIntegral slot) endpoint
         _ → pure [VInteger (-1)]
+    , -- The numbers of the subscriptions the engine ended without the script, taken once: the
+      -- driver lets go of the callbacks it holds for them.
+      asynchronousNativeRequestIn "forgotten" [SInteger] [SList SInteger] $ \context → \case
+        [VInteger slot] | slot >= 0 →
+          (\numbers → [VList [VInteger (fromIntegral number) | number ← numbers]]) <$> forgottenBy context (fromIntegral slot)
+        _ → pure [VList []]
     , asynchronousNativeRequestIn "unsubscribe" [SInteger, SInteger] [SBoolean] $ \context → \case
         [VInteger slot, VInteger number] | slot >= 0 && number >= 0 →
           (\ended → [VBoolean ended]) <$> unsubscribeFrom context (fromIntegral slot) (fromIntegral number)
@@ -180,11 +186,23 @@ luaBody =
   , "  end"
   , "end"
   , ""
+  , "-- Let go of the callbacks of subscriptions the engine ended without the script, and of the handles"
+  , "-- that named them."
+  , "local function sweep(slot, record)"
+  , "  for _, number in ipairs(host.forgotten(slot)) do"
+  , "    record.subscriptions[number] = nil"
+  , "  end"
+  , "  for handle, number in pairs(record.handles) do"
+  , "    if record.subscriptions[number] == nil then record.handles[handle] = nil end"
+  , "  end"
+  , "end"
+  , ""
   , "local function subscriber(slot, record)"
   , "  return function(endpoint, callback)"
   , "    if record.ended then error('api.subscribe: the instance has ended', 2) end"
   , "    if type(endpoint) ~= 'string' then error('api.subscribe: an event endpoint is named by a string', 2) end"
   , "    if type(callback) ~= 'function' then error('api.subscribe: the callback must be a function', 2) end"
+  , "    sweep(slot, record)"
   , "    local number = host.subscribe(slot, endpoint)"
   , "    local handle = {}"
   , "    record.subscriptions[number] = callback"
@@ -203,8 +221,14 @@ luaBody =
   , "  end"
   , "end"
   , ""
+  , "-- Creating a slot that is live is the owner's cleanup point for it: it lets go of what ended."
   , "function create(slot)"
-  , "  local record = { self = {}, connections = {}, subscriptions = {}, handles = {}, ended = false }"
+  , "  local live_record = live[slot]"
+  , "  if live_record ~= nil then"
+  , "    sweep(slot, live_record)"
+  , "    return"
+  , "  end"
+  , "  local record = { self = {}, connections = {}, subscriptions = {}, handles = setmetatable({}, { __mode = 'k' }), ended = false }"
   , "  record.api = { connect = connector(slot, record), subscribe = subscriber(slot, record), unsubscribe = unsubscriber(slot, record) }"
   , "  live[slot] = record"
   , "end"

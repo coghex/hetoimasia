@@ -23,12 +23,14 @@
 module Hetoimasia.Scripting.Lua.Provider.Subscribe
   ( subscribeTo
   , unsubscribeFrom
+  , forgottenBy
   , serviceFromContext
   ) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Exception (mask, mask_, rethrowIO, throwIO)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, evaluate, fromException, mask, mask_, rethrowIO, throwIO)
 import Data.Text (Text)
+import qualified Data.Text as Text
 import Data.Word (Word64)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (operation, throwFailure)
@@ -41,6 +43,7 @@ import Hetoimasia.Scripting.Lua.Provider.Events
   , commitSubscribed
   , deliverChecked
   , failDelivery
+  , takeForgotten
   , unsubscribeOf
   , withdrawSubscription
   )
@@ -49,6 +52,10 @@ import Hetoimasia.Scripting.Lua.Provider.State (Caller (CallerInstance), callerO
 import Hetoimasia.Scripting.Lua.Provider.Types
 import Hetoimasia.Scripting.Lua.Registration (RequestContext, fromRequestContext)
 import Hetoimasia.Scripting.Lua.Runtime.Shared (runtimeComponent)
+
+-- | The longest reason a provider's delivery failure keeps.
+maxReasonLength ∷ Int
+maxReasonLength = 512
 
 -- | The service of the owner whose script called, read from the engine's own context. A context
 -- that is not an owner's request service is the application's misuse of the library.
@@ -92,7 +99,16 @@ subscribeTo context slot name = do
             { feedDeliver = \slotOf value → do
                 checked ← checkEvent (psLimits service) endpoint value
                 atomically (deliverChecked service identity slotOf checked)
-            , feedFail = \reason → atomically (failDelivery service identity reason)
+            , feedFail = \reason → do
+                -- The reason is a producer's text: what the instance is failed with is cut and
+                -- copied to a buffer of its own, evaluated inside the guard, so a slice of a larger
+                -- text is not kept alive and one that throws is a failure that says so.
+                kept ← guarded (evaluate (Text.copy (Text.take maxReasonLength reason)))
+                case kept of
+                  Right text → atomically (failDelivery service identity text)
+                  Left (ExceptionWithContext _ raised)
+                    | Just (async ∷ SomeAsyncException) ← fromException raised → throwIO async
+                    | otherwise → atomically (failDelivery service identity "the reason could not be evaluated")
             }
         info =
           SubscriptionInfo
@@ -112,6 +128,14 @@ subscribeTo context slot name = do
         -- now that there is a provider to tell.
         raiseAmong "lua subscription cancel" =<< tellProviders service
         pure number
+
+-- | The numbers of the subscriptions the engine ended without the script, which the calling instance's
+-- VM still holds a callback for, taken once.
+forgottenBy ∷ HasCallStack ⇒ RequestContext → Word64 → IO [Word64]
+forgottenBy context slot = do
+  service ← serviceFromContext context
+  instanceNumber ← subscriberIn service slot
+  atomically (takeForgotten service instanceNumber)
 
 -- | End the calling instance's subscription of this number. Answers whether it ended a live one;
 -- a number that names none is not an error. Interest in the provider's work is withdrawn and the

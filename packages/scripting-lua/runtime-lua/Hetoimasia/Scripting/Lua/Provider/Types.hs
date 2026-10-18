@@ -493,7 +493,8 @@ renderSubscribeRefusal ∷ SubscribeRefusal → Text
 renderSubscribeRefusal = \case
   NoSubscriber → "subscribe refused: no instance is running to receive the events"
   SubscriptionsClosed → "subscribe refused: the instance is no longer taking subscriptions"
-  EndpointNotGranted name → "subscribe refused: no event endpoint named " <> name <> " is granted to this instance"
+  -- The name is a script's, as long as the owner's limits let a string be: what is quoted is cut.
+  EndpointNotGranted name → "subscribe refused: no event endpoint named " <> Text.take 64 name <> " is granted to this instance"
   SubscriptionsFull bound → "subscribe refused: all " <> Text.pack (show bound) <> " places are held"
 
 -- Who asks ---------------------------------------------------------------------------
@@ -584,6 +585,10 @@ data PState = PState
   , pEvents ∷ !EventCounts
   , pNextSub ∷ !Word64
     -- ^ The next subscription number. Never rewinds.
+  , pForget ∷ !(Map Word64 [Word64])
+    -- ^ The numbers of the subscriptions an epoch change ended, by instance, that the instance's VM
+    -- still holds a callback for: the owner has its driver let go of them at its next boundary,
+    -- without the script's help, and an instance that ends needs none.
   }
 
 -- | A request, as a script can reach it.

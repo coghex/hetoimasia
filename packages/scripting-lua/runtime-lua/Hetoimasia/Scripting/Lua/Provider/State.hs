@@ -118,6 +118,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Maybe (fromMaybe, isJust, isNothing)
+import Data.Sequence ((|>))
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
@@ -125,7 +126,8 @@ import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (operation, throwFailure)
 import Hetoimasia.Scripting.Lua.Instance.Types
   ( InstanceBounds (boundInvocationQueue)
-  , Instances (insBounds, insRunning)
+  , Instances (insBounds, insInbox, insRunning)
+  , Job (JobForget)
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Failure
   ( ReasonCode (ProviderFault, ValidationFault)
@@ -192,7 +194,7 @@ import Hetoimasia.Scripting.Lua.Retention
   , retain
   , sweep
   )
-import Hetoimasia.Scripting.Lua.Provider.Events (SubEnd (EndByModel), awaiting, endSubs, requesterClosed)
+import Hetoimasia.Scripting.Lua.Provider.Events (SubEnd (EndByEpoch, EndByOwner), awaiting, endSubs, requesterClosed)
 import Hetoimasia.Scripting.Lua.Provider.Types
 import Hetoimasia.Scripting.Lua.Owner (maxEntries)
 import Hetoimasia.Scripting.Lua.Registration (validName)
@@ -346,6 +348,7 @@ newProviderState owner label key limits grant endpoints subscriptions ticks inst
         , pStaged = Map.empty
         , pEvents = noEventCounts
         , pNextSub = 1
+        , pForget = Map.empty
         }
   pure
     ProviderState
@@ -945,8 +948,9 @@ endRequesterSTM service requester cause = do
                 (pWork withEnded)
                 theirWork
           }
-  ended ← endSubs service EndByModel owned prelim
-  writeTVar (psVar service) (retireEnded ended)
+  ended ← endSubs service EndByOwner owned prelim
+  -- An instance that ended needs nothing let go of: its VM is released with it.
+  writeTVar (psVar service) (retireEnded ended {pForget = foldr Map.delete (pForget ended) [number | RequesterInstance number ← [requester]]})
   pure (EndReport (length mine) (length told))
 
 -- | The task requesters whose tasks are gone: ended, or no longer known to the scheduler.
@@ -1007,7 +1011,11 @@ advanceEpochSTM service = do
           -- retained under the identities it was issued under, charged to the bound until the
           -- provider proves it over, so a late delivery finds nothing and churn reclaims nothing.
           let current = committed session
-          ended ← endSubs service EndByModel (Map.keys (pSubs current)) current
+          ended ← endSubs service EndByEpoch (Map.keys (pSubs current)) current
+          -- The owner is woken for each instance whose VM holds a callback that is no use now.
+          case psInstances service of
+            Nothing → pure ()
+            Just instances → forM_ (Map.keys (pForget ended)) $ \number → modifyTVar' (insInbox instances) (|> JobForget number)
           writeTVar (psVar service) ended
           pure (Just (EpochReport change cancelled discarded))
   where
@@ -1051,8 +1059,8 @@ closeSTM service = do
               , pExit = Just exit
               , pWork = Map.map (\work → if workEnded work then work else work {workWantsCancel = True}) (pWork withEnded)
               }
-      ended ← endSubs service EndByModel (Map.keys (pSubs prelim)) prelim
-      writeTVar (psVar service) (retireEnded ended)
+      ended ← endSubs service EndByOwner (Map.keys (pSubs prelim)) prelim
+      writeTVar (psVar service) (retireEnded ended {pForget = Map.empty})
       pure (Just exit)
 
 -- The provider's work ------------------------------------------------------------------

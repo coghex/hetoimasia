@@ -788,6 +788,9 @@ data Job
     JobDispatch !Word64
   | -- | Apply a request.
     JobControl !Word64 !InstanceControl !InstanceControlReceipt
+  | -- | Let the instance's VM go of the callbacks of subscriptions that ended without it
+    -- (an epoch change): they are named in the provider service, and are no use to anyone.
+    JobForget !Word64
 
 -- | An instance's settlement.
 data InstanceSettlement = InstanceSettlement
