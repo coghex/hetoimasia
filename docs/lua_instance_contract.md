@@ -172,7 +172,8 @@ decisions must be tied to logical boundaries so wall-time service speed alone
 does not decide which inputs are accepted.
 On an owner driven by logical time, a request's settlement reaches Lua at the
 tick the application assigned at admission (by default the next), and that tick
-does not begin until the request has settled (D-36).
+does not begin until the request has settled (D-36). A cancel before that tick
+always wins; a provider reply that arrived earlier is discarded (D-39).
 
 On resume, finish any previously suspended invocation before starting another.
 Then process retained events in admission order under ordinary service quotas;

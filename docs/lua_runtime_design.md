@@ -1065,6 +1065,34 @@ recommended partition:
 
 The split adds no scope; D-37's readiness covers both slices.
 
+### D-39. On a logical owner, a cancel before the due tick wins
+
+Owner decision, 2026-10-18, in the hetoimasia manager pane ("Cancel wins"), on
+the open decision #482's canonical review raised
+(https://github.com/coghex/hetoimasia/issues/482#issuecomment-6250181463): a
+request admitted at tick 0 with its settlement due at tick 2, cancelled by Lua
+at tick 1. LUA-4's model installs the first settlement physically
+(`Request.hs`), so an early provider reply would make the cancel fail while a
+late one would let it succeed: identical admissions, grants and script actions
+with different outcomes, which D-23 forbids.
+
+- On an owner driven by logical time, nothing is logically settled before the
+  due tick. A provider reply that arrives early is a held provider completion,
+  not a settlement.
+- A cancel before the due tick always settles the request `Cancelled`, whatever
+  the provider has done. Any held value is discarded without reaching Lua, the
+  due tick's hold is released, and the provider's work is retired through the
+  usual retained obligation.
+- At the due tick, a request not cancelled settles with what the provider
+  delivered, as D-36 says.
+- Owners on elapsed time keep first-settlement order: a reply that has settled
+  the request before a cancel wins.
+
+Rejected: refusing cancellation before the due tick (a script could not abandon
+a slow request), and recording a cancel to take effect at the due tick (the tick
+would still wait for the provider). Relaxing the determinism promise was not
+considered: D-23 is a requirement.
+
 ## Design
 
 P-1 through P-13 record the accepted contracts, with proof and delivery gates
@@ -2842,7 +2870,7 @@ and verified policy, with adversarial regression coverage.
   LUA-23's tick-assigned admission.
 - **Ordering:** after instance ownership and engine-held leases; precedes LUA-26;
   independent of Q-5.
-- **Relevant decisions:** D-1, D-2, D-3, D-4, D-12, D-13, D-14, D-22, D-23, D-24, D-25, D-36, D-37, D-38.
+- **Relevant decisions:** D-1, D-2, D-3, D-4, D-12, D-13, D-14, D-22, D-23, D-24, D-25, D-36, D-37, D-38, D-39.
 - **Acceptance signals:** full output paths never block provider completion;
   duplicate/late results harmless; cancellation and stop races settle once;
   provider dependency lifetime extends to actual completion, not cancellation
