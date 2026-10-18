@@ -828,6 +828,13 @@ is refused as the wrong kind of value. A module handle carries the identity of
 the VM that issued it: another owner's is refused (`ModuleHandleForeign`), and
 after the lifetime every use is `VmClosed`, as for the VM itself.
 
+A handle the application's check reports retired is refused by every binding before its action
+runs, with one exception: an explicit release (`releaseOperation`, below and in
+[Instance leases](#instance-leases)). It is declared with the one capability type it releases and
+takes that handle as its only argument, so it is run for a handle whose lease has ended and for
+nothing else. The handle is still checked for being issued by this VM and of that type, and a
+retired handle of another type, or given to any other binding, is refused as before.
+
 ### Calling a binding
 
 A Lua call to a delivered binding is, in order: the kind is checked (a binding of
@@ -1905,8 +1912,9 @@ reads. It follows the accepted
 when it is created with a `scheduledInstances` configuration (`InstanceConfig`); one without serves
 tasks as before and loads nothing of this. The modules that host instances declare their hooks as
 optional entry points (`hookEntries`). Periodic update cadence (LUA-24) is described under
-[Cadence](#cadence). Leases on Lua-exposed resources (LUA-22), granted Lua controls and Lua
-inspection (LUA-23) and real event providers (LUA-7) are later slices.
+[Cadence](#cadence). What an instance acquires through the application's bindings is owned by the
+engine (LUA-22, [Instance leases](#instance-leases)); granted Lua controls and Lua inspection (LUA-23) and
+real event providers (LUA-7) are later slices.
 
 ### Instances and identity
 
@@ -2244,6 +2252,186 @@ under test sets (a settlement, a terminal status, the notification the escalatio
 having been taken), never for an ordering the test assumes. The
 cancellation and shutdown windows are the kind an asynchronous-exception race can hide on one platform, so CI, which
 runs them on Linux, is the evidence for them and a local pass is not.
+
+## Instance leases
+
+`Hetoimasia.Scripting.Lua.Lease` (LUA-22, in `runtime-lua`) makes the resources a binding acquires for
+a script instance the engine's, so that cleanup is correct however the script behaves. It implements the
+accepted [instance contract's](../../docs/lua_instance_contract.md) "Automatic resource ownership"
+(D-26, D-27) on the capability-owned collection an owner lends to its callbacks
+([Lending a collection](#lending-a-collection), D-32). A script that raises before storing a handle,
+overwrites it, never stores it, or defines no `shutdown`, or a `shutdown` that fails, still has what
+it acquired released when its instance ends, and no Lua-written cleanup is ever required. **A binding
+that needs the script to clean up after it, whose ownership and retirement cannot be described, or that
+exposes a native lifetime for Lua to manage, is not qualified for this interface.**
+
+### The scope and the lent capability
+
+Each instance has a *scope* the engine makes before its first hook and dissolves when the instance
+settles. It lives in Haskell, in the state of the owner's `Leases` handle; `self`, a module's globals
+and every other Lua value cannot erase, replace or forge it, because none of them can reach it. A script
+holds only *handles*: capabilities whose key names a lease, issued by the VM and checked by the value
+boundary before a binding's action runs ([Handles](#handles)).
+
+One owner has one collection, and each instance's scope keeps its own bookkeeping over it, so what one
+instance holds is never another's to release. A binding's operations run on its callback's thread,
+through the capability the owner lent for that callback; the drain at an instance's end runs on the
+owner's thread, through the capability the owner holds. Nothing assumes a binding runs on the owner's
+thread, and `init` and `shutdown` are callbacks like any other, so a binding can acquire inside both.
+
+The application makes the handle over its `Lending`, closes its bindings over it, and gives the owner
+both:
+
+```haskell
+lending ← newLending
+leases  ← newLeases lending 8      -- at most 8 charges for each instance
+spec = (scheduledSpec vm worker bounds)
+  { scheduledInstances = Just instanceConfig
+  , scheduledLending   = Just lending
+  , scheduledLeases    = Just leases
+  }
+```
+
+An owner is refused before anything starts, naming every violation (`LeasesRefused`), if it hosts no
+instances, lends no collection, lends through a different handle than the leases were made over, or has
+a `scheduledMemberLimit` too small to hold every live instance at the capacity. A handle serves one owner,
+because the `Lending` it is made over does.
+
+### Reserving, acquiring and registering
+
+`acquireOwned` and `acquireShared` do three things, in this order, before they return, and none can be
+left half done:
+
+1. **Reserve** one charge of the instance's capacity, before any stage runs. Exhausting the capacity is
+   an *engine* refusal of the calling invocation, below.
+2. **Acquire** through a staged `Assembly`, with every guarantee of the foundation collection: a failing
+   stage rolls back exactly the stages that completed, registers nothing and gives Lua no handle. The
+   constructor's own failure is a failure of application code, so it ends the owner under its
+   `WorkerPolicy`, unconverted, as any binding's does; a binding author who wants a recoverable refusal
+   returns it as bounded data. A rollback whose release fails is a cleanup failure.
+3. **Register** the obligation in the masked step that registered the member, so a cancellation or a
+   failure to publish the call's result cannot land between having the resource and having a record of
+   it.
+
+Only then does the action have a `Lease` to turn into a handle (`leaseHandle`). There is no interval
+in which Lua holds a resource whose cleanup depends on the script's next statement. A result that cannot
+be published (the call returned more values than the binding declares, say) leaves the lease
+registered and drained with the instance.
+
+### Capacity and its refusal
+
+Capacity is bounded for each instance (`newLeases`). It counts every resource the instance holds *and*
+every released resource whose provider has not yet proved it retired, so a script cannot grow what is
+outstanding without limit by acquiring and releasing in a loop. An acquisition over it is refused by
+the engine, before any stage runs and before anything is charged:
+
+* the refusal is raised unmarked as application code, so it is a fault of the call
+  (`BindingRefused`, decision C1) and never a failure of the host, whatever the script does with the
+  Lua error it sees, a `pcall` included;
+* the invocation is faulted even though the script caught the error, so the instance fails (isolated,
+  as a faulted invocation is) and the owner goes on;
+* nothing converts an exception the `Assembly` throws: capacity is checked before the assembly runs
+  and only the engine can raise the refusal.
+
+### Instance versus application leases
+
+The binding author chooses:
+
+* `acquireOwned`: the instance owns what the assembly builds, and releasing the lease destroys it.
+* `acquireShared label take drop`: the instance takes an interest in a resource that lives on with its
+  owner (a shared asset, a world object). Releasing the lease runs `drop` and nothing else; another
+  instance's lease on the same asset, and the application's own, are untouched.
+
+A handle stays owned by the instance that acquired it. Caching it in a module's global or in another
+instance's `self` does not extend its lifetime: when the acquiring instance ends every later use is
+refused as retired (`RuleRetiredHandle`), and keys are issued in order and never again, so the capacity
+an ended lease gave back cannot make the old handle live. Using it from another instance while its
+owner lives is refused by the engine (`BindingRefused`). Longer-lived ownership than a lease is out of
+scope.
+
+### Using a handle
+
+The value boundary has already checked that a handle was issued by this VM, is of the declared type and,
+through `leaseLive` (declare the type with `leaseCapabilityType`), that its lease has not ended.
+`withLease leases key action` borrows the held resource for the action, under the collection's borrowing
+rules, and is refused for a lease of another type or another instance.
+
+### Early release and its answers
+
+A script may release a handle early through a binding built with `releaseOperation`
+([Handles](#handles)), whose action calls `releaseLease`:
+
+| Answer | Meaning |
+|---|---|
+| `Released` | The first release; the resource is retired. |
+| `Retiring` | The lease is revoked and the provider's retirement is pending. A repeated release answers it again and restarts nothing. |
+| `AlreadyReleased` | The lease ended whole earlier. Nothing ran. |
+
+A release whose native cleanup failed answers none of them. Its failure is retained on the lease, is
+the answer to every later release of it, never runs the cleanup again, and ends the owner as cleanup
+failures do. An invalid or missing Lua value is an ordinary argument error and never prevents the
+engine from cleaning up the instance's other holdings. A closing handler a script defined runs as the
+instance whose invocation it is, so it may release a handle it holds.
+
+### Draining and its failure evidence
+
+On every path by which an instance ends (a failed `init`, a stop, a faulted invocation including a
+failure of a closing handler, a one-shot's completion, the owner's retirement or cancellation, and a
+`shutdown` that is absent or raises) the instance's remaining holdings are released on the owner's
+thread after its `shutdown` has run or been skipped, newest acquisition first and each one's parts in
+the order its assembly declared. Handles stay usable inside `shutdown`. A release that fails does not
+stop the others from being attempted. Draining runs no Lua, so it also runs when Lua is no longer safe
+to enter.
+
+A release failure is a cleanup failure:
+
+* it is kept beside the instance's primary failure, which stays primary, in the settlement
+  (`failureSecondary`, stage `StageRelease`), and is the instance's failure when there is none;
+* it is cleanup evidence on the owner's outcome, so it ends the owner at once through supervision and
+  is fatal under every policy, an `Optional` owner whose classifier recognizes every exception
+  included;
+* it is never retried and never reported as reclaimed. `resultLeases` counts what the end released,
+  waited for and saw fail.
+
+### Retained retirement
+
+A resource retired by a provider that finishes later does not wait inside the collection's
+uninterruptible release (`docs/resources.md`, "What a release may do"). The assembly's release hands the
+resource over and records the obligation with `retireAsynchronously retirements label reading`, where
+`reading` is an STM transaction that says `ProviderPending`, `ProviderComplete` or `ProviderFailed` and
+never retries. The lease keeps its charge until the provider says it is done. The owner awaits it outside
+the collection, in its own protected lifetime:
+
+* the instance's stop completion settles only after its obligations have completed; until then it is
+  `Stopping`, and nothing is reported as reclaimed merely because Lua stopped;
+* the owner stays live, with everything its exit keeps, through a stop and through a cancellation, as a
+  stuck segment keeps it, until the provider has proved completion;
+* a retirement the provider reports failed is retained as cleanup evidence and is fatal, and the lease
+  it belonged to answers that failure and never success;
+* a stage rolled back whose provider has not finished keeps its charge, and the owner's life, though the
+  constructor failed.
+
+### What is not here
+
+Real providers and their retirement (LUA-7), GPU or native game bindings, rollback of committed effects
+(D-7), a longer-lived ownership API than the lease boundary, Lua lifecycle bindings and inspection
+(LUA-23), and periodic update cadence (LUA-24).
+
+### What proves it
+
+`Test.LuaRuntime.Instance.Lease.*`, in `lua-runtime-tests`, run real instances on real supervised
+scheduled owners that lend their collection and hold leases, with fake resources and a fake provider and
+no Lua cleanup code in any module: acquisition from `init`, a callback and `shutdown`; handles lost, overwritten or
+never stored; a constructor that fails part way, and a rollback whose release fails; the capacity and the
+engine's refusal, which a `pcall` does not turn into a host failure; a result that cannot be published; a
+shared asset surviving one instance's exit and a cached handle staying retired; early and repeated
+release, the retired handle accepted only by the release operation and refused by every other, and a failing
+release; the drain on each way an instance ends, newest first and past a failing release, with the failure
+beside the primary one and fatal under both a required and an optional policy; and a provider's retirement
+that holds the stop completion, the capacity and the owner's life through a stop and a cancellation. The
+release operation and the engine's refusal are also pinned in `lua-host-tests`. The cancellation and
+cleanup windows are the kind an asynchronous-exception race can hide on one platform, so CI, which runs
+them on Linux, is the evidence for them and a local pass is not.
 
 ## The protocol model
 

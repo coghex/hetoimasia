@@ -2569,6 +2569,24 @@ and verified policy, with adversarial regression coverage.
   game bindings, rollback of committed effects, longer-lived ownership APIs
   beyond the explicit lease boundary.
 - **Open questions:** None; D-27 fixes the requirement.
+- **Delivered (#473).** `Hetoimasia.Scripting.Lua.Lease` in `runtime-lua`; the
+  binding author's view is `packages/scripting-lua/README.md`, "Instance leases".
+  How the scope maps onto LUA-25's collection was the solver's choice (issue
+  requirement 1), and is this: one collection for the owner, held with the
+  owner's capability, with a scope of bookkeeping for each instance in the
+  owner's `Leases` handle. A scope is opened before the instance's first hook,
+  closed when its holdings are drained after `shutdown`, and dissolved when the
+  instance settles; a slot is made for each reservation and its key is the key
+  of the handle Lua is given, issued in order and never again. The instance's
+  capacity counts the resources it holds and the released ones whose provider
+  has not completed their retirement (the bound the issue asks for on pending
+  obligations). A provider's retirement is recorded by the assembly's release
+  (`retireAsynchronously`) as an STM reading that never retries; the owner
+  services the readings at its boundaries and from its one wait, parks the
+  instance's end until they complete, and waits uninterruptibly for them on its
+  exit. Two bridge additions carry the rest: an engine refusal an action asks
+  for (`BindingRefused`, unmarked, a fault of the call), and the release
+  operation, the one binding run for a retired handle.
 
 ### LUA-23. Grant Lua lifecycle controls and inspection across owners
 
