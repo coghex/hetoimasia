@@ -8,11 +8,12 @@ failure evidence, and lifetime. This is the canonical continuation of
 
 Design state: `ready for issue processing`
 
-Current readiness scope: **LUA-7 only** (D-37), which D-38 splits into LUA-7
-(requests) then LUA-26 (subscriptions), with D-36 fixing when a deterministic
-owner's Lua sees an asynchronous result or provider event. LUA-6 (with LUA-20 and
-LUA-21, D-28/D-29) and LUA-18 (with LUA-22, LUA-23, LUA-24 and LUA-25,
-D-30 to D-32) are delivered. Other unchecked slices retain their explicit
+Current readiness scope: none open. LUA-7 (D-37), split by D-38 into LUA-7
+(requests) and LUA-26 (subscriptions), is delivered, with D-36 and D-39 fixing
+when a deterministic owner's Lua sees an asynchronous result or provider event.
+LUA-6 (with LUA-20 and LUA-21, D-28/D-29) and LUA-18 (with LUA-22, LUA-23,
+LUA-24 and LUA-25, D-30 to D-32) are delivered too. LUA-19 is next on the trusted
+path and needs its own readiness renewal. Other unchecked slices retain their explicit
 deferrals; this state does not release the confinement gate.
 
 Owner: `coghex/hetoimasia`. Epic #145 and children #146–#149 have been
@@ -151,6 +152,10 @@ LUA-22 review, 2026-10-17: the canonical review of #473 requested changes
 a Lua binding runs on a fresh callback thread for each call and the owner's
 thread is blocked inside Lua, so D-30's "built on `Foundation.Resource.Collection`"
 could not hold. The owner chose a prerequisite slice (D-32, LUA-25).
+
+LUA-7 delivery, 2026-10-18 (request `user-het-next-slice-20261018-1235`):
+LUA-7/#482 (PR #484, `895d26b1`) and LUA-26/#483 (PR #485, `4560a08b`) are
+merged, with post-merge validation green for each.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
