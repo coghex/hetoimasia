@@ -2428,7 +2428,13 @@ resource over and records the obligation with `retireAsynchronously retirements 
 `reading` is an STM transaction that says `ProviderPending`, `ProviderComplete` or `ProviderFailed`. It is
 application code and may throw, when it is run or when what it answered is first inspected: either is
 that retirement failing, retained as cleanup evidence while every independent retirement is still served
-and awaited, and a reading that retries says it is not done. The same holds for every other call into
+and awaited, and a reading that retries says it is not done. A reading only reads: what it writes is not kept,
+and it may read TVars that other readings share or that the provider's own thread writes. The engine polls it
+inside a transaction that has read state already, so when another thread commits to what both read, the poll
+starts again from a consistent view and runs the reading once more, rather than running it again and again
+against the stale one; that holds under the build and runtime settings the repository already has, and is the
+same one reading (`Hetoimasia.Scripting.Lua.Retention.pollObligation`) for leases, requests and subscriptions.
+The same holds for every other call into
 provider or application code the retirement makes (a deferred disposal, the application's escalation of
 an instance's failure, the Lua `release` hook, rendering an exception for the settlement): each is run
 through one guard that answers the failure instead of raising it, with what it answered evaluated inside
@@ -2632,7 +2638,8 @@ read from the owner's configuration and never from a value a script supplied (`a
 An endpoint's `endpointSubmit` is handed a `Submission`: the request's arguments (bounded copies), a `Completion` and
 the request's identity (`RequestInfo`: the owner, the instance, the endpoint and the request's number). It answers a
 `ProviderWork`, which is how the engine later withdraws interest (`workCancel`) and reads where the provider's own
-retirement of the work has got to (`workRetirement`, a transaction that must not retry). The provider answers through
+retirement of the work has got to (`workRetirement`, a transaction that must not retry and only reads: what it writes
+is not kept). The provider answers through
 the `Completion`, from any thread, now or later: `ProviderResult` with a value, or `ProviderFailure` with a reason.
 Completing is one transaction that writes the request's reserved slot, or holds the answer, and never waits for the
 owner, a queue or Lua, so a full owner never makes a provider's thread wait. The answer says what became of the
