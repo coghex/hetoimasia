@@ -58,6 +58,7 @@ import Control.Exception
   ( ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException
   , SomeException
+  , finally
   , fromException
   , mask
   , mask_
@@ -126,6 +127,7 @@ import Hetoimasia.Scripting.Lua.Instance.Run
   )
 import Hetoimasia.Scripting.Lua.Instance.Types (Escalation, InstanceFailure)
 import Hetoimasia.Scripting.Lua.Scheduled.Shared (closeSuspended, exitOf, settledOrRaise, waitReport)
+import Hetoimasia.Scripting.Lua.Lifecycle.State (LifecycleState (lifeTask))
 import Hetoimasia.Scripting.Lua.Scheduled.Types
 import Hetoimasia.Scripting.Lua.Scheduler
   ( SegmentReport (..)
@@ -345,7 +347,7 @@ runSegment
   → IORef (Maybe InstanceHost)
   → TaskRun Cursor
   → IO (SegmentReport Cursor)
-runSegment control observe owned identity label handlesRef tasks extra instanceRef run = do
+runSegment control observe owned identity label handlesRef tasks extra instanceRef run = withRunning $ do
   observe
     SegmentContext
       { contextTask = ScheduledTaskId (controlOwner control) (runTask run)
@@ -392,6 +394,14 @@ runSegment control observe owned identity label handlesRef tasks extra instanceR
             Right step → reported step
     Finished result → started >> pure (ReportCompleted (Finished result))
   where
+    -- The task this segment is of is noted for the owner's lifecycle services, which tell
+    -- who a call is from by it: set by the owner's own thread, and cleared however the
+    -- segment ends.
+    withRunning action = case controlLifecycle control of
+      Nothing → action
+      Just lifecycle → do
+        atomically (writeTVar (lifeTask lifecycle) (Just (runTask run)))
+        action `finally` atomically (writeTVar (lifeTask lifecycle) Nothing)
     started = atomically (modifyTVar' (controlStarted control) (Set.insert (runTask run)))
     -- An invocation of a script instance: the instance layer runs it.
     hosted number invocation =

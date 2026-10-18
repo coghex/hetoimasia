@@ -8,10 +8,12 @@ import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Lifecycle
 import Hetoimasia.Scripting.Lua.Registration (bindingName, namespaceBindings)
+import Hetoimasia.Scripting.Lua.Scheduled (ServiceClass (OrdinaryClass))
 import Hetoimasia.Scripting.Lua.Value (valueLimits)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Lifecycle.Support
+import Test.LuaRuntime.Scheduled.Support (awaitEffect)
 import Test.LuaRuntime.Support (bounded, withBoundary)
 
 -- | A snapshot as a script renders it.
@@ -37,6 +39,24 @@ spec = describe "inspection" $ do
       _ ← settleControl targetFx owner "a" InstanceStop
       awaitPhase targetFx owner "a" Stopped
       ask callerFx caller "cmdr" "inspect" (Just tid) Nothing >>= (`shouldBe` seen "stopped")
+
+  it "reads a one-shot that has run to its end as completed, and finds it no longer there to control" $ bounded $ do
+    targetFx ← newIFixture
+    callerFx ← newIFixture
+    withBoundary $ \control runtime → do
+      owner ← startTarget targetFx runtime "target" [oneShot] (testConfig instanceBounds')
+      _ ← admitWith targetFx owner "once" (InstanceRequest (moduleNamed "oneshot") RunOnce (Just "once") OrdinaryClass ["tick"])
+      awaitEffect (sf targetFx) "run begin 1"
+      tid ← tidValue targetFx "once"
+      caller ← startCaller callerFx runtime "caller" (Just (target owner))
+      admitCommander callerFx caller "cmdr"
+      awaitEffect (sf targetFx) "run begin 1"
+      -- Running its @run@ hook, which waits for the next tick.
+      ask callerFx caller "cmdr" "inspect" (Just tid) Nothing >>= (`shouldSatisfy` Text.isInfixOf "status=active")
+      grantOne control owner
+      awaitPhase targetFx owner "once" Completed
+      ask callerFx caller "cmdr" "inspect" (Just tid) Nothing >>= (`shouldSatisfy` Text.isInfixOf "status=completed")
+      ask callerFx caller "cmdr" "stop" (Just tid) Nothing >>= (`shouldBe` "{accepted=false,refusal=unknown_target}")
 
   it "lists the instances of one owner in order of identity, in one read, and nothing of an owner it was not granted" $ bounded $ do
     targetFx ← newIFixture

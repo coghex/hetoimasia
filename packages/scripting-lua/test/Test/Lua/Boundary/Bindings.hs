@@ -20,9 +20,9 @@ import Hetoimasia.Scripting.Lua.Owner
   , Effect (..)
   , FaultOperation (CallBinding)
   , FaultReason (..)
-  , VmConfig (vmLibraries, vmLifecycle, vmValueLimits)
+  , VmConfig (vmLibraries, vmValueLimits)
   )
-import Hetoimasia.Scripting.Lua.Registration (BindingKind (..), commandReasonLimit, lifecycleContext)
+import Hetoimasia.Scripting.Lua.Registration (BindingKind (..), commandReasonLimit)
 import Hetoimasia.Scripting.Lua.Value
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 import Test.Lua.Boundary.Support
@@ -371,35 +371,6 @@ spec = describe "bindings called from Lua" $ do
         boundaryEffect caught `shouldBe` BindingRan
       -- Neither action ran, in any of the three calls.
       logged fixture >>= (`shouldBe` ["set_value"])
-
-    it "delivers a lifecycle operation only to an owner configured with a lifecycle context, handing its action that context" $ do
-      fixture ← newFixture
-      -- Without a context, every lifecycle operation is refused and none of its actions runs.
-      withOwner fixture ["sample"] $ \owned → do
-        plain ← runFault owned "sample.stop_in()"
-        boundaryReason plain `shouldBe` NotYetSupported LifecycleOperation
-        boundaryEffect plain `shouldBe` LuaRan
-      logged fixture >>= (`shouldBe` [])
-      -- With one, the action runs, and is handed the context of the owner that called it.
-      let granted = (sampleConfig fixture ["sample"]) {vmLifecycle = Just (lifecycleContext ("granted" ∷ Text))}
-      withOwnerOf granted $ \owned →
-        run
-          owned
-          ( Text.unlines
-              [ "assert(sample.stop_in() == 'granted')"
-              , "sample.stop()"
-              ]
-          )
-      logged fixture >>= (`shouldBe` ["stop_in: ran", "stop: ran"])
-
-    it "hands an action a context only as the type it was made from, and still refuses an asynchronous request the context does not deliver" $ do
-      fixture ← newFixture
-      let otherType = (sampleConfig fixture ["sample"]) {vmLifecycle = Just (lifecycleContext (7 ∷ Int))}
-      withOwnerOf otherType $ \owned → do
-        run owned "assert(sample.stop_in() == 'none')"
-        asynchronous ← runFault owned "sample.spawn_async('x')"
-        boundaryReason asynchronous `shouldBe` NotYetSupported AsynchronousNativeRequest
-      logged fixture >>= (`shouldBe` ["stop_in: ran"])
 
     it "runs only the bindings of the namespaces an owner is granted" $ do
       fixture ← newFixture

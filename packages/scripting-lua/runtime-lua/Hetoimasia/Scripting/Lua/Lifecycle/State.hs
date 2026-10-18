@@ -24,10 +24,13 @@ module Hetoimasia.Scripting.Lua.Lifecycle.State
     -- * The state
   , LifecycleState (..)
   , LuaReceipt (..)
+  , Issuer (..)
+  , callerOf
   , callerInstance
 
     -- * Receipts
   , abandonIssued
+  , sweepEndedTasks
   , abandonAll
   ) where
 
@@ -46,7 +49,9 @@ import Hetoimasia.Scripting.Lua.Instance.Types
   , InstanceId
   , Instances (insRunning)
   )
+import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (TaskId)
 import Hetoimasia.Scripting.Lua.Runtime.Types (OwnerId)
+import Hetoimasia.Scripting.Lua.Scheduler (Scheduler, TaskPhase (PhaseEnded), taskPhase)
 import Hetoimasia.Scripting.Lua.Value (ValueLimits)
 
 -- | What a grant permits of an owner it covers.
@@ -86,10 +91,19 @@ data Target = Target
   , targetAssign ∷ !(Maybe AssignControl)
   }
 
--- | A request's receipt, as a script holds it: the engine's receipt, and the instance
--- whose code made the request, which alone may read it.
+-- | Who made a request, as the engine knows it and never as a script says: the instance
+-- whose Lua the owner was running, or else the task it was running, or nothing it could name.
+-- Each reads the receipts of its own requests and no one else's.
+data Issuer
+  = IssuedByInstance !Word64
+  | IssuedByTask !TaskId
+  | IssuedByNobody
+  deriving (Eq, Show)
+
+-- | A request's receipt, as a script holds it: the engine's receipt, and who made the
+-- request, who alone may read it.
 data LuaReceipt = LuaReceipt
-  { luaIssuer ∷ !(Maybe Word64)
+  { luaIssuer ∷ !Issuer
   , luaReceipt ∷ !InstanceControlReceipt
   }
 
@@ -115,17 +129,31 @@ data LifecycleState = LifecycleState
   , lifeNext ∷ !(TVar Word64)
     -- ^ The next receipt number: never rewinds, so a number is never read for another
     -- request.
+  , lifeTask ∷ !(TVar (Maybe TaskId))
+    -- ^ The task the owner is running a segment of, set around each segment by the owner's
+    -- own thread: who a call from a task that is no instance's was made by.
   , lifeClosed ∷ !(TVar Bool)
     -- ^ Set once the owner's exit has abandoned every receipt: nothing is issued after it,
     -- so no receipt outlives the abandonment that would have released it.
   }
 
--- | The instance whose code the owner is running, if one: what a request is told it is
--- made by. Never from a script.
+-- | Who is calling: the instance whose code the owner is running, else the task. Never from
+-- a script.
+callerOf ∷ LifecycleState → IO Issuer
+callerOf state = do
+  instance' ← maybe (pure Nothing) (readTVarIO . insRunning) (lifeInstances state)
+  case instance' of
+    Just number → pure (IssuedByInstance number)
+    Nothing → maybe IssuedByNobody IssuedByTask <$> readTVarIO (lifeTask state)
+
+-- | The instance whose code the owner is running, if one.
 callerInstance ∷ LifecycleState → IO (Maybe Word64)
-callerInstance state = case lifeInstances state of
-  Nothing → pure Nothing
-  Just instances → readTVarIO (insRunning instances)
+callerInstance state =
+  callerOf state <&> \case
+    IssuedByInstance number → Just number
+    _ → Nothing
+  where
+    (<&>) = flip fmap
 
 -- | Abandon the receipts an instance holds, once it has ended: nobody can read them
 -- again. Each gives its reservation back as it settles, or now if it has; no request is
@@ -133,9 +161,29 @@ callerInstance state = case lifeInstances state of
 abandonIssued ∷ LifecycleState → Word64 → STM ()
 abandonIssued state number = do
   held ← readTVar (lifeReceipts state)
-  let (mine, rest) = Map.partition ((== Just number) . luaIssuer) held
+  let (mine, rest) = Map.partition ((== IssuedByInstance number) . luaIssuer) held
   forM_ mine (forgetReceipt . luaReceipt)
   writeTVar (lifeReceipts state) rest
+
+-- | Abandon the receipts of the tasks that have ended or that the scheduler no longer knows:
+-- nobody can read them again, and a long-lived owner's short-lived tasks would otherwise fill
+-- the table. Answers whether it abandoned any.
+sweepEndedTasks ∷ Scheduler v → LifecycleState → STM Bool
+sweepEndedTasks scheduler state = do
+  held ← readTVar (lifeReceipts state)
+  gone ← fmap concat . traverse (\(number, receipt) → ended number receipt) $ Map.toList held
+  forM_ gone $ \(_, receipt) → forgetReceipt (luaReceipt receipt)
+  writeTVar (lifeReceipts state) (foldr (Map.delete . fst) held gone)
+  pure (not (null gone))
+  where
+    ended number receipt = case luaIssuer receipt of
+      IssuedByTask task →
+        taskPhase scheduler task <&> \case
+          Nothing → [(number, receipt)]
+          Just (PhaseEnded _) → [(number, receipt)]
+          Just _ → []
+      _ → pure []
+    (<&>) = flip fmap
 
 -- | Abandon every receipt: the owner is exiting, and its scripts will read none. Taken
 -- out of the table in the transaction that abandons them, so each is abandoned once.

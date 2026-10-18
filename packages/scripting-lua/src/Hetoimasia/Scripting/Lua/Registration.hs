@@ -25,8 +25,12 @@
 -- acceptance, or a bounded rejection, as data: two values, a boolean and the
 -- reason text or nil. The last two are accepted and classified here, and a Lua
 -- call to one is a typed 'Hetoimasia.Scripting.Lua.Owner.NotYetSupported' fault
--- whose action never runs. The asynchronous kind can never be eligible to run
--- from a Lua finalizer during a VM's close.
+-- whose action never runs. A lifecycle operation is delivered, and its action runs, only
+-- for an owner configured with a 'LifecycleContext' (see 'lifecycleOperationIn'): the
+-- application's runtime hands each owner its own, so one registration shared by owners
+-- with different grants tells them apart, and an owner with none keeps the fault. The
+-- asynchronous kind can never be eligible to run from a Lua finalizer during a VM's close,
+-- and neither is a lifecycle operation delivered when a finalizer may call it.
 --
 -- = Scheduler operations
 --

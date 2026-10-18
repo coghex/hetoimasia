@@ -41,7 +41,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Word (Word64)
 import Hetoimasia.Scripting.Lua.Instance.Types (Instances)
-import Hetoimasia.Scripting.Lua.Lifecycle.State (LifecycleState, abandonAll)
+import Hetoimasia.Scripting.Lua.Lifecycle.State (LifecycleState, abandonAll, sweepEndedTasks)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (TaskId)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits (ServiceClass)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Task (TaskFailure)
@@ -244,6 +244,9 @@ forgetCell control cell = do
 -- Answers whether it gave any back.
 sweepForgotten ∷ Control → STM Bool
 sweepForgotten control = do
+  -- The receipts of the tasks that ended are abandoned here, as the tickets of forgotten
+  -- tasks are given back: on the owner's own thread, as it accounts for what ended.
+  lifecycle ← maybe (pure False) (sweepEndedTasks (controlScheduler control)) (controlLifecycle control)
   cells ← readTVar (controlCells control)
   mapM_
     ( \cell → do
@@ -252,7 +255,7 @@ sweepForgotten control = do
     )
     (Map.elems cells)
   remaining ← readTVar (controlCells control)
-  pure (Map.size remaining < Map.size cells)
+  pure (lifecycle || Map.size remaining < Map.size cells)
 
 settlementOf ∷ Control → TaskId → Maybe CallFault → TerminalResult Cursor → ScheduledSettlement
 settlementOf control identity fault terminal =

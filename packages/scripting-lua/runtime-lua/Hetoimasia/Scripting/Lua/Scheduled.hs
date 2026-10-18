@@ -23,6 +23,16 @@
 -- of this owner's scheduler and so are ordered by its policy among its tasks. An
 -- owner without the configuration loads nothing for them and behaves as it did.
 --
+-- = Lifecycle services
+--
+-- An owner created with a 'scheduledLifecycle' grant gives its scripts control and
+-- inspection of the script instances of the owners the grant covers, and of its own,
+-- as "Hetoimasia.Scripting.Lua.Lifecycle" documents. The grant is the whole of the
+-- authority, and an owner created without one keeps the not-yet-supported fault every
+-- lifecycle operation answered. The grant is checked against the owners it names before
+-- anything starts and refused, naming every reason, as 'LifecycleRefused'. The owner's
+-- exit abandons the receipts its scripts held, which undoes no request they had made.
+--
 -- = Creation and readiness
 --
 -- 'startScheduledOwner' validates the scheduler's configuration (the caps and the

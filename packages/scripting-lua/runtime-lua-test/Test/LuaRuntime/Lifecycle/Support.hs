@@ -45,6 +45,7 @@ module Test.LuaRuntime.Lifecycle.Support
 import Control.Concurrent (yield)
 import Control.Exception (throwIO)
 import Control.Monad (replicateM, void)
+import Data.IORef (atomicModifyIORef')
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Instance
@@ -56,7 +57,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value
 import Test.LuaRuntime.Instance.Support
 import qualified Data.Text.Encoding as Text
-import Test.LuaRuntime.Scheduled.Support (defaultSchedulerBounds)
+import Test.LuaRuntime.Scheduled.Support (defaultSchedulerBounds, schedRegistration)
 import Test.LuaRuntime.Support (requiredPolicy)
 
 -- | The registration of the instance examples, with the lifecycle bindings in @life@:
@@ -64,7 +65,16 @@ import Test.LuaRuntime.Support (requiredPolicy)
 lifeRegistration ∷ IFixture → Registration
 lifeRegistration fixture =
   either (error . show) id $
-    registration [] (registrationNamespaces (instRegistration fixture) <> [lifecycleNamespace "life"])
+    registration [] (registrationNamespaces (schedRegistration (ifBase fixture)) <> [inst, lifecycleNamespace "life"])
+  where
+    -- The counter every hook names itself with, as the instance examples' registration has it.
+    inst =
+      namespace
+        "inst"
+        [ stateOperation "next" [] [SInteger] $ \_ → do
+            n ← atomicModifyIORef' (ifCounter fixture) (\held → (held + 1, held + 1))
+            pure [VInteger (fromIntegral n)]
+        ]
 
 tidSchema' ∷ Schema
 tidSchema' = SRecord [("runtime", SInteger), ("owner", SInteger), ("id", SInteger)]

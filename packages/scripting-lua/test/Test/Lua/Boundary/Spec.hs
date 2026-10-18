@@ -9,6 +9,7 @@ import qualified Test.Lua.Boundary.Discipline
 import qualified Test.Lua.Boundary.Finalizers
 import qualified Test.Lua.Boundary.Independence
 import qualified Test.Lua.Boundary.Installation
+import qualified Test.Lua.Boundary.Lifecycle
 import qualified Test.Lua.Boundary.Modules
 import qualified Test.Lua.Boundary.Registration
 import qualified Test.Lua.Boundary.Tasks
@@ -25,4 +26,5 @@ spec = describe "the value boundary" $ do
   Test.Lua.Boundary.Finalizers.spec
   Test.Lua.Boundary.Independence.spec
   Test.Lua.Boundary.Installation.spec
+  Test.Lua.Boundary.Lifecycle.spec
   Test.Lua.Boundary.Dependencies.spec

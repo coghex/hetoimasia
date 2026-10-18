@@ -8,6 +8,7 @@ import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Instance
+import Hetoimasia.Scripting.Lua.Lifecycle (LifecycleGrant (grantReceiptBound))
 import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
@@ -178,6 +179,20 @@ spec = describe "settlement" $ do
       forM_ [0 .. 7] $ \n → ask callerFx caller "cmdr" "forget" Nothing (Just n) >>= (`shouldBe` "true")
       releaseOwner targetFx
       awaitPhase targetFx owner "a" Paused
+      reservationsAllFree targetFx owner "a"
+
+  it "abandons the receipts of a task that has ended, so a long-lived owner's short-lived tasks never fill the table" $ bounded $ do
+    targetFx ← newIFixture
+    callerFx ← newIFixture
+    withBoundary $ \_ runtime → do
+      owner ← startTarget targetFx runtime "target" [echoer] (testConfig instanceBounds')
+      _ ← admit targetFx owner "a" (moduleNamed "echoer")
+      awaitPhase targetFx owner "a" Active
+      tid ← tidValue targetFx "a"
+      caller ← startCaller callerFx runtime "caller" (Just ((target owner) {grantReceiptBound = 2}))
+      -- Each task asks and ends with its result unread; the owner holds room for two.
+      answers ← forM [1 ∷ Int .. 6] (const (taskLine callerFx caller "pause" [tid]))
+      answers `shouldBe` map takenAs [0 .. 5]
       reservationsAllFree targetFx owner "a"
 
   it "lets only the instance that made a request read its receipt, and a task's receipts are its owner's tasks' alone" $ bounded $ do

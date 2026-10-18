@@ -252,8 +252,27 @@
 -- had failed already settles as failed, with its first failure, which nothing later
 -- replaces, and the disposition its @shutdown@ came to when that was decided.
 --
--- A lifecycle-operation binding a script calls still answers a typed
--- @NotYetSupported@ fault: Lua's own controls and inspection are LUA-23.
+-- A lifecycle-operation binding a script calls answers a typed @NotYetSupported@
+-- fault from an owner that was granted nothing, and its action never runs. An owner
+-- that was granted lifecycle services ('Hetoimasia.Scripting.Lua.Lifecycle') gives its
+-- scripts these same controls, and inspection, over the owners the grant covers,
+-- through the same requests, receipts and settlements described here.
+--
+-- = Logical admission of controls
+--
+-- 'requestInstanceControl' admits a request on arrival, in the order accepted, whatever
+-- the owner is configured with, and is unchanged. An owner configured with
+-- 'AdmitLogically' ('instanceControlAdmission') also admits requests that carry a
+-- 'ControlSlot' the application assigned: 'requestInstanceControlAt', and the requests a
+-- script makes through a grant that assigns places. Each is applied at the logical
+-- boundary of its tick, in the order of (tick, sequence), before that tick's ordinary
+-- work and cadence point, whatever order the requests arrived in. One assigned a tick
+-- the owner has begun is refused as late ('InstanceControlLate'), and one assigned a
+-- place another request holds as a duplicate ('InstanceControlDuplicate'); neither is
+-- ever applied at a later boundary. Admission reads the tick and enqueues in one
+-- transaction, so a request accepted for a tick is queued before that tick is visible. A
+-- request waiting for its tick holds its reservation, and settles as no longer applicable
+-- if its instance ends first or the owner exits first.
 --
 -- = Results and inspection
 --
@@ -292,8 +311,11 @@
 -- binding, however long segments take, whenever timers fire, and whether budgets
 -- expire. It holds for logical-time workloads: elapsed waits legitimately change
 -- readiness, and so do elapsed-interval updates. The order of logical updates among an
--- instance's other invocations, and the @dt@ each receives, are among what is the same. An event or a request that arrives in the middle of a step is not ordered
--- logically here; deterministic logical admission of controls is LUA-23's.
+-- instance's other invocations, and the @dt@ each receives, are among what is the same. An
+-- event or a request admitted on arrival that arrives in the middle of a step is not ordered
+-- logically. Controls admitted logically are: the same tick-assigned requests give the same
+-- sequence of controls, and so of effects, in whatever order they arrive and from whichever
+-- VM sent them.
 module Hetoimasia.Scripting.Lua.Instance
   ( -- * Hosting instances
     InstanceConfig (..)

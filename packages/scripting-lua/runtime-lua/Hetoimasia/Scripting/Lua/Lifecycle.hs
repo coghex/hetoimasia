@@ -28,14 +28,17 @@
 --    not permit the operation there. Nothing is tested of the target, so the answer
 --    says nothing of whether it exists: an owner outside the grant, a foreign runtime's
 --    identity and an identity that was never issued answer alike.
--- 2. @full@: the caller already holds as many receipts as its grant allows.
--- 3. @closed@: the target's owner is not taking requests (it is stopping or has exited).
--- 4. @unknown_target@: within the authorized owner, no live instance has the identity:
+-- 2. For a target that admits logically, @unassigned@: the application is asked for the
+--    request's place once the grant has passed it, and gave none.
+-- 3. @full@: the caller already holds as many receipts as its grant allows.
+-- 4. @closed@: the target's owner is not taking requests (it is stopping or has exited).
+-- 5. @unknown_target@: within the authorized owner, no live instance has the identity:
 --    ended, stale or never issued.
--- 5. @full@: the target's owner holds as many result reservations as it allows.
--- 6. For an owner admitting logically: @unassigned@ (the application's assignment gave no
---    place), @late@ (the tick is one the owner has begun), @duplicate@ (the place is
---    taken).
+-- 6. For a target that admits logically, @late@ (the tick is one the owner has begun) and
+--    @duplicate@ (the place is taken).
+-- 7. @full@: the target's owner holds as many result reservations as it allows.
+--
+-- Inspection is refused as @unauthorized@, @closed@ and @unknown_target@ in that order.
 --
 -- = Requests and receipts
 --
@@ -277,6 +280,7 @@ newLifecycleState owner label limits own targets grant = do
   receipts ← newTVarIO Map.empty
   next ← newTVarIO 0
   closed ← newTVarIO False
+  running ← newTVarIO Nothing
   pure
     LifecycleState
       { lifeOwner = owner
@@ -288,6 +292,7 @@ newLifecycleState owner label limits own targets grant = do
       , lifeSnapshotBound = grantSnapshotBound grant
       , lifeReceipts = receipts
       , lifeNext = next
+      , lifeTask = running
       , lifeClosed = closed
       }
 
@@ -417,9 +422,12 @@ control operation context arguments = withState context (refused Unauthorized) $
     _ → pure (refused Unauthorized)
   where
     request state target local = do
-      caller ← callerInstance state
+      issuer ← callerOf state
       let identity = InstanceId (targetOwner target) local
-          info = ControlRequestInfo (lifeOwner state) (InstanceId (lifeOwner state) <$> caller) identity operation
+          caller = case issuer of
+            IssuedByInstance number → Just (InstanceId (lifeOwner state) number)
+            _ → Nothing
+          info = ControlRequestInfo (lifeOwner state) caller identity operation
       -- The application places a request only once the grant has passed it, and before the
       -- target is looked at: what it answers is the engine's own knowledge, never a script's.
       slot ← case targetAssign target of
@@ -443,7 +451,7 @@ control operation context arguments = withState context (refused Unauthorized) $
                         InstanceControlAccepted receipt → do
                           number ← readTVar (lifeNext state)
                           writeTVar (lifeNext state) (number + 1)
-                          writeTVar (lifeReceipts state) (Map.insert number (LuaReceipt caller receipt) held)
+                          writeTVar (lifeReceipts state) (Map.insert number (LuaReceipt issuer receipt) held)
                           pure (accepted number)
                         other → pure (refused (refusalOf other))
     refusalOf = \case
@@ -461,7 +469,7 @@ control operation context arguments = withState context (refused Unauthorized) $
 result ∷ LifecycleContext → [Value] → IO [Value]
 result context arguments = withState context [VText "unknown_receipt"] $ \state → case arguments of
   [VInteger number] → do
-    caller ← callerInstance state
+    caller ← callerOf state
     atomically $ do
       held ← readTVar (lifeReceipts state)
       case Map.lookup (fromIntegral number) held of
@@ -484,7 +492,7 @@ settlementText = \case
 forget ∷ LifecycleContext → [Value] → IO [Value]
 forget context arguments = withState context [VBoolean False] $ \state → case arguments of
   [VInteger number] → do
-    caller ← callerInstance state
+    caller ← callerOf state
     atomically $ do
       held ← readTVar (lifeReceipts state)
       case Map.lookup (fromIntegral number) held of

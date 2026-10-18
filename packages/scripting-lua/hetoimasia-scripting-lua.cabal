@@ -285,6 +285,7 @@ test-suite lua-host-tests
         Test.Lua.Boundary.Finalizers
         Test.Lua.Boundary.Independence
         Test.Lua.Boundary.Installation
+        Test.Lua.Boundary.Lifecycle
         Test.Lua.Boundary.Modules
         Test.Lua.Boundary.Registration
         Test.Lua.Boundary.Spec

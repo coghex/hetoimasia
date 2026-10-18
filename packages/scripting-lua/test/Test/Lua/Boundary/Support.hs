@@ -197,7 +197,6 @@ sampleRegistration fixture = ok (registration [capabilityType "ticket" alive, ca
         , attempt "trespass" (fixtureOther fixture) "run Lua"
         , asynchronousNativeRequest "spawn_async" [SText] [SInteger] (\_ → note fixture "spawn_async: ran" >> pure [VInteger 1])
         , lifecycleOperation "stop" [] [] (\_ → note fixture "stop: ran" >> pure [])
-        , lifecycleOperationIn "stop_in" [] [SText] (\context _ → note fixture "stop_in: ran" >> pure [VText (maybe "none" id (fromLifecycleContext context))])
         , finalizerEligible (stateOperation "note_gc" [SText] [] (\arguments → note fixture ("note_gc " <> render arguments) >> pure []))
         , finalizerEligible (lifecycleOperation "lifecycle_gc" [] [] (\_ → note fixture "lifecycle_gc: ran" >> pure []))
         , stateOperation "plain" [SText] [] (\_ → note fixture "plain" >> pure [])
