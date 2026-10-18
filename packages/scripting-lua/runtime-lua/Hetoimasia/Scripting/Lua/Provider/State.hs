@@ -31,6 +31,7 @@ module Hetoimasia.Scripting.Lua.Provider.State
   ( -- * Making a service
     newProviderState
   , validateGrant
+  , validateSubscriptions
   , requestLimits
 
     -- * Who asks
@@ -123,11 +124,8 @@ import Data.Word (Word64)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (operation, throwFailure)
 import Hetoimasia.Scripting.Lua.Instance.Types
-  ( IState (isStopped, isPhase)
-  , ICell (icState)
-  , InstancePhase (Stopping)
-  , Instances (insCells, insRunning)
-  , isTerminal
+  ( InstanceBounds (boundInvocationQueue)
+  , Instances (insBounds, insRunning)
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Failure
   ( ReasonCode (ProviderFault, ValidationFault)
@@ -194,7 +192,9 @@ import Hetoimasia.Scripting.Lua.Retention
   , retain
   , sweep
   )
+import Hetoimasia.Scripting.Lua.Provider.Events (SubEnd (EndByModel), awaiting, endSubs, requesterClosed)
 import Hetoimasia.Scripting.Lua.Provider.Types
+import Hetoimasia.Scripting.Lua.Owner (maxEntries)
 import Hetoimasia.Scripting.Lua.Registration (validName)
 import Hetoimasia.Scripting.Lua.Runtime.Shared (runtimeComponent)
 import Hetoimasia.Scripting.Lua.Runtime.Types (OwnerId)
@@ -223,6 +223,35 @@ validateGrant limits grant = case NonEmpty.nonEmpty violations of
       SList inner → hasCapability inner
       SOptional inner → hasCapability inner
       SRecord fields → any (hasCapability . snd) fields
+      _ → False
+
+-- | The subscription grant's endpoints by name, or every reason it is refused. The grant is made
+-- over the request service and the instances (whether the owner has each is given), and its
+-- endpoints each take an entry point in the driver beside the owner's event sources, which the
+-- driver module can only hold so many of.
+validateSubscriptions ∷ Bool → Bool → Int → SubscriptionGrant → Either (NonEmpty SubscriptionGrantViolation) (Map Text EventEndpoint)
+validateSubscriptions hasService hasInstances sources grant = case NonEmpty.nonEmpty violations of
+  Just refused → Left refused
+  Nothing → Right (Map.fromList [(eventName endpoint, endpoint) | endpoint ← endpoints])
+  where
+    endpoints = grantEvents grant
+    names = map eventName endpoints
+    room = maxEntries - 5 - sources
+    violations =
+      [SubscriptionBoundOutOfRange (grantSubscriptionBound grant) | grantSubscriptionBound grant < 1 || grantSubscriptionBound grant > maxSubscriptionBound]
+        <> [StagingBoundOutOfRange (grantStagingBound grant) | grantStagingBound grant < 1 || grantStagingBound grant > maxSubscriptionBound]
+        <> [NoEventEndpoints | null endpoints]
+        <> [InvalidEventName name | name ← names, isJust (validName name) || isJust (validName ("subscription_" <> name))]
+        <> [DuplicateEventName name | name ← nub names, length (filter (== name) names) > 1]
+        <> [EventPayloadCapability (eventName endpoint) | endpoint ← endpoints, hasCapabilityIn (eventPayload endpoint)]
+        <> [SubscriptionsNeedService | not hasService]
+        <> [SubscriptionsNeedInstances | not hasInstances]
+        <> [TooManyEventEndpoints (length endpoints) room | length endpoints > room]
+    hasCapabilityIn = \case
+      SCapability _ → True
+      SList inner → hasCapabilityIn inner
+      SOptional inner → hasCapabilityIn inner
+      SRecord fields → any (hasCapabilityIn . snd) fields
       _ → False
 
 -- | Whether a record fits the owner's value limits: the form every record a script is handed
@@ -263,15 +292,17 @@ fitReason limits why
   | fitsLimits limits (failureFields (reasonDetail (failureReason ProviderFault why))) = why
   | otherwise = undeliverableReason
 
--- | The protocol model's caps for a service: the requests are the ones that matter, and the
--- rest are the least the model accepts, since this session holds no tasks.
-requestLimits ∷ ValueLimits → RequestGrant → Limits
-requestLimits limits grant =
+-- | The protocol model's caps for a service: the requests and the subscriptions are the ones
+-- that matter, and the rest are the least the model accepts, since this session holds no
+-- tasks. A subscription's backlog is bounded by the places of its instance's queue, which it
+-- shares with every other delivery, so the model's bound is never the one that refuses.
+requestLimits ∷ ValueLimits → Int → RequestGrant → Maybe SubscriptionGrant → Limits
+requestLimits limits queue grant subscriptions =
   Limits
     { maxActiveTasks = 1
     , maxQueuedAdmissions = 1
-    , maxSubscriptions = 1
-    , maxSubscriptionQueue = 1
+    , maxSubscriptions = maybe 1 grantSubscriptionBound subscriptions
+    , maxSubscriptionQueue = queue
     , maxOutstandingRequests = grantRequestBound grant
     , maxPayloadBytes = limitBytes limits
     , maxRetainedResults = 1
@@ -287,11 +318,12 @@ newProviderState
   → ValueLimits
   → RequestGrant
   → Map Text RequestEndpoint
+  → Maybe (SubscriptionGrant, Map Text EventEndpoint)
   → Ticks
   → Maybe Instances
   → IO ProviderState
-newProviderState owner label key limits grant endpoints ticks instances = do
-  session ← case newSession key (requestLimits limits grant) of
+newProviderState owner label key limits grant endpoints subscriptions ticks instances = do
+  session ← case newSession key (requestLimits limits (maybe 1 (boundInvocationQueue . insBounds) instances) grant (fst <$> subscriptions)) of
     Right made → pure made
     Left violations → throwFailure runtimeComponent (operation "new-provider") [] (SchedulerRefused (fmap LimitRefused violations))
   task ← newTVarIO Nothing
@@ -309,6 +341,11 @@ newProviderState owner label key limits grant endpoints ticks instances = do
         , pClosed = False
         , pCounts = noCounts
         , pExit = Nothing
+        , pSubs = Map.empty
+        , pSubNumbers = Map.empty
+        , pStaged = Map.empty
+        , pEvents = noEventCounts
+        , pNextSub = 1
         }
   pure
     ProviderState
@@ -320,6 +357,9 @@ newProviderState owner label key limits grant endpoints ticks instances = do
       , psEndpoints = endpoints
       , psTicks = ticks
       , psInstances = instances
+      , psEvents = maybe Map.empty snd subscriptions
+      , psSubscriptionBound = maybe 1 (grantSubscriptionBound . fst) subscriptions
+      , psStagingBound = maybe 1 (grantStagingBound . fst) subscriptions
       , psTask = task
       , psVar = var
       }
@@ -362,24 +402,6 @@ markClosing service task = modifyTVar' (psVar service) (\st → st {pClosing = S
 -- | The task's coroutine has been closed.
 unmarkClosing ∷ ProviderState → TaskId → STM ()
 unmarkClosing service task = modifyTVar' (psVar service) (\st → st {pClosing = Set.delete task (pClosing st)})
-
--- | Whether a requester is no longer taking requests: its instance is ending or has ended, or
--- its task has ended or is being closed.
-requesterClosed ∷ ProviderState → Requester → STM Bool
-requesterClosed service = \case
-  RequesterTask task → do
-    ended ← ticksTaskGone (psTicks service) task
-    closing ← Set.member task . pClosing <$> readTVar (psVar service)
-    pure (ended || closing)
-  RequesterInstance number → case psInstances service of
-    Nothing → pure True
-    Just instances → do
-      cells ← readTVar (insCells instances)
-      case Map.lookup number cells of
-        Nothing → pure True
-        Just cell → do
-          state ← readTVar (icState cell)
-          pure (isStopped state || isTerminal (isPhase state) || isPhase state == Stopping)
 
 -- Admitting ---------------------------------------------------------------------------
 
@@ -489,6 +511,7 @@ admit service requester endpoint placement = do
                         , workEnded = False
                         , workFailure = Nothing
                         , workRetained = noRetained
+                        , workSubscription = Nothing
                         }
                 writeTVar (psVar service) st
                   { pSession = session
@@ -906,20 +929,24 @@ endRequesterSTM service requester cause = do
         Nothing → pSession withEnded
       gone = map recIdentity released
       told = [() | identity ← theirWork, Just work ← [Map.lookup identity (pWork withEnded)], not (workEnded work)]
-  writeTVar (psVar service) $
-    retireEnded
-      withEnded
-        { pSession = revoked
-        , pRecs = foldr Map.delete (pRecs withEnded) gone
-        , pByNumber = Map.filter (`notElem` gone) (pByNumber withEnded)
-        , pDue = Map.filter (`notElem` gone) (pDue withEnded)
-        , pHolders = Map.delete requester (pHolders withEnded)
-        , pWork =
-            foldr
-              (Map.adjust (\work → if workEnded work then work else work {workWantsCancel = True}))
-              (pWork withEnded)
-              theirWork
-        }
+  -- The subscriptions the requester owned are ended with it: the model's holder ended them, and
+  -- everything else about each goes with it, through the one place that ends a subscription.
+  let owned = [subIdentity sub | sub ← Map.elems (pSubs withEnded), RequesterInstance (subInstance sub) == requester]
+      prelim =
+        withEnded
+          { pSession = revoked
+          , pRecs = foldr Map.delete (pRecs withEnded) gone
+          , pByNumber = Map.filter (`notElem` gone) (pByNumber withEnded)
+          , pDue = Map.filter (`notElem` gone) (pDue withEnded)
+          , pHolders = Map.delete requester (pHolders withEnded)
+          , pWork =
+              foldr
+                (Map.adjust (\work → if workEnded work then work else work {workWantsCancel = True}))
+                (pWork withEnded)
+                theirWork
+          }
+  ended ← endSubs service EndByModel owned prelim
+  writeTVar (psVar service) (retireEnded ended)
   pure (EndReport (length mine) (length told))
 
 -- | The task requesters whose tasks are gone: ended, or no longer known to the scheduler.
@@ -974,7 +1001,14 @@ advanceEpochSTM service = do
       case advanceEpoch (pSession cancelledState) of
         (_, Left _) → Nothing <$ writeTVar (psVar service) (committed (pSession cancelledState))
         (session, Right change) → do
-          writeTVar (psVar service) (committed session)
+          -- The model invalidated every subscription with the epoch's records; the service's
+          -- records of them, the events held for them and the references in the queues go with
+          -- them, and the providers' interest is withdrawn. The accounting for their work is
+          -- retained under the identities it was issued under, charged to the bound until the
+          -- provider proves it over, so a late delivery finds nothing and churn reclaims nothing.
+          let current = committed session
+          ended ← endSubs service EndByModel (Map.keys (pSubs current)) current
+          writeTVar (psVar service) ended
           pure (Just (EpochReport change cancelled discarded))
   where
     cancelOne (st, kept, cancelled, discarded) record
@@ -1006,18 +1040,19 @@ closeSTM service = do
       let completed = [recIdentity record | record ← Map.elems (pRecs st), isJust (recHeld record)]
           withEnded = foldl' (flip endWork) st completed
           (session, exit) = stopSession (pSession withEnded)
-      writeTVar (psVar service) $
-        retireEnded
-          withEnded
-        { pSession = session
-        , pRecs = Map.empty
-        , pByNumber = Map.empty
-        , pDue = Map.empty
-        , pHolders = Map.empty
-        , pClosed = True
-        , pExit = Just exit
-        , pWork = Map.map (\work → if workEnded work then work else work {workWantsCancel = True}) (pWork withEnded)
-        }
+      let prelim =
+            withEnded
+              { pSession = session
+              , pRecs = Map.empty
+              , pByNumber = Map.empty
+              , pDue = Map.empty
+              , pHolders = Map.empty
+              , pClosed = True
+              , pExit = Just exit
+              , pWork = Map.map (\work → if workEnded work then work else work {workWantsCancel = True}) (pWork withEnded)
+              }
+      ended ← endSubs service EndByModel (Map.keys (pSubs prelim)) prelim
+      writeTVar (psVar service) (retireEnded ended)
       pure (Just exit)
 
 -- The provider's work ------------------------------------------------------------------
@@ -1130,9 +1165,6 @@ workPendingCount service = do
   st ← readTVar (psVar service)
   pure (length (filter awaiting (Map.elems (pWork st))))
 
-awaiting ∷ Work → Bool
-awaiting work = isNothing (workFailure work) && (not (workEnded work) || not (null (retainedDeferred (workRetained work))))
-
 -- | Whether the owner has anything to do for the provider's work: a reading that is no longer
 -- pending, or disposals to run. The owner composes it into its wait for work.
 workWaiting ∷ ProviderState → STM Bool
@@ -1170,8 +1202,8 @@ diagnosticsSTM service = do
       { rdEpoch = keyEpoch (sessionKey (pSession st))
       , rdOutstanding = chargedPlaces st
       , rdHeldNow = length [() | record ← Map.elems (pRecs st), isJust (recHeld record)]
-      , rdWorkPending = length [() | work ← Map.elems (pWork st), awaiting work]
-      , rdWorkFailed = length [() | work ← Map.elems (pWork st), isJust (workFailure work)]
+      , rdWorkPending = length [() | work ← Map.elems (pWork st), isNothing (workSubscription work), awaiting work]
+      , rdWorkFailed = length [() | work ← Map.elems (pWork st), isNothing (workSubscription work), isJust (workFailure work)]
       , rdAdmitted = countAdmitted counts
       , rdRefused = countRefused counts
       , rdHeldTotal = countHeld counts

@@ -289,7 +289,8 @@ module Hetoimasia.Scripting.Lua.Scheduled
 import Control.Concurrent.STM (STM, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (ExceptionWithContext, SomeException, evaluate, mask, mask_, onException)
 import Control.Monad (forM, forM_, join, when)
-import Data.Foldable (traverse_)
+import Data.Foldable (toList, traverse_)
+import Data.Maybe (isJust)
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -350,8 +351,8 @@ import Hetoimasia.Scripting.Lua.Runtime.Types
   , ownerSequence
   )
 import Hetoimasia.Scripting.Lua.Lease.State (LeasesRefused (LeasesRefused), LeasesViolation (..), Leases (leasesCapacity, leasesLending), bindLeasesHandle)
-import Hetoimasia.Scripting.Lua.Provider.State (newProviderState, validateGrant)
-import Hetoimasia.Scripting.Lua.Provider.Types (RequestGrant, RequestGrantRefused (RequestGrantRefused), Ticks (..))
+import Hetoimasia.Scripting.Lua.Provider.State (newProviderState, validateGrant, validateSubscriptions)
+import Hetoimasia.Scripting.Lua.Provider.Types (EventEndpoint (..), RequestGrant, RequestGrantRefused (RequestGrantRefused), SubscriptionGrant (grantEvents), SubscriptionGrantRefused (SubscriptionGrantRefused), Ticks (..))
 import Hetoimasia.Scripting.Lua.Request (requestContextOf)
 import Hetoimasia.Scripting.Lua.Lending.Loan (Lending, bindLending, sameLending)
 import Hetoimasia.Scripting.Lua.Scheduled.Run (runScheduledOwner)
@@ -445,6 +446,11 @@ data ScheduledSpec = ScheduledSpec
     -- ^ The asynchronous requests the owner's scripts may make of providers, and when their
     -- settlements reach Lua. 'Nothing', the default, leaves every asynchronous request, and a
     -- wait for one, refused as not yet supported. See "Hetoimasia.Scripting.Lua.Provider".
+  , scheduledSubscriptions ∷ Maybe SubscriptionGrant
+    -- ^ The provider events the owner's instances may subscribe functions to (LUA-26), made over
+    -- the request service: the owner must be granted one, and host instances. 'Nothing', the
+    -- default, leaves @api.subscribe@ refused as not yet supported. See
+    -- "Hetoimasia.Scripting.Lua.Provider".
   }
 
 -- | A configuration with the supplied defaults: the FIFO policy, the production
@@ -468,6 +474,7 @@ scheduledSpec config worker bounds =
     , scheduledMemberLimit = defaultMemberLimit
     , scheduledLifecycle = Nothing
     , scheduledRequests = Nothing
+    , scheduledSubscriptions = Nothing
     }
 
 -- | How many live members an owner's collection holds by default.
@@ -517,6 +524,12 @@ startScheduledOwner runtime spec = do
   -- The owner's instances, when it hosts any: refused before anything starts if the
   -- configuration does not fit the scheduler's own bounds, and given the driver, the
   -- binding its @api@ reaches the owner through and a namespace to install it in.
+  -- A subscription grant is made over the request service and the instances, and is refused,
+  -- naming every reason, before anything starts.
+  subscriptions ← forM (scheduledSubscriptions spec) $ \grant →
+    case validateSubscriptions (isJust (scheduledRequests spec)) (isJust (scheduledInstances spec)) (maybe 0 (length . instanceSources) (scheduledInstances spec)) grant of
+      Right endpoints → pure (grant, endpoints)
+      Left refused → throwFailure runtimeComponent (operation "start-scheduled-owner") [] (SubscriptionGrantRefused refused)
   hosted ← forM (scheduledInstances spec) $ \instanceConfig → do
     let bounds = scheduledBounds spec
         violations = validateInstanceConfig (boundRetainedResults bounds) (boundQueuedAdmissions bounds) instanceConfig
@@ -537,7 +550,7 @@ startScheduledOwner runtime spec = do
           base
             { vmRegistration = merged
             , vmPolicy = vmPolicy base <> [driverNamespaceName]
-            , vmModules = vmModules base <> [driverSource (instanceSources instanceConfig)]
+            , vmModules = vmModules base <> [driverSource (instanceSources instanceConfig) [(eventName endpoint, eventPayload endpoint) | (grant, _) ← toList subscriptions, endpoint ← grantEvents grant]]
             }
   scheduler ←
     newScheduler
@@ -574,7 +587,7 @@ startScheduledOwner runtime spec = do
   -- refused naming every reason.
   provider ← forM (scheduledRequests spec) $ \grant →
     case validateGrant (vmValueLimits config) grant of
-      Right endpoints → newProviderState owner label scope (vmValueLimits config) grant endpoints (ticksFor scheduler stopping) ownInstances
+      Right endpoints → newProviderState owner label scope (vmValueLimits config) grant endpoints subscriptions (ticksFor scheduler stopping) ownInstances
       Left refused → throwFailure runtimeComponent (operation "start-scheduled-owner") [] (RequestGrantRefused refused)
   let bare = Control owner label (vmValueLimits config) scheduler cells faults begun closing exited stopping ownInstances Nothing provider
   -- A lifecycle grant is resolved against the owners it names before anything starts, and

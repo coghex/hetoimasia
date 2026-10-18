@@ -150,6 +150,7 @@ module Hetoimasia.Scripting.Lua.Internal.Protocol.Session
 
     -- * Subscriptions
   , registerSubscription
+  , registerSubscriptionFor
   , unsubscribeIn
   , deliverEvent
   , takeEventIn
@@ -207,6 +208,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Stop (stopSession)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Subscriptions
   ( deliverEvent
   , registerSubscription
+  , registerSubscriptionFor
   , takeEventIn
   , unsubscribeIn
   )

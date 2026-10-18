@@ -43,7 +43,7 @@ import Data.Word (Word64)
 import Hetoimasia.Scripting.Lua.Instance.Types (Instances)
 import Hetoimasia.Scripting.Lua.Lifecycle.State (LifecycleState, abandonAll, sweepEndedTasks)
 import Hetoimasia.Scripting.Lua.Provider.Types (ProviderState)
-import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (TaskId)
+import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (SubscriptionId, TaskId)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits (ServiceClass)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Task (TaskFailure)
 import Hetoimasia.Scripting.Lua.Owner (CallResult (Returned), ModuleRef)
@@ -104,12 +104,18 @@ data Invocation
   | -- | A periodic instance's @update@ hook, handed the logical duration granted or
     -- the elapsed time since the previous update, fixed when it begins.
     InvokeUpdate
+  | -- | The callback subscribed to a provider's event endpoint, handed the delivery: the
+    -- endpoint and the subscription. The delivery itself is taken from the subscription as the
+    -- first segment is about to run, so until then it is still the subscription's, and
+    -- replaceable state can replace it.
+    InvokeSubscription !Text !SubscriptionId
 
 instance NFData Invocation where
   rnf = \case
     InvokeEvent source payload → source `seq` rnf payload
     InvokeRun → ()
     InvokeUpdate → ()
+    InvokeSubscription endpoint identity → endpoint `seq` identity `seq` ()
 
 instance NFData Cursor where
   rnf = \case

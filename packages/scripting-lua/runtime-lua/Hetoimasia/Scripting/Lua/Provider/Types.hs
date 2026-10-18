@@ -58,6 +58,23 @@ module Hetoimasia.Scripting.Lua.Provider.Types
   , RequestRefusal (..)
   , renderRequestRefusal
 
+    -- * Subscriptions
+  , SubscriptionGrant (..)
+  , subscriptionGrant
+  , defaultSubscriptionBound
+  , defaultStagingBound
+  , maxSubscriptionBound
+  , SubscriptionGrantViolation (..)
+  , SubscriptionGrantRefused (..)
+  , EventEndpoint (..)
+  , EventSubscription (..)
+  , SubscriptionInfo (..)
+  , EventFeed (..)
+  , EventAnswer (..)
+  , SubscribeRefusal (..)
+  , renderSubscribeRefusal
+  , OverloadPolicy (..)
+
     -- * Who asks
   , Requester (..)
 
@@ -67,6 +84,13 @@ module Hetoimasia.Scripting.Lua.Provider.Types
   , PState (..)
   , Rec (..)
   , Work (..)
+  , Sub (..)
+  , Staged (..)
+  , EventCounts (..)
+  , noEventCounts
+  , SubscriptionDiagnostics (..)
+  , SubscriptionReading (..)
+  , workIdOf
   , ProviderCounts (..)
   , noCounts
   , ProviderDiagnostics (..)
@@ -81,9 +105,11 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Scripting.Lua.Instance.Types (InstanceId, Instances)
-import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (Epoch, RequestId, TaskId)
+import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (Epoch, RequestId (RequestId), RequestName (RequestName), SubscriptionId (SubscriptionId), SubscriptionName (SubscriptionName), TaskId)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Request (CancelCause, Reply, Settlement)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Session (ExitRecord, Session)
+import Hetoimasia.Scripting.Lua.Internal.Protocol.Subscription (OverloadPolicy (..))
+import Hetoimasia.Scripting.Lua.Internal.Protocol.Value (Payload)
 import Hetoimasia.Scripting.Lua.Retention (Retained, RetirementState)
 import Hetoimasia.Scripting.Lua.Runtime.Types (OwnerId)
 import Hetoimasia.Scripting.Lua.Value (Schema, Value, ValueLimits)
@@ -292,6 +318,187 @@ renderRequestRefusal = \case
   NotTheRequester → "request refused: the handle belongs to another requester"
   RequestEnded → "request refused: the handle names no request that is still held"
 
+-- Subscriptions ---------------------------------------------------------------------
+
+-- | What an application grants one owner so that its instances can subscribe functions to
+-- providers' events (LUA-26), beside the request service it is granted.
+--
+-- A subscription grant is made over a request grant: the owner's request service is the
+-- provider service, and the owner's kind of time ('RequestTiming') is the kind of time its
+-- events are admitted in. The grant is the whole of the authority: an instance's @api@ can
+-- subscribe only to an endpoint the grant names and the instance was granted.
+data SubscriptionGrant = SubscriptionGrant
+  { grantEvents ∷ [EventEndpoint]
+    -- ^ The providers' event endpoints, each by its own name, once.
+  , grantSubscriptionBound ∷ !Int
+    -- ^ How many subscriptions the owner holds at once. A subscription holds its place from
+    -- its admission until it has ended /and/ its provider has proved its retirement, so
+    -- subscribing and unsubscribing over and over cannot reclaim a place the provider has
+    -- not given back. At least one.
+  , grantStagingBound ∷ !Int
+    -- ^ How many events an owner on logical time holds for a tick it has not reached yet. A
+    -- delivery past it is refused and counted. At least one.
+  }
+
+-- | A grant of these endpoints with the default bounds.
+subscriptionGrant ∷ [EventEndpoint] → SubscriptionGrant
+subscriptionGrant endpoints = SubscriptionGrant endpoints defaultSubscriptionBound defaultStagingBound
+
+-- | Thirty-two subscriptions.
+defaultSubscriptionBound ∷ Int
+defaultSubscriptionBound = 32
+
+-- | Two hundred and fifty-six staged events.
+defaultStagingBound ∷ Int
+defaultStagingBound = 256
+
+-- | The most subscriptions, or staged events, one owner may be granted.
+maxSubscriptionBound ∷ Int
+maxSubscriptionBound = 65536
+
+-- | Why a subscription grant was refused.
+data SubscriptionGrantViolation
+  = -- | The bound on subscriptions is below one or above 'maxSubscriptionBound'.
+    SubscriptionBoundOutOfRange !Int
+  | -- | The bound on staged events is below one or above 'maxSubscriptionBound'.
+    StagingBoundOutOfRange !Int
+  | -- | No endpoint at all: nothing could be subscribed to.
+    NoEventEndpoints
+  | -- | An endpoint name that is not a valid name, or whose entry point in the driver would
+    -- not be one.
+    InvalidEventName !Text
+  | -- | The same endpoint named twice.
+    DuplicateEventName !Text
+  | -- | An endpoint whose payload names a capability, which is a VM's.
+    EventPayloadCapability !Text
+  | -- | The owner has no request service: subscriptions are granted through it.
+    SubscriptionsNeedService
+  | -- | The owner hosts no instances: subscriptions are an instance's.
+    SubscriptionsNeedInstances
+  | -- | More event endpoints than the driver module can declare an entry point for beside
+    -- the owner's event sources: how many were given, and how many fit.
+    TooManyEventEndpoints !Int !Int
+  deriving (Eq, Show)
+
+-- | A subscription grant was refused, and nothing was made. Every violation.
+newtype SubscriptionGrantRefused = SubscriptionGrantRefused (NonEmpty SubscriptionGrantViolation)
+  deriving (Eq, Show)
+
+instance Exception SubscriptionGrantRefused
+
+-- | A provider's surface for events, by name: what its events are, how a subscription is
+-- handed to it, and the shape of what it delivers.
+data EventEndpoint = EventEndpoint
+  { eventName ∷ !Text
+    -- ^ A name of the kind bindings have: 1 to 64 ASCII letters, digits and underscores.
+  , eventPayload ∷ !Schema
+    -- ^ What every delivery must conform to. A delivery that does not is refused and counted.
+    -- No capability.
+  , eventPolicy ∷ !OverloadPolicy
+    -- ^ What overload means for this endpoint, per P-7: 'OrderedEvents' refuses a delivery
+    -- the queue has no place for, and 'ReplaceableState' keeps one unstarted delivery per
+    -- subscription and replaces its value in place.
+  , eventSubscribe ∷ EventSubscription → IO ProviderWork
+    -- ^ Hand a subscription to the provider. It must not block, and it delivers through the
+    -- 'EventFeed' it is given, from any thread, now or later. What it raises is a failure of
+    -- application code: a failure of the host under the owner's policy, unconverted, and the
+    -- subscription is taken back as though it had never been admitted. The 'ProviderWork' is
+    -- how interest in it is later withdrawn ('workCancel', called once) and its retirement
+    -- proved ('workRetirement').
+  }
+
+-- | A subscription, as the provider is handed it.
+data EventSubscription = EventSubscription
+  { subscriptionFeed ∷ !EventFeed
+  , subscriptionInfo ∷ !SubscriptionInfo
+  }
+
+-- | What the provider is told of a subscription: all of it the engine's own knowledge, none
+-- of it a value a script supplied.
+data SubscriptionInfo = SubscriptionInfo
+  { subscriptionOwner ∷ !OwnerId
+  , subscriptionInstance ∷ !InstanceId
+  , subscriptionEndpoint ∷ !Text
+  , subscriptionNumber ∷ !Word64
+    -- ^ The subscription's number, which is unique to its owner and never reissued.
+  }
+  deriving (Eq, Show)
+
+-- | How a provider delivers to one subscription. It never blocks, never waits for the owner,
+-- the queue or Lua, and a producer's thread never enters Lua: a delivery is one transaction
+-- that places a reference in the instance's queue, and the owner looks up the callback when
+-- it services it.
+--
+-- A feed is bound to the subscription it was made for. A delivery to one that has ended
+-- (unsubscribed, invalidated by an epoch change, or ended with its instance) is refused and
+-- counted, whatever has been subscribed since.
+data EventFeed = EventFeed
+  { feedDeliver ∷ Maybe DueSlot → Value → IO EventAnswer
+    -- ^ Deliver a value. On an owner on elapsed time the place is 'Nothing': the delivery is
+    -- admitted on arrival. On an owner on logical time the application assigns the place, the
+    -- tick whose boundary admits it and its place among the events due then (D-36); a delivery
+    -- with none is refused, as is one with a place on an owner on elapsed time.
+  , feedFail ∷ Text → IO ()
+    -- ^ The provider cannot preserve an authoritative event: it surfaces a delivery failure.
+    -- The instance fails with it, once, and the application's escalation decides what that
+    -- means for its peers. The reason is bounded.
+  }
+
+-- | What became of a delivery. Never an error: a refusal is evidence, counted, and the value
+-- is not kept.
+data EventAnswer
+  = -- | Admitted on arrival, and given a place in the instance's queue.
+    EventAdmitted
+  | -- | Admitted on arrival, replacing the unstarted delivery of replaceable state in place.
+    EventCoalesced
+  | -- | Accepted for its tick, and admitted at that tick's boundary.
+    EventStaged
+  | -- | The instance's queue has no place for it: refused and counted, nothing evicted.
+    EventQueueFull
+  | -- | The owner holds as many events for ticks it has not reached as it will: refused and
+    -- counted.
+    EventStagingFull
+  | -- | The subscription has ended, or its instance or its owner is no longer taking events:
+    -- refused and counted, never run.
+    EventEnded
+  | -- | Over the owner's limits, not what the endpoint declares, or not evaluable: refused
+    -- and counted.
+    EventRefusedValue
+  | -- | The tick assigned is one the owner has begun.
+    EventLate
+  | -- | The place assigned is taken.
+    EventDuplicate
+  | -- | An owner on logical time admits by an assigned place, never by arrival.
+    EventUnassigned
+  | -- | An owner on elapsed time admits on arrival, and takes no assigned place.
+    EventNotLogical
+  deriving (Eq, Show)
+
+-- | Why the engine refused to admit a subscription. Each is an answer the script reads as a
+-- fault of its call, never a failure of the host.
+data SubscribeRefusal
+  = -- | No instance's code is running: only an instance subscribes.
+    NoSubscriber
+  | -- | The owner, or the instance, is not taking subscriptions: it is stopping or has
+    -- exited.
+    SubscriptionsClosed
+  | -- | The owner offers no such endpoint, or the instance was not granted it.
+    EndpointNotGranted !Text
+  | -- | Every place is held: the bound.
+    SubscriptionsFull !Int
+  | -- | The handle names no subscription of this instance.
+    SubscriptionUnknown
+  deriving (Eq, Show)
+
+-- | A refusal as the reason a script reads.
+renderSubscribeRefusal ∷ SubscribeRefusal → Text
+renderSubscribeRefusal = \case
+  NoSubscriber → "subscribe refused: no instance is running to receive the events"
+  SubscriptionsClosed → "subscribe refused: the instance is no longer taking subscriptions"
+  EndpointNotGranted name → "subscribe refused: no event endpoint named " <> name <> " is granted to this instance"
+  SubscriptionsFull bound → "subscribe refused: all " <> Text.pack (show bound) <> " places are held"
+  SubscriptionUnknown → "unsubscribe refused: the handle names no subscription of this instance"
+
 -- Who asks ---------------------------------------------------------------------------
 
 -- | Who owns a request's interest. Never a script's claim: it is read from what the
@@ -336,6 +543,12 @@ data ProviderState = ProviderState
   , psEndpoints ∷ !(Map Text RequestEndpoint)
   , psTicks ∷ !Ticks
   , psInstances ∷ !(Maybe Instances)
+  , psEvents ∷ !(Map Text EventEndpoint)
+    -- ^ The event endpoints the owner offers, by name; none for an owner granted no subscriptions.
+  , psSubscriptionBound ∷ !Int
+    -- ^ How many places the owner may hold for subscriptions.
+  , psStagingBound ∷ !Int
+    -- ^ How many events for ticks not yet reached the owner stages.
   , psTask ∷ !(TVar (Maybe TaskId))
     -- ^ The task whose segment the owner is running, set around each segment by the
     -- owner's own thread: who a call from a task that is no instance's was made by.
@@ -349,6 +562,9 @@ data PState = PState
   , pRecs ∷ !(Map RequestId Rec)
   , pByNumber ∷ !(Map Word64 RequestId)
   , pWork ∷ !(Map RequestId Work)
+    -- ^ The accounting of every provider's work: a request's, and a subscription's under the
+    -- request identity its own makes ('workIdOf'), so that every path that polls, tells, disposes
+    -- of and awaits provider work serves them both.
   , pHolders ∷ !(Map Requester TaskId)
     -- ^ The model's holder for each requester that has made a request this epoch.
   , pClosing ∷ !(Set TaskId)
@@ -362,6 +578,15 @@ data PState = PState
     -- ^ Set once the owner has exited: nothing is admitted or answered after it.
   , pCounts ∷ !ProviderCounts
   , pExit ∷ !(Maybe ExitRecord)
+  , pSubs ∷ !(Map SubscriptionId Sub)
+    -- ^ The subscriptions that are live, by the identity the model issued.
+  , pSubNumbers ∷ !(Map Word64 SubscriptionId)
+  , pStaged ∷ !(Map DueSlot Staged)
+    -- ^ The events accepted for a tick not yet reached, by their places, which is their
+    -- order. They are admitted at their ticks' boundaries, and never in arrival order.
+  , pEvents ∷ !EventCounts
+  , pNextSub ∷ !Word64
+    -- ^ The next subscription number. Never rewinds.
   }
 
 -- | A request, as a script can reach it.
@@ -401,7 +626,111 @@ data Work = Work
   , workRetained ∷ !Retained
     -- ^ The retained obligation (the provider's own reading of its retirement) and, behind
     -- it, what the work needed: disposed of once the work is over and never if it failed.
+  , workSubscription ∷ !(Maybe SubscriptionId)
+    -- ^ The subscription this is the work of, when it is not a request's.
   }
+
+-- | A subscription, as the service holds it while it is live.
+data Sub = Sub
+  { subNumber ∷ !Word64
+  , subIdentity ∷ !SubscriptionId
+  , subInstance ∷ !Word64
+  , subEndpoint ∷ !Text
+  , subPolicy ∷ !OverloadPolicy
+  , subSchema ∷ !Schema
+  , subAdmitted ∷ !Int
+    -- ^ Deliveries that took a place in the queue.
+  , subCoalesced ∷ !Int
+    -- ^ Deliveries of replaceable state that replaced the unstarted one: the value they
+    -- replaced is counted here and was never delivered.
+  , subRefused ∷ !Int
+    -- ^ Deliveries refused for want of a place in the queue.
+  , subDelivered ∷ !Int
+    -- ^ Deliveries whose callback began.
+  }
+
+-- | An event accepted for a tick not yet reached.
+data Staged = Staged
+  { stagedSubscription ∷ !SubscriptionId
+  , stagedPayload ∷ !(Payload Value)
+  }
+
+-- | What the subscription side of the service counts, by owner.
+data EventCounts = EventCounts
+  { evSubscribed ∷ !Int
+  , evRefusedSubscribe ∷ !Int
+  , evUnsubscribed ∷ !Int
+  , evStaged ∷ !Int
+  , evStagingFull ∷ !Int
+  , evLate ∷ !Int
+  , evDuplicate ∷ !Int
+  , evUnassigned ∷ !Int
+  , evNotLogical ∷ !Int
+  , evRefusedEnded ∷ !Int
+    -- ^ Deliveries refused because the subscription, its instance or the owner had ended.
+  , evRefusedValue ∷ !Int
+  , evRefusedFull ∷ !Int
+    -- ^ Deliveries refused for want of a place in an instance's queue, on arrival or at a
+    -- boundary.
+  , evDiscarded ∷ !Int
+    -- ^ Staged events discarded when their subscription or instance ended before their tick.
+  , evFailures ∷ !Int
+    -- ^ Delivery failures surfaced.
+  }
+  deriving (Eq, Show)
+
+-- | Nothing happened yet.
+noEventCounts ∷ EventCounts
+noEventCounts = EventCounts 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+
+-- | A reading of one live subscription.
+data SubscriptionReading = SubscriptionReading
+  { readingNumber ∷ !Word64
+  , readingInstance ∷ !Word64
+  , readingEndpoint ∷ !Text
+  , readingAdmitted ∷ !Int
+  , readingCoalesced ∷ !Int
+  , readingRefused ∷ !Int
+  , readingDelivered ∷ !Int
+  , readingBacklog ∷ !Int
+    -- ^ Unstarted deliveries it holds.
+  }
+  deriving (Eq, Show)
+
+-- | A reading of the subscription side of the service, taken in one transaction.
+data SubscriptionDiagnostics = SubscriptionDiagnostics
+  { sdEpoch ∷ !Epoch
+  , sdLive ∷ !Int
+  , sdCharged ∷ !Int
+    -- ^ Places held: live subscriptions, and ended ones whose provider has not proved its
+    -- retirement.
+  , sdRetiring ∷ !Int
+    -- ^ Subscription work not yet over.
+  , sdRetirementFailed ∷ !Int
+  , sdStaged ∷ !Int
+  , sdSubscribed ∷ !Int
+  , sdRefusedSubscribe ∷ !Int
+  , sdUnsubscribed ∷ !Int
+  , sdStagedTotal ∷ !Int
+  , sdStagingFull ∷ !Int
+  , sdLate ∷ !Int
+  , sdDuplicate ∷ !Int
+  , sdUnassigned ∷ !Int
+  , sdNotLogical ∷ !Int
+  , sdRefusedEnded ∷ !Int
+  , sdRefusedValue ∷ !Int
+  , sdRefusedFull ∷ !Int
+  , sdDiscarded ∷ !Int
+  , sdFailures ∷ !Int
+  , sdCoalesced ∷ !Int
+    -- ^ The model's count of values replaced before they started.
+  , sdInvalidated ∷ !Int
+    -- ^ The model's count of subscriptions ended by an owner's end or an epoch change.
+  , sdDiscardedEvents ∷ !Int
+    -- ^ The model's count of unstarted deliveries discarded when their subscription ended.
+  , sdSubscriptions ∷ ![SubscriptionReading]
+  }
+  deriving (Eq, Show)
 
 -- | Evidence the service keeps that the protocol model has no counter for.
 data ProviderCounts = ProviderCounts
@@ -450,3 +779,11 @@ data ProviderDiagnostics = ProviderDiagnostics
   , rdEpochCancelled ∷ !Int
   }
   deriving (Eq, Show)
+
+-- | The identity a subscription's provider work is accounted under, in the one accounting that a
+-- request's is. It is the subscription's own scope, number and generation as a request identity:
+-- the session issues generations from one counter it never rewinds, so no request the model issues
+-- can have the same one, and the model, which knows no request by it, has nothing outstanding for
+-- it.
+workIdOf ∷ SubscriptionId → RequestId
+workIdOf (SubscriptionId scope (SubscriptionName number) generation) = RequestId scope (RequestName number) generation

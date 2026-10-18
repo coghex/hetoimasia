@@ -76,6 +76,21 @@ module Hetoimasia.Scripting.Lua.Provider
   , ProviderReply (..)
   , ReplyAnswer (..)
 
+    -- * Subscriptions
+  , SubscriptionGrant (..)
+  , subscriptionGrant
+  , defaultSubscriptionBound
+  , defaultStagingBound
+  , maxSubscriptionBound
+  , SubscriptionGrantViolation (..)
+  , SubscriptionGrantRefused (..)
+  , EventEndpoint (..)
+  , EventSubscription (..)
+  , SubscriptionInfo (..)
+  , EventFeed (..)
+  , EventAnswer (..)
+  , OverloadPolicy (..)
+
     -- * The guard
   , guarded
 
@@ -87,6 +102,9 @@ module Hetoimasia.Scripting.Lua.Provider
     -- * Reading
   , ProviderDiagnostics (..)
   , requestDiagnostics
+  , SubscriptionDiagnostics (..)
+  , SubscriptionReading (..)
+  , subscriptionDiagnostics
   ) where
 
 import Control.Concurrent.STM (STM)
@@ -94,6 +112,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Session (EpochChange (..))
 import Hetoimasia.Scripting.Lua.Retention (RetirementState (..))
 import Hetoimasia.Scripting.Lua.Provider.Serve (guarded)
 import qualified Hetoimasia.Scripting.Lua.Provider.Serve as Serve
+import Hetoimasia.Scripting.Lua.Provider.Events (subscriptionDiagnosticsSTM)
 import Hetoimasia.Scripting.Lua.Provider.State (EpochReport (..), diagnosticsSTM)
 import Hetoimasia.Scripting.Lua.Provider.Types
 import Hetoimasia.Scripting.Lua.Scheduled.Types (Control (controlProvider), ScheduledEndpoint (ScheduledEndpoint))
@@ -122,3 +141,12 @@ advanceRequestEpoch (ScheduledEndpoint control) = case controlProvider control o
 -- with none.
 requestDiagnostics ∷ ScheduledEndpoint → STM (Maybe ProviderDiagnostics)
 requestDiagnostics (ScheduledEndpoint control) = traverse diagnosticsSTM (controlProvider control)
+
+-- | A reading of the owner's subscriptions in one transaction, or 'Nothing' for an owner that
+-- was granted no request service or no subscriptions: the subscriptions live, the places they
+-- and their providers' unfinished retirements hold, the events held for ticks, each
+-- subscription's counters and every refusal, counted by what refused it.
+subscriptionDiagnostics ∷ ScheduledEndpoint → STM (Maybe SubscriptionDiagnostics)
+subscriptionDiagnostics (ScheduledEndpoint control) = case controlProvider control of
+  Just service | not (null (psEvents service)) → Just <$> subscriptionDiagnosticsSTM service
+  _ → pure Nothing

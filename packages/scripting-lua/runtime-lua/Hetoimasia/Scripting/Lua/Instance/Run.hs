@@ -88,6 +88,7 @@ import Data.Foldable (toList, traverse_)
 import Hetoimasia.Scripting.Lua.Lifecycle.State (abandonIssued)
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Sequence (ViewL (EmptyL, (:<)), viewl, (<|))
+import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Word (Word64)
@@ -139,6 +140,7 @@ import Hetoimasia.Scripting.Lua.Runtime.Types
   , Payload (WithinBounds)
   , Progress (NotStarted, Started)
   )
+import Hetoimasia.Scripting.Lua.Provider.Events (DeliveryStart (..), EventsServed (..), eventRecord, serveEvents, startDelivery)
 import Hetoimasia.Scripting.Lua.Provider.Serve (endRequester, raiseFirst, serveTick, serviceProvider)
 import Hetoimasia.Scripting.Lua.Provider.State (anyInstanceWorkPending, pendingWorkFor, workWaiting)
 import Hetoimasia.Scripting.Lua.Provider.Types (ProviderState, Requester (RequesterInstance))
@@ -200,7 +202,7 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , taskPhase
   )
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VRecord, VText))
-import Hetoimasia.Scripting.Lua.Instance.Driver (eventEntry)
+import Hetoimasia.Scripting.Lua.Instance.Driver (eventEntry, subscriptionEntry)
 
 -- | Whether the owner may still enter Lua for its instances.
 data ExitMode
@@ -677,6 +679,28 @@ hookAvailable ih handle name
 -- initializing admits none.
 dispatch ∷ InstanceHost → ICell → IO ()
 dispatch ih cell = do
+  -- A provider that could not preserve an authoritative event of one of the instance's
+  -- subscriptions has surfaced a delivery failure: the instance fails with it, once, and
+  -- nothing more is begun for it.
+  surfaced ← atomically (takeDeliveryFailure cell)
+  case surfaced of
+    Just (endpoint, reason, phase) → failInstance ih cell phase (StageEvent endpoint) (ErrorDelivery endpoint reason)
+    Nothing → admitNext ih cell
+
+-- | The instance's delivery failure, if a provider surfaced one and the instance is still taking
+-- anything, taken once, with the phase the instance was in.
+takeDeliveryFailure ∷ ICell → STM (Maybe (Text, Text, InstancePhase))
+takeDeliveryFailure cell = do
+  state ← readTVar (icState cell)
+  case isDeliveryFailure state of
+    Nothing → pure Nothing
+    Just (endpoint, reason) → do
+      writeTVar (icState cell) state {isDeliveryFailure = Nothing}
+      pure (if isStopped state || isTerminal (isPhase state) then Nothing else Just (endpoint, reason, isPhase state))
+
+-- | Admit the instance's next invocation as a task, if it has one and may start it.
+admitNext ∷ InstanceHost → ICell → IO ()
+admitNext ih cell = do
   -- What the scheduler holds for invocations that ended is given back first, so
   -- admitting the next one needs room for one more and not for every one before it.
   void (reapInvocations ih)
@@ -689,7 +713,7 @@ dispatch ih cell = do
       else do
         let nextEvent event rest =
               Just
-                ( InvokeEvent (queuedSource event) (WithinBounds [record event])
+                ( invocationOf event
                 , StageEvent (queuedSource event)
                 , rest
                 , Just event
@@ -710,8 +734,8 @@ dispatch ih cell = do
           Just (invocation, stage, rest, event, slot) → do
             let spec =
                   TaskSpec
-                    { specBehavior = BehaviorId (behavior stage)
-                    , specEntry = entry stage
+                    { specBehavior = BehaviorId (behavior invocation)
+                    , specEntry = entry invocation
                     , specName = icName cell
                     , specClass = icClass cell
                     , specKind = OneShot
@@ -760,11 +784,17 @@ dispatch ih cell = do
         , ("tick", VInteger (fromIntegral (queuedTick event)))
         , ("payload", queuedPayload event)
         ]
+    -- A subscription's delivery is a reference: its value is taken from the subscription as
+    -- the callback's first segment is about to run, not before.
+    invocationOf event = case queuedSubscription event of
+      Just identity → InvokeSubscription (queuedSource event) identity
+      Nothing → InvokeEvent (queuedSource event) (WithinBounds [record event])
     entry = \case
-      StageEvent source → eventEntry source
-      StageUpdate → "update"
-      _ → "run"
-    behavior stage = moduleRefName (icModule cell) <> "/" <> entry stage
+      InvokeSubscription endpoint _ → subscriptionEntry endpoint
+      InvokeEvent source _ → eventEntry source
+      InvokeUpdate → "update"
+      InvokeRun → "run"
+    behavior invocation = moduleRefName (icModule cell) <> "/" <> entry invocation
 
 -- | Run one segment of an instance's invocation, on behalf of the scheduler.
 --
@@ -785,9 +815,13 @@ instanceSegment ih run number starting = do
     _ → pure (ReportCompleted (Finished (Returned [])))
   where
     go cell stage = do
-      -- Its first segment is about to run: it is no longer an unstarted invocation.
-      atomically . modifyTVar' (icState cell) $ \state →
-        state
+      -- Its first segment is about to run: it is no longer an unstarted invocation. A
+      -- subscription's delivery is taken from the subscription in the same step, so nothing
+      -- replaces its value between its no longer being unstarted and its being taken: from
+      -- here the payload is the callback's, and immutable.
+      taken ← atomically $ do
+        state ← readTVar (icState cell)
+        writeTVar (icState cell) state
           { isPending = Nothing
           , isRunBegun = isRunBegun state || stage == StageRun
           , isUpdate = case isUpdate state of
@@ -795,11 +829,26 @@ instanceSegment ih run number starting = do
               other → other
           , isUpdateRunning = isUpdateRunning state || stage == StageUpdate
           }
+        case (starting, ihProvider ih, isPending state) of
+          (Just (InvokeSubscription _ identity), Just service, Just reference) | queuedSubscription reference == Just identity →
+            fmap ((,) reference) <$> startDelivery service identity
+          _ → pure Nothing
       let slot = VInteger (fromIntegral number)
       outcome ← case starting of
         Just (InvokeEvent source (WithinBounds [event])) →
           begin $ withRunning ih number (startTask (ihOwned ih) (ihDriver ih) (eventEntry source) [slot, event])
         Just (InvokeEvent _ _) → pure (Left (ErrorMissingEntry "an event"))
+        Just (InvokeSubscription endpoint _) → case taken of
+          Just (reference, started) →
+            begin . withRunning ih number $
+              startTask
+                (ihOwned ih)
+                (ihDriver ih)
+                (subscriptionEntry endpoint)
+                [slot, eventRecord endpoint (queuedSequence reference) (queuedTick reference) (startedNumber started) (startedPayload started)]
+          -- The subscription ended before its callback began, and the model counted what it
+          -- discarded: nothing runs and there is nothing to wait for.
+          Nothing → pure (Right Nothing)
         Just InvokeRun → do
           handles ← readIORef (ihHandles ih)
           case Map.lookup (icModule cell) handles of
@@ -1028,7 +1077,8 @@ serviceCadence ih = go []
           -- A tick just served has had no chance to run its update yet: it is looked at the
           -- next time round, which the answer below makes the boundary do.
           released ← settleHolds ih served
-          pure (not (null served) || released)
+          awaited ← settleEventHolds ih
+          pure (not (null served) || released || awaited)
 
 -- | The tick the owner asked to be held at has been reached, and the grant that reached it is
 -- held, so no later one is applied until this is done: the controls the application assigned to
@@ -1037,6 +1087,12 @@ serviceCadence ih = go []
 -- the tick, which then finds the instance as they left it, and so before any task the tick woke.
 -- What is queued for a later tick is what the owner next asks to be held at, in the step that
 -- takes these, so no request can be queued between.
+--
+-- The events a provider delivered to the tick are admitted after the controls, in the order of
+-- their places, and the grant is not let go until the instances they were admitted to have begun
+-- them or cannot ('settleEventHolds'): the next tick's events are not admitted while this tick's
+-- are unstarted, so a value is never replaced before it was seen at its own tick, and a queue
+-- that is full is full of what the logical sequence put in it, however fast the owner served.
 serveWatch ∷ InstanceHost → CadenceFiring → IO ()
 serveWatch ih = \case
   FiredLogical tick → do
@@ -1054,7 +1110,11 @@ serveWatch ih = \case
         pure due
       modifyIORef' (ihDue ih) (<> taken)
     applyDue ih (const True)
-    atomically (releaseWatch (scheduler' ih))
+    -- Taken and kept where the instances are looked at in one masked step: they are in the
+    -- queues, and the grant waits for them.
+    served ← mask_ (maybe (pure []) (\service → servedInstances <$> atomically (serveEvents service tick)) (ihProvider ih))
+    forM_ served $ \number → withCell ih number (dispatch ih)
+    void (settleEventHolds ih)
   _ → atomically (releaseWatch (scheduler' ih))
 
 -- | The earlier of two ticks that may not be there.
@@ -1150,6 +1210,53 @@ settleHold ih cell = do
       release ← holdReleasable ih state
       when release (atomically (releaseCadenceHold (scheduler' ih) (cadenceKey cell)))
       pure release
+
+-- | Let go of the grant the owner's watch holds when the deliveries admitted at its tick can no
+-- longer begin in it, or have. Answers whether it let any instance go.
+--
+-- An instance is waited for while deliveries admitted at the boundary are unstarted and can
+-- still begin: the instance is serving, and what is ahead of them, or they, is ready to run
+-- segments. It is let go when it is paused, stopping or ended, when an invocation ahead of them
+-- has begun and suspended on a wait, when everything admitted has begun, and when nothing at all
+-- is ready to run, so what it waits for can never happen: a tick never waits on a delivery that
+-- cannot start. The grant itself is given back once no instance is waited for.
+settleEventHolds ∷ InstanceHost → IO Bool
+settleEventHolds ih = do
+  cells ← Map.elems <$> readTVarIO (insCells (ihInstances ih))
+  letGo ← forM cells $ \cell → do
+    state ← readTVarIO (icState cell)
+    if not (isAwaited state)
+      then pure False
+      else do
+        release ← eventHoldReleasable ih state
+        when release (atomically (modifyTVar' (icState cell) (\current → current {isAwaited = False})))
+        pure release
+  remaining ← or . map isAwaited <$> mapM (readTVarIO . icState) cells
+  unless remaining (atomically (releaseWatch (scheduler' ih)))
+  pure (or letGo)
+
+-- | Whether the deliveries admitted to an instance at a boundary can no longer begin in the tick
+-- that is waiting for them. See 'settleEventHolds'.
+eventHoldReleasable ∷ InstanceHost → IState → IO Bool
+eventHoldReleasable ih state
+  | isTerminal (isPhase state) || isStopped state || isPhase state /= Active = pure True
+  | Seq.null (isQueue state) && isNothing (isPending state) = pure True
+  | otherwise = do
+      stuck ← not <$> atomically (tasksReady (scheduler' ih))
+      case isActive state of
+        -- Nothing in flight and the next delivery waits for its turn to be given a place.
+        Nothing → pure stuck
+        Just task →
+          atomically (taskPhase (scheduler' ih) task) <&> \case
+            Just PhaseReady → False
+            Just PhaseRunning → False
+            Just PhaseQueued → stuck
+            -- An invocation that ended is accounted for, and the next one begun, at the
+            -- boundary that sees it.
+            Just (PhaseEnded _) → False
+            _ → True
+  where
+    (<&>) = flip fmap
 
 -- | Whether a due update can no longer run in the tick that is waiting for it. A tick
 -- never waits on an update that cannot start.
