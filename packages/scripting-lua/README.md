@@ -2839,9 +2839,13 @@ retry). The provider delivers through the feed, from any thread, now or later:
 The answer says what became of a delivery (`EventAnswer`), and none is an error: `EventAdmitted`, `EventCoalesced`,
 `EventStaged`, `EventQueueFull`, `EventStagingFull`, `EventEnded`, `EventRefusedValue`, `EventLate`, `EventDuplicate`,
 `EventUnassigned` and `EventNotLogical`. A refusal is evidence about the provider: it is counted, and the value is not kept.
-A delivery is checked before anything is retained, against the owner's value limits (as the callback will be handed it, in
-a record naming the endpoint and the subscription) and the endpoint's schema, and fully evaluated inside the guard, so a
-value that throws when it is first looked at is a refused delivery and not an exception loose on the producer's thread.
+A delivery is checked before anything is retained, against the owner's value limits and the endpoint's schema. What is
+measured is what the callback's entry point is handed: the instance's number and the record naming the endpoint and the
+subscription, which the host checks together (so a payload that fits the record alone and not the record with the number is
+refused to the producer, and never accepted and then fails the instance). It is copied to buffers of its own, so a small slice
+of a large text or byte string does not keep the whole buffer alive while the delivery waits, which the limits do not count, and
+it is fully evaluated, all inside the guard: a value that throws when it is first looked at is a refused delivery and not an
+exception loose on the producer's thread. The reason of a `feedFail` is bounded (512 characters) and copied the same way.
 
 ### What a script sees
 
@@ -2877,8 +2881,9 @@ in order and run after the resume.
   needs none. "Unstarted" lasts through the callback's first segment, including the time after the owner selected the
   delivery for its next invocation and before that segment runs; once the segment begins the payload is the callback's and
   immutable, and a later value is a delivery of its own behind it.
-* A delivery to a subscription that has ended (unsubscribed, invalidated, or ended with its instance or its owner) is refused
-  and counted (`EventEnded`), never run. One accepted and not yet begun when its subscription ends is discarded, counted by
+* A delivery to a subscription that has ended (unsubscribed, invalidated, or ended with its instance or its owner), or whose
+  instance is stopping, is refused and counted (`EventEnded`), never run, and on a logical owner never held for a tick the
+  instance will not reach. One accepted and not yet begun when its subscription ends is discarded, counted by
   the model, and never run; an invocation already selected for it completes without entering Lua.
 
 ### Logical event admission
@@ -2899,11 +2904,13 @@ replaces one that was visible at an earlier tick. An ordered event that is accep
 delivery failure it is, exactly as `feedFail` is, and is counted; a refused fill of replaceable state is counted and fails
 nothing, since only the newest value of a state matters.
 
-The grant that reached the tick is let go once the deliveries admitted at it have begun, or cannot: it is held while the
-instance is serving and what is ahead of them, or they, is ready to run segments, and let go when the instance is paused,
-stopping, ended or still initializing, when an invocation ahead of them has begun and suspended on a wait, when everything
-admitted has begun, and when nothing at all is ready to run. So the next tick's deliveries are not admitted while this tick's
-are unstarted and can still run, and queued grants give the same admissions and effects as grants served one at a time.
+The grant that reached the tick is the claim on the tick of the callbacks it admitted: it is held for as long as the instance's
+invocation in flight is ready to run a segment, whether it has begun or not and whatever is behind it (a callback that yields
+and then waits for a tick waits for the same tick however the grants behind it were queued), and when nothing is in flight, until
+what was admitted has begun. It is let go when the instance is paused, stopping, ended or still initializing, when the invocation
+in flight has begun and suspended on a wait or ended with nothing unstarted behind it, and when nothing at all is ready to run.
+So the next tick's deliveries are not admitted while this tick's are unstarted and can still run, and queued grants give the same
+admissions and effects as grants served one at a time.
 
 ### Epochs
 
@@ -2913,7 +2920,10 @@ and counted, and the providers are told by the owner at its next boundary. The a
 identities it was issued under, so a late delivery from an old producer finds nothing, cannot reach a subscription made in the
 new epoch (an identity carries its epoch and a generation that is never reissued, so the same local number does not give it
 somewhere new to land), and the places stay charged until the providers prove their retirements over. Instances are not
-invalidated: the same instance subscribes again.
+invalidated: the same instance subscribes again. The instance's VM is not left holding what it captured for the subscriptions
+the engine ended: the owner has the driver let go of their callbacks and handles at its next boundary, without the script
+unsubscribing them (the driver's creation entry on a slot that is live is that cleanup point, and it asks the engine which
+numbers ended), so repeated subscribe, epoch-change and retirement cycles do not grow the VM.
 
 ### Retirement and the bound
 
