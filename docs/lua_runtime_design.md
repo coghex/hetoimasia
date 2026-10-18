@@ -958,6 +958,29 @@ the contract's pause rule already says. Rejected: letting a due update start
 alongside the active invocation (breaks one invocation at a time), and refusing
 waits in event callbacks (contradicts the accepted contract).
 
+### D-35. `dt` reaches Lua in seconds, and logical `dt` excludes pause
+
+Owner decisions, 2026-10-18, in the hetoimasia manager pane, on two choices
+#475's implementation found the issue left open (PR #479):
+
+- **Unit.** "Seconds as a float." `update(self, dt)` receives `dt` as a Lua
+  float number of seconds, for logical and elapsed intervals alike. Inside the
+  engine `dt` stays an exact `Duration` (granted ticks times the application's
+  tick duration, or the elapsed difference); it is converted to seconds only at
+  the Lua boundary, and that conversion is the only rounding. Rejected: integer
+  nanoseconds (every script divides by 1e9) and integer ticks (no unit for
+  elapsed intervals).
+- **Pause.** "Exclude pause." A logical instance's `dt` excludes logical time
+  granted while the instance was intentionally paused, as the elapsed `dt` is
+  rebased at resume. It is the logical duration granted since the previous
+  update finished (since successful `init` for the first), less any duration
+  granted while the instance was paused. Ticks that pass while an invocation is
+  active and the instance is not paused still count (D-33, D-34), so every
+  granted tick while the instance is live is accounted to it exactly once.
+  A resumed instance's first update therefore receives about one interval of
+  `dt`, not the whole pause. Rejected: counting paused ticks, which makes a
+  resumed instance integrate the whole pause in one update.
+
 ## Design
 
 P-1 through P-13 record the accepted contracts, with proof and delivery gates
@@ -2596,7 +2619,8 @@ and verified policy, with adversarial regression coverage.
   with the application's configured positive tick duration or refused, the first
   update due one interval after successful `init`, and the granted `dt` fixed at
   the invocation's start and kept across waits and real delays, and cadence
-  points passed during any active invocation are no-ops (D-33, D-34); elapsed intervals
+  points passed during any active invocation are no-ops (D-33, D-34), paused
+  time excluded from logical `dt` and `dt` handed to Lua in float seconds (D-35); elapsed intervals
   on the monotonic source with at most one unstarted refresh, obsolete demand
   coalesced without dropping queued events, `dt` the elapsed time between update
   starts (from successful `init`, rebased at resume) and lateness moving the
@@ -2609,7 +2633,7 @@ and verified policy, with adversarial regression coverage.
 - **Phase:** script authoring and lifetime.
 - **Depends on:** LUA-18.
 - **Ordering:** after LUA-18; independent of LUA-22 and LUA-23; precedes LUA-19.
-- **Relevant decisions:** D-15, D-21, D-22, D-23, D-26, D-31, D-33, D-34.
+- **Relevant decisions:** D-15, D-21, D-22, D-23, D-26, D-31, D-33, D-34, D-35.
 - **Acceptance signals:** exact tick conversion or refusal; the first update one
   interval after `init`; the granted `dt` kept across a wait; UI coalescing with
   no catch-up burst and elapsed `dt` rebased at resume; no periodic demand during

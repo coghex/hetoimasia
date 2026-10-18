@@ -233,6 +233,9 @@ duration input must convert exactly to that unit or be refused, never silently
 rounded. One-shot/event-only instances have no periodic interval. First update
 is due one interval after successful initialization. A gameplay invocation keeps
 its granted `dt` across waits and real execution delays.
+Logical `dt` excludes time granted while the instance was intentionally
+paused (D-35). Scripts receive `dt` as a float number of seconds for both
+interval kinds; the engine keeps it exact and converts only at the Lua boundary.
 
 UI periodic intervals use monotonic time. Keep at most one unstarted periodic
 refresh; coalesce obsolete refresh demand without dropping queued events. Its
