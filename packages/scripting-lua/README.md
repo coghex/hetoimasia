@@ -2036,10 +2036,12 @@ The update's `dt` is the logical duration granted since the previous update *fin
 succeeded, for the first), less any granted while the instance was intentionally paused (D-35), from
 grants alone. Ticks that pass while an invocation is active and the instance is not paused still
 count, so every tick granted while the instance is live is accounted to it once. It reaches Lua as a
-**float number of seconds**: the exact `Duration` (granted ticks times the application's tick
-duration, or the elapsed difference) is converted once at the Lua boundary, which is the only rounding.
-It is fixed as the update begins and is unchanged by its own waits, by later grants and by real delays.
-The duration an invocation's own wait was granted is
+**float number of seconds**: the exact `Duration` (the sum of the durations actually granted, so grants
+of unequal sizes are summed as they were granted; or the elapsed difference) is converted once at the Lua
+boundary, which is the only rounding. The owner's tick duration is only the unit an interval given as a
+duration converts by, never a replacement for the grants. A representable `Duration` never fails because
+its count of nanoseconds exceeds Lua's integer range. It is fixed as the update begins and is unchanged by
+its own waits, by later grants and by real delays. The duration an invocation's own wait was granted is
 reported to the application on the owner's thread when it resumes (`scheduledObserve`'s
 `ResumedLogical`); a resumed coroutine receives no value, so a script learns it only through a binding
 the application grants, as the test fixture's `fx.resume` does. That duration overlaps the next
