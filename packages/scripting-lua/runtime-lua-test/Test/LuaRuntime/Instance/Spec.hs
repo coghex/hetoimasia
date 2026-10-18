@@ -12,6 +12,7 @@ import qualified Test.LuaRuntime.Instance.Cadence
 import qualified Test.LuaRuntime.Instance.Capacity
 import qualified Test.LuaRuntime.Instance.Control
 import qualified Test.LuaRuntime.Instance.Determinism
+import qualified Test.LuaRuntime.Instance.Elapsed
 import qualified Test.LuaRuntime.Instance.Events
 import qualified Test.LuaRuntime.Instance.Failure
 import qualified Test.LuaRuntime.Instance.Stop
@@ -28,6 +29,7 @@ spec = describe "the script instances" $ do
   Test.LuaRuntime.Instance.Capacity.spec
   Test.LuaRuntime.Instance.Control.spec
   Test.LuaRuntime.Instance.Determinism.spec
+  Test.LuaRuntime.Instance.Elapsed.spec
   Test.LuaRuntime.Instance.Events.spec
   Test.LuaRuntime.Instance.Failure.spec
   Test.LuaRuntime.Instance.Stop.spec

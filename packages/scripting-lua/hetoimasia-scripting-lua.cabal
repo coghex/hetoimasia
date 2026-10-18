@@ -378,6 +378,7 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Instance.Capacity
         Test.LuaRuntime.Instance.Control
         Test.LuaRuntime.Instance.Determinism
+        Test.LuaRuntime.Instance.Elapsed
         Test.LuaRuntime.Instance.Events
         Test.LuaRuntime.Instance.Failure
         Test.LuaRuntime.Instance.Spec
