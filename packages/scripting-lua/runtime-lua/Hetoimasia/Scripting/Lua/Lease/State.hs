@@ -101,6 +101,8 @@ module Hetoimasia.Scripting.Lua.Lease.State
   , drainScope
   , RetirementEnd (..)
   , serviceRetirements
+  , Disposals (..)
+  , finishDisposals
   , retirementsReady
   , anyPending
   , noteScope
@@ -613,6 +615,27 @@ drainScope host number = mask_ $ do
       SlotLive → True
       _ → False
 
+-- | The disposals of one slot whose last retirement has completed, to be run. The slot
+-- is kept until they have been, so that a disposal that fails can be retained on it:
+-- 'finishDisposals' says how they went.
+data Disposals = Disposals
+  { disposalsKey ∷ !Word64
+  , disposalsInstance ∷ !Word64
+  , disposalsActions ∷ ![IO ()]
+  }
+
+-- | Record how a slot's disposals went: it is gone when they all succeeded, and holds the
+-- failure of the first that did not, which every later release of it answers.
+finishDisposals ∷ Leases → Word64 → Maybe (ExceptionWithContext SomeException) → STM ()
+finishDisposals leases key failure =
+  modifyTVar' (leasesState leases) $ \state →
+    state {lsSlots = Map.update settle key (lsSlots state)}
+  where
+    settle slot = case (failure, slotPhase slot) of
+      (Nothing, _) → Nothing
+      (Just _, SlotFailed _) → Just slot
+      (Just retained, _) → Just slot {slotPhase = SlotFailed retained, slotHolding = Nothing}
+
 -- | A retirement that came to an end.
 data RetirementEnd = RetirementEnd
   { endedInstance ∷ !(Maybe Word64)
@@ -628,7 +651,7 @@ data RetirementEnd = RetirementEnd
 --
 -- Run on the owner's thread. It never waits: a provider's reading is a transaction
 -- that must not retry.
-serviceRetirements ∷ Leases → STM ([RetirementEnd], [(Word64, IO ())])
+serviceRetirements ∷ Leases → STM ([RetirementEnd], [Disposals])
 serviceRetirements leases = do
   state ← readTVar (leasesState leases)
   swept ← forM (Map.toList (lsSlots state)) $ \(key, slot) → do
@@ -641,10 +664,12 @@ serviceRetirements leases = do
         slot' = slot {slotObligations = remaining, slotPhase = phase'}
         finished = null remaining && isReleased phase'
         completions = [RetirementEnd (Just (slotInstance slot)) label failure | (label, failure) ← ended]
-        -- A slot with nothing left to wait for and no failure gives its disposals up.
-        disposals = [(slotInstance slot, disposal) | null remaining, null failed, not (isFailed (slotPhase slot)), disposal ← slotDeferred slot]
-        slot'' = if null disposals then slot' else slot' {slotDeferred = []}
-    pure ((key, if finished then Nothing else Just slot''), completions, disposals)
+        -- A slot with nothing left to wait for and no failure gives its disposals up, and is
+        -- kept until they have been run.
+        disposing = null remaining && null failed && not (isFailed (slotPhase slot)) && not (null (slotDeferred slot))
+        disposals = [Disposals key (slotInstance slot) (slotDeferred slot) | disposing]
+        slot'' = if disposing then slot' {slotDeferred = []} else slot'
+    pure ((key, if finished && not disposing then Nothing else Just slot''), completions, disposals)
   (orphans, endedOrphans) ← sweepList (lsOrphans state)
   let ended = concat [completions | (_, completions, _) ← swept] <> [RetirementEnd Nothing label failure | (label, failure) ← endedOrphans]
   writeTVar (leasesState leases) state

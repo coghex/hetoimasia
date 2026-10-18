@@ -128,6 +128,32 @@ spec = describe "releasing" $ do
           leasesDrained (resultLeases result) `shouldBe` 2
         Nothing → fail "expected the instance to have settled"
 
+  it "ends the owner as a failure at once: the instances still to end during an orderly retirement have no shutdown run, and their holdings are drained all the same" $ bounded $ do
+    fixture ← newLFix 4
+    let base = lfBase fixture
+    breakRelease fixture "indep-b"
+    _ ← expectFatal $ \control runtime → do
+      owner ← startLeased fixture runtime "unorderly" [independent, plain] leaseConfig requiredPolicy
+      _ ← admit base owner "a" (moduleNamed "independent")
+      _ ← admit base owner "b" (moduleNamed "plain")
+      awaitPhase base owner "a" Active
+      awaitPhase base owner "b" Active
+      liveFor fixture "a" 3
+      liveFor fixture "b" 1
+      retireScheduled owner
+      awaitScheduledTerminal control owner
+    entries ← history fixture
+    -- The first instance's hook ran and its drain failed; the second's hook did not.
+    entries `shouldSatisfy` elem "shutdown 1 stopped"
+    entries `shouldSatisfy` notElem "shutdown 2 stopped"
+    entries `shouldSatisfy` elem "release plain-res.a"
+    settled ← tickOf base "b" >>= pollInstance
+    case settled of
+      Just result → do
+        terminationShutdown (resultTermination result) `shouldBe` ShutdownSkippedUnsafe
+        leasesDrained (resultLeases result) `shouldBe` 1
+      Nothing → fail "expected the instance to have settled"
+
   it "keeps a failed release in the instance's outcome when a cancellation is queued inside it: the independent holdings are still released, once each, and the failure is not lost" $ bounded $ do
     fixture ← newLFix 4
     let base = lfBase fixture

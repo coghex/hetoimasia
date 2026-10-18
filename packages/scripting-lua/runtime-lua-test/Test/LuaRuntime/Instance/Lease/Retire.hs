@@ -269,6 +269,26 @@ spec = describe "retained retirement" $ do
         _ ← awaitScheduledTerminal control owner
         pure ()
 
+  it "keeps a lease whose disposal failed failed: a closing handler's release during the teardown answers the failure and does not run the disposal again" $ bounded $ do
+    fixture ← newLFix 4
+    let base = lfBase fixture
+    breakRelease fixture "dep-res.device"
+    _ ← expectFatal $ \control runtime → providersFinish fixture $ do
+      owner ← startLeased fixture runtime "disposal failed" [closingDependent] leaseConfig requiredPolicy
+      _ ← admit base owner "a" (moduleNamed "closingdependent")
+      awaitPhase base owner "a" Active
+      expectDelivered base owner "a" 1
+      awaitEffect (sf base) "release Retiring"
+      awaitDiagnosticsWaiting owner
+      completeRetirement fixture "dep-res"
+      awaitScheduledTerminal control owner
+    entries ← history fixture
+    -- The disposal ran once and failed; the release from the closing handler was not
+    -- answered as released, and ran nothing.
+    filter (== "dispose dep-res.device") entries `shouldBe` ["dispose dep-res.device"]
+    entries `shouldSatisfy` elem "closing release false"
+    entries `shouldSatisfy` all (not . Text.isPrefixOf "released AlreadyReleased")
+
   it "disposes what a release needs at once when no retirement is pending, after the resource it released" $ bounded $ do
     fixture ← newLFix 4
     let base = lfBase fixture

@@ -41,6 +41,7 @@ module Test.LuaRuntime.Instance.Lease.Support
   , marker
   , escalating
   , dependentHolder
+  , closingDependent
   , dependentNowHolder
   , dependentRollback
   , cycler
@@ -616,6 +617,26 @@ dependentHolder =
     , "  end)"
     , "end"
     , "function shutdown(self, reason) " <> record <> "('shutdown ' .. self.id .. ' ' .. reason) end"
+    ]
+
+-- | Releases an asynchronously retired resource over a device early, and then holds a
+-- callback suspended whose closing handler releases it again.
+closingDependent ∷ ModuleSource
+closingDependent =
+  hooksModule
+    "closingdependent"
+    [ "function init(self, api)"
+    , "  self.id = inst.next()"
+    , "  self.h = lease.open_dependent('dep-res')"
+    , "  api.connect('tick', function(self, event)"
+    , "    " <> record <> "('release ' .. lease.release(self.h))"
+    , "    local guard <close> = setmetatable({}, {__close = function()"
+    , "      local ok = pcall(lease.release, self.h)"
+    , "      " <> record <> "('closing release ' .. tostring(ok))"
+    , "    end})"
+    , "    sched.wait_ticks(1)"
+    , "  end)"
+    , "end"
     ]
 
 -- | Holds a resource released at once over a device whose disposal it hands over, and

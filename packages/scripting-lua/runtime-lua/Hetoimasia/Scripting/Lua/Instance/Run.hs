@@ -95,11 +95,13 @@ import Hetoimasia.Scripting.Lua.Instance.Types
 import Hetoimasia.Scripting.Lua.Lease.State
   ( DrainReport (drainFailures)
   , LeaseHost (lhLeases)
+  , Disposals (Disposals, disposalsActions, disposalsInstance, disposalsKey)
   , RetirementEnd (endedFailure, endedInstance, endedLabel)
   , Scope (scopeAwaited, scopeDrained, scopeFailed, scopeNotes)
   , anyPending
   , dissolveScope
   , drainScope
+  , finishDisposals
   , noteScope
   , openScope
   , pendingFor
@@ -955,7 +957,10 @@ finishEnding ih cell closed = do
     -- or raised, on this thread and without entering Lua, so Lua being unsafe to enter
     -- does not keep a resource.
     drainInstance ih cell
-    when (created && safe && not (hookStarted (endShutdown ending))) $ do
+    -- A drain that failed has ended the owner as a failure, and Lua is not entered again for
+    -- the instances it leaves.
+    safeStill ← (\held → case held of Unorderly _ → False; _ → True) <$> readIORef (ihMode ih)
+    when (created && safe && safeStill && not (hookStarted (endShutdown ending))) $ do
       -- A release that fails is cleanup evidence, kept for the owner's end: nothing
       -- the application's escalation answers can hide it.
       released ← tryWithContext @SomeException (withRunning ih (icId cell) (callEntry (ihOwned ih) (ihDriver ih) "release" [slot]))
@@ -1002,6 +1007,10 @@ drainInstance ih cell = forM_ (ihLeases ih) $ \lh → mask_ $ do
 endOwner ∷ InstanceHost → IO ()
 endOwner ih = do
   writeIORef (ihFailed ih) True
+  -- The owner exits as a failure from now on, whatever order it was in: the instances still
+  -- to end have no hook run for them, and their holdings are drained all the same. An
+  -- earlier failure or cancellation stays how it exits.
+  recordExit ih (Just ExitFailed)
   atomically (writeTVar (controlClosing (ihControl ih)) True)
 
 -- | Whether a cleanup failure of the leases ended the owner.
@@ -1027,12 +1036,15 @@ serviceRetirementsOf ih = case ihLeases ih of
         endOwner ih
       -- What the retirements needed is disposed of now that every one has completed, as a
       -- release is: uninterruptibly, one at a time, a failure of one not stopping the rest.
-      forM_ disposals $ \(number, dispose) → do
-        disposed ← tryWithContext @SomeException (uninterruptibleMask_ dispose)
-        forM_ (either Just (const Nothing) disposed) $ \failure@(ExceptionWithContext _ raised) → do
+      forM_ disposals $ \Disposals {disposalsKey = key, disposalsInstance = number, disposalsActions = actions} → do
+        failures ← forM actions $ \dispose →
+          either Just (const Nothing) <$> tryWithContext @SomeException (uninterruptibleMask_ dispose)
+        forM_ [failure | Just failure ← failures] $ \failure@(ExceptionWithContext _ raised) → do
           modifyIORef' (ihExtra ih) (<> [("lua lease dependency", failure)])
           atomically . noteScope leases number . failureText $ "disposing what a retirement needed failed: " <> Text.pack (show raised)
           endOwner ih
+        -- The lease keeps the first failure, which every later release of it answers.
+        atomically (finishDisposals leases key (case [failure | Just failure ← failures] of first : _ → Just first; [] → Nothing))
       pure (not (null ended && null disposals))
     parked ← Set.toList <$> readIORef (ihParked ih)
     settled ← forM parked $ \number → do
