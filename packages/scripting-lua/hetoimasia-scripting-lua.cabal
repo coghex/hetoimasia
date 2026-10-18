@@ -326,6 +326,7 @@ test-suite lua-host-tests
         Test.Lua.Protocol.Epochs
         Test.Lua.Protocol.Failure
         Test.Lua.Protocol.Fixture
+        Test.Lua.Protocol.HolderSubscriptions
         Test.Lua.Protocol.Holders
         Test.Lua.Protocol.Isolation
         Test.Lua.Protocol.Reason

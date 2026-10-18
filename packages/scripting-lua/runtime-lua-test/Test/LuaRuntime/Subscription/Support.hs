@@ -40,6 +40,7 @@ module Test.LuaRuntime.Subscription.Support
   , shutdownSubscriber
   , oneShotSubscriber
   , failingInitSubscriber
+  , periodicSubscriber
 
     -- * Owners
   , dummyRequests
@@ -340,6 +341,16 @@ failingInitSubscriber =
          , "  fx.record('init subscribed')"
          , "  error('init boom')"
          , "end"
+         ]
+
+-- | A periodic instance: its update records itself, and it subscribes as it is told.
+periodicSubscriber ∷ ModuleSource
+periodicSubscriber =
+  hooksModule "periodicsubscriber" $
+    prelude
+      <> [ "function init(self, api) connect(self, api) end"
+         , "function update(self, dt) fx.record('update') end"
+         , "function shutdown(self, reason) fx.record('shutdown ' .. reason) end"
          ]
 
 -- Owners ----------------------------------------------------------------------------------

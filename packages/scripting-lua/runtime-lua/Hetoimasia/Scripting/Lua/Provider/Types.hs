@@ -486,8 +486,6 @@ data SubscribeRefusal
     EndpointNotGranted !Text
   | -- | Every place is held: the bound.
     SubscriptionsFull !Int
-  | -- | The handle names no subscription of this instance.
-    SubscriptionUnknown
   deriving (Eq, Show)
 
 -- | A refusal as the reason a script reads.
@@ -497,7 +495,6 @@ renderSubscribeRefusal = \case
   SubscriptionsClosed → "subscribe refused: the instance is no longer taking subscriptions"
   EndpointNotGranted name → "subscribe refused: no event endpoint named " <> name <> " is granted to this instance"
   SubscriptionsFull bound → "subscribe refused: all " <> Text.pack (show bound) <> " places are held"
-  SubscriptionUnknown → "unsubscribe refused: the handle names no subscription of this instance"
 
 -- Who asks ---------------------------------------------------------------------------
 

@@ -13,6 +13,7 @@ import qualified Test.Lua.Protocol.Determinism
 import qualified Test.Lua.Protocol.Epochs
 import qualified Test.Lua.Protocol.Failure
 import qualified Test.Lua.Protocol.Fixture
+import qualified Test.Lua.Protocol.HolderSubscriptions
 import qualified Test.Lua.Protocol.Holders
 import qualified Test.Lua.Protocol.Isolation
 import qualified Test.Lua.Protocol.Reason
@@ -26,6 +27,7 @@ spec = describe "Protocol" $ beforeAll_ Test.Lua.Protocol.Fixture.baseline $ do
   Test.Lua.Protocol.Tasks.spec
   Test.Lua.Protocol.Admission.spec
   Test.Lua.Protocol.Requests.spec
+  Test.Lua.Protocol.HolderSubscriptions.spec
   Test.Lua.Protocol.Holders.spec
   Test.Lua.Protocol.Subscriptions.spec
   Test.Lua.Protocol.Epochs.spec

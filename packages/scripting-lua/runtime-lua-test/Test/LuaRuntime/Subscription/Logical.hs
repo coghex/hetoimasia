@@ -9,6 +9,7 @@ module Test.LuaRuntime.Subscription.Logical (spec) where
 import Control.Monad (forM_, void)
 import Data.List (permutations)
 import Data.Text (Text)
+import qualified Data.Text as Text
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Owner (ModuleSource)
@@ -17,7 +18,7 @@ import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
 import Test.Hspec (Spec, describe, it, shouldBe)
 import Test.LuaRuntime.Instance.Support
-import Test.LuaRuntime.Request.Support (awaitLine, tickReached)
+import Test.LuaRuntime.Request.Support (awaitLine, linesOf, tickReached)
 import Test.LuaRuntime.Subscription.Support
 import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
 
@@ -182,6 +183,24 @@ spec = describe "on an owner on logical time" $ do
         awaitGot fixture 2
         gotLines fixture >>= (`shouldBe` ["got s n=1 seq=1 t=1", "got s n=2 seq=2 t=2"])
         (sdCoalesced <$> subDiagnostics owner) >>= (`shouldBe` 0)
+
+  describe "a due update" $ do
+    it "does not overtake a delivery admitted before it fell due, and a later value coalesces into that delivery without moving it" $ bounded $ do
+      fixture ← newIFixture
+      fake ← newFakeEvents
+      withBoundary $ \control runtime → eventsFinish fake $ do
+        owner ← logicalOwner fixture fake runtime "update" [periodicSubscriber] 16
+        _ ← admitWith fixture owner "i" (InstanceRequest (moduleNamed "periodicsubscriber") (Periodic (LogicalTicks 2)) (Just "i") OrdinaryClass ["cmd", "ticks", "state"])
+        awaitPhase fixture owner "i" Active
+        subscribeTo' fixture owner "i" "s" "state" Nothing
+        -- Two values for the tick the update falls due at: the second replaces the first in place.
+        deliverTo fake 0 (at 2 0) 1 >>= (`shouldBe` EventStaged)
+        deliverTo fake 0 (at 2 1) 2 >>= (`shouldBe` EventStaged)
+        stepsQueued control owner 2
+        awaitLine fixture "update"
+        recorded ← linesOf fixture
+        -- The delivery ran, once, with the newest value, before the update that fell due behind it.
+        filter (\line → line == "update" || Text.isPrefixOf "got " line) recorded `shouldBe` ["got s n=2 seq=1 t=2", "update"]
 
   describe "overflow" $ do
     it "is decided at the boundary, in the order of the places: an ordered event the queue has no place for fails the instance, and its peer is untouched" $ bounded $ do
