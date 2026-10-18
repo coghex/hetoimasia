@@ -74,6 +74,15 @@ module Hetoimasia.Scripting.Lua.Scheduler.State
   , cadenceHeldBy
   , cadenceTakeNext
 
+    -- * Ticks that wait for the owner
+  , holdTickIn
+  , releaseTickIn
+  , tickHeld
+
+    -- * Waiting for a request
+  , requestWaitersOf
+  , wakeRequestWaiter
+
     -- * The owner's watch on a tick
   , watchKey
   , watchTickIn
@@ -185,6 +194,12 @@ data WaitRecord
       , waitStart ∷ !Instant
       , waitDeadline ∷ !Instant
       }
+  | -- | Waiting for a request to settle: the owner's number for it. Woken when the
+    -- owner says it has, never by a grant or a deadline.
+    RequestWait
+      { waitSequence ∷ !Word64
+      , waitRequest ∷ !Word64
+      }
 
 -- | What the scheduler adds to a task's model record.
 data TaskInfo = TaskInfo
@@ -251,6 +266,12 @@ data SchedState v = SchedState
   , ssNextGrant ∷ !Word64
   , ssLogical ∷ !(Map Word64 TaskId)
   , ssElapsed ∷ !(Map (Instant, Word64) TaskId)
+  , ssRequestWaiters ∷ !(Map Word64 TaskId)
+    -- ^ The tasks waiting for a request to settle, by the sequence their waits began in.
+  , ssGates ∷ !(Map Word64 Int)
+    -- ^ For each tick, how many things the owner needs complete before the tick begins. A
+    -- grant that would reach a tick with a positive count is not applied: nothing of the
+    -- tick has happened until the count is zero.
   , ssNextWait ∷ !Word64
   , ssCadenceLogical ∷ !(Map CadenceKey LogicalCadence)
   , ssCadenceElapsed ∷ !(Map CadenceKey ElapsedCadence)
@@ -301,6 +322,8 @@ initialState label session =
     , ssNextGrant = 0
     , ssLogical = Map.empty
     , ssElapsed = Map.empty
+    , ssRequestWaiters = Map.empty
+    , ssGates = Map.empty
     , ssNextWait = 0
     , ssCadenceLogical = Map.empty
     , ssCadenceElapsed = Map.empty
@@ -379,7 +402,7 @@ workPending state =
     || grantWaiting
   where
     grantWaiting = case Seq.viewl (ssGrants state) of
-      grant :< _ → not (grantApplied grant)
+      grant :< _ → not (grantApplied grant) && not (tickHeld (ssTick state + 1) state)
       EmptyL → False
 
 slotFree ∷ SchedState v → Bool
@@ -663,6 +686,10 @@ applyReport identity reading report state = case report of
           Right deadline →
             placeWait value (ElapsedWait sequenceNumber now deadline) $
               \placed → placed {ssElapsed = Map.insert (deadline, sequenceNumber) identity (ssElapsed placed)}
+  ReportWaitRequest value key →
+    placeWait value (RequestWait sequenceNumber key) $
+      \placed → placed {ssRequestWaiters = Map.insert sequenceNumber identity (ssRequestWaiters placed)}
+  ReportWaitRefused _ why → refuse why
   ReportFailed failure → (failTaskIn False identity failure state, [Failed identity failure])
   where
     sequenceNumber = ssNextWait state
@@ -707,6 +734,7 @@ refusalText = \case
   WaitTicksOverflow → "the tick it would end at is not representable"
   WaitDurationNotPositive → "an elapsed wait of no time"
   WaitDeadlineOverflow → "the deadline is not representable"
+  WaitRequestRefused → "a wait for a request the task cannot wait for"
 
 -- | Fail a live task, ending it with the failure as its result. A task failed
 -- while its continuation was suspended (a wait that was refused, a wait that
@@ -744,6 +772,8 @@ removeWaiter identity state = case Map.lookup identity (ssInfo state) >>= infoWa
     state {ssLogical = Map.delete sequenceNumber (ssLogical state)}
   Just ElapsedWait {waitSequence = sequenceNumber, waitDeadline = deadline} →
     state {ssElapsed = Map.delete (deadline, sequenceNumber) (ssElapsed state)}
+  Just RequestWait {waitSequence = sequenceNumber} →
+    state {ssRequestWaiters = Map.delete sequenceNumber (ssRequestWaiters state)}
   Nothing → state
 
 -- | The site an overrun of this task would be attributed to: its kind and entry
@@ -823,6 +853,9 @@ settleGrants ∷ SchedState v → (SchedState v, [Event])
 settleGrants state = case Seq.viewl (ssGrants state) of
   EmptyL → (state, [])
   grant :< rest
+    -- The tick this grant would reach does not begin while the owner needs something
+    -- complete before it: the grant waits, unapplied, and nothing of the tick happens.
+    | not (grantApplied grant) && tickHeld (ssTick state + 1) state → (state, [])
     | not (grantApplied grant) →
         let (applied, events) = applyHead grant state
             (settled, more) = settleGrants applied
@@ -888,6 +921,66 @@ wake identity earned cause state = case Map.lookup identity (ssInfo state) of
         (_, Left _) → cleared
   where
     cleared = removeWaiter identity state
+    dueTo woken = case cause of
+      Nothing → woken
+      Just (GrantId number) →
+        woken {ssGrants = Seq.adjust' (\grant → grant {grantDue = grantDue grant + 1}) (fromIntegral (number - firstOpen woken)) (ssGrants woken)}
+
+-- Ticks that wait for the owner ---------------------------------------------------
+
+-- | Whether the owner needs something complete before this tick begins.
+tickHeld ∷ Word64 → SchedState v → Bool
+tickHeld tick state = Map.findWithDefault 0 tick (ssGates state) > 0
+
+-- | The owner needs one more thing complete before this tick begins.
+holdTickIn ∷ Word64 → SchedState v → SchedState v
+holdTickIn tick state = state {ssGates = Map.insertWith (+) tick 1 (ssGates state)}
+
+-- | One thing the owner needed complete before this tick has completed, or can no longer
+-- be needed. Never below none: a tick with nothing left is not held.
+releaseTickIn ∷ Word64 → SchedState v → SchedState v
+releaseTickIn tick state = state {ssGates = Map.update lessen tick (ssGates state)}
+  where
+    lessen count
+      | count <= 1 = Nothing
+      | otherwise = Just (count - 1)
+
+-- Waiting for a request -----------------------------------------------------------
+
+-- | The tasks waiting for a request, with the owner's number for it, in the order their
+-- waits began. A task paused while it waited is not among them: it is not woken, and keeps
+-- its wait, until it is resumed.
+requestWaitersOf ∷ SchedState v → [(TaskId, Word64)]
+requestWaitersOf state =
+  [ (identity, request)
+  | (_, identity) ← Map.toAscList (ssRequestWaiters state)
+  , Just info ← [Map.lookup identity (ssInfo state)]
+  , not (infoHeld info)
+  , Just RequestWait {waitRequest = request} ← [infoWait info]
+  ]
+
+-- | Wake a task waiting for a request, behind the tasks already ready. It is handed nothing,
+-- and takes the claim on the grant the owner is serving, if one has been applied and has not
+-- finished: a wake at a tick's boundary belongs to that tick, so the tick does not finish, and
+-- the next one does not begin, before the woken task has run. A task that is not waiting for a
+-- request, and one that is paused, is left as it is.
+wakeRequestWaiter ∷ TaskId → SchedState v → SchedState v
+wakeRequestWaiter identity state = case Map.lookup identity (ssInfo state) of
+  Just info@TaskInfo {infoWait = Just RequestWait {}}
+    | not (infoHeld info) → case wakeTaskIn identity (ssSession state) of
+        (session, Right ()) →
+          dueTo
+            cleared
+              { ssSession = session
+              , ssInfo = Map.insert identity info {infoWait = Nothing, infoResume = Nothing, infoDue = cause} (ssInfo cleared)
+              }
+        (_, Left _) → state
+  _ → state
+  where
+    cleared = removeWaiter identity state
+    cause = case Seq.viewl (ssGrants state) of
+      grant :< _ | grantApplied grant → Just (GrantId (firstOpen state))
+      _ → Nothing
     dueTo woken = case cause of
       Nothing → woken
       Just (GrantId number) →

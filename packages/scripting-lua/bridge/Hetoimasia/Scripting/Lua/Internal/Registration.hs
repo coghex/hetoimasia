@@ -25,7 +25,10 @@
 -- answer values; a command or UI intention answers acceptance or a bounded
 -- rejection as data; an asynchronous native request is accepted and classified by
 -- the registration, and a call to one is refused by the owner as not yet supported
--- (decision A1). A lifecycle operation is classified too, and is refused the same
+-- (decision A1) unless the owner was configured with a request service (LUA-7), in
+-- which case its action runs and is handed what the owner was configured with: the
+-- engine-owned 'RequestContext', never anything the script supplied. A lifecycle
+-- operation is classified too, and is refused the same
 -- way by an owner that is not granted lifecycle services; an owner that is (LUA-23)
 -- runs its action, handing it what the owner was configured with: the engine-owned
 -- 'LifecycleContext', never anything the script supplied. The kind that starts
@@ -66,6 +69,10 @@ module Hetoimasia.Scripting.Lua.Internal.Registration
   , LifecycleContext
   , lifecycleContext
   , fromLifecycleContext
+  , asynchronousNativeRequestIn
+  , RequestContext
+  , requestContext
+  , fromRequestContext
   , confinedEligible
   , finalizerEligible
   , withoutDirectPath
@@ -146,6 +153,10 @@ data WaitKind
     WaitElapsed
   | -- | A logical tick.
     WaitLogical
+  | -- | The settlement of a request: the wait's first argument is the request's
+    -- handle. Delivered only by an owner configured with a 'RequestContext'; anywhere
+    -- else a call to it is refused as not yet supported.
+    WaitSettlement
   deriving (Bounded, Enum, Eq, Ord, Show)
 
 -- | What a scheduler operation does when a task calls it.
@@ -177,10 +188,10 @@ data Action
   = -- | A snapshot query or an owned state operation: values in, values out.
     ValuesAction ([Value] → IO [Value])
   | CommandAction ([Value] → IO CommandResult)
-  | -- | A kind this slice classifies and does not deliver. The action is kept
-    -- for the slice that will, and is never run: a Lua call to the binding is
-    -- refused as not yet supported before anything else happens.
-    ReservedAction ([Value] → IO [Value])
+  | -- | An asynchronous native request: refused as not yet supported, and never
+    -- run, by an owner configured with no 'RequestContext'; run, with the owner's
+    -- own context, by one that has it. See 'asynchronousNativeRequestIn'.
+    RequestAction (RequestContext → [Value] → IO [Value])
   | -- | A lifecycle operation: refused as not yet supported, and never run, by an
     -- owner configured with no 'LifecycleContext'; run, with the owner's own
     -- context, by one that has it.
@@ -226,11 +237,24 @@ commandIntention ∷ Text → [Schema] → ([Value] → IO CommandResult) → Bi
 commandIntention name arguments action =
   Binding name CommandOrUiIntention arguments commandResults True False False (CommandAction action)
 
--- | An asynchronous native request: accepted and classified; a Lua call to it is
--- refused as not yet supported, and the action is never run.
+-- | An asynchronous native request: accepted and classified. A Lua call to it is
+-- refused as not yet supported, and the action never runs, from an owner that was
+-- configured with no 'RequestContext'; from one that was, the action runs, as a
+-- values action does. The action is shared by every owner that registers it, so it
+-- learns whose request service it is serving from 'asynchronousNativeRequestIn' and
+-- not from anything here.
 asynchronousNativeRequest ∷ Text → [Schema] → [Schema] → ([Value] → IO [Value]) → Binding
-asynchronousNativeRequest name arguments results action =
-  Binding name AsynchronousNativeRequest arguments results True False False (ReservedAction action)
+asynchronousNativeRequest name arguments results action = asynchronousNativeRequestIn name arguments results (const action)
+
+-- | An asynchronous native request whose action is handed the 'RequestContext' of
+-- the owner whose script called it. The context is the owner's own, set when the
+-- owner was made and read here by the engine, never taken from a value the script
+-- supplied: one registration, shared by owners with different request services,
+-- tells them apart by it. Never eligible for a finalizer: it starts asynchronous
+-- work. Otherwise as 'asynchronousNativeRequest'.
+asynchronousNativeRequestIn ∷ Text → [Schema] → [Schema] → (RequestContext → [Value] → IO [Value]) → Binding
+asynchronousNativeRequestIn name arguments results action =
+  Binding name AsynchronousNativeRequest arguments results True False False (RequestAction action)
 
 -- | A lifecycle operation: accepted and classified. A Lua call to it is refused as
 -- not yet supported, and the action never runs, from an owner that was configured
@@ -266,6 +290,24 @@ lifecycleContext = LifecycleContext . toDyn
 -- | The value a context holds, if it is of this type.
 fromLifecycleContext ∷ Typeable a ⇒ LifecycleContext → Maybe a
 fromLifecycleContext (LifecycleContext held) = fromDynamic held
+
+-- | What an owner is configured with so that its asynchronous native requests are
+-- delivered: an opaque value of the application's runtime, which this host library
+-- never reads. An owner that has none refuses an asynchronous request as not yet
+-- supported. A client of this library can read one back only as the type it was made
+-- from ('fromRequestContext').
+newtype RequestContext = RequestContext Dynamic
+
+instance Show RequestContext where
+  show _ = "<request context>"
+
+-- | A context holding this value.
+requestContext ∷ Typeable a ⇒ a → RequestContext
+requestContext = RequestContext . toDyn
+
+-- | The value a context holds, if it is of this type.
+fromRequestContext ∷ Typeable a ⇒ RequestContext → Maybe a
+fromRequestContext (RequestContext held) = fromDynamic held
 
 -- | An explicit release of a capability the application hands its scripts: the
 -- release operation of a handle type, named, declared with the one capability type

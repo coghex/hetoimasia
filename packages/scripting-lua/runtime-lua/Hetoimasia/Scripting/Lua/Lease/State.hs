@@ -106,6 +106,7 @@ module Hetoimasia.Scripting.Lua.Lease.State
   , retirementsReady
   , renderCaught
   , guarded
+  , pollObligation
   , anyPending
   , noteScope
   , readScope
@@ -115,15 +116,13 @@ import Control.Concurrent.STM
   ( STM
   , TVar
   , atomically
-  , catchSTM
   , modifyTVar'
   , newTVarIO
-  , orElse
   , readTVar
   , retry
   , writeTVar
   )
-import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, evaluate, fromException, mask_, someExceptionContext, throwIO, try, tryWithContext)
+import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, evaluate, fromException, mask_, throwIO, try)
 import Control.Monad (forM, when)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List.NonEmpty (NonEmpty)
@@ -142,6 +141,7 @@ import Hetoimasia.Foundation.Resource.OwnedCollection
   , retireOwnedMember
   )
 import Hetoimasia.Scripting.Lua.Lending.Loan (Lending)
+import Hetoimasia.Scripting.Lua.Retention
 
 -- The handle ----------------------------------------------------------------------
 
@@ -193,24 +193,8 @@ data Ownership
     ApplicationOwned
   deriving (Eq, Show)
 
--- | Where a provider's retirement of a resource has got to.
-data RetirementState
-  = -- | The provider has not finished.
-    ProviderPending
-  | -- | The provider has proved the resource retired.
-    ProviderComplete
-  | -- | The provider could not retire it. The failure is cleanup evidence.
-    ProviderFailed !SomeException
-
 -- | A held resource, typed so that only a borrower that asks for its type gets it.
 data Holding = ∀ a. Typeable a ⇒ Holding !(Member a)
-
--- | A retirement a provider has yet to complete, charged to a slot.
-data Obligation = Obligation
-  { obligationLabel ∷ !Text
-  , obligationState ∷ STM RetirementState
-    -- ^ The provider's own reading. It must not retry.
-  }
 
 -- | Where a slot is in its life.
 data SlotPhase
@@ -233,11 +217,10 @@ data Slot = Slot
   , slotOwnership ∷ !Ownership
   , slotPhase ∷ !SlotPhase
   , slotHolding ∷ !(Maybe Holding)
-  , slotObligations ∷ ![Obligation]
-  , slotDeferred ∷ ![IO ()]
-    -- ^ Disposals of what the pending retirements need, handed over by the assembly's
-    -- releases: run, in order, once every one of them has completed, and never if one
-    -- fails.
+  , slotRetained ∷ !Retained
+    -- ^ The retirements it awaits, and the disposals of what they need, handed over by the
+    -- assembly's releases: run, in order, once every one of them has completed, and never
+    -- if one fails.
   }
 
 -- | An instance's scope.
@@ -354,7 +337,7 @@ reserve leases number ownership = do
           let key = lsNext state
           writeTVar (leasesState leases) state
             { lsNext = key + 1
-            , lsSlots = Map.insert key (Slot number ownership SlotConstructing Nothing [] []) (lsSlots state)
+            , lsSlots = Map.insert key (Slot number ownership SlotConstructing Nothing noRetained) (lsSlots state)
             }
           pure (Right key)
       where
@@ -377,7 +360,7 @@ abandon leases key =
   where
     undo slot = case slotPhase slot of
       SlotConstructing
-        | null (slotObligations slot) → Nothing
+        | not (retainedPending (slotRetained slot)) → Nothing
         | otherwise → Just slot {slotPhase = SlotReleased}
       _ → Just slot
 
@@ -390,7 +373,7 @@ recordRetirement leases key label poll =
     let obligation = Obligation label poll
      in case Map.lookup key (lsSlots state) of
           Just slot →
-            state {lsSlots = Map.insert key slot {slotObligations = slotObligations slot <> [obligation]} (lsSlots state)}
+            state {lsSlots = Map.insert key slot {slotRetained = retain obligation (slotRetained slot)} (lsSlots state)}
           Nothing → state {lsOrphans = lsOrphans state <> [obligation]}
 
 -- | Hand a disposal to the slot's pending retirements: it is kept until every one of
@@ -400,12 +383,11 @@ deferDisposal ∷ Leases → Word64 → IO () → STM (Maybe (IO ()))
 deferDisposal leases key disposal = do
   state ← readTVar (leasesState leases)
   case Map.lookup key (lsSlots state) of
-    Just slot | not (null (slotObligations slot)) → do
-      writeTVar (leasesState leases) state
-        { lsSlots = Map.insert key slot {slotDeferred = slotDeferred slot <> [disposal]} (lsSlots state)
-        }
-      pure Nothing
-    _ → pure (Just disposal)
+    Just slot → do
+      let (held, now) = defer disposal (slotRetained slot)
+      writeTVar (leasesState leases) state {lsSlots = Map.insert key slot {slotRetained = held} (lsSlots state)}
+      pure now
+    Nothing → pure (Just disposal)
 
 -- Reading ------------------------------------------------------------------------------
 
@@ -450,7 +432,7 @@ summarize leases number = do
     ScopeSummary
       { summaryLive = length live
       , summaryConstructing = length constructing
-      , summaryPending = sum (map (length . slotObligations) mine)
+      , summaryPending = sum (map (length . retainedObligations . slotRetained) mine)
       , summaryCharged = length mine
       , summaryCapacity = leasesCapacity leases
       , summaryFailures = length failed + maybe 0 scopeFailed (Map.lookup number (lsScopes state))
@@ -460,7 +442,7 @@ summarize leases number = do
 pendingFor ∷ Leases → Word64 → STM Int
 pendingFor leases number = do
   state ← readTVar (leasesState leases)
-  pure (sum [length (slotObligations slot) | slot ← Map.elems (lsSlots state), slotInstance slot == number])
+  pure (sum [length (retainedObligations (slotRetained slot)) | slot ← Map.elems (lsSlots state), slotInstance slot == number])
 
 -- | An instance's scope, while it has one.
 readScope ∷ Leases → Word64 → STM (Maybe Scope)
@@ -542,7 +524,7 @@ endRelease leases key outcome = do
           }
         pure (EndedFailed failure)
       Right () → do
-        let pending = not (null (slotObligations slot))
+        let pending = retainedPending (slotRetained slot)
         writeTVar (leasesState leases) state
           { lsSlots =
               if pending
@@ -659,23 +641,26 @@ serviceRetirements ∷ Leases → STM ([RetirementEnd], [Disposals])
 serviceRetirements leases = do
   state ← readTVar (leasesState leases)
   swept ← forM (Map.toList (lsSlots state)) $ \(key, slot) → do
-    (remaining, ended) ← sweepList (slotObligations slot)
-    let failed = [failure | (_, Just failure) ← ended]
+    (retained, finished', due) ← sweep (isFailed (slotPhase slot)) (slotRetained slot)
+    let ended = [(finishedLabel done, finishedFailure done) | done ← finished']
+        remaining = retainedObligations retained
+        failed = [failure | (_, Just failure) ← ended]
         phase' = case (slotPhase slot, failed) of
           (SlotFailed existing, _) → SlotFailed existing
           (_, failure : _) → SlotFailed failure
           (phase, []) → phase
-        slot' = slot {slotObligations = remaining, slotPhase = phase'}
+        slot' = slot {slotRetained = retained, slotPhase = phase'}
         finished = null remaining && isReleased phase'
         completions = [RetirementEnd (Just (slotInstance slot)) label failure | (label, failure) ← ended]
         -- A slot with nothing left to wait for and no failure gives its disposals up, and is
         -- kept until they have been run.
-        disposing = null remaining && null failed && not (isFailed (slotPhase slot)) && not (null (slotDeferred slot))
-        disposals = [Disposals key (slotInstance slot) (slotDeferred slot) | disposing]
-        slot'' = if disposing then slot' {slotDeferred = []} else slot'
+        disposing = not (null due)
+        disposals = [Disposals key (slotInstance slot) due | disposing]
+        slot'' = slot'
     pure ((key, if finished && not disposing then Nothing else Just slot''), completions, disposals)
-  (orphans, endedOrphans) ← sweepList (lsOrphans state)
-  let ended = concat [completions | (_, completions, _) ← swept] <> [RetirementEnd Nothing label failure | (label, failure) ← endedOrphans]
+  (orphans, endedOrphans') ← pollAll (lsOrphans state)
+  let endedOrphans = [(finishedLabel done, finishedFailure done) | done ← endedOrphans']
+      ended = concat [completions | (_, completions, _) ← swept] <> [RetirementEnd Nothing label failure | (label, failure) ← endedOrphans]
   writeTVar (leasesState leases) state
     { lsSlots = Map.fromList [(key, slot) | ((key, Just slot), _, _) ← swept]
     , lsOrphans = orphans
@@ -694,45 +679,6 @@ serviceRetirements leases = do
     isFailed = \case
       SlotFailed _ → True
       _ → False
-    sweepList obligations = do
-      polled ← forM obligations $ \obligation → do
-        reading ← pollObligation obligation
-        pure $ case reading of
-          ProviderPending → Left obligation
-          ProviderComplete → Right (obligationLabel obligation, Nothing)
-          ProviderFailed failure → Right (obligationLabel obligation, Just (ExceptionWithContext (someExceptionContext failure) failure))
-      pure ([obligation | Left obligation ← polled], [ended | Right ended ← polled])
-
--- | Ask a provider where its retirement has got to, as a retirement and nothing else can
--- fail it. The provider's reading is application code and may throw, when it is run or
--- when what it answered is evaluated: either is the retirement failing, and is how it is
--- retained, as cleanup evidence, while the others go on being served and awaited. The
--- reading is evaluated, as far as anything later inspects it, inside the guard that
--- catches what it throws. A reading that retries says it is not done.
---
--- This is the one place a provider's reading is run: servicing and the wait for readiness
--- both read through it.
-pollObligation ∷ Obligation → STM RetirementState
-pollObligation obligation =
-  (reading `catchSTM` \failure → pure (ProviderFailed (failure ∷ SomeException)))
-    `orElse` pure ProviderPending
-  where
-    reading = obligationState obligation >>= evaluated
-    -- The constructor is evaluated here, with the failure it carries (a strict field): all
-    -- that servicing and readiness go on to inspect.
-    evaluated state = case state of
-      ProviderPending → pure state
-      ProviderComplete → pure state
-      ProviderFailed failure → failure `seq` pure state
-
--- | Run a call into provider or application code during retirement or teardown, answering
--- the failure it raised, with its context, instead of raising it, and evaluating what it
--- answered inside the same guard: a value that throws when it is first inspected is the
--- call failing, not an exception loose in whatever inspects it. Every such call that is
--- run on the owner's behalf goes through here, so that a failure is evidence and not a
--- reason to stop serving the others.
-guarded ∷ IO a → IO (Either (ExceptionWithContext SomeException) a)
-guarded action = tryWithContext @SomeException (action >>= evaluate)
 
 -- | An exception as the bounded line a settlement keeps. Rendering is the exception's
 -- own code, which may throw as well: that is rendered too, not raised.
@@ -749,7 +695,7 @@ renderCaught (ExceptionWithContext _ raised) = do
 retirementsReady ∷ Leases → STM ()
 retirementsReady leases = do
   state ← readTVar (leasesState leases)
-  let pending = concatMap slotObligations (Map.elems (lsSlots state)) <> lsOrphans state
+  let pending = concatMap (retainedObligations . slotRetained) (Map.elems (lsSlots state)) <> lsOrphans state
   readings ← forM pending pollObligation
   when (null [() | reading ← readings, finished reading]) retry
   where
@@ -761,4 +707,4 @@ retirementsReady leases = do
 anyPending ∷ Leases → STM Bool
 anyPending leases = do
   state ← readTVar (leasesState leases)
-  pure (any (not . null . slotObligations) (Map.elems (lsSlots state)) || not (null (lsOrphans state)))
+  pure (any (retainedPending . slotRetained) (Map.elems (lsSlots state)) || not (null (lsOrphans state)))

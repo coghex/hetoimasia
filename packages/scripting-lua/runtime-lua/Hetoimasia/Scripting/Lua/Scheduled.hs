@@ -338,7 +338,7 @@ import Hetoimasia.Scripting.Lua.Instance.Types
   , newInstances
   , validateInstanceConfig
   )
-import Hetoimasia.Scripting.Lua.Owner (ModuleRef (moduleRefName), VmConfig (vmLifecycle, vmModules, vmOwnerName, vmPolicy, vmRegistration, vmValueLimits))
+import Hetoimasia.Scripting.Lua.Owner (ModuleRef (moduleRefName), VmConfig (vmLifecycle, vmModules, vmOwnerName, vmPolicy, vmRegistration, vmRequests, vmValueLimits))
 import Hetoimasia.Scripting.Lua.Registration (registration, registrationCapabilityTypes, registrationNamespaces)
 import Hetoimasia.Scripting.Lua.Runtime.Shared
 import Hetoimasia.Scripting.Lua.Runtime.Types
@@ -350,6 +350,9 @@ import Hetoimasia.Scripting.Lua.Runtime.Types
   , ownerSequence
   )
 import Hetoimasia.Scripting.Lua.Lease.State (LeasesRefused (LeasesRefused), LeasesViolation (..), Leases (leasesCapacity, leasesLending), bindLeasesHandle)
+import Hetoimasia.Scripting.Lua.Provider.State (newProviderState, validateGrant)
+import Hetoimasia.Scripting.Lua.Provider.Types (RequestGrant, RequestGrantRefused (RequestGrantRefused), Ticks (..))
+import Hetoimasia.Scripting.Lua.Request (requestContextOf)
 import Hetoimasia.Scripting.Lua.Lending.Loan (Lending, bindLending, sameLending)
 import Hetoimasia.Scripting.Lua.Scheduled.Run (runScheduledOwner)
 import Hetoimasia.Scripting.Lua.Scheduled.Types
@@ -368,23 +371,32 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , Overrun (..)
   , Policy (..)
   , Resume (..)
+  , Scheduler
   , SchedulerBounds (..)
   , SchedulerConfig (..)
   , SchedulerRefused (..)
   , TaskKind (..)
+  , TaskPhase (PhaseEnded)
   , TaskSpec (..)
   , TimerBackend
   , admitTask
   , awaitStepsComplete
   , fifoPolicy
   , grantStep
+  , holdTick
   , newScheduler
   , readDiagnostics
   , readTick
+  , releaseTick
   , requestControl
+  , requestWaiting
   , schedulerClosed
   , stepsOutstanding
   , systemTimerBackend
+  , taskPhase
+  , wakeRequestWaiters
+  , wakeRequestWaitersOrdered
+  , watchTick
   )
 
 -- | What one scheduled owner is created from.
@@ -429,12 +441,16 @@ data ScheduledSpec = ScheduledSpec
     -- owners they cover and what each permits. 'Nothing', the default, leaves every
     -- lifecycle operation refused as not yet supported. See
     -- "Hetoimasia.Scripting.Lua.Lifecycle".
+  , scheduledRequests ∷ Maybe RequestGrant
+    -- ^ The asynchronous requests the owner's scripts may make of providers, and when their
+    -- settlements reach Lua. 'Nothing', the default, leaves every asynchronous request, and a
+    -- wait for one, refused as not yet supported. See "Hetoimasia.Scripting.Lua.Provider".
   }
 
 -- | A configuration with the supplied defaults: the FIFO policy, the production
 -- clock and timer, the gameplay domain, nothing observing segments, no lending
--- handle, room for 'defaultMemberLimit' members when there is one, and no
--- lifecycle grant.
+-- handle, room for 'defaultMemberLimit' members when there is one, no
+-- lifecycle grant and no request service.
 scheduledSpec ∷ VmConfig → WorkerPolicy → SchedulerBounds → ScheduledSpec
 scheduledSpec config worker bounds =
   ScheduledSpec
@@ -451,6 +467,7 @@ scheduledSpec config worker bounds =
     , scheduledLeases = Nothing
     , scheduledMemberLimit = defaultMemberLimit
     , scheduledLifecycle = Nothing
+    , scheduledRequests = Nothing
     }
 
 -- | How many live members an owner's collection holds by default.
@@ -553,7 +570,13 @@ startScheduledOwner runtime spec = do
   faults ← newTVarIO Map.empty
   begun ← newTVarIO mempty
   exited ← newTVarIO Nothing
-  let bare = Control owner label (vmValueLimits config) scheduler cells faults begun closing exited stopping ownInstances Nothing
+  -- A request service is granted against the endpoints it names before anything starts, and
+  -- refused naming every reason.
+  provider ← forM (scheduledRequests spec) $ \grant →
+    case validateGrant grant of
+      Right endpoints → newProviderState owner label scope (vmValueLimits config) grant endpoints (ticksFor scheduler stopping) ownInstances
+      Left refused → throwFailure runtimeComponent (operation "start-scheduled-owner") [] (RequestGrantRefused refused)
+  let bare = Control owner label (vmValueLimits config) scheduler cells faults begun closing exited stopping ownInstances Nothing provider
   -- A lifecycle grant is resolved against the owners it names before anything starts, and
   -- refused naming every reason.
   lifecycle ← forM (scheduledLifecycle spec) $ \grant →
@@ -577,7 +600,7 @@ startScheduledOwner runtime spec = do
                 -- everything that already ended the owner has done this.
                 (\held → atomically (settleAll held ExitFailed))
           )
-          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) (fmap (\(_, instanceConfig, _) → instanceEscalate instanceConfig) hosted) (scheduledLending spec) (scheduledLeases spec) (scheduledMemberLimit spec) config {vmLifecycle = lifecycleContextOf <$> lifecycle})
+          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) (fmap (\(_, instanceConfig, _) → instanceEscalate instanceConfig) hosted) (scheduledLending spec) (scheduledLeases spec) (scheduledMemberLimit spec) config {vmLifecycle = lifecycleContextOf <$> lifecycle, vmRequests = requestContextOf <$> provider})
   -- Acquisition is masked from the worker's start to the endpoint's handoff, and
   -- only the readiness wait is restored, exactly as for a finite-call owner.
   mask $ \restore → do
@@ -599,6 +622,32 @@ startScheduledOwner runtime spec = do
       atomically (workerStatus worker) >>= \case
         WorkerUnavailable failure → pure (ScheduledUnavailable failure)
         _ → pure ScheduledEnded
+
+-- | What a request service needs of the owner's scheduler, and nothing more: the tick, the
+-- hold a request puts on its due tick, the owner's watch on it, whether producers are admitted,
+-- whether a task is gone, and waking the tasks that wait for a request.
+ticksFor ∷ Scheduler Cursor → STM Bool → Ticks
+ticksFor scheduler stopping =
+  Ticks
+    { ticksNow = readTick scheduler
+    , ticksHold = holdTick scheduler
+    , ticksRelease = releaseTick scheduler
+    , ticksWatch = watchTick scheduler
+    , ticksOpen = do
+        closed ← schedulerClosed scheduler
+        asked ← stopping
+        pure (not closed && not asked)
+    , ticksTaskGone = \task →
+        taskPhase scheduler task <&> \case
+          Nothing → True
+          Just (PhaseEnded _) → True
+          Just _ → False
+    , ticksWaiting = requestWaiting scheduler
+    , ticksWakeSettled = wakeRequestWaiters scheduler
+    , ticksWakeOrdered = wakeRequestWaitersOrdered scheduler
+    }
+  where
+    (<&>) = flip fmap
 
 -- | The owner's identity.
 scheduledIdentity ∷ ScheduledOwner → OwnerId

@@ -15,6 +15,7 @@ module Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Failure
 
 import qualified Data.Map.Strict as Map
 import qualified Data.Sequence as Seq
+import qualified Data.Set as Set
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Failure (RecoverySafety (RecoveryUnsafe))
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Request (CancelCause (CancelledBySessionFailure))
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Revocation (retire, revocableRequests, revokeOne)
@@ -172,6 +173,7 @@ invalidateEverything session =
       { sessionAdmission = closedAdmission
       , sessionTasks = Map.filter (isTerminal . taskState) (sessionTasks session)
       , sessionQueued = Seq.empty
+      , sessionHolders = Set.empty
       , sessionSubscriptions = Map.empty
       , sessionReservations =
           sessionReservations session - Map.size live - Seq.length (sessionQueued session)

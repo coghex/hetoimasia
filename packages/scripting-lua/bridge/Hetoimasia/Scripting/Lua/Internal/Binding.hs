@@ -44,7 +44,7 @@ module Hetoimasia.Scripting.Lua.Internal.Binding
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, catch, evaluate, fromException, toException)
 import Control.Monad (foldM, forM_, unless, when)
 import Data.List (nub)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Text (Text)
 import Data.Text.Unsafe (lengthWord8)
 import qualified Data.Text as Text
@@ -173,16 +173,26 @@ valueHandler boundary vm space binding state restore = do
   -- call is never delivered, whatever the owner has, since nothing a finalizer runs
   -- may reach the application's lifecycle. Anything else of a reserved kind is
   -- refused as not yet supported, with its action never run.
-  let delivered = case (bindingAction binding, boundaryLifecycle boundary) of
-        (LifecycleAction run, Just lifecycle) | not (bindingFinalizer binding) → ValuesAction (run lifecycle)
-        (other, _) → other
+  --
+  -- An asynchronous request is delivered the same way, by an owner configured with the
+  -- context that delivers it, and so is a wait for one's settlement: the host reports it
+  -- to whatever resumed the task, and only an owner with a request service has anything
+  -- to resume it.
+  let delivered = case (bindingAction binding, boundaryLifecycle boundary, boundaryRequests boundary) of
+        (LifecycleAction run, Just lifecycle, _) | not (bindingFinalizer binding) → ValuesAction (run lifecycle)
+        (RequestAction run, _, Just requests) | not (bindingFinalizer binding) → ValuesAction (run requests)
+        (other, _, _) → other
   case delivered of
-    ReservedAction _ → do
+    RequestAction _ → do
       effect ← current
       faulted (NotYetSupported (bindingKind binding)) effect
     LifecycleAction _ → do
       effect ← current
       faulted (NotYetSupported (bindingKind binding)) effect
+    SuspendAction (SuspendWait WaitSettlement)
+      | isNothing (boundaryRequests boundary) → do
+          effect ← current
+          faulted (NotYetSupported (bindingKind binding)) effect
     action → do
       -- A scheduler operation is refused first, wherever it cannot reach the
       -- scheduler, before anything of its arguments is read.

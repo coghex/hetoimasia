@@ -52,7 +52,7 @@ module Hetoimasia.Scripting.Lua.Scheduled.Run
   ( runScheduledOwner
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', orElse, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', orElse, retry, writeTVar)
 import Control.Applicative ((<|>))
 import Control.Exception
   ( ExceptionWithContext (ExceptionWithContext)
@@ -118,6 +118,7 @@ import Hetoimasia.Scripting.Lua.Instance.Run
   , InstanceHost (ihMode)
   , awaitInstanceWork
   , cleanupEndedOwner
+  , endOwner
   , instanceClosed
   , instanceSegment
   , newInstanceHost
@@ -129,7 +130,10 @@ import Hetoimasia.Scripting.Lua.Instance.Run
   , settleEnded
   )
 import Hetoimasia.Scripting.Lua.Instance.Types (Escalation, InstanceFailure)
-import Hetoimasia.Scripting.Lua.Scheduled.Shared (closeSuspended, exitOf, settledOrRaise, waitReport)
+import Hetoimasia.Scripting.Lua.Provider.Serve (providerBoundary, providerWork, retireProvider)
+import Hetoimasia.Scripting.Lua.Provider.State (markClosing, unmarkClosing)
+import Hetoimasia.Scripting.Lua.Provider.Types (ProviderState (psTask), Requester (RequesterTask))
+import Hetoimasia.Scripting.Lua.Scheduled.Shared (closeSuspended, exitOf, settledOrRaise, waitReportFor)
 import Hetoimasia.Scripting.Lua.Lifecycle.State (LifecycleState (lifeTask))
 import Hetoimasia.Scripting.Lua.Scheduled.Types
 import Hetoimasia.Scripting.Lua.Scheduler
@@ -221,7 +225,7 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
     writeIORef handlesRef handles
     forM_ ((,) <$> controlInstances control <*> escalate) $ \(instances, decide) →
       forM_ (Map.lookup driverRef handles) $ \driver →
-        newInstanceHost control instances decide host owned driver handlesRef tasks extra leaseHost >>= writeIORef instanceRef . Just
+        newInstanceHost control instances decide host owned driver handlesRef tasks extra leaseHost (controlProvider control) >>= writeIORef instanceRef . Just
     atomically (writeTVar handoff (Just control))
     loop host kept extra instanceRef
   -- The owner is exiting, however it was asked to or made to. Admission, grants
@@ -285,6 +289,14 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
   retired ← case heldInstances of
     Nothing → pure (Right ())
     Just ih → tryWithContext @SomeException (retireInstances ih)
+  -- The owner's requests end with it: every one still held is revoked, the providers are told,
+  -- and the owner waits, uninterruptibly, for each to prove its work over before the VM, and
+  -- what its work needed, are let go.
+  providerEnd ← forM (controlProvider control) $ \service → tryWithContext @SomeException (retireProvider service)
+  let (providerTold, providerCleanup) = case providerEnd of
+        Just (Right ended) → ended
+        Just (Left failure) → ([failure], [])
+        Nothing → ([], [])
   earlier ← readIORef kept
   others ← readIORef extra
   let closeFailures =
@@ -301,7 +313,12 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
         | Left failure@(ExceptionWithContext _ raised) ← [stopped]
         , show raised `notElem` recorded
         ]
-      primary = either Just (const Nothing) served <|> either Just (const Nothing) retired
+      earlierPrimary = either Just (const Nothing) served <|> either Just (const Nothing) retired
+      -- A provider that raised when told is a failure of the host: the first is the owner's
+      -- if nothing failed before it, and every other is kept whole as evidence.
+      (primary, providerEvidence) = case (earlierPrimary, providerTold) of
+        (Nothing, first : rest) → (Just first, [("lua request cancel", other) | other ← rest])
+        (_, told) → (earlierPrimary, [("lua request cancel", other) | other ← told])
       -- What retiring the instances raised, when the owner had failed already: the owner's
       -- failure is the primary, and this is evidence beside it, not lost.
       retirement = [("lua instance retirement", failure) | Left failure ← [retired], isLeft served]
@@ -311,6 +328,8 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
       ( interruption
           <> timerEvidence
           <> others
+          <> providerEvidence
+          <> providerCleanup
           <> retirement
           <> [("lua task close", ExceptionWithContext (someExceptionContext failure) failure) | (_, failure) ← closeFailures]
       )
@@ -319,19 +338,29 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
     identity = vmIdentity (ownedInternalVm owned)
     label = vmOwnerName config
     scheduler = controlScheduler control
+    provider = controlProvider control
+    -- What an owner with a request service waits for beside its scheduler's work: a task whose
+    -- request has settled, a provider's account that is no longer pending, disposals to run.
+    requestWork = maybe retry providerWork provider
     -- Serve until a stop is requested, or until a turn reports a failure of
     -- cleanup: answers whether it was the latter.
     loop host kept extra instanceRef = do
       instances ← readIORef instanceRef
       atomically $ case instances of
-        Nothing → awaitWork scheduler
-        Just ih → awaitWork scheduler `orElse` awaitInstanceWork ih
+        Nothing → awaitWork scheduler `orElse` requestWork
+        Just ih → awaitWork scheduler `orElse` awaitInstanceWork ih `orElse` requestWork
       forM_ instances serviceInstances
       -- At each boundary, after the scheduler's work there, the owner accounts for
       -- what ended, looks at what its instances were asked and tries again what the
       -- scheduler had no room for, unless it was asked to stop itself, in which case
-      -- its exit settles it.
-      let atBoundary = maybe (pure False) serviceBoundary instances
+      -- its exit settles it. Its requests are looked at after that: the tasks whose
+      -- requests have settled are woken, the providers' accounts are polled, and the
+      -- requesters whose tasks are gone are ended.
+      let atBoundary = do
+            instanceStep ← maybe (pure False) serviceBoundary instances
+            requestStep ← forM provider $ \service →
+              providerBoundary service scheduler (isJust instances) extra (forM_ instances endOwner)
+            pure (instanceStep || or requestStep)
       report ← serviceTurnWith atBoundary scheduler host
       forM_ instances settleEnded
       mask_ $ do
@@ -345,7 +374,13 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
 
 -- | Close a task's coroutine as the task, and as its instance if it is an invocation of one.
 closeAs ∷ Control → Maybe InstanceHost → TaskId → IO a → IO a
-closeAs control instances task action = withTaskNoted control task (maybe action (\ih → runningTask ih task action) instances)
+closeAs control instances task action = closing (withTaskNoted control task (maybe action (\ih → runningTask ih task action) instances))
+  where
+    -- The closing handlers run after the stop began: the task is not taking requests while
+    -- they do, as an instance that is stopping is not. Every close of a coroutine is this one.
+    closing run = case controlProvider control of
+      Nothing → run
+      Just service → (atomically (markClosing service task) >> run) `finally` atomically (unmarkClosing service task)
 
 -- | The handle of a module the configuration loaded.
 resolve ∷ OwnedVm → ModuleRef → IO (Maybe (ModuleRef, ModuleHandle))
@@ -355,11 +390,14 @@ resolve owned ref = fmap ((,) ref) <$> loadedModule owned ref
 -- who a call is from by: set by the owner's own thread, and cleared however it ends. A segment
 -- is run so, and so is the closing of a coroutine, which runs the script's own closing handlers.
 withTaskNoted ∷ Control → TaskId → IO a → IO a
-withTaskNoted control task action = case controlLifecycle control of
-  Nothing → action
-  Just lifecycle → do
-    atomically (writeTVar (lifeTask lifecycle) (Just task))
-    action `finally` atomically (writeTVar (lifeTask lifecycle) Nothing)
+withTaskNoted control task action
+  | Nothing ← controlLifecycle control, Nothing ← controlProvider control = action
+  | otherwise = do
+      let note value = do
+            forM_ (controlLifecycle control) $ \lifecycle → writeTVar (lifeTask lifecycle) value
+            forM_ (controlProvider control) $ \service → writeTVar (psTask service) value
+      atomically (note (Just task))
+      action `finally` atomically (note Nothing)
 
 -- | Run one segment of a task: start it, or resume it, and say how it ended.
 --
@@ -439,7 +477,7 @@ runSegment control observe owned identity label handlesRef tasks extra instanceR
         modifyIORef' tasks (Map.delete (runTask run))
         pure (ReportCompleted (Finished (Returned values)))
       Yielded → pure (ReportYielded Suspended)
-      Waiting request → pure (waitReport Suspended request)
+      Waiting request → waitReportFor (controlProvider control) (RequesterTask (runTask run)) Suspended request
     refusedArguments ref entry rule =
       BoundaryFault
         { boundaryOwner = label

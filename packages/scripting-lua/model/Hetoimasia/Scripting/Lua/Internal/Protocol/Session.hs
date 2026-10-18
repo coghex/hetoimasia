@@ -137,8 +137,14 @@ module Hetoimasia.Scripting.Lua.Internal.Protocol.Session
 
     -- * Requests
   , acceptRequest
+  , issueHolder
+  , acceptRequestFor
+  , endHolder
+  , holderLive
+  , withdrawRequest
   , applyReplyIn
   , cancelRequestIn
+  , cancelRequestWith
   , observeRequestIn
   , completeProviderWorkIn
 
@@ -169,10 +175,16 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Epoch (EpochChange (..
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Failure (reportFailure)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Requests
   ( acceptRequest
+  , acceptRequestFor
   , applyReplyIn
   , cancelRequestIn
+  , cancelRequestWith
   , completeProviderWorkIn
+  , endHolder
+  , holderLive
+  , issueHolder
   , observeRequestIn
+  , withdrawRequest
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Session.State
   ( AdmissionState (..)

@@ -175,6 +175,16 @@ data SegmentReport v
   | -- | Wait for this much elapsed time on the owner's monotonic source, which
     -- must be positive.
     ReportWaitElapsed v !Duration
+  | -- | Wait for the settlement of a request, which the owner names by its own
+    -- number for it. The scheduler attaches no meaning to the number: the task
+    -- waits until the owner, asked at each safe boundary, says the request has
+    -- settled, and is then handed nothing. See
+    -- 'Hetoimasia.Scripting.Lua.Scheduler.wakeRequestWaiters'.
+    ReportWaitRequest v !Word64
+  | -- | The owner refuses the wait the segment ended in: the task fails with a typed,
+    -- recoverable failure, its continuation is owed a close, and nothing waits. It is how an
+    -- owner that knows what a wait is for, and found it could not be made, says so.
+    ReportWaitRefused v !WaitRefusal
   | -- | Failed, with a handled failure. It stays the task's own: whether it also
     -- ends a session is the integrating owner's decision, from 'TaskFailure'.
     ReportFailed !TaskFailure
@@ -236,6 +246,9 @@ data WaitRefusal
     WaitDurationNotPositive
   | -- | The deadline is not representable on the source's timeline.
     WaitDeadlineOverflow
+  | -- | A wait for a request the task cannot wait for: it is not the task's, it names none, or
+    -- the owner has no request service.
+    WaitRequestRefused
   deriving (Bounded, Enum, Eq, Show)
 
 -- Admission and grants ---------------------------------------------------------

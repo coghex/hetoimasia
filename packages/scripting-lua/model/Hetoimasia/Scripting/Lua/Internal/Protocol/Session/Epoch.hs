@@ -13,6 +13,7 @@ module Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Epoch
 
 import qualified Data.Map.Strict as Map
 import qualified Data.Sequence as Seq
+import qualified Data.Set as Set
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
   ( Epoch
   , RequestId
@@ -91,6 +92,9 @@ advanceEpoch session = case notStopped session >> notFailed session of
               , sessionQueued = Seq.empty
               , sessionResults = Map.empty
               , sessionReservations = 0
+              , -- A holder was issued under the scope that is gone: its owner issues
+                -- another for the epoch that replaces it.
+                sessionHolders = Set.empty
               , sessionSubscriptions = Map.empty
               }
      in ( next

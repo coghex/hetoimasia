@@ -13,6 +13,7 @@ module Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Stop
 import Data.Foldable (toList)
 import qualified Data.Map.Strict as Map
 import qualified Data.Sequence as Seq
+import qualified Data.Set as Set
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Request
   ( CancelCause (CancelledByStop)
   , RequestRecord (requestProviderOutstanding, requestSettlement)
@@ -112,5 +113,6 @@ stopSession session = case sessionExit session of
           , sessionQueued = Seq.empty
           , sessionResults = Map.empty
           , sessionReservations = 0
+          , sessionHolders = Set.empty
           , sessionSubscriptions = Map.empty
           }

@@ -239,6 +239,7 @@ import Hetoimasia.Scripting.Lua.Internal.Owner
       , ownerModules
       , ownerName
       , ownerRegistration
+      , ownerRequests
       )
   , callOwned
   , defaultOwnerConfig
@@ -246,7 +247,7 @@ import Hetoimasia.Scripting.Lua.Internal.Owner
   , ownedHost
   , withOwnedVm
   )
-import Hetoimasia.Scripting.Lua.Internal.Registration (LifecycleContext, Registration, emptyRegistration)
+import Hetoimasia.Scripting.Lua.Internal.Registration (LifecycleContext, Registration, RequestContext, emptyRegistration)
 import Hetoimasia.Scripting.Lua.Internal.Task
   ( Task
   , TaskStart (..)
@@ -284,12 +285,18 @@ data VmConfig = VmConfig
     -- an opaque value of the application's runtime, which this library never
     -- reads. 'Nothing', the default, leaves a lifecycle operation answering a typed
     -- 'NotYetSupported' fault whose action never runs.
+  , vmRequests ∷ Maybe RequestContext
+    -- ^ What delivers this owner's asynchronous native requests
+    -- ('asynchronousNativeRequestIn') and a wait for one's settlement: an opaque
+    -- value of the application's runtime, which this library never reads. 'Nothing',
+    -- the default, leaves both answering a typed 'NotYetSupported' fault whose action
+    -- never runs.
   }
 
 -- | A configuration over these libraries with no initial chunk, an empty
 -- registration, no exposed namespace, the default value limits and no module.
 vmConfig ∷ [Library] → VmConfig
-vmConfig libraries = VmConfig libraries [] "owner" emptyRegistration [] defaultValueLimits [] Nothing
+vmConfig libraries = VmConfig libraries [] "owner" emptyRegistration [] defaultValueLimits [] Nothing Nothing
 
 -- | Run a body over a VM this owner constructs, and close the VM on every exit.
 --
@@ -314,6 +321,7 @@ withVmOwnerScoped scope config =
       , ownerModules = vmModules config
       , ownerCallbackScope = scope
       , ownerLifecycle = vmLifecycle config
+      , ownerRequests = vmRequests config
       }
 
 -- | Load a module from the owner's body, in an environment of its own.

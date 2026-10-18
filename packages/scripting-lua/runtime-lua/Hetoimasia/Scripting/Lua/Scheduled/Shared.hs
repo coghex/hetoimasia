@@ -12,6 +12,7 @@ module Hetoimasia.Scripting.Lua.Scheduled.Shared
   , settledOrRaise
   , exitOf
   , waitReport
+  , waitReportFor
   ) where
 
 import Control.Exception
@@ -24,6 +25,7 @@ import Control.Exception
   , throwIO
   , tryWithContext
   )
+import Control.Concurrent.STM (atomically)
 import Control.Monad (when)
 import Data.IORef (IORef, modifyIORef', readIORef)
 import Data.Map.Strict (Map)
@@ -41,13 +43,17 @@ import Hetoimasia.Scripting.Lua.Owner
   , WaitRequest (waitArguments, waitKind)
   , closeTask
   )
-import Hetoimasia.Scripting.Lua.Registration (WaitKind (WaitElapsed, WaitLogical))
+import Hetoimasia.Scripting.Lua.Registration (WaitKind (WaitElapsed, WaitLogical, WaitSettlement))
 import Hetoimasia.Scripting.Lua.Runtime.Types
   ( CallFault (BoundaryFailed, LuaFailed)
   , ExitKind (ExitCancelled, ExitFailed)
   )
-import Hetoimasia.Scripting.Lua.Scheduler (SegmentReport (ReportWaitElapsed, ReportWaitTicks))
-import Hetoimasia.Scripting.Lua.Value (Value (VInteger))
+import Hetoimasia.Scripting.Lua.Internal.Protocol.Failure (ReasonCode (ValidationFault), RecoverySafety (RecoverySafe), failureReason)
+import Hetoimasia.Scripting.Lua.Internal.Protocol.Task (TaskFailure (TaskFailure))
+import Hetoimasia.Scripting.Lua.Provider.State (WaitStatus (WaitPending, WaitRefused, WaitSettled), waitStatus)
+import Hetoimasia.Scripting.Lua.Provider.Types (ProviderState, Requester)
+import Hetoimasia.Scripting.Lua.Scheduler (SegmentReport (ReportFailed, ReportWaitElapsed, ReportWaitRefused, ReportWaitRequest, ReportWaitTicks, ReportYielded), WaitRefusal (WaitRequestRefused))
+import Hetoimasia.Scripting.Lua.Value (Value (VCapability, VInteger), capabilityKey)
 
 -- | A wait's first argument as a whole number of ticks. Anything that is not a
 -- non-negative integer is read as none, which the scheduler refuses as a wait for
@@ -109,7 +115,37 @@ exitOf (ExceptionWithContext _ exception) = case fromException exception of
 
 -- | What a wait the script asked for tells the scheduler, with the cursor the task
 -- is left with.
+--
+-- A wait for a request's settlement names the request by the key of the handle the
+-- script gave, which the value boundary has already checked is a live handle of the
+-- type the operation declares. An argument that is anything else is not a wait: it
+-- fails the task, which a validated registration never makes happen.
 waitReport ∷ v → WaitRequest → SegmentReport v
 waitReport cursor request = case waitKind request of
   WaitLogical → ReportWaitTicks cursor (countOf (waitArguments request))
   WaitElapsed → ReportWaitElapsed cursor (durationOf (waitArguments request))
+  WaitSettlement → case waitArguments request of
+    [VCapability handle] → ReportWaitRequest cursor (capabilityKey handle)
+    _ → ReportFailed (TaskFailure (failureReason ValidationFault "a wait for a request without a request handle") RecoverySafe)
+
+-- | What a wait the script asked for tells the scheduler, for the requester whose code asked it.
+--
+-- A wait for a request is looked at now, on the owner's thread, with the request service the
+-- owner was granted. The request's own requester is the only one that may wait for it; one
+-- that is not, a handle that names no request, and an owner with no service are refused, which
+-- fails the task and owes its continuation a close, as any refused wait does. A request that
+-- has settled already is no wait: the task yields and goes on, still inside the tick it was
+-- woken for. One that has not is waited for, and the owner wakes the task, at a safe boundary,
+-- when it has.
+waitReportFor ∷ Maybe ProviderState → Requester → v → WaitRequest → IO (SegmentReport v)
+waitReportFor provider requester cursor request = case waitKind request of
+  WaitSettlement → case (provider, waitArguments request) of
+    (Just service, [VCapability handle]) →
+      atomically (waitStatus service requester (capabilityKey handle)) <&> \case
+        WaitRefused _ → ReportWaitRefused cursor WaitRequestRefused
+        WaitSettled → ReportYielded cursor
+        WaitPending → ReportWaitRequest cursor (capabilityKey handle)
+    _ → pure (ReportWaitRefused cursor WaitRequestRefused)
+  _ → pure (waitReport cursor request)
+  where
+    (<&>) = flip fmap

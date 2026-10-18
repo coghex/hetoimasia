@@ -202,6 +202,8 @@ library runtime-lua
     exposed-modules:
         Hetoimasia.Scripting.Lua.Lease
         Hetoimasia.Scripting.Lua.Lending
+        Hetoimasia.Scripting.Lua.Provider
+        Hetoimasia.Scripting.Lua.Request
         Hetoimasia.Scripting.Lua.Runtime
         Hetoimasia.Scripting.Lua.Instance
         Hetoimasia.Scripting.Lua.Lifecycle
@@ -213,8 +215,12 @@ library runtime-lua
         Hetoimasia.Scripting.Lua.Instance.State
         Hetoimasia.Scripting.Lua.Instance.Types
         Hetoimasia.Scripting.Lua.Lease.State
+        Hetoimasia.Scripting.Lua.Retention
         Hetoimasia.Scripting.Lua.Lending.Loan
         Hetoimasia.Scripting.Lua.Lifecycle.State
+        Hetoimasia.Scripting.Lua.Provider.Serve
+        Hetoimasia.Scripting.Lua.Provider.State
+        Hetoimasia.Scripting.Lua.Provider.Types
         Hetoimasia.Scripting.Lua.Runtime.Admission
         Hetoimasia.Scripting.Lua.Runtime.Dispatch
         Hetoimasia.Scripting.Lua.Runtime.Shared
@@ -291,6 +297,7 @@ test-suite lua-host-tests
         Test.Lua.Boundary.Modules
         Test.Lua.Boundary.Registration
         Test.Lua.Boundary.Release
+        Test.Lua.Boundary.Requests
         Test.Lua.Boundary.Spec
         Test.Lua.Boundary.Support
         Test.Lua.Boundary.Tasks
@@ -317,6 +324,7 @@ test-suite lua-host-tests
         Test.Lua.Protocol.Epochs
         Test.Lua.Protocol.Failure
         Test.Lua.Protocol.Fixture
+        Test.Lua.Protocol.Holders
         Test.Lua.Protocol.Isolation
         Test.Lua.Protocol.Reason
         Test.Lua.Protocol.Requests
@@ -406,6 +414,17 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Lifecycle.Spec
         Test.LuaRuntime.Lifecycle.Support
         Test.LuaRuntime.Readiness
+        Test.LuaRuntime.Request.Admission
+        Test.LuaRuntime.Request.Epoch
+        Test.LuaRuntime.Request.Failures
+        Test.LuaRuntime.Request.Invariants
+        Test.LuaRuntime.Request.Logical
+        Test.LuaRuntime.Request.Settlement
+        Test.LuaRuntime.Request.Smoke
+        Test.LuaRuntime.Request.Spec
+        Test.LuaRuntime.Request.Support
+        Test.LuaRuntime.Request.Teardown
+        Test.LuaRuntime.Request.Waiting
         Test.LuaRuntime.Scheduled.Creation
         Test.LuaRuntime.Scheduled.Execution
         Test.LuaRuntime.Scheduled.Settlement
@@ -423,6 +442,7 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Scheduler.Lifecycle
         Test.LuaRuntime.Scheduler.Logical
         Test.LuaRuntime.Scheduler.Policy
+        Test.LuaRuntime.Scheduler.Requests
         Test.LuaRuntime.Scheduler.Spec
         Test.LuaRuntime.Scheduler.Stop
         Test.LuaRuntime.Scheduler.Structure
