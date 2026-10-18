@@ -270,9 +270,14 @@
 -- the owner has begun is refused as late ('InstanceControlLate'), and one assigned a
 -- place another request holds as a duplicate ('InstanceControlDuplicate'); neither is
 -- ever applied at a later boundary. Admission reads the tick and enqueues in one
--- transaction, so a request accepted for a tick is queued before that tick is visible. A
--- request waiting for its tick holds its reservation, and settles as no longer applicable
--- if its instance ends first or the owner exits first.
+-- transaction, so a request accepted for a tick is queued before that tick is visible, and it
+-- asks the scheduler to hold the grant that reaches the tick: that grant is not finished, and no
+-- later one is applied, until the owner has applied the tick's controls, so grants queued
+-- together act as grants served one by one, and the cadence points the tick reached are still
+-- the scheduler's while the controls are applied. A request waiting for its tick holds its
+-- reservation, and settles as no longer applicable if its instance ends first or the owner
+-- exits first; its place stays taken until the tick begins, and the places queued are bounded
+-- as the reservations are.
 --
 -- = Results and inspection
 --

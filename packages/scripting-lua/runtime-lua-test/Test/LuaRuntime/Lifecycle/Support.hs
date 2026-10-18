@@ -13,6 +13,7 @@ module Test.LuaRuntime.Lifecycle.Support
     lifeRegistration
   , commander
   , commanderFailing
+  , closingCommander
   , taskCaller
   , cmdSource
   , cmdConfig
@@ -166,6 +167,24 @@ commanderFailing =
          , "end"
          ]
 
+-- | A commander whose callback waits a tick holding a closing handler that calls the lifecycle
+-- bindings: asks that the instance it was told of be paused, and who it is, as it is closed.
+closingCommander ∷ ModuleSource
+closingCommander =
+  hooksModule "closingcommander" $
+    prelude
+      <> [ "function init(self, api)"
+         , "  api.connect('cmd', function(self, event)"
+         , "    local p = event.payload"
+         , "    local guard <close> = setmetatable({}, {__close = function()"
+         , "      " <> record <> "('closed self ' .. fmt(life.self()))"
+         , "      " <> record <> "('closed pause ' .. fmt(life.pause(p.tid)))"
+         , "    end})"
+         , "    sched.wait_ticks(1)"
+         , "  end)"
+         , "end"
+         ]
+
 -- | Tasks that call the lifecycle bindings, for an owner whose scripts are not instances: a
 -- task has no instance to name, so what it holds is its owner's.
 taskCaller ∷ ModuleSource
@@ -203,12 +222,12 @@ startCaller fixture runtime = startCallerWith fixture (lifeRegistration fixture)
 -- | The same, from a registration built once and given to several owners.
 startCallerWith ∷ IFixture → Registration → LuaRuntime → Text → Maybe LifecycleGrant → IO ScheduledOwner
 startCallerWith fixture given runtime label grant =
-  startWith fixture runtime (lifeSpec fixture given label [commander, commanderFailing, taskCaller] cmdConfig grant)
+  startWith fixture runtime (lifeSpec fixture given label [commander, commanderFailing, closingCommander, taskCaller] cmdConfig grant)
 
 -- | An owner of commanders of this configuration, granted this.
 startCallerIn ∷ IFixture → LuaRuntime → Text → InstanceConfig → Maybe LifecycleGrant → IO ScheduledOwner
 startCallerIn fixture runtime label config grant =
-  startWith fixture runtime (lifeSpec fixture (lifeRegistration fixture) label [commander, commanderFailing, taskCaller] config grant)
+  startWith fixture runtime (lifeSpec fixture (lifeRegistration fixture) label [commander, commanderFailing, closingCommander, taskCaller] config grant)
 
 -- | Bounds and sources for an owner that admits the controls made through a grant logically.
 logicalConfig ∷ InstanceConfig

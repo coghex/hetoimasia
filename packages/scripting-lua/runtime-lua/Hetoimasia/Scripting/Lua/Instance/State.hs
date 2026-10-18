@@ -35,6 +35,7 @@ module Hetoimasia.Scripting.Lua.Instance.State
 import Control.Concurrent.STM (STM, modifyTVar', newTVar, readTVar, retry, writeTVar)
 import Control.Monad (unless, when)
 import Data.Foldable (toList)
+import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import Data.Sequence (Seq, (|>))
 import qualified Data.Sequence as Seq
@@ -53,6 +54,9 @@ data Gate = Gate
   { gateOpen ∷ STM Bool
   , gateTick ∷ STM Word64
   , gateExecution ∷ TaskId → STM Execution
+  , gateWatch ∷ Word64 → STM ()
+    -- ^ Ask the owner to be held at a tick: a grant that reaches it is not finished, and no
+    -- later one is applied, until the owner has applied what was assigned to it.
   }
 
 -- | Admit an instance. Never blocks.
@@ -206,7 +210,11 @@ admitControl instances gate owner identity request slot = do
               | controlTick place <= tick → Left InstanceControlLate
               | Map.member place queued → Left InstanceControlDuplicate
             _
+              -- A place stays taken until its tick begins, whatever became of the request that
+              -- took it, so what is queued is bounded as the reservations are: the places of
+              -- requests whose instances ended count until their ticks begin.
               | reserved >= boundInstanceControls (insBounds instances) → Left InstanceControlFull
+              | isJust slot && Map.size queued >= boundInstanceControls (insBounds instances) → Left InstanceControlFull
               | otherwise → Right $ do
                   settlement ← newTVar Nothing
                   forgotten ← newTVar False
@@ -214,7 +222,11 @@ admitControl instances gate owner identity request slot = do
                   let receipt = InstanceControlReceipt settlement forgotten released (insControls instances)
                   writeTVar (insControls instances) (reserved + 1)
                   case slot of
-                    Just place → modifyTVar' (insLogical instances) (Map.insert place (LogicalControl (icId cell) request receipt))
+                    Just place → do
+                      modifyTVar' (insLogical instances) (Map.insert place (LogicalControl (icId cell) request receipt))
+                      -- Queued and the owner asked to be held at its tick in one step, so no grant
+                      -- can reach the tick between the two.
+                      gateWatch gate (controlTick place)
                     Nothing → modifyTVar' (insInbox instances) (|> JobControl (icId cell) request receipt)
                   pure (InstanceControlAccepted receipt)
 
@@ -229,14 +241,13 @@ takeDueControls instances tick = do
   pure (Map.toAscList due)
 
 -- | The requests waiting for their ticks that are made of an instance that has ended,
--- settled as no longer applicable, once, and dropped: nothing is left to apply them to, so
--- they need not wait for a tick that may never come.
+-- settled as no longer applicable, once: nothing is left to apply them to, so their callers
+-- need not wait for a tick that may never come. They keep their places until their ticks
+-- begin, so that a place that was taken is never given twice.
 overtakeLogical ∷ Instances → Word64 → STM ()
 overtakeLogical instances number = do
   queued ← readTVar (insLogical instances)
-  let (overtaken, rest) = Map.partition ((== number) . logicalInstance) queued
-  writeTVar (insLogical instances) rest
-  mapM_ (\control → settleReceipt (logicalReceipt control) ControlNoLongerApplicable) (Map.elems overtaken)
+  mapM_ (\control → settleReceipt (logicalReceipt control) ControlNoLongerApplicable) (filter ((== number) . logicalInstance) (Map.elems queued))
 
 -- | Every request still waiting for its tick, taken: what the owner's exit settles.
 takeAllLogical ∷ Instances → STM [LogicalControl]

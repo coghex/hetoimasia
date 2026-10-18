@@ -7,10 +7,9 @@ module Test.LuaRuntime.Lifecycle.Logical (spec) where
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
-import Control.Monad (forM, forM_, replicateM_)
+import Control.Monad (forM, forM_, replicateM, replicateM_, void)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import Data.List (permutations, sort)
-import Control.Monad (void)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Instance
@@ -20,6 +19,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Lifecycle.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEffect, awaitScheduledTerminal)
+import Test.LuaRuntime.Scheduler.Support (nanoseconds)
 import Test.LuaRuntime.Support (bounded, withBoundary)
 
 takenAs ∷ Int → Text
@@ -286,6 +286,99 @@ spec = describe "logical admission" $ do
       tick ← atomically (scheduledTick (scheduledEndpoint owner))
       tick `shouldBe` 1
 
+  describe "a tick and the controls assigned to it" $ do
+    it "holds the tick until its controls are applied, so grants queued together act as grants served one by one" $ bounded $ do
+      -- A paused periodic instance and a resume assigned to tick 1: whether the grants for ticks 1 and 2
+      -- were applied together or one after the other, the resume finds the owner at tick 1, so the first
+      -- update newly due, one interval after it, is at tick 2.
+      updates ← forM [True, False] $ \batched → do
+        targetFx ← newIFixture
+        withBoundary $ \control runtime → do
+          owner ← startTarget targetFx runtime "target" [echoer, holder] logicalConfig
+          _ ← admitWith targetFx owner "p" (InstanceRequest (moduleNamed "echoer") (Periodic (LogicalTicks 1)) (Just "p") OrdinaryClass ["tick"])
+          awaitPhase targetFx owner "p" Active
+          settleControl targetFx owner "p" InstancePause >>= (`shouldBe` ControlApplied)
+          p ← idOf targetFx "p"
+          answer ← requestInstanceControlAt (scheduledEndpoint owner) p InstanceResume (ControlSlot 1 0)
+          answerKind answer `shouldBe` "accepted"
+          if batched
+            then do
+              holdOwner targetFx owner
+              replicateM_ 2 (grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1))
+              releaseOwner targetFx
+              void (awaitTicksComplete control owner)
+            else replicateM_ 2 (grantOne control owner)
+          awaitPhase targetFx owner "p" Active
+          logCount targetFx "update"
+      updates `shouldBe` [1, 1]
+
+    it "drops a cadence point a pause and a resume assigned to its tick invalidate: the next update is a full interval after the resume" $ bounded $ do
+      targetFx ← newIFixture
+      withBoundary $ \control runtime → do
+        owner ← startTarget targetFx runtime "target" [echoer] logicalConfig
+        _ ← admitWith targetFx owner "p" (InstanceRequest (moduleNamed "echoer") (Periodic (LogicalTicks 1)) (Just "p") OrdinaryClass ["tick"])
+        awaitPhase targetFx owner "p" Active
+        p ← idOf targetFx "p"
+        forM_ [(InstancePause, 0), (InstanceResume, 1)] $ \(op, order) →
+          requestInstanceControlAt (scheduledEndpoint owner) p op (ControlSlot 1 order) >>= (`shouldSatisfy` ((== "accepted") . answerKind))
+        -- The point the tick reached is the pause's to drop: no update at tick 1.
+        grantOne control owner
+        logCount targetFx "update" >>= (`shouldBe` 0)
+        grantOne control owner
+        awaitEffect (sf targetFx) "update"
+        logCount targetFx "update" >>= (`shouldBe` 1)
+
+    it "keeps a place taken until its tick begins, whatever became of the request that took it, within the bound on what is queued" $ bounded $ do
+      targetFx ← newIFixture
+      withBoundary $ \_ runtime → do
+        owner ← startTarget targetFx runtime "target" [echoer] (logicalConfig {instanceBounds = InstanceBounds 16 32 8 8})
+        forM_ [0 .. 8 ∷ Int] $ \n → admit targetFx owner (Text.pack (show n)) (moduleNamed "echoer")
+        forM_ [0 .. 8 ∷ Int] $ \n → awaitPhase targetFx owner (Text.pack (show n)) Active
+        ids ← forM [0 .. 8 ∷ Int] (idOf targetFx . Text.pack . show)
+        let at identity order = requestInstanceControlAt (scheduledEndpoint owner) identity InstancePause (ControlSlot 5 order)
+        first ← at (ids !! 0) 0
+        answerKind first `shouldBe` "accepted"
+        -- Its instance ends before the tick: its request settles, and its place stays taken.
+        settleControl targetFx owner "0" InstanceStop >>= (`shouldBe` ControlApplied)
+        _ ← awaitSettled targetFx "0"
+        case first of
+          InstanceControlAccepted receipt → waitInstanceControl receipt >>= (`shouldBe` ControlNoLongerApplicable)
+          _ → fail "not accepted"
+        (answerKind <$> at (ids !! 1) 0) >>= (`shouldBe` "duplicate")
+        -- Seven more places, each given up by an instance that ended: eight are queued and none is reserved.
+        forM_ [1 .. 7] $ \n → do
+          answer ← at (ids !! n) (fromIntegral n + 100)
+          answerKind answer `shouldBe` "accepted"
+          settleControl targetFx owner (Text.pack (show n)) InstanceStop >>= (`shouldBe` ControlApplied)
+          _ ← awaitSettled targetFx (Text.pack (show n))
+          case answer of
+            InstanceControlAccepted receipt → waitInstanceControl receipt >>= (`shouldBe` ControlNoLongerApplicable)
+            _ → fail "not accepted"
+        (answerKind <$> at (ids !! 8) 200) >>= (`shouldBe` "full")
+
+  describe "a closing handler" $
+    it "is the caller its instance is: it asks as the instance and reads who it is, and what it asked is abandoned when the instance ends" $ bounded $ do
+      targetFx ← newIFixture
+      callerFx ← newIFixture
+      withBoundary $ \_ runtime → do
+        owner ← startTarget targetFx runtime "target" [echoer] (testConfig instanceBounds')
+        _ ← admit targetFx owner "a" (moduleNamed "echoer")
+        awaitPhase targetFx owner "a" Active
+        tid ← tidValue targetFx "a"
+        caller ← startCaller callerFx runtime "caller" (Just (target owner))
+        _ ← admitWith callerFx caller "closer" (InstanceRequest (moduleNamed "closingcommander") EventOnly (Just "closer") OrdinaryClass ["cmd"])
+        awaitPhase callerFx caller "closer" Active
+        tell callerFx caller "closer" "wait" (Just tid) Nothing
+        awaitDiagnosticsWaiting caller
+        mine ← tidValue callerFx "closer"
+        -- Stopping it closes the suspended callback, which runs its closing handler.
+        settleControl callerFx caller "closer" InstanceStop >>= (`shouldBe` ControlApplied)
+        _ ← awaitSettled callerFx "closer"
+        logged callerFx >>= (`shouldBe` ["closed self " <> renderTid mine, "closed pause " <> takenAs 0])
+        -- Nothing is left holding a reservation of the target's: the instance's end abandoned it.
+        awaitPhase targetFx owner "a" Paused
+        reservationsAllFree' targetFx owner "a"
+
   describe "an instance's control of itself" $
     it "applies a request for its own pause at the assigned tick, before the tick's work: the wait the tick ends is not resumed" $ bounded $ do
       fixture ← newIFixture
@@ -321,6 +414,14 @@ spec = describe "logical admission" $ do
         admitCommander callerFx caller "cmdr"
         ask callerFx caller "cmdr" "inspect" (Just tid) Nothing >>= (`shouldSatisfy` Text.isInfixOf "status=active")
         ask callerFx caller "cmdr" "pause" (Just tid) Nothing >>= (`shouldBe` refusedAs "unauthorized")
+
+-- | Whether the target's owner holds a reservation for every control it may: it takes this many
+-- requests, whose receipts nobody reads, and refuses the next.
+reservationsAllFree' ∷ IFixture → ScheduledOwner → Text → IO ()
+reservationsAllFree' fixture owner name = do
+  receipts ← replicateM 8 (askUntilTaken fixture owner name InstancePause)
+  forM_ receipts $ \answer → answer `shouldSatisfy` \case InstanceControlAccepted _ → True; _ → False
+  askControl fixture owner name InstancePause >>= (`shouldSatisfy` \case InstanceControlFull → True; _ → False)
 
 -- | Do this many times, in order.
 replicateM' ∷ Int → IO a → IO [a]

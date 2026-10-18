@@ -72,6 +72,13 @@ module Hetoimasia.Scripting.Lua.Scheduler.State
   , cadenceAccruedOf
   , cadenceResetAccrued
   , cadenceHeldBy
+  , cadenceTakeNext
+
+    -- * The owner's watch on a tick
+  , watchKey
+  , watchTickIn
+  , setWatchIn
+  , releaseWatchIn
 
     -- * Control
   , pauseIn
@@ -249,6 +256,10 @@ data SchedState v = SchedState
   , ssCadenceElapsed ∷ !(Map CadenceKey ElapsedCadence)
   , ssFirings ∷ !(Seq (CadenceKey, CadenceFiring))
     -- ^ The cadence points reached and not yet taken, in the order they were reached.
+  , ssWatch ∷ !(Maybe Word64)
+    -- ^ The earliest tick the owner asked to be held at: a logical point of its own, with no
+    -- accrual, that a grant reaching it holds as a cadence point does.
+  , ssWatchHold ∷ !(Maybe GrantId)
   , ssControl ∷ !(Seq PendingControl)
   , ssReserved ∷ !Int
   , ssPhase ∷ !Phase
@@ -294,6 +305,8 @@ initialState label session =
     , ssCadenceLogical = Map.empty
     , ssCadenceElapsed = Map.empty
     , ssFirings = Seq.empty
+    , ssWatch = Nothing
+    , ssWatchHold = Nothing
     , ssControl = Seq.empty
     , ssReserved = 0
     , ssPhase = Open
@@ -818,7 +831,7 @@ settleGrants state = case Seq.viewl (ssGrants state) of
     | otherwise → (state, [])
 
 applyHead ∷ Grant → SchedState v → (SchedState v, [Event])
-applyHead grant state = (advanceCadences grant identityOfGrant tick woken, wakeEvents)
+applyHead grant state = (advanceCadences grant identityOfGrant tick (reachWatch identityOfGrant tick woken), wakeEvents)
   where
     (woken, wakeEvents) = foldl' advance (opened, []) (Map.toAscList (ssLogical state))
     tick = ssTick state + 1
@@ -970,6 +983,49 @@ cadenceDisarm key state =
     }
   where
     disarmed = invalidated False key state
+
+-- | The reserved key of the owner's own watch among the points it takes: no instance has it.
+watchKey ∷ CadenceKey
+watchKey = CadenceKey maxBound
+
+-- | A grant has been applied: if it reaches the tick the owner asked to be held at, it is
+-- held, as a cadence point holds it, and the point is the first of the grant's, so whatever the
+-- owner applies for the tick is applied before any cadence point of it. The watch is spent: the
+-- owner sets the next when it serves this one.
+reachWatch ∷ GrantId → Word64 → SchedState v → SchedState v
+reachWatch held tick state = case ssWatch state of
+  Just target | tick >= target →
+    state
+      { ssWatch = Nothing
+      , ssWatchHold = Just held
+      , ssGrants = Seq.adjust' (\open → open {grantDue = grantDue open + 1}) 0 (ssGrants state)
+      , ssFirings = ssFirings state |> (watchKey, FiredLogical tick)
+      }
+  _ → state
+
+-- | Ask to be held at a tick, if it is earlier than the one already asked for.
+watchTickIn ∷ Word64 → SchedState v → SchedState v
+watchTickIn tick state = state {ssWatch = Just (maybe tick (min tick) (ssWatch state))}
+
+-- | Set the tick the owner asks to be held at, replacing any.
+setWatchIn ∷ Maybe Word64 → SchedState v → SchedState v
+setWatchIn target state = state {ssWatch = target}
+
+-- | Give back the grant the watch holds, so that it can finish once its other work has.
+releaseWatchIn ∷ SchedState v → SchedState v
+releaseWatchIn state = case ssWatchHold state of
+  Just (GrantId number) →
+    state
+      { ssWatchHold = Nothing
+      , ssGrants = Seq.adjust' (\open → open {grantDue = max 0 (grantDue open - 1)}) (fromIntegral (number - firstOpen state)) (ssGrants state)
+      }
+  Nothing → state
+
+-- | The first point reached and not yet taken.
+cadenceTakeNext ∷ SchedState v → (Maybe (CadenceKey, CadenceFiring), SchedState v)
+cadenceTakeNext state = case Seq.viewl (ssFirings state) of
+  EmptyL → (Nothing, state)
+  point :< rest → (Just point, state {ssFirings = rest})
 
 -- | Take a cadence away, as an ending does: its demand is cancelled, whatever it made is
 -- invalidated and nothing of it is left.

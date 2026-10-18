@@ -57,6 +57,7 @@ module Hetoimasia.Scripting.Lua.Instance.Run
   , settleEnded
   , reapInvocations
   , retireInstances
+  , runningTask
   , recordExit
   ) where
 
@@ -132,8 +133,12 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , startElapsedCadence
   , startLogicalCadence
   , stopCadence
-  , takeCadenceFirings
+  , releaseWatch
+  , setWatch
+  , takeNextCadenceFiring
   , tasksReady
+  , watchKey
+  , watchTick
   , BehaviorId (BehaviorId)
   , ControlRequest (RequestPause, RequestResume, RequestStop)
   , ControlResult (ControlAlreadyInState, ControlApplied, ControlNoLongerApplicable)
@@ -304,6 +309,7 @@ gateOf control =
         stopping ← controlStopping control
         pure (not closed && not stopping)
     , gateTick = readTick scheduler
+    , gateWatch = watchTick scheduler
     , gateExecution = \task →
         taskPhase scheduler task <&> \case
           Just PhaseRunning → ExecRunning
@@ -579,6 +585,16 @@ withRunning ∷ InstanceHost → Word64 → IO a → IO a
 withRunning ih number action = do
   atomically (writeTVar (insRunning (ihInstances ih)) (Just number))
   action `finally` atomically (writeTVar (insRunning (ihInstances ih)) Nothing)
+
+-- | Run this on behalf of the instance whose invocation the task is, if it is one: what the
+-- scheduler runs of a task that is no segment of it (closing its coroutine, which runs the
+-- script's closing handlers) is still the instance's code, and a binding it calls must be told
+-- so.
+runningTask ∷ InstanceHost → TaskId → IO a → IO a
+runningTask ih task action =
+  Map.lookup task <$> readIORef (ihLive ih) >>= \case
+    Just live → withRunning ih (liveSlot live) action
+    Nothing → action
 
 -- | Whether a module has a hook, as an entry point it declares and has. One that is
 -- there and is not a function is a hook: running it raises the host's fault for it.
@@ -934,40 +950,42 @@ nextFuture deadline interval now =
 -- any task that grant woke is chosen: an instance's invocation in flight is in flight
 -- here, and a callback the grant resumes is still active.
 serviceCadence ∷ InstanceHost → IO Bool
-serviceCadence ih = do
-  -- What the boundary reached, and the controls assigned to a tick it has reached, are
-  -- taken in one masked step, so a cancellation cannot land between taking the controls and
-  -- keeping them where the owner's exit settles them.
-  (firings, due) ← mask_ $ do
-    taken ← atomically $ do
-      reached ← takeCadenceFirings (scheduler' ih)
-      tick ← readTick (scheduler' ih)
-      (,) reached <$> takeDueControls (ihInstances ih) tick
-    modifyIORef' (ihDue ih) (<> snd taken)
-    pure taken
-  serveLogical ih firings
-  -- A tick just served has had no chance to run its update yet: it is looked at the
-  -- next time round, which the answer below makes the boundary do.
-  released ← settleHolds ih (map fst firings)
-  pure (not (null firings) || not (null due) || released)
+serviceCadence ih = go []
+  where
+    -- The points are taken one at a time, so those behind the one being served are still the
+    -- scheduler's, where a pause, a resume or an ending that comes first can invalidate them.
+    go served =
+      atomically (takeNextCadenceFiring (scheduler' ih)) >>= \case
+        Just (key, firing)
+          | key == watchKey → serveWatch ih firing >> go (key : served)
+          | otherwise → serveFiring ih (key, firing) >> go (key : served)
+        Nothing → do
+          -- A tick just served has had no chance to run its update yet: it is looked at the
+          -- next time round, which the answer below makes the boundary do.
+          released ← settleHolds ih served
+          pure (not (null served) || released)
 
--- | Serve a boundary's logical work in the order of the ticks it belongs to: the controls
--- the application assigned to a tick are applied, in the order of their places, before
--- that tick's cadence point, which then finds the instance as they left it, and so before
--- any task the tick woke. Several ticks reach one boundary only when no task ran between
--- them (a grant that woke nothing finishes at once), so applying each tick's controls
--- ahead of its own point is the order the ticks happened in. What is assigned to a tick no
--- point of this boundary belongs to is applied after the points, still before any task
--- runs; an elapsed point carries no tick and is served in the order it was reached.
-serveLogical ∷ InstanceHost → [(CadenceKey, CadenceFiring)] → IO ()
-serveLogical ih = \case
-  [] → applyDue ih (const True)
-  (key, firing) : rest → do
-    case firing of
-      FiredLogical tick → applyDue ih ((<= tick) . controlTick)
-      _ → pure ()
-    serveFiring ih (key, firing)
-    serveLogical ih rest
+-- | The tick the owner asked to be held at has been reached, and the grant that reached it is
+-- held, so no later one is applied until this is done: the controls the application assigned to
+-- it, and to any earlier tick, are applied, in the order of their places, and then the grant is
+-- let go. It is the first point of its grant, so they are applied before any cadence point of
+-- the tick, which then finds the instance as they left it, and so before any task the tick woke.
+-- What is queued for a later tick is what the owner next asks to be held at, in the step that
+-- takes these, so no request can be queued between.
+serveWatch ∷ InstanceHost → CadenceFiring → IO ()
+serveWatch ih = \case
+  FiredLogical tick → do
+    -- The controls are taken and kept where the owner's exit settles them in one masked step.
+    mask_ $ do
+      taken ← atomically $ do
+        due ← takeDueControls (ihInstances ih) tick
+        later ← readTVar (insLogical (ihInstances ih))
+        setWatch (scheduler' ih) (fst <$> Map.lookupMin (Map.mapKeys controlTick later))
+        pure due
+      modifyIORef' (ihDue ih) (<> taken)
+    applyDue ih (const True)
+    atomically (releaseWatch (scheduler' ih))
+  _ → atomically (releaseWatch (scheduler' ih))
 
 -- | Apply the controls held for this boundary, from the front, for as long as the places
 -- they were assigned satisfy the test. Each leaves the list as it begins, with the handler
