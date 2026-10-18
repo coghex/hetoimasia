@@ -1944,7 +1944,7 @@ rather than being dropped.
 | Hook | When | Suspends |
 | --- | --- | --- |
 | `init(self, api)` | once, as a finite call, before anything else; an absent `init` is a successful empty one | no: a wait or a yield is a fault of the hook |
-| `update(self, dt)` | when a periodic instance's interval makes one due (see [Cadence](#cadence)), handed `dt` as an integer number of nanoseconds; an instance admitted without an interval never has one; a periodic instance whose module defines none is refused before any hook runs, naming `update` | yes, as `run` and the callbacks do |
+| `update(self, dt)` | when a periodic instance's interval makes one due (see [Cadence](#cadence)), handed `dt` as a float number of seconds; an instance admitted without an interval never has one; a periodic instance whose module defines none is refused before any hook runs, naming `update` | yes, as `run` and the callbacks do |
 | `run(self, api)` | a one-shot's body (`RunOnce`), to completion after `init`; a one-shot whose module defines none is refused before any hook runs, naming `run` | yes, as a task's entry point does |
 | callbacks | an event's callback, handed `self` and the event | yes |
 | `shutdown(self, reason)` | once, with `"stopped"`, `"completed"` or `"failed"`; optional | no |
@@ -2033,9 +2033,13 @@ finishes, and no update overtakes an active invocation or an earlier queued one.
 more than one unstarted update.
 
 The update's `dt` is the logical duration granted since the previous update *finished* (since `init`
-succeeded, for the first), in nanoseconds, from grants alone. It is fixed as the update begins and is
-unchanged by its own waits, by later grants and by real delays. A `dt` of more nanoseconds than an
-integer holds fails the instance (below). The duration an invocation's own wait was granted is
+succeeded, for the first), less any granted while the instance was intentionally paused (D-35), from
+grants alone. Ticks that pass while an invocation is active and the instance is not paused still
+count, so every tick granted while the instance is live is accounted to it once. It reaches Lua as a
+**float number of seconds**: the exact `Duration` (granted ticks times the application's tick
+duration, or the elapsed difference) is converted once at the Lua boundary, which is the only rounding.
+It is fixed as the update begins and is unchanged by its own waits, by later grants and by real delays.
+The duration an invocation's own wait was granted is
 reported to the application on the owner's thread when it resumes (`scheduledObserve`'s
 `ResumedLogical`); a resumed coroutine receives no value, so a script learns it only through a binding
 the application grants, as the test fixture's `fx.resume` does. That duration overlaps the next
@@ -2065,10 +2069,10 @@ refresh, not ten.
 demand is cancelled and a point that finds it paused adds nothing. An update that was already due or
 admitted and had not begun is retained, in its place, and holds no tick; it runs after the resume. After
 a resume the first update newly due is one full interval later: that many ticks after the tick the
-resume was applied at, or that much time after the instant it was, with an elapsed instance's baseline
-rebased to that instant so that its `dt` excludes the pause. A logical instance's `dt` still counts every
-tick granted, the paused ones included: the application resuming an instance chooses how the game
-accounts for its inactive time.
+resume was applied at, or that much time after the instant it was. An elapsed instance's baseline is
+rebased to that instant, and a logical instance accrues nothing toward its `dt` from the grants applied
+while it is paused, so either `dt` excludes the pause: a resumed instance's first update receives about
+one interval, plus whatever was granted between its previous update and the pause.
 
 **The queue.** A due update takes its place in the instance's one queue when it falls due: behind the
 events accepted before it, ahead of those accepted after it, so a continuous producer cannot starve it.
@@ -2078,9 +2082,9 @@ as full; `snapshotUpdateOwed` says one is owed.
 **Ending.** Every way an instance ends (a stop, a failure, its owner's retirement or exit) cancels its timer demand, discards its unstarted update, counted with the other unstarted
 invocations (`terminationUnstarted`), and lets go of a tick it held.
 
-**Arithmetic.** An accrued duration, a tick or a deadline that cannot be represented, or a `dt` of more
-nanoseconds than an integer holds, fails the instance (`ErrorCadence`, at `StageUpdate`), attributably:
-nothing wraps, no timer demand is left and no tick is held.
+**Arithmetic.** An accrued duration, a tick or a deadline that cannot be represented fails the instance
+(`ErrorCadence`, at `StageUpdate`), attributably: nothing wraps, no timer demand is left and no tick is
+held.
 
 ### Failure and escalation
 
