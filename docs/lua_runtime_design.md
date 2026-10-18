@@ -2622,6 +2622,35 @@ and verified policy, with adversarial regression coverage.
 - **Out of scope:** the game's terminal and its command parser, global
   registries, synchronous cross-owner Lua entry, rollback, forced interruption.
 - **Open questions:** None.
+- **As delivered (#474):** the choices the slice left to its solver, recorded so a
+  later slice does not reopen them. D-14's register-once rule is kept by handing each
+  owner its own `LifecycleContext`, an opaque value the host library carries from the
+  owner's configuration to the action of a `lifecycleOperationIn` binding and never
+  reads; a lifecycle binding is refused as `NotYetSupported`, action never run, for an
+  owner configured with none and for one a finalizer may call, so the host library
+  still depends on no runtime package and the shared registration cannot tell owners
+  apart by anything a script sends. A `LifecycleGrant` (`scheduledLifecycle`) names
+  covered owners of the same runtime (another owner's endpoint, or itself), what each
+  permits (inspect, control) and two bounds, is validated before anything starts, and
+  is the whole of the authority. Refusals are answers, in a fixed order: unauthorized
+  (decided from the grant alone, with nothing tested of the target), unassigned,
+  caller receipts full, closed, unknown target, late, duplicate, target reservations
+  full. A TID is the record `{runtime, owner, id}`, which names and grants nothing.
+  Receipts are the caller's: numbered by the owner, read only by the instance or task
+  that made the request, consumed by the first read of a settlement, abandoned when that
+  instance or task ends or the owner exits, never undoing a request already accepted.
+  Logical admission is the target's `instanceControlAdmission`: a request carries a
+  `ControlSlot` the application's `AssignControl` gives it, is queued by (tick,
+  sequence) in the same transaction that reads the tick, and is applied at that tick's
+  boundary ahead of its cadence point and any task it wakes, the scheduler holding the
+  grant that reaches the tick (an owner's watch, a point of its own beside the cadence
+  points) until the controls are applied, and the points the tick reached staying the
+  scheduler's while they are, so a pause and a resume at that tick invalidate a point due
+  at it; a request for a tick that
+  has begun, or a place that is taken, is refused, and one waiting for its tick settles
+  as no longer applicable when its instance ends or its owner exits, its place staying
+  taken, within a bound on what is queued, until its tick begins. The application's
+  own `requestInstanceControl` is unchanged and admitted on arrival.
 
 ### LUA-24. Run instance updates on logical and elapsed cadences
 

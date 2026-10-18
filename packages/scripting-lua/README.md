@@ -39,7 +39,10 @@ control, tested against scripted segments. See
 host it, and the host's task coroutines, on supervised workers with real VMs. See
 [The scheduled owner](#the-scheduled-owner). **Script instances** (LUA-18) sit on
 them: instances of a module with their own state, hooks, event callbacks and a
-lifecycle the application controls. See [Script instances](#script-instances). Any
+lifecycle the application controls. See [Script instances](#script-instances).
+**Lifecycle services** (LUA-23) let an owner's scripts pause, resume, stop and inspect instances
+of the owners the application grants them, and nothing else. See
+[Lifecycle services](#lifecycle-services). Any
 concrete game namespace, asynchronous requests and the confined path are later slices of
 [the Lua runtime design](../../docs/lua_runtime_design.md). What is here is the
 boundary they will be built on, and the evidence that it holds.
@@ -697,7 +700,7 @@ eligibilities (D-14):
 | owned state operation | `stateOperation` | trusted direct path | values |
 | command or UI intention | `commandIntention` | trusted direct path | `true, nil` accepted, or `false, reason` (at most 256 UTF-8 bytes) as data |
 | asynchronous native request | `asynchronousNativeRequest` | classified only | a Lua call is a typed `NotYetSupported` fault; the action never runs |
-| lifecycle operation | `lifecycleOperation` | classified only | a Lua call is a typed `NotYetSupported` fault; the action never runs |
+| lifecycle operation | `lifecycleOperation`, `lifecycleOperationIn` | an owner configured with a lifecycle context | from an owner with none, a Lua call is a typed `NotYetSupported` fault and the action never runs; from one with it, the action runs and (`lifecycleOperationIn`) is handed that owner's own context (see [Lifecycle services](#lifecycle-services)) |
 | scheduler operation | `yieldOperation`, `waitOperation` | trusted direct path | nothing: the task's coroutine is suspended (see [Tasks](#tasks-and-the-coroutine-library)) |
 
 The defaults are the safe ones: a binding is **direct-eligible** and nothing
@@ -948,7 +951,9 @@ called from Lua (every rule above, the limits at the limit and one past with
 input far larger than the limit, results, `pcall` cases for the settled
 decisions, handles, `VmReentered` and `VmNotOwned`, an action's own failure);
 modules and entry points; the finalizer allowlist (`__gc` finalizers reaching an
-eligible binding, an ineligible one, an allowlisted lifecycle binding);
+eligible binding, an ineligible one, an allowlisted lifecycle binding, also for an owner configured to
+deliver lifecycle operations); lifecycle operations delivered to an owner with a lifecycle context and
+refused, their action never run, to one without;
 independent owners on separate threads with different policies; installation;
 discipline, with the allocator's budget swept across installation, loading,
 calling and marshalling; and the dependency closure. `Test.Lua.Opacity` adds
@@ -1677,7 +1682,7 @@ The examples are part of `lua-runtime-tests` (`Test.LuaRuntime.Scheduler.*`), in
 `runtime-lua-test/`. They drive a rig of scripted segments under an injected clock and a
 fake timer whose wakes the example fires, so none sleeps and none needs a VM; the one
 exception that touches a VM checks that a lifecycle-operation binding still answers
-not-yet-supported. One example arms the production timer and blocks in STM until its wake
+not-yet-supported through the finite-call adapter, which has no grant. One example arms the production timer and blocks in STM until its wake
 arrives. Cancellation and shutdown windows are the kind an asynchronous-exception race can
 hide on one platform, so CI, which runs them on Linux, is the evidence for them and a local
 pass is not.
@@ -1874,8 +1879,8 @@ same order of effects recorded through a binding, however long the segments take
 whether budgets expire. It is a property of the scheduler's documented ordering, and holds
 for logical-time work: elapsed waits legitimately change readiness with real time, are not
 covered by it, and are tested separately. A control request that arrives in the middle of a
-step is not ordered logically here: deterministic logical admission of controls is LUA-23's
-(D-30). No claim is made across policies, worker counts,
+step is not ordered logically here: deterministic logical admission of a script instance's
+controls is the instance layer's (LUA-23, [Lifecycle services](#lifecycle-services); D-30). No claim is made across policies, worker counts,
 platforms or versions.
 
 ### What proves it
@@ -1913,8 +1918,9 @@ when it is created with a `scheduledInstances` configuration (`InstanceConfig`);
 tasks as before and loads nothing of this. The modules that host instances declare their hooks as
 optional entry points (`hookEntries`). Periodic update cadence (LUA-24) is described under
 [Cadence](#cadence). What an instance acquires through the application's bindings is owned by the
-engine (LUA-22, [Instance leases](#instance-leases)); granted Lua controls and Lua inspection (LUA-23) and
-real event providers (LUA-7) are later slices.
+engine (LUA-22, [Instance leases](#instance-leases)); control and inspection a script is granted across
+owners (LUA-23) are described under [Lifecycle services](#lifecycle-services); real event providers
+(LUA-7) are a later slice.
 
 ### Instances and identity
 
@@ -2198,8 +2204,9 @@ through the same path with the reason `stopped` before the VM is closed. An owne
 cancelled does not enter Lua for its instances again: no `shutdown` runs, which the settlement reports
 (`ShutdownSkippedUnsafe`), and each instance settles as discarded. That includes an owner whose retirement is
 itself failing: once an instance's `shutdown` raises a failure of the host, or a close or hook is cut short as a
-cancellation is, the instances after it are discarded with the owner's exit, not stopped. A lifecycle binding a script calls
-still answers a typed `NotYetSupported` fault; Lua's own controls and inspection are LUA-23.
+cancellation is, the instances after it are discarded with the owner's exit, not stopped. A lifecycle binding a script
+calls answers a typed `NotYetSupported` fault from an owner that was granted nothing; an owner that was granted lifecycle
+services gives its scripts these same controls (see [Lifecycle services](#lifecycle-services)).
 
 ### Results, inspection and idle
 
@@ -2230,8 +2237,8 @@ the same order of invocations and of effects recorded through a binding, however
 whenever timers fire and whether budgets expire. It holds for logical-time workloads: elapsed waits
 legitimately change readiness, as do elapsed-interval updates, which depend on real time and are tested
 against the injected clock. The order of logical updates among an instance's other invocations, and the
-`dt` each receives, are among what is the same. An event or request that arrives in the middle of a step
-is not ordered logically here; that is LUA-23's.
+`dt` each receives, are among what is the same. An event or an arrival-admitted request that arrives in the middle of
+a step is not ordered logically. A control admitted logically is: see [Logical admission](#logical-admission).
 
 ### What proves it
 
@@ -2438,8 +2445,8 @@ the collection, in its own protected lifetime:
 ### What is not here
 
 Real providers and their retirement (LUA-7), GPU or native game bindings, rollback of committed effects
-(D-7), a longer-lived ownership API than the lease boundary, Lua lifecycle bindings and inspection
-(LUA-23), and periodic update cadence (LUA-24).
+(D-7), a longer-lived ownership API than the lease boundary, and the update cadence of LUA-24, which
+is described under [Cadence](#cadence).
 
 ### What proves it
 
@@ -2456,6 +2463,125 @@ that holds the stop completion, the capacity and the owner's life through a stop
 release operation and the engine's refusal are also pinned in `lua-host-tests`. The cancellation and
 cleanup windows are the kind an asynchronous-exception race can hide on one platform, so CI, which runs
 them on Linux, is the evidence for them and a local pass is not.
+
+## Lifecycle services
+
+`Hetoimasia.Scripting.Lua.Lifecycle` (LUA-23, in `runtime-lua`) lets a script instance's code ask that an
+instance pause, resume or stop, and read snapshots of instances, across owners of one `LuaRuntime`. It builds
+on the instance layer, the capability-owned collection and the instance cadences, and reopens none of their
+contracts. It is available to the application's scripts only where the application grants it, and a grant is
+the whole of the authority.
+
+### Granting
+
+A `LifecycleGrant`, given to an owner as `scheduledLifecycle`, names the owners its scripts may reach
+(`GrantTarget`: `GrantedEndpoint` of another owner of the same runtime created earlier, or `GrantedSelf`), what
+each permits (`PermitInspect`, `PermitControl`) and two bounds (`grantReceiptBound`, `grantSnapshotBound`, each at
+least one; 32 and 64 by `lifecycleGrant`). It is validated before anything starts, and a grant that does not
+make sense is refused, naming every reason, as `LifecycleRefused`: a bound below one, too many or a repeated owner,
+no permits or a repeated one, an owner of another runtime, an owner that hosts no instances, a permitted control
+of an owner that admits logically with no assignment, and an assignment for an owner that does not.
+
+The bindings (`lifecycleBindings`, `lifecycleNamespace`) are registered once, in one `Registration` that any
+number of owners with different grants share, and exposed by an owner's policy like any namespace. Which owner
+is calling is not read from the script: the engine hands each owner's own state to its bindings through the host
+library's `LifecycleContext` (`lifecycleOperationIn`), set from the owner's configuration, so an inspection-only
+owner cannot control, a control-only owner cannot inspect, and an owner with no grant keeps the typed
+`NotYetSupported` fault with its action never run, whichever registration it was given. The calling instance is
+the one whose Lua the owner is running, and the calling task the one whose segment it is. The host library still
+depends on no runtime package, and a lifecycle binding a finalizer may call is never delivered.
+
+### What a script calls
+
+Identities are plain data: a TID is the record `{runtime, owner, id}` and an owner reference `{runtime, owner}`, all
+integers (`instanceIdValue`, `ownerRefValue` make them). They name and grant nothing: a script can forge any
+number, and reaches exactly what its grant covers.
+
+| Call | Answers |
+|---|---|
+| `pause(tid)`, `resume(tid)`, `stop(tid)` | `{accepted = true, receipt = n}` or `{accepted = false, refusal = reason}` |
+| `result(n)` | `pending`, or one of `applied`, `already_in_state`, `no_longer_applicable`, or `unknown_receipt` |
+| `forget(n)` | whether the receipt was held |
+| `inspect(tid)` | `{ok, refusal?, snapshot?}`: the TID, the owner's label, the name and the status |
+| `inspect_owner(ref)` | `{ok, refusal?, instances, truncated}`, in order of identity |
+| `owners()` | `{owners, truncated}`: the covered owners with their label and what each permits |
+| `self()` | the calling instance's TID, or nil |
+
+There is no call that controls an owner as a whole.
+
+### Requests and refusals
+
+A request never blocks, and every refusal is an answer, never a fault. They are decided in this order, and the order is
+the contract: `unauthorized` (the owner is outside the grant, or the grant does not permit the operation there: nothing is
+tested of the target, so an owner outside the grant, another runtime's identity and an identity never issued answer
+alike; it is also the answer to a request made when no instance's code and no task's segment is running, such as an
+initial chunk's or a module's top level, which has no caller to read its answer or to abandon it); for a target admitting logically, `unassigned` (the application is asked for the request's place once the grant
+has passed it, and gave none); `full` (the caller already holds as many receipts as its grant allows); `closed` (the
+target's owner is stopping or has exited); `unknown_target` (within the authorized owner, no live instance has the
+identity: ended, stale or never issued); for a target admitting logically, `late` (the tick has begun) and `duplicate`
+(the place is taken); and `full` (the target's owner holds every result reservation it may). Inspection is refused as
+`unauthorized`, `closed` and `unknown_target`, in that order. Routing is by identity and never by label, so two owners with one label
+are told apart. A request that is accepted reserves its result at the target before it is accepted, and the receipt at
+the caller in the same transaction.
+
+### Receipts
+
+An accepted request settles exactly once: `applied`, `already_in_state`, or `no_longer_applicable` (the instance ended
+first, a stop superseded it, or its owner stopped, failed or was cancelled first). A receipt is held until it is read
+once settled (reading consumes it and gives the reservation back; any later read answers `unknown_receipt`), forgotten
+(the reservation comes back when the request settles), or abandoned: when the instance that made the request ends, when
+a task that made it ends, and when the caller's owner exits. A closing handler a script defined runs as the instance or task
+whose coroutine is being closed, so it asks and reads as that caller and what it asked is abandoned with it. Only the instance or task that made a request reads its
+receipt. Abandoning interest never undoes a request already accepted: it is still applied, or settled, by its target.
+The engine keeps no other history of results; what is held is bounded by `grantReceiptBound`.
+
+### Self-control
+
+An instance may ask for its own control. The request is not applied inside the segment that made it: the target applies
+requests at its safe boundaries, so the segment returns or yields first, and its own inspection inside it still reads the
+status it had. The stop precedence of the Haskell API is unchanged.
+
+### Inspection
+
+`inspect` and `inspect_owner` read one transaction each, so an owner's snapshot is coherent, and borrow no Lua table. A
+snapshot holds the TID, the owner's label, the name and the status (`initializing`, `active`, `paused`, `stopping`,
+`completed`, `stopped`, `failed`). The count is bounded by the grant's snapshot bound and the size by the owner's value limits:
+a list that would not fit is cut, and says so (`truncated`), and never faults the script.
+
+### Logical admission
+
+An owner configured with `instanceControlAdmission = AdmitLogically` admits the controls made through a grant by the tick
+and sequence the application assigned each (D-23). The grant carries an `AssignControl` for such a target, which the engine
+calls for every request that passes the grant, telling it the calling owner, the calling instance, the target and the
+operation, all of them the engine's own knowledge; it answers a `ControlSlot` or declines. The request is applied at the
+logical boundary of its tick, before that tick's ordinary work and cadence point, in the order of (tick, sequence), whatever order
+requests arrived in and whichever VM sent them. The scheduler holds the grant that reaches such a tick, as it holds one a
+cadence point or a woken task owes work for, and applies no later grant, until the owner has applied the tick's controls, so
+grants queued together act exactly as grants served one by one; and the cadence points the tick reached are still the
+scheduler's while the controls are applied, so a pause and a resume assigned to a tick invalidate a point due at it, and the
+next update is a full interval after the resume. One assigned a tick the owner has begun is refused as `late`, one assigned
+a place another request holds as `duplicate`, and one given no place as `unassigned`; none is ever applied at another
+boundary. Admission reads the tick and enqueues in one transaction, so a request accepted for a tick is always queued before that
+tick is visible. A request waiting for its tick holds its reservation, and settles as no longer applicable if its instance
+ends or its owner exits first; its place stays taken until its tick begins whatever became of the request, and the places
+queued are bounded as the reservations are (a request is refused as `full` when the queue holds that many). The application's own `requestInstanceControl` is admitted on arrival whatever the owner admits,
+and `requestInstanceControlAt` takes a place from the Haskell API.
+
+### Determinism
+
+The same tick-assigned requests give the same sequence of controls, and so of effects, however the threads that made them
+interleave: the order is (tick, sequence) and nothing about arrival. Requests admitted on arrival are not ordered logically.
+
+### What proves it
+
+`Test.LuaRuntime.Lifecycle.*`, in `lua-runtime-tests`, run real instances on two or more real supervised scheduled owners,
+under injected clocks and fake wakes, with gates and barriers and no sleeps: one registration shared by owners with different
+grants, authority and its refusals, control across owners and its receipts, every refusal, exactly-once settlement whatever
+ends a target first, abandonment by a caller's instance, task or owner, self-control, inspection and its bounds, and logical
+admission (order independence, late, duplicate, unassigned, before-the-tick's-work, racing the grant that begins a tick,
+and retirement). The host library's examples (`Test.Lua.Boundary.*`) pin that a lifecycle operation is delivered only
+to an owner configured with a context. Cancellation and shutdown windows are the kind an asynchronous-exception race can
+hide on one platform, so CI, which runs them on Linux, is the evidence for them and a local pass is not.
 
 ## The protocol model
 
