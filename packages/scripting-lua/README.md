@@ -42,8 +42,10 @@ them: instances of a module with their own state, hooks, event callbacks and a
 lifecycle the application controls. See [Script instances](#script-instances).
 **Lifecycle services** (LUA-23) let an owner's scripts pause, resume, stop and inspect instances
 of the owners the application grants them, and nothing else. See
-[Lifecycle services](#lifecycle-services). Any
-concrete game namespace, asynchronous requests and the confined path are later slices of
+[Lifecycle services](#lifecycle-services). **Asynchronous requests** (LUA-7) let a script ask a provider for something it
+will answer later, with a reserved result slot, settled exactly once and, on a logical owner, delivered at the tick the
+application assigned. See [Asynchronous requests](#asynchronous-requests). Any
+concrete game namespace and the confined path are later slices of
 [the Lua runtime design](../../docs/lua_runtime_design.md). What is here is the
 boundary they will be built on, and the evidence that it holds.
 
@@ -699,9 +701,9 @@ eligibilities (D-14):
 | snapshot query | `snapshotQuery` | trusted direct path | values |
 | owned state operation | `stateOperation` | trusted direct path | values |
 | command or UI intention | `commandIntention` | trusted direct path | `true, nil` accepted, or `false, reason` (at most 256 UTF-8 bytes) as data |
-| asynchronous native request | `asynchronousNativeRequest` | classified only | a Lua call is a typed `NotYetSupported` fault; the action never runs |
+| asynchronous native request | `asynchronousNativeRequest`, `asynchronousNativeRequestIn` | an owner configured with a request context | from an owner with none, a Lua call is a typed `NotYetSupported` fault and the action never runs; from one with it, the action runs and (`asynchronousNativeRequestIn`) is handed that owner's own context (see [Asynchronous requests](#asynchronous-requests)) |
 | lifecycle operation | `lifecycleOperation`, `lifecycleOperationIn` | an owner configured with a lifecycle context | from an owner with none, a Lua call is a typed `NotYetSupported` fault and the action never runs; from one with it, the action runs and (`lifecycleOperationIn`) is handed that owner's own context (see [Lifecycle services](#lifecycle-services)) |
-| scheduler operation | `yieldOperation`, `waitOperation` | trusted direct path | nothing: the task's coroutine is suspended (see [Tasks](#tasks-and-the-coroutine-library)) |
+| scheduler operation | `yieldOperation`, `waitOperation` | trusted direct path | nothing: the task's coroutine is suspended (see [Tasks](#tasks-and-the-coroutine-library)); a wait for a request's settlement (`WaitSettlement`) is delivered only to an owner configured with a request context |
 
 The defaults are the safe ones: a binding is **direct-eligible** and nothing
 else, so a default registration exposes nothing to a mod
@@ -1919,8 +1921,9 @@ tasks as before and loads nothing of this. The modules that host instances decla
 optional entry points (`hookEntries`). Periodic update cadence (LUA-24) is described under
 [Cadence](#cadence). What an instance acquires through the application's bindings is owned by the
 engine (LUA-22, [Instance leases](#instance-leases)); control and inspection a script is granted across
-owners (LUA-23) are described under [Lifecycle services](#lifecycle-services); real event providers
-(LUA-7) are a later slice.
+owners (LUA-23) are described under [Lifecycle services](#lifecycle-services); the requests a script makes of
+providers (LUA-7) are described under [Asynchronous requests](#asynchronous-requests), and real event providers
+(LUA-26) are a later slice.
 
 ### Instances and identity
 
@@ -2428,7 +2431,10 @@ through one guard that answers the failure instead of raising it, with what it a
 that guard, and a failure of one is recorded while the independent ones go on. No failure is dropped:
 where several arise together (several endings settling at once, several releases of a drain, several
 retirements failing in one reading) the first is raised and every other is kept whole as cleanup evidence
-on the owner, so supervision receives each of them. The lease keeps its charge until the provider says it is done. The owner awaits it outside
+on the owner, so supervision receives each of them. The lease keeps its charge until the provider says it is done. The reading, the guard, the held
+disposals and their rules are one primitive, `Hetoimasia.Scripting.Lua.Retention`, which the request service
+uses for its provider work too (see [Asynchronous requests](#asynchronous-requests)); a lease's behavior is
+unchanged by that. The owner awaits it outside
 the collection, in its own protected lifetime:
 
 * the instance's stop completion settles only after its obligations have completed; until then it is
@@ -2449,7 +2455,7 @@ the collection, in its own protected lifetime:
 
 ### What is not here
 
-Real providers and their retirement (LUA-7), GPU or native game bindings, rollback of committed effects
+Real providers (a request's provider and its retirement are [Asynchronous requests](#asynchronous-requests)), GPU or native game bindings, rollback of committed effects
 (D-7), a longer-lived ownership API than the lease boundary, and the update cadence of LUA-24, which
 is described under [Cadence](#cadence).
 
@@ -2587,6 +2593,203 @@ admission (order independence, late, duplicate, unassigned, before-the-tick's-wo
 and retirement). The host library's examples (`Test.Lua.Boundary.*`) pin that a lifecycle operation is delivered only
 to an owner configured with a context. Cancellation and shutdown windows are the kind an asynchronous-exception race can
 hide on one platform, so CI, which runs them on Linux, is the evidence for them and a local pass is not.
+
+## Asynchronous requests
+
+`Hetoimasia.Scripting.Lua.Provider` and `Hetoimasia.Scripting.Lua.Request` (LUA-7, in `runtime-lua`) let a script ask
+for something an engine operation will answer later (pathfinding, an asset load, a query) without blocking its owner
+and without a provider's thread ever entering Lua. They follow P-7 of [the Lua runtime
+design](../../docs/lua_runtime_design.md): a component-local protocol, not an engine RPC bus. A bounded
+single-assignment result slot is reserved before a request is accepted; a response fills it without waiting on a
+shared queue; the session, domain, request identity and generation are carried; every admitted request settles
+exactly once, with a result, a failure or a cancellation; and a duplicate, late or stale reply cannot overwrite it.
+Cancelling revokes interest and is not proof that native work ended, so what the provider borrowed stays owned until
+it proves the work over. The mechanics are proven with fake providers. Subscriptions and provider events are
+[LUA-26](../../docs/lua_runtime_design.md#lua-26-deliver-provider-events-through-owned-lua-subscriptions)'s, which
+reuses this section's granted service, guard and epoch operation unchanged.
+
+### Granting the service
+
+A scheduled owner is granted the service when it is created, with `scheduledRequests ∷ Maybe RequestGrant`. A
+`RequestGrant` names the providers' endpoints (`RequestEndpoint`: a name, the schema of what the provider answers, and
+how a request is handed to it), the bound on the requests the owner holds, and when settlements reach Lua
+(`RequestTiming`). The grant is the whole of the authority. An owner created with none keeps the
+`NotYetSupported` fault every asynchronous request answered before, with its action never run, whichever registration it
+was given; the finalizer refusals do not change (an asynchronous binding still cannot be declared finalizer-eligible,
+and a call made while the VM closes is still refused with `FinalizerRefused` before dispatch). A grant that does not
+make sense (a bound below one, no endpoint, an invalid or repeated endpoint name, a result schema that names a
+capability, or value limits too small to hold the smallest failure or cancellation record a script is handed:
+`SettlementsDoNotFit`) is refused before anything starts as `RequestGrantRefused`, naming every reason. One registration serves
+any number of owners with different grants, because the binding's action is handed the *owner's own* `RequestContext`,
+read from the owner's configuration and never from a value a script supplied (`asynchronousNativeRequestIn`).
+
+### What a provider implements
+
+An endpoint's `endpointSubmit` is handed a `Submission`: the request's arguments (bounded copies), a `Completion` and
+the request's identity (`RequestInfo`: the owner, the instance, the endpoint and the request's number). It answers a
+`ProviderWork`, which is how the engine later withdraws interest (`workCancel`) and reads where the provider's own
+retirement of the work has got to (`workRetirement`, a transaction that must not retry). The provider answers through
+the `Completion`, from any thread, now or later: `ProviderResult` with a value, or `ProviderFailure` with a reason.
+Completing is one transaction that writes the request's reserved slot, or holds the answer, and never waits for the
+owner, a queue or Lua, so a full owner never makes a provider's thread wait. The answer says what became of the
+reply (`ReplyAnswer`): settled, held for its tick, refused for its size or shape, late, or unknown. None is an error;
+a duplicate, late or stale reply is evidence about the provider, is counted, overwrites nothing, and still retires
+the provider's work.
+
+A reply is bounded before it is retained, against the owner's value limits and the endpoint's schema, and what is
+measured is the record a script is handed when it takes the result, not the bare value, so a result that is
+retained is a result that can be delivered. A result over the limits settles an unsettled request as a failure, its
+value never kept, and retires the provider's accounting, as the model's `applyReplyIn` does; so does a result that is
+not what the endpoint declares. The same holds for a failure: a provider's failure reason is bounded, and one whose
+record would not fit the limits is retained as a failure that says so. Every record a script is handed (result,
+failure, cancellation) fits the owner's limits. Taking a settlement retires its handle, so it never loses one to a
+fault: a result that the taking operation itself cannot hold (its declared schema is not the endpoint's) is
+delivered as a failure that says so.
+
+### What a script sees
+
+A binding's author starts a request with `startRequest` and returns the handle as a capability
+(`requestHandleValue`, of a type declared with `requestHandleType`). The generic operations a script uses on it are
+supplied by `requestBindings` (a namespace the application names): `ready(h)` answers without blocking whether the
+request has settled; `take(h)` takes the settlement once, as `{status, value, reason}` (`"pending"` without taking
+anything, or `"result"`, `"failure"` or `"cancelled"`), and retires the handle; `cancel(h)` settles the request as
+cancelled (or answers `"settled"` when it settled first and keeps its settlement); and `wait(h)` gives control back,
+cooperatively and without blocking the owner, until the request has settled. A wait in `init` or `shutdown` is a
+hook fault as any wait is there; an owner with no service answers the wait `NotYetSupported`.
+
+A handle carries no authority. It names a request of the instance, or task, that made it; another requester's handle,
+one whose settlement was taken and one that names nothing are refused as a fault of the call, never run.
+
+### Admission and the reserved place
+
+`startRequest` never blocks. It is allowed in any invocation of an instance that is taking requests, `init` included,
+and from a task's segment. It reserves the request's place in the protocol model's session before the provider is
+asked anything, and the place is held until the settlement has been taken or discarded *and* the provider has proved
+its work over: a result nobody took counts, and so does a cancelled request whose provider has not finished.
+
+A request is refused, as a fault of the call and never a failure of the host, and with the provider asked nothing,
+in this order: when no instance or task is running to receive the answer; when the owner or the instance is no longer
+taking requests (it is stopping, which a `shutdown` hook and a coroutine's closing handlers already are, and so
+is a task whose coroutine is being closed); when the
+application's assignment declined to place it; when the tick assigned is one the owner has begun; when the place
+assigned is taken; and when every place is held. An endpoint the grant does not name is the application's own mistake
+and a failure of the host.
+
+### Whose a request is
+
+An instance owns its requests, not the invocation that admitted them. They survive that invocation's end until their
+settlement is taken, they are cancelled, or the instance ends; ending an invocation's task revokes nothing. This is
+the model's *holder*: an identity the session issues for an owner that is not one of its tasks, ended with the instance
+through the same revocation a retiring task's requests go through. A task of the owner that is no instance's invocation
+owns its own, and they are revoked at the first safe boundary after it ends.
+
+When an instance ends (a stop, a failed `init`, a faulting invocation, a one-shot's completion, the owner's exit) each
+of its requests settles once, as cancelled by the requester's end, and the providers are told once. The instance's
+settlement then *waits* for those providers to prove their work over, as it waits for a lease's retirement, so
+nothing is reported as stopped or reclaimed merely because Lua stopped. A scheduled owner's exit does the same for
+everything left: it revokes, tells the providers and stays live, through a stop and through a cancellation, until each
+has said it is done.
+
+### Settling on arrival, and at an assigned tick
+
+`RequestTiming` is the owner's kind of time. **`SettleOnArrival`** is an owner on elapsed time: a reply settles the
+request when it arrives, the first settlement wins, and the waiting script resumes at the next safe boundary after it.
+A cancel that finds the request settled is refused, counted (`rdLateCancels`), and the settlement stands. While the
+instance is paused a settlement is retained in its slot without resuming Lua (D-26).
+
+**`SettleAtAssignedTick`** is an owner on logical time (D-23, D-36, D-39). The application's policy, called through
+the binding that admits the request, assigns the tick its settlement is due (`AssignRequest`, which may decline,
+and by default the next tick) and the place among the requests due then, as LUA-23 assigns a control's. A tick the
+owner has begun is refused as late, and a place that is taken as a duplicate. Then:
+
+* a reply that arrives *before* the due tick is a **held completion**, kept in the request's record and not a
+  settlement, until the request's place is served at the boundary of its tick (so a duplicate that arrives after
+  the owner applied the tick and before it served the place is still a duplicate). The first is kept; a later one is counted (`rdDuplicateHeld`) and never replaces it or resurrects a
+  value a cancel discarded; the script cannot see it, and readiness reports pending;
+* the tick does **not begin** until the request is complete. The scheduler holds the grant that would reach it
+  (`holdTick`), as LUA-23 holds a tick for its controls, until the completion is held or the request is cancelled
+  or its requester ended. A slow provider stalls the owner only at its tick, a provider that never answers stalls
+  it there until its stop or failure ends the request, and later grants wait behind the held one in order;
+* a **cancel before the due tick always wins**: the request settles `Cancelled` whatever the provider has done, any
+  held value is discarded without reaching Lua, the tick's hold is released and the provider's work is retired. The
+  same cancel gives the same `Cancelled` settlement and the same recorded effects whether the reply arrived before it
+  or after;
+* a request that is not cancelled settles at its tick, at the boundary where the grant that reached it is held, in the
+  order of the places, with what the provider delivered, and the tasks waiting for them are woken in that order.
+  Readiness answers from logical state: pending before the tick, settled from it on.
+
+The one watch the owner keeps on a tick is shared with LUA-23's tick-assigned controls and with cadence points: each
+is served at the boundary of its tick, controls first, and what is next watched for is the earliest tick any of them
+is still waiting for, taken in the same transaction as the step that served the last, so none leaves another
+without its watch. An owner that hosts no instances serves the watch's points itself. No ordinary work for the due
+tick begins while a required completion is pending, cadence work included.
+
+### Cancellation and the provider's lifetime
+
+Cancellation (a script's, the requester's end, an epoch change, the owner's stop) revokes interest and settles the
+waiter `Cancelled`. It does not tell the engine the work ended. Outstanding provider work is a **retained
+retirement obligation**, and it is the same one the instance leases keep: the primitive (`Hetoimasia.Scripting.Lua.Retention`:
+`Obligation`, `RetirementState`, the single reading `pollObligation`, the single guard `guarded`, and the
+disposals held behind obligations and run only after they completed without failure) is shared by a lease's
+`retireAsynchronously` and by the request service, which keeps no copy of the rules. The request's work is not a
+lease and is not charged to a lease slot or to lease capacity; it is charged to the request bound (the request's place
+is held until the provider proves its work over), and it stays so until the provider proves it over, by replying or
+by its own reading (`workRetirement`). A binding's `afterCompletion` (what the work needed, such as a borrowed
+dependency) is disposed of on the owner's thread, uninterruptibly, only after that, and never if the retirement
+failed; a retirement failure is a cleanup failure, fatal under every policy. The provider is told *once* that
+interest was withdrawn, as soon as it can be; a provider that had already finished is not asked to stop. The model is
+told the work is over whenever its request has settled and the work is known over, whichever came last, so work
+that ended long before the request settled (a completion held for its tick) never leaves a place charged.
+
+### Epochs
+
+`advanceRequestEpoch` (P-9) replaces the generation of an owner's records at a moment the application chooses.
+Every outstanding request settles, once, as cancelled by the epoch change, and its script can take that; a cancellation
+nobody has taken is still a place held, charged to the bound until it is taken, so repeated epochs cannot accumulate
+more than the bound; a settled result nobody had taken is discarded with the epoch's records, as the model discards
+it; the ticks the requests held are let go; and the providers whose work that was are told by the owner at its next
+boundary, as for every other withdrawal of interest, so one that raises is a failure of the host under the owner's
+policy and nothing is raised on the application's thread. The accounting for work that is not over is retained under
+the identities it was issued under, so a late reply retires it without reaching anything the new epoch issues.
+Instances and tasks are not invalidated by it.
+
+### The guard, and what a failure is
+
+Every call into provider code (handing a request over, withdrawing interest, reading a retirement, disposing of what
+the work needed, and the application's assignment) goes through **one guard**, `guarded` (its transactional form,
+which the provider's own reading uses, is the same one the leases use), and is fully evaluated inside it. Nothing
+is dropped: where failures arise together the first is raised and the others are kept whole as cleanup evidence.
+
+* A provider reporting a failure is a reply, and settles the request as a failure, returned as data.
+* Provider code raising when the engine calls it (handing a request over, withdrawing interest, the assignment) is
+  a failure of application code: a failure of the host under the owner's `WorkerPolicy`, unconverted. A request
+  whose handoff raised is taken back as though it had never been admitted.
+* A provider's retirement that fails, and the disposal of what its work needed that raises, are cleanup failures:
+  retained on the work, never retried, fatal under every policy. Servicing answers each once, and recording it is
+  the same masked step, so a cancellation of the owner cannot come between and lose it; the same holds for a tell
+  that was claimed.
+
+### Determinism
+
+On one logical owner, identical inputs give identical settlements, settlement order and recorded effects however
+provider delays, arrival order and segment delays vary. The inputs are the admissions with their assigned ticks,
+cancels at logical points, and grants. What a binding's disposal of a dependency does follows when the provider
+finished, which is not logical time, and no script can see it.
+
+### What proves it
+
+`Test.LuaRuntime.Request.*`, in `lua-runtime-tests`, run real instances and tasks on real supervised scheduled owners
+with a fake provider the examples drive by hand, an injected clock and gates, never a sleep: admission and every
+refusal, a place reserved before the provider is asked and held until its work is over; settlement on every path
+with duplicate, late, unknown, oversized and malformed replies; interests admitted in `init` and in an update and
+taken in a later invocation; the instance's end and the owner's stop, failure and cancellation waiting for the
+provider; waits, pause, readiness and hook faults; a provider that raises, a retirement that fails, and failures
+arising together; a completion that never waits for the owner; the assigned tick, the held completion, the tick held
+until the provider completes, a late, unassigned or duplicate place, the cancel that wins whichever of the reply
+and the cancel came first, the order of the places, holds shared between requests, cadence work and controls, and
+determinism across arrival orders; and epochs. The protocol model's holders are pinned in `lua-host-tests`. The
+cancellation and cleanup windows are the kind an asynchronous-exception race can hide on one platform, so CI, which runs
+them on Linux, is the evidence for them and a local pass is not.
 
 ## The protocol model
 
@@ -2776,7 +2979,8 @@ worker unwound.
 | --- | --- |
 | LUA-21, the scheduling machinery | `Session` admission and its caps, `ServiceClass`, `Quanta` and `validateLimits`, `Ordinal`, the ready, waiting and paused states and their transitions, `activateNext`, `stopSession` |
 | LUA-6, the scheduled owner | the same, through LUA-21's machinery, with `TaskId` scoped by the owner's identity and wrapped in `ScheduledTaskId` |
-| LUA-7, requests and subscriptions | `RequestId`, `Settlement`, `Reply`, the two obligations, `OverloadPolicy` |
+| LUA-7, requests | `RequestId`, `Settlement`, `Reply`, the two obligations, holders, the epoch change and the stop, in a session of the owner's requests |
+| LUA-26, subscriptions | `OverloadPolicy`, and LUA-7's granted service, guard and epoch operation unchanged |
 | LUA-9, the child-process transport | every identity, `Payload`, `Reply`, `SegmentOutcome`, the rejection vocabulary |
 | LUA-5, supervision integration | `Limits` and `validateLimits`, for the two caps its call dispatch has (`maxQueuedAdmissions`, `maxRetainedResults`) |
 
@@ -2786,8 +2990,10 @@ discarded. The scheduling machinery is the first consumer of a session of tasks:
 one `Session` per scheduler, drives its transitions, and answers the model's `ExitRecord`
 in its stop report. It does not use the model's `reportFailure`, whose unsafe case ends the
 whole session (D-7): a failed task is failed alone, its `TaskFailure` and recovery marking are
-reported in the turn, and whether a session ends is the integrating owner's decision. Requests
-and subscriptions wait for LUA-7.
+reported in the turn, and whether a session ends is the integrating owner's decision. The request service keeps a
+session of its own (the scheduler's has no requests): requests are owned by *holders* the session issues, which an
+instance's end revokes through the same path a retiring task's requests go through; its epoch is the request
+service's, and the instances and tasks are not invalidated by it. Subscriptions wait for LUA-26.
 
 ## Running the suite
 

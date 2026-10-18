@@ -111,6 +111,8 @@ because Lua stopped. A release that fails is recorded, not silently retried.
 
 Delivery note: LUA-22 (#473) implements the automatic resource ownership rules above;
 the binding author's view of it is `packages/scripting-lua/README.md`, "Instance leases".
+Delivery note: LUA-7 (#482) implements the request rules of the pause and ordering sections;
+the binding author's view of it is `packages/scripting-lua/README.md`, "Asynchronous requests".
 
 ## Initialization and failure rules
 
