@@ -58,6 +58,7 @@ import Control.Exception
   ( ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException
   , SomeException
+  , finally
   , fromException
   , mask
   , mask_
@@ -120,12 +121,14 @@ import Hetoimasia.Scripting.Lua.Instance.Run
   , newInstanceHost
   , retireInstances
   , recordExit
+  , runningTask
   , serviceBoundary
   , serviceInstances
   , settleEnded
   )
 import Hetoimasia.Scripting.Lua.Instance.Types (Escalation, InstanceFailure)
 import Hetoimasia.Scripting.Lua.Scheduled.Shared (closeSuspended, exitOf, settledOrRaise, waitReport)
+import Hetoimasia.Scripting.Lua.Lifecycle.State (LifecycleState (lifeTask))
 import Hetoimasia.Scripting.Lua.Scheduled.Types
 import Hetoimasia.Scripting.Lua.Scheduler
   ( SegmentReport (..)
@@ -191,8 +194,8 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
             -- close was not interrupted, which an exit settles as discarded.
             hostClose = \task → do
               began ← Map.member task <$> readIORef tasks
-              closed ← try @SomeException (closeSuspended owned tasks kept task)
               instances ← readIORef instanceRef
+              closed ← try @SomeException (closeAs control instances task (closeSuspended owned tasks kept task))
               let interrupted = case closed of
                     Left failure | Just (_ ∷ SomeAsyncException) ← fromException failure → True
                     _ → False
@@ -253,7 +256,7 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
   -- cleanup a script asked for.
   held ← Map.keys <$> readIORef tasks
   swept ← forM held $ \held' → do
-    closed ← try @SomeException (closeSuspended owned tasks kept held')
+    closed ← try @SomeException (closeAs control heldInstances held' (closeSuspended owned tasks kept held'))
     -- Counted for its instance, which the exit then ends; an interruption of the close
     -- is a cancellation, as it is in the scheduler's stop.
     forM_ heldInstances $ \ih → do
@@ -324,9 +327,23 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
         then pure (retained && not halt)
         else loop host kept extra instanceRef
 
+-- | Close a task's coroutine as the task, and as its instance if it is an invocation of one.
+closeAs ∷ Control → Maybe InstanceHost → TaskId → IO a → IO a
+closeAs control instances task action = withTaskNoted control task (maybe action (\ih → runningTask ih task action) instances)
+
 -- | The handle of a module the configuration loaded.
 resolve ∷ OwnedVm → ModuleRef → IO (Maybe (ModuleRef, ModuleHandle))
 resolve owned ref = fmap ((,) ref) <$> loadedModule owned ref
+
+-- | Run this noting, for the owner's lifecycle services, which task is running, which they tell
+-- who a call is from by: set by the owner's own thread, and cleared however it ends. A segment
+-- is run so, and so is the closing of a coroutine, which runs the script's own closing handlers.
+withTaskNoted ∷ Control → TaskId → IO a → IO a
+withTaskNoted control task action = case controlLifecycle control of
+  Nothing → action
+  Just lifecycle → do
+    atomically (writeTVar (lifeTask lifecycle) (Just task))
+    action `finally` atomically (writeTVar (lifeTask lifecycle) Nothing)
 
 -- | Run one segment of a task: start it, or resume it, and say how it ended.
 --
@@ -345,7 +362,7 @@ runSegment
   → IORef (Maybe InstanceHost)
   → TaskRun Cursor
   → IO (SegmentReport Cursor)
-runSegment control observe owned identity label handlesRef tasks extra instanceRef run = do
+runSegment control observe owned identity label handlesRef tasks extra instanceRef run = withTaskNoted control (runTask run) $ do
   observe
     SegmentContext
       { contextTask = ScheduledTaskId (controlOwner control) (runTask run)

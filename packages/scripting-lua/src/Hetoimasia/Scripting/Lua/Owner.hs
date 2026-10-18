@@ -234,6 +234,7 @@ import Hetoimasia.Scripting.Lua.Internal.Owner
       ( ownerCallbackScope
       , ownerChunks
       , ownerGranted
+      , ownerLifecycle
       , ownerLimits
       , ownerModules
       , ownerName
@@ -245,7 +246,7 @@ import Hetoimasia.Scripting.Lua.Internal.Owner
   , ownedHost
   , withOwnedVm
   )
-import Hetoimasia.Scripting.Lua.Internal.Registration (Registration, emptyRegistration)
+import Hetoimasia.Scripting.Lua.Internal.Registration (LifecycleContext, Registration, emptyRegistration)
 import Hetoimasia.Scripting.Lua.Internal.Task
   ( Task
   , TaskStart (..)
@@ -278,12 +279,17 @@ data VmConfig = VmConfig
     -- ^ Modules loaded inside the lifetime, in order, after the initial chunks
     -- and before the body. One that fails ends the lifetime with its fault, after
     -- closing the VM.
+  , vmLifecycle ∷ Maybe LifecycleContext
+    -- ^ What delivers this owner's lifecycle operations ('lifecycleOperationIn'):
+    -- an opaque value of the application's runtime, which this library never
+    -- reads. 'Nothing', the default, leaves a lifecycle operation answering a typed
+    -- 'NotYetSupported' fault whose action never runs.
   }
 
 -- | A configuration over these libraries with no initial chunk, an empty
 -- registration, no exposed namespace, the default value limits and no module.
 vmConfig ∷ [Library] → VmConfig
-vmConfig libraries = VmConfig libraries [] "owner" emptyRegistration [] defaultValueLimits []
+vmConfig libraries = VmConfig libraries [] "owner" emptyRegistration [] defaultValueLimits [] Nothing
 
 -- | Run a body over a VM this owner constructs, and close the VM on every exit.
 --
@@ -307,6 +313,7 @@ withVmOwnerScoped scope config =
       , ownerLimits = vmValueLimits config
       , ownerModules = vmModules config
       , ownerCallbackScope = scope
+      , ownerLifecycle = vmLifecycle config
       }
 
 -- | Load a module from the owner's body, in an environment of its own.

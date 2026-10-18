@@ -117,6 +117,7 @@ import Hetoimasia.Scripting.Lua.Internal.Call (ChunkName, callGlobal, evalChunk)
 import Hetoimasia.Scripting.Lua.Internal.Module (Host, ModuleSource, loadModule, newHost)
 import Hetoimasia.Scripting.Lua.Internal.Registration
   ( Binding (bindingFinalizer, bindingName)
+  , LifecycleContext
   , Namespace (namespaceBindings, namespaceName)
   , Registration
   , emptyRegistration
@@ -176,6 +177,9 @@ data OwnerConfig = OwnerConfig
   , ownerCallbackScope ∷ !CallbackScope
     -- ^ What runs around each of the VM's callbacks, on the callback's thread.
     -- Nothing by default.
+  , ownerLifecycle ∷ !(Maybe LifecycleContext)
+    -- ^ What delivers this owner's lifecycle operations. Nothing by default: they
+    -- are refused as not yet supported.
   }
 
 -- | An owner over these libraries with no initial chunk, an empty finalizer
@@ -195,6 +199,7 @@ defaultOwnerConfig libraries =
     , ownerLimits = defaultValueLimits
     , ownerModules = []
     , ownerCallbackScope = noCallbackScope
+    , ownerLifecycle = Nothing
     }
 
 -- | The names of the bindings a Lua finalizer may run during this owner's close:
@@ -239,7 +244,7 @@ withOwnedVm config body = mask $ \restore → do
   -- Masked, and the VM is this owner's from the return: from here nothing is
   -- interruptible until the handler below is installed.
   vm ← allocateVm (VmSpec (ownerBudget config) (Just self) (FinalizersAllow (finalizerAllowlist config)) (ownerCallbackScope config))
-  let boundary = Boundary (ownerName config) (vmIdentity vm) (ownerRegistration config) (ownerLimits config)
+  let boundary = Boundary (ownerName config) (vmIdentity vm) (ownerRegistration config) (ownerLimits config) (ownerLifecycle config)
   host ← newHost vm boundary
   ran ← tryWithContext @SomeException $ restore $ do
     ownerAfterAllocation config vm

@@ -23,6 +23,16 @@
 -- of this owner's scheduler and so are ordered by its policy among its tasks. An
 -- owner without the configuration loads nothing for them and behaves as it did.
 --
+-- = Lifecycle services
+--
+-- An owner created with a 'scheduledLifecycle' grant gives its scripts control and
+-- inspection of the script instances of the owners the grant covers, and of its own,
+-- as "Hetoimasia.Scripting.Lua.Lifecycle" documents. The grant is the whole of the
+-- authority, and an owner created without one keeps the not-yet-supported fault every
+-- lifecycle operation answered. The grant is checked against the owners it names before
+-- anything starts and refused, naming every reason, as 'LifecycleRefused'. The owner's
+-- exit abandons the receipts its scripts held, which undoes no request they had made.
+--
 -- = Creation and readiness
 --
 -- 'startScheduledOwner' validates the scheduler's configuration (the caps and the
@@ -304,7 +314,9 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits (Quanta (..), Quantum (..), ServiceClass (..))
 import Hetoimasia.Scripting.Lua.Internal.Value (checkLimits)
 import Hetoimasia.Scripting.Lua.Instance.Driver (connectNamespace, driverNamespaceName, driverSource)
+import Hetoimasia.Scripting.Lua.Instance.Run (gateOf)
 import Hetoimasia.Scripting.Lua.Instance.State (isInstanceTask)
+import Hetoimasia.Scripting.Lua.Lifecycle (LifecycleGrant, LifecycleRefused (LifecycleRefused), lifecycleContextOf, newLifecycleState, resolveGrant)
 import Hetoimasia.Scripting.Lua.Instance.Types
   ( InstanceConfig (instanceEscalate, instanceSources)
   , InstanceViolation (RegistrationRefused)
@@ -312,7 +324,7 @@ import Hetoimasia.Scripting.Lua.Instance.Types
   , newInstances
   , validateInstanceConfig
   )
-import Hetoimasia.Scripting.Lua.Owner (ModuleRef (moduleRefName), VmConfig (vmModules, vmOwnerName, vmPolicy, vmRegistration, vmValueLimits))
+import Hetoimasia.Scripting.Lua.Owner (ModuleRef (moduleRefName), VmConfig (vmLifecycle, vmModules, vmOwnerName, vmPolicy, vmRegistration, vmValueLimits))
 import Hetoimasia.Scripting.Lua.Registration (registration, registrationCapabilityTypes, registrationNamespaces)
 import Hetoimasia.Scripting.Lua.Runtime.Shared
 import Hetoimasia.Scripting.Lua.Runtime.Types
@@ -392,11 +404,17 @@ data ScheduledSpec = ScheduledSpec
   , scheduledMemberLimit ∷ Int
     -- ^ The most members the owner's collection holds live at once. At least one:
     -- a lower limit is refused when the owner is created.
+  , scheduledLifecycle ∷ Maybe LifecycleGrant
+    -- ^ The lifecycle control and inspection the owner's scripts are granted, naming the
+    -- owners they cover and what each permits. 'Nothing', the default, leaves every
+    -- lifecycle operation refused as not yet supported. See
+    -- "Hetoimasia.Scripting.Lua.Lifecycle".
   }
 
 -- | A configuration with the supplied defaults: the FIFO policy, the production
 -- clock and timer, the gameplay domain, nothing observing segments, no lending
--- handle and room for 'defaultMemberLimit' members when there is one.
+-- handle, room for 'defaultMemberLimit' members when there is one, and no
+-- lifecycle grant.
 scheduledSpec ∷ VmConfig → WorkerPolicy → SchedulerBounds → ScheduledSpec
 scheduledSpec config worker bounds =
   ScheduledSpec
@@ -411,6 +429,7 @@ scheduledSpec config worker bounds =
     , scheduledInstances = Nothing
     , scheduledLending = Nothing
     , scheduledMemberLimit = defaultMemberLimit
+    , scheduledLifecycle = Nothing
     }
 
 -- | How many live members an owner's collection holds by default.
@@ -494,18 +513,24 @@ startScheduledOwner runtime spec = do
         , schedStopRequested = stopping
         }
       >>= either (throwFailure runtimeComponent (operation "start-scheduled-owner") []) pure
+  -- The owner's control, without its lifecycle services: what the owner's own gate reads
+  -- is the scheduler and whether it is stopping, which it already has.
+  let ownInstances = fmap (\(instances, _, _) → instances) hosted
+  cells ← newTVarIO Map.empty
+  faults ← newTVarIO Map.empty
+  begun ← newTVarIO mempty
+  exited ← newTVarIO Nothing
+  let bare = Control owner label (vmValueLimits config) scheduler cells faults begun closing exited stopping ownInstances Nothing
+  -- A lifecycle grant is resolved against the owners it names before anything starts, and
+  -- refused naming every reason.
+  lifecycle ← forM (scheduledLifecycle spec) $ \grant →
+    case resolveGrant owner label ((\instances → (instances, gateOf bare)) <$> ownInstances) grant of
+      Right targets → newLifecycleState owner label (vmValueLimits config) ownInstances targets grant
+      Left refused → throwFailure runtimeComponent (operation "start-scheduled-owner") [] (LifecycleRefused refused)
   -- The handle is taken once the configuration is known to be acceptable and
   -- before anything starts.
   traverse_ bindLending (scheduledLending spec)
-  control ←
-    Control owner label (vmValueLimits config) scheduler
-      <$> newTVarIO Map.empty
-      <*> newTVarIO Map.empty
-      <*> newTVarIO mempty
-      <*> pure closing
-      <*> newTVarIO Nothing
-      <*> pure stopping
-      <*> pure (fmap (\(instances, _, _) → instances) hosted)
+  let control = bare {controlLifecycle = lifecycle}
   handoff ← newTVarIO Nothing
   let definition =
         workerDefinition
@@ -517,7 +542,7 @@ startScheduledOwner runtime spec = do
                 -- everything that already ended the owner has done this.
                 (\held → atomically (settleAll held ExitFailed))
           )
-          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) (fmap (\(_, instanceConfig, _) → instanceEscalate instanceConfig) hosted) (scheduledLending spec) (scheduledMemberLimit spec) config)
+          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) (fmap (\(_, instanceConfig, _) → instanceEscalate instanceConfig) hosted) (scheduledLending spec) (scheduledMemberLimit spec) config {vmLifecycle = lifecycleContextOf <$> lifecycle})
   -- Acquisition is masked from the worker's start to the endpoint's handoff, and
   -- only the readiness wait is restored, exactly as for a finite-call owner.
   mask $ \restore → do
