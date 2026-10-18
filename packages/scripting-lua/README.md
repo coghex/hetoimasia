@@ -1904,9 +1904,9 @@ reads. It follows the accepted
 [instance contract](../../docs/lua_instance_contract.md) (D-26, D-27). An owner hosts instances
 when it is created with a `scheduledInstances` configuration (`InstanceConfig`); one without serves
 tasks as before and loads nothing of this. The modules that host instances declare their hooks as
-optional entry points (`hookEntries`). Leases on Lua-exposed resources (LUA-22), granted Lua
-controls and Lua inspection (LUA-23), periodic update cadence (LUA-24) and real event providers
-(LUA-7) are later slices.
+optional entry points (`hookEntries`). Periodic update cadence (LUA-24) is described under
+[Cadence](#cadence). Leases on Lua-exposed resources (LUA-22), granted Lua controls and Lua
+inspection (LUA-23) and real event providers (LUA-7) are later slices.
 
 ### Instances and identity
 
@@ -1944,7 +1944,7 @@ rather than being dropped.
 | Hook | When | Suspends |
 | --- | --- | --- |
 | `init(self, api)` | once, as a finite call, before anything else; an absent `init` is a successful empty one | no: a wait or a yield is a fault of the hook |
-| `update(self, dt)` | part of the authoring model; nothing makes one due until the periodic cadence (LUA-24), so it is never called in this slice | n/a |
+| `update(self, dt)` | when a periodic instance's interval makes one due (see [Cadence](#cadence)), handed `dt` as an integer number of nanoseconds; an instance admitted without an interval never has one; a periodic instance whose module defines none is refused before any hook runs, naming `update` | yes, as `run` and the callbacks do |
 | `run(self, api)` | a one-shot's body (`RunOnce`), to completion after `init`; a one-shot whose module defines none is refused before any hook runs, naming `run` | yes, as a task's entry point does |
 | callbacks | an event's callback, handed `self` and the event | yes |
 | `shutdown(self, reason)` | once, with `"stopped"`, `"completed"` or `"failed"`; optional | no |
@@ -1998,9 +1998,89 @@ recorded when it is made, so events can be accepted while `init` runs; none is d
 has succeeded, and if it fails the connection is revoked and the events are counted as unstarted.
 
 Each instance has one bounded first-in, first-out queue of invocations (`boundInvocationQueue`),
-built to be shared with the due updates the periodic cadence will add. A full queue refuses the new
-delivery, counts it (`snapshotQueueFull`) and never evicts an accepted one. Retained results use no
-part of it.
+which a due update shares: the update keeps its place among the events and is never counted in the
+bound. A full queue refuses the new delivery, counts it (`snapshotQueueFull`) and never evicts an
+accepted one. Retained results use no part of it.
+
+### Cadence
+
+An instance is admitted with no periodic interval (`EventOnly`, `RunOnce`), or as `Periodic interval`,
+which reacts to events as an event-only instance does and has its module's `update` called on that
+interval. The interval is chosen at admission and fixed for the instance's life. Neither kind belongs
+to the UI or to gameplay: either can run on any scheduled owner, and a gameplay owner and a UI owner
+are an application's arrangement, not a hard-coded pair.
+
+| Interval | Meaning |
+| --- | --- |
+| `LogicalTicks n` | gameplay's logical time: a positive number of ticks (`n` is an `Integer`; zero, a negative number and one that is not a tick count are refused) |
+| `LogicalDuration d` | the same, as a duration: converted to ticks only when `d` is an exact multiple of the owner's configured tick duration (`instanceTickDuration`, a positive `Duration` the application sets; no production rate is hard-coded), and refused otherwise, naming `d` |
+| `ElapsedEvery d` | the UI's elapsed time: a positive duration on the owner's monotonic source |
+
+A refused interval answers `InstanceIntervalRefused` (`IntervalNotPositive`, `IntervalUnrepresentable`,
+`IntervalNotExact`, `IntervalNoTickDuration`), takes no place and no result, and changes nothing.
+Nothing is rounded.
+
+**Logical updates.** The cadence points are every `interval` ticks from the tick at which `init`
+succeeded, on a fixed phase. A point is looked at when its grant is *applied* (not when it was
+accepted), at the safe boundary that follows, before any task that grant woke is chosen. It makes
+an update due only if it finds the instance serving (not paused, stopping or ended) with no invocation
+*active*. An invocation is active from the segment that begins it until it finishes, including while
+it is suspended on a wait, and whether it is an `update`, a `run` or an event callback; one that is
+admitted and has not yet begun is still queued, and the update falls due behind it. A point that
+finds an invocation active adds nothing at all: no catch-up and no backlog, the grant that resumes a
+waiting invocation included. The next update is due at the first point after that invocation
+finishes, and no update overtakes an active invocation or an earlier queued one. An instance never has
+more than one unstarted update.
+
+The update's `dt` is the logical duration granted since the previous update *finished* (since `init`
+succeeded, for the first), in nanoseconds, from grants alone. It is fixed as the update begins and is
+unchanged by its own waits, by later grants and by real delays. A `dt` of more nanoseconds than an
+integer holds fails the instance (below). The duration an invocation's own wait was granted is
+reported to the application on the owner's thread when it resumes (`scheduledObserve`'s
+`ResumedLogical`); a resumed coroutine receives no value, so a script learns it only through a binding
+the application grants, as the test fixture's `fx.resume` does. That duration overlaps the next
+update's `dt` and is no further credit. With a constant grant `q`, `init` at tick 0, interval 2 and an
+event callback that waits through tick 5, the callback's wait observation is `5q`, and the first update
+is at tick 6 with `dt = 6q`, whatever the callback did. Every granted tick is accounted exactly once in
+a `dt`, and once in the observation of the wait it fell in.
+
+**What a tick waits for.** A tick does not complete (`awaitTicksComplete`) until a due update has run
+in it, but only while the update can still run in it, so a tick never waits on an update that cannot
+start. The update lets go of its tick when: its instance is paused, or a stop or an ending discards it
+before it starts; an invocation queued ahead of it begins and suspends on a wait; it has begun and
+stopped being ready or running; or nothing at all is ready to run, so that what it waits for can never
+happen. A callback that waits for future ticks therefore never deadlocks a due update behind it.
+Real delay slows the simulation and never skips a due update: only the instance's own logical waits
+make a point a no-op.
+
+**Elapsed updates.** The interval is measured on the owner's monotonic source, behind the owner's one
+timer: there is no per-instance timer, no polling and no thread. At most one refresh is kept
+unstarted; demand that finds one is coalesced into it, and queued events are never dropped. Unlike a
+logical point, an elapsed point queues its refresh behind an active invocation. Its `dt` is the elapsed
+time between update starts, from the instant `init` succeeded. Ordinary lateness moves the next deadline
+to the first point on the configured cadence strictly in the future: a stall of ten intervals gives one
+refresh, not ten.
+
+**Pause and resume.** A paused instance accrues no periodic demand, logical or elapsed: its timer
+demand is cancelled and a point that finds it paused adds nothing. An update that was already due or
+admitted and had not begun is retained, in its place, and holds no tick; it runs after the resume. After
+a resume the first update newly due is one full interval later: that many ticks after the tick the
+resume was applied at, or that much time after the instant it was, with an elapsed instance's baseline
+rebased to that instant so that its `dt` excludes the pause. A logical instance's `dt` still counts every
+tick granted, the paused ones included: the application resuming an instance chooses how the game
+accounts for its inactive time.
+
+**The queue.** A due update takes its place in the instance's one queue when it falls due: behind the
+events accepted before it, ahead of those accepted after it, so a continuous producer cannot starve it.
+It is not counted in `boundInvocationQueue` and never competes with events for it, so it is never refused
+as full; `snapshotUpdateOwed` says one is owed.
+
+**Ending.** Every way an instance ends (a stop, a failure, its owner's retirement or exit) cancels its timer demand, discards its unstarted update, counted with the other unstarted
+invocations (`terminationUnstarted`), and lets go of a tick it held.
+
+**Arithmetic.** An accrued duration, a tick or a deadline that cannot be represented, or a `dt` of more
+nanoseconds than an integer holds, fails the instance (`ErrorCadence`, at `StageUpdate`), attributably:
+nothing wraps, no timer demand is left and no tick is held.
 
 ### Failure and escalation
 
@@ -2130,8 +2210,10 @@ On one owner with a fixed configuration and policy, the same admitted instances,
 and control requests, each made at the same logical point (while the owner awaits the next grant), give
 the same order of invocations and of effects recorded through a binding, however long the segments take,
 whenever timers fire and whether budgets expire. It holds for logical-time workloads: elapsed waits
-legitimately change readiness. An event or request that arrives in the middle of a step is not ordered
-logically here; that is LUA-23's.
+legitimately change readiness, as do elapsed-interval updates, which depend on real time and are tested
+against the injected clock. The order of logical updates among an instance's other invocations, and the
+`dt` each receives, are among what is the same. An event or request that arrives in the middle of a step
+is not ordered logically here; that is LUA-23's.
 
 ### What proves it
 
@@ -2142,7 +2224,13 @@ and the hooks that cannot suspend, a failed callback, a failed `shutdown`, the a
 host and the evidence of a failed close; events during `init`, a full queue, every refusal, and what an accepted event
 keeps; pause and the order resume restores, stop while paused, contradictory and refused requests; what each way
 of ending revokes and counts, retirement, cancellation and the instances an owner never began; every bound and a
-configuration that does not fit; and one workload run under different segment costs and service budgets; and a sweep of what ended the owner first (a failure of the host, a failing script its escalation made the owner's, a stop, a cancellation) by what happened to its teardown (a close interrupted, a hook cut short as a cancellation is, nothing but an idle peer), holding the instances, the exit record and supervision to one cause, with the two paths of it that only an interrupted close of a task inside a segment, and a cancelled escalation, reach; a matrix of what first happened
+configuration that does not fit; and one workload run under different segment costs and service budgets; the cadence's examples
+(`Test.LuaRuntime.Instance.Cadence` and `.Elapsed`): an interval's exact conversion and its refusals,
+the first update one interval after `init` and the duration granted since the previous one finished, a
+callback that waits across a due tick (the regression for a deadlock the first review of LUA-24 found), a
+due update's place in the queue and its tick released when it cannot start, pause and stop settlement of a
+due update, elapsed refreshes coalesced after a stall and rebased at a resume, the owner's one timer shared
+by instances and an ordinary waiter with a stale wake, and the checked arithmetic; and a sweep of what ended the owner first (a failure of the host, a failing script its escalation made the owner's, a stop, a cancellation) by what happened to its teardown (a close interrupted, a hook cut short as a cancellation is, nothing but an idle peer), holding the instances, the exit record and supervision to one cause, with the two paths of it that only an interrupted close of a task inside a segment, and a cancelled escalation, reach; a matrix of what first happened
 to an instance (a Lua error in a callback, a failure of the host, nothing) by what its `shutdown` does (returns, raises, raises a
 failure of the host) by how it ends (its own stop, the owner's retirement, the owner's teardown), each cell holding the settlement, the
 owner's exception and the application's notification to one model. Every wait in these examples is for a signal the code
