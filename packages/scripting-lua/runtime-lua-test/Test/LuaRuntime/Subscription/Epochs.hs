@@ -5,7 +5,8 @@
 -- place while a provider's retirement is pending.
 module Test.LuaRuntime.Subscription.Epochs (spec) where
 
-import Control.Monad (forM_, void)
+import Control.Monad (forM_, void, when)
+import Data.IORef (writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Instance
@@ -16,6 +17,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support (awaitLine, refusalOf)
+import Test.LuaRuntime.Scheduled.Support (SFixture (sfObserver), awaitEntered, blockOn, releaseGate)
 import Test.LuaRuntime.Subscription.Support
 import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
 
@@ -147,6 +149,46 @@ spec = describe "epochs" $ do
       finishSubscription fake 0
       settled ← awaitSettled fixture "i"
       resultPhase settled `shouldBe` Stopped
+
+  it "tells a provider that interest was withdrawn while it was being handed the subscription, once, as soon as it has accepted it" $ bounded $ do
+    fixture ← newIFixture
+    fake ← newFakeEvents
+    withBoundary $ \_ runtime → eventsFinish fake $ do
+      owner ← ownerOf fixture fake runtime "mid handoff" [subscriber] 4
+      -- The epoch changes while the provider is inside its subscribe: the subscription is invalidated
+      -- before the engine holds the provider's work, which it must still be told to withdraw.
+      onSubscribe fake (\_ → void (advanceRequestEpoch (scheduledEndpoint owner)))
+      admitSubscriber fixture owner "i" "subscriber"
+      subscribeTo' fixture owner "i" "a" "ticks"
+      awaitCancelledSubs fake 1
+      cancelledSubs fake >>= (`shouldBe` [0])
+      d ← subDiagnostics owner
+      (sdLive d, sdCharged d) `shouldBe` (0, 1)
+      deliverTo fake 0 Nothing 1 >>= (`shouldBe` EventEnded)
+      finishSubscription fake 0
+      awaitSubDiagnostic owner ((== 0) . sdCharged)
+
+  it "lets the invocation already selected for a delivery complete without entering Lua when the epoch changes before its callback begins" $ bounded $ do
+    fixture ← newIFixture
+    fake ← newFakeEvents
+    withBoundary $ \_ runtime → eventsFinish fake $ do
+      owner ← ownerOf fixture fake runtime "selected" [subscriber] 4
+      admitSubscriber fixture owner "i" "subscriber"
+      subscribeTo' fixture owner "i" "a" "ticks"
+      writeIORef (sfObserver (ifBase fixture)) $ \context →
+        when (contextName context == Just "i") (blockOn (ifBase fixture) "pending")
+      deliverTo fake 0 Nothing 1 >>= (`shouldBe` EventAdmitted)
+      awaitEntered (ifBase fixture) "pending"
+      void (advance owner)
+      writeIORef (sfObserver (ifBase fixture)) (const (pure ()))
+      releaseGate (ifBase fixture) "pending"
+      -- Nothing ran for it, and the instance is alive and serving: it takes a command all the same.
+      sync fixture owner "i" 1
+      gotLines fixture >>= (`shouldBe` [])
+      phaseOf fixture owner "i" >>= (`shouldBe` Just Active)
+      (snapshotQueued <$$> snapshotOf fixture owner "i") >>= (`shouldBe` Just 0)
+      d ← subDiagnostics owner
+      sdDiscardedEvents d `shouldBe` 1
 
   it "discards the events an owner on logical time held for ticks the old subscriptions were to be served at" $ bounded $ do
     fixture ← newIFixture

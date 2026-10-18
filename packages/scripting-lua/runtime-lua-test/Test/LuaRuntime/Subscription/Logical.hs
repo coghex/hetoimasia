@@ -184,6 +184,27 @@ spec = describe "on an owner on logical time" $ do
         gotLines fixture >>= (`shouldBe` ["got s n=1 seq=1 t=1", "got s n=2 seq=2 t=2"])
         (sdCoalesced <$> subDiagnostics owner) >>= (`shouldBe` 0)
 
+  describe "an instance that ends" $ do
+    it "has the events held for it discarded and counted, and the places they held given back" $ bounded $ do
+      fixture ← newIFixture
+      fake ← newFakeEvents
+      withBoundary $ \control runtime → eventsFinish fake $ do
+        owner ← logicalOwner fixture fake runtime "ends" [subscriber] 2
+        admitSubscriber fixture owner "i" "subscriber"
+        subscribeTo' fixture owner "i" "a" "ticks" Nothing
+        deliverTo fake 0 (at 3 0) 1 >>= (`shouldBe` EventStaged)
+        deliverTo fake 0 (at 3 1) 2 >>= (`shouldBe` EventStaged)
+        deliverTo fake 0 (at 3 2) 3 >>= (`shouldBe` EventStagingFull)
+        void (settleControl fixture owner "i" InstanceStop)
+        awaitCancelledSubs fake 1
+        d ← subDiagnostics owner
+        (sdStaged d, sdDiscarded d) `shouldBe` (0, 2)
+        finishSubscription fake 0
+        void (awaitSettled fixture "i")
+        -- The ticks pass, and the store has room again for another instance.
+        forM_ [1 .. 3 ∷ Int] (const (grantOne control owner))
+        gotLines fixture >>= (`shouldBe` [])
+
   describe "a due update" $ do
     it "does not overtake a delivery admitted before it fell due, and a later value coalesces into that delivery without moving it" $ bounded $ do
       fixture ← newIFixture
