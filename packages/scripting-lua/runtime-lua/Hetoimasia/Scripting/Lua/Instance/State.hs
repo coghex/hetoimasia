@@ -13,6 +13,7 @@ module Hetoimasia.Scripting.Lua.Instance.State
   , admitControl
   , takeDueControls
   , takeAllLogical
+  , overtakeLogical
   , observeInstance
   , forgetInstance
   , observeReceipt
@@ -43,7 +44,7 @@ import Data.Word (Word64)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (TaskId)
 import Hetoimasia.Scripting.Lua.Instance.Types
 import Hetoimasia.Scripting.Lua.Runtime.Types (OwnerId)
-import Hetoimasia.Scripting.Lua.Scheduler (ControlResult)
+import Hetoimasia.Scripting.Lua.Scheduler (ControlResult (ControlNoLongerApplicable))
 import Hetoimasia.Scripting.Lua.Value (Value)
 
 -- | What the scheduler answers the instance layer's transactions: whether
@@ -226,6 +227,16 @@ takeDueControls instances tick = do
   let (due, later) = Map.partitionWithKey (\place _ → controlTick place <= tick) queued
   writeTVar (insLogical instances) later
   pure (Map.toAscList due)
+
+-- | The requests waiting for their ticks that are made of an instance that has ended,
+-- settled as no longer applicable, once, and dropped: nothing is left to apply them to, so
+-- they need not wait for a tick that may never come.
+overtakeLogical ∷ Instances → Word64 → STM ()
+overtakeLogical instances number = do
+  queued ← readTVar (insLogical instances)
+  let (overtaken, rest) = Map.partition ((== number) . logicalInstance) queued
+  writeTVar (insLogical instances) rest
+  mapM_ (\control → settleReceipt (logicalReceipt control) ControlNoLongerApplicable) (Map.elems overtaken)
 
 -- | Every request still waiting for its tick, taken: what the owner's exit settles.
 takeAllLogical ∷ Instances → STM [LogicalControl]

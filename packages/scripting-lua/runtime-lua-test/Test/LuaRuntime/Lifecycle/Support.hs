@@ -21,6 +21,9 @@ module Test.LuaRuntime.Lifecycle.Support
   , startTarget
   , startCaller
   , startCallerWith
+  , startCallerIn
+  , logicalConfig
+  , logicalCommanders
   , grantOver
   , bothPermits
   , target
@@ -28,6 +31,7 @@ module Test.LuaRuntime.Lifecycle.Support
     -- * Commanding
   , ask
   , tell
+  , taskLine
   , notYetSupported
   , cmdLines
   , tidValue
@@ -40,7 +44,7 @@ module Test.LuaRuntime.Lifecycle.Support
 
 import Control.Concurrent (yield)
 import Control.Exception (throwIO)
-import Control.Monad (replicateM)
+import Control.Monad (replicateM, void)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Instance
@@ -191,6 +195,19 @@ startCallerWith ∷ IFixture → Registration → LuaRuntime → Text → Maybe 
 startCallerWith fixture given runtime label grant =
   startWith fixture runtime (lifeSpec fixture given label [commander, commanderFailing, taskCaller] cmdConfig grant)
 
+-- | An owner of commanders of this configuration, granted this.
+startCallerIn ∷ IFixture → LuaRuntime → Text → InstanceConfig → Maybe LifecycleGrant → IO ScheduledOwner
+startCallerIn fixture runtime label config grant =
+  startWith fixture runtime (lifeSpec fixture (lifeRegistration fixture) label [commander, commanderFailing, taskCaller] config grant)
+
+-- | Bounds and sources for an owner that admits the controls made through a grant logically.
+logicalConfig ∷ InstanceConfig
+logicalConfig = (testConfig instanceBounds') {instanceControlAdmission = AdmitLogically}
+
+-- | The same for an owner of commanders.
+logicalCommanders ∷ InstanceConfig
+logicalCommanders = cmdConfig {instanceControlAdmission = AdmitLogically}
+
 -- | A grant over this owner, permitting these things, assigning nothing.
 grantOver ∷ ScheduledOwner → [Permit] → GrantTarget
 grantOver owner permits = GrantTarget (GrantedEndpoint (scheduledEndpoint owner)) permits Nothing
@@ -275,3 +292,15 @@ notYetSupported settlement = case failureOf' settlement of
     ErrorFault (BoundaryFailed fault) → boundaryReason fault == NotYetSupported LifecycleOperation
     _ → False
   Nothing → False
+
+-- | Run an entry of the task module as a task of the owner, wait for it to settle, and answer
+-- what it recorded: the line's text after the entry's name, as the script rendered it.
+taskLine ∷ IFixture → ScheduledOwner → Text → [Value] → IO Text
+taskLine fixture owner entry arguments = do
+  before ← length <$> cmdLines fixture
+  admitScheduledTask (scheduledEndpoint owner) (TaskRequest (ModuleRef "taskcaller" "1") entry arguments OrdinaryClass OneShot Nothing) >>= \case
+    TaskAccepted _ ticket → void (waitTask ticket)
+    other → throwIO (userError ("expected the task accepted, found " <> show other))
+  awaitCmd fixture (before + 1)
+  line ← (!! before) <$> cmdLines fixture
+  pure (Text.drop (Text.length ("cmd " <> entry <> " ")) line)

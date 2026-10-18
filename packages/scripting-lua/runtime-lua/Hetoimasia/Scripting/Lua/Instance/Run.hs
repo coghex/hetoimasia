@@ -1335,6 +1335,7 @@ settleEnding ih cell = do
     -- is left that nothing can read, and none of what it asked is undone.
     won ← atomically $ do
       settled ← settleInstance (ihInstances ih) cell settlement
+      overtakeLogical (ihInstances ih) (icId cell)
       traverse_ (`abandonIssued` icId cell) (controlLifecycle (ihControl ih))
       pure settled
     modifyIORef' (ihEndings ih) (Map.delete (icId cell))

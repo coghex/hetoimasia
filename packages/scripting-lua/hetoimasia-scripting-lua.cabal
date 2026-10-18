@@ -388,6 +388,11 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Instance.Support
         Test.LuaRuntime.Lifecycle.Authority
         Test.LuaRuntime.Lifecycle.Control
+        Test.LuaRuntime.Lifecycle.Inspection
+        Test.LuaRuntime.Lifecycle.Logical
+        Test.LuaRuntime.Lifecycle.Refusals
+        Test.LuaRuntime.Lifecycle.SelfControl
+        Test.LuaRuntime.Lifecycle.Settlement
         Test.LuaRuntime.Lifecycle.Spec
         Test.LuaRuntime.Lifecycle.Support
         Test.LuaRuntime.Readiness
