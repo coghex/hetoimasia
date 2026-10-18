@@ -39,9 +39,10 @@
 --   @init@ is a successful empty initialization. @api@ carries only what the
 --   instance was granted: @api.connect(source, callback)@ connects a function to an
 --   event source ('instanceGrants'), and is a script error for any other source.
--- * @update(self, dt)@ is part of the authoring model and is declared, but nothing
---   makes an update due until the periodic cadence (LUA-24) does, so it is never
---   called in this slice.
+-- * @update(self, dt)@ runs when a periodic instance's interval makes one due (see
+--   "Cadence" below), handed @dt@ as a float number of seconds. An instance
+--   admitted without an interval never has one. It may wait and yield, as @run@ and the
+--   callbacks may.
 -- * @run(self, api)@ is a one-shot's body ('RunOnce'). It runs to completion after
 --   @init@; a one-shot whose module defines none is refused before any hook runs,
 --   and settles as failed, naming @run@.
@@ -88,13 +89,97 @@
 -- is revoked and the events are counted among the unstarted invocations discarded.
 --
 -- Each instance has one bounded first-in, first-out queue of invocations
--- ('boundInvocationQueue'), in which an accepted event waits for its turn. It is
--- built to be shared with the due updates the periodic cadence will add. A full queue
--- refuses the new delivery, counts it ('snapshotQueueFull') and never evicts an
--- accepted one. Terminal results are retained elsewhere and never use it.
+-- ('boundInvocationQueue'), in which an accepted event waits for its turn and which a
+-- due update shares: the update keeps its place among the events, and is never counted
+-- in the bound. A full queue refuses the new delivery, counts it ('snapshotQueueFull')
+-- and never evicts an accepted one. Terminal results are retained elsewhere and never
+-- use it.
 --
 -- A callback is handed its instance's @self@ and the event, a table with the fields
 -- @source@, @sequence@, @tick@ and @payload@.
+--
+-- = Cadence
+--
+-- An instance is admitted with no periodic interval ('EventOnly', 'RunOnce'), or as
+-- @'Periodic' interval@, which reacts to events as an event-only instance does and has
+-- its module's @update@ called on the interval. The interval is chosen at admission
+-- and fixed for the instance's life, and neither kind of interval belongs to the UI or
+-- to gameplay: either can run on any scheduled owner. A periodic instance whose module
+-- defines no @update@ is refused before any hook runs, as a one-shot whose module
+-- defines no @run@ is.
+--
+-- An 'Interval' is 'LogicalTicks' (a positive number of ticks of the owner's logical
+-- time), 'LogicalDuration' (converted to ticks only when it is an exact multiple of the
+-- owner's configured tick duration, 'instanceTickDuration', and refused otherwise) or
+-- 'ElapsedEvery' (a positive duration on the owner's monotonic source). An interval
+-- that does not convert, is zero or negative or is not a tick count is refused at
+-- admission, naming it ('InstanceIntervalRefused'); nothing is rounded.
+--
+-- __Logical.__ A cadence point is every interval ticks from the tick at which @init@
+-- succeeded, on a fixed phase. The point is looked at when its grant is applied, before
+-- any task that grant woke runs: it makes an update due only if it finds the instance
+-- serving (not paused, stopping or ended) with no invocation active. An invocation is
+-- active from the segment that begins it until it finishes, including while it is
+-- suspended on a wait, and whatever it is (@update@, @run@ or an event callback); an
+-- invocation admitted and not yet begun is still queued, and the update falls due
+-- behind it. A point that finds an invocation active adds nothing at all: there is no
+-- catch-up and no backlog, the grant that resumes a waiting invocation included, and the
+-- next update is due at the first point after the invocation finishes. An instance
+-- never has more than one unstarted update.
+--
+-- The update's @dt@ is the logical duration granted since the previous update
+-- finished (since @init@ succeeded, for the first), less any granted while the instance
+-- was intentionally paused, from grants alone (D-35). Ticks that pass while an invocation
+-- is active and the instance is not paused still count, so every tick granted while the
+-- instance is live is accounted to it once. It is the sum of the durations actually
+-- granted, unequal grants included, never a count of ticks times the tick duration. It
+-- reaches Lua as a float number of seconds: the exact 'Duration' is converted once at the
+-- boundary, which is the only rounding, and a representable duration never fails for
+-- the size of its count of nanoseconds. It
+-- is fixed as the update begins and is unchanged by its own waits, by later grants and by
+-- real delays. What an invocation's wait was granted is told to the application on
+-- the owner's thread ('Hetoimasia.Scripting.Lua.Scheduled.scheduledObserve'); a resumed
+-- coroutine receives no value, so a script learns it only through a binding the
+-- application grants. That duration overlaps the next update's @dt@ and is no further
+-- credit: every granted tick is accounted for in a @dt@ once, and in the observation of
+-- the wait it fell in.
+--
+-- __What a tick waits for.__ A tick does not complete until a due update has run in it,
+-- but only while the update can still run in it. Its hold on the tick is let go when the
+-- instance is paused or the update is discarded by a stop or an ending before it starts,
+-- when an invocation queued ahead of it begins and suspends on a wait, when it has begun
+-- and stopped being ready or running, and when nothing at all is ready to run. Real delay
+-- slows the simulation and never skips a due update; only the instance's own logical
+-- waits make a point a no-op.
+--
+-- __Elapsed.__ The interval is measured on the owner's monotonic source, behind the
+-- owner's one timer (no timer, thread or polling per instance). At most one refresh is
+-- kept unstarted; demand that finds one is coalesced into it, and queued events are
+-- never dropped. Unlike a logical point, an elapsed point queues its refresh behind an
+-- active invocation. Its @dt@ is the elapsed time between update starts, measured from
+-- the instant @init@ succeeded. Lateness moves the next deadline to the first point on
+-- the cadence strictly in the future: no burst of catch-up refreshes follows a stall.
+--
+-- __Pause and resume.__ A paused instance accrues no periodic demand, logical or
+-- elapsed: its timer demand is cancelled, and a point that finds it paused adds nothing.
+-- An update already due or admitted and not begun is retained, in its place in the
+-- queue, and holds no tick. After a resume the first update newly due is one full
+-- interval later: that many ticks after the tick the resume was applied at, or that much
+-- time after the instant it was. An elapsed instance's baseline is rebased to that
+-- instant, and a logical instance accrues nothing toward its @dt@ from the grants
+-- applied while it is paused, so either @dt@ excludes the pause.
+--
+-- __Queue.__ A due update takes its place in the instance's one queue when it falls
+-- due: behind the events accepted before it, ahead of those accepted after it, so a
+-- continuous producer cannot starve it. It never competes with events for the queue's
+-- bound, so it is never refused as full.
+--
+-- __Ending.__ Every end of an instance cancels its timer demand, discards its unstarted
+-- update, counted with the other unstarted invocations, and lets go of any tick it held.
+--
+-- __Arithmetic.__ Accrued durations, ticks and deadlines are checked: one that is not
+-- representable fails the instance ('ErrorCadence', at 'StageUpdate'), without wrapping,
+-- and leaves no demand and no tick held.
 --
 -- = Failure
 --
@@ -212,7 +297,8 @@
 -- = Idle
 --
 -- Everything an instance's owner does is a response to something: an admission, an
--- event, a request, a grant, a deadline or a stop. The owner's wait is the one STM
+-- event, a request, a grant, a deadline or a stop. A cadence point is a response to a
+-- grant or to a deadline, and a cadence arms no thread, timer or poll of its own. The owner's wait is the one STM
 -- wait of the scheduled owner with the instance layer's jobs added to it. An owner
 -- whose instances are all paused, waiting or idle enters no Lua and does no periodic
 -- work until one of those arrives.
@@ -224,7 +310,8 @@
 -- the same order of invocations and the same order of effects recorded through a
 -- binding, however long segments take, whenever timers fire, and whether budgets
 -- expire. It holds for logical-time workloads: elapsed waits legitimately change
--- readiness. An event or a request that arrives in the middle of a step is not ordered
+-- readiness, and so do elapsed-interval updates. The order of logical updates among an
+-- instance's other invocations, and the @dt@ each receives, are among what is the same. An event or a request that arrives in the middle of a step is not ordered
 -- logically here; deterministic logical admission of controls is LUA-23's.
 module Hetoimasia.Scripting.Lua.Instance
   ( -- * Hosting instances
@@ -239,6 +326,10 @@ module Hetoimasia.Scripting.Lua.Instance
 
     -- * Admitting instances
   , InstanceKind (..)
+  , Interval (..)
+  , IntervalRefusal (..)
+  , Cadence (..)
+  , resolveInterval
   , InstanceRequest (..)
   , InstanceAdmission (..)
   , InstanceId (..)

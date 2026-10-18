@@ -138,8 +138,36 @@ import Hetoimasia.Scripting.Lua.Runtime.Types
   )
 import Hetoimasia.Scripting.Lua.Scheduled.Shared (settledOrRaise, waitReport)
 import Hetoimasia.Scripting.Lua.Scheduled.Types
+import Hetoimasia.Foundation.Time
+  ( Duration
+  , DurationRequirement (AllowZero)
+  , Instant
+  , addDuration
+  , advanceBaseline
+  , durationFromNanoseconds
+  , durationNanoseconds
+  , elapsedBetween
+  , noBaseline
+  , readInstant
+  )
 import Hetoimasia.Scripting.Lua.Scheduler
   ( AdmitAnswer (Admitted)
+  , CadenceFault (CadenceAccrualOverflow)
+  , CadenceFiring (FiredElapsed, FiredFault, FiredLogical)
+  , CadenceKey (CadenceKey)
+  , armElapsedCadence
+  , armLogicalCadence
+  , cadenceAccrued
+  , cadenceHeld
+  , disarmCadence
+  , releaseCadenceHold
+  , resetCadenceAccrued
+  , schedulerClock
+  , startElapsedCadence
+  , startLogicalCadence
+  , stopCadence
+  , takeCadenceFirings
+  , tasksReady
   , BehaviorId (BehaviorId)
   , ControlRequest (RequestPause, RequestResume, RequestStop)
   , ControlResult (ControlAlreadyInState, ControlApplied, ControlNoLongerApplicable)
@@ -451,7 +479,11 @@ serviceBoundary ih = do
       room ← if blocked then atomically (hasRoom ih) else pure False
       let serve = not (null jobs && null backlog) || room
       when serve (serviceInstances ih)
-      pure (ended || swept || serve)
+      -- What the application asked, and what the invocations in flight came to, are
+      -- looked at before the cadence points the scheduler reached: a point finds an
+      -- instance as the order of its admissions left it.
+      cadenced ← serviceCadence ih
+      pure (ended || swept || serve || cadenced)
 
 -- | Pause, resume or stop an invocation's task now. This is the owner's own thread,
 -- at a boundary, so the scheduler applies it at once, with no reservation to wait
@@ -558,9 +590,10 @@ startInstance ih cell = do
       Just handle → do
         runnable ← case icKind cell of
           RunOnce → hookAvailable ih handle "run"
+          Periodic _ → hookAvailable ih handle "update"
           EventOnly → pure True
         if not runnable
-          then failInstance ih cell Initializing StageInit (ErrorMissingEntry "run")
+          then failInstance ih cell Initializing StageInit (ErrorMissingEntry (case icKind cell of Periodic _ → "update"; _ → "run"))
           else do
             made ← settledOrRaise (ihExtra ih) (withRunning ih (icId cell) (callEntry (ihOwned ih) (ihDriver ih) "create" [VInteger (fromIntegral (icId cell))]))
             case made of
@@ -579,7 +612,12 @@ startInstance ih cell = do
                       if isStopped current
                         then current
                         else current {isPhase = Active, isInitialized = True}
-                    dispatch ih cell
+                    -- A periodic instance's first update is due one interval after this
+                    -- point; its demand is registered now, before anything else runs.
+                    problem ← startCadence ih cell
+                    case problem of
+                      Just why → failInstance ih cell Active StageUpdate (ErrorCadence why)
+                      Nothing → dispatch ih cell
 
 -- | Run Lua on behalf of this instance, so that a binding its code calls is told
 -- which instance is calling and an instance cannot act as another.
@@ -614,20 +652,27 @@ dispatch ih cell = do
     if isPhase state /= Active || isJust (isActive state)
       then pure Nothing
       else do
-        let next = case icKind cell of
-              RunOnce | not (isRunBegun state) → Just (InvokeRun, StageRun, isQueue state, Nothing)
-              _ → case viewl (isQueue state) of
-                event :< rest →
-                  Just
-                    ( InvokeEvent (queuedSource event) (WithinBounds [record event])
-                    , StageEvent (queuedSource event)
-                    , rest
-                    , Just event
-                    )
-                EmptyL → Nothing
+        let nextEvent event rest =
+              Just
+                ( InvokeEvent (queuedSource event) (WithinBounds [record event])
+                , StageEvent (queuedSource event)
+                , rest
+                , Just event
+                , isUpdate state
+                )
+            -- The events accepted before the update fell due run first, then the update,
+            -- then the events accepted after it, so a continuous producer cannot jump
+            -- ahead of a due update, and the update never overtakes an earlier event.
+            next = case icKind cell of
+              RunOnce | not (isRunBegun state) → Just (InvokeRun, StageRun, isQueue state, Nothing, isUpdate state)
+              _ → case (isUpdate state, viewl (isQueue state)) of
+                (UpdateDue marker, event :< rest) | queuedSequence event < marker → nextEvent event rest
+                (UpdateDue marker, _) → Just (InvokeUpdate, StageUpdate, isQueue state, Nothing, UpdateAdmitted marker)
+                (_, event :< rest) → nextEvent event rest
+                (_, EmptyL) → Nothing
         case next of
           Nothing → pure Nothing
-          Just (invocation, stage, rest, event) → do
+          Just (invocation, stage, rest, event, slot) → do
             let spec =
                   TaskSpec
                     { specBehavior = BehaviorId (behavior stage)
@@ -661,6 +706,7 @@ dispatch ih cell = do
                     { isActive = Just task
                     , isQueue = rest
                     , isPending = event
+                    , isUpdate = slot
                     }
                 when (isNothing reusable) $ modifyTVar' (insTasks (ihInstances ih)) (Set.insert task)
                 pure (Just (task, stage, event, isJust reusable))
@@ -681,6 +727,7 @@ dispatch ih cell = do
         ]
     entry = \case
       StageEvent source → eventEntry source
+      StageUpdate → "update"
       _ → "run"
     behavior stage = moduleRefName (icModule cell) <> "/" <> entry stage
 
@@ -705,7 +752,14 @@ instanceSegment ih run number starting = do
     go cell stage = do
       -- Its first segment is about to run: it is no longer an unstarted invocation.
       atomically . modifyTVar' (icState cell) $ \state →
-        state {isPending = Nothing, isRunBegun = isRunBegun state || stage == StageRun}
+        state
+          { isPending = Nothing
+          , isRunBegun = isRunBegun state || stage == StageRun
+          , isUpdate = case isUpdate state of
+              UpdateAdmitted _ → UpdateNone
+              other → other
+          , isUpdateRunning = isUpdateRunning state || stage == StageUpdate
+          }
       let slot = VInteger (fromIntegral number)
       outcome ← case starting of
         Just (InvokeEvent source (WithinBounds [event])) →
@@ -716,6 +770,21 @@ instanceSegment ih run number starting = do
           case Map.lookup (icModule cell) handles of
             Nothing → pure (Left (ErrorFault (ModuleNotLoaded (icModule cell))))
             Just handle → begin $ withRunning ih number (startTaskVia (ownedHost (ihOwned ih)) (ihDriver ih) "run" handle "run" [slot])
+        Just InvokeUpdate → do
+          handles ← readIORef (ihHandles ih)
+          case Map.lookup (icModule cell) handles of
+            Nothing → pure (Left (ErrorFault (ModuleNotLoaded (icModule cell))))
+            Just handle →
+              -- Its dt is fixed here, as the invocation begins, and nothing it waits through
+              -- or is delayed by changes it.
+              updateDelta ih cell >>= \case
+                Left why → pure (Left (ErrorCadence why))
+                Right seconds → do
+                  -- The delta is left for the driver to take through its binding, as the
+                  -- update's first segment begins, and is not left behind if that never does.
+                  atomically (writeTVar (insDelta (ihInstances ih)) (Just (number, seconds)))
+                  begin (withRunning ih number (startTaskVia (ownedHost (ihOwned ih)) (ihDriver ih) "run" handle "update" [slot]))
+                    `finally` atomically (writeTVar (insDelta (ihInstances ih)) Nothing)
         Nothing → do
           held ← Map.lookup (runTask run) <$> readIORef (ihTasks ih)
           case held of
@@ -758,7 +827,11 @@ instanceSegment ih run number starting = do
 -- is done, if it was a one-shot's @run@.
 invocationCompleted ∷ InstanceHost → ICell → HookStage → IO ()
 invocationCompleted ih cell stage = do
-  atomically (modifyTVar' (icState cell) (\state → state {isActive = Nothing}))
+  atomically $ do
+    modifyTVar' (icState cell) (\state → state {isActive = Nothing, isUpdateRunning = isUpdateRunning state && stage /= StageUpdate})
+    -- A logical update's dt is the duration granted since the previous update
+    -- finished: a finished update begins the accrual again.
+    when (stage == StageUpdate) (resetCadenceAccrued (scheduler' ih) (CadenceKey (icId cell)))
   case stage of
     StageRun → beginStop ih cell EndCompleted Nothing
     _ → dispatch ih cell
@@ -802,6 +875,211 @@ instanceClosed ih task began = do
     modifyIORef' (ihEndings ih) (Map.adjust (\ending → ending {endClosed = max (endClosed ending) (if began then 1 else 0)}) (icId cell))
     modifyIORef' (ihToFinish ih) (Set.insert (icId cell))
 
+-- Cadence -------------------------------------------------------------------------------
+
+-- | The cadence's key for an instance: the instance's own number.
+cadenceKey ∷ ICell → CadenceKey
+cadenceKey = CadenceKey . icId
+
+-- | The tick an interval after another, or nothing when that is not a tick.
+checkedTick ∷ Word64 → Word64 → Maybe Word64
+checkedTick tick interval
+  | maxBound - tick < interval = Nothing
+  | otherwise = Just (tick + interval)
+
+-- | Register an initialized periodic instance's demand: a logical one at the tick one
+-- interval after the tick @init@ succeeded at, with nothing accrued, an elapsed one at
+-- the instant one interval after it, with the baseline its @dt@ is measured from.
+-- Answers what went wrong, if the first point is not representable.
+startCadence ∷ InstanceHost → ICell → IO (Maybe Text)
+startCadence ih cell = do
+  stopped ← isStopped <$> readTVarIO (icState cell)
+  case icCadence cell of
+    Just (CadenceTicks interval) | not stopped → do
+      tick ← atomically (readTick (scheduler' ih))
+      case checkedTick tick interval of
+        Nothing → pure (Just "the tick the first update is due at is not representable")
+        Just target → Nothing <$ atomically (startLogicalCadence (scheduler' ih) (cadenceKey cell) target)
+    Just (CadenceElapsed interval) | not stopped → do
+      now ← readInstant (schedulerClock (scheduler' ih))
+      case addDuration now interval of
+        Left _ → pure (Just "the deadline the first update is due at is not representable")
+        Right deadline → do
+          atomically $ do
+            started ← startElapsedCadence (scheduler' ih) (cadenceKey cell) deadline
+            when started (modifyTVar' (icState cell) (\state → state {isBaseline = snd (advanceBaseline now noBaseline)}))
+          pure Nothing
+    _ → pure Nothing
+
+-- | Arm a resumed instance's demand again: a full interval from now, from the tick at
+-- which the resume was applied or from the instant it was. An elapsed instance's
+-- baseline is rebased to this instant, so its @dt@ excludes the pause.
+resumeCadence ∷ InstanceHost → ICell → IO (Maybe Text)
+resumeCadence ih cell = case icCadence cell of
+  Just (CadenceTicks interval) → do
+    tick ← atomically (readTick (scheduler' ih))
+    case checkedTick tick interval of
+      Nothing → pure (Just "the tick the next update is due at is not representable")
+      Just target → Nothing <$ atomically (armLogicalCadence (scheduler' ih) (cadenceKey cell) target)
+  Just (CadenceElapsed interval) → do
+    now ← readInstant (schedulerClock (scheduler' ih))
+    case addDuration now interval of
+      Left _ → pure (Just "the deadline the next update is due at is not representable")
+      Right deadline → do
+        atomically $ do
+          armElapsedCadence (scheduler' ih) (cadenceKey cell) deadline
+          modifyTVar' (icState cell) (\state → state {isBaseline = snd (advanceBaseline now (isBaseline state))})
+        pure Nothing
+  Nothing → pure Nothing
+
+-- | The @dt@ an update begins with, in seconds: for a logical interval the duration
+-- granted since the previous update finished (since @init@ succeeded, for the first)
+-- less what was granted while the instance was intentionally paused, and for an
+-- elapsed one the time between update starts (from @init@, rebased at a resume). The
+-- exact duration is converted once, here, which is the only rounding. Fixed as the
+-- update begins.
+updateDelta ∷ InstanceHost → ICell → IO (Either Text Double)
+updateDelta ih cell = case icCadence cell of
+  Just (CadenceTicks _) →
+    maybe (Left "the instance's logical accrual is gone") fits <$> atomically (cadenceAccrued (scheduler' ih) (cadenceKey cell))
+  Just (CadenceElapsed _) → do
+    now ← readInstant (schedulerClock (scheduler' ih))
+    sampled ← atomically $ do
+      state ← readTVar (icState cell)
+      let (elapsed, baseline) = advanceBaseline now (isBaseline state)
+      writeTVar (icState cell) state {isBaseline = baseline}
+      pure elapsed
+    pure (fits sampled)
+  Nothing → pure (Left "the instance has no interval")
+  where
+    fits duration = Right (secondsOf duration)
+
+-- | A duration as a number of seconds, correctly rounded once from its exact count of
+-- nanoseconds.
+secondsOf ∷ Duration → Double
+secondsOf duration = fromRational (toRational (durationNanoseconds duration) / 1000000000)
+
+-- | The first point on a cadence, from this deadline and interval, that is strictly
+-- after this reading: ordinary lateness moves the next deadline here, with no burst of
+-- refreshes for the points it passed.
+nextFuture ∷ Instant → Duration → Instant → Maybe Instant
+nextFuture deadline interval now =
+  case durationFromNanoseconds AllowZero (toInteger (skipped * step)) of
+    Left _ → Nothing
+    Right span' → either (const Nothing) Just (addDuration deadline span')
+  where
+    late = durationNanoseconds (elapsedBetween deadline now)
+    step = durationNanoseconds interval
+    skipped = late `div` step + 1
+
+-- | Serve the cadence points the scheduler reached, in the order it reached them, and
+-- then let go of the ticks whose update cannot run in them. Answers whether it did
+-- anything the boundary should look at again.
+--
+-- Called at a safe boundary, after the grant a point belongs to was applied and before
+-- any task that grant woke is chosen: an instance's invocation in flight is in flight
+-- here, and a callback the grant resumes is still active.
+serviceCadence ∷ InstanceHost → IO Bool
+serviceCadence ih = do
+  firings ← atomically (takeCadenceFirings (scheduler' ih))
+  forM_ firings (serveFiring ih)
+  -- A tick just served has had no chance to run its update yet: it is looked at the
+  -- next time round, which the answer below makes the boundary do.
+  released ← settleHolds ih (map fst firings)
+  pure (not (null firings) || released)
+
+-- | One cadence point.
+serveFiring ∷ InstanceHost → (CadenceKey, CadenceFiring) → IO ()
+serveFiring ih (CadenceKey number, firing) = withCell ih number $ \cell → do
+  state ← readTVarIO (icState cell)
+  let accepting = isPhase state == Active && not (isStopped state)
+      markDue = atomically (modifyTVar' (icState cell) (\current → current {isUpdate = UpdateDue (isNextSequence current)}))
+      unrepresentable what = failInstance ih cell Active StageUpdate (ErrorCadence what)
+  case firing of
+    FiredFault CadenceAccrualOverflow ->
+      failInstance ih cell (isPhase state) StageUpdate (ErrorCadence "the logical duration granted since the previous update finished is not representable")
+    FiredLogical tick → do
+      -- A logical point makes an update due only if it finds the instance serving and
+      -- with no invocation active, whatever the invocation is and wherever it waits:
+      -- otherwise it adds nothing, and the grant it held is let go. An invocation that
+      -- is active has begun and not finished; one admitted and not yet begun is still
+      -- queued, and the update falls due behind it.
+      let begun = isJust (isActive state) && isNothing (isPending state) && not (admittedUpdate state)
+          free = not begun && isUpdate state == UpdateNone
+      if accepting && free
+        then markDue >> dispatch ih cell
+        else atomically (releaseCadenceHold (scheduler' ih) (cadenceKey cell))
+      when accepting $ case icCadence cell of
+        Just (CadenceTicks interval) → case checkedTick tick interval of
+          Nothing → unrepresentable "the tick the next update is due at is not representable"
+          Just target → atomically (armLogicalCadence (scheduler' ih) (cadenceKey cell) target)
+        _ → pure ()
+    FiredElapsed deadline now → when accepting $ do
+      -- At most one refresh is kept unstarted: demand that finds one is coalesced into it.
+      when (isUpdate state == UpdateNone) (markDue >> dispatch ih cell)
+      case icCadence cell of
+        Just (CadenceElapsed interval) → case nextFuture deadline interval now of
+          Nothing → unrepresentable "the deadline the next update is due at is not representable"
+          Just next → atomically (armElapsedCadence (scheduler' ih) (cadenceKey cell) next)
+        _ → pure ()
+
+-- | Whether the update is the invocation in flight and has not begun.
+admittedUpdate ∷ IState → Bool
+admittedUpdate state = case isUpdate state of
+  UpdateAdmitted _ → True
+  _ → False
+
+-- | Let go of the grants that logical instances' due updates hold when those updates
+-- can no longer run in their ticks. The instances whose points were served just now are
+-- left for the next look.
+settleHolds ∷ InstanceHost → [CadenceKey] → IO Bool
+settleHolds ih skip = do
+  cells ← Map.elems <$> readTVarIO (insCells (ihInstances ih))
+  or <$> forM cells (\cell → case icCadence cell of
+    Just (CadenceTicks _) | cadenceKey cell `notElem` skip → settleHold ih cell
+    _ → pure False)
+
+settleHold ∷ InstanceHost → ICell → IO Bool
+settleHold ih cell = do
+  held ← atomically (cadenceHeld (scheduler' ih) (cadenceKey cell))
+  if not held
+    then pure False
+    else do
+      state ← readTVarIO (icState cell)
+      release ← holdReleasable ih state
+      when release (atomically (releaseCadenceHold (scheduler' ih) (cadenceKey cell)))
+      pure release
+
+-- | Whether a due update can no longer run in the tick that is waiting for it. A tick
+-- never waits on an update that cannot start.
+--
+-- It keeps its hold while the update can still run in the tick: while it is due or
+-- admitted and what is ahead of it, or it, is ready to run segments; and lets go when
+-- the instance is paused, stopping or ended, when an invocation queued ahead of it has
+-- begun and suspended on a wait, when it has begun and stopped being ready or running,
+-- and when nothing at all is ready to run, so what it waits for can never happen.
+holdReleasable ∷ InstanceHost → IState → IO Bool
+holdReleasable ih state
+  | isTerminal (isPhase state) || isStopped state || isPhase state /= Active = pure True
+  | isUpdate state == UpdateNone && not (isUpdateRunning state) = pure True
+  | otherwise = do
+      stuck ← not <$> atomically (tasksReady (scheduler' ih))
+      case isActive state of
+        -- Due, and not admitted yet: the instance has nothing in flight and the update
+        -- waits for its turn to be given a place.
+        Nothing → pure stuck
+        Just task →
+          atomically (taskPhase (scheduler' ih) task) <&> \case
+            Just PhaseReady → False
+            Just PhaseRunning → False
+            Just PhaseQueued → stuck
+            -- An invocation that ended is accounted for, and the next one begun, at the
+            -- boundary that sees it: an update that ended has finished its work.
+            Just (PhaseEnded _) → isUpdateRunning state
+            _ → True
+  where
+    (<&>) = flip fmap
+
 -- Control --------------------------------------------------------------------------------
 
 -- | Apply a request: the instance's own transition, then what it means for the
@@ -821,15 +1099,21 @@ applyControl ih cell request receipt = do
             -- instance is frozen when the request is read as applied.
             atomically (modifyTVar' (icState cell) (\current → current {isPhase = Paused}))
             forM_ (isActive state) (pauseInvocation ih cell)
+            -- A paused instance accrues no periodic demand; what it has accrued toward its
+            -- dt it keeps.
+            atomically (disarmCadence (scheduler' ih) (CadenceKey (icId cell)))
             settle ControlApplied
           (Active, InstanceResume) → settle ControlAlreadyInState
           (Paused, InstancePause) → settle ControlAlreadyInState
           (Paused, InstanceResume) → do
             atomically (modifyTVar' (icState cell) (\current → current {isPhase = Active}))
+            -- The first update newly due is one full interval after this resume.
+            problem ← resumeCadence ih cell
             case isActive state of
               Just task → ownerOp ih task RequestResume
               Nothing → dispatch ih cell
             settle ControlApplied
+            forM_ problem (failInstance ih cell Active StageUpdate . ErrorCadence)
           (_, InstanceStop) → do
             -- Settled as it begins, before anything that can raise: a host failure in
             -- the hook that follows cannot leave the request unsettled.
@@ -888,16 +1172,19 @@ pauseInvocation ih cell task = do
       detach ih cell task
       -- An event goes back to the front of the queue; a run needs no putting back, for
       -- it was never anywhere but owed.
-      atomically . modifyTVar' (icState cell) $ \state → case isPending state of
-        Just event → state {isQueue = event <| isQueue state, isPending = Nothing}
-        Nothing → state
+      atomically . modifyTVar' (icState cell) $ \state → case (isPending state, isUpdate state) of
+        (Just event, _) → state {isQueue = event <| isQueue state, isPending = Nothing}
+        (Nothing, UpdateAdmitted marker) → state {isUpdate = UpdateDue marker}
+        _ → state
 
 -- | Record how an instance is ending, once, and close what it accepts.
 beginEnding' ∷ InstanceHost → ICell → EndReason → Maybe Primary → IO ()
 beginEnding' ih cell reason primary = mask_ $ do
   -- Closing admission and recording what that revoked and discarded are one step: a
-  -- cancellation cannot land between them and leave the counts unwritten.
-  (connections, unstarted, already) ← atomically (beginEnding cell)
+  -- cancellation cannot land between them and leave the counts unwritten. The
+  -- instance's periodic demand is cancelled with it, and a tick its due update held is
+  -- let go.
+  (connections, unstarted, already) ← atomically (beginEnding cell <* stopCadence (scheduler' ih) (CadenceKey (icId cell)))
   unless already $
     modifyIORef' (ihEndings ih) (Map.insert (icId cell) (Ending reason primary connections unstarted 0 ShutdownUndecided))
 

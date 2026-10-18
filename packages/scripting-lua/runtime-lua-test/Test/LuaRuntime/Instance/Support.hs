@@ -749,6 +749,7 @@ expectAccepted fixture name = \case
     pure ticket
   InstanceFull → throwIO (userError "expected the instance to be accepted, found it full")
   InstanceAdmissionClosed → throwIO (userError "expected the instance to be accepted, found it closed")
+  InstanceIntervalRefused refusal → throwIO (userError ("expected the instance to be accepted, found its interval refused: " <> show refusal))
 
 -- | The identity an instance was admitted under this name.
 idOf ∷ IFixture → Text → IO InstanceId
