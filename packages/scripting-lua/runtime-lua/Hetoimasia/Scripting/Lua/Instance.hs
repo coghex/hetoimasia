@@ -131,8 +131,11 @@
 -- finished (since @init@ succeeded, for the first), less any granted while the instance
 -- was intentionally paused, from grants alone (D-35). Ticks that pass while an invocation
 -- is active and the instance is not paused still count, so every tick granted while the
--- instance is live is accounted to it once. It reaches Lua as a float number of seconds:
--- the exact 'Duration' is converted once at the boundary, which is the only rounding. It
+-- instance is live is accounted to it once. It is the sum of the durations actually
+-- granted, unequal grants included, never a count of ticks times the tick duration. It
+-- reaches Lua as a float number of seconds: the exact 'Duration' is converted once at the
+-- boundary, which is the only rounding, and a representable duration never fails for
+-- the size of its count of nanoseconds. It
 -- is fixed as the update begins and is unchanged by its own waits, by later grants and by
 -- real delays. What an invocation's wait was granted is told to the application on
 -- the owner's thread ('Hetoimasia.Scripting.Lua.Scheduled.scheduledObserve'); a resumed

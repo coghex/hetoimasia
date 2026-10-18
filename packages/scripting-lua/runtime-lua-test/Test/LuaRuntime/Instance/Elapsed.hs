@@ -192,6 +192,16 @@ spec = describe "elapsed cadence" $ do
         fireLive fixture
         awaitEffect (sf fixture) "float 1.5"
         logged fixture >>= (`shouldBe` ["float 1.5"])
+    it "is a float for a whole number of seconds too" $ bounded $
+      withOwner [floatReporter] $ \fixture _ owner → do
+        setClock (sf fixture) 1000
+        _ ← elapsed fixture owner "floatreporter" 100
+        awaitPhase fixture owner "floatreporter" Active
+        awaitRegistrations (sf fixture) 1
+        setClock (sf fixture) 1000001000
+        fireLive fixture
+        awaitEffect (sf fixture) "float 1.0"
+        logged fixture >>= (`shouldBe` ["float 1.0"])
   describe "the owner's one timer" $ do
     it "is shared by instances and an ordinary waiter: pausing or stopping the earliest preserves the rest and recomputes the earliest deadline, and a stale wake revives nothing" $ bounded $
       withOwner [uiTicker, sleeper] $ \fixture _ owner → do

@@ -23,9 +23,10 @@ import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Scheduled
+import Hetoimasia.Scripting.Lua.Value (Value (VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
-import Test.LuaRuntime.Scheduled.Support (SFixture (sfDelay), awaitDiagnostics, awaitEffect, awaitEntered, awaitIdle, defaultSchedulerBounds, releaseGate)
+import Test.LuaRuntime.Scheduled.Support (SFixture (sfDelay), admitTask', awaitDiagnostics, awaitEffect, awaitEntered, awaitIdle, defaultSchedulerBounds, releaseGate, request)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
 import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
 
@@ -218,6 +219,7 @@ spec = describe "logical cadence" $ do
   queueSpec
   pauseSpec
   settlementSpec
+  capacitySpec
   arithmeticSpec
   determinismSpec
 
@@ -255,13 +257,13 @@ admissionSpec = describe "admitting a periodic instance" $ do
   let config = (testConfig instanceBounds') {instanceTickDuration = Just (nanoseconds 2)}
   it "refuses an interval that does not convert, naming it, taking no place and no result, and admits one that does" $ bounded $
     withOwner [ticker] config $ \fixture control owner → do
-      let request interval = InstanceRequest (moduleNamed "ticker") (Periodic interval) (Just "t") OrdinaryClass ["tick"]
+      let asked interval = InstanceRequest (moduleNamed "ticker") (Periodic interval) (Just "t") OrdinaryClass ["tick"]
           admitted = admitInstance (scheduledEndpoint owner)
-      admitted (request (LogicalDuration (nanoseconds 5))) >>= (`shouldSatisfy` \case InstanceIntervalRefused (IntervalNotExact _ _) → True; _ → False)
-      admitted (request (LogicalTicks 0)) >>= (`shouldSatisfy` \case InstanceIntervalRefused (IntervalNotPositive _) → True; _ → False)
+      admitted (asked (LogicalDuration (nanoseconds 5))) >>= (`shouldSatisfy` \case InstanceIntervalRefused (IntervalNotExact _ _) → True; _ → False)
+      admitted (asked (LogicalTicks 0)) >>= (`shouldSatisfy` \case InstanceIntervalRefused (IntervalNotPositive _) → True; _ → False)
       atomically (inspectInstances (scheduledEndpoint owner)) >>= (`shouldBe` [])
       -- Six nanoseconds is three of this owner's two-nanosecond ticks.
-      _ ← admitWith fixture owner "t" (request (LogicalDuration (nanoseconds 6)))
+      _ ← admitWith fixture owner "t" (asked (LogicalDuration (nanoseconds 6)))
       awaitPhase fixture owner "t" Active
       grantEach control owner [1, 1]
       logged fixture >>= (`shouldBe` [])
@@ -505,6 +507,36 @@ pauseSpec = describe "pausing" $ do
       logged fixture >>= (`shouldBe` [])
       grantEach control owner [4]
       logged fixture >>= (`shouldBe` ["update 37"])
+  it "hands the update at tick 11 five granted units when paused after tick 2 and resumed after tick 8: the two before the pause and the three after the resume, however long the pause" $ bounded $
+    withOwner [ticker] (testConfig instanceBounds') $ \fixture control owner → do
+      _ ← periodic fixture owner "ticker" (LogicalTicks 3)
+      awaitPhase fixture owner "ticker" Active
+      grantEach control owner [1, 1]
+      settleControl fixture owner "ticker" InstancePause >>= (`shouldBe` ControlApplied)
+      grantEach control owner (replicate 6 1)
+      settleControl fixture owner "ticker" InstanceResume >>= (`shouldBe` ControlApplied)
+      -- Ticks 9 and 10 are the two after the resume that come before the point at 11.
+      grantEach control owner [1, 1]
+      logged fixture >>= (`shouldBe` [])
+      grantEach control owner [1]
+      logged fixture >>= (`shouldBe` ["update 5"])
+  it "keeps the dt an update began with when the instance is paused during its wait, and tells the wait the grants applied while paused" $ bounded $
+    withOwner [longUpdate] (testConfig instanceBounds') $ \fixture control owner → do
+      _ ← admitWith fixture owner "longupdate" (InstanceRequest (moduleNamed "longupdate") (Periodic (LogicalTicks 2)) (Just "u") OrdinaryClass [])
+      awaitPhase fixture owner "longupdate" Active
+      grantEach control owner [1, 1]
+      awaitWaits owner 1
+      grantEach control owner [1]
+      settleControl fixture owner "longupdate" InstancePause >>= (`shouldBe` ControlApplied)
+      -- Its wait is satisfied at tick 7 while it is frozen; the grants applied meanwhile are
+      -- not the instance's to accrue, but they are what the wait was granted.
+      grantEach control owner [1, 1, 1, 1, 1]
+      logged fixture >>= (`shouldBe` ["update 2 begin"])
+      settleControl fixture owner "longupdate" InstanceResume >>= (`shouldBe` ControlApplied)
+      awaitEffect (sf fixture) "update 2 end tick=7 waited=5"
+      -- Resumed after tick 8: the next update is at tick 10, handed ticks 9 and 10 alone.
+      grantEach control owner [1, 1]
+      logged fixture >>= (`shouldBe` ["update 2 begin", "update 2 end tick=7 waited=5", "update 2 begin"])
   it "counts the ticks that pass while an invocation is active and the instance is not paused" $ bounded $
     withOwner [longUpdate] (testConfig instanceBounds') $ \fixture control owner → do
       _ ← admitWith fixture owner "longupdate" (InstanceRequest (moduleNamed "longupdate") (Periodic (LogicalTicks 2)) (Just "u") OrdinaryClass [])
@@ -521,6 +553,12 @@ pauseSpec = describe "pausing" $ do
       awaitPhase fixture owner "floatticker" Active
       grantEach control owner [250000000, 250000000]
       logged fixture >>= (`shouldBe` ["float 0.5 false"])
+  it "hands a whole number of seconds as a float too, never an integer" $ bounded $
+    withOwner [floatTicker] (testConfig instanceBounds') $ \fixture control owner → do
+      _ ← periodic fixture owner "floatticker" (LogicalTicks 1)
+      awaitPhase fixture owner "floatticker" Active
+      grantEach control owner [1000000000]
+      logged fixture >>= (`shouldBe` ["float 1.0 false"])
   it "hands one nanosecond as the float nearest 1e-9: converted once, from the exact count" $ bounded $
     withOwner [floatTicker] (testConfig instanceBounds') $ \fixture control owner → do
       _ ← periodic fixture owner "floatticker" (LogicalTicks 1)
@@ -546,7 +584,9 @@ pauseSpec = describe "pausing" $ do
       waitInstanceControl receipt >>= (`shouldBe` ControlApplied)
       logged fixture >>= (`shouldBe` ["gated reached", "gated released"])
       updateOwed' fixture owner "ticker" >>= (`shouldBe` True)
-      -- Resumed, it runs, handed what was granted since init, and the cadence goes on.
+      -- Time is granted while it is paused and retained; none of it is the update's.
+      grantEach control owner [100, 100, 100]
+      -- Resumed, it runs, handed what was granted before the pause, and the cadence goes on.
       settleControl fixture owner "ticker" InstanceResume >>= (`shouldBe` ControlApplied)
       awaitEffect (sf fixture) "update 2"
       grantEach control owner [1, 1]
@@ -589,6 +629,33 @@ settlementSpec = describe "a tick" $ do
       -- The callback's wait is for one tick.
       grantEach control owner [1]
       logged fixture >>= (`shouldBe` ["callback 1 begin", "callback 1 end"])
+
+capacitySpec ∷ Spec
+capacitySpec = describe "a due update the scheduler has no room for" $
+  it "lets the tick complete when nothing can run, stays pending once in its place, and runs when capacity returns" $ bounded $ do
+    fixture ← newIFixture
+    withBoundary $ \control runtime → do
+      let bounds = defaultSchedulerBounds {boundActiveTasks = 1}
+      owner ← startWith fixture runtime (instanceSpec fixture "capacity" [ticker, plainModule] (testConfig (InstanceBounds 1 2 4 4)) requiredPolicy bounds)
+      -- The only active slot is held by an ordinary task that waits for five ticks.
+      -- Its result is forgotten, so that what it holds goes back when it ends.
+      admitTask' (sf fixture) owner "w" (request "waits" [VText "w"] OrdinaryClass OneShot Nothing) >>= forgetTask
+      awaitWaits owner 1
+      _ ← periodic fixture owner "ticker" (LogicalTicks 2)
+      awaitPhase fixture owner "ticker" Active
+      -- Tick 2 makes the update due; there is nowhere to run it and nothing else can run, so
+      -- the tick does not wait for it.
+      grantEach control owner [1, 1]
+      logged fixture >>= (`shouldBe` [])
+      updateOwed' fixture owner "ticker" >>= (`shouldBe` True)
+      -- The point at tick 4 finds it owed and adds nothing.
+      grantEach control owner [1, 1]
+      updateOwed' fixture owner "ticker" >>= (`shouldBe` True)
+      -- The task ends at tick 5, the slot returns, and the one update runs, handed the five.
+      grantEach control owner [1]
+      awaitEffect (sf fixture) "update 5"
+      logged fixture >>= (`shouldBe` ["update 5"])
+      awaitUpdateOwed fixture owner "ticker" False
 
 -- Arithmetic ------------------------------------------------------------------------
 
