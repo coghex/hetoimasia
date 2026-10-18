@@ -154,6 +154,18 @@
 -- it, and it closes after the VM, on the owner's thread, releasing what remains
 -- newest first.
 --
+-- = Leases
+--
+-- An owner that hosts instances and lends a collection may also be given a
+-- 'Hetoimasia.Scripting.Lua.Lease.Leases' ('scheduledLeases'): each instance then has a scope
+-- of engine-held leases on the resources the application's bindings acquire for it,
+-- built on that collection, released when the instance ends and awaited until the
+-- providers have retired what they were handed. The handle must be made over the
+-- handle the owner lends through, and the collection must be able to hold every live
+-- instance at the handle's capacity; a configuration that does not fit is refused before
+-- anything starts ('Hetoimasia.Scripting.Lua.Lease.LeasesRefused'). The owner stays live
+-- while a provider's retirement is pending. See "Hetoimasia.Scripting.Lua.Lease".
+--
 -- = Host failures
 --
 -- A Haskell failure raised by a binding's action, or by the application's liveness
@@ -274,7 +286,7 @@ module Hetoimasia.Scripting.Lua.Scheduled
   , CallbackWaitRefused (..)
   ) where
 
-import Control.Concurrent.STM (STM, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, retry, writeTVar)
+import Control.Concurrent.STM (STM, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (ExceptionWithContext, SomeException, evaluate, mask, mask_, onException)
 import Control.Monad (forM, forM_, join, when)
 import Data.Foldable (traverse_)
@@ -318,8 +330,10 @@ import Hetoimasia.Scripting.Lua.Instance.Run (gateOf)
 import Hetoimasia.Scripting.Lua.Instance.State (isInstanceTask)
 import Hetoimasia.Scripting.Lua.Lifecycle (LifecycleGrant, LifecycleRefused (LifecycleRefused), lifecycleContextOf, newLifecycleState, resolveGrant)
 import Hetoimasia.Scripting.Lua.Instance.Types
-  ( InstanceConfig (instanceEscalate, instanceSources)
+  ( InstanceBounds (boundLiveInstances)
+  , InstanceConfig (instanceBounds, instanceEscalate, instanceSources)
   , InstanceViolation (RegistrationRefused)
+  , Instances (insRunning)
   , InstancesRefused (InstancesRefused)
   , newInstances
   , validateInstanceConfig
@@ -335,7 +349,8 @@ import Hetoimasia.Scripting.Lua.Runtime.Types
   , Payload (OverBound, WithinBounds)
   , ownerSequence
   )
-import Hetoimasia.Scripting.Lua.Lending.Loan (Lending, bindLending)
+import Hetoimasia.Scripting.Lua.Lease.State (LeasesRefused (LeasesRefused), LeasesViolation (..), Leases (leasesCapacity, leasesLending), bindLeasesHandle)
+import Hetoimasia.Scripting.Lua.Lending.Loan (Lending, bindLending, sameLending)
 import Hetoimasia.Scripting.Lua.Scheduled.Run (runScheduledOwner)
 import Hetoimasia.Scripting.Lua.Scheduled.Types
 import Hetoimasia.Scripting.Lua.Scheduler
@@ -401,6 +416,11 @@ data ScheduledSpec = ScheduledSpec
     -- ^ The handle the owner lends its collection through, if the application's
     -- bindings use one. A handle serves one owner. Without it the owner holds no
     -- collection. See "Hetoimasia.Scripting.Lua.Lending".
+  , scheduledLeases ∷ Maybe Leases
+    -- ^ The handle the owner's instances hold their leases through, if the
+    -- application's bindings use one: it must be made over the handle the owner lends
+    -- through, and the owner must host instances. A handle serves one owner. See
+    -- "Hetoimasia.Scripting.Lua.Lease".
   , scheduledMemberLimit ∷ Int
     -- ^ The most members the owner's collection holds live at once. At least one:
     -- a lower limit is refused when the owner is created.
@@ -428,6 +448,7 @@ scheduledSpec config worker bounds =
     , scheduledObserve = \_ → pure ()
     , scheduledInstances = Nothing
     , scheduledLending = Nothing
+    , scheduledLeases = Nothing
     , scheduledMemberLimit = defaultMemberLimit
     , scheduledLifecycle = Nothing
     }
@@ -513,6 +534,18 @@ startScheduledOwner runtime spec = do
         , schedStopRequested = stopping
         }
       >>= either (throwFailure runtimeComponent (operation "start-scheduled-owner") []) pure
+  -- The leases are refused, before anything starts, for a configuration they cannot
+  -- be used with: an owner that hosts no instances, or lends no collection, or lends
+  -- another one, or whose collection cannot hold every instance at its capacity.
+  forM_ (scheduledLeases spec) $ \leases → do
+    let live = maybe 0 (\(_, instanceConfig, _) → boundLiveInstances (instanceBounds instanceConfig)) hosted
+        violations =
+          [LeasesNeedInstances | null hosted]
+            <> [LeasesNeedLending | null (scheduledLending spec)]
+            <> [LeasesLendingMismatch | Just lending ← [scheduledLending spec], not (sameLending lending (leasesLending leases))]
+            <> [LeasesMembersTooFew (scheduledMemberLimit spec) (live * leasesCapacity leases) | scheduledMemberLimit spec < live * leasesCapacity leases]
+    forM_ (NonEmpty.nonEmpty violations) $ \refused →
+      throwFailure runtimeComponent (operation "start-scheduled-owner") [] (LeasesRefused refused)
   -- The owner's control, without its lifecycle services: what the owner's own gate reads
   -- is the scheduler and whether it is stopping, which it already has.
   let ownInstances = fmap (\(instances, _, _) → instances) hosted
@@ -530,6 +563,8 @@ startScheduledOwner runtime spec = do
   -- The handle is taken once the configuration is known to be acceptable and
   -- before anything starts.
   traverse_ bindLending (scheduledLending spec)
+  forM_ ((,) <$> scheduledLeases spec <*> hosted) $ \(leases, (instances, _, _)) →
+    bindLeasesHandle leases (readTVarIO (insRunning instances))
   let control = bare {controlLifecycle = lifecycle}
   handoff ← newTVarIO Nothing
   let definition =
@@ -542,7 +577,7 @@ startScheduledOwner runtime spec = do
                 -- everything that already ended the owner has done this.
                 (\held → atomically (settleAll held ExitFailed))
           )
-          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) (fmap (\(_, instanceConfig, _) → instanceEscalate instanceConfig) hosted) (scheduledLending spec) (scheduledMemberLimit spec) config {vmLifecycle = lifecycleContextOf <$> lifecycle})
+          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) (fmap (\(_, instanceConfig, _) → instanceEscalate instanceConfig) hosted) (scheduledLending spec) (scheduledLeases spec) (scheduledMemberLimit spec) config {vmLifecycle = lifecycleContextOf <$> lifecycle})
   -- Acquisition is masked from the worker's start to the endpoint's handoff, and
   -- only the readiness wait is restored, exactly as for a finite-call owner.
   mask $ \restore → do

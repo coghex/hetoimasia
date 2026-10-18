@@ -60,6 +60,8 @@ module Hetoimasia.Scripting.Lua.Internal.Registration
   , commandIntention
   , asynchronousNativeRequest
   , lifecycleOperation
+  , releaseOperation
+  , acceptsRetired
   , lifecycleOperationIn
   , LifecycleContext
   , lifecycleContext
@@ -187,6 +189,10 @@ data Action
     -- suspended and the host is told which operation did it, with the arguments
     -- it was given.
     SuspendAction !Suspend
+  | -- | An explicit release: values in, values out, like an owned state operation,
+    -- and the one kind that is run for a handle whose lease has ended. See
+    -- 'releaseOperation'.
+    ReleaseAction ([Value] → IO [Value])
 
 -- | One binding.
 data Binding = Binding
@@ -260,6 +266,29 @@ lifecycleContext = LifecycleContext . toDyn
 -- | The value a context holds, if it is of this type.
 fromLifecycleContext ∷ Typeable a ⇒ LifecycleContext → Maybe a
 fromLifecycleContext (LifecycleContext held) = fromDynamic held
+
+-- | An explicit release of a capability the application hands its scripts: the
+-- release operation of a handle type, named, declared with the one capability type
+-- it releases, and the results it answers.
+--
+-- It is the one binding that is run for a handle the application's own check
+-- reports as retired. Every binding refuses such a handle before its action runs
+-- (@RuleRetiredHandle@), because using what has ended is a fault; releasing it again
+-- is not one, and the action is what answers that the release has already
+-- happened. Only the handle argument is accepted this way: it must still be
+-- authentic, issued by this VM, and of the declared type, and it is the binding's
+-- only argument, so no other value of the call is ever let through. A retired
+-- handle of any other type, or given to any other binding, keeps the refusal.
+releaseOperation ∷ Text → Text → [Schema] → ([Value] → IO [Value]) → Binding
+releaseOperation name handleType results action =
+  Binding name OwnedStateOperation [SCapability handleType] results True False False (ReleaseAction action)
+
+-- | Whether a binding's action is run for a handle whose lease has ended: only an
+-- explicit release.
+acceptsRetired ∷ Binding → Bool
+acceptsRetired binding = case bindingAction binding of
+  ReleaseAction _ → True
+  _ → False
 
 -- | A yield: control goes back to whatever resumes the task, which resumes it
 -- later. It takes no arguments and answers none.

@@ -33,6 +33,7 @@ module Hetoimasia.Scripting.Lua.Internal.Fault
     -- * Where a failure came from
   , fromApplication
   , raisedByApplication
+  , CallRefusal (..)
     -- * Reading what a failed call left
   , classify
   , renderFailure
@@ -114,6 +115,26 @@ fromApplication action =
 -- | Whether a failure's context says application code raised it.
 raisedByApplication ∷ ExceptionContext → Bool
 raisedByApplication context = not (null (getExceptionAnnotations context ∷ [RaisedByApplication]))
+
+-- | The engine's own refusal of the call a binding's action is serving, raised
+-- by the engine's API from inside that action.
+--
+-- A failure that escapes an action is the application's and ends the owner, so an
+-- action cannot refuse its own call by throwing: whatever it throws is marked as
+-- its own. This is the exception for the refusals that are not. The binding's
+-- handler catches it around the action, and answers it as a fault of the call
+-- ('Hetoimasia.Scripting.Lua.Internal.Boundary.BindingRefused'): recorded on the
+-- VM like any other refusal of a call (decision C1), so the invocation's
+-- operation raises it whatever the script does with the error it sees, and never
+-- marked as a failure of application code. It is not exported by the public
+-- library, so application code cannot raise it; only an engine API that checks
+-- the condition itself, before it has any effect, does.
+newtype CallRefusal = CallRefusal
+  { refusalReason ∷ Text
+  }
+  deriving (Eq, Show)
+
+instance Exception CallRefusal
 
 -- | How many bytes of a Lua error value are reported.
 --

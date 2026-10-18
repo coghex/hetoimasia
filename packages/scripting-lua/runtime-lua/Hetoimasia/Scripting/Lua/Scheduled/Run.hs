@@ -85,6 +85,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Failure (ReasonCode (ScriptFau
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (TaskId)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Task (TaskFailure (TaskFailure))
 import Hetoimasia.Scripting.Lua.Internal.Vm (vmIdentity)
+import Hetoimasia.Scripting.Lua.Lease.State (LeaseHost (LeaseHost), Leases)
 import Hetoimasia.Scripting.Lua.Lending.Loan (Lending, lendingScope)
 import Hetoimasia.Scripting.Lua.Owner
   ( BoundaryFault (..)
@@ -116,6 +117,7 @@ import Hetoimasia.Scripting.Lua.Instance.Run
   ( ExitMode (Unorderly)
   , InstanceHost (ihMode)
   , awaitInstanceWork
+  , cleanupEndedOwner
   , instanceClosed
   , instanceSegment
   , newInstanceHost
@@ -156,27 +158,31 @@ runScheduledOwner
   → (SegmentContext → IO ())
   → Maybe (InstanceFailure → IO Escalation)
   → Maybe Lending
+  → Maybe Leases
   → Int
   → VmConfig
   → IO ()
-runScheduledOwner stopping control handoff observe escalate lending members config = mask $ \restore → do
+runScheduledOwner stopping control handoff observe escalate lending leases members config = mask $ \restore → do
   let body = serve stopping control handoff observe escalate config
   outcome ←
     tryWithContext @SomeException . restore $ case lending of
-      Nothing → withVmOwnerScoped noCallbackScope config body
+      Nothing → withVmOwnerScoped noCallbackScope config (body Nothing)
       -- The collection is allocated first and so released last: after the VM's
       -- close, which is the last thing 'withVmOwnerScoped' does.
       Just handle →
         withScoped (allocOwnedCollection members) $ \(collection, capability) →
-          withVmOwnerScoped (lendingScope handle collection capability) config body
+          withVmOwnerScoped (lendingScope handle collection capability) config
+            -- The owner's thread holds the capability, and with the leases it drains an
+            -- instance's holdings through it when the instance ends.
+            (body (LeaseHost <$> leases <*> pure collection <*> pure capability))
   -- An exit before the body, or a failure of the close itself: nothing of the
   -- tasks is left to settle then, and this records how the owner ended.
   atomically (settleAll control (either exitOf (const ExitStopped) outcome))
   either rethrowIO pure outcome
 
 -- | The body of the owner's lifetime.
-serve ∷ STM Bool → Control → TVar (Maybe Control) → (SegmentContext → IO ()) → Maybe (InstanceFailure → IO Escalation) → VmConfig → OwnedVm → IO ()
-serve stopping control handoff observe escalate config owned = mask $ \restore → do
+serve ∷ STM Bool → Control → TVar (Maybe Control) → (SegmentContext → IO ()) → Maybe (InstanceFailure → IO Escalation) → VmConfig → Maybe LeaseHost → OwnedVm → IO ()
+serve stopping control handoff observe escalate config leaseHost owned = mask $ \restore → do
   tasks ← newIORef Map.empty
   handlesRef ← newIORef Map.empty
   instanceRef ← newIORef Nothing
@@ -215,7 +221,7 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
     writeIORef handlesRef handles
     forM_ ((,) <$> controlInstances control <*> escalate) $ \(instances, decide) →
       forM_ (Map.lookup driverRef handles) $ \driver →
-        newInstanceHost control instances decide host owned driver handlesRef tasks extra >>= writeIORef instanceRef . Just
+        newInstanceHost control instances decide host owned driver handlesRef tasks extra leaseHost >>= writeIORef instanceRef . Just
     atomically (writeTVar handoff (Just control))
     loop host kept extra instanceRef
   -- The owner is exiting, however it was asked to or made to. Admission, grants
@@ -228,9 +234,15 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
   atomically (writeTVar (controlClosing control) True)
   -- Whether Lua may be entered for an instance again: only after an orderly stop.
   heldInstances ← readIORef instanceRef
+  let heldInstances0 = heldInstances
+  -- A cleanup failure of the instances' leases ended the owner at once: it exits as a
+  -- failure, as any cleanup failure ends it, even though what stopped its loop was the
+  -- closing the failure itself asked for.
+  leaseFailed ← maybe (pure False) cleanupEndedOwner heldInstances0
   let cause = case served of
         Left failure → Just (exitOf failure)
         Right True → Just ExitFailed
+        Right False | leaseFailed → Just ExitFailed
         Right False → Nothing
   forM_ heldInstances (`recordExit` cause)
   -- The owner's exit record says how it exited, and it is what the instances left are
@@ -247,9 +259,13 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
     _ → pure ()
   -- A stop that raised, because a close was interrupted or the timer's
   -- cancellation threw, completed first: asking again answers what it recorded.
-  report ← case stopped of
-    Right done → pure (Just done)
-    Left _ → either (const Nothing) Just <$> tryWithContext @SomeException (stopScheduler scheduler host)
+  stoppedAgain ← case stopped of
+    Right done → pure (Right done)
+    Left _ → tryWithContext @SomeException (stopScheduler scheduler host)
+  let report = either (const Nothing) Just stoppedAgain
+      -- What asking again raised is kept too: the first ask's failure is evidence, and so is
+      -- this one's, unless it is that same failure.
+      askedAgain = [("lua scheduler stop retry", failure) | Left failure@(ExceptionWithContext _ raised) ← [stoppedAgain], Left (ExceptionWithContext _ first) ← [stopped], show raised /= show first]
   -- A coroutine the scheduler did not close, because its task was inside a
   -- segment when the owner ended (the application's observer raised before it
   -- resumed, say), is closed here, before the VM is, where closing it can run the
@@ -279,7 +295,7 @@ serve stopping control handoff observe escalate config owned = mask $ \restore �
       recorded = map (show . snd) closeFailures <> [show failure | Just failure ← [timerFailure]]
       -- What cancelling the timer raised: the stop went on, and the report keeps it
       -- even when a close's interruption is what the stop raised.
-      timerEvidence = [("lua timer cancel", ExceptionWithContext (someExceptionContext failure) failure) | Just failure ← [timerFailure]]
+      timerEvidence = askedAgain <> [("lua timer cancel", ExceptionWithContext (someExceptionContext failure) failure) | Just failure ← [timerFailure]]
       interruption =
         [ ("lua scheduler stop", failure)
         | Left failure@(ExceptionWithContext _ raised) ← [stopped]
