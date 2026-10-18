@@ -98,11 +98,15 @@ data Invocation
     InvokeEvent !Text !Payload
   | -- | A one-shot's @run@ hook.
     InvokeRun
+  | -- | A periodic instance's @update@ hook, handed the logical duration granted or
+    -- the elapsed time since the previous update, fixed when it begins.
+    InvokeUpdate
 
 instance NFData Invocation where
   rnf = \case
     InvokeEvent source payload → source `seq` rnf payload
     InvokeRun → ()
+    InvokeUpdate → ()
 
 instance NFData Cursor where
   rnf = \case

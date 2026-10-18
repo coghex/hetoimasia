@@ -20,6 +20,7 @@ module Hetoimasia.Scripting.Lua.Instance.State
   , lookupLive
   , connectSource
   , isInstanceTask
+  , takeDelta
   , beginEnding
   , settleInstance
   , takeJobs
@@ -60,10 +61,17 @@ admitInstance instances gate owner request = do
   live ← readTVar (insLive instances)
   retained ← readTVar (insRetained instances)
   let bounds = insBounds instances
+      -- A periodic instance's interval is resolved here, exactly or not at all, and
+      -- before a place is taken for it.
+      resolved = case instanceKind request of
+        Periodic interval → Just <$> resolveInterval (insTickDuration instances) interval
+        _ → Right Nothing
   if not open
     then pure InstanceAdmissionClosed
-    else
-      if live >= boundLiveInstances bounds || retained >= boundRetainedInstances bounds
+    else case resolved of
+      Left refusal → pure (InstanceIntervalRefused refusal)
+      Right cadence →
+        if live >= boundLiveInstances bounds || retained >= boundRetainedInstances bounds
         then pure InstanceFull
         else do
           number ← readTVar (insNext instances)
@@ -77,6 +85,7 @@ admitInstance instances gate owner request = do
                   { icId = number
                   , icModule = instanceModule request
                   , icKind = instanceKind request
+                  , icCadence = cadence
                   , icName = instanceName request
                   , icClass = instanceClass request
                   , icGrants = Set.fromList (instanceGrants request)
@@ -244,7 +253,7 @@ settleInstance instances cell settlement =
     Just _ → pure False
     Nothing → do
       writeTVar (icResult cell) (Just settlement)
-      modifyTVar' (icState cell) (\state → state {isPhase = resultPhase settlement, isStopped = True, isActive = Nothing, isConnections = Set.empty, isQueue = Seq.empty, isPending = Nothing})
+      modifyTVar' (icState cell) (\state → state {isPhase = resultPhase settlement, isStopped = True, isActive = Nothing, isConnections = Set.empty, isQueue = Seq.empty, isPending = Nothing, isUpdate = UpdateNone})
       modifyTVar' (insLive instances) (subtract 1)
       forgotten ← readTVar (icForgotten cell)
       when forgotten (releaseResult instances cell)
@@ -271,6 +280,7 @@ snapshotOf instances gate owner label cell = do
       , snapshotQueueFull = isQueueFull state
       , snapshotDelivered = isDelivered state
       , snapshotConnections = Set.size (isConnections state)
+      , snapshotUpdateOwed = updateOwed state
       }
 
 -- | One instance, live or ended and not yet observed. 'Nothing' for another
@@ -329,6 +339,17 @@ connectSource instances number source = do
         writeTVar (icState cell) state {isConnections = Set.insert source (isConnections state)}
       pure allowed
 
+-- | The @dt@ of the update that is about to begin for this instance, in seconds, taken
+-- once; a negative number when none is, which is how the driver tells a one-shot's
+-- @run@ from an update. Only the instance whose code is running is answered.
+takeDelta ∷ Instances → Word64 → STM Double
+takeDelta instances number = do
+  running ← readTVar (insRunning instances)
+  pending ← readTVar (insDelta instances)
+  case pending of
+    Just (owner, seconds) | owner == number && running == Just number → seconds <$ writeTVar (insDelta instances) Nothing
+    _ → pure (-1)
+
 -- | Begin ending an instance, once: admission and delivery close, the connections
 -- are revoked and what had not begun is discarded. Answers what that revoked and
 -- discarded, and whether the instance was already ending, in which case nothing
@@ -346,6 +367,7 @@ beginEnding cell = do
           , isConnections = Set.empty
           , isQueue = Seq.empty
           , isPending = Nothing
+          , isUpdate = UpdateNone
           , isDispatchQueued = False
           }
       pure (Set.size (isConnections state), unstartedCount (icKind cell) state, False)

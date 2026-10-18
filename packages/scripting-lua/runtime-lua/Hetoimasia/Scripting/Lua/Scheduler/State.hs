@@ -18,6 +18,8 @@ module Hetoimasia.Scripting.Lua.Scheduler.State
   , TaskInfo (..)
   , WaitRecord (..)
   , Grant (..)
+  , LogicalCadence (..)
+  , ElapsedCadence (..)
   , Slot (..)
   , PendingControl (..)
   , initialState
@@ -30,6 +32,7 @@ module Hetoimasia.Scripting.Lua.Scheduler.State
   , diagnosticsOf
   , outstandingGrants
   , earliestDeadline
+  , elapsedDemand
   , liveTarget
   , liveCount
 
@@ -57,6 +60,19 @@ module Hetoimasia.Scripting.Lua.Scheduler.State
   , wakeDueElapsed
   , grantIn
 
+    -- * Cadences
+  , cadenceStartLogical
+  , cadenceStartElapsed
+  , cadenceArmLogical
+  , cadenceArmElapsed
+  , cadenceDisarm
+  , cadenceStop
+  , cadenceTake
+  , cadenceRelease
+  , cadenceAccruedOf
+  , cadenceResetAccrued
+  , cadenceHeldBy
+
     -- * Control
   , pauseIn
   , resumeIn
@@ -68,6 +84,7 @@ import Control.Concurrent.STM (TVar)
 import Control.Exception (SomeException)
 import Data.Foldable (toList)
 import Data.List (sortOn)
+import Data.Maybe (isJust)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -179,6 +196,21 @@ data TaskInfo = TaskInfo
     -- ^ The grant whose wake made the task ready and has not yet seen it finish.
   }
 
+-- | A logical cadence an owner registered: the tick it is next due at, the logical
+-- duration granted since its accrual began, whether it is accruing, and the grant it
+-- holds while its point is being served.
+data LogicalCadence = LogicalCadence
+  { lcTarget ∷ !(Maybe Word64)
+  , lcAccrued ∷ !Duration
+  , lcAccruing ∷ !Bool
+    -- ^ Whether the grants applied are added to what it has accrued: not while the
+    -- owner has disarmed it.
+  , lcHold ∷ !(Maybe GrantId)
+  }
+
+-- | An elapsed cadence an owner registered: the deadline it is next due at.
+newtype ElapsedCadence = ElapsedCadence {ecDeadline ∷ Maybe Instant}
+
 -- | One accepted grant, until its work has finished.
 data Grant = Grant
   { grantDuration ∷ !Duration
@@ -213,6 +245,10 @@ data SchedState v = SchedState
   , ssLogical ∷ !(Map Word64 TaskId)
   , ssElapsed ∷ !(Map (Instant, Word64) TaskId)
   , ssNextWait ∷ !Word64
+  , ssCadenceLogical ∷ !(Map CadenceKey LogicalCadence)
+  , ssCadenceElapsed ∷ !(Map CadenceKey ElapsedCadence)
+  , ssFirings ∷ !(Seq (CadenceKey, CadenceFiring))
+    -- ^ The cadence points reached and not yet taken, in the order they were reached.
   , ssControl ∷ !(Seq PendingControl)
   , ssReserved ∷ !Int
   , ssPhase ∷ !Phase
@@ -255,6 +291,9 @@ initialState label session =
     , ssLogical = Map.empty
     , ssElapsed = Map.empty
     , ssNextWait = 0
+    , ssCadenceLogical = Map.empty
+    , ssCadenceElapsed = Map.empty
+    , ssFirings = Seq.empty
     , ssControl = Seq.empty
     , ssReserved = 0
     , ssPhase = Open
@@ -370,9 +409,21 @@ diagnosticsOf state =
 outstandingGrants ∷ SchedState v → Int
 outstandingGrants = Seq.length . ssGrants
 
--- | The earliest deadline an elapsed waiter holds.
+-- | The earliest deadline an elapsed waiter or an elapsed cadence holds.
 earliestDeadline ∷ SchedState v → Maybe Instant
-earliestDeadline state = fst . fst <$> Map.lookupMin (ssElapsed state)
+earliestDeadline state = case (waiter, cadence) of
+  (Just a, Just b) → Just (min a b)
+  (a, Nothing) → a
+  (Nothing, b) → b
+  where
+    waiter = fst . fst <$> Map.lookupMin (ssElapsed state)
+    cadence = case [deadline | ElapsedCadence (Just deadline) ← Map.elems (ssCadenceElapsed state)] of
+      [] → Nothing
+      deadlines → Just (minimum deadlines)
+
+-- | Whether anything holds an elapsed deadline: a waiter, or a cadence armed.
+elapsedDemand ∷ SchedState v → Bool
+elapsedDemand state = not (Map.null (ssElapsed state)) || any (isJust . ecDeadline) (Map.elems (ssCadenceElapsed state))
 
 -- | Whether the identity names a task that is live: issued here, activated, and
 -- not finished.
@@ -767,8 +818,9 @@ settleGrants state = case Seq.viewl (ssGrants state) of
     | otherwise → (state, [])
 
 applyHead ∷ Grant → SchedState v → (SchedState v, [Event])
-applyHead grant state = foldl' advance (opened, []) (Map.toAscList (ssLogical state))
+applyHead grant state = (advanceCadences grant identityOfGrant tick woken, wakeEvents)
   where
+    (woken, wakeEvents) = foldl' advance (opened, []) (Map.toAscList (ssLogical state))
     tick = ssTick state + 1
     identityOfGrant = GrantId (firstOpen state)
     opened =
@@ -791,9 +843,10 @@ applyHead grant state = foldl' advance (opened, []) (Map.toAscList (ssLogical st
       _ → (current, events)
 
 -- | Wake the elapsed waiters whose deadlines the reading has reached, in
--- deadline order and, for equal deadlines, in the order their waits began.
+-- deadline order and, for equal deadlines, in the order their waits began, and
+-- reach the elapsed cadence points the reading has passed.
 wakeDueElapsed ∷ Instant → SchedState v → SchedState v
-wakeDueElapsed now state = foldl' wakeOne state due
+wakeDueElapsed now state = reachElapsedCadences now (foldl' wakeOne state due)
   where
     due = takeWhile (\((deadline, _), _) → deadlineReached now deadline) (Map.toAscList (ssElapsed state))
     wakeOne current (_, identity) = case Map.lookup identity (ssInfo current) >>= infoWait of
@@ -826,6 +879,134 @@ wake identity earned cause state = case Map.lookup identity (ssInfo state) of
       Nothing → woken
       Just (GrantId number) →
         woken {ssGrants = Seq.adjust' (\grant → grant {grantDue = grantDue grant + 1}) (fromIntegral (number - firstOpen woken)) (ssGrants woken)}
+
+-- Cadences ---------------------------------------------------------------------
+
+-- | A grant has been applied: add its duration to every logical cadence's accrual,
+-- and reach the points it is due at. A reached point holds the grant, as a task it
+-- woke would, so the grant is not finished until the owner has served the point and
+-- released the hold. An accrual that cannot be represented fails the cadence, on the
+-- grant, and nothing wraps.
+advanceCadences ∷ Grant → GrantId → Word64 → SchedState v → SchedState v
+advanceCadences grant held tick state = foldl' one state (Map.toAscList (ssCadenceLogical state))
+  where
+    one current (key, cadence)
+      | not (lcAccruing cadence) = current
+      | otherwise = accruing current key cadence
+    accruing current key cadence = case addDurations (lcAccrued cadence) (grantDuration grant) of
+      Left _ → reach current key cadence {lcTarget = Nothing} (FiredFault CadenceAccrualOverflow)
+      Right accrued → case lcTarget cadence of
+        Just target | tick >= target → reach current key cadence {lcAccrued = accrued, lcTarget = Nothing} (FiredLogical tick)
+        _ → current {ssCadenceLogical = Map.insert key cadence {lcAccrued = accrued} (ssCadenceLogical current)}
+    reach current key cadence firing =
+      current
+        { ssCadenceLogical = Map.insert key cadence {lcHold = Just held} (ssCadenceLogical current)
+        , ssGrants = Seq.adjust' (\open -> open {grantDue = grantDue open + 1}) 0 (ssGrants current)
+        , ssFirings = ssFirings current |> (key, firing)
+        }
+
+-- | The elapsed cadence points a reading has reached, in deadline order and, for equal
+-- deadlines, in the order of their keys. A reached cadence has no deadline until its
+-- owner arms it again.
+reachElapsedCadences ∷ Instant → SchedState v → SchedState v
+reachElapsedCadences now state = foldl' reach state due
+  where
+    due = sortOn (\(key, deadline) → (deadline, key)) [(key, deadline) | (key, ElapsedCadence (Just deadline)) ← Map.toList (ssCadenceElapsed state), deadlineReached now deadline]
+    reach current (key, deadline) =
+      current
+        { ssCadenceElapsed = Map.insert key (ElapsedCadence Nothing) (ssCadenceElapsed current)
+        , ssFirings = ssFirings current |> (key, FiredElapsed deadline now)
+        }
+
+-- | Register a logical cadence due at a tick, with nothing accrued. Refused, answering
+-- 'Nothing', for a key already registered.
+cadenceStartLogical ∷ CadenceKey → Word64 → SchedState v → Maybe (SchedState v)
+cadenceStartLogical key target state
+  | registered key state = Nothing
+  | otherwise = Just state {ssCadenceLogical = Map.insert key (LogicalCadence (Just target) zeroDuration True Nothing) (ssCadenceLogical state)}
+
+-- | Register an elapsed cadence due at a deadline. Refused for a key already registered.
+cadenceStartElapsed ∷ CadenceKey → Instant → SchedState v → Maybe (SchedState v)
+cadenceStartElapsed key deadline state
+  | registered key state = Nothing
+  | otherwise = Just state {ssCadenceElapsed = Map.insert key (ElapsedCadence (Just deadline)) (ssCadenceElapsed state)}
+
+registered ∷ CadenceKey → SchedState v → Bool
+registered key state = Map.member key (ssCadenceLogical state) || Map.member key (ssCadenceElapsed state)
+
+-- | Arm a registered logical cadence for a tick, keeping what it has accrued, and
+-- accruing again from the grants applied after this.
+cadenceArmLogical ∷ CadenceKey → Word64 → SchedState v → SchedState v
+cadenceArmLogical key target state = state {ssCadenceLogical = Map.adjust (\cadence → cadence {lcTarget = Just target, lcAccruing = True}) key (ssCadenceLogical state)}
+
+-- | Arm a registered elapsed cadence for a deadline.
+cadenceArmElapsed ∷ CadenceKey → Instant → SchedState v → SchedState v
+cadenceArmElapsed key deadline state = state {ssCadenceElapsed = Map.adjust (const (ElapsedCadence (Just deadline))) key (ssCadenceElapsed state)}
+
+-- | Invalidate what a cadence made before now, in the one place a pause and an ending
+-- both do it: the grant it holds is released, and the points it reached and nobody took
+-- are dropped, an elapsed one and a logical one alike, since each was made at a deadline
+-- or a tick that is no longer the cadence's. A pause and a resume that follow a point
+-- before it is served must not find it still there, and a point that is dropped here can
+-- no more hold a grant. A fault of the cadence's arithmetic is not demand: it is kept for
+-- its owner to be told of, unless the cadence is taken away altogether.
+invalidated ∷ Bool → CadenceKey → SchedState v → SchedState v
+invalidated everything key state = released {ssFirings = Seq.filter (not . dropped) (ssFirings released)}
+  where
+    released = cadenceRelease key state
+    dropped (firedKey, firing) = firedKey == key && (everything || demand firing)
+    demand = \case
+      FiredFault _ → False
+      _ → True
+
+-- | Disarm a cadence, as a pause does: everything it made before is invalidated, it is
+-- due at nothing and keeps what it has accrued, and a logical one accrues nothing from
+-- the grants applied until it is armed again.
+cadenceDisarm ∷ CadenceKey → SchedState v → SchedState v
+cadenceDisarm key state =
+  disarmed
+    { ssCadenceLogical = Map.adjust (\cadence → cadence {lcTarget = Nothing, lcAccruing = False}) key (ssCadenceLogical disarmed)
+    , ssCadenceElapsed = Map.adjust (const (ElapsedCadence Nothing)) key (ssCadenceElapsed disarmed)
+    }
+  where
+    disarmed = invalidated False key state
+
+-- | Take a cadence away, as an ending does: its demand is cancelled, whatever it made is
+-- invalidated and nothing of it is left.
+cadenceStop ∷ CadenceKey → SchedState v → SchedState v
+cadenceStop key state =
+  stopped
+    { ssCadenceLogical = Map.delete key (ssCadenceLogical stopped)
+    , ssCadenceElapsed = Map.delete key (ssCadenceElapsed stopped)
+    }
+  where
+    stopped = invalidated True key state
+
+-- | The points reached since they were last taken, in the order they were reached.
+cadenceTake ∷ SchedState v → ([(CadenceKey, CadenceFiring)], SchedState v)
+cadenceTake state = (toList (ssFirings state), state {ssFirings = Seq.empty})
+
+-- | Give back the grant a cadence holds, so that it can finish once its other work has.
+cadenceRelease ∷ CadenceKey → SchedState v → SchedState v
+cadenceRelease key state = case Map.lookup key (ssCadenceLogical state) of
+  Just cadence@LogicalCadence {lcHold = Just (GrantId number)} →
+    state
+      { ssCadenceLogical = Map.insert key cadence {lcHold = Nothing} (ssCadenceLogical state)
+      , ssGrants = Seq.adjust' (\open → open {grantDue = max 0 (grantDue open - 1)}) (fromIntegral (number - firstOpen state)) (ssGrants state)
+      }
+  _ → state
+
+-- | What a logical cadence has accrued.
+cadenceAccruedOf ∷ CadenceKey → SchedState v → Maybe Duration
+cadenceAccruedOf key state = lcAccrued <$> Map.lookup key (ssCadenceLogical state)
+
+-- | Begin a logical cadence's accrual again from nothing.
+cadenceResetAccrued ∷ CadenceKey → SchedState v → SchedState v
+cadenceResetAccrued key state = state {ssCadenceLogical = Map.adjust (\cadence → cadence {lcAccrued = zeroDuration}) key (ssCadenceLogical state)}
+
+-- | Whether a logical cadence holds a grant.
+cadenceHeldBy ∷ CadenceKey → SchedState v → Bool
+cadenceHeldBy key state = maybe False (isJust . lcHold) (Map.lookup key (ssCadenceLogical state))
 
 -- Control -----------------------------------------------------------------------
 

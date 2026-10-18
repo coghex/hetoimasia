@@ -1,5 +1,5 @@
 -- | The instance layer's part of the VM: a module the owner loads beside the
--- application's, and the one binding its @api@ reaches the owner through.
+-- application's, and the bindings its @api@ and its updates reach the owner through.
 --
 -- An instance's @self@ and the functions it connected are values of the VM: they
 -- have an identity and a lifetime of their own, and cannot cross the value boundary
@@ -10,7 +10,10 @@
 -- cannot reach the table, so it cannot forge or erase another instance's state, and
 -- cannot reach its own record except through the @self@ and @api@ it is handed.
 --
--- The one binding, @hetoimasia_instance.connect@, tells the owner that an instance
+-- The binding @hetoimasia_instance.delta@ hands the driver an update's @dt@, in seconds,
+-- and a negative number for anything else, so a one-shot's @run@ and an update go through
+-- one entry point that takes the instance's number alone. The binding
+-- @hetoimasia_instance.connect@ tells the owner that an instance
 -- connected a function to a source. The owner records the connection when it is
 -- made, whichever thread the event arrives from, so it can accept events for an
 -- instance whose @init@ is still running, and revoke what it connected whichever
@@ -28,17 +31,17 @@ import Control.Concurrent.STM (atomically)
 import qualified Data.ByteString.Char8 as Char8
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Hetoimasia.Scripting.Lua.Instance.State (connectSource)
+import Hetoimasia.Scripting.Lua.Instance.State (connectSource, takeDelta)
 import Hetoimasia.Scripting.Lua.Instance.Types (EventSource (..), Instances)
 import Hetoimasia.Scripting.Lua.Owner (EntryPoint (..), ModuleRef (..), ModuleSource (..), Requirement (..))
 import Hetoimasia.Scripting.Lua.Registration (Namespace, namespace, stateOperation)
-import Hetoimasia.Scripting.Lua.Value (Schema (..), Value (VBoolean, VInteger, VText))
+import Hetoimasia.Scripting.Lua.Value (Schema (..), Value (VBoolean, VFloat, VInteger, VText))
 
 -- | The driver's module.
 driverRef ∷ ModuleRef
 driverRef = ModuleRef "hetoimasia.instance" "1"
 
--- | The namespace the owner's one binding is installed in.
+-- | The namespace the owner's bindings are installed in.
 driverNamespaceName ∷ Text
 driverNamespaceName = "hetoimasia_instance"
 
@@ -48,13 +51,13 @@ eventEntry ∷ Text → Text
 eventEntry source = "event_" <> source
 
 -- | The hooks a module that hosts instances declares, each optional: @init@ runs
--- once, @update@ is part of the authoring model and is never due in this slice,
+-- once, @update@ runs when a periodic instance's interval makes one due,
 -- @shutdown@ runs once on the way out, and @run@ is a one-shot's body. Declared
 -- with no arguments: the driver hands each its @self@ and what else it takes.
 hookEntries ∷ [EntryPoint]
 hookEntries = [EntryPoint name Optional [] [] | name ← ["init", "update", "shutdown", "run"]]
 
--- | The namespace holding the owner's one binding, over the owner's instances.
+-- | The namespace holding the owner's bindings, over the owner's instances.
 connectNamespace ∷ Instances → Namespace
 connectNamespace instances =
   namespace driverNamespaceName
@@ -62,6 +65,12 @@ connectNamespace instances =
         [VInteger number, VText source] | number >= 0 →
           (\accepted → [VBoolean accepted]) <$> atomically (connectSource instances (fromIntegral number) source)
         _ → pure [VBoolean False]
+    , -- The delta, in seconds, of the update that is about to begin, or a negative one
+      -- for anything else: how the one entry point for @run@ and @update@ tells them
+      -- apart without a second value across the boundary.
+      stateOperation "delta" [SInteger] [SFloat] $ \case
+        [VInteger number] | number >= 0 → (\seconds → [VFloat seconds]) <$> atomically (takeDelta instances (fromIntegral number))
+        _ → pure [VFloat (-1)]
     ]
 
 -- | The driver as a module: its source, and the entry points the owner calls.
@@ -77,7 +86,11 @@ driverSource sources =
         [ entry "create" [SInteger]
         , entry "release" [SInteger]
         , entry "init" [SInteger]
-        , entry "run" [SInteger]
+        , -- The one entry point both a one-shot's @run@ and a periodic @update@ go
+          -- through, with the one value a one-shot's @run@ always had: the instance's
+          -- number. An update is told from a @run@, and handed its delta, by the
+          -- binding.
+          entry "run" [SInteger]
         , entry "shutdown" [SInteger, SText]
         ]
           <> [ entry (eventEntry (sourceName source)) [SInteger, eventSchema source]
@@ -151,7 +164,12 @@ luaBody =
   , ""
   , "function run(hook, slot)"
   , "  local record = find(slot)"
-  , "  hook(record.self, record.api)"
+  , "  local dt = host.delta(slot)"
+  , "  if dt < 0 then"
+  , "    hook(record.self, record.api)"
+  , "  else"
+  , "    hook(record.self, dt)"
+  , "  end"
   , "end"
   , ""
   , "function shutdown(hook, slot, reason)"

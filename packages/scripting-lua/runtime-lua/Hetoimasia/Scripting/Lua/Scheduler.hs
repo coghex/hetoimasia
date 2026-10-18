@@ -226,6 +226,25 @@ module Hetoimasia.Scripting.Lua.Scheduler
   , taskPhase
   , TaskPhase (..)
 
+    -- * Cadences
+  , CadenceKey (..)
+  , CadenceFault (..)
+  , CadenceFiring (..)
+  , startLogicalCadence
+  , startElapsedCadence
+  , armLogicalCadence
+  , armElapsedCadence
+  , disarmCadence
+  , stopCadence
+  , takeCadenceFirings
+  , cadenceFiringsPending
+  , releaseCadenceHold
+  , cadenceHeld
+  , cadenceAccrued
+  , resetCadenceAccrued
+  , tasksReady
+  , schedulerClock
+
     -- * Logical time
   , GrantId (..)
   , GrantAnswer (..)
@@ -331,6 +350,7 @@ import Data.Word (Word64)
 import Hetoimasia.Foundation.Time
   ( Duration
   , Instant
+  , MonotonicSource
   , addDuration
   , deadlineReached
   , readInstant
@@ -504,6 +524,94 @@ grantStep scheduler duration = do
   writeTVar (schedState scheduler) next
   pure answer
 
+-- Cadences -----------------------------------------------------------------------
+
+-- | Register a logical cadence, due at this tick, with nothing accrued. Never blocks.
+-- 'False' for a key already registered and for a scheduler that has stopped or been
+-- asked to.
+--
+-- A cadence is the owner's periodic demand on logical time. The scheduler adds the
+-- duration of every grant it applies to what the cadence has accrued, and when a
+-- grant is applied that reaches the tick the cadence is due at, it holds that grant:
+-- the grant is not finished, and no later one is applied, until the owner releases the
+-- hold ('releaseCadenceHold'), exactly as a task the grant woke holds it until the task
+-- stops being ready or running. The point is taken ('takeCadenceFirings') on the owner's
+-- thread at the boundary that follows, before any task the grant woke is chosen, and
+-- the cadence is not due at anything until the owner arms it again.
+startLogicalCadence ∷ Scheduler v → CadenceKey → Word64 → STM Bool
+startLogicalCadence scheduler key target = startCadence scheduler (cadenceStartLogical key target)
+
+-- | Register an elapsed cadence, due at this deadline on the scheduler's clock. Like a
+-- waiter's deadline it is placed behind the owner's one timer and looked at once at
+-- the start of each turn; the point is taken at the boundary that follows.
+startElapsedCadence ∷ Scheduler v → CadenceKey → Instant → STM Bool
+startElapsedCadence scheduler key deadline = startCadence scheduler (cadenceStartElapsed key deadline)
+
+startCadence ∷ Scheduler v → (SchedState v → Maybe (SchedState v)) → STM Bool
+startCadence scheduler step = do
+  state ← readTVar (schedState scheduler)
+  open ← isOpen scheduler state
+  case (open, step state) of
+    (True, Just next) → True <$ writeTVar (schedState scheduler) next
+    _ → pure False
+
+-- | Arm a registered logical cadence for a tick, keeping what it has accrued.
+armLogicalCadence ∷ Scheduler v → CadenceKey → Word64 → STM ()
+armLogicalCadence scheduler key target = modifyTVar' (schedState scheduler) (cadenceArmLogical key target)
+
+-- | Arm a registered elapsed cadence for a deadline.
+armElapsedCadence ∷ Scheduler v → CadenceKey → Instant → STM ()
+armElapsedCadence scheduler key deadline = modifyTVar' (schedState scheduler) (cadenceArmElapsed key deadline)
+
+-- | Make a cadence due at nothing. It keeps what it has accrued.
+disarmCadence ∷ Scheduler v → CadenceKey → STM ()
+disarmCadence scheduler key = modifyTVar' (schedState scheduler) (cadenceDisarm key)
+
+-- | Take a cadence away: its demand is cancelled, a point it reached and nobody took
+-- is dropped and a grant it held is released.
+stopCadence ∷ Scheduler v → CadenceKey → STM ()
+stopCadence scheduler key = modifyTVar' (schedState scheduler) (cadenceStop key)
+
+-- | The cadence points reached since they were last taken, in the order they were
+-- reached. Taking them does not release the grants they hold.
+takeCadenceFirings ∷ Scheduler v → STM [(CadenceKey, CadenceFiring)]
+takeCadenceFirings scheduler = do
+  state ← readTVar (schedState scheduler)
+  let (taken, next) = cadenceTake state
+  writeTVar (schedState scheduler) next
+  pure taken
+
+-- | Whether a cadence point has been reached and not taken.
+cadenceFiringsPending ∷ Scheduler v → STM Bool
+cadenceFiringsPending scheduler = not . Seq.null . ssFirings <$> readTVar (schedState scheduler)
+
+-- | Give back the grant a cadence holds, once the owner's work for its point is done
+-- or can no longer happen in its tick.
+releaseCadenceHold ∷ Scheduler v → CadenceKey → STM ()
+releaseCadenceHold scheduler key = modifyTVar' (schedState scheduler) (cadenceRelease key)
+
+-- | Whether a cadence holds a grant.
+cadenceHeld ∷ Scheduler v → CadenceKey → STM Bool
+cadenceHeld scheduler key = cadenceHeldBy key <$> readTVar (schedState scheduler)
+
+-- | The logical duration a cadence has accrued, 'Nothing' for a key that is not
+-- registered.
+cadenceAccrued ∷ Scheduler v → CadenceKey → STM (Maybe Duration)
+cadenceAccrued scheduler key = cadenceAccruedOf key <$> readTVar (schedState scheduler)
+
+-- | Begin a cadence's accrual again from nothing.
+resetCadenceAccrued ∷ Scheduler v → CadenceKey → STM ()
+resetCadenceAccrued scheduler key = modifyTVar' (schedState scheduler) (cadenceResetAccrued key)
+
+-- | Whether any task is ready to run a segment: whether anything can still make
+-- progress without a grant, a deadline or a request.
+tasksReady ∷ Scheduler v → STM Bool
+tasksReady scheduler = not . null . readyCandidates <$> readTVar (schedState scheduler)
+
+-- | The clock the scheduler was made with.
+schedulerClock ∷ Scheduler v → MonotonicSource
+schedulerClock = schedClock . schedConfig
+
 -- | Whether this grant has been applied and its work has finished.
 grantComplete ∷ Scheduler v → GrantId → STM Bool
 grantComplete scheduler (GrantId number) = do
@@ -666,7 +774,7 @@ serviceTurnWith atBoundary scheduler host = do
     else do
       atomically (clearTimerWake (schedTimerOf scheduler))
       atomically (modifyTVar' (schedState scheduler) acknowledgeEvidence)
-      waiting ← not . Map.null . ssElapsed <$> readTVarIO (schedState scheduler)
+      waiting ← elapsedDemand <$> readTVarIO (schedState scheduler)
       started ←
         if waiting || budget /= Nothing
           then Just <$> readInstant (schedClock config)
@@ -1002,6 +1110,9 @@ stopScheduler scheduler host = mask_ $ do
           , ssNextGrant = ssNextGrant state
           , ssLogical = Map.empty
           , ssElapsed = Map.empty
+          , ssCadenceLogical = Map.empty
+          , ssCadenceElapsed = Map.empty
+          , ssFirings = Seq.empty
           , ssControl = Seq.empty
           , ssToClose = Set.empty
           , ssEvidence = Seq.empty
