@@ -10,6 +10,7 @@ module Hetoimasia.Scripting.Lua.Scheduled.Types
 
     -- * What a task carries
   , Cursor (..)
+  , Invocation (..)
 
     -- * What a task settles as
   , ScheduledOutcome (..)
@@ -22,6 +23,7 @@ module Hetoimasia.Scripting.Lua.Scheduled.Types
     -- * Shared state
   , Cell (..)
   , Control (..)
+  , ScheduledEndpoint (..)
   , observeCell
   , forgetCell
   , sweepForgotten
@@ -36,6 +38,8 @@ import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
+import Data.Word (Word64)
+import Hetoimasia.Scripting.Lua.Instance.Types (Instances)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (TaskId)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits (ServiceClass)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Task (TaskFailure)
@@ -81,12 +85,32 @@ data Cursor
     Suspended
   | -- | Finished, with what the entry point answered.
     Finished !CallResult
+  | -- | An invocation of a script instance, not begun: the instance's number and what
+    -- it runs.
+    PendingInvocation !Word64 !Invocation
+  | -- | An invocation of a script instance that began and is suspended. Its
+    -- coroutine is on the owner's thread.
+    HostedInvocation !Word64
+
+-- | What one invocation of a script instance runs.
+data Invocation
+  = -- | The callback connected to a source, handed the event.
+    InvokeEvent !Text !Payload
+  | -- | A one-shot's @run@ hook.
+    InvokeRun
+
+instance NFData Invocation where
+  rnf = \case
+    InvokeEvent source payload → source `seq` rnf payload
+    InvokeRun → ()
 
 instance NFData Cursor where
   rnf = \case
     Pending ref entry payload → ref `seq` entry `seq` rnf payload
     Suspended → ()
     Finished result → result `seq` ()
+    PendingInvocation number invocation → number `seq` rnf invocation
+    HostedInvocation number → number `seq` ()
 
 -- | How an admitted task settled. Exactly one of these, once.
 data ScheduledOutcome
@@ -170,7 +194,14 @@ data Control = Control
     -- ^ Set when the owner begins to exit by failure or cancellation, to close
     -- admission, grants and control at once, as a stop request does.
   , controlExit ∷ !(TVar (Maybe ExitRecord))
+  , controlStopping ∷ !(STM Bool)
+    -- ^ Whether the owner has been asked to stop, or has begun to exit.
+  , controlInstances ∷ !(Maybe Instances)
+    -- ^ The owner's script instances, when it hosts any.
   }
+
+-- | Where an owner's tasks are admitted. Any thread may hold and use it.
+newtype ScheduledEndpoint = ScheduledEndpoint Control
 
 -- | Read a ticket's settlement without waiting. Reading a settlement is
 -- observing it: the first read that finds the task finished takes its result and
@@ -201,7 +232,8 @@ forgetCell control cell = do
   pure ()
 
 -- | Give back the reservations of forgotten tickets whose tasks have finished.
-sweepForgotten ∷ Control → STM ()
+-- Answers whether it gave any back.
+sweepForgotten ∷ Control → STM Bool
 sweepForgotten control = do
   cells ← readTVar (controlCells control)
   mapM_
@@ -210,6 +242,8 @@ sweepForgotten control = do
         when forgotten (() <$ observeCell control cell)
     )
     (Map.elems cells)
+  remaining ← readTVar (controlCells control)
+  pure (Map.size remaining < Map.size cells)
 
 settlementOf ∷ Control → TaskId → Maybe CallFault → TerminalResult Cursor → ScheduledSettlement
 settlementOf control identity fault terminal =

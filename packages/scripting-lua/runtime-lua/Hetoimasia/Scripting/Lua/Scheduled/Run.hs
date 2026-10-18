@@ -52,12 +52,12 @@ module Hetoimasia.Scripting.Lua.Scheduled.Run
   ( runScheduledOwner
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', orElse, writeTVar)
+import Control.Applicative ((<|>))
 import Control.Exception
   ( ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException
   , SomeException
-  , catch
   , fromException
   , mask
   , mask_
@@ -67,20 +67,18 @@ import Control.Exception
   , try
   , tryWithContext
   )
-import Control.Monad (forM, when)
+import Control.Monad (forM, forM_, void, when)
+import Data.Either (isLeft)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, isJust)
+import Data.Maybe (catMaybes, fromMaybe, isJust)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Word (Word64)
-import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailureLabel, cleanupFailuresInContext, composeCleanup, withScoped)
+import Hetoimasia.Foundation.Resource (composeCleanup, withScoped)
 import Hetoimasia.Foundation.Resource.OwnedCollection (allocOwnedCollection)
-import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero), durationFromNanoseconds, zeroDuration)
 import Hetoimasia.Scripting.Lua.Internal.Boundary (moduleChunk)
-import Hetoimasia.Scripting.Lua.Internal.Fault (raisedByApplication)
 import Hetoimasia.Scripting.Lua.Internal.Owner (ownedInternalVm)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Failure (ReasonCode (ScriptFault, ValidationFault), RecoverySafety (RecoverySafe), failureReason)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (TaskId)
@@ -100,8 +98,6 @@ import Hetoimasia.Scripting.Lua.Owner
   , TaskStart (TaskEntryAbsent, TaskStarted)
   , TaskStep (Completed, Waiting, Yielded)
   , VmConfig (vmModules, vmOwnerName)
-  , WaitRequest (waitArguments, waitKind)
-  , closeTask
   , loadedModule
   , resumeTask
   , startTask
@@ -109,12 +105,27 @@ import Hetoimasia.Scripting.Lua.Owner
   , withVmOwnerScoped
   )
 import qualified Hetoimasia.Scripting.Lua.Owner as Owner
-import Hetoimasia.Scripting.Lua.Registration (WaitKind (WaitElapsed, WaitLogical))
 import Hetoimasia.Scripting.Lua.Runtime.Types
-  ( CallFault (BoundaryFailed, LuaFailed, ModuleNotLoaded)
+  ( CallFault (BoundaryFailed, ModuleNotLoaded)
   , ExitKind (ExitCancelled, ExitFailed, ExitStopped)
   , Payload (OverBound, WithinBounds)
   )
+import Hetoimasia.Scripting.Lua.Instance.Driver (driverRef)
+import Hetoimasia.Scripting.Lua.Instance.Run
+  ( ExitMode (Unorderly)
+  , InstanceHost (ihMode)
+  , awaitInstanceWork
+  , instanceClosed
+  , instanceSegment
+  , newInstanceHost
+  , retireInstances
+  , recordExit
+  , serviceBoundary
+  , serviceInstances
+  , settleEnded
+  )
+import Hetoimasia.Scripting.Lua.Instance.Types (Escalation, InstanceFailure)
+import Hetoimasia.Scripting.Lua.Scheduled.Shared (closeSuspended, exitOf, settledOrRaise, waitReport)
 import Hetoimasia.Scripting.Lua.Scheduled.Types
 import Hetoimasia.Scripting.Lua.Scheduler
   ( SegmentReport (..)
@@ -123,10 +134,10 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , TaskRun (..)
   , TurnReport (turnCloseFailures)
   , awaitWork
-  , serviceTurn
+  , serviceTurnWith
   , stopScheduler
   )
-import Hetoimasia.Scripting.Lua.Value (Side (Arguments), Value (VInteger), ValueRefusal (ValueRefusal), VmIdentity)
+import Hetoimasia.Scripting.Lua.Value (Side (Arguments), ValueRefusal (ValueRefusal), VmIdentity)
 
 -- | The worker's run action for one scheduled owner.
 --
@@ -140,12 +151,13 @@ runScheduledOwner
   → Control
   → TVar (Maybe Control)
   → (SegmentContext → IO ())
+  → Maybe (InstanceFailure → IO Escalation)
   → Maybe Lending
   → Int
   → VmConfig
   → IO ()
-runScheduledOwner stopping control handoff observe lending members config = mask $ \restore → do
-  let body = serve stopping control handoff observe config
+runScheduledOwner stopping control handoff observe escalate lending members config = mask $ \restore → do
+  let body = serve stopping control handoff observe escalate config
   outcome ←
     tryWithContext @SomeException . restore $ case lending of
       Nothing → withVmOwnerScoped noCallbackScope config body
@@ -160,10 +172,11 @@ runScheduledOwner stopping control handoff observe lending members config = mask
   either rethrowIO pure outcome
 
 -- | The body of the owner's lifetime.
-serve ∷ STM Bool → Control → TVar (Maybe Control) → (SegmentContext → IO ()) → VmConfig → OwnedVm → IO ()
-serve stopping control handoff observe config owned = mask $ \restore → do
+serve ∷ STM Bool → Control → TVar (Maybe Control) → (SegmentContext → IO ()) → Maybe (InstanceFailure → IO Escalation) → VmConfig → OwnedVm → IO ()
+serve stopping control handoff observe escalate config owned = mask $ \restore → do
   tasks ← newIORef Map.empty
   handlesRef ← newIORef Map.empty
+  instanceRef ← newIORef Nothing
   -- What closing coroutines raised, by task, and every other cleanup failure
   -- (a script's own failure that was raised with the failures of closing its
   -- coroutine). Either is fatal evidence, so the first of them ends the owner:
@@ -172,14 +185,36 @@ serve stopping control handoff observe config owned = mask $ \restore → do
   extra ← newIORef []
   let host =
         TaskHost
-          { hostRun = runSegment control observe owned identity label handlesRef tasks extra
-          , hostClose = closeSuspended owned tasks kept
+          { hostRun = runSegment control observe owned identity label handlesRef tasks extra instanceRef
+          , -- The coroutine is closed first. The instance whose invocation it was is
+            -- ended after that, whatever the close did: it is told only when the
+            -- close was not interrupted, which an exit settles as discarded.
+            hostClose = \task → do
+              began ← Map.member task <$> readIORef tasks
+              closed ← try @SomeException (closeSuspended owned tasks kept task)
+              instances ← readIORef instanceRef
+              let interrupted = case closed of
+                    Left failure | Just (_ ∷ SomeAsyncException) ← fromException failure → True
+                    _ → False
+              -- The instance is only told its coroutine is closed. Ending it runs a hook,
+              -- which is application code, and a failure of that raised here would be
+              -- taken by the scheduler for the close's own: it ends the instance later,
+              -- from the owner's own code. A close that was interrupted is a cancellation:
+              -- no hook runs for any instance after it, and what the close had done is
+              -- still counted.
+              forM_ instances $ \ih → do
+                when interrupted (recordExit ih (Just ExitCancelled))
+                instanceClosed ih task began
+              either throwIO pure closed
           }
   served ← tryWithContext @SomeException . restore $ do
     handles ← Map.fromList . catMaybes <$> traverse (resolve owned) (map sourceIdentity (vmModules config))
     writeIORef handlesRef handles
+    forM_ ((,) <$> controlInstances control <*> escalate) $ \(instances, decide) →
+      forM_ (Map.lookup driverRef handles) $ \driver →
+        newInstanceHost control instances decide host owned driver handlesRef tasks extra >>= writeIORef instanceRef . Just
     atomically (writeTVar handoff (Just control))
-    loop host kept extra
+    loop host kept extra instanceRef
   -- The owner is exiting, however it was asked to or made to. Admission, grants
   -- and control close, every unsettled ticket settles, and only then are the
   -- suspended coroutines closed, masked from here on.
@@ -188,11 +223,25 @@ serve stopping control handoff observe config owned = mask $ \restore → do
   -- it commits nothing is admitted, and the settlement runs against a state that
   -- no producer is changing.
   atomically (writeTVar (controlClosing control) True)
-  atomically . settleAll control $ case served of
-    Left failure → exitOf failure
-    Right True → ExitFailed
-    Right False → ExitStopped
+  -- Whether Lua may be entered for an instance again: only after an orderly stop.
+  heldInstances ← readIORef instanceRef
+  let cause = case served of
+        Left failure → Just (exitOf failure)
+        Right True → Just ExitFailed
+        Right False → Nothing
+  forM_ heldInstances (`recordExit` cause)
+  -- The owner's exit record says how it exited, and it is what the instances left are
+  -- discarded as: both read the first way recorded, never one apart from the other.
+  firstExit ← traverse (readIORef . ihMode) heldInstances
+  atomically . settleAll control $ case firstExit of
+    Just (Unorderly kind) → kind
+    _ → fromMaybe ExitStopped cause
   stopped ← tryWithContext @SomeException (stopScheduler scheduler host)
+  -- A stop that was interrupted is a cancellation however the owner came to exit: the
+  -- hooks of the instances that are left do not run.
+  forM_ heldInstances $ \ih → case stopped of
+    Left (ExceptionWithContext _ raised) | Just (_ ∷ SomeAsyncException) ← fromException raised → recordExit ih (Just ExitCancelled)
+    _ → pure ()
   -- A stop that raised, because a close was interrupted or the timer's
   -- cancellation threw, completed first: asking again answers what it recorded.
   report ← case stopped of
@@ -203,8 +252,20 @@ serve stopping control handoff observe config owned = mask $ \restore → do
   -- resumed, say), is closed here, before the VM is, where closing it can run the
   -- cleanup a script asked for.
   held ← Map.keys <$> readIORef tasks
-  swept ← forM held $ \held' →
-    either (\failure → [(held', failure)]) (const []) <$> try @SomeException (closeSuspended owned tasks kept held')
+  swept ← forM held $ \held' → do
+    closed ← try @SomeException (closeSuspended owned tasks kept held')
+    -- Counted for its instance, which the exit then ends; an interruption of the close
+    -- is a cancellation, as it is in the scheduler's stop.
+    forM_ heldInstances $ \ih → do
+      when (either (isJust . (fromException ∷ SomeException → Maybe SomeAsyncException)) (const False) closed) $
+        recordExit ih (Just ExitCancelled)
+      instanceClosed ih held' True
+    pure (either (\failure → [(held', failure)]) (const []) closed)
+  -- What instances are still live ends now, with every coroutine closed and before
+  -- the VM is: in order, through the ordinary path, or as discarded.
+  retired ← case heldInstances of
+    Nothing → pure (Right ())
+    Just ih → tryWithContext @SomeException (retireInstances ih)
   earlier ← readIORef kept
   others ← readIORef extra
   let closeFailures =
@@ -221,13 +282,17 @@ serve stopping control handoff observe config owned = mask $ \restore → do
         | Left failure@(ExceptionWithContext _ raised) ← [stopped]
         , show raised `notElem` recorded
         ]
-      primary = either Just (const Nothing) served
+      primary = either Just (const Nothing) served <|> either Just (const Nothing) retired
+      -- What retiring the instances raised, when the owner had failed already: the owner's
+      -- failure is the primary, and this is evidence beside it, not lost.
+      retirement = [("lua instance retirement", failure) | Left failure ← [retired], isLeft served]
   composed ←
     composeCleanup
       primary
       ( interruption
           <> timerEvidence
           <> others
+          <> retirement
           <> [("lua task close", ExceptionWithContext (someExceptionContext failure) failure) | (_, failure) ← closeFailures]
       )
   maybe (pure ()) rethrowIO composed
@@ -237,17 +302,27 @@ serve stopping control handoff observe config owned = mask $ \restore → do
     scheduler = controlScheduler control
     -- Serve until a stop is requested, or until a turn reports a failure of
     -- cleanup: answers whether it was the latter.
-    loop host kept extra = do
-      atomically (awaitWork scheduler)
-      report ← serviceTurn scheduler host
+    loop host kept extra instanceRef = do
+      instances ← readIORef instanceRef
+      atomically $ case instances of
+        Nothing → awaitWork scheduler
+        Just ih → awaitWork scheduler `orElse` awaitInstanceWork ih
+      forM_ instances serviceInstances
+      -- At each boundary, after the scheduler's work there, the owner accounts for
+      -- what ended, looks at what its instances were asked and tries again what the
+      -- scheduler had no room for, unless it was asked to stop itself, in which case
+      -- its exit settles it.
+      let atBoundary = maybe (pure False) serviceBoundary instances
+      report ← serviceTurnWith atBoundary scheduler host
+      forM_ instances settleEnded
       mask_ $ do
         modifyIORef' kept (<> turnCloseFailures report)
-        atomically (sweepForgotten control)
+        void (atomically (sweepForgotten control))
       halt ← atomically stopping
       retained ← (||) <$> (not . null <$> readIORef kept) <*> (not . null <$> readIORef extra)
       if halt || retained
         then pure (retained && not halt)
-        else loop host kept extra
+        else loop host kept extra instanceRef
 
 -- | The handle of a module the configuration loaded.
 resolve ∷ OwnedVm → ModuleRef → IO (Maybe (ModuleRef, ModuleHandle))
@@ -267,9 +342,10 @@ runSegment
   → IORef (Map ModuleRef ModuleHandle)
   → IORef (Map TaskId Task)
   → IORef [(Text, ExceptionWithContext SomeException)]
+  → IORef (Maybe InstanceHost)
   → TaskRun Cursor
   → IO (SegmentReport Cursor)
-runSegment control observe owned identity label handlesRef tasks extra run = do
+runSegment control observe owned identity label handlesRef tasks extra instanceRef run = do
   observe
     SegmentContext
       { contextTask = ScheduledTaskId (controlOwner control) (runTask run)
@@ -279,9 +355,11 @@ runSegment control observe owned identity label handlesRef tasks extra run = do
       , contextSegment = runSegmentNumber run
       , contextResume = runResume run
       }
-  atomically (modifyTVar' (controlStarted control) (Set.insert (runTask run)))
   case runCursor run of
+    PendingInvocation number invocation → hosted number (Just invocation)
+    HostedInvocation number → hosted number Nothing
     Pending ref entry payload → do
+      started
       handles ← readIORef handlesRef
       case (Map.lookup ref handles, payload) of
         (Nothing, _) → failed (ModuleNotLoaded ref)
@@ -297,6 +375,7 @@ runSegment control observe owned identity label handlesRef tasks extra run = do
               modifyIORef' tasks (Map.insert (runTask run) task)
               reported step
     Suspended → do
+      started
       held ← Map.lookup (runTask run) <$> readIORef tasks
       case held of
         -- Nothing but a corrupted state leaves a suspended task without its
@@ -311,8 +390,14 @@ runSegment control observe owned identity label handlesRef tasks extra run = do
           mask_ $ settledOrRaise extra (resumeTask owned task) >>= \case
             Left fault → modifyIORef' tasks (Map.delete (runTask run)) >> failed fault
             Right step → reported step
-    Finished result → pure (ReportCompleted (Finished result))
+    Finished result → started >> pure (ReportCompleted (Finished result))
   where
+    started = atomically (modifyTVar' (controlStarted control) (Set.insert (runTask run)))
+    -- An invocation of a script instance: the instance layer runs it.
+    hosted number invocation =
+      readIORef instanceRef >>= \case
+        Just ih → instanceSegment ih run number invocation
+        Nothing → pure (ReportCompleted (Finished (Returned [])))
     failed fault = do
       atomically (modifyTVar' (controlFaults control) (Map.insert (runTask run) fault))
       pure (ReportFailed (TaskFailure (failureReason ScriptFault (Text.pack (show fault))) RecoverySafe))
@@ -321,9 +406,7 @@ runSegment control observe owned identity label handlesRef tasks extra run = do
         modifyIORef' tasks (Map.delete (runTask run))
         pure (ReportCompleted (Finished (Returned values)))
       Yielded → pure (ReportYielded Suspended)
-      Waiting request → pure $ case waitKind request of
-        WaitLogical → ReportWaitTicks Suspended (countOf (waitArguments request))
-        WaitElapsed → ReportWaitElapsed Suspended (durationOf (waitArguments request))
+      Waiting request → pure (waitReport Suspended request)
     refusedArguments ref entry rule =
       BoundaryFault
         { boundaryOwner = label
@@ -337,61 +420,3 @@ runSegment control observe owned identity label handlesRef tasks extra run = do
         , boundaryEffect = Owner.NoEffect
         , boundaryTraceback = Nothing
         }
-
--- | A wait's first argument as a whole number of ticks. Anything that is not a
--- non-negative integer is read as none, which the scheduler refuses as a wait for
--- no ticks: the operation's schema is what keeps a script from asking.
-countOf ∷ [Value] → Word64
-countOf = \case
-  [VInteger n] | n >= 0 → fromIntegral n
-  _ → 0
-
--- | A wait's first argument as nanoseconds, read the same way.
-durationOf ∷ [Value] → Duration
-durationOf = \case
-  [VInteger n] | n >= 0, Right duration ← durationFromNanoseconds AllowZero (toInteger n) → duration
-  _ → zeroDuration
-
--- | Close a suspended task's coroutine, once, on this thread. A failure of the
--- close is raised, for the scheduler to keep as evidence.
---
--- The scheduler keeps a synchronous failure of the close, but an asynchronous
--- exception that reaches it is raised unrecorded, and the coroutine is closed
--- and forgotten by then: it is kept here, by task, before it goes on.
-closeSuspended ∷ OwnedVm → IORef (Map TaskId Task) → IORef [(TaskId, SomeException)] → TaskId → IO ()
-closeSuspended owned tasks kept identity = do
-  held ← Map.lookup identity <$> readIORef tasks
-  case held of
-    Nothing → pure ()
-    Just task → do
-      modifyIORef' tasks (Map.delete identity)
-      closeTask owned task `catch` \(failure ∷ SomeException) → do
-        when (isJust (fromException failure ∷ Maybe SomeAsyncException)) $
-          modifyIORef' kept (<> [(identity, failure)])
-        throwIO failure
-
--- | Run one action of the VM, answering the fault of the task it raised, or
--- raising what is not the task's own.
---
--- A task's fault can be raised with the failures of closing its coroutine, which
--- the script's own error did not stop: those are cleanup evidence, kept, and no
--- part of the task's outcome.
-settledOrRaise ∷ IORef [(Text, ExceptionWithContext SomeException)] → IO a → IO (Either CallFault a)
-settledOrRaise extra action = do
-  ran ← tryWithContext @SomeException action
-  case ran of
-    Right value → pure (Right value)
-    Left failure@(ExceptionWithContext context exception)
-      | raisedByApplication context → rethrowIO failure
-      | Just fault ← fromException exception → retained context >> pure (Left (BoundaryFailed fault))
-      | Just fault ← fromException exception → retained context >> pure (Left (LuaFailed fault))
-      | otherwise → rethrowIO failure
-  where
-    retained context =
-      modifyIORef' extra (<> [(cleanupFailureLabel found, cleanupFailureException found) | found ← cleanupFailuresInContext context])
-
--- | How a failure that ended the owner ends its tasks.
-exitOf ∷ ExceptionWithContext SomeException → ExitKind
-exitOf (ExceptionWithContext _ exception) = case fromException exception of
-  Just (_ ∷ SomeAsyncException) → ExitCancelled
-  Nothing → ExitFailed

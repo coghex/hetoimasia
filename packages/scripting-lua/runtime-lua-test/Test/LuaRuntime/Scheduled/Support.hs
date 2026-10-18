@@ -245,6 +245,20 @@ schedRegistration fixture = ok (registration [] [sched, fx])
               [VInteger n] → advanceClock fixture (fromIntegral n)
               _ → pure ()
             pure []
+        , -- A script's admission of an ordinary task of the sample module: answered 0 if the
+          -- scheduler took it and 1 if it had no room, forgetting its ticket. It never waits.
+          stateOperation "spawn" [SText, SText] [SInteger] $ \arguments →
+            case arguments of
+              [VText entry, VText label] →
+                readIORef (sfEndpoint fixture) >>= \case
+                  Just held → do
+                    answer ← admitScheduledTask held (request entry [VText label] OrdinaryClass OneShot Nothing)
+                    -- Its result is forgotten at once: what it holds goes back when it finishes.
+                    case answer of
+                      TaskAccepted _ ticket → [VInteger 0] <$ forgetTask ticket
+                      _ → pure [VInteger 1]
+                  Nothing → pure [VInteger 2]
+              _ → pure [VInteger 3]
         , -- A script's request to pause, resume or stop a task it names. It never
           -- waits: a request is accepted or refused at once.
           stateOperation "control" [SText, SText] [SInteger] $ \arguments →

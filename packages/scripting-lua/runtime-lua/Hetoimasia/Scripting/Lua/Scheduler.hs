@@ -221,6 +221,7 @@ module Hetoimasia.Scripting.Lua.Scheduler
   , AdmitAnswer (..)
   , AdmitRefusal (..)
   , admitTask
+  , admissionAvailable
   , observeTask
   , taskPhase
   , TaskPhase (..)
@@ -251,6 +252,8 @@ module Hetoimasia.Scripting.Lua.Scheduler
   , WaitRefusal (..)
   , awaitWork
   , serviceTurn
+  , serviceTurnWith
+  , ownerControl
   , TurnReport (..)
   , TurnEnd (..)
   , stopScheduler
@@ -462,6 +465,17 @@ admitTask scheduler spec = do
   writeTVar (schedState scheduler) next
   pure answer
 
+-- | Whether admitting a task like this one would be accepted now: the scheduler is
+-- open and neither its queue of admissions nor its stored results is full. Reads
+-- and changes nothing, so an owner can wait for room.
+admissionAvailable ∷ Scheduler v → TaskSpec v → STM Bool
+admissionAvailable scheduler spec = do
+  state ← readTVar (schedState scheduler)
+  open ← isOpen scheduler state
+  pure $ open && case snd (admitIn open spec state) of
+    Admitted _ → True
+    AdmitRefused _ → False
+
 -- | Take a finished task's terminal result, if it has one, and give back the
 -- result storage its admission reserved. A task that has not finished, and one
 -- whose result was already taken, answer 'Nothing' and change nothing.
@@ -627,7 +641,25 @@ data Turn = Turn
 -- elapsed waiters or a budget, as a segment returns when there is a budget or the
 -- segment waits for elapsed time.
 serviceTurn ∷ Scheduler v → TaskHost v → IO TurnReport
-serviceTurn scheduler host = do
+serviceTurn = serviceTurnWith (pure False)
+
+-- | 'serviceTurn', running an action of the owner's at each safe boundary: before
+-- the first segment and after every segment, when no task is running. It is how an
+-- owner that serves more than tasks looks at what it was asked, and at what the
+-- scheduler released, at the same boundaries the scheduler does. What it raises is
+-- a failure of the host and propagates out of the turn.
+--
+-- The action runs after what the scheduler does at the boundary: after the
+-- activations, controls and closes that freed room, so what waited for that room is
+-- tried then and not at the start of the next turn. It answers whether it released
+-- or used anything the scheduler's own work depends on (it observed a result, which
+-- gives back an active slot and a place, it applied a control, it admitted), and
+-- while it does the boundary is done again, so a boundary ends only where neither the
+-- scheduler nor the owner has anything more to do with what is there. That is why
+-- where a turn is cut changes nothing: the next turn's first boundary finds what this
+-- one's last left.
+serviceTurnWith ∷ IO Bool → Scheduler v → TaskHost v → IO TurnReport
+serviceTurnWith atBoundary scheduler host = do
   phaseOpen ← atomically (isStillOpen scheduler)
   if not phaseOpen
     then pure (TurnReport 0 TurnClosed [] [] [])
@@ -672,7 +704,7 @@ serviceTurn scheduler host = do
 
     loop ∷ Maybe Instant → Maybe Instant → Turn → IO TurnReport
     loop deadline reading turn0 = do
-      turn ← boundary scheduler host turn0
+      turn ← boundary atBoundary scheduler host turn0
       stopping ← atomically (schedStopRequested config)
       -- The boundary can close continuations and so take time: look at the clock
       -- again before judging the budget, once a segment has run.
@@ -769,15 +801,19 @@ chooseNext scheduler = do
       Nothing → Just Nothing <$ writeTVar (schedState scheduler) chosen
 
 -- | A safe boundary: apply grants and activate queued admissions, apply control
--- requests, and settle what that freed.
-boundary ∷ Scheduler v → TaskHost v → Turn → IO Turn
-boundary scheduler host turn0 = do
-  first ← reconcile
-  applyControls scheduler host
-  second ← reconcile
-  closeOwed scheduler host
-  pure (foldl' absorb turn0 (first <> second))
+-- requests, and settle what that freed, then let the owner use what it freed, and
+-- again for what that freed in turn.
+boundary ∷ IO Bool → Scheduler v → TaskHost v → Turn → IO Turn
+boundary atBoundary scheduler host = settle
   where
+    settle turn = do
+      first ← reconcile
+      applyControls scheduler host
+      second ← reconcile
+      closeOwed scheduler host
+      again ← atBoundary
+      let next = foldl' absorb turn (first <> second)
+      if again then settle next else pure next
     reconcile = atomically $ do
       state ← readTVar (schedState scheduler)
       let (next, events) = settleGrants (activateQueued state)
@@ -847,6 +883,37 @@ applyControls scheduler host = do
       let (next, result) = step (pendingTask pending) state
       writeTVar reference next
       conclude pending result Nothing
+
+-- | Pause, resume or stop a task by the owner's own thread, at a boundary, at once:
+-- the three operations 'requestControl' applies between segments, without a
+-- reservation, a ticket or a queue to wait in, for an owner that applies requests of
+-- its own at the same boundaries. A task that is running, or that is not live, is
+-- no longer a target and answers 'ControlNoLongerApplicable'. A stop closes the
+-- task's continuation through 'hostClose', once, and cancels it; a failure of the
+-- close is kept as it is for a task's own stop. Only the owner's thread calls it, and
+-- never inside a segment.
+ownerControl ∷ Scheduler v → TaskHost v → TaskId → ControlRequest → IO ControlResult
+ownerControl scheduler host identity = \case
+  RequestPause → atomically (immediate pauseIn)
+  RequestResume → atomically (immediate resumeIn)
+  RequestStop → do
+    live ← liveTarget identity <$> readTVarIO reference
+    if not live
+      then pure ControlNoLongerApplicable
+      else mask_ $ do
+        closed ← tryClose (hostClose host identity)
+        atomically $ do
+          state ← readTVar reference
+          let (next, result) = cancelIn identity state
+          writeTVar reference (retainEvidence [(identity, failure) | CloseFailed failure ← [closed]] next)
+          pure result
+  where
+    reference = schedState scheduler
+    immediate step = do
+      state ← readTVar reference
+      let (next, result) = step identity state
+      writeTVar reference next
+      pure result
 
 -- | Close a continuation. A synchronous failure is the report; an asynchronous
 -- exception is not this action's to keep and propagates.
