@@ -752,6 +752,10 @@ data Instances = Instances
   , insBlocked ∷ !(TVar Bool)
     -- ^ An invocation was refused by the scheduler for want of room, and waits for
     -- room.
+  , insDelta ∷ !(TVar (Maybe (Word64, Double)))
+    -- ^ The @dt@, in seconds, of the update about to begin, and the instance it is
+    -- for: the driver's entry point takes it through the one binding built for the
+    -- purpose, so an update's boundary footprint is a one-shot's.
   }
 
 -- | Make an owner's instance state.
@@ -767,6 +771,7 @@ newInstances config =
     <*> newTVarIO Nothing
     <*> newTVarIO Set.empty
     <*> newTVarIO False
+    <*> newTVarIO Nothing
 
 -- | An error as one line of text, at most 'failureTextLimit' characters.
 renderError ∷ InstanceError → Text

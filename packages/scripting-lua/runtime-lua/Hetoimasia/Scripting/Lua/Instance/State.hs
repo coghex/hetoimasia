@@ -20,6 +20,7 @@ module Hetoimasia.Scripting.Lua.Instance.State
   , lookupLive
   , connectSource
   , isInstanceTask
+  , takeDelta
   , beginEnding
   , settleInstance
   , takeJobs
@@ -337,6 +338,17 @@ connectSource instances number source = do
       when allowed $
         writeTVar (icState cell) state {isConnections = Set.insert source (isConnections state)}
       pure allowed
+
+-- | The @dt@ of the update that is about to begin for this instance, in seconds, taken
+-- once; a negative number when none is, which is how the driver tells a one-shot's
+-- @run@ from an update. Only the instance whose code is running is answered.
+takeDelta ∷ Instances → Word64 → STM Double
+takeDelta instances number = do
+  running ← readTVar (insRunning instances)
+  pending ← readTVar (insDelta instances)
+  case pending of
+    Just (owner, seconds) | owner == number && running == Just number → seconds <$ writeTVar (insDelta instances) Nothing
+    _ → pure (-1)
 
 -- | Begin ending an instance, once: admission and delivery close, the connections
 -- are revoked and what had not begun is discarded. Answers what that revoked and

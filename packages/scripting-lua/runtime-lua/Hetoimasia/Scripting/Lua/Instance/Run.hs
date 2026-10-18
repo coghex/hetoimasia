@@ -153,7 +153,7 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , schedulerClosed
   , taskPhase
   )
-import Hetoimasia.Scripting.Lua.Value (Value (VFloat, VInteger, VRecord, VText))
+import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VRecord, VText))
 import Hetoimasia.Scripting.Lua.Instance.Driver (eventEntry)
 
 -- | Whether the owner may still enter Lua for its instances.
@@ -714,7 +714,7 @@ instanceSegment ih run number starting = do
           handles ← readIORef (ihHandles ih)
           case Map.lookup (icModule cell) handles of
             Nothing → pure (Left (ErrorFault (ModuleNotLoaded (icModule cell))))
-            Just handle → begin $ withRunning ih number (startTaskVia (ownedHost (ihOwned ih)) (ihDriver ih) "run" handle "run" [slot, VFloat (-1)])
+            Just handle → begin $ withRunning ih number (startTaskVia (ownedHost (ihOwned ih)) (ihDriver ih) "run" handle "run" [slot])
         Just InvokeUpdate → do
           handles ← readIORef (ihHandles ih)
           case Map.lookup (icModule cell) handles of
@@ -724,7 +724,12 @@ instanceSegment ih run number starting = do
               -- or is delayed by changes it.
               updateDelta ih cell >>= \case
                 Left why → pure (Left (ErrorCadence why))
-                Right seconds → begin $ withRunning ih number (startTaskVia (ownedHost (ihOwned ih)) (ihDriver ih) "run" handle "update" [slot, VFloat seconds])
+                Right seconds → do
+                  -- The delta is left for the driver to take through its binding, as the
+                  -- update's first segment begins, and is not left behind if that never does.
+                  atomically (writeTVar (insDelta (ihInstances ih)) (Just (number, seconds)))
+                  begin (withRunning ih number (startTaskVia (ownedHost (ihOwned ih)) (ihDriver ih) "run" handle "update" [slot]))
+                    `finally` atomically (writeTVar (insDelta (ihInstances ih)) Nothing)
         Nothing → do
           held ← Map.lookup (runTask run) <$> readIORef (ihTasks ih)
           case held of

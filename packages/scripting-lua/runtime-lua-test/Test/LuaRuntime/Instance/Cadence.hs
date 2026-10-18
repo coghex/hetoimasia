@@ -23,7 +23,7 @@ import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Scheduled
-import Hetoimasia.Scripting.Lua.Value (Value (VText))
+import Hetoimasia.Scripting.Lua.Value (Value (VText), valueLimits)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfDelay), admitTask', awaitDiagnostics, awaitEffect, awaitEntered, awaitIdle, defaultSchedulerBounds, releaseGate, request)
@@ -154,6 +154,17 @@ floatTicker =
     , "end"
     ]
 
+-- | A one-shot and an update, neither connecting a function (which a binding of two
+-- values would, beyond a narrow limit).
+bare ∷ ModuleSource
+bare =
+  hooksModule
+    "bare"
+    [ "local function ns(x) return math.floor(x * 1e9 + 0.5) end"
+    , "function run(self, api) " <> record <> "('run') end"
+    , "function update(self, dt) " <> record <> "('update ' .. ns(dt)) end"
+    ]
+
 -- | No update at all.
 noUpdate ∷ ModuleSource
 noUpdate = hooksModule "noupdate" ["function init(self, api) end"]
@@ -220,6 +231,7 @@ spec = describe "logical cadence" $ do
   pauseSpec
   settlementSpec
   capacitySpec
+  narrowSpec
   arithmeticSpec
   determinismSpec
 
@@ -629,6 +641,23 @@ settlementSpec = describe "a tick" $ do
       -- The callback's wait is for one tick.
       grantEach control owner [1]
       logged fixture >>= (`shouldBe` ["callback 1 begin", "callback 1 end"])
+
+-- | An owner whose values may hold one element: the footprint of a one-shot's @run@
+-- and of an update at the boundary is the instance's number alone.
+narrowSpec ∷ Spec
+narrowSpec = describe "an owner whose value limit is one element" $
+  it "completes a one-shot and hands a periodic update its dt, neither needing more than the instance's number across the boundary" $ bounded $ do
+    fixture ← newIFixture
+    withBoundary $ \control runtime → do
+      limits ← either (fail . show) pure (valueLimits 65536 8 1)
+      owner ← startWith fixture runtime . withLimits limits $ instanceSpec fixture "narrow" [bare] (testConfig instanceBounds') requiredPolicy defaultSchedulerBounds
+      _ ← admitWith fixture owner "one" (InstanceRequest (moduleNamed "bare") RunOnce (Just "one") OrdinaryClass [])
+      settled ← awaitSettled fixture "one"
+      resultPhase settled `shouldBe` Hetoimasia.Scripting.Lua.Instance.Completed
+      _ ← admitWith fixture owner "two" (InstanceRequest (moduleNamed "bare") (Periodic (LogicalTicks 1)) (Just "two") OrdinaryClass [])
+      awaitPhase fixture owner "two" Active
+      grantEach control owner [1]
+      logged fixture >>= (`shouldBe` ["run", "update 1"])
 
 capacitySpec ∷ Spec
 capacitySpec = describe "a due update the scheduler has no room for" $
