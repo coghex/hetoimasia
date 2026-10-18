@@ -8,8 +8,9 @@ failure evidence, and lifetime. This is the canonical continuation of
 
 Design state: `ready for issue processing`
 
-Current readiness scope: **LUA-7 only** (D-37), with D-36 fixing when a
-deterministic owner's Lua sees an asynchronous result. LUA-6 (with LUA-20 and
+Current readiness scope: **LUA-7 only** (D-37), which D-38 splits into LUA-7
+(requests) then LUA-26 (subscriptions), with D-36 fixing when a deterministic
+owner's Lua sees an asynchronous result or provider event. LUA-6 (with LUA-20 and
 LUA-21, D-28/D-29) and LUA-18 (with LUA-22, LUA-23, LUA-24 and LUA-25,
 D-30 to D-32) are delivered. Other unchecked slices retain their explicit
 deferrals; this state does not release the confinement gate.
@@ -173,7 +174,8 @@ concrete precondition
 - [x] LUA-23. Grant Lua lifecycle controls and inspection across owners — [#474]
 - [x] LUA-24. Run instance updates on logical and elapsed cadences — [#475]
 - [x] LUA-25. Lend a resource collection's ownership to synchronous Lua callbacks — [#476]
-- [ ] LUA-7. Add bounded asynchronous requests and owned subscriptions
+- [ ] LUA-7. Add bounded asynchronous Lua requests with reserved result slots
+- [ ] LUA-26. Deliver provider events through owned Lua subscriptions
 - [ ] LUA-19. Run script instances through a headless command-line entry — [deferred]: contract accepted; renew slice readiness
 - [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly — [deferred]: owner renews trusted-path readiness for this slice
 - [ ] LUA-9. Add bounded child-process transport and owned process lifetime — [deferred]: Q-5 successful Linux and macOS confinement verdicts
@@ -1038,6 +1040,30 @@ processed into issues, canonically approved, solved and merged. Splitting it, if
 the drafted issue is too large for one PR, is delegated (D-25) and adds no scope.
 LUA-19 and LUA-8 stay `[deferred]` on their own renewal, and the confined branch
 stays on Q-5. Readiness is not implementation approval beyond that request.
+
+### D-38. Carve owned subscriptions out of LUA-7
+
+LUA-7's drafted issue (request `user-het-next-slice-20261018-1235`, drafter's
+signoff package at `master@3c9a82b1`) held two separate review surfaces, each
+with its own failure paths: asynchronous requests (a callable binding kind,
+reserved slots, settlement on every path, a new wait, D-36's tick-held
+settlement, cancellation and retained provider retirement) and owned
+subscriptions (instance-owned delivery into the invocation FIFO, per-endpoint
+overload, unsubscribe, tick-assigned event admission and epochs). LUA-18 (#478,
+nine review rounds) and LUA-22 (#480, six) spent most of their rounds on failure
+handling, so one PR was unlikely to review soundly within five rounds. Under
+D-25's delegated organization and D-37, the manager takes the drafter's
+recommended partition:
+
+- **LUA-7** keeps its ID for requests: "Add bounded asynchronous Lua requests with
+  reserved result slots". It carries the provider service grant, the guard every
+  provider call goes through, epoch cancellation of requests and the shared
+  plumbing.
+- **LUA-26** (new): "Deliver provider events through owned Lua subscriptions",
+  after LUA-7, reusing that plumbing, with epoch invalidation of subscriptions.
+- LUA-19, LUA-8 and LUA-16 also depend on LUA-26.
+
+The split adds no scope; D-37's readiness covers both slices.
 
 ## Design
 
@@ -2794,33 +2820,71 @@ and verified policy, with adversarial regression coverage.
   contract; cross-owner sharing of a collection.
 - **Open questions:** None; D-32 fixes the approach.
 
-### LUA-7. Add bounded asynchronous requests and owned subscriptions
+### LUA-7. Add bounded asynchronous Lua requests with reserved result slots
 
 > Ready for issue processing under D-37. Its dependencies are delivered, and D-36
 > fixes the tick at which a deterministic owner's Lua sees a request's result.
+> D-38 carves owned subscriptions out of it (LUA-26), adding no scope.
 
-- **Outcome:** scripts can wait for an engine operation or event without
-  blocking the owner or invoking Lua from a producer thread.
-- **Scope:** P-7 reserved result slots, admission/status protocol, subscription
-  ownership, epoch invalidation, bounded overload, and fake providers; expose
-  readiness/resumption through LUA-4's protocol for LUA-6 to consume. Deliver
-  trusted in-process dispatch and reusable provider bookkeeping here;
-  LUA-13/LUA-16 supply broker enforcement and confined integration. Connect
-  function subscriptions to LUA-18 instance ownership, bounded paused queues,
-  explicit overflow and serialized dispatch per the instance contract.
+- **Outcome:** scripts can wait for an engine operation without blocking the
+  owner or invoking Lua from a producer thread.
+- **Scope:** P-7 reserved result slots, the admission/status protocol, request
+  identity and generation, settlement exactly once, cancellation, epoch
+  cancellation of outstanding requests, bounded quotas and fake request
+  providers; expose readiness/resumption through LUA-4's protocol for LUA-6's
+  scheduler to consume, with a request wait beside the existing waits and D-36's
+  tick-held settlement on logical owners. Deliver trusted in-process dispatch,
+  the granted provider service, the guard every provider call goes through, and
+  reusable provider bookkeeping and retained retirement here, on LUA-22's
+  obligations; LUA-13/LUA-16 supply broker enforcement and confined integration.
 - **Phase:** component integration protocol.
-- **Depends on:** LUA-18, LUA-22; consumes LUA-3/LUA-4/LUA-5 boundaries.
-- **Ordering:** after instance ownership and engine-held leases; independent of Q-5.
-- **Relevant decisions:** D-1, D-2, D-3, D-4, D-12, D-13, D-14, D-22, D-23, D-24, D-25, D-36, D-37.
+- **Depends on:** LUA-18, LUA-22; consumes LUA-3/LUA-4/LUA-5 boundaries and
+  LUA-23's tick-assigned admission.
+- **Ordering:** after instance ownership and engine-held leases; precedes LUA-26;
+  independent of Q-5.
+- **Relevant decisions:** D-1, D-2, D-3, D-4, D-12, D-13, D-14, D-22, D-23, D-24, D-25, D-36, D-37, D-38.
 - **Acceptance signals:** full output paths never block provider completion;
-  duplicate/late results harmless; unsubscribe and stop races settle once;
+  duplicate/late results harmless; cancellation and stop races settle once;
   provider dependency lifetime extends to actual completion, not cancellation
-  of interest; callbacks execute only on their VM owner.
-- **Out of scope:** actual pathfinding/assets/graphics services, general RPC or
-  broadcast, automatic restart, mandatory draining of infinite subscriptions.
-- **Open questions:** None; paused delivery/overflow are accepted by D-26;
-  D-27 requires engine-owned provider interest/retirement; D-36 fixes result
-  admission on a deterministic owner. Readiness renewed by D-37.
+  of interest; a settlement reaches Lua only on its VM owner and, on a logical
+  owner, at its assigned tick.
+- **Out of scope:** owned subscriptions and provider events (LUA-26); actual
+  pathfinding/assets/graphics services, general RPC or broadcast, automatic
+  restart.
+- **Open questions:** None; paused retention is accepted by D-26; D-27 requires
+  engine-owned provider interest/retirement; D-36 fixes result admission on a
+  deterministic owner. Readiness renewed by D-37.
+
+### LUA-26. Deliver provider events through owned Lua subscriptions
+
+> Ready for issue processing under D-37 and D-38: carved out of LUA-7 with no
+> added scope.
+
+- **Outcome:** scripts can react to engine events through subscriptions their
+  instance owns, without a producer thread invoking Lua.
+- **Scope:** P-7 subscription ownership on a granted provider endpoint, function
+  subscriptions owned by the LUA-18 instance beside its connections, delivery
+  into its bounded invocation FIFO with retention while paused and serialized
+  dispatch, the owner looking up the still-live callback when servicing,
+  per-endpoint overload (ordered events refused explicitly with an attributable
+  counter and a delivery failure surfaced to the application's policy, or
+  replaceable state coalesced), unsubscribe, revocation on every termination
+  path, epoch invalidation of subscriptions, D-36's tick-assigned event admission
+  on logical owners, and fake event providers. It reuses LUA-7's provider service
+  grant, guard and epoch plumbing.
+- **Phase:** component integration protocol.
+- **Depends on:** LUA-7.
+- **Ordering:** after LUA-7; precedes LUA-19; independent of Q-5.
+- **Relevant decisions:** D-1, D-2, D-3, D-4, D-12, D-13, D-14, D-22, D-23, D-24, D-25, D-26, D-27, D-36, D-38.
+- **Acceptance signals:** producers never block and never call Lua; unsubscribe
+  and stop races settle once; ordered overflow is refused and counted and
+  replaceable state coalesces; identical tick-assigned events give identical
+  admission order under varied arrival; callbacks execute only on their VM owner.
+- **Out of scope:** broadcast subscriptions in foundation messaging, real event
+  sources (input, assets, graphics), mandatory draining of infinite subscriptions,
+  automatic restart.
+- **Open questions:** None; D-26 fixes paused delivery and overflow, and D-36 the
+  logical admission of events.
 
 ### LUA-19. Run script instances through a headless command-line entry
 
@@ -2833,7 +2897,7 @@ and verified policy, with adversarial regression coverage.
   event-only and one-shot examples, console invocation/exit tests and Lua-owned
   library contract tests. No `--group` flag.
 - **Phase:** runnable consumer.
-- **Depends on:** LUA-18, LUA-24, LUA-7.
+- **Depends on:** LUA-18, LUA-24, LUA-7, LUA-26.
 - **Ordering:** after the instance, cadence and provider APIs, before LUA-8.
 - **Relevant decisions:** D-20, D-21, D-22, D-23, D-24, D-25.
 - **Acceptance signals:** start/inspect/control an instance; failed init names
@@ -2857,7 +2921,7 @@ and verified policy, with adversarial regression coverage.
   real-interpreter acceptance; reproduction commands and bounded optional
   profiling workloads delivered in the same PR.
 - **Phase:** trusted integrated acceptance.
-- **Depends on:** LUA-6, LUA-18, LUA-22, LUA-23, LUA-24, LUA-7, LUA-19.
+- **Depends on:** LUA-6, LUA-18, LUA-22, LUA-23, LUA-24, LUA-7, LUA-26, LUA-19.
 - **Ordering:** after instance/provider/runner delivery, independent of Q-5;
   no Vulkan or GLFW dependency.
 - **Relevant decisions:** D-1, D-2, D-3, D-4, D-7, D-12, D-13, D-14.
@@ -2995,11 +3059,11 @@ and verified policy, with adversarial regression coverage.
   and retains process/provider dependencies through exit without a new supervisor.
 - **Scope:** extend the runtime adapter with P-13 process ownership, bounded
   transport, parent-verified confinement/limits/grants, and component readiness.
-  Connect LUA-6's reusable task service and LUA-7's request/subscription protocol
+  Connect LUA-6's reusable task service and the LUA-7/LUA-26 request/subscription protocol
   to the confined child and LUA-13's broker. Reuse registration under D-14.
   Include package-owned integration tests and the public lifetime contract.
 - **Phase:** confined runtime integration.
-- **Depends on:** LUA-6, LUA-7, LUA-12, LUA-13.
+- **Depends on:** LUA-6, LUA-7, LUA-26, LUA-12, LUA-13.
 - **Ordering:** joins the shared runtime and qualified process branches.
 - **Relevant decisions:** D-1, D-4, D-6, D-7, D-8, D-9, D-12, D-13, D-14.
 - **Acceptance signals:** child readiness alone cannot admit work; failed or
@@ -3044,17 +3108,17 @@ and verified policy, with adversarial regression coverage.
 
 The trusted dependency order is LUA-2 after the delivered LUA-1; LUA-3 after
 LUA-2; LUA-5 after LUA-3 and the delivered LUA-4; then LUA-6 (as LUA-20 and
-LUA-21, then LUA-6, under D-29), LUA-18, then LUA-23 and LUA-24 (D-31), LUA-25 then LUA-22 (D-32), LUA-7, LUA-19 and
+LUA-21, then LUA-6, under D-29), LUA-18, then LUA-23 and LUA-24 (D-31), LUA-25 then LUA-22 (D-32), LUA-7 then LUA-26 (D-38), LUA-19 and
 LUA-8 under D-25 and D-30. LUA-6 retains external TIME-1; LUA-7 consumes the
 instance ownership API and introduces no second clock implementation.
 The shared VK-1 toolchain prerequisite remains satisfied.
 
 The confined branch remains LUA-9 after LUA-3/LUA-4 and both successful
 platform proofs; LUA-10, LUA-11, and LUA-13 in parallel; LUA-12 after both
-platform slices and TIME-1; LUA-16 after LUA-6/LUA-7/LUA-12/LUA-13; then
+platform slices and TIME-1; LUA-16 after LUA-6/LUA-7/LUA-26/LUA-12/LUA-13; then
 LUA-17 after LUA-8/LUA-16. Stable IDs are preserved, with LUA-16/LUA-17
 retaining the confined integration and acceptance removed from LUA-5/LUA-8.
-There are twenty-five delivery slices. All of this can run alongside
+There are twenty-six delivery slices. All of this can run alongside
 graphics implementation. Coordinate the shared Cabal project, CI
 catalog/workflow, and any narrow foundation evidence change; parallel work
 does not authorize conflicting edits or duplicate platform infrastructure.

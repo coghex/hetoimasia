@@ -5,7 +5,8 @@ Design contract, 2026-10-17. Owner: `coghex/hetoimasia`.
 **Status: accepted design contract (D-26), with the owner's automatic-cleanup
 requirement (D-27).** This refines [the Lua design](lua_runtime_design.md),
 D-16 through D-27. It describes intended behavior, not implemented APIs.
-The parent design is ready for issue processing for LUA-7 only under D-37
+The parent design is ready for issue processing for LUA-7 only under D-37,
+split into LUA-7 and LUA-26 by D-38
 (LUA-6 and LUA-18 with its carved slices are delivered); other slices retain their
 readiness gates. Contract approval does not itself
 create issues or qualify implementation.
@@ -273,7 +274,8 @@ The owner delegated organization. Keep separately reviewable outcomes:
    leases), LUA-23 (granted Lua controls, inspection and logical control
    admission) and LUA-24 (update cadence).
 3. LUA-7: connect real request/subscription machinery to instances; prove paused
-   event retention, overload, cancellation and safe provider retirement.
+   event retention, overload, cancellation and safe provider retirement. D-38
+   delivers it as LUA-7 (requests) then LUA-26 (owned subscriptions).
 4. LUA-19: headless CLI runner using the same reusable APIs available to a future
    windowed application; source loading stays in the application. No game terminal
    or windowed application is necessary for this proof.
