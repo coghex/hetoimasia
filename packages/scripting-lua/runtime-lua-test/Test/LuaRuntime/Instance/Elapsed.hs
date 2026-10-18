@@ -188,6 +188,30 @@ spec = describe "elapsed cadence" $ do
         void (awaitTicksComplete control owner)
         awaitEffect (sf fixture) "callback 2 begin"
         logged fixture >>= (`shouldBe` ["callback 1 begin", "callback 1 end", "update 1950", "callback 2 begin"])
+  describe "an update retained across a pause" $ do
+    it "is handed the time since the resume, not since the pause began: the baseline it is measured from is rebased, and nothing before the pause survives" $ bounded $
+      withOwner [uiWaiter] $ \fixture control owner → do
+        setClock (sf fixture) 1000
+        _ ← elapsed fixture owner "uiwaiter" 100
+        awaitPhase fixture owner "uiwaiter" Active
+        awaitRegistrations (sf fixture) 1
+        expectDelivered fixture owner "uiwaiter" 1
+        awaitWaits owner 1
+        -- A refresh falls due behind the callback that waits.
+        setClock (sf fixture) 1150
+        fireLive fixture
+        awaitOwed fixture owner "uiwaiter" True
+        settleControl fixture owner "uiwaiter" InstancePause >>= (`shouldBe` ControlApplied)
+        -- Paused, no timer demand is left, and the refresh stays owed.
+        awaitLive fixture []
+        awaitOwed fixture owner "uiwaiter" True
+        setClock (sf fixture) 5000
+        settleControl fixture owner "uiwaiter" InstanceResume >>= (`shouldBe` ControlApplied)
+        setClock (sf fixture) 5040
+        _ ← grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1)
+        void (awaitTicksComplete control owner)
+        awaitEffect (sf fixture) "update 40"
+        logged fixture >>= (`shouldBe` ["callback 1 begin", "callback 1 end", "update 40"])
   describe "a point reached and not yet served" $ do
     it "is dropped by a pause, so a pause and a resume processed between the sampling of the deadline and the serving of the point leave the next update a full interval after the resume" $ bounded $ do
       fixture ← newIFixture
@@ -218,6 +242,10 @@ spec = describe "elapsed cadence" $ do
         forM_ answers $ \case
           InstanceControlAccepted receipt → waitInstanceControl receipt >>= (`shouldBe` ControlApplied)
           other → fail ("expected the request accepted, found " <> show other)
+        -- The owner arms its timer for the resume's deadline as the turn ends, and that is
+        -- waited for, not assumed, before anything is fired.
+        awaitRegistrations (sf fixture) 2
+        awaitLive fixture [1]
         -- The cadence is one full interval from the resume at 1150: 1250, and nothing is due at 1200.
         setClock (sf fixture) 1200
         fireLive fixture

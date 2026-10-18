@@ -577,6 +577,26 @@ pauseSpec = describe "pausing" $ do
       awaitPhase fixture owner "floatticker" Active
       grantEach control owner [1]
       logged fixture >>= (`shouldBe` ["float 1e-09 true"])
+  it "drops a point whose grant was applied just before the pause: the tick completes, nothing is due for it, and the first update newly due is a full interval after the resume" $ bounded $
+    withGatedOwner [ticker, holder] (testConfig instanceBounds') $ \fixture control owner → do
+      _ ← periodic fixture owner "ticker" (LogicalTicks 2)
+      awaitPhase fixture owner "ticker" Active
+      grantEach control owner [1]
+      holdOwner fixture owner
+      -- Tick 2 is the point; the pause is accepted with it, and applied at the boundary
+      -- after the grant is: the grant counts toward dt, and the point it made is invalidated.
+      grantNow owner 1
+      receipt ← expectControl fixture owner "ticker" InstancePause
+      releaseOwner fixture
+      waitInstanceControl receipt >>= (`shouldBe` ControlApplied)
+      void (awaitTicksComplete control owner)
+      logged fixture >>= (`shouldBe` [])
+      settleControl fixture owner "ticker" InstanceResume >>= (`shouldBe` ControlApplied)
+      -- Resumed at tick 2: the next point is tick 4, two granted before the pause's end and two after.
+      grantEach control owner [1]
+      logged fixture >>= (`shouldBe` [])
+      grantEach control owner [1]
+      logged fixture >>= (`shouldBe` ["update 4"])
   it "lets the tick complete when a due update is paused before it starts, retains it, and runs it after the resume" $ bounded $
     withGatedOwner [ticker, gatedWaiter] (testConfig instanceBounds') $ \fixture control owner → do
       _ ← periodic fixture owner "ticker" (LogicalTicks 2)
