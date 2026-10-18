@@ -6,17 +6,19 @@
 module Test.LuaRuntime.Instance.Elapsed (spec) where
 
 import Control.Concurrent (yield)
-import Control.Monad (void)
+import Control.Monad (forM_, join, void)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Hetoimasia.Foundation.Time (readInstant, scriptedSource)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Scheduled
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
-import Test.LuaRuntime.Scheduled.Support (SFixture (sfTimer), awaitDiagnostics, awaitEffect, awaitRegistrations, setClock)
+import Test.LuaRuntime.Scheduled.Support (SFixture (sfTimer), awaitDiagnostics, awaitEffect, awaitRegistrations, defaultSchedulerBounds, setClock)
 import Test.LuaRuntime.Scheduler.Support (Reg (regMicroseconds), fireReg, liveRegs, nanoseconds)
 import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
 
@@ -99,6 +101,12 @@ awaitLive fixture wanted = do
   held ← liveMicroseconds fixture
   if held == wanted then pure () else yield >> awaitLive fixture wanted
 
+-- | Wait until the requests an example made from inside the owner's turn are in hand.
+awaitHeld ∷ IORef [a] → IO ()
+awaitHeld ref = do
+  held ← readIORef ref
+  if null held then yield >> awaitHeld ref else pure ()
+
 -- | Block until the instance of this name has a due update, or none.
 awaitOwed ∷ IFixture → ScheduledOwner → Text → Bool → IO ()
 awaitOwed fixture owner name wanted = do
@@ -180,6 +188,45 @@ spec = describe "elapsed cadence" $ do
         void (awaitTicksComplete control owner)
         awaitEffect (sf fixture) "callback 2 begin"
         logged fixture >>= (`shouldBe` ["callback 1 begin", "callback 1 end", "update 1950", "callback 2 begin"])
+  describe "a point reached and not yet served" $ do
+    it "is dropped by a pause, so a pause and a resume processed between the sampling of the deadline and the serving of the point leave the next update a full interval after the resume" $ bounded $ do
+      fixture ← newIFixture
+      hook ← newIORef (pure ())
+      withBoundary $ \_ runtime → do
+        let base = instanceSpec fixture "stale" [uiTicker] (testConfig instanceBounds') requiredPolicy defaultSchedulerBounds
+            -- A barrier at the clock's read: the turn's first, which samples the deadline.
+            spec' = base {scheduledClock = scriptedSource (join (readIORef hook) >> readInstant (scheduledClock base))}
+        owner ← startWith fixture runtime spec'
+        setClock (sf fixture) 1000
+        _ ← elapsed fixture owner "uiticker" 100
+        awaitPhase fixture owner "uiticker" Active
+        awaitRegistrations (sf fixture) 1
+        identity ← idOf fixture "uiticker"
+        receipts ← newIORef []
+        -- Once, as the next turn reads the clock: the pause and the resume are accepted after
+        -- the owner has drained what it was asked and before the boundary that serves the point.
+        writeIORef hook $ do
+          writeIORef hook (pure ())
+          setClock (sf fixture) 1150
+          pause ← requestInstanceControl (scheduledEndpoint owner) identity InstancePause
+          resume ← requestInstanceControl (scheduledEndpoint owner) identity InstanceResume
+          writeIORef receipts [pause, resume]
+        setClock (sf fixture) 1150
+        fireLive fixture
+        awaitHeld receipts
+        answers ← readIORef receipts
+        forM_ answers $ \case
+          InstanceControlAccepted receipt → waitInstanceControl receipt >>= (`shouldBe` ControlApplied)
+          other → fail ("expected the request accepted, found " <> show other)
+        -- The cadence is one full interval from the resume at 1150: 1250, and nothing is due at 1200.
+        setClock (sf fixture) 1200
+        fireLive fixture
+        awaitRegistrations (sf fixture) 3
+        logged fixture >>= (`shouldBe` [])
+        setClock (sf fixture) 1250
+        fireLive fixture
+        awaitEffect (sf fixture) "update 100"
+        logged fixture >>= (`shouldBe` ["update 100"])
   describe "its dt for Lua" $ do
     it "is a float number of seconds, the exact elapsed duration converted once" $ bounded $
       withOwner [floatReporter] $ \fixture _ owner → do

@@ -944,13 +944,22 @@ cadenceArmElapsed ∷ CadenceKey → Instant → SchedState v → SchedState v
 cadenceArmElapsed key deadline state = state {ssCadenceElapsed = Map.adjust (const (ElapsedCadence (Just deadline))) key (ssCadenceElapsed state)}
 
 -- | Disarm a cadence: it is due at nothing, and keeps what it has accrued. A logical
--- one accrues nothing from the grants applied until it is armed again.
+-- one accrues nothing from the grants applied until it is armed again. An elapsed point
+-- reached and not yet taken is dropped, since the deadline it was reached at is no
+-- longer the cadence's: a pause and a resume that follow it before it is served must not
+-- find it still there. A logical point reached holds a grant, which its owner releases
+-- when it serves the point, so it stays to be served.
 cadenceDisarm ∷ CadenceKey → SchedState v → SchedState v
 cadenceDisarm key state =
   state
     { ssCadenceLogical = Map.adjust (\cadence → cadence {lcTarget = Nothing, lcAccruing = False}) key (ssCadenceLogical state)
     , ssCadenceElapsed = Map.adjust (const (ElapsedCadence Nothing)) key (ssCadenceElapsed state)
+    , ssFirings = Seq.filter (not . staleElapsed) (ssFirings state)
     }
+  where
+    staleElapsed (firedKey, firing) = firedKey == key && case firing of
+      FiredElapsed _ _ → True
+      _ → False
 
 -- | Take a cadence away: its demand is cancelled, a point it reached and nobody took
 -- is dropped, and a grant it held is released.
