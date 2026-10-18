@@ -10,7 +10,7 @@
 -- * a task whose stop has begun is not taking requests, as an instance that is stopping is not.
 module Test.LuaRuntime.Request.Invariants (spec) where
 
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), finally)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, tryWithContext)
 import Control.Monad (void)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Resource (cleanupFailureLabel, cleanupFailuresInContext)
@@ -114,7 +114,7 @@ spec = describe "invariants" $ do
         command fixture owner "i" "take" "a"
         line ← awaitTaken fixture "cmd take a "
         line `shouldSatisfy` Text.isInfixOf "status=failure"
-        line `shouldSatisfy` Text.isInfixOf "could not be delivered"
+        line `shouldSatisfy` Text.isInfixOf "could be delivered within"
 
   describe "a task whose stop has begun is not taking requests" $ do
     it "refuses a request made by a closing handler of a task being stopped, without asking the provider again" $ bounded $ do
@@ -152,3 +152,57 @@ spec = describe "invariants" $ do
         awaitDiagnostic owner ((== 0) . rdOutstanding)
         d ← diagnostics owner
         (rdHeldNow d, rdEpochCancelled d) `shouldBe` (0, 1)
+
+  describe "a settlement retained for a script is a place held" $ do
+    it "keeps an epoch's cancellation charged until it is taken, so the bound holds across repeated epochs" $ bounded $ do
+      fixture ← newIFixture
+      fake ← newFake
+      withBoundary $ \_ runtime → providersFinish fake $ do
+        owner ← startRequester fixture runtime "charged" [asker] cmdConfig (logicalGrant fake 1 Nothing) requiredPolicy
+        admitAsker fixture owner "i" "asker"
+        admitAsker fixture owner "j" "asker"
+        command fixture owner "i" "start" "a"
+        awaitLine fixture "cmd start a started"
+        answerResult fake 0 7 >>= (`shouldBe` ReplyHeld)
+        awaitLine fixture "disposed 0"
+        awaitDiagnostic owner ((== 0) . rdWorkPending)
+        void (advanceRequestEpoch (scheduledEndpoint owner))
+        -- The model has released it; the script has not taken it: the place is still held.
+        awaitDiagnostic owner ((== 1) . rdOutstanding)
+        command fixture owner "j" "start" "b"
+        refusalOf fixture "j" >>= (`shouldBe` Just "request refused: all 1 places are held")
+        submissions fake >>= (`shouldBe` 1)
+        -- Taking it gives the place back.
+        command fixture owner "i" "take" "a"
+        awaitLine fixture "cmd take a {reason=epoch_change,status=cancelled}"
+        awaitDiagnostic owner ((== 0) . rdOutstanding)
+        admitAsker fixture owner "k" "asker"
+        command fixture owner "k" "start" "c"
+        awaitLine fixture "cmd start c started"
+
+  describe "every record a script is handed fits the owner's limits" $ do
+    it "delivers a provider's failure reason that the limits cannot hold as a failure that says so, never as a fault" $ bounded $ do
+      fixture ← newIFixture
+      fake ← newFake
+      withBoundary $ \_ runtime → providersFinish fake $ do
+        owner ← startRequesterWith fixture runtime (smallLimits (requestSpec fixture "failure text" [asker] cmdConfig (grantOf fake 4) requiredPolicy))
+        admitAsker fixture owner "i" "asker"
+        command fixture owner "i" "start" "a"
+        awaitLine fixture "cmd start a started"
+        answerWith fake 0 (ProviderFailure (Text.replicate 512 "x")) >>= (`shouldBe` ReplySettled)
+        command fixture owner "i" "take" "a"
+        line ← awaitTaken fixture "cmd take a "
+        line `shouldSatisfy` Text.isInfixOf "status=failure"
+        line `shouldSatisfy` Text.isInfixOf "exceeded the limits"
+        -- The instance is still running: nothing faulted.
+        command fixture owner "i" "noop" "n"
+        awaitLine fixture "cmd noop n noop"
+
+    it "refuses a grant under limits that cannot hold the smallest settlement, naming the reason" $ bounded $ do
+      fixture ← newIFixture
+      fake ← newFake
+      outcome ← tryWithContext @SomeException $ withBoundary $ \_ runtime → providersFinish fake $
+        startRequesterWith fixture runtime (withLimits (either (error . show) id (valueLimits 32 4 8)) (requestSpec fixture "tiny" [asker] cmdConfig (grantOf fake 4) requiredPolicy))
+      case outcome of
+        Left (ExceptionWithContext _ failure) → show failure `shouldSatisfy` Text.isInfixOf "SettlementsDoNotFit" . Text.pack
+        Right _ → fail "expected the grant refused"

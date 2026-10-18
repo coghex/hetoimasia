@@ -102,14 +102,17 @@ import Hetoimasia.Scripting.Lua.Scheduled.Types (Control (controlProvider), Sche
 -- choosing: every outstanding request settles, once, as cancelled by the epoch change, and
 -- its script can take that; a settled result nobody had taken is discarded with the epoch's
 -- records, as the model discards it; the ticks the requests held are let go; and the
--- providers whose work that was are told, once. The accounting for work that is not over is
--- retained, under the identities it was issued under, so a late reply retires it without
--- reaching anything the new epoch issues.
+-- providers whose work that was are to be told, once. The accounting for work that is not over
+-- is retained, under the identities it was issued under, so a late reply retires it without
+-- reaching anything the new epoch issues. A cancellation nobody has taken is still a place
+-- held, charged to the owner's bound until its script takes it.
 --
 -- The epoch is the request service's: instances and tasks are not invalidated by it. Answers
 -- what was invalidated, or 'Nothing' for an owner with no request service, or one that has
--- exited. A provider that raises when told is raised after every provider was told, with the
--- others attached as cleanup evidence; the epoch has changed by then.
+-- exited. The providers are told by the owner, at its next boundary, as for every other
+-- withdrawal of interest, so a provider that raises when told is a failure of the host under
+-- the owner's policy, first as the owner's failure and the others whole as cleanup evidence;
+-- nothing is raised on the application's thread.
 advanceRequestEpoch ∷ ScheduledEndpoint → IO (Maybe EpochReport)
 advanceRequestEpoch (ScheduledEndpoint control) = case controlProvider control of
   Nothing → pure Nothing

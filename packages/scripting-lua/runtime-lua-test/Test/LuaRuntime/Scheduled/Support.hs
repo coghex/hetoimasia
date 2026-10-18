@@ -16,6 +16,7 @@ module Test.LuaRuntime.Scheduled.Support
   , segmentsRun
   , releaseGate
   , awaitEntered
+  , blockOn
   , cancelQueued
     -- * The clock and the timer
   , Clock (..)

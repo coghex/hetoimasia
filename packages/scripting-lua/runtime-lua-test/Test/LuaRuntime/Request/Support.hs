@@ -89,7 +89,8 @@ import Hetoimasia.Scripting.Lua.Runtime (CallFault (BoundaryFailed), LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled hiding (Policy (..))
 import Hetoimasia.Scripting.Lua.Value
 import Test.LuaRuntime.Instance.Support
-import Test.LuaRuntime.Scheduled.Support (SFixture (..), defaultSchedulerBounds, scheduled, schedRegistration, startScheduled)
+import Test.LuaRuntime.Scheduled.Support (SFixture (..), blockOn, defaultSchedulerBounds, scheduled, schedRegistration, startScheduled)
+import Test.LuaRuntime.Support (Broken (Broken))
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
 
 -- The fake provider --------------------------------------------------------------------
@@ -245,6 +246,12 @@ requestRegistration fixture =
               handle ← startRequest context endpoint [VInteger n] (note ("disposed " <> Text.pack (show n)))
               pure [requestHandleValue "request" handle]
             _ → pure [VNil]
+        , -- A request whose dependency holds the owner at a gate and then fails to be disposed of.
+          asynchronousNativeRequestIn "start_failing" [SText, SInteger] [SCapability "request"] $ \context arguments → case arguments of
+            [VText endpoint, VInteger n] → do
+              handle ← startRequest context endpoint [VInteger n] (blockOn (ifBase fixture) "dispose" >> throwIO (Broken "disposal"))
+              pure [requestHandleValue "request" handle]
+            _ → pure [VNil]
         , -- A request of an endpoint the grant does not name: the application's own mistake.
           asynchronousNativeRequestIn "start_unnamed" [] [SCapability "request"] $ \context _ → do
             handle ← startRequest context "nowhere" [] (pure ())
@@ -274,6 +281,9 @@ prelude =
   , "  local out = '?'"
   , "  if p.op == 'start' then"
   , "    self.hs[key] = rq.start(p.endpoint or 'path', p.n or 0)"
+  , "    out = 'started'"
+  , "  elseif p.op == 'start_failing' then"
+  , "    self.hs[key] = rq.start_failing(p.endpoint or 'path', p.n or 0)"
   , "    out = 'started'"
   , "  elseif p.op == 'ready' then out = tostring(req.ready(self.hs[key]))"
   , "  elseif p.op == 'take' then out = fmt(req.take(self.hs[key]))"

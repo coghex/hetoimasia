@@ -171,6 +171,9 @@ data RequestGrantViolation
     DuplicateEndpoint !Text
   | -- | An endpoint whose result schema names a capability, which is a VM's.
     EndpointResultCapability !Text
+  | -- | The owner's value limits cannot hold the smallest records a script is handed for a
+    -- failure or a cancellation: no settlement could be delivered.
+    SettlementsDoNotFit
   deriving (Eq, Show)
 
 -- | A grant was refused, and nothing was made. Every violation.
@@ -328,6 +331,8 @@ data ProviderState = ProviderState
   , psLabel ∷ !Text
   , psLimits ∷ !ValueLimits
   , psTiming ∷ !RequestTiming
+  , psBound ∷ !Int
+    -- ^ How many places the owner may hold.
   , psEndpoints ∷ !(Map Text RequestEndpoint)
   , psTicks ∷ !Ticks
   , psInstances ∷ !(Maybe Instances)

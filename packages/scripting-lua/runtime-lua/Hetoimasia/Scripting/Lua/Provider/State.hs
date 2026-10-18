@@ -204,8 +204,8 @@ import Hetoimasia.Scripting.Lua.Value (Schema (..))
 -- Making a service -------------------------------------------------------------------
 
 -- | The grant's endpoints by name, or every reason it is refused.
-validateGrant ∷ RequestGrant → Either (NonEmpty RequestGrantViolation) (Map Text RequestEndpoint)
-validateGrant grant = case NonEmpty.nonEmpty violations of
+validateGrant ∷ ValueLimits → RequestGrant → Either (NonEmpty RequestGrantViolation) (Map Text RequestEndpoint)
+validateGrant limits grant = case NonEmpty.nonEmpty violations of
   Just refused → Left refused
   Nothing → Right (Map.fromList [(endpointName endpoint, endpoint) | endpoint ← grantEndpoints grant])
   where
@@ -217,12 +217,51 @@ validateGrant grant = case NonEmpty.nonEmpty violations of
         <> [InvalidEndpointName name | name ← names, isJust (validName name)]
         <> [DuplicateEndpoint name | name ← nub names, length (filter (== name) names) > 1]
         <> [EndpointResultCapability (endpointName endpoint) | endpoint ← endpoints, hasCapability (endpointResult endpoint)]
+        <> [SettlementsDoNotFit | not (all (fitsLimits limits) minimumRecords)]
     hasCapability = \case
       SCapability _ → True
       SList inner → hasCapability inner
       SOptional inner → hasCapability inner
       SRecord fields → any (hasCapability . snd) fields
       _ → False
+
+-- | Whether a record fits the owner's value limits: the form every record a script is handed
+-- must take, whatever it says.
+fitsLimits ∷ ValueLimits → [(Text, Value)] → Bool
+fitsLimits limits fields = either (const False) (const True) (valuesFootprint limits [VRecord fields])
+
+-- | The record a script is handed for a failure.
+failureFields ∷ Text → [(Text, Value)]
+failureFields reason = [("status", VText "failure"), ("reason", VText reason)]
+
+-- | The record a script is handed for a cancellation.
+cancelledFields ∷ CancelCause → [(Text, Value)]
+cancelledFields cause = [("status", VText "cancelled"), ("reason", VText (causeText cause))]
+
+-- | What the service says itself when a settlement could not be delivered as it was: short
+-- enough to fit every limits a grant is accepted with.
+undeliverableReason ∷ Text
+undeliverableReason = "the settlement exceeded the limits it could be delivered within"
+
+-- | The smallest records a script is handed, which every limits a grant is accepted with
+-- must be able to hold: every failure and cancellation the service itself makes, and the
+-- fallback for one that does not fit.
+minimumRecords ∷ [[(Text, Value)]]
+minimumRecords =
+  map failureFields [undeliverableReason, oversizedReason]
+    <> map cancelledFields [CancelledByOwner, CancelledByTaskInvalidation, CancelledByEpochChange, CancelledBySessionFailure, CancelledByStop]
+    <> [[("status", VText "pending")], [("status", VText "result"), ("value", VNil)]]
+
+-- | The reason a result over the limits is held and settled as.
+oversizedReason ∷ Text
+oversizedReason = "the provider's result exceeded the payload cap"
+
+-- | A failure's reason as it is retained: as the provider gave it, bounded, unless the record
+-- a script is handed for it would not fit the limits, in which case the service says so.
+fitReason ∷ ValueLimits → Text → Text
+fitReason limits why
+  | fitsLimits limits (failureFields (reasonDetail (failureReason ProviderFault why))) = why
+  | otherwise = undeliverableReason
 
 -- | The protocol model's caps for a service: the requests are the ones that matter, and the
 -- rest are the least the model accepts, since this session holds no tasks.
@@ -277,6 +316,7 @@ newProviderState owner label key limits grant endpoints ticks instances = do
       , psLabel = label
       , psLimits = limits
       , psTiming = grantTiming grant
+      , psBound = grantRequestBound grant
       , psEndpoints = endpoints
       , psTicks = ticks
       , psInstances = instances
@@ -361,6 +401,17 @@ data Admitted = Admitted
   , admittedDue ∷ !(Maybe DueSlot)
   }
 
+-- | The places the owner holds: every request the model still counts (an interest, a result
+-- nobody took, or provider work not yet over) and every settlement retained for a script
+-- outside it (an epoch's cancellations, which the model has released), each once. This is what
+-- the bound is on, so a cancellation nobody has taken is a place still held.
+chargedPlaces ∷ PState → Int
+chargedPlaces st =
+  Set.size
+    ( Set.fromList (Map.keys (sessionRequests (pSession st)))
+        `Set.union` Set.fromList [recIdentity record | record ← Map.elems (pRecs st), isJust (recEnded record)]
+    )
+
 -- | Whether the owner and the requester are taking requests at all, as a cheap look before the
 -- application's assignment is asked anything: a request refused as closed asks nobody.
 admissible ∷ ProviderState → Requester → STM Bool
@@ -408,8 +459,10 @@ admit service requester endpoint placement = do
             let (holder, withHolder) = case Map.lookup requester (pHolders st) of
                   Just held → (held, pSession st)
                   Nothing → issueHolder (pSession st)
+                bound = psBound service
             case acceptRequestFor holder (RequestName number) (EndpointId (endpointName endpoint)) withHolder of
-              (_, Left (CapReached OutstandingRequests bound)) → refuse (RequestsFull bound)
+              _ | chargedPlaces st >= bound → refuse (RequestsFull bound)
+              (_, Left (CapReached OutstandingRequests full)) → refuse (RequestsFull full)
               (_, Left _) → refuse RequestsClosed
               (session, Right identity) → do
                 forM_ slot $ \due → ticksHold (psTicks service) (dueTick due) >> ticksWatch (psTicks service) (dueTick due)
@@ -508,7 +561,7 @@ data Checked
 -- malformed reply and not an exception loose in a transaction.
 checkReply ∷ ValueLimits → Schema → ProviderReply → IO Checked
 checkReply limits schema = \case
-  ProviderFailure why → pure (CheckedFailure why)
+  ProviderFailure why → pure (CheckedFailure (fitReason limits why))
   ProviderResult value → do
     judged ← guarded (pure (judge value))
     case judged of
@@ -522,7 +575,7 @@ checkReply limits schema = \case
     judge value = case valuesFootprint limits [VRecord (resultFields value)] of
       Left _ → CheckedOversize (limitBytes limits + 1)
       Right bytes → case conformValue plainContext schema value of
-        Left (_, rule) → CheckedMalformed ("the result does not conform to the endpoint's schema: " <> Text.pack (show rule))
+        Left (_, rule) → CheckedMalformed (fitReason limits ("the result does not conform to the endpoint's schema: " <> Text.pack (show rule)))
         Right () → CheckedResult bytes value
 
 -- | A result carries no capability, so nothing of a VM is consulted.
@@ -537,8 +590,8 @@ resultFields value = [("status", VText "result"), ("value", value)]
 settlementFields ∷ Settlement Value → [(Text, Value)]
 settlementFields = \case
   SettledResult payload → resultFields (payloadValue payload)
-  SettledFailure reason → [("status", VText "failure"), ("reason", VText (reasonDetail reason))]
-  SettledCancelled cause → [("status", VText "cancelled"), ("reason", VText (causeText cause))]
+  SettledFailure reason → failureFields (reasonDetail reason)
+  SettledCancelled cause → cancelledFields cause
 
 causeText ∷ CancelCause → Text
 causeText = \case
@@ -549,20 +602,20 @@ causeText = \case
   CancelledByStop → "stop"
 
 -- | The record a script is handed on taking a settlement, and nothing that it could not be
--- handed: a result which, delivered, would break the limits or the schema the taking
--- operation declares (a mismatch between the operation and the endpoint that answered) is
--- delivered as a failure that says so, so that taking a settlement, which retires it, never
--- loses it to a fault.
+-- handed: every record is checked against the limits and, for a result, the schema the taking
+-- operation declares. One that does not fit (a mismatch between the operation and the endpoint
+-- that answered, or limits a reply was accepted under) is delivered as a failure that says so,
+-- which a grant is only accepted if the limits can hold, so that taking a settlement, which
+-- retires it, never loses it to a fault.
 deliverable ∷ ValueLimits → Schema → Settlement Value → [(Text, Value)]
-deliverable limits schema settlement = case settlement of
-  SettledResult payload
-    | not (fits (payloadValue payload)) →
-        [("status", VText "failure"), ("reason", VText "the result could not be delivered: it does not fit the limits or the schema of the operation that takes it")]
-  _ → settlementFields settlement
+deliverable limits schema settlement
+  | fits = fields
+  | otherwise = failureFields undeliverableReason
   where
-    fits value =
-      either (const False) (const True) (valuesFootprint limits [VRecord (resultFields value)])
-        && either (const False) (const True) (conformValue plainContext schema value)
+    fields = settlementFields settlement
+    fits = fitsLimits limits fields && case settlement of
+      SettledResult payload → either (const False) (const True) (conformValue plainContext schema (payloadValue payload))
+      _ → True
 
 -- | The model's reply for a checked one.
 modelReply ∷ Checked → Reply Value
@@ -601,7 +654,7 @@ replyTo service identity checked = do
           -- Over the limits it is held as a failure and the value is not kept, counted as
           -- the model counts an oversized reply.
           let held = case checked of
-                CheckedOversize _ → ReplyFailure (failureReason ValidationFault "the provider's result exceeded the payload cap")
+                CheckedOversize _ → ReplyFailure (failureReason ValidationFault oversizedReason)
                 _ → reply
               session' = case checked of
                 CheckedOversize _ → counting (\counters → counters {countOversizePayloads = countOversizePayloads counters + 1}) session
@@ -1101,7 +1154,7 @@ diagnosticsSTM service = do
   pure
     ProviderDiagnostics
       { rdEpoch = keyEpoch (sessionKey (pSession st))
-      , rdOutstanding = Map.size (sessionRequests (pSession st))
+      , rdOutstanding = chargedPlaces st
       , rdHeldNow = length [() | record ← Map.elems (pRecs st), isJust (recHeld record)]
       , rdWorkPending = length [() | work ← Map.elems (pWork st), awaiting work]
       , rdWorkFailed = length [() | work ← Map.elems (pWork st), isJust (workFailure work)]

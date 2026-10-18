@@ -94,6 +94,60 @@ spec = describe "failures" $ do
       -- Both were told, whatever the first raised.
       cancelledOrder fake >>= (`shouldBe` [0, 1])
 
+  describe "a provider that raises when an epoch change told it" $ do
+    it "is a failure of the host under a required policy, raised by the owner and not on the application's thread" $ bounded $ do
+      fixture ← newIFixture
+      fake ← newFake
+      onCancel fake (\_ → throwIO (Broken "epoch cancel"))
+      ExceptionWithContext _ failure ← expectFatal $ \control runtime → providersFinish fake $ do
+        owner ← startRequester fixture runtime "epoch required" [asker] cmdConfig (grantOf fake 4) requiredPolicy
+        admitAsker fixture owner "i" "asker"
+        command fixture owner "i" "start" "a"
+        awaitLine fixture "cmd start a started"
+        -- Advancing the epoch raises nothing here: the owner tells the provider.
+        _ ← advanceRequestEpoch (scheduledEndpoint owner)
+        awaitCancelled fake 1
+        finishWork fake 0
+        awaitScheduledTerminal control owner
+      failure `shouldSatisfy` brokenIs "epoch cancel"
+
+    it "ends only an optional owner whose classifier recognizes it, as unavailable with its own type" $ bounded $ do
+      fixture ← newIFixture
+      fake ← newFake
+      onCancel fake (\_ → throwIO (Broken "epoch cancel"))
+      withBoundary $ \control runtime → providersFinish fake $ do
+        owner ← startRequester fixture runtime "epoch optional" [asker] cmdConfig (grantOf fake 4) (optionalPolicy (brokenIs "epoch cancel"))
+        admitAsker fixture owner "i" "asker"
+        command fixture owner "i" "start" "a"
+        awaitLine fixture "cmd start a started"
+        _ ← advanceRequestEpoch (scheduledEndpoint owner)
+        awaitCancelled fake 1
+        finishWork fake 0
+        awaitScheduledTerminal control owner >>= \case
+          WorkerUnavailable (ExceptionWithContext _ raised) → raised `shouldSatisfy` brokenIs "epoch cancel"
+          other → fail ("expected an unavailable owner, found " <> show other)
+
+  describe "a cleanup failure that servicing answered once" $ do
+    it "is recorded as the owner's evidence even when the owner is cancelled while the disposal that failed was running" $ bounded $ do
+      fixture ← newIFixture
+      fake ← newFake
+      ExceptionWithContext context _ ← expectFatal $ \control runtime → providersFinish fake $ do
+        owner ← startRequester fixture runtime "cancelled disposal" [asker] cmdConfig (grantOf fake 4) (optionalPolicy (const True))
+        admitAsker fixture owner "i" "asker"
+        command fixture owner "i" "start_failing" "a"
+        awaitLine fixture "cmd start_failing a started"
+        command fixture owner "i" "cancel" "a"
+        awaitLine fixture "cmd cancel a cancelled"
+        awaitCancelled fake 1
+        finishWork fake 0
+        -- The disposal is running, uninterruptibly, and fails when it is let go; the owner is
+        -- cancelled meanwhile.
+        awaitEntered (sf fixture) "dispose"
+        cancelScheduled owner
+        releaseGate (sf fixture) "dispose"
+        awaitScheduledTerminal control owner
+      [cleanupFailureException found | found ← cleanupFailuresInContext context] `shouldSatisfy` any (brokenAmong "disposal")
+
   describe "a provider's retirement that fails" $ do
     it "is retained as cleanup evidence, fatal under a required and under an optional policy alike" $ bounded $ do
       forM_ [("required", requiredPolicy), ("optional", optionalPolicy (const True))] $ \(label, policy) → do

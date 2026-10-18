@@ -167,7 +167,10 @@ providerBoundary
   → IORef [(Text, ExceptionWithContext SomeException)]
   → IO ()
   → IO Bool
-providerBoundary service scheduler hasInstances evidence onCleanupFailure = do
+providerBoundary service scheduler hasInstances evidence onCleanupFailure = mask_ $ do
+  -- One masked step from the claims to their recording: a failure that servicing took out of
+  -- the accounts, or a tell that was claimed, is recorded or raised before a cancellation can
+  -- be delivered, so none is dropped.
   before ← atomically (workPendingCount service)
   swept ← sweepRequesters service
   told ← tellProviders service
@@ -231,15 +234,13 @@ retireProvider service = mask_ $ do
       if done then pure acc' else settleAll acc'
 
 -- | Replace the generation of the owner's records (P-9): every outstanding request settles,
--- once, as cancelled by the epoch change, and the provider work on all of them is told. The
--- application chooses when; the epoch changes in one transaction, and the answer is what it
+-- once, as cancelled by the epoch change, and the provider work on all of them is to be told.
+-- The application chooses when; the epoch changes in one transaction, and the answer is what it
 -- invalidated. 'Nothing' for an owner that has exited, which has no epoch to advance.
 --
--- A provider raising when told is raised to the caller after every provider was told, with
--- the others attached as cleanup evidence; the epoch has changed by then.
+-- The providers are told by the owner, at its next boundary, as for every other withdrawal of
+-- interest: a provider that raises when told is then a failure of the host under the owner's
+-- policy, whoever advanced the epoch, and is never raised on the application's thread, where
+-- no policy is applied and nothing would remember the claim.
 advanceRequestEpoch ∷ ProviderState → IO (Maybe EpochReport)
-advanceRequestEpoch service = mask_ $ do
-  changed ← atomically (advanceEpochSTM service)
-  failures ← tellProviders service
-  raiseAmong "lua request cancel" failures
-  pure changed
+advanceRequestEpoch service = mask_ (atomically (advanceEpochSTM service))

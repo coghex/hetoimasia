@@ -1388,7 +1388,7 @@ pendingOf ih number = do
 -- cut between: a failed slot is not drained again, so a failure that was not recorded
 -- would be lost.
 drainInstance ∷ InstanceHost → ICell → IO ()
-drainInstance ih cell = do
+drainInstance ih cell = mask_ $ do
   -- Its requests end first, and the providers are told: they are asked to stop before what
   -- the instance's leases hold is released. The instance owns them, whichever invocation
   -- made them, and nothing else ends them but its end.
@@ -1460,7 +1460,9 @@ serviceRetirementsOf ih = do
 serviceRequestWork ∷ InstanceHost → IO Bool
 serviceRequestWork ih = case ihProvider ih of
   Nothing → pure False
-  Just service → do
+  Just service → mask_ $ do
+    -- Servicing takes a failure out of the accounts and answers it once: recording it is the
+    -- same masked step, so a cancellation cannot come between and lose it.
     failures ← serviceProvider service
     unless (null failures) $ do
       modifyIORef' (ihExtra ih) (<> failures)

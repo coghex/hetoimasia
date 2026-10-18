@@ -573,7 +573,7 @@ startScheduledOwner runtime spec = do
   -- A request service is granted against the endpoints it names before anything starts, and
   -- refused naming every reason.
   provider ← forM (scheduledRequests spec) $ \grant →
-    case validateGrant grant of
+    case validateGrant (vmValueLimits config) grant of
       Right endpoints → newProviderState owner label scope (vmValueLimits config) grant endpoints (ticksFor scheduler stopping) ownInstances
       Left refused → throwFailure runtimeComponent (operation "start-scheduled-owner") [] (RequestGrantRefused refused)
   let bare = Control owner label (vmValueLimits config) scheduler cells faults begun closing exited stopping ownInstances Nothing provider

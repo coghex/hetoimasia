@@ -63,7 +63,7 @@ module Hetoimasia.Scripting.Lua.Request
   ) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Exception (mask, rethrowIO, throwIO)
+import Control.Exception (mask, mask_, rethrowIO, throwIO)
 import Control.Monad (unless)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -254,6 +254,7 @@ requestBindings handleType result =
           CancelRefused why → refuse why
           CancelTooLate → pure [VText "settled"]
           Cancelled → do
-            raiseAmong "lua request cancel" =<< tellProviders service
+            -- The claim and the raising of what the provider raised are one masked step.
+            mask_ (raiseAmong "lua request cancel" =<< tellProviders service)
             pure [VText "cancelled"]
       _ → refuse RequestEnded
