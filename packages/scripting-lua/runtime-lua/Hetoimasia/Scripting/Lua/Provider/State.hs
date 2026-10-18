@@ -560,8 +560,19 @@ data Checked
 -- fully inside the one guard, so a value that throws when it is first looked at is a
 -- malformed reply and not an exception loose in a transaction.
 checkReply ∷ ValueLimits → Schema → ProviderReply → IO Checked
-checkReply limits schema = \case
-  ProviderFailure why → pure (CheckedFailure (fitReason limits why))
+checkReply limits schema reply = fitted <$> checked
+  where
+    -- The one place a reason is fitted, whatever made the reply a failure: nothing reaches
+    -- the model or the held completion whose record would not fit the limits.
+    fitted = \case
+      CheckedFailure why → CheckedFailure (fitReason limits why)
+      CheckedMalformed why → CheckedMalformed (fitReason limits why)
+      other → other
+    checked = judgeReply limits schema reply
+
+judgeReply ∷ ValueLimits → Schema → ProviderReply → IO Checked
+judgeReply limits schema = \case
+  ProviderFailure why → pure (CheckedFailure why)
   ProviderResult value → do
     judged ← guarded (pure (judge value))
     case judged of
@@ -575,7 +586,7 @@ checkReply limits schema = \case
     judge value = case valuesFootprint limits [VRecord (resultFields value)] of
       Left _ → CheckedOversize (limitBytes limits + 1)
       Right bytes → case conformValue plainContext schema value of
-        Left (_, rule) → CheckedMalformed (fitReason limits ("the result does not conform to the endpoint's schema: " <> Text.pack (show rule)))
+        Left (_, rule) → CheckedMalformed ("the result does not conform to the endpoint's schema: " <> Text.pack (show rule))
         Right () → CheckedResult bytes value
 
 -- | A result carries no capability, so nothing of a VM is consulted.
@@ -915,7 +926,10 @@ endRequesterSTM service requester cause = do
 goneRequesters ∷ ProviderState → STM [Requester]
 goneRequesters service = do
   st ← readTVar (psVar service)
-  let tasks = [task | RequesterTask task ← Map.keys (pHolders st)]
+  -- Every task that still has anything: a holder, a record (an epoch's cancellation outlives
+  -- the holders it cleared) or work of its own.
+  let requesters = Map.keys (pHolders st) <> map recRequester (Map.elems (pRecs st)) <> map workRequester (Map.elems (pWork st))
+      tasks = nub [task | RequesterTask task ← requesters]
   gone ← forM tasks $ \task → (,) task <$> ticksTaskGone (psTicks service) task
   pure [RequesterTask task | (task, True) ← gone]
 

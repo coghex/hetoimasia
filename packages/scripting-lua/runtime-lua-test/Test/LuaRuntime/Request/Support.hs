@@ -450,6 +450,13 @@ taskAsker =
         , "  return n"
         , "end"
         , "function wait_other(n) local h = rq.start('path', n) req.wait(h) return n end"
+        , "function wait_only(endpoint, n)"
+        , "  local h = rq.start(endpoint, n)"
+        , "  fx.record('task started ' .. n)"
+        , "  req.wait(h)"
+        , "  fx.record('task woke ' .. n)"
+        , "  return n"
+        , "end"
         , "function close_block(endpoint, n)"
         , "  local guard <close> = setmetatable({}, {__close = function()"
         , "    fx.record('task closing')"
@@ -473,7 +480,7 @@ taskAsker =
         , "end"
         ]
     )
-    [EntryPoint "ask" Required [SText, SInteger] [SInteger], EntryPoint "start_only" Required [SText, SInteger] [SInteger], EntryPoint "wait_other" Required [SInteger] [SInteger], EntryPoint "close_ask" Required [SText, SInteger] [SInteger], EntryPoint "close_block" Required [SText, SInteger] [SInteger]]
+    [EntryPoint "ask" Required [SText, SInteger] [SInteger], EntryPoint "start_only" Required [SText, SInteger] [SInteger], EntryPoint "wait_other" Required [SInteger] [SInteger], EntryPoint "close_ask" Required [SText, SInteger] [SInteger], EntryPoint "close_block" Required [SText, SInteger] [SInteger], EntryPoint "wait_only" Required [SText, SInteger] [SInteger]]
 
 -- Owners ----------------------------------------------------------------------------------
 

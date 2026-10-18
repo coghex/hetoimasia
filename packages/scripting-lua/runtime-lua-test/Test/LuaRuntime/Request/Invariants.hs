@@ -180,7 +180,43 @@ spec = describe "invariants" $ do
         command fixture owner "k" "start" "c"
         awaitLine fixture "cmd start c started"
 
+  describe "a standalone task's retained cancellation" $ do
+    it "is given back when the task ends without taking it, after an epoch change cleared the holders" $ bounded $ do
+      fixture ← newIFixture
+      fake ← newFake
+      withBoundary $ \_ runtime → providersFinish fake $ do
+        owner ← startRequester fixture runtime "task epoch" [asker] cmdConfig (grantOf fake 1) requiredPolicy
+        ticket ← taskOf owner "wait_only" [VText "path", VInteger 5]
+        awaitSubmitted fake 1
+        awaitLine fixture "task started 5"
+        void (advanceRequestEpoch (scheduledEndpoint owner))
+        -- The task wakes to its cancellation and ends without taking it.
+        awaitLine fixture "task woke 5"
+        _ ← waitTask ticket
+        awaitCancelled fake 1
+        finishWork fake 0
+        awaitDiagnostic owner ((== 0) . rdOutstanding)
+        -- The one place is free again.
+        later ← taskOf owner "start_only" [VText "path", VInteger 8]
+        _ ← waitTask later
+        awaitLine fixture "task started 8"
+
   describe "every record a script is handed fits the owner's limits" $ do
+    it "fits a reason made of an exception the result raised when it was evaluated, multibyte text included" $ bounded $ do
+      fixture ← newIFixture
+      fake ← newFake
+      withBoundary $ \_ runtime → providersFinish fake $ do
+        owner ← startRequesterWith fixture runtime (smallLimits (requestSpec fixture "raising result" [asker] cmdConfig (RequestGrant [fakeEndpointOf fake "text" SText] 4 SettleOnArrival) requiredPolicy))
+        admitAsker fixture owner "i" "asker"
+        commandFrom fixture owner "i" "start" "a" (Just "text") (Just 1)
+        awaitLine fixture "cmd start a started"
+        answerWith fake 0 (ProviderResult (VList [VText (error (replicate 700 'é'))])) >>= (`shouldBe` ReplyRefusedValue)
+        command fixture owner "i" "take" "a"
+        line ← awaitTaken fixture "cmd take a "
+        line `shouldSatisfy` Text.isInfixOf "status=failure"
+        command fixture owner "i" "noop" "n"
+        awaitLine fixture "cmd noop n noop"
+
     it "delivers a provider's failure reason that the limits cannot hold as a failure that says so, never as a fault" $ bounded $ do
       fixture ← newIFixture
       fake ← newFake
