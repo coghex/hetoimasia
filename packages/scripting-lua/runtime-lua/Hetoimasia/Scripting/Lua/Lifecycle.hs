@@ -372,7 +372,7 @@ lifecycleBindings =
   , lifecycleOperationIn "forget" [SInteger] [SBoolean] forget
   , lifecycleOperationIn "inspect" [tidSchema] [SRecord inspectSchema] inspect
   , lifecycleOperationIn "inspect_owner" [ownerSchema] [SRecord inspectOwnerSchema] inspectOwner
-  , lifecycleOperationIn "owners" [] [SRecord [("owners", SList (SRecord ownersEntry))]] owners
+  , lifecycleOperationIn "owners" [] [SRecord [("owners", SList (SRecord ownersEntry)), ("truncated", SBoolean)]] owners
   , lifecycleOperationIn "self" [] [SOptional tidSchema] self
   ]
   where
@@ -552,22 +552,23 @@ inspectOwner context arguments = withState context (inspected Unauthorized) $ \s
           snapshots ← inspectInstances (targetInstances target) (targetGate target) (targetOwner target) (targetLabel target)
           let bounded = take (lifeSnapshotBound state) snapshots
               cut = length bounded < length snapshots
-          pure (fitted (lifeLimits state) cut (map snapshotValue bounded))
+          pure [cutToFit (lifeLimits state) listing cut (map snapshotValue bounded)]
     _ → pure (inspected Unauthorized)
   _ → pure (inspected Unauthorized)
   where
     inspected why = case notOk why of
       [VRecord fields] → [VRecord (fields <> [("instances", VList []), ("truncated", VBoolean False)])]
       other → other
+    listing items truncated = VRecord [("ok", VBoolean True), ("instances", VList items), ("truncated", VBoolean truncated)]
 
--- | The longest prefix of the snapshots that crosses the boundary within the limits, found
--- by halving: a result that would be refused is cut, and says so.
-fitted ∷ ValueLimits → Bool → [Value] → [Value]
-fitted limits cut snapshots = [render best (cut || best < length snapshots)]
+-- | A result that lists these items, cut to the longest prefix that crosses the boundary within
+-- the limits, found by halving: a list that would be refused is cut, and says so. The result is
+-- built from the items kept and whether any were cut.
+cutToFit ∷ ValueLimits → ([Value] → Bool → Value) → Bool → [Value] → Value
+cutToFit limits build cut items = build (take best items) (cut || best < length items)
   where
-    render count truncated = VRecord [("ok", VBoolean True), ("instances", VList (take count snapshots)), ("truncated", VBoolean truncated)]
-    fits count = either (const False) (const True) (checkLimits limits [render count True])
-    best = search 0 (length snapshots)
+    fits count = either (const False) (const True) (checkLimits limits [build (take count items) True])
+    best = search 0 (length items)
     -- The largest count in [low, high] that fits, assuming fitting is monotone.
     search low high
       | low >= high = low
@@ -576,25 +577,20 @@ fitted limits cut snapshots = [render best (cut || best < length snapshots)]
       where
         middle = (low + high + 1) `div` 2
 
--- | The owners the grant covers.
+-- | The owners the grant covers, cut to what crosses within the owner's limits, and saying so.
 owners ∷ LifecycleContext → [Value] → IO [Value]
-owners context _ = withState context [VRecord [("owners", VList [])]] $ \state →
-  pure
-    [ VRecord
-        [ ( "owners"
-          , VList
-              [ VRecord
-                  [ ("runtime", VInteger (fromIntegral (runtimeNumber (targetOwner target))))
-                  , ("owner", VInteger (fromIntegral (ownerSequence (targetOwner target))))
-                  , ("label", VText (targetLabel target))
-                  , ("inspect", VBoolean (PermitInspect `Set.member` targetPermits target))
-                  , ("control", VBoolean (PermitControl `Set.member` targetPermits target))
-                  ]
-              | target ← take maxGrantTargets (lifeTargets state)
-              ]
-          )
+owners context _ = withState context [VRecord [("owners", VList []), ("truncated", VBoolean False)]] $ \state →
+  pure [cutToFit (lifeLimits state) listing False (map entry (take maxGrantTargets (lifeTargets state)))]
+  where
+    listing items truncated = VRecord [("owners", VList items), ("truncated", VBoolean truncated)]
+    entry target =
+      VRecord
+        [ ("runtime", VInteger (fromIntegral (runtimeNumber (targetOwner target))))
+        , ("owner", VInteger (fromIntegral (ownerSequence (targetOwner target))))
+        , ("label", VText (targetLabel target))
+        , ("inspect", VBoolean (PermitInspect `Set.member` targetPermits target))
+        , ("control", VBoolean (PermitControl `Set.member` targetPermits target))
         ]
-    ]
 
 -- | The instance whose code is calling, if one.
 self ∷ LifecycleContext → [Value] → IO [Value]
