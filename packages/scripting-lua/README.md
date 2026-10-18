@@ -2398,7 +2398,9 @@ A release failure is a cleanup failure:
   instance beside it;
 * it is cleanup evidence on the owner's outcome, so it ends the owner at once through supervision and
   is fatal under every policy, an `Optional` owner whose classifier recognizes every exception
-  included;
+  included. At once means at the boundary where it was observed: admission, grants and control close
+  and the scheduler is asked to stop, so no queued invocation or `init` begins after it, and the owner
+  exits as a failure, settling or awaiting what is left as any exit does;
 * it is never retried and never reported as reclaimed. `resultLeases` counts what the end released,
   waited for and saw fail.
 
