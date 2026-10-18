@@ -15,7 +15,7 @@ import Hetoimasia.Runtime.Supervision (WorkerStatus (WorkerUnavailable))
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Lease
 import Hetoimasia.Scripting.Lua.Owner (BoundaryFault (boundaryReason), FaultReason (BindingRefused))
-import Hetoimasia.Scripting.Lua.Runtime (CallFault (BoundaryFailed), Discard (Discard), ExitKind (ExitCancelled))
+import Hetoimasia.Scripting.Lua.Runtime (CallFault (BoundaryFailed), Discard (Discard), ExitKind (ExitCancelled, ExitFailed))
 import Hetoimasia.Scripting.Lua.Scheduled
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Lease.Support
@@ -217,6 +217,34 @@ spec = describe "retained retirement" $ do
     settledB ← tickOf base "b" >>= pollInstance
     fmap resultPhase settledA `shouldBe` Just Failed
     fmap resultPhase settledB `shouldSatisfy` (/= Nothing)
+
+  it "begins nothing once a provider's failed retirement is observed: work queued behind it never starts, and the owner exits as a failure" $ bounded $ do
+    fixture ← newLFix 4
+    let base = lfBase fixture
+    ExceptionWithContext context _ ← expectFatal $ \control runtime → providersFinish fixture $ do
+      owner ← startLeased fixture runtime "halted" [asyncNamed, marker, holder] leaseConfig requiredPolicy
+      _ ← admit base owner "a" (moduleNamed "asyncnamed")
+      _ ← admit base owner "m" (moduleNamed "marker")
+      awaitPhase base owner "a" Active
+      awaitPhase base owner "m" Active
+      expectDelivered base owner "a" 1
+      awaitPending fixture "a" 1
+      -- The owner is held inside a segment while the provider fails and an event is queued
+      -- for the other instance: both are waiting when it comes to its next boundary.
+      holdOwner base owner
+      expectDelivered base owner "m" 1
+      failRetirement fixture "named-1"
+      releaseOwner base
+      awaitScheduledTerminal control owner
+    map cleanupFailureLabel (cleanupFailuresInContext context) `shouldSatisfy` any (Text.isInfixOf "lua lease retirement")
+    -- The queued work never began: it is discarded as an unstarted invocation.
+    history fixture >>= (`shouldSatisfy` notElem "ran marker")
+    settled ← tickOf base "m" >>= pollInstance
+    case settled of
+      Just result → do
+        resultOutcome result `shouldSatisfy` \case InstanceDiscarded (Discard ExitFailed _) → True; _ → False
+        terminationUnstarted (resultTermination result) `shouldBe` 1
+      Nothing → fail "expected the instance to have settled"
 
   it "disposes what a retirement needs only when the provider has proved it complete: not under a pending retirement, in a stop or a cancellation, and before the stop completion settles" $ bounded $ do
     forM_ [("stopped", False), ("retired", True)] $ \(label, byOwner) → do

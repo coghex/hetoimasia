@@ -117,6 +117,7 @@ import Hetoimasia.Scripting.Lua.Instance.Run
   , InstanceHost (ihMode)
   , awaitInstanceWork
   , closingAs
+  , cleanupEndedOwner
   , instanceClosed
   , instanceSegment
   , newInstanceHost
@@ -233,9 +234,15 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
   atomically (writeTVar (controlClosing control) True)
   -- Whether Lua may be entered for an instance again: only after an orderly stop.
   heldInstances ← readIORef instanceRef
+  let heldInstances0 = heldInstances
+  -- A cleanup failure of the instances' leases ended the owner at once: it exits as a
+  -- failure, as any cleanup failure ends it, even though what stopped its loop was the
+  -- closing the failure itself asked for.
+  leaseFailed ← maybe (pure False) cleanupEndedOwner heldInstances0
   let cause = case served of
         Left failure → Just (exitOf failure)
         Right True → Just ExitFailed
+        Right False | leaseFailed → Just ExitFailed
         Right False → Nothing
   forM_ heldInstances (`recordExit` cause)
   -- The owner's exit record says how it exited, and it is what the instances left are

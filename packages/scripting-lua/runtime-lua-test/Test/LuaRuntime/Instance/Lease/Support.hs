@@ -15,6 +15,9 @@ module Test.LuaRuntime.Instance.Lease.Support
   , position
     -- * The fake world
   , breakRelease
+  , blockRelease
+  , awaitReleaseEntered
+  , proceedRelease
   , completeRetirement
   , failRetirement
   , assetHolders
@@ -35,6 +38,7 @@ module Test.LuaRuntime.Instance.Lease.Support
   , asyncRollback
   , asyncShutdownFails
   , asyncNamed
+  , marker
   , escalating
   , dependentHolder
   , dependentNowHolder
@@ -66,10 +70,10 @@ module Test.LuaRuntime.Instance.Lease.Support
   ) where
 
 import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, retry, writeTVar)
 import Control.Exception (SomeException, finally, throwIO, toException, try)
-import Control.Monad (forM_)
+import Control.Monad (forM_, void)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -113,6 +117,12 @@ data LFix = LFix
     -- ^ What each asynchronously retired resource's provider has said.
   , lfAssets ∷ !(IORef (Map Text Int))
     -- ^ The interests taken in each shared asset: the application's own count.
+  , lfBlocking ∷ !(IORef (Set Text))
+    -- ^ The resources whose release waits at a gate before it goes on.
+  , lfEntered ∷ !(MVar ())
+    -- ^ Opened when a release has reached its gate.
+  , lfProceed ∷ !(MVar ())
+    -- ^ Opened by the example to let a release at its gate go on.
   }
 
 -- | A fixture whose instances may each have this much charged.
@@ -121,7 +131,7 @@ newLFix capacity = do
   base ← newIFixture
   lending ← newLending
   leases ← newLeases lending capacity
-  LFix base lending leases <$> newIORef Set.empty <*> newIORef Map.empty <*> newIORef Map.empty
+  LFix base lending leases <$> newIORef Set.empty <*> newIORef Map.empty <*> newIORef Map.empty <*> newIORef Set.empty <*> newEmptyMVar <*> newEmptyMVar
 
 -- | Record that something happened, in the order the hooks and the fakes share.
 note ∷ LFix → Text → IO ()
@@ -144,6 +154,18 @@ position entries wanted = length (takeWhile (/= wanted) entries)
 -- | Make this resource's release fail the way a native cleanup does.
 breakRelease ∷ LFix → Text → IO ()
 breakRelease fixture name = atomicModifyIORef' (lfBreaking fixture) (\held → (Set.insert name held, ()))
+
+-- | Make this resource's release wait at a gate, inside the release, before it goes on.
+blockRelease ∷ LFix → Text → IO ()
+blockRelease fixture name = atomicModifyIORef' (lfBlocking fixture) (\held → (Set.insert name held, ()))
+
+-- | Wait until a release has reached its gate.
+awaitReleaseEntered ∷ LFix → IO ()
+awaitReleaseEntered = readMVar . lfEntered
+
+-- | Let the release at its gate go on.
+proceedRelease ∷ LFix → IO ()
+proceedRelease = void . (`tryPutMVar` ()) . lfProceed
 
 -- | The provider of this asynchronously retired resource says it is done.
 completeRetirement ∷ LFix → Text → IO ()
@@ -187,6 +209,10 @@ twoParts fixture name = do
         (() <$ note fixture ("acquire " <> name <> "." <> which))
         ( \_ → do
             note fixture ("release " <> name <> "." <> which)
+            blocking ← readIORef (lfBlocking fixture)
+            if which == "a" && Set.member name blocking
+              then void (tryPutMVar (lfEntered fixture) ()) >> readMVar (lfProceed fixture)
+              else pure ()
             breaking ← readIORef (lfBreaking fixture)
             if which == "a" && Set.member name breaking
               then throwIO (Broken ("release " <> name))
@@ -619,6 +645,16 @@ asyncShutdownFails =
     , "  api.connect('tick', function(self, event) end)"
     , "end"
     , "function shutdown(self, reason) fx.fail('boom') end"
+    ]
+
+-- | Records that a tick reached it.
+marker ∷ ModuleSource
+marker =
+  hooksModule
+    "marker"
+    [ "function init(self, api)"
+    , "  api.connect('tick', function(self, event) " <> record <> "('ran marker') end)"
+    , "end"
     ]
 
 -- | Holds an asynchronously retired resource named for the instance, and releases it on a

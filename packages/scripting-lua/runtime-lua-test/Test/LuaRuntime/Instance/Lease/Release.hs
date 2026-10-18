@@ -128,6 +128,41 @@ spec = describe "releasing" $ do
           leasesDrained (resultLeases result) `shouldBe` 2
         Nothing → fail "expected the instance to have settled"
 
+  it "keeps a failed release in the instance's outcome when a cancellation is queued inside it: the independent holdings are still released, once each, and the failure is not lost" $ bounded $ do
+    fixture ← newLFix 4
+    let base = lfBase fixture
+    breakRelease fixture "indep-b"
+    blockRelease fixture "indep-b"
+    _ ← expectFatal $ \control runtime → do
+      owner ← startLeased fixture runtime "cancelled in release" [independent] leaseConfig requiredPolicy
+      _ ← admit base owner "a" (moduleNamed "independent")
+      awaitPhase base owner "a" Active
+      liveFor fixture "a" 3
+      _ ← askControl base owner "a" InstanceStop
+      -- The release of the middle holding is inside the drain, at its gate, when the
+      -- cancellation is queued behind it.
+      awaitReleaseEntered fixture
+      cancelQueued owner
+      proceedRelease fixture
+      awaitScheduledTerminal control owner
+    entries ← history fixture
+    releases entries
+      `shouldBe` [ "release indep-c.b"
+                 , "release indep-c.a"
+                 , "release indep-b.b"
+                 , "release indep-b.a"
+                 , "release indep-a.b"
+                 , "release indep-a.a"
+                 ]
+    settled ← tickOf base "a" >>= pollInstance
+    case settled of
+      Just result → do
+        resultPhase result `shouldBe` Failed
+        fmap failureStage (failureOf' result) `shouldBe` Just StageRelease
+        leasesFailed (resultLeases result) `shouldBe` 1
+        leasesDrained (resultLeases result) `shouldBe` 2
+      Nothing → fail "expected the instance to have settled"
+
   it "keeps the instance's primary failure primary and retains a release failure beside it, fatal for the owner whatever its policy" $ bounded $ do
     forM_ [("required", requiredPolicy), ("optional", optionalPolicy (const True))] $ \(label, policy) → do
       fixture ← newLFix 4

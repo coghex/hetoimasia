@@ -74,6 +74,7 @@ module Hetoimasia.Scripting.Lua.Instance.Run
   , retireInstances
   , recordExit
   , closingAs
+  , cleanupEndedOwner
   ) where
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', orElse, readTVar, readTVarIO, retry, swapTVar, writeTVar)
@@ -262,6 +263,9 @@ data InstanceHost = InstanceHost
   , ihParked ∷ !(IORef (Set.Set Word64))
     -- ^ Instances whose ending has run its hook and released its holdings and waits
     -- for a provider's retirement before it settles.
+  , ihFailed ∷ !(IORef Bool)
+    -- ^ Whether a cleanup failure of the leases ended the owner: it is how the owner exits,
+    -- as a failure and not an order, whatever stopped its loop.
   }
 
 -- | The host of an owner's instances.
@@ -289,6 +293,7 @@ newInstanceHost control instances escalate host owned driver handles tasks extra
     <*> newIORef []
     <*> pure leases
     <*> newIORef Set.empty
+    <*> newIORef False
 
 -- | Record how the owner exits, for the instances it leaves: the one place that writes it.
 -- The first failure or cancellation recorded is how the owner exits, and nothing later (a
@@ -977,13 +982,31 @@ parkOrSettle ih cell = do
 
 -- | Release what an instance still holds, newest first, whatever the instance's end
 -- was and whatever its hook did. A release that fails does not stop another, is
--- cleanup evidence on the owner, and is noted for the instance's settlement.
+-- cleanup evidence on the owner, is noted for the instance's settlement, and ends the
+-- owner. The drain and the record of what it came to are one step a cancellation cannot
+-- cut between: a failed slot is not drained again, so a failure that was not recorded
+-- would be lost.
 drainInstance ∷ InstanceHost → ICell → IO ()
-drainInstance ih cell = forM_ (ihLeases ih) $ \lh → do
+drainInstance ih cell = forM_ (ihLeases ih) $ \lh → mask_ $ do
   report ← drainScope lh (icId cell)
-  forM_ (drainFailures report) $ \failure@(ExceptionWithContext _ raised) → mask_ $ do
+  forM_ (drainFailures report) $ \failure@(ExceptionWithContext _ raised) → do
     modifyIORef' (ihExtra ih) (<> [("lua instance lease", failure)])
     atomically (noteScope (lhLeases lh) (icId cell) (failureText (Text.pack (show raised))))
+  unless (null (drainFailures report)) (endOwner ih)
+
+-- | A cleanup failure of the leases ends the owner at once, through supervision, with
+-- the evidence it was recorded as: admission, grants and control close and the scheduler
+-- is asked to stop, so that nothing is begun after it, at this boundary or any other, and
+-- the owner exits as a failure. What is left to settle, and the retirements still pending,
+-- are settled and awaited by its exit as they are for any exit.
+endOwner ∷ InstanceHost → IO ()
+endOwner ih = do
+  writeIORef (ihFailed ih) True
+  atomically (writeTVar (controlClosing (ihControl ih)) True)
+
+-- | Whether a cleanup failure of the leases ended the owner.
+cleanupEndedOwner ∷ InstanceHost → IO Bool
+cleanupEndedOwner = readIORef . ihFailed
 
 -- | Take away the retirements the providers finished, and settle the endings that
 -- were waiting for them. A retirement a provider reports failed is cleanup evidence
@@ -1001,6 +1024,7 @@ serviceRetirementsOf ih = case ihLeases ih of
         forM_ (endedInstance finished) $ \number →
           atomically . noteScope leases number . failureText $
             "the provider's retirement of " <> endedLabel finished <> " failed: " <> Text.pack (show raised)
+        endOwner ih
       -- What the retirements needed is disposed of now that every one has completed, as a
       -- release is: uninterruptibly, one at a time, a failure of one not stopping the rest.
       forM_ disposals $ \(number, dispose) → do
@@ -1008,6 +1032,7 @@ serviceRetirementsOf ih = case ihLeases ih of
         forM_ (either Just (const Nothing) disposed) $ \failure@(ExceptionWithContext _ raised) → do
           modifyIORef' (ihExtra ih) (<> [("lua lease dependency", failure)])
           atomically . noteScope leases number . failureText $ "disposing what a retirement needed failed: " <> Text.pack (show raised)
+          endOwner ih
       pure (not (null ended && null disposals))
     parked ← Set.toList <$> readIORef (ihParked ih)
     settled ← forM parked $ \number → do
