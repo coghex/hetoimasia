@@ -2411,8 +2411,12 @@ A release failure is a cleanup failure:
 A resource retired by a provider that finishes later does not wait inside the collection's
 uninterruptible release (`docs/resources.md`, "What a release may do"). The assembly's release hands the
 resource over and records the obligation with `retireAsynchronously retirements label reading`, where
-`reading` is an STM transaction that says `ProviderPending`, `ProviderComplete` or `ProviderFailed` and
-never retries. The lease keeps its charge until the provider says it is done. The owner awaits it outside
+`reading` is an STM transaction that says `ProviderPending`, `ProviderComplete` or `ProviderFailed`. It is
+application code and may throw: a reading that throws is that retirement failing, retained as cleanup
+evidence while every independent retirement is still served and awaited, and one that retries says it is
+not done. The same holds for every other call into application code the retirement makes (a deferred
+disposal, the application's escalation of an instance's failure, rendering an exception for the
+settlement): a failure of one is recorded and the independent ones go on. The lease keeps its charge until the provider says it is done. The owner awaits it outside
 the collection, in its own protected lifetime:
 
 * the instance's stop completion settles only after its obligations have completed; until then it is
