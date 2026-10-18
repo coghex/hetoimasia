@@ -1941,8 +1941,12 @@ lifetime of their own and cannot cross the value boundary, which copies. The lay
 table in the VM that only a driver module the owner loads beside the application's can reach, by the
 instance's number, and the host runs a hook by handing it to the driver, which calls it with its
 instance's `self`. A script cannot reach the table, so it cannot forge or erase another instance's
-state. The one binding the layer installs, `hetoimasia_instance.connect`, tells the owner a
-connection was made, so the owner records it at once; it accepts only the number of the instance
+state. The layer installs two bindings. `hetoimasia_instance.delta` hands the driver the `dt`, in
+seconds, of the update that is about to begin (a negative number for anything else), so that a one-shot's
+`run` and an update go through one driver entry point that takes the instance's number alone, which keeps
+the boundary footprint of `run` and of `update` to that one value; only the instance whose code is
+running is answered. `hetoimasia_instance.connect` tells the owner a connection was made, so the owner
+records it at once; it accepts only the number of the instance
 whose code is running, so a script that names another instance's number is refused. A script that connects itself through the binding and
 not through its `api` has a connection with no function behind it: the first event for it fails that instance, by name,
 rather than being dropped.
@@ -2381,12 +2385,17 @@ failure of a closing handler, a one-shot's completion, the owner's retirement or
 thread after its `shutdown` has run or been skipped, newest acquisition first and each one's parts in
 the order its assembly declared. Handles stay usable inside `shutdown`. A release that fails does not
 stop the others from being attempted. Draining runs no Lua, so it also runs when Lua is no longer safe
-to enter.
+to enter, and when a failure of the host in `shutdown` is what ends the owner: the instance is drained
+and, if a provider has yet to retire something, parked all the same, so nothing is left live for the
+collection's own close, where nothing would wait for its provider.
 
 A release failure is a cleanup failure:
 
 * it is kept beside the instance's primary failure, which stays primary, in the settlement
-  (`failureSecondary`, stage `StageRelease`), and is the instance's failure when there is none;
+  (`failureSecondary`, stage `StageRelease`), and is the instance's failure when there is none. That
+  includes a rollback release that failed while a constructor was failing: the constructor's exception
+  stays the owner's failure, as an application failure, and the rollback failure is kept for the
+  instance beside it;
 * it is cleanup evidence on the owner's outcome, so it ends the owner at once through supervision and
   is fatal under every policy, an `Optional` owner whose classifier recognizes every exception
   included;
@@ -2406,6 +2415,12 @@ the collection, in its own protected lifetime:
   `Stopping`, and nothing is reported as reclaimed merely because Lua stopped;
 * the owner stays live, with everything its exit keeps, through a stop and through a cancellation, as a
   stuck segment keeps it, until the provider has proved completion;
+* what a retirement needs is handed to it, not disposed: the release of the part that owns a dependency
+  calls `afterRetirement disposal`, ranked after the parts being retired, and the engine runs the disposal
+  once every retirement the lease has recorded has completed, uninterruptibly on the owner's thread and
+  before the stop completion settles (at once, inside the release, if none is pending), so a dependency is
+  never disposed under a retirement still using it. If a provider reports its retirement failed the disposal
+  never runs: the dependency is retained, as the resource is. A disposal that fails is cleanup evidence;
 * a retirement the provider reports failed is retained as cleanup evidence and is fatal, and the lease
   it belonged to answers that failure and never success;
 * a stage rolled back whose provider has not finished keeps its charge, and the owner's life, though the
