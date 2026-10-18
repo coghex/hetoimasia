@@ -1941,8 +1941,12 @@ lifetime of their own and cannot cross the value boundary, which copies. The lay
 table in the VM that only a driver module the owner loads beside the application's can reach, by the
 instance's number, and the host runs a hook by handing it to the driver, which calls it with its
 instance's `self`. A script cannot reach the table, so it cannot forge or erase another instance's
-state. The one binding the layer installs, `hetoimasia_instance.connect`, tells the owner a
-connection was made, so the owner records it at once; it accepts only the number of the instance
+state. The layer installs two bindings. `hetoimasia_instance.delta` hands the driver the `dt`, in
+seconds, of the update that is about to begin (a negative number for anything else), so that a one-shot's
+`run` and an update go through one driver entry point that takes the instance's number alone, which keeps
+the boundary footprint of `run` and of `update` to that one value; only the instance whose code is
+running is answered. `hetoimasia_instance.connect` tells the owner a connection was made, so the owner
+records it at once; it accepts only the number of the instance
 whose code is running, so a script that names another instance's number is refused. A script that connects itself through the binding and
 not through its `api` has a connection with no function behind it: the first event for it fails that instance, by name,
 rather than being dropped.
