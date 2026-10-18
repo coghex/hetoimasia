@@ -253,6 +253,7 @@ module Hetoimasia.Scripting.Lua.Scheduler
   , watchTick
   , setWatch
   , releaseWatch
+  , watchHeld
   , releaseCadenceHold
   , cadenceHeld
   , cadenceAccrued
@@ -678,6 +679,10 @@ setWatch scheduler target = modifyTVar' (schedState scheduler) (setWatchIn targe
 -- | Give back the grant the watch holds, once the owner has done what the tick asked of it.
 releaseWatch ∷ Scheduler v → STM ()
 releaseWatch scheduler = modifyTVar' (schedState scheduler) releaseWatchIn
+
+-- | Whether the owner's watch holds a grant now.
+watchHeld ∷ Scheduler v → STM Bool
+watchHeld scheduler = isJust . ssWatchHold <$> readTVar (schedState scheduler)
 
 -- | Whether a cadence point has been reached and not taken.
 cadenceFiringsPending ∷ Scheduler v → STM Bool

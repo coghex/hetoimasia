@@ -6,6 +6,7 @@
 -- session-lifetime counts of what was rejected, coalesced, or discarded.
 module Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Subscriptions
   ( registerSubscription
+  , registerSubscriptionFor
   , unsubscribeIn
   , deliverEvent
   , takeEventIn
@@ -22,6 +23,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits
   ( Limits (maxPayloadBytes, maxSubscriptionQueue, maxSubscriptions)
   , LimitName (Subscriptions)
   )
+import Hetoimasia.Scripting.Lua.Internal.Protocol.Session.Requests (holderLive)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Session.State
   ( Counters (..)
   , Session (..)
@@ -54,7 +56,43 @@ registerSubscription
   → OverloadPolicy
   → Session v
   → (Session v, Either SessionRejection SubscriptionId)
-registerSubscription owner name endpoint policy session = case checks of
+registerSubscription owner name endpoint policy session = registered owner name endpoint policy ownerLive session
+  where
+    ownerLive = case Map.lookup owner (sessionTasks session) of
+      Nothing → Left (UnknownTask owner)
+      Just task
+        | isTerminal (taskState task) → Left (UnknownTask owner)
+        | otherwise → Right ()
+
+-- | Register an owned subscription for a live holder, exactly as 'registerSubscription' does
+-- for a task.
+--
+-- An owner that is not one of the session's tasks, an instance of a script that outlives each
+-- of its invocations, owns its subscriptions through a /holder/ ('issueHolder'), as it owns its
+-- requests: they stay until it ends the holder ('endHolder') or unsubscribes, and ending the
+-- holder revokes them through the same path a retiring task's are.
+registerSubscriptionFor
+  ∷ TaskId
+  → SubscriptionName
+  → EndpointId
+  → OverloadPolicy
+  → Session v
+  → (Session v, Either SessionRejection SubscriptionId)
+registerSubscriptionFor holder name endpoint policy session = registered holder name endpoint policy holderOpen session
+  where
+    holderOpen
+      | holderLive holder session = Right ()
+      | otherwise = Left (UnknownTask holder)
+
+registered
+  ∷ TaskId
+  → SubscriptionName
+  → EndpointId
+  → OverloadPolicy
+  → Either SessionRejection ()
+  → Session v
+  → (Session v, Either SessionRejection SubscriptionId)
+registered owner name endpoint policy ownerOpen session = case checks of
   Left rejection → refuse session rejection
   Right () →
     let (generation, stamped) = takeGeneration session
@@ -72,11 +110,7 @@ registerSubscription owner name endpoint policy session = case checks of
     limits = limitsIn session
     checks = do
       notStopped session
-      case Map.lookup owner (sessionTasks session) of
-        Nothing → Left (UnknownTask owner)
-        Just task
-          | isTerminal (taskState task) → Left (UnknownTask owner)
-          | otherwise → Right ()
+      ownerOpen
       if Map.size (sessionSubscriptions session) >= maxSubscriptions limits
         then Left (CapReached Subscriptions (maxSubscriptions limits))
         else Right ()

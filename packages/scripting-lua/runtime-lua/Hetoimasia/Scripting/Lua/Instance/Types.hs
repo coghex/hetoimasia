@@ -95,7 +95,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
-import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (TaskId)
+import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (SubscriptionId, TaskId)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits (ServiceClass)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Task (TaskFailure)
 import Hetoimasia.Scripting.Lua.Owner (ModuleRef, maxEntries)
@@ -321,11 +321,21 @@ data EventRecord = EventRecord
   deriving (Eq, Show)
 
 -- | An accepted event, queued.
+--
+-- A connection's event carries its payload. A subscription's delivery is a /reference/: the
+-- payload stays in the subscription's record in the protocol model, where a later delivery of
+-- replaceable state replaces it in place, and is taken when the callback's first segment is
+-- about to run. The reference keeps the delivery's place in the queue, its sequence and the
+-- logical tick it was admitted at.
 data QueuedEvent = QueuedEvent
   { queuedSource ∷ !Text
+    -- ^ The event source a connection's event came from, or the subscription's endpoint.
   , queuedSequence ∷ !Word64
   , queuedTick ∷ !Word64
   , queuedPayload ∷ !Value
+    -- ^ Nil for a subscription's delivery, which holds none.
+  , queuedSubscription ∷ !(Maybe SubscriptionId)
+    -- ^ The subscription a delivery is for; 'Nothing' for a connection's event.
   }
 
 -- What an instance settles as -------------------------------------------------------
@@ -402,6 +412,10 @@ data InstanceError
     -- rendering of what failed. The failure itself is cleanup evidence on the
     -- owner.
     ErrorRelease !Text
+  | -- | A provider could not preserve an authoritative event of a subscription: the endpoint
+    -- and why. The simulation cannot go on as though it had been delivered, so the instance
+    -- fails, and the application's escalation decides what that means for its peers.
+    ErrorDelivery !Text !Text
   | -- | The cadence's own arithmetic could not be represented: a tick or a deadline
     -- past what a tick or an instant can be, or a logical duration granted that
     -- overflowed. Nothing wrapped; this is what happened.
@@ -715,6 +729,9 @@ data IState = IState
   , isBaseline ∷ !ElapsedBaseline
     -- ^ An elapsed instance's baseline: the instant its last update began, or its
     -- @init@ succeeded, or it resumed, which is what its @dt@ is measured from.
+  , isDeliveryFailure ∷ !(Maybe (Text, Text))
+    -- ^ The endpoint and why: a provider surfaced that it could not preserve an authoritative event of one of this
+    -- instance's subscriptions: the owner fails the instance with it, once.
   }
 
 -- | Where an instance's periodic update is.
@@ -757,7 +774,7 @@ unstartedCount kind state =
 
 -- | A fresh instance's state.
 initialState ∷ IState
-initialState = IState Initializing False Set.empty Seq.empty 0 0 0 Nothing False False False Nothing UpdateNone False noBaseline
+initialState = IState Initializing False Set.empty Seq.empty 0 0 0 Nothing False False False Nothing UpdateNone False noBaseline Nothing
 
 -- | What the owner's thread is asked to do, in the order the application asked.
 data Job
@@ -768,6 +785,9 @@ data Job
     JobDispatch !Word64
   | -- | Apply a request.
     JobControl !Word64 !InstanceControl !InstanceControlReceipt
+  | -- | Let the instance's VM go of the callbacks of subscriptions that ended without it
+    -- (an epoch change): they are named in the provider service, and are no use to anyone.
+    JobForget !Word64
 
 -- | An instance's settlement.
 data InstanceSettlement = InstanceSettlement
@@ -861,6 +881,7 @@ renderError = failureText . \case
   ErrorRefusedWait failure → Text.pack (show failure)
   ErrorRelease released → "a release failed: " <> released
   ErrorCadence what → "cadence: " <> what
+  ErrorDelivery endpoint why → "delivery to a subscription of " <> endpoint <> " failed: " <> why
 
 -- | A bounded rendering.
 failureText ∷ Text → Text

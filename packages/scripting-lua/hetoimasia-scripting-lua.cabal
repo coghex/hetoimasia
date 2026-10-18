@@ -218,8 +218,10 @@ library runtime-lua
         Hetoimasia.Scripting.Lua.Retention
         Hetoimasia.Scripting.Lua.Lending.Loan
         Hetoimasia.Scripting.Lua.Lifecycle.State
+        Hetoimasia.Scripting.Lua.Provider.Events
         Hetoimasia.Scripting.Lua.Provider.Serve
         Hetoimasia.Scripting.Lua.Provider.State
+        Hetoimasia.Scripting.Lua.Provider.Subscribe
         Hetoimasia.Scripting.Lua.Provider.Types
         Hetoimasia.Scripting.Lua.Runtime.Admission
         Hetoimasia.Scripting.Lua.Runtime.Dispatch
@@ -324,6 +326,7 @@ test-suite lua-host-tests
         Test.Lua.Protocol.Epochs
         Test.Lua.Protocol.Failure
         Test.Lua.Protocol.Fixture
+        Test.Lua.Protocol.HolderSubscriptions
         Test.Lua.Protocol.Holders
         Test.Lua.Protocol.Isolation
         Test.Lua.Protocol.Reason
@@ -425,6 +428,12 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Request.Support
         Test.LuaRuntime.Request.Teardown
         Test.LuaRuntime.Request.Waiting
+        Test.LuaRuntime.Subscription.Basics
+        Test.LuaRuntime.Subscription.Epochs
+        Test.LuaRuntime.Subscription.Failures
+        Test.LuaRuntime.Subscription.Logical
+        Test.LuaRuntime.Subscription.Spec
+        Test.LuaRuntime.Subscription.Support
         Test.LuaRuntime.Scheduled.Creation
         Test.LuaRuntime.Scheduled.Execution
         Test.LuaRuntime.Scheduled.Settlement

@@ -58,6 +58,7 @@ import Data.Word (Word64)
 import Hetoimasia.Foundation.Resource (composeCleanup)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Request (CancelCause (CancelledByTaskInvalidation))
 import Hetoimasia.Scripting.Lua.Retention (guarded)
+import Hetoimasia.Scripting.Lua.Provider.Events (nextStagedAfter)
 import Hetoimasia.Scripting.Lua.Provider.State
 import Hetoimasia.Scripting.Lua.Provider.Types
 import Hetoimasia.Scripting.Lua.Scheduler
@@ -107,13 +108,20 @@ raiseAmong label = \case
 -- | Serve a tick the owner has reached: the requests due at it or before are settled by the
 -- completions they held, in the order of their places, and the tasks waiting for them are
 -- woken in that order. All of it is one transaction, so nothing runs between. Answers the
--- earliest tick a request still unserved is due at, for the owner to watch.
+-- earliest tick a request or an event still unserved is due at, for the owner to watch. The
+-- events held for this tick are the instance layer's to admit ('serveEvents'), after the
+-- controls the tick holds, which come first.
 serveTick ∷ ProviderState → Word64 → STM (Maybe Word64)
 serveTick service tick = do
   due ← takeDue service tick
   settled ← serveDue service due
   _ ← ticksWakeOrdered (psTicks service) settled
-  nextDueTick service
+  requests ← nextDueTick service
+  events ← nextStagedAfter service tick
+  pure $ case (requests, events) of
+    (Just first, Just second) → Just (min first second)
+    (first, Nothing) → first
+    (Nothing, second) → second
 
 -- | Serve the watch's points for an owner that hosts no instances, so has nothing else that
 -- takes them: each reached tick serves its requests and the grant that reached it is let go.

@@ -50,10 +50,32 @@
 -- Identical admissions with their assigned ticks, cancels at logical points and grants give
 -- identical settlements in an identical order, however provider delays and arrival order vary.
 --
--- = Shared by owned subscriptions
+-- = Subscriptions (LUA-26)
 --
--- The grant, the guard every call into provider code goes through ('guarded') and the epoch
--- operation ('advanceRequestEpoch') are what LUA-26's subscriptions are built on, unchanged.
+-- An owner granted a 'SubscriptionGrant' beside its request service lets its instances subscribe
+-- functions to the providers' event endpoints. The grant, the guard every call into provider code
+-- goes through ('guarded') and the epoch operation ('advanceRequestEpoch') are the request
+-- service's, used unchanged:
+--
+-- * a subscription is a record of the protocol model, owned by the instance (not by the invocation
+--   that made it), with the overload policy its endpoint declares: 'OrderedEvents' refuses a
+--   delivery the instance's queue has no place for, and 'ReplaceableState' keeps one unstarted
+--   delivery and replaces its value in place;
+-- * a provider delivers through the 'EventFeed' it was handed, from any thread, without blocking,
+--   and never calls Lua: a delivery places a reference in the instance's queue, and the owner looks
+--   up the live callback when it services it. A delivery to a subscription that has ended
+--   (unsubscribed, invalidated by an epoch change, or ended with its instance) is refused and
+--   counted;
+-- * on an owner on logical time the application assigns each delivery its tick and place
+--   ('DueSlot'): deliveries are held in a bounded store and admitted at their tick's boundary in the
+--   order of their places, which decides overflow and coalescing by the logical sequence and not by
+--   how fast the owner served; an owner on elapsed time admits on arrival;
+-- * outstanding provider work is a retained retirement obligation, charged to the subscription's
+--   place until the provider proves it over, so subscribing and unsubscribing over and over cannot
+--   reclaim a place the provider still holds, and an instance's stop waits for it;
+-- * 'advanceRequestEpoch' invalidates every subscription with the rest of the epoch's records and
+--   keeps the accounting of their providers' work under the identities it was issued under.
+--
 module Hetoimasia.Scripting.Lua.Provider
   ( -- * Granting
     RequestGrant (..)
@@ -76,6 +98,21 @@ module Hetoimasia.Scripting.Lua.Provider
   , ProviderReply (..)
   , ReplyAnswer (..)
 
+    -- * Subscriptions
+  , SubscriptionGrant (..)
+  , subscriptionGrant
+  , defaultSubscriptionBound
+  , defaultStagingBound
+  , maxSubscriptionBound
+  , SubscriptionGrantViolation (..)
+  , SubscriptionGrantRefused (..)
+  , EventEndpoint (..)
+  , EventSubscription (..)
+  , SubscriptionInfo (..)
+  , EventFeed (..)
+  , EventAnswer (..)
+  , OverloadPolicy (..)
+
     -- * The guard
   , guarded
 
@@ -87,6 +124,9 @@ module Hetoimasia.Scripting.Lua.Provider
     -- * Reading
   , ProviderDiagnostics (..)
   , requestDiagnostics
+  , SubscriptionDiagnostics (..)
+  , SubscriptionReading (..)
+  , subscriptionDiagnostics
   ) where
 
 import Control.Concurrent.STM (STM)
@@ -94,6 +134,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Session (EpochChange (..))
 import Hetoimasia.Scripting.Lua.Retention (RetirementState (..))
 import Hetoimasia.Scripting.Lua.Provider.Serve (guarded)
 import qualified Hetoimasia.Scripting.Lua.Provider.Serve as Serve
+import Hetoimasia.Scripting.Lua.Provider.Events (subscriptionDiagnosticsSTM)
 import Hetoimasia.Scripting.Lua.Provider.State (EpochReport (..), diagnosticsSTM)
 import Hetoimasia.Scripting.Lua.Provider.Types
 import Hetoimasia.Scripting.Lua.Scheduled.Types (Control (controlProvider), ScheduledEndpoint (ScheduledEndpoint))
@@ -122,3 +163,12 @@ advanceRequestEpoch (ScheduledEndpoint control) = case controlProvider control o
 -- with none.
 requestDiagnostics ∷ ScheduledEndpoint → STM (Maybe ProviderDiagnostics)
 requestDiagnostics (ScheduledEndpoint control) = traverse diagnosticsSTM (controlProvider control)
+
+-- | A reading of the owner's subscriptions in one transaction, or 'Nothing' for an owner that
+-- was granted no request service or no subscriptions: the subscriptions live, the places they
+-- and their providers' unfinished retirements hold, the events held for ticks, each
+-- subscription's counters and every refusal, counted by what refused it.
+subscriptionDiagnostics ∷ ScheduledEndpoint → STM (Maybe SubscriptionDiagnostics)
+subscriptionDiagnostics (ScheduledEndpoint control) = case controlProvider control of
+  Just service | not (null (psEvents service)) → Just <$> subscriptionDiagnosticsSTM service
+  _ → pure Nothing

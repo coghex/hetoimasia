@@ -152,7 +152,7 @@ deliverEvent instances gate owner identity source payload = do
                 else do
                   tick ← gateTick gate
                   let sequenceNumber = isNextSequence state
-                      queued = QueuedEvent source sequenceNumber tick payload
+                      queued = QueuedEvent source sequenceNumber tick payload Nothing
                   writeTVar (icState cell) $
                     state
                       { isQueue = isQueue state |> queued

@@ -98,6 +98,34 @@
 -- A callback is handed its instance's @self@ and the event, a table with the fields
 -- @source@, @sequence@, @tick@ and @payload@.
 --
+-- = Provider events (subscriptions)
+--
+-- An owner granted subscriptions ('Hetoimasia.Scripting.Lua.Provider.SubscriptionGrant', over
+-- its request service) offers provider event endpoints. An instance subscribes a function to
+-- an endpoint it was granted ('instanceGrants' names endpoints beside sources) through
+-- @api.subscribe(endpoint, callback)@, which answers a handle, and ends the subscription with
+-- @api.unsubscribe(handle)@. The subscription is the instance's, beside its connections: it
+-- survives the invocation that made it and every callback after it, and every way the instance
+-- ends revokes it, with the provider told once and the instance's stop completing only when
+-- the provider has proved its retirement.
+--
+-- A provider delivers from any thread, through the feed it was handed, without blocking and
+-- without entering Lua. A delivery takes a place in the instance's queue, with the sequence
+-- admission gave it and the logical tick it was admitted at, and the owner looks up the live
+-- callback when it services it; the callback is handed the same record a connection's is, with
+-- the endpoint as @source@ and the subscription's number as @subscription@. A delivery to a
+-- subscription that has ended is refused and counted, and never run. Overload is stated per
+-- endpoint: ordered events are refused when the queue has no place and never evicted, and
+-- replaceable state keeps one unstarted delivery per subscription, replaced in place (keeping
+-- its place in the queue) by a later value until the callback's first segment begins, after
+-- which the value is the callback's and immutable.
+--
+-- On an owner driven by logical time, the application assigns each delivery the tick whose
+-- boundary admits it and its place among the deliveries due then; the owner admits them at
+-- that boundary, after the controls and before any task the tick woke, in the order of the
+-- places and never in arrival order, and the grant that reached the tick waits until what was
+-- admitted has begun or cannot. Owners on elapsed time admit on arrival.
+--
 -- = Cadence
 --
 -- An instance is admitted with no periodic interval ('EventOnly', 'RunOnce'), or as
@@ -422,7 +450,8 @@ import Hetoimasia.Scripting.Lua.Instance.Types
 import Hetoimasia.Scripting.Lua.Internal.Value (Context (..), VmIdentity (VmIdentity), checkLimits, conformValue)
 import Hetoimasia.Scripting.Lua.Runtime.Shared (compact, compactName, compactRef, refuseCallbackWait)
 import Hetoimasia.Scripting.Lua.Runtime.Types (Payload (WithinBounds))
-import Hetoimasia.Scripting.Lua.Scheduled.Types (Control (controlInstances, controlLabel, controlLimits, controlOwner), ScheduledEndpoint (ScheduledEndpoint))
+import Hetoimasia.Scripting.Lua.Provider.Types (ProviderState (psEvents))
+import Hetoimasia.Scripting.Lua.Scheduled.Types (Control (controlInstances, controlLabel, controlLimits, controlOwner, controlProvider), ScheduledEndpoint (ScheduledEndpoint))
 import Hetoimasia.Scripting.Lua.Scheduler (ControlResult)
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VRecord, VText))
 
@@ -434,15 +463,17 @@ admitInstance (ScheduledEndpoint control) request = case controlInstances contro
   Nothing → pure InstanceAdmissionClosed
   Just instances → do
     -- What the owner keeps is copied to buffers of its own, and cut as the routing
-    -- strings of a task are; the grants are only the owner's own sources, once each.
+    -- strings of a task are; the grants are only the owner's own sources and the provider event
+    -- endpoints it offers, once each.
     kept ← evaluate (compacted instances)
     atomically (State.admitInstance instances (gateOf control) (controlOwner control) kept)
   where
+    offered grant = maybe False (Map.member grant . psEvents) (controlProvider control)
     compacted instances =
       request
         { instanceModule = compactRef (instanceModule request)
         , instanceName = compactName <$> instanceName request
-        , instanceGrants = nub [grant | grant ← map compactName (instanceGrants request), Map.member grant (insSources instances)]
+        , instanceGrants = nub [grant | grant ← map compactName (instanceGrants request), Map.member grant (insSources instances) || offered grant]
         }
 
 -- | Deliver an event to the function an instance connected to a source, without
