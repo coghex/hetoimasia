@@ -8,6 +8,7 @@ import qualified Test.LuaRuntime.Instance.Boundary
 import qualified Test.LuaRuntime.Instance.ExitKind
 import qualified Test.LuaRuntime.Instance.Matrix
 import qualified Test.LuaRuntime.Instance.Sweep
+import qualified Test.LuaRuntime.Instance.Cadence
 import qualified Test.LuaRuntime.Instance.Capacity
 import qualified Test.LuaRuntime.Instance.Control
 import qualified Test.LuaRuntime.Instance.Determinism
@@ -23,6 +24,7 @@ spec = describe "the script instances" $ do
   Test.LuaRuntime.Instance.ExitKind.spec
   Test.LuaRuntime.Instance.Matrix.spec
   Test.LuaRuntime.Instance.Sweep.spec
+  Test.LuaRuntime.Instance.Cadence.spec
   Test.LuaRuntime.Instance.Capacity.spec
   Test.LuaRuntime.Instance.Control.spec
   Test.LuaRuntime.Instance.Determinism.spec

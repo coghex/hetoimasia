@@ -715,7 +715,7 @@ instanceSegment ih run number starting = do
           handles ← readIORef (ihHandles ih)
           case Map.lookup (icModule cell) handles of
             Nothing → pure (Left (ErrorFault (ModuleNotLoaded (icModule cell))))
-            Just handle → begin $ withRunning ih number (startTaskVia (ownedHost (ihOwned ih)) (ihDriver ih) "run" handle "run" [slot])
+            Just handle → begin $ withRunning ih number (startTaskVia (ownedHost (ihOwned ih)) (ihDriver ih) "run" handle "run" [slot, VInteger (-1)])
         Just InvokeUpdate → do
           handles ← readIORef (ihHandles ih)
           case Map.lookup (icModule cell) handles of
@@ -725,7 +725,7 @@ instanceSegment ih run number starting = do
               -- or is delayed by changes it.
               updateDelta ih cell >>= \case
                 Left why → pure (Left (ErrorCadence why))
-                Right nanoseconds → begin $ withRunning ih number (startTaskVia (ownedHost (ihOwned ih)) (ihDriver ih) "update" handle "update" [slot, VInteger nanoseconds])
+                Right nanoseconds → begin $ withRunning ih number (startTaskVia (ownedHost (ihOwned ih)) (ihDriver ih) "run" handle "update" [slot, VInteger nanoseconds])
         Nothing → do
           held ← Map.lookup (runTask run) <$> readIORef (ihTasks ih)
           case held of
@@ -937,8 +937,11 @@ serveFiring ih (CadenceKey number, firing) = withCell ih number $ \cell → do
     FiredLogical tick → do
       -- A logical point makes an update due only if it finds the instance serving and
       -- with no invocation active, whatever the invocation is and wherever it waits:
-      -- otherwise it adds nothing, and the grant it held is let go.
-      let free = isNothing (isActive state) && isNothing (isPending state) && isUpdate state == UpdateNone && not (isUpdateRunning state)
+      -- otherwise it adds nothing, and the grant it held is let go. An invocation that
+      -- is active has begun and not finished; one admitted and not yet begun is still
+      -- queued, and the update falls due behind it.
+      let begun = isJust (isActive state) && isNothing (isPending state) && not (admittedUpdate state)
+          free = not begun && isUpdate state == UpdateNone
       if accepting && free
         then markDue >> dispatch ih cell
         else atomically (releaseCadenceHold (scheduler' ih) (cadenceKey cell))
@@ -955,6 +958,12 @@ serveFiring ih (CadenceKey number, firing) = withCell ih number $ \cell → do
           Nothing → unrepresentable "the deadline the next update is due at is not representable"
           Just next → atomically (armElapsedCadence (scheduler' ih) (cadenceKey cell) next)
         _ → pure ()
+
+-- | Whether the update is the invocation in flight and has not begun.
+admittedUpdate ∷ IState → Bool
+admittedUpdate state = case isUpdate state of
+  UpdateAdmitted _ → True
+  _ → False
 
 -- | Let go of the grants that logical instances' due updates hold when those updates
 -- can no longer run in their ticks. The instances whose points were served just now are

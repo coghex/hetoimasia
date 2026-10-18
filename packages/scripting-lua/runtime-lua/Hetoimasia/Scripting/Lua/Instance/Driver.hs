@@ -77,8 +77,10 @@ driverSource sources =
         [ entry "create" [SInteger]
         , entry "release" [SInteger]
         , entry "init" [SInteger]
-        , entry "run" [SInteger]
-        , entry "update" [SInteger, SInteger]
+        , -- The one entry point both a one-shot's @run@ and a periodic @update@ go
+          -- through: the instance's number, and the delta an update is handed, or a
+          -- negative one for a @run@, which is handed the instance's api instead.
+          entry "run" [SInteger, SInteger]
         , entry "shutdown" [SInteger, SText]
         ]
           <> [ entry (eventEntry (sourceName source)) [SInteger, eventSchema source]
@@ -150,14 +152,13 @@ luaBody =
   , "  hook(record.self, record.api)"
   , "end"
   , ""
-  , "function run(hook, slot)"
+  , "function run(hook, slot, dt)"
   , "  local record = find(slot)"
-  , "  hook(record.self, record.api)"
-  , "end"
-  , ""
-  , "function update(hook, slot, dt)"
-  , "  local record = find(slot)"
-  , "  hook(record.self, dt)"
+  , "  if dt < 0 then"
+  , "    hook(record.self, record.api)"
+  , "  else"
+  , "    hook(record.self, dt)"
+  , "  end"
   , "end"
   , ""
   , "function shutdown(hook, slot, reason)"
