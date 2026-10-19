@@ -15,16 +15,7 @@ import Control.Exception (throwIO, try)
 import Control.Monad (forM_)
 import Data.List (isPrefixOf, tails)
 import Data.Maybe (mapMaybe)
-import qualified Data.Text as Text
-import Hetoimasia.Console.Exit (cancellationExitCode, exitOnFailure, failureExitCode)
-import Hetoimasia.Foundation.Log
-  ( LogVariables (..)
-  , variableComponentLevels
-  , variableDebug
-  , variableGlobalLevel
-  )
-import System.Directory (findExecutable)
-import System.Environment (getEnvironment)
+import Hetoimasia.Console.Exit (cancellationExitCode, exitOnFailure, failureExitCode, usageExitCode)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess), exitWith)
 import System.IO (hClose)
 import System.Process
@@ -32,10 +23,14 @@ import System.Process
   , StdStream (UseHandle)
   , createPipe
   , proc
-  , readCreateProcessWithExitCode
   , waitForProcess
   , withCreateProcess
   )
+import qualified Test.Engine.Console.Lua.Options as LuaOptions
+import qualified Test.Engine.Console.Lua.Process as LuaProcess
+import qualified Test.Engine.Console.Lua.Signals as LuaSignals
+import qualified Test.Engine.Console.Lua.Status as LuaStatus
+import Test.Engine.Console.Support (consoleExecutable, consoleVariableNames, controlledEnvironment, runConsole)
 import Test.Hspec
   ( Spec
   , describe
@@ -48,14 +43,23 @@ import Test.Hspec
   )
 
 spec ∷ Spec
-spec = describe "Console" $ describe "Console startup" $ do
+spec = describe "Console" $ do
+  startup
+  describe "Lua" $ do
+    LuaOptions.spec
+    LuaStatus.spec
+    LuaSignals.spec
+    LuaProcess.spec
+
+startup ∷ Spec
+startup = describe "Console startup" $ do
   it "emits the smoke records under the default configuration" testConsoleDefault
   it "applies a threshold and an exact override to the smoke path" testConsoleThreshold
   it "emits the owned-resource lifecycle records on the resource-smoke path"
     testConsoleResourceSmoke
   it "silences the resource-smoke path at a warn threshold"
     testConsoleResourceSmokeThreshold
-  it "rejects an unknown argument with a usage line naming both smoke paths"
+  it "rejects an unknown argument with status 2 and a usage line naming both smoke paths and lua"
     testConsoleUnknownArgument
   it "fails before any entry for each invalid variable" testConsoleInvalid
   it "keeps a forged value from splitting the diagnostic" testConsoleForgedValue
@@ -65,59 +69,18 @@ spec = describe "Console" $ describe "Console startup" $ do
     it "maps a cancellation to the cancellation status" testExitCancellation
     it "passes an explicit exit status through unchanged" testExitPassthrough
 
--- | The variable names the console application chooses.
-consoleVariables ∷ LogVariables
-consoleVariables = LogVariables
-  { variableGlobalLevel = "HETOIMASIA_LOG_LEVEL"
-  , variableComponentLevels = "HETOIMASIA_LOG_LEVELS"
-  , variableDebug = "HETOIMASIA_DEBUG"
-  }
-
--- | The three variable names the console application reads, as the environment
--- spells them.
-consoleVariableNames ∷ [String]
-consoleVariableNames =
-  map Text.unpack
-    [ variableGlobalLevel consoleVariables
-    , variableComponentLevels consoleVariables
-    , variableDebug consoleVariables
-    ]
-
--- | Run the built console executable with exactly the logging variables a case
--- asks for: the inherited environment is stripped of all three first, so an
--- inherited value can neither defeat a quiet run nor fail a default one. The
--- executable is reached through this suite's @build-tool-depends@ on it rather
--- than a guessed build path.
-runConsole ∷ [(String, String)] → [String] → IO (ExitCode, String, String)
-runConsole variables arguments = do
-  found ← findExecutable "hetoimasia"
-  case found of
-    Nothing → fail "the hetoimasia executable is not on this test's search path"
-    Just executable → do
-      inherited ← getEnvironment
-      let controlled =
-            [ pair | pair@(name, _) ← inherited, name `notElem` consoleVariableNames ]
-              <> variables
-      readCreateProcessWithExitCode
-        (proc executable arguments) { env = Just controlled }
-        ""
-
 -- | Run the built console executable with its stderr on a pipe whose reading end
 -- is already closed, so the first diagnostic write fails in the child.
 runConsoleWithBrokenStderr ∷ [String] → IO ExitCode
 runConsoleWithBrokenStderr arguments = do
-  found ← findExecutable "hetoimasia"
-  case found of
-    Nothing → fail "the hetoimasia executable is not on this test's search path"
-    Just executable → do
-      inherited ← getEnvironment
-      (reading, writing) ← createPipe
-      hClose reading
-      let controlled = [pair | pair@(name, _) ← inherited, name `notElem` consoleVariableNames]
-      -- The process library closes the writing end in this process once the
-      -- child has it.
-      withCreateProcess (proc executable arguments) { env = Just controlled, std_err = UseHandle writing } $
-        \_ _ _ child → waitForProcess child
+  executable ← consoleExecutable
+  controlled ← controlledEnvironment []
+  (reading, writing) ← createPipe
+  hClose reading
+  -- The process library closes the writing end in this process once the
+  -- child has it.
+  withCreateProcess (proc executable arguments) { env = Just controlled, std_err = UseHandle writing } $
+    \_ _ _ child → waitForProcess child
 
 -- | The component of each rendered record, which is its third segment. A line
 -- that is not a record is kept whole so a failure shows it.
@@ -216,11 +179,12 @@ testConsoleResourceSmokeThreshold = do
 testConsoleUnknownArgument ∷ IO ()
 testConsoleUnknownArgument = do
   (code, output, diagnostics) ← runConsole [] ["--resources"]
-  code `shouldNotBe` ExitSuccess
+  code `shouldBe` usageExitCode
   output `shouldBe` ""
   diagnostics `shouldContain` "Usage: hetoimasia"
   diagnostics `shouldContain` "--smoke"
   diagnostics `shouldContain` "--resource-smoke"
+  diagnostics `shouldContain` "lua"
 
 testConsoleInvalid ∷ IO ()
 testConsoleInvalid = forM_ invalid $ \(name, value) → do
@@ -265,6 +229,9 @@ testConsoleHelp = do
   -- also runs as a child process below.
   output `shouldContain` "--smoke"
   output `shouldContain` "--resource-smoke"
+  -- The lua subcommand and the exit statuses are listed too.
+  output `shouldContain` "lua OPTIONS"
+  output `shouldContain` "130"
   forM_ consoleVariableNames (shouldContain output)
   -- The help path resolves configuration first, so an invalid value fails it
   -- too, printing no help at all.

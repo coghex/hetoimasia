@@ -25,6 +25,10 @@ extra-doc-files:
     tools/README.md
     tools/KANBAN-LICENSE
 extra-source-files:
+    test/lua-examples/controller.lua
+    test/lua-examples/looped.lua
+    test/lua-examples/oneshot.lua
+    test/lua-examples/watcher.lua
     .github/workflows/ci-image.yml
     .github/workflows/review-gate.yml
     .github/workflows/validation.yml
@@ -88,8 +92,19 @@ library console
     hs-source-dirs: console
     exposed-modules:
         Hetoimasia.Console.Exit
+        Hetoimasia.Console.Lua
+        Hetoimasia.Console.Lua.Options
+        Hetoimasia.Console.Lua.Signals
+        Hetoimasia.Console.Lua.Status
     build-depends:
-        base >=4.22 && <4.23
+        base >=4.22 && <4.23,
+        filepath >=1.5 && <1.6,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        unix >=2.8 && <2.9,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-scripting-lua:runtime-lua
 
 executable hetoimasia
     import: language
@@ -100,8 +115,11 @@ executable hetoimasia
         base >=4.22 && <4.23,
         hetoimasia:console,
         text >=2.1 && <2.2,
+        unix >=2.8 && <2.9,
         hetoimasia-foundation ==0.1.0.0,
-        hetoimasia-runtime ==0.1.0.0
+        hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-scripting-lua,
+        hetoimasia-scripting-lua:runtime-lua
 
 test-suite workflow-tests
     import: language
@@ -169,13 +187,48 @@ test-suite hetoimasia-tests
     other-modules:
         Test.Engine.Spec
         Test.Engine.Console.Spec
+        Test.Engine.Console.Support
+        Test.Engine.Console.Lua.Options
+        Test.Engine.Console.Lua.Process
+        Test.Engine.Console.Lua.Signals
+        Test.Engine.Console.Lua.Status
     ghc-options: -threaded -rtsopts
     build-tool-depends: hetoimasia:hetoimasia
     build-depends:
         base >=4.22 && <4.23,
         directory >=1.3 && <1.4,
+        filepath >=1.5 && <1.6,
         hetoimasia:console,
         hspec >=2.11 && <3,
         process >=1.6 && <1.7,
+        stm >=2.5.3 && <2.6,
+        temporary >=1.3 && <1.4,
         text >=2.1 && <2.2,
-        hetoimasia-foundation ==0.1.0.0
+        unix >=2.8 && <2.9,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-scripting-lua:runtime-lua,
+        hetoimasia-test-support ==0.1.0.0
+
+-- The forced exit of the lua subcommand, which needs a script whose shutdown never
+-- returns: an optional local probe, never selected by affected inputs. It shares the
+-- console examples' process support, so no source file is duplicated.
+test-suite lua-forced-exit-probe
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: probe test
+    other-modules:
+        Test.Engine.Console.Support
+    ghc-options: -threaded -rtsopts
+    build-tool-depends: hetoimasia:hetoimasia
+    build-depends:
+        base >=4.22 && <4.23,
+        directory >=1.3 && <1.4,
+        filepath >=1.5 && <1.6,
+        hspec >=2.11 && <3,
+        process >=1.6 && <1.7,
+        temporary >=1.3 && <1.4,
+        text >=2.1 && <2.2,
+        unix >=2.8 && <2.9,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-test-support ==0.1.0.0
