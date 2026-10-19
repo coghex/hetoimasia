@@ -3132,8 +3132,8 @@ being admitted are produced after admission is complete, after every *started*; 
 completed; on an elapsed VM an end is produced when the run sees it. Events produced together are in ascending TID order. An event reaches only the subscriptions that
 exist when it is produced, and nothing is replayed to a later subscriber. One event is delivered once to each such subscription, in ascending order of the subscription's
 number, so several deliveries can go to one instance. On a tick VM every *delivery* is assigned the first tick the owner has not begun and a place of its own (a sequence that
-increases in production order and then recipient order; a place is unique across the owner); on an elapsed VM each is made on arrival. No event is produced once the orderly
-stop has begun.
+increases in production order and then recipient order; a place is unique across the owner); on an elapsed VM each is made on arrival. The ends instances have earned are produced, and counted, once the owner is quiet and before the run ends by every instance having ended or by the tick limit, even when no later tick can deliver them; no event is produced once the orderly
+stop (the stop request, the duration limit, the owner's exit) has begun.
 
 **Overload and defects.** Every answer to a delivery is classified by one pure function (`classifyAnswer`) and none is dropped without being counted. Admitted or staged:
 delivered (a staged one can still fail at its tick). Refused when offered because the queue is full (`EventQueueFull`, on an elapsed owner) or the staging store is full
