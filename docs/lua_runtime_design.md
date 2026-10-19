@@ -8,11 +8,11 @@ failure evidence, and lifetime. This is the canonical continuation of
 
 Design state: `ready for issue processing`
 
-Current readiness scope: none open. LUA-19 (D-41), delivered by D-42 as LUA-27
+Current readiness scope: **LUA-8 only** (D-45), with D-44 fixing its consumer,
+intentions, UI-progress proof and gameplay randomness. LUA-19 (D-41), delivered by D-42 as LUA-27
 (#492, PR #495), LUA-28 (#493, PR #496) and a narrowed LUA-19 (#494, PR #497),
 is delivered, with D-40, D-42 and D-43 fixing the runner's clock, ending, event
-source, overload and exit statuses. LUA-8 is next on the trusted path and needs
-its own readiness renewal. LUA-7 (D-37), split by D-38 into
+source, overload and exit statuses. LUA-7 (D-37), split by D-38 into
 LUA-7 (requests) and LUA-26 (subscriptions), is delivered, with D-36 and D-39
 fixing when a deterministic owner's Lua sees an asynchronous result or provider
 event. LUA-6 (with LUA-20 and LUA-21, D-28/D-29) and LUA-18 (with LUA-22, LUA-23,
@@ -187,7 +187,7 @@ concrete precondition
 - [x] LUA-27. Run Lua sources to completion through a reusable runner — [#492]
 - [x] LUA-28. Drive the runner on logical ticks and publish instance start and end events — [#493]
 - [x] LUA-19. Run script instances through a headless command-line entry — [#494]
-- [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly — [deferred]: owner renews trusted-path readiness for this slice
+- [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly
 - [ ] LUA-9. Add bounded child-process transport and owned process lifetime — [deferred]: Q-5 successful Linux and macOS confinement verdicts
 - [ ] LUA-10. Establish Linux mod-process confinement — [deferred]: Q-5 successful Linux and macOS confinement verdicts
 - [ ] LUA-11. Establish macOS mod-process confinement — [deferred]: Q-5 successful Linux and macOS confinement verdicts
@@ -1274,6 +1274,77 @@ Rejected: a runner capacity invariant that makes the post-staging overflow
 impossible under every permitted subscription pattern (hard to prove, and it
 would limit what scripts may subscribe to), and changing LUA-26 to count the
 post-staging overflow instead (reopens #483's merged contract).
+
+### D-44. The two-domain consumer, its intentions, progress proof and randomness
+
+Owner decisions, 2026-10-19, in the hetoimasia manager pane (request
+`user-het-lua8-20261019-2029`), on the four design gaps the LUA-8 readiness
+check found at `master@d9c4bc5d`:
+
+- **Consumer ("Separate example program").** LUA-8's consumer is a small
+  application-owned sample under `samples/` (as the graphics samples are), with
+  its own executable, tests and reproduction command. It composes a UI VM owner
+  and a gameplay VM owner directly from the library's public APIs. No engine
+  library or the `hetoimasia` executable depends on it (D-2, P-1). Rejected: a
+  consumer only inside `lua-runtime-tests` (no runnable program), and extending
+  the LUA-19 runner to two VMs (new runner scope near D-21's VM-group exclusion,
+  and demo-game concepts in the engine's command).
+- **Intentions ("Accepted when queued, applies next tick").** A UI intention is
+  answered "accepted" only once the gameplay owner's bounded intention queue
+  has taken it for the next unstarted gameplay tick. A full queue answers
+  `full` at once; an accepted intention is never dropped afterwards
+  (exactly-once). At its tick, gameplay revalidates it against the current
+  authoritative state (P-2); a stale intention is rejected there, and the
+  rejection is visible in the next committed snapshot. Rejected: a pending
+  handle whose acceptance is known only after application.
+- **UI-progress proof ("Barrier binding + CPU run").** Two proofs, with no new
+  host mechanism: a test binding holds gameplay inside a running segment while
+  the UI must complete a set number of updates (deterministic), and a separate
+  pure-Lua CPU-bound gameplay run must still let the UI make progress before
+  gameplay reports completion. The verification strategy's instruction-hook
+  latch is not used: the host removed `debug.sethook`. Rejected: reintroducing a
+  host instruction-count hook.
+- **Randomness ("App-owned seeded stream").** The gameplay VM gets an
+  application-owned random binding seeded per gameplay session (D-23's "owned
+  seeded random streams"); `math.random` and `math.randomseed` are removed from
+  the gameplay VM so nothing bypasses it. The UI VM keeps `math.random`.
+  Rejected: seeding `math.random` at session start (a script that reseeds breaks
+  determinism).
+
+### D-45. Renew LUA-8 readiness and delegate it through approval
+
+Owner request, 2026-10-19, in the hetoimasia manager pane: "help me get LUA-8
+turned into issues" (request `user-het-lua8-20261019-2029`), after LUA-19's
+delivery (D-41/D-42). The readiness check at `master@d9c4bc5d`:
+
+- Every dependency is delivered: LUA-6, LUA-18, LUA-22, LUA-23, LUA-24, LUA-7,
+  LUA-26, LUA-27, LUA-28 and LUA-19 (#468, #472–#475, #482, #483, #492–#494).
+- The merged library supplies the engine side: binding kinds including
+  `commandIntention` and `snapshotQuery` with per-path exposure (D-14),
+  per-owner policy, latest-value snapshots with revisions
+  (`Foundation.Messaging.Snapshot`), the per-segment observation point
+  (`scheduledObserve`), explicit grants (`grantScheduledStep`), tick-assigned
+  provider events (D-36/D-39), cross-owner lifecycle grants and failure
+  escalation. The consumer's game state, staging and commit, intention queue
+  and revalidation, canonical digest, failed-session status and fake input are
+  new application code.
+- D-44 settles the four open choices. Readings the manager takes as organization
+  (D-25), not new product decisions: D-7 is realized as a quiescent failed
+  gameplay session, as P-8 prefers (the owner stays alive with grants and
+  intentions closed, publishing the failure beside the last good snapshot), and
+  any gameplay instance failure fails the session; D-23's qualification replays a
+  scripted, tick-assigned input log while execution delays and UI activity vary,
+  comparing canonical state digests at tick boundaries; profiling workloads are
+  an optional probe group, never a CI timing gate (P-11); the macOS record is the
+  solver's local acceptance run recorded in the PR, with Linux CI as the
+  evidence for race windows.
+- The open tracker holds epic #145 and the unrelated #446, with no LUA-8 child or
+  duplicate.
+
+D-45 renews trusted readiness for LUA-8 only. The owner asks for it to be
+processed into issues and canonically approved; splitting is delegated (D-25)
+and adds no scope. The confined branch stays on Q-5. Readiness is not
+implementation approval beyond that request.
 
 ## Design
 
@@ -2392,7 +2463,8 @@ both real interpreters with substantial finite Lua work and verify UI progress
 before the gameplay work is allowed to report completion. A binding-level
 instruction-hook latch can establish overlap for that test, but may itself
 change progress; retain a separate no-hook CPU-work experiment when assessing
-latency. Use generous outer test timeouts only as deadlock guards and put
+latency. (D-44: the host removed `debug.sethook`, so LUA-8 uses a barrier
+binding and the separate no-hook CPU-bound run instead of a hook latch.) Use generous outer test timeouts only as deadlock guards and put
 performance distributions in optional probes, not fragile millisecond CI gates.
 Record threaded-RTS flags, binding/version, workload, and what each check proves.
 
@@ -3261,7 +3333,8 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-8. Prove independent trusted UI and gameplay execution headlessly
 
-> Deferred: owner renews trusted-path readiness for this slice. The 2026-10-15 narrow renewal covers LUA-2 and LUA-3 only.
+> Ready for issue processing under D-45. Its dependencies are delivered, and D-44
+> fixes its consumer, intentions, UI-progress proof and gameplay randomness.
 
 - **Outcome:** the trusted system milestone demonstrates responsive first-party
   Lua UI during busy finite gameplay, with independent in-process VMs, coherent
@@ -3270,12 +3343,13 @@ and verified policy, with adversarial regression coverage.
 - **Scope:** a small application-owned consumer with two domains, intentions,
   explicit gameplay grants and staged snapshot commit; P-2/P-8 policy and P-12
   real-interpreter acceptance; reproduction commands and bounded optional
-  profiling workloads delivered in the same PR.
+  profiling workloads. D-44 places the consumer in `samples/` and fixes its
+  intention, progress-proof and randomness rules; D-25 governs splitting.
 - **Phase:** trusted integrated acceptance.
 - **Depends on:** LUA-6, LUA-18, LUA-22, LUA-23, LUA-24, LUA-7, LUA-26, LUA-27, LUA-28, LUA-19.
 - **Ordering:** after instance/provider/runner delivery, independent of Q-5;
   no Vulkan or GLFW dependency.
-- **Relevant decisions:** D-1, D-2, D-3, D-4, D-7, D-12, D-13, D-14.
+- **Relevant decisions:** D-1, D-2, D-3, D-4, D-7, D-12, D-13, D-14, D-15, D-23, D-24, D-26, D-27, D-36, D-39, D-44, D-45.
 - **Acceptance signals:** UI makes progress before gameplay completes; no shared
   VM/global state; coherent old/new views and exactly-once accepted intentions;
   explicit overload, gameplay-session failure, and cleanup evidence. Demonstrate
@@ -3287,8 +3361,9 @@ and verified policy, with adversarial regression coverage.
   new game architecture, hard latency promises or a broad benchmark framework,
   mod admission and confinement proof (LUA-17). This milestone does not complete
   the epic.
-- **Open questions:** None once predecessor gates are satisfied; D-7 fixes
-  gameplay failure, not an implicit new transaction or save policy.
+- **Open questions:** None; D-44 settles the consumer's open choices and D-45
+  renews readiness. D-7 fixes gameplay failure, not an implicit new transaction
+  or save policy.
 
 ### LUA-9. Add bounded child-process transport and owned process lifetime
 
