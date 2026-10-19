@@ -45,8 +45,13 @@
 -- publish readiness, and only then does creation return an endpoint. Readiness is
 -- awaited through 'awaitSupervised' composed with the worker's terminal outcome,
 -- never through the startup acknowledgement, so a failure of initialization ends
--- creation under the owner's 'WorkerPolicy'. A creator whose wait is abandoned
--- asks the owner to stop and leaves nothing behind.
+-- creation under the owner's 'WorkerPolicy'. A creator whose wait fails or is abandoned
+-- asks the owner to stop and leaves nothing behind: creation returns or raises only once
+-- the worker it started has ended (its raw completion, which supervision's latch of
+-- another worker's failure does not shorten), however many times the wait is interrupted
+-- meanwhile, and then raises what happened in order, a cancellation as itself and the
+-- rest as evidence beside it. A script held in a module's top level keeps creation
+-- pending, as a held segment keeps the worker (D-27).
 --
 -- = Identity
 --
@@ -287,7 +292,7 @@ module Hetoimasia.Scripting.Lua.Scheduled
   ) where
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
-import Control.Exception (ExceptionWithContext, SomeException, evaluate, mask, mask_, onException)
+import Control.Exception (ExceptionWithContext, SomeException, evaluate, mask, mask_, rethrowIO, tryWithContext)
 import Control.Monad (forM, forM_, join, when)
 import Data.Foldable (toList, traverse_)
 import Data.Maybe (isJust)
@@ -356,6 +361,7 @@ import Hetoimasia.Scripting.Lua.Provider.Types (EventEndpoint (..), RequestGrant
 import Hetoimasia.Scripting.Lua.Request (requestContextOf)
 import Hetoimasia.Scripting.Lua.Lending.Loan (Lending, bindLending, sameLending)
 import Hetoimasia.Scripting.Lua.Scheduled.Run (runScheduledOwner)
+import Hetoimasia.Scripting.Lua.Scheduled.Shared (awaitWorkerEnded, propagateAll)
 import Hetoimasia.Scripting.Lua.Scheduled.Types
 import Hetoimasia.Scripting.Lua.Scheduler
   ( AdmitAnswer (Admitted, AdmitRefused)
@@ -623,9 +629,18 @@ startScheduledOwner runtime spec = do
       WorkerStartRejected → pure ScheduledRejected
       WorkerStartUnavailable _ failure → pure (ScheduledUnavailable failure)
       WorkerStarted worker → do
-        ready ←
-          restore (awaitSupervised (runtimeControl runtime) (readiness handoff worker))
-            `onException` stopSupervised worker
+        waited ← tryWithContext @SomeException (restore (awaitSupervised (runtimeControl runtime) (readiness handoff worker)))
+        -- A wait that failed or was abandoned leaves nothing behind: the worker is asked to stop and
+        -- waited for until it has ended, whatever interrupts that wait, as the retirement of an owner is,
+        -- before the failure that abandoned the wait propagates. A creator cannot be handed back an
+        -- exception while the worker it started still runs Lua, with what it was created over.
+        ready ← case waited of
+          Right found → pure found
+          Left failure → do
+            stopSupervised worker
+            interruptions ← awaitWorkerEnded restore worker
+            propagateAll (failure : interruptions)
+            rethrowIO failure
         case ready of
           Just held → do
             live ← atomically (admitting held)

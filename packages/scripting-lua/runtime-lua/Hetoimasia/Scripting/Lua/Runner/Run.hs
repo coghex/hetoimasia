@@ -21,7 +21,7 @@ module Hetoimasia.Scripting.Lua.Runner.Run
 
 import Control.Concurrent.MVar (newMVar, withMVar)
 import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, readTVar, retry, writeTVar)
-import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, fromException, mask, rethrowIO, throwIO, tryWithContext)
+import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, fromException, mask, rethrowIO, throwIO, tryWithContext)
 import Control.Monad (forM, forM_, void)
 import Data.List (elemIndex)
 import qualified Data.List.NonEmpty as NonEmpty
@@ -34,7 +34,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Log (Component, logInfo, unsafeComponent, withFields)
-import Hetoimasia.Foundation.Resource (composeCleanup, withResource)
+import Hetoimasia.Foundation.Resource (withResource)
 import Hetoimasia.Foundation.Worker (awaitCompletion)
 import Hetoimasia.Foundation.Time (Instant, addDuration, deadlineReached, readInstant, zeroDuration)
 import Hetoimasia.Runtime.Supervision
@@ -97,6 +97,7 @@ import Hetoimasia.Scripting.Lua.Runner.Output (outputChunk, outputNamespace, out
 import Hetoimasia.Scripting.Lua.Runner.Render
 import Hetoimasia.Scripting.Lua.Runner.Source (ReadProblem (..), defaultName, distinctPaths, moduleRefFor, readSources)
 import Hetoimasia.Scripting.Lua.Runner.Types
+import Hetoimasia.Scripting.Lua.Scheduled.Shared (awaitWorkerEnded, propagateAll)
 import Hetoimasia.Scripting.Lua.Runtime.Shared (LuaRuntime (runtimeControl))
 import Hetoimasia.Scripting.Lua.Scheduled
   ( ScheduledEndpoint
@@ -348,31 +349,25 @@ vmText = bounded columnLimit . runnerName
 -- closed and every instance settled), which supervision's latch of a failure never makes unavailable, so
 -- a failure another supervised worker latched cannot make the run propagate while the owner is still
 -- running: whoever the run's sinks and bindings are borrowed from cannot release them under Lua. The
--- wait is interruptible, because it is for arbitrary Lua segments and shutdown hooks: nothing about it
--- runs under an uninterruptible mask, a cancellation of the runner's thread reaches it, and what it
--- interrupts keeps the failure that was already propagating beside it. The failures themselves are the
--- body's and supervision's: waiting does not raise the owner's failure again, which supervision
--- delivers (to the next supervised wait, and at the boundary's exit beside the body's own).
+-- wait is for arbitrary Lua segments and shutdown hooks, so it is interruptible and never runs under
+-- an uninterruptible mask, but an interruption does not end it: each is recorded and the wait goes on
+-- until the worker has actually ended ('awaitWorkerEnded'), and then what happened is raised in order,
+-- a cancellation as itself and the rest beside it as evidence ('propagateAll'). The owner never outlives
+-- the call, however many times the runner's thread is interrupted; a segment that never returns keeps the
+-- call pending, as it keeps the worker (D-27). Creation is the same: 'startScheduledOwner' does not return
+-- or raise while the worker it started is alive. The failures themselves are the body's and supervision's:
+-- waiting does not raise the owner's failure again, which supervision delivers (to the next supervised
+-- wait, and at the boundary's exit beside the body's own).
 withStartedOwner ∷ LuaRuntime → ScheduledSpec → (ScheduledStart → IO a) → IO a
 withStartedOwner runtime spec body = mask $ \restore → do
   started ← startScheduledOwner runtime spec
   outcome ← tryWithContext @SomeException (restore (body started))
-  retired ← case started of
-    ScheduledStarted owner → do
-      retireScheduled owner
-      tryWithContext @SomeException (restore (awaitOwnerEnded owner))
-    _ → pure (Right ())
-  case (outcome, retired) of
-    (Right value, Right ()) → pure value
-    (Right _, Left interruption) → rethrowIO interruption
-    (Left failure, Right ()) → rethrowIO failure
-    -- Both failed. A cancellation that interrupted the wait is the one that propagates, as itself; any
-    -- other failure the body's came first and stays primary. Either way the other is kept whole.
-    (Left failure, Left interruption)
-      | asynchronous interruption → composeCleanup (Just interruption) [("script runner failure", failure)] >>= maybe (rethrowIO failure) rethrowIO
-      | otherwise → composeCleanup (Just failure) [("script runner retirement", interruption)] >>= maybe (rethrowIO failure) rethrowIO
-  where
-    asynchronous (ExceptionWithContext _ exception) = isJust (fromException exception ∷ Maybe SomeAsyncException)
+  interruptions ← case started of
+    ScheduledStarted owner → retireScheduled owner >> awaitWorkerEnded restore (scheduledSupervised owner)
+    _ → pure []
+  case outcome of
+    Right value → propagateAll interruptions >> pure value
+    Left failure → propagateAll (failure : interruptions) >> rethrowIO failure
 
 -- | Wait for the owner's worker to have ended, whatever supervision has latched: its raw completion.
 awaitOwnerEnded ∷ ScheduledOwner → IO ()
