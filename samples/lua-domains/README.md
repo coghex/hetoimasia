@@ -46,6 +46,10 @@ a handle into a VM; each owner's bindings borrow what they need and nothing else
 
 The UI never reads the committed world or the candidate; gameplay never reads the view or the snapshot.
 
+Every integer a script supplies is compared directly and never through `abs`, whose result for the minimum
+integer is itself negative: one check (`deltaWithin`) serves the admission of an intention and the staging of
+a move, and a move adds in `Integer` before it clamps, so no delta can wrap.
+
 ## The two owners
 
 `withDomains` creates one `LuaRuntime` and two scheduled owners, each with its own VM, standard
@@ -60,10 +64,17 @@ provides. The executable and the examples reach one through `runScopedApplicatio
   timer wake in the examples that move it by hand.
 
 Gameplay is started first and the UI second. Retirement runs in the opposite order, on every way out
-(`withDomains` runs it as the release): admission to the queue closes first, then the UI owner is
-retired and awaited (the producer of intentions and reader of snapshots is gone), then gameplay, then
-the snapshot's publication ends. A segment an owner is inside is let return: nothing is preempted.
-Each owner's exit record and its instance's settlement are read back (`Retirement`).
+(`withDomains`, `runSession`, or `retireDomains` itself): admission to the queue closes first, then the UI
+owner is retired and awaited (the producer of intentions and reader of snapshots is gone), then gameplay,
+then the snapshot's publication ends. Each wait is for the owner's worker to have *actually ended* (its raw
+completion), never for supervision's status: supervision latches one owner's fatal failure and wakes its own
+waits with it, which says nothing of the other owner, so a retirement that relied on it could leave an owner
+running a Lua segment when the call returned. The wait is not a resource release, so it is interruptible;
+an interruption is recorded and the wait goes on until both owners have ended, and then what happened is
+raised, a cancellation first. A segment an owner is inside is let return: nothing is preempted. The same
+protected wait retires an owner that came up when the other failed to start. Each owner's exit record and its
+instance's settlement are read back (`Retirement`), and when `withDomains` returns or raises, from inside
+the supervision boundary, neither owner is live.
 
 Grants start only after the owners' behaviors are active (`init` has run).
 

@@ -3410,7 +3410,9 @@ and verified policy, with adversarial regression coverage.
   facade in the UI's initial chunk, because the typed binding's schema faults a wrong arity or type past `pcall`; the
   bounds are answered by the binding. UI-path answers are `true`, `false, "full"`, `false, "closed"`,
   `false, "malformed"` and one fixed word per bound. The random stream is SplitMix64, fixed in `World.hs`. Both owners are
-  retired UI first, after the queue closes, and the snapshot's publication ends last. Test-only bindings reach an
+  retired UI first, after the queue closes, and the snapshot's publication ends last; each wait is for the worker's raw
+  completion (never supervision's status, which one owner's latched failure wakes while the other still runs Lua),
+  protected and interruptible, and so not a resource release. Test-only bindings reach an
   owner only through `DomainsConfig.configExtensions`, which the production configuration leaves empty. The two
   progress proofs are the barrier example and the CPU-bound example (sized from a calibration, asserted as an ordering
   of the UI's update count between the computation's start and its end). The library, the runner, the CI image and the
