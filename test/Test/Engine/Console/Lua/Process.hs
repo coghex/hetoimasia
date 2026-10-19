@@ -109,7 +109,9 @@ spec = describe "the lua subcommand, run as a process" $ do
         rest ← readRest child
         code `shouldBe` ExitFailure 130
         lines rest `shouldSatisfy` elem "looped: shutdown stopped"
-        seen `shouldSatisfy` elem "instances at start"
+        -- The start table may be written before or after the first update is printed, so it is looked for
+        -- in everything the child wrote, not only in what came before the marker.
+        (seen <> lines rest) `shouldSatisfy` elem "instances at start"
 
   describe "exits 1" $ do
     it "for an instance whose init fails, reporting it on stderr" $
