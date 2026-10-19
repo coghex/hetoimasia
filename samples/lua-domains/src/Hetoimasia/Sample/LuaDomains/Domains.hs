@@ -223,7 +223,8 @@ data DomainsDefect
   | -- | A grant was not accepted: the answer.
     TickNotGranted !Word64 !String
   | -- | The gameplay owner ended while the tick was outstanding. The owner's own failure, if it
-    -- failed, is supervision's to report and is retained beside this one.
+    -- failed, is supervision's to report: it is retained beside this one, or raised in its place if
+    -- supervision delivers it to the driver first.
     OwnerEndedDuringTick !Word64
   | -- | The tick completed without its work having finished successfully, so nothing was
     -- committed.

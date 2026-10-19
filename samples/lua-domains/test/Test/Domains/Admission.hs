@@ -59,7 +59,7 @@ spec = describe "tick assignment" $
           taken ← readTVar acceptedBy
           refused ← readTVar fulls
           when (null taken || refused == 0) retry
-        snapshots ← mapM (const (stepTick domains)) [1 .. ticks]
+        snapshots ← generous (mapM (const (stepTick domains)) [1 .. ticks])
         atomically (writeTVar stop True)
         sequence_ collectors
         accepted ← readTVarIO acceptedBy

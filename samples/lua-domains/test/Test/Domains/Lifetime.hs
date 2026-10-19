@@ -116,10 +116,13 @@ spec = describe "the owners' lifetime" $ do
             stepTick domains
     case outcome of
       Left failure → do
-        -- The driver says the owner ended with the tick outstanding; the owner's own failure is
-        -- supervision's, retained beside it with its type and message.
-        fromException (failure ∷ SomeException) `shouldBe` Just (OwnerEndedDuringTick 1)
-        map (displayException . failedException) (supervisedFailures failure) `shouldSatisfy` any ("the gameplay binding failed" `isInfixOf`)
+        -- Which of two supervised reports reaches the driver first is not fixed: the driver's own
+        -- statement that the owner ended with the tick outstanding, with the owner's failure retained
+        -- beside it, or the owner's failure itself. Either way the owner's failure, with its message,
+        -- is in what the boundary raised.
+        let evidence = displayException (failure ∷ SomeException) : map (displayException . failedException) (supervisedFailures failure)
+        any ("the gameplay binding failed" `isInfixOf`) evidence `shouldBe` True
+        (fromException failure == Just (OwnerEndedDuringTick 1) || "the gameplay binding failed" `isInfixOf` displayException failure) `shouldBe` True
       Right _ → expectationFailure "the tick committed"
     (domains, ui) ← readIORef captured >>= maybe (fail "the session never started") pure
     -- Neither owner is live, nothing was committed, and nothing is armed or admitted.

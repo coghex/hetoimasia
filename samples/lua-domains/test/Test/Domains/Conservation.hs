@@ -39,7 +39,7 @@ spec = describe "conservation of intentions" $ do
     withSample (\config → config {configInput = [], configBounds = bounds (configBounds config)}) $ \_ _ domains → do
       let shared = domainsShared domains
       answers ← newTVarIO []
-      snapshots ← forM [1 .. 30 ∷ Int] $ \_ → do
+      snapshots ← generous . forM [1 .. 30 ∷ Int] $ \_ → do
         current ← snapshotNow domains
         let versionOf index = entityVersion (Seq.index (worldEntities (snapWorld (fst current))) index)
             submitted =
