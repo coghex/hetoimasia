@@ -4,27 +4,42 @@
 -- back. Covered through the public interfaces of the request service, the subscription service
 -- (both through 'ProviderWork') and the leases ('retireAsynchronously').
 --
--- Each reading is counted on every execution, so that an example knows the pending answer was
--- polled before it lets the provider complete, and that the complete answer was polled after.
--- Nothing sleeps.
+-- A sentinel that is unchanged proves nothing until a transaction that polled the reading has
+-- committed: a write is invisible to everyone until then, kept or not. So no example looks at
+-- the sentinel on the strength of the reading having started. Each makes the owner serve more
+-- after the reading has been asked about pending work (two more commands, or two more events, each
+-- followed by a boundary that polls it in a transaction that commits, and which on the code
+-- before the fix leaves the sentinel written), and waits for an execution that answered
+-- pending. It then lets the provider complete, waits for the engine to report the work over
+-- (which it only does in a transaction that commits) and for an execution that answered
+-- complete. Nothing sleeps.
 module Test.LuaRuntime.Retention.Writes (spec) where
 
+import Control.Concurrent (yield)
+import Control.Exception (finally)
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVarIO, writeTVar)
 import Data.IORef (newIORef, readIORef)
+import Data.Text (Text)
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Lease
 import Hetoimasia.Scripting.Lua.Provider
 import Hetoimasia.Scripting.Lua.Scheduled
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
-import Test.LuaRuntime.Instance.Lease.Support (LFix (lfBase), liveFor, newLFix, summaryOf)
+import Test.LuaRuntime.Instance.Lease.Support (LFix (lfBase), awaitSummary, liveFor, marker, newLFix, summaryOf)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support
-import Test.LuaRuntime.Retention.Leases (World (..), pair, staleSpec)
+import Test.LuaRuntime.Retention.Leases (World (..), pairOnTick, staleSpec)
 import Test.LuaRuntime.Retention.Probe
 import Test.LuaRuntime.Scheduled.Support (awaitScheduledTerminal)
 import qualified Test.LuaRuntime.Subscription.Support as Sub
 import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+
+-- | Wait, without sleeping, until this many lines of this kind have been recorded.
+awaitMany ∷ IFixture → Text → Int → IO ()
+awaitMany fixture entry wanted = do
+  seen ← logCount fixture entry
+  if seen >= wanted then pure () else yield >> awaitMany fixture entry wanted
 
 spec ∷ Spec
 spec = describe "a retirement reading's writes" $ do
@@ -39,7 +54,7 @@ spec = describe "a retirement reading's writes" $ do
           base
             { endpointSubmit = \submission → do
                 work ← endpointSubmit base submission
-                pure work {workRetirement = instrument probe (modifyTVar' sentinel (+ 1) >> workRetirement work)}
+                pure work {workRetirement = instrumentAnswering probe (modifyTVar' sentinel (+ 1) >> workRetirement work)}
             }
         grant = RequestGrant [writing] 4 SettleOnArrival
     withBoundary $ \_ runtime → providersFinish fake $ do
@@ -49,14 +64,19 @@ spec = describe "a retirement reading's writes" $ do
       awaitLine fixture "cmd start a started"
       command fixture owner "i" "cancel" "a"
       awaitLine fixture "cmd cancel a cancelled"
-      -- The reading has answered pending, and what it wrote is gone.
-      awaitRuns probe 1
+      -- The owner has served two more commands since the work was asked about, each followed by
+      -- a boundary that polled it and committed; the reading has answered pending.
+      command fixture owner "i" "noop" "n1"
+      awaitLine fixture "cmd noop n1 noop"
+      command fixture owner "i" "noop" "n2"
+      awaitLine fixture "cmd noop n2 noop"
+      awaitAnswer probe AnsweredPending
       readTVarIO sentinel >>= (`shouldBe` 0)
-      before ← totalRuns probe
       finishWork fake 0
       awaitDiagnostic owner ((== 0) . rdWorkPending)
-      -- It has answered complete, and what it wrote is gone too; the work's accounting is back.
-      totalRuns probe >>= (`shouldSatisfy` (> before))
+      -- The engine reported the work over, so an execution answered complete, in a transaction
+      -- that committed; what it wrote is gone too.
+      answeredWith probe AnsweredComplete >>= (`shouldSatisfy` (>= 1))
       readTVarIO sentinel >>= (`shouldBe` 0)
       awaitLine fixture "disposed 0"
       command fixture owner "i" "take" "a"
@@ -74,7 +94,7 @@ spec = describe "a retirement reading's writes" $ do
           base
             { eventSubscribe = \subscription → do
                 work ← eventSubscribe base subscription
-                pure work {workRetirement = instrument probe (modifyTVar' sentinel (+ 1) >> workRetirement work)}
+                pure work {workRetirement = instrumentAnswering probe (modifyTVar' sentinel (+ 1) >> workRetirement work)}
             }
         grant = SubscriptionGrant [writing] 4 16
     withBoundary $ \_ runtime → Sub.eventsFinish fake $ do
@@ -83,12 +103,13 @@ spec = describe "a retirement reading's writes" $ do
       Sub.commandWith fixture owner "i" "subscribe" "a" (Just "ticks") Nothing
       awaitLine fixture "cmd subscribe a ok"
       Sub.commandWith fixture owner "i" "unsubscribe" "a" Nothing Nothing
-      awaitRuns probe 1
+      Sub.sync fixture owner "i" 1
+      Sub.sync fixture owner "i" 2
+      awaitAnswer probe AnsweredPending
       readTVarIO sentinel >>= (`shouldBe` 0)
-      before ← totalRuns probe
       Sub.finishSubscription fake 0
       Sub.awaitSubDiagnostic owner ((== 0) . sdRetiring)
-      totalRuns probe >>= (`shouldSatisfy` (> before))
+      answeredWith probe AnsweredComplete >>= (`shouldSatisfy` (>= 1))
       readTVarIO sentinel >>= (`shouldBe` 0)
       Sub.awaitSubDiagnostic owner (\reading → sdCharged reading == 0 && sdLive reading == 0)
 
@@ -102,21 +123,38 @@ spec = describe "a retirement reading's writes" $ do
     second ← newProbe trace "b"
     let world = World sharedVar providers (Map.fromList [("a", first), ("b", second)]) (Just sentinel)
         base = lfBase fixture
-    withBoundary $ \control runtime → do
-      owner ← startWith base runtime (staleSpec fixture world "reading writes, leases" [pair])
-      _ ← admit base owner "p" (moduleNamed "stalepair")
+    -- However the example ends the providers finish what they were asked to retire, so that a
+    -- failing example fails instead of waiting for an owner that is right to wait.
+    let finishRetirements = readIORef providers >>= \held → atomically (mapM_ (`writeTVar` ProviderComplete) (Map.elems held))
+    withBoundary $ \control runtime → (`finally` finishRetirements) $ do
+      owner ← startWith base runtime (staleSpec fixture world "reading writes, leases" [pairOnTick, marker])
+      _ ← admit base owner "p" (moduleNamed "stalepairontick")
+      _ ← admit base owner "m" (moduleNamed "marker")
       awaitPhase base owner "p" Active
+      awaitPhase base owner "m" Active
       liveFor fixture "p" 2
-      retireScheduled owner
-      awaitRuns first 1
-      awaitRuns second 1
+      -- A tick makes the instance release both resources; their retirements are pending and
+      -- the owner goes on serving.
+      expectDelivered base owner "p" 1
+      awaitSummary' fixture (== 2)
+      -- Two more events, to another instance, each followed by a boundary that services the
+      -- retirements in a transaction that commits.
+      expectDelivered base owner "m" 1
+      awaitMany base "ran marker" 1
+      expectDelivered base owner "m" 2
+      awaitMany base "ran marker" 2
+      awaitAnswer first AnsweredPending
+      awaitAnswer second AnsweredPending
       readTVarIO sentinel >>= (`shouldBe` 0)
-      before ← (+) <$> totalRuns first <*> totalRuns second
       held ← readIORef providers
       atomically (mapM_ (`writeTVar` ProviderComplete) (Map.elems held))
-      _ ← awaitScheduledTerminal control owner
-      after ← (+) <$> totalRuns first <*> totalRuns second
-      after `shouldSatisfy` (> before)
+      awaitSummary' fixture (== 0)
+      awaitAnswer first AnsweredComplete
+      awaitAnswer second AnsweredComplete
       readTVarIO sentinel >>= (`shouldBe` 0)
-      summary ← summaryOf fixture "p"
-      (summaryPending summary, summaryCharged summary) `shouldBe` (0, 0)
+      summaryOf fixture "p" >>= \summary → (summaryPending summary, summaryCharged summary) `shouldBe` (0, 0)
+      retireScheduled owner
+      _ ← awaitScheduledTerminal control owner
+      pure ()
+  where
+    awaitSummary' fixture wanted = awaitSummary fixture "p" (wanted . summaryPending)

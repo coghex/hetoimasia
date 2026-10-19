@@ -12,6 +12,7 @@ module Test.LuaRuntime.Retention.Leases
   , World (..)
   , staleSpec
   , pair
+  , pairOnTick
   ) where
 
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, writeTVar)
@@ -65,7 +66,7 @@ retiredLater world name retirements = do
           retireAsynchronously retirements name $ do
             mapM_ (`modifyTVar'` (+ 1)) (wSentinel world)
             case Map.lookup name (wProbes world) of
-              Just probe → instrument probe (readTVar (wShared world) >> readTVar tv)
+              Just probe → instrumentAnswering probe (readTVar (wShared world) >> readTVar tv)
               Nothing → readTVar (wShared world) >> readTVar tv
       )
   pure name
@@ -102,6 +103,22 @@ pair =
     [ "function init(self, api)"
     , "  self.a = stale.open('a')"
     , "  self.b = stale.open('b')"
+    , "end"
+    ]
+
+-- | Opens two resources in @init@ and releases both when a tick reaches it, so that their
+-- retirements are pending while the owner goes on serving other instances.
+pairOnTick ∷ ModuleSource
+pairOnTick =
+  hooksModule
+    "stalepairontick"
+    [ "function init(self, api)"
+    , "  self.a = stale.open('a')"
+    , "  self.b = stale.open('b')"
+    , "  api.connect('tick', function(self, event)"
+    , "    lease.release(self.a)"
+    , "    lease.release(self.b)"
+    , "  end)"
     , "end"
     ]
 

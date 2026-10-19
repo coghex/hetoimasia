@@ -13,6 +13,10 @@ module Test.LuaRuntime.Retention.Probe
   , newProbe
   , newGatedProbe
   , instrument
+  , instrumentAnswering
+  , Answer (..)
+  , answeredWith
+  , awaitAnswer
   , awaitEntry
   , commitThen
   , totalRuns
@@ -27,6 +31,7 @@ import Control.Monad (when)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import GHC.Conc (unsafeIOToSTM)
+import Hetoimasia.Scripting.Lua.Provider (RetirementState (..))
 
 -- | The order readings ran in, newest first, shared by the probes of one example.
 newtype Trace = Trace (IORef [Text])
@@ -48,6 +53,8 @@ data Probe = Probe
   , prCommitted ∷ !(IORef Bool)
   , prTotal ∷ !(IORef Int)
   , prAfter ∷ !(IORef Int)
+  , prAnswers ∷ !(IORef [Answer])
+    -- ^ What each execution that got as far as an answer answered, newest first.
   }
 
 -- | A probe that only counts.
@@ -67,6 +74,7 @@ make gated trace name =
     <*> newIORef False
     <*> newIORef 0
     <*> newIORef 0
+    <*> newIORef []
 
 -- | The reading, counted and recorded in the trace before it runs, and held at the gate if this
 -- is the first execution of a gated probe. What the reading itself reads comes after.
@@ -86,6 +94,34 @@ instrument probe reading = do
       putMVar (prEntered probe) seen
       readMVar (prProceed probe)
   reading
+
+-- | What an execution answered.
+data Answer = AnsweredPending | AnsweredComplete | AnsweredFailed
+  deriving (Eq, Show)
+
+-- | The reading as 'instrument' runs it, and what it answered recorded once it has answered.
+-- An execution that is still running, or that retried, or that raised, has answered nothing: an
+-- example that waits for an answer waits for an execution that got as far as returning one.
+instrumentAnswering ∷ Probe → STM RetirementState → STM RetirementState
+instrumentAnswering probe reading = instrument probe $ do
+  state ← reading
+  unsafeIOToSTM $ atomicModifyIORef' (prAnswers probe) $ \held → (answer state : held, ())
+  pure state
+  where
+    answer = \case
+      ProviderPending → AnsweredPending
+      ProviderComplete → AnsweredComplete
+      ProviderFailed _ → AnsweredFailed
+
+-- | How many executions answered this.
+answeredWith ∷ Probe → Answer → IO Int
+answeredWith probe wanted = length . filter (== wanted) <$> readIORef (prAnswers probe)
+
+-- | Wait, without sleeping, until an execution has answered this.
+awaitAnswer ∷ Probe → Answer → IO ()
+awaitAnswer probe wanted = do
+  found ← answeredWith probe wanted
+  if found >= 1 then pure () else yield >> awaitAnswer probe wanted
 
 -- | Wait until the gated probe's first execution holds the gate, and answer the trace it found:
 -- its own entry first, then the readings that ran before it.
