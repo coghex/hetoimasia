@@ -1248,6 +1248,31 @@ deterministic; when several outcomes apply, a failure (1) outranks a signal
 (130), which outranks success (0); `io`, `os`, `package` and `debug` stay closed
 to runner scripts, and `print` and `warn` are rebound to the bounded output.
 
+### D-43. An accepted instance event that overflows fails its watcher
+
+Owner decision, 2026-10-19, in the hetoimasia manager pane ("Keep LUA-26's
+rule"), on the open decision #493's canonical review raised
+(https://github.com/coghex/hetoimasia/issues/493#issuecomment-6270280724). The
+drafted LUA-28 said an overloaded watcher's events are refused and counted and
+fail nothing. LUA-26's merged contract has two cases on a logical owner: an
+ordered event refused when it is offered (queue or staging full) is refused and
+counted, and an event already staged for a tick that finds the subscriber's
+queue full at that tick fails the subscribing instance with a delivery error,
+with no second answer to the producer (`packages/scripting-lua/README.md`,
+owned subscriptions).
+
+- The runner's `instances` endpoint keeps LUA-26's rule unchanged. A refusal
+  when offered is counted in the run report by kind and fails nothing. A staged
+  event that cannot enter its subscriber's queue at its tick fails that watcher
+  instance, which is reported once like any instance failure and makes the run's
+  status a failure.
+- LUA-28 does not change LUA-26's provider or subscription contracts.
+
+Rejected: a runner capacity invariant that makes the post-staging overflow
+impossible under every permitted subscription pattern (hard to prove, and it
+would limit what scripts may subscribe to), and changing LUA-26 to count the
+post-staging overflow instead (reopens #483's merged contract).
+
 ## Design
 
 P-1 through P-13 record the accepted contracts, with proof and delivery gates
@@ -3122,7 +3147,7 @@ and verified policy, with adversarial regression coverage.
 - **Phase:** runnable consumer.
 - **Depends on:** LUA-27, LUA-7, LUA-26.
 - **Ordering:** after LUA-27; precedes LUA-19.
-- **Relevant decisions:** D-23, D-25, D-36, D-38, D-39, D-40, D-41, D-42.
+- **Relevant decisions:** D-23, D-25, D-36, D-38, D-39, D-40, D-41, D-42, D-43.
 - **Acceptance signals:** identical script sets and tick counts give identical
   output and event order under varied delays and arrival; events reach only
   subscriptions that exist when produced; an instance whose `init` fails produces
