@@ -257,7 +257,8 @@ data Retirements = Retirements
     -- ^ Record that the release has handed the resource to its provider, under a
     -- label that names it in evidence, and say how to ask the provider where it has
     -- got to. Called from the part's release: it never waits, and the reading
-    -- must not retry. The lease keeps its charge, and its owner stays live, until
+    -- must not retry, and it only reads (what it writes is not kept). It may read TVars that
+    -- more than one reading shares. The lease keeps its charge, and its owner stays live, until
     -- the reading says 'ProviderComplete' or 'ProviderFailed'.
   , afterRetirement ∷ IO () → IO ()
     -- ^ Hand over a dependency the retirements need. Called from the release of the
