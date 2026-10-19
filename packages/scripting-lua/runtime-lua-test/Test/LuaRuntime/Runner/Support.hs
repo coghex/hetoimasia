@@ -22,6 +22,8 @@ module Test.LuaRuntime.Runner.Support
   , noWait
     -- * Running
   , config
+  , tickConfig
+  , driveTicks
   , run
   , runTick
   , runWith
@@ -31,6 +33,7 @@ module Test.LuaRuntime.Runner.Support
   , deliverTick
   , admittedOf
   , awaitSnapshots
+  , awaitIdle
   , awaitRetiring
   , withCapturedStreams
   , outstanding
@@ -44,10 +47,12 @@ module Test.LuaRuntime.Runner.Support
   , awaitLive
   , liveTimers
   , fireLive
+  , fireEvery
   , tickClock
   , regCount
   , liveCount
   , gatedOn
+  , gatedErrorsOn
   , awaitGate
   , openGate
     -- * Reading reports
@@ -78,11 +83,11 @@ import Hetoimasia.Foundation.Time (Duration, scriptedInstant, scriptedSource)
 import Hetoimasia.Foundation.Worker (GroupStatus (statusOutstanding))
 import Hetoimasia.Runtime.Supervision (RuntimeControl, workerGroupStatus)
 import Hetoimasia.Scripting.Lua.Instance (Delivery (DeliveryClosed), EventSource (EventSource), InstanceId, InstanceSnapshot, InstanceTicket, deliverEvent, inspectInstances)
-import Hetoimasia.Scripting.Lua.Scheduled (ScheduledEndpoint)
+import Hetoimasia.Scripting.Lua.Scheduled (ScheduledEndpoint, ticksOutstanding)
 import Hetoimasia.Scripting.Lua.Owner (BoundaryFault (boundaryOperation), FaultOperation (LoadModule))
-import Hetoimasia.Scripting.Lua.Registration (Namespace, namespace, stateOperation)
+import Hetoimasia.Scripting.Lua.Registration (Namespace, WaitKind (WaitElapsed, WaitLogical), namespace, stateOperation, waitOperation, yieldOperation)
 import Hetoimasia.Scripting.Lua.Runner
-import Hetoimasia.Scripting.Lua.Runner.Internal (RunnerInternals (..), noInternals, runScriptsWith)
+import Hetoimasia.Scripting.Lua.Runner.Internal (RunnerInternals (..), noInternals, quiet, runScriptsWith)
 import Hetoimasia.Scripting.Lua.Value (Schema (SInteger, SRecord, SText), Value (VInteger, VRecord, VText))
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 import System.Directory (createDirectory, getTemporaryDirectory, removeDirectoryRecursive, removeFile)
@@ -128,8 +133,8 @@ setStop fixture = atomically . writeTVar (rfStop fixture)
 
 -- | The test bindings every script of an example can call: @fx.record(text)@ notes a line,
 -- @fx.block(name)@ waits at a gate the example opens, after saying it was reached, @fx.fail(kind)@
--- raises a failure of the host, @fx.bump()@ counts and answers the count, and @fx.stop()@ sets the
--- stop request.
+-- raises a failure of the host, @fx.bump()@ counts and answers the count, @fx.stop()@ sets the
+-- stop request, and @fx.yield()@, @fx.wait_ticks(n)@ and @fx.wait_ns(n)@ suspend the hook.
 fxNamespace ∷ RFixture → Namespace
 fxNamespace fixture =
   namespace
@@ -156,6 +161,11 @@ fxNamespace fixture =
     , stateOperation "bump" [] [SInteger] $ \_ →
         (\count → [VInteger (fromIntegral count)]) <$> atomicModifyIORef' (rfCounter fixture) (\held → (held + 1, held + 1))
     , stateOperation "stop" [] [] $ \_ → setStop fixture True >> pure []
+    , -- A yield, and waits for ticks and for time, which suspend the instance's hook the way a task's
+      -- own code does. The runner itself grants no script such a binding.
+      yieldOperation "yield"
+    , waitOperation "wait_ticks" WaitLogical [SInteger]
+    , waitOperation "wait_ns" WaitElapsed [SInteger]
     ]
 
 -- Scripts ----------------------------------------------------------------------
@@ -197,6 +207,25 @@ config fixture scripts =
     sinkInto name ref line = atomicModifyIORef' ref (\held → (line : held, ())) >> noteLine name line
     noteLine name line = atomicModifyIORef' (rfLines fixture) (\held → ((name, line) : held, ()))
 
+-- | A tick VM over these scripts: ticks of this many nanoseconds, a tick limit if there is one.
+tickConfig ∷ RFixture → Word64 → Maybe Integer → [Script] → RunnerConfig
+tickConfig fixture period limit scripts = (config fixture scripts) {runnerTick = Just (ns period), runnerTickLimit = limit}
+
+-- | Make this many ticks due, one at a time, as the driver arms its timer for each: the clock is moved a
+-- tick's duration and the timer's registration fired by hand, and the next tick is waited for to have
+-- been armed. The run, on the example's thread, ends after the last, so it is not waited for here.
+driveTicks ∷ RFixture → Word64 → Int → IO ()
+driveTicks fixture period count = go count
+  where
+    go 0 = pure ()
+    go remaining = do
+      awaitLive fixture 1
+      before ← regCount fixture
+      tickClock fixture period
+      fireLive fixture
+      when (remaining > 1) (awaitCount (regCount fixture) (before + 1))
+      go (remaining - 1 ∷ Int)
+
 -- | The seams every example has: the fixture's bindings and no event source.
 internals ∷ RFixture → RunnerInternals
 internals fixture =
@@ -228,6 +257,16 @@ awaitSnapshots ∷ RFixture → ([InstanceSnapshot] → Bool) → IO ()
 awaitSnapshots fixture ok = do
   (endpoint, _) ← admittedOf fixture
   atomically (inspectInstances endpoint >>= \snapshots → if ok snapshots then pure () else retry)
+
+-- | Wait, in STM, until no grant is outstanding and the runner's own reading of the owner's instances says
+-- the owner has nothing it must do: the state a tick's boundary is reached in.
+awaitIdle ∷ RFixture → IO ()
+awaitIdle fixture = do
+  (endpoint, _) ← admittedOf fixture
+  atomically $ do
+    outstanding' ← ticksOutstanding endpoint
+    snapshots ← inspectInstances endpoint
+    when (outstanding' /= 0 || not (quiet True snapshots)) retry
 
 -- | Wait until the run has asked its owner to retire, which an example sees from the owner no longer
 -- taking events: the instance at this index is told a @tick@ it has no connection for until the
@@ -351,6 +390,16 @@ gatedOn fixture line name configuration =
         when (written == line) (blockOn (rfBase fixture) name)
     }
 
+-- | A configuration whose error sink blocks at the gate of this name when it is handed a line that contains
+-- this text: the run's own thread is held while it writes a report.
+gatedErrorsOn ∷ RFixture → Text → Text → RunnerConfig → RunnerConfig
+gatedErrorsOn fixture needle name configuration =
+  configuration
+    { runnerErrors = \written → do
+        runnerErrors configuration written
+        when (needle `Text.isInfixOf` written) (blockOn (rfBase fixture) name)
+    }
+
 -- | Wait until a binding or a sink has reached this gate.
 awaitGate ∷ RFixture → Text → IO ()
 awaitGate fixture = awaitEntered (rfBase fixture)
@@ -362,6 +411,11 @@ openGate fixture = releaseGate (rfBase fixture)
 -- | Fire every live registration, as the timer would on expiry.
 fireLive ∷ RFixture → IO ()
 fireLive fixture = liveTimers fixture >>= mapM_ fireReg
+
+-- | Fire every registration the fake timer was ever given, live or not, as a timer that was cancelled too
+-- late would.
+fireEvery ∷ RFixture → IO ()
+fireEvery fixture = allRegs (sfTimer (rfBase fixture)) >>= mapM_ fireReg
 
 -- | Move the injected clock.
 tickClock ∷ RFixture → Word64 → IO ()

@@ -218,6 +218,8 @@ library runtime-lua
         Hetoimasia.Scripting.Lua.Instance.Types
         Hetoimasia.Scripting.Lua.Lease.State
         Hetoimasia.Scripting.Lua.Retention
+        Hetoimasia.Scripting.Lua.Runner.Events
+        Hetoimasia.Scripting.Lua.Runner.Gate
         Hetoimasia.Scripting.Lua.Runner.Output
         Hetoimasia.Scripting.Lua.Runner.Render
         Hetoimasia.Scripting.Lua.Runner.Run
@@ -393,14 +395,18 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.HostFailures
         Test.LuaRuntime.Identity
         Test.LuaRuntime.Independence
+        Test.LuaRuntime.Runner.Determinism
         Test.LuaRuntime.Runner.Ending
+        Test.LuaRuntime.Runner.Events
         Test.LuaRuntime.Runner.Failures
         Test.LuaRuntime.Runner.Kinds
         Test.LuaRuntime.Runner.Output
+        Test.LuaRuntime.Runner.Production
         Test.LuaRuntime.Runner.Query
         Test.LuaRuntime.Runner.Retirement
         Test.LuaRuntime.Runner.Sources
         Test.LuaRuntime.Runner.Tables
+        Test.LuaRuntime.Runner.Ticks
         Test.LuaRuntime.Runner.Spec
         Test.LuaRuntime.Runner.Support
         Test.LuaRuntime.Instance.Basics

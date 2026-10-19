@@ -18,7 +18,34 @@ module Hetoimasia.Scripting.Lua.Runner.Internal
   , runScriptsWith
   , moduleRefFor
   , outputLines
+
+    -- * The events and what decides them
+  , AnswerClass (..)
+  , Refusal (..)
+  , EventDefect (..)
+  , classifyAnswer
+  , InstanceEvent (..)
+  , eventValue
+  , eventSchema
+  , Registry
+  , newRegistry
+  , instancesEndpoint
+  , produceEvents
+  , Place (..)
+  , tallyOf
+  , busy
+  , quiet
+  , Gate
+  , newGate
+  , gateWait
+  , holdGate
+  , freeGate
+  , permitOne
+  , gateParked
   ) where
+
+import Hetoimasia.Scripting.Lua.Runner.Events (AnswerClass (..), EventDefect (..), InstanceEvent (..), Place (..), Refusal (..), Registry, classifyAnswer, eventSchema, eventValue, instancesEndpoint, newRegistry, produceEvents, tallyOf)
+import Hetoimasia.Scripting.Lua.Runner.Gate (Gate, busy, gateParked, gateWait, holdGate, newGate, freeGate, permitOne, quiet)
 
 import Hetoimasia.Scripting.Lua.Runner.Run (RunnerBug (..), RunnerInternals (..), noInternals, runWith)
 import Hetoimasia.Scripting.Lua.Runner.Render (outputLines)

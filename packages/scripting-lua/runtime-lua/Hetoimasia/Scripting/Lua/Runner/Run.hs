@@ -4,9 +4,11 @@
 -- "Hetoimasia.Scripting.Lua.Runner" documents the behavior; this module is where it is done. The
 -- shape of it is a few single places every path goes through:
 --
--- * one wait ('awaitWake'), composed in STM with supervision, which is the only place the run
---   waits: it sees a failure to report, the start-table barrier, every instance having ended, the
---   stop request and the timer's wake, in that order of precedence;
+-- * one wait ('awaitStep'), composed in STM with supervision, which is the only place the run
+--   waits: it sees a failure to report, every instance having ended, the stop request, the owner's
+--   exit, the tick limit and the duration limit's wake, in that order of precedence, and then
+--   whatever the step the run is in is waiting for (the admission of a script, the tick that is due,
+--   the tick that has completed);
 -- * one function that takes the failures not yet reported ('takeFailures') and one that writes
 --   them, so a failure is written exactly once whichever wake or ending finds it;
 -- * one retirement ('retireOwner'), run when the run ends and again on every other way out, which
@@ -20,9 +22,10 @@ module Hetoimasia.Scripting.Lua.Runner.Run
   ) where
 
 import Control.Concurrent.MVar (newMVar, withMVar)
-import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, readTVar, retry, writeTVar)
-import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, fromException, mask, rethrowIO, throwIO, tryWithContext)
-import Control.Monad (forM, forM_, void)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, throwSTM, writeTVar)
+import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, finally, fromException, mask, onException, rethrowIO, throwIO, tryWithContext)
+import Control.Monad (forM, forM_, unless, void, when)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (elemIndex)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Map.Strict (Map)
@@ -36,7 +39,7 @@ import Data.Word (Word64)
 import Hetoimasia.Foundation.Log (Component, logInfo, unsafeComponent, withFields)
 import Hetoimasia.Foundation.Resource (withResource)
 import Hetoimasia.Foundation.Worker (awaitCompletion)
-import Hetoimasia.Foundation.Time (Instant, addDuration, deadlineReached, readInstant, zeroDuration)
+import Hetoimasia.Foundation.Time (Duration, Instant, addDuration, deadlineReached, readInstant, zeroDuration)
 import Hetoimasia.Runtime.Supervision
   ( Disposition (Optional)
   , Recognition (Recognized, Unrecognized)
@@ -50,25 +53,27 @@ import Hetoimasia.Scripting.Lua.Instance
   ( EventSource
   , InstanceAdmission (InstanceAccepted, InstanceAdmissionClosed, InstanceFull, InstanceIntervalRefused)
   , InstanceRequest (..)
-  , Interval (ElapsedEvery)
+  , Interval (ElapsedEvery, LogicalTicks)
   , admitInstance
   , hookEntries
   , inspectInstances
   , moduleHooks
   )
 import Hetoimasia.Scripting.Lua.Instance.Types
-  ( ControlAdmission (AdmitOnArrival)
+  ( ControlAdmission (AdmitLogically, AdmitOnArrival)
+  , ControlSlot (ControlSlot)
   , Escalation (Isolate)
   , ICell (icResult)
   , InstanceConfig (..)
   , InstanceId (..)
   , InstanceKind (EventOnly, Periodic, RunOnce)
   , InstanceOutcome (InstanceCompleted, InstanceDiscarded, InstanceFailed, InstanceStopped)
-  , InstancePhase (Initializing)
+  , InstancePhase (Initializing, Stopping)
   , InstanceSettlement (..)
   , InstanceSnapshot (..)
   , InstanceTicket (..)
   , ModuleHooks (..)
+  , ShutdownDisposition (ShutdownSkippedNoInit)
   , Termination (terminationShutdown)
   )
 import Hetoimasia.Scripting.Lua.Internal.Fault (raisedByApplication)
@@ -79,6 +84,13 @@ import Hetoimasia.Scripting.Lua.Lifecycle
   , Permit (PermitControl, PermitInspect)
   , lifecycleGrant
   , lifecycleNamespace
+  )
+import Hetoimasia.Scripting.Lua.Provider
+  ( RequestGrant (RequestGrant, grantEndpoints, grantRequestBound, grantTiming)
+  , RequestTiming (SettleAtAssignedTick, SettleOnArrival)
+  , SubscriptionDiagnostics (sdFailures)
+  , SubscriptionGrant (SubscriptionGrant, grantEvents, grantStagingBound, grantSubscriptionBound)
+  , subscriptionDiagnostics
   )
 import Hetoimasia.Scripting.Lua.Owner
   ( BoundaryFault (boundaryModule, boundaryOperation, boundaryReason, boundaryTraceback)
@@ -93,6 +105,8 @@ import Hetoimasia.Scripting.Lua.Owner
   , vmConfig
   )
 import Hetoimasia.Scripting.Lua.Registration (Namespace, namespaceName, registration)
+import Hetoimasia.Scripting.Lua.Runner.Events
+import Hetoimasia.Scripting.Lua.Runner.Gate
 import Hetoimasia.Scripting.Lua.Runner.Output (outputChunk, outputNamespace, outputNamespaceName)
 import Hetoimasia.Scripting.Lua.Runner.Render
 import Hetoimasia.Scripting.Lua.Runner.Source (ReadProblem (..), defaultName, distinctPaths, moduleRefFor, readSources)
@@ -105,11 +119,15 @@ import Hetoimasia.Scripting.Lua.Scheduled
   , ScheduledSpec (..)
   , ScheduledStart (..)
   , retireScheduled
+  , GrantAnswer (GrantAccepted, GrantClosed, GrantFull, GrantNotPositive)
+  , grantScheduledStep
   , scheduledEndpoint
   , scheduledSpec
   , scheduledStatus
   , scheduledSupervised
+  , scheduledTick
   , startScheduledOwner
+  , ticksOutstanding
   )
 import Hetoimasia.Scripting.Lua.Scheduler.Timer (Timer, clearTimerWake, disposeTimer, newTimer, syncTimer, timerWoken)
 
@@ -146,6 +164,7 @@ data Admitted = Admitted
   { admittedId ∷ !InstanceId
   , admittedTicket ∷ !InstanceTicket
   , admittedFile ∷ !Text
+  , admittedName ∷ !Text
   }
 
 -- | The sinks, each writing its lines together under one lock, so a table or a report is never cut
@@ -174,17 +193,33 @@ runWith internals runtime config =
         then ended EndedStopRequest []
         else begin internals runtime config
   where
-    ended ending reports = finished config (RunReport ending reports Nothing (runStatusOf (any failedReport reports) ending))
+    ended ending reports = finished config (RunReport ending reports Nothing (runStatusOf (any failedReport reports) ending) 0 noTally)
 
--- | The arguments the runner can refuse without a VM.
+-- | The arguments the runner can refuse without a VM: the scripts, the limits and the clock they are
+-- given are checked against each other and against what a tick can be, before anything is read.
 usageViolations ∷ RunnerConfig → [UsageViolation]
 usageViolations config =
   [UsageViolation Nothing NoScripts | null scripts]
     <> [UsageViolation Nothing (TooManyScripts (length scripts) runnerMaxScripts) | length scripts > runnerMaxScripts]
     <> [UsageViolation Nothing LimitNotPositive | runnerLimit config == Just zeroDuration]
-    <> [UsageViolation (Just (pathText item)) IntervalNotPositive | item ← scripts, scriptInterval item == Just zeroDuration]
+    <> [UsageViolation Nothing TickDurationNotPositive | runnerTick config == Just zeroDuration]
+    <> [UsageViolation Nothing reason | Just count ← [runnerTickLimit config], reason ← tickCountProblems count]
+    <> [UsageViolation Nothing TickLimitNeedsTickClock | isJust (runnerTickLimit config), not tickVm]
+    <> concat
+      [ [UsageViolation (Just (pathText item)) IntervalNotPositive | not tickVm, scriptInterval item == Just zeroDuration]
+          <> [UsageViolation (Just (pathText item)) ElapsedIntervalOnTickClock | tickVm, isJust (scriptInterval item)]
+          <> [UsageViolation (Just (pathText item)) TickIntervalOnElapsedClock | not tickVm, isJust (scriptTicks item)]
+          <> [UsageViolation (Just (pathText item)) reason | tickVm, Just count ← [scriptTicks item], reason ← tickCountProblems count]
+      | item ← scripts
+      ]
   where
     scripts = runnerScripts config
+    tickVm = isJust (runnerTick config)
+
+-- | Why a number of ticks cannot be one: not positive, or not a 64-bit tick.
+tickCountProblems ∷ Integer → [UsageReason]
+tickCountProblems count =
+  [TickCountNotPositive | count < 1] <> [TickCountTooLarge | count > toInteger (maxBound ∷ Word64)]
 
 pathText ∷ Script → Text
 pathText = bounded pathLimit . Text.pack . scriptPath
@@ -212,6 +247,10 @@ failedReport report = case instanceEnd report of
 begin ∷ RunnerInternals → LuaRuntime → RunnerConfig → IO RunOutcome
 begin internals runtime config = do
   sinks ← newSinks config
+  gate ← newGate
+  registry ← newRegistry
+  endpointVar ← newTVarIO Nothing
+  controlCounter ← newTVarIO 1
   (readable, problem) ← readSources paths
   let sources = [ModuleSource (refOf path) bytes hookEntries | (path, bytes) ← readable]
       readFailure = uncurry (readFailureOf config) <$> problem
@@ -220,8 +259,8 @@ begin internals runtime config = do
     ([], Nothing) → throwIO (RunnerBug "no script was read and none failed to be")
     _ → do
       built ← either (throwIO . RunnerBug . Text.pack . show) pure (registrationFor sinks)
-      let spec = specFor sources built
-      withStartedOwner runtime spec $ \case
+      let spec = specFor gate registry (assignControl endpointVar controlCounter) sources built
+      withStartedOwner runtime spec (atomically (freeGate gate)) $ \case
         ScheduledUnavailable failure → sourceFault sinks failure
         ScheduledRejected → stoppedBeforeStart
         ScheduledEnded → stoppedBeforeStart
@@ -229,7 +268,9 @@ begin internals runtime config = do
           -- The modules before the file that could not be read have loaded, as the load order has
           -- it, and the VM is retired on the way out.
           Just failure → startupFailure config sinks failure
-          Nothing → ran internals runtime config sinks refOf owner
+          Nothing → do
+            atomically (writeTVar endpointVar (Just (scheduledEndpoint owner)))
+            ran internals runtime config sinks refOf gate registry owner
   where
     scripts = runnerScripts config
     paths = distinctPaths (map scriptPath scripts)
@@ -242,7 +283,8 @@ begin internals runtime config = do
             : lifecycleNamespace runnerLifecycleName
             : internalNamespaces internals
         )
-    specFor sources built =
+    tickVm = isJust (runnerTick config)
+    specFor gate registry assign sources built =
       let vm =
             (vmConfig [LibraryBase, LibraryString, LibraryTable, LibraryMath, LibraryCoroutine])
               { vmInitialChunks = [(chunkName "runner output", outputChunk)]
@@ -254,20 +296,46 @@ begin internals runtime config = do
        in (scheduledSpec vm workerPolicy runnerSchedulerBounds)
             { scheduledClock = runnerClock config
             , scheduledTimer = runnerTimer config
+            , scheduledObserve = gateHook gate
             , scheduledInstances =
                 Just
                   InstanceConfig
                     { instanceBounds = runnerInstanceBounds
                     , instanceSources = internalSources internals
-                    , instanceTickDuration = Nothing
-                    , instanceControlAdmission = AdmitOnArrival
+                    , instanceTickDuration = runnerTick config
+                    , instanceControlAdmission = if tickVm then AdmitLogically else AdmitOnArrival
                     , instanceEscalate = \_ → pure Isolate
                     }
-            , scheduledLifecycle = Just (lifecycleGrant [GrantTarget GrantedSelf [PermitInspect, PermitControl] Nothing])
+            , scheduledLifecycle = Just (lifecycleGrant [GrantTarget GrantedSelf [PermitInspect, PermitControl] (if tickVm then Just assign else Nothing)])
+            , scheduledRequests =
+                Just
+                  RequestGrant
+                    { grantEndpoints = [unreachableEndpoint]
+                    , grantRequestBound = 1
+                    , grantTiming = if tickVm then SettleAtAssignedTick Nothing else SettleOnArrival
+                    }
+            , scheduledSubscriptions =
+                Just
+                  SubscriptionGrant
+                    { grantEvents = [instancesEndpoint registry]
+                    , grantSubscriptionBound = runnerSubscriptionBound
+                    , grantStagingBound = runnerStagingBound
+                    }
             }
+    -- Every Lua control a script requests on a tick VM is placed by the runner, never declined: at the first
+    -- tick the owner has not begun, and a sequence of its own, unique and increasing in the order the
+    -- requests are made, which is the order the owner runs the scripts that make them.
+    assignControl endpointVar counter _ =
+      readTVarIO endpointVar >>= \case
+        Nothing → throwIO (RunnerBug "a Lua control was requested before the VM's endpoint was known")
+        Just endpoint → atomically $ do
+          tick ← scheduledTick endpoint
+          next ← readTVar counter
+          writeTVar counter (next + 1)
+          pure (Just (ControlSlot (tick + 1) next))
     -- A boundary that is closing, or an owner that ended before it was ready: the run was asked to
     -- end by supervision, which is a stop.
-    stoppedBeforeStart = finished config (RunReport EndedStopRequest [] Nothing StatusInterrupted)
+    stoppedBeforeStart = finished config (RunReport EndedStopRequest [] Nothing StatusInterrupted 0 noTally)
     -- A source that does not load fails the VM's start: the one failure supervision lets the
     -- creation answer, as data, and only for a fault of loading a module that no application code
     -- raised. Anything else, a failure of the host, propagates unchanged.
@@ -301,7 +369,7 @@ isSourceFault (ExceptionWithContext context exception)
 startupFailure ∷ RunnerConfig → Sinks → LoadFailure → IO RunOutcome
 startupFailure config sinks failure = do
   sinkErr sinks (loadFailureLines failure)
-  finished config (RunReport EndedStartupFailure [] (Just failure) StatusFailure)
+  finished config (RunReport EndedStartupFailure [] (Just failure) StatusFailure 0 noTally)
 
 readFailureOf ∷ RunnerConfig → FilePath → ReadProblem → LoadFailure
 readFailureOf config path problem =
@@ -358,12 +426,14 @@ vmText = bounded columnLimit . runnerName
 -- or raise while the worker it started is alive. The failures themselves are the body's and supervision's:
 -- waiting does not raise the owner's failure again, which supervision delivers (to the next supervised
 -- wait, and at the boundary's exit beside the body's own).
-withStartedOwner ∷ LuaRuntime → ScheduledSpec → (ScheduledStart → IO a) → IO a
-withStartedOwner runtime spec body = mask $ \restore → do
+withStartedOwner ∷ LuaRuntime → ScheduledSpec → IO () → (ScheduledStart → IO a) → IO a
+withStartedOwner runtime spec release body = mask $ \restore → do
   started ← startScheduledOwner runtime spec
   outcome ← tryWithContext @SomeException (restore (body started))
   interruptions ← case started of
-    ScheduledStarted owner → retireScheduled owner >> awaitWorkerEnded restore (scheduledSupervised owner)
+    -- What holds the owner back (the gate it parks at) is let go before it is asked to stop and waited for:
+    -- an owner parked at it could not end.
+    ScheduledStarted owner → release >> retireScheduled owner >> awaitWorkerEnded restore (scheduledSupervised owner)
     _ → pure []
   case outcome of
     Right value → propagateAll interruptions >> pure value
@@ -386,9 +456,27 @@ retireOwner runtime owner = do
 
 -- Running ---------------------------------------------------------------------------------------
 
+-- | What every step of the run holds.
+data Env = Env
+  { envRuntime ∷ LuaRuntime
+  , envConfig ∷ RunnerConfig
+  , envSinks ∷ Sinks
+  , envOwner ∷ ScheduledOwner
+  , envEndpoint ∷ ScheduledEndpoint
+  , envGate ∷ Gate
+  , envRegistry ∷ Registry
+  , envReported ∷ TVar (Set Word64)
+    -- ^ The instances whose failure has been written.
+  , envEnded ∷ TVar (Set Word64)
+    -- ^ The instances whose end has been taken to produce its event.
+  , envCompleted ∷ TVar Word64
+    -- ^ The ticks the run has seen complete: granted, finished and quiet.
+  , envLimit ∷ Maybe (Timer, Instant)
+  }
+
 -- | The VM has started. Ask it what its modules define, refuse what that makes usage, and run.
-ran ∷ RunnerInternals → LuaRuntime → RunnerConfig → Sinks → (FilePath → ModuleRef) → ScheduledOwner → IO RunOutcome
-ran internals runtime config sinks refOf owner = do
+ran ∷ RunnerInternals → LuaRuntime → RunnerConfig → Sinks → (FilePath → ModuleRef) → Gate → Registry → ScheduledOwner → IO RunOutcome
+ran internals runtime config sinks refOf gate registry owner = do
   let endpoint = scheduledEndpoint owner
   hooks ← forM (runnerScripts config) $ \item →
     atomically (moduleHooks endpoint (refOf (scriptPath item))) >>= \case
@@ -398,16 +486,23 @@ ran internals runtime config sinks refOf owner = do
     Just violations → pure (Refused (UsageRefusal violations))
     Nothing → do
       origin ← readInstant (runnerClock config)
-      admitted ← admitAll endpoint hooks
-      internalAdmitted internals endpoint [(admittedId item, admittedTicket item) | item ← admitted]
-      logInfo
-        (withFields [("vm", runnerName config)] (runnerLogger config))
-        runnerComponent
-        "script run started"
-        [("scripts", Text.pack (show (length (runnerScripts config)))), ("instances", Text.pack (show (length admitted)))]
       withLimit config origin $ \limit → do
         reported ← newTVarIO Set.empty
-        ending ← waitForEnd runtime config sinks endpoint admitted reported limit
+        ended ← newTVarIO Set.empty
+        completed ← newTVarIO 0
+        let env = Env runtime config sinks owner endpoint gate registry reported ended completed limit
+        (admitted, interrupted) ← admitScripts internals env refOf hooks
+        logInfo
+          (withFields [("vm", runnerName config)] (runnerLogger config))
+          runnerComponent
+          "script run started"
+          [("scripts", Text.pack (show (length (runnerScripts config)))), ("instances", Text.pack (show (length admitted)))]
+        ending ← case interrupted of
+          Just early → pure early
+          Nothing → steady env admitted
+        -- What the provider counted of watchers failed at a tick is read while the owner still serves: its
+        -- service answers nothing once the owner has exited.
+        failedWatchers ← maybe 0 sdFailures <$> atomically (subscriptionDiagnostics endpoint)
         -- The run ends in order: every instance still unended is stopped, the VM is closed, and
         -- only then is anything read of what the instances became.
         retireOwner runtime owner
@@ -418,48 +513,33 @@ ran internals runtime config sinks refOf owner = do
           Nothing → throwIO (RunnerBug "an instance had not settled when its owner had ended")
         sinkTable sinks endTitle (map rowOfSettlement done)
         let reports = zipWith (instanceReportOf config) admitted done
-        finished config (RunReport ending reports Nothing (runStatusOf (any failedReport reports) ending))
-  where
-    admitAll endpoint hooks = go [] hooks
-      where
-        go done [] = pure (reverse done)
-        go done ((item, defined) : rest) =
-          admitInstance endpoint (requestFor item defined) >>= \case
-            InstanceAccepted identity ticket → go (Admitted identity ticket (bounded pathLimit (Text.pack (scriptPath item))) : done) rest
-            -- The owner stopped admitting: supervision is closing. What was admitted is the run.
-            InstanceAdmissionClosed → pure (reverse done)
-            InstanceFull → throwIO (RunnerBug "admission was full for a run that holds at most the live bound")
-            InstanceIntervalRefused why → throwIO (RunnerBug ("an interval the runner checked was refused: " <> Text.pack (show why)))
-    requestFor item defined =
-      InstanceRequest
-        { instanceModule = refOf (scriptPath item)
-        , instanceKind = kindOf item defined
-        , instanceName = Just (instanceNameOf item)
-        , instanceClass = OrdinaryClass
-        , instanceGrants = internalGrants internals
-        }
+        ticks ← readTVarIO completed
+        tally ← tallyOf registry
+        finished config (RunReport ending reports Nothing (runStatusOf (any failedReport reports) ending) ticks tally {tallyWatchersFailed = fromIntegral failedWatchers})
 
 -- | A script's instance name: its own, or the end of its path, tamed and bounded.
 instanceNameOf ∷ Script → Text
 instanceNameOf item = bounded nameLimit (fromMaybe (defaultName (scriptPath item)) (scriptName item))
 
 -- | What follows from the entries a module defines: @run@ is a one-shot, @update@ a looped
--- instance on the script's interval, neither an event-only instance.
+-- instance on the script's interval (in ticks on a tick VM), neither an event-only instance.
 kindOf ∷ Script → ModuleHooks → InstanceKind
 kindOf item defined
   | hooksRun defined = RunOnce
   | hooksUpdate defined, Just interval ← scriptInterval item = Periodic (ElapsedEvery interval)
+  | hooksUpdate defined, Just ticks ← scriptTicks item = Periodic (LogicalTicks ticks)
   | otherwise = EventOnly
 
 -- | Why a script is refused as usage, once its module's hooks are known: one reason at most.
 hookViolations ∷ (Script, ModuleHooks) → [UsageViolation]
 hookViolations (item, defined)
   | hooksRun defined && hooksUpdate defined = [at ModuleDefinesRunAndUpdate]
-  | hooksUpdate defined && not (isJust (scriptInterval item)) = [at UpdateNeedsInterval]
-  | isJust (scriptInterval item) && not (hooksUpdate defined) = [at IntervalWithoutUpdate]
+  | hooksUpdate defined && not hasInterval = [at UpdateNeedsInterval]
+  | hasInterval && not (hooksUpdate defined) = [at IntervalWithoutUpdate]
   | otherwise = []
   where
     at = UsageViolation (Just (pathText item))
+    hasInterval = isJust (scriptInterval item) || isJust (scriptTicks item)
 
 -- The limit's timer --------------------------------------------------------------------------------
 
@@ -473,56 +553,346 @@ withLimit config origin body = case runnerLimit config of
     Left _ → body Nothing
     Right deadline → withResource (newTimer (runnerTimer config)) disposeTimer (\timer → body (Just (timer, deadline)))
 
+-- Admission ---------------------------------------------------------------------------------------
+
+-- | What one wait for an instance's @init@ answers.
+data Initialized
+  = -- | @init@ is finished or the instance is terminal: whether it succeeded, and, for the last
+    -- script, the rows of the start table.
+    InitDone Bool [TableRow]
+  | -- | The owner was parked at the gate before the instance's @init@ could run: it was let through
+    -- one segment, and the wait goes on.
+    Permitted
+
+-- | Admit the scripts one at a time, in order, each after the previous instance has finished its
+-- @init@ and the owner has nothing left to do. Answers the instances admitted, in script order, and
+-- why admission was cut short, if it was.
+--
+-- Every instance is admitted with the owner's gate held, so that the owner cannot run the one-shot's
+-- @run@ (or anything else the new instance makes ready) until the instance's /started/ event has been
+-- produced to the subscriptions that exist at that moment.
+admitScripts ∷ RunnerInternals → Env → (FilePath → ModuleRef) → [(Script, ModuleHooks)] → IO ([Admitted], Maybe RunEnding)
+admitScripts internals env refOf hooks = do
+  known ← newIORef []
+  told ← newIORef False
+  -- The seam is told once, with the instances admitted, as soon as the last is, or as admission ends
+  -- however it ends: a host failure included, because an example that reaches the endpoint after one
+  -- must find it.
+  let tellOnce admitted = do
+        already ← atomicModifyIORef' told (\held → (True, held))
+        unless already (internalAdmitted internals endpoint [(admittedId item, admittedTicket item) | item ← admitted])
+  (admitted, interrupted) ← go known tellOnce [] hooks `onException` (readIORef known >>= tellOnce)
+  tellOnce admitted
+  pure (admitted, interrupted)
+  where
+    endpoint = envEndpoint env
+    go _ _ soFar [] = pure (soFar, Nothing)
+    go known tell soFar ((item, defined) : rest) = do
+      -- The owner is quiet before anything is admitted: nothing the previous instance made ready
+      -- is left to run.
+      awaiting env (admitting False) soFar (quietNow env) >>= \case
+        Left ending → pure (soFar, Just ending)
+        Right () → do
+          atomically (holdGate (envGate env))
+          step ← admitOne known tell soFar item defined (null rest) `finally` atomically (freeGate (envGate env))
+          case step of
+            Admission now rows Nothing
+              | null rest → do
+                  sinkTable (envSinks env) startTitle rows
+                  awaiting env (admitting True) now (quietNow env) >>= \case
+                    Left ending → pure (now, Just ending)
+                    Right () → do
+                      pending ← atomically (takeEnded env now)
+                      produce (map endedEvent pending)
+                      pure (now, Nothing)
+              | otherwise → go known tell now rest
+            Admission now _ interrupted → pure (now, interrupted)
+    admitOne known tell soFar item defined isLast =
+      admitInstance endpoint (requestFor item defined) >>= \case
+        InstanceAccepted identity ticket → do
+          let new = Admitted identity ticket (bounded pathLimit (Text.pack (scriptPath item))) (instanceNameOf item)
+              now = soFar <> [new]
+          writeIORef known now
+          when isLast (tell now)
+          waited ← awaitInit now new isLast
+          case waited of
+            Left ending → pure (Admission now [] (Just ending))
+            Right (started, rows) → do
+              when started (produce [startedEvent new])
+              pure (Admission now rows Nothing)
+        -- The owner stopped admitting: supervision is closing. What was admitted is the run.
+        InstanceAdmissionClosed → pure (Admission soFar [] Nothing)
+        InstanceFull → throwIO (RunnerBug "admission was full for a run that holds at most the live bound")
+        InstanceIntervalRefused why → throwIO (RunnerBug ("an interval the runner checked was refused: " <> Text.pack (show why)))
+    awaitInit now new isLast =
+      awaiting env (admitting False) {modeProgressFirst = True} now (initProgress env now new isLast) >>= \case
+        Left ending → pure (Left ending)
+        Right Permitted → awaitInit now new isLast
+        Right (InitDone started rows) → pure (Right (started, rows))
+    requestFor item defined =
+      InstanceRequest
+        { instanceModule = refOf (scriptPath item)
+        , instanceKind = kindOf item defined
+        , instanceName = Just (instanceNameOf item)
+        , instanceClass = OrdinaryClass
+        , instanceGrants = runnerEventsName : internalGrants internals
+        }
+    produce events = do
+      place ← placeNow env
+      produceEvents (envRegistry env) place events
+    -- Every instance having ended ends the run only once the last script is admitted.
+    admitting complete = Mode {modeComplete = complete, modeEnded = False, modeTickLimit = False, modeDrain = False, modeProgressFirst = False}
+
+-- | One instance's admission: the instances admitted so far with it, the rows of the start table, and
+-- why the run ended meanwhile.
+data Admission = Admission [Admitted] [TableRow] (Maybe RunEnding)
+
+-- | Whether an instance's @init@ is finished (or it is terminal) and the owner is still: parked at the
+-- gate, before the segment it was about to run, or quiet. If the owner is parked before the instance's
+-- @init@ could be served, it is let through one segment.
+initProgress ∷ Env → [Admitted] → Admitted → Bool → STM (Maybe Initialized)
+initProgress env admitted item isLast = do
+  settled ← settledNow (admittedTicket item)
+  snapshots ← inspectInstances (envEndpoint env)
+  parked ← gateParked (envGate env)
+  let initDone = isJust settled || maybe False (\snapshot → snapshotPhase snapshot `notElem` [Initializing, Stopping]) (lookupSnapshot (admittedId item) snapshots)
+      initialized = maybe True (\settlement → terminationShutdown (resultTermination settlement) /= ShutdownSkippedNoInit) settled
+  if initDone && (parked || quiet (isTick env) snapshots)
+    then do
+      rows ←
+        if isLast
+          then barrierRows (envEndpoint env) admitted >>= maybe (throwSTM (RunnerBug "an instance admitted before the last had not left its initialization")) pure
+          else pure []
+      pure (Just (InitDone initialized rows))
+    else
+      if parked && not initDone
+        then (\granted → if granted then Just Permitted else Nothing) <$> permitOne (envGate env)
+        else pure Nothing
+
+-- | The owner has nothing it must do before it idles.
+quietNow ∷ Env → STM (Maybe ())
+quietNow env = do
+  snapshots ← inspectInstances (envEndpoint env)
+  pure (if quiet (isTick env) snapshots then Just () else Nothing)
+
+-- | Whether the VM is on logical ticks.
+isTick ∷ Env → Bool
+isTick = isJust . runnerTick . envConfig
+
+-- Events ------------------------------------------------------------------------------------------
+
+startedEvent ∷ Admitted → InstanceEvent
+startedEvent item = InstanceEvent True (admittedId item) (Just (admittedName item)) Nothing
+
+endedEvent ∷ (Admitted, InstanceSettlement) → InstanceEvent
+endedEvent (item, settlement) =
+  InstanceEvent False (admittedId item) (resultName settlement) (Just outcome)
+  where
+    outcome = case resultOutcome settlement of
+      InstanceCompleted → "completed"
+      InstanceFailed _ → "failed"
+      InstanceStopped → "stopped"
+      InstanceDiscarded _ → "stopped"
+
+-- | Where the next deliveries go: on arrival on an elapsed VM, at the first tick the owner has not begun
+-- on a tick VM.
+placeNow ∷ Env → IO Place
+placeNow env = case runnerTick (envConfig env) of
+  Nothing → pure (PlaceAt Nothing)
+  Just _ → PlaceAt . Just . (+ 1) <$> atomically (scheduledTick (envEndpoint env))
+
+-- | The instances that have settled and whose end has not been taken, and whoever takes them has them,
+-- in ascending instance number.
+takeEnded ∷ Env → [Admitted] → STM [(Admitted, InstanceSettlement)]
+takeEnded env admitted = do
+  done ← readTVar (envEnded env)
+  found ← forM admitted $ \item →
+    if Set.member (instanceLocal (admittedId item)) done
+      then pure Nothing
+      else fmap (\settlement → (item, settlement)) <$> settledNow (admittedTicket item)
+  let fresh = catMaybes found
+  if null fresh
+    then pure []
+    else writeTVar (envEnded env) (Set.union done (Set.fromList [instanceLocal (admittedId item) | (item, _) ← fresh])) >> pure fresh
+
 -- The wait ----------------------------------------------------------------------------------------
 
--- | What woke the run.
-data Wake
-  = -- | Failures settled and not yet written.
-    WakeReports [(Admitted, InstanceSettlement)]
-  | -- | Every instance has left its initialization or ended: the rows of the start table.
-    WakeBarrier [TableRow]
-  | WakeEnd RunEnding
-  | -- | The timer fired: look at the clock.
-    WakeTimer
+-- | What the common wait watches for, beyond what a phase waits on.
+data Mode = Mode
+  { modeComplete ∷ Bool
+    -- ^ Every script is admitted, so every instance having ended ends the run.
+  , modeEnded ∷ Bool
+    -- ^ An instance that settles has its end produced as it is seen (an elapsed VM's ordinary run).
+  , modeTickLimit ∷ Bool
+    -- ^ The tick limit, once it is reached, ends the run: between ticks, not during one.
+  , modeDrain ∷ Bool
+    -- ^ Every instance having ended does not end the run yet, and nor does anything that ranks below it: a
+    -- tick is waited out to its completion, and the run ends at the boundary after it, as every
+    -- instance having ended.
+  , modeProgressFirst ∷ Bool
+    -- ^ What the phase waits for outranks every ending, so that what is already done is taken before the
+    -- run ends: the finished @init@ of an instance, whose /started/ event and start table are owed.
+  }
 
--- | Wait for the run to end, writing what is owed on the way: the failures as they settle, and the
--- start table when every instance has left its initialization. Answers how the run ended.
-waitForEnd ∷ LuaRuntime → RunnerConfig → Sinks → ScheduledEndpoint → [Admitted] → TVar (Set Word64) → Maybe (Timer, Instant) → IO RunEnding
-waitForEnd runtime config sinks endpoint admitted reported limit = loop True
+-- | What woke the run.
+data Step a
+  = -- | Failures settled and not yet written.
+    StepReports [(Admitted, InstanceSettlement)]
+  | -- | Ends to produce.
+    StepEnded [(Admitted, InstanceSettlement)]
+  | StepEnd RunEnding
+  | -- | The duration limit's timer fired: look at the clock.
+    StepLimitTimer
+  | StepDone a
+
+-- | The one wait of the run, composed in STM with supervision. It writes what is owed on the way (the
+-- failures as they settle, the ends an elapsed VM produces as they are seen) and answers how the run
+-- ended, or what the phase it is in was waiting for.
+--
+-- The order of precedence is the contract: a failure to report, an end to produce, every instance
+-- ended, the stop request, the tick limit, the duration limit, and then what the phase waits for.
+awaiting ∷ Env → Mode → [Admitted] → STM (Maybe a) → IO (Either RunEnding a)
+awaiting env mode admitted progress = loop
   where
-    loop pendingStart = do
-      forM_ limit $ \(timer, deadline) → syncTimer timer (runnerClock config) (Just deadline)
-      wake ← awaitSupervised (runtimeControl runtime) (awaitWake pendingStart)
-      case wake of
-        WakeReports failures → writeFailures config sinks failures >> loop pendingStart
-        WakeBarrier rows → sinkTable sinks startTitle rows >> loop False
-        WakeEnd ending → pure ending
-        WakeTimer → do
+    config = envConfig env
+    loop = do
+      forM_ (envLimit env) $ \(timer, deadline) → syncTimer timer (runnerClock config) (Just deadline)
+      step ← awaitSupervised (runtimeControl (envRuntime env)) stepNow
+      case step of
+        StepReports failures → writeFailures config (envSinks env) failures >> loop
+        StepEnded settled → do
+          place ← placeNow env
+          produceEvents (envRegistry env) place (map endedEvent settled)
+          loop
+        StepEnd ending → pure (Left ending)
+        StepLimitTimer → do
           now ← readInstant (runnerClock config)
-          if any (deadlineReached now . snd) limit then pure EndedLimit else loop pendingStart
-    -- The order of precedence is the contract: a failure to report, the start table, every
-    -- instance ended, the stop request, then the limit.
-    awaitWake pendingStart = do
-      failures ← takeFailures reported admitted
-      if not (null failures)
-        then pure (WakeReports failures)
+          if any (deadlineReached now . snd) (envLimit env) then pure (Left EndedLimit) else loop
+        StepDone value → pure (Right value)
+    stepNow = do
+      failures ← takeFailures (envReported env) admitted
+      settled ← if null failures && modeEnded mode then takeEnded env admitted else pure []
+      -- The phase's own progress is read for what outranks the endings only where reading it changes
+      -- nothing: a finished @init@ (it permits a segment, and that is the answer) and a tick that has finished.
+      early ← if null failures && null settled && modeProgressFirst mode then progress else pure Nothing
+      everyone ← if modeComplete mode then allSettled admitted else pure False
+      stop ← runnerStop config
+      reached ← if modeTickLimit mode then tickLimitReached else pure False
+      woke ← maybe (pure False) (timerWoken . fst) (envLimit env)
+      finishing ← if modeDrain mode && not stop && not everyone then progress else pure Nothing
+      -- The first that applies is the answer: the order is the contract.
+      case concat
+        [ [pure (StepReports failures) | not (null failures)]
+        , [pure (StepEnded settled) | not (null settled)]
+        , [pure (StepDone value) | Just value ← [early]]
+        , [orRetry | everyone, modeDrain mode]
+        , [pure (StepEnd EndedAllInstances) | everyone]
+        , [pure (StepEnd EndedStopRequest) | stop]
+        , [pure (StepDone value) | Just value ← [finishing]]
+        , [pure (StepEnd EndedTickLimit) | reached]
+        , [forM_ (envLimit env) (clearTimerWake . fst) >> pure StepLimitTimer | woke]
+        , [orRetry | not (modeProgressFirst mode)]
+        ] of
+        action : _ → action
+        [] → retry
+      where
+        orRetry = maybe retry (pure . StepDone) =<< progress
+    tickLimitReached = case runnerTickLimit config of
+      Nothing → pure False
+      Just limit → (\done → toInteger done >= limit) <$> readTVar (envCompleted env)
+
+-- Running on --------------------------------------------------------------------------------------
+
+-- | The run after admission: wait for it to end, producing and writing what is owed on the way.
+steady ∷ Env → [Admitted] → IO RunEnding
+steady env admitted = case runnerTick (envConfig env) of
+  Nothing → repeatUntilEnded (awaiting env running admitted (pure Nothing))
+  Just tick → withResource (newTimer (runnerTimer (envConfig env))) disposeTimer (\timer → ticking env admitted tick timer)
+  where
+    running = Mode {modeComplete = True, modeEnded = True, modeTickLimit = False, modeDrain = False, modeProgressFirst = False}
+    repeatUntilEnded wait = wait >>= either pure (\() → repeatUntilEnded wait)
+
+-- | What waiting for a grant to finish answers.
+data Finished = Finished | OwnerGone
+
+-- | The tick driver: grant one tick of exactly the tick duration whenever one is due, wait for it to
+-- finish, then, at the boundary, produce the ends it saw, for the next tick.
+--
+-- Tick /n/ is due at the origin plus /n/ ticks of real time. A late tick is granted at once, one grant
+-- each, none skipped, merged or shortened. A timer wake is a notification only: the clock is read.
+ticking ∷ Env → [Admitted] → Duration → Timer → IO RunEnding
+ticking env admitted tick timer = do
+  origin ← readInstant clock
+  boundary >>= \case
+    Just ending → pure ending
+    Nothing → go (next (Just origin)) (1 ∷ Word64)
+  where
+    clock = runnerClock (envConfig env)
+    -- Between ticks: nothing is running, and the ends the last tick saw are produced for the next.
+    boundary =
+      awaiting env between admitted (Just <$> takeEnded env admitted) >>= \case
+        Left ending → pure (Just ending)
+        Right settled → do
+          place ← placeNow env
+          produceEvents (envRegistry env) place (map endedEvent settled)
+          pure Nothing
+    between = Mode {modeComplete = True, modeEnded = False, modeTickLimit = True, modeDrain = False, modeProgressFirst = False}
+    during = Mode {modeComplete = True, modeEnded = False, modeTickLimit = False, modeDrain = True, modeProgressFirst = False}
+    -- When the tick after one due at this instant is due, if that fits the clock's range, and
+    -- never otherwise.
+    next = \case
+      Just due → either (const Nothing) Just (addDuration due tick)
+      Nothing → Nothing
+    -- The deadline of tick @number@, and the number of the tick to be granted.
+    go due number = do
+      now ← readInstant clock
+      if maybe False (deadlineReached now) due
+        then
+          -- Already due, and so late: granted at once, after what ranks above a tick is looked at, with no
+          -- wait on a timer.
+          awaiting env between admitted (pure (Just ())) >>= \case
+            Left ending → pure ending
+            Right () → grant due number
         else do
-          barrier ← if pendingStart then barrierRows endpoint admitted else pure Nothing
-          case barrier of
-            Just rows → pure (WakeBarrier rows)
-            Nothing → do
-              everyone ← allSettled admitted
-              stop ← runnerStop config
-              woke ← maybe (pure False) (timerWoken . fst) limit
-              if everyone
-                then pure (WakeEnd EndedAllInstances)
-                else
-                  if stop
-                    then pure (WakeEnd EndedStopRequest)
-                    else
-                      if woke
-                        then forM_ limit (clearTimerWake . fst) >> pure WakeTimer
-                        else retry
+          syncTimer timer clock due
+          awaiting env between admitted woken >>= \case
+            Left ending → pure ending
+            Right () → go due number
+    woken = do
+      fired ← timerWoken timer
+      if fired then clearTimerWake timer >> pure (Just ()) else pure Nothing
+    grant due number =
+      grantScheduledStep (envEndpoint env) tick >>= \case
+        GrantAccepted _ →
+          awaiting env during admitted (finishedGrant env (envEndpoint env)) >>= \case
+            Left ending → pure ending
+            Right OwnerGone → pure EndedStopRequest
+            Right Finished → do
+              atomically (modifyTVar' (envCompleted env) (+ 1))
+              boundary >>= \case
+                Just ending → pure ending
+                Nothing → go (next due) (number + 1)
+        -- The bound on outstanding grants is reached: wait for them to finish and ask again.
+        GrantFull →
+          awaiting env during admitted (finishedGrant env (envEndpoint env)) >>= \case
+            Left ending → pure ending
+            Right OwnerGone → pure EndedStopRequest
+            Right Finished → grant due number
+        -- The owner is stopping: the run ends through its ordinary path.
+        GrantClosed → pure EndedStopRequest
+        GrantNotPositive → throwIO (RunnerBug "a tick duration the runner checked was not positive")
+
+-- | Every grant has finished and the owner is quiet, or the owner has exited.
+finishedGrant ∷ Env → ScheduledEndpoint → STM (Maybe Finished)
+finishedGrant env endpoint = do
+  outstanding ← ticksOutstanding endpoint
+  snapshots ← inspectInstances endpoint
+  status ← scheduledStatus (envOwner env)
+  pure $ case status of
+    WorkerLive
+      | outstanding == 0 && quiet (isTick env) snapshots → Just Finished
+      | otherwise → Nothing
+    _ → Just OwnerGone
 
 -- | An instance's settlement if it has one. Read from the instance's cell and not observed, so the
 -- instance stays in the owner's inspection until the owner exits.
