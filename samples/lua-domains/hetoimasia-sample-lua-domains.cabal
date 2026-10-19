@@ -58,7 +58,9 @@ library
         Hetoimasia.Sample.LuaDomains.Queue
         Hetoimasia.Sample.LuaDomains.Registration
         Hetoimasia.Sample.LuaDomains.Report
+        Hetoimasia.Sample.LuaDomains.Scenario
         Hetoimasia.Sample.LuaDomains.Scripts
+        Hetoimasia.Sample.LuaDomains.Session
         Hetoimasia.Sample.LuaDomains.Shared
         Hetoimasia.Sample.LuaDomains.Snapshot
         Hetoimasia.Sample.LuaDomains.Tally

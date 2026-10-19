@@ -8,6 +8,7 @@ module Hetoimasia.Sample.LuaDomains
   , module Hetoimasia.Sample.LuaDomains.Domains
   , module Hetoimasia.Sample.LuaDomains.Intention
   , module Hetoimasia.Sample.LuaDomains.Report
+  , module Hetoimasia.Sample.LuaDomains.Scenario
   , module Hetoimasia.Sample.LuaDomains.Snapshot
   ) where
 
@@ -15,4 +16,5 @@ import Hetoimasia.Sample.LuaDomains.Bounds
 import Hetoimasia.Sample.LuaDomains.Domains
 import Hetoimasia.Sample.LuaDomains.Intention
 import Hetoimasia.Sample.LuaDomains.Report
+import Hetoimasia.Sample.LuaDomains.Scenario
 import Hetoimasia.Sample.LuaDomains.Snapshot

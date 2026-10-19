@@ -51,11 +51,17 @@ data Bounds = Bounds
     -- ^ The most stale rejections one snapshot lists; the rest are counted.
   , boundStaging ∷ !Int
     -- ^ The most moves one tick's staging batch holds.
+  , boundDroppedListed ∷ !Int
+    -- ^ The most invalidated, or discarded, intentions the snapshot that ends a session lists;
+    -- the rest are counted.
+  , boundWorkspaces ∷ !Int
+    -- ^ The most workspaces one gameplay instance holds charged at once: the capacity of its leases.
   }
   deriving (Eq, Show)
 
 -- | Eight entities, moves of at most eight in each direction, twelve intentions waiting
--- at most, eight to a tick, four stale rejections listed and four staged moves.
+-- at most, eight to a tick, four stale rejections listed, four staged moves, eight dropped
+-- intentions listed and two workspaces for each gameplay instance.
 defaultBounds ∷ Bounds
 defaultBounds =
   Bounds
@@ -65,6 +71,8 @@ defaultBounds =
     , boundPlaces = 8
     , boundStaleListed = 4
     , boundStaging = 4
+    , boundDroppedListed = 8
+    , boundWorkspaces = 2
     }
 
 -- | Whether one component of a move is within the bound on deltas. Two direct comparisons, so that
@@ -96,6 +104,8 @@ validateBounds bounds =
       , ("places", boundPlaces bounds)
       , ("stale-listed", boundStaleListed bounds)
       , ("staging", boundStaging bounds)
+      , ("dropped-listed", boundDroppedListed bounds)
+      , ("workspaces", boundWorkspaces bounds)
       ]
   , value < 1
   ]

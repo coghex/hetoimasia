@@ -42,6 +42,7 @@ import Hetoimasia.Sample.LuaDomains.Intention
   , Placement
   , Stale (..)
   , StaleReason (..)
+  , noDispositions
   )
 import Hetoimasia.Sample.LuaDomains.World (World (..), drawBelow, entityAt, entityVersion, moveEntity)
 
@@ -81,7 +82,7 @@ beginCandidate bounds committed tick sealed =
     , candidateStaged = []
     , candidateFinished = False
     , candidateDispositions =
-        Dispositions
+        noDispositions
           { dispApplied = reverse appliedNewestFirst
           , dispStale = take (boundStaleListed bounds) staleInOrder
           , dispStaleOmitted = max 0 (length staleInOrder - boundStaleListed bounds)

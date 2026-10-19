@@ -12,6 +12,9 @@
 module Hetoimasia.Sample.LuaDomains.Scripts
   ( gameplayChunk
   , gameplayInitSource
+  , gameplayFailureSource
+  , fenceEntry
+  , fenceSource
   , gameplayModule
   , gameplaySource
   , interfaceModule
@@ -25,7 +28,7 @@ import Data.ByteString (ByteString)
 import Data.Text (Text)
 import Hetoimasia.Sample.LuaDomains.Embed (embedFile)
 import Hetoimasia.Scripting.Lua.Instance (hookEntries)
-import Hetoimasia.Scripting.Lua.Owner (ChunkName, ModuleRef (..), ModuleSource (..), chunkName)
+import Hetoimasia.Scripting.Lua.Owner (ChunkName, EntryPoint (..), ModuleRef (..), ModuleSource (..), Requirement (Required), chunkName)
 
 gameplayInitSource ∷ ByteString
 gameplayInitSource = $(embedFile "src/lua/gameplay_init.lua")
@@ -36,6 +39,18 @@ gameplaySource = $(embedFile "src/lua/gameplay.lua")
 facadeSource ∷ ByteString
 facadeSource = $(embedFile "src/lua/ui_facade.lua")
 
+-- | The `failure` scenario's gameplay behavior: the normal one, which then raises at tick six.
+gameplayFailureSource ∷ ByteString
+gameplayFailureSource = gameplaySource <> $(embedFile "src/lua/gameplay_failure.lua")
+
+-- | The fence task's entry point, appended to every gameplay module.
+fenceSource ∷ ByteString
+fenceSource = $(embedFile "src/lua/gameplay_fence.lua")
+
+-- | The fence task's entry point, as the module declares it.
+fenceEntry ∷ EntryPoint
+fenceEntry = EntryPoint "sample_fence" Required [] []
+
 interfaceSource ∷ ByteString
 interfaceSource = $(embedFile "src/lua/interface.lua")
 
@@ -43,9 +58,10 @@ interfaceSource = $(embedFile "src/lua/interface.lua")
 moduleSource ∷ Text → ByteString → ModuleSource
 moduleSource name source = ModuleSource (ModuleRef name "1") source hookEntries
 
--- | Gameplay's behavior module.
-gameplayModule ∷ ByteString → ModuleSource
-gameplayModule = moduleSource "gameplay"
+-- | Gameplay's behavior module: this source, the fence task's entry point appended, and the hooks and the
+-- fence declared, with these entry points beside them (what a test's own tasks call).
+gameplayModule ∷ [EntryPoint] → ByteString → ModuleSource
+gameplayModule extra source = ModuleSource (ModuleRef "gameplay" "1") (source <> fenceSource) (hookEntries <> [fenceEntry] <> extra)
 
 -- | The UI's behavior module.
 interfaceModule ∷ ByteString → ModuleSource

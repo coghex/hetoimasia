@@ -15,9 +15,9 @@
 --
 -- * 'Accepted' only once the gameplay queue has taken it for a tick that has not started, with
 --   the 'Placement' it holds;
--- * 'Full' when the queue's bound or the tick's places are all taken;
--- * 'Closed' when no tick that has not started is left to take it (the finite session's last tick
---   has begun);
+-- * 'Full' when the queue's bound or the tick's places are all taken, saying which;
+-- * 'Closed' when no tick that has not started is left to take it: the finite session's last tick
+--   has begun, or the session has failed, is stopping or has stopped;
 -- * 'Refused' for a value outside the application's bounds, naming which.
 --
 -- The reasons a script sees are the fixed words of 'answerReason', never text the script wrote.
@@ -30,6 +30,7 @@ module Hetoimasia.Sample.LuaDomains.Intention
   , refusalReason
     -- * Answers
   , Answer (..)
+  , FullCause (..)
   , answerReason
   , malformedReason
   , fullReason
@@ -124,16 +125,25 @@ data Placement = Placement
 -- | What the UI is answered.
 data Answer
   = Accepted !Placement
-  | Full
+  | Full !FullCause
   | Closed
   | Refused !Refusal
   deriving (Eq, Show)
 
--- | The reason a script is told for a refusal to accept, and nothing for an acceptance.
+-- | Why an intention was answered full.
+data FullCause
+  = -- | The queue holds as many accepted intentions, not yet settled, as its bound allows.
+    FullQueue
+  | -- | The tick holds every place it has.
+    FullPlaces
+  deriving (Eq, Ord, Show, Enum, Bounded)
+
+-- | The reason a script is told for a refusal to accept, and nothing for an acceptance. Both causes
+-- of full are the one word: the cause is the application's to count, not the script's to branch on.
 answerReason ∷ Answer → Maybe Text
 answerReason = \case
   Accepted _ → Nothing
-  Full → Just fullReason
+  Full _ → Just fullReason
   Closed → Just closedReason
   Refused refusal → Just (refusalReason refusal)
 
@@ -167,7 +177,8 @@ data Stale = Stale
 
 -- | The terminal dispositions of one tick's intentions, as its snapshot carries them. Every
 -- accepted intention of the tick is exactly one of: in 'dispApplied', listed in 'dispStale', or
--- counted in 'dispStaleOmitted' because the list was full.
+-- counted in 'dispStaleOmitted' because the list was full. The snapshot that ends a session carries,
+-- besides, the intentions it never settled, as invalidated by a failure or discarded by a stop.
 data Dispositions = Dispositions
   { dispApplied ∷ ![Placement]
     -- ^ The places applied, in order. The tick holds at most the bound on places, so this is
@@ -176,10 +187,18 @@ data Dispositions = Dispositions
     -- ^ The stale rejections, in order, at most the bound on listed ones.
   , dispStaleOmitted ∷ !Int
     -- ^ How many stale rejections did not fit in the list.
+  , dispInvalidated ∷ ![Placement]
+    -- ^ Accepted intentions with no committed terminal disposition when the session failed, in
+    -- the order of their places: those of the failing tick, applied only into its discarded batch
+    -- or not, and those accepted for ticks that never began. At most the bound on dropped ones.
+  , dispInvalidatedOmitted ∷ !Int
+  , dispDiscarded ∷ ![Placement]
+    -- ^ The same, when a stop ended the session.
+  , dispDiscardedOmitted ∷ !Int
   }
   deriving stock (Eq, Show, Generic)
   deriving anyclass (NFData)
 
 -- | A tick with nothing to settle.
 noDispositions ∷ Dispositions
-noDispositions = Dispositions [] [] 0
+noDispositions = Dispositions [] [] 0 [] 0 [] 0
