@@ -84,7 +84,7 @@ an ordinary example hanging during protected cleanup.
 
 ## Local probe inventory
 
-All five catalog groups below have `optional: true`, `category: probe`, and no
+All six catalog groups below have `optional: true`, `category: probe`, and no
 CI worker assignment. They remain in the catalog so their commands, ownership,
 inputs, and platform constraints have one authority. They must not be named in
 a PR `validation-request` block; a hosted plan cannot route them. `all-hspec`
@@ -95,6 +95,7 @@ also includes them and must not be used in a PR request.
 | `probe:x11-helper` / `test.x11-helper` | `cabal test x11-helper-tests --test-show-details=direct` | 19 stub-based examples, approximately 3.7 minutes; startup failures, deadline exhaustion, and cleanup; no desktop |
 | `probe:wayland-helper` / `test.wayland-helper` | `cabal test wayland-helper-tests --test-show-details=direct` | 11 stub-based examples, including a ten-second readiness deadline; isolated socket environment and cleanup; no desktop |
 | `probe:lua-nontermination` / `test.lua-hazard` | `cabal test hetoimasia-scripting-lua:lua-hazard-probes --test-show-details=direct` | Five-second cancellation observation of deliberately nonterminating Lua in a child that the probe terminates |
+| `probe:lua-forced-exit` / `test.lua-forced-exit` | `cabal test hetoimasia:lua-forced-exit-probe --test-show-details=direct` | Four examples; the `lua` subcommand's second SIGINT or SIGTERM during an orderly stop that never returns exits 130 promptly, in a child the probe kills and reaps itself |
 | `probe:lua-confinement-linux` / `test.lua-confinement-linux` | `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct` | Linux only; confinement, limits, isolation, and lifetime feasibility; missing prerequisites can leave evidence unproven |
 | `probe:lua-confinement-macos` / `test.macos-confinement` | `cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct` | Darwin only; confinement and resource-limit feasibility using unsupported interfaces |
 

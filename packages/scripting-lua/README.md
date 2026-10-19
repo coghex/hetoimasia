@@ -3240,9 +3240,90 @@ there is one, and the `RunStatus`. The status is `StatusFailure` if any instance
 stop request ended the run; otherwise `StatusSuccess`: a limit, a Lua control and every instance completing are success. Exit numbers are the command
 line's.
 
+### The command line
+
+`hetoimasia lua` (LUA-19, `console/Hetoimasia/Console/Lua*.hs` and `app/Main.hs` in the root package) is the
+runner's command line: it parses the arguments, installs two signal handlers, wires the runner to the
+process's streams and maps the runner's answer to an exit status. It changes nothing of the runner.
+
+```text
+hetoimasia lua [--vm NAME] [--scheduler fifo] [--headless] [--tick SECONDS] [--for SECONDS | --ticks N]
+               --script PATH [--name NAME] [--every SECONDS | --every-ticks N] [--script PATH ...]
+```
+
+Every option takes its value as the next argument. *VM options* may appear anywhere and at most once each: `--vm NAME`
+(default `main`), `--scheduler fifo` (the default and only value), `--headless` (accepted; headless is the default and only
+mode), `--tick SECONDS` (the tick duration: the VM runs on logical ticks granted at that real-time rate), `--for SECONDS` (the duration limit)
+and `--ticks N` (the tick limit). *Script options* bind to the most recent `--script PATH` and at most once each: `--name NAME` (default the
+file's name without directory and extension), `--every SECONDS` (an elapsed interval) and `--every-ticks N` (a tick interval). Seconds are positive decimal
+numbers of at most nine fractional digits with no sign and no exponent, so they are whole nanoseconds: zero, finer, malformed or unrepresentable
+values are refused and nothing is rounded. Counts are positive whole numbers that fit a 64-bit tick. `lua --help` alone writes the
+help to stdout and exits 0. No `--group` flag, and no stdin console.
+
+**Usage is validated first**, as a pure function of the argument list (`Hetoimasia.Console.Lua.Options.parseLua`), before any file is read, any VM is
+started or any signal handler is installed. Refused: an unknown option or argument; a value that is missing, empty or itself an option; a repeated VM option
+(`--headless` included); a script option before the first `--script`; a script option repeated for one script; a scheduler other than `fifo`; a malformed number;
+no `--script`; `--ticks` or `--every-ticks` without `--tick`; `--every` with `--tick`; `--every` with `--every-ticks`. A refusal the runner returns (it needs the
+module's entries: a module defining both `run` and `update`, `update` with no interval, an interval for a module with no `update`) is a usage error too. A usage error
+writes the usage line and a one-line reason to stderr, nothing to stdout, and exits 2; so does the top-level unknown argument. A present but invalid logging
+variable is configuration, not usage: it fails startup with status 1 before any argument is read.
+
+**Streams.** The runner's output sink is stdout and its error sink is stderr, each flushed after every write, so a reader on a pipe sees each line at once: `print` output
+and the TID/OWNER/NAME/STATUS tables on stdout; `warn`, failure and source-did-not-load reports and usage text on stderr (the owner's decision on
+[#492](https://github.com/coghex/hetoimasia/issues/492#issuecomment-6270451945)). The logger's records stay on stderr under the logging variables, as for `--smoke`. Both handles are UTF-8.
+
+**Exit statuses** (`Hetoimasia.Console.Exit` names them; `Hetoimasia.Console.Lua.Status` maps the runner's answer, a pure function):
+
+| Status | When |
+|---|---|
+| 0 | every instance completed or was stopped, by a control or by a limit |
+| 1 | an instance failed, a source did not load, or a failure of the host propagated |
+| 2 | invalid usage |
+| 130 | SIGINT or SIGTERM ended the run, after the orderly stop; also a cancellation |
+
+When several apply, 1 outranks 130, which outranks 0 (the runner's status value already ranks failure over interrupted over success).
+
+**Signals.** SIGINT and SIGTERM handlers are installed on the `lua` path only, after the usage check and before the runner starts; every other path keeps GHC's
+defaults. Both call one coordinator (`Hetoimasia.Console.Lua.Signals`), one atomic step on one state: the first signal, whichever it is, sets the runner's stop
+request and returns without waiting for the shutdown it asks for, and the run ends through the orderly stop of the runner (nothing is admitted if it comes first). A
+**second** signal while that stop is still running exits at once with status 130, skipping the shutdown hooks that have not run, waiting for no cleanup and
+flushing nothing (D-42; `exitImmediately`); a later one changes nothing, and overlapping deliveries request the stop once and force at most once. A script stuck in
+non-yielding Lua keeps the first stop pending (D-27), which is what the second signal is for.
+
+**Wiring.** The executable runs the runner through the runtime's application lifecycle (`runScopedApplication`): the logging lifetime over stderr, entered first and
+left last so it outlives the supervision drain and makes the one final flush after it, the public supervision boundary, and the runner inside it with the production
+clock and timer. The executable keeps `-threaded`; the bridge's calls are `safe`, so no more capabilities are needed. The interpreter is the copy the `lua` package bundles.
+
+**Examples.** Three checked-in scripts under `test/lua-examples/`, run by their documented commands in the root suite's `Console` group:
+
+```sh
+# a one-shot: prints and completes
+hetoimasia lua --script test/lua-examples/oneshot.lua
+# a looped instance and a controller that pauses, resumes and stops it through the lifecycle controls
+hetoimasia lua --tick 0.001 --ticks 40 \
+  --script test/lua-examples/looped.lua --every-ticks 1 \
+  --script test/lua-examples/controller.lua --every-ticks 3
+# an event-only watcher of the instances' start and end events, which stops itself once every other instance has ended
+hetoimasia lua --tick 0.001 --ticks 20 \
+  --script test/lua-examples/watcher.lua --script test/lua-examples/oneshot.lua
+```
+
+The looped and watcher examples run on `--tick` with `--ticks`, so their output is the same on every run; the elapsed-clock variant (`--every SECONDS`,
+`--for SECONDS`) is asserted on structure only.
+
+**What proves it.** The `Console` group of `hetoimasia-tests` (`--test-options='--match Console'`): the command line as direct examples (every refusal, default and
+number at its boundary), the status mapping, the coordinator (first signal, second, later, overlapping deliveries on many threads), and every status by running the
+built executable as a child process: 0, 1, 2 (a representative of each class of usage error, a runner refusal and the top-level unknown argument) and 130 for SIGINT
+and SIGTERM with the instance's `shutdown` output on stdout before the process exits, and which stream carries what. A signal is delivered only after the child has said on stdout
+that its script is running; every read and wait is bounded; no example sleeps; every child is killed with `SIGKILL` and reaped on every way out, independently of
+the signal under test. The forced exit needs a script whose `shutdown` never returns, so it is the optional probe `lua-forced-exit-probe`
+(`cabal test hetoimasia:lua-forced-exit-probe --test-show-details=direct`, validation group `test.lua-forced-exit`, `optional: true`, never selected by affected
+inputs): a first signal after the script reports it is running, a second after it reports its stop has begun, and the process exits 130 promptly, the hook never having finished.
+Signal semantics differ between Linux and macOS; Linux CI is the evidence.
+
 ### What is not here
 
-The command line, signals, `exit` and exit numbers (LUA-19); window creation, VM groups, module reload, a stop deadline. `Hetoimasia.Scripting.Lua.Runner.Internal` is the seam the
+Signals, `exit` and exit numbers belong to the command line above, and the runner does not use them; window creation, VM groups, module reload, a stop deadline. `Hetoimasia.Scripting.Lua.Runner.Internal` is the seam the
 examples use for a callback (an event source, bindings of their own, the owner's endpoint): it is not part of the contract and
 is no way to configure a production run.
 

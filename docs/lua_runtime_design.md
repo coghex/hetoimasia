@@ -3236,6 +3236,24 @@ and verified policy, with adversarial regression coverage.
   production game content or a full replay product.
 - **Open questions:** None; D-40 settles the runner's product choices and D-41
   renews readiness.
+- **As delivered (#494):** the choices the slice left to its solver, recorded so a later slice does not reopen
+  them. The package contract is [`packages/scripting-lua/README.md`](../packages/scripting-lua/README.md#the-command-line).
+  The command line is a pure parser (`Hetoimasia.Console.Lua.Options`) in the root package's private `console`
+  library, with the status mapping (`...Lua.Status`), the one signal coordinator (`...Lua.Signals`) and the wiring
+  (`Hetoimasia.Console.Lua`) beside it; `app/Main.hs` only routes. A value that is absent, empty or itself begins with
+  `--` is a missing value; a repeated `--headless` is a repeated VM option; `--help` is help only as the whole line;
+  `--every` with `--tick` is refused whichever order they come in, as is `--every-ticks` or `--ticks` without
+  `--tick`; a script's default name is its file's stem. A refusal the runner returns writes the usage line and its
+  reasons joined into one line, and exits 2. Both streams are UTF-8 and flushed after every write. The handlers
+  are installed after the usage check and before the logging lifetime is entered, and call `exitImmediately 130` as
+  the second signal's force action. The run goes through `runScopedApplication` with the logging lifetime over
+  stderr, so the final flush follows the supervision drain; the lifetime's logger is kept as it is entered because the
+  lifecycle hands its action none. The executable keeps `-threaded` and no extra capabilities, since the bridge's calls
+  are `safe`. The examples live under `test/lua-examples/`, where the planner classifies them as the root suite's
+  inputs. The forced exit is the optional probe `lua-forced-exit-probe` (group `test.lua-forced-exit`), which shares
+  the console examples' process support (`Test.Engine.Console.Support`), whose `withChild` kills with `SIGKILL`
+  and reaps on every way out. Nothing in the runner's directories, `Runtime.Supervision`, `Runtime.Inbox`, the CI image
+  or the native pins changed.
 
 ### LUA-8. Prove independent trusted UI and gameplay execution headlessly
 
