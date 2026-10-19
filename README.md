@@ -59,7 +59,8 @@ production mod-process work needs the deployment decision required by D-11.
 
 Toolchain: GHC **9.14.1**, Cabal **3.18.1.0**, qualified and pinned in
 [docs/toolchain.md](docs/toolchain.md). Console execution needs no
-Vulkan, Lua, display, or Synarchy process. Building all components requires
+Vulkan, display, or Synarchy process; the `lua` subcommand links the Lua interpreter
+the `lua` package bundles, never one on the machine. Building all components requires
 the pinned GLFW dependency: follow the
 [native prerequisites](docs/validation.md#developer-prerequisites-and-macos)
 to build/cache it and prepare the local environment. Linux CI uses the pinned image.
@@ -159,6 +160,28 @@ HETOIMASIA_LOG_LEVEL=warn cabal run exe:hetoimasia -- --resource-smoke
 
 Every lifecycle record above is `Info`, so the last command still acquires,
 uses, and releases both resources and still exits 0 — it just says nothing.
+
+### The `lua` subcommand
+
+`hetoimasia lua` runs Lua files as the instances of one named VM, headless, on elapsed
+time or on logical ticks:
+
+```sh
+cabal run exe:hetoimasia -- lua --script test/lua-examples/oneshot.lua
+cabal run exe:hetoimasia -- lua --vm test --scheduler fifo --headless --script ./testscript.lua
+cabal run exe:hetoimasia -- lua --tick 0.001 --ticks 40 \
+  --script test/lua-examples/looped.lua --every-ticks 1 \
+  --script test/lua-examples/controller.lua --every-ticks 3
+cabal run exe:hetoimasia -- lua --help
+```
+
+`print` output and the instance tables go to stdout, and `warn`, failure reports, usage text and the
+logger's records go to stderr. It exits **0** when every instance completed or was stopped by a
+control or a limit, **1** when an instance failed or a file did not load, **2** for invalid usage
+(the top-level unknown argument included), and **130** when SIGINT or SIGTERM ended the run after
+the orderly stop; 1 outranks 130, which outranks 0. A second signal during the orderly stop exits 130 at
+once. The options, the grammar of the numbers, the signal rule and the examples are in
+[the package README](packages/scripting-lua/README.md#the-command-line).
 
 ## Layout
 
