@@ -91,17 +91,25 @@ spec = describe "the lua subcommand, run as a process" $ do
         outcome ← lua ["--tick", "0.001", "--ticks", "3", "--script", at "wait.lua"]
         outcomeCode outcome `shouldBe` ExitSuccess
         lines (outcomeOut outcome) `shouldSatisfy` elem "shutdown stopped"
-    it "for a run ended by --for" $
+    it "for a run ended by --for, which a script that never ends cannot hold" $
       withLuaFiles [("wait.lua", waiting)] $ \at → do
+        -- The limit is measured from before admission and may end the run before, during or after it, so
+        -- nothing here depends on how far the child got: it ends, bounded, successfully, with nothing
+        -- on stderr.
         outcome ← lua ["--for", "0.05", "--script", at "wait.lua"]
         outcomeCode outcome `shouldBe` ExitSuccess
-        lines (outcomeOut outcome) `shouldSatisfy` elem "shutdown stopped"
-    it "for a looped example on the elapsed clock, asserted on its structure" $ do
-      outcome ← lua ["--for", "0.1", "--script", looped, "--every", "0.01"]
-      outcomeCode outcome `shouldBe` ExitSuccess
-      let seen = lines (outcomeOut outcome)
-      seen `shouldSatisfy` elem "looped: update 1"
-      seen `shouldSatisfy` elem "looped: shutdown stopped"
+        outcomeErr outcome `shouldBe` ""
+    it "for a looped example on the elapsed clock, once it has been seen to update, asserted on its structure" $
+      withChild quiet ["lua", "--script", looped, "--every", "0.005"] $ \child → do
+        -- Progress is coordinated through what the child printed, never through a deadline; the signal
+        -- ends the run.
+        seen ← awaitMarker child "looped: update 1"
+        sendSignal sigINT child
+        code ← awaitExit child
+        rest ← readRest child
+        code `shouldBe` ExitFailure 130
+        lines rest `shouldSatisfy` elem "looped: shutdown stopped"
+        seen `shouldSatisfy` elem "instances at start"
 
   describe "exits 1" $ do
     it "for an instance whose init fails, reporting it on stderr" $
@@ -157,6 +165,28 @@ spec = describe "the lua subcommand, run as a process" $ do
         outcomeOut outcome `shouldBe` ""
         outcomeErr outcome `shouldContain` "Usage: hetoimasia lua"
         outcomeErr outcome `shouldContain` "both.lua"
+    it "with one usage line and one reason line, whatever control characters the arguments carry" $
+      forM_
+        [ ["--ticks", "1\n2", "--script", "a.lua"]
+        , ["--script", "a\r\nb.lua", "--name", "x", "--name", "y"]
+        , ["--bogus\tline\nbreak"]
+        , ["stray\ESCargument"]
+        , ["--script", "caf\233.lua", "--every-ticks", "1"]
+        , ["--vm", replicate 5000 'v', "--vm", "w", "--script", "a.lua"]
+        ] $ \arguments → do
+          outcome ← lua arguments
+          outcomeCode outcome `shouldBe` ExitFailure 2
+          outcomeOut outcome `shouldBe` ""
+          let diagnostics = lines (outcomeErr outcome)
+          length diagnostics `shouldBe` 2
+          -- Plain printable ASCII, and bounded.
+          unlines diagnostics `shouldSatisfy` all (\character → character == '\n' || (character >= ' ' && character <= '~'))
+          forM_ diagnostics $ \line → length line `shouldSatisfy` (< 600)
+    it "for the top-level unknown argument carrying a line break, still one usage line and one reason" $ do
+      outcome ← runToCompletion quiet ["--bad\nargument"]
+      outcomeCode outcome `shouldBe` ExitFailure 2
+      outcomeOut outcome `shouldBe` ""
+      length (lines (outcomeErr outcome)) `shouldBe` 2
     it "for the top-level unknown argument, with a usage line naming the lua subcommand" $ do
       outcome ← runToCompletion quiet ["--resources"]
       outcomeCode outcome `shouldBe` ExitFailure 2

@@ -96,6 +96,7 @@ library console
         Hetoimasia.Console.Lua.Options
         Hetoimasia.Console.Lua.Signals
         Hetoimasia.Console.Lua.Status
+        Hetoimasia.Console.Usage
     build-depends:
         base >=4.22 && <4.23,
         filepath >=1.5 && <1.6,

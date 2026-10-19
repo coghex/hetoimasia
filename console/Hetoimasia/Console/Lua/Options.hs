@@ -41,6 +41,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (RequirePositive), durationFromNanoseconds)
+import Hetoimasia.Console.Usage (diagnosticText)
 import System.FilePath (takeBaseName)
 
 -- | What the arguments after @lua@ ask for.
@@ -111,19 +112,21 @@ problemReason ∷ UsageProblem → Text
 problemReason = \case
   UnknownOption option → "unknown option " <> quote option
   UnknownArgument argument → "unknown argument " <> quote argument
-  MissingValue option → Text.pack option <> " needs a value"
-  RepeatedVmOption option → Text.pack option <> " was given more than once"
-  ScriptOptionBeforeScript option → Text.pack option <> " must follow the --script it applies to"
-  RepeatedScriptOption option path → Text.pack option <> " was given more than once for " <> quote path
+  MissingValue option → shown option <> " needs a value"
+  RepeatedVmOption option → shown option <> " was given more than once"
+  ScriptOptionBeforeScript option → shown option <> " must follow the --script it applies to"
+  RepeatedScriptOption option path → shown option <> " was given more than once for " <> quote path
   SchedulerNotFifo given → "the scheduler " <> quote given <> " is not supported; the only one is fifo"
-  MalformedNumber option value → Text.pack option <> " has an invalid value " <> quote value
+  MalformedNumber option value → shown option <> " has an invalid value " <> quote value
   NoScript → "no --script was given"
   TicksWithoutTick → "--ticks needs --tick, the logical clock"
   EveryTicksWithoutTick path → "--every-ticks for " <> quote path <> " needs --tick, the logical clock"
   EveryWithTick path → "--every for " <> quote path <> " is an elapsed interval and the VM runs on ticks; use --every-ticks"
   EveryWithEveryTicks path → "--every and --every-ticks were both given for " <> quote path
   where
-    quote value = "'" <> Text.pack value <> "'"
+    -- Whatever the user typed is escaped and bounded: it is one line of plain ASCII.
+    shown = diagnosticText
+    quote value = "'" <> diagnosticText value <> "'"
 
 -- | The state of one parse.
 data Parsed = Parsed

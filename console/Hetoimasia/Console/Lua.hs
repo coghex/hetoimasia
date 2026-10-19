@@ -32,7 +32,7 @@ import qualified Data.List.NonEmpty as NonEmpty
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.IO as Text
-import Hetoimasia.Console.Exit (cancellationExitCode, usageExitCode)
+import Hetoimasia.Console.Exit (cancellationExitCode)
 import Hetoimasia.Console.Lua.Options
   ( LuaCommand (..)
   , LuaParse (LuaHelp, LuaRun)
@@ -44,6 +44,7 @@ import Hetoimasia.Console.Lua.Options
   )
 import Hetoimasia.Console.Lua.Signals (deliver, newCoordinator, stopRequested)
 import Hetoimasia.Console.Lua.Status (outcomeStatus, refusalLines)
+import Hetoimasia.Console.Usage (usageFailure)
 import Hetoimasia.Foundation.Log (LogFilter, Logger)
 import Hetoimasia.Runtime.Application (runScopedApplication)
 import Hetoimasia.Runtime.Logging (LoggingLifetime, lifetimeLogger, withHandleLoggingLifetime)
@@ -69,13 +70,9 @@ runLua configuration arguments = case parseLua arguments of
   Right LuaHelp → Text.putStr luaHelp
   Right (LuaRun command) → runCommand configuration command
 
--- | Write the usage line and the one-line reason to stderr, nothing to stdout, and exit 2.
+-- | The usage line and the one-line reason, on stderr, and exit 2.
 refuse ∷ Text → IO a
-refuse reason = do
-  Text.hPutStrLn stderr luaUsage
-  Text.hPutStrLn stderr ("hetoimasia lua: " <> reason)
-  hFlush stderr
-  exitWith usageExitCode
+refuse = usageFailure "hetoimasia lua: " luaUsage
 
 runCommand ∷ LogFilter → LuaCommand → IO ()
 runCommand configuration command = do

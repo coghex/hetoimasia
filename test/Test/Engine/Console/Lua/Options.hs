@@ -149,6 +149,18 @@ spec = describe "the lua command line" $ do
       parseLua ["--ticks", "3", "--script", "a.lua", "--every", "1", "--every-ticks", "2"] `shouldBe` Left TicksWithoutTick
       parseLua ["--tick", "1", "--script", "a.lua", "--every", "1", "--script", "b.lua", "--every-ticks", "2", "--every", "1"]
         `shouldBe` Left (EveryWithTick "a.lua")
+    it "escapes what the user typed, so a reason is one line of printable ASCII" $
+      forM_
+        [ MalformedNumber "--ticks" "1\n2"
+        , UnknownArgument "a\rb"
+        , UnknownOption "--x\ESC[0m"
+        , RepeatedScriptOption "--name" "caf\233\8232.lua"
+        , SchedulerNotFifo "\0"
+        , MissingValue "--vm\n"
+        ] $ \problem →
+          problemReason problem `shouldSatisfy` Text.all (\character → character >= ' ' && character <= '~')
+    it "bounds a long value with a visible marker" $
+      Text.length (problemReason (UnknownArgument (replicate 5000 'a'))) `shouldSatisfy` (< 300)
     it "gives every refusal a one-line reason" $
       forM_
         [ UnknownOption "--x", UnknownArgument "y", MissingValue "--vm", RepeatedVmOption "--vm", ScriptOptionBeforeScript "--name"

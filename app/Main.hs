@@ -4,8 +4,9 @@ import Control.Monad (void)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.IO as Text
-import Hetoimasia.Console.Exit (exitOnFailure, usageExitCode)
+import Hetoimasia.Console.Exit (exitOnFailure)
 import Hetoimasia.Console.Lua (runLua)
+import Hetoimasia.Console.Usage (diagnosticText, usageFailure)
 import Hetoimasia.Foundation.Log
   ( Component
   , LogFilter
@@ -19,8 +20,8 @@ import Hetoimasia.Runtime (runApplication)
 import Hetoimasia.Runtime.Logging (lifetimeLogger, withHandleLoggingLifetime)
 import Hetoimasia.Runtime.Resources (managedResourceSmoke, smokeWork, workingReleases)
 import System.Environment (getArgs, lookupEnv)
-import System.Exit (die, exitWith)
-import System.IO (hFlush, stderr)
+import System.Exit (die)
+import System.IO (stderr)
 
 -- | Startup resolves the logging configuration before any supported path
 -- runs, so a present but invalid variable fails with a non-zero exit and a
@@ -37,7 +38,7 @@ main = exitOnFailure $ do
     ["--resource-smoke"] → resourceSmokePath logFilter
     ["--help"] → Text.putStr help
     "lua" : rest → runLua logFilter rest
-    argument : _ → usageError ("unknown argument '" <> argument <> "'")
+    argument : _ → usageError ("unknown argument '" <> Text.unpack (diagnosticText argument) <> "'")
 
 -- | The three variables this console application reads its logging
 -- configuration from. The names are this application's own choice: the
@@ -55,15 +56,11 @@ logVariables = LogVariables
 readVariable ∷ Text → IO (Maybe Text)
 readVariable name = fmap Text.pack <$> lookupEnv (Text.unpack name)
 
--- | Every usage error of every path exits 2 (D-42): the usage line and a one-line
--- reason on stderr, nothing on stdout. The @lua@ subcommand has its own usage
--- line and calls the same status.
+-- | Every usage error of every path exits 2 (D-42), through one writer: the usage line and a
+-- one-line reason on stderr, nothing on stdout, the reason escaped (what the user typed cannot
+-- add a line). The @lua@ subcommand has its own usage line and the same writer.
 usageError ∷ String → IO a
-usageError reason = do
-  Text.hPutStrLn stderr usage
-  Text.hPutStrLn stderr ("hetoimasia: " <> Text.pack reason)
-  hFlush stderr
-  exitWith usageExitCode
+usageError reason = usageFailure "hetoimasia: " usage (Text.pack reason)
 
 -- | Help is ordinary application output rather than diagnostics, so it goes to
 -- stdout and stays visible at any configured threshold. The usage line is the
