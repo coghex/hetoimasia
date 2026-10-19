@@ -1,0 +1,141 @@
+cabal-version: 3.16
+name: hetoimasia-sample-lua-domains
+version: 0.1.0.0
+synopsis: A UI and a gameplay Lua owner composed side by side, headless
+description:
+    LUA-29's consumer (D-44): a small, application-owned sample that composes
+    two independent Lua VM owners from the Lua package's public modules, a UI
+    owner in the interface domain and a gameplay owner in the gameplay domain,
+    over one registration each exposes differently. Gameplay's world is
+    Haskell-owned and committed once per completed tick; the UI reads a
+    coherent latest snapshot and sends intentions that reach gameplay exactly
+    once. It has its own executable (`hetoimasia-lua-domains`) and tests. It
+    uses the public interfaces only, no engine library depends on it, and
+    nothing routine launches the executable.
+    .
+    It needs no GLFW, Vulkan or console package, so it builds in both
+    `cabal.project` and `cabal.project.cpu`.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.14.1
+extra-doc-files: README.md
+-- The application's Lua sources live under the library's source directory and are
+-- embedded in the library at compile time (`addDependentFile` registers them too;
+-- listing them lets a source distribution carry them).
+extra-source-files:
+    src/lua/*.lua
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: samples/lua-domains
+
+common language
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+
+-- The sample: its world, its intention queue, its two owners and the driver that
+-- grants gameplay's ticks. It imports foundation, runtime and the Lua package's
+-- public modules only: no `Runner`, no `Internal` module and nothing of GLFW,
+-- Vulkan or the console. `Test.Domains.Dependencies` reads this stanza and the
+-- imports of every module under `src`.
+library
+    import: language
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.Sample.LuaDomains
+        Hetoimasia.Sample.LuaDomains.Bounds
+        Hetoimasia.Sample.LuaDomains.Candidate
+        Hetoimasia.Sample.LuaDomains.Command
+        Hetoimasia.Sample.LuaDomains.Domains
+        Hetoimasia.Sample.LuaDomains.Embed
+        Hetoimasia.Sample.LuaDomains.Intention
+        Hetoimasia.Sample.LuaDomains.Queue
+        Hetoimasia.Sample.LuaDomains.Registration
+        Hetoimasia.Sample.LuaDomains.Report
+        Hetoimasia.Sample.LuaDomains.Scripts
+        Hetoimasia.Sample.LuaDomains.Shared
+        Hetoimasia.Sample.LuaDomains.Snapshot
+        Hetoimasia.Sample.LuaDomains.Tally
+        Hetoimasia.Sample.LuaDomains.World
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        deepseq >=1.5.1 && <1.6,
+        stm >=2.5.3 && <2.6,
+        template-haskell >=2.24 && <2.25,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-scripting-lua ==0.1.0.0,
+        hetoimasia-scripting-lua:runtime-lua ==0.1.0.0
+
+-- The headless session: both owners against a fixed scripted fake input source,
+-- N ticks, one bounded report on stdout. The threaded runtime is what lets the
+-- UI owner run while a gameplay segment is inside Lua.
+executable hetoimasia-lua-domains
+    import: language
+    main-is: Main.hs
+    hs-source-dirs: app
+    ghc-options: -threaded -rtsopts "-with-rtsopts=-N2"
+    build-depends:
+        base >=4.22 && <4.23,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-sample-lua-domains
+
+-- The sample's examples: real interpreters under real supervision, the UI owner's
+-- clock and timer injected where an example moves them by hand, and explicit
+-- gates and bounded waits everywhere else. The executable is run as a child
+-- process for its report, `--help` and exit statuses only; it is reached through
+-- `build-tool-depends`, and no routine check launches it any other way.
+test-suite lua-domains-tests
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: test
+    other-modules:
+        Test.Domains.Admission
+        Test.Domains.Barrier
+        Test.Domains.Command
+        Test.Domains.Conservation
+        Test.Domains.Dependencies
+        Test.Domains.Exposure
+        Test.Domains.Intentions
+        Test.Domains.Lifetime
+        Test.Domains.Process
+        Test.Domains.Progress
+        Test.Domains.Queue
+        Test.Domains.Random
+        Test.Domains.Spec
+        Test.Domains.Staging
+        Test.Domains.View
+        Test.Domains.Support
+        Test.Domains.World
+    -- The threaded runtime with two capabilities: the CPU-bound progress check
+    -- needs Haskell to run while a capability is inside a long Lua computation.
+    ghc-options: -threaded -rtsopts "-with-rtsopts=-N2"
+    build-tool-depends: hetoimasia-sample-lua-domains:hetoimasia-lua-domains
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        directory >=1.3 && <1.4,
+        filepath >=1.5 && <1.6,
+        hspec >=2.11 && <3,
+        process >=1.6 && <1.7,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-scripting-lua ==0.1.0.0,
+        hetoimasia-scripting-lua:runtime-lua ==0.1.0.0,
+        hetoimasia-test-support ==0.1.0.0,
+        hetoimasia-sample-lua-domains
