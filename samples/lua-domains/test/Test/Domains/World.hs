@@ -40,10 +40,42 @@ spec = describe "the world, the random stream and the candidate" $ do
       versionOf (moveEntity 0 1 0 world0) 0 `shouldBe` 1
       versionOf (moveEntity 0 0 (-1) (moveEntity 0 1 0 world0)) 0 `shouldBe` 2
 
-    it "keeps an entity inside the position limit, and leaves a move of no entity unchanged" $ do
+    it "keeps an entity inside the position limit however large the delta, and leaves a move of no entity unchanged" $ do
+      -- The sum is taken wide, so an extreme delta clamps and never wraps.
+      mapM_
+        (\(dx, dy, expected) → fmap (\entity → (entityX entity, entityY entity)) (entityAt (moveEntity 0 dx dy (moveEntity 0 positionLimit positionLimit world0)) 0) `shouldBe` Just expected)
+        [ (maxBound, maxBound, (positionLimit, positionLimit))
+        , (minBound, minBound, (negate positionLimit, negate positionLimit))
+        , (maxBound, minBound, (positionLimit, negate positionLimit))
+        ]
       let far = moveEntity 0 positionLimit 0 (moveEntity 0 positionLimit 0 world0)
       fmap entityX (entityAt far 0) `shouldBe` Just positionLimit
       moveEntity 99 1 1 world0 `shouldBe` world0
+
+  describe "the delta bound" $ do
+    it "is checked with two comparisons, so the minimum integer is outside it in either component" $ do
+      let at dx dy = validate bounds (Submitted 7 0 0 0 dx dy)
+          limit = fromIntegral (boundDelta bounds)
+      mapM_
+        (\(dx, dy) → at dx dy `shouldBe` Left RefusedDelta)
+        [ (minBound, 0)
+        , (0, minBound)
+        , (minBound, minBound)
+        , (maxBound, 0)
+        , (0, maxBound)
+        , (limit + 1, 0)
+        , (0, negate limit - 1)
+        ]
+      -- The bounds themselves are in.
+      fmap (\i → (intentDx i, intentDy i)) (at limit (negate limit)) `shouldBe` Right (limit, negate limit)
+
+    it "is the same check when a move is staged: no extreme delta is staged in either component" $ do
+      let candidate = beginCandidate bounds world0 1 []
+          refused dx dy = either Just (const Nothing) (stage bounds (Move 0 dx dy) candidate)
+      mapM_
+        (\(dx, dy) → refused dx dy `shouldBe` Just StagingDelta)
+        [(minBound, 0), (0, minBound), (minBound, minBound), (maxBound, 0), (0, maxBound)]
+      refused 8 (-8) `shouldBe` Nothing
 
   describe "the random stream" $ do
     it "is SplitMix64: the first outputs of seed zero are the published ones" $ do

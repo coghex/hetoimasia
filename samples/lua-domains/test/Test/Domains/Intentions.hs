@@ -137,6 +137,10 @@ spec = describe "the intention contract" $ do
                   , "  try('negative version', session, 0, 0, -1, 1, 0)"
                   , "  try('negative session', -1, 0, 0, 0, 1, 0)"
                   , "  try('negative tick', session, -1, 0, 0, 1, 0)"
+                  , "  try('minimum integer delta', session, 0, 0, 0, math.mininteger, 0)"
+                  , "  try('minimum integer second delta', session, 0, 0, 0, 0, math.mininteger)"
+                  , "  try('maximum integer delta', session, 0, 0, 0, math.maxinteger, 0)"
+                  , "  try('minimum integer entity', session, 0, math.mininteger, 0, 1, 0)"
                   , "  try('at the bounds', session, 0, 7, 0, 8, -8)"
                   ]
             }
@@ -152,9 +156,13 @@ spec = describe "the intention contract" $ do
                          , "negative version false version"
                          , "negative session false session"
                          , "negative tick false tick"
+                         , "minimum integer delta false delta"
+                         , "minimum integer second delta false delta"
+                         , "maximum integer delta false delta"
+                         , "minimum integer entity false entity"
                          , "at the bounds true nil"
                          ]
         counts ← readTVarIO (sharedCounts (domainsShared domains))
-        (countAccepted counts, countRefused counts, countMalformed counts) `shouldBe` (1, 7, 0)
+        (countAccepted counts, countRefused counts, countMalformed counts) `shouldBe` (1, 11, 0)
   where
     luaLinesOf = luaLines . map Text.pack

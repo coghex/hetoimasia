@@ -47,7 +47,7 @@ import Data.Int (Int64)
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
 import GHC.Generics (Generic)
-import Hetoimasia.Sample.LuaDomains.Bounds (Bounds (boundDelta, boundEntities))
+import Hetoimasia.Sample.LuaDomains.Bounds (Bounds (boundEntities), deltaWithin)
 
 -- | The six integers the UI's binding is handed, before any bound is applied.
 data Submitted = Submitted
@@ -91,7 +91,7 @@ validate bounds submitted
   | submittedTick submitted < 0 = Left RefusedTick
   | submittedEntity submitted < 0 || submittedEntity submitted >= fromIntegral (boundEntities bounds) = Left RefusedEntity
   | submittedVersion submitted < 0 = Left RefusedVersion
-  | abs (submittedDx submitted) > limit || abs (submittedDy submitted) > limit = Left RefusedDelta
+  | not (deltaWithin bounds (submittedDx submitted) && deltaWithin bounds (submittedDy submitted)) = Left RefusedDelta
   | otherwise =
       Right
         Intention
@@ -102,8 +102,6 @@ validate bounds submitted
           , intentDx = submittedDx submitted
           , intentDy = submittedDy submitted
           }
-  where
-    limit = fromIntegral (boundDelta bounds)
 
 -- | The reason a refusal answers with: a fixed word.
 refusalReason ∷ Refusal → Text

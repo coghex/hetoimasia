@@ -3,7 +3,8 @@
 module Test.Domains.Lifetime (spec) where
 
 import Control.Concurrent (forkIO, killThread)
-import Control.Concurrent.STM (atomically, readTVarIO)
+import Control.Concurrent.STM (atomically, readTVarIO, retry)
+import Control.Monad (unless)
 import Control.Exception (IOException, SomeException, displayException, fromException, throwIO, try)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf)
@@ -11,7 +12,8 @@ import Data.Maybe (isJust)
 import System.IO.Error (ioeGetErrorString)
 import Data.ByteString (ByteString)
 import Data.Text (Text)
-import Hetoimasia.Runtime.Supervision (SupervisedFailure (failedException), WorkerStatus (WorkerLive, WorkerStopped), supervisedFailures)
+import Hetoimasia.Foundation.Worker (pollCompletion)
+import Hetoimasia.Runtime.Supervision (SupervisedFailure (failedException), WorkerStatus (WorkerLive, WorkerStopped), supervisedFailures, supervisedWorker)
 import Hetoimasia.Sample.LuaDomains
   ( Answer (Closed)
   , Domains (domainsGameplay, domainsShared, domainsUi)
@@ -24,8 +26,9 @@ import Hetoimasia.Sample.LuaDomains
   , Started (startedOwner)
   , retireDomains
   , stepTick
+  , withDomains
   )
-import Hetoimasia.Sample.LuaDomains.Queue (reserved)
+import Hetoimasia.Sample.LuaDomains.Queue (isClosed, reserved)
 import Hetoimasia.Sample.LuaDomains.Scripts (gameplaySource, interfaceSource)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Messaging.Snapshot (Publication (PublicationClosed), publish)
@@ -34,7 +37,7 @@ import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedPublisher, sharedQueue
 import Hetoimasia.Scripting.Lua.Instance (InstanceOutcome (InstanceStopped), InstanceSettlement (resultOutcome))
 import Hetoimasia.Scripting.Lua.Runtime (ExitKind (ExitStopped), ExitRecord (exitKind, exitNotStarted, exitStarted))
 import Hetoimasia.Scripting.Lua.Registration (namespace, stateOperation)
-import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint, scheduledIdentity, scheduledStatus, ticksOutstanding)
+import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint, scheduledIdentity, scheduledStatus, scheduledSupervised, ticksOutstanding)
 import Test.Domains.Support
 import Test.Hspec
 
@@ -132,6 +135,45 @@ spec = describe "the owners' lifetime" $ do
     liveCount ui `shouldReturn` 0
     (committedTick domains, revisionNow domains) `shouldBe'` (0, 0)
     submit (domainsShared domains) (Submitted 1 0 0 0 1 0) `shouldReturn` Closed
+  it "leaves neither owner live when it raises, though one failed while the other was inside a segment and supervision had latched the failure" $ do
+    fx ← newFx
+    ui ← newFakeUi
+    let base = sampleConfig fx ui
+        config =
+          base
+            { configGameplaySource = luaLines ["function update(self, dt) boom.fail() end"]
+            , configUiSource = luaLines ["function update(self, dt) fx.hold('ui') ui.updated() end"]
+            , configExtensions = \shared → configExtensions base shared <> [Extension (namespace "boom" [stateOperation "fail" [] [] (\_ → throwIO (userError "the gameplay binding failed"))]) InGameplay]
+            }
+    facts ← newIORef Nothing
+    -- The supervision boundary rethrows the failure it latched when it closes, so the facts are
+    -- gathered inside it, while it is still open, and checked afterwards.
+    _ ←
+      try @SomeException . withBoundary $ \control → withReleased fx ["ui"] $ do
+        outcome ←
+          try . generous . withDomains control config $ \domains → do
+            writeIORef facts (Just (Left domains))
+            -- The UI owner is inside a held segment, and stays there until retirement has begun:
+            -- admission has ended. The gameplay failure then ends the body.
+            tickUi domains ui
+            awaitEntered fx "ui"
+            _ ← forkIO (atomically (isClosed (sharedQueue (domainsShared domains)) >>= \ended → unless ended retry) >> releaseGate fx "ui")
+            stepTick domains
+        let raised = either (\failure → const True (failure ∷ SomeException)) (const False) outcome
+        domains ← readIORef facts >>= \held → case held of
+          Just (Left found) → pure found
+          _ → fail "the session never started"
+        -- Still inside the boundary, which has drained nothing: both owners have actually ended,
+        -- whatever supervision latched, and the publication has ended with them.
+        ended ← mapM (\started → isJust . fmap (const ()) <$> atomically (pollCompletion (supervisedWorker (scheduledSupervised (startedOwner started))))) [domainsUi domains, domainsGameplay domains]
+        armed ← liveCount ui
+        snapshot ← prepare . fst =<< snapshotNow domains
+        publication ← atomically (publish (sharedPublisher (domainsShared domains)) snapshot)
+        answer ← submit (domainsShared domains) (Submitted 1 0 0 0 1 0)
+        writeIORef facts (Just (Right (raised, ended, armed, closed publication, answer)))
+    readIORef facts >>= \case
+      Just (Right found) → found `shouldBe` (True, [True, True], 0, True, Closed)
+      _ → expectationFailure "the example never reached its checks"
   where
     shouldBe' (a, b) expected = ((,) <$> a <*> b) `shouldReturn` expected
     notLive = \case

@@ -9,6 +9,7 @@ module Hetoimasia.Sample.LuaDomains.Bounds
   , defaultBounds
   , BoundsProblem (..)
   , validateBounds
+  , deltaWithin
   , maxEntities
   , maxDeltaLimit
   , positionLimit
@@ -65,6 +66,14 @@ defaultBounds =
     , boundStaleListed = 4
     , boundStaging = 4
     }
+
+-- | Whether one component of a move is within the bound on deltas. Two direct comparisons, so that
+-- no value can slip past: the absolute value of the minimum integer is itself negative, and a check
+-- written with it accepts the one value it most needs to refuse.
+deltaWithin ∷ Bounds → Int64 → Bool
+deltaWithin bounds delta = delta >= negate limit && delta <= limit
+  where
+    limit = fromIntegral (boundDelta bounds)
 
 -- | What is wrong with a configuration.
 data BoundsProblem

@@ -93,14 +93,16 @@ entityAt world index = Seq.lookup index (worldEntities world)
 moveEntity ∷ Int → Int64 → Int64 → World → World
 moveEntity index dx dy world = case entityAt world index of
   Nothing → world
-  Just entity ->
-    let x = clamp (entityX entity + dx)
-        y = clamp (entityY entity + dy)
+  Just entity →
+    let x = clamp (toInteger (entityX entity) + toInteger dx)
+        y = clamp (toInteger (entityY entity) + toInteger dy)
         moved = x /= entityX entity || y /= entityY entity
         entity' = Entity x y (if moved then entityVersion entity + 1 else entityVersion entity)
      in world {worldEntities = Seq.update index entity' (worldEntities world)}
   where
-    clamp = max (negate positionLimit) . min positionLimit
+    -- The sum is taken in 'Integer', so that no delta, however large, can wrap before the clamp.
+    clamp ∷ Integer → Int64
+    clamp = fromInteger . max (negate (toInteger positionLimit)) . min (toInteger positionLimit)
 
 -- | The stream's step: the output and the next state.
 nextRandom ∷ Word64 → (Word64, Word64)

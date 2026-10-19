@@ -98,10 +98,15 @@ spec = describe "conservation of intentions" $ do
       sequence_ collectors
       reportTicks report `shouldBe` 25
       revisionNow domains `shouldReturn` 25
-      let counts = reportCounts report
-      countAccepted counts `shouldBe` countApplied counts + countStale counts
+      -- The report was read when the owners were retired, before any producer need have met a
+      -- closed queue, so it says nothing of closed answers. It satisfies the law on its own; the
+      -- closed answers are read afresh, once the producers have joined.
+      let atRetirement = reportCounts report
+      countAccepted atRetirement `shouldBe` countApplied atRetirement + countStale atRetirement
+      counts ← readTVarIO (sharedCounts shared)
+      countAccepted counts `shouldBe` countAccepted atRetirement
+      countClosed counts `shouldSatisfy` (> 0)
       atomically (reserved (sharedQueue shared)) `shouldReturn` 0
       accepted ← readTVarIO acceptedBy
       [place | place ← accepted, placeTick place > (25 ∷ Word64)] `shouldBe` []
       length accepted `shouldBe` countAccepted counts
-      countClosed counts `shouldSatisfy` (> 0)

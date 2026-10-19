@@ -50,6 +50,7 @@ module Hetoimasia.Sample.LuaDomains.Queue
   , seal
   , settle
   , closeQueue
+  , isClosed
   , reserved
   , nextUnstarted
   , AdmitAt (..)
@@ -136,6 +137,10 @@ closeQueue ∷ Queue → STM ()
 closeQueue queue = do
   state ← readTVar (queueState queue)
   writeTVar (queueState queue) state {stateClosed = True}
+
+-- | Whether admission has ended.
+isClosed ∷ Queue → STM Bool
+isClosed queue = stateClosed <$> readTVar (queueState queue)
 
 -- | The UI's path: admit for the next tick that has not started, at the next free place in it. It
 -- reads the tick and takes the place in one transaction, so it cannot be late or a duplicate.

@@ -63,18 +63,19 @@ module Hetoimasia.Sample.LuaDomains.Domains
   , DomainsDefect (..)
   ) where
 
-import Control.Concurrent.MVar (MVar, modifyMVar, newMVar)
 import Control.Concurrent.STM (STM, atomically, modifyTVar', readTVar, retry, throwSTM, writeTVar)
-import Control.Exception (Exception, onException, throwIO)
+import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, fromException, mask, rethrowIO, throwIO, tryWithContext)
 import Control.Monad (forM_, unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.List.NonEmpty as NonEmpty
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Log (unsafeComponent)
 import Hetoimasia.Foundation.Messaging.Payload (prepare, preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (Publication (Published), SnapshotReader, closeSnapshot, observedValue, publish, readSnapshot, snapshotReader)
-import Hetoimasia.Foundation.Resource (withResource)
+import Hetoimasia.Foundation.Resource (composeCleanup)
+import Hetoimasia.Foundation.Worker (awaitCompletion)
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (RequirePositive), MonotonicSource, durationFromNanoseconds, monotonicSource)
 import Hetoimasia.Runtime.Supervision
   ( Disposition (Required)
@@ -82,8 +83,9 @@ import Hetoimasia.Runtime.Supervision
   , Role (Service)
   , RuntimeControl
   , WorkerPolicy (..)
-  , WorkerStatus (WorkerLive)
   , awaitSupervised
+  , checkRuntime
+  , supervisedWorker
   )
 import Hetoimasia.Sample.LuaDomains.Bounds (Bounds, defaultBounds, validateBounds)
 import Hetoimasia.Sample.LuaDomains.Candidate (Candidate (..), beginCandidate, commit)
@@ -134,7 +136,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
   , scheduledEndpoint
   , scheduledExitRecord
   , scheduledSpec
-  , scheduledStatus
+  , scheduledSupervised
   , startScheduledOwner
   )
 import Hetoimasia.Scripting.Lua.Scheduler (TimerBackend, systemTimerBackend)
@@ -257,7 +259,6 @@ data Domains = Domains
   , domainsControl ∷ !RuntimeControl
   , domainsGameplay ∷ !Started
   , domainsUi ∷ !Started
-  , domainsRetired ∷ !(MVar (Maybe Retirement))
   }
 
 -- | How one owner ended.
@@ -280,11 +281,35 @@ data Retirement = Retirement
 
 -- | Run a body over a session: both owners created, ready, with their behaviors active, under this
 -- supervision boundary, and retired in order on every way out.
+--
+-- Retirement is not a release: it waits for each owner's worker to have /actually ended/ (its raw
+-- completion, which supervision's latch of the other owner's failure neither shortens nor
+-- lengthens), and a segment that is running is waited for, so it can take as long as that segment.
+-- It therefore runs in the caller's own masking state, interruptibly, and an interruption does not
+-- end it: each is recorded, the wait goes on until both owners have ended, and then what happened is
+-- raised, a cancellation first, with the rest kept as cleanup evidence beside it. What both owners
+-- used (the shared state their bindings borrow) is never dropped under a Lua call that is still
+-- running, and when this returns or raises, from inside the supervision boundary, neither owner is live.
 withDomains ∷ RuntimeControl → DomainsConfig → (Domains → IO a) → IO a
-withDomains control config = withResource (startDomains control config) (void . retireDomains)
+withDomains control config body = mask $ \restore → do
+  domains ← startDomains restore control config
+  outcome ← tryWithContext @SomeException (restore (body domains))
+  (_, interruptions) ← retireWith restore domains
+  case outcome of
+    Right result → do
+      raiseAll interruptions
+      -- Both owners have ended; raise what supervision committed of either.
+      restore (checkRuntime control)
+      pure result
+    Left primary →
+      composeCleanup (Just primary) [("lua domains retirement", interruption) | interruption ← interruptions]
+        >>= maybe (rethrowIO primary) rethrowIO
 
-startDomains ∷ RuntimeControl → DomainsConfig → IO Domains
-startDomains control config = do
+-- | Create both owners, gameplay first. An owner that fails to start leaves nothing behind (creation
+-- returns or raises only once its worker has ended), and one that started when the second fails is
+-- retired, protected, before the failure propagates.
+startDomains ∷ (∀ x. IO x → IO x) → RuntimeControl → DomainsConfig → IO Domains
+startDomains restore control config = do
   forM_ (NonEmpty.nonEmpty (validateBounds (configBounds config))) $ \problems →
     throwIO (BoundsRefused (map show (NonEmpty.toList problems)))
   shared ← newShared (configBounds config) (configSession config) (configSeed config) (configTicks config) (configInput config)
@@ -296,23 +321,26 @@ startDomains control config = do
       (sampleRegistration shared (map extensionNamespace (configExtensions config shared)))
   gameplay ←
     startBehavior
+      restore
       control
       runtime
       "gameplay"
       (gameplaySpec shared config registered)
       (sourceIdentity (gameplayModule (configGameplaySource config)))
       (LogicalTicks 1)
-  ui ←
-    startBehavior
-      control
-      runtime
-      "interface"
-      (uiSpec shared config registered)
-      (sourceIdentity (interfaceModule (configUiSource config)))
-      (ElapsedEvery (configUiInterval config))
-      `onException` retireOwner control gameplay
-  retired ← newMVar Nothing
-  pure (Domains config shared control gameplay ui retired)
+  started ←
+    tryWithContext @SomeException $
+      startBehavior
+        restore
+        control
+        runtime
+        "interface"
+        (uiSpec shared config registered)
+        (sourceIdentity (interfaceModule (configUiSource config)))
+        (ElapsedEvery (configUiInterval config))
+  case started of
+    Right ui → pure (Domains config shared control gameplay ui)
+    Left failure → rollback restore (startedOwner gameplay) failure
 
 -- | The gameplay owner's configuration: the gameplay domain, its own libraries, bounds, initial
 -- chunk and policy. Its clock and timer are the library's defaults, which a logical owner never
@@ -407,25 +435,25 @@ workerPolicy label =
   WorkerPolicy Service Required (unsafeComponent ("sample.lua-domains." <> label)) (\_ → pure Unrecognized)
 
 -- | Create an owner and admit its one behavior, and wait until the behavior is active: gameplay's
--- grants and the UI's cadence start only after the behavior's initialization.
-startBehavior ∷ RuntimeControl → LuaRuntime → Text → ScheduledSpec → ModuleRef → Interval → IO Started
-startBehavior control runtime name spec ref interval = do
+-- grants and the UI's cadence start only after the behavior's initialization. An owner that is up
+-- when the rest fails is retired, protected, before the failure propagates.
+startBehavior ∷ (∀ x. IO x → IO x) → RuntimeControl → LuaRuntime → Text → ScheduledSpec → ModuleRef → Interval → IO Started
+startBehavior restore control runtime name spec ref interval = do
   started ← startScheduledOwner runtime spec
   owner ← case started of
     ScheduledStarted owner → pure owner
     ScheduledUnavailable failure → throwIO (OwnerDidNotStart name (show failure))
     ScheduledRejected → throwIO (OwnerDidNotStart name "the supervision boundary had closed")
     ScheduledEnded → throwIO (OwnerDidNotStart name "the owner ended before it was ready")
-  let endpoint = scheduledEndpoint owner
-  admission ← admitInstance endpoint (InstanceRequest ref (Periodic interval) (Just name) OrdinaryClass []) `onException` stopOwner control owner
-  case admission of
-    InstanceAccepted identity ticket → do
-      let behavior = Started owner identity ticket
-      awaitActive control behavior name `onException` stopOwner control owner
-      pure behavior
-    other → do
-      stopOwner control owner
-      throwIO (BehaviorDidNotStart name (show other))
+  outcome ← tryWithContext @SomeException $ do
+    admission ← admitInstance (scheduledEndpoint owner) (InstanceRequest ref (Periodic interval) (Just name) OrdinaryClass [])
+    case admission of
+      InstanceAccepted identity ticket → do
+        let behavior = Started owner identity ticket
+        awaitActive control behavior name
+        pure behavior
+      other → throwIO (BehaviorDidNotStart name (show other))
+  either (rollback restore owner) pure outcome
 
 -- | Wait, supervised, until the behavior is active; an instance that ended instead is a failure.
 awaitActive ∷ RuntimeControl → Started → Text → IO ()
@@ -437,42 +465,74 @@ awaitActive control started name =
         | isTerminal (snapshotPhase snapshot) → throwSTM (BehaviorDidNotStart name (show (snapshotPhase snapshot)))
       _ → retry
 
+-- | Retire an owner that came up when the rest of construction failed, and raise the failure, with
+-- whatever interrupted the wait kept beside it.
+rollback ∷ (∀ x. IO x → IO x) → ScheduledOwner → ExceptionWithContext SomeException → IO a
+rollback restore owner failure = do
+  interruptions ← stopOwner restore owner
+  composeCleanup (Just failure) [("lua domains rollback", interruption) | interruption ← interruptions]
+    >>= maybe (rethrowIO failure) rethrowIO
+
 -- Retirement -----------------------------------------------------------------------
 
--- | Ask an owner to stop and wait, supervised, until it has ended.
-stopOwner ∷ RuntimeControl → ScheduledOwner → IO ()
-stopOwner control owner = do
+-- | Ask an owner to stop and wait until its worker has actually ended: its raw completion, which
+-- the supervision latch neither shortens nor lengthens. The wait runs in the caller's state, so it
+-- is interruptible; an interruption is recorded and the wait goes on, until the worker has ended.
+-- It answers the interruptions, in the order they arrived.
+stopOwner ∷ (∀ x. IO x → IO x) → ScheduledOwner → IO [ExceptionWithContext SomeException]
+stopOwner restore owner = do
   retireScheduled owner
-  awaitSupervised control $
-    scheduledStatus owner >>= \case
-      WorkerLive → retry
-      _ → pure ()
+  go []
+  where
+    go interruptions =
+      tryWithContext @SomeException (restore (atomically (void (awaitCompletion (supervisedWorker (scheduledSupervised owner)))))) >>= \case
+        Right () → pure (reverse interruptions)
+        Left interruption → go (interruption : interruptions)
 
--- | Retire an owner and read how it ended: its exit record and its behavior's settlement.
-retireOwner ∷ RuntimeControl → Started → IO OwnerEnd
-retireOwner control started = do
-  stopOwner control (startedOwner started)
-  record ← atomically (scheduledExitRecord (startedOwner started))
-  settlement ← pollInstance (startedTicket started)
-  pure (OwnerEnd record settlement)
+-- | Raise what went wrong, in the order it happened: a cancellation, if one was among them, is the
+-- one that propagates, as itself; otherwise the first is, and every other is kept whole as cleanup
+-- evidence beside it. Nothing to raise returns.
+raiseAll ∷ [ExceptionWithContext SomeException] → IO ()
+raiseAll failures = case lookup chosen indexed of
+  Nothing → pure ()
+  Just primary →
+    composeCleanup (Just primary) [("lua domains retirement", failure) | (index, failure) ← indexed, index /= chosen]
+      >>= maybe (rethrowIO primary) rethrowIO
+  where
+    indexed = zip [0 ∷ Int ..] failures
+    isCancellation (ExceptionWithContext _ exception) = isJust (fromException exception ∷ Maybe SomeAsyncException)
+    chosen = case [index | (index, failure) ← indexed, isCancellation failure] of
+      index : _ → index
+      [] → 0
 
--- | Retire both owners, the UI first, and say how each ended. It runs once: a second call answers
--- the first's retirement. Waiting for an owner that holds a segment waits for the segment to
--- return, as the owners' stop does (nothing is preempted).
+-- | Retire both owners in order and say how each ended, and what interrupted the waiting. Admission
+-- ends first, as an owner's does when it stops: nothing is accepted for a tick that will never run.
+-- The UI owner is retired and awaited next, being the producer of intentions and the reader of
+-- snapshots, then gameplay, and only then does the snapshot's publication end. Every step is
+-- idempotent, so retiring again changes nothing.
+retireWith ∷ (∀ x. IO x → IO x) → Domains → IO (Retirement, [ExceptionWithContext SomeException])
+retireWith restore domains = do
+  atomically (closeQueue (sharedQueue (domainsShared domains)))
+  uiInterruptions ← stopOwner restore (startedOwner (domainsUi domains))
+  gameplayInterruptions ← stopOwner restore (startedOwner (domainsGameplay domains))
+  atomically (closeSnapshot (sharedPublisher (domainsShared domains)))
+  ui ← endOf (domainsUi domains)
+  gameplay ← endOf (domainsGameplay domains)
+  pure (Retirement ui gameplay, uiInterruptions <> gameplayInterruptions)
+  where
+    endOf started = do
+      record ← atomically (scheduledExitRecord (startedOwner started))
+      settlement ← pollInstance (startedTicket started)
+      pure (OwnerEnd record settlement)
+
+-- | Retire both owners, the UI first, and say how each ended. Waiting for an owner that holds a
+-- segment waits for the segment to return, as the owners' stop does (nothing is preempted). It can be
+-- called again, and after the owners have ended it answers at once.
 retireDomains ∷ Domains → IO Retirement
-retireDomains domains = modifyMVar (domainsRetired domains) $ \case
-  Just done → pure (Just done, done)
-  Nothing → do
-    -- Admission ends first, as an owner's does when it stops: nothing is accepted for a tick that
-    -- will never run.
-    atomically (closeQueue (sharedQueue (domainsShared domains)))
-    ui ← retireOwner (domainsControl domains) (domainsUi domains)
-    gameplay ← retireOwner (domainsControl domains) (domainsGameplay domains)
-    -- Both owners are gone, so nothing reads or publishes any more: the publication ends with
-    -- the session, keeping the last value.
-    atomically (closeSnapshot (sharedPublisher (domainsShared domains)))
-    let done = Retirement ui gameplay
-    pure (Just done, done)
+retireDomains domains = do
+  (retirement, interruptions) ← retireWith id domains
+  raiseAll interruptions
+  pure retirement
 
 -- | The latest committed snapshot, read as a UI segment's capture reads it.
 latestSnapshot ∷ Domains → IO GameSnapshot

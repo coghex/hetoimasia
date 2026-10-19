@@ -35,7 +35,7 @@ module Hetoimasia.Sample.LuaDomains.Candidate
 
 import Data.Int (Int64)
 import Data.Word (Word64)
-import Hetoimasia.Sample.LuaDomains.Bounds (Bounds (boundDelta, boundEntities, boundStaging, boundStaleListed))
+import Hetoimasia.Sample.LuaDomains.Bounds (Bounds (boundEntities, boundStaging, boundStaleListed), deltaWithin)
 import Hetoimasia.Sample.LuaDomains.Intention
   ( Dispositions (..)
   , Intention (..)
@@ -114,11 +114,9 @@ data StagingRefusal
 stage ∷ Bounds → Move → Candidate → Either StagingRefusal Candidate
 stage bounds move candidate
   | moveEntityIndex move < 0 || moveEntityIndex move >= boundEntities bounds = Left StagingNoEntity
-  | abs (moveDx move) > limit || abs (moveDy move) > limit = Left StagingDelta
+  | not (deltaWithin bounds (moveDx move) && deltaWithin bounds (moveDy move)) = Left StagingDelta
   | length (candidateStaged candidate) >= boundStaging bounds = Left StagingFull
   | otherwise = Right candidate {candidateStaged = move : candidateStaged candidate}
-  where
-    limit = fromIntegral (boundDelta bounds)
 
 -- | A draw from @[0, n)@, advancing the candidate's stream; 'Nothing' for a bound the stream does
 -- not accept, which draws nothing.
