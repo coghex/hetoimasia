@@ -3149,10 +3149,13 @@ and verified policy, with adversarial regression coverage.
   settlements are read without being observed, so the owner's inspection keeps every admitted instance for the tables; a
   failure is written once, when its settlement is first seen, under one lock per table, report or call. A host
   failure on the runner's own thread retires the owner in order before it propagates; one inside the owner
-  retires protected. The callback examples use a test-only seam (`Runner.Internal`: an event source, bindings
+  retires protected. The retirement waits for the owner worker's raw completion, interruptibly and outside any
+  release (a join has no controlled blocking duration), so it is complete before any failure propagates, whoever
+  latched it, and a cancellation reaches it; supervision, not the wait, delivers the owner's own failure. The callback examples use a test-only seam (`Runner.Internal`: an event source, bindings
   and the owner's endpoint) and the public configuration has no source or subscription grant; LUA-28 replaces it
   with the real endpoint. The runner's bounds are documented constants (64 scripts, 4096 bytes a call of
-  `print`, 32-column cells, 8 secondary failures, 1024-character errors, 4096-character tracebacks).
+  `print`, 32-column cells, 8 secondary failures, 1024-character errors, 4096-character tracebacks), each
+  enforced on what is written, after control characters are replaced, since replacing makes text longer.
 
 ### LUA-28. Drive the runner on logical ticks and publish instance start and end events
 
