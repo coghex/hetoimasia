@@ -28,7 +28,7 @@ module Hetoimasia.Scripting.Lua.Runner.Gate
   ) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, retry, writeTVar)
-import Control.Exception (finally)
+import Control.Exception (finally, mask)
 import Control.Monad (when)
 import Hetoimasia.Scripting.Lua.Instance
   ( Execution (ExecIdle, ExecReady, ExecRunning, ExecWaiting)
@@ -62,7 +62,9 @@ gateHook gate _ = gateWait gate
 -- | What the owner does before each segment: nothing while the gate is not held, and otherwise wait for a
 -- permit or for the gate to be opened, parked where the runner can see it.
 gateWait ∷ Gate → IO ()
-gateWait (Gate var) = do
+gateWait (Gate var) = mask $ \restore → do
+  -- Publishing that the owner is parked and installing what clears it are one masked step, so an
+  -- asynchronous exception can never leave the flag set; only the wait itself can be interrupted.
   parked ← atomically $ do
     state ← readTVar var
     if not (gateHeld state)
@@ -72,8 +74,8 @@ gateWait (Gate var) = do
           then writeTVar var state {gatePermits = gatePermits state - 1} >> pure False
           else writeTVar var state {gateIsParked = True} >> pure True
   when parked $
-    atomically
-      ( do
+    restore
+      ( atomically $ do
           state ← readTVar var
           if not (gateHeld state)
             then writeTVar var state {gateIsParked = False}

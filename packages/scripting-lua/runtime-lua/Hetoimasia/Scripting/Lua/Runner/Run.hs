@@ -593,8 +593,10 @@ admitScripts internals env refOf hooks = do
       awaiting env (admitting False) soFar (quietNow env) >>= \case
         Left ending → pure (soFar, Just ending)
         Right () → do
-          atomically (holdGate (envGate env))
-          step ← admitOne known tell soFar item defined (null rest) `finally` atomically (freeGate (envGate env))
+          -- Holding the gate and installing its release are one masked step: no exception leaves it held.
+          step ← mask $ \restore → do
+            atomically (holdGate (envGate env))
+            restore (admitOne known tell soFar item defined (null rest)) `finally` atomically (freeGate (envGate env))
           case step of
             Admission now rows Nothing
               | null rest → do
