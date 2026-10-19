@@ -5,6 +5,8 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.IO as Text
 import Hetoimasia.Console.Exit (exitOnFailure)
+import Hetoimasia.Console.Lua (runLua)
+import Hetoimasia.Console.Usage (diagnosticText, usageFailure)
 import Hetoimasia.Foundation.Log
   ( Component
   , LogFilter
@@ -35,7 +37,8 @@ main = exitOnFailure $ do
     ["--smoke"] → smoke logFilter
     ["--resource-smoke"] → resourceSmokePath logFilter
     ["--help"] → Text.putStr help
-    _ → die (Text.unpack usage)
+    "lua" : rest → runLua logFilter rest
+    argument : _ → usageError ("unknown argument '" <> Text.unpack (diagnosticText argument) <> "'")
 
 -- | The three variables this console application reads its logging
 -- configuration from. The names are this application's own choice: the
@@ -53,10 +56,17 @@ logVariables = LogVariables
 readVariable ∷ Text → IO (Maybe Text)
 readVariable name = fmap Text.pack <$> lookupEnv (Text.unpack name)
 
--- | Help and usage are ordinary application output rather than diagnostics, so
--- they go to stdout and stay visible at any configured threshold.
+-- | Every usage error of every path exits 2 (D-42), through one writer: the usage line and a
+-- one-line reason on stderr, nothing on stdout, the reason escaped (what the user typed cannot
+-- add a line). The @lua@ subcommand has its own usage line and the same writer.
+usageError ∷ String → IO a
+usageError reason = usageFailure "hetoimasia: " usage (Text.pack reason)
+
+-- | Help is ordinary application output rather than diagnostics, so it goes to
+-- stdout and stays visible at any configured threshold. The usage line is the
+-- one a usage error writes to stderr.
 usage ∷ Text
-usage = "Usage: hetoimasia [--smoke | --resource-smoke | --help]"
+usage = "Usage: hetoimasia [--smoke | --resource-smoke | --help | lua OPTIONS]"
 
 help ∷ Text
 help = Text.unlines
@@ -67,6 +77,21 @@ help = Text.unlines
   , "                    resource scopes, do bounded work with them, and report"
   , "                    the lifecycle. See docs/resources.md, Application"
   , "                    lifecycle."
+  , "  lua OPTIONS       Run Lua files as the instances of one VM, headless:"
+  , "                      --script PATH        a file to run; repeat for several"
+  , "                      --name NAME          the script's instance name (per script)"
+  , "                      --every SECONDS      the script's update interval (per script)"
+  , "                      --every-ticks N      the same, in ticks (per script)"
+  , "                      --vm NAME            the VM's name (default main)"
+  , "                      --scheduler fifo     the scheduling policy (the only one)"
+  , "                      --headless           accepted; the only mode"
+  , "                      --tick SECONDS       run on logical ticks of this length"
+  , "                      --for SECONDS        stop after this long"
+  , "                      --ticks N            stop after N ticks"
+  , "                    See 'hetoimasia lua --help' and packages/scripting-lua/README.md,"
+  , "                    The command line."
+  , ""
+  , "Exit status: 0 success, 1 failure, 2 invalid usage, 130 interrupted."
   , ""
   , "Logging is configured from the environment, read once at startup. An"
   , "absent variable keeps its default; a present but invalid value fails"

@@ -58,7 +58,7 @@
     },
     {
       "id": "test.engine",
-      "description": "Focused Hspec examples for the root package's console startup and exit integration.",
+      "description": "Focused Hspec examples for the root package's console: startup and exit integration, and the lua subcommand (LUA-19) run as a child process of the built executable, linked with the bundled Lua interpreter. The command line as direct examples of a pure function (every refusal, every default, every number at its boundary), the status mapping and the signal coordinator's rule (the first signal only requests the stop, the second forces exactly once, overlapping deliveries on many threads force at most once), and every exit status by running the executable: 0 for the checked-in one-shot, looped-with-controller and event-only watcher examples and for runs ended by --ticks and --for, 1 for a failing init, a later failure, a syntax error, a missing file and a failure followed by a signal, 2 for a representative of each class of usage error (including a refusal the runner returns and the top-level unknown argument), and 130 for SIGINT and SIGTERM with the instance's shutdown output on stdout before the process exits; which stream carries print, a table, a warning, a failure report and a usage line. A signal is delivered only after the child has said on stdout that its script is running, every read and every wait is bounded, no example sleeps, and every child is killed and reaped on every way out independently of the signal under test.",
       "command": [
         "cabal",
         "test",
@@ -136,7 +136,7 @@
     },
     {
       "id": "smoke.console",
-      "description": "Run the console executable's smoke mode end to end.",
+      "description": "Run the console executable's smoke mode end to end. The executable links the lua packages' bundled interpreter, so this also builds its C sources and the runner through the executable.",
       "command": [
         "cabal",
         "run",
@@ -675,6 +675,25 @@
       "framework": "hspec",
       "runner": "cpu",
       "timeout_seconds": 600,
+      "category": "probe",
+      "optional": true
+    },
+    {
+      "id": "test.lua-forced-exit",
+      "description": "Local-only optional probe of the lua subcommand's forced exit (LUA-19, D-42). Runs the built executable with a script whose shutdown never returns, delivers a first SIGINT or SIGTERM after the script reports it is running and a second after it reports its stop has begun, and shows the process exits with status 130 promptly, the hook never having finished. Deliberate nontermination, so never selected by affected inputs; the routine suite covers the rule through the coordinator's examples. Every wait is bounded and the child is killed and reaped independently of the signals under test.",
+      "command": [
+        "cabal",
+        "test",
+        "hetoimasia:lua-forced-exit-probe",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia:test:lua-forced-exit-probe",
+      "inputs": [
+        "cabal.project.common"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 900,
       "category": "probe",
       "optional": true
     }

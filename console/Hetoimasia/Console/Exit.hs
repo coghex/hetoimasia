@@ -13,7 +13,8 @@
 -- | Nothing: the path returned                  | Returns, so the process exits 0           |
 -- +---------------------------------------------+-------------------------------------------+
 -- | An 'ExitCode', such as a usage or           | Rethrows it unchanged                     |
--- | configuration @die@                         |                                           |
+-- | configuration @die@, or the @lua@ path's    |                                           |
+-- | mapped status                               |                                           |
 -- +---------------------------------------------+-------------------------------------------+
 -- | A cancellation: anything thrown as          | Exits with 'cancellationExitCode', writing|
 -- | asynchronous, including one arriving while  | nothing                                   |
@@ -23,6 +24,23 @@
 -- |                                             | then exits with 'failureExitCode'         |
 -- +---------------------------------------------+-------------------------------------------+
 --
+-- The statuses the executable uses, each named here:
+--
+-- +--------+-----------------------------------------------------+------------------------+
+-- | Status | Meaning                                             | Named                  |
+-- +========+=====================================================+========================+
+-- | 0      | The path returned: success                          |                        |
+-- +--------+-----------------------------------------------------+------------------------+
+-- | 1      | A failure, a configuration error, or an instance    | 'failureExitCode'      |
+-- |        | that failed or a source that did not load           |                        |
+-- +--------+-----------------------------------------------------+------------------------+
+-- | 2      | Invalid command-line usage (D-42), for every        | 'usageExitCode'        |
+-- |        | path, the @lua@ subcommand's and the top level's    |                        |
+-- +--------+-----------------------------------------------------+------------------------+
+-- | 130    | A cancellation, or a signal that ended the @lua@    | 'cancellationExitCode' |
+-- |        | run; also a second signal during its orderly stop   |                        |
+-- +--------+-----------------------------------------------------+------------------------+
+--
 -- The stderr line is application output, not a diagnostic: the runtime has
 -- already made whatever terminal report its logging lifetime allowed, and the
 -- sink that carried it may be the thing that failed, so a failure to write the
@@ -30,6 +48,7 @@
 module Hetoimasia.Console.Exit
   ( exitOnFailure
   , failureExitCode
+  , usageExitCode
   , cancellationExitCode
   ) where
 
@@ -49,6 +68,13 @@ import System.IO (hPutStrLn, stderr)
 -- | The status of a path that propagated a failure.
 failureExitCode ∷ ExitCode
 failureExitCode = ExitFailure 1
+
+-- | The status of invalid command-line usage, which every path uses (D-42): the
+-- @lua@ subcommand's usage errors and the top level's unknown argument alike. A
+-- present but invalid logging variable is configuration, not usage, and keeps
+-- 'failureExitCode'.
+usageExitCode ∷ ExitCode
+usageExitCode = ExitFailure 2
 
 -- | The status of a path that was cancelled: 128 plus @SIGINT@'s number, as a
 -- shell reports an interrupted command.
