@@ -146,6 +146,7 @@ module Hetoimasia.Scripting.Lua.Runner
     -- * What a run is given
   , Script (..)
   , script
+  , everyTicks
   , RunnerConfig (..)
   , runnerConfig
 
@@ -154,6 +155,8 @@ module Hetoimasia.Scripting.Lua.Runner
   , RunReport (..)
   , RunEnding (..)
   , RunStatus (..)
+  , EventTally (..)
+  , noTally
   , runStatusOf
   , InstanceReport (..)
   , InstanceEnd (..)
@@ -183,6 +186,9 @@ module Hetoimasia.Scripting.Lua.Runner
   , runnerInstanceBounds
   , runnerSchedulerBounds
   , runnerLifecycleName
+  , runnerEventsName
+  , runnerSubscriptionBound
+  , runnerStagingBound
   , outputCallLimit
   , truncationMarker
   , columnLimit

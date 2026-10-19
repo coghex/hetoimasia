@@ -257,10 +257,11 @@ spec = describe "failures" $ do
           expectBroken "host" failure
           expectNoEvidence failure
           -- Lua was not entered again: the instance whose init had succeeded keeps ShutdownSkippedUnsafe, and
-          -- the one whose init raised and the one that had not begun keep ShutdownSkippedNoInit.
+          -- the one whose init raised keeps ShutdownSkippedNoInit. Scripts are admitted one at a time, each
+          -- after the previous init has finished (LUA-28), so the third was never admitted.
           (_, admitted) ← admittedOf fixture
           settled ← forM admitted (pollInstance . snd)
-          map (fmap (terminationShutdown . resultTermination)) settled `shouldBe` [Just ShutdownSkippedUnsafe, Just ShutdownSkippedNoInit, Just ShutdownSkippedNoInit]
+          map (fmap (terminationShutdown . resultTermination)) settled `shouldBe` [Just ShutdownSkippedUnsafe, Just ShutdownSkippedNoInit]
           recorded fixture >>= (`shouldNotContain` ["c init"])
           filter (Text.isPrefixOf "shutdown") <$> recorded fixture `shouldReturn` []
           errLines fixture >>= (`shouldBe` [])

@@ -5,7 +5,7 @@ import Control.Monad (forM_)
 import Data.Char (isControl, isDigit)
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Hetoimasia.Scripting.Lua.Instance (InstancePhase (Completed, Failed), InstanceSnapshot (snapshotPhase), ShutdownDisposition (ShutdownRan, ShutdownSkippedNoInit))
+import Hetoimasia.Scripting.Lua.Instance (InstancePhase (Completed, Failed), InstanceSnapshot (snapshotPhase), ShutdownDisposition (ShutdownRan))
 import Hetoimasia.Scripting.Lua.Runner
 import Test.Hspec (Spec, describe, it, shouldBe, shouldNotContain, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Runner.Support
@@ -52,7 +52,7 @@ spec = describe "tables and status" $ do
         -- A TID is its three numbers, dotted.
         forM_ (tidsOf report) $ \tid → map (Text.all isDigit) (Text.splitOn "." (tidText tid)) `shouldBe` [True, True, True]
 
-  it "lists the instance that was not begun when the run is stopped, as stopped without its init, and writes no start table" $ bounded $ do
+  it "admits no further script when the run is stopped while an init is held, lists only what was admitted and writes no start table" $ bounded $ do
     fixture ← newRFixture
     withScripts
       [ ("a.lua", lua (["function init(self) fx.block('a') end"] <> eventOnly "a"))
@@ -62,17 +62,18 @@ spec = describe "tables and status" $ do
         withBoundary $ \_ runtime → do
           report ←
             alongside
-              -- The owner is held in a's init and b is admitted behind it, not begun. The stop request is
-              -- noticed, the run asks its owner to retire, and only then is the initializer let go.
-              (awaitGate fixture "a" >> setStop fixture True >> awaitRetiring fixture 1 >> openGate fixture "a")
+              -- The owner is held in a's init, and b waits to be admitted behind it. The stop request is
+              -- noticed, no further script is admitted, the run asks its owner to retire, and only then
+              -- is the initializer let go.
+              (awaitGate fixture "a" >> setStop fixture True >> awaitRetiring fixture 0 >> openGate fixture "a")
               (runTick fixture runtime (config fixture (map noWait paths)) >>= expectRan)
           reportEnding report `shouldBe` EndedStopRequest
-          -- The stop did not wait for b's initializer, and did not make it run to satisfy a barrier.
+          -- b was never admitted, so its init never ran, and a was stopped once it was begun.
           recorded fixture `shouldReturn` ["shutdown a stopped"]
-          map instanceShutdown (instancesOf report) `shouldBe` [ShutdownRan, ShutdownSkippedNoInit]
+          map instanceShutdown (instancesOf report) `shouldBe` [ShutdownRan]
           out ← outLines fixture
           out `shouldNotContain` [startTitle]
-          out `shouldBe` tableFor endTitle report [("a.lua", "stopped"), ("b.lua", "stopped")]
+          out `shouldBe` tableFor endTitle report [("a.lua", "stopped")]
 
   it "writes the start table when the held initializer is let go, with both instances active" $ bounded $ do
     -- One init holds the owner while the next instance waits behind it: the barrier opens when both have finished.
