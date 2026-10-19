@@ -599,12 +599,11 @@ admitScripts internals env refOf hooks = do
             Admission now rows Nothing
               | null rest → do
                   sinkTable (envSinks env) startTitle rows
+                  -- The ends seen while admitting are produced by this wait, once the owner is quiet and
+                  -- after every started event, in ascending TID order, before the run can end.
                   awaiting env (admitting True) now (quietNow env) >>= \case
                     Left ending → pure (now, Just ending)
-                    Right () → do
-                      pending ← atomically (takeEnded env now)
-                      produce (map endedEvent pending)
-                      pure (now, Nothing)
+                    Right () → pure (now, Nothing)
               | otherwise → go known tell now rest
             Admission now _ interrupted → pure (now, interrupted)
     admitOne known tell soFar item defined isLast =
@@ -641,7 +640,7 @@ admitScripts internals env refOf hooks = do
       place ← placeNow env
       produceEvents (envRegistry env) place events
     -- Every instance having ended ends the run only once the last script is admitted.
-    admitting complete = Mode {modeComplete = complete, modeEnded = False, modeTickLimit = False, modeDrain = False, modeProgressFirst = False}
+    admitting complete = Mode {modeComplete = complete, modeEnded = complete, modeTickLimit = False, modeDrain = False, modeProgressFirst = False}
 
 -- | One instance's admission: the instances admitted so far with it, the rows of the start table, and
 -- why the run ended meanwhile.
@@ -722,7 +721,8 @@ data Mode = Mode
   { modeComplete ∷ Bool
     -- ^ Every script is admitted, so every instance having ended ends the run.
   , modeEnded ∷ Bool
-    -- ^ An instance that settles has its end produced as it is seen (an elapsed VM's ordinary run).
+    -- ^ An instance that has settled has its end produced once the owner is quiet, before every instance
+    -- having ended, a limit or the end of the wait ends the run, and not once the stop request is set.
   , modeTickLimit ∷ Bool
     -- ^ The tick limit, once it is reached, ends the run: between ticks, not during one.
   , modeDrain ∷ Bool
@@ -771,12 +771,17 @@ awaiting env mode admitted progress = loop
         StepDone value → pure (Right value)
     stepNow = do
       failures ← takeFailures (envReported env) admitted
-      settled ← if null failures && modeEnded mode then takeEnded env admitted else pure []
+      everyone ← if modeComplete mode then allSettled admitted else pure False
+      stop ← runnerStop config
+      -- The ends the instances have earned are produced (and counted) once the owner is quiet, before the run
+      -- ends by every instance having ended or by a limit, so the events are the same as when the runner is
+      -- prompt; not once the orderly stop has begun, which no callback could answer. The ends are taken only
+      -- where they are answered: nothing is marked taken that is not produced.
+      quietNow' ← quiet (isTick env) <$> inspectInstances (envEndpoint env)
+      settled ← if null failures && modeEnded mode && quietNow' && (everyone || not stop) then takeEnded env admitted else pure []
       -- The phase's own progress is read for what outranks the endings only where reading it changes
       -- nothing: a finished @init@ (it permits a segment, and that is the answer) and a tick that has finished.
       early ← if null failures && null settled && modeProgressFirst mode then progress else pure Nothing
-      everyone ← if modeComplete mode then allSettled admitted else pure False
-      stop ← runnerStop config
       reached ← if modeTickLimit mode then tickLimitReached else pure False
       woke ← maybe (pure False) (timerWoken . fst) (envLimit env)
       finishing ← if modeDrain mode && not stop && not everyone then progress else pure Nothing
@@ -828,15 +833,13 @@ ticking env admitted tick timer = do
     Nothing → go (next (Just origin)) (1 ∷ Word64)
   where
     clock = runnerClock (envConfig env)
-    -- Between ticks: nothing is running, and the ends the last tick saw are produced for the next.
+    -- Between ticks: nothing is running, and the ends the last tick saw are produced for the next (the wait
+    -- does it, before it decides whether the run ends: the events are the run's whichever way it ends here).
     boundary =
-      awaiting env between admitted (Just <$> takeEnded env admitted) >>= \case
+      awaiting env between admitted (pure (Just ())) >>= \case
         Left ending → pure (Just ending)
-        Right settled → do
-          place ← placeNow env
-          produceEvents (envRegistry env) place (map endedEvent settled)
-          pure Nothing
-    between = Mode {modeComplete = True, modeEnded = False, modeTickLimit = True, modeDrain = False, modeProgressFirst = False}
+        Right () → pure Nothing
+    between = Mode {modeComplete = True, modeEnded = True, modeTickLimit = True, modeDrain = False, modeProgressFirst = False}
     during = Mode {modeComplete = True, modeEnded = False, modeTickLimit = False, modeDrain = True, modeProgressFirst = False}
     -- When the tick after one due at this instant is due, if that fits the clock's range, and
     -- never otherwise.

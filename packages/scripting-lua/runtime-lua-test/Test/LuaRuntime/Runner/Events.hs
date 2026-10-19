@@ -232,6 +232,48 @@ spec = describe "events" $ do
           eventsProduced report `shouldBe` 3
           attemptsMade report `shouldBe` 9
 
+  describe "the ends a run has earned when it ends" $ do
+    it "produces and counts every end when every one-shot has completed during admission" $ bounded $ do
+      fixture ← newRFixture
+      withScripts [("one.lua", lua ["function run(self) end"]), ("two.lua", lua ["function run(self) end"])] $ \paths →
+        withBoundary $ \_ runtime → do
+          report ← run fixture runtime (tickConfig fixture tickLength Nothing (map noWait paths)) >>= expectRan
+          reportEnding report `shouldBe` EndedAllInstances
+          let tally = reportEvents report
+          (tallyStarted tally, tallyEnded tally) `shouldBe` (2, 2)
+    it "produces and counts the end of the final instance when it ends during a tick" $ bounded $ do
+      fixture ← newRFixture
+      let selfStopping =
+            [ "function init(self, api) api.subscribe('instances', function(self, e) fx.record(e.payload.event .. ' ' .. e.payload.name) end) end"
+            , "function update(self, dt) lifecycle.stop(lifecycle.self()) end"
+            ]
+      withScripts [("a.lua", lua selfStopping)] $ \paths →
+        withBoundary $ \_ runtime → do
+          report ←
+            alongside
+              (driveTicks fixture tickLength 2)
+              (run fixture runtime (tickConfig fixture tickLength (Just 9) [everyTicks 1 (script (scriptAt paths 0))]) >>= expectRan)
+          reportEnding report `shouldBe` EndedAllInstances
+          reportTicks report `shouldBe` 2
+          let tally = reportEvents report
+          (tallyStarted tally, tallyEnded tally) `shouldBe` (1, 1)
+    it "produces and counts the ends of instances that end during the tick that reaches the tick limit" $ bounded $ do
+      fixture ← newRFixture
+      let selfStopping =
+            [ "function update(self, dt) lifecycle.stop(lifecycle.self()) end"
+            ]
+      withScripts [("watch.lua", lua watching), ("a.lua", lua selfStopping)] $ \paths →
+        withBoundary $ \_ runtime → do
+          report ←
+            alongside
+              (driveTicks fixture tickLength 2)
+              (run fixture runtime (tickConfig fixture tickLength (Just 2) [script (scriptAt paths 0), everyTicks 1 (script (scriptAt paths 1))]) >>= expectRan)
+          reportEnding report `shouldBe` EndedTickLimit
+          let tally = reportEvents report
+          -- The end of a.lua happened in the second tick and is counted, though no tick follows to deliver it.
+          (tallyStarted tally, tallyEnded tally) `shouldBe` (2, 1)
+          tallyStaged tally `shouldBe` 3
+
   describe "on an elapsed VM" $
     it "delivers each event on arrival, with no tick, and every delivery is an immediate answer" $ bounded $ do
       fixture ← newRFixture

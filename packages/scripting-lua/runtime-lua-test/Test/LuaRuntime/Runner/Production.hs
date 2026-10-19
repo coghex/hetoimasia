@@ -174,8 +174,8 @@ spec = describe "producing events" $ do
       atomically (holdGate gate)
       (done, _) ← waiter gate
       awaitParked gate True
-      first ← atomically (permitOne gate)
-      second ← atomically (permitOne gate)
+      -- Both asks in one transaction, so the owner cannot take the permit between them.
+      (first, second) ← atomically ((,) <$> permitOne gate <*> permitOne gate)
       (first, second) `shouldBe` (True, False)
       takeMVar done
       awaitParked gate False
