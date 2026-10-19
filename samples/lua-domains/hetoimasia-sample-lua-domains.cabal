@@ -120,6 +120,7 @@ test-suite lua-domains-tests
         Test.Domains.Random
         Test.Domains.Spec
         Test.Domains.Staging
+        Test.Domains.Stop
         Test.Domains.View
         Test.Domains.Support
         Test.Domains.World

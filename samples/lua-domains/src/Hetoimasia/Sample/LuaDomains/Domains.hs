@@ -1180,9 +1180,16 @@ settleStart domains = do
 
 -- | The one stop of the session, from the driver, as the module header describes. It can be called again, and
 -- from a thread that is not the driver's: it waits for the gameplay behavior to be settled, which waits for a
--- segment that is running to return. It answers how both owners ended.
+-- segment that is running to return. It answers how both owners ended. Once the owners are retired it only says how they ended again.
 stopSession ∷ Domains → IO Retirement
 stopSession domains = do
+  let shared = domainsShared domains
+  retired ← readTVarIO (sharedClosed shared)
+  if retired then retireDomains domains else stopLive domains
+
+-- | A stop of a session whose owners have not been retired.
+stopLive ∷ Domains → IO Retirement
+stopLive domains = do
   let shared = domainsShared domains
   atomically $ do
     void (requestStopNow (sharedSession shared))

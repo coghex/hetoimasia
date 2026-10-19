@@ -17,6 +17,7 @@ import qualified Test.Domains.Progress
 import qualified Test.Domains.Queue
 import qualified Test.Domains.Random
 import qualified Test.Domains.Staging
+import qualified Test.Domains.Stop
 import qualified Test.Domains.View
 import qualified Test.Domains.World
 import Test.Hspec (Spec, describe)
@@ -32,6 +33,7 @@ spec = describe "the two-domain Lua sample" $ do
   Test.Domains.Intentions.spec
   Test.Domains.Failure.spec
   Test.Domains.Ledger.spec
+  Test.Domains.Stop.spec
   Test.Domains.View.spec
   Test.Domains.Barrier.spec
   Test.Domains.Progress.spec
