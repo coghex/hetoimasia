@@ -9,7 +9,6 @@ import Hetoimasia.Sample.LuaDomains
   , DomainsConfig (configGameplaySource, configInput, configSeed, configUiSource)
   , GameSnapshot (snapWorld)
   , defaultBounds
-  , stepTick
   )
 import Hetoimasia.Sample.LuaDomains.World (World (worldRandom, worldTick), drawBelow, initialWorld, moveEntity)
 import Test.Domains.Support
@@ -43,7 +42,7 @@ sessionWorlds seed ticks uiSource =
       case uiSource of
         Nothing → pure ()
         Just _ → tickUi domains ui >> awaitUpdates domains 1
-      mapM (const (snapWorld <$> stepTick domains)) [1 .. ticks]
+      mapM (const (snapWorld <$> stepCommitted domains)) [1 .. ticks]
 
 probe ∷ String → [String]
 probe own =

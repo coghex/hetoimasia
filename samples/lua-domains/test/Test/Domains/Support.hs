@@ -37,6 +37,8 @@ module Test.Domains.Support
   , generous
   , spawn
   , withReleased
+  , stepCommitted
+  , newSharedFor
   ) where
 
 import Control.Concurrent (forkIO)
@@ -54,20 +56,26 @@ import qualified Data.Text.Encoding as Text
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Log (defaultLogFilter)
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
-import Hetoimasia.Foundation.Messaging.Snapshot (cursorRevision, observedCursor, observedValue, readSnapshot, snapshotReader)
+import Hetoimasia.Foundation.Messaging.Snapshot (cursorRevision, observedCursor, observedValue, readSnapshot)
 import Hetoimasia.Foundation.Time (DurationRequirement (AllowZero), MonotonicSource, durationFromNanoseconds, durationNanoseconds, scriptedInstant, scriptedSource)
 import Hetoimasia.Runtime.Logging (withHandleLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (RuntimeControl, awaitSupervised, withSupervision)
 import Hetoimasia.Sample.LuaDomains
-  ( Domains (domainsConfig, domainsControl, domainsShared)
+  ( Bounds (boundWorkspaces)
+  , Domains (domainsConfig, domainsControl, domainsShared)
   , DomainsConfig (configExtensions, configTicks, configUiClock, configUiInterval, configUiTimer)
   , Extension (Extension)
   , Where (InBoth)
+  , TickOutcome (TickCommitted)
+  , stepTick
+  , scriptedInputs
   , defaultConfig
   , withDomains
   )
-import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedPublisher, sharedUpdates))
 import Hetoimasia.Sample.LuaDomains.Snapshot (GameSnapshot (snapTick))
+import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedUpdates), SharedSetup (..), newShared, readerOf)
+import Hetoimasia.Scripting.Lua.Lease (newLeases)
+import Hetoimasia.Scripting.Lua.Lending (newLending)
 import Hetoimasia.Scripting.Lua.Registration (Namespace, namespace, stateOperation)
 import Hetoimasia.Scripting.Lua.Scheduler (TimerBackend (TimerBackend))
 import Hetoimasia.Scripting.Lua.Value (Schema (SText), Value (VText))
@@ -95,7 +103,7 @@ withSample adjust body = do
 withRealSample ∷ (DomainsConfig → DomainsConfig) → (Fx → Domains → IO a) → IO a
 withRealSample adjust body = do
   fx ← newFx
-  let config = adjust defaultConfig {configTicks = Nothing, configExtensions = \shared → [Extension (fxNamespace fx shared) InBoth]}
+  let config = adjust defaultConfig {configTicks = Nothing, configExtensions = \shared → [Extension (fxNamespace fx shared) InBoth []]}
   withBoundary $ \control → withDomains control config (body fx)
 
 -- | The production configuration with the UI owner on the fake clock and timer, no last tick and
@@ -106,7 +114,7 @@ sampleConfig fx ui =
     { configUiClock = fakeSource ui
     , configUiTimer = fakeTimer ui
     , configTicks = Nothing
-    , configExtensions = \shared → [Extension (fxNamespace fx shared) InBoth]
+    , configExtensions = \shared → [Extension (fxNamespace fx shared) InBoth []]
     }
 
 -- The UI owner's clock and timer -----------------------------------------------------------
@@ -259,7 +267,8 @@ awaitUpdates domains wanted =
 -- | The latest committed snapshot and its revision.
 snapshotNow ∷ Domains → IO (GameSnapshot, Natural)
 snapshotNow domains = atomically $ do
-  observation ← readSnapshot (snapshotReader (sharedPublisher (domainsShared domains)))
+  reader ← readerOf (domainsShared domains)
+  observation ← readSnapshot reader
   pure (preparedValue (observedValue observation), cursorRevision (observedCursor observation))
 
 -- | The revision of the latest publication: zero for the initial value, one more for each tick.
@@ -290,3 +299,28 @@ withReleased fx names body = body `finally` mapM_ (releaseGate fx) names
 -- | A deadlock guard for a call that does real work: two minutes, never an assertion.
 generous ∷ IO a → IO a
 generous action = timeout 120000000 action >>= maybe (throwIO (userError "a guarded call never returned")) pure
+
+-- | One tick of the driver, expecting it committed: the snapshot it published.
+stepCommitted ∷ Domains → IO GameSnapshot
+stepCommitted domains =
+  stepTick domains >>= \case
+    TickCommitted snapshot → pure snapshot
+    other → throwIO (userError ("expected a committed tick, found " <> show other))
+
+-- | A shared state over these bounds, with leases of its own, for the examples that read a registration.
+newSharedFor ∷ Bounds → IO Shared
+newSharedFor bounds = do
+  lending ← newLending
+  leases ← newLeases lending (boundWorkspaces bounds)
+  newShared
+    SharedSetup
+      { setupBounds = bounds
+      , setupSession = 1
+      , setupSeed = 1
+      , setupFinal = Nothing
+      , setupInput = scriptedInputs
+      , setupLending = lending
+      , setupLeases = leases
+      , setupAssignHook = pure ()
+      , setupScenario = "normal"
+      }

@@ -16,7 +16,6 @@ import Hetoimasia.Sample.LuaDomains
   , GameSnapshot (snapDispositions, snapTick)
   , Placement (placeTick)
   , Stale (stalePlace)
-  , stepTick
   )
 import Hetoimasia.Sample.LuaDomains.Intention (Submitted (Submitted))
 import Hetoimasia.Sample.LuaDomains.Queue (reserved)
@@ -48,7 +47,7 @@ spec = describe "tick assignment" $
                     answer ← submit shared (Submitted 1 0 (fromIntegral (number `mod` 8)) 0 1 0)
                     case answer of
                       Accepted place → atomically (modifyTVar' acceptedBy (place :))
-                      Full → atomically (modifyTVar' fulls (+ 1))
+                      Full _ → atomically (modifyTVar' fulls (+ 1))
                       _ → pure ()
                     yield
                     go
@@ -59,7 +58,7 @@ spec = describe "tick assignment" $
           taken ← readTVar acceptedBy
           refused ← readTVar fulls
           when (null taken || refused == 0) retry
-        snapshots ← generous (mapM (const (stepTick domains)) [1 .. ticks])
+        snapshots ← generous (mapM (const (stepCommitted domains)) [1 .. ticks])
         atomically (writeTVar stop True)
         sequence_ collectors
         accepted ← readTVarIO acceptedBy

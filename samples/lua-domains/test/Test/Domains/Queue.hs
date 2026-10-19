@@ -30,12 +30,12 @@ spec = describe "the intention queue" $ do
     queue ← newQueue bounds Nothing
     mapM_ (atomically . admitNext queue . intention) [0, 1]
     -- The tick holds its two places.
-    atomically (admitNext queue (intention 2)) `shouldReturn` AtFull
+    atomically (admitNext queue (intention 2)) `shouldReturn` AtFullPlaces
     -- The tick is sealed: its two intentions keep their reservations, so one more fits the bound
     -- of three and the next is full by the queue, not by the tick.
     _ ← atomically (seal queue)
     atomically (admitNext queue (intention 3)) `shouldReturn` AdmittedAt (placement 2 0)
-    atomically (admitNext queue (intention 4)) `shouldReturn` AtFull
+    atomically (admitNext queue (intention 4)) `shouldReturn` AtFullQueue
     atomically (reserved queue) `shouldReturn` 3
 
   it "gives a tick's reservations back only when the tick is settled, and only once" $ do
@@ -62,7 +62,7 @@ spec = describe "the intention queue" $ do
     atomically (admitAt queue (placement 1 3) (intention 3)) `shouldReturn` AdmittedAt (placement 1 3)
     atomically (admitAt queue (placement 1 1) (intention 1)) `shouldReturn` AdmittedAt (placement 1 1)
     atomically (admitAt queue (placement 1 1) (intention 2)) `shouldReturn` AtDuplicate
-    atomically (admitAt queue (placement 1 4) (intention 2)) `shouldReturn` AtFull
+    atomically (admitAt queue (placement 1 4) (intention 2)) `shouldReturn` AtFullPlaces
     -- A tick further ahead is held until its turn.
     atomically (admitAt queue (placement 3 0) (intention 0)) `shouldReturn` AdmittedAt (placement 3 0)
     (_, sealed) ← atomically (seal queue)
@@ -79,7 +79,7 @@ spec = describe "the intention queue" $ do
     atomically (admitAt queue (placement 1 0) (intention 0)) `shouldReturn` AtLate
     atomically (admitAt queue (placement 2 0) (intention 0)) `shouldReturn` AdmittedAt (placement 2 0)
     atomically (admitAt queue (placement 2 0) (intention 0)) `shouldReturn` AtDuplicate
-    atomically (admitAt queue (placement 2 1) (intention 0)) `shouldReturn` AtFull
+    atomically (admitAt queue (placement 2 1) (intention 0)) `shouldReturn` AtFullPlaces
 
   it "ends admission when it is closed, and still seals and settles what it held" $ do
     queue ← newQueue bounds Nothing

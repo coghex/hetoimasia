@@ -10,10 +10,9 @@ import Hetoimasia.Sample.LuaDomains
   , Domains (domainsShared, domainsUi)
   , DomainsConfig (configBounds, configGameplaySource, configUiSource)
   , Started (startedInstance, startedOwner)
-  , stepTick
   )
 import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCounts))
-import Hetoimasia.Sample.LuaDomains.Tally (Counts (..), noCounts)
+import Hetoimasia.Sample.LuaDomains.Tally (Counts (..), countFull, noCounts)
 import Hetoimasia.Scripting.Lua.Instance (InstancePhase (Active), InstanceSnapshot (snapshotPhase), inspectInstance)
 import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint)
 import Test.Domains.Support
@@ -67,7 +66,7 @@ spec = describe "the intention contract" $ do
         fxLines fx `shouldReturn` ["a1 true nil", "a2 true nil", "a3 false full"]
         -- Hold gameplay inside tick one, which keeps its two reservations; tick two is the next
         -- unstarted tick and takes one more, and the queue's bound of three makes the rest full.
-        collect ← spawn (stepTick domains)
+        collect ← spawn (stepCommitted domains)
         awaitEntered fx "gameplay"
         tickUi domains ui
         -- The UI's update completed while gameplay was held: the answers never waited for it.

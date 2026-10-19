@@ -7,15 +7,14 @@ import Hetoimasia.Sample.LuaDomains
   ( DomainsConfig (configExtensions, configGameplaySource, configUiSource)
   , Extension (extensionNamespace)
   , defaultConfig
-  , stepTick
   )
 import Hetoimasia.Sample.LuaDomains.Bounds (defaultBounds)
 import Hetoimasia.Sample.LuaDomains.Registration (allNamespaces, gameplayNamespaces, sampleRegistration, uiNamespaces)
-import Hetoimasia.Sample.LuaDomains.Shared (newShared, scriptedInputs)
 import Hetoimasia.Scripting.Lua.Registration
   ( bindingArguments
   , bindingName
   , bindingResults
+  , capabilityName
   , namespaceBindings
   , namespaceName
   , registrationCapabilityTypes
@@ -63,30 +62,33 @@ spec = describe "exposure" $ do
             }
       )
       $ \fx ui domains → do
-        mapM_ (const (stepTick domains)) [1 .. 2 ∷ Int]
+        mapM_ (const (stepCommitted domains)) [1 .. 2 ∷ Int]
         mapM_ (\done → tickUi domains ui >> awaitUpdates domains done) [1 .. 3]
         -- Two ticks and three UI updates: each VM counted its own and neither saw the other's.
         fxLines fx `shouldReturn` ["gameplay update 1", "gameplay update 2", "ui update 1", "ui update 2", "ui update 3"]
 
   it "registers every binding once, names disjoint namespaces for the two policies, and no hook for tests" $ do
-    shared ← newShared defaultBounds 1 1 Nothing scriptedInputs
-    registered ← either (fail . show) pure (sampleRegistration shared (map extensionNamespace (configExtensions defaultConfig shared)))
+    shared ← newSharedFor defaultBounds
+    registered ← either (fail . show) pure (sampleRegistration shared [] (map extensionNamespace (configExtensions defaultConfig shared)))
     sort (map namespaceName (registrationNamespaces registered)) `shouldBe` sort allNamespaces
     uiNamespaces `intersect` gameplayNamespaces `shouldBe` []
     sort (uiNamespaces <> gameplayNamespaces) `shouldBe` sort allNamespaces
     map namespaceName (registrationNamespaces registered) `shouldNotContain` ["fx"]
     length (configExtensions defaultConfig shared) `shouldBe` 0
 
-  it "gives neither VM a handle into the other: no capability type and no binding mentions one" $ do
-    shared ← newShared defaultBounds 1 1 Nothing scriptedInputs
-    registered ← either (fail . show) pure (sampleRegistration shared [])
-    length (registrationCapabilityTypes registered) `shouldBe` 0
+  it "gives neither VM a handle into the other: the one capability type is gameplay's workspace, and only its own namespace mentions it" $ do
+    shared ← newSharedFor defaultBounds
+    registered ← either (fail . show) pure (sampleRegistration shared [] [])
+    map capabilityName (registrationCapabilityTypes registered) `shouldBe` ["workspace"]
+    -- No namespace the UI is exposed to mentions a capability, and the one that does is gameplay's.
     [ namespaceName space <> "." <> bindingName binding
       | space ← registrationNamespaces registered
       , binding ← namespaceBindings space
       , any mentionsCapability (bindingArguments binding <> bindingResults binding)
       ]
-      `shouldBe` []
+      `shouldBe` ["workspace.open", "workspace.note", "workspace.read"]
+    "workspace" `elem` gameplayNamespaces `shouldBe` True
+    "workspace" `elem` uiNamespaces `shouldBe` False
   where
     luaLinesOf = luaLines . map Text.pack
 
