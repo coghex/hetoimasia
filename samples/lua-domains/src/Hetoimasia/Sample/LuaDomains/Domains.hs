@@ -220,6 +220,9 @@ data DomainsDefect
   | -- | The driver was asked for a tick while another had begun and not committed: a tick that
     -- did not complete leaves the session halted, and two drivers never share one.
     TickAlreadyInProgress !Word64
+  | -- | The queue's next tick is not the committed tick plus one: the two numberings of ticks
+    -- disagree. The tick asked for and the committed tick.
+    TickOutOfSequence !Word64 !Word64
   | -- | A grant was not accepted: the answer.
     TickNotGranted !Word64 !String
   | -- | The gameplay owner ended while the tick was outstanding. The owner's own failure, if it
@@ -492,8 +495,11 @@ stepTick domains = do
     inProgress ← readTVar (sharedTick shared)
     forM_ inProgress $ \working → throwSTM (TickAlreadyInProgress (candidateTick working))
     when (maybe False (next >) (configTicks config)) $ throwSTM (PastFinalTick next)
-    (tick, sealed) ← seal (sharedQueue shared)
     committed ← readTVar (sharedCommitted shared)
+    -- The queue's ticks and the world's are one numbering; a disagreement is a defect, found before
+    -- anything is sealed (a throw abandons the whole transaction).
+    when (worldTick committed + 1 /= next) $ throwSTM (TickOutOfSequence next (worldTick committed))
+    (tick, sealed) ← seal (sharedQueue shared)
     writeTVar (sharedTick shared) (Just (beginCandidate (configBounds config) committed tick sealed))
     pure tick
   granted ← grantScheduledStep (scheduledEndpoint owner) (configTickDuration config)

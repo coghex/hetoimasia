@@ -87,6 +87,18 @@ spec = describe "the world, the random stream and the candidate" $ do
       map staleReason (dispStale dispositions) `shouldBe` [StaleSession, StaleVersion]
       dispApplied dispositions `shouldBe` []
 
+    it "accounts for every sealed intention exactly once: applied, listed as stale or counted as omitted" $
+      mapM_
+        ( \count → do
+            let sealed = [(place (fromIntegral n), intention (n `mod` 3) (if even n then 0 else 7) 1 0) | n ← [0 .. count - 1]]
+                dispositions = candidateDispositions (beginCandidate bounds world0 1 sealed)
+            length (dispApplied dispositions) + length (dispStale dispositions) + dispStaleOmitted dispositions `shouldBe` count
+            -- No place appears twice among the applied and the listed stale.
+            let places = dispApplied dispositions <> map stalePlace (dispStale dispositions)
+            length places `shouldBe` length (foldr (\one seen → if one `elem` seen then seen else one : seen) [] places)
+        )
+        [0 .. 12 ∷ Int]
+
     it "lists at most the bound of stale rejections, earliest places first, and counts the rest" $ do
       let sealed = [(place n, intention 0 9 1 0) | n ← [0 .. 4]]
           dispositions = candidateDispositions (beginCandidate bounds world0 1 sealed)
