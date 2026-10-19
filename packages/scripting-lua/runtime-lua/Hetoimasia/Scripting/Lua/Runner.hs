@@ -66,13 +66,16 @@
 -- and nothing a script runs writes to the process's C streams. @print@ writes to the output sink
 -- and @warn@ (with the prefix @Lua warning: @) to the error sink, from a module's top level,
 -- @init@, @run@, @update@, a callback and @shutdown@ alike. One call writes at most
--- 'outputCallLimit' bytes, cut with a visible marker; any Lua string is accepted, including
--- invalid UTF-8 and embedded NUL bytes, which are replaced as the stream rules below say.
+-- 'outputCallLimit' bytes of UTF-8 in all, as it is written (each line counting one byte more for
+-- its end), cut with a visible marker that is counted; any Lua string is accepted, including invalid
+-- UTF-8 and embedded NUL bytes, which are replaced as the stream rules below say.
 --
 -- The stream rules: a sink is handed one line at a time, with no line break and no control
 -- character in it but a tab; a script's text and every other text a script can influence (a name,
 -- an error message, a traceback, a path) has its control characters replaced by @\\xNN@ escapes
--- and is cut to a documented bound, so none can split a table or a report into forged lines. The
+-- and is then cut to a documented bound, which therefore holds for what is written and not for what
+-- was passed before the replacement made it longer; so none can split a table or a report into forged
+-- lines. The
 -- runner holds one lock around every write of a table, a report or a call's lines, so a sink is
 -- never called by two threads at once and a table is never cut by a script's output. The
 -- /output sink/ receives the scripts' @print@ and the tables; the /error sink/ the scripts' @warn@
@@ -115,10 +118,18 @@
 -- failure propagate unchanged, with their type and context, under the owner's policy. A host
 -- failure inside the owner ends the owner, which retires protected: Lua is not entered again, so
 -- the instances it left keep 'Hetoimasia.Scripting.Lua.Instance.ShutdownSkippedUnsafe' (and one
--- that had not begun 'Hetoimasia.Scripting.Lua.Instance.ShutdownSkippedNoInit'). One raised on the
--- runner's own thread, a sink's while a table is written, retires the owner first, in order, as the
--- run's end would. When failures arise together the first is the primary and the rest are kept
--- whole as cleanup evidence beside it.
+-- whose @init@ had not succeeded 'Hetoimasia.Scripting.Lua.Instance.ShutdownSkippedNoInit'). One raised
+-- on the runner's own thread, a sink's while a table is written, retires the owner first, in order, as
+-- the run's end would. The retirement is complete before any failure propagates, whoever latched it:
+-- the run asks the owner to stop and waits for the owner's worker to have ended (its raw completion,
+-- which supervision's latch of another worker's failure never makes unavailable), so what a run's sinks
+-- and bindings are borrowed from is not released while the owner's Lua still uses them. That wait is
+-- for arbitrary Lua segments and shutdown hooks, so it is interruptible and never runs under an
+-- uninterruptible mask: a cancellation of the runner's thread reaches it, and what it interrupts keeps
+-- the failure that was already propagating beside it as evidence. The wait does not raise the owner's
+-- failure again: supervision delivers it, to the next supervised wait and at the boundary's exit beside
+-- the body's own. When failures arise together the first is the primary and the rest are kept whole as
+-- evidence beside it; a single failure is never recorded again as a failure of cleanup.
 --
 -- = The report and the status
 --

@@ -21,7 +21,7 @@ module Hetoimasia.Scripting.Lua.Runner.Run
 
 import Control.Concurrent.MVar (newMVar, withMVar)
 import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, readTVar, retry, writeTVar)
-import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, fromException, rethrowIO, throwIO)
+import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, fromException, mask, rethrowIO, throwIO, tryWithContext)
 import Control.Monad (forM, forM_, void)
 import Data.List (elemIndex)
 import qualified Data.List.NonEmpty as NonEmpty
@@ -34,7 +34,8 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Log (Component, logInfo, unsafeComponent, withFields)
-import Hetoimasia.Foundation.Resource (withResource)
+import Hetoimasia.Foundation.Resource (composeCleanup, withResource)
+import Hetoimasia.Foundation.Worker (awaitCompletion)
 import Hetoimasia.Foundation.Time (Instant, addDuration, deadlineReached, readInstant, zeroDuration)
 import Hetoimasia.Runtime.Supervision
   ( Disposition (Optional)
@@ -43,6 +44,7 @@ import Hetoimasia.Runtime.Supervision
   , WorkerPolicy (..)
   , WorkerStatus (WorkerLive)
   , awaitSupervised
+  , supervisedWorker
   )
 import Hetoimasia.Scripting.Lua.Instance
   ( EventSource
@@ -105,6 +107,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
   , scheduledEndpoint
   , scheduledSpec
   , scheduledStatus
+  , scheduledSupervised
   , startScheduledOwner
   )
 import Hetoimasia.Scripting.Lua.Scheduler.Timer (Timer, clearTimerWake, disposeTimer, newTimer, syncTimer, timerWoken)
@@ -183,7 +186,7 @@ usageViolations config =
     scripts = runnerScripts config
 
 pathText ∷ Script → Text
-pathText = tame . cut pathLimit . Text.pack . scriptPath
+pathText = bounded pathLimit . Text.pack . scriptPath
 
 -- | The report of a run is logged once, as it is returned.
 finished ∷ RunnerConfig → RunReport → IO RunOutcome
@@ -217,7 +220,7 @@ begin internals runtime config = do
     _ → do
       built ← either (throwIO . RunnerBug . Text.pack . show) pure (registrationFor sinks)
       let spec = specFor sources built
-      withResource (startScheduledOwner runtime spec) (retireStarted runtime) $ \case
+      withStartedOwner runtime spec $ \case
         ScheduledUnavailable failure → sourceFault sinks failure
         ScheduledRejected → stoppedBeforeStart
         ScheduledEnded → stoppedBeforeStart
@@ -302,13 +305,13 @@ startupFailure config sinks failure = do
 readFailureOf ∷ RunnerConfig → FilePath → ReadProblem → LoadFailure
 readFailureOf config path problem =
   LoadFailure
-    { loadFile = tame (cut pathLimit (Text.pack path))
+    { loadFile = bounded pathLimit (Text.pack path)
     , loadVm = vmText config
     , loadProblem = case problem of
         ReadMissing → LoadMissing
         ReadUnreadable _ → LoadUnreadable
         ReadTooLarge → LoadTooLarge
-    , loadError = tame . cut errorLimit $ case problem of
+    , loadError = bounded errorLimit $ case problem of
         ReadMissing → "the file does not exist"
         ReadUnreadable why → "the file could not be read: " <> why
         ReadTooLarge → "the file is larger than the host's source limit"
@@ -319,11 +322,11 @@ readFailureOf config path problem =
 rejectedBy ∷ RunnerConfig → Map ModuleRef Text → BoundaryFault → LoadFailure
 rejectedBy config files fault =
   LoadFailure
-    { loadFile = maybe "" (tame . cut pathLimit) (boundaryModule fault >>= (`Map.lookup` files))
+    { loadFile = maybe "" (bounded pathLimit) (boundaryModule fault >>= (`Map.lookup` files))
     , loadVm = vmText config
     , loadProblem = LoadRejected
-    , loadError = tame (cut errorLimit (reasonText (boundaryReason fault)))
-    , loadTraceback = tameTraceback <$> boundaryTraceback fault
+    , loadError = bounded errorLimit (reasonText (boundaryReason fault))
+    , loadTraceback = boundedLines tracebackLimit <$> boundaryTraceback fault
     }
   where
     reasonText = \case
@@ -335,23 +338,52 @@ rejectedBy config files fault =
       other → Text.pack (show other)
 
 vmText ∷ RunnerConfig → Text
-vmText = tame . cut columnLimit . runnerName
+vmText = bounded columnLimit . runnerName
 
-tameTraceback ∷ Text → Text
-tameTraceback text = Text.intercalate "\n" (map tame (Text.splitOn "\n" (cut tracebackLimit text)))
+-- | Start the owner and run a body over how it started, and retire the owner on every way out of it: the
+-- body's return, a failure of the host, a failure of the runner's own thread and a cancellation.
+--
+-- The retirement asks the owner to stop in order, which never blocks, and then waits for the owner to
+-- have ended. The wait is for the worker's raw completion (the owner's thread has finished, its VM is
+-- closed and every instance settled), which supervision's latch of a failure never makes unavailable, so
+-- a failure another supervised worker latched cannot make the run propagate while the owner is still
+-- running: whoever the run's sinks and bindings are borrowed from cannot release them under Lua. The
+-- wait is interruptible, because it is for arbitrary Lua segments and shutdown hooks: nothing about it
+-- runs under an uninterruptible mask, a cancellation of the runner's thread reaches it, and what it
+-- interrupts keeps the failure that was already propagating beside it. The failures themselves are the
+-- body's and supervision's: waiting does not raise the owner's failure again, which supervision
+-- delivers (to the next supervised wait, and at the boundary's exit beside the body's own).
+withStartedOwner ∷ LuaRuntime → ScheduledSpec → (ScheduledStart → IO a) → IO a
+withStartedOwner runtime spec body = mask $ \restore → do
+  started ← startScheduledOwner runtime spec
+  outcome ← tryWithContext @SomeException (restore (body started))
+  retired ← case started of
+    ScheduledStarted owner → do
+      retireScheduled owner
+      tryWithContext @SomeException (restore (awaitOwnerEnded owner))
+    _ → pure (Right ())
+  case (outcome, retired) of
+    (Right value, Right ()) → pure value
+    (Right _, Left interruption) → rethrowIO interruption
+    (Left failure, Right ()) → rethrowIO failure
+    -- Both failed. A cancellation that interrupted the wait is the one that propagates, as itself; any
+    -- other failure the body's came first and stays primary. Either way the other is kept whole.
+    (Left failure, Left interruption)
+      | asynchronous interruption → composeCleanup (Just interruption) [("script runner failure", failure)] >>= maybe (rethrowIO failure) rethrowIO
+      | otherwise → composeCleanup (Just failure) [("script runner retirement", interruption)] >>= maybe (rethrowIO failure) rethrowIO
+  where
+    asynchronous (ExceptionWithContext _ exception) = isJust (fromException exception ∷ Maybe SomeAsyncException)
 
--- | What retires the owner when the run is over, on every way out of it.
-retireStarted ∷ LuaRuntime → ScheduledStart → IO ()
-retireStarted runtime = \case
-  ScheduledStarted owner → retireOwner runtime owner
-  _ → pure ()
+-- | Wait for the owner's worker to have ended, whatever supervision has latched: its raw completion.
+awaitOwnerEnded ∷ ScheduledOwner → IO ()
+awaitOwnerEnded owner = atomically (void (awaitCompletion (supervisedWorker (scheduledSupervised owner))))
 
--- | Retire the owner in order and wait for it to end. Asking again changes nothing, and a status
--- already terminal is answered at once, so this is the same step at the end of every run and on
--- every way out of one; a failure of the owner supervision committed is raised by the wait.
+-- | Retire the owner in order, wait for it to end and raise what supervision committed of it: the step
+-- that ends a run. Asking again changes nothing and an owner that has ended is answered at once.
 retireOwner ∷ LuaRuntime → ScheduledOwner → IO ()
 retireOwner runtime owner = do
   retireScheduled owner
+  awaitOwnerEnded owner
   void . awaitSupervised (runtimeControl runtime) $
     scheduledStatus owner >>= \case
       WorkerLive → retry
@@ -398,7 +430,7 @@ ran internals runtime config sinks refOf owner = do
         go done [] = pure (reverse done)
         go done ((item, defined) : rest) =
           admitInstance endpoint (requestFor item defined) >>= \case
-            InstanceAccepted identity ticket → go (Admitted identity ticket (tame (cut pathLimit (Text.pack (scriptPath item)))) : done) rest
+            InstanceAccepted identity ticket → go (Admitted identity ticket (bounded pathLimit (Text.pack (scriptPath item))) : done) rest
             -- The owner stopped admitting: supervision is closing. What was admitted is the run.
             InstanceAdmissionClosed → pure (reverse done)
             InstanceFull → throwIO (RunnerBug "admission was full for a run that holds at most the live bound")
@@ -414,7 +446,7 @@ ran internals runtime config sinks refOf owner = do
 
 -- | A script's instance name: its own, or the end of its path, tamed and bounded.
 instanceNameOf ∷ Script → Text
-instanceNameOf item = tame (cut nameLimit (fromMaybe (defaultName (scriptPath item)) (scriptName item)))
+instanceNameOf item = bounded nameLimit (fromMaybe (defaultName (scriptPath item)) (scriptName item))
 
 -- | What follows from the entries a module defines: @run@ is a one-shot, @update@ a looped
 -- instance on the script's interval, neither an event-only instance.
@@ -570,7 +602,7 @@ instanceReportOf ∷ RunnerConfig → Admitted → InstanceSettlement → Instan
 instanceReportOf config item settlement =
   InstanceReport
     { instanceTid = resultInstance settlement
-    , instanceNameText = tame (cut nameLimit (fromMaybe "" (resultName settlement)))
+    , instanceNameText = bounded nameLimit (fromMaybe "" (resultName settlement))
     , instanceFile = admittedFile item
     , instanceStatus = resultPhase settlement
     , instanceEnd = case resultOutcome settlement of

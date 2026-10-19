@@ -17,9 +17,11 @@ module Hetoimasia.Scripting.Lua.Runner.Internal
   , RunnerBug (..)
   , runScriptsWith
   , moduleRefFor
+  , outputLines
   ) where
 
 import Hetoimasia.Scripting.Lua.Runner.Run (RunnerBug (..), RunnerInternals (..), noInternals, runWith)
+import Hetoimasia.Scripting.Lua.Runner.Render (outputLines)
 import Hetoimasia.Scripting.Lua.Runner.Source (moduleRefFor)
 import Hetoimasia.Scripting.Lua.Runner.Types (RunOutcome, RunnerConfig)
 import Hetoimasia.Scripting.Lua.Runtime.Shared (LuaRuntime)

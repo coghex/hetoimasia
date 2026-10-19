@@ -11,8 +11,9 @@
 --
 -- @print@ joins the @tostring@ of its arguments with a tab, and @warn@ does the same after the
 -- prefix @Lua warning: @. The text is cut by the script, before it crosses, to
--- 'outputCallLimit' bytes with the truncation marker counted in them, so one call writes at most
--- that many and a script cannot make the value boundary refuse it for length. Any Lua string is
+-- 'outputCallLimit' bytes with the truncation marker counted in them, so a script cannot make the
+-- value boundary refuse it for length, and the runner bounds what it writes again after decoding and
+-- escaping, which can make the text longer: one call writes at most that many bytes of UTF-8 in all. Any Lua string is
 -- accepted: it crosses as bytes, is decoded as UTF-8 with every invalid sequence replaced, is split
 -- at its line breaks, and has its control characters (an embedded NUL included) replaced by
 -- escapes, a tab excepted. Each line is one call of the sink.

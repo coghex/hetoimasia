@@ -79,6 +79,17 @@ spec = describe "sources" $ do
         report ← run fixture runtime (config fixture [noWait path]) >>= expectRan
         expectNotLoaded fixture control path LoadMissing report
 
+  it "bounds a path as it is written, after its control characters are replaced" $ bounded $ do
+    fixture ← newRFixture
+    withScripts [] $ \_ →
+      withBoundary $ \control runtime → do
+        let path = "/nonexistent-directory-for-the-runner/" <> replicate 200 '\SOH' <> ".lua"
+        report ← run fixture runtime (config fixture [noWait path]) >>= expectRan
+        fmap (Text.length . loadFile) (loadFailureOf report) `shouldBe` Just pathLimit
+        errors ← errLines fixture
+        forM_ errors $ \line → Text.length line `shouldSatisfy` (<= 2 * pathLimit)
+        outstanding control `shouldReturn` 0
+
   it "reports a file over the host's source limit, having read no more than one byte past it" $ bounded $ do
     fixture ← newRFixture
     withScripts [("big.lua", ByteString.replicate (maxSourceBytes + 1) 32)] $ \paths →

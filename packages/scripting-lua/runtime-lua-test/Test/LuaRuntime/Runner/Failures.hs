@@ -7,7 +7,8 @@ import Data.IORef (readIORef)
 import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailuresInContext)
+import Hetoimasia.Foundation.Resource (cleanupFailureLabel, cleanupFailuresInContext)
+import Hetoimasia.Runtime.Supervision (SupervisedFailure (failedException), supervisedFailuresInContext)
 import Hetoimasia.Scripting.Lua.Instance
   ( InstancePhase (Active, Initializing)
   , InstanceSettlement (resultTermination)
@@ -203,6 +204,26 @@ spec = describe "failures" $ do
           -- The table has the header and the instance's one row, at the start and at the end.
           length (filter (Text.isInfixOf "evil\\x0aname") out) `shouldBe` 2
 
+    it "bounds an error, a name and a secondary failure as they are written, after their control characters are replaced" $ bounded $ do
+      fixture ← newRFixture
+      let heavy = "string.rep(string.char(1), 5000)"
+      withScripts [("heavy.lua", lua ["function run(self) error(" <> heavy <> ") end", "function shutdown(self, reason) error(" <> heavy <> ") end"])] $ \paths →
+        withBoundary $ \_ runtime → do
+          report ← run fixture runtime (config fixture [Script (scriptAt paths 0) (Just (Text.replicate 200 "\SOH")) Nothing]) >>= expectRan
+          case instancesOf report of
+            [one] → do
+              let failure = failedOf one
+              Text.length (frError failure) `shouldSatisfy` (<= errorLimit)
+              Text.length (frName failure) `shouldSatisfy` (<= nameLimit)
+              Text.length (instanceNameText one) `shouldSatisfy` (<= nameLimit)
+              map (Text.length . secondaryError) (frSecondary failure) `shouldSatisfy` all (<= errorLimit)
+            other → fail ("expected one instance, found " <> show (length other))
+          err ← errLines fixture
+          -- Every line of the report is as long as its fixed words and the bounds of what it carries.
+          forM_ err $ \line → Text.length line `shouldSatisfy` (<= 2 * errorLimit)
+          out ← outLines fixture
+          forM_ out $ \line → Text.length line `shouldSatisfy` (<= 2 * columnLimit + 64)
+
     it "writes a failure as it settles, and keeps every admitted instance in the tables when one fails before the last initializer finishes" $ bounded $ do
       fixture ← newRFixture
       withScripts [("early.lua", lua (failing "init")), ("slow.lua", lua ["function init(self) fx.block('slow') end", "function shutdown(self, reason) fx.record('shutdown slow ' .. reason) end"])] $ \paths →
@@ -234,6 +255,7 @@ spec = describe "failures" $ do
         $ \paths → do
           failure ← expectFatal $ \_ runtime → run fixture runtime (config fixture (map noWait paths)) >>= void'
           expectBroken "host" failure
+          expectNoEvidence failure
           -- Lua was not entered again: the instance whose init had succeeded keeps ShutdownSkippedUnsafe, and
           -- the one whose init raised and the one that had not begun keep ShutdownSkippedNoInit.
           (_, admitted) ← admittedOf fixture
@@ -251,6 +273,7 @@ spec = describe "failures" $ do
         let failingSink = (config fixture [noWait (scriptAt paths 0)]) {runnerOutput = \line → if line == "boom" then throwIO (Broken "sink") else pure ()}
         failure ← expectFatal $ \_ runtime → run fixture runtime failingSink >>= void'
         expectBroken "sink" failure
+        expectNoEvidence failure
 
     it "propagates a failure of a sink or a binding while a module loads, and is no source that did not load" $ bounded $ do
       fixture ← newRFixture
@@ -276,6 +299,7 @@ spec = describe "failures" $ do
         let failingTable = (config fixture [noWait (scriptAt paths 0)]) {runnerOutput = \line → if line == startTitle then throwIO (Broken "table sink") else pure ()}
         failure ← expectFatal $ \_ runtime → run fixture runtime failingTable >>= void'
         expectBroken "table sink" failure
+        expectNoEvidence failure
         -- The orderly retirement ran first: the hook ran, with reason stopped.
         recorded fixture `shouldReturn` ["shutdown stopped"]
         liveCount fixture `shouldReturn` 0
@@ -297,9 +321,17 @@ spec = describe "failures" $ do
         failure ← expectFatal $ \_ runtime → run fixture runtime failingTable >>= void'
         expectBroken "first" failure
         let ExceptionWithContext context _ = failure
-        [brokenIs "second" evidence | found ← cleanupFailuresInContext context, let ExceptionWithContext _ evidence = cleanupFailureException found] `shouldContain` [True]
+        -- The owner's failure while it was retired in order is supervision's evidence beside the primary.
+        [brokenIs "second" evidence | found ← supervisedFailuresInContext context, let ExceptionWithContext _ evidence = failedException found] `shouldContain` [True]
   where
     void' _ = pure ()
+
+-- | A single failure of the host is not recorded again as a failure of cleanup, by the retirement's wait or
+-- by anything else: it carries no other failure with it.
+expectNoEvidence ∷ ExceptionWithContext SomeException → IO ()
+expectNoEvidence (ExceptionWithContext context _) = do
+  map cleanupFailureLabel (cleanupFailuresInContext context) `shouldBe` []
+  length (supervisedFailuresInContext context) `shouldSatisfy` (<= 1)
 
 expectBroken ∷ Text → ExceptionWithContext SomeException → IO ()
 expectBroken expected (ExceptionWithContext _ raised) = raised `shouldSatisfy` brokenIs expected

@@ -327,7 +327,8 @@ runnerSchedulerBounds =
 runnerLifecycleName ∷ Text
 runnerLifecycleName = "lifecycle"
 
--- | The most bytes one call of @print@ or @warn@ writes, the marker included.
+-- | The most bytes one call of @print@ or @warn@ writes, as it is written: the UTF-8 bytes of its
+-- lines, each line counting one more for its end, and the marker, when there is one, included.
 outputCallLimit ∷ Int
 outputCallLimit = 4096
 
@@ -343,18 +344,18 @@ columnLimit = 32
 secondaryLimit ∷ Int
 secondaryLimit = 8
 
--- | The most characters of an error a report keeps.
+-- | The most characters of an error a report keeps, as written: after its control characters are replaced.
 errorLimit ∷ Int
 errorLimit = 1024
 
--- | The most characters of a traceback a report keeps.
+-- | The most characters of a traceback a report keeps, as written.
 tracebackLimit ∷ Int
 tracebackLimit = 4096
 
--- | The most characters of an instance's name the runner gives the instance.
+-- | The most characters of an instance's name the runner gives the instance, as written.
 nameLimit ∷ Int
 nameLimit = 64
 
--- | The most characters of a path a report keeps.
+-- | The most characters of a path a report keeps, as written.
 pathLimit ∷ Int
 pathLimit = 256
