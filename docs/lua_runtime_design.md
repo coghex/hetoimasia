@@ -3394,6 +3394,27 @@ and verified policy, with adversarial regression coverage.
 - **Out of scope:** session failure, overload evidence and stop paths (LUA-30);
   determinism qualification and evidence (LUA-8); everything LUA-8 excludes.
 - **Open questions:** None; D-44 and D-46 fix its behavior.
+- **As delivered (#498):** the package is `samples/lua-domains` (`hetoimasia-sample-lua-domains`: the library, the
+  executable `hetoimasia-lua-domains` and the suite `lua-domains-tests`, the group `test.lua-domains`, routed to the
+  `haskell-engine` worker); its README is the contract, and the choices the slice left to its solver are recorded
+  here so LUA-30 and LUA-8 extend them rather than reopen them. The world is Haskell-owned and committed once per
+  completed tick in one transaction that also publishes the snapshot, settles the queue and counts the tick; gameplay's
+  Lua stages effects into a tick-local candidate that holds the tick's applied intentions, and the tick commits only
+  if gameplay said its work was done (`staging.finish()`) and the instance is active with nothing in flight, so a tick
+  that merely completed (a wait, a failure) commits nothing and halts the session (`TickNotCompleted`, then
+  `TickAlreadyInProgress`; LUA-30 turns this into the failed status the snapshot's type already admits). The queue is
+  an application-owned transactional structure, not provider events: `admitAt` takes the tick and the place
+  explicitly (late for a begun tick, duplicate for an occupied place), `admitNext` is the UI's path, a tick begins
+  when the driver seals it, and a reservation lasts from acceptance to the commit of the tick; it answers `closed`
+  beyond a finite session's last tick and once retirement has begun. Malformed intentions are answered by a Lua
+  facade in the UI's initial chunk, because the typed binding's schema faults a wrong arity or type past `pcall`; the
+  bounds are answered by the binding. UI-path answers are `true`, `false, "full"`, `false, "closed"`,
+  `false, "malformed"` and one fixed word per bound. The random stream is SplitMix64, fixed in `World.hs`. Both owners are
+  retired UI first, after the queue closes, and the snapshot's publication ends last. Test-only bindings reach an
+  owner only through `DomainsConfig.configExtensions`, which the production configuration leaves empty. The two
+  progress proofs are the barrier example and the CPU-bound example (sized from a calibration, asserted as an ordering
+  of the UI's update count between the computation's start and its end). The library, the runner, the CI image and the
+  native pins are unchanged; the only workflow change is routing and publishing the new group's receipt.
 
 ### LUA-30. Fail, overload and stop the two-domain sample explicitly
 

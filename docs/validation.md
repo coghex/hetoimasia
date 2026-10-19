@@ -146,6 +146,7 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.glfw` | `cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct` | no | yes | any |
 | `test.scripting-lua` | `cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct` | no | no | any |
 | `test.scripting-lua-runtime` | `cabal test hetoimasia-scripting-lua:lua-runtime-tests --test-show-details=direct` | no | no | any |
+| `test.lua-domains` | `cabal test hetoimasia-sample-lua-domains:lua-domains-tests --test-show-details=direct` | no | no | any |
 | `test.lua-confinement-linux` | `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct` | yes | no | `Linux` |
 | `test.vulkan` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct` | no | no | any |
 | `test.vulkan-diagnostics` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-details=direct` | no | no | any |
