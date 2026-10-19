@@ -1722,7 +1722,14 @@ and its modules loaded inside `withVmOwner` on the worker's thread; only then is
 readiness published and an endpoint returned. Readiness is awaited through
 `awaitSupervised` composed with the worker's outcome, never the startup acknowledgement,
 and acquisition is masked exactly as for a finite-call owner. A failure of initialization
-ends creation under the owner's `WorkerPolicy`.
+ends creation under the owner's `WorkerPolicy`. Unlike a finite-call owner's, a scheduled owner's creation
+leaves nothing behind when its wait fails or is abandoned (another worker's fatal outcome, a cancellation): it asks
+the owner to stop and waits for the worker it started to have ended (its raw completion, which supervision's latch
+does not shorten), recording each interruption of that wait and going on until the worker has ended, and only then raises
+what happened in order, a cancellation as itself and the rest as evidence beside it. A script held in a module's top
+level keeps creation pending, as a held segment keeps the worker (D-27); the wait is interruptible and never runs under an
+uninterruptible mask. This is what lets an application release what the owner's bindings borrow as soon as creation
+has returned or raised.
 
 ### Identity
 
@@ -3112,14 +3119,17 @@ ends the owner, which retires protected: Lua is not entered again, so the instan
 `init` had not succeeded keeps `ShutdownSkippedNoInit`. One raised on the runner's own thread (a sink's, as a table or a report is written)
 retires the owner first, in order, as the run's end would.
 
-The retirement is complete before any failure propagates, whoever latched it: the run asks the owner to stop and waits for the owner's worker
-to have ended (its raw completion, which supervision's latch of another worker's failure never makes unavailable), so what the run's sinks and
-bindings are borrowed from is not released while the owner's Lua still uses them. That wait is for arbitrary Lua segments and shutdown hooks,
-so it is interruptible and never runs under an uninterruptible mask (a release has a controlled blocking duration, and a worker's join has
-none): a cancellation of the runner's thread reaches it, the owner having been asked to stop, and what it interrupts keeps the failure that was
-already propagating beside it as evidence. The wait does not raise the owner's failure again: supervision delivers it, to the next supervised
-wait and at the boundary's exit beside the body's own. When failures arise together the first is the primary and the rest are kept whole as
-evidence beside it; a single failure is never recorded again as a failure of cleanup.
+The retirement is complete before anything propagates, however it began and however many times the runner's thread is interrupted meanwhile:
+the run asks the owner to stop and waits for the owner's worker to have ended (its raw completion, which supervision's latch of another worker's
+failure never makes unavailable), so what the run's sinks and bindings are borrowed from is not released while the owner's Lua still uses them.
+That wait is for arbitrary Lua segments and shutdown hooks, so it is interruptible and never runs under an uninterruptible mask (a release has
+a controlled blocking duration, and a worker's join has none); but an interruption does not end it. Each one is recorded and the wait goes on
+until the worker has actually ended, and then what happened is raised in order: a cancellation, if one was among them, as itself, and every other
+failure whole as evidence beside it. A segment that never returns keeps the call pending, as it keeps the worker (D-27). Creation is the same:
+`startScheduledOwner` does not return or raise, on a failure of its wait (another worker's latched failure, a cancellation) or any other, while the
+worker it started is alive, so a script held in a module's top level keeps the call pending until it is let go. The wait does not raise the owner's
+failure again: supervision delivers it, to the next supervised wait and at the boundary's exit beside the body's own. When failures arise together
+the first is the primary and the rest are kept whole as evidence beside it; a single failure is never recorded again as a failure of cleanup.
 
 ### Waiting and ending
 
@@ -3165,7 +3175,7 @@ refusal, with no hook run and the VM retired; the query answering defined, absen
 changing; a failed `init`, a failing `run`, `update`, callback and `shutdown`, several failures in one run and a primary kept over a failing `shutdown`;
 a host failure from a binding, from a sink while a script prints and while a module loads (and an application's exception shaped as the host's
 fault of loading), the runner's own write failing after an orderly retirement, failures arising together, a failure another supervised worker latched
-propagating only after the owner's retirement is complete, and a cancellation reaching a retirement that waits on a held segment; every ending (a one-shot, a script stopping
+propagating only after the owner's retirement is complete (during the run and during startup), and cancellations, during startup and during cleanup after a failure, that do not end the wait for the owner; every ending (a one-shot, a script stopping
 itself and another, the stop request, the limit with an early and a stale wake, a stop request set beforehand), each stop path stopping a live
 event-only, looped and paused instance in order, simultaneous endings in their order of precedence, the timer cancelled on every exit; the
 start table with a gated initializer and a stop before an instance began, the early settlement kept in the tables, and the tables' bounds; output
