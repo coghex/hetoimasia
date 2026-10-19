@@ -184,7 +184,7 @@ concrete precondition
 - [x] LUA-26. Deliver provider events through owned Lua subscriptions — [#483]
 - [x] LUA-27. Run Lua sources to completion through a reusable runner — [#492]
 - [x] LUA-28. Drive the runner on logical ticks and publish instance start and end events — [#493]
-- [ ] LUA-19. Run script instances through a headless command-line entry
+- [x] LUA-19. Run script instances through a headless command-line entry — [#494]
 - [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly — [deferred]: owner renews trusted-path readiness for this slice
 - [ ] LUA-9. Add bounded child-process transport and owned process lifetime — [deferred]: Q-5 successful Linux and macOS confinement verdicts
 - [ ] LUA-10. Establish Linux mod-process confinement — [deferred]: Q-5 successful Linux and macOS confinement verdicts
