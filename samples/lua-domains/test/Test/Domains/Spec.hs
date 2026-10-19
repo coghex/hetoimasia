@@ -8,7 +8,9 @@ import qualified Test.Domains.Command
 import qualified Test.Domains.Conservation
 import qualified Test.Domains.Dependencies
 import qualified Test.Domains.Exposure
+import qualified Test.Domains.Failure
 import qualified Test.Domains.Intentions
+import qualified Test.Domains.Ledger
 import qualified Test.Domains.Lifetime
 import qualified Test.Domains.Process
 import qualified Test.Domains.Progress
@@ -28,6 +30,8 @@ spec = describe "the two-domain Lua sample" $ do
   Test.Domains.Exposure.spec
   Test.Domains.Staging.spec
   Test.Domains.Intentions.spec
+  Test.Domains.Failure.spec
+  Test.Domains.Ledger.spec
   Test.Domains.View.spec
   Test.Domains.Barrier.spec
   Test.Domains.Progress.spec

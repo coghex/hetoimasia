@@ -39,6 +39,10 @@ module Test.Domains.Support
   , withReleased
   , stepCommitted
   , newSharedFor
+  , offer
+  , awaitClosed
+  , balanced
+  , failedEvidence
   ) where
 
 import Control.Concurrent (forkIO)
@@ -72,8 +76,11 @@ import Hetoimasia.Sample.LuaDomains
   , defaultConfig
   , withDomains
   )
-import Hetoimasia.Sample.LuaDomains.Snapshot (GameSnapshot (snapTick))
-import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedUpdates), SharedSetup (..), newShared, readerOf)
+import Hetoimasia.Sample.LuaDomains.Snapshot (FailureEvidence, GameSnapshot (snapStatus, snapTick), SessionStatus (Failed))
+import Hetoimasia.Sample.LuaDomains.Intention (Answer, Submitted (Submitted))
+import Hetoimasia.Sample.LuaDomains.Queue (isClosed, reserved)
+import Hetoimasia.Sample.LuaDomains.Tally (Counts (countAccepted), settledTotal)
+import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCounts, sharedQueue, sharedUpdates), SharedSetup (..), newShared, readerOf, submit)
 import Hetoimasia.Scripting.Lua.Lease (newLeases)
 import Hetoimasia.Scripting.Lua.Lending (newLending)
 import Hetoimasia.Scripting.Lua.Registration (Namespace, namespace, stateOperation)
@@ -82,6 +89,7 @@ import Hetoimasia.Scripting.Lua.Value (Schema (SText), Value (VText))
 import Numeric.Natural (Natural)
 import System.IO (stderr)
 import System.Timeout (timeout)
+import Test.Hspec (shouldBe)
 import Test.Support.Bounded (bounded)
 
 -- | A real supervision boundary over a real worker group. Diagnostics go to stderr, as they do
@@ -324,3 +332,24 @@ newSharedFor bounds = do
       , setupAssignHook = pure ()
       , setupScenario = "normal"
       }
+
+-- | Offer one intention for this entity, carrying version zero, as the UI's binding does.
+offer ∷ Domains → Int → IO Answer
+offer domains entity = submit (domainsShared domains) (Submitted 1 0 (fromIntegral entity) 0 1 0)
+
+-- | The ledger of a quiescent session balances: every accepted intention reached exactly one terminal
+-- disposition, and nothing is reserved.
+balanced ∷ Domains → IO ()
+balanced domains = do
+  (counts, left) ← atomically ((,) <$> readTVar (sharedCounts (domainsShared domains)) <*> reserved (sharedQueue (domainsShared domains)))
+  (countAccepted counts, left) `shouldBe` (settledTotal counts, 0)
+
+-- | The evidence a snapshot publishes of a failed session, if it is one.
+failedEvidence ∷ GameSnapshot → Maybe FailureEvidence
+failedEvidence snapshot = case snapStatus snapshot of
+  Failed found → Just found
+  _ → Nothing
+
+-- | Block, in STM, until admission to the queue has closed: a stop, a failure or a retirement has begun.
+awaitClosed ∷ Domains → STM ()
+awaitClosed domains = isClosed (sharedQueue (domainsShared domains)) >>= \closed → when (not closed) retry
