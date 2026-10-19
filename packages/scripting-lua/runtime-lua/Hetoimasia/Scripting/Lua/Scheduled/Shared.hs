@@ -13,6 +13,8 @@ module Hetoimasia.Scripting.Lua.Scheduled.Shared
   , exitOf
   , waitReport
   , waitReportFor
+  , awaitWorkerEnded
+  , propagateAll
   ) where
 
 import Control.Exception
@@ -26,14 +28,16 @@ import Control.Exception
   , tryWithContext
   )
 import Control.Concurrent.STM (atomically)
-import Control.Monad (when)
+import Control.Monad (void, when)
 import Data.IORef (IORef, modifyIORef', readIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Word (Word64)
-import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailureLabel, cleanupFailuresInContext)
+import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailureLabel, cleanupFailuresInContext, composeCleanup)
+import Hetoimasia.Foundation.Worker (awaitCompletion)
+import Hetoimasia.Runtime.Supervision (SupervisedWorker, supervisedWorker)
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero), durationFromNanoseconds, zeroDuration)
 import Hetoimasia.Scripting.Lua.Internal.Fault (raisedByApplication)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (TaskId)
@@ -106,6 +110,39 @@ settledOrRaise extra action = do
   where
     retained context =
       modifyIORef' extra (<> [(cleanupFailureLabel found, cleanupFailureException found) | found ← cleanupFailuresInContext context])
+
+-- | Wait until a supervised worker has ended, and answer what interrupted the wait on the way.
+--
+-- The wait is for the worker's raw completion: its thread has finished, whatever it ran has been
+-- closed, and whatever supervision has latched (another worker's fatal failure, say) neither shortens
+-- nor lengthens it. It is for arbitrary Lua segments and shutdown hooks, which a release cannot wait for,
+-- so it runs in the caller's restored state and is interruptible; but an interruption is not the end of
+-- the wait. Each is recorded, in the order it arrived, and the wait goes on until the worker has actually
+-- ended, so what the worker used (sinks, bindings, a VM's dependencies) is never released under a Lua
+-- call that is still running. A stuck segment keeps the wait pending, as it keeps the worker (D-27).
+awaitWorkerEnded ∷ (∀ x. IO x → IO x) → SupervisedWorker () → IO [ExceptionWithContext SomeException]
+awaitWorkerEnded restore worker = go []
+  where
+    go interruptions =
+      tryWithContext @SomeException (restore (atomically (void (awaitCompletion (supervisedWorker worker))))) >>= \case
+        Right () → pure (reverse interruptions)
+        Left interruption → go (interruption : interruptions)
+
+-- | Raise what went wrong, in the order it happened, as one failure: a cancellation, if one was among
+-- them, is the one that propagates (as itself), otherwise the first is, and every other is kept whole as
+-- cleanup evidence beside it. Nothing to raise returns.
+propagateAll ∷ [ExceptionWithContext SomeException] → IO ()
+propagateAll failures = case lookup chosen indexed of
+  Nothing → pure ()
+  Just primary →
+    composeCleanup (Just primary) [("lua scheduled owner", failure) | (index, failure) ← indexed, index /= chosen]
+      >>= maybe (rethrowIO primary) rethrowIO
+  where
+    indexed = zip [0 ∷ Int ..] failures
+    isCancellation (ExceptionWithContext _ exception) = isJust (fromException exception ∷ Maybe SomeAsyncException)
+    chosen = case [index | (index, failure) ← indexed, isCancellation failure] of
+      index : _ → index
+      [] → 0
 
 -- | How a failure that ended the owner ends its tasks.
 exitOf ∷ ExceptionWithContext SomeException → ExitKind
