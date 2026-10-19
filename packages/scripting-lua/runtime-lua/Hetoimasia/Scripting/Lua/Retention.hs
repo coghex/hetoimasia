@@ -9,7 +9,12 @@
 --
 -- * a provider's reading is application code. It is run in a transaction that must not
 --   retry, and what it throws, when it runs or when what it answered is first inspected, is
---   the retirement failing, not an exception loose in whatever polls it ('pollObligation');
+--   the retirement failing, not an exception loose in whatever polls it ('pollObligation').
+--   It is a /reading/: it asks where the provider's work has got to, and what it writes is not
+--   kept. The engine may poll it inside a transaction that has already read, and so may be
+--   asked to run it against a view another thread has since committed over; running it is
+--   what notices, and the poll then starts again from a consistent view instead of running the
+--   reading again against the stale one (see 'pollObligation');
 -- * a retirement that completes gives its charge back; one that fails is retained as
 --   evidence by whoever owns it, and nothing is retried or reported as reclaimed;
 -- * the disposal of what a retirement needs is held behind every obligation recorded, run
@@ -38,11 +43,13 @@ module Hetoimasia.Scripting.Lua.Retention
   , pollAll
   ) where
 
-import Control.Concurrent.STM (STM, catchSTM, orElse)
+import Control.Concurrent.STM (STM, catchSTM, orElse, throwSTM)
 import Control.Exception
-  ( ExceptionWithContext (ExceptionWithContext)
+  ( Exception
+  , ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , evaluate
+  , fromException
   , someExceptionContext
   , tryWithContext
   )
@@ -62,7 +69,8 @@ data RetirementState
 data Obligation = Obligation
   { obligationLabel ∷ !Text
   , obligationState ∷ STM RetirementState
-    -- ^ The provider's own reading. It must not retry.
+    -- ^ The provider's own reading. It must not retry, and it only reads: what it writes is
+    -- not kept (see 'pollObligation').
   }
 
 -- | Ask a provider where its retirement has got to, as a retirement and nothing else can
@@ -72,20 +80,53 @@ data Obligation = Obligation
 -- reading is evaluated, as far as anything later inspects it, inside the guard that
 -- catches what it throws. A reading that retries says it is not done.
 --
--- This is the one place a provider's reading is run: servicing and the wait for readiness
--- both read through it.
+-- This is the one place a provider's reading is run: servicing, the wait for readiness and
+-- the request and subscription services all read through it.
+--
+-- = A reading is never run again against a stale view
+--
+-- The engine polls readings inside a transaction that has usually read state already, and
+-- several readings in one transaction may read one TVar. A reading runs in a nested
+-- transaction, and a nested transaction that finds the TVars it read changed by another thread
+-- is run again at once, still under the enclosing transaction's copy of what that thread
+-- overwrote: it reads the same stale value, fails the same way, and does not return to the
+-- scheduler to be restarted whole, for as long as it does not happen to allocate.
+--
+-- So a reading never leaves its nested transaction by returning. It leaves by raising its
+-- answer (a private exception, caught here), and GHC does not handle an exception raised in
+-- a transaction that is no longer valid: it restarts the transaction from the beginning,
+-- with a view that is consistent, before any handler runs. The poll therefore sees its
+-- reading's answer only if what the reading read was current, and a conflicting commit costs
+-- one more run of the reading, whatever the reading does or does not allocate. This holds by
+-- the semantics of the transaction, not by a build or runtime setting.
+--
+-- The price is that a reading's own writes are rolled back with the exception. A reading
+-- reads: it must not retry, and it must not write anything it needs kept.
 pollObligation ∷ Obligation → STM RetirementState
 pollObligation obligation =
-  (reading `catchSTM` \failure → pure (ProviderFailed (failure ∷ SomeException)))
+  ((reading >>= throwSTM . Polled) `catchSTM` outcome)
     `orElse` pure ProviderPending
   where
     reading = obligationState obligation >>= evaluated
+    outcome failure = case fromException failure of
+      Just (Polled state) → pure state
+      Nothing → pure (ProviderFailed failure)
     -- The constructor is evaluated here, with the failure it carries (a strict field): all
     -- that servicing and readiness go on to inspect.
     evaluated state = case state of
       ProviderPending → pure state
       ProviderComplete → pure state
       ProviderFailed failure → failure `seq` pure state
+
+-- | What a reading answered, raised out of its nested transaction so that GHC validates the
+-- transaction before it is read. Private to 'pollObligation': nothing else can raise it, so
+-- nothing a provider throws is taken for an answer.
+newtype Polled = Polled RetirementState
+
+instance Show Polled where
+  show _ = "Polled"
+
+instance Exception Polled
 
 -- | Run a call into provider or application code during retirement or teardown, answering
 -- the failure it raised, with its context, instead of raising it, and evaluating what it

@@ -246,7 +246,10 @@ data ProviderWork = ProviderWork
     -- ^ The provider's own reading of where its work has got to, polled after interest was
     -- withdrawn: 'Hetoimasia.Scripting.Lua.Retention.ProviderPending' until it can prove
     -- the work over, then 'Hetoimasia.Scripting.Lua.Retention.ProviderComplete', or
-    -- 'Hetoimasia.Scripting.Lua.Retention.ProviderFailed'. It must not retry. A reply the
+    -- 'Hetoimasia.Scripting.Lua.Retention.ProviderFailed'. It must not retry, and it only reads:
+    -- the engine may run it inside a transaction that has read state already, and what it
+    -- writes is not kept ('Hetoimasia.Scripting.Lua.Retention.pollObligation'). It may read TVars
+    -- that more than one reading shares, or that the provider's own thread writes. A reply the
     -- provider has made is proof as well, and needs no reading.
   }
 
