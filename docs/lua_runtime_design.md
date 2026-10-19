@@ -182,7 +182,7 @@ concrete precondition
 - [x] LUA-25. Lend a resource collection's ownership to synchronous Lua callbacks — [#476]
 - [x] LUA-7. Add bounded asynchronous Lua requests with reserved result slots — [#482]
 - [x] LUA-26. Deliver provider events through owned Lua subscriptions — [#483]
-- [ ] LUA-27. Run Lua sources to completion through a reusable runner
+- [x] LUA-27. Run Lua sources to completion through a reusable runner — [#492]
 - [ ] LUA-28. Drive the runner on logical ticks and publish instance start and end events
 - [ ] LUA-19. Run script instances through a headless command-line entry
 - [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly — [deferred]: owner renews trusted-path readiness for this slice
