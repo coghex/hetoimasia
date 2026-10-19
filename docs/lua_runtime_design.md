@@ -3192,7 +3192,7 @@ and verified policy, with adversarial regression coverage.
   (the owner parks before its next segment, readable in STM), admits each script with the gate held, produces the
   instance's *started* event while the owner is held, and only then lets the owner run the one-shot's `run`; the owner is
   *quiet* (readable from one inspection: no instance initializing or stopping, none ready or running, nothing queued, no
-  update owed on logical time, no one-shot's `run` yet to execute; paused and waiting instances are quiet) before the next
+  update owed on logical time, no one-shot's `run` yet to execute; a paused instance is quiet, and so is one whose invocation is suspended on a wait, however much is queued behind it) before the next
   script is admitted and, on a tick VM, after every grant and before the boundary's events are produced. On the elapsed
   clock an update owed does not count as work, because it falls due by the wall clock. *Ticks:* the tick duration is both
   the logical duration of a grant and the real-time period; tick *n* is due *n* periods after the instant read once admission

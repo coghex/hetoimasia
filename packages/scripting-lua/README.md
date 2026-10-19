@@ -3073,7 +3073,7 @@ another, and itself. Scripts are trusted (D-12): nothing here claims a sandbox.
 
 Scripts are admitted one at a time, in the order they are listed, each only after the previous instance's `init` has finished or failed and the owner
 has nothing left to do (every instance quiet, which the runner reads from one inspection: nothing initializing or stopping, nothing ready or running,
-no event queued, no update owed, no one-shot's `run` yet to execute; a paused instance and one that waits are quiet). So TIDs ascend in script order
+no event queued, no update owed, no one-shot's `run` yet to execute; a paused instance is quiet, and so is one whose invocation is suspended on a wait, however much is queued behind it: the owner can do nothing for it until its wake, a tick or a time that a grant of the runner's brings). So TIDs ascend in script order
 and the order of the `init`s is the script order, on both clocks. A failed `init` does not stop later scripts from being admitted. The wait is
 the run's one wait: a stop request, the duration limit or the owner's exit during admission admits no further script, the instances admitted are
 stopped in ascending TID order and the tables list them. While one instance is admitted the owner is held, before its next segment, at the gate the
