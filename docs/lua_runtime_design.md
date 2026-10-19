@@ -8,13 +8,13 @@ failure evidence, and lifetime. This is the canonical continuation of
 
 Design state: `ready for issue processing`
 
-Current readiness scope: none open. LUA-7 (D-37), split by D-38 into LUA-7
-(requests) and LUA-26 (subscriptions), is delivered, with D-36 and D-39 fixing
-when a deterministic owner's Lua sees an asynchronous result or provider event.
-LUA-6 (with LUA-20 and LUA-21, D-28/D-29) and LUA-18 (with LUA-22, LUA-23,
-LUA-24 and LUA-25, D-30 to D-32) are delivered too. LUA-19 is next on the trusted
-path and needs its own readiness renewal. Other unchecked slices retain their explicit
-deferrals; this state does not release the confinement gate.
+Current readiness scope: **LUA-19 only** (D-41), with D-40 fixing the runner's
+clock, ending, event source and exit statuses. LUA-7 (D-37), split by D-38 into
+LUA-7 (requests) and LUA-26 (subscriptions), is delivered, with D-36 and D-39
+fixing when a deterministic owner's Lua sees an asynchronous result or provider
+event. LUA-6 (with LUA-20 and LUA-21, D-28/D-29) and LUA-18 (with LUA-22, LUA-23,
+LUA-24 and LUA-25, D-30 to D-32) are delivered too. Other unchecked slices retain
+their explicit deferrals; this state does not release the confinement gate.
 
 Owner: `coghex/hetoimasia`. Epic #145 and children #146–#149 have been
 created; those children are merged. The owner accepted the two-domain direction,
@@ -181,7 +181,7 @@ concrete precondition
 - [x] LUA-25. Lend a resource collection's ownership to synchronous Lua callbacks — [#476]
 - [x] LUA-7. Add bounded asynchronous Lua requests with reserved result slots — [#482]
 - [x] LUA-26. Deliver provider events through owned Lua subscriptions — [#483]
-- [ ] LUA-19. Run script instances through a headless command-line entry — [deferred]: contract accepted; renew slice readiness
+- [ ] LUA-19. Run script instances through a headless command-line entry
 - [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly — [deferred]: owner renews trusted-path readiness for this slice
 - [ ] LUA-9. Add bounded child-process transport and owned process lifetime — [deferred]: Q-5 successful Linux and macOS confinement verdicts
 - [ ] LUA-10. Establish Linux mod-process confinement — [deferred]: Q-5 successful Linux and macOS confinement verdicts
@@ -1097,6 +1097,103 @@ Rejected: refusing cancellation before the due tick (a script could not abandon
 a slow request), and recording a cancel to take effect at the due tick (the tick
 would still wait for the provider). Relaxing the determinism promise was not
 considered: D-23 is a requirement.
+
+### D-40. The headless runner's clock, ending, event source and exit statuses
+
+Owner decisions, 2026-10-19, in the hetoimasia manager pane (request
+`user-het-lua19-20261019-1356`), on the four product choices the LUA-19
+readiness check found at `master@b130ccab`:
+
+- **Clock ("Real time default, game ticks opt-in").** A looped script's
+  interval is given on the command line. By default it is elapsed time
+  (`--every SECONDS`). An option (`--tick SECONDS`) switches the VM to logical
+  ticks that the runner grants at that real-time rate, and a looped script's
+  interval is then given in ticks (`--every-ticks N`). Both D-23 clocks are
+  reachable from the command line.
+- **Ending ("Controls, limits and Ctrl-C").** A run ends when every instance has
+  ended, including through granted Lua lifecycle controls (LUA-23: a script
+  stops itself or another); when a run limit is reached (`--for SECONDS`, or
+  `--ticks N` on the logical clock); or on SIGINT/SIGTERM. Every one of these
+  stops the remaining instances in order, so their `shutdown` hooks run under
+  the usual contract. No stdin command console: the game terminal stays out of
+  scope.
+- **Event source ("Instance start/end events").** The runner delivers
+  "instance started" and "instance ended" events (TID, name, and on an end the
+  outcome) through an event source scripts may connect to under LUA-26's owned
+  subscriptions. The event-only example is a watcher reacting to the other
+  instances finishing or failing. Events reach only connections that exist when
+  they are produced. Rejected: stdin lines (no need for terminal input), a timer
+  source (overlaps looped updates), a script-to-script channel (a general
+  message bus), dropping the event-only example.
+- **Exit statuses ("0 / 1 / 2 / 130").** 0 when every instance completed or was
+  stopped by a control or a limit; 1 when an instance failed or a source did not
+  load; 2 for invalid command-line usage; 130 when a signal ended the run, after
+  the orderly stop. This matches the console's existing mapping
+  (`Hetoimasia.Console.Exit`). Rejected: a separate status for source errors,
+  and 0 for a signal-ended run.
+
+The readiness check also found two statements that disagree with the merged
+API, corrected here:
+
+- **Source loading.** Q-14 put file loading at task admission. The merged
+  library loads application-supplied modules only when a VM owner starts and
+  reads no files itself (`bridge/Hetoimasia/Scripting/Lua/Internal/Module.hs`).
+  The runner reads each file and supplies it as a module; admission selects it.
+  A source that does not load fails the VM's start, not an instance, so its
+  bounded report names the file, the VM, the error and the traceback, with no
+  TID. No later hook runs.
+- **`--headless`.** There is no windowed mode. `--headless` is accepted, is the
+  default and is the only mode; leaving it out is not an error.
+
+Organization the manager takes under D-25 (not product decisions):
+
+- The runner is a reusable module of the Lua runtime library; `app/Main.hs`
+  only parses the `lua` subcommand, so a future windowed application can run
+  the same runner.
+- `--script` may be repeated. Options after a `--script` apply to that script
+  (`--name`, its interval), so one VM can run instances at independently chosen
+  intervals (Q-15).
+- An instance's kind follows the module's entries: `run` is a one-shot,
+  `update` a looped instance that needs an interval, neither an event-only
+  instance. A module with both `run` and `update` is refused as usage.
+- Lua's base `print` is replaced by a binding that writes bounded lines through
+  Haskell; raw C stdout is not used.
+- The runner prints the TID/OWNER/NAME/STATUS table (D-17) at start and at end.
+  The examples demonstrate pause, resume and stop through LUA-23's granted Lua
+  controls.
+- `--scheduler` accepts `fifo`, the only built-in policy, and the runner uses
+  the library's default bounds.
+
+### D-41. Renew LUA-19 readiness and delegate it through merge
+
+Owner request, 2026-10-19, in the hetoimasia manager pane: "go, those 4 steps
+are right, please do this with me" (request `user-het-lua19-20261019-1356`),
+after the manager proposed renewing LUA-19's readiness, settling its open
+choices with the owner, then processing, approving, solving and merging it. The
+readiness check at `master@b130ccab`:
+
+- LUA-19's dependencies are delivered: LUA-18 (#472), LUA-24 (#475), LUA-7
+  (#482, PR #484, `895d26b1`) and LUA-26 (#483, PR #485, `4560a08b`). The test
+  fixes #486–#488 are merged too.
+- The merged library supplies every engine API the runner needs: scheduled VM
+  owners with a policy (`startScheduledOwner`), instance admission of looped,
+  one-shot and event-only kinds (`admitInstance`), inspection
+  (`inspectInstances`), control (`requestInstanceControl`), settlement with
+  bounded failure records (`waitInstance`), logical tick grants
+  (`grantScheduledStep`) and LUA-26's event endpoints. The runner layer itself
+  is new: file reading, option mapping, the tick driver, bounded script output,
+  rendering and exit statuses.
+- D-40 settles the product choices the check found. The accepted contract
+  (D-26/D-27) and D-17/D-20 to D-25 fix the rest.
+- The open tracker holds epic #145 and the unrelated #446, with no LUA-19 child
+  or duplicate.
+
+D-41 renews trusted readiness for LUA-19 only. The owner asks for it to be
+processed into an issue, canonically approved, solved and merged, with the owner
+consulted along the way. Splitting it, if the drafted issue is too large for one
+PR, is delegated (D-25) and adds no scope. LUA-8 stays `[deferred]` on its own
+renewal, and the confined branch stays on Q-5. Readiness is not implementation
+approval beyond that request.
 
 ## Design
 
@@ -2067,7 +2164,9 @@ Use the following CLI shape in LUA-19, with final option validation documented
 in that slice:
 `hetoimasia lua --vm test --scheduler fifo --script ./testscript.lua --headless`.
 A `lua` subcommand scopes its flags; scheduler
-selection belongs to the VM and file loading belongs to task admission. Useful
+selection belongs to the VM and file loading belongs to task admission. D-40
+corrects the loading half against the merged API: the runner reads each file,
+the VM loads its modules when it starts, and instance admission selects one. Useful
 defaults can shorten the common case once those semantics are settled.
 
 LUA-19 delivers a headless runner using reusable APIs available to a future
@@ -2921,7 +3020,8 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-19. Run script instances through a headless command-line entry
 
-> Deferred: contract accepted (D-26/D-27); explicit trusted readiness pending.
+> Ready for issue processing under D-41. Its dependencies are delivered, and D-40
+> fixes the runner's clock, ending, event source and exit statuses.
 
 - **Outcome:** run a selected Lua source in a named VM with a selected scheduler,
   exposing the same instance APIs a future windowed application can use.
@@ -2939,7 +3039,8 @@ and verified policy, with adversarial regression coverage.
   and exit status without invoking later hooks.
 - **Out of scope:** window creation, game terminal UI, VM groups, module reload,
   production game content or a full replay product.
-- **Open questions:** None; contract accepted. Readiness remains pending.
+- **Open questions:** None; D-40 settles the runner's product choices and D-41
+  renews readiness.
 
 ### LUA-8. Prove independent trusted UI and gameplay execution headlessly
 
