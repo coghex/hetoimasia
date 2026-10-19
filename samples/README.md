@@ -35,3 +35,12 @@ library depends on a sample, and nothing routine launches one.
   its executable (`scene3d/app`, `hetoimasia-scene3d`) writes the same evidence
   (`--evidence`), launched by hand. Its windowed mode arrives with windowed
   depth (GRS-13).
+- [`lua-domains/`](lua-domains/README.md) — LUA-29's two-domain Lua consumer: a UI
+  VM owner and a gameplay VM owner composed side by side from the Lua package's
+  public modules, headless. Gameplay's Haskell-owned world is committed once per
+  completed tick and published as a snapshot; the UI reads a coherent latest
+  snapshot and sends intentions that reach gameplay exactly once. One package
+  (`hetoimasia-sample-lua-domains`) holds the library, the executable
+  (`hetoimasia-lua-domains`, launched by hand) and the suite (`lua-domains-tests`,
+  the group `test.lua-domains`). Unlike the graphics samples it needs no GLFW or
+  Vulkan, so both `cabal.project` and `cabal.project.cpu` build it.
