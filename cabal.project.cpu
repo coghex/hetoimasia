@@ -15,6 +15,7 @@ packages:
   packages/render-2d-oracle
   packages/runtime
   packages/scripting-lua
+  samples/lua-domains
   packages/gpu-vulkan/model
   packages/gpu-vulkan/diagnostics
   tools/test-support
