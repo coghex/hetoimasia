@@ -8,9 +8,11 @@ failure evidence, and lifetime. This is the canonical continuation of
 
 Design state: `ready for issue processing`
 
-Current readiness scope: **LUA-19 only** (D-41), delivered by D-42 as LUA-27,
-LUA-28, then a narrowed LUA-19, with D-40 and D-42 fixing the runner's clock,
-ending, event source and exit statuses. LUA-7 (D-37), split by D-38 into
+Current readiness scope: none open. LUA-19 (D-41), delivered by D-42 as LUA-27
+(#492, PR #495), LUA-28 (#493, PR #496) and a narrowed LUA-19 (#494, PR #497),
+is delivered, with D-40, D-42 and D-43 fixing the runner's clock, ending, event
+source, overload and exit statuses. LUA-8 is next on the trusted path and needs
+its own readiness renewal. LUA-7 (D-37), split by D-38 into
 LUA-7 (requests) and LUA-26 (subscriptions), is delivered, with D-36 and D-39
 fixing when a deterministic owner's Lua sees an asynchronous result or provider
 event. LUA-6 (with LUA-20 and LUA-21, D-28/D-29) and LUA-18 (with LUA-22, LUA-23,
