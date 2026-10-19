@@ -8,8 +8,9 @@ failure evidence, and lifetime. This is the canonical continuation of
 
 Design state: `ready for issue processing`
 
-Current readiness scope: **LUA-8 only** (D-45), with D-44 fixing its consumer,
-intentions, UI-progress proof and gameplay randomness. LUA-19 (D-41), delivered by D-42 as LUA-27
+Current readiness scope: **LUA-8 only** (D-45), delivered by D-46 as LUA-29,
+LUA-30, then a narrowed LUA-8, with D-44 fixing its consumer, intentions,
+UI-progress proof and gameplay randomness. LUA-19 (D-41), delivered by D-42 as LUA-27
 (#492, PR #495), LUA-28 (#493, PR #496) and a narrowed LUA-19 (#494, PR #497),
 is delivered, with D-40, D-42 and D-43 fixing the runner's clock, ending, event
 source, overload and exit statuses. LUA-7 (D-37), split by D-38 into
@@ -187,6 +188,8 @@ concrete precondition
 - [x] LUA-27. Run Lua sources to completion through a reusable runner — [#492]
 - [x] LUA-28. Drive the runner on logical ticks and publish instance start and end events — [#493]
 - [x] LUA-19. Run script instances through a headless command-line entry — [#494]
+- [ ] LUA-29. Compose independent UI and gameplay Lua owners in a headless sample
+- [ ] LUA-30. Fail, overload and stop the two-domain sample explicitly
 - [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly
 - [ ] LUA-9. Add bounded child-process transport and owned process lifetime — [deferred]: Q-5 successful Linux and macOS confinement verdicts
 - [ ] LUA-10. Establish Linux mod-process confinement — [deferred]: Q-5 successful Linux and macOS confinement verdicts
@@ -1345,6 +1348,43 @@ D-45 renews trusted readiness for LUA-8 only. The owner asks for it to be
 processed into issues and canonically approved; splitting is delegated (D-25)
 and adds no scope. The confined branch stays on Q-5. Readiness is not
 implementation approval beyond that request.
+
+### D-46. Deliver LUA-8 as LUA-29, LUA-30 and a narrowed LUA-8
+
+LUA-8's drafted issue (request `user-het-lua8-20261019-2029`, drafter's package
+at `master@93938d60`, sha256 `e90f82c0`) held 30 requirements and an estimated
+8–11k added lines, well past the largest merged slice of this arc (#484), with
+three separate proof obligations. Under D-25 and the owner's standing grant of
+2026-10-19 (the manager signs off issue drafts, revisions, splits and order;
+design gaps go to the owner), the manager takes the drafter's partition:
+
+- **LUA-29** (new): "Compose independent UI and gameplay Lua owners in a headless
+  sample": the `samples/` package, both owners, one registration with per-owner
+  exposure, the small authoritative world with staging, explicit grants with one
+  commit and snapshot per completed tick, the intention contract and its
+  explicit-tick admission seam, exactly-once with revalidation, coherent
+  per-segment views, both UI-progress proofs, the seeded stream, the runnable
+  headless session, tests and docs.
+- **LUA-30** (new): "Fail, overload and stop the two-domain sample explicitly":
+  the D-7 failed session, no implicit retry, exactly-once on every path,
+  overload as evidence (including D-43's post-staging failure), stop paths with
+  cleanup evidence, D-27's integrated failure examples, UI failure isolation,
+  pause and resume of gameplay as UI intentions through a lifecycle grant, the
+  executable's failure status.
+- **LUA-8** keeps its ID, outcome, acceptance signals and out-of-scope list for the
+  closing slice: the canonical state digest, the tick-assigned input log and its
+  replay, D-23's qualification, reproduction commands, the optional profiling
+  probe and the milestone record. The trusted milestone is complete when it
+  merges.
+
+The split adds no scope; D-45's readiness covers all three. Readings the manager
+takes from the package: the authoritative world of the sample is Haskell-owned
+and committed after a tick completes while gameplay Lua stages effects (D-2
+allows either; P-8's staged first example and the failed-session and digest
+slices need a canonical state a failed tick leaves untouched); one sample package
+holds library, executable and tests; the barrier binding is test-only; the
+executable is a bounded scripted session whose usage errors exit 2 (D-42's
+convention); the epic lists the carved children under Phase 8.
 
 ## Design
 
@@ -3331,6 +3371,50 @@ and verified policy, with adversarial regression coverage.
   and reaps on every way out. Nothing in the runner's directories, `Runtime.Supervision`, `Runtime.Inbox`, the CI image
   or the native pins changed.
 
+### LUA-29. Compose independent UI and gameplay Lua owners in a headless sample
+
+> Ready for issue processing under D-45 and D-46: carved out of LUA-8 with no
+> added scope.
+
+- **Outcome:** a small application-owned sample composes a UI VM owner and a
+  gameplay VM owner from the public library, with intentions, explicit gameplay
+  grants and a staged snapshot commit, and shows the UI progressing while
+  gameplay is busy.
+- **Scope:** D-46's LUA-29 list, under D-44's consumer, intention, progress-proof
+  and randomness rules.
+- **Phase:** trusted integrated acceptance.
+- **Depends on:** LUA-6, LUA-18, LUA-24, LUA-7, LUA-26.
+- **Ordering:** after the instance, cadence and provider APIs; precedes LUA-30
+  and LUA-8.
+- **Relevant decisions:** D-1, D-2, D-3, D-12, D-13, D-14, D-15, D-23, D-36, D-44, D-45, D-46.
+- **Acceptance signals:** UI makes progress before gameplay completes, held by a
+  barrier and under CPU-bound Lua; no shared VM or global state; one commit and
+  snapshot per completed tick and a coherent view per UI segment; accepted
+  intentions applied or rejected exactly once, `full` answered at once.
+- **Out of scope:** session failure, overload evidence and stop paths (LUA-30);
+  determinism qualification and evidence (LUA-8); everything LUA-8 excludes.
+- **Open questions:** None; D-44 and D-46 fix its behavior.
+
+### LUA-30. Fail, overload and stop the two-domain sample explicitly
+
+> Ready for issue processing under D-45 and D-46: carved out of LUA-8 with no
+> added scope.
+
+- **Outcome:** the sample's gameplay failure, overload and every stop path are
+  explicit, with cleanup evidence, and a UI failure never touches gameplay.
+- **Scope:** D-46's LUA-30 list.
+- **Phase:** trusted integrated acceptance.
+- **Depends on:** LUA-29, LUA-22, LUA-23.
+- **Ordering:** after LUA-29; precedes LUA-8.
+- **Relevant decisions:** D-7, D-15, D-24, D-26, D-27, D-43, D-44, D-45, D-46.
+- **Acceptance signals:** a failed gameplay session closes admission, discards the
+  failing tick's batch and publishes the failure beside the last good snapshot;
+  accepted intentions equal applied plus rejected plus invalidated plus discarded;
+  overload is counted and never resent; every stop path leaves cleanup evidence.
+- **Out of scope:** determinism qualification and evidence (LUA-8); automatic
+  restart, save/load.
+- **Open questions:** None; D-7, P-8 and D-46 fix its behavior.
+
 ### LUA-8. Prove independent trusted UI and gameplay execution headlessly
 
 > Ready for issue processing under D-45. Its dependencies are delivered, and D-44
@@ -3346,7 +3430,8 @@ and verified policy, with adversarial regression coverage.
   profiling workloads. D-44 places the consumer in `samples/` and fixes its
   intention, progress-proof and randomness rules; D-25 governs splitting.
 - **Phase:** trusted integrated acceptance.
-- **Depends on:** LUA-6, LUA-18, LUA-22, LUA-23, LUA-24, LUA-7, LUA-26, LUA-27, LUA-28, LUA-19.
+- **Depends on:** LUA-6, LUA-18, LUA-22, LUA-23, LUA-24, LUA-7, LUA-26, LUA-27, LUA-28, LUA-19, LUA-29, LUA-30.
+- **Delivery (D-46):** LUA-29 and LUA-30 carry the sample's core and its failure paths; this slice keeps the canonical digest, the input log and replay, D-23's qualification, reproduction commands, the optional profiling probe and the milestone record.
 - **Ordering:** after instance/provider/runner delivery, independent of Q-5;
   no Vulkan or GLFW dependency.
 - **Relevant decisions:** D-1, D-2, D-3, D-4, D-7, D-12, D-13, D-14, D-15, D-23, D-24, D-26, D-27, D-36, D-39, D-44, D-45.
@@ -3534,7 +3619,7 @@ and verified policy, with adversarial regression coverage.
 
 The trusted dependency order is LUA-2 after the delivered LUA-1; LUA-3 after
 LUA-2; LUA-5 after LUA-3 and the delivered LUA-4; then LUA-6 (as LUA-20 and
-LUA-21, then LUA-6, under D-29), LUA-18, then LUA-23 and LUA-24 (D-31), LUA-25 then LUA-22 (D-32), LUA-7 then LUA-26 (D-38), LUA-27 then LUA-28 then LUA-19 (D-42), and
+LUA-21, then LUA-6, under D-29), LUA-18, then LUA-23 and LUA-24 (D-31), LUA-25 then LUA-22 (D-32), LUA-7 then LUA-26 (D-38), LUA-27 then LUA-28 then LUA-19 (D-42), LUA-29 then LUA-30 then LUA-8 (D-46), and
 LUA-8 under D-25 and D-30. LUA-6 retains external TIME-1; LUA-7 consumes the
 instance ownership API and introduces no second clock implementation.
 The shared VK-1 toolchain prerequisite remains satisfied.
@@ -3544,7 +3629,7 @@ platform proofs; LUA-10, LUA-11, and LUA-13 in parallel; LUA-12 after both
 platform slices and TIME-1; LUA-16 after LUA-6/LUA-7/LUA-26/LUA-12/LUA-13; then
 LUA-17 after LUA-8/LUA-16. Stable IDs are preserved, with LUA-16/LUA-17
 retaining the confined integration and acceptance removed from LUA-5/LUA-8.
-There are twenty-eight delivery slices. All of this can run alongside
+There are thirty delivery slices. All of this can run alongside
 graphics implementation. Coordinate the shared Cabal project, CI
 catalog/workflow, and any narrow foundation evidence change; parallel work
 does not authorize conflicting edits or duplicate platform infrastructure.
