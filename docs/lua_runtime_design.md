@@ -183,8 +183,8 @@ concrete precondition
 - [x] LUA-7. Add bounded asynchronous Lua requests with reserved result slots — [#482]
 - [x] LUA-26. Deliver provider events through owned Lua subscriptions — [#483]
 - [x] LUA-27. Run Lua sources to completion through a reusable runner — [#492]
-- [ ] LUA-28. Drive the runner on logical ticks and publish instance start and end events
-- [ ] LUA-19. Run script instances through a headless command-line entry
+- [x] LUA-28. Drive the runner on logical ticks and publish instance start and end events — [#493]
+- [x] LUA-19. Run script instances through a headless command-line entry — [#494]
 - [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly — [deferred]: owner renews trusted-path readiness for this slice
 - [ ] LUA-9. Add bounded child-process transport and owned process lifetime — [deferred]: Q-5 successful Linux and macOS confinement verdicts
 - [ ] LUA-10. Establish Linux mod-process confinement — [deferred]: Q-5 successful Linux and macOS confinement verdicts
@@ -1247,6 +1247,31 @@ instance's `init` has finished, so instance numbers and event order are
 deterministic; when several outcomes apply, a failure (1) outranks a signal
 (130), which outranks success (0); `io`, `os`, `package` and `debug` stay closed
 to runner scripts, and `print` and `warn` are rebound to the bounded output.
+
+### D-43. An accepted instance event that overflows fails its watcher
+
+Owner decision, 2026-10-19, in the hetoimasia manager pane ("Keep LUA-26's
+rule"), on the open decision #493's canonical review raised
+(https://github.com/coghex/hetoimasia/issues/493#issuecomment-6270280724). The
+drafted LUA-28 said an overloaded watcher's events are refused and counted and
+fail nothing. LUA-26's merged contract has two cases on a logical owner: an
+ordered event refused when it is offered (queue or staging full) is refused and
+counted, and an event already staged for a tick that finds the subscriber's
+queue full at that tick fails the subscribing instance with a delivery error,
+with no second answer to the producer (`packages/scripting-lua/README.md`,
+owned subscriptions).
+
+- The runner's `instances` endpoint keeps LUA-26's rule unchanged. A refusal
+  when offered is counted in the run report by kind and fails nothing. A staged
+  event that cannot enter its subscriber's queue at its tick fails that watcher
+  instance, which is reported once like any instance failure and makes the run's
+  status a failure.
+- LUA-28 does not change LUA-26's provider or subscription contracts.
+
+Rejected: a runner capacity invariant that makes the post-staging overflow
+impossible under every permitted subscription pattern (hard to prove, and it
+would limit what scripts may subscribe to), and changing LUA-26 to count the
+post-staging overflow instead (reopens #483's merged contract).
 
 ## Design
 
@@ -3104,6 +3129,30 @@ and verified policy, with adversarial regression coverage.
   line, signals and exit numbers (LUA-19), window creation, VM groups, module
   reload.
 - **Open questions:** None; D-40 and D-42 fix its behavior.
+- **As delivered (#492):** the choices the slice left to its solver, recorded so a later slice does not reopen
+  them. The package contract is [`packages/scripting-lua/README.md`](../packages/scripting-lua/README.md#the-script-runner).
+  Sinks (the owner's amendment on #492, `owner-decision:lua27-runner-sinks`): the tables go to the *output* sink as
+  `print` does, the source-did-not-load report and every instance failure report to the *error* sink as `warn`
+  does; which process streams they are is LUA-19's. Hooks: the owner reads which optional hooks a module defines
+  once, before it is ready, through the instance's own definition of a hook (declared and present, a present
+  non-function counting), and `Instance.moduleHooks` answers from it for the owner's life. A source that does
+  not load is told from a failure of the host by the owner being an *optional* worker whose classifier recognizes
+  only the host's fault of loading a module not raised by application code (the marker the bridge already puts on
+  every failure that escapes application code), so creation answers it as data while every other failure of the
+  owner stays fatal under supervision and propagates unchanged; the modules before a file that cannot be read are
+  loaded first, so the first failure in script order is the one reported. The identity of a module is its place
+  among the run's distinct paths and the end of the path. The run's limit is measured from the instant read just
+  before the first instance is admitted. When endings apply together the order is: a failure to write, the start
+  table, every instance ended, the stop request, the limit, decided in one STM wait with supervision; a run asked
+  to end before the start-table barrier opens writes no start table, and the barrier is `no instance is
+  initializing`, so an instance that became terminal without its `init` having run is accepted. Instances'
+  settlements are read without being observed, so the owner's inspection keeps every admitted instance for the tables; a
+  failure is written once, when its settlement is first seen, under one lock per table, report or call. A host
+  failure on the runner's own thread retires the owner in order before it propagates; one inside the owner
+  retires protected. The callback examples use a test-only seam (`Runner.Internal`: an event source, bindings
+  and the owner's endpoint) and the public configuration has no source or subscription grant; LUA-28 replaces it
+  with the real endpoint. The runner's bounds are documented constants (64 scripts, 4096 bytes a call of
+  `print`, 32-column cells, 8 secondary failures, 1024-character errors, 4096-character tracebacks).
 
 ### LUA-28. Drive the runner on logical ticks and publish instance start and end events
 
@@ -3122,7 +3171,7 @@ and verified policy, with adversarial regression coverage.
 - **Phase:** runnable consumer.
 - **Depends on:** LUA-27, LUA-7, LUA-26.
 - **Ordering:** after LUA-27; precedes LUA-19.
-- **Relevant decisions:** D-23, D-25, D-36, D-38, D-39, D-40, D-41, D-42.
+- **Relevant decisions:** D-23, D-25, D-36, D-38, D-39, D-40, D-41, D-42, D-43.
 - **Acceptance signals:** identical script sets and tick counts give identical
   output and event order under varied delays and arrival; events reach only
   subscriptions that exist when produced; an instance whose `init` fails produces
