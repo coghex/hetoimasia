@@ -102,12 +102,21 @@ test-suite lua-domains-tests
     main-is: Main.hs
     hs-source-dirs: test
     other-modules:
+        Test.Domains.Admission
+        Test.Domains.Barrier
+        Test.Domains.Command
+        Test.Domains.Conservation
+        Test.Domains.Dependencies
         Test.Domains.Exposure
         Test.Domains.Intentions
         Test.Domains.Lifetime
+        Test.Domains.Process
+        Test.Domains.Progress
         Test.Domains.Queue
+        Test.Domains.Random
         Test.Domains.Spec
         Test.Domains.Staging
+        Test.Domains.View
         Test.Domains.Support
         Test.Domains.World
     -- The threaded runtime with two capabilities: the CPU-bound progress check

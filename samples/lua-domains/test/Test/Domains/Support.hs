@@ -9,6 +9,7 @@ module Test.Domains.Support
   ( -- * The boundary
     withBoundary
   , withSample
+  , withRealSample
   , sampleConfig
     -- * The UI owner's clock and timer
   , FakeUi
@@ -33,6 +34,7 @@ module Test.Domains.Support
   , committedTick
     -- * Waiting
   , waitFor
+  , generous
   , spawn
   , withReleased
   ) where
@@ -71,6 +73,7 @@ import Hetoimasia.Scripting.Lua.Scheduler (TimerBackend (TimerBackend))
 import Hetoimasia.Scripting.Lua.Value (Schema (SText), Value (VText))
 import Numeric.Natural (Natural)
 import System.IO (stderr)
+import System.Timeout (timeout)
 import Test.Support.Bounded (bounded)
 
 -- | A real supervision boundary over a real worker group. Diagnostics go to stderr, as they do
@@ -86,6 +89,14 @@ withSample adjust body = do
   fx ← newFx
   ui ← newFakeUi
   withBoundary $ \control → withDomains control (adjust (sampleConfig fx ui)) (body fx ui)
+
+-- | A session over a configuration the example adjusts, with the UI owner on the real clock and
+-- timer, as in the executable, and the test-only namespace in both owners.
+withRealSample ∷ (DomainsConfig → DomainsConfig) → (Fx → Domains → IO a) → IO a
+withRealSample adjust body = do
+  fx ← newFx
+  let config = adjust defaultConfig {configTicks = Nothing, configExtensions = \shared → [Extension (fxNamespace fx shared) InBoth]}
+  withBoundary $ \control → withDomains control config (body fx)
 
 -- | The production configuration with the UI owner on the fake clock and timer, no last tick and
 -- the test-only namespace added to both owners.
@@ -275,3 +286,7 @@ spawn action = do
 -- the owner, and with it the session's retirement, waiting.
 withReleased ∷ Fx → [Text] → IO a → IO a
 withReleased fx names body = body `finally` mapM_ (releaseGate fx) names
+
+-- | A deadlock guard for a call that does real work: two minutes, never an assertion.
+generous ∷ IO a → IO a
+generous action = timeout 120000000 action >>= maybe (throwIO (userError "a guarded call never returned")) pure

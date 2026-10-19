@@ -193,6 +193,25 @@
       "optional": false
     },
     {
+      "id": "test.lua-domains",
+      "description": "Focused Hspec examples for the two-domain Lua sample (LUA-29, D-44): a UI VM owner and a gameplay VM owner composed side by side from the Lua package's public modules, with real interpreters under a real supervision boundary, the UI owner's clock and timer injected where an example moves it by hand, and gates and bounded waits everywhere else. The package and import boundary read from the Cabal description and the imports (no runner, no internal module, nothing of GLFW, Vulkan or the console, no engine package depending on it); both owners' exit records and nothing left live; exposure per owner, no shared global and no handle into the other VM; a staged batch invisible until the commit, exactly one snapshot per completed tick, none for a held tick and none for a tick whose work did not finish; the intention contract (true only once the queue has taken an intention for the next unstarted tick, full at once, a malformed or over-bound call answered as data before the typed binding, never waiting for gameplay); admissions raced against the driver's grants, each settled at the tick it was accepted for; conservation of accepted intentions, applied or rejected as stale exactly once, including a finite session's final grant racing admissions; a coherent view for each UI segment; the UI completing a set number of updates while gameplay is held by a barrier, and while gameplay runs a pure-Lua CPU-bound computation with no hook, counted from the computation's start to its end on the threaded runtime with the tenfold margin; the application-owned seeded random stream; and the sample's executable run as a child process for its report, --help and exit status 2 for an unknown argument and for a malformed value. The executable is reached through the suite's build-tool dependency and is never launched by a smoke group. No example sleeps.",
+      "command": [
+        "cabal",
+        "test",
+        "hetoimasia-sample-lua-domains:lua-domains-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-sample-lua-domains:test:lua-domains-tests",
+      "inputs": [
+        "cabal.project.common"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": false
+    },
+    {
       "id": "test.lua-confinement-linux",
       "description": "Local-only optional Linux confinement and resource-limit feasibility probe (LUA-14). Launches confined children through the candidate namespace, private-root, and seccomp profile; records the machine, the permissions, and whether the profile installed at all; and checks the fail-closed refusal, the denied native and Lua accesses with the mechanism that denied each, two-instance isolation and independent termination, the whole-process memory ceiling, the execution bound's escalation, and the three lifetime cases. Built and run on Linux only; on other platforms the components are not built. A green run is evidence, never a supported-platform verdict.",
       "command": [
