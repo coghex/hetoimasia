@@ -7,6 +7,7 @@ import Hetoimasia.Sample.LuaDomains
   ( DomainsConfig (configExtensions, configGameplaySource, configUiSource)
   , Extension (extensionNamespace)
   , defaultConfig
+  , stepTick
   )
 import Hetoimasia.Sample.LuaDomains.Bounds (defaultBounds)
 import Hetoimasia.Sample.LuaDomains.Registration (allNamespaces, gameplayNamespaces, sampleRegistration, uiNamespaces)
@@ -52,6 +53,20 @@ spec = describe "exposure" $ do
                          , "ui sees view,intent,input,ui,fx"
                          , "ui reads the other global nil"
                          ]
+
+  it "keeps each VM's module state to itself: a local the module closes over counts only that VM's own updates" $
+    withSample
+      ( \config →
+          config
+            { configGameplaySource = luaLinesOf ["local count = 0", "function update(self, dt) count = count + 1 fx.record('gameplay update ' .. count) staging.finish() end"]
+            , configUiSource = luaLinesOf ["local count = 0", "function update(self, dt) count = count + 1 fx.record('ui update ' .. count) ui.updated() end"]
+            }
+      )
+      $ \fx ui domains → do
+        mapM_ (const (stepTick domains)) [1 .. 2 ∷ Int]
+        mapM_ (\done → tickUi domains ui >> awaitUpdates domains done) [1 .. 3]
+        -- Two ticks and three UI updates: each VM counted its own and neither saw the other's.
+        fxLines fx `shouldReturn` ["gameplay update 1", "gameplay update 2", "ui update 1", "ui update 2", "ui update 3"]
 
   it "registers every binding once, names disjoint namespaces for the two policies, and no hook for tests" $ do
     shared ← newShared defaultBounds 1 1 Nothing scriptedInputs

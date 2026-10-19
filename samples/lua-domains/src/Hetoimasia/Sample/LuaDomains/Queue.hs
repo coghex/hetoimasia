@@ -31,6 +31,11 @@
 -- runs, and 'settle' gives them back in the transaction that commits the tick, so a producer can
 -- never fill the queue beyond what the commit has not yet disposed of.
 --
+-- = Closing
+--
+-- 'closeQueue' ends admission for good: the session closes it first when it is retired, so nothing is
+-- accepted for a tick that will never run.
+--
 -- = A finite session
 --
 -- A queue made for a session of @n@ ticks answers 'Closed' for an intention whose tick is beyond
@@ -44,6 +49,7 @@ module Hetoimasia.Sample.LuaDomains.Queue
   , admitNext
   , seal
   , settle
+  , closeQueue
   , reserved
   , nextUnstarted
   , AdmitAt (..)
@@ -66,6 +72,8 @@ data State = State
     -- ^ How many intentions each started tick holds a reservation for until its commit.
   , statePending ∷ !Int
     -- ^ Accepted and not settled: the sum of both tables above.
+  , stateClosed ∷ !Bool
+    -- ^ Admission has ended, because the session is being retired.
   }
 
 -- | The bounded queue, owned as the module header says.
@@ -79,7 +87,7 @@ data Queue = Queue
 -- | An empty queue whose first unstarted tick is 1, for a session of this many ticks if it is
 -- finite.
 newQueue ∷ Bounds → Maybe Word64 → IO Queue
-newQueue bounds final = Queue bounds final <$> newTVarIO (State 1 Map.empty Map.empty 0)
+newQueue bounds final = Queue bounds final <$> newTVarIO (State 1 Map.empty Map.empty 0 False)
 
 -- | What admitting at an explicit place answered.
 data AdmitAt
@@ -96,7 +104,7 @@ data AdmitAt
 
 -- | Admit an intention at an explicit tick and place.
 --
--- The checks, in order: the tick is within the session ('AtClosed'), the tick has not started
+-- The checks, in order: admission is open and the tick is within the session ('AtClosed'), the tick has not started
 -- ('AtLate'), the place is free ('AtDuplicate'), and neither the tick's places nor the queue's
 -- bound are exhausted ('AtFull'). A place at or beyond the bound on places is full.
 admitAt ∷ Queue → Placement → Intention → STM AdmitAt
@@ -104,7 +112,7 @@ admitAt queue place@(Placement tick order) intention = do
   state ← readTVar (queueState queue)
   let taken = Map.findWithDefault Map.empty tick (stateOpen state)
       refused
-        | maybe False (tick >) (queueFinal queue) = Just AtClosed
+        | stateClosed state || maybe False (tick >) (queueFinal queue) = Just AtClosed
         | tick < stateNext state = Just AtLate
         | Map.member order taken = Just AtDuplicate
         | fromIntegral order >= boundPlaces (queueBounds queue) = Just AtFull
@@ -120,6 +128,14 @@ admitAt queue place@(Placement tick order) intention = do
           , statePending = statePending state + 1
           }
       pure (AdmittedAt place)
+
+-- | End admission: every later admission answers 'AtClosed'. What was accepted stays held, and a
+-- tick that has begun is still sealed and settled as usual. The session closes the queue first when
+-- it is retired, as an owner closes its admission first when it stops.
+closeQueue ∷ Queue → STM ()
+closeQueue queue = do
+  state ← readTVar (queueState queue)
+  writeTVar (queueState queue) state {stateClosed = True}
 
 -- | The UI's path: admit for the next tick that has not started, at the next free place in it. It
 -- reads the tick and takes the place in one transaction, so it cannot be late or a duplicate.

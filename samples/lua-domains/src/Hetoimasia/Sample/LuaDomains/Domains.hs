@@ -73,7 +73,7 @@ import Data.Text (Text)
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Log (unsafeComponent)
 import Hetoimasia.Foundation.Messaging.Payload (prepare, preparedValue)
-import Hetoimasia.Foundation.Messaging.Snapshot (Publication (Published), SnapshotReader, observedValue, publish, readSnapshot, snapshotReader)
+import Hetoimasia.Foundation.Messaging.Snapshot (Publication (Published), SnapshotReader, closeSnapshot, observedValue, publish, readSnapshot, snapshotReader)
 import Hetoimasia.Foundation.Resource (withResource)
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (RequirePositive), MonotonicSource, durationFromNanoseconds, monotonicSource)
 import Hetoimasia.Runtime.Supervision
@@ -88,7 +88,7 @@ import Hetoimasia.Runtime.Supervision
 import Hetoimasia.Sample.LuaDomains.Bounds (Bounds, defaultBounds, validateBounds)
 import Hetoimasia.Sample.LuaDomains.Candidate (Candidate (..), beginCandidate, commit)
 import Hetoimasia.Sample.LuaDomains.Intention (Dispositions (..))
-import Hetoimasia.Sample.LuaDomains.Queue (nextUnstarted, reserved, seal, settle)
+import Hetoimasia.Sample.LuaDomains.Queue (closeQueue, nextUnstarted, reserved, seal, settle)
 import Hetoimasia.Sample.LuaDomains.Registration (gameplayNamespaces, sampleRegistration, uiNamespaces)
 import Hetoimasia.Sample.LuaDomains.Scripts (facadeChunk, gameplayChunk, gameplayModule, gameplaySource, interfaceModule, interfaceSource)
 import Hetoimasia.Sample.LuaDomains.Shared (ScriptedInput, Shared (..), captureView, newShared, scriptedInputs)
@@ -217,9 +217,13 @@ data DomainsDefect
     BehaviorDidNotStart !Text !String
   | -- | The driver was asked for a tick beyond a finite session's last.
     PastFinalTick !Word64
+  | -- | The driver was asked for a tick while another had begun and not committed: a tick that
+    -- did not complete leaves the session halted, and two drivers never share one.
+    TickAlreadyInProgress !Word64
   | -- | A grant was not accepted: the answer.
     TickNotGranted !Word64 !String
-  | -- | The gameplay owner ended while the tick was outstanding.
+  | -- | The gameplay owner ended while the tick was outstanding. The owner's own failure, if it
+    -- failed, is supervision's to report and is retained beside this one.
     OwnerEndedDuringTick !Word64
   | -- | The tick completed without its work having finished successfully, so nothing was
     -- committed.
@@ -231,7 +235,7 @@ data DomainsDefect
   | -- | A finite session ended with something pending, or with accepted not equal to applied plus
     -- stale: the counters and what was pending.
     ConservationViolated !Counts !Int
-  deriving (Show)
+  deriving (Eq, Show)
 
 instance Exception DomainsDefect
 
@@ -455,8 +459,14 @@ retireDomains ∷ Domains → IO Retirement
 retireDomains domains = modifyMVar (domainsRetired domains) $ \case
   Just done → pure (Just done, done)
   Nothing → do
+    -- Admission ends first, as an owner's does when it stops: nothing is accepted for a tick that
+    -- will never run.
+    atomically (closeQueue (sharedQueue (domainsShared domains)))
     ui ← retireOwner (domainsControl domains) (domainsUi domains)
     gameplay ← retireOwner (domainsControl domains) (domainsGameplay domains)
+    -- Both owners are gone, so nothing reads or publishes any more: the publication ends with
+    -- the session, keeping the last value.
+    atomically (closeSnapshot (sharedPublisher (domainsShared domains)))
     let done = Retirement ui gameplay
     pure (Just done, done)
 
@@ -478,6 +488,8 @@ stepTick domains = do
       owner = startedOwner gameplay
   tick ← atomically $ do
     next ← nextUnstarted (sharedQueue shared)
+    inProgress ← readTVar (sharedTick shared)
+    forM_ inProgress $ \working → throwSTM (TickAlreadyInProgress (candidateTick working))
     when (maybe False (next >) (configTicks config)) $ throwSTM (PastFinalTick next)
     (tick, sealed) ← seal (sharedQueue shared)
     committed ← readTVar (sharedCommitted shared)

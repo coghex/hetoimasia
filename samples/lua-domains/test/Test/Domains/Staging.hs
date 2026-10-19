@@ -11,7 +11,7 @@ import Hetoimasia.Sample.LuaDomains
   ( Bounds (boundStaging)
   , Domains (domainsShared)
   , DomainsConfig (configBounds, configGameplaySource, configExtensions)
-  , DomainsDefect (TickNotCompleted)
+  , DomainsDefect (TickAlreadyInProgress, TickNotCompleted)
   , Extension (Extension)
   , GameSnapshot (snapTick, snapWorld)
   , Where (InGameplay)
@@ -108,5 +108,12 @@ spec = describe "staging and the commit" $ do
         worldRandom committedAfter `shouldBe` worldRandom committedBefore
         revisionNow domains `shouldReturn` 0
         committedTick domains `shouldReturn` 0
+        -- The session is halted: a tick that did not complete is not stepped past.
+        again ← try (stepTick domains)
+        case again of
+          Left (TickAlreadyInProgress tick) → tick `shouldBe` 1
+          Left other → expectationFailure ("a different defect: " <> show other)
+          Right _ → expectationFailure "a second tick began"
+        revisionNow domains `shouldReturn` 0
     withWait extensions shared =
       extensions shared <> [Extension (namespace "sched" [waitOperation "wait_ticks" WaitLogical [SInteger]]) InGameplay]

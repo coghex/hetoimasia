@@ -81,6 +81,17 @@ spec = describe "the intention queue" $ do
     atomically (admitAt queue (placement 2 0) (intention 0)) `shouldReturn` AtDuplicate
     atomically (admitAt queue (placement 2 1) (intention 0)) `shouldReturn` AtFull
 
+  it "ends admission when it is closed, and still seals and settles what it held" $ do
+    queue ← newQueue bounds Nothing
+    atomically (admitNext queue (intention 0)) `shouldReturn` AdmittedAt (placement 1 0)
+    atomically (closeQueue queue)
+    atomically (admitNext queue (intention 1)) `shouldReturn` AtClosed
+    atomically (admitAt queue (placement 5 0) (intention 1)) `shouldReturn` AtClosed
+    (tick, sealed) ← atomically (seal queue)
+    map fst sealed `shouldBe` [placement 1 0]
+    atomically (settle queue tick)
+    atomically (reserved queue) `shouldReturn` 0
+
   it "of a finite session answers closed on the UI's path once the last tick has started" $ do
     queue ← newQueue bounds (Just 2)
     _ ← atomically (seal queue)
