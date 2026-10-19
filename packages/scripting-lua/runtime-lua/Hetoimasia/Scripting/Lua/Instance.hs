@@ -425,6 +425,10 @@ module Hetoimasia.Scripting.Lua.Instance
   , InstanceError (..)
   , HookStage (..)
 
+    -- * What a module defines
+  , ModuleHooks (..)
+  , moduleHooks
+
     -- * Inspection
   , InstanceSnapshot (..)
   , InstancePhase (..)
@@ -434,7 +438,7 @@ module Hetoimasia.Scripting.Lua.Instance
   , inspectInstances
   ) where
 
-import Control.Concurrent.STM (STM, atomically, retry)
+import Control.Concurrent.STM (STM, atomically, readTVar, retry)
 import Control.Exception (evaluate)
 import qualified Data.Map.Strict as Map
 import Data.List (nub)
@@ -451,7 +455,8 @@ import Hetoimasia.Scripting.Lua.Internal.Value (Context (..), VmIdentity (VmIden
 import Hetoimasia.Scripting.Lua.Runtime.Shared (compact, compactName, compactRef, refuseCallbackWait)
 import Hetoimasia.Scripting.Lua.Runtime.Types (Payload (WithinBounds))
 import Hetoimasia.Scripting.Lua.Provider.Types (ProviderState (psEvents))
-import Hetoimasia.Scripting.Lua.Scheduled.Types (Control (controlInstances, controlLabel, controlLimits, controlOwner, controlProvider), ScheduledEndpoint (ScheduledEndpoint))
+import Hetoimasia.Scripting.Lua.Owner (ModuleRef)
+import Hetoimasia.Scripting.Lua.Scheduled.Types (Control (controlHooks, controlInstances, controlLabel, controlLimits, controlOwner, controlProvider), ScheduledEndpoint (ScheduledEndpoint))
 import Hetoimasia.Scripting.Lua.Scheduler (ControlResult)
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VRecord, VText))
 
@@ -579,6 +584,17 @@ awaitInstance supervision ticket = do
 -- reservation back now, a live one when it ends.
 forgetInstance ∷ InstanceTicket → IO ()
 forgetInstance = atomically . State.forgetInstance
+
+-- | Which of the optional hooks (@init@, @update@, @shutdown@ and @run@) a module the owner
+-- loaded defines; 'Nothing' for a module it did not load. An entry that is present and is not
+-- a function counts as defined, as the instance's own check counts it.
+--
+-- The owner read it from the module, running none of the module's code, before it was ready:
+-- the answer is available from the moment creation returns the owner, and it does not change for
+-- the owner's life. It is how an application chooses an instance's kind from what its module
+-- defines ('InstanceKind') without admitting an instance to find out.
+moduleHooks ∷ ScheduledEndpoint → ModuleRef → STM (Maybe ModuleHooks)
+moduleHooks (ScheduledEndpoint control) ref = Map.lookup ref <$> readTVar (controlHooks control)
 
 -- | One instance, live or ended and not yet observed, read in one transaction.
 inspectInstance ∷ ScheduledEndpoint → InstanceId → STM (Maybe InstanceSnapshot)

@@ -76,6 +76,7 @@ module Hetoimasia.Scripting.Lua.Instance.Run
   , recordExit
   , cleanupEndedOwner
   , endOwner
+  , definedHooks
   ) where
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', orElse, readTVar, readTVarIO, retry, swapTVar, writeTVar)
@@ -669,9 +670,22 @@ runningTask ih task action =
 -- | Whether a module has a hook, as an entry point it declares and has. One that is
 -- there and is not a function is a hook: running it raises the host's fault for it.
 hookAvailable ∷ InstanceHost → ModuleHandle → Text → IO Bool
-hookAvailable ih handle name
+hookAvailable ih = hookDefined (ihOwned ih)
+
+-- | Whether a module defines a hook: the one definition, which every reading of a module's hooks
+-- goes through, the instance's own and the query an application makes of the owner.
+hookDefined ∷ OwnedVm → ModuleHandle → Text → IO Bool
+hookDefined owned handle name
   | name `notElem` map entryName (handleEntries handle) = pure False
-  | otherwise = entryPresent (ownedHost (ihOwned ih)) handle name
+  | otherwise = entryPresent (ownedHost owned) handle name
+
+-- | The optional hooks a module defines, read from the module and running none of its code. On
+-- the owner's thread.
+definedHooks ∷ OwnedVm → ModuleHandle → IO ModuleHooks
+definedHooks owned handle =
+  ModuleHooks <$> defined "init" <*> defined "update" <*> defined "shutdown" <*> defined "run"
+  where
+    defined = hookDefined owned handle
 
 -- | Have the driver let go of the callbacks of subscriptions that ended without the script (an
 -- epoch change), on the owner's thread at a safe boundary: the script does not have to unsubscribe

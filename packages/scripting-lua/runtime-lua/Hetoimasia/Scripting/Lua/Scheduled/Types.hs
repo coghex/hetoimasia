@@ -40,7 +40,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Word (Word64)
-import Hetoimasia.Scripting.Lua.Instance.Types (Instances)
+import Hetoimasia.Scripting.Lua.Instance.Types (Instances, ModuleHooks)
 import Hetoimasia.Scripting.Lua.Lifecycle.State (LifecycleState, abandonAll, sweepEndedTasks)
 import Hetoimasia.Scripting.Lua.Provider.Types (ProviderState)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (SubscriptionId, TaskId)
@@ -217,6 +217,9 @@ data Control = Control
   , controlProvider ∷ !(Maybe ProviderState)
     -- ^ What the owner's request service holds, when it was granted one: its requests, and the
     -- accounting of its providers' work, which its exit revokes and awaits.
+  , controlHooks ∷ !(TVar (Map ModuleRef ModuleHooks))
+    -- ^ The hooks each module the owner loaded defines, written once, in the transaction that
+    -- publishes readiness, and never changed after it.
   }
 
 -- | Where an owner's tasks are admitted. Any thread may hold and use it.

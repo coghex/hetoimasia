@@ -118,6 +118,7 @@ import Hetoimasia.Scripting.Lua.Instance.Run
   , InstanceHost (ihMode)
   , awaitInstanceWork
   , cleanupEndedOwner
+  , definedHooks
   , endOwner
   , instanceClosed
   , instanceSegment
@@ -226,7 +227,12 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
     forM_ ((,) <$> controlInstances control <*> escalate) $ \(instances, decide) →
       forM_ (Map.lookup driverRef handles) $ \driver →
         newInstanceHost control instances decide host owned driver handlesRef tasks extra leaseHost (controlProvider control) >>= writeIORef instanceRef . Just
-    atomically (writeTVar handoff (Just control))
+    -- What each module defines is read now, from the modules as loaded, running none of their
+    -- code, and published with readiness: the owner's query answers from it and it never changes.
+    defined ← forM (Map.toList (Map.delete driverRef handles)) $ \(ref, handle) → (,) ref <$> definedHooks owned handle
+    atomically $ do
+      writeTVar (controlHooks control) (Map.fromList defined)
+      writeTVar handoff (Just control)
     loop host kept extra instanceRef
   -- The owner is exiting, however it was asked to or made to. Admission, grants
   -- and control close, every unsettled ticket settles, and only then are the

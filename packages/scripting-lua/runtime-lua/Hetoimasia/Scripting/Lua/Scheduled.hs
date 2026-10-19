@@ -589,7 +589,8 @@ startScheduledOwner runtime spec = do
     case validateGrant (vmValueLimits config) grant of
       Right endpoints → newProviderState owner label scope (vmValueLimits config) grant endpoints subscriptions (ticksFor scheduler stopping) ownInstances
       Left refused → throwFailure runtimeComponent (operation "start-scheduled-owner") [] (RequestGrantRefused refused)
-  let bare = Control owner label (vmValueLimits config) scheduler cells faults begun closing exited stopping ownInstances Nothing provider
+  hooks ← newTVarIO Map.empty
+  let bare = Control owner label (vmValueLimits config) scheduler cells faults begun closing exited stopping ownInstances Nothing provider hooks
   -- A lifecycle grant is resolved against the owners it names before anything starts, and
   -- refused naming every reason.
   lifecycle ← forM (scheduledLifecycle spec) $ \grant →

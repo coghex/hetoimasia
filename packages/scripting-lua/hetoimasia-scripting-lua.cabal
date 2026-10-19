@@ -204,6 +204,8 @@ library runtime-lua
         Hetoimasia.Scripting.Lua.Lending
         Hetoimasia.Scripting.Lua.Provider
         Hetoimasia.Scripting.Lua.Request
+        Hetoimasia.Scripting.Lua.Runner
+        Hetoimasia.Scripting.Lua.Runner.Internal
         Hetoimasia.Scripting.Lua.Runtime
         Hetoimasia.Scripting.Lua.Instance
         Hetoimasia.Scripting.Lua.Lifecycle
@@ -216,6 +218,11 @@ library runtime-lua
         Hetoimasia.Scripting.Lua.Instance.Types
         Hetoimasia.Scripting.Lua.Lease.State
         Hetoimasia.Scripting.Lua.Retention
+        Hetoimasia.Scripting.Lua.Runner.Output
+        Hetoimasia.Scripting.Lua.Runner.Render
+        Hetoimasia.Scripting.Lua.Runner.Run
+        Hetoimasia.Scripting.Lua.Runner.Source
+        Hetoimasia.Scripting.Lua.Runner.Types
         Hetoimasia.Scripting.Lua.Lending.Loan
         Hetoimasia.Scripting.Lua.Lifecycle.State
         Hetoimasia.Scripting.Lua.Provider.Events
@@ -386,6 +393,14 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.HostFailures
         Test.LuaRuntime.Identity
         Test.LuaRuntime.Independence
+        Test.LuaRuntime.Runner.Ending
+        Test.LuaRuntime.Runner.Failures
+        Test.LuaRuntime.Runner.Kinds
+        Test.LuaRuntime.Runner.Output
+        Test.LuaRuntime.Runner.Query
+        Test.LuaRuntime.Runner.Sources
+        Test.LuaRuntime.Runner.Spec
+        Test.LuaRuntime.Runner.Support
         Test.LuaRuntime.Instance.Basics
         Test.LuaRuntime.Instance.Boundary
         Test.LuaRuntime.Instance.ExitKind

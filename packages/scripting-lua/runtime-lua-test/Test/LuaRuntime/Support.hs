@@ -12,6 +12,7 @@ module Test.LuaRuntime.Support
   , brokenIs
     -- * The boundary
   , withBoundary
+  , quietLogger
   , expectFatal
   , bounded
     -- * The fixture

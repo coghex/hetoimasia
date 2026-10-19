@@ -12,6 +12,7 @@ module Hetoimasia.Scripting.Lua.Instance.Types
     InstanceId (..)
 
     -- * What an application admits
+  , ModuleHooks (..)
   , InstanceKind (..)
   , Interval (..)
   , IntervalRefusal (..)
@@ -122,6 +123,20 @@ data InstanceId = InstanceId
   deriving (Eq, Ord, Show)
 
 -- What an application admits ----------------------------------------------------
+
+-- | Which of the optional hooks a module defines, as the owner read them from the module once it
+-- had loaded, running none of the module's code. A hook is defined when the module declares it
+-- among its entry points ('Hetoimasia.Scripting.Lua.Instance.hookEntries') and its environment has a
+-- value of that name: one that is present and is not a function counts as defined, because running
+-- it raises the host's fault for it, as 'Hetoimasia.Scripting.Lua.Instance.Run.hookAvailable'
+-- counts it. It is read once, before the owner is ready, and never changes for the owner's life.
+data ModuleHooks = ModuleHooks
+  { hooksInit ∷ !Bool
+  , hooksUpdate ∷ !Bool
+  , hooksShutdown ∷ !Bool
+  , hooksRun ∷ !Bool
+  }
+  deriving (Eq, Show)
 
 -- | What an instance does after it initializes.
 data InstanceKind
