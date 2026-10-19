@@ -3185,6 +3185,29 @@ and verified policy, with adversarial regression coverage.
 - **Out of scope:** the command line, signals and exit numbers (LUA-19), a general
   message bus, replay.
 - **Open questions:** None; D-40 and D-42 fix its behavior.
+- **As delivered (#493):** the choices the slice left to its solver, recorded so a later slice does not reopen
+  them. The package contract is [`packages/scripting-lua/README.md`](../packages/scripting-lua/README.md#the-script-runner).
+  *Coordination (requirement 6)* is met with the engine as delivered, changing none of LUA-18's dispatch, LUA-23's
+  control admission or LUA-26's subscriptions: the runner installs the owner's segment observer as a *gate* it can hold
+  (the owner parks before its next segment, readable in STM), admits each script with the gate held, produces the
+  instance's *started* event while the owner is held, and only then lets the owner run the one-shot's `run`; the owner is
+  *quiet* (readable from one inspection: no instance initializing or stopping, none ready or running, nothing queued, no
+  update owed on logical time, no one-shot's `run` yet to execute; paused and waiting instances are quiet) before the next
+  script is admitted and, on a tick VM, after every grant and before the boundary's events are produced. On the elapsed
+  clock an update owed does not count as work, because it falls due by the wall clock. *Ticks:* the tick duration is both
+  the logical duration of a grant and the real-time period; tick *n* is due *n* periods after the instant read once admission
+  is complete, a late tick is granted at once with no timer wait, and the driver's own timer is separate from the duration
+  limit's. A tick in progress when the stop request arrives is not counted as completed; a tick whose last instance ended
+  is waited out and counted; a finished tick is counted before the duration limit's wake is looked at. The precedence is
+  a failure to write, what a finished `init` owes, every instance ended, the stop request, the tick limit, the duration limit.
+  *Events:* the payload's `name` is always present because the runner always names its instances; an instance discarded
+  at the owner's exit reads as `stopped`; the report's watchers-failed count is the provider's failure counter read
+  before the owner is retired. The subscription bound is 256, the staging bound 1024, and the instance queue bound is
+  now 128 (twice the most scripts), up from 64, so a watcher with one subscription never overflows in a full run; this
+  alters a number #492 documented. Sequential admission changes two #492 examples whose scripts assumed the batch
+  admission of #492 (a host failure in the second of three scripts leaves two instances, not three; a script behind a held
+  `init` is never admitted when the run is stopped), and the admitted-instances test seam is told as soon as the last
+  instance is admitted, or as admission ends however it ends."
 
 ### LUA-19. Run script instances through a headless command-line entry
 

@@ -47,8 +47,8 @@ will answer later, with a reserved result slot, settled exactly once and, on a l
 application assigned. See [Asynchronous requests](#asynchronous-requests). **Provider events** (LUA-26) let an
 instance subscribe a function to a provider's events: owned by the instance, delivered into its bounded queue by
 producers that never call Lua, and, on a logical owner, admitted at the tick and place the application assigned. See
-[Provider events](#provider-events). **The script runner** (LUA-27) runs a list of Lua files to completion as the instances of one
-named VM, on the elapsed clock, and answers a bounded report: the library the `lua` subcommand and a windowed application
+[Provider events](#provider-events). **The script runner** (LUA-27, LUA-28) runs a list of Lua files to completion as the instances of one
+named VM, on the elapsed clock or on logical ticks, publishes the instances' start and end events, and answers a bounded report: the library the `lua` subcommand and a windowed application
 share. See [The script runner](#the-script-runner). Any
 concrete game namespace and the confined path are later slices of
 [the Lua runtime design](../../docs/lua_runtime_design.md). What is here is the
@@ -3000,10 +3000,10 @@ can hide on one platform, so CI, which runs them on Linux, is the evidence for t
 
 ## The script runner
 
-`Hetoimasia.Scripting.Lua.Runner` (LUA-27, in `runtime-lua`) runs a list of scripts, each a file, as instances of one
-named VM on the elapsed clock, and answers a bounded report of the run. It is the layer under the `lua` subcommand
-(LUA-19) and under a windowed application alike, and the one LUA-28 extends with logical ticks and the instances' start and
-end events. It parses no arguments, installs no signal handler, never calls `exit`, opens no window and imports nothing of the
+`Hetoimasia.Scripting.Lua.Runner` (LUA-27 and LUA-28, in `runtime-lua`) runs a list of scripts, each a file, as instances of one
+named VM, on the elapsed clock or on logical ticks it grants at a real-time rate, and answers a bounded report of the run. It is the
+layer under the `lua` subcommand (LUA-19) and under a windowed application alike. It publishes an event when an instance starts and when
+it ends, to the scripts that subscribe. It parses no arguments, installs no signal handler, never calls `exit`, opens no window and imports nothing of the
 console, GLFW, Vulkan or a game: what the outside world does is injected. Its behavior is [D-40 and D-42 of the Lua runtime
 design](../../docs/lua_runtime_design.md#d-40-the-headless-runners-clock-ending-event-source-and-exit-statuses), over the
 instance contract (D-26, D-27), and it reopens none of the contracts it is built on.
@@ -3015,11 +3015,13 @@ runScripts ∷ LuaRuntime → RunnerConfig → IO RunOutcome
 ### What a run is given
 
 `RunnerConfig` holds the VM's name (`runnerName`, the owner label the tables and reports show), the scripts
-(`runnerScripts`), an optional run limit (`runnerLimit`), and the inputs that are not data: the stop request
+(`runnerScripts`), an optional run limit (`runnerLimit`), an optional tick duration (`runnerTick`) with an optional limit of ticks
+(`runnerTickLimit`), and the inputs that are not data: the stop request
 (`runnerStop ∷ STM Bool`, which the run waits on and never polls), the monotonic clock and the timer backend
 (`runnerClock`, `runnerTimer`; `runnerConfig` supplies the production ones), the output sink and the error sink
 (`runnerOutput`, `runnerErrors ∷ Text → IO ()`) and a `Logger`. A `Script` is a file path, an optional name (without one, the last
-component of the path) and an optional interval, a positive elapsed duration. The `LuaRuntime` is the one a `withSupervision`
+component of the path) and an optional interval: a positive elapsed duration (`Script path name (Just duration)`), or on a tick VM a
+positive whole number of ticks (`everyTicks n (script path)`). The `LuaRuntime` is the one a `withSupervision`
 boundary made: the owner the run starts is one of its supervised workers.
 
 A run admits at most `runnerMaxScripts` (64) scripts. The scheduler and instance bounds are the runner's own, documented
@@ -3049,19 +3051,96 @@ that reading for the owner's life. An entry that is present and is not a functio
 A module defining `run` is a one-shot, one defining `update` is looped on the script's interval, and one defining neither is an
 event-only instance. These are refused as usage, before any instance is admitted and before any hook runs, naming the script: a
 module defining both `run` and `update`; one defining `update` with no interval; an interval for a module that does not define
-`update`; no scripts at all; more scripts than a run admits; a zero interval or a zero limit. A refusal is the distinct outer result
+`update`; no scripts at all; more scripts than a run admits; a zero interval or a zero limit; and, for the clock: a tick duration of zero
+(`TickDurationNotPositive`), an elapsed interval on a tick VM (`ElapsedIntervalOnTickClock`), a tick interval on an elapsed VM
+(`TickIntervalOnElapsedClock`), a tick limit on an elapsed VM (`TickLimitNeedsTickClock`), and a tick count, as a limit or as an interval,
+that is not positive (`TickCountNotPositive`) or does not fit a 64-bit tick (`TickCountTooLarge`). A refusal is the distinct outer result
 `Refused (UsageRefusal reasons)`, never a report of a run, so the command line can map it. Where it needed the VM to ask, the VM that
 was started is retired.
 
 ### The VM
 
 It opens the base, string, table, math and coroutine libraries and no others; `io`, `os`, `package` and `debug` stay closed. The policy is
-`fifo`, the only built-in one. The owner hosts instances with no event source, no request service, no subscription grant and no tick
-duration, and admits controls on arrival; every instance's failure is isolated (the runner's answer to the escalation decision is
+`fifo`, the only built-in one. The owner hosts instances with no event source of the old kind, and holds the request service and the subscription grant that the instance events
+need ([Events](#the-instance-events)). On the elapsed clock it has no tick duration and admits controls on arrival. On a tick VM it is hosted with the
+tick duration and admits controls logically ([Ticks](#the-tick-clock)). Every instance's failure is isolated (the runner's answer to the escalation decision is
 always `Isolate`). The lifecycle bindings are registered as `lifecycle` (`runnerLifecycleName`): `pause`, `resume`, `stop`, `inspect`,
 `inspect_owner`, `owners`, `self`, `result` and `forget`, as [Lifecycle services](#lifecycle-services) documents them. The owner is
 granted every control and inspection permit over its own VM's instances and nothing else, so one script can pause, resume, stop and inspect
 another, and itself. Scripts are trusted (D-12): nothing here claims a sandbox.
+
+### Admission
+
+Scripts are admitted one at a time, in the order they are listed, each only after the previous instance's `init` has finished or failed and the owner
+has nothing left to do (every instance quiet, which the runner reads from one inspection: nothing initializing or stopping, nothing ready or running,
+no event queued, no update owed, no one-shot's `run` yet to execute; a paused instance and one that waits are quiet). So TIDs ascend in script order
+and the order of the `init`s is the script order, on both clocks. A failed `init` does not stop later scripts from being admitted. The wait is
+the run's one wait: a stop request, the duration limit or the owner's exit during admission admits no further script, the instances admitted are
+stopped in ascending TID order and the tables list them. While one instance is admitted the owner is held, before its next segment, at the gate the
+runner installs as the owner's segment observer; the instance's *started* event is produced while it is held, and only then does the owner run the
+instance's `run`. That is what makes a one-shot that runs, ends or unsubscribes at once give the same events as one the runner's thread observes
+promptly: the owner is never ahead of the runner's coordination. The gate is released on every way out of the admission and before every retirement.
+`runnerInstanceBounds` queues for twice as many invocations as a run has scripts (128), so a watcher with one subscription never overflows in the
+ordinary case.
+
+### The tick clock
+
+With `runnerTick = Just d` (a positive duration of whole nanoseconds) the VM is a *tick VM*: it is hosted with tick duration `d`, admits Lua controls
+logically and takes events at assigned ticks. A looped script's interval is then in ticks (`everyTicks n`). The driver grants one tick of exactly `d`
+whenever one is due: tick *n* is due *n* tick durations after the instant read when admission is complete, on the injected clock, and waited for on
+the injected timer, whose wake only says to look at the clock again, so an early or a stale wake grants nothing. A tick that is late is granted at
+once, one grant for each, so that none is skipped, merged or shortened and the number granted is the number due. A grant the engine answers full is
+waited out and asked again; one it answers closed means the owner is stopping, and the run ends as for a stop request. After a grant the driver waits
+for the engine to have finished it *and* for every instance to be quiet (a grant finishes when the work it woke has finished, which is not the owner
+having nothing left to do: a resumed instance can make other work ready), and then, at the boundary, produces the ends it saw, for the next tick. The
+wait is one STM wait with no polling, composed with supervision, the stop request, the limits, the owner's exit and every instance having ended.
+
+A **tick limit** (`runnerTickLimit = Just n`, at least one) ends the run when *n* ticks have completed, exactly as a duration limit ends it: every
+remaining instance is stopped in ascending TID order, its `shutdown` runs once with reason `stopped`, the VM is retired, and no tick is granted after
+the stop begins. A tick that is in progress when a stop request or a duration limit arrives lets the running segment return and is not counted as
+completed. Both limits may be set; the first reached ends the run. **When several endings hold together** the order of precedence is the contract, and
+the tick limit is third: a failure to write, then *every instance ended* (a tick whose last instance ended is waited out and counted first), then *the
+stop request*, then *the tick limit*, then *the duration limit*. A tick that has finished is counted before the duration limit is looked at. The
+report says the run ended at the tick limit (`EndedTickLimit`) and how many ticks completed (`reportTicks`); the status is success only if no instance
+failed (a failing `shutdown` included) and no source failed to load, as for any ending.
+
+Every pause, resume or stop a script requests through the lifecycle namespace on a tick VM is assigned by the runner a tick, the first the owner has not
+begun, and a sequence that is unique and increases in assignment order; the runner never declines to assign, so the engine's *late* and *duplicate*
+answers are not reachable in a correct run. On an elapsed VM controls are admitted on arrival.
+
+**Determinism.** On a tick VM, for identical scripts, intervals, tick duration and scheduling configuration, on the same build and platform, runs give the
+same script output, events (with their ticks and places), order of controls, tables and report however long segments take, however the runner's own
+threads are scheduled and whenever in real time the ticks are granted, provided the runs set no duration limit and take no external stop (those can change
+the completed work when pacing changes); a tick limit is allowed. Runtime identities are unique to a run, so a comparison maps TIDs to the instance's
+order in the run. The guarantee is of logical-time work: any elapsed wait a script makes keeps its wall-clock semantics.
+
+### The instance events
+
+Every instance is granted one ordered-events endpoint, `instances` (`runnerEventsName`), which a script reaches with `api.subscribe("instances", callback)`.
+The callback is handed LUA-26's envelope (`source`, `sequence`, `tick`, `subscription`, `payload`) unchanged, and the payload is a record: `event`, `"started"` or
+`"ended"`; `tid`, the record the lifecycle namespace uses (`{runtime, owner, id}`), so a watcher can hand it to `pause`, `resume`, `stop` and `inspect`; `name`, the
+instance's name; and `outcome`, present only on an end, `"completed"`, `"stopped"` or `"failed"`. The request service the subscription grant needs holds exactly one
+endpoint, which no namespace of the VM can start (a script has no binding that starts a request); it settles at assigned ticks on a tick VM and on arrival on an
+elapsed VM, which is what decides whether the endpoint's deliveries are assigned. The endpoint's subscription bound is `runnerSubscriptionBound` (256) and its staging
+bound `runnerStagingBound` (1024), sized so that a watcher with one subscription in a run of the most scripts does not overflow in the ordinary case, since each instance
+produces at most two events. No capacity invariant is claimed for other subscription patterns. When the engine withdraws interest in a subscription the runner stops delivering
+to it and proves its retirement at once, so no instance's stop waits on the runner.
+
+**When an event is produced.** *Started* is produced when an instance's `init` has succeeded, while the owner is held; an instance whose `init` fails produces only
+*ended*, with outcome `failed`, and an instance's *started* always precedes its *ended*. *Ended* is produced when the instance has ended. Ends seen while scripts are still
+being admitted are produced after admission is complete, after every *started*; on a tick VM ends seen during a tick are produced at its boundary, after the tick has
+completed; on an elapsed VM an end is produced when the run sees it. Events produced together are in ascending TID order. An event reaches only the subscriptions that
+exist when it is produced, and nothing is replayed to a later subscriber. One event is delivered once to each such subscription, in ascending order of the subscription's
+number, so several deliveries can go to one instance. On a tick VM every *delivery* is assigned the first tick the owner has not begun and a place of its own (a sequence that
+increases in production order and then recipient order; a place is unique across the owner); on an elapsed VM each is made on arrival. No event is produced once the orderly
+stop has begun.
+
+**Overload and defects.** Every answer to a delivery is classified by one pure function (`classifyAnswer`) and none is dropped without being counted. Admitted or staged:
+delivered (a staged one can still fail at its tick). Refused when offered because the queue is full (`EventQueueFull`, on an elapsed owner) or the staging store is full
+(`EventStagingFull`): counted in the report by kind, nothing evicted or retried, nothing fails. A delivery staged for a tick that finds its subscriber's queue full when the tick
+is admitted fails that watcher with LUA-26's delivery error (D-43): there is no second answer to the runner, the failure is reported once like any instance failure, the run's
+status is failure and the report counts the watcher failed. The subscription having ended is counted and benign. Late, duplicate, unassigned, not logical, a value the endpoint's
+schema refuses and coalesced (the endpoint is ordered events) are defects of the runner: they are raised as a failure of the host, never counted away.
 
 ### Output and the stream rules
 
@@ -3094,7 +3173,7 @@ At the start and at the end the runner writes a title line (`instances at start`
 `completed`, `stopped`, `failed`. The owner and name columns are cut to `columnLimit` (32) characters with the visible marker; a row has no
 control character; a run that admitted no instance writes no table.
 
-The start table is one coherent snapshot taken when every admitted instance has finished its `init` or failed it, or has become terminal
+The start table is one coherent snapshot taken when the last admitted instance has finished its `init` or failed it, or has become terminal
 without its `init` having run (a stop of an instance the owner had not begun discards it, and nothing waits for an initializer that
 will never execute, nor makes it run to satisfy the barrier). Every admitted instance is a row, including one that completed or failed
 before the last initializer finished: the run reads an instance's settlement without observing it, so the owner's inspection keeps the
@@ -3134,15 +3213,16 @@ the first is the primary and the rest are kept whole as evidence beside it; a si
 ### Waiting and ending
 
 A run waits in one place: a single STM wait, composed with supervision (a failure of the owner raises as soon as supervision commits it), that sees a
-failure to write, the start-table barrier, every instance having ended, the stop request and the timer's wake. It polls nothing.
+failure to write, the ends to produce (an elapsed VM), every instance having ended, the stop request, the tick limit, the duration limit's timer and what the
+step the run is in waits for (an admission, a tick that is due, a tick that has finished). It polls nothing.
 The run ends at the first of: every instance has ended (a one-shot completing, a failure, or a granted Lua control, of itself or another); the stop
-request fires; the limit is reached. **The limit** is a positive duration measured on the injected clock from the *origin*, the instant read just
+request fires; the tick limit is reached; the duration limit is reached. **The limit** is a positive duration measured on the injected clock from the *origin*, the instant read just
 before the first instance is admitted, and waited for on the injected timer, whose wake only tells the run to look at the clock again: an early
 or a stale wake finds the deadline not reached and the run arms again. The timer's registration is cancelled on every way out of the run, and a
 limit too large for the clock's range is one that is never reached.
 
-**When several apply together** the order of precedence is the contract: a failure to write, then the start table, then *every instance ended*, then *the
-stop request*, then *the limit*. So a run in which every instance has ended ends as `EndedAllInstances` even if the stop request and the limit
+**When several apply together** the order of precedence is the contract: a failure to write, then what a finished `init` owes (the start table and the *started*
+event), then *every instance ended*, then *the stop request*, then *the tick limit*, then *the limit*. So a run in which every instance has ended ends as `EndedAllInstances` even if the stop request and the limit
 are due too; one that the stop request and the limit both end is `EndedStopRequest`; the limit ends a run nothing else has. A stop request that is
 already set when the run begins admits nothing, reads no file and starts no VM, and returns as stopped.
 
@@ -3153,16 +3233,16 @@ stops, or that ends by itself, ends under the same contract: no path runs a `shu
 
 ### The report and the status
 
-`Ran RunReport` holds how the run ended (`EndedAllInstances`, `EndedLimit`, `EndedStopRequest`, or `EndedStartupFailure` when a source did not load),
-each instance's report (TID, name, file, final status, how it ended and what became of `shutdown`, its failure if any), the `LoadFailure` when
+`Ran RunReport` holds how the run ended (`EndedAllInstances`, `EndedLimit`, `EndedTickLimit`, `EndedStopRequest`, or `EndedStartupFailure` when a source did not load),
+the ticks completed (`reportTicks`) and the event tallies (`reportEvents`: events produced, started and ended; delivery attempts, counted by the engine's answer, admitted,
+staged, refused queue-full, refused staging-full, subscription ended; and watchers failed by overflow), each instance's report (TID, name, file, final status, how it ended and what became of `shutdown`, its failure if any), the `LoadFailure` when
 there is one, and the `RunStatus`. The status is `StatusFailure` if any instance failed or a source did not load; otherwise `StatusInterrupted` if the
 stop request ended the run; otherwise `StatusSuccess`: a limit, a Lua control and every instance completing are success. Exit numbers are the command
 line's.
 
 ### What is not here
 
-The logical clock, tick intervals and limits, the instances' start and end events and their grants (LUA-28); the command line, signals, `exit` and
-exit numbers (LUA-19); window creation, VM groups, module reload, a stop deadline. `Hetoimasia.Scripting.Lua.Runner.Internal` is the seam the
+The command line, signals, `exit` and exit numbers (LUA-19); window creation, VM groups, module reload, a stop deadline. `Hetoimasia.Scripting.Lua.Runner.Internal` is the seam the
 examples use for a callback (an event source, bindings of their own, the owner's endpoint): it is not part of the contract and
 is no way to configure a production run.
 
@@ -3179,7 +3259,13 @@ propagating only after the owner's retirement is complete (during the run and du
 itself and another, the stop request, the limit with an early and a stale wake, a stop request set beforehand), each stop path stopping a live
 event-only, looped and paused instance in order, simultaneous endings in their order of precedence, the timer cancelled on every exit; the
 start table with a gated initializer and a stop before an instance began, the early settlement kept in the tables, and the tables' bounds; output
-to the sinks only (and to no C stream), bounded as it is written after escaping (NUL bytes, invalid bytes, line breaks, multibyte text, an error, a name and a path), safe and unforgeable; and the status for each combination. The cancellation and shutdown
+to the sinks only (and to no C stream), bounded as it is written after escaping (NUL bytes, invalid bytes, line breaks, multibyte text, an error, a name and a path), safe and unforgeable; and the status for each combination. For LUA-28: every usage refusal of the clock; the driver granting ticks of exactly the tick duration, back to back when the clock
+jumps past several deadlines while a segment is held, nothing for an early or a stale wake, none after a stop begins; the tick limit and every ending of a tick VM
+leaving each remaining `shutdown` once, in order; the tie rule at a tick's boundary with the runner held in the write of a report; Lua controls placed by the runner in the
+order they were issued; the events a watcher sees, with a usable TID, the outcomes, the failed `init`, no replay and recipients in subscription order; the pure
+classification of every engine answer and production against feeds that answer each way; both overload cases and the defects with real VMs; admission one script at a time
+with an init held; and a scenario with a ready, yielding one-shot, a one-shot that unsubscribes at once and a paused one-shot resumed by a logical control, compared transcript
+for transcript across runs whose pacing differs. The cancellation and shutdown
 windows are the kind an asynchronous-exception race can hide on one platform, so CI, which runs them on Linux, is the evidence for them and a local
 pass is not.
 
