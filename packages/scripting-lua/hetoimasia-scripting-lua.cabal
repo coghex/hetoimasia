@@ -428,6 +428,11 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Request.Support
         Test.LuaRuntime.Request.Teardown
         Test.LuaRuntime.Request.Waiting
+        Test.LuaRuntime.Retention.Leases
+        Test.LuaRuntime.Retention.Probe
+        Test.LuaRuntime.Retention.Requests
+        Test.LuaRuntime.Retention.Spec
+        Test.LuaRuntime.Retention.Writes
         Test.LuaRuntime.Subscription.Basics
         Test.LuaRuntime.Subscription.Epochs
         Test.LuaRuntime.Subscription.Failures
