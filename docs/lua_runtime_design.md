@@ -190,7 +190,7 @@ concrete precondition
 - [x] LUA-19. Run script instances through a headless command-line entry — [#494]
 - [x] LUA-29. Compose independent UI and gameplay Lua owners in a headless sample — [#498]
 - [x] LUA-30. Fail, overload and stop the two-domain sample explicitly — [#499]
-- [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly
+- [x] LUA-8. Prove independent trusted UI and gameplay execution headlessly — [#500]
 - [ ] LUA-9. Add bounded child-process transport and owned process lifetime — [deferred]: Q-5 successful Linux and macOS confinement verdicts
 - [ ] LUA-10. Establish Linux mod-process confinement — [deferred]: Q-5 successful Linux and macOS confinement verdicts
 - [ ] LUA-11. Establish macOS mod-process confinement — [deferred]: Q-5 successful Linux and macOS confinement verdicts
