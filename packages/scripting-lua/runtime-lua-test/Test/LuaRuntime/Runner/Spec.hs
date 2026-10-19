@@ -10,6 +10,7 @@ import qualified Test.LuaRuntime.Runner.Kinds
 import qualified Test.LuaRuntime.Runner.Output
 import qualified Test.LuaRuntime.Runner.Query
 import qualified Test.LuaRuntime.Runner.Sources
+import qualified Test.LuaRuntime.Runner.Tables
 import Test.Hspec (Spec, describe)
 
 spec ∷ Spec
@@ -20,3 +21,4 @@ spec = describe "Runner" $ do
   Test.LuaRuntime.Runner.Query.spec
   Test.LuaRuntime.Runner.Ending.spec
   Test.LuaRuntime.Runner.Failures.spec
+  Test.LuaRuntime.Runner.Tables.spec

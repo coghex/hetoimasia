@@ -5,10 +5,12 @@ import qualified Data.ByteString as ByteString
 import Data.Char (isControl)
 import Data.Text (Text)
 import qualified Data.Text as Text
+import Data.IORef (newIORef, readIORef)
+import Hetoimasia.Foundation.Log (LogEntry (entryComponent, entryMessage), componentText)
 import Hetoimasia.Scripting.Lua.Runner
 import Test.Hspec (Spec, describe, it, shouldBe, shouldContain, shouldNotContain, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Runner.Support
-import Test.LuaRuntime.Support (bounded, withBoundary)
+import Test.LuaRuntime.Support (bounded, recordingLogger, withBoundary)
 
 -- | The lines a script printed, found by what they start with.
 startingWith ∷ Text → [Text] → [Text]
@@ -125,6 +127,18 @@ spec = describe "output" $ do
             -- Lua functions the runner defined (a C function cannot be dumped).
             recorded fixture
               `shouldReturn` ["nil nil nil nil", "nil", "true true", "true", "function function"]
+
+  it "keeps the runner's own diagnostics in the logger under one component, and script output, tables and reports out of it" $ bounded $ do
+    fixture ← newRFixture
+    entries ← newIORef []
+    withScripts [("p.lua", lua ["function run(self) print('script output'); error('a failure') end"])] $ \paths →
+      withBoundary $ \_ runtime → do
+        report ← run fixture runtime ((config fixture [noWait (scriptAt paths 0)]) {runnerLogger = recordingLogger entries}) >>= expectRan
+        statusOf report `shouldBe` StatusFailure
+        logged ← readIORef entries
+        map (componentText . entryComponent) logged `shouldSatisfy` all (== "scripting.lua.runner")
+        map entryMessage logged `shouldBe` ["script run ended", "script run started"]
+        forM' logged $ \entry → entryMessage entry `shouldSatisfy` (not . Text.isInfixOf "script output")
 
 forM' ∷ [a] → (a → IO ()) → IO ()
 forM' items body = mapM_ body items

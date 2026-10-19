@@ -399,6 +399,7 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Runner.Output
         Test.LuaRuntime.Runner.Query
         Test.LuaRuntime.Runner.Sources
+        Test.LuaRuntime.Runner.Tables
         Test.LuaRuntime.Runner.Spec
         Test.LuaRuntime.Runner.Support
         Test.LuaRuntime.Instance.Basics

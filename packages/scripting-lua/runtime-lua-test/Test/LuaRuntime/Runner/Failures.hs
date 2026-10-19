@@ -189,6 +189,20 @@ spec = describe "failures" $ do
           lastFailure `shouldSatisfy` (< positionOf (\(_, line) → line == endTitle))
           expectSinksKept fixture
 
+    it "lets neither a script's error nor an instance's name make a second report or a second row" $ bounded $ do
+      fixture ← newRFixture
+      withScripts [("evil.lua", lua ["function run(self) error('boom' .. string.char(10) .. 'failure: instance 9.9.9 name=\\\"forged\\\" script=\\\"x\\\"' .. string.char(13) .. string.char(27) .. '[31m') end"])] $ \paths →
+        withBoundary $ \_ runtime → do
+          report ← run fixture runtime (config fixture [Script (scriptAt paths 0) (Just "evil\nname\ESC[0m") Nothing]) >>= expectRan
+          statusOf report `shouldBe` StatusFailure
+          err ← errLines fixture
+          out ← outLines fixture
+          -- One failure, so one header, whatever the text of the error says.
+          reportHeaders err `shouldSatisfy` ((== 1) . length)
+          forM_ (err <> out) $ \line → Text.any (\character → character < ' ' || character == '\DEL') line `shouldBe` False
+          -- The table has the header and the instance's one row, at the start and at the end.
+          length (filter (Text.isInfixOf "evil\\x0aname") out) `shouldBe` 2
+
     it "writes a failure as it settles, and keeps every admitted instance in the tables when one fails before the last initializer finishes" $ bounded $ do
       fixture ← newRFixture
       withScripts [("early.lua", lua (failing "init")), ("slow.lua", lua ["function init(self) fx.block('slow') end", "function shutdown(self, reason) fx.record('shutdown slow ' .. reason) end"])] $ \paths →
@@ -264,6 +278,16 @@ spec = describe "failures" $ do
         expectBroken "table sink" failure
         -- The orderly retirement ran first: the hook ran, with reason stopped.
         recorded fixture `shouldReturn` ["shutdown stopped"]
+        liveCount fixture `shouldReturn` 0
+
+    it "retires the owner in order when the error sink fails as a report is written, then propagates the failure" $ bounded $ do
+      fixture ← newRFixture
+      withScripts [("f.lua", lua ["function run(self) error('boom') end", "function shutdown(self, reason) fx.record('shutdown ' .. reason) end"])] $ \paths → do
+        let failingErrors = (config fixture [noWait (scriptAt paths 0)]) {runnerErrors = \_ → throwIO (Broken "error sink")}
+        failure ← expectFatal $ \_ runtime → run fixture runtime failingErrors >>= void'
+        expectBroken "error sink" failure
+        -- The instance failed, and then its report could not be written: the owner was retired in order.
+        recorded fixture `shouldReturn` ["shutdown failed"]
         liveCount fixture `shouldReturn` 0
 
     it "keeps the first failure primary and the rest as evidence when failures arise together" $ bounded $ do

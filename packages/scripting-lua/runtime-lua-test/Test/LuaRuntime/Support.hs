@@ -13,6 +13,7 @@ module Test.LuaRuntime.Support
     -- * The boundary
   , withBoundary
   , quietLogger
+  , recordingLogger
   , expectFatal
   , bounded
     -- * The fixture
@@ -81,7 +82,8 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (ThreadBlocked), threadStatus)
 import Hetoimasia.Foundation.Log
-  ( Logger
+  ( LogEntry
+  , Logger
   , MetadataProviders (..)
   , callbackSink
   , defaultLogFilter
@@ -131,6 +133,10 @@ fixedMetadata =
 
 quietLogger ∷ Logger
 quietLogger = mkLoggerWith defaultLogFilter fixedMetadata (callbackSink (\_ → pure ()))
+
+-- | A logger that keeps every entry it is handed, newest first.
+recordingLogger ∷ IORef [LogEntry] → Logger
+recordingLogger entries = mkLoggerWith defaultLogFilter fixedMetadata (callbackSink (\entry → atomicModifyIORef' entries (\held → (entry : held, ()))))
 
 -- | A real supervision boundary over a real worker group, with a runtime
 -- boundary for the owners an example creates.

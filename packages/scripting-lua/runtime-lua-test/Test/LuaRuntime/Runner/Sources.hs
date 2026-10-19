@@ -6,6 +6,7 @@ import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as Char8
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
+import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Hetoimasia.Scripting.Lua.Owner (ModuleRef (ModuleRef), maxIdentityLength, maxSourceBytes)
 import Hetoimasia.Scripting.Lua.Runner
 import Hetoimasia.Scripting.Lua.Runner.Internal (moduleRefFor)
@@ -28,8 +29,8 @@ hooked =
 -- | What a source that did not load leaves, whatever the cause: a failed start with a report
 -- that names the file, the VM and the error, no instance, no table and the failure status, the
 -- report written to the error sink and nothing to the output sink.
-expectNotLoaded ∷ RFixture → FilePath → LoadProblem → RunReport → IO ()
-expectNotLoaded fixture path problem report = do
+expectNotLoaded ∷ RFixture → RuntimeControl → FilePath → LoadProblem → RunReport → IO ()
+expectNotLoaded fixture control path problem report = do
   reportEnding report `shouldBe` EndedStartupFailure
   statusOf report `shouldBe` StatusFailure
   instancesOf report `shouldBe` []
@@ -44,6 +45,8 @@ expectNotLoaded fixture path problem report = do
   errors ← errLines fixture
   take 1 errors `shouldSatisfy` (\found → all (Text.isPrefixOf "failure: source did not load script=") found && length found == 1)
   outLines fixture `shouldReturn` []
+  -- The VM is retired, or was never started.
+  outstanding control `shouldReturn` 0
 
 spec ∷ Spec
 spec = describe "sources" $ do
@@ -55,9 +58,9 @@ spec = describe "sources" $ do
       it ("reports " <> label <> " as a source that did not load, with no TID, and runs no hook") $ bounded $ do
         fixture ← newRFixture
         withScripts [("bad.lua", source)] $ \paths →
-          withBoundary $ \_ runtime → do
+          withBoundary $ \control runtime → do
             report ← run fixture runtime (config fixture [noWait (scriptAt paths 0)]) >>= expectRan
-            expectNotLoaded fixture (scriptAt paths 0) problem report
+            expectNotLoaded fixture control (scriptAt paths 0) problem report
             -- Nothing of the module's hooks ran, and no instance was admitted.
             recorded fixture >>= (`shouldNotSatisfyElem` ["init", "run", "shutdown stopped"])
 
@@ -71,17 +74,17 @@ spec = describe "sources" $ do
   it "reports a file that does not exist" $ bounded $ do
     fixture ← newRFixture
     withScripts [] $ \_ →
-      withBoundary $ \_ runtime → do
+      withBoundary $ \control runtime → do
         let path = "/nonexistent-directory-for-the-runner/none.lua"
         report ← run fixture runtime (config fixture [noWait path]) >>= expectRan
-        expectNotLoaded fixture path LoadMissing report
+        expectNotLoaded fixture control path LoadMissing report
 
   it "reports a file over the host's source limit, having read no more than one byte past it" $ bounded $ do
     fixture ← newRFixture
     withScripts [("big.lua", ByteString.replicate (maxSourceBytes + 1) 32)] $ \paths →
-      withBoundary $ \_ runtime → do
+      withBoundary $ \control runtime → do
         report ← run fixture runtime (config fixture [noWait (scriptAt paths 0)]) >>= expectRan
-        expectNotLoaded fixture (scriptAt paths 0) LoadTooLarge report
+        expectNotLoaded fixture control (scriptAt paths 0) LoadTooLarge report
 
   it "accepts a file of exactly the host's source limit" $ bounded $ do
     fixture ← newRFixture
@@ -99,37 +102,37 @@ spec = describe "sources" $ do
   it "reports a path that cannot be read as a file" $ bounded $ do
     fixture ← newRFixture
     withScripts [("a.lua", hooked)] $ \paths →
-      withBoundary $ \_ runtime → do
+      withBoundary $ \control runtime → do
         -- A directory is a path that is there and cannot be read as a file.
         let directory = scriptAt paths 0 <> ".d"
         createDirectory directory
         report ← run fixture runtime (config fixture [noWait directory]) >>= expectRan
-        expectNotLoaded fixture directory LoadUnreadable report
+        expectNotLoaded fixture control directory LoadUnreadable report
 
   it "reports the first source that did not load in script order, with the modules before it loaded" $ bounded $ do
     fixture ← newRFixture
     withScripts [("a.lua", lua ["fx.record('a loaded')"]), ("b.lua", lua ["syntax error here"]), ("c.lua", lua ["fx.record('c loaded')"])] $ \paths →
-      withBoundary $ \_ runtime → do
+      withBoundary $ \control runtime → do
         report ← run fixture runtime (config fixture (map noWait paths)) >>= expectRan
-        expectNotLoaded fixture (scriptAt paths 1) LoadRejected report
+        expectNotLoaded fixture control (scriptAt paths 1) LoadRejected report
         recorded fixture `shouldReturn` ["a loaded"]
 
   it "reports a file that is missing, with the modules before it loaded and the ones after it never read" $ bounded $ do
     fixture ← newRFixture
     withScripts [("a.lua", lua ["fx.record('a loaded')"]), ("c.lua", lua ["syntax error here"])] $ \paths →
-      withBoundary $ \_ runtime → do
+      withBoundary $ \control runtime → do
         let missing = scriptAt paths 0 <> ".missing"
         report ← run fixture runtime (config fixture [noWait (scriptAt paths 0), noWait missing, noWait (scriptAt paths 1)]) >>= expectRan
-        expectNotLoaded fixture missing LoadMissing report
+        expectNotLoaded fixture control missing LoadMissing report
         recorded fixture `shouldReturn` ["a loaded"]
 
   it "reports a module that does not load before a file that is missing later in the order" $ bounded $ do
     fixture ← newRFixture
     withScripts [("a.lua", lua ["syntax error here"])] $ \paths →
-      withBoundary $ \_ runtime → do
+      withBoundary $ \control runtime → do
         let missing = scriptAt paths 0 <> ".missing"
         report ← run fixture runtime (config fixture [noWait (scriptAt paths 0), noWait missing]) >>= expectRan
-        expectNotLoaded fixture (scriptAt paths 0) LoadRejected report
+        expectNotLoaded fixture control (scriptAt paths 0) LoadRejected report
 
   it "reads a path named twice once, loads it once and admits it twice" $ bounded $ do
     fixture ← newRFixture
@@ -148,8 +151,6 @@ spec = describe "sources" $ do
 
   it "gives two paths with one file name distinct identities, so both load" $ bounded $ do
     fixture ← newRFixture
-    withScripts [] $ \_ → withBoundary $ \_ runtime → do
-      pure (runtime `seq` ())
     withScripts [("x.lua", lua ["fx.record('top x')", "function run(self) fx.record('run x') end"])] $ \paths → do
       let one = scriptAt paths 0
           directory = one <> ".dir"

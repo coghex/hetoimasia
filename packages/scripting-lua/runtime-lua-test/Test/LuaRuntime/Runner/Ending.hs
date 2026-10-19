@@ -121,8 +121,10 @@ spec = describe "how a run ends" $ do
       withScripts [("slow.lua", lua ["function run(self) fx.block('hold') fx.record('finished') end", "function shutdown(self, reason) fx.record('shutdown ' .. reason) end"])] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside (awaitGate fixture "hold" >> setStop fixture True >> openGate fixture "hold") $
-              run fixture runtime (config fixture [noWait (scriptAt paths 0)]) >>= expectRan
+            -- The stop request is set while the segment is held, and the segment is let go once the run has
+            -- asked its owner to retire.
+            alongside (awaitGate fixture "hold" >> setStop fixture True >> awaitRetiring fixture 0 >> openGate fixture "hold") $
+              runTick fixture runtime (config fixture [noWait (scriptAt paths 0)]) >>= expectRan
           -- The stop request was set while the segment was held, and the segment was not cut short.
           reportEnding report `shouldBe` EndedStopRequest
           recorded fixture >>= (`shouldContain` ["finished"])
