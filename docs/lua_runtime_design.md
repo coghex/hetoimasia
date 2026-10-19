@@ -8,8 +8,9 @@ failure evidence, and lifetime. This is the canonical continuation of
 
 Design state: `ready for issue processing`
 
-Current readiness scope: **LUA-19 only** (D-41), with D-40 fixing the runner's
-clock, ending, event source and exit statuses. LUA-7 (D-37), split by D-38 into
+Current readiness scope: **LUA-19 only** (D-41), delivered by D-42 as LUA-27,
+LUA-28, then a narrowed LUA-19, with D-40 and D-42 fixing the runner's clock,
+ending, event source and exit statuses. LUA-7 (D-37), split by D-38 into
 LUA-7 (requests) and LUA-26 (subscriptions), is delivered, with D-36 and D-39
 fixing when a deterministic owner's Lua sees an asynchronous result or provider
 event. LUA-6 (with LUA-20 and LUA-21, D-28/D-29) and LUA-18 (with LUA-22, LUA-23,
@@ -181,6 +182,8 @@ concrete precondition
 - [x] LUA-25. Lend a resource collection's ownership to synchronous Lua callbacks — [#476]
 - [x] LUA-7. Add bounded asynchronous Lua requests with reserved result slots — [#482]
 - [x] LUA-26. Deliver provider events through owned Lua subscriptions — [#483]
+- [ ] LUA-27. Run Lua sources to completion through a reusable runner
+- [ ] LUA-28. Drive the runner on logical ticks and publish instance start and end events
 - [ ] LUA-19. Run script instances through a headless command-line entry
 - [ ] LUA-8. Prove independent trusted UI and gameplay execution headlessly — [deferred]: owner renews trusted-path readiness for this slice
 - [ ] LUA-9. Add bounded child-process transport and owned process lifetime — [deferred]: Q-5 successful Linux and macOS confinement verdicts
@@ -1128,9 +1131,11 @@ readiness check found at `master@b130ccab`:
 - **Exit statuses ("0 / 1 / 2 / 130").** 0 when every instance completed or was
   stopped by a control or a limit; 1 when an instance failed or a source did not
   load; 2 for invalid command-line usage; 130 when a signal ended the run, after
-  the orderly stop. This matches the console's existing mapping
-  (`Hetoimasia.Console.Exit`). Rejected: a separate status for source errors,
-  and 0 for a signal-ended run.
+  the orderly stop. 1 and 130 are the console's existing mapping
+  (`Hetoimasia.Console.Exit`); 2 is new, and D-42 applies it to every usage
+  error (corrected: this line first said all four matched the existing mapping,
+  but a usage error exits 1 today). Rejected: a separate status for source
+  errors, and 0 for a signal-ended run.
 
 The readiness check also found two statements that disagree with the merged
 API, corrected here:
@@ -1194,6 +1199,54 @@ consulted along the way. Splitting it, if the drafted issue is too large for one
 PR, is delegated (D-25) and adds no scope. LUA-8 stays `[deferred]` on its own
 renewal, and the confined branch stays on Q-5. Readiness is not implementation
 approval beyond that request.
+
+### D-42. Deliver LUA-19 as LUA-27, LUA-28 and a narrowed LUA-19
+
+LUA-19's drafted issue (request `user-het-lua19-20261019-1356`, drafter's sizing
+package at `master@a67a847c`, sha256 `c2e9e17b`) held 23 requirements, about
+twice a delivered sibling's, and three separate proof obligations, each heavy in
+the failure handling that took #478 nine review rounds and #480 six: the runner's
+failure reports and ordered stop, the logical clock with deterministic instance
+events, and the executable's signals and exit statuses. Owner decision,
+2026-10-19, in the hetoimasia manager pane ("Take the 3-way split"), on the
+manager's recommendation under D-25:
+
+- **LUA-27** (new): "Run Lua sources to completion through a reusable runner",
+  the runner library on the elapsed clock.
+- **LUA-28** (new): "Drive the runner on logical ticks and publish instance start
+  and end events", after LUA-27.
+- **LUA-19** keeps its ID, outcome, acceptance signals and out-of-scope list for
+  the `lua` subcommand, its usage validation, signals, exit statuses tested by
+  running the executable, the examples and documentation, after LUA-27 and
+  LUA-28.
+
+The split adds no scope; D-41's readiness covers all three. Two further owner
+decisions on readings the drafter took:
+
+- **Every usage error exits 2** ("Every usage error"): the `lua` subcommand's and
+  the existing top-level unknown argument's, so the program follows one
+  convention. The drafter's reading, 2 for the `lua` subcommand only, is
+  rejected.
+- **A second signal forces exit 130** ("Force exit 130"): a SIGINT or SIGTERM
+  that arrives while the orderly stop after the first is still running exits at
+  once with 130, skipping the shutdown hooks that have not run; the operating
+  system reclaims the process. A script stuck in non-yielding Lua (D-27 promises
+  no preemption) can then always be ended from the terminal. Rejected: ignoring
+  it (only `kill -9` would end a stuck run) and a fixed stop deadline.
+
+Readings the manager takes from the package (organization under D-25, not
+product decisions): the instance events use a LUA-26 provider endpoint that
+every instance is granted, with the one request endpoint the subscription
+service requires left unreachable by scripts; the library gains a read-only
+query of which hooks a module defines, running none of its code; the runner
+defines its own documented scheduler bounds, since the library has no public
+default; signal handling lives in the executable, which hands the runner a stop
+request, because the runtime library's dependencies are pinned by a test;
+scripts are admitted one at a time in `--script` order, each after the previous
+instance's `init` has finished, so instance numbers and event order are
+deterministic; when several outcomes apply, a failure (1) outranks a signal
+(130), which outranks success (0); `io`, `os`, `package` and `debug` stay closed
+to runner scripts, and `print` and `warn` are rebound to the bounded output.
 
 ## Design
 
@@ -3018,6 +3071,66 @@ and verified policy, with adversarial regression coverage.
 - **Open questions:** None; D-26 fixes paused delivery and overflow, and D-36 the
   logical admission of events.
 
+### LUA-27. Run Lua sources to completion through a reusable runner
+
+> Ready for issue processing under D-41 and D-42: carved out of LUA-19 with no
+> added scope.
+
+- **Outcome:** a reusable runner runs a list of Lua sources as instances of one
+  named VM on the elapsed clock and returns a bounded run report, for the `lua`
+  subcommand and a future windowed application alike.
+- **Scope:** a public runner module of the Lua runtime library with injected
+  clock, timer, output sinks, logger and stop request; application-side source
+  reading (the host reads no files), instance kind from the module's entries and
+  the read-only hook query it needs, VM composition (`fifo`, the runner's own
+  bounds, the opened libraries, the lifecycle grant over the run's VM), bounded
+  `print`/`warn` output, the bounded report of a source that does not load, of a
+  failed `init` and of a later instance failure, the TID/OWNER/NAME/STATUS table
+  at start and end, the ending conditions of D-40 with every remaining instance
+  stopped in order, and the run's status value. No command line, no signal
+  handler, no `exit`.
+- **Phase:** runnable consumer.
+- **Depends on:** LUA-18, LUA-23, LUA-24.
+- **Ordering:** after the instance, control and cadence APIs; precedes LUA-28 and
+  LUA-19.
+- **Relevant decisions:** D-17, D-20, D-21, D-22, D-24, D-25, D-26, D-27, D-40, D-41, D-42.
+- **Acceptance signals:** a source that does not load fails the VM's start with a
+  bounded report and no later hook; a failed `init` names the instance and cause
+  and runs no later hook; one-shot completion, a Lua control and a run limit each
+  end the run with every remaining `shutdown` run once in order; script output
+  never reaches the C streams; library tests use injected clocks and gates, not
+  sleeps.
+- **Out of scope:** the logical clock and instance events (LUA-28), the command
+  line, signals and exit numbers (LUA-19), window creation, VM groups, module
+  reload.
+- **Open questions:** None; D-40 and D-42 fix its behavior.
+
+### LUA-28. Drive the runner on logical ticks and publish instance start and end events
+
+> Ready for issue processing under D-41 and D-42: carved out of LUA-19 with no
+> added scope.
+
+- **Outcome:** the runner can run its VM on logical ticks it grants at a real-time
+  rate, and scripts can react to the runner's "instance started" and "instance
+  ended" events, deterministically.
+- **Scope:** the tick driver (steps of exactly the tick duration, never skipped or
+  merged when the owner lags), intervals in ticks and a run limit in ticks, the
+  instance start/end event endpoint under LUA-26's owned subscriptions with its
+  unreachable request endpoint, logical assignment of every event and Lua control
+  on a tick VM, sequential admission and event order on both clocks, and
+  determinism evidence across varied execution delays.
+- **Phase:** runnable consumer.
+- **Depends on:** LUA-27, LUA-7, LUA-26.
+- **Ordering:** after LUA-27; precedes LUA-19.
+- **Relevant decisions:** D-23, D-25, D-36, D-38, D-39, D-40, D-41, D-42.
+- **Acceptance signals:** identical script sets and tick counts give identical
+  output and event order under varied delays and arrival; events reach only
+  subscriptions that exist when produced; an instance whose `init` fails produces
+  only its end event; a tick-limited run ends in order after N ticks.
+- **Out of scope:** the command line, signals and exit numbers (LUA-19), a general
+  message bus, replay.
+- **Open questions:** None; D-40 and D-42 fix its behavior.
+
 ### LUA-19. Run script instances through a headless command-line entry
 
 > Ready for issue processing under D-41. Its dependencies are delivered, and D-40
@@ -3028,10 +3141,14 @@ and verified policy, with adversarial regression coverage.
 - **Scope:** the Q-14 `lua` subcommand, application-owned source loading and
   cadence configuration, bounded failure/status output, reproducible looped,
   event-only and one-shot examples, console invocation/exit tests and Lua-owned
-  library contract tests. No `--group` flag.
+  library contract tests. No `--group` flag. Under D-42 the runner library is
+  LUA-27's and the logical clock and instance events LUA-28's; this slice keeps
+  the subcommand, its usage validation (every usage error exits 2), signals (a
+  second signal forces exit 130), exit statuses tested by running the
+  executable, the examples and documentation.
 - **Phase:** runnable consumer.
-- **Depends on:** LUA-18, LUA-24, LUA-7, LUA-26.
-- **Ordering:** after the instance, cadence and provider APIs, before LUA-8.
+- **Depends on:** LUA-18, LUA-24, LUA-7, LUA-26, LUA-27, LUA-28.
+- **Ordering:** after LUA-27 and LUA-28, before LUA-8.
 - **Relevant decisions:** D-20, D-21, D-22, D-23, D-24, D-25.
 - **Acceptance signals:** start/inspect/control an instance; failed init names
   the instance and cause; one-shot completion exits cleanly; looped examples
@@ -3055,7 +3172,7 @@ and verified policy, with adversarial regression coverage.
   real-interpreter acceptance; reproduction commands and bounded optional
   profiling workloads delivered in the same PR.
 - **Phase:** trusted integrated acceptance.
-- **Depends on:** LUA-6, LUA-18, LUA-22, LUA-23, LUA-24, LUA-7, LUA-26, LUA-19.
+- **Depends on:** LUA-6, LUA-18, LUA-22, LUA-23, LUA-24, LUA-7, LUA-26, LUA-27, LUA-28, LUA-19.
 - **Ordering:** after instance/provider/runner delivery, independent of Q-5;
   no Vulkan or GLFW dependency.
 - **Relevant decisions:** D-1, D-2, D-3, D-4, D-7, D-12, D-13, D-14.
@@ -3242,7 +3359,7 @@ and verified policy, with adversarial regression coverage.
 
 The trusted dependency order is LUA-2 after the delivered LUA-1; LUA-3 after
 LUA-2; LUA-5 after LUA-3 and the delivered LUA-4; then LUA-6 (as LUA-20 and
-LUA-21, then LUA-6, under D-29), LUA-18, then LUA-23 and LUA-24 (D-31), LUA-25 then LUA-22 (D-32), LUA-7 then LUA-26 (D-38), LUA-19 and
+LUA-21, then LUA-6, under D-29), LUA-18, then LUA-23 and LUA-24 (D-31), LUA-25 then LUA-22 (D-32), LUA-7 then LUA-26 (D-38), LUA-27 then LUA-28 then LUA-19 (D-42), and
 LUA-8 under D-25 and D-30. LUA-6 retains external TIME-1; LUA-7 consumes the
 instance ownership API and introduces no second clock implementation.
 The shared VK-1 toolchain prerequisite remains satisfied.
@@ -3252,7 +3369,7 @@ platform proofs; LUA-10, LUA-11, and LUA-13 in parallel; LUA-12 after both
 platform slices and TIME-1; LUA-16 after LUA-6/LUA-7/LUA-26/LUA-12/LUA-13; then
 LUA-17 after LUA-8/LUA-16. Stable IDs are preserved, with LUA-16/LUA-17
 retaining the confined integration and acceptance removed from LUA-5/LUA-8.
-There are twenty-six delivery slices. All of this can run alongside
+There are twenty-eight delivery slices. All of this can run alongside
 graphics implementation. Coordinate the shared Cabal project, CI
 catalog/workflow, and any narrow foundation evidence change; parallel work
 does not authorize conflicting edits or duplicate platform infrastructure.
