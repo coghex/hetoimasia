@@ -3129,6 +3129,30 @@ and verified policy, with adversarial regression coverage.
   line, signals and exit numbers (LUA-19), window creation, VM groups, module
   reload.
 - **Open questions:** None; D-40 and D-42 fix its behavior.
+- **As delivered (#492):** the choices the slice left to its solver, recorded so a later slice does not reopen
+  them. The package contract is [`packages/scripting-lua/README.md`](../packages/scripting-lua/README.md#the-script-runner).
+  Sinks (the owner's amendment on #492, `owner-decision:lua27-runner-sinks`): the tables go to the *output* sink as
+  `print` does, the source-did-not-load report and every instance failure report to the *error* sink as `warn`
+  does; which process streams they are is LUA-19's. Hooks: the owner reads which optional hooks a module defines
+  once, before it is ready, through the instance's own definition of a hook (declared and present, a present
+  non-function counting), and `Instance.moduleHooks` answers from it for the owner's life. A source that does
+  not load is told from a failure of the host by the owner being an *optional* worker whose classifier recognizes
+  only the host's fault of loading a module not raised by application code (the marker the bridge already puts on
+  every failure that escapes application code), so creation answers it as data while every other failure of the
+  owner stays fatal under supervision and propagates unchanged; the modules before a file that cannot be read are
+  loaded first, so the first failure in script order is the one reported. The identity of a module is its place
+  among the run's distinct paths and the end of the path. The run's limit is measured from the instant read just
+  before the first instance is admitted. When endings apply together the order is: a failure to write, the start
+  table, every instance ended, the stop request, the limit, decided in one STM wait with supervision; a run asked
+  to end before the start-table barrier opens writes no start table, and the barrier is `no instance is
+  initializing`, so an instance that became terminal without its `init` having run is accepted. Instances'
+  settlements are read without being observed, so the owner's inspection keeps every admitted instance for the tables; a
+  failure is written once, when its settlement is first seen, under one lock per table, report or call. A host
+  failure on the runner's own thread retires the owner in order before it propagates; one inside the owner
+  retires protected. The callback examples use a test-only seam (`Runner.Internal`: an event source, bindings
+  and the owner's endpoint) and the public configuration has no source or subscription grant; LUA-28 replaces it
+  with the real endpoint. The runner's bounds are documented constants (64 scripts, 4096 bytes a call of
+  `print`, 32-column cells, 8 secondary failures, 1024-character errors, 4096-character tracebacks).
 
 ### LUA-28. Drive the runner on logical ticks and publish instance start and end events
 

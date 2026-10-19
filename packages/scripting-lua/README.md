@@ -47,7 +47,9 @@ will answer later, with a reserved result slot, settled exactly once and, on a l
 application assigned. See [Asynchronous requests](#asynchronous-requests). **Provider events** (LUA-26) let an
 instance subscribe a function to a provider's events: owned by the instance, delivered into its bounded queue by
 producers that never call Lua, and, on a logical owner, admitted at the tick and place the application assigned. See
-[Provider events](#provider-events). Any
+[Provider events](#provider-events). **The script runner** (LUA-27) runs a list of Lua files to completion as the instances of one
+named VM, on the elapsed clock, and answers a bounded report: the library the `lua` subcommand and a windowed application
+share. See [The script runner](#the-script-runner). Any
 concrete game namespace and the confined path are later slices of
 [the Lua runtime design](../../docs/lua_runtime_design.md). What is here is the
 boundary they will be built on, and the evidence that it holds.
@@ -1433,6 +1435,12 @@ pass is not.
 
 ```bash
 cabal test hetoimasia-scripting-lua:lua-runtime-tests --test-show-details=direct
+```
+
+The script runner's examples are the `Runner` component of that suite, and a selector that matches none fails the suite:
+
+```bash
+cabal test hetoimasia-scripting-lua:lua-runtime-tests --test-show-details=direct --test-options='--match Runner'
 ```
 
 It also runs under `--project-file cabal.project.cpu`. The validation group is
@@ -2982,6 +2990,176 @@ epochs, generations and the bound that churn cannot reclaim; a provider that rai
 arising together; unfit and throwing deliveries; and every grant that is refused. The protocol model's holders of
 subscriptions are pinned in `lua-host-tests`. The cancellation and cleanup windows are the kind an asynchronous-exception race
 can hide on one platform, so CI, which runs them on Linux, is the evidence for them and a local pass is not.
+
+## The script runner
+
+`Hetoimasia.Scripting.Lua.Runner` (LUA-27, in `runtime-lua`) runs a list of scripts, each a file, as instances of one
+named VM on the elapsed clock, and answers a bounded report of the run. It is the layer under the `lua` subcommand
+(LUA-19) and under a windowed application alike, and the one LUA-28 extends with logical ticks and the instances' start and
+end events. It parses no arguments, installs no signal handler, never calls `exit`, opens no window and imports nothing of the
+console, GLFW, Vulkan or a game: what the outside world does is injected. Its behavior is [D-40 and D-42 of the Lua runtime
+design](../../docs/lua_runtime_design.md#d-40-the-headless-runners-clock-ending-event-source-and-exit-statuses), over the
+instance contract (D-26, D-27), and it reopens none of the contracts it is built on.
+
+```haskell
+runScripts ∷ LuaRuntime → RunnerConfig → IO RunOutcome
+```
+
+### What a run is given
+
+`RunnerConfig` holds the VM's name (`runnerName`, the owner label the tables and reports show), the scripts
+(`runnerScripts`), an optional run limit (`runnerLimit`), and the inputs that are not data: the stop request
+(`runnerStop ∷ STM Bool`, which the run waits on and never polls), the monotonic clock and the timer backend
+(`runnerClock`, `runnerTimer`; `runnerConfig` supplies the production ones), the output sink and the error sink
+(`runnerOutput`, `runnerErrors ∷ Text → IO ()`) and a `Logger`. A `Script` is a file path, an optional name (without one, the last
+component of the path) and an optional interval, a positive elapsed duration. The `LuaRuntime` is the one a `withSupervision`
+boundary made: the owner the run starts is one of its supervised workers.
+
+A run admits at most `runnerMaxScripts` (64) scripts. The scheduler and instance bounds are the runner's own, documented
+constants (`runnerSchedulerBounds`, `runnerInstanceBounds`) that pass the instance configuration's validation: the
+live-instance bound is the most scripts a run admits, and the retained results are twice that.
+
+### Loading
+
+The host reads nothing from disk, so the runner reads each *distinct* path once, in order (a path is distinct by its text;
+nothing is resolved), and hands the host the bytes as a module. A read is bounded by the host's source limit: no more than one byte
+past it is read, and a file over it is refused. A path named twice is read and loaded once and admitted twice. A module's identity is its
+place among the run's distinct paths, a colon and the end of its path, with control characters replaced and cut to the host's
+128-byte rule: two distinct paths never share one, even with the same file name in different directories, and it is the same for
+the same scripts every time.
+
+A missing, unreadable or over-bound file, and a module the host rejects (a syntax error, an error at its top level), are each *a source that
+did not load*. It fails the VM's start and not an instance: the run ends with `EndedStartupFailure` and a `LoadFailure` naming the
+file as it was given, the VM, the error and the traceback if one was captured, each bounded, and no TID. The first one in script
+order is the one reported, and the top level of the modules before it has run, as the host's load order has it; no instance is
+admitted and no `init`, `run`, `update`, callback or `shutdown` runs. The VM is retired. The status is failure.
+
+### The kind of an instance
+
+The owner reads, once, before it is ready and running none of the module's code, which of the optional hooks `init`, `update`,
+`shutdown` and `run` each module it loaded defines, and answers `moduleHooks` (in `Hetoimasia.Scripting.Lua.Instance`) from
+that reading for the owner's life. An entry that is present and is not a function counts as defined, as the instance's own check counts it.
+A module defining `run` is a one-shot, one defining `update` is looped on the script's interval, and one defining neither is an
+event-only instance. These are refused as usage, before any instance is admitted and before any hook runs, naming the script: a
+module defining both `run` and `update`; one defining `update` with no interval; an interval for a module that does not define
+`update`; no scripts at all; more scripts than a run admits; a zero interval or a zero limit. A refusal is the distinct outer result
+`Refused (UsageRefusal reasons)`, never a report of a run, so the command line can map it. Where it needed the VM to ask, the VM that
+was started is retired.
+
+### The VM
+
+It opens the base, string, table, math and coroutine libraries and no others; `io`, `os`, `package` and `debug` stay closed. The policy is
+`fifo`, the only built-in one. The owner hosts instances with no event source, no request service, no subscription grant and no tick
+duration, and admits controls on arrival; every instance's failure is isolated (the runner's answer to the escalation decision is
+always `Isolate`). The lifecycle bindings are registered as `lifecycle` (`runnerLifecycleName`): `pause`, `resume`, `stop`, `inspect`,
+`inspect_owner`, `owners`, `self`, `result` and `forget`, as [Lifecycle services](#lifecycle-services) documents them. The owner is
+granted every control and inspection permit over its own VM's instances and nothing else, so one script can pause, resume, stop and inspect
+another, and itself. Scripts are trusted (D-12): nothing here claims a sandbox.
+
+### Output and the stream rules
+
+Before any module loads, `print` and `warn` are rebound, by an initial chunk, to bindings that write through Haskell; the namespace the
+chunk reads them from is removed from the globals, so no reference to the originals stays reachable and nothing a script runs writes
+to the process's C streams. `print` joins the `tostring` of its arguments with a tab and writes the line to the **output sink**; `warn` does the
+same after `Lua warning: ` and writes to the **error sink**, from a module's top level, `init`, `run`, `update`, a callback and
+`shutdown` alike. One call writes at most `outputCallLimit` (4096) bytes, cut with the visible marker `...` (counted in the bound), and
+any Lua string is accepted: it crosses as bytes, is decoded as UTF-8 with every invalid sequence replaced, is split at its line breaks,
+and has its control characters (an embedded NUL included) replaced by `\xNN` escapes, a tab excepted.
+
+The rules for every write: a sink is handed one line at a time, with no line break and no control character in it but a tab; a script's
+text and every other text a script can influence (a name, an error, a traceback, a path) is cut to a documented bound and has its control
+characters replaced, so none can split a table or a report into forged lines; the runner holds one lock around each table, report or call,
+so a sink is never called by two threads at once and a table is never cut by a script's output. The **tables** go to the output sink, like
+`print`; the **source-did-not-load report** and every **instance failure report** go to the error sink, like `warn` (the owner's decision
+on [#492](https://github.com/coghex/hetoimasia/issues/492#issuecomment-6270451945)). Which process streams the two sinks are is LUA-19's
+wiring. The runner's own diagnostics (a record when a run starts and when it ends) go to the logger, under the component
+`scripting.lua.runner`; script output, tables and reports never do.
+
+### The table
+
+At the start and at the end the runner writes a title line (`instances at start`, `instances at end`) and the table of D-17: a header
+`TID OWNER NAME STATUS` and a row for each instance of the run, ended ones included, in ascending TID order. A TID has one text form
+(`tidText`): the runtime's number, the owner's and the instance's, dotted, the three integers of the record a script reads from
+`lifecycle.self` and `lifecycle.inspect`. The status words are the lifecycle snapshot's: `initializing`, `active`, `paused`, `stopping`,
+`completed`, `stopped`, `failed`. The owner and name columns are cut to `columnLimit` (32) characters with the visible marker; a row has no
+control character; a run that admitted no instance writes no table.
+
+The start table is one coherent snapshot taken when every admitted instance has finished its `init` or failed it, or has become terminal
+without its `init` having run (a stop of an instance the owner had not begun discards it, and nothing waits for an initializer that
+will never execute, nor makes it run to satisfy the barrier). Every admitted instance is a row, including one that completed or failed
+before the last initializer finished: the run reads an instance's settlement without observing it, so the owner's inspection keeps the
+instance for the tables. A run asked to end before the barrier opens writes no start table. The end table is taken after the VM is retired
+and shows each instance's final status.
+
+### Failures
+
+An instance's failure is written to the error sink as one report as soon as it settles, and is in the run report. A report names the
+TID, the instance's name and script, the VM, the phase it was in, the stage (`init`, `run`, `update`, `event <source>`, `shutdown`,
+`release`), the error and the traceback if one was captured, each bounded, and up to `secondaryLimit` (8) other failures that happened as the
+instance ended (`also failed:` lines), with the count of those not kept. A failed `init` runs none of the instance's later hooks; a failure
+in `run`, `update` or a callback runs its `shutdown` once with reason `failed`; a failing `shutdown` is kept, a primary failure stays primary
+and the rest are listed. Every failure is written exactly once whichever wake or ending finds it, and failures that settle together are
+written in ascending TID order, all of them before the end table.
+
+A failure of the **host** is not an instance's failure and is never turned into a report: an exception a binding or a sink raised, one the
+runner raised itself and a retained cleanup failure propagate unchanged, with their type and context, under the owner's policy (an
+optional worker whose classifier recognizes only the host's fault of loading a module, which is how a source that did not load is told
+from a host failure: an exception application code raised is the application's whatever its type). A host failure inside the owner
+ends the owner, which retires protected: Lua is not entered again, so the instances it left keep `ShutdownSkippedUnsafe`, and one whose
+`init` had not succeeded keeps `ShutdownSkippedNoInit`. One raised on the runner's own thread (a sink's, as a table or a report is written)
+retires the owner first, in order, as the run's end would. When failures arise together the first is the primary and the rest are kept
+whole as cleanup evidence beside it.
+
+### Waiting and ending
+
+A run waits in one place: a single STM wait, composed with supervision (a failure of the owner raises as soon as supervision commits it), that sees a
+failure to write, the start-table barrier, every instance having ended, the stop request and the timer's wake. It polls nothing.
+The run ends at the first of: every instance has ended (a one-shot completing, a failure, or a granted Lua control, of itself or another); the stop
+request fires; the limit is reached. **The limit** is a positive duration measured on the injected clock from the *origin*, the instant read just
+before the first instance is admitted, and waited for on the injected timer, whose wake only tells the run to look at the clock again: an early
+or a stale wake finds the deadline not reached and the run arms again. The timer's registration is cancelled on every way out of the run, and a
+limit too large for the clock's range is one that is never reached.
+
+**When several apply together** the order of precedence is the contract: a failure to write, then the start table, then *every instance ended*, then *the
+stop request*, then *the limit*. So a run in which every instance has ended ends as `EndedAllInstances` even if the stop request and the limit
+are due too; one that the stop request and the limit both end is `EndedStopRequest`; the limit ends a run nothing else has. A stop request that is
+already set when the run begins admits nothing, reads no file and starts no VM, and returns as stopped.
+
+Whatever the end, every instance still unended is stopped in ascending TID order through the ordinary path: its `shutdown` runs once, with reason
+`stopped`, if its module defines one (an instance that is paused is stopped too), and then the VM is retired. A running segment is let return and the
+runner sets no deadline: a script stuck in non-yielding Lua keeps the stop pending (D-27), and forcing the exit is LUA-19's. An instance a Lua control
+stops, or that ends by itself, ends under the same contract: no path runs a `shutdown` twice or skips the retirement.
+
+### The report and the status
+
+`Ran RunReport` holds how the run ended (`EndedAllInstances`, `EndedLimit`, `EndedStopRequest`, or `EndedStartupFailure` when a source did not load),
+each instance's report (TID, name, file, final status, how it ended and what became of `shutdown`, its failure if any), the `LoadFailure` when
+there is one, and the `RunStatus`. The status is `StatusFailure` if any instance failed or a source did not load; otherwise `StatusInterrupted` if the
+stop request ended the run; otherwise `StatusSuccess`: a limit, a Lua control and every instance completing are success. Exit numbers are the command
+line's.
+
+### What is not here
+
+The logical clock, tick intervals and limits, the instances' start and end events and their grants (LUA-28); the command line, signals, `exit` and
+exit numbers (LUA-19); window creation, VM groups, module reload, a stop deadline. `Hetoimasia.Scripting.Lua.Runner.Internal` is the seam the
+examples use for a callback (an event source, bindings of their own, the owner's endpoint): it is not part of the contract and
+is no way to configure a production run.
+
+### What proves it
+
+`Test.LuaRuntime.Runner.*`, in `lua-runtime-tests` (select them with `--test-options='--match Runner'`), run real Lua on real supervised
+scheduled owners started by the runner, with the injected clock, a fake timer, gates and STM signals, and no sleep: every way a source can fail to load,
+in script order; a path named twice; two files with one name; the identity's rules; each kind from a module's entries and each usage
+refusal, with no hook run and the VM retired; the query answering defined, absent and present-but-not-a-function, running no code and never
+changing; a failed `init`, a failing `run`, `update`, callback and `shutdown`, several failures in one run and a primary kept over a failing `shutdown`;
+a host failure from a binding, from a sink while a script prints and while a module loads (and an application's exception shaped as the host's
+fault of loading), the runner's own write failing after an orderly retirement, failures arising together; every ending (a one-shot, a script stopping
+itself and another, the stop request, the limit with an early and a stale wake, a stop request set beforehand), each stop path stopping a live
+event-only, looped and paused instance in order, simultaneous endings in their order of precedence, the timer cancelled on every exit; the
+start table with a gated initializer and a stop before an instance began, the early settlement kept in the tables, and the tables' bounds; output
+to the sinks only (and to no C stream), bounded, safe and unforgeable; and the status for each combination. The cancellation and shutdown
+windows are the kind an asynchronous-exception race can hide on one platform, so CI, which runs them on Linux, is the evidence for them and a local
+pass is not.
 
 ## The protocol model
 
