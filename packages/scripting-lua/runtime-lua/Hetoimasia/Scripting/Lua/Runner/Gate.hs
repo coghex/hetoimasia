@@ -31,7 +31,7 @@ import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, re
 import Control.Exception (finally)
 import Control.Monad (when)
 import Hetoimasia.Scripting.Lua.Instance
-  ( Execution (ExecIdle, ExecReady, ExecRunning)
+  ( Execution (ExecIdle, ExecReady, ExecRunning, ExecWaiting)
   , InstanceKind (RunOnce)
   , InstancePhase (Active, Initializing, Paused, Stopping)
   , InstanceSnapshot (..)
@@ -106,11 +106,13 @@ permitOne (Gate var) = do
 gateParked ∷ Gate → STM Bool
 gateParked (Gate var) = gateIsParked <$> readTVar var
 
--- | Whether an instance has work the owner has yet to do for it: it is initializing or ending; or it is
--- serving and has an invocation ready or running, an event queued, (on logical time) an update owed, or (a
--- one-shot) its @run@ owed or just done and not yet settled. A paused instance does nothing, whatever it
--- holds; a finished one has nothing; an instance suspended on a wait, or serving with nothing to do, has no
--- work now.
+-- | Whether an instance has work the owner can do for it now: it is initializing or ending; or it is serving
+-- and has an invocation ready or running, or, with none in progress, an event queued, (on logical time) an
+-- update owed, or (a one-shot) its @run@ owed or just done and not yet settled. A paused instance does
+-- nothing, whatever it holds; a finished one has nothing. An instance whose invocation is suspended on a
+-- wait has nothing the owner can do however much is queued behind it: the invocations of one instance are
+-- served one after another, so what waits behind the suspended one waits for its wake, which is a tick or a
+-- time the runner does not hold the next grant for.
 --
 -- On elapsed time an update falls due by the wall clock whenever it does, so a looped instance owing one is
 -- not work the owner could be waited for: the run's coordination there is of the instances' own work, and the
@@ -120,11 +122,14 @@ busy updatesOwed snapshot = case snapshotPhase snapshot of
   Initializing → True
   Stopping → True
   Paused → False
-  Active →
-    snapshotExecution snapshot `elem` [ExecReady, ExecRunning]
-      || snapshotQueued snapshot > 0
-      || (updatesOwed && snapshotUpdateOwed snapshot)
-      || (snapshotKind snapshot == RunOnce && snapshotExecution snapshot == ExecIdle)
+  Active → case snapshotExecution snapshot of
+    ExecReady → True
+    ExecRunning → True
+    ExecWaiting → False
+    ExecIdle →
+      snapshotQueued snapshot > 0
+        || (updatesOwed && snapshotUpdateOwed snapshot)
+        || snapshotKind snapshot == RunOnce
   phase → not (isTerminal phase)
 
 -- | Whether no instance is busy: the owner has nothing it must do before it idles.

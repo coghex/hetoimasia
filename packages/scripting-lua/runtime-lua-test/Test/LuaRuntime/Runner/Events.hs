@@ -274,6 +274,35 @@ spec = describe "events" $ do
           (tallyStarted tally, tallyEnded tally) `shouldBe` (2, 1)
           tallyStaged tally `shouldBe` 3
 
+  describe "events behind a suspended callback" $
+    it "does not hold the next tick for events queued behind a callback that waits for a tick" $ bounded $ do
+      fixture ← newRFixture
+      let slow =
+            [ "function init(self, api)"
+            , "  api.subscribe('instances', function(self, e)"
+            , "    fx.record(e.payload.event .. ' ' .. e.payload.name .. ' @' .. e.tick)"
+            , "    fx.wait_ticks(1)"
+            , "  end)"
+            , "end"
+            ]
+      withScripts [("slow.lua", lua slow), ("one.lua", lua ["function run(self) end"])] $ \paths →
+        withBoundary $ \_ runtime → do
+          report ←
+            alongside
+              (driveTicks fixture tickLength 5)
+              (run fixture runtime (tickConfig fixture tickLength (Just 5) (map noWait paths)) >>= expectRan)
+          reportEnding report `shouldBe` EndedTickLimit
+          reportTicks report `shouldBe` 5
+          -- Three events were assigned the first tick; each callback waits a tick, so they are served one tick
+          -- after another, in order, and the driver grants every tick between.
+          recorded fixture
+            >>= ( `shouldBe`
+                    [ "started slow.lua @1"
+                    , "started one.lua @1"
+                    , "ended one.lua @1"
+                    ]
+                )
+
   describe "on an elapsed VM" $
     it "delivers each event on arrival, with no tick, and every delivery is an immediate answer" $ bounded $ do
       fixture ← newRFixture
