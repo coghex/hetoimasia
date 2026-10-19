@@ -3265,7 +3265,7 @@ started or any signal handler is installed. Refused: an unknown option or argume
 (`--headless` included); a script option before the first `--script`; a script option repeated for one script; a scheduler other than `fifo`; a malformed number;
 no `--script`; `--ticks` or `--every-ticks` without `--tick`; `--every` with `--tick`; `--every` with `--every-ticks`. A refusal the runner returns (it needs the
 module's entries: a module defining both `run` and `update`, `update` with no interval, an interval for a module with no `update`) is a usage error too. A usage error
-writes the usage line and a one-line reason to stderr, nothing to stdout, and exits 2; so does the top-level unknown argument. A present but invalid logging
+writes the usage line and a one-line reason to stderr, nothing to stdout, and exits 2; so does the top-level unknown argument, through the same writer (`Hetoimasia.Console.Usage`). The reason is built from what the user typed, so every character that is not printable ASCII becomes a `\xNN` escape and each value is cut at 200 characters with a visible marker: a newline or a carriage return in an argument or a path cannot add a line, and a locale that cannot encode the text cannot turn a usage error into a failure to report it. A present but invalid logging
 variable is configuration, not usage: it fails startup with status 1 before any argument is read.
 
 **Streams.** The runner's output sink is stdout and its error sink is stderr, each flushed after every write, so a reader on a pipe sees each line at once: `print` output

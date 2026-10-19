@@ -3244,7 +3244,9 @@ and verified policy, with adversarial regression coverage.
   `--` is a missing value; a repeated `--headless` is a repeated VM option; `--help` is help only as the whole line;
   `--every` with `--tick` is refused whichever order they come in, as is `--every-ticks` or `--ticks` without
   `--tick`; a script's default name is its file's stem. A refusal the runner returns writes the usage line and its
-  reasons joined into one line, and exits 2. Both streams are UTF-8 and flushed after every write. The handlers
+  reasons joined into one line, and exits 2. Every usage error of every path goes through one writer
+  (`Hetoimasia.Console.Usage.usageFailure`) that escapes whatever is not printable ASCII and bounds each value,
+  so the reason is one line. Both streams are UTF-8 and flushed after every write. The handlers
   are installed after the usage check and before the logging lifetime is entered, and call `exitImmediately 130` as
   the second signal's force action. The run goes through `runScopedApplication` with the logging lifetime over
   stderr, so the final flush follows the supervision drain; the lifetime's logger is kept as it is entered because the
