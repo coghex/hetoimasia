@@ -3062,13 +3062,16 @@ Before any module loads, `print` and `warn` are rebound, by an initial chunk, to
 chunk reads them from is removed from the globals, so no reference to the originals stays reachable and nothing a script runs writes
 to the process's C streams. `print` joins the `tostring` of its arguments with a tab and writes the line to the **output sink**; `warn` does the
 same after `Lua warning: ` and writes to the **error sink**, from a module's top level, `init`, `run`, `update`, a callback and
-`shutdown` alike. One call writes at most `outputCallLimit` (4096) bytes, cut with the visible marker `...` (counted in the bound), and
-any Lua string is accepted: it crosses as bytes, is decoded as UTF-8 with every invalid sequence replaced, is split at its line breaks,
-and has its control characters (an embedded NUL included) replaced by `\xNN` escapes, a tab excepted.
+`shutdown` alike. One call writes at most `outputCallLimit` (4096) bytes of UTF-8 in all, as it is written (each line counting one byte more for its end), cut
+with the visible marker `...` (counted in the bound), and any Lua string is accepted: it crosses as bytes, is decoded as UTF-8 with every
+invalid sequence replaced, is split at its line breaks, and has its control characters (an embedded NUL included) replaced by `\xNN`
+escapes, a tab excepted. The script cuts the text to the same number of bytes before it crosses, so the value boundary cannot refuse it for
+length, and the runner bounds what it writes again after decoding and escaping, which can make the text longer (a NUL byte becomes four
+characters, an invalid byte three).
 
 The rules for every write: a sink is handed one line at a time, with no line break and no control character in it but a tab; a script's
-text and every other text a script can influence (a name, an error, a traceback, a path) is cut to a documented bound and has its control
-characters replaced, so none can split a table or a report into forged lines; the runner holds one lock around each table, report or call,
+text and every other text a script can influence (a name, an error, a traceback, a path) has its control characters replaced and is then cut
+to a documented bound, so the bound holds for what is written and none can split a table or a report into forged lines; the runner holds one lock around each table, report or call,
 so a sink is never called by two threads at once and a table is never cut by a script's output. The **tables** go to the output sink, like
 `print`; the **source-did-not-load report** and every **instance failure report** go to the error sink, like `warn` (the owner's decision
 on [#492](https://github.com/coghex/hetoimasia/issues/492#issuecomment-6270451945)). Which process streams the two sinks are is LUA-19's
@@ -3107,8 +3110,16 @@ optional worker whose classifier recognizes only the host's fault of loading a m
 from a host failure: an exception application code raised is the application's whatever its type). A host failure inside the owner
 ends the owner, which retires protected: Lua is not entered again, so the instances it left keep `ShutdownSkippedUnsafe`, and one whose
 `init` had not succeeded keeps `ShutdownSkippedNoInit`. One raised on the runner's own thread (a sink's, as a table or a report is written)
-retires the owner first, in order, as the run's end would. When failures arise together the first is the primary and the rest are kept
-whole as cleanup evidence beside it.
+retires the owner first, in order, as the run's end would.
+
+The retirement is complete before any failure propagates, whoever latched it: the run asks the owner to stop and waits for the owner's worker
+to have ended (its raw completion, which supervision's latch of another worker's failure never makes unavailable), so what the run's sinks and
+bindings are borrowed from is not released while the owner's Lua still uses them. That wait is for arbitrary Lua segments and shutdown hooks,
+so it is interruptible and never runs under an uninterruptible mask (a release has a controlled blocking duration, and a worker's join has
+none): a cancellation of the runner's thread reaches it, the owner having been asked to stop, and what it interrupts keeps the failure that was
+already propagating beside it as evidence. The wait does not raise the owner's failure again: supervision delivers it, to the next supervised
+wait and at the boundary's exit beside the body's own. When failures arise together the first is the primary and the rest are kept whole as
+evidence beside it; a single failure is never recorded again as a failure of cleanup.
 
 ### Waiting and ending
 
@@ -3153,11 +3164,12 @@ in script order; a path named twice; two files with one name; the identity's rul
 refusal, with no hook run and the VM retired; the query answering defined, absent and present-but-not-a-function, running no code and never
 changing; a failed `init`, a failing `run`, `update`, callback and `shutdown`, several failures in one run and a primary kept over a failing `shutdown`;
 a host failure from a binding, from a sink while a script prints and while a module loads (and an application's exception shaped as the host's
-fault of loading), the runner's own write failing after an orderly retirement, failures arising together; every ending (a one-shot, a script stopping
+fault of loading), the runner's own write failing after an orderly retirement, failures arising together, a failure another supervised worker latched
+propagating only after the owner's retirement is complete, and a cancellation reaching a retirement that waits on a held segment; every ending (a one-shot, a script stopping
 itself and another, the stop request, the limit with an early and a stale wake, a stop request set beforehand), each stop path stopping a live
 event-only, looped and paused instance in order, simultaneous endings in their order of precedence, the timer cancelled on every exit; the
 start table with a gated initializer and a stop before an instance began, the early settlement kept in the tables, and the tables' bounds; output
-to the sinks only (and to no C stream), bounded, safe and unforgeable; and the status for each combination. The cancellation and shutdown
+to the sinks only (and to no C stream), bounded as it is written after escaping (NUL bytes, invalid bytes, line breaks, multibyte text, an error, a name and a path), safe and unforgeable; and the status for each combination. The cancellation and shutdown
 windows are the kind an asynchronous-exception race can hide on one platform, so CI, which runs them on Linux, is the evidence for them and a local
 pass is not.
 
