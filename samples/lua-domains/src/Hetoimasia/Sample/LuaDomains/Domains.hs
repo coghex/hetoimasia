@@ -1005,19 +1005,26 @@ stepTick domains = do
         Nothing → pure TickHalted
         Just (tick, pausedAtBegin) → do
           granted ← grantScheduledStep (scheduledEndpoint owner) (configTickDuration config)
-          case granted of
-            GrantAccepted _ → pure ()
-            other → throwIO (TickNotGranted tick (show other))
-          waited ← awaitTicksComplete (domainsControl domains) owner
-          -- An owner that ended because the session was stopped, or had failed, while the tick was in flight (the
-          -- stop retired it from another thread) is the ending the session already decided: the tick is halted.
-          -- An owner that ended otherwise is a defect.
-          when (waited /= TicksCompleted) $ do
-            over ← atomically ((||) <$> haltedNow shared <*> failedNow (sharedSession shared))
-            unless over (throwIO (OwnerEndedDuringTick tick))
-          fence domains
-          watchTasks domains
-          decide domains tick pausedAtBegin
+          accepted ← case granted of
+            GrantAccepted _ → pure True
+            -- A grant an owner refuses because a stop (from another thread) has retired it is the ending the session
+            -- already decided; one it refuses otherwise is a defect.
+            other → do
+              over ← atomically (haltedNow shared)
+              if over then pure False else throwIO (TickNotGranted tick (show other))
+          if not accepted
+            then pure TickHalted
+            else do
+              waited ← awaitTicksComplete (domainsControl domains) owner
+              -- An owner that ended because the session was stopped, or had failed, while the tick was in flight (the
+              -- stop retired it from another thread) is the ending the session already decided: the tick is halted.
+              -- An owner that ended otherwise is a defect.
+              when (waited /= TicksCompleted) $ do
+                over ← atomically (haltedNow shared)
+                unless over (throwIO (OwnerEndedDuringTick tick))
+              fence domains
+              watchTasks domains
+              decide domains tick pausedAtBegin
 
 -- | What the driver decided after the fence.
 data Verdict
