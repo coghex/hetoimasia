@@ -11,6 +11,7 @@ import qualified Test.Domains.Exposure
 import qualified Test.Domains.Failure
 import qualified Test.Domains.Intentions
 import qualified Test.Domains.Ledger
+import qualified Test.Domains.Leases
 import qualified Test.Domains.Lifetime
 import qualified Test.Domains.Process
 import qualified Test.Domains.Progress
@@ -33,6 +34,7 @@ spec = describe "the two-domain Lua sample" $ do
   Test.Domains.Intentions.spec
   Test.Domains.Failure.spec
   Test.Domains.Ledger.spec
+  Test.Domains.Leases.spec
   Test.Domains.Stop.spec
   Test.Domains.View.spec
   Test.Domains.Barrier.spec

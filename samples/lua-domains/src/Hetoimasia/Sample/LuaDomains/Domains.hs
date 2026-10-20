@@ -891,7 +891,7 @@ fenceModule = sourceIdentity (gameplayModule [] "")
 -- | Admit the fence task and wait for its settlement. The owner runs a segment and then the boundary after
 -- it, one after the other, so the fence's segment begins only once every boundary before it is over: what the
 -- instance layer was to account for, it has, an instance that failed has ended and the application has been
--- told. What the fence settles as other than returned is a defect of the sample.
+-- told. What the fence settles as other than returned, with the owner still serving, is a defect of the sample.
 fence ∷ Domains → IO ()
 fence domains = do
   admission ← admitScheduledTask (scheduledEndpoint (startedOwner (domainsGameplay domains))) (TaskRequest fenceModule "sample_fence" [] OrdinaryClass OneShot (Just "fence"))
@@ -900,7 +900,12 @@ fence domains = do
       settlement ← awaitTask (domainsControl domains) ticket
       case settledOutcome settlement of
         SettledReturned _ → pure ()
+        -- An owner that ended while the fence waited settles it as discarded: it has no boundary left to run.
+        SettledDiscarded _ → pure ()
         other → throwIO (FenceFailed (take 200 (show other)))
+    -- An owner whose admission is closed is ending (a stop, or a cleanup failure that ended it fatally): there
+    -- is no boundary left to wait for, and retirement waits for its worker, whose end supervision reports.
+    TaskAdmissionClosed → pure ()
     other → throwIO (FenceFailed (show other))
 
 -- | Admit a task to the gameplay owner as the session's: if it faults, the session fails, as an instance's

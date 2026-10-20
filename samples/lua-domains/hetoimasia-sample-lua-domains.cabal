@@ -113,6 +113,7 @@ test-suite lua-domains-tests
         Test.Domains.Failure
         Test.Domains.Intentions
         Test.Domains.Ledger
+        Test.Domains.Leases
         Test.Domains.Lifetime
         Test.Domains.Process
         Test.Domains.Progress
