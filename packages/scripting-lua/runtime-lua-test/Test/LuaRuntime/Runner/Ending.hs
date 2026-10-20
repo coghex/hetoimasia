@@ -11,7 +11,7 @@ import Hetoimasia.Scripting.Lua.Runner
 import Test.Hspec (Spec, describe, it, shouldBe, shouldContain, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Runner.Support
 import Test.LuaRuntime.Scheduler.Support (fireReg)
-import Test.LuaRuntime.Support (bounded, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, withBoundary, withBoundaryOpening)
 
 -- | Reports an instance by its shutdown, so the order of shutdowns is read from what was recorded.
 shutdownOf ∷ Text → [Text]
@@ -81,7 +81,7 @@ spec = describe "how a run ends" $ do
       withScripts [("paused.lua", lua (["function init(self) lifecycle.pause(lifecycle.self()) end"] <> eventOnly "paused"))] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               (awaitOut fixture 3 >> awaitSnapshots fixture (any ((== Paused) . snapshotPhase)) >> setStop fixture True)
               (run fixture runtime (config fixture [noWait (scriptAt paths 0)]) >>= expectRan)
           reportEnding report `shouldBe` EndedStopRequest
@@ -93,7 +93,7 @@ spec = describe "how a run ends" $ do
       withScripts [("e.lua", lua (eventOnly "e"))] $ \paths →
         withBoundary $ \control runtime → do
           report ←
-            alongside (awaitOut fixture 3 >> setStop fixture True) $
+            alongside fixture (awaitOut fixture 3 >> setStop fixture True) $
               run fixture runtime (config fixture [noWait (scriptAt paths 0)]) >>= expectRan
           reportEnding report `shouldBe` EndedStopRequest
           statusOf report `shouldBe` StatusInterrupted
@@ -119,11 +119,11 @@ spec = describe "how a run ends" $ do
     it "lets a running segment return: the instance in the middle of its run completes" $ bounded $ do
       fixture ← newRFixture
       withScripts [("slow.lua", lua ["function run(self) fx.block('hold') fx.record('finished') end", "function shutdown(self, reason) fx.record('shutdown ' .. reason) end"])] $ \paths →
-        withBoundary $ \_ runtime → do
+        withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
           report ←
             -- The stop request is set while the segment is held, and the segment is let go once the run has
             -- asked its owner to retire.
-            alongside (awaitGate fixture "hold" >> setStop fixture True >> awaitRetiring fixture 0 >> openGate fixture "hold") $
+            alongside fixture (awaitGate fixture "hold" >> setStop fixture True >> awaitRetiring fixture 0 >> openGate fixture "hold") $
               runTick fixture runtime (config fixture [noWait (scriptAt paths 0)]) >>= expectRan
           -- The stop request was set while the segment was held, and the segment was not cut short.
           reportEnding report `shouldBe` EndedStopRequest
@@ -136,7 +136,7 @@ spec = describe "how a run ends" $ do
       withScripts [("e.lua", lua (eventOnly "e"))] $ \paths →
         withBoundary $ \control runtime → do
           report ←
-            alongside (awaitOut fixture 3 >> awaitLive fixture 1 >> tickClock fixture 1000000 >> fireLive fixture) $
+            alongside fixture (awaitOut fixture 3 >> awaitLive fixture 1 >> tickClock fixture 1000000 >> fireLive fixture) $
               run fixture runtime (limited fixture [noWait (scriptAt paths 0)]) >>= expectRan
           reportEnding report `shouldBe` EndedLimit
           statusOf report `shouldBe` StatusSuccess
@@ -150,7 +150,7 @@ spec = describe "how a run ends" $ do
         withBoundary $ \_ runtime → do
           tickClock fixture 5000000
           report ←
-            alongside
+            alongside fixture
               ( awaitOut fixture 3
                   >> awaitLive fixture 1
                   -- Not yet: a limit of one millisecond after the origin is 6ms on the clock.
@@ -171,7 +171,7 @@ spec = describe "how a run ends" $ do
       withScripts [("e.lua", lua (eventOnly "e"))] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               ( awaitOut fixture 3
                   >> awaitLive fixture 1
                   >> (liveTimers fixture >>= \firsts → mapM_ fireReg firsts >> awaitCount (regCount fixture) 2 >> awaitLive fixture 1 >> mapM_ fireReg firsts)
@@ -196,7 +196,7 @@ spec = describe "how a run ends" $ do
       withScripts [("e.lua", lua (eventOnly "e"))] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside (awaitOut fixture 3 >> awaitLive fixture 1 >> setStop fixture True) $
+            alongside fixture (awaitOut fixture 3 >> awaitLive fixture 1 >> setStop fixture True) $
               run fixture runtime (limited fixture [noWait (scriptAt paths 0)]) >>= expectRan
           reportEnding report `shouldBe` EndedStopRequest
           liveCount fixture `shouldReturn` 0
@@ -218,9 +218,9 @@ spec = describe "how a run ends" $ do
     it "ends as every instance having ended when that and the stop request and the limit all apply" $ bounded $ do
       fixture ← newRFixture
       withScripts [("one.lua", lua ["function run(self) fx.record('ran') end"])] $ \paths →
-        withBoundary $ \_ runtime → do
+        withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
           report ←
-            alongside (awaitGate fixture "table" >> awaitSnapshots fixture (all (isTerminal . snapshotPhase)) >> everythingReady' fixture) $
+            alongside fixture (awaitGate fixture "table" >> awaitSnapshots fixture (all (isTerminal . snapshotPhase)) >> everythingReady' fixture) $
               run fixture runtime (held fixture [noWait (scriptAt paths 0)]) >>= expectRan
           reportEnding report `shouldBe` EndedAllInstances
           -- The stop request was set, and the run was not interrupted by it: nothing was left to stop.
@@ -228,9 +228,9 @@ spec = describe "how a run ends" $ do
     it "ends as the stop request when it and the limit both apply, and so is interrupted" $ bounded $ do
       fixture ← newRFixture
       withScripts [("e.lua", lua (eventOnly "e"))] $ \paths →
-        withBoundary $ \_ runtime → do
+        withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
           report ←
-            alongside (everythingReady fixture) $
+            alongside fixture (everythingReady fixture) $
               run fixture runtime (held fixture [noWait (scriptAt paths 0)]) >>= expectRan
           reportEnding report `shouldBe` EndedStopRequest
           statusOf report `shouldBe` StatusInterrupted
@@ -238,9 +238,9 @@ spec = describe "how a run ends" $ do
     it "ends as the limit when only the limit applies" $ bounded $ do
       fixture ← newRFixture
       withScripts [("e.lua", lua (eventOnly "e"))] $ \paths →
-        withBoundary $ \_ runtime → do
+        withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
           report ←
-            alongside (awaitGate fixture "table" >> tickClock fixture 1000000 >> fireLive fixture >> openGate fixture "table") $
+            alongside fixture (awaitGate fixture "table" >> tickClock fixture 1000000 >> fireLive fixture >> openGate fixture "table") $
               run fixture runtime (held fixture [noWait (scriptAt paths 0)]) >>= expectRan
           reportEnding report `shouldBe` EndedLimit
           statusOf report `shouldBe` StatusSuccess
@@ -265,7 +265,7 @@ spec = describe "how a run ends" $ do
           withBoundary $ \_ runtime → do
             let configured = (config fixture (scripts paths)) {runnerLimit = if byLimit then Just (ns 1000000) else Nothing}
             report ←
-              alongside
+              alongside fixture
                 ( awaitOut fixture 5
                     >> paused fixture (any (\snapshot → snapshotPhase snapshot == Paused))
                     >> if byLimit then tickClock fixture 1000000 >> fireLive fixture else setStop fixture True

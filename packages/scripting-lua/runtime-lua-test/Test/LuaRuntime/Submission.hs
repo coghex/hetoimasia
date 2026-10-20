@@ -34,7 +34,7 @@ spec = describe "submission" $ do
   describe "the queued-call bound" $ do
     it "accepts calls up to the bound, and answers full one past it, without blocking" $ bounded $ do
       fixture ← newFixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         owner ← startOwner runtime (ownerSpec fixture "queue" ["app"] requiredPolicy (bounds 3 100))
         let endpoint = ownerEndpoint owner
         -- One call in flight, so the three that follow wait.
@@ -55,7 +55,7 @@ spec = describe "submission" $ do
   describe "the result bound" $ do
     it "counts every reservation, pending ones included, and recovers capacity on observation" $ bounded $ do
       fixture ← newFixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         owner ← startOwner runtime (ownerSpec fixture "results" ["app"] requiredPolicy (bounds 50 2))
         let endpoint = ownerEndpoint owner
             full ∷ String → IO ()
@@ -95,7 +95,7 @@ spec = describe "submission" $ do
 
     it "gives a reservation back when an abandoned call settles" $ bounded $ do
       fixture ← newFixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         owner ← startOwner runtime (ownerSpec fixture "forget" ["app"] requiredPolicy (bounds 5 1))
         let endpoint = ownerEndpoint owner
         holder ← submit endpoint "block_call" [VText "hold"] >>= accepted
@@ -144,7 +144,7 @@ spec = describe "submission" $ do
   describe "preparation on the producer's side" $ do
     it "raises a failure nested in a lazy argument on the producer's thread, while the owner is busy, and queues nothing" $ bounded $ do
       fixture ← newFixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         owner ← startOwner runtime (ownerSpec fixture "producer" ["app"] requiredPolicy (bounds 2 10))
         let endpoint = ownerEndpoint owner
         holder ← submit endpoint "block_call" [VText "hold"] >>= accepted
@@ -166,7 +166,7 @@ spec = describe "submission" $ do
 
     it "bounds oversized arguments while the owner is occupied, keeps none, and settles them as the value refusal" $ bounded $ do
       fixture ← newFixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         owner ← startOwner runtime (ownerSpec fixture "oversized" ["app"] requiredPolicy (bounds 4 10))
         let endpoint = ownerEndpoint owner
         holder ← submit endpoint "block_call" [VText "hold"] >>= accepted
@@ -196,7 +196,7 @@ spec = describe "submission" $ do
         retireOwner owner
     it "bounds a capability's type name, which the value limits do not count, so a huge one is not kept" $ bounded $ do
       fixture ← newFixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         owner ← startOwner runtime (ownerSpec fixture "capability" ["app"] requiredPolicy (bounds 4 10))
         let endpoint = ownerEndpoint owner
         holder ← submit endpoint "block_call" [VText "hold"] >>= accepted

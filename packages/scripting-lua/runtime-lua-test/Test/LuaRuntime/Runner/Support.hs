@@ -66,10 +66,10 @@ module Test.LuaRuntime.Runner.Support
   , ns
   ) where
 
-import Control.Concurrent (forkIO, killThread, yield)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar, tryTakeMVar)
+import Control.Concurrent (yield)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, readMVar, tryPutMVar)
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, retry, writeTVar)
-import Control.Exception (AsyncException (ThreadKilled), SomeException, finally, fromException, onException, throwIO, try)
+import Control.Exception (finally, throwIO)
 import Control.Monad (void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -95,7 +95,7 @@ import System.IO (hClose, hFlush, openBinaryTempFile, stderr, stdout)
 import System.FilePath ((</>))
 import Test.LuaRuntime.Scheduled.Support (Clock (Clock), SFixture (..), awaitEntered, blockOn, newSFixture, releaseGate)
 import Test.LuaRuntime.Scheduler.Support (FakeTimer (..), Reg (regLive), allRegs, fireReg, nanoseconds)
-import Test.LuaRuntime.Support (Broken (Broken), applicationBoundaryFault, quietLogger)
+import Test.LuaRuntime.Support (Broken (Broken), Gated (..), alongsideOpening, applicationBoundaryFault, quietLogger)
 
 -- The fixture ------------------------------------------------------------------
 
@@ -112,6 +112,9 @@ data RFixture = RFixture
   , rfAdmitted ∷ !(MVar (ScheduledEndpoint, [(InstanceId, InstanceTicket)]))
     -- ^ The owner's endpoint and the instances, once the run has admitted them.
   }
+
+instance Gated RFixture where
+  openAllGates = openAllGates . rfBase
 
 newRFixture ∷ IO RFixture
 newRFixture = RFixture <$> newSFixture <*> newIORef [] <*> newIORef [] <*> newTVarIO False <*> newIORef 0 <*> newIORef [] <*> newEmptyMVar
@@ -331,18 +334,10 @@ expectRefused = \case
 
 -- Acting while a run is in progress -------------------------------------------
 
--- | Run the helper on a thread of its own while the other action runs on this one, and answer the
--- other's result. The helper is stopped when the run is over, whatever it was waiting for; a failure
--- of the helper is raised after the run's.
-alongside ∷ IO () → IO a → IO a
-alongside helper main' = do
-  result ← newEmptyMVar
-  thread ← forkIO (try @SomeException helper >>= putMVar result)
-  value ← main' `onException` killThread thread
-  killThread thread
-  tryTakeMVar result >>= \case
-    Just (Left failure) | fromException failure /= Just ThreadKilled → throwIO failure
-    _ → pure value
+-- | 'alongsideOpening' with the fixture's gates: the helper is stopped when the run is over, and a
+-- helper that fails opens them and is what the example fails with.
+alongside ∷ RFixture → IO () → IO a → IO a
+alongside fixture = alongsideOpening [openAllGates fixture]
 
 -- | Wait until a counter of the example's reaches this many, yielding to the other threads and
 -- never sleeping.

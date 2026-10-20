@@ -21,7 +21,7 @@ spec = describe "kinds and usage" $ do
       withBoundary $ \_ runtime → do
         let scripts = [noWait (scriptAt paths 0), Script (scriptAt paths 1) Nothing (Just (ns 10000000)), noWait (scriptAt paths 2)]
         report ←
-          alongside
+          alongside fixture
             ( do
                 -- The start table is written once every instance has initialized; the looped
                 -- instance's interval is then armed on the fake timer.

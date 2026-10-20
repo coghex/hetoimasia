@@ -33,7 +33,7 @@ import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support (awaitLine, linesOf, refusalOf)
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfObserver), awaitEntered, blockOn, releaseGate)
 import Test.LuaRuntime.Subscription.Support
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- | An owner of subscribers on elapsed time, granted both endpoints.
 elapsedOwner ∷ IFixture → FakeEvents → LuaRuntime → Text → [ModuleSource] → IO ScheduledOwner
@@ -74,7 +74,7 @@ spec = describe "on an owner on elapsed time" $ do
     it "never blocks and never calls Lua, whatever the owner is doing, from threads of its own" $ bounded $ do
       fixture ← newIFixture
       fake ← newFakeEvents
-      withBoundary $ \_ runtime → eventsFinish fake $ do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → eventsFinish fake $ do
         owner ← elapsedOwner fixture fake runtime "producers" [subscriber, holder]
         admitSubscriber fixture owner "i" "subscriber"
         subscribeTo' fixture owner "i" "a" "ticks" Nothing
@@ -97,7 +97,7 @@ spec = describe "on an owner on elapsed time" $ do
     it "is answered while a callback holds the owner inside Lua: a producer's thread does not enter it" $ bounded $ do
       fixture ← newIFixture
       fake ← newFakeEvents
-      withBoundary $ \_ runtime → eventsFinish fake $ do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → eventsFinish fake $ do
         owner ← elapsedOwner fixture fake runtime "owner thread" [subscriber]
         admitSubscriber fixture owner "i" "subscriber"
         subscribeTo' fixture owner "i" "a" "ticks" (Just "gate")
@@ -112,7 +112,7 @@ spec = describe "on an owner on elapsed time" $ do
     it "run in the order they were delivered, each once" $ bounded $ do
       fixture ← newIFixture
       fake ← newFakeEvents
-      withBoundary $ \_ runtime → eventsFinish fake $ do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → eventsFinish fake $ do
         owner ← elapsedOwner fixture fake runtime "ordered" [subscriber, holder]
         admitSubscriber fixture owner "i" "subscriber"
         subscribeTo' fixture owner "i" "a" "ticks" Nothing
@@ -125,7 +125,7 @@ spec = describe "on an owner on elapsed time" $ do
     it "are refused and counted when the queue has no place, and nothing accepted is evicted" $ bounded $ do
       fixture ← newIFixture
       fake ← newFakeEvents
-      withBoundary $ \_ runtime → eventsFinish fake $ do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → eventsFinish fake $ do
         owner ← elapsedOwner fixture fake runtime "overflow" [subscriber, holder]
         admitSubscriber fixture owner "i" "subscriber"
         subscribeTo' fixture owner "i" "a" "ticks" Nothing
@@ -174,7 +174,7 @@ spec = describe "on an owner on elapsed time" $ do
     it "keeps one unstarted delivery, replaced in place by a later value, counted as coalesced" $ bounded $ do
       fixture ← newIFixture
       fake ← newFakeEvents
-      withBoundary $ \_ runtime → eventsFinish fake $ do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → eventsFinish fake $ do
         owner ← elapsedOwner fixture fake runtime "coalesce" [subscriber, holder]
         admitSubscriber fixture owner "i" "subscriber"
         subscribeTo' fixture owner "i" "a" "state" Nothing
@@ -192,7 +192,7 @@ spec = describe "on an owner on elapsed time" $ do
     it "keeps the place of the delivery it replaces, among ordered events and other state" $ bounded $ do
       fixture ← newIFixture
       fake ← newFakeEvents
-      withBoundary $ \_ runtime → eventsFinish fake $ do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → eventsFinish fake $ do
         owner ← elapsedOwner fixture fake runtime "position" [subscriber, holder]
         admitSubscriber fixture owner "i" "subscriber"
         subscribeTo' fixture owner "i" "o" "ticks" Nothing
@@ -210,7 +210,7 @@ spec = describe "on an owner on elapsed time" $ do
     it "needs a place to fill an empty slot but none to replace what is unstarted, at capacity" $ bounded $ do
       fixture ← newIFixture
       fake ← newFakeEvents
-      withBoundary $ \_ runtime → eventsFinish fake $ do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → eventsFinish fake $ do
         owner ← elapsedOwner fixture fake runtime "capacity" [subscriber, holder]
         admitSubscriber fixture owner "i" "subscriber"
         subscribeTo' fixture owner "i" "o" "ticks" Nothing
@@ -231,7 +231,7 @@ spec = describe "on an owner on elapsed time" $ do
     it "needs a place of its own once the value it would replace has begun, and the callback's value is immutable" $ bounded $ do
       fixture ← newIFixture
       fake ← newFakeEvents
-      withBoundary $ \_ runtime → eventsFinish fake $ do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → eventsFinish fake $ do
         owner ← elapsedOwner fixture fake runtime "immutable" [subscriber]
         admitSubscriber fixture owner "i" "subscriber"
         subscribeTo' fixture owner "i" "a" "state" (Just "gate")
@@ -249,7 +249,7 @@ spec = describe "on an owner on elapsed time" $ do
     it "replaces the delivery already selected for the owner's next invocation, until its first segment runs" $ bounded $ do
       fixture ← newIFixture
       fake ← newFakeEvents
-      withBoundary $ \_ runtime → eventsFinish fake $ do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → eventsFinish fake $ do
         owner ← elapsedOwner fixture fake runtime "pending" [subscriber]
         admitSubscriber fixture owner "i" "subscriber"
         subscribeTo' fixture owner "i" "a" "state" Nothing
@@ -269,7 +269,7 @@ spec = describe "on an owner on elapsed time" $ do
     it "settles once: the provider is told once, the unstarted deliveries are discarded and counted, and a delivery after it is refused" $ bounded $ do
       fixture ← newIFixture
       fake ← newFakeEvents
-      withBoundary $ \_ runtime → eventsFinish fake $ do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → eventsFinish fake $ do
         owner ← elapsedOwner fixture fake runtime "unsubscribe" [subscriber, holder]
         admitSubscriber fixture owner "i" "subscriber"
         subscribeTo' fixture owner "i" "a" "ticks" Nothing
@@ -295,7 +295,7 @@ spec = describe "on an owner on elapsed time" $ do
     it "discards what was accepted and had not begun, counted by the model, and never runs it" $ bounded $ do
       fixture ← newIFixture
       fake ← newFakeEvents
-      withBoundary $ \_ runtime → eventsFinish fake $ do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → eventsFinish fake $ do
         owner ← elapsedOwner fixture fake runtime "discard" [subscriber, holder]
         admitSubscriber fixture owner "i" "subscriber"
         subscribeTo' fixture owner "i" "a" "ticks" Nothing

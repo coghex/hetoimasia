@@ -13,7 +13,7 @@ import Hetoimasia.Scripting.Lua.Instance (InstanceId (instanceLocal), ShutdownDi
 import Hetoimasia.Scripting.Lua.Runner
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Runner.Support
-import Test.LuaRuntime.Support (bounded, brokenIs, expectFatal, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, brokenIs, expectFatal, withBoundary, withBoundaryOpening)
 
 period ∷ Word64
 period = 1000
@@ -78,7 +78,7 @@ spec = describe "ticks" $ do
         withBoundary $ \_ runtime → do
           let largest = toInteger (maxBound ∷ Word64)
           report ←
-            alongside
+            alongside fixture
               (driveTicks fixture period 1 >> setStop fixture True)
               (run fixture runtime ((tickConfig fixture period (Just largest) [everyTicks largest (script (scriptAt paths 0))])) >>= expectRan)
           reportEnding report `shouldBe` EndedStopRequest
@@ -89,7 +89,7 @@ spec = describe "ticks" $ do
       withScripts [("l.lua", lua (counting "l"))] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               (driveTicks fixture period 3)
               (run fixture runtime (tickConfig fixture period (Just 3) [everyTick (scriptAt paths 0)]) >>= expectRan)
           reportEnding report `shouldBe` EndedTickLimit
@@ -107,9 +107,9 @@ spec = describe "ticks" $ do
     it "grants back-to-back ticks when the clock jumps past several deadlines while a segment is held, with none skipped, merged or shortened" $ bounded $ do
       fixture ← newRFixture
       withScripts [("l.lua", lua (blockingFirst "seg" "l"))] $ \paths →
-        withBoundary $ \_ runtime → do
+        withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               ( awaitLive fixture 1
                   >> tickClock fixture period
                   >> fireLive fixture
@@ -130,7 +130,7 @@ spec = describe "ticks" $ do
       withScripts [("l.lua", lua (counting "l"))] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               ( do
                   awaitLive fixture 1
                   -- The timer fires with the clock short of the deadline: an early wake.
@@ -154,9 +154,9 @@ spec = describe "ticks" $ do
     it "grants no further tick once a stop begins, and counts the tick that was in progress as not completed" $ bounded $ do
       fixture ← newRFixture
       withScripts [("l.lua", lua (blockingFirst "seg" "l"))] $ \paths →
-        withBoundary $ \_ runtime → do
+        withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               ( awaitLive fixture 1
                   >> tickClock fixture (3 * period)
                   >> fireLive fixture
@@ -182,7 +182,7 @@ spec = describe "ticks" $ do
         $ \paths →
           withBoundary $ \_ runtime → do
             report ←
-              alongside
+              alongside fixture
                 (driveTicks fixture period 2)
                 (run fixture runtime (tickConfig fixture period (Just 2) [script (scriptAt paths 0), everyTick (scriptAt paths 1), script (scriptAt paths 2)]) >>= expectRan)
             reportEnding report `shouldBe` EndedTickLimit
@@ -203,7 +203,7 @@ spec = describe "ticks" $ do
       withScripts [("bad.lua", lua ["function update(self, dt) error('boom') end"]), ("ok.lua", lua (counting "ok"))] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               (driveTicks fixture period 2)
               (run fixture runtime (tickConfig fixture period (Just 2) (map everyTick paths)) >>= expectRan)
           reportEnding report `shouldBe` EndedTickLimit
@@ -215,7 +215,7 @@ spec = describe "ticks" $ do
       withScripts [("l.lua", lua ["function update(self, dt) end", "function shutdown(self, reason) error('late') end"])] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               (driveTicks fixture period 2)
               (run fixture runtime (tickConfig fixture period (Just 2) [everyTick (scriptAt paths 0)]) >>= expectRan)
           reportEnding report `shouldBe` EndedTickLimit
@@ -237,7 +237,7 @@ spec = describe "ticks" $ do
             limits = if label `elem` ["the duration limit", "a duration limit that arrives mid-tick"] then Just (ns (period + period `div` 2)) else Nothing
             tickLimit = if label == "the tick limit" then Just 1 else Nothing
         withScripts files $ \paths →
-          withBoundary $ \_ runtime → do
+          withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
             let driver = case label of
                   "the tick limit" → driveTicks fixture period 1
                   "the duration limit" → driveTicks fixture period 1 >> awaitLive fixture 2 >> tickClock fixture (period `div` 2 + 1) >> fireLive fixture
@@ -245,7 +245,7 @@ spec = describe "ticks" $ do
                   _ → awaitLive fixture 2 >> tickClock fixture period >> fireLive fixture >> awaitGate fixture "seg" >> tickClock fixture period >> fireLive fixture
                 finish = if label == "a duration limit that arrives mid-tick" then openGate fixture "seg" else pure ()
             report ←
-              alongside (driver >> finish) $
+              alongside fixture (driver >> finish) $
                 run fixture runtime ((tickConfig fixture period tickLimit (threeScripts paths)) {runnerLimit = limits}) >>= expectRan
             reportEnding report
               `shouldBe` ( case label of
@@ -268,9 +268,9 @@ spec = describe "ticks" $ do
           tie label scriptsOf expectedEnding setup = it label $ bounded $ do
             fixture ← newRFixture
             withScripts scriptsOf $ \paths →
-              withBoundary $ \_ runtime → do
+              withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
                 report ←
-                  alongside
+                  alongside fixture
                     (awaitLive fixture (maybe 1 (const 2) (limitFor label)) >> tickClock fixture period >> fireLive fixture >> awaitGate fixture "rep" >> setup fixture)
                     (run fixture runtime (held fixture (map everyTick paths) (tickLimitFor label) (limitFor label)) >>= expectRan)
                 reportEnding report `shouldBe` expectedEnding
@@ -324,7 +324,7 @@ spec = describe "ticks" $ do
         $ \paths →
           withBoundary $ \_ runtime → do
             report ←
-              alongside
+              alongside fixture
                 (driveTicks fixture period 2)
                 (run fixture runtime (tickConfig fixture period (Just 2) (script (scriptAt paths 0) : script (scriptAt paths 1) : script (scriptAt paths 2) : map everyTick (drop 3 paths))) >>= expectRan)
             reportEnding report `shouldBe` EndedTickLimit
@@ -352,7 +352,7 @@ spec = describe "ticks" $ do
         $ \paths →
           withBoundary $ \_ runtime → do
             report ←
-              alongside
+              alongside fixture
                 (driveTicks fixture period 3)
                 (run fixture runtime (tickConfig fixture period (Just 3) (map script (take 3 paths) <> [everyTick (scriptAt paths 3)])) >>= expectRan)
             reportEnding report `shouldBe` EndedTickLimit
@@ -377,7 +377,7 @@ spec = describe "ticks" $ do
         $ \paths →
           withBoundary $ \_ runtime → do
             report ←
-              alongside
+              alongside fixture
                 (driveTicks fixture period 2)
                 (run fixture runtime (tickConfig fixture period (Just 9) [script (scriptAt paths 0), everyTick (scriptAt paths 1)]) >>= expectRan)
             reportEnding report `shouldBe` EndedAllInstances
@@ -391,9 +391,9 @@ spec = describe "ticks" $ do
     it "admits each script only after the previous instance's init has finished, so TIDs and inits follow the script order, on a tick VM" $ bounded $ do
       fixture ← newRFixture
       withScripts [("a.lua", lua (holding "a")), ("b.lua", lua (initing "b")), ("c.lua", lua (initing "c"))] $ \paths →
-        withBoundary $ \_ runtime → do
+        withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               ( awaitGate fixture "a"
                   >> replicateM_ 300 yield
                   -- While a's init is held nothing behind it has been admitted, so no other init has run.
@@ -408,9 +408,9 @@ spec = describe "ticks" $ do
     it "admits each script only after the previous instance's init has finished, on an elapsed VM" $ bounded $ do
       fixture ← newRFixture
       withScripts [("a.lua", lua (holding "a")), ("b.lua", lua (initing "b"))] $ \paths →
-        withBoundary $ \_ runtime → do
+        withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               ( awaitGate fixture "a"
                   >> replicateM_ 300 yield
                   >> (recorded fixture `shouldReturn` ["a init"])
@@ -424,9 +424,9 @@ spec = describe "ticks" $ do
     it "admits no further script when the duration limit is reached while an init is held, and tables the instances admitted" $ bounded $ do
       fixture ← newRFixture
       withScripts [("a.lua", lua (holding "a")), ("b.lua", lua (initing "b"))] $ \paths →
-        withBoundary $ \_ runtime → do
+        withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               (awaitGate fixture "a" >> awaitLive fixture 1 >> tickClock fixture (2 * period) >> fireLive fixture >> openGate fixture "a")
               (run fixture runtime ((tickConfig fixture period Nothing (map script paths)) {runnerLimit = Just (ns period)}) >>= expectRan)
           reportEnding report `shouldBe` EndedLimit
@@ -436,9 +436,9 @@ spec = describe "ticks" $ do
     it "admits no further script when the stop request arrives while an init is held, on a tick VM" $ bounded $ do
       fixture ← newRFixture
       withScripts [("a.lua", lua (holding "a")), ("b.lua", lua (initing "b"))] $ \paths →
-        withBoundary $ \_ runtime → do
+        withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               (awaitGate fixture "a" >> setStop fixture True >> openGate fixture "a")
               (run fixture runtime (tickConfig fixture period Nothing (map script paths)) >>= expectRan)
           reportEnding report `shouldBe` EndedStopRequest
@@ -460,7 +460,7 @@ spec = describe "ticks" $ do
       withScripts [("l.lua", lua (counting "l"))] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               (awaitOut fixture 3 >> tickClock fixture (10 * period) >> setStop fixture True)
               (run fixture runtime ((tickConfig fixture period Nothing [everyTick (scriptAt paths 0)]) {runnerTick = Just maximumDuration}) >>= expectRan)
           reportEnding report `shouldBe` EndedStopRequest
@@ -472,7 +472,7 @@ spec = describe "ticks" $ do
       fixture ← newRFixture
       withScripts [("w.lua", lua ["function update(self, dt) fx.fail('host') end"]), ("ev.lua", lua (eventOnly "ev"))] $ \paths → do
         failure ← expectFatal $ \_ runtime →
-          alongside
+          alongside fixture
             -- Both timers are armed: the duration limit's and the driver's.
             (awaitLive fixture 2 >> tickClock fixture period >> fireLive fixture)
             (run fixture runtime ((tickConfig fixture period (Just 5) [everyTicks 1 (script (scriptAt paths 0)), script (scriptAt paths 1)]) {runnerLimit = Just (ns (100 * period))}) >>= \_ → pure ())

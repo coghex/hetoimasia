@@ -21,7 +21,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (FakeTimer (ftOnCancel), nanoseconds)
-import Test.LuaRuntime.Support (Broken (Broken), bounded, brokenIs, expectFatal, optionalPolicy, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Broken (Broken), Gated (..), bounded, brokenIs, expectFatal, expectFatalOpening, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
 
 blockThenFail ∷ Value → Value → TaskRequest
 blockThenFail name kind = request "block_then_fail" [name, kind] OrdinaryClass OneShot Nothing
@@ -30,7 +30,7 @@ spec ∷ Spec
 spec = describe "host failures, failure and cancellation" $ do
   it "ends only an optional owner whose classifier recognizes the failure, settling its tasks as discarded, while another owner goes on" $ bounded $ do
     fixture ← newSFixture
-    withBoundary $ \control runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \control runtime → do
       victim ← startScheduled fixture runtime (scheduled fixture "victim" (optionalPolicy (brokenIs "bang")) defaultSchedulerBounds)
       bystander ← startScheduled fixture runtime (scheduled fixture "bystander" requiredPolicy defaultSchedulerBounds)
       running ← admitTask' fixture victim "running" (blockThenFail (VText "v") (VText "bang"))
@@ -52,7 +52,7 @@ spec = describe "host failures, failure and cancellation" $ do
 
   it "leaves no admitted task unsettled when admissions race the owner's failure: admission closes as the owner begins to exit" $ bounded $ do
     fixture ← newSFixture
-    withBoundary $ \control runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \control runtime → do
       victim ← startScheduled fixture runtime (scheduled fixture "racing" (optionalPolicy (brokenIs "bang")) defaultSchedulerBounds {boundQueuedAdmissions = 4096, boundRetainedResults = 8192})
       let endpoint = scheduledEndpoint victim
       _ ← admitTask' fixture victim "bang" (request "block_then_fail" [VText "r", VText "bang"] OrdinaryClass OneShot Nothing)
@@ -248,7 +248,7 @@ spec = describe "host failures, failure and cancellation" $ do
   describe "cancellation" $ do
     it "keeps the result of a task that finished in a resumed segment a cancellation was queued during" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \control runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \control runtime → do
         owner ← startScheduled fixture runtime (scheduled fixture "resumed" requiredPolicy defaultSchedulerBounds)
         ticket ← admitTask' fixture owner "r" (request "resumes_then_blocks" [VText "r", VText "g"] OrdinaryClass OneShot Nothing)
         awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
@@ -261,7 +261,7 @@ spec = describe "host failures, failure and cancellation" $ do
 
     it "keeps the failures of closing the ended coroutine of a task whose resumed segment failed when a cancellation was queued during it" $ bounded $ do
       fixture ← newSFixture
-      ExceptionWithContext context _ ← expectFatal $ \control runtime → do
+      ExceptionWithContext context _ ← expectFatalOpening [openAllGates fixture] $ \control runtime → do
         owner ← startScheduled fixture runtime (scheduled fixture "resumed fault" (optionalPolicy (const True)) defaultSchedulerBounds)
         _ ← admitTask' fixture owner "r" (request "resumes_blocks_fails" [VText "r", VText "g"] OrdinaryClass OneShot Nothing)
         awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
@@ -275,7 +275,7 @@ spec = describe "host failures, failure and cancellation" $ do
 
     it "closes a coroutine whose task a cancellation interrupted as it first yielded, before the VM, so its close may use a state operation" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \control runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \control runtime → do
         owner ← startScheduled fixture runtime (scheduled fixture "first segment" requiredPolicy defaultSchedulerBounds)
         ticket ← admitTask' fixture owner "a" (request "blocks_then_suspends" [VText "a", VText "g"] OrdinaryClass OneShot Nothing)
         awaitEntered fixture "g"
@@ -287,7 +287,7 @@ spec = describe "host failures, failure and cancellation" $ do
 
     it "retires the coroutines as a stop does, settling the tasks as discarded by a cancellation" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \control runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \control runtime → do
         owner ← startScheduled fixture runtime (scheduled fixture "cancelled" requiredPolicy defaultSchedulerBounds)
         suspended ← admitTask' fixture owner "suspended" (request "closes_cleanly" [VText "a"] OrdinaryClass OneShot Nothing)
         awaitDiagnostics owner (\counts → diagWaiting counts >= 1)

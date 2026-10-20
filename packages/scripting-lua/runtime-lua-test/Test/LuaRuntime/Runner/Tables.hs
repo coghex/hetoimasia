@@ -9,7 +9,7 @@ import Hetoimasia.Scripting.Lua.Instance (InstancePhase (Completed, Failed), Ins
 import Hetoimasia.Scripting.Lua.Runner
 import Test.Hspec (Spec, describe, it, shouldBe, shouldNotContain, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Runner.Support
-import Test.LuaRuntime.Support (bounded, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, withBoundary, withBoundaryOpening)
 
 eventOnly ∷ Text → [Text]
 eventOnly name = ["function shutdown(self, reason) fx.record('shutdown " <> name <> " ' .. reason) end"]
@@ -32,9 +32,9 @@ spec = describe "tables and status" $ do
   it "writes the start table once every instance has initialized and the end table once the VM is retired, to the output sink only" $ bounded $ do
     fixture ← newRFixture
     withScripts [("alpha.lua", lua (eventOnly "alpha")), ("beta.lua", lua ["function run(self) fx.block('beta') end"])] $ \paths →
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         report ←
-          alongside
+          alongside fixture
             ( awaitGate fixture "beta"
                 -- The owner is held in beta's run: both instances have initialized, and the table is written.
                 >> awaitOut fixture 4
@@ -59,9 +59,9 @@ spec = describe "tables and status" $ do
       , ("b.lua", lua (["function init(self) fx.record('b init') end"] <> eventOnly "b"))
       ]
       $ \paths →
-        withBoundary $ \_ runtime → do
+        withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               -- The owner is held in a's init, and b waits to be admitted behind it. The stop request is
               -- noticed, no further script is admitted, the run asks its owner to retire, and only then
               -- is the initializer let go.
@@ -83,9 +83,9 @@ spec = describe "tables and status" $ do
       , ("b.lua", lua (["function init(self) fx.record('b init') end"] <> eventOnly "b"))
       ]
       $ \paths →
-        withBoundary $ \_ runtime → do
+        withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               (awaitGate fixture "a" >> openGate fixture "a" >> awaitOut fixture 4 >> setStop fixture True)
               (run fixture runtime (config fixture (map noWait paths)) >>= expectRan)
           out ← outLines fixture
@@ -105,7 +105,7 @@ spec = describe "tables and status" $ do
       withScripts [("e.lua", lua (eventOnly "e"))] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside (awaitOut fixture (runnerMaxScripts + 2) >> setStop fixture True) $
+            alongside fixture (awaitOut fixture (runnerMaxScripts + 2) >> setStop fixture True) $
               run fixture runtime (config fixture (replicate runnerMaxScripts (noWait (scriptAt paths 0)))) >>= expectRan
           length (instancesOf report) `shouldBe` runnerMaxScripts
           out ← outLines fixture
@@ -118,7 +118,7 @@ spec = describe "tables and status" $ do
           let long = Text.replicate 100 "n"
               scripts = [Script (scriptAt paths 0) (Just long) Nothing, Script (scriptAt paths 0) (Just "evil\nname\ESC[0m\tx") Nothing]
               configured = (config fixture scripts) {runnerName = Text.replicate 80 "v"}
-          report ← alongside (awaitOut fixture 4 >> setStop fixture True) (run fixture runtime configured >>= expectRan)
+          report ← alongside fixture (awaitOut fixture 4 >> setStop fixture True) (run fixture runtime configured >>= expectRan)
           out ← outLines fixture
           forM_ out $ \line → Text.any isControl line `shouldBe` False
           -- Every cell of the owner and name columns is at most the column limit, and a cut ends in the marker.
@@ -140,7 +140,7 @@ spec = describe "tables and status" $ do
             fixture ← newRFixture
             withScripts files $ \paths →
               withBoundary $ \_ runtime → do
-                report ← alongside (drive fixture) (run fixture runtime (configure fixture (map noWait paths)) >>= expectRan)
+                report ← alongside fixture (drive fixture) (run fixture runtime (configure fixture (map noWait paths)) >>= expectRan)
                 statusOf report `shouldBe` expected
     statusOfRun "is success when every instance completes" [completing] (\f s → config f s) (\_ → pure ()) StatusSuccess
     statusOfRun "is success when the limit ends the run" [waiting] (\f s → (config f s) {runnerLimit = Just (ns 1000000)}) (\f → awaitOut f 3 >> awaitLive f 1 >> tickClock f 1000000 >> fireLive f) StatusSuccess

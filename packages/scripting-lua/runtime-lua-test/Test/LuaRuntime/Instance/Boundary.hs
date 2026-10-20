@@ -29,7 +29,7 @@ import Test.LuaRuntime.Scheduled.Support
   , releaseGate
   , request
   )
-import Test.LuaRuntime.Support (bounded, brokenIs, expectFatal, optionalPolicy, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, brokenIs, expectFatal, expectFatalOpening, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
 
 stopped ∷ InstanceOutcome → Bool
 stopped = \case InstanceStopped → True; _ → False
@@ -39,7 +39,7 @@ spec = describe "the boundaries of service" $ do
   it "settles every request of a batch, and the ones after it, when ending an instance raises a failure of the host" $ bounded $ do
     fixture ← newIFixture
     receipts ← newIORef []
-    ExceptionWithContext _ raised ← expectFatal $ \control runtime → do
+    ExceptionWithContext _ raised ← expectFatalOpening [openAllGates fixture] $ \control runtime → do
       owner ← startInstances fixture runtime "batch" [hostShutdown, echoer, holder] (testConfig instanceBounds') requiredPolicy
       _ ← admit fixture owner "a" (moduleNamed "hostshutdown")
       _ ← admit fixture owner "b" (moduleNamed "echoer")
@@ -65,7 +65,7 @@ spec = describe "the boundaries of service" $ do
 
   it "keeps a pause and the stop behind it when the scheduler can hold one request at a time, and ends the instance" $ bounded $ do
     fixture ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       let bounds = defaultSchedulerBounds {boundControlRequests = 1}
       owner ←
         startWith fixture runtime $
@@ -137,7 +137,7 @@ spec = describe "the boundaries of service" $ do
 
   it "applies a request at the next segment boundary, not only when a turn ends: a callback released at a gate does not run on after a stop" $ bounded $ do
     fixture ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       owner ← startInstances fixture runtime "boundary" [gated] (testConfig instanceBounds') requiredPolicy
       _ ← admit fixture owner "a" (moduleNamed "gated")
       awaitPhase fixture owner "a" Active
@@ -201,7 +201,7 @@ spec = describe "the boundaries of service" $ do
 
   it "counts an invocation stopped before its first segment as an unstarted one discarded, not as a coroutine closed" $ bounded $ do
     fixture ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       owner ← startInstances fixture runtime "unbegun" [echoer, holder] (testConfig instanceBounds') requiredPolicy
       _ ← admit fixture owner "a" (moduleNamed "echoer")
       awaitPhase fixture owner "a" Active
@@ -288,7 +288,7 @@ spec = describe "the boundaries of service" $ do
 
   it "settles every request of a batch the owner was cancelled in the middle of, those it never began included" $ bounded $ do
     fixture ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       owner ← startInstances fixture runtime "cancelled batch" [echoer, gateInit, holder] (testConfig instanceBounds') requiredPolicy
       _ ← admit fixture owner "x" (moduleNamed "echoer")
       awaitPhase fixture owner "x" Active
@@ -342,7 +342,7 @@ spec = describe "the boundaries of service" $ do
 
   it "ends an instance only by the task that is its invocation in flight: a task it took back, closed first, ends nothing" $ bounded $ do
     fixture ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       -- Run the newest ready task first, so a task the instance took back stays behind
       -- its replacement and the scheduler closes it first, by identity, at retirement.
       let spec' = (instanceSpec fixture "ghost" [closingGated, holder] (testConfig instanceBounds') requiredPolicy defaultSchedulerBounds) {scheduledPolicy = newestFirst}
@@ -369,7 +369,7 @@ spec = describe "the boundaries of service" $ do
 
   it "begins nothing more once the owner is asked to stop in the middle of a batch: the rest stay unstarted" $ bounded $ do
     fixture ← newIFixture
-    withBoundary $ \control runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \control runtime → do
       owner ← startInstances fixture runtime "halted batch" [gateInit, echoer, holder] (testConfig instanceBounds') requiredPolicy
       holdOwner fixture owner
       _ ← admit fixture owner "g" (moduleNamed "gateinit")
@@ -473,7 +473,7 @@ spec = describe "the boundaries of service" $ do
     let scenario cost budget = do
           fixture ← newIFixture
           writeIORef (sfDelay (sf fixture)) cost
-          withBoundary $ \_ runtime → do
+          withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
             -- Four result places: two held by ordinary tasks nobody reads, two for the
             -- instances' invocations; a second invocation of an instance finds none until
             -- the first's place is given back.
@@ -505,7 +505,7 @@ spec = describe "the boundaries of service" $ do
     forM_ [True, False] $ \stopping → do
       -- Each on an owner of its own: the instance's init waits at a gate that opens once.
       fixture ← newIFixture
-      withBoundary $ \control runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \control runtime → do
         let bounds = defaultSchedulerBounds {boundActiveTasks = 1}
         owner ←
           startWith fixture runtime $
@@ -532,7 +532,7 @@ spec = describe "the boundaries of service" $ do
 
   it "holds a one-shot's pending run outside the event queue's bound, through initialization and a pause" $ bounded $ do
     fixture ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       let bounds = defaultSchedulerBounds {boundActiveTasks = 1}
       owner ←
         startWith fixture runtime $
@@ -604,7 +604,7 @@ spec = describe "the boundaries of service" $ do
 
   it "keeps what an ending counted when the owner is cancelled while its shutdown waits: connections revoked, events discarded" $ bounded $ do
     fixture ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       owner ← startInstances fixture runtime "cancelled hook" [gateShutdown, holder] (testConfig instanceBounds') requiredPolicy
       _ ← admit fixture owner "a" (moduleNamed "gateshutdown")
       awaitPhase fixture owner "a" Active

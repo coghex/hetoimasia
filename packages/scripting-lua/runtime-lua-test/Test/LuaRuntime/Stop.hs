@@ -22,7 +22,7 @@ spec ∷ Spec
 spec = describe "stop and retire" $ do
   it "closes admission at once, lets the in-flight call return, discards the backlog as not started and stopped, and closes the VM after" $ bounded $ do
     fixture ← newFixture
-    withBoundary $ \control runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \control runtime → do
       owner ←
         startOwner runtime $
           withChunks [gcInitChunk "closed"] (ownerSpec fixture "stopping" ["app"] requiredPolicy (bounds 4 10))
@@ -56,7 +56,7 @@ spec = describe "stop and retire" $ do
 
   it "closes admission before the VM begins to close, so a failed owner held in a finalizer answers closed and keeps its settlements and its dependencies" $ bounded $ do
     fixture ← newFixture
-    withBoundary $ \control runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \control runtime → do
       let holdsClose =
             ( chunkName "gc-block"
             , "collectgarbage('stop') holder = setmetatable({}, {__gc = function() app.gc_block('fin') end})"

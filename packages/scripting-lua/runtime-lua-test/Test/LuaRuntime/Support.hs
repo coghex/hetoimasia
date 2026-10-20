@@ -12,13 +12,22 @@ module Test.LuaRuntime.Support
   , brokenIs
     -- * The boundary
   , withBoundary
+  , withBoundaryOpening
   , quietLogger
   , recordingLogger
   , expectFatal
+  , tryBoundaryOpening
+  , tryExpected
+  , alongsideOpening
+  , expectFatalOpening
   , bounded
+  , boundedAfter
     -- * The fixture
   , Fixture (..)
   , newFixture
+  , Gated (..)
+  , gateIn
+  , openGatesIn
   , releaseGate
   , awaitEntered
   , hasEntered
@@ -59,22 +68,28 @@ module Test.LuaRuntime.Support
   , isDiscard
   ) where
 
-import Control.Concurrent (ThreadId, yield)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, readMVar, tryPutMVar, tryReadMVar)
+import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, throwTo, yield)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, readMVar, tryPutMVar, tryReadMVar, tryTakeMVar)
 import Control.Concurrent.STM (retry)
 import Control.Exception
-  ( Exception
+  ( AsyncException (ThreadKilled)
+  , Exception
   , ExceptionWithContext (ExceptionWithContext)
   , SomeException
+  , bracket_
+  , finally
   , fromException
+  , onException
   , throw
   , throwIO
+  , try
   , tryWithContext
   )
 import Control.Monad (void)
 import Data.ByteString (ByteString)
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
 import Data.Maybe (isJust)
+import Data.Unique (Unique, newUnique)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -108,7 +123,9 @@ import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Registration
 import Hetoimasia.Scripting.Lua.Runtime
 import Hetoimasia.Scripting.Lua.Value
-import System.Timeout (timeout)
+import System.IO.Unsafe (unsafePerformIO)
+import System.Timeout (Timeout, timeout)
+import Test.HUnit.Lang (HUnitFailure)
 import Test.Hspec (Expectation, expectationFailure)
 
 -- Failures ---------------------------------------------------------------------
@@ -145,6 +162,35 @@ withBoundary body =
   withLoggingLifetime quietLogger $ \lifetime →
     withSupervision lifetime $ \control → newLuaRuntime control >>= body control
 
+-- | 'withBoundary' for an example that holds a callback at a gate. The openers, which let
+-- every gate of the fixtures the example holds callbacks at go on, run if the body ends
+-- by raising anything (a failed assertion, say), and when the example's 'bounded' limit
+-- expires; so they run inside the body and before control leaves the supervised
+-- boundary, whose protected teardown waits for the callback a held gate holds. The body
+-- that returns is left as it is: it has let its own gates go.
+withBoundaryOpening ∷ [IO ()] → (RuntimeControl → LuaRuntime → IO a) → IO a
+withBoundaryOpening openers body =
+  openedAtBound openers . withBoundary $ \control runtime →
+    body control runtime `onException` sequence_ openers
+
+-- | What the example running on each thread holds callbacks at: the openers its bound runs.
+{-# NOINLINE openersAtBound #-}
+openersAtBound ∷ IORef [(ThreadId, Unique, [IO ()])]
+openersAtBound = unsafePerformIO (newIORef [])
+
+-- | Run the action with these openers registered for the 'bounded' limit of the example
+-- running on this thread. An exception the limit throws cannot always end the example at
+-- once: its thread may be inside a protected wait for the very callbacks a held gate holds,
+-- as the script runner's retirement is, and no exception ends that.
+openedAtBound ∷ [IO ()] → IO a → IO a
+openedAtBound openers action = do
+  example ← myThreadId
+  token ← newUnique
+  bracket_
+    (atomicModifyIORef' openersAtBound (\held → ((example, token, openers) : held, ())))
+    (atomicModifyIORef' openersAtBound (\held → ([entry | entry@(_, other, _) ← held, other /= token], ())))
+    action
+
 -- | Run a boundary that is expected to fail, answering the failure it ended
 -- with and keeping its context.
 expectFatal ∷ (RuntimeControl → LuaRuntime → IO a) → IO (ExceptionWithContext SomeException)
@@ -153,11 +199,87 @@ expectFatal body =
     Left failure → pure failure
     Right _ → throwIO (userError "expected the boundary to fail, but it returned")
 
--- | Stop an example that has already hung. Never a concurrency assertion.
+-- | Run a boundary that may end in a failure of the application's own, answering how
+-- it ended, as 'withBoundaryOpening' lets the gates go. What it may fail with is the
+-- application's own failure: a failed assertion of the example, or the example's
+-- 'bounded' timeout, is never taken for it, and is raised as itself.
+tryBoundaryOpening ∷ [IO ()] → (RuntimeControl → LuaRuntime → IO a) → IO (Either (ExceptionWithContext SomeException) a)
+tryBoundaryOpening openers body = tryExpected (withBoundaryOpening openers body)
+
+-- | Run an action that is expected to fail with a failure of the application's own, answering
+-- how it ended and keeping its context. A failed assertion of the example, or the example's
+-- 'bounded' timeout, is not that failure: it is raised as itself, and an example that expects
+-- a failure cannot swallow what makes it fail.
+tryExpected ∷ IO a → IO (Either (ExceptionWithContext SomeException) a)
+tryExpected action =
+  tryWithContext action >>= \case
+    Left (ExceptionWithContext _ failure)
+      | Just (_ ∷ HUnitFailure) ← fromException failure → throwIO failure
+      | Just (_ ∷ Timeout) ← fromException failure → throwIO failure
+    outcome → pure outcome
+
+-- | 'expectFatal' for an example that holds a callback at a gate, with the gates let
+-- go and the failures of the example raised as 'tryBoundaryOpening' does.
+expectFatalOpening ∷ [IO ()] → (RuntimeControl → LuaRuntime → IO a) → IO (ExceptionWithContext SomeException)
+expectFatalOpening openers body =
+  tryBoundaryOpening openers body >>= \case
+    Left failure → pure failure
+    Right _ → throwIO (userError "expected the boundary to fail, but it returned")
+
+-- | Run the helper on a thread of its own while the other action runs on this one, and
+-- answer the other's result. The helper is stopped when the other action is over,
+-- whatever it was waiting for. A helper that fails (a failed assertion, say) lets
+-- these gates go on, and then raises its failure in the thread of the other action,
+-- which is parked in a wait that depends on what the helper was to do and that no gate
+-- opening would end; and the helper's failure, not what the other action made of it,
+-- is what the example fails with.
+alongsideOpening ∷ [IO ()] → IO () → IO a → IO a
+alongsideOpening openers helper main' = do
+  example ← myThreadId
+  failed ← newEmptyMVar
+  thread ← forkIO $
+    try @SomeException helper >>= \case
+      Left failure | fromException failure /= Just ThreadKilled → do
+        putMVar failed failure
+        sequence_ openers
+        throwTo example failure
+      _ → pure ()
+  outcome ← try @SomeException main'
+  killThread thread
+  tryTakeMVar failed >>= \case
+    Just failure → throwIO failure
+    Nothing → either throwIO pure outcome
+
+-- | Stop an example that has already hung. Never a concurrency assertion. As the limit
+-- expires, the gates the example registered with 'withBoundaryOpening' are opened from a
+-- thread of their own: an example parked in a protected wait for a held callback cannot
+-- do it for itself, and the exception that interrupts it does not end that wait. The
+-- expiry is recorded before they are opened, and an example that returns once they are
+-- open has still not finished within its bound.
 bounded ∷ Expectation → Expectation
-bounded action =
-  timeout (60 * 1000 * 1000) action
-    >>= maybe (expectationFailure "the example did not finish within its bound") pure
+bounded = boundedAfter exampleBound exampleBound
+
+-- | 'bounded' with the time its gates are opened at apart from the limit the example is
+-- interrupted at, so that the examples of the helper itself can have the gates opened first.
+boundedAfter ∷ Int → Int → Expectation → Expectation
+boundedAfter openAfter limit action = do
+  example ← myThreadId
+  finished ← newEmptyMVar
+  expired ← newIORef False
+  _ ← forkIO (timeout openAfter (readMVar finished) >>= maybe (atomicWriteIORef expired True >> openAtBound example) pure)
+  outcome ← timeout limit action `finally` putMVar finished ()
+  opened ← readIORef expired
+  case outcome of
+    Just () | not opened → pure ()
+    _ → expectationFailure "the example did not finish within its bound"
+  where
+    openAtBound example = do
+      held ← readIORef openersAtBound
+      sequence_ (concat [openers | (thread, _, openers) ← held, thread == example])
+
+-- | How long an example may run, in microseconds.
+exampleBound ∷ Int
+exampleBound = 60 * 1000 * 1000
 
 -- The fixture ------------------------------------------------------------------
 
@@ -195,13 +317,37 @@ newFixture =
     <*> newIORef []
     <*> newIORef Nothing
 
--- | The gate of this name, made when first asked for.
+-- | The gate of this name, made when first asked for: open at once if the table's
+-- gates have all been let go ('openGatesIn'), as a callback that arrives at a gate
+-- nobody has named yet is let through too.
 gateIn ∷ IORef (Map Text (MVar ())) → Text → IO (MVar ())
 gateIn table name = do
   fresh ← newEmptyMVar
+  open ← newMVar ()
   atomicModifyIORef' table $ \held → case Map.lookup name held of
     Just existing → (held, existing)
-    Nothing → (Map.insert name fresh held, fresh)
+    Nothing
+      | Map.member allOpen held → (Map.insert name open held, open)
+      | otherwise → (Map.insert name fresh held, fresh)
+
+-- | The mark a table of gates carries once all of them are open. No gate has this name.
+allOpen ∷ Text
+allOpen = "\0all open"
+
+-- | Let every gate of this table go on, the ones made so far and the ones made later.
+openGatesIn ∷ IORef (Map Text (MVar ())) → IO ()
+openGatesIn table = do
+  mark ← newMVar ()
+  held ← atomicModifyIORef' table (\gates → (Map.insert allOpen mark gates, gates))
+  mapM_ (void . (`tryPutMVar` ())) held
+
+-- | A fixture that holds callbacks at gates.
+class Gated a where
+  -- | Let every gate go on, now and for good. Harmless twice, as 'releaseGate' is.
+  openAllGates ∷ a → IO ()
+
+instance Gated Fixture where
+  openAllGates = openGatesIn . fixtureGates
 
 gate ∷ Fixture → Text → IO (MVar ())
 gate fixture = gateIn (fixtureGates fixture)

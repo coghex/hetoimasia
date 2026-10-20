@@ -126,6 +126,7 @@ import Test.LuaRuntime.Scheduled.Support
   , scheduled
   , startScheduled
   )
+import Test.LuaRuntime.Support (Gated (..))
 
 -- The fixture ------------------------------------------------------------------
 
@@ -137,6 +138,9 @@ data IFixture = IFixture
   , ifIds ∷ !(IORef (Map Text InstanceId))
   , ifTickets ∷ !(IORef (Map Text InstanceTicket))
   }
+
+instance Gated IFixture where
+  openAllGates = openAllGates . ifBase
 
 newIFixture ∷ IO IFixture
 newIFixture = IFixture <$> newSFixture <*> newIORef 0 <*> newIORef Map.empty <*> newIORef Map.empty

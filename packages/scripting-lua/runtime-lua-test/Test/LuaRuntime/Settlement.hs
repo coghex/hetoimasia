@@ -74,7 +74,7 @@ spec = describe "dispatch and settlement" $ do
 
   it "settles every call exactly once across a thousand submissions interleaved with a stop" $ bounded $ do
     fixture ← newFixture
-    withBoundary $ \control runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \control runtime → do
       owner ← startOwner runtime (ownerSpec fixture "thousand" ["app"] requiredPolicy (bounds 1000 1000))
       let endpoint = ownerEndpoint owner
       -- One call is held in flight, so what follows queues behind it.

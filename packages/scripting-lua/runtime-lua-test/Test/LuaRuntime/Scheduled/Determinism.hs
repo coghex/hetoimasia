@@ -17,7 +17,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (allRegs, nanoseconds)
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundaryOpening)
 
 -- | What one run observed.
 data Observation = Observation
@@ -33,7 +33,7 @@ run ∷ Word → Maybe Word → IO Observation
 run delay budget = do
   fixture ← newSFixture
   writeIORef (sfDelay fixture) (fromIntegral delay)
-  withBoundary $ \control runtime → do
+  withBoundaryOpening [openAllGates fixture] $ \control runtime → do
     let bounds = defaultSchedulerBounds {boundServiceBudget = nanoseconds . fromIntegral <$> budget}
     owner ← startScheduled fixture runtime (scheduled fixture "deterministic" requiredPolicy bounds)
     let endpoint = scheduledEndpoint owner

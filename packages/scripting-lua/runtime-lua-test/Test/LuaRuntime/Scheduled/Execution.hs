@@ -17,7 +17,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (fireReg, liveRegs, nanoseconds)
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- | A task of the module's @spin@ entry, which records a label and a number and
 -- yields, this many times.
@@ -54,7 +54,7 @@ spec = describe "tasks run as coroutines on a scheduled owner" $ do
   describe "the FIFO default and a test policy" $ do
     it "serves ready peers in the order they were admitted, and a yielded task goes behind them" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         owner ← startScheduled fixture runtime (scheduled fixture "fifo" requiredPolicy defaultSchedulerBounds)
         tickets ← holding fixture owner (mapM (\label → admitTask' fixture owner label (ordinary label 2)) ["a", "b", "c"])
         mapM_ outcomeOf tickets
@@ -63,7 +63,7 @@ spec = describe "tasks run as coroutines on a scheduled owner" $ do
 
     it "changes only the next choice under a policy chosen at creation" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         owner ← startScheduled fixture runtime ((scheduled fixture "newest" requiredPolicy defaultSchedulerBounds) {scheduledPolicy = newestFirst})
         tickets ← holding fixture owner (mapM (\label → admitTask' fixture owner label (ordinary label 2)) ["a", "b", "c"])
         mapM_ outcomeOf tickets
@@ -73,7 +73,7 @@ spec = describe "tasks run as coroutines on a scheduled owner" $ do
   describe "classes, quanta and one-shot placement" $ do
     it "runs each class at most its quantum per turn, and a yielded task behind its ready peers" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         let bounds = defaultSchedulerBounds {boundQuanta = Quanta (Quantum 1) (Quantum 2) (Quantum 3)}
         owner ← startScheduled fixture runtime (scheduled fixture "quanta" requiredPolicy bounds)
         tickets ←
@@ -90,7 +90,7 @@ spec = describe "tasks run as coroutines on a scheduled owner" $ do
 
     it "places a one-shot where the selected policy says" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         owner ← startScheduled fixture runtime ((scheduled fixture "kinds" requiredPolicy defaultSchedulerBounds) {scheduledPolicy = oneShotsFirst})
         tickets ←
           holding fixture owner $ do
@@ -141,7 +141,7 @@ spec = describe "tasks run as coroutines on a scheduled owner" $ do
     it "ends a turn at an expired budget without preempting a segment or reordering tasks, and attributes the overruns" $ bounded $ do
       let workload bounds = do
             fixture ← newSFixture
-            withBoundary $ \_ runtime → do
+            withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
               owner ← startScheduled fixture runtime (scheduled fixture "budget" requiredPolicy bounds)
               tickets ←
                 holding fixture owner $
@@ -164,7 +164,7 @@ spec = describe "tasks run as coroutines on a scheduled owner" $ do
   describe "pause, resume and stop at safe boundaries" $ do
     it "pauses a task from another task's request, and resumes it at the tail" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         owner ← startScheduled fixture runtime (scheduled fixture "control" requiredPolicy defaultSchedulerBounds)
         (target, controller) ←
           holding fixture owner $
@@ -184,7 +184,7 @@ spec = describe "tasks run as coroutines on a scheduled owner" $ do
 
     it "applies a request about the running task when its segment returns" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         owner ← startScheduled fixture runtime (scheduled fixture "self" requiredPolicy defaultSchedulerBounds)
         ticket ← holding fixture owner (admitTask' fixture owner "s" (request "controls" [VText "s", VText "s", VText "pause"] OrdinaryClass OneShot (Just "s")))
         -- It asked for its own pause inside its first segment and yielded; the pause
@@ -201,7 +201,7 @@ spec = describe "tasks run as coroutines on a scheduled owner" $ do
 
     it "applies a stop of the running task when its segment returns, closing its coroutine" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         owner ← startScheduled fixture runtime (scheduled fixture "self stop" requiredPolicy defaultSchedulerBounds)
         ticket ← holding fixture owner (admitTask' fixture owner "k" (request "controls" [VText "k", VText "k", VText "stop"] OrdinaryClass OneShot (Just "k")))
         outcomeOf ticket >>= \case
@@ -214,7 +214,7 @@ spec = describe "tasks run as coroutines on a scheduled owner" $ do
 
     it "stops a task, closing its coroutine, and settles it as cancelled" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         owner ← startScheduled fixture runtime (scheduled fixture "stop" requiredPolicy defaultSchedulerBounds)
         (victim, killer) ←
           holding fixture owner $

@@ -46,20 +46,25 @@ spec ∷ Spec
 spec = describe "readiness" $ do
   it "is observed only after a configured module has loaded, by a module whose load records it" $ bounded $ do
     fixture ← newFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       creator ← myThreadId
       observed ← newEmptyMVar
-      _ ← forkIO $ do
-        awaitEntered fixture "load"
-        -- The module has loaded far enough to record itself, and creation has
-        -- not returned: its thread is parked in the supervised wait.
-        awaitBlockedOnSTM creator
-        noted fixture >>= putMVar observed
-        releaseGate fixture "load"
-      owner ← startOwner runtime (withModules [loader] (quickSpec fixture "loading" ["app"]))
-      takeMVar observed >>= (`shouldBe` ["loaded"])
-      noted fixture >>= (`shouldBe` ["loaded"])
-      retireOwner owner
+      alongsideOpening
+        [openAllGates fixture]
+        ( do
+            awaitEntered fixture "load"
+            -- The module has loaded far enough to record itself, and creation has
+            -- not returned: its thread is parked in the supervised wait.
+            awaitBlockedOnSTM creator
+            noted fixture >>= putMVar observed
+            releaseGate fixture "load"
+        )
+        ( do
+            owner ← startOwner runtime (withModules [loader] (quickSpec fixture "loading" ["app"]))
+            takeMVar observed >>= (`shouldBe` ["loaded"])
+            noted fixture >>= (`shouldBe` ["loaded"])
+            retireOwner owner
+        )
 
   it "fails creation, with nobody left waiting, for a failing initial chunk" $ bounded $ do
     fixture ← newFixture
@@ -107,27 +112,32 @@ spec = describe "readiness" $ do
 
   it "does not mistake the startup acknowledgement for readiness" $ bounded $ do
     fixture ← newFixture
-    withBoundary $ \control runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \control runtime → do
       creator ← myThreadId
       observed ← newEmptyMVar
-      _ ← forkIO $ do
-        awaitEntered fixture "init"
-        awaitBlockedOnSTM creator
-        -- The worker is acknowledged, the chunk is still running, and creation
-        -- has not returned.
-        status ← atomically (workerGroupStatus control)
-        putMVar observed (map outstandingAcknowledged (statusOutstanding status))
-        releaseGate fixture "init"
-      owner ←
-        startOwner runtime $
-          withChunks [(chunkName "slow", Text.encodeUtf8 "app.block('init')")] (quickSpec fixture "slow" ["app"])
-      takeMVar observed >>= (`shouldBe` [True])
-      retireOwner owner
+      alongsideOpening
+        [openAllGates fixture]
+        ( do
+            awaitEntered fixture "init"
+            awaitBlockedOnSTM creator
+            -- The worker is acknowledged, the chunk is still running, and creation
+            -- has not returned.
+            status ← atomically (workerGroupStatus control)
+            putMVar observed (map outstandingAcknowledged (statusOutstanding status))
+            releaseGate fixture "init"
+        )
+        ( do
+            owner ←
+              startOwner runtime $
+                withChunks [(chunkName "slow", Text.encodeUtf8 "app.block('init')")] (quickSpec fixture "slow" ["app"])
+            takeMVar observed >>= (`shouldBe` [True])
+            retireOwner owner
+        )
 
   it "leaves an abandoned creation owned, stopped and drained by the boundary" $ bounded $ do
     fixture ← newFixture
     outcome ← newEmptyMVar
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       creator ←
         forkIO $
           try @SomeException

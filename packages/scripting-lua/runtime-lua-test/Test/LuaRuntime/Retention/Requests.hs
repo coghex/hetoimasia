@@ -17,7 +17,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support
 import Test.LuaRuntime.Retention.Probe
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundaryOpening)
 
 -- | The most times a reading may run from the one conflicting commit until the engine reports
 -- the work over.
@@ -46,7 +46,7 @@ spec = describe "a retirement reading polled by the request service" $ do
     trace ← newTrace
     probe ← newGatedProbe trace "a"
     let grant = RequestGrant [instrumented fake (Map.fromList [(1, (probe, pure ()))])] 4 SettleOnArrival
-    withBoundary $ \_ runtime → providersFinish fake $ do
+    withBoundaryOpening [openAllGates probe] $ \_ runtime → providersFinish fake $ do
       owner ← startRequester fixture runtime "stale reading, service state" [asker] cmdConfig grant requiredPolicy
       admitAsker fixture owner "i" "asker"
       command fixture owner "i" "start" "a"
@@ -74,7 +74,7 @@ spec = describe "a retirement reading polled by the request service" $ do
     second ← newGatedProbe trace "b"
     let reads' = () <$ readTVar sharedVar
         grant = RequestGrant [instrumented fake (Map.fromList [(1, (first, reads')), (2, (second, reads'))])] 4 SettleOnArrival
-    withBoundary $ \_ runtime → providersFinish fake $ do
+    withBoundaryOpening [openAllGates first, openAllGates second] $ \_ runtime → providersFinish fake $ do
       owner ← startRequester fixture runtime "stale reading, provider state" [asker] cmdConfig grant requiredPolicy
       admitAsker fixture owner "i" "asker"
       command fixture owner "i" "start" "a"

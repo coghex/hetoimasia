@@ -6,7 +6,6 @@
 -- admissions and recorded effects however the producers' arrivals and the grants' pacing vary.
 module Test.LuaRuntime.Subscription.Logical (spec) where
 
-import Control.Exception (finally)
 import Control.Monad (forM_, void)
 import Data.List (permutations)
 import Data.Text (Text)
@@ -22,7 +21,7 @@ import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support (awaitLine, linesOf, tickReached)
 import Test.LuaRuntime.Scheduled.Support (awaitEntered, releaseGate)
 import Test.LuaRuntime.Subscription.Support
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- | An owner of subscribers on logical time, granted both endpoints with this room for held events.
 logicalOwner ∷ IFixture → FakeEvents → LuaRuntime → Text → [ModuleSource] → Int → IO ScheduledOwner
@@ -190,8 +189,7 @@ spec = describe "on an owner on logical time" $ do
     it "takes no event for a tick it will not reach: a delivery after its stop was applied is refused, not held, and takes no place in the store" $ bounded $ do
       fixture ← newIFixture
       fake ← newFakeEvents
-      -- The gate is let go however the example ends, so a failing one fails and does not hold the owner.
-      withBoundary $ \_ runtime → (`finally` releaseGate (ifBase fixture) "shutdown") $ eventsFinish fake $ do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → eventsFinish fake $ do
         owner ← logicalOwner fixture fake runtime "stopping" [gatedShutdownSubscriber] 2
         admitSubscriber fixture owner "i" "gatedshutdownsubscriber"
         subscribeTo' fixture owner "i" "a" "ticks" Nothing

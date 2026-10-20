@@ -20,7 +20,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEffect, awaitEntered, awaitScheduledTerminal, releaseGate, withChunks)
-import Test.LuaRuntime.Support (bounded, expectFatal, optionalPolicy, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, expectFatal, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
 import qualified Data.Text.Encoding as Text
 import Hetoimasia.Scripting.Lua.Owner (chunkName)
 
@@ -105,7 +105,7 @@ spec = describe "admission" $ do
   it "refuses a request once the owner has been asked to stop, without asking the provider" $ bounded $ do
     fixture ← newIFixture
     fake ← newFake
-    withBoundary $ \control runtime → providersFinish fake $ do
+    withBoundaryOpening [openAllGates fixture] $ \control runtime → providersFinish fake $ do
       owner ← startRequester fixture runtime "stopping" [asker] cmdConfig (grantOf fake 4) requiredPolicy
       admitAsker fixture owner "i" "asker"
       command fixture owner "i" "block_start" "gate"

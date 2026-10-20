@@ -20,7 +20,7 @@ import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Lifecycle.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEffect, awaitScheduledTerminal)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (bounded, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, withBoundary, withBoundaryOpening)
 
 takenAs ∷ Int → Text
 takenAs number = "{accepted=true,receipt=" <> Text.pack (show number) <> "}"
@@ -293,7 +293,7 @@ spec = describe "logical admission" $ do
       -- update newly due, one interval after it, is at tick 2.
       updates ← forM [True, False] $ \batched → do
         targetFx ← newIFixture
-        withBoundary $ \control runtime → do
+        withBoundaryOpening [openAllGates targetFx] $ \control runtime → do
           owner ← startTarget targetFx runtime "target" [echoer, holder] logicalConfig
           _ ← admitWith targetFx owner "p" (InstanceRequest (moduleNamed "echoer") (Periodic (LogicalTicks 1)) (Just "p") OrdinaryClass ["tick"])
           awaitPhase targetFx owner "p" Active

@@ -32,7 +32,7 @@ import Test.LuaRuntime.Instance.Lease.Support
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Retention.Probe
 import Test.LuaRuntime.Scheduled.Support (awaitScheduledTerminal)
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundaryOpening)
 
 -- | The most times a reading may run from the one conflicting commit until the engine reports
 -- the retirement over.
@@ -48,6 +48,13 @@ data World = World
   , wSentinel ∷ !(Maybe (TVar Int))
     -- ^ A TVar every reading writes when it runs: nothing it writes is kept.
   }
+
+-- | The providers prove every retirement they were handed over, as the example does when its
+-- checks are over, and as it must however it ends, or the owner waits for them for ever.
+completeProviders ∷ IORef (Map Text (TVar RetirementState)) → IO ()
+completeProviders providers = do
+  held ← readIORef providers
+  atomically (mapM_ (`writeTVar` ProviderComplete) (Map.elems held))
 
 -- | A resource whose provider retires it later, whose reading is instrumented and reads the
 -- sharedVar TVar.
@@ -133,7 +140,7 @@ spec = describe "a retirement reading polled for the leases" $ do
     second ← newGatedProbe trace "b"
     let world = World sharedVar providers (Map.fromList [("a", first), ("b", second)]) Nothing
         base = lfBase fixture
-    withBoundary $ \control runtime → do
+    withBoundaryOpening [openAllGates second, openAllGates fixture, completeProviders providers] $ \control runtime → do
       owner ← startWith base runtime (staleSpec fixture world "stale lease reading" [pair])
       _ ← admit base owner "p" (moduleNamed "stalepair")
       awaitPhase base owner "p" Active
@@ -145,7 +152,6 @@ spec = describe "a retirement reading polled for the leases" $ do
       take 2 entered `shouldBe` ["b", "a"]
       -- The one conflicting commit: the application writes the shared TVar.
       commitThen second (atomically (modifyTVar' sharedVar (+ 1)))
-      held ← readIORef providers
-      atomically (mapM_ (`writeTVar` ProviderComplete) (Map.elems held))
+      completeProviders providers
       _ ← awaitScheduledTerminal control owner
       runsAfterCommit second >>= (`shouldSatisfy` (<= bound))
