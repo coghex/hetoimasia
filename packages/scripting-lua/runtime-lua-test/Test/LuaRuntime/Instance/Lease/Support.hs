@@ -47,6 +47,7 @@ module Test.LuaRuntime.Instance.Lease.Support
   , dependentHolder
   , closingDependent
   , dependentNowHolder
+  , dependentTwoHolder
   , dependentRollback
   , cycler
   , overCapacity
@@ -299,6 +300,31 @@ dependent fixture name retirements = do
   _ ← asynchronous fixture name retirements
   pure name
 
+-- A resource retired by a provider that finishes later, over two devices: when the retirement
+-- completes the owner disposes of them in order, the first raising and the second waiting at the
+-- release gate, so the owner is inside the disposals with a failure caught and not yet kept.
+dependentTwo ∷ LFix → Text → Retirements → Assembly Text
+dependentTwo fixture name retirements = do
+  _ ←
+    acquirePart
+      (name <> ".first")
+      (releaseRank 2)
+      (note fixture ("acquire " <> name <> ".first"))
+      (\_ → afterRetirement retirements (note fixture ("dispose " <> name <> ".first") >> throwIO (Broken ("dispose " <> name <> ".first"))))
+  _ ←
+    acquirePart
+      (name <> ".second")
+      (releaseRank 1)
+      (note fixture ("acquire " <> name <> ".second"))
+      ( \_ →
+          afterRetirement retirements $ do
+            note fixture ("dispose " <> name <> ".second")
+            void (tryPutMVar (lfEntered fixture) ())
+            readMVar (lfProceed fixture)
+      )
+  _ ← asynchronous fixture name retirements
+  pure name
+
 -- A resource released at once, over a device whose disposal is handed over all the same:
 -- nothing is pending, so it is disposed of inside the release.
 dependentNow ∷ LFix → Text → Retirements → Assembly Text
@@ -338,6 +364,7 @@ leaseNamespace fixture =
     , opening "open_async" (\name retirements → asynchronous fixture name retirements)
     , opening "open_dependent" (dependent fixture)
     , opening "open_dependent_now" (dependentNow fixture)
+    , opening "open_dependent_two" (dependentTwo fixture)
     , opening "open_dependent_failing" $ \name retirements → do
         _ ← dependent fixture name retirements
         restoredStep (throwIO (Broken "constructor"))
@@ -678,6 +705,21 @@ closingDependent =
 
 -- | Holds a resource released at once over a device whose disposal it hands over, and
 -- releases it on a tick.
+-- | Holds an asynchronously retired resource over two devices, and releases it on a tick, which leaves
+-- the instance active.
+dependentTwoHolder ∷ ModuleSource
+dependentTwoHolder =
+  hooksModule
+    "dependenttwoholder"
+    [ "function init(self, api)"
+    , "  self.id = inst.next()"
+    , "  self.h = lease.open_dependent_two('dep2-res')"
+    , "  api.connect('tick', function(self, event)"
+    , "    " <> record <> "('release ' .. lease.release(self.h))"
+    , "  end)"
+    , "end"
+    ]
+
 dependentNowHolder ∷ ModuleSource
 dependentNowHolder =
   hooksModule

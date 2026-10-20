@@ -3,6 +3,7 @@
 -- need no VM.
 module Test.LuaRuntime.Spec (spec) where
 
+import qualified Test.LuaRuntime.Accounting.Spec
 import qualified Test.LuaRuntime.Callbacks
 import qualified Test.LuaRuntime.Dependencies
 import qualified Test.LuaRuntime.HostFailures
@@ -35,6 +36,7 @@ spec = describe "the Lua runtime adapter" $ do
   Test.LuaRuntime.Callbacks.spec
   Test.LuaRuntime.Scheduler.Spec.spec
   Test.LuaRuntime.Scheduled.Spec.spec
+  Test.LuaRuntime.Accounting.Spec.spec
   Test.LuaRuntime.Instance.Spec.spec
   Test.LuaRuntime.Lifecycle.Spec.spec
   Test.LuaRuntime.Request.Spec.spec

@@ -1444,7 +1444,13 @@ beginEnding' ih cell reason primary = mask_ $ do
   -- cancellation cannot land between them and leave the counts unwritten. The
   -- instance's periodic demand is cancelled with it, and a tick its due update held is
   -- let go.
-  (connections, unstarted, already) ← atomically (beginEnding cell <* stopCadence (scheduler' ih) (CadenceKey (icId cell)))
+  -- The owner's accounting is told in the same step: an ending that has begun is owed to the
+  -- application's wait for the owner's accounting until it has settled and its escalation has
+  -- returned, and there is no moment in which it has begun and is not counted.
+  (connections, unstarted, already) ← atomically $ do
+    begun@(_, _, began) ← beginEnding cell <* stopCadence (scheduler' ih) (CadenceKey (icId cell))
+    unless began (endingBegun (ihControl ih) (icId cell))
+    pure begun
   unless already $
     modifyIORef' (ihEndings ih) (Map.insert (icId cell) (Ending reason primary connections unstarted 0 ShutdownUndecided))
 
@@ -1754,13 +1760,19 @@ settleEnding ih cell = do
     modifyIORef' (ihCreated ih) (Set.delete (icId cell))
     tell restore mode won failure
   where
-    tell restore mode won failure = case (won, failure) of
-      (True, Just failed) → do
-        decision ← restore (ihEscalate ih failed)
-        case mode of
-          Unorderly _ → pure ()
-          _ → when (decision == Escalate) $ throwIO (InstanceEscalated failed)
-      _ → pure ()
+    -- The ending is accounted for once the application has been told and has answered: not
+    -- when the instance settles, which is readable before the telling, and not when the
+    -- answer is to escalate or the telling raises, which end the owner and leave the ending
+    -- owed.
+    tell restore mode won failure = do
+      case (won, failure) of
+        (True, Just failed) → do
+          decision ← restore (ihEscalate ih failed)
+          case mode of
+            Unorderly _ → pure ()
+            _ → when (decision == Escalate) $ throwIO (InstanceEscalated failed)
+        _ → pure ()
+      when won (atomically (endingAccounted (ihControl ih) (icId cell)))
 
 -- Exit ---------------------------------------------------------------------------------------
 
