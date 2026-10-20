@@ -11,7 +11,7 @@ module Test.LuaRuntime.Readiness (spec) where
 import Control.Concurrent (forkIO, myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
-import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwTo, try)
+import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, throwTo, try)
 import Data.Text (Text)
 import qualified Data.Text.Encoding as Text
 import Hetoimasia.Foundation.Worker (GroupStatus (statusOutstanding), OutstandingWorker (outstandingAcknowledged))
@@ -19,6 +19,7 @@ import Hetoimasia.Runtime.Supervision (workerGroupStatus)
 import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Runtime
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger))
+import Test.HUnit.Lang (HUnitFailure)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Support
 
@@ -152,7 +153,10 @@ spec = describe "readiness" $ do
       -- parked in the readiness wait.
       awaitBlockedOnSTM creator
       throwTo creator ThreadKilled
-      takeMVar outcome >>= (`shouldSatisfy` maybe False ((== Just ThreadKilled) . fromException))
+      -- The creator ends with the exception thrown to it; a failed assertion it raised first is not that.
+      takeMVar outcome >>= \case
+        Just failure | Just (assertion ∷ HUnitFailure) ← fromException failure → throwIO assertion
+        ended → ended `shouldSatisfy` maybe False ((== Just ThreadKilled) . fromException)
       releaseGate fixture "init"
       -- The adapter asked the owner to stop, so with its initialization done it
       -- stops and closes its VM, which its finalizer says, while the boundary
