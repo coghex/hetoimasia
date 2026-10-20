@@ -144,7 +144,9 @@ The driver's `stepTick`:
    stop with `requestStop`, which waits for nothing, so a stop never waits beside the driver. The admissions of tasks
    that are in flight are waited for next (a task the owner accepted runs, and can fault in the tick, before its
    admitter has registered it), and then the faults of the tasks the session admitted are read, though each was told
-   when it happened, by the task's own watcher.
+   when it happened, by the task's own watcher. Nothing stops another admission beginning after that, so the commit
+   (step 6) checks, in its own transaction, that none is in flight and none has begun since the tasks were read, and
+   the driver reads again if one has: admission is either excluded or detected from the first reading to the commit.
 5. **Decide.** A failure told of fails the session and commits nothing; a stop commits nothing; otherwise the
    tick commits only if its work **finished successfully**: gameplay called `staging.finish()` and the instance
    is active with nothing in flight and no update owed, or the engine says why there is no work (the behavior
