@@ -1402,9 +1402,12 @@ gap and found the fence insufficient even when it runs:
   (`Scheduler.hs` grant completion; README's scheduled-owner and cadence
   sections): every task the grant woke stopped being ready or running, including
   by a wait that was refused or a failure. Its one-line summary ("the work it
-  made due has finished") overstates this. A refused wait can expose zero
-  outstanding grants before the coroutine is closed and the instance layer has
-  settled the ending in the owner's boundary action.
+  made due has finished") overstates this. A grant can leave the queue before
+  the owner's boundary action has run the closes it owes (a task stopped by a
+  control, or ended when a grant is applied) and before the instance layer has
+  settled the endings of the tick's work. (A refused wait reported by a segment
+  is closed before its grant completes, `closeOwed` in `runSegment`; corrected
+  by LUA-31's drafting.)
 - An ending's settlement is readable before the escalation callback is called
   and returns, and an ending held by asynchronous retirement (D-27) notifies
   only once its pending obligations are done. A no-op task proves passage
