@@ -12,7 +12,7 @@
 -- the rest are here.
 module Test.LuaRuntime.Accounting.Evidence (spec) where
 
-import Control.Exception (throwIO)
+import Control.Exception (finally, throwIO)
 import Control.Monad (void, when)
 import Data.IORef (writeIORef)
 import Hetoimasia.Scripting.Lua.Instance
@@ -81,7 +81,7 @@ spec = describe "cleanup evidence the owner retains" $ do
     it "ends the wait with a lease's failed retirement" $ bounded $ do
       fixture ← newLFix 4
       let base = lfBase fixture
-      failingWait fixture [] $ \control runtime → providersFinish fixture $ do
+      failingWait (sf base) [] $ \control runtime → providersFinish fixture $ do
         owner ← startLeased fixture runtime "retirement failed" [retiresOnStop] leaseConfig requiredPolicy
         _ ← admit base owner "a" (moduleNamed "retiresonstop")
         awaitPhase base owner "a" Active
@@ -97,7 +97,7 @@ spec = describe "cleanup evidence the owner retains" $ do
       fixture ← newLFix 4
       let base = lfBase fixture
       breakRelease fixture "drain-res"
-      failingWait fixture [] $ \control runtime → providersFinish fixture $ do
+      failingWait (sf base) [] $ \control runtime → providersFinish fixture $ do
         owner ← startLeased fixture runtime "drain failed" [drainsBroken] leaseConfig requiredPolicy
         _ ← admit base owner "a" (moduleNamed "drainsbroken")
         awaitPhase base owner "a" Active
@@ -114,7 +114,7 @@ spec = describe "cleanup evidence the owner retains" $ do
     it "does not complete while the owner is between two disposals, the first having raised, though no instance is ending" $ bounded $ do
       fixture ← newLFix 4
       let base = lfBase fixture
-      failingWait fixture [] $ \control runtime → providersFinish fixture $ do
+      failingWait (sf base) [] $ \control runtime → (`finally` proceedRelease fixture) . providersFinish fixture $ do
         owner ← startLeased fixture runtime "two disposals" [dependentTwoHolder] leaseConfig requiredPolicy
         _ ← admit base owner "a" (moduleNamed "dependenttwoholder")
         awaitPhase base owner "a" Active
@@ -135,7 +135,7 @@ spec = describe "cleanup evidence the owner retains" $ do
       fixture ← newLFix 4
       let base = lfBase fixture
       breakRelease fixture "dep-res.device"
-      failingWait fixture [] $ \control runtime → providersFinish fixture $ do
+      failingWait (sf base) [] $ \control runtime → providersFinish fixture $ do
         owner ← startLeased fixture runtime "disposal failed" [dependentHolder] leaseConfig requiredPolicy
         _ ← admit base owner "a" (moduleNamed "dependentholder")
         awaitPhase base owner "a" Active
@@ -153,7 +153,7 @@ spec = describe "cleanup evidence the owner retains" $ do
       fake ← Request.newFake
       told ← newGate
       Request.onCancel fake (\index → if index == 0 then throwIO (Broken "cancel 0") else passGate told)
-      failingWait fixture [told] $ \control runtime → Request.providersFinish fake $ do
+      failingWait (sf fixture) [told] $ \control runtime → Request.providersFinish fake $ do
         owner ← Request.startRequester fixture runtime "told in a batch" [Request.asker] Request.cmdConfig (Request.grantOf fake 4) requiredPolicy
         Request.admitAsker fixture owner "i" "asker"
         Request.command fixture owner "i" "start" "a"
@@ -180,7 +180,7 @@ spec = describe "cleanup evidence the owner retains" $ do
       -- The one provider told holds the owner at a gate and then raises: nothing is kept for the batch
       -- (it has no other failure), and the exception leaves the owner's loop and ends it.
       Request.onCancel fake (\_ → passGate told >> throwIO (Broken "cancel"))
-      failingWait fixture [told] $ \control runtime → Request.providersFinish fake $ do
+      failingWait (sf fixture) [told] $ \control runtime → Request.providersFinish fake $ do
         owner ← Request.startRequester fixture runtime "told alone" [Request.asker] Request.cmdConfig (Request.grantOf fake 4) requiredPolicy
         Request.admitAsker fixture owner "i" "asker"
         Request.command fixture owner "i" "start" "a"
@@ -198,7 +198,7 @@ spec = describe "cleanup evidence the owner retains" $ do
       fixture ← newIFixture
       fake ← Request.newFake
       Request.onCancel fake (\_ → throwIO (Broken "cancel"))
-      failingWait fixture [] $ \control runtime → Request.providersFinish fake $ do
+      failingWait (sf fixture) [] $ \control runtime → Request.providersFinish fake $ do
         owner ← Request.startRequester fixture runtime "request told" [Request.asker] Request.cmdConfig (Request.grantOf fake 4) requiredPolicy
         Request.admitAsker fixture owner "i" "asker"
         Request.command fixture owner "i" "start" "a"

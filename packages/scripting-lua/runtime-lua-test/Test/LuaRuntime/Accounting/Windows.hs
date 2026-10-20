@@ -10,7 +10,8 @@ module Test.LuaRuntime.Accounting.Windows (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, tryReadMVar)
 import Control.Concurrent.STM (atomically, writeTVar)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException, throwIO)
+import System.Timeout (Timeout)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, try)
 import Control.Monad (forM_, void, when)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Maybe (isJust)
@@ -26,7 +27,7 @@ import Test.LuaRuntime.Instance.Lease.Support
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (awaitDiagnostics, awaitEffect, awaitEntered, awaitIdle, awaitScheduledTerminal, blockOn, defaultSchedulerBounds, releaseGate, setClockHook)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (Broken (Broken), Gated (..), bounded, brokenIs, expectFatalOpening, optionalPolicy, requiredPolicy, tryBoundaryOpening, withBoundaryOpening)
+import Test.LuaRuntime.Support (Broken (Broken), bounded, brokenIs, expectFatal, optionalPolicy, requiredPolicy, withBoundary)
 
 -- | What a wait ended with, failing if it raised.
 answer ∷ PendingWait → IO AccountingWait
@@ -41,7 +42,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
   describe "each window on its own" $ do
     it "does not return while the owner closes a stopped instance's coroutine at a boundary after the grants finished" $ bounded $ do
       fixture ← newIFixture
-      withBoundaryOpening [openAllGates fixture] $ \control runtime → do
+      withBoundary $ \control runtime → releasing (sf fixture) [] $ do
         owner ← startInstances fixture runtime "closure" [stoppableClosing, holder] (testConfig instanceBounds') requiredPolicy
         _ ← admit fixture owner "c" (moduleNamed "stoppableclosing")
         awaitPhase fixture owner "c" Active
@@ -69,7 +70,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
 
     it "does not return while the owner closes the coroutine of a refused wait" $ bounded $ do
       fixture ← newIFixture
-      withBoundaryOpening [openAllGates fixture] $ \control runtime → do
+      withBoundary $ \control runtime → releasing (sf fixture) [] $ do
         owner ← startInstances fixture runtime "refused closure" [refusedClosing] (testConfig instanceBounds') requiredPolicy
         _ ← admit fixture owner "r" (moduleNamed "refusedclosing")
         awaitPhase fixture owner "r" Active
@@ -87,7 +88,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
 
     it "does not return while the instance's shutdown runs, which is after tick completion has returned" $ bounded $ do
       fixture ← newIFixture
-      withBoundaryOpening [openAllGates fixture] $ \control runtime → do
+      withBoundary $ \control runtime → releasing (sf fixture) [] $ do
         owner ← startInstances fixture runtime "shutdown" [refusedGatedShutdown] (testConfig instanceBounds') requiredPolicy
         _ ← admit fixture owner "s" (moduleNamed "refusedgatedshutdown")
         awaitPhase fixture owner "s" Active
@@ -109,7 +110,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
     it "does not return while a provider owes a retirement, and returns when it completes with nothing else happening" $ bounded $ do
       fixture ← newLFix 4
       let base = lfBase fixture
-      withBoundaryOpening [openAllGates fixture] $ \control runtime → providersFinish fixture $ do
+      withBoundary $ \control runtime → releasing (sf (lfBase fixture)) [] $ providersFinish fixture $ do
         owner ← startLeased fixture runtime "retirement" [refusedLeased] leaseConfig requiredPolicy
         _ ← admit base owner "r" (moduleNamed "refusedleased")
         awaitPhase base owner "r" Active
@@ -133,7 +134,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
     it "returns when a retirement completes after the turn's final boundary, before the owner settles what that turn ended" $ bounded $ do
       fixture ← newLFix 4
       let base = lfBase fixture
-      withBoundaryOpening [openAllGates fixture] $ \control runtime → providersFinish fixture $ do
+      withBoundary $ \control runtime → releasing (sf base) [] $ providersFinish fixture $ do
         let budgeted = defaultSchedulerBounds {boundServiceBudget = Just (nanoseconds 1000000000)}
             leased = leaseSpec fixture "late" [refusedLeased] leaseConfig requiredPolicy
         owner ← startWith base runtime leased {scheduledBounds = budgeted}
@@ -172,7 +173,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
     it "does not return while the application's escalation runs, though the instance's settlement can be read" $ bounded $ do
       fixture ← newIFixture
       escalation ← newGate
-      withBoundaryOpening [openAllGates fixture, openGate escalation] $ \control runtime → do
+      withBoundary $ \control runtime → releasing (sf fixture) [escalation] $ do
         owner ← startInstances fixture runtime "escalation" [refusedAfterTick] (gatedEscalation escalation) requiredPolicy
         _ ← admit fixture owner "e" (moduleNamed "refusedaftertick")
         awaitPhase fixture owner "e" Active
@@ -194,7 +195,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
     it "covers the endings already begun when no grant is outstanding, and returns once the application has been told of a failure" $ bounded $ do
       fixture ← newIFixture
       escalation ← newGate
-      withBoundaryOpening [openAllGates fixture, openGate escalation] $ \control runtime → do
+      withBoundary $ \control runtime → releasing (sf fixture) [escalation] $ do
         owner ← startInstances fixture runtime "no grant" [failCallback] (gatedEscalation escalation) requiredPolicy
         _ ← admit fixture owner "f" (moduleNamed "failcallback")
         awaitPhase fixture owner "f" Active
@@ -214,7 +215,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
   describe "after the instances have ended" $ do
     it "returns once every instance has been stopped and awaited, on an owner that was granted nothing" $ bounded $ do
       fixture ← newIFixture
-      withBoundaryOpening [openAllGates fixture] $ \control runtime → do
+      withBoundary $ \control runtime → releasing (sf fixture) [] $ do
         owner ← startInstances fixture runtime "all stopped" [echoer] (testConfig instanceBounds') requiredPolicy
         let names = ["a", "b", "c"]
         forM_ names $ \name → admit fixture owner name (moduleNamed "echoer") >> awaitPhase fixture owner name Active
@@ -227,7 +228,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
       fixture ← newIFixture
       told ← newIORef (0 ∷ Int)
       let config = (testConfig instanceBounds') {instanceEscalate = \_ → atomicModifyIORef' told (\n → (n + 1, ())) >> pure Isolate}
-      withBoundaryOpening [openAllGates fixture] $ \control runtime → do
+      withBoundary $ \control runtime → releasing (sf fixture) [] $ do
         owner ← startInstances fixture runtime "told" [refusedAfterTick] config requiredPolicy
         forM_ [1 .. 30 ∷ Int] $ \round' → do
           let name = "r" <> Text.pack (show round')
@@ -249,7 +250,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
       let base = lfBase fixture
           config = leaseConfig {instanceEscalate = \_ → passGate escalation >> pure Isolate}
           endpoint = scheduledEndpoint
-      withBoundaryOpening [openAllGates fixture, openGate escalation] $ \control runtime → providersFinish fixture $ do
+      withBoundary $ \control runtime → releasing (sf (lfBase fixture)) [escalation] $ providersFinish fixture $ do
         owner ← startLeased fixture runtime "cutoff" [overflowLeased, windowTasks] config requiredPolicy
         _ ← admit base owner "v" (moduleNamed "overflowleased")
         awaitPhase base owner "v" Active
@@ -291,7 +292,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
       it ("ends with a " <> label <> " owner once it has ended, and never as a completion, though its last ending is accounted for during the exit") $ bounded $ do
         fixture ← newLFix 4
         let base = lfBase fixture
-        withBoundaryOpening [openAllGates fixture] $ \control runtime → providersFinish fixture $ do
+        withBoundary $ \control runtime → releasing (sf (lfBase fixture)) [] $ providersFinish fixture $ do
           owner ← startLeased fixture runtime ("owed " <> Text.pack label) [asyncHolder] leaseConfig requiredPolicy
           _ ← admit base owner "a" (moduleNamed "asyncholder")
           awaitPhase base owner "a" Active
@@ -317,7 +318,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
       outcome ← newEmptyMVar
       -- The boundary ends with the instance accounted for and the close's failure retained, and a ready
       -- task keeps the owner serving: only the wait could say the owner had finished well, and it must not.
-      _ ← tryBoundaryOpening [openAllGates fixture] $ \control runtime → do
+      stalled ← try @SomeException . withBoundary $ \control runtime → releasing (sf fixture) [] $ do
         owner ← startInstances fixture runtime "close fails" [closeRaises, holder, plainModule] (testConfig instanceBounds') requiredPolicy
         _ ← admit fixture owner "c" (moduleNamed "closeraises")
         awaitPhase fixture owner "c" Active
@@ -338,8 +339,11 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         awaitPending waiting
         releaseGate (sf fixture) "blk"
         resultOf waiting >>= putMVar outcome
-      -- The boundary may end with the failure the wait carried; a failed assertion of the example and a timeout
-      -- of its bound are not that failure, and are not swallowed.
+      -- The boundary may end with the failure the wait carried; a timeout of this example's bound is not that
+      -- failure, and is not swallowed.
+      case stalled of
+        Left raised | Just (_ ∷ Timeout) ← fromException raised → throwIO raised
+        _ → pure ()
       tryReadMVar outcome >>= \case
         Nothing → fail "the example recorded no outcome for the wait"
         Just result → either (const (pure ())) (\answered → fail ("the wait answered " <> show answered)) result
@@ -356,7 +360,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
                   Just "c" → passGate lastTold >> pure Isolate
                   _ → pure Isolate
               }
-      _ ← tryBoundaryOpening [openAllGates fixture, openGate lastTold] $ \control runtime → providersFinish fixture $ do
+      stalled ← try @SomeException . withBoundary $ \control runtime → releasing (sf base) [lastTold] $ providersFinish fixture $ do
         owner ← startLeased fixture runtime "deferred" [retiresThenFails, retiresOnStop, retiresThenFailsLast] config requiredPolicy
         -- The lower number is the one that fails, and is settled first when both retirements complete.
         _ ← admit base owner "b" (moduleNamed "retiresthenfails")
@@ -385,6 +389,9 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         awaitPending waiting
         openGate lastTold
         resultOf waiting >>= putMVar outcome
+      case stalled of
+        Left raised | Just (_ ∷ Timeout) ← fromException raised → throwIO raised
+        _ → pure ()
       tryReadMVar outcome >>= \case
         Nothing → fail "the example recorded no outcome for the wait"
         Just result → either (const (pure ())) (\answered → fail ("the wait answered " <> show answered)) result
@@ -394,7 +401,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
           recognizes failure = isJust (fromException failure ∷ Maybe InstanceEscalated) || brokenIs "callback" failure
       it ("rethrows the fatal failure " <> label <> " ends a required owner with, and never completes") $ bounded $ do
         fixture ← newIFixture
-        ExceptionWithContext _ raised ← expectFatalOpening [openAllGates fixture] $ \control runtime → do
+        ExceptionWithContext _ raised ← expectFatal $ \control runtime → releasing (sf fixture) [] $ do
           owner ← startInstances fixture runtime "required" [refusedAfterTick] config requiredPolicy
           _ ← admit fixture owner "e" (moduleNamed "refusedaftertick")
           awaitPhase fixture owner "e" Active
@@ -407,7 +414,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
 
       it ("ends with an optional owner that " <> label <> " ends, once supervision has handled it, and never as a completion") $ bounded $ do
         fixture ← newIFixture
-        withBoundaryOpening [openAllGates fixture] $ \control runtime → do
+        withBoundary $ \control runtime → releasing (sf fixture) [] $ do
           owner ← startInstances fixture runtime "optional" [refusedAfterTick] config (optionalPolicy recognizes)
           _ ← admit fixture owner "e" (moduleNamed "refusedaftertick")
           awaitPhase fixture owner "e" Active
