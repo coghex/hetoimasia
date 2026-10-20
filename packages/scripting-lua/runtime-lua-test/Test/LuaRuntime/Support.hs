@@ -21,6 +21,7 @@ module Test.LuaRuntime.Support
   , alongsideOpening
   , expectFatalOpening
   , bounded
+  , boundedAfter
     -- * The fixture
   , Fixture (..)
   , newFixture
@@ -86,7 +87,7 @@ import Control.Exception
   )
 import Control.Monad (void)
 import Data.ByteString (ByteString)
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
 import Data.Maybe (isJust)
 import Data.Unique (Unique, newUnique)
 import Data.Map.Strict (Map)
@@ -252,14 +253,25 @@ alongsideOpening openers helper main' = do
 -- | Stop an example that has already hung. Never a concurrency assertion. As the limit
 -- expires, the gates the example registered with 'withBoundaryOpening' are opened from a
 -- thread of their own: an example parked in a protected wait for a held callback cannot
--- do it for itself, and the exception that interrupts it does not end that wait.
+-- do it for itself, and the exception that interrupts it does not end that wait. The
+-- expiry is recorded before they are opened, and an example that returns once they are
+-- open has still not finished within its bound.
 bounded ∷ Expectation → Expectation
-bounded action = do
+bounded = boundedAfter exampleBound exampleBound
+
+-- | 'bounded' with the time its gates are opened at apart from the limit the example is
+-- interrupted at, so that the examples of the helper itself can have the gates opened first.
+boundedAfter ∷ Int → Int → Expectation → Expectation
+boundedAfter openAfter limit action = do
   example ← myThreadId
   finished ← newEmptyMVar
-  _ ← forkIO (timeout exampleBound (readMVar finished) >>= maybe (openAtBound example) pure)
-  (timeout exampleBound action `finally` putMVar finished ())
-    >>= maybe (expectationFailure "the example did not finish within its bound") pure
+  expired ← newIORef False
+  _ ← forkIO (timeout openAfter (readMVar finished) >>= maybe (atomicWriteIORef expired True >> openAtBound example) pure)
+  outcome ← timeout limit action `finally` putMVar finished ()
+  opened ← readIORef expired
+  case outcome of
+    Just () | not opened → pure ()
+    _ → expectationFailure "the example did not finish within its bound"
   where
     openAtBound example = do
       held ← readIORef openersAtBound

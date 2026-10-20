@@ -3,11 +3,12 @@
 -- hang in the protected teardown that waits for the callbacks they hold.
 module Test.LuaRuntime.Gates (spec) where
 
-import Control.Concurrent.MVar (tryReadMVar)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), throwIO)
-import Control.Monad (forM_)
+import Control.Concurrent.MVar (newEmptyMVar, readMVar, tryPutMVar, tryReadMVar)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), throwIO, try)
+import Control.Monad (forM_, void)
 import Hetoimasia.Scripting.Lua.Runtime (ownerEndpoint)
 import Hetoimasia.Scripting.Lua.Value
+import Test.HUnit.Lang (HUnitFailure)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Support
 
@@ -47,3 +48,12 @@ spec = describe "the gates a boundary opens when an example fails" $ do
     case ended of
       Left (ExceptionWithContext _ raised) → raised `shouldSatisfy` brokenIs "helper"
       Right _ → fail "the failure of the helper was lost"
+
+  it "fails an example that returned only because its bound had opened its gates, and does not let it pass" $ bounded $ do
+    gate' ← newEmptyMVar
+    -- The gates are opened at a tenth of a second, the example's own limit is a minute: it returns
+    -- as soon as they are open, long before the limit, and must fail all the same.
+    outcome ← try @HUnitFailure . boundedAfter 100000 (60 * 1000 * 1000) $
+      withBoundaryOpening [void (tryPutMVar gate' ())] $ \_ _ → readMVar gate'
+    outcome `shouldSatisfy` either (const True) (const False)
+
