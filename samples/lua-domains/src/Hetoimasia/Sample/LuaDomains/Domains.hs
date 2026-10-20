@@ -1101,9 +1101,9 @@ faultOf = \case
 -- watcher may not have run yet), and answer the admissions entered when it began. The admissions in flight are waited for
 -- first, however the session stands: a task the owner accepted runs, and can fault, before its admitter has registered it,
 -- so a decision made without waiting would see neither the task nor its fault. An admission waits for nothing, so this is
--- brief. Nothing stops another admission beginning after: the answer is what the decision checks is still the number of
--- admissions entered, in the transaction that decides and in the one that commits ('admissionsStable'), and the
--- observation is made again if it moved.
+-- brief. Nothing stops another admission beginning after: the answer is what the commit checks is still the number of
+-- admissions entered, with none in flight, in the transaction that commits ('admissionsStable'), and the observation is
+-- made again if it moved.
 watchTasks ∷ Domains → IO Int
 watchTasks domains = do
   let shared = domainsShared domains
@@ -1265,8 +1265,6 @@ data Verdict
   | VerdictHalted
   | VerdictIncomplete
   | VerdictCommit !Candidate
-  | -- | A task admission began since the tasks were observed, so what was observed may not be all the owner accepted.
-    VerdictAgain
 
 -- | Decide a tick that has completed and been accounted for: a failure told of fails the session and commits
 -- nothing; a stop commits nothing; otherwise the tick commits if its work finished successfully, or the engine says why
@@ -1286,17 +1284,15 @@ decide domains tick pausedAtBegin generation = do
             working ← readTVar (sharedTick shared)
             instanceNow ← behaviorNow (domainsGameplay domains)
             assigned ← Set.member tick <$> readTVar (sharedControlTicks shared)
-            stable ← admissionsStable shared generation
             pure $ case (working, instanceNow) of
               (Just candidate, Just snapshot)
                 | candidateTick candidate == tick
-                , acceptable candidate snapshot assigned → if stable then VerdictCommit candidate else VerdictAgain
+                , acceptable candidate snapshot assigned → VerdictCommit candidate
               _ → VerdictIncomplete
   case verdict of
     VerdictFailed → Just . maybe TickHalted TickFailed <$> publishEnding domains EndedByFailure
     VerdictHalted → pure (Just TickHalted)
     VerdictIncomplete → throwIO (TickNotCompleted tick)
-    VerdictAgain → pure Nothing
     VerdictCommit candidate → commitTick domains tick generation candidate
   where
     -- Work finished successfully: gameplay said so, and the instance is serving, with nothing in flight and
@@ -1325,7 +1321,6 @@ commitTick domains tick generation candidate = do
     failed ← failedNow (sharedSession shared)
     working ← readTVar (sharedTick shared)
     instanceNow ← behaviorNow (domainsGameplay domains)
-    stable ← admissionsStable shared generation
     pure $
       if failed
         then Left (Just True)
@@ -1333,11 +1328,8 @@ commitTick domains tick generation candidate = do
           if halted || fmap candidateTick working /= Just tick
             then Left (Just False)
             else
-              if not stable
-                then Left Nothing
-                else
-                  Right
-                    GameSnapshot
+              Right
+                GameSnapshot
                   { snapSession = configSession config
                   , snapTick = tick
                   , snapWorld = world
