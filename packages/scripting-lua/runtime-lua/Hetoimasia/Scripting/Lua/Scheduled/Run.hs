@@ -356,14 +356,14 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
       atomically $ case instances of
         Nothing → awaitWork scheduler `orElse` requestWork
         Just ih → awaitWork scheduler `orElse` awaitInstanceWork ih `orElse` requestWork
-      forM_ instances serviceInstances
+      servicing control (forM_ instances serviceInstances)
       -- At each boundary, after the scheduler's work there, the owner accounts for
       -- what ended, looks at what its instances were asked and tries again what the
       -- scheduler had no room for, unless it was asked to stop itself, in which case
       -- its exit settles it. Its requests are looked at after that: the tasks whose
       -- requests have settled are woken, the providers' accounts are polled, and the
       -- requesters whose tasks are gone are ended.
-      let atBoundary = do
+      let atBoundary = servicing control $ do
             instanceStep ← maybe (pure False) serviceBoundary instances
             requestStep ← forM provider $ \service →
               providerBoundary service scheduler (isJust instances) extra (forM_ instances endOwner)
@@ -375,7 +375,7 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
             unless again (atomically (sealAccounting control))
             pure again
       report ← serviceTurnWith atBoundary scheduler host
-      forM_ instances settleEnded
+      servicing control (forM_ instances settleEnded)
       mask_ $ do
         retainCleanup kept (turnCloseFailures report)
         void (atomically (sweepForgotten control))

@@ -12,11 +12,12 @@
 -- the rest are here.
 module Test.LuaRuntime.Accounting.Evidence (spec) where
 
-import Control.Exception (throwIO)
+import Control.Exception (finally, throwIO)
 import Control.Monad (void, when)
 import Data.IORef (writeIORef)
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Lease
+import Hetoimasia.Scripting.Lua.Provider
 import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe)
@@ -93,6 +94,26 @@ spec = describe "cleanup evidence the owner retains" $ do
         releaseGate (sf base) "shutdown"
         pure waiting
 
+    it "does not complete while the owner is between two disposals, the first having raised, though no instance is ending" $ bounded $ do
+      fixture ← newLFix 4
+      let base = lfBase fixture
+      failingWait (sf base) [] $ \control runtime → (`finally` proceedRelease fixture) . providersFinish fixture $ do
+        owner ← startLeased fixture runtime "two disposals" [dependentTwoHolder] leaseConfig requiredPolicy
+        _ ← admit base owner "a" (moduleNamed "dependenttwoholder")
+        awaitPhase base owner "a" Active
+        expectDelivered base owner "a" 1
+        awaitEffect (sf base) "release Retiring"
+        -- The instance stays active, so no ending is owed and the wait has nothing to wait for but the owner.
+        -- The retirement completes: the owner disposes of the first device, which raises, and then of the second,
+        -- which waits at the release gate with the first failure caught and not yet kept.
+        completeRetirement fixture "dep2-res"
+        awaitReleaseEntered fixture
+        waiting ← beginWait control owner
+        stabilize waiting
+        awaitPending waiting
+        proceedRelease fixture
+        pure waiting
+
     it "ends the wait with the failure of disposing what a retirement needed" $ bounded $ do
       fixture ← newLFix 4
       let base = lfBase fixture
@@ -108,6 +129,31 @@ spec = describe "cleanup evidence the owner retains" $ do
         waiting ← beginWait control owner
         awaitPending waiting
         completeRetirement fixture "dep-res"
+        pure waiting
+
+    it "does not complete while providers are being told, the first having raised, though no instance is ending" $ bounded $ do
+      fixture ← newIFixture
+      fake ← Request.newFake
+      told ← newGate
+      Request.onCancel fake (\index → if index == 0 then throwIO (Broken "cancel 0") else passGate told)
+      failingWait (sf fixture) [told] $ \control runtime → Request.providersFinish fake $ do
+        owner ← Request.startRequester fixture runtime "told in a batch" [Request.asker] Request.cmdConfig (Request.grantOf fake 4) requiredPolicy
+        Request.admitAsker fixture owner "i" "asker"
+        Request.command fixture owner "i" "start" "a"
+        Request.awaitLine fixture "cmd start a started"
+        Request.command fixture owner "i" "start" "b"
+        Request.awaitLine fixture "cmd start b started"
+        -- Both requests are withdrawn together, so the owner tells the providers in one step: the first
+        -- provider raises, and the second waits, with that failure caught and not yet kept. The instance stays
+        -- active, so no ending is owed.
+        _ ← advanceRequestEpoch (scheduledEndpoint owner)
+        awaitGateEntered told
+        waiting ← beginWait control owner
+        stabilize waiting
+        awaitPending waiting
+        openGate told
+        Request.finishWork fake 0
+        Request.finishWork fake 1
         pure waiting
 
     it "ends the wait with a request provider that raises when told its interest was withdrawn" $ bounded $ do

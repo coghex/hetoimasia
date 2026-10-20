@@ -28,6 +28,7 @@ module Hetoimasia.Scripting.Lua.Scheduled.Types
   , watchAccounting
   , unwatchAccounting
   , accountingFailed
+  , servicing
   , sealAccounting
   , accountingReady
   , endingBegun
@@ -39,7 +40,8 @@ module Hetoimasia.Scripting.Lua.Scheduled.Types
   , settleAll
   ) where
 
-import Control.Concurrent.STM (STM, TVar, modifyTVar', readTVar, retry, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', readTVar, retry, writeTVar)
+import Control.Exception (finally, mask)
 import Control.DeepSeq (NFData (rnf))
 import Control.Monad (forM, when)
 import Data.Foldable (traverse_)
@@ -258,6 +260,11 @@ data Accounting = Accounting
     -- failure (the failure of a close, a release, a settlement) at a point where it could have
     -- accounted for an ending or sealed a boundary: from then on it is exiting, and the wait
     -- neither completes nor ends until it has ended and supervision has handled the outcome.
+  , acBusy ∷ !Int
+    -- ^ How many of the owner's servicing steps are running: the instance layer's accounting, the
+    -- providers' and the leases' retirements and the disposals they owe, the controls the owner
+    -- applies. While one runs, the owner may have caught a cleanup failure it has not yet kept (the
+    -- first of several disposals has raised and the next waits), so the wait does not complete.
   , acSealed ∷ !Word64
     -- ^ How many grants had finished when the owner's last boundary ended. Grants finish only
     -- inside a boundary, so a watch whose grants number no more than this is for a boundary
@@ -273,7 +280,7 @@ data Accounting = Accounting
 
 -- | An owner's accounting before anything has begun.
 newAccounting ∷ Accounting
-newAccounting = Accounting Nothing Nothing False 0 0 Map.empty
+newAccounting = Accounting Nothing Nothing False 0 0 0 Map.empty
 
 -- | Take the wait's snapshot: how many grants have been accepted, committed in this one
 -- transaction, and watch for them. Replaces any earlier watch, which the application's one
@@ -297,6 +304,16 @@ watchAccounting control = do
 accountingFailed ∷ Control → STM ()
 accountingFailed control =
   modifyTVar' (controlAccounting control) (\accounting → accounting {acTainted = True})
+
+-- | Run one of the owner's servicing steps, noting that it runs. Whatever such a step catches it keeps,
+-- but not before it has run its other actions: a failure caught between two disposals is held by the
+-- step alone, where nothing the wait can read shows it. So the wait does not complete while a step
+-- runs, and a step that has caught a failure has kept it by the time it ends.
+servicing ∷ Control → IO a → IO a
+servicing control action =
+  mask $ \restore → do
+    atomically (modifyTVar' (controlAccounting control) (\accounting → accounting {acBusy = acBusy accounting + 1}))
+    restore action `finally` atomically (modifyTVar' (controlAccounting control) (\accounting → accounting {acBusy = acBusy accounting - 1}))
 
 -- | Clear the watch, whether it was latched or not, as the wait ends.
 unwatchAccounting ∷ Control → STM ()
@@ -328,6 +345,7 @@ accountingReady ∷ Control → STM ()
 accountingReady control = do
   accounting ← readTVar (controlAccounting control)
   when (acTainted accounting) retry
+  when (acBusy accounting > 0) retry
   case acCut accounting of
     Nothing → retry
     Just cut → when (any (<= cut) (Map.elems (acOpen accounting))) retry

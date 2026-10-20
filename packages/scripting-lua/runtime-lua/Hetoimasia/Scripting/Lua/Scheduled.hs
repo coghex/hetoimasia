@@ -965,7 +965,10 @@ data AccountingWait
 -- earlier wait: a later grant entering a blocking callback while an earlier ending is
 -- parked awaiting retirement holds the thread the ending needs to settle. A retirement a
 -- provider owes holds the wait for as long as it holds the instance's stop completion;
--- there is no timeout. Returning is evidence about the owner's accounting. It is not
+-- there is no timeout. A wait begun while the owner is inside one of its servicing steps (the
+-- instance layer's accounting at a boundary, the disposals a retirement owes, the providers being
+-- told) does not complete until the step has ended, whatever it owes the wait: a failure the step
+-- has caught and not yet kept is not visible from outside it. Returning is evidence about the owner's accounting. It is not
 -- permission to advance or to commit a tick that failed.
 --
 -- = Who may call it
