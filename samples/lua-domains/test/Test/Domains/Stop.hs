@@ -6,7 +6,8 @@ module Test.Domains.Stop (spec) where
 
 import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
-import Control.Concurrent.STM (readTVarIO)
+import Control.Concurrent (yield)
+import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, writeTVar)
 import Control.Exception (finally)
 import Control.Monad (forM_, replicateM_)
 import System.Exit (ExitCode (ExitFailure))
@@ -223,8 +224,15 @@ spec = describe "the stop paths and the cleanup evidence" $ do
         replicateM_ 2 (stepCommitted domains)
         outcome ← stepTick domains
         outcome `shouldSatisfy` \case TickFailed _ → True; _ → False
-        -- The session waits for the UI to see what ends it, and the UI sees the last good tick beside the failure.
-        stopServing domains ui
+        -- The session waits for the UI to see what ends it: the stop does not return while the UI has not run,
+        -- however long it is given, and returns once the UI has run.
+        finished ← newTVarIO False
+        stopped ← spawn (stopSession domains >> atomically (writeTVar finished True))
+        replicateM_ 2000 yield
+        readTVarIO finished `shouldReturn` False
+        uiStep domains ui
+        _ ← stopped
+        -- The UI saw the last good tick beside the failure.
         fxLines fx >>= (`shouldSatisfy` elem "saw failed at tick 2")
         balanced domains
   where

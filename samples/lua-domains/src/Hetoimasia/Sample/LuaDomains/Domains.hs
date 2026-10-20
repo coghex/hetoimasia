@@ -1304,7 +1304,11 @@ finishLive domains = do
   failed ← atomically (failedNow (sharedSession shared))
   if failed
     then void (publishEnding domains EndedByFailure)
-    else atomically (markEnded (sharedSession shared) EndedFinished)
+    else -- The ending takes the publication as every ending does, and publishes nothing: another thread's stop is
+    -- waited for, not raced.
+      atomically $ do
+        mine ← claimEnding (sharedSession shared)
+        when mine (markEnded (sharedSession shared) EndedFinished)
   afterEnding domains
 
 -- | Ask each gameplay instance to stop, once for the session (a repeated stop asks nothing again), wait for each to be
