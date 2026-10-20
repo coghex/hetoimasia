@@ -1824,11 +1824,19 @@ lies ahead on the owner's thread.
   still delay an earlier wait: a later grant entering a blocking callback while an earlier
   ending is parked awaiting retirement holds the thread the ending needs to settle. A
   retirement a provider owes holds the wait for as long as it holds the instance's stop
-  completion; there is no timeout. A wait begun while the owner is inside one of its servicing
-  steps (the instance layer's accounting at a boundary, the disposals a retirement owes, the
-  providers being told) does not complete until the step has ended, because a failure the step has
-  caught and not yet kept is not visible from outside it. Returning is evidence about the owner's
-  accounting. It is not permission to advance or to commit a tick that failed.
+  completion; there is no timeout. Returning is evidence about the owner's accounting. It is not
+  permission to advance or to commit a tick that failed.
+- *Who decides it is complete.* The owner, never the wait. At the end of a boundary that finds
+  nothing more to do (the last step of its settling, after the instance layer's accounting, the
+  providers' and leases' retirements and the disposals they owed were swept and handed over), the
+  owner's thread, if it holds no failure that will end it (what the scheduler kept, what the owner
+  kept) and is not stopping, writes an acknowledgement. The wait completes on an acknowledgement
+  written after its cut was fixed (so a wait begun in the middle of a batch, the disposals a
+  retirement owes or the providers being told, waits for the end of that batch), when the grants it
+  captured have finished and no ending it covers was open when the acknowledgement was written.
+  A boundary cut short by a failure kept or raised, an exception included, writes none, so a
+  failure caught and not yet kept can never be acknowledged over. An idle owner is woken to write
+  one.
 - *What it costs the owner.* No task, control or result slot, no ticket and no per-wait state:
   the owner keeps a watch and a count of the endings it has begun and not yet accounted for,
   bounded by the instances' own bound, whatever number of waits were made, and the wait works
@@ -1839,10 +1847,10 @@ lies ahead on the owner's thread.
   with `AccountingOwnerEnded` once it has ended and supervision has handled the outcome
   without latching a fatal failure, and never with `AccountingComplete` unless the accounting
   was complete before the owner began to exit. An owner that is exiting but has not ended (a
-  stop waiting for a provider's retirement) neither completes the wait nor ends it, and neither
-  does an owner that holds cleanup evidence that will end it as a failure (the failure of closing
-  a coroutine, of a release, of a settlement), even with every ending accounted for: the wait is
-  for the exit, and for the failure supervision then handles. An
+  stop waiting for a provider's retirement) neither completes the wait nor ends it, and an owner
+  that holds cleanup evidence that will end it as a failure (the failure of closing a coroutine, of
+  a release, of a settlement) writes no acknowledgement, even with every ending accounted for: the
+  wait is for the exit, and for the failure supervision then handles. An
   `Escalate` answer, an escalation callback that raises and a failed retirement end the owner
   as a failure, and the wait follows the severity supervision gives that outcome: rethrown if
   it is fatal, `AccountingOwnerEnded` if it is tolerated.
