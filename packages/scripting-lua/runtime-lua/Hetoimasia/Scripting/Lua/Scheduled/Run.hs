@@ -68,7 +68,7 @@ import Control.Exception
   , try
   , tryWithContext
   )
-import Control.Monad (forM, forM_, void, when)
+import Control.Monad (forM, forM_, unless, void, when)
 import Data.Either (isLeft)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
@@ -144,6 +144,7 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , TaskRun (..)
   , TurnReport (turnCloseFailures)
   , awaitWork
+  , retainsEvidence
   , serviceTurnWith
   , stopScheduler
   )
@@ -352,9 +353,11 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
     -- cleanup: answers whether it was the latter.
     loop host kept extra instanceRef = do
       instances ← readIORef instanceRef
+      -- Beside its other work the owner wakes for an accounting wait whose cut is fixed and which
+      -- no acknowledgement has answered yet: an idle owner has no boundary to end until it is woken.
       atomically $ case instances of
-        Nothing → awaitWork scheduler `orElse` requestWork
-        Just ih → awaitWork scheduler `orElse` awaitInstanceWork ih `orElse` requestWork
+        Nothing → awaitWork scheduler `orElse` requestWork `orElse` awaitAcknowledgement control
+        Just ih → awaitWork scheduler `orElse` awaitInstanceWork ih `orElse` requestWork `orElse` awaitAcknowledgement control
       forM_ instances serviceInstances
       -- At each boundary, after the scheduler's work there, the owner accounts for
       -- what ended, looks at what its instances were asked and tries again what the
@@ -366,7 +369,19 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
             instanceStep ← maybe (pure False) serviceBoundary instances
             requestStep ← forM provider $ \service →
               providerBoundary service scheduler (isJust instances) extra (forM_ instances endOwner)
-            pure (instanceStep || or requestStep)
+            let again = instanceStep || or requestStep
+            -- A boundary that finds nothing more to do is the last of its settling: it ends when this
+            -- returns. This is the owner's checkpoint, and nothing after it in the boundary can fail. The
+            -- sweep of what the providers and the leases had to hand over is the step just made, which
+            -- found none; the failures the owner caught were kept by the steps that caught them, or
+            -- raised past this point. If it holds none of them, is not stopping, and the boundary finished
+            -- the grants a wait captured, it fixes that wait's cut; and then it acknowledges: whatever
+            -- wait is pending is answered by an acknowledgement written here, after its cut was fixed, and
+            -- by nothing else.
+            unless again $ do
+              held ← holdsFailure kept extra
+              atomically (sealAccounting control >> unless held (acknowledgeAccounting control))
+            pure again
       report ← serviceTurnWith atBoundary scheduler host
       forM_ instances settleEnded
       mask_ $ do
@@ -377,6 +392,14 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
       if halt || retained
         then pure (retained && not halt)
         else loop host kept extra instanceRef
+
+    -- Whether the owner holds a failure that will end it, or is ending: what the scheduler kept, what the
+    -- owner kept, or a stop. An acknowledgement is not written while it does.
+    holdsFailure kept extra = do
+      scheduled ← atomically ((||) <$> retainsEvidence scheduler <*> stopping)
+      kept' ← not . null <$> readIORef kept
+      extra' ← not . null <$> readIORef extra
+      pure (scheduled || kept' || extra')
 
 -- | Close a task's coroutine as the task, and as its instance if it is an invocation of one.
 closeAs ∷ Control → Maybe InstanceHost → TaskId → IO a → IO a

@@ -24,6 +24,7 @@ module Test.LuaRuntime.Scheduled.Support
   , setClock
   , advanceClock
   , readClock
+  , setClockHook
     -- * Configurations
   , theModule
   , schedRegistration
@@ -104,6 +105,8 @@ data SFixture = SFixture
     -- ^ How long each @fx.delay()@ takes on the injected clock.
   , sfClock ∷ !Clock
   , sfTimer ∷ !FakeTimer
+  , sfClockHook ∷ !(IORef (IO ()))
+    -- ^ Run by the owner's thread before every read of the injected clock.
   }
 
 newSFixture ∷ IO SFixture
@@ -128,6 +131,7 @@ newSFixture =
     <*> newIORef 0 -- delay
     <*> newClock
     <*> newFakeTimer
+    <*> newIORef (pure ()) -- clock hook
 
 -- | What the bindings recorded, oldest first.
 effects ∷ SFixture → IO [Text]
@@ -316,6 +320,12 @@ attempt fixture kind name = do
         case (owner, control) of
           (Just held, Just supervision) → void (awaitTicksComplete supervision held)
           _ → pure ()
+      "await_accounting" → do
+        owner ← readIORef (sfOwner fixture)
+        control ← readIORef (sfSupervision fixture)
+        case (owner, control) of
+          (Just held, Just supervision) → void (awaitScheduledAccounting supervision held)
+          _ → pure ()
       "start" → do
         runtime ← readIORef (sfRuntime fixture)
         case runtime of
@@ -490,7 +500,7 @@ scheduled fixture label worker =
 scheduledWith ∷ SFixture → Text → [Text] → WorkerPolicy → SchedulerBounds → ScheduledSpec
 scheduledWith fixture label granted worker bounds =
   (scheduledSpec vm worker bounds)
-    { scheduledClock = scriptedSource (clockInstant (sfClock fixture))
+    { scheduledClock = scriptedSource (join (readIORef (sfClockHook fixture)) >> clockInstant (sfClock fixture))
     , scheduledTimer = ftBackend (sfTimer fixture)
     , scheduledObserve = \context → do
         -- The owner's thread is the one the hook runs on, which is not the thread a
@@ -508,6 +518,10 @@ scheduledWith fixture label granted worker bounds =
         , vmOwnerName = label
         , vmModules = [tasksModule]
         }
+
+-- | Run this before every read of the injected clock, on the thread that reads it.
+setClockHook ∷ SFixture → IO () → IO ()
+setClockHook fixture = writeIORef (sfClockHook fixture)
 
 clockInstant ∷ Clock → IO Instant
 clockInstant (Clock ref) = scriptedInstant . nanoseconds <$> readIORef ref
