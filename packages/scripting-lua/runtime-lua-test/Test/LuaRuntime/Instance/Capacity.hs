@@ -6,7 +6,7 @@ module Test.LuaRuntime.Instance.Capacity (spec) where
 import Control.Concurrent (forkIO, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
-import Control.Exception (SomeException, fromException, try)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException)
 import Control.Monad (forM, forM_, replicateM, void)
 import Data.List.NonEmpty (toList)
 import qualified Data.Text as Text
@@ -19,7 +19,7 @@ import Hetoimasia.Scripting.Lua.Value (Schema (SCapability, SInteger, SList, SRe
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (defaultSchedulerBounds, scheduled, startScheduled)
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (bounded, failExample, requiredPolicy, tryExpected, withBoundary)
 
 -- | What admitting answered, as something an example compares.
 full ∷ InstanceAdmission → Bool
@@ -34,12 +34,12 @@ accepted' = \case InstanceAccepted _ _ → True; _ → False
 -- | The violations a configuration is refused with.
 refusedWith ∷ IFixture → LuaRuntime → InstanceConfig → IO [InstanceViolation]
 refusedWith fixture runtime config = do
-  outcome ← try @SomeException (startInstances fixture runtime "refused" [echoer] config requiredPolicy)
+  outcome ← tryExpected (startInstances fixture runtime "refused" [echoer] config requiredPolicy)
   case outcome of
-    Left failure → case fromException failure of
+    Left (ExceptionWithContext _ failure) → case fromException failure of
       Just (InstancesRefused violations) → pure (toList violations)
-      Nothing → fail ("expected the refusal of the configuration, found " <> show failure)
-    Right _ → fail "the configuration should have been refused"
+      Nothing → failExample ("expected the refusal of the configuration, found " <> show failure)
+    Right _ → failExample "the configuration should have been refused"
 
 -- | Admit until the answer is not that a bound is held: a result or a place the
 -- owner has yet to give back.
@@ -144,15 +144,15 @@ spec = describe "capacity" $ do
       let many = [EventSource ("source" <> Text.pack (show n)) SInteger | n ← [1 .. 60 ∷ Int]]
       refusedWith fixture runtime base {instanceSources = many} >>= (`shouldBe` [TooManySources 60 59])
       -- A registration that already holds the layer's namespace cannot take it.
-      taken ← try @SomeException $ do
+      taken ← tryExpected $ do
         let plain = instanceSpec fixture "taken" [echoer] base requiredPolicy defaultSchedulerBounds
             existing = either (error . show) id (registration [] (registrationNamespaces (vmRegistration (scheduledVm plain)) <> [namespace "hetoimasia_instance" []]))
         startScheduled (sf fixture) runtime plain {scheduledVm = (scheduledVm plain) {vmRegistration = existing}}
       case taken of
-        Left failure → case fromException failure of
+        Left (ExceptionWithContext _ failure) → case fromException failure of
           Just (InstancesRefused violations) → [reason | RegistrationRefused reason ← toList violations] `shouldSatisfy` (not . null)
-          Nothing → fail ("expected the refusal of the registration, found " <> show failure)
-        Right _ → fail "the registration should have been refused"
+          Nothing → failExample ("expected the refusal of the registration, found " <> show failure)
+        Right _ → failExample "the registration should have been refused"
 
   it "settles every accepted instance exactly once when admissions race the owner's retirement" $ bounded $ do
     fixture ← newIFixture

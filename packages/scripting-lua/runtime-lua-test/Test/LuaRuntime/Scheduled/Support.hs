@@ -73,7 +73,7 @@ import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value
 import Test.LuaRuntime.Scheduler.Support (FakeTimer (..), allRegs, newFakeTimer, nanoseconds)
-import Test.LuaRuntime.Support (Broken (Broken), Gated (..), applicationBoundaryFault, awaitBlockedOnSTM, gateIn, openGatesIn, requiredPolicy)
+import Test.LuaRuntime.Support (applicationBoundaryFault, awaitBlockedOnSTM, Broken (Broken), failExample, Gated (..), gateIn, openGatesIn, requiredPolicy)
 
 -- The fixture ------------------------------------------------------------------
 
@@ -531,9 +531,9 @@ withChunks chunks spec = spec {scheduledVm = (scheduledVm spec) {vmInitialChunks
 expectScheduled ∷ ScheduledStart → IO ScheduledOwner
 expectScheduled = \case
   ScheduledStarted owner → pure owner
-  ScheduledUnavailable failure → throwIO (userError ("expected an owner, found it unavailable: " <> show failure))
-  ScheduledRejected → throwIO (userError "expected an owner, found the boundary closed")
-  ScheduledEnded → throwIO (userError "expected an owner, found it ended")
+  ScheduledUnavailable failure → failExample ("expected an owner, found it unavailable: " <> show failure)
+  ScheduledRejected → failExample "expected an owner, found the boundary closed"
+  ScheduledEnded → failExample "expected an owner, found it ended"
 
 -- | Create a scheduled owner and expect it to be ready. Registers its endpoint in
 -- the fixture, for the bindings that make requests.
@@ -566,8 +566,8 @@ accepted fixture name = \case
   TaskAccepted identity ticket → do
     atomicModifyIORef' (sfIds fixture) (\held → (Map.insert name identity held, ()))
     pure ticket
-  TaskQueueFull → throwIO (userError "expected the task to be accepted, found it full")
-  TaskAdmissionClosed → throwIO (userError "expected the task to be accepted, found it closed")
+  TaskQueueFull → failExample "expected the task to be accepted, found it full"
+  TaskAdmissionClosed → failExample "expected the task to be accepted, found it closed"
 
 -- | Wait until the owner's thread is parked in an STM transaction: it has served
 -- everything it was given and is idle.

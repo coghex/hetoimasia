@@ -20,7 +20,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfTimer), awaitDiagnostics, awaitEffect, awaitRegistrations, defaultSchedulerBounds, setClock)
 import Test.LuaRuntime.Scheduler.Support (Reg (regMicroseconds), fireReg, liveRegs, nanoseconds)
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (bounded, failExample, requiredPolicy, withBoundary)
 
 -- The modules -------------------------------------------------------------------
 
@@ -241,7 +241,7 @@ spec = describe "elapsed cadence" $ do
         answers ← readIORef receipts
         forM_ answers $ \case
           InstanceControlAccepted receipt → waitInstanceControl receipt >>= (`shouldBe` ControlApplied)
-          other → fail ("expected the request accepted, found " <> show other)
+          other → failExample ("expected the request accepted, found " <> show other)
         -- The owner arms its timer for the resume's deadline as the turn ends, and that is
         -- waited for, not assumed, before anything is fired.
         awaitRegistrations (sf fixture) 2

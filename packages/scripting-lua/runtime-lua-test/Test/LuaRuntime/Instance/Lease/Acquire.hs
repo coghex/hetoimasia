@@ -21,7 +21,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Lease.Support
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEffect, awaitScheduledTerminal)
-import Test.LuaRuntime.Support (bounded, brokenIs, expectFatal, optionalPolicy, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (bounded, brokenIs, expectFatal, failExample, optionalPolicy, requiredPolicy, withBoundary)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext))
 
@@ -29,7 +29,7 @@ import Control.Exception (ExceptionWithContext (ExceptionWithContext))
 expectFailure ∷ InstanceSettlement → IO InstanceFailure
 expectFailure settled = case failureOf' settled of
   Just failure → pure failure
-  Nothing → fail ("expected a failure, found " <> show (resultOutcome settled))
+  Nothing → failExample ("expected a failure, found " <> show (resultOutcome settled))
 
 -- | The reason a call was refused, when the failure is a refusal of a call.
 refusedWith ∷ InstanceError → Maybe FaultReason
@@ -179,8 +179,8 @@ spec = describe "acquiring" $ do
             Just failure → do
               failureStage failure `shouldBe` StageRelease
               failureMessage failure `shouldSatisfy` Text.isInfixOf "a rollback release failed: doomed.first"
-            Nothing → fail "expected the instance to have failed at the release"
-        Nothing → fail "expected the instance to have settled"
+            Nothing → failExample "expected the instance to have failed at the release"
+        Nothing → failExample "expected the instance to have settled"
 
   it "refuses an acquisition over the instance's capacity as the engine, before any stage runs, and a script that catches the error is still faulted and not made a host failure" $ bounded $ do
     fixture ← newLFix 2

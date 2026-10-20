@@ -20,7 +20,7 @@ import Hetoimasia.Scripting.Lua.Owner (BoundaryFault (boundaryChunk))
 import Hetoimasia.Scripting.Lua.Runner
 import Test.Hspec (Spec, describe, it, shouldBe, shouldContain, shouldNotContain, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Runner.Support
-import Test.LuaRuntime.Support (Broken (Broken), Gated (..), bounded, brokenIs, expectFatal, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, Broken (Broken), brokenIs, expectFatal, failExample, Gated (..), withBoundary, withBoundaryOpening)
 
 -- | A module that fails where its name says, and records every hook that runs.
 failing ∷ Text → [Text]
@@ -77,11 +77,11 @@ spec = describe "failures" $ do
               frError failure `shouldSatisfy` Text.isInfixOf "init boom"
               case instanceEnd good of
                 EndCompleted → pure ()
-                other → fail ("the other instance should have gone on: " <> show other)
+                other → failExample ("the other instance should have gone on: " <> show other)
               err ← errLines fixture
               reportHeaders err `shouldSatisfy` ((== 1) . length)
               reportOf (tidText (instanceTid bad)) err `shouldSatisfy` (\ls → any (Text.isInfixOf "name=\"bad\"") ls && any (Text.isInfixOf "stage=init") ls && any (Text.isInfixOf "init boom") ls)
-            other → fail ("expected two instances, found " <> show (length other))
+            other → failExample ("expected two instances, found " <> show (length other))
           -- No later hook of the failed instance ran: not run, not shutdown.
           found ← recorded fixture
           found `shouldContain` ["init init"]
@@ -101,7 +101,7 @@ spec = describe "failures" $ do
               frStage (failedOf one) `shouldBe` "run"
               frPhase (failedOf one) `shouldBe` Active
               frError (failedOf one) `shouldSatisfy` Text.isInfixOf "run boom"
-            other → fail ("expected one instance, found " <> show (length other))
+            other → failExample ("expected one instance, found " <> show (length other))
           filter (Text.isPrefixOf "shutdown") <$> recorded fixture `shouldReturn` ["shutdown run failed"]
           expectSinksKept fixture
 
@@ -115,7 +115,7 @@ spec = describe "failures" $ do
           statusOf report `shouldBe` StatusFailure
           case instancesOf report of
             [one] → frStage (failedOf one) `shouldBe` "update"
-            other → fail ("expected one instance, found " <> show (length other))
+            other → failExample ("expected one instance, found " <> show (length other))
           recorded fixture `shouldReturn` ["update", "shutdown failed"]
 
     it "reports a failing callback, with the source it was connected to" $ bounded $ do
@@ -131,7 +131,7 @@ spec = describe "failures" $ do
             [one] → do
               frStage (failedOf one) `shouldBe` "event tick"
               frError (failedOf one) `shouldSatisfy` Text.isInfixOf "callback boom"
-            other → fail ("expected one instance, found " <> show (length other))
+            other → failExample ("expected one instance, found " <> show (length other))
           recorded fixture `shouldReturn` ["tick", "shutdown failed"]
           expectSinksKept fixture
 
@@ -149,7 +149,7 @@ spec = describe "failures" $ do
             [one] → do
               frStage (failedOf one) `shouldBe` "shutdown"
               frError (failedOf one) `shouldSatisfy` Text.isInfixOf "shutdown boom"
-            other → fail ("expected one instance, found " <> show (length other))
+            other → failExample ("expected one instance, found " <> show (length other))
           recorded fixture `shouldReturn` ["shutdown stopped"]
           errLines fixture >>= (`shouldSatisfy` ((== 1) . length . reportHeaders))
 
@@ -166,7 +166,7 @@ spec = describe "failures" $ do
               map secondaryStage (frSecondary failure) `shouldBe` ["shutdown"]
               map secondaryError (frSecondary failure) `shouldSatisfy` all (Text.isInfixOf "shutdown boom")
               frOmitted failure `shouldBe` 0
-            other → fail ("expected one instance, found " <> show (length other))
+            other → failExample ("expected one instance, found " <> show (length other))
           err ← errLines fixture
           reportHeaders err `shouldSatisfy` ((== 1) . length)
           err `shouldSatisfy` any (Text.isPrefixOf "  also failed: shutdown: ")
@@ -217,7 +217,7 @@ spec = describe "failures" $ do
               Text.length (frName failure) `shouldSatisfy` (<= nameLimit)
               Text.length (instanceNameText one) `shouldSatisfy` (<= nameLimit)
               map (Text.length . secondaryError) (frSecondary failure) `shouldSatisfy` all (<= errorLimit)
-            other → fail ("expected one instance, found " <> show (length other))
+            other → failExample ("expected one instance, found " <> show (length other))
           err ← errLines fixture
           -- Every line of the report is as long as its fixed words and the bounds of what it carries.
           forM_ err $ \line → Text.length line `shouldSatisfy` (<= 2 * errorLimit)

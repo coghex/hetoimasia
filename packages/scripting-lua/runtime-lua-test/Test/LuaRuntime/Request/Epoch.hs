@@ -12,14 +12,14 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (bounded, failExample, requiredPolicy, withBoundary)
 import Control.Monad (void)
 import Hetoimasia.Runtime.Supervision (WorkerStatus (WorkerStopped))
 import Test.LuaRuntime.Scheduled.Support (awaitScheduledTerminal)
 
 -- | The epoch change, expecting there to be one.
 advanced ∷ ScheduledOwner → IO EpochReport
-advanced owner = advanceRequestEpoch (scheduledEndpoint owner) >>= maybe (fail "expected an epoch to advance") pure
+advanced owner = advanceRequestEpoch (scheduledEndpoint owner) >>= maybe (failExample "expected an epoch to advance") pure
 
 spec ∷ Spec
 spec = describe "epochs" $ do

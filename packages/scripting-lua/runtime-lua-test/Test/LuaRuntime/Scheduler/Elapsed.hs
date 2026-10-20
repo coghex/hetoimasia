@@ -13,7 +13,7 @@ import Hetoimasia.Foundation.Time (monotonicSource)
 import Hetoimasia.Scripting.Lua.Scheduler
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduler.Support
-import Test.LuaRuntime.Support (bounded)
+import Test.LuaRuntime.Support (bounded, failExample)
 
 microsecondsOf ∷ Rig → IO [Int]
 microsecondsOf rig = map regMicroseconds <$> liveRegs (rigTimer rig)
@@ -232,7 +232,7 @@ spec = describe "elapsed time and the owned timer" $ do
               }
       _ ← pure timer
       newScheduler config >>= \case
-        Left refused → fail (show refused)
+        Left refused → failExample (show refused)
         Right scheduler → do
           seen ← newIORef []
           let host =
@@ -253,7 +253,7 @@ spec = describe "elapsed time and the owned timer" $ do
           untilResumed
           reverse <$> readIORef seen >>= \case
             [Nothing, Just (ResumedElapsed elapsed)] → elapsed `shouldSatisfy` (>= nanoseconds 2000000)
-            other → fail ("unexpected resumes: " <> show other)
+            other → failExample ("unexpected resumes: " <> show other)
           _ ← stopScheduler scheduler host
           pure ()
 
@@ -274,7 +274,7 @@ spec = describe "elapsed time and the owned timer" $ do
               , hostClose = \_ → pure ()
               }
       newScheduler config >>= \case
-        Left refused → fail (show refused)
+        Left refused → failExample (show refused)
         Right scheduler → do
           _ ← atomically (admitTask scheduler (taskSpec "waiter" OrdinaryClass OneShot))
           report ← serviceTurn scheduler host

@@ -10,8 +10,7 @@ module Test.LuaRuntime.Accounting.Windows (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, tryReadMVar)
 import Control.Concurrent.STM (atomically, writeTVar)
-import System.Timeout (Timeout)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, try)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException, throwIO)
 import Control.Monad (forM_, void, when)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Maybe (isJust)
@@ -27,11 +26,11 @@ import Test.LuaRuntime.Instance.Lease.Support
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (awaitDiagnostics, awaitEffect, awaitEntered, awaitIdle, awaitScheduledTerminal, blockOn, defaultSchedulerBounds, releaseGate, setClockHook)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (Broken (Broken), bounded, brokenIs, expectFatal, optionalPolicy, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (bounded, Broken (Broken), brokenIs, expectFatal, failExample, optionalPolicy, requiredPolicy, tryExpected, withBoundary)
 
 -- | What a wait ended with, failing if it raised.
 answer ∷ PendingWait → IO AccountingWait
-answer waiting = resultOf waiting >>= either (\failure → fail ("the wait raised " <> show failure)) pure
+answer waiting = resultOf waiting >>= either (\failure → failExample ("the wait raised " <> show failure)) pure
 
 -- | The owner's escalation, which waits at a gate and then isolates.
 gatedEscalation ∷ Gate → InstanceConfig
@@ -260,7 +259,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         awaitDiagnosticsWaiting owner
         admitScheduledTask (endpoint owner) (blockAfterTicks "b" 1) >>= \case
           TaskAccepted _ _ → pure ()
-          other → fail ("expected the task accepted, found " <> show other)
+          other → failExample ("expected the task accepted, found " <> show other)
         awaitDiagnostics owner (\counts → diagWaiting counts >= 2)
         -- The first grant gives the victim the largest duration there is and wakes the blocker, which
         -- keeps the grant unfinished. The wait captures it, and a second grant is accepted after.
@@ -318,7 +317,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
       outcome ← newEmptyMVar
       -- The boundary ends with the instance accounted for and the close's failure retained, and a ready
       -- task keeps the owner serving: only the wait could say the owner had finished well, and it must not.
-      stalled ← try @SomeException . withBoundary $ \control runtime → releasing (sf fixture) [] $ do
+      _ ← tryExpected . withBoundary $ \control runtime → releasing (sf fixture) [] $ do
         owner ← startInstances fixture runtime "close fails" [closeRaises, holder, plainModule] (testConfig instanceBounds') requiredPolicy
         _ ← admit fixture owner "c" (moduleNamed "closeraises")
         awaitPhase fixture owner "c" Active
@@ -329,7 +328,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         _ ← expectControl fixture owner "c" InstanceStop
         admitScheduledTask (scheduledEndpoint owner) (TaskRequest (moduleNamed "tasks") "holds" [VText "blk"] OrdinaryClass OneShot Nothing) >>= \case
           TaskAccepted _ _ → pure ()
-          other → fail ("expected the task accepted, found " <> show other)
+          other → failExample ("expected the task accepted, found " <> show other)
         waiting ← beginWait control owner
         awaitPending waiting
         releaseOwner fixture
@@ -339,14 +338,11 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         awaitPending waiting
         releaseGate (sf fixture) "blk"
         resultOf waiting >>= putMVar outcome
-      -- The boundary may end with the failure the wait carried; a timeout of this example's bound is not that
-      -- failure, and is not swallowed.
-      case stalled of
-        Left raised | Just (_ ∷ Timeout) ← fromException raised → throwIO raised
-        _ → pure ()
+      -- The boundary may end with the failure the wait carried; a failed assertion of the example, or a
+      -- timeout of its bound, is not that failure, and is raised as itself ('tryExpected').
       tryReadMVar outcome >>= \case
-        Nothing → fail "the example recorded no outcome for the wait"
-        Just result → either (const (pure ())) (\answered → fail ("the wait answered " <> show answered)) result
+        Nothing → failExample "the example recorded no outcome for the wait"
+        Just result → either (const (pure ())) (\answered → failExample ("the wait answered " <> show answered)) result
 
     it "does not complete while a failure caught in settling another ending is held, though the ending it covers is accounted for" $ bounded $ do
       fixture ← newLFix 4
@@ -360,7 +356,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
                   Just "c" → passGate lastTold >> pure Isolate
                   _ → pure Isolate
               }
-      stalled ← try @SomeException . withBoundary $ \control runtime → releasing (sf base) [lastTold] $ providersFinish fixture $ do
+      _ ← tryExpected . withBoundary $ \control runtime → releasing (sf base) [lastTold] $ providersFinish fixture $ do
         owner ← startLeased fixture runtime "deferred" [retiresThenFails, retiresOnStop, retiresThenFailsLast] config requiredPolicy
         -- The lower number is the one that fails, and is settled first when both retirements complete.
         _ ← admit base owner "b" (moduleNamed "retiresthenfails")
@@ -389,12 +385,9 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         awaitPending waiting
         openGate lastTold
         resultOf waiting >>= putMVar outcome
-      case stalled of
-        Left raised | Just (_ ∷ Timeout) ← fromException raised → throwIO raised
-        _ → pure ()
       tryReadMVar outcome >>= \case
-        Nothing → fail "the example recorded no outcome for the wait"
-        Just result → either (const (pure ())) (\answered → fail ("the wait answered " <> show answered)) result
+        Nothing → failExample "the example recorded no outcome for the wait"
+        Just result → either (const (pure ())) (\answered → failExample ("the wait answered " <> show answered)) result
 
     forM_ [("an escalating answer", pure Escalate), ("a raising callback", throwIO (Broken "callback"))] $ \(label, told) → do
       let config = (testConfig instanceBounds') {instanceEscalate = \_ → told}
@@ -409,7 +402,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
           awaitDiagnosticsWaiting owner
           grant owner 1
           void (awaitScheduledAccounting control owner)
-          throwIO (userError "the wait returned instead of rethrowing the fatal failure")
+          failExample "the wait returned instead of rethrowing the fatal failure"
         raised `shouldSatisfy` \failure → recognizes failure
 
       it ("ends with an optional owner that " <> label <> " ends, once supervision has handled it, and never as a completion") $ bounded $ do

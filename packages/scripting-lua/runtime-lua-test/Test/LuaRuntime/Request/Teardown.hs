@@ -15,7 +15,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support
 import Test.LuaRuntime.Scheduled.Support (awaitScheduledTerminal)
-import Test.LuaRuntime.Support (bounded, brokenIs, optionalPolicy, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (bounded, brokenIs, failExample, optionalPolicy, requiredPolicy, withBoundary)
 
 isLive ∷ WorkerStatus → Bool
 isLive = \case
@@ -59,7 +59,7 @@ spec = describe "the owner's end" $ do
       finishWork fake 0
       awaitScheduledTerminal control owner >>= \case
         WorkerUnavailable (ExceptionWithContext _ failure) → failure `shouldSatisfy` brokenIs "boom"
-        other → fail ("expected an unavailable owner, found " <> show other)
+        other → failExample ("expected an unavailable owner, found " <> show other)
       linesOf fixture >>= (`shouldSatisfy` elem "disposed 5")
 
   it "does the same when the owner is cancelled" $ bounded $ do

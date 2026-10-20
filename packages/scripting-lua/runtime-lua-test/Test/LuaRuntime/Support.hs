@@ -18,6 +18,7 @@ module Test.LuaRuntime.Support
   , expectFatal
   , tryBoundaryOpening
   , tryExpected
+  , failExample
   , alongsideOpening
   , expectFatalOpening
   , bounded
@@ -125,7 +126,8 @@ import Hetoimasia.Scripting.Lua.Runtime
 import Hetoimasia.Scripting.Lua.Value
 import System.IO.Unsafe (unsafePerformIO)
 import System.Timeout (Timeout, timeout)
-import Test.HUnit.Lang (HUnitFailure)
+import GHC.Stack (HasCallStack)
+import Test.HUnit.Lang (HUnitFailure, assertFailure)
 import Test.Hspec (Expectation, expectationFailure)
 
 -- Failures ---------------------------------------------------------------------
@@ -192,12 +194,15 @@ openedAtBound openers action = do
     action
 
 -- | Run a boundary that is expected to fail, answering the failure it ended
--- with and keeping its context.
+-- with and keeping its context. What it ends with is the application's own failure, as
+-- 'tryExpected' reads it: a failed assertion of the example (its own, or a fixture helper's,
+-- raised with 'failExample'), or the example's 'bounded' timeout, is never taken for it, and
+-- is raised as itself.
 expectFatal ∷ (RuntimeControl → LuaRuntime → IO a) → IO (ExceptionWithContext SomeException)
 expectFatal body =
-  tryWithContext (withBoundary body) >>= \case
+  tryExpected (withBoundary body) >>= \case
     Left failure → pure failure
-    Right _ → throwIO (userError "expected the boundary to fail, but it returned")
+    Right _ → failExample "expected the boundary to fail, but it returned"
 
 -- | Run a boundary that may end in a failure of the application's own, answering how
 -- it ended, as 'withBoundaryOpening' lets the gates go. What it may fail with is the
@@ -210,6 +215,12 @@ tryBoundaryOpening openers body = tryExpected (withBoundaryOpening openers body)
 -- how it ended and keeping its context. A failed assertion of the example, or the example's
 -- 'bounded' timeout, is not that failure: it is raised as itself, and an example that expects
 -- a failure cannot swallow what makes it fail.
+--
+-- A failed assertion is an 'HUnitFailure': the examples' own ('shouldBe' and the like) and the
+-- fixture helpers' ('failExample'), which keep the message and the source location they were
+-- raised with. An 'IOException', 'userError' or the like is not one, and may be an application's
+-- own failure an example injected, so it is accepted; a helper that asserts therefore raises
+-- 'failExample' and never 'fail' or a 'userError'.
 tryExpected ∷ IO a → IO (Either (ExceptionWithContext SomeException) a)
 tryExpected action =
   tryWithContext action >>= \case
@@ -218,13 +229,21 @@ tryExpected action =
       | Just (_ ∷ Timeout) ← fromException failure → throwIO failure
     outcome → pure outcome
 
+-- | Fail the example as a failed assertion, with this message and the source location of the
+-- caller, as 'expectationFailure' does, for the helpers and examples that answer an assertion
+-- of their own in a result and not as an 'Expectation'. It is not 'fail', which in 'IO' raises a
+-- 'userError', which an expected-failure helper cannot tell from a failure of the application's
+-- own that an example injected.
+failExample ∷ HasCallStack ⇒ String → IO a
+failExample = assertFailure
+
 -- | 'expectFatal' for an example that holds a callback at a gate, with the gates let
 -- go and the failures of the example raised as 'tryBoundaryOpening' does.
 expectFatalOpening ∷ [IO ()] → (RuntimeControl → LuaRuntime → IO a) → IO (ExceptionWithContext SomeException)
 expectFatalOpening openers body =
   tryBoundaryOpening openers body >>= \case
     Left failure → pure failure
-    Right _ → throwIO (userError "expected the boundary to fail, but it returned")
+    Right _ → failExample "expected the boundary to fail, but it returned"
 
 -- | Run the helper on a thread of its own while the other action runs on this one, and
 -- answer the other's result. The helper is stopped when the other action is over,
@@ -633,20 +652,22 @@ requiredPolicy ∷ WorkerPolicy
 requiredPolicy = WorkerPolicy Service Supervision.Required (unsafeComponent "test.luaruntime") (\_ → pure Unrecognized)
 
 -- | An optional worker whose component recognizes the failures this says it
--- does.
+-- does. A failed assertion, which a fixture helper running on the worker raises, is not a failure
+-- the application's component supports: whatever this says, it is unrecognized, and fatal, and the
+-- example fails with it and does not go on beside an owner it left unavailable.
 optionalPolicy ∷ (SomeException → Bool) → WorkerPolicy
 optionalPolicy recognizes =
   WorkerPolicy Service Supervision.Optional (unsafeComponent "test.luaruntime") $ \(ExceptionWithContext _ failure) →
-    pure (if recognizes failure then Recognized else Unrecognized)
+    pure (if isJust (fromException failure ∷ Maybe HUnitFailure) || not (recognizes failure) then Unrecognized else Recognized)
 
 -- Creating and calling ---------------------------------------------------------
 
 expectOwner ∷ OwnerStart → IO LuaOwner
 expectOwner = \case
   OwnerStarted owner → pure owner
-  OwnerUnavailable failure → throwIO (userError ("expected an owner, found it unavailable: " <> show failure))
-  OwnerRejected → throwIO (userError "expected an owner, found the boundary closed")
-  OwnerEnded → throwIO (userError "expected an owner, found it ended")
+  OwnerUnavailable failure → failExample ("expected an owner, found it unavailable: " <> show failure)
+  OwnerRejected → failExample "expected an owner, found the boundary closed"
+  OwnerEnded → failExample "expected an owner, found it ended"
 
 -- | Create an owner and expect it to be ready.
 startOwner ∷ LuaRuntime → OwnerSpec → IO LuaOwner
@@ -660,8 +681,8 @@ submit endpoint = submitCall endpoint theModule
 accepted ∷ Submission → IO CallTicket
 accepted = \case
   CallAccepted ticket → pure ticket
-  CallFull → throwIO (userError "expected the call to be accepted, found it full")
-  CallClosed → throwIO (userError "expected the call to be accepted, found it closed")
+  CallFull → failExample "expected the call to be accepted, found it full"
+  CallClosed → failExample "expected the call to be accepted, found it closed"
 
 -- | Wait for a call's settlement.
 settle ∷ CallTicket → IO Settlement

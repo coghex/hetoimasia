@@ -12,6 +12,7 @@ import Data.Word (Word64)
 import Hetoimasia.Scripting.Lua.Scheduler
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduler.Support
+import Test.LuaRuntime.Support (failExample)
 
 budgeted ∷ Maybe Word64 → SchedulerBounds → SchedulerBounds
 budgeted budget bounds = bounds {boundServiceBudget = nanoseconds <$> budget}
@@ -50,7 +51,7 @@ spec = describe "service budgets and overruns" $ do
     task ← admit rig "task" OrdinaryClass Looped
     script rig "task" [writeIORef (rigClockHook rig) (ioError (userError "clock down")) >> yielded "task"]
     outcome ← try @SomeException (turn rig)
-    either (const (pure ())) (const (fail "the turn should have failed")) outcome
+    either (const (pure ())) (const (failExample "the turn should have failed")) outcome
     -- The segment had returned and its report was applied before the clock was
     -- read, so the task is ready, not running, and the stop closes it.
     phase rig task >>= (`shouldBe` Just PhaseReady)
@@ -63,7 +64,7 @@ spec = describe "service budgets and overruns" $ do
     task ← admit rig "task" OrdinaryClass Looped
     script rig "task" [writeIORef (rigClockHook rig) (ioError (userError "clock down")) >> waitFor "task" 100]
     outcome ← try @SomeException (turn rig)
-    either (const (pure ())) (const (fail "the turn should have failed")) outcome
+    either (const (pure ())) (const (failExample "the turn should have failed")) outcome
     writeIORef (rigClockHook rig) (pure ())
     phase rig task >>= (`shouldBe` Just PhaseReady)
     _ ← stopScheduler (rigScheduler rig) (rigHost rig)
@@ -84,7 +85,7 @@ spec = describe "service budgets and overruns" $ do
       ( ( do
             atomically (requestControl (rigScheduler rig) a RequestStop) >>= \case
               ControlAccepted accepted → writeIORef cell (Just accepted)
-              other → fail ("not accepted: " <> show other)
+              other → failExample ("not accepted: " <> show other)
             cost rig 1 (yielded "a")
         )
           : repeat (cost rig 1 (yielded "a"))
@@ -94,7 +95,7 @@ spec = describe "service budgets and overruns" $ do
     -- task it asked to stop and the clock reached 101; no second segment started.
     (turnSegments report, turnEnd report) `shouldBe` (1, TurnBudgetExpired)
     ran rig >>= (`shouldBe` ["a"])
-    readIORef cell >>= maybe (fail "no request") (\accepted → atomically (pollControl accepted) >>= (`shouldSatisfy` \case Just (ControlSettlement ControlApplied (Just CloseClean)) → True; _ → False))
+    readIORef cell >>= maybe (failExample "no request") (\accepted → atomically (pollControl accepted) >>= (`shouldSatisfy` \case Just (ControlSettlement ControlApplied (Just CloseClean)) → True; _ → False))
 
   it "leaves the pass as the next choice would when a cutoff coincides with the owner becoming idle" $ do
     let order budget = do
@@ -151,7 +152,7 @@ spec = describe "service budgets and overruns" $ do
       ( ( do
             atomically (requestControl (rigScheduler rig) victim RequestPause) >>= \case
               ControlAccepted accepted → writeIORef cell (Just accepted)
-              other → fail ("not accepted: " <> show (answer other))
+              other → failExample ("not accepted: " <> show (answer other))
             cost rig 100 (yielded "a")
         )
           : repeat (cost rig 100 (yielded "a"))
@@ -166,7 +167,7 @@ spec = describe "service budgets and overruns" $ do
     phase rig victim >>= (`shouldBe` Just PhasePaused)
     readIORef cell >>= \case
       Just accepted → atomically (pollControl accepted) >>= (`shouldSatisfy` \case Just (ControlSettlement ControlApplied Nothing) → True; _ → False)
-      Nothing → fail "the request was not made"
+      Nothing → failExample "the request was not made"
 
   it "counts an overrun against its owner, kind and entry point, and not a segment that ends at the deadline" $ do
     rig ← newRigWith defaultOptions {optBounds = budgeted (Just 10) defaultBounds}

@@ -26,7 +26,7 @@ import Test.LuaRuntime.Instance.Lease.Support
 import Test.LuaRuntime.Instance.Support
 import qualified Test.LuaRuntime.Request.Support as Request
 import Test.LuaRuntime.Scheduled.Support
-import Test.LuaRuntime.Support (Broken (Broken), bounded, requiredPolicy)
+import Test.LuaRuntime.Support (bounded, Broken (Broken), failExample, requiredPolicy)
 
 spec ∷ Spec
 spec = describe "cleanup evidence the owner retains" $ do
@@ -66,7 +66,7 @@ spec = describe "cleanup evidence the owner retains" $ do
         awaitEntered fixture "obs"
         requestTaskControl endpoint (ticketTask parked) RequestStop >>= \case
           TaskControlAccepted _ → pure ()
-          other → fail ("expected the stop accepted, found " <> show other)
+          other → failExample ("expected the stop accepted, found " <> show other)
         -- A ready task is queued behind it, so that the owner is still serving, parked at its own gate, after
         -- the boundary that closed the stopped task's coroutine.
         void (admitTask' fixture owner "B" (request "block_in" [VText "blk"] OrdinaryClass OneShot Nothing))

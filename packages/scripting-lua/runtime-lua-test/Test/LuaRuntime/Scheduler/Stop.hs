@@ -13,12 +13,13 @@ import qualified Data.Map.Strict as Map
 import Hetoimasia.Scripting.Lua.Scheduler
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduler.Support
+import Test.LuaRuntime.Support (failExample)
 
 request ∷ Rig → TaskId → ControlRequest → IO ControlTicket
 request rig identity what =
   atomically (requestControl (rigScheduler rig) identity what) >>= \case
     ControlAccepted ticket → pure ticket
-    _ → fail "the request was not accepted"
+    _ → failExample "the request was not accepted"
 
 spec ∷ Spec
 spec = describe "stopping the scheduler, admission and diagnostics" $ do
@@ -59,7 +60,7 @@ spec = describe "stopping the scheduler, admission and diagnostics" $ do
       granted rig 5 >>= (`shouldBe` GrantClosed)
       atomically (requestControl (rigScheduler rig) ready RequestStop) >>= \case
         ControlClosed → pure ()
-        _ → fail "expected the request to be refused as closed"
+        _ → failExample "expected the request to be refused as closed"
       after ← turn rig
       (turnSegments after, turnEnd after) `shouldBe` (0, TurnClosed)
       counts ← diagnostics rig
@@ -95,7 +96,7 @@ spec = describe "stopping the scheduler, admission and diagnostics" $ do
       outcome ← takeMVar finished
       case outcome of
         Left failure → fromException failure `shouldBe` Just ThreadKilled
-        Right _ → fail "the interruption should have been raised after the stop completed"
+        Right _ → failExample "the interruption should have been raised after the stop completed"
       map fst <$> closedTasks rig >>= (`shouldBe` [taskIdAt 0, taskIdAt 1, taskIdAt 2])
       atomically (schedulerClosed (rigScheduler rig)) >>= (`shouldBe` True)
       -- The stop is complete and its record keeps the interruption as evidence;
@@ -118,7 +119,7 @@ spec = describe "stopping the scheduler, admission and diagnostics" $ do
       outcome ← try @SomeException (stopScheduler (rigScheduler rig) (rigHost rig))
       case outcome of
         Left failure → show failure `shouldBe` show (userError "cancel failed")
-        Right _ → fail "the timer's failure should have been raised after the stop completed"
+        Right _ → failExample "the timer's failure should have been raised after the stop completed"
       map fst <$> closedTasks rig >>= (`shouldBe` [sleeper, other])
       atomically (pollControl pending) >>= (`shouldSatisfy` \case Just (ControlSettlement ControlNoLongerApplicable Nothing) → True; _ → False)
       atomically (schedulerClosed (rigScheduler rig)) >>= (`shouldBe` True)
@@ -146,7 +147,7 @@ spec = describe "stopping the scheduler, admission and diagnostics" $ do
       throwTo stopper ThreadKilled
       takeMVar finished >>= \case
         Left failure → fromException failure `shouldBe` Just ThreadKilled
-        Right _ → fail "the interruption should have been raised after the stop completed"
+        Right _ → failExample "the interruption should have been raised after the stop completed"
       again ← stopScheduler (rigScheduler rig) (rigHost rig)
       fmap show (stopTimerFailure again) `shouldBe` Just (show (userError "cancel failed"))
       map fst (stopCloseFailures again) `shouldBe` [taskIdAt 0]
@@ -162,7 +163,7 @@ spec = describe "stopping the scheduler, admission and diagnostics" $ do
           -- The refused wait fails its task, whose suspended continuation is
           -- closed and fails to close; then the next task's host raises.
           outcome ← try @SomeException (turn rig)
-          either (const (pure ())) (const (fail "the turn should have ended with the host's failure")) outcome
+          either (const (pure ())) (const (failExample "the turn should have ended with the host's failure")) outcome
           pure (rig, refused)
 
     it "are kept for the scheduler's stop, which reports them" $ do
@@ -198,7 +199,7 @@ spec = describe "stopping the scheduler, admission and diagnostics" $ do
         n ← atomicModifyIORef' readings (\seen → (seen + 1, seen + 1))
         when (n == 2) (ioError (userError "clock down"))
       outcome ← try @SomeException (turn rig)
-      either (const (pure ())) (const (fail "the turn should have failed")) outcome
+      either (const (pure ())) (const (failExample "the turn should have failed")) outcome
       writeIORef (rigClockHook rig) (pure ())
       report ← stopScheduler (rigScheduler rig) (rigHost rig)
       map fst (stopCloseFailures report) `shouldBe` [refused]
@@ -306,7 +307,7 @@ spec = describe "stopping the scheduler, admission and diagnostics" $ do
       _ ← request rig stopped RequestStop
       atomically (requestControl (rigScheduler rig) (taskIdAt 999) RequestPause) >>= \case
         ControlUnknownTarget → pure ()
-        _ → fail "expected the unknown target to be refused"
+        _ → failExample "expected the unknown target to be refused"
       mapM_ (granted rig) [5, 6]
       granted rig 7 >>= (`shouldBe` GrantFull)
       granted rig 0 >>= (`shouldBe` GrantNotPositive)

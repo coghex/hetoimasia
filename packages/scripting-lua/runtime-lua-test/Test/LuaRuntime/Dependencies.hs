@@ -16,11 +16,12 @@ import Data.List (isPrefixOf, sort)
 import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
 import System.FilePath (takeExtension, (</>))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.LuaRuntime.Support (failExample)
 
 packageRoot ∷ IO FilePath
 packageRoot = search "." (8 ∷ Int)
   where
-    search _ 0 = fail "hetoimasia-scripting-lua.cabal was not found above the working directory"
+    search _ 0 = failExample "hetoimasia-scripting-lua.cabal was not found above the working directory"
     search directory budget = do
       here ← doesFileExist (directory </> cabalName)
       if here then pure directory else search (directory </> "..") (budget - 1)
@@ -34,7 +35,7 @@ stanzaBody header = do
   root ← packageRoot
   description ← readFile (root </> cabalName)
   case stanza (lines description) of
-    [] → fail ("the cabal description has no `" <> header <> "` stanza")
+    [] → failExample ("the cabal description has no `" <> header <> "` stanza")
     body → pure body
   where
     stanza allLines = case dropWhile (/= header) allLines of

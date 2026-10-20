@@ -17,7 +17,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (allRegs, nanoseconds)
-import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, failExample, Gated (..), requiredPolicy, withBoundaryOpening)
 
 -- | What one run observed.
 data Observation = Observation
@@ -56,7 +56,7 @@ run delay budget = do
         controlB request' = do
           requestTaskControl endpoint (ticketTask b) request' >>= \case
             TaskControlAccepted receipt → void (waitControl receipt)
-            other → fail ("the request was not accepted: " <> show other)
+            other → failExample ("the request was not accepted: " <> show other)
     grant 3
     controlB RequestPause
     grant 5

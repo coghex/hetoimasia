@@ -190,7 +190,7 @@ spec = describe "submission" $ do
               ValueRefused (ValueRefusal Arguments 0 [] (RuleElementLimit _) 0) → True
               _ → False
             boundaryOwner fault `shouldBe` "oversized"
-          other → fail ("expected the value refusal, found " <> show other)
+          other → failExample ("expected the value refusal, found " <> show other)
         -- The owner went on, in order, and nothing ran for the refused call.
         returnedValues <$> settleOutcome after >>= (`shouldBe` Just [VInteger 9])
         retireOwner owner

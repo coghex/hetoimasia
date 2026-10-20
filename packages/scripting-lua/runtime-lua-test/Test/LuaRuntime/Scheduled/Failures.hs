@@ -21,7 +21,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (FakeTimer (ftOnCancel), nanoseconds)
-import Test.LuaRuntime.Support (Broken (Broken), Gated (..), bounded, brokenIs, expectFatal, expectFatalOpening, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, Broken (Broken), brokenIs, expectFatal, expectFatalOpening, failExample, Gated (..), optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
 
 blockThenFail ∷ Value → Value → TaskRequest
 blockThenFail name kind = request "block_then_fail" [name, kind] OrdinaryClass OneShot Nothing
@@ -44,7 +44,7 @@ spec = describe "host failures, failure and cancellation" $ do
       forM queued outcomeOf >>= mapM_ (`shouldSatisfy` \case SettledDiscarded (Discard ExitFailed NotStarted) → True; _ → False)
       atomically (scheduledExitRecord victim) >>= \case
         Just record → (exitKind record, exitStarted record, exitNotStarted record) `shouldBe` (ExitFailed, 1, 2)
-        Nothing → fail "the owner recorded no exit"
+        Nothing → failExample "the owner recorded no exit"
       -- The other owner is untouched.
       served ← admitTask' fixture bystander "served" (request "echo" [VInteger 9] OrdinaryClass OneShot Nothing)
       outcomeOf served >>= (`shouldBe` Just [VInteger 9]) . taskReturned
@@ -83,7 +83,7 @@ spec = describe "host failures, failure and cancellation" $ do
       _ ← admitTask' fixture two "own" (request "forever" [VText "y"] OrdinaryClass Looped Nothing)
       requestTaskControl (scheduledEndpoint two) (ticketTask theirs) RequestStop >>= \case
         TaskControlUnknown → pure ()
-        other → fail ("expected the identity to be unknown, found " <> show other)
+        other → failExample ("expected the identity to be unknown, found " <> show other)
       retireScheduled one
       retireScheduled two
 
@@ -240,7 +240,7 @@ spec = describe "host failures, failure and cancellation" $ do
         receipt ← requestTaskControl (scheduledEndpoint owner) (ticketTask ticket) RequestStop
         case receipt of
           TaskControlAccepted held → void (waitControl held)
-          other → fail ("the request was not accepted: " <> show other)
+          other → failExample ("the request was not accepted: " <> show other)
         -- The close of the stopped task failed: the owner is ending, not serving on.
         awaitScheduledTerminal control owner
       length (cleanupFailuresInContext context) `shouldSatisfy` (>= 1)
@@ -307,7 +307,7 @@ spec = describe "host failures, failure and cancellation" $ do
         effects fixture >>= (`shouldSatisfy` elem "a closed")
         atomically (scheduledExitRecord owner) >>= \case
           Just record → exitKind record `shouldBe` ExitCancelled
-          Nothing → fail "the owner recorded no exit"
+          Nothing → failExample "the owner recorded no exit"
 
     it "keeps a closing failure as cleanup evidence on a cancelled owner, which is fatal" $ bounded $ do
       fixture ← newSFixture

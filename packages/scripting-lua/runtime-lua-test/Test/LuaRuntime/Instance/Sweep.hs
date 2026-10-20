@@ -41,7 +41,7 @@ import Test.LuaRuntime.Scheduled.Support
   , request
   )
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, failExample, Gated (..), requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- The order of effects ------------------------------------------------------------------
 
@@ -165,7 +165,7 @@ orderOf exhausted release (Cut cost budget) = do
     admitOrdinary owner entry label =
       admitScheduledTask (scheduledEndpoint owner) (request entry [VText label] OrdinaryClass OneShot Nothing) >>= \case
         TaskAccepted _ ticket → pure ticket
-        other → fail ("expected the task accepted, found " <> show other)
+        other → failExample ("expected the task accepted, found " <> show other)
 
 -- | How a contended workload is set up: the finished tasks whose results nobody reads, the
 -- active slots, and the tasks whose tickets are forgotten before they run.
@@ -203,7 +203,7 @@ contendedOrder (Shape unreadHeld active forgotten) release (Cut cost budget) = d
         ticket ←
           admitScheduledTask (scheduledEndpoint owner) (request "once" [VText (Text.pack ("unread" <> show i))] OrdinaryClass OneShot Nothing) >>= \case
             TaskAccepted _ held → pure held
-            other → fail ("expected the task accepted, found " <> show other)
+            other → failExample ("expected the task accepted, found " <> show other)
         awaitEffect (sf fixture) (Text.pack ("unread" <> show i))
         pure ticket
     holdOwner fixture owner
@@ -211,7 +211,7 @@ contendedOrder (Shape unreadHeld active forgotten) release (Cut cost budget) = d
     forM_ [1 .. forgotten] $ \i →
       admitScheduledTask (scheduledEndpoint owner) (request "once" [VText (Text.pack ("forgotten " <> show i))] OrdinaryClass OneShot Nothing) >>= \case
         TaskAccepted _ ticket → forgetTask ticket
-        other → fail ("expected the task accepted, found " <> show other)
+        other → failExample ("expected the task accepted, found " <> show other)
     forM_ [1 .. eventsPer Contended] $ \n → do
       expectDelivered fixture owner "a" n
       expectDelivered fixture owner "b" n
@@ -297,7 +297,7 @@ awaitTicks control fixture owner wanted =
       seen ← logged fixture
       counts ← atomically (scheduledDiagnostics (scheduledEndpoint owner))
       status ← timeout (2 * 1000 * 1000) (awaitScheduledTerminal control owner)
-      fail ("expected " <> show wanted <> " ticks, found " <> show seen <> "; the scheduler: " <> show counts <> "; the owner: " <> show status)
+      failExample ("expected " <> show wanted <> " ticks, found " <> show seen <> "; the scheduler: " <> show counts <> "; the owner: " <> show status)
   where
     wait = do
       seen ← length . filter ("tick" `Text.isPrefixOf`) <$> logged fixture
@@ -375,7 +375,7 @@ unstartedAt base pausing ending events = do
     admitOrdinary owner entry label =
       admitScheduledTask (scheduledEndpoint owner) (request entry [VText label] OrdinaryClass OneShot Nothing) >>= \case
         TaskAccepted _ ticket → pure ticket
-        other → fail ("expected the task accepted, found " <> show other)
+        other → failExample ("expected the task accepted, found " <> show other)
 
 spec ∷ Spec
 spec = describe "the invariants, swept over the configurations that could break them" $ do
@@ -384,7 +384,7 @@ spec = describe "the invariants, swept over the configurations that could break 
       it ("is the same for every budget when " <> show exhausted <> " is exhausted and room is freed by " <> show release) $ bounded $ do
         runs ← forM cuts (orderOf exhausted release)
         case runs of
-          [] → fail "no cuts"
+          [] → failExample "no cuts"
           baseline : others → do
             forM_ others (`shouldBe` baseline)
             -- Every event of every instance was handled, and in the order the instances were

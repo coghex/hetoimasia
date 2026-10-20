@@ -9,7 +9,7 @@
 module Test.LuaRuntime.Subscription.Basics (spec) where
 
 import Control.Concurrent (forkIO)
-import Control.Exception (SomeException, evaluate, try)
+import Control.Exception (evaluate)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Monad (forM, forM_, void, when)
 import Data.List (elemIndex, sort)
@@ -33,7 +33,7 @@ import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support (awaitLine, linesOf, refusalOf)
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfObserver), awaitEntered, blockOn, releaseGate)
 import Test.LuaRuntime.Subscription.Support
-import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, failExample, Gated (..), requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- | An owner of subscribers on elapsed time, granted both endpoints.
 elapsedOwner ∷ IFixture → FakeEvents → LuaRuntime → Text → [ModuleSource] → IO ScheduledOwner
@@ -163,8 +163,8 @@ spec = describe "on an owner on elapsed time" $ do
               endpoint `shouldBe` "ticks"
               Text.length why `shouldBe` 512
               why `shouldSatisfy` Text.isPrefixOf "the producer's backlog was lost"
-            other → fail ("expected a delivery failure, found " <> show other)
-          other → fail ("expected the instance failed, found " <> show other)
+            other → failExample ("expected a delivery failure, found " <> show other)
+          other → failExample ("expected the instance failed, found " <> show other)
         -- Its peer is isolated from it.
         phaseOf fixture owner "peer" >>= (`shouldBe` Just Active)
         d ← subDiagnostics owner
@@ -321,8 +321,10 @@ spec = describe "on an owner on elapsed time" $ do
           if stopFirst
             then do
               void (settleControl fixture owner "i" InstanceStop)
-              -- The instance has stopped: the command is refused, or never runs.
-              void (try (command fixture owner "i" "unsubscribe" "a") ∷ IO (Either SomeException ()))
+              -- The instance has stopped: the command is refused, or never runs. Nothing else is an answer
+              -- to it, and a failure of the example's own is not one.
+              deliverCommand fixture owner "i" "unsubscribe" "a" Nothing Nothing
+                >>= (`shouldSatisfy` \case DeliveryAccepted _ → True; DeliveryClosed → True; DeliveryUnknownTarget → True; _ → False)
             else do
               command fixture owner "i" "unsubscribe" "a"
               awaitLine fixture "cmd unsubscribe a true"

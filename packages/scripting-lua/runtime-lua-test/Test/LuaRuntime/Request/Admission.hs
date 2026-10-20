@@ -4,7 +4,7 @@
 -- provider asked nothing.
 module Test.LuaRuntime.Request.Admission (spec) where
 
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, tryWithContext)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext))
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Resource (cleanupFailureLabel, cleanupFailuresInContext)
 import Hetoimasia.Scripting.Lua.Instance
@@ -20,7 +20,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEffect, awaitEntered, awaitScheduledTerminal, releaseGate, withChunks)
-import Test.LuaRuntime.Support (Gated (..), bounded, expectFatal, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, expectFatal, failExample, Gated (..), optionalPolicy, requiredPolicy, tryExpected, withBoundary, withBoundaryOpening)
 import qualified Data.Text.Encoding as Text
 import Hetoimasia.Scripting.Lua.Owner (chunkName)
 
@@ -142,12 +142,12 @@ spec = describe "admission" $ do
     fixture ← newIFixture
     fake ← newFake
     let source = "rq.start('path', 1)"
-    outcome ← tryWithContext @SomeException $ withBoundary $ \_ runtime → providersFinish fake $ do
+    outcome ← tryExpected $ withBoundary $ \_ runtime → providersFinish fake $ do
       let spec' = withChunks [(chunkName "init", Text.encodeUtf8 source)] (requestSpec fixture "nobody" [asker] cmdConfig (grantOf fake 4) requiredPolicy)
       startRequesterWith fixture runtime spec'
     case outcome of
       Left (ExceptionWithContext _ failure) → show failure `shouldSatisfy` Text.isInfixOf "no instance or task is running" . Text.pack
-      Right _ → fail "expected the initial chunk's request refused"
+      Right _ → failExample "expected the initial chunk's request refused"
     submissions fake >>= (`shouldBe` 0)
 
   it "answers an endpoint the grant does not name as the application's own mistake, a failure of the host" $ bounded $ do
@@ -215,7 +215,7 @@ spec = describe "admission" $ do
       submissions fake >>= (`shouldBe` 0)
       let refused binding = case registration [requestHandleType "request"] [namespace "n" [finalizerEligible binding]] of
             Left (FinalizerCannotStartWork _) → pure ()
-            other → fail ("expected the finalizer eligibility refused, found " <> either show (const "a registration") other)
+            other → failExample ("expected the finalizer eligibility refused, found " <> either show (const "a registration") other)
           requests = [binding | binding ← requestBindings "request" SInteger, bindingKind binding == AsynchronousNativeRequest]
       refused (asynchronousNativeRequestIn "start" [] [] (\_ _ → pure []))
       length requests `shouldBe` 3

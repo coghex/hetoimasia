@@ -19,7 +19,7 @@ import Control.Concurrent.MVar (readMVar)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (fireReg, liveRegs, nanoseconds)
-import Test.LuaRuntime.Support (Gated (..), bounded, expectFatal, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, expectFatal, failExample, Gated (..), requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- | Whether the owner's thread is parked in an STM transaction, which is where an
 -- idle owner is, and nowhere else it ever blocks without an event to wait for.
@@ -42,7 +42,7 @@ spec = describe "idle and stop" $ do
         awaitDiagnostics owner (\counts → diagYielded counts >= 2)
         requestTaskControl endpoint (ticketTask looping) RequestPause >>= \case
           TaskControlAccepted receipt → void (waitControl receipt)
-          other → fail ("the pause was not accepted: " <> show other)
+          other → failExample ("the pause was not accepted: " <> show other)
         awaitIdle fixture
         -- Paused: no segment runs, however long the owner is left.
         before ← length <$> segmentsRun fixture
@@ -76,7 +76,7 @@ spec = describe "idle and stop" $ do
         -- The paused task is still paused through all of it, and resumes on request.
         requestTaskControl endpoint (ticketTask looping) RequestResume >>= \case
           TaskControlAccepted receipt → void (waitControl receipt)
-          other → fail ("the resume was not accepted: " <> show other)
+          other → failExample ("the resume was not accepted: " <> show other)
         awaitDiagnostics owner (\counts → diagYielded counts >= 4)
         retireScheduled owner
 
@@ -112,11 +112,11 @@ spec = describe "idle and stop" $ do
         outcomeOf stuck >>= (`shouldSatisfy` \case SettledReturned _ → True; _ → False)
         outcomes ← forM unstarted $ \case
           TaskAccepted _ ticket → outcomeOf ticket
-          other → fail ("expected the task to have been accepted, found " <> show other)
+          other → failExample ("expected the task to have been accepted, found " <> show other)
         mapM_ (`shouldSatisfy` \case SettledDiscarded (Discard ExitStopped NotStarted) → True; _ → False) outcomes
         atomically (scheduledExitRecord owner) >>= \case
           Just record → (exitNotStarted record, exitStarted record) `shouldBe` (3, 0)
-          Nothing → fail "the owner recorded no exit"
+          Nothing → failExample "the owner recorded no exit"
 
     it "closes every suspended coroutine on its own thread, keeps the closing errors as cleanup evidence beside the others, and settles each task" $ bounded $ do
       fixture ← newSFixture
@@ -125,12 +125,14 @@ spec = describe "idle and stop" $ do
         clean ← admitTask' fixture owner "clean" (request "closes_cleanly" [VText "a"] OrdinaryClass OneShot Nothing)
         bad ← admitTask' fixture owner "bad" (request "closes_badly" [VText "b"] OrdinaryClass OneShot Nothing)
         awaitDiagnostics owner (\counts → diagWaiting counts >= 2)
+        -- Both are suspended, and only the first has said so: the second records its closing, and nothing before it.
+        effects fixture >>= (`shouldBe` ["a suspended"])
         retireScheduled owner
         ended ← tryWithContext @SomeException (awaitScheduledTerminal control owner)
         -- Both were suspended, and both were settled whatever the closing did.
         forM [clean, bad] outcomeOf >>= mapM_ (`shouldSatisfy` \case SettledDiscarded (Discard ExitStopped Started) → True; _ → False)
-        effects fixture >>= (`shouldBe` ["a suspended", "b suspended", "a closed", "b closing"])
-        either rethrowIO (const (fail "the owner should have ended with the closing error")) ended
+        effects fixture >>= (`shouldBe` ["a suspended", "a closed", "b closing"])
+        either rethrowIO (const (failExample "the owner should have ended with the closing error")) ended
       -- The failure of the one close is retained as cleanup evidence on the owner's
       -- outcome, which is fatal.
       length (cleanupFailuresInContext context) `shouldSatisfy` (>= 1)

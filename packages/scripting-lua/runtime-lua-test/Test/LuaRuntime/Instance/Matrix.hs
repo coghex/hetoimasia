@@ -30,7 +30,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (awaitScheduledTerminal)
-import Test.LuaRuntime.Support (Broken (Broken), bounded, brokenIs, expectFatal, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (bounded, Broken (Broken), brokenIs, expectFatal, failExample, requiredPolicy, withBoundary)
 
 -- | What first happens to the instance.
 data First = FirstLua | FirstHost | FirstNone
@@ -237,20 +237,20 @@ cell first hook route = do
   map failureInstance held `shouldBe` replicate (shapeTold shape) identity
   settled ← tickOf fixture "a" >>= pollInstance
   case settled of
-    Nothing → fail "the instance was never settled"
+    Nothing → failExample "the instance was never settled"
     Just result → do
       resultPhase result `shouldBe` shapePhase shape
       terminationShutdown (resultTermination result) `shouldBe` shapeDisposition shape
       case resultOutcome result of
         InstanceDiscarded (Discard ExitFailed Started) → shapeDiscarded shape `shouldBe` True
-        InstanceDiscarded other → fail ("discarded as " <> show other)
+        InstanceDiscarded other → failExample ("discarded as " <> show other)
         InstanceStopped → do
           shapeDiscarded shape `shouldBe` False
           shapePhase shape `shouldBe` Stopped
           isNothing (shapeFirst shape) `shouldBe` True
-        InstanceCompleted → fail "a one-shot's completion"
+        InstanceCompleted → failExample "a one-shot's completion"
         InstanceFailed failure → case shapeFirst shape of
-          Nothing → fail "a failure was not expected"
+          Nothing → failExample "a failure was not expected"
           Just (stage, text) → do
             failureStage failure `shouldBe` stage
             failureMessage failure `shouldSatisfy` Text.isInfixOf text

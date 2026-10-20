@@ -10,7 +10,7 @@
 -- * a task whose stop has begun is not taking requests, as an instance that is stopping is not.
 module Test.LuaRuntime.Request.Invariants (spec) where
 
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, tryWithContext)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext))
 import Control.Monad (void)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Resource (cleanupFailureLabel, cleanupFailuresInContext)
@@ -23,7 +23,7 @@ import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEffect, awaitEntered, awaitScheduledTerminal, releaseGate)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (Gated (..), bounded, expectFatal, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, expectFatal, failExample, Gated (..), optionalPolicy, requiredPolicy, tryExpected, withBoundary, withBoundaryOpening)
 
 step ∷ ScheduledOwner → IO ()
 step owner = void (grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1))
@@ -234,8 +234,8 @@ spec = describe "invariants" $ do
     it "refuses a grant under limits that cannot hold the smallest settlement, naming the reason" $ bounded $ do
       fixture ← newIFixture
       fake ← newFake
-      outcome ← tryWithContext @SomeException $ withBoundary $ \_ runtime → providersFinish fake $
+      outcome ← tryExpected $ withBoundary $ \_ runtime → providersFinish fake $
         startRequesterWith fixture runtime (withLimits (either (error . show) id (valueLimits 32 4 8)) (requestSpec fixture "tiny" [asker] cmdConfig (grantOf fake 4) requiredPolicy))
       case outcome of
         Left (ExceptionWithContext _ failure) → show failure `shouldSatisfy` Text.isInfixOf "SettlementsDoNotFit" . Text.pack
-        Right _ → fail "expected the grant refused"
+        Right _ → failExample "expected the grant refused"

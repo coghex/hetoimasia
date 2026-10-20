@@ -17,7 +17,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEntered, awaitScheduledTerminal, releaseGate)
-import Test.LuaRuntime.Support (Broken (Broken), Gated (..), bounded, brokenIs, expectFatal, expectFatalOpening, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, Broken (Broken), brokenIs, expectFatal, expectFatalOpening, failExample, Gated (..), optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- | Whether a retained failure is the application's own, of this name.
 brokenAmong ∷ Text.Text → ExceptionWithContext SomeException → Bool
@@ -47,7 +47,7 @@ spec = describe "failures" $ do
         command fixture owner "i" "start" "a"
         awaitScheduledTerminal control owner >>= \case
           WorkerUnavailable (ExceptionWithContext _ failure) → failure `shouldSatisfy` brokenIs "submit"
-          other → fail ("expected an unavailable owner, found " <> show other)
+          other → failExample ("expected an unavailable owner, found " <> show other)
         submissions fake >>= (`shouldBe` 0)
         d ← diagnostics owner
         -- Admitted, and taken back: nothing is held for a request that never reached its provider.
@@ -125,7 +125,7 @@ spec = describe "failures" $ do
         finishWork fake 0
         awaitScheduledTerminal control owner >>= \case
           WorkerUnavailable (ExceptionWithContext _ raised) → raised `shouldSatisfy` brokenIs "epoch cancel"
-          other → fail ("expected an unavailable owner, found " <> show other)
+          other → failExample ("expected an unavailable owner, found " <> show other)
 
   describe "a cleanup failure that servicing answered once" $ do
     it "is recorded as the owner's evidence even when the owner is cancelled while the disposal that failed was running" $ bounded $ do
