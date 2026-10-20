@@ -537,9 +537,10 @@ data Retirement = Retirement
 data PublishPoint = BeforeClaim | AfterClaim
   deriving (Eq, Show)
 
--- | Where the driver is in a tick, for a test that holds it: the tick has begun and no grant is issued; it has decided to
--- commit and has not yet taken the commit step; or the step is taken and it has not yet returned.
-data TickPoint = BeforeGrant | BeforeCommitStep | AfterCommitStep
+-- | Where the driver is in a tick, for a test that holds it: the tick has begun and no grant is issued; it is issuing the
+-- grant (the session's state was checked and the grant not yet issued: a stop or a failure is not recorded until the grant is
+-- issued); it has decided to commit and has not yet taken the commit step; or the step is taken and it has not yet returned.
+data TickPoint = BeforeGrant | AtGrant | BeforeCommitStep | AfterCommitStep
   deriving (Eq, Show)
 
 -- | Where a stop is, for a test that holds it: its intent is recorded and admission closed, and nothing has been asked
@@ -1222,9 +1223,21 @@ stepTick domains = do
         Nothing → haltedOrFailed domains
         Just (tick, pausedAtBegin) → do
           configTickHook config BeforeGrant
-          -- No grant is issued once a failure is told or a stop asked for, whenever that came: this is the last check.
-          proceeding ← atomically (not <$> haltedNow shared)
-          granted ← if proceeding then Just <$> grantScheduledStep (scheduledEndpoint owner) (configTickDuration config) else pure Nothing
+          -- No grant is issued once a failure is told or a stop asked for: the check and the mark that a grant is being
+          -- issued are one transaction, and recording a failure or a stop waits for the mark to be cleared, so a grant is
+          -- issued wholly before either is recorded, or not at all.
+          granted ← mask_ $ do
+            proceeding ← atomically $ do
+              over ← haltedNow shared
+              if over then pure False else True <$ writeTVar (sharedGranting shared) True
+            if proceeding
+              then
+                ( do
+                    configTickHook config AtGrant
+                    Just <$> grantScheduledStep (scheduledEndpoint owner) (configTickDuration config)
+                )
+                  `finally` atomically (writeTVar (sharedGranting shared) False)
+              else pure Nothing
           accepted ← case granted of
             Nothing → pure False
             Just (GrantAccepted _) → pure True
@@ -1467,7 +1480,8 @@ stopSession domains = do
   retired ← readTVarIO (sharedClosed shared)
   if retired then retireDomains domains else stopLive domains
 
--- | Ask for the stop from any thread, and never wait: the stop is recorded and admission closed in one transaction, the
+-- | Ask for the stop from any thread, waiting for nothing but a grant that is being issued (a short call that waits for
+-- nothing, so that no grant follows the stop): the stop is recorded and admission closed in one transaction, the
 -- driver's next tick is halted, and every gameplay instance and task is asked to stop, so a tick that is in flight or a wait
 -- that depends on what the session holds can end. It finalizes nothing: the application thread does that, through
 -- 'stopSession' (or 'runSession', which a halted tick returns to), because the waits that settle the session are the
@@ -1476,6 +1490,9 @@ requestStop ∷ Domains → IO ()
 requestStop domains = do
   let shared = domainsShared domains
   atomically $ do
+    -- A grant being issued is issued whole first (a short call that waits for nothing).
+    granting ← readTVar (sharedGranting shared)
+    when granting retry
     _ ← requestStopNow (sharedSession shared)
     closeQueue (sharedQueue shared)
   configStopHook (domainsConfig domains) StopIntended

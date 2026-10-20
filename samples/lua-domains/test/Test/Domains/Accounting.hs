@@ -21,7 +21,7 @@ import Hetoimasia.Sample.LuaDomains
   , Bounds (boundSessionTasks)
   , Domains (domainsGameplay, domainsShared)
   , DomainsDefect (DriverOffApplicationThread, StopOffApplicationThread)
-  , TickPoint (AfterCommitStep, BeforeCommitStep, BeforeGrant)
+  , TickPoint (AfterCommitStep, AtGrant, BeforeCommitStep, BeforeGrant)
   , DomainsConfig (..)
   , Dispositions (dispInvalidated)
   , Evidence (evidenceGameplay)
@@ -45,7 +45,7 @@ import Hetoimasia.Sample.LuaDomains
   )
 import Hetoimasia.Sample.LuaDomains.Bounds (maxSessionTasks)
 import Hetoimasia.Sample.LuaDomains.Scripts (moduleSource)
-import Hetoimasia.Sample.LuaDomains.Session (SessionState (sessionFailureCount))
+import Hetoimasia.Sample.LuaDomains.Session (SessionState (sessionFailureCount), stopRequestedNow)
 import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCommitted, sharedSession, sharedStopsIssued, sharedTaskAdmitting, sharedWaitDepth, sharedWaitThreads))
 import Hetoimasia.Sample.LuaDomains.Snapshot (FailureEvidence (..), SessionFailure (..))
 import Hetoimasia.Scripting.Lua.Instance (InstanceKind (RunOnce), InstanceRequest (..))
@@ -444,6 +444,34 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
           dispInvalidated (snapDispositions snapshot) `shouldBe` [place | Accepted place ← offered]
           atomically (scheduledTick (scheduledEndpoint (startedOwner (domainsGameplay domains)))) `shouldReturn` granted
           balanced domains
+    it "a stop or a failure is not recorded while a grant is being issued, and none is issued after one is recorded: the grant is wholly before it" $
+      forM_ [True, False] $ \asking → do
+        fx ← newFx
+        ui ← newFakeUi
+        withBoundary $ \control →
+          withDomains control (configHere fx ui) {configTickHook = \reached → when (reached == AtGrant) (holdAt fx "at the grant")} $ \domains → withReleased fx ["at the grant", "release"] $ do
+            outcome ←
+              driving
+                domains
+                ( do
+                    -- The driver has checked that the session runs and is issuing the grant, which is not yet issued.
+                    awaitEntered fx "at the grant"
+                    atomically (scheduledTick (scheduledEndpoint (startedOwner (domainsGameplay domains)))) `shouldReturn` 0
+                    recorded ← spawn (if asking then requestStop domains else releaseGate fx "release")
+                    -- Neither the stop nor the failure is recorded while the grant is being issued.
+                    replicateM_ 2000 yield
+                    (atomically (stopRequestedNow (sharedSession (domainsShared domains))) `shouldReturn` False)
+                    toldBy domains `shouldReturn` 0
+                    releaseGate fx "at the grant"
+                    recorded
+                )
+            -- The grant was issued whole, and then the stop or the failure was recorded: the tick it began is the one it stops.
+            atomically (scheduledTick (scheduledEndpoint (startedOwner (domainsGameplay domains)))) `shouldReturn` 1
+            if asking
+              then outcome `shouldSatisfy` \case TickHalted → True; _ → False
+              else do
+                snapshot ← expectFailed outcome
+                (snapTick snapshot, failingTick snapshot) `shouldBe` (0, Just 1)
     it "a fault of a task that no tick resumed, told after tick T's commit step, belongs to the first tick not yet committed: T stays committed, and the session fails at T+1" $ do
       fx ← newFx
       ui ← newFakeUi

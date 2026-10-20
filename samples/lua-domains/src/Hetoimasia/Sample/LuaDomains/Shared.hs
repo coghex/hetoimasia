@@ -194,6 +194,10 @@ data Shared = Shared
     -- ^ The gameplay instances (by position) a stop has been claimed for and requested of, in the one step.
   , sharedTaskSeq ∷ !(TVar Int)
     -- ^ The next task's number.
+  , sharedGranting ∷ !(TVar Bool)
+    -- ^ Whether the driver is issuing a grant: it checks that the session still runs and sets this in one transaction, issues
+    -- the grant, and clears it. Recording a failure or a stop waits while it is set, so a grant is issued wholly before the
+    -- failure or the stop is recorded, or not at all.
   , sharedWaitDepth ∷ !(TVar (Int, Int))
     -- ^ How many of those waits are pending now, and the most there have been at once: never more than one.
   , sharedWaitThreads ∷ !(TVar (Set ThreadId))
@@ -238,6 +242,7 @@ newShared setup = do
     <*> newTVarIO 0
     <*> newTVarIO []
     <*> newTVarIO 0
+    <*> newTVarIO False
     <*> newTVarIO (0, 0)
     <*> newTVarIO Set.empty
     <*> newIORef (pure ())
@@ -419,6 +424,10 @@ assignControl shared _ = do
 -- intention is accepted for a tick after the failure that will never run it, whenever the driver gets to publish.
 failSession ∷ Shared → SessionFailure → STM ()
 failSession shared failure = do
+  -- A grant being issued is issued whole before this is recorded: the transaction waits for it (a short call that waits
+  -- for nothing), and so no grant is issued once a failure is recorded.
+  granting ← readTVar (sharedGranting shared)
+  when granting retry
   recordFailure (sharedSession shared) failure
   closeQueue (sharedQueue shared)
 
