@@ -212,6 +212,7 @@ import Hetoimasia.Sample.LuaDomains.Shared
   , publisherOf
   , readerOf
   , supervisedWait
+  , takesTasks
   , taskAdmissionsDrained
   )
 import Hetoimasia.Sample.LuaDomains.Snapshot
@@ -1056,8 +1057,12 @@ admitGameplayTask domains request = mask_ $ do
           case admission of
             TaskAccepted _ ticket → do
               configAcceptedHook config
-              watched ← atomically (handOffTask shared (maybe "task" id (requestName request)) ticket)
+              -- Registered, and told in the same transaction whether the session still takes work. A halt recorded before this
+              -- transaction was recorded without this task in the registry, so whatever quiescence it ran has missed it; one
+              -- recorded after finds it. Either way the task is stopped, and by its own admitter in the first case.
+              (watched, open) ← atomically ((,) <$> handOffTask shared (maybe "task" id (requestName request)) ticket <*> takesTasks shared)
               startWatcher domains watched
+              unless open (issueTaskStops domains)
             _ → pure ()
           configHandoffHook config
           pure admission

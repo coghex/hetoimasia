@@ -9,7 +9,7 @@ import Control.Concurrent (forkIO, killThread, myThreadId, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, tryReadMVar)
 import Control.Concurrent.STM (atomically, readTVar, readTVarIO, retry)
 import Control.Exception (AsyncException (ThreadKilled), SomeException, finally, fromException, throwIO, try)
-import Control.Monad (forM, forM_, replicateM_, void, when)
+import Control.Monad (forM, forM_, replicateM_, unless, void, when)
 import Data.ByteString (ByteString)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (sort)
@@ -46,7 +46,7 @@ import Hetoimasia.Sample.LuaDomains
 import Hetoimasia.Sample.LuaDomains.Bounds (maxSessionTasks)
 import Hetoimasia.Sample.LuaDomains.Scripts (moduleSource)
 import Hetoimasia.Sample.LuaDomains.Session (SessionState (sessionFailureCount), stopRequestedNow)
-import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCommitted, sharedSession, sharedStopsIssued, sharedTaskAdmitting, sharedWaitDepth, sharedWaitThreads))
+import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCommitted, sharedSession, sharedStopsIssued, sharedTaskAdmitting, sharedWaitDepth, sharedWaitThreads), tasksHeld)
 import Hetoimasia.Sample.LuaDomains.Snapshot (FailureEvidence (..), SessionFailure (..))
 import Hetoimasia.Scripting.Lua.Instance (InstanceKind (RunOnce), InstanceRequest (..))
 import Hetoimasia.Scripting.Lua.Owner (EntryPoint (EntryPoint), ModuleRef (ModuleRef), ModuleSource, Requirement (Required))
@@ -342,8 +342,9 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
           [ "function update(self, dt) staging.finish() end"
           , "function task_waits_then_fails() sched.wait_ticks(1) error('task failed') end"
           , "function task_fails() error('task failed') end"
+          , "function task_waits_then_yields() sched.wait_ticks(1) while true do sched.yield() end end"
           ]
-        entriesHere = [EntryPoint "task_waits_then_fails" Required [] [], EntryPoint "task_fails" Required [] []]
+        entriesHere = [EntryPoint "task_waits_then_fails" Required [] [], EntryPoint "task_fails" Required [] [], EntryPoint "task_waits_then_yields" Required [] []]
         peerModule = extraModule ["function run(self) while not fx.released('release') do sched.yield() end error('the peer failed') end"]
         configHere fx ui =
           (withWait (sampleConfig fx ui))
@@ -444,6 +445,50 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
           dispInvalidated (snapDispositions snapshot) `shouldBe` [place | Accepted place ← offered]
           atomically (scheduledTick (scheduledEndpoint (startedOwner (domainsGameplay domains)))) `shouldReturn` granted
           balanced domains
+    forM_ [True, False] $ \failing →
+      it ((if failing then "a failure" else "a concurrent stop request") <> " recorded while a task is accepted and not yet registered still stops the task, which its admitter does when it registers it: the tick it keeps outstanding completes, and nothing is left running") $ do
+        fx ← newFx
+        ui ← newFakeUi
+        withBoundary $ \control →
+          withDomains control (configHere fx ui) {configAcceptedHook = holdAt fx "accepted"} $ \domains → withReleased fx ["accepted", "release"] $ do
+            -- The owner accepts the task, which runs to its wait for the next tick; its admitter is held before it registers it.
+            admitter ← spawn (admitGameplayTask domains (task "yielding task" "task_waits_then_yields"))
+            awaitEntered fx "accepted"
+            waitFor (scheduledDiagnostics (scheduledEndpoint (startedOwner (domainsGameplay domains))) >>= \diagnostics → when (diagWaiting diagnostics < 1) retry)
+            outcome ←
+              driving
+                domains
+                ( do
+                    -- The tick resumes the task, which yields for ever and keeps the tick outstanding. Quiescence runs now and
+                    -- cannot find the task, which is not registered.
+                    waitFor (ticksOutstanding (scheduledEndpoint (startedOwner (domainsGameplay domains))) >>= \outstanding → when (outstanding < 1) retry)
+                    if failing then releaseGate fx "release" >> faultsTold domains else requestStop domains
+                    -- The admitter registers the task, finds the session halted, and stops it itself.
+                    releaseGate fx "accepted"
+                )
+            admitter >>= (`shouldSatisfy` accepted)
+            if failing
+              then do
+                snapshot ← expectFailed outcome
+                (snapTick snapshot, failingTick snapshot) `shouldBe` (0, Just 1)
+              else outcome `shouldSatisfy` \case TickHalted → True; _ → False
+            _ ← if failing then pure () else void (stopSession domains)
+            generous (waitFor (tasksHeld (domainsShared domains) >>= \held → when (held > 0) retry))
+    forM_ [True, False] $ \failing →
+      it ((if failing then "a failure" else "a concurrent stop request") <> " recorded after an admission was entered and before the owner is asked still stops the task, which its admitter does when it registers it: with no driver and no stop to repair it, the task ends") $ do
+        fx ← newFx
+        ui ← newFakeUi
+        withBoundary $ \control →
+          withDomains control (configHere fx ui) {configTaskHook = holdAt fx "admitting"} $ \domains → withReleased fx ["admitting", "release"] $ do
+            admitter ← spawn (admitGameplayTask domains (task "yielding task" "task_waits_then_yields"))
+            awaitEntered fx "admitting"
+            -- The admission has entered, and the session then halts; the registry holds nothing for quiescence to stop.
+            if failing then releaseGate fx "release" >> faultsTold domains else requestStop domains
+            releaseGate fx "admitting"
+            admitter >>= (`shouldSatisfy` accepted)
+            -- Nothing else runs: the task that waits for ticks it will never be granted has been stopped, and told.
+            generous (waitFor (tasksHeld (domainsShared domains) >>= \held → when (held > 0) retry))
+            unless failing (void (stopSession domains))
     it "a stop or a failure is not recorded while a grant is being issued, and none is issued after one is recorded: the grant is wholly before it" $
       forM_ [True, False] $ \asking → do
         fx ← newFx
