@@ -25,7 +25,8 @@
 --   the UI's control bindings and the assignment the lifecycle grant asks for, both on the UI owner's
 --   callback thread; the driver reads them.
 -- * 'sharedWorkspaces': the workspace bindings' acquire and release, on the gameplay owner's threads.
--- * 'sharedTasks': the driver, on the application thread.
+-- * 'sharedTasks', 'sharedTaskAdmitting': whoever admits a task and whoever observes the tasks' settlements (the
+--   driver, a stop from any thread), each under the 'sharedTasks' lock.
 --
 -- The UI never reads 'sharedCommitted' or 'sharedTick'; gameplay never reads 'sharedView' or the
 -- snapshot. Each owner's namespaces are the only way its VM reaches any of this
@@ -64,6 +65,10 @@ module Hetoimasia.Sample.LuaDomains.Shared
   , gameplayBegan
   , gameplayFinish
   , failSession
+  , enterTaskAdmission
+  , leaveTaskAdmission
+  , taskAdmissionsDrained
+  , takesTasks
     -- * Workspaces
   , Workspace (..)
   , openWorkspace
@@ -73,6 +78,7 @@ module Hetoimasia.Sample.LuaDomains.Shared
   , Watched (..)
   ) where
 
+import Control.Concurrent.MVar (MVar, newMVar)
 import Control.Concurrent.STM
   ( STM
   , TVar
@@ -80,12 +86,12 @@ import Control.Concurrent.STM
   , modifyTVar'
   , newTVarIO
   , readTVar
+  , retry
   , throwSTM
   , writeTVar
   )
 import Control.Exception (Exception)
 import Control.Monad (when)
-import Data.IORef (IORef, newIORef)
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
@@ -106,7 +112,7 @@ import Hetoimasia.Foundation.Resource (acquirePart, releaseRank)
 import Hetoimasia.Sample.LuaDomains.Bounds (Bounds (boundPendingControls))
 import Hetoimasia.Sample.LuaDomains.Candidate (Candidate (..), Move, StagingRefusal, begin, draw, finish, stage)
 import Hetoimasia.Sample.LuaDomains.Intention (Answer (..), FullCause (..), Submitted, validate)
-import Hetoimasia.Sample.LuaDomains.Queue (AdmitAt (..), Queue, admitNext, closeQueue, isClosed, newQueue, nextUnstarted)
+import Hetoimasia.Sample.LuaDomains.Queue (AdmitAt (..), Queue, admitNext, closeQueue, hasTickLeft, isClosed, newQueue, nextUnstarted)
 import Hetoimasia.Sample.LuaDomains.Session (SessionState, failedNow, newSessionState, recordFailure, stopRequestedNow)
 import Hetoimasia.Sample.LuaDomains.Snapshot (GameSnapshot, SessionFailure, initialSnapshot)
 import Hetoimasia.Sample.LuaDomains.Tally
@@ -166,7 +172,11 @@ data Shared = Shared
   , sharedReceipts ∷ !(TVar Int)
   , sharedUiNotes ∷ !(TVar UiNotes)
   , sharedUiFailure ∷ !(TVar (Maybe SessionFailure))
-  , sharedTasks ∷ !(IORef [Watched])
+  , sharedTasks ∷ !(MVar [Watched])
+    -- ^ The tasks the session watches. Whoever observes them holds the lock for the whole observation, so each
+    -- settlement is consumed once.
+  , sharedTaskAdmitting ∷ !(TVar Int)
+    -- ^ The task admissions between the check that the session takes tasks and the task's being watched.
   , sharedAssignHook ∷ !(IO ())
   , sharedScenario ∷ !Text
   , sharedClosed ∷ !(TVar Bool)
@@ -200,7 +210,8 @@ newShared setup = do
     <*> newTVarIO 0
     <*> newTVarIO (UiNotes 0 0 [])
     <*> newTVarIO Nothing
-    <*> newIORef []
+    <*> newMVar []
+    <*> newTVarIO 0
     <*> pure (setupAssignHook setup)
     <*> pure (setupScenario setup)
     <*> newTVarIO False
@@ -350,7 +361,7 @@ abandonReceipts shared = atomically $ do
 
 -- | Where a control the UI asks for belongs: the next tick that has not begun, and the next place among
 -- the controls of that tick; declined when the session has failed, is stopping or is closed, or has no tick
--- left. It reads the tick in one transaction with the place it takes, and the driver begins no tick while a
+-- left (a finite session's last tick has begun, so the next unstarted tick is beyond it). It reads the tick in one transaction with the place it takes, and the driver begins no tick while a
 -- request is between this and the engine's admission (the UI's bracket), so the engine never finds the tick
 -- begun.
 assignControl ∷ Shared → ControlRequestInfo → IO (Maybe ControlSlot)
@@ -360,9 +371,10 @@ assignControl shared _ = do
     failed ← failedNow (sharedSession shared)
     stopping ← stopRequestedNow (sharedSession shared)
     held ← readTVar (sharedReceipts shared)
+    left ← hasTickLeft (sharedQueue shared)
     -- The engine holds a reservation for each accepted control until its receipt is read; the owner has as many
     -- as the pending bound and one more for each instance the stop must reach, so the stop is always admitted.
-    if closed || failed || stopping || held >= boundPendingControls (sharedBounds shared)
+    if closed || failed || stopping || not left || held >= boundPendingControls (sharedBounds shared)
       then pure Nothing
       else do
         tick ← nextUnstarted (sharedQueue shared)
@@ -380,6 +392,34 @@ failSession ∷ Shared → SessionFailure → STM ()
 failSession shared failure = do
   recordFailure (sharedSession shared) failure
   closeQueue (sharedQueue shared)
+
+-- | Whether the session takes tasks: it has not failed, is not stopping, and its admission is open. Failing, stopping and
+-- ending all close the queue in the transaction that records them, so a closed queue is the one answer to all three.
+takesTasks ∷ Shared → STM Bool
+takesTasks shared = do
+  closed ← isClosed (sharedQueue shared)
+  failed ← failedNow (sharedSession shared)
+  stopping ← stopRequestedNow (sharedSession shared)
+  pure (not (closed || failed || stopping))
+
+-- | Enter a task admission, if the session takes tasks: the check and the entry are one transaction, and the entry
+-- is what the session's ending waits for ('taskAdmissionsDrained'), so no task is admitted to the owner once the
+-- session has ended.
+enterTaskAdmission ∷ Shared → STM Bool
+enterTaskAdmission shared = do
+  open ← takesTasks shared
+  when open (modifyTVar' (sharedTaskAdmitting shared) (+ 1))
+  pure open
+
+-- | The admission entered is over: the task is accepted and watched, or refused.
+leaveTaskAdmission ∷ Shared → STM ()
+leaveTaskAdmission shared = modifyTVar' (sharedTaskAdmitting shared) (\held → max 0 (held - 1))
+
+-- | Retry until no task admission is between its check and its being watched.
+taskAdmissionsDrained ∷ Shared → STM ()
+taskAdmissionsDrained shared = do
+  held ← readTVar (sharedTaskAdmitting shared)
+  when (held > 0) retry
 
 -- Gameplay ---------------------------------------------------------------------
 

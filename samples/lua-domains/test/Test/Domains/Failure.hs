@@ -8,7 +8,7 @@ import Control.Concurrent.STM (atomically, readTVarIO)
 import Control.Exception (SomeException, throwIO, try)
 import Control.Concurrent (yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
-import Control.Monad (forM_, join, replicateM_, when)
+import Control.Monad (forM, forM_, join, replicateM_, when)
 import Data.ByteString (ByteString)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (isNothing)
@@ -18,14 +18,14 @@ import qualified Data.Text as Text
 import Hetoimasia.Runtime.Supervision (WorkerStatus (WorkerLive))
 import Hetoimasia.Sample.LuaDomains
   ( Answer (Closed)
-  , Domains (domainsGameplay, domainsShared)
-  , DomainsConfig (configInput, configPublishHook, configExtensions, configGameplayEntries, configGameplayInstances, configGameplayModules, configGameplaySource)
+  , Domains (domainsControl, domainsGameplay, domainsShared)
+  , DomainsConfig (configInput, configPublishHook, configTaskHook, configExtensions, configGameplayEntries, configGameplayInstances, configGameplayModules, configGameplaySource)
   , Evidence (evidenceAfter, evidenceFailures, evidenceGameplay)
   , Extension (Extension)
   , GameSnapshot (snapStatus, snapTick, snapWorld)
   , OwnerEvidence (evidenceEnded)
   , PublishPoint (AfterClaim, BeforeClaim)
-  , SessionStatus (Failed)
+  , SessionStatus (Failed, Stopped)
   , Started (startedOwner)
   , TickOutcome (TickFailed, TickHalted)
   , Where (InGameplay)
@@ -38,7 +38,7 @@ import Hetoimasia.Sample.LuaDomains
   )
 import Hetoimasia.Sample.LuaDomains.Scripts (moduleSource)
 import Hetoimasia.Sample.LuaDomains.Session (SessionState (sessionFailureCount, sessionFailures))
-import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCommitted, sharedSession, sharedTick))
+import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCommitted, sharedSession, sharedTick), failSession)
 import Hetoimasia.Sample.LuaDomains.Snapshot (FailureEvidence (..), SessionFailure (..))
 import Hetoimasia.Sample.LuaDomains.World (initialWorld)
 import Hetoimasia.Scripting.Lua.Instance (InstanceKind (EventOnly, RunOnce), InstanceRequest (..))
@@ -47,9 +47,10 @@ import Hetoimasia.Scripting.Lua.Registration (WaitKind (WaitLogical), namespace,
 import Hetoimasia.Scripting.Lua.Scheduled
   ( ScheduledOwner
   , ServiceClass (OrdinaryClass)
-  , TaskAdmission (TaskAccepted)
+  , TaskAdmission (TaskAccepted, TaskAdmissionClosed)
   , TaskKind (OneShot)
   , TaskRequest (..)
+  , awaitTask
   , scheduledEndpoint
   , scheduledStatus
   , scheduledTick
@@ -330,6 +331,68 @@ spec = describe "the failure of the gameplay session" $ do
             forM_ task $ \_ → admitGameplayTask domains (TaskRequest (ModuleRef "gameplay" "1") "task_fails" [] OrdinaryClass OneShot (Just "faulting task"))
             _ ← stepTick domains >>= expectFailed
             readIORef answered `shouldReturn` Just Closed
+
+  describe "a session takes no task once it has failed or stopped" $ do
+    let runs = gameplayWith ["function update(self, dt) staging.finish() end", "function task_runs() fx.record('task ran') end"]
+        runsConfig config = config {configGameplaySource = runs, configGameplayEntries = [EntryPoint "task_runs" Required [] []]}
+        taskRuns = TaskRequest (ModuleRef "gameplay" "1") "task_runs" [] OrdinaryClass OneShot (Just "late task")
+    it "refuses a task after the failure was published, and the task never runs" $
+      withSample (\config → (runsConfig config) {configGameplaySource = gameplayWith ["function update(self, dt) error('update failed') end", "function task_runs() fx.record('task ran') end"]}) $ \fx _ domains → do
+        _ ← stepTick domains >>= expectFailed
+        admitGameplayTask domains taskRuns >>= (`shouldSatisfy` \case TaskAdmissionClosed → True; _ → False)
+        _ ← stopSession domains
+        fxLines fx >>= (`shouldNotContain` ["task ran"])
+    it "refuses a task after a stop, and the task never runs" $
+      withSample runsConfig $ \fx _ domains → do
+        _ ← stopSession domains
+        admitGameplayTask domains taskRuns >>= (`shouldSatisfy` \case TaskAdmissionClosed → True; _ → False)
+        fxLines fx >>= (`shouldNotContain` ["task ran"])
+    it "refuses a task once the failure is recorded, before the driver has published it" $
+      withSample (\config → (runsConfig config) {configGameplaySource = gameplayWith ["function update(self, dt) error('update failed') end", "function task_runs() fx.record('task ran') end"]}) $ \fx _ domains → do
+        atomically (failSession (domainsShared domains) (SessionFailure "test" "run" "run" 0 "script fault" "recorded"))
+        admitGameplayTask domains taskRuns >>= (`shouldSatisfy` \case TaskAdmissionClosed → True; _ → False)
+        _ ← stopSession domains
+        fxLines fx >>= (`shouldNotContain` ["task ran"])
+    it "does not publish the ending while an admission that began before it is unfinished, and then publishes it" $ do
+      fx ← newFx
+      ui ← newFakeUi
+      withBoundary $ \control →
+        withDomains control (runsConfig (sampleConfig fx ui)) {configInput = [], configTaskHook = holdAt fx "admitting"} $ \domains →
+          withReleased fx ["admitting"] $ do
+            admit ← spawn (admitGameplayTask domains taskRuns)
+            awaitEntered fx "admitting"
+            stop ← spawn (stopSession domains)
+            waitFor (awaitClosed domains)
+            replicateM_ 2000 yield
+            revisionNow domains `shouldReturn` 0
+            releaseGate fx "admitting"
+            admit >>= (`shouldSatisfy` \case TaskAccepted _ _ → True; _ → False)
+            _ ← stop
+            (snapshot, revision) ← snapshotNow domains
+            (revision, snapStatus snapshot) `shouldBe` (1, Stopped)
+
+  describe "the settlements of the tasks a session watches are consumed once" $
+    it "counts each task's fault once however many stops overlap" $
+      forM_ [1 .. 10 ∷ Int] $ \_ → do
+        let tasks = 6 ∷ Int
+        withSample
+          ( \config →
+              config
+                { configGameplaySource = gameplayWith ["function update(self, dt) staging.finish() end", "function task_fails() error('task failed') end"]
+                , configGameplayEntries = [EntryPoint "task_fails" Required [] []]
+                }
+          )
+          $ \_ _ domains → do
+            tickets ← forM [1 .. tasks] $ \_ →
+              admitGameplayTask domains (TaskRequest (ModuleRef "gameplay" "1") "task_fails" [] OrdinaryClass OneShot (Just "faulting task")) >>= \case
+                TaskAccepted _ ticket → pure ticket
+                other → throwIO (userError ("the task was not admitted: " <> show other))
+            forM_ tickets (generous . awaitTask (domainsControl domains))
+            first ← spawn (stopSession domains)
+            second ← spawn (stopSession domains)
+            _ ← first
+            _ ← second
+            sessionFailureCount <$> readTVarIO (sharedSession (domainsShared domains)) >>= (`shouldBe` tasks)
   where
     isHalted = \case
       TickHalted → True

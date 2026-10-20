@@ -53,6 +53,7 @@ module Hetoimasia.Sample.LuaDomains.Queue
   , settle
   , closeQueue
   , isClosed
+  , hasTickLeft
   , drain
   , reserved
   , nextUnstarted
@@ -147,6 +148,13 @@ closeQueue queue = do
 -- | Whether admission has ended.
 isClosed ∷ Queue → STM Bool
 isClosed queue = stateClosed <$> readTVar (queueState queue)
+
+-- | Whether the finite session has a tick left that has not started: the next unstarted tick is within the session.
+-- A session with no limit always has one.
+hasTickLeft ∷ Queue → STM Bool
+hasTickLeft queue = do
+  next ← stateNext <$> readTVar (queueState queue)
+  pure (maybe True (next <=) (queueFinal queue))
 
 -- | The UI's path: admit for the next tick that has not started, at the next free place in it. It
 -- reads the tick and takes the place in one transaction, so it cannot be late or a duplicate.

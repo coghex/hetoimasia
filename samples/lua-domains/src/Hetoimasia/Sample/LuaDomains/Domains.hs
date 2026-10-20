@@ -112,6 +112,7 @@ module Hetoimasia.Sample.LuaDomains.Domains
   , cleanupEvidence
   ) where
 
+import Control.Concurrent.MVar (modifyMVar_)
 import Control.Concurrent.STM
   ( STM
   , atomically
@@ -127,6 +128,7 @@ import Control.Exception
   , ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException
   , SomeException
+  , finally
   , fromException
   , mask
   , mask_
@@ -137,7 +139,6 @@ import Control.Exception
   )
 import Control.Monad (forM, forM_, join, unless, void, when)
 import Data.ByteString (ByteString)
-import Data.IORef (modifyIORef', readIORef, writeIORef)
 import qualified Data.Set as Set
 import Data.Int (Int64)
 import qualified Data.List.NonEmpty as NonEmpty
@@ -195,11 +196,15 @@ import Hetoimasia.Sample.LuaDomains.Shared
   , abandonReceipts
   , assignControl
   , captureView
+  , enterTaskAdmission
   , failSession
+  , leaveTaskAdmission
   , newShared
   , publishInitial
   , publisherOf
   , readerOf
+  , taskAdmissionsDrained
+  , takesTasks
   )
 import Hetoimasia.Sample.LuaDomains.Snapshot
   ( GameSnapshot (..)
@@ -355,6 +360,8 @@ data DomainsConfig = DomainsConfig
     -- ^ Test-only: the last word on the gameplay owner's configuration (a request service and subscriptions).
   , configAssignHook ∷ !(IO ())
     -- ^ Test-only: run by a control's assignment before it returns, in the interval before the engine admits it.
+  , configTaskHook ∷ !(IO ())
+    -- ^ Test-only: run inside a task admission, after the session was found to take tasks and before the owner is asked.
   , configPublishHook ∷ !(PublishPoint → IO ())
     -- ^ Test-only: run by the publication that ends a session, before it takes the publication and after, in the
     -- interval before the snapshot is published.
@@ -392,6 +399,7 @@ defaultConfig =
     , configGameplayInstances = []
     , configGameplaySpec = id
     , configAssignHook = pure ()
+    , configTaskHook = pure ()
     , configPublishHook = const (pure ())
     , configUiSeesEnd = True
     , configPace = \_ → pure ()
@@ -958,32 +966,48 @@ fence domains = do
     other → throwIO (FenceFailed (show other))
 
 -- | Admit a task to the gameplay owner as the session's: if it faults, the session fails, as an instance's
--- failure fails it.
+-- failure fails it. A session that has failed, is stopping or has ended takes none: the answer is
+-- 'TaskAdmissionClosed' and nothing reaches the owner. An admission that began before the session ended is
+-- finished, and watched, before the ending is published or the settlements are read for it.
 admitGameplayTask ∷ Domains → TaskRequest → IO TaskAdmission
-admitGameplayTask domains request = do
-  admission ← admitScheduledTask (scheduledEndpoint (startedOwner (domainsGameplay domains))) request
-  case admission of
-    TaskAccepted _ ticket →
-      modifyIORef' (sharedTasks (domainsShared domains)) (<> [Watched (maybe "task" id (requestName request)) ticket])
-    _ → pure ()
-  pure admission
+admitGameplayTask domains request = mask_ $ do
+  let shared = domainsShared domains
+  entered ← atomically (enterTaskAdmission shared)
+  if not entered
+    then pure TaskAdmissionClosed
+    else
+      ( do
+          configTaskHook (domainsConfig domains)
+          admission ← admitScheduledTask (scheduledEndpoint (startedOwner (domainsGameplay domains))) request
+          case admission of
+            TaskAccepted _ ticket →
+              modifyMVar_ (sharedTasks shared) (pure . (<> [Watched (maybe "task" id (requestName request)) ticket]))
+            _ → pure ()
+          pure admission
+      )
+        `finally` atomically (leaveTaskAdmission shared)
 
 -- | Read the settlement of each task the session admitted that has one, and record a fault as a session failure.
--- Each task is read once.
+-- Each task is read once: the observation holds the lock on the watched tasks throughout, so concurrent observers
+-- (a stop, the driver) take it in turn and the second finds nothing left. Once the session takes no more tasks, the
+-- admissions that began before wait to be watched first, so none is missed.
 watchTasks ∷ Domains → IO ()
 watchTasks domains = do
   let shared = domainsShared domains
-  held ← readIORef (sharedTasks shared)
-  remaining ← forM held $ \watched →
-    pollTask (watchedTicket watched) >>= \case
-      Nothing → pure (Just watched)
-      Just settlement → do
-        forM_ (faultOf (settledOutcome settlement)) $ \(kind, message) →
-          atomically $ do
-            tick ← currentTick shared
-            failSession shared (SessionFailure (watchedName watched) "task" "task" tick kind (boundedMessage message))
-        pure Nothing
-  writeIORef (sharedTasks shared) (catMaybes remaining)
+  atomically $ do
+    open ← takesTasks shared
+    unless open (taskAdmissionsDrained shared)
+  modifyMVar_ (sharedTasks shared) $ \held → do
+    remaining ← forM held $ \watched →
+      pollTask (watchedTicket watched) >>= \case
+        Nothing → pure (Just watched)
+        Just settlement → do
+          forM_ (faultOf (settledOutcome settlement)) $ \(kind, message) →
+            atomically $ do
+              tick ← currentTick shared
+              failSession shared (SessionFailure (watchedName watched) "task" "task" tick kind (boundedMessage message))
+          pure Nothing
+    pure (catMaybes remaining)
   where
     faultOf = \case
       SettledFaulted fault → Just ("script fault", Text.pack (take 600 (show fault)))
@@ -1206,7 +1230,7 @@ publishEnding domains ending = mask_ $ do
       then pure Nothing
       else
         -- Taking the publication waits for another's to finish, and then there is nothing left to publish.
-        claimEnding var >>= \case
+        taskAdmissionsDrained shared >> claimEnding var >>= \case
           False → pure Nothing
           True → do
             committed ← readTVar (sharedCommitted shared)

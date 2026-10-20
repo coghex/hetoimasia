@@ -16,7 +16,7 @@ import Data.Text (Text)
 import Hetoimasia.Sample.LuaDomains
   ( Bounds (boundPendingControls)
   , Domains (domainsShared)
-  , DomainsConfig (configAssignHook, configGameplaySource, configInput, configUiSource)
+  , DomainsConfig (configAssignHook, configGameplaySource, configInput, configTicks, configUiSource)
   , DomainsDefect (TickNotCompleted)
   , GameSnapshot (snapStatus)
   , SessionStatus (Paused, Running)
@@ -169,6 +169,19 @@ spec = describe "the UI's control of the gameplay behavior" $ do
           Left (TickNotCompleted tick) → tick `shouldBe` 1
           Left other → expectationFailure ("a different defect: " <> show other)
           Right _ → expectationFailure "the tick committed"
+
+  describe "a finite session's last tick" $
+    it "takes no control for a tick that cannot run: a request made while the last tick runs is refused as unassigned" $
+      withSample (\config → config {configInput = [], configTicks = Just 1, configGameplaySource = luaLines ["function update(self, dt) fx.hold('last') staging.finish() end"], configUiSource = uiActing ["control.pause()", ""]}) $ \fx ui domains →
+        withReleased fx ["last"] $ do
+          collect ← spawn (stepTick domains)
+          awaitEntered fx "last"
+          uiStep domains ui
+          releaseGate fx "last"
+          _ ← collect
+          counts ← readTVarIO (sharedControls (domainsShared domains))
+          (controlOffered counts, controlAccepted counts, Map.toList (controlRefused counts)) `shouldBe` (1, 0, [("unassigned", 1)])
+          controlsBalance domains
 
   describe "serialization with the tick" $
     it "holds the tick's begin from the control's assignment until the engine has admitted the control: a tick attempted in that interval does not begin, and the control is applied in the tick it was assigned, never late" $ do
