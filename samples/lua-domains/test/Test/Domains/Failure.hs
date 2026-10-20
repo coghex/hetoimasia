@@ -498,10 +498,11 @@ spec = describe "the failure of the gameplay session" $ do
                 }
           )
           $ \_ _ domains → do
-            tickets ← forM [1 .. tasks] $ \_ →
-              admitGameplayTask domains (TaskRequest (ModuleRef "gameplay" "1") "task_fails" [] OrdinaryClass OneShot (Just "faulting task")) >>= \case
-                TaskAccepted _ ticket → pure ticket
-                other → throwIO (userError ("the task was not admitted: " <> show other))
+            -- The first fault is told as soon as it has one, which closes admission: the tasks after it may be refused.
+            admissions ← forM [1 .. tasks] $ \_ →
+              admitGameplayTask domains (TaskRequest (ModuleRef "gameplay" "1") "task_fails" [] OrdinaryClass OneShot (Just "faulting task"))
+            let tickets = [ticket | TaskAccepted _ ticket ← admissions]
+            tickets `shouldSatisfy` (not . null)
             settled ← forM tickets (generous . awaitTask (domainsControl domains))
             -- The first fault asks the tasks that have not run to stop, so how many fault is the library's to say; each is
             -- told once, by its watcher, the driver and the stop however they overlap.

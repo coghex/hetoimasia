@@ -1168,10 +1168,7 @@ stepTick domains = do
       config = domainsConfig domains
       gameplay = domainsGameplay domains
       owner = startedOwner gameplay
-  pending ← atomically $ do
-    failed ← failedNow (sharedSession shared)
-    state ← readTVar (sharedSession shared)
-    pure (failed && sessionEnded state == Nothing)
+  pending ← failurePending shared
   if pending
     then maybe TickHalted TickFailed <$> publishEnding domains EndedByFailure
     else do
@@ -1198,7 +1195,8 @@ stepTick domains = do
             paused ← maybe False ((== Instance.Paused) . snapshotPhase) <$> behaviorNow gameplay
             pure (Just (tick, paused))
       case begun of
-        Nothing → pure TickHalted
+        -- A failure told between the check above and the begin (a task's watcher, say) is published all the same.
+        Nothing → haltedOrFailed domains
         Just (tick, pausedAtBegin) → do
           granted ← grantScheduledStep (scheduledEndpoint owner) (configTickDuration config)
           accepted ← case granted of
@@ -1209,7 +1207,7 @@ stepTick domains = do
               over ← atomically (haltedNow shared)
               if over then pure False else throwIO (TickNotGranted tick (show other))
           if not accepted
-            then pure TickHalted
+            then haltedOrFailed domains
             else do
               waited ← serially domains (awaitTicksComplete (domainsControl domains) owner)
               accounted ← awaitAccounting domains
@@ -1221,6 +1219,20 @@ stepTick domains = do
                 unless over (throwIO (OwnerEndedDuringTick tick))
               watchTasks domains
               decide domains tick pausedAtBegin
+
+-- | Whether a failure has been told and its publication has not been made.
+failurePending ∷ Shared → IO Bool
+failurePending shared = atomically $ do
+  failed ← failedNow (sharedSession shared)
+  state ← readTVar (sharedSession shared)
+  pure (failed && sessionEnded state == Nothing)
+
+-- | The outcome of a tick that did not begin because the session no longer runs one: halted, or, if a failure has been told and
+-- not yet published, failed, with the one publication the failure owes.
+haltedOrFailed ∷ Domains → IO TickOutcome
+haltedOrFailed domains = do
+  pending ← failurePending (domainsShared domains)
+  if pending then maybe TickHalted TickFailed <$> publishEnding domains EndedByFailure else pure TickHalted
 
 -- | What the driver decided after the accounting.
 data Verdict
