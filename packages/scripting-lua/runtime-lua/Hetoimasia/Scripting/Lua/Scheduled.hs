@@ -398,6 +398,7 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , newScheduler
   , readDiagnostics
   , readTick
+  , retainsEvidence
   , releaseTick
   , requestControl
   , requestWaiting
@@ -1024,7 +1025,10 @@ awaitScheduledAccounting supervision owner = do
           -- Cleanup evidence the owner holds ends it as a failure, whatever else it has done:
           -- the accounting is not a success while it is held.
           tainted ← acTainted <$> readTVar (controlAccounting control)
-          if exiting || tainted
+          -- And what the scheduler holds this instant: the failure of a close that no boundary has
+          -- yet sealed or accounted for is the owner's end all the same.
+          retained ← retainsEvidence (controlScheduler control)
+          if exiting || tainted || retained
             then retry
             else accountingReady control >> pure AccountingComplete
         _ → pure AccountingOwnerEnded

@@ -36,6 +36,7 @@ module Test.LuaRuntime.Accounting.Support
     -- * The tasks
   , windowTasks
   , windowTasksRef
+  , closesGated
   , blockAfterTicks
     -- * Grants
   , grant
@@ -314,9 +315,25 @@ windowTasks =
         , "  fx.block(name)"
         , "  return 1"
         , "end"
+        , "function close_at(name)"
+        , "  local guard <close> = setmetatable({}, {__close = function() fx.block(name) end})"
+        , "  sched.wait_ticks(1)"
+        , "end"
         ]
     )
-    [EntryPoint "block_after" Required [SText, SInteger] [SInteger]]
+    [EntryPoint "block_after" Required [SText, SInteger] [SInteger], EntryPoint "close_at" Required [SText] []]
+
+-- | A task of that module that waits a tick holding a variable whose closing handler waits at this gate.
+closesGated ∷ Text.Text → TaskRequest
+closesGated gate' =
+  TaskRequest
+    { requestModule = windowTasksRef
+    , requestEntry = "close_at"
+    , requestArguments = [VText gate']
+    , requestClass = OrdinaryClass
+    , requestKind = OneShot
+    , requestName = Nothing
+    }
 
 -- | A task of that module: wait this many ticks and then wait at this gate.
 blockAfterTicks ∷ Text.Text → Int → TaskRequest
@@ -359,5 +376,5 @@ holdingSafely fixture owner body = do
 releasing ∷ SFixture → [Gate] → IO a → IO a
 releasing fixture gates action =
   action `finally` do
-    forM_ ["holder", "hold", "close", "shutdown", "a", "b", "blk"] (releaseGate fixture)
+    forM_ ["holder", "hold", "close", "shutdown", "a", "b", "blk", "y"] (releaseGate fixture)
     forM_ gates openGate

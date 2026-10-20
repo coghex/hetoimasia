@@ -6,11 +6,13 @@
 -- Every example coordinates with gates and with threads parked in STM, never a sleep.
 module Test.LuaRuntime.Accounting.Waits (spec) where
 
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, tryReadMVar)
 import Control.Concurrent.STM (atomically, retry)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), finally, throwIO)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, fromException, throwIO, try)
 import Control.Monad (forM_, replicateM_, void, when)
 import Data.IORef (readIORef, writeIORef)
 import Data.Text (Text)
+import System.Timeout (Timeout)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Log (unsafeComponent)
 import Hetoimasia.Foundation.Worker (GroupStatus (..), Outstanding (..), OutstandingWorker (..))
@@ -271,6 +273,36 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
           throwIO (userError "the wait returned instead of rethrowing the fatal failure")
       let ExceptionWithContext _ raised = failure
       raised `shouldSatisfy` brokenIs "bang"
+
+    it "does not complete while the scheduler holds the failure of a close, though nothing was sealed since and nothing is owed" $ bounded $ do
+      fixture ← newSFixture
+      outcome ← newEmptyMVar
+      stalled ← try @SomeException . withBoundary $ \control runtime → releasing fixture [] $ do
+        owner ← startPlain fixture runtime "retained" requiredPolicy defaultSchedulerBounds
+        let endpoint = scheduledEndpoint owner
+            stop ticket =
+              requestTaskControl endpoint (ticketTask ticket) RequestStop >>= \case
+                TaskControlAccepted _ → pure ()
+                other → fail ("expected the stop accepted, found " <> show other)
+        failing ← admitTask' fixture owner "X" (request "closes_badly" [VText "X"] OrdinaryClass OneShot (Just "X"))
+        gated ← admitTask' fixture owner "Y" (closesGated "y")
+        awaitDiagnostics owner (\counts → diagWaiting counts >= 2)
+        -- Both stops are applied in one boundary, in the order they were asked: the first coroutine's
+        -- closing handler raises, which the scheduler keeps, and the second waits at a gate. The owner
+        -- hosts no instance and has no grant: a wait begun now has nothing to wait for but the owner.
+        holdingSafely fixture owner (stop failing >> stop gated)
+        awaitEntered fixture "y"
+        waiting ← beginWait control owner
+        stabilize waiting
+        awaitPending waiting
+        releaseGate fixture "y"
+        resultOf waiting >>= putMVar outcome
+      case stalled of
+        Left raised | Just (_ ∷ Timeout) ← fromException raised → throwIO raised
+        _ → pure ()
+      tryReadMVar outcome >>= \case
+        Nothing → fail "the example recorded no outcome for the wait"
+        Just result → either (const (pure ())) (\answered → fail ("the wait answered " <> show answered)) result
 
     it "rethrows a fatal failure that is already published when it is called, ahead of a completion that is ready" $ bounded $ do
       fixture ← newSFixture
