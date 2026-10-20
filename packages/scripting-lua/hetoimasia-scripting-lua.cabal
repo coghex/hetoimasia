@@ -397,6 +397,7 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Accounting.Windows
         Test.LuaRuntime.Callbacks
         Test.LuaRuntime.Dependencies
+        Test.LuaRuntime.Expected
         Test.LuaRuntime.Gates
         Test.LuaRuntime.HostFailures
         Test.LuaRuntime.Identity

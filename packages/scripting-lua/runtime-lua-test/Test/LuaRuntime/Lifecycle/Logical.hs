@@ -20,7 +20,7 @@ import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Lifecycle.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEffect, awaitScheduledTerminal)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (Gated (..), bounded, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, failExample, Gated (..), withBoundary, withBoundaryOpening)
 
 takenAs ∷ Int → Text
 takenAs number = "{accepted=true,receipt=" <> Text.pack (show number) <> "}"
@@ -260,7 +260,7 @@ spec = describe "logical admission" $ do
       -- apply them to, and no tick need come.
       case first of
         InstanceControlAccepted receipt → waitInstanceControl receipt >>= (`shouldBe` ControlNoLongerApplicable)
-        _ → fail "not accepted"
+        _ → failExample "not accepted"
 
   it "never loses a request racing the grant that begins its tick: each is accepted and then settles, or is refused as late" $ bounded $ do
     targetFx ← newIFixture
@@ -278,7 +278,7 @@ spec = describe "logical admission" $ do
       forM_ answers $ \case
         InstanceControlAccepted receipt → waitInstanceControl receipt >>= (`shouldSatisfy` \result → result `elem` [ControlApplied, ControlAlreadyInState])
         InstanceControlLate → pure ()
-        other → fail ("expected accepted or late, found " <> show other)
+        other → failExample ("expected accepted or late, found " <> show other)
       -- Accepted before the tick was reached, it is applied; after, it is refused: the tick 1 pause
       -- was applied if any was accepted.
       let acceptedCount = length [() | InstanceControlAccepted _ ← answers]
@@ -343,7 +343,7 @@ spec = describe "logical admission" $ do
         _ ← awaitSettled targetFx "0"
         case first of
           InstanceControlAccepted receipt → waitInstanceControl receipt >>= (`shouldBe` ControlNoLongerApplicable)
-          _ → fail "not accepted"
+          _ → failExample "not accepted"
         (answerKind <$> at (ids !! 1) 0) >>= (`shouldBe` "duplicate")
         -- Seven more places, each given up by an instance that ended: eight are queued and none is reserved.
         forM_ [1 .. 7] $ \n → do
@@ -353,7 +353,7 @@ spec = describe "logical admission" $ do
           _ ← awaitSettled targetFx (Text.pack (show n))
           case answer of
             InstanceControlAccepted receipt → waitInstanceControl receipt >>= (`shouldBe` ControlNoLongerApplicable)
-            _ → fail "not accepted"
+            _ → failExample "not accepted"
         (answerKind <$> at (ids !! 8) 200) >>= (`shouldBe` "full")
 
   describe "a closing handler" $

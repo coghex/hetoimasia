@@ -24,7 +24,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Runner.Support
 import qualified Test.LuaRuntime.Support as Base
-import Test.LuaRuntime.Support (Broken (Broken), Gated (..), awaitBlockedOnSTM, bounded, brokenIs, expectFatalOpening, quickSpec, startOwner, submit, tryExpected, withBoundaryOpening)
+import Test.LuaRuntime.Support (awaitBlockedOnSTM, bounded, Broken (Broken), brokenIs, expectFatalOpening, failExample, Gated (..), quickSpec, startOwner, submit, tryExpected, withBoundaryOpening)
 
 -- | What a test throws to the runner's thread to cancel it.
 data Cancelling = Cancelling
@@ -127,7 +127,7 @@ spec = describe "retirement" $ do
             (tryExpected (run fixture runtime (config fixture [noWait (scriptAt paths 0)])) `finally` (markReturned fixture >> putMVar returned ()))
         case outcome of
           Left (ExceptionWithContext _ raised) → (fromException raised ∷ Maybe Cancelling) `shouldSatisfy` isJust
-          Right _ → fail "the run returned instead of being cancelled"
+          Right _ → failExample "the run returned instead of being cancelled"
         takeMVar observed `shouldReturn` (True, True)
         expectWrittenBeforeReturn fixture "after"
 
@@ -155,7 +155,7 @@ spec = describe "retirement" $ do
             (tryExpected (runTick fixture runtime (config fixture [noWait (scriptAt paths 0)])) `finally` (markReturned fixture >> putMVar returned ()))
         case outcome of
           Left (ExceptionWithContext _ raised) → (fromException raised ∷ Maybe Cancelling) `shouldSatisfy` isJust
-          Right _ → fail "the run returned instead of being cancelled"
+          Right _ → failExample "the run returned instead of being cancelled"
         takeMVar observed `shouldReturn` (True, True)
         expectWrittenBeforeReturn fixture "after"
 
@@ -194,4 +194,4 @@ spec = describe "retirement" $ do
             -- The cancellation propagates as itself, and the failure that was already propagating is kept beside it.
             (fromException raised ∷ Maybe AsyncException) `shouldSatisfy` isJust
             [brokenIs "table sink" evidence | found ← cleanupFailuresInContext context, let ExceptionWithContext _ evidence = cleanupFailureException found] `shouldSatisfy` or
-          Right _ → fail "the run returned instead of raising"
+          Right _ → failExample "the run returned instead of raising"

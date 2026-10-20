@@ -21,7 +21,7 @@ import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support (awaitLine, linesOf, tickReached)
 import Test.LuaRuntime.Scheduled.Support (awaitEntered, releaseGate)
 import Test.LuaRuntime.Subscription.Support
-import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, failExample, Gated (..), requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- | An owner of subscribers on logical time, granted both endpoints with this room for held events.
 logicalOwner ∷ IFixture → FakeEvents → LuaRuntime → Text → [ModuleSource] → Int → IO ScheduledOwner
@@ -264,8 +264,8 @@ spec = describe "on an owner on logical time" $ do
         case resultOutcome settled of
           InstanceFailed failure → case failureError failure of
             ErrorDelivery endpoint _ → endpoint `shouldBe` "ticks"
-            other → fail ("expected a delivery failure, found " <> show other)
-          other → fail ("expected the instance failed, found " <> show other)
+            other → failExample ("expected a delivery failure, found " <> show other)
+          other → failExample ("expected the instance failed, found " <> show other)
         phaseOf fixture owner "peer" >>= (`shouldBe` Just Active)
         d ← subDiagnostics owner
         (sdRefusedFull d, sdFailures d) `shouldBe` (2, 1)

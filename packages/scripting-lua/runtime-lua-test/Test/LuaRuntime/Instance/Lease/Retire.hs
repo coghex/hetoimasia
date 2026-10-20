@@ -21,7 +21,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Lease.Support
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfOwnerThread), awaitEffect, awaitIdle, awaitScheduledTerminal, cancelQueued)
-import Test.LuaRuntime.Support (Broken (Broken), Gated (..), awaitBlockedOnSTM, bounded, brokenIs, expectFatal, expectFatalOpening, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (awaitBlockedOnSTM, bounded, Broken (Broken), brokenIs, expectFatal, expectFatalOpening, failExample, Gated (..), optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
 import Control.Concurrent.MVar (readMVar)
 
 -- | Block until an instance has this many retirements pending.
@@ -82,7 +82,7 @@ spec = describe "retained retirement" $ do
           resultPhase result `shouldBe` Failed
           fmap failureStage (failureOf' result) `shouldBe` Just StageRelease
           leasesFailed (resultLeases result) `shouldBe` 1
-        Nothing → fail "expected the instance to have settled"
+        Nothing → failExample "expected the instance to have settled"
 
   it "keeps the owner live through a retirement, an orderly stop and a cancellation alike, until the provider has completed it" $ bounded $ do
     forM_ [("retired", False), ("cancelled", True)] $ \(label, cancel) → do
@@ -156,7 +156,7 @@ spec = describe "retained retirement" $ do
             BindingRefused _ → True
             _ → False
           _ → False
-        Nothing → fail "expected a failure"
+        Nothing → failExample "expected a failure"
       resultLeases settled `shouldBe` LeaseOutcome 0 2 0
       retireScheduled owner
       _ ← awaitScheduledTerminal control owner
@@ -384,7 +384,7 @@ spec = describe "retained retirement" $ do
       Just result → do
         resultOutcome result `shouldSatisfy` \case InstanceDiscarded (Discard ExitFailed _) → True; _ → False
         terminationUnstarted (resultTermination result) `shouldBe` 1
-      Nothing → fail "expected the instance to have settled"
+      Nothing → failExample "expected the instance to have settled"
 
   it "disposes what a retirement needs only when the provider has proved it complete: not under a pending retirement, in a stop or a cancellation, and before the stop completion settles" $ bounded $ do
     forM_ [("stopped", False), ("retired", True)] $ \(label, byOwner) → do

@@ -20,7 +20,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Lease.Support
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (awaitScheduledTerminal, cancelQueued)
-import Test.LuaRuntime.Support (Gated (..), bounded, brokenIs, expectFatal, expectFatalOpening, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, brokenIs, expectFatal, expectFatalOpening, failExample, Gated (..), optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
 
 releases ∷ [Text.Text] → [Text.Text]
 releases = filter (Text.isPrefixOf "release ")
@@ -66,7 +66,7 @@ spec = describe "releasing" $ do
               _ → False
             _ → False
           _ → False
-        Nothing → fail "expected a failure"
+        Nothing → failExample "expected a failure"
       entries ← history fixture
       -- The action of the use never ran, so it recorded nothing.
       entries `shouldSatisfy` notElem "use retired-res"
@@ -126,7 +126,7 @@ spec = describe "releasing" $ do
           fmap failureStage (failureOf' result) `shouldBe` Just StageRelease
           leasesFailed (resultLeases result) `shouldBe` 1
           leasesDrained (resultLeases result) `shouldBe` 2
-        Nothing → fail "expected the instance to have settled"
+        Nothing → failExample "expected the instance to have settled"
 
   it "ends the owner as a failure at once: the instances still to end during an orderly retirement have no shutdown run, and their holdings are drained all the same" $ bounded $ do
     fixture ← newLFix 4
@@ -152,7 +152,7 @@ spec = describe "releasing" $ do
       Just result → do
         terminationShutdown (resultTermination result) `shouldBe` ShutdownSkippedUnsafe
         leasesDrained (resultLeases result) `shouldBe` 1
-      Nothing → fail "expected the instance to have settled"
+      Nothing → failExample "expected the instance to have settled"
 
   it "keeps a failed release in the instance's outcome when a cancellation is queued inside it: the independent holdings are still released, once each, and the failure is not lost" $ bounded $ do
     fixture ← newLFix 4
@@ -187,7 +187,7 @@ spec = describe "releasing" $ do
         fmap failureStage (failureOf' result) `shouldBe` Just StageRelease
         leasesFailed (resultLeases result) `shouldBe` 1
         leasesDrained (resultLeases result) `shouldBe` 2
-      Nothing → fail "expected the instance to have settled"
+      Nothing → failExample "expected the instance to have settled"
 
   it "keeps the instance's primary failure primary and retains a release failure beside it, fatal for the owner whatever its policy" $ bounded $ do
     forM_ [("required", requiredPolicy), ("optional", optionalPolicy (const True))] $ \(label, policy) → do
@@ -208,7 +208,7 @@ spec = describe "releasing" $ do
           failureStage failure `shouldBe` StageEvent "tick"
           failureMessage failure `shouldSatisfy` Text.isInfixOf "callback boom"
           map fst (failureSecondary failure) `shouldBe` [StageRelease]
-        Nothing → fail "expected the instance to have failed"
+        Nothing → failExample "expected the instance to have failed"
 
   it "lets a closing handler the script defined release a handle, as the instance whose invocation it is" $ bounded $ do
     fixture ← newLFix 4

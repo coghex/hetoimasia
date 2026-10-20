@@ -17,5 +17,5 @@ spec = describe "lifecycle-operation bindings" $
       lifecycle ← submit (ownerEndpoint owner) "lifecycle" [] >>= accepted
       settleOutcome lifecycle >>= \case
         CallFaulted (BoundaryFailed fault) → boundaryReason fault `shouldSatisfy` \case NotYetSupported _ → True; _ → False
-        other → fail ("expected a not-yet-supported fault, found " <> show other)
+        other → failExample ("expected a not-yet-supported fault, found " <> show other)
       retireOwner owner

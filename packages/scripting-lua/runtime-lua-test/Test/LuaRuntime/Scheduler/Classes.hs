@@ -10,6 +10,7 @@ import Hetoimasia.Foundation.Time (scriptedInstant, scriptedSource, zeroDuration
 import Hetoimasia.Scripting.Lua.Scheduler
 import Test.Hspec (Spec, describe, it, shouldBe)
 import Test.LuaRuntime.Scheduler.Support
+import Test.LuaRuntime.Support (failExample)
 
 quantaOf ∷ Int → Int → Int → SchedulerBounds
 quantaOf control ordinary background =
@@ -57,7 +58,7 @@ spec = describe "service classes and quanta" $ do
     loop rig "ready"
     atomically (requestControl (rigScheduler rig) paused RequestPause) >>= \case
       ControlAccepted _ → pure ()
-      other → fail ("the pause was not accepted: " <> show (answerName other))
+      other → failExample ("the pause was not accepted: " <> show (answerName other))
     _ ← turn rig
     ran rig >>= (`shouldBe` ["waiting", "ready", "ready", "ready"])
     phase rig waiting >>= (`shouldBe` Just PhaseWaiting)
@@ -89,7 +90,7 @@ spec = describe "service classes and quanta" $ do
                      , ControlBoundBelowOne 0
                      , BudgetNotPositive
                      ]
-      Right _ → fail "the configuration should have been refused"
+      Right _ → failExample "the configuration should have been refused"
     -- Nothing was started: no registration was ever armed.
     length <$> allRegs timer >>= (`shouldBe` 0)
     ok ← newScheduler @() (config (quantaOf 1 1 1))

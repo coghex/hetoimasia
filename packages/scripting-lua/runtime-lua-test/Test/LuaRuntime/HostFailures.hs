@@ -33,7 +33,7 @@ spec = describe "host failures" $ do
       failing ← submit (ownerEndpoint victim) "host_fail" [VText "binding"] >>= accepted
       awaitTerminal control victim >>= \case
         WorkerUnavailable (ExceptionWithContext _ failure) → failure `shouldSatisfy` brokenIs "binding"
-        other → fail ("expected an unavailable owner, found " <> show other)
+        other → failExample ("expected an unavailable owner, found " <> show other)
       -- No caller received the failure: the call settled as discarded, started.
       settleOutcome failing >>= (`shouldSatisfy` isDiscard ExitFailed Started)
       -- The other owner is untouched, with its bindings as they were.
@@ -71,7 +71,7 @@ spec = describe "host failures" $ do
       releaseGate fixture "go"
       awaitTerminal control owner >>= \case
         WorkerUnavailable (ExceptionWithContext _ failure) → failure `shouldSatisfy` brokenIs "binding"
-        other → fail ("expected an unavailable owner, found " <> show other)
+        other → failExample ("expected an unavailable owner, found " <> show other)
       settleOutcome inflight >>= (`shouldSatisfy` isDiscard ExitFailed Started)
       forM_ queued $ \ticket → settleOutcome ticket >>= (`shouldSatisfy` isDiscard ExitFailed NotStarted)
       Just record ← atomically (ownerExitRecord owner)
@@ -134,7 +134,7 @@ spec = describe "host failures" $ do
           -- The fault the fixture threw, effect and all: a later binding's call
           -- rewrote nothing of it.
           fromException @BoundaryFault failure `shouldBe` Just applicationBoundaryFault
-        other → fail ("expected an unavailable owner, found " <> show other)
+        other → failExample ("expected an unavailable owner, found " <> show other)
       settleOutcome call >>= (`shouldSatisfy` isDiscard ExitFailed Started)
 
   it "settles a cancelled owner's in-flight call as discarded, started, cancelled, and its queued calls as not started, cancelled" $ bounded $ do

@@ -23,7 +23,7 @@ spec = describe "the gates a boundary opens when an example fails" $ do
       throwIO (Broken "body")
     case ended of
       Left (ExceptionWithContext _ raised) → raised `shouldSatisfy` brokenIs "body"
-      Right _ → fail "the failure of the body was lost"
+      Right _ → failExample "the failure of the body was lost"
 
   it "opens every gate there is, and the gate that is first named afterwards, so that a callback arriving late is let through" $ bounded $ do
     fixture ← newFixture
@@ -43,11 +43,11 @@ spec = describe "the gates a boundary opens when an example fails" $ do
             ticket ← submit (ownerEndpoint owner) "block_call" [VText "hold"] >>= accepted
             -- Only the helper's failure opens the gate this waits behind.
             _ ← settleOutcome ticket
-            fail "the call settled without the gate being opened"
+            failExample "the call settled without the gate being opened"
         )
     case ended of
       Left (ExceptionWithContext _ raised) → raised `shouldSatisfy` brokenIs "helper"
-      Right _ → fail "the failure of the helper was lost"
+      Right _ → failExample "the failure of the helper was lost"
 
   it "fails an example that returned only because its bound had opened its gates, and does not let it pass" $ bounded $ do
     gate' ← newEmptyMVar

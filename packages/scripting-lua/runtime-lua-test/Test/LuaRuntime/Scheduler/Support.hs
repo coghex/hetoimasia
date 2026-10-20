@@ -79,6 +79,7 @@ import Hetoimasia.Foundation.Time
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (TaskId (TaskId), TaskName (TaskName))
 import Hetoimasia.Scripting.Lua.Scheduler
 import Test.Hspec (Expectation, expectationFailure)
+import Test.LuaRuntime.Support (failExample)
 
 -- | One scheduler over scripted segments.
 data Rig = Rig
@@ -151,7 +152,7 @@ newRigWith options = do
           , schedTimer = ftBackend timer
           , schedStopRequested = readTVar stop
           }
-  scheduler ← newScheduler config >>= either (\refused → fail ("the configuration was refused: " <> show refused)) pure
+  scheduler ← newScheduler config >>= either (\refused → failExample ("the configuration was refused: " <> show refused)) pure
   let host =
         TaskHost
           { hostRun = \run → do
@@ -223,7 +224,7 @@ admitSpec ∷ Rig → TaskSpec Text → IO TaskId
 admitSpec rig wanted =
   atomically (admitTask (rigScheduler rig) wanted) >>= \case
     Admitted identity → pure identity
-    AdmitRefused why → fail ("admission was refused: " <> show why)
+    AdmitRefused why → failExample ("admission was refused: " <> show why)
 
 -- | One service turn.
 turn ∷ Rig → IO TurnReport
@@ -248,7 +249,7 @@ runSegments rig wanted = go (0 ∷ Int)
         then pure (take wanted segments)
         else
           if guardCount > 10000
-            then fail "the turns made no progress"
+            then failExample "the turns made no progress"
             else turn rig >> go (guardCount + 1)
 
 -- | The names of the segments that have run, in order.

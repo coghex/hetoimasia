@@ -14,7 +14,7 @@ import System.Directory (createDirectory)
 import System.FilePath ((</>))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldContain, shouldNotBe, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Runner.Support
-import Test.LuaRuntime.Support (bounded, withBoundary)
+import Test.LuaRuntime.Support (bounded, failExample, withBoundary)
 
 -- | A module whose every hook records, so a hook that ran is seen.
 hooked ∷ Char8.ByteString
@@ -35,7 +35,7 @@ expectNotLoaded fixture control path problem report = do
   statusOf report `shouldBe` StatusFailure
   instancesOf report `shouldBe` []
   case loadFailureOf report of
-    Nothing → fail "the report of a run that did not start carries no load failure"
+    Nothing → failExample "the report of a run that did not start carries no load failure"
     Just failure → do
       loadFile failure `shouldBe` Text.pack path
       loadVm failure `shouldBe` "vm"

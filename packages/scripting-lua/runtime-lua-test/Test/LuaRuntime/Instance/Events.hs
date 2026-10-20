@@ -15,7 +15,7 @@ import Hetoimasia.Scripting.Lua.Value (Schema (SInteger, SList), Value (VInteger
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEffect, awaitEntered, defaultSchedulerBounds, releaseGate)
-import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, failExample, Gated (..), requiredPolicy, withBoundary, withBoundaryOpening)
 
 spec ∷ Spec
 spec = describe "events" $ do
@@ -122,7 +122,7 @@ spec = describe "events" $ do
     fixture ← newIFixture
     withBoundary $ \_ runtime → do
       -- The payload alone is twenty bytes; the record the callback is handed is more.
-      limits ← either (fail . show) pure (valueLimits 90 8 4096)
+      limits ← either (failExample . show) pure (valueLimits 90 8 4096)
       owner ←
         startWith fixture runtime . withLimits limits $
           instanceSpec fixture "limits" [echoer] (testConfig instanceBounds') requiredPolicy defaultSchedulerBounds
@@ -136,7 +136,7 @@ spec = describe "events" $ do
     fixture ← newIFixture
     withBoundary $ \_ runtime → do
       let ownerWith bytes label = do
-            limits ← either (fail . show) pure (valueLimits bytes 8 4096)
+            limits ← either (failExample . show) pure (valueLimits bytes 8 4096)
             startWith fixture runtime . withLimits limits $
               instanceSpec fixture label [echoer] (testConfig instanceBounds') requiredPolicy defaultSchedulerBounds
       -- The stamped event is 97 bytes, and the number the driver takes is 9 more.

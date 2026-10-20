@@ -44,7 +44,6 @@ module Test.LuaRuntime.Lifecycle.Support
   ) where
 
 import Control.Concurrent (yield)
-import Control.Exception (throwIO)
 import Control.Monad (replicateM, void)
 import Data.IORef (atomicModifyIORef')
 import Data.Text (Text)
@@ -59,7 +58,7 @@ import Hetoimasia.Scripting.Lua.Value
 import Test.LuaRuntime.Instance.Support
 import qualified Data.Text.Encoding as Text
 import Test.LuaRuntime.Scheduled.Support (defaultSchedulerBounds, schedRegistration)
-import Test.LuaRuntime.Support (requiredPolicy)
+import Test.LuaRuntime.Support (failExample, requiredPolicy)
 
 -- | The registration of the instance examples, with the lifecycle bindings in @life@:
 -- registered once, and shared by every owner of an example whatever it is granted.
@@ -301,7 +300,7 @@ tell fixture owner name op tid n = do
             <> [("n", VInteger (fromIntegral number)) | Just number ← [n]]
   deliverEvent (scheduledEndpoint owner) identity "cmd" payload >>= \case
     DeliveryAccepted _ → pure ()
-    other → throwIO (userError ("expected the command delivered, found " <> show other))
+    other → failExample ("expected the command delivered, found " <> show other)
 
 -- | Tell the commander of this name to call this operation, naming this instance and
 -- this number when it takes them, and answer what it recorded for the call: the
@@ -329,7 +328,7 @@ taskLine fixture owner entry arguments = do
   before ← length <$> cmdLines fixture
   admitScheduledTask (scheduledEndpoint owner) (TaskRequest (ModuleRef "taskcaller" "1") entry arguments OrdinaryClass OneShot Nothing) >>= \case
     TaskAccepted _ ticket → void (waitTask ticket)
-    other → throwIO (userError ("expected the task accepted, found " <> show other))
+    other → failExample ("expected the task accepted, found " <> show other)
   awaitCmd fixture (before + 1)
   line ← (!! before) <$> cmdLines fixture
   pure (Text.drop (Text.length ("cmd " <> entry <> " ")) line)

@@ -8,7 +8,7 @@
 -- decide whether it may subscribe at all.
 module Test.LuaRuntime.Subscription.Failures (spec) where
 
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, throwIO, toException, tryWithContext)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, throwIO, toException)
 import Control.Monad (forM_, void)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -25,7 +25,7 @@ import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support (awaitLine, linesOf, refusalOf)
 import Test.LuaRuntime.Scheduled.Support (awaitScheduledTerminal)
 import Test.LuaRuntime.Subscription.Support
-import Test.LuaRuntime.Support (Broken (Broken), bounded, brokenIs, expectFatal, optionalPolicy, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (bounded, Broken (Broken), brokenIs, expectFatal, failExample, optionalPolicy, requiredPolicy, tryExpected, withBoundary)
 
 -- | Whether a retained failure is the application's own, of this name.
 brokenAmong ∷ Text → ExceptionWithContext SomeException → Bool
@@ -64,7 +64,7 @@ spec = describe "failures" $ do
         commandWith fixture owner "i" "subscribe" "a" (Just "ticks") Nothing
         awaitScheduledTerminal control owner >>= \case
           WorkerUnavailable (ExceptionWithContext _ failure) → failure `shouldSatisfy` brokenIs "subscribe"
-          other → fail ("expected an unavailable owner, found " <> show other)
+          other → failExample ("expected an unavailable owner, found " <> show other)
         subscribedCount fake >>= (`shouldBe` 0)
         d ← subDiagnostics owner
         -- Admitted, and taken back: nothing is held for a subscription that never reached its provider.
@@ -203,11 +203,11 @@ spec = describe "failures" $ do
       fixture ← newIFixture
       fake ← newFakeEvents
       let refusedWith label change wanted = do
-            outcome ← tryWithContext @SomeException $ withBoundary $ \_ runtime → eventsFinish fake $
+            outcome ← tryExpected $ withBoundary $ \_ runtime → eventsFinish fake $
               startWith fixture runtime (change (subscriptionSpec fixture label [subscriber] subConfig SettleOnArrival (subGrant fake 4 16) requiredPolicy))
             case outcome of
               Left (ExceptionWithContext _ failure) → show failure `shouldSatisfy` Text.isInfixOf wanted . Text.pack
-              Right _ → fail ("expected the grant refused: " <> Text.unpack wanted)
+              Right _ → failExample ("expected the grant refused: " <> Text.unpack wanted)
       refusedWith "bounds" (\spec' → spec' {scheduledSubscriptions = Just (SubscriptionGrant (allEndpoints fake) 0 0)}) "SubscriptionBoundOutOfRange 0"
       refusedWith "staging" (\spec' → spec' {scheduledSubscriptions = Just (SubscriptionGrant (allEndpoints fake) 4 0)}) "StagingBoundOutOfRange 0"
       refusedWith "none" (\spec' → spec' {scheduledSubscriptions = Just (SubscriptionGrant [] 4 16)}) "NoEventEndpoints"

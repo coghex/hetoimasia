@@ -16,13 +16,14 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (TaskId (TaskId), Tas
 import Hetoimasia.Scripting.Lua.Scheduler
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduler.Support
+import Test.LuaRuntime.Support (failExample)
 
 -- | Make a request and require that it was accepted.
 request ∷ Rig → TaskId → ControlRequest → IO ControlTicket
 request rig identity what =
   atomically (requestControl (rigScheduler rig) identity what) >>= \case
     ControlAccepted ticket → pure ticket
-    other → fail ("the request was not accepted: " <> answerName other)
+    other → failExample ("the request was not accepted: " <> answerName other)
 
 -- | The answer, for a refusal that is expected.
 ask ∷ Rig → TaskId → ControlRequest → IO String
@@ -83,7 +84,7 @@ spec = describe "safe-boundary control" $ do
       phase rig ending >>= (`shouldBe` Just (PhaseEnded OutcomeCompleted))
       readIORef overtaken >>= \case
         Just ticket → resultOf ticket >>= (`shouldBe` Just ControlNoLongerApplicable)
-        Nothing → fail "the request was not made"
+        Nothing → failExample "the request was not made"
       ask rig ending RequestPause >>= (`shouldBe` "unknown")
       -- Observing the result takes the record with it, and the identity stays stale.
       observe rig ending >>= (`shouldSatisfy` \case Just (ResultCompleted _) → True; _ → False)
@@ -117,7 +118,7 @@ spec = describe "safe-boundary control" $ do
           running `shouldBe` Just PhaseRunning
           pending `shouldBe` Nothing
           resultOf ticket >>= (`shouldBe` Just ControlApplied)
-        Nothing → fail "the segment did not run"
+        Nothing → failExample "the segment did not run"
       phase rig a >>= (`shouldBe` Just PhasePaused)
       resume ← request rig a RequestResume
       _ ← turn rig
@@ -150,7 +151,7 @@ spec = describe "safe-boundary control" $ do
       -- The pause was asked for inside a segment that then waited: it applied to a
       -- waiting task, which is paused and still waiting.
       phase rig a >>= (`shouldBe` Just PhasePaused)
-      readIORef ticket >>= maybe (fail "no request") (\t → resultOf t >>= (`shouldBe` Just ControlApplied))
+      readIORef ticket >>= maybe (failExample "no request") (\t → resultOf t >>= (`shouldBe` Just ControlApplied))
       _ ← granted rig 10
       _ ← turn rig
       -- The wait was satisfied and the grant finished, and the task did not run.
@@ -256,7 +257,7 @@ spec = describe "safe-boundary control" $ do
       ticket ← newIORef Nothing
       script rig "task" [request rig task RequestStop >>= writeIORef ticket . Just >> completed "task"]
       _ ← turn rig
-      readIORef ticket >>= maybe (fail "no request") (\t → resultOf t >>= (`shouldBe` Just ControlNoLongerApplicable))
+      readIORef ticket >>= maybe (failExample "no request") (\t → resultOf t >>= (`shouldBe` Just ControlNoLongerApplicable))
       phase rig task >>= (`shouldBe` Just (PhaseEnded OutcomeCompleted))
       closedTasks rig >>= (`shouldSatisfy` null)
 
@@ -270,7 +271,7 @@ spec = describe "safe-boundary control" $ do
       report ← turn rig
       settlement stop >>= \case
         Just (ControlSettlement ControlApplied (Just (CloseFailed failure))) → displayException failure `shouldSatisfy` ("close boom" `isInfixOf`)
-        other → fail ("expected a failed close, found " <> show other)
+        other → failExample ("expected a failed close, found " <> show other)
       map fst (turnCloseFailures report) `shouldBe` [task]
       phase rig task >>= (`shouldBe` Just (PhaseEnded OutcomeCancelled))
       observe rig task >>= (`shouldSatisfy` \case Just ResultCancelled → True; _ → False)
@@ -285,7 +286,7 @@ spec = describe "safe-boundary control" $ do
       outcome ← try (turn rig)
       case outcome of
         Left failure → fromException failure `shouldBe` Just ThreadKilled
-        Right _ → fail "the turn should have been interrupted"
+        Right _ → failExample "the turn should have been interrupted"
       -- Nothing was cancelled, nothing was settled, and the request is still the
       -- scheduler's to settle when it stops.
       phase rig task >>= (`shouldBe` Just PhaseReady)

@@ -12,7 +12,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldNotBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (awaitDiagnostics, awaitEffect, awaitIdle, awaitScheduledTerminal, segmentsRun)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (bounded, failExample, requiredPolicy, withBoundary)
 
 stoppedOutcome ∷ InstanceOutcome → Bool
 stoppedOutcome = \case InstanceStopped → True; _ → False
@@ -123,8 +123,8 @@ spec = describe "an instance" $ do
           failureStage failure `shouldBe` StageInit
           case failureError failure of
             ErrorMissingEntry entry → entry `shouldBe` "run"
-            other → fail ("expected the missing entry, found " <> show other)
-        Nothing → fail "expected a failure"
+            other → failExample ("expected the missing entry, found " <> show other)
+        Nothing → failExample "expected a failure"
       logged fixture >>= (`shouldBe` [])
       terminationShutdown (resultTermination settled) `shouldBe` ShutdownSkippedNoInit
 
@@ -135,7 +135,7 @@ spec = describe "an instance" $ do
       _ ← admitWith fixture owner "a" (InstanceRequest (moduleNamed "echoer") EventOnly (Just "a") OrdinaryClass [])
       settled ← awaitSettled fixture "a"
       resultPhase settled `shouldBe` Failed
-      failure ← maybe (fail "expected a failure") pure (failureOf' settled)
+      failure ← maybe (failExample "expected a failure") pure (failureOf' settled)
       failureStage failure `shouldBe` StageInit
       failureMessage failure `shouldSatisfy` Text.isInfixOf "no event source named tick is granted"
       terminationConnections (resultTermination settled) `shouldBe` 0
@@ -180,7 +180,7 @@ spec = describe "an instance" $ do
           snapshotKind held `shouldBe` EventOnly
           snapshotQueued held `shouldBe` 0
           snapshotConnections held `shouldBe` 1
-        Nothing → fail "expected a snapshot"
+        Nothing → failExample "expected a snapshot"
       all' ← atomically (inspectInstances (scheduledEndpoint owner))
       map snapshotInstance all' `shouldBe` [identity]
 

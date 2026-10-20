@@ -14,7 +14,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VBoolean, VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (Gated (..), bounded, brokenIs, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, brokenIs, failExample, Gated (..), optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
 
 spec ∷ Spec
 spec = describe "waits from callbacks and tick completion" $ do
@@ -31,7 +31,7 @@ spec = describe "waits from callbacks and tick completion" $ do
       receipt ←
         requestTaskControl (scheduledEndpoint owner) (ticketTask target) RequestPause >>= \case
           TaskControlAccepted held → pure held
-          other → fail ("the request was not accepted: " <> show other)
+          other → failExample ("the request was not accepted: " <> show other)
       modifyIORef' (sfTickets fixture) (Map.insert "done" done)
       modifyIORef' (sfReceipts fixture) (Map.insert "receipt" receipt)
       -- Built outside any callback, run inside one.

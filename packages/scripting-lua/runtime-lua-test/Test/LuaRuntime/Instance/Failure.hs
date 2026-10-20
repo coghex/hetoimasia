@@ -16,13 +16,13 @@ import Hetoimasia.Runtime.Supervision (WorkerStatus (WorkerUnavailable))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEffect, awaitScheduledTerminal)
-import Test.LuaRuntime.Support (bounded, brokenIs, expectFatal, optionalPolicy, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (bounded, brokenIs, expectFatal, failExample, optionalPolicy, requiredPolicy, withBoundary)
 
 -- | The failure an instance settled as, which an example expects it did.
 expectFailure ∷ InstanceSettlement → IO InstanceFailure
 expectFailure settled = case failureOf' settled of
   Just failure → pure failure
-  Nothing → fail ("expected a failure, found " <> show (resultOutcome settled))
+  Nothing → failExample ("expected a failure, found " <> show (resultOutcome settled))
 
 isSuspendRefused ∷ InstanceError → Bool
 isSuspendRefused = \case
@@ -190,7 +190,7 @@ spec = describe "failure" $ do
       Just (InstanceEscalated failure) → do
         failureOwner failure `shouldBe` "escalated"
         failureStage failure `shouldBe` StageEvent "tick"
-      Nothing → fail ("expected the escalation, found " <> show raised)
+      Nothing → failExample ("expected the escalation, found " <> show raised)
     -- The instance that failed had ended before the owner did, as its failure; the
     -- one that was running was discarded with its owner.
     a ← tickOf fixture "a" >>= pollInstance
@@ -266,4 +266,4 @@ spec = describe "failure" $ do
       Just failure → do
         failureStage failure `shouldBe` StageEvent "tick"
         failureMessage failure `shouldSatisfy` Text.isInfixOf "callback boom"
-      Nothing → fail "expected the instance to have failed with the script's own error"
+      Nothing → failExample "expected the instance to have failed with the script's own error"

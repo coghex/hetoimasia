@@ -36,7 +36,7 @@ spec = describe "dispatch and settlement" $ do
       absent ← submit endpoint "absent" [] >>= accepted
       settleOutcome absent >>= \case
         CallReturned EntryAbsent → pure ()
-        other → fail ("expected an absent entry point, found " <> show other)
+        other → failExample ("expected an absent entry point, found " <> show other)
       retireOwner owner
 
   it "returns a script error, a value refusal, a not-yet-supported binding and an unknown module to the caller as data, and serves the next call" $ bounded $ do
@@ -53,20 +53,20 @@ spec = describe "dispatch and settlement" $ do
         CallFaulted (BoundaryFailed fault) → do
           boundaryReason fault `shouldSatisfy` \case ScriptFailed CallFailed _ → True; _ → False
           boundaryEffect fault `shouldBe` LuaRan
-        other → fail ("expected a script fault, found " <> show other)
+        other → failExample ("expected a script fault, found " <> show other)
       settleOutcome valueRefusal >>= \case
         CallFaulted fault@(BoundaryFailed inner) → do
           boundaryReason inner `shouldSatisfy` \case ValueRefused _ → True; _ → False
           callFaultEffect fault `shouldBe` NoEffect
-        other → fail ("expected a value refusal, found " <> show other)
+        other → failExample ("expected a value refusal, found " <> show other)
       settleOutcome lifecycle >>= \case
         CallFaulted (BoundaryFailed fault) → boundaryReason fault `shouldSatisfy` \case NotYetSupported _ → True; _ → False
-        other → fail ("expected a not-yet-supported fault, found " <> show other)
+        other → failExample ("expected a not-yet-supported fault, found " <> show other)
       settleOutcome ghost >>= \case
         CallFaulted fault@(ModuleNotLoaded ref) → do
           ref `shouldBe` ModuleRef "ghost" "9"
           callFaultEffect fault `shouldBe` NoEffect
-        other → fail ("expected the unknown module, found " <> show other)
+        other → failExample ("expected the unknown module, found " <> show other)
       returnedValues <$> settleOutcome next >>= (`shouldBe` Just [VInteger 7])
       -- Nothing ended the owner, and nothing of the faults reached supervision.
       noted fixture >>= (`shouldBe` [])

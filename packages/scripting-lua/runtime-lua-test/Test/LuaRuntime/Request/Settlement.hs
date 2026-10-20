@@ -15,7 +15,7 @@ import Hetoimasia.Scripting.Lua.Value
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (bounded, failExample, requiredPolicy, withBoundary)
 
 -- | An owner of askers granted a provider with a path endpoint and a text endpoint.
 textAndPath ∷ Fake → RequestGrant
@@ -222,8 +222,8 @@ spec = describe "settlement" $ do
         case failureOf' settled of
           Just failure → case failureError failure of
             ErrorFault (BoundaryFailed fault) → boundaryReason fault `shouldSatisfy` \case ScriptFailed _ _ → True; _ → False
-            other → fail ("expected a script fault, found " <> show other)
-          Nothing → fail "expected the instance to fail"
+            other → failExample ("expected a script fault, found " <> show other)
+          Nothing → failExample "expected the instance to fail"
         cancelledOrder fake >>= (`shouldBe` [0])
         rdInvalidated <$> diagnostics owner >>= (`shouldBe` 1)
 

@@ -20,7 +20,7 @@ import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support (awaitLine, refusalOf)
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfObserver), awaitEntered, blockOn, releaseGate)
 import Test.LuaRuntime.Subscription.Support
-import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, failExample, Gated (..), requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- | An owner of subscribers on elapsed time, granted both endpoints with this room for subscriptions.
 ownerOf ∷ IFixture → FakeEvents → LuaRuntime → Text → [ModuleSource] → Int → IO ScheduledOwner
@@ -35,7 +35,7 @@ subscribeTo' fixture owner name key endpoint = do
 -- | Advance the owner's epoch, expecting it to have one to advance.
 advance ∷ ScheduledOwner → IO EpochReport
 advance owner =
-  advanceRequestEpoch (scheduledEndpoint owner) >>= maybe (fail "the owner has no epoch to advance") pure
+  advanceRequestEpoch (scheduledEndpoint owner) >>= maybe (failExample "the owner has no epoch to advance") pure
 
 spec ∷ Spec
 spec = describe "epochs" $ do

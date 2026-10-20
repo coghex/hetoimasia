@@ -25,7 +25,7 @@ import Hetoimasia.Scripting.Lua.Runner
 import Hetoimasia.Scripting.Lua.Runner.Internal
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Runner.Support
-import Test.LuaRuntime.Support (bounded, withBoundary)
+import Test.LuaRuntime.Support (bounded, failExample, withBoundary)
 
 -- | A real instance's identity, which a subscription needs: from a run of one script.
 anInstanceId ∷ IO InstanceId
@@ -37,7 +37,7 @@ anInstanceId = do
       (_, admitted) ← admittedOf fixture
       case admitted of
         (identity, _) : _ → pure identity
-        [] → fail "no instance was admitted"
+        [] → failExample "no instance was admitted"
 
 -- | A subscription of the endpoint, as the engine hands it over, whose feed answers this way and notes
 -- every delivery.
