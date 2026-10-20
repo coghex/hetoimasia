@@ -3481,16 +3481,21 @@ and verified policy, with adversarial regression coverage.
 - **As delivered (#499):** the sample now fails, overloads and stops explicitly, extending #498's contract without
   reopening it (`samples/lua-domains/README.md` is the contract). Any script failure on the gameplay owner fails the
   session (every instance's escalation callback answers `Isolate` and records the failure, a faulted task the session
-  admitted is read after the fence, an application failure is not one); the first failure is primary and the rest
-  bounded evidence; one failure snapshot is published carrying the last good world and tick and the invalidated
-  intentions. The driver learns of a failure in tick T before it decides T's commit through a **fence**: after the
-  tick completes it admits a no-op task and awaits it, which settles only after the owner has run the boundary of
-  every earlier segment (the scheduler reconciles a grant before the instance layer accounts for the tick's last
-  segment, so a refused wait looks, for a moment, like an idle active instance). The ledger gains *invalidated* and
-  *discarded*; a stop (`stopSession`) ends admission and grants, settles the gameplay instances including `shutdown`
-  and lease cleanup, then publishes one `Stopped` (or failed) snapshot; a stop from another thread halts a tick in
-  flight; cancellation cancels both owners instead of stopping them (the library records `ExitCancelled` or
-  `ExitStopped` per owner, a race it owns). Each gameplay instance leases a workspace through the engine; a failing
+  admitted is read after the accounting wait, an application failure is not one); the first failure is primary and the
+  rest bounded evidence; one failure snapshot is published carrying the last good world and tick and the invalidated
+  intentions, after every gameplay instance has been stopped through the public instance controls and settled, with
+  the owner kept alive. The driver learns of a failure in tick T before it decides T's commit through the owner's
+  accounting wait (D-47, `awaitScheduledAccounting`): after the tick completes it waits, on the application thread and
+  one wait at a time, until the owner has accounted for the endings the tick's work began, the escalation of a failure
+  included, and commits only on `AccountingComplete` (the scheduler reconciles a grant before the instance layer
+  accounts for the tick's last segment, so a refused wait looks, for a moment, like an idle active instance); the
+  sample admits no task and holds no slot only to order a failure. The gameplay owner's scheduling is derived from the
+  bounds so that live instances' invocations and the session's unobserved tasks both have active slots. The ledger gains
+  *invalidated* and *discarded*; a stop (`stopSession`) ends admission and grants, settles the gameplay instances
+  including `shutdown` and lease cleanup, waits for the accounting, then publishes one `Stopped` (or failed) snapshot; a
+  stop from another thread halts a tick in flight; cancellation cancels both owners instead of stopping them (each
+  exits cancelled when the cancellation reaches its thread before its stop check, which the examples hold with gates in
+  the owner's observer). Each gameplay instance leases a workspace through the engine; a failing
   release is cleanup evidence that ends the owner fatally. The UI pauses and resumes the gameplay behavior through the
   engine's lifecycle controls, granted for control and inspection of that endpoint only; the application assigns each
   a tick and a place, and the driver's begin waits while a request is between assignment and admission. A UI failure is
