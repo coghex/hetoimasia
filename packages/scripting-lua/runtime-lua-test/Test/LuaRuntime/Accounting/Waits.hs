@@ -8,11 +8,13 @@ module Test.LuaRuntime.Accounting.Waits (spec) where
 
 import Control.Concurrent.STM (atomically, retry)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), finally, throwIO)
-import Control.Monad (forM_, replicateM_, void)
+import Control.Monad (forM_, replicateM_, void, when)
 import Data.IORef (readIORef, writeIORef)
 import Data.Text (Text)
+import qualified Data.Text as Text
 import Hetoimasia.Foundation.Log (unsafeComponent)
-import Hetoimasia.Runtime.Supervision (Recognition (Recognized), Role (Service), WorkerPolicy (..), WorkerStatus (WorkerLive))
+import Hetoimasia.Foundation.Worker (GroupStatus (..), Outstanding (..), OutstandingWorker (..))
+import Hetoimasia.Runtime.Supervision (Recognition (Recognized), Role (Service), WorkerPolicy (..), WorkerStatus (WorkerLive), workerGroupStatus)
 import qualified Hetoimasia.Runtime.Supervision as Supervision
 import Hetoimasia.Scripting.Lua.Owner (vmModules)
 import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
@@ -30,6 +32,10 @@ startPlain fixture runtime label policy bounds =
   startScheduled fixture runtime base {scheduledVm = (scheduledVm base) {vmModules = vmModules (scheduledVm base) <> [windowTasks]}}
   where
     base = scheduled fixture label policy bounds
+
+-- | Whether this is the failing owner's worker, which has not yet published its terminal outcome.
+awaitingFailing ∷ OutstandingWorker → Bool
+awaitingFailing worker = outstandingState worker == AwaitingTerminal && "failing" `Text.isInfixOf` outstandingLabel worker
 
 -- | What a wait ended with, failing if it raised.
 answer ∷ PendingWait → IO AccountingWait
@@ -263,6 +269,24 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
           grant other 1
           void (awaitScheduledAccounting control owner)
           throwIO (userError "the wait returned instead of rethrowing the fatal failure")
+      let ExceptionWithContext _ raised = failure
+      raised `shouldSatisfy` brokenIs "bang"
+
+    it "rethrows a fatal failure that is already published when it is called, ahead of a completion that is ready" $ bounded $ do
+      fixture ← newSFixture
+      failure ← expectFatal $ \control runtime → do
+        owner ← startPlain fixture runtime "ready" requiredPolicy defaultSchedulerBounds
+        other ← startPlain fixture runtime "failing" requiredPolicy defaultSchedulerBounds
+        _ ← admitTask' fixture other "bang" (request "host_fail" [VText "bang"] OrdinaryClass OneShot Nothing)
+        -- The failing owner's worker has published its terminal outcome, and nothing in this thread has
+        -- made a supervised call since, so supervision has not handled it: the drain status, the one
+        -- read any thread may make, shows it.
+        atomically $ do
+          status ← workerGroupStatus control
+          when (any awaitingFailing (statusOutstanding status)) retry
+        -- The wait is ready all the same, and is not what the call answers.
+        void (awaitScheduledAccounting control owner)
+        throwIO (userError "the wait returned instead of rethrowing the fatal failure")
       let ExceptionWithContext _ raised = failure
       raised `shouldSatisfy` brokenIs "bang"
 
