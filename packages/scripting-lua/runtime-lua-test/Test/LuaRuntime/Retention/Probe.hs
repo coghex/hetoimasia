@@ -25,12 +25,13 @@ module Test.LuaRuntime.Retention.Probe
   ) where
 
 import Control.Concurrent (yield)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar)
 import Control.Concurrent.STM (STM)
-import Control.Monad (when)
+import Control.Monad (void, when)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import GHC.Conc (unsafeIOToSTM)
+import Test.LuaRuntime.Support (Gated (..))
 import Hetoimasia.Scripting.Lua.Provider (RetirementState (..))
 
 -- | The order readings ran in, newest first, shared by the probes of one example.
@@ -56,6 +57,11 @@ data Probe = Probe
   , prAnswers ∷ !(IORef [Answer])
     -- ^ What each execution that got as far as an answer answered, newest first.
   }
+
+-- | Letting go of a probe lets its gated first execution go on, as the example does after its
+-- conflicting commit, without that commit. Harmless twice, and for a probe that holds no gate.
+instance Gated Probe where
+  openAllGates = void . (`tryPutMVar` ()) . prProceed
 
 -- | A probe that only counts.
 newProbe ∷ Trace → Text → IO Probe

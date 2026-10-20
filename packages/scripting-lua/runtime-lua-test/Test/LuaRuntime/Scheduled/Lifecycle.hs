@@ -19,7 +19,7 @@ import Control.Concurrent.MVar (readMVar)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (fireReg, liveRegs, nanoseconds)
-import Test.LuaRuntime.Support (bounded, expectFatal, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, expectFatal, requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- | Whether the owner's thread is parked in an STM transaction, which is where an
 -- idle owner is, and nowhere else it ever blocks without an event to wait for.
@@ -96,7 +96,7 @@ spec = describe "idle and stop" $ do
   describe "stopping the owner" $ do
     it "lets a running segment return, discards what had not started and counts it, and keeps the worker live while a segment is stuck" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \control runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \control runtime → do
         owner ← startScheduled fixture runtime (scheduled fixture "stuck" requiredPolicy defaultSchedulerBounds)
         stuck ← admitTask' fixture owner "stuck" (request "block_in" [VText "s"] OrdinaryClass OneShot Nothing)
         awaitEntered fixture "s"

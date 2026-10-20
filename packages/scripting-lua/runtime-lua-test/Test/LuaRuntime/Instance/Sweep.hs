@@ -41,7 +41,7 @@ import Test.LuaRuntime.Scheduled.Support
   , request
   )
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- The order of effects ------------------------------------------------------------------
 
@@ -112,7 +112,7 @@ orderOf ContendedForgotten release cut = contendedOrder (Shape 3 6 2) release cu
 orderOf exhausted release (Cut cost budget) = do
   fixture ← newIFixture
   writeIORef (sfDelay (sf fixture)) cost
-  withBoundary $ \control runtime → do
+  withBoundaryOpening [openAllGates fixture] $ \control runtime → do
     let bounds =
           defaultSchedulerBounds
             { boundServiceBudget = nanoseconds <$> budget
@@ -182,7 +182,7 @@ contendedOrder ∷ Shape → Release → Cut → IO [Text]
 contendedOrder (Shape unreadHeld active forgotten) release (Cut cost budget) = do
   fixture ← newIFixture
   writeIORef (sfDelay (sf fixture)) cost
-  withBoundary $ \control runtime → do
+  withBoundaryOpening [openAllGates fixture] $ \control runtime → do
     let bounds =
           defaultSchedulerBounds
             { boundServiceBudget = nanoseconds <$> budget
@@ -235,7 +235,7 @@ wakeOrder ∷ Cut → IO [Text]
 wakeOrder (Cut cost budget) = do
   fixture ← newIFixture
   writeIORef (sfDelay (sf fixture)) cost
-  withBoundary $ \_ runtime → do
+  withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
     let bounds = defaultSchedulerBounds {boundServiceBudget = nanoseconds <$> budget, boundActiveTasks = 2}
     owner ←
       startWith fixture runtime $
@@ -266,7 +266,7 @@ jobOrder ∷ Cut → IO [Text]
 jobOrder (Cut cost budget) = do
   fixture ← newIFixture
   writeIORef (sfDelay (sf fixture)) cost
-  withBoundary $ \control runtime → do
+  withBoundaryOpening [openAllGates fixture] $ \control runtime → do
     let bounds = defaultSchedulerBounds {boundServiceBudget = nanoseconds <$> budget, boundRetainedResults = 4}
     owner ←
       startWith fixture runtime $
@@ -339,7 +339,7 @@ data Ending
 unstartedAt ∷ Base → Pausing → Ending → Int → IO Int
 unstartedAt base pausing ending events = do
   fixture ← newIFixture
-  withBoundary $ \control runtime → do
+  withBoundaryOpening [openAllGates fixture] $ \control runtime → do
     let bounds =
           defaultSchedulerBounds
             { boundActiveTasks = 1
@@ -424,7 +424,7 @@ spec = describe "the invariants, swept over the configurations that could break 
         terminationUnstarted (resultTermination settled) `shouldBe` 0
     it "is not counted once it has begun" $ bounded $ do
       fixture ← newIFixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         owner ←
           startWith fixture runtime $
             instanceSpec fixture "begun run" [gateOneShot] (testConfig (InstanceBounds 1 2 4 4)) requiredPolicy defaultSchedulerBounds

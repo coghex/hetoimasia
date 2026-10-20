@@ -138,10 +138,12 @@ The driver's `stepTick`:
    (`awaitScheduledAccounting`, D-47), which takes no task, ticket or slot: an instance that failed has ended (its
    `shutdown` and the release of what it held included) and the application's escalation has been called and has
    returned. If the owner ended instead (`AccountingOwnerEnded`) nothing was accounted for and nothing is
-   committed. The wait is one of the supervised waits the sample makes, called on the application thread that owns
-   the supervision handle, one at a time (they take a lock, and `stopSession`, whose waits they are, refuses any
-   thread but the application thread's: another thread asks with `requestStop`, which waits for nothing, so a stop
-   never waits beside the driver). The faults of tasks the session admitted are read next, though each was told
+   committed. The wait is one of the supervised waits the sample makes, and those are the application thread's (the
+   thread that created the session, which owns the supervision handle), one at a time: `stepTick` and `stopSession`
+   refuse any other thread (`DriverOffApplicationThread`, `StopOffApplicationThread`), and another thread asks for a
+   stop with `requestStop`, which waits for nothing, so a stop never waits beside the driver. The admissions of tasks
+   that are in flight are waited for next (a task the owner accepted runs, and can fault in the tick, before its
+   admitter has registered it), and then the faults of the tasks the session admitted are read, though each was told
    when it happened, by the task's own watcher.
 5. **Decide.** A failure told of fails the session and commits nothing; a stop commits nothing; otherwise the
    tick commits only if its work **finished successfully**: gameplay called `staging.finish()` and the instance

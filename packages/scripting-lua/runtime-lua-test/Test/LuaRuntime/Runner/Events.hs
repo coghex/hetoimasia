@@ -13,7 +13,7 @@ import Hetoimasia.Scripting.Lua.Runner
 import Hetoimasia.Scripting.Lua.Runner.Internal (AnswerClass (..), Refusal (..), classifyAnswer)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Runner.Support
-import Test.LuaRuntime.Support (bounded, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, withBoundary, withBoundaryOpening)
 
 -- | A watcher's init: subscribe to the instances and record every event, with its tick.
 watching ∷ [Text]
@@ -79,7 +79,7 @@ spec = describe "events" $ do
         $ \paths →
           withBoundary $ \_ runtime → do
             report ←
-              alongside
+              alongside fixture
                 (driveTicks fixture tickLength 2)
                 (run fixture runtime (tickConfig fixture tickLength (Just 2) (map noWait paths)) >>= expectRan)
             reportEnding report `shouldBe` EndedTickLimit
@@ -120,7 +120,7 @@ spec = describe "events" $ do
       withScripts [("watch.lua", lua watcher), ("target.lua", lua eventOnly)] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               (driveTicks fixture tickLength 3)
               (run fixture runtime (tickConfig fixture tickLength (Just 3) (map noWait paths)) >>= expectRan)
           reportEnding report `shouldBe` EndedTickLimit
@@ -148,7 +148,7 @@ spec = describe "events" $ do
       withScripts [("watch.lua", lua watcher), ("one.lua", lua ["function run(self) end"])] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               (driveTicks fixture tickLength 1)
               (run fixture runtime (tickConfig fixture tickLength (Just 1) (map noWait paths)) >>= expectRan)
           reportEnding report `shouldBe` EndedTickLimit
@@ -165,7 +165,7 @@ spec = describe "events" $ do
       withScripts [("watch.lua", lua watching), ("bad.lua", lua ["function init(self) error('no') end"])] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               (driveTicks fixture tickLength 1)
               (run fixture runtime (tickConfig fixture tickLength (Just 1) (map noWait paths)) >>= expectRan)
           reportEnding report `shouldBe` EndedTickLimit
@@ -188,7 +188,7 @@ spec = describe "events" $ do
         $ \paths →
           withBoundary $ \_ runtime → do
             report ←
-              alongside
+              alongside fixture
                 (driveTicks fixture tickLength 1)
                 (run fixture runtime (tickConfig fixture tickLength (Just 1) (map noWait paths)) >>= expectRan)
             reportEnding report `shouldBe` EndedTickLimit
@@ -216,7 +216,7 @@ spec = describe "events" $ do
       withScripts [("twice.lua", lua twice), ("one.lua", lua ["function run(self) end"])] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               (driveTicks fixture tickLength 1)
               (run fixture runtime (tickConfig fixture tickLength (Just 1) (map noWait paths)) >>= expectRan)
           reportEnding report `shouldBe` EndedTickLimit
@@ -250,7 +250,7 @@ spec = describe "events" $ do
       withScripts [("a.lua", lua selfStopping)] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               (driveTicks fixture tickLength 2)
               (run fixture runtime (tickConfig fixture tickLength (Just 9) [everyTicks 1 (script (scriptAt paths 0))]) >>= expectRan)
           reportEnding report `shouldBe` EndedAllInstances
@@ -265,7 +265,7 @@ spec = describe "events" $ do
       withScripts [("watch.lua", lua watching), ("a.lua", lua selfStopping)] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               (driveTicks fixture tickLength 2)
               (run fixture runtime (tickConfig fixture tickLength (Just 2) [script (scriptAt paths 0), everyTicks 1 (script (scriptAt paths 1))]) >>= expectRan)
           reportEnding report `shouldBe` EndedTickLimit
@@ -288,7 +288,7 @@ spec = describe "events" $ do
       withScripts [("slow.lua", lua slow), ("one.lua", lua ["function run(self) end"])] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               (driveTicks fixture tickLength 5)
               (run fixture runtime (tickConfig fixture tickLength (Just 5) (map noWait paths)) >>= expectRan)
           reportEnding report `shouldBe` EndedTickLimit
@@ -309,7 +309,7 @@ spec = describe "events" $ do
       withScripts [("watch.lua", lua watching), ("one.lua", lua ["function run(self) end"])] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               (awaitRecorded fixture 3 >> setStop fixture True)
               (run fixture runtime (config fixture (map noWait paths)) >>= expectRan)
           reportEnding report `shouldBe` EndedStopRequest
@@ -342,7 +342,7 @@ spec = describe "events" $ do
       withScripts (("watch.lua", lua (manyWatches 20 (Just "lifecycle.pause(lifecycle.self())"))) : oneShots 6) $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               (awaitSnapshots fixture (\snapshots → length (filter (isTerminal . snapshotPhase) snapshots) >= 6) >> setStop fixture True)
               (run fixture runtime (config fixture (map noWait paths)) >>= expectRan)
           let tally = reportEvents report
@@ -356,9 +356,9 @@ spec = describe "events" $ do
     it "counts a delivery refused because the owner holds as many events for later ticks as it will, and fails nothing" $ bounded $ do
       fixture ← newRFixture
       withScripts (("watch.lua", lua (manyWatches 17 Nothing)) : oneShots 63) $ \paths →
-        withBoundary $ \_ runtime → do
+        withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               (awaitGate fixture "table" >> setStop fixture True >> openGate fixture "table")
               (run fixture runtime (gatedOn fixture startTitle "table" (tickConfig fixture tickLength Nothing (map noWait paths))) >>= expectRan)
           let tally = reportEvents report
@@ -374,7 +374,7 @@ spec = describe "events" $ do
       withScripts (("watch.lua", lua (manyWatches 20 Nothing)) : oneShots 4) $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               (driveTicks fixture tickLength 1)
               (run fixture runtime (tickConfig fixture tickLength (Just 5) (map noWait paths)) >>= expectRan)
           -- The watcher failed at the first tick and the one-shots had completed, so that is every instance.

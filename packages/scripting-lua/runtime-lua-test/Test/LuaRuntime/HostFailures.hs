@@ -62,7 +62,7 @@ spec = describe "host failures" $ do
 
   it "settles the in-flight call as discarded, started, failed, and every queued call as not started, failed, and no caller receives the failure" $ bounded $ do
     fixture ← newFixture
-    withBoundary $ \control runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \control runtime → do
       owner ← startOwner runtime (ownerSpec fixture "failing" ["app"] (optionalPolicy (brokenIs "binding")) (bounds 8 8))
       let endpoint = ownerEndpoint owner
       inflight ← submit endpoint "block_then_fail" [VText "go", VText "binding"] >>= accepted
@@ -139,7 +139,7 @@ spec = describe "host failures" $ do
 
   it "settles a cancelled owner's in-flight call as discarded, started, cancelled, and its queued calls as not started, cancelled" $ bounded $ do
     fixture ← newFixture
-    withBoundary $ \control runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \control runtime → do
       owner ← startOwner runtime (ownerSpec fixture "cancelled" ["app"] requiredPolicy (bounds 8 8))
       let endpoint = ownerEndpoint owner
       inflight ← submit endpoint "block_call" [VText "go"] >>= accepted

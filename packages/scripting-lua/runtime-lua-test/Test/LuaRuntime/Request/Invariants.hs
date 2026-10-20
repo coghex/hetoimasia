@@ -10,7 +10,7 @@
 -- * a task whose stop has begun is not taking requests, as an instance that is stopping is not.
 module Test.LuaRuntime.Request.Invariants (spec) where
 
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, tryWithContext)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, tryWithContext)
 import Control.Monad (void)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Resource (cleanupFailureLabel, cleanupFailuresInContext)
@@ -23,7 +23,7 @@ import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEffect, awaitEntered, awaitScheduledTerminal, releaseGate)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (bounded, expectFatal, optionalPolicy, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, expectFatal, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
 
 step ∷ ScheduledOwner → IO ()
 step owner = void (grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1))
@@ -55,36 +55,33 @@ spec = describe "invariants" $ do
     it "keeps the first value against a duplicate that arrives after the tick was applied and before its settlements were served" $ bounded $ do
       fixture ← newIFixture
       fake ← newFake
-      withBoundary $ \control runtime → providersFinish fake $ do
+      withBoundaryOpening [openAllGates fixture] $ \control runtime → providersFinish fake $ do
         owner ← startRequester fixture runtime "window" [asker] cmdConfig (logicalGrant fake 8 Nothing) requiredPolicy
         admitAsker fixture owner "i" "asker"
-        (do
-            command fixture owner "i" "start" "a"
-            awaitLine fixture "cmd start a started"
-            ticket ← taskOf owner "close_block" [VText "path", VInteger 5]
-            awaitSubmitted fake 2
-            awaitLine fixture "task started 5"
-            -- The owner is held in Lua while the grant, the task's stop and both completions
-            -- are accepted, so that all of them are found together at the next boundary.
-            command fixture owner "i" "block" "g1"
-            awaitEntered (sf fixture) "g1"
-            step owner
-            _ ← requestTaskControl (scheduledEndpoint owner) (ticketTask ticket) RequestStop
-            answerResult fake 0 7 >>= (`shouldBe` ReplyHeld)
-            answerResult fake 1 3 >>= (`shouldBe` ReplyHeld)
-            releaseGate (sf fixture) "g1"
-            -- The grant is applied, then the stop, and the task's closing handler holds the
-            -- owner before the tick's places are served.
-            awaitEntered (sf fixture) "upd"
-            tickReached owner >>= (`shouldBe` 1)
-            answerResult fake 0 9 >>= (`shouldBe` ReplyLate)
-            rdDuplicateHeld <$> diagnostics owner >>= (`shouldBe` 1)
-            releaseGate (sf fixture) "upd"
-            _ ← awaitTicksComplete control owner
-            command fixture owner "i" "take" "a"
-            awaitLine fixture "cmd take a {status=result,value=7}"
-          )
-          `finally` (releaseGate (sf fixture) "g1" >> releaseGate (sf fixture) "upd")
+        command fixture owner "i" "start" "a"
+        awaitLine fixture "cmd start a started"
+        ticket ← taskOf owner "close_block" [VText "path", VInteger 5]
+        awaitSubmitted fake 2
+        awaitLine fixture "task started 5"
+        -- The owner is held in Lua while the grant, the task's stop and both completions
+        -- are accepted, so that all of them are found together at the next boundary.
+        command fixture owner "i" "block" "g1"
+        awaitEntered (sf fixture) "g1"
+        step owner
+        _ ← requestTaskControl (scheduledEndpoint owner) (ticketTask ticket) RequestStop
+        answerResult fake 0 7 >>= (`shouldBe` ReplyHeld)
+        answerResult fake 1 3 >>= (`shouldBe` ReplyHeld)
+        releaseGate (sf fixture) "g1"
+        -- The grant is applied, then the stop, and the task's closing handler holds the
+        -- owner before the tick's places are served.
+        awaitEntered (sf fixture) "upd"
+        tickReached owner >>= (`shouldBe` 1)
+        answerResult fake 0 9 >>= (`shouldBe` ReplyLate)
+        rdDuplicateHeld <$> diagnostics owner >>= (`shouldBe` 1)
+        releaseGate (sf fixture) "upd"
+        _ ← awaitTicksComplete control owner
+        command fixture owner "i" "take" "a"
+        awaitLine fixture "cmd take a {status=result,value=7}"
 
   describe "what is retained can be delivered" $ do
     it "bounds a result with the record a script is handed counted, so one that would not fit is a failure when it arrives" $ bounded $ do

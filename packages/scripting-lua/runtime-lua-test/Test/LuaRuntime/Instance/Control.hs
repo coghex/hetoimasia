@@ -9,7 +9,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEffect, awaitEntered, awaitIdle, cancelQueued, releaseGate)
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundary, withBoundaryOpening)
 
 spec ∷ Spec
 spec = describe "control" $ do
@@ -56,7 +56,7 @@ spec = describe "control" $ do
 
   it "stops while paused: it closes the suspended callback before shutdown, discards what had not begun with counts, and runs shutdown once" $ bounded $ do
     fixture ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       owner ← startInstances fixture runtime "stop paused" [closing, holder] (testConfig instanceBounds') requiredPolicy
       _ ← admit fixture owner "a" (moduleNamed "closing")
       awaitPhase fixture owner "a" Active
@@ -86,7 +86,7 @@ spec = describe "control" $ do
 
   it "settles contradictory requests in the order accepted, and none resurrects an instance or undoes a stop" $ bounded $ do
     fixture ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       owner ← startInstances fixture runtime "contradictions" [slow, holder] (testConfig instanceBounds') requiredPolicy
       _ ← admit fixture owner "a" (moduleNamed "slow")
       awaitPhase fixture owner "a" Active
@@ -126,7 +126,7 @@ spec = describe "control" $ do
 
   it "settles a request that finds its instance already ended as no longer applicable, not as already in that state" $ bounded $ do
     fixture ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       owner ← startInstances fixture runtime "ended first" [echoer, holder] (testConfig instanceBounds') requiredPolicy
       _ ← admit fixture owner "a" (moduleNamed "echoer")
       awaitPhase fixture owner "a" Active
@@ -139,7 +139,7 @@ spec = describe "control" $ do
 
   it "refuses what it cannot take: an identity it never issued, another owner's, a full set of reservations, a closed owner" $ bounded $ do
     fixture ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       owner ← startInstances fixture runtime "refusals" [echoer, gateShutdown] (testConfig instanceBounds' {boundInstanceControls = 1}) requiredPolicy
       other ← startInstances fixture runtime "other" [echoer] (testConfig instanceBounds') requiredPolicy
       _ ← admit fixture owner "a" (moduleNamed "echoer")
@@ -171,7 +171,7 @@ spec = describe "control" $ do
 
   it "settles a request the owner never applied, once, as no longer applicable, whether the owner retired or failed" $ bounded $ do
     fixture ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       retiring ← startInstances fixture runtime "retiring" [echoer, holder] (testConfig instanceBounds') requiredPolicy
       _ ← admit fixture retiring "a" (moduleNamed "echoer")
       awaitPhase fixture retiring "a" Active
@@ -183,7 +183,7 @@ spec = describe "control" $ do
       pollInstanceControl receipt >>= (`shouldBe` Just ControlNoLongerApplicable)
     -- The same when the owner is cancelled while it is held, on a fixture of its own.
     failing ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture, openAllGates failing] $ \_ runtime → do
       owner ← startInstances failing runtime "cancelled" [echoer, holder] (testConfig instanceBounds') requiredPolicy
       _ ← admit failing owner "a" (moduleNamed "echoer")
       awaitPhase failing owner "a" Active

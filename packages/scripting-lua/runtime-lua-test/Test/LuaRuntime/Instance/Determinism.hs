@@ -14,7 +14,7 @@ import Test.Hspec (Spec, describe, it, shouldBe)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfDelay), awaitEffect, defaultSchedulerBounds)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundaryOpening)
 
 -- | Two instances fed the same events while the owner is held, the owner then let
 -- go, and what their callbacks recorded. Each segment costs this much of the
@@ -37,7 +37,7 @@ run cost budget = do
     logged fixture
   where
     withBoundary' fixture body =
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         let bounds = defaultSchedulerBounds {boundServiceBudget = nanoseconds . fromIntegral <$> budget}
         owner ← startWith fixture runtime (instanceSpec fixture "deterministic" [paced, holder] (testConfig instanceBounds') requiredPolicy bounds)
         body owner

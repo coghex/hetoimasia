@@ -17,7 +17,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEntered, awaitScheduledTerminal, releaseGate)
-import Test.LuaRuntime.Support (Broken (Broken), bounded, brokenIs, expectFatal, optionalPolicy, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Broken (Broken), Gated (..), bounded, brokenIs, expectFatal, expectFatalOpening, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- | Whether a retained failure is the application's own, of this name.
 brokenAmong ∷ Text.Text → ExceptionWithContext SomeException → Bool
@@ -131,7 +131,7 @@ spec = describe "failures" $ do
     it "is recorded as the owner's evidence even when the owner is cancelled while the disposal that failed was running" $ bounded $ do
       fixture ← newIFixture
       fake ← newFake
-      ExceptionWithContext context _ ← expectFatal $ \control runtime → providersFinish fake $ do
+      ExceptionWithContext context _ ← expectFatalOpening [openAllGates fixture] $ \control runtime → providersFinish fake $ do
         owner ← startRequester fixture runtime "cancelled disposal" [asker] cmdConfig (grantOf fake 4) (optionalPolicy (const True))
         admitAsker fixture owner "i" "asker"
         command fixture owner "i" "start_failing" "a"
@@ -184,7 +184,7 @@ spec = describe "failures" $ do
     it "never waits for the owner: it completes while the owner is inside a segment and the owner's places are all held" $ bounded $ do
       fixture ← newIFixture
       fake ← newFake
-      withBoundary $ \_ runtime → providersFinish fake $ do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → providersFinish fake $ do
         owner ← startRequester fixture runtime "busy" [asker] cmdConfig (grantOf fake 1) requiredPolicy
         admitAsker fixture owner "i" "asker"
         command fixture owner "i" "start" "a"

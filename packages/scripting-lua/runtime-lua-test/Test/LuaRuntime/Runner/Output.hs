@@ -47,7 +47,7 @@ spec = describe "output" $ do
       $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               (awaitOut fixture 4 >> deliverTick fixture 0 1 >> awaitCount (length . startingWith "callback" <$> outLines fixture) 1 >> setStop fixture True)
               (runTick fixture runtime (config fixture (map noWait paths)) >>= expectRan)
           reportEnding report `shouldBe` EndedStopRequest

@@ -20,7 +20,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VInteger))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (allRegs)
-import Test.LuaRuntime.Support (bounded, newFixture, optionalPolicy, quickSpec, requiredPolicy, startOwner, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, newFixture, optionalPolicy, quickSpec, requiredPolicy, startOwner, withBoundary, withBoundaryOpening)
 
 -- | An initial chunk that runs the Lua given, under the name @init@.
 initial ∷ Text → [(ChunkName, ByteString)]
@@ -30,7 +30,7 @@ spec ∷ Spec
 spec = describe "creation, readiness and identity" $ do
   it "is ready only once its configured initialization has run" $ bounded $ do
     fixture ← newSFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       let config = withChunks (initial "fx.block('init')") (scheduled fixture "slow init" requiredPolicy defaultSchedulerBounds)
       created ← newEmptyMVar
       _ ← forkIO (startScheduled fixture runtime config >>= putMVar created)

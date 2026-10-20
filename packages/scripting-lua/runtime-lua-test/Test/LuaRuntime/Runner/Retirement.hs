@@ -11,7 +11,7 @@ module Test.LuaRuntime.Runner.Retirement (spec) where
 import Control.Concurrent (myThreadId, throwTo)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryReadMVar)
 import Control.Concurrent.STM (atomically, retry)
-import Control.Exception (AsyncException (ThreadKilled), Exception, ExceptionWithContext (ExceptionWithContext), SomeException, finally, fromException, throwIO, try, tryWithContext)
+import Control.Exception (AsyncException (ThreadKilled), Exception, ExceptionWithContext (ExceptionWithContext), finally, fromException, throwIO)
 import Control.Monad (void)
 import Data.IORef (atomicModifyIORef', readIORef)
 import Data.Maybe (isJust, isNothing)
@@ -24,7 +24,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Runner.Support
 import qualified Test.LuaRuntime.Support as Base
-import Test.LuaRuntime.Support (Broken (Broken), awaitBlockedOnSTM, bounded, brokenIs, expectFatal, quickSpec, startOwner, submit, withBoundary)
+import Test.LuaRuntime.Support (Broken (Broken), Gated (..), awaitBlockedOnSTM, bounded, brokenIs, expectFatalOpening, quickSpec, startOwner, submit, tryExpected, withBoundaryOpening)
 
 -- | What a test throws to the runner's thread to cancel it.
 data Cancelling = Cancelling
@@ -50,11 +50,11 @@ spec = describe "retirement" $ do
     returned ← newEmptyMVar
     observed ← newEmptyMVar
     withScripts [("e.lua", lua ["function shutdown(self, reason) fx.block('shutdown') print('after') end"])] $ \paths → do
-      ExceptionWithContext _ failure ← expectFatal $ \control runtime → do
+      ExceptionWithContext _ failure ← expectFatalOpening [openAllGates fixture, openAllGates other] $ \control runtime → do
         runner ← myThreadId
         owner ← startOwner runtime (quickSpec other "other" ["app"])
         void (submit (ownerEndpoint owner) "block_then_fail" [VText "go", VText "host"] >>= Base.accepted)
-        alongside
+        Base.alongsideOpening [openAllGates fixture, openAllGates other]
           ( do
               -- The run waits, the instance is up: another worker fails, which latches and asks every worker to stop.
               awaitOut fixture 3
@@ -80,11 +80,11 @@ spec = describe "retirement" $ do
     returned ← newEmptyMVar
     observed ← newEmptyMVar
     withScripts [("held.lua", lua ["fx.block('load')", "print('after')", "function run(self) end"])] $ \paths → do
-      ExceptionWithContext _ failure ← expectFatal $ \control runtime → do
+      ExceptionWithContext _ failure ← expectFatalOpening [openAllGates fixture, openAllGates other] $ \control runtime → do
         runner ← myThreadId
         owner ← startOwner runtime (quickSpec other "other" ["app"])
         void (submit (ownerEndpoint owner) "block_then_fail" [VText "go", VText "host"] >>= Base.accepted)
-        alongside
+        Base.alongsideOpening [openAllGates fixture, openAllGates other]
           ( do
               -- The owner is inside the module's top level, held, and the runner's thread is in creation's wait.
               awaitGate fixture "load"
@@ -106,12 +106,12 @@ spec = describe "retirement" $ do
   it "completes before the run is cancelled during startup" $ bounded $ do
     fixture ← newRFixture
     withScripts [("held.lua", lua ["fx.block('load')", "print('after')", "function run(self) end"])] $ \paths →
-      withBoundary $ \control runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \control runtime → do
         runner ← myThreadId
         returned ← newEmptyMVar
         observed ← newEmptyMVar
         outcome ←
-          alongside
+          alongside fixture
             ( do
                 awaitGate fixture "load"
                 awaitBlockedOnSTM runner
@@ -124,9 +124,9 @@ spec = describe "retirement" $ do
                 putMVar observed (notReturned, workers >= 1)
                 openGate fixture "load"
             )
-            (try @SomeException (run fixture runtime (config fixture [noWait (scriptAt paths 0)])) `finally` (markReturned fixture >> putMVar returned ()))
+            (tryExpected (run fixture runtime (config fixture [noWait (scriptAt paths 0)])) `finally` (markReturned fixture >> putMVar returned ()))
         case outcome of
-          Left raised → (fromException raised ∷ Maybe Cancelling) `shouldSatisfy` isJust
+          Left (ExceptionWithContext _ raised) → (fromException raised ∷ Maybe Cancelling) `shouldSatisfy` isJust
           Right _ → fail "the run returned instead of being cancelled"
         takeMVar observed `shouldReturn` (True, True)
         expectWrittenBeforeReturn fixture "after"
@@ -134,12 +134,12 @@ spec = describe "retirement" $ do
   it "is not cut short by a cancellation while it waits for a held segment: the owner has ended before the cancellation propagates" $ bounded $ do
     fixture ← newRFixture
     withScripts [("slow.lua", lua ["function run(self) fx.block('hold') print('after') end"])] $ \paths →
-      withBoundary $ \control runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \control runtime → do
         runner ← myThreadId
         returned ← newEmptyMVar
         observed ← newEmptyMVar
         outcome ←
-          alongside
+          alongside fixture
             ( do
                 -- The segment is held, the stop request is set, and the run has asked its owner to retire.
                 awaitGate fixture "hold"
@@ -152,9 +152,9 @@ spec = describe "retirement" $ do
                 putMVar observed (notReturned, workers >= 1)
                 openGate fixture "hold"
             )
-            (try @SomeException (runTick fixture runtime (config fixture [noWait (scriptAt paths 0)])) `finally` (markReturned fixture >> putMVar returned ()))
+            (tryExpected (runTick fixture runtime (config fixture [noWait (scriptAt paths 0)])) `finally` (markReturned fixture >> putMVar returned ()))
         case outcome of
-          Left raised → (fromException raised ∷ Maybe Cancelling) `shouldSatisfy` isJust
+          Left (ExceptionWithContext _ raised) → (fromException raised ∷ Maybe Cancelling) `shouldSatisfy` isJust
           Right _ → fail "the run returned instead of being cancelled"
         takeMVar observed `shouldReturn` (True, True)
         expectWrittenBeforeReturn fixture "after"
@@ -162,7 +162,7 @@ spec = describe "retirement" $ do
   it "keeps draining when cleanup after a failure of the runner's own thread is interrupted, and keeps both failures" $ bounded $ do
     fixture ← newRFixture
     withScripts [("e.lua", lua ["function shutdown(self, reason) fx.block('shutdown') print('after') end"])] $ \paths →
-      withBoundary $ \control runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \control runtime → do
         runner ← myThreadId
         returned ← newEmptyMVar
         observed ← newEmptyMVar
@@ -174,7 +174,7 @@ spec = describe "retirement" $ do
                     if line == startTitle then throwIO (Broken "table sink") else pure ()
                 }
         outcome ←
-          alongside
+          alongside fixture
             ( do
                 -- The owner is in the hook, held, and the run's cleanup is waiting for it. It is interrupted.
                 awaitGate fixture "shutdown"
@@ -186,7 +186,7 @@ spec = describe "retirement" $ do
                 putMVar observed (notReturned, workers >= 1)
                 openGate fixture "shutdown"
             )
-            (tryWithContext @SomeException (run fixture runtime failingTable) `finally` (markReturned fixture >> putMVar returned ()))
+            (tryExpected (run fixture runtime failingTable) `finally` (markReturned fixture >> putMVar returned ()))
         takeMVar observed `shouldReturn` (True, True)
         expectWrittenBeforeReturn fixture "after"
         case outcome of

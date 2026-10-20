@@ -20,7 +20,7 @@ import Hetoimasia.Scripting.Lua.Owner (BoundaryFault (boundaryChunk))
 import Hetoimasia.Scripting.Lua.Runner
 import Test.Hspec (Spec, describe, it, shouldBe, shouldContain, shouldNotContain, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Runner.Support
-import Test.LuaRuntime.Support (Broken (Broken), bounded, brokenIs, expectFatal, withBoundary)
+import Test.LuaRuntime.Support (Broken (Broken), Gated (..), bounded, brokenIs, expectFatal, withBoundary, withBoundaryOpening)
 
 -- | A module that fails where its name says, and records every hook that runs.
 failing ∷ Text → [Text]
@@ -110,7 +110,7 @@ spec = describe "failures" $ do
       withScripts [("up.lua", lua ["function update(self, dt) fx.record('update') error('update boom') end", "function shutdown(self, reason) fx.record('shutdown ' .. reason) end"])] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside (awaitOut fixture 3 >> awaitLive fixture 1 >> tickClock fixture 10000000 >> fireLive fixture) $
+            alongside fixture (awaitOut fixture 3 >> awaitLive fixture 1 >> tickClock fixture 10000000 >> fireLive fixture) $
               run fixture runtime (config fixture [Script (scriptAt paths 0) Nothing (Just (ns 10000000))]) >>= expectRan
           statusOf report `shouldBe` StatusFailure
           case instancesOf report of
@@ -123,7 +123,7 @@ spec = describe "failures" $ do
       withScripts [("cb.lua", lua ["function init(self, api) api.connect('tick', function(self, event) fx.record('tick') error('callback boom') end) end", "function shutdown(self, reason) fx.record('shutdown ' .. reason) end"])] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside (awaitOut fixture 3 >> deliverTick fixture 0 1 >>= \_ → pure ()) $
+            alongside fixture (awaitOut fixture 3 >> deliverTick fixture 0 1 >>= \_ → pure ()) $
               runTick fixture runtime (config fixture [noWait (scriptAt paths 0)]) >>= expectRan
           reportEnding report `shouldBe` EndedAllInstances
           statusOf report `shouldBe` StatusFailure
@@ -140,7 +140,7 @@ spec = describe "failures" $ do
       withScripts [("sd.lua", lua ["function shutdown(self, reason) fx.record('shutdown ' .. reason) error('shutdown boom') end"])] $ \paths →
         withBoundary $ \_ runtime → do
           report ←
-            alongside (awaitOut fixture 3 >> setStop fixture True) $
+            alongside fixture (awaitOut fixture 3 >> setStop fixture True) $
               run fixture runtime (config fixture [noWait (scriptAt paths 0)]) >>= expectRan
           reportEnding report `shouldBe` EndedStopRequest
           -- A failure outranks the stop request.
@@ -227,9 +227,9 @@ spec = describe "failures" $ do
     it "writes a failure as it settles, and keeps every admitted instance in the tables when one fails before the last initializer finishes" $ bounded $ do
       fixture ← newRFixture
       withScripts [("early.lua", lua (failing "init")), ("slow.lua", lua ["function init(self) fx.block('slow') end", "function shutdown(self, reason) fx.record('shutdown slow ' .. reason) end"])] $ \paths →
-        withBoundary $ \_ runtime → do
+        withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
           report ←
-            alongside
+            alongside fixture
               ( awaitGate fixture "slow"
                   -- The early failure is reported while the last initializer is still held, before the start table.
                   >> awaitCount (length . reportHeaders <$> errLines fixture) 1

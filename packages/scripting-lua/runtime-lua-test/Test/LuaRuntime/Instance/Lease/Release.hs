@@ -20,7 +20,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Lease.Support
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (awaitScheduledTerminal, cancelQueued)
-import Test.LuaRuntime.Support (bounded, brokenIs, expectFatal, optionalPolicy, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, brokenIs, expectFatal, expectFatalOpening, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
 
 releases ∷ [Text.Text] → [Text.Text]
 releases = filter (Text.isPrefixOf "release ")
@@ -159,7 +159,7 @@ spec = describe "releasing" $ do
     let base = lfBase fixture
     breakRelease fixture "indep-b"
     blockRelease fixture "indep-b"
-    _ ← expectFatal $ \control runtime → do
+    _ ← expectFatalOpening [openAllGates fixture] $ \control runtime → do
       owner ← startLeased fixture runtime "cancelled in release" [independent] leaseConfig requiredPolicy
       _ ← admit base owner "a" (moduleNamed "independent")
       awaitPhase base owner "a" Active
@@ -321,7 +321,7 @@ spec = describe "releasing" $ do
     it "releases what an instance held when the owner is cancelled, though no hook may run" $ bounded $ do
       fixture ← newLFix 4
       let base = lfBase fixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         owner ← startLeased fixture runtime "cancelled owner" [plain, holder] leaseConfig requiredPolicy
         _ ← admit base owner "p" (moduleNamed "plain")
         awaitPhase base owner "p" Active
