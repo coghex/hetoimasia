@@ -71,6 +71,7 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , TerminalResult (ResultCancelled, ResultCompleted, ResultFailed)
   , grantsAccepted
   , grantsFinished
+  , retainsEvidence
   , observeTask
   )
 import Hetoimasia.Scripting.Lua.Value (Value, ValueLimits)
@@ -251,6 +252,11 @@ data Accounting = Accounting
     -- ^ Written once for a watch: how many instance endings had begun when the boundary that
     -- finished the watched grants ended, or, for a watch whose grants had finished at a boundary
     -- that had already ended, when it was taken. Every ending numbered up to it is the wait's.
+  , acTainted ∷ !Bool
+    -- ^ Set, for good, by the owner when the owner holds cleanup evidence that will end it as a
+    -- failure (the failure of a close, a release, a settlement) at a point where it could have
+    -- accounted for an ending or sealed a boundary: from then on it is exiting, and the wait
+    -- neither completes nor ends until it has ended and supervision has handled the outcome.
   , acSealed ∷ !Word64
     -- ^ How many grants had finished when the owner's last boundary ended. Grants finish only
     -- inside a boundary, so a watch whose grants number no more than this is for a boundary
@@ -266,7 +272,7 @@ data Accounting = Accounting
 
 -- | An owner's accounting before anything has begun.
 newAccounting ∷ Accounting
-newAccounting = Accounting Nothing Nothing 0 0 Map.empty
+newAccounting = Accounting Nothing Nothing False 0 0 Map.empty
 
 -- | Take the wait's snapshot: how many grants have been accepted, committed in this one
 -- transaction, and watch for them. Replaces any earlier watch, which the application's one
@@ -292,21 +298,28 @@ unwatchAccounting control =
 -- | At the end of a boundary, on the owner's thread: note how many grants have finished and,
 -- if that finishes every grant a watch captured, latch it, fixing which endings are its own:
 -- those begun by now. Writes nothing when neither changed.
-sealAccounting ∷ Control → STM ()
-sealAccounting control = do
+--
+-- The flag says whether the owner holds cleanup evidence of its own, beside what the
+-- scheduler retains: either will end the owner as a failure, so the accounting is not a
+-- success from here on.
+sealAccounting ∷ Control → Bool → STM ()
+sealAccounting control held = do
   finished ← grantsFinished (controlScheduler control)
+  retained ← retainsEvidence (controlScheduler control)
   accounting ← readTVar (controlAccounting control)
   let latched = case (acWatch accounting, acCut accounting) of
         (Just captured, Nothing) | finished >= captured → Just (acBegun accounting)
         _ → acCut accounting
-  when (finished /= acSealed accounting || latched /= acCut accounting) $
-    writeTVar (controlAccounting control) accounting {acSealed = finished, acCut = latched}
+      tainted = acTainted accounting || held || retained
+  when (finished /= acSealed accounting || latched /= acCut accounting || tainted /= acTainted accounting) $
+    writeTVar (controlAccounting control) accounting {acSealed = finished, acCut = latched, acTainted = tainted}
 
 -- | Whether the latched watch's grants have finished, the boundary has ended, and every
 -- ending it covers has been accounted for. Retries until then.
 accountingReady ∷ Control → STM ()
 accountingReady control = do
   accounting ← readTVar (controlAccounting control)
+  when (acTainted accounting) retry
   case acCut accounting of
     Nothing → retry
     Just cut → when (any (<= cut) (Map.elems (acOpen accounting))) retry
@@ -318,10 +331,16 @@ endingBegun control instance' =
     let number = acBegun accounting + 1
      in accounting {acBegun = number, acOpen = Map.insert instance' number (acOpen accounting)}
 
--- | An instance's ending has been accounted for.
-endingAccounted ∷ Control → Word64 → STM ()
-endingAccounted control instance' =
-  modifyTVar' (controlAccounting control) (\accounting → accounting {acOpen = Map.delete instance' (acOpen accounting)})
+-- | An instance's ending has been accounted for. The flag says whether the owner holds
+-- cleanup evidence of its own, as for 'sealAccounting'.
+endingAccounted ∷ Control → Word64 → Bool → STM ()
+endingAccounted control instance' held = do
+  retained ← retainsEvidence (controlScheduler control)
+  modifyTVar' (controlAccounting control) $ \accounting →
+    accounting
+      { acOpen = Map.delete instance' (acOpen accounting)
+      , acTainted = acTainted accounting || held || retained
+      }
 
 -- | Where an owner's tasks are admitted. Any thread may hold and use it.
 newtype ScheduledEndpoint = ScheduledEndpoint Control

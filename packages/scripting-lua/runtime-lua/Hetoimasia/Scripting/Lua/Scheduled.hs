@@ -993,7 +993,10 @@ data AccountingWait
 -- supervision has handled the outcome without latching a fatal failure, and never with
 -- 'AccountingComplete' unless the accounting was complete before the owner began to exit.
 -- An owner that is exiting but has not ended (a stop waiting for a provider's retirement,
--- say) neither completes the wait nor ends it: the wait is for the exit. An @Escalate@
+-- say) neither completes the wait nor ends it: the wait is for the exit. Nor does an owner
+-- that holds cleanup evidence that will end it as a failure (the failure of closing a
+-- coroutine, of a release, of a settlement), even one whose every ending is accounted for: the
+-- wait is for the exit and the failure supervision then handles. An @Escalate@
 -- answer, an escalation callback that raises and a failed retirement end the owner as a
 -- failure, and the wait follows the severity supervision gives that outcome: a fatal one
 -- is rethrown, and a tolerated one ends the wait.
@@ -1018,7 +1021,10 @@ awaitScheduledAccounting supervision owner = do
       case status of
         WorkerLive → do
           exiting ← (||) <$> schedulerClosed (controlScheduler control) <*> controlStopping control
-          if exiting
+          -- Cleanup evidence the owner holds ends it as a failure, whatever else it has done:
+          -- the accounting is not a success while it is held.
+          tainted ← acTainted <$> readTVar (controlAccounting control)
+          if exiting || tainted
             then retry
             else accountingReady control >> pure AccountingComplete
         _ → pure AccountingOwnerEnded

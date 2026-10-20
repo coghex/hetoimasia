@@ -371,7 +371,9 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
             -- it ends when this returns, and it is the point an accounting wait's watch is
             -- latched at, once its grants have finished. The endings begun by now are the
             -- wait's own, whatever began them, and an ending begun later is not.
-            unless again (atomically (sealAccounting control))
+            unless again $ do
+              held ← (||) <$> (not . null <$> readIORef kept) <*> (not . null <$> readIORef extra)
+              atomically (sealAccounting control held)
             pure again
       report ← serviceTurnWith atBoundary scheduler host
       forM_ instances settleEnded

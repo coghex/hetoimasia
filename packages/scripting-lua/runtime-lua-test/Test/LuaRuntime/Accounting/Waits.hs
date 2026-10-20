@@ -52,7 +52,7 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
   describe "what it waits for" $ do
     it "returns for a tick that did no work, and for an owner that was never granted one" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \control runtime → do
+      withBoundary $ \control runtime → releasing fixture [] $ do
         owner ← startPlain fixture runtime "idle" requiredPolicy defaultSchedulerBounds
         awaitScheduledAccounting control owner >>= (`shouldBe` AccountingComplete)
         grant owner 1
@@ -65,7 +65,7 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
 
     it "waits for the grants it captured, however many, and for the tasks they woke" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \control runtime → do
+      withBoundary $ \control runtime → releasing fixture [] $ do
         owner ← startPlain fixture runtime "captured" requiredPolicy defaultSchedulerBounds
         _ ← admitTask' fixture owner "A" (blockAfterTicks "a" 1)
         awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
@@ -83,7 +83,7 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
 
     it "does not wait for a grant accepted after the ones it captured, which is not even finished" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \control runtime → do
+      withBoundary $ \control runtime → releasing fixture [] $ do
         owner ← startPlain fixture runtime "isolation" requiredPolicy defaultSchedulerBounds
         _ ← admitTask' fixture owner "A" (request "wait_ticks" [VText "A", VInteger 1] OrdinaryClass OneShot (Just "A"))
         _ ← admitTask' fixture owner "B" (blockAfterTicks "b" 2)
@@ -110,7 +110,7 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
       fixture ← newSFixture
       handled ← newGate
       openGate handled
-      withBoundary $ \control runtime → do
+      withBoundary $ \control runtime → releasing fixture [handled] $ do
         owner ← startPlain fixture runtime "norecapture" requiredPolicy defaultSchedulerBounds
         bystander ← startPlain fixture runtime "bystander" (classifying handled) defaultSchedulerBounds
         _ ← admitTask' fixture owner "A" (request "wait_ticks" [VText "A", VInteger 1] OrdinaryClass OneShot (Just "A"))
@@ -145,7 +145,7 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
               , boundControlRequests = 1
               , boundOutstandingGrants = 2
               }
-      withBoundary $ \control runtime → do
+      withBoundary $ \control runtime → releasing fixture [] $ do
         owner ← startPlain fixture runtime "saturated" requiredPolicy bounds
         let endpoint = scheduledEndpoint owner
         a ← admitTask' fixture owner "A" (request "wait_ticks" [VText "A", VInteger 1] OrdinaryClass OneShot (Just "A"))
@@ -179,7 +179,7 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
     it "can be made more times than any bound allows, one after another, leaving the owner's counters as they were" $ bounded $ do
       fixture ← newSFixture
       let bounds = defaultSchedulerBounds {boundActiveTasks = 2, boundQueuedAdmissions = 1, boundRetainedResults = 2, boundControlRequests = 1, boundOutstandingGrants = 2}
-      withBoundary $ \control runtime → do
+      withBoundary $ \control runtime → releasing fixture [] $ do
         owner ← startPlain fixture runtime "repeated" requiredPolicy bounds
         before ← atomically (scheduledDiagnostics (scheduledEndpoint owner))
         replicateM_ 9 $ awaitScheduledAccounting control owner >>= (`shouldBe` AccountingComplete)
@@ -195,7 +195,7 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
     it "leaves nothing behind when it is cancelled, whether it is parked or inside supervision's handling of an outcome" $ bounded $ do
       fixture ← newSFixture
       classifying' ← newGate
-      withBoundary $ \control runtime → do
+      withBoundary $ \control runtime → releasing fixture [classifying'] $ do
         owner ← startPlain fixture runtime "cancelled" requiredPolicy defaultSchedulerBounds
         bystander ← startPlain fixture runtime "bystander" (classifying classifying') defaultSchedulerBounds
         _ ← admitTask' fixture owner "A" (request "wait_ticks" [VText "A", VInteger 1] OrdinaryClass OneShot (Just "A"))
@@ -222,7 +222,7 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
   describe "when its owner ends" $ do
     it "ends with an owner that was stopped with a captured grant outstanding, and never reports it complete" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \control runtime → do
+      withBoundary $ \control runtime → releasing fixture [] $ do
         owner ← startPlain fixture runtime "stopped" requiredPolicy defaultSchedulerBounds
         _ ← admitTask' fixture owner "w" (request "wait_ticks" [VText "w", VInteger 1] OrdinaryClass OneShot (Just "w"))
         awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
@@ -237,7 +237,7 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
 
     it "ends with a cancelled owner, and with one that had ended before the wait began" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \control runtime → do
+      withBoundary $ \control runtime → releasing fixture [] $ do
         owner ← startPlain fixture runtime "cancelled owner" requiredPolicy defaultSchedulerBounds
         _ ← admitTask' fixture owner "w" (request "wait_ticks" [VText "w", VInteger 1] OrdinaryClass OneShot (Just "w"))
         awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
@@ -254,7 +254,7 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
 
     it "rethrows a fatal failure of supervision that arrives while it waits, and ends with nothing else" $ bounded $ do
       fixture ← newSFixture
-      failure ← expectFatal $ \control runtime → do
+      failure ← expectFatal $ \control runtime → releasing fixture [] $ do
         owner ← startPlain fixture runtime "pending" requiredPolicy defaultSchedulerBounds
         other ← startPlain fixture runtime "failing" requiredPolicy defaultSchedulerBounds
         _ ← admitTask' fixture owner "A" (blockAfterTicks "a" 1)
@@ -274,7 +274,7 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
 
     it "rethrows a fatal failure that is already published when it is called, ahead of a completion that is ready" $ bounded $ do
       fixture ← newSFixture
-      failure ← expectFatal $ \control runtime → do
+      failure ← expectFatal $ \control runtime → releasing fixture [] $ do
         owner ← startPlain fixture runtime "ready" requiredPolicy defaultSchedulerBounds
         other ← startPlain fixture runtime "failing" requiredPolicy defaultSchedulerBounds
         _ ← admitTask' fixture other "bang" (request "host_fail" [VText "bang"] OrdinaryClass OneShot Nothing)
@@ -292,7 +292,7 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
 
     it "ends with an owner that failed recognizably, and not with a completion, once supervision has handled it" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \control runtime → do
+      withBoundary $ \control runtime → releasing fixture [] $ do
         victim ← startPlain fixture runtime "victim" (optionalPolicy (brokenIs "bang")) defaultSchedulerBounds
         _ ← admitTask' fixture victim "bang" (request "tick_then_fail" [VText "bang"] OrdinaryClass OneShot Nothing)
         awaitDiagnostics victim (\counts → diagWaiting counts >= 1)
@@ -307,7 +307,7 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
   describe "from a Lua callback" $ do
     it "is refused, like every other wait, naming its operation" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \control runtime → do
+      withBoundary $ \control runtime → releasing fixture [] $ do
         owner ← startPlain fixture runtime "probes" requiredPolicy defaultSchedulerBounds
         writeIORef (sfRuntime fixture) (Just runtime)
         writeIORef (sfSupervision fixture) (Just control)
@@ -349,7 +349,7 @@ data Observation = Observation
 observe ∷ Maybe Strategy → IO Observation
 observe strategy = do
   fixture ← newSFixture
-  withBoundary $ \control runtime → do
+  withBoundary $ \control runtime → releasing fixture [] $ do
     owner ← startPlain fixture runtime "deterministic" requiredPolicy defaultSchedulerBounds
     let endpoint = scheduledEndpoint owner
         ticker label n every serviceClass kind =

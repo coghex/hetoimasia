@@ -25,6 +25,7 @@ module Test.LuaRuntime.Accounting.Support
   , refusedGatedShutdown
   , refusedClosing
   , stoppableClosing
+  , closeRaises
   , refusedLeased
   , overflowLeased
   , failsAfterTick
@@ -36,11 +37,14 @@ module Test.LuaRuntime.Accounting.Support
   , grant
     -- * Holding the owner
   , holdingSafely
+  , releasing
   ) where
 
-import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread)
+import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, yield)
+import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (ThreadBlocked), threadStatus)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar, tryReadMVar)
-import Control.Exception (SomeException, mask_, onException, try)
+import Control.Exception (SomeException, finally, mask_, onException, try)
+import Control.Monad (forM_)
 import Data.Word (Word64)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Hetoimasia.Scripting.Lua.Owner
@@ -51,7 +55,6 @@ import qualified Data.Text.Encoding as Text
 import Test.LuaRuntime.Instance.Support (hooksModule, record)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
 import Test.LuaRuntime.Scheduled.Support (SFixture, admitTask', awaitEntered, releaseGate, request)
-import Test.LuaRuntime.Support (awaitBlockedOnSTM)
 
 -- A wait on a thread of its own -----------------------------------------------------
 
@@ -75,8 +78,18 @@ beginWait control owner = do
 -- | Block until the wait is parked in STM. Its snapshot has been taken by then, and it
 -- has not returned: a thread parked in a transaction is a wait that did not find its
 -- condition.
+--
+-- A wait that has already ended is not pending, and an example that expects one parked fails at
+-- once and does not loop on a thread that has finished.
 awaitPending ∷ PendingWait → IO ()
-awaitPending = awaitBlockedOnSTM . waitingThread
+awaitPending waiting = do
+  ended ← tryReadMVar (waitingResult waiting)
+  case ended of
+    Just result → ioError (userError ("the wait ended before it was seen parked: " <> either show show result))
+    Nothing →
+      threadStatus (waitingThread waiting) >>= \case
+        ThreadBlocked BlockedOnSTM → pure ()
+        _ → yield >> awaitPending waiting
 
 -- | Whether the wait has not ended.
 isPending ∷ PendingWait → IO Bool
@@ -174,6 +187,22 @@ stoppableClosing =
     , "  self.id = inst.next()"
     , "  api.connect('tick', function(self, event)"
     , "    local guard <close> = setmetatable({}, {__close = function() fx.block('close') end})"
+    , "    sched.wait_ticks(2)"
+    , "  end)"
+    , "end"
+    ]
+
+-- | A callback that waits two ticks holding a variable whose closing handler raises: stopped by a
+-- control, the instance ends and the failure of closing its coroutine is cleanup evidence that
+-- ends the owner.
+closeRaises ∷ ModuleSource
+closeRaises =
+  hooksModule
+    "closeraises"
+    [ "function init(self, api)"
+    , "  self.id = inst.next()"
+    , "  api.connect('tick', function(self, event)"
+    , "    local guard <close> = setmetatable({}, {__close = function() error('close boom') end})"
     , "    sched.wait_ticks(2)"
     , "  end)"
     , "end"
@@ -277,3 +306,12 @@ holdingSafely fixture owner body = do
   releaseGate fixture "holder"
   _ ← waitTask ticket
   pure result
+
+-- | Run this, and however it ends open every gate an example parks the owner at (the gate of a
+-- hook, of a closing handler, of a task, of the application's own callback), so that an example
+-- that fails fails, and does not leave a protected exit waiting on an owner nothing can wake.
+releasing ∷ SFixture → [Gate] → IO a → IO a
+releasing fixture gates action =
+  action `finally` do
+    forM_ ["holder", "hold", "close", "shutdown", "a", "b", "blk"] (releaseGate fixture)
+    forM_ gates openGate

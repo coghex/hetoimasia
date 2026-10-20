@@ -1772,7 +1772,11 @@ settleEnding ih cell = do
             Unorderly _ → pure ()
             _ → when (decision == Escalate) $ throwIO (InstanceEscalated failed)
         _ → pure ()
-      when won (atomically (endingAccounted (ihControl ih) (icId cell)))
+      -- Cleanup evidence held now (a release that failed, the failure of a close) ends the owner as a
+      -- failure: an ending accounted for beside it is not a success.
+      when won $ do
+        held ← not . null <$> readIORef (ihExtra ih)
+        atomically (endingAccounted (ihControl ih) (icId cell) held)
 
 -- Exit ---------------------------------------------------------------------------------------
 

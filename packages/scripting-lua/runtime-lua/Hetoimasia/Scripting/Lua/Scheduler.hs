@@ -268,6 +268,7 @@ module Hetoimasia.Scripting.Lua.Scheduler
   , grantComplete
   , grantsAccepted
   , grantsFinished
+  , retainsEvidence
   , stepsOutstanding
   , awaitStepsComplete
   , readTick
@@ -733,6 +734,12 @@ grantsAccepted scheduler = ssNextGrant <$> readTVar (schedState scheduler)
 -- accepted, so 'grantsAccepted' less this is 'stepsOutstanding'.
 grantsFinished ∷ Scheduler v → STM Word64
 grantsFinished scheduler = (\state → ssNextGrant state - fromIntegral (outstandingGrants state)) <$> readTVar (schedState scheduler)
+
+-- | Whether the scheduler holds the failure of a close that no report has yet carried to
+-- the owner's end: cleanup evidence, fatal under every policy, which ends the owner
+-- as soon as its turn reports it.
+retainsEvidence ∷ Scheduler v → STM Bool
+retainsEvidence scheduler = (\state → not (null (ssEvidence state)) || not (null (ssDelivered state))) <$> readTVar (schedState scheduler)
 
 -- | How many accepted grants have not finished.
 stepsOutstanding ∷ Scheduler v → STM Int
