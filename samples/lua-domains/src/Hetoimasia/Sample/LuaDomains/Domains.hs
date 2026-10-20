@@ -201,7 +201,6 @@ import Hetoimasia.Sample.LuaDomains.Shared
   , UiNotes (..)
   , Watched (..)
   , abandonReceipts
-  , admissionsStable
   , assignControl
   , captureView
   , enterTaskAdmission
@@ -1103,26 +1102,22 @@ faultOf = \case
   SettledRefused why → Just ("refused wait", Text.pack (take 600 (show why)))
   _ → Nothing
 
--- | What the driver knew of the gameplay owner's tasks when it read them: the admissions entered, and the failures the
--- scheduler has counted (a task ending in a fault, a refused wait included, each counted in the transaction that ends it,
--- so a failure that is counted is a settlement a later reading sees).
-data Observed = Observed
-  { observedAdmissions ∷ !Int
-  , observedFailures ∷ !Int
-  }
+-- | What the driver knew when it began to read the gameplay owner's tasks: the failures the scheduler had counted (a task
+-- ending in a fault, a refused wait included, each counted in the same transaction that ends the task and makes its
+-- settlement readable, so a failure that is counted is a settlement a later reading sees).
+newtype Observed = Observed {observedFailures ∷ Int}
 
--- | What the driver knows of the gameplay owner's tasks and failures at an instant: wait for the admissions in flight, and
--- read, in the same transaction, the admissions entered and the failures the owner has counted. The driver reads this
--- first, then waits for the owner's accounting, then reads the tasks, and its commit checks that neither number has moved
--- ('tickIsStable'). A task that settled in a fault before this instant is seen by the reading that follows (the count and
--- the settlement are written in one transaction), and an instance's failure in the work the tick's grant caused is
--- covered by the accounting wait; a task failure counted, or an admission begun, after it moves a number, whatever a
--- watcher has or has not told.
+-- | Wait for the task admissions in flight, so that every task the owner has accepted is registered, and in the same
+-- transaction read the failures the scheduler has counted. The driver reads this first, then waits for the owner's
+-- accounting, then reads the tasks, and its commit checks that the count has not moved ('tickIsStable'). A task that
+-- settled in a fault before this instant is seen by the reading that follows; one that faults after it, whether it was
+-- registered or accepted since, moves the count, whatever its watcher has or has not told; an instance's failure in the
+-- work the tick's grant caused is covered by the accounting wait.
 baselineOf ∷ Domains → IO Observed
 baselineOf domains = atomically $ do
-  admissions ← taskAdmissionsDrained (domainsShared domains)
+  taskAdmissionsDrained (domainsShared domains)
   counters ← scheduledDiagnostics (scheduledEndpoint (startedOwner (domainsGameplay domains)))
-  pure (Observed admissions (diagFailed counters))
+  pure (Observed (diagFailed counters))
 
 -- | Tell the session of the settlement of each task that has one, which the driver does before it decides a tick (a
 -- watcher may not have run yet). The admissions in flight were waited for when the baseline was read, so every task the
@@ -1136,14 +1131,12 @@ pollTasks domains = do
 watchTasks ∷ Domains → IO ()
 watchTasks domains = baselineOf domains >> pollTasks domains
 
--- | Whether nothing has moved since the baseline was read, in the transaction that commits a tick: no task admission is in
--- flight or has begun, and no task has ended in a failure: an ordering of the commit after every task fault that can
--- belong to the tick, whatever a watcher has or has not yet told.
+-- | Whether no task has ended in a failure since the baseline was read, in the transaction that commits a tick: an ordering
+-- of the commit after every task fault that can belong to the tick, whatever a watcher has or has not yet told.
 tickIsStable ∷ Domains → Observed → STM Bool
 tickIsStable domains observed = do
-  admissions ← admissionsStable (domainsShared domains) (observedAdmissions observed)
   counters ← scheduledDiagnostics (scheduledEndpoint (startedOwner (domainsGameplay domains)))
-  pure (admissions && diagFailed counters == observedFailures observed)
+  pure (diagFailed counters == observedFailures observed)
 
 -- | Settle every task the session admitted, which a session that takes no more tasks does once, before its status is
 -- decided: each task without a settlement is asked to stop (it need not yield for the stop to reach it, and asking is
@@ -1264,8 +1257,8 @@ stepTick domains = do
             then haltedOrFailed domains
             else do
               waited ← serially domains (awaitTicksComplete (domainsControl domains) owner)
-              -- Read the baseline, account, observe the tasks and decide; if anything moved since the baseline (an admission
-              -- began, or a task ended in a failure), start again: the accounting that follows covers whatever the owner has
+              -- Read the baseline, account, observe the tasks and decide; if anything moved since the baseline (a task
+              -- ended in a failure), start again: the accounting that follows covers whatever the owner has
               -- begun by then. An instance's failure in the work this tick's grant caused is ordered by the accounting wait;
               -- a free-running instance's failure later is later work, told when it happens.
               let settleAndDecide = do

@@ -75,7 +75,6 @@ module Hetoimasia.Sample.LuaDomains.Shared
   , enterTaskAdmission
   , leaveTaskAdmission
   , taskAdmissionsDrained
-  , admissionsStable
   , takesTasks
   , handOffTask
   , tasksHeld
@@ -195,9 +194,6 @@ data Shared = Shared
     -- ^ The gameplay instances (by position) a stop has been claimed for and requested of, in the one step.
   , sharedTaskSeq ∷ !(TVar Int)
     -- ^ The next task's number.
-  , sharedAdmissionGen ∷ !(TVar Int)
-    -- ^ How many task admissions have been entered: it moves whenever one begins, so a reader that saw nothing in flight
-    -- and this number, and sees the same number and nothing in flight later, knows no admission began between.
   , sharedWaitDepth ∷ !(TVar (Int, Int))
     -- ^ How many of those waits are pending now, and the most there have been at once: never more than one.
   , sharedWaitThreads ∷ !(TVar (Set ThreadId))
@@ -241,7 +237,6 @@ newShared setup = do
     <*> newTVarIO []
     <*> newTVarIO 0
     <*> newTVarIO []
-    <*> newTVarIO 0
     <*> newTVarIO 0
     <*> newTVarIO (0, 0)
     <*> newTVarIO Set.empty
@@ -461,27 +456,17 @@ enterTaskAdmission shared = do
         then pure TaskEntryFull
         else do
           writeTVar (sharedTaskAdmitting shared) (admitting + 1)
-          modifyTVar' (sharedAdmissionGen shared) (+ 1)
           pure TaskEntered
 
 -- | The admission entered is over: the task is accepted and watched, or refused.
 leaveTaskAdmission ∷ Shared → STM ()
 leaveTaskAdmission shared = modifyTVar' (sharedTaskAdmitting shared) (\held → max 0 (held - 1))
 
--- | Retry until no task admission is between its check and its being watched, and answer the admissions entered so far.
-taskAdmissionsDrained ∷ Shared → STM Int
+-- | Retry until no task admission is between its check and its being watched.
+taskAdmissionsDrained ∷ Shared → STM ()
 taskAdmissionsDrained shared = do
   held ← readTVar (sharedTaskAdmitting shared)
   when (held > 0) retry
-  readTVar (sharedAdmissionGen shared)
-
--- | Whether no admission is in flight and none has begun since the number 'taskAdmissionsDrained' answered: what a decision
--- that rests on having read every task the owner accepted needs to be true in the transaction that makes it.
-admissionsStable ∷ Shared → Int → STM Bool
-admissionsStable shared generation = do
-  held ← readTVar (sharedTaskAdmitting shared)
-  now ← readTVar (sharedAdmissionGen shared)
-  pure (held == 0 && now == generation)
 
 -- | How many tasks the session has admitted and not been told the settlement of.
 tasksHeld ∷ Shared → STM Int
