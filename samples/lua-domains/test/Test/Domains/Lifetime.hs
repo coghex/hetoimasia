@@ -152,11 +152,13 @@ spec = describe "the owners' lifetime" $ do
           try . generous . withDomains control config $ \domains → do
             writeIORef facts (Just (Left domains))
             -- The UI owner is inside a held segment, and stays there until retirement has begun:
-            -- admission has ended. The gameplay failure then ends the body.
-            tickUi domains ui
-            awaitEntered fx "ui"
-            _ ← forkRegistered (atomically (isClosed (sharedQueue (domainsShared domains)) >>= \ended → unless ended retry) >> releaseGate fx "ui")
-            stepCommitted domains
+            -- admission has ended. The gameplay failure then ends the body. However the body ends, the segment is
+            -- released, so the owners can end.
+            withReleased fx ["ui"] $ do
+              tickUi domains ui
+              awaitEntered fx "ui"
+              _ ← forkRegistered (atomically (isClosed (sharedQueue (domainsShared domains)) >>= \ended → unless ended retry) >> releaseGate fx "ui")
+              stepCommitted domains
         let raised = either (\failure → const True (failure ∷ SomeException)) (const False) outcome
         domains ← readIORef facts >>= \held → case held of
           Just (Left found) → pure found

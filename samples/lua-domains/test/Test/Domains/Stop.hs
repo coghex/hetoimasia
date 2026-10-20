@@ -132,11 +132,13 @@ spec = describe "the stop paths and the cleanup evidence" $ do
     let config = (sampleConfig fx ui) {configGameplaySource = luaLines ["function update(self, dt) fx.hold('held') staging.finish() end"]}
     thread ← forkRegistered $ (withBoundary (\control → withDomains control config (\domains → putMVar captured domains >> stepCommitted domains >> pure ()))) `finally` putMVar finished ()
     domains ← bounded (readMVar captured)
-    awaitEntered fx "held"
-    -- Cancelled in the middle of the tick; a running segment is not preempted, so the owners end once it returns.
-    killThread thread
-    releaseGate fx "held"
-    bounded (readMVar finished)
+    -- However the example ends, the held segment is released, so the owners can end and the scope's thread with them.
+    withReleased fx ["held"] $ do
+      awaitEntered fx "held"
+      -- Cancelled in the middle of the tick; a running segment is not preempted, so the owners end once it returns.
+      killThread thread
+      releaseGate fx "held"
+      bounded (readMVar finished)
     evidence ← cleanupEvidence domains
     leavesNothing evidence
     -- The library decides how an owner that was cancelled records its exit: the cancellation also trips its

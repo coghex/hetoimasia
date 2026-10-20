@@ -285,39 +285,42 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
       returned ← newIORef False
       finalized ← newIORef False
       let side = holdAt fx "side body" `finally` (holdAt fx "side finalizer" >> writeIORef finalized True)
-      caller ← spawn (try @SomeException (alongside side (awaitEntered fx "side body" >> throwIO (userError "the main action failed") ∷ IO ())) >> writeIORef returned True)
-      awaitEntered fx "side finalizer"
-      replicateM_ 2000 yield
-      readIORef returned `shouldReturn` False
-      releaseGate fx "side finalizer"
-      caller
-      ((,) <$> readIORef returned <*> readIORef finalized) `shouldReturn` (True, True)
+      withReleased fx ["side body", "side finalizer"] $ do
+        caller ← spawn (try @SomeException (alongside side (awaitEntered fx "side body" >> throwIO (userError "the main action failed") ∷ IO ())) >> writeIORef returned True)
+        awaitEntered fx "side finalizer"
+        replicateM_ 2000 yield
+        readIORef returned `shouldReturn` False
+        releaseGate fx "side finalizer"
+        caller
+        ((,) <$> readIORef returned <*> readIORef finalized) `shouldReturn` (True, True)
     it "wait for the trigger of 'cancelWhen' to have terminated, its finalizer included, when the action raises: the call does not return while the finalizer is held" $ do
       fx ← newFx
       returned ← newIORef False
       finalized ← newIORef False
       let trigger = holdAt fx "trigger body" `finally` (holdAt fx "trigger finalizer" >> writeIORef finalized True)
-      caller ← spawn (try @SomeException (cancelWhen trigger (awaitEntered fx "trigger body" >> throwIO (userError "the action failed") ∷ IO ())) >> writeIORef returned True)
-      awaitEntered fx "trigger finalizer"
-      replicateM_ 2000 yield
-      readIORef returned `shouldReturn` False
-      releaseGate fx "trigger finalizer"
-      caller
-      ((,) <$> readIORef returned <*> readIORef finalized) `shouldReturn` (True, True)
+      withReleased fx ["trigger body", "trigger finalizer"] $ do
+        caller ← spawn (try @SomeException (cancelWhen trigger (awaitEntered fx "trigger body" >> throwIO (userError "the action failed") ∷ IO ())) >> writeIORef returned True)
+        awaitEntered fx "trigger finalizer"
+        replicateM_ 2000 yield
+        readIORef returned `shouldReturn` False
+        releaseGate fx "trigger finalizer"
+        caller
+        ((,) <$> readIORef returned <*> readIORef finalized) `shouldReturn` (True, True)
     it "wait for a registered thread to have terminated, its finalizer included, when the example's threads are reaped" $ do
       fx ← newFx
       finalized ← newIORef False
       reaped ← newEmptyMVar
-      _ ← forkRegistered (holdAt fx "child body" `finally` (holdAt fx "child finalizer" >> writeIORef finalized True))
-      awaitEntered fx "child body"
-      -- Reaped from a thread that is not itself registered.
-      _ ← forkIO (reapForked >> putMVar reaped ())
-      awaitEntered fx "child finalizer"
-      replicateM_ 2000 yield
-      tryReadMVar reaped >>= (`shouldSatisfy` isNothing)
-      releaseGate fx "child finalizer"
-      generous (readMVar reaped)
-      readIORef finalized `shouldReturn` True
+      withReleased fx ["child body", "child finalizer"] $ do
+        _ ← forkRegistered (holdAt fx "child body" `finally` (holdAt fx "child finalizer" >> writeIORef finalized True))
+        awaitEntered fx "child body"
+        -- Reaped from a thread that is not itself registered.
+        _ ← forkIO (reapForked >> putMVar reaped ())
+        awaitEntered fx "child finalizer"
+        replicateM_ 2000 yield
+        tryReadMVar reaped >>= (`shouldSatisfy` isNothing)
+        releaseGate fx "child finalizer"
+        generous (readMVar reaped)
+        readIORef finalized `shouldReturn` True
     it "raise the failure of a trigger that fails, in place of a cancellation it never reached" $ do
       fx ← newFx
       raised ← try @SomeException (cancelWhen (throwIO (userError "the trigger failed")) (holdAt fx "action"))
