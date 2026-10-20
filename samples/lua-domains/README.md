@@ -248,15 +248,26 @@ What the session does, by design (D-26, D-27, P-7):
   `TaskAdmissionClosed`, and nothing reaches the owner or runs), in the transaction that records the failure or
   the stop; an admission that began before is finished, and its task watched, before the stop settles anything and
   before the ending is published (both wait for it);
-* the session **holds at most `boundSessionTasks`, three, tasks it has not observed**: the owner keeps a task's
-  slot and result reservation until its settlement is observed, so a fourth is refused (`TaskQueueFull`) to
-  leave the fence of every tick its slot, and a tick or a stop never waits for a slot nobody will free;
+* the session **holds at most `boundSessionTasks`, three by default (at most sixteen), tasks it has not
+  observed**: the owner keeps a task's slot and result reservation until its settlement is observed, so a fourth
+  is refused (`TaskQueueFull`) to leave the fence of every tick its slot, and a tick or a stop never waits for a
+  slot nobody will free. The gameplay owner's scheduling is *made from* that bound (one more active task than it, for
+  the fence, and queued admissions and retained results to match), so no configuration can leave the fence
+  without a slot;
 * the settlements of the tasks the session watches are **consumed once**: whoever observes them (the driver, a
   stop from any thread, two stops at once) holds the lock on the watched tasks for the whole observation, so a
-  fault is recorded once, never twice;
+  fault is recorded once, never twice, and a task whose settlement was told of is given up however the
+  observation ends;
+* the session is **quiescent when its failure is published**: the driver settles what the session admitted first
+  (a task that has no settlement, one that goes on running after it yields included, is asked to stop and waited
+  for, with the owner left alive), so nothing the session admitted runs after the failure's snapshot; a fault
+  such a task raises first is counted in the failure's evidence;
 * a stop **settles every task the session admitted** before it decides its status: a task with no settlement is
   asked to stop, its settlement is waited for, and a fault it raised first fails the session (a task a stop
   cancels has none to tell); a fault told of after the failure was published is counted in the final report;
+* a stop **asks each gameplay instance to stop once, whoever asks and whoever is interrupted**: what was asked is
+  tracked (not who asked first), and the requests are issued before the stop waits for anything, so a stop
+  that is cancelled while it waits has asked already, and the next one completes;
 * a failure that is told of later (a teardown, a `shutdown` that raises when the session is stopped) is
   counted in the evidence the report and `cleanupEvidence` give; it is never published, and the snapshot is
   not republished.
