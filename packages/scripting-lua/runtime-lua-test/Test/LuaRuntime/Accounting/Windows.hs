@@ -10,6 +10,7 @@ module Test.LuaRuntime.Accounting.Windows (spec) where
 
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException, throwIO)
 import Control.Monad (forM_, void)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Maybe (isJust)
 import qualified Data.Text as Text
 import Hetoimasia.Runtime.Supervision (WorkerStatus (WorkerUnavailable))
@@ -166,6 +167,37 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         answer waiting >>= (`shouldBe` AccountingComplete)
         -- With every instance ended and told of, a wait returns at once.
         awaitScheduledAccounting control owner >>= (`shouldBe` AccountingComplete)
+        retireScheduled owner
+
+  describe "after the instances have ended" $ do
+    it "returns once every instance has been stopped and awaited, on an owner that was granted nothing" $ bounded $ do
+      fixture ← newIFixture
+      withBoundary $ \control runtime → do
+        owner ← startInstances fixture runtime "all stopped" [echoer] (testConfig instanceBounds') requiredPolicy
+        let names = ["a", "b", "c"]
+        forM_ names $ \name → admit fixture owner name (moduleNamed "echoer") >> awaitPhase fixture owner name Active
+        forM_ names $ \name → settleControl fixture owner name InstanceStop >>= (`shouldBe` ControlApplied)
+        forM_ names $ \name → awaitSettled fixture name >>= \settled → resultOutcome settled `shouldSatisfy` \case InstanceStopped → True; _ → False
+        awaitScheduledAccounting control owner >>= (`shouldBe` AccountingComplete)
+        retireScheduled owner
+
+    it "has been told of every failure when it returns, however many times it is asked in a row" $ bounded $ do
+      fixture ← newIFixture
+      told ← newIORef (0 ∷ Int)
+      let config = (testConfig instanceBounds') {instanceEscalate = \_ → atomicModifyIORef' told (\n → (n + 1, ())) >> pure Isolate}
+      withBoundary $ \control runtime → do
+        owner ← startInstances fixture runtime "told" [refusedAfterTick] config requiredPolicy
+        forM_ [1 .. 30 ∷ Int] $ \round' → do
+          let name = "r" <> Text.pack (show round')
+          _ ← admit fixture owner name (moduleNamed "refusedaftertick")
+          awaitPhase fixture owner name Active
+          expectDelivered fixture owner name 1
+          awaitDiagnostics owner (\counts → diagWaiting counts >= round')
+          grant owner 1
+          awaitScheduledAccounting control owner >>= (`shouldBe` AccountingComplete)
+          -- The application has been told, and the instance has settled, by the time the wait returns.
+          readIORef told >>= (`shouldBe` round')
+          tickOf fixture name >>= pollInstance >>= (`shouldSatisfy` isJust)
         retireScheduled owner
 
   describe "the final boundary of the captured grants" $ do
