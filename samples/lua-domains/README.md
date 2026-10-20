@@ -246,11 +246,17 @@ What the session does, by design (D-26, D-27, P-7):
   of failures told of by then, and the **invalidated** intentions;
 * the session **takes no task from the moment it fails or is stopping** (`admitGameplayTask` answers
   `TaskAdmissionClosed`, and nothing reaches the owner or runs), in the transaction that records the failure or
-  the stop; an admission that began before is finished, and its task watched, before the ending is published,
-  and before the settlements are read for it (the ending waits for it);
+  the stop; an admission that began before is finished, and its task watched, before the stop settles anything and
+  before the ending is published (both wait for it);
+* the session **holds at most `boundSessionTasks`, three, tasks it has not observed**: the owner keeps a task's
+  slot and result reservation until its settlement is observed, so a fourth is refused (`TaskQueueFull`) to
+  leave the fence of every tick its slot, and a tick or a stop never waits for a slot nobody will free;
 * the settlements of the tasks the session watches are **consumed once**: whoever observes them (the driver, a
   stop from any thread, two stops at once) holds the lock on the watched tasks for the whole observation, so a
   fault is recorded once, never twice;
+* a stop **settles every task the session admitted** before it decides its status: a task with no settlement is
+  asked to stop, its settlement is waited for, and a fault it raised first fails the session (a task a stop
+  cancels has none to tell); a fault told of after the failure was published is counted in the final report;
 * a failure that is told of later (a teardown, a `shutdown` that raises when the session is stopped) is
   counted in the evidence the report and `cleanupEvidence` give; it is never published, and the snapshot is
   not republished.
