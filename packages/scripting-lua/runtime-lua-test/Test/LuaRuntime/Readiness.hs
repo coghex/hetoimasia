@@ -11,7 +11,7 @@ module Test.LuaRuntime.Readiness (spec) where
 import Control.Concurrent (forkIO, myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
-import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, throwTo, try)
+import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwTo, try)
 import Data.Text (Text)
 import qualified Data.Text.Encoding as Text
 import Hetoimasia.Foundation.Worker (GroupStatus (statusOutstanding), OutstandingWorker (outstandingAcknowledged))
@@ -139,6 +139,7 @@ spec = describe "readiness" $ do
     fixture ← newFixture
     outcome ← newEmptyMVar
     withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
+      example ← myThreadId
       creator ←
         forkIO $
           try @SomeException
@@ -147,16 +148,17 @@ spec = describe "readiness" $ do
                   [gcInitChunk "closed", (chunkName "slow", Text.encodeUtf8 "app.block('init')")]
                   (quickSpec fixture "abandoned" ["app"])
             )
-            >>= putMVar outcome . either Just (const Nothing)
+            >>= \case
+              -- A failed assertion of the creator ends the example, wherever the example is waiting for it,
+              -- and is not the exception the example throws to the creator.
+              Left failure | Just (assertion ∷ HUnitFailure) ← fromException failure → throwTo example assertion
+              ended → putMVar outcome (either Just (const Nothing) ended)
       awaitEntered fixture "init"
       -- The startup was acknowledged, so a creator parked in an STM wait is
       -- parked in the readiness wait.
       awaitBlockedOnSTM creator
       throwTo creator ThreadKilled
-      -- The creator ends with the exception thrown to it; a failed assertion it raised first is not that.
-      takeMVar outcome >>= \case
-        Just failure | Just (assertion ∷ HUnitFailure) ← fromException failure → throwIO assertion
-        ended → ended `shouldSatisfy` maybe False ((== Just ThreadKilled) . fromException)
+      takeMVar outcome >>= (`shouldSatisfy` maybe False ((== Just ThreadKilled) . fromException))
       releaseGate fixture "init"
       -- The adapter asked the owner to stop, so with its initialization done it
       -- stops and closes its VM, which its finalizer says, while the boundary
