@@ -236,7 +236,7 @@ retiresOnStop =
     ]
 
 -- | Holds a resource whose release the example breaks, which its drain at the end of the instance
--- raises.
+-- raises; its @shutdown@ waits at the @shutdown@ gate, which holds the ending open before the drain.
 drainsBroken ∷ ModuleSource
 drainsBroken =
   hooksModule
@@ -246,6 +246,7 @@ drainsBroken =
     , "  self.h = lease.open('drain-res')"
     , "  api.connect('tick', function(self, event) end)"
     , "end"
+    , "function shutdown(self, reason) fx.block('shutdown') end"
     ]
 
 -- | Holds an asynchronously retired resource named for it, and fails when it is delivered an event,

@@ -85,9 +85,13 @@ spec = describe "cleanup evidence the owner retains" $ do
         awaitPhase base owner "a" Active
         liveFor fixture "a" 1
         _ ← expectControl base owner "a" InstanceStop
-        -- The ending has begun, and is the wait's.
-        awaitPhase base owner "a" Stopping
-        beginWait control owner
+        -- The ending has begun, held in the instance's shutdown, and is the wait's; letting it go drains what
+        -- the instance held, whose release fails.
+        awaitEntered (sf base) "shutdown"
+        waiting ← beginWait control owner
+        awaitPending waiting
+        releaseGate (sf base) "shutdown"
+        pure waiting
 
     it "ends the wait with the failure of disposing what a retirement needed" $ bounded $ do
       fixture ← newLFix 4
