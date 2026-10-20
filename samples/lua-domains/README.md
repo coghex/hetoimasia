@@ -131,15 +131,16 @@ The driver's `stepTick`:
 2. **Grant** gameplay one logical step of the configured duration (ten milliseconds). One grant is
    outstanding at a time.
 3. Wait for the owner to complete the tick (`awaitTicksComplete`).
-4. **Fence.** A completed tick says only that the grant was applied and nothing is left it could run: the
+4. **Accounting.** A completed tick says only that the grant was applied and nothing is left it could run: the
    scheduler reconciles the grant *before* the instance layer has accounted for what the tick's last segment
    did, so an invocation the scheduler ended with a refused wait still looks, for a moment, like an active
-   instance with nothing in flight. The driver therefore admits a task that does nothing (`sample_fence`,
-   appended to every gameplay module) and waits for its settlement. The owner's thread runs a segment and the
-   boundary after it strictly in turn, so the fence's segment begins only after every earlier boundary is over:
-   the instance layer has accounted for the tick, an instance that failed has ended (its `shutdown` and the
-   release of what it held included) and the application has been told. The faults of tasks the session
-   admitted are read next.
+   instance with nothing in flight. The driver therefore waits for the owner's accounting
+   (`awaitScheduledAccounting`, D-47), which takes no task, ticket or slot: an instance that failed has ended (its
+   `shutdown` and the release of what it held included) and the application's escalation has been called and has
+   returned. If the owner ended instead (`AccountingOwnerEnded`) nothing was accounted for and nothing is
+   committed. The wait is one of the supervised waits the sample makes, called on the application thread that owns
+   the supervision handle and one at a time: a stop from another thread waits its turn and never waits beside the
+   driver. The faults of tasks the session admitted are read next.
 5. **Decide.** A failure told of fails the session and commits nothing; a stop commits nothing; otherwise the
    tick commits only if its work **finished successfully**: gameplay called `staging.finish()` and the instance
    is active with nothing in flight and no update owed, or the engine says why there is no work (the behavior
@@ -236,9 +237,10 @@ What the session does, by design (D-26, D-27, P-7):
 * **admission closes in the same transaction that records the failure**, so no intention is accepted for a tick
   that will never run after the failure, whenever the driver gets to publish it;
 * from the moment the driver knows of a failure it grants nothing more and commits nothing: **the driver learns
-  of a failure in tick T before it decides T's commit**, on every ordering, which is what the fence of step 4
-  enforces (a failure in the last segment, in the only segment, two failures, and a wait the scheduler refused
-  in the final segment with a held `shutdown` are covered by examples that force each ordering with gates);
+  of a failure in tick T before it decides T's commit**, on every ordering, which is what the accounting wait of
+  step 4 enforces (a failure in the last segment, in the only segment, two failures, a wait the scheduler refused
+  in the final segment with a held `shutdown`, and a failure whose escalation is still pending after the grant
+  completed are covered by examples that force each ordering with gates);
 * the driver publishes **one** snapshot for the failure. The publication is *taken* first: from that moment it is
   the publisher's alone, and a stop, a second failure or a retirement that arrives meanwhile waits for it, so the
   publisher is never closed under it: the last good world and committed tick, status
@@ -250,24 +252,37 @@ What the session does, by design (D-26, D-27, P-7):
   before the ending is published (both wait for it);
 * the session **holds at most `boundSessionTasks`, three by default (at most sixteen), tasks it has not
   observed**: the owner keeps a task's slot and result reservation until its settlement is observed, so a fourth
-  is refused (`TaskQueueFull`) to leave the fence of every tick its slot, and a tick or a stop never waits for a
-  slot nobody will free. The gameplay owner's scheduling is *made from* that bound (one more active task than it, for
-  the fence, and queued admissions and retained results to match), so no configuration can leave the fence
-  without a slot;
+  is refused (`TaskQueueFull`), and a tick or a stop never waits for a slot nobody will free. A live instance's
+  invocation takes an active slot of the same pool, so the gameplay owner's scheduling is *made from* that bound and
+  from the instances the owner may hold live (one active slot for each, and queued admissions and retained results
+  twice that): an update has a slot whichever tasks are unobserved and whichever instances are suspended, in every
+  supported configuration (examples at one, three and sixteen tasks);
 * the settlements of the tasks the session watches are **consumed once**: whoever observes them (the driver, a
   stop from any thread, two stops at once) holds the lock on the watched tasks for the whole observation, so a
   fault is recorded once, never twice, and a task whose settlement was told of is given up however the
   observation ends;
-* the session is **quiescent when its failure is published**: the driver settles what the session admitted first
-  (a task that has no settlement, one that goes on running after it yields included, is asked to stop and waited
-  for, with the owner left alive), so nothing the session admitted runs after the failure's snapshot; a fault
-  such a task raises first is counted in the failure's evidence;
+* the session is **quiescent when its failure is published**: the driver first asks every gameplay instance to
+  stop, through the engine's instance controls, and waits for each to settle (the one that failed has ended; a
+  surviving instance, one with work still to run included, runs its `shutdown` and its leases are released), waits
+  for the owner's accounting of those endings, and settles what the session admitted (a task that has no
+  settlement, one that goes on running after it yields included, is asked to stop and waited for), with the owner
+  left alive. Nothing the session admitted and no instance runs after the failure's snapshot; a failure such an
+  instance or task raises first (a `shutdown` that raises, say) is counted in the failure's evidence;
 * a stop **settles every task the session admitted** before it decides its status: a task with no settlement is
   asked to stop, its settlement is waited for, and a fault it raised first fails the session (a task a stop
   cancels has none to tell); a fault told of after the failure was published is counted in the final report;
 * a stop **asks each gameplay instance to stop once, whoever asks and whoever is interrupted**: what was asked is
   tracked (not who asked first), and the requests are issued before the stop waits for anything, so a stop
-  that is cancelled while it waits has asked already, and the next one completes;
+  that is cancelled while it waits has asked already, and the next one completes (the request and the record of it
+  are not separated by anything that waits, and a stop cancelled between recording its intent and asking the first
+  instance leaves the next one to ask);
+* **an accepted task is tracked from the moment the owner accepts it**: the admission hands the task to the
+  session's tracking in one transaction that waits for nothing, so cancelling the admitting thread at any point
+  leaves it tracked and counted, its fault told once, and its reservation given back when it is observed; a task the
+  owner had not accepted is never counted;
+* **the final publication is the next caller's if its first caller is cancelled**: before the ending is claimed
+  nothing was taken, and after it was claimed the session is marked ended however the publisher ends, so no later
+  caller waits for ever;
 * a failure that is told of later (a teardown, a `shutdown` that raises when the session is stopped) is
   counted in the evidence the report and `cleanupEvidence` give; it is never published, and the snapshot is
   not republished.
@@ -275,7 +290,7 @@ What the session does, by design (D-26, D-27, P-7):
 A failed `init` of the behavior is the same failure at tick 0: the initial world is published with it.
 
 **The commit condition.** Whether a tick that ran no work may commit is decided from evidence the application
-holds, not from the engine's counters: every gameplay module's `update` is wrapped (`gameplay_fence.lua`) so that
+holds, not from the engine's counters: every gameplay module's `update` is wrapped (`gameplay_update.lua`) so that
 `staging.began()` says, before the script's own code runs, that the update began in this tick. An update that began
 must have called `staging.finish()` to commit. A tick whose update never began commits only if the engine says
 why: the behavior is paused, was paused as the tick began (this is the tick that resumes it), or a control was
@@ -314,7 +329,8 @@ reports how the owners ended). It:
 2. asks the gameplay instances (the behavior and any others) to stop and waits for each to be **settled**,
    which includes its `shutdown` hook and the release of every lease it held, so a segment that is running is
    not preempted and the stop waits for it to return;
-3. runs the fence, and learns through it whether that settlement was a failure;
+3. waits for the owner's accounting (`awaitScheduledAccounting`), and learns through it whether that settlement
+   was a failure (the escalation of a `shutdown` that raised has returned before the outcome is decided);
 4. publishes one last snapshot: `Stopped` with the intentions the stop discarded; or, if `shutdown` raised
    and nothing failed before, the failure (the world is the last committed one: frozen); a session that had
    already failed keeps the failure as its status, and nothing is published for the stop;
@@ -327,15 +343,18 @@ A stop from another thread while a tick is in flight halts that tick (`TickHalte
 nothing, and the driver is told so, not left with a defect.
 
 **A finite session that ran its last tick** settles the same way before its publication closes (it asks the
-gameplay instances to stop and waits for their `shutdown` and lease release, then runs the fence): a `shutdown` that
+gameplay instances to stop and waits for their `shutdown` and lease release, then for the owner's accounting): a `shutdown` that
 raises is a session failure and is published, after the last tick, with the world frozen at it, and the status and
 the exit status say so. When nothing failed, nothing more is published: the last tick's snapshot stands.
 
 **Cancellation** of the enclosing scope retires both owners by cancelling them, not by stopping them: each exits
-cancelled (the library records either `ExitCancelled` or `ExitStopped`, since the cancellation also trips the
-owner's stop token and which its loop sees first is the library's race, and its instance settles as discarded
-or stopped); what is not settled is discarded, and nothing hangs. The examples check that both workers
-ended, the publication closed, nothing is pending and the workspaces released.
+cancelled and its instance settles as discarded; what is not settled is discarded, and nothing hangs. The library
+records an owner's exit as cancelled when the cancellation reaches it before its orderly stop check (a cancel request
+is also a stop request, and the cancellation is raised in the owner's thread a moment later), so the example that
+asserts `ExitCancelled` holds each owner's thread in Haskell, in the observer that runs before every segment, where
+the cancellation can reach it and nothing else opens it (a barrier inside a Lua callback would leave the order to the
+scheduler); the example that holds a Lua segment keeps the actual exit records and accepts either kind. Both check
+that the workers ended, the publication closed, nothing is pending and the workspaces released.
 
 **Evidence.** For every way a session can end, `cleanupEvidence` (and the last lines of the report) gives
 one bounded record: both owners' exit records and statuses, each instance's termination (what it revoked
