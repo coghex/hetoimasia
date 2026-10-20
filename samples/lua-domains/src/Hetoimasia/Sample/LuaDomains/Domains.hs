@@ -1104,34 +1104,41 @@ faultOf = \case
   _ → Nothing
 
 -- | What the driver knew of the gameplay owner's tasks when it read them: the admissions entered, and the failures the
--- owner has counted (an instance's invocation or a task ending in a fault, a refused wait included, each counted in the
--- transaction that ends it, so a failure that is counted is a settlement a later reading sees).
+-- scheduler has counted (a task ending in a fault, a refused wait included, each counted in the transaction that ends it,
+-- so a failure that is counted is a settlement a later reading sees).
 data Observed = Observed
   { observedAdmissions ∷ !Int
   , observedFailures ∷ !Int
   }
 
--- | Tell the session of the settlement of each task that has one, which the driver does before it decides a tick (a
--- watcher may not have run yet), and answer what was known when it began. The admissions in flight are waited for first,
--- however the session stands: a task the owner accepted runs, and can fault, before its admitter has registered it. Then
--- the count of admissions and of failures is read, in one transaction with that wait, and the registered tasks are read.
--- A task that settled before the count is read is seen by the reading that follows it; one that settles, or is admitted,
--- after it moves a count, which the commit checks has not moved ('tickIsStable'), so that no fault that can belong to a
--- tick is left to a watcher's timing.
-watchTasks ∷ Domains → IO Observed
-watchTasks domains = do
-  let shared = domainsShared domains
-  observed ← atomically $ do
-    admissions ← taskAdmissionsDrained shared
-    counters ← scheduledDiagnostics (scheduledEndpoint (startedOwner (domainsGameplay domains)))
-    pure (Observed admissions (diagFailed counters))
-  held ← readTVarIO (sharedTasks shared)
-  forM_ held $ \watched → pollTask (watchedTicket watched) >>= mapM_ (tellTask domains watched)
-  pure observed
+-- | What the driver knows of the gameplay owner's tasks and failures at an instant: wait for the admissions in flight, and
+-- read, in the same transaction, the admissions entered and the failures the owner has counted. The driver reads this
+-- first, then waits for the owner's accounting, then reads the tasks, and its commit checks that neither number has moved
+-- ('tickIsStable'). A task that settled in a fault before this instant is seen by the reading that follows (the count and
+-- the settlement are written in one transaction), and an instance's failure in the work the tick's grant caused is
+-- covered by the accounting wait; a task failure counted, or an admission begun, after it moves a number, whatever a
+-- watcher has or has not told.
+baselineOf ∷ Domains → IO Observed
+baselineOf domains = atomically $ do
+  admissions ← taskAdmissionsDrained (domainsShared domains)
+  counters ← scheduledDiagnostics (scheduledEndpoint (startedOwner (domainsGameplay domains)))
+  pure (Observed admissions (diagFailed counters))
 
--- | Whether nothing has moved since the tasks were read, in the transaction that commits a tick: no task admission is in
--- flight or has begun, and no instance's invocation or task has ended in a failure. Whatever a watcher has or has not yet
--- told, an ordering of the commit after every fault that can belong to the tick.
+-- | Tell the session of the settlement of each task that has one, which the driver does before it decides a tick (a
+-- watcher may not have run yet). The admissions in flight were waited for when the baseline was read, so every task the
+-- owner accepted before it is registered.
+pollTasks ∷ Domains → IO ()
+pollTasks domains = do
+  held ← readTVarIO (sharedTasks (domainsShared domains))
+  forM_ held $ \watched → pollTask (watchedTicket watched) >>= mapM_ (tellTask domains watched)
+
+-- | The baseline and then the reading, for a reader that is not deciding a tick.
+watchTasks ∷ Domains → IO ()
+watchTasks domains = baselineOf domains >> pollTasks domains
+
+-- | Whether nothing has moved since the baseline was read, in the transaction that commits a tick: no task admission is in
+-- flight or has begun, and no task has ended in a failure: an ordering of the commit after every task fault that can
+-- belong to the tick, whatever a watcher has or has not yet told.
 tickIsStable ∷ Domains → Observed → STM Bool
 tickIsStable domains observed = do
   admissions ← admissionsStable (domainsShared domains) (observedAdmissions observed)
@@ -1257,19 +1264,23 @@ stepTick domains = do
             then haltedOrFailed domains
             else do
               waited ← serially domains (awaitTicksComplete (domainsControl domains) owner)
-              accounted ← awaitAccounting domains
-              -- An owner that ended because the session was stopped, or had failed, while the tick was in flight (the
-              -- stop retired it from another thread) is the ending the session already decided: the tick is halted,
-              -- and nothing is committed whatever it had begun. An owner that ended otherwise is a defect.
-              when (waited /= TicksCompleted || accounted /= AccountingComplete) $ do
-                over ← atomically (haltedNow shared)
-                unless over (throwIO (OwnerEndedDuringTick tick))
-              -- Observe the tasks and decide; if a task admission began since the observation, observe again.
-              let observeAndDecide = do
-                    observed ← watchTasks domains
+              -- Read the baseline, account, observe the tasks and decide; if anything moved since the baseline (an admission
+              -- began, or a task ended in a failure), start again: the accounting that follows covers whatever the owner has
+              -- begun by then. An instance's failure in the work this tick's grant caused is ordered by the accounting wait;
+              -- a free-running instance's failure later is later work, told when it happens.
+              let settleAndDecide = do
+                    observed ← baselineOf domains
+                    accounted ← awaitAccounting domains
+                    -- An owner that ended because the session was stopped, or had failed, while the tick was in flight (the
+                    -- stop retired it from another thread) is the ending the session already decided: the tick is halted,
+                    -- and nothing is committed whatever it had begun. An owner that ended otherwise is a defect.
+                    when (waited /= TicksCompleted || accounted /= AccountingComplete) $ do
+                      over ← atomically (haltedNow shared)
+                      unless over (throwIO (OwnerEndedDuringTick tick))
+                    pollTasks domains
                     configDecisionHook config AfterObserved
-                    decide domains tick pausedAtBegin observed >>= maybe observeAndDecide pure
-              observeAndDecide
+                    decide domains tick pausedAtBegin observed >>= maybe settleAndDecide pure
+              settleAndDecide
 
 -- | Whether a failure has been told and its publication has not been made.
 failurePending ∷ Shared → IO Bool
@@ -1472,7 +1483,7 @@ settleStart domains = do
   let unsettled = [phase | Just phase ← phases, phase /= Active]
   unless (null unsettled) $ do
     void (awaitAccounting domains)
-    void (watchTasks domains)
+    watchTasks domains
   failed ← atomically (failedNow (sharedSession (domainsShared domains)))
   if failed
     then void (publishEnding domains EndedByFailure)
