@@ -5,7 +5,7 @@
 -- with a gate; and a failed session is quiescent before its failure is published.
 module Test.Domains.Accounting (spec) where
 
-import Control.Concurrent (forkIO, killThread, myThreadId, yield)
+import Control.Concurrent (killThread, myThreadId, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Concurrent.STM (readTVar, readTVarIO, retry)
 import Control.Exception (SomeException, finally, fromException, throwIO, try)
@@ -339,7 +339,7 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
           $ \domains → withReleased fx ["before the owner"] $ do
             let shared = domainsShared domains
             ended ← newEmptyMVar
-            admitter ← forkIO (try @SomeException (admitGameplayTask domains (task "cancelled" "task_runs")) >>= putMVar ended)
+            admitter ← forkRegistered (try @SomeException (admitGameplayTask domains (task "cancelled" "task_runs")) >>= putMVar ended)
             awaitEntered fx "before the owner"
             killThread admitter
             _ ← generous (readMVar ended)
@@ -369,7 +369,7 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
             $ \domains → withReleased fx ["accepted"] $ do
               let shared = domainsShared domains
               ended ← newEmptyMVar
-              admitter ← forkIO (try @SomeException (admitGameplayTask domains (task "cancelled task" entry)) >>= putMVar ended)
+              admitter ← forkRegistered (try @SomeException (admitGameplayTask domains (task "cancelled task" entry)) >>= putMVar ended)
               awaitEntered fx "accepted"
               killThread admitter
               _ ← generous (readMVar ended)

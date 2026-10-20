@@ -40,6 +40,8 @@ module Test.Domains.Support
   , waitFor
   , generous
   , spawn
+  , forkRegistered
+  , reapForked
   , withReleased
   , stepCommitted
   , newSharedFor
@@ -55,13 +57,14 @@ module Test.Domains.Support
   , cancelWhen
   ) where
 
-import Control.Concurrent (forkIO, forkIOWithUnmask, killThread, myThreadId, throwTo)
+import Control.Concurrent (ThreadId, forkIO, forkIOWithUnmask, killThread, myThreadId, throwTo)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, tryPutMVar, withMVar)
 import Control.Exception (Exception, SomeException, catch, finally, fromException, mask, onException, throwIO, try)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Monad (void, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import System.IO.Unsafe (unsafePerformIO)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Text (Text)
@@ -317,8 +320,27 @@ waitFor = bounded . atomically
 spawn ∷ IO a → IO (IO a)
 spawn action = do
   result ← newEmptyMVar
-  _ ← forkIO (try action >>= putMVar result)
+  _ ← forkRegistered (try action >>= putMVar result)
   pure (bounded (readMVar result >>= either (\failure → throwIO (failure ∷ SomeException)) pure))
+
+-- | The threads an example forked and has not seen end: 'reapForked' cancels what is left of them when the example is over.
+forkedThreads ∷ IORef [ThreadId]
+forkedThreads = unsafePerformIO (newIORef [])
+{-# NOINLINE forkedThreads #-}
+
+-- | Fork a thread of an example's own, registered so that however the example ends, the thread does not outlive it.
+forkRegistered ∷ IO () → IO ThreadId
+forkRegistered action = do
+  thread ← forkIO action
+  atomicModifyIORef' forkedThreads (\held → (thread : held, ()))
+  pure thread
+
+-- | Cancel every thread an example forked that is still running, each having ended before this returns. It runs after
+-- every example, whatever the example's outcome.
+reapForked ∷ IO ()
+reapForked = do
+  threads ← atomicModifyIORef' forkedThreads (\held → ([], held))
+  mapM_ killThread threads
 
 -- | Run a body, and open these gates however it ends, so a segment an example held never keeps
 -- the owner, and with it the session's retirement, waiting.

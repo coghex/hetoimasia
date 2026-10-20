@@ -4,7 +4,7 @@
 -- enclosing scope; and, for every way a session ends, one bounded evidence record that says every worker ended.
 module Test.Domains.Stop (spec) where
 
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Control.Concurrent (yield)
@@ -130,7 +130,7 @@ spec = describe "the stop paths and the cleanup evidence" $ do
     captured ← newEmptyMVar
     finished ← newEmptyMVar
     let config = (sampleConfig fx ui) {configGameplaySource = luaLines ["function update(self, dt) fx.hold('held') staging.finish() end"]}
-    thread ← forkIO $ (withBoundary (\control → withDomains control config (\domains → putMVar captured domains >> stepCommitted domains >> pure ()))) `finally` putMVar finished ()
+    thread ← forkRegistered $ (withBoundary (\control → withDomains control config (\domains → putMVar captured domains >> stepCommitted domains >> pure ()))) `finally` putMVar finished ()
     domains ← bounded (readMVar captured)
     awaitEntered fx "held"
     -- Cancelled in the middle of the tick; a running segment is not preempted, so the owners end once it returns.
@@ -166,7 +166,7 @@ spec = describe "the stop paths and the cleanup evidence" $ do
             , configUiSpec = hold "ui observer"
             , configGameplaySource = luaLines ["function update(self, dt) staging.finish() end"]
             }
-    thread ← forkIO $ withBoundary (\control → withDomains control config (\domains → putMVar captured domains >> writeIORef armed True >> void (stepTick domains))) `finally` putMVar finished ()
+    thread ← forkRegistered $ withBoundary (\control → withDomains control config (\domains → putMVar captured domains >> writeIORef armed True >> void (stepTick domains))) `finally` putMVar finished ()
     domains ← bounded (readMVar captured)
     tickUi domains ui
     awaitEntered fx "gameplay observer"

@@ -2,7 +2,6 @@
 -- order in which neither outlives what its bindings borrow, and nothing left live.
 module Test.Domains.Lifetime (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.STM (atomically, readTVarIO, retry)
 import Control.Monad (unless)
 import Control.Exception (IOException, SomeException, displayException, fromException, throwIO, try)
@@ -156,7 +155,7 @@ spec = describe "the owners' lifetime" $ do
             -- admission has ended. The gameplay failure then ends the body.
             tickUi domains ui
             awaitEntered fx "ui"
-            _ ← forkIO (atomically (isClosed (sharedQueue (domainsShared domains)) >>= \ended → unless ended retry) >> releaseGate fx "ui")
+            _ ← forkRegistered (atomically (isClosed (sharedQueue (domainsShared domains)) >>= \ended → unless ended retry) >> releaseGate fx "ui")
             stepCommitted domains
         let raised = either (\failure → const True (failure ∷ SomeException)) (const False) outcome
         domains ← readIORef facts >>= \held → case held of
