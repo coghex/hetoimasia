@@ -189,6 +189,7 @@ import Hetoimasia.Sample.LuaDomains.Session
   )
 import Hetoimasia.Sample.LuaDomains.Shared
   ( ScriptedInput
+  , TaskEntry (..)
   , Shared (..)
   , SharedSetup (..)
   , UiNotes (..)
@@ -277,7 +278,8 @@ import Hetoimasia.Scripting.Lua.Registration (CapabilityType, Namespace, Registr
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VRecord))
 import Hetoimasia.Scripting.Lua.Runtime (CallFault (BoundaryFailed), ExitRecord, LuaRuntime, newLuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
-  ( ExecutionDomain (GameplayDomain, InterfaceDomain)
+  ( ControlRequest (RequestStop)
+  , ExecutionDomain (GameplayDomain, InterfaceDomain)
   , GrantAnswer (GrantAccepted)
   , Quanta (Quanta)
   , Quantum (Quantum)
@@ -290,6 +292,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
   , SchedulerBounds (..)
   , ServiceClass (OrdinaryClass)
   , TaskAdmission (..)
+  , TaskControlAnswer (..)
   , TaskKind (OneShot)
   , TaskRequest (..)
   , TickWait (TicksCompleted)
@@ -297,8 +300,10 @@ import Hetoimasia.Scripting.Lua.Scheduled
   , awaitTask
   , awaitTicksComplete
   , cancelScheduled
+  , forgetControl
   , grantScheduledStep
   , pollTask
+  , requestTaskControl
   , retireScheduled
   , scheduledEndpoint
   , scheduledExitRecord
@@ -306,6 +311,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
   , scheduledStatus
   , scheduledSupervised
   , startScheduledOwner
+  , ticketTask
   )
 import Hetoimasia.Scripting.Lua.Scheduler (TimerBackend, systemTimerBackend)
 
@@ -973,15 +979,20 @@ admitGameplayTask ∷ Domains → TaskRequest → IO TaskAdmission
 admitGameplayTask domains request = mask_ $ do
   let shared = domainsShared domains
   entered ← atomically (enterTaskAdmission shared)
-  if not entered
-    then pure TaskAdmissionClosed
-    else
+  case entered of
+    TaskEntryClosed → pure TaskAdmissionClosed
+    -- The session holds as many tasks it has not observed as leave the fence its slot: the owner keeps a task's slot
+    -- until its settlement is observed, so one more could keep the fence from ever running.
+    TaskEntryFull → pure TaskQueueFull
+    TaskEntered →
       ( do
           configTaskHook (domainsConfig domains)
           admission ← admitScheduledTask (scheduledEndpoint (startedOwner (domainsGameplay domains))) request
           case admission of
             TaskAccepted _ ticket →
-              modifyMVar_ (sharedTasks shared) (pure . (<> [Watched (maybe "task" id (requestName request)) ticket]))
+              modifyMVar_ (sharedTasks shared) $ \held → do
+                atomically (modifyTVar' (sharedTaskHeld shared) (+ 1))
+                pure (held <> [Watched (maybe "task" id (requestName request)) ticket])
             _ → pure ()
           pure admission
       )
@@ -997,9 +1008,38 @@ watchTasks domains = do
   atomically $ do
     open ← takesTasks shared
     unless open (taskAdmissionsDrained shared)
+  consumeTasks domains (pollTask . watchedTicket)
+
+-- | Settle every task the session admitted, which a session that takes no more tasks and has no admission unfinished
+-- does once, before its status is decided: a task with no settlement is asked to stop, and its settlement is
+-- waited for (the owner settles every accepted task), so its fault, if it faulted, is told of. A task the stop cancels
+-- has no fault to tell.
+settleTasks ∷ Domains → IO ()
+settleTasks domains = do
+  let shared = domainsShared domains
+      endpoint = scheduledEndpoint (startedOwner (domainsGameplay domains))
+  atomically (taskAdmissionsDrained shared)
+  consumeTasks domains $ \watched →
+    let ticket = watchedTicket watched
+     in pollTask ticket >>= \case
+          Just settlement → pure (Just settlement)
+          Nothing → do
+            asked ← requestTaskControl endpoint (ticketTask ticket) RequestStop
+            case asked of
+              TaskControlAccepted receipt → forgetControl receipt
+              TaskControlFull → throwIO (StopRefused "task" (show asked))
+              -- An owner that no longer takes requests is ending, and settles the task as discarded.
+              _ → pure ()
+            Just <$> awaitTask (domainsControl domains) ticket
+
+-- | Take the lock on the watched tasks, learn each one's settlement as asked (nothing: it stays watched), record the
+-- faults among them as session failures, and give the observed tasks up.
+consumeTasks ∷ Domains → (Watched → IO (Maybe ScheduledSettlement)) → IO ()
+consumeTasks domains observe = do
+  let shared = domainsShared domains
   modifyMVar_ (sharedTasks shared) $ \held → do
     remaining ← forM held $ \watched →
-      pollTask (watchedTicket watched) >>= \case
+      observe watched >>= \case
         Nothing → pure (Just watched)
         Just settlement → do
           forM_ (faultOf (settledOutcome settlement)) $ \(kind, message) →
@@ -1007,7 +1047,9 @@ watchTasks domains = do
               tick ← currentTick shared
               failSession shared (SessionFailure (watchedName watched) "task" "task" tick kind (boundedMessage message))
           pure Nothing
-    pure (catMaybes remaining)
+    let kept = catMaybes remaining
+    atomically (modifyTVar' (sharedTaskHeld shared) (subtract (length held - length kept)))
+    pure kept
   where
     faultOf = \case
       SettledFaulted fault → Just ("script fault", Text.pack (take 600 (show fault)))
@@ -1341,6 +1383,8 @@ finishLive domains = do
 -- admitted whatever the UI holds.
 settleGameplay ∷ Domains → Bool → IO ()
 settleGameplay domains asking = do
+  -- The caller has closed admission: an admission that began before is finished and watched before anything is settled.
+  atomically (taskAdmissionsDrained (domainsShared domains))
   forM_ (domainsGameplay domains : domainsExtras domains) $ \started → do
     when asking $ do
       asked ← requestInstanceControl (scheduledEndpoint (startedOwner started)) (startedInstance started) InstanceStop
@@ -1349,7 +1393,7 @@ settleGameplay domains asking = do
         _ → pure ()
     void (awaitInstance (domainsControl domains) (startedTicket started))
   fence domains
-  watchTasks domains
+  settleTasks domains
 
 -- | What follows the publication that ends the session: the UI reads the settlements of the controls it asked for,
 -- and, when the configuration asks, sees the status that ends the session, while it serves; a UI that has ended

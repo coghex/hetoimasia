@@ -56,6 +56,10 @@ data Bounds = Bounds
     -- the rest are counted.
   , boundWorkspaces ∷ !Int
     -- ^ The most workspaces one gameplay instance holds charged at once: the capacity of its leases.
+  , boundSessionTasks ∷ !Int
+    -- ^ The most tasks the session may hold admitted and not yet observed. The owner keeps a task's slot and result
+    -- reservation until its settlement is observed, so this is one fewer than the gameplay owner's active tasks: the
+    -- fence of every tick always has a slot to run in.
   , boundPendingControls ∷ !Int
     -- ^ The most controls the UI may hold accepted and unread at once. The engine holds a reservation for each until its
     -- receipt is read, and the owner's reservations are this many and one for each instance the stop must reach, so a
@@ -77,6 +81,7 @@ defaultBounds =
     , boundStaging = 4
     , boundDroppedListed = 8
     , boundWorkspaces = 2
+    , boundSessionTasks = 3
     , boundPendingControls = 4
     }
 
@@ -111,6 +116,7 @@ validateBounds bounds =
       , ("staging", boundStaging bounds)
       , ("dropped-listed", boundDroppedListed bounds)
       , ("workspaces", boundWorkspaces bounds)
+      , ("session-tasks", boundSessionTasks bounds)
       , ("pending-controls", boundPendingControls bounds)
       ]
   , value < 1

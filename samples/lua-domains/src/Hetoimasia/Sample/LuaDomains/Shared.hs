@@ -65,6 +65,7 @@ module Hetoimasia.Sample.LuaDomains.Shared
   , gameplayBegan
   , gameplayFinish
   , failSession
+  , TaskEntry (..)
   , enterTaskAdmission
   , leaveTaskAdmission
   , taskAdmissionsDrained
@@ -109,7 +110,7 @@ import Hetoimasia.Foundation.Messaging.Snapshot
   , snapshotReader
   )
 import Hetoimasia.Foundation.Resource (acquirePart, releaseRank)
-import Hetoimasia.Sample.LuaDomains.Bounds (Bounds (boundPendingControls))
+import Hetoimasia.Sample.LuaDomains.Bounds (Bounds (boundPendingControls, boundSessionTasks))
 import Hetoimasia.Sample.LuaDomains.Candidate (Candidate (..), Move, StagingRefusal, begin, draw, finish, stage)
 import Hetoimasia.Sample.LuaDomains.Intention (Answer (..), FullCause (..), Submitted, validate)
 import Hetoimasia.Sample.LuaDomains.Queue (AdmitAt (..), Queue, admitNext, closeQueue, hasTickLeft, isClosed, newQueue, nextUnstarted)
@@ -177,6 +178,8 @@ data Shared = Shared
     -- settlement is consumed once.
   , sharedTaskAdmitting ∷ !(TVar Int)
     -- ^ The task admissions between the check that the session takes tasks and the task's being watched.
+  , sharedTaskHeld ∷ !(TVar Int)
+    -- ^ The tasks in 'sharedTasks': admitted, and not yet observed. Changed only under the 'sharedTasks' lock.
   , sharedAssignHook ∷ !(IO ())
   , sharedScenario ∷ !Text
   , sharedClosed ∷ !(TVar Bool)
@@ -211,6 +214,7 @@ newShared setup = do
     <*> newTVarIO (UiNotes 0 0 [])
     <*> newTVarIO Nothing
     <*> newMVar []
+    <*> newTVarIO 0
     <*> newTVarIO 0
     <*> pure (setupAssignHook setup)
     <*> pure (setupScenario setup)
@@ -402,14 +406,32 @@ takesTasks shared = do
   stopping ← stopRequestedNow (sharedSession shared)
   pure (not (closed || failed || stopping))
 
--- | Enter a task admission, if the session takes tasks: the check and the entry are one transaction, and the entry
--- is what the session's ending waits for ('taskAdmissionsDrained'), so no task is admitted to the owner once the
--- session has ended.
-enterTaskAdmission ∷ Shared → STM Bool
+-- | What entering a task admission answered.
+data TaskEntry
+  = TaskEntered
+  | -- | The session takes no task: it has failed, is stopping or has ended.
+    TaskEntryClosed
+  | -- | The session holds as many unobserved tasks as 'boundSessionTasks' allows.
+    TaskEntryFull
+  deriving (Eq, Show)
+
+-- | Enter a task admission, if the session takes tasks and holds fewer than 'boundSessionTasks' that are not yet
+-- observed (those watched, and those whose admission is unfinished): the check and the entry are one transaction, and
+-- the entry is what the session's ending waits for ('taskAdmissionsDrained'), so no task is admitted to the owner once
+-- the session has ended.
+enterTaskAdmission ∷ Shared → STM TaskEntry
 enterTaskAdmission shared = do
   open ← takesTasks shared
-  when open (modifyTVar' (sharedTaskAdmitting shared) (+ 1))
-  pure open
+  admitting ← readTVar (sharedTaskAdmitting shared)
+  held ← readTVar (sharedTaskHeld shared)
+  if not open
+    then pure TaskEntryClosed
+    else
+      if admitting + held >= boundSessionTasks (sharedBounds shared)
+        then pure TaskEntryFull
+        else do
+          writeTVar (sharedTaskAdmitting shared) (admitting + 1)
+          pure TaskEntered
 
 -- | The admission entered is over: the task is accepted and watched, or refused.
 leaveTaskAdmission ∷ Shared → STM ()
