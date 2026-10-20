@@ -1433,6 +1433,23 @@ and shutdown windows are the kind an asynchronous-exception race can hide on one
 platform, so CI, which runs them on Linux, is the evidence for them and a local
 pass is not.
 
+An example that parks a callback at a gate (`fx.block`, `app.block`, `holdOwner`, a host
+callback) must fail, and fail within its 60-second `bounded` limit, whatever way it ends
+between the hold and its own release: the boundary's protected teardown waits for the
+callback a held gate holds, so a gate nothing opens turns a failed assertion into a hang
+until an outside deadline. Such an example runs its boundary through `withBoundaryOpening`
+(`expectFatalOpening`, `tryBoundaryOpening` where it expects the boundary to fail, and
+`alongsideOpening` where a helper thread acts) with the fixtures it parks callbacks at.
+When the body ends by raising anything, every gate of those fixtures is opened inside the
+body, the ones made so far and the ones a callback first arrives at later, before the
+teardown begins; and when the example's bound expires, `bounded` opens them from a thread of
+its own, because an example parked in the runner's protected retirement cannot, and the
+exception the bound throws does not end that wait. A helper thread that fails opens them too,
+and the example fails with the helper's failure. The passing path is untouched: each example
+still opens each gate where it opens it. `expectFatalOpening` and `tryBoundaryOpening` also
+raise a failed assertion or the bound as itself, and do not take it for the failure the
+boundary was expected to end with. The `Gates` examples hold these helpers to that.
+
 ```bash
 cabal test hetoimasia-scripting-lua:lua-runtime-tests --test-show-details=direct
 ```
