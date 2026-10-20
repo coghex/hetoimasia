@@ -1425,7 +1425,10 @@ that the library supplies it first, as a **new explicit wait**, and that
   boundary work has been accounted, and every ending that work caused has run
   `shutdown` (or skipped it), drained its leases and requests, completed its
   retirement and had its escalation callback called and returned. It is usable
-  when no grant is outstanding (after a stop's instances settle). It uses no task,
+  when no grant is outstanding (after a stop's instances settle). Its endings are
+  every one begun by the end of the captured grants' final boundary, whatever
+  began it, a later grant applied in that same boundary included. It is called on
+  the application thread, one at a time, like every supervised wait. It uses no task,
   control or result slot and retains no per-waiter ticket; cancelling it abandons
   only the wait; an owner exit or fatal supervision ends it and never as a false
   success. It does not wait for healthy instances' future ticks or for idle
@@ -3515,9 +3518,10 @@ and verified policy, with adversarial regression coverage.
 - **Acceptance signals:** gated examples (no sleeps) in which the wait does not
   return before a refused wait's closure, `shutdown`, a deferred retirement and
   the escalation callback's return, each on its own; a tick with no work and a
-  wait with no grant outstanding return; saturated task slots, concurrent and
-  cancelled waiters and an owner that fails or exits during the wait end
-  correctly; existing `awaitTicksComplete` callers unchanged.
+  wait with no grant outstanding return; saturated task slots, repeated and
+  cancelled waits (one at a time, on the application thread that owns the
+  `RuntimeControl`, like every supervised wait) and an owner that fails or exits
+  during the wait end correctly; existing `awaitTicksComplete` callers unchanged.
 - **Out of scope:** the sample's use of it (LUA-30); changing
   `awaitTicksComplete`'s behavior; preliminary failure notification, rollback,
   stopping peers, timeouts, preemption; the runner and the `lua` subcommand.
