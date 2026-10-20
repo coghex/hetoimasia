@@ -30,7 +30,6 @@ module Hetoimasia.Sample.LuaDomains.Scenario
   , scenarioInputs
   , scenarioGameplay
   , scenarioStopAfter
-  , scenarioMinimumTicks
   , scriptedInputs
   ) where
 
@@ -99,12 +98,3 @@ scenarioStopAfter ∷ Scenario → Maybe Word64
 scenarioStopAfter = \case
   Stop → Just 8
   _ → Nothing
-
--- | The fewest ticks a scenario's point can fall within: asking for fewer ends the session before it.
-scenarioMinimumTicks ∷ Scenario → Word64
-scenarioMinimumTicks = \case
-  Normal → 1
-  Pause → 12
-  Failure → 7
-  Flood → 4
-  Stop → 9

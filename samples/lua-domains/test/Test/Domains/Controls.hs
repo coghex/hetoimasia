@@ -6,7 +6,7 @@ module Test.Domains.Controls (spec) where
 
 import Control.Concurrent (yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
-import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
+import Control.Concurrent.STM (readTVar, readTVarIO, retry)
 import Control.Monad (replicateM_, when)
 import Data.ByteString (ByteString)
 import Data.Foldable (toList)
@@ -56,23 +56,6 @@ controlsBalance domains = do
   counts ← readTVarIO (sharedControls (domainsShared domains))
   controlOffered counts `shouldBe` controlAccepted counts + sum (Map.elems (controlRefused counts))
   controlAccepted counts `shouldBe` controlApplied counts + controlAlready counts + controlNoLonger counts + controlAbandoned counts
-
--- | Stop the session while the UI is serving, keeping the UI's updates coming as its timer would until the stop has
--- returned: the stop waits for the UI to read the settlements of the controls it asked for.
-stopServing ∷ Domains → FakeUi → IO ()
-stopServing domains ui = do
-  finished ← newTVarIO False
-  stopped ← spawn (stopSession domains >> atomically (writeTVar finished True))
-  let go = do
-        next ← waitFor $ do
-          done ← readTVar finished
-          held ← readTVar (sharedReceipts (domainsShared domains))
-          live ← liveRegistrations ui
-          if done then pure False else if held > 0 && not (null live) then pure True else retry
-        when next (uiStep domains ui >> go)
-  go
-  _ ← stopped
-  pure ()
 
 spec ∷ Spec
 spec = describe "the UI's control of the gameplay behavior" $ do

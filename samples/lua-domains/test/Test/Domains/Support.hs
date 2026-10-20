@@ -16,6 +16,7 @@ module Test.Domains.Support
   , newFakeUi
   , tickUi
   , uiStep
+  , stopServing
   , liveRegistrations
   , liveCount
   , uiIntervalNanoseconds
@@ -74,6 +75,7 @@ import Hetoimasia.Sample.LuaDomains
   , Where (InBoth)
   , TickOutcome (TickCommitted)
   , stepTick
+  , stopSession
   , scriptedInputs
   , defaultConfig
   , withDomains
@@ -82,7 +84,7 @@ import Hetoimasia.Sample.LuaDomains.Snapshot (FailureEvidence, GameSnapshot (sna
 import Hetoimasia.Sample.LuaDomains.Intention (Answer, Submitted (Submitted))
 import Hetoimasia.Sample.LuaDomains.Queue (isClosed, reserved)
 import Hetoimasia.Sample.LuaDomains.Tally (Counts (countAccepted), settledTotal)
-import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCounts, sharedQueue, sharedUpdates), SharedSetup (..), newShared, readerOf, submit)
+import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCounts, sharedQueue, sharedReceipts, sharedUpdates), SharedSetup (..), newShared, readerOf, submit)
 import Hetoimasia.Scripting.Lua.Lease (newLeases)
 import Hetoimasia.Scripting.Lua.Lending (newLending)
 import Hetoimasia.Scripting.Lua.Registration (Namespace, namespace, stateOperation)
@@ -362,3 +364,20 @@ uiStep domains ui = do
   done ← updatesNow domains
   tickUi domains ui
   awaitUpdates domains (done + 1)
+
+-- | Stop the session while the UI is serving, keeping the UI's updates coming as its timer would until the stop has
+-- returned: the stop waits for the UI to read the settlements of the controls it asked for.
+stopServing ∷ Domains → FakeUi → IO ()
+stopServing domains ui = do
+  finished ← newTVarIO False
+  stopped ← spawn (stopSession domains >> atomically (writeTVar finished True))
+  let go = do
+        next ← waitFor $ do
+          done ← readTVar finished
+          held ← readTVar (sharedReceipts (domainsShared domains))
+          live ← liveRegistrations ui
+          if done then pure False else if held > 0 && not (null live) then pure True else retry
+        when next (uiStep domains ui >> go)
+  go
+  _ ← stopped
+  pure ()

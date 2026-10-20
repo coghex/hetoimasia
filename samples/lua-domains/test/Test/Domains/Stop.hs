@@ -13,7 +13,7 @@ import Data.Text (Text)
 import Hetoimasia.Sample.LuaDomains
   ( Dispositions (..)
   , Domains (domainsShared)
-  , DomainsConfig (configGameplaySource, configInput, configTicks)
+  , DomainsConfig (configGameplaySource, configInput, configTicks, configUiSource)
   , Evidence (..)
   , GameSnapshot (snapDispositions, snapStatus, snapTick)
   , InstanceEvidence (..)
@@ -29,8 +29,8 @@ import Hetoimasia.Sample.LuaDomains
   , withDomains
   )
 import Hetoimasia.Sample.LuaDomains.Intention (Answer (Accepted))
-import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCounts))
-import Hetoimasia.Sample.LuaDomains.Tally (Counts (..), Workspaces (..), settledTotal)
+import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedControls, sharedCounts))
+import Hetoimasia.Sample.LuaDomains.Tally (ControlCounts (..), Counts (..), Workspaces (..), settledTotal)
 import Hetoimasia.Scripting.Lua.Runtime (ExitKind (ExitCancelled, ExitStopped), ExitRecord (exitKind))
 import Test.Domains.Support
 import Test.Hspec
@@ -52,6 +52,13 @@ leavesNothing evidence = do
   evidencePending evidence `shouldBe` 0
   (workspacesAcquired (evidenceWorkspaces evidence), workspacesReleased (evidenceWorkspaces evidence), workspacesReleaseFailed (evidenceWorkspaces evidence))
     `shouldSatisfy` (\(acquired, released, failed) → acquired == released && failed == 0)
+
+failingHeld ∷ [Text]
+failingHeld = ["function update(self, dt) fx.hold('held') error('failed at tick 1') end"]
+
+-- | A UI that reads its receipts and asks to pause gameplay in each update, and says it has completed.
+pausing ∷ [Text]
+pausing = ["function update(self, dt) control.settle() control.pause() ui.updated() end"]
 
 failingAtTwo ∷ [Text]
 failingAtTwo =
@@ -137,6 +144,41 @@ spec = describe "the stop paths and the cleanup evidence" $ do
     balanced domains
     counts ← readTVarIO (sharedCounts (domainsShared domains))
     countAccepted counts `shouldBe` settledTotal counts
+  it "overlaps a stop requested while a segment is held with the failure that segment then raises: the failure is the session's, published once, nothing is committed, and the ledger balances" $
+    withSample (\config → config {configInput = [], configGameplaySource = luaLines ["function update(self, dt) fx.hold('held') error('failed while stopping') end"]}) $ \fx _ domains → withReleased fx ["held"] $ do
+      offered ← mapM (offer domains) [0, 1]
+      collect ← spawn (stepTick domains)
+      awaitEntered fx "held"
+      stopped ← spawn (stopSession domains)
+      waitFor (awaitClosed domains)
+      releaseGate fx "held"
+      _ ← stopped
+      outcome ← collect
+      outcome `shouldSatisfy` \case TickFailed _ → True; TickHalted → True; _ → False
+      (snapshot, revision) ← snapshotNow domains
+      (revision, snapTick snapshot, snapStatus snapshot) `shouldSatisfy` \(published, committed, status) → published == 1 && committed == 0 && isFailed status
+      dispInvalidated (snapDispositions snapshot) `shouldBe` placementsOf offered
+      evidence ← cleanupEvidence domains
+      leavesNothing evidence
+      balanced domains
+
+  it "overlaps a pause accepted for the next tick with the failure of the current one: the failure is published once, the control is settled as no longer applicable and the UI observes it, and the controls balance" $ do
+    fx ← newFx
+    ui ← newFakeUi
+    withBoundary $ \control →
+      withDomains control ((sampleConfig fx ui) {configInput = [], configGameplaySource = luaLines failingHeld, configUiSource = luaLines pausing}) $ \domains → withReleased fx ["held"] $ do
+        collect ← spawn (stepTick domains)
+        awaitEntered fx "held"
+        -- Tick one has begun, so the pause is for tick two, which will never run.
+        uiStep domains ui
+        releaseGate fx "held"
+        outcome ← collect
+        outcome `shouldSatisfy` \case TickFailed _ → True; _ → False
+        stopServing domains ui
+        counts ← readTVarIO (sharedControls (domainsShared domains))
+        (controlAccepted counts, controlNoLonger counts, controlApplied counts, controlAbandoned counts) `shouldBe` (1, 1, 0, 0)
+        revisionNow domains `shouldReturn` 1
+        balanced domains
   where
     isHalted = \case
       TickHalted → True
