@@ -1447,6 +1447,43 @@ failure notification ahead of cleanup, automatic rollback, peer stopping, a
 wall-time timeout and preemption are not part of it. D-45's readiness covers
 LUA-31; the manager processes it through merge under the owner's request.
 
+### D-48. Which tick a failure belongs to: the accounting cutoff (LUA-30)
+
+LUA-30's second review budget (#499, PR #502, rounds 2-5 at `858ccebe`) found one
+gap at four moments: a failure that begins after the driver has observed tick T
+(an admission still in flight, an admission after the drain, a task that was
+still runnable when T completed, and a `RunOnce` peer that runs without waiting
+for ticks and faults while its escalation is pending) still let T commit. #499's
+requirement 4 says a failure "in tick T" is known before T's commit, but not which
+tick a failure that begins on its own belongs to, so every new ordering was a new
+window.
+
+The owner decided (2026-10-20, request `user-het-lua8-solve-20261019-2212`) that
+the sample attributes failures by D-47's cutoff, with no library change:
+
+- **Tick T's failures** are the failures of T's own work (a segment or a task
+  resumption of T's grants) and every ending begun by the end of T's captured
+  final boundary: exactly what `awaitScheduledAccounting` for T covers. Each is
+  recorded before that wait returns `AccountingComplete`, and none ever lets T
+  commit, on every ordering (requirement 4's gated examples).
+- **The commit decision** is one atomic step after that wait: T commits only if
+  no session failure is recorded at that step.
+- **A failure that begins after the cutoff** belongs to the first tick not yet
+  committed when it is recorded. Recorded before T's commit step, it stops T;
+  recorded after, T commits and stays the last good snapshot, and the failure fails
+  the session at T+1 (no further grant; T+1's batch, if any, is discarded and never
+  committed). Either outcome is correct. Examples need not force one for such a
+  failure; they show it is published exactly once, that no snapshot shows an
+  effect of a tick whose commit step saw a failure, and that the published
+  failing tick and last good tick agree.
+
+This narrows requirement 4's "on every ordering of the owner's thread and the
+driver's" to tick T's failures as defined here, and defines "the failing tick"
+of requirements 2 and 3. Nothing else in #499 changes: every failure still fails
+the session, the failure snapshot carries the last good world, and no effect of
+an uncommitted tick is ever published. #499 resumes on PR #502 with three fresh
+review rounds.
+
 ## Design
 
 P-1 through P-13 record the accepted contracts, with proof and delivery gates
@@ -3544,7 +3581,7 @@ and verified policy, with adversarial regression coverage.
 - **Phase:** trusted integrated acceptance.
 - **Depends on:** LUA-29, LUA-31, LUA-22, LUA-23.
 - **Ordering:** after LUA-29 and LUA-31 (D-47); precedes LUA-8.
-- **Relevant decisions:** D-7, D-15, D-24, D-26, D-27, D-43, D-44, D-45, D-46, D-47.
+- **Relevant decisions:** D-7, D-15, D-24, D-26, D-27, D-43, D-44, D-45, D-46, D-47, D-48.
 - **Acceptance signals:** a failed gameplay session closes admission, discards the
   failing tick's batch and publishes the failure beside the last good snapshot;
   accepted intentions equal applied plus rejected plus invalidated plus discarded;
