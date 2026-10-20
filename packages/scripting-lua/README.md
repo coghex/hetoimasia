@@ -1836,7 +1836,11 @@ lies ahead on the owner's thread.
   captured have finished and no ending it covers was open when the acknowledgement was written.
   A boundary cut short by a failure kept or raised, an exception included, writes none, so a
   failure caught and not yet kept can never be acknowledged over. An idle owner is woken to write
-  one.
+  one, and is woken again when an acknowledgement was written with a covered ending still open and
+  that ending has been accounted for since (its retirement completed after the boundary, and the
+  owner settled it after its turn): that acknowledgement can no longer answer the wait, and it
+  does not wait for unrelated work to cause another boundary. An owner whose covered ending is
+  still open is not woken, so one waiting for a retirement does not spin.
 - *What it costs the owner.* No task, control or result slot, no ticket and no per-wait state:
   the owner keeps a watch and a count of the endings it has begun and not yet accounted for,
   bounded by the instances' own bound, whatever number of waits were made, and the wait works
