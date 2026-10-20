@@ -55,9 +55,9 @@ module Test.Domains.Support
   , cancelWhen
   ) where
 
-import Control.Concurrent (forkIO, killThread, myThreadId, throwTo)
+import Control.Concurrent (forkIO, forkIOWithUnmask, killThread, myThreadId, throwTo)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, tryPutMVar, withMVar)
-import Control.Exception (Exception, SomeException, finally, mask, throwIO, try)
+import Control.Exception (Exception, SomeException, catch, finally, fromException, mask, onException, throwIO, try)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Monad (void, when)
 import Data.ByteString (ByteString)
@@ -426,27 +426,37 @@ stopBounded domains = void (bounded (stopSession domains))
 
 -- | Run an action on a thread of its own while this thread does the other, and answer the other's result once the
 -- first has ended, raising what it raised. A stop or a tick is the application thread's, so what an example does around
--- it, in the interval it holds, is done on the side. If the side fails while this thread is still running the other (a
--- failed assertion, with the other held at a gate the side would have opened), the failure is raised here, in the
--- other's place, so that the example unwinds, opens its gates and retires its owners, and nothing is left hanging.
+-- it, in the interval it holds, is done on the side.
+--
+-- The side's thread lives no longer than this call, whatever the other does: if the other raises, whatever it raises, the
+-- side is cancelled and has ended before this returns, and nothing it does can reach the caller afterwards. If the side
+-- fails while this thread is still running the other (a failed assertion, with the other held at a gate the side would
+-- have opened), the failure is raised here, in the other's place, so that the example unwinds, opens its gates and retires
+-- its owners, and nothing is left hanging.
 alongside ∷ IO () → IO a → IO a
-alongside side main = do
+alongside side main = mask $ \restore → do
   me ← myThreadId
-  running ← newMVar True
+  open ← newMVar True
   sideResult ← newEmptyMVar
-  _ ← forkIO $ do
-    outcome ← try side
+  sideThread ← forkIOWithUnmask $ \unmask → do
+    outcome ← try @SomeException (unmask side)
     case outcome of
-      Left failure → withMVar running (\open → when open (throwTo me (SideFailed failure))) `finally` putMVar sideResult (Left failure)
+      Left failure → withMVar open (\delivering → when delivering (throwTo me (SideFailed failure))) `finally` putMVar sideResult (Left failure)
       Right () → putMVar sideResult (Right ())
-  result ← try main
-  -- Whether or not the side is still running, it is not to interrupt this thread once the other is over.
-  modifyMVar_ running (\_ → pure False)
+  result ← try @SomeException (restore main)
+  -- The side may no longer interrupt this thread; one that is delivering a failure finishes first, and the delivery that
+  -- reaches this thread while it waits is the side's own failure, which is reported below.
+  let close = modifyMVar_ open (\_ → pure False) `catch` \(SideFailed _) → close
+  close
   case result of
-    Left (SideFailed failure) → throwIO (failure ∷ SomeException)
     Right value → do
-      bounded (readMVar sideResult) >>= either (\failure → throwIO (failure ∷ SomeException)) pure
-      pure value
+      outcome ← restore (bounded (readMVar sideResult)) `onException` killThread sideThread
+      either (\failure → throwIO (failure ∷ SomeException)) (const (pure value)) outcome
+    Left raised → do
+      killThread sideThread
+      case fromException raised of
+        Just (SideFailed failure) → throwIO failure
+        Nothing → throwIO raised
 
 -- | What the side of 'alongside' raised, delivered to the other.
 newtype SideFailed = SideFailed SomeException
@@ -462,17 +472,25 @@ instance Exception Cancelled
 
 -- | Run an action on this thread and cancel it, with an exception of its own, once this has happened (the trigger, which an
 -- example makes a gate entered): the action's result, or 'Nothing' if it was cancelled. The thread the action runs on is
--- the thread of the example, so a stop, which is the application thread's, can be the one that is cancelled.
+-- the thread of the example, so a stop, which is the application thread's, can be the one that is cancelled. The thread
+-- that waits for the trigger lives no longer than this call, whatever the action raises: it is cancelled and has ended
+-- before this returns, so the trigger firing later cancels nothing.
 cancelWhen ∷ IO () → IO a → IO (Maybe a)
-cancelWhen trigger action = do
+cancelWhen trigger action = mask $ \restore → do
   me ← myThreadId
-  mask $ \restore → do
-    canceller ← forkIO (trigger >> throwTo me Cancelled)
-    outcome ← try (restore action)
-    killThread canceller
-    case outcome of
-      Left Cancelled → pure Nothing
-      Right result → pure (Just result)
+  armed ← newMVar True
+  canceller ← forkIOWithUnmask $ \unmask → do
+    _ ← try @SomeException (unmask trigger)
+    withMVar armed (\on → when on (throwTo me Cancelled))
+  outcome ← try @SomeException (restore action)
+  let disarm = modifyMVar_ armed (\_ → pure False) `catch` \Cancelled → disarm
+  disarm
+  killThread canceller
+  case outcome of
+    Right result → pure (Just result)
+    Left raised → case fromException raised of
+      Just Cancelled → pure Nothing
+      Nothing → throwIO raised
 
 -- | One tick of the driver, on this thread, which is the application thread's, while another thread does what the example
 -- does around it, in the order it does it: the tick's outcome once both have ended, the side's exception raised if it

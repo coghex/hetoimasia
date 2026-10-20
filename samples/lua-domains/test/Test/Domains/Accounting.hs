@@ -20,6 +20,7 @@ import Hetoimasia.Sample.LuaDomains
   ( Bounds (boundSessionTasks)
   , Domains (domainsGameplay, domainsShared)
   , DomainsDefect (DriverOffApplicationThread, StopOffApplicationThread)
+  , DecisionPoint (AfterObserved, BeforeCommit)
   , DomainsConfig (..)
   , Evidence (evidenceGameplay)
   , Extension (Extension)
@@ -265,6 +266,58 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
             snapshot ← expectFailed outcome
             fmap (failWho . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "faulting task"
             snapTick snapshot `shouldBe` 0
+
+  describe "a tick's decision and an admission that begins after the tasks were read" $
+    forM_ [("before it decides", AfterObserved), ("after it decided and before it commits", BeforeCommit)] $ \(label, point) →
+      it ("reads again when the admission begins " <> label <> ": the task accepted and unregistered faults in the tick, and the tick is not committed") $ do
+        fx ← newFx
+        ui ← newFakeUi
+        withBoundary $ \control →
+          withDomains
+            control
+            (withWait (sampleConfig fx ui))
+              { configInput = []
+              , configGameplaySource = gameplayWith ["function update(self, dt) staging.finish() end", "function task_fails() fx.record('task ran') error('task failed') end"]
+              , configGameplayEntries = [EntryPoint "task_fails" Required [] []]
+              , configDecisionHook = \reached → when (reached == point) (holdAt fx "deciding")
+              , configAcceptedHook = holdAt fx "accepted"
+              }
+            $ \domains → withReleased fx ["deciding", "accepted"] $ do
+              outcome ←
+                driving
+                  domains
+                  ( do
+                      -- The tick has completed and the driver has read the tasks, of which there are none.
+                      awaitEntered fx "deciding"
+                      admitter ← spawn (admitGameplayTask domains (task "faulting task" "task_fails"))
+                      -- An admission begins now: the owner accepts the task, which runs and faults in the tick, and its admitter
+                      -- is held before it registers it.
+                      awaitEntered fx "accepted"
+                      awaitLine fx "task ran"
+                      releaseGate fx "deciding"
+                      -- The driver sees that an admission began since it read the tasks, and reads again: it waits for the admitter.
+                      replicateM_ 2000 yield
+                      revisionNow domains `shouldReturn` 0
+                      releaseGate fx "accepted"
+                      void admitter
+                  )
+              snapshot ← expectFailed outcome
+              fmap (failWho . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "faulting task"
+              snapTick snapshot `shouldBe` 0
+
+  describe "the helpers the examples use" $ do
+    it "cancel the side of 'alongside' whatever the other raises: nothing the side does later reaches the caller" $ do
+      fx ← newFx
+      raised ← try @SomeException (alongside (holdAt fx "side" >> expectationFailure "a late failure of the side") (throwIO (userError "the main action failed") ∷ IO ()))
+      raised `shouldSatisfy` \case Left failure → show failure == show (userError "the main action failed"); Right _ → False
+      releaseGate fx "side"
+      replicateM_ 2000 yield
+    it "cancel the trigger of 'cancelWhen' whatever the action raises: the trigger firing later cancels nothing" $ do
+      fx ← newFx
+      raised ← try @SomeException (cancelWhen (holdAt fx "trigger") (throwIO (userError "the action failed") ∷ IO ()))
+      raised `shouldSatisfy` \case Left failure → show failure == show (userError "the action failed"); Right _ → False
+      releaseGate fx "trigger"
+      replicateM_ 2000 yield
 
   describe "an admission cancelled" $ do
     it "before the owner is asked leaves nothing behind: nothing is accepted or counted, and the next admission and a stop go on" $ do
