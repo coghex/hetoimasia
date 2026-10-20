@@ -139,8 +139,10 @@ The driver's `stepTick`:
    `shutdown` and the release of what it held included) and the application's escalation has been called and has
    returned. If the owner ended instead (`AccountingOwnerEnded`) nothing was accounted for and nothing is
    committed. The wait is one of the supervised waits the sample makes, called on the application thread that owns
-   the supervision handle and one at a time: a stop from another thread waits its turn and never waits beside the
-   driver. The faults of tasks the session admitted are read next.
+   the supervision handle, one at a time (they take a lock, and `stopSession`, whose waits they are, refuses any
+   thread but the application thread's: another thread asks with `requestStop`, which waits for nothing, so a stop
+   never waits beside the driver). The faults of tasks the session admitted are read next, though each was told
+   when it happened, by the task's own watcher.
 5. **Decide.** A failure told of fails the session and commits nothing; a stop commits nothing; otherwise the
    tick commits only if its work **finished successfully**: gameplay called `staging.finish()` and the instance
    is active with nothing in flight and no update owed, or the engine says why there is no work (the behavior
@@ -250,19 +252,25 @@ What the session does, by design (D-26, D-27, P-7):
   `TaskAdmissionClosed`, and nothing reaches the owner or runs), in the transaction that records the failure or
   the stop; an admission that began before is finished, and its task watched, before the stop settles anything and
   before the ending is published (both wait for it);
-* the session **holds at most `boundSessionTasks`, three by default (at most sixteen), tasks it has not
-  observed**: the owner keeps a task's slot and result reservation until its settlement is observed, so a fourth
-  is refused (`TaskQueueFull`), and a tick or a stop never waits for a slot nobody will free. A live instance's
-  invocation takes an active slot of the same pool, so the gameplay owner's scheduling is *made from* that bound and
-  from the instances the owner may hold live (one active slot for each, and queued admissions and retained results
-  twice that): an update has a slot whichever tasks are unobserved and whichever instances are suspended, in every
-  supported configuration (examples at one, three and sixteen tasks);
-* the settlements of the tasks the session watches are **consumed once**: whoever observes them (the driver, a
-  stop from any thread, two stops at once) holds the lock on the watched tasks for the whole observation, so a
-  fault is recorded once, never twice, and a task whose settlement was told of is given up however the
-  observation ends;
-* the session is **quiescent when its failure is published**: the driver first asks every gameplay instance to
-  stop, through the engine's instance controls, and waits for each to settle (the one that failed has ended; a
+* the session **holds at most `boundSessionTasks`, three by default (at most sixteen), tasks it has not been told the
+  settlement of**: a task holds its slot and result reservation until its settlement is observed, and each task's
+  watcher observes it as soon as there is one, so a fourth is refused (`TaskQueueFull`) while three are running or
+  suspended, and a tick or a stop never waits for a slot nobody will free. A live instance's invocation takes an
+  active slot of the same pool, so the gameplay owner's scheduling is *made from* that bound and from the instances
+  the owner may hold live (one active slot for each, and queued admissions and retained results twice that): an
+  update has a slot whichever tasks are suspended and whichever instances are suspended, in every supported
+  configuration (examples at one, three and sixteen tasks);
+* the settlements of the tasks the session watches are **told once**: the task's watcher, the driver (before it
+  decides a tick) and the stop each learn a settlement, and learning it is one transaction that takes the task off the
+  registry and records its fault as a session failure, so a fault is recorded once, never twice, and a thread that is
+  interrupted tells nothing half;
+* a failure **asks everything the session holds to stop as soon as it is told**, from the owner's thread (an
+  instance's escalation) or the task's watcher, without waiting: every gameplay instance and every task is claimed and
+  asked in one step, so a tick that a surviving instance, or a task that has woken on it and stays ready, would keep
+  outstanding can complete, and the driver reaches the failure's publication; a stop asks the same before it waits for
+  anything;
+* the session is **quiescent when its failure is published**: every gameplay instance has been asked to stop, through
+  the engine's instance controls (see above), and the driver waits for each to settle (the one that failed has ended; a
   surviving instance, one with work still to run included, runs its `shutdown` and its leases are released), waits
   for the owner's accounting of those endings, and settles what the session admitted (a task that has no
   settlement, one that goes on running after it yields included, is asked to stop and waited for), with the owner
@@ -322,11 +330,14 @@ answered `full` shows a busy indication and offers the intention again at most t
 
 ## Stopping, cancellation and the cleanup evidence
 
-`stopSession` is the one stop of the session, from the driver, and it can be called again (it then only
+`stopSession` is the one stop of the session, on the application thread (the one that created the session, whose
+supervision handle the waits below are; another thread's call is refused with `StopOffApplicationThread`, and that
+thread asks with `requestStop`), and it can be called again (it then only
 reports how the owners ended). It:
 
 1. closes admission and grants at once, so nothing is accepted for a tick that will never run;
-2. asks the gameplay instances (the behavior and any others) to stop and waits for each to be **settled**,
+2. asks the gameplay instances (the behavior and any others) and every task to stop, without waiting, and then waits
+   for each instance to be **settled**,
    which includes its `shutdown` hook and the release of every lease it held, so a segment that is running is
    not preempted and the stop waits for it to return;
 3. waits for the owner's accounting (`awaitScheduledAccounting`), and learns through it whether that settlement
@@ -339,8 +350,10 @@ reports how the owners ended). It:
    publication and retires both owners, the UI first. The UI therefore notes `failed` (or `stopped`) with the last
    good tick, and the report says so.
 
-A stop from another thread while a tick is in flight halts that tick (`TickHalted`): the tick commits
-nothing, and the driver is told so, not left with a defect.
+A stop asked for from another thread (`requestStop`: it records the intent, closes admission and asks every instance
+and task to stop, and waits for nothing) while a tick is in flight halts that tick (`TickHalted`): the tick commits
+nothing, and the driver is told so, not left with a defect; the application thread then finalizes the stop with
+`stopSession`, as `runSession` does when a tick is halted.
 
 **A finite session that ran its last tick** settles the same way before its publication closes (it asks the
 gameplay instances to stop and waits for their `shutdown` and lease release, then for the owner's accounting): a `shutdown` that
