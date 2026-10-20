@@ -145,7 +145,11 @@ spec = describe "the failure of the gameplay session" $ do
               }
         )
         $ \_ _ domains → do
-          snapshot ← awaitRevision domains 1
+          -- The driver publishes the failure: at the start if it was told of it then, and otherwise when it acts, with the
+          -- tick it then begins failed and not committed.
+          outcome ← stepTick domains
+          outcome `shouldSatisfy` \case TickFailed _ → True; TickHalted → True; _ → False
+          (snapshot, _) ← snapshotNow domains
           fmap (failStage . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "run"
           fmap (failWho . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "one-shot"
           stepTick domains >>= (`shouldSatisfy` isHalted)

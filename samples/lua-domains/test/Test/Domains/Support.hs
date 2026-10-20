@@ -34,7 +34,6 @@ module Test.Domains.Support
   , updatesNow
   , snapshotNow
   , revisionNow
-  , awaitRevision
   , committedTick
     -- * Waiting
   , waitFor
@@ -283,15 +282,6 @@ snapshotNow domains = atomically $ do
   reader ← readerOf (domainsShared domains)
   observation ← readSnapshot reader
   pure (preparedValue (observedValue observation), cursorRevision (observedCursor observation))
-
--- | Wait, bounded, until a publication of at least this revision exists, and answer the latest snapshot: for a
--- failure of an instance that is not the behavior, whose end the session is told of from the owner's thread.
-awaitRevision ∷ Domains → Natural → IO GameSnapshot
-awaitRevision domains wanted = waitFor $ do
-  reader ← readerOf (domainsShared domains)
-  observation ← readSnapshot reader
-  when (cursorRevision (observedCursor observation) < wanted) retry
-  pure (preparedValue (observedValue observation))
 
 -- | The revision of the latest publication: zero for the initial value, one more for each tick.
 revisionNow ∷ Domains → IO Natural
