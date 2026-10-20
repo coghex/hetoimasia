@@ -339,8 +339,9 @@ windowTasks =
         , "  fx.block(name)"
         , "  return 1"
         , "end"
-        , "function refused_closing()"
+        , "function refused_closing(name)"
         , "  local guard <close> = setmetatable({}, {__close = function() error('close boom') end})"
+        , "  fx.block(name)"
         , "  sched.wait_ticks(0)"
         , "end"
         , "function close_at(name)"
@@ -349,7 +350,7 @@ windowTasks =
         , "end"
         ]
     )
-    [EntryPoint "block_after" Required [SText, SInteger] [SInteger], EntryPoint "close_at" Required [SText] [], EntryPoint "refused_closing" Required [] []]
+    [EntryPoint "block_after" Required [SText, SInteger] [SInteger], EntryPoint "close_at" Required [SText] [], EntryPoint "refused_closing" Required [SText] []]
 
 -- | A task of that module that waits a tick holding a variable whose closing handler waits at this gate.
 closesGated ∷ Text.Text → TaskRequest
@@ -363,14 +364,14 @@ closesGated gate' =
     , requestName = Nothing
     }
 
--- | A task of that module that holds a variable whose closing handler raises and waits for no ticks,
--- which the scheduler refuses: the scheduler closes its coroutine, and the close fails.
-refusedClosing' ∷ TaskRequest
-refusedClosing' =
+-- | A task of that module that holds a variable whose closing handler raises, waits at this gate, and then
+-- waits for no ticks, which the scheduler refuses: the scheduler closes its coroutine, and the close fails.
+refusedClosing' ∷ Text.Text → TaskRequest
+refusedClosing' gate' =
   TaskRequest
     { requestModule = windowTasksRef
     , requestEntry = "refused_closing"
-    , requestArguments = []
+    , requestArguments = [VText gate']
     , requestClass = OrdinaryClass
     , requestKind = OneShot
     , requestName = Nothing
@@ -445,19 +446,21 @@ failingWait fixture gates scenario = do
     Left raised | Just (_ ∷ Timeout) ← fromException raised → throwIO raised
     _ → pure ()
   tryReadMVar outcome >>= \case
-    Nothing → ioError (userError "the example recorded no outcome for the wait")
+    Nothing → ioError (userError ("the example recorded no outcome for the wait" <> either (\raised → ": " <> show raised) (const "") stalled))
     Just (Right answered) → ioError (userError ("the wait answered " <> show answered))
     Just (Left _) → pure ()
 
 -- | The scenario leaves the owner holding a cleanup failure it has retained, and parked at this gate, with
--- nothing owed and no grant outstanding: the wait begun there must stay parked, and end with the failure
--- once the gate is opened. It returns the owner and what lets the owner go on.
-retainedFailure ∷ SFixture → [Gate] → Text.Text → (RuntimeControl → LuaRuntime → IO (ScheduledOwner, IO ())) → IO ()
+-- nothing owed and no grant outstanding. The wait is begun while the owner is still held, before the
+-- boundary that retains the failure, so that the owner's acknowledgement at the end of that boundary
+-- would answer it if the owner wrongly wrote one; it must stay parked while the owner is parked, and end
+-- with the failure once the gate is opened. The scenario returns the owner and what lets it go on, which is
+-- handed the action that begins the wait and calls it, while the owner is held, before it lets the owner go.
+retainedFailure ∷ SFixture → [Gate] → Text.Text → (RuntimeControl → LuaRuntime → IO (ScheduledOwner, IO PendingWait → IO PendingWait)) → IO ()
 retainedFailure fixture gates gate' scenario = failingWait fixture gates $ \control runtime → do
   (owner, go) ← scenario control runtime
-  go
+  waiting ← go (do w ← beginWait control owner; awaitPending w; pure w)
   awaitEntered fixture gate'
-  waiting ← beginWait control owner
   stabilize waiting
   awaitPending waiting
   releaseGate fixture gate'

@@ -398,7 +398,6 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , newScheduler
   , readDiagnostics
   , readTick
-  , retainsEvidence
   , releaseTick
   , requestControl
   , requestWaiting
@@ -965,10 +964,13 @@ data AccountingWait
 -- earlier wait: a later grant entering a blocking callback while an earlier ending is
 -- parked awaiting retirement holds the thread the ending needs to settle. A retirement a
 -- provider owes holds the wait for as long as it holds the instance's stop completion;
--- there is no timeout. A wait begun while the owner is inside one of its servicing steps (the
--- instance layer's accounting at a boundary, the disposals a retirement owes, the providers being
--- told) does not complete until the step has ended, whatever it owes the wait: a failure the step
--- has caught and not yet kept is not visible from outside it. Returning is evidence about the owner's accounting. It is not
+-- there is no timeout. The wait completes on an acknowledgement
+-- the owner's thread writes after the wait's cut was fixed, as the last step of an iteration of its
+-- loop that has kept every failure it caught, found nothing it holds, and swept what the providers
+-- and the leases have yet to hand it; an iteration cut short by a failure writes none. A wait begun
+-- while the owner is in the middle of a batch (the disposals a retirement owes, the providers being
+-- told) therefore waits for the end of that iteration, and cannot complete between a failure being
+-- caught and being kept. Returning is evidence about the owner's accounting. It is not
 -- permission to advance or to commit a tick that failed.
 --
 -- = Who may call it
@@ -1019,19 +1021,15 @@ awaitScheduledAccounting supervision owner = do
     -- Only the owner's termination ends the wait with 'AccountingOwnerEnded', and supervision
     -- handles an owner's outcome, a fatal one rethrown, before this transaction runs: so an owner
     -- that is exiting (stopped, or failing with an outcome not yet published) neither completes
-    -- the wait nor ends it. It waits for the exit.
+    -- the wait nor ends it. It waits for the exit. Completion is the owner's acknowledgement,
+    -- written by the owner's thread after it has kept every failure it caught: the wait decides
+    -- nothing about failures in flight.
     accounted control = do
       status ← workerStatus (ownerWorker owner)
       case status of
         WorkerLive → do
           exiting ← (||) <$> schedulerClosed (controlScheduler control) <*> controlStopping control
-          -- Cleanup evidence the owner holds ends it as a failure, whatever else it has done:
-          -- the accounting is not a success while it is held.
-          tainted ← acTainted <$> readTVar (controlAccounting control)
-          -- And what the scheduler holds this instant: the failure of a close that no boundary has
-          -- yet sealed or accounted for is the owner's end all the same.
-          retained ← retainsEvidence (controlScheduler control)
-          if exiting || tainted || retained
+          if exiting
             then retry
             else accountingReady control >> pure AccountingComplete
         _ → pure AccountingOwnerEnded

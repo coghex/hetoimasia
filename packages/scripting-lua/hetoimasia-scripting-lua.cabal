@@ -236,7 +236,6 @@ library runtime-lua
         Hetoimasia.Scripting.Lua.Runtime.Dispatch
         Hetoimasia.Scripting.Lua.Runtime.Shared
         Hetoimasia.Scripting.Lua.Runtime.Types
-        Hetoimasia.Scripting.Lua.Cleanup
         Hetoimasia.Scripting.Lua.Scheduled.Run
         Hetoimasia.Scripting.Lua.Scheduled.Shared
         Hetoimasia.Scripting.Lua.Scheduled.Types

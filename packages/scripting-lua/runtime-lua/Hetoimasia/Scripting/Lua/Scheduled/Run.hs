@@ -79,7 +79,6 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Resource (composeCleanup, withScoped)
 import Hetoimasia.Foundation.Resource.OwnedCollection (allocOwnedCollection)
-import Hetoimasia.Scripting.Lua.Cleanup (Evidence, newEvidence, retainCleanup, retainedCleanup)
 import Hetoimasia.Scripting.Lua.Internal.Boundary (moduleChunk)
 import Hetoimasia.Scripting.Lua.Internal.Owner (ownedInternalVm)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Failure (ReasonCode (ScriptFault, ValidationFault), RecoverySafety (RecoverySafe), failureReason)
@@ -145,6 +144,7 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , TaskRun (..)
   , TurnReport (turnCloseFailures)
   , awaitWork
+  , retainsEvidence
   , serviceTurnWith
   , stopScheduler
   )
@@ -196,8 +196,8 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
   -- (a script's own failure that was raised with the failures of closing its
   -- coroutine). Either is fatal evidence, so the first of them ends the owner:
   -- nothing here accumulates for as long as the owner serves.
-  kept ← newEvidence (accountingFailed control)
-  extra ← newEvidence (accountingFailed control)
+  kept ← newIORef []
+  extra ← newIORef []
   let host =
         TaskHost
           { hostRun = runSegment control observe owned identity label handlesRef tasks extra instanceRef
@@ -304,8 +304,8 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
         Just (Right ended) → ended
         Just (Left failure) → ([failure], [])
         Nothing → ([], [])
-  earlier ← retainedCleanup kept
-  others ← retainedCleanup extra
+  earlier ← readIORef kept
+  others ← readIORef extra
   let closeFailures =
         Map.toList . Map.fromListWith (\_ first → first) $
           earlier <> maybe [] stopCloseFailures report <> concat swept
@@ -353,37 +353,53 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
     -- cleanup: answers whether it was the latter.
     loop host kept extra instanceRef = do
       instances ← readIORef instanceRef
+      -- Beside its other work the owner wakes for an accounting wait whose cut is fixed and which
+      -- no acknowledgement has answered yet: an idle owner has no boundary to end until it is woken.
       atomically $ case instances of
-        Nothing → awaitWork scheduler `orElse` requestWork
-        Just ih → awaitWork scheduler `orElse` awaitInstanceWork ih `orElse` requestWork
-      servicing control (forM_ instances serviceInstances)
+        Nothing → awaitWork scheduler `orElse` requestWork `orElse` awaitAcknowledgement control
+        Just ih → awaitWork scheduler `orElse` awaitInstanceWork ih `orElse` requestWork `orElse` awaitAcknowledgement control
+      forM_ instances serviceInstances
       -- At each boundary, after the scheduler's work there, the owner accounts for
       -- what ended, looks at what its instances were asked and tries again what the
       -- scheduler had no room for, unless it was asked to stop itself, in which case
       -- its exit settles it. Its requests are looked at after that: the tasks whose
       -- requests have settled are woken, the providers' accounts are polled, and the
       -- requesters whose tasks are gone are ended.
-      let atBoundary = servicing control $ do
+      let atBoundary = do
             instanceStep ← maybe (pure False) serviceBoundary instances
             requestStep ← forM provider $ \service →
               providerBoundary service scheduler (isJust instances) extra (forM_ instances endOwner)
             let again = instanceStep || or requestStep
-            -- A boundary that finds nothing more to account for is the last of its settling:
-            -- it ends when this returns, and it is the point an accounting wait's watch is
-            -- latched at, once its grants have finished. The endings begun by now are the
-            -- wait's own, whatever began them, and an ending begun later is not.
-            unless again (atomically (sealAccounting control))
+            -- A boundary that finds nothing more to do is the last of its settling: it ends when this
+            -- returns. This is the owner's checkpoint, and nothing after it in the boundary can fail. The
+            -- sweep of what the providers and the leases had to hand over is the step just made, which
+            -- found none; the failures the owner caught were kept by the steps that caught them, or
+            -- raised past this point. If it holds none of them, is not stopping, and the boundary finished
+            -- the grants a wait captured, it fixes that wait's cut; and then it acknowledges: whatever
+            -- wait is pending is answered by an acknowledgement written here, after its cut was fixed, and
+            -- by nothing else.
+            unless again $ do
+              held ← holdsFailure kept extra
+              atomically (sealAccounting control >> unless held (acknowledgeAccounting control))
             pure again
       report ← serviceTurnWith atBoundary scheduler host
-      servicing control (forM_ instances settleEnded)
+      forM_ instances settleEnded
       mask_ $ do
-        retainCleanup kept (turnCloseFailures report)
+        modifyIORef' kept (<> turnCloseFailures report)
         void (atomically (sweepForgotten control))
       halt ← atomically stopping
-      retained ← (||) <$> (not . null <$> retainedCleanup kept) <*> (not . null <$> retainedCleanup extra)
+      retained ← (||) <$> (not . null <$> readIORef kept) <*> (not . null <$> readIORef extra)
       if halt || retained
         then pure (retained && not halt)
         else loop host kept extra instanceRef
+
+    -- Whether the owner holds a failure that will end it, or is ending: what the scheduler kept, what the
+    -- owner kept, or a stop. An acknowledgement is not written while it does.
+    holdsFailure kept extra = do
+      scheduled ← atomically ((||) <$> retainsEvidence scheduler <*> stopping)
+      kept' ← not . null <$> readIORef kept
+      extra' ← not . null <$> readIORef extra
+      pure (scheduled || kept' || extra')
 
 -- | Close a task's coroutine as the task, and as its instance if it is an invocation of one.
 closeAs ∷ Control → Maybe InstanceHost → TaskId → IO a → IO a
@@ -425,7 +441,7 @@ runSegment
   → Text
   → IORef (Map ModuleRef ModuleHandle)
   → IORef (Map TaskId Task)
-  → Evidence (Text, ExceptionWithContext SomeException)
+  → IORef [(Text, ExceptionWithContext SomeException)]
   → IORef (Maybe InstanceHost)
   → TaskRun Cursor
   → IO (SegmentReport Cursor)

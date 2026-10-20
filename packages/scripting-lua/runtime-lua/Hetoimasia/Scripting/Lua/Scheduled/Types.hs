@@ -24,12 +24,13 @@ module Hetoimasia.Scripting.Lua.Scheduled.Types
   , Cell (..)
   , Control (..)
   , Accounting (..)
+  , Cut (..)
   , newAccounting
   , watchAccounting
   , unwatchAccounting
-  , accountingFailed
-  , servicing
   , sealAccounting
+  , acknowledgeAccounting
+  , awaitAcknowledgement
   , accountingReady
   , endingBegun
   , endingAccounted
@@ -40,12 +41,12 @@ module Hetoimasia.Scripting.Lua.Scheduled.Types
   , settleAll
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', readTVar, retry, writeTVar)
-import Control.Exception (finally, mask)
+import Control.Concurrent.STM (STM, TVar, modifyTVar', readTVar, retry, writeTVar)
 import Control.DeepSeq (NFData (rnf))
 import Control.Monad (forM, when)
 import Data.Foldable (traverse_)
 import Data.Map.Strict (Map)
+import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -74,7 +75,6 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , TerminalResult (ResultCancelled, ResultCompleted, ResultFailed)
   , grantsAccepted
   , grantsFinished
-  , retainsEvidence
   , observeTask
   )
 import Hetoimasia.Scripting.Lua.Value (Value, ValueLimits)
@@ -247,28 +247,32 @@ data Control = Control
 -- wait the application thread has pending registers a watch, the owner's thread latches it
 -- at the end of the boundary that finished the watched grants, and the wait clears it as it
 -- ends, however it ends.
+--
+-- The wait never decides for itself that the owner has finished well. The owner's thread
+-- writes an acknowledgement, 'acknowledgeAccounting', as the last step of an iteration of
+-- its loop that has kept every failure it caught, found nothing held and nothing the
+-- providers have yet to hand it, and has not been asked to stop; an iteration that is cut
+-- short, by a failure kept or raised, writes none. The wait completes on an acknowledgement
+-- written after its cut was fixed, and on nothing else.
 data Accounting = Accounting
   { acWatch ∷ !(Maybe Word64)
     -- ^ The number of grants the pending wait captured: every grant numbered below it must
     -- have finished.
-  , acCut ∷ !(Maybe Word64)
-    -- ^ Written once for a watch: how many instance endings had begun when the boundary that
-    -- finished the watched grants ended, or, for a watch whose grants had finished at a boundary
-    -- that had already ended, when it was taken. Every ending numbered up to it is the wait's.
-  , acTainted ∷ !Bool
-    -- ^ Set, for good, by the owner when the owner holds cleanup evidence that will end it as a
-    -- failure (the failure of a close, a release, a settlement) at a point where it could have
-    -- accounted for an ending or sealed a boundary: from then on it is exiting, and the wait
-    -- neither completes nor ends until it has ended and supervision has handled the outcome.
-  , acBusy ∷ !Int
-    -- ^ How many of the owner's servicing steps are running: the instance layer's accounting, the
-    -- providers' and the leases' retirements and the disposals they owe, the controls the owner
-    -- applies. While one runs, the owner may have caught a cleanup failure it has not yet kept (the
-    -- first of several disposals has raised and the next waits), so the wait does not complete.
+  , acCut ∷ !(Maybe Cut)
+    -- ^ Written once for a watch, when the grants it captured have finished at a boundary that
+    -- has ended, or when it was taken if they had: which endings are its own, and the
+    -- acknowledgement it waits for.
   , acSealed ∷ !Word64
     -- ^ How many grants had finished when the owner's last boundary ended. Grants finish only
     -- inside a boundary, so a watch whose grants number no more than this is for a boundary
     -- that has ended already.
+  , acGeneration ∷ !Word64
+    -- ^ How many acknowledgements the owner has written. Never rewinds.
+  , acAckedOpen ∷ !Word64
+    -- ^ The number among the endings begun of the earliest one still open when the last
+    -- acknowledgement was written, or the largest number there is if none was: the endings
+    -- numbered below it were accounted for, and the owner had kept every failure that
+    -- accounting caused.
   , acBegun ∷ !Word64
     -- ^ How many instance endings have begun. Never rewinds.
   , acOpen ∷ !(Map Word64 Word64)
@@ -278,42 +282,38 @@ data Accounting = Accounting
     -- failed, the application's escalation has been called and has returned.
   }
 
+-- | Which endings a watch is for, and which acknowledgement it waits for.
+data Cut = Cut
+  { cutEndings ∷ !Word64
+    -- ^ How many endings had begun: every ending numbered up to it is the wait's.
+  , cutGeneration ∷ !Word64
+    -- ^ The first acknowledgement written after the cut was fixed.
+  }
+
 -- | An owner's accounting before anything has begun.
 newAccounting ∷ Accounting
-newAccounting = Accounting Nothing Nothing False 0 0 0 Map.empty
+newAccounting = Accounting Nothing Nothing 0 0 maxBound 0 Map.empty
 
 -- | Take the wait's snapshot: how many grants have been accepted, committed in this one
 -- transaction, and watch for them. Replaces any earlier watch, which the application's one
 -- wait at a time has already cleared.
 --
 -- If a boundary has ended since the last of those grants finished, the boundary the wait is
--- for is over, and the watch is latched at once: the endings that have begun are the wait's.
--- Otherwise the owner latches it when the boundary that finishes them ends.
+-- for is over, and the cut is fixed at once: the endings that have begun are the wait's, and
+-- it waits for the owner's next acknowledgement. Otherwise the owner fixes it when the boundary
+-- that finishes them ends.
 watchAccounting ∷ Control → STM ()
 watchAccounting control = do
   captured ← grantsAccepted (controlScheduler control)
   modifyTVar' (controlAccounting control) $ \accounting →
     accounting
       { acWatch = Just captured
-      , acCut = if acSealed accounting >= captured then Just (acBegun accounting) else Nothing
+      , acCut = if acSealed accounting >= captured then Just (cutOf accounting) else Nothing
       }
 
--- | The owner has caught a failure that will end it, one it raises only after it has settled
--- the others it was settling: from here the accounting is not a success, whichever ending
--- it accounts for next.
-accountingFailed ∷ Control → STM ()
-accountingFailed control =
-  modifyTVar' (controlAccounting control) (\accounting → accounting {acTainted = True})
-
--- | Run one of the owner's servicing steps, noting that it runs. Whatever such a step catches it keeps,
--- but not before it has run its other actions: a failure caught between two disposals is held by the
--- step alone, where nothing the wait can read shows it. So the wait does not complete while a step
--- runs, and a step that has caught a failure has kept it by the time it ends.
-servicing ∷ Control → IO a → IO a
-servicing control action =
-  mask $ \restore → do
-    atomically (modifyTVar' (controlAccounting control) (\accounting → accounting {acBusy = acBusy accounting + 1}))
-    restore action `finally` atomically (modifyTVar' (controlAccounting control) (\accounting → accounting {acBusy = acBusy accounting - 1}))
+-- | The cut now: the endings begun, and the next acknowledgement.
+cutOf ∷ Accounting → Cut
+cutOf accounting = Cut (acBegun accounting) (acGeneration accounting + 1)
 
 -- | Clear the watch, whether it was latched or not, as the wait ends.
 unwatchAccounting ∷ Control → STM ()
@@ -321,34 +321,46 @@ unwatchAccounting control =
   modifyTVar' (controlAccounting control) (\accounting → accounting {acWatch = Nothing, acCut = Nothing})
 
 -- | At the end of a boundary, on the owner's thread: note how many grants have finished and,
--- if that finishes every grant a watch captured, latch it, fixing which endings are its own:
--- those begun by now. Writes nothing when neither changed.
---
--- Cleanup evidence the owner holds ends it as a failure, so the accounting is not a success
--- from here on: the scheduler's own is read here, and the owner's other lists publish
--- 'accountingFailed' as each failure is kept ('Hetoimasia.Scripting.Lua.Cleanup').
+-- if that finishes every grant a watch captured, fix its cut. Writes nothing when neither
+-- changed.
 sealAccounting ∷ Control → STM ()
 sealAccounting control = do
   finished ← grantsFinished (controlScheduler control)
-  retained ← retainsEvidence (controlScheduler control)
   accounting ← readTVar (controlAccounting control)
-  let latched = case (acWatch accounting, acCut accounting) of
-        (Just captured, Nothing) | finished >= captured → Just (acBegun accounting)
+  let fixed = case (acWatch accounting, acCut accounting) of
+        (Just captured, Nothing) | finished >= captured → Just (cutOf accounting)
         _ → acCut accounting
-      tainted = acTainted accounting || retained
-  when (finished /= acSealed accounting || latched /= acCut accounting || tainted /= acTainted accounting) $
-    writeTVar (controlAccounting control) accounting {acSealed = finished, acCut = latched, acTainted = tainted}
+  when (finished /= acSealed accounting || isJust fixed /= isJust (acCut accounting)) $
+    writeTVar (controlAccounting control) accounting {acSealed = finished, acCut = fixed}
 
--- | Whether the latched watch's grants have finished, the boundary has ended, and every
--- ending it covers has been accounted for. Retries until then.
+-- | The acknowledgement: on the owner's thread, as the last step of an iteration of its loop that
+-- has kept every failure it caught and found nothing it holds. Records which endings were still open.
+acknowledgeAccounting ∷ Control → STM ()
+acknowledgeAccounting control =
+  modifyTVar' (controlAccounting control) $ \accounting →
+    accounting
+      { acGeneration = acGeneration accounting + 1
+      , acAckedOpen = if Map.null (acOpen accounting) then maxBound else minimum (Map.elems (acOpen accounting))
+      }
+
+-- | Retry until the owner has an acknowledgement to write for a watch whose cut is fixed. What
+-- the owner's thread waits for beside its other work: an idle owner has no iteration to end until
+-- it is woken, and the wait is for the one that follows.
+awaitAcknowledgement ∷ Control → STM ()
+awaitAcknowledgement control = do
+  accounting ← readTVar (controlAccounting control)
+  case (acWatch accounting, acCut accounting) of
+    (Just _, Just cut) | acGeneration accounting < cutGeneration cut → pure ()
+    _ → retry
+
+-- | Whether the owner has acknowledged, after the wait's cut was fixed, an accounting in which
+-- every ending the cut covers was accounted for. Retries until then.
 accountingReady ∷ Control → STM ()
 accountingReady control = do
   accounting ← readTVar (controlAccounting control)
-  when (acTainted accounting) retry
-  when (acBusy accounting > 0) retry
   case acCut accounting of
     Nothing → retry
-    Just cut → when (any (<= cut) (Map.elems (acOpen accounting))) retry
+    Just cut → when (acGeneration accounting < cutGeneration cut || acAckedOpen accounting <= cutEndings cut) retry
 
 -- | An instance's ending has begun. In the transaction that begins it.
 endingBegun ∷ Control → Word64 → STM ()
@@ -359,13 +371,8 @@ endingBegun control instance' =
 
 -- | An instance's ending has been accounted for.
 endingAccounted ∷ Control → Word64 → STM ()
-endingAccounted control instance' = do
-  retained ← retainsEvidence (controlScheduler control)
-  modifyTVar' (controlAccounting control) $ \accounting →
-    accounting
-      { acOpen = Map.delete instance' (acOpen accounting)
-      , acTainted = acTainted accounting || retained
-      }
+endingAccounted control instance' =
+  modifyTVar' (controlAccounting control) (\accounting → accounting {acOpen = Map.delete instance' (acOpen accounting)})
 
 -- | Where an owner's tasks are admitted. Any thread may hold and use it.
 newtype ScheduledEndpoint = ScheduledEndpoint Control

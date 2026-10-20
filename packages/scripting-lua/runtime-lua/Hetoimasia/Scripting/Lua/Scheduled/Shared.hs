@@ -39,7 +39,6 @@ import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailureLa
 import Hetoimasia.Foundation.Worker (awaitCompletion)
 import Hetoimasia.Runtime.Supervision (SupervisedWorker, supervisedWorker)
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero), durationFromNanoseconds, zeroDuration)
-import Hetoimasia.Scripting.Lua.Cleanup (Evidence, retainCleanup)
 import Hetoimasia.Scripting.Lua.Internal.Fault (raisedByApplication)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (TaskId)
 import Hetoimasia.Scripting.Lua.Owner
@@ -80,7 +79,7 @@ durationOf = \case
 -- The scheduler keeps a synchronous failure of the close, but an asynchronous
 -- exception that reaches it is raised unrecorded, and the coroutine is closed
 -- and forgotten by then: it is kept here, by task, before it goes on.
-closeSuspended ∷ OwnedVm → IORef (Map TaskId Task) → Evidence (TaskId, SomeException) → TaskId → IO ()
+closeSuspended ∷ OwnedVm → IORef (Map TaskId Task) → IORef [(TaskId, SomeException)] → TaskId → IO ()
 closeSuspended owned tasks kept identity = do
   held ← Map.lookup identity <$> readIORef tasks
   case held of
@@ -89,7 +88,7 @@ closeSuspended owned tasks kept identity = do
       modifyIORef' tasks (Map.delete identity)
       closeTask owned task `catch` \(failure ∷ SomeException) → do
         when (isJust (fromException failure ∷ Maybe SomeAsyncException)) $
-          retainCleanup kept [(identity, failure)]
+          modifyIORef' kept (<> [(identity, failure)])
         throwIO failure
 
 -- | Run one action of the VM, answering the fault of the task it raised, or
@@ -98,7 +97,7 @@ closeSuspended owned tasks kept identity = do
 -- A task's fault can be raised with the failures of closing its coroutine, which
 -- the script's own error did not stop: those are cleanup evidence, kept, and no
 -- part of the task's outcome.
-settledOrRaise ∷ Evidence (Text, ExceptionWithContext SomeException) → IO a → IO (Either CallFault a)
+settledOrRaise ∷ IORef [(Text, ExceptionWithContext SomeException)] → IO a → IO (Either CallFault a)
 settledOrRaise extra action = do
   ran ← tryWithContext @SomeException action
   case ran of
@@ -110,7 +109,7 @@ settledOrRaise extra action = do
       | otherwise → rethrowIO failure
   where
     retained context =
-      retainCleanup extra [(cleanupFailureLabel found, cleanupFailureException found) | found ← cleanupFailuresInContext context]
+      modifyIORef' extra (<> [(cleanupFailureLabel found, cleanupFailureException found) | found ← cleanupFailuresInContext context])
 
 -- | Wait until a supervised worker has ended, and answer what interrupted the wait on the way.
 --

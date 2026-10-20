@@ -37,15 +37,23 @@ spec = describe "cleanup evidence the owner retains" $ do
         owner ← startPlain fixture runtime "close owed" requiredPolicy defaultSchedulerBounds
         -- Both are admitted while the owner is held: the first is refused its wait and its closing handler
         -- raises, the second parks the owner at a gate.
-        let go = holdingSafely fixture owner $ do
-              void (admitTask' fixture owner "R" refusedClosing')
+        -- The first task holds the owner at a gate inside its segment, with the second queued behind it. The
+        -- wait is begun there, before the failure exists, and the next boundary end after it is the one that
+        -- follows the first task's refused wait and the failure of closing its coroutine: it must write no
+        -- acknowledgement, and the second task then holds the owner at its own gate.
+        let go begin = do
+              void (admitTask' fixture owner "R" (refusedClosing' "r"))
+              awaitEntered fixture "r"
               void (admitTask' fixture owner "B" (request "block_in" [VText "blk"] OrdinaryClass OneShot Nothing))
+              waiting ← begin
+              releaseGate fixture "r"
+              pure waiting
         pure (owner, go)
 
   describe "the owner's own" $ do
     it "does not complete while the cleanup failure that settling a task's fault retained is held" $ bounded $ do
       fixture ← newSFixture
-      retainedFailure fixture [] "y" $ \_ runtime → do
+      retainedFailure fixture [] "blk" $ \_ runtime → do
         owner <- startPlain fixture runtime "settled fault" requiredPolicy defaultSchedulerBounds
         let endpoint = scheduledEndpoint owner
         parked ← admitTask' fixture owner "Y" (closesGated "y")
@@ -59,7 +67,16 @@ spec = describe "cleanup evidence the owner retains" $ do
         requestTaskControl endpoint (ticketTask parked) RequestStop >>= \case
           TaskControlAccepted _ → pure ()
           other → fail ("expected the stop accepted, found " <> show other)
-        pure (owner, releaseGate fixture "obs")
+        -- A ready task is queued behind it, so that the owner is still serving, parked at its own gate, after
+        -- the boundary that closed the stopped task's coroutine.
+        void (admitTask' fixture owner "B" (request "block_in" [VText "blk"] OrdinaryClass OneShot Nothing))
+        let go begin = do
+              w ← begin
+              releaseGate fixture "obs"
+              awaitEntered fixture "y"
+              releaseGate fixture "y"
+              pure w
+        pure (owner, go)
 
     it "ends the wait with a lease's failed retirement" $ bounded $ do
       fixture ← newLFix 4
@@ -154,6 +171,27 @@ spec = describe "cleanup evidence the owner retains" $ do
         openGate told
         Request.finishWork fake 0
         Request.finishWork fake 1
+        pure waiting
+
+    it "does not complete while a provider is told, the only one failing, and the exception unwinds the owner's iteration" $ bounded $ do
+      fixture ← newIFixture
+      fake ← Request.newFake
+      told ← newGate
+      -- The one provider told holds the owner at a gate and then raises: nothing is kept for the batch
+      -- (it has no other failure), and the exception leaves the owner's loop and ends it.
+      Request.onCancel fake (\_ → passGate told >> throwIO (Broken "cancel"))
+      failingWait (sf fixture) [told] $ \control runtime → Request.providersFinish fake $ do
+        owner ← Request.startRequester fixture runtime "told alone" [Request.asker] Request.cmdConfig (Request.grantOf fake 4) requiredPolicy
+        Request.admitAsker fixture owner "i" "asker"
+        Request.command fixture owner "i" "start" "a"
+        Request.awaitLine fixture "cmd start a started"
+        _ ← advanceRequestEpoch (scheduledEndpoint owner)
+        awaitGateEntered told
+        waiting ← beginWait control owner
+        stabilize waiting
+        awaitPending waiting
+        openGate told
+        Request.finishWork fake 0
         pure waiting
 
     it "ends the wait with a request provider that raises when told its interest was withdrawn" $ bounded $ do

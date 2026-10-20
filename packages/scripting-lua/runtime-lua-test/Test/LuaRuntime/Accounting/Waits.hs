@@ -6,13 +6,11 @@
 -- Every example coordinates with gates and with threads parked in STM, never a sleep.
 module Test.LuaRuntime.Accounting.Waits (spec) where
 
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, tryReadMVar)
 import Control.Concurrent.STM (atomically, retry)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, fromException, throwIO, try)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), finally, throwIO)
 import Control.Monad (forM_, replicateM_, void, when)
 import Data.IORef (readIORef, writeIORef)
 import Data.Text (Text)
-import System.Timeout (Timeout)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Log (unsafeComponent)
 import Hetoimasia.Foundation.Worker (GroupStatus (..), Outstanding (..), OutstandingWorker (..))
@@ -267,8 +265,7 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
 
     it "does not complete while the scheduler holds the failure of a close, though nothing was sealed since and nothing is owed" $ bounded $ do
       fixture ← newSFixture
-      outcome ← newEmptyMVar
-      stalled ← try @SomeException . withBoundary $ \control runtime → releasing fixture [] $ do
+      retainedFailure fixture [] "blk" $ \_ runtime → do
         owner ← startPlain fixture runtime "retained" requiredPolicy defaultSchedulerBounds
         let endpoint = scheduledEndpoint owner
             stop ticket =
@@ -280,20 +277,18 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
         awaitDiagnostics owner (\counts → diagWaiting counts >= 2)
         -- Both stops are applied in one boundary, in the order they were asked: the first coroutine's
         -- closing handler raises, which the scheduler keeps, and the second waits at a gate. The owner
-        -- hosts no instance and has no grant: a wait begun now has nothing to wait for but the owner.
-        holdingSafely fixture owner (stop failing >> stop gated)
-        awaitEntered fixture "y"
-        waiting ← beginWait control owner
-        stabilize waiting
-        awaitPending waiting
-        releaseGate fixture "y"
-        resultOf waiting >>= putMVar outcome
-      case stalled of
-        Left raised | Just (_ ∷ Timeout) ← fromException raised → throwIO raised
-        _ → pure ()
-      tryReadMVar outcome >>= \case
-        Nothing → fail "the example recorded no outcome for the wait"
-        Just result → either (const (pure ())) (\answered → fail ("the wait answered " <> show answered)) result
+        -- hosts no instance and has no grant: the wait begun while it is held has nothing to wait for
+        -- but the owner's next acknowledgement, and the boundary that applies the stops must not write one.
+        -- A ready task is queued behind them, so that the owner is still serving, parked at its own gate,
+        -- after the boundary that applied the stops: only the owner's acknowledgement could answer the wait.
+        let go begin = do
+              waiting ← holdingSafely fixture owner $ do
+                void (admitTask' fixture owner "B" (request "block_in" [VText "blk"] OrdinaryClass OneShot Nothing))
+                stop failing >> stop gated >> begin
+              awaitEntered fixture "y"
+              releaseGate fixture "y"
+              pure waiting
+        pure (owner, go)
 
     it "rethrows a fatal failure that is already published when it is called, ahead of a completion that is ready" $ bounded $ do
       fixture ← newSFixture
