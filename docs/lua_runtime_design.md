@@ -3493,7 +3493,8 @@ and verified policy, with adversarial regression coverage.
   bounds so that live instances' invocations and the session's unobserved tasks both have active slots. The ledger gains
   *invalidated* and *discarded*; a stop (`stopSession`) ends admission and grants, settles the gameplay instances
   including `shutdown` and lease cleanup, waits for the accounting, then publishes one `Stopped` (or failed) snapshot; a
-  stop from another thread halts a tick in flight; cancellation cancels both owners instead of stopping them (each
+  stop asked for from another thread (`requestStop`, which waits for nothing) halts a tick in flight, and the application
+  thread finalizes it; a failure asks every instance and task to stop as soon as it is told; cancellation cancels both owners instead of stopping them (each
   exits cancelled when the cancellation reaches its thread before its stop check, which the examples hold with gates in
   the owner's observer). Each gameplay instance leases a workspace through the engine; a failing
   release is cleanup evidence that ends the owner fatally. The UI pauses and resumes the gameplay behavior through the
