@@ -5,9 +5,9 @@
 module Test.Domains.Leases (spec) where
 
 import Control.Concurrent.STM (atomically, modifyTVar', readTVarIO)
-import Control.Exception (SomeException, try)
+import Control.Exception (SomeException, displayException, try)
 import Control.Monad (void)
-import Data.Either (isLeft)
+import Data.List (isInfixOf)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Hetoimasia.Sample.LuaDomains
@@ -118,7 +118,8 @@ spec = describe "the gameplay workspace's leases" $ do
           (latest, _) ← snapshotNow domains
           writeIORef seen (Just (evidenceEnded (evidenceGameplay evidence), evidenceWorkspaces evidence, isFailed (snapStatus latest)))
       -- The release failure is the cleanup evidence that ended the owner: it is the supervised failure that propagates.
-      outcome `shouldSatisfy` isLeft
+      -- The failed release is what propagates, kept whole.
+      either displayException (const "returned") outcome `shouldSatisfy` isInfixOf "the release failed"
       found ← readIORef seen
       -- The worker ended; the failed release is counted apart from the released; and the session did not fail.
       fmap (\(ended, held, failed) → (ended, (workspacesAcquired held, workspacesReleased held, workspacesReleaseFailed held), failed)) found
