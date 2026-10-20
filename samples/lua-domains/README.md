@@ -142,11 +142,14 @@ The driver's `stepTick`:
    thread that created the session, which owns the supervision handle), one at a time: `stepTick` and `stopSession`
    refuse any other thread (`DriverOffApplicationThread`, `StopOffApplicationThread`), and another thread asks for a
    stop with `requestStop`, which waits for nothing, so a stop never waits beside the driver. The admissions of tasks
-   that are in flight are waited for next (a task the owner accepted runs, and can fault in the tick, before its
-   admitter has registered it), and then the faults of the tasks the session admitted are read, though each was told
-   when it happened, by the task's own watcher. Nothing stops another admission beginning after that, so the commit
-   (step 6) checks, in its own transaction, that none is in flight and none has begun since the tasks were read, and
-   the driver reads again if one has: admission is either excluded or detected from the first reading to the commit.
+   that are in flight are waited for first (a task the owner accepted runs, and can fault in the tick, before its
+   admitter has registered it), and the count of failures the scheduler has made is read in the same transaction (the
+   *baseline*), all before the accounting wait; after it the tasks are read, and the faults of those that have settled
+   are told, though each was told when it happened by the task's own watcher. Nothing stops a task faulting after that
+   reading, whatever its watcher has told, so the commit (step 6) checks, in its own transaction, that the scheduler has
+   counted no failure since the baseline (the count and the settlement are written in one transaction), and the driver
+   starts again, accounting and reading again, if it has: **a tick commits only if every task fault that can belong to it
+   has been told, or has not happened, when the commit is made.**
 5. **Decide.** A failure told of fails the session and commits nothing; a stop commits nothing; otherwise the
    tick commits only if its work **finished successfully**: gameplay called `staging.finish()` and the instance
    is active with nothing in flight and no update owed, or the engine says why there is no work (the behavior
