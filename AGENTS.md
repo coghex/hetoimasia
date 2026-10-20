@@ -197,27 +197,18 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
 
 ## Delivery and worktrees
 
-- Implement in isolated worktrees. Keep the primary checkout clean for Kanban
-  integration.
+The GitHub-project rules in the owner's global instructions apply. Specific to
+this repository:
+
 - Use the installed Kanban plugin skills for issue drafting, readiness review,
-  solving, PR review, and the user-selected merge workflow. Resolve the actual
-  target repository; never mistake `~/work/kanban` for this project's tracker.
-- Existing authorization carries across turns. Complete authorized local work
-  before asking for any additional decision needed to publish it.
-- Keep each issue's implementation and validation in its worktree and PR. Use
-  `Closes #N` when that PR completes the issue.
-- Documentation is tracked but never gated on CI or review: land it on
-  `master` with `docs-push [-m "message"] <paths...>` from any worktree,
-  including the docs, evidence write-ups and verdicts an issue requires. Link
-  them from the PR and finish them before its final review. Markdown that
-  tests or tools read (`MEMORY.md`, the Vulkan records) stays in the PR;
-  `docs-push` refuses it. See workflow.md.
-- Follow the selected Kanban workflow's claim and opposite-agent review gates.
-  A label alone is not proof of a fresh approval. Do not self-approve or merge
-  on your own initiative; the installed drainer or explicitly requested
-  supported merge workflow owns that action.
-- Preserve unrelated edits and interrupted work. Never reset or clean another
-  agent's worktree. Stop only processes you started and tracked.
+  solving, PR review and the merge workflow.
+- Complete authorized local work before asking for any further decision
+  needed to publish it.
+- Docs, evidence write-ups and verdicts an issue requires land with
+  `docs-push` and are linked from the pull request before its final review.
+  `MEMORY.md` and the Vulkan records are read by tests and tools, so they stay
+  in the pull request. See workflow.md.
+- Preserve unrelated edits and interrupted work.
 
 ## Files, launches, and documentation
 
