@@ -229,12 +229,19 @@ failure, which supervision reports as it always does, and the snapshot does not 
 What the session does, by design (D-26, D-27, P-7):
 
 * the instance's escalation callback records the failure in the session state and answers `Isolate`, so the
-  engine keeps the owner and its VM alive, running nothing;
+  engine keeps the owner and its VM alive, running nothing. It records the primary and, beside it, what else
+  failed while the instance ended (a `shutdown` that raised after an `update` did): each of those is counted and
+  kept as evidence and never replaces the primary. A failed *release* is cleanup evidence, fatal under supervision,
+  and is neither;
+* **admission closes in the same transaction that records the failure**, so no intention is accepted for a tick
+  that will never run after the failure, whenever the driver gets to publish it;
 * from the moment the driver knows of a failure it grants nothing more and commits nothing: **the driver learns
   of a failure in tick T before it decides T's commit**, on every ordering, which is what the fence of step 4
   enforces (a failure in the last segment, in the only segment, two failures, and a wait the scheduler refused
   in the final segment with a held `shutdown` are covered by examples that force each ordering with gates);
-* the driver publishes **one** snapshot for the failure: the last good world and committed tick, status
+* the driver publishes **one** snapshot for the failure. The publication is *taken* first: from that moment it is
+  the publisher's alone, and a stop, a second failure or a retirement that arrives meanwhile waits for it, so the
+  publisher is never closed under it: the last good world and committed tick, status
   `Failed` with the primary failure (who, which stage, which tick, which kind, a bounded message), the number
   of failures told of by then, and the **invalidated** intentions;
 * a failure that is told of later (a teardown, a `shutdown` that raises when the session is stopped) is
@@ -242,6 +249,14 @@ What the session does, by design (D-26, D-27, P-7):
   not republished.
 
 A failed `init` of the behavior is the same failure at tick 0: the initial world is published with it.
+
+**The commit condition.** Whether a tick that ran no work may commit is decided from evidence the application
+holds, not from the engine's counters: every gameplay module's `update` is wrapped (`gameplay_fence.lua`) so that
+`staging.began()` says, before the script's own code runs, that the update began in this tick. An update that began
+must have called `staging.finish()` to commit. A tick whose update never began commits only if the engine says
+why: the behavior is paused, was paused as the tick began (this is the tick that resumes it), or a control was
+applied at its boundary. A control is not proof that the update did not run: a request for the state it is
+already in changes nothing, and the update runs and must finish.
 
 ## The ledger on every path
 
@@ -279,11 +294,18 @@ reports how the owners ended). It:
 4. publishes one last snapshot: `Stopped` with the intentions the stop discarded; or, if `shutdown` raised
    and nothing failed before, the failure (the world is the last committed one: frozen); a session that had
    already failed keeps the failure as its status, and nothing is published for the stop;
-5. lets the UI owner read the receipts of the controls it asked for (while the UI serves), closes the
-   publication and retires both owners, the UI first.
+5. lets the UI owner read the receipts of the controls it asked for and, as the executable is configured
+   (`configUiSeesEnd`), see the status that ends the session, both while the UI serves; then closes the
+   publication and retires both owners, the UI first. The UI therefore notes `failed` (or `stopped`) with the last
+   good tick, and the report says so.
 
 A stop from another thread while a tick is in flight halts that tick (`TickHalted`): the tick commits
 nothing, and the driver is told so, not left with a defect.
+
+**A finite session that ran its last tick** settles the same way before its publication closes (it asks the
+gameplay instances to stop and waits for their `shutdown` and lease release, then runs the fence): a `shutdown` that
+raises is a session failure and is published, after the last tick, with the world frozen at it, and the status and
+the exit status say so. When nothing failed, nothing more is published: the last tick's snapshot stands.
 
 **Cancellation** of the enclosing scope retires both owners by cancelling them, not by stopping them: each exits
 cancelled (the library records either `ExitCancelled` or `ExitStopped`, since the cancellation also trips the
@@ -317,7 +339,10 @@ the next tick that has not begun and a place in it (`assignControl`), the engine
 boundary, and the UI is answered with the engine's own reasons:
 
 * a request is *accepted* (for that tick) or refused at once (`unassigned` when the session has failed, is
-  stopping or is closed; `unknown_target` before gameplay's identity is known);
+  stopping or is closed, or the UI already holds `boundPendingControls`, four, unread receipts;
+  `unknown_target` before gameplay's identity is known). The engine holds a reservation for each accepted
+  control until its receipt is read; the owner has the pending bound's worth and one more for each instance
+  the stop must reach, so the stop is admitted whatever the UI holds;
 * an accepted request settles *applied*, *already in that state* (a pause of a paused behavior: both are
   accepted, in order, in one tick), or *no longer applicable* (the instance ended, or the session did, before
   its tick);
@@ -418,7 +443,7 @@ status: failed at tick 6: gameplay active update, script error: gameplay@1:33: s
 intentions answered: accepted 40, full 16 (queue 0, places 16), closed 0, refused 0, malformed 0
 intentions settled: applied 24, stale 4, invalidated 12, discarded 0
 controls: offered 0, accepted 0, refused 0, applied 0, already 0, no longer applicable 0, abandoned 0
-ui: updates 14, busy 16, retried 16, saw running, no failure
+ui: updates 15, busy 16, retried 14, saw running,failed, no failure
 cleanup: ui ended (status stopped, exit ExitStopped, not started 0, in flight 0); gameplay ended (status stopped, exit ExitStopped, not started 0, in flight 0)
 cleanup: gameplay failed [shutdown ShutdownAbsent, leases drained 1 failed 0]; interface stopped [shutdown ShutdownAbsent, leases drained 0 failed 0]
 cleanup: workspaces acquired 1, released 1, release failed 0; publication closed; pending 0; failures told of 1, after publication 0
