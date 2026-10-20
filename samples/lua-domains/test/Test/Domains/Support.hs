@@ -15,6 +15,8 @@ module Test.Domains.Support
   , FakeUi
   , newFakeUi
   , tickUi
+  , uiStep
+  , liveRegistrations
   , liveCount
   , uiIntervalNanoseconds
     -- * The test-only namespace
@@ -353,3 +355,10 @@ failedEvidence snapshot = case snapStatus snapshot of
 -- | Block, in STM, until admission to the queue has closed: a stop, a failure or a retirement has begun.
 awaitClosed ∷ Domains → STM ()
 awaitClosed domains = isClosed (sharedQueue (domainsShared domains)) >>= \closed → when (not closed) retry
+
+-- | Let the UI do its next update and wait until it has completed.
+uiStep ∷ Domains → FakeUi → IO ()
+uiStep domains ui = do
+  done ← updatesNow domains
+  tickUi domains ui
+  awaitUpdates domains (done + 1)

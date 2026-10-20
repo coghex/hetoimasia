@@ -7,6 +7,7 @@ import qualified Test.Domains.Barrier
 import qualified Test.Domains.Command
 import qualified Test.Domains.Conservation
 import qualified Test.Domains.Dependencies
+import qualified Test.Domains.Controls
 import qualified Test.Domains.Exposure
 import qualified Test.Domains.Failure
 import qualified Test.Domains.Intentions
@@ -33,6 +34,7 @@ spec = describe "the two-domain Lua sample" $ do
   Test.Domains.Exposure.spec
   Test.Domains.Staging.spec
   Test.Domains.Intentions.spec
+  Test.Domains.Controls.spec
   Test.Domains.Failure.spec
   Test.Domains.Ledger.spec
   Test.Domains.Leases.spec

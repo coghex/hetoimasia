@@ -109,6 +109,7 @@ test-suite lua-domains-tests
         Test.Domains.Command
         Test.Domains.Conservation
         Test.Domains.Dependencies
+        Test.Domains.Controls
         Test.Domains.Exposure
         Test.Domains.Failure
         Test.Domains.Intentions
