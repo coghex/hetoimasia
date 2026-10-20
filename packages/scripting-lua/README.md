@@ -1570,7 +1570,10 @@ the step stands.
 Composed with `awaitSupervised` it is how an application observes tick completion without
 blocking a thread of its own; `grantComplete` and `stepsOutstanding` read the same state
 without waiting. A task that is paused when its grant is applied does not hold the grant:
-it is not ready or running.
+it is not ready or running. That is the scheduler's progress, and all `awaitStepsComplete`
+promises: it does not say that the owner has accounted for an instance ending the work
+caused (`shutdown`, the drain of what the instance held, a retirement a provider still owes,
+its settlement, the application's escalation), which `awaitScheduledAccounting` waits for.
 
 ### Elapsed time
 
@@ -1763,10 +1766,13 @@ engine keeps no other history of terminal results: the retained cells are bounde
 reservations.
 
 A wait is refused from inside a Lua callback, scheduled-owner creation, `waitTask`,
-`awaitTask`, `waitControl`, `awaitControl` and `awaitTicksComplete` included, with
-`CallbackWaitRefused`, and so is an action built outside the callback; a task waits by
-yielding. `awaitTicksComplete` ends with `TickOwnerEnded`, never a false completion, when
-the owner exits with a tick outstanding.
+`awaitTask`, `waitControl`, `awaitControl`, `awaitTicksComplete` and
+`awaitScheduledAccounting` included, with `CallbackWaitRefused`, and so is an action built
+outside the callback; a task waits by yielding. `awaitTicksComplete` ends with
+`TickOwnerEnded`, never a false completion, when the owner exits with a tick outstanding. It
+returns when every accepted grant has been applied and every task it woke has stopped being
+ready or running, which is the scheduler's progress and not the owner's accounting of what
+that work caused.
 
 ### Time, control and what a script is told
 
@@ -1780,6 +1786,60 @@ that ended earned (the tick reached and the granted duration, or the elapsed tim
 to the application on the owner's thread, before the segment that follows
 (`scheduledObserve`); a binding that should answer a script's question about its tick keeps
 what it was told where it reads it.
+
+### Waiting for the owner's accounting
+
+`awaitScheduledAccounting` (LUA-31, D-47) is the supervised wait for the owner's accounting
+of the grants it has accepted: it returns `AccountingComplete` once the owner has finished
+those grants, has ended the boundary at which the last of them was found finished, and every
+instance ending begun by the end of that boundary has run its `shutdown` (or had it skipped),
+released and drained what it held, completed every retirement a provider owes it, settled and,
+for a failure, had `instanceEscalate` called **and returned**. An application decides a tick's
+commit, or a stop's outcome, on it: `awaitTicksComplete` can return while any of those still
+lies ahead on the owner's thread.
+
+- *Who may call it.* It is a supervised wait like every other, composed with
+  `awaitSupervised` and called on the application thread that owns the `RuntimeControl`
+  (`docs/supervision.md`: the control is owned by the application thread, the drain status
+  its one read-only exception), so one wait is pending at a time. Pending worker outcomes are
+  handled first, and a latched fatal failure is rethrown by the wait and wins over a ready
+  completion. It is refused from a Lua callback. It must not be called from the owner's own
+  thread, an escalation callback say, where it would wait for its own return.
+- *What it captures.* One committed snapshot of the owner's grant accounting, taken once
+  when the wait begins and kept across the retries of the wait and across supervision's
+  handling of outcomes, never taken again: every grant whose `grantScheduledStep` had
+  committed before it, and concurrent grant calls are ordered by it. It does not wait for a
+  grant accepted after the snapshot to be applied or finished, nor for a boundary after the
+  captured grants' final one.
+- *Where its ending cutoff lies.* At the end of that final boundary, not at the snapshot:
+  every ending begun by then is covered whatever began it (a failed hook, a refused wait, a
+  faulted invocation, a delivery failure, a stop, a one-shot completing, an instance stopping
+  itself, and a grant accepted after the snapshot that was applied in that same boundary,
+  which can fail a task by overflowing a logical wait's accumulated duration), and nothing
+  begun in a later boundary is. With no grant outstanding, or none ever accepted, it covers
+  the endings already begun, and it works for an owner that hosts no instances. It does not
+  wait for healthy instances' future ticks, for idle peers, or for an ordinary task's fault,
+  which stays a ticket result the application consumes.
+- *What can delay it.* The owner has one thread and nothing is preempted, so later work can
+  still delay an earlier wait: a later grant entering a blocking callback while an earlier
+  ending is parked awaiting retirement holds the thread the ending needs to settle. A
+  retirement a provider owes holds the wait for as long as it holds the instance's stop
+  completion; there is no timeout. Returning is evidence about the owner's accounting. It
+  is not permission to advance or to commit a tick that failed.
+- *What it costs the owner.* No task, control or result slot, no ticket and no per-wait state:
+  the owner keeps a watch and a count of the endings it has begun and not yet accounted for,
+  bounded by the instances' own bound, whatever number of waits were made, and the wait works
+  with every one of the scheduler's bounds exhausted. Cancelling a pending wait, while it is
+  parked or while supervision handles an outcome, abandons only that wait. A wait changes
+  nothing the owner does.
+- *When its owner ends.* An owner that exits, is stopped, cancelled or fails ends the wait
+  with `AccountingOwnerEnded` once it has ended and supervision has handled the outcome
+  without latching a fatal failure, and never with `AccountingComplete` unless the accounting
+  was complete before the owner began to exit. An owner that is exiting but has not ended (a
+  stop waiting for a provider's retirement) neither completes the wait nor ends it. An
+  `Escalate` answer, an escalation callback that raises and a failed retirement end the owner
+  as a failure, and the wait follows the severity supervision gives that outcome: rethrown if
+  it is fatal, `AccountingOwnerEnded` if it is tolerated.
 
 ### Idle
 
@@ -1912,7 +1972,13 @@ one-shot placement, grants, elapsed waits, budgets and control end to end; creat
 readiness and identity across cycles; every outcome, every bound, a thousand admissions
 racing control requests and a stop, and a ticket's reservation; idle and stop, with
 closing errors retained; host failures, failure and cancellation; the refused waits and tick
-completion; repeated runs of one workload under different delays and budgets; and the
+completion; repeated runs of one workload under different delays and budgets; the
+accounting wait (`Test.LuaRuntime.Accounting.*`), each window it waits through on its own
+(a close the owner runs at a boundary, a refused wait's close, a `shutdown`, a retirement a
+provider completes later, the escalation callback and its return), the final boundary of the
+captured grants and an ending a later grant caused in it, prefix isolation and a snapshot kept
+across supervision's handling of an outcome, every bound exhausted, cancellation, and the
+owner's end in each way; and the
 lent collection (`Test.LuaRuntime.Scheduled.Lending`): members acquired, borrowed and
 retired during a callback and in a later one, the bound and a lower limit refused, a loan
 kept past its callback, used from a thread the callback started and presented from another
