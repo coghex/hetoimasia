@@ -8,10 +8,10 @@ module Test.Domains.Accounting (spec) where
 import Control.Concurrent (forkIO, killThread, myThreadId, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, tryReadMVar)
 import Control.Concurrent.STM (readTVar, readTVarIO, retry)
-import Control.Exception (SomeException, fromException, throwIO, try)
+import Control.Exception (SomeException, finally, fromException, throwIO, try)
 import Control.Monad (forM, forM_, replicateM_, void, when)
 import Data.ByteString (ByteString)
-import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (sort)
 import Data.Maybe (isNothing)
 import qualified Data.Set as Set
@@ -455,6 +455,51 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
                   void (generous (stopSession domains))
               (snapshot, _) ← snapshotNow domains
               (snapTick snapshot, snapStatus snapshot) `shouldBe` (0, Stopped)
+
+  describe "the publication of a failure" $
+    it "waits for a surviving instance's shutdown, which the failure asked for, to have ended: nothing is published while it is held, and then the failure is" $ do
+      fx ← newFx
+      ui ← newFakeUi
+      withBoundary $ \control →
+        withDomains
+          control
+          (withWait (sampleConfig fx ui))
+            { configInput = []
+            , configGameplaySource = gameplayWith ["function update(self, dt) error('update failed') end"]
+            , configGameplayInstances = [peer "peer"]
+            , configGameplayModules = [extraModule ["function run(self) sched.wait_ticks(1000000) end", "function shutdown(self, reason) fx.hold('peer shutdown') fx.record('peer shut down') end"]]
+            }
+          $ \domains → withReleased fx ["peer shutdown"] $ do
+            collect ← spawn (stepTick domains)
+            awaitEntered fx "peer shutdown"
+            replicateM_ 2000 yield
+            revisionNow domains `shouldReturn` 0
+            releaseGate fx "peer shutdown"
+            _ ← collect >>= expectFailed
+            revisionNow domains `shouldReturn` 1
+            fxLines fx >>= (`shouldSatisfy` elem "peer shut down")
+
+  describe "the publication of a failure told at the start" $
+    it "waits for a surviving instance's shutdown too: a failed init publishes nothing until the peer, which the failure asked to stop, has shut down" $ do
+      fx ← newFx
+      ui ← newFakeUi
+      seen ← newIORef Nothing
+      let claimed point = when (point == BeforeClaim) (fxLines fx >>= writeIORef seen . Just)
+      -- The creation of the session publishes the failure, so what releases the peer's shutdown is another thread's.
+      releaser ← spawn (awaitEntered fx "peer shutdown" >> replicateM_ 2000 yield >> releaseGate fx "peer shutdown")
+      withBoundary $ \control →
+        withDomains
+          control
+          (withWait (sampleConfig fx ui))
+            { configInput = []
+            , configGameplaySource = gameplayWith ["function init(self, api) error('init failed') end", "function update(self, dt) staging.finish() end"]
+            , configGameplayInstances = [peer "peer"]
+            , configGameplayModules = [extraModule ["function run(self) sched.wait_ticks(1000000) end", "function shutdown(self, reason) fx.hold('peer shutdown') fx.record('peer shut down') end"]]
+            , configPublishHook = claimed
+            }
+          (\_ → releaser)
+        `finally` releaseGate fx "peer shutdown"
+      readIORef seen >>= (`shouldSatisfy` maybe False (elem "peer shut down"))
 
   describe "a failed session" $
     it "has stopped every surviving instance before its failure is published, one with work still to run among them: each is settled and its shutdown has run, and the owner stays alive" $ do
