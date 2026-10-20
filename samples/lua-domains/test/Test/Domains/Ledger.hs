@@ -24,6 +24,7 @@ import Hetoimasia.Sample.LuaDomains
   , retireDomains
   , runSession
   , stepTick
+  , requestStop
   , stopSession
   )
 import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCounts), submit)
@@ -133,13 +134,14 @@ spec = describe "the ledger of intentions on every path" $ do
         collect ← spawn (stepTick domains)
         awaitEntered fx "held"
         open ← mapM (offer domains) [2, 3]
-        stopped ← spawn (stopSession domains)
-        -- The stop has begun when admission has closed; the segment is not preempted, so it has not finished.
+        -- The stop is asked for from this thread and finalized on the application thread: the segment is not
+        -- preempted, so the stop has begun when admission has closed and it has not finished.
+        requestStop domains
         waitFor (awaitClosed domains)
         revisionNow domains `shouldReturn` 0
         releaseGate fx "held"
-        _ ← stopped
         collect >>= (`shouldSatisfy` isHalted)
+        _ ← stopSession domains
         (snapshot, revision) ← snapshotNow domains
         (revision, snapTick snapshot, snapStatus snapshot) `shouldBe` (1, 0, Stopped)
         dispDiscarded (snapDispositions snapshot) `shouldBe` placementsOf (sealed <> open)

@@ -5,18 +5,21 @@
 -- with a gate; and a failed session is quiescent before its failure is published.
 module Test.Domains.Accounting (spec) where
 
-import Control.Concurrent (forkIO, killThread, yield)
+import Control.Concurrent (forkIO, killThread, myThreadId, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
-import Control.Concurrent.STM (readTVarIO, retry)
-import Control.Exception (SomeException, throwIO, try)
+import Control.Concurrent.STM (readTVar, readTVarIO, retry)
+import Control.Exception (SomeException, fromException, throwIO, try)
 import Control.Monad (forM, forM_, replicateM_, void, when)
 import Data.ByteString (ByteString)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.List (sort)
+import Data.Maybe (isNothing)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import Hetoimasia.Sample.LuaDomains
   ( Bounds (boundSessionTasks)
   , Domains (domainsGameplay, domainsShared)
+  , DomainsDefect (StopOffApplicationThread)
   , DomainsConfig (..)
   , Evidence (evidenceGameplay)
   , Extension (Extension)
@@ -32,6 +35,7 @@ import Hetoimasia.Sample.LuaDomains
   , admitGameplayTask
   , cleanupEvidence
   , defaultBounds
+  , requestStop
   , stepTick
   , stopSession
   , withDomains
@@ -39,11 +43,11 @@ import Hetoimasia.Sample.LuaDomains
 import Hetoimasia.Sample.LuaDomains.Bounds (maxSessionTasks)
 import Hetoimasia.Sample.LuaDomains.Scripts (moduleSource)
 import Hetoimasia.Sample.LuaDomains.Session (SessionState (sessionFailureCount))
-import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCommitted, sharedSession, sharedStopsIssued, sharedTaskAdmitting, sharedTaskHeld, sharedWaitDepth))
+import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCommitted, sharedSession, sharedStopsIssued, sharedTaskAdmitting, sharedWaitDepth, sharedWaitThreads))
 import Hetoimasia.Sample.LuaDomains.Snapshot (FailureEvidence (..), SessionFailure (..))
 import Hetoimasia.Scripting.Lua.Instance (InstanceKind (RunOnce), InstanceRequest (..))
 import Hetoimasia.Scripting.Lua.Owner (EntryPoint (EntryPoint), ModuleRef (ModuleRef), ModuleSource, Requirement (Required))
-import Hetoimasia.Scripting.Lua.Registration (WaitKind (WaitLogical), namespace, waitOperation)
+import Hetoimasia.Scripting.Lua.Registration (WaitKind (WaitLogical), namespace, waitOperation, yieldOperation)
 import Hetoimasia.Scripting.Lua.Scheduled
   ( ServiceClass (OrdinaryClass)
   , TaskAdmission (TaskAccepted, TaskAdmissionClosed)
@@ -68,7 +72,7 @@ expectFailed = \case
 
 -- | The scheduler's wait operation in the gameplay VM, for the instances and tasks that wait for ticks.
 withWait ∷ DomainsConfig → DomainsConfig
-withWait config = config {configExtensions = \shared → configExtensions config shared <> [Extension (namespace "sched" [waitOperation "wait_ticks" WaitLogical [SInteger]]) InGameplay []]}
+withWait config = config {configExtensions = \shared → configExtensions config shared <> [Extension (namespace "sched" [waitOperation "wait_ticks" WaitLogical [SInteger], yieldOperation "yield"]) InGameplay []]}
 
 gameplayWith ∷ [Text] → ByteString
 gameplayWith = luaLines
@@ -89,10 +93,10 @@ accepted = \case
   _ → False
 
 taskEntries ∷ [EntryPoint]
-taskEntries = [EntryPoint "task_runs" Required [] [], EntryPoint "task_fails" Required [] []]
+taskEntries = [EntryPoint "task_runs" Required [] [], EntryPoint "task_fails" Required [] [], EntryPoint "task_waits" Required [] []]
 
 taskFunctions ∷ [Text]
-taskFunctions = ["function task_runs() fx.record('task ran') end", "function task_fails() error('task failed') end"]
+taskFunctions = ["function task_runs() fx.record('task ran') end", "function task_fails() error('task failed') end", "function task_waits() sched.wait_ticks(1000000) end"]
 
 spec ∷ Spec
 spec = describe "the owner's accounting, and what the sample's own bookkeeping survives" $ do
@@ -138,18 +142,33 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
             , configEscalateHook = holdAt fx "escalating"
             }
           $ \domains → withReleased fx ["escalating"] $ do
-            stop ← spawn (stopSession domains)
-            awaitEntered fx "escalating"
-            replicateM_ 2000 yield
-            revisionNow domains `shouldReturn` 0
-            releaseGate fx "escalating"
-            _ ← stop
+            _ ← alongside (awaitEntered fx "escalating" >> replicateM_ 2000 yield >> (revisionNow domains `shouldReturn` 0) >> releaseGate fx "escalating") (stopSession domains)
             (snapshot, revision) ← snapshotNow domains
             revision `shouldBe` 1
             fmap (failStage . evidencePrimary) (failedEvidence snapshot) `shouldBe` Just "shutdown"
 
-  describe "the supervised waits the sample makes" $
-    it "are made one at a time: a stop that comes while the driver's accounting wait is pending waits its turn" $ do
+  describe "the supervised waits the sample makes" $ do
+    it "are made on the application thread, one at a time: a stop requested while the driver's accounting wait is pending waits for no wait of its own" $ do
+      fx ← newFx
+      ui ← newFakeUi
+      withBoundary $ \control →
+        withDomains
+          control
+          (sampleConfig fx ui)
+            { configInput = []
+            , configGameplaySource = gameplayWith ["function update(self, dt) error('update failed') end"]
+            , configEscalateHook = holdAt fx "escalating"
+            }
+          $ \domains → withReleased fx ["escalating"] $ do
+            home ← myThreadId
+            -- The driver is the application thread's; the stop is asked for from another, which waits for nothing.
+            _ ← alongside (awaitEntered fx "escalating" >> requestStop domains >> waitFor (awaitClosed domains) >> replicateM_ 2000 yield >> releaseGate fx "escalating") (stepTick domains)
+            _ ← stopSession domains
+            (_, most) ← readTVarIO (sharedWaitDepth (domainsShared domains))
+            most `shouldBe` 1
+            readTVarIO (sharedWaitThreads (domainsShared domains)) `shouldReturn` Set.singleton home
+
+    it "are taken in turn when the driver runs on a thread of its own: the stop's wait does not begin beside the driver's" $ do
       fx ← newFx
       ui ← newFakeUi
       withBoundary $ \control →
@@ -163,18 +182,24 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
           $ \domains → withReleased fx ["escalating"] $ do
             collect ← spawn (stepTick domains)
             awaitEntered fx "escalating"
-            stop ← spawn (stopSession domains)
-            waitFor (awaitClosed domains)
-            replicateM_ 2000 yield
-            releaseGate fx "escalating"
+            _ ← alongside (waitFor (awaitClosed domains) >> replicateM_ 2000 yield >> releaseGate fx "escalating") (stopSession domains)
             _ ← collect
-            _ ← stop
             (_, most) ← readTVarIO (sharedWaitDepth (domainsShared domains))
             most `shouldBe` 1
 
+    it "are refused to a stop from another thread, which asks through requestStop and finalizes nothing" $
+      withSample (\config → config {configInput = []}) $ \_ _ domains → do
+        outcome ← spawn (stopSession domains)
+        try @SomeException outcome >>= (`shouldSatisfy` \case Left failure → fromException failure == Just StopOffApplicationThread; Right _ → False)
+        requestStop domains
+        revisionNow domains `shouldReturn` 0
+        _ ← stopSession domains
+        (snapshot, revision) ← snapshotNow domains
+        (revision, snapStatus snapshot) `shouldBe` (1, Stopped)
+
   describe "the gameplay owner's capacity" $
     forM_ [1, boundSessionTasks defaultBounds, maxSessionTasks] $ \limit →
-      it ("leaves the update a slot with " <> show limit <> " unobserved tasks held and every instance live and suspended: the tick reaches its commit decision, and a stop completes") $ do
+      it ("leaves the update a slot with " <> show limit <> " suspended tasks held and every instance live and suspended: the tick reaches its commit decision, and a stop completes") $ do
         let peers = [peer "peer one", peer "peer two", peer "peer three"]
         withSample
           ( \config →
@@ -188,9 +213,9 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
                 }
           )
           $ \_ _ domains → do
-            admitted ← forM [1 .. limit] $ \_ → admitGameplayTask domains (task "task" "task_runs")
+            admitted ← forM [1 .. limit] $ \_ → admitGameplayTask domains (task "waiting task" "task_waits")
             map accepted admitted `shouldBe` replicate limit True
-            -- Every task is unobserved and holds its slot, every peer is suspended in its run and holds one, and the
+            -- Every task is suspended and holds its slot, every peer is suspended in its run and holds one, and the
             -- behavior's update is due: the owner has a slot for each.
             stepTick domains >>= (`shouldSatisfy` \case TickCommitted _ → True; _ → False)
             void (stopSession domains)
@@ -199,7 +224,7 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
 
   describe "the gameplay owner's capacity at a stop" $
     forM_ [1, boundSessionTasks defaultBounds, maxSessionTasks] $ \limit →
-      it ("leaves every instance's shutdown a slot with " <> show limit <> " tasks unobserved: a stop with no tick between completes, and settles the tasks") $
+      it ("leaves every instance's shutdown a slot with " <> show limit <> " suspended tasks held: a stop with no tick between completes, and settles the tasks") $
         withSample
           ( \config →
               (withWait config)
@@ -212,11 +237,11 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
                 }
           )
           $ \fx _ domains → do
-            admitted ← forM [1 .. limit] $ \_ → admitGameplayTask domains (task "task" "task_runs")
+            admitted ← forM [1 .. limit] $ \_ → admitGameplayTask domains (task "waiting task" "task_waits")
             map accepted admitted `shouldBe` replicate limit True
-            void (spawn (stopSession domains) >>= id)
+            stopBounded domains
             fxLines fx >>= \recorded → (length (filter (== "peer shutdown") recorded), length (filter (== "gameplay shutdown") recorded)) `shouldBe` (3, 1)
-            readTVarIO (sharedTaskHeld (domainsShared domains)) `shouldReturn` 0
+            heldTasks domains `shouldReturn` 0
             (snapshot, _) ← snapshotNow domains
             snapStatus snapshot `shouldBe` Stopped
 
@@ -240,45 +265,49 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
             awaitEntered fx "before the owner"
             killThread admitter
             _ ← generous (readMVar ended)
-            readTVarIO (sharedTaskHeld shared) `shouldReturn` 0
+            heldTasks domains `shouldReturn` 0
             readTVarIO (sharedTaskAdmitting shared) `shouldReturn` 0
             releaseGate fx "before the owner"
             admitGameplayTask domains (task "next" "task_runs") >>= (`shouldSatisfy` accepted)
-            readTVarIO (sharedTaskHeld shared) `shouldReturn` 1
-            void (spawn (stopSession domains) >>= id)
-            readTVarIO (sharedTaskHeld shared) `shouldReturn` 0
+            heldTasks domains `shouldReturn` 1
+            stopBounded domains
+            heldTasks domains `shouldReturn` 0
             (snapshot, _) ← snapshotNow domains
             snapStatus snapshot `shouldBe` Stopped
 
-    it "after the owner accepted the task leaves it tracked and counted: a stop settles it, its fault is told once, and no reservation is lost" $ do
-      fx ← newFx
-      ui ← newFakeUi
-      withBoundary $ \control →
-        withDomains
-          control
-          (withWait (sampleConfig fx ui))
-            { configInput = []
-            , configGameplaySource = gameplayWith ("function update(self, dt) staging.finish() end" : taskFunctions)
-            , configGameplayEntries = taskEntries
-            , configHandoffHook = holdAt fx "accepted"
-            }
-          $ \domains → withReleased fx ["accepted"] $ do
-            let shared = domainsShared domains
-            ended ← newEmptyMVar
-            admitter ← forkIO (try @SomeException (admitGameplayTask domains (task "faulting task" "task_fails")) >>= putMVar ended)
-            awaitEntered fx "accepted"
-            killThread admitter
-            _ ← generous (readMVar ended)
-            -- The owner accepted it and the session tracks it, though the admitter never returned.
-            readTVarIO (sharedTaskHeld shared) `shouldReturn` 1
-            readTVarIO (sharedTaskAdmitting shared) `shouldReturn` 0
-            releaseGate fx "accepted"
-            void (spawn (stopSession domains) >>= id)
-            sessionFailureCount <$> readTVarIO (sharedSession shared) >>= (`shouldBe` 1)
-            readTVarIO (sharedTaskHeld shared) `shouldReturn` 0
-            (snapshot, _) ← snapshotNow domains
-            fmap (failWho . evidencePrimary) (failedEvidence snapshot) `shouldBe` Just "faulting task"
-            admitGameplayTask domains (task "late" "task_runs") >>= (`shouldSatisfy` \case TaskAdmissionClosed → True; _ → False)
+    forM_ [("a suspended task", "task_waits", False), ("a task that faults", "task_fails", True)] $ \(label, entry, faults) →
+      it ("after the owner accepted " <> label <> " leaves it tracked and counted: it is held until it settles, a fault is told once, a stop settles the rest, and no reservation is lost") $ do
+        fx ← newFx
+        ui ← newFakeUi
+        withBoundary $ \control →
+          withDomains
+            control
+            (withWait (sampleConfig fx ui))
+              { configInput = []
+              , configGameplaySource = gameplayWith ("function update(self, dt) staging.finish() end" : taskFunctions)
+              , configGameplayEntries = taskEntries
+              , configHandoffHook = holdAt fx "accepted"
+              }
+            $ \domains → withReleased fx ["accepted"] $ do
+              let shared = domainsShared domains
+              ended ← newEmptyMVar
+              admitter ← forkIO (try @SomeException (admitGameplayTask domains (task "cancelled task" entry)) >>= putMVar ended)
+              awaitEntered fx "accepted"
+              killThread admitter
+              _ ← generous (readMVar ended)
+              readTVarIO (sharedTaskAdmitting shared) `shouldReturn` 0
+              if faults
+                then -- The owner accepted it and the session tracks it, though the admitter never returned: its watcher tells
+                  -- the fault, which nothing else would if the task were not tracked.
+                  waitFor (readTVar (sharedSession shared) >>= \state → when (sessionFailureCount state < 1) retry)
+                else heldTasks domains `shouldReturn` 1
+              releaseGate fx "accepted"
+              stopBounded domains
+              sessionFailureCount <$> readTVarIO (sharedSession shared) >>= (`shouldBe` (if faults then 1 else 0))
+              heldTasks domains `shouldReturn` 0
+              (snapshot, _) ← snapshotNow domains
+              snapStatus snapshot `shouldSatisfy` \case Failed _ → faults; Stopped → not faults; _ → False
+              admitGameplayTask domains (task "late" "task_runs") >>= (`shouldSatisfy` \case TaskAdmissionClosed → True; _ → False)
 
   describe "a stop cancelled" $
     forM_ [("after its intent is recorded and before it has asked any instance", StopIntended, []), ("after it asked the first instance to stop", StopIssued 0, [0])] $ \(label, point, issued) →
@@ -300,15 +329,13 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
               , configStopHook = hook
               }
             $ \domains → withReleased fx ["stop held"] $ do
-              ended ← newEmptyMVar
-              first ← forkIO (try @SomeException (stopSession domains) >>= putMVar ended)
-              awaitEntered fx "stop held"
-              killThread first
-              _ ← generous (readMVar ended)
+              -- The first stop is the application thread's own call, cancelled where it is held.
+              first ← cancelWhen (awaitEntered fx "stop held") (stopSession domains)
+              first `shouldSatisfy` isNothing
               -- What the first stop asked for is remembered, whoever was interrupted.
-              readMVar (sharedStopsIssued (domainsShared domains)) >>= (`shouldBe` issued)
+              readTVarIO (sharedStopsIssued (domainsShared domains)) `shouldReturn` issued
               releaseGate fx "stop held"
-              void (spawn (stopSession domains) >>= id)
+              stopBounded domains
               -- Each instance was asked once, in all.
               asked ← readIORef seen
               [position | StopIssued position ← asked] `shouldBe` [0, 1, 2]
@@ -337,7 +364,7 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
             _ ← generous (readMVar ended)
             releaseGate fx "before the claim"
             revisionNow domains `shouldReturn` 0
-            void (spawn (stopSession domains) >>= id)
+            stopBounded domains
             (snapshot, revision) ← snapshotNow domains
             revision `shouldBe` 1
             fmap (failStage . evidencePrimary) (failedEvidence snapshot) `shouldBe` Just "update"
@@ -359,9 +386,71 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
             killThread driver
             _ ← generous (readMVar ended)
             releaseGate fx "claimed"
-            void (spawn (stopSession domains) >>= id)
+            stopBounded domains
             evidence ← cleanupEvidence domains
             evidenceEnded (evidenceGameplay evidence) `shouldBe` True
+
+  describe "what a failure and a stop ask for before they wait" $ do
+    let ready = "function run(self) sched.wait_ticks(1) while true do sched.yield() end end"
+        yielding = [EntryPoint "task_yields" Required [] []]
+        yieldingTask = "function task_yields() sched.wait_ticks(1) while true do sched.yield() end end"
+    it "has an instance's failure ask a surviving instance that stays ready after yielding to stop, so the failed tick completes and its failure is published" $
+      withSample
+        ( \config →
+            (withWait config)
+              { configInput = []
+              , configGameplaySource = gameplayWith ["function update(self, dt) error('update failed') end"]
+              , configGameplayInstances = [peer "ready peer"]
+              , configGameplayModules = [extraModule [ready]]
+              }
+        )
+        $ \_ _ domains → do
+          snapshot ← generous (stepTick domains) >>= expectFailed
+          fmap (failStage . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "update"
+          evidence ← cleanupEvidence domains
+          sort [(evidenceInstance found, evidenceOutcome found) | found ← evidenceInstances (evidenceGameplay evidence)] `shouldBe` [("gameplay", "failed"), ("ready peer", "stopped")]
+    it "has a task's fault ask a surviving instance that stays ready after yielding to stop, as soon as the fault is told" $
+      withSample
+        ( \config →
+            (withWait config)
+              { configInput = []
+              , configGameplaySource = gameplayWith ["function update(self, dt) staging.finish() end", "function task_fails() error('task failed') end"]
+              , configGameplayEntries = [EntryPoint "task_fails" Required [] []]
+              , configGameplayInstances = [peer "ready peer"]
+              , configGameplayModules = [extraModule [ready]]
+              }
+        )
+        $ \_ _ domains → do
+          _ ← admitGameplayTask domains (task "faulting task" "task_fails")
+          snapshot ← generous (stepTick domains) >>= expectFailed
+          fmap (failWho . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "faulting task"
+    forM_ ["a concurrent stop request", "a stop after the driver was cancelled"] $ \how →
+      it ("has " <> how <> " ask a task that wakes on the tick and stays ready after yielding to stop, though the driver is waiting for the tick it keeps outstanding") $ do
+        fx ← newFx
+        ui ← newFakeUi
+        withBoundary $ \control →
+          withDomains
+            control
+            (withWait (sampleConfig fx ui))
+              { configInput = []
+              , configGameplaySource = gameplayWith ["function update(self, dt) staging.finish() end", yieldingTask]
+              , configGameplayEntries = yielding
+              }
+            $ \domains → do
+              admitGameplayTask domains (task "yielding task" "task_yields") >>= (`shouldSatisfy` accepted)
+              ended ← newEmptyMVar
+              driver ← forkIO (try @SomeException (stepTick domains) >>= putMVar ended)
+              -- The task has woken on the tick and keeps it outstanding: the driver is in its wait for the tick.
+              waitFor (ticksOutstanding (scheduledEndpoint (startedOwner (domainsGameplay domains))) >>= \outstanding → when (outstanding < 1) retry)
+              if how == "a stop after the driver was cancelled"
+                then killThread driver >> void (generous (readMVar ended)) >> void (generous (stopSession domains))
+                else do
+                  requestStop domains
+                  _ ← generous (readMVar ended)
+                  void (generous (stopSession domains))
+              (snapshot, _) ← snapshotNow domains
+              snapStatus snapshot `shouldBe` Stopped
+              heldTasks domains `shouldReturn` 0
 
   describe "a failed session" $
     it "has stopped every surviving instance before its failure is published, one with work still to run among them: each is settled and its shutdown has run, and the owner stays alive" $ do

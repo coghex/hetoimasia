@@ -101,6 +101,7 @@ module Hetoimasia.Sample.LuaDomains.Domains
     -- * The driver
   , TickOutcome (..)
   , stepTick
+  , requestStop
   , stopSession
   , runSession
   , SessionReport (..)
@@ -113,7 +114,7 @@ module Hetoimasia.Sample.LuaDomains.Domains
   , cleanupEvidence
   ) where
 
-import Control.Concurrent.MVar (putMVar, takeMVar)
+import Control.Concurrent (ThreadId, forkIOWithUnmask, myThreadId)
 import Control.Concurrent.STM
   ( STM
   , atomically
@@ -141,7 +142,7 @@ import Control.Exception
   )
 import Control.Monad (forM, forM_, join, unless, void, when)
 import Data.ByteString (ByteString)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (readIORef, writeIORef)
 import qualified Data.Set as Set
 import Data.Int (Int64)
 import qualified Data.List.NonEmpty as NonEmpty
@@ -209,7 +210,6 @@ import Hetoimasia.Sample.LuaDomains.Shared
   , publisherOf
   , readerOf
   , serialWait
-  , swapIntake
   , taskAdmissionsDrained
   , takesTasks
   )
@@ -304,7 +304,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
   , TickWait (TicksCompleted)
   , admitScheduledTask
   , awaitScheduledAccounting
-  , awaitTask
+  , waitTask
   , awaitTicksComplete
   , cancelScheduled
   , forgetControl
@@ -469,6 +469,9 @@ data DomainsDefect
     TickNotCompleted !Word64
   | -- | A snapshot was refused because its publisher had closed.
     PublicationRefused !Word64
+  | -- | 'stopSession' was called from a thread other than the application thread's: the supervised waits that settle the
+    -- session are that thread's, so another asks through 'requestStop'.
+    StopOffApplicationThread
   | -- | 'runSession' was asked to run a session that is not finite.
     SessionNotFinite
   | -- | A session ended with something pending, or with the ledger out of balance: the counters and
@@ -487,7 +490,9 @@ data Started = Started
 
 -- | A running session: the shared state and the two owners.
 data Domains = Domains
-  { domainsConfig ∷ !DomainsConfig
+  { domainsHome ∷ !ThreadId
+    -- ^ The application thread: the one that created the session, which owns the supervision handle.
+  , domainsConfig ∷ !DomainsConfig
   , domainsShared ∷ !Shared
   , domainsControl ∷ !RuntimeControl
   , domainsGameplay ∷ !Started
@@ -618,10 +623,14 @@ startDomains restore control config = do
         pure ui
     case started of
       Left failure → rollback restore uiOwner failure
-      Right ui → pure (Domains config shared control gameplay extras ui)
+      Right ui → do
+        home ← myThreadId
+        pure (Domains home config shared control gameplay extras ui)
   case outcome of
     Left failure → rollback restore gameplayOwner failure
     Right domains → do
+      -- A failure told from now on asks everything the session holds to stop, without waiting.
+      writeIORef (sharedOnFailure shared) (quiesceNow domains)
       -- A behavior that ended in its init has failed the session before the first tick: the failure is
       -- published beside the initial world, once, now that the UI can see it.
       settled ← tryWithContext @SomeException (settleStart domains)
@@ -761,6 +770,9 @@ gameplayEscalation config shared failure = do
   atomically $ do
     tick ← currentTick shared
     forM_ (sessionFailuresOf tick failure) (failSession shared)
+  -- The session is told, and the owner's thread goes on: whatever else the session holds is asked to stop, so a wait for a
+  -- tick that a surviving instance would keep from completing ends. Asking never waits.
+  join (readIORef (sharedOnFailure shared))
   pure Isolate
 
 -- | The session failures an instance's failure tells, in the order they happened: its primary, and then each of what
@@ -1005,7 +1017,9 @@ awaitAccounting domains =
 -- finished, and tracked, before the ending is published or the settlements are read for it. The owner's acceptance and
 -- the session's tracking of the task are not separated by anything that waits: the task is handed over in one
 -- transaction ('handOffTask') as soon as the owner has accepted it, so it is tracked and counted whatever interrupts
--- the admitter next, and a task that was not accepted is never counted.
+-- the admitter next, and a task that was not accepted is never counted. Each accepted task has a watcher thread, which
+-- tells the session of its settlement as soon as there is one, so a fault is known when it happens and not when the
+-- driver next looks.
 admitGameplayTask ∷ Domains → TaskRequest → IO TaskAdmission
 admitGameplayTask domains request = mask_ $ do
   let shared = domainsShared domains
@@ -1013,93 +1027,114 @@ admitGameplayTask domains request = mask_ $ do
   entered ← atomically (enterTaskAdmission shared)
   case entered of
     TaskEntryClosed → pure TaskAdmissionClosed
-    -- The session holds as many tasks it has not observed as 'boundSessionTasks' allows, and the owner's scheduling
-    -- has an active slot for each of them beside the instances'.
+    -- The session holds as many tasks it has not been told the settlement of as 'boundSessionTasks' allows, and the
+    -- owner's scheduling has an active slot for each of them beside the instances'.
     TaskEntryFull → pure TaskQueueFull
     TaskEntered →
       ( do
           configTaskHook config
           admission ← admitScheduledTask (scheduledEndpoint (startedOwner (domainsGameplay domains))) request
           case admission of
-            TaskAccepted _ ticket → atomically (handOffTask shared (Watched (maybe "task" id (requestName request)) ticket))
+            TaskAccepted _ ticket → do
+              watched ← atomically (handOffTask shared (maybe "task" id (requestName request)) ticket)
+              startWatcher domains watched
             _ → pure ()
           configHandoffHook config
           pure admission
       )
         `finally` atomically (leaveTaskAdmission shared)
 
--- | Read the settlement of each task the session admitted that has one, and record a fault as a session failure.
--- Each task is read once: the observation holds the lock on the watched tasks throughout, so concurrent observers
--- (a stop, the driver) take it in turn and the second finds nothing left. Once the session takes no more tasks, the
--- admissions that began before wait to be watched first, so none is missed.
+-- | The thread that waits for a task's settlement, on its own and without supervision (any thread may wait for one), and
+-- tells it. Every accepted task settles, even if only as discarded when the owner exits, so it ends.
+startWatcher ∷ Domains → Watched → IO ()
+startWatcher domains watched =
+  void $ forkIOWithUnmask $ \unmask →
+    void . try @SomeException $ do
+      settlement ← unmask (waitTask (watchedTicket watched))
+      tellTask domains watched settlement
+
+-- | Tell the session of a task's settlement: in one transaction the task leaves the registry and a fault it raised is
+-- recorded as a session failure (which closes admission), so each settlement is told once however many threads learn
+-- it, and a thread that is interrupted tells nothing half. A fault asks every instance and task to stop, without
+-- waiting, whatever the driver is waiting for.
+tellTask ∷ Domains → Watched → ScheduledSettlement → IO ()
+tellTask domains watched settlement = do
+  let shared = domainsShared domains
+  faulted ← atomically $ do
+    held ← readTVar (sharedTasks shared)
+    if watched `notElem` held
+      then pure False
+      else do
+        writeTVar (sharedTasks shared) (filter (/= watched) held)
+        case faultOf (settledOutcome settlement) of
+          Nothing → pure False
+          Just (kind, message) → do
+            tick ← currentTick shared
+            failSession shared (SessionFailure (watchedName watched) "task" "task" tick kind (boundedMessage message))
+            pure True
+  when faulted (quiesceNow domains)
+
+-- | What a settlement says of a fault, if it is one.
+faultOf ∷ ScheduledOutcome → Maybe (Text, Text)
+faultOf = \case
+  SettledFaulted fault → Just ("script fault", Text.pack (take 600 (show fault)))
+  SettledRefused why → Just ("refused wait", Text.pack (take 600 (show why)))
+  _ → Nothing
+
+-- | Tell the session of the settlement of each task that has one, which the driver does before it decides a tick (a
+-- watcher may not have run yet). Once the session takes no more tasks, the admissions that began before wait to be
+-- registered first, so none is missed.
 watchTasks ∷ Domains → IO ()
 watchTasks domains = do
   let shared = domainsShared domains
   atomically $ do
     open ← takesTasks shared
     unless open (taskAdmissionsDrained shared)
-  consumeTasks domains (pollTask . watchedTicket)
+  held ← readTVarIO (sharedTasks shared)
+  forM_ held $ \watched → pollTask (watchedTicket watched) >>= mapM_ (tellTask domains watched)
 
--- | Settle every task the session admitted, which a session that takes no more tasks and has no admission unfinished
--- does once, before its status is decided: a task with no settlement is asked to stop, and its settlement is
--- waited for (the owner settles every accepted task), so its fault, if it faulted, is told of. A task the stop cancels
--- has no fault to tell.
+-- | Settle every task the session admitted, which a session that takes no more tasks does once, before its status is
+-- decided: each task without a settlement is asked to stop (it need not yield for the stop to reach it, and asking is
+-- claimed and recorded without waiting), and its settlement is waited for, with no supervised wait (the owner settles
+-- every accepted task), so its fault, if it faulted, is told of. A task the stop cancels has no fault to tell.
 settleTasks ∷ Domains → IO ()
 settleTasks domains = do
   let shared = domainsShared domains
-      endpoint = scheduledEndpoint (startedOwner (domainsGameplay domains))
   atomically (taskAdmissionsDrained shared)
-  consumeTasks domains $ \watched →
-    let ticket = watchedTicket watched
-     in pollTask ticket >>= \case
-          Just settlement → pure (Just settlement)
-          Nothing → do
-            asked ← requestTaskControl endpoint (ticketTask ticket) RequestStop
-            case asked of
-              TaskControlAccepted receipt → forgetControl receipt
-              TaskControlFull → throwIO (StopRefused "task" (show asked))
-              -- An owner that no longer takes requests is ending, and settles the task as discarded.
-              _ → pure ()
-            Just <$> serially domains (awaitTask (domainsControl domains) ticket)
-
--- | Take the lock on the watched tasks, learn each one's settlement as asked (nothing: it stays watched), record the
--- faults among them as session failures, and give the observed tasks up. However the observation ends, a task whose
--- settlement was told of is given up, so no fault is told of twice, and one not yet reached stays watched.
-consumeTasks ∷ Domains → (Watched → IO (Maybe ScheduledSettlement)) → IO ()
-consumeTasks domains observe = mask $ \restore → do
-  let shared = domainsShared domains
-  watching ← takeMVar (sharedTasks shared)
-  -- The tasks handed over since the last observation join this one's, in the order they were accepted. Nothing here
-  -- waits (the lock is held), and a task taken is in this list until it is observed or put back.
-  handed ← atomically (swapIntake shared)
-  let held = watching <> handed
-  progress ← newIORef ([], held)
-  let go = do
-        (keptSoFar, pending) ← readIORef progress
-        case pending of
+  issueTaskStops domains
+  let go =
+        readTVarIO (sharedTasks shared) >>= \case
           [] → pure ()
-          watched : rest → do
-            observed ← restore (observe watched)
-            case observed of
-              Nothing → writeIORef progress (watched : keptSoFar, rest)
-              Just settlement → do
-                forM_ (faultOf (settledOutcome settlement)) $ \(kind, message) →
-                  atomically $ do
-                    tick ← currentTick shared
-                    failSession shared (SessionFailure (watchedName watched) "task" "task" tick kind (boundedMessage message))
-                writeIORef progress (keptSoFar, rest)
+          watched : _ → do
+            settlement ← waitTask (watchedTicket watched)
+            tellTask domains watched settlement
             go
-  outcome ← try @SomeException go
-  (keptSoFar, pending) ← readIORef progress
-  let now = reverse keptSoFar <> pending
-  atomically (modifyTVar' (sharedTaskHeld shared) (subtract (length held - length now)))
-  putMVar (sharedTasks shared) now
-  either throwIO pure outcome
-  where
-    faultOf = \case
-      SettledFaulted fault → Just ("script fault", Text.pack (take 600 (show fault)))
-      SettledRefused why → Just ("refused wait", Text.pack (take 600 (show why)))
-      _ → Nothing
+  go
+
+-- | Ask every task the session holds to stop that has not been asked. Each is claimed and then asked in one step that
+-- nothing interrupts, and the request never waits.
+issueTaskStops ∷ Domains → IO ()
+issueTaskStops domains = do
+  let endpoint = scheduledEndpoint (startedOwner (domainsGameplay domains))
+  held ← readTVarIO (sharedTasks (domainsShared domains))
+  forM_ held $ \watched → mask_ $ do
+    asked ← atomically (readTVar (watchedStopAsked watched) <* writeTVar (watchedStopAsked watched) True)
+    unless asked $ do
+      answer ← requestTaskControl endpoint (ticketTask (watchedTicket watched)) RequestStop
+      case answer of
+        TaskControlAccepted receipt → forgetControl receipt
+        TaskControlFull → atomically (writeTVar (watchedStopAsked watched) False) >> throwIO (StopRefused "task" (show answer))
+        -- An owner that no longer takes requests is ending, and settles the task as discarded; a task with no live
+        -- identity has settled.
+        _ → pure ()
+
+-- | Ask every gameplay instance and every task the session holds to stop, once each, without waiting for any. It is what
+-- a failure does, as soon as it is told (from the owner's thread, or a task's watcher) and what a stop does first, so that
+-- nothing the session holds can keep a wait that the driver or the stop makes from ever ending. Idempotent.
+quiesceNow ∷ Domains → IO ()
+quiesceNow domains = do
+  issueStops domains (zip [0 ∷ Int ..] (domainsGameplay domains : domainsExtras domains))
+  issueTaskStops domains
 
 -- The driver ------------------------------------------------------------------------
 
@@ -1372,23 +1407,38 @@ settleStart domains = do
     then void (publishEnding domains EndedByFailure)
     else unless (null unsettled) $ throwIO (BehaviorDidNotStart "gameplay" (show unsettled))
 
--- | The one stop of the session, from the driver, as the module header describes. It can be called again, and
--- from a thread that is not the driver's: it waits for the gameplay behavior to be settled, which waits for a
--- segment that is running to return. It answers how both owners ended. Once the owners are retired it only says how they ended again.
+-- | The one stop of the session, on the application thread, as the module header describes: the thread that created the
+-- domains, whose supervision handle the waits are, so another thread asks through 'requestStop' and this raises
+-- 'StopOffApplicationThread' if it is called there. It can be called again: it waits for the gameplay behavior to be
+-- settled, which waits for a segment that is running to return. It answers how both owners ended. Once the owners are
+-- retired it only says how they ended again.
 stopSession ∷ Domains → IO Retirement
 stopSession domains = do
   let shared = domainsShared domains
+  here ← myThreadId
+  when (here /= domainsHome domains) (throwIO StopOffApplicationThread)
   retired ← readTVarIO (sharedClosed shared)
   if retired then retireDomains domains else stopLive domains
 
--- | A stop of a session whose owners have not been retired.
-stopLive ∷ Domains → IO Retirement
-stopLive domains = do
+-- | Ask for the stop from any thread, and never wait: the stop is recorded and admission closed in one transaction, the
+-- driver's next tick is halted, and every gameplay instance and task is asked to stop, so a tick that is in flight or a wait
+-- that depends on what the session holds can end. It finalizes nothing: the application thread does that, through
+-- 'stopSession' (or 'runSession', which a halted tick returns to), because the waits that settle the session are the
+-- supervision handle's, which that thread owns. Asking again asks nothing again.
+requestStop ∷ Domains → IO ()
+requestStop domains = do
   let shared = domainsShared domains
   atomically $ do
     _ ← requestStopNow (sharedSession shared)
     closeQueue (sharedQueue shared)
   configStopHook (domainsConfig domains) StopIntended
+  quiesceNow domains
+
+-- | A stop of a session whose owners have not been retired.
+stopLive ∷ Domains → IO Retirement
+stopLive domains = do
+  let shared = domainsShared domains
+  requestStop domains
   settleGameplay domains
   failed ← atomically (failedNow (sharedSession shared))
   void (publishEnding domains (if failed then EndedByFailure else EndedByStop))
@@ -1407,10 +1457,7 @@ settleFinite domains = do
 finishLive ∷ Domains → IO Retirement
 finishLive domains = do
   let shared = domainsShared domains
-  atomically $ do
-    _ ← requestStopNow (sharedSession shared)
-    closeQueue (sharedQueue shared)
-  configStopHook (domainsConfig domains) StopIntended
+  requestStop domains
   settleGameplay domains
   failed ← atomically (failedNow (sharedSession shared))
   if failed
@@ -1422,40 +1469,45 @@ finishLive domains = do
         when mine (markEnded (sharedSession shared) EndedFinished)
   afterEnding domains
 
--- | Ask each gameplay instance to stop, once for the session however many stops there are and whoever is interrupted
--- (what was asked is tracked, not who asked first), wait for each to be settled, which includes its @shutdown@ and the
--- release of what it held, wait for the owner's accounting of what those endings caused (the escalation of a
--- @shutdown@ that raised included), so that every failure of the settlement has been told, and settle the session's
--- tasks. The engine's reservations for control leave one for each instance, so the stop is admitted whatever the UI
--- holds. The caller has closed admission: an admission that began before is finished and tracked before the
--- instances are awaited, and the requests are issued first, so a stop interrupted while it waits has asked already.
--- Everything here is idempotent, and every wait is taken in turn ('serially').
+-- | Settle the gameplay owner's instances and tasks: everything is asked to stop first, without waiting (a stop is cancelled
+-- or concurrent with a driver that is waiting for a tick that something the session holds keeps from completing), then each
+-- instance is waited for until it has settled, which includes its @shutdown@ and the release of what it held, then the
+-- owner's accounting of what those endings caused (the escalation of a @shutdown@ that raised included), so that every
+-- failure of the settlement has been told, and last the session's tasks. The engine's reservations for control leave one
+-- for each instance, so the stop is admitted whatever the UI holds. The caller has closed admission: an admission that
+-- began before is finished and its task asked to stop before the instances are awaited. Everything here is idempotent, and
+-- every supervised wait is taken in turn ('serially').
 settleGameplay ∷ Domains → IO ()
 settleGameplay domains = do
   let started = domainsGameplay domains : domainsExtras domains
-  issueStops domains (zip [0 ∷ Int ..] started)
+  quiesceNow domains
   atomically (taskAdmissionsDrained (domainsShared domains))
+  quiesceNow domains
   forM_ started $ \one → void (serially domains (awaitInstance (domainsControl domains) (startedTicket one)))
   void (awaitAccounting domains)
   settleTasks domains
 
--- | Ask each of these instances to stop that has not been asked, and remember each that was. The requests never block,
--- and what is remembered is what the engine took, whatever interrupts the asking: the request and the record of it
--- are not separated by anything that waits.
+-- | Ask each of these gameplay instances to stop that has not been asked, remembering each that was. An instance is claimed
+-- and then asked in one step that nothing interrupts, and the request never waits, so what is remembered is what the engine
+-- took, whatever interrupts the asking and whoever asks first (a failure, a stop, the finite end).
 issueStops ∷ Domains → [(Int, Started)] → IO ()
-issueStops domains started = mask_ $ do
-  let var = sharedStopsIssued (domainsShared domains)
-  issued ← takeMVar var
-  progress ← newIORef issued
-  forM_ started (\(index, one) → do
-    done ← readIORef progress
-    unless (index `elem` done) $ do
-      asked ← requestInstanceControl (scheduledEndpoint (startedOwner one)) (startedInstance one) InstanceStop
-      case asked of
-        InstanceControlFull → throwIO (StopRefused "gameplay" (show asked))
-        _ → writeIORef progress (index : done)
-      configStopHook (domainsConfig domains) (StopIssued index))
-    `finally` (readIORef progress >>= putMVar var)
+issueStops domains started =
+  forM_ started $ \(index, one) → do
+    issuedNow ← mask_ $ do
+      claimed ← atomically $ do
+        done ← readTVar (sharedStopsIssued (domainsShared domains))
+        if index `elem` done
+          then pure False
+          else True <$ writeTVar (sharedStopsIssued (domainsShared domains)) (index : done)
+      when claimed $ do
+        asked ← requestInstanceControl (scheduledEndpoint (startedOwner one)) (startedInstance one) InstanceStop
+        case asked of
+          InstanceControlFull → do
+            atomically (modifyTVar' (sharedStopsIssued (domainsShared domains)) (filter (/= index)))
+            throwIO (StopRefused "gameplay" (show asked))
+          _ → pure ()
+      pure claimed
+    when issuedNow (configStopHook (domainsConfig domains) (StopIssued index))
 
 -- | What follows the publication that ends the session: the UI reads the settlements of the controls it asked for,
 -- and, when the configuration asks, sees the status that ends the session, while it serves; a UI that has ended

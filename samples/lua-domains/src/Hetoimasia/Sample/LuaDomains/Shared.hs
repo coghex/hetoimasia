@@ -25,12 +25,14 @@
 --   the UI's control bindings and the assignment the lifecycle grant asks for, both on the UI owner's
 --   callback thread; the driver reads them.
 -- * 'sharedWorkspaces': the workspace bindings' acquire and release, on the gameplay owner's threads.
--- * 'sharedTasks', 'sharedTaskIntake', 'sharedTaskAdmitting': whoever admits a task and whoever observes the tasks'
---   settlements (the driver, a stop from any thread). An admission hands the task over in one transaction that
---   waits for nothing ('sharedTaskIntake'); an observer takes the intake into its own list under the 'sharedTasks'
---   lock, which it holds for the whole observation.
--- * 'sharedWaitLock': whoever makes one of the supervised waits the sample makes (the driver, a stop from any thread),
---   one at a time.
+-- * 'sharedTasks', 'sharedTaskAdmitting': whoever admits a task, the task's own watcher, and whoever reads the tasks'
+--   settlements (the driver, the application thread's stop). An admission hands the task over in one transaction that
+--   waits for nothing; whoever learns a settlement tells it in one transaction that also records its fault and takes
+--   the task off the registry, so a settlement is told once however many of them learn it.
+-- * 'sharedStopsIssued', 'sharedOnFailure': the gameplay owner's escalation callback, the task watchers, the driver
+--   and whoever asks for the stop; asking is claimed and recorded without waiting.
+-- * 'sharedWaitLock', 'sharedWaitDepth', 'sharedWaitThreads': whoever makes one of the supervised waits the sample
+--   makes (the application thread), one at a time.
 --
 -- The UI never reads 'sharedCommitted' or 'sharedTick'; gameplay never reads 'sharedView' or the
 -- snapshot. Each owner's namespaces are the only way its VM reaches any of this
@@ -75,7 +77,7 @@ module Hetoimasia.Sample.LuaDomains.Shared
   , taskAdmissionsDrained
   , takesTasks
   , handOffTask
-  , swapIntake
+  , tasksHeld
   , serialWait
     -- * Workspaces
   , Workspace (..)
@@ -86,12 +88,15 @@ module Hetoimasia.Sample.LuaDomains.Shared
   , Watched (..)
   ) where
 
+import Control.Concurrent (ThreadId, myThreadId)
 import Control.Concurrent.MVar (MVar, newMVar, withMVar)
+import Data.IORef (IORef, newIORef)
 import Control.Concurrent.STM
   ( STM
   , TVar
   , atomically
   , modifyTVar'
+  , newTVar
   , newTVarIO
   , readTVar
   , retry
@@ -180,24 +185,25 @@ data Shared = Shared
   , sharedReceipts ∷ !(TVar Int)
   , sharedUiNotes ∷ !(TVar UiNotes)
   , sharedUiFailure ∷ !(TVar (Maybe SessionFailure))
-  , sharedTasks ∷ !(MVar [Watched])
-    -- ^ The tasks the session watches. Whoever observes them holds the lock for the whole observation, so each
-    -- settlement is consumed once.
-  , sharedTaskIntake ∷ !(TVar [Watched])
-    -- ^ The tasks accepted and not yet taken by an observer, oldest first. An admission puts its task here in one
-    -- transaction that waits for nothing, so an accepted task is tracked whatever interrupts its admitter.
+  , sharedTasks ∷ !(TVar [Watched])
+    -- ^ The tasks the session admitted and has not yet been told the settlement of, oldest first. An admission puts its
+    -- task here in one transaction that waits for nothing, so an accepted task is tracked whatever interrupts its
+    -- admitter; a settlement is told, its fault recorded and its task taken off in one transaction.
   , sharedTaskAdmitting ∷ !(TVar Int)
     -- ^ The task admissions between the check that the session takes tasks and the task's being watched.
-  , sharedStopsIssued ∷ !(MVar [Int])
-    -- ^ The gameplay instances (by position) a stop has been issued to; changed only under its lock.
-  , sharedTaskHeld ∷ !(TVar Int)
-    -- ^ The tasks in 'sharedTasks' and 'sharedTaskIntake': admitted, and not yet observed. Raised by the handoff,
-    -- lowered by the observer that gives a task up.
+  , sharedStopsIssued ∷ !(TVar [Int])
+    -- ^ The gameplay instances (by position) a stop has been claimed for and requested of, in the one step.
+  , sharedTaskSeq ∷ !(TVar Int)
+    -- ^ The next task's number.
   , sharedWaitDepth ∷ !(TVar (Int, Int))
     -- ^ How many of those waits are pending now, and the most there have been at once: never more than one.
+  , sharedWaitThreads ∷ !(TVar (Set ThreadId))
+    -- ^ The threads that have made one of those waits.
   , sharedWaitLock ∷ !(MVar ())
-    -- ^ Held by whoever has a supervised wait pending, so at most one is: the supervision handle is the application
-    -- thread's, and a stop from another thread does not wait beside the driver.
+    -- ^ Held by whoever has a supervised wait pending, so at most one is.
+  , sharedOnFailure ∷ !(IORef (IO ()))
+    -- ^ What the owner's escalation callback and a task's watcher run after they tell the session of a failure:
+    -- asking every instance and task to stop, which never waits. Set once the session's owners exist.
   , sharedAssignHook ∷ !(IO ())
   , sharedScenario ∷ !Text
   , sharedClosed ∷ !(TVar Bool)
@@ -231,13 +237,14 @@ newShared setup = do
     <*> newTVarIO 0
     <*> newTVarIO (UiNotes 0 0 [])
     <*> newTVarIO Nothing
-    <*> newMVar []
     <*> newTVarIO []
     <*> newTVarIO 0
-    <*> newMVar []
+    <*> newTVarIO []
     <*> newTVarIO 0
     <*> newTVarIO (0, 0)
+    <*> newTVarIO Set.empty
     <*> newMVar ()
+    <*> newIORef (pure ())
     <*> pure (setupAssignHook setup)
     <*> pure (setupScenario setup)
     <*> newTVarIO False
@@ -445,7 +452,7 @@ enterTaskAdmission ∷ Shared → STM TaskEntry
 enterTaskAdmission shared = do
   open ← takesTasks shared
   admitting ← readTVar (sharedTaskAdmitting shared)
-  held ← readTVar (sharedTaskHeld shared)
+  held ← tasksHeld shared
   if not open
     then pure TaskEntryClosed
     else
@@ -465,29 +472,34 @@ taskAdmissionsDrained shared = do
   held ← readTVar (sharedTaskAdmitting shared)
   when (held > 0) retry
 
--- | Track a task the owner has accepted: it joins the intake and is counted as held, in one transaction that waits for
--- nothing, so a task the owner accepted is tracked and counted whatever interrupts the admitter next.
-handOffTask ∷ Shared → Watched → STM ()
-handOffTask shared watched = do
-  modifyTVar' (sharedTaskIntake shared) (<> [watched])
-  modifyTVar' (sharedTaskHeld shared) (+ 1)
+-- | How many tasks the session has admitted and not been told the settlement of.
+tasksHeld ∷ Shared → STM Int
+tasksHeld shared = length <$> readTVar (sharedTasks shared)
 
--- | Take every task handed over and not yet taken: the observer that holds the 'sharedTasks' lock adds them to its own
--- list. The count of held tasks does not change; the observer lowers it when it gives a task up.
-swapIntake ∷ Shared → STM [Watched]
-swapIntake shared = do
-  handed ← readTVar (sharedTaskIntake shared)
-  writeTVar (sharedTaskIntake shared) []
-  pure handed
+-- | Track a task the owner has accepted: it joins the registry in one transaction that waits for nothing, so a task the
+-- owner accepted is tracked and counted whatever interrupts the admitter next.
+handOffTask ∷ Shared → Text → ScheduledTicket → STM Watched
+handOffTask shared name ticket = do
+  number ← readTVar (sharedTaskSeq shared)
+  writeTVar (sharedTaskSeq shared) (number + 1)
+  stopped ← newTVar False
+  let watched = Watched name ticket number stopped
+  modifyTVar' (sharedTasks shared) (<> [watched])
+  pure watched
 
--- | Run one of the supervised waits the sample makes with no other of them pending: the supervision handle is the
--- application thread's, so the driver's waits and a stop's, which may come from another thread, are taken in turn.
--- Waiting for the turn is interruptible, and the turn is given back however the wait ends.
+-- | Run one of the supervised waits the sample makes with no other of them pending, and note which thread made it. The
+-- supervision handle is the application thread's, and the driver's waits and the stop's are made on it, one at a time;
+-- the lock is what makes that true of a session whose driver runs on a thread of its own. Waiting for the turn is
+-- interruptible, and the turn is given back however the wait ends.
 serialWait ∷ Shared → IO a → IO a
-serialWait shared wait =
+serialWait shared wait = do
+  here ← myThreadId
   withMVar (sharedWaitLock shared) $ \_ →
     bracket_
-      (atomically (modifyTVar' (sharedWaitDepth shared) (\(now, most) → (now + 1, max most (now + 1)))))
+      ( atomically $ do
+          modifyTVar' (sharedWaitDepth shared) (\(now, most) → (now + 1, max most (now + 1)))
+          modifyTVar' (sharedWaitThreads shared) (Set.insert here)
+      )
       (atomically (modifyTVar' (sharedWaitDepth shared) (\(now, most) → (now - 1, most))))
       wait
 
@@ -583,4 +595,11 @@ readWorkspace (Workspace cell) = atomically (readTVar cell)
 data Watched = Watched
   { watchedName ∷ !Text
   , watchedTicket ∷ !ScheduledTicket
+  , watchedNumber ∷ !Int
+    -- ^ Its place among the tasks the session admitted.
+  , watchedStopAsked ∷ !(TVar Bool)
+    -- ^ Whether it has been asked to stop: claimed before the request is made, in the one step.
   }
+
+instance Eq Watched where
+  a == b = watchedNumber a == watchedNumber b

@@ -195,10 +195,9 @@ spec = describe "the UI's control of the gameplay behavior" $ do
           -- The request has its tick and its place, and the engine has not admitted it: the session is stopped now, and
           -- the instance it names has ended when the UI goes on.
           awaitEntered fx "assigned"
-          stopped ← spawn (stopSession domains)
-          waitFor (readTVar (sharedSession (domainsShared domains)) >>= \state → when (isNothing (sessionEnded state)) retry)
-          releaseGate fx "assigned"
-          _ ← stopped
+          -- The stop is the application thread's, and it retires the UI owner, which is held in the request: the gate is
+          -- opened from a thread of its own once the session has ended, with the instance it names settled.
+          _ ← alongside (waitFor (readTVar (sharedSession (domainsShared domains)) >>= \state → when (isNothing (sessionEnded state)) retry) >> releaseGate fx "assigned") (stopSession domains)
           counts ← readTVarIO (sharedControls (domainsShared domains))
           (controlOffered counts, controlAccepted counts) `shouldBe` (1, 0)
           Map.toList (controlRefused counts) `shouldSatisfy` (\refused → refused `elem` [[("closed", 1)], [("unknown_target", 1)]])

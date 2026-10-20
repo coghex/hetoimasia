@@ -47,11 +47,16 @@ module Test.Domains.Support
   , awaitClosed
   , balanced
   , failedEvidence
+  , heldTasks
+  , stopBounded
+  , alongside
+  , Cancelled (..)
+  , cancelWhen
   ) where
 
-import Control.Concurrent (forkIO)
+import Control.Concurrent (forkIO, killThread, myThreadId, throwTo)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar)
-import Control.Exception (SomeException, finally, throwIO, try)
+import Control.Exception (Exception, SomeException, finally, mask, throwIO, try)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Monad (void, when)
 import Data.ByteString (ByteString)
@@ -86,7 +91,7 @@ import Hetoimasia.Sample.LuaDomains.Intention (Answer, Submitted (Submitted))
 import Hetoimasia.Sample.LuaDomains.Queue (isClosed, reserved)
 import Hetoimasia.Sample.LuaDomains.Tally (Counts (countAccepted), settledTotal)
 import Hetoimasia.Sample.LuaDomains.Session (Ended (..), SessionState (sessionEnded))
-import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCounts, sharedQueue, sharedReceipts, sharedSession, sharedUiNotes, sharedUpdates), SharedSetup (..), UiNotes (notesSaw), newShared, readerOf, submit)
+import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCounts, sharedQueue, sharedReceipts, sharedSession, sharedUiNotes, sharedUpdates), SharedSetup (..), UiNotes (notesSaw), newShared, readerOf, submit, tasksHeld)
 import Hetoimasia.Scripting.Lua.Lease (newLeases)
 import Hetoimasia.Scripting.Lua.Lending (newLending)
 import Hetoimasia.Scripting.Lua.Registration (Namespace, namespace, stateOperation)
@@ -382,7 +387,6 @@ uiStep domains ui = do
 stopServing ∷ Domains → FakeUi → IO ()
 stopServing domains ui = do
   finished ← newTVarIO False
-  stopped ← spawn (stopSession domains >> atomically (writeTVar finished True))
   let go = do
         next ← waitFor $ do
           done ← readTVar finished
@@ -390,8 +394,10 @@ stopServing domains ui = do
           owes ← uiOwes domains
           if done then pure False else if owes && not (null live) then pure True else retry
         when next (uiStep domains ui >> go)
-  go
-  _ ← stopped
+  -- The stop is the application thread's, so the UI is kept going from a thread of its own.
+  stepper ← spawn go
+  _ ← stopSession domains `finally` atomically (writeTVar finished True)
+  _ ← stepper
   pure ()
 
 -- | What the stop is waiting for the UI to do: read the settlements of the controls it asked for, and, when the
@@ -408,3 +414,41 @@ uiOwes domains = do
         _ → Nothing
       unseen = configUiSeesEnd (domainsConfig domains) && maybe False (`notElem` notesSaw notes) word
   pure (held > 0 || unseen)
+
+-- | How many tasks the session has admitted and not been told the settlement of.
+heldTasks ∷ Domains → IO Int
+heldTasks domains = atomically (tasksHeld (domainsShared domains))
+
+-- | The stop, which is the application thread's, bounded: this thread's call, not a thread of its own.
+stopBounded ∷ Domains → IO ()
+stopBounded domains = void (bounded (stopSession domains))
+
+-- | Run an action on a thread of its own while this thread does the other, and answer the other's result once the
+-- first has ended, raising what it raised. A stop is the application thread's, so what an example does around it, in
+-- the interval it holds, is done on the side.
+alongside ∷ IO () → IO a → IO a
+alongside side main = do
+  joined ← spawn side
+  result ← main
+  joined
+  pure result
+
+-- | The exception that cancels an action an example runs with 'cancelWhen'.
+data Cancelled = Cancelled
+  deriving (Show)
+
+instance Exception Cancelled
+
+-- | Run an action on this thread and cancel it, with an exception of its own, once this has happened (the trigger, which an
+-- example makes a gate entered): the action's result, or 'Nothing' if it was cancelled. The thread the action runs on is
+-- the thread of the example, so a stop, which is the application thread's, can be the one that is cancelled.
+cancelWhen ∷ IO () → IO a → IO (Maybe a)
+cancelWhen trigger action = do
+  me ← myThreadId
+  mask $ \restore → do
+    canceller ← forkIO (trigger >> throwTo me Cancelled)
+    outcome ← try (restore action)
+    killThread canceller
+    case outcome of
+      Left Cancelled → pure Nothing
+      Right result → pure (Just result)

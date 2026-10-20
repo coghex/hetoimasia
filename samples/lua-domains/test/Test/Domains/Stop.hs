@@ -29,6 +29,7 @@ import Hetoimasia.Sample.LuaDomains
   , exitStatusOf
   , runSession
   , stepTick
+  , requestStop
   , stopSession
   , withDomains
   )
@@ -185,11 +186,11 @@ spec = describe "the stop paths and the cleanup evidence" $ do
       offered ← mapM (offer domains) [0, 1]
       collect ← spawn (stepTick domains)
       awaitEntered fx "held"
-      stopped ← spawn (stopSession domains)
+      requestStop domains
       waitFor (awaitClosed domains)
       releaseGate fx "held"
-      _ ← stopped
       outcome ← collect
+      _ ← stopSession domains
       outcome `shouldSatisfy` \case TickFailed _ → True; TickHalted → True; _ → False
       (snapshot, revision) ← snapshotNow domains
       (revision, snapTick snapshot, snapStatus snapshot) `shouldSatisfy` \(published, committed, status) → published == 1 && committed == 0 && isFailed status
@@ -260,11 +261,9 @@ spec = describe "the stop paths and the cleanup evidence" $ do
         -- The session waits for the UI to see what ends it: the stop does not return while the UI has not run,
         -- however long it is given, and returns once the UI has run.
         finished ← newTVarIO False
-        stopped ← spawn (stopSession domains >> atomically (writeTVar finished True))
-        replicateM_ 2000 yield
-        readTVarIO finished `shouldReturn` False
-        uiStep domains ui
-        _ ← stopped
+        -- The stop is the application thread's; the UI runs from a thread of its own, once the stop has had every chance
+        -- to return without it.
+        _ ← alongside (replicateM_ 2000 yield >> (readTVarIO finished `shouldReturn` False) >> uiStep domains ui) (stopSession domains >> atomically (writeTVar finished True))
         -- The UI saw the last good tick beside the failure.
         fxLines fx >>= (`shouldSatisfy` elem "saw failed at tick 2")
         balanced domains
