@@ -55,15 +55,16 @@ module Test.Domains.Support
   , driving
   , Cancelled (..)
   , cancelWhen
+  , TriggerFailed (..)
   ) where
 
 import Control.Concurrent (ThreadId, forkIO, forkIOWithUnmask, killThread, myThreadId, throwTo)
-import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, tryPutMVar, withMVar)
-import Control.Exception (Exception, SomeException, catch, finally, fromException, mask, onException, throwIO, try)
+import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, tryPutMVar, tryReadMVar, withMVar)
+import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, catch, finally, fromException, mask, onException, throwIO, try)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Monad (void, when)
 import Data.ByteString (ByteString)
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import System.IO.Unsafe (unsafePerformIO)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
@@ -100,7 +101,8 @@ import Hetoimasia.Scripting.Lua.Lease (newLeases)
 import Hetoimasia.Scripting.Lua.Lending (newLending)
 import Hetoimasia.Scripting.Lua.Registration (Namespace, namespace, stateOperation)
 import Hetoimasia.Scripting.Lua.Scheduler (TimerBackend (TimerBackend))
-import Hetoimasia.Scripting.Lua.Value (Schema (SText), Value (VText))
+import Hetoimasia.Scripting.Lua.Value (Schema (SBoolean, SText), Value (VBoolean, VText))
+import Data.Maybe (isJust)
 import Numeric.Natural (Natural)
 import System.IO (stderr)
 import System.Timeout (timeout)
@@ -240,6 +242,12 @@ fxNamespace fx shared =
           modifyTVar' (fxMarksVar fx) ((name, updates) :)
           pure []
         _ → pure []
+    , stateOperation "released" [SText] [SBoolean] $ \case
+        [VText name] → do
+          gate ← gateFor fx name
+          opened ← tryReadMVar (gateReleased gate)
+          pure [VBoolean (isJust opened)]
+        _ → pure [VBoolean False]
     , stateOperation "hold" [SText] [] $ \case
         [VText name] → do
           gate ← gateFor fx name
@@ -320,11 +328,21 @@ waitFor = bounded . atomically
 spawn ∷ IO a → IO (IO a)
 spawn action = do
   result ← newEmptyMVar
-  _ ← forkRegistered (try action >>= putMVar result)
-  pure (bounded (readMVar result >>= either (\failure → throwIO (failure ∷ SomeException)) pure))
+  collected ← newIORef False
+  thread ← forkIO (try action >>= putMVar result)
+  -- A thread that failed and was never collected is the example's failure, raised when it is over: nothing an example
+  -- spawns can fail unseen.
+  let unseen = do
+        seen ← readIORef collected
+        failed ← tryReadMVar result
+        case failed of
+          Just (Left failure) | not seen → throwIO (failure ∷ SomeException)
+          _ → pure ()
+  atomicModifyIORef' forkedThreads (\held → ((thread, unseen) : held, ()))
+  pure (writeIORef collected True >> bounded (readMVar result >>= either (\failure → throwIO (failure ∷ SomeException)) pure))
 
 -- | The threads an example forked and has not seen end: 'reapForked' cancels what is left of them when the example is over.
-forkedThreads ∷ IORef [ThreadId]
+forkedThreads ∷ IORef [(ThreadId, IO ())]
 forkedThreads = unsafePerformIO (newIORef [])
 {-# NOINLINE forkedThreads #-}
 
@@ -332,15 +350,16 @@ forkedThreads = unsafePerformIO (newIORef [])
 forkRegistered ∷ IO () → IO ThreadId
 forkRegistered action = do
   thread ← forkIO action
-  atomicModifyIORef' forkedThreads (\held → (thread : held, ()))
+  atomicModifyIORef' forkedThreads (\held → ((thread, pure ()) : held, ()))
   pure thread
 
--- | Cancel every thread an example forked that is still running, each having ended before this returns. It runs after
--- every example, whatever the example's outcome.
+-- | Cancel every thread an example forked that is still running, each having ended before this returns, and raise the
+-- failure of any that failed without being collected. It runs after every example, whatever the example's outcome.
 reapForked ∷ IO ()
 reapForked = do
   threads ← atomicModifyIORef' forkedThreads (\held → ([], held))
-  mapM_ killThread threads
+  mapM_ (killThread . fst) threads
+  mapM_ snd (reverse threads)
 
 -- | Run a body, and open these gates however it ends, so a segment an example held never keeps
 -- the owner, and with it the session's retirement, waiting.
@@ -492,25 +511,45 @@ data Cancelled = Cancelled
 
 instance Exception Cancelled
 
+-- | The trigger of 'cancelWhen' failed (an assertion, a gate that never came): the failure, delivered in place of a
+-- cancellation, which the trigger did not reach.
+newtype TriggerFailed = TriggerFailed SomeException
+  deriving (Show)
+
+instance Exception TriggerFailed
+
 -- | Run an action on this thread and cancel it, with an exception of its own, once this has happened (the trigger, which an
 -- example makes a gate entered): the action's result, or 'Nothing' if it was cancelled. The thread the action runs on is
 -- the thread of the example, so a stop, which is the application thread's, can be the one that is cancelled. The thread
 -- that waits for the trigger lives no longer than this call, whatever the action raises: it is cancelled and has ended
--- before this returns, so the trigger firing later cancels nothing.
+-- before this returns, so the trigger firing later cancels nothing. A trigger that fails is not a cancellation: its
+-- failure is raised, whatever became of the action, so that an example never passes for having reached a point it did
+-- not reach.
 cancelWhen ∷ IO () → IO a → IO (Maybe a)
 cancelWhen trigger action = mask $ \restore → do
   me ← myThreadId
   armed ← newMVar True
+  triggerFailure ← newEmptyMVar
   canceller ← forkIOWithUnmask $ \unmask → do
-    _ ← try @SomeException (unmask trigger)
-    withMVar armed (\on → when on (throwTo me Cancelled))
+    reached ← try @SomeException (unmask trigger)
+    case reached of
+      -- This thread's own cancellation, when the call is over, is not the trigger's failure.
+      Left failure | Just ThreadKilled ← fromException failure → pure ()
+      Left failure → void (tryPutMVar triggerFailure failure) >> withMVar armed (\on → when on (throwTo me (TriggerFailed failure)))
+      Right () → withMVar armed (\on → when on (throwTo me Cancelled))
   outcome ← try @SomeException (restore action)
-  let disarm = modifyMVar_ armed (\_ → pure False) `catch` \Cancelled → disarm
+  let disarm = modifyMVar_ armed (\_ → pure False) `catch` \raised → case fromException raised of
+        Just Cancelled → disarm
+        Nothing → case fromException raised of
+          Just (TriggerFailed _) → disarm
+          Nothing → throwIO (raised ∷ SomeException)
   disarm
   killThread canceller
-  case outcome of
-    Right result → pure (Just result)
-    Left raised → case fromException raised of
+  failedTrigger ← tryReadMVar triggerFailure
+  case (failedTrigger, outcome) of
+    (Just failure, _) → throwIO failure
+    (Nothing, Right result) → pure (Just result)
+    (Nothing, Left raised) → case fromException raised of
       Just Cancelled → pure Nothing
       Nothing → throwIO raised
 

@@ -287,6 +287,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VRecord))
 import Hetoimasia.Scripting.Lua.Runtime (CallFault (BoundaryFailed), ExitRecord, LuaRuntime, newLuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
   ( AccountingWait (..)
+  , Diagnostics (diagFailed)
   , ControlRequest (RequestStop)
   , ExecutionDomain (GameplayDomain, InterfaceDomain)
   , GrantAnswer (GrantAccepted)
@@ -314,6 +315,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
   , pollTask
   , requestTaskControl
   , retireScheduled
+  , scheduledDiagnostics
   , scheduledEndpoint
   , scheduledExitRecord
   , scheduledSpec
@@ -379,6 +381,8 @@ data DomainsConfig = DomainsConfig
     -- ^ Test-only: run by a control's assignment before it returns, in the interval before the engine admits it.
   , configTaskHook ∷ !(IO ())
     -- ^ Test-only: run inside a task admission, after the session was found to take tasks and before the owner is asked.
+  , configWatcherHook ∷ !(IO ())
+    -- ^ Test-only: run by a task's watcher, on its own thread, after it has the task's settlement and before it tells it.
   , configDecisionHook ∷ !(DecisionPoint → IO ())
     -- ^ Test-only: run by the driver at each point 'DecisionPoint' names.
   , configAcceptedHook ∷ !(IO ())
@@ -431,6 +435,7 @@ defaultConfig =
     , configUiSpec = id
     , configAssignHook = pure ()
     , configTaskHook = pure ()
+    , configWatcherHook = pure ()
     , configDecisionHook = const (pure ())
     , configAcceptedHook = pure ()
     , configHandoffHook = pure ()
@@ -1067,6 +1072,7 @@ startWatcher domains watched =
   void $ forkIOWithUnmask $ \unmask →
     void . try @SomeException $ do
       settlement ← unmask (waitTask (watchedTicket watched))
+      configWatcherHook (domainsConfig domains)
       tellTask domains watched settlement
 
 -- | Tell the session of a task's settlement: in one transaction the task leaves the registry and a fault it raised is
@@ -1097,20 +1103,40 @@ faultOf = \case
   SettledRefused why → Just ("refused wait", Text.pack (take 600 (show why)))
   _ → Nothing
 
+-- | What the driver knew of the gameplay owner's tasks when it read them: the admissions entered, and the failures the
+-- owner has counted (an instance's invocation or a task ending in a fault, a refused wait included, each counted in the
+-- transaction that ends it, so a failure that is counted is a settlement a later reading sees).
+data Observed = Observed
+  { observedAdmissions ∷ !Int
+  , observedFailures ∷ !Int
+  }
+
 -- | Tell the session of the settlement of each task that has one, which the driver does before it decides a tick (a
--- watcher may not have run yet), and answer the admissions entered when it began. The admissions in flight are waited for
--- first, however the session stands: a task the owner accepted runs, and can fault, before its admitter has registered it,
--- so a decision made without waiting would see neither the task nor its fault. An admission waits for nothing, so this is
--- brief. Nothing stops another admission beginning after: the answer is what the commit checks is still the number of
--- admissions entered, with none in flight, in the transaction that commits ('admissionsStable'), and the observation is
--- made again if it moved.
-watchTasks ∷ Domains → IO Int
+-- watcher may not have run yet), and answer what was known when it began. The admissions in flight are waited for first,
+-- however the session stands: a task the owner accepted runs, and can fault, before its admitter has registered it. Then
+-- the count of admissions and of failures is read, in one transaction with that wait, and the registered tasks are read.
+-- A task that settled before the count is read is seen by the reading that follows it; one that settles, or is admitted,
+-- after it moves a count, which the commit checks has not moved ('tickIsStable'), so that no fault that can belong to a
+-- tick is left to a watcher's timing.
+watchTasks ∷ Domains → IO Observed
 watchTasks domains = do
   let shared = domainsShared domains
-  generation ← atomically (taskAdmissionsDrained shared)
+  observed ← atomically $ do
+    admissions ← taskAdmissionsDrained shared
+    counters ← scheduledDiagnostics (scheduledEndpoint (startedOwner (domainsGameplay domains)))
+    pure (Observed admissions (diagFailed counters))
   held ← readTVarIO (sharedTasks shared)
   forM_ held $ \watched → pollTask (watchedTicket watched) >>= mapM_ (tellTask domains watched)
-  pure generation
+  pure observed
+
+-- | Whether nothing has moved since the tasks were read, in the transaction that commits a tick: no task admission is in
+-- flight or has begun, and no instance's invocation or task has ended in a failure. Whatever a watcher has or has not yet
+-- told, an ordering of the commit after every fault that can belong to the tick.
+tickIsStable ∷ Domains → Observed → STM Bool
+tickIsStable domains observed = do
+  admissions ← admissionsStable (domainsShared domains) (observedAdmissions observed)
+  counters ← scheduledDiagnostics (scheduledEndpoint (startedOwner (domainsGameplay domains)))
+  pure (admissions && diagFailed counters == observedFailures observed)
 
 -- | Settle every task the session admitted, which a session that takes no more tasks does once, before its status is
 -- decided: each task without a settlement is asked to stop (it need not yield for the stop to reach it, and asking is
@@ -1240,9 +1266,9 @@ stepTick domains = do
                 unless over (throwIO (OwnerEndedDuringTick tick))
               -- Observe the tasks and decide; if a task admission began since the observation, observe again.
               let observeAndDecide = do
-                    generation ← watchTasks domains
+                    observed ← watchTasks domains
                     configDecisionHook config AfterObserved
-                    decide domains tick pausedAtBegin generation >>= maybe observeAndDecide pure
+                    decide domains tick pausedAtBegin observed >>= maybe observeAndDecide pure
               observeAndDecide
 
 -- | Whether a failure has been told and its publication has not been made.
@@ -1269,8 +1295,8 @@ data Verdict
 -- | Decide a tick that has completed and been accounted for: a failure told of fails the session and commits
 -- nothing; a stop commits nothing; otherwise the tick commits if its work finished successfully, or the engine says why
 -- there is none to do.
-decide ∷ Domains → Word64 → Bool → Int → IO (Maybe TickOutcome)
-decide domains tick pausedAtBegin generation = do
+decide ∷ Domains → Word64 → Bool → Observed → IO (Maybe TickOutcome)
+decide domains tick pausedAtBegin observed = do
   let shared = domainsShared domains
   verdict ← atomically $ do
     halted ← haltedNow shared
@@ -1293,7 +1319,7 @@ decide domains tick pausedAtBegin generation = do
     VerdictFailed → Just . maybe TickHalted TickFailed <$> publishEnding domains EndedByFailure
     VerdictHalted → pure (Just TickHalted)
     VerdictIncomplete → throwIO (TickNotCompleted tick)
-    VerdictCommit candidate → commitTick domains tick generation candidate
+    VerdictCommit candidate → commitTick domains tick observed candidate
   where
     -- Work finished successfully: gameplay said so, and the instance is serving, with nothing in flight and
     -- no update owed; or there was no work to do: gameplay's update never began (the wrapper every gameplay
@@ -1310,8 +1336,8 @@ decide domains tick pausedAtBegin generation = do
 
 -- | Commit a tick: replace the committed world, publish the snapshot, settle the queue's reservations and count
 -- the dispositions, in one transaction that first checks again that nothing has ended the session meanwhile.
-commitTick ∷ Domains → Word64 → Int → Candidate → IO (Maybe TickOutcome)
-commitTick domains tick generation candidate = do
+commitTick ∷ Domains → Word64 → Observed → Candidate → IO (Maybe TickOutcome)
+commitTick domains tick observed candidate = do
   let shared = domainsShared domains
       config = domainsConfig domains
       (world, dispositions) = commit candidate
@@ -1348,7 +1374,7 @@ commitTick domains tick generation candidate = do
         halted ← haltedNow shared
         failed ← failedNow (sharedSession shared)
         working ← readTVar (sharedTick shared)
-        stable ← admissionsStable shared generation
+        stable ← tickIsStable domains observed
         if halted || failed || fmap candidateTick working /= Just tick
           then pure (Left (Just failed))
           else
