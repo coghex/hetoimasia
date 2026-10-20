@@ -1446,9 +1446,24 @@ teardown begins; and when the example's bound expires, `bounded` opens them from
 its own, because an example parked in the runner's protected retirement cannot, and the
 exception the bound throws does not end that wait. A helper thread that fails opens them too,
 and the example fails with the helper's failure. The passing path is untouched: each example
-still opens each gate where it opens it. `expectFatalOpening` and `tryBoundaryOpening` also
-raise a failed assertion or the bound as itself, and do not take it for the failure the
-boundary was expected to end with. The `Gates` examples hold these helpers to that.
+still opens each gate where it opens it. The `Gates` examples hold these helpers to that.
+
+An example that expects the boundary, or a wait, to fail must not take its own failure for the
+one it expects. Every helper that catches the failure (`expectFatal`, `expectFatalOpening`,
+`tryBoundaryOpening`, `tryExpected` which the others are built on, and the accounting examples'
+`failingWait` and `retainedFailure`) raises a failed assertion, or the example's `bounded`
+timeout, as itself: the example fails with the assertion's own message and source location,
+within its bound, and the helper answers no outcome and runs nothing after it. What it still
+answers is the application's own failures: a typed one such as `Broken`, an injected
+`userError` or other `IOException`, and the supervised fatal outcomes with their context and
+retained cleanup evidence. So a helper or an example that asserts raises `failExample`, an
+`HUnitFailure` carrying the caller's location, and never `fail` or a `userError`, which a
+helper cannot tell from an application failure an example injected. An optional worker's
+`optionalPolicy` does not recognize a failed assertion either, whatever else it recognizes, so
+one a fixture raises on the worker is fatal. A catch that wraps only one production call, with
+no fixture or assertion of the example inside it, may stay a plain `try`. The `Expected` examples
+hold each helper to this, for an assertion raised in the boundary (the example's own and a fixture
+helper's) and for the bound expiring.
 
 ```bash
 cabal test hetoimasia-scripting-lua:lua-runtime-tests --test-show-details=direct
