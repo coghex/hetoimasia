@@ -13,14 +13,17 @@ single-VM runner (`Hetoimasia.Scripting.Lua.Runner`) or any `Internal` module, a
 GLFW or console dependency, so it builds in both `cabal.project` and `cabal.project.cpu`. No engine
 library depends on it, and nothing routine launches its executable.
 
-This slice is the two-domain core. A failed gameplay session, intention overload beyond the `full`
-answer, the stop and cancellation paths with cleanup evidence on every path, and determinism
-qualification are later slices; nothing below claims them.
+This sample covers the two-domain core (LUA-29) and, on top of it, the paths that decide whether the
+design is trustworthy (LUA-30): a failed gameplay session, overload beyond the `full` answer, the stop and
+cancellation paths with cleanup evidence on every path, the leases a gameplay instance holds, and the UI's
+pause and resume of gameplay. Determinism qualification is a later slice; nothing below claims it.
 
 ## Reproduce
 
 ```sh
 cabal run exe:hetoimasia-lua-domains -- --ticks 20 --seed 1
+cabal run exe:hetoimasia-lua-domains -- --scenario normal     # exits 0
+cabal run exe:hetoimasia-lua-domains -- --scenario failure    # exits 1, with the failure as evidence
 cabal run exe:hetoimasia-lua-domains -- --help
 cabal test hetoimasia-sample-lua-domains:lua-domains-tests --test-show-details=direct
 ```
@@ -43,6 +46,9 @@ a handle into a VM; each owner's bindings borrow what they need and nothing else
 | UI view (the segment's capture) | the UI owner, as each of its segments is about to run | the UI's bindings | UI owner's thread and its callback thread | one segment |
 | Fake input source, completed-update count | the UI's bindings | the UI's bindings, the examples | UI owner's callback thread | the session |
 | Counters by answer and by disposition | the answering and committing transactions | the report, the examples | any | the session |
+| Session state (`Session`): the failures told of, whether a stop was asked for, how the session ended | the owners' escalation callbacks, the driver's stop | the driver, the report | the owner's thread, the driver | the session |
+| Control bookkeeping (next place per tick, requests in flight, counts, receipts held) | the UI's facade, the assignment callback | the driver (it waits on the in-flight count), the report | the UI owner's thread, any | the session |
+| Workspace tally (acquired, released, release failed) | the workspace's acquire and release, on the gameplay owner's threads | the report, the examples | any | the session |
 
 The UI never reads the committed world or the candidate; gameplay never reads the view or the snapshot.
 
@@ -76,7 +82,12 @@ protected wait retires an owner that came up when the other failed to start. Eac
 instance's settlement are read back (`Retirement`), and when `withDomains` returns or raises, from inside
 the supervision boundary, neither owner is live.
 
-Grants start only after the owners' behaviors are active (`init` has run).
+Grants start only after the owners' behaviors are active (`init` has run), or have failed: an `init` that
+raises ends the instance, which is the session's failure and is published before the first tick (below).
+
+Both owners are created with the engine's `vmPolicy` for what each exposes, but the cross-owner link is the
+engine's own: the UI owner is granted **control and inspection of the gameplay owner's endpoint and nothing
+else** (`lifecycleGrant`), and gameplay admits those controls logically, at an application-assigned tick.
 
 ## Registration and exposure
 
@@ -89,14 +100,20 @@ empty).
 | --- | --- | --- |
 | `view` | UI | `tick()`, `session()`, `count()`, `entity(i)`: snapshot queries answering from the segment's one capture |
 | `intent_raw` | UI | `submit(...)`, the typed intention binding, and `malformed()`; the UI's initial chunk reads both and removes the namespace |
-| `input` | UI | `poll()`: the next entry of the fixed fake input source |
-| `ui` | UI | `updated()`: one update completed |
+| `input` | UI | `poll()`: the next entry of the fixed fake input source, and `scenario()`: the scenario's name |
+| `ui` | UI | `updated()`: one update completed; `busy()`, `saw(status)`: what the UI noted |
+| `control_raw` | UI | bookkeeping for the control facade (`begin`, `finish`, `note`, `settled`), removed from the globals by the UI's initial chunk |
+| `lifecycle_raw` | UI | the engine's lifecycle namespace (`pause`, `resume`, `result`) over the granted gameplay endpoint, wrapped by the facade and removed |
+| `workspace` | gameplay | `open()`, `note(handle, n)`, `read(handle)`: the per-instance leased workspace |
 | `world` | gameplay | `tick()`, `session()`, `count()`, `entity(i)` over the tick's candidate |
 | `staging` | gameplay | `move(i, dx, dy)` into the bounded batch, `finish()` |
 | `rand` | gameplay | `below(n)`: a draw from the application-owned stream |
 
-No binding takes or returns a capability and the registration declares no capability type, so nothing
-one VM holds names anything in the other; module state, including a global or an upvalue, is per VM.
+The one capability type is `workspace`, issued by the gameplay VM for the gameplay instance that opened the
+workspace; it is a lease handle, valid only in that VM and only while the lease is live, and nothing in it
+names anything in the other VM. The UI sees no capability type: it reaches gameplay only through the
+engine's lifecycle controls, whose target is a plain record of the gameplay behavior's engine identity
+(read from the view). Module state, including a global or an upvalue, is per VM.
 
 ## The world and one tick
 
@@ -106,19 +123,32 @@ and the random stream's state. Positions are clamped to ±10⁹.
 
 The driver's `stepTick`:
 
-1. In one transaction, **seal** the next unstarted tick of the queue and make the tick's
-   **candidate**: the committed world with the tick's intentions revalidated against it, in the order of
-   their places, and applied (below). The tick's random stream starts at the committed state.
+1. In one transaction, check the session still runs (nothing failed, no stop was asked for), **wait while a
+   control request is between the assignment of its place and the engine's admission of it** (the UI's
+   bracket; a UI that has ended is not waited for), then **seal** the next unstarted tick of the queue and
+   make the tick's **candidate**: the committed world with the tick's intentions revalidated against it, in
+   the order of their places, and applied (below). The tick's random stream starts at the committed state.
 2. **Grant** gameplay one logical step of the configured duration (ten milliseconds). One grant is
    outstanding at a time.
 3. Wait for the owner to complete the tick (`awaitTicksComplete`).
-4. Check that the work **finished successfully**. A completed tick says only that the grant was applied
-   and nothing is left it could run; a task that waits, fails, pauses or stops completes its tick too. The
-   tick commits only if gameplay called `staging.finish()` and the instance is still active with nothing in
-   flight and no update owed. Otherwise nothing is committed and `TickNotCompleted` is raised, and the
-   session is halted: a later `stepTick` raises `TickAlreadyInProgress`.
-5. In one transaction, replace the committed world, publish the snapshot, settle the tick's
-   reservations in the queue and count its dispositions. A reader sees the whole tick or none of it.
+4. **Fence.** A completed tick says only that the grant was applied and nothing is left it could run: the
+   scheduler reconciles the grant *before* the instance layer has accounted for what the tick's last segment
+   did, so an invocation the scheduler ended with a refused wait still looks, for a moment, like an active
+   instance with nothing in flight. The driver therefore admits a task that does nothing (`sample_fence`,
+   appended to every gameplay module) and waits for its settlement. The owner's thread runs a segment and the
+   boundary after it strictly in turn, so the fence's segment begins only after every earlier boundary is over:
+   the instance layer has accounted for the tick, an instance that failed has ended (its `shutdown` and the
+   release of what it held included) and the application has been told. The faults of tasks the session
+   admitted are read next.
+5. **Decide.** A failure told of fails the session and commits nothing; a stop commits nothing; otherwise the
+   tick commits only if its work **finished successfully**: gameplay called `staging.finish()` and the instance
+   is active with nothing in flight and no update owed, or the engine says why there is no work (the behavior
+   is paused, was paused when the tick began, or a control was applied at the tick's boundary). Anything else
+   raises `TickNotCompleted`, commits nothing and halts the session. Tick completion alone never authorizes a
+   commit.
+6. In one transaction, replace the committed world, publish the snapshot (its status taken from the engine's
+   inspection of the behavior, `Paused` or `Running`), settle the tick's reservations in the queue and count
+   its dispositions. A reader sees the whole tick or none of it.
 
 Gameplay reads the world through `world`, stages moves through `staging.move` into a batch bounded by
 `boundStaging` (a move past it, of no entity or over the delta bound is answered `false`, a recoverable
@@ -130,8 +160,10 @@ nothing, so the snapshot always shows the last completed tick, and real delays c
 happens and never what it contains.
 
 A **snapshot** (`GameSnapshot`) carries the session's identity, the completed tick, the whole world, the
-tick's dispositions and a session status. The status type admits a failed session, which a later slice
-sets; in this slice only `Running` is reachable. Its revision advances by exactly one per committed tick.
+tick's dispositions, the gameplay behavior's engine identity (which the UI addresses its controls to) and a
+session status: `Running`, `Paused` (the behavior is paused; ticks and accepted intentions go on), `Failed`
+with its evidence, or `Stopped`. Its revision advances by exactly one per committed tick, and by one for the
+session's ending (a failure or a stop), which is published once.
 
 ## Intentions
 
@@ -185,6 +217,135 @@ before that is for a tick up to N and is settled by that tick's commit. `runSess
 the UI first, before it reads the counters, so no producer of the UI's is left, and raises
 `ConservationViolated` if anything is pending or the law does not hold.
 
+## A failed session
+
+Any failure of script execution on the gameplay owner fails the session: an `init`, `update`, `run` or
+`shutdown` that raises, a callback that raises, a delivery the instance cannot be handed, a wait the
+scheduler refuses, and the fault of a task the session admitted. The first failure is the session's
+(*primary*); later ones are *evidence* (`maxSecondaryKept`, four, are kept and the rest only counted).
+Application code that fails, a binding that raises for instance, is not a script failure: it is an owner
+failure, which supervision reports as it always does, and the snapshot does not say `Failed` for it.
+
+What the session does, by design (D-26, D-27, P-7):
+
+* the instance's escalation callback records the failure in the session state and answers `Isolate`, so the
+  engine keeps the owner and its VM alive, running nothing;
+* from the moment the driver knows of a failure it grants nothing more and commits nothing: **the driver learns
+  of a failure in tick T before it decides T's commit**, on every ordering, which is what the fence of step 4
+  enforces (a failure in the last segment, in the only segment, two failures, and a wait the scheduler refused
+  in the final segment with a held `shutdown` are covered by examples that force each ordering with gates);
+* the driver publishes **one** snapshot for the failure: the last good world and committed tick, status
+  `Failed` with the primary failure (who, which stage, which tick, which kind, a bounded message), the number
+  of failures told of by then, and the **invalidated** intentions;
+* a failure that is told of later (a teardown, a `shutdown` that raises when the session is stopped) is
+  counted in the evidence the report and `cleanupEvidence` give; it is never published, and the snapshot is
+  not republished.
+
+A failed `init` of the behavior is the same failure at tick 0: the initial world is published with it.
+
+## The ledger on every path
+
+Every accepted intention reaches exactly one terminal disposition, and none is applied twice or retried:
+
+| Disposition | When |
+| --- | --- |
+| applied, rejected as stale | the tick it was accepted for committed (these stand, whatever happens later) |
+| **invalidated** | a failure ended the session before the tick the intention was for committed: those of the failing tick, those accepted for ticks that never began (listed in the failure snapshot, at most `boundDroppedListed`, eight, with a count of any not listed) |
+| **discarded** | a stop (or retirement) ended the session before its tick committed (listed in the stopped snapshot the same way) |
+
+Staged is not committed: what a failed tick staged or applied into its candidate is thrown away with it and
+the intentions are invalidated, never counted as applied. After a quiescent run
+`accepted = applied + stale + invalidated + discarded` with nothing reserved, and `runSession` raises
+`ConservationViolated` if it does not hold. Admission answers `closed` from the moment a failure, a stop or a
+retirement begins.
+
+## Overload
+
+The answers to an intention are counted by kind, and `full` by cause (the queue's bound, or the places of the
+tick): `accepted + full + closed + refused + malformed` is the number of offers made, and the UI never blocks
+on any of them. The flood scenario and the examples with several producer threads show it; a UI that is
+answered `full` shows a busy indication and offers the intention again at most three times.
+
+## Stopping, cancellation and the cleanup evidence
+
+`stopSession` is the one stop of the session, from the driver, and it can be called again (it then only
+reports how the owners ended). It:
+
+1. closes admission and grants at once, so nothing is accepted for a tick that will never run;
+2. asks the gameplay instances (the behavior and any others) to stop and waits for each to be **settled**,
+   which includes its `shutdown` hook and the release of every lease it held, so a segment that is running is
+   not preempted and the stop waits for it to return;
+3. runs the fence, and learns through it whether that settlement was a failure;
+4. publishes one last snapshot: `Stopped` with the intentions the stop discarded; or, if `shutdown` raised
+   and nothing failed before, the failure (the world is the last committed one: frozen); a session that had
+   already failed keeps the failure as its status, and nothing is published for the stop;
+5. lets the UI owner read the receipts of the controls it asked for (while the UI serves), closes the
+   publication and retires both owners, the UI first.
+
+A stop from another thread while a tick is in flight halts that tick (`TickHalted`): the tick commits
+nothing, and the driver is told so, not left with a defect.
+
+**Cancellation** of the enclosing scope retires both owners by cancelling them, not by stopping them: each exits
+cancelled (the library records either `ExitCancelled` or `ExitStopped`, since the cancellation also trips the
+owner's stop token and which its loop sees first is the library's race, and its instance settles as discarded
+or stopped); what is not settled is discarded, and nothing hangs. The examples check that both workers
+ended, the publication closed, nothing is pending and the workspaces released.
+
+**Evidence.** For every way a session can end, `cleanupEvidence` (and the last lines of the report) gives
+one bounded record: both owners' exit records and statuses, each instance's termination (what it revoked
+and discarded, what became of `shutdown`, the leases drained and failed), the workspaces acquired against
+released and release-failed, whether the publication ended, the ledger and what was left pending, the UI's
+control counts, and the failures told of after the failure snapshot (bounded). A teardown failure after the
+snapshot goes there and is never republished.
+
+## Leases: the gameplay workspace
+
+Each gameplay instance's `init` opens a **workspace** through the engine's leases (capacity `boundWorkspaces`,
+two); the script keeps the handle in `self` and never releases it. The engine releases whatever an instance
+acquired when the instance ends, however the script behaves: a failed `init` after acquiring, a handle the
+script overwrote or never stored, an absent or a raising `shutdown`, a stop, the owner's retirement. A third
+open beyond the capacity is refused by the engine and faults the invocation (a session failure). The tally
+distinguishes *released* from *release failed*; a release that itself fails is cleanup evidence that ends the
+owner fatally and terminates its worker (the engine's rule), is reported in the evidence, and is not a
+recoverable session failure: nothing in the sample catches it as one.
+
+## Controls: pause and resume
+
+The UI owner may ask the gameplay owner to **pause** or **resume** the gameplay behavior (the engine's
+lifecycle controls, granted for control and inspection of that one endpoint). The application assigns each request
+the next tick that has not begun and a place in it (`assignControl`), the engine applies it at that tick's
+boundary, and the UI is answered with the engine's own reasons:
+
+* a request is *accepted* (for that tick) or refused at once (`unassigned` when the session has failed, is
+  stopping or is closed; `unknown_target` before gameplay's identity is known);
+* an accepted request settles *applied*, *already in that state* (a pause of a paused behavior: both are
+  accepted, in order, in one tick), or *no longer applicable* (the instance ended, or the session did, before
+  its tick);
+* the UI reads the settlement through a receipt (`control.settle()`); the receipts it still holds when it
+  ends are *abandoned*, reported apart and never given a result; an abandoned control is not cancelled, an
+  accepted control still applies; an orderly stop settles the pending gameplay controls, and waits for the UI to
+  read them while the UI serves.
+
+Pause stops the gameplay behavior's `update` and nothing else: **ticks go on being granted and committed,
+intentions accepted are applied while paused**, and the committed snapshots say `Paused`. The tick that
+resumes it runs no update; the first update is a full interval later. Control counts satisfy
+`offered = accepted + refused` and, once quiescent, `accepted = applied + already + no longer applicable +
+abandoned`.
+
+**Serialization with the tick.** The assignment and the engine's admission are two steps, and a tick that
+began between them would find the control late. The UI facade brackets each lifecycle call with an in-flight
+count (`control_raw.begin`/`finish`); the driver's begin transaction waits on it, unless the UI that made the
+request has ended. The UI is never made to wait for the driver, and never late. An example holds the interval open
+with a test seam and shows that a tick attempted in it does not begin and that the control applies in the tick it
+was assigned.
+
+## A failure of the UI behavior
+
+A failure of the UI owner's behavior is isolated: it is recorded once (bounded), the UI instance ends and is
+not restarted, and nothing else changes: gameplay is not told and keeps ticking (its worlds are the same as for a
+UI that offered nothing), intentions already accepted are still applied, the UI offers nothing more, its held
+receipts are abandoned, and the report and the exit status say the UI failed.
+
 ## The UI's view
 
 The UI owner captures the latest committed snapshot at the start of each of its segments, in
@@ -229,29 +390,44 @@ intentions are assigned to ticks by elapsed time.
 ## The executable
 
 ```
-hetoimasia-lua-domains [--ticks N] [--seed N]
+hetoimasia-lua-domains [--ticks N] [--seed N] [--scenario NAME]
 hetoimasia-lua-domains --help
 ```
 
-It runs both owners against the fixed scripted fake input source (forty entries, the same on every run;
-the UI script polls it through a UI-owned binding), commits N ticks (1 to 100000, twenty by default;
-`--seed` defaults to 1), retires both owners and exits **0** after one bounded report on stdout:
+It runs both owners against a fixed scripted fake input source (forty entries, the same on every run, or two
+hundred for `flood`), commits N ticks (1 to 100000, twenty by default; `--seed` defaults to 1), retires both
+owners and prints one bounded report on stdout.
+
+| Scenario | What it does | Exit |
+| --- | --- | --- |
+| `normal` (default) | the fixed input and nothing else | 0 |
+| `pause` | the UI pauses gameplay once its view shows tick 4 and resumes it at tick 9 | 0 |
+| `failure` | gameplay's behavior raises at tick 6: the session fails there, with tick 5's world | **1** |
+| `flood` | the UI offers two hundred intentions, sixteen an update: many are answered `full` | 0 |
+| `stop` | the driver stops the session after tick 8 | 0 |
+
+The exit status is **0** when the session ended without a failure (a stop is not one), **1** when the gameplay
+session failed or a UI failure was recorded, and **2** for an unknown, repeated or malformed argument (one bounded line
+on stderr, the user's text escaped and cut, and no report). `--help` prints the usage and exits 0. The report is
+ten lines:
 
 ```
-hetoimasia-lua-domains: session 1, seed 1
-ticks committed: 20
-intentions answered: accepted 32, full 8, closed 0, refused 0, malformed 0
-intentions settled: applied 24, stale 8
-ui updates: 56
-intentions pending: 0
+hetoimasia-lua-domains: session 1, seed 1, scenario failure
+ticks committed: 5
+status: failed at tick 6: gameplay active update, script error: gameplay@1:33: scripted failure at tick 6, later failures 0
+intentions answered: accepted 40, full 16 (queue 0, places 16), closed 0, refused 0, malformed 0
+intentions settled: applied 24, stale 4, invalidated 12, discarded 0
+controls: offered 0, accepted 0, refused 0, applied 0, already 0, no longer applicable 0, abandoned 0
+ui: updates 14, busy 16, retried 16, saw running, no failure
+cleanup: ui ended (status stopped, exit ExitStopped, not started 0, in flight 0); gameplay ended (status stopped, exit ExitStopped, not started 0, in flight 0)
+cleanup: gameplay failed [shutdown ShutdownAbsent, leases drained 1 failed 0]; interface stopped [shutdown ShutdownAbsent, leases drained 0 failed 0]
+cleanup: workspaces acquired 1, released 1, release failed 0; publication closed; pending 0; failures told of 1, after publication 0
 ```
 
 The counts vary from run to run, because the UI runs on elapsed time and so decides which tick takes an
-intention; *accepted = applied + stale* and *pending 0* do not. `--help` prints the usage and exits 0. Any
-unknown, repeated or malformed argument, or a missing value, prints one bounded line on stderr (the user's
-text escaped and cut) and exits **2**. Diagnostics go to stderr and no window is created. Between ticks the
-executable waits five milliseconds of real time so the UI owner has something to do; that pacing changes
-when a commit happens and never what it contains.
+intention; the laws do not: *accepted = applied + stale + invalidated + discarded* and *pending 0*. Diagnostics go to stderr and no
+window is created. Between ticks the executable waits five milliseconds of real time so the UI owner has
+something to do; that pacing changes when a commit happens and never what it contains.
 
 ## Tests
 
@@ -259,11 +435,14 @@ when a commit happens and never what it contains.
 timing sleeps for concurrency correctness: explicit gates, STM waits and bounded waits through
 `hetoimasia-test-support`. It covers, by requirement: the package and import boundary read from the Cabal
 description and the imports; both owners' exit records and nothing left live, on a clean run, when the body
-fails, when the driver is cancelled in the middle of a held tick, and when a gameplay binding fails;
-exposure per owner, module state per VM and no handle into the other VM; a staged batch invisible until the
-commit, one snapshot per completed tick and none for a held tick or one whose work did not finish; the
-answers to valid, full, malformed and over-bound intentions with a held gameplay tick; admissions raced
-against the grants; conservation, including a finite session's final grant racing admissions; the coherent
-view; both progress proofs; the random stream; and the executable's report, `--help` and exit status 2. The
-executable is reached through the suite's `build-tool-depends` and run as a child process, and no
-validation group launches it any other way.
+fails, when the driver is cancelled in the middle of a held tick, and when a gameplay binding fails; exposure
+per owner, module state per VM and no handle into the other VM; a staged batch invisible until the commit, one
+snapshot per completed tick and none for a held tick or one whose work did not finish; the answers to valid,
+full, malformed and over-bound intentions with a held gameplay tick; admissions raced against the grants;
+conservation on every path (`Ledger`); the coherent view; both progress proofs; the random stream; the
+failure of the gameplay session, with each failure timing forced by gates (`Failure`); events a provider
+delivers and what a delivery failure does (`Delivery`); the stop paths and the cleanup evidence (`Stop`); the
+workspace leases on every path an instance can end by, with a test-only workspace whose release fails
+(`Leases`); the UI's failure (`UiFailure`); pause, resume and the serialization of controls with the tick
+(`Controls`); and the executable's report, scenarios, `--help` and exit statuses. The executable is reached through the suite's
+`build-tool-depends` and run as a child process, and no validation group launches it any other way.

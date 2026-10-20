@@ -3417,6 +3417,24 @@ and verified policy, with adversarial regression coverage.
   progress proofs are the barrier example and the CPU-bound example (sized from a calibration, asserted as an ordering
   of the UI's update count between the computation's start and its end). The library, the runner, the CI image and the
   native pins are unchanged; the only workflow change is routing and publishing the new group's receipt.
+- **As delivered (#499):** the sample now fails, overloads and stops explicitly, extending #498's contract without
+  reopening it (`samples/lua-domains/README.md` is the contract). Any script failure on the gameplay owner fails the
+  session (every instance's escalation callback answers `Isolate` and records the failure, a faulted task the session
+  admitted is read after the fence, an application failure is not one); the first failure is primary and the rest
+  bounded evidence; one failure snapshot is published carrying the last good world and tick and the invalidated
+  intentions. The driver learns of a failure in tick T before it decides T's commit through a **fence**: after the
+  tick completes it admits a no-op task and awaits it, which settles only after the owner has run the boundary of
+  every earlier segment (the scheduler reconciles a grant before the instance layer accounts for the tick's last
+  segment, so a refused wait looks, for a moment, like an idle active instance). The ledger gains *invalidated* and
+  *discarded*; a stop (`stopSession`) ends admission and grants, settles the gameplay instances including `shutdown`
+  and lease cleanup, then publishes one `Stopped` (or failed) snapshot; a stop from another thread halts a tick in
+  flight; cancellation cancels both owners instead of stopping them (the library records `ExitCancelled` or
+  `ExitStopped` per owner, a race it owns). Each gameplay instance leases a workspace through the engine; a failing
+  release is cleanup evidence that ends the owner fatally. The UI pauses and resumes the gameplay behavior through the
+  engine's lifecycle controls, granted for control and inspection of that endpoint only; the application assigns each
+  a tick and a place, and the driver's begin waits while a request is between assignment and admission. A UI failure is
+  isolated and reported. The executable gains `--scenario normal|pause|failure|flood|stop` and exit status 1 for a failed
+  session. No library, runner, workflow, CI image or native pin changed.
 
 ### LUA-30. Fail, overload and stop the two-domain sample explicitly
 
