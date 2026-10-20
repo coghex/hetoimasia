@@ -145,7 +145,7 @@ spec = describe "the failure of the gameplay session" $ do
               }
         )
         $ \_ _ domains → do
-          (snapshot, _) ← snapshotNow domains
+          snapshot ← awaitRevision domains 1
           fmap (failStage . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "run"
           fmap (failWho . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "one-shot"
           stepTick domains >>= (`shouldSatisfy` isHalted)
