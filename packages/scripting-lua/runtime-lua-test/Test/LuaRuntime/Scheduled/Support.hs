@@ -73,7 +73,7 @@ import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value
 import Test.LuaRuntime.Scheduler.Support (FakeTimer (..), allRegs, newFakeTimer, nanoseconds)
-import Test.LuaRuntime.Support (Broken (Broken), applicationBoundaryFault, awaitBlockedOnSTM, requiredPolicy)
+import Test.LuaRuntime.Support (Broken (Broken), Gated (..), applicationBoundaryFault, awaitBlockedOnSTM, gateIn, openGatesIn, requiredPolicy)
 
 -- The fixture ------------------------------------------------------------------
 
@@ -145,12 +145,8 @@ taskEffects fixture = filter (not . Text.isSuffixOf " holder") <$> effects fixtu
 segmentsRun ∷ SFixture → IO [SegmentContext]
 segmentsRun fixture = reverse <$> readIORef (sfContexts fixture)
 
-gateIn ∷ IORef (Map Text (MVar ())) → Text → IO (MVar ())
-gateIn table name = do
-  fresh ← newEmptyMVar
-  atomicModifyIORef' table $ \held → case Map.lookup name held of
-    Just existing → (held, existing)
-    Nothing → (Map.insert name fresh held, fresh)
+instance Gated SFixture where
+  openAllGates = openGatesIn . sfGates
 
 -- | Let the binding waiting on this gate go on. Harmless twice.
 releaseGate ∷ SFixture → Text → IO ()

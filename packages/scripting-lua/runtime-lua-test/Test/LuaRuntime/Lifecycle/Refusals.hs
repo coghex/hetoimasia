@@ -13,7 +13,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Lifecycle.Support
 import Test.LuaRuntime.Scheduled.Support (awaitScheduledTerminal)
-import Test.LuaRuntime.Support (bounded, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, withBoundary, withBoundaryOpening)
 
 -- | What an accepted request answered, with this receipt.
 takenAs ∷ Int → Text
@@ -28,7 +28,7 @@ spec = describe "refusals" $ do
   it "refuses a request the target has no reservation for, takes none for it, and takes one again as a result is read" $ bounded $ do
     targetFx ← newIFixture
     callerFx ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates targetFx, openAllGates callerFx] $ \_ runtime → do
       owner ← startTarget targetFx runtime "target" [echoer, holder] (testConfig instanceBounds')
       _ ← admit targetFx owner "a" (moduleNamed "echoer")
       awaitPhase targetFx owner "a" Active
@@ -74,7 +74,7 @@ spec = describe "refusals" $ do
   it "refuses as closed from the moment the target's owner is asked to stop, settles what it had accepted and never applied as no longer applicable, and keeps refusing after it has exited" $ bounded $ do
     targetFx ← newIFixture
     callerFx ← newIFixture
-    withBoundary $ \control runtime → do
+    withBoundaryOpening [openAllGates targetFx, openAllGates callerFx] $ \control runtime → do
       owner ← startTarget targetFx runtime "target" [echoer, holder] (testConfig instanceBounds')
       _ ← admit targetFx owner "a" (moduleNamed "echoer")
       awaitPhase targetFx owner "a" Active

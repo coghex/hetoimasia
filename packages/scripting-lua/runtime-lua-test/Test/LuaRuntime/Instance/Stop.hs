@@ -12,7 +12,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEffect, awaitScheduledTerminal, cancelQueued)
-import Test.LuaRuntime.Support (bounded, brokenIs, expectFatal, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, brokenIs, expectFatal, requiredPolicy, withBoundary, withBoundaryOpening)
 
 stopped ∷ InstanceOutcome → Bool
 stopped = \case InstanceStopped → True; _ → False
@@ -44,7 +44,7 @@ spec = describe "stopping" $ do
 
   it "counts what each end revoked and discarded: an idle stop, a failed callback with events queued, and the owner's retirement" $ bounded $ do
     fixture ← newIFixture
-    withBoundary $ \control runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \control runtime → do
       owner ← startInstances fixture runtime "counts" [echoer, failCallback, holder] (testConfig instanceBounds') requiredPolicy
       _ ← admit fixture owner "idle" (moduleNamed "echoer")
       _ ← admit fixture owner "failing" (moduleNamed "failcallback")
@@ -102,7 +102,7 @@ spec = describe "stopping" $ do
 
   it "runs no hook and settles as discarded when the owner is cancelled, however far each instance had come" $ bounded $ do
     fixture ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       owner ← startInstances fixture runtime "cancelled" [echoer, holder] (testConfig instanceBounds') requiredPolicy
       _ ← admit fixture owner "begun" (moduleNamed "echoer")
       awaitPhase fixture owner "begun" Active
@@ -121,7 +121,7 @@ spec = describe "stopping" $ do
 
   it "stops an instance accepted and not yet begun when the owner retires, running none of its hooks" $ bounded $ do
     fixture ← newIFixture
-    withBoundary $ \control runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \control runtime → do
       owner ← startInstances fixture runtime "unbegun" [echoer, holder] (testConfig instanceBounds') requiredPolicy
       holdOwner fixture owner
       _ ← admit fixture owner "a" (moduleNamed "echoer")

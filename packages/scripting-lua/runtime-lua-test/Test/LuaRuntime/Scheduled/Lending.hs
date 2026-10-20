@@ -15,7 +15,6 @@ import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar,
 import Control.Exception
   ( ExceptionWithContext (ExceptionWithContext)
   , SomeException
-  , finally
   , fromException
   , throwIO
   , try
@@ -46,7 +45,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduled.Support
-import Test.LuaRuntime.Support (Broken (Broken), bounded, brokenIs, expectFatal, optionalPolicy, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Broken (Broken), Gated (..), bounded, brokenIs, expectFatal, gateIn, openGatesIn, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- The fixture ------------------------------------------------------------------
 
@@ -85,12 +84,9 @@ note fixture entry = atomicModifyIORef' (lfLog fixture) (\held → (entry : held
 history ∷ LFixture → IO [Text]
 history fixture = reverse <$> readIORef (lfLog fixture)
 
-gateIn ∷ IORef (Map Text (MVar ())) → Text → IO (MVar ())
-gateIn table name = do
-  fresh ← newEmptyMVar
-  atomicModifyIORef' table $ \held → case Map.lookup name held of
-    Just existing → (held, existing)
-    Nothing → (Map.insert name fresh held, fresh)
+-- | Let every gate of the fixture go on, its own and its scheduled base's.
+instance Gated LFixture where
+  openAllGates fixture = openGatesIn (lfGates fixture) >> openAllGates (lfBase fixture)
 
 openGate ∷ LFixture → Text → IO ()
 openGate fixture name = gateIn (lfGates fixture) name >>= void . (`tryPutMVar` ())
@@ -448,20 +444,17 @@ spec = describe "a collection lent to the owner's callbacks (LUA-25)" $ do
 
     it "refuses a loan presented from another VM's callback while the callback it was lent to is running, and that callback goes on using it" $ bounded $ do
       fixture ← newLFixture
-      withBoundary $ \control runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \control runtime → do
         holder ← startLending fixture runtime (lendingSpec fixture "holder" requiredPolicy [])
         presenterHandle ← newLending
         presenter ← startLending fixture runtime (lendingSpecFor fixture presenterHandle "presenter" requiredPolicy [])
         held ← task fixture holder "holds" [VText "g"]
         awaitReached fixture "g"
         -- The holder's callback is running and its loan is kept; another VM's
-        -- callback presents it. The gate is opened however the checks go, so a
-        -- failing example fails instead of leaving the holder stuck.
-        ( do
-            _ ← task fixture presenter "presents" [VText "p"] >>= outcomeOf
-            history fixture >>= (`shouldBe` ["reuse: elsewhere"])
-          )
-          `finally` openGate fixture "g"
+        -- callback presents it.
+        _ ← task fixture presenter "presents" [VText "p"] >>= outcomeOf
+        history fixture >>= (`shouldBe` ["reuse: elsewhere"])
+        openGate fixture "g"
         _ ← outcomeOf held
         history fixture >>= (`shouldBe` ["reuse: elsewhere", "acquire legit", "after hold: ok"])
         retireScheduled holder

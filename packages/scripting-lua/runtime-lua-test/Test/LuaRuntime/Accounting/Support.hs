@@ -42,9 +42,6 @@ module Test.LuaRuntime.Accounting.Support
   , blockAfterTicks
     -- * Grants
   , grant
-    -- * Holding the owner
-  , holdingSafely
-  , releasing
     -- * Owners
   , startPlain
     -- * Examples that expect the wait to end with a failure
@@ -56,10 +53,8 @@ import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, yield)
 import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (ThreadBlocked), threadStatus)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar, tryReadMVar)
 import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
-import System.Timeout (Timeout)
-import Test.LuaRuntime.Support (withBoundary)
-import Control.Exception (SomeException, finally, fromException, mask_, onException, throwIO, try)
-import Control.Monad (forM_)
+import Test.LuaRuntime.Support (Gated (..), tryBoundaryOpening)
+import Control.Exception (SomeException, mask_, try)
 import Data.Word (Word64)
 import Hetoimasia.Runtime.Supervision (RuntimeControl, WorkerPolicy)
 import Hetoimasia.Scripting.Lua.Owner
@@ -69,7 +64,7 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Test.LuaRuntime.Instance.Support (hooksModule, record)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Scheduled.Support (SFixture, admitTask', awaitEntered, releaseGate, request, scheduled, startScheduled)
+import Test.LuaRuntime.Scheduled.Support (SFixture, awaitEntered, releaseGate, scheduled, startScheduled)
 
 -- A wait on a thread of its own -----------------------------------------------------
 
@@ -398,29 +393,6 @@ grant owner n =
     GrantAccepted _ → pure ()
     other → ioError (userError ("expected the grant accepted, found " <> show other))
 
--- Holding the owner --------------------------------------------------------------------
-
--- | Run this while the owner is held inside a segment, as "Test.LuaRuntime.Scheduled.Support"'s
--- own helper does, but let the owner go if the body raises, so that a failing example fails and
--- does not hang the protected exit of the boundary it ran in.
-holdingSafely ∷ SFixture → ScheduledOwner → IO a → IO a
-holdingSafely fixture owner body = do
-  ticket ← admitTask' fixture owner "holder" (request "block_in" [VText "holder"] ControlClass OneShot Nothing)
-  awaitEntered fixture "holder"
-  result ← body `onException` releaseGate fixture "holder"
-  releaseGate fixture "holder"
-  _ ← waitTask ticket
-  pure result
-
--- | Run this, and however it ends open every gate an example parks the owner at (the gate of a
--- hook, of a closing handler, of a task, of the application's own callback), so that an example
--- that fails fails, and does not leave a protected exit waiting on an owner nothing can wake.
-releasing ∷ SFixture → [Gate] → IO a → IO a
-releasing fixture gates action =
-  action `finally` do
-    forM_ ["holder", "hold", "close", "shutdown", "a", "b", "blk", "y", "obs", "r", "clk1", "clk2"] (releaseGate fixture)
-    forM_ gates openGate
-
 -- Owners ---------------------------------------------------------------------------------
 
 -- | A plain scheduled owner that also loads the module of tasks the windows add.
@@ -434,17 +406,14 @@ startPlain fixture runtime label policy bounds =
 
 -- | Run a scenario inside a boundary, which begins a wait and drives the owner to a failure, and
 -- require that the wait ended by raising one: the supervised failure, rethrown, and never an answer.
--- The boundary's own end may carry the failure; a timeout of the example's bound is not that failure and is
--- not swallowed, and the outcome is read without blocking.
-failingWait ∷ SFixture → [Gate] → (RuntimeControl → LuaRuntime → IO PendingWait) → IO ()
+-- The boundary's own end may carry the failure; a failed assertion of the scenario and a timeout of the
+-- example's bound are not that failure and are not swallowed, and the outcome is read without blocking.
+failingWait ∷ Gated fixture ⇒ fixture → [Gate] → (RuntimeControl → LuaRuntime → IO PendingWait) → IO ()
 failingWait fixture gates scenario = do
   outcome ← newEmptyMVar
-  stalled ← try @SomeException . withBoundary $ \control runtime → releasing fixture gates $ do
+  stalled ← tryBoundaryOpening (openAllGates fixture : map openGate gates) $ \control runtime → do
     waiting ← scenario control runtime
     resultOf waiting >>= putMVar outcome
-  case stalled of
-    Left raised | Just (_ ∷ Timeout) ← fromException raised → throwIO raised
-    _ → pure ()
   tryReadMVar outcome >>= \case
     Nothing → ioError (userError ("the example recorded no outcome for the wait" <> either (\raised → ": " <> show raised) (const "") stalled))
     Just (Right answered) → ioError (userError ("the wait answered " <> show answered))

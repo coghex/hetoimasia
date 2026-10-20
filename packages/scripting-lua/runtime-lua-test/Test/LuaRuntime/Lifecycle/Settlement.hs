@@ -17,7 +17,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Lifecycle.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEntered, releaseGate, awaitScheduledTerminal)
-import Test.LuaRuntime.Support (bounded, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, withBoundary, withBoundaryOpening)
 
 takenAs ∷ Int → Text
 takenAs number = "{accepted=true,receipt=" <> Text.pack (show number) <> "}"
@@ -35,7 +35,7 @@ spec = describe "settlement" $ do
   it "settles every request exactly once, in the order accepted, whatever a stop makes of the ones behind it" $ bounded $ do
     targetFx ← newIFixture
     callerFx ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates targetFx, openAllGates callerFx] $ \_ runtime → do
       owner ← startTarget targetFx runtime "target" [echoer, holder] (testConfig instanceBounds')
       _ ← admit targetFx owner "a" (moduleNamed "echoer")
       awaitPhase targetFx owner "a" Active
@@ -56,7 +56,7 @@ spec = describe "settlement" $ do
   it "applies a request made of an instance that is still initializing once it has initialized, and settles one its failure overtook as no longer applicable" $ bounded $ do
     targetFx ← newIFixture
     callerFx ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates targetFx, openAllGates callerFx] $ \_ runtime → do
       owner ← startTarget targetFx runtime "target" [gateInit, gateFailAt "gatefailheld" "badinit"] (testConfig instanceBounds')
       caller ← startCaller callerFx runtime "caller" (Just (target owner))
       admitCommander callerFx caller "cmdr"
@@ -85,7 +85,7 @@ spec = describe "settlement" $ do
   it "takes a request made of an instance that is stopping, and settles it as no longer applicable once the instance has ended" $ bounded $ do
     targetFx ← newIFixture
     callerFx ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates targetFx, openAllGates callerFx] $ \_ runtime → do
       owner ← startTarget targetFx runtime "target" [gateShutdown] (testConfig instanceBounds')
       _ ← admit targetFx owner "a" (moduleNamed "gateshutdown")
       awaitPhase targetFx owner "a" Active
@@ -110,7 +110,7 @@ spec = describe "settlement" $ do
     targetFx ← newIFixture
     callerFx ← newIFixture
     seen ← newIORef Nothing
-    withBoundary $ \control runtime → do
+    withBoundaryOpening [openAllGates targetFx, openAllGates callerFx] $ \control runtime → do
       owner ← startTarget targetFx runtime "target" [echoer, holder] (testConfig instanceBounds')
       _ ← admit targetFx owner "a" (moduleNamed "echoer")
       awaitPhase targetFx owner "a" Active
@@ -132,7 +132,7 @@ spec = describe "settlement" $ do
   it "never undoes what its caller asked when the caller's instance ends, and gives every reservation back though none of the results was read" $ bounded $ do
     targetFx ← newIFixture
     callerFx ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates targetFx, openAllGates callerFx] $ \_ runtime → do
       owner ← startTarget targetFx runtime "target" [echoer, holder] (testConfig instanceBounds')
       _ ← admit targetFx owner "a" (moduleNamed "echoer")
       awaitPhase targetFx owner "a" Active
@@ -154,7 +154,7 @@ spec = describe "settlement" $ do
   it "gives every reservation back when the caller's owner retires with results unread, and still applies what it had accepted" $ bounded $ do
     targetFx ← newIFixture
     callerFx ← newIFixture
-    withBoundary $ \control runtime → do
+    withBoundaryOpening [openAllGates targetFx, openAllGates callerFx] $ \control runtime → do
       owner ← startTarget targetFx runtime "target" [echoer, holder] (testConfig instanceBounds')
       _ ← admit targetFx owner "a" (moduleNamed "echoer")
       awaitPhase targetFx owner "a" Active
@@ -173,7 +173,7 @@ spec = describe "settlement" $ do
   it "gives a reservation back at settlement for a result forgotten while its request was pending" $ bounded $ do
     targetFx ← newIFixture
     callerFx ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates targetFx, openAllGates callerFx] $ \_ runtime → do
       owner ← startTarget targetFx runtime "target" [echoer, holder] (testConfig instanceBounds')
       _ ← admit targetFx owner "a" (moduleNamed "echoer")
       awaitPhase targetFx owner "a" Active

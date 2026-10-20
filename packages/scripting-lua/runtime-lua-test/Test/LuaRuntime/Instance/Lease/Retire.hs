@@ -21,7 +21,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Lease.Support
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfOwnerThread), awaitEffect, awaitIdle, awaitScheduledTerminal, cancelQueued)
-import Test.LuaRuntime.Support (Broken (Broken), awaitBlockedOnSTM, bounded, brokenIs, expectFatal, optionalPolicy, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Broken (Broken), Gated (..), awaitBlockedOnSTM, bounded, brokenIs, expectFatal, expectFatalOpening, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
 import Control.Concurrent.MVar (readMVar)
 
 -- | Block until an instance has this many retirements pending.
@@ -88,7 +88,7 @@ spec = describe "retained retirement" $ do
     forM_ [("retired", False), ("cancelled", True)] $ \(label, cancel) → do
       fixture ← newLFix 4
       let base = lfBase fixture
-      withBoundary $ \control runtime → providersFinish fixture $ do
+      withBoundaryOpening [openAllGates fixture] $ \control runtime → providersFinish fixture $ do
         owner ← startLeased fixture runtime ("live " <> label) [asyncHolder, holder] leaseConfig requiredPolicy
         _ ← admit base owner "a" (moduleNamed "asyncholder")
         awaitPhase base owner "a" Active
@@ -227,7 +227,7 @@ spec = describe "retained retirement" $ do
     forM_ [QueryThrows, QueryLazy, QueryLazyFailure] $ \fault → do
       fixture ← newLFix 4
       let base = lfBase fixture
-      ExceptionWithContext context _ ← expectFatal $ \control runtime → providersFinish fixture $ do
+      ExceptionWithContext context _ ← expectFatalOpening [openAllGates fixture] $ \control runtime → providersFinish fixture $ do
         owner ← startLeased fixture runtime "query fails when serviced" [asyncNamed, marker, holder] leaseConfig requiredPolicy
         _ ← admit base owner "a" (moduleNamed "asyncnamed")
         _ ← admit base owner "b" (moduleNamed "asyncnamed")
@@ -361,7 +361,7 @@ spec = describe "retained retirement" $ do
   it "begins nothing once a provider's failed retirement is observed: work queued behind it never starts, and the owner exits as a failure" $ bounded $ do
     fixture ← newLFix 4
     let base = lfBase fixture
-    ExceptionWithContext context _ ← expectFatal $ \control runtime → providersFinish fixture $ do
+    ExceptionWithContext context _ ← expectFatalOpening [openAllGates fixture] $ \control runtime → providersFinish fixture $ do
       owner ← startLeased fixture runtime "halted" [asyncNamed, marker, holder] leaseConfig requiredPolicy
       _ ← admit base owner "a" (moduleNamed "asyncnamed")
       _ ← admit base owner "m" (moduleNamed "marker")

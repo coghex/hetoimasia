@@ -109,7 +109,7 @@ import Test.LuaRuntime.Instance.Support
   , startWith
   )
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfLog), defaultSchedulerBounds)
-import Test.LuaRuntime.Support (Broken (Broken))
+import Test.LuaRuntime.Support (Broken (Broken), Gated (..))
 
 -- The fixture ---------------------------------------------------------------------
 
@@ -133,6 +133,10 @@ data LFix = LFix
   , lfThrowing ∷ !(TVar (Map Text QueryFault))
     -- ^ The resources whose provider's query of where its retirement has got to fails, and how.
   }
+
+-- | Every gate of the fixture opens: the instance fixture's, and the one a release waits at.
+instance Gated LFix where
+  openAllGates fixture = openAllGates (lfBase fixture) >> void (tryPutMVar (lfProceed fixture) ())
 
 -- | A fixture whose instances may each have this much charged.
 newLFix ∷ Int → IO LFix

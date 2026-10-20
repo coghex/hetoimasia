@@ -14,7 +14,7 @@ import Hetoimasia.Scripting.Lua.Runner
 import System.FilePath (takeDirectory)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Runner.Support
-import Test.LuaRuntime.Support (bounded, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, withBoundaryOpening)
 
 period ∷ Word64
 period = 1000
@@ -114,9 +114,9 @@ transcript ∷ (RFixture → RunnerConfig → RunnerConfig) → (RFixture → IO
 transcript adapt pace = do
   fixture ← newRFixture
   withScripts [(name, lua body) | (name, body) ← scenario] $ \paths →
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       report ←
-        alongside
+        alongside fixture
           (pace fixture)
           (run fixture runtime (adapt fixture (tickConfig fixture period (Just 6) (scriptsAt paths))) >>= expectRan)
       seen ← recorded fixture

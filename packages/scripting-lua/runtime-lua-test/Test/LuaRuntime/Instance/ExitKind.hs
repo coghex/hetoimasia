@@ -19,7 +19,7 @@
 module Test.LuaRuntime.Instance.ExitKind (spec) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, tryWithContext)
+import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), fromException, throwIO)
 import Control.Monad (forM_, void, when)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (isJust)
@@ -30,7 +30,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfObserver), awaitEntered, awaitScheduledTerminal, blockOn)
-import Test.LuaRuntime.Support (Broken (Broken), bounded, brokenIs, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Broken (Broken), Gated (..), bounded, brokenIs, requiredPolicy, tryBoundaryOpening)
 
 -- | What ends the owner first.
 data Cause = CauseHost | CauseLua | CauseStop | CauseCancel
@@ -68,7 +68,7 @@ spec = describe "how the owner exits" $ do
   it "keeps a failure of the host as the exit when closing the coroutine of a task that was inside a segment is interrupted at the owner's end" $ bounded $ do
     fixture ← newIFixture
     held ← newIORef Nothing
-    ended ← tryWithContext @SomeException . withBoundary $ \control runtime → do
+    ended ← tryBoundaryOpening [openAllGates fixture] $ \control runtime → do
       owner ← startInstances fixture runtime "observed" [closeKilled, echoer] (testConfig instanceBounds') requiredPolicy
       writeIORef held (Just owner)
       void (admit fixture owner "k" (moduleNamed "closekilled"))
@@ -97,7 +97,7 @@ spec = describe "how the owner exits" $ do
   it "keeps a failure of the host as the exit when the application's escalation is cancelled while retirement settles the failed instance" $ bounded $ do
     fixture ← newIFixture
     let config = (testConfig instanceBounds') {instanceEscalate = \_ → throwIO ThreadKilled}
-    ended ← tryWithContext @SomeException . withBoundary $ \control runtime → do
+    ended ← tryBoundaryOpening [openAllGates fixture] $ \control runtime → do
       owner ← startInstances fixture runtime "told" [failHookHost, echoer] config requiredPolicy
       void (admit fixture owner "a" (moduleNamed "failhookhost"))
       void (admit fixture owner "p" (moduleNamed "echoer"))
@@ -162,7 +162,7 @@ cell cause later = do
         CauseCancel → []
         CauseStop → []
       members = laterModule <> [("p", echoer, "echoer")] <> trigger
-  ended ← tryWithContext @SomeException . withBoundary $ \control runtime → do
+  ended ← tryBoundaryOpening [openAllGates fixture] $ \control runtime → do
     owner ← startInstances fixture runtime "exit" [source | (_, source, _) ← members] config requiredPolicy
     forM_ members $ \(name, _, identity) → void (admit fixture owner name (moduleNamed identity))
     forM_ [name | (name, _, _) ← members] $ \name → awaitPhase fixture owner name Active

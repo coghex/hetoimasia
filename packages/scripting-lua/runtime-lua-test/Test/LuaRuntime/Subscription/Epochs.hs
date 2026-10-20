@@ -5,7 +5,6 @@
 -- place while a provider's retirement is pending.
 module Test.LuaRuntime.Subscription.Epochs (spec) where
 
-import Control.Exception (finally)
 import Control.Monad (forM_, void, when)
 import Data.IORef (writeIORef)
 import Data.Text (Text)
@@ -21,7 +20,7 @@ import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support (awaitLine, refusalOf)
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfObserver), awaitEntered, blockOn, releaseGate)
 import Test.LuaRuntime.Subscription.Support
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- | An owner of subscribers on elapsed time, granted both endpoints with this room for subscriptions.
 ownerOf ∷ IFixture → FakeEvents → LuaRuntime → Text → [ModuleSource] → Int → IO ScheduledOwner
@@ -43,7 +42,7 @@ spec = describe "epochs" $ do
   it "invalidate every subscription once, discard what had not begun, tell the providers, and keep their accounting until they say they are done" $ bounded $ do
     fixture ← newIFixture
     fake ← newFakeEvents
-    withBoundary $ \_ runtime → eventsFinish fake $ do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → eventsFinish fake $ do
       owner ← ownerOf fixture fake runtime "epoch" [subscriber, holder] 4
       admitSubscriber fixture owner "i" "subscriber"
       subscribeTo' fixture owner "i" "a" "ticks"
@@ -173,7 +172,7 @@ spec = describe "epochs" $ do
   it "lets the invocation already selected for a delivery complete without entering Lua when the epoch changes before its callback begins" $ bounded $ do
     fixture ← newIFixture
     fake ← newFakeEvents
-    withBoundary $ \_ runtime → eventsFinish fake $ do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → eventsFinish fake $ do
       owner ← ownerOf fixture fake runtime "selected" [subscriber] 4
       admitSubscriber fixture owner "i" "subscriber"
       subscribeTo' fixture owner "i" "a" "ticks"
@@ -216,7 +215,7 @@ spec = describe "epochs" $ do
   it "wakes the owner once for an instance's cleanup however often the epoch changes while the owner cannot drain its inbox" $ bounded $ do
     fixture ← newIFixture
     fake ← newFakeEvents
-    withBoundary $ \_ runtime → (`finally` releaseOwner fixture) $ eventsFinish fake $ do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → eventsFinish fake $ do
       owner ← ownerOf fixture fake runtime "repeated" [subscriber, holder] 4
       admitSubscriber fixture owner "i" "subscriber"
       subscribeTo' fixture owner "i" "a" "ticks"

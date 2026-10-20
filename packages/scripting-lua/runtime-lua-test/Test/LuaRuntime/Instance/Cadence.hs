@@ -10,7 +10,7 @@
 module Test.LuaRuntime.Instance.Cadence (spec) where
 
 import Control.Concurrent.STM (atomically, retry)
-import Control.Exception (SomeException, finally, fromException, try)
+import Control.Exception (SomeException, fromException, try)
 import Control.Monad (forM_, replicateM_, void)
 import Data.Foldable (toList)
 import Data.IORef (writeIORef)
@@ -28,7 +28,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfDelay), admitTask', awaitDiagnostics, awaitEffect, awaitEntered, awaitIdle, defaultSchedulerBounds, releaseGate, request)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- The modules -------------------------------------------------------------------
 
@@ -188,21 +188,15 @@ grantNow ∷ ScheduledOwner → Word64 → IO ()
 grantNow owner step = void (grantScheduledStep (scheduledEndpoint owner) (nanoseconds step))
 
 -- | An owner of these modules with the standard bounds and the @tick@ source, and the
--- hooks' effects; the examples' common start.
+-- hooks' effects; the examples' common start. Whatever way the example ends, every gate
+-- of its fixture is opened, inside the boundary, so a failure of an example that holds the
+-- owner at a gate fails instead of waiting on an owner that is held.
 withOwner ∷ [ModuleSource] → InstanceConfig → (IFixture → RuntimeControl → ScheduledOwner → IO a) → IO a
 withOwner modules config body = do
   fixture ← newIFixture
-  withBoundary $ \control runtime → do
+  withBoundaryOpening [openAllGates fixture] $ \control runtime → do
     owner ← startInstances fixture runtime "cadence" modules config requiredPolicy
     body fixture control owner
-
--- | The same, for an example that holds the owner at a gate: the gates are opened
--- whatever the example does, so a failure of it fails instead of waiting on an owner
--- that is held.
-withGatedOwner ∷ [ModuleSource] → InstanceConfig → (IFixture → RuntimeControl → ScheduledOwner → IO a) → IO a
-withGatedOwner modules config body =
-  withOwner modules config $ \fixture control owner →
-    body fixture control owner `finally` (releaseGate (sf fixture) "hold" >> releaseGate (sf fixture) "gate")
 
 -- | Block until the instance of this name has a due update, or none.
 awaitUpdateOwed ∷ IFixture → ScheduledOwner → Text → Bool → IO ()
@@ -396,7 +390,7 @@ overlapSpec = describe "a cadence point passed during an active invocation" $ do
 queueSpec ∷ Spec
 queueSpec = describe "a due update in the instance's queue" $ do
   it "queued behind an event that begins and waits releases its tick, keeps its place, and runs after the event, with one pending" $ bounded $
-    withGatedOwner [slowTicker, holder] (testConfig instanceBounds') $ \fixture control owner → do
+    withOwner [slowTicker, holder] (testConfig instanceBounds') $ \fixture control owner → do
       _ ← periodic fixture owner "slowticker" (LogicalTicks 2)
       awaitPhase fixture owner "slowticker" Active
       holdOwner fixture owner
@@ -416,7 +410,7 @@ queueSpec = describe "a due update in the instance's queue" $ do
       logged fixture >>= (`shouldBe` ["callback 1 begin", "callback 1 end", "update 3"])
       updateOwed' fixture owner "slowticker" >>= (`shouldBe` False)
   it "keeps a continuous producer behind a due update: the events accepted before it fell due run first, those accepted after it run after it" $ bounded $
-    withGatedOwner [gatedTicker, holder] (testConfig instanceBounds') $ \fixture control owner → do
+    withOwner [gatedTicker, holder] (testConfig instanceBounds') $ \fixture control owner → do
       _ ← periodic fixture owner "gatedticker" (LogicalTicks 2)
       awaitPhase fixture owner "gatedticker" Active
       holdOwner fixture owner
@@ -445,7 +439,7 @@ queueSpec = describe "a due update in the instance's queue" $ do
                 ]
             )
   it "is retained when the event queue is full, refusing later events without moving the update, and is never a second update" $ bounded $
-    withGatedOwner [gatedTicker, holder] (testConfig instanceBounds') $ \fixture control owner → do
+    withOwner [gatedTicker, holder] (testConfig instanceBounds') $ \fixture control owner → do
       _ ← periodic fixture owner "gatedticker" (LogicalTicks 2)
       awaitPhase fixture owner "gatedticker" Active
       holdOwner fixture owner
@@ -578,7 +572,7 @@ pauseSpec = describe "pausing" $ do
       grantEach control owner [1]
       logged fixture >>= (`shouldBe` ["float 1e-09 true"])
   it "drops a point whose grant was applied just before the pause: the tick completes, nothing is due for it, and the first update newly due is a full interval after the resume" $ bounded $
-    withGatedOwner [ticker, holder] (testConfig instanceBounds') $ \fixture control owner → do
+    withOwner [ticker, holder] (testConfig instanceBounds') $ \fixture control owner → do
       _ ← periodic fixture owner "ticker" (LogicalTicks 2)
       awaitPhase fixture owner "ticker" Active
       grantEach control owner [1]
@@ -598,7 +592,7 @@ pauseSpec = describe "pausing" $ do
       grantEach control owner [1]
       logged fixture >>= (`shouldBe` ["update 4"])
   it "lets the tick complete when a due update is paused before it starts, retains it, and runs it after the resume" $ bounded $
-    withGatedOwner [ticker, gatedWaiter] (testConfig instanceBounds') $ \fixture control owner → do
+    withOwner [ticker, gatedWaiter] (testConfig instanceBounds') $ \fixture control owner → do
       _ ← periodic fixture owner "ticker" (LogicalTicks 2)
       _ ← admit fixture owner "gatedwaiter" (moduleNamed "gatedwaiter")
       awaitPhase fixture owner "ticker" Active
@@ -625,7 +619,7 @@ pauseSpec = describe "pausing" $ do
       awaitEffect (sf fixture) "update 2"
       length . filter (== "update 2") <$> logged fixture >>= (`shouldBe` 2)
   it "discards a due update that a stop reaches before it starts, counts it, and lets the tick complete" $ bounded $
-    withGatedOwner [ticker, gatedWaiter] (testConfig instanceBounds') $ \fixture control owner → do
+    withOwner [ticker, gatedWaiter] (testConfig instanceBounds') $ \fixture control owner → do
       _ ← periodic fixture owner "ticker" (LogicalTicks 2)
       _ ← admit fixture owner "gatedwaiter" (moduleNamed "gatedwaiter")
       awaitPhase fixture owner "ticker" Active
@@ -652,7 +646,7 @@ pauseSpec = describe "pausing" $ do
 settlementSpec ∷ Spec
 settlementSpec = describe "a tick" $ do
   it "completes without a due update that cannot start, and an unaffected pause or stop settlement is the instance layer's, as before" $ bounded $
-    withGatedOwner [slowTicker, holder] (testConfig instanceBounds') $ \fixture control owner → do
+    withOwner [slowTicker, holder] (testConfig instanceBounds') $ \fixture control owner → do
       _ ← periodic fixture owner "slowticker" (LogicalTicks 1)
       awaitPhase fixture owner "slowticker" Active
       expectDelivered fixture owner "slowticker" 1
@@ -735,25 +729,24 @@ workload ∷ Word → Maybe Word → IO [Text]
 workload cost budget = do
   fixture ← newIFixture
   writeIORef (sfDelay (sf fixture)) (fromIntegral cost)
-  withBoundary $ \control runtime → do
+  withBoundaryOpening [openAllGates fixture] $ \control runtime → do
     let bounds = defaultSchedulerBounds {boundServiceBudget = nanoseconds . fromIntegral <$> budget}
     owner ← startWith fixture runtime (instanceSpec fixture "deterministic" [pacedUpdate, ticker, holder] (testConfig instanceBounds') requiredPolicy bounds)
-    flip finally (releaseGate (sf fixture) "hold") $ do
-      _ ← admitWith fixture owner "pacedupdate" (InstanceRequest (moduleNamed "pacedupdate") (Periodic (LogicalTicks 3)) (Just "pacedupdate") OrdinaryClass [])
-      _ ← periodic fixture owner "ticker" (LogicalTicks 2)
-      awaitPhase fixture owner "pacedupdate" Active
-      awaitPhase fixture owner "ticker" Active
-      holdOwner fixture owner
-      forM_ [1, 2, 3] (expectDelivered fixture owner "ticker")
-      replicateM_ 3 (grantNow owner 1)
-      releaseOwner fixture
-      void (awaitTicksComplete control owner)
+    _ ← admitWith fixture owner "pacedupdate" (InstanceRequest (moduleNamed "pacedupdate") (Periodic (LogicalTicks 3)) (Just "pacedupdate") OrdinaryClass [])
+    _ ← periodic fixture owner "ticker" (LogicalTicks 2)
+    awaitPhase fixture owner "pacedupdate" Active
+    awaitPhase fixture owner "ticker" Active
+    holdOwner fixture owner
+    forM_ [1, 2, 3] (expectDelivered fixture owner "ticker")
+    replicateM_ 3 (grantNow owner 1)
+    releaseOwner fixture
+    void (awaitTicksComplete control owner)
+    awaitIdle (sf fixture)
+    -- A few more ticks, one at a time, the owner at rest between.
+    forM_ [1 .. 9 ∷ Int] $ \_ → do
+      grantEach control owner [1]
       awaitIdle (sf fixture)
-      -- A few more ticks, one at a time, the owner at rest between.
-      forM_ [1 .. 9 ∷ Int] $ \_ → do
-        grantEach control owner [1]
-        awaitIdle (sf fixture)
-      logged fixture
+    logged fixture
 
 determinismSpec ∷ Spec
 determinismSpec = describe "determinism" $ do

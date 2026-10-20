@@ -15,13 +15,13 @@ import Hetoimasia.Scripting.Lua.Value (Schema (SInteger, SList), Value (VInteger
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEffect, awaitEntered, defaultSchedulerBounds, releaseGate)
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundary, withBoundaryOpening)
 
 spec ∷ Spec
 spec = describe "events" $ do
   it "accepts an event while init runs, holds it until init has succeeded, and only then runs its callback" $ bounded $ do
     fixture ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       owner ← startInstances fixture runtime "during init" [gateInit] (testConfig instanceBounds') requiredPolicy
       _ ← admit fixture owner "a" (moduleNamed "gateinit")
       awaitEntered (sf fixture) "init"
@@ -36,7 +36,7 @@ spec = describe "events" $ do
 
   it "revokes the connection of an instance whose init fails and counts the events it held among the unstarted" $ bounded $ do
     fixture ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       owner ← startInstances fixture runtime "failed init" [gateFail] (testConfig instanceBounds') requiredPolicy
       _ ← admit fixture owner "a" (moduleNamed "gatefail")
       awaitEntered (sf fixture) "init"
@@ -81,7 +81,7 @@ spec = describe "events" $ do
 
   it "answers a delivery that cannot be taken: unknown, not connected, not a source, refused, closed" $ bounded $ do
     fixture ← newIFixture
-    withBoundary $ \_ runtime → do
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
       owner ← startInstances fixture runtime "refusals" [echoer, noHooks, gateShutdown] (testConfig instanceBounds') requiredPolicy
       other ← startInstances fixture runtime "other" [echoer] (testConfig instanceBounds') requiredPolicy
       _ ← admit fixture owner "a" (moduleNamed "echoer")

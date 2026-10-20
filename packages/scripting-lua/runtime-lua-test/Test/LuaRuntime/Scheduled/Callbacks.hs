@@ -14,7 +14,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VBoolean, VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (bounded, brokenIs, optionalPolicy, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, brokenIs, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
 
 spec ∷ Spec
 spec = describe "waits from callbacks and tick completion" $ do
@@ -46,7 +46,7 @@ spec = describe "waits from callbacks and tick completion" $ do
   describe "waiting for tick completion" $ do
     it "ends with the owner when it stops with a tick outstanding, and never reports the tick completed" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \control runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \control runtime → do
         owner ← startScheduled fixture runtime (scheduled fixture "ticks" requiredPolicy defaultSchedulerBounds)
         _ ← admitTask' fixture owner "w" (request "wait_ticks" [VText "w", VInteger 1] OrdinaryClass OneShot (Just "w"))
         awaitDiagnostics owner (\counts → diagWaiting counts >= 1)

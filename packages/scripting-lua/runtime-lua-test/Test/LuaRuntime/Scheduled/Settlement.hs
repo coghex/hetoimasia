@@ -23,7 +23,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- | Keep asking until the admission is accepted: for the moment between a
 -- reservation being forgotten and the owner's next sweep giving it back.
@@ -92,7 +92,7 @@ spec = describe "admission and settlement" $ do
 
     it "discards a task that had not started, and one the owner was running, when the owner exits, and says which" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \control runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \control runtime → do
         owner ← startScheduled fixture runtime (scheduled fixture "discard" requiredPolicy defaultSchedulerBounds)
         running ← admitTask' fixture owner "running" (blockedIn (VText "r"))
         awaitEntered fixture "r"
@@ -115,7 +115,7 @@ spec = describe "admission and settlement" $ do
   describe "bounds" $ do
     it "accepts the queue of admissions to its limit and answers full one past it" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         let bounds = defaultSchedulerBounds {boundActiveTasks = 1, boundQueuedAdmissions = 2, boundRetainedResults = 10}
         owner ← startScheduled fixture runtime (scheduled fixture "queue" requiredPolicy bounds)
         answers ←
@@ -126,7 +126,7 @@ spec = describe "admission and settlement" $ do
 
     it "accepts the results to their limit and answers full one past it, reserving a result when the task is admitted" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         let bounds = defaultSchedulerBounds {boundRetainedResults = 3}
         owner ← startScheduled fixture runtime (scheduled fixture "results" requiredPolicy bounds)
         answers ←
@@ -138,7 +138,7 @@ spec = describe "admission and settlement" $ do
 
     it "accepts control requests to their limit and answers full one past it, and gives a reservation back when its result is observed" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         let bounds = defaultSchedulerBounds {boundControlRequests = 2}
         owner ← startScheduled fixture runtime (scheduled fixture "control" requiredPolicy bounds)
         (target, receipts, full) ←
@@ -169,7 +169,7 @@ spec = describe "admission and settlement" $ do
 
     it "accepts grants to their limit and answers full one past it" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         let bounds = defaultSchedulerBounds {boundOutstandingGrants = 2}
         owner ← startScheduled fixture runtime (scheduled fixture "grants" requiredPolicy bounds)
         answers ← holding fixture owner (replicateM 3 (grantScheduledStep (scheduledEndpoint owner) (nanoseconds 5)))
@@ -278,7 +278,7 @@ spec = describe "admission and settlement" $ do
 
     it "is given back at settlement, once, for a task whose result was forgotten before it settled" $ bounded $ do
       fixture ← newSFixture
-      withBoundary $ \_ runtime → do
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
         let bounds = defaultSchedulerBounds {boundRetainedResults = 1}
         owner ← startScheduled fixture runtime (scheduled fixture "forget" requiredPolicy bounds)
         let endpoint = scheduledEndpoint owner
