@@ -129,7 +129,10 @@ The driver's `stepTick`:
    make the tick's **candidate**: the committed world with the tick's intentions revalidated against it, in
    the order of their places, and applied (below). The tick's random stream starts at the committed state.
 2. **Grant** gameplay one logical step of the configured duration (ten milliseconds). One grant is
-   outstanding at a time.
+   outstanding at a time. The check that the session still runs and the mark that a grant is being issued are one
+   transaction, and recording a failure or a stop waits while the mark is set (the grant is a short call that waits for
+   nothing): a grant is issued wholly before a failure or a stop is recorded, or not at all, so **no grant is issued once
+   either is recorded**.
 3. Wait for the owner to complete the tick (`awaitTicksComplete`).
 4. **Accounting.** A completed tick says only that the grant was applied and nothing is left it could run: the
    scheduler reconciles the grant *before* the instance layer has accounted for what the tick's last segment
