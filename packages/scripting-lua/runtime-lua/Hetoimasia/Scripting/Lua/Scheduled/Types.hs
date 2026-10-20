@@ -333,8 +333,9 @@ sealAccounting control = do
   when (finished /= acSealed accounting || isJust fixed /= isJust (acCut accounting)) $
     writeTVar (controlAccounting control) accounting {acSealed = finished, acCut = fixed}
 
--- | The acknowledgement: on the owner's thread, as the last step of an iteration of its loop that
--- has kept every failure it caught and found nothing it holds. Records which endings were still open.
+-- | The acknowledgement: on the owner's thread, as the last step of a boundary that has kept every
+-- failure it caught and found nothing it holds (the owner's checkpoint, in 'Scheduled.Run'). Records
+-- which endings were still open.
 acknowledgeAccounting ∷ Control → STM ()
 acknowledgeAccounting control =
   modifyTVar' (controlAccounting control) $ \accounting →
