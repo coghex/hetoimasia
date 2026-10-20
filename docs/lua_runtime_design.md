@@ -3485,8 +3485,8 @@ and verified policy, with adversarial regression coverage.
   rest bounded evidence; one failure snapshot is published carrying the last good world and tick and the invalidated
   intentions, after every gameplay instance has been stopped through the public instance controls and settled, with
   the owner kept alive. The driver learns of a failure in tick T before it decides T's commit through the owner's
-  accounting wait (D-47, `awaitScheduledAccounting`): after the tick completes it waits, on the application thread and
-  one wait at a time, until the owner has accounted for the endings the tick's work began, the escalation of a failure
+  accounting wait (D-47, `awaitScheduledAccounting`): after the tick completes it waits, on the application thread (`stepTick`
+  and `stopSession` refuse any other) and one wait at a time, until the owner has accounted for the endings the tick's work began, the escalation of a failure
   included, and commits only on `AccountingComplete` (the scheduler reconciles a grant before the instance layer
   accounts for the tick's last segment, so a refused wait looks, for a moment, like an idle active instance); the
   sample admits no task and holds no slot only to order a failure. The gameplay owner's scheduling is derived from the
