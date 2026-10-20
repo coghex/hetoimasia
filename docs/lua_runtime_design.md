@@ -9,7 +9,8 @@ failure evidence, and lifetime. This is the canonical continuation of
 Design state: `ready for issue processing`
 
 Current readiness scope: **LUA-8 only** (D-45), delivered by D-46 as LUA-29,
-LUA-30, then a narrowed LUA-8, with D-44 fixing its consumer, intentions,
+LUA-30, then a narrowed LUA-8, with D-47 adding the library prerequisite LUA-31
+before LUA-30, with D-44 fixing its consumer, intentions,
 UI-progress proof and gameplay randomness. LUA-19 (D-41), delivered by D-42 as LUA-27
 (#492, PR #495), LUA-28 (#493, PR #496) and a narrowed LUA-19 (#494, PR #497),
 is delivered, with D-40, D-42 and D-43 fixing the runner's clock, ending, event
@@ -189,6 +190,7 @@ concrete precondition
 - [x] LUA-28. Drive the runner on logical ticks and publish instance start and end events — [#493]
 - [x] LUA-19. Run script instances through a headless command-line entry — [#494]
 - [x] LUA-29. Compose independent UI and gameplay Lua owners in a headless sample — [#498]
+- [ ] LUA-31. Wait for a scheduled owner's accounting of its accepted ticks without a task slot
 - [x] LUA-30. Fail, overload and stop the two-domain sample explicitly — [#499]
 - [x] LUA-8. Prove independent trusted UI and gameplay execution headlessly — [#500]
 - [ ] LUA-9. Add bounded child-process transport and owned process lifetime — [deferred]: Q-5 successful Linux and macOS confinement verdicts
@@ -1385,6 +1387,59 @@ slices need a canonical state a failed tick leaves untouched); one sample packag
 holds library, executable and tests; the barrier binding is test-only; the
 executable is a bounded scripted session whose usage errors exit 2 (D-42's
 convention); the epic lists the carved children under Phase 8.
+
+### D-47. A slot-free accounting wait before commit and after stop (LUA-31)
+
+LUA-30's review (#499, PR #502, five rounds) traced most of its findings to the
+sample's **fence**: after `awaitTicksComplete` the driver admitted a no-op task
+and awaited it, so as to decide a tick's commit only after the owner had
+accounted for the tick's last segment. The fence takes a scheduler task slot and
+a ticket, so saturated or cancelled callers deadlocked it. The guide's audit
+(`master@a1cd65ee`, request `user-het-lua8-solve-20261019-2212`) confirmed the
+gap and found the fence insufficient even when it runs:
+
+- `TicksCompleted` is scheduler progress, as the detailed contract defines it
+  (`Scheduler.hs` grant completion; README's scheduled-owner and cadence
+  sections): every task the grant woke stopped being ready or running, including
+  by a wait that was refused or a failure. Its one-line summary ("the work it
+  made due has finished") overstates this. A refused wait can expose zero
+  outstanding grants before the coroutine is closed and the instance layer has
+  settled the ending in the owner's boundary action.
+- An ending's settlement is readable before the escalation callback is called
+  and returns, and an ending held by asynchronous retirement (D-27) notifies
+  only once its pending obligations are done. A no-op task proves passage
+  through earlier synchronous boundaries, not that every failure of the tick has
+  been told.
+- No public observation supplies this today (inspection, receipts,
+  `scheduledObserve`, diagnostics, the runner's internal gate).
+
+The owner decided (2026-10-20, request `user-het-lua8-solve-20261019-2212`)
+that the library supplies it first, as a **new explicit wait**, and that
+`awaitTicksComplete` keeps its meaning:
+
+- **LUA-31** (new, library): a supervised wait on a scheduled owner that captures
+  the accepted grants and returns once that prefix has completed, its final
+  boundary work has been accounted, and every ending that work caused has run
+  `shutdown` (or skipped it), drained its leases and requests, completed its
+  retirement and had its escalation callback called and returned. It is usable
+  when no grant is outstanding (after a stop's instances settle). It uses no task,
+  control or result slot and retains no per-waiter ticket; cancelling it abandons
+  only the wait; an owner exit or fatal supervision ends it and never as a false
+  success. It does not wait for healthy instances' future ticks or for idle
+  peers, and ordinary task faults stay ticket results the application consumes.
+  `awaitTicksComplete`'s summary is corrected to say what it is.
+- **LUA-30** then uses the new wait before every commit decision and after the
+  stop's settlement, with no fence, and fixes in the sample what an observation
+  cannot: task and instance capacity, cancellation-safe handoff of admitted
+  tasks and stop requests, and quiescing surviving instances at failure. #499
+  resumes on PR #502 with a fresh review budget once LUA-31 merges.
+
+This adds a library prerequisite to D-46's split and no new product behavior:
+failure-before-commit (P-6, P-8, D-7), the failed session's quiescence and
+cleanup that cannot be skipped (D-27) are already required. A preliminary
+failure notification ahead of cleanup, automatic rollback, peer stopping, a
+wall-time timeout and preemption are not part of it. D-45's readiness covers
+LUA-31; the manager processes it through merge under the owner's request.
 
 ## Design
 
@@ -3436,6 +3491,35 @@ and verified policy, with adversarial regression coverage.
   isolated and reported. The executable gains `--scenario normal|pause|failure|flood|stop` and exit status 1 for a failed
   session. No library, runner, workflow, CI image or native pin changed.
 
+### LUA-31. Wait for a scheduled owner's accounting of its accepted ticks without a task slot
+
+> Ready for issue processing under D-45 and D-47: a library prerequisite of
+> LUA-30, adding no product behavior.
+
+- **Outcome:** an application can wait, without consuming any scheduler slot,
+  until a scheduled owner has accounted for every grant accepted so far,
+  including the endings that work caused and their escalation callbacks, and so
+  decide a tick's commit, or a stop's outcome, on complete evidence.
+- **Scope:** D-47's LUA-31 description: the supervised wait and its exported
+  result type in `Scheduled`; bounded owner-owned checkpoint state serviced at the
+  owner's boundary; the instance layer's notice when an ending's retirement and
+  escalation are complete; a precise post-boundary seam in the scheduler; the
+  corrected `awaitTicksComplete` summary; Haddock and `packages/scripting-lua/README.md`.
+- **Phase:** trusted integrated acceptance (library prerequisite).
+- **Depends on:** LUA-6, LUA-18, LUA-22, LUA-24, LUA-26.
+- **Ordering:** after LUA-29; precedes LUA-30 and LUA-8.
+- **Relevant decisions:** D-7, D-19, D-22, D-27, D-45, D-46, D-47.
+- **Acceptance signals:** gated examples (no sleeps) in which the wait does not
+  return before a refused wait's closure, `shutdown`, a deferred retirement and
+  the escalation callback's return, each on its own; a tick with no work and a
+  wait with no grant outstanding return; saturated task slots, concurrent and
+  cancelled waiters and an owner that fails or exits during the wait end
+  correctly; existing `awaitTicksComplete` callers unchanged.
+- **Out of scope:** the sample's use of it (LUA-30); changing
+  `awaitTicksComplete`'s behavior; preliminary failure notification, rollback,
+  stopping peers, timeouts, preemption; the runner and the `lua` subcommand.
+- **Open questions:** None; D-47 fixes its contract.
+
 ### LUA-30. Fail, overload and stop the two-domain sample explicitly
 
 > Ready for issue processing under D-45 and D-46: carved out of LUA-8 with no
@@ -3445,9 +3529,9 @@ and verified policy, with adversarial regression coverage.
   explicit, with cleanup evidence, and a UI failure never touches gameplay.
 - **Scope:** D-46's LUA-30 list.
 - **Phase:** trusted integrated acceptance.
-- **Depends on:** LUA-29, LUA-22, LUA-23.
-- **Ordering:** after LUA-29; precedes LUA-8.
-- **Relevant decisions:** D-7, D-15, D-24, D-26, D-27, D-43, D-44, D-45, D-46.
+- **Depends on:** LUA-29, LUA-31, LUA-22, LUA-23.
+- **Ordering:** after LUA-29 and LUA-31 (D-47); precedes LUA-8.
+- **Relevant decisions:** D-7, D-15, D-24, D-26, D-27, D-43, D-44, D-45, D-46, D-47.
 - **Acceptance signals:** a failed gameplay session closes admission, discards the
   failing tick's batch and publishes the failure beside the last good snapshot;
   accepted intentions equal applied plus rejected plus invalidated plus discarded;
@@ -3660,7 +3744,7 @@ and verified policy, with adversarial regression coverage.
 
 The trusted dependency order is LUA-2 after the delivered LUA-1; LUA-3 after
 LUA-2; LUA-5 after LUA-3 and the delivered LUA-4; then LUA-6 (as LUA-20 and
-LUA-21, then LUA-6, under D-29), LUA-18, then LUA-23 and LUA-24 (D-31), LUA-25 then LUA-22 (D-32), LUA-7 then LUA-26 (D-38), LUA-27 then LUA-28 then LUA-19 (D-42), LUA-29 then LUA-30 then LUA-8 (D-46), and
+LUA-21, then LUA-6, under D-29), LUA-18, then LUA-23 and LUA-24 (D-31), LUA-25 then LUA-22 (D-32), LUA-7 then LUA-26 (D-38), LUA-27 then LUA-28 then LUA-19 (D-42), LUA-29 then LUA-31 then LUA-30 then LUA-8 (D-46, D-47), and
 LUA-8 under D-25 and D-30. LUA-6 retains external TIME-1; LUA-7 consumes the
 instance ownership API and introduces no second clock implementation.
 The shared VK-1 toolchain prerequisite remains satisfied.
@@ -3670,7 +3754,7 @@ platform proofs; LUA-10, LUA-11, and LUA-13 in parallel; LUA-12 after both
 platform slices and TIME-1; LUA-16 after LUA-6/LUA-7/LUA-26/LUA-12/LUA-13; then
 LUA-17 after LUA-8/LUA-16. Stable IDs are preserved, with LUA-16/LUA-17
 retaining the confined integration and acceptance removed from LUA-5/LUA-8.
-There are thirty delivery slices. All of this can run alongside
+There are thirty-one delivery slices. All of this can run alongside
 graphics implementation. Coordinate the shared Cabal project, CI
 catalog/workflow, and any narrow foundation evidence change; parallel work
 does not authorize conflicting edits or duplicate platform infrastructure.
