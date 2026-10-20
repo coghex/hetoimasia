@@ -50,10 +50,12 @@ import Hetoimasia.Scripting.Lua.Instance (InstanceKind (RunOnce), InstanceReques
 import Hetoimasia.Scripting.Lua.Owner (EntryPoint (EntryPoint), ModuleRef (ModuleRef), ModuleSource, Requirement (Required))
 import Hetoimasia.Scripting.Lua.Registration (WaitKind (WaitLogical), namespace, waitOperation, yieldOperation)
 import Hetoimasia.Scripting.Lua.Scheduled
-  ( ServiceClass (OrdinaryClass)
+  ( Diagnostics (diagFailed)
+  , ServiceClass (OrdinaryClass)
   , TaskAdmission (TaskAccepted, TaskAdmissionClosed)
   , TaskKind (OneShot)
   , TaskRequest (..)
+  , scheduledDiagnostics
   , scheduledEndpoint
   , ticksOutstanding
   )
@@ -257,6 +259,7 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
                     -- The segment ends, the task runs and faults in the tick, and the tick completes with nothing registered: the
                     -- driver waits for the admission before it decides, so nothing is committed or published.
                     releaseGate fx "held"
+                    waitFor (scheduledDiagnostics (scheduledEndpoint (startedOwner (domainsGameplay domains))) >>= \diagnostics → when (diagFailed diagnostics < 1) retry)
                     waitFor (ticksOutstanding (scheduledEndpoint (startedOwner (domainsGameplay domains))) >>= \outstanding → when (outstanding > 0) retry)
                     replicateM_ 2000 yield
                     revisionNow domains `shouldReturn` 0
@@ -277,7 +280,7 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
             control
             (withWait (sampleConfig fx ui))
               { configInput = []
-              , configGameplaySource = gameplayWith ["function update(self, dt) staging.finish() end", "function task_fails() fx.record('task ran') error('task failed') end"]
+              , configGameplaySource = gameplayWith ["function update(self, dt) staging.finish() end", "function task_fails() error('task failed') end"]
               , configGameplayEntries = [EntryPoint "task_fails" Required [] []]
               , configDecisionHook = \reached → when (reached == point) (holdAt fx "deciding")
               , configAcceptedHook = holdAt fx "accepted"
@@ -293,7 +296,8 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
                       -- An admission begins now: the owner accepts the task, which runs and faults in the tick, and its admitter
                       -- is held before it registers it.
                       awaitEntered fx "accepted"
-                      awaitLine fx "task ran"
+                      -- The task has run and faulted: the owner has settled it, as its counters say.
+                      waitFor (scheduledDiagnostics (scheduledEndpoint (startedOwner (domainsGameplay domains))) >>= \diagnostics → when (diagFailed diagnostics < 1) retry)
                       releaseGate fx "deciding"
                       -- The driver sees that an admission began since it read the tasks, and reads again: it waits for the admitter.
                       replicateM_ 2000 yield
