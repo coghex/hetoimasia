@@ -244,6 +244,13 @@ What the session does, by design (D-26, D-27, P-7):
   publisher is never closed under it: the last good world and committed tick, status
   `Failed` with the primary failure (who, which stage, which tick, which kind, a bounded message), the number
   of failures told of by then, and the **invalidated** intentions;
+* the session **takes no task from the moment it fails or is stopping** (`admitGameplayTask` answers
+  `TaskAdmissionClosed`, and nothing reaches the owner or runs), in the transaction that records the failure or
+  the stop; an admission that began before is finished, and its task watched, before the ending is published,
+  and before the settlements are read for it (the ending waits for it);
+* the settlements of the tasks the session watches are **consumed once**: whoever observes them (the driver, a
+  stop from any thread, two stops at once) holds the lock on the watched tasks for the whole observation, so a
+  fault is recorded once, never twice;
 * a failure that is told of later (a teardown, a `shutdown` that raises when the session is stopped) is
   counted in the evidence the report and `cleanupEvidence` give; it is never published, and the snapshot is
   not republished.
@@ -339,7 +346,8 @@ the next tick that has not begun and a place in it (`assignControl`), the engine
 boundary, and the UI is answered with the engine's own reasons:
 
 * a request is *accepted* (for that tick) or refused at once (`unassigned` when the session has failed, is
-  stopping or is closed, or the UI already holds `boundPendingControls`, four, unread receipts;
+  stopping or is closed, or is finite and its last tick has begun (the next tick that has not begun is beyond the
+  session), or the UI already holds `boundPendingControls`, four, unread receipts;
   `unknown_target` before gameplay's identity is known). The engine holds a reservation for each accepted
   control until its receipt is read; the owner has the pending bound's worth and one more for each instance
   the stop must reach, so the stop is admitted whatever the UI holds;
