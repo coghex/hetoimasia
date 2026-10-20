@@ -325,7 +325,7 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
       releaseGate fx "action"
     it "raise the failure of a thread an example spawned and never collected, when the example is over" $ do
       _ ← spawn (throwIO (userError "an uncollected failure") ∷ IO ())
-      raised ← try @SomeException (replicateM_ 2000 yield >> reapForked)
+      raised ← try @SomeException (awaitForkedEnded >> reapForked)
       raised `shouldSatisfy` \case Left failure → show failure == show (userError "an uncollected failure"); Right _ → False
     it "cancel the trigger of 'cancelWhen' whatever the action raises: the trigger firing later cancels nothing" $ do
       fx ← newFx

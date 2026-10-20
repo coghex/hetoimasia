@@ -42,6 +42,7 @@ module Test.Domains.Support
   , spawn
   , forkRegistered
   , reapForked
+  , awaitForkedEnded
   , withReleased
   , stepCommitted
   , newSharedFor
@@ -369,6 +370,12 @@ forkRegistered action = do
   child ← forkTerminating (\unmask → unmask action)
   atomicModifyIORef' forkedThreads (\held → ((child, pure ()) : held, ()))
   pure (fst child)
+
+-- | Wait until every thread an example forked has ended of itself: for an example whose threads are known to end.
+awaitForkedEnded ∷ IO ()
+awaitForkedEnded = do
+  threads ← readIORef forkedThreads
+  mapM_ (\((_, done), _) → bounded (readMVar done)) threads
 
 -- | Cancel every thread an example forked that is still running, each having terminated, handlers and finalizers done,
 -- before this returns, and raise the failure of any that failed without being collected. It runs after every example,
