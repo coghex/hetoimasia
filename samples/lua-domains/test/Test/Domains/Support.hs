@@ -56,7 +56,7 @@ module Test.Domains.Support
   ) where
 
 import Control.Concurrent (forkIO, killThread, myThreadId, throwTo)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar)
+import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, tryPutMVar, withMVar)
 import Control.Exception (Exception, SomeException, finally, mask, throwIO, try)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Monad (void, when)
@@ -425,14 +425,34 @@ stopBounded ∷ Domains → IO ()
 stopBounded domains = void (bounded (stopSession domains))
 
 -- | Run an action on a thread of its own while this thread does the other, and answer the other's result once the
--- first has ended, raising what it raised. A stop is the application thread's, so what an example does around it, in
--- the interval it holds, is done on the side.
+-- first has ended, raising what it raised. A stop or a tick is the application thread's, so what an example does around
+-- it, in the interval it holds, is done on the side. If the side fails while this thread is still running the other (a
+-- failed assertion, with the other held at a gate the side would have opened), the failure is raised here, in the
+-- other's place, so that the example unwinds, opens its gates and retires its owners, and nothing is left hanging.
 alongside ∷ IO () → IO a → IO a
 alongside side main = do
-  joined ← spawn side
-  result ← main
-  joined
-  pure result
+  me ← myThreadId
+  running ← newMVar True
+  sideResult ← newEmptyMVar
+  _ ← forkIO $ do
+    outcome ← try side
+    case outcome of
+      Left failure → withMVar running (\open → when open (throwTo me (SideFailed failure))) `finally` putMVar sideResult (Left failure)
+      Right () → putMVar sideResult (Right ())
+  result ← try main
+  -- Whether or not the side is still running, it is not to interrupt this thread once the other is over.
+  modifyMVar_ running (\_ → pure False)
+  case result of
+    Left (SideFailed failure) → throwIO (failure ∷ SomeException)
+    Right value → do
+      bounded (readMVar sideResult) >>= either (\failure → throwIO (failure ∷ SomeException)) pure
+      pure value
+
+-- | What the side of 'alongside' raised, delivered to the other.
+newtype SideFailed = SideFailed SomeException
+  deriving (Show)
+
+instance Exception SideFailed
 
 -- | The exception that cancels an action an example runs with 'cancelWhen'.
 data Cancelled = Cancelled
