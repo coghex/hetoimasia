@@ -4,7 +4,7 @@
 -- ordering the examples can force with gates.
 module Test.Domains.Failure (spec) where
 
-import Control.Concurrent.STM (atomically, readTVarIO)
+import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, retry)
 import Control.Exception (SomeException, throwIO, try)
 import Control.Concurrent (yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
@@ -35,12 +35,13 @@ import Hetoimasia.Sample.LuaDomains
   , defaultBounds
   , stepTick
   , stopSession
+  , tellTask
   , withDomains
   )
 import Hetoimasia.Sample.LuaDomains.Bounds (maxSessionTasks)
 import Hetoimasia.Sample.LuaDomains.Scripts (moduleSource)
 import Hetoimasia.Sample.LuaDomains.Session (SessionState (sessionFailureCount, sessionFailures))
-import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCommitted, sharedSession, sharedTick), failSession)
+import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCommitted, sharedSession, sharedTick), Watched (Watched), failSession)
 import Hetoimasia.Sample.LuaDomains.Snapshot (FailureEvidence (..), SessionFailure (..))
 import Hetoimasia.Sample.LuaDomains.World (initialWorld)
 import Hetoimasia.Scripting.Lua.Instance (InstanceKind (EventOnly, RunOnce), InstanceRequest (..))
@@ -508,6 +509,27 @@ spec = describe "the failure of the gameplay session" $ do
             _ ← alongside (void (stepTick domains)) (stopSession domains)
             faulted `shouldSatisfy` (>= 1)
             sessionFailureCount <$> readTVarIO (sharedSession (domainsShared domains)) >>= (`shouldBe` faulted)
+  describe "a task's settlement is told once, whoever learns it" $
+    it "records the fault once however many times it is told: the watcher, and this thread telling it again" $
+      withSample
+        ( \config →
+            config
+              { configGameplaySource = gameplayWith ["function update(self, dt) staging.finish() end", "function task_fails() error('task failed') end"]
+              , configGameplayEntries = [EntryPoint "task_fails" Required [] []]
+              }
+        )
+        $ \_ _ domains → do
+          ticket ← admitGameplayTask domains (TaskRequest (ModuleRef "gameplay" "1") "task_fails" [] OrdinaryClass OneShot (Just "faulting task")) >>= \case
+            TaskAccepted _ ticket → pure ticket
+            other → throwIO (userError ("the task was not admitted: " <> show other))
+          settlement ← generous (awaitTask (domainsControl domains) ticket)
+          stopped ← newTVarIO False
+          -- The task is the session's first: its place among them is nought, which is all telling it looks at.
+          let again = Watched "faulting task" ticket 0 stopped
+          replicateM_ 3 (tellTask domains again settlement)
+          waitFor (readTVar (sharedSession (domainsShared domains)) >>= \state → when (sessionFailureCount state < 1) retry)
+          heldTasks domains `shouldReturn` 0
+          sessionFailureCount <$> readTVarIO (sharedSession (domainsShared domains)) >>= (`shouldBe` 1)
   where
     isHalted = \case
       TickHalted → True

@@ -107,6 +107,7 @@ module Hetoimasia.Sample.LuaDomains.Domains
   , SessionReport (..)
   , DomainsDefect (..)
   , admitGameplayTask
+  , tellTask
     -- * What the session leaves
   , Evidence (..)
   , OwnerEvidence (..)

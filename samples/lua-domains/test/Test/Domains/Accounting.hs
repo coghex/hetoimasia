@@ -6,7 +6,7 @@
 module Test.Domains.Accounting (spec) where
 
 import Control.Concurrent (forkIO, killThread, myThreadId, yield)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, tryReadMVar)
 import Control.Concurrent.STM (readTVar, readTVarIO, retry)
 import Control.Exception (SomeException, fromException, throwIO, try)
 import Control.Monad (forM, forM_, replicateM_, void, when)
@@ -31,7 +31,7 @@ import Hetoimasia.Sample.LuaDomains
   , StopPoint (StopIntended, StopIssued)
   , Started (startedOwner)
   , Where (InGameplay)
-  , TickOutcome (TickCommitted, TickFailed)
+  , TickOutcome (TickCommitted, TickFailed, TickHalted)
   , admitGameplayTask
   , cleanupEvidence
   , defaultBounds
@@ -392,8 +392,6 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
 
   describe "what a failure and a stop ask for before they wait" $ do
     let ready = "function run(self) sched.wait_ticks(1) while true do sched.yield() end end"
-        yielding = [EntryPoint "task_yields" Required [] []]
-        yieldingTask = "function task_yields() sched.wait_ticks(1) while true do sched.yield() end end"
     it "has an instance's failure ask a surviving instance that stays ready after yielding to stop, so the failed tick completes and its failure is published" $
       withSample
         ( \config →
@@ -409,7 +407,7 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
           fmap (failStage . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "update"
           evidence ← cleanupEvidence domains
           sort [(evidenceInstance found, evidenceOutcome found) | found ← evidenceInstances (evidenceGameplay evidence)] `shouldBe` [("gameplay", "failed"), ("ready peer", "stopped")]
-    it "has a task's fault ask a surviving instance that stays ready after yielding to stop, as soon as the fault is told" $
+    it "has a task's fault ask a surviving instance that stays ready after yielding to stop, as soon as the fault is told, though the driver is waiting for the tick the instance keeps outstanding" $
       withSample
         ( \config →
             (withWait config)
@@ -421,11 +419,13 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
               }
         )
         $ \_ _ domains → do
+          collect ← spawn (stepTick domains)
+          waitFor (ticksOutstanding (scheduledEndpoint (startedOwner (domainsGameplay domains))) >>= \outstanding → when (outstanding < 1) retry)
           _ ← admitGameplayTask domains (task "faulting task" "task_fails")
-          snapshot ← generous (stepTick domains) >>= expectFailed
+          snapshot ← collect >>= expectFailed
           fmap (failWho . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "faulting task"
     forM_ ["a concurrent stop request", "a stop after the driver was cancelled"] $ \how →
-      it ("has " <> how <> " ask a task that wakes on the tick and stays ready after yielding to stop, though the driver is waiting for the tick it keeps outstanding") $ do
+      it ("has " <> how <> " ask an instance that wakes on the tick and stays ready after yielding to stop, though the driver is waiting for the tick it keeps outstanding") $ do
         fx ← newFx
         ui ← newFakeUi
         withBoundary $ \control →
@@ -433,24 +433,28 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
             control
             (withWait (sampleConfig fx ui))
               { configInput = []
-              , configGameplaySource = gameplayWith ["function update(self, dt) staging.finish() end", yieldingTask]
-              , configGameplayEntries = yielding
+              , configGameplaySource = gameplayWith ["function update(self, dt) staging.finish() end"]
+              , configGameplayInstances = [peer "ready peer"]
+              , configGameplayModules = [extraModule [ready]]
               }
             $ \domains → do
-              admitGameplayTask domains (task "yielding task" "task_yields") >>= (`shouldSatisfy` accepted)
               ended ← newEmptyMVar
               driver ← forkIO (try @SomeException (stepTick domains) >>= putMVar ended)
-              -- The task has woken on the tick and keeps it outstanding: the driver is in its wait for the tick.
+              -- The peer has woken on the tick and keeps it outstanding: the driver is in its wait for the tick, and
+              -- nothing ends the wait by itself.
               waitFor (ticksOutstanding (scheduledEndpoint (startedOwner (domainsGameplay domains))) >>= \outstanding → when (outstanding < 1) retry)
+              replicateM_ 2000 yield
+              tryReadMVar ended >>= (`shouldSatisfy` isNothing)
               if how == "a stop after the driver was cancelled"
                 then killThread driver >> void (generous (readMVar ended)) >> void (generous (stopSession domains))
                 else do
                   requestStop domains
-                  _ ← generous (readMVar ended)
+                  outcome ← generous (readMVar ended)
+                  -- The driver's tick was halted by the stop, which freed it, and committed nothing.
+                  either (const Nothing) Just outcome `shouldSatisfy` \case Just TickHalted → True; _ → False
                   void (generous (stopSession domains))
               (snapshot, _) ← snapshotNow domains
-              snapStatus snapshot `shouldBe` Stopped
-              heldTasks domains `shouldReturn` 0
+              (snapTick snapshot, snapStatus snapshot) `shouldBe` (0, Stopped)
 
   describe "a failed session" $
     it "has stopped every surviving instance before its failure is published, one with work still to run among them: each is settled and its shutdown has run, and the owner stays alive" $ do
