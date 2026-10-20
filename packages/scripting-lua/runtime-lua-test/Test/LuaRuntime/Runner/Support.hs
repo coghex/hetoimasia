@@ -95,7 +95,7 @@ import System.IO (hClose, hFlush, openBinaryTempFile, stderr, stdout)
 import System.FilePath ((</>))
 import Test.LuaRuntime.Scheduled.Support (Clock (Clock), SFixture (..), awaitEntered, blockOn, newSFixture, releaseGate)
 import Test.LuaRuntime.Scheduler.Support (FakeTimer (..), Reg (regLive), allRegs, fireReg, nanoseconds)
-import Test.LuaRuntime.Support (Broken (Broken), Gated (..), alongsideOpening, applicationBoundaryFault, quietLogger)
+import Test.LuaRuntime.Support (alongsideOpening, applicationBoundaryFault, Broken (Broken), failExample, Gated (..), quietLogger)
 
 -- The fixture ------------------------------------------------------------------
 
@@ -325,12 +325,12 @@ runWith = runScriptsWith
 expectRan ∷ RunOutcome → IO RunReport
 expectRan = \case
   Ran report → pure report
-  Refused refusal → throwIO (userError ("expected a run, found a refusal: " <> show refusal))
+  Refused refusal → failExample ("expected a run, found a refusal: " <> show refusal)
 
 expectRefused ∷ RunOutcome → IO [UsageViolation]
 expectRefused = \case
   Refused (UsageRefusal violations) → pure (foldr (:) [] violations)
-  Ran report → throwIO (userError ("expected a refusal, found a run: " <> show report))
+  Ran report → failExample ("expected a refusal, found a run: " <> show report)
 
 -- Acting while a run is in progress -------------------------------------------
 

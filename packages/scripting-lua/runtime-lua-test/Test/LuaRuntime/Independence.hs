@@ -44,7 +44,7 @@ spec = describe "independent owners" $ do
       failing ← submit (ownerEndpoint narrow) "extra_fail" [VText "binding"] >>= accepted
       awaitTerminal control narrow >>= \case
         WorkerUnavailable (ExceptionWithContext _ failure) → failure `shouldSatisfy` brokenIs "binding"
-        other → fail ("expected an unavailable owner, found " <> show other)
+        other → failExample ("expected an unavailable owner, found " <> show other)
       _ ← settle failing
       namespaces steady >>= (`shouldBe` Just [VText "app"])
       -- A later owner is created while the steady one still serves.

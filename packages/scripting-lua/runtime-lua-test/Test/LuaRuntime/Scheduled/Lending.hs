@@ -45,7 +45,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduled.Support
-import Test.LuaRuntime.Support (Broken (Broken), Gated (..), bounded, brokenIs, expectFatal, gateIn, openGatesIn, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, Broken (Broken), brokenIs, expectFatal, failExample, Gated (..), gateIn, openGatesIn, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- The fixture ------------------------------------------------------------------
 
@@ -130,7 +130,7 @@ remember fixture name member = atomicModifyIORef' (lfMembers fixture) (\held →
 
 recall ∷ LFixture → Text → IO (Member Text)
 recall fixture name =
-  Map.lookup name <$> readIORef (lfMembers fixture) >>= maybe (throwIO (userError ("no member " <> Text.unpack name))) pure
+  Map.lookup name <$> readIORef (lfMembers fixture) >>= maybe (failExample ("no member " <> Text.unpack name)) pure
 
 -- | How a refusal reads in the history.
 describeRefusal ∷ SomeException → Text

@@ -30,7 +30,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfObserver), awaitEntered, awaitScheduledTerminal, blockOn)
-import Test.LuaRuntime.Support (Broken (Broken), Gated (..), bounded, brokenIs, requiredPolicy, tryBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, Broken (Broken), brokenIs, failExample, Gated (..), requiredPolicy, tryBoundaryOpening)
 
 -- | What ends the owner first.
 data Cause = CauseHost | CauseLua | CauseStop | CauseCancel
@@ -85,14 +85,14 @@ spec = describe "how the owner exits" $ do
       void (awaitScheduledTerminal control owner)
     case ended of
       Left (ExceptionWithContext _ raised) → raised `shouldSatisfy` brokenIs "observer"
-      Right _ → fail "the observer's failure of the host was lost"
+      Right _ → failExample "the observer's failure of the host was lost"
     forM_ ["k", "p"] $ \name → do
       settled ← tickOf fixture name >>= pollInstance
       fmap resultOutcome settled `shouldSatisfy` \case
         Just (InstanceDiscarded (Discard ExitFailed _)) → True
         _ → False
     readIORef held >>= \case
-      Nothing → fail "the owner never started"
+      Nothing → failExample "the owner never started"
       Just owner → atomically (scheduledExitRecord owner) >>= (`shouldSatisfy` maybe False ((== ExitFailed) . exitKind))
   it "keeps a failure of the host as the exit when the application's escalation is cancelled while retirement settles the failed instance" $ bounded $ do
     fixture ← newIFixture
@@ -107,7 +107,7 @@ spec = describe "how the owner exits" $ do
       void (awaitScheduledTerminal control owner)
     case ended of
       Left (ExceptionWithContext _ raised) → raised `shouldSatisfy` brokenIs "shutdown host"
-      Right _ → fail "the shutdown's failure of the host was lost"
+      Right _ → failExample "the shutdown's failure of the host was lost"
     -- The failed instance is told of and cancelled in the telling, and the one retired
     -- after it is still discarded by the first cause, not by the cancellation.
     a ← tickOf fixture "a" >>= pollInstance
@@ -181,22 +181,22 @@ cell cause later = do
   -- Supervision: the exception that ended the owner is the first cause's.
   case (cause, ended) of
     (CauseHost, Left (ExceptionWithContext _ raised)) → raised `shouldSatisfy` brokenIs "boom"
-    (CauseHost, Right _) → fail "the owner's host failure was lost"
+    (CauseHost, Right _) → failExample "the owner's host failure was lost"
     (CauseLua, Left (ExceptionWithContext _ raised)) → (fromException raised ∷ Maybe InstanceEscalated) `shouldSatisfy` isJust
-    (CauseLua, Right _) → fail "the owner's escalation was lost"
+    (CauseLua, Right _) → failExample "the owner's escalation was lost"
     _ → pure ()
   -- The exit record: what the owner's exit discarded names the first cause.
   readIORef exitRecord >>= \case
-    Nothing → fail "the owner never started"
+    Nothing → failExample "the owner never started"
     Just owner → atomically (scheduledExitRecord owner) >>= \case
       Just held → exitKind held `shouldBe` recordedAs cause
-      Nothing → fail "the owner's exit was not recorded"
+      Nothing → failExample "the owner's exit was not recorded"
   -- Every instance the owner left is discarded by the same cause.
   forM_ [name | (name, _, _) ← members, name /= "t" || cause == CauseHost] $ \name → do
     settled ← tickOf fixture name >>= pollInstance
     case (settled, discardedBy cause later) of
       (Just result, Just kind) → case resultOutcome result of
         InstanceDiscarded (Discard actual _) → (name, actual) `shouldBe` (name, kind)
-        other → fail (show name <> " settled as " <> show other <> ", expected discarded by " <> show kind)
+        other → failExample (show name <> " settled as " <> show other <> ", expected discarded by " <> show kind)
       (Just result, Nothing) → resultOutcome result `shouldSatisfy` \case InstanceStopped → True; _ → False
-      (Nothing, _) → fail (show name <> " was never settled")
+      (Nothing, _) → failExample (show name <> " was never settled")

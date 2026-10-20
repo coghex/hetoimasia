@@ -10,7 +10,7 @@
 module Test.LuaRuntime.Instance.Cadence (spec) where
 
 import Control.Concurrent.STM (atomically, retry)
-import Control.Exception (SomeException, fromException, try)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException)
 import Control.Monad (forM_, replicateM_, void)
 import Data.Foldable (toList)
 import Data.IORef (writeIORef)
@@ -28,7 +28,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfDelay), admitTask', awaitDiagnostics, awaitEffect, awaitEntered, awaitIdle, defaultSchedulerBounds, releaseGate, request)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, failExample, Gated (..), requiredPolicy, tryExpected, withBoundary, withBoundaryOpening)
 
 -- The modules -------------------------------------------------------------------
 
@@ -284,10 +284,10 @@ admissionSpec = describe "admitting a periodic instance" $ do
   it "refuses an owner configured with a zero tick duration, before anything starts" $ bounded $ do
     fixture ← newIFixture
     withBoundary $ \_ runtime → do
-      outcome ← try @SomeException (startInstances fixture runtime "zero" [ticker] (testConfig instanceBounds') {instanceTickDuration = Just zeroDuration} requiredPolicy)
+      outcome ← tryExpected (startInstances fixture runtime "zero" [ticker] (testConfig instanceBounds') {instanceTickDuration = Just zeroDuration} requiredPolicy)
       case outcome of
-        Left failure → fmap (\(InstancesRefused violations) → toList violations) (fromException failure) `shouldBe` Just [TickDurationNotPositive]
-        Right _ → fail "the configuration should have been refused"
+        Left (ExceptionWithContext _ failure) → fmap (\(InstancesRefused violations) → toList violations) (fromException failure) `shouldBe` Just [TickDurationNotPositive]
+        Right _ → failExample "the configuration should have been refused"
   it "fails a periodic instance whose module defines no update before any hook runs, naming it" $ bounded $
     withOwner [noUpdate] (testConfig instanceBounds') $ \fixture _ owner → do
       _ ← periodic fixture owner "noupdate" (LogicalTicks 2)
@@ -474,7 +474,7 @@ queueSpec = describe "a due update in the instance's queue" $ do
         [first, second] → do
           (Just first > position "event 8 end", Just first < position "event 10 begin") `shouldBe` (True, True)
           Just second > position "event 10 end" `shouldBe` True
-        _ → fail ("expected two updates, found " <> show updates)
+        _ → failExample ("expected two updates, found " <> show updates)
       filter (Text.isPrefixOf "update ") final `shouldBe` ["update 2", "update 2"]
 
 -- Pause -----------------------------------------------------------------------------
@@ -663,7 +663,7 @@ narrowSpec = describe "an owner whose value limit is one element" $
   it "completes a one-shot and hands a periodic update its dt, neither needing more than the instance's number across the boundary" $ bounded $ do
     fixture ← newIFixture
     withBoundary $ \control runtime → do
-      limits ← either (fail . show) pure (valueLimits 65536 8 1)
+      limits ← either (failExample . show) pure (valueLimits 65536 8 1)
       owner ← startWith fixture runtime . withLimits limits $ instanceSpec fixture "narrow" [bare] (testConfig instanceBounds') requiredPolicy defaultSchedulerBounds
       _ ← admitWith fixture owner "one" (InstanceRequest (moduleNamed "bare") RunOnce (Just "one") OrdinaryClass [])
       settled ← awaitSettled fixture "one"

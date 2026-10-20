@@ -10,7 +10,7 @@ import Hetoimasia.Scripting.Lua.Lending (LendingRefused (LendingInUse), newLendi
 import Hetoimasia.Scripting.Lua.Scheduled
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Lease.Support
-import Test.LuaRuntime.Support (bounded, failureOf, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (bounded, failureOf, requiredPolicy, tryExpected, withBoundary)
 import Test.LuaRuntime.Instance.Support (admit, awaitPhase, moduleNamed)
 import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 
@@ -64,6 +64,6 @@ spec = describe "giving an owner its leases" $ do
     withBoundary $ \_ runtime → do
       owner ← startLeased fixture runtime "first" [plain] leaseConfig requiredPolicy
       -- The handle it is made over is taken with it, so a second owner cannot be given either.
-      outcome ← tryWithContext @SomeException (startLeased fixture runtime "second" [plain] leaseConfig requiredPolicy)
+      outcome ← tryExpected (startLeased fixture runtime "second" [plain] leaseConfig requiredPolicy)
       either failureOf (const Nothing) outcome `shouldBe` Just LendingInUse
       retireScheduled owner

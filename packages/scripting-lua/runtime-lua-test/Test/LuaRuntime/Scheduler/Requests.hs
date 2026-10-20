@@ -11,6 +11,7 @@ import Data.Word (Word64)
 import Hetoimasia.Scripting.Lua.Scheduler
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduler.Support
+import Test.LuaRuntime.Support (failExample)
 
 -- | A step that waits for the request the owner numbers this.
 waitRequest ∷ Text → Word64 → Step
@@ -108,7 +109,7 @@ spec = describe "requests" $ do
       ticket ←
         atomically (requestControl (rigScheduler rig) identity RequestPause) >>= \case
           ControlAccepted accepted → pure accepted
-          other → fail ("the request was not accepted: " <> show other)
+          other → failExample ("the request was not accepted: " <> show other)
       _ ← turn rig
       _ ← atomically (pollControl ticket)
       phase rig identity >>= (`shouldBe` Just PhasePaused)
@@ -119,7 +120,7 @@ spec = describe "requests" $ do
       resumed ←
         atomically (requestControl (rigScheduler rig) identity RequestResume) >>= \case
           ControlAccepted accepted → pure accepted
-          other → fail ("the request was not accepted: " <> show other)
+          other → failExample ("the request was not accepted: " <> show other)
       _ ← turn rig
       _ ← atomically (pollControl resumed)
       atomically (requestWaiting (rigScheduler rig) (\_ → pure True)) >>= (`shouldBe` True)
@@ -144,7 +145,7 @@ spec = describe "requests" $ do
       ticket ←
         atomically (requestControl (rigScheduler rig) identity RequestStop) >>= \case
           ControlAccepted accepted → pure accepted
-          other → fail ("the request was not accepted: " <> show other)
+          other → failExample ("the request was not accepted: " <> show other)
       _ ← turn rig
       _ ← atomically (pollControl ticket)
       -- Nothing is left waiting for the request.

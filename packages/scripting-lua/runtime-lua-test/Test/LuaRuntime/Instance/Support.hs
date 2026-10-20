@@ -98,7 +98,6 @@ module Test.LuaRuntime.Instance.Support
 
 import Control.Concurrent (yield)
 import Control.Concurrent.STM (atomically, retry)
-import Control.Exception (throwIO)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -126,7 +125,7 @@ import Test.LuaRuntime.Scheduled.Support
   , scheduled
   , startScheduled
   )
-import Test.LuaRuntime.Support (Gated (..))
+import Test.LuaRuntime.Support (failExample, Gated (..))
 
 -- The fixture ------------------------------------------------------------------
 
@@ -758,9 +757,9 @@ expectAccepted fixture name = \case
     atomicModifyIORef' (ifIds fixture) (\held → (Map.insert name identity held, ()))
     atomicModifyIORef' (ifTickets fixture) (\held → (Map.insert name ticket held, ()))
     pure ticket
-  InstanceFull → throwIO (userError "expected the instance to be accepted, found it full")
-  InstanceAdmissionClosed → throwIO (userError "expected the instance to be accepted, found it closed")
-  InstanceIntervalRefused refusal → throwIO (userError ("expected the instance to be accepted, found its interval refused: " <> show refusal))
+  InstanceFull → failExample "expected the instance to be accepted, found it full"
+  InstanceAdmissionClosed → failExample "expected the instance to be accepted, found it closed"
+  InstanceIntervalRefused refusal → failExample ("expected the instance to be accepted, found its interval refused: " <> show refusal)
 
 -- | The identity an instance was admitted under this name.
 idOf ∷ IFixture → Text → IO InstanceId
@@ -785,7 +784,7 @@ expectDelivered ∷ IFixture → ScheduledOwner → Text → Int → IO ()
 expectDelivered fixture owner name n =
   deliverTick fixture owner name n >>= \case
     DeliveryAccepted _ → pure ()
-    other → throwIO (userError ("expected the delivery accepted, found " <> show other))
+    other → failExample ("expected the delivery accepted, found " <> show other)
 
 -- | Ask for control of the instance of this name.
 askControl ∷ IFixture → ScheduledOwner → Text → InstanceControl → IO InstanceControlAnswer
@@ -798,7 +797,7 @@ expectControl ∷ IFixture → ScheduledOwner → Text → InstanceControl → I
 expectControl fixture owner name request =
   askControl fixture owner name request >>= \case
     InstanceControlAccepted receipt → pure receipt
-    other → throwIO (userError ("expected the request accepted, found " <> show other))
+    other → failExample ("expected the request accepted, found " <> show other)
 
 -- | Ask until the answer is not that every reservation is held: a settlement the
 -- owner has yet to give back one for.

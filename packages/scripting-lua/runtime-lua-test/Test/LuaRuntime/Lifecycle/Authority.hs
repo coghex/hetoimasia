@@ -3,7 +3,7 @@
 -- exists, and the refusal of a grant that does not make sense.
 module Test.LuaRuntime.Lifecycle.Authority (spec) where
 
-import Control.Exception (SomeException, fromException, try)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException)
 import Data.List.NonEmpty (toList)
 import Data.Maybe (isJust)
 import Data.Text (Text)
@@ -17,7 +17,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Lifecycle.Support
 import Test.LuaRuntime.Scheduled.Support (defaultSchedulerBounds, scheduled, startScheduled)
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (bounded, failExample, requiredPolicy, tryExpected, withBoundary)
 
 unauthorized ∷ Text
 unauthorized = "{accepted=false,refusal=unauthorized}"
@@ -28,12 +28,12 @@ unknownTarget = "{accepted=false,refusal=unknown_target}"
 -- | The violations a grant is refused with.
 refusedWith ∷ IFixture → LuaRuntime → InstanceConfig → LifecycleGrant → IO [LifecycleViolation]
 refusedWith fixture runtime config grant = do
-  outcome ← try @SomeException (startWith fixture runtime (lifeSpec fixture (lifeRegistration fixture) "refused" [echoer] config (Just grant)))
+  outcome ← tryExpected (startWith fixture runtime (lifeSpec fixture (lifeRegistration fixture) "refused" [echoer] config (Just grant)))
   case outcome of
-    Left failure → case fromException failure of
+    Left (ExceptionWithContext _ failure) → case fromException failure of
       Just (LifecycleRefused violations) → pure (toList violations)
-      Nothing → fail ("expected the refusal of the grant, found " <> show failure)
-    Right _ → fail "the grant should have been refused"
+      Nothing → failExample ("expected the refusal of the grant, found " <> show failure)
+    Right _ → failExample "the grant should have been refused"
 
 spec ∷ Spec
 spec = describe "authority" $ do

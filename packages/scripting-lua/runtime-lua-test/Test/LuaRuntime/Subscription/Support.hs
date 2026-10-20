@@ -57,6 +57,7 @@ module Test.LuaRuntime.Subscription.Support
   , admitSubscriber
   , command
   , commandWith
+  , deliverCommand
   , sync
   , gotLines
   , awaitGot
@@ -66,7 +67,7 @@ module Test.LuaRuntime.Subscription.Support
 
 import Control.Concurrent (yield)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, retry, writeTVar)
-import Control.Exception (finally, throwIO)
+import Control.Exception (finally)
 import Control.Monad (void)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Text (Text)
@@ -82,6 +83,7 @@ import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support (awaitLine)
 import Test.LuaRuntime.Scheduled.Support (defaultSchedulerBounds, startScheduled)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
+import Test.LuaRuntime.Support (failExample)
 
 -- The fake provider --------------------------------------------------------------------
 
@@ -176,7 +178,7 @@ subscribedAt fake index = do
   held ← atomically (readTVar (feSubs fake))
   case drop index held of
     found : _ → pure found
-    [] → throwIO (userError ("the provider was handed no subscription " <> show index))
+    [] → failExample ("the provider was handed no subscription " <> show index)
 
 -- | A delivery's value.
 payloadOf ∷ Int → Value
@@ -430,7 +432,7 @@ startSubscriber fixture runtime label modules config timing grant worker =
 subDiagnostics ∷ ScheduledOwner → IO SubscriptionDiagnostics
 subDiagnostics owner = do
   found ← atomically (subscriptionDiagnostics (scheduledEndpoint owner))
-  maybe (throwIO (userError "the owner has no subscriptions")) pure found
+  maybe (failExample "the owner has no subscriptions") pure found
 
 -- | Block, in STM, until the owner's subscriptions read like this.
 awaitSubDiagnostic ∷ ScheduledOwner → (SubscriptionDiagnostics → Bool) → IO ()
@@ -459,16 +461,22 @@ command fixture owner name op key = commandWith fixture owner name op key Nothin
 
 -- | The same, with the endpoint and the callback's mode a subscribe is told.
 commandWith ∷ IFixture → ScheduledOwner → Text → Text → Text → Maybe Text → Maybe Text → IO ()
-commandWith fixture owner name op key endpoint mode = do
+commandWith fixture owner name op key endpoint mode =
+  deliverCommand fixture owner name op key endpoint mode >>= \case
+    DeliveryAccepted _ → pure ()
+    other → failExample ("expected the command accepted, found " <> show other)
+
+-- | The same, answering what delivering the command answered, for an example that expects a
+-- refusal among the answers it may get.
+deliverCommand ∷ IFixture → ScheduledOwner → Text → Text → Text → Maybe Text → Maybe Text → IO Delivery
+deliverCommand fixture owner name op key endpoint mode = do
   identity ← idOf fixture name
   let payload =
         VRecord $
           [("op", VText op), ("key", VText key)]
             <> [("endpoint", VText found) | Just found ← [endpoint]]
             <> [("mode", VText found) | Just found ← [mode]]
-  deliverEvent (scheduledEndpoint owner) identity "cmd" payload >>= \case
-    DeliveryAccepted _ → pure ()
-    other → throwIO (userError ("expected the command accepted, found " <> show other))
+  deliverEvent (scheduledEndpoint owner) identity "cmd" payload
 
 -- | Have the owner serve one more thing, and wait until it has: the subscriber of this name is
 -- told to do nothing, under this number. When the owner is held at a tick, this shows it is

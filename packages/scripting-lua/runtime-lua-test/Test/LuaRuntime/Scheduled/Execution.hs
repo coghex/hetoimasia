@@ -17,7 +17,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (fireReg, liveRegs, nanoseconds)
-import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, failExample, Gated (..), requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- | A task of the module's @spin@ entry, which records a label and a number and
 -- yields, this many times.
@@ -177,7 +177,7 @@ spec = describe "tasks run as coroutines on a scheduled owner" $ do
         let endpoint = scheduledEndpoint owner
         requestTaskControl endpoint (ticketTask target) RequestResume >>= \case
           TaskControlAccepted receipt → waitControl receipt >>= (`shouldSatisfy` \settled → settledResult settled == ControlApplied)
-          other → fail ("the resume was not accepted: " <> show other)
+          other → failExample ("the resume was not accepted: " <> show other)
         _ ← outcomeOf target
         taskEffects fixture >>= (`shouldBe` ["p1", "c pause p -> 0", "c after", "p2", "p3", "p4"])
         retireScheduled owner
@@ -194,7 +194,7 @@ spec = describe "tasks run as coroutines on a scheduled owner" $ do
         taskEffects fixture >>= (`shouldBe` ["s pause s -> 0"])
         requestTaskControl (scheduledEndpoint owner) (ticketTask ticket) RequestResume >>= \case
           TaskControlAccepted _ → pure ()
-          other → fail ("the resume was not accepted: " <> show other)
+          other → failExample ("the resume was not accepted: " <> show other)
         _ ← outcomeOf ticket
         taskEffects fixture >>= (`shouldBe` ["s pause s -> 0", "s after"])
         retireScheduled owner
@@ -206,7 +206,7 @@ spec = describe "tasks run as coroutines on a scheduled owner" $ do
         ticket ← holding fixture owner (admitTask' fixture owner "k" (request "controls" [VText "k", VText "k", VText "stop"] OrdinaryClass OneShot (Just "k")))
         outcomeOf ticket >>= \case
           SettledCancelled → pure ()
-          other → fail ("expected the task to be cancelled, found " <> show other)
+          other → failExample ("expected the task to be cancelled, found " <> show other)
         -- It asked inside its first segment and was stopped as that returned, so it
         -- never ran the line after its yield.
         taskEffects fixture >>= (`shouldBe` ["k stop k -> 0"])
@@ -224,5 +224,5 @@ spec = describe "tasks run as coroutines on a scheduled owner" $ do
         _ ← outcomeOf killer
         outcomeOf victim >>= \case
           SettledCancelled → pure ()
-          other → fail ("expected the task to be cancelled, found " <> show other)
+          other → failExample ("expected the task to be cancelled, found " <> show other)
         retireScheduled owner

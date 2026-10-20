@@ -7,7 +7,7 @@
 module Test.LuaRuntime.Accounting.Waits (spec) where
 
 import Control.Concurrent.STM (atomically, retry)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), finally, throwIO)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), finally)
 import Control.Monad (forM_, replicateM_, void, when)
 import Data.IORef (readIORef, writeIORef)
 import Data.Text (Text)
@@ -22,7 +22,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Accounting.Support
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (bounded, brokenIs, expectFatal, optionalPolicy, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (bounded, brokenIs, expectFatal, failExample, optionalPolicy, requiredPolicy, withBoundary)
 
 -- | Whether this is the failing owner's worker, which has not yet published its terminal outcome.
 awaitingFailing ∷ OutstandingWorker → Bool
@@ -30,7 +30,7 @@ awaitingFailing worker = outstandingState worker == AwaitingTerminal && "failing
 
 -- | What a wait ended with, failing if it raised.
 answer ∷ PendingWait → IO AccountingWait
-answer waiting = resultOf waiting >>= either (\failure → fail ("the wait raised " <> show failure)) pure
+answer waiting = resultOf waiting >>= either (\failure → failExample ("the wait raised " <> show failure)) pure
 
 -- | A worker policy for an optional worker whose failures are all recognized, and which
 -- passes a gate when it classifies one.
@@ -147,20 +147,20 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
             _ ← admitTask' fixture owner "B" (request "once" [VText "B"] OrdinaryClass OneShot (Just "B"))
             admitScheduledTask endpoint (request "once" [VText "C"] OrdinaryClass OneShot (Just "C")) >>= \case
               TaskQueueFull → pure ()
-              other → fail ("expected the queue full, found " <> show other)
+              other → failExample ("expected the queue full, found " <> show other)
             -- One control place, taken and never given back.
             requestTaskControl endpoint (ticketTask a) RequestResume >>= \case
               TaskControlAccepted _ → pure ()
-              other → fail ("expected the control accepted, found " <> show other)
+              other → failExample ("expected the control accepted, found " <> show other)
             requestTaskControl endpoint (ticketTask a) RequestPause >>= \case
               TaskControlFull → pure ()
-              other → fail ("expected the control full, found " <> show other)
+              other → failExample ("expected the control full, found " <> show other)
             -- Two outstanding grants, and a third is refused.
             grant owner 1
             grant owner 1
             grantScheduledStep endpoint (nanoseconds 1) >>= \case
               GrantFull → pure ()
-              other → fail ("expected the grants full, found " <> show other)
+              other → failExample ("expected the grants full, found " <> show other)
             captured ← beginWait control owner
             awaitPending captured
             pure captured
@@ -259,7 +259,7 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
           awaitEntered fixture "a"
           grant other 1
           void (awaitScheduledAccounting control owner)
-          throwIO (userError "the wait returned instead of rethrowing the fatal failure")
+          failExample "the wait returned instead of rethrowing the fatal failure"
       let ExceptionWithContext _ raised = failure
       raised `shouldSatisfy` brokenIs "bang"
 
@@ -271,7 +271,7 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
             stop ticket =
               requestTaskControl endpoint (ticketTask ticket) RequestStop >>= \case
                 TaskControlAccepted _ → pure ()
-                other → fail ("expected the stop accepted, found " <> show other)
+                other → failExample ("expected the stop accepted, found " <> show other)
         failing ← admitTask' fixture owner "X" (request "closes_badly" [VText "X"] OrdinaryClass OneShot (Just "X"))
         gated ← admitTask' fixture owner "Y" (closesGated "y")
         awaitDiagnostics owner (\counts → diagWaiting counts >= 2)
@@ -304,7 +304,7 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
           when (any awaitingFailing (statusOutstanding status)) retry
         -- The wait is ready all the same, and is not what the call answers.
         void (awaitScheduledAccounting control owner)
-        throwIO (userError "the wait returned instead of rethrowing the fatal failure")
+        failExample "the wait returned instead of rethrowing the fatal failure"
       let ExceptionWithContext _ raised = failure
       raised `shouldSatisfy` brokenIs "bang"
 

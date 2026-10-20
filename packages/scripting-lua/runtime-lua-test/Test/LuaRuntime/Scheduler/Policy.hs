@@ -12,6 +12,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (TaskId (TaskId), Tas
 import Hetoimasia.Scripting.Lua.Scheduler
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduler.Support
+import Test.LuaRuntime.Support (failExample)
 
 spec ∷ Spec
 spec = describe "scheduling policy" $ do
@@ -167,7 +168,7 @@ spec = describe "scheduling policy" $ do
           Text.length name `shouldBe` 128
           Text.length entry `shouldBe` 128
           entry' `shouldBe` "anonymous"
-        other → fail ("unexpected hosts calls: " <> show other)
+        other → failExample ("unexpected hosts calls: " <> show other)
 
 -- The policies the examples try ---------------------------------------------------
 
@@ -207,7 +208,7 @@ writeTicket ∷ IORef (Maybe ControlTicket) → ControlTicket → IO ()
 writeTicket cell = writeIORef cell . Just
 
 readTicket ∷ IORef (Maybe ControlTicket) → IO ControlTicket
-readTicket cell = readIORef cell >>= maybe (fail "the request was not accepted") pure
+readTicket cell = readIORef cell >>= maybe (failExample "the request was not accepted") pure
 
 newIORefList ∷ IO (IORef [(Maybe Text, Text)])
 newIORefList = newIORef []

@@ -13,7 +13,7 @@ import Hetoimasia.Scripting.Lua.Runner
 import Hetoimasia.Scripting.Lua.Runner.Internal (outputLines)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldContain, shouldNotContain, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Runner.Support
-import Test.LuaRuntime.Support (bounded, recordingLogger, withBoundary)
+import Test.LuaRuntime.Support (bounded, failExample, recordingLogger, withBoundary)
 
 -- | The lines a script printed, found by what they start with.
 startingWith ∷ Text → [Text] → [Text]
@@ -82,12 +82,12 @@ spec = describe "output" $ do
         [line] → do
           Text.length line `shouldSatisfy` (<= outputCallLimit)
           Text.isSuffixOf truncationMarker line `shouldBe` True
-        other → fail ("expected one cut line, found " <> show (length other))
+        other → failExample ("expected one cut line, found " <> show (length other))
       case filter (Text.isInfixOf "W:") err of
         [line] → do
           Text.length line `shouldSatisfy` (<= outputCallLimit)
           Text.isSuffixOf truncationMarker line `shouldBe` True
-        other → fail ("expected one cut warning, found " <> show (length other))
+        other → failExample ("expected one cut warning, found " <> show (length other))
     it "writes what is under the bound whole" $ do
       (out, _) ← printing ["print('M:' .. string.rep('z', 4000))"]
       startingWith "M:" out `shouldBe` ["M:" <> Text.replicate 4000 "z"]

@@ -29,7 +29,7 @@ import Test.LuaRuntime.Scheduled.Support
   , releaseGate
   , request
   )
-import Test.LuaRuntime.Support (Gated (..), bounded, brokenIs, expectFatal, expectFatalOpening, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, brokenIs, expectFatal, expectFatalOpening, failExample, Gated (..), optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
 
 stopped ∷ InstanceOutcome → Bool
 stopped = \case InstanceStopped → True; _ → False
@@ -234,7 +234,7 @@ spec = describe "the boundaries of service" $ do
       -- The ordinary task's request settles and is not read: it holds the reservation.
       held ← requestTaskControl (scheduledEndpoint owner) task RequestPause >>= \case
         TaskControlAccepted receipt → pure receipt
-        other → fail ("expected the request accepted, found " <> show other)
+        other → failExample ("expected the request accepted, found " <> show other)
       awaitDiagnostics owner (\counts → diagControlAccepted counts >= 1)
       settleControl fixture owner "a" InstanceStop >>= (`shouldBe` ControlApplied)
       settled ← awaitSettled fixture "a"
@@ -439,7 +439,7 @@ spec = describe "the boundaries of service" $ do
       awaitPhase fixture owner "a" Active
       expectDelivered fixture owner "a" 1
       awaitDiagnosticsWaiting owner
-      task ← readIORef seen >>= maybe (fail "no segment was observed") pure
+      task ← readIORef seen >>= maybe (failExample "no segment was observed") pure
       -- Told to the application by the observer, and of no use to it.
       requestTaskControl (scheduledEndpoint owner) task RequestPause >>= (`shouldSatisfy` \case TaskControlUnknown → True; _ → False)
       requestTaskControl (scheduledEndpoint owner) task RequestStop >>= (`shouldSatisfy` \case TaskControlUnknown → True; _ → False)
@@ -567,7 +567,7 @@ spec = describe "the boundaries of service" $ do
         Just failure → do
           failureStage failure `shouldBe` StageInit
           failureError failure `shouldSatisfy` isNotAFunction
-        Nothing → fail "expected the invalid init to fail the instance"
+        Nothing → failExample "expected the invalid init to fail the instance"
       _ ← admit fixture owner "s" (moduleNamed "shutdownvalue")
       awaitPhase fixture owner "s" Active
       settleControl fixture owner "s" InstanceStop >>= (`shouldBe` ControlApplied)
@@ -577,7 +577,7 @@ spec = describe "the boundaries of service" $ do
         Just failure → do
           failureStage failure `shouldBe` StageShutdown
           failureError failure `shouldSatisfy` isNotAFunction
-        Nothing → fail "expected the invalid shutdown to fail the instance"
+        Nothing → failExample "expected the invalid shutdown to fail the instance"
       terminationShutdown (resultTermination ended) `shouldBe` ShutdownRaised
 
   it "keeps the queue within its bound when an unstarted invocation is taken back by a pause" $ bounded $ do
@@ -650,8 +650,8 @@ spec = describe "the boundaries of service" $ do
       _ → False
     ordinary = \case
       TaskAccepted _ ticket → pure ticket
-      other → fail ("expected the task accepted, found " <> show other)
+      other → failExample ("expected the task accepted, found " <> show other)
     ordinaryIdentity = \case
       TaskAccepted identity _ → pure identity
-      other → fail ("expected the task accepted, found " <> show other)
+      other → failExample ("expected the task accepted, found " <> show other)
     grantFive control owner = forM_ [1 .. 5 ∷ Int] (const (grantOne control owner))

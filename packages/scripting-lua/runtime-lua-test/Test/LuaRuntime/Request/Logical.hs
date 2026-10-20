@@ -22,7 +22,7 @@ import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfDelay), awaitScheduledTerminal)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
+import Test.LuaRuntime.Support (bounded, failExample, requiredPolicy, withBoundary)
 
 -- | An owner of askers that settles at assigned ticks, placing requests by this assignment.
 logicalOwner ∷ IFixture → Fake → LuaRuntime → Text → Maybe AssignRequest → IO ScheduledOwner
@@ -400,7 +400,7 @@ spec = describe "logical time" $ do
         answerResult fake 0 8 >>= (`shouldBe` ReplyHeld)
         receipt ← requestInstanceControlAt (scheduledEndpoint owner) identity InstanceStop (ControlSlot 1 0) >>= \case
           InstanceControlAccepted accepted → pure accepted
-          other → fail ("expected the control accepted, found " <> show other)
+          other → failExample ("expected the control accepted, found " <> show other)
         grantOne control owner
         waitInstanceControl receipt >>= (`shouldBe` ControlApplied)
         replicateM_ 2 (grantOne control owner)
@@ -424,7 +424,7 @@ spec = describe "logical time" $ do
         answerResult fake 0 8 >>= (`shouldBe` ReplyHeld)
         receipt ← requestInstanceControlAt (scheduledEndpoint owner) identity InstanceStop (ControlSlot 3 0) >>= \case
           InstanceControlAccepted accepted → pure accepted
-          other → fail ("expected the control accepted, found " <> show other)
+          other → failExample ("expected the control accepted, found " <> show other)
         grantOne control owner
         command fixture owner "i" "take" "a"
         awaitLine fixture "cmd take a {status=result,value=8}"
@@ -473,4 +473,4 @@ spec = describe "logical time" $ do
       results ← sequence [run variant cut | variant ← [0, 1, 2], cut ← cuts]
       case results of
         first : rest → forM_ rest (`shouldBe` first)
-        [] → fail "no runs"
+        [] → failExample "no runs"

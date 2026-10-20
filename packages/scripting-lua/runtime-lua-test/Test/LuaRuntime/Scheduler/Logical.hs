@@ -13,7 +13,7 @@ import Hetoimasia.Runtime.Supervision (awaitSupervised)
 import Hetoimasia.Scripting.Lua.Scheduler
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduler.Support
-import Test.LuaRuntime.Support (bounded, withBoundary)
+import Test.LuaRuntime.Support (bounded, failExample, withBoundary)
 
 tick ∷ Rig → IO Word64
 tick = atomically . readTick . rigScheduler
@@ -24,7 +24,7 @@ outstanding = atomically . stepsOutstanding . rigScheduler
 accepted ∷ GrantAnswer → IO GrantId
 accepted = \case
   GrantAccepted grant → pure grant
-  other → fail ("the grant was not accepted: " <> show other)
+  other → failExample ("the grant was not accepted: " <> show other)
 
 spec ∷ Spec
 spec = describe "logical time" $ do
@@ -142,7 +142,7 @@ spec = describe "logical time" $ do
       Just (ResultFailed failure) → do
         reasonCode (failureReasonOf failure) `shouldBe` ValidationFault
         failureRecovery failure `shouldBe` RecoverySafe
-      other → fail ("expected a failed result, found " <> show other)
+      other → failExample ("expected a failed result, found " <> show other)
     map fst (turnFailures report) `shouldBe` [victim]
     -- "late" began waiting at the first tick and was woken by the second grant, with
     -- exactly what that grant gave it.
@@ -175,7 +175,7 @@ spec = describe "logical time" $ do
     turnRefusedWaits final `shouldBe` [(late, WaitDeadlineOverflow)]
     observe rig late >>= \case
       Just (ResultFailed failure) → reasonDetail (failureReasonOf failure) `shouldSatisfy` (/= mempty)
-      other → fail ("expected a failed result, found " <> show other)
+      other → failExample ("expected a failed result, found " <> show other)
     counts ← diagnostics rig
     diagRefusedWaits counts `shouldBe` 4
     -- Each refused wait left a suspended continuation, which was closed once.

@@ -20,7 +20,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VInteger))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (allRegs)
-import Test.LuaRuntime.Support (Gated (..), bounded, newFixture, optionalPolicy, quickSpec, requiredPolicy, startOwner, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, failExample, Gated (..), newFixture, optionalPolicy, quickSpec, requiredPolicy, startOwner, withBoundary, withBoundaryOpening)
 
 -- | An initial chunk that runs the Lua given, under the name @init@.
 initial ∷ Text → [(ChunkName, ByteString)]
@@ -50,7 +50,7 @@ spec = describe "creation, readiness and identity" $ do
       let broken = withChunks (initial "error('init boom')") (scheduled fixture "broken" (optionalPolicy (const True)) defaultSchedulerBounds)
       startScheduledOwner runtime broken >>= \case
         ScheduledUnavailable _ → pure ()
-        _ → fail "expected the optional owner to be unavailable"
+        _ → failExample "expected the optional owner to be unavailable"
       ticket ← admitTask' fixture bystander "echo" (request "echo" [VInteger 2] OrdinaryClass OneShot Nothing)
       outcomeOf ticket >>= (`shouldBe` Just [VInteger 2]) . taskReturned
       retireScheduled bystander
@@ -63,8 +63,8 @@ spec = describe "creation, readiness and identity" $ do
       case outcome of
         Left failure → case fromException failure of
           Just (SchedulerRefused _) → pure ()
-          Nothing → fail ("expected the refusal of the configuration, found " <> show failure)
-        Right _ → fail "the configuration should have been refused"
+          Nothing → failExample ("expected the refusal of the configuration, found " <> show failure)
+        Right _ → failExample "the configuration should have been refused"
       -- Nothing was started or armed.
       length <$> allRegs (sfTimer fixture) >>= (`shouldBe` 0)
 
@@ -81,7 +81,7 @@ spec = describe "creation, readiness and identity" $ do
             TaskAccepted identity ticket → do
               _ ← outcomeOf ticket
               pure identity
-            _ → fail "expected the task to be accepted"
+            _ → failExample "expected the task to be accepted"
         let ownerIds = map scheduledIdentity owners <> [ownerIdentity finite]
         forM_ owners retireScheduled
         retireOwner finite

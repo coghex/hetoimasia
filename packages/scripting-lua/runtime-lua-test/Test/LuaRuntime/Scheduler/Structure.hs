@@ -10,11 +10,12 @@ import Data.List (isPrefixOf)
 import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
 import System.FilePath (takeExtension, (</>))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
+import Test.LuaRuntime.Support (failExample)
 
 packageRoot ∷ IO FilePath
 packageRoot = search "." (8 ∷ Int)
   where
-    search _ 0 = fail "hetoimasia-scripting-lua.cabal was not found above the working directory"
+    search _ 0 = failExample "hetoimasia-scripting-lua.cabal was not found above the working directory"
     search directory budget = do
       here ← doesFileExist (directory </> "hetoimasia-scripting-lua.cabal")
       if here then pure directory else search (directory </> "..") (budget - 1)

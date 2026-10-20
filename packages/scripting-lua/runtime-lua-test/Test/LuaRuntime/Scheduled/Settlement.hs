@@ -23,7 +23,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (Gated (..), bounded, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, failExample, Gated (..), requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- | Keep asking until the admission is accepted: for the moment between a
 -- reservation being forgotten and the owner's next sweep giving it back.
@@ -32,7 +32,7 @@ untilAccepted endpoint taskRequest =
   admitScheduledTask endpoint taskRequest >>= \case
     TaskAccepted _ ticket → pure ticket
     TaskQueueFull → yield >> untilAccepted endpoint taskRequest
-    TaskAdmissionClosed → fail "the owner closed"
+    TaskAdmissionClosed → failExample "the owner closed"
 
 echoing ∷ Int → TaskRequest
 echoing n = request "echo" [VInteger (fromIntegral n)] OrdinaryClass OneShot Nothing
@@ -57,24 +57,24 @@ spec = describe "admission and settlement" $ do
         outcomeOf returned >>= (`shouldBe` Just [VInteger 7]) . taskReturned
         outcomeOf absent >>= \case
           SettledReturned _ → pure ()
-          other → fail ("expected the absent entry point to settle as returned, found " <> show other)
+          other → failExample ("expected the absent entry point to settle as returned, found " <> show other)
         outcomeOf faulted >>= \case
           SettledFaulted (BoundaryFailed fault) → boundaryReason fault `shouldSatisfy` \case ScriptFailed CallFailed _ → True; _ → False
-          other → fail ("expected a script fault as data, found " <> show other)
+          other → failExample ("expected a script fault as data, found " <> show other)
         outcomeOf ghost >>= \case
           SettledFaulted (ModuleNotLoaded ref) → ref `shouldBe` ModuleRef "ghost" "9"
-          other → fail ("expected the unknown module, found " <> show other)
+          other → failExample ("expected the unknown module, found " <> show other)
         outcomeOf refused >>= \case
           SettledRefused failure → reasonCode (failureReasonOf failure) `shouldBe` ValidationFault
-          other → fail ("expected the scheduler's refusal, found " <> show other)
+          other → failExample ("expected the scheduler's refusal, found " <> show other)
         -- None of those ended the owner: it stops a task on request, and a task is
         -- served after them.
         requestTaskControl endpoint (ticketTask stopped) RequestStop >>= \case
           TaskControlAccepted receipt → void (waitControl receipt)
-          other → fail ("the stop was not accepted: " <> show other)
+          other → failExample ("the stop was not accepted: " <> show other)
         outcomeOf stopped >>= \case
           SettledCancelled → pure ()
-          other → fail ("expected a cancellation, found " <> show other)
+          other → failExample ("expected a cancellation, found " <> show other)
         after ← admitTask' fixture owner "after" (echoing 8)
         outcomeOf after >>= (`shouldBe` Just [VInteger 8]) . taskReturned
         retireScheduled owner
@@ -86,7 +86,7 @@ spec = describe "admission and settlement" $ do
         ticket ← admitTask' fixture owner "over" (request "once" [VText (replicate' 100000)] OrdinaryClass OneShot Nothing)
         outcomeOf ticket >>= \case
           SettledFaulted (BoundaryFailed fault) → boundaryReason fault `shouldSatisfy` \case ValueRefused _ → True; _ → False
-          other → fail ("expected a refused argument, found " <> show other)
+          other → failExample ("expected a refused argument, found " <> show other)
         effects fixture >>= (`shouldBe` [])
         retireScheduled owner
 
@@ -103,14 +103,14 @@ spec = describe "admission and settlement" $ do
         _ ← awaitScheduledTerminal control owner
         outcomeOf waiting >>= \case
           SettledDiscarded discard → discard `shouldBe` Discard ExitStopped NotStarted
-          other → fail ("expected a discard, found " <> show other)
+          other → failExample ("expected a discard, found " <> show other)
         -- The task that was running finished its segment and was not discarded.
         outcomeOf running >>= \case
           SettledReturned _ → pure ()
-          other → fail ("expected the running task to finish, found " <> show other)
+          other → failExample ("expected the running task to finish, found " <> show other)
         atomically (scheduledExitRecord owner) >>= \case
           Just record → (exitNotStarted record, exitStarted record) `shouldBe` (1, 0)
-          Nothing → fail "the owner recorded no exit"
+          Nothing → failExample "the owner recorded no exit"
 
   describe "bounds" $ do
     it "accepts the queue of admissions to its limit and answers full one past it" $ bounded $ do
@@ -154,17 +154,17 @@ spec = describe "admission and settlement" $ do
             -- queue and has not been observed still holds its reservation.
             resume >>= \case
               TaskControlFull → pure ()
-              other → fail ("expected the reservations to be held, found " <> show other)
+              other → failExample ("expected the reservations to be held, found " <> show other)
             -- Observing the first gives its reservation back, once, however often.
             _ ← waitControl first
             _ ← waitControl first
             resume >>= \case
               TaskControlAccepted _ → pure ()
-              other → fail ("expected the reservation to be given back, found " <> show other)
+              other → failExample ("expected the reservation to be given back, found " <> show other)
             resume >>= \case
               TaskControlFull → pure ()
-              other → fail ("expected exactly one reservation to have been given back, found " <> show other)
-          other → fail ("unexpected answers: " <> show other)
+              other → failExample ("expected exactly one reservation to have been given back, found " <> show other)
+          other → failExample ("unexpected answers: " <> show other)
         retireScheduled owner
 
     it "accepts grants to their limit and answers full one past it" $ bounded $ do
@@ -185,11 +185,11 @@ spec = describe "admission and settlement" $ do
         _ ← awaitScheduledTerminal control owner
         admitScheduledTask (scheduledEndpoint owner) (echoing 1) >>= \case
           TaskAdmissionClosed → pure ()
-          other → fail ("expected admission to be closed, found " <> show other)
+          other → failExample ("expected admission to be closed, found " <> show other)
         grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1) >>= (`shouldBe` GrantClosed)
         requestTaskControl (scheduledEndpoint owner) (ticketTask ticket) RequestStop >>= \case
           TaskControlClosed → pure ()
-          other → fail ("expected control to be closed, found " <> show other)
+          other → failExample ("expected control to be closed, found " <> show other)
 
   describe "exactly-once settlement under races" $ do
     it "settles every accepted task once across a thousand admissions racing control requests and a stop" $ bounded $ do
@@ -242,7 +242,7 @@ spec = describe "admission and settlement" $ do
             , length [() | Discard _ Started ← discards]
             )
               `shouldBe` (exitNotStarted record, exitStarted record)
-          Nothing → fail "the owner recorded no exit"
+          Nothing → failExample "the owner recorded no exit"
 
   describe "a ticket's reservation" $ do
     it "is given back by the first observation only, whatever the later or concurrent observations" $ bounded $ do
@@ -292,7 +292,7 @@ spec = describe "admission and settlement" $ do
         -- The forgotten ticket still reads what its task settled as.
         pollTask blocked >>= \case
           Just settled → settledOutcome settled `shouldSatisfy` \case SettledReturned _ → True; _ → False
-          Nothing → fail "the forgotten ticket lost its settlement"
+          Nothing → failExample "the forgotten ticket lost its settlement"
         retireScheduled owner
 
     it "is given back for a cancelled task as for any other, and the engine keeps no other history" $ bounded $ do
@@ -304,10 +304,10 @@ spec = describe "admission and settlement" $ do
         victim ← admitTask' fixture owner "v" (request "forever" [VText "v"] OrdinaryClass Looped Nothing)
         requestTaskControl endpoint (ticketTask victim) RequestStop >>= \case
           TaskControlAccepted receipt → void (waitControl receipt)
-          other → fail ("the stop was not accepted: " <> show other)
+          other → failExample ("the stop was not accepted: " <> show other)
         outcomeOf victim >>= \case
           SettledCancelled → pure ()
-          other → fail ("expected a cancellation, found " <> show other)
+          other → failExample ("expected a cancellation, found " <> show other)
         -- Observed by the wait above: the one reservation is back.
         _ ← untilAccepted endpoint (echoing 1)
         retireScheduled owner

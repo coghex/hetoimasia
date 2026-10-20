@@ -86,4 +86,4 @@ spec = describe "stop and retire" $ do
       releaseGate fixture "fin"
       awaitTerminal control owner >>= \case
         WorkerUnavailable (ExceptionWithContext _ failure) → failure `shouldSatisfy` brokenIs "binding"
-        other → fail ("expected an unavailable owner, found " <> show other)
+        other → failExample ("expected an unavailable owner, found " <> show other)

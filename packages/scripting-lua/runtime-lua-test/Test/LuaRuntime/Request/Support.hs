@@ -90,7 +90,7 @@ import Hetoimasia.Scripting.Lua.Scheduled hiding (Policy (..))
 import Hetoimasia.Scripting.Lua.Value
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (SFixture (..), blockOn, defaultSchedulerBounds, scheduled, schedRegistration, startScheduled)
-import Test.LuaRuntime.Support (Broken (Broken))
+import Test.LuaRuntime.Support (Broken (Broken), failExample)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
 
 -- The fake provider --------------------------------------------------------------------
@@ -179,7 +179,7 @@ submissionAt fake index = do
   held ← atomically (readTVar (fkSubmitted fake))
   case drop index held of
     found : _ → pure found
-    [] → throwIO (userError ("the provider was handed no request " <> show index))
+    [] → failExample ("the provider was handed no request " <> show index)
 
 -- | Answer the nth request.
 answerWith ∷ Fake → Int → ProviderReply → IO ReplyAnswer
@@ -521,7 +521,7 @@ startRequesterWith fixture = startScheduled (ifBase fixture)
 diagnostics ∷ ScheduledOwner → IO ProviderDiagnostics
 diagnostics owner = do
   found ← atomically (requestDiagnostics (scheduledEndpoint owner))
-  maybe (throwIO (userError "the owner has no request service")) pure found
+  maybe (failExample "the owner has no request service") pure found
 
 -- Commanding ---------------------------------------------------------------------------------
 
@@ -550,7 +550,7 @@ commandFrom fixture owner name op key endpoint n = do
             <> [("n", VInteger (fromIntegral found)) | Just found ← [n]]
   deliverEvent (scheduledEndpoint owner) identity "cmd" payload >>= \case
     DeliveryAccepted _ → pure ()
-    other → throwIO (userError ("expected the command accepted, found " <> show other))
+    other → failExample ("expected the command accepted, found " <> show other)
 
 -- | The first line a script recorded that starts with this, if any.
 lineIn ∷ IFixture → Text → IO (Maybe Text)
@@ -634,4 +634,4 @@ taskOf ∷ ScheduledOwner → Text → [Value] → IO ScheduledTicket
 taskOf owner entry arguments =
   admitScheduledTask (scheduledEndpoint owner) (TaskRequest (ModuleRef "taskasker" "1") entry arguments OrdinaryClass OneShot Nothing) >>= \case
     TaskAccepted _ ticket → pure ticket
-    other → fail ("expected the task accepted, found " <> show other)
+    other → failExample ("expected the task accepted, found " <> show other)

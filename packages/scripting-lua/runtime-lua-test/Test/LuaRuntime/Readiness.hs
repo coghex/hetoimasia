@@ -19,6 +19,7 @@ import Hetoimasia.Runtime.Supervision (workerGroupStatus)
 import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Runtime
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger))
+import Test.HUnit.Lang (HUnitFailure)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Support
 
@@ -138,6 +139,7 @@ spec = describe "readiness" $ do
     fixture ← newFixture
     outcome ← newEmptyMVar
     withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
+      example ← myThreadId
       creator ←
         forkIO $
           try @SomeException
@@ -146,7 +148,11 @@ spec = describe "readiness" $ do
                   [gcInitChunk "closed", (chunkName "slow", Text.encodeUtf8 "app.block('init')")]
                   (quickSpec fixture "abandoned" ["app"])
             )
-            >>= putMVar outcome . either Just (const Nothing)
+            >>= \case
+              -- A failed assertion of the creator ends the example, wherever the example is waiting for it,
+              -- and is not the exception the example throws to the creator.
+              Left failure | Just (assertion ∷ HUnitFailure) ← fromException failure → throwTo example assertion
+              ended → putMVar outcome (either Just (const Nothing) ended)
       awaitEntered fixture "init"
       -- The startup was acknowledged, so a creator parked in an STM wait is
       -- parked in the readiness wait.

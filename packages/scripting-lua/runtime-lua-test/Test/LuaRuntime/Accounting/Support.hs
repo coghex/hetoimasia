@@ -56,9 +56,8 @@ import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, yield)
 import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (ThreadBlocked), threadStatus)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar, tryReadMVar)
 import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
-import System.Timeout (Timeout)
-import Test.LuaRuntime.Support (withBoundary)
-import Control.Exception (SomeException, finally, fromException, mask_, onException, throwIO, try)
+import Test.LuaRuntime.Support (failExample, tryExpected, withBoundary)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, mask_, onException, try)
 import Control.Monad (forM_)
 import Data.Word (Word64)
 import Hetoimasia.Runtime.Supervision (RuntimeControl, WorkerPolicy)
@@ -100,7 +99,7 @@ awaitPending ∷ PendingWait → IO ()
 awaitPending waiting = do
   ended ← tryReadMVar (waitingResult waiting)
   case ended of
-    Just result → ioError (userError ("the wait ended before it was seen parked: " <> either show show result))
+    Just result → failExample ("the wait ended before it was seen parked: " <> either show show result)
     Nothing →
       threadStatus (waitingThread waiting) >>= \case
         ThreadBlocked BlockedOnSTM → pure ()
@@ -396,7 +395,7 @@ grant ∷ ScheduledOwner → Word64 → IO ()
 grant owner n =
   grantScheduledStep (scheduledEndpoint owner) (nanoseconds n) >>= \case
     GrantAccepted _ → pure ()
-    other → ioError (userError ("expected the grant accepted, found " <> show other))
+    other → failExample ("expected the grant accepted, found " <> show other)
 
 -- Holding the owner --------------------------------------------------------------------
 
@@ -434,20 +433,18 @@ startPlain fixture runtime label policy bounds =
 
 -- | Run a scenario inside a boundary, which begins a wait and drives the owner to a failure, and
 -- require that the wait ended by raising one: the supervised failure, rethrown, and never an answer.
--- The boundary's own end may carry the failure; a timeout of the example's bound is not that failure and is
--- not swallowed, and the outcome is read without blocking.
+-- The boundary's own end may carry the failure; a failed assertion of the scenario, or a timeout of the
+-- example's bound, is not that failure and is raised as itself ('tryExpected'), and the outcome is read
+-- without blocking.
 failingWait ∷ SFixture → [Gate] → (RuntimeControl → LuaRuntime → IO PendingWait) → IO ()
 failingWait fixture gates scenario = do
   outcome ← newEmptyMVar
-  stalled ← try @SomeException . withBoundary $ \control runtime → releasing fixture gates $ do
+  stalled ← tryExpected . withBoundary $ \control runtime → releasing fixture gates $ do
     waiting ← scenario control runtime
     resultOf waiting >>= putMVar outcome
-  case stalled of
-    Left raised | Just (_ ∷ Timeout) ← fromException raised → throwIO raised
-    _ → pure ()
   tryReadMVar outcome >>= \case
-    Nothing → ioError (userError ("the example recorded no outcome for the wait" <> either (\raised → ": " <> show raised) (const "") stalled))
-    Just (Right answered) → ioError (userError ("the wait answered " <> show answered))
+    Nothing → failExample ("the example recorded no outcome for the wait" <> either (\(ExceptionWithContext _ raised) → ": " <> show raised) (const "") stalled)
+    Just (Right answered) → failExample ("the wait answered " <> show answered)
     Just (Left _) → pure ()
 
 -- | The scenario leaves the owner holding a cleanup failure it has retained, and parked at this gate, with
