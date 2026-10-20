@@ -112,7 +112,7 @@ module Hetoimasia.Sample.LuaDomains.Domains
   , cleanupEvidence
   ) where
 
-import Control.Concurrent.MVar (modifyMVar_)
+import Control.Concurrent.MVar (modifyMVar_, putMVar, takeMVar)
 import Control.Concurrent.STM
   ( STM
   , atomically
@@ -135,10 +135,12 @@ import Control.Exception
   , onException
   , rethrowIO
   , throwIO
+  , try
   , tryWithContext
   )
 import Control.Monad (forM, forM_, join, unless, void, when)
 import Data.ByteString (ByteString)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Set as Set
 import Data.Int (Int64)
 import qualified Data.List.NonEmpty as NonEmpty
@@ -1033,23 +1035,34 @@ settleTasks domains = do
             Just <$> awaitTask (domainsControl domains) ticket
 
 -- | Take the lock on the watched tasks, learn each one's settlement as asked (nothing: it stays watched), record the
--- faults among them as session failures, and give the observed tasks up.
+-- faults among them as session failures, and give the observed tasks up. However the observation ends, a task whose
+-- settlement was told of is given up, so no fault is told of twice, and one not yet reached stays watched.
 consumeTasks ∷ Domains → (Watched → IO (Maybe ScheduledSettlement)) → IO ()
-consumeTasks domains observe = do
+consumeTasks domains observe = mask $ \restore → do
   let shared = domainsShared domains
-  modifyMVar_ (sharedTasks shared) $ \held → do
-    remaining ← forM held $ \watched →
-      observe watched >>= \case
-        Nothing → pure (Just watched)
-        Just settlement → do
-          forM_ (faultOf (settledOutcome settlement)) $ \(kind, message) →
-            atomically $ do
-              tick ← currentTick shared
-              failSession shared (SessionFailure (watchedName watched) "task" "task" tick kind (boundedMessage message))
-          pure Nothing
-    let kept = catMaybes remaining
-    atomically (modifyTVar' (sharedTaskHeld shared) (subtract (length held - length kept)))
-    pure kept
+  held ← takeMVar (sharedTasks shared)
+  progress ← newIORef ([], held)
+  let go = do
+        (keptSoFar, pending) ← readIORef progress
+        case pending of
+          [] → pure ()
+          watched : rest → do
+            observed ← restore (observe watched)
+            case observed of
+              Nothing → writeIORef progress (watched : keptSoFar, rest)
+              Just settlement → do
+                forM_ (faultOf (settledOutcome settlement)) $ \(kind, message) →
+                  atomically $ do
+                    tick ← currentTick shared
+                    failSession shared (SessionFailure (watchedName watched) "task" "task" tick kind (boundedMessage message))
+                writeIORef progress (keptSoFar, rest)
+            go
+  outcome ← try @SomeException go
+  (keptSoFar, pending) ← readIORef progress
+  let now = reverse keptSoFar <> pending
+  atomically (modifyTVar' (sharedTaskHeld shared) (subtract (length held - length now)))
+  putMVar (sharedTasks shared) now
+  either throwIO pure outcome
   where
     faultOf = \case
       SettledFaulted fault → Just ("script fault", Text.pack (take 600 (show fault)))
