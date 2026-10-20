@@ -142,7 +142,8 @@ spec = describe "the failure of the gameplay session" $ do
         snapWorld snapshot `shouldBe` initialWorld defaultBounds 1 1
         revisionNow domains `shouldReturn` 1
         fmap (failStage . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "init"
-        fmap (failTick . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just 0
+        -- The failing tick is the last good one's successor, the first not yet committed.
+        fmap (failTick . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just 1
         stepTick domains >>= (`shouldSatisfy` isHalted)
         revisionNow domains `shouldReturn` 1
 

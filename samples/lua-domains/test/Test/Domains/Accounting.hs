@@ -5,9 +5,9 @@
 -- with a gate; and a failed session is quiescent before its failure is published.
 module Test.Domains.Accounting (spec) where
 
-import Control.Concurrent (killThread, myThreadId, yield)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
-import Control.Concurrent.STM (readTVar, readTVarIO, retry)
+import Control.Concurrent (forkIO, killThread, myThreadId, yield)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, tryReadMVar)
+import Control.Concurrent.STM (atomically, readTVar, readTVarIO, retry)
 import Control.Exception (AsyncException (ThreadKilled), SomeException, finally, fromException, throwIO, try)
 import Control.Monad (forM, forM_, replicateM_, void, when)
 import Data.ByteString (ByteString)
@@ -17,14 +17,16 @@ import Data.Maybe (isNothing)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import Hetoimasia.Sample.LuaDomains
-  ( Bounds (boundSessionTasks)
+  ( Answer (Accepted)
+  , Bounds (boundSessionTasks)
   , Domains (domainsGameplay, domainsShared)
   , DomainsDefect (DriverOffApplicationThread, StopOffApplicationThread)
-  , DecisionPoint (AfterObserved, BeforeCommit)
+  , TickPoint (AfterCommitStep, BeforeCommitStep, BeforeGrant)
   , DomainsConfig (..)
+  , Dispositions (dispInvalidated)
   , Evidence (evidenceGameplay)
   , Extension (Extension)
-  , GameSnapshot (snapStatus, snapTick)
+  , GameSnapshot (snapDispositions, snapStatus, snapTick)
   , InstanceEvidence (evidenceInstance, evidenceOutcome)
   , OwnerEvidence (evidenceEnded, evidenceInstances)
   , PublishPoint (AfterClaim, BeforeClaim)
@@ -50,13 +52,14 @@ import Hetoimasia.Scripting.Lua.Instance (InstanceKind (RunOnce), InstanceReques
 import Hetoimasia.Scripting.Lua.Owner (EntryPoint (EntryPoint), ModuleRef (ModuleRef), ModuleSource, Requirement (Required))
 import Hetoimasia.Scripting.Lua.Registration (WaitKind (WaitLogical), namespace, waitOperation, yieldOperation)
 import Hetoimasia.Scripting.Lua.Scheduled
-  ( Diagnostics (diagFailed)
+  ( Diagnostics (diagFailed, diagWaiting)
   , ServiceClass (OrdinaryClass)
   , TaskAdmission (TaskAccepted, TaskAdmissionClosed)
   , TaskKind (OneShot)
   , TaskRequest (..)
   , scheduledDiagnostics
   , scheduledEndpoint
+  , scheduledTick
   , ticksOutstanding
   )
 import Hetoimasia.Scripting.Lua.Value (Schema (SInteger))
@@ -270,45 +273,6 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
             fmap (failWho . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "faulting task"
             snapTick snapshot `shouldBe` 0
 
-  describe "a tick's decision and an admission that begins after the tasks were read" $
-    forM_ [("before it decides", AfterObserved), ("after it decided and before it commits", BeforeCommit)] $ \(label, point) →
-      it ("reads again when the admission begins " <> label <> ": the task accepted and unregistered faults in the tick, and the tick is not committed") $ do
-        fx ← newFx
-        ui ← newFakeUi
-        withBoundary $ \control →
-          withDomains
-            control
-            (withWait (sampleConfig fx ui))
-              { configInput = []
-              , configGameplaySource = gameplayWith ["function update(self, dt) staging.finish() end", "function task_fails() error('task failed') end"]
-              , configGameplayEntries = [EntryPoint "task_fails" Required [] []]
-              , configDecisionHook = \reached → when (reached == point) (holdAt fx "deciding")
-              , configAcceptedHook = holdAt fx "accepted"
-              }
-            $ \domains → withReleased fx ["deciding", "accepted"] $ do
-              outcome ←
-                driving
-                  domains
-                  ( do
-                      -- The tick has completed and the driver has read the tasks, of which there are none.
-                      awaitEntered fx "deciding"
-                      admitter ← spawn (admitGameplayTask domains (task "faulting task" "task_fails"))
-                      -- An admission begins now: the owner accepts the task, which runs and faults in the tick, and its admitter
-                      -- is held before it registers it.
-                      awaitEntered fx "accepted"
-                      -- The task has run and faulted: the owner has settled it, as its counters say.
-                      waitFor (scheduledDiagnostics (scheduledEndpoint (startedOwner (domainsGameplay domains))) >>= \diagnostics → when (diagFailed diagnostics < 1) retry)
-                      releaseGate fx "deciding"
-                      -- The driver sees that an admission began since it read the tasks, and reads again: it waits for the admitter.
-                      replicateM_ 2000 yield
-                      revisionNow domains `shouldReturn` 0
-                      releaseGate fx "accepted"
-                      void admitter
-                  )
-              snapshot ← expectFailed outcome
-              fmap (failWho . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "faulting task"
-              snapTick snapshot `shouldBe` 0
-
   describe "the helpers the examples use" $ do
     it "cancel the side of 'alongside' whatever the other raises: nothing the side does later reaches the caller" $ do
       fx ← newFx
@@ -316,6 +280,44 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
       raised `shouldSatisfy` \case Left failure → show failure == show (userError "the main action failed"); Right _ → False
       releaseGate fx "side"
       replicateM_ 2000 yield
+    it "wait for the side of 'alongside' to have terminated, its finalizer included, when the other raises: the call does not return while the finalizer is held" $ do
+      fx ← newFx
+      returned ← newIORef False
+      finalized ← newIORef False
+      let side = holdAt fx "side body" `finally` (holdAt fx "side finalizer" >> writeIORef finalized True)
+      caller ← spawn (try @SomeException (alongside side (awaitEntered fx "side body" >> throwIO (userError "the main action failed") ∷ IO ())) >> writeIORef returned True)
+      awaitEntered fx "side finalizer"
+      replicateM_ 2000 yield
+      readIORef returned `shouldReturn` False
+      releaseGate fx "side finalizer"
+      caller
+      ((,) <$> readIORef returned <*> readIORef finalized) `shouldReturn` (True, True)
+    it "wait for the trigger of 'cancelWhen' to have terminated, its finalizer included, when the action raises: the call does not return while the finalizer is held" $ do
+      fx ← newFx
+      returned ← newIORef False
+      finalized ← newIORef False
+      let trigger = holdAt fx "trigger body" `finally` (holdAt fx "trigger finalizer" >> writeIORef finalized True)
+      caller ← spawn (try @SomeException (cancelWhen trigger (awaitEntered fx "trigger body" >> throwIO (userError "the action failed") ∷ IO ())) >> writeIORef returned True)
+      awaitEntered fx "trigger finalizer"
+      replicateM_ 2000 yield
+      readIORef returned `shouldReturn` False
+      releaseGate fx "trigger finalizer"
+      caller
+      ((,) <$> readIORef returned <*> readIORef finalized) `shouldReturn` (True, True)
+    it "wait for a registered thread to have terminated, its finalizer included, when the example's threads are reaped" $ do
+      fx ← newFx
+      finalized ← newIORef False
+      reaped ← newEmptyMVar
+      _ ← forkRegistered (holdAt fx "child body" `finally` (holdAt fx "child finalizer" >> writeIORef finalized True))
+      awaitEntered fx "child body"
+      -- Reaped from a thread that is not itself registered.
+      _ ← forkIO (reapForked >> putMVar reaped ())
+      awaitEntered fx "child finalizer"
+      replicateM_ 2000 yield
+      tryReadMVar reaped >>= (`shouldSatisfy` isNothing)
+      releaseGate fx "child finalizer"
+      generous (readMVar reaped)
+      readIORef finalized `shouldReturn` True
     it "raise the failure of a trigger that fails, in place of a cancellation it never reached" $ do
       fx ← newFx
       raised ← try @SomeException (cancelWhen (throwIO (userError "the trigger failed")) (holdAt fx "action"))
@@ -332,69 +334,132 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
       releaseGate fx "trigger"
       replicateM_ 2000 yield
 
-  describe "a tick's commit is ordered after every task fault that can belong to it" $ do
-    let taskFunctionsHere =
+  describe "a failure belongs to the tick whose accounting cutoff covers it, or to the first tick not yet committed (D-48)" $ do
+    let functionsHere =
           [ "function update(self, dt) staging.finish() end"
+          , "function task_waits_then_fails() sched.wait_ticks(1) error('task failed') end"
           , "function task_fails() error('task failed') end"
-          , "function task_yields_then_fails() while not fx.released('release') do sched.yield() end error('task failed') end"
           ]
-        entriesHere = [EntryPoint "task_fails" Required [] [], EntryPoint "task_yields_then_fails" Required [] []]
+        entriesHere = [EntryPoint "task_waits_then_fails" Required [] [], EntryPoint "task_fails" Required [] []]
+        peerModule = extraModule ["function run(self) while not fx.released('release') do sched.yield() end error('the peer failed') end"]
         configHere fx ui =
           (withWait (sampleConfig fx ui))
             { configInput = []
-            , configGameplaySource = gameplayWith taskFunctionsHere
+            , configGameplaySource = gameplayWith functionsHere
             , configGameplayEntries = entriesHere
-            , configWatcherHook = holdAt fx "watcher"
+            , configGameplayInstances = [peer "free-running peer"]
+            , configGameplayModules = [peerModule]
             }
-        settledFaults domains = waitFor (scheduledDiagnostics (scheduledEndpoint (startedOwner (domainsGameplay domains))) >>= \diagnostics → when (diagFailed diagnostics < 1) retry)
         faultsTold domains = waitFor (readTVar (sharedSession (domainsShared domains)) >>= \state → when (sessionFailureCount state < 1) retry)
         toldBy domains = sessionFailureCount <$> readTVarIO (sharedSession (domainsShared domains))
-    it "a fault settled before the tasks are read, that its watcher has not yet told, is told by the driver's reading" $ do
+        failingTick snapshot = fmap (failTick . evidencePrimary) (evidenceOf snapshot)
+    it "a task that tick T resumed and that faults in it, however its watcher and the ticket's observation are delayed, fails T: nothing is committed, and the failure is T's, not T+1's" $ do
       fx ← newFx
       ui ← newFakeUi
       withBoundary $ \control →
-        withDomains control (configHere fx ui) $ \domains → withReleased fx ["watcher"] $ do
-          admitGameplayTask domains (task "faulting task" "task_fails") >>= (`shouldSatisfy` accepted)
-          -- The task has faulted and is settled, and its watcher is held before it tells it: the session has not been told.
-          settledFaults domains
-          toldBy domains `shouldReturn` 0
+        withDomains control (configHere fx ui) {configWatcherHook = holdAt fx "watcher", configGameplayInstances = []} $ \domains → withReleased fx ["watcher"] $ do
+          -- The task waits for the next tick: tick one resumes it, and it faults there. Its watcher is held before it tells it.
+          admitGameplayTask domains (task "faulting task" "task_waits_then_fails") >>= (`shouldSatisfy` accepted)
+          -- The task has run to its wait: the tick is the next it will see.
+          waitFor (scheduledDiagnostics (scheduledEndpoint (startedOwner (domainsGameplay domains))) >>= \diagnostics → when (diagWaiting diagnostics < 1) retry)
           snapshot ← stepTick domains >>= expectFailed
+          toldBy domains `shouldReturn` 1
           fmap (failWho . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "faulting task"
-          snapTick snapshot `shouldBe` 0
-    it "a fault of a task registered and unfinished when the tasks were read, which settles before the commit while its watcher is delayed, moves the count the commit checks: the tick reads again and is not committed" $ do
+          (snapTick snapshot, failingTick snapshot) `shouldBe` (0, Just 1)
+          revisionNow domains `shouldReturn` 1
+    it "a failure recorded after tick T's accounting and before its commit step stops T: nothing of T is committed, and the failure is T's" $ do
       fx ← newFx
       ui ← newFakeUi
       withBoundary $ \control →
-        withDomains control (configHere fx ui) {configDecisionHook = \reached → when (reached == AfterObserved) (holdAt fx "deciding")} $ \domains → withReleased fx ["watcher", "deciding", "release"] $ do
-          admitGameplayTask domains (task "faulting task" "task_yields_then_fails") >>= (`shouldSatisfy` accepted)
+        withDomains control (configHere fx ui) {configTickHook = \reached → when (reached == BeforeCommitStep) (holdAt fx "before the step")} $ \domains → withReleased fx ["before the step", "release"] $ do
           outcome ←
             driving
               domains
               ( do
-                  -- The driver has read the tasks: the task is registered and running, yielding. It now faults, and settles, and its
-                  -- watcher is held before it tells it.
-                  awaitEntered fx "deciding"
-                  toldBy domains `shouldReturn` 0
+                  -- The driver has decided to commit and is about to take the step. The free-running peer fails now, and the
+                  -- failure is recorded.
+                  awaitEntered fx "before the step"
                   releaseGate fx "release"
-                  settledFaults domains
-                  toldBy domains `shouldReturn` 0
-                  releaseGate fx "deciding"
+                  faultsTold domains
+                  releaseGate fx "before the step"
               )
           snapshot ← expectFailed outcome
-          fmap (failWho . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "faulting task"
-          snapTick snapshot `shouldBe` 0
-    it "a fault after the commit belongs to the next tick: the tick commits while the task runs, and the next is failed by the task's fault, the committed tick the last good one" $ do
+          (snapTick snapshot, failingTick snapshot) `shouldBe` (0, Just 1)
+          revisionNow domains `shouldReturn` 1
+    it "a failure recorded just after tick T's commit step leaves T committed and the last good snapshot, and fails the session at T+1: no further grant, T+1 not committed, the snapshot shows T, and it is published once" $ do
       fx ← newFx
       ui ← newFakeUi
       withBoundary $ \control →
-        withDomains control (configHere fx ui) {configWatcherHook = pure ()} $ \domains → withReleased fx ["release"] $ do
-          admitGameplayTask domains (task "faulting task" "task_yields_then_fails") >>= (`shouldSatisfy` accepted)
-          stepTick domains >>= (`shouldSatisfy` \case TickCommitted _ → True; _ → False)
-          releaseGate fx "release"
-          faultsTold domains
+        withDomains control (configHere fx ui) {configTickHook = \reached → when (reached == AfterCommitStep) (holdAt fx "after the step")} $ \domains → withReleased fx ["after the step", "release"] $ do
+          granted ← atomically (scheduledTick (scheduledEndpoint (startedOwner (domainsGameplay domains))))
+          outcome ←
+            driving
+              domains
+              ( do
+                  -- Tick one's commit step is taken. The free-running peer fails now, and the failure is recorded.
+                  awaitEntered fx "after the step"
+                  releaseGate fx "release"
+                  faultsTold domains
+                  releaseGate fx "after the step"
+              )
+          outcome `shouldSatisfy` \case TickCommitted _ → True; _ → False
+          committedTick domains `shouldReturn` 1
+          revisionNow domains `shouldReturn` 1
+          -- The next step issues no grant, commits nothing, and publishes the failure, as the failure of tick two.
+          snapshot ← stepTick domains >>= expectFailed
+          (snapTick snapshot, failingTick snapshot) `shouldBe` (1, Just 2)
+          revisionNow domains `shouldReturn` 2
+          atomically (scheduledTick (scheduledEndpoint (startedOwner (domainsGameplay domains)))) `shouldReturn` granted + 1
+          stepTick domains >>= (`shouldSatisfy` \case TickHalted → True; _ → False)
+          revisionNow domains `shouldReturn` 2
+          balanced domains
+    it "a failure recorded after tick T+1 has begun and before its grant fails the session at T+1: no grant is issued, the batch of T+1 is discarded and invalidated, and the snapshot shows T" $ do
+      fx ← newFx
+      ui ← newFakeUi
+      begun ← newIORef (0 ∷ Int)
+      -- Only the second tick is held before its grant.
+      let hook reached = when (reached == BeforeGrant) $ do
+            count ← atomicModifyIORef' begun (\held → (held + 1, held + 1))
+            when (count == 2) (holdAt fx "before the grant")
+      withBoundary $ \control →
+        withDomains control (configHere fx ui) {configTickHook = hook} $ \domains → withReleased fx ["before the grant", "release"] $ do
+          _ ← stepCommitted domains
+          granted ← atomically (scheduledTick (scheduledEndpoint (startedOwner (domainsGameplay domains))))
+          offered ← mapM (offer domains) [0, 1]
+          outcome ←
+            driving
+              domains
+              ( do
+                  -- Tick two has begun, with its intentions sealed, and no grant is issued yet. The peer fails now.
+                  awaitEntered fx "before the grant"
+                  releaseGate fx "release"
+                  faultsTold domains
+                  releaseGate fx "before the grant"
+              )
+          snapshot ← expectFailed outcome
+          (snapTick snapshot, failingTick snapshot) `shouldBe` (1, Just 2)
+          dispInvalidated (snapDispositions snapshot) `shouldBe` [place | Accepted place ← offered]
+          atomically (scheduledTick (scheduledEndpoint (startedOwner (domainsGameplay domains)))) `shouldReturn` granted
+          balanced domains
+    it "a fault of a task that no tick resumed, told after tick T's commit step, belongs to the first tick not yet committed: T stays committed, and the session fails at T+1" $ do
+      fx ← newFx
+      ui ← newFakeUi
+      withBoundary $ \control →
+        withDomains control (configHere fx ui) {configTickHook = \reached → when (reached == AfterCommitStep) (holdAt fx "after the step"), configGameplayInstances = []} $ \domains → withReleased fx ["after the step"] $ do
+          outcome ←
+            driving
+              domains
+              ( do
+                  awaitEntered fx "after the step"
+                  -- A task that waits for no tick faults as soon as it runs: after the commit step, outside every grant.
+                  void (admitGameplayTask domains (task "faulting task" "task_fails"))
+                  faultsTold domains
+                  releaseGate fx "after the step"
+              )
+          outcome `shouldSatisfy` \case TickCommitted _ → True; _ → False
           snapshot ← stepTick domains >>= expectFailed
           fmap (failWho . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "faulting task"
-          snapTick snapshot `shouldBe` 1
+          (snapTick snapshot, failingTick snapshot) `shouldBe` (1, Just 2)
 
   describe "an admission cancelled" $ do
     it "before the owner is asked leaves nothing behind: nothing is accepted or counted, and the next admission and a stop go on" $ do

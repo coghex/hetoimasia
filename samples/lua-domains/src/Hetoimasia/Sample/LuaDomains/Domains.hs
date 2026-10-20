@@ -87,7 +87,7 @@ module Hetoimasia.Sample.LuaDomains.Domains
   , defaultConfig
   , PublishPoint (..)
   , StopPoint (..)
-  , DecisionPoint (..)
+  , TickPoint (..)
   , Extension (..)
   , Where (..)
   , tickDuration
@@ -286,7 +286,6 @@ import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VRecord))
 import Hetoimasia.Scripting.Lua.Runtime (CallFault (BoundaryFailed), ExitRecord, LuaRuntime, newLuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
   ( AccountingWait (..)
-  , Diagnostics (diagFailed)
   , ControlRequest (RequestStop)
   , ExecutionDomain (GameplayDomain, InterfaceDomain)
   , GrantAnswer (GrantAccepted)
@@ -314,7 +313,6 @@ import Hetoimasia.Scripting.Lua.Scheduled
   , pollTask
   , requestTaskControl
   , retireScheduled
-  , scheduledDiagnostics
   , scheduledEndpoint
   , scheduledExitRecord
   , scheduledSpec
@@ -382,8 +380,8 @@ data DomainsConfig = DomainsConfig
     -- ^ Test-only: run inside a task admission, after the session was found to take tasks and before the owner is asked.
   , configWatcherHook ∷ !(IO ())
     -- ^ Test-only: run by a task's watcher, on its own thread, after it has the task's settlement and before it tells it.
-  , configDecisionHook ∷ !(DecisionPoint → IO ())
-    -- ^ Test-only: run by the driver at each point 'DecisionPoint' names.
+  , configTickHook ∷ !(TickPoint → IO ())
+    -- ^ Test-only: run by the driver at each point 'TickPoint' names.
   , configAcceptedHook ∷ !(IO ())
     -- ^ Test-only: run inside a task admission after the owner has accepted the task and before the session tracks it. The
     -- interval is not interruptible in production, so an example that holds it must not cancel the admitter.
@@ -435,7 +433,7 @@ defaultConfig =
     , configAssignHook = pure ()
     , configTaskHook = pure ()
     , configWatcherHook = pure ()
-    , configDecisionHook = const (pure ())
+    , configTickHook = const (pure ())
     , configAcceptedHook = pure ()
     , configHandoffHook = pure ()
     , configStopHook = const (pure ())
@@ -539,9 +537,9 @@ data Retirement = Retirement
 data PublishPoint = BeforeClaim | AfterClaim
   deriving (Eq, Show)
 
--- | Where the driver is in deciding a tick, for a test that holds it: it has read the tasks and not yet decided, or it has
--- decided to commit and not yet committed.
-data DecisionPoint = AfterObserved | BeforeCommit
+-- | Where the driver is in a tick, for a test that holds it: the tick has begun and no grant is issued; it has decided to
+-- commit and has not yet taken the commit step; or the step is taken and it has not yet returned.
+data TickPoint = BeforeGrant | BeforeCommitStep | AfterCommitStep
   deriving (Eq, Show)
 
 -- | Where a stop is, for a test that holds it: its intent is recorded and admission closed, and nothing has been asked
@@ -828,7 +826,8 @@ currentTick ∷ Shared → STM Word64
 currentTick shared =
   readTVar (sharedTick shared) >>= \case
     Just working → pure (candidateTick working)
-    Nothing → worldTick <$> readTVar (sharedCommitted shared)
+    -- No tick is in progress: the failure belongs to the first tick not yet committed (D-48).
+    Nothing → (+ 1) . worldTick <$> readTVar (sharedCommitted shared)
 
 -- | An instance's failure as the evidence names it.
 sessionFailureOf ∷ Word64 → InstanceFailure → SessionFailure
@@ -1102,41 +1101,18 @@ faultOf = \case
   SettledRefused why → Just ("refused wait", Text.pack (take 600 (show why)))
   _ → Nothing
 
--- | What the driver knew when it began to read the gameplay owner's tasks: the failures the scheduler had counted (a task
--- ending in a fault, a refused wait included, each counted in the same transaction that ends the task and makes its
--- settlement readable, so a failure that is counted is a settlement a later reading sees).
-newtype Observed = Observed {observedFailures ∷ Int}
-
--- | Wait for the task admissions in flight, so that every task the owner has accepted is registered, and in the same
--- transaction read the failures the scheduler has counted. The driver reads this first, then waits for the owner's
--- accounting, then reads the tasks, and its commit checks that the count has not moved ('tickIsStable'). A task that
--- settled in a fault before this instant is seen by the reading that follows; one that faults after it, whether it was
--- registered or accepted since, moves the count, whatever its watcher has or has not told; an instance's failure in the
--- work the tick's grant caused is covered by the accounting wait.
-baselineOf ∷ Domains → IO Observed
-baselineOf domains = atomically $ do
-  taskAdmissionsDrained (domainsShared domains)
-  counters ← scheduledDiagnostics (scheduledEndpoint (startedOwner (domainsGameplay domains)))
-  pure (Observed (diagFailed counters))
-
--- | Tell the session of the settlement of each task that has one, which the driver does before it decides a tick (a
--- watcher may not have run yet). The admissions in flight were waited for when the baseline was read, so every task the
--- owner accepted before it is registered.
-pollTasks ∷ Domains → IO ()
-pollTasks domains = do
-  held ← readTVarIO (sharedTasks (domainsShared domains))
-  forM_ held $ \watched → pollTask (watchedTicket watched) >>= mapM_ (tellTask domains watched)
-
--- | The baseline and then the reading, for a reader that is not deciding a tick.
+-- | Tell the session of the settlement of each task that has one, which the driver does after the accounting wait and
+-- before the commit step: the accounting wait does not consume a task's result, so a task a tick resumed that faulted in
+-- it is told here, whatever its watcher has or has not yet told (a watcher may not have run), and never shifted to the
+-- next tick. The admissions in flight are waited for first (brief: an admission waits for nothing), so a task the owner
+-- accepted is registered, and read, before the tick is decided. A task admitted or running outside the tick's grants
+-- that faults after this reading is later work: it belongs to the first tick not yet committed when it is told (D-48).
 watchTasks ∷ Domains → IO ()
-watchTasks domains = baselineOf domains >> pollTasks domains
-
--- | Whether no task has ended in a failure since the baseline was read, in the transaction that commits a tick: an ordering
--- of the commit after every task fault that can belong to the tick, whatever a watcher has or has not yet told.
-tickIsStable ∷ Domains → Observed → STM Bool
-tickIsStable domains observed = do
-  counters ← scheduledDiagnostics (scheduledEndpoint (startedOwner (domainsGameplay domains)))
-  pure (diagFailed counters == observedFailures observed)
+watchTasks domains = do
+  let shared = domainsShared domains
+  atomically (taskAdmissionsDrained shared)
+  held ← readTVarIO (sharedTasks shared)
+  forM_ held $ \watched → pollTask (watchedTicket watched) >>= mapM_ (tellTask domains watched)
 
 -- | Settle every task the session admitted, which a session that takes no more tasks does once, before its status is
 -- decided: each task without a settlement is asked to stop (it need not yield for the stop to reach it, and asking is
@@ -1245,35 +1221,35 @@ stepTick domains = do
         -- A failure told between the check above and the begin (a task's watcher, say) is published all the same.
         Nothing → haltedOrFailed domains
         Just (tick, pausedAtBegin) → do
-          granted ← grantScheduledStep (scheduledEndpoint owner) (configTickDuration config)
+          configTickHook config BeforeGrant
+          -- No grant is issued once a failure is told or a stop asked for, whenever that came: this is the last check.
+          proceeding ← atomically (not <$> haltedNow shared)
+          granted ← if proceeding then Just <$> grantScheduledStep (scheduledEndpoint owner) (configTickDuration config) else pure Nothing
           accepted ← case granted of
-            GrantAccepted _ → pure True
+            Nothing → pure False
+            Just (GrantAccepted _) → pure True
             -- A grant an owner refuses because a stop (from another thread) has retired it is the ending the session
             -- already decided; one it refuses otherwise is a defect.
-            other → do
+            Just other → do
               over ← atomically (haltedNow shared)
               if over then pure False else throwIO (TickNotGranted tick (show other))
           if not accepted
             then haltedOrFailed domains
             else do
               waited ← serially domains (awaitTicksComplete (domainsControl domains) owner)
-              -- Read the baseline, account, observe the tasks and decide; if anything moved since the baseline (a task
-              -- ended in a failure), start again: the accounting that follows covers whatever the owner has
-              -- begun by then. An instance's failure in the work this tick's grant caused is ordered by the accounting wait;
-              -- a free-running instance's failure later is later work, told when it happens.
-              let settleAndDecide = do
-                    observed ← baselineOf domains
-                    accounted ← awaitAccounting domains
-                    -- An owner that ended because the session was stopped, or had failed, while the tick was in flight (the
-                    -- stop retired it from another thread) is the ending the session already decided: the tick is halted,
-                    -- and nothing is committed whatever it had begun. An owner that ended otherwise is a defect.
-                    when (waited /= TicksCompleted || accounted /= AccountingComplete) $ do
-                      over ← atomically (haltedNow shared)
-                      unless over (throwIO (OwnerEndedDuringTick tick))
-                    pollTasks domains
-                    configDecisionHook config AfterObserved
-                    decide domains tick pausedAtBegin observed >>= maybe settleAndDecide pure
-              settleAndDecide
+              -- Account for the tick (every ending its work began, an instance's escalation included, is told when this
+              -- returns), tell the faults of the tasks it resumed, and decide: the commit is one atomic step after
+              -- this. A failure that begins after the accounting's cutoff is later work (D-48): told before the commit
+              -- step it stops this tick, told after it this tick stays committed and the session fails at the next.
+              accounted ← awaitAccounting domains
+              -- An owner that ended because the session was stopped, or had failed, while the tick was in flight (the
+              -- stop retired it from another thread) is the ending the session already decided: the tick is halted,
+              -- and nothing is committed whatever it had begun. An owner that ended otherwise is a defect.
+              when (waited /= TicksCompleted || accounted /= AccountingComplete) $ do
+                over ← atomically (haltedNow shared)
+                unless over (throwIO (OwnerEndedDuringTick tick))
+              watchTasks domains
+              decide domains tick pausedAtBegin
 
 -- | Whether a failure has been told and its publication has not been made.
 failurePending ∷ Shared → IO Bool
@@ -1299,8 +1275,8 @@ data Verdict
 -- | Decide a tick that has completed and been accounted for: a failure told of fails the session and commits
 -- nothing; a stop commits nothing; otherwise the tick commits if its work finished successfully, or the engine says why
 -- there is none to do.
-decide ∷ Domains → Word64 → Bool → Observed → IO (Maybe TickOutcome)
-decide domains tick pausedAtBegin observed = do
+decide ∷ Domains → Word64 → Bool → IO TickOutcome
+decide domains tick pausedAtBegin = do
   let shared = domainsShared domains
   verdict ← atomically $ do
     halted ← haltedNow shared
@@ -1320,10 +1296,10 @@ decide domains tick pausedAtBegin observed = do
                 , acceptable candidate snapshot assigned → VerdictCommit candidate
               _ → VerdictIncomplete
   case verdict of
-    VerdictFailed → Just . maybe TickHalted TickFailed <$> publishEnding domains EndedByFailure
-    VerdictHalted → pure (Just TickHalted)
+    VerdictFailed → maybe TickHalted TickFailed <$> publishEnding domains EndedByFailure
+    VerdictHalted → pure TickHalted
     VerdictIncomplete → throwIO (TickNotCompleted tick)
-    VerdictCommit candidate → commitTick domains tick observed candidate
+    VerdictCommit candidate → commitTick domains tick candidate
   where
     -- Work finished successfully: gameplay said so, and the instance is serving, with nothing in flight and
     -- no update owed; or there was no work to do: gameplay's update never began (the wrapper every gameplay
@@ -1338,10 +1314,12 @@ decide domains tick pausedAtBegin observed = do
           Instance.Paused → True
           _ → False
 
--- | Commit a tick: replace the committed world, publish the snapshot, settle the queue's reservations and count
--- the dispositions, in one transaction that first checks again that nothing has ended the session meanwhile.
-commitTick ∷ Domains → Word64 → Observed → Candidate → IO (Maybe TickOutcome)
-commitTick domains tick observed candidate = do
+-- | Commit a tick, which is one atomic step: in one transaction that checks, once more, that no failure is recorded and
+-- nothing has ended the session, replace the committed world, publish the snapshot, settle the queue's reservations and
+-- count the dispositions. A failure recorded before this step stops the tick, and is published instead; one recorded after it
+-- leaves the tick committed and the last good one, and fails the session at the next tick (D-48).
+commitTick ∷ Domains → Word64 → Candidate → IO TickOutcome
+commitTick domains tick candidate = do
   let shared = domainsShared domains
       config = domainsConfig domains
       (world, dispositions) = commit candidate
@@ -1353,10 +1331,10 @@ commitTick domains tick observed candidate = do
     instanceNow ← behaviorNow (domainsGameplay domains)
     pure $
       if failed
-        then Left (Just True)
+        then Left True
         else
           if halted || fmap candidateTick working /= Just tick
-            then Left (Just False)
+            then Left False
             else
               Right
                 GameSnapshot
@@ -1368,36 +1346,30 @@ commitTick domains tick observed candidate = do
                   , snapGameplay = identity
                   }
   case built of
-    Left (Just True) → Just . maybe TickHalted TickFailed <$> publishEnding domains EndedByFailure
-    Left (Just False) → pure (Just TickHalted)
-    Left Nothing → pure Nothing
+    Left True → maybe TickHalted TickFailed <$> publishEnding domains EndedByFailure
+    Left False → pure TickHalted
     Right snapshot → do
       prepared ← prepare snapshot
-      configDecisionHook (domainsConfig domains) BeforeCommit
+      configTickHook config BeforeCommitStep
       done ← atomically $ do
         halted ← haltedNow shared
         failed ← failedNow (sharedSession shared)
         working ← readTVar (sharedTick shared)
-        stable ← tickIsStable domains observed
         if halted || failed || fmap candidateTick working /= Just tick
-          then pure (Left (Just failed))
-          else
-            if not stable
-              then pure (Left Nothing)
-              else do
-                writeTVar (sharedCommitted shared) world
-                writeTVar (sharedTick shared) Nothing
-                settle (sharedQueue shared) tick
-                modifyTVar' (sharedCounts shared) (countSettled (length (dispApplied dispositions)) (length (dispStale dispositions) + dispStaleOmitted dispositions))
-                publisher ← publisherOf shared
-                publish publisher prepared >>= \case
-                  Published → pure (Right ())
-                  _ → throwSTM (PublicationRefused tick)
+          then pure (Left failed)
+          else do
+            writeTVar (sharedCommitted shared) world
+            writeTVar (sharedTick shared) Nothing
+            settle (sharedQueue shared) tick
+            modifyTVar' (sharedCounts shared) (countSettled (length (dispApplied dispositions)) (length (dispStale dispositions) + dispStaleOmitted dispositions))
+            publisher ← publisherOf shared
+            publish publisher prepared >>= \case
+              Published → pure (Right ())
+              _ → throwSTM (PublicationRefused tick)
       case done of
-        Right () → pure (Just (TickCommitted snapshot))
-        Left (Just True) → Just . maybe TickHalted TickFailed <$> publishEnding domains EndedByFailure
-        Left (Just False) → pure (Just TickHalted)
-        Left Nothing → pure Nothing
+        Right () → configTickHook config AfterCommitStep >> pure (TickCommitted snapshot)
+        Left True → maybe TickHalted TickFailed <$> publishEnding domains EndedByFailure
+        Left False → pure TickHalted
 
 -- | How a session's last publication ends it.
 data Ending = EndedByFailure | EndedByStop

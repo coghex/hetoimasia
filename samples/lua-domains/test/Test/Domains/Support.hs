@@ -58,7 +58,7 @@ module Test.Domains.Support
   , TriggerFailed (..)
   ) where
 
-import Control.Concurrent (ThreadId, forkIO, forkIOWithUnmask, killThread, myThreadId, throwTo)
+import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, myThreadId, throwTo)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, tryPutMVar, tryReadMVar, withMVar)
 import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, catch, finally, fromException, mask, onException, throwIO, try)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
@@ -329,36 +329,54 @@ spawn ∷ IO a → IO (IO a)
 spawn action = do
   result ← newEmptyMVar
   collected ← newIORef False
-  thread ← forkIO (try action >>= putMVar result)
+  thread ← forkTerminating $ \unmask → try (unmask action) >>= putMVar result
   -- A thread that failed and was never collected is the example's failure, raised when it is over: nothing an example
-  -- spawns can fail unseen.
+  -- spawns can fail unseen. (Its own cancellation, when the example is over, is not a failure.)
   let unseen = do
         seen ← readIORef collected
         failed ← tryReadMVar result
         case failed of
-          Just (Left failure) | not seen → throwIO (failure ∷ SomeException)
+          Just (Left failure) | not seen, fromException failure /= Just ThreadKilled → throwIO (failure ∷ SomeException)
           _ → pure ()
   atomicModifyIORef' forkedThreads (\held → ((thread, unseen) : held, ()))
   pure (writeIORef collected True >> bounded (readMVar result >>= either (\failure → throwIO (failure ∷ SomeException)) pure))
 
+-- | A thread, and the signal that it has terminated: every handler and finalizer inside it done, which is what makes it
+-- over, and not the delivery of the exception that ends it.
+type Child = (ThreadId, MVar ())
+
+-- | Fork a thread, handed the means to unmask, that signals its termination once the body, with whatever handlers and
+-- finalizers it runs, has ended however it ended.
+forkTerminating ∷ ((∀ x. IO x → IO x) → IO ()) → IO Child
+forkTerminating body = do
+  done ← newEmptyMVar
+  thread ← forkIOWithUnmask $ \unmask → body unmask `finally` putMVar done ()
+  pure (thread, done)
+
+-- | Cancel a child and wait for its termination: its handlers and finalizers are done when this returns, however long
+-- they take, bounded by the examples' guard, which fails loudly where a finalizer never ends.
+cancelAndJoin ∷ Child → IO ()
+cancelAndJoin (thread, done) = killThread thread >> bounded (readMVar done)
+
 -- | The threads an example forked and has not seen end: 'reapForked' cancels what is left of them when the example is over.
-forkedThreads ∷ IORef [(ThreadId, IO ())]
+forkedThreads ∷ IORef [(Child, IO ())]
 forkedThreads = unsafePerformIO (newIORef [])
 {-# NOINLINE forkedThreads #-}
 
 -- | Fork a thread of an example's own, registered so that however the example ends, the thread does not outlive it.
 forkRegistered ∷ IO () → IO ThreadId
 forkRegistered action = do
-  thread ← forkIO action
-  atomicModifyIORef' forkedThreads (\held → ((thread, pure ()) : held, ()))
-  pure thread
+  child ← forkTerminating (\unmask → unmask action)
+  atomicModifyIORef' forkedThreads (\held → ((child, pure ()) : held, ()))
+  pure (fst child)
 
--- | Cancel every thread an example forked that is still running, each having ended before this returns, and raise the
--- failure of any that failed without being collected. It runs after every example, whatever the example's outcome.
+-- | Cancel every thread an example forked that is still running, each having terminated, handlers and finalizers done,
+-- before this returns, and raise the failure of any that failed without being collected. It runs after every example,
+-- whatever the example's outcome.
 reapForked ∷ IO ()
 reapForked = do
   threads ← atomicModifyIORef' forkedThreads (\held → ([], held))
-  mapM_ (killThread . fst) threads
+  mapM_ (cancelAndJoin . fst) threads
   mapM_ snd (reverse threads)
 
 -- | Run a body, and open these gates however it ends, so a segment an example held never keeps
@@ -479,7 +497,7 @@ alongside side main = mask $ \restore → do
   me ← myThreadId
   open ← newMVar True
   sideResult ← newEmptyMVar
-  sideThread ← forkIOWithUnmask $ \unmask → do
+  child@(_, sideDone) ← forkTerminating $ \unmask → do
     outcome ← try @SomeException (unmask side)
     case outcome of
       Left failure → withMVar open (\delivering → when delivering (throwTo me (SideFailed failure))) `finally` putMVar sideResult (Left failure)
@@ -491,10 +509,12 @@ alongside side main = mask $ \restore → do
   close
   case result of
     Right value → do
-      outcome ← restore (bounded (readMVar sideResult)) `onException` killThread sideThread
+      outcome ← restore (bounded (readMVar sideResult)) `onException` cancelAndJoin child
+      -- The side has ended, and its termination is waited for all the same.
+      restore (bounded (readMVar sideDone)) `onException` cancelAndJoin child
       either (\failure → throwIO (failure ∷ SomeException)) (const (pure value)) outcome
     Left raised → do
-      killThread sideThread
+      cancelAndJoin child
       case fromException raised of
         Just (SideFailed failure) → throwIO failure
         Nothing → throwIO raised
@@ -530,7 +550,7 @@ cancelWhen trigger action = mask $ \restore → do
   me ← myThreadId
   armed ← newMVar True
   triggerFailure ← newEmptyMVar
-  canceller ← forkIOWithUnmask $ \unmask → do
+  canceller ← forkTerminating $ \unmask → do
     reached ← try @SomeException (unmask trigger)
     case reached of
       -- This thread's own cancellation, when the call is over, is not the trigger's failure.
@@ -544,7 +564,7 @@ cancelWhen trigger action = mask $ \restore → do
           Just (TriggerFailed _) → disarm
           Nothing → throwIO (raised ∷ SomeException)
   disarm
-  killThread canceller
+  cancelAndJoin canceller
   failedTrigger ← tryReadMVar triggerFailure
   case (failedTrigger, outcome) of
     (Just failure, _) → throwIO failure
