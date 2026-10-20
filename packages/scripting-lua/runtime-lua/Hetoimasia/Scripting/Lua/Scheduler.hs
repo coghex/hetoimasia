@@ -266,6 +266,8 @@ module Hetoimasia.Scripting.Lua.Scheduler
   , GrantAnswer (..)
   , grantStep
   , grantComplete
+  , grantsAccepted
+  , grantsFinished
   , stepsOutstanding
   , awaitStepsComplete
   , readTick
@@ -720,6 +722,17 @@ grantComplete ∷ Scheduler v → GrantId → STM Bool
 grantComplete scheduler (GrantId number) = do
   state ← readTVar (schedState scheduler)
   pure (number < ssNextGrant state - fromIntegral (outstandingGrants state))
+
+-- | How many grants have been accepted, ever. A grant's number is the count before it
+-- was accepted, so this is the number the next one is given.
+grantsAccepted ∷ Scheduler v → STM Word64
+grantsAccepted scheduler = ssNextGrant <$> readTVar (schedState scheduler)
+
+-- | How many grants have finished, ever: every grant numbered below this has been applied
+-- and has finished, and is no longer counted. Grants finish in the order they were
+-- accepted, so 'grantsAccepted' less this is 'stepsOutstanding'.
+grantsFinished ∷ Scheduler v → STM Word64
+grantsFinished scheduler = (\state → ssNextGrant state - fromIntegral (outstandingGrants state)) <$> readTVar (schedState scheduler)
 
 -- | How many accepted grants have not finished.
 stepsOutstanding ∷ Scheduler v → STM Int

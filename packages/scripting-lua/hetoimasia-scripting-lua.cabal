@@ -390,6 +390,10 @@ test-suite lua-runtime-tests
     main-is: Main.hs
     hs-source-dirs: runtime-lua-test
     other-modules:
+        Test.LuaRuntime.Accounting.Spec
+        Test.LuaRuntime.Accounting.Support
+        Test.LuaRuntime.Accounting.Waits
+        Test.LuaRuntime.Accounting.Windows
         Test.LuaRuntime.Callbacks
         Test.LuaRuntime.Dependencies
         Test.LuaRuntime.HostFailures

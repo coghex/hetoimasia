@@ -115,7 +115,7 @@
 -- A thread that is running any Lua callback may submit and request but may not
 -- wait: it would be a synchronous call into a thread that may be waiting for it. So
 -- 'startScheduledOwner', 'waitTask', 'awaitTask', 'waitControl', 'awaitControl' and
--- 'awaitTicksComplete' are each refused at once, when they execute, with
+-- 'awaitTicksComplete' and 'awaitScheduledAccounting' are each refused at once, when they execute, with
 -- 'CallbackWaitRefused', and an action built earlier outside the callback is
 -- refused the same way. A task waits by yielding to its owner's scheduler, never
 -- by blocking its owner's thread.
@@ -124,7 +124,9 @@
 --
 -- 'grantScheduledStep' grants a logical step, 'requestTaskControl' requests that a
 -- task pause, resume or stop, and 'awaitTicksComplete' is the supervised wait for
--- tick completion. The scheduler's module says what each means. A script waits by
+-- tick completion (scheduler progress), and 'awaitScheduledAccounting' the one for the
+-- owner's accounting of what that work caused. The scheduler's module says what each
+-- means. A script waits by
 -- calling a wait operation the application registered ('waitOperation'): its first
 -- argument, an integer, is the number of ticks of a 'WaitLogical' wait or the
 -- nanoseconds of a 'WaitElapsed' one; anything else is read as none and refused as
@@ -260,6 +262,8 @@ module Hetoimasia.Scripting.Lua.Scheduled
   , grantScheduledStep
   , TickWait (..)
   , awaitTicksComplete
+  , AccountingWait (..)
+  , awaitScheduledAccounting
   , scheduledTick
   , ticksOutstanding
 
@@ -292,7 +296,7 @@ module Hetoimasia.Scripting.Lua.Scheduled
   ) where
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
-import Control.Exception (ExceptionWithContext, SomeException, evaluate, mask, mask_, rethrowIO, tryWithContext)
+import Control.Exception (ExceptionWithContext, SomeException, evaluate, finally, mask, mask_, rethrowIO, tryWithContext)
 import Control.Monad (forM, forM_, join, when)
 import Data.Foldable (toList, traverse_)
 import Data.Maybe (isJust)
@@ -596,7 +600,8 @@ startScheduledOwner runtime spec = do
       Right endpoints → newProviderState owner label scope (vmValueLimits config) grant endpoints subscriptions (ticksFor scheduler stopping) ownInstances
       Left refused → throwFailure runtimeComponent (operation "start-scheduled-owner") [] (RequestGrantRefused refused)
   hooks ← newTVarIO Map.empty
-  let bare = Control owner label (vmValueLimits config) scheduler cells faults begun closing exited stopping ownInstances Nothing provider hooks
+  accounting ← newTVarIO newAccounting
+  let bare = Control owner label (vmValueLimits config) scheduler cells faults begun closing exited stopping ownInstances Nothing provider hooks accounting
   -- A lifecycle grant is resolved against the owners it names before anything starts, and
   -- refused naming every reason.
   lifecycle ← forM (scheduledLifecycle spec) $ \grant →
@@ -870,8 +875,14 @@ grantScheduledStep (ScheduledEndpoint control) duration = atomically (grantStep 
 
 -- | How a wait for tick completion ended.
 data TickWait
-  = -- | Every accepted grant has been applied, and the work it made due has
-    -- finished.
+  = -- | Every accepted grant has been applied, and every task it woke has stopped
+    -- being ready or running: by waiting again, completing, failing (a wait the
+    -- scheduler refused included), being paused or being stopped. That is the
+    -- scheduler's progress, and it is all this promises. It does not promise that
+    -- the owner has accounted for an instance ending the work caused: the instance's
+    -- @shutdown@, the drain of what it held, a retirement a provider still owes, its
+    -- settlement and the application's escalation may all still lie ahead on the
+    -- owner's thread. 'awaitScheduledAccounting' waits for those.
     TicksCompleted
   | -- | The owner exited first. The ticks outstanding did not complete: they were
     -- discarded with the owner.
@@ -880,6 +891,10 @@ data TickWait
 
 -- | Wait, on the application thread and composed with 'awaitSupervised', until
 -- every accepted grant has completed, or the owner has exited.
+--
+-- A grant completes when every task it woke has stopped being ready or running,
+-- which is scheduler progress and not the owner's accounting of the instance endings
+-- that work caused; see 'TicksCompleted' and 'awaitScheduledAccounting'.
 --
 -- An owner that stops or fails with a tick outstanding ends the wait with
 -- 'TickOwnerEnded' and never with a false completion. Refused with
@@ -897,6 +912,116 @@ awaitTicksComplete supervision owner = do
                        WorkerLive → retry
                        _ → pure TickOwnerEnded
                    )
+
+-- | How a wait for the owner's accounting ended.
+data AccountingWait
+  = -- | The owner has accounted for every grant the wait captured and for every
+    -- instance ending it covers: see 'awaitScheduledAccounting'.
+    AccountingComplete
+  | -- | The owner exited, was stopped, cancelled or failed first, and supervision
+    -- handled that without latching a fatal failure. Nothing was accounted for: this is
+    -- never a completion. A fatal failure is not an answer: the wait rethrows it.
+    AccountingOwnerEnded
+  deriving (Eq, Show)
+
+-- | Wait, on the application thread and composed with 'awaitSupervised', until the
+-- owner has accounted for every grant accepted so far, and for the instance endings
+-- that work caused, and so the application can decide a tick's commit, or a stop's
+-- outcome, on complete evidence.
+--
+-- = What it waits for
+--
+-- The wait captures the grants accepted when it begins: one committed snapshot of the
+-- owner's grant accounting, taken once and kept across retries of the wait and across
+-- supervision's handling of outcomes, never taken again. A grant is in it if
+-- 'grantScheduledStep' had committed its acceptance before that snapshot. It returns
+-- 'AccountingComplete' only when all of these hold, each a condition of its own:
+--
+-- 1. every captured grant has been applied and has finished, as for 'TicksCompleted';
+-- 2. the owner has ended the boundary at which the last of them was found finished,
+--    which includes the closes it ran there and the instance layer's accounting of the
+--    invocations that ended; and
+-- 3. every instance ending begun by the end of that boundary, whatever began it (a failed
+--    hook, a refused wait, a faulted invocation, a delivery failure, a stop, a one-shot
+--    completing, an instance stopping itself, and a grant accepted after the snapshot
+--    that was applied in that same boundary), has run its @shutdown@ or had it skipped,
+--    released and drained what it held, completed every retirement a provider owes it
+--    (including one that completes later), settled and, if it failed, had the
+--    application's escalation called and /returned/.
+--
+-- With no grant outstanding, or none ever accepted, the wait covers the endings already
+-- begun, and needs nothing further from the application to return: the owner is woken
+-- to account for them. It also works for an owner that hosts no instances.
+--
+-- It does not wait for grants accepted after the snapshot to be applied or finished, for
+-- any boundary after the captured grants' final one, for healthy instances' future ticks,
+-- for idle peers, or for an ordinary task's fault, which stays a ticket result the
+-- application consumes.
+--
+-- = What can delay it
+--
+-- The owner has one thread and nothing is preempted, so later work can still delay an
+-- earlier wait: a later grant entering a blocking callback while an earlier ending is
+-- parked awaiting retirement holds the thread the ending needs to settle. A retirement a
+-- provider owes holds the wait for as long as it holds the instance's stop completion;
+-- there is no timeout. Returning is evidence about the owner's accounting. It is not
+-- permission to advance or to commit a tick that failed.
+--
+-- = Who may call it
+--
+-- It is a supervised wait like 'awaitTicksComplete' and every other: called on the
+-- application thread that owns the 'RuntimeControl', so one is pending at a time. Pending
+-- worker outcomes are handled first, and a latched fatal failure is rethrown by the wait
+-- and wins over a ready completion. It must not be called from the owner's own thread
+-- (an escalation callback, a segment observer): it would wait for its own return. Refused
+-- with 'CallbackWaitRefused' from a Lua callback.
+--
+-- = What it costs the owner
+--
+-- It takes no task, control or result slot and creates no ticket; it works with every
+-- one of those bounds exhausted, and the owner keeps a constant amount of state for it
+-- whatever number of waits were made. Cancelling a pending wait (an asynchronous
+-- exception on the application thread, while it is blocked or while supervision handles
+-- an outcome) abandons only that wait and leaves nothing behind for a later wait, the
+-- owner's bounds, its diagnostics or its progress to observe. A wait changes nothing the
+-- owner does.
+--
+-- = When the owner ends
+--
+-- An owner that exits, is stopped, cancelled or fails before the wait is called or while
+-- it is pending ends the wait with 'AccountingOwnerEnded' once it has ended and
+-- supervision has handled the outcome without latching a fatal failure, and never with
+-- 'AccountingComplete' unless the accounting was complete before the owner began to exit.
+-- An owner that is exiting but has not ended (a stop waiting for a provider's retirement,
+-- say) neither completes the wait nor ends it: the wait is for the exit. An @Escalate@
+-- answer, an escalation callback that raises and a failed retirement end the owner as a
+-- failure, and the wait follows the severity supervision gives that outcome: a fatal one
+-- is rethrown, and a tolerated one ends the wait.
+awaitScheduledAccounting ∷ HasCallStack ⇒ RuntimeControl → ScheduledOwner → IO AccountingWait
+awaitScheduledAccounting supervision owner = do
+  refuseCallbackWait "await-scheduled-accounting"
+  let control = ownerControl owner
+  -- The snapshot is committed once, before the supervised wait, so a retry of the wait
+  -- or the handling of an outcome inside it cannot move it. The watch is cleared however
+  -- the wait ends, in the cleanup of the same masked region that registered it.
+  mask $ \restore → do
+    atomically (watchAccounting control)
+    restore (awaitSupervised supervision (accounted control))
+      `finally` atomically (unwatchAccounting control)
+  where
+    -- Only the owner's termination ends the wait with 'AccountingOwnerEnded', and supervision
+    -- handles an owner's outcome, a fatal one rethrown, before this transaction runs: so an owner
+    -- that is exiting (stopped, or failing with an outcome not yet published) neither completes
+    -- the wait nor ends it. It waits for the exit.
+    accounted control = do
+      status ← workerStatus (ownerWorker owner)
+      case status of
+        WorkerLive → do
+          exiting ← (||) <$> schedulerClosed (controlScheduler control) <*> controlStopping control
+          if exiting
+            then retry
+            else accountingReady control >> pure AccountingComplete
+        _ → pure AccountingOwnerEnded
 
 -- | The logical tick reached.
 scheduledTick ∷ ScheduledEndpoint → STM Word64

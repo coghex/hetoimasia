@@ -316,6 +316,12 @@ attempt fixture kind name = do
         case (owner, control) of
           (Just held, Just supervision) → void (awaitTicksComplete supervision held)
           _ → pure ()
+      "await_accounting" → do
+        owner ← readIORef (sfOwner fixture)
+        control ← readIORef (sfSupervision fixture)
+        case (owner, control) of
+          (Just held, Just supervision) → void (awaitScheduledAccounting supervision held)
+          _ → pure ()
       "start" → do
         runtime ← readIORef (sfRuntime fixture)
         case runtime of

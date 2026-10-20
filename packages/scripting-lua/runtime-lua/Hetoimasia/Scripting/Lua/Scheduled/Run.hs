@@ -68,7 +68,7 @@ import Control.Exception
   , try
   , tryWithContext
   )
-import Control.Monad (forM, forM_, void, when)
+import Control.Monad (forM, forM_, unless, void, when)
 import Data.Either (isLeft)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
@@ -366,7 +366,13 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
             instanceStep ← maybe (pure False) serviceBoundary instances
             requestStep ← forM provider $ \service →
               providerBoundary service scheduler (isJust instances) extra (forM_ instances endOwner)
-            pure (instanceStep || or requestStep)
+            let again = instanceStep || or requestStep
+            -- A boundary that finds nothing more to account for is the last of its settling:
+            -- it ends when this returns, and it is the point an accounting wait's watch is
+            -- latched at, once its grants have finished. The endings begun by now are the
+            -- wait's own, whatever began them, and an ending begun later is not.
+            unless again (atomically (sealAccounting control))
+            pure again
       report ← serviceTurnWith atBoundary scheduler host
       forM_ instances settleEnded
       mask_ $ do
