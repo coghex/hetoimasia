@@ -6,16 +6,17 @@ module Test.Domains.Stop (spec) where
 
 import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Control.Concurrent (yield)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVarIO, writeTVar)
 import Control.Exception (finally)
-import Control.Monad (forM_, replicateM_)
+import Control.Monad (forM_, replicateM_, void, when)
 import System.Exit (ExitCode (ExitFailure))
 import Data.Text (Text)
 import Hetoimasia.Sample.LuaDomains
   ( Dispositions (..)
   , Domains (domainsShared)
-  , DomainsConfig (configGameplaySource, configInput, configTicks, configUiSeesEnd, configUiSource)
+  , DomainsConfig (configGameplaySource, configGameplaySpec, configInput, configTicks, configUiSeesEnd, configUiSource, configUiSpec)
   , Evidence (..)
   , GameSnapshot (snapDispositions, snapStatus, snapTick)
   , InstanceEvidence (..)
@@ -35,6 +36,7 @@ import Hetoimasia.Sample.LuaDomains.Intention (Answer (Accepted))
 import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedControls, sharedCounts))
 import Hetoimasia.Sample.LuaDomains.Tally (ControlCounts (..), Counts (..), Workspaces (..), settledTotal)
 import Hetoimasia.Scripting.Lua.Runtime (ExitKind (ExitCancelled, ExitStopped), ExitRecord (exitKind))
+import Hetoimasia.Scripting.Lua.Scheduled (ScheduledSpec (scheduledObserve))
 import Test.Domains.Support
 import Test.Hspec
 import Test.Support.Bounded (bounded)
@@ -147,6 +149,37 @@ spec = describe "the stop paths and the cleanup evidence" $ do
     balanced domains
     counts ← readTVarIO (sharedCounts (domainsShared domains))
     countAccepted counts `shouldBe` settledTotal counts
+  it "on cancellation of the enclosing scope with both owners held where the cancellation reaches them, ends both owners cancelled: the instances settle as discarded, and the exit records say so" $ do
+    fx ← newFx
+    ui ← newFakeUi
+    armed ← newIORef False
+    captured ← newEmptyMVar
+    finished ← newEmptyMVar
+    -- Each owner's own thread is held in Haskell, in the application's observer that runs before each of its segments,
+    -- which a cancellation interrupts and which nothing else opens: the cancellation lands before the owner reaches its
+    -- orderly stop check. A barrier inside a Lua callback would leave that order to the scheduler.
+    let hold name owner = owner {scheduledObserve = \segment → do on ← readIORef armed; when on (holdAt fx name); scheduledObserve owner segment}
+        config =
+          (sampleConfig fx ui)
+            { configGameplaySpec = hold "gameplay observer"
+            , configUiSpec = hold "ui observer"
+            , configGameplaySource = luaLines ["function update(self, dt) staging.finish() end"]
+            }
+    thread ← forkIO $ withBoundary (\control → withDomains control config (\domains → putMVar captured domains >> writeIORef armed True >> void (stepTick domains))) `finally` putMVar finished ()
+    domains ← bounded (readMVar captured)
+    tickUi domains ui
+    awaitEntered fx "gameplay observer"
+    awaitEntered fx "ui observer"
+    killThread thread
+    bounded (readMVar finished) `finally` mapM_ (releaseGate fx) ["gameplay observer", "ui observer"]
+    evidence ← cleanupEvidence domains
+    leavesNothing evidence
+    forM_ [evidenceUi evidence, evidenceGameplay evidence] $ \owner → do
+      evidenceEnded owner `shouldBe` True
+      (exitKind <$> evidenceExit owner) `shouldBe` Just ExitCancelled
+      map evidenceOutcome (evidenceInstances owner) `shouldBe` ["discarded"]
+    revisionNow domains `shouldReturn` 0
+    balanced domains
   it "overlaps a stop requested while a segment is held with the failure that segment then raises: the failure is the session's, published once, nothing is committed, and the ledger balances" $
     withSample (\config → config {configInput = [], configGameplaySource = luaLines ["function update(self, dt) fx.hold('held') error('failed while stopping') end"]}) $ \fx _ domains → withReleased fx ["held"] $ do
       offered ← mapM (offer domains) [0, 1]

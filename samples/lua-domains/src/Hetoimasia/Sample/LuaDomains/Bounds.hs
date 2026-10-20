@@ -63,8 +63,8 @@ data Bounds = Bounds
     -- ^ The most workspaces one gameplay instance holds charged at once: the capacity of its leases.
   , boundSessionTasks ∷ !Int
     -- ^ The most tasks the session may hold admitted and not yet observed. The owner keeps a task's slot and result
-    -- reservation until its settlement is observed, so the gameplay owner's scheduling is made from this (one more
-    -- active task than it): the fence of every tick always has a slot to run in.
+    -- reservation until its settlement is observed, and a live instance's invocation takes a slot of the same pool, so
+    -- the gameplay owner's scheduling is made from this and the instances it may hold live: an update always has a slot.
   , boundPendingControls ∷ !Int
     -- ^ The most controls the UI may hold accepted and unread at once. The engine holds a reservation for each until its
     -- receipt is read, and the owner's reservations are this many and one for each instance the stop must reach, so a

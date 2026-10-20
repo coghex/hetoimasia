@@ -104,6 +104,7 @@ test-suite lua-domains-tests
     main-is: Main.hs
     hs-source-dirs: test
     other-modules:
+        Test.Domains.Accounting
         Test.Domains.Admission
         Test.Domains.Barrier
         Test.Domains.Command

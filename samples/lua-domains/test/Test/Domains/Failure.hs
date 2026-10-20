@@ -256,7 +256,7 @@ spec = describe "the failure of the gameplay session" $ do
           revisionNow domains `shouldReturn` 1
 
   describe "what a failure leaves for the stop" $
-    it "counts a failure told of after the failure was published, keeps the first as the session's, and publishes nothing more" $
+    it "has quiesced every surviving instance before it is published: a bystander's shutdown that raises is counted in the one snapshot, and the stop finds nothing left to tell" $
       withSample
         ( \config →
             config
@@ -268,13 +268,17 @@ spec = describe "the failure of the gameplay session" $ do
         $ \_ _ domains → do
           snapshot ← stepTick domains >>= expectFailed
           revisionNow domains `shouldReturn` 1
-          -- The bystander's shutdown raises when the session is stopped, after the failure was published.
+          -- The bystander was stopped before the failure was published, and its shutdown's error is the failure's
+          -- later one: it is in the snapshot, not told of afterwards.
+          fmap evidenceLater (evidenceOf snapshot) `shouldBe` Just 1
           _ ← stopSession domains
           revisionNow domains `shouldReturn` 1
           (latest, _) ← snapshotNow domains
           latest `shouldBe` snapshot
           evidence ← cleanupEvidence domains
-          (evidenceFailures evidence, map failWho (evidenceAfter evidence)) `shouldBe` (2, ["bystander"])
+          (evidenceFailures evidence, map failWho (evidenceAfter evidence)) `shouldBe` (2, [])
+          held ← sessionFailures <$> readTVarIO (sharedSession (domainsShared domains))
+          map failWho held `shouldBe` ["gameplay", "bystander"]
   describe "what else failed while the instance ended" $
     it "is the session's too, beside the primary and never in its place: an update that fails and a shutdown that fails" $
       withSample
@@ -389,15 +393,15 @@ spec = describe "the failure of the gameplay session" $ do
         refusedFull = \case TaskQueueFull → True; _ → False
         held = boundSessionTasks defaultBounds
         failingWith = gameplayWith ("function update(self, dt) error('update failed') end" : taskFunctions)
-    it "are no more than leave the fence a slot, and a tick goes on while the owner holds the results it has not observed" $
+    it "are no more than the session's bound, and a tick goes on while the owner holds the results it has not observed" $
       withSample tasksConfig $ \_ _ domains → do
         first ← forM [1 .. held] $ \_ → admitGameplayTask domains (task "task" "task_runs")
         map accepted first `shouldBe` replicate held True
         admitGameplayTask domains (task "task" "task_runs") >>= (`shouldSatisfy` refusedFull)
-        -- Every task is unobserved; the fence of the tick needs its own slot, and the tick's watch gives theirs back.
+        -- Every task is unobserved and holds its slot; the update has one of its own, and the tick's watch gives theirs back.
         spawn (stepTick domains) >>= \collect → collect >>= (`shouldSatisfy` \case TickCommitted _ → True; _ → False)
         admitGameplayTask domains (task "task" "task_runs") >>= (`shouldSatisfy` accepted)
-    it "are settled by a stop however many the owner holds: the stop does not wait for a slot the fence cannot have" $
+    it "are settled by a stop however many the owner holds: the stop waits for no slot" $
       withSample tasksConfig $ \_ _ domains → do
         forM_ [1 .. held] $ \_ → admitGameplayTask domains (task "task" "task_runs")
         spawn (stopSession domains) >>= \collect → void collect
@@ -413,7 +417,7 @@ spec = describe "the failure of the gameplay session" $ do
         sessionFailureCount <$> readTVarIO (sharedSession (domainsShared domains)) >>= (`shouldBe` 0)
         readTVarIO (sharedTaskHeld (domainsShared domains)) `shouldReturn` 0
     forM_ [1, 5, maxSessionTasks] $ \limit →
-      it ("holds the fence's slot whatever the bound is: " <> show limit <> " unobserved tasks leave a tick and a stop able to run") $
+      it ("leaves the update a slot whatever the bound is: " <> show limit <> " unobserved tasks leave a tick and a stop able to run") $
         withSample (\config → (tasksConfig config) {configBounds = (configBounds config) {boundSessionTasks = limit}}) $ \_ _ domains → do
           first ← forM [1 .. limit] $ \_ → admitGameplayTask domains (task "task" "task_runs")
           map accepted first `shouldBe` replicate limit True

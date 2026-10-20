@@ -33,15 +33,15 @@
 -- 2. Grant gameplay one logical step of the configured duration. Grants are made one at a time, so
 --    at most one is outstanding (P-6).
 -- 3. Wait for the owner to complete the tick ('awaitTicksComplete').
--- 4. /Fence/. Completion of the tick says only that the grant was applied and nothing is left that
+-- 4. /Accounting/. Completion of the tick says only that the grant was applied and nothing is left that
 --    it could run: the scheduler reconciles the grant before the instance layer has accounted for what the
 --    tick's last segment did, so an invocation that the scheduler ended with a refused wait still looks,
---    for a moment, like an instance that is active with nothing in flight. The driver therefore admits a
---    task that does nothing, and waits for its settlement. The owner's thread runs a segment and then the
---    boundary that follows it, one after the other, so the fence's segment begins only after every boundary
---    before it is over: the instance layer has accounted for the tick, an instance that failed has ended —
---    its @shutdown@ and the release of what it held included — and the application has been told. Only
---    then does the driver decide, and it never decides from the tick's completion alone.
+--    for a moment, like an instance that is active with nothing in flight. The driver therefore waits for the
+--    owner's accounting ('awaitScheduledAccounting', D-47), which takes no task, ticket or slot: an instance
+--    that failed has ended — its @shutdown@ and the release of what it held included — and the application's
+--    escalation has been called and has returned. Only then does the driver decide, and it never decides
+--    from the tick's completion alone. An owner that ended instead has accounted for nothing, and nothing is
+--    committed.
 -- 5. Decide. If a session failure has been told of, or a task the session admitted has faulted, nothing is
 --    committed: the failure is published (below). If a stop was asked for, nothing is committed. Otherwise
 --    the tick commits only if its work finished successfully: gameplay said so (@staging.finish()@) and
@@ -59,7 +59,7 @@
 --
 -- A failure of script execution on the gameplay owner fails the session ("Hetoimasia.Sample.LuaDomains.Session"):
 -- the instance's failure is told to the application by the owner's escalation callback, which records it and
--- answers 'Isolate', and the fault of a task the session admitted is found by the driver at the fence. From
+-- answers 'Isolate', and the fault of a task the session admitted is found by the driver after the accounting wait. From
 -- the moment the driver knows of one, it grants nothing more and publishes @one@ snapshot for it: the last
 -- good world and committed tick, status 'Failed' with the evidence, and the intentions the failure invalidated
 -- (every accepted intention that had no committed terminal disposition, those of the failing tick, applied only
@@ -70,7 +70,7 @@
 -- 'stopSession' is the one stop, from the driver. It ends admission and grants at once, asks the gameplay
 -- behavior to stop and waits for it to be settled — its @shutdown@ run and the workspaces it leased released —
 -- (so a segment that is running is not preempted, and the stop waits for it to return), finds out through the
--- fence whether that settlement was a failure, and then publishes the one last snapshot: @Stopped@ with the
+-- accounting wait whether that settlement was a failure, and then publishes the one last snapshot: @Stopped@ with the
 -- intentions the stop discarded, or, if @shutdown@ raised and nothing failed before, the failure; a session
 -- that had already failed keeps the failure as its status and is published nothing more. It lets the UI read
 -- the receipts of the controls it asked for, closes the publication and retires both owners.
@@ -86,6 +86,7 @@ module Hetoimasia.Sample.LuaDomains.Domains
     DomainsConfig (..)
   , defaultConfig
   , PublishPoint (..)
+  , StopPoint (..)
   , Extension (..)
   , Where (..)
   , tickDuration
@@ -112,7 +113,7 @@ module Hetoimasia.Sample.LuaDomains.Domains
   , cleanupEvidence
   ) where
 
-import Control.Concurrent.MVar (modifyMVar_, putMVar, takeMVar)
+import Control.Concurrent.MVar (putMVar, takeMVar)
 import Control.Concurrent.STM
   ( STM
   , atomically
@@ -201,11 +202,14 @@ import Hetoimasia.Sample.LuaDomains.Shared
   , captureView
   , enterTaskAdmission
   , failSession
+  , handOffTask
   , leaveTaskAdmission
   , newShared
   , publishInitial
   , publisherOf
   , readerOf
+  , serialWait
+  , swapIntake
   , taskAdmissionsDrained
   , takesTasks
   )
@@ -280,7 +284,8 @@ import Hetoimasia.Scripting.Lua.Registration (CapabilityType, Namespace, Registr
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VRecord))
 import Hetoimasia.Scripting.Lua.Runtime (CallFault (BoundaryFailed), ExitRecord, LuaRuntime, newLuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
-  ( ControlRequest (RequestStop)
+  ( AccountingWait (..)
+  , ControlRequest (RequestStop)
   , ExecutionDomain (GameplayDomain, InterfaceDomain)
   , GrantAnswer (GrantAccepted)
   , Quanta (Quanta)
@@ -295,10 +300,10 @@ import Hetoimasia.Scripting.Lua.Scheduled
   , ServiceClass (OrdinaryClass)
   , TaskAdmission (..)
   , TaskControlAnswer (..)
-  , TaskKind (OneShot)
   , TaskRequest (..)
   , TickWait (TicksCompleted)
   , admitScheduledTask
+  , awaitScheduledAccounting
   , awaitTask
   , awaitTicksComplete
   , cancelScheduled
@@ -366,10 +371,20 @@ data DomainsConfig = DomainsConfig
     -- ^ Test-only: instances admitted to the gameplay owner after the behavior. Their failures fail the session.
   , configGameplaySpec ∷ !(ScheduledSpec → ScheduledSpec)
     -- ^ Test-only: the last word on the gameplay owner's configuration (a request service and subscriptions).
+  , configUiSpec ∷ !(ScheduledSpec → ScheduledSpec)
+    -- ^ Test-only: the last word on the UI owner's configuration (a hold on its thread, where a cancellation can reach it).
   , configAssignHook ∷ !(IO ())
     -- ^ Test-only: run by a control's assignment before it returns, in the interval before the engine admits it.
   , configTaskHook ∷ !(IO ())
     -- ^ Test-only: run inside a task admission, after the session was found to take tasks and before the owner is asked.
+  , configHandoffHook ∷ !(IO ())
+    -- ^ Test-only: run inside a task admission after the owner has accepted the task and the session tracks it, in the
+    -- interval before the admission returns.
+  , configStopHook ∷ !(StopPoint → IO ())
+    -- ^ Test-only: run by a stop at each point 'StopPoint' names.
+  , configEscalateHook ∷ !(IO ())
+    -- ^ Test-only: run by the gameplay owner's escalation callback, on the owner's thread, before it tells the session
+    -- of a failure.
   , configPublishHook ∷ !(PublishPoint → IO ())
     -- ^ Test-only: run by the publication that ends a session, before it takes the publication and after, in the
     -- interval before the snapshot is published.
@@ -406,8 +421,12 @@ defaultConfig =
     , configGameplayModules = []
     , configGameplayInstances = []
     , configGameplaySpec = id
+    , configUiSpec = id
     , configAssignHook = pure ()
     , configTaskHook = pure ()
+    , configHandoffHook = pure ()
+    , configStopHook = const (pure ())
+    , configEscalateHook = pure ()
     , configPublishHook = const (pure ())
     , configUiSeesEnd = True
     , configPace = \_ → pure ()
@@ -450,8 +469,6 @@ data DomainsDefect
     TickNotCompleted !Word64
   | -- | A snapshot was refused because its publisher had closed.
     PublicationRefused !Word64
-  | -- | The fence task was not admitted, or did not run to its end: what was answered.
-    FenceFailed !String
   | -- | 'runSession' was asked to run a session that is not finite.
     SessionNotFinite
   | -- | A session ended with something pending, or with the ledger out of balance: the counters and
@@ -499,6 +516,11 @@ data Retirement = Retirement
 
 -- | Where the publication that ends a session is, for a test that holds it.
 data PublishPoint = BeforeClaim | AfterClaim
+  deriving (Eq, Show)
+
+-- | Where a stop is, for a test that holds it: its intent is recorded and admission closed, and nothing has been asked
+-- of the instances yet; or the gameplay instance at this position has been asked to stop and the request is recorded.
+data StopPoint = StopIntended | StopIssued !Int
   deriving (Eq, Show)
 
 -- | How a retirement ends the owners.
@@ -619,7 +641,7 @@ gameplaySpec shared config registered =
     config
     ( (scheduledSpec vm (workerPolicy "gameplay") (gameplayScheduling (configBounds config)))
         { scheduledDomain = GameplayDomain
-        , scheduledInstances = Just ((instanceConfigFor config) {instanceControlAdmission = AdmitLogically, instanceEscalate = gameplayEscalation shared})
+        , scheduledInstances = Just ((instanceConfigFor config) {instanceControlAdmission = AdmitLogically, instanceEscalate = gameplayEscalation config shared})
         , scheduledLending = Just (sharedLending shared)
         , scheduledLeases = Just (sharedLeases shared)
         }
@@ -640,15 +662,18 @@ gameplaySpec shared config registered =
 -- gameplay owner and nothing else.
 uiSpec ∷ Shared → DomainsConfig → Registration → ScheduledEndpoint → ScheduledSpec
 uiSpec shared config registered gameplayEndpoint =
-  (scheduledSpec vm (workerPolicy "interface") uiScheduling)
-    { scheduledDomain = InterfaceDomain
-    , scheduledClock = configUiClock config
-    , scheduledTimer = configUiTimer config
-    , scheduledObserve = \_ → captureView shared
-    , scheduledInstances = Just ((instanceConfigFor config) {instanceEscalate = uiEscalation shared})
-    , scheduledLifecycle =
-        Just (lifecycleGrant [GrantTarget (GrantedEndpoint gameplayEndpoint) [PermitInspect, PermitControl] (Just (assignControl shared))])
-    }
+  configUiSpec
+    config
+    ( (scheduledSpec vm (workerPolicy "interface") uiScheduling)
+        { scheduledDomain = InterfaceDomain
+        , scheduledClock = configUiClock config
+        , scheduledTimer = configUiTimer config
+        , scheduledObserve = \_ → captureView shared
+        , scheduledInstances = Just ((instanceConfigFor config) {instanceEscalate = uiEscalation shared})
+        , scheduledLifecycle =
+            Just (lifecycleGrant [GrantTarget (GrantedEndpoint gameplayEndpoint) [PermitInspect, PermitControl] (Just (assignControl shared))])
+        }
+    )
   where
     vm =
       (vmConfig [LibraryBase, LibraryString, LibraryTable, LibraryMath])
@@ -682,24 +707,28 @@ instanceConfigFor config =
     , instanceTickDuration = Just (configTickDuration config)
     }
 
--- | Gameplay's scheduling, from the session's bounds: one task more than the session may hold unobserved, which is the
--- fence's; queued admissions for those and for the instances; retained results for the instances' (two for each, as the
--- instance layer requires), those tasks' and the fence's; and one grant outstanding at a time, which is enough (P-6).
--- The owner keeps a task's slot and result until it is observed, so whatever 'boundSessionTasks' is, the fence has a
--- slot to run in (four tasks, eight queued admissions and twelve retained results, by default).
+-- | Gameplay's scheduling, from the session's bounds. The owner keeps a task's active slot and its result until the
+-- task's settlement is observed, and a live instance's invocation takes an active slot of the same pool, so both
+-- are counted: one active slot for each instance the owner may hold live and one for each task the session may hold
+-- unobserved ('boundSessionTasks'). However many tasks are unobserved and whichever instances are due, an update
+-- always has a slot, and the tick reaches its commit decision with no task of the sample's own to wait for. Queued
+-- admissions and retained results are twice that, which covers the two the instance layer reserves for each live
+-- instance and each task's, and one grant is outstanding at a time, which is enough (P-6). Control requests are the
+-- stops of the tasks the session holds, one at a time (seven active slots, fourteen queued admissions and fourteen
+-- retained results by default: three session tasks and four live instances).
 gameplayScheduling ∷ Bounds → SchedulerBounds
 gameplayScheduling bounds =
   SchedulerBounds
     { boundActiveTasks = active
-    , boundQueuedAdmissions = max liveInstances (2 * active)
-    , boundRetainedResults = max (2 * liveInstances) (liveInstances + 2 * active)
+    , boundQueuedAdmissions = 2 * active
+    , boundRetainedResults = 2 * active
     , boundQuanta = Quanta (Quantum 4) (Quantum 4) (Quantum 4)
     , boundOutstandingGrants = 1
-    , boundControlRequests = max 4 active
+    , boundControlRequests = active
     , boundServiceBudget = Nothing
     }
   where
-    active = boundSessionTasks bounds + 1
+    active = liveInstances + boundSessionTasks bounds
 
 -- | The UI's scheduling: its own bounds, of the same size. It is never granted a step.
 uiScheduling ∷ SchedulerBounds
@@ -726,8 +755,9 @@ workerPolicy label =
 -- instance has ended: a script failure fails the session, and the instance's peers go on (@Isolate@), so the
 -- owner stays alive and quiescent. A failure that is only a failed release is cleanup evidence, fatal under
 -- supervision, and is never a session failure.
-gameplayEscalation ∷ Shared → InstanceFailure → IO Escalation
-gameplayEscalation shared failure = do
+gameplayEscalation ∷ DomainsConfig → Shared → InstanceFailure → IO Escalation
+gameplayEscalation config shared failure = do
+  configEscalateHook config
   atomically $ do
     tick ← currentTick shared
     forM_ (sessionFailuresOf tick failure) (failSession shared)
@@ -948,59 +978,52 @@ latestSnapshot domains = atomically $ do
   reader ← readerOf (domainsShared domains)
   preparedValue . observedValue <$> readSnapshot reader
 
--- The fence and the tasks ---------------------------------------------------------
+-- The accounting and the tasks ------------------------------------------------------
 
 -- | The behavior's instance, as the engine reports it now.
 behaviorNow ∷ Started → STM (Maybe InstanceSnapshot)
 behaviorNow started = inspectInstance (scheduledEndpoint (startedOwner started)) (startedInstance started)
 
--- | The module the fence task's entry point is in.
-fenceModule ∷ ModuleRef
-fenceModule = sourceIdentity (gameplayModule [] "")
+-- | Run one of the sample's supervised waits with no other of them pending (the supervision handle is the
+-- application thread's, and a stop may come from another thread).
+serially ∷ Domains → IO a → IO a
+serially domains = serialWait (domainsShared domains)
 
--- | Admit the fence task and wait for its settlement. The owner runs a segment and then the boundary after
--- it, one after the other, so the fence's segment begins only once every boundary before it is over: what the
--- instance layer was to account for, it has, an instance that failed has ended and the application has been
--- told. What the fence settles as other than returned, with the owner still serving, is a defect of the sample.
-fence ∷ Domains → IO ()
-fence domains = do
-  admission ← admitScheduledTask (scheduledEndpoint (startedOwner (domainsGameplay domains))) (TaskRequest fenceModule "sample_fence" [] OrdinaryClass OneShot (Just "fence"))
-  case admission of
-    TaskAccepted _ ticket → do
-      settlement ← awaitTask (domainsControl domains) ticket
-      case settledOutcome settlement of
-        SettledReturned _ → pure ()
-        -- An owner that ended while the fence waited settles it as discarded: it has no boundary left to run.
-        SettledDiscarded _ → pure ()
-        other → throwIO (FenceFailed (take 200 (show other)))
-    -- An owner whose admission is closed is ending (a stop, or a cleanup failure that ended it fatally): there
-    -- is no boundary left to wait for, and retirement waits for its worker, whose end supervision reports.
-    TaskAdmissionClosed → pure ()
-    other → throwIO (FenceFailed (show other))
+-- | Wait for the gameplay owner to have accounted for every grant accepted so far and for the instance endings they
+-- caused ('awaitScheduledAccounting', D-47): a failed instance has ended, its @shutdown@ and the release of what it
+-- held included, and the application's escalation has been called and has returned. It takes no task, ticket or slot,
+-- so it works whatever the session holds. 'AccountingOwnerEnded' says the owner ended first and accounted for nothing:
+-- never a completion. It is one of the supervised waits, so it is taken in turn ('serially'), and a stop from another
+-- thread does not wait beside the driver.
+awaitAccounting ∷ Domains → IO AccountingWait
+awaitAccounting domains =
+  serially domains (awaitScheduledAccounting (domainsControl domains) (startedOwner (domainsGameplay domains)))
 
 -- | Admit a task to the gameplay owner as the session's: if it faults, the session fails, as an instance's
 -- failure fails it. A session that has failed, is stopping or has ended takes none: the answer is
 -- 'TaskAdmissionClosed' and nothing reaches the owner. An admission that began before the session ended is
--- finished, and watched, before the ending is published or the settlements are read for it.
+-- finished, and tracked, before the ending is published or the settlements are read for it. The owner's acceptance and
+-- the session's tracking of the task are not separated by anything that waits: the task is handed over in one
+-- transaction ('handOffTask') as soon as the owner has accepted it, so it is tracked and counted whatever interrupts
+-- the admitter next, and a task that was not accepted is never counted.
 admitGameplayTask ∷ Domains → TaskRequest → IO TaskAdmission
 admitGameplayTask domains request = mask_ $ do
   let shared = domainsShared domains
+      config = domainsConfig domains
   entered ← atomically (enterTaskAdmission shared)
   case entered of
     TaskEntryClosed → pure TaskAdmissionClosed
-    -- The session holds as many tasks it has not observed as leave the fence its slot: the owner keeps a task's slot
-    -- until its settlement is observed, so one more could keep the fence from ever running.
+    -- The session holds as many tasks it has not observed as 'boundSessionTasks' allows, and the owner's scheduling
+    -- has an active slot for each of them beside the instances'.
     TaskEntryFull → pure TaskQueueFull
     TaskEntered →
       ( do
-          configTaskHook (domainsConfig domains)
+          configTaskHook config
           admission ← admitScheduledTask (scheduledEndpoint (startedOwner (domainsGameplay domains))) request
           case admission of
-            TaskAccepted _ ticket →
-              modifyMVar_ (sharedTasks shared) $ \held → do
-                atomically (modifyTVar' (sharedTaskHeld shared) (+ 1))
-                pure (held <> [Watched (maybe "task" id (requestName request)) ticket])
+            TaskAccepted _ ticket → atomically (handOffTask shared (Watched (maybe "task" id (requestName request)) ticket))
             _ → pure ()
+          configHandoffHook config
           pure admission
       )
         `finally` atomically (leaveTaskAdmission shared)
@@ -1037,7 +1060,7 @@ settleTasks domains = do
               TaskControlFull → throwIO (StopRefused "task" (show asked))
               -- An owner that no longer takes requests is ending, and settles the task as discarded.
               _ → pure ()
-            Just <$> awaitTask (domainsControl domains) ticket
+            Just <$> serially domains (awaitTask (domainsControl domains) ticket)
 
 -- | Take the lock on the watched tasks, learn each one's settlement as asked (nothing: it stays watched), record the
 -- faults among them as session failures, and give the observed tasks up. However the observation ends, a task whose
@@ -1045,7 +1068,11 @@ settleTasks domains = do
 consumeTasks ∷ Domains → (Watched → IO (Maybe ScheduledSettlement)) → IO ()
 consumeTasks domains observe = mask $ \restore → do
   let shared = domainsShared domains
-  held ← takeMVar (sharedTasks shared)
+  watching ← takeMVar (sharedTasks shared)
+  -- The tasks handed over since the last observation join this one's, in the order they were accepted. Nothing here
+  -- waits (the lock is held), and a task taken is in this list until it is observed or put back.
+  handed ← atomically (swapIntake shared)
+  let held = watching <> handed
   progress ← newIORef ([], held)
   let go = do
         (keptSoFar, pending) ← readIORef progress
@@ -1110,7 +1137,7 @@ stepTick domains = do
     state ← readTVar (sharedSession shared)
     pure (failed && sessionEnded state == Nothing)
   if pending
-    then maybe TickHalted TickFailed <$> settleFailure domains
+    then maybe TickHalted TickFailed <$> publishEnding domains EndedByFailure
     else do
       begun ← atomically $ do
         halted ← haltedNow shared
@@ -1148,25 +1175,25 @@ stepTick domains = do
           if not accepted
             then pure TickHalted
             else do
-              waited ← awaitTicksComplete (domainsControl domains) owner
+              waited ← serially domains (awaitTicksComplete (domainsControl domains) owner)
+              accounted ← awaitAccounting domains
               -- An owner that ended because the session was stopped, or had failed, while the tick was in flight (the
-              -- stop retired it from another thread) is the ending the session already decided: the tick is halted.
-              -- An owner that ended otherwise is a defect.
-              when (waited /= TicksCompleted) $ do
+              -- stop retired it from another thread) is the ending the session already decided: the tick is halted,
+              -- and nothing is committed whatever it had begun. An owner that ended otherwise is a defect.
+              when (waited /= TicksCompleted || accounted /= AccountingComplete) $ do
                 over ← atomically (haltedNow shared)
                 unless over (throwIO (OwnerEndedDuringTick tick))
-              fence domains
               watchTasks domains
               decide domains tick pausedAtBegin
 
--- | What the driver decided after the fence.
+-- | What the driver decided after the accounting.
 data Verdict
   = VerdictFailed
   | VerdictHalted
   | VerdictIncomplete
   | VerdictCommit !Candidate
 
--- | Decide a tick that has completed and been fenced: a failure told of fails the session and commits
+-- | Decide a tick that has completed and been accounted for: a failure told of fails the session and commits
 -- nothing; a stop commits nothing; otherwise the tick commits if its work finished successfully, or the engine says why
 -- there is none to do.
 decide ∷ Domains → Word64 → Bool → IO TickOutcome
@@ -1262,13 +1289,6 @@ commitTick domains tick candidate = do
         Left True → maybe TickHalted TickFailed <$> publishEnding domains EndedByFailure
         Left False → pure TickHalted
 
--- | Tell the session's failure after a fence, and publish it.
-settleFailure ∷ Domains → IO (Maybe GameSnapshot)
-settleFailure domains = do
-  fence domains
-  watchTasks domains
-  publishEnding domains EndedByFailure
-
 -- | How a session's last publication ends it.
 data Ending = EndedByFailure | EndedByStop
 
@@ -1282,11 +1302,13 @@ publishEnding domains ending = mask_ $ do
       config = domainsConfig domains
       bounds = configBounds config
       var = sharedSession shared
-  -- A failed session is quiescent when it is told of: what it admitted is settled (and what is still running is asked to
-  -- stop) before the failure is published, with the owner alive. Admission closed where the failure was recorded.
+  -- A failed session is quiescent when its failure is published: every gameplay instance has been asked to stop and
+  -- has settled (the one that failed has ended, and the peers that were still serving or had work queued run nothing
+  -- more), the accounting of what that did is complete, and the tasks it admitted are settled, with the owner alive.
+  -- Admission was closed where the failure was recorded. A stop has done all this already, and it is not done twice.
   when (isFailure ending) $ do
     failed ← atomically (failedNow var)
-    when failed (settleTasks domains)
+    when failed (settleGameplay domains)
   configPublishHook config BeforeClaim
   built ← atomically $ do
     state ← readTVar var
@@ -1343,7 +1365,7 @@ settleStart domains = do
   phases ← atomically (mapM (fmap (fmap snapshotPhase) . behaviorNow) behaviors)
   let unsettled = [phase | Just phase ← phases, phase /= Active]
   unless (null unsettled) $ do
-    fence domains
+    void (awaitAccounting domains)
     watchTasks domains
   failed ← atomically (failedNow (sharedSession (domainsShared domains)))
   if failed
@@ -1366,6 +1388,7 @@ stopLive domains = do
   atomically $ do
     _ ← requestStopNow (sharedSession shared)
     closeQueue (sharedQueue shared)
+  configStopHook (domainsConfig domains) StopIntended
   settleGameplay domains
   failed ← atomically (failedNow (sharedSession shared))
   void (publishEnding domains (if failed then EndedByFailure else EndedByStop))
@@ -1387,6 +1410,7 @@ finishLive domains = do
   atomically $ do
     _ ← requestStopNow (sharedSession shared)
     closeQueue (sharedQueue shared)
+  configStopHook (domainsConfig domains) StopIntended
   settleGameplay domains
   failed ← atomically (failedNow (sharedSession shared))
   if failed
@@ -1400,21 +1424,24 @@ finishLive domains = do
 
 -- | Ask each gameplay instance to stop, once for the session however many stops there are and whoever is interrupted
 -- (what was asked is tracked, not who asked first), wait for each to be settled, which includes its @shutdown@ and the
--- release of what it held, run the fence so that every failure of the settlement has been told, and settle the
--- session's tasks. The engine's reservations for control leave one for each instance, so the stop is admitted whatever
--- the UI holds. The caller has closed admission: an admission that began before is finished and watched before the
+-- release of what it held, wait for the owner's accounting of what those endings caused (the escalation of a
+-- @shutdown@ that raised included), so that every failure of the settlement has been told, and settle the session's
+-- tasks. The engine's reservations for control leave one for each instance, so the stop is admitted whatever the UI
+-- holds. The caller has closed admission: an admission that began before is finished and tracked before the
 -- instances are awaited, and the requests are issued first, so a stop interrupted while it waits has asked already.
+-- Everything here is idempotent, and every wait is taken in turn ('serially').
 settleGameplay ∷ Domains → IO ()
 settleGameplay domains = do
   let started = domainsGameplay domains : domainsExtras domains
   issueStops domains (zip [0 ∷ Int ..] started)
   atomically (taskAdmissionsDrained (domainsShared domains))
-  forM_ started $ \one → void (awaitInstance (domainsControl domains) (startedTicket one))
-  fence domains
+  forM_ started $ \one → void (serially domains (awaitInstance (domainsControl domains) (startedTicket one)))
+  void (awaitAccounting domains)
   settleTasks domains
 
 -- | Ask each of these instances to stop that has not been asked, and remember each that was. The requests never block,
--- and what is remembered is what the engine took, whatever interrupts the asking.
+-- and what is remembered is what the engine took, whatever interrupts the asking: the request and the record of it
+-- are not separated by anything that waits.
 issueStops ∷ Domains → [(Int, Started)] → IO ()
 issueStops domains started = mask_ $ do
   let var = sharedStopsIssued (domainsShared domains)
@@ -1426,7 +1453,8 @@ issueStops domains started = mask_ $ do
       asked ← requestInstanceControl (scheduledEndpoint (startedOwner one)) (startedInstance one) InstanceStop
       case asked of
         InstanceControlFull → throwIO (StopRefused "gameplay" (show asked))
-        _ → writeIORef progress (index : done))
+        _ → writeIORef progress (index : done)
+      configStopHook (domainsConfig domains) (StopIssued index))
     `finally` (readIORef progress >>= putMVar var)
 
 -- | What follows the publication that ends the session: the UI reads the settlements of the controls it asked for,
@@ -1436,14 +1464,14 @@ afterEnding ∷ Domains → IO Retirement
 afterEnding domains = do
   let shared = domainsShared domains
       config = domainsConfig domains
-  awaitSupervised (domainsControl domains) $ do
+  serially domains $ awaitSupervised (domainsControl domains) $ do
     held ← readTVar (sharedReceipts shared)
     serving ← uiServing domains
     when (held > 0 && serving) retry
   when (configUiSeesEnd config) $ do
     ended ← sessionEnded <$> readTVarIO (sharedSession shared)
     forM_ (endingWord =<< ended) $ \word →
-      awaitSupervised (domainsControl domains) $ do
+      serially domains $ awaitSupervised (domainsControl domains) $ do
         notes ← readTVar (sharedUiNotes shared)
         serving ← uiServing domains
         when (serving && word `notElem` notesSaw notes) retry

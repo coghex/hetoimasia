@@ -11,6 +11,7 @@ import Control.Exception (try)
 import Control.Monad (replicateM_, when)
 import Data.ByteString (ByteString)
 import Data.Foldable (toList)
+import Data.Maybe (isNothing)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Hetoimasia.Sample.LuaDomains
@@ -26,7 +27,8 @@ import Hetoimasia.Sample.LuaDomains
   , stepTick
   , stopSession
   )
-import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedControls, sharedCounts, sharedReceipts, sharedTick))
+import Hetoimasia.Sample.LuaDomains.Session (SessionState (sessionEnded))
+import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedControls, sharedCounts, sharedReceipts, sharedSession, sharedTick))
 import Hetoimasia.Sample.LuaDomains.Tally (ControlCounts (..), Counts (..))
 import Test.Domains.Support
 import Test.Hspec
@@ -181,6 +183,25 @@ spec = describe "the UI's control of the gameplay behavior" $ do
           _ ← collect
           counts ← readTVarIO (sharedControls (domainsShared domains))
           (controlOffered counts, controlAccepted counts, Map.toList (controlRefused counts)) `shouldBe` (1, 0, [("unassigned", 1)])
+          controlsBalance domains
+
+  describe "a target that ends between the assignment and the admission" $
+    it "answers the request as the engine does, closed or unknown_target and never late, and the sample counts it as it was said, owing nothing for it" $ do
+      probe ← newEmptyMVar
+      withSample (\config → config {configInput = [], configAssignHook = readMVar probe >>= id, configUiSource = uiActing ["control.pause()", ""]}) $ \fx ui domains →
+        withReleased fx ["assigned"] $ do
+          putMVar probe (holdAt fx "assigned")
+          tickUi domains ui
+          -- The request has its tick and its place, and the engine has not admitted it: the session is stopped now, and
+          -- the instance it names has ended when the UI goes on.
+          awaitEntered fx "assigned"
+          stopped ← spawn (stopSession domains)
+          waitFor (readTVar (sharedSession (domainsShared domains)) >>= \state → when (isNothing (sessionEnded state)) retry)
+          releaseGate fx "assigned"
+          _ ← stopped
+          counts ← readTVarIO (sharedControls (domainsShared domains))
+          (controlOffered counts, controlAccepted counts) `shouldBe` (1, 0)
+          Map.toList (controlRefused counts) `shouldSatisfy` (\refused → refused `elem` [[("closed", 1)], [("unknown_target", 1)]])
           controlsBalance domains
 
   describe "serialization with the tick" $

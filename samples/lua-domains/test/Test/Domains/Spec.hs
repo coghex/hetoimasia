@@ -2,6 +2,7 @@
 -- under a real supervision boundary; the structural and pure ones need no VM.
 module Test.Domains.Spec (spec) where
 
+import qualified Test.Domains.Accounting
 import qualified Test.Domains.Admission
 import qualified Test.Domains.Barrier
 import qualified Test.Domains.Command
@@ -38,6 +39,7 @@ spec = describe "the two-domain Lua sample" $ do
   Test.Domains.Controls.spec
   Test.Domains.Delivery.spec
   Test.Domains.Failure.spec
+  Test.Domains.Accounting.spec
   Test.Domains.Ledger.spec
   Test.Domains.Leases.spec
   Test.Domains.Stop.spec
