@@ -176,11 +176,7 @@ spec = describe "the UI's control of the gameplay behavior" $ do
     it "takes no control for a tick that cannot run: a request made while the last tick runs is refused as unassigned" $
       withSample (\config → config {configInput = [], configTicks = Just 1, configGameplaySource = luaLines ["function update(self, dt) fx.hold('last') staging.finish() end"], configUiSource = uiActing ["control.pause()", ""]}) $ \fx ui domains →
         withReleased fx ["last"] $ do
-          collect ← spawn (stepTick domains)
-          awaitEntered fx "last"
-          uiStep domains ui
-          releaseGate fx "last"
-          _ ← collect
+          _ ← driving domains (awaitEntered fx "last" >> uiStep domains ui >> releaseGate fx "last")
           counts ← readTVarIO (sharedControls (domainsShared domains))
           (controlOffered counts, controlAccepted counts, Map.toList (controlRefused counts)) `shouldBe` (1, 0, [("unassigned", 1)])
           controlsBalance domains
@@ -206,18 +202,22 @@ spec = describe "the UI's control of the gameplay behavior" $ do
   describe "serialization with the tick" $
     it "holds the tick's begin from the control's assignment until the engine has admitted the control: a tick attempted in that interval does not begin, and the control is applied in the tick it was assigned, never late" $ do
       probe ← newEmptyMVar
-      result ← newEmptyMVar
-      withSample (\config → config {configInput = [], configAssignHook = readMVar probe >>= id, configUiSource = uiActing ["control.pause()", ""]}) $ \_ ui domains → do
-        putMVar probe $ do
-          -- On the UI owner's thread, after the assignment and before the admission: the driver tries to begin the tick.
-          collect ← spawn (stepTick domains)
-          replicateM_ 2000 yield
-          began ← toList <$> readTVarIO (sharedTick (domainsShared domains))
-          putMVar result (collect, began)
-        uiStep domains ui
-        (collect, began) ← readMVar result
-        began `shouldSatisfy` null
-        outcome ← collect
+      withSample (\config → config {configInput = [], configAssignHook = readMVar probe >>= id, configUiSource = uiActing ["control.pause()", ""]}) $ \fx ui domains → withReleased fx ["assigned"] $ do
+        -- On the UI owner's thread, after the assignment and before the admission, which is held open: the driver tries to
+        -- begin the tick, and it does not begin.
+        putMVar probe (holdAt fx "assigned")
+        tickUi domains ui
+        awaitEntered fx "assigned"
+        outcome ←
+          driving
+            domains
+            ( do
+                replicateM_ 2000 yield
+                began ← toList <$> readTVarIO (sharedTick (domainsShared domains))
+                began `shouldSatisfy` null
+                releaseGate fx "assigned"
+            )
+        awaitUpdates domains 1
         case outcome of
           TickCommitted snapshot → snapStatus snapshot `shouldBe` Paused
           other → expectationFailure ("the tick did not commit: " <> show other)

@@ -45,16 +45,19 @@ spec = describe "staging and the commit" $ do
             }
       )
       $ \fx _ domains → withReleased fx ["before the commit"] $ do
-        collect ← spawn (stepCommitted domains)
-        awaitEntered fx "before the commit"
-        -- Held inside the tick: the committed world and the snapshot are the initial ones.
-        committed ← readTVarIO (sharedCommitted (domainsShared domains))
-        (snapshot, revision) ← snapshotNow domains
-        (revision, snapTick snapshot, worldTick committed) `shouldBe` (0, 0, 0)
-        fmap entityVersion (toList (worldEntities committed)) `shouldBe` replicate 8 0
-        fxLines fx `shouldReturn` ["staged true", "read after staging 0,0,0"]
-        releaseGate fx "before the commit"
-        done ← collect
+        done ←
+          alongside
+            ( do
+                awaitEntered fx "before the commit"
+                -- Held inside the tick: the committed world and the snapshot are the initial ones.
+                committed ← readTVarIO (sharedCommitted (domainsShared domains))
+                (snapshot, revision) ← snapshotNow domains
+                (revision, snapTick snapshot, worldTick committed) `shouldBe` (0, 0, 0)
+                fmap entityVersion (toList (worldEntities committed)) `shouldBe` replicate 8 0
+                fxLines fx `shouldReturn` ["staged true", "read after staging 0,0,0"]
+                releaseGate fx "before the commit"
+            )
+            (stepCommitted domains)
         (entityX (entity done 0), entityY (entity done 0), entityVersion (entity done 0)) `shouldBe` (3, 4, 1)
         snapTick done `shouldBe` 1
 

@@ -50,6 +50,7 @@ module Test.Domains.Support
   , heldTasks
   , stopBounded
   , alongside
+  , driving
   , Cancelled (..)
   , cancelWhen
   ) where
@@ -452,3 +453,9 @@ cancelWhen trigger action = do
     case outcome of
       Left Cancelled → pure Nothing
       Right result → pure (Just result)
+
+-- | One tick of the driver, on this thread, which is the application thread's, while another thread does what the example
+-- does around it, in the order it does it: the tick's outcome once both have ended, the side's exception raised if it
+-- raised one.
+driving ∷ Domains → IO () → IO TickOutcome
+driving domains around = alongside around (stepTick domains)

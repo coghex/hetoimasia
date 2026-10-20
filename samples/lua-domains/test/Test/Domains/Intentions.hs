@@ -66,16 +66,19 @@ spec = describe "the intention contract" $ do
         fxLines fx `shouldReturn` ["a1 true nil", "a2 true nil", "a3 false full"]
         -- Hold gameplay inside tick one, which keeps its two reservations; tick two is the next
         -- unstarted tick and takes one more, and the queue's bound of three makes the rest full.
-        collect ← spawn (stepCommitted domains)
-        awaitEntered fx "gameplay"
-        tickUi domains ui
-        -- The UI's update completed while gameplay was held: the answers never waited for it.
-        awaitUpdates domains 2
-        fxLines fx `shouldReturn` ["a1 true nil", "a2 true nil", "a3 false full", "b1 true nil", "b2 false full", "b3 false full"]
-        counts ← readTVarIO (sharedCounts (domainsShared domains))
-        (countAccepted counts, countFull counts, countRefused counts, countMalformed counts) `shouldBe` (3, 3, 0, 0)
-        releaseGate fx "gameplay"
-        _ ← collect
+        _ ←
+          alongside
+            ( do
+                awaitEntered fx "gameplay"
+                tickUi domains ui
+                -- The UI's update completed while gameplay was held: the answers never waited for it.
+                awaitUpdates domains 2
+                fxLines fx `shouldReturn` ["a1 true nil", "a2 true nil", "a3 false full", "b1 true nil", "b2 false full", "b3 false full"]
+                counts ← readTVarIO (sharedCounts (domainsShared domains))
+                (countAccepted counts, countFull counts, countRefused counts, countMalformed counts) `shouldBe` (3, 3, 0, 0)
+                releaseGate fx "gameplay"
+            )
+            (stepCommitted domains)
         pure ()
 
   it "answers a malformed call as data, before the typed binding, without faulting the instance" $

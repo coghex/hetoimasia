@@ -5,6 +5,7 @@
 module Test.Domains.Ledger (spec) where
 
 import Control.Concurrent (yield)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Monad (forM, forM_, unless, when)
 import Data.List (nub, sort)
@@ -61,11 +62,11 @@ spec = describe "the ledger of intentions on every path" $ do
         (countApplied settledBefore + countStale settledBefore) `shouldBe` 3
         -- Tick two is for two more, and is held at the barrier before it fails; two more are accepted for tick three.
         second ← mapM (offer domains) [3, 4]
-        collect ← spawn (stepTick domains)
-        awaitEntered fx "failing tick"
-        third ← mapM (offer domains) [5, 6]
-        releaseGate fx "failing tick"
-        outcome ← collect
+        (outcome, third) ← do
+          sideResult ← newEmptyMVar
+          o ← driving domains (do awaitEntered fx "failing tick"; offered ← mapM (offer domains) [5, 6]; putMVar sideResult offered; releaseGate fx "failing tick")
+          offered ← readMVar sideResult
+          pure (o, offered)
         snapshot ← case outcome of
           TickFailed found → pure found
           other → fail ("expected the session to fail, found " <> show other)
@@ -131,16 +132,22 @@ spec = describe "the ledger of intentions on every path" $ do
     it "discards the held tick's intentions and the open ones when a stop is requested while a segment is held, and commits nothing" $
       withSample (\config → config {configInput = [], configGameplaySource = luaLines ["function update(self, dt) fx.hold('held') staging.finish() end"]}) $ \fx _ domains → withReleased fx ["held"] $ do
         sealed ← mapM (offer domains) [0, 1]
-        collect ← spawn (stepTick domains)
-        awaitEntered fx "held"
-        open ← mapM (offer domains) [2, 3]
-        -- The stop is asked for from this thread and finalized on the application thread: the segment is not
-        -- preempted, so the stop has begun when admission has closed and it has not finished.
-        requestStop domains
-        waitFor (awaitClosed domains)
-        revisionNow domains `shouldReturn` 0
-        releaseGate fx "held"
-        collect >>= (`shouldSatisfy` isHalted)
+        openResult ← newEmptyMVar
+        outcome ←
+          driving
+            domains
+            ( do
+                awaitEntered fx "held"
+                putMVar openResult =<< mapM (offer domains) [2, 3]
+                -- The stop is asked for from a thread of its own and finalized on the application thread: the segment is
+                -- not preempted, so the stop has begun when admission has closed and it has not finished.
+                requestStop domains
+                waitFor (awaitClosed domains)
+                revisionNow domains `shouldReturn` 0
+                releaseGate fx "held"
+            )
+        open ← readMVar openResult
+        outcome `shouldSatisfy` isHalted
         _ ← stopSession domains
         (snapshot, revision) ← snapshotNow domains
         (revision, snapTick snapshot, snapStatus snapshot) `shouldBe` (1, 0, Stopped)
@@ -182,16 +189,19 @@ spec = describe "the ledger of intentions on every path" $ do
               }
         )
         $ \fx ui domains → withReleased fx ["held"] $ do
-          collect ← spawn (stepTick domains)
-          awaitEntered fx "held"
-          -- Tick one holds nothing (no intention was accepted before it began); the UI floods tick two's places.
-          tickUi domains ui
-          awaitUpdates domains 1
-          fxLines fx `shouldReturn` ["flood 4 36"]
-          counts ← readTVarIO (sharedCounts (domainsShared domains))
-          (countAccepted counts, countFull counts, countFullPlaces counts) `shouldBe` (4, 36, 36)
-          releaseGate fx "held"
-          _ ← collect
+          _ ←
+            driving
+              domains
+              ( do
+                  awaitEntered fx "held"
+                  -- Tick one holds nothing (no intention was accepted before it began); the UI floods tick two's places.
+                  tickUi domains ui
+                  awaitUpdates domains 1
+                  fxLines fx `shouldReturn` ["flood 4 36"]
+                  counts ← readTVarIO (sharedCounts (domainsShared domains))
+                  (countAccepted counts, countFull counts, countFullPlaces counts) `shouldBe` (4, 36, 36)
+                  releaseGate fx "held"
+              )
           pure ()
 
     it "adds up when several producers on threads of their own offer while ticks run: the counts are the offers, and nothing accepted is lost or duplicated" $

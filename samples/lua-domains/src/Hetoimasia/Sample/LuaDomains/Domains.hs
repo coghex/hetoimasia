@@ -210,9 +210,8 @@ import Hetoimasia.Sample.LuaDomains.Shared
   , publishInitial
   , publisherOf
   , readerOf
-  , serialWait
+  , supervisedWait
   , taskAdmissionsDrained
-  , takesTasks
   )
 import Hetoimasia.Sample.LuaDomains.Snapshot
   ( GameSnapshot (..)
@@ -378,6 +377,9 @@ data DomainsConfig = DomainsConfig
     -- ^ Test-only: run by a control's assignment before it returns, in the interval before the engine admits it.
   , configTaskHook ∷ !(IO ())
     -- ^ Test-only: run inside a task admission, after the session was found to take tasks and before the owner is asked.
+  , configAcceptedHook ∷ !(IO ())
+    -- ^ Test-only: run inside a task admission after the owner has accepted the task and before the session tracks it. The
+    -- interval is not interruptible in production, so an example that holds it must not cancel the admitter.
   , configHandoffHook ∷ !(IO ())
     -- ^ Test-only: run inside a task admission after the owner has accepted the task and the session tracks it, in the
     -- interval before the admission returns.
@@ -425,6 +427,7 @@ defaultConfig =
     , configUiSpec = id
     , configAssignHook = pure ()
     , configTaskHook = pure ()
+    , configAcceptedHook = pure ()
     , configHandoffHook = pure ()
     , configStopHook = const (pure ())
     , configEscalateHook = pure ()
@@ -473,6 +476,9 @@ data DomainsDefect
   | -- | 'stopSession' was called from a thread other than the application thread's: the supervised waits that settle the
     -- session are that thread's, so another asks through 'requestStop'.
     StopOffApplicationThread
+  | -- | 'stepTick' was called from a thread other than the application thread's: the waits that decide a tick are the
+    -- supervision handle's, which that thread owns.
+    DriverOffApplicationThread
   | -- | 'runSession' was asked to run a session that is not finite.
     SessionNotFinite
   | -- | A session ended with something pending, or with the ledger out of balance: the counters and
@@ -997,17 +1003,15 @@ latestSnapshot domains = atomically $ do
 behaviorNow ∷ Started → STM (Maybe InstanceSnapshot)
 behaviorNow started = inspectInstance (scheduledEndpoint (startedOwner started)) (startedInstance started)
 
--- | Run one of the sample's supervised waits with no other of them pending (the supervision handle is the
--- application thread's, and a stop may come from another thread).
+-- | Run one of the sample's supervised waits, which are the application thread's and one at a time.
 serially ∷ Domains → IO a → IO a
-serially domains = serialWait (domainsShared domains)
+serially domains = supervisedWait (domainsShared domains)
 
 -- | Wait for the gameplay owner to have accounted for every grant accepted so far and for the instance endings they
 -- caused ('awaitScheduledAccounting', D-47): a failed instance has ended, its @shutdown@ and the release of what it
 -- held included, and the application's escalation has been called and has returned. It takes no task, ticket or slot,
 -- so it works whatever the session holds. 'AccountingOwnerEnded' says the owner ended first and accounted for nothing:
--- never a completion. It is one of the supervised waits, so it is taken in turn ('serially'), and a stop from another
--- thread does not wait beside the driver.
+-- never a completion. It is one of the supervised waits, which only the application thread makes ('serially').
 awaitAccounting ∷ Domains → IO AccountingWait
 awaitAccounting domains =
   serially domains (awaitScheduledAccounting (domainsControl domains) (startedOwner (domainsGameplay domains)))
@@ -1037,6 +1041,7 @@ admitGameplayTask domains request = mask_ $ do
           admission ← admitScheduledTask (scheduledEndpoint (startedOwner (domainsGameplay domains))) request
           case admission of
             TaskAccepted _ ticket → do
+              configAcceptedHook config
               watched ← atomically (handOffTask shared (maybe "task" id (requestName request)) ticket)
               startWatcher domains watched
             _ → pure ()
@@ -1083,14 +1088,13 @@ faultOf = \case
   _ → Nothing
 
 -- | Tell the session of the settlement of each task that has one, which the driver does before it decides a tick (a
--- watcher may not have run yet). Once the session takes no more tasks, the admissions that began before wait to be
--- registered first, so none is missed.
+-- watcher may not have run yet). The admissions in flight are waited for first, however the session stands: a task the
+-- owner accepted runs, and can fault, before its admitter has registered it, so a decision made without waiting would
+-- see neither the task nor its fault. An admission waits for nothing, so this is brief.
 watchTasks ∷ Domains → IO ()
 watchTasks domains = do
   let shared = domainsShared domains
-  atomically $ do
-    open ← takesTasks shared
-    unless open (taskAdmissionsDrained shared)
+  atomically (taskAdmissionsDrained shared)
   held ← readTVarIO (sharedTasks shared)
   forM_ held $ \watched → pollTask (watchedTicket watched) >>= mapM_ (tellTask domains watched)
 
@@ -1161,9 +1165,12 @@ haltedNow shared = do
 uiServing ∷ Domains → STM Bool
 uiServing domains = maybe False ((== Active) . snapshotPhase) <$> behaviorNow (domainsUi domains)
 
--- | Run one gameplay tick as the module header describes.
+-- | Run one gameplay tick as the module header describes, on the application thread: the waits that decide it are the
+-- supervision handle's, which that thread owns, so another thread's call raises 'DriverOffApplicationThread'.
 stepTick ∷ Domains → IO TickOutcome
 stepTick domains = do
+  here ← myThreadId
+  when (here /= domainsHome domains) (throwIO DriverOffApplicationThread)
   let shared = domainsShared domains
       config = domainsConfig domains
       gameplay = domainsGameplay domains
@@ -1489,7 +1496,7 @@ finishLive domains = do
 -- failure of the settlement has been told, and last the session's tasks. The engine's reservations for control leave one
 -- for each instance, so the stop is admitted whatever the UI holds. The caller has closed admission: an admission that
 -- began before is finished and its task asked to stop before the instances are awaited. Everything here is idempotent, and
--- every supervised wait is taken in turn ('serially').
+-- every supervised wait is the application thread's ('serially').
 settleGameplay ∷ Domains → IO ()
 settleGameplay domains = do
   let started = domainsGameplay domains : domainsExtras domains

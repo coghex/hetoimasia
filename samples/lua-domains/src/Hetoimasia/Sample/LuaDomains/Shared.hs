@@ -31,8 +31,8 @@
 --   the task off the registry, so a settlement is told once however many of them learn it.
 -- * 'sharedStopsIssued', 'sharedOnFailure': the gameplay owner's escalation callback, the task watchers, the driver
 --   and whoever asks for the stop; asking is claimed and recorded without waiting.
--- * 'sharedWaitLock', 'sharedWaitDepth', 'sharedWaitThreads': whoever makes one of the supervised waits the sample
---   makes (the application thread), one at a time.
+-- * 'sharedWaitDepth', 'sharedWaitThreads': the application thread, which makes the supervised waits the sample
+--   makes, one at a time.
 --
 -- The UI never reads 'sharedCommitted' or 'sharedTick'; gameplay never reads 'sharedView' or the
 -- snapshot. Each owner's namespaces are the only way its VM reaches any of this
@@ -78,7 +78,7 @@ module Hetoimasia.Sample.LuaDomains.Shared
   , takesTasks
   , handOffTask
   , tasksHeld
-  , serialWait
+  , supervisedWait
     -- * Workspaces
   , Workspace (..)
   , openWorkspace
@@ -89,7 +89,6 @@ module Hetoimasia.Sample.LuaDomains.Shared
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
-import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Data.IORef (IORef, newIORef)
 import Control.Concurrent.STM
   ( STM
@@ -199,8 +198,6 @@ data Shared = Shared
     -- ^ How many of those waits are pending now, and the most there have been at once: never more than one.
   , sharedWaitThreads ∷ !(TVar (Set ThreadId))
     -- ^ The threads that have made one of those waits.
-  , sharedWaitLock ∷ !(MVar ())
-    -- ^ Held by whoever has a supervised wait pending, so at most one is.
   , sharedOnFailure ∷ !(IORef (IO ()))
     -- ^ What the owner's escalation callback and a task's watcher run after they tell the session of a failure:
     -- asking every instance and task to stop, which never waits. Set once the session's owners exist.
@@ -243,7 +240,6 @@ newShared setup = do
     <*> newTVarIO 0
     <*> newTVarIO (0, 0)
     <*> newTVarIO Set.empty
-    <*> newMVar ()
     <*> newIORef (pure ())
     <*> pure (setupAssignHook setup)
     <*> pure (setupScenario setup)
@@ -487,21 +483,20 @@ handOffTask shared name ticket = do
   modifyTVar' (sharedTasks shared) (<> [watched])
   pure watched
 
--- | Run one of the supervised waits the sample makes with no other of them pending, and note which thread made it. The
--- supervision handle is the application thread's, and the driver's waits and the stop's are made on it, one at a time;
--- the lock is what makes that true of a session whose driver runs on a thread of its own. Waiting for the turn is
--- interruptible, and the turn is given back however the wait ends.
-serialWait ∷ Shared → IO a → IO a
-serialWait shared wait = do
+-- | Run one of the supervised waits the sample makes, and note which thread made it and how many were pending. The
+-- supervision handle is the application thread's: the driver ('Hetoimasia.Sample.LuaDomains.Domains.stepTick') and the
+-- stop ('Hetoimasia.Sample.LuaDomains.Domains.stopSession') refuse any other thread, so the waits are that thread's and
+-- one at a time (none is nested in another), and what is noted is evidence of it.
+supervisedWait ∷ Shared → IO a → IO a
+supervisedWait shared wait = do
   here ← myThreadId
-  withMVar (sharedWaitLock shared) $ \_ →
-    bracket_
-      ( atomically $ do
-          modifyTVar' (sharedWaitDepth shared) (\(now, most) → (now + 1, max most (now + 1)))
-          modifyTVar' (sharedWaitThreads shared) (Set.insert here)
-      )
-      (atomically (modifyTVar' (sharedWaitDepth shared) (\(now, most) → (now - 1, most))))
-      wait
+  bracket_
+    ( atomically $ do
+        modifyTVar' (sharedWaitDepth shared) (\(now, most) → (now + 1, max most (now + 1)))
+        modifyTVar' (sharedWaitThreads shared) (Set.insert here)
+    )
+    (atomically (modifyTVar' (sharedWaitDepth shared) (\(now, most) → (now - 1, most))))
+    wait
 
 -- Gameplay ---------------------------------------------------------------------
 

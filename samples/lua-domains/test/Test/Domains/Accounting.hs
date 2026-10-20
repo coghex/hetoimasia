@@ -6,7 +6,7 @@
 module Test.Domains.Accounting (spec) where
 
 import Control.Concurrent (forkIO, killThread, myThreadId, yield)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, tryReadMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Concurrent.STM (readTVar, readTVarIO, retry)
 import Control.Exception (SomeException, finally, fromException, throwIO, try)
 import Control.Monad (forM, forM_, replicateM_, void, when)
@@ -19,7 +19,7 @@ import Data.Text (Text)
 import Hetoimasia.Sample.LuaDomains
   ( Bounds (boundSessionTasks)
   , Domains (domainsGameplay, domainsShared)
-  , DomainsDefect (StopOffApplicationThread)
+  , DomainsDefect (DriverOffApplicationThread, StopOffApplicationThread)
   , DomainsConfig (..)
   , Evidence (evidenceGameplay)
   , Extension (Extension)
@@ -116,15 +116,19 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
             }
           $ \domains → withReleased fx ["escalating"] $ do
             lastGood ← readTVarIO (sharedCommitted (domainsShared domains))
-            collect ← spawn (stepTick domains)
-            awaitEntered fx "escalating"
-            -- The tick has completed, as the scheduler counts: what is pending is the owner's accounting of the failure.
-            waitFor (ticksOutstanding (scheduledEndpoint (startedOwner (domainsGameplay domains))) >>= \outstanding → when (outstanding > 0) retry)
-            replicateM_ 2000 yield
-            revisionNow domains `shouldReturn` 0
-            readTVarIO (sharedCommitted (domainsShared domains)) `shouldReturn` lastGood
-            releaseGate fx "escalating"
-            snapshot ← collect >>= expectFailed
+            snapshot ←
+              driving
+                domains
+                ( do
+                    awaitEntered fx "escalating"
+                    -- The tick has completed, as the scheduler counts: what is pending is the owner's accounting of the failure.
+                    waitFor (ticksOutstanding (scheduledEndpoint (startedOwner (domainsGameplay domains))) >>= \outstanding → when (outstanding > 0) retry)
+                    replicateM_ 2000 yield
+                    revisionNow domains `shouldReturn` 0
+                    readTVarIO (sharedCommitted (domainsShared domains)) `shouldReturn` lastGood
+                    releaseGate fx "escalating"
+                )
+                >>= expectFailed
             snapTick snapshot `shouldBe` 0
             fmap (failKind . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "refused wait"
             revisionNow domains `shouldReturn` 1
@@ -168,29 +172,11 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
             most `shouldBe` 1
             readTVarIO (sharedWaitThreads (domainsShared domains)) `shouldReturn` Set.singleton home
 
-    it "are taken in turn when the driver runs on a thread of its own: the stop's wait does not begin beside the driver's" $ do
-      fx ← newFx
-      ui ← newFakeUi
-      withBoundary $ \control →
-        withDomains
-          control
-          (sampleConfig fx ui)
-            { configInput = []
-            , configGameplaySource = gameplayWith ["function update(self, dt) error('update failed') end"]
-            , configEscalateHook = holdAt fx "escalating"
-            }
-          $ \domains → withReleased fx ["escalating"] $ do
-            collect ← spawn (stepTick domains)
-            awaitEntered fx "escalating"
-            _ ← alongside (waitFor (awaitClosed domains) >> replicateM_ 2000 yield >> releaseGate fx "escalating") (stopSession domains)
-            _ ← collect
-            (_, most) ← readTVarIO (sharedWaitDepth (domainsShared domains))
-            most `shouldBe` 1
-
-    it "are refused to a stop from another thread, which asks through requestStop and finalizes nothing" $
+    it "are refused to the driver and to a stop from another thread, which ask through requestStop and finalize nothing" $
       withSample (\config → config {configInput = []}) $ \_ _ domains → do
-        outcome ← spawn (stopSession domains)
-        try @SomeException outcome >>= (`shouldSatisfy` \case Left failure → fromException failure == Just StopOffApplicationThread; Right _ → False)
+        let refused wanted outcome = try @SomeException outcome >>= (`shouldSatisfy` \case Left failure → fromException failure == Just wanted; Right _ → False)
+        spawn (stopSession domains) >>= refused StopOffApplicationThread
+        spawn (stepTick domains) >>= refused DriverOffApplicationThread
         requestStop domains
         revisionNow domains `shouldReturn` 0
         _ ← stopSession domains
@@ -245,6 +231,41 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
             (snapshot, _) ← snapshotNow domains
             snapStatus snapshot `shouldBe` Stopped
 
+  describe "a tick's decision and an admission in flight" $
+    it "waits for a task the owner accepted and its admitter has not registered: the task faults in the tick, and the tick is not committed" $ do
+      fx ← newFx
+      ui ← newFakeUi
+      withBoundary $ \control →
+        withDomains
+          control
+          (withWait (sampleConfig fx ui))
+            { configInput = []
+            , configGameplaySource = gameplayWith ["function update(self, dt) fx.hold('held') staging.finish() end", "function task_fails() error('task failed') end"]
+            , configGameplayEntries = [EntryPoint "task_fails" Required [] []]
+            , configAcceptedHook = holdAt fx "accepted"
+            }
+          $ \domains → withReleased fx ["held", "accepted"] $ do
+            admitter ← spawn (admitGameplayTask domains (task "faulting task" "task_fails"))
+            outcome ←
+              driving
+                domains
+                ( do
+                    -- The tick is in its segment; the owner accepts the task, whose admitter is held before it registers it.
+                    awaitEntered fx "held"
+                    awaitEntered fx "accepted"
+                    -- The segment ends, the task runs and faults in the tick, and the tick completes with nothing registered: the
+                    -- driver waits for the admission before it decides, so nothing is committed or published.
+                    releaseGate fx "held"
+                    waitFor (ticksOutstanding (scheduledEndpoint (startedOwner (domainsGameplay domains))) >>= \outstanding → when (outstanding > 0) retry)
+                    replicateM_ 2000 yield
+                    revisionNow domains `shouldReturn` 0
+                    releaseGate fx "accepted"
+                )
+            _ ← admitter
+            snapshot ← expectFailed outcome
+            fmap (failWho . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "faulting task"
+            snapTick snapshot `shouldBe` 0
+
   describe "an admission cancelled" $ do
     it "before the owner is asked leaves nothing behind: nothing is accepted or counted, and the next admission and a stop go on" $ do
       fx ← newFx
@@ -268,7 +289,7 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
             heldTasks domains `shouldReturn` 0
             readTVarIO (sharedTaskAdmitting shared) `shouldReturn` 0
             releaseGate fx "before the owner"
-            admitGameplayTask domains (task "next" "task_runs") >>= (`shouldSatisfy` accepted)
+            admitGameplayTask domains (task "next" "task_waits") >>= (`shouldSatisfy` accepted)
             heldTasks domains `shouldReturn` 1
             stopBounded domains
             heldTasks domains `shouldReturn` 0
@@ -357,11 +378,9 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
             , configPublishHook = \point → when (point == BeforeClaim) (holdAt fx "before the claim")
             }
           $ \domains → withReleased fx ["before the claim"] $ do
-            ended ← newEmptyMVar
-            driver ← forkIO (try @SomeException (stepTick domains) >>= putMVar ended)
-            awaitEntered fx "before the claim"
-            killThread driver
-            _ ← generous (readMVar ended)
+            -- The driver is the application thread's own call, cancelled where it is held.
+            driver ← cancelWhen (awaitEntered fx "before the claim") (stepTick domains)
+            driver `shouldSatisfy` isNothing
             releaseGate fx "before the claim"
             revisionNow domains `shouldReturn` 0
             stopBounded domains
@@ -380,11 +399,8 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
             , configPublishHook = \point → when (point == AfterClaim) (holdAt fx "claimed")
             }
           $ \domains → withReleased fx ["claimed"] $ do
-            ended ← newEmptyMVar
-            driver ← forkIO (try @SomeException (stepTick domains) >>= putMVar ended)
-            awaitEntered fx "claimed"
-            killThread driver
-            _ ← generous (readMVar ended)
+            driver ← cancelWhen (awaitEntered fx "claimed") (stepTick domains)
+            driver `shouldSatisfy` isNothing
             releaseGate fx "claimed"
             stopBounded domains
             evidence ← cleanupEvidence domains
@@ -419,10 +435,14 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
               }
         )
         $ \_ _ domains → do
-          collect ← spawn (stepTick domains)
-          waitFor (ticksOutstanding (scheduledEndpoint (startedOwner (domainsGameplay domains))) >>= \outstanding → when (outstanding < 1) retry)
-          _ ← admitGameplayTask domains (task "faulting task" "task_fails")
-          snapshot ← collect >>= expectFailed
+          snapshot ←
+            driving
+              domains
+              ( do
+                  waitFor (ticksOutstanding (scheduledEndpoint (startedOwner (domainsGameplay domains))) >>= \outstanding → when (outstanding < 1) retry)
+                  void (admitGameplayTask domains (task "faulting task" "task_fails"))
+              )
+              >>= expectFailed
           fmap (failWho . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "faulting task"
     forM_ ["a concurrent stop request", "a stop after the driver was cancelled"] $ \how →
       it ("has " <> how <> " ask an instance that wakes on the tick and stays ready after yielding to stop, though the driver is waiting for the tick it keeps outstanding") $ do
@@ -438,20 +458,28 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
               , configGameplayModules = [extraModule [ready]]
               }
             $ \domains → do
-              ended ← newEmptyMVar
-              driver ← forkIO (try @SomeException (stepTick domains) >>= putMVar ended)
-              -- The peer has woken on the tick and keeps it outstanding: the driver is in its wait for the tick, and
-              -- nothing ends the wait by itself.
-              waitFor (ticksOutstanding (scheduledEndpoint (startedOwner (domainsGameplay domains))) >>= \outstanding → when (outstanding < 1) retry)
-              replicateM_ 2000 yield
-              tryReadMVar ended >>= (`shouldSatisfy` isNothing)
+              let outstanding = ticksOutstanding (scheduledEndpoint (startedOwner (domainsGameplay domains)))
+              finished ← newIORef False
               if how == "a stop after the driver was cancelled"
-                then killThread driver >> void (generous (readMVar ended)) >> void (generous (stopSession domains))
+                then do
+                  -- The driver is the application thread's own call, cancelled while it waits for the tick the peer keeps outstanding.
+                  driver ← cancelWhen (waitFor (outstanding >>= \held → when (held < 1) retry) >> replicateM_ 2000 yield) (stepTick domains)
+                  driver `shouldSatisfy` isNothing
+                  void (generous (stopSession domains))
                 else do
-                  requestStop domains
-                  outcome ← generous (readMVar ended)
+                  outcome ←
+                    alongside
+                      ( do
+                          -- The peer has woken on the tick and keeps it outstanding: the driver is in its wait for the tick, and
+                          -- nothing ends the wait by itself.
+                          waitFor (outstanding >>= \held → when (held < 1) retry)
+                          replicateM_ 2000 yield
+                          readIORef finished `shouldReturn` False
+                          requestStop domains
+                      )
+                      (stepTick domains <* writeIORef finished True)
                   -- The driver's tick was halted by the stop, which freed it, and committed nothing.
-                  either (const Nothing) Just outcome `shouldSatisfy` \case Just TickHalted → True; _ → False
+                  outcome `shouldSatisfy` \case TickHalted → True; _ → False
                   void (generous (stopSession domains))
               (snapshot, _) ← snapshotNow domains
               (snapTick snapshot, snapStatus snapshot) `shouldBe` (0, Stopped)
@@ -470,12 +498,7 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
             , configGameplayModules = [extraModule ["function run(self) sched.wait_ticks(1000000) end", "function shutdown(self, reason) fx.hold('peer shutdown') fx.record('peer shut down') end"]]
             }
           $ \domains → withReleased fx ["peer shutdown"] $ do
-            collect ← spawn (stepTick domains)
-            awaitEntered fx "peer shutdown"
-            replicateM_ 2000 yield
-            revisionNow domains `shouldReturn` 0
-            releaseGate fx "peer shutdown"
-            _ ← collect >>= expectFailed
+            _ ← driving domains (awaitEntered fx "peer shutdown" >> replicateM_ 2000 yield >> (revisionNow domains `shouldReturn` 0) >> releaseGate fx "peer shutdown") >>= expectFailed
             revisionNow domains `shouldReturn` 1
             fxLines fx >>= (`shouldSatisfy` elem "peer shut down")
 

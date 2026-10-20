@@ -184,12 +184,7 @@ spec = describe "the stop paths and the cleanup evidence" $ do
   it "overlaps a stop requested while a segment is held with the failure that segment then raises: the failure is the session's, published once, nothing is committed, and the ledger balances" $
     withSample (\config → config {configInput = [], configGameplaySource = luaLines ["function update(self, dt) fx.hold('held') error('failed while stopping') end"]}) $ \fx _ domains → withReleased fx ["held"] $ do
       offered ← mapM (offer domains) [0, 1]
-      collect ← spawn (stepTick domains)
-      awaitEntered fx "held"
-      requestStop domains
-      waitFor (awaitClosed domains)
-      releaseGate fx "held"
-      outcome ← collect
+      outcome ← driving domains (awaitEntered fx "held" >> requestStop domains >> waitFor (awaitClosed domains) >> releaseGate fx "held")
       _ ← stopSession domains
       outcome `shouldSatisfy` \case TickFailed _ → True; TickHalted → True; _ → False
       (snapshot, revision) ← snapshotNow domains
@@ -204,12 +199,8 @@ spec = describe "the stop paths and the cleanup evidence" $ do
     ui ← newFakeUi
     withBoundary $ \control →
       withDomains control ((sampleConfig fx ui) {configInput = [], configGameplaySource = luaLines failingHeld, configUiSource = luaLines pausing}) $ \domains → withReleased fx ["held"] $ do
-        collect ← spawn (stepTick domains)
-        awaitEntered fx "held"
         -- Tick one has begun, so the pause is for tick two, which will never run.
-        uiStep domains ui
-        releaseGate fx "held"
-        outcome ← collect
+        outcome ← driving domains (awaitEntered fx "held" >> uiStep domains ui >> releaseGate fx "held")
         outcome `shouldSatisfy` \case TickFailed _ → True; _ → False
         stopServing domains ui
         counts ← readTVarIO (sharedControls (domainsShared domains))

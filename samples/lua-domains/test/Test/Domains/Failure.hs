@@ -8,7 +8,7 @@ import Control.Concurrent.STM (atomically, newTVarIO, readTVar, readTVarIO, retr
 import Control.Exception (SomeException, throwIO, try)
 import Control.Concurrent (yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
-import Control.Monad (forM, forM_, join, replicateM_, void, when)
+import Control.Monad (forM, forM_, join, replicateM_, when)
 import Data.ByteString (ByteString)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (isNothing)
@@ -33,6 +33,7 @@ import Hetoimasia.Sample.LuaDomains
   , cleanupEvidence
   , Bounds (boundSessionTasks)
   , defaultBounds
+  , requestStop
   , stepTick
   , stopSession
   , tellTask
@@ -214,10 +215,7 @@ spec = describe "the failure of the gameplay session" $ do
               }
         )
         $ \fx _ domains → withReleased fx ["both"] $ do
-          collect ← spawn (stepTick domains)
-          awaitEntered fx "both"
-          releaseGate fx "both"
-          snapshot ← collect >>= expectFailed
+          snapshot ← driving domains (awaitEntered fx "both" >> releaseGate fx "both") >>= expectFailed
           -- Both are the session's, in the tick they happened in; the behavior's is first, and the other is counted.
           fmap evidenceLater (evidenceOf snapshot) `shouldBe` Just 1
           held ← sessionFailures <$> readTVarIO (sharedSession (domainsShared domains))
@@ -237,15 +235,19 @@ spec = describe "the failure of the gameplay session" $ do
                 }
         )
         $ \fx _ domains → withReleased fx ["shutdown"] $ do
-          collect ← spawn (stepTick domains)
-          -- The refused wait ended the tick's work and the instance, whose shutdown is held: the tick has
-          -- completed, and the failure has not yet settled.
-          awaitEntered fx "shutdown"
-          (held, revision) ← snapshotNow domains
-          (snapTick held, revision, evidenceOf held) `shouldBe` (0, 0, Nothing)
-          readTVarIO (sharedCommitted (domainsShared domains)) `shouldReturn` snapWorld held
-          releaseGate fx "shutdown"
-          snapshot ← collect >>= expectFailed
+          snapshot ←
+            driving
+              domains
+              ( do
+                  -- The refused wait ended the tick's work and the instance, whose shutdown is held: the tick has
+                  -- completed, and the failure has not yet settled.
+                  awaitEntered fx "shutdown"
+                  (held, revision) ← snapshotNow domains
+                  (snapTick held, revision, evidenceOf held) `shouldBe` (0, 0, Nothing)
+                  readTVarIO (sharedCommitted (domainsShared domains)) `shouldReturn` snapWorld held
+                  releaseGate fx "shutdown"
+              )
+              >>= expectFailed
           snapTick snapshot `shouldBe` 0
           fmap (failKind . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "refused wait"
           awaitLine fx "shutdown failed"
@@ -308,13 +310,11 @@ spec = describe "the failure of the gameplay session" $ do
           control
           (sampleConfig fx ui) {configInput = [], configGameplaySource = gameplayWith ["function update(self, dt) error('update failed') end"], configPublishHook = \point → when (point == AfterClaim) (holdAt fx "claimed")}
           $ \domains → withReleased fx ["claimed"] $ do
-            collect ← spawn (stepTick domains)
-            awaitEntered fx "claimed"
-            -- The stop runs on while the publication is held; it must not retire the owners, and so close the
-            -- publisher, under it. It is the application thread's, so the gate is opened from a thread of its own.
-            _ ← alongside (replicateM_ 2000 yield >> releaseGate fx "claimed") (stopSession domains)
-            outcome ← collect
+            -- A stop asked for while the publication is held waits for nothing and changes nothing: it must not retire the
+            -- owners, and so close the publisher, under it. The finalization is the application thread's, after.
+            outcome ← driving domains (awaitEntered fx "claimed" >> requestStop domains >> replicateM_ 2000 yield >> releaseGate fx "claimed")
             outcome `shouldSatisfy` \case TickFailed _ → True; _ → False
+            _ ← stopSession domains
             (snapshot, revision) ← snapshotNow domains
             revision `shouldBe` 1
             snapStatus snapshot `shouldSatisfy` \case Failed _ → True; _ → False
@@ -394,7 +394,7 @@ spec = describe "the failure of the gameplay session" $ do
         map accepted first `shouldBe` replicate held True
         admitGameplayTask domains (task "waiting task" "task_waits") >>= (`shouldSatisfy` refusedFull)
         -- Every task is suspended and holds its slot; the update has one of its own.
-        spawn (stepTick domains) >>= \collect → collect >>= (`shouldSatisfy` \case TickCommitted _ → True; _ → False)
+        stepTick domains >>= (`shouldSatisfy` \case TickCommitted _ → True; _ → False)
         admitGameplayTask domains (task "waiting task" "task_waits") >>= (`shouldSatisfy` refusedFull)
     it "are settled by a stop however many the owner holds: the stop waits for no slot" $
       withSample tasksConfig $ \_ _ domains → do
@@ -417,7 +417,7 @@ spec = describe "the failure of the gameplay session" $ do
           first ← forM [1 .. limit] $ \_ → admitGameplayTask domains (task "waiting task" "task_waits")
           map accepted first `shouldBe` replicate limit True
           admitGameplayTask domains (task "waiting task" "task_waits") >>= (`shouldSatisfy` refusedFull)
-          spawn (stepTick domains) >>= \collect → collect >>= (`shouldSatisfy` \case TickCommitted _ → True; _ → False)
+          stepTick domains >>= (`shouldSatisfy` \case TickCommitted _ → True; _ → False)
           stopBounded domains
           (snapshot, _) ← snapshotNow domains
           snapStatus snapshot `shouldBe` Stopped
@@ -456,11 +456,7 @@ spec = describe "the failure of the gameplay session" $ do
           withReleased fx ["admitting"] $ do
             admit ← spawn (admitGameplayTask domains (task "looping task" "task_loops"))
             awaitEntered fx "admitting"
-            collect ← spawn (stepTick domains)
-            waitFor (awaitClosed domains)
-            releaseGate fx "admitting"
-            admit >>= (`shouldSatisfy` accepted)
-            _ ← collect >>= expectFailed
+            _ ← driving domains (waitFor (awaitClosed domains) >> releaseGate fx "admitting" >> (admit >>= (`shouldSatisfy` accepted))) >>= expectFailed
             heldTasks domains `shouldReturn` 0
     it "is told of the fault of a task that is running when the stop is asked for: the stop decides the status after it, and the failure is the task's" $ do
       fx ← newFx
@@ -507,7 +503,8 @@ spec = describe "the failure of the gameplay session" $ do
             -- The first fault asks the tasks that have not run to stop, so how many fault is the library's to say; each is
             -- told once, by its watcher, the driver and the stop however they overlap.
             let faulted = length [() | one ← settled, SettledFaulted _ ← [settledOutcome one]]
-            _ ← alongside (void (stepTick domains)) (stopSession domains)
+            _ ← stepTick domains
+            _ ← stopSession domains
             faulted `shouldSatisfy` (>= 1)
             sessionFailureCount <$> readTVarIO (sharedSession (domainsShared domains)) >>= (`shouldBe` faulted)
   describe "a task's settlement is told once, whoever learns it" $

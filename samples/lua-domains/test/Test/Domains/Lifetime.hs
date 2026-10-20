@@ -2,13 +2,13 @@
 -- order in which neither outlives what its bindings borrow, and nothing left live.
 module Test.Domains.Lifetime (spec) where
 
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (forkIO)
 import Control.Concurrent.STM (atomically, readTVarIO, retry)
 import Control.Monad (unless)
 import Control.Exception (IOException, SomeException, displayException, fromException, throwIO, try)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf)
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import System.IO.Error (ioeGetErrorString)
 import Data.ByteString (ByteString)
 import Data.Text (Text)
@@ -90,9 +90,9 @@ spec = describe "the owners' lifetime" $ do
   it "leaves a tick uncommitted and retires cleanly when the driver is cancelled in the middle of it" $
     withSample (\config → config {configGameplaySource = luaLines ["function update(self, dt) fx.hold('gameplay') staging.finish() end"]}) $
       \fx _ domains → withReleased fx ["gameplay"] $ do
-        driver ← forkIO (either (\failure → const () (failure ∷ SomeException)) (const ()) <$> try (stepCommitted domains))
-        awaitEntered fx "gameplay"
-        killThread driver
+        -- The driver is the application thread's own call, cancelled in the middle of the tick.
+        driver ← cancelWhen (awaitEntered fx "gameplay") (stepCommitted domains)
+        driver `shouldSatisfy` isNothing
         -- The held tick published nothing, and the session stays halted at it.
         (committedTick domains, revisionNow domains) `shouldBe'` (0, 0)
         readTVarIO (sharedTick (domainsShared domains)) >>= (`shouldSatisfy` isJust)
