@@ -345,14 +345,22 @@ acknowledgeAccounting control =
       }
 
 -- | Retry until the owner has an acknowledgement to write for a watch whose cut is fixed. What
--- the owner's thread waits for beside its other work: an idle owner has no iteration to end until
--- it is woken, and the wait is for the one that follows.
+-- the owner's thread waits for beside its other work: an idle owner has no boundary to end until
+-- it is woken, and the wait is for the one that follows. One is owed while the cut's generation has
+-- not been reached, and also while the last acknowledgement left a covered ending open that has
+-- been accounted for since (by the owner's settling after its turn, say): that acknowledgement can
+-- no longer answer the wait, and no other work need follow it. It is not owed while a covered
+-- ending is still open, so an owner waiting for a retirement does not spin.
 awaitAcknowledgement ∷ Control → STM ()
 awaitAcknowledgement control = do
   accounting ← readTVar (controlAccounting control)
   case (acWatch accounting, acCut accounting) of
-    (Just _, Just cut) | acGeneration accounting < cutGeneration cut → pure ()
+    (Just _, Just cut)
+      | acGeneration accounting < cutGeneration cut → pure ()
+      | acAckedOpen accounting <= cutEndings cut && not (coveredOpen cut accounting) → pure ()
     _ → retry
+  where
+    coveredOpen cut accounting = any (<= cutEndings cut) (Map.elems (acOpen accounting))
 
 -- | Whether the owner has acknowledged, after the wait's cut was fixed, an accounting in which
 -- every ending the cut covers was accounted for. Retries until then.

@@ -418,7 +418,7 @@ holdingSafely fixture owner body = do
 releasing ∷ SFixture → [Gate] → IO a → IO a
 releasing fixture gates action =
   action `finally` do
-    forM_ ["holder", "hold", "close", "shutdown", "a", "b", "blk", "y", "obs", "r"] (releaseGate fixture)
+    forM_ ["holder", "hold", "close", "shutdown", "a", "b", "blk", "y", "obs", "r", "clk1", "clk2"] (releaseGate fixture)
     forM_ gates openGate
 
 -- Owners ---------------------------------------------------------------------------------

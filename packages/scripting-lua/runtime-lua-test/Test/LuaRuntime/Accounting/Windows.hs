@@ -12,7 +12,7 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, tryReadMVar)
 import Control.Concurrent.STM (atomically, writeTVar)
 import System.Timeout (Timeout)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, try)
-import Control.Monad (forM_, void)
+import Control.Monad (forM_, void, when)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Maybe (isJust)
 import Hetoimasia.Scripting.Lua.Value (Value (VText))
@@ -25,7 +25,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Accounting.Support
 import Test.LuaRuntime.Instance.Lease.Support
 import Test.LuaRuntime.Instance.Support
-import Test.LuaRuntime.Scheduled.Support (awaitDiagnostics, awaitEffect, awaitEntered, awaitIdle, awaitScheduledTerminal, releaseGate)
+import Test.LuaRuntime.Scheduled.Support (awaitDiagnostics, awaitEffect, awaitEntered, awaitIdle, awaitScheduledTerminal, blockOn, defaultSchedulerBounds, releaseGate, setClockHook)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
 import Test.LuaRuntime.Support (Broken (Broken), bounded, brokenIs, expectFatal, optionalPolicy, requiredPolicy, withBoundary)
 
@@ -126,6 +126,45 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         awaitPending waiting
         tickOf base "r" >>= pollInstance >>= (`shouldSatisfy` \case Nothing → True; Just _ → False)
         completeRetirement fixture "async-res"
+        answer waiting >>= (`shouldBe` AccountingComplete)
+        settled ← awaitSettled base "r"
+        resultPhase settled `shouldBe` Failed
+        retireScheduled owner
+
+    it "returns when a retirement completes after the turn's final boundary, before the owner settles what that turn ended" $ bounded $ do
+      fixture ← newLFix 4
+      let base = lfBase fixture
+      withBoundary $ \control runtime → releasing (sf base) [] $ providersFinish fixture $ do
+        let budgeted = defaultSchedulerBounds {boundServiceBudget = Just (nanoseconds 1000000000)}
+            leased = leaseSpec fixture "late" [refusedLeased] leaseConfig requiredPolicy
+        owner ← startWith base runtime leased {scheduledBounds = budgeted}
+        _ ← admit base owner "r" (moduleNamed "refusedleased")
+        awaitPhase base owner "r" Active
+        liveFor fixture "r" 1
+        expectDelivered base owner "r" 1
+        awaitDiagnosticsWaiting owner
+        -- With a service budget the owner reads the clock at a turn's start and again after each boundary
+        -- that follows a segment. Its first read of the grant's turn holds the owner before the segment,
+        -- where the wait is begun; the first read after the ending is parked on the provider is after the
+        -- turn's final boundary, which has acknowledged with the ending open.
+        clockReads ← newIORef (0 ∷ Int)
+        setClockHook (sf base) $ do
+          n ← atomicModifyIORef' clockReads (\held → (held + 1, held + 1))
+          if n == 1
+            then blockOn (sf base) "clk1"
+            else do
+              parked ← (== 1) . summaryPending <$> summaryOf fixture "r"
+              when parked (blockOn (sf base) "clk2")
+        grant owner 1
+        awaitEntered (sf base) "clk1"
+        waiting ← beginWait control owner
+        awaitPending waiting
+        releaseGate (sf base) "clk1"
+        awaitEntered (sf base) "clk2"
+        -- The provider completes after the last boundary that could have taken the retirement, and before
+        -- the owner settles what the turn ended: nothing else is left for the owner to do.
+        completeRetirement fixture "async-res"
+        releaseGate (sf base) "clk2"
         answer waiting >>= (`shouldBe` AccountingComplete)
         settled ← awaitSettled base "r"
         resultPhase settled `shouldBe` Failed
