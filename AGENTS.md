@@ -197,9 +197,8 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
 
 ## Delivery and worktrees
 
-- This empty-repository bootstrap is explicitly authorized in the primary
-  directory. After its initial commit, implementation belongs in isolated
-  worktrees and the primary checkout should stay clean for Kanban integration.
+- Implement in isolated worktrees. Keep the primary checkout clean for Kanban
+  integration.
 - Use the installed Kanban plugin skills for issue drafting, readiness review,
   solving, PR review, and the user-selected merge workflow. Resolve the actual
   target repository; never mistake `~/work/kanban` for this project's tracker.
