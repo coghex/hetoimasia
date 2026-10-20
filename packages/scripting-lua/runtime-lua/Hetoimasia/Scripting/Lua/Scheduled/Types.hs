@@ -307,18 +307,18 @@ unwatchAccounting control =
 -- if that finishes every grant a watch captured, latch it, fixing which endings are its own:
 -- those begun by now. Writes nothing when neither changed.
 --
--- The flag says whether the owner holds cleanup evidence of its own, beside what the
--- scheduler retains: either will end the owner as a failure, so the accounting is not a
--- success from here on.
-sealAccounting ∷ Control → Bool → STM ()
-sealAccounting control held = do
+-- Cleanup evidence the owner holds ends it as a failure, so the accounting is not a success
+-- from here on: the scheduler's own is read here, and the owner's other lists publish
+-- 'accountingFailed' as each failure is kept ('Hetoimasia.Scripting.Lua.Cleanup').
+sealAccounting ∷ Control → STM ()
+sealAccounting control = do
   finished ← grantsFinished (controlScheduler control)
   retained ← retainsEvidence (controlScheduler control)
   accounting ← readTVar (controlAccounting control)
   let latched = case (acWatch accounting, acCut accounting) of
         (Just captured, Nothing) | finished >= captured → Just (acBegun accounting)
         _ → acCut accounting
-      tainted = acTainted accounting || held || retained
+      tainted = acTainted accounting || retained
   when (finished /= acSealed accounting || latched /= acCut accounting || tainted /= acTainted accounting) $
     writeTVar (controlAccounting control) accounting {acSealed = finished, acCut = latched, acTainted = tainted}
 
@@ -339,15 +339,14 @@ endingBegun control instance' =
     let number = acBegun accounting + 1
      in accounting {acBegun = number, acOpen = Map.insert instance' number (acOpen accounting)}
 
--- | An instance's ending has been accounted for. The flag says whether the owner holds
--- cleanup evidence of its own, as for 'sealAccounting'.
-endingAccounted ∷ Control → Word64 → Bool → STM ()
-endingAccounted control instance' held = do
+-- | An instance's ending has been accounted for.
+endingAccounted ∷ Control → Word64 → STM ()
+endingAccounted control instance' = do
   retained ← retainsEvidence (controlScheduler control)
   modifyTVar' (controlAccounting control) $ \accounting →
     accounting
       { acOpen = Map.delete instance' (acOpen accounting)
-      , acTainted = acTainted accounting || held || retained
+      , acTainted = acTainted accounting || retained
       }
 
 -- | Where an owner's tasks are admitted. Any thread may hold and use it.

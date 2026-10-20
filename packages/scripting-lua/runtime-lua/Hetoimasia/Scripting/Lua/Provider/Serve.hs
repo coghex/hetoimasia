@@ -52,10 +52,10 @@ import Control.Exception
   , uninterruptibleMask_
   )
 import Control.Monad (forM, unless, when)
-import Data.IORef (IORef, modifyIORef')
 import Data.Text (Text)
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Resource (composeCleanup)
+import Hetoimasia.Scripting.Lua.Cleanup (Evidence, retainCleanup)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Request (CancelCause (CancelledByTaskInvalidation))
 import Hetoimasia.Scripting.Lua.Retention (guarded)
 import Hetoimasia.Scripting.Lua.Provider.Events (nextStagedAfter)
@@ -86,11 +86,11 @@ tellProviders service = mask_ $ do
 
 -- | Raise the first of several failures, and keep each of the others whole as cleanup
 -- evidence under this label, so that none is dropped.
-raiseFirst ∷ IORef [(Text, ExceptionWithContext SomeException)] → Text → [ExceptionWithContext SomeException] → IO ()
+raiseFirst ∷ Evidence (Text, ExceptionWithContext SomeException) → Text → [ExceptionWithContext SomeException] → IO ()
 raiseFirst evidence label = \case
   [] → pure ()
   first : others → do
-    modifyIORef' evidence (<> [(label, other) | other ← others])
+    retainCleanup evidence [(label, other) | other ← others]
     rethrowIO first
 
 -- | Raise the first of several failures with the others attached to it as cleanup evidence,
@@ -172,7 +172,7 @@ providerBoundary
   ∷ ProviderState
   → Scheduler v
   → Bool
-  → IORef [(Text, ExceptionWithContext SomeException)]
+  → Evidence (Text, ExceptionWithContext SomeException)
   → IO ()
   → IO Bool
 providerBoundary service scheduler hasInstances evidence onCleanupFailure = mask_ $ do
@@ -184,7 +184,7 @@ providerBoundary service scheduler hasInstances evidence onCleanupFailure = mask
   told ← tellProviders service
   cleanup ← serviceProvider service
   unless (null cleanup) $ do
-    modifyIORef' evidence (<> cleanup)
+    retainCleanup evidence cleanup
     onCleanupFailure
   served ← if hasInstances then pure False else serveWatchOnly service scheduler
   woke ← atomically (ticksWakeSettled (psTicks service) (settledNumber service))

@@ -79,6 +79,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Resource (composeCleanup, withScoped)
 import Hetoimasia.Foundation.Resource.OwnedCollection (allocOwnedCollection)
+import Hetoimasia.Scripting.Lua.Cleanup (Evidence, newEvidence, retainCleanup, retainedCleanup)
 import Hetoimasia.Scripting.Lua.Internal.Boundary (moduleChunk)
 import Hetoimasia.Scripting.Lua.Internal.Owner (ownedInternalVm)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Failure (ReasonCode (ScriptFault, ValidationFault), RecoverySafety (RecoverySafe), failureReason)
@@ -195,8 +196,8 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
   -- (a script's own failure that was raised with the failures of closing its
   -- coroutine). Either is fatal evidence, so the first of them ends the owner:
   -- nothing here accumulates for as long as the owner serves.
-  kept ← newIORef []
-  extra ← newIORef []
+  kept ← newEvidence (accountingFailed control)
+  extra ← newEvidence (accountingFailed control)
   let host =
         TaskHost
           { hostRun = runSegment control observe owned identity label handlesRef tasks extra instanceRef
@@ -303,8 +304,8 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
         Just (Right ended) → ended
         Just (Left failure) → ([failure], [])
         Nothing → ([], [])
-  earlier ← readIORef kept
-  others ← readIORef extra
+  earlier ← retainedCleanup kept
+  others ← retainedCleanup extra
   let closeFailures =
         Map.toList . Map.fromListWith (\_ first → first) $
           earlier <> maybe [] stopCloseFailures report <> concat swept
@@ -371,17 +372,15 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
             -- it ends when this returns, and it is the point an accounting wait's watch is
             -- latched at, once its grants have finished. The endings begun by now are the
             -- wait's own, whatever began them, and an ending begun later is not.
-            unless again $ do
-              held ← (||) <$> (not . null <$> readIORef kept) <*> (not . null <$> readIORef extra)
-              atomically (sealAccounting control held)
+            unless again (atomically (sealAccounting control))
             pure again
       report ← serviceTurnWith atBoundary scheduler host
       forM_ instances settleEnded
       mask_ $ do
-        modifyIORef' kept (<> turnCloseFailures report)
+        retainCleanup kept (turnCloseFailures report)
         void (atomically (sweepForgotten control))
       halt ← atomically stopping
-      retained ← (||) <$> (not . null <$> readIORef kept) <*> (not . null <$> readIORef extra)
+      retained ← (||) <$> (not . null <$> retainedCleanup kept) <*> (not . null <$> retainedCleanup extra)
       if halt || retained
         then pure (retained && not halt)
         else loop host kept extra instanceRef
@@ -426,7 +425,7 @@ runSegment
   → Text
   → IORef (Map ModuleRef ModuleHandle)
   → IORef (Map TaskId Task)
-  → IORef [(Text, ExceptionWithContext SomeException)]
+  → Evidence (Text, ExceptionWithContext SomeException)
   → IORef (Maybe InstanceHost)
   → TaskRun Cursor
   → IO (SegmentReport Cursor)

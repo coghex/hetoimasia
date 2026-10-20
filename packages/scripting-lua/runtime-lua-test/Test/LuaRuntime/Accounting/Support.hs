@@ -29,6 +29,7 @@ module Test.LuaRuntime.Accounting.Support
   , retiresOnStop
   , retiresThenFails
   , retiresThenFailsLast
+  , drainsBroken
   , stabilize
   , refusedLeased
   , overflowLeased
@@ -37,21 +38,30 @@ module Test.LuaRuntime.Accounting.Support
   , windowTasks
   , windowTasksRef
   , closesGated
+  , refusedClosing'
   , blockAfterTicks
     -- * Grants
   , grant
     -- * Holding the owner
   , holdingSafely
   , releasing
+    -- * Owners
+  , startPlain
+    -- * Examples that expect the wait to end with a failure
+  , failingWait
+  , retainedFailure
   ) where
 
 import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, yield)
 import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (ThreadBlocked), threadStatus)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar, tryReadMVar)
-import Control.Exception (SomeException, finally, mask_, onException, try)
+import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
+import System.Timeout (Timeout)
+import Test.LuaRuntime.Support (withBoundary)
+import Control.Exception (SomeException, finally, fromException, mask_, onException, throwIO, try)
 import Control.Monad (forM_)
 import Data.Word (Word64)
-import Hetoimasia.Runtime.Supervision (RuntimeControl)
+import Hetoimasia.Runtime.Supervision (RuntimeControl, WorkerPolicy)
 import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value
@@ -59,7 +69,7 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Test.LuaRuntime.Instance.Support (hooksModule, record)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Scheduled.Support (SFixture, admitTask', awaitEntered, releaseGate, request)
+import Test.LuaRuntime.Scheduled.Support (SFixture, admitTask', awaitEntered, releaseGate, request, scheduled, startScheduled)
 
 -- A wait on a thread of its own -----------------------------------------------------
 
@@ -225,6 +235,19 @@ retiresOnStop =
     , "end"
     ]
 
+-- | Holds a resource whose release the example breaks, which its drain at the end of the instance
+-- raises.
+drainsBroken ∷ ModuleSource
+drainsBroken =
+  hooksModule
+    "drainsbroken"
+    [ "function init(self, api)"
+    , "  self.id = inst.next()"
+    , "  self.h = lease.open('drain-res')"
+    , "  api.connect('tick', function(self, event) end)"
+    , "end"
+    ]
+
 -- | Holds an asynchronously retired resource named for it, and fails when it is delivered an event,
 -- which leaves the resource pending and the application to be told.
 retiresThenFails ∷ ModuleSource
@@ -315,13 +338,17 @@ windowTasks =
         , "  fx.block(name)"
         , "  return 1"
         , "end"
+        , "function refused_closing()"
+        , "  local guard <close> = setmetatable({}, {__close = function() error('close boom') end})"
+        , "  sched.wait_ticks(0)"
+        , "end"
         , "function close_at(name)"
         , "  local guard <close> = setmetatable({}, {__close = function() fx.block(name) end})"
         , "  sched.wait_ticks(1)"
         , "end"
         ]
     )
-    [EntryPoint "block_after" Required [SText, SInteger] [SInteger], EntryPoint "close_at" Required [SText] []]
+    [EntryPoint "block_after" Required [SText, SInteger] [SInteger], EntryPoint "close_at" Required [SText] [], EntryPoint "refused_closing" Required [] []]
 
 -- | A task of that module that waits a tick holding a variable whose closing handler waits at this gate.
 closesGated ∷ Text.Text → TaskRequest
@@ -330,6 +357,19 @@ closesGated gate' =
     { requestModule = windowTasksRef
     , requestEntry = "close_at"
     , requestArguments = [VText gate']
+    , requestClass = OrdinaryClass
+    , requestKind = OneShot
+    , requestName = Nothing
+    }
+
+-- | A task of that module that holds a variable whose closing handler raises and waits for no ticks,
+-- which the scheduler refuses: the scheduler closes its coroutine, and the close fails.
+refusedClosing' ∷ TaskRequest
+refusedClosing' =
+  TaskRequest
+    { requestModule = windowTasksRef
+    , requestEntry = "refused_closing"
+    , requestArguments = []
     , requestClass = OrdinaryClass
     , requestKind = OneShot
     , requestName = Nothing
@@ -376,5 +416,48 @@ holdingSafely fixture owner body = do
 releasing ∷ SFixture → [Gate] → IO a → IO a
 releasing fixture gates action =
   action `finally` do
-    forM_ ["holder", "hold", "close", "shutdown", "a", "b", "blk", "y"] (releaseGate fixture)
+    forM_ ["holder", "hold", "close", "shutdown", "a", "b", "blk", "y", "obs"] (releaseGate fixture)
     forM_ gates openGate
+
+-- Owners ---------------------------------------------------------------------------------
+
+-- | A plain scheduled owner that also loads the module of tasks the windows add.
+startPlain ∷ SFixture → LuaRuntime → Text.Text → WorkerPolicy → SchedulerBounds → IO ScheduledOwner
+startPlain fixture runtime label policy bounds =
+  startScheduled fixture runtime base {scheduledVm = (scheduledVm base) {vmModules = vmModules (scheduledVm base) <> [windowTasks]}}
+  where
+    base = scheduled fixture label policy bounds
+
+-- Examples that expect the wait to end with a failure -------------------------------------
+
+-- | Run a scenario inside a boundary, which begins a wait and drives the owner to a failure, and
+-- require that the wait ended by raising one: the supervised failure, rethrown, and never an answer.
+-- The boundary's own end may carry the failure; a timeout of the example's bound is not that failure and is
+-- not swallowed, and the outcome is read without blocking.
+failingWait ∷ SFixture → [Gate] → (RuntimeControl → LuaRuntime → IO PendingWait) → IO ()
+failingWait fixture gates scenario = do
+  outcome ← newEmptyMVar
+  stalled ← try @SomeException . withBoundary $ \control runtime → releasing fixture gates $ do
+    waiting ← scenario control runtime
+    resultOf waiting >>= putMVar outcome
+  case stalled of
+    Left raised | Just (_ ∷ Timeout) ← fromException raised → throwIO raised
+    _ → pure ()
+  tryReadMVar outcome >>= \case
+    Nothing → ioError (userError "the example recorded no outcome for the wait")
+    Just (Right answered) → ioError (userError ("the wait answered " <> show answered))
+    Just (Left _) → pure ()
+
+-- | The scenario leaves the owner holding a cleanup failure it has retained, and parked at this gate, with
+-- nothing owed and no grant outstanding: the wait begun there must stay parked, and end with the failure
+-- once the gate is opened. It returns the owner and what lets the owner go on.
+retainedFailure ∷ SFixture → [Gate] → Text.Text → (RuntimeControl → LuaRuntime → IO (ScheduledOwner, IO ())) → IO ()
+retainedFailure fixture gates gate' scenario = failingWait fixture gates $ \control runtime → do
+  (owner, go) ← scenario control runtime
+  go
+  awaitEntered fixture gate'
+  waiting ← beginWait control owner
+  stabilize waiting
+  awaitPending waiting
+  releaseGate fixture gate'
+  pure waiting

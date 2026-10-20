@@ -18,8 +18,6 @@ import Hetoimasia.Foundation.Log (unsafeComponent)
 import Hetoimasia.Foundation.Worker (GroupStatus (..), Outstanding (..), OutstandingWorker (..))
 import Hetoimasia.Runtime.Supervision (Recognition (Recognized), Role (Service), WorkerPolicy (..), WorkerStatus (WorkerLive), workerGroupStatus)
 import qualified Hetoimasia.Runtime.Supervision as Supervision
-import Hetoimasia.Scripting.Lua.Owner (vmModules)
-import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value (Value (VBoolean, VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
@@ -27,13 +25,6 @@ import Test.LuaRuntime.Accounting.Support
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
 import Test.LuaRuntime.Support (bounded, brokenIs, expectFatal, optionalPolicy, requiredPolicy, withBoundary)
-
--- | A plain scheduled owner that also loads the module of tasks the windows add.
-startPlain ∷ SFixture → LuaRuntime → Text → WorkerPolicy → SchedulerBounds → IO ScheduledOwner
-startPlain fixture runtime label policy bounds =
-  startScheduled fixture runtime base {scheduledVm = (scheduledVm base) {vmModules = vmModules (scheduledVm base) <> [windowTasks]}}
-  where
-    base = scheduled fixture label policy bounds
 
 -- | Whether this is the failing owner's worker, which has not yet published its terminal outcome.
 awaitingFailing ∷ OutstandingWorker → Bool

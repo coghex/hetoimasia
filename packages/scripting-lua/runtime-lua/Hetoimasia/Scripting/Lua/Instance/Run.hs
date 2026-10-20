@@ -87,6 +87,7 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Either (isLeft)
 import Data.Foldable (toList, traverse_)
+import Hetoimasia.Scripting.Lua.Cleanup (Evidence, retainCleanup)
 import Hetoimasia.Scripting.Lua.Lifecycle.State (abandonIssued)
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Sequence (ViewL (EmptyL, (:<)), viewl, (<|))
@@ -288,7 +289,7 @@ data InstanceHost = InstanceHost
   , ihDriver ∷ !ModuleHandle
   , ihHandles ∷ !(IORef (Map ModuleRef ModuleHandle))
   , ihTasks ∷ !(IORef (Map TaskId Task))
-  , ihExtra ∷ !(IORef [(Text, ExceptionWithContext SomeException)])
+  , ihExtra ∷ !(Evidence (Text, ExceptionWithContext SomeException))
   , ihLive ∷ !(IORef (Map TaskId Live))
   , ihEndings ∷ !(IORef (Map Word64 Ending))
   , ihCreated ∷ !(IORef (Set.Set Word64))
@@ -331,7 +332,7 @@ newInstanceHost
   → ModuleHandle
   → IORef (Map ModuleRef ModuleHandle)
   → IORef (Map TaskId Task)
-  → IORef [(Text, ExceptionWithContext SomeException)]
+  → Evidence (Text, ExceptionWithContext SomeException)
   → Maybe LeaseHost
   → Maybe ProviderState
   → IO InstanceHost
@@ -1523,7 +1524,7 @@ finishEnding ih cell closed = do
         Left failure@(ExceptionWithContext context raised)
           | isJust (fromException raised ∷ Maybe SomeAsyncException) → rethrowIO failure
           | raisedByApplication context → rethrowIO failure
-          | otherwise → modifyIORef' (ihExtra ih) (<> [("lua instance release", failure)])
+          | otherwise → retainCleanup (ihExtra ih) [("lua instance release", failure)]
     parkOrSettle ih cell
 
 -- | Settle an ending whose hook has run or been skipped and whose holdings are released,
@@ -1565,7 +1566,7 @@ drainInstance ih cell = mask_ $ do
     report ← drainScope lh (icId cell)
     forM_ (drainFailures report) $ \failure → do
       note ← renderCaught failure
-      modifyIORef' (ihExtra ih) (<> [("lua instance lease", failure)])
+      retainCleanup (ihExtra ih) [("lua instance lease", failure)]
       atomically (noteScope (lhLeases lh) (icId cell) note)
     unless (null (drainFailures report)) (endOwner ih)
   -- A provider that raised when told is a failure of the host: raised once everything has
@@ -1617,7 +1618,7 @@ serviceRetirementsOf ih = do
   -- owner's end, whole, so that supervision receives each of them.
   case [failure | (_, Just failure) ← settledEach] of
     failure : others → do
-      modifyIORef' (ihExtra ih) (<> [("lua instance settlement", other) | other ← others])
+      retainCleanup (ihExtra ih) [("lua instance settlement", other) | other ← others]
       rethrowIO failure
     [] → pure ()
   let settled = map fst settledEach
@@ -1634,7 +1635,7 @@ serviceRequestWork ih = case ihProvider ih of
     -- same masked step, so a cancellation cannot come between and lose it.
     failures ← serviceProvider service
     unless (null failures) $ do
-      modifyIORef' (ihExtra ih) (<> failures)
+      retainCleanup (ihExtra ih) failures
       endOwner ih
     pure (not (null failures))
 
@@ -1647,7 +1648,7 @@ serviceLeaseRetirements ih lh = do
     (ended, disposals) ← atomically (serviceRetirements leases)
     forM_ ended $ \finished → forM_ (endedFailure finished) $ \failure → do
       rendered ← renderCaught failure
-      modifyIORef' (ihExtra ih) (<> [("lua lease retirement", failure)])
+      retainCleanup (ihExtra ih) [("lua lease retirement", failure)]
       forM_ (endedInstance finished) $ \number →
         atomically . noteScope leases number . failureText $
           "the provider's retirement of " <> endedLabel finished <> " failed: " <> rendered
@@ -1659,7 +1660,7 @@ serviceLeaseRetirements ih lh = do
         either Just (const Nothing) <$> guarded (uninterruptibleMask_ dispose)
       forM_ [failure | Just failure ← failures] $ \failure → do
         rendered ← renderCaught failure
-        modifyIORef' (ihExtra ih) (<> [("lua lease dependency", failure)])
+        retainCleanup (ihExtra ih) [("lua lease dependency", failure)]
         atomically . noteScope leases number . failureText $ "disposing what a retirement needed failed: " <> rendered
         endOwner ih
       -- The lease keeps the first failure, which every later release of it answers.
@@ -1776,11 +1777,7 @@ settleEnding ih cell = do
             Unorderly _ → pure ()
             _ → when (decision == Escalate) $ throwIO (InstanceEscalated failed)
         _ → pure ()
-      -- Cleanup evidence held now (a release that failed, the failure of a close) ends the owner as a
-      -- failure: an ending accounted for beside it is not a success.
-      when won $ do
-        held ← not . null <$> readIORef (ihExtra ih)
-        atomically (endingAccounted (ihControl ih) (icId cell) held)
+      when won (atomically (endingAccounted (ihControl ih) (icId cell)))
 
 -- Exit ---------------------------------------------------------------------------------------
 
@@ -1837,7 +1834,7 @@ retireInstances ih = do
   -- supervision receives each of them and none is chosen over the rest.
   case concat failures <> awaited of
     failure : others → do
-      modifyIORef' (ihExtra ih) (<> [("lua instance end", other) | other ← others])
+      retainCleanup (ihExtra ih) [("lua instance end", other) | other ← others]
       rethrowIO failure
     [] → pure ()
 

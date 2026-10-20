@@ -236,6 +236,7 @@ library runtime-lua
         Hetoimasia.Scripting.Lua.Runtime.Dispatch
         Hetoimasia.Scripting.Lua.Runtime.Shared
         Hetoimasia.Scripting.Lua.Runtime.Types
+        Hetoimasia.Scripting.Lua.Cleanup
         Hetoimasia.Scripting.Lua.Scheduled.Run
         Hetoimasia.Scripting.Lua.Scheduled.Shared
         Hetoimasia.Scripting.Lua.Scheduled.Types
@@ -390,6 +391,7 @@ test-suite lua-runtime-tests
     main-is: Main.hs
     hs-source-dirs: runtime-lua-test
     other-modules:
+        Test.LuaRuntime.Accounting.Evidence
         Test.LuaRuntime.Accounting.Spec
         Test.LuaRuntime.Accounting.Support
         Test.LuaRuntime.Accounting.Waits
