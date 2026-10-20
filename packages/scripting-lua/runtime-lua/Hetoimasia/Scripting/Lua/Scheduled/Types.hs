@@ -27,6 +27,7 @@ module Hetoimasia.Scripting.Lua.Scheduled.Types
   , newAccounting
   , watchAccounting
   , unwatchAccounting
+  , accountingFailed
   , sealAccounting
   , accountingReady
   , endingBegun
@@ -289,6 +290,13 @@ watchAccounting control = do
       { acWatch = Just captured
       , acCut = if acSealed accounting >= captured then Just (acBegun accounting) else Nothing
       }
+
+-- | The owner has caught a failure that will end it, one it raises only after it has settled
+-- the others it was settling: from here the accounting is not a success, whichever ending
+-- it accounts for next.
+accountingFailed ∷ Control → STM ()
+accountingFailed control =
+  modifyTVar' (controlAccounting control) (\accounting → accounting {acTainted = True})
 
 -- | Clear the watch, whether it was latched or not, as the wait ends.
 unwatchAccounting ∷ Control → STM ()

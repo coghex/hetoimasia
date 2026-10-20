@@ -85,6 +85,7 @@ import Control.Monad (forM, forM_, unless, void, when)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Either (isLeft)
 import Data.Foldable (toList, traverse_)
 import Hetoimasia.Scripting.Lua.Lifecycle.State (abandonIssued)
 import Data.Maybe (fromMaybe, isJust, isNothing)
@@ -1608,6 +1609,9 @@ serviceRetirementsOf ih = do
       else do
         modifyIORef' (ihParked ih) (Set.delete number)
         outcome ← guarded (withCell ih number (settleEnding ih))
+        -- A failure caught here is raised once the others have been settled, and the owner ends
+        -- with it: the endings settled after it are not a success the accounting may report.
+        when (isLeft outcome) (atomically (accountingFailed (ihControl ih)))
         pure (True, either Just (const Nothing) outcome)
   -- None is dropped: the first is raised, and every other is cleanup evidence for the
   -- owner's end, whole, so that supervision receives each of them.

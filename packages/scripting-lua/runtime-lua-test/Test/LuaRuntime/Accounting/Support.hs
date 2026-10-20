@@ -26,6 +26,10 @@ module Test.LuaRuntime.Accounting.Support
   , refusedClosing
   , stoppableClosing
   , closeRaises
+  , retiresOnStop
+  , retiresThenFails
+  , retiresThenFailsLast
+  , stabilize
   , refusedLeased
   , overflowLeased
   , failsAfterTick
@@ -207,6 +211,48 @@ closeRaises =
     , "  end)"
     , "end"
     ]
+
+-- | Holds an asynchronously retired resource named for it, which its stop leaves pending.
+retiresOnStop ∷ ModuleSource
+retiresOnStop =
+  hooksModule
+    "retiresonstop"
+    [ "function init(self, api)"
+    , "  self.id = inst.next()"
+    , "  self.h = lease.open_async('res-stop')"
+    , "  api.connect('tick', function(self, event) end)"
+    , "end"
+    ]
+
+-- | Holds an asynchronously retired resource named for it, and fails when it is delivered an event,
+-- which leaves the resource pending and the application to be told.
+retiresThenFails ∷ ModuleSource
+retiresThenFails = retiresThenFailsOn "retiresthenfails" "res-fail"
+
+-- | The same, over a resource of its own, for a second instance that fails.
+retiresThenFailsLast ∷ ModuleSource
+retiresThenFailsLast = retiresThenFailsOn "retiresthenfailslast" "res-fail-last"
+
+retiresThenFailsOn ∷ Text.Text → Text.Text → ModuleSource
+retiresThenFailsOn name resource =
+  hooksModule
+    name
+    [ "function init(self, api)"
+    , "  self.id = inst.next()"
+    , "  self.h = lease.open_async('" <> resource <> "')"
+    , "  api.connect('tick', function(self, event) error('callback boom') end)"
+    , "end"
+    ]
+
+-- | Give whatever is going to happen a fair chance to, without sleeping: yield this many times,
+-- or until the wait has ended. A bound on the looking and never a wait for the result.
+stabilize ∷ PendingWait → IO ()
+stabilize waiting = go (5000 ∷ Int)
+  where
+    go 0 = pure ()
+    go n = do
+      pending ← isPending waiting
+      if pending then yield >> go (n - 1) else pure ()
 
 -- | Holds an asynchronously retired resource, and fails by a refused wait after a tick.
 refusedLeased ∷ ModuleSource

@@ -8,7 +8,9 @@
 -- after the grant finished the example shows tick completion has returned meanwhile.
 module Test.LuaRuntime.Accounting.Windows (spec) where
 
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, tryReadMVar)
+import Control.Concurrent.STM (atomically, writeTVar)
+import System.Timeout (Timeout)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, try)
 import Control.Monad (forM_, void)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
@@ -277,7 +279,7 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
       outcome ← newEmptyMVar
       -- The boundary ends with the instance accounted for and the close's failure retained, and a ready
       -- task keeps the owner serving: only the wait could say the owner had finished well, and it must not.
-      _ ← try @SomeException . withBoundary $ \control runtime → releasing (sf fixture) [] $ do
+      stalled ← try @SomeException . withBoundary $ \control runtime → releasing (sf fixture) [] $ do
         owner ← startInstances fixture runtime "close fails" [closeRaises, holder, plainModule] (testConfig instanceBounds') requiredPolicy
         _ ← admit fixture owner "c" (moduleNamed "closeraises")
         awaitPhase fixture owner "c" Active
@@ -298,7 +300,62 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         awaitPending waiting
         releaseGate (sf fixture) "blk"
         resultOf waiting >>= putMVar outcome
-      takeMVar outcome >>= \result → either (const (pure ())) (\answered → fail ("the wait answered " <> show answered)) result
+      -- The boundary may end with the failure the wait carried; a timeout of this example's bound is not that
+      -- failure, and is not swallowed.
+      case stalled of
+        Left raised | Just (_ ∷ Timeout) ← fromException raised → throwIO raised
+        _ → pure ()
+      tryReadMVar outcome >>= \case
+        Nothing → fail "the example recorded no outcome for the wait"
+        Just result → either (const (pure ())) (\answered → fail ("the wait answered " <> show answered)) result
+
+    it "does not complete while a failure caught in settling another ending is held, though the ending it covers is accounted for" $ bounded $ do
+      fixture ← newLFix 4
+      let base = lfBase fixture
+      outcome ← newEmptyMVar
+      lastTold ← newGate
+      let config =
+            leaseConfig
+              { instanceEscalate = \failure → case failureName failure of
+                  Just "b" → throwIO (Broken "callback")
+                  Just "c" → passGate lastTold >> pure Isolate
+                  _ → pure Isolate
+              }
+      stalled ← try @SomeException . withBoundary $ \control runtime → releasing (sf base) [lastTold] $ providersFinish fixture $ do
+        owner ← startLeased fixture runtime "deferred" [retiresThenFails, retiresOnStop, retiresThenFailsLast] config requiredPolicy
+        -- The lower number is the one that fails, and is settled first when both retirements complete.
+        _ ← admit base owner "b" (moduleNamed "retiresthenfails")
+        _ ← admit base owner "a" (moduleNamed "retiresonstop")
+        _ ← admit base owner "c" (moduleNamed "retiresthenfailslast")
+        forM_ ["a", "b", "c"] $ \name → awaitPhase base owner name Active >> liveFor fixture name 1
+        -- The ending the wait covers: the second instance's, stopped and parked on its retirement.
+        _ ← settleControl base owner "a" InstanceStop >>= \result → result `shouldBe` ControlApplied
+        awaitSummary fixture "a" ((== 1) . summaryPending)
+        waiting ← beginWait control owner
+        awaitPending waiting
+        -- An ending the wait does not cover: the first instance fails and is parked on its own retirement.
+        expectDelivered base owner "b" 1
+        expectDelivered base owner "c" 1
+        awaitSummary fixture "b" ((== 1) . summaryPending)
+        awaitSummary fixture "c" ((== 1) . summaryPending)
+        isPending waiting >>= (`shouldBe` True)
+        -- Every provider finishes in one step, so the owner settles the first instance, whose callback
+        -- raises, then the second, the ending the wait covers, and then the third, whose callback the
+        -- example holds: the covered ending is accounted for, and the owner is held inside a callback,
+        -- while a failure that will end it is already caught.
+        retirements ← mapM (provided fixture) ["res-stop", "res-fail", "res-fail-last"]
+        atomically (forM_ (reverse retirements) (`writeTVar` ProviderComplete))
+        awaitGateEntered lastTold
+        stabilize waiting
+        awaitPending waiting
+        openGate lastTold
+        resultOf waiting >>= putMVar outcome
+      case stalled of
+        Left raised | Just (_ ∷ Timeout) ← fromException raised → throwIO raised
+        _ → pure ()
+      tryReadMVar outcome >>= \case
+        Nothing → fail "the example recorded no outcome for the wait"
+        Just result → either (const (pure ())) (\answered → fail ("the wait answered " <> show answered)) result
 
     forM_ [("an escalating answer", pure Escalate), ("a raising callback", throwIO (Broken "callback"))] $ \(label, told) → do
       let config = (testConfig instanceBounds') {instanceEscalate = \_ → told}
