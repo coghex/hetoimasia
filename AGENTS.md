@@ -59,92 +59,11 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
   a design choice. Add extensions and dependencies only when used.
 - Routine build: `cabal build all`.
 - Console smoke: `cabal run exe:hetoimasia -- --smoke`.
-- Current focused tests:
-  `cabal test hetoimasia-foundation:foundation-tests --test-show-details=direct`,
-  `cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct`,
-  `cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct`,
-  `cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct`,
-  `cabal test hetoimasia-scripting-lua:lua-runtime-tests --test-show-details=direct`,
-  `cabal test hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct`,
-  `cabal test hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-details=direct`,
-  `cabal test --project-file cabal.project.cpu hetoimasia-math:math-tests --test-show-details=direct`,
-  `cabal test --project-file cabal.project.cpu hetoimasia-asset-image:asset-image-tests --test-show-details=direct`,
-  `cabal test --project-file cabal.project.cpu hetoimasia-render-api:render-api-tests --test-show-details=direct`,
-  `cabal test --project-file cabal.project.cpu hetoimasia-render-2d:render-2d-tests --test-show-details=direct`,
-  `cabal test --project-file cabal.project.cpu hetoimasia-render-2d-oracle:render-2d-oracle-tests --test-show-details=direct`,
-  and `cabal test hetoimasia-tests --test-show-details=direct`.
-- On Linux only,
-  `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct`
-  runs LUA-14's confinement probe. Its validation group
-  `test.lua-confinement-linux` is optional and local-only; a green run is
-  evidence rather than a verdict: where the machine cannot install the profile
-  every experiment reports itself unproven. Its components are not built off
-  Linux. Read [its verdict](docs/lua_linux_confinement_verdict.md) before
-  building on it — the answer is `inconclusive`.
-- On macOS only,
-  `cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct`
-  runs LUA-15's confinement probe. It is local evidence, not a routine check:
-  its validation group `test.macos-confinement` is optional, no CI runs it, and
-  its components are not built off Darwin. A pull-request request block must
-  name neither it nor `all-hspec`. Read
-  [its verdict](docs/macos_confinement_verdict.md) before building on it — the
-  answer is `inconclusive`.
-- Tests belong to the package whose contract they assert. `foundation-tests`
-  (`packages/foundation/test/`) owns the `Logging`, `Resources`, `Failures`,
-  `Recovery`, `Workers`, `Messaging`, and `Time` components, composed by
-  `Test.Foundation.Spec`; it depends on no runtime, GLFW, or console code.
-  `runtime-tests` (`packages/runtime/test/`) owns the `Runtime` group, composed
-  by `Test.Runtime.Spec`: the runner and application lifecycle, logging
-  lifetime, reporting, supervision, inbox services, runtime opacity, the
-  resource smoke, and the supervised channel and snapshot waits, against real
-  foundation services; it depends on no GLFW or console code. `glfw-tests`
-  (`packages/glfw/test/`) owns the headless `GLFW` group, composed by
-  `Test.GLFW.Spec`: the session, window, command, control, host, dynamic
-  window, monitor, input, and mode examples over the test seam, the link
-  declarations, and the external-client opacity examples; it initializes no
-  GLFW and needs no display. Root `hetoimasia-tests` (`test/`) owns only
-  `Console` (the executable's startup and exit mapping, run as a child
-  process), composed by `Test.Engine.Spec`, and depends on no GLFW package. A
-  new runtime example belongs in `runtime-tests`, beside that component's own
-  helpers; a headless GLFW example belongs in `glfw-tests`, and one that needs a
-  real native session in `glfw-native-tests`; a console example belongs in root
-  `Console`;
-  in general a new example belongs in the component spec that owns the
-  behaviour it asserts. `lua-host-tests`
-  (`packages/scripting-lua/test/`) owns two components: the bridge's own
-  examples, and `Protocol` (`Test.Lua.Protocol.Spec`), the pure task,
-  admission, request, subscription, epoch, failure, and stop model in the
-  package's private `model` sublibrary. Select the model's examples with
-  `--test-options='--match Protocol'`; they construct no interpreter, and the
-  group's last example reports that they acquired none. Every VM the suite
-  constructs goes through `Test.Lua.Support.acquireVm`, which is what makes
-  that report the suite's whole construction record. Run one component with
-  `--test-options='--match <Component>'` on the suite that owns it; a selector
-  that matches no example fails the suite rather than reporting a silent pass.
-  `lua-runtime-tests` (`packages/scripting-lua/runtime-lua-test/`, composed by
-  `Test.LuaRuntime.Spec`, group `test.scripting-lua-runtime`) owns the runtime
-  adapter's examples: readiness, identity, submission and its bounds,
-  settlement, host failures, stop, independent owners, and the refused reply
-  wait from a Lua callback, with real VMs under a real `withSupervision`, plus
-  the adapter's dependency closure, which needs no VM. It selects and fails on
-  an empty selection the same way.
-  Selectors moved with their examples: on the root suite, `--match Runtime`,
-  `Resources`, `Recovery`, `Workers`, `Messaging`, `Logging`, `Failures`, and
-  `GLFW` now select nothing and fail; on `runtime-tests`, `--match Supervision`
-  or `--match 'Logging lifetime'` select runtime subgroups as they did at root,
-  and on `glfw-tests` the GLFW group names, such as `--match 'GLFW session'`,
-  select what they selected at root or in the removed window-examples executable.
-- The Vulkan native backend and window integration packages, the 2D
-  renderer's Vulkan recorder (`packages/render-2d-vulkan`), and the
-  triangle, sprites, image2d and scene3d samples, build only through `cabal.project.vulkan`, by
-  `bash tools/vulkan/run.sh`. Its test mode runs their headless suites
-  (`native-tests`, `shader-tests`, `integration-tests`, `triangle-tests`,
-  `sprites-tests`, `image2d-tests`, `scene3d-tests`, `render-2d-vulkan-tests`) — the
-  group `test.vulkan-headless` — and needs no consent. The native suite `vulkan-native-tests` (`test.vulkan-native`) opens
-  windows and presents on macOS, so it takes the same desktop opt-in, under the
-  same standing approval, as `glfw-native-tests`; on Linux its runner starts an
-  isolated X11 display, and `test.vulkan-wayland` runs it on the isolated
-  headless Wayland compositor. See [gpu_backend.md](docs/gpu_backend.md#the-native-suite).
+- Every test suite, its command, and the components it owns are in
+  [test_suites.md](docs/test_suites.md), with the platform-only confinement
+  probes and the Vulkan suites. A new example belongs in the suite that owns
+  the behaviour it asserts. Ask `tools/validation/plan.py` which validation
+  groups a change requires.
 - Without the GLFW SDK, build and run the foundation, runtime, Lua host, and
   root suites with `--project-file cabal.project.cpu`, which shares
   `cabal.project.common` with `cabal.project` and leaves out `hetoimasia-glfw`,
@@ -197,27 +116,18 @@ These instructions are also the authority for Claude sessions through CLAUDE.md.
 
 ## Delivery and worktrees
 
-- Implement in isolated worktrees. Keep the primary checkout clean for Kanban
-  integration.
+The GitHub-project rules in the owner's global instructions apply. Specific to
+this repository:
+
 - Use the installed Kanban plugin skills for issue drafting, readiness review,
-  solving, PR review, and the user-selected merge workflow. Resolve the actual
-  target repository; never mistake `~/work/kanban` for this project's tracker.
-- Existing authorization carries across turns. Complete authorized local work
-  before asking for any additional decision needed to publish it.
-- Keep each issue's implementation and validation in its worktree and PR. Use
-  `Closes #N` when that PR completes the issue.
-- Documentation is tracked but never gated on CI or review: land it on
-  `master` with `docs-push [-m "message"] <paths...>` from any worktree,
-  including the docs, evidence write-ups and verdicts an issue requires. Link
-  them from the PR and finish them before its final review. Markdown that
-  tests or tools read (`MEMORY.md`, the Vulkan records) stays in the PR;
-  `docs-push` refuses it. See workflow.md.
-- Follow the selected Kanban workflow's claim and opposite-agent review gates.
-  A label alone is not proof of a fresh approval. Do not self-approve or merge
-  on your own initiative; the installed drainer or explicitly requested
-  supported merge workflow owns that action.
-- Preserve unrelated edits and interrupted work. Never reset or clean another
-  agent's worktree. Stop only processes you started and tracked.
+  solving, PR review and the merge workflow.
+- Complete authorized local work before asking for any further decision
+  needed to publish it.
+- Docs, evidence write-ups and verdicts an issue requires land with
+  `docs-push` and are linked from the pull request before its final review.
+  `MEMORY.md` and the Vulkan records are read by tests and tools, so they stay
+  in the pull request. See workflow.md.
+- Preserve unrelated edits and interrupted work.
 
 ## Files, launches, and documentation
 
