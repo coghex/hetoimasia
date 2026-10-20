@@ -3526,8 +3526,14 @@ and verified policy, with adversarial regression coverage.
   and `stopSession` refuse any other) and one wait at a time, until the owner has accounted for the endings the tick's work began, the escalation of a failure
   included, and commits only on `AccountingComplete` (the scheduler reconciles a grant before the instance layer
   accounts for the tick's last segment, so a refused wait looks, for a moment, like an idle active instance); the
-  sample admits no task and holds no slot only to order a failure. The gameplay owner's scheduling is derived from the
-  bounds so that live instances' invocations and the session's unobserved tasks both have active slots. The ledger gains
+  sample admits no task and holds no slot only to order a failure. Failures are attributed as D-48 decides: tick T's
+  are those of its own work (a segment or a task resumption of its grants, the sample reading and telling the tasks'
+  results itself) and every ending begun by the end of the final boundary the accounting covered, and none of them
+  ever lets T commit; the commit is one atomic step that commits only if no failure is recorded at it; a failure
+  that begins after the cutoff belongs to the first tick not yet committed when it is recorded, so recorded before T's
+  commit step it stops T, and recorded after it T stays the last good snapshot and the session fails at T+1 with no
+  further grant (the failing tick is always the last good one plus one). The gameplay owner's scheduling is derived from
+  the bounds so that live instances' invocations and the session's tasks both have active slots. The ledger gains
   *invalidated* and *discarded*; a stop (`stopSession`) ends admission and grants, settles the gameplay instances
   including `shutdown` and lease cleanup, waits for the accounting, then publishes one `Stopped` (or failed) snapshot; a
   stop asked for from another thread (`requestStop`, which waits for nothing) halts a tick in flight, and the application

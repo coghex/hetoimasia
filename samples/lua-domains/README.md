@@ -141,22 +141,25 @@ The driver's `stepTick`:
    committed. The wait is one of the supervised waits the sample makes, and those are the application thread's (the
    thread that created the session, which owns the supervision handle), one at a time: `stepTick` and `stopSession`
    refuse any other thread (`DriverOffApplicationThread`, `StopOffApplicationThread`), and another thread asks for a
-   stop with `requestStop`, which waits for nothing, so a stop never waits beside the driver. The admissions of tasks
-   that are in flight are waited for first (a task the owner accepted runs, and can fault in the tick, before its
-   admitter has registered it), and the count of failures the scheduler has made is read in the same transaction (the
-   *baseline*), all before the accounting wait; after it the tasks are read, and the faults of those that have settled
-   are told, though each was told when it happened by the task's own watcher. Nothing stops a task faulting after that
-   reading, whatever its watcher has told, so the commit (step 6) checks, in its own transaction, that the scheduler has
-   counted no failure since the baseline (the count and the settlement are written in one transaction), and the driver
-   starts again, accounting and reading again, if it has: **a tick commits only if every task fault that can belong to it
-   has been told, or has not happened, when the commit is made.**
+   stop with `requestStop`, which waits for nothing, so a stop never waits beside the driver. The admissions of tasks that are in flight are waited for next, and the tasks the
+   session admitted are read: the faults of those that have settled are told, though each was told when it happened
+   by the task's own watcher, so a task a tick resumed that faulted in it is told here, whatever its watcher and the
+   ticket's observation have done, and its failure is that tick's and never the next's (the accounting wait does not
+   consume a task's result; the sample does). **Attribution (D-48).** Tick T's failures are those of its own work
+   (a segment, or a task resumption of its grants) and every ending begun by the end of the final boundary the
+   accounting covered; each is recorded before the wait returns, and none ever lets T commit, on every ordering. A
+   failure that begins after that cutoff (an independently running instance, a task running outside T's grants, an
+   admission that completes late) belongs to the first tick not yet committed when it is recorded: told before T's
+   commit step it stops T; told after it T commits and stays the last good snapshot, and the session fails at T+1,
+   with no further grant and T+1's batch discarded. Either outcome is correct.
 5. **Decide.** A failure told of fails the session and commits nothing; a stop commits nothing; otherwise the
    tick commits only if its work **finished successfully**: gameplay called `staging.finish()` and the instance
    is active with nothing in flight and no update owed, or the engine says why there is no work (the behavior
    is paused, was paused when the tick began, or a control was applied at the tick's boundary). Anything else
    raises `TickNotCompleted`, commits nothing and halts the session. Tick completion alone never authorizes a
    commit.
-6. In one transaction, replace the committed world, publish the snapshot (its status taken from the engine's
+6. **The commit step**, one transaction: it first checks that no failure is recorded (one that is stops the tick, and
+   is published instead), and then replaces the committed world, publishes the snapshot (its status taken from the engine's
    inspection of the behavior, `Paused` or `Running`), settle the tick's reservations in the queue and count
    its dispositions. A reader sees the whole tick or none of it.
 
@@ -302,7 +305,7 @@ What the session does, by design (D-26, D-27, P-7):
   counted in the evidence the report and `cleanupEvidence` give; it is never published, and the snapshot is
   not republished.
 
-A failed `init` of the behavior is the same failure at tick 0: the initial world is published with it.
+A failed `init` of the behavior is the same failure, the failure of the first tick not yet committed (tick one): the initial world and committed tick zero are published with it. In general **the failing tick is the last good tick plus one**: a tick's own failure is that tick, and a failure told while no tick is in progress is the next one's.
 
 **The commit condition.** Whether a tick that ran no work may commit is decided from evidence the application
 holds, not from the engine's counters: every gameplay module's `update` is wrapped (`gameplay_update.lua`) so that
