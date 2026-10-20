@@ -44,3 +44,5 @@ library depends on a sample, and nothing routine launches one.
   (`hetoimasia-lua-domains`, launched by hand) and the suite (`lua-domains-tests`,
   the group `test.lua-domains`). Unlike the graphics samples it needs no GLFW or
   Vulkan, so both `cabal.project` and `cabal.project.cpu` build it.
+  It also fails, overloads and stops explicitly (LUA-30): `--scenario` runs the
+  normal, pause, failure, flood and stop sessions, and the failure scenario exits 1.
