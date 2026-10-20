@@ -1836,7 +1836,10 @@ lies ahead on the owner's thread.
   with `AccountingOwnerEnded` once it has ended and supervision has handled the outcome
   without latching a fatal failure, and never with `AccountingComplete` unless the accounting
   was complete before the owner began to exit. An owner that is exiting but has not ended (a
-  stop waiting for a provider's retirement) neither completes the wait nor ends it. An
+  stop waiting for a provider's retirement) neither completes the wait nor ends it, and neither
+  does an owner that holds cleanup evidence that will end it as a failure (the failure of closing
+  a coroutine, of a release, of a settlement), even with every ending accounted for: the wait is
+  for the exit, and for the failure supervision then handles. An
   `Escalate` answer, an escalation callback that raises and a failed retirement end the owner
   as a failure, and the wait follows the severity supervision gives that outcome: rethrown if
   it is fatal, `AccountingOwnerEnded` if it is tolerated.
