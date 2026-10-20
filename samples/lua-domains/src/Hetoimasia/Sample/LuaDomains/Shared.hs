@@ -178,6 +178,8 @@ data Shared = Shared
     -- settlement is consumed once.
   , sharedTaskAdmitting ∷ !(TVar Int)
     -- ^ The task admissions between the check that the session takes tasks and the task's being watched.
+  , sharedStopsIssued ∷ !(MVar [Int])
+    -- ^ The gameplay instances (by position) a stop has been issued to; changed only under its lock.
   , sharedTaskHeld ∷ !(TVar Int)
     -- ^ The tasks in 'sharedTasks': admitted, and not yet observed. Changed only under the 'sharedTasks' lock.
   , sharedAssignHook ∷ !(IO ())
@@ -215,6 +217,7 @@ newShared setup = do
     <*> newTVarIO Nothing
     <*> newMVar []
     <*> newTVarIO 0
+    <*> newMVar []
     <*> newTVarIO 0
     <*> pure (setupAssignHook setup)
     <*> pure (setupScenario setup)

@@ -617,7 +617,7 @@ gameplaySpec ∷ Shared → DomainsConfig → Registration → ScheduledSpec
 gameplaySpec shared config registered =
   configGameplaySpec
     config
-    ( (scheduledSpec vm (workerPolicy "gameplay") gameplayScheduling)
+    ( (scheduledSpec vm (workerPolicy "gameplay") (gameplayScheduling (configBounds config)))
         { scheduledDomain = GameplayDomain
         , scheduledInstances = Just ((instanceConfigFor config) {instanceControlAdmission = AdmitLogically, instanceEscalate = gameplayEscalation shared})
         , scheduledLending = Just (sharedLending shared)
@@ -682,19 +682,24 @@ instanceConfigFor config =
     , instanceTickDuration = Just (configTickDuration config)
     }
 
--- | Gameplay's scheduling: four tasks, eight queued admissions and retained results, and one
--- grant outstanding at a time, which is enough (P-6).
-gameplayScheduling ∷ SchedulerBounds
-gameplayScheduling =
+-- | Gameplay's scheduling, from the session's bounds: one task more than the session may hold unobserved, which is the
+-- fence's; queued admissions for those and for the instances; retained results for the instances' (two for each, as the
+-- instance layer requires), those tasks' and the fence's; and one grant outstanding at a time, which is enough (P-6).
+-- The owner keeps a task's slot and result until it is observed, so whatever 'boundSessionTasks' is, the fence has a
+-- slot to run in (four tasks, eight queued admissions and twelve retained results, by default).
+gameplayScheduling ∷ Bounds → SchedulerBounds
+gameplayScheduling bounds =
   SchedulerBounds
-    { boundActiveTasks = 4
-    , boundQueuedAdmissions = 8
-    , boundRetainedResults = 8
+    { boundActiveTasks = active
+    , boundQueuedAdmissions = max liveInstances (2 * active)
+    , boundRetainedResults = max (2 * liveInstances) (liveInstances + 2 * active)
     , boundQuanta = Quanta (Quantum 4) (Quantum 4) (Quantum 4)
     , boundOutstandingGrants = 1
-    , boundControlRequests = 4
+    , boundControlRequests = max 4 active
     , boundServiceBudget = Nothing
     }
+  where
+    active = boundSessionTasks bounds + 1
 
 -- | The UI's scheduling: its own bounds, of the same size. It is never granted a step.
 uiScheduling ∷ SchedulerBounds
@@ -1277,6 +1282,11 @@ publishEnding domains ending = mask_ $ do
       config = domainsConfig domains
       bounds = configBounds config
       var = sharedSession shared
+  -- A failed session is quiescent when it is told of: what it admitted is settled (and what is still running is asked to
+  -- stop) before the failure is published, with the owner alive. Admission closed where the failure was recorded.
+  when (isFailure ending) $ do
+    failed ← atomically (failedNow var)
+    when failed (settleTasks domains)
   configPublishHook config BeforeClaim
   built ← atomically $ do
     state ← readTVar var
@@ -1353,11 +1363,10 @@ stopSession domains = do
 stopLive ∷ Domains → IO Retirement
 stopLive domains = do
   let shared = domainsShared domains
-  first ← atomically $ do
-    asked ← requestStopNow (sharedSession shared)
+  atomically $ do
+    _ ← requestStopNow (sharedSession shared)
     closeQueue (sharedQueue shared)
-    pure asked
-  settleGameplay domains first
+  settleGameplay domains
   failed ← atomically (failedNow (sharedSession shared))
   void (publishEnding domains (if failed then EndedByFailure else EndedByStop))
   afterEnding domains
@@ -1375,11 +1384,10 @@ settleFinite domains = do
 finishLive ∷ Domains → IO Retirement
 finishLive domains = do
   let shared = domainsShared domains
-  first ← atomically $ do
-    asked ← requestStopNow (sharedSession shared)
+  atomically $ do
+    _ ← requestStopNow (sharedSession shared)
     closeQueue (sharedQueue shared)
-    pure asked
-  settleGameplay domains first
+  settleGameplay domains
   failed ← atomically (failedNow (sharedSession shared))
   if failed
     then void (publishEnding domains EndedByFailure)
@@ -1390,23 +1398,36 @@ finishLive domains = do
         when mine (markEnded (sharedSession shared) EndedFinished)
   afterEnding domains
 
--- | Ask each gameplay instance to stop, once for the session (a repeated stop asks nothing again), wait for each to be
--- settled, which includes its @shutdown@ and the release of what it held, and run the fence so that every failure
--- of the settlement has been told. The engine's reservations for control leave one for each instance, so the stop is
--- admitted whatever the UI holds.
-settleGameplay ∷ Domains → Bool → IO ()
-settleGameplay domains asking = do
-  -- The caller has closed admission: an admission that began before is finished and watched before anything is settled.
+-- | Ask each gameplay instance to stop, once for the session however many stops there are and whoever is interrupted
+-- (what was asked is tracked, not who asked first), wait for each to be settled, which includes its @shutdown@ and the
+-- release of what it held, run the fence so that every failure of the settlement has been told, and settle the
+-- session's tasks. The engine's reservations for control leave one for each instance, so the stop is admitted whatever
+-- the UI holds. The caller has closed admission: an admission that began before is finished and watched before the
+-- instances are awaited, and the requests are issued first, so a stop interrupted while it waits has asked already.
+settleGameplay ∷ Domains → IO ()
+settleGameplay domains = do
+  let started = domainsGameplay domains : domainsExtras domains
+  issueStops domains (zip [0 ∷ Int ..] started)
   atomically (taskAdmissionsDrained (domainsShared domains))
-  forM_ (domainsGameplay domains : domainsExtras domains) $ \started → do
-    when asking $ do
-      asked ← requestInstanceControl (scheduledEndpoint (startedOwner started)) (startedInstance started) InstanceStop
-      case asked of
-        InstanceControlFull → throwIO (StopRefused "gameplay" (show asked))
-        _ → pure ()
-    void (awaitInstance (domainsControl domains) (startedTicket started))
+  forM_ started $ \one → void (awaitInstance (domainsControl domains) (startedTicket one))
   fence domains
   settleTasks domains
+
+-- | Ask each of these instances to stop that has not been asked, and remember each that was. The requests never block,
+-- and what is remembered is what the engine took, whatever interrupts the asking.
+issueStops ∷ Domains → [(Int, Started)] → IO ()
+issueStops domains started = mask_ $ do
+  let var = sharedStopsIssued (domainsShared domains)
+  issued ← takeMVar var
+  progress ← newIORef issued
+  forM_ started (\(index, one) → do
+    done ← readIORef progress
+    unless (index `elem` done) $ do
+      asked ← requestInstanceControl (scheduledEndpoint (startedOwner one)) (startedInstance one) InstanceStop
+      case asked of
+        InstanceControlFull → throwIO (StopRefused "gameplay" (show asked))
+        _ → writeIORef progress (index : done))
+    `finally` (readIORef progress >>= putMVar var)
 
 -- | What follows the publication that ends the session: the UI reads the settlements of the controls it asked for,
 -- and, when the configuration asks, sees the status that ends the session, while it serves; a UI that has ended

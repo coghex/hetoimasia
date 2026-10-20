@@ -12,6 +12,7 @@ module Hetoimasia.Sample.LuaDomains.Bounds
   , deltaWithin
   , maxEntities
   , maxDeltaLimit
+  , maxSessionTasks
   , positionLimit
   , randomLimit
   ) where
@@ -25,6 +26,10 @@ maxEntities = 64
 -- | The largest delta bound a configuration may choose.
 maxDeltaLimit ∷ Int
 maxDeltaLimit = 1000
+
+-- | The most tasks a configuration may let the session hold unobserved: the gameplay owner's scheduling is made from it.
+maxSessionTasks ∷ Int
+maxSessionTasks = 16
 
 -- | A position is clamped to the range from the negative of this to this, so that no
 -- sequence of moves can overflow a 64-bit integer.
@@ -58,8 +63,8 @@ data Bounds = Bounds
     -- ^ The most workspaces one gameplay instance holds charged at once: the capacity of its leases.
   , boundSessionTasks ∷ !Int
     -- ^ The most tasks the session may hold admitted and not yet observed. The owner keeps a task's slot and result
-    -- reservation until its settlement is observed, so this is one fewer than the gameplay owner's active tasks: the
-    -- fence of every tick always has a slot to run in.
+    -- reservation until its settlement is observed, so the gameplay owner's scheduling is made from this (one more
+    -- active task than it): the fence of every tick always has a slot to run in.
   , boundPendingControls ∷ !Int
     -- ^ The most controls the UI may hold accepted and unread at once. The engine holds a reservation for each until its
     -- receipt is read, and the owner's reservations are this many and one for each instance the stop must reach, so a
@@ -101,6 +106,8 @@ data BoundsProblem
     TooManyEntities !Int
   | -- | A delta bound over 'maxDeltaLimit'.
     DeltaTooLarge !Int
+  | -- | More session tasks than 'maxSessionTasks'.
+    TooManySessionTasks !Int
   deriving (Eq, Show)
 
 -- | Every problem with a configuration, so that a refusal names all of them.
@@ -123,3 +130,4 @@ validateBounds bounds =
   ]
     <> [TooManyEntities (boundEntities bounds) | boundEntities bounds > maxEntities]
     <> [DeltaTooLarge (boundDelta bounds) | boundDelta bounds > maxDeltaLimit]
+    <> [TooManySessionTasks (boundSessionTasks bounds) | boundSessionTasks bounds > maxSessionTasks]
