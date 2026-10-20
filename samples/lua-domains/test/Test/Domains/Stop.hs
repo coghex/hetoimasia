@@ -8,21 +8,23 @@ import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Concurrent.STM (readTVarIO)
 import Control.Exception (finally)
-import Control.Monad (forM_)
+import Control.Monad (forM_, replicateM_)
+import System.Exit (ExitCode (ExitFailure))
 import Data.Text (Text)
 import Hetoimasia.Sample.LuaDomains
   ( Dispositions (..)
   , Domains (domainsShared)
-  , DomainsConfig (configGameplaySource, configInput, configTicks, configUiSource)
+  , DomainsConfig (configGameplaySource, configInput, configTicks, configUiSeesEnd, configUiSource)
   , Evidence (..)
   , GameSnapshot (snapDispositions, snapStatus, snapTick)
   , InstanceEvidence (..)
   , OwnerEvidence (..)
-  , SessionReport (reportEvidence, reportStatus)
+  , SessionReport (reportEvidence, reportStatus, reportTicks)
   , Placement
   , SessionStatus (Failed, Running, Stopped)
   , TickOutcome (TickFailed, TickHalted)
   , cleanupEvidence
+  , exitStatusOf
   , runSession
   , stepTick
   , stopSession
@@ -178,6 +180,52 @@ spec = describe "the stop paths and the cleanup evidence" $ do
         counts ← readTVarIO (sharedControls (domainsShared domains))
         (controlAccepted counts, controlNoLonger counts, controlApplied counts, controlAbandoned counts) `shouldBe` (1, 1, 0, 0)
         revisionNow domains `shouldReturn` 1
+        balanced domains
+  it "settles the gameplay instances at the end of a finite session before the publication closes: a shutdown that raises fails it, published after the last tick, and the executable's status says so" $
+    withSample
+      ( \config →
+          config
+            { configInput = []
+            , configTicks = Just 3
+            , configGameplaySource = luaLines ["function update(self, dt) staging.finish() end", "function shutdown(self, reason) error('shutdown failed') end"]
+            }
+      )
+      $ \_ _ domains → do
+        report ← runSession domains
+        reportTicks report `shouldBe` 3
+        reportStatus report `shouldSatisfy` isFailed
+        exitStatusOf report `shouldBe` ExitFailure 1
+        -- Three ticks, and one publication for the failure, with the world of the last tick frozen.
+        (snapshot, revision) ← snapshotNow domains
+        (revision, snapTick snapshot) `shouldBe` (4, 3)
+        leavesNothing (reportEvidence report)
+        balanced domains
+
+  it "lets the surviving UI see the failure and the frozen world before the session ends" $ do
+    fx ← newFx
+    ui ← newFakeUi
+    let seeing =
+          [ "function update(self, dt)"
+          , "  local status = view.status()"
+          , "  ui.saw(status)"
+          , "  fx.record('saw ' .. status .. ' at tick ' .. view.tick())"
+          , "  ui.updated()"
+          , "end"
+          ]
+        failingAtThree =
+          [ "function update(self, dt)"
+          , "  if world.tick() == 3 then error('failed at tick 3') end"
+          , "  staging.finish()"
+          , "end"
+          ]
+    withBoundary $ \control →
+      withDomains control ((sampleConfig fx ui) {configInput = [], configUiSeesEnd = True, configGameplaySource = luaLines failingAtThree, configUiSource = luaLines seeing}) $ \domains → do
+        replicateM_ 2 (stepCommitted domains)
+        outcome ← stepTick domains
+        outcome `shouldSatisfy` \case TickFailed _ → True; _ → False
+        -- The session waits for the UI to see what ends it, and the UI sees the last good tick beside the failure.
+        stopServing domains ui
+        fxLines fx >>= (`shouldSatisfy` elem "saw failed at tick 2")
         balanced domains
   where
     isHalted = \case

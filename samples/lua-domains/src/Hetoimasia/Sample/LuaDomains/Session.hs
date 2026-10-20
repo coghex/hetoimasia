@@ -30,19 +30,23 @@ module Hetoimasia.Sample.LuaDomains.Session
   , failedNow
   , evidenceNow
   , markPublished
+  , claimEnding
   , requestStopNow
   , stopRequestedNow
   , markEnded
   , Ended (..)
   ) where
 
-import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, readTVar, writeTVar)
+import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, readTVar, retry, writeTVar)
 import Hetoimasia.Sample.LuaDomains.Snapshot (FailureEvidence (..), SessionFailure)
 
 -- | How a session ended, once the publication that ends it has been made.
 data Ended
   = EndedFailed
   | EndedStopped
+  | -- | A finite session ran its last tick and nothing failed: the last tick's snapshot stands, and none was
+    -- published for the ending.
+    EndedFinished
   deriving (Eq, Show)
 
 -- | The session's record.
@@ -56,13 +60,16 @@ data SessionState = SessionState
   , sessionAfter ∷ ![SessionFailure]
     -- ^ The failures told of after the failure snapshot was published, bounded, for the report.
   , sessionStopRequested ∷ !Bool
+  , sessionClaimed ∷ !Bool
+    -- ^ Some thread has taken the publication that ends the session and has not finished it: any other waits
+    -- for it, so the publisher is never closed under it.
   , sessionEnded ∷ !(Maybe Ended)
-    -- ^ Set when the publication that ends the session is made, or the failure that ended it published.
+    -- ^ Set, in the transaction that makes it, by the publication that ends the session.
   }
   deriving (Eq, Show)
 
 newSessionState ∷ IO (TVar SessionState)
-newSessionState = newTVarIO (SessionState [] 0 Nothing [] False Nothing)
+newSessionState = newTVarIO (SessionState [] 0 Nothing [] False False Nothing)
 
 -- | How many failures are kept beside the first.
 maxSecondaryKept ∷ Int
@@ -100,11 +107,21 @@ evidenceNow var = do
     primary : _ → Just (FailureEvidence primary (sessionFailureCount state - 1))
     [] → Nothing
 
--- | Say the failure snapshot is being published with this evidence, in the transaction that publishes it:
--- later failures are counted apart from now on.
+-- | Say the failure snapshot is being published with this evidence, in the transaction that takes the
+-- publication: later failures are counted apart from now on.
 markPublished ∷ TVar SessionState → FailureEvidence → STM ()
 markPublished var evidence = modifyTVar' var $ \state →
-  state {sessionPublishedLater = Just (evidenceLater evidence), sessionEnded = Just EndedFailed}
+  state {sessionPublishedLater = Just (evidenceLater evidence)}
+
+-- | Take the publication that ends the session, if no other has: answers whether this call has it. It waits for
+-- another's to finish first, so what it answers after the wait is that the session has ended.
+claimEnding ∷ TVar SessionState → STM Bool
+claimEnding var = do
+  state ← readTVar var
+  case (sessionEnded state, sessionClaimed state) of
+    (Just _, _) → pure False
+    (Nothing, True) → retry
+    (Nothing, False) → True <$ writeTVar var state {sessionClaimed = True}
 
 -- | Ask for a stop. Answers whether this call is the one that asked: a repeated stop asks nothing again.
 requestStopNow ∷ TVar SessionState → STM Bool

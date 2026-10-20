@@ -7,17 +7,21 @@ module Test.Domains.Controls (spec) where
 import Control.Concurrent (yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Concurrent.STM (readTVar, readTVarIO, retry)
+import Control.Exception (try)
 import Control.Monad (replicateM_, when)
 import Data.ByteString (ByteString)
 import Data.Foldable (toList)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Hetoimasia.Sample.LuaDomains
-  ( Domains (domainsShared)
+  ( Bounds (boundPendingControls)
+  , Domains (domainsShared)
   , DomainsConfig (configAssignHook, configGameplaySource, configInput, configUiSource)
+  , DomainsDefect (TickNotCompleted)
   , GameSnapshot (snapStatus)
   , SessionStatus (Paused, Running)
   , TickOutcome (TickCommitted)
+  , defaultBounds
   , retireDomains
   , stepTick
   , stopSession
@@ -143,6 +147,28 @@ spec = describe "the UI's control of the gameplay behavior" $ do
         counts ← readTVarIO (sharedControls (domainsShared domains))
         (controlAccepted counts, controlAbandoned counts, controlApplied counts) `shouldBe` (1, 1, 0)
         controlsBalance domains
+
+  describe "the engine's reservations" $
+    it "leave the stop room whatever the UI holds: controls beyond the pending bound are refused, and a stop with the bound's worth unread completes" $
+      withSample (\config → config {configInput = [], configUiSource = uiActing ["for i = 1, 8 do control.pause() end", "", "", "", "", "", ""]}) $ \_ ui domains → do
+        let allowed = boundPendingControls defaultBounds
+        uiStep domains ui
+        held ← readTVarIO (sharedControls (domainsShared domains))
+        (controlAccepted held, Map.toList (controlRefused held)) `shouldBe` (allowed, [("unassigned", 8 - allowed)])
+        stopServing domains ui
+        settled ← readTVarIO (sharedControls (domainsShared domains))
+        (controlAccepted settled, controlNoLonger settled) `shouldBe` (allowed, allowed)
+        controlsBalance domains
+
+  describe "a control is no proof that an update did not run" $
+    it "does not commit a tick whose update began and did not finish because a redundant resume was assigned to it" $
+      withSample (\config → config {configInput = [], configGameplaySource = luaLines ["function update(self, dt) staging.move(0, 1, 0) end"], configUiSource = uiActing ["control.resume()", ""]}) $ \_ ui domains → do
+        uiStep domains ui
+        outcome ← try (stepCommitted domains)
+        case outcome of
+          Left (TickNotCompleted tick) → tick `shouldBe` 1
+          Left other → expectationFailure ("a different defect: " <> show other)
+          Right _ → expectationFailure "the tick committed"
 
   describe "serialization with the tick" $
     it "holds the tick's begin from the control's assignment until the engine has admitted the control: a tick attempted in that interval does not begin, and the control is applied in the tick it was assigned, never late" $ do

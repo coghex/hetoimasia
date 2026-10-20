@@ -6,21 +6,25 @@ module Test.Domains.Failure (spec) where
 
 import Control.Concurrent.STM (atomically, readTVarIO)
 import Control.Exception (SomeException, throwIO, try)
-import Control.Monad (forM_)
+import Control.Concurrent (yield)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
+import Control.Monad (forM_, join, replicateM_, when)
 import Data.ByteString (ByteString)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (isNothing)
 import Data.List (isInfixOf, sort)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Runtime.Supervision (WorkerStatus (WorkerLive))
 import Hetoimasia.Sample.LuaDomains
-  ( Domains (domainsGameplay, domainsShared)
-  , DomainsConfig (configExtensions, configGameplayEntries, configGameplayInstances, configGameplayModules, configGameplaySource)
+  ( Answer (Closed)
+  , Domains (domainsGameplay, domainsShared)
+  , DomainsConfig (configInput, configPublishHook, configExtensions, configGameplayEntries, configGameplayInstances, configGameplayModules, configGameplaySource)
   , Evidence (evidenceAfter, evidenceFailures, evidenceGameplay)
   , Extension (Extension)
   , GameSnapshot (snapStatus, snapTick, snapWorld)
   , OwnerEvidence (evidenceEnded)
+  , PublishPoint (AfterClaim, BeforeClaim)
   , SessionStatus (Failed)
   , Started (startedOwner)
   , TickOutcome (TickFailed, TickHalted)
@@ -268,6 +272,64 @@ spec = describe "the failure of the gameplay session" $ do
           latest `shouldBe` snapshot
           evidence ← cleanupEvidence domains
           (evidenceFailures evidence, map failWho (evidenceAfter evidence)) `shouldBe` (2, ["bystander"])
+  describe "what else failed while the instance ended" $
+    it "is the session's too, beside the primary and never in its place: an update that fails and a shutdown that fails" $
+      withSample
+        ( \config →
+            config
+              { configInput = []
+              , configGameplaySource = gameplayWith ["function update(self, dt) error('update failed') end", "function shutdown(self, reason) error('shutdown failed') end"]
+              }
+        )
+        $ \_ _ domains → do
+          snapshot ← stepTick domains >>= expectFailed
+          fmap (failStage . evidencePrimary) (evidenceOf snapshot) `shouldBe` Just "update"
+          fmap evidenceLater (evidenceOf snapshot) `shouldBe` Just 1
+          held ← sessionFailures <$> readTVarIO (sharedSession (domainsShared domains))
+          map failStage held `shouldBe` ["update", "shutdown"]
+          Text.unpack (failMessage (held !! 1)) `shouldSatisfy` ("shutdown failed" `isInfixOf`)
+
+  describe "the publication that ends the session" $ do
+    it "is the publisher's alone from the moment it is taken: a stop that comes while it is held waits for it, and the one failure snapshot is published" $ do
+      fx ← newFx
+      ui ← newFakeUi
+      withBoundary $ \control →
+        withDomains
+          control
+          (sampleConfig fx ui) {configInput = [], configGameplaySource = gameplayWith ["function update(self, dt) error('update failed') end"], configPublishHook = \point → when (point == AfterClaim) (holdAt fx "claimed")}
+          $ \domains → withReleased fx ["claimed"] $ do
+            collect ← spawn (stepTick domains)
+            awaitEntered fx "claimed"
+            stopped ← spawn (stopSession domains)
+            -- The stop runs on while the publication is held; it must not retire the owners, and so close the
+            -- publisher, under it.
+            replicateM_ 2000 yield
+            releaseGate fx "claimed"
+            outcome ← collect
+            outcome `shouldSatisfy` \case TickFailed _ → True; _ → False
+            _ ← stopped
+            (snapshot, revision) ← snapshotNow domains
+            revision `shouldBe` 1
+            snapStatus snapshot `shouldSatisfy` \case Failed _ → True; _ → False
+
+    forM_ [("an instance's failure", Nothing), ("a task's fault", Just "function update(self, dt) staging.finish() end")] $ \(label, task) →
+      it ("closes admission when " <> label <> " is recorded, before the driver has published it") $ do
+        fx ← newFx
+        ui ← newFakeUi
+        probe ← newEmptyMVar
+        answered ← newIORef Nothing
+        let hook point = when (point == BeforeClaim) (join (readMVar probe))
+            source = maybe ["function update(self, dt) error('update failed') end"] (\ok → [ok, "function task_fails() error('task failed') end"]) task
+            entries = maybe [] (const [EntryPoint "task_fails" Required [] []]) task
+        withBoundary $ \control →
+          withDomains control (sampleConfig fx ui) {configInput = [], configGameplaySource = gameplayWith source, configGameplayEntries = entries, configPublishHook = hook} $ \domains → do
+            -- The driver is told of the failure, and has not yet taken the publication: an offer now is answered closed.
+            putMVar probe $ do
+              answer ← offer domains 0
+              atomicModifyIORef' answered (\held → (maybe (Just answer) Just held, ()))
+            forM_ task $ \_ → admitGameplayTask domains (TaskRequest (ModuleRef "gameplay" "1") "task_fails" [] OrdinaryClass OneShot (Just "faulting task"))
+            _ ← stepTick domains >>= expectFailed
+            readIORef answered `shouldReturn` Just Closed
   where
     isHalted = \case
       TickHalted → True

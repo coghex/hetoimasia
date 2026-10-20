@@ -85,6 +85,7 @@ module Hetoimasia.Sample.LuaDomains.Domains
   ( -- * Configuration
     DomainsConfig (..)
   , defaultConfig
+  , PublishPoint (..)
   , Extension (..)
   , Where (..)
   , tickDuration
@@ -129,6 +130,7 @@ import Control.Exception
   , fromException
   , mask
   , mask_
+  , onException
   , rethrowIO
   , throwIO
   , tryWithContext
@@ -139,7 +141,7 @@ import Data.IORef (modifyIORef', readIORef, writeIORef)
 import qualified Data.Set as Set
 import Data.Int (Int64)
 import qualified Data.List.NonEmpty as NonEmpty
-import Data.Maybe (catMaybes, isJust, listToMaybe)
+import Data.Maybe (catMaybes, isJust, isNothing, listToMaybe)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
@@ -176,11 +178,11 @@ import Hetoimasia.Sample.LuaDomains.Scripts (facadeChunk, gameplayChunk, gamepla
 import Hetoimasia.Sample.LuaDomains.Session
   ( Ended (..)
   , SessionState (..)
+  , claimEnding
   , evidenceNow
   , failedNow
   , markEnded
   , markPublished
-  , recordFailure
   , requestStopNow
   , stopRequestedNow
   )
@@ -188,11 +190,12 @@ import Hetoimasia.Sample.LuaDomains.Shared
   ( ScriptedInput
   , Shared (..)
   , SharedSetup (..)
-  , UiNotes
+  , UiNotes (..)
   , Watched (..)
   , abandonReceipts
   , assignControl
   , captureView
+  , failSession
   , newShared
   , publishInitial
   , publisherOf
@@ -221,6 +224,7 @@ import Hetoimasia.Scripting.Lua.Instance
   , InstanceBounds (..)
   , InstanceConfig (..)
   , InstanceControl (InstanceStop)
+  , InstanceControlAnswer (InstanceControlFull)
   , InstanceError (..)
   , InstanceFailure (..)
   , InstanceId
@@ -351,6 +355,13 @@ data DomainsConfig = DomainsConfig
     -- ^ Test-only: the last word on the gameplay owner's configuration (a request service and subscriptions).
   , configAssignHook ∷ !(IO ())
     -- ^ Test-only: run by a control's assignment before it returns, in the interval before the engine admits it.
+  , configPublishHook ∷ !(PublishPoint → IO ())
+    -- ^ Test-only: run by the publication that ends a session, before it takes the publication and after, in the
+    -- interval before the snapshot is published.
+  , configUiSeesEnd ∷ !Bool
+    -- ^ Whether the session waits, after it has published its ending (a failure or a stop), for the UI to have
+    -- seen it while the UI serves. The executable does; an example whose UI is moved by hand does not unless it is
+    -- the example.
   , configPace ∷ !(Word64 → IO ())
     -- ^ Run after each committed tick of 'runSession'. It paces a session in real time and takes
     -- no part in what a tick contains.
@@ -381,6 +392,8 @@ defaultConfig =
     , configGameplayInstances = []
     , configGameplaySpec = id
     , configAssignHook = pure ()
+    , configPublishHook = const (pure ())
+    , configUiSeesEnd = True
     , configPace = \_ → pure ()
     }
 
@@ -407,6 +420,9 @@ data DomainsDefect
   | -- | The queue's next tick is not the committed tick plus one: the two numberings of ticks
     -- disagree. The tick asked for and the committed tick.
     TickOutOfSequence !Word64 !Word64
+  | -- | The engine refused to admit the stop of a gameplay instance. The pending bound leaves the owner a reservation
+    -- for each instance, so this does not happen; it is a defect of the sample if it does.
+    StopRefused !Text !String
   | -- | A grant was not accepted: the answer.
     TickNotGranted !Word64 !String
   | -- | The gameplay owner ended while the tick was outstanding. The owner's own failure, if it
@@ -464,6 +480,10 @@ data Retirement = Retirement
   , retiredGameplay ∷ !OwnerEnd
   }
   deriving (Show)
+
+-- | Where the publication that ends a session is, for a test that holds it.
+data PublishPoint = BeforeClaim | AfterClaim
+  deriving (Eq, Show)
 
 -- | How a retirement ends the owners.
 data How = Orderly | Cancelled
@@ -634,10 +654,15 @@ extensionNames place shared config =
 -- | Each owner hosts a few instances: the behavior, and a test's extras on the gameplay owner. The bounds
 -- satisfy the scheduler's own requirements of them (retained results at least twice the live instances, and a
 -- queue of admissions that holds each).
+-- | How many instances an owner holds live at once: the behavior and the instances beside it. The engine's reservations
+-- for control are the pending bound and one for the stop of each of these.
+liveInstances ∷ Int
+liveInstances = 4
+
 instanceConfigFor ∷ DomainsConfig → InstanceConfig
 instanceConfigFor config =
   defaultInstanceConfig
-    { instanceBounds = InstanceBounds {boundLiveInstances = 4, boundRetainedInstances = 8, boundInvocationQueue = 8, boundInstanceControls = 8}
+    { instanceBounds = InstanceBounds {boundLiveInstances = liveInstances, boundRetainedInstances = 8, boundInvocationQueue = 8, boundInstanceControls = boundPendingControls (configBounds config) + liveInstances}
     , instanceTickDuration = Just (configTickDuration config)
     }
 
@@ -682,17 +707,37 @@ workerPolicy label =
 -- supervision, and is never a session failure.
 gameplayEscalation ∷ Shared → InstanceFailure → IO Escalation
 gameplayEscalation shared failure = do
-  when (recordable failure) . atomically $ do
+  atomically $ do
     tick ← currentTick shared
-    recordFailure (sharedSession shared) (sessionFailureOf tick failure)
+    forM_ (sessionFailuresOf tick failure) (failSession shared)
   pure Isolate
 
--- | Whether an instance's failure is a failure of script execution: not one whose primary is a failed release.
-recordable ∷ InstanceFailure → Bool
-recordable failure = case (failureStage failure, failureError failure) of
+-- | The session failures an instance's failure tells, in the order they happened: its primary, and then each of what
+-- else failed while it ended (the error its @shutdown@ raised) that is a failure of script execution. A failed
+-- release is cleanup evidence, fatal under supervision, and is never a session failure, whichever it is of the two.
+sessionFailuresOf ∷ Word64 → InstanceFailure → [SessionFailure]
+sessionFailuresOf tick failure =
+  [sessionFailureOf tick failure | scriptFailure (failureStage failure) (failureError failure)]
+    <> [secondaryFailureOf tick failure stage err | (stage, err) ← failureSecondary failure, scriptFailure stage err]
+
+-- | Whether a failure at this stage is a failure of script execution: not a failed release.
+scriptFailure ∷ HookStage → InstanceError → Bool
+scriptFailure stage err = case (stage, err) of
   (StageRelease, _) → False
   (_, ErrorRelease _) → False
   _ → True
+
+-- | What else failed while the instance ended, as the evidence names it.
+secondaryFailureOf ∷ Word64 → InstanceFailure → HookStage → InstanceError → SessionFailure
+secondaryFailureOf tick failure stage err =
+  SessionFailure
+    { failWho = maybe "instance" id (failureName failure)
+    , failPhase = Text.toLower (Text.pack (show (failurePhase failure)))
+    , failStage = stageText stage
+    , failTick = tick
+    , failKind = kindText err
+    , failMessage = boundedMessage (maybe (Text.pack (show err)) id (errorText err))
+    }
 
 -- | The tick a failure is told of at: the tick in progress, or the last committed one.
 currentTick ∷ Shared → STM Word64
@@ -734,13 +779,17 @@ kindText = \case
 
 -- | What the instance's code said: the error it raised, when it raised one, and otherwise the engine's rendering.
 messageOf ∷ InstanceFailure → Text
-messageOf failure = case failureError failure of
-  ErrorFault (BoundaryFailed fault) → case boundaryReason fault of
+messageOf failure = maybe (failureMessage failure) id (errorText (failureError failure))
+
+-- | What an instance's code said in an error, when it was a script error the engine caught.
+errorText ∷ InstanceError → Maybe Text
+errorText = \case
+  ErrorFault (BoundaryFailed fault) → Just $ case boundaryReason fault of
     ScriptFailed _ (ErrorMessage message _) → message
     ScriptFailed _ (ErrorOpaque kind) → "an error value of type " <> kind
     ScriptFailed _ ErrorAbsent → "no error value"
     other → Text.pack (show other)
-  _ → failureMessage failure
+  _ → Nothing
 
 -- | A message with its control characters replaced and cut to the evidence's bound.
 boundedMessage ∷ Text → Text
@@ -932,7 +981,7 @@ watchTasks domains = do
         forM_ (faultOf (settledOutcome settlement)) $ \(kind, message) →
           atomically $ do
             tick ← currentTick shared
-            recordFailure (sharedSession shared) (SessionFailure (watchedName watched) "task" "task" tick kind (boundedMessage message))
+            failSession shared (SessionFailure (watchedName watched) "task" "task" tick kind (boundedMessage message))
         pure Nothing
   writeIORef (sharedTasks shared) (catMaybes remaining)
   where
@@ -1063,13 +1112,15 @@ decide domains tick pausedAtBegin = do
     VerdictCommit candidate → commitTick domains tick candidate
   where
     -- Work finished successfully: gameplay said so, and the instance is serving, with nothing in flight and
-    -- no update owed; or there was no work to do and the engine says why: the behavior is paused, was paused
-    -- as the tick began, or a control was applied at its boundary. A paused instance may hold an update it
-    -- will not run.
+    -- no update owed; or there was no work to do: gameplay's update never began (the wrapper every gameplay
+    -- module's update is given says when it does) and the engine says why: the behavior is paused, was paused
+    -- as the tick began, or a control was applied at its boundary. A control is no proof that the update did not
+    -- run (a request for the state it is already in changes nothing): an update that began must have finished.
+    -- A paused instance may hold an update it will not run.
     acceptable candidate snapshot assigned =
       snapshotExecution snapshot == ExecIdle
         && case snapshotPhase snapshot of
-          Active → not (snapshotUpdateOwed snapshot) && (candidateFinished candidate || pausedAtBegin || assigned)
+          Active → not (snapshotUpdateOwed snapshot) && (candidateFinished candidate || (not (candidateBegan candidate) && (pausedAtBegin || assigned)))
           Instance.Paused → True
           _ → False
 
@@ -1146,39 +1197,54 @@ publishEnding domains ending = mask_ $ do
   let shared = domainsShared domains
       config = domainsConfig domains
       bounds = configBounds config
+      var = sharedSession shared
+  configPublishHook config BeforeClaim
   built ← atomically $ do
-    state ← readTVar (sharedSession shared)
-    evidence ← evidenceNow (sharedSession shared)
-    case (sessionEnded state, ending, evidence) of
-      (Just _, _, _) → pure Nothing
-      (Nothing, EndedByFailure, Nothing) → pure Nothing
-      (Nothing, _, _) → do
-        committed ← readTVar (sharedCommitted shared)
-        dropped ← drain (sharedQueue shared)
-        closeQueue (sharedQueue shared)
-        writeTVar (sharedTick shared) Nothing
-        identity ← snapGameplay <$> readTVar (sharedView shared)
-        let places = map fst dropped
-            listed = take (boundDroppedListed bounds) places
-            omitted = max 0 (length places - boundDroppedListed bounds)
-        (dispositions, status) ← case (ending, evidence) of
-          (EndedByFailure, Just found) → do
-            modifyTVar' (sharedCounts shared) (countInvalidated' (length places))
-            markPublished (sharedSession shared) found
-            pure (noDispositions {dispInvalidated = listed, dispInvalidatedOmitted = omitted}, Failed found)
-          _ → do
-            modifyTVar' (sharedCounts shared) (countDiscarded' (length places))
-            markEnded (sharedSession shared) EndedStopped
-            pure (noDispositions {dispDiscarded = listed, dispDiscardedOmitted = omitted}, Stopped)
-        pure (Just (GameSnapshot (configSession config) (worldTick committed) committed dispositions status identity))
-  forM built $ \snapshot → do
-    prepared ← prepare snapshot
-    atomically $ do
-      publisher ← publisherOf shared
-      publish publisher prepared >>= \case
-        Published → pure ()
-        _ → throwSTM (PublicationRefused (snapTick snapshot))
+    state ← readTVar var
+    evidence ← evidenceNow var
+    if isJust (sessionEnded state) || (isNothing evidence && isFailure ending)
+      then pure Nothing
+      else
+        -- Taking the publication waits for another's to finish, and then there is nothing left to publish.
+        claimEnding var >>= \case
+          False → pure Nothing
+          True → do
+            committed ← readTVar (sharedCommitted shared)
+            dropped ← drain (sharedQueue shared)
+            closeQueue (sharedQueue shared)
+            writeTVar (sharedTick shared) Nothing
+            identity ← snapGameplay <$> readTVar (sharedView shared)
+            let places = map fst dropped
+                listed = take (boundDroppedListed bounds) places
+                omitted = max 0 (length places - boundDroppedListed bounds)
+            (dispositions, status, how) ← case (ending, evidence) of
+              (EndedByFailure, Just found) → do
+                modifyTVar' (sharedCounts shared) (countInvalidated' (length places))
+                markPublished var found
+                pure (noDispositions {dispInvalidated = listed, dispInvalidatedOmitted = omitted}, Failed found, EndedFailed)
+              _ → do
+                modifyTVar' (sharedCounts shared) (countDiscarded' (length places))
+                pure (noDispositions {dispDiscarded = listed, dispDiscardedOmitted = omitted}, Stopped, EndedStopped)
+            pure (Just (GameSnapshot (configSession config) (worldTick committed) committed dispositions status identity, how))
+  forM built $ \(snapshot, how) → do
+    -- The publication is taken and nothing else publishes, or ends the session, or closes the publisher until it is
+    -- made: another call waits in 'claimEnding', so the interval between the claim and the publication is the
+    -- publisher's alone. However it ends, the session has ended, so no waiter is left waiting.
+    (do
+        configPublishHook config AfterClaim
+        prepared ← prepare snapshot
+        atomically $ do
+          publisher ← publisherOf shared
+          publish publisher prepared >>= \case
+            Published → markEnded var how
+            _ → throwSTM (PublicationRefused (snapTick snapshot))
+      )
+      `onException` atomically (markEnded var how)
     pure snapshot
+  where
+    isFailure = \case
+      EndedByFailure → True
+      EndedByStop → False
 
 -- | After a start in which a behavior ended in its init: that is a failure of the session before its first tick,
 -- published beside the initial world; a behavior that is neither serving nor failed is a defect of the sample.
@@ -1208,22 +1274,79 @@ stopSession domains = do
 stopLive ∷ Domains → IO Retirement
 stopLive domains = do
   let shared = domainsShared domains
-  atomically $ do
-    void (requestStopNow (sharedSession shared))
+  first ← atomically $ do
+    asked ← requestStopNow (sharedSession shared)
     closeQueue (sharedQueue shared)
+    pure asked
+  settleGameplay domains first
+  failed ← atomically (failedNow (sharedSession shared))
+  void (publishEnding domains (if failed then EndedByFailure else EndedByStop))
+  afterEnding domains
+
+-- | The end of a finite session that ran its last tick, once, whatever else has ended it.
+settleFinite ∷ Domains → IO Retirement
+settleFinite domains = do
+  retired ← readTVarIO (sharedClosed (domainsShared domains))
+  ended ← sessionEnded <$> readTVarIO (sharedSession (domainsShared domains))
+  if retired || isJust ended then stopSession domains else finishLive domains
+
+-- | The end of a finite session that ran its last tick: the gameplay instances are settled as a stop settles them
+-- (a @shutdown@ that raises, or a lease that does not release, is told of before the publication closes), and then
+-- either that failure is published, as any failure is, or nothing is: the last tick's snapshot stands.
+finishLive ∷ Domains → IO Retirement
+finishLive domains = do
+  let shared = domainsShared domains
+  first ← atomically $ do
+    asked ← requestStopNow (sharedSession shared)
+    closeQueue (sharedQueue shared)
+    pure asked
+  settleGameplay domains first
+  failed ← atomically (failedNow (sharedSession shared))
+  if failed
+    then void (publishEnding domains EndedByFailure)
+    else atomically (markEnded (sharedSession shared) EndedFinished)
+  afterEnding domains
+
+-- | Ask each gameplay instance to stop, once for the session (a repeated stop asks nothing again), wait for each to be
+-- settled, which includes its @shutdown@ and the release of what it held, and run the fence so that every failure
+-- of the settlement has been told. The engine's reservations for control leave one for each instance, so the stop is
+-- admitted whatever the UI holds.
+settleGameplay ∷ Domains → Bool → IO ()
+settleGameplay domains asking = do
   forM_ (domainsGameplay domains : domainsExtras domains) $ \started → do
-    void (requestInstanceControl (scheduledEndpoint (startedOwner started)) (startedInstance started) InstanceStop)
+    when asking $ do
+      asked ← requestInstanceControl (scheduledEndpoint (startedOwner started)) (startedInstance started) InstanceStop
+      case asked of
+        InstanceControlFull → throwIO (StopRefused "gameplay" (show asked))
+        _ → pure ()
     void (awaitInstance (domainsControl domains) (startedTicket started))
   fence domains
   watchTasks domains
-  failed ← atomically (failedNow (sharedSession shared))
-  void (publishEnding domains (if failed then EndedByFailure else EndedByStop))
-  -- The UI reads the settlements of the controls it asked for while it lives; a UI that has ended abandoned its receipts.
+
+-- | What follows the publication that ends the session: the UI reads the settlements of the controls it asked for,
+-- and, when the configuration asks, sees the status that ends the session, while it serves; a UI that has ended
+-- abandoned its receipts and has nothing to see. Then the owners are retired.
+afterEnding ∷ Domains → IO Retirement
+afterEnding domains = do
+  let shared = domainsShared domains
+      config = domainsConfig domains
   awaitSupervised (domainsControl domains) $ do
     held ← readTVar (sharedReceipts shared)
     serving ← uiServing domains
     when (held > 0 && serving) retry
+  when (configUiSeesEnd config) $ do
+    ended ← sessionEnded <$> readTVarIO (sharedSession shared)
+    forM_ (endingWord =<< ended) $ \word →
+      awaitSupervised (domainsControl domains) $ do
+        notes ← readTVar (sharedUiNotes shared)
+        serving ← uiServing domains
+        when (serving && word `notElem` notesSaw notes) retry
   retireDomains domains
+  where
+    endingWord = \case
+      EndedFailed → Just "failed"
+      EndedStopped → Just "stopped"
+      EndedFinished → Nothing
 
 -- | What a finite session did.
 data SessionReport = SessionReport
@@ -1267,7 +1390,7 @@ runSession domains = do
               TickFailed _ → pure True
               TickHalted → pure True
   stoppedEarly ← go 1
-  retirement ← if stoppedEarly then stopSession domains else retireDomains domains
+  retirement ← if stoppedEarly then stopSession domains else settleFinite domains
   -- Both owners have ended: what supervision committed of either is raised, and the statuses the evidence reads are its decisions.
   checkRuntime (domainsControl domains)
   evidence ← cleanupEvidence domains

@@ -26,6 +26,7 @@ module Test.Domains.Support
   , fxLines
   , awaitLine
   , awaitEntered
+  , holdAt
   , releaseGate
   , fxMarks
   , luaLines
@@ -70,7 +71,7 @@ import Hetoimasia.Runtime.Supervision (RuntimeControl, awaitSupervised, withSupe
 import Hetoimasia.Sample.LuaDomains
   ( Bounds (boundWorkspaces)
   , Domains (domainsConfig, domainsControl, domainsShared)
-  , DomainsConfig (configExtensions, configTicks, configUiClock, configUiInterval, configUiTimer)
+  , DomainsConfig (configExtensions, configTicks, configUiClock, configUiInterval, configUiSeesEnd, configUiTimer)
   , Extension (Extension)
   , Where (InBoth)
   , TickOutcome (TickCommitted)
@@ -84,7 +85,8 @@ import Hetoimasia.Sample.LuaDomains.Snapshot (FailureEvidence, GameSnapshot (sna
 import Hetoimasia.Sample.LuaDomains.Intention (Answer, Submitted (Submitted))
 import Hetoimasia.Sample.LuaDomains.Queue (isClosed, reserved)
 import Hetoimasia.Sample.LuaDomains.Tally (Counts (countAccepted), settledTotal)
-import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCounts, sharedQueue, sharedReceipts, sharedUpdates), SharedSetup (..), newShared, readerOf, submit)
+import Hetoimasia.Sample.LuaDomains.Session (Ended (..), SessionState (sessionEnded))
+import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCounts, sharedQueue, sharedReceipts, sharedSession, sharedUiNotes, sharedUpdates), SharedSetup (..), UiNotes (notesSaw), newShared, readerOf, submit)
 import Hetoimasia.Scripting.Lua.Lease (newLeases)
 import Hetoimasia.Scripting.Lua.Lending (newLending)
 import Hetoimasia.Scripting.Lua.Registration (Namespace, namespace, stateOperation)
@@ -126,6 +128,7 @@ sampleConfig fx ui =
     { configUiClock = fakeSource ui
     , configUiTimer = fakeTimer ui
     , configTicks = Nothing
+    , configUiSeesEnd = False
     , configExtensions = \shared → [Extension (fxNamespace fx shared) InBoth []]
     }
 
@@ -236,6 +239,14 @@ fxNamespace fx shared =
           pure []
         _ → pure []
     ]
+
+-- | Hold the calling thread at the gate of this name until the example releases it: what @fx.hold@ does in a
+-- script, for a seam an example puts in the application's own code.
+holdAt ∷ Fx → Text → IO ()
+holdAt fx name = do
+  gate ← gateFor fx name
+  void (tryPutMVar (gateEntered gate) ())
+  readMVar (gateReleased gate)
 
 -- | The lines scripts recorded, oldest first.
 fxLines ∷ Fx → IO [Text]
@@ -366,7 +377,8 @@ uiStep domains ui = do
   awaitUpdates domains (done + 1)
 
 -- | Stop the session while the UI is serving, keeping the UI's updates coming as its timer would until the stop has
--- returned: the stop waits for the UI to read the settlements of the controls it asked for.
+-- returned: the stop waits for the UI to read the settlements of the controls it asked for, and, when the
+-- configuration asks, to see the status that ends the session.
 stopServing ∷ Domains → FakeUi → IO ()
 stopServing domains ui = do
   finished ← newTVarIO False
@@ -374,10 +386,25 @@ stopServing domains ui = do
   let go = do
         next ← waitFor $ do
           done ← readTVar finished
-          held ← readTVar (sharedReceipts (domainsShared domains))
           live ← liveRegistrations ui
-          if done then pure False else if held > 0 && not (null live) then pure True else retry
+          owes ← uiOwes domains
+          if done then pure False else if owes && not (null live) then pure True else retry
         when next (uiStep domains ui >> go)
   go
   _ ← stopped
   pure ()
+
+-- | What the stop is waiting for the UI to do: read the settlements of the controls it asked for, and, when the
+-- configuration asks for it, see the status that ends the session once that is published.
+uiOwes ∷ Domains → STM Bool
+uiOwes domains = do
+  let shared = domainsShared domains
+  held ← readTVar (sharedReceipts shared)
+  state ← readTVar (sharedSession shared)
+  notes ← readTVar (sharedUiNotes shared)
+  let word = case sessionEnded state of
+        Just EndedFailed → Just "failed"
+        Just EndedStopped → Just "stopped"
+        _ → Nothing
+      unseen = configUiSeesEnd (domainsConfig domains) && maybe False (`notElem` notesSaw notes) word
+  pure (held > 0 || unseen)

@@ -61,7 +61,9 @@ module Hetoimasia.Sample.LuaDomains.Shared
   , gameplayWorld
   , gameplayStage
   , gameplayDraw
+  , gameplayBegan
   , gameplayFinish
+  , failSession
     -- * Workspaces
   , Workspace (..)
   , openWorkspace
@@ -101,11 +103,11 @@ import Hetoimasia.Foundation.Messaging.Snapshot
   , snapshotReader
   )
 import Hetoimasia.Foundation.Resource (acquirePart, releaseRank)
-import Hetoimasia.Sample.LuaDomains.Bounds (Bounds)
-import Hetoimasia.Sample.LuaDomains.Candidate (Candidate (..), Move, StagingRefusal, draw, finish, stage)
+import Hetoimasia.Sample.LuaDomains.Bounds (Bounds (boundPendingControls))
+import Hetoimasia.Sample.LuaDomains.Candidate (Candidate (..), Move, StagingRefusal, begin, draw, finish, stage)
 import Hetoimasia.Sample.LuaDomains.Intention (Answer (..), FullCause (..), Submitted, validate)
-import Hetoimasia.Sample.LuaDomains.Queue (AdmitAt (..), Queue, admitNext, isClosed, newQueue, nextUnstarted)
-import Hetoimasia.Sample.LuaDomains.Session (SessionState, failedNow, newSessionState, stopRequestedNow)
+import Hetoimasia.Sample.LuaDomains.Queue (AdmitAt (..), Queue, admitNext, closeQueue, isClosed, newQueue, nextUnstarted)
+import Hetoimasia.Sample.LuaDomains.Session (SessionState, failedNow, newSessionState, recordFailure, stopRequestedNow)
 import Hetoimasia.Sample.LuaDomains.Snapshot (GameSnapshot, SessionFailure, initialSnapshot)
 import Hetoimasia.Sample.LuaDomains.Tally
   ( ControlCounts (..)
@@ -310,7 +312,7 @@ noteRetry shared = atomically (modifyTVar' (sharedUiNotes shared) (\notes → no
 noteSaw ∷ Shared → Text → IO ()
 noteSaw shared status = atomically $
   modifyTVar' (sharedUiNotes shared) $ \notes →
-    if take 1 (reverse (notesSaw notes)) == [status] || length (notesSaw notes) >= 8
+    if take 1 (reverse (notesSaw notes)) == [status] || (length (notesSaw notes) >= 8 && status `notElem` ["failed", "stopped"])
       then notes
       else notes {notesSaw = notesSaw notes <> [status]}
 
@@ -357,7 +359,10 @@ assignControl shared _ = do
     closed ← isClosed (sharedQueue shared)
     failed ← failedNow (sharedSession shared)
     stopping ← stopRequestedNow (sharedSession shared)
-    if closed || failed || stopping
+    held ← readTVar (sharedReceipts shared)
+    -- The engine holds a reservation for each accepted control until its receipt is read; the owner has as many
+    -- as the pending bound and one more for each instance the stop must reach, so the stop is always admitted.
+    if closed || failed || stopping || held >= boundPendingControls (sharedBounds shared)
       then pure Nothing
       else do
         tick ← nextUnstarted (sharedQueue shared)
@@ -368,6 +373,13 @@ assignControl shared _ = do
         pure (Just (ControlSlot tick order))
   sharedAssignHook shared
   pure slot
+
+-- | Tell the session of a failure: it is recorded, and admission to the queue closes in the same transaction, so no
+-- intention is accepted for a tick after the failure that will never run it, whenever the driver gets to publish.
+failSession ∷ Shared → SessionFailure → STM ()
+failSession shared failure = do
+  recordFailure (sharedSession shared) failure
+  closeQueue (sharedQueue shared)
 
 -- Gameplay ---------------------------------------------------------------------
 
@@ -402,6 +414,10 @@ gameplayDraw shared bound = atomically (withCandidate shared Nothing $ \candidat
   case draw bound candidate of
     Nothing → (Nothing, candidate)
     Just (value, next) → (Just value, next))
+
+-- | Say gameplay's update has begun in the tick. Answers whether there was a tick.
+gameplayBegan ∷ Shared → IO Bool
+gameplayBegan shared = atomically (withCandidate shared False (\candidate → (True, begin candidate)))
 
 -- | Say gameplay's work for the tick is done. Answers whether there was a tick to finish.
 gameplayFinish ∷ Shared → IO Bool

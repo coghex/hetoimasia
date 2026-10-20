@@ -1,6 +1,19 @@
-
--- Appended to every gameplay module: the entry point of the fence task the driver admits after each tick
--- (see `Hetoimasia.Sample.LuaDomains.Domains`). It does nothing, and that is the point: the owner runs it
--- only after everything the tick left to do, so its settlement says the owner has done that.
+-- Appended to every gameplay module (after the script's own code).
+--
+-- The fence's entry point: the driver admits a task of it after each tick (see
+-- `Hetoimasia.Sample.LuaDomains.Domains`). It does nothing, and that is the point: the owner runs it only after
+-- everything the tick left to do, so its settlement says the owner has done that.
 function sample_fence()
+end
+
+-- The update wrapper: if the script defined an `update`, it is replaced by one that first says, through the
+-- application's own binding, that an update began in this tick, and then runs the script's. A tick whose update
+-- never began (the behavior is paused, or this is the tick that resumes it) is therefore told apart, by the
+-- application and not by guessing from the engine's counters, from one whose update began and never finished.
+if type(update) == "function" then
+  local scripted = update
+  function update(...)
+    staging.began()
+    return scripted(...)
+  end
 end

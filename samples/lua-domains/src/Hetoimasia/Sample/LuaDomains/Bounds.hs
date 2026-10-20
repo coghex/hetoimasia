@@ -56,12 +56,16 @@ data Bounds = Bounds
     -- the rest are counted.
   , boundWorkspaces ∷ !Int
     -- ^ The most workspaces one gameplay instance holds charged at once: the capacity of its leases.
+  , boundPendingControls ∷ !Int
+    -- ^ The most controls the UI may hold accepted and unread at once. The engine holds a reservation for each until its
+    -- receipt is read, and the owner's reservations are this many and one for each instance the stop must reach, so a
+    -- stop can always be admitted.
   }
   deriving (Eq, Show)
 
 -- | Eight entities, moves of at most eight in each direction, twelve intentions waiting
 -- at most, eight to a tick, four stale rejections listed, four staged moves, eight dropped
--- intentions listed and two workspaces for each gameplay instance.
+-- intentions listed, two workspaces for each gameplay instance and four controls pending.
 defaultBounds ∷ Bounds
 defaultBounds =
   Bounds
@@ -73,6 +77,7 @@ defaultBounds =
     , boundStaging = 4
     , boundDroppedListed = 8
     , boundWorkspaces = 2
+    , boundPendingControls = 4
     }
 
 -- | Whether one component of a move is within the bound on deltas. Two direct comparisons, so that
@@ -106,6 +111,7 @@ validateBounds bounds =
       , ("staging", boundStaging bounds)
       , ("dropped-listed", boundDroppedListed bounds)
       , ("workspaces", boundWorkspaces bounds)
+      , ("pending-controls", boundPendingControls bounds)
       ]
   , value < 1
   ]

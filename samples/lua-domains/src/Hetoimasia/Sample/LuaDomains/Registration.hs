@@ -61,6 +61,7 @@ import Hetoimasia.Sample.LuaDomains.Shared
   , controlSettled
   , currentView
   , gameplayDraw
+  , gameplayBegan
   , gameplayFinish
   , gameplayStage
   , gameplayWorld
@@ -215,6 +216,8 @@ stagingNamespace shared =
           | entity >= 0 && entity <= fromIntegral (maxBound ∷ Int) →
               (\answer → [VBoolean (answer == Staged)]) <$> gameplayStage shared (Move (fromIntegral entity) dx dy)
         _ → pure [VBoolean False]
+    , -- Said by the wrapper every gameplay module's update is given, before the script's own code runs.
+      stateOperation "began" [] [] $ \_ → [] <$ gameplayBegan shared
     , stateOperation "finish" [] [] $ \_ → [] <$ gameplayFinish shared
     ]
 
