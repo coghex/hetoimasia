@@ -980,6 +980,29 @@ cost of understanding commit boundaries. These are examples, not new APIs or
 game-specific engine behavior. Pause/stop dispositions, exact checkpoint
 spelling and initial-state construction remain open.
 
+### D-36. A rejected gameplay state mutation fails the tick
+
+Owner answer, **2026-10-21 18:41:59 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: fail the tick (Rec.)
+
+Authenticated relay: `het-manager`, message `52nacc9w84v29zwvg3jbw25bkn`,
+posted **2026-10-21 18:41:59.736 UTC** in `#het-luafirst`, replying to Q-5g
+message `yfsx2kt72zpu8yegu7ndgt73xe`.
+
+P-32 option A is accepted: a rejected authoritative mutation is a gameplay
+failure. The refused operation changes nothing, and no writes from that tick
+commit. Catching the error cannot clear the recorded failure. Gameplay stops
+with the last good snapshot; a healthy UI shows the attributed error under
+D-19/D-26. There is no automatic retry or recoverable try-write exception.
+
+The manager presented the coin/item example and the strict cost: stale targets
+and full-container rejections also stop gameplay. Lua handles expected game
+conditions such as insufficient coins or a full inventory before attempting
+invalid mutations. Exact target validity, permissions, limits and query results
+remain separate contracts; this decision chooses rejection escalation.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -2190,7 +2213,7 @@ individual-write rejection remain later checkpoints; slices remain unset.
 
 ### P-32. A rejected authoritative mutation fails the gameplay tick
 
-**Unapproved; active checkpoint Q-5g.** Recommend A: an invalid attempt to
+**Option A accepted by D-36.** An invalid attempt to
 mutate authoritative state during a gameplay tick records a gameplay failure.
 Examples include a wrong component value type, an out-of-range value, exceeding
 a declared/store capacity limit, an invalid mutation target or a disallowed
@@ -2248,6 +2271,69 @@ rest of its batch intact. A deliberately chooses a stricter policy for the new
 generic launcher/store, requiring failure recording on rejected mutation paths
 and commit/accounting checks even when Lua catches the error. No such generic
 store policy is claimed implemented. Delivery slices remain unset.
+
+### P-33. Entity references do not keep their targets alive
+
+**Unapproved; active checkpoint Q-5h.** Recommend A: entity references are
+non-owning identities. Deleting an entity removes that entity and its components
+from the working state, but does not delete other entities, clear their fields,
+edit their lists/maps or refuse deletion because they refer to it. Such fields
+can retain a reference whose target no longer exists. For example, an NPC can
+be deleted while a quest still records it as its target; Lua decides whether
+that means the quest failed, completed or needs a new target.
+
+A valid current-session entity reference remains valid component data after
+its target is deleted, so copying a record containing it is allowed. This is
+different from using the deleted entity as the target of a mutation: that
+mutation is invalid and fails the tick under D-36. Malformed or foreign-session
+reference values do not become valid merely because missing targets are allowed.
+The concrete representation, allocation bounds and validation encoding follow
+separately; this is not a permission to inject arbitrary native handles.
+
+Both options below include these identity/read guarantees:
+
+- A reference never silently starts naming a different entity after deletion.
+  A new entity has a distinct identity, even if physical storage is reused.
+  References are scoped to the session; they are not stable save-file IDs.
+  Allocator/reuse representation and save scope are separate decisions.
+- Existence checks and optional component lookup let Lua handle a well-formed
+  current-session reference to a deleted entity, or a missing component, as
+  ordinary absence without failing gameplay. Exact result spelling is open;
+  absence must be distinguishable from malformed input or engine failure.
+  No placeholder entity/component is created by a read.
+- Gameplay checks observe the current working state (D-33); UI checks observe
+  its coherent committed snapshot. A UI snapshot from before deletion can
+  still contain the entity. Gameplay must revalidate later UI intentions;
+  this is not permission for UI commands to mutate stale state unchecked.
+- Checking and acting without yielding avoids another gameplay hook intervening
+  between those operations on the same VM (D-34). After any yield/checkpoint,
+  Lua must re-check when its action depends on continued existence. Read
+  results remain copies, not lifetime locks.
+
+Alternative B enforces live-target relationships in stored component data:
+writing a reference to a missing entity is invalid, and deleting an entity
+while references from other surviving entities still point to it is refused
+(therefore tick-fatal under D-36). Lua must clear/repoint those references
+before deletion. B still does not cascade-delete or automatically rewrite
+other entities. It requires incoming-reference tracking or bounded scanning
+through nested records/lists/maps, and coordination across mods that hold
+references. Copies in Lua locals or old UI snapshots cannot be protected by
+that stored-state rule and still need existence checks.
+
+A is recommended because game-defined relationships need different deletion
+policies, and one mod retaining a reference should not automatically prevent
+another from deleting an entity. Its cost is that schema-valid state can
+contain missing targets: game/mod authors must handle absence and deliberately
+clean up relationships when appropriate. The engine cannot infer ownership or
+quest semantics from a reference field. This adds no implicit entity garbage
+collection, native-resource ownership or cross-session persistence. Value-write
+permissions and entity/component query ordering remain open.
+
+Evidence: D-31 already distinguishes reference data from native leases but
+leaves validity/deletion open. The lua-domains sample has a fixed entity set
+and does not implement generic deletion or relationship tracking. Either
+choice requires new store operations and read validation; no implementation
+or delivery slice is claimed here.
 
 ## Open questions
 
@@ -2475,12 +2561,17 @@ completion/failure accounting remain required.
 
 #### Q-5g. Does a rejected state mutation fail the tick or permit recovery?
 
-The only active checkpoint: P-32 option A (recommended, record a gameplay
-failure and discard the tick even if Lua catches the error) or B (structured
-refusal; earlier writes may still commit), or an owner-specified revision.
-Both reject the individual operation without partial mutation. A is strict
-even for invalid/stale targets and capacity limits; B requires author-managed
-consistency across separate writes. Exact validation and query APIs follow.
+Resolved by D-36: record a gameplay failure and discard the tick even if Lua
+catches the rejected mutation's error. Invalid/stale targets and capacity
+rejections are included; exact validation and query APIs follow.
+
+#### Q-5h. May stored entity references outlive their targets?
+
+The only active checkpoint: P-33 option A (recommended, non-owning references
+may remain after deletion; Lua handles missing targets) or B (stored references
+must target live entities and block deletion until cleared), or an owner-
+specified revision. Both preserve identity without silent retargeting, provide
+non-fatal absence checks, and forbid implicit cascading deletion or field edits.
 
 ### Q-6. Which services and UI behavior does Lua drive in this arc?
 
