@@ -561,7 +561,35 @@ The manager summarized all five parts and the advice to keep init short.
 The owner chose "Approve as proposed", not "Approve + progress": the early
 loading screen gets starting/root-readiness status, with no detailed progress
 channel from gameplay init. The original concurrent-start request remains
-quoted under Q-3e. Post-start failure policy and exact diagnostics remain open.
+quoted under Q-3e. D-19 subsequently settles post-start root failure policy;
+exact diagnostics remain open.
+
+### D-19. Keep healthy UI available after a gameplay root failure
+
+Owner answer, **2026-10-21 16:03:29 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: UI shows the error (Rec.)
+
+Authenticated relay: `het-manager`, message `en3y2uv2mgduvh3d6ug7bnhzi6`,
+posted **2026-10-21 16:03:30.012 UTC** in `#het-luafirst`, replying to Q-3f
+message `aiittxgyf34n5bkskpgrb2g7re`.
+
+P-15 option A is accepted. After startup, gameplay root failure stops simulation,
+refuses new gameplay commands, discards uncommitted work and preserves the last
+committed state. Healthy presentation continues with a bounded failure view
+and frozen world until exit; Lua authors handle that status to show an error.
+Without such handling the screen may remain unchanged until quit. There is
+no automatic timeout, restart or retry, and the eventual exit reports failure.
+A presentation root failure ends the session, as does failure in a one-role
+session. D-18 still governs startup; host/provider/cleanup failures remain
+fatal and engine-owned retirement remains mandatory.
+
+The manager described the healthy-UI behavior as matching V-9's rule that an
+unsafe authoritative-state failure stops gameplay while UI can report it.
+That rule is present in the current vision; this answer does not approve the
+separate trust/confinement reconciliation still required by Q-8. Exact error
+schema/exit codes and additional instance/mod failure policy remain open.
 
 ## Proposals
 
@@ -897,7 +925,7 @@ the concurrent launcher protocol is new work, not claimed delivered behavior.
 
 ### P-15. Preserve a healthy presentation root after a gameplay root failure
 
-**Unapproved; active checkpoint Q-3f.** Recommend A for ordinary root-script
+**Option A accepted by D-19.** For ordinary root-script
 failures after successful startup: a gameplay root failure ends simulation,
 while a healthy presentation root continues to render and receive input so
 Lua can show the error. Close gameplay admission and tick grants immediately;
@@ -949,7 +977,61 @@ Evidence: `samples/lua-domains` retains the last good world and accounts for
 gameplay settlement before publishing final failure, and lets UI observe the
 end. It also isolates UI failure while gameplay continues; that sample policy
 is deliberately not assumed for this launcher. Keeping healthy UI alive until
-explicit exit is a proposed launcher policy, not an existing sample guarantee.
+explicit exit is the accepted launcher design, not an existing sample guarantee.
+
+### P-16. Reuse console outcome conventions and the two-signal escape
+
+**Unapproved; active checkpoint Q-3g.** Recommend A: the new game-launch path
+uses the existing console outcome conventions, with these explicit mappings:
+
+| Exit status | Game-launch outcome |
+| --- | --- |
+| 0 | Explicit normal session quit/cancellation completes without failure |
+| 1 | Content/manifest/entry/boot failure, root-script failure, or host/cleanup failure |
+| 2 | Invalid command-line syntax or arguments, diagnosed before game execution |
+| 130 | An orderly SIGINT/SIGTERM interruption without failure; also the forced second-signal path below |
+
+A broken game manifest or invalid Lua behavior is a game/boot failure (1),
+not command-line misuse (2). During orderly exit, failure outranks interruption,
+which outranks success: quitting from D-19's error UI still returns 1. A normal
+Lua session-exit request starts orderly teardown of the whole session; it does
+not merely pause gameplay or leave the UI running. Repeated requests are
+idempotent. Window-close behavior and the exact Lua exit binding remain part
+of the service design, not inferred from this choice.
+
+Diagnostics go to stderr independently of the Lua error screen; authored
+application output/print uses stdout, and warnings/logging use stderr. Reports
+identify component/operation and, where available, role, source content root
+and path, lifecycle stage, last committed/failing tick, traceback and retained
+cleanup failures. Preserve the primary error when reporting or teardown also
+fails. Diagnostics and the UI failure view are bounded with visible truncation;
+exact field names/limits and machine-readable formatting remain to be specified.
+This does not add a world-save or crash-dump feature.
+
+The first SIGINT or SIGTERM asks the coordinator to stop the entire session
+without waiting in the signal handler. Close admission/grants, discard
+uncommitted work, request cancellation and complete orderly shutdown and
+protected retirement, including startup and D-19's surviving error UI. A
+second signal while stopping forces process exit 130, without waiting for
+remaining hooks/cleanup or flushing output. This exceptional forced exit
+cannot promise cleanup or a complete diagnostic report, and always returns
+130 even if failure had already been recorded. Lua gets only the orderly
+session-exit request, not a force-exit capability. Handlers are scoped to the
+new launch path; existing commands keep their behavior.
+
+Alternative B keeps the same reports, outcome mapping and orderly first-signal
+stop, but subsequent signals never force exit. B avoids a launcher escape
+which skips cleanup; hung trusted Lua then requires the user to terminate the
+process externally. A is recommended because this explicit two-step escape
+already exists on the trusted `lua` command and is useful when cooperative
+shutdown cannot finish. It is a user-requested process termination, not script
+containment or a timeout/retry policy.
+
+Evidence: `packages/scripting-lua/README.md` (The executable, Exit statuses,
+Signals) documents 0/1/2/130, failure precedence, stderr/stdout separation and
+the second-signal forced exit. The new launch path needs its own outcome
+mapping and native-resource/partial-start integration; reuse is a design
+choice, not a claim that its lifecycle has already been implemented.
 
 ## Open questions
 
@@ -1064,12 +1146,16 @@ The owner did not select the extra progress-channel alternative.
 
 #### Q-3f. May healthy UI continue after a gameplay root fails at runtime?
 
-The only active checkpoint: P-15 option A (recommended, stop failed gameplay
-and keep healthy UI until explicit exit; UI failure ends the session) or B
-(either root failure ends the session), or an owner-specified revision.
-Both preserve the last committed state, report failure and perform engine-owned
-cleanup without retry. Fatal host/cleanup failures and startup failures retain
-their existing rules. Exact diagnostics/exit codes and child/mod policy follow.
+Resolved by D-19: keep healthy presentation after gameplay failure until exit;
+presentation failure ends the session. Exact diagnostics/exit codes and
+child/mod policy follow.
+
+#### Q-3g. Reuse console outcomes with a second-signal forced-exit escape?
+
+The only active checkpoint: P-16 option A (recommended, console outcome/report
+contract with orderly first signal and forced exit on a second) or B (same
+contract, orderly signals only), or an owner-specified revision. Manifest/CLI
+spelling, native close requests and diagnostic field spellings remain separate.
 
 ### Q-4. How are mods discovered, ordered and combined?
 
