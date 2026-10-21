@@ -832,6 +832,64 @@ changes, including new API dependents require, advance the revision;
 implementation/content-only releases need not. Fingerprints, manifest-format
 version, engine binding compatibility and saves remain separate as P-25 states.
 
+### D-30. Use engine-owned entities with Lua-defined components
+
+Owner answer, **2026-10-21 17:25:15 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: entities + components (Rec.)
+
+Authenticated relay: `het-manager`, message `myhqi8zc7gtgqp5i8dkswm3tnw`,
+posted **2026-10-21 17:25:15.745 UTC** in `#het-luafirst`, replying to Q-5a
+message `6u957ufyvg2ea3pgxry36nr9mw`.
+
+Before choosing, the owner asked, verbatim:
+
+> this sounds like an important decision, can you explain why the recommended option sounds better to you
+
+The manager then gave its own reasoning: mods can attach components without
+coordinating changes to a common entity record; engine commit/digest and later
+save/tool facilities benefit from a common vocabulary; the entity/version and
+ID-ordered digest sample offers a starting point; and a component is a small
+change unit. It also explained the costs: opinionated entity organization,
+world entities and list/map values for global/document-shaped data, with static
+definitions potentially outside the store. It identified document-heavy or
+narrative games as a case for B. The manager re-asked after this explanation;
+the owner then selected A. The explanation's separate time was not supplied.
+
+P-26 option A is accepted: the engine owns entities with stable identities
+and Lua-defined, schema-checked named component data. Lua defines rules;
+gameplay changes are committed by the engine and UI consumes coherent views.
+No game-specific component types, physical storage layout, parallel-system
+scheduler or performance claim is selected. Independent component addition
+does not waive schema registration/validation or conflict handling. The
+manager's save/tool examples are rationale, not approved scope; exact digest,
+identity/version rules and list/map support still need their own contracts.
+
+### D-31. Use bounded nested component data with typed lists and maps
+
+Owner answer, **2026-10-21 17:28:37 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: nested + lists/maps (Rec.)
+
+Authenticated relay: `het-manager`, message `b7nb2v44mexhzmab8zcffch92s`,
+posted **2026-10-21 17:28:37.095 UTC** in `#het-luafirst`, replying to Q-5b
+message `3nv87fvwnd8napcrfa5r9ux6f2`.
+
+P-27 option A, including its shared base types and exclusions, is accepted:
+fixed-field nested records, homogeneous dense lists and typed text-keyed maps,
+with absent optional fields, no list holes and non-recursive schemas. String/
+container limits plus engine depth/byte/element ceilings bound validation and
+storage. Values are copied data; no live Lua object identity, metatables,
+cycles, code or native handles enter the state. Integer/float distinctions,
+finite floats, UTF-8 checks and atomic rejection remain as stated in P-27.
+
+The manager illustrated an inventory list of `{item, count}` records and a
+quest-state map. These are examples, not prescribed game component schemas
+or API spelling. Exact limits, reference lifetime, transaction rejection policy
+and canonical/query ordering remain open.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -1712,7 +1770,7 @@ host behavior or proof that arbitrary shared Lua code is compatible.
 
 ### P-26. Store authoritative state as entities with Lua-defined components
 
-**Unapproved; active checkpoint Q-5a.** Recommend A: the generic engine state
+**Option A accepted by D-30.** The generic engine state
 store owns entities with stable identities and named, schema-checked component
 records. Lua game/mod code declares component schemas and game rules; the
 engine validates and stores their data and commits changes at logical tick
@@ -1759,6 +1817,108 @@ world with staged per-tick changes and coherent snapshots, but its entity
 fields and transaction are sample-specific. No generic schema/component store
 is claimed delivered. D-3 selects engine ownership, while V-1 keeps concrete
 game rules out of engine packages; this proposal chooses the missing shape.
+
+### P-27. Allow bounded typed records, lists and text-key maps in components
+
+**Option A accepted by D-31.** Component schemas describe
+plain copied data using booleans, signed 64-bit integers, finite floats, UTF-8
+text, typed entity references and typed content references. Schemas can combine
+these into fixed-field records, homogeneous dense lists and homogeneous maps
+with UTF-8 text keys. Optional record fields may be absent. These allow, for
+example, an inventory list or a map of quest flags without requiring a separate
+entity for each list item or flag. They are still schema-checked component
+data, not arbitrary VM objects.
+
+Every string/container has declared finite size limits; schema nesting and
+total component/value bytes/elements also have engine-enforced ceilings. The
+exact limits and aggregate store/transaction budgets follow separately. Record
+fields are declared, unknown fields are refused, lists have no holes, and map
+values have one declared type. Nil represents an absent optional field, not
+a retained list element or map value. Schemas are finite/non-recursive;
+relationships between entities use references instead of cyclic value graphs.
+References are data identities, not ownership of another entity or a live
+native lease; their representation, validity and deletion rules follow.
+
+Copy/validate across the Lua boundary without invoking metamethods. Refuse
+metatables, cycles, functions, coroutines and live native handles. Aliased Lua
+tables contribute copied values, not retained alias identity. Integers and
+floats stay distinct, with no silent coercion; refuse NaN/infinity in stored
+float fields. Text must be valid UTF-8; arbitrary binary blobs are not a state
+type in this proposal. Out-of-range, wrong-type or over-budget data is rejected
+without partial mutation, never truncated or silently clamped. Whether a
+reported rejection is recoverable in the enclosing tick follows with the
+transaction API; this choice does not settle that failure policy.
+
+Alternative B starts with flat fixed-field component records containing only
+those scalar/reference types, no nested records/lists/maps. Games represent
+collections and relationships using more entities/components. B has a smaller
+validator and mutation surface, but makes inventory, quests and document-like
+data less direct. A is recommended for the Lua authoring surface: bounded
+containers support those common shapes while preserving copied state and
+finite validation. Its cost is recursive schema/value validation, container
+limits and deterministic traversal/encoding rules to specify and test.
+
+Evidence: the Lua host already supports bounded copies of typed integers,
+floats, UTF-8 text, records and dense lists, refuses metatables/cycles and
+distinguishes absent optional fields (Lua host README, Values). Dynamic typed
+maps, state-specific finite floats, schema-defined limits and state references
+are additional store/binding work, not claimed as existing host features.
+Query order, canonical digest encoding, container edit granularity and schema
+registration remain later contracts.
+
+### P-28. Register owned component schemas during gameplay init and then freeze
+
+**Unapproved; active checkpoint Q-5c.** Recommend A: the game gameplay root
+and each gameplay mod instance register component schemas from their finite
+init hooks, in D-25's root-first/dependency order. Module top level may define
+plain schema-description tables for later use, but cannot register them
+(D-8). Presentation cannot register authoritative schemas. Content-only mods
+may supply description helpers; an owning gameplay initializer performs any
+registration. Presentation-only sessions have no authoritative state catalog.
+
+A component type's identity is the registering game/mod content ID plus a
+local type name. For example, `game-id:position` and `weather-mod:temperature`
+illustrate the identity, not its final syntax. The engine derives the namespace
+from the active instance; callers cannot register in someone else's namespace.
+Mod types can be attached alongside game types without editing a central game
+entity schema. Other components may be used by their qualified identity
+through the eventual state API; registration ownership is not a decision about
+who may read/write component values.
+
+Reject duplicate full identities, even with identical descriptions; there is
+no schema overwrite or load-order winner. Use lookup for an existing type,
+rather than idempotent re-registration. Invalid schemas or duplicate registration
+fail boot with declaring instance/type provenance; catching a Lua error does
+not turn that invalid configuration into a successful boot. Registration is
+atomic: refusal never leaves a partial schema behind. Schema/name/count bounds
+and name grammar follow with the budget and API contracts.
+
+After the gameplay initialization chain succeeds, freeze the catalog before
+the joint startup transition publishes the initial world. No later addition,
+removal, field extension or replacement of a schema is accepted in this
+session. Loading new rooms/modules at runtime remains allowed, but their state
+must use already declared types. Schema data belongs to the session's state
+store and remains available with committed snapshots, including D-19's error
+UI; it is not a native resource lease destroyed when its declaring mod ends.
+The gameplay owner is the sole registration writer; presentation sees only
+the frozen schema/view published through the normal cross-domain boundary.
+
+Alternative B allows new, uniquely named component types to be added at runtime
+through an explicit logical-tick operation; existing types still cannot change
+or disappear. B supports content which introduces previously unknown types,
+but requires schema additions to join transaction accounting, snapshot/catalog
+versioning, capacity limits and deterministic replay. A is recommended to
+keep the initial state contract stable; its cost is declaring every type needed
+by later-loaded content during startup, or starting a new session to add types.
+Neither choice permits schema migration or silently expands Q-10's hot-swap
+scope. Game extension-definition conflicts remain separate from schema identity
+collisions; this is not a universal replacement registry.
+
+Evidence: D-25 supplies ordered gameplay initialization, D-30/D-31 require
+engine-owned validated component data, and D-8 reserves effects for hooks.
+The current host validates binding schemas separately, but has no generic
+state-schema registry. This proposal requires new store registration, phase
+checks, bounded validation and immutable schema publication.
 
 ## Open questions
 
@@ -1948,11 +2108,24 @@ game-specific save semantics remain game-owned under the existing rules.
 
 #### Q-5a. Entity/component state or generic named records?
 
-The only active checkpoint: P-26 option A (recommended, engine-owned entities
-with Lua-defined component schemas) or B (schema-checked named tables/records
-with game-defined entity conventions), or an owner-specified revision. Exact
-values, schema registration, identity/query rules and transactional behavior
-remain separate decisions; no physical storage layout is selected here.
+Resolved by D-30 after the manager's explanation and the owner's explicit
+choice. Exact values, schema registration, identity/query rules and transaction
+behavior remain separate decisions; no physical storage layout is selected.
+
+#### Q-5b. Bounded nested data or flat scalar/reference components only?
+
+Resolved by D-31: bounded typed records/lists/text-key maps and P-27's base
+types/exclusions. Exact budgets, reference lifetime, transaction rejection
+handling and digest/query ordering follow separately.
+
+#### Q-5c. Freeze the schema catalog after init or permit runtime additions?
+
+The only active checkpoint: P-28 option A (recommended, register namespaced
+schemas during gameplay init, then freeze) or B (also allow tick-committed
+new types later), or an owner-specified revision. Both forbid duplicate or
+foreign-namespace registration and changing existing types; invalid startup
+registration fails boot. Value-write permissions and extension conflicts remain
+separate from schema registration ownership.
 
 ### Q-6. Which services and UI behavior does Lua drive in this arc?
 
