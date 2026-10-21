@@ -1,38 +1,38 @@
 # Guide cursor
 
-Resume after: `edefc398ba6af202897476864b61086973c627bc` · [2026-10-20T150446Z-4e70eff](2026-10-20T150446Z-4e70eff.md) · 2026-10-20T15:18:54+00:00
-Covered beyond the boundary: #489, #490, #491, #501 (2026-10-20T150446Z-4e70eff)
+Resume after: `b7f3b56e03887d6020e5a04891ce02bdf728a55c` · [2026-10-21T140406Z-b7f3b56](2026-10-21T140406Z-b7f3b56.md) · 2026-10-21T14:17:51+00:00
+Covered beyond the boundary: none
 
 ## Next
 
-Finish #503 / PR #504 → resume amended #499 / PR #502 → qualify #500. LUA-5/6/7 and the runner/sample core are delivered; the old readiness advice is obsolete. Continue the uncovered lifetime-heavy guide inventory separately.
+Trusted milestone delivered and owner-accepted. Reconcile #145 and the design's delivered-state notes, then choose a named consumer (recommended) or renewed Q-5 feasibility for the next scoped design discussion. This review does not start that work.
 
 ## Open findings
 
-- 2026-10-20T150446Z-4e70eff/GUIDE-1 — release lifecycle test callback gates on assertion failure before protected teardown — unprocessed.
+None from this run. Previous 2026-10-20T150446Z-4e70eff/GUIDE-1 was filed as #505 and repaired by #506; #508 repairs related assertion swallowing. Historical report unchanged.
 
 ## Pending handoff
 
-- Partial review: PRs #465, #469, #470, #471, #477, #478, #479, #480, #481, #484, #485, #495, #496, #497 and specs #464, #466–#468, #472–#476, #482/#483, #492–#494 remain uncovered. Boundary intentionally unchanged.
-- #503/#499 are open work, not delivered. #500 is approved but blocked; deterministic qualification remains prospective. Follow existing owner review budgets.
-- Q-5 remains inconclusive on both platforms; LUA-9–13/16/17 stay gated. After the trusted milestone, owner chooses a named consumer or renewed confinement feasibility discussion.
-- #446 remains deferred until a render-to-texture consumer and Q-10; text is an alternative for a named consumer. #145's merged runner/sample checkboxes need routine reconciliation.
-- Historical #360/#362 apparatus coverage remains incomplete.
-- End recheck at 2026-10-20T15:16:06Z: master remained at the pin; no issue fingerprints or published vision changed. PR #504 updated after the snapshot. Its later revision is pending, and no conclusion here extends to it.
-- Owner docs-push rule supersedes V-11's older one-PR docs sentence; no vision or owner draft was edited. Review only: no follow-up walk or tracker changes.
+- All fourteen pending PRs/specs and #504/#506/#508/#502/#509 are assessed at this pin; four earlier PRs remain inherited. No requested item remains pending.
+- D-23 qualification is fixed-build/platform/configuration/input. D-48's independent post-cutoff failures are not trace-equality qualified; future consumers must not infer that guarantee.
+- #145 has seven merged children still unchecked (#492/#493/#494/#498/#503/#499/#500) and a stale fifteen-slice count. Design lacks LUA-31's delivered entry, places #499 under LUA-29, and retains stale readiness/handoff text; exact notes in report. Report only: neither edited.
+- Q-5 is inconclusive on both platforms; LUA-9–13/16/17 stay gated. Full Lua epic remains incomplete.
+- #446 stays deferred until a named render-to-texture consumer and Q-10; text remains an alternative for a named consumer. Historical #360/#362 apparatus coverage remains incomplete.
+- End recheck found nothing moved: master at pin, no issue/specification, PR or published vision changes. Conclusions remain snapshot-scoped.
+- No probes, builds, suites or GHCi ran in this review. Linux exact-tree CI and published macOS receipts were reused. Owner docs-push rule supersedes V-11's older one-PR docs sentence. No step-8 walk or tracker changes.
 
 ## Alignment
 
 | Principle | Reading | Since | Note |
 |---|---|---|---|
-| V-1 | aligned | 2026-10-20T150446Z-4e70eff | Application-owned authoritative state and public engine services in #501. |
-| V-2 | aligned | 2026-10-20T150446Z-4e70eff | Accepted core/failure/qualification split remains coherent; #503 makes the missing prerequisite explicit. |
-| V-3 | aligned | 2026-10-20T150446Z-4e70eff | Core ownership and raw retirement preserve dependency lifetime; open #503/#499 completion obligations remain pending. |
-| V-4 | aligned | 2026-10-20T150446Z-4e70eff | Core refusals are explicit; terminal failure handling belongs to amended #499. |
-| V-5 | aligned | 2026-10-20T150446Z-4e70eff | Sample reservations remain held through atomic commit; open work must account for all instance and task capacity. |
-| V-6 | aligned | 2026-10-16T165532Z-edefc39 | Publication holds and conservative GPU retirement remain; renderer repair does not turn CPU release into GPU completion. |
-| V-7 | aligned | 2026-10-16T165532Z-edefc39 | Lua allocating operations protected in C and called safely; material-check optimization uses retained sets with measured historical evidence. |
-| V-8 | aligned | 2026-10-16T165532Z-edefc39 | Evidence distinguishes Linux exact-tree reuse, fresh local macOS tests and absent native/confinement qualification. |
-| V-9 | aligned | 2026-10-20T150446Z-4e70eff | Trusted independent domains delivered; D-23 qualification remains #500, untrusted deployment remains gated. |
-| V-10 | drifting | 2026-10-20T150446Z-4e70eff | GUIDE-1: a merged gated assertion cannot fail within the promised example bound because teardown needs the unreleased gate. |
-| V-11 | aligned | 2026-10-20T150446Z-4e70eff | Qualified GHC/Cabal and focused checks; owner docs-push rule supersedes the old one-PR docs sentence. |
+| V-1 | aligned | 2026-10-21T140406Z-b7f3b56 | Application-owned world and commit policy; narrow engine services. |
+| V-2 | aligned | 2026-10-21T140406Z-b7f3b56 | Concrete accounting prerequisite delivered; next consumer is a design choice. |
+| V-3 | aligned | 2026-10-21T140406Z-b7f3b56 | Owner acknowledgement, engine leases and provider retirement preserve completion. |
+| V-4 | aligned | 2026-10-21T140406Z-b7f3b56 | Last-good-state failure and explicit host/cleanup authority. |
+| V-5 | aligned | 2026-10-21T140406Z-b7f3b56 | Bounded reservations and logical placement compose through the sample. |
+| V-6 | aligned | 2026-10-16T165532Z-edefc39 | Not exercised here; prior GPU ownership reading retained. |
+| V-7 | aligned | 2026-10-21T140406Z-b7f3b56 | Protected coroutine foreign boundary; no new performance guarantee. |
+| V-8 | aligned | 2026-10-21T140406Z-b7f3b56 | Exact-tree Linux CI, identified macOS receipts; confinement unqualified. |
+| V-9 | aligned | 2026-10-21T140406Z-b7f3b56 | Trusted milestone delivered within D-23/D-48; mod branch remains gated. |
+| V-10 | aligned | 2026-10-21T140406Z-b7f3b56 | Was drifting; #506/#508 repair gate unwind and swallowed assertions. |
+| V-11 | aligned | 2026-10-21T140406Z-b7f3b56 | Pinned inputs, proven evidence reuse and owner-authorized docs lane. |
