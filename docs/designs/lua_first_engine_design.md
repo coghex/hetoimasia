@@ -663,6 +663,30 @@ evaluation, asset readiness or override precedence. Version compatibility and
 activation's relationship to root init remain open. P-18 retains those
 boundaries and its evidence.
 
+### D-23. Share role VMs while giving mods separate owned instances
+
+Owner answer, **2026-10-21 16:35:49 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: share the game's VMs (Rec.)
+
+Authenticated relay: `het-manager`, message `pm5v3h9aiirs7ng6ce5dvavxvn`,
+posted **2026-10-21 16:35:50.091 UTC** in `#het-luafirst`, replying to Q-7b
+message `ak4dt6ajtuevjnzgnu6gpea4we`.
+
+P-19 option A is accepted: gameplay mods share the game's gameplay VM and UI
+mods share its presentation VM. Each mod has its own primary engine-owned
+instance per contributed role, with the same hooks/cadence contract, separate
+`self`, connections and resource leases, and mod/source attribution. Engine
+calls enter the owning instance context. Imports and mutable module exports
+remain shared within each VM under D-7; a non-yielding mod can block its whole
+role VM. Separate instances do not promise shared-state rollback.
+
+D-14's role-VM limit remains unchanged. Role declarations, absent-role handling,
+activation relative to game init, cross-role dependency readiness and failure
+escalation remain open. This document's D-23 concerns mod ownership; prior
+Lua design D-23 remains the separate determinism contract.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -1191,7 +1215,7 @@ activation ownership and the domain mapping still require Q-4/Q-7 decisions.
 
 ### P-19. Give each mod its own instances inside the existing role VMs
 
-**Unapproved; active checkpoint Q-7b.** Recommend A: game and mod gameplay
+**Option A accepted by D-23.** Game and mod gameplay
 code share the session's gameplay VM; game and mod presentation code share
 its presentation VM. A mod contributing to both roles has one primary
 engine-owned instance in each, separate from the game's root instance. Those
@@ -1239,6 +1263,51 @@ instances, gives each instance its own leases/connections and failure identity,
 and permits multiple scheduled instances per owner (`packages/scripting-lua/README.md`,
 Instances and One invocation at a time). This is a new launcher composition
 over those mechanisms, not an already implemented mod system.
+
+### P-20. Declare mod role contributions explicitly and require those roles
+
+**Unapproved; active checkpoint Q-4c.** Recommend A: a mod manifest explicitly
+declares zero, one or both of `gameplay` and `presentation`, with Lua entry
+path(s) for its contributed roles. There is no implicit two-role default for
+mods. An entry supplies the corresponding named behavior table, validated
+under D-15/D-17; one file can export both tables or the roles can use separate
+files. Exact manifest fields remain part of the format design. A mod cannot
+create a VM or change the game's clocks through this declaration.
+
+Each declared role is required. If the game's D-14 arrangement lacks it, fail
+boot before Lua, naming the mod and missing role. Do not silently skip half of
+a selected mod or create an extra VM to accommodate it. For example, a mod
+declaring both roles cannot run in a gameplay-only game; an author can split
+the gameplay contribution and the UI addition into separately selected mods.
+An entry that lacks its declared behavior or has invalid hooks/cadence still
+fails boot under the existing validation rules.
+
+An explicit empty contribution set denotes a content/library-only mod: its
+root, dependencies and fingerprints are validated normally, but the launcher
+creates no behavior instance and automatically executes no entry. Its Lua
+modules/data/textures remain available through explicit content references
+when imported or requested. It participates in D-22's dependency graph without
+an effectful activation hook; schema/data registration, if needed, must be
+performed by an owning behavior through a later approved service. This does
+not give module top level new capabilities or new resource ownership.
+
+Alternative B adds a per-contribution optional-role flag. Required roles still
+fail if absent; optional contributions are skipped only when the game's VM
+role is absent. If that VM exists, the declared entry must load and validate
+and its failures follow the normal rules; optional-role does not mean optional
+code errors or optional module loading. B lets one mod serve full and headless
+games, but needs skipped-contribution diagnostics, validation combinations
+and rules for dependencies on role-specific activation. Those dependency
+readiness rules would need a follow-up contract before implementation.
+A is recommended for explicit selection semantics and fewer conditional
+activation cases; its authoring cost is separate mods for independently
+selectable role contributions. Neither choice settles game/mod init ordering
+or implies a cross-VM call can wait for another role to initialize.
+
+Evidence: D-14 lets the game select one or both VM roles; D-21 explicitly
+selects whole mod roots; D-23 assigns instances per contributed role. The
+missing-role policy and content-only case do not follow automatically from
+those decisions. Both are proposed launcher manifest/admission behavior here.
 
 ## Open questions
 
@@ -1382,6 +1451,13 @@ order, stable ID ties and pre-Lua cycle refusal. Compatibility, activation
 lifecycle, cross-VM composition and overrides remain separate decisions.
 Q-7b is next because activation needs an instance/VM ownership model first.
 
+#### Q-4c. Must every declared mod role exist in the game's VM arrangement?
+
+The only active checkpoint: P-20 option A (recommended, explicit contributions
+all required) or B (also optional-role contributions skipped when that VM is
+absent), or an owner-specified revision. Both permit explicit content-only
+mods. Entry/format details and activation/dependency readiness follow.
+
 ### Q-5. What generic engine state does Lua define and mutate?
 
 Settle entities/components versus tables/schemas, validation, stable identity,
@@ -1424,11 +1500,10 @@ remaining lifecycle details stay open.
 
 #### Q-7b. Do mods use separate instances in the existing role VMs?
 
-The only active checkpoint: P-19 option A (recommended, one primary instance
-per contributed mod role in the existing gameplay/presentation VMs) or B
-(separate per-mod role VMs, requiring a revision to D-14), or an owner-specified
-revision. Shared-module state and execution in A are explicit costs. Role
-declarations, startup integration and mod failure escalation follow.
+Resolved by D-23: primary instances per contributed mod role in the existing
+gameplay/presentation VMs. Shared-module state and execution are explicit
+costs. Q-4c now addresses role declarations; startup integration and mod failure
+escalation follow.
 
 ### Q-8. How should the prior vision and Lua epic be reconciled?
 
