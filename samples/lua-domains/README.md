@@ -581,8 +581,12 @@ tick after the last tick or after the tick the scenario stops the session at, mo
 engine's reservations take, a place beyond the tick's, a record the live path would have refused, a place held twice. What an
 execution does after it starts is not predicted: a failure keeps the sample's failure, disposition and cleanup behavior, and a
 session that fails or stops before a record's tick is never reported as a complete replay (`replay: fed 8 of 40 records,
-incomplete (session failed at tick 6)`). A record the seam does not take though the session has not ended is a defect that
-raises, never a silent loss.
+incomplete (session failed at tick 6)`). A stop, a failure or a retirement recorded while a tick's records are being released
+(or before) ends the release quietly: nothing more is released, whatever it was about to be, and what was released before it is
+accounted for as any accepted input is (a control the engine took settles as no longer applicable, an intention is invalidated
+by the failure or discarded by the stop, and both are in the recorded log), with #499's report and an incomplete replay. A
+refusal that no halt explains, a record the seam does not take though the session has not ended, is a defect that raises,
+never a silent loss.
 
 ## What was qualified
 
