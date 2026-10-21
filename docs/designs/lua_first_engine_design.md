@@ -792,48 +792,84 @@ Evidence: `packages/scripting-lua/README.md` (Cadence) provides `LogicalTicks`,
 elapsed refresh and elapsed `dt` between update starts. The launcher/entry
 adapter must supply that admission configuration from the chosen source.
 
-### P-14. Finish both root initializers before normal session execution
+### P-14. Start root initializers concurrently and release presentation first
 
-**Unapproved; active checkpoint Q-3e.** Recommend A: first validate the
-manifest/content inventory, then load and validate the selected entry exports
-and cadence in their VMs before running either root's `init`. Initialize
-gameplay first and presentation second, omitting an absent role. Only after
-all selected roots initialize successfully does normal session execution
-begin: gameplay tick grants, periodic updates and event callback delivery.
-There is no extra yielding setup hook or separate script-declared ready flag.
+**Revision 2, unapproved; active checkpoint Q-3e.** This revises the original
+serial-start proposal in response to the owner's variant preserved under
+Q-3e. Recommend approving all five parts below together.
 
-Requests made in init may start their background work immediately; successful
-init does not wait for them. Results/callbacks remain subject to normal domain
-delivery once execution begins, including assigned gameplay ticks. Lua can
-show a loading screen and delay game-specific play while runtime content is
-pending. The engine's running state means the roots initialized, not that all
-assets or a playable world are ready. Initial state publication still needs
-the generic store contract; this proposal does not grant presentation a view
-of partially staged state.
+1. **Concurrent admission.** Validate the manifest/content inventory and the
+   selected entry exports/cadences, then dispatch both root initializers to
+   their separate VM owners without waiting for either to finish first.
+   Concurrent means neither completion depends on the other; it does not
+   promise simultaneous CPU execution. D-15's finite, non-yielding init remains
+   unchanged. Initial scanning and entry/module evaluation still precede this
+   phase and have no Lua loading UI under this proposal.
+2. **Independent UI start.** As soon as presentation init succeeds, its elapsed
+   updates, input/events, content completions and presentation services may
+   run. Its cadence begins from its own successful init (D-17). It sees a
+   coherent session-starting status and root readiness, with no authoritative
+   gameplay snapshot yet. Gameplay-state reads return a structured not-ready
+   result, never partial initialization data. UI may load its own content,
+   operate its windows/rendering and request session cancellation. Gameplay
+   intentions and gameplay lifecycle controls are refused as not-ready during
+   startup, not buffered for later or silently dropped. Exact binding names
+   and status schema remain to be specified. UI must not depend on gameplay
+   init data or synchronously call the gameplay owner; no custom gameplay
+   progress-message channel is introduced by this choice.
+3. **Gameplay start gate.** If gameplay finishes first it waits. No gameplay
+   ticks, updates or event callbacks run until both selected inits succeeded
+   and no failure/cancellation is recorded. The transition publishes a coherent
+   initial gameplay view and running status before releasing normal gameplay
+   delivery; the generic store design must define that initial snapshot and
+   its validation. Startup wall time grants no gameplay time or accumulated
+   catch-up ticks. Pending content requests need not finish before this gate
+   opens: gameplay results keep their assigned-tick delivery, and game-specific
+   asset/readiness state remains Lua-owned. A one-role session skips the absent
+   role: gameplay-only starts after its own init, presentation-only after its
+   own init, with absent-domain calls refused under D-14.
+4. **Failure and cancellation.** An init failure on either side, or a failure
+   of the already-running presentation root before the gameplay gate opens,
+   fails boot. Atomically close the startup gate against late success, stop
+   accepting new work, request cancellation on the other owner and pending
+   interests, and retire both sides. No failure path waits for the other side
+   to become ready before asking it to stop. A failed initializer receives no
+   shutdown; a root which successfully initialized follows normal shutdown
+   and engine cleanup, including a success racing with cancellation. A late
+   completion cannot reopen the gate. Retain concurrent failures and cleanup
+   evidence; exact reporting/exit codes and post-start session failure policy
+   follow separately. Early UI may disappear on failed boot; a persistent
+   custom error screen is not promised. Session cancellation follows the same
+   stop/cleanup path without inventing an init failure. Trusted non-yielding
+   Lua can keep cancellation pending; do not destroy its VM or release native
+   resources while it is still executing (prior Lua D-27).
+5. **Startup ownership.** Replace the proposed single execution barrier with
+   per-role gates: presentation opens on its own success, gameplay on joint
+   success. The coordinator owns the status, transition and cancellation;
+   each VM still owns its execution and resources. Callback admission and
+   completion queues remain bounded and cannot bypass those gates. The native
+   main-thread service loop must continue servicing presentation while the
+   coordinator awaits gameplay init; blocking that loop would defeat this
+   design. Native effects such as a visible window are cleaned up on failure,
+   not retrospectively undone.
 
-An entry/validation/init failure fails boot: do not begin normal execution,
-cancel pending interests and retire resources/owners already created. A root
-whose init failed does not receive shutdown; successfully initialized roots
-follow normal shutdown/cleanup. Failed cleanup remains authoritative (prior
-Lua D-27); exact diagnostic format and exit codes are a subsequent choice.
-Native commands requested by init can have effects, such as a window becoming
-visible: boot failure requires cleanup, not undo of every visible effect.
+**Recommendation.** The owner's variant is a good fit for a loading screen
+during gameplay init, and is preferable to the original serial order for that
+goal. Keep heavy asset work in engine-owned asynchronous requests and let init
+return promptly; then normal updates/events can maintain Lua loading state.
+This works with concurrent startup and avoids treating a long or blocking init
+as the asset-loading mechanism. Separate owners permit progress but do not
+guarantee smooth rendering under CPU/native-service contention. There is no
+need for a new yielding setup hook or a gameplay-dependent UI bootstrap.
 
-Alternative B initializes presentation first and lets its updates/events run
-while gameplay initializes. It can display custom startup progress earlier,
-but needs a starting-state view and explicit rules for gameplay intents and
-controls before gameplay exists. A keeps that partial-start phase out of Lua's
-normal execution contract; its cost is no Lua loading UI during the initial
-scan, entry evaluation or root init. Both options can display Lua loading UI
-for pending runtime requests after init. Trusted nonterminating init is still
-not contained by either option.
-
-Evidence: `samples/lua-domains` starts gameplay init before UI and waits for
-initialization before gameplay grants. This proposal adds an explicit generic
-boot barrier and failure cleanup contract, rather than assuming the sample
-already gates every event/elapsed callback. The entry adapter must ensure
-queued request completions or connected events cannot bypass that barrier,
-with bounded buffering/admission and cancellation owned by startup.
+Cost: explicit starting/not-ready behavior, two admission gates, race-safe
+failure/cancellation, and coverage of both completion orders, early UI events,
+one-role sessions and failure while the other init is active. The original
+alternatives (gameplay then presentation behind one barrier, or presentation
+first then gameplay) remain historical proposals, not accepted contracts.
+Evidence: the existing VM-owner and instance mechanisms support separate
+owners and lifecycle cleanup, but `samples/lua-domains` uses serial startup;
+the concurrent launcher protocol is new work, not claimed delivered behavior.
 
 ## Open questions
 
@@ -929,13 +965,24 @@ Resolved by D-17: P-13 option A, Lua behavior metadata, with the shared rules
 recorded there. `every` is an illustrative name only. Additional routines,
 state-transaction waits and exact field spellings remain separate choices.
 
-#### Q-3e. Do both roots finish init before normal session execution?
+#### Q-3e. How do concurrently initializing roots enter normal execution?
 
-The only active checkpoint: P-14 option A (recommended, validate entries then
-initialize gameplay and presentation before normal execution) or B (start
-presentation execution before gameplay initialization completes), or an
-owner-specified revision. Pending content does not delay successful boot;
-game-specific readiness is Lua state. Exact failure reporting follows.
+Owner response, **2026-10-21 15:52:01 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> both start at the same time, if game finishes first, then we wait, if ui finishes first, then we start ui. we write ui not to rely on any game init work. i want this so that we can set up the loading screen and run game init during that, unless you think i should do this someother way
+
+Authenticated relay: `het-manager`, message `jekfp3ijixjajaqrmnfm56ux2s`,
+posted **2026-10-21 15:52:02.047 UTC** in `#het-luafirst`, replying to original
+Q-3e message `acx2n5b76r2gcnc4are4buuh8e`. The owner selected neither serial
+option and invited advice. Preserve this as direction for the revision, not
+approval of the added startup/error protocol.
+
+The only active checkpoint is signoff on all five parts of P-14 revision 2:
+concurrent init, early independent presentation with not-ready gameplay
+access, the joint gameplay start gate, failure/cancellation, and startup
+ownership. Recommend approval, or an owner-specified revision. No D-entry is
+recorded until that signoff arrives. Post-start failure reporting follows.
 
 ### Q-4. How are mods discovered, ordered and combined?
 
