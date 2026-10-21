@@ -29,6 +29,7 @@ module Hetoimasia.Sample.LuaDomains.Candidate
   , StagingRefusal (..)
   , stage
   , draw
+  , begin
   , finish
   , commit
   ) where
@@ -42,6 +43,7 @@ import Hetoimasia.Sample.LuaDomains.Intention
   , Placement
   , Stale (..)
   , StaleReason (..)
+  , noDispositions
   )
 import Hetoimasia.Sample.LuaDomains.World (World (..), drawBelow, entityAt, entityVersion, moveEntity)
 
@@ -64,6 +66,10 @@ data Candidate = Candidate
     -- ^ The stream's state as the tick's draws have left it.
   , candidateStaged ∷ ![Move]
     -- ^ The staging batch, newest first.
+  , candidateBegan ∷ !Bool
+    -- ^ Whether gameplay's update began in the tick: said by the wrapper every gameplay module's @update@ is given, before
+    -- the script's own code runs, so a tick whose update never began (it was paused, or is the tick that resumed
+    -- it) is told apart from one whose update began and did not finish.
   , candidateFinished ∷ !Bool
     -- ^ Whether gameplay said its work for the tick is done.
   , candidateDispositions ∷ !Dispositions
@@ -79,9 +85,10 @@ beginCandidate bounds committed tick sealed =
     , candidateWorld = world
     , candidateRandom = worldRandom committed
     , candidateStaged = []
+    , candidateBegan = False
     , candidateFinished = False
     , candidateDispositions =
-        Dispositions
+        noDispositions
           { dispApplied = reverse appliedNewestFirst
           , dispStale = take (boundStaleListed bounds) staleInOrder
           , dispStaleOmitted = max 0 (length staleInOrder - boundStaleListed bounds)
@@ -124,6 +131,10 @@ draw ∷ Int64 → Candidate → Maybe (Int64, Candidate)
 draw bound candidate = case drawBelow bound (candidateRandom candidate) of
   Nothing → Nothing
   Just (value, state) → Just (value, candidate {candidateRandom = state})
+
+-- | Gameplay's update has begun in the tick.
+begin ∷ Candidate → Candidate
+begin candidate = candidate {candidateBegan = True}
 
 -- | Gameplay's work for the tick is done.
 finish ∷ Candidate → Candidate

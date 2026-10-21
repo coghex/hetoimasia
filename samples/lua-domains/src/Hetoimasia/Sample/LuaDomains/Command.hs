@@ -1,7 +1,7 @@
 -- | The executable's command line, as a pure function (requirement 13).
 --
--- @hetoimasia-lua-domains [--ticks N] [--seed N]@ runs a session; @--help@, alone, prints the usage
--- and exits 0. Anything else — an unknown argument, a repeated one, a missing or malformed value —
+-- @hetoimasia-lua-domains [--ticks N] [--seed N] [--scenario NAME]@ runs a session; @--help@, alone, prints the
+-- usage and exits 0. Anything else — an unknown argument, a repeated one, a missing or malformed value —
 -- is refused with one reason, which the executable writes as a single bounded line on stderr
 -- before it exits 2.
 --
@@ -17,18 +17,21 @@ module Hetoimasia.Sample.LuaDomains.Command
   , helpText
   , defaultTicks
   , maxTicks
+  , escapedText
   ) where
 
 import Data.Char (isAscii, isDigit, isPrint)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
+import Hetoimasia.Sample.LuaDomains.Scenario (Scenario (Normal), allScenarios, parseScenario, scenarioName)
 import Numeric (showHex)
 
 -- | What a session is asked to do.
 data Command = Command
   { commandTicks ∷ !Word64
   , commandSeed ∷ !Word64
+  , commandScenario ∷ !Scenario
   }
   deriving (Eq, Show)
 
@@ -65,16 +68,19 @@ parseArguments ∷ [String] → Either Problem Parsed
 parseArguments = \case
   ["--help"] → Right Help
   arguments | "--help" `elem` arguments → Left HelpAlone
-  arguments → Run <$> go Nothing Nothing arguments
+  arguments → Run <$> go Nothing Nothing Nothing arguments
   where
-    go ticks seed = \case
-      [] → Right (Command (maybe defaultTicks id ticks) (maybe 1 id seed))
+    go ticks seed scenario = \case
+      [] → Right (Command (maybe defaultTicks id ticks) (maybe 1 id seed) (maybe Normal id scenario))
       "--ticks" : rest → option "--ticks" ticks rest $ \value more → do
         number ← readTicks value
-        go (Just number) seed more
+        go (Just number) seed scenario more
       "--seed" : rest → option "--seed" seed rest $ \value more → do
         number ← readNumber "--seed" value
-        go ticks (Just number) more
+        go ticks (Just number) scenario more
+      "--scenario" : rest → option "--scenario" scenario rest $ \value more → do
+        named ← maybe (Left (MalformedValue "--scenario" value)) Right (parseScenario value)
+        go ticks seed (Just named) more
       unknown : _ → Left (UnknownArgument unknown)
     option name held rest continue = case (held, rest) of
       (Just _, _) → Left (RepeatedOption name)
@@ -94,7 +100,7 @@ readNumber name value
 
 -- | The usage, without a line break.
 usage ∷ Text
-usage = "usage: hetoimasia-lua-domains [--ticks N] [--seed N] | --help"
+usage = "usage: hetoimasia-lua-domains [--ticks N] [--seed N] [--scenario NAME] | --help"
 
 -- | The one line a refusal is written as: the executable, the reason and the usage. Every
 -- character of user text that is not printable ASCII is written as @\\xNN@ or @\\x{NNNN}@, and a
@@ -112,7 +118,12 @@ problemLine problem = "hetoimasia-lua-domains: " <> reason <> "; " <> usage
 
 -- | A bounded, escaped copy of user text, in quotes.
 quoted ∷ String → Text
-quoted raw = "'" <> Text.pack (concatMap escape (take valueLimit raw)) <> (if length raw > valueLimit then "...'" else "'")
+quoted raw = "'" <> escapedText valueLimit (Text.pack raw) <> (if length raw > valueLimit then "...'" else "'")
+
+-- | Text with everything that is not printable ASCII written as @\\xNN@ or @\\x{NNNN}@, cut to this many
+-- characters before it is escaped.
+escapedText ∷ Int → Text → Text
+escapedText limit raw = Text.pack (concatMap escape (take limit (Text.unpack raw)))
   where
     escape character
       | isAscii character && isPrint character = [character]
@@ -135,7 +146,9 @@ helpText =
     , ""
     , "  --ticks N   gameplay ticks to commit, 1 to " <> Text.pack (show maxTicks) <> " (default " <> Text.pack (show defaultTicks) <> ")"
     , "  --seed N    the gameplay session's random seed, 0 to 2^64-1 (default 1)"
+    , "  --scenario  " <> Text.intercalate ", " (map scenarioName allScenarios) <> " (default normal): what the session also does"
     , "  --help      this text, on stdout, exit status 0"
     , ""
-    , "Exit status: 0 after the report; 2 for any usage error, with one line on stderr; 1 for a failure."
+    , "Exit status: 0 after the report when the session ended without a failure (a stop is not a failure);"
+    , "1 when the gameplay session failed or a UI failure was recorded; 2 for any usage error, with one line on stderr."
     ]

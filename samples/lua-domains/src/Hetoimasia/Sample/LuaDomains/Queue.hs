@@ -31,10 +31,12 @@
 -- runs, and 'settle' gives them back in the transaction that commits the tick, so a producer can
 -- never fill the queue beyond what the commit has not yet disposed of.
 --
--- = Closing
+-- = Closing and draining
 --
--- 'closeQueue' ends admission for good: the session closes it first when it is retired, so nothing is
--- accepted for a tick that will never run.
+-- 'closeQueue' ends admission for good: the session closes it first when it fails, is stopped or is
+-- retired, so nothing is accepted for a tick that will never run. 'drain' then takes what no commit
+-- settled, so that each such intention gets exactly one terminal disposition, invalidated or
+-- discarded, and the reservations come back.
 --
 -- = A finite session
 --
@@ -51,6 +53,8 @@ module Hetoimasia.Sample.LuaDomains.Queue
   , settle
   , closeQueue
   , isClosed
+  , hasTickLeft
+  , drain
   , reserved
   , nextUnstarted
   , AdmitAt (..)
@@ -69,8 +73,9 @@ data State = State
     -- ^ The next tick that has not started. The first is 1.
   , stateOpen ∷ !(Map Word64 (Map Word32 Intention))
     -- ^ The intentions accepted for ticks that have not started, by tick and place.
-  , stateSealed ∷ !(Map Word64 Int)
-    -- ^ How many intentions each started tick holds a reservation for until its commit.
+  , stateSealed ∷ !(Map Word64 [(Placement, Intention)])
+    -- ^ The intentions each started tick holds a reservation for until its commit, in the order
+    -- of their places.
   , statePending ∷ !Int
     -- ^ Accepted and not settled: the sum of both tables above.
   , stateClosed ∷ !Bool
@@ -93,8 +98,10 @@ newQueue bounds final = Queue bounds final <$> newTVarIO (State 1 Map.empty Map.
 -- | What admitting at an explicit place answered.
 data AdmitAt
   = AdmittedAt !Placement
-  | -- | The queue's bound or the tick's places are all taken. Nothing changed.
-    AtFull
+  | -- | The queue's bound is reached. Nothing changed.
+    AtFullQueue
+  | -- | The tick's places are all taken. Nothing changed.
+    AtFullPlaces
   | -- | The tick is beyond the finite session's last. Nothing changed.
     AtClosed
   | -- | The tick has started, so it can take nothing more. Nothing changed.
@@ -107,7 +114,7 @@ data AdmitAt
 --
 -- The checks, in order: admission is open and the tick is within the session ('AtClosed'), the tick has not started
 -- ('AtLate'), the place is free ('AtDuplicate'), and neither the tick's places nor the queue's
--- bound are exhausted ('AtFull'). A place at or beyond the bound on places is full.
+-- bound are exhausted ('AtFullPlaces', then 'AtFullQueue'). A place at or beyond the bound on places is full.
 admitAt ∷ Queue → Placement → Intention → STM AdmitAt
 admitAt queue place@(Placement tick order) intention = do
   state ← readTVar (queueState queue)
@@ -116,8 +123,8 @@ admitAt queue place@(Placement tick order) intention = do
         | stateClosed state || maybe False (tick >) (queueFinal queue) = Just AtClosed
         | tick < stateNext state = Just AtLate
         | Map.member order taken = Just AtDuplicate
-        | fromIntegral order >= boundPlaces (queueBounds queue) = Just AtFull
-        | statePending state >= boundQueue (queueBounds queue) = Just AtFull
+        | fromIntegral order >= boundPlaces (queueBounds queue) = Just AtFullPlaces
+        | statePending state >= boundQueue (queueBounds queue) = Just AtFullQueue
         | otherwise = Nothing
   case refused of
     Just answer → pure answer
@@ -142,6 +149,13 @@ closeQueue queue = do
 isClosed ∷ Queue → STM Bool
 isClosed queue = stateClosed <$> readTVar (queueState queue)
 
+-- | Whether the finite session has a tick left that has not started: the next unstarted tick is within the session.
+-- A session with no limit always has one.
+hasTickLeft ∷ Queue → STM Bool
+hasTickLeft queue = do
+  next ← stateNext <$> readTVar (queueState queue)
+  pure (maybe True (next <=) (queueFinal queue))
+
 -- | The UI's path: admit for the next tick that has not started, at the next free place in it. It
 -- reads the tick and takes the place in one transaction, so it cannot be late or a duplicate.
 admitNext ∷ Queue → Intention → STM AdmitAt
@@ -160,14 +174,15 @@ seal queue = do
   state ← readTVar (queueState queue)
   let tick = stateNext state
       taken = Map.findWithDefault Map.empty tick (stateOpen state)
+      placed = [(Placement tick order, intention) | (order, intention) ← Map.toAscList taken]
   writeTVar
     (queueState queue)
     state
       { stateNext = tick + 1
       , stateOpen = Map.delete tick (stateOpen state)
-      , stateSealed = Map.insert tick (Map.size taken) (stateSealed state)
+      , stateSealed = Map.insert tick placed (stateSealed state)
       }
-  pure (tick, [(Placement tick order, intention) | (order, intention) ← Map.toAscList taken])
+  pure (tick, placed)
 
 -- | Give back the reservations of a started tick, once its disposition is committed. Settling a
 -- tick that holds none, or twice, changes nothing.
@@ -179,7 +194,20 @@ settle queue tick = do
     Just held →
       writeTVar
         (queueState queue)
-        state {stateSealed = Map.delete tick (stateSealed state), statePending = statePending state - held}
+        state {stateSealed = Map.delete tick (stateSealed state), statePending = statePending state - length held}
+
+-- | Take every intention that has no committed terminal disposition: the sealed ticks' that were not
+-- settled, then those accepted for ticks that never began, each in the order of its tick and place.
+-- Their reservations are given back, so a drained queue holds nothing. The session calls it once,
+-- when a failure or a stop ends it, after admission has closed, and reports exactly these as
+-- invalidated or discarded.
+drain ∷ Queue → STM [(Placement, Intention)]
+drain queue = do
+  state ← readTVar (queueState queue)
+  let sealed = concat (Map.elems (stateSealed state))
+      open = [(Placement tick order, intention) | (tick, taken) ← Map.toAscList (stateOpen state), (order, intention) ← Map.toAscList taken]
+  writeTVar (queueState queue) state {stateOpen = Map.empty, stateSealed = Map.empty, statePending = 0}
+  pure (sealed <> open)
 
 -- | How many intentions are accepted and not yet settled by a commit.
 reserved ∷ Queue → STM Int

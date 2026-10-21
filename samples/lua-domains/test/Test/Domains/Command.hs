@@ -5,19 +5,20 @@ module Test.Domains.Command (spec) where
 import Data.Char (isControl)
 import qualified Data.Text as Text
 import Hetoimasia.Sample.LuaDomains.Command
+import Hetoimasia.Sample.LuaDomains.Scenario (Scenario (Normal))
 import Test.Hspec
 
 spec ∷ Spec
 spec = describe "the command line" $ do
   it "runs the documented default session when given nothing" $
-    parseArguments [] `shouldBe` Right (Run (Command defaultTicks 1))
+    parseArguments [] `shouldBe` Right (Run (Command defaultTicks 1 Normal))
 
   it "reads the ticks and the seed, in either order" $ do
-    parseArguments ["--ticks", "5"] `shouldBe` Right (Run (Command 5 1))
-    parseArguments ["--seed", "7", "--ticks", "9"] `shouldBe` Right (Run (Command 9 7))
-    parseArguments ["--ticks", "20", "--seed", "18446744073709551615"] `shouldBe` Right (Run (Command 20 18446744073709551615))
-    parseArguments ["--seed", "0"] `shouldBe` Right (Run (Command defaultTicks 0))
-    parseArguments ["--ticks", "100000"] `shouldBe` Right (Run (Command 100000 1))
+    parseArguments ["--ticks", "5"] `shouldBe` Right (Run (Command 5 1 Normal))
+    parseArguments ["--seed", "7", "--ticks", "9"] `shouldBe` Right (Run (Command 9 7 Normal))
+    parseArguments ["--ticks", "20", "--seed", "18446744073709551615"] `shouldBe` Right (Run (Command 20 18446744073709551615 Normal))
+    parseArguments ["--seed", "0"] `shouldBe` Right (Run (Command defaultTicks 0 Normal))
+    parseArguments ["--ticks", "100000"] `shouldBe` Right (Run (Command 100000 1 Normal))
 
   it "treats --help alone as help, and refuses it beside anything else" $ do
     parseArguments ["--help"] `shouldBe` Right Help

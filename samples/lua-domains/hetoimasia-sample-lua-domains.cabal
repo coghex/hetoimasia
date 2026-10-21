@@ -58,7 +58,9 @@ library
         Hetoimasia.Sample.LuaDomains.Queue
         Hetoimasia.Sample.LuaDomains.Registration
         Hetoimasia.Sample.LuaDomains.Report
+        Hetoimasia.Sample.LuaDomains.Scenario
         Hetoimasia.Sample.LuaDomains.Scripts
+        Hetoimasia.Sample.LuaDomains.Session
         Hetoimasia.Sample.LuaDomains.Shared
         Hetoimasia.Sample.LuaDomains.Snapshot
         Hetoimasia.Sample.LuaDomains.Tally
@@ -102,13 +104,19 @@ test-suite lua-domains-tests
     main-is: Main.hs
     hs-source-dirs: test
     other-modules:
+        Test.Domains.Accounting
         Test.Domains.Admission
         Test.Domains.Barrier
         Test.Domains.Command
         Test.Domains.Conservation
         Test.Domains.Dependencies
+        Test.Domains.Controls
+        Test.Domains.Delivery
         Test.Domains.Exposure
+        Test.Domains.Failure
         Test.Domains.Intentions
+        Test.Domains.Ledger
+        Test.Domains.Leases
         Test.Domains.Lifetime
         Test.Domains.Process
         Test.Domains.Progress
@@ -116,6 +124,8 @@ test-suite lua-domains-tests
         Test.Domains.Random
         Test.Domains.Spec
         Test.Domains.Staging
+        Test.Domains.Stop
+        Test.Domains.UiFailure
         Test.Domains.View
         Test.Domains.Support
         Test.Domains.World

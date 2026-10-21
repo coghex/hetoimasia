@@ -15,7 +15,6 @@ import Hetoimasia.Sample.LuaDomains
   , Extension (Extension)
   , GameSnapshot (snapTick, snapWorld)
   , Where (InGameplay)
-  , stepTick
   )
 import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCommitted))
 import Hetoimasia.Sample.LuaDomains.World (Entity (..), World (worldEntities, worldRandom, worldTick))
@@ -46,22 +45,25 @@ spec = describe "staging and the commit" $ do
             }
       )
       $ \fx _ domains → withReleased fx ["before the commit"] $ do
-        collect ← spawn (stepTick domains)
-        awaitEntered fx "before the commit"
-        -- Held inside the tick: the committed world and the snapshot are the initial ones.
-        committed ← readTVarIO (sharedCommitted (domainsShared domains))
-        (snapshot, revision) ← snapshotNow domains
-        (revision, snapTick snapshot, worldTick committed) `shouldBe` (0, 0, 0)
-        fmap entityVersion (toList (worldEntities committed)) `shouldBe` replicate 8 0
-        fxLines fx `shouldReturn` ["staged true", "read after staging 0,0,0"]
-        releaseGate fx "before the commit"
-        done ← collect
+        done ←
+          alongside
+            ( do
+                awaitEntered fx "before the commit"
+                -- Held inside the tick: the committed world and the snapshot are the initial ones.
+                committed ← readTVarIO (sharedCommitted (domainsShared domains))
+                (snapshot, revision) ← snapshotNow domains
+                (revision, snapTick snapshot, worldTick committed) `shouldBe` (0, 0, 0)
+                fmap entityVersion (toList (worldEntities committed)) `shouldBe` replicate 8 0
+                fxLines fx `shouldReturn` ["staged true", "read after staging 0,0,0"]
+                releaseGate fx "before the commit"
+            )
+            (stepCommitted domains)
         (entityX (entity done 0), entityY (entity done 0), entityVersion (entity done 0)) `shouldBe` (3, 4, 1)
         snapTick done `shouldBe` 1
 
   it "publishes exactly one snapshot for each completed tick, advancing the committed tick by one" $
     withSample id $ \_ _ domains → do
-      ticks ← mapM (const (stepTick domains >>= \snapshot → (,) (snapTick snapshot) <$> revisionNow domains)) [1 .. 5 ∷ Int]
+      ticks ← mapM (const (stepCommitted domains >>= \snapshot → (,) (snapTick snapshot) <$> revisionNow domains)) [1 .. 5 ∷ Int]
       ticks `shouldBe` [(n, fromIntegral n) | n ← [1 .. 5 ∷ Word64]]
       committedTick domains `shouldReturn` 5
 
@@ -82,7 +84,7 @@ spec = describe "staging and the commit" $ do
             }
       )
       $ \fx _ domains → do
-        snapshot ← stepTick domains
+        snapshot ← stepCommitted domains
         fxLines fx `shouldReturn` ["true true false false"]
         map entityVersion (toList (worldEntities (snapWorld snapshot))) `shouldBe` [0, 1, 1, 0, 0, 0, 0, 0]
 
@@ -90,14 +92,13 @@ spec = describe "staging and the commit" $ do
     mapM_
       unfinished
       [ ("never says it is done", "function update(self, dt) staging.move(0, 1, 0) end")
-      , ("fails after staging", "function update(self, dt) staging.move(0, 1, 0) staging.finish() error('boom') end")
       , ("waits across the tick after saying it is done", "function update(self, dt) staging.move(0, 1, 0) staging.finish() sched.wait_ticks(5) end")
       ]
   where
     unfinished (label, source) = it ("commits nothing and says so when the update " <> label) $
       withSample (\config → config {configGameplaySource = luaLines [source], configExtensions = withWait (configExtensions config)}) $ \_ _ domains → do
         committedBefore ← readTVarIO (sharedCommitted (domainsShared domains))
-        outcome ← try (stepTick domains)
+        outcome ← try (stepCommitted domains)
         case outcome of
           Left (TickNotCompleted tick) → tick `shouldBe` 1
           Left other → expectationFailure ("a different defect: " <> show other)
@@ -109,11 +110,11 @@ spec = describe "staging and the commit" $ do
         revisionNow domains `shouldReturn` 0
         committedTick domains `shouldReturn` 0
         -- The session is halted: a tick that did not complete is not stepped past.
-        again ← try (stepTick domains)
+        again ← try (stepCommitted domains)
         case again of
           Left (TickAlreadyInProgress tick) → tick `shouldBe` 1
           Left other → expectationFailure ("a different defect: " <> show other)
           Right _ → expectationFailure "a second tick began"
         revisionNow domains `shouldReturn` 0
     withWait extensions shared =
-      extensions shared <> [Extension (namespace "sched" [waitOperation "wait_ticks" WaitLogical [SInteger]]) InGameplay]
+      extensions shared <> [Extension (namespace "sched" [waitOperation "wait_ticks" WaitLogical [SInteger]]) InGameplay []]

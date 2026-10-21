@@ -23,7 +23,6 @@ import Hetoimasia.Foundation.Time (durationNanoseconds)
 import Hetoimasia.Sample.LuaDomains
   ( DomainsConfig (configGameplaySource, configUiInterval)
   , defaultConfig
-  , stepTick
   )
 import Hetoimasia.Scripting.Lua.Owner (Library (LibraryBase), chunkName, evalOwned, vmConfig, withVmOwner)
 import Test.Domains.Support
@@ -90,7 +89,7 @@ spec = describe "progress while gameplay is CPU-bound" $
             }
       )
       $ \fx domains → do
-        _ ← generous (stepTick domains)
+        _ ← generous (stepCommitted domains)
         marks ← fxMarks fx
         case marks of
           [("begin", begun), ("end", ended)] → do

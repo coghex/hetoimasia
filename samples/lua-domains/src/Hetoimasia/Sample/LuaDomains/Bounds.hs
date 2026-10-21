@@ -12,6 +12,7 @@ module Hetoimasia.Sample.LuaDomains.Bounds
   , deltaWithin
   , maxEntities
   , maxDeltaLimit
+  , maxSessionTasks
   , positionLimit
   , randomLimit
   ) where
@@ -25,6 +26,10 @@ maxEntities = 64
 -- | The largest delta bound a configuration may choose.
 maxDeltaLimit ∷ Int
 maxDeltaLimit = 1000
+
+-- | The most tasks a configuration may let the session hold unobserved: the gameplay owner's scheduling is made from it.
+maxSessionTasks ∷ Int
+maxSessionTasks = 16
 
 -- | A position is clamped to the range from the negative of this to this, so that no
 -- sequence of moves can overflow a 64-bit integer.
@@ -51,11 +56,25 @@ data Bounds = Bounds
     -- ^ The most stale rejections one snapshot lists; the rest are counted.
   , boundStaging ∷ !Int
     -- ^ The most moves one tick's staging batch holds.
+  , boundDroppedListed ∷ !Int
+    -- ^ The most invalidated, or discarded, intentions the snapshot that ends a session lists;
+    -- the rest are counted.
+  , boundWorkspaces ∷ !Int
+    -- ^ The most workspaces one gameplay instance holds charged at once: the capacity of its leases.
+  , boundSessionTasks ∷ !Int
+    -- ^ The most tasks the session may hold admitted and not yet observed. The owner keeps a task's slot and result
+    -- reservation until its settlement is observed, and a live instance's invocation takes a slot of the same pool, so
+    -- the gameplay owner's scheduling is made from this and the instances it may hold live: an update always has a slot.
+  , boundPendingControls ∷ !Int
+    -- ^ The most controls the UI may hold accepted and unread at once. The engine holds a reservation for each until its
+    -- receipt is read, and the owner's reservations are this many and one for each instance the stop must reach, so a
+    -- stop can always be admitted.
   }
   deriving (Eq, Show)
 
 -- | Eight entities, moves of at most eight in each direction, twelve intentions waiting
--- at most, eight to a tick, four stale rejections listed and four staged moves.
+-- at most, eight to a tick, four stale rejections listed, four staged moves, eight dropped
+-- intentions listed, two workspaces for each gameplay instance and four controls pending.
 defaultBounds ∷ Bounds
 defaultBounds =
   Bounds
@@ -65,6 +84,10 @@ defaultBounds =
     , boundPlaces = 8
     , boundStaleListed = 4
     , boundStaging = 4
+    , boundDroppedListed = 8
+    , boundWorkspaces = 2
+    , boundSessionTasks = 3
+    , boundPendingControls = 4
     }
 
 -- | Whether one component of a move is within the bound on deltas. Two direct comparisons, so that
@@ -83,6 +106,8 @@ data BoundsProblem
     TooManyEntities !Int
   | -- | A delta bound over 'maxDeltaLimit'.
     DeltaTooLarge !Int
+  | -- | More session tasks than 'maxSessionTasks'.
+    TooManySessionTasks !Int
   deriving (Eq, Show)
 
 -- | Every problem with a configuration, so that a refusal names all of them.
@@ -96,8 +121,13 @@ validateBounds bounds =
       , ("places", boundPlaces bounds)
       , ("stale-listed", boundStaleListed bounds)
       , ("staging", boundStaging bounds)
+      , ("dropped-listed", boundDroppedListed bounds)
+      , ("workspaces", boundWorkspaces bounds)
+      , ("session-tasks", boundSessionTasks bounds)
+      , ("pending-controls", boundPendingControls bounds)
       ]
   , value < 1
   ]
     <> [TooManyEntities (boundEntities bounds) | boundEntities bounds > maxEntities]
     <> [DeltaTooLarge (boundDelta bounds) | boundDelta bounds > maxDeltaLimit]
+    <> [TooManySessionTasks (boundSessionTasks bounds) | boundSessionTasks bounds > maxSessionTasks]

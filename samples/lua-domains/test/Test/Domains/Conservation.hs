@@ -20,12 +20,11 @@ import Hetoimasia.Sample.LuaDomains
   , SessionReport (reportCounts, reportTicks)
   , Stale (stalePlace)
   , runSession
-  , stepTick
   )
 import Hetoimasia.Sample.LuaDomains.Intention (Submitted (Submitted))
 import Hetoimasia.Sample.LuaDomains.Queue (reserved)
 import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedCounts, sharedQueue), submit)
-import Hetoimasia.Sample.LuaDomains.Tally (Counts (..))
+import Hetoimasia.Sample.LuaDomains.Tally (Counts (..), countFull)
 import Hetoimasia.Sample.LuaDomains.World (Entity (entityVersion), World (worldEntities))
 import Test.Domains.Support
 import Test.Hspec
@@ -51,14 +50,14 @@ spec = describe "conservation of intentions" $ do
               , Submitted 1 0 4 (fromIntegral (versionOf 4)) 1 0 -- full
               ]
         forM_ submitted $ \one → submit shared one >>= \answer → atomically (modifyTVar' answers (answer :))
-        stepTick domains
+        stepCommitted domains
       given ← readTVarIO answers
       counts ← readTVarIO (sharedCounts shared)
       let accepted = [place | Accepted place ← given]
           settled = [place | snapshot ← snapshots, let d = snapDispositions snapshot, place ← dispApplied d <> map stalePlace (dispStale d)]
       -- The answers and the counters agree, and the full answers happened.
       length accepted `shouldBe` countAccepted counts
-      length [() | Full ← given] `shouldBe` countFull counts
+      length [() | Full _ ← given] `shouldBe` countFull counts
       countFull counts `shouldSatisfy` (> 0)
       -- Applied and stale both happened, and together they are what was accepted.
       countApplied counts `shouldSatisfy` (> 0)

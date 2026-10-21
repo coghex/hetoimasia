@@ -8,7 +8,6 @@ import qualified Data.Text as Text
 import Hetoimasia.Sample.LuaDomains
   ( DomainsConfig (configGameplaySource)
   , GameSnapshot (snapTick)
-  , stepTick
   )
 import Test.Domains.Support
 import Test.Hspec
@@ -21,20 +20,23 @@ spec = describe "progress while gameplay is held" $
   it "lets the UI complete a fixed number of updates while gameplay is inside a segment, then commits the tick" $
     withSample (\config → config {configGameplaySource = luaLines (map Text.pack ["function update(self, dt) fx.hold('gameplay') staging.finish() end"])}) $
       \fx ui domains → withReleased fx ["gameplay"] $ do
-        collect ← spawn (stepTick domains)
-        awaitEntered fx "gameplay"
-        mapM_
-          ( \done → do
-              tickUi domains ui
-              awaitUpdates domains done
-              -- Each update completed with gameplay still held, and nothing was published.
-              (snapshot, revision) ← snapshotNow domains
-              (snapTick snapshot, revision) `shouldBe` (0, 0)
-          )
-          [1 .. updatesWhileHeld]
-        updatesNow domains `shouldReturn` updatesWhileHeld
-        releaseGate fx "gameplay"
-        committed ← collect
+        committed ←
+          alongside
+            ( do
+                awaitEntered fx "gameplay"
+                mapM_
+                  ( \done → do
+                      tickUi domains ui
+                      awaitUpdates domains done
+                      -- Each update completed with gameplay still held, and nothing was published.
+                      (snapshot, revision) ← snapshotNow domains
+                      (snapTick snapshot, revision) `shouldBe` (0, 0)
+                  )
+                  [1 .. updatesWhileHeld]
+                updatesNow domains `shouldReturn` updatesWhileHeld
+                releaseGate fx "gameplay"
+            )
+            (stepCommitted domains)
         snapTick committed `shouldBe` 1
         (snapshot, revision) ← snapshotNow domains
         (snapTick snapshot, revision) `shouldBe` (1, 1)

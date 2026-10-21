@@ -7,7 +7,6 @@ import qualified Data.Text as Text
 import Hetoimasia.Sample.LuaDomains
   ( DomainsConfig (configGameplaySource, configUiSource)
   , GameSnapshot (snapTick)
-  , stepTick
   )
 import Test.Domains.Support
 import Test.Hspec
@@ -57,7 +56,7 @@ spec = describe "the UI's view" $
         -- The first UI segment begins with the initial snapshot and is held in the middle.
         tickUi domains ui
         awaitEntered fx "mid segment"
-        committed ← stepTick domains
+        committed ← stepCommitted domains
         snapTick committed `shouldBe` 1
         releaseGate fx "mid segment"
         awaitUpdates domains 1

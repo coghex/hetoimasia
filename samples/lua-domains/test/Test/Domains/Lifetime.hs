@@ -2,13 +2,12 @@
 -- order in which neither outlives what its bindings borrow, and nothing left live.
 module Test.Domains.Lifetime (spec) where
 
-import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.STM (atomically, readTVarIO, retry)
 import Control.Monad (unless)
 import Control.Exception (IOException, SomeException, displayException, fromException, throwIO, try)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf)
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, isNothing)
 import System.IO.Error (ioeGetErrorString)
 import Data.ByteString (ByteString)
 import Data.Text (Text)
@@ -25,7 +24,6 @@ import Hetoimasia.Sample.LuaDomains
   , Retirement (retiredGameplay, retiredUi)
   , Started (startedOwner)
   , retireDomains
-  , stepTick
   , withDomains
   )
 import Hetoimasia.Sample.LuaDomains.Queue (isClosed, reserved)
@@ -33,7 +31,7 @@ import Hetoimasia.Sample.LuaDomains.Scripts (gameplaySource, interfaceSource)
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.Foundation.Messaging.Snapshot (Publication (PublicationClosed), publish)
 import Hetoimasia.Sample.LuaDomains.Intention (Submitted (Submitted))
-import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedPublisher, sharedQueue, sharedTick), submit)
+import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedQueue, sharedTick), publisherOf, submit)
 import Hetoimasia.Scripting.Lua.Instance (InstanceOutcome (InstanceStopped), InstanceSettlement (resultOutcome))
 import Hetoimasia.Scripting.Lua.Runtime (ExitKind (ExitStopped), ExitRecord (exitKind, exitNotStarted, exitStarted))
 import Hetoimasia.Scripting.Lua.Registration (namespace, stateOperation)
@@ -53,8 +51,8 @@ spec = describe "the owners' lifetime" $ do
       withSample
         (\config → config {configGameplaySource = recording "gameplay" gameplaySource, configUiSource = recording "ui" interfaceSource})
         $ \fx ui domains → do
-          _ ← stepTick domains
-          _ ← stepTick domains
+          _ ← stepCommitted domains
+          _ ← stepCommitted domains
           retirement ← retireDomains domains
           -- The UI owner's behavior was stopped, with its reason, before gameplay's.
           fxLines fx `shouldReturn` ["ui shutdown stopped", "gameplay shutdown stopped"]
@@ -67,7 +65,7 @@ spec = describe "the owners' lifetime" $ do
     liveCount ui `shouldReturn` 0
     -- The publication ended with the session and kept its last value.
     snapshot ← prepare . fst =<< snapshotNow domains
-    atomically (publish (sharedPublisher (domainsShared domains)) snapshot) >>= (`shouldSatisfy` closed)
+    atomically (publisherOf (domainsShared domains) >>= \publisher → publish publisher snapshot) >>= (`shouldSatisfy` closed)
     committedTick domains `shouldReturn` 2
     atomically (ticksOutstanding (scheduledEndpoint (startedOwner (domainsGameplay domains)))) `shouldReturn` 0
     atomically (reserved (sharedQueue (domainsShared domains))) `shouldReturn` 0
@@ -78,7 +76,7 @@ spec = describe "the owners' lifetime" $ do
     outcome ←
       try $ withSample id $ \_ ui domains → do
         writeIORef captured (Just (domains, ui))
-        _ ← stepTick domains
+        _ ← stepCommitted domains
         throwIO (userError "the body failed")
     either ioeGetErrorString (const "returned") (outcome ∷ Either IOException ()) `shouldBe` "the body failed"
     (domains, ui) ← readIORef captured >>= maybe (fail "the session never started") pure
@@ -91,9 +89,9 @@ spec = describe "the owners' lifetime" $ do
   it "leaves a tick uncommitted and retires cleanly when the driver is cancelled in the middle of it" $
     withSample (\config → config {configGameplaySource = luaLines ["function update(self, dt) fx.hold('gameplay') staging.finish() end"]}) $
       \fx _ domains → withReleased fx ["gameplay"] $ do
-        driver ← forkIO (either (\failure → const () (failure ∷ SomeException)) (const ()) <$> try (stepTick domains))
-        awaitEntered fx "gameplay"
-        killThread driver
+        -- The driver is the application thread's own call, cancelled in the middle of the tick.
+        driver ← cancelWhen (awaitEntered fx "gameplay") (stepCommitted domains)
+        driver `shouldSatisfy` isNothing
         -- The held tick published nothing, and the session stays halted at it.
         (committedTick domains, revisionNow domains) `shouldBe'` (0, 0)
         readTVarIO (sharedTick (domainsShared domains)) >>= (`shouldSatisfy` isJust)
@@ -111,12 +109,12 @@ spec = describe "the owners' lifetime" $ do
           ( \config →
               config
                 { configGameplaySource = luaLines ["function update(self, dt) boom.fail() end"]
-                , configExtensions = \shared → configExtensions config shared <> [Extension (namespace "boom" [stateOperation "fail" [] [] (\_ → throwIO (userError "the gameplay binding failed"))]) InGameplay]
+                , configExtensions = \shared → configExtensions config shared <> [Extension (namespace "boom" [stateOperation "fail" [] [] (\_ → throwIO (userError "the gameplay binding failed"))]) InGameplay []]
                 }
           )
           $ \_ ui domains → do
             writeIORef captured (Just (domains, ui))
-            stepTick domains
+            stepCommitted domains
     case outcome of
       Left failure → do
         -- Which of two supervised reports reaches the driver first is not fixed: the driver's own
@@ -143,7 +141,7 @@ spec = describe "the owners' lifetime" $ do
           base
             { configGameplaySource = luaLines ["function update(self, dt) boom.fail() end"]
             , configUiSource = luaLines ["function update(self, dt) fx.hold('ui') ui.updated() end"]
-            , configExtensions = \shared → configExtensions base shared <> [Extension (namespace "boom" [stateOperation "fail" [] [] (\_ → throwIO (userError "the gameplay binding failed"))]) InGameplay]
+            , configExtensions = \shared → configExtensions base shared <> [Extension (namespace "boom" [stateOperation "fail" [] [] (\_ → throwIO (userError "the gameplay binding failed"))]) InGameplay []]
             }
     facts ← newIORef Nothing
     -- The supervision boundary rethrows the failure it latched when it closes, so the facts are
@@ -154,11 +152,13 @@ spec = describe "the owners' lifetime" $ do
           try . generous . withDomains control config $ \domains → do
             writeIORef facts (Just (Left domains))
             -- The UI owner is inside a held segment, and stays there until retirement has begun:
-            -- admission has ended. The gameplay failure then ends the body.
-            tickUi domains ui
-            awaitEntered fx "ui"
-            _ ← forkIO (atomically (isClosed (sharedQueue (domainsShared domains)) >>= \ended → unless ended retry) >> releaseGate fx "ui")
-            stepTick domains
+            -- admission has ended. The gameplay failure then ends the body. However the body ends, the segment is
+            -- released, so the owners can end.
+            withReleased fx ["ui"] $ do
+              tickUi domains ui
+              awaitEntered fx "ui"
+              _ ← forkRegistered (atomically (isClosed (sharedQueue (domainsShared domains)) >>= \ended → unless ended retry) >> releaseGate fx "ui")
+              stepCommitted domains
         let raised = either (\failure → const True (failure ∷ SomeException)) (const False) outcome
         domains ← readIORef facts >>= \held → case held of
           Just (Left found) → pure found
@@ -168,7 +168,7 @@ spec = describe "the owners' lifetime" $ do
         ended ← mapM (\started → isJust . fmap (const ()) <$> atomically (pollCompletion (supervisedWorker (scheduledSupervised (startedOwner started))))) [domainsUi domains, domainsGameplay domains]
         armed ← liveCount ui
         snapshot ← prepare . fst =<< snapshotNow domains
-        publication ← atomically (publish (sharedPublisher (domainsShared domains)) snapshot)
+        publication ← atomically (publisherOf (domainsShared domains) >>= \publisher → publish publisher snapshot)
         answer ← submit (domainsShared domains) (Submitted 1 0 0 0 1 0)
         writeIORef facts (Just (Right (raised, ended, armed, closed publication, answer)))
     readIORef facts >>= \case

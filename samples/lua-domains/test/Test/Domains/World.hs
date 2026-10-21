@@ -34,6 +34,8 @@ spec = describe "the world, the random stream and the candidate" $ do
       Seq.length (worldEntities world0) `shouldBe` boundEntities bounds
       validateBounds bounds {boundEntities = maxEntities + 1} `shouldBe` [TooManyEntities (maxEntities + 1)]
       validateBounds bounds {boundEntities = maxEntities} `shouldBe` []
+      validateBounds bounds {boundSessionTasks = maxSessionTasks + 1} `shouldBe` [TooManySessionTasks (maxSessionTasks + 1)]
+      validateBounds bounds {boundSessionTasks = maxSessionTasks} `shouldBe` []
 
     it "changes an entity's version if and only if its position changed" $ do
       versionOf (moveEntity 0 0 0 world0) 0 `shouldBe` 0
