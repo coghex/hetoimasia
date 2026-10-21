@@ -6,18 +6,25 @@ module Test.Domains.Replay (spec) where
 
 import Control.Concurrent.STM (atomically, readTVarIO)
 import Control.Exception (try)
-import Control.Monad (forM, forM_)
+import Control.Monad (forM, forM_, void, when)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
-import Data.List (isInfixOf)
+import Data.List (isInfixOf, isPrefixOf, isSuffixOf)
+import qualified Data.Text as Text
 import qualified Data.ByteString.Lazy as Lazy
 import Data.Word (Word64)
 import Hetoimasia.Sample.LuaDomains
   ( Bounds (boundDelta, boundEntities, boundPendingControls, boundPlaces, boundQueue)
-  , Domains (domainsShared)
+  , Domains (domainsControl, domainsGameplay, domainsShared)
   , DomainsConfig (..)
   , DomainsDefect (BoundsRefused, ReplayNotAdmitted, ReplayRefused)
+  , ReplayOutcome (..)
+  , SessionReport (reportControls, reportCounts, reportReplay, reportRecorded, reportStatus, reportTicks)
+  , Started (startedTicket)
+  , renderReport
+  , requestStop
+  , runSession
   , GameSnapshot (..)
-  , SessionStatus (Paused, Running)
+  , SessionStatus (Failed, Paused, Running, Stopped)
   , TickPoint (BeforeGrant)
   , defaultBounds
   , defaultConfig
@@ -28,7 +35,9 @@ import Hetoimasia.Sample.LuaDomains.InputLog
 import Hetoimasia.Sample.LuaDomains.Intention (Answer (Declined), Dispositions (..), Intention (..), Placement (..), Refusal (RefusedDelta, RefusedEntity), Stale (..), StaleReason (StaleSession, StaleVersion))
 import Hetoimasia.Sample.LuaDomains.Queue (AdmitAt (AdmittedAt), nextUnstarted, reserved)
 import Hetoimasia.Sample.LuaDomains.Scenario (Scenario (Normal, Stop), scenarioStopAfter)
-import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedControls, sharedCounts, sharedQueue, sharedRecorder), admitLogged)
+import Hetoimasia.Sample.LuaDomains.Shared (Shared (sharedControls, sharedCounts, sharedQueue, sharedRecorder), admitLogged, failSession)
+import Hetoimasia.Sample.LuaDomains.Snapshot (SessionFailure (SessionFailure))
+import Hetoimasia.Scripting.Lua.Instance (awaitInstance)
 import Hetoimasia.Sample.LuaDomains.Tally (ControlCounts (..), Counts (..))
 import qualified Data.Map.Strict as Map
 import Test.Domains.FixedLog
@@ -124,6 +133,96 @@ spec = describe "a replay through the admission seam" $ do
       accepted ← session 100000 defaultBounds
       accepted `shouldSatisfy` either (const False) (const True)
       readIORef ran `shouldReturn` True
+
+  describe "a stop or a failure recorded while a replay releases its records" $ do
+    -- Admission has ended for the tick that was about to begin: nothing is released after it, whichever it is, and a record
+    -- that was released before it is accounted for as any accepted input is. The session ends as it would for any other, with
+    -- #499's report, and the replay says it is incomplete; it is never a defect of the replay.
+    let stopping holder = do
+          known ← readIORef holder
+          forM_ known $ \domains → do
+            requestStop domains
+            -- The gameplay instance has settled, so what asks it for anything is refused as unknown.
+            void (awaitInstance (domainsControl domains) (startedTicket (domainsGameplay domains)))
+        failing holder = do
+          known ← readIORef holder
+          forM_ known $ \domains →
+            atomically (failSession (domainsShared domains) (SessionFailure "injected" "active" "update" 1 "script error" "injected"))
+        -- Run a replay of these records to its end, the hook run before each record is released: it is given the holder of
+        -- the session and how many records have been released before.
+        racing records act = do
+          holder ← newIORef Nothing
+          releases ← newIORef (0 ∷ Int)
+          let hook = do
+                released ← readIORef releases
+                modifyIORef' releases (+ 1)
+                act holder released
+          withSample (\config → (fixedConfig (logOf records) 3 1 Normal config) {configReleaseHook = hook}) $ \_ _ domains → do
+            writeIORef holder (Just domains)
+            generous (runSession domains)
+        settledControls report =
+          let controls = reportControls report
+           in controlApplied controls + controlAlready controls + controlNoLonger controls + controlAbandoned controls
+        stopsAt n holder released = when (released == n) (stopping holder)
+        failsAt n holder released = when (released == n) (failing holder)
+
+    it "stops quietly before a control is released: no defect, a stopped session's report, an incomplete replay, nothing recorded" $ do
+      report ← racing [control 1 0 OpPause] (stopsAt 0)
+      (reportTicks report, reportStatus report) `shouldBe` (0, Stopped)
+      reportReplay report `shouldBe` Just (ReplayOutcome 1 0)
+      reportRecorded report `shouldBe` Right emptyLog
+      (controlOffered (reportControls report), controlAccepted (reportControls report)) `shouldBe` (1, 0)
+
+    it "stops quietly before an intention is released, the same" $ do
+      report ← racing [intent 1 0 0 0 1 0] (stopsAt 0)
+      (reportTicks report, reportStatus report) `shouldBe` (0, Stopped)
+      reportReplay report `shouldBe` Just (ReplayOutcome 1 0)
+      reportRecorded report `shouldBe` Right emptyLog
+      countAccepted (reportCounts report) `shouldBe` 0
+
+    it "stops between the records of one tick: what was released is accounted for, the rest is not released" $ do
+      let records = [control 1 0 OpPause, intent 1 0 0 0 1 0, intent 1 1 1 0 1 0]
+      report ← racing records (stopsAt 1)
+      reportStatus report `shouldBe` Stopped
+      reportReplay report `shouldBe` Just (ReplayOutcome 3 1)
+      -- The control the engine took is recorded and settles as no longer applicable; the intentions were never released.
+      reportRecorded report `shouldBe` Right (logOf [control 1 0 OpPause])
+      (controlAccepted (reportControls report), settledControls report) `shouldBe` (1, 1)
+      countAccepted (reportCounts report) `shouldBe` 0
+
+    it "stops between two intentions of one tick: the one released is discarded exactly once, with the ledger balanced" $ do
+      let records = [intent 1 0 0 0 1 0, intent 1 1 1 0 1 0]
+      report ← racing records (stopsAt 1)
+      reportStatus report `shouldBe` Stopped
+      reportReplay report `shouldBe` Just (ReplayOutcome 2 1)
+      -- The one released is discarded by the stop, exactly once: the session's own law holds ('runSession' checks it).
+      (countAccepted (reportCounts report), countDiscarded (reportCounts report)) `shouldBe` (1, 1)
+      reportRecorded report `shouldBe` Right (logOf [intent 1 0 0 0 1 0])
+
+    it "fails the session quietly when a failure is recorded before an intention is released: #499's failure, an incomplete replay" $ do
+      report ← racing [intent 1 0 0 0 1 0] (failsAt 0)
+      reportTicks report `shouldBe` 0
+      reportStatus report `shouldSatisfy` \case Failed _ → True; _ → False
+      reportReplay report `shouldBe` Just (ReplayOutcome 1 0)
+      reportRecorded report `shouldBe` Right emptyLog
+      filter ("replay: " `isPrefixOf`) (map Text.unpack (renderReport report)) `shouldSatisfy` \case
+        [line] → "incomplete (session failed at tick 1)" `isSuffixOf` line
+        _ → False
+
+    it "fails the session when a failure is recorded before a control is released: the engine still takes it, and it settles as no longer applicable" $ do
+      report ← racing [control 1 0 OpPause] (failsAt 0)
+      reportStatus report `shouldSatisfy` \case Failed _ → True; _ → False
+      reportReplay report `shouldBe` Just (ReplayOutcome 1 1)
+      reportRecorded report `shouldBe` Right (logOf [control 1 0 OpPause])
+      (controlAccepted (reportControls report), settledControls report) `shouldBe` (1, 1)
+
+    it "fails the session when a failure is recorded between the records of a tick: the intentions released before it are invalidated" $ do
+      let records = [intent 1 0 0 0 1 0, intent 1 1 1 0 1 0]
+      report ← racing records (failsAt 1)
+      reportStatus report `shouldSatisfy` \case Failed _ → True; _ → False
+      reportReplay report `shouldBe` Just (ReplayOutcome 2 1)
+      (countAccepted (reportCounts report), countInvalidated (reportCounts report)) `shouldBe` (1, 1)
+      reportRecorded report `shouldBe` Right (logOf [intent 1 0 0 0 1 0])
 
   describe "a log that can" $ do
     it "is released to the seam one tick at a time: each tick's records only once it is the next unstarted tick, none before it" $ do

@@ -201,7 +201,7 @@ import Hetoimasia.Sample.LuaDomains.InputLog
   , ReplayProblem
   )
 import Hetoimasia.Sample.LuaDomains.Intention (Dispositions (..), noDispositions)
-import Hetoimasia.Sample.LuaDomains.Queue (AdmitAt (..), closeQueue, drain, nextUnstarted, reserved, seal, settle)
+import Hetoimasia.Sample.LuaDomains.Queue (AdmitAt (..), closeQueue, drain, isClosed, nextUnstarted, reserved, seal, settle)
 import Hetoimasia.Sample.LuaDomains.Registration (gameplayNamespaces, sampleRegistration, uiNamespaces)
 import Hetoimasia.Sample.LuaDomains.Scenario (scriptedInputs)
 import Hetoimasia.Sample.LuaDomains.Scripts (facadeChunk, gameplayChunk, gameplayModule, gameplaySource, interfaceModule, interfaceSource)
@@ -440,6 +440,9 @@ data DomainsConfig = DomainsConfig
     -- driver releases each record to the seam the UI's path uses, before the tick it is for has begun; the UI's offers are
     -- declined and its control requests refused, before they take a place. A log that cannot be replayed under this
     -- configuration is refused before anything starts ('ReplayRefused').
+  , configReleaseHook ∷ !(IO ())
+    -- ^ Test-only: run by a replay before it releases each record, after the session was found to be running: the
+    -- interval in which a stop, a failure or a retirement can be recorded while a release is under way.
   , configUiScenario ∷ !(Maybe Text)
     -- ^ The scenario name the UI behavior reads, when it is not 'configScenario': a replay of a @pause@ log runs gameplay
     -- as that scenario does and its UI as @normal@, which asks for no control of its own.
@@ -482,6 +485,7 @@ defaultConfig =
     , configUiSeesEnd = True
     , configPace = \_ → pure ()
     , configReplay = Nothing
+    , configReleaseHook = pure ()
     , configUiScenario = Nothing
     }
 
@@ -1801,63 +1805,73 @@ data FeedState = FeedState
 newFeed ∷ InputLog → IO Feed
 newFeed replay = Feed (byTick replay) (length (logRecords replay)) <$> newTVarIO (FeedState 0 0 [])
 
--- | Release the records of the next unstarted tick, once, as the module header says: each intention through the seam the
+-- | Release the records of the next unstarted tick, once, as the module header describes: each intention through the seam the
 -- UI's path uses ('admitLogged'), each control through the owner's logical admission at its recorded place, before the
--- tick begins. What the records of earlier ticks did is settled first. A session that no longer takes work (it failed or is
--- being stopped) answers that it is closed, which ends the release quietly: that tick will not begin. Anything else that is
--- not an admission is a defect, because everything decidable beforehand was checked before the session started.
+-- tick begins. What the records of earlier ticks did is settled first.
+--
+-- A session that no longer takes work (it failed, is being stopped or retired, or has ended) is a session whose tick will
+-- not begin, and releasing is then quiet: it checks first, and it checks again after anything it was refused, since a halt
+-- can be recorded at any point between. A refusal that a halt explains (the queue closed, the gameplay instance settled
+-- because it was asked to stop) ends the release and changes nothing else: the tick is halted or failed as it would have been
+-- for any session, with #499's report. Anything else that is not an admission is a defect, because everything decidable
+-- beforehand was checked before the session started.
 releaseRecords ∷ Domains → Feed → IO ()
 releaseRecords domains feed = do
   settleReplayed domains feed
   let shared = domainsShared domains
       session = configSession (domainsConfig domains)
+      -- Admission has ended, for any reason: a failure, a stop, a retirement, the session's end.
+      over = atomically ((||) <$> haltedNow shared <*> isClosed (sharedQueue shared))
   next ← atomically (nextUnstarted (sharedQueue shared))
   before ← readTVarIO (feedState feed)
-  when (next > feedReleased before) $ do
+  halted ← over
+  when (next > feedReleased before && not halted) $ do
     -- The tick is claimed first: it is released once, and a release that is interrupted is never begun again from the
     -- start, which would find the places it had already taken held.
     atomically (modifyTVar' (feedState feed) (\state → state {feedReleased = next}))
-    foldM_ (release shared session next) True (Map.findWithDefault [] next (feedRecords feed))
+    foldM_ (release shared session over next) True (Map.findWithDefault [] next (feedRecords feed))
   where
-    release _ _ _ False _ = pure False
-    release shared session tick True record = case record of
-      RecordIntention {} → case intentionOf session record of
-        Nothing → pure False
-        Just (place, intention) → do
-          -- The admission, its count and its record, and the count of what the replay released, are one transaction.
-          answer ← atomically $ do
-            admitted ← admitLogged shared place intention
-            case admitted of
-              AdmittedAt _ → fed
-              _ → pure ()
-            pure admitted
-          case answer of
-            AdmittedAt _ → pure True
-            AtClosed → pure False
-            other → throwIO (ReplayNotAdmitted tick (show other))
-      RecordControl _ sequence' _ op →
-        -- The engine's acceptance and the session's record of it are not separated by anything that is interrupted: the
-        -- request never waits, and what follows it is one transaction, so a control the engine took is counted, recorded and
-        -- held for its receipt whatever happens next.
-        mask_ $ do
-          let request = case op of OpPause → InstancePause; OpResume → InstanceResume
-              gameplay = domainsGameplay domains
-          answer ← requestInstanceControlAt (scheduledEndpoint (startedOwner gameplay)) (startedInstance gameplay) request (ControlSlot tick sequence')
-          case answer of
-            InstanceControlAccepted receipt → do
-              atomically $ do
-                modifyTVar' (sharedControls shared) (bumpAnswer Nothing . bumpOffered)
-                modifyTVar' (sharedControlTicks shared) (Set.insert tick)
-                modifyTVar' (sharedRecorder shared) (appendRecord record)
-                modifyTVar' (feedState feed) (\state → state {feedReceipts = feedReceipts state <> [(feedFed state + 1, receipt)]})
-                fed
-              pure True
-            InstanceControlClosed → do
-              atomically (modifyTVar' (sharedControls shared) (bumpAnswer (Just "closed") . bumpOffered))
-              pure False
-            other → do
-              atomically (modifyTVar' (sharedControls shared) (bumpAnswer (Just "refused") . bumpOffered))
-              throwIO (ReplayNotAdmitted tick (show other))
+    release _ _ _ _ False _ = pure False
+    release shared session over tick True record = do
+      configReleaseHook (domainsConfig domains)
+      case record of
+        RecordIntention {} → case intentionOf session record of
+          Nothing → pure False
+          Just (place, intention) → do
+            -- The admission, its count and its record, and the count of what the replay released, are one transaction.
+            answer ← atomically $ do
+              admitted ← admitLogged shared place intention
+              case admitted of
+                AdmittedAt _ → fed
+                _ → pure ()
+              pure admitted
+            case answer of
+              AdmittedAt _ → pure True
+              AtClosed → pure False
+              other → throwIO (ReplayNotAdmitted tick (show other))
+        RecordControl _ sequence' _ op →
+          -- The engine's acceptance and the session's record of it are not separated by anything that is interrupted: the
+          -- request never waits, and what follows it is one transaction, so a control the engine took is counted, recorded
+          -- and held for its receipt whatever happens next.
+          mask_ $ do
+            let request = case op of OpPause → InstancePause; OpResume → InstanceResume
+                gameplay = domainsGameplay domains
+            answer ← requestInstanceControlAt (scheduledEndpoint (startedOwner gameplay)) (startedInstance gameplay) request (ControlSlot tick sequence')
+            case answer of
+              InstanceControlAccepted receipt → do
+                atomically $ do
+                  modifyTVar' (sharedControls shared) (bumpAnswer Nothing . bumpOffered)
+                  modifyTVar' (sharedControlTicks shared) (Set.insert tick)
+                  modifyTVar' (sharedRecorder shared) (appendRecord record)
+                  modifyTVar' (feedState feed) (\state → state {feedReceipts = feedReceipts state <> [(feedFed state + 1, receipt)]})
+                  fed
+                pure True
+              refused → do
+                -- A halt explains a refusal: it was recorded before the instance was asked to stop, or the owner retired,
+                -- and so is visible now. Nothing else does.
+                explained ← over
+                atomically (modifyTVar' (sharedControls shared) (bumpAnswer (Just (if explained then "closed" else "refused")) . bumpOffered))
+                if explained then pure False else throwIO (ReplayNotAdmitted tick (show refused))
     fed = modifyTVar' (feedState feed) (\state → state {feedFed = feedFed state + 1})
 
 -- | Read the settlements of the controls a replay released that have settled, counting each as the UI's read does; the
