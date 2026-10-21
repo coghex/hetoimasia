@@ -13,10 +13,12 @@ single-VM runner (`Hetoimasia.Scripting.Lua.Runner`) or any `Internal` module, a
 GLFW or console dependency, so it builds in both `cabal.project` and `cabal.project.cpu`. No engine
 library depends on it, and nothing routine launches its executable.
 
-This sample covers the two-domain core (LUA-29) and, on top of it, the paths that decide whether the
+This sample covers the two-domain core (LUA-29), on top of it the paths that decide whether the
 design is trustworthy (LUA-30): a failed gameplay session, overload beyond the `full` answer, the stop and
 cancellation paths with cleanup evidence on every path, the leases a gameplay instance holds, and the UI's
-pause and resume of gameplay. Determinism qualification is a later slice; nothing below claims it.
+pause and resume of gameplay, and, closing the trusted milestone (LUA-8), the canonical digest of its authoritative
+state, a tick-assigned input log with its replay, and the qualification of D-23's deterministic gameplay on it. What was
+qualified, and what was not, is stated in [What was qualified](#what-was-qualified) and nowhere widened.
 
 ## Reproduce
 
@@ -26,10 +28,20 @@ cabal run exe:hetoimasia-lua-domains -- --scenario normal     # exits 0
 cabal run exe:hetoimasia-lua-domains -- --scenario failure    # exits 1, with the failure as evidence
 cabal run exe:hetoimasia-lua-domains -- --help
 cabal test hetoimasia-sample-lua-domains:lua-domains-tests --test-show-details=direct
+# the input log, its replay and the digest trace (SCRATCH is a directory of your own; nothing is written elsewhere)
+cabal run exe:hetoimasia-lua-domains -- --scenario normal --ticks 50 --seed 1 --record "$SCRATCH"/log.txt --digests
+cabal run exe:hetoimasia-lua-domains -- --replay "$SCRATCH"/log.txt --ticks 50 --seed 1 --digests
+# the optional profiling probe: prints records, asserts no number
+cabal test hetoimasia-sample-lua-domains:lua-domains-profile --test-show-details=direct
 ```
 
 Add `--project-file cabal.project.cpu` to any of them for the CPU-only configuration. The
-validation group is `test.lua-domains`, a non-optional group of the `haskell-engine` worker.
+validation group is `test.lua-domains`, a non-optional group of the `haskell-engine` worker; the probe is
+`test.lua-domains-profile`, an optional group that affected inputs never select.
+
+The two `--digests` runs print the same `digest N HEX` lines (the live run decided which tick took each intention by
+elapsed time; the replay is given exactly what it decided). Every command of the acceptance map below is run by an example
+of `lua-domains-tests` that starts the executable as a bounded child process.
 
 ## What owns what
 
@@ -49,6 +61,9 @@ a handle into a VM; each owner's bindings borrow what they need and nothing else
 | Session state (`Session`): the failures told of, whether a stop was asked for, how the session ended | the owners' escalation callbacks, the driver's stop | the driver, the report | the owner's thread, the driver | the session |
 | Control bookkeeping (next place per tick, requests in flight, counts, receipts held) | the UI's facade, the assignment callback | the driver (it waits on the in-flight count), the report | the UI owner's thread, any | the session |
 | Workspace tally (acquired, released, release failed) | the workspace's acquire and release, on the gameplay owner's threads | the report, the examples | any | the session |
+| Digest trace (the initial state's digest, then each committed tick's) | the driver, in the transaction that commits the tick | the report, the examples | application thread | the session; at most 100001 entries, never dropped |
+| Input recorder (every accepted intention and control, in the order accepted) | the transaction that admits each: the UI's `submit`, a replay's `admitLogged`, the control bookkeeping the UI's facade and the assignment run, a replay's control admission | the report, once, after the session ends | any | the session; bounded by the log's, never silently truncated |
+| Replay feed (the log's records by tick, what was released, the receipts of released controls) | the driver, from `stepTick` | the report | application thread | the session |
 
 The UI never reads the committed world or the candidate; gameplay never reads the view or the snapshot.
 
@@ -485,18 +500,138 @@ gameplay behavior draws three values in every tick.
 With the same seed, the same initial state and the same tick-assigned intentions, the committed worlds are
 the same; a different seed gives a different sequence. The examples compare them with a pure model of the
 behavior. They hold the inputs fixed (no intentions at all) rather than claim equal worlds for a UI whose
-intentions are assigned to ticks by elapsed time.
+intentions are assigned to ticks by elapsed time; the qualification below holds the inputs fixed as a log instead.
+
+## The canonical state and its digest
+
+`Hetoimasia.Sample.LuaDomains.Canonical` encodes what the driver has committed, or published to end the session, as bytes,
+and digests the encoding with SHA-256 (`cryptohash-sha256`, the bounds the Vulkan native package uses). The encoding is
+versioned (`HLDS`, version 1) and is made of fixed-width big-endian integers in a fixed order, with no `show`, no floating
+point and no map or set iteration order:
+
+| Field | Encoding |
+| --- | --- |
+| format | `HLDS`, then the version as a `u16` |
+| committed tick, random stream's state | `u64`, `u64` |
+| entities, by index | `u32` count, then each position `i64`, `i64` and version `u64` |
+| status | `u8` kind (running, paused, failed, stopped); failed adds the failing tick `u64` and the failing phase's kind `u8` |
+| dispositions | applied places; stale rejections (place, reason, entity, version, delta); invalidated places; discarded places; each a `u32` count then its entries, and the number not listed |
+
+It excludes everything that is run-local identity or text a script chose: the session's identity, the gameplay
+instance's and owner's identities, the failure's message, stage and kind, the number of later failures, a stale intention's
+own session and the tick of its view, tracebacks, timestamps and the snapshot's revision. Equal states give equal digests; a
+change to any covered field changes the digest and a change to any excluded field does not; and the encoding and digest of
+two hand-built states are pinned to golden values computed apart from the code. They are the only golden digests: no
+whole-run digest is committed, because the claim is the same build and platform, not a value across platforms.
+
+**The trace** holds the digest of the initial state (tick 0) and then of the state each successful commit publishes, appended
+in the transaction that commits the tick. A tick that did not commit adds nothing, and a failed or stopped session's trace
+ends where its committed ticks end. It is bounded by the most ticks a session may have (100000, so 100001 entries) and a full
+trace is a defect that raises, never an entry dropped.
+
+**The final digest** is the digest of the final *published snapshot, status included*, which the report names. It is not the
+trace's last entry: a failure or a stop after the last commit changes the final digest (the status, and what the failure
+invalidated or the stop discarded, are covered) without adding to the trace or rewriting an entry of it. A session that
+finishes with no failure and no stop ends in the digest of its last commit.
+
+## The input log and its replay
+
+`Hetoimasia.Sample.LuaDomains.InputLog` is a text format with a versioned header, one line for each *accepted* record, and a
+trailer that counts them. A record is something the session accepted, in exactly the terms its admission takes it, with the
+tick it was accepted for and its place there; never something merely offered. There are two kinds, because there are two
+admission paths and each has its own places in a tick (as when the sample was delivered): an *intention* (the queue's seam,
+`admitAt`) and a *control* (the owner's logical admission, `requestInstanceControlAt`).
+
+```
+hetoimasia-lua-domains input log v1
+control tick=5 place=0 target=gameplay op=pause
+intent tick=6 place=0 session=current view=5 entity=3 version=0 dx=1 dy=-2
+end records=2
+```
+
+An intention's fields are the tick, its place, whether it acted in the session that took it (`current`) or another
+(`foreign`: an identity is run-local, so a log never names one), the tick of its view, the entity, the entity's version and
+the delta. A control names its target by the sample-local role `gameplay` (never an owner or an instance identity) and its
+operation (`pause` or `resume`). Records are in canonical order (by tick, a tick's controls by sequence and then its
+intentions by place, each strictly increasing); numbers are canonical decimals. Bounds: a header of at most 64 bytes, a line of
+at most 128, a place or sequence below 256, at most 1,200,000 records (100000 ticks of the default eight places and four
+controls). The format carries every input the live path accepts, so a configuration is refused when a session is made if it
+could accept more than the format holds: more than 256 places or pending controls for a tick, a finite session of more than
+100000 ticks (the trace holds the initial state and that many ticks), or one whose ticks times its places and pending
+controls pass the record bound. The view's tick, the version and the delta are the numbers the live path takes (it checks only
+that the first two are not negative and the delta within the configured bound, which is at most 1000).
+
+**The writer** collects every successful admission in the transaction that makes it (the UI's path, a replay's, and a control
+once the engine has accepted it), so there is one record for each, in the order the admissions took effect however many
+callers complete at once, and reads them out in canonical order. It never hands back a log that has lost a record: past the
+bound, for a record the format cannot carry, or for a control whose answer was never told, it says why there is none.
+
+**The parser** refuses a malformed, unordered, duplicated-place or over-bound record, a missing or wrong header, a missing or
+mismatched trailer (so a log cut short at a record boundary is refused as truncated) and anything after the trailer, whole,
+naming the line and never skipping one. What it says is fixed words and the line's number, never text from the file.
+
+**A replay** (`configReplay`; `--replay`) takes the session's intentions and controls from the log and from nothing else. The
+driver releases the records of a tick when that tick is the next unstarted one, before it begins, each intention through the
+same seam the UI's path uses and each control through the owner's logical admission at its recorded place, and the sample's
+rules apply unchanged (revalidation in place order, dispositions, staging, commit). The UI's own offers are answered
+`replay` (*declined*: counted, and given no place and no disposition) and its requests for a control are refused as
+`unassigned`, both before they take a place, and the UI behavior need not run at all. A log that cannot be replayed is
+refused before the session starts, with the reason, from what the log, the tick limit and the scenario decide: a record for a
+tick after the last tick or after the tick the scenario stops the session at, more records for a tick than the queue or the
+engine's reservations take, a place beyond the tick's, a record the live path would have refused, a place held twice. What an
+execution does after it starts is not predicted: a failure keeps the sample's failure, disposition and cleanup behavior, and a
+session that fails or stops before a record's tick is never reported as a complete replay (`replay: fed 8 of 40 records,
+incomplete (session failed at tick 6)`). A stop, a failure or a retirement recorded while a tick's records are being released
+(or before) ends the release quietly: nothing more is released, whatever it was about to be, and what was released before it is
+accounted for as any accepted input is (a control the engine took settles as no longer applicable, an intention is invalidated
+by the failure or discarded by the stop, and both are in the recorded log), with #499's report and an incomplete replay. A
+refusal that no halt explains, a record the seam does not take though the session has not ended, is a defect that raises,
+never a silent loss.
+
+## What was qualified
+
+D-23's first qualification target, on this sample: **one gameplay VM, one scheduling configuration (the owners' as
+`withDomains` configures them), the same build and supported platform, identical tick-assigned inputs** (the input log, the
+seed, the initial world and the scenario's gameplay). Repeated runs give the same digest at every tick boundary, tick by
+tick, however long segments take, whenever the UI does and wherever grants are issued, which `Test.Domains.Qualify` shows with
+real interpreters and real supervision:
+
+* an undisturbed run, repeated;
+* gameplay segments held and released at differing points by gates;
+* differing amounts of spin work in segments (a test-only binding with no clock);
+* the UI doing many more updates, snapshot reads, `math.random` draws and offered intentions of its own, and asking to pause
+  gameplay, that are no part of the log;
+* the driver issuing grants back to back, and with gaps that are UI updates;
+* the UI owner on the real clock and timer;
+* a replay, with no UI activity at all, of the log a UI-driven run recorded.
+
+Delays and UI activity are produced by gates, the busy work of a binding, the injected clock's advancement and its updates
+each awaited by its own completion signal; no check waits for wall-clock time. Each run also shows that the log was the only
+source: what the session accepted and recorded is exactly the log. Three negative controls show the comparison can fail (a
+different seed, one record moved to another tick, two intentions on one entity exchanged in place order, each diverging at the
+first tick it should), and the failure and pause scenarios reproduce their traces across replays. The routine suite repeats
+each disturbance five times; the optional probe repeats them fifty times.
+
+**Not qualified, and not claimed:** different scheduling policies, worker counts, platforms or library versions; cross-platform
+bitwise identity; cross-version replay; network lockstep; a replay product (the log carries no seed, tick count or scenario:
+the command line does). A failure that begins after a tick's accounting cutoff may land at that tick or the next (D-48), so a
+run that depends on one is never compared by trace; the failure the scenarios use is a script error in the tick's own update.
+
+**Versions in force** (the resolved plan at the time of the delivering pull request): GHC 9.14.1, Cabal 3.18.1.0, `lua` 2.3.4
+(the bundled interpreter; `-system-lua -pkg-config -allow-unsafe-gc`), `cryptohash-sha256` 0.11.102.1, `unix` 2.8.8.0, `hspec` 2.11.17,
+`stm` 2.5.3.1, `bytestring` 0.12.2.0, `containers` 0.8, `text` 2.1.3, the pinned `index-state` 2026-09-18T00:00:00Z, the threaded
+runtime with `-N2`.
 
 ## The executable
 
 ```
-hetoimasia-lua-domains [--ticks N] [--seed N] [--scenario NAME]
+hetoimasia-lua-domains [--ticks N] [--seed N] [--scenario NAME] [--record FILE] [--replay FILE] [--digests] [--expect-digest HEX]
 hetoimasia-lua-domains --help
 ```
 
 It runs both owners against a fixed scripted fake input source (forty entries, the same on every run, or two
-hundred for `flood`), commits N ticks (1 to 100000, twenty by default; `--seed` defaults to 1), retires both
-owners and prints one bounded report on stdout.
+hundred for `flood`), or against an input log, commits N ticks (1 to 100000, twenty by default; `--seed` defaults to 1), retires
+both owners and prints one bounded report on stdout.
 
 | Scenario | What it does | Exit |
 | --- | --- | --- |
@@ -506,28 +641,71 @@ owners and prints one bounded report on stdout.
 | `flood` | the UI offers two hundred intentions, sixteen an update: many are answered `full` | 0 |
 | `stop` | the driver stops the session after tick 8 | 0 |
 
+| Option | Meaning |
+| --- | --- |
+| `--record FILE` | write the accepted-input log to `FILE`, which must **not name anything** (an existing file, empty or not, a directory, or a symbolic link, dangling or not, is refused, and never opened for writing; the directory must exist). The file is created after the session by an exclusive creation (`O_CREAT | O_EXCL`), so it is this run's whatever happened since the check, written whole, and removed on every unsuccessful way out, an interruption included; a partial file that cannot be removed is reported |
+| `--replay FILE` | take the session's intentions and controls from `FILE`, which must exist, be readable and valid, and be replayable in this session; it is also the only source (see above). `--record` beside it writes what the replay accepted |
+| `--digests` | after the report, print the digest trace: `digest TICK HEX`, tick 0 first, one line for each committed tick, at most 100001 |
+| `--expect-digest HEX` | compare the final digest (64 hex digits, either case) and exit 1 on a mismatch, naming both digests on stderr |
+
 The exit status is **0** when the session ended without a failure (a stop is not one), **1** when the gameplay
-session failed or a UI failure was recorded, and **2** for an unknown, repeated or malformed argument (one bounded line
-on stderr, the user's text escaped and cut, and no report). `--help` prints the usage and exits 0. The report is
-ten lines:
+session failed or a UI failure was recorded, when the final digest is not `--expect-digest`'s, or when a recording that was asked
+for could not be written (the report says so and never claims it), and **2** for an unknown, repeated or malformed argument, a
+`--replay` file that is missing, unreadable, malformed or not replayable here, or a `--record` path that exists or has no directory
+(one bounded line on stderr, the user's text escaped and cut, and no report; nothing has run). A matching `--expect-digest` never
+changes a failure's status. `--help` prints the usage and exits 0. The report is eleven lines, and a twelfth for a replay and a
+thirteenth for a recording:
 
 ```
 hetoimasia-lua-domains: session 1, seed 1, scenario failure
 ticks committed: 5
 status: failed at tick 6: gameplay active update, script error: gameplay@1:33: scripted failure at tick 6, later failures 0
-intentions answered: accepted 40, full 16 (queue 0, places 16), closed 0, refused 0, malformed 0
+intentions answered: accepted 40, full 16 (queue 0, places 16), closed 0, refused 0, malformed 0, declined 0
 intentions settled: applied 24, stale 4, invalidated 12, discarded 0
 controls: offered 0, accepted 0, refused 0, applied 0, already 0, no longer applicable 0, abandoned 0
 ui: updates 15, busy 16, retried 14, saw running,failed, no failure
 cleanup: ui ended (status stopped, exit ExitStopped, not started 0, in flight 0); gameplay ended (status stopped, exit ExitStopped, not started 0, in flight 0)
 cleanup: gameplay failed [shutdown ShutdownAbsent, leases drained 1 failed 0]; interface stopped [shutdown ShutdownAbsent, leases drained 0 failed 0]
 cleanup: workspaces acquired 1, released 1, release failed 0; publication closed; pending 0; failures told of 1, after publication 0
+final digest: HEX (trace 6 entries)
 ```
 
 The counts vary from run to run, because the UI runs on elapsed time and so decides which tick takes an
-intention; the laws do not: *accepted = applied + stale + invalidated + discarded* and *pending 0*. Diagnostics go to stderr and no
-window is created. Between ticks the executable waits five milliseconds of real time so the UI owner has
-something to do; that pacing changes when a commit happens and never what it contains.
+intention; the laws do not: *accepted = applied + stale + invalidated + discarded* and *pending 0*, and the offers
+(*accepted + full + closed + refused + malformed + declined*). Diagnostics go to stderr and no window is created. Between ticks
+the executable waits five milliseconds of real time so the UI owner has something to do; that pacing changes when a commit
+happens and never what it contains.
+
+## The acceptance map
+
+Each acceptance signal of the design's LUA-8 section, the check that proves it, and the issue that delivered it. Names are the
+`describe` groups of `lua-domains-tests` (run one with `--test-option=--match --test-option="NAME"`) and the executable's
+commands; this table is checked in review against the real names, and no test reads it.
+
+| Acceptance signal | Check | Delivered by |
+| --- | --- | --- |
+| UI makes progress before gameplay completes | `progress while gameplay is held`, `progress while gameplay is CPU-bound` (prints the RTS options in force); the `normal` scenario's report line `ui: updates N` | #498 10, 11 |
+| No shared VM or global state | `exposure`, `the owners' lifetime`, `the package and import boundary` | #498 3 |
+| Coherent old and new views, exactly-once accepted intentions | `the UI's view`, `staging and the commit`, `the intention contract`, `tick assignment`, `conservation of intentions` | #498 8, 9; #499 5 |
+| Explicit overload, gameplay-session failure and cleanup evidence | `the failure of the gameplay session`, `the owner's accounting, and what the sample's own bookkeeping survives`, `the ledger of intentions on every path`, `the stop paths and the cleanup evidence`, `the gameplay workspace's leases`, `a failure of the UI owner's behavior`, `the UI's control of the gameplay behavior`; the executable's `--scenario failure` (exit 1), `flood` and `stop` | #499 1-10 |
+| Direct registration without weakening cross-owner boundaries | `exposure`, `the package and import boundary` | #498 3 |
+| D-23 qualified on the sample | `D-23 qualified on the sample`, `the canonical encoding and the digest trace`, `the input log`, `a replay through the admission seam`, `the executable's record, replay and digest options`, `the files of the record and replay options`; `--record ... --digests` then `--replay ... --digests` (same digest lines); the optional probe's `qualify-repeat` records | #500 1-7 |
+| The threaded-RTS record | the RTS options `progress while gameplay is CPU-bound` and the probe's `rts-options` record print; the delivering pull request's macOS record and its Linux CI receipts | #500 5, 9 |
+
+The platform records are the delivering pull request's: its local macOS run (commands, outputs and exit statuses, `ghc --version`,
+the resolved `lua`, the OS and hardware, the RTS options) covers the signals above on macOS; its own Linux CI receipts are the
+evidence for the race windows. This README does not record either.
+
+## The optional profiling probe
+
+`cabal test hetoimasia-sample-lua-domains:lua-domains-profile --test-show-details=direct` (the optional catalog group
+`test.lua-domains-profile`, never selected by affected inputs or the fallback) runs bounded workloads and prints one record
+for each, `probe: NAME | key=value | ...`, with no threshold and no assertion on a number: the UI's update cadence (count,
+minimum, median, 90th percentile and maximum of the intervals between completed updates) while gameplay is idle, held in a running
+segment and CPU-bound; gameplay's throughput in ticks per second with the UI idle and busy; the scheduler's counters for both
+owners; the RTS statistics (collections, allocation, the collector's pause total, live bytes); and requirement 5's runs repeated
+fifty times each with how many matched the baseline. It is built `-threaded -rtsopts -with-rtsopts=-N2 -T` and prints that. A
+divergence it prints is a finding, not a failure of the probe.
 
 ## Tests
 
@@ -546,3 +724,11 @@ workspace leases on every path an instance can end by, with a test-only workspac
 (`Leases`); the UI's failure (`UiFailure`); pause, resume and the serialization of controls with the tick
 (`Controls`); and the executable's report, scenarios, `--help` and exit statuses. The executable is reached through the suite's
 `build-tool-depends` and run as a child process, and no validation group launches it any other way.
+
+The qualification adds, by requirement: the canonical encoding, its golden values, the field-by-field examples of what changes
+and what does not change the digest, the trace and the final digest (`Canonical`); the format, the writer, every refusal of
+the parser and the raced admissions (`InputLog`); the replay's refusals, release timing and the UI's declined offers and
+refused requests (`Replay`); D-23's qualification, its negative controls and the failure and pause replays (`Qualify`); and the
+executable's options, their exit statuses and the distinctions of the final digest (`Options`); and the files of the record and replay options, with exclusive creation, symbolic links, a competing creation and an interrupted write (`Files`). The helpers the suite and the
+probe share (the boundary, the fake UI clock, the test-only namespace, the generated log and the disturbances) are the private
+library `lua-domains-fixtures`, so neither imports the other's sources.

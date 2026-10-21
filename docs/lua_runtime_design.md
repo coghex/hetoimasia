@@ -3630,6 +3630,27 @@ and verified policy, with adversarial regression coverage.
 - **Open questions:** None; D-44 settles the consumer's open choices and D-45
   renews readiness. D-7 fixes gameplay failure, not an implicit new transaction
   or save policy.
+- **As delivered (#500):** the closing slice extends the sample without reopening #498 and #499
+  (`samples/lua-domains/README.md` is the contract). `Canonical` encodes the committed state (the world, the tick, the
+  stream's state, the dispositions and the status kind, with the failing tick and phase's kind for a failure; versioned
+  `HLDS` 1, fixed-width, no run-local identity or script text) and digests it with SHA-256; the driver appends the digest of
+  tick 0 and of each successful commit to a bounded trace in the commit's own transaction, and the report's final digest is
+  that of the final *published* snapshot, so a failure or a stop after the last commit changes it and never the trace. The
+  input log is a versioned text format of accepted records only (intentions through `admitAt`'s terms, controls by the
+  sample-local role `gameplay` through the engine's `requestInstanceControlAt`, two place spaces as delivered), with a
+  trailer that counts, a bounded parser that refuses whole and names a line, and a writer that records in the admitting
+  transaction and never hands back a log that lost a record; a recording is created exclusively and is removed on every
+  unsuccessful exit; a configuration that could accept more than the format holds (places, pending controls, ticks, records) is
+  refused when the session is made. A replay releases each tick's records when that tick is the next unstarted one, through the
+  same seam; the UI's offers are declined and its control requests refused before they take a place; what the log, the tick
+  limit and the scenario decide is refused before the start, and anything an execution does keeps #499's failure behavior
+  and is never reported as a complete replay. The qualification (`Test.Domains.Qualify`) holds the log, seed and
+  configuration fixed and compares the digest trace tick by tick across gates, spin work, heavy UI activity, grants back to
+  back and gapped, the real clock and a recorded UI run's replay, with three negative controls and the failure and pause
+  replays; it found no divergence, so no library change was needed (D-48's late failures are never compared by trace). The
+  executable gains `--record`, `--replay`, `--digests` and `--expect-digest`; the optional probe group
+  `test.lua-domains-profile` prints measurements and asserts none (P-11). The suite and the probe share a private fixtures
+  library. The library, runner, CI image and native pins are unchanged.
 
 ### LUA-9. Add bounded child-process transport and owned process lifetime
 
