@@ -1027,6 +1027,32 @@ retained reference cannot itself prevent another mod's deletion. This selects
 reference lifetime, not cross-mod write permission, exact ID representation
 or persistence. No automatic relationship cleanup is introduced.
 
+### D-38. Trusted gameplay instances share state access
+
+Owner answer, **2026-10-21 18:57:21 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: shared access (Rec.)
+
+Authenticated relay: `het-manager`, message `dez3g8k3a6uij2pqwmib4vjgri`,
+posted **2026-10-21 18:57:21.377 UTC** in `#het-luafirst`, replying to Q-5i
+message `xghikfxgcwzjecwb676sbm47fs`.
+
+P-34 option A is accepted: the game and every gameplay mod share the state
+service, with access to all entities and registered components during allowed
+phases. They may create entities, attach/change/remove components and delete
+entities, including components contributed by other mods. Namespaces govern
+schema definition, not value-write permissions. The UI remains snapshot-only;
+state checks, D-36 failure behavior, executing-instance attribution and native
+resource ownership remain in force.
+
+The manager presented the combat-mod/health and game/weather examples as
+matching the owner's trusted game/mod direction, and explained that mods may
+bypass conventions, make schema-valid changes that break game logic or delete
+entities others need. Neither access model was described as hostile-code
+containment. Exact mutations, phase rules and overlapping-write semantics
+remain separate checkpoints.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -2361,7 +2387,7 @@ or delivery slice is claimed here.
 
 ### P-34. Trusted gameplay instances share state-write authority
 
-**Unapproved; active checkpoint Q-5i.** Recommend A: the game's gameplay root
+**Option A accepted by D-38.** The game's gameplay root
 and every enabled gameplay mod instance receive the same generic state service.
 During phases where state operations are allowed, they may read any entity/
 component, create entities, attach/change/remove any registered component type,
@@ -2418,6 +2444,62 @@ explicitly left value-write permissions open. The host has capability/grant
 mechanisms for native services, but no generic entity/component ACL is claimed
 implemented. This proposal selects the new store's access policy; delivery
 slices remain unset.
+
+### P-35. Write complete component values rather than nested mutation paths
+
+**Unapproved; active checkpoint Q-5j.** Recommend A: attaching a component
+supplies its complete initial value; replacing an existing component supplies
+its complete new value. Lua reads a copied component, edits that local copy
+and submits it explicitly. The engine validates/copies the whole submitted
+value and applies the individual operation atomically to the working state.
+No field-path setters, list splice/append operations or map-entry mutation
+bindings are included in the first store API. Those changes are expressed by
+building and submitting the desired complete component value in Lua.
+
+Replacement is not a merge. Omitted optional fields become absent; required
+fields must still be present, and lists/maps have exactly the submitted
+contents. There is no implicit deep merge, numeric accumulation or combination
+of two authors' intentions. Schema/size/reference checks apply to the entire
+replacement, and rejection fails the tick under D-36. Entity creation/deletion,
+component removal and reads remain separate operations; exact signatures and
+presence/duplicate rules are not selected by this granularity choice.
+
+D-33/D-34 already make accepted writes visible in execution order, including
+the health 9/8 example. A applies that existing rule to the whole component:
+the later complete replacement is the resulting component value. An old copy
+does not carry an implicit version precondition. For example, Lua reads
+`{health = 10, armour = 2}` and yields; another mod writes armour 3. Resuming
+and writing the old copy with health changed to 9 produces
+`{health = 9, armour = 2}`. Both writes can be schema-valid; no automatic
+conflict error restores armour 3. Re-read after suspension and perform the
+read/edit/write sequence without yielding when it must use current values.
+This is an authoring rule, not a lock on the whole tick or a guarantee of
+game-rule correctness. Versions for UI intentions/digests and any explicit
+conditional-write API still need separate scope decisions.
+
+Alternative B includes typed field and container mutation operations from the
+start: set a declared field, update a map entry or edit a list without replacing
+unrelated values. Setting health would preserve armour without resubmitting it.
+Overlapping writes still follow D-34's order; targeted writes do not magically
+detect an outdated computed health value or give an entire hook a transaction.
+B needs exact path validation, optional-record creation rules, list indexing/
+insertion/removal semantics, map edits and budget accounting. It is more
+convenient for large components and frequent small edits but expands the
+binding and validation contract. Choosing B requires that follow-up design.
+
+A is recommended for a small, explicit first API and D-31's bounded copied
+values. Its costs are whole-value copy/validation work and the risk of stale
+copies overwriting unrelated changes. Large inventories may be expensive to
+rewrite; there is no performance claim or implied free copy. Authors can
+choose smaller components where that fits their data. This choice concerns
+Lua-facing operations, not the engine's physical storage layout or a full-world
+copy each tick. There is no automatic diffing of Lua tables.
+
+Evidence: the host supports typed copied records/lists but has no generic
+component mutation interface. D-31 establishes bounded nested values and
+D-33 establishes copied reads and explicit writes. Either option adds store
+bindings; B adds a path/edit language beyond whole-value validation. No
+delivery slices are selected yet.
 
 ## Open questions
 
@@ -2657,12 +2739,17 @@ Exact representation, access permissions and persistence remain separate.
 
 #### Q-5i. Shared gameplay state authority or engine-enforced owner permissions?
 
-The only active checkpoint: P-34 option A (recommended, all trusted gameplay
-instances can modify any registered state through the service) or B (design
-ownership/grants for cross-owner state changes), or an owner-specified revision.
-A includes entity deletion across component authors; schema namespaces do not
-restrict value writes. Native-resource ownership and the UI read-only boundary
-remain unchanged. Schema validity does not prove game-rule correctness.
+Resolved by D-38: all trusted gameplay instances share state authority,
+including entity deletion across component authors. Schema namespaces do not
+restrict value writes; schema validity does not prove game-rule correctness.
+
+#### Q-5j. Whole-component replacement or typed field/container edits?
+
+The only active checkpoint: P-35 option A (recommended, complete component
+values with no implicit merging/version check) or B (also design field/list/map
+mutation operations now), or an owner-specified revision. Both preserve D-34's
+ordered effects. A costs whole-value copying and requires authors to avoid
+writing stale copies over intervening changes.
 
 ### Q-6. Which services and UI behavior does Lua drive in this arc?
 
