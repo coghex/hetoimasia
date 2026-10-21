@@ -1003,6 +1003,30 @@ conditions such as insufficient coins or a full inventory before attempting
 invalid mutations. Exact target validity, permissions, limits and query results
 remain separate contracts; this decision chooses rejection escalation.
 
+### D-37. Entity references may outlive their targets
+
+Owner answer, **2026-10-21 18:45:28 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: non-owning refs (Rec.)
+
+Authenticated relay: `het-manager`, message `eviwsh3iq9kvsaa2qf3gurpbmi`,
+posted **2026-10-21 18:45:28.980 UTC** in `#het-luafirst`, replying to Q-5h
+message `aufvrqzapkcjt4fuqfqsjwkxv6`.
+
+P-33 option A, including its shared identity/read guarantees, is accepted.
+Deleting an entity removes it and its components without clearing references
+elsewhere or cascading to other entities. A quest may retain the deleted NPC's
+reference; Lua checks existence and chooses the game meaning. Such references
+remain valid stored data, but using a deleted entity as a mutation target is
+tick-fatal under D-36. References never silently retarget a different entity,
+are session-scoped, and support ordinary absence checks.
+
+The owner was shown the cost of handling missing targets, and that one mod's
+retained reference cannot itself prevent another mod's deletion. This selects
+reference lifetime, not cross-mod write permission, exact ID representation
+or persistence. No automatic relationship cleanup is introduced.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -2274,7 +2298,7 @@ store policy is claimed implemented. Delivery slices remain unset.
 
 ### P-33. Entity references do not keep their targets alive
 
-**Unapproved; active checkpoint Q-5h.** Recommend A: entity references are
+**Option A accepted by D-37.** Entity references are
 non-owning identities. Deleting an entity removes that entity and its components
 from the working state, but does not delete other entities, clear their fields,
 edit their lists/maps or refuse deletion because they refer to it. Such fields
@@ -2334,6 +2358,66 @@ leaves validity/deletion open. The lua-domains sample has a fixed entity set
 and does not implement generic deletion or relationship tracking. Either
 choice requires new store operations and read validation; no implementation
 or delivery slice is claimed here.
+
+### P-34. Trusted gameplay instances share state-write authority
+
+**Unapproved; active checkpoint Q-5i.** Recommend A: the game's gameplay root
+and every enabled gameplay mod instance receive the same generic state service.
+During phases where state operations are allowed, they may read any entity/
+component, create entities, attach/change/remove any registered component type,
+and delete any entity, regardless of which game/mod declared the type or created
+the entity. Deletion can therefore remove components contributed by other mods.
+This selects authority, not exact operation spelling, mutation granularity or
+the still-open initial-state/shutdown phase rules.
+
+D-32's schema namespace identifies who defines the type and prevents foreign
+registration, duplicate identities and schema replacement. It is not a private
+data namespace or a runtime write lock. For example, a combat mod may update
+the game's health component directly through the state service; the game may
+read or change a weather mod's registered state. No per-entity creator ACL,
+component-owner grant registry or foreign-type permission handshake is added.
+
+The existing boundaries still apply: only gameplay mutates authoritative state;
+presentation gets committed views and sends intentions. Module top level has
+no world access (D-8). Content-only modules act through the calling gameplay
+instance rather than acquiring their own state authority. Values must satisfy
+the frozen schemas, reference/phase rules and limits; rejected writes still
+fail the tick under D-36. Attribute effects/failures to the executing instance,
+not automatically to the component's schema author. Native resources retain
+their own instance ownership and capability rules; shared state authority does
+not grant another instance's texture/window handles or OS functionality.
+
+This makes the runtime-state consequence explicit alongside D-28: authored
+definition/rule/UI extension points remain game-exposed Lua APIs, and content
+paths/modules are not remapped. Runtime component data, however, is directly
+modifiable through the common engine service without an extra game-provided
+setter. The store enforces its data contract, not every game invariant. A
+schema-valid write can still break the game's logic; a mod can bypass the
+game's preferred helper convention or delete something another mod needs.
+Trust, documentation and cooperative game APIs carry that responsibility.
+Shared VM tables already preclude treating this as hostile-code isolation.
+
+Alternative B adds engine-enforced state authority: creation/ownership and
+schema namespaces determine default rights, and explicit grants or mediated
+operations allow cross-owner changes. It can catch accidental edits outside
+a mod's intended scope, but requires a separate design for grant/delegation
+identity, deletion of entities carrying several owners' components, revocation
+and game-extension callback authority. Choosing B would start that design;
+it would not approve an unspecified ACL or claim to contain hostile Lua.
+
+A is recommended for D-2's equally trusted game/mod scripts and the shared
+gameplay VM. It keeps state access a narrow service without building a second
+ownership/permission system around every record. Its cost is broad authority:
+one gameplay mod can alter or delete another's valid state, and validation
+cannot detect all semantic mistakes. D-34 supplies execution order but does
+not resolve authors' competing intentions; exact overlapping-write semantics
+and cooperative extension registration remain separate checkpoints.
+
+Evidence: D-28 reserves state mutation to approved engine services; D-32
+explicitly left value-write permissions open. The host has capability/grant
+mechanisms for native services, but no generic entity/component ACL is claimed
+implemented. This proposal selects the new store's access policy; delivery
+slices remain unset.
 
 ## Open questions
 
@@ -2567,11 +2651,18 @@ rejections are included; exact validation and query APIs follow.
 
 #### Q-5h. May stored entity references outlive their targets?
 
-The only active checkpoint: P-33 option A (recommended, non-owning references
-may remain after deletion; Lua handles missing targets) or B (stored references
-must target live entities and block deletion until cleared), or an owner-
-specified revision. Both preserve identity without silent retargeting, provide
-non-fatal absence checks, and forbid implicit cascading deletion or field edits.
+Resolved by D-37: non-owning references may remain after deletion, with Lua
+handling absence. No silent identity retargeting, automatic clearing or cascade.
+Exact representation, access permissions and persistence remain separate.
+
+#### Q-5i. Shared gameplay state authority or engine-enforced owner permissions?
+
+The only active checkpoint: P-34 option A (recommended, all trusted gameplay
+instances can modify any registered state through the service) or B (design
+ownership/grants for cross-owner state changes), or an owner-specified revision.
+A includes entity deletion across component authors; schema namespaces do not
+restrict value writes. Native-resource ownership and the UI read-only boundary
+remain unchanged. Schema validity does not prove game-rule correctness.
 
 ### Q-6. Which services and UI behavior does Lua drive in this arc?
 
