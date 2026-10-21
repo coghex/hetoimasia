@@ -953,6 +953,33 @@ the game or an earlier dependency need not finish its update before a mod runs.
 Exact input assignment, tick completion and suspension rules remain separate;
 this decision supplies no implicit commit permission at scheduler quiescence.
 
+### D-35. Use explicit checkpoint waits for gameplay spanning ticks
+
+Owner answer, **2026-10-21 18:27:19 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: checkpoint waits (Rec.)
+
+Authenticated relay: `het-manager`, message `k9n9zt25jfvj65iq8yjwxczpd2`,
+posted **2026-10-21 18:27:19.659 UTC** in `#het-luafirst`, replying to Q-5f
+message `ff2nw75z6fk5n2t5d5khtwazew`.
+
+P-31 option A is accepted: future-tick/result waits explicitly finish the
+invocation's contribution to this tick; ordinary cooperative yields do not.
+The engine requires positive completion/no-work evidence for all participants
+and due work, plus failure accounting, before the whole tick can commit.
+Another participant's failure rejects that tick's entire working state.
+Resumption uses the later tick's working state; saved copies can be stale.
+Earlier committed ticks survive later failure. Existing one-active-invocation
+and cadence behavior remains, with no catch-up updates while a hook waits.
+
+The manager used an NPC walking, waiting three ticks and opening a door to
+illustrate a multi-tick routine. The question also included the coin example,
+the pattern of waiting for data before an atomic purchase, and the authoring
+cost of understanding commit boundaries. These are examples, not new APIs or
+game-specific engine behavior. Pause/stop dispositions, exact checkpoint
+spelling and initial-state construction remain open.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -2094,7 +2121,7 @@ No delivery slices have been selected yet.
 
 ### P-31. Cross-tick waits explicitly finish the current tick's contribution
 
-**Unapproved; active checkpoint Q-5f.** Recommend A: a gameplay update/event
+**Option A accepted by D-35.** A gameplay update/event
 may span ticks, but crossing a tick boundary requires an explicit engine
 operation meaning **finish my contribution to this tick and wait**. It may
 wait for a future logical tick or an engine result assigned to a future tick.
@@ -2160,6 +2187,67 @@ for the new store while retaining positive success evidence, whole-tick atomic
 publication and failure accounting. Neither existing sample nor host is claimed
 to implement this new checkpoint protocol. Initial-state construction and
 individual-write rejection remain later checkpoints; slices remain unset.
+
+### P-32. A rejected authoritative mutation fails the gameplay tick
+
+**Unapproved; active checkpoint Q-5g.** Recommend A: an invalid attempt to
+mutate authoritative state during a gameplay tick records a gameplay failure.
+Examples include a wrong component value type, an out-of-range value, exceeding
+a declared/store capacity limit, an invalid mutation target or a disallowed
+state mutation. Exact target/reference validity, write permissions, limits and
+operation semantics still need their own contracts; this selects what happens
+when one of those checks rejects a mutation, not the checks themselves.
+
+Reject the individual operation atomically, without partial application,
+clamping or truncation (D-31). Also mark the tick failed, so none of its earlier
+successful writes can commit. Catching the binding error in Lua, returning
+normally or reaching a D-35 checkpoint cannot clear that recorded failure.
+Stop gameplay under D-19/D-26, retaining its last good committed snapshot for
+a healthy UI. Attribute the error to the game/mod instance and state operation,
+with bounded entity/component/field information where available. This is a
+script/state-contract failure; native engine/cleanup failures retain their
+existing stronger handling and are not converted into recoverable write errors.
+
+For example, in a single tick a purchase removes a coin, then adding the item
+exceeds a state limit. A rejects the tick, so neither the coin subtraction nor
+the item addition is published. It also stops gameplay: it does not roll back
+and retry the purchase or silently keep playing. A failure in a later tick
+still cannot undo a purchase committed earlier (D-35).
+
+Ordinary game-rule outcomes, such as insufficient coins or a full authored
+inventory, should be handled by Lua before attempting invalid state mutations.
+They are not automatically engine failures merely because the game declines
+an action. Queries and their missing-value/error results need a separate API
+contract. A grants no implicit per-hook rollback, recoverable try-write variant,
+preflight reservation, multi-operation subtransaction or automatic compensation.
+Schema-registration failures remain D-32's boot failures; whether/how state
+values are created during init remains the initial-state checkpoint.
+
+Alternative B returns a structured refusal for an invalid mutation and permits
+gameplay to continue. The refused operation changes nothing, but earlier
+successful writes remain staged and can commit. Thus removing a coin and then
+getting an item-add refusal may publish the coin removal unless Lua explicitly
+handles it; a caught/ignored refusal alone does not reject the tick. B supports
+expected stale targets and capacity failures without ending gameplay, but puts
+recovery and consistency between separate writes on game/mod authors. It is
+not an automatic rollback of the hook's earlier work, which other hooks may
+already have observed under D-33/D-34.
+
+A is recommended for the first generic-store contract: a violated mutation
+contract cannot leave a tick looking successful merely because the Lua caller
+ignored the error. Its cost is deliberately strict: even a stale-target or
+capacity rejection ends gameplay, so authors must validate expected game
+conditions and re-read state after suspension instead of using failed writes
+as normal branching. Handling these refusals without ending gameplay would
+require a later explicit API/atomicity design, not a silent exception to A.
+
+Evidence: D-31 already requires atomic rejection but leaves escalation open;
+D-33/D-35 define shared staged writes and tick commits. The lua-domains sample
+returns recoverable `false` for its narrow staged-move refusal and leaves the
+rest of its batch intact. A deliberately chooses a stricter policy for the new
+generic launcher/store, requiring failure recording on rejected mutation paths
+and commit/accounting checks even when Lua catches the error. No such generic
+store policy is claimed implemented. Delivery slices remain unset.
 
 ## Open questions
 
@@ -2380,12 +2468,19 @@ order. Input assignment and transaction completion follow separately.
 
 #### Q-5f. Explicit cross-tick checkpoints or hooks completed within one tick?
 
-The only active checkpoint: P-31 option A (recommended, explicit successful
-contribution checkpoint before a future-tick wait) or B (refuse cross-tick waits
-in gameplay hooks; return and continue via later invocations), or an owner-
-specified revision. A permits earlier writes to commit while the hook remains
-suspended; a later failure cannot undo earlier committed ticks. Both retain
-whole-tick publication and positive completion/failure accounting.
+Resolved by D-35: explicit successful contribution checkpoints before future-
+tick waits. Earlier writes may commit while the hook remains suspended; a later
+failure cannot undo earlier committed ticks. Whole-tick publication and positive
+completion/failure accounting remain required.
+
+#### Q-5g. Does a rejected state mutation fail the tick or permit recovery?
+
+The only active checkpoint: P-32 option A (recommended, record a gameplay
+failure and discard the tick even if Lua catches the error) or B (structured
+refusal; earlier writes may still commit), or an owner-specified revision.
+Both reject the individual operation without partial mutation. A is strict
+even for invalid/stale targets and capacity limits; B requires author-managed
+consistency across separate writes. Exact validation and query APIs follow.
 
 ### Q-6. Which services and UI behavior does Lua drive in this arc?
 
