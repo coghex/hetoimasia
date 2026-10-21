@@ -18,7 +18,9 @@
 -- * 'Full' when the queue's bound or the tick's places are all taken, saying which;
 -- * 'Closed' when no tick that has not started is left to take it: the finite session's last tick
 --   has begun, or the session has failed, is stopping or has stopped;
--- * 'Refused' for a value outside the application's bounds, naming which.
+-- * 'Refused' for a value outside the application's bounds, naming which;
+-- * 'Declined' when the session takes its intentions from an input log alone (a replay, or a fixed-log qualification
+--   run): the offer is refused before it is accepted, takes no place and gets no disposition (#500 requirement 4).
 --
 -- The reasons a script sees are the fixed words of 'answerReason', never text the script wrote.
 module Hetoimasia.Sample.LuaDomains.Intention
@@ -35,6 +37,7 @@ module Hetoimasia.Sample.LuaDomains.Intention
   , malformedReason
   , fullReason
   , closedReason
+  , declinedReason
     -- * Places and dispositions
   , Placement (..)
   , StaleReason (..)
@@ -128,6 +131,8 @@ data Answer
   | Full !FullCause
   | Closed
   | Refused !Refusal
+  | -- | The log is the only source of the session's intentions, so this offer is not accepted: it takes no place.
+    Declined
   deriving (Eq, Show)
 
 -- | Why an intention was answered full.
@@ -146,6 +151,7 @@ answerReason = \case
   Full _ → Just fullReason
   Closed → Just closedReason
   Refused refusal → Just (refusalReason refusal)
+  Declined → Just declinedReason
 
 -- | What the facade answers for a call whose arity or types are wrong.
 malformedReason ∷ Text
@@ -156,6 +162,10 @@ fullReason = "full"
 
 closedReason ∷ Text
 closedReason = "closed"
+
+-- | What a script is told for an offer a log-only session declined.
+declinedReason ∷ Text
+declinedReason = "replay"
 
 -- | Why an accepted intention was rejected at its tick.
 data StaleReason

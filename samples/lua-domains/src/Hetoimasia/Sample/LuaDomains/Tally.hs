@@ -46,6 +46,9 @@ data Counts = Counts
     -- ^ Over a bound of the application, which the binding answered.
   , countMalformed ∷ !Int
     -- ^ A wrong arity or type, which the facade answered before the binding was reached.
+  , countDeclined ∷ !Int
+    -- ^ Offered to a session that takes its intentions from an input log alone, and declined: never accepted, and so
+    -- given no place and no disposition.
   , countApplied ∷ !Int
   , countStale ∷ !Int
     -- ^ Rejected at their tick, listed or not.
@@ -57,7 +60,7 @@ data Counts = Counts
   deriving (Eq, Show)
 
 noCounts ∷ Counts
-noCounts = Counts 0 0 0 0 0 0 0 0 0 0
+noCounts = Counts 0 0 0 0 0 0 0 0 0 0 0
 
 -- | Every full answer, whatever its cause.
 countFull ∷ Counts → Int
@@ -72,6 +75,7 @@ countAnswer answer counts = case answer of
   Just (Full FullPlaces) → counts {countFullPlaces = countFullPlaces counts + 1}
   Just Closed → counts {countClosed = countClosed counts + 1}
   Just (Refused _) → counts {countRefused = countRefused counts + 1}
+  Just Declined → counts {countDeclined = countDeclined counts + 1}
 
 -- | Count the dispositions of one committed tick.
 countSettled ∷ Int → Int → Counts → Counts

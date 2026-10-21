@@ -18,7 +18,7 @@ run arguments = do
   executable ← findExecutable "hetoimasia-lua-domains" >>= maybe (fail "the executable is not on this test's search path") pure
   generous (readCreateProcessWithExitCode (proc executable arguments) "")
 
--- | The report of a scenario: its lines, which the report keeps to ten.
+-- | The report of a scenario: its lines, which the report keeps to eleven.
 reportOf ∷ [String] → IO (ExitCode, [String])
 reportOf arguments = do
   (status, out, err) ← run arguments
@@ -31,13 +31,13 @@ numberAfter marker line =
   let rest = snd (Text.breakOn (Text.pack marker) (Text.pack line))
    in read (Text.unpack (Text.takeWhile (`elem` ['0' .. '9']) (Text.drop (length marker) rest)))
 
--- | What every scenario's report has in common: ten lines in a fixed order, and a ledger that balances.
+-- | What every scenario's report has in common: eleven lines in a fixed order, and a ledger that balances.
 structure ∷ String → [String] → Expectation
 structure scenario reported = do
-  length reported `shouldBe` 10
+  length reported `shouldBe` 11
   take 1 reported `shouldBe` ["hetoimasia-lua-domains: session 1, seed 1, scenario " <> scenario]
   map (takeWhile (/= ':')) (drop 1 reported)
-    `shouldBe` ["ticks committed", "status", "intentions answered", "intentions settled", "controls", "ui", "cleanup", "cleanup", "cleanup"]
+    `shouldBe` ["ticks committed", "status", "intentions answered", "intentions settled", "controls", "ui", "cleanup", "cleanup", "cleanup", "final digest"]
   let accepted = numberAfter "accepted " (reported !! 3)
       settled = sum [numberAfter label (reported !! 4) | label ← ["applied ", "stale ", "invalidated ", "discarded "]]
   -- Every accepted intention is exactly one of applied, stale, invalidated or discarded, and none is left.
@@ -100,7 +100,7 @@ spec = describe "the executable" $ do
     (status, out, err) ← run ["--help"]
     status `shouldBe` ExitSuccess
     err `shouldBe` ""
-    take 1 (lines out) `shouldBe` ["usage: hetoimasia-lua-domains [--ticks N] [--seed N] [--scenario NAME] | --help"]
+    take 1 (lines out) `shouldBe` ["usage: hetoimasia-lua-domains [--ticks N] [--seed N] [--scenario NAME] [--record FILE] [--replay FILE] [--digests] [--expect-digest HEX] | --help"]
 
   mapM_
     usageError

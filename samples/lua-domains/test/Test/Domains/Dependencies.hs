@@ -93,7 +93,10 @@ spec = describe "the package and import boundary" $ do
         [ "base"
         , "bytestring"
         , "containers"
+        , "cryptohash-sha256"
         , "deepseq"
+        , "directory"
+        , "filepath"
         , "hetoimasia-foundation"
         , "hetoimasia-runtime"
         , "hetoimasia-scripting-lua"
@@ -101,6 +104,7 @@ spec = describe "the package and import boundary" $ do
         , "stm"
         , "template-haskell"
         , "text"
+        , "unix"
         ]
 
   it "has an executable that depends on the sample, the runtime's lifecycle and the foundation, and no GLFW, Vulkan or console package" $
@@ -142,6 +146,7 @@ spec = describe "the package and import boundary" $ do
       any
         (`isPrefixOf` name)
         [ "Control."
+        , "Crypto.Hash."
         , "Data."
         , "GHC."
         , "Language.Haskell.TH"

@@ -5,6 +5,7 @@ module Test.Domains.Spec (spec) where
 import qualified Test.Domains.Accounting
 import qualified Test.Domains.Admission
 import qualified Test.Domains.Barrier
+import qualified Test.Domains.Canonical
 import qualified Test.Domains.Command
 import qualified Test.Domains.Conservation
 import qualified Test.Domains.Dependencies
@@ -12,14 +13,19 @@ import qualified Test.Domains.Controls
 import qualified Test.Domains.Delivery
 import qualified Test.Domains.Exposure
 import qualified Test.Domains.Failure
+import qualified Test.Domains.Files
+import qualified Test.Domains.InputLog
 import qualified Test.Domains.Intentions
 import qualified Test.Domains.Ledger
 import qualified Test.Domains.Leases
 import qualified Test.Domains.Lifetime
+import qualified Test.Domains.Options
 import qualified Test.Domains.Process
 import qualified Test.Domains.Progress
+import qualified Test.Domains.Qualify
 import qualified Test.Domains.Queue
 import qualified Test.Domains.Random
+import qualified Test.Domains.Replay
 import qualified Test.Domains.Staging
 import qualified Test.Domains.Stop
 import qualified Test.Domains.UiFailure
@@ -51,5 +57,11 @@ spec = after_ reapForked . describe "the two-domain Lua sample" $ do
   Test.Domains.Admission.spec
   Test.Domains.Conservation.spec
   Test.Domains.Random.spec
+  Test.Domains.Canonical.spec
+  Test.Domains.InputLog.spec
+  Test.Domains.Files.spec
+  Test.Domains.Replay.spec
+  Test.Domains.Qualify.spec
   Test.Domains.Command.spec
   Test.Domains.Process.spec
+  Test.Domains.Options.spec

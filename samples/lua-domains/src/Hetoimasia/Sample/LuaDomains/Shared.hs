@@ -33,6 +33,13 @@
 --   and whoever asks for the stop; asking is claimed and recorded without waiting.
 -- * 'sharedWaitDepth', 'sharedWaitThreads': the application thread, which makes the supervised waits the sample
 --   makes, one at a time.
+-- * 'sharedRecorder': every admission of an intention, in the transaction that admits it ('submit' for the UI's path,
+--   'admitLogged' for a replay's), and the control bookkeeping the UI's facade and the assignment callback run, on the UI
+--   owner's callback thread. It is read once, after the session has ended, to read the log out. Its lifetime is the
+--   session; it is bounded by the log's own bound and never silently truncates (see "Hetoimasia.Sample.LuaDomains.InputLog").
+-- * 'sharedTrace': the driver, in the transaction that commits a tick (and the initial digest, at creation); read by the
+--   report and the examples. It is bounded by the session bound and never drops an entry.
+-- * 'sharedLogOnly', 'sharedSessionId': immutable, set at creation.
 --
 -- The UI never reads 'sharedCommitted' or 'sharedTick'; gameplay never reads 'sharedView' or the
 -- snapshot. Each owner's namespaces are the only way its VM reaches any of this
@@ -49,6 +56,10 @@ module Hetoimasia.Sample.LuaDomains.Shared
   , captureView
   , currentView
   , submit
+  , admitLogged
+  , instanceTriple
+  , appendTrace
+  , traceBound
   , noteMalformed
   , ScriptedInput (..)
   , pollInput
@@ -107,6 +118,8 @@ import Control.Monad (when)
 import Data.Int (Int64)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
+import Data.Sequence (Seq, (|>))
+import qualified Data.Sequence as Seq
 import qualified Data.Set as Set
 import Data.Set (Set)
 import Data.Text (Text)
@@ -121,12 +134,26 @@ import Hetoimasia.Foundation.Messaging.Snapshot
   , snapshotReader
   )
 import Hetoimasia.Foundation.Resource (acquirePart, releaseRank)
-import Hetoimasia.Sample.LuaDomains.Bounds (Bounds (boundPendingControls, boundSessionTasks))
+import Hetoimasia.Sample.LuaDomains.Bounds (Bounds (boundPendingControls, boundSessionTasks), maxSessionTicks)
+import Hetoimasia.Sample.LuaDomains.Canonical (Digest, digestSnapshot)
+import Hetoimasia.Sample.LuaDomains.InputLog
+  ( ControlOp (..)
+  , ControlTarget (..)
+  , Recorder
+  , Record (..)
+  , acceptControl
+  , appendRecord
+  , assignControlRecord
+  , intentionRecord
+  , newRecorder
+  , noteUnrepresentableControl
+  , refuseControl
+  )
 import Hetoimasia.Sample.LuaDomains.Candidate (Candidate (..), Move, StagingRefusal, begin, draw, finish, stage)
-import Hetoimasia.Sample.LuaDomains.Intention (Answer (..), FullCause (..), Submitted, validate)
-import Hetoimasia.Sample.LuaDomains.Queue (AdmitAt (..), Queue, admitNext, closeQueue, hasTickLeft, isClosed, newQueue, nextUnstarted)
+import Hetoimasia.Sample.LuaDomains.Intention (Answer (..), FullCause (..), Intention, Placement, Submitted, validate)
+import Hetoimasia.Sample.LuaDomains.Queue (AdmitAt (..), Queue, admitAt, admitNext, closeQueue, hasTickLeft, isClosed, newQueue, nextUnstarted)
 import Hetoimasia.Sample.LuaDomains.Session (SessionState, failedNow, newSessionState, recordFailure, stopRequestedNow)
-import Hetoimasia.Sample.LuaDomains.Snapshot (GameSnapshot, SessionFailure, initialSnapshot)
+import Hetoimasia.Sample.LuaDomains.Snapshot (GameSnapshot (snapGameplay), SessionFailure, initialSnapshot)
 import Hetoimasia.Sample.LuaDomains.Tally
   ( ControlCounts (..)
   , Counts
@@ -140,10 +167,11 @@ import Hetoimasia.Sample.LuaDomains.Tally
   , noWorkspaces
   )
 import Hetoimasia.Sample.LuaDomains.World (World, initialWorld)
-import Hetoimasia.Scripting.Lua.Instance (ControlSlot (..))
+import Hetoimasia.Scripting.Lua.Instance (ControlSlot (..), InstanceControl (..), InstanceId)
 import Hetoimasia.Scripting.Lua.Lease (Leases, Lease, acquireOwned)
 import Hetoimasia.Scripting.Lua.Lending (Lending)
-import Hetoimasia.Scripting.Lua.Lifecycle (ControlRequestInfo)
+import Hetoimasia.Scripting.Lua.Lifecycle (ControlRequestInfo (..), instanceIdValue)
+import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VRecord))
 import Hetoimasia.Scripting.Lua.Scheduled (ScheduledTicket)
 
 -- | What a session's shared state is made from.
@@ -160,6 +188,9 @@ data SharedSetup = SharedSetup
     -- interval before the engine admits the request: the window a test holds to show what the driver
     -- does in it. Nothing in production.
   , setupScenario ∷ !Text
+  , setupLogOnly ∷ !Bool
+    -- ^ Whether the session's intentions and controls come from an input log alone: the UI's offers are then declined and
+    -- its control requests refused, before either takes a place.
   }
 
 -- | The sample's shared state, owned as the module header says.
@@ -209,6 +240,13 @@ data Shared = Shared
   , sharedScenario ∷ !Text
   , sharedClosed ∷ !(TVar Bool)
     -- ^ Whether the snapshot's publication has ended, which retirement does last.
+  , sharedSessionId ∷ !Word64
+    -- ^ The session's identity, which an input log never names: a record says only whether an intention acted in it.
+  , sharedLogOnly ∷ !Bool
+  , sharedRecorder ∷ !(TVar Recorder)
+    -- ^ What the session has accepted, for the input log.
+  , sharedTrace ∷ !(TVar (Seq Digest))
+    -- ^ The digest of the initial state and then of each committed tick, in tick order: never more than 'traceBound'.
   }
 
 -- | A session's state: the world at its seed, an empty queue (of a finite session's ticks, if it is
@@ -249,6 +287,10 @@ newShared setup = do
     <*> pure (setupAssignHook setup)
     <*> pure (setupScenario setup)
     <*> newTVarIO False
+    <*> pure (setupSession setup)
+    <*> pure (setupLogOnly setup)
+    <*> newTVarIO newRecorder
+    <*> newTVarIO (Seq.singleton (digestSnapshot first))
 
 -- | The sample's own defect, raised as a failure of the host and never counted away: the admission seam
 -- answered the UI's path something it cannot, or a publication was asked for before there was one.
@@ -299,20 +341,62 @@ currentView shared = atomically (readTVar (sharedView shared))
 -- | Submit an intention, as the UI's binding does: apply the application's bounds, then ask the
 -- queue for the next tick that has not started, and count the answer, all in one transaction. It
 -- never waits, and the answer is the one the script is told.
+--
+-- A session that takes its intentions from an input log alone ('sharedLogOnly') declines every offer that is within the
+-- bounds: it is answered 'Declined' and counted, and the queue is not touched, so the offer takes no place, displaces
+-- no logged record and gets no disposition. An accepted offer is recorded, in the transaction that accepts it.
 submit ∷ Shared → Submitted → IO Answer
 submit shared submitted = atomically $ do
   answer ← case validate (sharedBounds shared) submitted of
     Left refusal → pure (Refused refusal)
-    Right intention →
-      admitNext (sharedQueue shared) intention >>= \case
-        AdmittedAt place → pure (Accepted place)
-        AtFullQueue → pure (Full FullQueue)
-        AtFullPlaces → pure (Full FullPlaces)
-        AtClosed → pure Closed
-        AtLate → throwSTM (AdmissionDefect "the UI's path was answered late")
-        AtDuplicate → throwSTM (AdmissionDefect "the UI's path was answered a duplicate place")
+    Right intention
+      | sharedLogOnly shared → pure Declined
+      | otherwise →
+          admitNext (sharedQueue shared) intention >>= \case
+            AdmittedAt place → Accepted place <$ recordIntention shared place intention
+            AtFullQueue → pure (Full FullQueue)
+            AtFullPlaces → pure (Full FullPlaces)
+            AtClosed → pure Closed
+            AtLate → throwSTM (AdmissionDefect "the UI's path was answered late")
+            AtDuplicate → throwSTM (AdmissionDefect "the UI's path was answered a duplicate place")
   modifyTVar' (sharedCounts shared) (countAnswer (Just answer))
   pure answer
+
+-- | Record an accepted intention for the input log, in the transaction that accepted it.
+recordIntention ∷ Shared → Placement → Intention → STM ()
+recordIntention shared place intention =
+  modifyTVar' (sharedRecorder shared) (appendRecord (intentionRecord (sharedSessionId shared) place intention))
+
+-- | The replay's path: admit an intention at the tick and place a log recorded, through the same seam the UI's path
+-- uses ('admitAt'), applying the sample's rules unchanged. What it accepts is counted as accepted and recorded, in the one
+-- transaction; anything else changes nothing and is the caller's to name.
+admitLogged ∷ Shared → Placement → Intention → STM AdmitAt
+admitLogged shared place intention = do
+  answer ← admitAt (sharedQueue shared) place intention
+  case answer of
+    AdmittedAt _ → do
+      modifyTVar' (sharedCounts shared) (countAnswer (Just (Accepted place)))
+      recordIntention shared place intention
+    _ → pure ()
+  pure answer
+
+-- | An instance's identity as a script holds it: the runtime, the owner and the number.
+instanceTriple ∷ InstanceId → (Int64, Int64, Int64)
+instanceTriple identity = case instanceIdValue identity of
+  VRecord [("runtime", VInteger runtime), ("owner", VInteger owner), ("id", VInteger number)] → (runtime, owner, number)
+  _ → (0, 0, 0)
+
+-- | The most digests the trace holds: the initial state's and one for each of the most ticks a session may have.
+traceBound ∷ Int
+traceBound = fromIntegral maxSessionTicks + 1
+
+-- | Append the digest of a committed tick. Called in the transaction that commits the tick; a trace that is full is a
+-- defect of the session (it would have to drop an entry) and raises rather than losing one.
+appendTrace ∷ Shared → Digest → STM ()
+appendTrace shared digest = do
+  held ← readTVar (sharedTrace shared)
+  when (Seq.length held >= traceBound) (throwSTM (AdmissionDefect "the digest trace is full"))
+  writeTVar (sharedTrace shared) (held |> digest)
 
 -- | Count a call the facade refused for its arity or types, which never reached 'submit'.
 noteMalformed ∷ Shared → IO ()
@@ -376,6 +460,8 @@ controlFinish shared = atomically (modifyTVar' (sharedControlsInFlight shared) (
 controlNote ∷ Shared → Maybe Text → IO ()
 controlNote shared reason = atomically $ do
   modifyTVar' (sharedControls shared) (bumpAnswer reason)
+  -- The engine's answer decides what the log holds: an accepted control is recorded, a refused one is not.
+  modifyTVar' (sharedRecorder shared) (if reason == Nothing then acceptControl else refuseControl)
   when (reason == Nothing) (modifyTVar' (sharedReceipts shared) (+ 1))
 
 -- | The UI read an accepted request's settlement, by the engine's word for it, and gave the receipt up.
@@ -399,7 +485,7 @@ abandonReceipts shared = atomically $ do
 -- request is between this and the engine's admission (the UI's bracket), so the engine never finds the tick
 -- begun.
 assignControl ∷ Shared → ControlRequestInfo → IO (Maybe ControlSlot)
-assignControl shared _ = do
+assignControl shared info = do
   slot ← atomically $ do
     closed ← isClosed (sharedQueue shared)
     failed ← failedNow (sharedSession shared)
@@ -408,7 +494,9 @@ assignControl shared _ = do
     left ← hasTickLeft (sharedQueue shared)
     -- The engine holds a reservation for each accepted control until its receipt is read; the owner has as many
     -- as the pending bound and one more for each instance the stop must reach, so the stop is always admitted.
-    if closed || failed || stopping || not left || held >= boundPendingControls (sharedBounds shared)
+    -- A session that takes its controls from an input log alone assigns the UI's none: the request is refused as
+    -- unassigned, before it takes a place.
+    if sharedLogOnly shared || closed || failed || stopping || not left || held >= boundPendingControls (sharedBounds shared)
       then pure Nothing
       else do
         tick ← nextUnstarted (sharedQueue shared)
@@ -416,9 +504,18 @@ assignControl shared _ = do
         let order = Map.findWithDefault 0 tick sequences
         writeTVar (sharedControlSeq shared) (Map.insert tick (order + 1) sequences)
         modifyTVar' (sharedControlTicks shared) (Set.insert tick)
+        view ← readTVar (sharedView shared)
+        -- The place is assigned; whether the engine accepts the request is told by 'controlNote', which records it.
+        modifyTVar' (sharedRecorder shared) (awaiting (snapGameplay view == Just (instanceTriple (requestTarget info))) tick order)
         pure (Just (ControlSlot tick order))
   sharedAssignHook shared
   pure slot
+  where
+    -- The record a request would leave: the sample's one target, by its role, and the two operations the UI is given.
+    awaiting isGameplay tick order recorder = case (isGameplay, requestOperation info) of
+      (True, InstancePause) → assignControlRecord (RecordControl tick order TargetGameplay OpPause) recorder
+      (True, InstanceResume) → assignControlRecord (RecordControl tick order TargetGameplay OpResume) recorder
+      _ → noteUnrepresentableControl recorder
 
 -- | Tell the session of a failure: it is recorded, and admission to the queue closes in the same transaction, so no
 -- intention is accepted for a tick after the failure that will never run it, whenever the driver gets to publish.

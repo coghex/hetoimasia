@@ -51,9 +51,12 @@ library
         Hetoimasia.Sample.LuaDomains
         Hetoimasia.Sample.LuaDomains.Bounds
         Hetoimasia.Sample.LuaDomains.Candidate
+        Hetoimasia.Sample.LuaDomains.Canonical
         Hetoimasia.Sample.LuaDomains.Command
         Hetoimasia.Sample.LuaDomains.Domains
         Hetoimasia.Sample.LuaDomains.Embed
+        Hetoimasia.Sample.LuaDomains.Files
+        Hetoimasia.Sample.LuaDomains.InputLog
         Hetoimasia.Sample.LuaDomains.Intention
         Hetoimasia.Sample.LuaDomains.Queue
         Hetoimasia.Sample.LuaDomains.Registration
@@ -69,10 +72,14 @@ library
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
         containers >=0.8 && <0.9,
+        cryptohash-sha256 >=0.11.102 && <0.12,
         deepseq >=1.5.1 && <1.6,
+        directory >=1.3 && <1.4,
+        filepath >=1.5 && <1.6,
         stm >=2.5.3 && <2.6,
         template-haskell >=2.24 && <2.25,
         text >=2.1 && <2.2,
+        unix >=2.8 && <2.9,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-scripting-lua ==0.1.0.0,
@@ -93,6 +100,35 @@ executable hetoimasia-lua-domains
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-sample-lua-domains
 
+-- What the suite and the profiling probe share, so that neither imports a helper from the other's sources: a real
+-- supervision boundary with the UI owner's injected clock and fake timer, the test-only namespace and the coordination the
+-- examples use in place of sleeping (`Test.Domains.Support`), and a deterministic input log with the runs over it and the
+-- disturbances that vary their execution (`Test.Domains.FixedLog`). It is private to this package and only the suite and the
+-- probe depend on it; the sample's own library does not.
+library lua-domains-fixtures
+    import: language
+    visibility: private
+    hs-source-dirs: fixtures
+    exposed-modules:
+        Test.Domains.FixedLog
+        Test.Domains.Support
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        directory >=1.3 && <1.4,
+        filepath >=1.5 && <1.6,
+        hspec >=2.11 && <3,
+        process >=1.6 && <1.7,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-scripting-lua ==0.1.0.0,
+        hetoimasia-scripting-lua:runtime-lua ==0.1.0.0,
+        hetoimasia-test-support ==0.1.0.0,
+        hetoimasia-sample-lua-domains
+
 -- The sample's examples: real interpreters under real supervision, the UI owner's
 -- clock and timer injected where an example moves them by hand, and explicit
 -- gates and bounded waits everywhere else. The executable is run as a child
@@ -107,6 +143,7 @@ test-suite lua-domains-tests
         Test.Domains.Accounting
         Test.Domains.Admission
         Test.Domains.Barrier
+        Test.Domains.Canonical
         Test.Domains.Command
         Test.Domains.Conservation
         Test.Domains.Dependencies
@@ -114,20 +151,24 @@ test-suite lua-domains-tests
         Test.Domains.Delivery
         Test.Domains.Exposure
         Test.Domains.Failure
+        Test.Domains.Files
+        Test.Domains.InputLog
         Test.Domains.Intentions
         Test.Domains.Ledger
         Test.Domains.Leases
         Test.Domains.Lifetime
+        Test.Domains.Options
         Test.Domains.Process
         Test.Domains.Progress
+        Test.Domains.Qualify
         Test.Domains.Queue
         Test.Domains.Random
+        Test.Domains.Replay
         Test.Domains.Spec
         Test.Domains.Staging
         Test.Domains.Stop
         Test.Domains.UiFailure
         Test.Domains.View
-        Test.Domains.Support
         Test.Domains.World
     -- The threaded runtime with two capabilities: the CPU-bound progress check
     -- needs Haskell to run while a capability is inside a long Lua computation.
@@ -148,4 +189,31 @@ test-suite lua-domains-tests
         hetoimasia-scripting-lua ==0.1.0.0,
         hetoimasia-scripting-lua:runtime-lua ==0.1.0.0,
         hetoimasia-test-support ==0.1.0.0,
-        hetoimasia-sample-lua-domains
+        hetoimasia-sample-lua-domains,
+        hetoimasia-sample-lua-domains:lua-domains-fixtures
+
+-- The optional profiling probe (#500 requirement 8; D-45, P-11): bounded workloads that print one record each and assert no
+-- number. It measures the UI's update cadence while gameplay is idle, held and CPU-bound, gameplay's throughput with and
+-- without UI activity, the scheduler's counters and the RTS statistics, and repeats requirement 5's runs many more times than
+-- the routine suite does. It is the catalog's optional group `test.lua-domains-profile`, never selected by affected inputs. It
+-- runs under the same options as the executable and the suite with `-T`, which makes the RTS statistics readable.
+test-suite lua-domains-profile
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: profile
+    other-modules:
+        Profile.Workloads
+    ghc-options: -threaded -rtsopts "-with-rtsopts=-N2 -T"
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        hspec >=2.11 && <3,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-scripting-lua ==0.1.0.0,
+        hetoimasia-scripting-lua:runtime-lua ==0.1.0.0,
+        hetoimasia-sample-lua-domains,
+        hetoimasia-sample-lua-domains:lua-domains-fixtures
