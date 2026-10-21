@@ -9,7 +9,7 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current pass records direction and the manifest-domain revision checkpoint; it is
+The current pass records direction and the entry-lifecycle checkpoint; it is
 not an approved specification or authority to implement or file issues.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
@@ -429,6 +429,34 @@ command line with no manifest. A self-describing folder keeps entry knowledge
 with the content and gives game/mod roots explicit identities. Boot, root
 registration and mod metadata are affected; slices remain undefined.
 
+### D-14. Configure supported VM roles in the manifest, with both as the default
+
+Owner answer, **2026-10-21 15:31:39 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> Approve as proposed
+
+Authenticated relay: `het-manager`, message `cb344sy9r3dg5xk9rvjmiek24n`,
+posted **2026-10-21 15:31:39.888 UTC** in `#het-luafirst`, replying to Q-7a
+revision 2 message `w594czmy428p67k9z3rrew9dhs`.
+
+The owner approves all four parts of P-10 revision 2, retained below as the
+accepted contract: an optional manifest VM set; validated role/clock pairs;
+the default pair independently loading the common entry and selecting their
+role exports, with optional separate entry paths and no bootstrap VM; and
+gameplay-only/presentation-only variants with absent-domain calls refused.
+There is at most one gameplay and one presentation VM, at least one overall.
+Gameplay uses logical time; presentation uses elapsed time. Custom/additional
+or dynamically created VMs remain a later design, without restricting the
+general VM-owner library.
+
+The owner was shown the validation, entry-routing and three-arrangement test
+cost, and chose this over "Approve, both VMs only". The one-role variants are
+therefore included, not merely examples. A gameplay-only session has no
+presentation owner to keep a UI responsive; presentation-only has no
+authoritative gameplay. Hook schema, tick settings, startup order and mod
+mapping remain open. No delivery readiness is implied.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -492,12 +520,11 @@ boot contract. Its compatibility remains a separate choice.
 
 ### P-10. Declare the VM arrangement in the manifest, defaulting to the pair
 
-**Revised proposal; not approved. Active checkpoint Q-7a revision 2.** The
-owner accepted the two-VM default in principle and asked whether it could be
-declared in the manifest; the exact answer and relay are preserved under Q-7a.
-Do not turn that question into approval of the new configuration contract.
+**Revision 2 accepted by D-14.** Retain this P-ID and the exact four-part
+contract as design history. The initial request to put the default in the
+manifest is preserved under Q-7a; D-14 records the subsequent explicit signoff.
 
-Recommended revision:
+Accepted contract:
 
 1. An optional declarative `vms` section lists the supported roles to create:
    `gameplay`, `presentation`, or both. Each declaration names its role,
@@ -555,6 +582,47 @@ historical alternatives, not owner-rejected requirements. The revised contract
 affects boot/manifest validation, entry hooks, domain services, state publication
 and verification. Startup order, mod mapping and failure escalation remain
 open; no delivery slices are approved.
+
+### P-11. Use the existing finite init, paced update and finite shutdown hooks
+
+**Unapproved; active checkpoint Q-3b.** Recommend option A: each selected
+`gameplay` or `presentation` export is a behavior table with optional
+`init(self, api)`, `update(self, dt)` and `shutdown(self, reason)` functions.
+An absent selected behavior table, or a present hook that is not a function,
+is a startup error. A missing optional hook is a no-op. The root behavior is
+an engine-owned instance with its own `self`, connections and leases.
+
+`init` runs once and cannot yield or wait. It may initiate engine-owned loads
+and connect callbacks, then return. Loading work and its interest stay owned
+by the instance after `init` returns. `update` and event callbacks may suspend
+through the existing task/request machinery. Gameplay updates use logical
+time; presentation updates use elapsed time. Their cadence defaults and
+startup ordering remain separate decisions. `shutdown` is optional, finite
+and non-suspending; cleanup still occurs if it is absent or fails (D-27).
+
+For example, `init` requests the player's texture and returns with its pending
+request recorded in `self`. An update or callback uses the texture once ready.
+The author does not write a blocking texture wait inside `init`. Required
+gameplay results retain D-9's tick-assigned delivery; returning from `init`
+does not bypass that boundary or establish that all content is already ready.
+An update-free behavior may work through connected events; the exact event
+and readiness APIs remain part of the service/boot contract.
+
+Alternative B adds a new yielding startup hook between finite `init` and normal
+updates. Authors could await startup content sequentially there before entering
+the regular update lifecycle. It offers more linear startup scripts, but needs
+a new startup phase, completion/readiness semantics, logical-result delivery
+during that phase and partial-start cancellation/cleanup rules. It would not
+make the existing `init` yielding.
+
+A is recommended because it reuses the delivered instance lifecycle and
+request ownership, at the cost of expressing asynchronous setup through pending
+requests and later updates/callbacks. Root behaviors do not also select a
+one-shot `run` mode in this proposal; the existing general one-shot instance
+primitive remains available for a separately designed Lua instance API.
+This affects the entry adapter, boot readiness and content-binding examples.
+State initialization/commit, failure escalation and the exact async Lua API
+remain open; no new lifecycle behavior is approved yet.
 
 ## Open questions
 
@@ -629,7 +697,15 @@ Keep D-27 cleanup independent of successful Lua shutdown.
 Resolved by D-13: content folder plus a non-executable identity/entry manifest,
 with corresponding mod manifests later. Format and command spelling remain
 open, as do launcher compatibility and lifecycle. Q-7a is asked next because
-default domain composition affects entry/lifecycle design.
+default domain composition affects entry/lifecycle design; D-14 now settles it.
+
+#### Q-3b. Reuse existing hooks or add a yielding startup phase?
+
+The only active checkpoint: P-11 option A (recommended, optional finite init,
+paced update and finite shutdown, with pending loads handled by updates/events)
+or B (add a yielding startup hook), or an owner-specified revision. State
+initialization, readiness, startup order and failure escalation still need
+their own contracts.
 
 ### Q-4. How are mods discovered, ordered and combined?
 
@@ -669,14 +745,12 @@ manager's pane, verbatim:
 Verified relay `gbyui2gk6dj4693izanm543f3s` from `het-manager`, posted
 **2026-10-21 15:27:07.008 UTC**, replies to question
 `vjgmesg3jfm9v8fnvsdd5jmwba`. The owner accepts the default pair in principle;
-the manifest-controlled revision needs its own signoff. No new D-entry is
-recorded from this answer yet, as the relay explicitly requests revision
-signoff before recording the resulting contract.
+the manifest-controlled revision needed its own signoff. That initial answer
+was retained without recording a new decision until the explicit revision-2
+approval at **2026-10-21 15:31:39 UTC**, relay `cb344sy9r3dg5xk9rvjmiek24n`.
 
-The only active checkpoint is **P-10 revision 2**: optional manifest VM set,
-supported role/clock pairs, entry/export defaults and one-role variants.
-Approve the enumerated revision or specify changes. Additional owners,
-mod mapping, startup order and lifecycle details remain open.
+Resolved by D-14: all four parts of P-10 revision 2, including one-role variants.
+Additional owners, mod mapping, startup order and lifecycle details remain open.
 
 ### Q-8. How should the prior vision and Lua epic be reconciled?
 
