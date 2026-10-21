@@ -9,7 +9,7 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current pass records direction and the module-import checkpoint; it is
+The current pass records direction and the module-initialization checkpoint; it is
 not an approved specification or authority to implement or file issues.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
@@ -224,6 +224,38 @@ The choice affects content loading, boot and mod composition, whose slice
 boundaries are still open. Path/symlink rules, module reuse, loading phases and
 save/write APIs are not approved by this answer.
 
+### D-7. Load each module once per VM and share its exports there
+
+Owner answer, **2026-10-21 14:58:57 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: load once per VM (Rec.)
+
+Authenticated relay: `het-manager`, message `p7kj8m62k87v4vnj7cmd8x6njs`,
+posted **2026-10-21 14:58:57.754 UTC** in `#het-luafirst`, replying to Q-2b
+message `gvq9h5gpv3aq3f9fepqe3mawtw`.
+
+Within one VM, a module is identified by content root and path. Its first
+import evaluates it and obtains an export table; later imports return that
+same table without rerunning top-level code. Importers share its module state
+and mutable exports. Fresh local state comes from a factory or script instance.
+Other VMs evaluate their own copies: Lua tables, closures and mutable module
+state do not cross VM owners. D-3 still places authoritative game state in
+the engine, not in these shared module tables.
+
+Cycles are rejected with their root/path chain rather than exposing partly
+initialized exports. Failed imports stay failed in that VM, expose no
+successful exports and are not automatically retried. Effects already
+performed are not undone by the import failure. Allowed top-level effects
+and boot/session failure escalation remain separate choices.
+
+Rejected: evaluating a fresh table and module environment on every import,
+which repeats top-level effects and dependency loading. Reuse keeps module
+dependencies predictable; factories make fresh local state explicit. The
+choice affects content-loader and module/instance integration slices, still
+undefined. Path normalization/aliases, loading phases, live reload, cache
+bounds and data/texture caching are not settled by this answer.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -242,41 +274,44 @@ For illustration only: `(game-id, images/title.png)` and
 
 ### P-3. Evaluate an imported module once per VM and reuse its exports
 
-**Unapproved; active checkpoint Q-2b.** Recommended option A is an engine-owned
-module cache per VM, keyed by content-root identity and normalized relative
-module path. The first import evaluates text source in that module's environment
-and obtains an export table. Later imports in that VM return the same table
-without rerunning top-level code. Another VM evaluates its own copy; no Lua
-table, closure or mutable module state crosses VM owners.
-
-The consequence is explicit sharing within a VM: changes to exported tables
-and module upvalues are visible to its importers. Authors use factory functions
-or script instances when they need fresh local state; importing again does not
-create a fresh instance. Authoritative gameplay state still belongs to the
-engine under D-3, not to a module cache.
-
-Reject an import cycle with a diagnostic naming the root/path chain rather than
-exposing partly initialized exports. A failed module import returns an attributed
-failure, exposes no successful cached exports and is not automatically retried;
-subsequent imports of that failed identity in the same VM return its failure.
-This does not roll back effects already performed during module evaluation.
-Allowed top-level effects and whether a failure ends boot or a session remain
-part of the loading-phase and boot contracts.
-
-Alternative B evaluates a fresh module environment and export table on every
-import. It provides separate module-local state to each importer, but repeats
-top-level effects and can load the same dependency many times. Both options
-reject cycles and report failures without automatic effect replay. A is
-recommended because dependency imports reuse code and state predictably, while
-factories make fresh state explicit.
-
+Accepted by D-7; retain this proposal ID as history.
 The current host already separates a loaded module from its instances and
 refuses duplicate loads under one identity; it exposes host-declared entry
-points, not this proposed Lua-to-Lua export-table interface. The proposal is new
-loader behavior, not a claim that the present API supplies it. It affects the
-content-loader and module/instance integration slices, still undefined. It
-does not decide loading phases, live reload, path aliases, cache bounds, or
-the treatment of data and texture caches.
+points, not the new Lua-to-Lua export-table interface. This is new loader
+behavior, not a claim that the present API supplies it.
+
+### P-4. Import modules without starting engine services or acquiring resources
+
+**Unapproved; active checkpoint Q-2c.** Recommended option A gives module
+evaluation a declaration phase. Top-level Lua may construct tables, functions
+and constants, import dependencies, use pure value/math helpers and emit
+diagnostics. Effectful engine bindings are unavailable during that phase:
+no window creation, asset/data reads other than module import, texture
+acquisition, input subscription, instance start, world access or staged world
+mutation. These actions belong to explicitly invoked lifecycle hooks or
+functions running in their permitted lifecycle context, where the engine
+can establish the instance/session ownership and tick boundary.
+
+The restriction is on engine authority, not a claim that ordinary Lua is
+pure: code can still mutate Lua tables, including shared imported exports,
+hang or exhaust memory. There is no rollback of such Lua mutations. The
+declaration phase also applies to a dependency first imported from inside a
+hook: that dependency's top-level code does not inherit the hook's effectful
+engine access. Exact bindings and the permitted loading times remain open.
+
+Alternative B permits content reads and native resource acquisition during
+module evaluation, recording their ownership in an engine-held module scope
+within the VM lifetime. Import failure must safely release that module's
+holdings without losing dependencies still borrowed by successful modules;
+module resources remain shared across importers. It still cannot bypass
+D-3's tick-based authoritative state changes. This requires a separate module
+resource-ownership contract in addition to the existing instance leases.
+
+A is recommended because an import defines reusable code while an explicit
+lifecycle action starts work under a named owner. The author-visible cost is
+moving top-level texture loads and window creation into hooks; imports cannot
+return already acquired native resources. This affects module loading, boot,
+service bindings and resource ownership, whose slices remain undefined.
 
 ## Open questions
 
@@ -290,7 +325,8 @@ epic's disposition are not settled by this answer.
 Settle modules, data and textures scoped to game/mod content roots, module
 identity/cache/cycles, cross-mod access, root/path and symlink handling,
 failure attribution and when loading is allowed. D-6 settles explicit root
-addressing; engine API spelling and the remaining loader behavior are open.
+addressing and D-7 module reuse/cycle/failure behavior; engine API spelling
+and the remaining loader behavior are open.
 
 #### Q-2a. Explicit content-root references or one merged override namespace?
 
@@ -300,10 +336,17 @@ remain open.
 
 #### Q-2b. Reuse a module's exports within a VM or evaluate afresh per import?
 
-The only active checkpoint: P-3 option A (recommended, cached exports per VM)
-or B (fresh module per import), or an owner-specified revision. The proposed
-contract includes cycle rejection and attributed failed imports without
-automatic retries. Loading phases and failure escalation remain open.
+Resolved by D-7: shared exports from one evaluation per VM, cycle rejection,
+failed imports retained as failures and no automatic retry or undo of effects.
+Loading phases and failure escalation remain open.
+
+#### Q-2c. May module top-level code acquire engine resources?
+
+The only active checkpoint: P-4 option A (recommended, declarations/imports,
+pure helpers and diagnostics, with effectful engine access reserved for
+lifecycle execution) or B (engine-held module resource scopes), or an
+owner-specified revision. This does not yet decide when new modules may be
+imported or when texture/data loading is allowed in a running session.
 
 ### Q-3. What is the generic executable's boot and session contract?
 
