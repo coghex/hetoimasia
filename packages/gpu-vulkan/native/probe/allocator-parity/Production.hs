@@ -568,7 +568,7 @@ limitsSection invalid report verdicts validated messages =
              , if invalid
                  then "**This run is invalid** (see the self-checks), so none of the results above qualifies anything."
                  else
-                   "A configuration qualifies for #333 only if it meets every limit. The recommendation, and whether it qualifies, is stated in `docs/gpu_vma_qualification_record.md` from this run and the run of the other binding variant."
+                   "A configuration qualifies for #333 only if it meets every limit. The recommendation, and whether it qualifies, is stated in `docs/archive/gpu_vma_qualification_record.md` from this run and the run of the other binding variant."
              , ""
              ]
         where

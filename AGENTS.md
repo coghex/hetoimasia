@@ -168,5 +168,11 @@ this repository:
   ([the MEMORY.md rule](docs/validation.md#the-memorymd-rule)). Implementation docs
   describe current behavior; designs label proposals and unresolved choices.
   Update the relevant document with the change, without inventing completion.
+- `docs/archive/` is history: finished designs, evidence, verdicts and
+  records. Read it only when asked or when tracing why something was decided,
+  and never treat it as current behavior. `.ignore` hides it, and the records
+  tools read in place, from search (`rg --no-ignore` reaches them). Once a
+  design's work has merged, or a record's issue has closed, move it there with
+  `git mv` and land it with `docs-push`.
 - Keep instructions short. Add subsystem contracts where the subsystem lives,
   rather than growing a central inventory of every field and function.
