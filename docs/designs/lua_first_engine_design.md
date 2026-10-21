@@ -9,7 +9,7 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current pass records direction and the boot-input checkpoint; it is
+The current pass records direction and the default-domain checkpoint; it is
 not an approved specification or authority to implement or file issues.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
@@ -401,6 +401,34 @@ optionality lets Lua distinguish essential content from content for which it
 can choose a fallback. Loading, Lua results and failure integration are
 affected; delivery slices remain undefined.
 
+### D-13. Launch a game folder with a declarative identity/entry manifest
+
+Owner answer, **2026-10-21 15:23:57 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: folder + manifest (Rec.)
+
+Authenticated relay: `het-manager`, message `brhjnmqp2fdr7kdtym3t6ferv2`,
+posted **2026-10-21 15:23:57.221 UTC** in `#het-luafirst`, replying to Q-3a
+message `fwbt73n3ivxkimhsrigkvupv2w`.
+
+Launch takes a content folder. A small non-executable manifest inside names
+its stable content identity and relative Lua entry path; the engine validates
+them before running game Lua. Mods will use the same kind of manifest, with
+their discovery, enablement and additional metadata still to be designed.
+Game rules and orchestration remain Lua-authored, without game-specific Haskell.
+
+`hetoimasia run ./mygame`, content ID `example_game` and entry `lua/main.lua`
+were illustrations, not approved command spelling or a fixed entry convention.
+Manifest filename, format/schema and versioning remain open. This decision
+does not settle lifecycle hooks, domains, windows or the existing headless
+command's compatibility.
+
+Rejected: requiring the content folder and entry script separately on the
+command line with no manifest. A self-describing folder keeps entry knowledge
+with the content and gives game/mod roots explicit identities. Boot, root
+registration and mod metadata are affected; slices remain undefined.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -458,33 +486,42 @@ what a failure is"); the content result API remains new work.
 
 ### P-9. Boot a self-describing game folder
 
-**Unapproved; active checkpoint Q-3a.** Recommend option A: the launch command
-takes a game content-root directory. A small, non-executable manifest in that
-root supplies its stable content identity and relative Lua entry-module path.
-The engine validates those fields before executing game Lua; no game-specific
-Haskell chooses an entry. The author can hand someone the folder and a command
-that names the folder, without requiring them to know its internal script path.
+Accepted by D-13; retain this proposal ID as history. The current headless
+command takes explicit `--script` paths and does not supply this game-folder
+boot contract. Its compatibility remains a separate choice.
 
-For illustration only, a manifest could say `id = "example_game"` and
-`entry = "lua/main.lua"`; its filename, format/schema, versioning and command
-spelling are not selected at this checkpoint. The manifest is boot metadata,
-not a place for game rules, routines or native resource ownership. Required
-startup validation still includes the approved content and library policies.
+### P-10. Supply independent gameplay and presentation domains by default
 
-Alternative B takes the root and entry path directly on the command line,
-with no mandatory game manifest. This starts an arbitrary entry without
-packaging metadata but moves knowledge of the folder's entry point into each
-launch configuration; stable root identity would need a separate convention
-or argument. A is recommended to give games and eventual mods explicit
-identities and make the normal launch self-contained in its content folder.
+**Unapproved; active checkpoint Q-7a.** This choice precedes the remaining
+entry-hook design because that design needs to know which owners the boot
+contract supplies. Recommend option A: the generic game launcher supplies
+two independent VM owners by default, one for logical gameplay and one for
+elapsed-time presentation/UI. Lua defines their game behaviors; the engine
+supplies their scheduling, service boundaries and state-commit machinery.
 
-This affects boot, content-root registration and eventual mod metadata.
-It does not select domain creation, entry hooks, mod discovery/enabling,
-window defaults, engine settings, or manifest fields beyond identity and
-entry. Whether the new launch is a subcommand or a separate executable, and
-compatibility with the existing `hetoimasia lua` command, remain open. The
-current headless command takes explicit `--script` paths and does not supply
-this game-folder boot contract.
+Gameplay operates on the generic engine-held state. Presentation observes
+completed snapshots and sends bounded intentions, without synchronous entry
+into the gameplay VM. A gameplay tick waiting on required content does not
+hold up the presentation owner's ordinary progress. Module caches and Lua
+mutable state are separate per VM under D-7. This continues the two-domain
+consumer's useful boundary without importing its sample game.
+
+This is the launcher's default composition, not a fixed-pair restriction in
+the general VM-owner library: Lua design D-15 remains intact. Additional
+owners and how Lua may create/control them need their own scoped API decision;
+the choice does not silently add a VM pool, sharding or per-mod owners.
+
+Alternative B starts only a generic bootstrap VM and makes the game's Lua
+explicitly create and configure the execution owners it needs, including the
+UI/gameplay pair when desired. That gives the author more composition control
+but makes every game establish its own responsive/deterministic arrangement
+through a new Lua owner-construction API. A is recommended for a usable default
+that preserves the already demonstrated logical/presentation separation.
+
+This affects boot/lifecycle, state publication and service bindings. It does
+not decide which VM evaluates the manifest entry, startup order, mod-to-domain
+mapping, presentation failure policy or whether a headless mode omits an owner.
+Those remain explicit follow-up choices; no delivery slices are approved.
 
 ## Open questions
 
@@ -556,11 +593,10 @@ Keep D-27 cleanup independent of successful Lua shutdown.
 
 #### Q-3a. Does the game folder declare its entry point?
 
-The only active checkpoint: P-9 option A (recommended, root directory plus a
-non-executable manifest naming content identity and entry) or B (root and
-entry supplied directly at launch, no mandatory manifest), or an
-owner-specified revision. Manifest syntax, launcher compatibility and
-lifecycle remain separate decisions.
+Resolved by D-13: content folder plus a non-executable identity/entry manifest,
+with corresponding mod manifests later. Format and command spelling remain
+open, as do launcher compatibility and lifecycle. Q-7a is asked next because
+default domain composition affects entry/lifecycle design.
 
 ### Q-4. How are mods discovered, ordered and combined?
 
@@ -589,6 +625,14 @@ obligations; the new binding and service boundaries need concrete contracts.
 Settle the UI/gameplay pair and how mods map to owners/modules/instances.
 Lua D-15 supplies general independent owners, not a mandatory hard-coded pair.
 Keep coherent publication and no synchronous cross-owner VM entry.
+
+#### Q-7a. Does the launcher supply the UI/gameplay pair by default?
+
+The only active checkpoint: P-10 option A (recommended, default independent
+logical gameplay and elapsed presentation owners) or B (a bootstrap VM whose
+Lua explicitly constructs the domain arrangement), or an owner-specified
+revision. General VM owners remain available at the library level; mod mapping,
+additional Lua-controlled owners and entry routing are not decided here.
 
 ### Q-8. How should the prior vision and Lua epic be reconciled?
 
