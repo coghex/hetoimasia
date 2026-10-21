@@ -539,6 +539,30 @@ does not reschedule the instance. The illustrative `every = 2` field shown by
 the manager did not settle field names or grammar. Additional routines,
 rescheduling and state-transaction waits remain separate choices.
 
+### D-18. Initialize concurrently, with independently starting presentation
+
+Owner answer, **2026-10-21 15:59:37 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> Approve as proposed
+
+Authenticated relay: `het-manager`, message `mtzmhhh2j6kibwqscp53uiyqe2`,
+posted **2026-10-21 15:59:37.792 UTC** in `#het-luafirst`, replying to Q-3e
+revision 2 message `j4p8yi8ftca2q2mpw3her2garn`.
+
+All five parts of P-14 revision 2 below are accepted: concurrent root init
+after validation, independently starting UI, gameplay gated on both roots,
+failure/cancellation with late-success races closed, and per-role startup
+ownership with continued main-thread servicing. A one-role session waits only
+for its own init. No gameplay time accrues during startup. Pending loads can
+continue after init; game-specific readiness remains Lua-owned.
+
+The manager summarized all five parts and the advice to keep init short.
+The owner chose "Approve as proposed", not "Approve + progress": the early
+loading screen gets starting/root-readiness status, with no detailed progress
+channel from gameplay init. The original concurrent-start request remains
+quoted under Q-3e. Post-start failure policy and exact diagnostics remain open.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -794,9 +818,9 @@ adapter must supply that admission configuration from the chosen source.
 
 ### P-14. Start root initializers concurrently and release presentation first
 
-**Revision 2, unapproved; active checkpoint Q-3e.** This revises the original
-serial-start proposal in response to the owner's variant preserved under
-Q-3e. Recommend approving all five parts below together.
+**Revision 2 accepted by D-18.** Retain the five-part contract below. It
+revises the original serial-start proposal in response to the owner's variant
+preserved under Q-3e; the subsequent explicit signoff is recorded in D-18.
 
 1. **Concurrent admission.** Validate the manifest/content inventory and the
    selected entry exports/cadences, then dispatch both root initializers to
@@ -870,6 +894,62 @@ first then gameplay) remain historical proposals, not accepted contracts.
 Evidence: the existing VM-owner and instance mechanisms support separate
 owners and lifecycle cleanup, but `samples/lua-domains` uses serial startup;
 the concurrent launcher protocol is new work, not claimed delivered behavior.
+
+### P-15. Preserve a healthy presentation root after a gameplay root failure
+
+**Unapproved; active checkpoint Q-3f.** Recommend A for ordinary root-script
+failures after successful startup: a gameplay root failure ends simulation,
+while a healthy presentation root continues to render and receive input so
+Lua can show the error. Close gameplay admission and tick grants immediately;
+discard uncommitted work and retain the last committed state. Stop/settle
+gameplay work and account for its failures before claiming final quiescence,
+preserving prior Lua D-47/D-48's attribution and commit boundary. UI may see
+failure/ending status with the last good snapshot during settlement, but must
+not be told cleanup has finished until it has. This is failure containment,
+not rollback of Lua globals, native effects or already committed ticks.
+
+The surviving UI receives a bounded structured failure description, including
+source/role, stage and available traceback, alongside the coherent frozen
+gameplay view. It may keep using its own presentation/input/content services
+and request session exit. Gameplay intentions and lifecycle controls are
+refused as ended. There is no automatic restart/retry, no continuation of the
+failed simulation and no newly authorized reload/recovery API. Lua authors
+must handle failed-session status if they want a useful error screen; the
+engine also reports diagnostics independently of that UI. Without such Lua
+handling, an unchanged screen may remain until the user quits. No timeout or
+automatic exit is imposed while healthy presentation is running.
+
+A presentation root failure ends the whole session: stop gameplay, retain the
+last committed state for the final report, and retire both sides. Continuing
+gameplay without its failed UI is not the launcher policy in A. Gameplay-only
+failure and presentation-only failure both end their one-role session. The
+eventual process outcome remains failure even if the user later exits normally
+from the surviving UI; precise CLI codes and diagnostic schema follow.
+
+Both A and alternative B preserve D-12: explicitly optional content can return
+a structured failure to Lua; a failed required operation cannot silently become
+optional. A resulting root failure follows this policy. Host/provider and
+cleanup failures remain fatal to the session, not ordinary script errors
+which a surviving UI is promised to absorb. D-18 already governs failures
+before startup completes. Additional instance/mod failure boundaries remain
+part of their own design, rather than being silently classified here.
+
+Alternative B ends the whole session on either root-script failure after
+startup, preserving the last committed state and diagnostics while retiring
+both sides. B has a smaller terminal-state lifetime contract and needs no
+Lua error-screen handling, but offers no continuing in-game explanation.
+A is recommended for an interactive Lua-authored engine because the existing
+domain separation can keep an error screen responsive without executing any
+more failed gameplay. Its cost is a bounded failure view, an explicit
+failed-gameplay/live-presentation state and tests of late failures and exit
+during retirement. Neither option promises immediate cancellation of trusted
+non-yielding code or releases resources before safe retirement.
+
+Evidence: `samples/lua-domains` retains the last good world and accounts for
+gameplay settlement before publishing final failure, and lets UI observe the
+end. It also isolates UI failure while gameplay continues; that sample policy
+is deliberately not assumed for this launcher. Keeping healthy UI alive until
+explicit exit is a proposed launcher policy, not an existing sample guarantee.
 
 ## Open questions
 
@@ -978,11 +1058,18 @@ Q-3e message `acx2n5b76r2gcnc4are4buuh8e`. The owner selected neither serial
 option and invited advice. Preserve this as direction for the revision, not
 approval of the added startup/error protocol.
 
-The only active checkpoint is signoff on all five parts of P-14 revision 2:
-concurrent init, early independent presentation with not-ready gameplay
-access, the joint gameplay start gate, failure/cancellation, and startup
-ownership. Recommend approval, or an owner-specified revision. No D-entry is
-recorded until that signoff arrives. Post-start failure reporting follows.
+Resolved by D-18: all five parts of P-14 revision 2 approved at
+**2026-10-21 15:59:37 UTC**, relay `mtzmhhh2j6kibwqscp53uiyqe2`.
+The owner did not select the extra progress-channel alternative.
+
+#### Q-3f. May healthy UI continue after a gameplay root fails at runtime?
+
+The only active checkpoint: P-15 option A (recommended, stop failed gameplay
+and keep healthy UI until explicit exit; UI failure ends the session) or B
+(either root failure ends the session), or an owner-specified revision.
+Both preserve the last committed state, report failure and perform engine-owned
+cleanup without retry. Fatal host/cleanup failures and startup failures retain
+their existing rules. Exact diagnostics/exit codes and child/mod policy follow.
 
 ### Q-4. How are mods discovered, ordered and combined?
 
@@ -1027,7 +1114,8 @@ was retained without recording a new decision until the explicit revision-2
 approval at **2026-10-21 15:31:39 UTC**, relay `cb344sy9r3dg5xk9rvjmiek24n`.
 
 Resolved by D-14: all four parts of P-10 revision 2, including one-role variants.
-Additional owners, mod mapping, startup order and lifecycle details remain open.
+Startup order is now settled by D-18. Additional owners, mod mapping and
+remaining lifecycle details stay open.
 
 ### Q-8. How should the prior vision and Lua epic be reconciled?
 
