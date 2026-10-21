@@ -9,7 +9,7 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current pass records direction and the default-domain checkpoint; it is
+The current pass records direction and the manifest-domain revision checkpoint; it is
 not an approved specification or authority to implement or file issues.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
@@ -490,38 +490,71 @@ Accepted by D-13; retain this proposal ID as history. The current headless
 command takes explicit `--script` paths and does not supply this game-folder
 boot contract. Its compatibility remains a separate choice.
 
-### P-10. Supply independent gameplay and presentation domains by default
+### P-10. Declare the VM arrangement in the manifest, defaulting to the pair
 
-**Unapproved; active checkpoint Q-7a.** This choice precedes the remaining
-entry-hook design because that design needs to know which owners the boot
-contract supplies. Recommend option A: the generic game launcher supplies
-two independent VM owners by default, one for logical gameplay and one for
-elapsed-time presentation/UI. Lua defines their game behaviors; the engine
-supplies their scheduling, service boundaries and state-commit machinery.
+**Revised proposal; not approved. Active checkpoint Q-7a revision 2.** The
+owner accepted the two-VM default in principle and asked whether it could be
+declared in the manifest; the exact answer and relay are preserved under Q-7a.
+Do not turn that question into approval of the new configuration contract.
 
-Gameplay operates on the generic engine-held state. Presentation observes
-completed snapshots and sends bounded intentions, without synchronous entry
-into the gameplay VM. A gameplay tick waiting on required content does not
-hold up the presentation owner's ordinary progress. Module caches and Lua
-mutable state are separate per VM under D-7. This continues the two-domain
-consumer's useful boundary without importing its sample game.
+Recommended revision:
 
-This is the launcher's default composition, not a fixed-pair restriction in
-the general VM-owner library: Lua design D-15 remains intact. Additional
-owners and how Lua may create/control them need their own scoped API decision;
-the choice does not silently add a VM pool, sharding or per-mod owners.
+1. An optional declarative `vms` section lists the supported roles to create:
+   `gameplay`, `presentation`, or both. Each declaration names its role,
+   relative entry-module path and clock. In this initial contract there is
+   at most one of each role, at least one overall, and no additional roles.
+2. Gameplay requires a logical clock; presentation requires an elapsed clock.
+   Incompatible clocks, duplicate/unknown roles and an explicitly empty set
+   are configuration errors, reported before game Lua runs. Exact tick/cadence
+   settings and their defaults still need the scheduling/lifecycle contract.
+3. When `vms` is absent, create both roles. Each independently loads D-13's
+   top-level manifest `entry` and selects the corresponding `gameplay` or
+   `presentation` behavior exported by that module. There is no third
+   bootstrap VM. A declared VM may override its entry path; it still selects
+   that role's behavior from the chosen module. The behavior/hook schema and
+   manifest file format remain to be signed off separately.
+4. A gameplay-only set is headless gameplay; it has no presentation owner to
+   keep a UI available. A presentation-only set has no authoritative gameplay
+   session. With both roles present, presentation observes completed snapshots
+   and sends bounded intentions while gameplay owns logical progression and
+   accesses the generic engine-held state. No synchronous cross-VM entry or
+   shared Lua table is introduced. Behavior requiring an absent domain must
+   be refused explicitly; exact service errors belong to the binding contract.
 
-Alternative B starts only a generic bootstrap VM and makes the game's Lua
-explicitly create and configure the execution owners it needs, including the
-UI/gameplay pair when desired. That gives the author more composition control
-but makes every game establish its own responsive/deterministic arrangement
-through a new Lua owner-construction API. A is recommended for a usable default
-that preserves the already demonstrated logical/presentation separation.
+Illustrative declarations, not a selected manifest syntax:
 
-This affects boot/lifecycle, state publication and service bindings. It does
-not decide which VM evaluates the manifest entry, startup order, mod-to-domain
-mapping, presentation failure policy or whether a headless mode omits an owner.
-Those remain explicit follow-up choices; no delivery slices are approved.
+| Role | Clock | Entry | Selected export |
+| --- | --- | --- | --- |
+| gameplay | logical | `lua/game.lua` | `gameplay` |
+| presentation | elapsed | `lua/ui.lua` | `presentation` |
+
+With no VM section, both entry cells instead use the manifest's common entry,
+for example `lua/main.lua`, whose export table supplies both named behaviors.
+Top-level source runs independently in each VM under D-7/D-8; its globals,
+exports and module cache are not shared. Separate entry paths avoid loading
+the other role's module dependencies where that matters.
+
+The advantage is that the folder declares how it runs without Lua having to
+construct owners before its ordinary lifecycle starts. The two-VM default
+preserves the proven logical/presentation separation. The cost is manifest
+parsing and validation, role-specific entry selection, and qualification of
+the pair and both one-role variants, including absent-domain service failures.
+An omitted presentation owner supplies no responsive-UI guarantee; normal
+process diagnostics still have to report failures. Nothing here makes trusted
+Lua preemptible or gives a hard latency or memory guarantee.
+
+This limits only the initial launcher schema: the general VM-owner library
+and Lua D-15 remain unchanged. Additional declared or Lua-created owners,
+per-mod owner allocation, arbitrary clock/role combinations and dynamically
+changing the VM set need a separate approved extension. They are not delivered
+merely by allowing this manifest section.
+
+Earlier alternatives were a launcher-supplied pair with no manifest choice,
+or a bootstrap VM whose Lua explicitly creates its owners. They remain
+historical alternatives, not owner-rejected requirements. The revised contract
+affects boot/manifest validation, entry hooks, domain services, state publication
+and verification. Startup order, mod mapping and failure escalation remain
+open; no delivery slices are approved.
 
 ## Open questions
 
@@ -628,11 +661,22 @@ Keep coherent publication and no synchronous cross-owner VM entry.
 
 #### Q-7a. Does the launcher supply the UI/gameplay pair by default?
 
-The only active checkpoint: P-10 option A (recommended, default independent
-logical gameplay and elapsed presentation owners) or B (a bootstrap VM whose
-Lua explicitly constructs the domain arrangement), or an owner-specified
-revision. General VM owners remain available at the library level; mod mapping,
-additional Lua-controlled owners and entry routing are not decided here.
+Owner response, **2026-10-21 15:27:06 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> two vms default is fine, but can this be in the manifest?
+
+Verified relay `gbyui2gk6dj4693izanm543f3s` from `het-manager`, posted
+**2026-10-21 15:27:07.008 UTC**, replies to question
+`vjgmesg3jfm9v8fnvsdd5jmwba`. The owner accepts the default pair in principle;
+the manifest-controlled revision needs its own signoff. No new D-entry is
+recorded from this answer yet, as the relay explicitly requests revision
+signoff before recording the resulting contract.
+
+The only active checkpoint is **P-10 revision 2**: optional manifest VM set,
+supported role/clock pairs, entry/export defaults and one-role variants.
+Approve the enumerated revision or specify changes. Additional owners,
+mod mapping, startup order and lifecycle details remain open.
 
 ### Q-8. How should the prior vision and Lua epic be reconciled?
 
