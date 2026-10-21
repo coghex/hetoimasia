@@ -73,7 +73,7 @@ took 0.27 s of the native run.
 
 The graphics-owner interaction probe, the suite's last example, reported
 pending, as it does in every run that does not activate it; its activated
-runs are [the interaction verdict](../graphics_owner_interaction_verdict.md)'s.
+runs are [the interaction verdict](../archive/graphics_owner_interaction_verdict.md)'s.
 
 The plan's local worker declaration is the one
 [docs/validation.md](../validation.md#a-local-run-and-its-receipt) shows, with

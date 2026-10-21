@@ -4,7 +4,7 @@
 -- placement (design decision D-13), measured against VMA and superseded when
 -- the owner chose VMA for production allocation (D-38): neither it nor a
 -- mutable prototype met the parity gates, recorded in
--- @docs/gpu_allocator_parity_record.md@. It lives in the model package's
+-- @docs/archive/gpu_allocator_parity_record.md@. It lives in the model package's
 -- @placement-reference@ sublibrary, which only test suites depend on, because
 -- it states best fit's rules exactly and is tested against them.
 --

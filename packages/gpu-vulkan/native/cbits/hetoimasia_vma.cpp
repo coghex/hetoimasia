@@ -170,7 +170,7 @@ int32_t hetoimasia_vma_create_buffer(hetoimasia_vma_allocator* state, uint64_t s
   // block retained and falls back to a dedicated allocation, opening more than
   // was reserved. Map afterwards with hetoimasia_vma_map. The compiled VMA's
   // VMA_DEBUG_MARGIN must stay zero too. See D-40's preconditions in
-  // docs/designs/gpu_resource_services_design.md.
+  // docs/archive/designs/gpu_resource_services_design.md.
   request.flags = never_allocate != 0 ? VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT : 0;
   request.usage = VMA_MEMORY_USAGE_UNKNOWN;
   request.memoryTypeBits = 1u << memory_type;

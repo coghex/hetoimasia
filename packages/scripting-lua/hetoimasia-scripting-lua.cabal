@@ -542,7 +542,7 @@ test-suite lua-hazard-probes
 --
 -- Both of the mechanisms it measures are resolved at run time rather than
 -- linked, because whether they are exported at all is one of the questions.
--- See docs/macos_confinement_verdict.md for what they turned out to be worth.
+-- See docs/archive/macos_confinement_verdict.md for what they turned out to be worth.
 library macos-probe
     import: language
     visibility: private
@@ -659,7 +659,7 @@ executable lua-confine-child
 -- The probe's parent side, and the verdict's evidence. It launches confined
 -- children, reads what they observed, ends them, and records the machine it
 -- ran on; it draws no conclusion about whether the profile is adequate, which
--- is docs/lua_linux_confinement_verdict.md's.
+-- is docs/archive/lua_linux_confinement_verdict.md's.
 test-suite linux-confinement-probe
     import: language
     type: exitcode-stdio-1.0
