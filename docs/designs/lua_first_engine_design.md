@@ -9,7 +9,7 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current pass records direction and the first decision checkpoint; it is
+The current pass records direction and the content-addressing checkpoint; it is
 not an approved specification or authority to implement or file issues.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
@@ -98,7 +98,8 @@ No build, probe or desktop session ran for this draft.
 
 ## Desired experience and scope
 
-D-1 through D-3 below are the owner's settled direction. Game and mod Lua
+D-1 through D-3 below are the owner's settled direction; D-5 settles the
+standard-library exclusions. Game and mod Lua
 orchestrate the game and use engine services without direct OS functionality.
 The engine stores the state generically and commits Lua-defined changes per
 tick, preserving deterministic simulation and explicit failure handling.
@@ -137,7 +138,7 @@ relayed through the briefing and the 14:41:43.272 UTC message above:
 
 > mods = game, trusted, but we need to filter out the dangerous commands from the library. mods and game lua should not be able to use os functionality
 
-The filtering profile is Q-1. The resulting disposition of the previous
+The filtering profile is settled by D-5 (Q-1). The resulting disposition of the previous
 confined branch is separately reserved for explicit reconciliation, Q-8.
 
 ### D-3. Engine holds, Lua defines
@@ -161,39 +162,37 @@ source is the supplied briefing, corroborated by the manager's start relay:
 The endpoint is owner signoff on this design and dependency-ordered slices.
 Review and issue processing come later on the manager's instruction.
 
-## Proposals
+### D-5. Use profile A, with no exceptions to the listed removals
 
-### P-1. A common filtered library profile for game and mod content
+Owner answer, **2026-10-21 14:51:42 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
 
-**Unapproved; first owner checkpoint, Q-1.** Recommended option A:
+> A: smaller (Recommended)
 
-| Surface | Proposed author-visible contract |
+Authenticated relay: `het-manager`, message `bdck3xh3mbqzpyp2ss7bpw8em6`,
+posted **2026-10-21 14:51:42.794 UTC** in `#het-luafirst`, replying to Q-1
+message `xh6q5jhu8kdhn8j46kj5jyit6s`. The owner was shown these exact
+exclusions and told that neither option prevents hanging or memory exhaustion.
+
+| Surface | Approved exclusion for game and mod Lua |
 | --- | --- |
 | `os`, `io` | Absent in full; no direct filesystem, environment, shell, process or OS-clock access. |
 | Standard `package` and its `require` | Absent, including search paths, searchers and C/native loaders. A separately designed engine module loader supplies content imports (Q-2). |
 | `load`, `loadfile`, `dofile` | Absent; executable source enters through the engine's content loader, not arbitrary paths, bytecode or runtime strings. |
-| `debug` | Absent in full; engine-generated failure reports retain diagnostic context without granting Lua debug access. |
+| `debug` | Absent in full. |
 | `string.dump` | Absent; no script-side bytecode export. |
-| `collectgarbage` | Absent; GC policy and memory diagnostics remain engine-owned. |
-| Base, string, table, math, coroutine | Keep ordinary computation and the existing supported coroutine behavior after the exclusions above. Preserve the logical-domain restriction on `math.random`/`math.randomseed` and the owned seeded stream; presentation randomness remains separate. |
-| Output and time | Route script output through engine diagnostics; expose time through the engine's domain-appropriate interface. Exact bindings remain Q-6. |
+| `collectgarbage` | Absent, including read-only statistics. |
 
 Apply the restrictions before any game/mod module runs. Closing a global name
 while leaving an alternate exposed library reference is insufficient. Engine
 bindings must not reintroduce an unrestricted OS escape.
 
-Alternative B keeps the same OS/file/native/debug exclusions but additionally
-permits text-only in-memory `load` and read-only GC statistics. It offers dynamic
-code generation and script-visible memory measurements at the cost of another
-execution-entry contract and nondeterministic observations that must be kept
-out of authoritative gameplay. Neither option is approved. No alternative
-allows raw file access or native loading.
-
-The recommendation is A: ordinary game authoring can use modules and explicit
-engine services, with a smaller supported execution surface. The consequence
-is that scripts using these removed functions require changes. This affects
-the future library-profile, content-loading and boot slices; those slices have
-not yet been decomposed or approved.
+The choice keeps the supported surface small; scripts using removed functions
+must change. Rejected option B would have allowed text-only in-memory `load`
+and read-only GC statistics. No exception for either is approved. This affects
+future library-profile, content-loading and boot slices, whose boundaries are
+not yet settled. It does not decide whether the existing standalone headless
+command changes; that compatibility choice remains Q-3.
 
 Filtering removes ambient OS authority; it is **not hostile-code containment**.
 A trusted script can still hang its owner or exhaust process memory.
@@ -201,13 +200,52 @@ Cooperative budgets are not hard limits, and protected dependencies remain
 held until actual completion. This follows existing Lua D-13/D-14 and is not
 an additional guarantee of either option.
 
+## Proposals
+
+### P-1. A common filtered library profile for game and mod content
+
+The exclusion choice is accepted by D-5; retain this proposal ID as its history.
+Ordinary computation and supported coroutine behavior remain the basis for
+authoring. The existing logical-domain seeded stream and separation from
+presentation randomness remain constraints. Exact output, diagnostic and time
+bindings still belong to Q-6; Q-1's answer does not settle their API.
+
+### P-2. Address content by an explicit root and a relative path
+
+**Unapproved; active checkpoint Q-2a.** Recommend namespaced content references:
+each game/mod has an engine-registered content-root identity. A relative
+reference resolves within the referring content's own root. A cross-content
+reference explicitly names the game or an enabled mod's root, and any enabled
+root can be referenced. The engine resolves a root identity and relative path
+for module, data and texture loading, without exposing an arbitrary host path.
+For illustration only: `(game-id, images/title.png)` and
+`(mod-id, lua/rules.lua)`; concrete Lua syntax is not selected.
+
+Under option A, two roots may both contain `images/title.png` without one
+silently replacing the other. Mod replacement can still be explicit through
+the composition/override rules to be designed in Q-4. A missing explicit
+reference fails with its root and path instead of searching unrelated roots.
+
+Alternative B presents one merged content namespace: the same relative path
+may be supplied by the game or a mod, and the selected mod order determines
+which wins. That makes file replacement convenient but makes every unqualified
+module/data/texture reference depend on global override order, which must be
+settled before the resolver is specified.
+
+Both options confine engine content reads to the enabled roots; neither
+restores standard `require`, direct file access or native loaders. A is
+recommended for explicit dependencies and predictable provenance. It affects
+content loading, mod composition and boot; no slice boundaries are approved.
+This checkpoint settles addressing and cross-root visibility only. Symlink
+policy, module cache/cycles, loading phases, asynchronous result timing and
+write/save APIs remain open and require their own decisions.
+
 ## Open questions
 
 ### Q-1. Which filtered standard-library profile applies to every script?
 
-Awaiting owner choice between P-1 option A (recommended), option B, or a
-specified revision. This is the only active decision checkpoint. Settling
-this does not settle file resolution or the old epic's disposition.
+Resolved by D-5: profile A, with no exceptions. File resolution and the old
+epic's disposition are not settled by this answer.
 
 ### Q-2. How does content loading replace filesystem and package access?
 
@@ -215,6 +253,14 @@ Settle modules, data and textures scoped to game/mod content roots, module
 identity/cache/cycles, cross-mod access, root/path and symlink handling,
 failure attribution and when loading is allowed. No engine API spelling or
 search/override policy is decided yet.
+
+#### Q-2a. Explicit content-root references or one merged override namespace?
+
+The only active checkpoint: P-2 option A (recommended, explicit roots and
+cross-root references) or B (merged namespace resolved by mod order), or an
+owner-specified revision. The remaining Q-2 choices wait; do not treat an
+answer about addressing as approval of cache, lifecycle or path-resolution
+details.
 
 ### Q-3. What is the generic executable's boot and session contract?
 
