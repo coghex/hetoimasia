@@ -9,7 +9,7 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current pass records direction and the content-version checkpoint; it is
+The current pass records direction and the content-symlink checkpoint; it is
 not an approved specification or authority to implement or file issues.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
@@ -319,6 +319,37 @@ be preloaded or a new session to load it. Runtime loading supports ordinary
 Lua-authored game progression without that restriction. Loading, boot and
 service integration slices are affected; their boundaries remain undefined.
 
+### D-10. Fingerprint content and fail changed loads for now
+
+Owner answer, **2026-10-21 15:13:05 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> fingerprint and fail is fine for now, but hotswapping scripts is something i wanted to look into
+
+Authenticated relay: `het-manager`, message `9szibrd3bzej6rvwmq73nnrx8s`,
+posted **2026-10-21 15:13:05.866 UTC** in `#het-luafirst`, replying to Q-2e
+message `xr83f6qwknt8vtqmjjre5gnqus`. The options presented were startup
+fingerprinting with changed-load failure, versus an immutable content snapshot;
+deliberate development hot reload was explicitly left undecided.
+
+For now, pin content paths/fingerprints at startup and verify the bytes used
+on each later load. A changed or missing file produces an attributed
+content-changed failure instead of silently entering the running session;
+new paths cannot silently extend its pinned inventory. Already loaded content
+remains original. Restarting establishes the content version for the next run.
+This does not undo D-9: loading, decoding and upload remain demand-driven.
+
+The initial contract avoids retaining a private copy of every content byte,
+at the cost of inventory/fingerprint work and a failed load if source content
+changes. The concrete inventory preparation and bounded storage mechanism,
+and how loading failures affect the session, still need specification.
+The immutable-snapshot alternative is not selected for this initial contract.
+
+The second part of the owner's answer is **an interest to investigate, not an
+approved hot-swapping feature or a permanent exclusion**. Q-10 preserves it
+separately. D-7's once-per-VM imports and this version check remain the current
+contract until an explicit replacement/reload protocol is designed and approved.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -358,35 +389,34 @@ do not yet implement these content services.
 
 ### P-6. Pin content versions and refuse changed bytes on a later load
 
-**Unapproved; active checkpoint Q-2e.** Recommended option A pins the session's
-content inventory and fingerprints at startup. Each later load verifies the
-exact bytes it will use against that inventory before exposing or executing
-them. A changed, removed or newly added path cannot silently change the
-session's content: its load fails with an attributed content-version error.
-Already loaded objects remain their original versions. Editing files for the
-next run is allowed; restarting establishes a new inventory.
+Accepted for now by D-10; retain this proposal ID as history. An author editing
+an unvisited room's script must restart before that changed file can load.
+Q-10 separately preserves the owner's interest in deliberate script hot-swapping.
 
-For example, the author edits an unvisited room's script while playing. On
-entering that room, A reports the version mismatch instead of running the new
-script in the old session. This preserves an explicit content identity for
-D-23 without retaining a private copy of every content byte. It requires
-inventory/fingerprint work, potentially reading all content at startup or
-using a prepared manifest; the preparation and bounded storage mechanism
-still need specification. Loading and decoding can remain on demand under D-9.
+### P-7. Refuse symbolic links inside content roots
 
-Alternative B retains a private immutable snapshot of the session's content
-bytes, in engine-owned storage, and loads from it. Editing or deleting the
-original room file then leaves the running session able to load the original
-version. This avoids the changed-file failure but adds snapshot preparation,
-storage and cleanup, potentially covering an entire game's content.
+**Unapproved; active checkpoint Q-2f.** Recommend option A: content entries
+are ordinary files and directories, with no symbolic links inside a registered
+root. Inventory construction refuses a symlink with the root and offending
+path, and later reads cannot follow a link introduced after inventory creation.
+An author copies shared content into the root or references its separately
+enabled root explicitly under D-6, rather than linking across directories.
 
-Both options make file edits take effect in a new session, not through an
-implicit live reload; neither changes D-7's once-per-VM evaluation. A is
-recommended as the smaller initial contract for fixed-content sessions.
-This affects boot/content identity, loading and deterministic qualification.
-It does not decide how a load failure affects its instance or session, the
-cache policy for decoded/GPU resources, or whether an explicit hot-reload
-feature belongs in a later arc. No content-version policy is approved yet.
+Alternative B permits symbolic links only when their resolved target stays
+within the same registered root. It still refuses links escaping that root,
+including links into another enabled root: those need D-6's explicit reference.
+It must also resolve link cycles and aliases consistently with D-7's module
+identity, and prevent a changed link from redirecting a later read outside the
+root. Exact alias identity would need to be settled before implementation.
+
+For example, a `textures/shared` symlink to a directory inside the same root
+is refused by A and could be accepted by B; one leading outside the root is
+refused by both. A is recommended for a smaller, predictable content resolver
+and portable content layout, at the cost of losing in-root symlink convenience.
+This addresses links within a root, not how the launcher resolves the owner's
+chosen root directory. Root registration and logical path normalization still
+need a concrete contract. Content inventory/resolution slices are affected;
+none is defined yet.
 
 ## Open questions
 
@@ -401,8 +431,8 @@ Settle modules, data and textures scoped to game/mod content roots, module
 identity/cache/cycles, cross-mod access, root/path and symlink handling,
 failure attribution and when loading is allowed. D-6 settles explicit root
 addressing, D-7 module reuse/cycle/failure behavior, D-8 the top-level
-effect boundary and D-9 runtime loading. Engine API spelling and remaining
-loader behavior are open.
+effect boundary, D-9 runtime loading and D-10 content-version checks for now.
+Engine API spelling and remaining loader behavior are open.
 
 #### Q-2a. Explicit content-root references or one merged override namespace?
 
@@ -431,11 +461,16 @@ failures remain separate questions.
 
 #### Q-2e. What happens if content files change during a session?
 
-The only active checkpoint: P-6 option A (recommended, pin inventory and
-fingerprints; reject changed bytes when loaded) or B (retain immutable content
-bytes so later loads still use the old version), or an owner-specified revision.
-Both defer edits to the next session without implicit hot reload. The concrete
-inventory/snapshot mechanism and failure escalation are not settled yet.
+Resolved for now by D-10: fingerprint at startup and fail later changed loads;
+restart to use edits. The concrete inventory mechanism and failure escalation
+remain open. Script hot-swapping is separately recorded in Q-10, not approved.
+
+#### Q-2f. Should content roots allow internal symbolic links?
+
+The only active checkpoint: P-7 option A (recommended, refuse symbolic links
+inside roots) or B (allow links only within the same root, with further alias
+rules), or an owner-specified revision. Neither option allows a link to bypass
+explicit roots. Root registration and logical path grammar remain to settle.
 
 ### Q-3. What is the generic executable's boot and session contract?
 
@@ -455,7 +490,8 @@ is fixed. Trust does not itself define these behaviors.
 Settle entities/components versus tables/schemas, validation, stable identity,
 read visibility while staging, atomic tick commit, bounded capacity and
 failure. Carry D-23 and D-47/D-48's exact guarantees into this store. Settle
-whether saves, schema migration and hot reload are excluded or included;
+whether saves and schema migration are excluded or included; Q-10 separately
+records the owner's interest in script hot-swapping;
 game-specific save semantics remain game-owned under the existing rules.
 
 ### Q-6. Which services and UI behavior does Lua drive in this arc?
@@ -488,6 +524,22 @@ filtered library, a window and a texture; then input, state, mods and UI.
 Confirm this order and split it into one-PR outcomes only after the dependent
 choices above are settled. Identify verification, compatibility, persistence,
 migration and deliberate deferrals for each affected slice before readiness.
+
+### Q-10. Investigate deliberate script hot-swapping
+
+Owner interest expressed in the **2026-10-21 15:13:05 UTC** answer quoted in
+D-10, verified relay `9szibrd3bzej6rvwmq73nnrx8s`: the owner wants to look
+into hot-swapping scripts. This is an open design interest, not approval of
+implementation, silent reload, automatic file watching or a chosen delivery arc.
+Do not erase it by interpreting "for now" as a permanent restart-only policy.
+
+A later focused discussion must settle development-only versus ordinary
+runtime use, explicit activation, the safe point for replacement, old closures
+and shared exports, instance-state migration, lease/resource ownership,
+failure recovery and the deterministic/replay implications. That discussion
+must explicitly reconcile D-7/D-10 where it changes them. Its scope and timing
+remain an owner decision before the final delivery plan; no slice is created
+merely from this interest.
 
 ## Verification strategy
 
