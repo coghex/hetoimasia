@@ -8,7 +8,7 @@
 -- work for the presentation engine, not for a queue, so @vkDeviceWaitIdle@ can
 -- return @VK_SUCCESS@ with a present still outstanding. A teardown that ran
 -- every release anyway would be the device-idle fallback
--- @docs/vulkan_backend_design.md@ P-12 and Q-2 forbid.
+-- @docs/archive/vulkan_backend_design.md@ P-12 and Q-2 forbid.
 --
 -- So teardown asks this module instead, and this module is pure: it decides
 -- from the native effects and results the run recorded and from nothing else.

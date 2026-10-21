@@ -9,6 +9,7 @@
     "*.md",
     ".editorconfig",
     ".gitignore",
+    ".ignore",
     "LICENSE",
     "tools/KANBAN-LICENSE",
     "docs/evidence/gpu_2d/*.png"

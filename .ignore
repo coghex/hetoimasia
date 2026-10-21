@@ -1,0 +1,10 @@
+# Hidden from search, kept for tools and history (ripgrep and fd read this file; git does not).
+# docs/archive/ is history; the rest is read by tools or tests at these paths. See AGENTS.md.
+docs/archive/
+docs/evidence/
+docs/guide/*
+!docs/guide/CURSOR.md
+docs/project_review/
+docs/project_review_*.md
+docs/vulkan/
+docs/vulkan_compatibility_record.md

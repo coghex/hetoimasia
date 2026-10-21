@@ -351,8 +351,8 @@ test-suite native-tests
 -- chooses the binding's call safety. Here VMA is the copy the pinned Hackage
 -- `VulkanMemoryAllocator` package compiles, reaching this suite alone. It is
 -- linked with the threaded runtime the engine uses. See
--- probe/allocator-parity/README.md, docs/gpu_vma_qualification_record.md and
--- docs/gpu_allocator_parity_record.md.
+-- probe/allocator-parity/README.md, docs/archive/gpu_vma_qualification_record.md and
+-- docs/archive/gpu_allocator_parity_record.md.
 test-suite allocator-parity-probe
     import: language
     type: exitcode-stdio-1.0

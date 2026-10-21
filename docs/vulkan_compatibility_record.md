@@ -1,6 +1,6 @@
 # The VK-2 native Vulkan compatibility record
 
-This is the answer to [Q-2](vulkan_backend_design.md#q-2-what-compatibility-and-completion-contract-should-the-backend-require),
+This is the answer to [Q-2](archive/vulkan_backend_design.md#q-2-what-compatibility-and-completion-contract-should-the-backend-require),
 the deliberately open evidence gate of the Vulkan backend design: which runtime
 profile this project may require, on which loader and driver, with which
 completion and abandonment behaviour, on both selected platforms. It is the
