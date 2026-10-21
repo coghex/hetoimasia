@@ -890,6 +890,26 @@ quest-state map. These are examples, not prescribed game component schemas
 or API spelling. Exact limits, reference lifetime, transaction rejection policy
 and canonical/query ordering remain open.
 
+### D-32. Register component schemas at gameplay init and freeze for the session
+
+Owner answer, **2026-10-21 17:34:31 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: register at init (Rec.)
+
+Authenticated relay: `het-manager`, message `6pekwzn45z2s2878vx8jahc3g2`,
+posted **2026-10-21 17:34:31.873 UTC** in `#het-luafirst`, replying to Q-5c
+message `5g3a3ucwjh9qwtdbiaj3uw846a`.
+
+P-28 option A, including its shared rules, is accepted: the game's and mods'
+gameplay init hooks register namespaced component types in D-25 order; freeze
+the catalog before the first published state. Registration derives its namespace
+from the owning instance; duplicate identities and invalid schemas fail boot
+without partial registration. Later content uses known types; adding a type
+requires a new session. Presentation cannot register authoritative schemas.
+Value-write permissions, concrete limits and game-extension conflicts remain
+separate decisions.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -1868,7 +1888,7 @@ registration remain later contracts.
 
 ### P-28. Register owned component schemas during gameplay init and then freeze
 
-**Unapproved; active checkpoint Q-5c.** Recommend A: the game gameplay root
+**Option A accepted by D-32.** The game gameplay root
 and each gameplay mod instance register component schemas from their finite
 init hooks, in D-25's root-first/dependency order. Module top level may define
 plain schema-description tables for later use, but cannot register them
@@ -1919,6 +1939,56 @@ engine-owned validated component data, and D-8 reserves effects for hooks.
 The current host validates binding schemas separately, but has no generic
 state-schema registry. This proposal requires new store registration, phase
 checks, bounded validation and immutable schema publication.
+
+### P-29. Gameplay reads see the current tick's staged changes
+
+**Unapproved; active checkpoint Q-5d.** Recommend A: one engine-owned working
+state for the tick, shared by gameplay instances. Each successful state mutation
+updates that working state immediately; later gameplay reads see it, including
+reads by the writer and by other game/mod hooks that execute afterward. For
+example, reading health 10, writing health 9 and reading again returns 9. A
+later mod also reads 9, unless intervening gameplay has changed it again.
+Creation, component attachment/removal and deletion follow the same visibility
+rule; their identity/reference validity rules still need separate decisions.
+
+The working state remains private to gameplay until the engine accepts the
+whole tick. UI reads only the last committed snapshot and cannot see a half
+tick. Failure that rejects the tick discards its state changes and retains the
+last good published world (D-19/D-26). This does not undo arbitrary Lua table
+changes, logging or resource effects; shared Lua state is one reason a failed
+gameplay domain stops rather than resuming after state rollback.
+
+Reads return copied values, not writable Lua aliases into engine storage;
+editing a returned table changes nothing until an explicit state write. Reads
+made later can see newer staged values, but copies already returned do not
+change behind the caller's back. This extends D-31's copied-value boundary.
+No physical full-world copy per tick or particular storage layout is selected.
+
+Alternative B keeps a fixed gameplay read view for the tick, with writes queued
+for commit. In the example, the second read and a later mod still see health
+10; the write of 9 remains pending. This resembles the current lua-domains
+sample's staged moves. It makes reads independent of earlier staged writes,
+but authors must retain pending values themselves, and read/modify/write
+operations can unintentionally replace one another at commit. B also needs a
+separate rule for using entities created in the pending batch.
+
+A is recommended for ordinary sequential Lua rules and game extension hooks:
+an accepted change is visible to the next operation. Its cost is that execution
+order becomes part of gameplay behavior, including what a mod observes. Both
+choices still need an explicit deterministic execution/input order, mutation
+and conflict rules, bounded storage, and the prior Lua D-47/D-48 completion and
+failure-accounting fences before publication. This choice does not approve
+wall-clock-dependent ordering or treating scheduler quiescence as successful
+tick completion. Whether invocations may suspend across future ticks, how
+initial state is built, and what a rejected individual write does are subsequent
+checkpoints; no per-hook transaction or automatic rollback is implied.
+
+Evidence: `samples/lua-domains/README.md` describes a private candidate, a
+staged batch invisible even to gameplay reads, and explicit completion/failure
+accounting before commit. A deliberately changes that sample's read visibility
+for the new generic store while preserving private staging and atomic external
+publication. It requires store read/write bindings and tick ownership work;
+it is not claimed as existing Lua host behavior. Delivery slices remain unset.
 
 ## Open questions
 
@@ -2120,12 +2190,17 @@ handling and digest/query ordering follow separately.
 
 #### Q-5c. Freeze the schema catalog after init or permit runtime additions?
 
-The only active checkpoint: P-28 option A (recommended, register namespaced
-schemas during gameplay init, then freeze) or B (also allow tick-committed
-new types later), or an owner-specified revision. Both forbid duplicate or
-foreign-namespace registration and changing existing types; invalid startup
-registration fails boot. Value-write permissions and extension conflicts remain
-separate from schema registration ownership.
+Resolved by D-32: register namespaced schemas during gameplay init, then freeze.
+Runtime loads use existing types; a new type needs a new session. Value-write
+permissions and extension conflicts remain separate from schema ownership.
+
+#### Q-5d. Do gameplay reads see earlier writes in the same tick?
+
+The only active checkpoint: P-29 option A (recommended, shared working state
+with immediate visibility to later gameplay reads) or B (fixed read view and
+writes queued for commit), or an owner-specified revision. UI sees committed
+state in both. Exact execution/conflict order, cross-tick suspension, initial
+state construction and individual-write rejection policy follow separately.
 
 ### Q-6. Which services and UI behavior does Lua drive in this arc?
 
