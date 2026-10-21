@@ -1053,6 +1053,29 @@ entities others need. Neither access model was described as hostile-code
 containment. Exact mutations, phase rules and overlapping-write semantics
 remain separate checkpoints.
 
+### D-39. Write whole component values
+
+Owner answer, **2026-10-21 19:00:22 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: whole components (Rec.)
+
+Authenticated relay: `het-manager`, message `sgsmh47fxw78gvk6n9n4af3mpn`,
+posted **2026-10-21 19:00:23.061 UTC** in `#het-luafirst`, replying to Q-5j
+message `79t6ab4zbkhsi778hpxhgtb63w`.
+
+P-35 option A is accepted: read a copy, edit in Lua and explicitly submit a
+whole component value. Attachment supplies the full initial value; replacement
+validates/copies atomically without merging, diffing or nested setters. Later
+complete replacements determine the resulting value in D-34 execution order;
+there is no implicit stale-version precondition.
+
+The manager presented the armour 3-to-2 stale-copy example, the need to re-read
+after yielding and use an uninterrupted read/edit/write sequence when current
+values matter, and the full copy/validation cost for large components. Smaller
+components were offered as an authoring option, not a physical storage mandate
+or performance guarantee. Exact presence rules and signatures remain open.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -2447,7 +2470,7 @@ slices remain unset.
 
 ### P-35. Write complete component values rather than nested mutation paths
 
-**Unapproved; active checkpoint Q-5j.** Recommend A: attaching a component
+**Option A accepted by D-39.** Attaching a component
 supplies its complete initial value; replacing an existing component supplies
 its complete new value. Lua reads a copied component, edits that local copy
 and submits it explicitly. The engine validates/copies the whole submitted
@@ -2500,6 +2523,68 @@ component mutation interface. D-31 establishes bounded nested values and
 D-33 establishes copied reads and explicit writes. Either option adds store
 bindings; B adds a path/edit language beyond whole-value validation. No
 delivery slices are selected yet.
+
+### P-36. Queries return bounded, ordered copies of matching entity references
+
+**Unapproved; active checkpoint Q-5k.** Recommend A: a query names a set of
+required component types and returns a dense copied list of entity references
+that have all of them when the call executes. An empty required set selects
+all live entities. Return each matching entity once, in the engine's stable
+total order of entity identities, never hash/storage traversal order. The
+concrete ID representation and ordering encoding remain to be specified with
+identity allocation. Query syntax is illustrative here; no Lua predicate
+callback, joins, field-value expression language or sorted-by-field API is
+included. Lua can read values and apply further game-specific filtering.
+
+The list fixes membership at the query call; it does not freeze component
+values or keep entities alive. New matches are absent until a new query.
+Removed entities/components do not rewrite an already-returned list. For
+example, querying two NPCs yields their two references; creating a third does
+not add it, and deleting the second leaves its now-missing reference in that
+list. Before acting on an entry whose existence/components may have changed,
+Lua uses D-37's absence checks. Component reads observe the then-current
+working state under D-33, and copies kept across yields can be stale.
+
+Gameplay queries run against the current working state. Presentation queries
+use its coherent committed view; they do not mix gameplay's staged values into
+UI reads. How a presentation invocation acquires/refreshes that view remains
+part of the snapshot API contract. The returned list is ordinary copied Lua
+data, not a live iterator, store lock or engine resource that needs closing.
+
+Query input/output and scanning work must be bounded by configured store/read
+limits, whose values follow with the budget contract. These are deterministic
+count/size/work bounds, not elapsed-time cutoffs. If the complete result
+cannot fit the allowed query/read budget, return a structured read refusal
+with no partial list; never silently truncate, choose an arbitrary subset or
+pretend there were no matches. A valid query with no matches returns an empty
+list. A read-budget refusal alone does not fail a gameplay tick: Lua may handle
+it without any state having changed. This does not weaken D-36 for mutations
+or turn engine failures into ordinary absence. Exact malformed-query errors
+and result spelling remain part of the binding contract.
+
+Alternative B adds a paged query cursor that freezes the matching ID set/order
+and returns it in bounded pages. Like A, this need not freeze component values
+or prevent deletion, and later additions do not join that existing result.
+B reduces the Lua allocation needed at once for a large result, but still must
+bound and retain engine-side query state, define cursor ownership/expiry and
+cleanup, and settle resumption across ticks. It does not make arbitrarily large
+queries free. Choosing B requires those cursor contracts before approval of
+an API; neither option selects a live, mutation-sensitive traversal.
+
+A is recommended as the first query surface because fixed ordered membership
+is easy to reason about while modifying entities, and requires no new retained
+cursor lifetime. Its costs are collecting/copying the entire matching reference
+list and refusing results beyond the read budget. Component values are read
+separately, so this does not copy every matching component into the query result.
+Entity indexes and physical query implementation remain implementation choices;
+there is no performance claim. Canonical map iteration and digest encoding are
+separate deterministic-data contracts.
+
+Evidence: D-30 selected entity/component presence queries but left order/bounds
+open. The lua-domains sample enumerates its fixed entity world by index; it has
+no generic schema query or paged cursor. This proposal adds that missing store
+surface while using D-33/D-37's copied reads and non-owning identity rules.
+Delivery slices remain unset.
 
 ## Open questions
 
@@ -2745,11 +2830,17 @@ restrict value writes; schema validity does not prove game-rule correctness.
 
 #### Q-5j. Whole-component replacement or typed field/container edits?
 
-The only active checkpoint: P-35 option A (recommended, complete component
-values with no implicit merging/version check) or B (also design field/list/map
-mutation operations now), or an owner-specified revision. Both preserve D-34's
-ordered effects. A costs whole-value copying and requires authors to avoid
-writing stale copies over intervening changes.
+Resolved by D-39: complete component values with no implicit merge/version
+check or nested edits. Authors bear whole-value copy/validation costs and must
+avoid writing stale copies over intervening changes.
+
+#### Q-5k. Copied entity-query lists or retained paged query cursors?
+
+The only active checkpoint: P-36 option A (recommended, complete bounded lists
+with fixed membership and stable identity order) or B (design paged cursors for
+the same fixed membership), or an owner-specified revision. Component values
+remain separate reads; references do not retain targets. A returns a structured
+read refusal rather than truncating a result that exceeds its budget.
 
 ### Q-6. Which services and UI behavior does Lua drive in this arc?
 
