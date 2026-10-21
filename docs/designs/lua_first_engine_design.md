@@ -9,7 +9,7 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current pass records direction and the content-symlink checkpoint; it is
+The current pass records direction and the optional-content checkpoint; it is
 not an approved specification or authority to implement or file issues.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
@@ -350,6 +350,28 @@ approved hot-swapping feature or a permanent exclusion**. Q-10 preserves it
 separately. D-7's once-per-VM imports and this version check remain the current
 contract until an explicit replacement/reload protocol is designed and approved.
 
+### D-11. Refuse symbolic links inside content roots
+
+Owner answer, **2026-10-21 15:18:24 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: no symlinks (Rec.)
+
+Authenticated relay: `het-manager`, message `rafks3fkpi5q783c4u6yqnqzsw`,
+posted **2026-10-21 15:18:24.407 UTC** in `#het-luafirst`, replying to Q-2f
+message `2ciabpjhnrqnkvxsdynpi9c72n`.
+
+Content roots contain ordinary files and directories only. The startup scan
+rejects symbolic links with the offending root/path, and a later link is never
+followed. Shared content is copied or referenced through its own enabled root
+under D-6. This keeps the initial resolver and module identities straightforward
+at the cost of symlink convenience.
+
+Rejected: permitting links whose targets remain inside the same content root.
+Launcher resolution of the owner's selected root directory is separate and
+remains open, as do the concrete logical path and root-registration rules.
+The decision affects content inventory and resolution; no slice is defined yet.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -395,28 +417,44 @@ Q-10 separately preserves the owner's interest in deliberate script hot-swapping
 
 ### P-7. Refuse symbolic links inside content roots
 
-**Unapproved; active checkpoint Q-2f.** Recommend option A: content entries
-are ordinary files and directories, with no symbolic links inside a registered
-root. Inventory construction refuses a symlink with the root and offending
-path, and later reads cannot follow a link introduced after inventory creation.
-An author copies shared content into the root or references its separately
-enabled root explicitly under D-6, rather than linking across directories.
+Accepted by D-11; retain this proposal ID as history. Root registration and
+logical path normalization remain to be specified.
 
-Alternative B permits symbolic links only when their resolved target stays
-within the same registered root. It still refuses links escaping that root,
-including links into another enabled root: those need D-6's explicit reference.
-It must also resolve link cycles and aliases consistently with D-7's module
-identity, and prevent a changed link from redirecting a later read outside the
-root. Exact alias identity would need to be settled before implementation.
+### P-8. Make content required by default, with explicit optional data/textures
 
-For example, a `textures/shared` symlink to a directory inside the same root
-is refused by A and could be accepted by B; one leading outside the root is
-refused by both. A is recommended for a smaller, predictable content resolver
-and portable content layout, at the cost of losing in-root symlink convenience.
-This addresses links within a root, not how the launcher resolves the owner's
-chosen root directory. Root registration and logical path normalization still
-need a concrete contract. Content inventory/resolution slices are affected;
-none is defined yet.
+**Unapproved; active checkpoint Q-2g.** Recommend option A: a normal load is
+required. If an accepted load cannot produce valid content, its owning
+lifecycle operation fails; failed boot cannot report success and failed
+gameplay retains the last good committed state under V-4/D-3. Exact boot,
+UI and session escalation are settled in Q-3/Q-5, not inferred here.
+
+Lua may explicitly request optional data or textures. Expected content
+failures then return structured failure data, naming the requesting content,
+target root/path, operation and reason, so Lua can choose a fallback. For
+example, a missing optional portrait can use an already loaded default image;
+a required level definition cannot silently vanish. A content-changed result
+still refuses the changed bytes under D-10; optionality does not grant reload.
+No engine-provided placeholder or automatic retry is implied.
+
+Module imports remain required in this proposal: syntax/evaluation faults
+and failed dependencies are not downgraded to optional asset failures. D-7
+continues to retain a failed import in that VM. Unexpected provider-code or
+engine cleanup failures retain their existing fatal authority, regardless of
+optional status. The existing request layer already distinguishes expected
+provider failure replies from raised host/cleanup failures
+(`packages/scripting-lua/README.md`, "The guard, and what a failure is").
+
+Alternative B makes all content required, with no optional data/texture load
+operation in this arc. It reduces the API but requires every referenced
+portrait or cosmetic asset to be present and valid, with no Lua-selected
+fallback after a failed load. A is recommended so the game can distinguish
+essential state from optional presentation/content explicitly.
+
+This affects loading, Lua results and boot/session failure integration.
+It does not settle result syntax, admission-full/cancellation handling,
+resource-cache behavior or UI-instance escalation. Logical gameplay results,
+including optional failures, still arrive at assigned ticks under D-9;
+wall-clock completion must not decide authoritative behavior.
 
 ## Open questions
 
@@ -431,8 +469,8 @@ Settle modules, data and textures scoped to game/mod content roots, module
 identity/cache/cycles, cross-mod access, root/path and symlink handling,
 failure attribution and when loading is allowed. D-6 settles explicit root
 addressing, D-7 module reuse/cycle/failure behavior, D-8 the top-level
-effect boundary, D-9 runtime loading and D-10 content-version checks for now.
-Engine API spelling and remaining loader behavior are open.
+effect boundary, D-9 runtime loading, D-10 content-version checks for now and
+D-11 the symlink rule. Engine API spelling and remaining loader behavior are open.
 
 #### Q-2a. Explicit content-root references or one merged override namespace?
 
@@ -467,10 +505,15 @@ remain open. Script hot-swapping is separately recorded in Q-10, not approved.
 
 #### Q-2f. Should content roots allow internal symbolic links?
 
-The only active checkpoint: P-7 option A (recommended, refuse symbolic links
-inside roots) or B (allow links only within the same root, with further alias
-rules), or an owner-specified revision. Neither option allows a link to bypass
-explicit roots. Root registration and logical path grammar remain to settle.
+Resolved by D-11: no symbolic links inside content roots. Launcher resolution
+of the selected root, root registration and logical path grammar remain open.
+
+#### Q-2g. Can Lua explicitly handle an optional data/texture load failure?
+
+The only active checkpoint: P-8 option A (recommended, required by default,
+explicit optional data/textures with structured failures; modules required)
+or B (all content required), or an owner-specified revision. Neither weakens
+host/cleanup failure authority or permits changed bytes to enter the session.
 
 ### Q-3. What is the generic executable's boot and session contract?
 
