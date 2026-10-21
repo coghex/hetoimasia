@@ -383,7 +383,7 @@ Guide is advisory and does not replace Kanban approval or project-review records
   operation; no assumed privileged install or paid signing account. Never weaken
   isolation to convert an inconclusive proof into support.
 - **LUA-15's macOS verdict (#148) is `inconclusive`**, recorded in
-  [docs/macos_confinement_verdict.md](docs/archive/macos_confinement_verdict.md) with
+  [docs/archive/macos_confinement_verdict.md](docs/archive/macos_confinement_verdict.md) with
   its probe at `packages/scripting-lua/macos/`. The retained experiments ran
   on macOS 26.6 (`25G5065a`, arm64, Command Line Tools, linker ad-hoc signature,
   no entitlement or privilege) — per-instance SBPL confinement, all four denied
