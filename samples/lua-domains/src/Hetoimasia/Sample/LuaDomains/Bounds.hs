@@ -13,11 +13,13 @@ module Hetoimasia.Sample.LuaDomains.Bounds
   , maxEntities
   , maxDeltaLimit
   , maxSessionTasks
+  , maxSessionTicks
   , positionLimit
   , randomLimit
   ) where
 
 import Data.Int (Int64)
+import Data.Word (Word64)
 
 -- | The most entities a world may have (requirement 4).
 maxEntities ∷ Int
@@ -30,6 +32,11 @@ maxDeltaLimit = 1000
 -- | The most tasks a configuration may let the session hold unobserved: the gameplay owner's scheduling is made from it.
 maxSessionTasks ∷ Int
 maxSessionTasks = 16
+
+-- | The most ticks a finite session may be asked for: the executable refuses more, and the digest trace and the input
+-- log are bounded by it (#500 requirements 2, 3 and 7).
+maxSessionTicks ∷ Word64
+maxSessionTicks = 100000
 
 -- | A position is clamped to the range from the negative of this to this, so that no
 -- sequence of moves can overflow a 64-bit integer.

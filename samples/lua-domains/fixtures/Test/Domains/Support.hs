@@ -29,6 +29,7 @@ module Test.Domains.Support
   , holdAt
   , releaseGate
   , fxMarks
+  , fxStamps
   , luaLines
     -- * Reading the session
   , awaitUpdates
@@ -46,6 +47,7 @@ module Test.Domains.Support
   , withReleased
   , stepCommitted
   , newSharedFor
+  , newLogOnlyShared
   , offer
   , awaitClosed
   , balanced
@@ -61,7 +63,7 @@ module Test.Domains.Support
 
 import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, myThreadId, throwTo)
 import Control.Concurrent.MVar (MVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, tryPutMVar, tryReadMVar, withMVar)
-import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, catch, finally, fromException, mask, onException, throwIO, try)
+import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, catch, evaluate, finally, fromException, mask, onException, throwIO, try)
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Monad (void, when)
 import Data.ByteString (ByteString)
@@ -70,6 +72,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Text (Text)
+import GHC.Clock (getMonotonicTimeNSec)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Data.Word (Word64)
@@ -102,7 +105,7 @@ import Hetoimasia.Scripting.Lua.Lease (newLeases)
 import Hetoimasia.Scripting.Lua.Lending (newLending)
 import Hetoimasia.Scripting.Lua.Registration (Namespace, namespace, stateOperation)
 import Hetoimasia.Scripting.Lua.Scheduler (TimerBackend (TimerBackend))
-import Hetoimasia.Scripting.Lua.Value (Schema (SBoolean, SText), Value (VBoolean, VText))
+import Hetoimasia.Scripting.Lua.Value (Schema (SBoolean, SInteger, SText), Value (VBoolean, VInteger, VText))
 import Data.Maybe (isJust)
 import Numeric.Natural (Natural)
 import System.IO (stderr)
@@ -210,6 +213,7 @@ data Fx = Fx
   { fxLog ∷ TVar [Text]
   , fxMarksVar ∷ TVar [(Text, Int)]
   , fxGates ∷ IORef (Map Text Gate)
+  , fxStampsVar ∷ TVar [Word64]
   }
 
 data Gate = Gate
@@ -218,7 +222,7 @@ data Gate = Gate
   }
 
 newFx ∷ IO Fx
-newFx = Fx <$> newTVarIO [] <*> newTVarIO [] <*> newIORef Map.empty
+newFx = Fx <$> newTVarIO [] <*> newTVarIO [] <*> newIORef Map.empty <*> newTVarIO []
 
 gateFor ∷ Fx → Text → IO Gate
 gateFor fx name = do
@@ -243,6 +247,15 @@ fxNamespace fx shared =
           modifyTVar' (fxMarksVar fx) ((name, updates) :)
           pure []
         _ → pure []
+    , -- Busy work of a given size in the calling segment: a pure loop in Haskell whose cost is the count it is given and no
+      -- clock, so that segments of differing lengths are made without waiting for time to pass.
+      stateOperation "spin" [SInteger] [] $ \case
+        [VInteger n] → [] <$ evaluate (foldl' (+) 0 [1 .. max 0 (min 5000000 n)])
+        _ → pure []
+    , -- The monotonic clock's reading, kept: the probe's measure of when a script's update completed. Never a check's input.
+      stateOperation "stamp" [] [] $ \_ → do
+        now ← getMonotonicTimeNSec
+        [] <$ atomically (modifyTVar' (fxStampsVar fx) (now :))
     , stateOperation "released" [SText] [SBoolean] $ \case
         [VText name] → do
           gate ← gateFor fx name
@@ -283,6 +296,10 @@ awaitEntered fx name = gateFor fx name >>= bounded . readMVar . gateEntered
 -- | Let the segment held under this name go on. Harmless twice.
 releaseGate ∷ Fx → Text → IO ()
 releaseGate fx name = gateFor fx name >>= void . (`tryPutMVar` ()) . gateReleased
+
+-- | The clock readings @fx.stamp()@ kept, oldest first, in nanoseconds.
+fxStamps ∷ Fx → IO [Word64]
+fxStamps fx = reverse <$> readTVarIO (fxStampsVar fx)
 
 -- | The marks scripts kept, oldest first.
 fxMarks ∷ Fx → IO [(Text, Int)]
@@ -404,7 +421,14 @@ stepCommitted domains =
 
 -- | A shared state over these bounds, with leases of its own, for the examples that read a registration.
 newSharedFor ∷ Bounds → IO Shared
-newSharedFor bounds = do
+newSharedFor = newSharedMode False
+
+-- | A shared state whose intentions and controls come from an input log alone: every offer it is made is declined.
+newLogOnlyShared ∷ Bounds → IO Shared
+newLogOnlyShared = newSharedMode True
+
+newSharedMode ∷ Bool → Bounds → IO Shared
+newSharedMode logOnly bounds = do
   lending ← newLending
   leases ← newLeases lending (boundWorkspaces bounds)
   newShared
@@ -418,6 +442,7 @@ newSharedFor bounds = do
       , setupLeases = leases
       , setupAssignHook = pure ()
       , setupScenario = "normal"
+      , setupLogOnly = logOnly
       }
 
 -- | Offer one intention for this entity, carrying version zero, as the UI's binding does.

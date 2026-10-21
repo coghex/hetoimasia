@@ -93,7 +93,10 @@ spec = describe "the package and import boundary" $ do
         [ "base"
         , "bytestring"
         , "containers"
+        , "cryptohash-sha256"
         , "deepseq"
+        , "directory"
+        , "filepath"
         , "hetoimasia-foundation"
         , "hetoimasia-runtime"
         , "hetoimasia-scripting-lua"
@@ -142,6 +145,7 @@ spec = describe "the package and import boundary" $ do
       any
         (`isPrefixOf` name)
         [ "Control."
+        , "Crypto.Hash."
         , "Data."
         , "GHC."
         , "Language.Haskell.TH"

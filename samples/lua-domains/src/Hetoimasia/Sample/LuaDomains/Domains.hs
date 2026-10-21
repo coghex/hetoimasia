@@ -106,6 +106,8 @@ module Hetoimasia.Sample.LuaDomains.Domains
   , stopSession
   , runSession
   , SessionReport (..)
+  , ReplayOutcome (..)
+  , Feed
   , DomainsDefect (..)
   , admitGameplayTask
   , tellTask
@@ -119,8 +121,10 @@ module Hetoimasia.Sample.LuaDomains.Domains
 import Control.Concurrent (ThreadId, forkIOWithUnmask, myThreadId)
 import Control.Concurrent.STM
   ( STM
+  , TVar
   , atomically
   , modifyTVar'
+  , newTVarIO
   , readTVar
   , readTVarIO
   , retry
@@ -132,6 +136,7 @@ import Control.Exception
   , ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException
   , SomeException
+  , evaluate
   , finally
   , fromException
   , mask
@@ -142,13 +147,16 @@ import Control.Exception
   , try
   , tryWithContext
   )
-import Control.Monad (forM, forM_, join, unless, void, when)
+import Control.Monad (foldM_, forM, forM_, join, unless, void, when)
 import Data.ByteString (ByteString)
+import Data.Foldable (toList)
 import Data.IORef (readIORef, writeIORef)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Int (Int64)
 import qualified Data.List.NonEmpty as NonEmpty
-import Data.Maybe (catMaybes, isJust, isNothing, listToMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing, listToMaybe)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
@@ -177,8 +185,23 @@ import Hetoimasia.Runtime.Supervision
   )
 import Hetoimasia.Sample.LuaDomains.Bounds (Bounds (..), defaultBounds, validateBounds)
 import Hetoimasia.Sample.LuaDomains.Candidate (Candidate (..), beginCandidate, commit)
+import Hetoimasia.Sample.LuaDomains.Canonical (Digest, digestSnapshot)
+import Hetoimasia.Sample.LuaDomains.InputLog
+  ( ControlOp (..)
+  , InputLog
+  , RecordProblem
+  , Record (..)
+  , appendRecord
+  , byTick
+  , checkReplayable
+  , intentionOf
+  , logRecords
+  , maxRecords
+  , recorderLog
+  , ReplayProblem
+  )
 import Hetoimasia.Sample.LuaDomains.Intention (Dispositions (..), noDispositions)
-import Hetoimasia.Sample.LuaDomains.Queue (closeQueue, drain, nextUnstarted, reserved, seal, settle)
+import Hetoimasia.Sample.LuaDomains.Queue (AdmitAt (..), closeQueue, drain, nextUnstarted, reserved, seal, settle)
 import Hetoimasia.Sample.LuaDomains.Registration (gameplayNamespaces, sampleRegistration, uiNamespaces)
 import Hetoimasia.Sample.LuaDomains.Scenario (scriptedInputs)
 import Hetoimasia.Sample.LuaDomains.Scripts (facadeChunk, gameplayChunk, gameplayModule, gameplaySource, interfaceModule, interfaceSource)
@@ -201,11 +224,14 @@ import Hetoimasia.Sample.LuaDomains.Shared
   , UiNotes (..)
   , Watched (..)
   , abandonReceipts
+  , admitLogged
+  , appendTrace
   , assignControl
   , captureView
   , enterTaskAdmission
   , failSession
   , handOffTask
+  , instanceTriple
   , leaveTaskAdmission
   , newShared
   , publishInitial
@@ -222,9 +248,12 @@ import Hetoimasia.Sample.LuaDomains.Snapshot
   , failureMessageLimit
   )
 import Hetoimasia.Sample.LuaDomains.Tally
-  ( ControlCounts
+  ( ControlCounts (controlAbandoned)
   , Counts (..)
   , Workspaces
+  , bumpAnswer
+  , bumpOffered
+  , bumpSettled
   , countDiscarded'
   , countInvalidated'
   , countSettled
@@ -237,8 +266,10 @@ import Hetoimasia.Scripting.Lua.Instance
   , InstanceAdmission (..)
   , InstanceBounds (..)
   , InstanceConfig (..)
-  , InstanceControl (InstanceStop)
-  , InstanceControlAnswer (InstanceControlFull)
+  , ControlSlot (ControlSlot)
+  , InstanceControl (InstancePause, InstanceResume, InstanceStop)
+  , InstanceControlAnswer (..)
+  , InstanceControlReceipt
   , InstanceError (..)
   , InstanceFailure (..)
   , InstanceId
@@ -259,7 +290,9 @@ import Hetoimasia.Scripting.Lua.Instance
   , defaultInstanceConfig
   , inspectInstance
   , pollInstance
+  , pollInstanceControl
   , requestInstanceControl
+  , requestInstanceControlAt
   )
 import qualified Hetoimasia.Scripting.Lua.Instance as Instance (InstancePhase (Paused))
 import Hetoimasia.Scripting.Lua.Lease (newLeases)
@@ -268,7 +301,6 @@ import Hetoimasia.Scripting.Lua.Lifecycle
   ( GrantTarget (..)
   , GrantedOwner (GrantedEndpoint)
   , Permit (PermitControl, PermitInspect)
-  , instanceIdValue
   , lifecycleGrant
   )
 import Hetoimasia.Scripting.Lua.Owner
@@ -283,7 +315,6 @@ import Hetoimasia.Scripting.Lua.Owner
   , vmConfig
   )
 import Hetoimasia.Scripting.Lua.Registration (CapabilityType, Namespace, Registration, namespaceName)
-import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VRecord))
 import Hetoimasia.Scripting.Lua.Runtime (CallFault (BoundaryFailed), ExitRecord, LuaRuntime, newLuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
   ( AccountingWait (..)
@@ -322,7 +353,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
   , startScheduledOwner
   , ticketTask
   )
-import Hetoimasia.Scripting.Lua.Scheduler (TimerBackend, systemTimerBackend)
+import Hetoimasia.Scripting.Lua.Scheduler (ControlResult (..), TimerBackend, systemTimerBackend)
 
 -- | Where an extra namespace is exposed.
 data Where = InUi | InGameplay | InBoth
@@ -404,6 +435,14 @@ data DomainsConfig = DomainsConfig
   , configPace ∷ !(Word64 → IO ())
     -- ^ Run after each committed tick of 'runSession'. It paces a session in real time and takes
     -- no part in what a tick contains.
+  , configReplay ∷ !(Maybe InputLog)
+    -- ^ An input log the session takes its intentions and controls from, and from nothing else (#500 requirement 4): the
+    -- driver releases each record to the seam the UI's path uses, before the tick it is for has begun; the UI's offers are
+    -- declined and its control requests refused, before they take a place. A log that cannot be replayed under this
+    -- configuration is refused before anything starts ('ReplayRefused').
+  , configUiScenario ∷ !(Maybe Text)
+    -- ^ The scenario name the UI behavior reads, when it is not 'configScenario': a replay of a @pause@ log runs gameplay
+    -- as that scenario does and its UI as @normal@, which asks for no control of its own.
   }
 
 -- | The production configuration: the default bounds, session 1 at seed 1 for twenty ticks of ten
@@ -442,6 +481,8 @@ defaultConfig =
     , configPublishHook = const (pure ())
     , configUiSeesEnd = True
     , configPace = \_ → pure ()
+    , configReplay = Nothing
+    , configUiScenario = Nothing
     }
 
 -- | Ten milliseconds of logical time per tick.
@@ -492,6 +533,12 @@ data DomainsDefect
   | -- | A session ended with something pending, or with the ledger out of balance: the counters and
     -- what was pending.
     ConservationViolated !Counts !Int
+  | -- | The input log cannot be replayed under this configuration; decided before anything started, from the log, the
+    -- tick limit and the scenario (the first few problems).
+    ReplayRefused ![ReplayProblem]
+  | -- | A record the log holds and the checks before the start did not exclude was not admitted when the driver released
+    -- it, though the session had not ended: the tick and what was answered. A defect of the sample, never a log's.
+    ReplayNotAdmitted !Word64 !String
   deriving (Eq, Show)
 
 instance Exception DomainsDefect
@@ -514,6 +561,8 @@ data Domains = Domains
   , domainsExtras ∷ ![Started]
     -- ^ A test's extra instances on the gameplay owner.
   , domainsUi ∷ !Started
+  , domainsFeed ∷ !(Maybe Feed)
+    -- ^ The replay's records and what has become of them, when the session is a replay.
   }
 
 -- | How one owner ended.
@@ -591,6 +640,19 @@ startDomains ∷ (∀ x. IO x → IO x) → RuntimeControl → DomainsConfig →
 startDomains restore control config = do
   forM_ (NonEmpty.nonEmpty (validateBounds (configBounds config))) $ \problems →
     throwIO (BoundsRefused (map show (NonEmpty.toList problems)))
+  -- A finite session is made only if every record it can accept fits the input log: at most a tick's places and a tick's
+  -- pending controls, for each of its ticks. The log's bound is thereby the bound of every valid bounded session, and a log
+  -- never has to be cut short.
+  forM_ (configTicks config) $ \ticks →
+    let most = toInteger ticks * toInteger (boundPlaces (configBounds config) + boundPendingControls (configBounds config))
+     in when (most > toInteger maxRecords) $
+          throwIO (BoundsRefused ["a session of " <> show ticks <> " ticks can accept " <> show most <> " records, and an input log holds " <> show maxRecords])
+  -- A log that cannot be replayed is refused before anything starts, from what is decidable without running: the log, the
+  -- tick limit and the scenario's stop. What an execution does afterwards is not predicted.
+  forM_ (configReplay config) $ \replay →
+    forM_ (NonEmpty.nonEmpty (checkReplayable (configBounds config) (configTicks config) (configStopAfter config) replay)) $ \problems →
+      throwIO (ReplayRefused (NonEmpty.toList problems))
+  feed ← traverse newFeed (configReplay config)
   lending ← newLending
   leases ← newLeases lending (boundWorkspaces (configBounds config))
   shared ←
@@ -604,7 +666,8 @@ startDomains restore control config = do
         , setupLending = lending
         , setupLeases = leases
         , setupAssignHook = configAssignHook config
-        , setupScenario = configScenario config
+        , setupScenario = fromMaybe (configScenario config) (configUiScenario config)
+        , setupLogOnly = isJust (configReplay config)
         }
   runtime ← newLuaRuntime control
   let extensions = configExtensions config shared
@@ -646,7 +709,7 @@ startDomains restore control config = do
       Left failure → rollback restore uiOwner failure
       Right ui → do
         home ← myThreadId
-        pure (Domains home config shared control gameplay extras ui)
+        pure (Domains home config shared control gameplay extras ui feed)
   case outcome of
     Left failure → rollback restore gameplayOwner failure
     Right domains → do
@@ -929,9 +992,7 @@ rollback restore owner failure = do
 
 -- | An instance's identity as a script holds it: the runtime, the owner and the number.
 tidOf ∷ InstanceId → (Int64, Int64, Int64)
-tidOf identity = case instanceIdValue identity of
-  VRecord [("runtime", VInteger runtime), ("owner", VInteger owner), ("id", VInteger number)] → (runtime, owner, number)
-  _ → (0, 0, 0)
+tidOf = instanceTriple
 
 -- Waiting and stopping -----------------------------------------------------------------
 
@@ -1201,6 +1262,9 @@ stepTick domains = do
   if pending
     then maybe TickHalted TickFailed <$> publishEnding domains EndedByFailure
     else do
+      -- A replay releases the records of the tick that is the next unstarted one, here, before the tick begins and by the
+      -- driver alone: the log is the only source of what the tick will hold.
+      forM_ (domainsFeed domains) (releaseRecords domains)
       begun ← atomically $ do
         halted ← haltedNow shared
         if halted
@@ -1368,6 +1432,9 @@ commitTick domains tick candidate = do
     Left False → pure TickHalted
     Right snapshot → do
       prepared ← prepare snapshot
+      -- The digest of the state this step commits is made before the step, from the snapshot it publishes, and joins the
+      -- trace in the step's own transaction: a tick that does not commit adds nothing.
+      digest ← evaluate (digestSnapshot snapshot)
       configTickHook config BeforeCommitStep
       done ← atomically $ do
         halted ← haltedNow shared
@@ -1378,6 +1445,7 @@ commitTick domains tick candidate = do
           else do
             writeTVar (sharedCommitted shared) world
             writeTVar (sharedTick shared) Nothing
+            appendTrace shared digest
             settle (sharedQueue shared) tick
             modifyTVar' (sharedCounts shared) (countSettled (length (dispApplied dispositions)) (length (dispStale dispositions) + dispStaleOmitted dispositions))
             publisher ← publisherOf shared
@@ -1619,8 +1687,26 @@ data SessionReport = SessionReport
   , reportUiFailure ∷ !(Maybe SessionFailure)
   , reportRetirement ∷ !Retirement
   , reportEvidence ∷ !Evidence
+  , reportDigest ∷ !Digest
+    -- ^ The digest of the final published snapshot, status included: the state the session ended in. A failure or a stop
+    -- after the last committed tick changes it without adding or rewriting an entry of the trace.
+  , reportTrace ∷ ![Digest]
+    -- ^ The digest of the initial state and then of each committed tick, in tick order: a tick that did not commit adds
+    -- nothing, and a failed or stopped session's trace ends where its committed ticks end.
+  , reportRecorded ∷ !(Either RecordProblem InputLog)
+    -- ^ What the session accepted, as an input log, or why there is none: never a log that has lost a record.
+  , reportReplay ∷ !(Maybe ReplayOutcome)
+    -- ^ How many of a replayed log's records were released, when the session was a replay.
   }
   deriving (Show)
+
+-- | What a replay released: the records the log holds, and how many were admitted. A session that ends (a failure, a stop)
+-- before it reaches a record's tick leaves it unreleased; the replay is then not complete, and is never reported as one.
+data ReplayOutcome = ReplayOutcome
+  { replayRecords ∷ !Int
+  , replayFed ∷ !Int
+  }
+  deriving (Eq, Show)
 
 -- | Run a finite session: commit its ticks, pacing as the configuration says, until it ends: its last tick, a
 -- failure, or the stop the scenario asks for after a tick; then settle it (a stop, for the two that did not run
@@ -1648,8 +1734,10 @@ runSession domains = do
   retirement ← if stoppedEarly then stopSession domains else settleFinite domains
   -- Both owners have ended: what supervision committed of either is raised, and the statuses the evidence reads are its decisions.
   checkRuntime (domainsControl domains)
+  -- The controls a replay released are settled now that nothing can still settle one: read, or abandoned.
+  forM_ (domainsFeed domains) (finalizeReplayed domains)
   evidence ← cleanupEvidence domains
-  (counts, left, controls, updates, notes, uiFailure, final) ← atomically $ do
+  (counts, left, controls, updates, notes, uiFailure, final, trace, recorder) ← atomically $ do
     counts ← readTVar (sharedCounts shared)
     left ← reserved (sharedQueue shared)
     controls ← readTVar (sharedControls shared)
@@ -1658,10 +1746,149 @@ runSession domains = do
     uiFailure ← readTVar (sharedUiFailure shared)
     reader ← readerOf shared
     snapshot ← preparedValue . observedValue <$> readSnapshot reader
-    pure (counts, left, controls, updates, notes, uiFailure, snapshot)
+    held ← readTVar (sharedTrace shared)
+    recorded ← readTVar (sharedRecorder shared)
+    pure (counts, left, controls, updates, notes, uiFailure, snapshot, toList held, recorded)
   when (left /= 0 || countAccepted counts /= settledTotal counts) $
     throwIO (ConservationViolated counts left)
-  pure (SessionReport (configSession config) (configSeed config) (configScenario config) (snapTick final) (snapStatus final) counts controls updates notes uiFailure retirement evidence)
+  replayed ← traverse replayOutcome (domainsFeed domains)
+  pure
+    SessionReport
+      { reportSession = configSession config
+      , reportSeed = configSeed config
+      , reportScenario = configScenario config
+      , reportTicks = snapTick final
+      , reportStatus = snapStatus final
+      , reportCounts = counts
+      , reportControls = controls
+      , reportUiUpdates = updates
+      , reportUiNotes = notes
+      , reportUiFailure = uiFailure
+      , reportRetirement = retirement
+      , reportEvidence = evidence
+      , reportDigest = digestSnapshot final
+      , reportTrace = trace
+      , reportRecorded = recorderLog recorder
+      , reportReplay = replayed
+      }
+
+-- The replay ----------------------------------------------------------------------------
+
+-- | A replay's records, indexed by the tick each is for, and what has become of them. Its owner is the driver (the
+-- application thread): 'releaseRecords' writes it from 'stepTick', and 'runSession' reads it when the session is over. It
+-- lives as long as the session and holds no Lua value.
+data Feed = Feed
+  { feedRecords ∷ !(Map Word64 [Record])
+    -- ^ The log, by tick, each tick's controls first and then its intentions, in the order of their places.
+  , feedTotal ∷ !Int
+  , feedState ∷ !(TVar FeedState)
+  }
+
+data FeedState = FeedState
+  { feedReleased ∷ !Word64
+    -- ^ The last tick whose records were released: a tick is released once, when it is the next unstarted one.
+  , feedFed ∷ !Int
+    -- ^ The records admitted.
+  , feedReceipts ∷ ![(Int, InstanceControlReceipt)]
+    -- ^ The receipts of the controls admitted that have not yet been read, each with its number (how many records had been
+    -- released when it was): a receipt is read once, and counted and taken off in the transaction that follows the read.
+  }
+
+newFeed ∷ InputLog → IO Feed
+newFeed replay = Feed (byTick replay) (length (logRecords replay)) <$> newTVarIO (FeedState 0 0 [])
+
+-- | Release the records of the next unstarted tick, once, as the module header says: each intention through the seam the
+-- UI's path uses ('admitLogged'), each control through the owner's logical admission at its recorded place, before the
+-- tick begins. What the records of earlier ticks did is settled first. A session that no longer takes work (it failed or is
+-- being stopped) answers that it is closed, which ends the release quietly: that tick will not begin. Anything else that is
+-- not an admission is a defect, because everything decidable beforehand was checked before the session started.
+releaseRecords ∷ Domains → Feed → IO ()
+releaseRecords domains feed = do
+  settleReplayed domains feed
+  let shared = domainsShared domains
+      session = configSession (domainsConfig domains)
+  next ← atomically (nextUnstarted (sharedQueue shared))
+  before ← readTVarIO (feedState feed)
+  when (next > feedReleased before) $ do
+    -- The tick is claimed first: it is released once, and a release that is interrupted is never begun again from the
+    -- start, which would find the places it had already taken held.
+    atomically (modifyTVar' (feedState feed) (\state → state {feedReleased = next}))
+    foldM_ (release shared session next) True (Map.findWithDefault [] next (feedRecords feed))
+  where
+    release _ _ _ False _ = pure False
+    release shared session tick True record = case record of
+      RecordIntention {} → case intentionOf session record of
+        Nothing → pure False
+        Just (place, intention) → do
+          -- The admission, its count and its record, and the count of what the replay released, are one transaction.
+          answer ← atomically $ do
+            admitted ← admitLogged shared place intention
+            case admitted of
+              AdmittedAt _ → fed
+              _ → pure ()
+            pure admitted
+          case answer of
+            AdmittedAt _ → pure True
+            AtClosed → pure False
+            other → throwIO (ReplayNotAdmitted tick (show other))
+      RecordControl _ sequence' _ op →
+        -- The engine's acceptance and the session's record of it are not separated by anything that is interrupted: the
+        -- request never waits, and what follows it is one transaction, so a control the engine took is counted, recorded and
+        -- held for its receipt whatever happens next.
+        mask_ $ do
+          let request = case op of OpPause → InstancePause; OpResume → InstanceResume
+              gameplay = domainsGameplay domains
+          answer ← requestInstanceControlAt (scheduledEndpoint (startedOwner gameplay)) (startedInstance gameplay) request (ControlSlot tick sequence')
+          case answer of
+            InstanceControlAccepted receipt → do
+              atomically $ do
+                modifyTVar' (sharedControls shared) (bumpAnswer Nothing . bumpOffered)
+                modifyTVar' (sharedControlTicks shared) (Set.insert tick)
+                modifyTVar' (sharedRecorder shared) (appendRecord record)
+                modifyTVar' (feedState feed) (\state → state {feedReceipts = feedReceipts state <> [(feedFed state + 1, receipt)]})
+                fed
+              pure True
+            InstanceControlClosed → do
+              atomically (modifyTVar' (sharedControls shared) (bumpAnswer (Just "closed") . bumpOffered))
+              pure False
+            other → do
+              atomically (modifyTVar' (sharedControls shared) (bumpAnswer (Just "refused") . bumpOffered))
+              throwIO (ReplayNotAdmitted tick (show other))
+    fed = modifyTVar' (feedState feed) (\state → state {feedFed = feedFed state + 1})
+
+-- | Read the settlements of the controls a replay released that have settled, counting each as the UI's read does; the
+-- ones that have not are kept. Reading a settlement gives its reservation back, so the read, the count and taking the
+-- receipt off are not separated by anything that is interrupted: the read never waits, and what follows it is one
+-- transaction, so a receipt is counted exactly once.
+settleReplayed ∷ Domains → Feed → IO ()
+settleReplayed domains feed = do
+  held ← readTVarIO (feedState feed)
+  forM_ (feedReceipts held) $ \(number, receipt) →
+    mask_ $
+      pollInstanceControl receipt >>= \case
+        Nothing → pure ()
+        Just result →
+          atomically $ do
+            modifyTVar' (sharedControls (domainsShared domains)) (bumpSettled (controlWord result))
+            modifyTVar' (feedState feed) (\state → state {feedReceipts = filter ((/= number) . fst) (feedReceipts state)})
+  where
+    controlWord = \case
+      ControlApplied → "applied"
+      ControlAlreadyInState → "already_in_state"
+      ControlNoLongerApplicable → "no_longer_applicable"
+
+-- | The session is over: settle what can be, and count each receipt that never was as abandoned, reported apart.
+finalizeReplayed ∷ Domains → Feed → IO ()
+finalizeReplayed domains feed = do
+  settleReplayed domains feed
+  left ← feedReceipts <$> readTVarIO (feedState feed)
+  atomically $ do
+    modifyTVar' (sharedControls (domainsShared domains)) (\counts → counts {controlAbandoned = controlAbandoned counts + length left})
+    modifyTVar' (feedState feed) (\state → state {feedReceipts = []})
+
+-- | What the replay released.
+replayOutcome ∷ Feed → IO ReplayOutcome
+replayOutcome feed = ReplayOutcome (feedTotal feed) . feedFed <$> readTVarIO (feedState feed)
 
 -- Evidence ----------------------------------------------------------------------------
 
