@@ -711,6 +711,31 @@ The normal identity, dependency and content checks still apply. Exact manifest
 fields, activation order relative to roots and dependency readiness remain
 open; this does not create another VM or alter the game's clocks.
 
+### D-25. Initialize game roots before their ordered role-mod instances
+
+Owner answer, **2026-10-21 17:04:22 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: roots first (Rec.)
+
+Authenticated relay: `het-manager`, message `h5jxbapx9ubpbk7j3u2gzf62fa`,
+posted **2026-10-21 17:04:22.535 UTC** in `#het-luafirst`, replying to Q-4d
+message `d37sh9d9c3rfa5nrajxvfrrrvs`.
+
+All five parts of P-21 option A are accepted: concurrent game-root init,
+ordered mod init after the corresponding root, early UI-root execution and
+gated UI-mod callbacks, the joint gameplay start gate, role-local dependency
+readiness and fail-boot handling for mod-init failures. The detailed protocol
+is retained in P-21. A dependency's other-role init need not have completed;
+no initializer synchronously waits for another VM.
+
+The manager presented the authoring cost explicitly: game init cannot use
+effects of later mod inits. Mod-dependent work such as world generation runs
+after startup, while imports can supply plain definitions earlier. Early UI
+must tolerate incomplete mod activation. Runtime mod failure escalation and
+teardown order remain open. The intervening documentation archive move changed
+four evidence links; those current `docs/archive/` targets are preserved.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -1336,8 +1361,8 @@ not implemented behavior.
 
 ### P-21. Initialize each game root before its role's ordered mod instances
 
-**Unapproved; active checkpoint Q-4d.** Recommend A, with the following explicit
-integration of D-18/D-22/D-23/D-24:
+**Option A accepted by D-25.** Retain this five-part integration of
+D-18/D-22/D-23/D-24:
 
 1. Validate all selected role entries before hooks. Start the game gameplay
    and presentation root inits concurrently as D-18 requires. After a root's
@@ -1401,6 +1426,56 @@ and supports init-time queued connections, but does not supply this launcher
 protocol. Verification needs both role completion orders, dependencies whose
 other role is still initializing, early UI progress, blocked mod callbacks,
 one-role/content-only sets and failure/cancellation at each admission boundary.
+
+### P-22. Escalate runtime mod-instance failure through its role's policy
+
+**Unapproved; active checkpoint Q-4e.** Recommend A: after successful startup,
+an unhandled failure of a mod's primary gameplay instance fails the gameplay
+session under D-19, just as a gameplay root failure does. Close gameplay
+admission/grants, discard uncommitted work, stop all gameplay instances and
+retain the last committed state. Healthy presentation may continue to show
+the failure until exit; it receives the mod/role/source attribution as part
+of the bounded failure view. Do not merely disable the failed mod and continue
+simulation with possibly damaged shared Lua state.
+
+An unhandled failure of a presentation mod instance ends the whole session,
+as a presentation root failure does. One-role sessions follow the same rules.
+There is no per-mod recoverability/criticality flag in A, no automatic unload
+of just the failed mod and its dependents, and no retry/restart. Mod init and
+early UI failures before the joint startup gate remain boot failures under
+D-25; host/provider/cleanup failures remain session-fatal under D-12/D-19.
+Ordinary Lua errors raised by shutdown are retained in the role's failure
+evidence; protected release failures cannot be downgraded to script errors.
+
+Attribute failure to the engine-owned instance executing the invocation and
+its mod/role, with the failing module/source and traceback where available.
+Calling an imported helper does not transfer instance or lease ownership to
+the helper's content root. A content-only mod has no independently executing
+instance to disable; an unhandled import/helper failure propagates through
+the executing consumer's root/mod policy, retaining source provenance.
+Handled optional data/texture failures still follow D-12 rather than making
+the whole session fail merely because an optional result was unsuccessful.
+This policy concerns reported instance failures; it does not turn every caught
+Lua exception into a session failure. Ownership/escalation for additional
+Lua-created tasks/instances will be explicitly connected to this policy when
+that API is designed.
+
+Alternative B would introduce explicitly recoverable mod failures, stopping
+the failed mod and affected dependents while keeping the rest running. Before
+recording B, design the recoverability declaration, permitted shared-state
+effects, dependency shutdown and engine-state commit boundary; the existing
+shared-VM/module contract alone cannot establish that continuing is safe.
+B may suit optional cosmetic extensions but adds a recovery contract beyond
+instance cleanup. A is recommended because D-23 shares mutable module state
+and execution, so role-wide failure makes no unproven rollback assumption.
+Its cost is that even a small UI mod's unhandled error can end the session;
+authors must handle expected errors within their normal behavior.
+
+Evidence: the Lua host reports instance identity, stage and traceback and
+leaves escalation to its application because it cannot know whether shared
+state was damaged (Lua host README, Failure and escalation). D-19 already
+sets the launcher root policy; this proposal applies it to mod instances,
+without treating the host's default instance isolation as proven recovery.
 
 ## Open questions
 
@@ -1552,11 +1627,17 @@ readiness follow.
 
 #### Q-4d. How do root and mod initialization compose with early UI?
 
-The only active checkpoint is P-21 option A: approve the five-part root-first,
-role-local activation protocol and its authoring costs; or request the
-mods-first alternative B for a concrete D-18 revision; or specify a revision.
-Cross-role dependency readiness is explicitly not promised by A. Runtime
-mod failure escalation and teardown ordering follow separately.
+Resolved by D-25: all five parts of P-21 option A and its authoring costs.
+Cross-role dependency readiness is not promised. Runtime mod failure escalation
+and teardown ordering follow separately.
+
+#### Q-4e. Does an unhandled mod-instance failure fail its role like a root?
+
+The only active checkpoint: P-22 option A (recommended, apply D-19's role
+failure policy to mod instances) or request alternative B (explicitly
+recoverable mod failures) for a concrete recovery contract, or specify a
+revision. Shared-state safety and dependency cleanup cannot be assumed from
+separate instance ownership alone.
 
 ### Q-5. What generic engine state does Lua define and mutate?
 
