@@ -9,7 +9,7 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current pass records direction and the content-addressing checkpoint; it is
+The current pass records direction and the module-import checkpoint; it is
 not an approved specification or authority to implement or file issues.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
@@ -99,7 +99,7 @@ No build, probe or desktop session ran for this draft.
 ## Desired experience and scope
 
 D-1 through D-3 below are the owner's settled direction; D-5 settles the
-standard-library exclusions. Game and mod Lua
+standard-library exclusions and D-6 settles content addressing. Game and mod Lua
 orchestrate the game and use engine services without direct OS functionality.
 The engine stores the state generically and commits Lua-defined changes per
 tick, preserving deterministic simulation and explicit failure handling.
@@ -200,6 +200,30 @@ Cooperative budgets are not hard limits, and protected dependencies remain
 held until actual completion. This follows existing Lua D-13/D-14 and is not
 an additional guarantee of either option.
 
+### D-6. Address content through explicit roots, without implicit overrides
+
+Owner answer, **2026-10-21 14:54:46 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: explicit roots (Rec.)
+
+Authenticated relay: `het-manager`, message `yk9r4b7x8zw6r85nvywz5zjfps`,
+posted **2026-10-21 14:54:46.840 UTC** in `#het-luafirst`, replying to Q-2a
+message `2y2yzah4tzqzp3udsp5hswjs9s`.
+
+A relative reference resolves in the caller's own content root. To reference
+another root, a script explicitly names the game or a particular enabled mod.
+Engine content reads stay inside enabled roots. The same path in two roots
+never silently replaces one with the other; deliberate mod replacement remains
+a later Q-4 choice. This applies to modules, data and textures. It establishes
+addressing and cross-root visibility, not a concrete Lua API spelling.
+
+This preserves predictable provenance and explicit cross-content references.
+Rejected: one merged content tree whose file winner depends on mod load order.
+The choice affects content loading, boot and mod composition, whose slice
+boundaries are still open. Path/symlink rules, module reuse, loading phases and
+save/write APIs are not approved by this answer.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -212,33 +236,47 @@ bindings still belong to Q-6; Q-1's answer does not settle their API.
 
 ### P-2. Address content by an explicit root and a relative path
 
-**Unapproved; active checkpoint Q-2a.** Recommend namespaced content references:
-each game/mod has an engine-registered content-root identity. A relative
-reference resolves within the referring content's own root. A cross-content
-reference explicitly names the game or an enabled mod's root, and any enabled
-root can be referenced. The engine resolves a root identity and relative path
-for module, data and texture loading, without exposing an arbitrary host path.
+The addressing choice is accepted by D-6; retain this proposal ID as history.
 For illustration only: `(game-id, images/title.png)` and
 `(mod-id, lua/rules.lua)`; concrete Lua syntax is not selected.
 
-Under option A, two roots may both contain `images/title.png` without one
-silently replacing the other. Mod replacement can still be explicit through
-the composition/override rules to be designed in Q-4. A missing explicit
-reference fails with its root and path instead of searching unrelated roots.
+### P-3. Evaluate an imported module once per VM and reuse its exports
 
-Alternative B presents one merged content namespace: the same relative path
-may be supplied by the game or a mod, and the selected mod order determines
-which wins. That makes file replacement convenient but makes every unqualified
-module/data/texture reference depend on global override order, which must be
-settled before the resolver is specified.
+**Unapproved; active checkpoint Q-2b.** Recommended option A is an engine-owned
+module cache per VM, keyed by content-root identity and normalized relative
+module path. The first import evaluates text source in that module's environment
+and obtains an export table. Later imports in that VM return the same table
+without rerunning top-level code. Another VM evaluates its own copy; no Lua
+table, closure or mutable module state crosses VM owners.
 
-Both options confine engine content reads to the enabled roots; neither
-restores standard `require`, direct file access or native loaders. A is
-recommended for explicit dependencies and predictable provenance. It affects
-content loading, mod composition and boot; no slice boundaries are approved.
-This checkpoint settles addressing and cross-root visibility only. Symlink
-policy, module cache/cycles, loading phases, asynchronous result timing and
-write/save APIs remain open and require their own decisions.
+The consequence is explicit sharing within a VM: changes to exported tables
+and module upvalues are visible to its importers. Authors use factory functions
+or script instances when they need fresh local state; importing again does not
+create a fresh instance. Authoritative gameplay state still belongs to the
+engine under D-3, not to a module cache.
+
+Reject an import cycle with a diagnostic naming the root/path chain rather than
+exposing partly initialized exports. A failed module import returns an attributed
+failure, exposes no successful cached exports and is not automatically retried;
+subsequent imports of that failed identity in the same VM return its failure.
+This does not roll back effects already performed during module evaluation.
+Allowed top-level effects and whether a failure ends boot or a session remain
+part of the loading-phase and boot contracts.
+
+Alternative B evaluates a fresh module environment and export table on every
+import. It provides separate module-local state to each importer, but repeats
+top-level effects and can load the same dependency many times. Both options
+reject cycles and report failures without automatic effect replay. A is
+recommended because dependency imports reuse code and state predictably, while
+factories make fresh state explicit.
+
+The current host already separates a loaded module from its instances and
+refuses duplicate loads under one identity; it exposes host-declared entry
+points, not this proposed Lua-to-Lua export-table interface. The proposal is new
+loader behavior, not a claim that the present API supplies it. It affects the
+content-loader and module/instance integration slices, still undefined. It
+does not decide loading phases, live reload, path aliases, cache bounds, or
+the treatment of data and texture caches.
 
 ## Open questions
 
@@ -251,16 +289,21 @@ epic's disposition are not settled by this answer.
 
 Settle modules, data and textures scoped to game/mod content roots, module
 identity/cache/cycles, cross-mod access, root/path and symlink handling,
-failure attribution and when loading is allowed. No engine API spelling or
-search/override policy is decided yet.
+failure attribution and when loading is allowed. D-6 settles explicit root
+addressing; engine API spelling and the remaining loader behavior are open.
 
 #### Q-2a. Explicit content-root references or one merged override namespace?
 
-The only active checkpoint: P-2 option A (recommended, explicit roots and
-cross-root references) or B (merged namespace resolved by mod order), or an
-owner-specified revision. The remaining Q-2 choices wait; do not treat an
-answer about addressing as approval of cache, lifecycle or path-resolution
-details.
+Resolved by D-6: explicit content roots, with explicit cross-root references
+and no silent path overrides. Cache, lifecycle and path-resolution details
+remain open.
+
+#### Q-2b. Reuse a module's exports within a VM or evaluate afresh per import?
+
+The only active checkpoint: P-3 option A (recommended, cached exports per VM)
+or B (fresh module per import), or an owner-specified revision. The proposed
+contract includes cycle rejection and attributed failed imports without
+automatic retries. Loading phases and failure escalation remain open.
 
 ### Q-3. What is the generic executable's boot and session contract?
 
