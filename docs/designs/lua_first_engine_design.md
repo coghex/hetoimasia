@@ -736,6 +736,30 @@ must tolerate incomplete mod activation. Runtime mod failure escalation and
 teardown order remain open. The intervening documentation archive move changed
 four evidence links; those current `docs/archive/` targets are preserved.
 
+### D-26. Apply root failure policy to runtime mod-instance failures
+
+Owner answer, **2026-10-21 17:07:18 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: same as the game (Rec.)
+
+Authenticated relay: `het-manager`, message `s5mat8dd22dasy4be78dpy6a52`,
+posted **2026-10-21 17:07:18.888 UTC** in `#het-luafirst`, replying to Q-4e
+message `6sr92w7jk4h4ragchj4xjqqc9n`.
+
+P-22 option A is accepted: an unhandled gameplay mod-instance failure stops
+all gameplay, preserves the last committed state and lets healthy UI show
+the mod-attributed failure until exit. A presentation mod-instance failure
+ends the session. No recoverability flag, disable-and-continue or retry is
+introduced. Attribution retains mod, role and available source/traceback;
+instance ownership remains with the executing consumer of imported helpers.
+
+The owner was shown that a small UI mod bug can end the session because
+cleanup of an instance does not undo shared-VM mutations. Expected optional
+content failures and caught Lua errors retain P-22's boundaries. Startup,
+fatal host/cleanup behavior and prior Lua failure accounting remain unchanged.
+Additional Lua-created instance/task ownership and teardown order remain open.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -1429,7 +1453,7 @@ one-role/content-only sets and failure/cancellation at each admission boundary.
 
 ### P-22. Escalate runtime mod-instance failure through its role's policy
 
-**Unapproved; active checkpoint Q-4e.** Recommend A: after successful startup,
+**Option A accepted by D-26.** After successful startup,
 an unhandled failure of a mod's primary gameplay instance fails the gameplay
 session under D-19, just as a gameplay root failure does. Close gameplay
 admission/grants, discard uncommitted work, stop all gameplay instances and
@@ -1476,6 +1500,51 @@ leaves escalation to its application because it cannot know whether shared
 state was damaged (Lua host README, Failure and escalation). D-19 already
 sets the launcher root policy; this proposal applies it to mod instances,
 without treating the host's default instance isolation as proven recovery.
+
+### P-23. Make shutdown self-contained, without a mod ordering guarantee
+
+**Unapproved; active checkpoint Q-4f.** Recommend A: root/mod `shutdown`
+hooks must not rely on another instance, dependency or role still serving.
+The launcher promises no relative order between their hooks. A hook may use
+its own still-live handles and local/pure helpers, but cannot depend on another
+instance processing a cleanup event, another mod retaining its resources, or
+the other VM answering. This is an authoring contract, not a claim that the
+engine can prove arbitrary Lua functions pure. A manifest requirement orders
+startup; it does not confer access to another instance's leases or guarantee
+that dependency survives shutdown.
+
+Reuse ordinary lifecycle stopping and engine-owned resource retirement.
+Shutdown remains finite, optional and non-yielding; no hook runs for failed
+init, and an unsafe owner exit can skip hooks. Engine cleanup still runs when
+hooks are absent, fail or cannot safely execute, and retains provider/GPU
+dependencies until actual retirement. Shared engine resources remain alive
+for outstanding valid interests, independently of mod hook order. Hooks are
+not responsible for discovering every resource or making dependency release
+safe. No stopped instance is restarted to satisfy somebody else's cleanup.
+
+For whole-session quit or a fatal presentation failure, close normal admission
+and gameplay grants, request stops without waiting for another role to finish,
+then account for settlement and protected retirement. The UI-only continuation
+after a gameplay script failure remains D-19/D-26: only gameplay is stopped
+until exit or a later fatal failure. D-20's deliberate forced process exit
+remains the exception that skips remaining cleanup.
+
+Alternative B adds reverse activation order for surviving initialized instances
+on an orderly role shutdown: dependent mods first, then dependencies, game
+root last. It needs a coordinated phase that first prevents ordinary work
+throughout that role, then sequences hook entry/stopping. Already-ended
+instances, concurrent failures, cancellation and unsafe owner exits still
+cannot obey that order, so it would not make cross-mod cleanup safe on every
+path. B is useful if an author needs orderly teardown notifications, but adds
+a second ordering contract and failure-path exceptions. A is recommended
+because owned lifetimes already provide resource safety on both orderly and
+failed exits; authors give up reliance on cross-instance shutdown callbacks.
+
+Evidence: the Lua host's Whole-owner control, Ending and Draining contracts
+already skip Lua hooks on unsafe exit, drain instance holdings even after
+hook failure and retain asynchronous retirements. The headless runner's
+ascending instance-ID shutdown order is its own policy, not a dependency
+ordering guarantee for this new launcher.
 
 ## Open questions
 
@@ -1633,11 +1702,15 @@ and teardown ordering follow separately.
 
 #### Q-4e. Does an unhandled mod-instance failure fail its role like a root?
 
-The only active checkpoint: P-22 option A (recommended, apply D-19's role
-failure policy to mod instances) or request alternative B (explicitly
-recoverable mod failures) for a concrete recovery contract, or specify a
-revision. Shared-state safety and dependency cleanup cannot be assumed from
-separate instance ownership alone.
+Resolved by D-26: apply D-19's role failure policy to mod instances, with no
+recoverability flag or automatic disable-and-continue.
+
+#### Q-4f. May shutdown depend on a particular mod/root teardown order?
+
+The only active checkpoint: P-23 option A (recommended, self-contained hooks
+with no relative ordering guarantee) or B (reverse activation order on orderly
+shutdown only, with failure-path exceptions), or an owner-specified revision.
+Engine-owned lifetime/retirement guarantees apply independently of hook order.
 
 ### Q-5. What generic engine state does Lua define and mutate?
 
