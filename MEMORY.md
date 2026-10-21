@@ -1,486 +1,98 @@
 # Hetoimasia project memory
 
-Implementation notes below were last reconciled on 2026-09-19 against code
-`master@38388f8`; they are dated context, not the latest tracker inventory.
-The architectural review entry point was added on 2026-09-20. Recheck Git and
-the tracker before relying on status.
-Working rules live in [AGENTS.md](AGENTS.md); historical context is preserved in
-[the memory archive](docs/archive/history/memory_before_2026-09-17.md). Read only the
-owning subsystem's contract/design when continuing its work.
+Owner decisions in force, open owner decisions, and facts that were expensive to
+learn. Status lives in [README.md](README.md), the owning design or contract, and
+the guide cursor; working rules live in [AGENTS.md](AGENTS.md). The memory as it
+stood before 2026-10-21 is [archived](docs/archive/history/memory_before_2026-10-21.md):
+history, not a work queue.
 
-For an architectural review, run `$guide` (Codex) or `/guide` (Claude Code);
-the skill lives at `~/.codex/skills/guide/` and Claude Code links to it. It
-checks merged work and changed issues against [the vision](docs/vision.md) and
-records each run in `docs/guide/`. Start from
-[the guide cursor](docs/guide/CURSOR.md): it holds the resume boundary, open
-guide findings, pending handoff and the latest alignment reading per principle.
-Guide is advisory and does not replace Kanban approval or project-review records.
+The heading is [the vision](docs/vision.md). `$guide` (`/guide` in Claude Code)
+checks merged work and changed issues against it and resumes from
+[the guide cursor](docs/guide/CURSOR.md). It is advisory and approves nothing.
 
-## Direction and owner preferences
+## Where things stand
 
-- Owner decision 2026-09-26: [module conventions](docs/module_conventions.md)
-  settle flexible `Base`/`Types`, dedicated type modules, and independent
-  `packages/math` for abstract mathematical structures and operations. Math
-  imports no other local or graphics package; its API remains undesigned.
-  Finish structural refactors before resuming the feature backlog. #267/#265
-  is merged at `9e2f033` and guide-audited at that pin.
-  Owner sequencing clarification: refactor existing code into the flexible
-  `Base`/`Types` layers first; defer the GPU-model `State.hs` decomposition until
-  that refactor is complete. Package scope and delivery slices still need
-  planning. Defer math-package implementation; it blocks neither refactor.
-  Module-specific types live under the owning module's directory, such as
-  `Camera/Types.hs`, `Camera/Base.hs` or dedicated `Camera/Vertex.hs`.
-  Keep `Base`/`Types` below roughly 600 lines; split coherent subcomponents
-  when they grow. The foundation layout is being proposed in
-  [its refactor design](docs/archive/designs/foundation_modules_design.md).
-- On 2026-09-23 the owner requested documentation-only tracing design, with no
-  issue drafts or filing. [Runtime tracing](docs/runtime_tracing_design.md)
-  proposes opt-in GHC eventlog capture, bounded engine records and offline
-  inspection. Backend, viewer and cost/budget choices await owner agreement;
-  RTC-1 remains unprocessed and no implementation is claimed.
-- Build a modular Haskell/Vulkan engine with Lua, then separate 2D and 3D
-  renderers. Synarchy (`~/work/synarchy`) is valuable prior work and a possible
-  future game client; migration is not automatic compatibility.
-- The application assembles game state, runtime services, graphics and scripting
-  through narrow interfaces. No universal `EngineEnv`, global service locator,
-  engine import of concrete game code, or new all-purpose application monad.
-- Develop infrastructure methodically before Vulkan. A rendered triangle is the
-  first eventual graphics result; it is not a reason to skip lifecycle work.
-  GLFW stays on the process main thread; accepted Vulkan D-29–D-33 place rendering
-  on a separate supervised graphics owner with protected retirement and bounded
-  handoffs. Native evidence must still establish progress during Cocoa modal loops.
-- Owner decisions 2026-09-22 (Ecce Homo rewrite review):
-  - First-party game scripts are trusted and run in-process in the UI and
-    gameplay VM owners with direct bindings. Mods keep the confined-process
-    pipeline, and both share one registration layer
-    ([Lua D-12](docs/lua_runtime_design.md#d-12-run-first-party-scripts-trusted-and-in-process)).
-    Owner decisions D-13/D-14 on 2026-09-24 resolve Q-8: trusted slices may
-    proceed independently of Q-5 after renewed readiness, with explicit binding
-    eligibility and no mod exposure by default. The reconciled local design
-    remains `exploring`; confined integration/acceptance (LUA-16/LUA-17) still
-    require successful platform qualification and remain part of epic completion.
-  - Quit may be bounded by an application-level watchdog. It names the stuck
-    owner, makes a bounded best-effort flush, and exits the process without
-    unwinding. Foundation keeps its no-deadline drain
-    ([V-3](docs/vision.md#v-3-ownership-and-completion-are-correctness-boundaries)).
-- Preserve Synarchy's useful behavior and rationale deliberately: inspect its
-  windowing, monotonic time, Vulkan ownership, Lua and rendering code before
-  replacing concepts. Do not copy its central environment or game managers.
-- GitHub: `coghex/hetoimasia`, public, default `master`; license `GPL-3.0-only`.
-  GHC 9.14.1, Cabal 3.18.1.0, `index-state: 2026-09-18T00:00:00Z`, GHC2024,
-  Unicode type syntax, standard Prelude. `docs/toolchain.md` records that
-  qualification, the candidates rejected, and the pinned `vulkan-3.27` /
-  `vulkan-utils-0.5.11.0` pair VK-2 inherits. The
-  [#171 review](docs/project_review/171.md) records a provenance-documentation
-  correction; preserve the receipts' exact historical revisions rather than
-  claiming all subsequent changes through `HEAD` were documentation-only.
-  Preserve `semaphore: False` for the multi-worktree build.
-- Use Kanban skills and `~/work/kanban` for issue/PR workflow. This repository
-  is the target. Code and its required documentation/evidence ship in the same
-  PR; standalone docs use the docs worktree and docs landing helper.
-- Prefer Hspec. Python probes need a boundary Hspec cannot reasonably exercise.
-  Use coordinated concurrency tests, not sleeps; preserve fail-on-empty and
-  meaningful external-client opacity checks. Scope tests to changed contracts.
-- Remote CI is Linux-only; macOS native evidence is local. Owner decision
-  2026-09-26: desktop-disrupting native runs an issue or PR needs have
-  **standing approval** — run them without asking, with
-  `HETOIMASIA_NATIVE_SESSION=desktop` on that one command. Never set the flag
-  persistently. Owner decision 2026-09-29: a quruntul `$flake` batch of
-  never-measured tests may run them under the same approval, one
-  window-opening batch at a time. Other periodic testing and profiling still
-  need the owner's request for that run. Isolated X11 through `tools/display/x11.sh` and
-  approval-free native selectors need no consent at all.
+- Lua: [runtime design](docs/lua_runtime_design.md), trusted milestone delivered
+  and owner-accepted 2026-10-21 (#500). The confined mod branch (LUA-9 to LUA-13,
+  LUA-16, LUA-17) waits on Q-5. The [Lua-first engine design](docs/designs/lua_first_engine_design.md)
+  is `exploring`; its questions go to `#het-luafirst`.
+- Rendering: the [2D renderer design](docs/designs/render_2d_design.md) is delivered
+  except deferred #446; [GPU backend contract](docs/gpu_backend.md);
+  [samples](samples/README.md).
+- Runtime and windowing contracts: [resources](docs/resources.md),
+  [supervision](docs/supervision.md), [workers](docs/workers.md),
+  [messaging](docs/messaging.md), [time](docs/time.md),
+  [scheduling](docs/scheduling.md), [GLFW](docs/glfw.md), [logging](docs/logging.md),
+  [failures](docs/failures.md), [recovery](docs/recovery.md).
+- Review coverage: the [project-review ledger](docs/project_review/ledger.md).
 
-## Implemented and reviewed
+## Owner decisions in force
 
-- Logging, CPU scopes/collections, structured failures and bounded recovery,
-  application composition, workers/supervision, bounded channels/snapshots,
-  supervised inboxes, and GLFW dynamic windows/controls/monitors/input exist.
-- In addition to root, foundation, runtime, GLFW, Lua, test support and the GPU
-  model, #217 now supplies portable Vulkan diagnostics and a native diagnostics
-  package. #216 supplies GLFW's optional Vulkan interop component. #219 adds
-  the native Vulkan roots (instance, messenger, one shared device, per-target
-  surfaces) and the `hetoimasia-gpu-vulkan-glfw` integration that runs them
-  under the graphics owner ([contract](docs/gpu_backend.md)). #222 adds
-  swapchain generations, and #223 managed resources, a scoped recorder with
-  exact retention, and the audited `unsafe` recording subset. #225 adds
-  frames: non-blocking acquisition, submission of sealed batches, and safe
-  abandonment of skipped and never-presented frames through cleanup
-  submissions and maintenance release. #227 adds presentation through a
-  bounded per-target pool of render-finished semaphores and present fences,
-  bound at reservation (the slot no longer owns the render-finished
-  semaphore); what was enqueued is read from `pResults`, an unwritten entry is
-  uncertain; a presentation retires only on its own present fence, and
-  generations and closing windows retire incrementally from that evidence.
-  #231 adds the terminal latch: the first failure — device loss, a validation
-  error or sink failure read from the capture at a checkpoint, an uncertain
-  effect, a failed cleanup, a required target's exhaustion — is the primary,
-  refuses every later rendering, acquisition, submission, presentation and
-  handover naming it, and keeps later failures and retentions as evidence; the
-  device's loss is kept apart from the primary (model `noteDeviceLoss`). After
-  a loss the frames ask and wait on no fence and release what only the lost
-  device could discharge (`releaseToDeviceLoss`), never as completion. No
-  device loss is induced natively. #232 (VK-16) wires the recording and the
-  frames into the controller's step — demand, a newer scene, a changed
-  generation or a resumption asks a target for a frame; acquisitions and fence
-  polls are paced on the owner's deadlines and the model's `progressDeadline`
-  (render demand left out); a target's retirement is `RetirementOwed` until its
-  frames and presentations have gone on their own evidence — and adds
-  `runVulkanOwnerLoop`, which publishes observations, captured window demand
-  and replacement surfaces every turn and folds the owner's deadline into the
-  main loop's wait. #229 (VK-14) adds recovery: a
-  lost surface's generations go, then the surface, and the episode admits an
-  attempt; the controller asks the main thread for a replacement through
-  #216's `replaceWindowSurface` under the same attachment
-  (`replaceVulkanSurfaces`, which `runVulkanOwnerLoop` runs every turn), rechecks
-  the one device's support and builds a fresh generation. An unrecoverable
-  optional target is reported unavailable (`readVulkanUnavailability`, read
-  from the model's escalation, since the model forgets an unavailable target
-  holding nothing); a required one is latched as the terminal primary and
-  raises `VulkanRequiredTargetFailed`. A
-  no-effect submission or presentation, or a creation that raised, gets one
-  reclamation pass through disposers each layer registers with the roots and
-  at most one retry through the model's allocation attempt. A report from
-  another thread wakes no owner, and neither does republishing an unchanged
-  observation at the same revision. Fonts and renderers remain plans.
-- GLFW #87–#100 merged through PRs #101–#114. Repairs #115–#118 merged through
-  #119–#122; monitor follow-up #123 merged in #126; native consent #124 merged
-  in #128. Epic #86 is closed after checklist reconciliation on 2026-09-17.
-- Test-support extraction #125/#132, foundation migration #127/#137, and
-  runtime migration #129/#150, and GLFW headless migration #130/#151 are
-  complete. All children of epic #49 are merged, and #49 closed on
-  2026-09-20.
-- Audit at `8e4eb6e`: the latest twelve merged PRs (#150–#165, exact list in
-  [the report](docs/project_review_165-150.md)) cover every merge since the
-  previous review through #137. Build and 1,289 existing Hspec examples passed;
-  five added headless examples reproduced four follow-ups: completion-policy
-  evaluation escaping protected retirement (P1), direct-versus-queued evidence
-  revival, retirement budget busy polling, and diagnostic-failure propagation.
-  Those four findings became #166–#169 and merged as PRs #170, #172, #178,
-  and #180. The [review ledger](docs/project_review/ledger.md) records the
-  follow-up batch through #180 and links its current findings. No desktop
-  session ran in either audit. Counts above are historical evidence.
-- Foundation owns `packages/foundation/test/` (`test.foundation`) and runtime
-  owns `packages/runtime/test/` (`test.runtime`, 143 examples at #129, with the
-  per-example map in docs/runtime_tests_mapping.md). GLFW owns
-  `packages/glfw/test/` (`test.glfw`, 234 examples at #130, including the 180
-  former window-executable examples, mapped in docs/glfw_tests_mapping.md);
-  `glfw-native-tests` stays separate. Root tests keep only `Console` and depend
-  on no GLFW package. Shared neutral helpers are test-only; no production
-  dependency on test support. CPU-only foundation, runtime, and root builds use
-  `cabal.project.cpu`, sharing canonical settings in `cabal.project.common`.
+- 2026-09-26, [module conventions](docs/module_conventions.md): flexible `Base`/`Types`,
+  dedicated type modules, module types under the owning module's directory
+  (`Camera/Types.hs`), `Base`/`Types` under about 600 lines. `packages/math`
+  imports no other local or graphics package.
+- 2026-09-22: first-party game scripts are trusted and run in-process in the UI
+  and gameplay VM owners
+  ([Lua D-12](docs/lua_runtime_design.md#d-12-run-first-party-scripts-trusted-and-in-process));
+  mods keep confined processes, and both share one registration layer. D-13/D-14:
+  trusted slices proceed independently of Q-5.
+- 2026-09-22: quit may be bounded by an application-level watchdog that names the
+  stuck owner, flushes best-effort and exits without unwinding. Foundation keeps
+  its no-deadline drain
+  ([V-3](docs/vision.md#v-3-ownership-and-completion-are-correctness-boundaries)).
+- 2026-09-18: Lua cancellation targets a VM's execution owner. A callback never
+  publishes its `ThreadId` or outlives its return; nothing promises to interrupt
+  running Lua.
+- GLFW stays on the main thread; rendering runs on a separate supervised graphics
+  owner (Vulkan D-29 to D-33). A live resize is coalesced for 16 ms from its first
+  sighting, built from the newest extent, and the active generation keeps
+  presenting while a replacement waits (P-15 as amended).
+- Vulkan: 1.3 minimum, one shared loader, managed retention, present-fence
+  retirement, two frame slots by default.
+- Never weaken isolation to turn an inconclusive confinement proof into support.
+- Not committed: a game save schema, a full Synarchy port, permanent RTS tuning,
+  an engine-wide rendering abstraction.
 
-- LUA-1 (#146) is the Lua binding and foreign-call boundary. The selected pair
-  is `lua-2.3.4`, bundling Lua 5.4.8, on the #157 baseline merged as `3af4cb2`;
-  `hslua-core` was rejected because its `LuaE` hands out the raw state and its
-  `run` masks cancellation across the whole computation. The bridge is private:
-  the state, trampoline, and registry references live in the package's `bridge`
-  sublibrary, and the public module offers construct / load / call / close and
-  nothing else. `cabal.project.common` sets `lua` to
-  `-system-lua -pkg-config -allow-unsafe-gc`; the last is a correctness setting,
-  because every VM that has held a Haskell callback re-enters the RTS from its
-  collector. The suite is `lua-host-tests`, the group `test.scripting-lua`, and
-  the audit is in the package README. Open follow-ups it records, all for later
-  slices: cancelling a thread that is inside Lua cannot work with an
-  asynchronous exception, so a supervisor that must reclaim a running task needs
-  a Lua-consulted hook or a process boundary (LUA-4 onward); the `safe`-call
-  cost of disabling `allow-unsafe-gc` is unmeasured and belongs with the first
-  workload that has a budget to weigh it against. **Cancellation targets a VM's execution
-  owner**, decided by the owner on 2026-09-18: a callback thread is the
-  runtime's machinery, not an endpoint, and a trusted callback must not publish
-  its `ThreadId` or outlive its own return. Owner cancellation stays observable
-  after the native call and the bookkeeping; a callback's failure keeps its type
-  and context; nothing promises to interrupt arbitrary Lua, so callbacks stay
-  short and limits on untrusted code belong to LUA-14/LUA-15's processes. The
-  package performs state creation, publication, global reads, and library
-  opening through its own C — each one protected call — because the binding's
-  wrappers allocate their arguments before their own protection; it owns the
-  callback path and its error protocol for the same reason plus the export
-  window. A budget-walking allocator in the hazard runner proves every
-  allocation on the publication path reports rather than panics, that a failed
-  publication leaves the state usable, and that carriers are finalized exactly
-  once.
-- LUA-14 (#147) is the Linux confinement and resource-limit feasibility proof,
-  and **its verdict is `inconclusive`** — recorded in
-  [the Linux confinement verdict](docs/archive/lua_linux_confinement_verdict.md), whose
-  three runs are kept verbatim in
-  [the retained runs](docs/archive/lua_linux_confinement_evidence.md). The
-  candidate profile works: on an ordinary unprivileged Linux machine (Ubuntu
-  24.04, kernel 6.8, aarch64, non-root, no capability) every row of Q-5's proof
-  matrix was demonstrated. It works only where the distribution gives an
-  unprivileged process a *usable* user namespace, and neither required
-  environment does. Ubuntu 24.04 ships
-  `kernel.apparmor_restrict_unprivileged_userns=1`, which lets the `unshare`
-  succeed and then denies `CAP_SYS_ADMIN` inside the namespace it created; the
-  Linux CI container refuses the `unshare` outright. So the mechanism is proven
-  and the deployment baseline is not, which returns the Lua design to
-  `exploring` under D-11. The obstacle is the owner's to resolve: relaxing that
-  restriction, shipping an AppArmor profile, a file-capability helper, and
-  **Landlock instead of namespaces** (unprivileged, no namespace needed, TCP
-  rules since kernel 6.7) are the alternatives, the last being the one worth
-  evaluating next. No CI image or container option was changed.
-- The probe's own shape is the reusable part. It is private to
-  `packages/scripting-lua/linux/`, Linux-only, admits no mod source, and its
-  group is `test.lua-confinement-linux`; a green run is evidence and never a
-  verdict, because each example either proves its property or prints that the
-  machine could not install the profile. Facts it fixed: an unprivileged user
-  namespace must be entered from a freshly `fork`ed child, because
-  `unshare(CLONE_NEWUSER)` is refused to a threaded process; asking whether one
-  can be *created* is the wrong question, and the whole sequence through the
-  identity maps must be attempted; a bind mount remounted read-only inside a
-  user namespace must carry the source's locked flags forward or the remount is
-  `EPERM`; `RLIMIT_AS` is a whole-process ceiling but counts the runtime's
-  address-space reservation, so the child needs `-xr256m` and enough headroom
-  for eight megabytes of stack per runtime thread; a `dlopen` fixture must be a
-  module the program does not already link; a PID namespace needs a second fork
-  and leaves the caller holding a supervisor rather than the confined process,
-  so that supervisor reproduces the confined exit status and forwards the
-  cooperative stop; and lowering `RLIMIT_NOFILE` closes nothing already open,
-  so every descriptor above the four the child is given must be swept before
-  the exec. Registering the group needed
-  the validation planner to accept `buildable` inside an `if os(...)`
-  conditional, which it now does without reading the body, so a platform
-  component's sources select their group on every platform rather than only the
-  one that builds them.
+## Open owner decisions
 
-## Contracts to preserve
+- Q-5 on Linux ([verdict](docs/archive/lua_linux_confinement_verdict.md)): Ubuntu
+  24.04's `kernel.apparmor_restrict_unprivileged_userns=1` and the CI container
+  both deny usable unprivileged user namespaces. Options: relax the restriction,
+  ship an AppArmor profile, a file-capability helper, or Landlock (unprivileged,
+  no namespace), the one worth evaluating next.
+- Q-5 on macOS ([verdict](docs/archive/macos_confinement_verdict.md)): accept the
+  unsupported-SPI profile (`sandbox_init_with_parameters`,
+  `posix_spawnattr_setjetsam_ext`), accept App Sandbox's weaker contract, or drop
+  macOS from untrusted-mod targets.
+- [Runtime tracing](docs/runtime_tracing_design.md): backend, viewer and cost
+  choices; RTC-1 unprocessed.
+- #446, sampling an offscreen pass's target: deferred; Q-10 is settled before it
+  is specified.
 
-- [GPU model](docs/gpu_model.md) (VK-3, `packages/gpu-vulkan/model`): the pure
-  retention and frame-ownership model, a separate package whose only project
-  dependency is the foundation, listed in both project files so it and its suite
-  build with no Vulkan SDK permanently. It proves no native completion: a
-  submitted use, a presentation obligation and an unpresented frame's
-  synchronization end only on a fact the boundary injects. Five holds are tracked
-  separately per generation and per managed resource, and nothing is disposed of
-  until every one has ended. Budget exhaustion is typed backpressure, never
-  failure, and never takes a cleanup record reserved for admitted work. Recovery
-  is three attempts at 100 ms and 500 ms, replenished only by a retirement cycle
-  plus a healthy second; an `oldSwapchain` retirement is irreversible; a failed
-  disposal is preserved, not replayed, and escalates the session. Its suite is
-  the non-floor CPU group `test.vulkan`, which runs through `cabal.project.cpu`.
+## Facts not worth rediscovering
 
-- [Resources](docs/resources.md): scoped continuation over CPU ownership;
-  construction rollback and once-only consumer; original failure/cancellation
-  stays primary and cleanup evidence survives. Foundation releases are bounded
-  and uninterruptible. CPU scope exit is never GPU completion.
-- [Supervision](docs/supervision.md) and [workers](docs/workers.md): explicit
-  checkpoints and supervised waits; distinguish services/jobs and required/
-  optional failures. Keep borrowed resources alive while a worker cannot stop.
-  No unsafe detachment or cleanup error used as permission to release parents.
-  Logging finalization has its own IO lifetime outside bounded finalizers.
-- [Messaging](docs/messaging.md): bounded FIFO and latest snapshots; prepared
-  NFData payloads; immediate Full with explicit waiting; close drains and abort
-  discards; no automatic replay of in-flight effects. Graceful inbox finish is
-  explicit. Escaping handler failures terminate the worker under normal policy.
-- [GLFW](docs/glfw.md): one main-thread owner, opaque capabilities, independently
-  closing windows, bounded commands with persistent tickets, coherent state and
-  explicit input resets. A close acknowledgement is not native destruction. The
-  owner has two loops: `runOwnerLoop`, unchanged and paced by the turn before
-  it, and the additive `runScheduledOwnerLoop`, paced by absolute deadlines from
-  the host's injected monotonic clock and bounded by the same finite fallback.
-  `renderTurn` is the pure helper that maps the runtime's simulation demand and
-  each window's captured demand onto that schedule; it knows no GPU, and
-  retirement is never gated by render eligibility.
-  `withProtectedWindowHost` builds the same host inside an IO continuation
-  boundary that owns attachment retirement; the `Scoped` constructors keep their
-  behaviour and accept no attachment. On every exit that boundary ends new
-  graphics use, retires attachments on the main thread with the windows, the
-  session, and the parents live, and retains them all when it cannot.
-  `withGraphicsOwnerHost` is the additive constructor beside it: the same host
-  with one supervised graphics owner alive across that drain, taking the
-  backend's operations as an injected record. The owner makes no GLFW call —
-  its one cross-thread reach is the session's existing wake — and the exit
-  retires each target, then the owner, then destroys it, then joins, and only
-  then releases the windows. Nothing but the injected evidence is permission:
-  an owner that ends without whole-owner destruction evidence retains the
-  windows, the session and every parent until independent evidence arrives.
-- [Validation](docs/validation.md): mandatory floor plus affected non-optional
-  and PR-requested groups. Optional probes remain opt-in. CI evidence and review
-  approval have independent freshness rules; approved clean merges may retain
-  review while changed inputs require CI. Docs-only reuse compares actual inputs.
-
-## Active backlog and next design
-
-- All three pre-Vulkan documents are fully processed into tracker artifacts;
-  processing completion does not mean implementation completion. Their canonical
-  approval comments amend the issue bodies and must be included by solvers.
-- [Test ownership](docs/archive/test_architecture_design.md), epic #49: all children
-  have merged. Package suites and the root/tools separation are implemented.
-- [Scheduling](docs/archive/runtime_scheduling_design.md), epic #131: #133, #134, #135,
-  #136, #138, #139 are all merged. Accepted: event/deadline/fixed-step updates
-  with bounded catch-up; render suspension per window while simulation remains application-
-  owned; committed demand retained across cancellation; expected wake failure
-  keeps accepted work, reports once under logging policy and degrades to polling.
-  RR-4 (#200) is measured, not assumed: on macOS 26.6 with the pinned Cocoa
-  GLFW 3.4, a live resize and a menu-bar interaction each block the owner turn's
-  native event call for as long as the person interacts — 68.92 s and 13.30 s
-  observed, with no owner turn and no update opportunity in either — while a
-  window move does not block it at all. Cocoa keeps requesting a redraw about
-  111 times a second throughout a resize; a menu tracking loop delivers nothing.
-  Resolved by Vulkan D-29–D-33: the separate graphics owner's machinery is
-  delivered by VK-18/#218 inside the GLFW package's runtime integration
-  (`Hetoimasia.Runtime.GLFW.Internal.Owner`, contract in
-  [glfw.md](docs/glfw.md#the-supervised-graphics-owner)), with its backend
-  operations injected and proved through fakes; VK-7/#219 supplies the Vulkan
-  ones. VK-16/#232 measured the Cocoa progress
-  ([verdict](docs/archive/graphics_owner_interaction_verdict.md), 2026-09-28). Its
-  first session found a live resize starving the owner for 15.44 s: P-15's
-  16 ms quiet period outlasted Cocoa's ~8.5 ms framebuffer changes, and the
-  frames acquired nothing from a settling target. The owner then chose the
-  surveyed engines' approach: a move is coalesced for 16 ms from its first
-  sighting and built from the newest extent, and the active generation keeps
-  presenting while a replacement waits (P-15 amended). That needed MoltenVK
-  1.4.2, since 1.4.0 sets the drawable to 1x1 when a swapchain is recreated
-  over an in-flight presentation, which spent the required target's recovery.
-  The pin moved, a CI-image requalification. Under both, the owner presented
-  at display rate through a 14.55 s live resize (506 generations, longest gap
-  19 ms) and a 23.47 s menu block. The owner removes the
-  stale or stretched surface during both modal loops (visibility is
-  testimony, not evidence), but
-  not the stall: window commands and observations
-  still wait for the pump, and a rendered latest snapshot does not mean
-  gameplay or input continued. The [verdict](docs/archive/owner_loop_interaction_verdict.md) is historical
-  measurement, not a later policy decision. Its probe stays selectable, never
-  routine. Simulation remains application-owned; scene snapshots can originate
-  on any application thread without introducing a simulation driver in this arc.
-- [Window/graphics lifetime](docs/archive/window_graphics_lifetime_design.md), epic #140:
-  #141, #142, #143, and #144 are merged. The current review report records
-  follow-up repairs; #166–#169 have now merged. The review ledger records their
-  verification separately from new Lua/GPU findings. One exclusive
-  graphics owner per window, attached through `attachWindowGraphics` and held as
-  an opaque `GraphicsService`. Protected main-thread retirement follows worker
-  drain and precedes dependency release on every exit; in-run retirement
-  progresses on owner turns under `hostRetirementBudget`, rotating across pending
-  attachments, and publishes `hostRetirementDemand` for the scheduled loop.
-  Unknown safety retains resources. Completed #123 no longer blocks this work.
-  `attachHostWindow` and the rest of the #143 seam stay private to
-  `runtime-glfw-core` beneath that contract. Still open: no surface, GPU
-  submission, or device wait exists anywhere here — evidence that GPU work has
-  completed is the backend's. Vulkan compatibility proof #158 has qualified
-  present-fence retirement and image release on both selected profiles; VK-8
-  (#220) retired its harness and runs its cases, with VK-5–VK-7's, in the
-  window integration's native suite, the required group `test.vulkan-native`,
-  with synchronization validation enabled on every validation-enabled instance.
-- [Lua](docs/lua_runtime_design.md) has returned to `exploring` under D-11.
-  Independent UI/gameplay execution domains; stop unsafe authoritative gameplay
-  while keeping UI available. Untrusted mods require separate processes per mod/domain,
-  explicit capabilities, and enforced whole-process resource/execution limits.
-  Epic #145's children #146–#149 are merged: the binding uses #157's qualified
-  toolchain, both platform proofs have retained verdicts, and the pure protocol
-  model exists. The [#179 review](docs/project_review/179.md) recorded
-  failure-settlement and bounded failure-detail defects, repaired by #193/#194.
-  The [#173 review](docs/project_review/173.md) recorded stale binding comments,
-  corrected in PR #241. These repairs do not clear the confinement gate. #148
-  added bounded OS-conditional `buildable`
-  parser support, reused by #147; conservative source hashing is intentional,
-  but [the #177 review](docs/project_review/177.md) records the separate platform
-  eligibility defect repaired by #191. Both confinement probes are now optional
-  and local-only under the current test policy.
-  Both confinement verdicts remain inconclusive. LUA-9 through LUA-13 and
-  dependent integration slices stay blocked until the owner resolves the
-  deployment constraints and both required profiles have successful evidence.
-  Signed bundled macOS helpers may be evaluated while preserving headless CLI
-  operation; no assumed privileged install or paid signing account. Never weaken
-  isolation to convert an inconclusive proof into support.
-- **LUA-15's macOS verdict (#148) is `inconclusive`**, recorded in
-  [docs/archive/macos_confinement_verdict.md](docs/archive/macos_confinement_verdict.md) with
-  its probe at `packages/scripting-lua/macos/`. The retained experiments ran
-  on macOS 26.6 (`25G5065a`, arm64, Command Line Tools, linker ad-hoc signature,
-  no entitlement or privilege) — per-instance SBPL confinement, all four denied
-  accesses natively (three of them again from Lua; Lua has no socket API, and
-  that gap is named in the verdict rather than counted as a pass),
-  two-instance isolation including inherited descriptors, a fatal whole-process
-  footprint cap, an enforced execution budget, and the three lifetime endings.
-  It is not `supported` because both load-bearing mechanisms are unsupported:
-  `sandbox_init_with_parameters` (undeclared; the family its header does declare
-  is marked "No longer supported") and `posix_spawnattr_setjetsam_ext`
-  (undeclared SPI). Four measurements worth not rediscovering: a spawn-time
-  jetsam memory limit is **cleared by any later `exec`**, so an exec-based
-  wrapper such as `sandbox-exec` silently drops it and the helper must confine
-  itself; the cap is on **physical footprint**, so the threaded RTS's ~1.44 TiB
-  virtual reservation does not count against it; `RLIMIT_AS`/`RLIMIT_DATA`
-  cannot be installed below ~1.44 TiB in that helper (~415 GiB even in a trivial
-  C process) and so cannot express any mod budget; and App Sandbox — the
-  supported alternative — permits `exec`, shares one container per bundle
-  identifier, and leaves a `~/Library/Containers/<id>` an unprivileged process
-  **cannot delete**. A fifth, found in review: a confinement profile bounds what
-  a process may reach *by name* and says nothing about descriptors it was
-  *handed* — the parent's listening endpoints were inherited across the spawn
-  until `FD_CLOEXEC` and `POSIX_SPAWN_CLOEXEC_DEFAULT` closed them. Q-5's macOS
-  row is the owner's: accept the unsupported-SPI profile, accept a weaker App Sandbox contract, or drop macOS from this arc's
-  untrusted-mod targets. Until then the design stays `exploring` and LUA-9
-  through LUA-13 stay undrafted, whatever #147 concludes. The
-  [#176 review](docs/project_review/176.md) found that optimization removed the
-  intended native-buffer growth. #228, merged in PR #243, repaired the workload
-  and refreshed the retained evidence: the unlimited control retains distinct
-  Lua and native payloads, with all 16 native buffers checked after a major
-  collection. This closes that measurement defect, not the deployment or
-  Lua-side network-evidence gaps; the verdict remains `inconclusive`.
-- [Vulkan](docs/archive/vulkan_backend_design.md) has all delivery slices filed under
-  epic #155. Reconciled on 2026-09-23 against `80c974a`: shared toolchain #157,
-  native compatibility proof #158, pure ownership model #160, reusable
-  supervised graphics owner #218, and native provisioning #208 have merged.
-  Since that snapshot, the production native backend and window integration
-  (#219–#232) and the independent two-window triangle consumer (#233) have
-  merged. Epic #155 is complete; the
-  [milestone verdict](docs/archive/vulkan_milestone_verdict.md) records its final required
-  native profile on macOS and Linux, with both one and two frame slots.
-  Vulkan 1.3 minimum, a shared
-  loader, managed retention, present-fence retirement, and default two frame
-  slots are accepted design choices. #158 proved the native profile on both platforms and recorded it in
-  [docs/vulkan_compatibility_record.md](docs/vulkan_compatibility_record.md):
-  Vulkan 1.3 with dynamic rendering and synchronization2, one shared standard
-  loader, `VK_EXT_swapchain_maintenance1` present fences and image release, and
-  a transfer-source capture. Two things that record leaves unproved are easy to
-  assume wrongly later: the KHR maintenance spelling is an alias neither
-  MoltenVK nor Lavapipe resolves, and no device loss was induced, so those rows
-  are specification evidence. VK-4/#208 then promoted that profile into the
-  recipe: `tools/native/vulkan.pin` names the loader, driver, validation layer
-  and glslang compiler per platform, `tools/native/vulkan.py` provisions them
-  into `<native prefix>/vulkan`, and their identities reach the image
-  descriptor and the plan's toolchain map, so a changed input is an explicit
-  requalification rather than a silent drift. Both prefixes are **natively
-  qualified against the provisioned inputs**, by a second pair of records
-  retained beside the VK-2 pair: `docs/vulkan/linux-provisioned.md` from inside
-  the published image, and `docs/vulkan/macos-provisioned.md` from a local run
-  under the human's explicit approval for that one session. Reusing the VK-2
-  macOS record could not have done it — that record names versions and paths but
-  no binary or manifest digests, so it cannot establish that the identities the
-  prefix now records are the ones it consumed — which is why the consented run
-  was needed. The provisioned pair carries one source digest computed
-  independently on both platforms, as the VK-2 pair does. A third thing the
-  VK-2 record leaves unproved is a rule rather than an observation: a present fence's status before it is waited on is not a
-  contract on either platform, so the fence is waited for and nothing is read
-  into whether it happened to be signalled already. Later
-  native slices' #158 prerequisite is satisfied by PR #174. Host-retirement
-  repairs #166–#169 are also merged. Model/proof repairs #181–#184 and the
-  later publication/cancellation-test repairs #189–#190 are merged too.
-  The [#174 review](docs/project_review/174.md) remains historical evidence of
-  unsafe proof cleanup and missing construction rollback, repaired by
-  #181/#182; it is not a new prerequisite queue. Device idle alone is still
-  not presentation retirement. Preserve the repaired lifetime contracts when
-  implementing the production backend; the retained successful profile
-  evidence remains useful.
-- Test selection follows [the owner policy](docs/test_classification.md): quick
-  core contracts in the floor, relevant integration/tooling contracts selected
-  by changes, and optional local display-deadline/nontermination/confinement
-  probes. The external [quruntul](https://github.com/coghex/quruntul) lab, via
-  [its adapter](.quruntul/adapter.py), supplies `$test`/`$flake` selection,
-  claims and durable evidence; broader CI-5
-  receipt/scheduler work remains deferred. The old foundation umbrella is
-  architectural context, not another queue for duplicating completed arcs.
-- No game save schema, full Synarchy port, permanent RTS tuning, or general
-  engine-wide rendering abstraction is committed yet.
-
-## Where to look
-
-- [Logging/module authoring](docs/logging.md), [failures](docs/failures.md),
-  [recovery](docs/recovery.md), and the subsystem contracts above.
-- [Workflow](docs/workflow.md) for publication and the
-  [review ledger](docs/project_review/ledger.md) for project-review coverage,
-  recorded verification revisions, and legacy provenance. The old
-  [cursor](docs/project_review_boundaries.md) is retained migration evidence.
-  Historical reports keep their original baselines.
-- [Historical memory](docs/archive/history/memory_before_2026-09-17.md) for prior rationale
-  and delivery history; do not load it automatically or use its old open-issue
-  claims as a new work queue.
+- Cocoa: a live resize or menu tracking blocks GLFW's event call for the whole
+  interaction (68.9 s and 13.3 s measured); a window move does not. The graphics
+  owner keeps presenting, but window commands and observations still wait
+  ([verdict](docs/archive/graphics_owner_interaction_verdict.md)).
+- MoltenVK 1.4.2 or later: 1.4.0 sets the drawable to 1x1 when a swapchain is
+  recreated over an in-flight presentation.
+- The KHR swapchain-maintenance spelling is an alias neither MoltenVK nor
+  Lavapipe resolves; use the EXT extension. A present fence's status before it
+  is waited on is no contract: wait for it. Device idle is not presentation
+  retirement. No device loss was induced natively; those rows are specification
+  evidence.
+- The `lua` package's `-allow-unsafe-gc` is a correctness setting: a VM that held
+  a Haskell callback re-enters the RTS from its collector. An asynchronous
+  exception cannot cancel a thread inside Lua.
+- Linux confinement probe: `unshare(CLONE_NEWUSER)` is refused to a threaded
+  process, so fork first; `RLIMIT_AS` counts the RTS reservation (`-xr256m`); a
+  read-only bind remount must carry the source's locked flags; lowering
+  `RLIMIT_NOFILE` closes nothing, so sweep descriptors before the exec.
+- macOS confinement: a spawn-time jetsam limit is cleared by any later `exec` (so
+  `sandbox-exec` drops it); the cap is physical footprint; `RLIMIT_AS`/`RLIMIT_DATA`
+  cannot go below the RTS's ~1.44 TiB reservation; an unprivileged process cannot
+  delete an App Sandbox container; a profile does not cover inherited descriptors
+  (`FD_CLOEXEC`, `POSIX_SPAWN_CLOEXEC_DEFAULT`).
+- Remote CI is Linux-only; macOS native evidence is local.
