@@ -5,7 +5,7 @@ Implementation notes below were last reconciled on 2026-09-19 against code
 The architectural review entry point was added on 2026-09-20. Recheck Git and
 the tracker before relying on status.
 Working rules live in [AGENTS.md](AGENTS.md); historical context is preserved in
-[the memory archive](docs/history/memory_before_2026-09-17.md). Read only the
+[the memory archive](docs/archive/history/memory_before_2026-09-17.md). Read only the
 owning subsystem's contract/design when continuing its work.
 
 For an architectural review, run `$guide` (Codex) or `/guide` (Claude Code);
@@ -32,7 +32,7 @@ Guide is advisory and does not replace Kanban approval or project-review records
   `Camera/Types.hs`, `Camera/Base.hs` or dedicated `Camera/Vertex.hs`.
   Keep `Base`/`Types` below roughly 600 lines; split coherent subcomponents
   when they grow. The foundation layout is being proposed in
-  [its refactor design](docs/designs/foundation_modules_design.md).
+  [its refactor design](docs/archive/designs/foundation_modules_design.md).
 - On 2026-09-23 the owner requested documentation-only tracing design, with no
   issue drafts or filing. [Runtime tracing](docs/runtime_tracing_design.md)
   proposes opt-in GHC eventlog capture, bounded engine records and offline
@@ -202,9 +202,9 @@ Guide is advisory and does not replace Kanban approval or project-review records
   once.
 - LUA-14 (#147) is the Linux confinement and resource-limit feasibility proof,
   and **its verdict is `inconclusive`** — recorded in
-  [the Linux confinement verdict](docs/lua_linux_confinement_verdict.md), whose
+  [the Linux confinement verdict](docs/archive/lua_linux_confinement_verdict.md), whose
   three runs are kept verbatim in
-  [the retained runs](docs/lua_linux_confinement_evidence.md). The
+  [the retained runs](docs/archive/lua_linux_confinement_evidence.md). The
   candidate profile works: on an ordinary unprivileged Linux machine (Ubuntu
   24.04, kernel 6.8, aarch64, non-root, no capability) every row of Q-5's proof
   matrix was demonstrated. It works only where the distribution gives an
@@ -304,9 +304,9 @@ Guide is advisory and does not replace Kanban approval or project-review records
 - All three pre-Vulkan documents are fully processed into tracker artifacts;
   processing completion does not mean implementation completion. Their canonical
   approval comments amend the issue bodies and must be included by solvers.
-- [Test ownership](docs/test_architecture_design.md), epic #49: all children
+- [Test ownership](docs/archive/test_architecture_design.md), epic #49: all children
   have merged. Package suites and the root/tools separation are implemented.
-- [Scheduling](docs/runtime_scheduling_design.md), epic #131: #133, #134, #135,
+- [Scheduling](docs/archive/runtime_scheduling_design.md), epic #131: #133, #134, #135,
   #136, #138, #139 are all merged. Accepted: event/deadline/fixed-step updates
   with bounded catch-up; render suspension per window while simulation remains application-
   owned; committed demand retained across cancellation; expected wake failure
@@ -323,7 +323,7 @@ Guide is advisory and does not replace Kanban approval or project-review records
   [glfw.md](docs/glfw.md#the-supervised-graphics-owner)), with its backend
   operations injected and proved through fakes; VK-7/#219 supplies the Vulkan
   ones. VK-16/#232 measured the Cocoa progress
-  ([verdict](docs/graphics_owner_interaction_verdict.md), 2026-09-28). Its
+  ([verdict](docs/archive/graphics_owner_interaction_verdict.md), 2026-09-28). Its
   first session found a live resize starving the owner for 15.44 s: P-15's
   16 ms quiet period outlasted Cocoa's ~8.5 ms framebuffer changes, and the
   frames acquired nothing from a settling target. The owner then chose the
@@ -339,11 +339,11 @@ Guide is advisory and does not replace Kanban approval or project-review records
   testimony, not evidence), but
   not the stall: window commands and observations
   still wait for the pump, and a rendered latest snapshot does not mean
-  gameplay or input continued. The [verdict](docs/owner_loop_interaction_verdict.md) is historical
+  gameplay or input continued. The [verdict](docs/archive/owner_loop_interaction_verdict.md) is historical
   measurement, not a later policy decision. Its probe stays selectable, never
   routine. Simulation remains application-owned; scene snapshots can originate
   on any application thread without introducing a simulation driver in this arc.
-- [Window/graphics lifetime](docs/window_graphics_lifetime_design.md), epic #140:
+- [Window/graphics lifetime](docs/archive/window_graphics_lifetime_design.md), epic #140:
   #141, #142, #143, and #144 are merged. The current review report records
   follow-up repairs; #166–#169 have now merged. The review ledger records their
   verification separately from new Lua/GPU findings. One exclusive
@@ -383,7 +383,7 @@ Guide is advisory and does not replace Kanban approval or project-review records
   operation; no assumed privileged install or paid signing account. Never weaken
   isolation to convert an inconclusive proof into support.
 - **LUA-15's macOS verdict (#148) is `inconclusive`**, recorded in
-  [docs/macos_confinement_verdict.md](docs/macos_confinement_verdict.md) with
+  [docs/archive/macos_confinement_verdict.md](docs/archive/macos_confinement_verdict.md) with
   its probe at `packages/scripting-lua/macos/`. The retained experiments ran
   on macOS 26.6 (`25G5065a`, arm64, Command Line Tools, linker ad-hoc signature,
   no entitlement or privilege) — per-instance SBPL confinement, all four denied
@@ -416,14 +416,14 @@ Guide is advisory and does not replace Kanban approval or project-review records
   Lua and native payloads, with all 16 native buffers checked after a major
   collection. This closes that measurement defect, not the deployment or
   Lua-side network-evidence gaps; the verdict remains `inconclusive`.
-- [Vulkan](docs/vulkan_backend_design.md) has all delivery slices filed under
+- [Vulkan](docs/archive/vulkan_backend_design.md) has all delivery slices filed under
   epic #155. Reconciled on 2026-09-23 against `80c974a`: shared toolchain #157,
   native compatibility proof #158, pure ownership model #160, reusable
   supervised graphics owner #218, and native provisioning #208 have merged.
   Since that snapshot, the production native backend and window integration
   (#219–#232) and the independent two-window triangle consumer (#233) have
   merged. Epic #155 is complete; the
-  [milestone verdict](docs/vulkan_milestone_verdict.md) records its final required
+  [milestone verdict](docs/archive/vulkan_milestone_verdict.md) records its final required
   native profile on macOS and Linux, with both one and two frame slots.
   Vulkan 1.3 minimum, a shared
   loader, managed retention, present-fence retirement, and default two frame
@@ -481,6 +481,6 @@ Guide is advisory and does not replace Kanban approval or project-review records
   recorded verification revisions, and legacy provenance. The old
   [cursor](docs/project_review_boundaries.md) is retained migration evidence.
   Historical reports keep their original baselines.
-- [Historical memory](docs/history/memory_before_2026-09-17.md) for prior rationale
+- [Historical memory](docs/archive/history/memory_before_2026-09-17.md) for prior rationale
   and delivery history; do not load it automatically or use its old open-issue
   claims as a new work queue.
