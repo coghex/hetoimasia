@@ -11,9 +11,10 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-41/Q-6a revision 2: M1 service grants by VM role.
-The original Q-6a was not answered. D-43 accepts P-40's scope and delivery tags;
-D-42 supplies the runtime contract within that M1 boundary.
+The current checkpoint is P-42/Q-6b: Lua-requested asynchronous window creation.
+D-44 resolves Q-6a revision 2 with UI-only graphics; the original broader
+Q-6a was not answered. D-43 accepts P-40's scope and delivery tags; D-42
+supplies the runtime contract within that M1 boundary.
 This document is not authority to implement or file issues.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
@@ -1334,6 +1335,32 @@ Continue deep design for M1-touched contracts, then its APIs, vision/#145
 reconciliation and one-PR slices. This scope approval is not implementation
 or tracker-mutation authorization. Original Q-6a remains unanswered; re-ask
 its applicable M1-only service-grant choice next.
+
+### D-44. M1 graphics belong to the UI VM only
+
+**Delivery:** M1; narrows D-9's texture grants.
+
+Owner answer, **2026-10-21 20:32:12 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: UI VM only (Rec.)
+
+Authenticated relay: `het-manager`, message `88zsk5ymf3v35w8wxykyckq9yi`,
+posted **2026-10-21 20:32:12.222 UTC** in `#het-luafirst`, replying to
+Q-6a revision 2 message `24m9yw4ptg68rw3q5kzepx4b9n`.
+
+Accept P-41's A: presentation instances request textures, own window/texture
+resources and publish scenes. Logical instances load modules/data but cannot
+request texture leases in M1, expressly narrowing D-9. There is no forwarding
+or cross-VM graphics bridge; logical-only remains headless. Wrong-role graphics
+calls are refused before native action as ordinary Lua errors. D-42's terminal
+state-service guard remains separate. Both roles retain the approved runtime
+services, and Haskell retains native-thread and protected retirement duties.
+
+The manager presented this as matching the owner's UI-VM-draws-the-quad direction;
+the owner chose A rather than graphics in both VMs. This selects role grants,
+not exact window readiness, scene format, resource-sharing APIs or general input.
+Continue with M1 binding/lifetime contracts, starting with P-42/Q-6b.
 
 ## Proposals
 
@@ -3320,7 +3347,7 @@ approved tag is attached to every D-entry for readers arriving directly there.
 | D-6 | M1 foundation / L-MODS activation | Real root-qualified identity and one enabled game root; enabling mod roots later. |
 | D-7 | M1 | Once-per-VM module loading, shared exports and failed-import/cycle contract. |
 | D-8 | M1 | Hooks-only acquisition and instance context; no working state service. |
-| D-9 | M1 | Real async runtime content providers and result timing; role grants still need M1 Q-6a. |
+| D-9 | M1 | Real async runtime content providers and result timing; D-44 narrows texture grants to presentation. |
 | D-10 | M1 / L-RELOAD | Fingerprint/refuse/restart now; deliberate hot-swap later. |
 | D-11 | M1 | Root/file validation and no symlinks. |
 | D-12 | M1 | Required/optional result policy, bounded failures and cancellation. |
@@ -3385,7 +3412,7 @@ features now would exceed the requested milestone. Neither is recommended.
 
 ### P-41. M1 graphics bindings belong to presentation instances
 
-**Unapproved; only active checkpoint Q-6a revision 2. Delivery: M1.**
+**A accepted by D-44 through Q-6a revision 2. Delivery: M1.**
 This replaces the held P-39 question with the scope D-43 actually approved.
 Recommend A: presentation instances get the M1 window, texture-load/lease and
 2D scene-publication bindings. Both roles get scoped module/data loading,
@@ -3439,6 +3466,60 @@ Evidence remains the delivered GLFW/2D/texture service boundaries described
 under P-39 and the image2d sample. This is a role-grant proposal, not a claim
 that the M1 bindings are delivered. General input/advanced presentation parts
 of P-39 are later work under D-43, not carried into this revised question.
+
+### P-42. Lua requests a window asynchronously and owns the resulting lease
+
+**Unapproved; active checkpoint Q-6b. Delivery: M1.** Recommend A: a presentation
+hook requests a window with a title and initial logical dimensions. The engine
+validates the request and reserves bounded per-instance capacity before queuing
+native work. The call returns a pending request without waiting for GLFW or GPU
+setup; `init` can return, and a later update can observe success or failure.
+Exact names, limits and the request/result API are subsequent binding details.
+This is real Lua-driven creation, not a Haskell demo window opened unconditionally.
+
+The main thread creates the native window, and the graphics owner establishes
+its protected attachment. Success exposes an opaque, instance-owned window
+lease only after that setup is complete and scene publication can be accepted.
+It does not promise that a frame has been presented or that a minimized/zero-
+framebuffer window can currently draw. Rendering and native resize handling
+remain independent; readiness is not a render-frame callback. An empty window
+may be visible while the texture loads. Texture readiness and scene contents
+are separate contracts, not extra prerequisites for window success.
+
+Window creation is required in M1: failure fails the requesting operation under
+the approved role/boot failure policy, with instance attribution. There is no
+optional-window fallback or automatic retry. Invalid arguments are refused
+before native work. A pending request and any partial native acquisition remain
+engine-owned even if Lua loses the request, the instance ends or the session
+stops. Cancellation prevents delivery of a new usable lease; any late creation
+is retired through the protected path. It must never leak a window or report
+cleanup complete merely because cancellation was requested. CPU scope exit
+does not establish GPU retirement.
+
+The resulting lease follows the existing host rule: it belongs to the acquiring
+instance, and a shared module table cannot transfer it to another instance or
+extend its lifetime. Closing the demonstration window requests orderly session
+quit as D-43 already requires. This question does not add multiple-window
+policy, advanced window controls, general input, a public instance-spawn API or
+cross-instance window borrowing; exact supported window counts/control surface
+remain to be fixed in the M1 API contract.
+
+Alternative B: the launcher creates a window from manifest settings before
+presentation hooks and gives the UI instance its lease; Lua loads the texture
+and publishes scenes but does not request creation in M1. This reduces the new
+asynchronous window-request surface, at the cost of moving window orchestration
+into the launcher and requiring a later API extension for Lua-created windows.
+A is recommended because it exercises the ownership, cancellation and readiness
+boundary needed by the reusable Lua integration. Its cost is real pending-window
+machinery and testing stop/failure races, beyond the small visible quad.
+
+Evidence: [instance leases](../../packages/scripting-lua/README.md#instance-leases)
+already refuse use/release through another instance and retain cleanup without
+Lua cooperation. [Window lifetime](../archive/window_graphics_lifetime_design.md)
+requires main-thread native handling and verified graphics retirement. The
+[image2d sample](../../samples/image2d/README.md#the-windowed-mode) composes window
+adoption and scene publication in Haskell. These are mechanisms to reuse;
+the asynchronous Lua window binding proposed here is not already delivered.
 
 ## Open questions
 
@@ -3717,10 +3798,17 @@ threading and GPU lifetime obligations; M1 needs concrete safe boundaries.
 #### Q-6a. Are graphics/input services presentation-only or available to both roles?
 
 The original P-39 question was held at 19:38:08 UTC and remains unanswered.
-After D-43 scope signoff, **revision 2 is the only active checkpoint**, P-41:
-A (recommended, M1 window/texture/scene bindings in presentation, module/data/
-runtime services in both roles) or B (design logical-role graphics too).
-A explicitly narrows D-9 texture grants. No general input or mod API is included.
+Revision 2/P-41 is resolved by D-44: UI VM only, expressly narrowing D-9's
+texture grants. Both roles retain module/data/runtime services. No general
+input or mod API is included; B (graphics in both VMs) was not chosen.
+
+#### Q-6b. Does Lua request its window asynchronously or receive one from the launcher?
+
+**Active checkpoint, P-42.** A (recommended): a presentation hook requests a
+window, returns without waiting, and later receives its instance-owned lease
+after native/graphics setup; required failure and protected cancellation apply.
+B: manifest/launcher-created window handed to UI, with Lua creation deferred.
+This selects creation/readiness/ownership behavior, not advanced window features.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
@@ -3803,7 +3891,8 @@ Q-6, Q-8, Q-9 and remaining milestone APIs, not the deferred Q-5 state agenda.
 ### Q-12. Approve the milestone-1 scope, delivery tags and acceptance?
 
 Resolved by D-43: all six P-40 parts, acceptance and delivery tags approved.
-The original Q-6a remains unanswered; its M1-only revision 2 is now P-41.
+The original Q-6a remains unanswered; its M1-only revision 2/P-41 is resolved
+by D-44.
 
 ## Verification strategy
 
