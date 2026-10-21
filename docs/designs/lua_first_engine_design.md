@@ -9,7 +9,7 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current pass records direction and the session-loading checkpoint; it is
+The current pass records direction and the content-version checkpoint; it is
 not an approved specification or authority to implement or file issues.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
@@ -289,6 +289,36 @@ The decision affects module loading, boot and service bindings; it does not
 change the existing finite, non-suspending `init`/`shutdown` hook contract or
 decide when a running session may request new content.
 
+### D-9. Allow engine-owned content loading while the game runs
+
+Owner answer, **2026-10-21 15:08:24 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: load while running (Rec.)
+
+Authenticated relay: `het-manager`, message `6hvhxyv22ujd5r7savqihfrifa`,
+posted **2026-10-21 15:08:24.498 UTC** in `#het-luafirst`, replying to Q-2d
+message `yqjnh8cjcecnjsvhi4ckcmjdea`.
+
+Lua may request modules, data and textures from enabled roots during a running
+session, such as loading a room's content when entering it. The engine performs
+background loading through bounded requests with explicit pending, success and
+failure outcomes. Gameplay receives results at assigned logical ticks. A late
+required result holds its tick, without skipped work or increased `dt`, while
+rendering/presentation keeps its independent pace.
+
+D-8's hooks-only ownership remains in force and `init` gains no blocking or
+yielding wait. This choice requires concrete loader providers and their
+cancellation/cleanup contract over the existing request machinery. It does
+not select a result/await API, content-version policy, cache/eviction policy
+or failure escalation. Hot reload and enabling mods mid-session remain
+separate questions.
+
+Rejected: startup-only loading, which requires every future room's content to
+be preloaded or a new session to load it. Runtime loading supports ordinary
+Lua-authored game progression without that restriction. Loading, boot and
+service integration slices are affected; their boundaries remain undefined.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -320,40 +350,43 @@ and loading times remain to be designed within the approved boundary.
 
 ### P-5. Permit demand loading during a running session
 
-**Unapproved; active checkpoint Q-2d.** Recommend option A: hooks may request
-previously unloaded modules, data and textures from enabled content roots
-both during startup and during play. For example, entering a new room can
-request its textures then, instead of loading every room before the game starts.
-Native file reads, decoding and upload progress are engine-owned work, with
-bounded request admission and explicit pending/completed/failed results rather
-than an unbounded blocking native call on a Lua owner.
-
-Gameplay-visible results must enter at assigned logical positions under
-Lua D-23/D-36/D-39. A required result not ready at its assigned tick holds that
-tick; it cannot skip work or enlarge gameplay `dt`. Independently paced
-presentation can continue showing already available content and handle its
-own load results without advancing authoritative state by wall-clock timing.
-The later binding and boot designs must settle the exact request/await API,
-what counts as presentation-only, and failure policy. A finite `init` may
-initiate work but cannot gain a yielding wait merely from this choice.
-
-Alternative B restricts first acquisition/import of content to startup for
-this arc. A running session can use only what was loaded before it started;
-new room content needs preloading or a new session. It reduces runtime-loader
-scope but forces larger startup loads and constrains game authoring.
-
-A is recommended for the Lua-authored game's ordinary content needs. Its
-cost is concrete loading providers, bounds, cancellation/retirement and
-logical result placement, building on the existing request machinery. The
-current host already distinguishes arrival-based presentation requests from
+Accepted by D-9; retain this proposal ID as history. The current host already
+distinguishes arrival-based presentation requests from
 tick-assigned requests that hold a grant until the result is available
 (`packages/scripting-lua/README.md`, asynchronous requests); those mechanisms
 do not yet implement these content services.
 
-This choice affects loading, boot and service integration slices, still
-undefined. It grants no live reload or mid-session mod enablement, which
-remain separate scope choices, and settles neither content immutability nor
-cache/eviction policy. All module evaluation still obeys D-7/D-8.
+### P-6. Pin content versions and refuse changed bytes on a later load
+
+**Unapproved; active checkpoint Q-2e.** Recommended option A pins the session's
+content inventory and fingerprints at startup. Each later load verifies the
+exact bytes it will use against that inventory before exposing or executing
+them. A changed, removed or newly added path cannot silently change the
+session's content: its load fails with an attributed content-version error.
+Already loaded objects remain their original versions. Editing files for the
+next run is allowed; restarting establishes a new inventory.
+
+For example, the author edits an unvisited room's script while playing. On
+entering that room, A reports the version mismatch instead of running the new
+script in the old session. This preserves an explicit content identity for
+D-23 without retaining a private copy of every content byte. It requires
+inventory/fingerprint work, potentially reading all content at startup or
+using a prepared manifest; the preparation and bounded storage mechanism
+still need specification. Loading and decoding can remain on demand under D-9.
+
+Alternative B retains a private immutable snapshot of the session's content
+bytes, in engine-owned storage, and loads from it. Editing or deleting the
+original room file then leaves the running session able to load the original
+version. This avoids the changed-file failure but adds snapshot preparation,
+storage and cleanup, potentially covering an entire game's content.
+
+Both options make file edits take effect in a new session, not through an
+implicit live reload; neither changes D-7's once-per-VM evaluation. A is
+recommended as the smaller initial contract for fixed-content sessions.
+This affects boot/content identity, loading and deterministic qualification.
+It does not decide how a load failure affects its instance or session, the
+cache policy for decoded/GPU resources, or whether an explicit hot-reload
+feature belongs in a later arc. No content-version policy is approved yet.
 
 ## Open questions
 
@@ -367,8 +400,9 @@ epic's disposition are not settled by this answer.
 Settle modules, data and textures scoped to game/mod content roots, module
 identity/cache/cycles, cross-mod access, root/path and symlink handling,
 failure attribution and when loading is allowed. D-6 settles explicit root
-addressing, D-7 module reuse/cycle/failure behavior and D-8 the top-level
-effect boundary; engine API spelling and remaining loader behavior are open.
+addressing, D-7 module reuse/cycle/failure behavior, D-8 the top-level
+effect boundary and D-9 runtime loading. Engine API spelling and remaining
+loader behavior are open.
 
 #### Q-2a. Explicit content-root references or one merged override namespace?
 
@@ -390,11 +424,18 @@ This does not decide when new content may load during a session.
 
 #### Q-2d. May a running session load new content on demand?
 
-The only active checkpoint: P-5 option A (recommended, engine-owned runtime
-loading with bounded requests and deterministic gameplay result placement)
-or B (startup-only loading for this arc), or an owner-specified revision.
-The result/wait API, content immutability, cache policy and escalation of
-loading failures remain separate questions.
+Resolved by D-9: background loading during play, with explicit results and
+tick-assigned gameplay delivery that waits for required late results. The
+result/wait API, content versions, cache policy and escalation of loading
+failures remain separate questions.
+
+#### Q-2e. What happens if content files change during a session?
+
+The only active checkpoint: P-6 option A (recommended, pin inventory and
+fingerprints; reject changed bytes when loaded) or B (retain immutable content
+bytes so later loads still use the old version), or an owner-specified revision.
+Both defer edits to the next session without implicit hot reload. The concrete
+inventory/snapshot mechanism and failure escalation are not settled yet.
 
 ### Q-3. What is the generic executable's boot and session contract?
 
