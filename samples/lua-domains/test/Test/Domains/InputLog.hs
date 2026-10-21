@@ -15,7 +15,7 @@ import qualified Data.ByteString.Char8 as Char8
 import qualified Data.ByteString.Lazy as Lazy
 import Data.List (sort)
 import Data.Word (Word64)
-import Hetoimasia.Sample.LuaDomains (Bounds (boundPlaces, boundQueue), defaultBounds)
+import Hetoimasia.Sample.LuaDomains (Bounds (boundDelta, boundEntities, boundPlaces, boundQueue), defaultBounds)
 import Hetoimasia.Sample.LuaDomains.InputLog
 import Hetoimasia.Sample.LuaDomains.Intention (Answer (..), FullCause (..), Intention (..), Placement (..), Refusal (RefusedEntity), Submitted (Submitted))
 import Hetoimasia.Sample.LuaDomains.Queue (AdmitAt (..), closeQueue, seal, settle)
@@ -181,7 +181,6 @@ spec = describe "the input log" $ do
       [ ("tick zero", intentWith "tick" "0")
       , ("a tick past the session bound", intentWith "tick" "100001")
       , ("a place past the largest", intentWith "place" "256")
-      , ("a view past the session bound", intentWith "view" "100001")
       , ("an entity the world cannot have", intentWith "entity" "64")
       , ("a delta past the largest bound", intentWith "dx" "1001")
       , ("a negative delta past the largest bound", intentWith "dy" "-1001")
@@ -259,6 +258,30 @@ spec = describe "the input log" $ do
       recorderLog (acceptControl newRecorder) `shouldBe` Left ControlUndecided
       recorderLog (acceptControl (assignControlRecord pause (assignControlRecord pause newRecorder))) `shouldBe` Left ControlUndecided
       recorderLog (noteUnrepresentableControl newRecorder) `shouldBe` Left NotRepresentable
+
+    it "carries every input a valid bounded session accepts, at the extremes the live path takes: it records, renders and parses back" $ do
+      -- The widest configuration a session may have: 256 places, 64 entities and the largest delta bound.
+      let bounds = defaultBounds {boundPlaces = 256, boundQueue = 300, boundDelta = 1000, boundEntities = 64}
+      shared ← newSharedFor bounds
+      let extremes =
+            [ Submitted 1 100001 0 0 1 0
+            , Submitted 1 maxBound 63 maxBound 1000 (-1000)
+            , Submitted 1 0 0 0 (-1000) 1000
+            , Submitted 5 7 1 2 0 0
+            ]
+          filler = replicate 252 (Submitted 1 5 7 3 1 1)
+      answers ← forM (extremes <> filler) (submit shared)
+      answers `shouldBe` [Accepted (Placement 1 place) | place ← [0 .. 255]]
+      recorded ← recordedNow shared
+      case recorded of
+        Left problem → expectationFailure ("a record the live path accepted could not be recorded: " <> show problem)
+        Right records → do
+          length records `shouldBe` 256
+          let log' = logOf records
+              text = Lazy.toStrict (renderLog log')
+          parseLog text `shouldBe` Right log'
+          -- The longest line the format has fits the bound a line is given.
+          maximum (map ByteString.length (Char8.lines text)) `shouldSatisfy` (<= maxLineBytes)
 
     it "makes one record for each intention the queue accepted, and none for an offer it answered otherwise" $ do
       shared ← newSharedFor defaultBounds

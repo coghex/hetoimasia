@@ -183,7 +183,7 @@ import Hetoimasia.Runtime.Supervision
   , checkRuntime
   , supervisedWorker
   )
-import Hetoimasia.Sample.LuaDomains.Bounds (Bounds (..), defaultBounds, validateBounds)
+import Hetoimasia.Sample.LuaDomains.Bounds (Bounds (..), defaultBounds, maxSessionTicks, validateBounds)
 import Hetoimasia.Sample.LuaDomains.Candidate (Candidate (..), beginCandidate, commit)
 import Hetoimasia.Sample.LuaDomains.Canonical (Digest, digestSnapshot)
 import Hetoimasia.Sample.LuaDomains.InputLog
@@ -643,7 +643,11 @@ startDomains restore control config = do
   -- A finite session is made only if every record it can accept fits the input log: at most a tick's places and a tick's
   -- pending controls, for each of its ticks. The log's bound is thereby the bound of every valid bounded session, and a log
   -- never has to be cut short.
-  forM_ (configTicks config) $ \ticks →
+  forM_ (configTicks config) $ \ticks → do
+    -- The digest trace holds the initial state and one entry for each tick, and the input log names ticks up to this
+    -- bound: a finite session longer than it would end by exhausting the trace.
+    when (ticks > maxSessionTicks) $
+      throwIO (BoundsRefused ["a session of " <> show ticks <> " ticks is longer than the " <> show maxSessionTicks <> " ticks a session may have"])
     let most = toInteger ticks * toInteger (boundPlaces (configBounds config) + boundPendingControls (configBounds config))
      in when (most > toInteger maxRecords) $
           throwIO (BoundsRefused ["a session of " <> show ticks <> " ticks can accept " <> show most <> " records, and an input log holds " <> show maxRecords])

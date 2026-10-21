@@ -12,7 +12,7 @@ import Data.List (isInfixOf)
 import qualified Data.ByteString.Lazy as Lazy
 import Data.Word (Word64)
 import Hetoimasia.Sample.LuaDomains
-  ( Bounds (boundDelta, boundEntities, boundPlaces, boundQueue)
+  ( Bounds (boundDelta, boundEntities, boundPendingControls, boundPlaces, boundQueue)
   , Domains (domainsShared)
   , DomainsConfig (..)
   , DomainsDefect (BoundsRefused, ReplayNotAdmitted, ReplayRefused)
@@ -103,6 +103,21 @@ spec = describe "a replay through the admission seam" $ do
       outcome ← session 20000 defaultBounds {boundPlaces = 64}
       outcome `shouldSatisfy` \case
         Left (BoundsRefused [reason]) → "1360000 records" `isInfixOf` reason
+        _ → False
+      readIORef ran `shouldReturn` False
+      -- A configuration that could accept a place or a control no log can name, or a session longer than a trace holds, is
+      -- refused as well, whatever its records would come to.
+      places ← session 10 defaultBounds {boundPlaces = 257}
+      places `shouldSatisfy` \case
+        Left (BoundsRefused [reason]) → "TooManyPlaces 257" `isInfixOf` reason
+        _ → False
+      controls ← session 10 defaultBounds {boundPendingControls = 257}
+      controls `shouldSatisfy` \case
+        Left (BoundsRefused [reason]) → "TooManyPendingControls 257" `isInfixOf` reason
+        _ → False
+      longer ← session 100001 defaultBounds {boundPlaces = 1, boundPendingControls = 1}
+      longer `shouldSatisfy` \case
+        Left (BoundsRefused [reason]) → "100001 ticks is longer" `isInfixOf` reason
         _ → False
       readIORef ran `shouldReturn` False
       -- The most a session may be asked for, at the default bounds, is exactly what a log holds: it is made.

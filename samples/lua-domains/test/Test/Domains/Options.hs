@@ -8,20 +8,17 @@
 -- into a success.
 module Test.Domains.Options (spec) where
 
-import Control.Exception (finally)
 import Control.Monad (forM_)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Lazy as Lazy
-import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.List (isInfixOf, isPrefixOf)
-import System.Directory (createDirectory, createFileLink, doesDirectoryExist, doesFileExist, doesPathExist, findExecutable, getTemporaryDirectory, listDirectory, removeDirectoryRecursive)
+import System.Directory (createFileLink, doesDirectoryExist, doesFileExist, doesPathExist, findExecutable, listDirectory)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
-import System.IO.Unsafe (unsafePerformIO)
-import System.Process (getCurrentPid, proc, readCreateProcessWithExitCode)
+import System.Process (proc, readCreateProcessWithExitCode)
 import Hetoimasia.Sample.LuaDomains.InputLog (InputLog, renderLog)
 import Test.Domains.FixedLog (generateLog)
-import Test.Domains.Support (generous)
+import Test.Domains.Support (generous, withTempDirectory)
 import Test.Hspec
 
 -- | The executable's exit status, stdout and stderr.
@@ -29,20 +26,6 @@ runExe ∷ [String] → IO (ExitCode, String, String)
 runExe arguments = do
   executable ← findExecutable "hetoimasia-lua-domains" >>= maybe (fail "the executable is not on this test's search path") pure
   generous (readCreateProcessWithExitCode (proc executable arguments) "")
-
-counter ∷ IORef Int
-counter = unsafePerformIO (newIORef 0)
-{-# NOINLINE counter #-}
-
--- | A directory of the example's own, removed however the example ends.
-withTempDirectory ∷ (FilePath → IO a) → IO a
-withTempDirectory body = do
-  base ← getTemporaryDirectory
-  pid ← getCurrentPid
-  number ← atomicModifyIORef' counter (\held → (held + 1, held))
-  let directory = base </> ("lua-domains-options-" <> show pid <> "-" <> show number)
-  createDirectory directory
-  body directory `finally` removeDirectoryRecursive directory
 
 -- | The lines of a report or a trace that start with this word.
 linesWith ∷ String → String → [String]
@@ -167,19 +150,20 @@ spec = describe "the executable's record, replay and digest options" $ do
         doesFileExist path `shouldReturn` True
         listDirectory directory `shouldReturn` ["log.txt"]
 
-    it "reports an output error and never claims a recording that did not happen: no success line, no file, exit status 1" $
+    it "refuses a path that is a dangling symbolic link, which names nothing a recording may create, and creates nothing behind it" $
       withTempDirectory $ \directory → do
-        -- A path that looks free and cannot be written: a link to a file in a directory that is not there.
         let link = directory </> "dangling.txt"
-        createFileLink (directory </> "nowhere" </> "target.txt") link
-        (status, out, err) ← runExe ["--record", link, "--ticks", "5"]
-        status `shouldBe` ExitFailure 1
-        linesWith "record: wrote " out `shouldBe` []
-        length (linesWith "record: FAILED, nothing was recorded to " out) `shouldBe` 1
-        doesPathExist (directory </> "nowhere") `shouldReturn` False
-        err `shouldBe` ""
-        -- The session itself ran, and the report still says how it ended.
-        linesWith "ticks committed: 5" out `shouldBe` ["ticks committed: 5"]
+            target = directory </> "behind.txt"
+        createFileLink target link
+        runExe ["--record", link, "--ticks", "5"] >>= \found → usageRefusal found "the path exists"
+        doesPathExist target `shouldReturn` False
+
+    it "refuses an existing empty file as it refuses any other, and leaves it empty" $
+      withTempDirectory $ \directory → do
+        let existing = directory </> "empty.txt"
+        writeFile existing ""
+        runExe ["--record", existing] >>= \found → usageRefusal found "the path exists"
+        ByteString.readFile existing `shouldReturn` ""
 
   describe "--expect-digest, which compares the final digest" $ do
     it "exits 0 for a digest that matches and names both digests on a mismatch, exiting 1" $

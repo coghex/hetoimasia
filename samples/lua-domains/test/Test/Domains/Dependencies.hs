@@ -104,6 +104,7 @@ spec = describe "the package and import boundary" $ do
         , "stm"
         , "template-haskell"
         , "text"
+        , "unix"
         ]
 
   it "has an executable that depends on the sample, the runtime's lifecycle and the foundation, and no GLFW, Vulkan or console package" $

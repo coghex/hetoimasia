@@ -108,7 +108,7 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32, Word64)
-import Hetoimasia.Sample.LuaDomains.Bounds (Bounds (boundPendingControls, boundPlaces, boundQueue), maxDeltaLimit, maxEntities, maxSessionTicks)
+import Hetoimasia.Sample.LuaDomains.Bounds (Bounds (boundPendingControls, boundPlaces, boundQueue), maxDeltaLimit, maxEntities, maxPlacesPerTick, maxSessionTicks)
 import Hetoimasia.Sample.LuaDomains.Intention (Intention (..), Placement (..), Refusal, Submitted (..), refusalReason, validate)
 
 -- | Whether an intention acted in the session that took it.
@@ -197,17 +197,18 @@ maxLogBytes = maxHeaderBytes + 1 + maxRecords * (maxLineBytes + 1) + 64
 
 -- | The largest place or sequence a log names.
 maxLogPlace ∷ Word64
-maxLogPlace = 255
+maxLogPlace = fromIntegral maxPlacesPerTick - 1
 
 -- | Whether every field of a record is within what the format carries: the tick from one to the session bound, the
--- place and sequence to 'maxLogPlace', the view's tick to the session bound, the entity below the world's most and each
--- component of a delta within the largest bound a configuration may choose.
+-- place and sequence to 'maxLogPlace', the entity below the world's most and each component of a delta within the largest
+-- bound a configuration may choose. The view's tick and the version are any number the live path takes (it checks only
+-- that they are not negative), and the log carries each as the 64-bit number it is: nothing the live path accepts is out of
+-- the format's range, which the configuration's own bounds (places, pending controls, deltas, entities) guarantee.
 withinFormat ∷ Record → Bool
 withinFormat = \case
-  RecordIntention (Placement tick order) _ view entity _ dx dy →
+  RecordIntention (Placement tick order) _ _ entity _ dx dy →
     tickOk tick
       && fromIntegral order <= maxLogPlace
-      && view <= maxSessionTicks
       && entity >= 0
       && entity < maxEntities
       && deltaOk dx

@@ -31,6 +31,7 @@ module Test.Domains.Support
   , fxMarks
   , fxStamps
   , luaLines
+  , withTempDirectory
     -- * Reading the session
   , awaitUpdates
   , updatesNow
@@ -108,7 +109,10 @@ import Hetoimasia.Scripting.Lua.Scheduler (TimerBackend (TimerBackend))
 import Hetoimasia.Scripting.Lua.Value (Schema (SBoolean, SInteger, SText), Value (VBoolean, VInteger, VText))
 import Data.Maybe (isJust)
 import Numeric.Natural (Natural)
+import System.Directory (createDirectory, getTemporaryDirectory, removeDirectoryRecursive)
+import System.FilePath ((</>))
 import System.IO (stderr)
+import System.Process (getCurrentPid)
 import System.Timeout (timeout)
 import Test.Hspec (shouldBe)
 import Test.Support.Bounded (bounded)
@@ -308,6 +312,20 @@ fxMarks fx = reverse <$> readTVarIO (fxMarksVar fx)
 -- | A Lua source from its lines.
 luaLines ∷ [Text] → ByteString
 luaLines = Text.encodeUtf8 . Text.unlines
+
+-- | A directory of the example's own, removed, with what it holds, however the example ends.
+withTempDirectory ∷ (FilePath → IO a) → IO a
+withTempDirectory body = do
+  base ← getTemporaryDirectory
+  pid ← getCurrentPid
+  number ← atomicModifyIORef' tempCounter (\held → (held + 1, held))
+  let directory = base </> ("lua-domains-" <> show pid <> "-" <> show number)
+  createDirectory directory
+  body directory `finally` removeDirectoryRecursive directory
+
+tempCounter ∷ IORef Int
+tempCounter = unsafePerformIO (newIORef 0)
+{-# NOINLINE tempCounter #-}
 
 -- Reading the session -------------------------------------------------------------------------
 

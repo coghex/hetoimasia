@@ -14,6 +14,7 @@ module Hetoimasia.Sample.LuaDomains.Bounds
   , maxDeltaLimit
   , maxSessionTasks
   , maxSessionTicks
+  , maxPlacesPerTick
   , positionLimit
   , randomLimit
   ) where
@@ -37,6 +38,11 @@ maxSessionTasks = 16
 -- log are bounded by it (#500 requirements 2, 3 and 7).
 maxSessionTicks ∷ Word64
 maxSessionTicks = 100000
+
+-- | The most places an intention's tick, or a control's, may be configured to hold: the input log names a place with a
+-- number below this (#500 requirement 3), so a configuration that allowed more could accept what no log can hold.
+maxPlacesPerTick ∷ Int
+maxPlacesPerTick = 256
 
 -- | A position is clamped to the range from the negative of this to this, so that no
 -- sequence of moves can overflow a 64-bit integer.
@@ -115,6 +121,10 @@ data BoundsProblem
     DeltaTooLarge !Int
   | -- | More session tasks than 'maxSessionTasks'.
     TooManySessionTasks !Int
+  | -- | More places for a tick than 'maxPlacesPerTick'.
+    TooManyPlaces !Int
+  | -- | More pending controls than 'maxPlacesPerTick': a control's place is one of a tick's.
+    TooManyPendingControls !Int
   deriving (Eq, Show)
 
 -- | Every problem with a configuration, so that a refusal names all of them.
@@ -138,3 +148,5 @@ validateBounds bounds =
     <> [TooManyEntities (boundEntities bounds) | boundEntities bounds > maxEntities]
     <> [DeltaTooLarge (boundDelta bounds) | boundDelta bounds > maxDeltaLimit]
     <> [TooManySessionTasks (boundSessionTasks bounds) | boundSessionTasks bounds > maxSessionTasks]
+    <> [TooManyPlaces (boundPlaces bounds) | boundPlaces bounds > maxPlacesPerTick]
+    <> [TooManyPendingControls (boundPendingControls bounds) | boundPendingControls bounds > maxPlacesPerTick]

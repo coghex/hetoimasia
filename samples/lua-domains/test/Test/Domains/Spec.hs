@@ -13,6 +13,7 @@ import qualified Test.Domains.Controls
 import qualified Test.Domains.Delivery
 import qualified Test.Domains.Exposure
 import qualified Test.Domains.Failure
+import qualified Test.Domains.Files
 import qualified Test.Domains.InputLog
 import qualified Test.Domains.Intentions
 import qualified Test.Domains.Ledger
@@ -58,6 +59,7 @@ spec = after_ reapForked . describe "the two-domain Lua sample" $ do
   Test.Domains.Random.spec
   Test.Domains.Canonical.spec
   Test.Domains.InputLog.spec
+  Test.Domains.Files.spec
   Test.Domains.Replay.spec
   Test.Domains.Qualify.spec
   Test.Domains.Command.spec
