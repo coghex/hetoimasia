@@ -454,8 +454,9 @@ The owner was shown the validation, entry-routing and three-arrangement test
 cost, and chose this over "Approve, both VMs only". The one-role variants are
 therefore included, not merely examples. A gameplay-only session has no
 presentation owner to keep a UI responsive; presentation-only has no
-authoritative gameplay. Hook schema, tick settings, startup order and mod
-mapping remain open. No delivery readiness is implied.
+authoritative gameplay. D-15 through D-17 subsequently settle hook schema,
+tick settings and root cadence; startup order and mod mapping remain open.
+No delivery readiness is implied.
 
 ### D-15. Use optional init/update/shutdown on each root behavior
 
@@ -484,8 +485,9 @@ Engine cleanup remains authoritative even without successful Lua shutdown
 The manager illustrated a texture request in `init`, readiness checked in
 `update`, and `shutdown(self, reason)`. The illustrative content/readiness API
 names, including `api.content.texture`, were not approved by this choice.
-Tick duration, cadence, startup/readiness order, state initialization and
-failure escalation remain open. This document's D-15 is distinct from the
+Tick duration and cadence are subsequently settled by D-16/D-17;
+startup/readiness order, state initialization and failure escalation remain
+open. This document's D-15 is distinct from the
 prior Lua design's D-15 (general VM ownership).
 
 ### D-16. Fix an explicitly declared gameplay tick duration for each session
@@ -507,10 +509,35 @@ required loads delays progress without dropping ticks or stretching their
 duration. Rendering remains independent.
 
 The manager's 2x fast-forward example illustrated game-defined speed as Lua
-data; it did not approve an engine fast-forward or clock-rate API. Root update
-cadence, presentation timing, pacing mechanics and state-transaction suspension
-rules remain separate. An update's accumulated logical `dt` need not be one
+data; it did not approve an engine fast-forward or clock-rate API. D-17 later
+settles root cadence and presentation timing; pacing mechanics and
+state-transaction suspension rules remain separate. An update's accumulated logical `dt` need not be one
 tick, as P-12 explains.
+
+### D-17. Keep root update cadence in Lua beside the behavior
+
+Owner answer, **2026-10-21 15:46:36 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: in Lua, beside code (Rec.)
+
+Authenticated relay: `het-manager`, message `2nq5bq9c5gahasckv8mtwxzjwe`,
+posted **2026-10-21 15:46:36.851 UTC** in `#het-luafirst`, replying to Q-3d
+message `fc4ydfdi9uy76sfd6yk6qkjrgn`.
+
+P-13 option A is accepted: root behavior metadata in Lua supplies the update
+cadence. Gameplay uses a positive integer tick interval, defaulting to every
+tick. Presentation requires an explicit positive elapsed interval when it has
+an update; there is no default. Its timer is independent of rendering, merges
+late refresh demand and supplies actual elapsed `dt`. There is no frame-rate
+guarantee or render-frame callback.
+
+Without update the behavior is event-driven; cadence without update is an
+error. Validate before init and fix the cadence for the instance's life,
+using the existing scheduler rules. Changing the exported metadata afterward
+does not reschedule the instance. The illustrative `every = 2` field shown by
+the manager did not settle field names or grammar. Additional routines,
+rescheduling and state-transaction waits remain separate choices.
 
 ## Proposals
 
@@ -724,7 +751,7 @@ new scheduler mode.
 
 ### P-13. Declare root update cadence alongside the Lua behavior
 
-**Unapproved; active checkpoint Q-3d.** Recommend A: a root behavior with an
+**Option A accepted by D-17.** A root behavior with an
 `update` hook declares its cadence in Lua metadata beside that hook. The
 manifest continues to choose the VM role/clock and gameplay tick duration.
 Gameplay cadence is a positive integer number of logical ticks, defaulting to
@@ -764,6 +791,49 @@ Evidence: `packages/scripting-lua/README.md` (Cadence) provides `LogicalTicks`,
 `ElapsedEvery`, event-only admission, fixed lifetime intervals, one pending
 elapsed refresh and elapsed `dt` between update starts. The launcher/entry
 adapter must supply that admission configuration from the chosen source.
+
+### P-14. Finish both root initializers before normal session execution
+
+**Unapproved; active checkpoint Q-3e.** Recommend A: first validate the
+manifest/content inventory, then load and validate the selected entry exports
+and cadence in their VMs before running either root's `init`. Initialize
+gameplay first and presentation second, omitting an absent role. Only after
+all selected roots initialize successfully does normal session execution
+begin: gameplay tick grants, periodic updates and event callback delivery.
+There is no extra yielding setup hook or separate script-declared ready flag.
+
+Requests made in init may start their background work immediately; successful
+init does not wait for them. Results/callbacks remain subject to normal domain
+delivery once execution begins, including assigned gameplay ticks. Lua can
+show a loading screen and delay game-specific play while runtime content is
+pending. The engine's running state means the roots initialized, not that all
+assets or a playable world are ready. Initial state publication still needs
+the generic store contract; this proposal does not grant presentation a view
+of partially staged state.
+
+An entry/validation/init failure fails boot: do not begin normal execution,
+cancel pending interests and retire resources/owners already created. A root
+whose init failed does not receive shutdown; successfully initialized roots
+follow normal shutdown/cleanup. Failed cleanup remains authoritative (prior
+Lua D-27); exact diagnostic format and exit codes are a subsequent choice.
+Native commands requested by init can have effects, such as a window becoming
+visible: boot failure requires cleanup, not undo of every visible effect.
+
+Alternative B initializes presentation first and lets its updates/events run
+while gameplay initializes. It can display custom startup progress earlier,
+but needs a starting-state view and explicit rules for gameplay intents and
+controls before gameplay exists. A keeps that partial-start phase out of Lua's
+normal execution contract; its cost is no Lua loading UI during the initial
+scan, entry evaluation or root init. Both options can display Lua loading UI
+for pending runtime requests after init. Trusted nonterminating init is still
+not contained by either option.
+
+Evidence: `samples/lua-domains` starts gameplay init before UI and waits for
+initialization before gameplay grants. This proposal adds an explicit generic
+boot barrier and failure cleanup contract, rather than assuming the sample
+already gates every event/elapsed callback. The entry adapter must ensure
+queued request completions or connected events cannot bypass that barrier,
+with bounded buffering/admission and cancellation owned by startup.
 
 ## Open questions
 
@@ -855,12 +925,17 @@ cadence, presentation timing and transaction suspension rules are separate.
 
 #### Q-3d. Does root update cadence live with the Lua behavior or in the manifest?
 
-The only active checkpoint: P-13 option A (recommended, Lua behavior metadata)
-or B (manifest fields), or an owner-specified revision. Both use a positive
-gameplay tick interval, default one, and an explicit presentation elapsed
-interval when an update exists; cadence is fixed at admission and presentation
-updates are independent of rendering. Additional routines, state-transaction
-waits and exact field spellings remain separate choices.
+Resolved by D-17: P-13 option A, Lua behavior metadata, with the shared rules
+recorded there. `every` is an illustrative name only. Additional routines,
+state-transaction waits and exact field spellings remain separate choices.
+
+#### Q-3e. Do both roots finish init before normal session execution?
+
+The only active checkpoint: P-14 option A (recommended, validate entries then
+initialize gameplay and presentation before normal execution) or B (start
+presentation execution before gameplay initialization completes), or an
+owner-specified revision. Pending content does not delay successful boot;
+game-specific readiness is Lua state. Exact failure reporting follows.
 
 ### Q-4. How are mods discovered, ordered and combined?
 
