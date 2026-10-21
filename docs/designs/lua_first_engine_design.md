@@ -809,6 +809,29 @@ The answer does not select new callback signatures or make extension callbacks
 identical to lifecycle hooks. Registration/conflict handling, callback ownership
 and the separate hot-swap question remain open.
 
+### D-29. Match declared game/mod API revisions exactly
+
+Owner answer, **2026-10-21 17:18:05 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: exact revision (Rec.)
+
+Authenticated relay: `het-manager`, message `92543pjipmjfvn52x63kpuf32e`,
+posted **2026-10-21 17:18:05.622 UTC** in `#het-luafirst`, replying to Q-4h
+message `8kk4zg37vzwzkesbxftse74mje`.
+
+P-25 option A and its shared compatibility contract are accepted. Each
+game/mod declares a positive whole-number API revision. A mod declares a
+target game ID/revision or game-independence; required-mod dependencies name
+ID plus exact expected revision. Mismatches fail before Lua with expected
+and actual values, without automatic selection/download or accepted ranges.
+The author must update and verify a changed expectation before it is accepted.
+
+These are author assertions, not proof of semantic compatibility. API contract
+changes, including new API dependents require, advance the revision;
+implementation/content-only releases need not. Fingerprints, manifest-format
+version, engine binding compatibility and saves remain separate as P-25 states.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -1646,7 +1669,7 @@ choice whose remaining API/conflict details must be resolved before readiness.
 
 ### P-25. Check exact declared game/mod API revisions before Lua
 
-**Unapproved; active checkpoint Q-4h.** Recommend A: each game and mod manifest
+**Option A accepted by D-29.** Each game and mod manifest
 publishes a positive integer API revision for the interfaces/definitions it
 offers to mods. Each required-mod dependency names both the selected mod ID
 and the exact API revision it expects. A mod also declares either a target
@@ -1686,6 +1709,56 @@ and D-21/D-22 validate selected identities and required dependencies before
 Lua. They do not yet detect incompatible changes under an unchanged content
 ID. This is a proposed additional manifest validation contract, not existing
 host behavior or proof that arbitrary shared Lua code is compatible.
+
+### P-26. Store authoritative state as entities with Lua-defined components
+
+**Unapproved; active checkpoint Q-5a.** Recommend A: the generic engine state
+store owns entities with stable identities and named, schema-checked component
+records. Lua game/mod code declares component schemas and game rules; the
+engine validates and stores their data and commits changes at logical tick
+boundaries. It has no built-in player, enemy, health or other game-specific
+component types. This is a narrow state service, not a universal engine service
+registry or a place to store native subsystem owners.
+
+Illustratively, one player entity has position and health components; a world
+entity has weather and score components. Game-wide/singleton state can use
+such an entity rather than requiring a second global-state storage mechanism.
+These names/shapes are examples, not approved engine schemas. Entity creation,
+deletion, component attachment/removal and field changes are the operations
+whose staging/commit contracts follow. Lua can select entities by component
+presence; query ordering, bounds and exact API are separate decisions.
+
+Only schema-checked data belongs in authoritative state. Lua functions,
+coroutines, mutable VM table identity and live native resource handles stay
+outside it; an engine snapshot must not depend on a live Lua object. Exact
+value types, identifier/reference representation, schema registration/freeze
+rules and rejection behavior are the next contracts. Gameplay submits state
+changes; presentation consumes coherent committed views and sends intentions,
+preserving the domain boundary rather than mutating gameplay state directly.
+
+This chooses a logical data model. It does not require archetype storage,
+parallel systems, a new scheduling framework or a performance claim. Existing
+Lua hooks/routines remain the place for game logic. Physical layout should be
+chosen for a concrete implementation and measured needs. The engine continues
+to own the authoritative data and lifetime; Lua module tables may contain
+definitions and local working state but are not the committed world (D-3).
+
+Alternative B is a generic store of named, schema-checked tables/records,
+without built-in entity/component identity or component queries. Games model
+entities, relationships and lookup indexes in their own data convention.
+B suits document-shaped state and avoids requiring entity organization, but
+each game must define those common identity/query conventions. Both need
+bounded values, schema validation, deterministic transaction ordering and
+atomic tick publication; neither is arbitrary live Lua tables in the engine.
+A is recommended for a game engine's reusable identity/query foundation;
+its cost is entity/component modeling, including world entities for global
+state, and implementing their generic operations and validation.
+
+Evidence: `samples/lua-domains` already demonstrates a Haskell-owned entity
+world with staged per-tick changes and coherent snapshots, but its entity
+fields and transaction are sample-specific. No generic schema/component store
+is claimed delivered. D-3 selects engine ownership, while V-1 keeps concrete
+game rules out of engine packages; this proposal chooses the missing shape.
 
 ## Open questions
 
@@ -1859,10 +1932,10 @@ remain further design work; arbitrary shared-table mutations are not policed.
 
 #### Q-4h. Exact game/mod API revisions or accepted revision ranges?
 
-The only active checkpoint: P-25 option A (recommended, exact declared API
-revisions) or B (inclusive accepted ranges), or an owner-specified revision.
-The shared proposal includes an explicit target game or game-independent
-declaration and pre-Lua mismatch errors, without automatic version selection.
+Resolved by D-29: exact declared game/mod API revisions and the shared
+target-game/game-independent compatibility contract. Extension registration,
+conflicts and callback ownership will be revisited with the state/service
+design, rather than treating Q-4 as fully resolved.
 
 ### Q-5. What generic engine state does Lua define and mutate?
 
@@ -1872,6 +1945,14 @@ failure. Carry prior Lua D-23 and D-47/D-48's exact guarantees into this store. 
 whether saves and schema migration are excluded or included; Q-10 separately
 records the owner's interest in script hot-swapping;
 game-specific save semantics remain game-owned under the existing rules.
+
+#### Q-5a. Entity/component state or generic named records?
+
+The only active checkpoint: P-26 option A (recommended, engine-owned entities
+with Lua-defined component schemas) or B (schema-checked named tables/records
+with game-defined entity conventions), or an owner-specified revision. Exact
+values, schema registration, identity/query rules and transactional behavior
+remain separate decisions; no physical storage layout is selected here.
 
 ### Q-6. Which services and UI behavior does Lua drive in this arc?
 
