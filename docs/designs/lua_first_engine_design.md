@@ -1,7 +1,8 @@
 # Lua-first engine design
 
-Make Lua the authoring and orchestration surface for games and mods, over a
-generic engine that owns state and service lifetimes without knowing a game.
+Make Lua the authoring and orchestration surface over generic engine services.
+**Current milestone: boot, filtered Lua, content loading, mods, windows, input,
+rendering and textures; no gameplay state store (D-41).**
 This document carries request `user-het-luafirst-20261021-1435`.
 
 Design state: `exploring`
@@ -9,8 +10,9 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current pass records direction and the entry-lifecycle checkpoint; it is
-not an approved specification or authority to implement or file issues.
+The current checkpoint is P-38/Q-11: reconcile the remaining runtime decisions
+with D-41's narrowed scope. Proposed interpretations are not approved decisions.
+This document is not authority to implement or file issues.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -18,7 +20,7 @@ concrete precondition
 
 ## Processing status
 
-- [ ] EPIC. Run Lua-authored games and mods through a generic engine
+- [ ] EPIC. Expose engine boot/content/mod and presentation services to Lua
 
 No delivery slices are defined yet. Their boundaries and order depend on the
 owner's answers below. The umbrella's relationship to existing epic #145 also
@@ -26,13 +28,13 @@ needs explicit reconciliation; this entry does not request a duplicate epic.
 
 ## Epic contract
 
-- **Goal:** the executable starts Lua without game-specific Haskell; Lua
-  defines the game, routines, data and assets while the engine holds state
-  and implements protected services.
-- **Done when:** not settled. The briefing proposes a first runnable milestone
-  that boots Lua, opens a window and draws a texture, followed by input, the
-  generic state store, mods and UI. The final observable arc boundary needs
-  owner signoff.
+- **Goal:** the executable starts Lua without game-specific Haskell and exposes
+  protected boot, content, mod, window, input, rendering and texture services.
+  D-41 excludes gameplay concepts and the generic state store from this milestone.
+- **Done when:** precise acceptance and order remain open. The state store is
+  deferred, not a prerequisite or later slice inside this milestone. A state
+  service call prints an unavailable message and exits (D-41); its exact
+  reporting/termination integration awaits P-38 signoff.
 - **Users and operators:** game and mod authors, the owner running their
   content, and maintainers of the reusable engine and its Lua interfaces.
 - **Arc label:** None proposed.
@@ -98,22 +100,30 @@ No build, probe or desktop session ran for this draft.
 
 ## Desired experience and scope
 
-D-1 through D-3 below are the owner's settled direction; D-5 settles the
-standard-library exclusions and D-6 settles content addressing. Game and mod Lua
-orchestrate the game and use engine services without direct OS functionality.
-The engine stores the state generically and commits Lua-defined changes per
-tick, preserving deterministic simulation and explicit failure handling.
+D-41 is the controlling owner scope decision: this milestone has no gameplay
+state store and does not design gameplay concepts. D-3 and D-30 through D-40
+are preserved for a later arc, with no milestone implementation or verification
+obligation. Init/update/shutdown remain; calling a state service prints that it
+is unavailable in this milestone and exits. Q-5l/P-37 is withdrawn, not answered.
 
-The exact boot interface, mod composition, generic data model, bindings, UI
-scope and compatibility promises remain open. The briefing names windows,
-input, scenes, layers, sprites, textures and time for discussion, with 3D and
-audio later; this is a design agenda, not approved delivery scope.
+Boot, the filtered library, content loading, mods and Lua driving windows,
+input, rendering and textures remain in scope. Exact service coverage, UI
+construction, compatibility, vision/epic reconciliation and delivery order
+remain to be settled. P-38 audits every earlier decision for state dependencies;
+its logical-VM/tick and failure interpretations require signoff before proceeding
+to those remaining questions. The original briefing's broader state/replay
+agenda does not override this later owner decision.
 
 This design session changes only this document. Production code, tracker
 mutations, changes to the vision or prior design, review and issue processing
 are outside this session's authorized work. No subagents are used.
 
 ## Decisions
+
+**Scope precedence:** D-41 controls this milestone. Earlier decisions retain
+their historical wording/quotes; working-store clauses are not current scope.
+D-3 and D-30–D-40 are explicitly deferred. P-38 lists affected clauses in all
+other decisions and proposes replacements that still require owner approval.
 
 The quotations below arrived in the owner-supplied manager briefing, not as
 answers typed in this designer's pane. The authenticated manager's relay
@@ -142,6 +152,9 @@ The filtering profile is settled by D-5 (Q-1). The resulting disposition of the 
 confined branch is separately reserved for explicit reconciliation, Q-8.
 
 ### D-3. Engine holds, Lua defines
+
+**Deferred to a later arc by D-41; not a requirement of this milestone.**
+The original owner direction is preserved below, not deleted or implemented here.
 
 Owner, **2026-10-21, exact answer time not supplied**, in the manager's pane;
 same relay provenance:
@@ -459,6 +472,11 @@ tick settings and root cadence; startup order and mod mapping remain open.
 No delivery readiness is implied.
 
 ### D-15. Use optional init/update/shutdown on each root behavior
+
+**Revised by D-41:** the hooks stay, but no hook gains a working state service
+in this milestone. Any state-service call prints an unavailable message and
+exits. Exact exit integration is proposed in P-38; the original lifecycle
+decision below is preserved, with its state-initialization agenda withdrawn.
 
 Owner answer, **2026-10-21 15:36:57 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
@@ -834,6 +852,8 @@ version, engine binding compatibility and saves remain separate as P-25 states.
 
 ### D-30. Use engine-owned entities with Lua-defined components
 
+**Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
+
 Owner answer, **2026-10-21 17:25:15 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
 
@@ -868,6 +888,8 @@ identity/version rules and list/map support still need their own contracts.
 
 ### D-31. Use bounded nested component data with typed lists and maps
 
+**Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
+
 Owner answer, **2026-10-21 17:28:37 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
 
@@ -892,6 +914,8 @@ and canonical/query ordering remain open.
 
 ### D-32. Register component schemas at gameplay init and freeze for the session
 
+**Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
+
 Owner answer, **2026-10-21 17:34:31 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
 
@@ -912,6 +936,8 @@ separate decisions.
 
 ### D-33. Gameplay reads see earlier staged writes within the tick
 
+**Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
+
 Owner answer, **2026-10-21 18:18:50 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
 
@@ -931,6 +957,8 @@ told that what code observes depends on execution order; its deterministic
 contract follows next. No physical storage layout is selected.
 
 ### D-34. Fix gameplay to FIFO scheduling with deterministic admission
+
+**Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
 
 Owner answer, **2026-10-21 18:24:44 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
@@ -954,6 +982,8 @@ Exact input assignment, tick completion and suspension rules remain separate;
 this decision supplies no implicit commit permission at scheduler quiescence.
 
 ### D-35. Use explicit checkpoint waits for gameplay spanning ticks
+
+**Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
 
 Owner answer, **2026-10-21 18:27:19 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
@@ -982,6 +1012,8 @@ spelling and initial-state construction remain open.
 
 ### D-36. A rejected gameplay state mutation fails the tick
 
+**Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
+
 Owner answer, **2026-10-21 18:41:59 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
 
@@ -1004,6 +1036,8 @@ invalid mutations. Exact target validity, permissions, limits and query results
 remain separate contracts; this decision chooses rejection escalation.
 
 ### D-37. Entity references may outlive their targets
+
+**Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
 
 Owner answer, **2026-10-21 18:45:28 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
@@ -1028,6 +1062,8 @@ reference lifetime, not cross-mod write permission, exact ID representation
 or persistence. No automatic relationship cleanup is introduced.
 
 ### D-38. Trusted gameplay instances share state access
+
+**Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
 
 Owner answer, **2026-10-21 18:57:21 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
@@ -1055,6 +1091,8 @@ remain separate checkpoints.
 
 ### D-39. Write whole component values
 
+**Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
+
 Owner answer, **2026-10-21 19:00:22 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
 
@@ -1078,6 +1116,8 @@ or performance guarantee. Exact presence rules and signatures remain open.
 
 ### D-40. Queries return copied, ordered lists with fixed membership
 
+**Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
+
 Owner answer, **2026-10-21 19:12:41 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
 
@@ -1100,7 +1140,52 @@ game component types. The owner was told the full-copy cost and that large
 queries may be refused. Exact limits, identity encoding, result syntax and
 the presentation snapshot-acquisition contract remain open.
 
+### D-41. Defer gameplay state; deliver an engine-service milestone
+
+Owner scope decision reported at **2026-10-21 19:21:07 UTC**, in the manager's
+pane, replacing Q-5l. The owner's replies, verbatim and in order:
+
+> why should this even be in scope?
+
+The manager explained its reading that D-3/D-15 needed an init-state rule and
+offered a designer choice of A, B, or continued questions. The owner replied:
+
+> then i need to change d-3 and d-15, when init calls the state service, it needs to simply print and exit, this is just a milestone, i dont want to touch any gameplay concepts
+
+After the manager clarified three readings, the owner selected, verbatim:
+
+> Defer the state store
+
+The selected option was shown with this text (quoted option wording, not a
+separate free-form owner utterance):
+
+> The milestone has NO gameplay state store: D-3 and the state decisions D-30 to D-40 (entities, components, values, schemas, queries, writes) are deferred to a later arc. Any call to a state service just prints a 'not available in this milestone' message and exits. The milestone covers boot, the filtered library, content loading, mods and Lua driving windows, input, rendering and textures. Init/update/shutdown hooks stay.
+
+Authenticated relay: `het-manager`, message `ahptym5v44ee35afe5en96dkmi`,
+posted **2026-10-21 19:21:07.738 UTC** in `#het-luafirst`, replying to Q-5l
+message `3uzg7vi972ir7qjmi83yb8w9us`. Separate times for the preceding questions
+and free-form replies were not supplied.
+
+This revises D-3's scope and D-15's service availability as stated. Preserve
+D-30 through D-40 as recorded owner decisions for a later arc, explicitly
+deferred in full here, including D-34's scheduling selection and D-35's state
+checkpoint protocol. Withdraw Q-5l and its unapproved P-37; neither initial
+world option was accepted. Do not implement a substitute Lua gameplay store,
+world snapshot, entity/schema/query system or transaction/replay layer to fill
+the gap. Ordinary script locals and engine service/lifetime bookkeeping are
+not the deferred gameplay store.
+
+The manager asks for an exhaustive dependency audit and proposed milestone
+interpretations, especially the gameplay VM/ticks, before the remaining service,
+vision/epic and delivery questions. That audit is P-38/Q-11. D-41 approves the
+scope change itself, not the designer's subsequent reconciliation choices.
+
 ## Proposals
+
+**Scope precedence:** D-41 supersedes the original state-store agenda. Accepted
+proposals P-26 through P-36 are retained only for the later state arc. P-37 is
+withdrawn. State-dependent clauses in other historical proposals must be read
+with the P-38 audit; its replacements remain unapproved until owner signoff.
 
 ### P-1. A common filtered library profile for game and mod content
 
@@ -1980,6 +2065,8 @@ host behavior or proof that arbitrary shared Lua code is compatible.
 
 ### P-26. Store authoritative state as entities with Lua-defined components
 
+**Later arc only: deferred by D-41. The original accepted contract follows.**
+
 **Option A accepted by D-30.** The generic engine state
 store owns entities with stable identities and named, schema-checked component
 records. Lua game/mod code declares component schemas and game rules; the
@@ -2030,6 +2117,8 @@ game rules out of engine packages; this proposal chooses the missing shape.
 
 ### P-27. Allow bounded typed records, lists and text-key maps in components
 
+**Later arc only: deferred by D-41. The original accepted contract follows.**
+
 **Option A accepted by D-31.** Component schemas describe
 plain copied data using booleans, signed 64-bit integers, finite floats, UTF-8
 text, typed entity references and typed content references. Schemas can combine
@@ -2077,6 +2166,8 @@ Query order, canonical digest encoding, container edit granularity and schema
 registration remain later contracts.
 
 ### P-28. Register owned component schemas during gameplay init and then freeze
+
+**Later arc only: deferred by D-41. The original accepted contract follows.**
 
 **Option A accepted by D-32.** The game gameplay root
 and each gameplay mod instance register component schemas from their finite
@@ -2132,6 +2223,8 @@ checks, bounded validation and immutable schema publication.
 
 ### P-29. Gameplay reads see the current tick's staged changes
 
+**Later arc only: deferred by D-41. The original accepted contract follows.**
+
 **Option A accepted by D-33.** One engine-owned working
 state for the tick, shared by gameplay instances. Each successful state mutation
 updates that working state immediately; later gameplay reads see it, including
@@ -2181,6 +2274,8 @@ publication. It requires store read/write bindings and tick ownership work;
 it is not claimed as existing Lua host behavior. Delivery slices remain unset.
 
 ### P-30. Fix gameplay to the existing FIFO scheduler, with deterministic admission
+
+**Later arc only: deferred by D-41. The original accepted contract follows.**
 
 **Option A accepted by D-34.** Use the existing scheduler's
 FIFO policy for the gameplay VM, fixed for the session. Game and mod updates
@@ -2240,6 +2335,8 @@ the game's input-assignment policy or a generic state transaction coordinator.
 No delivery slices have been selected yet.
 
 ### P-31. Cross-tick waits explicitly finish the current tick's contribution
+
+**Later arc only: deferred by D-41. The original accepted contract follows.**
 
 **Option A accepted by D-35.** A gameplay update/event
 may span ticks, but crossing a tick boundary requires an explicit engine
@@ -2310,6 +2407,8 @@ individual-write rejection remain later checkpoints; slices remain unset.
 
 ### P-32. A rejected authoritative mutation fails the gameplay tick
 
+**Later arc only: deferred by D-41. The original accepted contract follows.**
+
 **Option A accepted by D-36.** An invalid attempt to
 mutate authoritative state during a gameplay tick records a gameplay failure.
 Examples include a wrong component value type, an out-of-range value, exceeding
@@ -2370,6 +2469,8 @@ and commit/accounting checks even when Lua catches the error. No such generic
 store policy is claimed implemented. Delivery slices remain unset.
 
 ### P-33. Entity references do not keep their targets alive
+
+**Later arc only: deferred by D-41. The original accepted contract follows.**
 
 **Option A accepted by D-37.** Entity references are
 non-owning identities. Deleting an entity removes that entity and its components
@@ -2434,6 +2535,8 @@ or delivery slice is claimed here.
 
 ### P-34. Trusted gameplay instances share state-write authority
 
+**Later arc only: deferred by D-41. The original accepted contract follows.**
+
 **Option A accepted by D-38.** The game's gameplay root
 and every enabled gameplay mod instance receive the same generic state service.
 During phases where state operations are allowed, they may read any entity/
@@ -2494,6 +2597,8 @@ slices remain unset.
 
 ### P-35. Write complete component values rather than nested mutation paths
 
+**Later arc only: deferred by D-41. The original accepted contract follows.**
+
 **Option A accepted by D-39.** Attaching a component
 supplies its complete initial value; replacing an existing component supplies
 its complete new value. Lua reads a copied component, edits that local copy
@@ -2549,6 +2654,8 @@ bindings; B adds a path/edit language beyond whole-value validation. No
 delivery slices are selected yet.
 
 ### P-36. Queries return bounded, ordered copies of matching entity references
+
+**Later arc only: deferred by D-41. The original accepted contract follows.**
 
 **Option A accepted by D-40.** A query names a set of
 required component types and returns a dense copied list of entity references
@@ -2612,7 +2719,8 @@ Delivery slices remain unset.
 
 ### P-37. Build a private initial world during gameplay init
 
-**Unapproved; active checkpoint Q-5l.** Recommend A: start gameplay initialization
+**Withdrawn by D-41; neither option accepted. Retained as design history only.**
+The former recommendation was A: start gameplay initialization
 with an empty, engine-owned initial working state. The game root and gameplay
 mods may use the ordinary state read/query/mutation service in their finite
 init hooks, alongside schema registration. They execute in D-25's existing
@@ -2680,6 +2788,137 @@ effectful init. Those decisions left initial value construction open. The
 sample starts with a Haskell-created world; this proposal adds generic Lua
 initial-state construction without changing the host's non-yielding init.
 Delivery slices remain unset.
+
+### P-38. Reconcile the runtime with the service-only milestone
+
+**Unapproved; only active checkpoint Q-11.** D-41 already selects no state
+store. The following six-part package is the designer's recommended reading
+of the remaining decisions, not an inferred owner decision. Approve or revise
+it before returning to service bindings, vision/epic reconciliation and slices.
+
+1. **A logical Lua owner, not a simulation store.** Keep D-14's manifest roles,
+   default pair and one-role variants. The existing `gameplay` role name means
+   the logical-clock Lua VM in this milestone: it runs the game's/mods' hooks,
+   ordinary Lua code and the non-state services later explicitly granted to
+   that role. Its ticks advance scheduler time, determine update cadence/`dt`,
+   wake logical waits and deliver assigned content results. They do not create,
+   validate, commit or publish game data. Keep D-16's required fixed positive
+   tick duration and D-17's cadence rules. No logical time accrues during boot.
+   The presentation role remains elapsed-time based; gameplay-only remains
+   headless, presentation-only is sufficient for a service/graphics example.
+   No substitute gameplay data model, game rules or Lua-state persistence is
+   designed. Ordinary locals/`self`/module tables remain ordinary Lua data.
+2. **Scheduling and content, without transactions.** Keep D-9/D-12's async
+   providers, pending/success/failure results and assigned delivery for the
+   logical owner; a late required result holds its due tick while presentation
+   progresses. Presentation uses its existing arrival/elapsed delivery. Use
+   the host's fixed FIFO policy, equal ordinary class for root/mod hooks and
+   stable root/dependency/ID admission; this is a new milestone proposal to
+   reuse that mechanism, not silently retaining deferred D-34. Use ordinary
+   host yielding and future-tick/result waits, with the existing one-active-
+   invocation/cadence rules. No D-35 checkpoint acknowledgement or per-hook
+   transaction proof exists. A tick's scheduler completion does not claim
+   successful world commit; there is no world commit. Supervision still
+   accounts for task/instance failures and resource retirement, and stops
+   grants when failure/stop is recorded; runtime completion is not cleanup
+   completion. No input-command/replay queue is added under this wording.
+3. **Status-only startup and cross-role observation.** Keep D-18/D-25's
+   concurrent roots, role-local mod-init order, early UI and joint logical-
+   owner start gate. Publish starting/role-ready/running/failure/ending status,
+   not an initial world, catalog or tick-0 state snapshot. Remove not-ready
+   world reads: state calls use D-41's unavailable exit before and after boot.
+   No gameplay intentions, authoritative snapshot channel or arbitrary Lua
+   data/message bus replaces the store in this milestone. Runtime status and
+   session stop are sufficient for the loading/error screen; detailed init
+   progress remains excluded. Generic runtime control bindings, if any beyond
+   quit, need explicit service-scope approval and may not smuggle game commands
+   back in. No direct cross-VM calls/shared Lua tables are introduced.
+4. **Failure means stop the owner, not restore state.** For ordinary post-boot
+   logical-root/mod failures, keep D-19/D-26's healthy UI continuation, bounded
+   role/mod-attributed error, refused new logical work, no retry and failure
+   exit outcome. Remove promises of a last committed/frozen world, discarded
+   state transaction or rollback. Effects already performed are not undone;
+   the UI renders using its own still-valid resources and state, with no
+   guarantee that the engine freezes the last picture. UI failures, boot
+   failures and fatal engine/provider/cleanup failures retain their existing
+   session-ending policies. Resource teardown remains protected, and status
+   must not claim it is finished while work/GPU retirement is outstanding.
+5. **Unavailable-state call: report and end the whole session.** Honor D-41
+   from either VM and any call context, including init/module evaluation,
+   update/events or shutdown: report `state service not available in this
+   milestone` and request terminal whole-session shutdown. Recommend stderr
+   (D-20 diagnostic convention) and orderly exit code 1 after engine-owned
+   cleanup. Catching a Lua error cannot cancel the terminal request. Unlike an
+   ordinary logical script error, this ends even a healthy UI because the
+   owner explicitly said exit. Do not call an immediate process-exit primitive
+   that bypasses protected native cleanup; D-20's second-signal force exit stays
+   the explicit exception. Make repeated calls while stopping idempotent and
+   retain the first diagnostic, without recursively restarting shutdown.
+   This is a small unavailable-service boundary, not implementation of the
+   deferred entity/schema/query API. Its exact exposed spelling belongs to
+   the service API decision; there is no fake empty store or successful no-op.
+6. **Narrow guarantees and remaining work.** Preserve the existing host's
+   conditional logical scheduling/result-order guarantees and failure/resource
+   accounting. Do not claim deterministic game-state evolution, canonical
+   world digests, saved initial worlds, transaction checkpoints or a replay
+   product. Prior Lua D-23/D-47/D-48 and the sample remain intact as repository
+   contracts/evidence; their state-commit applications belong to the later arc.
+   Time/randomness binding details remain Q-6; this proposal adds no new seeded
+   world RNG/replay subsystem. Renderer scene data, coherent service messages
+   and native resource bookkeeping remain service responsibilities; removing
+   the gameplay store does not remove those safety boundaries. Move straight
+   to the milestone's service surface,
+   exact vision/#145 reconciliation, outstanding boot/content/mod API choices,
+   hot-swap scope and dependency-ordered delivery after this signoff. No more
+   gameplay-state design checkpoints or state acceptance tests in this arc.
+
+The tradeoff in retaining the logical owner is explicit: the milestone still
+has two clock kinds, manifest tick validation and assigned-result scheduling,
+even though it has no simulated world or cross-VM gameplay data. That preserves
+earlier boot/mod decisions and uses delivered host mechanisms. If the owner
+wants a presentation-only milestone instead, revise parts 1–3 and the dependent
+manifest/mod contracts before recording a new decision; do not guess that the
+scope cut implicitly removed the logical VM. The default pair is a recommendation
+here, not a requirement newly derived from the absence of a store.
+
+#### Exhaustive earlier-decision audit
+
+All D-1 through D-40 were checked, including the proposals they accepted. The
+table identifies direct store dependencies and adjacent contracts whose meaning
+could otherwise be misleading. **Every proposed replacement below awaits Q-11
+signoff; D-41's deferrals and unavailable-state behavior are already approved.**
+
+| Decisions | Store dependency or affected wording | Proposed milestone interpretation |
+| --- | --- | --- |
+| D-1, D-3 | Broad Lua game orchestration and engine-held authoritative data. | D-1 motivates the service interface; D-3's store/commit application is deferred. No gameplay system is a milestone deliverable. |
+| D-8 | World/state access described as an allowed hook effect. | Hooks remain the ownership boundary for available services; they never make state available. The unavailable guard applies at top level too (part 5). |
+| D-9, D-12 | Runtime loads described as gameplay/room work with tick-assigned results. | Content loads are service requests. Retain logical result scheduling and optional data/texture failures without a transaction or room model (parts 1–2). |
+| D-14 / P-10 | Logical gameplay role; UI snapshots/intentions; one-role variants. | Keep role/clock/default choices as scheduling only; remove store views/intentions, retain runtime status, no replacement message bus (parts 1, 3). |
+| D-15 | State initialization left open under lifecycle hooks. | D-41 keeps hooks and makes every state call unavailable/terminal. Ordinary yielding hooks can orchestrate available services; no state checkpoint (parts 2, 5). |
+| D-16, D-17 | Tick duration/cadence justified partly by simulation and commit semantics; rendering consumes presentation data. | Keep scheduler time and `dt`, not a simulation contract; remove state-transaction rationale. Existing busy-instance cadence and renderer-owned scene publication remain (parts 1–2, 6). |
+| D-18 / P-14 | Not-ready gameplay reads, initial coherent world, intentions/controls at startup. | Status-only early UI/joint gate; no initial world and state calls exit at all phases. No gameplay-intention API (part 3). |
+| D-19 / P-15 | Last committed state, frozen UI world, discard/commit cutoff. | Healthy UI handles a logical-owner error status with its own resources; no state rollback/frozen-world promise. Account for shutdown without inventing a commit (part 4). |
+| D-20 | Error/quit/forced-exit outcomes; state failure was one diagnostic case. | Keep existing codes/streams/signals; propose unavailable-state stderr + terminal orderly exit 1, including healthy UI (part 5). |
+| D-23, D-24 | Mods contribute gameplay/presentation roles and share role VMs. | Keep owned instances and role validation against the retained clocks; a gameplay contribution runs logical hooks, not a game-state system (parts 1–2). |
+| D-25 / P-21 | Joint gate publishes initial gameplay view; world generation after mod init. | Retain activation gates/order and partial UI initialization; publish runtime status only. Remove world-generation/store obligations and examples as milestone work (part 3). |
+| D-26 / P-22 | Gameplay-mod failure preserves last good state. | Same status-only logical failure policy as root; preserve mod attribution, remove state restoration (part 4). |
+| D-27 / P-23 | Shutdown may outlive/observe failure; could imply state cleanup. | Keep self-contained native/resource cleanup and UI continuation for ordinary logical failure. No state-read/write teardown service; calls invoke part 5. |
+| D-28 / P-24 | Game extension APIs plus authoritative state services. | Retain explicit Lua extension points/no file remapping for service-facing content; remove working state service. No generic game-rule framework is added. |
+| D-29 | API revisions, with save/state compatibility mentioned as separate work. | Keep manifest API revision checks; no state/save schema versioning in this milestone. |
+| D-30, D-31, D-32 | Entities, component values and init-time schema registration. | Deferred in full by D-41; no empty catalog, schema-registration-only substitute or generic store. |
+| D-33 | Shared staged state and atomic public snapshots. | Deferred in full; runtime/native effects are not a transaction (parts 3–4). |
+| D-34 | FIFO policy selected in the shared-store discussion. | Deferred in full as instructed; part 2 explicitly proposes reusing only host FIFO/admission for this milestone. |
+| D-35 | Future waits acknowledge per-tick state contribution/commit eligibility. | Deferred in full; use host waits with no checkpoint, commit or rollback implication (part 2). |
+| D-36 | Rejected mutation poisons tick even if caught. | Deferred in full; no mutation API. Part 5's terminal unavailable-service rule is a separate scope guard, not a failed transaction. |
+| D-37, D-38, D-39, D-40 | Entity references, shared write authority, whole components, queries. | Deferred in full, including their read/refusal APIs; no placeholder reference/query surface. |
+| Prior Lua D-23/D-47/D-48; current evidence/verification | Deterministic state, commit fences/cutoff and sample digests/replay. | Keep delivered host guarantees/accounting; no new world/replay/commit acceptance. Exact narrower validation follows approved services (part 6). |
+| D-2, D-4–D-7, D-10, D-11, D-13, D-21, D-22 | No working-store dependency. | Trust/filtering, session/design process, roots/imports, fingerprints/no links, folder manifest, explicit mods and dependency order remain. D-10's hot-swap interest stays open; state migration is not silently brought into scope. |
+
+P-37 and Q-5l are withdrawn; no tick-0 initial-state protocol survives from
+that proposal. Q-5a–Q-5k and P-26–P-36 are later-arc history. Q-8/Q-9 and the
+verification/goal text above now reflect D-41's scope; their remaining exact
+reconciliation and acceptance choices still need approval. This audit changes
+only this design document, not the old Lua design, vision, sample or tracker.
 
 ## Open questions
 
@@ -2860,6 +3099,10 @@ design, rather than treating Q-4 as fully resolved.
 
 ### Q-5. What generic engine state does Lua define and mutate?
 
+**Deferred in full by D-41.** Q-5a through Q-5k preserve the later arc's decision
+history below; they are not current milestone requirements or active questions.
+The following original agenda is retained only for that future arc.
+
 Settle entities/components versus tables/schemas, validation, stable identity,
 read visibility while staging, atomic tick commit, bounded capacity and
 failure. Carry prior Lua D-23 and D-47/D-48's exact guarantees into this store. Settle
@@ -2937,11 +3180,8 @@ Read-budget refusals return no partial result and do not by themselves fail a ti
 
 #### Q-5l. May gameplay init populate the initial world?
 
-The only active checkpoint: P-37 option A (recommended, one private initial
-state built in gameplay init order and published at tick 0 only after the joint
-gate succeeds) or B (schema-only init, empty tick-0 world, values created in
-normal ticks), or an owner-specified revision. Both keep finite non-waiting init
-and the existing concurrent-UI startup/failure contract.
+Withdrawn by D-41. The owner chose to defer the entire store rather than either
+initial-world option. Do not continue this question in the current milestone.
 
 ### Q-6. Which services and UI behavior does Lua drive in this arc?
 
@@ -2986,16 +3226,19 @@ escalation follow.
 The manager proposes that V-9 and Q-5 cease to require confined processes for
 trusted mods, and LUA-9–13/16/17 cease to be required for that purpose, while
 LUA-14/LUA-15 verdicts remain historical evidence. The manager also reads V-1
-as making the Lua game the application with engine-held generic state.
+as making the Lua game the application with engine-held generic state. D-41 now
+defers that store: propose milestone wording about Lua consuming engine services
+without gameplay-state implementation, preserving the later-arc direction.
 These are proposals to present as exact reconciliation text for owner signoff.
 Do not edit `docs/vision.md`, the old design or #145 in this session. Decide
 the new arc's relationship to #145 before readiness or tracker processing.
 
 ### Q-9. What is the accepted delivery order and final scope?
 
-The briefing proposes the first runnable milestone as Lua boot with the
-filtered library, a window and a texture; then input, state, mods and UI.
-Confirm this order and split it into one-PR outcomes only after the dependent
+The original briefing's inclusion of a state-store slice is superseded by D-41.
+The remaining milestone is boot, filtered Lua, content loading, mods, windows,
+input, rendering and textures. Confirm its concrete order, UI scope and
+acceptance, then split it into one-PR outcomes only after the dependent
 choices above are settled. Identify verification, compatibility, persistence,
 migration and deliberate deferrals for each affected slice before readiness.
 
@@ -3015,6 +3258,17 @@ must explicitly reconcile D-7/D-10 where it changes them. Its scope and timing
 remain an owner decision before the final delivery plan; no slice is created
 merely from this interest.
 
+### Q-11. Approve the service-only runtime reconciliation?
+
+The only active checkpoint is P-38's explicitly enumerated six-part package,
+with its exhaustive earlier-decision audit: retain a logical scheduling VM and
+ticks without a world/transactions, keep content scheduling, use status-only
+startup/failures, make state calls terminal with diagnostic/cleanup, and limit
+determinism/replay claims. Approve the package or identify revisions, especially
+if the logical owner should be removed from this milestone instead. D-41 itself
+does not need reconfirmation. After resolution, return to Q-6, Q-8, Q-9 and the
+remaining milestone API questions, not the deferred Q-5 state agenda.
+
 ## Verification strategy
 
 Existing constraints to preserve: focused Hspec suites selected by the
@@ -3025,11 +3279,15 @@ qualifying command. A headless success proves no displayed result.
 Proposed acceptance families, to refine after owner decisions: forbidden
 library and alternate-reference checks; content-root refusal and attribution;
 boot/init/shutdown failures with engine-held cleanup; independent UI progress;
-generic-store canonical state at logical boundaries under varied execution
-delays with fixed inputs; failed-tick discard and the accounting cutoff;
 mod ordering/conflicts; Lua-authored rendered output checked by offscreen
 pixels and explicit windowed evidence. No new performance, hostile-code
 containment or cross-platform determinism claim is proposed.
+
+D-41 removes generic-store canonical-state, commit/discard, checkpoint and
+state-replay acceptance from this milestone. P-38 proposes narrower scheduler/
+result-order checks, status-only failure handling and the unavailable-state
+exit probe; those replacements require signoff. Existing sample tests/contracts
+remain historical/current repository behavior, not new milestone deliverables.
 
 ## Delivery plan
 
