@@ -1662,9 +1662,11 @@ the revision check does not add optional ordering edges. All selected mods,
 including content-only mods, participate in these manifest checks.
 
 An API revision is not a package release number or content fingerprint. Authors
-keep it unchanged for compatible releases and change it when their declared
-interface contract breaks; D-10 fingerprints still identify the exact session
-content. The launcher verifies the declarations, not the semantic correctness
+keep it unchanged when the advertised API contract is unchanged, and advance
+it when that contract changes, including new API that dependents need. A
+release changing only implementation/content may keep the same revision;
+D-10 fingerprints still identify the exact session content. The launcher
+verifies the declarations, not the semantic correctness
 of an author's compatibility claim. Save schemas, engine binding compatibility
 and the manifest format version remain distinct contracts; no save migration
 or dependency download/version solver is implied.
