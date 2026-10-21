@@ -10,8 +10,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-38/Q-11: reconcile the remaining runtime decisions
-with D-41's narrowed scope. Proposed interpretations are not approved decisions.
+The current checkpoint is P-39/Q-6a: select the service bindings by VM role.
+D-42 accepts the runtime reconciliation with D-41's narrowed scope.
 This document is not authority to implement or file issues.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
@@ -33,8 +33,8 @@ needs explicit reconciliation; this entry does not request a duplicate epic.
   D-41 excludes gameplay concepts and the generic state store from this milestone.
 - **Done when:** precise acceptance and order remain open. The state store is
   deferred, not a prerequisite or later slice inside this milestone. A state
-  service call prints an unavailable message and exits (D-41); its exact
-  reporting/termination integration awaits P-38 signoff.
+  service call prints an unavailable diagnostic and ends the whole session
+  through orderly failure cleanup (D-41/D-42).
 - **Users and operators:** game and mod authors, the owner running their
   content, and maintainers of the reusable engine and its Lua interfaces.
 - **Arc label:** None proposed.
@@ -110,8 +110,8 @@ Boot, the filtered library, content loading, mods and Lua driving windows,
 input, rendering and textures remain in scope. Exact service coverage, UI
 construction, compatibility, vision/epic reconciliation and delivery order
 remain to be settled. P-38 audits every earlier decision for state dependencies;
-its logical-VM/tick and failure interpretations require signoff before proceeding
-to those remaining questions. The original briefing's broader state/replay
+D-42 accepts its logical-VM/tick and failure interpretations. The original
+briefing's broader state/replay
 agenda does not override this later owner decision.
 
 This design session changes only this document. Production code, tracker
@@ -123,7 +123,7 @@ are outside this session's authorized work. No subagents are used.
 **Scope precedence:** D-41 controls this milestone. Earlier decisions retain
 their historical wording/quotes; working-store clauses are not current scope.
 D-3 and D-30–D-40 are explicitly deferred. P-38 lists affected clauses in all
-other decisions and proposes replacements that still require owner approval.
+other decisions; D-42 accepts its replacement milestone interpretations.
 
 The quotations below arrived in the owner-supplied manager briefing, not as
 answers typed in this designer's pane. The authenticated manager's relay
@@ -475,7 +475,7 @@ No delivery readiness is implied.
 
 **Revised by D-41:** the hooks stay, but no hook gains a working state service
 in this milestone. Any state-service call prints an unavailable message and
-exits. Exact exit integration is proposed in P-38; the original lifecycle
+exits. D-42 accepts P-38's exit integration; the original lifecycle
 decision below is preserved, with its state-initialization agenda withdrawn.
 
 Owner answer, **2026-10-21 15:36:57 UTC**, through AskUserQuestion in the
@@ -1180,12 +1180,43 @@ interpretations, especially the gameplay VM/ticks, before the remaining service,
 vision/epic and delivery questions. That audit is P-38/Q-11. D-41 approves the
 scope change itself, not the designer's subsequent reconciliation choices.
 
+### D-42. Retain logical scheduling and reconcile the service-only runtime
+
+Owner answer, **2026-10-21 19:28:09 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> Approve all six (Rec.)
+
+Authenticated relay: `het-manager`, message `b9bv8e44kd7w5q3t4jk3asavan`,
+posted **2026-10-21 19:28:09.801 UTC** in `#het-luafirst`, replying to Q-11
+message `6hx83nmctxvj4jwhkrhxpjjdaw`.
+
+All six parts of P-38, including its exhaustive earlier-decision audit, are
+accepted as this milestone's runtime contract: retain the logical-clock VM,
+fixed ticks/cadence, assigned content results and host FIFO scheduling without
+a world or transactions; use ordinary waits, status-only startup/cross-role
+observation and status-only logical-owner failures; terminate the whole session
+on a state-service call with an unavailable diagnostic on stderr and orderly
+failure exit 1 after protected cleanup; preserve only the stated host/service
+guarantees, without adding gameplay-state determinism, digests or replay.
+
+The manager summarized all six parts and the cost of two clocks and assigned-
+result machinery without a store. The owner did not choose the offered
+presentation-only milestone alternative. D-14's default pair and one-role
+variants therefore remain, including a headless logical-only arrangement.
+D-3/D-30–D-40 remain deferred; the reuse of host FIFO is approved here in its
+own right and does not reactivate the deferred state/checkpoint design.
+
+Proceed to the available service bindings, vision/#145 reconciliation and
+delivery order. Exact service grants, API spelling and acceptance details
+remain to be selected; this is not approval to implement or file issues.
+
 ## Proposals
 
 **Scope precedence:** D-41 supersedes the original state-store agenda. Accepted
 proposals P-26 through P-36 are retained only for the later state arc. P-37 is
 withdrawn. State-dependent clauses in other historical proposals must be read
-with the P-38 audit; its replacements remain unapproved until owner signoff.
+with the P-38 audit and its replacements accepted by D-42.
 
 ### P-1. A common filtered library profile for game and mod content
 
@@ -2791,10 +2822,9 @@ Delivery slices remain unset.
 
 ### P-38. Reconcile the runtime with the service-only milestone
 
-**Unapproved; only active checkpoint Q-11.** D-41 already selects no state
-store. The following six-part package is the designer's recommended reading
-of the remaining decisions, not an inferred owner decision. Approve or revise
-it before returning to service bindings, vision/epic reconciliation and slices.
+**All six parts accepted by D-42.** D-41 selects no state store. The following
+package and audit specify the approved milestone interpretation of the earlier
+runtime decisions. The original recommendation and its tradeoffs are retained.
 
 1. **A logical Lua owner, not a simulation store.** Keep D-14's manifest roles,
    default pair and one-role variants. The existing `gameplay` role name means
@@ -2813,8 +2843,8 @@ it before returning to service bindings, vision/epic reconciliation and slices.
    logical owner; a late required result holds its due tick while presentation
    progresses. Presentation uses its existing arrival/elapsed delivery. Use
    the host's fixed FIFO policy, equal ordinary class for root/mod hooks and
-   stable root/dependency/ID admission; this is a new milestone proposal to
-   reuse that mechanism, not silently retaining deferred D-34. Use ordinary
+   stable root/dependency/ID admission; D-42 approves reuse of that mechanism
+   for this milestone without reactivating deferred D-34. Use ordinary
    host yielding and future-tick/result waits, with the existing one-active-
    invocation/cadence rules. No D-35 checkpoint acknowledgement or per-hook
    transaction proof exists. A tick's scheduler completion does not claim
@@ -2879,14 +2909,15 @@ earlier boot/mod decisions and uses delivered host mechanisms. If the owner
 wants a presentation-only milestone instead, revise parts 1–3 and the dependent
 manifest/mod contracts before recording a new decision; do not guess that the
 scope cut implicitly removed the logical VM. The default pair is a recommendation
-here, not a requirement newly derived from the absence of a store.
+here, accepted by D-42 rather than derived from the absence of a store. The
+presentation-only milestone alternative was offered and not chosen.
 
 #### Exhaustive earlier-decision audit
 
 All D-1 through D-40 were checked, including the proposals they accepted. The
 table identifies direct store dependencies and adjacent contracts whose meaning
-could otherwise be misleading. **Every proposed replacement below awaits Q-11
-signoff; D-41's deferrals and unavailable-state behavior are already approved.**
+could otherwise be misleading. **D-42 accepts every replacement below;
+D-41's deferrals and unavailable-state behavior remain in force.**
 
 | Decisions | Store dependency or affected wording | Proposed milestone interpretation |
 | --- | --- | --- |
@@ -2919,6 +2950,74 @@ that proposal. Q-5a–Q-5k and P-26–P-36 are later-arc history. Q-8/Q-9 and th
 verification/goal text above now reflect D-41's scope; their remaining exact
 reconciliation and acceptance choices still need approval. This audit changes
 only this design document, not the old Lua design, vision, sample or tracker.
+
+### P-39. Presentation owns window, input and 2D graphics bindings
+
+**Unapproved; only active checkpoint Q-6a.** Recommend A: expose the milestone's
+window, native input, 2D scene/layer/sprite and GPU texture services to presentation
+root/mod instances. Both VM roles get scoped module/data loading, diagnostics/
+authored output, their own clock/waits, session status and orderly session quit.
+The state-service boundary exists only to report unavailability and exit under
+D-42. No game-state/input-intention service is added.
+
+| Service family | Logical (`gameplay`) role | Presentation role |
+| --- | --- | --- |
+| Scoped Lua module imports and data-file requests | Available; logical assigned results where asynchronous | Available; arrival/elapsed result delivery |
+| Logging/print, role-appropriate time/waits, session status/quit | Available | Available |
+| Windows and window controls | Refused | Available |
+| Native keyboard/pointer/text/window input | Refused | Available through bounded copied feeds/events |
+| 2D scenes, layers, sprites and scene publication | Refused | Available |
+| Texture loading/registration and texture leases | Refused | Available through scoped content loading and protected GPU services |
+| Gameplay state | Unavailable diagnostic and terminal exit | Unavailable diagnostic and terminal exit |
+
+This intentionally narrows D-9's earlier role-neutral texture-load wording:
+logical hooks can load modules and data, but cannot request texture leases in
+this milestone. D-12's optional texture loads remain available to presentation.
+The logical-only arrangement stays headless. There is no implicit forwarding
+of input, textures or scene commands between VMs, and D-42 adds no message bus.
+Logical code therefore cannot preload a texture for UI or drive a window by
+proxy. Presentation Lua itself orchestrates those services, including during
+logical-owner startup or after an ordinary logical-owner failure.
+
+Role grants are checked before a native action. A wrong-role call is a refused
+capability/script error, not a successful no-op or a route through the other
+VM; ordinary caught/uncaught Lua error rules apply. Only the state-service
+stub has D-42's unconditional terminal behavior. Namespace/function spelling,
+precise errors, service limits and individual controls follow with their API
+contracts; this proposal selects available families and ownership boundaries.
+
+Lua initiates work through narrow bindings; Haskell retains the process main-
+thread GLFW loop, native callback capture, graphics owner, validation and
+protected lifetime/retirement. Native callbacks never call arbitrary Lua on
+the GLFW thread. GPU completion remains distinct from CPU hook return, and
+texture/window leases belong to the acquiring presentation instance. Same-VM
+module tables do not transfer ownership merely by retaining a handle. Sharing
+resources between presentation instances still needs an explicit binding
+contract. The engine does not expose raw native pointers or a universal engine
+environment. These are service and resource boundaries, not gameplay concepts.
+
+Alternative B allows logical hooks to acquire/use graphics and native input
+too, with commands routed to the appropriate Haskell owner. That would require
+an explicit revision of D-42's headless logical-only arrangement, logical input
+assignment and graphics-result timing, plus rules for competing role writers.
+It does not require Lua to run on the native thread, but it expands the role/
+ordering contract. Choosing B would trigger that concrete revision before
+recording a new decision; it is not already authorized by the earlier generic
+word "services".
+
+A is recommended to keep graphics/input on the responsive presentation side
+and preserve the approved headless variant without a new cross-VM protocol.
+Its authoring cost is role-specific scripts: logical modules/data examples
+cannot also act as window/input/texture examples. It limits where services
+are available, not what game rules Lua may express privately. Exact window
+controls/close policy, input consumption, scene/texture sharing and Lua UI
+scope follow next; 3D/audio are not introduced here.
+
+Evidence: the delivered GLFW service uses main-thread ownership, bounded
+input feeds and narrow command ports; the 2D renderer consumes published
+per-window scenes on its graphics owner. The image2d sample composes these
+services in Haskell. This proposal selects their new Lua-role grants, not a
+claim that these bindings already exist. Delivery slices remain unset.
 
 ## Open questions
 
@@ -3190,6 +3289,14 @@ whether UI is authored in Lua over 2D and what text/widget scope that needs;
 what is later for 3D/audio. Haskell retains native threading and GPU lifetime
 obligations; the new binding and service boundaries need concrete contracts.
 
+#### Q-6a. Are graphics/input services presentation-only or available to both roles?
+
+The only active checkpoint is P-39: A (recommended, presentation owns windows,
+input, 2D scenes and texture leases; both roles have module/data/runtime services)
+or B (design an explicit extension allowing logical graphics/input too), or an
+owner-specified revision. A narrows D-9 texture loading to presentation and
+keeps D-42's logical-only arrangement headless; it adds no forwarding channel.
+
 ### Q-7. What is the default domain arrangement for games and mods?
 
 Settle the UI/gameplay pair and how mods map to owners/modules/instances.
@@ -3260,14 +3367,9 @@ merely from this interest.
 
 ### Q-11. Approve the service-only runtime reconciliation?
 
-The only active checkpoint is P-38's explicitly enumerated six-part package,
-with its exhaustive earlier-decision audit: retain a logical scheduling VM and
-ticks without a world/transactions, keep content scheduling, use status-only
-startup/failures, make state calls terminal with diagnostic/cleanup, and limit
-determinism/replay claims. Approve the package or identify revisions, especially
-if the logical owner should be removed from this milestone instead. D-41 itself
-does not need reconfirmation. After resolution, return to Q-6, Q-8, Q-9 and the
-remaining milestone API questions, not the deferred Q-5 state agenda.
+Resolved by D-42: all six parts of P-38 and its audit are accepted. The owner
+was offered a presentation-only milestone and did not choose it. Continue
+Q-6, Q-8, Q-9 and remaining milestone APIs, not the deferred Q-5 state agenda.
 
 ## Verification strategy
 
@@ -3284,9 +3386,10 @@ pixels and explicit windowed evidence. No new performance, hostile-code
 containment or cross-platform determinism claim is proposed.
 
 D-41 removes generic-store canonical-state, commit/discard, checkpoint and
-state-replay acceptance from this milestone. P-38 proposes narrower scheduler/
+state-replay acceptance from this milestone. D-42 accepts P-38's narrower scheduler/
 result-order checks, status-only failure handling and the unavailable-state
-exit probe; those replacements require signoff. Existing sample tests/contracts
+exit probe. Exact acceptance commands follow the service/slice decisions.
+Existing sample tests/contracts
 remain historical/current repository behavior, not new milestone deliverables.
 
 ## Delivery plan
