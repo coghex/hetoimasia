@@ -149,7 +149,7 @@ same relay provenance:
 > Engine holds, Lua defines
 
 The option offered to the owner was: Lua defines data and rules; the engine
-stores state generically and commits Lua's changes per tick, keeping D-23 and
+stores state generically and commits Lua's changes per tick, keeping prior Lua D-23 and
 V-4 guarantees. The generic representation and transaction API are Q-5.
 
 ### D-4. Hold a fresh design session
@@ -269,7 +269,7 @@ message `wwe79m6c9vwsifzesj3rmpdcie`.
 
 Before answering, the owner requested a fuller explanation. The manager
 contrasted loading a player's texture at `player.lua` top level with doing
-so in `init`, explained D-27 cleanup ownership, the lack of an owning
+so in `init`, explained prior Lua D-27 cleanup ownership, the lack of an owning
 instance for a shared module, and failure halfway through an import. The
 owner then selected A after it was presented again.
 
@@ -760,6 +760,30 @@ content failures and caught Lua errors retain P-22's boundaries. Startup,
 fatal host/cleanup behavior and prior Lua failure accounting remain unchanged.
 Additional Lua-created instance/task ownership and teardown order remain open.
 
+### D-27. Keep shutdown self-contained without a mod ordering guarantee
+
+Owner answer, **2026-10-21 17:11:17 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: self-contained (Rec.)
+
+Authenticated relay: `het-manager`, message `683xirne97p9zymsded24s8v92`,
+posted **2026-10-21 17:11:17.801 UTC** in `#het-luafirst`, replying to Q-4f
+message `3mkpt2477apdbgk5m4fxfirf22`.
+
+P-23 option A is accepted: each root/mod shutdown hook is self-contained,
+with no promised relative order and no assumption that another mod is still
+alive. Hooks are optional, finite, may fail and are skipped when Lua is unsafe.
+Engine-owned cleanup remains authoritative independently of hook success;
+resource/provider/GPU dependencies stay held until safe retirement. This does
+not require scripts to discover and release everything themselves or promise
+immediate release while a provider is still using it.
+
+No reverse-activation shutdown phase is introduced. The existing orderly and
+failure paths, D-19/D-26's surviving healthy UI and D-20's forced-exit exception
+remain as recorded in P-23. This document's D-27 is the shutdown-order choice;
+prior Lua design D-27 is the underlying engine-owned cleanup contract.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -901,7 +925,7 @@ by the instance after `init` returns. `update` and event callbacks may suspend
 through the existing task/request machinery. Gameplay updates use logical
 time; presentation updates use elapsed time. Their cadence defaults and
 startup ordering remain separate decisions. `shutdown` is optional, finite
-and non-suspending; cleanup still occurs if it is absent or fails (D-27).
+and non-suspending; cleanup still occurs if it is absent or fails (prior Lua D-27).
 
 For example, `init` requests the player's texture and returns with its pending
 request recorded in `self`. An update or callback uses the texture once ready.
@@ -1503,7 +1527,7 @@ without treating the host's default instance isolation as proven recovery.
 
 ### P-23. Make shutdown self-contained, without a mod ordering guarantee
 
-**Unapproved; active checkpoint Q-4f.** Recommend A: root/mod `shutdown`
+**Option A accepted by D-27.** Root/mod `shutdown`
 hooks must not rely on another instance, dependency or role still serving.
 The launcher promises no relative order between their hooks. A hook may use
 its own still-live handles and local/pure helpers, but cannot depend on another
@@ -1545,6 +1569,55 @@ already skip Lua hooks on unsafe exit, drain instance holdings even after
 hook failure and retain asynchronous retirements. The headless runner's
 ascending instance-ID shutdown order is its own policy, not a dependency
 ordering guarantee for this new launcher.
+
+### P-24. Replace game behavior through explicit game APIs, not content remapping
+
+**Unapproved; active checkpoint Q-4g.** Recommend A for this arc: mods extend
+or deliberately replace game definitions through explicit Lua APIs/extension
+points which the game exposes, and mutate authoritative state through approved
+engine state services. The engine supplies lifecycle, content and generic
+services without knowing which game-specific rule, item, sprite definition
+or UI feature is replaceable. Games choose those extension contracts; a mod
+cannot assume every game exposes the same ones.
+
+For example, a game could expose a named player-appearance definition which
+accepts an explicit reference to a texture in a mod's root. The game then
+uses that reference; requesting the game's original texture path still names
+the game's original content. Likewise a game can expose a rule/behavior
+extension instead of redirecting the engine's module loader. These are
+illustrations of the approach, not approved API names, object schemas or a
+cross-instance callback protocol.
+
+There is no launcher-wide file/module replacement map, merged content tree,
+or automatic winner based on activation order. Root/path identity and D-7's
+cache keep their existing meaning. This supported extension approach does
+not prevent trusted Lua from mutating shared exports (D-7/D-23), and promises
+no security boundary or automatic conflict detection for arbitrary table
+writes. Exact registration, collision handling and callback ownership must
+still be specified with the state/service contract; ordinary mod hooks keep
+their engine-owned instance context. Native engine services, VM clocks and
+the filtered-library policy are not game definition slots which mods replace.
+
+Alternative B adds explicit engine content remapping: mod declarations name
+which root/path to redirect to another selected root/path, including Lua
+modules or textures. B supports asset/code replacement without a game-provided
+extension point, but requires a conflict rule, remapping-cycle validation,
+source/cache identity, fingerprint and provenance rules, and reconciliation
+with D-6/D-7. It must never silently become load-order precedence. If chosen,
+design that concrete revision before recording a replacement contract.
+
+A is recommended because it retains explicit content identity and keeps
+game-specific extension meaning in Lua. Its cost is that the game author
+must expose useful APIs; this arc would not promise generic file/module
+overrides for games which were not authored to support them. This choice does
+not decide Q-10's deliberate development hot-swap protocol or permanent
+exclusion of future replacement facilities.
+
+Evidence: D-6 explicitly rejected implicit root overrides and reserved deliberate
+replacement; D-7 fixes module identity to root/path; D-1 keeps game rules in Lua.
+Neither current host module loading nor the selected mod lifecycle supplies
+an engine-wide replacement resolver. This is a supported composition-surface
+choice whose remaining API/conflict details must be resolved before readiness.
 
 ## Open questions
 
@@ -1612,7 +1685,7 @@ failure authority and D-10's version checks remain intact.
 Settle content root and entry selection, startup validation, init, logical
 updates, presentation/UI updates and shutdown; boot/session failure reporting,
 exit behavior and compatibility with the existing headless `lua` command.
-Keep D-27 cleanup independent of successful Lua shutdown.
+Keep prior Lua D-27 cleanup independent of successful Lua shutdown.
 
 #### Q-3a. Does the game folder declare its entry point?
 
@@ -1707,10 +1780,16 @@ recoverability flag or automatic disable-and-continue.
 
 #### Q-4f. May shutdown depend on a particular mod/root teardown order?
 
-The only active checkpoint: P-23 option A (recommended, self-contained hooks
-with no relative ordering guarantee) or B (reverse activation order on orderly
-shutdown only, with failure-path exceptions), or an owner-specified revision.
+Resolved by D-27: self-contained hooks with no relative ordering guarantee.
 Engine-owned lifetime/retirement guarantees apply independently of hook order.
+
+#### Q-4g. Game-defined replacement APIs or an engine content-remapping facility?
+
+The only active checkpoint: P-24 option A (recommended, explicit Lua game
+extension APIs with no engine file/module remapping in this arc) or request
+B (explicit remapping) for a concrete D-6/D-7 revision, or specify a revision.
+Registration/conflict handling and callback ownership remain further design
+work; arbitrary shared-table mutations are not automatically policed.
 
 ### Q-5. What generic engine state does Lua define and mutate?
 
