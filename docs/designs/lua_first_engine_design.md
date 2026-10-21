@@ -637,8 +637,31 @@ those roots. Listing order does not itself decide execution or overrides.
 
 The example `--mod` spelling remains illustrative. Saved profiles and a
 mod-selector screen were described as later design possibilities, not an
-approved feature or delivery commitment. Dependency ordering, compatibility,
-mod activation and override policy remain open.
+approved feature or delivery commitment. D-22 subsequently settles dependency
+ordering; compatibility, mod activation and override policy remain open.
+
+### D-22. Use required dependencies and deterministic mod activation order
+
+Owner answer, **2026-10-21 16:28:18 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: requires only (Rec.)
+
+Authenticated relay: `het-manager`, message `m6na7hiduq4ifvx3f8bxaremn2`,
+posted **2026-10-21 16:28:18.258 UTC** in `#het-luafirst`, replying to Q-4b
+message `c3dyjijbv6xz5he7ynupqvycs2`.
+
+P-18 option A is accepted: manifests declare required mod IDs, all already
+selected at launch. Missing/self dependencies or cycles fail before Lua.
+Dependencies activate before dependents; exact mod-ID order breaks ties among
+eligible mods, never launch-list order, folder enumeration or locale. Startup
+diagnostics show the resolved order. There are no optional before/after hints
+in this contract; ordering without a requirement is a later extension.
+
+This fixes mod activation order, not cross-VM completion order, module import
+evaluation, asset readiness or override precedence. Version compatibility and
+activation's relationship to root init remain open. P-18 retains those
+boundaries and its evidence.
 
 ## Proposals
 
@@ -1124,7 +1147,7 @@ launcher work; none of those decisions alone chooses automatic discovery.
 
 ### P-18. Order mod activation by declared required dependencies
 
-**Unapproved; active checkpoint Q-4b.** Recommend A: each mod manifest may
+**Option A accepted by D-22.** Each mod manifest may
 declare required mod IDs. All must already be in the explicit selection
 (D-21); do not automatically expand it. Validate the dependency graph before
 Lua: missing dependencies, self-dependencies and cycles fail boot, with the
@@ -1165,6 +1188,57 @@ Evidence: D-21 already requires missing selected dependencies to fail boot,
 but neither it nor the existing Lua module loader defines mod activation
 ordering. This manifest graph/resolution stage is new launcher work. Actual
 activation ownership and the domain mapping still require Q-4/Q-7 decisions.
+
+### P-19. Give each mod its own instances inside the existing role VMs
+
+**Unapproved; active checkpoint Q-7b.** Recommend A: game and mod gameplay
+code share the session's gameplay VM; game and mod presentation code share
+its presentation VM. A mod contributing to both roles has one primary
+engine-owned instance in each, separate from the game's root instance. Those
+instances use the same optional init/update/shutdown and Lua cadence contract
+as the roots (D-15/D-17). Each has its own `self`, connections and resource
+leases, with mod content ID, role and source recorded for diagnostics.
+The engine invokes mod hooks in their owning instance context rather than
+having the game call them as ordinary functions under the game's root owner.
+
+Keep D-14's at-most-one-VM-per-role launcher arrangement. D-7's module cache
+and export sharing apply within each VM: importing the same root/path reuses
+its exports, including shared mutable Lua module state. Separate instances
+provide cleanup ownership and attribution; they do not promise rollback or
+independent module state. D-8 still prohibits top-level resource acquisition.
+A mod's gameplay and presentation copies share no Lua object references and
+communicate only through approved engine snapshots/intentions/services.
+
+The cost of sharing a VM is a shared execution bottleneck: a non-yielding
+mod can hang that role's game and other mods, and shared Lua tables can be
+mutated by their users. The other role has its own owner, subject to the
+existing trusted-code and native-service limits. This follows the owner's
+trusted-mod choice; it does not claim hostile isolation. An ordinary mod
+instance failure's escalation still needs an explicit policy because its
+shared state may already have changed.
+
+Alternative B gives each mod a separate VM for each role it contributes to.
+It separates module/global state and VM execution from the game's VM, but
+adds owners, scheduling and snapshot/command boundaries for mod interaction;
+imports have separate caches and cannot directly share exports across those
+VMs. It still supplies no process-level memory or hostile-code containment.
+B would revise D-14's current launcher limit for mod-owned VMs and require a
+concrete topology/communication revision before that exception is recorded.
+A is recommended for trusted mods, using existing instance ownership inside
+the already approved role pair instead of expanding VM topology.
+
+This question chooses ownership/topology only. Mod role/entry declarations,
+behavior when a contributed role is absent, exact init order relative to game
+roots, dependency readiness across roles, failure escalation and additional
+Lua-created instances follow separately. D-18's root concurrency remains the
+baseline; mod activation must be integrated explicitly rather than assumed to
+fit its gates unchanged.
+
+Evidence: the Lua host already distinguishes a loaded module from engine-owned
+instances, gives each instance its own leases/connections and failure identity,
+and permits multiple scheduled instances per owner (`packages/scripting-lua/README.md`,
+Instances and One invocation at a time). This is a new launcher composition
+over those mechanisms, not an already implemented mod system.
 
 ## Open questions
 
@@ -1303,11 +1377,10 @@ profiles and a selector are later design possibilities.
 
 #### Q-4b. Required-dependency ordering alone or optional before/after hints too?
 
-The only active checkpoint: P-18 option A (recommended, required dependency
-IDs and deterministic dependency-first order) or B (also optional before/after
-edges for selected mods), or an owner-specified revision. Cycles fail boot;
-unrelated choices use stable ID order. Compatibility, activation lifecycle,
-cross-VM composition and overrides remain separate decisions.
+Resolved by D-22: required dependency IDs only, deterministic dependency-first
+order, stable ID ties and pre-Lua cycle refusal. Compatibility, activation
+lifecycle, cross-VM composition and overrides remain separate decisions.
+Q-7b is next because activation needs an instance/VM ownership model first.
 
 ### Q-5. What generic engine state does Lua define and mutate?
 
@@ -1348,6 +1421,14 @@ approval at **2026-10-21 15:31:39 UTC**, relay `cb344sy9r3dg5xk9rvjmiek24n`.
 Resolved by D-14: all four parts of P-10 revision 2, including one-role variants.
 Startup order is now settled by D-18. Additional owners, mod mapping and
 remaining lifecycle details stay open.
+
+#### Q-7b. Do mods use separate instances in the existing role VMs?
+
+The only active checkpoint: P-19 option A (recommended, one primary instance
+per contributed mod role in the existing gameplay/presentation VMs) or B
+(separate per-mod role VMs, requiring a revision to D-14), or an owner-specified
+revision. Shared-module state and execution in A are explicit costs. Role
+declarations, startup integration and mod failure escalation follow.
 
 ### Q-8. How should the prior vision and Lua epic be reconciled?
 
