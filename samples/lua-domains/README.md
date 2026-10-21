@@ -554,8 +554,12 @@ An intention's fields are the tick, its place, whether it acted in the session t
 the delta. A control names its target by the sample-local role `gameplay` (never an owner or an instance identity) and its
 operation (`pause` or `resume`). Records are in canonical order (by tick, a tick's controls by sequence and then its
 intentions by place, each strictly increasing); numbers are canonical decimals. Bounds: a header of at most 64 bytes, a line of
-at most 128, at most 1,200,000 records (100000 ticks of the default eight places and four controls; a finite session whose
-bounds could accept more is refused when it is made, so the bound is every valid bounded session's).
+at most 128, a place or sequence below 256, at most 1,200,000 records (100000 ticks of the default eight places and four
+controls). The format carries every input the live path accepts, so a configuration is refused when a session is made if it
+could accept more than the format holds: more than 256 places or pending controls for a tick, a finite session of more than
+100000 ticks (the trace holds the initial state and that many ticks), or one whose ticks times its places and pending
+controls pass the record bound. The view's tick, the version and the delta are the numbers the live path takes (it checks only
+that the first two are not negative and the delta within the configured bound, which is at most 1000).
 
 **The writer** collects every successful admission in the transaction that makes it (the UI's path, a replay's, and a control
 once the engine has accepted it), so there is one record for each, in the order the admissions took effect however many
@@ -610,7 +614,7 @@ the command line does). A failure that begins after a tick's accounting cutoff m
 run that depends on one is never compared by trace; the failure the scenarios use is a script error in the tick's own update.
 
 **Versions in force** (the resolved plan at the time of the delivering pull request): GHC 9.14.1, Cabal 3.18.1.0, `lua` 2.3.4
-(the bundled interpreter; `-system-lua -pkg-config -allow-unsafe-gc`), `cryptohash-sha256` 0.11.102.1, `hspec` 2.11.17,
+(the bundled interpreter; `-system-lua -pkg-config -allow-unsafe-gc`), `cryptohash-sha256` 0.11.102.1, `unix` 2.8.8.0, `hspec` 2.11.17,
 `stm` 2.5.3.1, `bytestring` 0.12.2.0, `containers` 0.8, `text` 2.1.3, the pinned `index-state` 2026-09-18T00:00:00Z, the threaded
 runtime with `-N2`.
 
@@ -635,7 +639,7 @@ both owners and prints one bounded report on stdout.
 
 | Option | Meaning |
 | --- | --- |
-| `--record FILE` | write the accepted-input log to `FILE`, which must **not exist** (an existing path of any kind is refused, and never opened for writing; the directory must exist). The file is created after the session, whole, and removed if the write fails |
+| `--record FILE` | write the accepted-input log to `FILE`, which must **not name anything** (an existing file, empty or not, a directory, or a symbolic link, dangling or not, is refused, and never opened for writing; the directory must exist). The file is created after the session by an exclusive creation (`O_CREAT | O_EXCL`), so it is this run's whatever happened since the check, written whole, and removed on every unsuccessful way out, an interruption included; a partial file that cannot be removed is reported |
 | `--replay FILE` | take the session's intentions and controls from `FILE`, which must exist, be readable and valid, and be replayable in this session; it is also the only source (see above). `--record` beside it writes what the replay accepted |
 | `--digests` | after the report, print the digest trace: `digest TICK HEX`, tick 0 first, one line for each committed tick, at most 100001 |
 | `--expect-digest HEX` | compare the final digest (64 hex digits, either case) and exit 1 on a mismatch, naming both digests on stderr |
@@ -681,7 +685,7 @@ commands; this table is checked in review against the real names, and no test re
 | Coherent old and new views, exactly-once accepted intentions | `the UI's view`, `staging and the commit`, `the intention contract`, `tick assignment`, `conservation of intentions` | #498 8, 9; #499 5 |
 | Explicit overload, gameplay-session failure and cleanup evidence | `the failure of the gameplay session`, `the owner's accounting, and what the sample's own bookkeeping survives`, `the ledger of intentions on every path`, `the stop paths and the cleanup evidence`, `the gameplay workspace's leases`, `a failure of the UI owner's behavior`, `the UI's control of the gameplay behavior`; the executable's `--scenario failure` (exit 1), `flood` and `stop` | #499 1-10 |
 | Direct registration without weakening cross-owner boundaries | `exposure`, `the package and import boundary` | #498 3 |
-| D-23 qualified on the sample | `D-23 qualified on the sample`, `the canonical encoding and the digest trace`, `the input log`, `a replay through the admission seam`, `the executable's record, replay and digest options`; `--record ... --digests` then `--replay ... --digests` (same digest lines); the optional probe's `qualify-repeat` records | #500 1-7 |
+| D-23 qualified on the sample | `D-23 qualified on the sample`, `the canonical encoding and the digest trace`, `the input log`, `a replay through the admission seam`, `the executable's record, replay and digest options`, `the files of the record and replay options`; `--record ... --digests` then `--replay ... --digests` (same digest lines); the optional probe's `qualify-repeat` records | #500 1-7 |
 | The threaded-RTS record | the RTS options `progress while gameplay is CPU-bound` and the probe's `rts-options` record print; the delivering pull request's macOS record and its Linux CI receipts | #500 5, 9 |
 
 The platform records are the delivering pull request's: its local macOS run (commands, outputs and exit statuses, `ghc --version`,
@@ -721,6 +725,6 @@ The qualification adds, by requirement: the canonical encoding, its golden value
 and what does not change the digest, the trace and the final digest (`Canonical`); the format, the writer, every refusal of
 the parser and the raced admissions (`InputLog`); the replay's refusals, release timing and the UI's declined offers and
 refused requests (`Replay`); D-23's qualification, its negative controls and the failure and pause replays (`Qualify`); and the
-executable's options, their exit statuses and the distinctions of the final digest (`Options`). The helpers the suite and the
+executable's options, their exit statuses and the distinctions of the final digest (`Options`); and the files of the record and replay options, with exclusive creation, symbolic links, a competing creation and an interrupted write (`Files`). The helpers the suite and the
 probe share (the boundary, the fake UI clock, the test-only namespace, the generated log and the disturbances) are the private
 library `lua-domains-fixtures`, so neither imports the other's sources.

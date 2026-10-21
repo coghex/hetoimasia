@@ -3639,8 +3639,9 @@ and verified policy, with adversarial regression coverage.
   input log is a versioned text format of accepted records only (intentions through `admitAt`'s terms, controls by the
   sample-local role `gameplay` through the engine's `requestInstanceControlAt`, two place spaces as delivered), with a
   trailer that counts, a bounded parser that refuses whole and names a line, and a writer that records in the admitting
-  transaction and never hands back a log that lost a record; a finite session that could accept more records than a log
-  holds is refused when made. A replay releases each tick's records when that tick is the next unstarted one, through the
+  transaction and never hands back a log that lost a record; a recording is created exclusively and is removed on every
+  unsuccessful exit; a configuration that could accept more than the format holds (places, pending controls, ticks, records) is
+  refused when the session is made. A replay releases each tick's records when that tick is the next unstarted one, through the
   same seam; the UI's offers are declined and its control requests refused before they take a place; what the log, the tick
   limit and the scenario decide is refused before the start, and anything an execution does keeps #499's failure behavior
   and is never reported as a complete replay. The qualification (`Test.Domains.Qualify`) holds the log, seed and
