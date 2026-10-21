@@ -784,6 +784,31 @@ failure paths, D-19/D-26's surviving healthy UI and D-20's forced-exit exception
 remain as recorded in P-23. This document's D-27 is the shutdown-order choice;
 prior Lua design D-27 is the underlying engine-owned cleanup contract.
 
+### D-28. Use game-exposed extension APIs without engine content remapping
+
+Owner answer, **2026-10-21 17:14:08 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: game-exposed hooks (Rec.)
+
+Authenticated relay: `het-manager`, message `a3m9a2gd7gs3hdfvmk7nggy4j2`,
+posted **2026-10-21 17:14:08.143 UTC** in `#het-luafirst`, replying to Q-4g
+message `f2fas8mkxfvuad48ubawza7eze`.
+
+P-24 option A is accepted: the supported way for mods to extend/replace game
+definitions is through extension points exposed by the game's Lua. The
+player-appearance example supplies a mod texture reference while the original
+game path continues naming its original file. Rule/UI changes use game APIs;
+authoritative state changes use engine state services. There is no engine-wide
+file/module remapping or load-order winner in this arc.
+
+The owner was shown the cost: a game exposing no extension APIs cannot be
+generically overridden through this supported mechanism. Trusted scripts can
+still mutate shared tables, so this is not an enforced isolation boundary.
+The answer does not select new callback signatures or make extension callbacks
+identical to lifecycle hooks. Registration/conflict handling, callback ownership
+and the separate hot-swap question remain open.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -1572,7 +1597,7 @@ ordering guarantee for this new launcher.
 
 ### P-24. Replace game behavior through explicit game APIs, not content remapping
 
-**Unapproved; active checkpoint Q-4g.** Recommend A for this arc: mods extend
+**Option A accepted by D-28.** In this arc, mods extend
 or deliberately replace game definitions through explicit Lua APIs/extension
 points which the game exposes, and mutate authoritative state through approved
 engine state services. The engine supplies lifecycle, content and generic
@@ -1618,6 +1643,47 @@ replacement; D-7 fixes module identity to root/path; D-1 keeps game rules in Lua
 Neither current host module loading nor the selected mod lifecycle supplies
 an engine-wide replacement resolver. This is a supported composition-surface
 choice whose remaining API/conflict details must be resolved before readiness.
+
+### P-25. Check exact declared game/mod API revisions before Lua
+
+**Unapproved; active checkpoint Q-4h.** Recommend A: each game and mod manifest
+publishes a positive integer API revision for the interfaces/definitions it
+offers to mods. Each required-mod dependency names both the selected mod ID
+and the exact API revision it expects. A mod also declares either a target
+game ID with an exact game API revision, or explicitly that it is game-independent.
+The latter accommodates reusable content/libraries and engine-only extensions;
+it is an author's compatibility assertion, not automatic detection.
+
+Before Lua, reject an incompatible target game or any required revision
+mismatch, naming the consumer, required ID/revision and actual ID/revision.
+Do not choose another installed version or expand the launch selection.
+D-21's unique IDs and D-22's required-dependency order remain unchanged; adding
+the revision check does not add optional ordering edges. All selected mods,
+including content-only mods, participate in these manifest checks.
+
+An API revision is not a package release number or content fingerprint. Authors
+keep it unchanged for compatible releases and change it when their declared
+interface contract breaks; D-10 fingerprints still identify the exact session
+content. The launcher verifies the declarations, not the semantic correctness
+of an author's compatibility claim. Save schemas, engine binding compatibility
+and the manifest format version remain distinct contracts; no save migration
+or dependency download/version solver is implied.
+
+Alternative B lets a target/dependency accept an inclusive range of API
+revisions, checked against the one explicitly selected version. That helps a
+mod which deliberately supports several interface revisions, but needs range
+syntax/validation, broader author testing and precise mismatch diagnostics.
+A is recommended for a small, strict first contract: authors supporting a
+changed API must update the expected revision and verify their mod. Its cost
+is no single manifest advertising support for multiple API revisions; even
+a compatible implementation is refused if its declared expected revision is
+different. Exact field names and integer bounds follow with manifest grammar.
+
+Evidence: D-28 makes game extension APIs the supported integration surface,
+and D-21/D-22 validate selected identities and required dependencies before
+Lua. They do not yet detect incompatible changes under an unchanged content
+ID. This is a proposed additional manifest validation contract, not existing
+host behavior or proof that arbitrary shared Lua code is compatible.
 
 ## Open questions
 
@@ -1785,11 +1851,16 @@ Engine-owned lifetime/retirement guarantees apply independently of hook order.
 
 #### Q-4g. Game-defined replacement APIs or an engine content-remapping facility?
 
-The only active checkpoint: P-24 option A (recommended, explicit Lua game
-extension APIs with no engine file/module remapping in this arc) or request
-B (explicit remapping) for a concrete D-6/D-7 revision, or specify a revision.
-Registration/conflict handling and callback ownership remain further design
-work; arbitrary shared-table mutations are not automatically policed.
+Resolved by D-28: explicit Lua game extension APIs, without engine file/module
+remapping in this arc. Registration/conflict handling and callback ownership
+remain further design work; arbitrary shared-table mutations are not policed.
+
+#### Q-4h. Exact game/mod API revisions or accepted revision ranges?
+
+The only active checkpoint: P-25 option A (recommended, exact declared API
+revisions) or B (inclusive accepted ranges), or an owner-specified revision.
+The shared proposal includes an explicit target game or game-independent
+declaration and pre-Lua mismatch errors, without automatic version selection.
 
 ### Q-5. What generic engine state does Lua define and mutate?
 
