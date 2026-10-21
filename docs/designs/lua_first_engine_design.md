@@ -617,6 +617,29 @@ explicit exception to orderly precedence and cleanup guarantees. Lua receives
 no force-exit capability. The manager's Ctrl-C label does not narrow the
 approved behavior to SIGINT; the question expressly covered SIGINT/SIGTERM.
 
+### D-21. Select mods explicitly at launch and fix that set for the session
+
+Owner answer, **2026-10-21 16:10:37 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: explicit list (Rec.)
+
+Authenticated relay: `het-manager`, message `yyckma8k6xffdrczwsy34irc8i`,
+posted **2026-10-21 16:10:37.653 UTC** in `#het-luafirst`, replying to Q-4a
+message `grnqksdhfi6hcx9rcmiupamauw`.
+
+P-17 option A is accepted: select a game folder and an explicit list of mod
+folders; no list means base game only. Nothing is discovered or enabled
+automatically. Validate identities before Lua; duplicate roots/IDs, collision
+with the game ID, or an unselected required dependency fail boot. The enabled
+set is fixed until a new session, while D-9 permits runtime loading inside
+those roots. Listing order does not itself decide execution or overrides.
+
+The example `--mod` spelling remains illustrative. Saved profiles and a
+mod-selector screen were described as later design possibilities, not an
+approved feature or delivery commitment. Dependency ordering, compatibility,
+mod activation and override policy remain open.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -1061,7 +1084,7 @@ choice, not a claim that its lifecycle has already been implemented.
 
 ### P-17. Enable mods through an explicit launch-time list of content folders
 
-**Unapproved; active checkpoint Q-4a.** Recommend A: the launcher takes the
+**Option A accepted by D-21.** The launcher takes the
 game folder (D-13) and zero or more explicitly selected mod folders. No mod
 selection means the base game alone. The first interface is a repeatable
 command-line argument; `--mod ./my-mod` is illustrative until the CLI contract
@@ -1098,6 +1121,50 @@ has no game/mod discovery subsystem (`app/Main.hs`, Lua host README, The command
 line). D-6 requires explicit content identities, D-10 pins session content and
 D-13 already establishes manifest-bearing folders. Mod selection is new
 launcher work; none of those decisions alone chooses automatic discovery.
+
+### P-18. Order mod activation by declared required dependencies
+
+**Unapproved; active checkpoint Q-4b.** Recommend A: each mod manifest may
+declare required mod IDs. All must already be in the explicit selection
+(D-21); do not automatically expand it. Validate the dependency graph before
+Lua: missing dependencies, self-dependencies and cycles fail boot, with the
+involved IDs and a dependency chain in the diagnostic. Dependency versions
+and game compatibility remain a separate contract; this choice introduces no
+version solver or automatic download.
+
+Compute a deterministic order in which dependencies precede dependents. When
+several mods are eligible, choose by exact content-ID byte order, independent
+of filesystem enumeration, CLI order or locale. For example, if weather
+requires calendar, calendar precedes weather; an unrelated mod is placed by
+the same deterministic tie rule. Include the resolved order in startup
+diagnostics so an author can inspect what the engine will do.
+
+This is the order for explicit mod activation/registration steps once those
+are designed. It is not a new cross-VM synchronization rule: D-18 still starts
+the selected gameplay/presentation roots concurrently. Module imports retain
+D-7's demand evaluation, shared exports and separate import-cycle errors; a
+mod ordering edge does not imply every module ran or every asset finished
+loading. Hooks still own effects under D-8. How game/root initialization and
+mod activation fit together is the next lifecycle contract, not inferred here.
+No order makes one mod silently overwrite another; conflicts/overrides remain
+explicit decisions under D-6.
+
+Alternative B adds optional ordering edges: a mod may ask to run before/after
+another selected mod without requiring that mod to be enabled. An absent
+optional target contributes no edge; any cycle among the combined required
+and present optional edges fails boot. B handles optional integrations whose
+order matters, but adds manifest syntax, conditional graph construction and
+diagnostics/tests for conflicts between hard and optional edges.
+A is recommended for the initial mod contract's smaller authoring surface.
+Its cost is no optional ordering hint: integrations needing guaranteed order
+must be modeled as real dependencies, or wait for the optional-order extension.
+Do not rename IDs or rely on tie order as a substitute for an explicit
+dependency or approved replacement rule.
+
+Evidence: D-21 already requires missing selected dependencies to fail boot,
+but neither it nor the existing Lua module loader defines mod activation
+ordering. This manifest graph/resolution stage is new launcher work. Actual
+activation ownership and the domain mapping still require Q-4/Q-7 decisions.
 
 ## Open questions
 
@@ -1230,11 +1297,17 @@ is fixed. Trust does not itself define these behaviors.
 
 #### Q-4a. Explicitly enable selected mod folders or automatically discover them?
 
-The only active checkpoint: P-17 option A (recommended, an explicit launch-time
-list; no mods by default) or B (enable valid folders found under a designated
-mods directory), or an owner-specified revision. Identity validation and a
-fixed session set apply to both. Dependency ordering, override policy and mod
-VM/instance mapping follow; CLI field spellings remain illustrative.
+Resolved by D-21: an explicit launch-time list, no mods by default, validated
+identities and a fixed session set. CLI field spellings remain illustrative;
+profiles and a selector are later design possibilities.
+
+#### Q-4b. Required-dependency ordering alone or optional before/after hints too?
+
+The only active checkpoint: P-18 option A (recommended, required dependency
+IDs and deterministic dependency-first order) or B (also optional before/after
+edges for selected mods), or an owner-specified revision. Cycles fail boot;
+unrelated choices use stable ID order. Compatibility, activation lifecycle,
+cross-VM composition and overrides remain separate decisions.
 
 ### Q-5. What generic engine state does Lua define and mutate?
 
