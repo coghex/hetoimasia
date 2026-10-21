@@ -910,6 +910,26 @@ requires a new session. Presentation cannot register authoritative schemas.
 Value-write permissions, concrete limits and game-extension conflicts remain
 separate decisions.
 
+### D-33. Gameplay reads see earlier staged writes within the tick
+
+Owner answer, **2026-10-21 18:18:50 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: see staged writes (Rec.)
+
+Authenticated relay: `het-manager`, message `yh9kejzwpg4axcrmfue93q5pjs`,
+posted **2026-10-21 18:18:50.123 UTC** in `#het-luafirst`, replying to Q-5d
+message `gh4upyrtyy338iqzvqxaehtmma`.
+
+P-29 option A is accepted: gameplay shares one engine-owned working state per
+tick. Successful writes, creation and removal are visible to subsequent reads,
+including other mods' reads. Read 10, write 9, read again returns 9. Reads are
+copies, and mutation of a returned Lua table requires an explicit state write.
+UI sees only committed snapshots; a failed tick publishes none of its changes.
+This does not roll back plain Lua tables or resource effects. The owner was
+told that what code observes depends on execution order; its deterministic
+contract follows next. No physical storage layout is selected.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -1942,7 +1962,7 @@ checks, bounded validation and immutable schema publication.
 
 ### P-29. Gameplay reads see the current tick's staged changes
 
-**Unapproved; active checkpoint Q-5d.** Recommend A: one engine-owned working
+**Option A accepted by D-33.** One engine-owned working
 state for the tick, shared by gameplay instances. Each successful state mutation
 updates that working state immediately; later gameplay reads see it, including
 reads by the writer and by other game/mod hooks that execute afterward. For
@@ -1989,6 +2009,65 @@ accounting before commit. A deliberately changes that sample's read visibility
 for the new generic store while preserving private staging and atomic external
 publication. It requires store read/write bindings and tick ownership work;
 it is not claimed as existing Lua host behavior. Delivery slices remain unset.
+
+### P-30. Fix gameplay to the existing FIFO scheduler, with deterministic admission
+
+**Unapproved; active checkpoint Q-5e.** Recommend A: use the existing scheduler's
+FIFO policy for the gameplay VM, fixed for the session. Game and mod updates
+and event callbacks use the same ordinary service class; content cannot choose
+a priority, service class or replacement scheduling policy. Engine control/stop
+handling retains its existing boundary rules. This is the launcher's gameplay
+contract, not a removal of policy support from the host library.
+
+Create gameplay instances in the same root-first, dependency-first order as
+D-25/D-22, with mod-ID ties already fixed by D-22. Stable instance order governs
+admission when multiple instances have due work. Within each instance, keep
+the existing accepted invocation order and one-active-invocation rule. Among
+ready gameplay invocations, run the oldest ready one first. A cooperative
+yield or a wake/resume joins behind already-ready work, rather than retaining
+priority because it belongs to the game or an earlier dependency.
+
+Consequently, with idle instances, no earlier queued work and all updates due,
+the game starts before the mods in their resolved order. If the game writes
+health 9 and yields, a ready mod may read 9 and write 8 before the game resumes;
+the game's next read then sees 8. D-33 makes that interleaving visible. A mod's
+dependency being initialized first does not promise that every update of the
+dependency finishes before that mod runs. Hooks that do not yield execute
+their Lua segment without another gameplay hook interleaving on the same VM.
+
+Logical events, controls and loader results must enter through assigned tick
+and sequence positions, not raw wall-clock arrival. Gameplay cannot use elapsed
+waits or elapsed cadence to change readiness; presentation keeps elapsed time.
+With the same fixed scheduler configuration, admitted work, assigned inputs,
+grants and script behavior, segment durations, provider delays and budget cuts
+must not change gameplay effect order. Deterministic input assignment, queue
+bounds and the exact boundary ordering still need their concrete contracts;
+this choice alone is not a complete replay specification. Prior Lua D-48's
+limits for independently arising failures remain explicit.
+
+Alternative B introduces an authored per-tick phase/order system, so, for
+example, all game movement can finish before combat mods and then UI-facing
+state preparation. It can express dependencies on completed work rather than
+just ready-queue order, but requires new phase registration/conflict rules,
+completion barriers and a suspension/deadlock contract. It is not merely a
+different FIFO sort key. B would need a follow-up design before acceptance of
+any particular phases or API.
+
+A is recommended because it reuses the host's tested ordering and gives a
+small explicit rule for shared staged state. Its authoring cost is that mods
+cannot demand arbitrary before/after update phases, and a yielding hook cannot
+assume the working state stays unchanged while suspended. Game-defined direct
+Lua orchestration remains possible under D-28; callback ownership still needs
+its own contract. Cross-tick suspension/commit eligibility, individual-write
+rejection and conflicting writes remain separate checkpoints. Neither A nor B
+permits publishing merely because no task is currently runnable.
+
+Evidence: the Lua host README's Policies, Service classes, One invocation at a
+time, Cadence, Determinism and assigned-tick request sections define FIFO ready
+ordinals, deterministic instance admission and logical delivery. A fixes those
+choices in the new launcher; it does not claim that the host already supplies
+the game's input-assignment policy or a generic state transaction coordinator.
+No delivery slices have been selected yet.
 
 ## Open questions
 
@@ -2196,11 +2275,19 @@ permissions and extension conflicts remain separate from schema ownership.
 
 #### Q-5d. Do gameplay reads see earlier writes in the same tick?
 
-The only active checkpoint: P-29 option A (recommended, shared working state
-with immediate visibility to later gameplay reads) or B (fixed read view and
-writes queued for commit), or an owner-specified revision. UI sees committed
-state in both. Exact execution/conflict order, cross-tick suspension, initial
-state construction and individual-write rejection policy follow separately.
+Resolved by D-33: shared working state with immediate visibility to later
+gameplay reads; UI sees committed snapshots only. Exact execution/conflict
+order, cross-tick suspension, initial state construction and individual-write
+rejection policy follow separately.
+
+#### Q-5e. Fixed FIFO gameplay scheduling or authored per-tick phases?
+
+The only active checkpoint: P-30 option A (recommended, fixed FIFO gameplay
+policy, root/mod admission order and yielding to already-ready work) or B
+(design explicit per-tick phases and completion barriers), or an owner-specified
+revision. A's order is deterministic for the same logical admissions/configuration;
+it does not guarantee that an earlier hook finishes before a later hook starts.
+The input-assignment and transaction-completion contracts remain to be settled.
 
 ### Q-6. Which services and UI behavior does Lua drive in this arc?
 
