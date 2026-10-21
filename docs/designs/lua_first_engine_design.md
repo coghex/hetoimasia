@@ -9,7 +9,7 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current pass records direction and the module-initialization checkpoint; it is
+The current pass records direction and the session-loading checkpoint; it is
 not an approved specification or authority to implement or file issues.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
@@ -256,6 +256,39 @@ choice affects content-loader and module/instance integration slices, still
 undefined. Path normalization/aliases, loading phases, live reload, cache
 bounds and data/texture caching are not settled by this answer.
 
+### D-8. Acquire resources through lifecycle hooks, not module top level
+
+Owner answer, **2026-10-21 15:04:11 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: hooks only (Rec.)
+
+Authenticated relay: `het-manager`, message `zi64juxixem8cjdz48zffjh79a`,
+posted **2026-10-21 15:04:11.762 UTC** in `#het-luafirst`, replying to Q-2c
+message `wwe79m6c9vwsifzesj3rmpdcie`.
+
+Before answering, the owner requested a fuller explanation. The manager
+contrasted loading a player's texture at `player.lua` top level with doing
+so in `init`, explained D-27 cleanup ownership, the lack of an owning
+instance for a shared module, and failure halfway through an import. The
+owner then selected A after it was presented again.
+
+Module top level defines tables/functions, imports dependencies, uses pure
+helpers and emits diagnostics. Texture/window acquisition, data reads, input
+subscriptions, starting instances and world access/mutation happen in
+lifecycle hooks or functions executing within their permitted lifecycle
+context, with engine-held cleanup ownership and the proper tick context.
+Importing a new dependency from a hook does not grant that dependency's
+top-level code the hook's effectful engine authority.
+
+This restricts engine bindings, not arbitrary Lua table mutation, and promises
+no purity or rollback of Lua state. Authors move top-level resource work into
+hooks. Rejected: new per-module resource scopes lasting within the VM lifetime,
+with their additional shared ownership and failed-import cleanup contract.
+The decision affects module loading, boot and service bindings; it does not
+change the existing finite, non-suspending `init`/`shutdown` hook contract or
+decide when a running session may request new content.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -282,36 +315,45 @@ behavior, not a claim that the present API supplies it.
 
 ### P-4. Import modules without starting engine services or acquiring resources
 
-**Unapproved; active checkpoint Q-2c.** Recommended option A gives module
-evaluation a declaration phase. Top-level Lua may construct tables, functions
-and constants, import dependencies, use pure value/math helpers and emit
-diagnostics. Effectful engine bindings are unavailable during that phase:
-no window creation, asset/data reads other than module import, texture
-acquisition, input subscription, instance start, world access or staged world
-mutation. These actions belong to explicitly invoked lifecycle hooks or
-functions running in their permitted lifecycle context, where the engine
-can establish the instance/session ownership and tick boundary.
+Accepted by D-8; retain this proposal ID as history. Exact binding eligibility
+and loading times remain to be designed within the approved boundary.
 
-The restriction is on engine authority, not a claim that ordinary Lua is
-pure: code can still mutate Lua tables, including shared imported exports,
-hang or exhaust memory. There is no rollback of such Lua mutations. The
-declaration phase also applies to a dependency first imported from inside a
-hook: that dependency's top-level code does not inherit the hook's effectful
-engine access. Exact bindings and the permitted loading times remain open.
+### P-5. Permit demand loading during a running session
 
-Alternative B permits content reads and native resource acquisition during
-module evaluation, recording their ownership in an engine-held module scope
-within the VM lifetime. Import failure must safely release that module's
-holdings without losing dependencies still borrowed by successful modules;
-module resources remain shared across importers. It still cannot bypass
-D-3's tick-based authoritative state changes. This requires a separate module
-resource-ownership contract in addition to the existing instance leases.
+**Unapproved; active checkpoint Q-2d.** Recommend option A: hooks may request
+previously unloaded modules, data and textures from enabled content roots
+both during startup and during play. For example, entering a new room can
+request its textures then, instead of loading every room before the game starts.
+Native file reads, decoding and upload progress are engine-owned work, with
+bounded request admission and explicit pending/completed/failed results rather
+than an unbounded blocking native call on a Lua owner.
 
-A is recommended because an import defines reusable code while an explicit
-lifecycle action starts work under a named owner. The author-visible cost is
-moving top-level texture loads and window creation into hooks; imports cannot
-return already acquired native resources. This affects module loading, boot,
-service bindings and resource ownership, whose slices remain undefined.
+Gameplay-visible results must enter at assigned logical positions under
+Lua D-23/D-36/D-39. A required result not ready at its assigned tick holds that
+tick; it cannot skip work or enlarge gameplay `dt`. Independently paced
+presentation can continue showing already available content and handle its
+own load results without advancing authoritative state by wall-clock timing.
+The later binding and boot designs must settle the exact request/await API,
+what counts as presentation-only, and failure policy. A finite `init` may
+initiate work but cannot gain a yielding wait merely from this choice.
+
+Alternative B restricts first acquisition/import of content to startup for
+this arc. A running session can use only what was loaded before it started;
+new room content needs preloading or a new session. It reduces runtime-loader
+scope but forces larger startup loads and constrains game authoring.
+
+A is recommended for the Lua-authored game's ordinary content needs. Its
+cost is concrete loading providers, bounds, cancellation/retirement and
+logical result placement, building on the existing request machinery. The
+current host already distinguishes arrival-based presentation requests from
+tick-assigned requests that hold a grant until the result is available
+(`packages/scripting-lua/README.md`, asynchronous requests); those mechanisms
+do not yet implement these content services.
+
+This choice affects loading, boot and service integration slices, still
+undefined. It grants no live reload or mid-session mod enablement, which
+remain separate scope choices, and settles neither content immutability nor
+cache/eviction policy. All module evaluation still obeys D-7/D-8.
 
 ## Open questions
 
@@ -325,8 +367,8 @@ epic's disposition are not settled by this answer.
 Settle modules, data and textures scoped to game/mod content roots, module
 identity/cache/cycles, cross-mod access, root/path and symlink handling,
 failure attribution and when loading is allowed. D-6 settles explicit root
-addressing and D-7 module reuse/cycle/failure behavior; engine API spelling
-and the remaining loader behavior are open.
+addressing, D-7 module reuse/cycle/failure behavior and D-8 the top-level
+effect boundary; engine API spelling and remaining loader behavior are open.
 
 #### Q-2a. Explicit content-root references or one merged override namespace?
 
@@ -342,11 +384,17 @@ Loading phases and failure escalation remain open.
 
 #### Q-2c. May module top-level code acquire engine resources?
 
-The only active checkpoint: P-4 option A (recommended, declarations/imports,
-pure helpers and diagnostics, with effectful engine access reserved for
-lifecycle execution) or B (engine-held module resource scopes), or an
-owner-specified revision. This does not yet decide when new modules may be
-imported or when texture/data loading is allowed in a running session.
+Resolved by D-8: effectful engine access belongs to lifecycle execution;
+module evaluation permits definitions/imports, pure helpers and diagnostics.
+This does not decide when new content may load during a session.
+
+#### Q-2d. May a running session load new content on demand?
+
+The only active checkpoint: P-5 option A (recommended, engine-owned runtime
+loading with bounded requests and deterministic gameplay result placement)
+or B (startup-only loading for this arc), or an owner-specified revision.
+The result/wait API, content immutability, cache policy and escalation of
+loading failures remain separate questions.
 
 ### Q-3. What is the generic executable's boot and session contract?
 
