@@ -930,6 +930,29 @@ This does not roll back plain Lua tables or resource effects. The owner was
 told that what code observes depends on execution order; its deterministic
 contract follows next. No physical storage layout is selected.
 
+### D-34. Fix gameplay to FIFO scheduling with deterministic admission
+
+Owner answer, **2026-10-21 18:24:44 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: fixed FIFO (Rec.)
+
+Authenticated relay: `het-manager`, message `fxkg67gqhvg53eh3gyz64vdhdi`,
+posted **2026-10-21 18:24:44.795 UTC** in `#het-luafirst`, replying to Q-5e
+message `vw6zn3rfb9cnqzja49qzr7qgge`.
+
+P-30 option A is accepted: fixed FIFO gameplay policy, equal ordinary priority
+for game/mod updates and events, stable root-first then dependency/ID instance
+admission, and oldest-ready-first execution. Yielding/waking rejoins behind
+already-ready work; non-yielding Lua segments are not interleaved on that VM.
+Content cannot select priorities or before/after phases. Logical admissions
+use assigned tick/sequence positions; real delays do not select effect order.
+
+The manager presented the health 9/8 interleaving example and the cost that
+the game or an earlier dependency need not finish its update before a mod runs.
+Exact input assignment, tick completion and suspension rules remain separate;
+this decision supplies no implicit commit permission at scheduler quiescence.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -2012,7 +2035,7 @@ it is not claimed as existing Lua host behavior. Delivery slices remain unset.
 
 ### P-30. Fix gameplay to the existing FIFO scheduler, with deterministic admission
 
-**Unapproved; active checkpoint Q-5e.** Recommend A: use the existing scheduler's
+**Option A accepted by D-34.** Use the existing scheduler's
 FIFO policy for the gameplay VM, fixed for the session. Game and mod updates
 and event callbacks use the same ordinary service class; content cannot choose
 a priority, service class or replacement scheduling policy. Engine control/stop
@@ -2068,6 +2091,75 @@ ordinals, deterministic instance admission and logical delivery. A fixes those
 choices in the new launcher; it does not claim that the host already supplies
 the game's input-assignment policy or a generic state transaction coordinator.
 No delivery slices have been selected yet.
+
+### P-31. Cross-tick waits explicitly finish the current tick's contribution
+
+**Unapproved; active checkpoint Q-5f.** Recommend A: a gameplay update/event
+may span ticks, but crossing a tick boundary requires an explicit engine
+operation meaning **finish my contribution to this tick and wait**. It may
+wait for a future logical tick or an engine result assigned to a future tick.
+The operation's spelling and result API are not selected here. It is a
+successful checkpoint for that invocation's current-tick work, not a request
+to keep a transaction open across ticks. Ordinary cooperative yielding keeps
+the invocation runnable within the same tick and acknowledges no completion.
+
+1. A successful hook return or accepted checkpoint supplies positive completion
+   evidence for that invocation's work in the current tick. The engine must
+   account for every invocation that participated and all due work before
+   publishing: each contribution finished successfully, or the engine records
+   a valid no-work case. An invocation already waiting for a later tick and not
+   resumed in this tick is a no-work case. No runnable work, pending admission
+   or owed work may disappear merely because the scheduler looks idle.
+   Refused waits, faults and unaccounted endings cannot count as checkpoints.
+   Prior Lua D-47/D-48 failure accounting and the atomic failure/stop check
+   still precede commit. Pause/stop/control dispositions need their own rules;
+   they do not acquire completion permission from this proposal.
+2. A checkpoint makes the invocation's earlier writes eligible for the shared
+   tick commit, alongside other gameplay writes. It does not publish early or
+   give that invocation an independent commit. If another participant fails
+   before this tick commits, discard the whole working state. The engine then
+   stops gameplay under D-19/D-26; it does not resume checkpointed work from a
+   rejected tick. Only after successful commit may it grant the next tick.
+3. When the invocation resumes, state reads/writes use that later tick's working
+   state. No state transaction or live store alias survives the wait. Lua locals
+   and copied values do survive and can be stale; authors must re-read/revalidate
+   them when needed. FIFO interleaving within a tick remains D-34's rule.
+   The existing one-active-invocation/cadence behavior remains: while a hook is
+   waiting, that instance's further update cadence points do not queue catch-up
+   updates. Other instances can keep advancing.
+4. A later failure discards the failing tick, not earlier committed ticks. For
+   example, subtracting one coin in tick T, checkpointing for a load assigned
+   to T+2, and failing in T+2 leaves the committed coin subtraction intact.
+   A game that needs coin removal and item creation to be atomic must do both
+   in one tick, after the needed data is available, without a checkpoint between.
+5. A missing required provider result holds its assigned future tick as D-9
+   requires; it does not hold the tick that requested it. Gameplay still has
+   no elapsed-time waits. A result already logically available can be consumed
+   without crossing a tick boundary; asking to wait on a future result uses
+   the explicit checkpoint contract. No automatic retry or rollback of plain
+   Lua data/resource effects is introduced.
+
+Alternative B requires each gameplay update/event to finish within one tick:
+cooperative yields within that tick are allowed, but waits requiring a later
+tick are refused. Async loading still works by requesting, returning and
+checking readiness in a subsequent update/event. Long routines keep their
+continuation state explicitly in Lua data rather than a suspended hook. B
+makes hook completion the simpler transaction boundary, at the cost of more
+author-written state machines; it narrows D-15's permitted gameplay suspension
+to same-tick yielding. Presentation's elapsed waits are unaffected by either
+choice.
+
+A is recommended to retain useful multi-tick Lua routines while making the
+atomicity limit explicit. Its cost is exposing a checkpoint authors must
+understand, plus per-invocation completion evidence and tests in the generic
+tick coordinator. It is not enough to reuse `awaitTicksComplete` alone. The
+host already supports future waits and deterministic resumption; the sample
+instead requires its particular `staging.finish()` and idle-instance proof.
+This proposal deliberately replaces that sample-specific completion predicate
+for the new store while retaining positive success evidence, whole-tick atomic
+publication and failure accounting. Neither existing sample nor host is claimed
+to implement this new checkpoint protocol. Initial-state construction and
+individual-write rejection remain later checkpoints; slices remain unset.
 
 ## Open questions
 
@@ -2282,12 +2374,18 @@ rejection policy follow separately.
 
 #### Q-5e. Fixed FIFO gameplay scheduling or authored per-tick phases?
 
-The only active checkpoint: P-30 option A (recommended, fixed FIFO gameplay
-policy, root/mod admission order and yielding to already-ready work) or B
-(design explicit per-tick phases and completion barriers), or an owner-specified
-revision. A's order is deterministic for the same logical admissions/configuration;
-it does not guarantee that an earlier hook finishes before a later hook starts.
-The input-assignment and transaction-completion contracts remain to be settled.
+Resolved by D-34: fixed FIFO gameplay policy, stable root/mod admission and
+yielding to already-ready work. This does not guarantee whole-hook completion
+order. Input assignment and transaction completion follow separately.
+
+#### Q-5f. Explicit cross-tick checkpoints or hooks completed within one tick?
+
+The only active checkpoint: P-31 option A (recommended, explicit successful
+contribution checkpoint before a future-tick wait) or B (refuse cross-tick waits
+in gameplay hooks; return and continue via later invocations), or an owner-
+specified revision. A permits earlier writes to commit while the hook remains
+suspended; a later failure cannot undo earlier committed ticks. Both retain
+whole-tick publication and positive completion/failure accounting.
 
 ### Q-6. Which services and UI behavior does Lua drive in this arc?
 
