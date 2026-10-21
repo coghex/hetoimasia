@@ -5,7 +5,7 @@ provenance, the decoded-asset types, and the decoder interface. It holds no
 codec. Codecs live one package per kind — images in
 [`hetoimasia-asset-image`](../asset-image/README.md) — so a program depends
 on this core and only the codec packages it needs
-([asset design](../../docs/designs/asset_design.md), D-1).
+([asset design](../../docs/archive/designs/asset_design.md), D-1).
 
 | Module | Contents |
 | --- | --- |

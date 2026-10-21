@@ -124,7 +124,7 @@ their contracts permit direct construction.
 The package boundary and flexible module conventions are settled. The math
 package's first concrete consumer, the GPU resource services arc's 3D fixture,
 settled its first shape (#348, under that arc's
-[D-37](designs/gpu_resource_services_design.md#d-37-create-packagesmath-in-this-arc-as-its-own-slice)):
+[D-37](archive/designs/gpu_resource_services_design.md#d-37-create-packagesmath-in-this-arc-as-its-own-slice)):
 
 - **Precision and API.** 32-bit `Float` throughout, and a minimal API: 2-, 3-
   and 4-component vectors and 4×4 matrices with strict fields, translation,

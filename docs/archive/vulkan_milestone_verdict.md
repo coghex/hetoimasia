@@ -24,7 +24,7 @@ repeated.
 | Driver | MoltenVK 1.4.2's library (`MoltenVK 1.4.0 05df2d2145b9`, the manifest's declared API) | Mesa Lavapipe, `lvp 1.4.318 9d69cae2004b` |
 | Validation layer | `VK_LAYER_KHRONOS_validation 1.3.296 dc6b9c2fd7b6 +synchronization` | `VK_LAYER_KHRONOS_validation 1.3.275 1d486283e4ce +synchronization` |
 | Executed | `fc8bfe0`, input identity `14437135…` | the merge candidate `5697a5c` of head `2040d1d`, input identity `2cb159e4…` |
-| Record | [`docs/vulkan/macos-vk17.md`](vulkan/macos-vk17.md) | [`docs/vulkan/linux-vk17.md`](vulkan/linux-vk17.md) |
+| Record | [`docs/vulkan/macos-vk17.md`](../vulkan/macos-vk17.md) | [`docs/vulkan/linux-vk17.md`](../vulkan/linux-vk17.md) |
 
 Both records carry their receipts verbatim, with the toolchain map each run
 recorded; the macOS one names no CI image and records `Darwin`, so neither can
@@ -88,10 +88,10 @@ two — and a clean verdict, and those counts measure nothing about refresh cade
 2. **Pinned native and build identities are reproduced through local
    provisioning and the Linux image; missing or changed inputs cannot reuse
    incompatible evidence; CPU and window-only builds stay independent.** The
-   provisioned prefixes are qualified in [`linux-provisioned.md`](vulkan/linux-provisioned.md)
-   and [`macos-provisioned.md`](vulkan/macos-provisioned.md) against
-   [the toolchain record](toolchain.md); every receipt binds its input identity
-   and toolchain map ([validation.md](validation.md#receipts)), and a Darwin
+   provisioned prefixes are qualified in [`linux-provisioned.md`](../vulkan/linux-provisioned.md)
+   and [`macos-provisioned.md`](../vulkan/macos-provisioned.md) against
+   [the toolchain record](../toolchain.md); every receipt binds its input identity
+   and toolchain map ([validation.md](../validation.md#receipts)), and a Darwin
    receipt names no CI image. `cabal build all` and `cabal build all
    --project-file cabal.project.cpu` build the same package set as before #302
    and resolve no binding, and the workflow suite's Vulkan project boundary
@@ -100,8 +100,8 @@ two — and a clean verdict, and those counts measure nothing about refresh cade
 3. **The same tested VK-18 machinery runs the Vulkan owner; bounded ports,
    stop and terminal evidence, deadline independence, failed startup,
    cancellation and protected join order are proved; main-thread GLFW ownership
-   is preserved.** [The supervised graphics owner](glfw.md#the-supervised-graphics-owner)
-   (VK-18, #218) is the machinery [the composition](gpu_backend.md#composition)
+   is preserved.** [The supervised graphics owner](../glfw.md#the-supervised-graphics-owner)
+   (VK-18, #218) is the machinery [the composition](../gpu_backend.md#composition)
    supplies its Vulkan operations to; its examples are in `glfw-tests` and the
    integration's `integration-tests`. In the required profile every Vulkan call
    ran on the graphics owner's thread and every surface was created on the main
@@ -120,24 +120,24 @@ two — and a clean verdict, and those counts measure nothing about refresh cade
    cleanup preserves the initiating failure and additional evidence.** VK-12
    and VK-13 ([#225](https://github.com/coghex/hetoimasia/issues/225),
    [#227](https://github.com/coghex/hetoimasia/issues/227)): the
-   [frames](gpu_backend.md#frames-acquisition-submission-and-abandonment) and
-   [presentation and retirement](gpu_backend.md#presentation-and-retirement)
-   contracts, with native evidence in [`macos-vk12.md`](vulkan/macos-vk12.md),
-   [`linux-vk12.md`](vulkan/linux-vk12.md), [`macos-vk13.md`](vulkan/macos-vk13.md)
-   and [`linux-vk13.md`](vulkan/linux-vk13.md); VK-15's
-   [terminal failure](gpu_backend.md#terminal-failure) keeps the primary. Every
+   [frames](../gpu_backend.md#frames-acquisition-submission-and-abandonment) and
+   [presentation and retirement](../gpu_backend.md#presentation-and-retirement)
+   contracts, with native evidence in [`macos-vk12.md`](../vulkan/macos-vk12.md),
+   [`linux-vk12.md`](../vulkan/linux-vk12.md), [`macos-vk13.md`](../vulkan/macos-vk13.md)
+   and [`linux-vk13.md`](../vulkan/linux-vk13.md); VK-15's
+   [terminal failure](../gpu_backend.md#terminal-failure) keeps the primary. Every
    frame the required profile captured retired on its own present fence.
 6. **Bounded recovery preserves healthy targets and applies required and
    optional failure policy; lost devices are not automatically recreated; final
    validation and diagnostic failures reach the verdict.** VK-14
    ([#229](https://github.com/coghex/hetoimasia/issues/229)),
-   [recovery](gpu_backend.md#recovery), with [`macos-vk14.md`](vulkan/macos-vk14.md)
-   and [`linux-vk14.md`](vulkan/linux-vk14.md); VK-15
+   [recovery](../gpu_backend.md#recovery), with [`macos-vk14.md`](../vulkan/macos-vk14.md)
+   and [`linux-vk14.md`](../vulkan/linux-vk14.md); VK-15
    ([#231](https://github.com/coghex/hetoimasia/issues/231)), whose
    `vk15-validation-stop` case, in both platforms' runs above, stops at the
    checkpoint after an injected validation error with that error in the
-   verdict ([`macos-vk15.md`](vulkan/macos-vk15.md), [`linux-vk15.md`](vulkan/linux-vk15.md)).
-   No device loss was induced natively, as [the compatibility record](vulkan_compatibility_record.md)
+   verdict ([`macos-vk15.md`](../vulkan/macos-vk15.md), [`linux-vk15.md`](../vulkan/linux-vk15.md)).
+   No device loss was induced natively, as [the compatibility record](../vulkan_compatibility_record.md)
    states; device loss is specification evidence and the headless examples'.
 7. **Retained Cocoa resize and menu records establish the claimed graphics
    progress while the main owner turn is stalled, separating present requests,
@@ -159,8 +159,8 @@ two — and a clean verdict, and those counts measure nothing about refresh cade
    selections, no validation errors or incomplete diagnostic capture, and
    separate local macOS and remote Linux evidence.** 5.3 s on macOS and 3.97 s
    on Linux, for 121 examples each, with clean verdicts, in
-   [`macos-vk17.md`](vulkan/macos-vk17.md) and
-   [`linux-vk17.md`](vulkan/linux-vk17.md). The budget was not infeasible, so
+   [`macos-vk17.md`](../vulkan/macos-vk17.md) and
+   [`linux-vk17.md`](../vulkan/linux-vk17.md). The budget was not infeasible, so
    nothing returned to the owner, and no case was dropped or made optional to
    fit it.
 9. **Builds remain warning-clean; required headless suites initialize no GLFW,

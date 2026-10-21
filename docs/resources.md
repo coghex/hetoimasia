@@ -2,7 +2,7 @@
 
 Current behavior of `Hetoimasia.Foundation.Resource`, the public CPU resource
 scope. The approved policy and its alternatives live in
-[the resource ownership design](resource_ownership_design.md) (D-1, D-2, and
+[the resource ownership design](archive/resource_ownership_design.md) (D-1, D-2, and
 D-6 through D-8); this document describes what the code does today.
 
 Scope: the scope primitive, ownership and borrowing of the scoped value, the

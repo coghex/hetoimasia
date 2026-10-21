@@ -106,8 +106,8 @@ is unavailable. The catalog command deadlines include compilation overhead;
 they are not the probes' expected execution times.
 
 Both confinement verdicts remain inconclusive. Read
-[Linux's verdict](lua_linux_confinement_verdict.md) or
-[macOS's verdict](macos_confinement_verdict.md) before selecting or interpreting
+[Linux's verdict](archive/lua_linux_confinement_verdict.md) or
+[macOS's verdict](archive/macos_confinement_verdict.md) before selecting or interpreting
 the corresponding experiment. Optionality does not turn an inconclusive result
 into a supported security boundary.
 
@@ -121,11 +121,11 @@ Other existing apparatus is already outside routine automation:
 - The allocator probe,
   `bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:allocator-parity-probe`:
   by default GRS-18's qualification of the production VMA integration on a
-  windowless device (#361, [its record](gpu_vma_qualification_record.md)),
+  windowless device (#361, [its record](archive/gpu_vma_qualification_record.md)),
   run once per binding variant with `HETOIMASIA_VMA_FOREIGN_CALLS` unset or
   `safe`; with `-- --virtual-block-parity`, #331's measurement of an owned
   allocator against VMA, kept as the evidence for the resource services
-  design's D-38 ([its record](gpu_allocator_parity_record.md)). It is
+  design's D-38 ([its record](archive/gpu_allocator_parity_record.md)). It is
   deliberately not a catalog group: only the three required Vulkan groups may
   run a Vulkan-project command, and it reports figures rather than Hspec
   examples. It opens no window. Run it on request, on a quiet machine; each

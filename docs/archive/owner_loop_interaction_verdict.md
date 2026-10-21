@@ -15,7 +15,7 @@ offered 2128 update opportunities, and its longest stretch without one was
 one supervised graphics owner under
 [Vulkan D-29–D-33](vulkan_backend_design.md#d-29-render-from-one-supervised-graphics-owner-keep-glfw-on-the-main-thread),
 with GLFW and its record-only callbacks remaining on the process main thread.
-#218 has since delivered the [reusable owner machinery](glfw.md#the-supervised-graphics-owner).
+#218 has since delivered the [reusable owner machinery](../glfw.md#the-supervised-graphics-owner).
 Its injected backend operations and headless tests establish no native
 rendering result; VK-16 still owes rendering-progress evidence during Cocoa
 modal interactions. The [original alternatives](#what-the-owner-has-to-decide)
@@ -69,7 +69,7 @@ attributed.
 written on. `HETOIMASIA_INTERACTION_PROBE_SECONDS` is what makes the probe run
 at all; without it the example is pending and opens no window, which is how the
 mandatory `test.glfw-native` group meets it. See
-[docs/glfw.md](glfw.md#the-interaction-probe).
+[docs/glfw.md](../glfw.md#the-interaction-probe).
 
 ## How it was measured
 
@@ -156,7 +156,7 @@ Two things about the callbacks matter beyond the count:
   sets in 68.92 s; 1079 in 9.65 s). The platform is asking the application to
   redraw, continuously, for the entire time the application cannot act.
 - Those callbacks behaved exactly as
-  [their contract](glfw.md#callbacks-and-the-reconciliation-boundary) says:
+  [their contract](../glfw.md#callbacks-and-the-reconciliation-boundary) says:
   each recorded into the window's capture latch and returned. Nothing was
   reconciled, published, or drawn until the call returned and the turn reached
   its next owner boundary, where the 7648 sizes coalesce into one observation.
@@ -334,7 +334,7 @@ by the planner, so the owner's standing approval for runs an issue or pull
 request needs (2026-09-26, AGENTS.md) does not reach it: it runs when the owner
 asks for it, with the owner performing the interactions. The command, the variables, and what the
 report contains are in
-[docs/glfw.md](glfw.md#the-interaction-probe). What an owner turn offers the
+[docs/glfw.md](../glfw.md#the-interaction-probe). What an owner turn offers the
 trace, the bound, and its loss and fault reporting are asserted headlessly over
 the test seam in `Test.GLFW.Trace`, which needs no desktop and no observed
 stall.

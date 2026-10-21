@@ -51,7 +51,7 @@ The proof enables the Khronos validation layer, but repository configuration and
 **Evidence:**
 
 - `tools/vulkan-proof/proof/Test/Vulkan/Proof/Run.hs:509` and `:540` — layer selection and the instance-create chain.
-- `docs/vulkan_backend_design.md:2260` — evidence identifies the validation binary, but does not specify this setting.
+- `docs/archive/vulkan_backend_design.md:2260` — evidence identifies the validation binary, but does not specify this setting.
 - [#220](https://github.com/coghex/hetoimasia/issues/220), including amendments — owns native validation and receipts without an explicit synchronization-validation requirement.
 - [Khronos validation documentation](https://github.com/KhronosGroup/Vulkan-ValidationLayers/blob/main/README.md) distinguishes default core checks from additionally enabled synchronization validation.
 
@@ -64,7 +64,7 @@ The diagnostic design captures messages and bounded object information, but no i
 **Evidence:**
 
 - [#217](https://github.com/coghex/hetoimasia/issues/217), requirement 2 and its amendment — bounds copied object information; it does not assign native names.
-- `docs/vulkan_backend_design.md:1069` — minimal recorder operations omit capture labels.
+- `docs/archive/vulkan_backend_design.md:1069` — minimal recorder operations omit capture labels.
 - [Khronos debug-utils example](https://docs.vulkan.org/samples/latest/samples/extensions/debug_utils/README.html) describes native object names and command/queue labels for debugging tools.
 
 **Handoff context:** Coordinate naming with #219/#223 and consume #217’s bounded diagnostics. Define bounded names using existing identities and balanced labels around meaningful recording regions, including exceptional recording exits. Preserve optional debug capability handling and the FFI audit. This is separate from RTC-1’s performance collector. GPU timing is planned future work and should reuse the shared correlation format where applicable; its implementation and qualification remain outside the first CPU tracing/stalled-drain effort. Tool/platform capture support still needs qualification.
@@ -72,7 +72,7 @@ The diagnostic design captures messages and bounded object information, but no i
 ## Resource services beyond the triangle
 
 > **Handoff (2026-09-29):** VKR-3 through VKR-6 are carried by the
-> [GPU resource services design](designs/gpu_resource_services_design.md),
+> [GPU resource services design](archive/designs/gpu_resource_services_design.md),
 > which owns their allocation, upload, access/layout and binding contracts.
 > Its D-1 records the owner's bindless, atlased-texture decision, which
 > overrides VKR-6's "do not assume bindless". Process these findings against
@@ -87,7 +87,7 @@ Finite byte/object budgets and retirement are implemented, but there is no produ
 
 - `docs/gpu_model.md:239` — admission accounting and backpressure, not native allocation.
 - `tools/vulkan-proof/proof/Test/Vulkan/Proof/Run.hs:1662` — one buffer allocation using a host-visible, coherent memory type.
-- `docs/vulkan_backend_design.md:1452` — reusable pools/arenas are intended, without a device-memory allocator contract.
+- `docs/archive/vulkan_backend_design.md:1452` — reusable pools/arenas are intended, without a device-memory allocator contract.
 - [Khronos memory guidance](https://docs.vulkan.org/guide/latest/memory_allocation.html) recommends suballocation and explains discrete/UMA memory differences.
 
 **Handoff context:** Establish memory-type selection, alignment/granularity, required dedicated allocations, mapped-range rules, backing-allocation accounting, and completion-safe reuse before general resource creation. Evaluate a private VMA integration versus a small owned allocator; neither is selected here. Reuse #160/#229 rather than creating competing budgets or recovery. RTC-4 proposes loading-stage accounting; define how future reservations relate to backend storage without assuming that a loader already exists. No fragmentation or performance problem has been measured.
@@ -99,7 +99,7 @@ The triangle plan provides a readback buffer, but not a reusable native path for
 **Evidence:**
 
 - [#223](https://github.com/coghex/hetoimasia/issues/223), requirements 1–2 — triangle resources and verification readback; asset streaming is excluded.
-- `docs/vulkan_backend_design.md:1014` — grow recording through concrete consumers.
+- `docs/archive/vulkan_backend_design.md:1014` — grow recording through concrete consumers.
 - [Runtime capability report, RTC-4](runtime_capabilities_findings.md) — proposes requests, cancellation, loading budgets, and GPU ownership transfer.
 - [Renderer foundation report, FND-4](renderer_foundation_findings.md) — the proposed 2D consumer needs shared textured resources.
 
@@ -111,8 +111,8 @@ The existing design explicitly distinguishes lifetime retention from synchroniza
 
 **Evidence:**
 
-- `docs/vulkan_backend_design.md:1069` — barriers for the minimal operations.
-- `docs/vulkan_backend_design.md:1079` — retention does not resolve hazards or image layouts.
+- `docs/archive/vulkan_backend_design.md:1069` — barriers for the minimal operations.
+- `docs/archive/vulkan_backend_design.md:1079` — retention does not resolve hazards or image layouts.
 - `packages/gpu-vulkan/model/src/Hetoimasia/GPU/Model.hs:17` — the model tracks holds, not Vulkan access/layout state.
 
 **Handoff context:** Before extending the recorder, assign ownership of image subresource layouts, buffer ranges, access/stage dependencies, and any queue-family transitions actually supported. Start with explicit checked operations; a render graph is not selected. Cover upload-to-use and attachment-to-sampling transitions, overlapping updates, and cancellation/failed recording without manufacturing completion. Coordinate with VKR-4/VKR-6 and #223; the appropriate consumer and API granularity remain design questions.
@@ -123,7 +123,7 @@ The managed-retention policy anticipates transitive dependencies, but the first 
 
 **Evidence:**
 
-- `docs/vulkan_backend_design.md:1079` and `:1453` — descriptor contracts/pools await supported consumers.
+- `docs/archive/vulkan_backend_design.md:1079` and `:1453` — descriptor contracts/pools await supported consumers.
 - [#223](https://github.com/coghex/hetoimasia/issues/223) — requires exact transitive retention while excluding descriptor indirection.
 - [#221](https://github.com/coghex/hetoimasia/issues/221) — reproducible shader compilation; no general host/shader interface-verification contract.
 - [Khronos descriptor guidance](https://docs.vulkan.org/samples/latest/samples/performance/descriptor_management/README.html) connects binding reuse with per-frame buffer management.
@@ -157,6 +157,6 @@ The retained proof establishes particular Apple/MoltenVK and Lavapipe environmen
 - `docs/vulkan_compatibility_record.md:46` — exact proved loader, layer, driver, device, and presentation profiles.
 - `tools/vulkan-proof/proof/Test/Vulkan/Proof/Run.hs:867` — proof selection takes the first device satisfying its profile.
 - [#208](https://github.com/coghex/hetoimasia/issues/208) owns pinned development/CI provisioning; [#219](https://github.com/coghex/hetoimasia/issues/219) owns compatible production device/queue selection.
-- `docs/vulkan_backend_design.md:1743` — only evidenced capability profiles may be advertised.
+- `docs/archive/vulkan_backend_design.md:1743` — only evidenced capability profiles may be advertised.
 
 **Handoff context:** Before distribution, select the supported hardware/driver matrix, runtime dependency/discovery contract, and any application adapter preference needed beyond #219. Verify clean-machine startup without a developer SDK or mandatory validation-layer installation. Preserve required Vulkan features and presentation-completion guarantees; do not add silent fallback. Coordinate startup diagnostics with #219 and provisioning with #208; native crash collection is planned future work requiring separate refinement outside RTC-2's first stalled-drain effort. Release targets and available qualification hardware remain owner decisions, so this requires design refinement before implementation issues.

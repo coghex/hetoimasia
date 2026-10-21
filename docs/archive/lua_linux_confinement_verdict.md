@@ -18,7 +18,7 @@ proven and the deployment baseline is not, which is what `inconclusive` means
 here.
 
 Under D-11 that returns the Lua design to `exploring`. Recording the reference
-in [the Lua runtime design](lua_runtime_design.md) is a later documentation step
+in [the Lua runtime design](../lua_runtime_design.md) is a later documentation step
 rather than this pull request's, and nothing here weakens D-6, D-8, D-9, or
 P-13. The concrete obstacle and the alternatives are at the end.
 

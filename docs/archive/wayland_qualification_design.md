@@ -6,10 +6,10 @@ admits an explicit Wayland request while retaining X11 as its default.
 WL-3/#207 then supplies the D-13 probe, the D-12 native evidence under the
 isolated compositor, and the required-when-affected `test.glfw-wayland`; its
 run is retained in [the qualification record](wayland_qualification_record.md)
-and the supported profile is stated in [glfw.md](glfw.md#wayland). Selection
+and the supported profile is stated in [glfw.md](../glfw.md#wayland). Selection
 support alone does not establish that profile. This arc supplies
 native Wayland support and the evidence that establishes it, in the order
-the owner approved on 2026-09-20 through [RR-7](runtime_review_findings.md): provision
+the owner approved on 2026-09-20 through [RR-7](../runtime_review_findings.md): provision
 the inputs, settle the selection and capability contract, collect headless
 native evidence, then rendering evidence once the Vulkan slices that create
 surfaces exist. Windows execution is recorded as deferred on a machine being
@@ -335,7 +335,7 @@ The qualification reuses the pinned Linux image, the native cache and the
 validation catalog, defines its groups and their promotion to small
 required-when-affected checks when support is established, and keeps extensive
 desktop and compositor-specific probes optional. Local macOS testing and the
-human's explicit consent for desktop disruption are preserved. *Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md).*
+human's explicit consent for desktop disruption are preserved. *Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../../AGENTS.md).*
 
 Decisions D-7 through D-11 were made by the owner on 2026-09-20 in review of
 this document's first draft.

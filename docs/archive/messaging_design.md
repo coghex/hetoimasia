@@ -13,7 +13,7 @@ The owner granted readiness on 2026-09-13 after the review corrections in D-12.
 The six-slice design was subsequently processed and implemented as issues
 #74–#79 through PRs #80–#85. Epic #73 is closed. The retained ready state records
 the approved design; it does not mean another implementation should be filed.
-Current behavior is documented in [messaging.md](messaging.md).
+Current behavior is documented in [messaging.md](../messaging.md).
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a

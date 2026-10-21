@@ -2,7 +2,7 @@
 
 Current behavior of `Hetoimasia.Foundation.Log`, the public logging facade.
 The approved contract and its alternatives live in
-[the logging design](logging_design.md) (P-1 and P-2); this document describes
+[the logging design](archive/logging_design.md) (P-1 and P-2); this document describes
 what the code does today.
 
 Scope: the logger model, validated components, filtering, startup
@@ -389,7 +389,7 @@ an error-reporting or cleanup boundary must preserve its own primary failure
 when the diagnostic it tried to emit fails too.
 
 Generic resource-scope primitives stay out of this module; see
-[the resource ownership design](resource_ownership_design.md). A scope must run
+[the resource ownership design](archive/resource_ownership_design.md). A scope must run
 its cleanup and expose its outcome with no logger at all, or with a broken one.
 Composing the two is the application's obligation, and
 [Application lifecycle](resources.md#application-lifecycle) in the resource
@@ -969,7 +969,7 @@ lost, which [Ownership and failures](#ownership-and-failures) forbids. For a
 `forkIO`-spawned worker, escaping means escaping the worker action: with no
 supervisor in scope it reaches GHC's uncaught-exception handler, and giving the
 spawner a way to observe it belongs to
-[the resource ownership design](resource_ownership_design.md), not here.
+[the resource ownership design](archive/resource_ownership_design.md), not here.
 
 The reporting attempt is guarded, and only it. A synchronous failure from
 `logError` is discarded in favour of the work's own exception, which is rethrown

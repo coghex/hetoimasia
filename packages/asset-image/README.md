@@ -3,7 +3,7 @@
 Image codecs implementing [`hetoimasia-asset`](../asset/README.md)'s decoder
 interface. PNG decodes through JuicyPixels into one tightly packed RGBA8 level
 the GPU upload endpoint (#342) takes unchanged
-([asset design](../../docs/designs/asset_design.md), AST-1). BC7 levels are
+([asset design](../../docs/archive/designs/asset_design.md), AST-1). BC7 levels are
 checked, marked, and decoded to RGBA8 in software for devices that cannot
 sample BC7 (AST-3). A decoded image gets a full mip chain only when its caller
 asks for one (AST-4). KTX2 files carrying RGBA8 or BC7 levels are read by pure

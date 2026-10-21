@@ -37,7 +37,7 @@ drifts.
 ## What was considered, and what excluded the newer candidate
 
 Design records D-8 and D-13 in
-[the Vulkan backend design](vulkan_backend_design.md) ask for the newest
+[the Vulkan backend design](archive/vulkan_backend_design.md) ask for the newest
 *compatible* compiler, build tool, and dependencies, explicitly permit release
 candidates, and require a compatibility proof on Linux and local macOS before
 anything is pinned. "Permitted" is not "preferred": a release candidate is
@@ -74,7 +74,7 @@ Both examples assert that context is *dropped* on a path the foundation
 documents as lossy: a bare typed `catch`/`try` that rethrows the caught value,
 and a plain `throwIO` of an already-caught exception. On 9.14.2-rc2 the cleanup
 evidence survives both. That is a change in the exact behaviour
-[the resource ownership design](resource_ownership_design.md) and
+[the resource ownership design](archive/resource_ownership_design.md) and
 [`docs/resources.md`](resources.md) build on to distinguish `throwIO` from
 `rethrowIO` and `catchNoPropagate`, and #157 requires that the foundation's
 exception-context behaviour be unchanged across this refresh.
@@ -305,7 +305,7 @@ compiled VMA reads. Both see the same Vulkan headers, the ones the native pin
 names (`/usr/include` on Linux, `/usr/local/include` on macOS).
 
 The binding is #361's recommendation (Q-19), measured in
-[the VMA qualification record](gpu_vma_qualification_record.md): an
+[the VMA qualification record](archive/gpu_vma_qualification_record.md): an
 engine-owned shim taking scalars and one reused result record, imported
 `unsafe`, with D-40's callbacks counting in C. The Hackage package's own
 Haskell binding is not used by the engine; only the allocator probe calls it,

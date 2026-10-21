@@ -1,7 +1,7 @@
 # Resource ownership design
 
 Establish safe CPU ownership before implementing Vulkan. This is the detailed
-delivery plan for FND-1 in the [foundation design](engine_foundation_design.md).
+delivery plan for FND-1 in the [foundation design](../engine_foundation_design.md).
 
 Design state: `ready for issue processing`
 
@@ -22,7 +22,7 @@ plan was subsequently published and processed.
 
 Implementation status: RES-1 through RES-4 and their review repairs are merged;
 epic #22 is closed. Current scopes, composites and continuation contracts are
-in [resources.md](resources.md). The later GLFW arc added the independent CPU
+in [resources.md](../resources.md). The later GLFW arc added the independent CPU
 resource collection through #87 / PR #101. GPU completion remains outside
 these CPU ownership guarantees. The retained design state is not an unfiled queue.
 
@@ -82,13 +82,13 @@ document.
 
 Two contracts landed since the first review bind this arc's pull requests:
 
-- The [validation catalog](validation.md) declares every check. Resource tests
+- The [validation catalog](../validation.md) declares every check. Resource tests
   added to `hetoimasia-tests` are covered by the floor group `test.engine`
   without a catalog change. A new console path needs an explicit catalog
   decision, recorded in RES-4. Catalog edits are policy inputs and widen
   selection, so make one only with the slice that needs it. A pull request
   requests extra groups through its `validation-request` block.
-- The test architecture design (`docs/test_architecture_design.md`, local to
+- The test architecture design (`docs/archive/test_architecture_design.md`, local to
   `docs-wip` until published) groups engine tests by component. Its TEST-1
   waits for RES-1 through RES-4 to merge, and its D-6 lets resource tests adopt
   the `Test/Engine/Resources` grouping immediately. Add resource examples to
@@ -437,12 +437,12 @@ and application boundaries decide which diagnostics to emit. Resource failures
 must not survive only as a message that may never reach the sink.
 
 Shutdown order is the one the logging contract already establishes in
-[Ownership and failures](logging.md#ownership-and-failures): stop and join
+[Ownership and failures](../logging.md#ownership-and-failures): stop and join
 producers, finish subsystem cleanup, then flush and close a handle the
 application owns. Borrowed stderr or another caller-owned handle remains that
 caller's property. A boundary that turns a resource failure into a diagnostic
 follows the worker reporting-boundary example in the
-[module authoring guide](logging.md#module-authoring-guide): classify any
+[module authoring guide](../logging.md#module-authoring-guide): classify any
 `SomeAsyncException` as cancellation and let it escape unreported, report an
 ordinary failure once, and keep the original failure when the report itself
 fails. No logger call belongs in the gap between acquiring a resource and

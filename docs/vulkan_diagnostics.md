@@ -5,7 +5,7 @@ Current behavior of the Vulkan backend's diagnostic capture: the header-free
 debug-utils messengers the native backend package
 `Hetoimasia.GPU.Vulkan.Native.Diagnostics` in `packages/gpu-vulkan/native`
 installs. The accepted policy lives in
-[the Vulkan backend design](vulkan_backend_design.md) — D-19, D-20, D-21, D-28,
+[the Vulkan backend design](archive/vulkan_backend_design.md) — D-19, D-20, D-21, D-28,
 P-11 and the VK-6 slice — and in
 [runtime review finding RR-5](runtime_review_findings.md); this document says
 what the code does today.

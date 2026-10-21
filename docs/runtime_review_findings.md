@@ -80,7 +80,7 @@ would not establish reproducibility.
 - `tools/vulkan-proof/environment.pin:16` — `MACOS_VULKAN_DRIVER_MANIFEST=/opt/homebrew/Cellar/molten-vk/1.4.0/etc/vulkan/icd.d/MoltenVK_icd.json`.
 - `tools/vulkan-proof/environment.pin:17` — `MACOS_VULKAN_LAYER_PATH=/usr/local/share/vulkan/explicit_layer.d`.
 - `tools/vulkan-proof/run-proof.sh:80-82` — accepts `HETOIMASIA_VULKAN_PREFIX`, `HETOIMASIA_VULKAN_DRIVER_MANIFEST` and `HETOIMASIA_VULKAN_LAYER_PATH` overrides; later checks refuse unavailable inputs.
-- `docs/vulkan_backend_design.md`, VK-4 — already owns cached native provisioning, explicit discovery and manifest/binary identities in validation evidence.
+- `docs/archive/vulkan_backend_design.md`, VK-4 — already owns cached native provisioning, explicit discovery and manifest/binary identities in validation evidence.
 
 **Handoff context:**
 
@@ -175,7 +175,7 @@ benchmark; the size of any performance benefit remains unmeasured.
   `debugCallback` in Haskell; `:531-557` registers it before instance creation.
   `tools/vulkan-proof/proof/Test/Vulkan/Proof/Spec.hs:229-261` checks callbacks,
   teardown lifetime, the threaded RTS and that safe-call configuration.
-- [Vulkan design P-9](vulkan_backend_design.md#binding-and-callback-configuration)
+- [Vulkan design P-9](archive/vulkan_backend_design.md#binding-and-callback-configuration)
   currently defers native-only capture. P-11 and D-19 already require bounded
   capture, independent failure latches and a separately owned diagnostic worker;
   VK-6 and VK-11 are the delivery points this decision affects.
@@ -490,8 +490,8 @@ that coverage forward rather than filing an independent duplicate prerequisite.
 
 - `packages/glfw/model/Hetoimasia/GLFW/Internal/Session.hs:895-901` — `initialize` calls `nativeSetInitHints` then `nativeInitialize` with no injectable step between them.
 - `packages/glfw/model/Hetoimasia/GLFW/Internal/Session.hs:418-502` — `Native` declares no loader, surface, or Vulkan-support operation.
-- `docs/vulkan_backend_design.md`, P-7 — specifies the additive capability, its ordering, and the reset on every exit.
-- `docs/vulkan_backend_design.md`, VK-5 — names the opaque session-integration capability, pre-init loader selection and reset on all exits in its delivery scope.
+- `docs/archive/vulkan_backend_design.md`, P-7 — specifies the additive capability, its ordering, and the reset on every exit.
+- `docs/archive/vulkan_backend_design.md`, VK-5 — names the opaque session-integration capability, pre-init loader selection and reset on all exits in its delivery scope.
 
 **Handoff context:**
 

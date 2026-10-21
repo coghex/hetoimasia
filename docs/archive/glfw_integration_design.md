@@ -80,7 +80,7 @@ dynamic multi-window host, monitor-aware controls/modes, and bounded native inpu
 The runtime adapter is a separate public Cabal sublibrary with its own source
 root inside `hetoimasia-glfw`; the foundation/runtime boundaries remain intact.
 
-The [completion review](project_review_114-101.md) found four open repairs:
+The [completion review](../project_review_114-101.md) found four open repairs:
 #115 construction/rollback failure preservation, #116 disconnect recovery across
 observations, #117 geometry restoration after partial departure, and #118 fixture
 drain under repeated cancellation. All four are repaired: #118's fixture now
@@ -108,7 +108,7 @@ baseline, not the implementation inventory above.
 | `Hetoimasia.Runtime.Supervision` | `checkRuntime` and `awaitSupervised` settle worker outcomes. Arbitrary native blocking calls are not supervised waits. |
 | `Messaging.Payload`, `Channel`, and `Snapshot` | Producer-side deep preparation, explicit Full/Closed admission, distinct close/abort, coherent observations, and checked snapshot cursors are already available. |
 | `Hetoimasia.Runtime.Inbox` | Owns a background worker's inbox. Its worker execution model does not give it GLFW main-thread authority. Do not put GLFW operations in an inbox handler. |
-| `docs/test_architecture_design.md`, epic #49 | TEST-1 (#50) is complete. TEST-2 is linked to GLFW-7/#93 through the separately approved existing-issue disposition; implementation still waits for GLFW-1/GLFW-2 and native evidence. |
+| `docs/archive/test_architecture_design.md`, epic #49 | TEST-1 (#50) is complete. TEST-2 is linked to GLFW-7/#93 through the separately approved existing-issue disposition; implementation still waits for GLFW-1/GLFW-2 and native evidence. |
 | `tools/validation/catalog.json` | Existing mandatory floor, affected non-optional tests, and PR-requested groups remain authoritative. Optional groups stay optional when affected. |
 
 The baseline workflow had no display provisioning and routed four CPU groups
@@ -118,7 +118,7 @@ GLFW-7 owns the display runner
 classification and execution wiring, with regression tests for the existing
 selection, evidence reuse and aggregate behavior.
 
-The earlier `docs/vulkan_backend_design.md` reserves a separate GLFW owner.
+The earlier `docs/archive/vulkan_backend_design.md` reserves a separate GLFW owner.
 Its narrow triangle-era scope is historical context for that rendering milestone,
 not a decision against the broader window manipulation now requested. Rendering
 work and its proposed GLFW/Vulkan interop remain deferred.
@@ -1458,7 +1458,7 @@ call of its own, so the session, the windows, the callbacks and the pump this
 fixture owns stay exactly where they are: the executable's main thread still
 owns the session and pumps owner operations, and Hspec still dispatches native
 operations to it. See
-[glfw.md](glfw.md#the-supervised-graphics-owner) for what the owner may and may
+[glfw.md](../glfw.md#the-supervised-graphics-owner) for what the owner may and may
 not do.
 
 ### CI and local evidence

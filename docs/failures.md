@@ -3,7 +3,7 @@
 Current behavior of `Hetoimasia.Foundation.Failure`: where an engine failure
 came from, what operation it passed through, and how a caller reads that back.
 The accepted policy lives in
-[the runtime foundation design](runtime_foundation_design.md) (D-4, D-5, P-1,
+[the runtime foundation design](archive/runtime_foundation_design.md) (D-4, D-5, P-1,
 and P-4); this document describes what the code does today.
 
 Scope: raising an engine failure with its origin, in `IO` or inside a

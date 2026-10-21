@@ -5,12 +5,12 @@ Local apparatus with two modes, both run through `tools/vulkan/run.sh`:
 - **GRS-18, the default**: the production VMA integration qualified by bounded
   measurement on a real device (#361, design decisions D-16, D-38, D-39 and
   D-40 in
-  [the GPU resource services design](../../../../../docs/designs/gpu_resource_services_design.md)).
+  [the GPU resource services design](../../../../../docs/archive/designs/gpu_resource_services_design.md)).
   Its retained runs and verdict are in
-  [the VMA qualification record](../../../../../docs/gpu_vma_qualification_record.md).
+  [the VMA qualification record](../../../../../docs/archive/gpu_vma_qualification_record.md).
 - **GRS-1, `--virtual-block-parity`**: #331's comparison of an owned Haskell
   allocator with VMA's virtual block, kept as D-38's evidence in
-  [the parity record](../../../../../docs/gpu_allocator_parity_record.md).
+  [the parity record](../../../../../docs/archive/gpu_allocator_parity_record.md).
 
 ```bash
 bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:allocator-parity-probe -- --output FILE --warmup 3 --repetitions 20
@@ -263,7 +263,7 @@ search, copying, collection and timer overhead. It replays each trace through:
 **Status: retained evidence.** Neither Haskell allocator met the gates, and
 the owner chose VMA for production allocation (D-38). The probe and its three
 runs are kept as that decision's evidence, in
-[the parity record](../../../../../docs/gpu_allocator_parity_record.md).
+[the parity record](../../../../../docs/archive/gpu_allocator_parity_record.md).
 
 ```bash
 bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:allocator-parity-probe -- --virtual-block-parity --output FILE
@@ -529,4 +529,4 @@ Exit status 2, and a report headed *Failed*, if any of these fails:
 - the runtime keeps statistics.
 
 Retained results belong in
-[`docs/gpu_allocator_parity_record.md`](../../../../../docs/gpu_allocator_parity_record.md).
+[`docs/archive/gpu_allocator_parity_record.md`](../../../../../docs/archive/gpu_allocator_parity_record.md).

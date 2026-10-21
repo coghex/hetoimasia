@@ -13,7 +13,7 @@ The owner requested publication to `master` on 2026-09-10.
 Implementation status: LOG-1 through LOG-3 and the logging follow-up #9 are
 merged; epic #1 is closed. This is the retained approved design, not pending
 implementation. Current behavior and authoring conventions are in
-[logging.md](logging.md).
+[logging.md](../logging.md).
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -41,10 +41,10 @@ concrete precondition
 
 ## Historical design evidence
 
-At Hetoimasia `4c4ed18`, the [logger](../packages/foundation/src/Hetoimasia/Foundation/Log.hs)
+At Hetoimasia `4c4ed18`, the [logger](../../packages/foundation/src/Hetoimasia/Foundation/Log.hs)
 is scratch code: synchronous level filtering, an opaque injected sink, strict
 text entries, and a borrowed handle formatter. Sink exceptions propagate.
-[Four Hspec examples](../test/Main.hs) cover filtering, sink failure, runtime
+[Four Hspec examples](../../test/Main.hs) cover filtering, sink failure, runtime
 ordering/results, and action failure. Metadata, concurrent use, and handle
 ownership are not yet tested.
 

@@ -545,7 +545,7 @@ D-11 decided: any change that selects `test.glfw-native` selects it too. The
 [display worker](#the-display-worker) runs it under `tools/display/wayland.sh`
 rather than `x11.sh`, which is what gives it a Wayland session to select. The
 retained evidence of the run that promoted it is
-[the Wayland qualification record](wayland_qualification_record.md).
+[the Wayland qualification record](archive/wayland_qualification_record.md).
 
 The local-only probes are `test.x11-helper`, `test.wayland-helper`,
 `test.lua-hazard`, `test.lua-confinement-linux`, and `test.macos-confinement`.
@@ -560,7 +560,7 @@ helper's denied filesystem, network, process, and native-module accesses before
 and after its mod source loads, two-instance process and storage isolation, the
 enforced whole-process memory limit and the execution bound, and the three
 lifetime endings. Its verdict is
-[docs/macos_confinement_verdict.md](macos_confinement_verdict.md).
+[docs/archive/macos_confinement_verdict.md](archive/macos_confinement_verdict.md).
 
 ```bash
 cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct
@@ -2485,7 +2485,7 @@ passed. A Linux plan also leaves the local-only optional group
 `optional-unrequested` when its inputs change. No CI worker routes it; a
 local Linux run must explicitly request the group and assign it to a local
 `cpu` worker. The retained Linux receipt, rather than a later CI run, supports
-the [inconclusive verdict](lua_linux_confinement_verdict.md).
+the [inconclusive verdict](archive/lua_linux_confinement_verdict.md).
 
 On macOS a local worker provides the `display` class through Cocoa, so the same
 plan executes the native group directly — no display helper, since Cocoa is the

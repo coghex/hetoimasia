@@ -1,8 +1,8 @@
 # Archived foundation plan — before the 2026-09-22 reconciliation
 
-Historical planning only. The current [boundary overview](../engine_foundation_design.md)
+Historical planning only. The current [boundary overview](../../engine_foundation_design.md)
 links the focused owners; remaining consumer goals are in the
-[renderer report](../renderer_foundation_findings.md). The ledger below is the
+[renderer report](../../renderer_foundation_findings.md). The ledger below is the
 original snapshot, not an active processing queue. Only navigation links were
 adjusted for this archive's location.
 
@@ -23,7 +23,7 @@ and Linux, with Linux-only remote CI and local macOS validation. See D-8 and
 
 At `master@727f59a`, logging, resources, runtime composition/supervision,
 messaging, and the original GLFW arc are implemented. The
-[GLFW completion review](../project_review_114-101.md) tracks repairs #115–#118.
+[GLFW completion review](../../project_review_114-101.md) tracks repairs #115–#118.
 Vulkan, rendering, Lua, and game integration remain planned. This broader design
 stays exploring; update its rendering slices after settling the backend's
 ownership, completion, frame scheduling, and platform contracts.
@@ -129,7 +129,7 @@ arbitrary mutable references. Concurrency is introduced for measured needs.
 Logging uses an injectable sink and no global mutable context. The thin
 `runApplication` wrapper remains available, while `runScopedApplication` composes
 scoped dependencies, supervision, startup/action and pre-drain quiescence on its
-caller. The [resource contract](../resources.md) supplies the continuation facade;
+caller. The [resource contract](../../resources.md) supplies the continuation facade;
 the implemented [runtime design](../runtime_foundation_design.md) uses explicit IO
 and narrow handles. An application-wide monad remains outside that arc. GPU
 completion is deliberately a separate backend obligation.
@@ -221,7 +221,7 @@ remains the ownership mechanism under these new contracts.
 
 ### Q-1. Workflow service setup
 
-CI and Kanban setup are recorded in [workflow.md](../workflow.md); this is no
+CI and Kanban setup are recorded in [workflow.md](../../workflow.md); this is no
 longer a prerequisite design question. Installed services' current running
 state is local operational state and must be checked when needed. The
 publication target is settled in D-6.

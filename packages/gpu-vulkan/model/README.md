@@ -64,7 +64,7 @@ a test reference only — production allocation uses VMA (resource services
 design D-38) — so only test suites may depend on it: `gpu-model-tests` and the
 native package's allocator parity probe. The model library does not. See
 [`docs/gpu_model.md`](../../../docs/gpu_model.md#the-placement-reference) and
-[the parity record](../../../docs/gpu_allocator_parity_record.md).
+[the parity record](../../../docs/archive/gpu_allocator_parity_record.md).
 
 ## Testing
 

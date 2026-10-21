@@ -2,13 +2,13 @@
 
 Give Hetoimasia an independent 2D renderer, `render-2d`, over the shared GPU
 resource services. Its first milestone also needs image decoding, which is a
-separate epic in the [asset design](asset_design.md) (D-15).
+separate epic in the [asset design](../archive/designs/asset_design.md) (D-15).
 A 2D game should draw textured sprites through cameras and views, with depth
 for opaque art and correct ordering for translucent art, without constructing
 a 3D renderer (foundation D-2). This arc carries FND-4 of the
 [renderer findings](../renderer_foundation_findings.md), whose precondition
 (#345 and #346 closed) is met, and answers the `render-api` question that
-[GPU resource services D-8](gpu_resource_services_design.md#d-8-services-extend-the-native-backend-package)
+[GPU resource services D-8](../archive/designs/gpu_resource_services_design.md#d-8-services-extend-the-native-backend-package)
 left to it. Synarchy (`~/work/synarchy`) is prior experience to improve on,
 not a compatibility target.
 
@@ -165,7 +165,7 @@ ran for this document.
 
 - Text and fonts: their own arc and design document (D-6).
 - Image decoding (`asset`, `asset-image`) and every other asset concern:
-  the [asset design](asset_design.md)'s epic (D-15).
+  the [asset design](../archive/designs/asset_design.md)'s epic (D-15).
 - Runtime content loading: background decoding workers, loader budgets, file
   watching and hot reload (RTC-4, RTC-3).
 - MSAA and alpha-to-coverage; the backend owns them, deferred.
@@ -415,7 +415,7 @@ at 3D's needs.
 
 The first milestone shows an image file, and compressed textures are built
 alongside PNG. D-15 moves this delivery to its own epic; the
-[asset design](asset_design.md) carries this decision as its D-1 and D-3.
+[asset design](../archive/designs/asset_design.md) carries this decision as its D-1 and D-3.
 
 | Package | Contents |
 | --- | --- |
@@ -445,7 +445,7 @@ content, materials, clipping and the text arc.
 ### D-15. Asset decoding is its own epic
 
 Owner decision 2026-10-04; resolves Q-8. The `asset` packages form their own
-epic, designed in the [asset design](asset_design.md), with their own
+epic, designed in the [asset design](../archive/designs/asset_design.md), with their own
 tracker label. R2D-5 and R2D-6 move there as AST-1 and AST-2, and R2D-8
 depends on AST-1. The owner confirmed on 2026-10-05 that this means a GitHub
 issue label, `asset`, and an epic tracker named for assets.
@@ -884,11 +884,11 @@ Resolved by D-17: a configurable list, with smooth zoom kept available.
 
 ### R2D-5. Decode PNG into premultiplied RGBA8 levels
 
-Moved to the [asset design](asset_design.md) as AST-1 (D-15).
+Moved to the [asset design](../archive/designs/asset_design.md) as AST-1 (D-15).
 
 ### R2D-6. Read KTX2 files carrying BC7 or RGBA8 levels
 
-Moved to the [asset design](asset_design.md) as AST-2 (D-15).
+Moved to the [asset design](../archive/designs/asset_design.md) as AST-2 (D-15).
 
 ### R2D-16. Let table pipelines choose samplers in the shader
 

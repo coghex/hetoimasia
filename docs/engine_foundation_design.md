@@ -11,7 +11,7 @@ This path remains the architectural reference used by AGENTS.md and existing
 documents. On 2026-09-22 its broad delivery plan was reconciled with the focused
 arcs below. It is an architecture overview, not a document to process into
 another foundation epic. The
-[original plan](history/engine_foundation_design_before_2026-09-22.md)
+[original plan](archive/history/engine_foundation_design_before_2026-09-22.md)
 preserves its bootstrap evidence, original ledger and proposed sequence.
 
 ## Current implementation
@@ -53,7 +53,7 @@ to these focused contracts and work queues:
 | Original concern | Current authority and status |
 | --- | --- |
 | FND-1, CPU resource ownership | [Resource contract](resources.md), delivered through #22; no duplicate slice |
-| FND-2, Vulkan initialization and disposal | [Vulkan backend design](vulkan_backend_design.md), epic #155; native proof #158 delivered; production instance, device and target ownership delivered by #219 ([contract](gpu_backend.md)) |
+| FND-2, Vulkan initialization and disposal | [Vulkan backend design](archive/vulkan_backend_design.md), epic #155; native proof #158 delivered; production instance, device and target ownership delivered by #219 ([contract](gpu_backend.md)) |
 | FND-3, minimal depth-tested 3D consumer | [Renderer foundation findings](renderer_foundation_findings.md), FND-3; needs focused refinement |
 | FND-4, independent textured 2D consumer | [Renderer foundation findings](renderer_foundation_findings.md), FND-4; needs focused refinement |
 | FND-5, Lua hosting and application bindings | [Lua runtime design](lua_runtime_design.md), epic #145; binding and protocol model delivered, confinement inconclusive and further processing paused |
@@ -138,8 +138,8 @@ standing permission to publish later changes outside their delivery lane.
 
 ### D-7. Process the dedicated logging and resource designs
 
-The owner requested readiness of the [logging](logging_design.md) and
-[resource](resource_ownership_design.md) designs on 2026-09-10. Those arcs are
+The owner requested readiness of the [logging](archive/logging_design.md) and
+[resource](archive/resource_ownership_design.md) designs on 2026-09-10. Those arcs are
 delivered. Their failure and ownership policies remain authoritative; FND-1's
 old entry delegates to #22 rather than creating duplicate work.
 
@@ -148,7 +148,7 @@ old entry delegates to #22 rather than creating duplicate work.
 The owner prioritized methodical infrastructure over rushing another triangle.
 Logging, CPU resource ownership, messaging, runtime initialization/lifecycle,
 worker supervision and GLFW now have dedicated contracts and implementations.
-The [backend design](vulkan_backend_design.md) owns the accepted windowed-triangle
+The [backend design](archive/vulkan_backend_design.md) owns the accepted windowed-triangle
 milestone, GPU completion rules, capability profiles and Linux/macOS qualification.
 Follow its concrete prerequisites; do not revive the old offscreen-first
 Vulkan bootstrap.

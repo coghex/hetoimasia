@@ -18,22 +18,22 @@ The original GLFW arc and its completion repairs (#115–#118 and #123) are
 merged and reviewed; epic #86 is complete. Native desktop tests require an
 explicit per-command opt-in (#124), given under the owner's standing approval
 (2026-09-26) for runs an issue or pull request needs. The children of the
-[package-owned tests](docs/test_architecture_design.md) (#49),
-[scheduling and native wake](docs/runtime_scheduling_design.md) (#131), and
-[window/graphics retirement](docs/window_graphics_lifetime_design.md) (#140)
+[package-owned tests](docs/archive/test_architecture_design.md) (#49),
+[scheduling and native wake](docs/archive/runtime_scheduling_design.md) (#131), and
+[window/graphics retirement](docs/archive/window_graphics_lifetime_design.md) (#140)
 arcs have merged, including retirement/reporting repairs #166–#169. The
 [review ledger](docs/project_review/ledger.md) records audited PR coverage and
 current findings.
 
 Shared toolchain qualification #157 is complete, and the [Vulkan compatibility
 proof](docs/vulkan_compatibility_record.md) #158 records the selected profiles. The
-[Vulkan design](docs/vulkan_backend_design.md) (#155) is complete, with all
+[Vulkan design](docs/archive/vulkan_backend_design.md) (#155) is complete, with all
 nineteen delivery slices completed. The reviewed model/proof repairs #181–#184
 and #189–#190 are merged, as is the reusable supervised graphics owner #218.
 The production native backend has merged through #219–#232, with its contract
 in [docs/gpu_backend.md](docs/gpu_backend.md). The independent
 [two-window triangle consumer](samples/triangle/README.md) (#233) is delivered;
-the [milestone verdict](docs/vulkan_milestone_verdict.md) links the final
+the [milestone verdict](docs/archive/vulkan_milestone_verdict.md) links the final
 required native-profile evidence on macOS and Linux. The
 [Lua design](docs/lua_runtime_design.md) (#145) has returned to exploring: both platform confinement verdicts are inconclusive, so
 production mod-process work needs the deployment decision required by D-11.
@@ -51,7 +51,7 @@ production mod-process work needs the deployment decision required by D-11.
 - [Scheduling update policy](docs/scheduling.md)
 - [GLFW contract and native tests](docs/glfw.md)
 - [Validation and evidence reuse](docs/validation.md)
-- [Vulkan backend design — staged qualification](docs/vulkan_backend_design.md)
+- [Vulkan backend design — staged qualification](docs/archive/vulkan_backend_design.md)
 - [Vulkan backend and window integration contract](docs/gpu_backend.md)
 - [Kanban development workflow](docs/workflow.md)
 

@@ -3,7 +3,7 @@
 Current behavior of `Hetoimasia.Foundation.Recovery`: bounded, classified
 recovery around one complete owned operation, and the outcome or preserved
 failure it hands back. The accepted policy lives in
-[the runtime foundation design](runtime_foundation_design.md) (D-2 through D-7,
+[the runtime foundation design](archive/runtime_foundation_design.md) (D-2 through D-7,
 P-2, P-3, and P-5); this document describes what the code does today.
 
 Scope: the boundary, its policy, the attempt order, its outcomes, and the

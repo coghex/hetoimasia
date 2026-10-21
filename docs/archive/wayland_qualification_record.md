@@ -1,7 +1,7 @@
 # Native Wayland qualification: the retained runs
 
 The records WL-3 (#207) and WL-4 (#327) require: the run that established the
-headless native Wayland profile [glfw.md](glfw.md#wayland) states, and the run
+headless native Wayland profile [glfw.md](../glfw.md#wayland) states, and the run
 that established Vulkan rendering on it ([Rendering](#rendering)), each kept
 verbatim because a run's own output is the evidence and a CI log that expires
 is not a record. A third, #357's, qualifies hiding a presenting window, which
@@ -186,7 +186,7 @@ Test suite glfw-native-tests: PASS
 WL-4's evidence (#327, pull request
 [#356](https://github.com/coghex/hetoimasia/pull/356)): the Vulkan native
 suite's whole `--complete` profile on native Wayland, as the required group
-`test.vulkan-wayland` ([gpu_backend.md](gpu_backend.md#the-native-suite)),
+`test.vulkan-wayland` ([gpu_backend.md](../gpu_backend.md#the-native-suite)),
 with the Wayland qualification design's D-5, D-6 and D-10.
 
 ### The run
@@ -523,8 +523,8 @@ VK-16's `vk16-composed`, which hides one of two presenting windows and shows it
 again, run and passed under the isolated compositor's consent, where WL-4's run
 left it pending. The engine change it qualifies is the presentation hold a hide
 takes before its native call and the replacement a resumed target is given
-([gpu_backend.md](gpu_backend.md#pacing-suspension-and-fairness),
-[glfw.md](glfw.md#hiding-an-attached-window)). The same run's
+([gpu_backend.md](../gpu_backend.md#pacing-suspension-and-fairness),
+[glfw.md](../glfw.md#hiding-an-attached-window)). The same run's
 `test.vulkan-native` is the X11 regression; the Cocoa one was run on the
 owner's machine.
 

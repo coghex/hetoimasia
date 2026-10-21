@@ -3736,11 +3736,11 @@ It is not selected automatically, even for affected inputs. A green run of it is
 evidence and never a verdict: each example prints what it proved, or says that
 the machine could not install the profile and names the prerequisite that was
 missing. What those lines add up to is
-[the Linux confinement verdict](../../docs/lua_linux_confinement_verdict.md),
+[the Linux confinement verdict](../../docs/archive/lua_linux_confinement_verdict.md),
 which is where the accounting semantics of the memory limit, the deployment
 baseline, and the residual limits are recorded, and the runs it draws on are
 kept verbatim in
-[the retained runs](../../docs/lua_linux_confinement_evidence.md).
+[the retained runs](../../docs/archive/lua_linux_confinement_evidence.md).
 
 ## The macOS confinement probe
 
@@ -3760,7 +3760,7 @@ macOS row with observations.
 
 The answer is `inconclusive` — with one row of evidence explicitly identified as
 missing rather than passed — and
-[docs/macos_confinement_verdict.md](../../docs/macos_confinement_verdict.md) is
+[docs/archive/macos_confinement_verdict.md](../../docs/archive/macos_confinement_verdict.md) is
 where it is stated and argued: every proof row was demonstrated, on two
 interfaces Apple does not support. Read it before building anything on this
 code.

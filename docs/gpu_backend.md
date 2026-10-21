@@ -1,7 +1,7 @@
 # The Vulkan roots and their window integration
 
 This is the delivered contract of VK-7 ([#219](https://github.com/coghex/hetoimasia/issues/219))
-of [the Vulkan backend design](vulkan_backend_design.md): one graphics
+of [the Vulkan backend design](archive/vulkan_backend_design.md): one graphics
 session's Vulkan instance, its explicit debug messenger, its one shared device
 and a target for every window surface handed to it, owned by the supervised
 graphics owner and retired through its protected exit. It covers the design's
@@ -29,7 +29,7 @@ properties; the model's accounted bytes charging the blocks VMA holds, through
 a bounded reservation before any call that could open one; VK-14's recovery
 for a no-effect allocating failure; and readback buffers moved onto it as its
 first consumer — D-15, D-16, D-38 and D-40 of the
-[GPU resource services design](designs/gpu_resource_services_design.md). See
+[GPU resource services design](archive/designs/gpu_resource_services_design.md). See
 [Device memory](#device-memory).
 
 GRS-2 ([#334](https://github.com/coghex/hetoimasia/issues/334)) adds **managed
@@ -107,7 +107,7 @@ device-loss teardown across submitted work and pending presentations is the
 frames' own ([Terminal failure](#terminal-failure)).
 
 GRS-15 ([#336](https://github.com/coghex/hetoimasia/issues/336)) of
-[the GPU resource services design](designs/gpu_resource_services_design.md)
+[the GPU resource services design](archive/designs/gpu_resource_services_design.md)
 lets a session **start its device without a window**: an opt-in host setting,
 `DeviceSurfaceFree`, has the owner's startup select and create the device
 against no surface, and a window handed over later is admitted only if the
@@ -655,7 +655,7 @@ declares a foreign import.
 ## Device memory
 
 GRS-11 (#333) backs device memory with VMA beneath the model's accounting, as
-D-38 and D-40 of the [GPU resource services design](designs/gpu_resource_services_design.md)
+D-38 and D-40 of the [GPU resource services design](archive/designs/gpu_resource_services_design.md)
 decide. `Hetoimasia.GPU.Vulkan.Native.Allocator` is the allocator's shape — an
 open record of calls, `AllocatorOps`, over 64-bit handles — and the engine's
 memory-type policy; `Hetoimasia.GPU.Vulkan.Native.Allocator.Vulkan` is its
@@ -736,7 +736,7 @@ allocation attempt in this order; the two differ only in VMA's calls
    VMA's `CalcPreferredBlockSize`, an eighth of a heap of at most 1 GiB and
    otherwise the configured 256 MiB, aligned to 32 bytes (`preferredBlockSize`)
    — and the requirements' size. The bound holds only under
-   [D-40](designs/gpu_resource_services_design.md#d-40-the-byte-budget-charges-vmas-blocks-reserved-before-one-can-open)'s
+   [D-40](archive/designs/gpu_resource_services_design.md#d-40-the-byte-budget-charges-vmas-blocks-reserved-before-one-can-open)'s
    preconditions: the allocating call asks VMA to map nothing — no
    `VMA_ALLOCATION_CREATE_MAPPED_BIT`, nor any other mapping inside the call;
    the shim passes `VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT` in step 2 and no
@@ -2283,7 +2283,7 @@ disagreement above with no native call, through a replacement too.
 
 GRS-6 (#342) moves bytes into a fresh texture, vertex buffer or index buffer.
 Its design is D-9, D-11, D-20, D-21 and D-30 of the
-[resource services design](designs/gpu_resource_services_design.md). Bytes go
+[resource services design](archive/designs/gpu_resource_services_design.md). Bytes go
 through one bounded, host-visible staging buffer that the graphics owner holds.
 The owner records copies from it into frame-less batches
 ([Batches](#batches), GRS-12), in chunks under a per-turn byte budget. Each
@@ -2571,7 +2571,7 @@ nothing.
 
 GRS-7 (#343) is the bindless texture table. Its design is D-1, D-11, D-22,
 D-23, D-27, D-31 and D-35 of the
-[resource services design](designs/gpu_resource_services_design.md). A
+[resource services design](archive/designs/gpu_resource_services_design.md). A
 texture registered with the table gets a stable handle. Shaders resolve the
 handle through a lookup version that each batch freezes when it first binds
 the table, then sample one update-after-bind array of images with one of four
@@ -3481,7 +3481,7 @@ GRS-11 adds the second set of `unsafe` imports: the allocator's VMA shim, in
 the private `Hetoimasia.GPU.Vulkan.Native.Internal.Vma`. Each is one C entry
 of the engine's own shim (`cbits/hetoimasia_vma.cpp`) taking scalars and one
 result record the allocator reuses, the shape #361 qualified
-([the VMA qualification record](gpu_vma_qualification_record.md)). VMA's
+([the VMA qualification record](archive/gpu_vma_qualification_record.md)). VMA's
 device-memory callbacks are C functions counting into the allocator's own
 state, so none of these calls can enter Haskell, and VMA's own Vulkan calls
 reach the capture's C messenger at most. They are made on the owner's thread
@@ -4825,7 +4825,7 @@ that the presentation engine finished with the image. Neither proves the frame
 became visible. Whether frames visibly advance during a Cocoa live resize or
 menu interaction is a native measurement: the graphics-owner interaction probe
 ([The native suite](#the-native-suite)) records it, and
-[the graphics-owner interaction verdict](graphics_owner_interaction_verdict.md)
+[the graphics-owner interaction verdict](archive/graphics_owner_interaction_verdict.md)
 states what was measured and what was not.
 
 ### How it is built
@@ -4840,7 +4840,7 @@ states what was measured and what was not.
 ## Surface-free sessions and owner-thread actions
 
 GRS-15 ([#336](https://github.com/coghex/hetoimasia/issues/336)) delivers
-[D-28](designs/gpu_resource_services_design.md#d-28-the-device-can-start-without-a-window-inside-the-existing-owner):
+[D-28](archive/designs/gpu_resource_services_design.md#d-28-the-device-can-start-without-a-window-inside-the-existing-owner):
 offscreen and upload work runs without a window inside the existing
 GLFW-hosted graphics owner, not a second, headless one. On Linux the host
 still runs under a display — the native suite's isolated X11 display — because
@@ -5980,7 +5980,7 @@ and [`docs/vulkan/linux-vk11.md`](vulkan/linux-vk11.md). VK-12's are retained as
 [`docs/vulkan/linux-vk15.md`](vulkan/linux-vk15.md). VK-17's are retained as
 [`docs/vulkan/macos-vk17.md`](vulkan/macos-vk17.md) and
 [`docs/vulkan/linux-vk17.md`](vulkan/linux-vk17.md), and the milestone they
-complete is [the Vulkan milestone verdict](vulkan_milestone_verdict.md).
+complete is [the Vulkan milestone verdict](archive/vulkan_milestone_verdict.md).
 VK-19's are retained as
 [`docs/vulkan/macos-vk19.md`](vulkan/macos-vk19.md) and
 [`docs/vulkan/linux-vk19.md`](vulkan/linux-vk19.md). #250's are retained as
@@ -6291,7 +6291,7 @@ thread and every surface was created on the main thread; and if the verdict
 after the last teardown callback has no issue and no error was reported. Both
 children run inside the group's one thirty-second watchdog, with the rest of
 the suite. The milestone they complete is recorded in
-[the Vulkan milestone verdict](vulkan_milestone_verdict.md).
+[the Vulkan milestone verdict](archive/vulkan_milestone_verdict.md).
 
 VK-19's case, `vk19-capture`, runs the production composition with
 verification capture on — `withVulkanOwnerHostAs CaptureOn`, the private
@@ -6912,7 +6912,7 @@ platform, compiler, device, loader, driver and layer identities. It asserts
 that every phase measured something, lost nothing and faulted nothing, and
 that validation reported nothing — never whether a stall happened, and never
 that frames visibly advanced, which a present return and a present fence do not
-prove. [The graphics-owner interaction verdict](graphics_owner_interaction_verdict.md)
+prove. [The graphics-owner interaction verdict](archive/graphics_owner_interaction_verdict.md)
 records its measurement.
 
 ```bash

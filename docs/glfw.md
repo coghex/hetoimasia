@@ -32,7 +32,7 @@ to upstream GLFW 3.4, the one process-main-thread session over it, the
 lexically scoped windows created in that session, and the window host and owner
 loop that compose them with the runtime's application lifecycle. The accepted
 direction and the later slices live in
-[the GLFW integration design](glfw_integration_design.md) (P-1 to P-9, P-10's
+[the GLFW integration design](archive/glfw_integration_design.md) (P-1 to P-9, P-10's
 monitor identity rules, P-11, P-13, D-4 to D-9, D-11 to D-13, D-17, D-19); this document
 describes what the code does today.
 
@@ -733,7 +733,7 @@ A session enters native Wayland only when its configuration requests
 the platform's own default stays X11, and no request is served by the other
 backend. What that session supports is what WL-3 (#207) demonstrated under the
 pinned headless Weston `tools/display/wayland.sh` starts, recorded with its CI
-run in [the Wayland qualification record](wayland_qualification_record.md):
+run in [the Wayland qualification record](archive/wayland_qualification_record.md):
 
 - entry selecting Wayland on the socket it was pointed at, and an unrequested
   session still selecting X11;
@@ -771,7 +771,7 @@ The remaining gaps are stated rather than estimated:
   with verified present-fence completion, and retired under the protected
   boundary, and a compositor lost during rendering ending the session with no
   completion recorded for work it interrupted. Its run is retained in
-  [the qualification record](wayland_qualification_record.md#rendering).
+  [the qualification record](archive/wayland_qualification_record.md#rendering).
   Hiding a window whose target is presenting is qualified there too, since
   [#357](https://github.com/coghex/hetoimasia/issues/357): Weston 13 offers
   no `wp_fifo_v1`, so Mesa's FIFO waits for a frame callback the compositor
@@ -975,7 +975,7 @@ boundary after quiescence, and `reportHostWakeDegradation` — marks a synchrono
 sink failure with the runtime's `DiagnosticFailure`, keeping the exception's
 type, value, and context and adding nothing else. So a failure that leaves the
 host as the run's own is one the terminal reporting in
-[the runtime design](runtime_foundation_design.md) does not write through the
+[the runtime design](archive/runtime_foundation_design.md) does not write through the
 sink that just failed, and the logging lifetime does not flush through either. A
 cancellation is left exactly as it arrived, unmarked.
 
@@ -3049,7 +3049,7 @@ Its exit handler is installed under masking before the scope is entered at all,
 so it covers the handoff out of construction and into the consumer — itself a
 point the scope restores at — as well as everything the consumer then does.
 It is the LIFE-3 slice of
-[the window and graphics lifetime design](window_graphics_lifetime_design.md)
+[the window and graphics lifetime design](archive/window_graphics_lifetime_design.md)
 (P-3, D-1 to D-4).
 
 On **every** exit — a normal return, an action failure, a startup failure, a
@@ -3311,7 +3311,7 @@ whole way in, and it exists only for a host built by the protected lifetime; a
 host built with `allocWindowHost` answers `GraphicsHostUnprotected` before any
 effect, because it was issued no identity an attachment could name. It is the
 LIFE-4 slice of
-[the window and graphics lifetime design](window_graphics_lifetime_design.md)
+[the window and graphics lifetime design](archive/window_graphics_lifetime_design.md)
 (P-1, P-2, D-1 to D-4).
 
 Nothing here creates a surface, submits GPU work, or waits on a device.
@@ -3337,7 +3337,7 @@ disposal — and may not wait on a GPU, wait on a worker, or pump native events;
 exception is `protocolBeforeHide`, which may wait for the graphics owner's step
 in flight to end, and no longer ([Hiding an attached window](#hiding-an-attached-window)). That work does
 not move the graphics owner's responsibilities into a callback: under the
-[lifetime design's D-6](window_graphics_lifetime_design.md#d-6-the-graphics-owner-survives-worker-drain-and-retires-on-its-own-thread),
+[lifetime design's D-6](archive/window_graphics_lifetime_design.md#d-6-the-graphics-owner-survives-worker-drain-and-retires-on-its-own-thread),
 GPU effects and graphics-owned disposal execute on the graphics owner, and a
 callback that creates a main-thread resource such as a surface hands it to that
 owner under the retained attachment, then requests or observes the owner's
@@ -3817,7 +3817,7 @@ The owner exists because of what RR-4 measured: a Cocoa live resize blocked the
 owner turn's native event call for 68.92 s and a menu interaction for 13.30 s,
 with no owner turn in either. Rendering from the owner turn therefore means a
 stale or stretched surface for the whole interaction. The owner is the
-[Vulkan design](vulkan_backend_design.md)'s D-29 answer, and this section is
+[Vulkan design](archive/vulkan_backend_design.md)'s D-29 answer, and this section is
 its delivered contract. The Vulkan integration's `runVulkanOwnerLoop` composes
 it with the scheduled owner turn — observations, captured render demand and
 the owner's deadline crossing every turn — which is VK-16's, in
@@ -4206,7 +4206,7 @@ loop becomes visible is the platform's, and no headless example and no
 present call's return can show it; the Vulkan integration's
 [graphics-owner interaction probe](gpu_backend.md#the-native-suite) measures
 what happens on Cocoa, and
-[its verdict](graphics_owner_interaction_verdict.md) says what was and was not
+[its verdict](archive/graphics_owner_interaction_verdict.md) says what was and was not
 established.
 
 #### The extent seam
@@ -4816,7 +4816,7 @@ depends on a window for longer than a borrow. The private
 that dependency: which window an integration has attached to, where the
 attachment is in its lifetime, what evidence retires it, and whether it still
 vetoes the window's destruction. It is the LIFE-1 slice of
-[the window and graphics lifetime design](window_graphics_lifetime_design.md)
+[the window and graphics lifetime design](archive/window_graphics_lifetime_design.md)
 (P-1, P-5, D-1, D-2, D-4).
 
 **The model itself is not public.** No module under `packages/glfw/src/` or
@@ -4986,7 +4986,7 @@ The GLFW package's Vulkan-specific code is one separate component,
 `hetoimasia-glfw:vulkan-interop`, and a Vulkan-free half that the rest of the
 package owns: the session's loader capability in the `model` sublibrary and the
 surface bridge in `runtime-glfw-core`. It is VK-5 of
-[the Vulkan backend design](vulkan_backend_design.md) (P-1's package boundary,
+[the Vulkan backend design](archive/vulkan_backend_design.md) (P-1's package boundary,
 P-7, D-5, D-7, D-14, D-29, D-33) and depends on no GPU package and no renderer.
 
 ### The component and its build
@@ -5877,9 +5877,9 @@ interaction runs a platform modal loop inside `glfwPollEvents` or
 commands, and offers the update hook only after that call returns, so a blocked
 call stalls that owner-driven work. Work the application runs on another thread
 is outside this measurement. `Test.GLFW.Native.Interaction` measures owner-loop
-progress; [the verdict](owner_loop_interaction_verdict.md)
+progress; [the verdict](archive/owner_loop_interaction_verdict.md)
 records what the approved macOS sessions observed, and
-[the records](owner_loop_interaction_evidence.md) retain every timestamped
+[the records](archive/owner_loop_interaction_evidence.md) retain every timestamped
 record those sessions produced.
 
 The probe runs the production owner loop over one ordinary shown window in the

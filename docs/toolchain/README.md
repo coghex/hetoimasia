@@ -147,13 +147,13 @@ That command reports exactly these files, and every one is retained on purpose:
 | --- | --- |
 | `docs/toolchain.md` | The qualification record. It names the versions it replaced, and the ones Synarchy still uses, because that is what the record is for. |
 | `docs/toolchain/README.md` | This file, including the audit command and this table. |
-| `docs/resource_ownership_design.md` | States the verification baseline the recorded probes ran on. |
-| `docs/runtime_foundation_design.md`, `docs/messaging_design.md` | Behaviour claims probed on GHC 9.12.2, cited with the compiler they were observed on. |
-| `docs/glfw_integration_design.md`, `docs/lua_runtime_design.md` | Links into the GHC 9.12.2 and Cabal 3.16 documentation the design reasoned from. |
+| `docs/archive/resource_ownership_design.md` | States the verification baseline the recorded probes ran on. |
+| `docs/archive/runtime_foundation_design.md`, `docs/archive/messaging_design.md` | Behaviour claims probed on GHC 9.12.2, cited with the compiler they were observed on. |
+| `docs/archive/glfw_integration_design.md`, `docs/lua_runtime_design.md` | Links into the GHC 9.12.2 and Cabal 3.16 documentation the design reasoned from. |
 | `docs/project_review_114-101.md`, `docs/project_review_122-119.md`, `docs/project_review_38-31.md`, `docs/project_review_46-43.md` | Dated audit evidence naming the toolchain each review actually ran on. |
 | `docs/ci_validation_design.md` | The CI-2 row records the boundary settled at design time; it is a historical decision record, not current policy. `../toolchain.md` is the authority for the current baseline. |
-| `docs/vulkan_backend_design.md` | Records #146's former GHC 9.12.2 requirement, Synarchy's build plan (which genuinely still uses 9.12.2), and another project's 9.12.2 / `vulkan-3.26.6` precedent. |
-| `docs/history/memory_before_2026-09-17.md` | History, by definition. |
+| `docs/archive/vulkan_backend_design.md` | Records #146's former GHC 9.12.2 requirement, Synarchy's build plan (which genuinely still uses 9.12.2), and another project's 9.12.2 / `vulkan-3.26.6` precedent. |
+| `docs/archive/history/memory_before_2026-09-17.md` | History, by definition. |
 
 No tracked file outside `docs/` matches, which is the part that matters: every
 pin, bound, fixture, and current instruction moved.

@@ -30,7 +30,7 @@ The resources this backend's renderers draw with — device memory, managed
 buffers and images, uploads, and the texture table — are designed in the
 [GPU resource services design](designs/gpu_resource_services_design.md), epic
 #330. Its D-1 (bindless, atlased textures) overrides VKR-6's "do not assume
-bindless" in the [Vulkan capability findings](vulkan_backend_findings.md).
+bindless" in the [Vulkan capability findings](../vulkan_backend_findings.md).
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
@@ -85,11 +85,11 @@ exists in the GLFW package's runtime integration, in
 `Hetoimasia.Runtime.GLFW.Internal.Owner` and its `.Handoff` module, exported
 through `Hetoimasia.Runtime.GLFW` (since #318, `Internal.Owner` composes the
 owner from private modules beneath it, listed in
-[glfw.md](glfw.md#package-layout)): the narrow injected `GraphicsOperations`
+[glfw.md](../glfw.md#package-layout)): the narrow injected `GraphicsOperations`
 record, the bounded lifetime port and latest-value snapshots in both
 directions, the owner's own timer and deadlines, the D-33 exit composed by
 `withGraphicsOwnerHost`, the supervision sentinel `superviseGraphicsOwner`, and
-D-30's extent seam. [glfw.md](glfw.md#the-supervised-graphics-owner) is its
+D-30's extent seam. [glfw.md](../glfw.md#the-supervised-graphics-owner) is its
 contract. The backend operations are fakes in `test.glfw`; no Vulkan handle,
 surface, device or GPU dependency is involved, and the GLFW package depends on
 no GPU package.
@@ -127,16 +127,16 @@ processing state.
 ## Historical handoff at `38388f8` — 2026-09-19
 
 VK-1/#157, VK-2/#158 and VK-3/#160 merged through PRs #171, #174 and
-#175. The [qualified toolchain](toolchain.md) and
-[compatibility record](vulkan_compatibility_record.md) supply the previously
+#175. The [qualified toolchain](../toolchain.md) and
+[compatibility record](../vulkan_compatibility_record.md) supply the previously
 open preliminary evidence. TIME and LIFE's children, package-owned test
 migration, and host repairs #166–#169 are also merged. Consume their current
 contracts; do not redraft those prerequisites.
 
-The [batch review ledger](project_review/ledger.md) records the review of
-PRs #170–#180. The [Vulkan model review](project_review/175.md) identified
+The [batch review ledger](../project_review/ledger.md) records the review of
+PRs #170–#180. The [Vulkan model review](../project_review/175.md) identified
 image-reacquisition and budget-opacity repairs, and the
-[proof review](project_review/174.md) identified unsafe unsuccessful-exit
+[proof review](../project_review/174.md) identified unsafe unsuccessful-exit
 cleanup and partial-construction rollback gaps.
 
 Image reacquisition was repaired **after this snapshot**, by #183: the pure
@@ -158,7 +158,7 @@ VK-4 onward remain unprocessed. The original #158 merge gate is satisfied;
 processing a later issue must account for its actual dependencies and these
 review findings, rather than preserving an obsolete merge wait or treating
 merged code as defect-free. Lua's independent platform verdicts are
-inconclusive, so [its design](lua_runtime_design.md) returns to exploring under
+inconclusive, so [its design](../lua_runtime_design.md) returns to exploring under
 D-11 without making Lua a prerequisite of Vulkan.
 
 ## Historical handoff at `e0c752e` — 2026-09-17
@@ -170,8 +170,8 @@ The CPU runtime, messaging, and independent GLFW implementation are now present.
 Logging, resources, runtime, and messaging arcs are complete. GLFW issues
 #87–#100 merged through PRs #101–#114, including the main-thread host, dynamic
 windows, native input, and shared native fixture. The
-[completion review](project_review_114-101.md) produced repairs #115–#118,
-now merged through #119–#122. The [repair review](project_review_122-119.md)
+[completion review](../project_review_114-101.md) produced repairs #115–#118,
+now merged through #119–#122. The [repair review](../project_review_122-119.md)
 found follow-up #123 (the recovery association after a move between live
 monitors), now merged in PR #126. Native desktop-test consent #124 merged in
 PR #128. Epic #86 is closed; none of these repairs remains an implementation
@@ -204,7 +204,7 @@ multiple-window ownership and capability boundaries; do not reimplement the
 runtime, messaging, window binding, or fixture from historical inventory text.
 Linux remote CI and local Cocoa verification remain fixed owner decisions.
 
-The owner plans to process the canonical [Lua design](lua_runtime_design.md)
+The owner plans to process the canonical [Lua design](../lua_runtime_design.md)
 in parallel with this design work. Its binding and confinement proof gates
 remain intact. Neither backend imports the other: application-owned services
 connect scripting to eventual rendering consumers. Coordinate shared clock,
@@ -255,14 +255,14 @@ historical assessment, not a list of current open defects.
 ## Completed foundations and prior evidence
 
 The historical pre-GLFW inventory is superseded by implemented contracts:
-[CPU resources](resources.md), [runtime/supervision](supervision.md),
-[messaging](messaging.md), and [GLFW](glfw.md). The continuation facade,
+[CPU resources](../resources.md), [runtime/supervision](../supervision.md),
+[messaging](../messaging.md), and [GLFW](../glfw.md). The continuation facade,
 application composition, component state, worker ownership and failure evidence
 are delivered; do not rebuild Synarchy's combined Reader/State EngineEnv.
 
 This arc refines the Vulkan prerequisites of the original FND-2/FND-3 plan.
-The [foundation overview](engine_foundation_design.md) now records ownership;
-the remaining 3D/2D consumers live in the [renderer report](renderer_foundation_findings.md).
+The [foundation overview](../engine_foundation_design.md) now records ownership;
+the remaining 3D/2D consumers live in the [renderer report](../renderer_foundation_findings.md).
 D-1 supersedes the archived plan's early offscreen-first sequence. TEST-2/#93 and
 its repair #118 delivered the GLFW-only shared fixture; actual GPU completion
 and GPU fixtures belong here. Prior reviews and Git history retain the original
@@ -464,7 +464,7 @@ identities and the dependency index once proved. If a candidate fails, record
 the blocker and choose a working version or a reviewed repair explicitly.
 Recheck release availability when implementing an upgrade. GHC 9.14.2-rc2 was
 eligible under this policy and was then excluded by the compatibility blocker
-[the toolchain record](toolchain.md) documents; the qualified baseline is GHC
+[the toolchain record](../toolchain.md) documents; the qualified baseline is GHC
 9.14.1. This resolves Q-10's policy, without making any later candidate's
 compatibility proof a foregone conclusion.
 
@@ -791,12 +791,12 @@ measurements recorded with toolchain, layer and driver identity; no speedup is
 asserted unmeasured and no timing threshold enters required CI. This decision
 does not change Lua's FFI settings, rewrite the foundation logger, tune the RTS
 broadly, add a render thread or expand platform support. It originates from
-[runtime_review_findings.md](runtime_review_findings.md) RR-5.
+[runtime_review_findings.md](../runtime_review_findings.md) RR-5.
 
 ### D-29. Render from one supervised graphics owner; keep GLFW on the main thread
 
 Owner accepted on 2026-09-20, from guide finding GUIDE-1 in
-[the guide report](guide/2026-09-20T201612Z-8b2fcfd-ff7e.md) and RR-4's
+[the guide report](../guide/2026-09-20T201612Z-8b2fcfd-ff7e.md) and RR-4's
 [verdict](owner_loop_interaction_verdict.md) (#200). The exact decision:
 
 > Keep GLFW operations and record-only callbacks on the process main thread.
@@ -1082,7 +1082,7 @@ viewport/scissor, triangle draws, barriers required by those operations and
 bounded verification readback. Managed buffers and images are ordered by
 GRS-3's contract instead: resting states, mechanical boundary barriers, and
 checked explicit transitions
-([gpu_backend.md](gpu_backend.md#ordering-managed-resources)). Unsupported commands fail at the interface rather
+([gpu_backend.md](../gpu_backend.md#ordering-managed-resources)). Unsupported commands fail at the interface rather
 than becoming an unchecked callback escape hatch.
 
 Recording operations retain dependencies through managed handles, including
@@ -1271,7 +1271,7 @@ model its irreversible retirement even when replacement creation fails.
 ### P-3. Establish a small message-passing foundation before its GLFW consumer
 
 Completed by messaging epic #73; Q-4 is resolved. Use bounded channels,
-prepared payloads, snapshots and supervised inboxes from [messaging.md](messaging.md).
+prepared payloads, snapshots and supervised inboxes from [messaging.md](../messaging.md).
 The historical transport proposal is superseded by that implemented contract;
 no additional queue abstraction or event-bus delivery belongs in this arc.
 
@@ -1562,7 +1562,7 @@ reentry, and dispatch identity on both platforms.
 #### Compatibility profile — proved on 2026-09-18
 
 VK-2 (#158) ran the proof this table was waiting for, on both selected
-platforms, and [docs/vulkan_compatibility_record.md](vulkan_compatibility_record.md)
+platforms, and [docs/vulkan_compatibility_record.md](../vulkan_compatibility_record.md)
 is its record. The rows below now state what was proved rather than what was
 proposed; where a row is still a direction rather than an observation, it says
 so. Q-9/Q-10 remain resolved policy decisions. Keep build-tool versions distinct
@@ -1571,7 +1571,7 @@ does not itself raise that minimum.
 
 | Choice | Proved profile, or the accepted direction where none was proved | Next reasonable alternative |
 |---|---|---|
-| Haskell binding/toolchain | **Proven and pinned by VK-1 (#157) on 2026-09-18**: GHC 9.14.1, cabal-install 3.18.1.0, `index-state: 2026-09-18T00:00:00Z`, `vulkan-3.27` with `vulkan-utils-0.5.11.0` at `+safe-foreign-calls -darwin-lib-dirs`. GHC 9.14.2-rc2 was the newer D-13 candidate and was excluded by a documented compatibility blocker. See [docs/toolchain.md](toolchain.md). | The candidate row this replaced recorded GHC 9.14.2-rc2 as the recommended candidate on 2026-09-17, subject to proof before pinning; that proof is what excluded it. |
+| Haskell binding/toolchain | **Proven and pinned by VK-1 (#157) on 2026-09-18**: GHC 9.14.1, cabal-install 3.18.1.0, `index-state: 2026-09-18T00:00:00Z`, `vulkan-3.27` with `vulkan-utils-0.5.11.0` at `+safe-foreign-calls -darwin-lib-dirs`. GHC 9.14.2-rc2 was the newer D-13 candidate and was excluded by a documented compatibility blocker. See [docs/toolchain.md](../toolchain.md). | The candidate row this replaced recorded GHC 9.14.2-rc2 as the recommended candidate on 2026-09-17, subject to proof before pinning; that proof is what excluded it. |
 | Runtime baseline | **Proved by VK-2 (#158) on 2026-09-18**: Vulkan 1.3 with `dynamicRendering` and `synchronization2` supported, requested, and accepted on both platforms — MoltenVK 1.4.0 reports device API 1.3.323 on an Apple M3 Max, and pinned Mesa 25.2.8 Lavapipe reports 1.4.318 in the Linux proof container. D-12's 1.3 minimum stands as a requirement downstream slices may assume. | A 1.4-only minimum was considered and not selected. A later 1.2 profile needs its own supported features and tests, not another copied backend. |
 | Bindless descriptor indexing | **Required by GRS-7 (#343) on 2026-10-03**: the device profile requires six Vulkan 1.2 descriptor-indexing features for the texture table — `runtimeDescriptorArray`, `descriptorBindingPartiallyBound`, `descriptorBindingSampledImageUpdateAfterBind`, `shaderSampledImageArrayNonUniformIndexing`, `descriptorBindingVariableDescriptorCount` and `descriptorBindingUpdateUnusedWhilePending` — enables them at device creation, and refuses a device missing any, by name. MoltenVK 1.4.2 on an Apple M3 Max offers all six (device API 1.3.357, 1,000,000 update-after-bind sampled images per stage and per set) and passes the `grs7-texture-table` native case with validation and synchronization validation reporting nothing; pinned Mesa 25.2.8 Lavapipe offers all six and passes the same case in the Linux CI's `test.vulkan-native` and `test.vulkan-wayland` (run 37155388851). | A device without update-unused-while-pending would need slot writes deferred to a quiescent point, which D-27's lookup versions were designed to avoid; none is known on the selected platforms. |
 | Presentation retirement | **Proved by VK-2 (#158)**: `VK_EXT_swapchain_maintenance1` with `VK_KHR_swapchain`, `VK_EXT_surface_maintenance1`, and `VK_KHR_get_surface_capabilities2`, and its `swapchainMaintenance1` feature enabled. Present fences signal, and both abandonment paths return an image through `vkReleaseSwapchainImagesEXT` with no swapchain rebuild. The KHR spelling remains an **unproved alias** on both platforms: neither MoltenVK 1.4.0 nor Mesa 25.2.8 Lavapipe resolves `vkReleaseSwapchainImagesKHR`, and `vulkan-3.27` hides the difference by exposing the KHR types as aliases and trying the EXT name first. | Requiring KHR alone could force a newer Mesa build without strengthening this arc's contract. Proving the KHR alias needs a driver that offers it and is its own piece of evidence. |
@@ -1604,7 +1604,7 @@ conflicting discovery overrides cleared in the child environment, with the
 actually loaded identities recorded. Nothing was installed, no shell profile was
 edited, and Synarchy's installation is untouched. See
 [the loader's explicit driver selection](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md#overriding-the-default-driver-discovery)
-and [the compatibility record](vulkan_compatibility_record.md).
+and [the compatibility record](../vulkan_compatibility_record.md).
 
 VK-16 moved the pinned driver to Homebrew's MoltenVK **1.4.2**
 (`/opt/homebrew/Cellar/molten-vk/1.4.2`, installed beside 1.4.0), through
@@ -1665,7 +1665,7 @@ validation and image/lifecycle assertions. D-21 settles required-when-affected
 native checks, their execution budget and the local macOS/remote Linux split;
 the verification strategy specifies evidence and applicability. Lengthy stress,
 performance and extra-hardware probes remain optional. Local disruptive macOS
-evidence needs the human's explicit approval each session. *Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md).*
+evidence needs the human's explicit approval each session. *Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../../AGENTS.md).*
 Use the package-owned suite layout already delivered by #129/#130. Backend
 contracts belong beside the backend; root tests own application composition,
 and tool tests own provisioning/selection. Do not move them into one root suite.
@@ -1698,7 +1698,7 @@ As delivered by VK-15 (#231), initialization and frame operations inspect it at
 the owner's checkpoints; teardown inspects it through the verdict that follows
 the last callback rather than through a checkpoint, because protected
 retirement must not re-enter a checkpoint that would only rethrow the latched
-failure ([gpu_backend.md](gpu_backend.md#terminal-failure)).
+failure ([gpu_backend.md](../gpu_backend.md#terminal-failure)).
 [The Vulkan callback contract](https://docs.vulkan.org/refpages/latest/refpages/source/PFN_vkDebugUtilsMessengerCallbackEXT.html)
 forbids Vulkan calls from the callback.
 
@@ -2035,7 +2035,7 @@ destruction; it cannot mark unfinished work as a successfully signaled fence.
 Unresolved safety retains ownership under P-12 rather than releasing parents.
 
 **Answered on 2026-09-18 by #158**, which passed on both platforms:
-[docs/vulkan_compatibility_record.md](vulkan_compatibility_record.md) records
+[docs/vulkan_compatibility_record.md](../vulkan_compatibility_record.md) records
 the profile, the loader identity evidence, the completion and abandonment
 results, the cited operation matrix, and the unknowns it deliberately leaves —
 the KHR maintenance alias, every rare result, and any real device loss. The
@@ -2066,7 +2066,7 @@ for a scope/test split; it does not silently make required coverage optional.
 
 Resolved and implemented by messaging epic #73, issues #74–#79 and PRs #80–#85.
 Use the existing bounded channels, snapshots, and inbox contracts in
-[messaging.md](messaging.md). No further queue prerequisite or generic event bus
+[messaging.md](../messaging.md). No further queue prerequisite or generic event bus
 is authorized by this historical proposal.
 
 ### Q-5. What is the runtime composition and initialization contract?
@@ -2233,7 +2233,7 @@ native group to the existing display runner class; do not run it on a CPU-only
 worker or add a duplicate runner-class mechanism. Vulkan tests remain owned by
 the backend package rather than extending the root console suite.
 Keep evidence tied to the tested inputs and platform under the existing
-[validation contract](validation.md); local macOS evidence cannot substitute
+[validation contract](../validation.md); local macOS evidence cannot substitute
 for Linux evidence, nor can Linux success establish macOS verification. Reuse
 current selection and freshness rules.
 
@@ -2256,12 +2256,12 @@ assuming Linux's green check enforces a local requirement:
   evidence. Use existing receipts where applicable; local evidence must never
   claim the Linux image identity or satisfy a Linux receipt requirement.
 - Explicit platform applicability and a visible non-empty example selection.
-  The [validation contract](validation.md) already delivers the selector: a
+  The [validation contract](../validation.md) already delivers the selector: a
   catalog group may declare optional `platforms`, which narrows and never
   widens applicability; a plan whose `runner_os` it does not name omits the
-  group as [`platform-inapplicable`](validation.md#reasons-and-inputs_changed);
+  group as [`platform-inapplicable`](../validation.md#reasons-and-inputs_changed);
   the runner refuses to execute that unselected group or create its receipt;
-  and the [aggregate](validation.md#the-aggregate-and-build-test) rejects a
+  and the [aggregate](../validation.md#the-aggregate-and-build-test) rejects a
   receipt collected for it, or an offered reuse of an earlier execution of it,
   the one omission reason that refuses evidence. Declare `platforms` only for
   a genuinely platform-specific group; inside shared groups keep
@@ -2280,7 +2280,7 @@ assuming Linux's green check enforces a local requirement:
 - Preserve the human's explicit per-session approval before any local test
   disrupts their desktop, even when the test is required and the solver owns
   running it. No consent means local verification remains pending, not passed.
-  *Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md).*
+  *Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../../AGENTS.md).*
   Isolated Linux X11 needs no desktop approval. Do not infer consent from an
   issue approval or turn the native-session opt-in into a persistent setting.
 
@@ -2343,7 +2343,7 @@ fixture must show both identities, not assume the main thread for either.
 **Progress claims need native evidence.** Any statement that rendering, frame
 presentation or retirement progresses while the main thread is inside a
 platform modal loop is measured, never inferred: extend RR-4's selectable
-interaction probe ([docs/glfw.md](glfw.md#the-interaction-probe)) with the
+interaction probe ([docs/glfw.md](../glfw.md#the-interaction-probe)) with the
 graphics owner, record owner turns, callbacks, frame identities, present requests
 and independently observed completion in one monotonic time domain, and retain
 the records under the same identity, loss
@@ -2499,7 +2499,7 @@ native evidence obligations even when its implementation can run in parallel.
 - **Depends on:** `VK-1`.
 - **Ordering:** critical path; hard gate for native delivery.
 - **Relevant decisions:** D-2, D-9–D-14, D-17, D-23–D-25.
-- **Acceptance signals:** Real present-fence retirement and successful unused-image cleanup on both profiles; callback/dispatch identity verified; exceptional paths distinguished as specification or injected evidence. Explicit human approval precedes disruptive local execution. *Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md).*
+- **Acceptance signals:** Real present-fence retirement and successful unused-image cleanup on both profiles; callback/dispatch identity verified; exceptional paths distinguished as specification or injected evidence. Explicit human approval precedes disruptive local execution. *Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../../AGENTS.md).*
 - **Out of scope:** Production managed backend or a claim that a prototype satisfies final CI/lifecycle coverage.
 - **Open questions:** Q-2 deliberately open. Stop dependent native slices and consult the owner if proof fails or needs a policy change; do not waive the gate.
 
@@ -2565,7 +2565,7 @@ native evidence obligations even when its implementation can run in parallel.
 > the Vulkan operations without adding GPU dependencies to the GLFW package.
 
 - **Outcome:** The production supervised graphics owner's ownership and communication machinery, with backend operations injected and proven through fakes, whose handoffs with the main-thread host are explicit, bounded, cancellable and self-scheduled, and whose lifetime runs through protected retirement under D-33; the documents' main-thread assumptions reconciled to D-29.
-- **Scope:** The owner as a foundation worker under the existing supervision and failure contracts, outliving ordinary worker drain (D-33); a narrow injected operation set covering worker ownership, handoffs, cancellation and retirement and nothing resembling a rendering API (D-32); main-thread-to-owner handoff of `WindowObservation` and render-eligibility snapshots, render demand, scene snapshots from any application thread (D-31) and attachment lifetime through bounded ports and latest-value snapshots; owner-to-main-thread publication of progress, earliest absolute next deadline and retirement facts through the TIME wake, with the owner's own waits driven by its own deadlines and demand; cancellation at every wait in dependency order; the D-33 retirement sequence including the main-thread housekeeping-and-await boundary and the final join before window release; the extent policy seam D-30 needs; the documented behaviour during a main-thread stall; and the reconciliation of P-1, P-5, P-6, P-7, VK-8, VK-16, [glfw.md](glfw.md), [the lifetime design](window_graphics_lifetime_design.md) (its D-6 and P-3) and the fixture thread demonstrations.
+- **Scope:** The owner as a foundation worker under the existing supervision and failure contracts, outliving ordinary worker drain (D-33); a narrow injected operation set covering worker ownership, handoffs, cancellation and retirement and nothing resembling a rendering API (D-32); main-thread-to-owner handoff of `WindowObservation` and render-eligibility snapshots, render demand, scene snapshots from any application thread (D-31) and attachment lifetime through bounded ports and latest-value snapshots; owner-to-main-thread publication of progress, earliest absolute next deadline and retirement facts through the TIME wake, with the owner's own waits driven by its own deadlines and demand; cancellation at every wait in dependency order; the D-33 retirement sequence including the main-thread housekeeping-and-await boundary and the final join before window release; the extent policy seam D-30 needs; the documented behaviour during a main-thread stall; and the reconciliation of P-1, P-5, P-6, P-7, VK-8, VK-16, [glfw.md](../glfw.md), [the lifetime design](window_graphics_lifetime_design.md) (its D-6 and P-3) and the fixture thread demonstrations.
 - **Phase:** Native foundations.
 - **Depends on:** `VK-3`. External prerequisite: TIME #139 and LIFE #144 merged.
 - **Ordering:** critical path; precedes VK-7 and can land beside VK-5/VK-6.

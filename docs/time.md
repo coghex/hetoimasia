@@ -3,7 +3,7 @@
 Current behavior of `Hetoimasia.Foundation.Time`: monotonic instants,
 non-negative durations, validated construction, deadline arithmetic, and
 elapsed-time sampling. The accepted policy lives in
-[the runtime scheduling design](runtime_scheduling_design.md) (P-1, D-1, and
+[the runtime scheduling design](archive/runtime_scheduling_design.md) (P-1, D-1, and
 D-3); this document describes what the code does today.
 
 Scope: the values, the arithmetic over them, the injected clock, and how a

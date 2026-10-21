@@ -3,7 +3,7 @@
 Current behavior of `Hetoimasia.Foundation.Worker`: a worker group that owns CPU
 worker threads from a successful fork until terminal completion, and keeps the
 dependencies those workers borrow alive on every exit. The accepted policy
-lives in [the runtime foundation design](runtime_foundation_design.md) (D-11 as
+lives in [the runtime foundation design](archive/runtime_foundation_design.md) (D-11 as
 revised by D-13, D-17, P-8, and P-12 "Worker lifetime and state ownership");
 this document describes what the code does today.
 

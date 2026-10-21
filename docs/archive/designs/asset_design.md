@@ -4,7 +4,7 @@ Give Hetoimasia small, separately built packages that turn asset files into
 data the engine's services accept, starting with images: PNG and KTX2 files
 become upload-ready RGBA8 or BC7 levels for the
 [bindless texture table](gpu_resource_services_design.md#d-1-bindless-atlased-textures).
-Its first consumer is the [2D renderer](render_2d_design.md)'s
+Its first consumer is the [2D renderer](../../designs/render_2d_design.md)'s
 static-image milestone (render-2d D-14). Each kind of codec lives in its own
 package, so audio, video and later formats never drag image code along and
 CI stays light.
@@ -48,7 +48,7 @@ document.
 - **GRS D-3** ended the GPU services arc at "bytes in, handle out": decoding,
   build tooling, file watching and loader concurrency were left to a later
   content-loading arc. **RTC-4** in the
-  [runtime capability findings](../runtime_capabilities_findings.md) is
+  [runtime capability findings](../../runtime_capabilities_findings.md) is
   deferred until a first content type and consumer are named.
 - **Content-side decisions of 2026-09-29** are preserved in the GPU services
   design's Source notes: sheets as a texture plus an optional region table, a

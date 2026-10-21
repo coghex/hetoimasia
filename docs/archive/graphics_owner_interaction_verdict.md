@@ -264,7 +264,7 @@ new one.
 ## Reproducing this
 
 The probe is VK-16's example in `vulkan-native-tests`
-([gpu_backend.md](gpu_backend.md#the-native-suite)). Run it only with the
+([gpu_backend.md](../gpu_backend.md#the-native-suite)). Run it only with the
 owner's approval for that session, with the owner performing the interactions,
 and size the phases so a person can see each instruction as it begins. A
 blocked phase ends only when the person lets go, so the whole run is longer

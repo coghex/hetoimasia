@@ -27,7 +27,7 @@ The qualification is for the configuration measured: a shim whose Haskell
 side marshals no struct and calls each entry directly. The probe's shim is
 apparatus: one C entry per engine call, taking scalars and writing its
 results into one reused record (`hetoimasia_shim_*` in
-[the probe's C file](../packages/gpu-vulkan/native/probe/allocator-parity/cbits/vma_production.cpp)).
+[the probe's C file](../../packages/gpu-vulkan/native/probe/allocator-parity/cbits/vma_production.cpp)).
 GRS-11's production shim keeps this qualification only if it keeps that
 shape. D-38 leaves making VMA a production native input, and its
 `docs/toolchain.md` record, to GRS-11. That includes obtaining
@@ -63,7 +63,7 @@ Both runs come from commit `e0846a2`, source digest
 Each report states the full configuration of every result: the per-class
 memory requirements and chosen memory types, the trace-to-resource mapping,
 and the timing protocol. The probe's
-[README](../packages/gpu-vulkan/native/probe/allocator-parity/README.md)
+[README](../../packages/gpu-vulkan/native/probe/allocator-parity/README.md)
 states the protocol in full.
 
 The machine was not quiet: other work held the load average near 3 to 3.7 on

@@ -61,5 +61,5 @@ integration, and the GLFW package depends on no GPU package at all.
 [`docs/gpu_backend.md`](../../docs/gpu_backend.md) is the roots' and the
 integration's contract.
 
-[The Vulkan backend design](../../docs/vulkan_backend_design.md) records the
+[The Vulkan backend design](../../docs/archive/vulkan_backend_design.md) records the
 accepted policy behind all three.

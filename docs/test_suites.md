@@ -31,7 +31,7 @@ cabal test hetoimasia-tests --test-show-details=direct
   `test.lua-confinement-linux` is optional and local-only; a green run is
   evidence rather than a verdict: where the machine cannot install the profile
   every experiment reports itself unproven. Its components are not built off
-  Linux. Read [its verdict](lua_linux_confinement_verdict.md) before
+  Linux. Read [its verdict](archive/lua_linux_confinement_verdict.md) before
   building on it — the answer is `inconclusive`.
 - On macOS only,
   `cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct`
@@ -39,7 +39,7 @@ cabal test hetoimasia-tests --test-show-details=direct
   its validation group `test.macos-confinement` is optional, no CI runs it, and
   its components are not built off Darwin. A pull-request request block must
   name neither it nor `all-hspec`. Read
-  [its verdict](macos_confinement_verdict.md) before building on it — the
+  [its verdict](archive/macos_confinement_verdict.md) before building on it — the
   answer is `inconclusive`.
 
 ## Which suite owns what

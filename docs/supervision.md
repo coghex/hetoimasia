@@ -3,7 +3,7 @@
 Current behavior of `Hetoimasia.Runtime.Supervision`: the runtime layer that
 turns the raw worker evidence of [workers.md](workers.md) into decisions on the
 application thread, through explicit checkpoints and supervised STM waits. The
-accepted policy lives in [the runtime foundation design](runtime_foundation_design.md)
+accepted policy lives in [the runtime foundation design](archive/runtime_foundation_design.md)
 (D-2 through D-7, D-13, D-15 through D-18, P-12 "Checkpoints, waits, and
 failure classification" and "Closing and reporting", and P-13); this document
 describes what the code does today.

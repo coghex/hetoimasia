@@ -14,7 +14,7 @@ supported", one absent from the public SDK altogether. Q-5 requires a supported,
 verified profile; accepting those interfaces alone would not close the network
 evidence gap.
 
-**Evidence reconciliation, 2026-09-23:** [review #176](project_review/176.md)
+**Evidence reconciliation, 2026-09-23:** [review #176](../project_review/176.md)
 established that optimization shared the original native buffer and removed
 its unused retention accumulator. Its workload counter did not prove mixed
 Lua/native growth. [#228](https://github.com/coghex/hetoimasia/issues/228), merged
@@ -28,7 +28,7 @@ That is a decision for the owner, not for this slice. Section
 [What the owner has to decide](#what-the-owner-has-to-decide) states it.
 
 Nothing here was weakened to make a test pass, and no proof row was reclassified
-as optional. Under [D-11](lua_runtime_design.md#d-11-gate-process-delivery-on-two-preliminary-platform-proofs)
+as optional. Under [D-11](../lua_runtime_design.md#d-11-gate-process-delivery-on-two-preliminary-platform-proofs)
 an `inconclusive` macOS verdict leaves the design at `exploring` and leaves
 LUA-9 through LUA-13 undraftable, whatever the Linux proof (#147) concludes.
 
@@ -54,7 +54,7 @@ not close the remaining qualification gaps above.
 ### The retained receipt
 
 The local validation run described in
-[docs/validation.md](validation.md#the-macos-confinement-probes-receipt)
+[docs/validation.md](../validation.md#the-macos-confinement-probes-receipt)
 produced this, and it is kept here rather than as a file of its own: a tracked
 `.json` under `docs/` is an undeclared input, and a run that added one would
 report an unknown input and select every non-optional group. Markdown is
@@ -360,7 +360,7 @@ link error. That is a way of failing safely, not a way of being supported.
 
 App Sandbox — a `.app` bundle carrying `com.apple.security.app-sandbox`,
 ad-hoc-signed with `codesign --sign -` — is the arrangement
-[D-10](lua_runtime_design.md#d-10-allow-evaluation-of-signed-bundled-macos-helpers)
+[D-10](../lua_runtime_design.md#d-10-allow-evaluation-of-signed-bundled-macos-helpers)
 permits and the one Apple documents. It was evaluated manually on this host
 during this slice's investigation. It is not what the committed probe runs, for
 the reason in the last row below.
@@ -399,7 +399,7 @@ the manual investigation, recorded here rather than re-created on each run.
 - The probe proves confinement of a helper the parent launched. It does not
   address kernel or hardware vulnerabilities, side channels, or whether a mod
   granted gameplay authority behaves fairly — as
-  [P-13](lua_runtime_design.md#p-13-untrusted-processes-permissions-and-enforced-limits)
+  [P-13](../lua_runtime_design.md#p-13-untrusted-processes-permissions-and-enforced-limits)
   already says.
 - One instance, one profile, one host, one OS build. Nothing here establishes a
   minimum supported macOS version, and nothing here was run on Intel.
@@ -431,7 +431,7 @@ Q-5's macOS row cannot be closed by this slice. The choice is between:
    is a typed refusal at launch, not a silently unconfined mod.
 2. **Accept App Sandbox with a weaker contract** — no exec denial, and either
    one shared container for all instances (which
-   [D-8](lua_runtime_design.md#d-8-isolate-each-mod-and-execution-domain)
+   [D-8](../lua_runtime_design.md#d-8-isolate-each-mod-and-execution-domain)
    forbids) or an undeletable per-instance container in the user's Library. Both
    are material changes to accepted decisions and would need fresh readiness
    signoff.
@@ -446,13 +446,13 @@ memory-workload repair does not select a supported deployment profile.
 
 ## Related
 
-- [`docs/lua_runtime_design.md`](lua_runtime_design.md): LUA-15, Q-5 and its
+- [`docs/lua_runtime_design.md`](../lua_runtime_design.md): LUA-15, Q-5 and its
   2026-09-16 follow-up, P-13, D-6, D-8, D-9, D-10, D-11. The design references
   both inconclusive verdicts and records the current gate on further processing.
-- [`docs/validation.md`](validation.md#the-macos-confinement-probe): the
+- [`docs/validation.md`](../validation.md#the-macos-confinement-probe): the
   optional `test.macos-confinement` group, why Linux never selects it, and the
   local run that produces its `Darwin` receipt.
-- [`packages/scripting-lua/README.md`](../packages/scripting-lua/README.md#the-macos-confinement-probe):
+- [`packages/scripting-lua/README.md`](../../packages/scripting-lua/README.md#the-macos-confinement-probe):
   the probe's own components.
 - Issue #147 (LUA-14) owns the Linux proof. Both verdicts must be successful
   before the process branch is drafted; this one is not.

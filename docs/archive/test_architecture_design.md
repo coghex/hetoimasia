@@ -41,7 +41,7 @@ The ledger records issue processing, not implementation completion. TEST-1/#50
 merged through PR #51. TEST-2's single implementation, GLFW-7/#93, merged through
 PR #107 with its shared native fixture and platform gates. Repair #118 merged
 through PR #122; the subsequent review is recorded in
-[project_review_122-119.md](project_review_122-119.md). On 2026-09-16 the owner
+[project_review_122-119.md](../project_review_122-119.md). On 2026-09-16 the owner
 directly authorized the epic amendment: #49 now marks TEST-1/TEST-2 complete,
 records the merged fixture repair, and includes TEST-3 through TEST-6 with the
 reviewed ownership, dependency and validation contracts. The tracker edit was
@@ -77,7 +77,7 @@ The TEST-6 implementation inspected on 2026-09-17 is now merged through
 PR #151. Rechecked against `master@38388f8` on 2026-09-19: foundation, runtime,
 GLFW, and root ownership below describes the current tree. The Lua and GPU
 model packages added since then also own their headless suites. The
-[review ledger](project_review/ledger.md) records subsequent reviews; each PR
+[review ledger](../project_review/ledger.md) records subsequent reviews; each PR
 retains its own test evidence.
 
 - Foundation owns `foundation-tests`, runtime owns `runtime-tests`, and GLFW
@@ -114,7 +114,7 @@ retains its own test evidence.
   the root `Runtime` group, which TEST-5 then moved into `runtime-tests` as
   described above. P-6's clean CPU-only check needed a
   `cabal.project.cpu` that imports the shared `cabal.project.common`; see
-  [validation.md](validation.md#building-without-the-glfw-sdk).
+  [validation.md](../validation.md#building-without-the-glfw-sdk).
 - Before TEST-6, GLFW's `window-examples/` executable owned the scripted
   window/host examples so they could use private libraries, and one root Hspec
   example launched it as a subprocess, obscuring its individual examples from
@@ -133,7 +133,7 @@ Tracker recheck found open epic #49 with TEST-5 merged in PR #150 and TEST-6
 (#130) as its last open child.
 Native-test consent #124 and monitor recovery #123 are merged; preserve their
 behavior through the remaining test moves. See
-[glfw.md](glfw.md#the-native-suite) for native-fixture instructions.
+[glfw.md](../glfw.md#the-native-suite) for native-fixture instructions.
 
 ## Historical design evidence
 
@@ -177,7 +177,7 @@ The initial tracker check and readiness recheck on 2026-09-11 found the existing
 with no overlapping test-architecture issue or epic. The CI epic owns selection
 and evidence handling; it does not own this component-spec refactor. Recheck
 overlap before issue processing, especially against the
-[foundation plan](engine_foundation_design.md).
+[foundation plan](../engine_foundation_design.md).
 
 ## Decisions accepted by the owner
 
@@ -248,7 +248,7 @@ and [Hspec's execution model](https://hspec.github.io/parallel-spec-execution.ht
 
 ### D-5. Keep selection policy in the existing CI contract
 
-The [CI design](ci_validation_design.md) decides which groups must run; fixture
+The [CI design](../ci_validation_design.md) decides which groups must run; fixture
 ownership decides how selected examples execute. Preserve mandatory checks,
 affected non-optional groups, and PR-requested groups. Optional tests remain
 optional even when their fixture or shared dependency changes.
@@ -323,7 +323,7 @@ Retain the owner's accepted desktop policy: before opening native windows,
 requesting focus, or manipulating fullscreen/display state locally, ask the
 human user for explicit approval and wait for acceptance for that session.
 Issue approval or a previous session's permission is not standing consent.
-*Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md).*
+*Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../../AGENTS.md).*
 Isolated Linux X11 CI remains non-optional when affected. Issue #124 implements
 the native opt-in guard; this migration preserves it and does not duplicate it.
 

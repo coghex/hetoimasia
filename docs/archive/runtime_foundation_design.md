@@ -94,7 +94,7 @@ Hetoimasia already implements:
   the implemented scope and composite-construction contracts.
 - Exception propagation that preserves the primary type, payload, and context;
   cleanup failures retained as separately inspectable evidence; cancellation
-  unwinding under the accepted mask discipline. See [resources.md](resources.md).
+  unwinding under the accepted mask discipline. See [resources.md](../resources.md).
 - `Hetoimasia.Runtime.Resources.resourceSmoke`: a specific composition of
   resource scopes, injected work, and the existing reporting policy. It is an
   example consumer, not a generic runtime error boundary or message transport.
@@ -148,7 +148,7 @@ An ordinary `Either` result remains useful when it is intentionally data.
 
 The owner selected methodical work on logging, messaging, runtime composition,
 threading, and GLFW before Vulkan. The first eventual graphics milestone remains
-a windowed triangle. The [foundation design](engine_foundation_design.md)
+a windowed triangle. The [foundation design](../engine_foundation_design.md)
 provides the broader component boundaries.
 
 ### D-2. Preserve the existing resource failure and reporting contracts
@@ -599,8 +599,8 @@ scoped-initialization design, not an excuse to return a released handle here.
 
 Recovery data does not require logging. A runtime adapter uses the existing
 injected logger to explain recovery/degradation and terminal failure, preserving
-the level meanings in [logging.md](logging.md) and reporting semantics in
-[resources.md](resources.md). Foundation/resource code must not acquire a
+the level meanings in [logging.md](../logging.md) and reporting semantics in
+[resources.md](../resources.md). Foundation/resource code must not acquire a
 logger dependency to support this adapter.
 
 Keep diagnostic effects outside release callbacks and outside any gap between
@@ -1301,7 +1301,7 @@ release; the other made a child's release throw and observed its still-running
 borrower resume after its parent had been released. Coordination used MVars
 and thread status, with a watchdog only for hangs. These verify design hazards,
 not new defects in the existing resource contract. The relevant implementation
-is `withResourceLabelled`/`attemptRelease`; see [resources.md](resources.md).
+is `withResourceLabelled`/`attemptRelease`; see [resources.md](../resources.md).
 
 The broad D-10/D-12 direction remains useful. D-11's original bounded-detach
 mechanics were rejected and then replaced by the owner's D-13 protected-wait

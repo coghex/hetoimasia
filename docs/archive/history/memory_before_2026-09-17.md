@@ -3,7 +3,7 @@
 This preserves the prior memory and pending documentation notes. Dates, counts,
 open-issue statements and implementation claims below are historical snapshots,
 including overlapping notes from master and docs-wip. They are not current
-instructions or a processing queue. Read [MEMORY.md](../../MEMORY.md) for the
+instructions or a processing queue. Read [MEMORY.md](../../../MEMORY.md) for the
 active handoff and the owning contract/design for a subsystem.
 
 The GLFW window examples' former executable is referred to below as the
@@ -13,8 +13,8 @@ directly in `hetoimasia-glfw:glfw-tests`.
 # Hetoimasia project memory
 
 Updated: 2026-09-16. Durable project context for future interactive sessions.
-Working rules live in [AGENTS.md](../../AGENTS.md); design proposals live in
-[the foundation design](../engine_foundation_design.md).
+Working rules live in [AGENTS.md](../../../AGENTS.md); design proposals live in
+[the foundation design](../../engine_foundation_design.md).
 
 ## Current handoff — pre-Vulkan scheduling and lifetime design
 
@@ -23,7 +23,7 @@ Working rules live in [AGENTS.md](../../AGENTS.md); design proposals live in
   supervision, application composition, messaging, dynamic windows, controls,
   modes, monitors, and native input are implemented.
 - GLFW issues #87–#100 merged through PRs #101–#114. The
-  [review report](../project_review_114-101.md) identified four repairs:
+  [review report](../../project_review_114-101.md) identified four repairs:
   #115 creation primary/cleanup evidence; #116 disconnect recovery across
   observations; #117 restoration after partial departure; #118 fixture drain
   under repeated cancellation. All four merged through PRs #119–#122.
@@ -79,7 +79,7 @@ Working rules live in [AGENTS.md](../../AGENTS.md); design proposals live in
   `--match Logging` still selects the runtime `Logging lifetime` subgroup.
   `cabal.project` now imports the shared `cabal.project.common`, which
   `cabal.project.cpu` also imports to build the foundation suite without the
-  GLFW SDK. The per-example mapping is `docs/foundation_tests_mapping.md`.
+  GLFW SDK. The per-example mapping is `docs/archive/foundation_tests_mapping.md`.
 - Next design: Vulkan ownership, window/surface retirement, completion, frame
   scheduling, and platform verification. The design remains exploring; the
   four GLFW repairs gate implementation. Completed runtime/messaging arcs need
@@ -87,7 +87,7 @@ Working rules live in [AGENTS.md](../../AGENTS.md); design proposals live in
 
 ### Pending handoff notes from the documentation branch (historical)
 
-- The [repair review](../project_review_122-119.md) found one remaining defect:
+- The [repair review](../../project_review_122-119.md) found one remaining defect:
   a borderless window's recovery association does not follow later observed
   movement between live monitors. The owner approved and filed #123. Four
   additional CPU-seam Hspec examples reproduce it; #115/#117/#118 had no further
@@ -126,8 +126,8 @@ Working rules live in [AGENTS.md](../../AGENTS.md); design proposals live in
   for issue/PR development. This repository is the target project; Kanban is
   the workflow application. Existing worktree and review habits carry over.
 - Mixed implementation and documentation always travel in the same PR.
-- Pre-Vulkan backlog (2026-09-16): `docs/runtime_scheduling_design.md` owns
-  TIME-1–TIME-6; `docs/window_graphics_lifetime_design.md` owns LIFE-1–LIFE-4.
+- Pre-Vulkan backlog (2026-09-16): `docs/archive/runtime_scheduling_design.md` owns
+  TIME-1–TIME-6; `docs/archive/window_graphics_lifetime_design.md` owns LIFE-1–LIFE-4.
   Both are ready for issue processing after the final review on 2026-09-16;
   no TIME/LIFE tracker items have been filed. The owner
   accepted event/deadline/fixed-step scheduling with configurable limits,
@@ -137,7 +137,7 @@ Working rules live in [AGENTS.md](../../AGENTS.md); design proposals live in
   The owner also accepted protected main-thread graphics retirement after
   worker drain and before dependency release, retaining resources while safety
   is unknown. Actual Vulkan completion and
-  surface integration stay in `docs/vulkan_backend_design.md`. Follow-up #123
+  surface integration stay in `docs/archive/vulkan_backend_design.md`. Follow-up #123
   is filed; CPU timing/model work can proceed independently of that repair.
 - Test organization discussion (2026-09-16): the owner asked about package-owned,
   independently runnable suites. Inspection confirms the root engine suite
@@ -199,7 +199,7 @@ not a verdict that Synarchy's design should be discarded.
   a pure filter (master switch, global and per-component thresholds, independent
   Debug selection, source switch), carries immutable derived fields and
   breadcrumbs, and validates dotted component names. It is synchronous; see
-  [docs/logging.md](../logging.md). Runtime invokes a supplied action and
+  [docs/logging.md](../../logging.md). Runtime invokes a supplied action and
   propagates failures. Both were written from scratch; no Synarchy
   implementation was copied.
 - LOG-2 settled the record layout: one line per entry, UTC to the millisecond,
@@ -603,7 +603,7 @@ not a verdict that Synarchy's design should be discarded.
 - The repository vendors the docs landing helper and checker from Kanban,
   with its MIT notice retained under `tools/`. The local adaptation supports
   the regular authoritative `AGENTS.md`; no instruction-file migration is needed.
-  Provenance and checks are recorded in [tools/README.md](../../tools/README.md).
+  Provenance and checks are recorded in [tools/README.md](../../../tools/README.md).
 - Use `kanban:push-docs` for user-requested standalone documentation batches.
   Mixed code/docs remain in the same PR. Plugin-owned design/report helpers
   come from the installed bundle, not this repository's `tools/` directory.
@@ -619,12 +619,12 @@ not a verdict that Synarchy's design should be discarded.
 ## Open choices and next work
 
 - CI runs the validation pipeline and the review gate described in
-  [validation.md](../validation.md). `build-test` and `review-approved` are
+  [validation.md](../../validation.md). `build-test` and `review-approved` are
   the checks the installed drainer reads. A prose-only update now inherits an
   earlier run's code evidence through candidate input identity and receipt
   artifacts. Review inheritance requires a proven approved revision and an
   identical-tree push or an exact clean merge with a commit already on master;
-  CI evidence is assessed independently. See [workflow.md](../workflow.md). The
+  CI evidence is assessed independently. See [workflow.md](../../workflow.md). The
   selected GitHub repo was verified empty with zero issues and PRs before the
   initial publication on 2026-09-10; repeat deduplication when turning designs
   into tracker artifacts.
@@ -672,7 +672,7 @@ not a verdict that Synarchy's design should be discarded.
   component contexts, scoped construction, recovery, worker ownership,
   supervision, and boot/shutdown composition through explicit IO and narrow
   handles. RT-5 (#57) implements the raw worker contract in foundation's
-  `Hetoimasia.Foundation.Worker` ([docs/workers.md](../workers.md)): a group
+  `Hetoimasia.Foundation.Worker` ([docs/workers.md](../../workers.md)): a group
   boundary with a `Scoped` adapter, gated fork/registration, STM startup and
   terminal observation, run-exit ordering, group-owned cancellation helpers,
   retirement, and a protected drain; it adds `stm`, not `async`. Supervision
@@ -693,7 +693,7 @@ not a verdict that Synarchy's design should be discarded.
   Application services remain application-owned and immutable. Messaging and
   independent GLFW were subsequently implemented; current repairs are in the
   handoff above.
-- Messaging design started in [docs/messaging_design.md](../messaging_design.md)
+- Messaging design started in [docs/archive/messaging_design.md](../messaging_design.md)
   against `8979877`, with Synarchy `fe225c5` inspected read-only. It was marked
   `ready for issue processing` by owner signoff on 2026-09-13 (D-12):
   the owner approved typed bounded FIFO channels plus latest-value snapshots,

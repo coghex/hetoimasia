@@ -4,9 +4,9 @@ Give the Vulkan backend the shared resource services that every renderer
 beyond the triangle needs — device memory, buffers and images, access and
 layout ordering, uploads, bindless texture addressing and depth — once,
 beneath both a future `render-2d` and `render-3d`. It carries VKR-3 through
-VKR-6 of the [Vulkan capability findings](../vulkan_backend_findings.md) and
+VKR-6 of the [Vulkan capability findings](../../vulkan_backend_findings.md) and
 the backend prerequisites of FND-3 and FND-4 in the
-[renderer findings](../renderer_foundation_findings.md). A 2D application
+[renderer findings](../../renderer_foundation_findings.md). A 2D application
 should get these services without constructing a 3D renderer (foundation
 D-2), which is the efficiency and simplicity it lacked when 2D was a 3D
 engine with a fixed viewport.
@@ -70,7 +70,7 @@ filed as #361.
 Checked against `master@034990a` on 2026-09-29. No builds or native sessions
 ran for this document.
 
-- **Lifetime and accounting exist.** The [GPU model](../gpu_model.md) tracks
+- **Lifetime and accounting exist.** The [GPU model](../../gpu_model.md) tracks
   five independent holds on every generation and managed resource (logical
   release, ended CPU use, recorded reference, submitted use, presentation)
   and offers a subject for disposal only when all have ended. Admission
@@ -95,7 +95,7 @@ ran for this document.
   non-indexed `draw`, image transitions and `copyToReadback`. No buffers for
   drawing, push constants, descriptors, sampled images, depth or offscreen
   images. The design grows it only for actual consumers
-  (`docs/vulkan_backend_design.md:1024`), limits barriers to the operations
+  (`docs/archive/vulkan_backend_design.md:1024`), limits barriers to the operations
   supported (`:1071`), and requires advanced descriptors to have their own
   reference/mutation contract (`:1081`); descriptor pools arrive only with a
   command that needs them (`:1452`).
@@ -294,7 +294,7 @@ Owner decision 2026-09-29. New services live in
 Vulkan-side. `render-api` is not created until `render-2d` needs a
 backend-independent handle, decided in the FND-4 arc.
 
-Answered on 2026-10-05 by the [2D renderer design](render_2d_design.md)'s
+Answered on 2026-10-05 by the [2D renderer design](../../designs/render_2d_design.md)'s
 D-12: `render-2d` needs one, so `render-api` starts with only the
 backend-independent texture handle.
 
@@ -511,7 +511,7 @@ growth) and D-35 (the lookup buffer's own set). Reconciled with D-35 on
 2026-10-03, as GRS-7 (#343) builds it: the bullets above describe the two
 sets.
 
-For `render-2d`, the [2D renderer design](render_2d_design.md)'s D-4
+For `render-2d`, the [2D renderer design](../../designs/render_2d_design.md)'s D-4
 (2026-10-05) moves the sampler choice from the push constants into each
 instance's flags word, so mixed filtering stays in one draw. The table and
 its samplers are unchanged, but the recorder today refuses a table draw
@@ -1014,7 +1014,7 @@ variants, and safe calls missed through either
 ([the VMA qualification record](../gpu_vma_qualification_record.md)).
 Resolved by #333 (GRS-11), whose requirement 1 adopts that recommendation: the
 production binding is the engine's own shim, recorded in
-[the toolchain record](../toolchain.md#vma). The candidates were:
+[the toolchain record](../../toolchain.md#vma). The candidates were:
 
 - the Hackage `VulkanMemoryAllocator` binding, which bundles VMA 3.3.0, makes
   unsafe foreign calls unless its `safe-foreign-calls` flag is set, and needs
@@ -1493,8 +1493,8 @@ pull request.
 > the depth test can show it over the farther — from two poses built with
 > `hetoimasia-math`, and its probes are exact against an oracle that ray-casts
 > the scene without the math package. See
-> [the backend's contract](../gpu_backend.md#depth-attachments) and
-> [the retained evidence](../evidence/gpu_3d/README.md).
+> [the backend's contract](../../gpu_backend.md#depth-attachments) and
+> [the retained evidence](../../evidence/gpu_3d/README.md).
 
 ### GRS-13. Give each target generation a managed depth attachment
 
@@ -1502,8 +1502,8 @@ pull request.
 > per swapchain generation, shared by its frames in flight; windowed depth is
 > an opt-in host setting; `samples/scene3d/`'s windowed mode orbits the
 > camera around the evidence scene. Delivered by #350: see
-> [the backend's contract](../gpu_backend.md#windowed-depth) and
-> [the retained evidence](../evidence/gpu_3d_windowed/README.md).
+> [the backend's contract](../../gpu_backend.md#windowed-depth) and
+> [the retained evidence](../../evidence/gpu_3d_windowed/README.md).
 
 - **Outcome:** windowed frames can render with depth images that follow
   their swapchain generation through construction, resize, replacement and

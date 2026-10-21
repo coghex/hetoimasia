@@ -14,7 +14,7 @@ below relabels a missed gate as met.
 ## What was compared
 
 The optional probe `allocator-parity-probe`
-([its README](../packages/gpu-vulkan/native/probe/allocator-parity/README.md)
+([its README](../../packages/gpu-vulkan/native/probe/allocator-parity/README.md)
 states the protocol) replays committed allocation and free traces into one
 fixed-size block through:
 
@@ -173,4 +173,4 @@ depend on, so a new run is comparable but not identical.
 
 Take timings only on a quiet machine. Each report records the load average at
 its start. The probe is local apparatus outside routine automation, not a
-validation group ([test classification](test_classification.md)).
+validation group ([test classification](../test_classification.md)).

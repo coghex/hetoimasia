@@ -3,7 +3,7 @@
 Current behavior of `Hetoimasia.Runtime.UpdatePolicy`: demand deadlines,
 bounded variable-step elapsed time, fixed steps with bounded catch-up, and
 explicit pause and resume. The accepted policy lives in
-[the runtime scheduling design](runtime_scheduling_design.md) (P-2, D-1, and
+[the runtime scheduling design](archive/runtime_scheduling_design.md) (P-2, D-1, and
 D-2); this document describes what the code does today.
 
 Scope: pure policy over the [time values](time.md) the foundation supplies.

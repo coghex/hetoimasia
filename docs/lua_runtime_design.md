@@ -360,7 +360,7 @@ LUA-18 builds on:
 - **The clock.** The monotonic time and deadline boundary that LUA-6 and
   LUA-12 need (Q-4) has shipped: TIME-1/#133, merged by PR #152, and
   `Foundation.Time` with its `Types` and `Arithmetic` modules (the latest split
-  is `16933652`). [Runtime scheduling](runtime_scheduling_design.md) owns
+  is `16933652`). [Runtime scheduling](archive/runtime_scheduling_design.md) owns
   monotonic time and native wake, not Lua tasks.
 - **A graphics consumer now exists.** The 2D renderer (epic #413, closed
   2026-10-14) publishes per-window scenes in the window host (#423, PR #435,
@@ -368,8 +368,8 @@ LUA-18 builds on:
   #441, `1728868b`). These are the presentation consumers P-2 anticipated.
   The trusted milestone LUA-8 stays headless, with fake capability and
   presentation consumers and no Vulkan or GLFW dependency.
-- [Window/graphics lifetime](window_graphics_lifetime_design.md) owns graphics
-  retirement. [Test architecture](test_architecture_design.md) specifies
+- [Window/graphics lifetime](archive/window_graphics_lifetime_design.md) owns graphics
+  retirement. [Test architecture](archive/test_architecture_design.md) specifies
   package-owned suites, so new Lua suites start in this package.
 - **Tracker.** The open items at inspection are #145 (this epic) and #446
   (deferred render-to-texture, unrelated). No other issue or pull request
@@ -2138,14 +2138,14 @@ GLFW scheduling, or a completed game loop artificial prerequisites.
 **Result reconciled 2026-09-23:** both preliminary proofs are merged and
 `inconclusive`; no production deployment profile is selected.
 
-- [Linux verdict](lua_linux_confinement_verdict.md), LUA-14/#147, PR #177:
+- [Linux verdict](archive/lua_linux_confinement_verdict.md), LUA-14/#147, PR #177:
   the candidate enforces the tested boundary where unprivileged user
   namespaces are usable. Stock Ubuntu 24.04 restrictions and the current CI
   container prevent that setup. The successful reference experiment required
   an administrative restriction change; this is not an approved deployment
-  requirement. [Retained runs](lua_linux_confinement_evidence.md) distinguish
+  requirement. [Retained runs](archive/lua_linux_confinement_evidence.md) distinguish
   all three environments/outcomes.
-- [macOS verdict](macos_confinement_verdict.md), LUA-15/#148, PR #176:
+- [macOS verdict](archive/macos_confinement_verdict.md), LUA-15/#148, PR #176:
   the candidate uses unsupported confinement and memory-limit interfaces.
   Its named residual limits and missing Lua-side network-denial evidence
   remain part of the result. The [#176 review](project_review/176.md) also

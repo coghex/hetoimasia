@@ -109,7 +109,7 @@ excludes an announcement for as long as it is held; a claim that could not
 complete is retryable, while recorded facts are terminal; and an
 announcement's admission checks the incarnation is current and installs its
 slot in the same transaction, so a settled incarnation can never reopen.
-[glfw.md](glfw.md#who-owes-an-attachments-settlement) records the invariants.
+[glfw.md](../glfw.md#who-owes-an-attachments-settlement) records the invariants.
 
 One rule the delivered machinery makes explicit that D-6 left implicit: the
 owner never retires an attachment the main thread still holds. When a target's
@@ -124,8 +124,8 @@ cross-thread authority over either.
 
 At `master@3a8abdc`, LIFE-1 through LIFE-4 and the retirement/reporting repairs
 #166–#169 are merged. The implemented host/attachment contract is in
-[glfw.md](glfw.md); the [review ledger](project_review/ledger.md) records current
-review outcomes. The [#170 review](project_review/170.md) confirms the
+[glfw.md](../glfw.md); the [review ledger](../project_review/ledger.md) records current
+review outcomes. The [#170 review](../project_review/170.md) confirms the
 metadata repair but records an older callback-comment contradiction: finite,
 nonblocking native work is permitted; blocking GPU waits are not. The Vulkan
 proof and pure GPU model now exist separately,
@@ -198,7 +198,7 @@ D-4 accepts the corresponding rule for graphics dependents.
 Use Hspec and scripted lifetimes for failure/ordering proofs, isolated X11 for
 native window lifetime, and local Cocoa only after asking for and receiving
 the human user's explicit approval for that test session. No hosted macOS CI.
-*Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../AGENTS.md).*
+*Superseded on 2026-09-26: the owner gave standing approval for desktop-disrupting native runs an issue or pull request needs; see [AGENTS.md](../../AGENTS.md).*
 GLFW-only evidence is not GPU-completion evidence.
 
 ### D-4. Protect retirement between worker drain and dependency release
@@ -504,7 +504,7 @@ merged #158/PR #174 and whose exceptional cleanup was repaired by #181/#182.
 That arc selects maintenance present fences and unused-image release. No LIFE
 slice itself creates GPU work or a surface: its CPU flags and fake completion
 tests remain no proof of native retirement. Native implementation consumes the
-[compatibility record](vulkan_compatibility_record.md) and still owes its own
+[compatibility record](../vulkan_compatibility_record.md) and still owes its own
 production evidence and any changed-input requalification.
 
 ## Verification strategy

@@ -107,7 +107,7 @@ This is an arc overlap check, not final per-issue deduplication.
 
 ### D-1. Flexible Base/Types and dedicated type modules
 
-The owner accepted the boundaries in [module conventions](../module_conventions.md).
+The owner accepted the boundaries in [module conventions](../../module_conventions.md).
 No package-wide universal type collection, forced empty modules or renaming of
 already cohesive dedicated type modules is required.
 

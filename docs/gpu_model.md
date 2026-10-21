@@ -5,7 +5,7 @@ Current behavior of `Hetoimasia.GPU.Model`, the pure model in
 tracks, the holds that decide when any of it may be disposed of, frame ownership
 phases and their obligations, validated admission budgets, recovery accounting,
 and bounded owner progress. The accepted policy lives in
-[the Vulkan backend design](vulkan_backend_design.md) (D-15 through D-18, D-22
+[the Vulkan backend design](archive/vulkan_backend_design.md) (D-15 through D-18, D-22
 through D-26, and P-1, P-2, P-8, P-14 and P-15); this document describes what the
 code does today.
 
@@ -372,7 +372,7 @@ the configuration, not of how many attempts were made.
 
 The accounted bytes also charge the device memory the backend's allocator holds
 — each block and each dedicated allocation — for as long as it holds it (D-15,
-D-40 of the [GPU resource services design](designs/gpu_resource_services_design.md)).
+D-40 of the [GPU resource services design](archive/designs/gpu_resource_services_design.md)).
 Those charges belong to the memory, not to any resource: a block serves many
 resources and may outlive them all, so creating, disposing of or abandoning a
 resource never moves them. The model learns about the memory only as the
@@ -875,7 +875,7 @@ growth and dedicated routing; and a strategy interface. It is **a test
 reference, not production code.** The owner chose VMA for production
 allocation (resource services design D-38) after neither this placement nor a
 mutable prototype of it met the parity gates, which
-[the parity record](gpu_allocator_parity_record.md) retains.
+[the parity record](archive/gpu_allocator_parity_record.md) retains.
 
 No library depends on it. `gpu-model-tests` tests it — its `placement` group
 checks every rule by hand and against a brute-force best-fit reference over

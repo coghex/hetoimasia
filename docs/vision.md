@@ -44,7 +44,7 @@ come before the production renderer. A multi-window triangle is an eventual
 integration milestone, not a reason to skip these boundaries. Lua can progress
 independently where its prerequisites are satisfied. Add abstractions and
 concurrency for a concrete consumer; defer bound-worker variants until a named
-consumer needs OS-thread affinity. See [runtime direction](runtime_foundation_design.md)
+consumer needs OS-thread affinity. See [runtime direction](archive/runtime_foundation_design.md)
 and [runtime review dispositions](runtime_review_findings.md).
 
 ## Lifetime, failure and concurrency
@@ -69,7 +69,7 @@ holds each window alive until retirement is acknowledged. Closing the first
 window must not invalidate another. GPU submission completion, presentation
 retirement, CPU scope exit and logical asset release are distinct facts.
 See [resources](resources.md), [workers](workers.md), runtime D-13 and
-[window/graphics lifetime](window_graphics_lifetime_design.md).
+[window/graphics lifetime](archive/window_graphics_lifetime_design.md).
 
 ### V-4. Explicit failures and bounded safe recovery
 
@@ -78,7 +78,7 @@ requires proven safety and finite budgets; never replay arbitrary consumer
 effects. Distinguish optional-service rejection from required-service failure.
 Supervision uses checkpoints and supervised waits, without promising interruption
 of every blocking operation. Logging failures must not replace an earlier
-primary failure. See [runtime foundation](runtime_foundation_design.md).
+primary failure. See [runtime foundation](archive/runtime_foundation_design.md).
 
 ### V-5. Bounded communication and responsive ownership
 
@@ -86,14 +86,14 @@ Use bounded FIFO commands/events and coherent latest-value snapshots. Prepare
 payloads deeply on the producer. Ordinary send reports full immediately;
 waiting is explicit. Close permits backlog drain, abort discards it, and
 in-flight effects are not automatically retried. Generic broadcast and
-request/reply are deferred. See [messaging](messaging_design.md).
+request/reply are deferred. See [messaging](archive/messaging_design.md).
 
 The GLFW owner stays on the process main thread. Owned ports, snapshots and
 persistent command tickets connect services. Scheduling uses monotonic time,
 explicit deadlines and optional fixed steps with bounded catch-up. Render demand
 is per window; simulation pause policy belongs to the application. Expected
 native-wake failure preserves admitted commands and degrades to bounded polling
-with a diagnostic. See [scheduling](runtime_scheduling_design.md) and [GLFW](glfw.md).
+with a diagnostic. See [scheduling](archive/runtime_scheduling_design.md) and [GLFW](glfw.md).
 
 The approved production rendering design uses a separate supervised graphics
 owner, with bounded handoffs and explicit ownership of Vulkan roots. GLFW calls
@@ -104,7 +104,7 @@ handoffs before the final join. Rendering consumes published scene snapshots;
 the application chooses which thread produces them, and a simulation driver is
 deferred. This does not promise window-command progress during a Cocoa modal
 loop, or qualify rendering progress without the retained VK-16 native evidence.
-See [Vulkan decisions D-29–D-33](vulkan_backend_design.md) and LIFE D-6.
+See [Vulkan decisions D-29–D-33](archive/vulkan_backend_design.md) and LIFE D-6.
 
 ## Graphics and platforms
 
@@ -122,7 +122,7 @@ replacement, allocation reclamation and explicit frame abandonment preserve
 ownership and finite recovery budgets. Device loss and validation errors stop
 the affected shared graphics session. Elapsed time and render fences do not
 prove presentation retirement. Platform timing assumptions are not correctness
-evidence. See [Vulkan decisions D-12–D-33](vulkan_backend_design.md).
+evidence. See [Vulkan decisions D-12–D-33](archive/vulkan_backend_design.md).
 
 ### V-7. Optimize actual foreign-call and diagnostic boundaries
 
@@ -150,7 +150,7 @@ Private shims may implement approved native integrations without exposing
 ownership to applications. The Wayland connection-status exception is a
 read-only owner-thread probe, not permission to consume protocol messages or
 take over GLFW's connection. Keep the exception and required disconnect
-experiment in the [Wayland design](wayland_qualification_design.md).
+experiment in the [Wayland design](archive/wayland_qualification_design.md).
 Compositor loss cannot manufacture GPU completion.
 
 ## Scripting, tests and delivery
@@ -225,7 +225,7 @@ covered too, one window-opening batch at a time, because every test is measured
 once and a stable test is not re-run.
 Isolated scripted displays are a separate approved path.
 Pure/model tests do not establish visual results, performance or confinement.
-See [validation](validation.md) and [test architecture](test_architecture_design.md).
+See [validation](validation.md) and [test architecture](archive/test_architecture_design.md).
 
 ### V-11. Reproducible inputs and efficient solo delivery
 

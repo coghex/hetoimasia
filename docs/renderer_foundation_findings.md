@@ -10,11 +10,11 @@ Status legend: `[ ]` unprocessed · `[#N]` filed as issue N · `[no-issue]` revi
 ## Methodology
 
 Reviewed the docs-worktree foundation plan, [owner vision](vision.md),
-[Vulkan backend design](vulkan_backend_design.md), and
+[Vulkan backend design](archive/vulkan_backend_design.md), and
 [Vulkan capability report](vulkan_backend_findings.md) against
 `master@da81087bb2c81e844588a0fc30197bd99201c6b9` on 2026-09-22.
 The original plan is retained in
-[history](history/engine_foundation_design_before_2026-09-22.md).
+[history](archive/history/engine_foundation_design_before_2026-09-22.md).
 
 The tracker assigns the production backend and first windowed triangle to
 #155, with recording #223, scheduling integration #232 and consumer #233
@@ -50,7 +50,7 @@ drawing game managers into the engine.
 
 - Foundation D-2 and [owner vision](vision.md) require independent rendering
   modules over shared infrastructure.
-- The [original FND-3](history/engine_foundation_design_before_2026-09-22.md)
+- The [original FND-3](archive/history/engine_foundation_design_before_2026-09-22.md)
   proposed depth-tested geometry, a camera and captured image evidence.
 - [#223](https://github.com/coghex/hetoimasia/issues/223) and
   [#233](https://github.com/coghex/hetoimasia/issues/233) own managed triangle
@@ -90,7 +90,7 @@ goal, not an instruction to add a complete UI system.
 
 - Foundation D-2 and [owner vision](vision.md) retain independent 2D and 3D
   modules over shared services.
-- The [original FND-4](history/engine_foundation_design_before_2026-09-22.md)
+- The [original FND-4](archive/history/engine_foundation_design_before_2026-09-22.md)
   proposed ordered textured sprites, camera behavior and independent startup.
 - [VKR-4/VKR-6](vulkan_backend_findings.md) identify upload and binding
   capabilities beyond the current triangle scope.

@@ -80,8 +80,8 @@ Final-pass inspection on 2026-09-10 found primary at
 `e0691ec6a54940dc62a36054c1bc750b08be1cca`, with no CI workflows yet. Logging
 PR #5 has landed; the open tracker contains logging epic #1 and children #3–#4,
 with no open PR or overlapping CI arc. Recheck during issue processing because
-logging work is concurrent. The dedicated [logging](logging_design.md) and
-[resource](resource_ownership_design.md) contracts remain authoritative.
+logging work is concurrent. The dedicated [logging](archive/logging_design.md) and
+[resource](archive/resource_ownership_design.md) contracts remain authoritative.
 
 ### Synarchy: retain the ideas, assess their costs
 

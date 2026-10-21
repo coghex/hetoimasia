@@ -78,13 +78,13 @@ No build, probe or desktop session ran for this draft.
   this limit and reports the trusted milestone delivered at `b7f3b56e`.
 - The [2D design](render_2d_design.md), especially D-12/D-20, separates pure
   scenes from Vulkan recording and assigns Lua bindings to the Lua arc.
-  [Asset decoding](asset_design.md) consumes bytes; file loading is the caller's
+  [Asset decoding](../archive/designs/asset_design.md) consumes bytes; file loading is the caller's
   responsibility. Mod-supplied content was deferred by that older design.
   [The image2d sample](../../samples/README.md) already composes decoded PNG
   and KTX2 images, texture registration and per-window 2D scenes in Haskell.
-- [GPU services](gpu_resource_services_design.md),
-  [window/graphics lifetime](../window_graphics_lifetime_design.md) and
-  [GLFW integration](../glfw_integration_design.md) retain native ownership:
+- [GPU services](../archive/designs/gpu_resource_services_design.md),
+  [window/graphics lifetime](../archive/window_graphics_lifetime_design.md) and
+  [GLFW integration](../archive/glfw_integration_design.md) retain native ownership:
   GLFW on the main thread, graphics under its protected owner, resources held
   until actual GPU and presentation retirement. Lua bindings must preserve
   these boundaries.
