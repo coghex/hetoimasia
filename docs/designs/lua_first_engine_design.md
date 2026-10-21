@@ -9,7 +9,7 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current pass records direction and the optional-content checkpoint; it is
+The current pass records direction and the boot-input checkpoint; it is
 not an approved specification or authority to implement or file issues.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
@@ -372,6 +372,35 @@ Launcher resolution of the owner's selected root directory is separate and
 remains open, as do the concrete logical path and root-registration rules.
 The decision affects content inventory and resolution; no slice is defined yet.
 
+### D-12. Required loads by default, with explicit optional data/textures
+
+Owner answer, **2026-10-21 15:21:13 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: optional loads (Rec.)
+
+Authenticated relay: `het-manager`, message `s7igcu9a4rejrnmjhb23296iua`,
+posted **2026-10-21 15:21:13.318 UTC** in `#het-luafirst`, replying to Q-2g
+message `eier38txdpppyzm8kqazfu9ehw`.
+
+Loads are required by default. An accepted required load that fails fails the
+operation that requested it. Lua can explicitly request optional data files
+or textures and receive a structured failure naming the content root, path
+and reason, then choose a fallback such as an already loaded default portrait.
+Modules remain required. Changed content is still refused under D-10;
+optionality does not permit changed bytes to enter the session.
+
+Engine/provider-code and cleanup failures retain their existing fatal
+authority, and no automatic placeholder or retry is introduced. Gameplay
+results, including optional failures, remain tick-assigned under D-9.
+Exact session/UI escalation, result syntax, admission-full and cancellation
+behavior remain separate questions.
+
+Rejected: requiring all data and textures with no optional-load API. Explicit
+optionality lets Lua distinguish essential content from content for which it
+can choose a fallback. Loading, Lua results and failure integration are
+affected; delivery slices remain undefined.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -422,39 +451,40 @@ logical path normalization remain to be specified.
 
 ### P-8. Make content required by default, with explicit optional data/textures
 
-**Unapproved; active checkpoint Q-2g.** Recommend option A: a normal load is
-required. If an accepted load cannot produce valid content, its owning
-lifecycle operation fails; failed boot cannot report success and failed
-gameplay retains the last good committed state under V-4/D-3. Exact boot,
-UI and session escalation are settled in Q-3/Q-5, not inferred here.
+Accepted by D-12; retain this proposal ID as history. The existing request
+layer already distinguishes expected provider failure replies from raised
+host/cleanup failures (`packages/scripting-lua/README.md`, "The guard, and
+what a failure is"); the content result API remains new work.
 
-Lua may explicitly request optional data or textures. Expected content
-failures then return structured failure data, naming the requesting content,
-target root/path, operation and reason, so Lua can choose a fallback. For
-example, a missing optional portrait can use an already loaded default image;
-a required level definition cannot silently vanish. A content-changed result
-still refuses the changed bytes under D-10; optionality does not grant reload.
-No engine-provided placeholder or automatic retry is implied.
+### P-9. Boot a self-describing game folder
 
-Module imports remain required in this proposal: syntax/evaluation faults
-and failed dependencies are not downgraded to optional asset failures. D-7
-continues to retain a failed import in that VM. Unexpected provider-code or
-engine cleanup failures retain their existing fatal authority, regardless of
-optional status. The existing request layer already distinguishes expected
-provider failure replies from raised host/cleanup failures
-(`packages/scripting-lua/README.md`, "The guard, and what a failure is").
+**Unapproved; active checkpoint Q-3a.** Recommend option A: the launch command
+takes a game content-root directory. A small, non-executable manifest in that
+root supplies its stable content identity and relative Lua entry-module path.
+The engine validates those fields before executing game Lua; no game-specific
+Haskell chooses an entry. The author can hand someone the folder and a command
+that names the folder, without requiring them to know its internal script path.
 
-Alternative B makes all content required, with no optional data/texture load
-operation in this arc. It reduces the API but requires every referenced
-portrait or cosmetic asset to be present and valid, with no Lua-selected
-fallback after a failed load. A is recommended so the game can distinguish
-essential state from optional presentation/content explicitly.
+For illustration only, a manifest could say `id = "example_game"` and
+`entry = "lua/main.lua"`; its filename, format/schema, versioning and command
+spelling are not selected at this checkpoint. The manifest is boot metadata,
+not a place for game rules, routines or native resource ownership. Required
+startup validation still includes the approved content and library policies.
 
-This affects loading, Lua results and boot/session failure integration.
-It does not settle result syntax, admission-full/cancellation handling,
-resource-cache behavior or UI-instance escalation. Logical gameplay results,
-including optional failures, still arrive at assigned ticks under D-9;
-wall-clock completion must not decide authoritative behavior.
+Alternative B takes the root and entry path directly on the command line,
+with no mandatory game manifest. This starts an arbitrary entry without
+packaging metadata but moves knowledge of the folder's entry point into each
+launch configuration; stable root identity would need a separate convention
+or argument. A is recommended to give games and eventual mods explicit
+identities and make the normal launch self-contained in its content folder.
+
+This affects boot, content-root registration and eventual mod metadata.
+It does not select domain creation, entry hooks, mod discovery/enabling,
+window defaults, engine settings, or manifest fields beyond identity and
+entry. Whether the new launch is a subcommand or a separate executable, and
+compatibility with the existing `hetoimasia lua` command, remain open. The
+current headless command takes explicit `--script` paths and does not supply
+this game-folder boot contract.
 
 ## Open questions
 
@@ -470,7 +500,10 @@ identity/cache/cycles, cross-mod access, root/path and symlink handling,
 failure attribution and when loading is allowed. D-6 settles explicit root
 addressing, D-7 module reuse/cycle/failure behavior, D-8 the top-level
 effect boundary, D-9 runtime loading, D-10 content-version checks for now and
-D-11 the symlink rule. Engine API spelling and remaining loader behavior are open.
+D-11 the symlink rule and D-12 required/optional content failure handling.
+Root/path grammar, inventory preparation, loader/result API, bounds/cache
+policy and detailed failure escalation remain open. These will be revisited
+with the boot, state and service contracts; Q-2 as a whole is not marked resolved.
 
 #### Q-2a. Explicit content-root references or one merged override namespace?
 
@@ -510,10 +543,9 @@ of the selected root, root registration and logical path grammar remain open.
 
 #### Q-2g. Can Lua explicitly handle an optional data/texture load failure?
 
-The only active checkpoint: P-8 option A (recommended, required by default,
-explicit optional data/textures with structured failures; modules required)
-or B (all content required), or an owner-specified revision. Neither weakens
-host/cleanup failure authority or permits changed bytes to enter the session.
+Resolved by D-12: loads required by default, with explicit optional data and
+textures returning structured failures. Modules stay required; host/cleanup
+failure authority and D-10's version checks remain intact.
 
 ### Q-3. What is the generic executable's boot and session contract?
 
@@ -521,6 +553,14 @@ Settle content root and entry selection, startup validation, init, logical
 updates, presentation/UI updates and shutdown; boot/session failure reporting,
 exit behavior and compatibility with the existing headless `lua` command.
 Keep D-27 cleanup independent of successful Lua shutdown.
+
+#### Q-3a. Does the game folder declare its entry point?
+
+The only active checkpoint: P-9 option A (recommended, root directory plus a
+non-executable manifest naming content identity and entry) or B (root and
+entry supplied directly at launch, no mandatory manifest), or an
+owner-specified revision. Manifest syntax, launcher compatibility and
+lifecycle remain separate decisions.
 
 ### Q-4. How are mods discovered, ordered and combined?
 
