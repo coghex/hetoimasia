@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-43/Q-6c: copied scene publication and texture retention.
+The current checkpoint is P-44/Q-6d: one texture request through usable GPU readiness.
+D-46 accepts copied scenes and protected texture retention.
 D-45 accepts Lua-requested asynchronous window creation.
 D-44 resolves Q-6a revision 2 with UI-only graphics; the original broader
 Q-6a was not answered. D-43 accepts P-40's scope and delivery tags; D-42
@@ -1389,6 +1390,33 @@ session quit under D-43.
 The manager presented the pending-window machinery and race-test cost. The
 owner chose A rather than manifest/launcher-created windows. Exact API spelling,
 limits, window counts and the remaining scene/texture contracts remain open.
+
+### D-46. Publish copied scenes with atomic replacement and protected holds
+
+**Delivery:** M1.
+
+Owner answer, **2026-10-21 22:09:12 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: copied scenes (Rec.)
+
+Authenticated relay: `het-manager`, message `m4wbgg9uvpve3ftwhfr73z953i`,
+posted **2026-10-21 22:09:12.667 UTC** in `#het-luafirst`, replying to Q-6c
+message `4gxisg374bz7by7cprxs5jnhma`.
+
+Accept P-43's A: Lua publishes a plain scene table to its own ready window.
+The binding copies and validates the whole bounded scene before atomic
+replacement; editing the source table afterwards has no effect until another
+publication. A static quad is published once, and independent rendering uses
+the latest complete scene without promising every publication is displayed.
+Invalid scenes or unavailable texture references refuse the whole call and
+preserve the previous published scene, with the error/failure distinction in
+P-43. Protected publication/release barriers and revision holds keep textures
+alive through actual rendering/GPU use without extending released Lua handles.
+
+The manager presented the whole-scene copy cost. The owner chose A rather than
+engine-owned mutable scene objects. Scene fields, numeric limits and the
+remaining texture/request APIs are not selected by this answer.
 
 ## Proposals
 
@@ -3551,7 +3579,7 @@ the asynchronous Lua window binding proposed here is not already delivered.
 
 ### P-43. Publish a copied complete scene for one window
 
-**Unapproved; active checkpoint Q-6c. Delivery: M1.** Recommend A: a UI hook
+**A accepted by D-46 through Q-6c. Delivery: M1.** Recommend A: a UI hook
 constructs a plain Lua scene value and publishes it to its ready window. The
 binding copies and validates the complete bounded value and the instance's
 ready texture leases before atomically replacing that window's published scene.
@@ -3609,6 +3637,57 @@ holds objects by adopted window/revision until released. The
 [per-window host](../gpu_backend.md#a-scene-for-each-window) uses latest-value
 publication without waiting for adoption. The new Lua conversion and ready-lease
 validation are proposed integration work, not existing bindings.
+
+### P-44. One texture request ends with a usable GPU texture lease
+
+**Unapproved; active checkpoint Q-6d. Delivery: M1.** Recommend A: a UI hook
+requests a texture by scoped content path, and one pending request covers
+fingerprint-checked reading, decoding, upload and renderer registration. Success
+delivers an instance-owned texture lease plus its image dimensions only after
+the upload has actually completed and the renderer's texture mapping is ready
+for subsequent scene use. Decoded bytes, an admitted upload or an early native
+texture handle are not success. This makes D-46's ready-texture check concrete;
+it does not reopen its refusal of unavailable textures or add placeholders.
+
+The provider progresses without waiting in a Lua hook or on a rendered frame.
+It can load a texture before a window is ready, or with no window yet; GPU
+service setup/upload progress must therefore not depend on a window's first
+frame. Success does not mean any window has displayed the texture. Lua can
+request window and texture in init, then publish the scene when both have
+succeeded. Presentation result delivery uses D-44's elapsed/arrival runtime;
+this does not grant texture loading to the logical role.
+
+D-12's required-by-default and explicit optional-texture behavior applies to
+the whole request: an ordinary content/decoding failure fails required work or
+returns the optional structured root/path/reason failure. Changed content is
+still refused under D-10. Optional does not hide fatal engine/provider or
+cleanup failures. The request is bounded, has no automatic retry, and every
+intermediate CPU/GPU holding has engine-owned cleanup even if the result is
+never collected. Stopping/cancelling suppresses delivery and initiates cleanup;
+an already-started native upload may have to finish before safe retirement.
+No Lua reference loss or cancellation acknowledgement proves GPU completion.
+
+Alternative B exposes two Lua operations: load/decode to an owned CPU-image
+result, then explicitly request upload/registration to a texture lease. The
+texture still cannot enter a scene until GPU readiness. This gives Lua a
+separate CPU-image lifetime and upload decision, but adds a public result type,
+two-stage orchestration, budgets and cancellation/cleanup cases. It does not
+by itself authorize pixel editing, streaming or other advanced asset features.
+
+A is recommended for the approved quad and runtime texture loading: one
+observable pending/success/failure result corresponds to a usable resource.
+Its cost is that the provider coordinates every stage and delays success until
+GPU readiness; Lua cannot retain a decoded image separately or choose its
+upload time. Exact format/options, request syntax, caching/sharing and explicit
+release APIs remain subsequent M1 contracts, not silently selected here.
+
+Evidence: [asset-image](../../packages/asset-image/README.md) decodes bytes;
+the [GPU upload and texture-table contracts](../gpu_backend.md) distinguish
+completed upload from mere admission and from descriptor/lookup publication.
+Registration of an already completed texture refreshes the table before
+returning. The image2d sample composes upload completion and registration in
+Haskell. The new asynchronous Lua provider must qualify these same stages,
+including cancellation during upload and progress before any window exists.
 
 ## Open questions
 
@@ -3899,10 +3978,17 @@ chosen. Exact API/counts and advanced window features were not selected here.
 
 #### Q-6c. Publish copied scenes or mutate engine-owned scene objects?
 
-**Active checkpoint, P-43.** A (recommended): copied/validated complete scenes,
-atomic per-window replacement, independent latest-scene rendering, whole-call
-refusal and protected texture retention. B: mutable scene/sprite objects with
-a separately designed edit/publication boundary. Neither option introduces ECS.
+Resolved by D-46: P-43's A, copied/validated complete scenes, atomic per-window
+replacement, latest-scene rendering, whole-call refusal and protected texture
+retention. The mutable-scene-object alternative was not chosen. No ECS is added.
+
+#### Q-6d. Does one texture request cover reading through GPU readiness?
+
+**Active checkpoint, P-44.** A (recommended): one request succeeds only with
+a usable texture lease after verified read, decode, completed upload and
+registration. B: separate owned CPU-image and GPU-texture requests. Both retain
+D-46's ready-texture publication rule and protected cleanup; neither permits
+an unfinished texture to appear as a successful load.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
