@@ -682,10 +682,34 @@ calls enter the owning instance context. Imports and mutable module exports
 remain shared within each VM under D-7; a non-yielding mod can block its whole
 role VM. Separate instances do not promise shared-state rollback.
 
-D-14's role-VM limit remains unchanged. Role declarations, absent-role handling,
-activation relative to game init, cross-role dependency readiness and failure
-escalation remain open. This document's D-23 concerns mod ownership; prior
+D-14's role-VM limit remains unchanged. D-24 later settles role declarations
+and absent-role handling; activation relative to game init, cross-role
+dependency readiness and failure escalation remain open. This document's D-23 concerns mod ownership; prior
 Lua design D-23 remains the separate determinism contract.
+
+### D-24. Require every explicitly declared mod role
+
+Owner answer, **2026-10-21 16:38:07 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: roles are required (Rec.)
+
+Authenticated relay: `het-manager`, message `mdwfz4rj45qkwt6yeieezvx6fs`,
+posted **2026-10-21 16:38:07.503 UTC** in `#het-luafirst`, replying to Q-4c
+message `69nteh5dwzydaj3fm9s86v7qd6`.
+
+P-20 option A and the shared contribution contract are accepted. Each mod
+explicitly declares gameplay, presentation, both, or no role contributions;
+each declared role names its entry. An absent required game role fails boot
+before Lua, naming the mod and role. There is no optional-role flag. Authors
+can split gameplay and UI contributions into separately selected mods for
+gameplay-only use.
+
+An empty contribution set is content/library-only: no automatic instance or
+entry execution, while its content remains explicitly importable/loadable.
+The normal identity, dependency and content checks still apply. Exact manifest
+fields, activation order relative to roots and dependency readiness remain
+open; this does not create another VM or alter the game's clocks.
 
 ## Proposals
 
@@ -1266,7 +1290,7 @@ over those mechanisms, not an already implemented mod system.
 
 ### P-20. Declare mod role contributions explicitly and require those roles
 
-**Unapproved; active checkpoint Q-4c.** Recommend A: a mod manifest explicitly
+**Option A accepted by D-24.** A mod manifest explicitly
 declares zero, one or both of `gameplay` and `presentation`, with Lua entry
 path(s) for its contributed roles. There is no implicit two-role default for
 mods. An entry supplies the corresponding named behavior table, validated
@@ -1307,7 +1331,76 @@ or implies a cross-VM call can wait for another role to initialize.
 Evidence: D-14 lets the game select one or both VM roles; D-21 explicitly
 selects whole mod roots; D-23 assigns instances per contributed role. The
 missing-role policy and content-only case do not follow automatically from
-those decisions. Both are proposed launcher manifest/admission behavior here.
+those decisions. Both are now accepted launcher manifest/admission design,
+not implemented behavior.
+
+### P-21. Initialize each game root before its role's ordered mod instances
+
+**Unapproved; active checkpoint Q-4d.** Recommend A, with the following explicit
+integration of D-18/D-22/D-23/D-24:
+
+1. Validate all selected role entries before hooks. Start the game gameplay
+   and presentation root inits concurrently as D-18 requires. After a root's
+   init succeeds, initialize that role's mod instances one at a time in D-22's
+   resolved order, filtering out mods without that role. Each runs under its
+   own engine-owned instance context, with finite non-yielding init; do not
+   add a new configure/setup hook. Content-only mods have no initializer.
+2. The presentation root may run as soon as its own init succeeds, while both
+   initialization chains continue. Its timer/events may run between finite UI
+   mod initializers on the same VM; a long or hung UI mod init still delays
+   that VM. UI mod updates/events are held until the UI mod-init chain has
+   succeeded, then may run even if gameplay is still starting. Startup UI must
+   tolerate incomplete mod activation and cannot depend on gameplay init.
+   Keep the existing starting/role-ready status contract, without adding a
+   detailed gameplay-init progress channel.
+3. Gameplay ticks/updates/events wait for the gameplay root and all gameplay
+   mod inits, plus the presentation root and all presentation mod inits when
+   that role exists. Publish a coherent initial gameplay view and running
+   status at that joint transition. No startup wall time becomes gameplay
+   ticks. Pending content still need not finish before init is considered
+   successful. One-role sessions omit the other chain.
+4. Required dependencies guarantee preceding successful init **within each
+   role**, not cross-role readiness. If mod B requires mod A and both have UI
+   contributions, A's UI init finishes before B's UI init starts; A's gameplay
+   init may still be pending. A dependency without that role contributes no
+   initializer there. Its declared content is available under normal import
+   rules, but other-role state remains unavailable until the joint gate opens.
+   No initializer waits synchronously for another VM. This is the concrete
+   role-local interpretation of D-22's activation order, not a promise that
+   an entire two-role mod is initialized before its dependent starts anywhere.
+5. Any selected mod init failure fails boot, attributably to its mod/role, and
+   closes both chains and the gameplay start gate. Stop admitting later inits,
+   cancel pending work and tear down successful roots/mod instances through
+   their owned lifetimes; a failed or never-started init gets no shutdown.
+   Late successes cannot reopen startup. Existing D-18 failure/cancellation
+   rules also cover early running UI here. No skip, automatic retry or rollback
+   of shared Lua mutations is promised. Runtime mod failure escalation and
+   exact teardown ordering remain separate contracts.
+
+Authoring cost: game root init establishes core services/state before mod init
+effects exist. It can import pure mod definitions, but cannot consume mutable
+registrations or state which mod init has not yet produced. Work depending on
+those effects, such as generating a world from mod registrations, belongs in
+normal execution after the joint gate opens; the store contract must specify
+how initial data and later tick commits are staged. Early UI must tolerate
+partially initialized UI mod contributions; there is no atomic rollback of
+native or Lua effects while that UI is running.
+
+Alternative B initializes mods before game roots, allowing roots to consume
+their completed registration effects. It would delay the game-authored
+loading UI behind UI-mod init and require a revised D-18 startup protocol
+(and a way for mods to initialize without root-provided services/state).
+If preferred, write that concrete revision for signoff instead of silently
+changing the concurrent/early-UI contract. A is recommended because it retains
+the approved game-root startup and gives mods an initialized core in their
+own role, at the explicit authoring and partial-UI costs above.
+
+Evidence: D-18 supplies role gates, D-22 a deterministic mod order and D-23
+separate instances inside each VM. The host serializes an owner's execution
+and supports init-time queued connections, but does not supply this launcher
+protocol. Verification needs both role completion orders, dependencies whose
+other role is still initializing, early UI progress, blocked mod callbacks,
+one-role/content-only sets and failure/cancellation at each admission boundary.
 
 ## Open questions
 
@@ -1453,16 +1546,23 @@ Q-7b is next because activation needs an instance/VM ownership model first.
 
 #### Q-4c. Must every declared mod role exist in the game's VM arrangement?
 
-The only active checkpoint: P-20 option A (recommended, explicit contributions
-all required) or B (also optional-role contributions skipped when that VM is
-absent), or an owner-specified revision. Both permit explicit content-only
-mods. Entry/format details and activation/dependency readiness follow.
+Resolved by D-24: explicit contributions, all declared roles required, and
+explicit content-only mods. Entry/format details and activation/dependency
+readiness follow.
+
+#### Q-4d. How do root and mod initialization compose with early UI?
+
+The only active checkpoint is P-21 option A: approve the five-part root-first,
+role-local activation protocol and its authoring costs; or request the
+mods-first alternative B for a concrete D-18 revision; or specify a revision.
+Cross-role dependency readiness is explicitly not promised by A. Runtime
+mod failure escalation and teardown ordering follow separately.
 
 ### Q-5. What generic engine state does Lua define and mutate?
 
 Settle entities/components versus tables/schemas, validation, stable identity,
 read visibility while staging, atomic tick commit, bounded capacity and
-failure. Carry D-23 and D-47/D-48's exact guarantees into this store. Settle
+failure. Carry prior Lua D-23 and D-47/D-48's exact guarantees into this store. Settle
 whether saves and schema migration are excluded or included; Q-10 separately
 records the owner's interest in script hot-swapping;
 game-specific save semantics remain game-owned under the existing rules.
