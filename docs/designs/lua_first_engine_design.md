@@ -488,6 +488,30 @@ Tick duration, cadence, startup/readiness order, state initialization and
 failure escalation remain open. This document's D-15 is distinct from the
 prior Lua design's D-15 (general VM ownership).
 
+### D-16. Fix an explicitly declared gameplay tick duration for each session
+
+Owner answer, **2026-10-21 15:41:26 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: fixed in manifest (Rec.)
+
+Authenticated relay: `het-manager`, message `9i4th4sg63dq3zh3dkzzwpd88e`,
+posted **2026-10-21 15:41:26.402 UTC** in `#het-luafirst`, replying to Q-3c
+message `2u78yvc4amktmvgstv32vigp5a`.
+
+P-12 option A is accepted: a game with a gameplay VM must declare an exact,
+positive tick duration in its manifest. Validate it before Lua and keep it
+fixed until restart. There is no implicit rate; 10 ms was an example only.
+Presentation-only games need no gameplay tick setting. Slow execution or late
+required loads delays progress without dropping ticks or stretching their
+duration. Rendering remains independent.
+
+The manager's 2x fast-forward example illustrated game-defined speed as Lua
+data; it did not approve an engine fast-forward or clock-rate API. Root update
+cadence, presentation timing, pacing mechanics and state-transaction suspension
+rules remain separate. An update's accumulated logical `dt` need not be one
+tick, as P-12 explains.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -658,7 +682,7 @@ startup hook is not selected.
 
 ### P-12. Fix the gameplay tick duration in the session manifest
 
-**Unapproved; active checkpoint Q-3c.** Recommend A: whenever the gameplay
+**Option A accepted by D-16.** Whenever the gameplay
 role exists, the game manifest must declare a positive, exactly representable
 tick duration. Validate it before executing Lua and keep it fixed for the
 session. There is no implicit production simulation rate. A game might choose
@@ -697,6 +721,49 @@ and separates logical grants from elapsed-time pacing. The 10 ms setting in
 `samples/lua-domains` is a sample choice, not a library default. The launcher
 would add validation and configuration wiring; this proposal does not add a
 new scheduler mode.
+
+### P-13. Declare root update cadence alongside the Lua behavior
+
+**Unapproved; active checkpoint Q-3d.** Recommend A: a root behavior with an
+`update` hook declares its cadence in Lua metadata beside that hook. The
+manifest continues to choose the VM role/clock and gameplay tick duration.
+Gameplay cadence is a positive integer number of logical ticks, defaulting to
+one when omitted. Presentation cadence is an explicit positive, exactly
+representable elapsed duration; it has no implicit rate. The metadata grammar
+and field names remain to be specified. This is declarative data, so it does
+not violate D-8's module-top-level effect restriction.
+
+Validate the selected behavior and cadence before its `init`. A presentation
+`update` without an interval, or an invalid/wrong-clock interval, fails startup.
+A behavior without `update` is event-driven and declares no periodic cadence;
+a cadence with no update is an error, rather than a silently unused setting.
+Cadence is captured on instance admission and fixed for that instance's life;
+mutating the exported metadata afterward does not reconfigure it. Additional
+Lua-created routines and any deliberate rescheduling API remain to be designed.
+
+Presentation updates use the existing monotonic timer, independently of
+rendering: a late timer coalesces refresh demand and supplies actual elapsed
+`dt`, without a backlog of missed refreshes. This is a target update interval,
+not guaranteed frames per second; multiple windows need not share a render
+rate. Rendering can reuse the latest published presentation state. Gameplay
+uses the existing logical cadence rules from P-12; choosing every tick does
+not override a currently active/suspended invocation or establish transaction
+commit rules. Event delivery remains independent of periodic update demand.
+
+Alternative B puts these same root cadence settings in the manifest, retaining
+the same defaults, validation, fixed admission and independent elapsed timer.
+It centralizes launcher configuration but splits a behavior from its routine
+schedule. A is recommended because Lua owns the routines; it adds behavior
+metadata validation while reusing the delivered scheduler. B instead adds
+manifest fields and resolves them against the selected Lua exports. Neither
+choice introduces render-frame callbacks or changes the fixed gameplay tick
+duration. A render-driven presentation update would be a revision needing its
+own multiple-window, minimized/no-window and render-backpressure contract.
+
+Evidence: `packages/scripting-lua/README.md` (Cadence) provides `LogicalTicks`,
+`ElapsedEvery`, event-only admission, fixed lifetime intervals, one pending
+elapsed refresh and elapsed `dt` between update starts. The launcher/entry
+adapter must supply that admission configuration from the chosen source.
 
 ## Open questions
 
@@ -782,11 +849,18 @@ escalation still need their own contracts.
 
 #### Q-3c. Is the gameplay tick duration fixed for the session?
 
-The only active checkpoint: P-12 option A (recommended, require an explicit
-positive gameplay tick duration in the manifest and keep it fixed until
-restart) or B (Lua can establish/change it during the session), or an
-owner-specified revision. No numeric default is proposed. Instance cadence,
-presentation timing and transaction suspension rules are separate questions.
+Resolved by D-16: require an explicit positive gameplay tick duration in the
+manifest and keep it fixed until restart, with no numeric default. Instance
+cadence, presentation timing and transaction suspension rules are separate.
+
+#### Q-3d. Does root update cadence live with the Lua behavior or in the manifest?
+
+The only active checkpoint: P-13 option A (recommended, Lua behavior metadata)
+or B (manifest fields), or an owner-specified revision. Both use a positive
+gameplay tick interval, default one, and an explicit presentation elapsed
+interval when an update exists; cadence is fixed at admission and presentation
+updates are independent of rendering. Additional routines, state-transaction
+waits and exact field spellings remain separate choices.
 
 ### Q-4. How are mods discovered, ordered and combined?
 
