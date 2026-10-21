@@ -6,9 +6,16 @@ Keep Lua central to authoring a game while Haskell owns execution, transport,
 failure evidence, and lifetime. This is the canonical continuation of
 `lua_runtime_architecture_notes.md` and the design conversation of 2026-09-16.
 
-Design state: `ready for issue processing`
+Design state: `trusted milestone delivered`; the confined branch stays blocked on Q-5.
 
-Current readiness scope: **LUA-8 only** (D-45), delivered by D-46 as LUA-29,
+The trusted milestone is delivered and owner-accepted (2026-10-21): LUA-29 (#498, PR #501),
+LUA-31 (#503, PR #504), LUA-30 (#499, PR #502) and LUA-8 (#500, PR #509, `b7f3b56e`). It qualifies
+D-23 for one build, platform, scheduling configuration and input log; D-48's failures that begin
+after a tick's accounting cutoff are outside trace equality. No slice is ready for issue processing
+now: the next trusted step is a named consumer's design discussion, and the confined branch
+(LUA-9 to LUA-13, LUA-16, LUA-17) waits for successful Q-5 verdicts on both platforms.
+
+Previous readiness scope, now delivered: **LUA-8 only** (D-45), delivered by D-46 as LUA-29,
 LUA-30, then a narrowed LUA-8, with D-47 adding the library prerequisite LUA-31
 before LUA-30, with D-44 fixing its consumer, intentions,
 UI-progress proof and gameplay randomness. LUA-19 (D-41), delivered by D-42 as LUA-27
@@ -3471,8 +3478,8 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-29. Compose independent UI and gameplay Lua owners in a headless sample
 
-> Ready for issue processing under D-45 and D-46: carved out of LUA-8 with no
-> added scope.
+> Delivered by #498 (PR #501, `21c92058`); carved out of LUA-8 under D-45 and
+> D-46 with no added scope.
 
 - **Outcome:** a small application-owned sample composes a UI VM owner and a
   gameplay VM owner from the public library, with intentions, explicit gameplay
@@ -3515,6 +3522,68 @@ and verified policy, with adversarial regression coverage.
   progress proofs are the barrier example and the CPU-bound example (sized from a calibration, asserted as an ordering
   of the UI's update count between the computation's start and its end). The library, the runner, the CI image and the
   native pins are unchanged; the only workflow change is routing and publishing the new group's receipt.
+
+### LUA-31. Wait for a scheduled owner's accounting of its accepted ticks without a task slot
+
+> Delivered by #503 (PR #504, `170455e3`); a library prerequisite of LUA-30
+> under D-45 and D-47, adding no product behavior.
+
+- **Outcome:** an application can wait, without consuming any scheduler slot,
+  until a scheduled owner has accounted for every grant accepted so far,
+  including the endings that work caused and their escalation callbacks, and so
+  decide a tick's commit, or a stop's outcome, on complete evidence.
+- **Scope:** D-47's LUA-31 description: the supervised wait and its exported
+  result type in `Scheduled`; bounded owner-owned checkpoint state serviced at the
+  owner's boundary; the instance layer's notice when an ending's retirement and
+  escalation are complete; a precise post-boundary seam in the scheduler; the
+  corrected `awaitTicksComplete` summary; Haddock and `packages/scripting-lua/README.md`.
+- **Phase:** trusted integrated acceptance (library prerequisite).
+- **Depends on:** LUA-6, LUA-18, LUA-22, LUA-24, LUA-26.
+- **Ordering:** after LUA-29; precedes LUA-30 and LUA-8.
+- **Relevant decisions:** D-7, D-19, D-22, D-27, D-45, D-46, D-47.
+- **Acceptance signals:** gated examples (no sleeps) in which the wait does not
+  return before a refused wait's closure, `shutdown`, a deferred retirement and
+  the escalation callback's return, each on its own; a tick with no work and a
+  wait with no grant outstanding return; saturated task slots, repeated and
+  cancelled waits (one at a time, on the application thread that owns the
+  `RuntimeControl`, like every supervised wait) and an owner that fails or exits
+  during the wait end correctly; existing `awaitTicksComplete` callers unchanged.
+- **Out of scope:** the sample's use of it (LUA-30); changing
+  `awaitTicksComplete`'s behavior; preliminary failure notification, rollback,
+  stopping peers, timeouts, preemption; the runner and the `lua` subcommand.
+- **Open questions:** None; D-47 fixes its contract.
+- **As delivered (#503):** `awaitScheduledAccounting` in `Hetoimasia.Scripting.Lua.Scheduled`, with its result
+  `AccountingWait` (`AccountingComplete` or `AccountingOwnerEnded`); `packages/scripting-lua/README.md`, "Waiting for the
+  owner's accounting", is the contract. It is a supervised wait on the application thread that owns the
+  `RuntimeControl`, one at a time, refused from a Lua callback; a latched fatal failure is rethrown and wins over a ready
+  completion. It captures one snapshot of the grants accepted when it begins and covers every ending begun by the end of
+  the boundary at which the last of them finished, through `shutdown`, lease and provider retirement, settlement and the
+  escalation callback's return. The owner decides completion: at the end of a boundary with nothing left to do, holding no
+  failure that will end it and not stopping, its thread writes an acknowledgement, and a boundary cut short by a failure
+  writes none. An idle owner is woken to write one, and woken again when a covered ending opened at an earlier
+  acknowledgement has since been accounted for. It costs no task, control or result slot and no per-wait state. An owner
+  that ends yields `AccountingOwnerEnded`, or the rethrown failure when supervision latches it. `awaitTicksComplete` is
+  unchanged. The runner and the `lua` subcommand are unchanged.
+
+### LUA-30. Fail, overload and stop the two-domain sample explicitly
+
+> Delivered by #499 (PR #502, `5ec9ac04`); carved out of LUA-8 under D-45 and
+> D-46 with no added scope, with D-47 and D-48 decided during its delivery.
+
+- **Outcome:** the sample's gameplay failure, overload and every stop path are
+  explicit, with cleanup evidence, and a UI failure never touches gameplay.
+- **Scope:** D-46's LUA-30 list.
+- **Phase:** trusted integrated acceptance.
+- **Depends on:** LUA-29, LUA-31, LUA-22, LUA-23.
+- **Ordering:** after LUA-29 and LUA-31 (D-47); precedes LUA-8.
+- **Relevant decisions:** D-7, D-15, D-24, D-26, D-27, D-43, D-44, D-45, D-46, D-47, D-48.
+- **Acceptance signals:** a failed gameplay session closes admission, discards the
+  failing tick's batch and publishes the failure beside the last good snapshot;
+  accepted intentions equal applied plus rejected plus invalidated plus discarded;
+  overload is counted and never resent; every stop path leaves cleanup evidence.
+- **Out of scope:** determinism qualification and evidence (LUA-8); automatic
+  restart, save/load.
+- **Open questions:** None; D-7, P-8 and D-46 fix its behavior.
 - **As delivered (#499):** the sample now fails, overloads and stops explicitly, extending #498's contract without
   reopening it (`samples/lua-domains/README.md` is the contract). Any script failure on the gameplay owner fails the
   session (every instance's escalation callback answers `Isolate` and records the failure, a faulted task the session
@@ -3546,60 +3615,11 @@ and verified policy, with adversarial regression coverage.
   isolated and reported. The executable gains `--scenario normal|pause|failure|flood|stop` and exit status 1 for a failed
   session. No library, runner, workflow, CI image or native pin changed.
 
-### LUA-31. Wait for a scheduled owner's accounting of its accepted ticks without a task slot
-
-> Ready for issue processing under D-45 and D-47: a library prerequisite of
-> LUA-30, adding no product behavior.
-
-- **Outcome:** an application can wait, without consuming any scheduler slot,
-  until a scheduled owner has accounted for every grant accepted so far,
-  including the endings that work caused and their escalation callbacks, and so
-  decide a tick's commit, or a stop's outcome, on complete evidence.
-- **Scope:** D-47's LUA-31 description: the supervised wait and its exported
-  result type in `Scheduled`; bounded owner-owned checkpoint state serviced at the
-  owner's boundary; the instance layer's notice when an ending's retirement and
-  escalation are complete; a precise post-boundary seam in the scheduler; the
-  corrected `awaitTicksComplete` summary; Haddock and `packages/scripting-lua/README.md`.
-- **Phase:** trusted integrated acceptance (library prerequisite).
-- **Depends on:** LUA-6, LUA-18, LUA-22, LUA-24, LUA-26.
-- **Ordering:** after LUA-29; precedes LUA-30 and LUA-8.
-- **Relevant decisions:** D-7, D-19, D-22, D-27, D-45, D-46, D-47.
-- **Acceptance signals:** gated examples (no sleeps) in which the wait does not
-  return before a refused wait's closure, `shutdown`, a deferred retirement and
-  the escalation callback's return, each on its own; a tick with no work and a
-  wait with no grant outstanding return; saturated task slots, repeated and
-  cancelled waits (one at a time, on the application thread that owns the
-  `RuntimeControl`, like every supervised wait) and an owner that fails or exits
-  during the wait end correctly; existing `awaitTicksComplete` callers unchanged.
-- **Out of scope:** the sample's use of it (LUA-30); changing
-  `awaitTicksComplete`'s behavior; preliminary failure notification, rollback,
-  stopping peers, timeouts, preemption; the runner and the `lua` subcommand.
-- **Open questions:** None; D-47 fixes its contract.
-
-### LUA-30. Fail, overload and stop the two-domain sample explicitly
-
-> Ready for issue processing under D-45 and D-46: carved out of LUA-8 with no
-> added scope.
-
-- **Outcome:** the sample's gameplay failure, overload and every stop path are
-  explicit, with cleanup evidence, and a UI failure never touches gameplay.
-- **Scope:** D-46's LUA-30 list.
-- **Phase:** trusted integrated acceptance.
-- **Depends on:** LUA-29, LUA-31, LUA-22, LUA-23.
-- **Ordering:** after LUA-29 and LUA-31 (D-47); precedes LUA-8.
-- **Relevant decisions:** D-7, D-15, D-24, D-26, D-27, D-43, D-44, D-45, D-46, D-47, D-48.
-- **Acceptance signals:** a failed gameplay session closes admission, discards the
-  failing tick's batch and publishes the failure beside the last good snapshot;
-  accepted intentions equal applied plus rejected plus invalidated plus discarded;
-  overload is counted and never resent; every stop path leaves cleanup evidence.
-- **Out of scope:** determinism qualification and evidence (LUA-8); automatic
-  restart, save/load.
-- **Open questions:** None; D-7, P-8 and D-46 fix its behavior.
-
 ### LUA-8. Prove independent trusted UI and gameplay execution headlessly
 
-> Ready for issue processing under D-45. Its dependencies are delivered, and D-44
-> fixes its consumer, intentions, UI-progress proof and gameplay randomness.
+> Delivered by #500 (PR #509, `b7f3b56e`), the trusted milestone, owner-accepted
+> on 2026-10-21; made ready under D-45, with D-44 fixing its consumer, intentions,
+> UI-progress proof and gameplay randomness.
 
 - **Outcome:** the trusted system milestone demonstrates responsive first-party
   Lua UI during busy finite gameplay, with independent in-process VMs, coherent
@@ -3836,11 +3856,12 @@ graphics implementation. Coordinate the shared Cabal project, CI
 catalog/workflow, and any narrow foundation evidence change; parallel work
 does not authorize conflicting edits or duplicate platform infrastructure.
 
-Q-8 is resolved by D-13/D-14. The next checkpoint is explicit readiness
-signoff for this reconciled design, with Q-5 deliberately open and the confined
-branch blocked. Decision approval alone does not authorize issue processing.
-Once readiness is approved, resume the existing epic/ledger one child per
-invocation, starting with LUA-2; do not recreate #145 or #146–#149.
+Q-8 is resolved by D-13/D-14. The trusted branch is delivered through LUA-8
+(2026-10-21); do not recreate #145 or #146–#149. The next trusted step is not a
+slice of this design: the owner chooses a named consumer and holds the smallest
+design discussion around its next missing behavior (its owner, input and commit
+boundary, lifetime and observable acceptance), or renews the Q-5 feasibility
+investigation if mods are the immediate need.
 Resolve Q-5's deployment obstacles and record both successful platform verdicts
 before drafting LUA-9 through LUA-13 or LUA-16/LUA-17. Neither trusted delivery
 nor completed feasibility issues discharge that gate. Required untrusted-mod
