@@ -589,7 +589,33 @@ The manager described the healthy-UI behavior as matching V-9's rule that an
 unsafe authoritative-state failure stops gameplay while UI can report it.
 That rule is present in the current vision; this answer does not approve the
 separate trust/confinement reconciliation still required by Q-8. Exact error
-schema/exit codes and additional instance/mod failure policy remain open.
+schema and additional instance/mod failure policy remain open; D-20 later
+settles exit codes and console reporting conventions.
+
+### D-20. Use console outcomes and a forced exit on the second stop signal
+
+Owner answer, **2026-10-21 16:08:09 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: 2nd Ctrl-C forces (Rec.)
+
+Authenticated relay: `het-manager`, message `5xxpq68cbqvph5tms5acikrawa`,
+posted **2026-10-21 16:08:09.331 UTC** in `#het-luafirst`, replying to Q-3g
+message `adxdaqvf8x56tfaw4vvwktyvja`.
+
+P-16 option A and its shared outcome/reporting contract are accepted: 0 for
+clean normal quit, 1 for a failed boot/session or host/cleanup failure, 2 for
+bad command-line arguments, and 130 for an orderly signal interruption without
+failure. Orderly outcome precedence is failure over interruption over success.
+Lua quit tears down the entire session idempotently. Diagnostics use stderr;
+authored print uses stdout. Window-close policy remains a later service choice.
+
+The first SIGINT or SIGTERM requests orderly stop. A second signal while
+stopping force-exits 130, skipping remaining hooks, cleanup and flushing,
+including when a failure had already been recorded. This forced path is the
+explicit exception to orderly precedence and cleanup guarantees. Lua receives
+no force-exit capability. The manager's Ctrl-C label does not narrow the
+approved behavior to SIGINT; the question expressly covered SIGINT/SIGTERM.
 
 ## Proposals
 
@@ -981,7 +1007,7 @@ explicit exit is the accepted launcher design, not an existing sample guarantee.
 
 ### P-16. Reuse console outcome conventions and the two-signal escape
 
-**Unapproved; active checkpoint Q-3g.** Recommend A: the new game-launch path
+**Option A accepted by D-20.** The new game-launch path
 uses the existing console outcome conventions, with these explicit mappings:
 
 | Exit status | Game-launch outcome |
@@ -1032,6 +1058,46 @@ Signals) documents 0/1/2/130, failure precedence, stderr/stdout separation and
 the second-signal forced exit. The new launch path needs its own outcome
 mapping and native-resource/partial-start integration; reuse is a design
 choice, not a claim that its lifecycle has already been implemented.
+
+### P-17. Enable mods through an explicit launch-time list of content folders
+
+**Unapproved; active checkpoint Q-4a.** Recommend A: the launcher takes the
+game folder (D-13) and zero or more explicitly selected mod folders. No mod
+selection means the base game alone. The first interface is a repeatable
+command-line argument; `--mod ./my-mod` is illustrative until the CLI contract
+is approved. Do not search user directories or automatically enable neighboring
+folders. An enabled mod is a content root with its own non-executable manifest
+and stable ID, under the same filtering and file rules as the game.
+
+Resolve the selected set and validate its manifests before any Lua starts.
+Duplicate selected roots or duplicate content IDs, including collision with
+the game's ID, fail boot instead of silently choosing a winner. Only selected
+roots are enabled; a missing required dependency fails boot rather than
+searching for, downloading or automatically enabling it. Dependency declaration
+and execution order are the next mod decisions; the order of command-line
+selection does not by itself establish an override or execution order.
+
+Freeze the enabled set for this session. Lua may load more modules/data/textures
+from those roots at runtime under D-9, but enabling/disabling mods requires a
+new session. This does not decide the separate Q-10 script hot-swap proposal.
+Selection-path resolution, packaged distributions, saved launch profiles and
+a graphical mod selector remain separate scope choices; no mod installer or
+automatic dependency resolver is implied.
+
+Alternative B discovers and enables every valid mod folder under a designated
+mods directory. B makes adding a folder enough to enable it, but the directory's
+contents then determine the session's code set; it needs explicit rules for
+unwanted folders and discovery errors. Both still validate identity, pin the
+chosen content and refuse undeclared/missing required roots before Lua.
+A is recommended for an explicit, reproducible launch set and straightforward
+failure attribution; its cost is listing the desired folders at launch, until
+a separately designed saved profile or selector supplies that list.
+
+Evidence: the current executable exposes explicit headless script paths and
+has no game/mod discovery subsystem (`app/Main.hs`, Lua host README, The command
+line). D-6 requires explicit content identities, D-10 pins session content and
+D-13 already establishes manifest-bearing folders. Mod selection is new
+launcher work; none of those decisions alone chooses automatic discovery.
 
 ## Open questions
 
@@ -1152,16 +1218,23 @@ child/mod policy follow.
 
 #### Q-3g. Reuse console outcomes with a second-signal forced-exit escape?
 
-The only active checkpoint: P-16 option A (recommended, console outcome/report
-contract with orderly first signal and forced exit on a second) or B (same
-contract, orderly signals only), or an owner-specified revision. Manifest/CLI
-spelling, native close requests and diagnostic field spellings remain separate.
+Resolved by D-20: P-16 option A, console outcomes/reporting and a forced
+second-signal exit. Manifest/CLI spelling, native close requests and diagnostic
+field spellings remain separate.
 
 ### Q-4. How are mods discovered, ordered and combined?
 
 Settle selection, dependency/load order, conflicts, replacement and override
 scope, attribution of a mod's failure, and the point at which the content set
 is fixed. Trust does not itself define these behaviors.
+
+#### Q-4a. Explicitly enable selected mod folders or automatically discover them?
+
+The only active checkpoint: P-17 option A (recommended, an explicit launch-time
+list; no mods by default) or B (enable valid folders found under a designated
+mods directory), or an owner-specified revision. Identity validation and a
+fixed session set apply to both. Dependency ordering, override policy and mod
+VM/instance mapping follow; CLI field spellings remain illustrative.
 
 ### Q-5. What generic engine state does Lua define and mutate?
 
