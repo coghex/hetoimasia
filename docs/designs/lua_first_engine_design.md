@@ -457,6 +457,37 @@ presentation owner to keep a UI responsive; presentation-only has no
 authoritative gameplay. Hook schema, tick settings, startup order and mod
 mapping remain open. No delivery readiness is implied.
 
+### D-15. Use optional init/update/shutdown on each root behavior
+
+Owner answer, **2026-10-21 15:36:57 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: init/update/shutdown (Rec.)
+
+Authenticated relay: `het-manager`, message `6uwmasf229sxuc2q6sm96nnqjw`,
+posted **2026-10-21 15:36:57.477 UTC** in `#het-luafirst`, replying to Q-3b
+message `hptheckqiw3ufxvbd6f67j9sue`.
+
+P-11 option A is accepted: the selected role export is a behavior table with
+optional `init(self, api)`, `update(self, dt)` and `shutdown(self, reason)`.
+The engine owns the root instance, its connections and leases. A missing
+selected behavior or a non-function hook fails startup; an absent optional
+hook does nothing. Without `update`, the behavior can respond through events.
+Root behaviors do not select the separate one-shot `run` mode.
+
+`init` and `shutdown` are finite and cannot suspend or wait. Initialization
+may request content and return; updates/events may suspend and handle pending
+work. Gameplay `dt` uses logical time and presentation `dt` elapsed time.
+Engine cleanup remains authoritative even without successful Lua shutdown
+(prior Lua design D-27). No extra yielding setup hook is introduced.
+
+The manager illustrated a texture request in `init`, readiness checked in
+`update`, and `shutdown(self, reason)`. The illustrative content/readiness API
+names, including `api.content.texture`, were not approved by this choice.
+Tick duration, cadence, startup/readiness order, state initialization and
+failure escalation remain open. This document's D-15 is distinct from the
+prior Lua design's D-15 (general VM ownership).
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -585,7 +616,7 @@ open; no delivery slices are approved.
 
 ### P-11. Use the existing finite init, paced update and finite shutdown hooks
 
-**Unapproved; active checkpoint Q-3b.** Recommend option A: each selected
+**Option A accepted by D-15.** Each selected
 `gameplay` or `presentation` export is a behavior table with optional
 `init(self, api)`, `update(self, dt)` and `shutdown(self, reason)` functions.
 An absent selected behavior table, or a present hook that is not a function,
@@ -622,7 +653,50 @@ one-shot `run` mode in this proposal; the existing general one-shot instance
 primitive remains available for a separately designed Lua instance API.
 This affects the entry adapter, boot readiness and content-binding examples.
 State initialization/commit, failure escalation and the exact async Lua API
-remain open; no new lifecycle behavior is approved yet.
+remain open. The hook contract above is accepted; the alternative yielding
+startup hook is not selected.
+
+### P-12. Fix the gameplay tick duration in the session manifest
+
+**Unapproved; active checkpoint Q-3c.** Recommend A: whenever the gameplay
+role exists, the game manifest must declare a positive, exactly representable
+tick duration. Validate it before executing Lua and keep it fixed for the
+session. There is no implicit production simulation rate. A game might choose
+10 ms (100 logical ticks per simulated second); that is an example, not an
+approved default. Manifest units/spelling remain part of its format design.
+Presentation-only games need no gameplay tick setting.
+
+Real time paces gameplay, but every granted gameplay tick has that same logical
+duration. Slow execution or late required content delays progress; it does not
+drop simulation ticks or enlarge their duration to catch up. Rendering and
+presentation remain independent. This chooses the simulation clock's unit,
+not a requirement to finish each tick within a real-time deadline. Pacing and
+overload mechanics must preserve those properties.
+
+An instance's `update` cadence is distinct from this tick duration. Existing
+scheduler behavior skips an instance's cadence point when its invocation is
+already active, including a deliberate logical wait; later `dt` accounts for
+the logical time since its previous update finished. Thus this proposal does
+not promise every callback receives exactly one tick of `dt`, does not change
+the delivered instance scheduler, and does not settle which waits are legal
+inside a state transaction. Root cadence, Lua-created routine intervals and
+presentation update timing remain subsequent choices.
+
+Alternative B lets Lua establish and change the simulation tick duration while
+the session runs. That supports games which alter the simulation step itself,
+but needs an ordered change boundary and rules for existing duration-based
+intervals, waits, tick-assigned content/input and replay. A is recommended to
+keep the engine-held per-tick state contract on one stable time unit. Its cost
+is one required game setting and a restart to change that unit; ordinary
+game-specific speeds and time-scale values can still be Lua data, without
+changing the engine clock.
+
+Evidence: `packages/scripting-lua/README.md` (Cadence) already takes an
+application-configured positive tick duration with exact interval conversion,
+and separates logical grants from elapsed-time pacing. The 10 ms setting in
+`samples/lua-domains` is a sample choice, not a library default. The launcher
+would add validation and configuration wiring; this proposal does not add a
+new scheduler mode.
 
 ## Open questions
 
@@ -701,11 +775,18 @@ default domain composition affects entry/lifecycle design; D-14 now settles it.
 
 #### Q-3b. Reuse existing hooks or add a yielding startup phase?
 
-The only active checkpoint: P-11 option A (recommended, optional finite init,
-paced update and finite shutdown, with pending loads handled by updates/events)
-or B (add a yielding startup hook), or an owner-specified revision. State
-initialization, readiness, startup order and failure escalation still need
-their own contracts.
+Resolved by D-15: P-11 option A, optional finite init/shutdown and updates/events
+which may suspend. The manager's content/readiness API spellings remain
+illustrations. State initialization, readiness, startup order and failure
+escalation still need their own contracts.
+
+#### Q-3c. Is the gameplay tick duration fixed for the session?
+
+The only active checkpoint: P-12 option A (recommended, require an explicit
+positive gameplay tick duration in the manifest and keep it fixed until
+restart) or B (Lua can establish/change it during the session), or an
+owner-specified revision. No numeric default is proposed. Instance cadence,
+presentation timing and transaction suspension rules are separate questions.
 
 ### Q-4. How are mods discovered, ordered and combined?
 
