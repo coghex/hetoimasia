@@ -1,8 +1,9 @@
 # Lua-first engine design
 
 Make Lua the authoring and orchestration surface over generic engine services.
-**Current milestone: boot, filtered Lua, content loading, mods, windows, input,
-rendering and textures; no gameplay state store (D-41).**
+**Scope revision under review (P-40/Q-12): milestone 1 is a Lua-driven textured
+quad in a rendered window, with a real logical runtime running stub content;
+mod-aware foundations without mod activation; no ECS/gameplay store.**
 This document carries request `user-het-luafirst-20261021-1435`.
 
 Design state: `exploring`
@@ -10,8 +11,9 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-39/Q-6a: select the service bindings by VM role.
-D-42 accepts the runtime reconciliation with D-41's narrowed scope.
+The current checkpoint is P-40/Q-12: approve the milestone-1 scope revision.
+Q-6a is on hold without an answer. D-42's runtime reconciliation remains the
+accepted baseline; P-40 explicitly proposes which parts deliver in milestone 1.
 This document is not authority to implement or file issues.
 
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
@@ -27,6 +29,10 @@ owner's answers below. The umbrella's relationship to existing epic #145 also
 needs explicit reconciliation; this entry does not request a duplicate epic.
 
 ## Epic contract
+
+The contract below records the D-41/D-42 baseline. The later owner direction
+and proposed replacement definition/acceptance are P-40; do not treat the old
+mod/input scope as the new milestone-1 target while that revision is pending.
 
 - **Goal:** the executable starts Lua without game-specific Haskell and exposes
   protected boot, content, mod, window, input, rendering and texture services.
@@ -124,6 +130,10 @@ are outside this session's authorized work. No subagents are used.
 their historical wording/quotes; working-store clauses are not current scope.
 D-3 and D-30–D-40 are explicitly deferred. P-38 lists affected clauses in all
 other decisions; D-42 accepts its replacement milestone interpretations.
+Each D-entry also has a **proposed delivery tag** for P-40. These tags await
+Q-12 signoff; they do not erase the original decision or decide a later epic's
+delivery order. `M1` means the textured-quad milestone; `L-MODS`, `L-STATE`,
+`L-RELOAD` and `L-PRESENTATION` identify later work, not numbered commitments.
 
 The quotations below arrived in the owner-supplied manager briefing, not as
 answers typed in this designer's pane. The authenticated manager's relay
@@ -132,6 +142,8 @@ the direction, trust and state choices. The original answer times, except
 the approximate direction time, were not supplied; none are invented here.
 
 ### D-1. Lua orchestrates the game without game-specific engine startup
+
+**Proposed delivery (P-40; signoff pending):** M1 / later arcs.
 
 Owner, **2026-10-21 approximately 14:35 UTC**, in the manager's pane:
 
@@ -143,6 +155,8 @@ coverage and the boot protocol remain choices to settle, not implied details.
 
 ### D-2. Game and mod scripts are trusted, with OS functionality removed
 
+**Proposed delivery (P-40; signoff pending):** M1.
+
 Owner, **2026-10-21, exact answer time not supplied**, in the manager's pane;
 relayed through the briefing and the 14:41:43.272 UTC message above:
 
@@ -152,6 +166,8 @@ The filtering profile is settled by D-5 (Q-1). The resulting disposition of the 
 confined branch is separately reserved for explicit reconciliation, Q-8.
 
 ### D-3. Engine holds, Lua defines
+
+**Proposed delivery (P-40; signoff pending):** L-STATE.
 
 **Deferred to a later arc by D-41; not a requirement of this milestone.**
 The original owner direction is preserved below, not deleted or implemented here.
@@ -167,6 +183,8 @@ V-4 guarantees. The generic representation and transaction API are Q-5.
 
 ### D-4. Hold a fresh design session
 
+**Proposed delivery (P-40; signoff pending):** M1 process.
+
 Owner, **2026-10-21, exact answer time not supplied**, in the manager's pane;
 source is the supplied briefing, corroborated by the manager's start relay:
 
@@ -176,6 +194,8 @@ The endpoint is owner signoff on this design and dependency-ordered slices.
 Review and issue processing come later on the manager's instruction.
 
 ### D-5. Use profile A, with no exceptions to the listed removals
+
+**Proposed delivery (P-40; signoff pending):** M1.
 
 Owner answer, **2026-10-21 14:51:42 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
@@ -215,6 +235,8 @@ an additional guarantee of either option.
 
 ### D-6. Address content through explicit roots, without implicit overrides
 
+**Proposed delivery (P-40; signoff pending):** M1 root-identity foundation / L-MODS activation.
+
 Owner answer, **2026-10-21 14:54:46 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
 
@@ -238,6 +260,8 @@ boundaries are still open. Path/symlink rules, module reuse, loading phases and
 save/write APIs are not approved by this answer.
 
 ### D-7. Load each module once per VM and share its exports there
+
+**Proposed delivery (P-40; signoff pending):** M1.
 
 Owner answer, **2026-10-21 14:58:57 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
@@ -270,6 +294,8 @@ undefined. Path normalization/aliases, loading phases, live reload, cache
 bounds and data/texture caching are not settled by this answer.
 
 ### D-8. Acquire resources through lifecycle hooks, not module top level
+
+**Proposed delivery (P-40; signoff pending):** M1.
 
 Owner answer, **2026-10-21 15:04:11 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
@@ -304,6 +330,8 @@ decide when a running session may request new content.
 
 ### D-9. Allow engine-owned content loading while the game runs
 
+**Proposed delivery (P-40; signoff pending):** M1.
+
 Owner answer, **2026-10-21 15:08:24 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
 
@@ -333,6 +361,8 @@ Lua-authored game progression without that restriction. Loading, boot and
 service integration slices are affected; their boundaries remain undefined.
 
 ### D-10. Fingerprint content and fail changed loads for now
+
+**Proposed delivery (P-40; signoff pending):** M1 fingerprint policy / L-RELOAD.
 
 Owner answer, **2026-10-21 15:13:05 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
@@ -365,6 +395,8 @@ contract until an explicit replacement/reload protocol is designed and approved.
 
 ### D-11. Refuse symbolic links inside content roots
 
+**Proposed delivery (P-40; signoff pending):** M1.
+
 Owner answer, **2026-10-21 15:18:24 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
 
@@ -386,6 +418,8 @@ remains open, as do the concrete logical path and root-registration rules.
 The decision affects content inventory and resolution; no slice is defined yet.
 
 ### D-12. Required loads by default, with explicit optional data/textures
+
+**Proposed delivery (P-40; signoff pending):** M1.
 
 Owner answer, **2026-10-21 15:21:13 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
@@ -416,6 +450,8 @@ affected; delivery slices remain undefined.
 
 ### D-13. Launch a game folder with a declarative identity/entry manifest
 
+**Proposed delivery (P-40; signoff pending):** M1 game manifest / L-MODS manifests.
+
 Owner answer, **2026-10-21 15:23:57 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
 
@@ -443,6 +479,8 @@ with the content and gives game/mod roots explicit identities. Boot, root
 registration and mod metadata are affected; slices remain undefined.
 
 ### D-14. Configure supported VM roles in the manifest, with both as the default
+
+**Proposed delivery (P-40; signoff pending):** M1.
 
 Owner answer, **2026-10-21 15:31:39 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
@@ -472,6 +510,8 @@ tick settings and root cadence; startup order and mod mapping remain open.
 No delivery readiness is implied.
 
 ### D-15. Use optional init/update/shutdown on each root behavior
+
+**Proposed delivery (P-40; signoff pending):** M1.
 
 **Revised by D-41:** the hooks stay, but no hook gains a working state service
 in this milestone. Any state-service call prints an unavailable message and
@@ -510,6 +550,8 @@ prior Lua design's D-15 (general VM ownership).
 
 ### D-16. Fix an explicitly declared gameplay tick duration for each session
 
+**Proposed delivery (P-40; signoff pending):** M1.
+
 Owner answer, **2026-10-21 15:41:26 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
 
@@ -533,6 +575,8 @@ state-transaction suspension rules remain separate. An update's accumulated logi
 tick, as P-12 explains.
 
 ### D-17. Keep root update cadence in Lua beside the behavior
+
+**Proposed delivery (P-40; signoff pending):** M1.
 
 Owner answer, **2026-10-21 15:46:36 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
@@ -559,6 +603,8 @@ rescheduling and state-transaction waits remain separate choices.
 
 ### D-18. Initialize concurrently, with independently starting presentation
 
+**Proposed delivery (P-40; signoff pending):** M1.
+
 Owner answer, **2026-10-21 15:59:37 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
 
@@ -583,6 +629,8 @@ quoted under Q-3e. D-19 subsequently settles post-start root failure policy;
 exact diagnostics remain open.
 
 ### D-19. Keep healthy UI available after a gameplay root failure
+
+**Proposed delivery (P-40; signoff pending):** M1.
 
 Owner answer, **2026-10-21 16:03:29 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
@@ -612,6 +660,8 @@ settles exit codes and console reporting conventions.
 
 ### D-20. Use console outcomes and a forced exit on the second stop signal
 
+**Proposed delivery (P-40; signoff pending):** M1.
+
 Owner answer, **2026-10-21 16:08:09 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
 
@@ -637,6 +687,8 @@ approved behavior to SIGINT; the question expressly covered SIGINT/SIGTERM.
 
 ### D-21. Select mods explicitly at launch and fix that set for the session
 
+**Proposed delivery (P-40; signoff pending):** L-MODS.
+
 Owner answer, **2026-10-21 16:10:37 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
 
@@ -660,6 +712,8 @@ ordering; compatibility, mod activation and override policy remain open.
 
 ### D-22. Use required dependencies and deterministic mod activation order
 
+**Proposed delivery (P-40; signoff pending):** L-MODS.
+
 Owner answer, **2026-10-21 16:28:18 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
 
@@ -682,6 +736,8 @@ activation's relationship to root init remain open. P-18 retains those
 boundaries and its evidence.
 
 ### D-23. Share role VMs while giving mods separate owned instances
+
+**Proposed delivery (P-40; signoff pending):** M1 instance foundation / L-MODS activation.
 
 Owner answer, **2026-10-21 16:35:49 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
@@ -707,6 +763,8 @@ Lua design D-23 remains the separate determinism contract.
 
 ### D-24. Require every explicitly declared mod role
 
+**Proposed delivery (P-40; signoff pending):** L-MODS.
+
 Owner answer, **2026-10-21 16:38:07 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
 
@@ -730,6 +788,8 @@ fields, activation order relative to roots and dependency readiness remain
 open; this does not create another VM or alter the game's clocks.
 
 ### D-25. Initialize game roots before their ordered role-mod instances
+
+**Proposed delivery (P-40; signoff pending):** M1 root gates / L-MODS init chains.
 
 Owner answer, **2026-10-21 17:04:22 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
@@ -756,6 +816,8 @@ four evidence links; those current `docs/archive/` targets are preserved.
 
 ### D-26. Apply root failure policy to runtime mod-instance failures
 
+**Proposed delivery (P-40; signoff pending):** M1 instance failure mechanism / L-MODS admission.
+
 Owner answer, **2026-10-21 17:07:18 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
 
@@ -780,6 +842,8 @@ Additional Lua-created instance/task ownership and teardown order remain open.
 
 ### D-27. Keep shutdown self-contained without a mod ordering guarantee
 
+**Proposed delivery (P-40; signoff pending):** M1.
+
 Owner answer, **2026-10-21 17:11:17 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
 
@@ -803,6 +867,8 @@ remain as recorded in P-23. This document's D-27 is the shutdown-order choice;
 prior Lua design D-27 is the underlying engine-owned cleanup contract.
 
 ### D-28. Use game-exposed extension APIs without engine content remapping
+
+**Proposed delivery (P-40; signoff pending):** L-MODS.
 
 Owner answer, **2026-10-21 17:14:08 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
@@ -829,6 +895,8 @@ and the separate hot-swap question remain open.
 
 ### D-29. Match declared game/mod API revisions exactly
 
+**Proposed delivery (P-40; signoff pending):** L-MODS.
+
 Owner answer, **2026-10-21 17:18:05 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
 
@@ -851,6 +919,8 @@ implementation/content-only releases need not. Fingerprints, manifest-format
 version, engine binding compatibility and saves remain separate as P-25 states.
 
 ### D-30. Use engine-owned entities with Lua-defined components
+
+**Proposed delivery (P-40; signoff pending):** L-STATE.
 
 **Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
 
@@ -888,6 +958,8 @@ identity/version rules and list/map support still need their own contracts.
 
 ### D-31. Use bounded nested component data with typed lists and maps
 
+**Proposed delivery (P-40; signoff pending):** L-STATE.
+
 **Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
 
 Owner answer, **2026-10-21 17:28:37 UTC**, through AskUserQuestion in the
@@ -914,6 +986,8 @@ and canonical/query ordering remain open.
 
 ### D-32. Register component schemas at gameplay init and freeze for the session
 
+**Proposed delivery (P-40; signoff pending):** L-STATE.
+
 **Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
 
 Owner answer, **2026-10-21 17:34:31 UTC**, through AskUserQuestion in the
@@ -936,6 +1010,8 @@ separate decisions.
 
 ### D-33. Gameplay reads see earlier staged writes within the tick
 
+**Proposed delivery (P-40; signoff pending):** L-STATE.
+
 **Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
 
 Owner answer, **2026-10-21 18:18:50 UTC**, through AskUserQuestion in the
@@ -957,6 +1033,8 @@ told that what code observes depends on execution order; its deterministic
 contract follows next. No physical storage layout is selected.
 
 ### D-34. Fix gameplay to FIFO scheduling with deterministic admission
+
+**Proposed delivery (P-40; signoff pending):** L-STATE.
 
 **Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
 
@@ -982,6 +1060,8 @@ Exact input assignment, tick completion and suspension rules remain separate;
 this decision supplies no implicit commit permission at scheduler quiescence.
 
 ### D-35. Use explicit checkpoint waits for gameplay spanning ticks
+
+**Proposed delivery (P-40; signoff pending):** L-STATE.
 
 **Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
 
@@ -1012,6 +1092,8 @@ spelling and initial-state construction remain open.
 
 ### D-36. A rejected gameplay state mutation fails the tick
 
+**Proposed delivery (P-40; signoff pending):** L-STATE.
+
 **Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
 
 Owner answer, **2026-10-21 18:41:59 UTC**, through AskUserQuestion in the
@@ -1036,6 +1118,8 @@ invalid mutations. Exact target validity, permissions, limits and query results
 remain separate contracts; this decision chooses rejection escalation.
 
 ### D-37. Entity references may outlive their targets
+
+**Proposed delivery (P-40; signoff pending):** L-STATE.
 
 **Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
 
@@ -1062,6 +1146,8 @@ reference lifetime, not cross-mod write permission, exact ID representation
 or persistence. No automatic relationship cleanup is introduced.
 
 ### D-38. Trusted gameplay instances share state access
+
+**Proposed delivery (P-40; signoff pending):** L-STATE.
 
 **Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
 
@@ -1091,6 +1177,8 @@ remain separate checkpoints.
 
 ### D-39. Write whole component values
 
+**Proposed delivery (P-40; signoff pending):** L-STATE.
+
 **Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
 
 Owner answer, **2026-10-21 19:00:22 UTC**, through AskUserQuestion in the
@@ -1115,6 +1203,8 @@ components were offered as an authoring option, not a physical storage mandate
 or performance guarantee. Exact presence rules and signatures remain open.
 
 ### D-40. Queries return copied, ordered lists with fixed membership
+
+**Proposed delivery (P-40; signoff pending):** L-STATE.
 
 **Deferred to a later arc by D-41; preserved owner decision, outside this milestone.**
 
@@ -1141,6 +1231,8 @@ queries may be refused. Exact limits, identity encoding, result syntax and
 the presentation snapshot-acquisition contract remain open.
 
 ### D-41. Defer gameplay state; deliver an engine-service milestone
+
+**Proposed delivery (P-40; signoff pending):** M1 scope / L-STATE history.
 
 Owner scope decision reported at **2026-10-21 19:21:07 UTC**, in the manager's
 pane, replacing Q-5l. The owner's replies, verbatim and in order:
@@ -1181,6 +1273,8 @@ vision/epic and delivery questions. That audit is P-38/Q-11. D-41 approves the
 scope change itself, not the designer's subsequent reconciliation choices.
 
 ### D-42. Retain logical scheduling and reconcile the service-only runtime
+
+**Proposed delivery (P-40; signoff pending):** M1 runtime / L-MODS feature implementation.
 
 Owner answer, **2026-10-21 19:28:09 UTC**, through AskUserQuestion in the
 manager's pane, verbatim:
@@ -2953,7 +3047,8 @@ only this design document, not the old Lua design, vision, sample or tracker.
 
 ### P-39. Presentation owns window, input and 2D graphics bindings
 
-**Unapproved; only active checkpoint Q-6a.** Recommend A: expose the milestone's
+**On hold by the 19:38:08 owner rescope relay; no answer recorded.**
+The former recommendation was A: expose the milestone's
 window, native input, 2D scene/layer/sprite and GPU texture services to presentation
 root/mod instances. Both VM roles get scoped module/data loading, diagnostics/
 authored output, their own clock/waits, session status and orderly session quit.
@@ -3018,6 +3113,244 @@ input feeds and narrow command ports; the 2D renderer consumes published
 per-window scenes on its graphics owner. The image2d sample composes these
 services in Haskell. This proposal selects their new Lua-role grants, not a
 claim that these bindings already exist. Delivery slices remain unset.
+
+### P-40. Milestone 1: a textured quad over durable Lua/service components
+
+**Unapproved; only active checkpoint Q-12.** This is a proposed scope revision,
+not D-43. The owner's direction and the manager's suggested implementation
+boundary are separated below. Recommend approving the six-part package,
+including the per-decision delivery tags and acceptance requirements.
+
+#### Owner direction and provenance
+
+Owner rescope direction reported at **2026-10-21 19:38:08 UTC** in the manager's
+pane, verbatim:
+
+> ok, to me the milestone 1 that i had in my head was the one i dot for all my graphics projects, that is, a textured quad in a rendered window. here what i was thinking was that the game vm would be a stub, and the ui vm would draw the quad. so there are also a bunch of other things we would need to design for this milestone, but we dont need to do it yet, just finish the epic, then move on to the next, adding design as we go. right? do you have any suggestions for me here?
+
+After the manager suggested tagging decisions by milestone and limiting current
+questions to milestone 1, the owner replied, verbatim:
+
+> ok yes, help me rescope, i was happy with the way we were digging in depth into the lua, i dont want it to just be 'only what the milestone 1 needs', it should be structured to be as complex as it needs to be to accomplish the limited task, but not so simple as to not capture behavior that we need in the component to build upon, that's why i was concerned when you were getting into gameplay, but i still wanted the ecs, we could use it to define the quad, but then you convinced me out of that idea and i think youre right, we can omit that, but the mods? our system needs to be designed with the mod model in mind, but not implement mods yet, just make sure we remember the ownership and timing requrements of the different lua scripts. what do you think?
+
+Authenticated relay: `het-manager`, message `p4h88gp8yi6mxmgn5bkygzufg2`,
+posted **2026-10-21 19:38:08.399 UTC** in `#het-luafirst`, replying to held Q-6a
+message `69mzs6as8k7gaxfmuwtyuz2rue`. Separate times for the two owner replies
+were not supplied. The relay is also retained at
+`~/.local/state/project-manager/hetoimasia/request-user-het-luafirst-20261021-1435-rescope-relay.txt`.
+
+The manager proposed a game folder/manifest, real filtered dual-VM runtime,
+UI texture loading and quad submission, root/instance identity, real clocks,
+ownership/failure rules, deferred mod features and a two-instance test. These
+are proposals incorporated into the package below, not additional owner
+decisions. The earlier ECS recommendation and its later deferral remain in
+the record; this revision neither reintroduces the ECS for scene data nor
+rewrites who recommended it.
+
+#### 1. Concrete milestone and observable acceptance
+
+Milestone 1 is complete when a supplied game content folder and declarative
+manifest launch filtered Lua, a **real logical VM running stub content**, and
+a UI VM which displays a visibly textured quad in a real rendered window.
+Lua specifies the texture reference and quad/scene; Haskell does not hard-code
+that demonstration in the executable or import its game content. The quad is
+renderer scene data, not an ECS entity or substitute gameplay store.
+
+The UI initializer **requests** a texture through the real scoped loader and
+returns without waiting; an update handles readiness and submits the textured
+quad through the existing 2D renderer's scene-publication boundary. The engine
+renders on its independent cadence, not by calling Lua per render frame.
+Window/texture readiness and failure must be real, not a sleep or a successful
+placeholder. Exact window/scene bindings are remaining M1 design, not silently
+fixed by this example. The UI can use a labeled test texture; no production
+art approval is implied.
+
+The logical content has no gameplay rules, world or application data model.
+It may use no-op hooks; qualification fixtures exercise its fixed ticks,
+cadence, ordinary waits and assigned module/data result delivery. The logical
+VM/owner is not a dummy object, fake timer, skipped lifecycle or mocked result
+provider in the shipped composition. Keep D-14's accepted role-aware manifest
+and one-role capabilities; the primary milestone demonstration uses both roles.
+Keeping those capabilities does not change the two-VM acceptance into a
+presentation-only milestone or invent additional/custom VM support.
+
+Acceptance includes observable rendering evidence (an offscreen pixel check
+through the corresponding production texture/scene path, plus an explicit
+native-window demonstration/capture), orderly quit and failure behavior,
+and the two-instance qualification in part 4. A console-only success cannot
+prove the quad. Closing the demonstration's window requests orderly session
+quit; keep native resize/framebuffer handling safe. Broader multi-window close
+policy and generalized keyboard/pointer/text bindings are later presentation
+work, not prerequisites to this quad. Exact commands/evidence and the bounded
+window API are fixed with the M1 slices, using existing native qualification
+and protected retirement rules.
+
+#### 2. Real components, with the mod model built into their boundaries
+
+Build and qualify these as reusable service components, not demo-specific
+shortcuts:
+
+- Content identity is `(content root, relative module/asset path)` with stable
+  game ID and diagnostics. M1 enables the game root only; the registry/resolver
+  and interfaces take explicit root identities rather than assuming every
+  resource belongs to one global folder. Relative and explicitly game-qualified
+  references work; unknown/not-enabled roots are refused. No mod discovery,
+  second enabled mod root or implicit search/override tree is shipped.
+- Filter libraries before Lua evaluation; preserve D-7 module identity/cache,
+  hooks-only acquisition, fingerprint/change refusal, no-symlink confinement
+  to the content root, async pending/result delivery, optional data/texture
+  failures, bounds and cancellation. M1 uses real providers and real data
+  validation/cleanup paths. It need not preload every future resource at boot.
+- Instances are the unit of hook context, request/lease ownership, source/role
+  attribution and cleanup. The game root is one instance per role, not a
+  privileged implementation shortcut. No singleton "current game script"
+  resource bucket or root-only failure path. Adding a mod later must reuse
+  these boundaries; its admission/manifest/dependency features are still real
+  future work, not claimed to be solved merely by having instances.
+- Retain D-42's genuine logical/elapsed clocks, manifest tick validation,
+  cadence, FIFO ready ordering, stable instance admission, ordinary waits,
+  concurrent root startup, early UI and the status-only joint gate. There is
+  no mod-init chain to execute yet; no state commit/checkpoint or message bus.
+- Apply failure policy by role and executing instance: ordinary logical
+  failures stop logical work while healthy UI can report failure; UI/boot/
+  fatal engine failures end the session. Preserve finite hooks, self-contained
+  shutdown, engine-owned request/lease cleanup, native main-thread ownership,
+  GPU-safe retirement, diagnostic attribution, exit outcomes and forced-signal
+  exception. A state-service call retains D-42's diagnostic and terminal exit.
+
+The presentation/error fixture can indicate status with its quad and console
+diagnostics. M1 does not require a font renderer or widget toolkit to prove
+that a healthy UI can observe a logical failure.
+
+#### 3. Designed later, not implemented or continually questioned now
+
+Do not implement mod launch selection, mod manifests, dependency resolution,
+mod role admission/compatibility, game/mod API revision matching, extension
+registration or replacement hooks in M1. Preserve D-21/D-22/D-24/D-28/D-29 and
+the mod-specific halves of D-23/D-25/D-26 as later-arc design decisions. They
+remain owner-approved inputs to that arc, not erased choices or a claim that
+the later design is finished. Its still-open API/conflict questions are asked
+when that milestone is designed. M1 rejects unsupported mod declarations/options
+rather than silently accepting them or pretending to activate a mod.
+
+The game manifest still carries content identity, entry/role routing and timing
+needed by M1; it does not need game/mod compatibility machinery merely because
+D-29 described it. Manifest-format validation is still real M1 work. Lua module
+imports and shared exports are available, without an engine extension registry.
+
+Hot-swap is `L-RELOAD`: retain the owner's interest and D-10's restart-to-use-edits
+policy, without a watcher, migration or replacement implementation. No hot-swap
+scope question blocks M1 readiness. The ECS/store decisions remain `L-STATE`
+under D-41; no gameplay concepts, save system, world digest or replay product
+are a prerequisite. General input, text/widgets, advanced presentation controls,
+3D and audio belong to later presentation/service arcs unless an explicit M1
+component requirement is identified and approved. Do not expand this milestone
+just to exhaust every feature of the existing Haskell libraries.
+
+#### 4. Required two-instance test through the new composition
+
+Use **two real Lua instances from the one game root in the same VM**, admitted
+by a test harness through the same instance construction, content attribution
+and binding/ownership layer used by the launcher. This is not a public Lua
+spawn API or a hidden mod loader. It must exercise the new integration, not
+merely rerun an existing scheduler unit test and infer that the bindings work.
+
+Prove independent `self`/holdings, shared module behavior where promised,
+stable admission and FIFO yield/resume ordering, and instance-specific request,
+resource and diagnostic attribution. Each instance acquires its own resource
+or pending request. A normal test-controlled ending cancels/releases only its
+own holdings and waits for actual provider retirement; the peer's live holdings
+remain usable unless the role-level failure policy intentionally ends it too.
+An injected failure names the correct root/module/role/instance, triggers the
+approved role escalation, and cleans up every affected instance's holdings
+without double release or false completion.
+
+Use controlled providers/leases at native boundaries and explicit gates to
+vary completion order, with real Lua and the real integration code; no timing
+sleeps to prove order. Separate native graphics evidence still proves actual
+texture/GPU retirement and rendered output. A same-root test proves multiple
+script owners, not mod discovery, multi-root activation, dependency graphs or
+all future resource-sharing semantics. Those remain honest later obligations.
+
+#### 5. Per-decision delivery allocation (all tags proposed for Q-12)
+
+`M1` is the textured-quad milestone. `L-MODS`, `L-STATE`, `L-RELOAD` and
+`L-PRESENTATION` name future work areas; they do not assign milestone numbers,
+epics or ordering. Split tags identify the exact part built now. The same
+proposed tag is attached to every D-entry for readers arriving directly there.
+
+| Decision | Proposed delivery | What delivers now / what stays later |
+| --- | --- | --- |
+| D-1 | M1 + later arcs | Lua authors the quad/service orchestration now; broad game features later. |
+| D-2 | M1 | Same trusted script model and its limits. |
+| D-3 | L-STATE | Engine-held gameplay state remains deferred. |
+| D-4 | M1 process | Finish this design to M1 readiness; later arcs get later design passes. |
+| D-5 | M1 | Complete approved filtered-library profile. |
+| D-6 | M1 foundation / L-MODS activation | Real root-qualified identity and one enabled game root; enabling mod roots later. |
+| D-7 | M1 | Once-per-VM module loading, shared exports and failed-import/cycle contract. |
+| D-8 | M1 | Hooks-only acquisition and instance context; no working state service. |
+| D-9 | M1 | Real async runtime content providers and result timing; role grants still need M1 Q-6a. |
+| D-10 | M1 / L-RELOAD | Fingerprint/refuse/restart now; deliberate hot-swap later. |
+| D-11 | M1 | Root/file validation and no symlinks. |
+| D-12 | M1 | Required/optional result policy, bounded failures and cancellation. |
+| D-13 | M1 / L-MODS | Game folder/manifest/content ID now; mod manifests later. |
+| D-14 | M1 | Real dual-role default, role/entry/clock validation and accepted one-role capabilities; demo uses the pair. |
+| D-15 | M1 | Real instance hooks and unavailable-state boundary. |
+| D-16 | M1 | Exact fixed manifest logical tick duration. |
+| D-17 | M1 | Real logical/elapsed cadence, independent renderer. |
+| D-18 | M1 | Concurrent roots, early UI, status-only joint gate and races. |
+| D-19 | M1 | Logical failure/healthy-UI behavior as revised by D-42, no frozen world. |
+| D-20 | M1 | Quit, exit codes, diagnostic streams and signal policy. |
+| D-21 | L-MODS | Explicit mod-list activation; M1 enables base game only. |
+| D-22 | L-MODS | Dependency graph/ID tie-breaking; no fake empty graph feature now. |
+| D-23 | M1 foundation / L-MODS activation | Per-instance ownership/role attribution and two-instance test now; mod admission later. |
+| D-24 | L-MODS | Mod role declarations/required-role checks, not game VM configuration. |
+| D-25 | M1 root gates / L-MODS chains | Root startup sequencing now; dependency-ordered mod init and its mixed-role cases later. |
+| D-26 | M1 failure mechanism / L-MODS admission | Generic instance/role escalation and attribution tested now; actual mod launch/failure fixture later. |
+| D-27 | M1 | Independent ownership/cleanup without shutdown-order reliance. |
+| D-28 | L-MODS | Mod extension registration/replacement APIs later; no content remapping is introduced now. |
+| D-29 | L-MODS | Game/mod API revision compatibility; M1 still validates its manifest format. |
+| D-30 | L-STATE | Entities/components. |
+| D-31 | L-STATE | Component schema/value types. |
+| D-32 | L-STATE | State schema registration. |
+| D-33 | L-STATE | Shared staged state. |
+| D-34 | L-STATE | Stored-state scheduling decision remains deferred; host FIFO is separately approved by D-42 for M1. |
+| D-35 | L-STATE | State checkpoint waits, not ordinary host waits. |
+| D-36 | L-STATE | Rejected state mutations. |
+| D-37 | L-STATE | Entity references. |
+| D-38 | L-STATE | State-write authority. |
+| D-39 | L-STATE | Component replacements. |
+| D-40 | L-STATE | Entity queries. |
+| D-41 | M1 scope / L-STATE history | No store; unavailable guard in M1; preserve future state decisions. |
+| D-42 | M1 runtime / L-MODS features | Real clocks/status/failures/exit now; previous mod implementation breadth narrows as above. |
+
+#### 6. Process, remaining decisions and recommendation
+
+Keep the depth of design where M1 components need it: file safety and identity,
+module/instance boundaries, async readiness/cancellation, window/texture/scene
+ownership, clocks, startup/failure races, shutdown and error reporting. Do not
+equate a small visible result with weak error/lifetime contracts. Reuse the
+delivered host/GLFW/renderer mechanisms rather than build parallel schedulers
+or a demo-only global environment.
+
+After scope approval, reframe/re-ask Q-6a for **M1 service grants only** if needed;
+its pending proposal was not accepted by these owner remarks. Then settle the
+M1 manifest/entry and binding details, window/texture/scene lifecycle, close/
+failure behavior and acceptance, followed by exact vision/#145 reconciliation
+and dependency-ordered one-PR slices. Do not wait to finish mod/gameplay/UI-
+toolkit/hot-swap design before marking this epic ready. Do not file or implement
+anything during this design session; process-design-doc and reviews remain
+separate on manager instruction.
+
+Recommend this allocation. It proves the owner's intended quad milestone with
+real reusable boundaries, while preserving the decisions needed for later mod
+work. Its cost is more than a graphics demo: real async loaders, dual-clock
+failure/cleanup behavior, instance-safe bindings and integration tests must be
+delivered. Its limit is equally explicit: the two-instance test and root-aware
+types do not mean mod support is implemented, and successful rendering does not
+prove a gameplay store. A more limited throwaway launcher would postpone the
+very ownership/timing problems the owner wants solved; implementing all mod
+features now would exceed the requested milestone. Neither is recommended.
 
 ## Open questions
 
@@ -3291,11 +3624,10 @@ obligations; the new binding and service boundaries need concrete contracts.
 
 #### Q-6a. Are graphics/input services presentation-only or available to both roles?
 
-The only active checkpoint is P-39: A (recommended, presentation owns windows,
-input, 2D scenes and texture leases; both roles have module/data/runtime services)
-or B (design an explicit extension allowing logical graphics/input too), or an
-owner-specified revision. A narrows D-9 texture loading to presentation and
-keeps D-42's logical-only arrangement headless; it adds no forwarding channel.
+On hold by the owner rescope relay at 19:38:08 UTC; **no answer recorded**.
+P-39 remains historical pending text. After P-40 scope signoff, reframe/re-ask
+this question for M1 window/texture/scene and runtime grants if it still applies;
+general input/advanced presentation grants must not sneak back into M1 through it.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
@@ -3371,7 +3703,20 @@ Resolved by D-42: all six parts of P-38 and its audit are accepted. The owner
 was offered a presentation-only milestone and did not choose it. Continue
 Q-6, Q-8, Q-9 and remaining milestone APIs, not the deferred Q-5 state agenda.
 
+### Q-12. Approve the milestone-1 scope, delivery tags and acceptance?
+
+The only active checkpoint is P-40's six-part revision: a textured quad in a
+real window from UI Lua, a real logical runtime running stub content, durable
+root/instance/timing/failure components, later mod/state/expanded presentation/
+hot-swap implementation, the required two-instance qualification, and the full
+per-decision delivery allocation. Approve it or identify revisions. Q-6a stays
+held until this scope question is resolved; no answer to it is inferred.
+
 ## Verification strategy
+
+P-40 proposes the M1 acceptance boundary and two-instance qualification above.
+Until Q-12 signoff, the families below are the earlier broader baseline, not
+an instruction to implement mod features or general input for the quad.
 
 Existing constraints to preserve: focused Hspec suites selected by the
 validation catalog; coordinated failure/concurrency checks without timing
@@ -3393,6 +3738,10 @@ Existing sample tests/contracts
 remain historical/current repository behavior, not new milestone deliverables.
 
 ## Delivery plan
+
+P-40 proposes making this document's eventual epic and `LFE-N` slices M1-only.
+Later design areas remain recorded here for continuity, without blocking the
+M1 epic or being silently scheduled inside it. That allocation awaits Q-12.
 
 Zero defined slices. Stop before decomposition while material choices remain
 unanswered. When choices settle, use stable `LFE-N` IDs, dependencies and
