@@ -1076,6 +1076,30 @@ values matter, and the full copy/validation cost for large components. Smaller
 components were offered as an authoring option, not a physical storage mandate
 or performance guarantee. Exact presence rules and signatures remain open.
 
+### D-40. Queries return copied, ordered lists with fixed membership
+
+Owner answer, **2026-10-21 19:12:41 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: copied ordered list (Rec.)
+
+Authenticated relay: `het-manager`, message `9iyjvzk59gqyj4fk94psvu58ts`,
+posted **2026-10-21 19:12:41.614 UTC** in `#het-luafirst`, replying to Q-5k
+message `rf42cgc86ypfmyd7hcm67gvk3a`.
+
+P-36 option A is accepted: required component types select a dense copied
+list of matching references, once each in stable entity-ID order, with
+membership fixed at the call. Empty requirements select all live entities;
+Lua performs further filtering. Values are read separately; later creations
+do not enter the old list and deleted targets leave dangling references.
+An over-budget query is refused in full without failing the tick, never
+silently truncated. No cursor or query-expression language is selected.
+
+The manager illustrated requiring position and health, without prescribing
+game component types. The owner was told the full-copy cost and that large
+queries may be refused. Exact limits, identity encoding, result syntax and
+the presentation snapshot-acquisition contract remain open.
+
 ## Proposals
 
 ### P-1. A common filtered library profile for game and mod content
@@ -2526,7 +2550,7 @@ delivery slices are selected yet.
 
 ### P-36. Queries return bounded, ordered copies of matching entity references
 
-**Unapproved; active checkpoint Q-5k.** Recommend A: a query names a set of
+**Option A accepted by D-40.** A query names a set of
 required component types and returns a dense copied list of entity references
 that have all of them when the call executes. An empty required set selects
 all live entities. Return each matching entity once, in the engine's stable
@@ -2584,6 +2608,77 @@ Evidence: D-30 selected entity/component presence queries but left order/bounds
 open. The lua-domains sample enumerates its fixed entity world by index; it has
 no generic schema query or paged cursor. This proposal adds that missing store
 surface while using D-33/D-37's copied reads and non-owning identity rules.
+Delivery slices remain unset.
+
+### P-37. Build a private initial world during gameplay init
+
+**Unapproved; active checkpoint Q-5l.** Recommend A: start gameplay initialization
+with an empty, engine-owned initial working state. The game root and gameplay
+mods may use the ordinary state read/query/mutation service in their finite
+init hooks, alongside schema registration. They execute in D-25's existing
+root-first/dependency order, and later initializers see earlier successful
+writes. A component type must already have been registered before values of
+that type can be attached. This does not reorder init or add a separate pass
+that registers every schema before the game's root init.
+
+For example, the game registers its health type and creates a player; a later
+mod registers its own type and attaches it to that player. The game's init
+cannot depend on that later mod's registration or initialization effects.
+Work requiring all mods' effects still belongs after the startup gate, as
+D-25 already requires. Whole-value replacement, non-owning references,
+shared authority and bounded copied queries have their normal meanings in
+this private initial state.
+
+After gameplay initialization succeeds, freeze its schema catalog (D-32).
+Only when D-18/D-25's joint startup gate succeeds for all required roots/mods
+does the engine publish the complete initial world and frozen catalog together,
+as state at **tick 0**, and allow gameplay ticks to begin. This publication
+grants no logical duration and runs no update; the first normal grant is tick 1.
+There is no partial publication after each initializer. The concurrently
+running UI keeps the existing starting/not-ready view until this publication;
+it cannot inspect or send gameplay work into the initial candidate.
+
+Any rejected initial-state mutation records boot failure, even if Lua catches
+the binding error, and prevents publication. A later gameplay or presentation
+init failure, early UI failure or stop likewise discards the initial candidate
+under the existing startup failure/gate rules. There is no previously committed
+world to preserve on that path; stop/clean up both roles as D-18/D-25 require,
+rather than switching to D-19's post-startup frozen-world error mode. Schema
+and state validation must be accounted for before the atomic gate/publication
+decision; late init success cannot reopen a failed gate. Lua tables and native
+effects are not rolled back; engine-owned resources still require cleanup.
+
+Init remains finite and cannot yield, checkpoint or wait for content. Assigned-
+tick content results do not become visible early merely because their provider
+finished during init. Use init for small starting records and request content
+there when useful; build content-dependent or expensive worlds during normal
+ticks, using D-35 checkpoints if appropriate. Tick 0 can therefore describe a
+game-authored loading phase rather than a fully populated level. No detailed
+gameplay-init progress channel is added to D-18. The game decides what its own
+loading state means; engine startup readiness does not certify a playable level.
+All initial state remains subject to the configured state/read limits.
+
+Alternative B permits schema registration but no state-value mutation in init.
+After the same startup gate, publish an empty tick-0 world; game/mod updates or
+events then create entities using normal tick transactions. B keeps all value
+mutation under one recurring tick path, but even a small starting world needs
+post-startup orchestration and the UI must handle an initially empty world.
+It does not remove ordered init or permit waiting in init.
+
+A is recommended so small starting state can be assembled naturally in the
+existing initialization chain while the first public world is coherent. Its
+cost is an explicit boot transaction/failure path in addition to recurring
+tick commits, plus the temptation for authors to put too much work in finite
+init. Keep init short; the runtime-loading/checkpoint design is the better
+place for substantial asynchronous generation. Shutdown state access remains
+a separate lifecycle decision. Presentation-only sessions still have no
+authoritative store, and gameplay-only sessions use their own startup gate.
+
+Evidence: D-18/D-25 already require a coherent initial publication after the
+startup gate, D-32 freezes schemas before it, and D-8/D-15 allow finite
+effectful init. Those decisions left initial value construction open. The
+sample starts with a Haskell-created world; this proposal adds generic Lua
+initial-state construction without changing the host's non-yielding init.
 Delivery slices remain unset.
 
 ## Open questions
@@ -2836,11 +2931,17 @@ avoid writing stale copies over intervening changes.
 
 #### Q-5k. Copied entity-query lists or retained paged query cursors?
 
-The only active checkpoint: P-36 option A (recommended, complete bounded lists
-with fixed membership and stable identity order) or B (design paged cursors for
-the same fixed membership), or an owner-specified revision. Component values
-remain separate reads; references do not retain targets. A returns a structured
-read refusal rather than truncating a result that exceeds its budget.
+Resolved by D-40: complete bounded lists with fixed membership and stable
+identity order. Component values are read separately; targets are not retained.
+Read-budget refusals return no partial result and do not by themselves fail a tick.
+
+#### Q-5l. May gameplay init populate the initial world?
+
+The only active checkpoint: P-37 option A (recommended, one private initial
+state built in gameplay init order and published at tick 0 only after the joint
+gate succeeds) or B (schema-only init, empty tick-0 world, values created in
+normal ticks), or an owner-specified revision. Both keep finite non-waiting init
+and the existing concurrent-UI startup/failure contract.
 
 ### Q-6. Which services and UI behavior does Lua drive in this arc?
 
