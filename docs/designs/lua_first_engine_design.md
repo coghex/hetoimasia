@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-42/Q-6b: Lua-requested asynchronous window creation.
+The current checkpoint is P-43/Q-6c: copied scene publication and texture retention.
+D-45 accepts Lua-requested asynchronous window creation.
 D-44 resolves Q-6a revision 2 with UI-only graphics; the original broader
 Q-6a was not answered. D-43 accepts P-40's scope and delivery tags; D-42
 supplies the runtime contract within that M1 boundary.
@@ -1361,6 +1362,33 @@ The manager presented this as matching the owner's UI-VM-draws-the-quad directio
 the owner chose A rather than graphics in both VMs. This selects role grants,
 not exact window readiness, scene format, resource-sharing APIs or general input.
 Continue with M1 binding/lifetime contracts, starting with P-42/Q-6b.
+
+### D-45. Lua requests its window without waiting in init
+
+**Delivery:** M1.
+
+Owner answer, **2026-10-21 20:35:57 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: Lua requests it (Rec.)
+
+Authenticated relay: `het-manager`, message `85rqwhtvh547qbimeeu5k6pzrn`,
+posted **2026-10-21 20:35:57.477 UTC** in `#het-luafirst`, replying to Q-6b
+message `yaigtrzxnueepz5q75c325864i`.
+
+Accept P-42's A: a UI hook requests a window with title and initial logical
+size and receives a pending request. A later update observes success/failure;
+success supplies that instance's window lease after native/graphics setup can
+accept scenes, not after a frame is displayed. An empty window may be visible
+while a texture loads. Creation is required, without optional fallback or
+automatic retry. Cancellation, partial/late acquisition and instance/session
+ending use protected cleanup with no false retirement claim. Existing
+per-instance lease ownership applies; the demo window's close requests orderly
+session quit under D-43.
+
+The manager presented the pending-window machinery and race-test cost. The
+owner chose A rather than manifest/launcher-created windows. Exact API spelling,
+limits, window counts and the remaining scene/texture contracts remain open.
 
 ## Proposals
 
@@ -3469,7 +3497,7 @@ of P-39 are later work under D-43, not carried into this revised question.
 
 ### P-42. Lua requests a window asynchronously and owns the resulting lease
 
-**Unapproved; active checkpoint Q-6b. Delivery: M1.** Recommend A: a presentation
+**A accepted by D-45 through Q-6b. Delivery: M1.** Recommend A: a presentation
 hook requests a window with a title and initial logical dimensions. The engine
 validates the request and reserves bounded per-instance capacity before queuing
 native work. The call returns a pending request without waiting for GLFW or GPU
@@ -3520,6 +3548,67 @@ requires main-thread native handling and verified graphics retirement. The
 [image2d sample](../../samples/image2d/README.md#the-windowed-mode) composes window
 adoption and scene publication in Haskell. These are mechanisms to reuse;
 the asynchronous Lua window binding proposed here is not already delivered.
+
+### P-43. Publish a copied complete scene for one window
+
+**Unapproved; active checkpoint Q-6c. Delivery: M1.** Recommend A: a UI hook
+constructs a plain Lua scene value and publishes it to its ready window. The
+binding copies and validates the complete bounded value and the instance's
+ready texture leases before atomically replacing that window's published scene.
+Mutating the original table afterwards does nothing until another publication.
+The quad is scene data, not an ECS entity. Exact fields and the M1 subset of the
+existing 2D renderer are the next API contract, not approval of every renderer
+feature or of a separate mutable scene-object system.
+
+The accepted scene remains available for independent rendering until replaced
+or the window ends. A static quad needs one publication, not one call per
+rendered frame. Publication does not wait for GPU work or a displayed frame.
+Rendering may skip intermediate publications and adopt the latest complete
+scene; it never observes half a Lua edit. This is presentation coalescing, not
+permission to drop logical ticks or assigned logical results. Multiple calls
+from the owning instance replace in their actual execution order. No other
+instance can publish through its window lease.
+
+Invalid/over-budget scene values or unavailable, retired or wrong-instance
+texture references refuse the entire publication as an ordinary Lua error,
+leaving the previous published scene intact. No partial update, automatic
+placeholder or silent omission is introduced. If uncaught, the script error
+follows the approved UI/boot failure policy; a healthy session is not promised
+to survive an uncaught error merely because an old scene exists. Engine/provider
+or cleanup failures remain fatal rather than becoming recoverable validation
+errors. Exact numeric budgets and error representation remain API details.
+
+Acceptance establishes protected resource obligations before publication is
+exposed to the graphics owner. Reuse the adapter's publication/release barrier
+and per-revision holds: a Lua lease ending cannot destroy a texture still
+needed by an accepted/adopted scene or in-flight GPU work. A replaced scene's
+resources retire only after its actual use completes. Existing scene holds do
+not keep a released Lua handle usable for a later publication. Instance ending
+closes its window/publications and drains its holdings through protected native
+retirement; Lua cleanup hooks and Lua garbage collection are not the lifetime
+proof. This does not select a public early-release API or texture-sharing API.
+
+Alternative B: Lua creates engine-owned mutable scene/sprite objects and sends
+individual edits, with a separate rule for when a complete edited scene becomes
+visible. This can avoid copying a large scene for small changes, but requires
+object identities, ownership, edit validation, publication boundaries and
+teardown beyond the quad's needs. Existing Haskell retained-rendering mechanisms
+can still be used internally or exposed in a later binding extension; A does
+not remove them or require rebuilding static content every rendered frame.
+
+A is recommended because it uses the delivered renderer's per-window snapshot
+model and makes cross-thread publication/retirement concrete. Its cost is full
+copy/validation on each publication; larger or frequently changing scenes may
+later need retained content or smaller update surfaces. M1 must qualify rejected
+publication preserving the prior scene, table mutation after publication,
+coalescing, and replacement/ending while GPU work still references a texture.
+
+Evidence: the [2D host adapter](../../packages/render-2d-vulkan/README.md)
+validates `publish2DSnapshot`, serializes publication with texture release, and
+holds objects by adopted window/revision until released. The
+[per-window host](../gpu_backend.md#a-scene-for-each-window) uses latest-value
+publication without waiting for adoption. The new Lua conversion and ready-lease
+validation are proposed integration work, not existing bindings.
 
 ## Open questions
 
@@ -3804,11 +3893,16 @@ input or mod API is included; B (graphics in both VMs) was not chosen.
 
 #### Q-6b. Does Lua request its window asynchronously or receive one from the launcher?
 
-**Active checkpoint, P-42.** A (recommended): a presentation hook requests a
-window, returns without waiting, and later receives its instance-owned lease
-after native/graphics setup; required failure and protected cancellation apply.
-B: manifest/launcher-created window handed to UI, with Lua creation deferred.
-This selects creation/readiness/ownership behavior, not advanced window features.
+Resolved by D-45: P-42's A, Lua-requested asynchronous creation with required
+failure and protected cancellation. The launcher-created alternative was not
+chosen. Exact API/counts and advanced window features were not selected here.
+
+#### Q-6c. Publish copied scenes or mutate engine-owned scene objects?
+
+**Active checkpoint, P-43.** A (recommended): copied/validated complete scenes,
+atomic per-window replacement, independent latest-scene rendering, whole-call
+refusal and protected texture retention. B: mutable scene/sprite objects with
+a separately designed edit/publication boundary. Neither option introduces ECS.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
