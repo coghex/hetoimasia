@@ -144,7 +144,7 @@ The driver's `stepTick`:
    committed. The wait is one of the supervised waits the sample makes, and those are the application thread's (the
    thread that created the session, which owns the supervision handle), one at a time: `stepTick` and `stopSession`
    refuse any other thread (`DriverOffApplicationThread`, `StopOffApplicationThread`), and another thread asks for a
-   stop with `requestStop`, which waits for nothing, so a stop never waits beside the driver. The admissions of tasks that are in flight are waited for next, and the tasks the
+   stop with `requestStop`, which waits for nothing but a grant that is being issued (a short call), so a stop never waits beside the driver. The admissions of tasks that are in flight are waited for next, and the tasks the
    session admitted are read: the faults of those that have settled are told, though each was told when it happened
    by the task's own watcher, so a task a tick resumed that faulted in it is told here, whatever its watcher and the
    ticket's observation have done, and its failure is that tick's and never the next's (the accounting wait does not
@@ -264,7 +264,12 @@ What the session does, by design (D-26, D-27, P-7):
 * the session **takes no task from the moment it fails or is stopping** (`admitGameplayTask` answers
   `TaskAdmissionClosed`, and nothing reaches the owner or runs), in the transaction that records the failure or
   the stop; an admission that began before is finished, and its task watched, before the stop settles anything and
-  before the ending is published (both wait for it);
+  before the ending is published (both wait for it). **Work handed over after a halt is recorded stops itself**: a task
+  the owner accepted, or whose admission had begun, when the failure or the stop was recorded is not in the registry
+  the quiescence that ran asked to stop, so its registration says, in the same transaction, whether the session still
+  takes work, and its admitter asks for the task's stop when it does not (cancellation-safe, once, whether the halt
+  came before or after: a halt after the registration finds the task, a halt before it is seen by the registration), so
+  a tick the task would keep outstanding completes with no driver or stop left to repair it;
 * the session **holds at most `boundSessionTasks`, three by default (at most sixteen), tasks it has not been told the
   settlement of**: a task holds its slot and result reservation until its settlement is observed, and each task's
   watcher observes it as soon as there is one, so a fourth is refused (`TaskQueueFull`) while three are running or
@@ -364,7 +369,7 @@ reports how the owners ended). It:
    good tick, and the report says so.
 
 A stop asked for from another thread (`requestStop`: it records the intent, closes admission and asks every instance
-and task to stop, and waits for nothing) while a tick is in flight halts that tick (`TickHalted`): the tick commits
+and task to stop, and waits for nothing but a grant that is being issued) while a tick is in flight halts that tick (`TickHalted`): the tick commits
 nothing, and the driver is told so, not left with a defect; the application thread then finalizes the stop with
 `stopSession`, as `runSession` does when a tick is halted.
 
