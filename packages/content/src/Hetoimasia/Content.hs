@@ -63,6 +63,7 @@ module Hetoimasia.Content
   , FailureKind (..)
   , SelectionRefusal (..)
   , LimitKind (..)
+  , NativeOp (..)
   , RootAttribution (..)
   , ContentDefect (..)
   , Defect (..)

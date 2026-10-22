@@ -8,7 +8,6 @@ import qualified Data.ByteString as BS
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Hetoimasia.Content
 import Hetoimasia.Content.Internal.Native
-import Hetoimasia.Content.Internal.Types (NativeOp (..))
 import System.Directory (createDirectory)
 import System.FilePath ((</>))
 import System.Posix.Files (deviceID, fileID, getFileStatus, removeLink)
