@@ -80,7 +80,7 @@ concrete precondition
 - [x] LFE-15. Decode the approved PNG variants within accounted workspace — [#530]
 - [x] LFE-16. Own texture pipeline lanes, leases and byte reservations — [#531]
 - [x] LFE-17. Finish texture requests through real GPU readiness — [#532]
-- [ ] LFE-18. Create and retire instance-owned windows asynchronously
+- [x] LFE-18. Create and retire instance-owned windows asynchronously — [#533]
 - [ ] LFE-19. Validate and copy the fixed M1 scene schema
 - [ ] LFE-20. Publish scenes with completion-safe texture retention
 - [ ] LFE-21. Expose the complete UI-only graphics facade
