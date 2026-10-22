@@ -905,6 +905,9 @@ importHandler loader state restore = do
                   Just (ExportHeld slot _) → pushReady slot
                   Just (ExportBroken failure) →
                     condemn (ModuleRefused (DependencyFailed target failure)) ("the module " <> target <> " failed")
+                  -- Never met while a chain runs: stopping closes the chain first. Refused rather
+                  -- than waited for, in case it ever is.
+                  Just ExportStopped → raiseOrdinary ("the loader stopped before the module " <> target <> " was evaluated")
                   _ → do
                     let chain = lsChain s
                         closing = takeThrough ((== identity) . frameIdentity) chain
