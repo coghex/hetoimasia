@@ -25,12 +25,14 @@
 -- = A job
 --
 -- @Queued@ (in the queue, no file touched) becomes @Issued@ (a worker took it; it may be cancelled
--- but not withdrawn) and then @Done@ (the sink was called, or its call was suppressed because
--- interest was withdrawn), or @Withdrawn@ (it left the queue before issuance, on a cancel or when
--- the pool closed or failed). The three transitions out of @Queued@ and @Issued@ are STM
--- transactions on the one pool state, so a cancel and an issuance cannot both win. 'retired' is
--- true from @Done@ or @Withdrawn@ on: it is the per-job evidence a consumer's own retirement
--- reading is made of, and the one a group drain or a worker's exit cannot give.
+-- but not withdrawn), then @Delivering@ (the worker decided to call the sink, and the job's claim
+-- on its slot is over) and then @Done@ (the sink returned); or @Done@ directly when interest was
+-- withdrawn before delivery and the call is suppressed; or @Withdrawn@ (it left the queue before
+-- issuance, on a cancel or when the pool closed or failed). Every transition out of @Queued@,
+-- @Issued@ and into @Delivering@ is an STM transaction on the one pool state, so a cancel and an
+-- issuance, or a cancel and the decision to deliver, cannot both win. 'retired' is true from @Done@
+-- or @Withdrawn@ on: it is the per-job evidence a consumer's own retirement reading is made of,
+-- and the one a group drain or a worker's exit cannot give.
 --
 -- A worker releases its execution slot as soon as the sink returned. The sink is a consumer's
 -- non-blocking completion whose room the consumer reserved when it admitted the job (for the Lua
@@ -396,6 +398,8 @@ submit pool request = do
     (_, PoolClosed) → pure (Left PoolIsClosed)
     _ → do
       when (psLive st >= psReserved st) $ throwSTM (ContentDefect ReadSubmittedWithoutSlot)
+      -- Sequence numbers order the queue and are never reused or wrapped.
+      when (psNext st == maxBound) $ throwSTM (ContentDefect ReadSequenceExhausted)
       state ← newTVar JobQueued
       let order = (fromEnum (requestPriority request), psNext st)
           job = Job (requestKey request) (requestAllowance request) order (requestSink request) state

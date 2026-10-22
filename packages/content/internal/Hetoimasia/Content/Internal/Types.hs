@@ -329,6 +329,8 @@ data Defect
     ReadWorkerNotStarted !Int
   | -- | A job was submitted to a read pool with no reserved slot left for it.
     ReadSubmittedWithoutSlot
+  | -- | A read pool accepted as many jobs as its sequence numbers can order: they never wrap.
+    ReadSequenceExhausted
   | -- | A read pool's slot was released while every reserved slot was held by a live job, or
     -- more slots were released than were reserved.
     ReadSlotReleasedWhileLive
