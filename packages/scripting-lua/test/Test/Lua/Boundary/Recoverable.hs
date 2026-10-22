@@ -625,6 +625,8 @@ disciplineSpec = describe "discipline" $ do
                 [ ("caught", "assert(pcall(checked.add, 1.5, 2) == false)")
                 , ("arity", "assert(pcall(checked.echo_list) == false)")
                 , ("valid", "assert(checked.add(1, 2) == 3)")
+                , -- Valid, and under pcall: the interpreter or host running out of what the copy needs is a fault of the call, never an ordinary error pcall hides.
+                  ("copy", "local ok, err = pcall(checked.echo_list, {1, 2, 3, 4, 5, 6, 7, 8}); assert(ok, tostring(err))")
                 , ("busy", "checked.admit(1)")
                 ]
                 $ \(label, source) → do
@@ -641,6 +643,7 @@ disciplineSpec = describe "discipline" $ do
     kinds `shouldSatisfy` elem "caught:ok"
     -- Memory ran out where the refusal was built, and was a fault of the call.
     kinds `shouldSatisfy` elem "caught:memory at the boundary"
+    kinds `shouldSatisfy` any (Text.isPrefixOf "copy:memory")
 
 classified ∷ Either SomeException a → Text
 classified = \case
@@ -649,6 +652,7 @@ classified = \case
     | Just (fault ∷ LuaFault) ← fromException failure, faultKind fault == MemoryExhausted → "memory in Lua"
     | Just (fault ∷ BoundaryFault) ← fromException failure → case boundaryReason fault of
         ScriptFailed MemoryExhausted _ → "memory at the boundary"
+        ValueRefused found | refusalRule found `elem` [RuleStack, RuleMemory] → "memory reading the copy"
         other → "unclassified " <> Text.pack (show other)
     | otherwise → "unclassified " <> Text.pack (show failure)
 
