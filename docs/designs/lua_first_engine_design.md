@@ -82,7 +82,7 @@ concrete precondition
 - [x] LFE-17. Finish texture requests through real GPU readiness — [#532]
 - [x] LFE-18. Create and retire instance-owned windows asynchronously — [#533]
 - [x] LFE-19. Validate and copy the fixed M1 scene schema — [#534]
-- [ ] LFE-20. Publish scenes with completion-safe texture retention
+- [x] LFE-20. Publish scenes with completion-safe texture retention — [#535]
 - [ ] LFE-21. Expose the complete UI-only graphics facade
 - [ ] LFE-22. Assemble the generic run command and Lua quad content
 - [ ] LFE-23. Qualify integrated failure and two-instance ownership headlessly
