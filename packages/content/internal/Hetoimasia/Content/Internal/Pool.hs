@@ -101,14 +101,16 @@ import Control.Exception
   , fromException
   , mask
   , mask_
+  , displayException
   , rethrowIO
   , throwIO
   , tryWithContext
   )
-import Control.Monad (forM, forM_, unless, when)
+import Control.Monad (forM, forM_, when)
 import Data.ByteString (ByteString)
 import Data.Functor ((<&>))
 import Data.Map.Strict (Map)
+import Data.Maybe (fromMaybe, isNothing)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word64)
 import Hetoimasia.Content.Internal.Identity.Types (ContentKey)
@@ -134,9 +136,9 @@ import qualified Data.Text as Text
 -- profile's worker count (two for M1) and the queue capacity its consumers' reservations add up
 -- to.
 data PoolSpec = PoolSpec
-  { specWorkers ∷ !Int
+  { poolWorkers ∷ !Int
   -- ^ Worker threads: the most reads in flight at once.
-  , specSlots ∷ !Int
+  , poolSlots ∷ !Int
   -- ^ The most jobs queued, issued or finishing at once: the capacity 'reserveSlot' hands out.
   }
   deriving (Eq, Show)
@@ -238,7 +240,12 @@ data JobState
     -- over; the job is not retired until the sink returned.
     JobDelivering
   | JobDone
-  | JobWithdrawn
+  | -- | Left the queue unissued and has been withdrawn with no sink to tell: retired.
+    JobWithdrawn
+  | -- | Left the queue unissued because the pool closed or failed, and its sink is yet to be
+    -- told: not retired until it has been. The flag says interest was withdrawn meanwhile, which
+    -- suppresses the call if it has not been made.
+    JobNotifying !Bool
 
 data Job = Job
   { jobKey ∷ !ContentKey
@@ -262,7 +269,7 @@ data PoolPhase = PoolOpen | PoolClosed
 -- Invariant: @queued <= live <= reserved <= capacity@ and @active <= live@.
 data PoolState = PoolState
   { psPhase ∷ !PoolPhase
-  , psFailure ∷ !(Maybe SomeException)
+  , psFailure ∷ !(Maybe (ExceptionWithContext SomeException))
   , psQueue ∷ !(Map (Int, Word64) Job)
   , psNext ∷ !Word64
   , psReserved ∷ !Int
@@ -303,8 +310,8 @@ status pool = do
     PoolStatus
       { statusPhase = psPhase st
       , statusFailed = maybe False (const True) (psFailure st)
-      , statusWorkers = specWorkers (poolSpecOf pool)
-      , statusCapacity = specSlots (poolSpecOf pool)
+      , statusWorkers = poolWorkers (poolSpecOf pool)
+      , statusCapacity = poolSlots (poolSpecOf pool)
       , statusReserved = psReserved st
       , statusQueued = Map.size (psQueue st)
       , statusActive = psActive st
@@ -313,7 +320,7 @@ status pool = do
 
 -- | Wait, in STM, for the first defect a worker or sink raised, so a supervisor can compose it
 -- into a supervised wait.
-awaitFailure ∷ ReadPool → STM SomeException
+awaitFailure ∷ ReadPool → STM (ExceptionWithContext SomeException)
 awaitFailure pool = readTVar (poolState pool) >>= maybe retry pure . psFailure
 
 -- The scope -------------------------------------------------------------------------------
@@ -338,7 +345,7 @@ withPoolWith hooks spec reader body = withWorkerGroup $ \group → do
   let pool = ReadPool spec var reader hooks
   result ← mask $ \restore → do
     outcome ← tryWithContext @SomeException $ restore $ do
-      forM_ [0 .. specWorkers spec - 1] $ \index → do
+      forM_ [0 .. poolWorkers spec - 1] $ \index → do
         hookWorkerStart hooks index
         startWorker group (workerDefinition (Text.pack ("content-read-" <> show index)) (\_ → pure ()) (\token () → runWorker pool token)) >>= \case
           Started _ → pure ()
@@ -361,7 +368,7 @@ withPoolWith hooks spec reader body = withWorkerGroup $ \group → do
       -- A worker's failure after the body began its return is still the scope's failure.
       _ ← closeWorkerGroup group
       latched ← readTVarIO var
-      maybe (pure value) throwIO (psFailure latched)
+      maybe (pure value) rethrowIO (psFailure latched)
 
 -- Capacity -------------------------------------------------------------------------------
 
@@ -371,7 +378,7 @@ withPoolWith hooks spec reader body = withWorkerGroup $ \group → do
 reserveSlot ∷ ReadPool → STM Bool
 reserveSlot pool = do
   st ← readTVar (poolState pool)
-  if psReserved st >= specSlots (poolSpecOf pool)
+  if psReserved st >= poolSlots (poolSpecOf pool)
     then pure False
     else True <$ writeTVar (poolState pool) st {psReserved = psReserved st + 1}
 
@@ -394,7 +401,7 @@ submit pool request = do
   when (requestAllowance request < 0) $ throwSTM (ContentDefect (BadReadCeiling (requestAllowance request)))
   st ← readTVar (poolState pool)
   case (psFailure st, psPhase st) of
-    (Just failure, _) → pure (Left (PoolHasFailed failure))
+    (Just (ExceptionWithContext _ failure), _) → pure (Left (PoolHasFailed failure))
     (_, PoolClosed) → pure (Left PoolIsClosed)
     _ → do
       when (psLive st >= psReserved st) $ throwSTM (ContentDefect ReadSubmittedWithoutSlot)
@@ -437,6 +444,7 @@ cancel (ReadTicket var job) =
     JobIssued _ → CancelInFlight <$ writeTVar (jobState job) (JobIssued True)
     JobDelivering → pure CancelInFlight
     JobDone → pure CancelTooLate
+    JobNotifying _ → CancelInFlight <$ writeTVar (jobState job) (JobNotifying True)
     JobWithdrawn → pure CancelTooLate
 
 -- | Whether the job has retired: its sink has been called (or suppressed), or it was withdrawn.
@@ -456,15 +464,47 @@ retired (ReadTicket _ job) =
 -- The whole loop is masked and a read runs unmasked inside it, so the only places an asynchronous
 -- exception can arrive are the wait for a job (nothing is issued yet) and the read itself (whose
 -- job is then settled as abandoned). A job taken off the queue is therefore always settled.
+--
+-- A worker is never allowed to end quietly while its pool is open: whether it returned because it
+-- was asked to stop, was terminated by an asynchronous exception nobody in this scope sent, or
+-- raised, the pool is then failed (it will not run what is queued, and the queued jobs are told),
+-- so nothing accepted is left pending behind a pool that looks healthy. The scope's own exit closes
+-- the pool before it stops or cancels a worker, so that exit is not a failure.
 runWorker ∷ ReadPool → StopToken → IO ()
-runWorker pool token = mask $ \restore →
-  let loop =
-        atomically (takeNext pool token) >>= \case
-          Nothing → pure ()
-          Just job → do
-            runJob restore pool job `onSynchronousFailure` latchFailure pool
-            loop
-   in loop
+runWorker pool token = mask $ \restore → do
+  outcome ← tryWithContext @SomeException (loop restore)
+  healthy ← atomically (isHealthy pool)
+  ended ←
+    if healthy
+      then Just <$> (exitFailure outcome >>= latchFailure pool)
+      else pure Nothing
+  case (outcome, ended) of
+    (Left caught, Nothing) → rethrowIO caught
+    (_, Just failure) → rethrowIO failure
+    (Right (), Nothing) → pure ()
+  where
+    loop ∷ (∀ x. IO x → IO x) → IO ()
+    loop restore =
+      atomically (takeNext pool token) >>= \case
+        Nothing → pure ()
+        Just job → do
+          runJob restore pool job `onSynchronousFailure` latchFailure pool
+          loop restore
+
+-- | Open and with no latched failure.
+isHealthy ∷ ReadPool → STM Bool
+isHealthy pool = do
+  st ← readTVar (poolState pool)
+  pure (psPhase st == PoolOpen && isNothing (psFailure st))
+
+-- | What an exit of a worker from an open pool is, as a failure with its context.
+exitFailure ∷ Either (ExceptionWithContext SomeException) () → IO (ExceptionWithContext SomeException)
+exitFailure outcome = do
+  let defect = case outcome of
+        Right () → ReadWorkerEndedOpen
+        Left (ExceptionWithContext _ failure) → ReadWorkerTerminated (displayException failure)
+  raised ← tryWithContext @SomeException (throwIO (ContentDefect defect))
+  either pure (\() → throwIO (ContentDefect defect)) raised
 
 -- | The next job, or 'Nothing' when this worker should end.
 takeNext ∷ ReadPool → StopToken → STM (Maybe Job)
@@ -549,29 +589,42 @@ settle pool job result pending = do
       st ← readTVar (poolState pool)
       writeTVar (poolState pool) st {psActive = psActive st - 1, psLive = psLive st - 1}
 
--- | Run an action; if it raises a synchronous exception, do this with it, then raise it.
-onSynchronousFailure ∷ IO () → (SomeException → IO ()) → IO ()
+-- | Run an action; if it raises a synchronous exception, give it to the handler, which answers the
+-- exception to raise (the same, or one that keeps the handler's own failure beside it).
+onSynchronousFailure ∷ IO () → (ExceptionWithContext SomeException → IO (ExceptionWithContext SomeException)) → IO ()
 onSynchronousFailure action handler =
   tryWithContext @SomeException action >>= \case
     Right () → pure ()
-    Left caught@(ExceptionWithContext _ failure) → do
-      unless (isAsynchronous failure) $ mask_ (handler failure)
-      rethrowIO caught
+    Left caught@(ExceptionWithContext _ failure)
+      | isAsynchronous failure → rethrowIO caught
+      | otherwise → mask_ (handler caught) >>= rethrowIO
   where
     isAsynchronous failure = case fromException failure of
       Just (SomeAsyncException _) → True
       Nothing → False
 
--- | The first defect: latch it, refuse every later job, and tell every queued job so that none
--- stays pending.
-latchFailure ∷ ReadPool → SomeException → IO ()
-latchFailure pool failure = do
+-- | The first defect: latch it with its context, refuse every later job, and tell every queued job
+-- so that none stays pending. Answers the exception to raise: the defect itself, or, when telling a
+-- queued job's sink raised, the defect with that failure kept beside it (also what the pool keeps).
+latchFailure ∷ ReadPool → ExceptionWithContext SomeException → IO (ExceptionWithContext SomeException)
+latchFailure pool caught@(ExceptionWithContext _ failure) = do
   withdrawn ← atomically $ do
     st ← readTVar (poolState pool)
     case psFailure st of
-      Just _ → pure []
-      Nothing → withdrawQueue pool st {psFailure = Just failure}
-  tellAll withdrawn (ReadDefect failure)
+      Just _ → pure Nothing
+      Nothing → Just <$> withdrawQueue pool st {psFailure = Just caught}
+  case withdrawn of
+    Nothing → pure caught
+    Just jobs →
+      tellAll jobs (ReadDefect failure) >>= \case
+        Nothing → pure caught
+        Just notification → do
+          composed ← composeCleanup (Just caught) [("content read sink", notification)]
+          let final = fromMaybe caught composed
+          atomically $ do
+            st ← readTVar (poolState pool)
+            writeTVar (poolState pool) st {psFailure = Just final}
+          pure final
 
 -- | Close admission and withdraw what is queued, telling each job it was abandoned.
 closePool ∷ ReadPool → IO ()
@@ -579,23 +632,30 @@ closePool pool = mask_ $ do
   withdrawn ← atomically $ do
     st ← readTVar (poolState pool)
     withdrawQueue pool st {psPhase = PoolClosed}
-  tellAll withdrawn ReadAbandoned
+  tellAll withdrawn ReadAbandoned >>= maybe (pure ()) rethrowIO
 
--- | Empty the queue into the withdrawn state, in the same transaction that records the new state.
+-- | Empty the queue into the notifying state, in the same transaction that records the new state.
+-- A withdrawn job is not retired until its sink has been told ('tellAll'); its claim on its slot
+-- ends here, as a delivering job's does, because the sink may be accounted as soon as it has run.
 withdrawQueue ∷ ReadPool → PoolState → STM [Job]
 withdrawQueue pool st = do
   let jobs = Map.elems (psQueue st)
-  forM_ jobs $ \job → writeTVar (jobState job) JobWithdrawn
+  forM_ jobs $ \job → writeTVar (jobState job) (JobNotifying False)
   writeTVar (poolState pool) st {psQueue = Map.empty, psLive = psLive st - length jobs}
   pure jobs
 
--- | Tell every job in order; each is told whatever another's sink raised, and the first failure is
--- raised with the others kept beside it.
-tellAll ∷ [Job] → ReadResult → IO ()
+-- | Tell every job in order, each retired only after its own sink returned, and unless interest was
+-- withdrawn first. Each is told whatever another's sink raised; the first failure is answered with
+-- the others kept beside it.
+tellAll ∷ [Job] → ReadResult → IO (Maybe (ExceptionWithContext SomeException))
 tellAll jobs result = do
-  outcomes ← forM jobs $ \job → tryWithContext @SomeException (jobSink job result)
+  outcomes ← forM jobs $ \job → do
+    deliver ← atomically (readTVar (jobState job) <&> \case JobNotifying False → True; _ → False)
+    told ← tryWithContext @SomeException (when deliver (jobSink job result))
+    atomically (writeTVar (jobState job) JobWithdrawn)
+    pure told
   case [failure | Left failure ← outcomes] of
-    [] → pure ()
+    [] → pure Nothing
     first : others → do
       composed ← composeCleanup (Just first) [("content read sink", other) | other ← others]
-      rethrowIO (maybe first id composed)
+      pure (Just (fromMaybe first composed))

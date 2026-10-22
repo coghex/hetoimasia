@@ -13,6 +13,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Content.ReadPool (PoolStatus (..))
 import Hetoimasia.LuaEngine.Profile (ByteLimit (..), Profile, fixedM1Profile)
+import Hetoimasia.Scripting.Lua.Admission (newRequestHandles)
 import Hetoimasia.Scripting.Lua.Provider (ProviderDiagnostics (..))
 import Test.Hspec
 import Test.LuaEngine.Data.Support
@@ -131,6 +132,16 @@ bank = describe "the byte bank" $ do
       (started, busy) `shouldBe` (1, 1)
       total ← (+) <$> charged first <*> charged second
       total `shouldBe` 64
+
+  it "refuses a bank that is not the profile's own per-VM bank: a larger one would admit more than the VM may retain" $
+    withSession small (1, 1) realReader files $ \session _ _ → do
+      handles ← newRequestHandles
+      requests ← either (\refused → expectationFailure (show refused) >> error "unreachable") pure (m1Requests small handles)
+      larger ← newByteBankFor fixedM1Profile
+      fmap (const ()) (dataService requests (ssInventory session) (ssPool session) larger)
+        `shouldBe` Left (BankDisagreesWithProfile (64 * 1024 * 1024) 128)
+      own ← newByteBankFor small
+      fmap (const ()) (dataService requests (ssInventory session) (ssPool session) own) `shouldBe` Right ()
 
   it "checks its arithmetic: a request larger than the room left is refused without wrapping, and a return of more than was charged is a defect" $
     withSession small (1, 1) realReader files $ \session _ runtime → do

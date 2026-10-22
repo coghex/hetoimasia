@@ -57,7 +57,7 @@ module Hetoimasia.Content.ReadPool
   ) where
 
 import Hetoimasia.Content.Internal.Inventory.Types (Inventory)
-import Hetoimasia.Content.Internal.Pool hiding (withPool, withPoolWith)
+import Hetoimasia.Content.Internal.Pool hiding (poolSlots, poolWorkers, withPool, withPoolWith)
 import qualified Hetoimasia.Content.Internal.Pool as Pool
 import Hetoimasia.Content.Internal.Root (ContentRoot)
 
@@ -77,3 +77,11 @@ withReadPool = Pool.withPool
 -- fail a read, and says so where it does. Whatever the reader borrows must outlive the scope.
 withReadPoolUsing ∷ PoolSpec → VerifiedRead → (ReadPool → IO a) → IO a
 withReadPoolUsing = Pool.withPoolWith noHooks
+
+-- | The worker threads of a specification: the most reads in flight.
+specWorkers ∷ PoolSpec → Int
+specWorkers = Pool.poolWorkers
+
+-- | The slot capacity of a specification.
+specSlots ∷ PoolSpec → Int
+specSlots = Pool.poolSlots

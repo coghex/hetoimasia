@@ -329,6 +329,12 @@ data Defect
     ReadWorkerNotStarted !Int
   | -- | A job was submitted to a read pool with no reserved slot left for it.
     ReadSubmittedWithoutSlot
+  | -- | A worker of a read pool ended while the pool was open, without having been stopped or
+    -- cancelled by the scope: it ran nothing further.
+    ReadWorkerEndedOpen
+  | -- | A worker of a read pool was terminated by an asynchronous exception while the pool was
+    -- open: the exception, rendered.
+    ReadWorkerTerminated !String
   | -- | A read pool accepted as many jobs as its sequence numbers can order: they never wrap.
     ReadSequenceExhausted
   | -- | A read pool's slot was released while every reserved slot was held by a live job, or

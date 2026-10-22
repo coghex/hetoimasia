@@ -59,7 +59,6 @@
 module Hetoimasia.LuaEngine.Data
   ( -- * The byte bank
     ByteBank
-  , newByteBank
   , newByteBankFor
   , byteBankLimit
   , byteBankCharged
@@ -175,7 +174,8 @@ data ByteBank = ByteBank
   , bankCharged ∷ !(TVar Word64)
   }
 
--- | A bank with this much room.
+-- | A bank with this much room. Private: the only bank a VM's service accepts is the profile's own
+-- ('newByteBankFor'), so no production path tunes the limit.
 newByteBank ∷ Word64 → IO ByteBank
 newByteBank limit = ByteBank limit <$> newTVarIO 0
 
@@ -232,9 +232,9 @@ data DataService = DataService
 data DataServiceRefused
   = -- | The profile's data ceiling does not fit the machine integer a read is asked with.
     CeilingNotRepresentable !Word64
-  | -- | The bank is smaller than the data ceiling: the largest permitted file could never be
-    -- admitted. The bank's limit and the ceiling.
-    BankBelowCeiling !Word64 !Word64
+  | -- | The bank is not the profile's per-VM bank (@RetainedDataBytesPerVm@): its limit and the
+    -- profile's. A larger one would admit more than the VM may retain, a smaller one less.
+    BankDisagreesWithProfile !Word64 !Word64
   deriving (Eq, Show)
 
 -- | The service of one VM. @M1Requests@ carries the validated profile whose 'DataBytes' is the
@@ -242,10 +242,11 @@ data DataServiceRefused
 dataService ∷ M1Requests → Inventory → ReadPool → ByteBank → Either DataServiceRefused DataService
 dataService requests inventory pool bank
   | ceiling' > fromIntegral (maxBound ∷ Int) = Left (CeilingNotRepresentable ceiling')
-  | bankLimit bank < ceiling' = Left (BankBelowCeiling (bankLimit bank) ceiling')
+  | bankLimit bank /= retained = Left (BankDisagreesWithProfile (bankLimit bank) retained)
   | otherwise = Right (DataService requests inventory pool bank ceiling')
   where
     Bytes ceiling' = bytesLimit (m1Profile requests) DataBytes
+    Bytes retained = bytesLimit (m1Profile requests) RetainedDataBytesPerVm
 
 -- | The most bytes one file or result may have.
 dataCeiling ∷ DataService → Word64

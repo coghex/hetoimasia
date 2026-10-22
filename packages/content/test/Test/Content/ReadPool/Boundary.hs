@@ -25,6 +25,15 @@ spec = do
       rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "PoolSpec"
 
+  it "rejects a client that updates a validated specification by record update" $
+    withClient "Client.hs" updateClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess → expectationFailure ("the client compiled, so a specification can be rewritten:\n" <> clientOutput outcome)
+      clientOutput outcome `shouldContain` "specWorkers"
+      clientOutput outcome `shouldNotContain` "Could not find module"
+
   it "rejects a client that reaches the pool's coordination hooks" $
     withClient "Client.hs" hooksClient $ \compile → do
       outcome ← compile Typecheck
@@ -66,6 +75,17 @@ specClient =
     , ""
     , "forged ∷ Int → Int → PoolSpec"
     , "forged = PoolSpec"
+    ]
+
+updateClient ∷ String
+updateClient =
+  unlines
+    [ "module Client (zeroed) where"
+    , ""
+    , "import Hetoimasia.Content.ReadPool (PoolSpec, specWorkers)"
+    , ""
+    , "zeroed ∷ PoolSpec → PoolSpec"
+    , "zeroed spec = spec {specWorkers = 0}"
     ]
 
 hooksClient ∷ String

@@ -4,8 +4,12 @@ module Test.Content.ReadPool.Lifecycle (spec) where
 
 import Control.Concurrent (killThread)
 import Control.Concurrent.STM (atomically)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), throwIO)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, rethrowIO, throwIO, tryWithContext)
+import Data.Maybe (fromMaybe)
 import Hetoimasia.Content.Inventory (readVerified)
+import Hetoimasia.Content.Internal.Types (ContentDefect (ContentDefect), Defect (ReadWorkerTerminated))
+import Hetoimasia.Foundation.Resource (cleanupFailureLabel, cleanupFailuresInContext, composeCleanup)
 import Hetoimasia.Content.Internal.Native (Boundary (ReadOpened), productionSeam)
 import Hetoimasia.Content.Internal.Pool (PoolHooks (..), noHooks, withPoolWith)
 import Hetoimasia.Content.ReadPool
@@ -30,6 +34,7 @@ import Test.Hspec
 spec ∷ Spec
 spec = do
   closing
+  notifying
   failing
   starting
   draining
@@ -72,6 +77,54 @@ closing = describe "closing the scope" $ do
         Left (PoolHasFailed failure) → expectationFailure ("expected a closed pool, found a failed one: " <> show failure)
         Right _ → expectationFailure "expected a closed pool to refuse the job"
       seenOutcomes outcomes `shouldReturn` []
+
+-- Notifying -------------------------------------------------------------------------------
+
+notifying ∷ Spec
+notifying = describe "a withdrawn job" $ do
+  it "is not retired until its sink has returned, when a defect withdraws it" $ do
+    probe ← newProbe
+    closeGate probe "boom.bin"
+    held ← newGate
+    withInventory [("boom.bin", "x"), ("next.bin", "y")] $ \_ inventory → do
+      outcomes ← newOutcomes
+      failure <-
+        failsWith @IOError $
+          withReadPoolUsing (poolOf 1 4) (probeReader probe (failingReader (userError "boom"))) $ \pool → do
+            _ ← accepted pool (request inventory outcomes OrdinaryRead 64 "boom.bin")
+            awaitStarted probe 1
+            queued ← accepted pool (ReadRequest (keyOf inventory "next.bin") 64 OrdinaryRead (\_ → holdAt held))
+            openGate probe "boom.bin"
+            -- The defect withdrew the queued job and its sink is running: the job is not retired,
+            -- so a consumer that retires its request on it cannot dispose its borrows yet.
+            awaitHeld held
+            atomically (retired queued) `shouldReturn` False
+            atomically (cancel queued) `shouldReturn` CancelInFlight
+            releaseGate held
+            awaitRetired queued
+      (\(ExceptionWithContext _ raised) -> show raised) failure `shouldContain` "boom"
+
+  it "is not retired until its sink has returned, when the closing scope withdraws it" $ do
+    probe ← newProbe
+    closeGate probe "a.bin"
+    held ← newGate
+    tickets ← newEmptyMVar
+    withInventory [("a.bin", "a"), ("b.bin", "b")] $ \root inventory → do
+      outcomes ← newOutcomes
+      scope ← spawn $
+        withReadPoolUsing (poolOf 1 4) (probeReader probe (readVerified inventory root)) $ \pool → do
+          _ ← accepted pool (request inventory outcomes OrdinaryRead 64 "a.bin")
+          awaitStarted probe 1
+          queued ← accepted pool (ReadRequest (keyOf inventory "b.bin") 64 OrdinaryRead (\_ → holdAt held))
+          putMVar tickets queued
+      queued ← takeMVar tickets
+      awaitHeld held
+      atomically (retired queued) `shouldReturn` False
+      isFinished scope `shouldReturn` False
+      releaseGate held
+      awaitRetired queued
+      openGate probe "a.bin"
+      awaitDone scope
 
 -- Failing -------------------------------------------------------------------------------
 
@@ -116,6 +169,56 @@ failing = describe "a defect" $ do
             _ ← awaitSTM (awaitFailure pool)
             pure ()
       show failure `shouldContain` "injected sink failure"
+
+  it "fails the open pool when a worker is terminated by an asynchronous exception the scope did not send, and tells what is queued" $ do
+    probe ← newProbe
+    closeGate probe "a.bin"
+    withInventory [("a.bin", "a"), ("b.bin", "b")] $ \_ inventory → do
+      outcomes ← newOutcomes
+      ExceptionWithContext _ failure ←
+        failsWith @ContentDefect $
+          withReadPoolUsing (poolOf 1 4) (probeReader probe (\_ _ → throwIO ThreadKilled)) $ \pool → do
+            running ← accepted pool (request inventory outcomes OrdinaryRead 64 "a.bin")
+            awaitStarted probe 1
+            queued ← accepted pool (request inventory outcomes OrdinaryRead 64 "b.bin")
+            -- Interest in the running read is withdrawn, so its sink is suppressed; then the reader
+            -- is terminated. Nothing but the pool's own failure can tell the queued job.
+            atomically (cancel running) `shouldReturn` CancelInFlight
+            openGate probe "a.bin"
+            awaitRetired queued
+            map snd <$> seenOutcomes outcomes >>= \seen → length seen `shouldBe` 1
+            seenOutcomes outcomes >>= \seen → case seen of
+              [(_, SeenDefect _)] → pure ()
+              other → expectationFailure ("expected the queued job told of a defect, found " <> show other)
+            _ ← awaitSTM (awaitFailure pool)
+            awaitRetired running
+      case failure of
+        ContentDefect (ReadWorkerTerminated _) → pure ()
+        other → expectationFailure ("expected the worker's termination, found " <> show other)
+
+  it "keeps the reader's cleanup evidence and a queued sink's failure beside it" $ do
+    probe ← newProbe
+    closeGate probe "a.bin"
+    let failingWithEvidence _ _ = do
+          Left primary ← tryWithContext @SomeException (throwIO (userError "primary reader failure"))
+          Left secondary ← tryWithContext @SomeException (throwIO (userError "reader cleanup failure"))
+          composed ← composeCleanup (Just primary) [("injected reader cleanup", secondary)]
+          rethrowIO (fromMaybe primary composed)
+    withInventory [("a.bin", "a"), ("b.bin", "b")] $ \_ inventory → do
+      outcomes ← newOutcomes
+      ExceptionWithContext trail failure ←
+        failsWith @IOError $
+          withReadPoolUsing (poolOf 1 4) (probeReader probe failingWithEvidence) $ \pool → do
+            _ ← accepted pool (request inventory outcomes OrdinaryRead 64 "a.bin")
+            awaitStarted probe 1
+            queued <- accepted pool (ReadRequest (keyOf inventory "b.bin") 64 OrdinaryRead (\_ → throwIO (userError "queued sink failure")))
+            openGate probe "a.bin"
+            awaitRetired queued
+            _ ← awaitSTM (awaitFailure pool)
+            pure ()
+      show failure `shouldContain` "primary reader failure"
+      map cleanupFailureLabel (cleanupFailuresInContext trail) `shouldContain` ["injected reader cleanup"]
+      map cleanupFailureLabel (cleanupFailuresInContext trail) `shouldContain` ["content read sink"]
 
 -- Starting -------------------------------------------------------------------------------
 
