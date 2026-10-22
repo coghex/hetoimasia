@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-55/Q-2j: module evaluation order and queued dependencies.
+The current checkpoint is P-56/Q-2k: module capacity and dependency-limit failures.
+D-58 accepts one import chain per VM and queued-dependency evaluation timing.
 D-57 accepts VM-owned shared module jobs with per-instance waiters.
 D-56 accepts resumable module-level imports and explicit loading from hooks.
 D-55 accepts bounded byte-for-byte data-file results.
@@ -1695,7 +1696,7 @@ D-7's once/cache/cycle/failure rules and D-8's top-level effect limits remain.
 The manager presented the resumable-loader/scheduling cost and the fact that
 a non-yielding module may still hang its VM. The owner chose imports in Lua
 rather than a declared dependency list. D-57 subsequently settles shared-load
-ownership/cancellation; evaluation order, limits and exact module API remain open.
+ownership/cancellation and D-58 evaluation order; limits and exact module API remain open.
 
 ### D-57. A module job belongs to its VM and outlives cancelled waiters
 
@@ -1726,8 +1727,46 @@ and the non-preemptible trusted-script limit remain unchanged.
 
 The manager presented the cost: unwanted loading, effects and tick delay may
 continue until completion or VM stop. The owner chose this over stopping at
-the last dependent's departure. Evaluation order, including a dependency that
-already has a later queued job, is the next explicit checkpoint P-55/Q-2j.
+the last dependent's departure. D-58 subsequently settles evaluation order,
+including a dependency that already has a later queued job.
+
+### D-58. Evaluate one import chain per VM, reusing queued dependencies
+
+**Delivery:** M1; qualifies D-56/D-57's assigned evaluation timing.
+
+Owner answer, **2026-10-22 01:28:15 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: one import chain (Rec.)
+
+Authenticated relay: `het-manager`, message `jzs7v3cvthmm7q9y5fq98up626`,
+posted **2026-10-22 01:28:16.097 UTC** in `#het-luafirst`, replying to Q-2j
+message `62yjdxh32u3nzqc5gk6y9ksmis`.
+
+Accept P-55's A: one module evaluation chain at a time per VM, independent
+roots in logical tick/sequence order or UI request-admission order, imports
+depth-first in Lua call order. Reads may overlap, but a later ready file
+cannot overtake an earlier root. Reuse a queued dependency within the active
+chain exactly once; reject cycles with their path and expose no partial exports.
+
+The manager's relay abbreviated UI ordering as "arrival order". On checking
+that wording, authenticated clarification `nhngg4fwmmtw7eyucmf9vp9zd2`, posted
+**2026-10-22 01:29:12.946 UTC**, confirmed it meant request-admission order,
+not file-read completion order. The owner had also been told, verbatim,
+"files may be read in parallel, but a later file that's ready can't jump ahead."
+This clarifies the presentation of the approved option; no new choice was asked.
+
+The owner accepted the timing refinement: A due at tick 10 may import and
+evaluate B already requested for tick 12. B's separate request still settles
+at tick 12, while its ready/failed cache entry exists from the dependency
+evaluation; failure of A's dependency affects A at A's position. This does not
+permit execution driven early by native arrival or duplicate evaluation.
+
+Eligible UI hooks and stop/control still run while the UI loader waits for
+source bytes. A due unfinished logical chain holds its tick, with the other
+VM independent. The manager explained the cost: a slow dependency delays
+unrelated module evaluation in that VM. The owner chose this over interleaved
+module loads. Capacity behavior and exact bounds remain to be settled.
 
 ## Proposals
 
@@ -4604,7 +4643,7 @@ and qualified explicitly, not inferred from existing request cleanup.
 
 ### P-55. Evaluate one module dependency chain at a time in each VM
 
-**Unapproved; active checkpoint Q-2j. Delivery: M1.** Recommend A: serialize
+**A accepted by D-58 through Q-2j. Delivery: M1.** Recommend A: serialize
 module evaluation within each VM. Independent root jobs start in assigned
 tick/sequence order for the logical VM, and admission order for the UI VM.
 An earlier root waiting for source bytes holds its place; faster I/O for a
@@ -4634,8 +4673,8 @@ another wait for source bytes. Cancellation still removes only a waiter.
 Thus the earliest actual evaluation is at an eligible importing chain's
 position, or at the module's own scheduled root position if reached first;
 native arrival alone never starts logical top-level execution early. The
-owner must approve this qualification, rather than silently treating D-56's
-original timing sentence as if it already covered dependency promotion.
+owner approved this qualification in D-58; D-56's original timing sentence
+alone did not cover dependency promotion.
 
 Serialization applies to module evaluation, not every task in the VM. While
 the UI loader waits for I/O, eligible UI instance hooks and stop/control work
@@ -4667,6 +4706,76 @@ UI hook progress during source waits and VM stop. The existing host's FIFO
 ready ordinals govern scheduling (see the
 [host scheduler](../../packages/scripting-lua/README.md#policies)); they do not
 already provide this module queue or dependency-promotion protocol.
+
+### P-56. Refuse permanent module limits without waiting for cache space
+
+**Unapproved; active checkpoint Q-2k. Delivery: M1.** D-7/D-57 retain module
+identity and ready/failed outcomes until VM end. Unlike request slots, those
+entries do not become free after taking a result, cancelling a waiter or
+releasing a texture. Recommend A: use a bounded per-VM identity cache counting
+pending, evaluating, successful and failed modules, including entries and
+dependencies. No eviction, unloading or re-evaluation is introduced in M1.
+The numeric limit, source-byte limit and dependency-depth limit belong to the
+forthcoming concrete bounds/API package; this checkpoint selects their failure
+semantics, not unmentioned numbers or a configuration mechanism.
+
+For a hook requesting a new, uncached identity when that permanent cache is
+full, refuse before admission with an ordinary Lua error identifying the
+module limit. No request handle, job, source read or failed-cache entry for
+that refused identity is created. Lua may catch this pre-admission error and
+continue using already-known modules; uncaught errors use the normal instance
+failure policy. It is not a temporary `busy` result, and waiting or cancelling
+other requests will not free a module identity. Existing cached modules and
+joining already-admitted jobs do not require another identity slot, although
+a new instance request still needs its own request/result capacity.
+
+Reserve a root's needed request/result and new identity/job metadata together
+before accepting it. Temporary exhaustion of reclaimable request capacity
+uses D-53's nonfatal `busy` semantics: no half-reservation or hidden retry.
+Successful root admission does not promise room for every dependency the Lua
+code might later discover. There is no speculative dependency declaration or
+unbounded reservation of an unknown graph.
+
+If an admitted chain discovers a new dependency with no identity space, or
+exceeds its source-byte or dependency-depth bound, fail that module load with
+an attributed limit reason and import chain. Do not wait for cache space or
+retry the evaluation. Retain the failed outcome for each already-admitted
+module whose required dependency fails; allocate no extra cache entry for a
+dependency refused before admission. Already-completed dependencies stay
+cached. Catching the failed required import inside module code cannot turn
+the containing failed load into a successful cache entry. Partial Lua effects
+are not undone. Existing D-52/D-57 rules govern required waiters, eligible
+logical settlement, diagnostics without waiters and boot failure.
+
+This prevents an active chain from waiting for space that only its own
+completion could release. Bounded source workers/buffers must likewise make
+progress or refuse explicitly, not deadlock behind the suspended chain. Their
+exact concurrency and reservation arrangement is part of provider design;
+this is not a promise that admission pre-reserves all native resources.
+
+Alternative B makes permanent module-capacity exhaustion a VM failure even
+when detected before a new root request is admitted. That gives every such
+limit violation the same terminal treatment, but a speculative extra module
+request would stop its role/session despite all existing modules remaining
+usable. Accepted-load failure behavior otherwise stays the same.
+
+A is recommended because it distinguishes work never admitted from a required
+load that has failed after acceptance, consistent with D-53. Its cost is an
+explicit permanent-limit error alongside `busy`, plus the possibility that
+an accepted root later fails on a discovered dependency limit. Failed entries
+consume the lifetime budget too; authors must fit the session's module set,
+and cannot recover slots by dropping Lua references. This bounds loader
+bookkeeping and source inputs, not arbitrary allocations or execution in
+trusted Lua.
+
+Qualification covers full-cache root refusal with no work/reservation leak,
+cached access and joining at the limit, temporary request saturation, a
+dependency hitting the last slot, depth/source failures, caught required-import
+failure, retained completed dependencies, cancelled waiters and logical timing.
+Evidence: the current host's `Internal/Module.hs` bounds modules at 256 and
+each source at 1 MiB, and refuses before loading; those are existing facts,
+not automatically the new loader's selected numbers. Its loaded-handle map
+does not supply this pending/failed cache or dependency-limit supervision.
 
 ## Open questions
 
@@ -4744,13 +4853,20 @@ VM stop. Queued-dependency evaluation order is a separate checkpoint.
 
 #### Q-2j. Serialize module evaluation chains or interleave independent loads?
 
-**Active checkpoint, P-55.** A (recommended): one active dependency chain per
-VM, ordered roots and depth-first imports; reuse a queued dependency within
-the active chain. Explicitly qualify D-56/D-57: a dependency may evaluate at
-its importer's earlier logical position while its independent request still
-settles at its own assigned position. B: interleave independent evaluations
-and design the cross-job wait/cycle/effect-order contract. A costs delay behind
-slow dependencies, including for unrelated modules whose source is ready.
+Resolved by D-58: P-55's A, one chain per VM with ordered roots, depth-first
+imports and reuse of queued dependencies. D-56/D-57 are explicitly qualified:
+a dependency may evaluate at its importer's earlier logical position while
+its independent request still settles at its own assigned position. UI order
+is request-admission order, as clarified by the manager's authenticated record.
+
+#### Q-2k. How does a full module cache or a dependency limit fail?
+
+**Active checkpoint, P-56.** A (recommended): permanent cache exhaustion before
+root admission is an ordinary Lua error, with no work started; an admitted
+chain hitting a dependency/source/depth limit fails the required load and
+caches admitted failures, without waiting, eviction or retry. Temporary
+request pressure still returns `busy`. B: permanent cache exhaustion fails
+the VM even before root admission. Concrete numeric bounds remain open.
 
 ### Q-3. What is the generic executable's boot and session contract?
 
