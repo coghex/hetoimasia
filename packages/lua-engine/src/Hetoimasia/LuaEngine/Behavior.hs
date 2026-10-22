@@ -50,7 +50,7 @@ import Hetoimasia.LuaEngine.Profile
   ( ByteLimit (ModuleSourceBytes)
   , Bytes (Bytes)
   , Count (Count)
-  , CountLimit (ModuleIdentitiesPerVm)
+  , CountLimit (ModuleChainDepth, ModuleIdentitiesPerVm)
   , Profile
   , bytesLimit
   , countLimit
@@ -72,17 +72,22 @@ behaviorField = \case
   Presentation → "presentation"
 
 -- | The ceilings a VM holds its export modules to under a profile: the source a new
--- evaluation may be given, and the module identities the VM may hold, failed and
--- in-progress ones included. The fixed M1 profile's are one mebibyte and 256.
+-- evaluation may be given, the module identities the VM may hold, failed and
+-- in-progress ones included, and how many module frames an import chain holds at once,
+-- the root counted. The fixed M1 profile's are one mebibyte, 256 and 32; they are the
+-- Lua host's module loader's limits as well, so that a loader configured from the profile
+-- holds exactly these and the profile has one source for them.
 exportLimits ∷ Profile → ExportLimits
 exportLimits profile =
   ExportLimits
     { exportMaxSourceBytes = fromIntegral sourceBytes
     , exportMaxIdentities = fromIntegral identities
+    , exportMaxChainDepth = fromIntegral depth
     }
   where
     Bytes sourceBytes = bytesLimit profile ModuleSourceBytes
     Count identities = countLimit profile ModuleIdentitiesPerVm
+    Count depth = countLimit profile ModuleChainDepth
 
 -- | A cadence field of a behavior table.
 data CadenceKey = EveryTicks | EverySeconds

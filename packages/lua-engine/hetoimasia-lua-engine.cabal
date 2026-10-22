@@ -71,6 +71,7 @@ test-suite lua-engine-tests
     other-modules:
         Test.LuaEngine.Behavior
         Test.LuaEngine.Boundary
+        Test.LuaEngine.Loader
         Test.LuaEngine.Manifest.Examples
         Test.LuaEngine.Manifest.Schema
         Test.LuaEngine.Manifest.Syntax

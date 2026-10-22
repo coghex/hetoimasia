@@ -57,18 +57,21 @@ spec = describe "the M1 behavior selection" $ do
       behaviorField Presentation `shouldBe` "presentation"
 
   describe "limits" $ do
-    it "take the fixed profile's source and identity ceilings: one mebibyte and 256" $
-      exportLimits fixedM1Profile `shouldBe` ExportLimits {exportMaxSourceBytes = 1048576, exportMaxIdentities = 256}
+    it "take the fixed profile's source, identity and chain ceilings: one mebibyte, 256 and 32" $
+      exportLimits fixedM1Profile `shouldBe` ExportLimits {exportMaxSourceBytes = 1048576, exportMaxIdentities = 256, exportMaxChainDepth = 32}
 
     it "follow a smaller validated profile" $ do
       let spec' = profileSpec fixedM1Profile
           smaller =
             spec'
               { specBytes = \limit → if limit == ModuleSourceBytes then Bytes 4096 else specBytes spec' limit
-              , specCounts = \limit → if limit == ModuleIdentitiesPerVm then Count 64 else specCounts spec' limit
+              , specCounts = \limit → case limit of
+                  ModuleIdentitiesPerVm → Count 64
+                  ModuleChainDepth → Count 8
+                  _ → specCounts spec' limit
               }
       case validateProfile smaller of
-        Right profile → exportLimits profile `shouldBe` ExportLimits {exportMaxSourceBytes = 4096, exportMaxIdentities = 64}
+        Right profile → exportLimits profile `shouldBe` ExportLimits {exportMaxSourceBytes = 4096, exportMaxIdentities = 64, exportMaxChainDepth = 8}
         Left problems → expectationFailure ("the smaller profile was refused: " <> show problems)
 
   describe "gameplay cadence" $ do
