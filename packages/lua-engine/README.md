@@ -16,7 +16,8 @@ is pure and returns a plain value or a bounded refusal. The boot checkpoint read
 through the verified read the caller passes it (normally the content inventory's), and
 imports no module that opens a file itself. The **M1 request adapter**
 (LFE-7) is the `request` sublibrary beside it, in a source directory of its own
-so that this one stays pure: see [below](#the-m1-request-adapter).
+so that this one stays pure: see [below](#the-m1-request-adapter). The **raw-data provider**
+(LFE-10) is the `data` sublibrary, for the same reason: see [below](#the-raw-data-provider-lfe-10).
 
 The library depends on `hetoimasia-foundation` (its `Duration`, checked
 nanoseconds from 1 to 2^64 − 1), on the Lua host and its runtime
@@ -35,6 +36,7 @@ composition to this package; they are not here.
 | `Hetoimasia.LuaEngine.Behavior` | `behaviorField`, `exportLimits`, `cadenceOf`, `behaviorRequest`; `CadenceRefusal` |
 | `Hetoimasia.LuaEngine.Boot` | `contentConfiguration`, `bootCheckpoint`, `bootCheckpointFrom`, `checkManifestPinned`; `Checkpoint`, `ResolvedEntry`, `BootRefusal` |
 | `Hetoimasia.LuaEngine.Request` (sublibrary `request`) | the M1 request policy over a validated profile and the exact common result adapter: `m1Requests`, `startM1`, `m1ArgumentCheck`, `m1RequestBindings` |
+| `Hetoimasia.LuaEngine.Data` (sublibrary `data`) | the raw-data provider over the content package's read pool and the per-VM byte bank: `dataService`, `dataEndpoint`, `dataKey`, `startData`, `dataArgumentCheck`, `newByteBankFor` |
 
 Every other module is hidden. A client of the pure boundary imports the manifest, the profile and the behavior modules.
 
@@ -428,6 +430,101 @@ profile; the message, path and copied-value bounds, where a reply that breaks th
 envelope; a service's own permanent refusal said apart from busy; and required and optional failure through the
 adapter. They build every fixture beside the suite from public host modules; none is imported from the host's suites.
 
+## The raw-data provider (LFE-10)
+
+`Hetoimasia.LuaEngine.Data` (the `data` sublibrary) answers a request for the exact bytes of an inventoried file. It is a
+**composable typed endpoint**, not a Lua API: the eventual `api.content.data(path [, options])` (LFE-12) parses its
+arguments with `dataKey`, builds its binding from `startData` and `dataArgumentCheck`, and declares `dataValueSchema`
+(a byte string) for the common `take`. Nothing here is installed in a VM, and no temporary public Lua spelling exists; the
+examples drive it through a binding of their own. It imports the profile, the [request adapter](#the-m1-request-adapter),
+the content package's public modules (`Identity`, `Inventory`, `ReadPool`) and the host's public modules, and nothing of a
+game, window, GPU or console.
+
+### What a script receives
+
+A successful `take` yields `{status = "success", value = BYTES}`: the whole file copied to an ordinary Lua string, with NUL,
+invalid UTF-8, a byte order mark, line endings and an empty file preserved. No text decoding, normalization, parser,
+execution, serialization or Lua resource lease is involved, and the string is ordinary Lua memory after `take`: it stays
+usable after the request retires and needs no release. The result and its envelope fit the profile's crossing: 8 MiB of
+data plus the record around it is well inside 16 MiB. Nothing is cached: every request of a path repeats the verified
+read.
+
+An expected failure carries one of `not_found` (not an inventoried regular file: absent, a directory, another case, or a
+file added after the scan), `content_changed` (the content is no longer what the scan pinned, or no longer a permitted
+type), `io_error` or `too_large`, with the root and path of the file and a bounded message. A malformed address is a
+permanent argument error before any admission (`dataKey` refuses it), never a content failure. The host's required and
+optional rules, timing and cancellation apply unchanged: nothing is duplicated in the provider.
+
+### What is reserved, and when
+
+One transaction admits a request (the host's `startAdmitted`) and reserves, before the provider is handed anything:
+
+| Reservation | Owner | For which requests |
+|---|---|---|
+| Request and result records, per-instance, per-VM and owner places | the host | every request |
+| The file's known length in the VM's `ByteBank` (`data bytes`) | this service, one bank per VM: the profile's `RetainedDataBytesPerVm` (64 MiB), made only by `newByteBankFor`; `dataService` refuses a bank whose limit is not the profile's | an eligible file (a zero-byte file reserves none but still a slot) |
+| One queue slot of the session's pool (`io queue`) | the pool | an eligible file |
+
+A bank without room is the host's busy answer, naming the bank, with **no file work and nothing left reserved**
+(`catchSTM` undoes a half-made reservation: a request that wins the bytes and loses the slot leaves no byte charged).
+Two VMs asking at once for the pool's last slot get exactly one acceptance. A path the inventory does not hold, and a file
+over the data ceiling (`DataBytes`, 8 MiB), are **not** busy: they are accepted with only their records and fail as
+`not_found` / `too_large` without a worker, a file open or a payload byte, even while the byte bank is full. The inventory
+is immutable, so classifying a request when it is asked and when it is handed over cannot disagree.
+
+### The byte bank and the buffer
+
+The bytes charged for a request are the one allocation the verified read produces (see
+[the pool](../content/README.md#the-buffer)). They are charged from admission, while the job waits, while a worker reads,
+while a finished result is held for its logical tick or waits for `take`, and while a cancelled request's read is
+retiring. They are returned only when the host returns the credit: after the result was taken or discarded **and** the
+provider's work is retired, at an accounted boundary of the owner, never from a worker's thread. Cancelling, losing the
+Lua handle, `ready`, `wait` or the instance ending is not evidence of retirement. The same allocation is never charged
+twice, and no separately retained engine payload is left uncharged. The bank bounds the payload this service retains, not
+Lua's or the process's memory. One bank belongs to one VM and is shared by its instances; one instance's cleanup discards
+only its own results; a VM that ends returns its own bytes and neither stops the pool nor touches another VM's bank.
+
+### Settlement
+
+Both logical and presentation instances may ask. The provider passes the requesting metadata (necessity, source, offset)
+to the host and keeps no timing or failure latch of its own: on logical time a finished result is held, hidden from `ready`,
+`take` and `wait`, until its assigned position (default offset 1, init at tick 0), a late read holds its tick, and a cancel
+before the position wins; on arrival a result settles when it comes. A worker never waits for any of that: it releases its
+execution slot when the sink returns.
+
+### Failure and teardown
+
+Failures known at admission use no worker. A reader, pool or sink defect is a `ProviderFailure`, which the host treats as
+a provider defect: it fails the owner at its next boundary, required or optional alike, and is never given a code. A pool
+that cannot take a job (closed or failed) raises from the endpoint's submit, so the host takes the request back whole
+(credits returned unused) and fails the owner. Nothing here retries, restarts, polls or times out; a read that never
+returns keeps its owners live. The pool outlives the owners: the session builds it inside the scopes of the root and
+inventory and encloses the owners' supervision with it.
+
+### State
+
+| State | Owner | Writers | Readers | Lifetime |
+|---|---|---|---|---|
+| `ByteBank` charge | one VM's `DataService` | the host's admission (`creditReserve`) and the owner's boundaries (`creditRelease`) | `byteBankCharged` | the VM's service; zero at rest |
+| Pool slots and jobs | the session's pool ([content](../content/README.md#the-verified-read-pool-lfe-10)) | the same, and the pool's workers for the jobs | `status`, `retired` | the pool's scope |
+| Request records, holds, places | the host | the host | diagnostics | per [admission](../scripting-lua/README.md#atomic-request-admission) |
+
+### What proves it
+
+`Test.LuaEngine.Data.*` (group `test.lua-engine`) run real instances on real supervised owners, a real temporary content
+root, inventory and pool, and the production reader behind gates. Real-file evidence: exact bytes for empty, NUL,
+non-UTF-8, BOM and line-ending content, taken once and usable after retirement; repeated independent reads; a file at the
+ceiling and one byte over; the fixed profile's exact 8 MiB inside the 16 MiB crossing; same-size edit, growth, removal and
+replacement by a directory, including edits made after a job was queued; a file that really cannot be opened (mode 000;
+reported pending, not passed, where the process can read it anyway). Injected evidence, labelled in the examples: an
+`io_error` and a reader defect produced by a replaced reader. Races, each gated rather than slept: busy with zero file
+work and nothing leaked; no overbooking by simultaneous VMs; checked bank arithmetic and a bank that is not the profile's refused; at most two reads at once with the
+oldest queued read next; a finished result held for a future tick while its worker runs another read and its bytes stay
+charged; default and explicit due positions; a late read holding the tick; reversed completion order not changing
+delivery order; queued and in-progress cancels; an early held result against a cancel; instance stop waiting for a
+read; one instance or VM ending while another carries on; an owner stopped repeatedly; every place held yet completions
+still landing; and a pool that is down when a request is handed over.
+
 ## Deferred, by design
 
 Not here, and not claimed: the CLI `run` dispatch and exit mapping (LFE-22), which will
@@ -448,8 +545,9 @@ cabal test --project-file cabal.project.cpu hetoimasia-lua-engine:lua-engine-tes
 The manifest, profile and behavior examples perform no IO and start no Lua; the boot checkpoint's
 examples scan real temporary folders through the content package and evaluate nothing (the Lua host's behavior
 mechanism is tested in its own suites); the request adapter's examples start real Lua instances on a real
-supervised owner, with controlled fake providers, and no window or GPU. It covers the accepted
+supervised owner, with controlled fake providers, and no window or GPU; the raw-data provider's examples do the same over a real
+content root, inventory and read pool (see above). It covers the accepted
 examples, every syntax and schema refusal with the limits at their boundary and
 one past, the exact tick endpoints and forbidden forms, every fixed value against
 an independently written expectation, valid smaller profiles and refused ones,
-the behavior selection's cadence rules and numeric boundaries, the boot checkpoint (see above), the request adapter (see above), and this package's dependency and import boundary.
+the behavior selection's cadence rules and numeric boundaries, the boot checkpoint (see above), the request adapter (see above), the raw-data provider (see above), and this package's dependency and import boundary.
