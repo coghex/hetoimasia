@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-68/Q-6s: authored output and diagnostic logging.
+The current checkpoint is P-69/Q-6t: Lua's orderly whole-session quit operation.
+D-71 accepts bounded print/warn output without a separate Lua logging API.
 D-70 accepts UI-only polling of copied session status sampled per segment.
 D-69 defers engine randomness and removes standard RNG calls in both M1 VMs.
 D-68 accepts role-specific clocks and cooperative waits with sampled UI time.
@@ -2140,6 +2141,36 @@ samples; independent stderr diagnostics still report failures.
 The manager presented polling and no wakeup for event-driven instances as the
 cost. The owner chose polling over status callbacks. Exact record fields and
 numeric bounds remain part of the API package.
+
+### D-71. Use bounded print/warn output without a separate Lua logger in M1
+
+**Delivery:** M1 authored output and warning bridge.
+
+Owner answer, **2026-10-22 03:16:07 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: print/warn only (Rec.)
+
+Authenticated relay: `het-manager`, message `eh3s29hkuckqgv377t9resdime`,
+posted **2026-10-22 03:16:07.915 UTC** in `#het-luafirst`, replying to Q-6s
+message `3wypxkwhxjrqbbhf87w272x8ww`.
+
+Accept P-68's A: engine-rebound print writes plain authored text to stdout;
+warn writes stderr with engine-owned VM/content/instance attribution, or
+module attribution during evaluation. Both are available in both VMs and
+all authored phases. Arguments are converted and tab-joined; each complete
+call has a 4096-byte written cap including formatting and visible truncation,
+with invalid UTF-8 replacement and control escaping.
+
+Calls use synchronous serialized writes and flushing, with no queue, drop or
+retry mechanism. A write/sink/flush failure is fatal host failure. Authored
+output bypasses engine log filters; warnings do not themselves fail an instance.
+P-68 retains independent engine failure reports and the protected sink lifetime.
+
+The manager presented the lack of levels/structured fields, truncation and
+blocking on slow output as costs. The owner chose the small print/warn surface
+over a structured Lua logging service. Existing Haskell logging remains;
+its Lua service is deferred, not removed from the engine.
 
 ## Proposals
 
@@ -5865,7 +5896,7 @@ binding integration.
 
 ### P-68. Reuse bounded print/warn output and defer a separate Lua logging API
 
-**Unapproved; active checkpoint Q-6s. Delivery: M1.** D-20 already places
+**A accepted by D-71 through Q-6s. Delivery: M1.** D-20 already places
 authored output on stdout and diagnostics on stderr; D-8 permits module-level
 diagnostics. Recommend A: expose engine-rebound `print(...)` and `warn(...)`
 in both roles, during module evaluation and lifecycle hooks including finite
@@ -5939,6 +5970,82 @@ already rebind print/warn, cap each call at 4096 bytes and serialize writes;
 [the logger](../logging.md) has synchronous injected sinks and propagates sink
 exceptions. M1 warning context and launcher-wide coordination are integration
 work, not a claim that the current runner already implements this proposal.
+
+### P-69. Make Lua quit an idempotent stop request that returns normally
+
+**Unapproved; active checkpoint Q-6t. Delivery: M1.** D-20 already requires
+orderly whole-session quit, failure-dominant exit status and no Lua force-exit.
+Recommend A: a no-argument, no-result quit operation latches the session's
+normal-stop request and returns to the current Lua hook. The spelling belongs
+to the API package. It is available to either role from lifecycle hooks,
+including finite init and shutdown; module-top-level calls are ordinary Lua
+errors under D-8. No exit-code argument, arbitrary reason payload, stop-other-
+instance operation, pause/resume, restart or public instance-spawn API is added.
+
+The operation records stop directly in the existing session coordinator,
+without consuming a request/result slot or returning busy. Repeated calls,
+including calls from shutdown, are idempotent and cannot reopen admission,
+replace an existing failure or run shutdown twice. It requests the entire
+session's end even if called by only one instance. D-43's two-instance test
+therefore ends one instance through its Haskell harness, not through this
+whole-session Lua operation.
+
+Latching stop closes new work admission and future tick grants. New content/
+window/texture requests and scene publications after that latch are refused
+before new native action as ordinary Lua errors, not busy retries. Cleanup
+operations such as releasing an owned texture or cancelling a request, and
+print/warn, remain usable subject to their existing handle/phase rules. Pending
+work is cancelled and retired through its actual owners; required failures
+already latched still count, and existing settlement/cancellation ordering
+continues to decide races. Quit does not undo a scene, an output line or Lua
+table changes already made, nor claim that GPU/provider work has retired.
+
+The current hook is not unwound at the call: local statements after quit can
+still run until the hook returns or reaches a scheduler boundary. Authors
+should return after requesting quit. No further ordinary continuation is
+resumed after stop is applied; each VM observes stop at its safe boundary,
+without preempting a segment already running on the other owner. A caught Lua
+error cannot withdraw the stop request. An uncaught error after requesting
+quit, or a shutdown/cleanup failure, still makes the orderly exit fail under
+D-20. Returning from quit is neither a successful-cleanup receipt nor a
+guarantee of a final displayed frame. D-70 status remains the segment's earlier
+sample, so an immediate status read need not yet show the just-requested stop.
+
+During init, stop prevents the joint startup gate from opening. An init that
+returns normally remains eligible for the normal shutdown policy, but its
+success cannot restart the session; failed/incomplete init and unsafe-Lua
+shutdown skipping still follow D-18/D-27. Shutdown runs at most once where
+safe, engine cleanup remains mandatory, and the caller never synchronously
+waits for the other VM, native cleanup or GPU completion. A hook that keeps
+running forever after quit can still prevent orderly completion; D-20's
+second-signal forced exit remains the owner's escape.
+
+Alternative B makes quit terminate the current invocation immediately as a
+distinguished orderly-stop outcome, so ordinary statements after the call do
+not run. That requires a protected terminal control mechanism, distinct from
+Lua errors and robust against pcall/coroutine wrappers, plus an explicit rule
+for interrupted init and shutdown. It cannot merely throw a catchable Lua
+error, skip native cleanup or terminate an independently executing VM. Both
+choices retain whole-session scope and existing exit-status precedence.
+
+A is recommended because a returning stop request fits the existing
+cooperative supervisor and keeps native retirement outside Lua. Its authoring
+cost is the need to return promptly and avoid new service work after quit;
+an error on that later work can turn a requested clean exit into failure.
+B is more convenient for authors expecting a terminal exit statement but
+adds a new control-flow contract to this milestone.
+
+Qualification checks quit from either role, init and shutdown, repeated calls
+with full request capacity, module-phase refusal, admission/grant closure,
+code executing after the call, cancellation/required-failure races, failure
+precedence and actual retirement. Injected barriers coordinate simultaneous
+owners and stop; no hanging-script or desktop probe is required to establish
+these state transitions. Evidence: the
+[Lua host's control and runner rules](../../packages/scripting-lua/README.md)
+already apply controls at safe boundaries, stop future grants, retire pending
+requests and distinguish stop from cleanup completion. The no-store launcher
+must wire a narrow whole-session binding and admission gate; this proposal
+does not expose the existing runner's wider instance-control namespace.
 
 ## Open questions
 
@@ -6392,12 +6499,18 @@ logical/module-top reads are ordinary Lua errors.
 
 #### Q-6s. Use bounded print/warn only or add structured Lua logging in M1?
 
-**Active checkpoint, P-68.** A (recommended): rebound print to stdout and
-attributed warn to stderr, both roles and module/hooks, 4096-byte final call
-bound, synchronous serialized/flush-on-emission sinks, no filtering of authored
-output and no separate Lua logger API. Cost: truncation, potentially blocking
-output, and no authored levels/fields. B: also expose structured level-based
-logging and settle its Lua schema/filtering contract next.
+Resolved by D-71: P-68's A, bounded rebound print/warn with attributed
+warnings, both roles and every authored phase, synchronous serialized writes,
+fatal sink failure and no separate structured Lua logger in M1.
+
+#### Q-6t. Does orderly session quit return or terminate the invocation?
+
+**Active checkpoint, P-69.** A (recommended): either role's hook latches an
+idempotent whole-session stop without a request slot, then returns normally;
+authors return promptly and avoid new work. Module-top calls are refused,
+shutdown calls are harmless, and existing failure/cleanup precedence remains.
+B: a protected terminal control operation ends the invocation immediately,
+requiring its own pcall/coroutine and interrupted-init/shutdown semantics.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
