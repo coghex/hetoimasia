@@ -3,6 +3,7 @@
 module Test.Lua.Boundary.Spec (spec) where
 
 import Test.Hspec (Spec, describe)
+import qualified Test.Lua.Boundary.ArgumentChecks
 import qualified Test.Lua.Boundary.Bindings
 import qualified Test.Lua.Boundary.Dependencies
 import qualified Test.Lua.Boundary.Discipline
@@ -22,6 +23,7 @@ spec ∷ Spec
 spec = describe "the value boundary" $ do
   Test.Lua.Boundary.Bindings.spec
   Test.Lua.Boundary.Recoverable.spec
+  Test.Lua.Boundary.ArgumentChecks.spec
   Test.Lua.Boundary.Registration.spec
   Test.Lua.Boundary.Release.spec
   Test.Lua.Boundary.Values.spec

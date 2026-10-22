@@ -300,6 +300,7 @@ test-suite lua-host-tests
     -- fail after its module was stored, which no script can do (see its header).
     c-sources: test/cbits/hetoimasia_lua_hooks.c
     other-modules:
+        Test.Lua.Boundary.ArgumentChecks
         Test.Lua.Boundary.Bindings
         Test.Lua.Boundary.Dependencies
         Test.Lua.Boundary.Discipline
