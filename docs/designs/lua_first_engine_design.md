@@ -68,7 +68,7 @@ concrete precondition
 - [x] LFE-4. Own anchored native content roots and no-follow reads — [#518]
 - [x] LFE-5. Validate literal Unicode content identities — [#519]
 - [x] LFE-6. Build and verify the bounded whole-folder inventory — [#520]
-- [ ] LFE-7. Reserve M1 requests and results atomically
+- [x] LFE-7. Reserve M1 requests and results atomically — [#521]
 - [ ] LFE-8. Retain VM-local module exports and captured behaviors
 - [ ] LFE-9. Resume ordered module import chains on their VM owner
 - [ ] LFE-10. Load raw data through owned bounded file workers
