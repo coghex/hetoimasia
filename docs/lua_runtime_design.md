@@ -6,14 +6,33 @@ Keep Lua central to authoring a game while Haskell owns execution, transport,
 failure evidence, and lifetime. This is the canonical continuation of
 `lua_runtime_architecture_notes.md` and the design conversation of 2026-09-16.
 
-Design state: `trusted milestone delivered`; the confined branch stays blocked on Q-5.
+Design state: `trusted milestone delivered`; confinement is deferred outside
+the completed trusted scope by the owner's 2026-10-22 reconciliation.
+
+**Current scope precedence (2026-10-22):** the trusted milestone is delivered
+and owner-accepted at `b7f3b56e` on 2026-10-21. The owner's later trust decision
+treats game and mod Lua alike as trusted. LUA-9–LUA-13, LUA-16 and LUA-17 are
+deferred outside this completed trusted milestone; they are not implemented
+or qualified. Q-5 remains unresolved technical evidence for any future
+hostile-code arc, not a prerequisite for Lua-first M1 or later trusted-mod
+activation. The [Lua-first design](designs/lua_first_engine_design.md), D-79/
+P-75, records the confirmed reconciliation and the named consumer's M1 profile.
+The manager owns #145's corresponding revised-scope closure.
+
+Older dated decisions, quotations, readiness notes and process-branch specs
+below retain their historical meaning. Their requirements that confinement
+complete this first epic are superseded by this explicit scope reduction,
+not satisfied by trusted execution. All thirty-one LUA IDs and both
+inconclusive platform verdicts are preserved. A future hostile-code arc needs
+new owner scope/readiness signoff and successful platform qualification; it
+cannot use trusted delivery or the old unsuccessful proofs to unlock admission.
 
 The trusted milestone is delivered and owner-accepted (2026-10-21): LUA-29 (#498, PR #501),
 LUA-31 (#503, PR #504), LUA-30 (#499, PR #502) and LUA-8 (#500, PR #509, `b7f3b56e`). It qualifies
 D-23 for one build, platform, scheduling configuration and input log; D-48's failures that begin
 after a tick's accounting cutoff are outside trace equality. No slice is ready for issue processing
-now: the next trusted step is a named consumer's design discussion, and the confined branch
-(LUA-9 to LUA-13, LUA-16, LUA-17) waits for successful Q-5 verdicts on both platforms.
+now: the next trusted step is the Lua-first named consumer's design. The
+confined branch is outside the active roadmap under the scope precedence above.
 
 Previous readiness scope, now delivered: **LUA-8 only** (D-45), delivered by D-46 as LUA-29,
 LUA-30, then a narrowed LUA-8, with D-47 adding the library prerequisite LUA-31
@@ -175,7 +194,7 @@ concrete precondition
 
 ## Processing status
 
-- [x] EPIC. Establish isolated UI and gameplay Lua execution — [#145]
+- [x] EPIC. Establish trusted UI and gameplay Lua execution — [#145]; owner-confirmed revised scope, tracker reconciliation owned by the manager
 - [x] LUA-1. Establish the Lua binding and foreign-call boundary — [#146]
 - [x] LUA-14. Prove Linux confinement and resource-limit feasibility — [#147]
 - [x] LUA-15. Prove macOS confinement and resource-limit feasibility — [#148]
@@ -200,19 +219,20 @@ concrete precondition
 - [x] LUA-31. Wait for a scheduled owner's accounting of its accepted ticks without a task slot — [#503]
 - [x] LUA-30. Fail, overload and stop the two-domain sample explicitly — [#499]
 - [x] LUA-8. Prove independent trusted UI and gameplay execution headlessly — [#500]
-- [ ] LUA-9. Add bounded child-process transport and owned process lifetime — [deferred]: Q-5 successful Linux and macOS confinement verdicts
-- [ ] LUA-10. Establish Linux mod-process confinement — [deferred]: Q-5 successful Linux and macOS confinement verdicts
-- [ ] LUA-11. Establish macOS mod-process confinement — [deferred]: Q-5 successful Linux and macOS confinement verdicts
-- [ ] LUA-12. Enforce parent-owned execution and resource budgets — [deferred]: Q-5 successful Linux and macOS confinement verdicts
-- [ ] LUA-13. Broker scoped mod capabilities in the parent — [deferred]: Q-5 successful Linux and macOS confinement verdicts
-- [ ] LUA-16. Integrate confined mod owners with the runtime — [deferred]: Q-5 successful Linux and macOS confinement verdicts
-- [ ] LUA-17. Prove confined execution and adversarial isolation headlessly — [deferred]: Q-5 successful Linux and macOS confinement verdicts
+- [ ] LUA-9. Add bounded child-process transport and owned process lifetime — [deferred]: outside completed trusted scope; new owner scope/readiness and successful platform qualification required
+- [ ] LUA-10. Establish Linux mod-process confinement — [deferred]: outside completed trusted scope; new owner scope/readiness and successful platform qualification required
+- [ ] LUA-11. Establish macOS mod-process confinement — [deferred]: outside completed trusted scope; new owner scope/readiness and successful platform qualification required
+- [ ] LUA-12. Enforce parent-owned execution and resource budgets — [deferred]: outside completed trusted scope; new owner scope/readiness and successful platform qualification required
+- [ ] LUA-13. Broker scoped mod capabilities in the parent — [deferred]: outside completed trusted scope; new owner scope/readiness and successful platform qualification required
+- [ ] LUA-16. Integrate confined mod owners with the runtime — [deferred]: outside completed trusted scope; new owner scope/readiness and successful platform qualification required
+- [ ] LUA-17. Prove confined execution and adversarial isolation headlessly — [deferred]: outside completed trusted scope; new owner scope/readiness and successful platform qualification required
 
-The ledger records processing, not implementation. Keep it synchronized with
-the delivery plan; do not infer issue numbers from these local slice IDs.
-LUA-2's former #146 merge prerequisite is satisfied; its unchecked entry still
-means no issue has been processed. Renewed readiness gates trusted processing;
-Q-5 additionally gates the process branch under D-11/D-13.
+The ledger records processing; linked issue numbers are not inferred from local
+slice IDs. The trusted deliveries above are merged. LUA-14/LUA-15 delivered
+feasibility evidence with inconclusive verdicts. The seven unchecked entries
+are intentionally deferred outside revised epic completion, not implementation
+successes or current processing requests. Their detailed historical dependency
+specifications remain below, subject to the new scope/readiness gate.
 
 Dependency reconciliation, 2026-09-18: the owner selected the shared-toolchain
 qualification VK-1/#157 before LUA-1/#146. The amended and reapproved #146 and
@@ -223,19 +243,24 @@ source observations below remain historical.
 
 ## Epic contract
 
-- **Goal:** a reusable Lua host and runtime adapter run trusted first-party UI
-  and gameplay on independent in-process VM owners, with untrusted execution
-  confined per mod and domain in separate sandboxed processes, without a window,
-  renderer, or concrete game.
+**Revised scope, owner-confirmed 2026-10-22:** the completed trusted foundation.
+The original confinement obligation remains recorded in the historical
+decisions and seven deferred slice specifications; it is not claimed delivered.
+
+- **Goal:** a reusable Lua host and runtime adapter run trusted UI and gameplay
+  on independent in-process VM owners, without a window, renderer or concrete
+  game in the host. The Lua-first consumer adds its filtered game/mod profile
+  and concrete engine bindings in a separate M1 arc.
 - **Done when:** a headless consumer loads application-owned Lua behavior in
   both domains; UI handles input against the last completed gameplay snapshot
   while gameplay is busy; cooperative tasks yield/wait/resume; overload is
-  bounded and explicit; malicious/failed children cannot bypass capability
-  checks or configured resource limits; failure and cancellation preserve
-  parent-owned resource lifetime. Linux CI and local macOS verify both the
-  binding and actual confinement, including denied-access tests.
-  LUA-8 establishes the trusted milestone; LUA-17 establishes confined system
-  acceptance. Both are required to complete the epic.
+  bounded and explicit; failure and cancellation preserve engine-owned
+  resource lifetime. Linux CI and local macOS establish the trusted binding,
+  runtime and integrated acceptance. LUA-8 is delivered and owner-accepted;
+  the sample's D-23/D-48 qualification remains scoped to its recorded inputs.
+  LUA-17 and the other six confinement slices are not required for revised
+  completion, are not implemented, and would need fresh scope/readiness and
+  successful platform qualification before any future confined delivery.
 - **Users and operators:** authors of Lua-driven games/tools, engine component
   authors registering capabilities, and agents maintaining focused tests.
 - **Arc label:** propose `scripting`, description “Lua hosting, execution, and
@@ -2099,6 +2124,11 @@ readiness remain separate gates.
 
 ### Q-1. Trust scope of the first runtime
 
+**Supersession, 2026-10-22:** the answer below records the original contract.
+The owner's Lua-first trust decision and confirmed P-75 reconciliation remove
+confinement from the completed trusted epic's required scope. This is a scope
+revision, not proof that the original isolation requirement was met.
+
 Resolved by D-6: untrusted-mod isolation is required in this arc. P-13 records
 the added process/OS boundary. Do not reduce this to separate in-process VMs or
 defer it while claiming the first arc is complete. Q-5 remains a real technical
@@ -2274,6 +2304,10 @@ mod process on enforced execution or memory limit violations. Q-5 chooses the
 verified mechanisms; P-13 distinguishes child termination from parent cleanup.
 
 ### Q-8. Reconciling the trusted in-process path
+
+**Supersession, 2026-10-22:** this 2026-09-24 answer remains history. Current
+completion follows the revised trusted scope above; the seven confinement
+slices are deferred outside it, with Q-5 unresolved for any future revival.
 
 Resolved by D-13 and D-14, explicitly approved on 2026-09-24. Trusted delivery
 (LUA-2, LUA-3, LUA-5 through LUA-8) may proceed independently of Q-5 after
@@ -2570,10 +2604,11 @@ about their organizational split. No tracker artifact has been created.
 
 The design requires observable contracts rather than one happy-path Lua call:
 
-LUA-8 proves the trusted milestone using the applicable binding, protocol,
-failure, and two-domain checks below. LUA-17 adds confined system and
-adversarial acceptance after Q-5; trusted evidence cannot satisfy containment.
-Both milestones are required for epic completion.
+LUA-8 proves the delivered trusted milestone using the applicable binding,
+protocol, failure and two-domain checks below. Under the owner's 2026-10-22
+scope revision, LUA-17's confined/adversarial acceptance is deferred outside
+epic completion. The confinement checks below remain the historical/later-arc
+requirements, not evidence that trusted execution satisfies containment.
 
 1. **Binding/lifetime:** creation and partial-initialization faults; repeated
    loading/calling without stack/ref growth; callback exceptions in both
@@ -2621,6 +2656,13 @@ security vulnerabilities. Containment claims must state the enforced boundary
 and verified policy, with adversarial regression coverage.
 
 ## Delivery plan
+
+**Scope note, 2026-10-22:** preserve the historical slice contracts and IDs.
+The seven confinement slices LUA-9–LUA-13/LUA-16/LUA-17 are outside completed
+trusted scope, not current work unlocked merely by finishing a proof. Their
+revival requires explicit owner scope/readiness and successful platform
+qualification. Other delivered receipts and public host/runner behavior are
+unchanged; Lua-first M1 is a separate consumer plan.
 
 ### LUA-1. Establish the Lua binding and foreign-call boundary
 
@@ -3674,7 +3716,9 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-9. Add bounded child-process transport and owned process lifetime
 
-> Deferred: Q-5 successful Linux and macOS confinement verdicts (D-11/D-13).
+> Deferred outside completed trusted scope (owner reconciliation 2026-10-22).
+> Revival needs new owner scope/readiness and successful platform qualification;
+> the historical Q-5 prerequisite and inconclusive evidence remain.
 
 - **Outcome:** a parent owns a child and bounded private IPC through launch,
   readiness, exit, cancellation, and reaping, with no detached helpers.
@@ -3698,7 +3742,9 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-10. Establish Linux mod-process confinement
 
-> Deferred: Q-5 successful Linux and macOS confinement verdicts (D-11/D-13).
+> Deferred outside completed trusted scope (owner reconciliation 2026-10-22).
+> Revival needs new owner scope/readiness and successful platform qualification;
+> the historical Q-5 prerequisite and inconclusive evidence remain.
 
 - **Outcome:** the selected Linux backend installs and verifies the restricted
   launch/resource profile before untrusted initialization is possible.
@@ -3719,7 +3765,9 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-11. Establish macOS mod-process confinement
 
-> Deferred: Q-5 successful Linux and macOS confinement verdicts (D-11/D-13).
+> Deferred outside completed trusted scope (owner reconciliation 2026-10-22).
+> Revival needs new owner scope/readiness and successful platform qualification;
+> the historical Q-5 prerequisite and inconclusive evidence remain.
 
 - **Outcome:** the selected macOS helper/deployment arrangement enforces the same
   logical permissions and resource profile on local supported macOS.
@@ -3741,7 +3789,9 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-12. Enforce parent-owned execution and resource budgets
 
-> Deferred: Q-5 successful Linux and macOS confinement verdicts (D-11/D-13).
+> Deferred outside completed trusted scope (owner reconciliation 2026-10-22).
+> Revival needs new owner scope/readiness and successful platform qualification;
+> the historical Q-5 prerequisite and inconclusive evidence remain.
 
 - **Outcome:** a child cannot evade configured admission/execution/shutdown
   limits by ignoring yields, forging heartbeats, or flooding the parent.
@@ -3761,7 +3811,9 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-13. Broker scoped mod capabilities in the parent
 
-> Deferred: Q-5 successful Linux and macOS confinement verdicts (D-11/D-13).
+> Deferred outside completed trusted scope (owner reconciliation 2026-10-22).
+> Revival needs new owner scope/readiness and successful platform qualification;
+> the historical Q-5 prerequisite and inconclusive evidence remain.
 
 - **Outcome:** even a malicious child can invoke only its explicitly granted,
   bounded application operations and receive only its allowed views.
@@ -3786,7 +3838,9 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-16. Integrate confined mod owners with the runtime
 
-> Deferred: Q-5 successful Linux and macOS confinement verdicts (D-11/D-13).
+> Deferred outside completed trusted scope (owner reconciliation 2026-10-22).
+> Revival needs new owner scope/readiness and successful platform qualification;
+> the historical Q-5 prerequisite and inconclusive evidence remain.
 
 - **Outcome:** a supervised parent owner exposes a ready confined Lua endpoint
   and retains process/provider dependencies through exit without a new supervisor.
@@ -3812,7 +3866,9 @@ and verified policy, with adversarial regression coverage.
 
 ### LUA-17. Prove confined execution and adversarial isolation headlessly
 
-> Deferred: Q-5 successful Linux and macOS confinement verdicts (D-11/D-13).
+> Deferred outside completed trusted scope (owner reconciliation 2026-10-22).
+> Revival needs new owner scope/readiness and successful platform qualification;
+> the historical Q-5 prerequisite and inconclusive evidence remain.
 
 - **Outcome:** the confined system milestone demonstrates independent mod/domain
   execution alongside trusted first-party owners, with enforced permissions and
@@ -3846,26 +3902,31 @@ LUA-8 under D-25 and D-30. LUA-6 retains external TIME-1; LUA-7 consumes the
 instance ownership API and introduces no second clock implementation.
 The shared VK-1 toolchain prerequisite remains satisfied.
 
-The confined branch remains LUA-9 after LUA-3/LUA-4 and both successful
+The historical confined dependency graph remains LUA-9 after LUA-3/LUA-4 and both successful
 platform proofs; LUA-10, LUA-11, and LUA-13 in parallel; LUA-12 after both
 platform slices and TIME-1; LUA-16 after LUA-6/LUA-7/LUA-26/LUA-12/LUA-13; then
 LUA-17 after LUA-8/LUA-16. Stable IDs are preserved, with LUA-16/LUA-17
 retaining the confined integration and acceptance removed from LUA-5/LUA-8.
-There are thirty-one delivery slices. All of this can run alongside
-graphics implementation. Coordinate the shared Cabal project, CI
+There are thirty-one preserved slice IDs. The seven confinement slices are
+outside the active roadmap under the 2026-10-22 scope revision. Any newly
+authorized work must coordinate the shared Cabal project, CI
 catalog/workflow, and any narrow foundation evidence change; parallel work
 does not authorize conflicting edits or duplicate platform infrastructure.
 
-Q-8 is resolved by D-13/D-14. The trusted branch is delivered through LUA-8
-(2026-10-21); do not recreate #145 or #146–#149. The next trusted step is not a
-slice of this design: the owner chooses a named consumer and holds the smallest
-design discussion around its next missing behavior (its owner, input and commit
-boundary, lifetime and observable acceptance), or renews the Q-5 feasibility
-investigation if mods are the immediate need.
-Resolve Q-5's deployment obstacles and record both successful platform verdicts
-before drafting LUA-9 through LUA-13 or LUA-16/LUA-17. Neither trusted delivery
-nor completed feasibility issues discharge that gate. Required untrusted-mod
-isolation remains part of epic completion; D-6 through D-9 still apply.
+Q-8's historical D-13/D-14 answer is qualified by the later trust decision.
+The trusted branch is delivered through LUA-8 (2026-10-21); do not recreate
+this host/runtime or #146–#149. The named successor is
+[Lua-first M1](designs/lua_first_engine_design.md): a separate consumer epic
+after its own readiness, with a rendered Lua quad, real logical stub and no
+state store/mod activation. The manager reconciles #145's title/body and closes
+its explicitly reduced trusted scope; that is not original-scope completion.
+
+Q-5's deployment obstacles and inconclusive platform verdicts remain recorded.
+Any future hostile-code arc first needs owner scope/readiness authorization
+and successful platform qualification before dependent confinement work.
+Neither trusted delivery nor completed feasibility issues discharge that gate.
+D-6 through D-9 retain their historical threat-model meaning; their requirement
+to complete confinement in this epic is superseded, not implemented.
 
 An engine-side wait counter that intercepts a script's wait (D-33's recorded
 future idea) needs its own design.
@@ -3874,7 +3935,8 @@ Further arcs require their own evidence and scope: a sharded authoritative
 simulation; durable saves/hot reload; broader mod permissions/distribution;
 generalized script transforms; concrete engine bindings; and measured
 worker-count/GC tuning. Preserve these possibilities without implementing their
-machinery now. Untrusted-mod containment itself is required in this first arc.
+machinery now. Untrusted-mod containment is deferred outside the completed
+trusted arc; none of those extensions is silently scheduled in Lua-first M1.
 
 ## Technical references
 

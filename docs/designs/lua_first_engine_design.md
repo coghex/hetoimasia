@@ -11,7 +11,10 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-75/Q-8: vision and prior-epic reconciliation.
+P-76/Q-9 is approved by the manager under D-78, with D-80's LFE-13/LFE-26
+split and lifecycle-review requirements. Final readiness audit follows.
+D-79 confirms P-75/Q-8's wording and authorizes the narrow vision/prior-design
+publication; the manager owns #145 and MEMORY follow-up.
 D-77 accepts the six-part fixed M1 ceilings and worker-accounting package.
 D-76 accepts the six-part remaining service API and record-schema package.
 D-75 accepts the five-part core Lua module/behavior/request API package.
@@ -57,10 +60,37 @@ concrete precondition
 ## Processing status
 
 - [ ] EPIC. Draw a textured quad from Lua over reusable engine services
+- [ ] LFE-1. Install the explicit filtered M1 library profile
+- [ ] LFE-2. Add opt-in recoverable binding validation and refusal
+- [ ] LFE-3. Parse the strict manifest and validate the fixed M1 profile
+- [ ] LFE-4. Own anchored native content roots and no-follow reads
+- [ ] LFE-5. Validate literal Unicode content identities
+- [ ] LFE-6. Build and verify the bounded whole-folder inventory
+- [ ] LFE-7. Reserve M1 requests and results atomically
+- [ ] LFE-8. Retain VM-local module exports and captured behaviors
+- [ ] LFE-9. Resume ordered module import chains on their VM owner
+- [ ] LFE-10. Load raw data through owned bounded file workers
+- [ ] LFE-11. Join shared module jobs and deliver them at assigned positions
+- [ ] LFE-12. Bind per-instance content, request, time and output APIs
+- [ ] LFE-13. Coordinate role startup gates, failure policy and session stop
+- [ ] LFE-26. Expose UI status, quit and the unavailable-state guard
+- [ ] LFE-14. Preflight static PNG structure and bounded inflation
+- [ ] LFE-15. Decode the approved PNG variants within accounted workspace
+- [ ] LFE-16. Own texture pipeline lanes, leases and byte reservations
+- [ ] LFE-17. Finish texture requests through real GPU readiness
+- [ ] LFE-18. Create and retire instance-owned windows asynchronously
+- [ ] LFE-19. Validate and copy the fixed M1 scene schema
+- [ ] LFE-20. Publish scenes with completion-safe texture retention
+- [ ] LFE-21. Expose the complete UI-only graphics facade
+- [ ] LFE-22. Assemble the generic run command and Lua quad content
+- [ ] LFE-23. Qualify integrated failure and two-instance ownership headlessly
+- [ ] LFE-24. Verify Lua-authored output through offscreen pixels
+- [ ] LFE-25. Qualify native windows, independent retirement and quit
 
-No delivery slices are defined yet. Their boundaries and order depend on the
-owner's answers below. The umbrella's relationship to existing epic #145 also
-needs explicit reconciliation; this entry does not request a duplicate epic.
+The twenty-six LFE slices below have manager process signoff under D-80;
+they are not approved issues or implementation authorization. Q-8 is confirmed
+by D-79; the manager owns the #145 tracker mutation. Ledger revision D-80
+inserts new LFE-26 after LFE-13, preserving LFE-14–LFE-25 IDs and their order.
 
 ## Epic contract
 
@@ -162,9 +192,12 @@ bounds; vision/epic reconciliation and delivery order remain to be settled.
 D-42's runtime reconciliation applies
 within D-43's delivery allocation; earlier broader scope is historical.
 
-This design session changes only this document. Production code, tracker
-mutations, changes to the vision or prior design, review and issue processing
-are outside this session's authorized work. No subagents are used.
+This session normally changes only this design. D-79 grants one narrow
+exception: apply the confirmed P-75 wording/status reconciliation to vision
+and the prior Lua design and land those documents. Production code, tracker
+mutations, MEMORY changes, review and issue processing remain outside this
+designer's authorized work. The manager owns those separately. No subagents
+are used.
 
 ## Decisions
 
@@ -2351,6 +2384,102 @@ costs. Those included unused oversized files failing boot, resizing PNGs above
 reservations, and the absence of a total Lua memory cap. The alternative
 "Revise limits" was not chosen. No runtime, allocation or native evidence is
 claimed by this signoff; implementation must establish P-74's proof obligations.
+
+### D-78. Draft both remaining pieces; delegate slice process signoff
+
+**Delivery:** design completion and publication coordination, not new M1 behavior.
+
+Owner answer, **2026-10-22 05:22:06 UTC**, in the manager's pane, verbatim:
+
+> yes, i sign off on all of that
+
+Authenticated relay: `het-manager`, message `64zimzpdu6jiigicdy9d5tmapi`,
+posted **2026-10-22 05:22:06.247 UTC** in `#het-luafirst`. The relay identifies
+this request and says it replies to the designer's latest status; it has no
+reply_to field. The manager states that the owner had just been shown the two
+remaining pieces: vision/#145 reconciliation and one-PR delivery slices.
+This is not represented as approval of text or slice rows shown afterwards.
+
+The manager explicitly directs both drafts now. Slice splitting and ordering
+are process work under the owner's standing grant, quoted in that relay:
+
+> as long as its process work, i dont care how things are split, or ordered ... just stop if there is a design gap or ambiguity
+
+For this request, `het-manager` reviews and signs off the proposed slice plan;
+only design gaps return to the owner. This supersedes the earlier requirement
+to wait for Q-8 before decomposition and the earlier owner-only slice signoff.
+It grants no new behavior, tracker mutation, review verdict or implementation.
+No expiry was stated; the grant applies to this design's delivery-plan process,
+not authority over unrelated work or trust/security decisions.
+
+The owner has approved the trust/scope substance through D-2/D-41/D-43. The
+manager nevertheless requires the exact vision and #145 wording to receive
+one-line owner confirmation before publication. Keep Q-8 pending for that
+wording; do not edit vision or #145. This round's design edits remain local
+until the publication confirmation, conservatively applying "before anything
+lands". P-75's prior publication at 9fb6af1a00 predates this relay's delivery
+to the designer; it did not mutate vision or the tracker.
+
+### D-79. Confirm the exact vision and prior-epic reconciliation
+
+**Delivery:** P-75 wording/status reconciliation; no new implementation behavior.
+
+Owner confirmation, reported **2026-10-22 05:31:42 UTC**, through
+AskUserQuestion in the manager's pane, verbatim:
+
+> Confirm all five (Rec.)
+
+Authenticated relay: `het-manager`, message `hjejzmnk7ify3p9s62kpkq47sn`,
+posted **2026-10-22 05:31:42.929 UTC** in `#het-luafirst`, replying to the
+exact-wording message `3h2k5kcsskvymgttc2ga7ifvt6` (with continued text ending
+at `uqgv5zmdjkptta2zrnew6n7mqi`). All five P-75 parts are confirmed.
+
+Before confirming, the owner saw the V-1 opening and V-9 title/trust/filtering/
+confinement paragraphs verbatim from P-75, plus summaries of the D-23 note,
+V-4/V-5, old-design status, #145 rename/revised closure and separate M1 epic,
+and MEMORY follow-up. The manager explicitly verified that the exact vision
+message matched P-75 and that the full #145 replacement body implemented
+part 4; the relay says the confirmation covers that text. This records what
+was actually shown, not a claim that every remaining line was read aloud.
+
+The manager now authorizes this designer to apply only the confirmed V-1/V-9/
+V-4/V-5 wording in `docs/vision.md` and part-3 status/deferral reconciliation
+in `docs/lua_runtime_design.md`, then land both with docs-push and report the
+commit. This supersedes D-78's publication hold and the original design-only
+file restriction for these exact edits. Change nothing else in those files.
+The manager applies #145's title/body and closure and arranges MEMORY.md as
+a separate PR; this designer does neither. Q-9 proceeds to manager process
+review under D-78. No issue creation or implementation is authorized here.
+
+### D-80. Approve the slice plan with a lifecycle split and review invariants
+
+**Delivery:** process-only plan signoff under D-78's owner grant.
+
+Authenticated manager signoff at **2026-10-22 05:36:07 UTC**:
+`het-manager`, message `9pcc2j4u78ytq2sfr3s2xtaumw`, posted
+**2026-10-22 05:36:07.755 UTC**, replying to Q-9/P-76 message
+`nje4nbtgfkafwtjjztvyf8ebnw`. This is manager process authority delegated by
+the owner, not an invented owner quotation or new behavior decision.
+
+The manager approved coverage/dependency order with two explicit changes:
+
+1. Split LFE-13 into **LFE-13: Coordinate role startup gates, failure policy
+   and session stop**, and new **LFE-26: Expose UI status, quit and the
+   unavailable-state guard**. LFE-26 depends on LFE-12 and LFE-13; LFE-21 and
+   LFE-22 also depend on LFE-26. Insert LFE-26 immediately after LFE-13 in both
+   ledger and delivery plan without renumbering the other slices. There are
+   twenty-six slices. The manager cites #499/#502's thirteen review rounds as
+   the reason for a smaller startup/failure/stop boundary.
+2. Lifecycle-heavy issues require a PR-body invariant table covering every
+   reservation, settlement/publication site and cancellation window, including
+   admission-to-tracking, intent-to-issuance and pre-final-publication gaps.
+   Sweep every site of a fixed shape before review round 1. This applies at
+   least to LFE-7, LFE-9, LFE-10, LFE-11, LFE-13, LFE-16, LFE-17, LFE-18,
+   LFE-20 and LFE-26, and wherever later specifications expose the same risks.
+
+Record/apply the split, publish the draft with docs-push, then finish the
+readiness audit. These requirements change process boundaries/evidence, not
+the accepted Lua contract, budgets, failure authority or deferred scope.
 
 ## Proposals
 
@@ -7124,11 +7253,10 @@ need a package revision, not silent relaxation during implementation.
 
 ### P-75. Reconcile the vision and close the delivered trusted arc explicitly
 
-**Unapproved; active checkpoint Q-8.** Recommend all five parts below. These
-are proposed reconciliation text and dispositions, recorded here only. Approval
-selects their meaning; it does not authorize this designer to edit other
-documents or mutate the tracker during this session. The manager can arrange
-the authorized publication/processing follow-up after signoff. Stable principle,
+**All five parts confirmed by D-79 through Q-8.** The five parts below contain
+the confirmed reconciliation text and dispositions. D-79 authorizes this
+designer's narrow vision/old-design edit; the manager owns tracker and MEMORY
+follow-up. The design remains the wording record. Stable principle,
 decision and slice IDs, prior quotations and qualification evidence survive.
 
 #### 1. V-1: the Lua game is the application; the engine remains generic
@@ -7267,20 +7395,129 @@ failure semantics, sample's state contract or existing configurable limits.
 
 #### 4. Revise #145's scope, close that arc, and use a separate M1 epic
 
-Recommend renaming #145 to **Establish trusted UI and gameplay Lua execution**
-and revising its current goal/completion requirement to the delivered trusted
-foundation, before closing it as completed under that revised scope. Proposed
-leading reconciliation text:
+Proposed exact title: **Establish trusted UI and gameplay Lua execution**.
+Proposed disposition after applying the confirmed scope revision: **closed,
+completed under the revised trusted scope**. The full proposed replacement body
+is below. The original issue-origin marker is retained as historical authorship
+of #145; this revision is recorded by its dated scope note and design link.
 
-> Owner scope revision: trusted UI/gameplay Lua delivery is complete through
-> LUA-8, #500 / PR #509, b7f3b56e, accepted 2026-10-21. Game and mod Lua are
-> now both trusted. The seven unfiled confinement slices LUA-9–LUA-13, LUA-16
-> and LUA-17 are deferred outside this epic's required scope. Their code was
-> not delivered; Linux/macOS feasibility verdicts remain inconclusive. Closing
-> this revised epic records the trusted foundation's completion, not completion
-> of the original all-thirty-one-slice confinement contract. The Lua-first
-> textured-quad M1 is a separate consumer arc governed by its own design and
-> acceptance; it reuses this host/runtime instead of recreating it.
+```markdown
+## Owner scope revision — 2026-10-22
+
+Trusted UI/gameplay Lua delivery is complete through LUA-8, #500 / PR #509,
+b7f3b56e, accepted by the owner on 2026-10-21. The owner's subsequent direction
+treats game and mod Lua alike as trusted in-process code with a filtered
+library. The Lua-first engine design records that direction and its M1 scope.
+
+The seven unfiled confinement slices LUA-9–LUA-13, LUA-16 and LUA-17 are
+deferred outside this epic's required scope. Their code was not delivered;
+the Linux and macOS feasibility verdicts remain inconclusive. Closing this
+revised epic records the trusted foundation's completion, not completion of
+the original all-thirty-one-slice confinement contract.
+
+The Lua-first textured-quad M1 is a separate consumer arc with its own design,
+future epic and acceptance. It reuses the delivered host/runtime; it does not
+recreate this epic, admit untrusted code, or implement a gameplay state store.
+
+## Delivered goal and qualification
+
+A reusable trusted Lua host and runtime adapter run independent UI and
+gameplay VM owners without a concrete game, window or renderer in the engine
+host. Application-owned bindings, modules, instances, scheduling, asynchronous
+requests and resource leases preserve explicit admission, failure and cleanup.
+The headless lua-domains consumer proves the integrated trusted milestone.
+
+Its deterministic gameplay qualification is limited to the same build,
+supported platform, initial state, content, seed, tick-assigned inputs and
+scheduling configuration. D-48 limits failures that begin after a tick's
+accounting cutoff. The sample owns its world, commit, snapshot and replay
+policy; it is not a delivered generic engine state store.
+
+Trusted Lua may hang its VM or exhaust process memory. Cooperative budgets
+and separate VMs do not establish hostile-code containment. Host/provider/
+cleanup failures preserve fatal authority; dependencies remain protected
+until actual retirement. The Lua-first profile's added filtering, content
+services and graphics bindings belong to its new consumer arc.
+
+## Completed deliveries
+
+- [x] LUA-1. Lua binding and foreign-call boundary — #146
+- [x] LUA-14. Linux confinement feasibility investigation — #147; inconclusive
+- [x] LUA-15. macOS confinement feasibility investigation — #148; inconclusive
+- [x] LUA-2. Protected VM lifetime — #460
+- [x] LUA-3. Application-owned modules and bounded value bindings — #462
+- [x] LUA-4. Bounded task and protocol model — #149
+- [x] LUA-5. Runtime-supervised trusted VM owners — #464
+- [x] LUA-20. VM-owned task coroutines — #466
+- [x] LUA-21. Scheduling policies, logical time and owned timer — #467
+- [x] LUA-6. Cooperative tasks and bounded service turns — #468
+- [x] LUA-18. Instances, hooks and lifecycle controls — #472
+- [x] LUA-25. Resource-collection loans to synchronous callbacks — #476
+- [x] LUA-22. Engine-held instance leases — #473
+- [x] LUA-23. Granted lifecycle controls across owners — #474
+- [x] LUA-24. Logical and elapsed update cadences — #475
+- [x] LUA-7. Asynchronous requests with reserved results — #482
+- [x] LUA-26. Owned provider-event subscriptions — #483
+- [x] LUA-27. Reusable Lua runner — #492
+- [x] LUA-28. Logical runner and instance events — #493
+- [x] LUA-19. Headless command-line entry — #494
+- [x] LUA-29. Two-domain headless consumer — #498
+- [x] LUA-31. Wait for accepted-tick accounting — #503
+- [x] LUA-30. Explicit failure, overload and stop — #499
+- [x] LUA-8. Integrated trusted two-domain acceptance — #500
+
+The checked feasibility investigations delivered evidence, not successful
+containment qualification. Completed implementation children retain their
+original issues, PRs, receipts and contracts.
+
+## Deferred outside this revised epic
+
+- [ ] LUA-9. Child-process transport and lifetime — deferred, not implemented
+- [ ] LUA-10. Linux confinement — deferred, not implemented
+- [ ] LUA-11. macOS confinement — deferred, not implemented
+- [ ] LUA-12. Parent-enforced execution/resource budgets — deferred, not implemented
+- [ ] LUA-13. Parent-brokered mod capabilities — deferred, not implemented
+- [ ] LUA-16. Confined runtime integration — deferred, not implemented
+- [ ] LUA-17. Confined/adversarial acceptance — deferred, not implemented
+
+These are preserved historical slice IDs, not outstanding requirements for
+closing the revised trusted epic. They are not automatically scheduled or
+filed as placeholder issues. Any future hostile-code product needs new owner
+scope/readiness signoff and successful Linux/macOS qualification before the
+dependent confinement work; Q-5's inconclusive evidence does not unlock it.
+Content admitted as untrusted must never fall back to in-process execution.
+
+## Revised completion and successor
+
+This epic is complete under its revised scope: the required trusted host,
+runtime, lifecycle, request and integrated headless deliveries above are
+merged and the owner accepted LUA-8. No claim is made that the superseded
+confinement completion criteria were met. The historical contract and slice
+dependencies remain in docs/lua_runtime_design.md, with supersession notes.
+
+The successor M1 is defined in docs/designs/lua_first_engine_design.md. It
+requires a real logical runtime with stub content and a Lua-driven textured
+quad in a rendered window, including asynchronous loading, protected cleanup,
+offscreen/native evidence and independent-instance qualification. It excludes
+mod activation, gameplay state, replay, hot-swap and general input. Its epic
+and children are filed only through the separately authorized design-processing
+workflow after readiness. Existing #446 remains separately deferred.
+
+## Evidence and related work
+
+- Trusted acceptance: #500 / PR #509 / b7f3b56e.
+- Owning host contract: packages/scripting-lua/README.md.
+- Sample contract: samples/lua-domains/README.md.
+- Design/history: docs/lua_runtime_design.md.
+- Alignment evidence: docs/guide/2026-10-21T140406Z-b7f3b56.md (snapshot-scoped).
+- Inconclusive platform evidence: docs/archive/lua_linux_confinement_verdict.md
+  and docs/archive/macos_confinement_verdict.md.
+- Clock/scheduling predecessor: #131/#133; window/graphics lifetime: #140.
+- Foundation FND-5 overlaps delivered LUA-2/LUA-3 and must be reconciled by
+  reference, not filed again as another Lua host.
+
+<!-- issue-origin:claude -->
+```
 
 Keep the completed child references and seven explicitly deferred entries.
 Replace the live "all thirty-one required" and process-acceptance obligations
@@ -7333,11 +7570,36 @@ deliveries somehow happened. M1 will have a new epic, and documentation/tracker
 bookkeeping must be reconciled before filing it. None of this adds a state
 store, replay system or mod activation back into the quad milestone.
 
-After this package is approved, Q-9 proposes dependency-ordered, one-PR M1
-slices with concrete observable acceptance, compatibility and ownership
-boundaries. Slice decomposition and final readiness are separate signoffs;
-this package selects no issue bodies, labels, implementation or automatic
-publication authority outside this document.
+Under D-78, Q-9 proceeds alongside the wording confirmation. The manager reviews
+and signs off the process-only slice decomposition; design gaps return to the
+owner. This package grants no implementation or automatic publication authority
+outside this document. Final readiness remains a separately recorded checkpoint.
+
+### P-76. Deliver M1 through bounded implementation slices
+
+**Accepted by D-80 through Q-9 under D-78's process grant.** The Processing
+status and Delivery plan contain the same twenty-six stable IDs in dependency-
+valid order. The initial twenty-five-slice draft is revised by inserting
+LFE-26 after LFE-13; later IDs stay stable. These implement approved behavior
+only, not twenty-six filed issues or a time estimate.
+
+The first executable end-to-end quad is LFE-22, after its reusable providers
+and bindings work; LFE-23–LFE-25 complete the cross-service and visual/native
+evidence required for M1. Earlier slices each deliver a working, tested public
+or subsystem boundary. No skeleton-only placeholder PR, temporary game-specific
+Haskell launcher, fake production loader, or later replacement of ownership is
+planned. Existing host/scheduler/renderer mechanisms are extended narrowly.
+
+The manager may change process boundaries/order without returning to the owner
+so long as behavior, scope, evidence and ownership remain the approved ones.
+Retain stable IDs once referenced; subsequent splits get new IDs and an explicit
+dependency/ledger revision. A change to a limit, format, VM/failure policy,
+supported content, lifetime or acceptance is a design revision and stops the
+affected work for owner resolution. A hard implementation problem alone is
+not permission to relax the contract.
+
+D-79 releases the wording/publication hold. D-80 supplies manager Q-9 signoff;
+finish the readiness audit after publication. No tracker creation occurs here.
 
 ## Open questions
 
@@ -7846,21 +8108,19 @@ escalation follow.
 
 ### Q-8. How should the prior vision and Lua epic be reconciled?
 
-**Active checkpoint, P-75.** Approve the five-part reconciliation package or
-name revisions: V-1's Lua application boundary; V-9/V-4/V-5's trusted M1
-qualifications; the old Lua design's delivered/deferred status; explicit
-scope reduction and closure of #145 with a separate M1 epic; and the controlled
-documentation/tracker handoff. Exact proposed text and costs are in P-75.
-No vision, prior-design, memory or tracker mutation occurs in this session.
-Q-9 delivery slices follow this owner decision; readiness is not implied.
+Resolved by D-79: all five P-75 parts and their exact wording confirmed.
+Historical evidence and seven unfinished confinement slices remain preserved.
+The designer's narrow vision/prior-design publication is authorized; the
+manager owns #145 and MEMORY follow-up. Q-9 proceeds under the manager's
+process authority; readiness is not implied by this wording confirmation alone.
 
 ### Q-9. What is the accepted delivery order and final scope?
 
-D-43/P-40 settles M1's quad outcome, evidence and deferred areas. Fix remaining
-M1 API contracts, exact acceptance commands and prerequisite order, then split
-into one-PR outcomes. Mod features, state, generalized input and hot-swap do not
-block this epic. Identify verification, compatibility and explicit deferrals
-for each M1 slice; do not invent persistence/migration work outside its scope.
+Resolved by D-80 under D-78's manager process authority: the plan is accepted
+with LFE-13 split, new LFE-26 and explicit lifecycle invariant/sweep requirements.
+Mod activation, state, general input and hot-swap remain outside M1. No new
+persistence/migration behavior is introduced. This is plan signoff, not issue
+creation or PR approval; final readiness audit follows.
 
 ### Q-10. Investigate deliberate script hot-swapping
 
@@ -7945,9 +8205,506 @@ D-43 makes this document's eventual epic and `LFE-N` slices M1-only.
 Later design areas remain recorded here for continuity, without blocking the
 M1 epic or being silently scheduled inside it. P-40 records the approved allocation.
 
-Zero defined slices. Stop before decomposition while material choices remain
-unanswered. When choices settle, use stable `LFE-N` IDs, dependencies and
-one-PR acceptance signals in exactly the same order as the processing ledger.
+**Accepted under P-76/D-80; final readiness audit pending.** Each section below
+is one issue/worktree/reviewable code PR, including its own focused tests.
+Documentation lands through docs-push and is linked from that PR before review;
+it is not a separate implementation slice or a reason to rerun CI. No slice
+edits MEMORY.md. Exact issue specs, final deduplication and approval belong to
+the later process-design-doc workflow.
+
+### Component and validation boundaries
+
+These are proposed implementation locations for review, not new public Lua
+behavior. Use `packages/content` for the generic CPU content-root, inventory
+and verified-read service; it imports neither Lua nor graphics. Use
+`packages/lua-engine` for the M1 profile, manifest, service adapters and role
+composition over the existing Lua runtime, without GLFW/Vulkan dependencies.
+Use `packages/lua-engine-graphics` for adapters from those narrow services to
+the existing asset/GLFW/graphics interfaces. Core Lua mechanisms remain in
+`packages/scripting-lua`; PNG mechanisms remain in `packages/asset-image`.
+The executable assembles the concrete services. No engine package imports a
+sample or concrete game, and no universal mutable environment is introduced.
+Components have separate source directories and small exposed interfaces;
+these locations can be refined as process work while preserving dependency
+direction. A new public Haskell operation is justified by its named consumer
+in this plan, not speculative future mods.
+
+Preserve `cabal.project.cpu` and the mandatory floor without Vulkan headers or
+loader dependencies. The complete rendered product builds through the explicit
+Vulkan project, adding the root application/Lua/new-component dependency closure
+there. Wire the full executable at LFE-22 without making routine CPU checks
+open windows or claim graphics support. Build-flag/component wiring is process
+work; inventing a second user command, silently degrading `run` to fake graphics,
+or changing the approved `run` behavior is not. Existing `lua`, smoke, help and
+default console behavior keep their compatibility coverage in both applicable
+build profiles. No graphics-only dependency flows into the reusable host.
+
+Validation names below are families, not claims that future suites already
+exist. Existing targets are `hetoimasia-scripting-lua:lua-host-tests`,
+`hetoimasia-scripting-lua:lua-runtime-tests`,
+`hetoimasia-asset-image:asset-image-tests` and root `hetoimasia-tests`.
+New content/profile/adapter suites belong to their new packages and enter
+`tools/validation/catalog.json` with the first implementing slice; the full
+product's console composition tests belong at root. Do not postpone registration
+or failure-path tests to the final acceptance slices.
+
+- CPU host/runtime/content/profile tests use the CPU project with focused Hspec
+  selectors; e.g. `cabal test --project-file cabal.project.cpu
+  hetoimasia-scripting-lua:lua-runtime-tests --test-show-details=direct` for
+  runtime changes. The issue names the actual new target/selector once defined.
+- Codec tests use `cabal test --project-file cabal.project.cpu
+  hetoimasia-asset-image:asset-image-tests --test-show-details=direct`.
+- GPU/offscreen tests use the existing `bash tools/vulkan/run.sh test` path and
+  the owning registered targets. Main-thread/window tests use that runner's
+  native path, with isolated Linux X11 or per-command local macOS desktop
+  opt-in. New suites obey the same routing, not a parallel native harness.
+- Each PR asks `python3 tools/validation/plan.py --base origin/master --head HEAD`
+  for its actual required groups. This design does not invent CI receipts or
+  bypass the mandatory floor. No `cabal test all` or optional hang probe is
+  required merely because this arc touches Lua.
+
+Use explicit gates, injected clocks and small validated test budgets for
+ordering, cancellation and saturation; no timing sleeps as correctness proof.
+Every slice preserves primary and cleanup failures, and documents owners,
+threads, readers/writers, lifetime and disposal/reset behavior where introduced.
+Under D-80, lifecycle-heavy issues require a PR-body invariant table for every
+reservation, settlement/publication site and cancellation window: admission
+before tracking, intent before issuance, and checks before final publication.
+List the owner, reserved/borrowed resource, terminal authority and cleanup
+action on each outcome. Before review round 1, sweep every other site of the
+same shape for the same invariant, recording the searched surface and result.
+Apply this at least to LFE-7/9/10/11/13/16/17/18/20/26; a later issue adds any
+other slice with those risks. This is reviewable evidence, not a test count or
+permission to replace race coverage with a checklist.
+Retained evidence includes exact code revision, command, platform/profile and
+limitations. Offscreen and native suites supplement model tests; they do not
+replace boundary tests, prove performance or establish confinement.
+
+### Proposed slices
+
+#### LFE-1. Install the explicit filtered M1 library profile
+
+- **Depends on:** delivered Lua host; no new LFE dependency.
+- **Boundary:** an opt-in host profile installed before any authored module;
+  remove D-5's complete list and D-69's RNG functions, including alternate
+  references through accessible library tables. Keep other host profiles and
+  the existing `lua` command unchanged. No filesystem service or launcher yet.
+- **Acceptance:** real-interpreter tests enumerate forbidden names/aliases,
+  preserve permitted computation/coroutines, and show separate owners cannot
+  acquire an omitted library through the profile. Calls fail as ordinary Lua
+  operations where specified; this makes no hang/memory containment claim.
+- **Owner/tests:** Lua bridge/profile, `lua-host-tests`; document the exact
+  profile and trusted-code limitation.
+
+#### LFE-2. Add opt-in recoverable binding validation and refusal
+
+- **Depends on:** delivered registration/runtime machinery; no new LFE dependency.
+- **Boundary:** narrow opt-in pre-action validation/refusal support for M1's
+  catchable errors and no-work busy return. Keep old generic binding failure
+  authority unchanged. Expose only the hook needed by the M1 adapter, with
+  no exception-swallowing wrapper around a fatal action.
+- **Acceptance:** pcall can catch malformed/phase/owner refusals, action counters
+  stay zero, and the same VM can make a valid next call. Uncaught Lua faults
+  and deliberately latched required/provider/cleanup failures still stop the
+  appropriate owner even when Lua catches their immediate error.
+- **Owner/tests:** registration/bridge and runtime error classification;
+  host/runtime tests include legacy-client compatibility and callback cleanup.
+
+#### LFE-3. Parse the strict manifest and validate the fixed M1 profile
+
+- **Depends on:** none; consumes approved D-74/D-77 contracts.
+- **Boundary:** strict byte-oriented JSON manifest parsing and pure validation
+  into role/entry/clock configuration; fixed production budget values with
+  validated smaller test configurations. No filesystem traversal or VM startup.
+  Parser/dependency selection is implementation work under the pinned toolchain.
+- **Acceptance:** duplicate decoded keys, invalid UTF-8/surrogates, unknown
+  fields, wrong types, null, size/depth limits and role/entry/tick combinations
+  fail before Lua; exact decimal nanoseconds and boundary arithmetic match
+  D-74/D-77. No default tick, hidden extension fields or numeric coercion.
+- **Owner/tests:** CPU profile component; fixtures cover accepted manifest
+  examples and limit/one-past cases without adding a Lua tuning API.
+
+#### LFE-4. Own anchored native content roots and no-follow reads
+
+- **Depends on:** none; generic content service independent of manifest/Lua.
+- **Boundary:** native Linux/macOS root ownership resolves the launch path once,
+  anchors the actual directory and opens descendants without following internal
+  links, checking types on actual handles. Enumeration/read handles remain
+  borrowed from a protected root lifetime; no string-prefix confinement substitute.
+- **Acceptance:** temporary-directory tests exercise root rename/retarget,
+  internal links, component swaps, unsupported types and partial-open failure;
+  actual readers drain before root close. Preserve hard-link/mount policy and
+  detect ancestor directory cycles using native identity, not path spelling.
+- **Owner/tests:** new content service/native adapters, CPU platform-owned
+  tests on Linux and local macOS. No real personal folder is mutated; mounting
+  privileged test filesystems is not required or silently attempted.
+
+#### LFE-5. Validate literal Unicode content identities
+
+- **Depends on:** LFE-3's profile values, without making generic content depend
+  on the Lua profile package; pass narrow limit values from the caller.
+- **Boundary:** literal root-relative path grammar, UTF-8/NFC identity, exact
+  case lookup and sibling caseless/normalization collision detection with a
+  logical-to-native mapping. Pin the normalization/case data used; no host
+  filesystem's case behavior becomes the logical lookup policy.
+- **Acceptance:** composed/decomposed matches, exact-case mismatch, collisions,
+  invalid encoding, forbidden separators/segments and both pre/post-normalized
+  byte limits; distinct hard-link names remain distinct identities. Pure and
+  native-name fixtures distinguish argument refusal from bad inventory.
+- **Owner/tests:** generic content identity module and its focused CPU tests.
+  No normalization shortcut, extension search or path overlay is introduced.
+
+#### LFE-6. Build and verify the bounded whole-folder inventory
+
+- **Depends on:** LFE-4, LFE-5; assembly limits from LFE-3.
+- **Boundary:** startup traversal hashes every regular file with streaming
+  SHA-256 and retains identity/path/size/digest, not all bytes. Later reads
+  validate the exact returned buffer through the anchored root. Include the
+  manifest bytes and every declared entry path in boot verification.
+- **Acceptance:** hidden/unused files, aliases, total/individual limits,
+  changing/unreadable files, directory cycles and missing/type-changed paths;
+  later content edits fail, newly added paths stay absent, and parse/compile/
+  decode consume only verified bytes. No hash-then-reopen race or byte snapshot.
+- **Owner/tests:** content inventory/read boundary, CPU tests with controlled
+  mutations and bounded buffers; no claim of an atomic filesystem snapshot.
+
+#### LFE-7. Reserve M1 requests and results atomically
+
+- **Depends on:** LFE-2, LFE-3; existing instance/request owners.
+- **Boundary:** opt-in admission metadata carries required/optional policy and
+  validated logical offset. Reserve request/result/provider credits as one
+  operation or return busy with no handle/work. Supply terminal take-once,
+  non-consuming ready/wait and cancel race semantics through the narrow adapter.
+- **Acceptance:** full/multi-bank refusal leaves zero reservations/actions;
+  due-tick versus UI delivery, required failure without polling, caught-error
+  latching, cancel-first/settle-first, take-invalidates and actual-retirement
+  capacity release. Inject counter exhaustion; preserve existing generic host
+  semantics outside this opt-in path.
+- **Owner/tests:** request/runtime internals plus M1 adapter tests with fake
+  providers. No native provider or hidden retry queue is added in this slice.
+
+#### LFE-8. Retain VM-local module exports and captured behaviors
+
+- **Depends on:** LFE-1, LFE-2; behavior schema/limits from LFE-3.
+- **Boundary:** text-module evaluation yields exactly one plain export table
+  held by the VM; retain functions/graphs without copied-value serialization.
+  Validate selected role behavior and capture hooks/cadence for each instance;
+  fresh self remains separate from shared exports. No filesystem/import waiting.
+- **Acceptance:** shared table identity within one VM, independence across VMs,
+  sticky evaluation/return-shape failure, missing/non-function hooks, wrong
+  cadence, private module globals, and reference cleanup on VM close. Later
+  behavior-table edits do not replace captured hooks; mutable upvalues remain Lua.
+- **Owner/tests:** host export references and runtime instance construction;
+  real-interpreter host/runtime tests, including old module API compatibility.
+
+#### LFE-9. Resume ordered module import chains on their VM owner
+
+- **Depends on:** LFE-8; existing coroutine/scheduling boundary.
+- **Boundary:** resumable engine-managed evaluation, one active chain per VM,
+  depth-first imports in Lua call order, root/path cache and sticky cycle/failure
+  results. Source suppliers are narrow injected verified-byte operations;
+  production filesystem/job wiring comes later. Top level cannot acquire services.
+- **Acceptance:** import suspends for source and resumes only on its VM owner;
+  chain errors include paths, limits count failed/pending entries, a non-yielding
+  module remains trusted code. UI hooks/stop progress while a source is held,
+  and module exceptions/stop safely release loader references. No C require,
+  Lua binary loader, new thread entering Lua or cross-VM direct call.
+- **Owner/tests:** generic loader/runtime boundary; gated real-interpreter tests.
+
+#### LFE-10. Load raw data through owned bounded file workers
+
+- **Depends on:** LFE-3, LFE-6, LFE-7.
+- **Boundary:** two owned I/O workers and bounded queues for accepted verified
+  byte reads; data requests reserve known length, return the complete byte
+  string, and account held/unconsumed/retiring payloads. Reuse the read service
+  for later module and texture sources; worker slots are not waiter slots.
+- **Acceptance:** raw NUL/non-text bytes, size/content errors, optional fallback,
+  required failure, busy without I/O, cancellation during read and late logical
+  delivery. Full normal queues cannot block reserved completion/cleanup work;
+  root/sink/provider dependencies outlive every started reader.
+- **Owner/tests:** content worker service and M1 data adapter; focused CPU
+  tests with explicitly gated reads, no sleep-based ordering or cache.
+
+#### LFE-11. Join shared module jobs and deliver them at assigned positions
+
+- **Depends on:** LFE-7, LFE-9, LFE-10.
+- **Boundary:** one VM-owned load job per root/path, per-instance waiter handles,
+  ordered evaluation roots and independent waiter due positions. Cancel removes
+  only interest; no-waiter jobs still finish/cache until VM stop. Reserve source
+  space for the active dependency ahead of unrelated prefetch.
+- **Acceptance:** A due at 10 importing B requested for 12 evaluates B once at
+  10 while B's ticket settles at 12; UI admission order cannot be overtaken by
+  faster I/O. Failed cache/join/full-cache rules and earliest-obligation-after-
+  cancel match D-57–D-59/D-67. Full prefetch cannot deadlock the active chain;
+  no worker waits for work that needs its own occupied pool slot.
+- **Owner/tests:** M1 loader coordinator over generic Lua loader; real VMs and
+  gated providers, including instance end, module failure and stop/drain races.
+
+#### LFE-12. Bind per-instance content, request, time and output APIs
+
+- **Depends on:** LFE-3, LFE-7, LFE-8, LFE-11.
+- **Boundary:** fresh self/api with captured metadata and instance-bound dot
+  calls for module/data/request/clock/wait/yield. Install lexical-root import
+  semantics and rebounded print/warn before module evaluation. Inject narrow
+  session-control endpoints for the following slice; no graphics dependency.
+- **Acceptance:** the P-72 busy-retry example runs on real Lua; shared-module
+  helpers retain lexical import roots while service requests use instance roots.
+  Foreign/consumed handles, colon/extra arguments, wrong phase/VM, exact integer
+  versus numeric seconds, sampled UI time and round-up/overflow cases obey
+  schemas. Bounded escaped output, attribution, sink failure and serialization
+  are tested without exposing original streams or logger configuration.
+- **Owner/tests:** CPU Lua-engine facade/clock/output adapters; public-consumer
+  tests use no internal VM handles and keep the general host unchanged.
+
+#### LFE-13. Coordinate role startup gates, failure policy and session stop
+
+- **Depends on:** LFE-3, LFE-12.
+- **Boundary:** generic one/two-role session composition, concurrent root inits,
+  UI starts on own readiness, logical ticks wait for the joint gate; fixed
+  FIFO cadence over the existing scheduler. Internal narrow stop/failure/status
+  endpoints support LFE-26, without adding its Lua status/control bindings here.
+- **Acceptance:** both init completion orders, UI during blocked logical init,
+  either init failure, no late gate reopen, logical failure with healthy UI,
+  UI/one-role/engine failure, shutdown eligibility, stop and drain. Late starts
+  and issued work cannot escape closure of admission. Inject overflow, partial
+  startup and secondary cleanup failures; prove no reopening or false retirement.
+  No world, progress channel or new event API. D-80's invariant table and
+  same-shape cancellation/publication sweep precede review round 1.
+- **Owner/tests:** CPU session coordinator and composed real-VM tests; protected
+  provider/VM ordering remains engine-owned rather than shutdown-hook order.
+
+#### LFE-26. Expose UI status, quit and the unavailable-state guard
+
+- **Depends on:** LFE-12, LFE-13.
+- **Boundary:** bind the copied, per-hook/resumed-segment UI status record and
+  its latched failure fields; expose session quit and global/api state() guard
+  through LFE-13's narrow coordinator endpoints. State guard prints once and
+  latches whole-session failure; it is not a store or an ordinary role failure.
+- **Acceptance:** repeated status reads within a segment agree, later segments
+  see transitions, copying/mutating a result cannot mutate the engine, wrong-VM
+  reads are ordinary errors. Quit returns normally, closes new work immediately,
+  is idempotent and cannot be caught away; state guard stays terminal even when
+  caught at module or hook scope. Failure/status publication cannot race past
+  stop or erase the first failure. Test all D-76 record fields and omissions.
+- **Owner/tests:** CPU session facade and real-VM tests over the coordinator;
+  D-80's reservation/publication/cancellation invariant table and whole-shape
+  sweep are required before first review. No new session-control features.
+
+#### LFE-14. Preflight static PNG structure and bounded inflation
+
+- **Depends on:** approved D-65/D-77 limits; no graphics/Lua dependency.
+- **Boundary:** a bounded decoder entry/preflight path checks signature, static
+  PNG profile, chunk count, dimensions, checked scanline sizes and inflation
+  limit before size-derived allocation. Ignored metadata is not decompressed.
+  Existing broad Haskell decode entry points remain compatible.
+- **Acceptance:** APNG/non-PNG/malformed/oversized distinctions, limit-and-one-
+  past fixtures, excessive compressed scanline output and arithmetic failures
+  stop at the bounded operation. Prove incremental inflation obeys the cap;
+  post-decode size checks or catching an out-of-memory failure are insufficient.
+- **Owner/tests:** asset-image decoder boundary and codec tests; supply the
+  bounded input needed by LFE-15, without claiming full workspace proof yet.
+
+#### LFE-15. Decode the approved PNG variants within accounted workspace
+
+- **Depends on:** LFE-14.
+- **Boundary:** complete the bounded decode/conversion path for the existing
+  approved PNG color/depth/interlace variants, one RGBA8 sRGB premultiplied
+  level, with explicit live-buffer/workspace accounting. Reuse audited decoder
+  mechanisms or extend the adapter; do not silently narrow the accepted formats.
+- **Acceptance:** palette/transparency/16-bit/interlaced fixtures preserve texels
+  and orientation; peak accounted encoded/inflate/intermediate/convert/staging
+  payload stays within D-77's bank. Release retained buffers on refusal and
+  cancellation. Document the allocation argument and excluded runtime overhead;
+  RSS observation alone is not proof. Keep KTX2/BC7/mip APIs unchanged.
+- **Owner/tests:** asset-image codec tests and focused allocation/retention
+  assertions; unsupported library internals cannot be assumed bounded.
+
+#### LFE-16. Own texture pipeline lanes, leases and byte reservations
+
+- **Depends on:** LFE-3, LFE-7, LFE-10, LFE-15.
+- **Boundary:** one decode worker and two texture lanes share the existing file
+  workers. Reserve texture/request/result credits and worst-case nominal bytes
+  atomically; shrink safely after validated dimensions. Model per-instance
+  ownership and explicit release/cancel while injecting the upload backend.
+- **Acceptance:** two independent loads of the same path, pipeline-stage and
+  cancellation races, release while displayed/in-flight, repeated release,
+  retained capacity until actual retirement, and no worker-slot deadlock.
+  Full normal queues leave drain capacity. No texture cache, early CPU-scope
+  disposal, module-lifetime lease or global instance resource registry.
+- **Owner/tests:** CPU adapter ownership/queue model with real bounded decoder
+  and gated fake GPU completion; later GPU proofs cannot replace these races.
+
+#### LFE-17. Finish texture requests through real GPU readiness
+
+- **Depends on:** LFE-16; delivered GPU upload/registry services.
+- **Boundary:** concrete graphics adapter allocates/uploads/registers the texture
+  before settling success with an instance handle and dimensions. Works before
+  any window exists and borrows the protected graphics owner. Use the existing
+  validated native budget and completion accounting, not an independent allocator.
+- **Acceptance:** actual uploaded texels, usable registration at success,
+  cancellation/instance-end at allocation/upload/registration stages and
+  failure cleanup; retained dependencies survive until completion. Device/
+  provider/cleanup faults remain fatal rather than optional image errors.
+- **Owner/tests:** graphics adapter, existing headless GPU runner and focused
+  integration tests. No presentation or window requirement for this slice.
+
+#### LFE-18. Create and retire instance-owned windows asynchronously
+
+- **Depends on:** LFE-7, LFE-13; delivered GLFW/graphics host.
+- **Boundary:** UI window provider dispatches on the main-thread host, with one
+  pending/live/retiring slot per instance, required creation and readiness once
+  scene publication is accepted. Native close requests session quit; instance
+  retirement closes its own window without generating a peer-ending user quit.
+- **Acceptance:** concurrent create/cancel/stop, partial attachment and delayed
+  actual retirement, invalid second request, slot release, title/size checks,
+  no ready-before-publish capability and no displayed-frame promise. Another
+  instance's target remains valid after owner retirement.
+- **Owner/tests:** graphics window adapter with headless protocol tests and
+  explicit native checks for actual creation/retirement; no Lua close/reopen.
+
+#### LFE-19. Validate and copy the fixed M1 scene schema
+
+- **Depends on:** LFE-2, LFE-3, LFE-16's neutral texture authority boundary.
+- **Boundary:** exact plain table clear/sprite schema, whole-copy preparation,
+  finite/Float32 checked rectangles, sRGB byte conversion and ordered full-image
+  nearest sprites. Resolve ownership/readiness through narrow texture checks;
+  translate to existing pure render-2d snapshots without native work.
+- **Acceptance:** whole-call refusal for holes, unknown fields/metatables,
+  released/foreign/not-ready textures, bad numerics or oversized scenes;
+  later Lua edits do not change a prepared snapshot. Verify ordering, alpha,
+  empty clear and coordinate conversion with the existing renderer oracle.
+- **Owner/tests:** scene preparation adapter with CPU Lua/renderer tests;
+  no rotation/crop/camera/tint/material or mutable scene-object API.
+
+#### LFE-20. Publish scenes with completion-safe texture retention
+
+- **Depends on:** LFE-17, LFE-18, LFE-19.
+- **Boundary:** atomically publish a complete snapshot to the instance's ready
+  window; reuse the latest-scene slot and bounded adopted-revision ledger.
+  Publication owns texture interests through real frame/presentation use,
+  including a Lua release immediately after publish.
+- **Acceptance:** refusal keeps the previous scene, release prevents new scene
+  use without invalidating an old one, replacement/close eventually retires
+  interests, and full adopted capacity defers safely. Resize/content-scale/
+  zero-size behavior remains the renderer's existing view contract. No final
+  frame or GPU completion is inferred from a CPU function returning.
+- **Owner/tests:** headless GPU/scene tests and focused native retention checks;
+  preserve the six-revision policy and no unbounded publication FIFO.
+
+#### LFE-21. Expose the complete UI-only graphics facade
+
+- **Depends on:** LFE-12, LFE-13, LFE-26, LFE-20.
+- **Boundary:** bind D-76's texture/window/scene/release functions to the real
+  providers with per-instance capabilities, complete request values and the
+  UI-only/phase/quit checks. The CPU facade receives narrow service operations;
+  it does not import the concrete graphics package or share another VM's API.
+- **Acceptance:** Lua init can request texture and window together; update
+  collects once, publishes and releases. Wrong VM/owner/phase has zero native
+  action; optional image failures return structured data, required failures
+  latch without polling, late cancel cannot erase failure, and post-quit calls
+  follow the exact allowed/refused split. Engine-owned cleanup survives absent
+  shutdown, lost handles and throwing init/shutdown.
+- **Owner/tests:** real-Lua graphics adapter tests using both gated providers
+  and real GPU paths; no Haskell game rules or special-case quad binding.
+
+#### LFE-22. Assemble the generic run command and Lua quad content
+
+- **Depends on:** LFE-6, LFE-11, LFE-13, LFE-26, LFE-21.
+- **Boundary:** `hetoimasia run GAME_ROOT` / `run -- GAME_ROOT` composes the
+  protected root/inventory, profile, roles, providers, main-thread GLFW and
+  graphics owner. Add the explicit full-product build wiring while preserving
+  CPU-only compatibility. Ship a small content folder containing the accepted
+  manifest, logical stub, Lua UI and clearly identified technical PNG fixture.
+- **Acceptance:** actual P-73 flow runs without game-specific Haskell; invalid
+  arguments exit 2 before filesystem work, manifest/content boot failures exit
+  1 before Lua, clean stop 0, orderly signal 130 unless failure, second signal
+  forces 130. Existing help/smoke/lua commands keep behavior. Common/separate
+  entry and each accepted role selection use the same assembly contract.
+- **Owner/tests:** executable composition and root CLI tests; real graphics
+  smoke through the explicit runner. Protected stop owns all services; no
+  test-only provider is substituted in the production command.
+
+#### LFE-23. Qualify integrated failure and two-instance ownership headlessly
+
+- **Depends on:** LFE-22.
+- **Boundary:** integrated public-consumer qualification covers combinations
+  that local provider tests cannot: two engine-owned instances in one VM plus
+  independent role owners, shared module exports, distinct resource attribution,
+  early/late failure and full-queue stop. Test composition may create the second
+  instance; no Lua spawn/mod API is added.
+- **Acceptance:** same-path textures remain separate interests, ending one
+  instance leaves the peer operating, no lost terminal result or double cleanup,
+  both init orders and role failures match status/exit, unavailable state is
+  terminal even when caught, and assigned logical results are not retimed by
+  I/O delay. No replay or world-transaction assertion enters this suite.
+- **Owner/tests:** package/root composition Hspec tests with explicit gates
+  and production loader/VM paths; fake native edges isolate races, while the
+  following two slices establish pixels and desktop resource use.
+
+#### LFE-24. Verify Lua-authored output through offscreen pixels
+
+- **Depends on:** LFE-22, LFE-23.
+- **Boundary:** drive real content/module/PNG/request/scene bindings into managed
+  offscreen rendering using the existing capture/oracle facilities. The test
+  adapter replaces only the display target, not decoder, scene preparation,
+  texture upload, Lua API or ownership. No new Lua offscreen API is exposed.
+- **Acceptance:** expected textured quad, top-left coordinates, nearest full
+  image, transparent overlap/draw order, sRGB mid-grey, clipping and empty
+  clear; rejected publication keeps old pixels and release-after-publish
+  preserves output through completion. Retain selected evidence with checksums,
+  exact source/command/profile and explicitly labeled technical assets.
+- **Owner/tests:** graphics acceptance suite through the Vulkan headless runner.
+  This establishes pixel semantics, not native window behavior or performance.
+
+#### LFE-25. Qualify native windows, independent retirement and quit
+
+- **Depends on:** LFE-24.
+- **Boundary:** final full-product Linux X11 and local macOS qualification using
+  the approved native harness/consent rules. Exercise the actual command and
+  a public-composition two-instance harness with the same content path. Existing
+  Wayland/platform rules remain; this slice adds no platform qualification claim.
+- **Acceptance:** visible textured output; initial empty window allowed; resize
+  clips without stretching, zero framebuffer pauses drawing and restores;
+  one instance retires with pending/displayed work while the other's window
+  and texture continue. Native user close requests session quit; Lua quit,
+  signal stop, creation failure and cleanup retain exit/ownership rules.
+  Retain platform-specific evidence; no GPU retirement inferred from a timeout.
+- **Owner/tests:** root/full-product native composition and graphics native
+  suites, narrowly routed by the validation catalog. Final arc accounting
+  links all required receipts and deferrals; completion needs the actual quad
+  and independent-instance evidence, not only green headless tests.
+
+### Coverage and handoff checks
+
+| Approved contract family | Owning delivery slices |
+| --- | --- |
+| Filtered trusted library, no RNG/ambient OS | LFE-1, LFE-2, LFE-12 |
+| Manifest, exact clocks, fixed limits | LFE-3, LFE-7, LFE-12, LFE-13 |
+| Root anchoring, Unicode, fingerprinted bytes | LFE-4–LFE-6, LFE-10 |
+| VM-local exports, resumable imports, shared jobs | LFE-8, LFE-9, LFE-11 |
+| Request schemas, required failure, busy/cancel/take | LFE-7, LFE-10–LFE-13, LFE-21 |
+| Workers, payload banks, no false retirement | LFE-10, LFE-11, LFE-16–LFE-18, LFE-20 |
+| PNG profile and pre-allocation/workspace bounds | LFE-14, LFE-15, LFE-16 |
+| Window/texture/scene calls and per-instance ownership | LFE-16–LFE-21 |
+| Concurrent boot, role status, guard/quit/output/exit | LFE-12, LFE-13, LFE-26, LFE-22, LFE-23 |
+| Two-instance qualification, actual pixel/native output | LFE-23–LFE-25 |
+
+The plan has twenty-six slices and no unassigned approved M1 service family.
+That coverage statement is a design mapping, not proof that implementation
+is feasible without further engineering. Concrete dependency/codec/native
+obstacles must be investigated within the owning slice; if resolution would
+change approved behavior or qualification, stop that slice and escalate.
+Implementers may refine modules and test selectors, not weaken P-74 limits or
+replace protected work with fake production providers. No later-arc decision
+is silently implemented to make a current slice easier.
+
+Before readiness: Q-8 exact wording is confirmed by D-79 and Q-9 process
+boundaries by D-80; reconcile any design gaps, recheck tracker overlap and
+record the final readiness authorization. Before filing
+the new epic, the manager's separately authorized reconciliation must resolve
+#145's current required-scope wording. The process-design-doc workflow then
+handles the epic and exactly one child per invocation with its own tracker
+approval. This design session creates none of them.
 
 ## Source notes
 

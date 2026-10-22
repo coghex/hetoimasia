@@ -14,12 +14,21 @@ or an agent recommendation. Preserve these principle IDs.
 
 ### V-1. A reusable engine, with the game outside it
 
-Build a modular Haskell engine using Lua for game authoring and Vulkan for the
-first graphics backend, with independent 2D and 3D renderers. Applications
-assemble services and own game rules, assets and authoritative state. Engine
-packages never import concrete games. Use narrow services and opaque handles,
-not a universal `EngineEnv`, service locator or mutable global registry. An
-application-wide monad must not conceal dependency ownership.
+Build a modular Haskell engine using Lua for game authoring and Vulkan for
+the first graphics backend, with independent 2D and 3D renderers. The generic
+executable assembles services and starts a game's Lua content without
+game-specific Haskell. The Lua game is the application: it defines game
+rules, authored data, assets and orchestration through narrow engine services.
+Engine packages never import concrete games. Use narrow services and opaque
+handles, not a universal EngineEnv, service locator or mutable global
+registry. An application-wide monad must not conceal dependency ownership.
+
+Owner direction of 2026-10-21: the later gameplay-state arc is engine-held
+and Lua-defined. The Lua-first textured-quad milestone deliberately has no
+gameplay state store; state-service calls report unavailability and stop
+the session. This deferral does not assign an authoritative world to Lua
+tables or promise rollback of Lua mutations. The milestone's scope and
+service contracts are in the Lua-first engine design, D-41–D-43.
 
 Preserve Synarchy's useful reasoning about GLFW, logging, monotonic time,
 shaders and rendering deliberately. Reuse is selective; its coupled environment
@@ -80,6 +89,13 @@ Supervision uses checkpoints and supervised waits, without promising interruptio
 of every blocking operation. Logging failures must not replace an earlier
 primary failure. See [runtime foundation](archive/runtime_foundation_design.md).
 
+Lua-first M1 distinguishes pre-admission busy refusal with no work started,
+ordinary Lua validation/phase/ownership errors, accepted optional content
+failure, and latched required failure. Catching or ignoring a required
+failure does not clear it. Whole-scene refusal keeps the previous complete
+scene; it does not roll back arbitrary Lua or resource effects. Engine and
+cleanup failures retain fatal authority and primary/secondary evidence.
+
 ### V-5. Bounded communication and responsive ownership
 
 Use bounded FIFO commands/events and coherent latest-value snapshots. Prepare
@@ -105,6 +121,11 @@ the application chooses which thread produces them, and a simulation driver is
 deferred. This does not promise window-command progress during a Cocoa modal
 loop, or qualify rendering progress without the retained VK-16 native evidence.
 See [Vulkan decisions D-29–D-33](archive/vulkan_backend_design.md) and LIFE D-6.
+
+Lua-first M1 introduces a logical Lua tick driver, not a gameplay-state
+simulation/commit service. UI publishes copied latest scenes independently
+of logical completion. Service workers, results and retirement bookkeeping
+have explicit finite ownership and admission budgets.
 
 ## Graphics and platforms
 
@@ -155,35 +176,38 @@ Compositor loss cannot manufacture GPU completion.
 
 ## Scripting, tests and delivery
 
-### V-9. Responsive Lua domains with untrusted-process isolation
+### V-9. Responsive trusted Lua domains with filtered services
 
-Own independent UI and gameplay execution domains with bounded scheduling and
-communication. Untrusted mods require confined processes per mod and domain,
-explicit capability grants and enforced memory/execution limits. They receive
-no ambient filesystem, network, process-launching or native-module authority.
-Unsafe authoritative-state failure stops the affected gameplay session while
-UI remains available to report it.
+Own independent logical and UI/presentation execution domains with bounded
+scheduling and communication. Owner direction of 2026-10-21 treats game and
+mod Lua alike as trusted, in-process code. Both use the same filtered
+standard-library policy and engine-provided content services. Scripts receive
+no ambient OS, filesystem, network, process-launching or native-loader API.
+The Lua-first design specifies the removed functions, content-root access
+and phase/instance checks; mod activation is later work, not part of M1.
 
-The game's own first-party scripts are trusted and run in-process in those
-domains, calling bindings directly without IPC (owner decision 2026-09-22,
-Lua D-12). Mods keep the confined pipeline. Both share one module and
-capability registration layer, and the trusted path is never a mod fallback.
+Filtering is not hostile-code containment. A trusted script can hang its VM
+or exhaust application memory. Cooperative budgets, provider accounting,
+distinct VMs and module environments are not hard execution or memory limits.
+Direct bindings cannot synchronously enter another VM owner. Dependencies
+remain held until actual completion; cancellation is not proof of retirement.
 
-Owner decisions on 2026-09-24 (Lua D-13/D-14) permit trusted delivery
-independently of confinement qualification, after renewed design readiness.
-Binding registration defaults to no mod exposure: a confined binding needs an
-explicit grant and supported bounded transport semantics. Direct bindings need
-no IPC equivalent and cannot synchronously enter another VM owner. Trusted
-scripts may hang or exhaust application memory; cooperative budgets are not
-hard limits, and their dependencies remain held until actual completion.
-Confined integration and adversarial acceptance remain required for the full
-Lua arc, behind successful qualification on both platforms.
+Confined processes are no longer a requirement for trusted game/mod delivery
+or completion of the delivered trusted Lua arc. LUA-9–LUA-13, LUA-16 and
+LUA-17 are deferred outside the active roadmap by the revised trust decision.
+LUA-14/LUA-15 remain delivered feasibility investigations with inconclusive
+verdicts, not qualified containment. If hostile-code support is requested
+later, it needs an explicit new scope/readiness decision and successful
+platform qualification before dependent confinement work; there is no
+unconfined fallback for content admitted as untrusted.
 
-Cooperative scheduling is not hostile-code containment. A merged probe with an
-inconclusive verdict does not qualify deployment or release its dependent gates.
-Callback threads are runtime machinery, not cancellation endpoints; limits and
-cancellation follow the VM-owner or process protocol. See [Lua design](lua_runtime_design.md)
-and its platform confinement verdicts.
+An ordinary logical-role failure stops that role while a healthy UI can
+report it until exit. In M1 the UI receives lifecycle/failure status, not
+a world snapshot: there is no engine-held gameplay state to freeze or roll
+back. UI-role failure, engine/provider/cleanup failure, or a call to the
+unavailable state service ends the session. The Lua-first startup gate and
+one-role rules define the cases where no healthy UI can continue. Callback
+threads remain runtime machinery, not cancellation endpoints.
 
 Owner decision 2026-10-17 ([Lua D-23](lua_runtime_design.md#d-23-deterministic-simulation-is-a-design-requirement)):
 deterministic authoritative simulation is a design requirement. The initial
@@ -196,6 +220,17 @@ or change its time increments. UI/presentation keep independent elapsed/frame
 timing and randomness. Applications own simulation and commit policy; engine
 contracts must support this requirement. Cross-platform/version identity and
 network lockstep are separate future qualifications, not current guarantees.
+
+For Lua-first M1, retain exact fixed logical tick duration, stable scheduled
+effect positions and assigned result delivery; late work delays progress
+without skipping ticks or stretching dt. The logical VM runs ordinary Lua
+hooks and module/data loads with Lua-local state, while the UI has its own
+elapsed clock. M1 has no state store, committed-world/digest/replay API,
+engine RNG or seeded-stream guarantee; math.random and math.randomseed are
+removed in both roles. It claims no whole-session or cross-run gameplay
+determinism. The existing lua-domains sample retains its own D-23/D-48
+qualification, including the limit on late independent failures. Its state
+transactions, replay and seeded streams are not M1 services.
 
 Owner decision 2026-10-17 ([Lua D-27](lua_runtime_design.md#d-27-engine-owned-cleanup-independent-of-script-correctness)):
 script authors must not be responsible for remembering which engine resources
