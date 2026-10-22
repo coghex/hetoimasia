@@ -41,7 +41,7 @@ import qualified Data.Map.Strict as Map
 import Data.Word (Word8)
 import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrBytes, withForeignPtr)
 import Foreign.Ptr (castPtr, plusPtr)
-import Hetoimasia.Content.Internal.Access (fileMetadata, readChunk, readInto, withFile)
+import Hetoimasia.Content.Internal.Access (fileMetadata, readChunk, readInto, withExactFile)
 import Hetoimasia.Content.Internal.Identity.Mapping
 import Hetoimasia.Content.Internal.Identity.Types (ContentKey (..), logicalPathBytes)
 import Hetoimasia.Content.Internal.Inventory.Outcome (ordinarily)
@@ -114,18 +114,21 @@ readVerified inventory root key byteCeiling = do
   where
     failed = ReadFailure (invAttribution inventory) key
     seam = rootSeam root
+    -- A content change found while the file is open is raised inside the scope,
+    -- so that if the close then fails the change stays the primary failure with
+    -- the failed close beside it; it becomes a value only after cleanup succeeded.
     verify natives fact = do
-      outcome ← ordinarily classify (withFile root natives (verifying natives fact))
+      outcome ← ordinarily classify (withExactFile root natives (verifying natives fact))
       pure $ case outcome of
         Left ordinary → Left (failed ordinary)
-        Right (Left change) → Left (failed (ReadChanged change))
-        Right (Right bytes) → Right bytes
+        Right bytes → Right bytes
+    changed change = throwIO (failed (ReadChanged change))
     verifying natives fact file = do
       let len = fromIntegral (factLength fact) ∷ Int
           bufferBytes = inventoryBufferBytes (invLimits inventory)
       metadata ← fileMetadata file
       if metadataSize metadata /= factLength fact
-        then pure (Left (LengthChanged (factLength fact) (metadataSize metadata)))
+        then changed (LengthChanged (factLength fact) (metadataSize metadata))
         else do
           seamBoundary seam (ReadOpened natives)
           buffer ← mallocForeignPtrBytes len ∷ IO (ForeignPtr Word8)
@@ -135,7 +138,7 @@ readVerified inventory root key byteCeiling = do
                   | otherwise = do
                       got ← readInto file (pointer `plusPtr` done) (min bufferBytes (len - done))
                       if got == 0
-                        then pure (Left (Truncated (factLength fact) (fromIntegral done)))
+                        then changed (Truncated (factLength fact) (fromIntegral done))
                         else do
                           view ← BSU.unsafePackCStringLen (castPtr (pointer `plusPtr` done), got)
                           go (SHA256.update context view) (done + got)
@@ -143,16 +146,15 @@ readVerified inventory root key byteCeiling = do
                   extra ← readChunk file 1
                   after ← fileMetadata file
                   seamBoundary seam (ReadBeforeCompare natives)
-                  pure $
-                    if not (BS.null extra)
-                      then Left (Grew (factLength fact))
-                      else
-                        if metadataSize after /= factLength fact
-                          then Left (LengthChanged (factLength fact) (metadataSize after))
-                          else
-                            if Sha256 (SHA256.finalize context) /= factDigest fact
-                              then Left DigestMismatch
-                              else Right (BSI.fromForeignPtr buffer 0 len)
+                  if not (BS.null extra)
+                    then changed (Grew (factLength fact))
+                    else
+                      if metadataSize after /= factLength fact
+                        then changed (LengthChanged (factLength fact) (metadataSize after))
+                        else
+                          if Sha256 (SHA256.finalize context) /= factDigest fact
+                            then changed DigestMismatch
+                            else pure (BSI.fromForeignPtr buffer 0 len)
             go SHA256.init 0
 
 -- | The ordinary failures a verified read of an inventoried name can meet. A
@@ -162,15 +164,17 @@ readVerified inventory root key byteCeiling = do
 -- already validated) cannot arise from an inventoried path and is left to
 -- propagate as the content failure it is.
 classify ∷ SomeException → Maybe ReadOutcome
-classify exception = do
-  ContentFailure _ _ kind ← fromException exception
-  case kind of
-    NotFound → Just (ReadChanged Missing)
-    ForbiddenLink → Just (ReadChanged (Retyped kind))
-    ForbiddenType _ _ → Just (ReadChanged (Retyped kind))
-    NotDirectory → Just (ReadChanged (Retyped kind))
-    MappingChanged _ _ → Just (ReadChanged (Retyped kind))
-    DirectoryCycle _ _ → Just (ReadChanged (Retyped kind))
-    Unreadable _ → Just (ReadIoError kind)
-    Unsupported _ → Just (ReadIoError kind)
-    _ → Nothing
+classify exception
+  | Just (ReadFailure _ _ outcome) ← fromException exception = Just outcome
+  | otherwise = do
+      ContentFailure _ _ kind ← fromException exception
+      case kind of
+        NotFound → Just (ReadChanged Missing)
+        ForbiddenLink → Just (ReadChanged (Retyped kind))
+        ForbiddenType _ _ → Just (ReadChanged (Retyped kind))
+        NotDirectory → Just (ReadChanged (Retyped kind))
+        MappingChanged _ _ → Just (ReadChanged (Retyped kind))
+        DirectoryCycle _ _ → Just (ReadChanged (Retyped kind))
+        Unreadable _ → Just (ReadIoError kind)
+        Unsupported _ → Just (ReadIoError kind)
+        _ → Nothing

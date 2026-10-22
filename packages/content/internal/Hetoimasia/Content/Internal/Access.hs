@@ -36,6 +36,7 @@ module Hetoimasia.Content.Internal.Access
   , withDirectory
   , withEntryFile
   , withEntryDirectory
+  , withExactFile
   , readChunk
   , readInto
   , fileMetadata
@@ -323,6 +324,33 @@ withEntryFile parent entry body = do
   withOpened root (dirFd parent) (length (dirTrail parent)) name KindRegular (Observed (entryKind entry)) trail FileHandle $ \fd _ →
     lendFile root fd trail body
 
+-- | Open the regular file at a root-relative path by its exact native spelling.
+--
+-- Every directory on the way, the root's included, is enumerated and the entry
+-- whose native name equals the requested one byte for byte is the one opened,
+-- beneath the stream that listed it. 'withFile' hands the name to the operating
+-- system, and a filesystem that folds case or treats canonically equivalent
+-- names as one resolves a different spelling to the same object; here a name
+-- that is no longer spelled as it was observed is not found, however the
+-- filesystem would have resolved it. A file or directory that is no longer the
+-- kind it was listed as is a changed mapping, as for 'withEntryFile'. The cost
+-- is one enumeration of each directory on the path, stopping at the match.
+withExactFile ∷ ContentRoot → [NativeName] → (FileReader → IO r) → IO r
+withExactFile root path body = withDirectory root [] (descend path)
+  where
+    descend [] _ = refuse root [] (ForbiddenType KindDirectory KindRegular)
+    descend (name : rest) reader = do
+      entry ← findExact reader name
+      case rest of
+        [] → withEntryFile reader entry body
+        _ → withEntryDirectory reader entry (descend rest)
+    findExact reader name =
+      readEntry reader >>= \case
+        Nothing → refuse root (directoryPath reader <> [name]) NotFound
+        Just entry
+          | entryName entry == name → pure entry
+          | otherwise → findExact reader name
+
 -- | Open the directory an enumeration reported as an enumeration of its own,
 -- one level deeper, refusing a directory already on the active ancestor chain.
 withEntryDirectory ∷ DirectoryReader → DirectoryEntry → (DirectoryReader → IO r) → IO r
@@ -384,10 +412,20 @@ fileMetadata reader = do
 -- read, so the result owns its memory and may be kept past the callback.
 readChunk ∷ FileReader → Int → IO BS.ByteString
 readChunk reader size = do
-  assertLive (fileLive reader)
-  when (size < 1) (throwIO (ContentDefect (BadChunkSize size)))
+  -- the bounds are decided before anything is allocated for the request
+  checkRequest reader size
   chunk ← BSI.createUptoN size $ \buffer → readInto reader buffer size
   pure (if BS.length chunk < size then BS.copy chunk else chunk)
+
+-- | A request must be for at least one byte and at most the root's read-chunk
+-- limit, from the thread that was lent the reader and while it is live.
+checkRequest ∷ FileReader → Int → IO ()
+checkRequest reader size = do
+  assertLive (fileLive reader)
+  let root = fileRoot reader
+      bound = limitReadChunk (rootLimits root)
+  when (size < 1) (throwIO (ContentDefect (BadChunkSize size)))
+  when (size > bound) (refuse root (fileTrail reader) (LimitExceeded ReadChunk bound))
 
 -- | Up to @size@ bytes from the opened file, written to the caller's buffer,
 -- which must hold @size@ bytes; the count read, zero at the end of the file. A
@@ -396,11 +434,8 @@ readChunk reader size = do
 -- and at most the root's read-chunk limit.
 readInto ∷ FileReader → Ptr Word8 → Int → IO Int
 readInto reader buffer size = do
-  assertLive (fileLive reader)
+  checkRequest reader size
   let root = fileRoot reader
-      bound = limitReadChunk (rootLimits root)
-  when (size < 1) (throwIO (ContentDefect (BadChunkSize size)))
-  when (size > bound) (refuse root (fileTrail reader) (LimitExceeded ReadChunk bound))
   hook root BeforeRead
   got ← performRead root reader buffer size
   hook root AfterRead

@@ -255,28 +255,39 @@ spec = do
         _ ← asserting rig
         pure ()
 
-    it "reports a failed close after a verified read as the failure it is, and delivers no bytes" $
+    it "keeps a refused verified read primary when the close also fails, with the failed close beside it" $
       withLayout $ \tree → do
         populate (rootPath tree) [("f", "bytes")]
         flag ← newIORef False
         (recorded, rig) ← recordingSeam
-        withScanned (failingCloseWhen flag 28 recorded) limits (rootPath tree) $ \root inventory → do
-          writeIORef flag True
-          ExceptionWithContext _ failed ← failsWith (readVerified inventory root (keyFor inventory "f") 4096)
-          closeKind failed `shouldBe` FileHandle
-          writeIORef flag False
+        let seam = failingCloseWhen flag 28 recorded
+        outcome ←
+          spawn
+            ( withRootOwned seam rootLimits (rootPath tree) $ \root → do
+                inventory ← scanInventory limits testKey root >>= either (fail . show) pure
+                writeBytes (rootPath tree </> "f") "BYTES"
+                writeIORef flag True
+                readVerified inventory root (keyFor inventory "f") 4096 <* writeIORef flag False
+            )
+            >>= awaitOutcome
+        case outcome of
+          Left exception → do
+            case fromException exception of
+              Just refusal → readFailureOutcome refusal `shouldBe` ReadChanged DigestMismatch
+              Nothing → expectationFailure ("expected the refused read to be primary, got " <> show exception)
+            -- every close fails once armed: the file's, then the root's
+            map closeKind (closeFailuresOf (cleanupFailures exception)) `shouldBe` [FileHandle, RootHandle]
+          Right returned → expectationFailure ("a refused read with a failed close was returned as a value: " <> either show (const "bytes") returned)
         _ ← asserting rig
         pure ()
 
-    it "reports a failed close after a refused verified read as the failure it is, not as changed content" $
+    it "reports a failed close after a successful verified read as the failure it is, delivering no bytes" $
       withLayout $ \tree → do
         populate (rootPath tree) [("f", "bytes")]
         flag ← newIORef False
         (recorded, rig) ← recordingSeam
         withScanned (failingCloseWhen flag 28 recorded) limits (rootPath tree) $ \root inventory → do
-          writeBytes (rootPath tree </> "f") "BYTES"
           writeIORef flag True
-          -- the bytes differ, which alone is a refusal; the close failed too, and that is not one
           ExceptionWithContext _ failed ← failsWith (readVerified inventory root (keyFor inventory "f") 4096)
           closeKind failed `shouldBe` FileHandle
           writeIORef flag False

@@ -17,7 +17,7 @@ import Hetoimasia.Content
 import qualified Hetoimasia.Content.Identity as Identity
 import Hetoimasia.Content.Internal.Native
 import Hetoimasia.Content.Inventory
-import System.Directory (createDirectory, removeDirectory, removeFile, renameFile)
+import System.Directory (createDirectory, removeDirectory, removeFile, renameDirectory, renameFile)
 import System.FilePath ((</>))
 import System.Posix.Files (ownerReadMode, ownerWriteMode, setFileMode, setFileSize, setFileTimes, unionFileModes, createSymbolicLink)
 import System.Posix.User (getEffectiveUserID)
@@ -228,6 +228,24 @@ spec = do
           refusalOf <$> readOf inventory root "dir/inner" 4096 `shouldReturn` Just (ReadChanged Missing)
           -- the new name is not admitted
           refusalOf <$> readOf inventory root "renamed-away" 4096 `shouldReturn` Just ReadNotFound
+
+    it "refuses a file whose name was changed only in case, on a filesystem that would still resolve the old spelling" $
+      withLayout $ \tree → do
+        populate (rootPath tree) [("Hero.png", "hero bytes")]
+        withScanned productionSeam limits (rootPath tree) $ \root inventory → do
+          readOf inventory root "Hero.png" 4096 `shouldReturn` Right "hero bytes"
+          renameFile (rootPath tree </> "Hero.png") (rootPath tree </> "hero.png")
+          -- the bytes are untouched; the spelling the inventory holds is not there any more
+          refusalOf <$> readOf inventory root "Hero.png" 4096 `shouldReturn` Just (ReadChanged Missing)
+          refusalOf <$> readOf inventory root "hero.png" 4096 `shouldReturn` Just ReadNotFound
+
+    it "refuses a file under a directory whose name was changed only in case" $
+      withLayout $ \tree → do
+        populate (rootPath tree) [("Assets/Hero.png", "hero bytes")]
+        withScanned productionSeam limits (rootPath tree) $ \root inventory → do
+          renameDirectory (rootPath tree </> "Assets") (rootPath tree </> "assets-tmp")
+          renameDirectory (rootPath tree </> "assets-tmp") (rootPath tree </> "assets")
+          refusalOf <$> readOf inventory root "Assets/Hero.png" 4096 `shouldReturn` Just (ReadChanged Missing)
 
     it "refuses a file replaced by a directory or by a link, and never reads what the link names" $
       withLayout $ \tree → do
