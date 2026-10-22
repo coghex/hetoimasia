@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-61/Q-2p: hard links and mounted content directories.
+The current checkpoint is P-62/Q-6m: the M1 texture-file profile.
+D-64 accepts hard-linked files and mounted subtrees with per-path identity.
 D-63 accepts resolving the launch path once and retaining the actual root owner.
 D-62 accepts whole-folder startup hashing and exact-byte verification on loads.
 D-61 accepts Unicode NFC filename identity, exact case and collision rejection.
@@ -1923,8 +1924,37 @@ cancellation and partial-boot cleanup; unsupported behavior refuses startup.
 
 The manager presented native adapters, handle ownership, race and cleanup tests
 as the cost. The owner chose this over banning symlinks in the launch path.
-Hard-link/mount policy and numeric handle limits remain separate; no immutable
-snapshot or hostile-filesystem containment is claimed.
+D-64 subsequently settles hard-link/mount policy; numeric handle limits remain
+open. No immutable snapshot or hostile-filesystem containment is claimed.
+
+### D-64. Hard-linked files and mounted subfolders are allowed content
+
+**Delivery:** M1; path identity with verified bytes, not exclusive storage.
+
+Owner answer, **2026-10-22 02:13:22 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: allow them (Rec.)
+
+Authenticated relay: `het-manager`, message `kpvfkcfa9rh68kg7wg82wk3cis`,
+posted **2026-10-22 02:13:22.171 UTC** in `#het-luafirst`, replying to Q-2p
+message `xvtvr9htcg5rm4snkadpg5x4ds`.
+
+Accept P-61's A: hard-linked regular files and mounted subfolders are allowed
+under the anchored, no-symlink content rules. The engine creates neither.
+Each path has its own identity and counts separately: two hard-link names
+for one Lua file are two modules, not an inode-deduplicated module. An outside
+edit to the shared bytes can fail a later inside fingerprint check.
+
+Scan mounted content, reject directory traversal cycles with a path chain,
+and retain the inventory bounds. Mount/device identity is not an extra content
+version key; no new path or changed bytes are admitted by a topology change.
+The selected root remains anchored. D-11's non-regular-entry and symbolic-link
+refusals remain, with no hostile-OS containment claim.
+
+The manager presented outside aliases, scan time and repeated work as the
+cost. The owner chose this over rejecting hard links and mount crossings.
+Native qualification and numerical bounds remain delivery work.
 
 ## Proposals
 
@@ -5196,7 +5226,7 @@ it is not this scoped provider and must not be treated as one.
 
 ### P-61. Treat hard-linked files and mounted directories as selected-root content
 
-**Unapproved; active checkpoint Q-2p. Delivery: M1.** Recommend A: the
+**A accepted by D-64 through Q-2p. Delivery: M1.** Recommend A: the
 selected root defines a content namespace, not exclusive ownership of the
 underlying storage. A regular file reached through a legal inventoried path
 may have other hard-link names, inside or outside the root. A directory below
@@ -5256,6 +5286,67 @@ defines another directory entry for an existing file, while the
 [Linux mount documentation](https://cdn.kernel.org/doc/html/latest/filesystems/sharedsubtree.html)
 describes mounted subtree relationships. Neither is a symbolic-link traversal.
 
+### P-62. Expose static PNG colour textures for M1
+
+**Unapproved; active checkpoint Q-6m. Delivery: M1.** Recommend A: the Lua
+texture request accepts static PNG images through the existing `asset-image`
+PNG decoder, always as `ColourImage`. Select by the verified bytes' PNG
+signature, not the filename extension. There is no format hint, extension
+search or trial of unrelated codecs. Non-PNG bytes, malformed PNGs and
+animation-marked PNGs are refused as content failures under the request's
+required/optional policy. No first-frame-only fallback for animation is added.
+
+Reuse the existing PNG profile: greyscale, palette, RGB/RGBA, supported bit
+depths and interlacing become one tightly packed RGBA8 level, top row first.
+The decoder's colour contract interprets colour channels as sRGB and
+premultiplies in linear light; alpha is retained, with opaque alpha supplied
+when absent. Its existing 16-to-8-bit conversion and transparency rules remain.
+Embedded colour-space/profile chunks do not change decoded texels. There is
+no M1 Lua switch for data textures, linear/HDR colour, premultiplication or
+colour-profile processing. This is the existing engine colour convention,
+not an additional conversion for Lua on top of the decoded result.
+
+Upload that one level and return D-47's ready owned texture plus its dimensions
+only after upload/registration readiness. Generate no mip chain. D-50's full
+image, fixed nearest filtering and alpha-blended ordered rectangles remain;
+do not infer new sampler, UV, animation or material controls. Missing/bad/over-
+limit content has no placeholder or implicit format conversion fallback.
+An unsupported texture file may still be loaded as raw data under D-55.
+
+The provider must enforce source-byte, dimension, pixel-count and decoded/work
+memory bounds before the corresponding large allocation/work, with checked
+arithmetic. A small compressed file is not permission for unlimited decoded
+storage. Preflight and decoder integration must be qualified; the current
+decoder's format checks alone are not proof of the new provider's resource
+budget. Numeric limits follow in the bounds package. Cancellation may suppress
+delivery while an already-started decode finishes; buffers and upload work
+remain owned and charged until actual retirement, as in D-47/D-48.
+
+Alternative B exposes PNG plus the existing KTX2 colour profile now: sRGB
+RGBA8 or BC7, supported 2D/single-layer/single-face files, their stored mip
+levels, and the existing BC7 software fallback when required by the device.
+That adds no new codec, but requires format dispatch, compressed/fallback
+budgeting and additional integration evidence. Existing KTX2 alpha/orientation/
+format restrictions would remain; choosing B is not approval for arbitrary
+KTX2, Basis/supercompression, data textures or new Lua rendering controls.
+
+A is recommended for the one-quad milestone because it gives authors a common
+image format and uses the real image/upload services with a single Lua-facing
+profile. Its cost is exporting authored images as PNG, one uncompressed RGBA8
+GPU level, decode work on each independent request, and no mip-assisted
+minification. KTX2/BC7/mip-generation remain available to Haskell consumers;
+exposing them through Lua is a later extension if A is selected.
+
+Qualification covers nontrivial opaque/transparent PNG output, top-row
+orientation, non-8-bit/palette conversion through existing decoder tests,
+invalid and animation-marked inputs, oversized declarations/decoded work,
+optional versus required failures, readiness and cancellation ownership. The
+existing [image codec contract](../../packages/asset-image/README.md) and
+[image2d sample](../../samples/image2d/README.md) establish decoder behaviour
+and composed rendering evidence. The new signature dispatch, animation refusal,
+provider bounds and Lua lifecycle still need their own integration evidence;
+this design turn ran no decoder, GPU or native tests.
+
 ## Open questions
 
 ### Q-1. Which filtered standard-library profile applies to every script?
@@ -5271,9 +5362,12 @@ failure attribution and when loading is allowed. D-6 settles explicit root
 addressing, D-7 module reuse/cycle/failure behavior, D-8 the top-level
 effect boundary, D-9 runtime loading, D-10 content-version checks for now and
 D-11 the symlink rule and D-12 required/optional content failure handling.
-Root/path grammar, inventory preparation, loader/result API, bounds/cache
-policy and detailed failure escalation remain open. These will be revisited
-with the boot, state and service contracts; Q-2 as a whole is not marked resolved.
+D-56 through D-59 settle resumable imports, shared-job ownership, ordering and
+module-limit failure policy. D-60 through D-64 settle path grammar, Unicode
+identity, inventory/hash policy, anchored root selection and hard links/mounts.
+Exact loader/result APIs, provider scheduling/accounting and numeric bounds
+remain open within M1; Q-2 as a whole is not marked resolved. State-store
+questions remain deferred under D-41/D-43.
 
 #### Q-2a. Explicit content-root references or one merged override namespace?
 
@@ -5372,11 +5466,10 @@ no-follow reads to it. Renames/retargeting do not select another root.
 
 #### Q-2p. Permit hard links/mounted subtrees or require a stricter content layout?
 
-**Active checkpoint, P-61.** A (recommended): permit regular hard-linked files
-and mounted directories through the anchored namespace; identities and budgets
-remain per path, bytes are verified and traversal cycles refused. B: reject
-multiply linked files and mount crossings below the root using qualified native
-checks. Both retain D-11's symbolic-link and non-regular-entry refusal.
+Resolved by D-64: P-61's A, hard-linked regular files and mounted directories
+are permitted through the anchored namespace. Identities/budgets remain per
+path, bytes are verified, traversal cycles rejected, and internal symlinks and
+non-regular content entries refused.
 
 ### Q-3. What is the generic executable's boot and session contract?
 
@@ -5663,6 +5756,14 @@ Repeat-readable request objects with a dispose lifetime were not chosen.
 Resolved by D-55: P-52's A, bounded byte-for-byte strings without parsing,
 execution, data caching or open-file handles. Engine-parsed data was not chosen;
 the manager's parser-library example adds no selected library deliverable.
+
+#### Q-6m. Static PNG colour textures alone or the existing KTX2 profile too?
+
+**Active checkpoint, P-62.** A (recommended): static PNG, fixed colour decoding,
+one RGBA8 sRGB level, no generated mips/options/animation; signature dispatch,
+bounds and normal content-failure handling. B: also expose the existing KTX2
+sRGB RGBA8/BC7 profile with authored levels and device fallback. A narrows the
+Lua surface only; existing Haskell codec/rendering features remain available.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
