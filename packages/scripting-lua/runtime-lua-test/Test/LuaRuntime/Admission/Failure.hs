@@ -6,6 +6,7 @@ module Test.LuaRuntime.Admission.Failure (spec) where
 
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException, throwIO, toException)
 import Control.Monad (forM_)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Admission
@@ -40,6 +41,12 @@ requestFailure settlement = do
     ErrorRequest endpoint why → Just (endpoint, why)
     _ → Nothing
 
+-- | The same, from the failure the application was told.
+requestFailure' ∷ InstanceFailure → Maybe (Text, Text)
+requestFailure' failure = case failureError failure of
+  ErrorRequest endpoint why → Just (endpoint, why)
+  _ → Nothing
+
 spec ∷ Spec
 spec = describe "failure" $ do
   describe "a required request's expected failure" $ do
@@ -54,8 +61,24 @@ spec = describe "failure" $ do
         answerExpected fixture 0 "not_found" >>= (`shouldBe` ReplySettled)
         settlement ← awaitSettled (afBase fixture) "i"
         requestFailure settlement `shouldBe` Just ("path", "(the title screen) not_found: detail of not_found")
+        fmap failureStage (failureOf' settlement) `shouldBe` Just (StageRequest "path")
         d ← diagnostics owner
         rdLatched d `shouldBe` 1
+
+    it "reaches the application through the existing escalation boundary, once, as the instance's failure" $ bounded $ do
+      fixture ← newAFix 4
+      told ← newIORef []
+      let config = aConfig {instanceEscalate = \failure → modifyIORef' told (failure :) >> pure Isolate}
+      withBoundary $ \_ runtime → settleAll fixture $ do
+        owner ← startAdmitting fixture runtime "escalation" [admitter] config (admissionGrant fixture 8 SettleOnArrival) requiredPolicy
+        admitAdmitter fixture owner "i" "admitter"
+        acommand fixture owner "i" "start" "a"
+        awaitNote fixture "cmd start a started"
+        _ ← answerExpected fixture 0 "not_found"
+        settlement ← awaitSettled (afBase fixture) "i"
+        fmap fst (requestFailure settlement) `shouldBe` Just "path"
+        seen ← readIORef told
+        map (fmap fst . requestFailure' ) seen `shouldBe` [Just "path"]
 
     it "is unseen until its position on logical time, and fails the instance when the position is reached" $ bounded $ do
       fixture ← newAFix 4
@@ -74,6 +97,22 @@ spec = describe "failure" $ do
         grantOne control owner
         settlement ← awaitSettled (afBase fixture) "i"
         fmap fst (requestFailure settlement) `shouldBe` Just "path"
+
+    it "fails the instance before the script that waits for the request is resumed: no ordinary work follows the eligible failure" $ bounded $ do
+      fixture ← newAFix 4
+      withBoundary $ \control runtime → settleAll fixture $ do
+        owner ← logical fixture runtime "waiter"
+        admitAdmitter fixture owner "i" "admitter"
+        acommand fixture owner "i" "start" "a"
+        awaitNote fixture "cmd start a started"
+        acommand fixture owner "i" "wait" "a"
+        awaitNote fixture "waiting a"
+        answerExpected fixture 0 "not_found" >>= (`shouldBe` ReplyHeld)
+        grantOne control owner
+        settlement ← awaitSettled (afBase fixture) "i"
+        fmap fst (requestFailure settlement) `shouldBe` Just "path"
+        seen ← history fixture
+        seen `shouldSatisfy` notElem "cmd wait a woke"
 
     it "is not cleared by an error the script caught or by a cancel it made afterwards: the failure was already latched" $ bounded $ do
       fixture ← newAFix 4

@@ -922,6 +922,7 @@ stageText = \case
   StageEvent source → "event " <> source
   StageShutdown → "shutdown"
   StageRelease → "release"
+  StageRequest endpoint → "request " <> endpoint
 
 kindText ∷ InstanceError → Text
 kindText = \case
@@ -931,6 +932,7 @@ kindText = \case
   ErrorRefusedWait _ → "refused wait"
   ErrorRelease _ → "release failure"
   ErrorDelivery _ _ → "delivery failure"
+  ErrorRequest _ _ → "required request failure"
   ErrorCadence _ → "cadence failure"
 
 -- | What the instance's code said: the error it raised, when it raised one, and otherwise the engine's rendering.

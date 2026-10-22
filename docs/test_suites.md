@@ -90,8 +90,14 @@ cabal test hetoimasia-tests --test-show-details=direct
   configuration boundary (LFE-3): the strict manifest parser's accepted examples,
   byte and nesting limits, syntax and schema refusals and exact tick conversion, the
   fixed M1 profile and its smaller validated test profiles, and the package's
-  dependency and import boundary. It performs no IO and starts no Lua, window or GPU.
+  dependency and import boundary; and the M1 request adapter (LFE-7, `Test.LuaEngine.Request.*`):
+  the busy record, the exact `ready`/`take`/`cancel`/`wait` records, handles and phases,
+  the profile's limits, a texture lease, and required and optional failure, over real Lua
+  instances on a supervised owner with controlled fake providers. The manifest and profile
+  examples perform no IO and start no Lua; the request examples start no window or GPU.
   A new manifest or profile example belongs there, in the component spec that owns it.
+  `lua-runtime-tests` also owns the host's opt-in admission (`Test.LuaRuntime.Admission.*`)
+  and `lua-host-tests` the argument checks (`Test.Lua.Boundary.ArgumentChecks`).
   Selectors moved with their examples: on the root suite, `--match Runtime`,
   `Resources`, `Recovery`, `Workers`, `Messaging`, `Logging`, `Failures`, and
   `GLFW` now select nothing and fail; on `runtime-tests`, `--match Supervision`

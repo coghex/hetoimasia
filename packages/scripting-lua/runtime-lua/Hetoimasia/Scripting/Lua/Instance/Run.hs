@@ -725,7 +725,7 @@ dispatch ih cell = do
       -- ordinary work, whether or not its script ever read the request.
       latched ← atomically (takeRequestFailure cell)
       case latched of
-        Just (endpoint, reason, phase) → failInstance ih cell phase (StageEvent endpoint) (ErrorRequest endpoint reason)
+        Just (endpoint, reason, phase) → failInstance ih cell phase (StageRequest endpoint) (ErrorRequest endpoint reason)
         Nothing → admitNext ih cell
 
 -- | The instance's delivery failure, if a provider surfaced one and the instance is still taking

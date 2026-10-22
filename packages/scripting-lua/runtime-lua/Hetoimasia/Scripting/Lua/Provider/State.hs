@@ -755,6 +755,9 @@ admitOptIn service requester endpoint ask = (OptInAccepted <$> attempt) `catchST
       let number = pNext st
           taking = not (pClosed st) && open && not closedRequester
       slot ← either (stop' . StopRefused) pure (optInSlot service requester ask taking now phase number)
+      -- The place is taken only by an assignment the application made for a request that is not
+      -- this kind; the sequence of this one is its own number, which no request shares.
+      forM_ slot $ \due → when (Map.member due (pDue st)) (stop' (StopRefused RequestDuplicatePlace))
       when (number == maxBound) (stop' (AdmissionDefect "the request counter has no number after the last"))
       when (isJust (admitLease ask) && isNothing (admitCombine ask)) $
         stop' (AdmissionDefect "an admission that reserves a result lease says nothing of how its handle reaches the script")

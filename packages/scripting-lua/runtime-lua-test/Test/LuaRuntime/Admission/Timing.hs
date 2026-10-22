@@ -7,7 +7,8 @@ module Test.LuaRuntime.Admission.Timing (spec) where
 
 import Control.Concurrent.STM (atomically)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException)
-import Control.Monad (replicateM_, void)
+import qualified Data.Text as Text
+import Control.Monad (forM_, replicateM_, void)
 import Data.Text (Text)
 import Hetoimasia.Scripting.Lua.Admission
 import Hetoimasia.Scripting.Lua.Provider
@@ -144,6 +145,30 @@ spec = describe "timing" $ do
         awaitNote fixture "cmd take a {status=cancelled}"
         d ← diagnostics owner
         (rdLatched d, rdCancelledBeforeTick d, rdHeldNow d) `shouldBe` (0, 1, 0)
+
+  describe "the accepted conditional ordering" $ do
+    it "gives the same settlements however the providers' completions are ordered, for the same admissions, cancels and grants" $ bounded $ do
+      let orders = [[0, 1, 2], [2, 1, 0], [1, 2, 0], [2, 0, 1]]
+          scenario order = do
+            fixture ← newAFix 4
+            withBoundary $ \control runtime → settleAll fixture $ do
+              owner ← logical fixture runtime "determinism"
+              admitAdmitter fixture owner "i" "admitter"
+              forM_ (zip [1 ∷ Int ..] ["a", "b", "c"]) $ \(n, key) → do
+                acommand fixture owner "i" "start" key
+                awaitStarts fixture n
+              -- Every completion arrives before the position, in this order.
+              forM_ order $ \index → answerResult (afFake fixture) index (10 + index) >>= (`shouldBe` ReplyHeld)
+              acommand fixture owner "i" "cancel" "b"
+              awaitNote fixture "cmd cancel b cancelled"
+              grantOne control owner
+              forM_ ["a", "b", "c"] $ \key → do
+                acommand fixture owner "i" "take" key
+                _ ← lineStarting fixture ("cmd take " <> key <> " ")
+                pure ()
+              filter (Text.isPrefixOf "cmd take ") <$> history fixture
+      results ← mapM scenario orders
+      forM_ results (`shouldBe` ["cmd take a {status=success,value={v=10}}", "cmd take b {status=cancelled}", "cmd take c {status=success,value={v=12}}"])
 
   describe "on elapsed time" $ do
     it "takes no tick offset: it is an ordinary Lua error before any work" $ bounded $ do

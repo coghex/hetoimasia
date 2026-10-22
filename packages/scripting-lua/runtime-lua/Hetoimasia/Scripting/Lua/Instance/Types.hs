@@ -409,6 +409,9 @@ data HookStage
   | StageShutdown
   | -- | Releasing what the instance held, as it ended.
     StageRelease
+  | -- | A required request's expected failure, by the endpoint it asked: the instance was not in a
+    -- hook, and the failure is the request's.
+    StageRequest !Text
   deriving (Eq, Show)
 
 -- | What went wrong, as the host reports it.

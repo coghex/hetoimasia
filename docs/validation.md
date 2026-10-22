@@ -306,8 +306,11 @@ comments, trailing commas and data, non-object roots, duplicate keys after escap
 decoding), the exact numeric reading of `format`, every schema refusal and the fixed
 order refusals are decided in, and `tick_seconds` as exact decimal nanoseconds -- and
 the fixed M1 profile of limits against an independently written expectation, with its
-smaller validated test profiles and the profiles it refuses. It performs no IO and
-starts no Lua, window or GPU. It is mandatory but outside the floor, like `test.math`,
+smaller validated test profiles and the profiles it refuses, and, for the M1 request adapter, the busy
+record, the exact request records, handles, phases, the profile's limits and required and optional
+failure over real Lua instances on a supervised owner with controlled fake providers. The manifest and
+profile examples perform no IO and start no Lua; no example starts a window or a GPU. It is mandatory
+but outside the floor, like `test.math`,
 and its command names `cabal.project.cpu`; the group declares that file beside
 `cabal.project.common`. CI routes it to the `haskell-engine` worker and publishes its
 receipt like every other group that worker owns. See

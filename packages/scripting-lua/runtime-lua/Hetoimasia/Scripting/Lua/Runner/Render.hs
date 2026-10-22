@@ -136,6 +136,7 @@ stageWord = \case
   StageEvent source → "event " <> bounded nameLimit source
   StageShutdown → "shutdown"
   StageRelease → "release"
+  StageRequest endpoint → "request " <> bounded nameLimit endpoint
 
 -- Reports ---------------------------------------------------------------------------------------
 
