@@ -3,6 +3,7 @@ import: cabal.project.common
 packages:
   .
   packages/foundation
+  packages/content
   packages/math
   packages/asset
   packages/asset-image

@@ -303,6 +303,28 @@
       "optional": false
     },
     {
+      "id": "test.content",
+      "description": "Headless Hspec contracts for the content package's anchored native roots, over temporary trees each example owns. A launch path that is relative, absolute or reached through symbolic links opens one directory whose identity and descriptor the root keeps, so renaming it, replacing its old path or retargeting the selection link never switches an open root, while a root opened afterwards selects the new target; every component below the root, the final file included, is opened without following a symbolic link and its type checked on the opened object, with internal links to the same root, to outside targets and dangling ones refused, a component or the final file swapped for a link at a controlled open boundary refused without the outside sentinel ever being read (a check-then-open control reads it under the same swap), a FIFO refused without waiting for a writer and a socket classified as a forbidden type whichever errno the native open reports, plus device kinds, permission denial and missing entries through the adapter seam; strict bounded reads and metadata from the opened object across short reads, read errors, early stop and a pathname replaced mid-read; enumeration with each entry's own kind, lossless non-UTF-8 names (a real one where the filesystem accepts it, a supplied one elsewhere), both names of a hard link as separate paths, entries that changed since they were observed, a depth bound, a directory that reports another device still traversed, and a directory repeating on its active ancestor chain refused with its chain while a repeat on another branch is allowed (identity injected, since no mount is created); and the lifecycle: a root closes only after every borrowing operation has retired and refuses new ones once its exit begins, a cancellation of the exiting thread neither shortens that wait nor is lost, cancellation at each boundary and with a cancellation pending as an open returns closes every descriptor exactly once through the stream when it owns the descriptor, a failed close is retained beside the primary failure and the remaining closes still run, two roots and two concurrent borrowers do not disturb one another, and repeated success, refusal and cancellation return to the starting descriptor count by exact acquisition and close accounting at the adapter seam. A separately compiled client proves the public API hides the name constructor, raw descriptors, reader constructors and the private adapter library. It runs through the CPU project and needs no display.",
+      "command": [
+        "cabal",
+        "test",
+        "--project-file",
+        "cabal.project.cpu",
+        "hetoimasia-content:content-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-content:test:content-tests",
+      "inputs": [
+        "cabal.project.common",
+        "cabal.project.cpu"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": false
+    },
+    {
       "id": "test.asset-image",
       "description": "Portable Hspec contracts for the asset-image package's PNG decoder over committed fixture files whose texels the suite states by hand: every colour type at every bit depth, 16-bit components rounded to nearest, palette tRNS alpha, Adam7 interlacing, greyscale and RGB tRNS colour keys honoured at every bit depth by comparing stored samples before any reduction (malformed keys ignored), and colour-space chunks that change no texel; colour images premultiplied in linear light within one code value of an independent reference for every (channel, alpha) pair, exact at alpha 0 and 255, and data images byte-for-byte unchanged; the format, extent and single-level layout the GPU upload endpoint takes; the binary-alpha cutout mark; and the refusal, naming the asset, of empty, foreign, truncated, corrupt-stream and undecodable bytes, each result fully evaluated. It runs through the CPU project and needs no GPU.",
       "command": [
