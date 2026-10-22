@@ -24,6 +24,7 @@ module Test.Lua.Boundary.Loader.Support
   , supplyText
   , supplyFailure
   , supplyBytes
+  , supplyIn
   , pointRigAt
   , advance
   , statusOfName
@@ -273,6 +274,13 @@ supplyFailure rig owned path why = do
   let answer = SourceFailure why
   atomicModifyIORef' (rigAvailable rig) (\held → (Map.insert (ident path) answer held, ()))
   deliverSource owned (ident path) answer
+
+-- | The source of a module under any root, by identity.
+supplyIn ∷ Rig → OwnedVm → ExportIdentity → [Text] → IO SourceDelivery
+supplyIn rig owned identity body = do
+  let answer = SourceVerified (lua body)
+  atomicModifyIORef' (rigAvailable rig) (\held → (Map.insert identity answer held, ()))
+  deliverSource owned identity answer
 
 -- | A source of these exact bytes.
 supplyBytes ∷ Rig → OwnedVm → Text → ByteString → IO SourceDelivery

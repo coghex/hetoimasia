@@ -149,6 +149,24 @@ spec = describe "the module loader" $ do
         -- The resolver and the acquire of a dependency run inside the callback an import is.
         forM_ [thread | ("resolve", thread) ← threads] (`shouldNotBe` owner)
 
+    it "keeps a separate cache for each VM: the same identity is evaluated in each, to a table of its own" $
+      withRig $ \rig owned → do
+        _ ← supply rig owned "shared" (simple "shared" [])
+        _ ← admit owned "shared"
+        _ ← advance owned
+        first ← readyOf owned "shared"
+        withRig $ \rig' owned' → do
+          statusOfName owned' "shared" >>= (`shouldBe` ModuleUnknown)
+          _ ← supply rig' owned' "shared" (simple "shared" [])
+          _ ← admit owned' "shared"
+          _ ← advance owned'
+          second ← readyOf owned' "shared"
+          second `shouldNotBe` first
+          traced rig' >>= (`shouldBe` ["shared"])
+        -- Each ran its own module once, and the other's evaluation changed nothing here.
+        traced rig >>= (`shouldBe` ["shared"])
+        statusOfName owned "shared" >>= (`shouldBe` ModuleReady first)
+
     it "does not let a later root overtake the current one when its source arrives first" $
       withRig $ \rig owned → do
         _ ← admit owned "first"
@@ -462,6 +480,20 @@ spec = describe "the module loader" $ do
         _ ← runHook'
         traced rig >>= (`shouldSatisfy` elem "hook:1")
         actions rig >>= (`shouldBe` 1)
+
+  describe "the default root of an import" $
+    it "is the root of the module the closure belongs to, even when a helper runs in a hook of a module of another root" $
+      withRigAt (\config → config {vmModules = [hookDriver]}) $ \rig owned → do
+        _ ← supplyIn rig owned (rootAt "mod" "lib") ["return { helper = function() return import('x') end }"]
+        _ ← admitRoot owned (RootRequest (rootAt "mod" "lib") "mod:lib")
+        _ ← supply rig owned "hook" ["local lib = import('lib', 'mod')", "return { gameplay = { init = function(self, api) local ok, err = pcall(lib.helper) trace.mark(tostring(err)) end } }"]
+        _ ← admit owned "hook"
+        _ ← advance owned
+        statusOfName owned "hook" >>= (`shouldSatisfy` isReady)
+        runInit owned "hook"
+        -- The helper belongs to a module of the mod root, so its import is a module of that root,
+        -- whichever module's hook called it.
+        traced rig >>= (`shouldSatisfy` any (Text.isInfixOf "module_not_ready: mod:x"))
 
   describe "the resolver's refusals" $ do
     it "are ordinary Lua errors before any identity, source interest or frame, and do not latch a failure" $

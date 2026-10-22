@@ -103,7 +103,7 @@ import Control.Concurrent.STM
   , writeTVar
   )
 import Control.Exception (Exception, ExceptionWithContext, SomeException, tryWithContext)
-import Control.Monad (forM_, when)
+import Control.Monad (forM, forM_, when)
 import Data.Foldable (toList)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
@@ -129,6 +129,7 @@ import Hetoimasia.Scripting.Lua.Owner
   , advanceLoader
   , loaderConfig
   , deliverSource
+  , lookupModule
   , stopModuleLoader
   )
 import Hetoimasia.Scripting.Lua.Provider.Types (Ticks (ticksHold, ticksNow, ticksOpen, ticksRelease))
@@ -438,12 +439,18 @@ retireLoading ∷ LoadingState → OwnedVm → IO (Either (ExceptionWithContext 
 retireLoading ls owned = do
   atomically (closeLoading ls)
   stopped ← tryWithContext @SomeException (stopModuleLoader owned)
+  -- What each root the owner admitted came to, read from the loader while its VM is still
+  -- open: a root that was abandoned by a failure reads as failed, not as stopped.
+  admitted ← atomically (Map.keys . Map.filter (== OutcomeAdmitted) <$> readTVar (lsOutcomes ls))
+  read' ← forM admitted $ \identity → do
+    status ← tryWithContext @SomeException (lookupModule owned identity)
+    pure (identity, either (const OutcomeStopped) outcomeOfStatus status)
   atomically $ do
-    modifyTVar' (lsOutcomes ls) (Map.map (\outcome → if outcome == OutcomeAdmitted then OutcomeStopped else outcome))
+    forM_ read' $ \(identity, outcome) → modifyTVar' (lsOutcomes ls) (Map.insert identity outcome)
     -- Every identity the stop found pending or evaluating reads as stopped, the dependencies
     -- of a chain among them.
     forM_ (either (const []) stopIdentities stopped) $ \identity →
-      modifyTVar' (lsOutcomes ls) (Map.insert identity OutcomeStopped)
+      modifyTVar' (lsOutcomes ls) (Map.insertWith (\_ existing → existing) identity OutcomeStopped)
     writeTVar (lsDues ls) Map.empty
     writeTVar (lsSubmitted ls) Seq.empty
     writeTVar (lsNotified ls) Map.empty
@@ -451,3 +458,8 @@ retireLoading ls owned = do
     forM_ held (ticksRelease (lsTicks ls))
     writeTVar (lsHeld ls) Nothing
   pure stopped
+  where
+    outcomeOfStatus status = case status of
+      ModuleReady _ → OutcomeSettled status
+      ModuleFailed _ → OutcomeSettled status
+      _ → OutcomeStopped
