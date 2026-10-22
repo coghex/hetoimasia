@@ -256,6 +256,16 @@ spec = describe "the module loader" $ do
         -- Nothing of it was published.
         ledger owned >>= \found → ledgerExports found `shouldBe` 0
 
+    it "refuses a precompiled chunk: only text is loaded" $
+      withRig $ \rig owned → do
+        _ ← admit owned "binary"
+        delivered ← supplyBytes rig owned "binary" "\ESCLua\x54\x00\x19\x93\r\n\x1a\n"
+        delivered `shouldBe` SourceDelivered
+        _ ← advance owned
+        failed ← failureOf owned "binary"
+        failed `shouldSatisfy` \fault → case boundaryReason fault of ScriptFailed _ _ → boundaryEffect fault == NoEffect; _ → False
+        ledger owned >>= (`shouldSatisfy` balanced)
+
     it "fails a module a binding refused as a fault of the call, even when its code caught the error, and goes on" $
       withRig $ \rig owned → do
         _ ← supply rig owned "refused" ["local ok = pcall(trace.strict, 5)", "trace.mark('caught ' .. tostring(ok))", "return {}"]
