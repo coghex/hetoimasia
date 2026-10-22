@@ -229,6 +229,11 @@ lua_State *hetoimasia_lua_task_thread(lua_State *L, lua_Integer slot);
 ** thread. */
 int hetoimasia_lua_yieldable(lua_State *L);
 
+/* Whether the collector is running: 1 if it is, 0 if not. It is not while a Lua
+** finalizer runs, which Lua holds it for, nor when a script stopped it, so 0 is
+** the conservative reading of "a finalizer may be the caller". Runs no Lua. */
+int hetoimasia_lua_collector_running(lua_State *L);
+
 /*
 ** Run the next segment of the task in `slot`. See the definition for what each
 ** outcome leaves on the stack. The result is the status of a failure, LUA_OK
