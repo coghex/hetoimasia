@@ -72,7 +72,7 @@ concrete precondition
 - [x] LFE-8. Retain VM-local module exports and captured behaviors — [#522]
 - [x] LFE-9. Resume ordered module import chains on their VM owner — [#523]
 - [x] LFE-10. Load raw data through owned bounded file workers — [#524]
-- [ ] LFE-11. Join shared module jobs and deliver them at assigned positions
+- [x] LFE-11. Join shared module jobs and deliver them at assigned positions — [#525]
 - [ ] LFE-12. Bind per-instance content, request, time and output APIs
 - [ ] LFE-13. Coordinate role startup gates, failure policy and session stop
 - [ ] LFE-26. Expose UI status, quit and the unavailable-state guard
