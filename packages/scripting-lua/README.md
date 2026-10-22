@@ -1292,7 +1292,9 @@ has validated and been captured (so a facade builder never runs for a behavior t
 
 * `FacadeValue v`: a copy of the value `v`, made fresh for this capture alone within the owner's
   value limits (a capability the application's own check retires, or an oversize value, is refused).
-  Data only: it cannot carry a function.
+  Data only: it cannot carry a function. It must be a **table** (a record or a list): `nil` and every
+  scalar are refused (`FacadeNotATable`) before anything is captured, so `self.api` and `init`'s second
+  argument can never be a scalar.
 * `FacadeField export key`: the table a retained export module holds under `key`, used as it is: one
   existing facade reference shared by every capture that names it.
 * `FacadeBuilt export key v`: built for this capture alone by calling the function the export module
@@ -1311,6 +1313,13 @@ Replacing or removing a field of the behavior table, replacing the role table, o
 field afterwards changes nothing a capture does; a later capture reads the table as it is then.
 Capturing a function does not freeze its upvalues or the shared exports: mutable upvalues and
 shared state stay ordinary Lua, and `self` stays separate.
+
+What a captured hook raises is attributed to **the export module that holds it** (its bounded label and the
+version `export`, with the hook's name as the entry), not to the driver that calls it: the module and entry of a
+script error, and of a binding's refusal made from the module's own code (the chunk it was loaded under matches
+the module's), are the same for `init`, for each segment of an `update`, including after a resume, and for
+`shutdown`. A host failure a callback recorded while a facade builder ran is raised before anything that fails
+after it (and a builder that catches Lua's side of it with `pcall` still cannot hide it).
 
 The hooks are run by the runtime through a driver, never looked up again by name: see
 [M1 behavior instances](#m1-behavior-instances-opt-in).
