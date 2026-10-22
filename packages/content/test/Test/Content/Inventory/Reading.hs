@@ -229,6 +229,26 @@ spec = do
           -- the new name is not admitted
           refusalOf <$> readOf inventory root "renamed-away" 4096 `shouldReturn` Just ReadNotFound
 
+    it "still reads a file when an unrelated sibling vanishes while its directory is being listed (injected listing)" $
+      withLayout $ \tree → do
+        populate (rootPath tree) [("target", "target bytes")]
+        armedFlag ← newIORef False
+        ghostServed ← newIORef False
+        let ghosting = mapNative $ \native →
+              native
+                { nativeReadStream = \stream → do
+                    on ← readIORef armedFlag
+                    served ← readIORef ghostServed
+                    if on && not served
+                      then writeIORef ghostServed True >> pure (Right (Just "ghost"))
+                      else nativeReadStream native stream
+                }
+        withScanned (ghosting productionSeam) limits (rootPath tree) $ \root inventory → do
+          writeIORef armedFlag True
+          -- "ghost" is listed first and is gone when its kind is asked for
+          readOf inventory root "target" 4096 `shouldReturn` Right "target bytes"
+          readIORef ghostServed `shouldReturn` True
+
     it "refuses a file whose name was changed only in case, on a filesystem that would still resolve the old spelling" $
       withLayout $ \tree → do
         populate (rootPath tree) [("Hero.png", "hero bytes")]

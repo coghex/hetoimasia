@@ -47,7 +47,7 @@ module Hetoimasia.Content.Internal.Access
   ) where
 
 import Control.Concurrent (ThreadId, myThreadId)
-import Control.Exception (finally, throwIO)
+import Control.Exception (finally, throwIO, try)
 import Control.Monad (unless, when)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Internal as BSI
@@ -345,11 +345,21 @@ withExactFile root path body = withDirectory root [] (descend path)
         [] → withEntryFile reader entry body
         _ → withEntryDirectory reader entry (descend rest)
     findExact reader name =
-      readEntry reader >>= \case
+      listed reader name >>= \case
         Nothing → refuse root (directoryPath reader <> [name]) NotFound
         Just entry
           | entryName entry == name → pure entry
           | otherwise → findExact reader name
+    -- The next entry. A different entry that vanished between the listing and
+    -- the query for its kind says nothing about the one being looked for and is
+    -- skipped; the wanted entry itself vanishing is a missing file.
+    listed reader name =
+      try (readEntry reader) >>= \case
+        Right entry → pure entry
+        Left (ContentFailure _ trail (MappingChanged Nothing Nothing))
+          | take 1 (reverse trail) == [name] → refuse root (directoryPath reader <> [name]) NotFound
+          | otherwise → listed reader name
+        Left other → throwIO other
 
 -- | Open the directory an enumeration reported as an enumeration of its own,
 -- one level deeper, refusing a directory already on the active ancestor chain.
