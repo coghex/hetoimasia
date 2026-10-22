@@ -62,6 +62,7 @@ module Hetoimasia.Scripting.Lua.Internal.Task
   , WaitRequest (..)
   , startTask
   , startTaskVia
+  , startTaskCaptured
   , resumeTask
   , closeTask
   , liveTaskReferences
@@ -76,6 +77,7 @@ import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure, withOperationContext)
 import Hetoimasia.Foundation.Resource (composeCleanup)
 import Hetoimasia.Scripting.Lua.Internal.Boundary
+import Hetoimasia.Scripting.Lua.Internal.ExportTypes (CaptureHandle, Hook, hookName)
 import Hetoimasia.Scripting.Lua.Internal.Fault
   ( CloseSource (FromCoroutineClose)
   , ErrorValue (ErrorAbsent)
@@ -194,6 +196,13 @@ startTask = startTaskWith Module.NoLead
 startTaskVia ∷ HasCallStack ⇒ Host → ModuleHandle → Text → ModuleHandle → Text → [Value] → IO TaskStart
 startTaskVia host driver driverName = startTaskWith (Module.Lead driver driverName) host
 
+-- | Start a task through a driver's entry point, handing it a captured hook, the
+-- capture's @self@ and its facade: see 'Module.LeadCaptured'. A hook the capture has
+-- none of answers 'TaskEntryAbsent' and runs nothing; a handle another owner issued,
+-- or whose capture was released, is refused before anything runs.
+startTaskCaptured ∷ HasCallStack ⇒ Host → ModuleHandle → Text → CaptureHandle → Hook → [Value] → IO TaskStart
+startTaskCaptured host driver driverName capture hook = startTaskWith (Module.LeadCaptured driver driverName capture hook) host driver (hookName hook)
+
 startTaskWith ∷ HasCallStack ⇒ Module.Lead → Host → ModuleHandle → Text → [Value] → IO TaskStart
 startTaskWith lead host handle name arguments =
   withOperationContext luaComponent startOperation [("module", moduleRefName ref), ("entry", name)] $
@@ -218,7 +227,7 @@ startTaskWith lead host handle name arguments =
           TaskStarted task <$> runSegment host StartTask startOperation task True state entry
   where
     vm = hostVm host
-    ref = Module.handleModule handle
+    ref = Module.attributedTo lead handle
 
 -- | Run a suspended task's next segment: it goes on from the yield or wait it
 -- stopped at, to the next, or to its return.

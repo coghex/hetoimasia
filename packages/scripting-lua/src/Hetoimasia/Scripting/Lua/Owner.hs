@@ -86,6 +86,21 @@
 -- application declared ('callEntry'). Values cross as bounded copies; see
 -- "Hetoimasia.Scripting.Lua.Value" for the rules and the limits.
 --
+-- = Export modules (opt-in)
+--
+-- Beside those, and replacing none of them, an owner can hold /export modules/:
+-- source text under a stable identity ('ExportSource') whose chunk returns exactly
+-- one plain table, which the VM keeps as it is, functions, tables and cycles
+-- included, instead of copying it across the value boundary. They are evaluated at
+-- initialization ('vmExports') or from the body ('evaluateExport'), once per
+-- identity per VM, and asked for again with 'retrieveExport'. A failed identity
+-- stays failed. 'captureBehavior' validates one field of an export table as a
+-- behavior (init, update, shutdown and the two cadence fields), and holds its hook
+-- functions, a fresh @self@ and a facade for one instance until 'releaseBehavior'
+-- or the VM's close. None of this is a copy and none of it crosses to another VM;
+-- the handles are values that name a slot of one VM, checked on every use. The
+-- package README documents the contract.
+--
 -- = Faults across the boundary
 --
 -- A refusal of a value, a missing required entry point, a call to a binding of a
@@ -155,6 +170,28 @@ module Hetoimasia.Scripting.Lua.Owner
   , maxEntries
   , maxIdentityLength
 
+    -- * Export modules
+  , ExportIdentity (..)
+  , ExportSource (..)
+  , ExportLimits (..)
+  , defaultExportLimits
+  , maxExportIdentityBytes
+  , ExportHandle
+  , ExportOutcome (..)
+  , evaluateExport
+  , retrieveExport
+
+    -- * Captured behaviors
+  , FacadeSource (..)
+  , Hook (..)
+  , CaptureHandle
+  , Captured (..)
+  , BehaviorShape (..)
+  , CadenceField (..)
+  , BehaviorProblem (..)
+  , captureBehavior
+  , releaseBehavior
+
     -- * Tasks
   , Task
   , TaskStart (..)
@@ -170,6 +207,7 @@ module Hetoimasia.Scripting.Lua.Owner
   , FaultReason (..)
   , Effect (..)
   , ModuleProblem (..)
+  , ExportShape (..)
   , TaskEnd (..)
   , TaskProblem (..)
   , SuspendRefusal (..)
@@ -211,6 +249,7 @@ import Hetoimasia.Scripting.Lua.Internal.Boundary
   ( BoundaryFault (..)
   , Effect (..)
   , FaultOperation (..)
+  , ExportShape (..)
   , FaultReason (..)
   , ModuleProblem (..)
   , ModuleRef (..)
@@ -233,6 +272,23 @@ import Hetoimasia.Scripting.Lua.Internal.Fault
   , VmReentered (..)
   , closeSourceLabel
   )
+import qualified Hetoimasia.Scripting.Lua.Internal.Export as Export
+import Hetoimasia.Scripting.Lua.Internal.ExportTypes
+  ( BehaviorProblem (..)
+  , BehaviorShape (..)
+  , CadenceField (..)
+  , CaptureHandle
+  , Captured (..)
+  , ExportHandle
+  , ExportIdentity (..)
+  , FacadeSource (..)
+  , ExportLimits (..)
+  , ExportOutcome (..)
+  , ExportSource (..)
+  , Hook (..)
+  , defaultExportLimits
+  , maxExportIdentityBytes
+  )
 import Hetoimasia.Scripting.Lua.Internal.Library (Library (..), LibraryProfile (..), profileLibraries)
 import Hetoimasia.Scripting.Lua.Internal.Module
   ( CallResult (..)
@@ -254,6 +310,8 @@ import Hetoimasia.Scripting.Lua.Internal.Owner
       , ownerGranted
       , ownerLifecycle
       , ownerLimits
+      , ownerExportLimits
+      , ownerExports
       , ownerModules
       , ownerName
       , ownerProfile
@@ -312,6 +370,15 @@ data VmConfig = VmConfig
     -- an opaque value of the application's runtime, which this library never
     -- reads. 'Nothing', the default, leaves a lifecycle operation answering a typed
     -- 'NotYetSupported' fault whose action never runs.
+  , vmExports ∷ [ExportSource]
+    -- ^ Export modules evaluated inside the lifetime, in order, after the modules
+    -- and before the body, and asked for with 'retrieveExport'. One that fails is a
+    -- sticky failure of its identity and does not end the lifetime; a Haskell
+    -- failure that reaches a callback while one runs does. Empty by default.
+  , vmExportLimits ∷ ExportLimits
+    -- ^ The source and identity ceilings export modules are held to, from the
+    -- application's profile: 'defaultExportLimits' is one mebibyte of source and
+    -- 256 identities. A limit of zero refuses every new identity or every source.
   , vmRequests ∷ Maybe RequestContext
     -- ^ What delivers this owner's asynchronous native requests
     -- ('asynchronousNativeRequestIn') and a wait for one's settlement: an opaque
@@ -323,7 +390,7 @@ data VmConfig = VmConfig
 -- | A configuration over these libraries with no initial chunk, an empty
 -- registration, no exposed namespace, the default value limits and no module.
 vmConfig ∷ [Library] → VmConfig
-vmConfig libraries = VmConfig libraries Nothing [] "owner" emptyRegistration [] defaultValueLimits [] Nothing Nothing
+vmConfig libraries = VmConfig libraries Nothing [] "owner" emptyRegistration [] defaultValueLimits [] Nothing [] defaultExportLimits Nothing
 
 -- | A configuration over a library profile, otherwise as 'vmConfig' makes it.
 --
@@ -361,6 +428,8 @@ withVmOwnerScoped scope config =
       , ownerCallbackScope = scope
       , ownerLifecycle = vmLifecycle config
       , ownerRequests = vmRequests config
+      , ownerExports = vmExports config
+      , ownerExportLimits = vmExportLimits config
       }
 
 -- | Load a module from the owner's body, in an environment of its own.
@@ -425,3 +494,46 @@ resumeTask owned = Task.resumeTask (ownedHost owned)
 -- is closed even if that failed, and closing a task that has ended does nothing.
 closeTask ∷ HasCallStack ⇒ OwnedVm → Task → IO ()
 closeTask owned = Task.closeTask (ownedHost owned)
+
+-- | Evaluate an export module from the owner's body, or answer what its identity
+-- already came to.
+--
+-- The chunk must return exactly one table with no metatable, which the VM keeps as
+-- it is. What the identity came to is sticky: asking again answers the same table,
+-- or the same failure, and runs nothing, however the second ask's bytes differ. An
+-- identity that is empty or past 'maxExportIdentityBytes', and a new identity
+-- while the owner holds as many as 'vmExportLimits' allows (failed and in-progress
+-- ones included), are refused with 'NoEffect' and no record; source past the limit
+-- is never compiled and is a failed identity that counts. The owner's thread only;
+-- used by any other thread it is refused with 'VmNotOwned', and once the lifetime
+-- has ended with 'VmClosed'.
+evaluateExport ∷ HasCallStack ⇒ OwnedVm → ExportSource → IO ExportOutcome
+evaluateExport owned = Export.evaluateExport (ownedHost owned)
+
+-- | What an identity came to, without evaluating anything: 'Nothing' for an
+-- identity the owner holds no record of. The same table, or the same failure, as
+-- every earlier answer for it. The owner's thread only.
+retrieveExport ∷ HasCallStack ⇒ OwnedVm → ExportIdentity → IO (Maybe ExportOutcome)
+retrieveExport owned = Export.retrieveExport (ownedHost owned)
+
+-- | Validate the field named by the text of the export table a handle names as a
+-- behavior, and capture it with a facade.
+--
+-- The field must be a plain table whose only keys are @init@, @update@,
+-- @shutdown@, @every_ticks@ and @every_seconds@, each hook absent or a function.
+-- It is read by raw access, so no metamethod, indexing function or conversion
+-- runs, and at most six of its entries are visited: nothing walks the library
+-- exports around it. A behavior that does not fit is answered as a
+-- 'BehaviorProblem' and holds nothing; a fault ('BoundaryFault') is a handle that
+-- is not this owner's, a facade past the value limits, or an allocation that
+-- failed, and holds nothing either. On success the capture holds the very hook
+-- functions, a fresh @self@ table whose @api@ is the facade, and the facade, until
+-- 'releaseBehavior' or the VM's close; later changes to the tables it was read
+-- from do not reach it. The owner's thread only.
+captureBehavior ∷ HasCallStack ⇒ OwnedVm → ExportHandle → Text → FacadeSource → IO (Either BehaviorProblem Captured)
+captureBehavior owned = Export.captureBehavior (ownedHost owned)
+
+-- | Let go of a capture. Idempotent; refused for a handle another owner issued.
+-- The owner's thread only.
+releaseBehavior ∷ HasCallStack ⇒ OwnedVm → CaptureHandle → IO ()
+releaseBehavior owned = Export.releaseBehavior (ownedHost owned)
