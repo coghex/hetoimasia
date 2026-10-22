@@ -1512,7 +1512,10 @@ surface, and an engine service the application guards with `withPrecondition` re
 `modulePhaseActive` and refuses as an ordinary Lua error **before its action**: the action counter
 stays at zero, and the module can catch the error and go on. A function a module defines may use
 the service later, when a hook calls it; that includes a helper a module exported, and a facade a
-hook stashed in the shared exports and a module's top level later reached for. Concrete facades and
+hook stashed in the shared exports and a module's top level later reached for. The phase also covers the closing of a
+module's coroutine: the to-be-closed variables a failed module's coroutine runs when it is closed, and those of a
+suspended one the loader's stop closes, are the module's own code and run under it, so a guarded service is refused there
+as at the top level. The flag is put back as it was however the closing ends. Concrete facades and
 output bindings are installed by LFE-12; the phase is the integration point they use.
 
 ### Stop and what it leaves
@@ -1580,12 +1583,20 @@ compile, evaluation, resume, publication and Lua-reference release happens on th
 turns**: hooks and stop requests go on while a chain waits for a source, another owner is not affected, and a
 non-yielding module still blocks its own owner.
 
-A **due logical chain holds the next tick.** While a `DueTick` root whose tick has been reached has no outcome the owner
-asks to be held at the following tick, in the same transaction that read the tick, so the scheduler does not apply a grant
-that would begin it: the tick is not complete and nothing advances past the obligation. The hold is one need whatever the
-number of roots, and is given back when the last due root has an outcome or the owner exits. A UI chain holds nothing.
-When the owner exits the inbox closes, the loader is stopped on the owner's thread, every outcome that was only admitted
-is published as stopped, and the hold is given back. `LoaderPlanRefused` names, before anything starts, a bound below
+A **logical root owes its tick from its submission.** `submitRoot` records what the root owes (the tick `t` of a
+`DueTick t`) in the one transaction that accepts the submission and reads the tick, before the owner has looked at
+anything. The scheduler keeps the grant that reaches tick `t` unfinished, and applies no later grant, until the root has an
+outcome: however many grants were queued while the owner was busy, tick `t` is not complete, `awaitTicksComplete` does not
+return for it, and nothing advances past the obligation. The need is one whatever the number of roots, for the earliest
+tick an unfinished root owes (or the current tick, once that has passed), and is given back when none is owed or the
+owner exits. A root submitted again keeps the earliest of its obligations and of the ticks it may begin at; a later
+submission never postpones either. A UI chain owes nothing and holds nothing.
+
+Once a stop is asked of the owner, nothing more is admitted, delivered, started or resumed: its boundary leaves the
+loader alone, the loader starts no queued root and resumes no suspended importer or starts no dependency of an advance a
+stop interrupted (a module already running is not preempted), and what is unfinished is left for the exit. When the owner
+exits the inbox closes, the loader is stopped on the owner's thread, every outcome that was only admitted is published as
+stopped, and the need is given back. `LoaderPlanRefused` names, before anything starts, a bound below
 one and a VM configuration that already names a loader.
 
 ### What is not here
