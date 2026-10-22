@@ -12,6 +12,7 @@ Haskell code, with their own levels (AST-2).
 | Module | Contents |
 | --- | --- |
 | `Hetoimasia.Asset.Image.Png` | `pngDecoder ∷ ImageKind → Decoder DecodedImage`; `decodePng ∷ ImageKind → Asset → ByteString → Either AssetRefusal DecodedImage` |
+| `Hetoimasia.Asset.Image.PngPreflight` | `preflightPng ∷ PngLimits → Asset → ByteString → Either PngRefusal PngPreflight`; `PngLimits`, `pngLimits ∷ PngLimitSettings → Either LimitsRefusal PngLimits`, `m1PngLimits`; `PngRefusal` (`PngRefusalClass`: `UnsupportedFormat`, `MalformedPng`, `ExceededLimit LimitKind`); `PngPreflight` and its accessors |
 | `Hetoimasia.Asset.Image.Mips` | `MipRequest` (`mipCoverage`), `Coverage` (`CoverageFromMark`, `PreserveCoverage`, `PlainAverages`), `mipRequest`; `generateMips ∷ MipRequest → DecodedImage → Either Text DecodedImage`; `mipmapped ∷ MipRequest → Decoder DecodedImage → Decoder DecodedImage` |
 | `Hetoimasia.Asset.Image.Ktx2` | `Ktx2Image` (`Ktx2Rgba8`, `Ktx2Bc7`), `ktx2DecodedImage`; `ktx2Decoder ∷ ImageKind → Decoder Ktx2Image`; `decodeKtx2 ∷ ImageKind → Asset → ByteString → Either AssetRefusal Ktx2Image` |
 | `Hetoimasia.Asset.Image.Bc7` | `Bc7Format` (`Bc7Srgb`, `Bc7Linear`); `Bc7Image` and `bc7Image ∷ Asset → Bc7Format → Word32 → Word32 → [ByteString] → Either AssetRefusal Bc7Image`, `bc7DecodedImage`; `decodeBc7 ∷ Bc7Image → DecodedImage`; `Bc7Support`, `bc7Fallback ∷ Bc7Support → Bc7Image → Bc7Fallback`, `fallbackImage`, `fallbackSoftwareDecode` |
@@ -89,6 +90,178 @@ checks. The checks above that it does not make run before it, or where the
 palette is applied, so it never reads past a buffer. Each result is evaluated
 completely before it is returned, and any synchronous exception that
 evaluation throws becomes a refusal.
+
+## Bounded static-PNG preflight
+
+`Hetoimasia.Asset.Image.PngPreflight` is the opt-in boundary the M1 Lua
+texture profile uses (design D-65, D-77; LFE-14). It decides, before any
+size-derived allocation and before a decoder runs, whether a PNG's bytes are
+a static PNG inside a caller's limits. `pngDecoder` and `decodePng` do not
+use it, impose none of these limits and are unchanged; so are the KTX2, BC7
+and mip entry points.
+
+A successful preflight is **not** a decoded image and not a usable texture. It
+says: under these limits, these bytes have sound framing and CRCs, a header
+inside the profile, and an image data stream that inflates to at least the
+scanline bytes the header needs and at most the inflation limit. Decoding to
+RGBA8 and the accounting of its buffers belong to the next stage (LFE-15).
+
+### The limits
+
+`PngLimitSettings` states seven limits as `Integer`s; `pngLimits` validates
+them into `PngLimits`; `m1PngLimits` is the approved profile. KiB and MiB are
+powers of 1024.
+
+| Limit | M1 value | Bounds |
+| --- | --- | --- |
+| `settingSourceBytes` | 32 MiB | the encoded bytes supplied |
+| `settingChunks` | 4,096 | chunks from IHDR through IEND inclusive |
+| `settingWidth`, `settingHeight` | 2,048 each | each axis, in pixels |
+| `settingPixels` | 4,194,304 | width × height |
+| `settingRgba8Bytes` | 16 MiB | the eventual single RGBA8 output, 4 bytes a pixel |
+| `settingInflatedBytes` | 40 MiB | decompressed scanline bytes, filter bytes included |
+
+`pngLimits` refuses, naming the first limit in the order above (a bounded
+`LimitsRefusal`), any value below 1 or above `largestLimit` = 2³¹ − 1. Zero,
+negative and oversized values are all refused, and no value means
+"unlimited". The upper bound is the PNG specification's largest dimension and a
+value every `Int` represents, so no limit, narrowing or allocation size
+depends on the machine word. Smaller limits (the suite's boundary cases) go
+through the same validation and arithmetic; there is no Lua or product tuning
+interface.
+
+### Arithmetic
+
+Everything derived from a header is an `Integer`: chunk lengths against the
+remaining input, `width × height`, `× 4`, the packed row length
+`⌈width_p × bitsPerPixel ÷ 8⌉` and its filter byte for each pass, and the
+pass extents of Adam7 (an empty pass, no columns or no rows, contributes
+nothing, not even filter bytes). A value is compared with its limit first and
+narrowed to `Int` only when it is within a limit, which is at most 2³¹ − 1.
+Nothing wraps or clamps. A declared huge chunk length or dimension is
+refused without attempting its allocation: preflight allocates nothing from a
+declared size at all.
+
+At the M1 maxima a 2048 × 2048 RGBA16 image needs 33,556,480 scanline bytes
+(33,558,272 with Adam7): under the 40 MiB limit, so the inflation limit binds
+the stream, not any legal M1 header, and the pixel and RGBA8 limits equal the
+axis limits' product (2048² and 2048² × 4). The suite reaches those limits'
+one-past cases with smaller injected limits.
+
+### The profile
+
+All the supported baseline variants are accepted: greyscale at 1, 2, 4, 8 and
+16 bits; palette at 1, 2, 4 and 8; RGB, greyscale-alpha and RGBA at 8 and 16;
+each noninterlaced or Adam7. Recognition is by the eight-byte signature, never
+an extension or hint. Animated PNGs (any `acTL`, `fcTL` or `fdAT` chunk up to
+IEND, before or after the image data) are refused, never decoded as a first
+frame.
+
+Colour and profile metadata (`gAMA`, `cHRM`, `sRGB`, `iCCP`, text, anything
+else) is framed, counted and CRC-checked but never decompressed and never
+built into an object graph; the source and chunk limits bound it. A
+transparency key is read as the general decoder reads it
+(`preflightColourKey`: exactly one `tRNS` chunk of the colour type's length,
+else ignored). A palette image's first `PLTE` and every `tRNS` chunk's data
+are kept as slices for decoding (`preflightPalette`, `preflightTransparency`).
+Palette indices, `tRNS` length for palette images and texel conversion are
+decoding's.
+
+### Preflight refusals
+
+`PngRefusal` carries the asset, a class and a bounded reason built from fixed
+text and numbers (never the offending bytes). The class is what a texture
+provider maps:
+
+- `UnsupportedFormat`: not a PNG, including empty input and a proper prefix of
+  the signature; or an animated PNG.
+- `MalformedPng`: begins with the complete signature and is not a sound PNG of
+  the profile: truncation (including a declared chunk length past the end of
+  the input, refused before anything is taken from it), a CRC failure in any
+  chunk, no or a misplaced IHDR, no IEND, an invalid header, or an image data
+  stream that is corrupt, truncated, or inflates to fewer bytes than the header
+  needs.
+- `ExceededLimit kind`: sound so far and over a limit.
+
+**The order of the checks** is fixed, and the first that fails decides the
+class: (1) the source length against its limit; (2) the signature; (3) each
+chunk in file order from the first to IEND — its framing, then the chunk limit,
+then its CRC, then its meaning (the first chunk must be a 13-byte IHDR; an
+animation chunk is unsupported); (4) the header; (5) width, height, pixels,
+RGBA8 bytes, then the header's scanline bytes against the inflation limit; (6)
+inflation. A chunk-count overflow therefore wins over a later animation marker,
+and an animation marker wins over a later CRC failure.
+
+A dimension above 2³¹ − 1 is malformed, as the specification forbids it; one
+between the limit and 2³¹ − 1 is `ExceededLimit`. Bytes after a complete IEND
+are not parsed and do not count as chunks, but count towards the source limit;
+the general decoder accepts them too, and they are accepted here.
+
+**Faults are not refusals.** An allocator failure, an exception from the
+inflater binding other than its own corrupt-or-truncated report, or any other
+fault is never reported as one of the three classes. `preflightPng` does not
+catch it: it propagates as an exception when the result is demanded, an
+asynchronous exception included, so cancellation is never a successful result
+or a malformed-content answer. This is deliberately unlike `decodePng`, which
+turns every synchronous exception into a refusal. The result is built
+strictly: a value in hand holds no suspended computation, inflater state or
+inflater output.
+
+### Bounded inflation
+
+The IDAT chunks are one zlib stream, handed to the inflater as their slices
+without concatenation. The preflight counts each output piece the moment the
+inflater produces it, as an `Integer` comparison, and the piece that crosses the
+inflation limit ends the work: the rest of the stream is never inflated. The
+limit holds independently of the header, so a one-pixel image with excessive
+data cannot consume unlimited work; and the header's scanline bytes are checked
+against it before inflation starts. A stream that fails or ends early inside the
+budget is `MalformedPng`; one that inflates to fewer bytes than the header needs is
+`MalformedPng`; more than needed but within the limit is accepted, as the general
+decoder accepts it.
+
+The suite shows the stop through the public entry: past the budget by more than
+one inflater piece (at most 32 KiB) a stream continues with a hand-written
+reserved deflate block type, and the answer is `ExceededLimit`, not corruption;
+the same stream with the budget beyond it is `MalformedPng`. It also splits the
+stream over many IDAT chunks, and puts the budget inside an output piece.
+
+### What a result retains, and its accounting
+
+A `PngPreflight` can be built only by `preflightPng`, and carries the bytes and
+limits it checked (`preflightSource`, `preflightLimits`), so it cannot authorize
+decoding other bytes. It retains the caller's `ByteString` itself, not a copy,
+and slices of it: the data of each IDAT chunk (`preflightImageData`), the first
+`PLTE` and each `tRNS`. Nothing inflated is kept, only its count. The slices keep
+the source buffer alive; dropping the result releases everything. Preflight
+owns no thread, file or native handle.
+
+| Item | Size | Lifetime |
+| --- | --- | --- |
+| Input view | the caller's buffer, not copied; at most the source limit | the caller's, kept alive by the result |
+| Chunk descriptors | the scan's few words of state, plus one slice per IDAT, `tRNS` and the first `PLTE`: at most the chunk limit | the scan; retained slices live in the result |
+| Inflater state | one zlib stream | from the first input to stream end or failure, or, when the budget ends the work, to the binding's finalizer |
+| Inflater output scratch | one piece at a time, at most 32 KiB | counted and dropped |
+| Inflated image | none; only the count | not applicable |
+
+**Dependency assumptions.** The inflater's native state is created and
+released by the pinned `zlib` binding (`inflateEnd` runs when a stream ends or
+fails, and as a foreign-pointer finalizer for a stream the budget abandons);
+this package adds no disposal machinery and holds the state only inside the
+`ST` computation that drives it. Its per-call state is one inflater and one
+output piece. The bundled C zlib is used; `cabal.project.common` keeps a system
+libz out of the build. These figures cover the preflight only: the complete
+decoder's workspace is not accounted here.
+
+### Obligations on LFE-15
+
+Preflight does not bound the decoder. The decoding stage must decode from
+`preflightSource` (or the `preflightImageData` slices) with an inflation bounded
+by the inflation limit in `preflightLimits`, rather than the general decoder,
+which inflates without a limit and builds its full chunk list, or establish an
+equally bounded path for any later inflation; and it must account for the RGBA8
+output (`preflightRgba8Bytes`) and its own intermediates. This slice claims no
+complete-pipeline or GPU-readiness bound.
 
 ## BC7
 
@@ -372,6 +545,7 @@ and the BC7 partition and weight tables are constants shared by every decode.
 BC7 checking, decoding, the mark and the fallback step are pure too, as are
 KTX2 reading and mip generation: the same bytes and kind always give the same
 result, and the same image and request always give the same levels. The
+bounded PNG preflight is pure as well; its accounting is above. The
 package holds no logger. A decoded image's bytes are the caller's.
 
 ## Tests
@@ -387,6 +561,13 @@ that uses only Python's standard library, independent of this decoder and of
 JuicyPixels. Every expected texel is written out in the test. To regenerate
 the fixtures, run `python3 make_fixtures.py` in that directory; the output is
 byte-for-byte deterministic.
+
+The bounded preflight's cases build their defects byte by byte in
+`Test.Asset.Image.PngBuilder` (a bitwise CRC-32, zlib streams from the `zlib`
+package or spelled out as stored blocks, and expected scanline sizes counted
+pixel by pixel), independently of the production parser, JuicyPixels and the
+formula the production code uses, over the committed fixtures where an existing
+file already holds the defect. Boundary cases use small injected limits.
 
 Its BC7 fixture, `test/fixtures/bc7-reference.txt`, comes from
 `make_bc7_fixtures.py`, which builds blocks bit by bit (every partition of
