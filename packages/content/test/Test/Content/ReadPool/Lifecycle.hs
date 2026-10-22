@@ -128,7 +128,9 @@ starting = describe "a partial startup" $
         failsWith @IOError (withPoolWith hooks (poolOf 3 4) (readVerified inventory root) (\_ → pure ()))
       show failure `shouldContain` "injected start failure"
       case workerEvidenceInContext evidence of
-        [GroupExit report] → length (reportDrained report) `shouldBe` 1
+        -- The worker may have seen the closed pool and returned before the group began to close,
+        -- or be drained by it; either way the group's report accounts for the one worker started.
+        [GroupExit report] → (length (reportDrained report) + length (reportExitedBeforeClosing report)) `shouldBe` 1
         other → expectationFailure ("expected one group report, found " <> show (length other) <> " evidence entries")
 
 -- Draining -------------------------------------------------------------------------------
