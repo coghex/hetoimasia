@@ -125,6 +125,7 @@ test-suite content-tests
         Test.Content.Links
         Test.Content.Names
         Test.Content.Opacity
+        Test.Content.ReadPool.Boundary
         Test.Content.ReadPool.Jobs
         Test.Content.ReadPool.Lifecycle
         Test.Content.ReadPool.Support

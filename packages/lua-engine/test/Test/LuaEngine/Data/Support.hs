@@ -56,6 +56,7 @@ module Test.LuaEngine.Data.Support
   , grantOne
   , grantStep
   , awaitEnd
+  , awaitOwnerEnded
   , awaitFailure
   , instanceTicket
   , requestFailureOf
@@ -232,7 +233,11 @@ withSession profile (workers, slots) readerOf (Layout files) body =
           withSupervision lifetime $ \control → do
             runtime ← newLuaRuntime control
             outcome ← timeout exampleBound (body session control runtime) `finally` (writeIORef (ssOpened session) True >> openGates session >> openAllProbeGates probe)
-            maybe (assertFailure "the example did not finish within its bound") pure outcome
+            case outcome of
+              Just value → pure value
+              Nothing → do
+                seen ← history session
+                assertFailure ("the example did not finish within its bound; it had recorded: " <> show (reverse (take 12 (reverse seen))))
 
 -- | An example whose owner is expected to end in a failure of the application's own, which
 -- supervision raises at the boundary: answers the failure with its context. A failed assertion or
@@ -691,6 +696,13 @@ awaitEnd control vm =
     scheduledStatus (vmOwner vm) >>= \case
       WorkerLive → retry
       status' → pure status'
+
+-- | Wait, without supervision's rethrow, until the owner is no longer live.
+awaitOwnerEnded ∷ Vm → IO ()
+awaitOwnerEnded vm = atomically $
+  scheduledStatus (vmOwner vm) >>= \case
+    WorkerLive → retry
+    _ → pure ()
 
 -- | The failure an instance settled with, waiting for it to settle.
 awaitFailure ∷ Session → Text → IO (Maybe InstanceFailure)

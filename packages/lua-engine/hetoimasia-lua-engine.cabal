@@ -125,6 +125,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Boot
         Test.LuaEngine.Boundary
         Test.LuaEngine.Data.Contract
+        Test.LuaEngine.Data.Lifecycle
         Test.LuaEngine.Data.Limits
         Test.LuaEngine.Data.Spec
         Test.LuaEngine.Data.Support

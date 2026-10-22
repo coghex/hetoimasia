@@ -178,6 +178,30 @@ slots = describe "the slot reservations" $ do
         ExceptionWithContext _ extra ← failsWith (atomically (releaseSlot pool))
         extra `shouldBe` ContentDefect ReadSlotReleasedWhileLive
 
+  it "lets the consumer release its slot from inside the sink: the claim ends before the reply can be accounted" $
+    withRealPool (poolOf 1 1) [("a.bin", "a")] $ \inventory pool → do
+      outcomes ← newOutcomes
+      released ← newGate
+      _ ← atomically (reserveSlot pool)
+      ticket ←
+        atomically
+          ( submit
+              pool
+              ( ReadRequest
+                  (keyOf inventory "a.bin")
+                  64
+                  OrdinaryRead
+                  (\result → atomically (releaseSlot pool) >> recordingSink outcomes (keyOf inventory "a.bin") result >> holdAt released)
+              )
+          )
+          >>= either (\_ → fail "refused") pure
+      awaitHeld released
+      -- The sink released the slot while the job is not yet retired: another reservation fits.
+      atomically (reserveSlot pool) `shouldReturn` True
+      atomically (retired ticket) `shouldReturn` False
+      releaseGate released
+      awaitRetired ticket
+
 -- Cancelling -------------------------------------------------------------------------------
 
 cancelling ∷ Spec
