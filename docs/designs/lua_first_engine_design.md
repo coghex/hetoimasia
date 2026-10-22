@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-67/Q-6r: how UI Lua observes session status.
+The current checkpoint is P-68/Q-6s: authored output and diagnostic logging.
+D-70 accepts UI-only polling of copied session status sampled per segment.
 D-69 defers engine randomness and removes standard RNG calls in both M1 VMs.
 D-68 accepts role-specific clocks and cooperative waits with sampled UI time.
 D-67 accepts logical request tick offsets and earliest shared-module evaluation.
@@ -2109,6 +2110,37 @@ The manager presented the cost that cosmetic UI scripts using the standard
 RNG must change or bring their own generator. The owner chose deferral over
 retaining UI randomness. Future engine seeding/streams remain undecided.
 
+### D-70. UI hooks poll copied session status without status-change callbacks
+
+**Delivery:** M1 loading/failure observation; no gameplay-state channel.
+
+Owner answer, **2026-10-22 03:12:39 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: UI polls (Rec.)
+
+Authenticated relay: `het-manager`, message `ctf5698qnashwmy5exx7gdpmf2`,
+posted **2026-10-22 03:12:39.490 UTC** in `#het-luafirst`, replying to Q-6r
+message `exsvbk36ehrfvp69sq9rrjpga2`.
+
+Accept P-67's A: a UI lifecycle hook reads a plain copied status sampled once
+per hook/resumed segment. It describes present VMs, readiness, running/failure/
+stopping/actual retirement and stop requests. A logical failure remains latched
+with source, executing instance, role, stage, explanation and available bounded
+traceback. Copies do not mutate engine status; cleanup completion is reported
+only after actual retirement. Early UI receives starting/ready information,
+not detailed progress or a world. Existing startup/stop/failure policies remain.
+
+The read is UI-only, including finite init/shutdown; logical-VM and module-top
+calls are ordinary Lua errors. This narrows P-41's earlier role-neutral runtime
+status wording. No callbacks, history, acknowledgement or status-triggered wake
+is added. Intermediate changes may be missed and long segments see stale
+samples; independent stderr diagnostics still report failures.
+
+The manager presented polling and no wakeup for event-driven instances as the
+cost. The owner chose polling over status callbacks. Exact record fields and
+numeric bounds remain part of the API package.
+
 ## Proposals
 
 **Scope precedence:** D-41 supersedes the original state-store agenda. Accepted
@@ -4165,7 +4197,8 @@ features now would exceed the requested milestone. Neither is recommended.
 This replaces the held P-39 question with the scope D-43 actually approved.
 Recommend A: presentation instances get the M1 window, texture-load/lease and
 2D scene-publication bindings. Both roles get scoped module/data loading,
-logging/print, their own clocks/waits, runtime status and orderly session quit.
+logging/print, their own clocks/waits and orderly session quit. Runtime status
+is UI-only under the later D-70 refinement.
 Native close/resize handling needed by the quad remains engine-serviced.
 No general keyboard/pointer/text input API, widget system, advanced window
 controls or mod-activation API is part of this selection.
@@ -5759,7 +5792,7 @@ not an existing standalone generic service to wire into the no-store M1.
 
 ### P-67. Let UI hooks poll a coherent copied session-status record
 
-**Unapproved; active checkpoint Q-6r. Delivery: M1.** D-18/D-19/D-42 already
+**A accepted by D-70 through Q-6r. Delivery: M1.** D-18/D-19/D-42 already
 require startup and failure information for a Lua loading/error screen. They
 do not select a Lua delivery API. Recommend A: a synchronous, non-waiting
 status read in UI lifecycle hooks returns a plain copied record, sampled at
@@ -5829,6 +5862,83 @@ publication is not a ready-made no-store M1 API. The
 observations on the owner thread (`scheduledObserve`); exposing this new
 bounded launcher status still requires explicit supervisor publication and
 binding integration.
+
+### P-68. Reuse bounded print/warn output and defer a separate Lua logging API
+
+**Unapproved; active checkpoint Q-6s. Delivery: M1.** D-20 already places
+authored output on stdout and diagnostics on stderr; D-8 permits module-level
+diagnostics. Recommend A: expose engine-rebound `print(...)` and `warn(...)`
+in both roles, during module evaluation and lifecycle hooks including finite
+init/shutdown. Keep the original C-stream functions unreachable before authored
+code runs. Add no Lua logger constructor, level/field API, sink choice, file
+writer or logging-configuration control in M1.
+
+Both calls convert arguments with Lua `tostring`, join them with tabs and
+emit bounded text through injected Haskell sinks. `print` is unprefixed
+application output on stdout. `warn` is a diagnostic on stderr with an
+engine-generated warning prefix and context: role and content ID, plus the
+executing instance during hooks or the evaluating module path during loading.
+Shared-module hook code retains the executing instance's attribution; this
+does not promise an exact helper-function call site. Module evaluation does
+not invent an instance owner. Attribution comes from the engine, not a
+script-supplied identity. The final prefix spelling belongs to the API package.
+
+Reuse the runner's 4096-byte total written limit per authored call, counting
+prefixes, escaping, line endings and a visible truncation marker. No silent
+unbounded print path remains. Invalid UTF-8 bytes are replaced, line breaks
+are split into output lines, and other controls are escaped except tabs;
+each warning line is marked as authored warning output. Bound text before
+crossing into the host and again after formatting, since replacement/escaping
+can expand it. Oversized output is visibly truncated, not a required-request
+failure. Lua conversion/metamethod failures are ordinary Lua errors with no
+partial output from that call. Conversion may run authored code and still has
+the trusted-script hang/memory limitations; this is an output bound, not an
+execution quota.
+
+Authored print/warn calls bypass engine log filtering, as in the existing
+runner; `warn` does not fail the instance merely because it emits a warning.
+Lua warning-control strings such as `@off` are ordinary text in this rebound
+function, not controls over engine diagnostics. Engine lifecycle/failure
+diagnostics remain separately attributed under the existing logging/reporting
+contract, and script output does not suppress failure reports. M1 adds no
+mandatory runner instance tables to stdout; that remains the authored-output
+stream for the new launcher, apart from explicit help output.
+
+Output is synchronous, serialized for a complete authored call/report through
+session-owned sink coordination, and flushed on emission. It adds no hidden
+queue, drop policy, rate limiter or asynchronous delivery receipt. Per-owner
+call order is preserved; interleaving between independent VMs follows actual
+execution and is not a deterministic transcript. A successful return does not
+promise durable storage. The application owns sinks through protected session
+cleanup so shutdown hooks can still write. A sink/write/flush failure is a
+host failure under existing fatal-session policy, not a catchable content-load
+refusal; do not recursively retry output through a failed sink. Forced exit
+retains D-20's exception to cleanup/flushing guarantees.
+
+Alternative B also exposes a Lua diagnostic logging service with levels and
+structured fields through the existing Haskell logger. It enables filtered
+debug/info diagnostics without authors formatting them into warning strings,
+but requires selecting the Lua schema, allowed fields/components, attribution
+and filtering behavior next. It does not expose OS logging configuration or
+file handles implicitly. Both options retain D-20's stream split.
+
+A is recommended for the quad milestone because the runner already supplies
+the bounded output bridge and Lua can distinguish ordinary output from a
+warning. Costs: no authored debug/info levels or structured log fields yet;
+long messages truncate, and a slow terminal/pipe can block the calling VM
+and other writers waiting on the shared output lock. There is no promise that
+printing is nonblocking or can be preempted by cooperative Lua cancellation.
+
+Qualification covers both roles and module/hook phases, stream separation,
+engine-owned warning attribution including shared-module calls, conversion
+failure before emission, invalid bytes/control escaping and the final byte
+bound, concurrent complete-call serialization, sink failures and output during
+shutdown. Tests use injected sinks rather than timing sleeps. Evidence:
+[Lua runner output and stream rules](../../packages/scripting-lua/README.md#output-and-the-stream-rules)
+already rebind print/warn, cap each call at 4096 bytes and serialize writes;
+[the logger](../logging.md) has synchronous injected sinks and propagates sink
+exceptions. M1 warning context and launcher-wide coordination are integration
+work, not a claim that the current runner already implements this proposal.
 
 ## Open questions
 
@@ -6275,13 +6385,19 @@ in their own scope and the later arc.
 
 #### Q-6r. Should UI Lua poll session status or receive status-change callbacks?
 
-**Active checkpoint, P-67.** A (recommended): UI-only lifecycle reads of a
-coherent copied latest status, sampled per hook/resumed segment, including
-role presence/readiness, running/failure/retirement and bounded latched failure
-detail. No progress channel or status-triggered wakeup; authors poll in
-scheduled hooks. B: add callbacks and design their bounded delivery/lifetime
-contract next. Logical/module-top calls are refused under A; neither choice
-changes startup, failure or stop policy.
+Resolved by D-70: P-67's A, UI-only lifecycle polling of coherent copied
+status sampled per hook/resumed segment, with bounded latched failure detail
+and actual retirement. No status callbacks/wakeup, progress or world channel;
+logical/module-top reads are ordinary Lua errors.
+
+#### Q-6s. Use bounded print/warn only or add structured Lua logging in M1?
+
+**Active checkpoint, P-68.** A (recommended): rebound print to stdout and
+attributed warn to stderr, both roles and module/hooks, 4096-byte final call
+bound, synchronous serialized/flush-on-emission sinks, no filtering of authored
+output and no separate Lua logger API. Cost: truncation, potentially blocking
+output, and no authored levels/fields. B: also expose structured level-based
+logging and settle its Lua schema/filtering contract next.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
