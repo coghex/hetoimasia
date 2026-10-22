@@ -65,7 +65,7 @@ concrete precondition
 - [x] LFE-1. Install the explicit filtered M1 library profile — [#515]
 - [x] LFE-2. Add opt-in recoverable binding validation and refusal — [#516]
 - [x] LFE-3. Parse the strict manifest and validate the fixed M1 profile — [#517]
-- [ ] LFE-4. Own anchored native content roots and no-follow reads
+- [x] LFE-4. Own anchored native content roots and no-follow reads — [#518]
 - [ ] LFE-5. Validate literal Unicode content identities
 - [ ] LFE-6. Build and verify the bounded whole-folder inventory
 - [ ] LFE-7. Reserve M1 requests and results atomically
