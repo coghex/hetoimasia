@@ -3,8 +3,8 @@
 -- around the checks, reach a descriptor, or substitute the native adapter.
 --
 -- Each compiles a separate single-module client with the harness from
--- "Test.Support.ExternalClient", exposing @base@, @bytestring@ and
--- @hetoimasia-content@ and hiding everything else, so what the client can say is
+-- "Test.Support.ExternalClient", exposing @base@, @bytestring@ and the
+-- package's main library and hiding everything else, so what the client can say is
 -- exactly what the library's @exposed-modules@ and export lists allow. Every
 -- rejected client is checked against the diagnostic that names its cause; the
 -- accepted client is compiled, linked and run against a tree this example
@@ -79,7 +79,10 @@ spec = describe "Content package boundary" $ do
         (status, out, err) `shouldBe` (ExitSuccess, "read through the public API", "")
 
 withClient ∷ String → String → ((Mode → IO Client) → IO ()) → IO ()
-withClient = withPackageClient ["base", "bytestring", "hetoimasia-content"]
+-- | The facade is exposed by its unit id: a package with a private sublibrary
+-- registers every component under one package name, so the name alone matches
+-- more than one unit and the compiler's choice among them is not stable.
+withClient = withPackageClient ["base", "bytestring", "hetoimasia-content-0.1.0.0-inplace"]
 
 constructorClient ∷ String
 constructorClient =

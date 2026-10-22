@@ -90,7 +90,7 @@ spec = do
         rootVar ← newEmptyMVar
         opVar ← newEmptyMVar
         let seam = onBoundary (announce drainStarted) (pauseWhen (== BeforeRead) pause recorded)
-        owner ← spawn $ withRootVia seam defaultContentLimits path $ \root → do
+        owner ← spawn $ withRootOwned seam defaultContentLimits path $ \root → do
           putMVar rootVar root
           operation ← spawn (readFirst root ["file.bin"])
           putMVar opVar operation
@@ -122,7 +122,7 @@ spec = do
         drainStarted ← newEmptyMVar
         opVar ← newEmptyMVar
         let seam = onBoundary (announce drainStarted) (pauseWhen (== BeforeRead) pause recorded)
-        owner ← spawn $ withRootVia seam defaultContentLimits path $ \root → do
+        owner ← spawn $ withRootOwned seam defaultContentLimits path $ \root → do
           operation ← spawn (readFirst root ["file.bin"])
           putMVar opVar operation
           awaitReached pause
@@ -156,7 +156,7 @@ spec = do
         opVar ← newEmptyMVar
         -- closes: 1 the qualification probe, 2 the operation's file, 3 the root
         let seam = failNthClose counter 3 28 (onBoundary (announce drainStarted) (pauseWhen (== BeforeRead) pause recorded))
-        owner ← spawn $ withRootVia seam defaultContentLimits path $ \root → do
+        owner ← spawn $ withRootOwned seam defaultContentLimits path $ \root → do
           operation ← spawn (readFirst root ["file.bin"])
           putMVar opVar operation
           awaitReached pause
@@ -185,7 +185,7 @@ spec = do
         drainStarted ← newEmptyMVar
         opVar ← newEmptyMVar
         let seam = onBoundary (announce drainStarted) (pauseWhen (== BeforeRead) pause recorded)
-        owner ← spawn $ withRootVia seam defaultContentLimits path $ \root → do
+        owner ← spawn $ withRootOwned seam defaultContentLimits path $ \root → do
           operation ← spawn (readFirst root ["file.bin"])
           putMVar opVar operation
           awaitReached pause
@@ -314,7 +314,7 @@ spec = do
               result ← nativeOpenRoot native selection
               putMVar reached () >> spinUntilCancelling killerRef
               pure result}) recorded
-        owner ← spawn (withRootVia pendingAfter defaultContentLimits path (\_ → pure ()))
+        owner ← spawn (withRootOwned pendingAfter defaultContentLimits path (\_ → pure ()))
         bounded (takeMVar reached)
         killer ← spawn (killThread (childThread owner))
         writeIORef killerRef (Just killer)

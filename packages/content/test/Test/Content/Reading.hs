@@ -148,13 +148,14 @@ spec = do
       withFileTree $ \path → do
         (seam, rig) ← recordingSeam
         retained ← newIORef Nothing
-        withRootVia seam defaultContentLimits path $ \root →
+        withRootVia seam defaultContentLimits path $ \root → do
           withFile root (names ["file.bin"]) $ \reader → writeIORef retained (Just reader)
-        Just stale ← readIORef retained
-        ExceptionWithContext _ afterRead ← failsWith (readChunk stale 4)
-        afterRead `shouldBe` ContentDefect ReaderNotLive
-        ExceptionWithContext _ afterMetadata ← failsWith (fileMetadata stale)
-        afterMetadata `shouldBe` ContentDefect ReaderNotLive
+          -- the same thread, after the callback: the reader is dead, not foreign
+          Just stale ← readIORef retained
+          ExceptionWithContext _ afterRead ← failsWith (readChunk stale 4)
+          afterRead `shouldBe` ContentDefect ReaderNotLive
+          ExceptionWithContext _ afterMetadata ← failsWith (fileMetadata stale)
+          afterMetadata `shouldBe` ContentDefect ReaderNotLive
         log' ← events rig
         length [() | Read _ _ ← log'] `shouldBe` 0
 

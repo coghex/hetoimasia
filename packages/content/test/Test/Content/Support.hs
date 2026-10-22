@@ -60,6 +60,7 @@ module Test.Content.Support
     -- * Roots
   , withRoot
   , withRootVia
+  , withRootOwned
   , readAll
 
     -- * Children
@@ -334,8 +335,19 @@ resumePaused (Pause _ resume _) = putMVar resume ()
 withRoot ∷ FilePath → (ContentRoot → IO a) → IO a
 withRoot = withRootVia productionSeam defaultContentLimits
 
+-- | The root's scope on the calling thread, for an example that owns the thread
+-- the scope runs on (to cancel it, or to watch its exit from outside).
+withRootOwned ∷ Seam → ContentLimits → FilePath → (ContentRoot → IO a) → IO a
+withRootOwned seam limits path = withContentRootWith seam limits (BC.pack path)
+
+-- | The root's scope runs on a child of its own, which the example waits for
+-- within a bound. A defect that kept an operation from retiring would hold the
+-- scope's exit, which waits uninterruptibly by design; running the scope here
+-- turns that hang into an example that fails within its bound instead of one
+-- that never ends.
 withRootVia ∷ Seam → ContentLimits → FilePath → (ContentRoot → IO a) → IO a
-withRootVia seam limits path = withContentRootWith seam limits (BC.pack path)
+withRootVia seam limits path use =
+  spawn (withContentRootWith seam limits (BC.pack path) use) >>= awaitChild
 
 -- | Every byte of an opened file, read in chunks of @size@.
 readAll ∷ Int → (Int → IO ByteString) → IO ByteString
