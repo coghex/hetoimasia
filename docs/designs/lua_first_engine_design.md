@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-50/Q-6j: admission when request/resource capacity is full.
+The current checkpoint is P-51/Q-6k: one-shot request result consumption.
+D-53 accepts recoverable busy admission with atomic reservations.
 D-52 accepts required failure escalation at eligible settlement.
 D-51 accepts one window slot per UI instance and the M1 close/control policy.
 D-50 accepts the clear-colour and ordered texture-rectangle scene surface.
@@ -1584,6 +1585,32 @@ separate result behavior. The manager presented the cost: speculative work
 must be optional or cancelled before failure settles. The owner chose A rather
 than failure only when Lua reads the result. Pre-admission capacity refusal
 and exact result APIs remain separate contracts.
+
+### D-53. Full admission capacity returns busy without accepting work
+
+**Delivery:** M1; new safe admission facility required.
+
+Owner answer, **2026-10-22 00:29:45 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: return busy (Rec.)
+
+Authenticated relay: `het-manager`, message `ihrfmmas8726shkrqsvm46rpri`,
+posted **2026-10-22 00:29:45.444 UTC** in `#het-luafirst`, replying to Q-6j
+message `ja2n5udw5yg7v8np3iamq9szi6`.
+
+Accept P-50's A: reserve request and necessary result-lease capacity atomically
+before acceptance. If full, return a bounded busy reason with no handle, no
+provider/native work and no partial reservation. This does not fail the
+instance, even for a required load, because no request was accepted. Lua may
+pace requests in later updates; there is no hidden retry queue. Retiring work
+continues to count, and D-52 applies to failures after acceptance.
+
+The manager presented the extra result to handle and atomic-reservation cost.
+The owner chose A rather than current-host fault-on-full behavior. P-50's
+distinction from permanent invalid requests and native/engine/cleanup failures
+remains; this is not a blanket conversion of host faults to busy. Numeric
+budgets and the exact public result shape remain API work.
 
 ## Proposals
 
@@ -4145,7 +4172,7 @@ work and must preserve the existing safe-boundary and retirement guarantees.
 
 ### P-50. Refuse capacity-full admission with a bounded busy result
 
-**Unapproved; active checkpoint Q-6j. Delivery: M1.** Recommend A: before
+**A accepted by D-53 through Q-6j. Delivery: M1.** Recommend A: before
 accepting a new asynchronous data/texture/window request, reserve its request
 slot and any required result-lease slot together. If a declared admission
 capacity is full, return a bounded `busy` refusal identifying the exhausted
@@ -4199,6 +4226,71 @@ currently refuse full capacity as invocation faults, including a caught lease
 capacity error. They already retain slots through settlement consumption and
 provider retirement. The proposed non-fatal busy path is new M1 work, not a
 behavior the existing API can be assumed to provide.
+
+### P-51. Consume each accepted request's terminal result once
+
+**Unapproved; active checkpoint Q-6k. Delivery: M1.** Recommend A: reuse the
+host's `ready`, `take`, `wait` and `cancel` behavior for accepted data/texture/
+window requests, under the new integration's namespace/result schemas. D-53's
+busy response contains no request handle and is not a pending request. A
+request belongs to its requesting instance; sharing its handle through a
+module does not grant another instance permission to inspect or consume it.
+
+- `ready` reports whether a settlement is available without consuming it.
+- `take` on a pending request reports pending and consumes nothing. On a
+  terminal success, optional failure or cancellation it returns the bounded
+  settlement once and invalidates the request handle.
+- `wait` cooperatively suspends an eligible update/event invocation until
+  settlement; it does not consume the result. Call `take` afterwards. It never
+  blocks the VM's owner thread and is forbidden in finite init/shutdown hooks.
+- `cancel` retains the already approved first-settlement rules. Cancellation
+  is a terminal result to consume, not a way to skip result accounting.
+
+Logical `ready`/`take`/`wait` obey assigned-tick visibility; early native
+completion is not visible. Presentation uses its elapsed/arrival settlement.
+D-52's required failure stops the owner at the eligible safe boundary rather
+than waiting for `take`; optional failure remains data for Lua. Request
+consumption does not erase an already latched failure.
+
+A successful texture/window result supplies its already engine-owned lease.
+Taking the result does not release that lease; it stays owned by the instance
+under D-48/D-51. Lua may retain the copied data/result and reuse its own live
+resource handle as permitted, but may not take the same request again. Reusing
+a consumed/foreign request handle is the host's call fault, not another copy
+of the result or a silent no-op. Store the returned result and stop using the
+request handle after consumption.
+
+Request capacity is reclaimed only after terminal consumption (or internal
+discard on instance/session end) and actual provider retirement. A result or
+cancelled request never consumed still occupies its slot; `ready` and `wait`
+alone do not free it. No public discard/forget operation is added in A. Lua
+takes a cancelled/optional-failure result to clear its interest; takes and
+explicitly releases a successful texture if no longer wanted; a successful
+window retains D-51's no-independent-close rule. Automatic cleanup handles
+every uncollected result at instance/session end, without relying on Lua GC.
+
+Alternative B retains a terminal request object whose result can be read
+repeatedly, with a separate explicit forget/dispose operation and a defined
+relationship to any resource lease it carries. It may be more convenient for
+polling authors but adds a second public lifetime to end, retained result
+storage and more sharing/disposal cases. If chosen, specify that lifecycle
+before approval; it must not become an unbounded cache or let forgetting a
+successful window bypass D-51.
+
+A is recommended because it fits the existing host's bounded result model
+and separates a short-lived request from the resulting data/resource lifetime.
+Its authoring cost is explicit consumption: polling-only code can fill its
+slots, and a second take is misuse. Qualification covers pending takes,
+one-time terminal consumption, wait without consumption, cancellation cleanup,
+capacity held after consumption while a provider retires, and request ownership
+across two real instances. Module-import/cache behavior remains a separate
+contract; this does not turn shared module exports into one-shot values.
+
+Evidence: [host requests](../../packages/scripting-lua/README.md#what-a-script-sees)
+and `Hetoimasia.Scripting.Lua.Request.requestBindings` implement these four
+operations, including pending takes and terminal handle retirement. D-52/D-53's
+required-failure and busy-admission policies still require new integration work;
+reusing result operations does not claim those changes already exist.
 
 ## Open questions
 
@@ -4531,10 +4623,16 @@ cancellation remain distinct. Failure-on-read was not chosen.
 
 #### Q-6j. Is full admission capacity recoverable or instance-fatal?
 
-**Active checkpoint, P-50.** A (recommended): atomic reservation or a bounded
-busy refusal, no provider work, explicit Lua pacing, no failure for an unaccepted
-load. B: retain instance-fatal capacity refusal. Accepted required requests
-still follow D-52; busy does not relabel native or cleanup failures.
+Resolved by D-53: P-50's A, atomic admission or bounded busy refusal with no
+provider work or instance failure. Accepted required requests still follow
+D-52; native/engine/cleanup failures are not relabelled busy.
+
+#### Q-6k. Consume a request result once or keep a repeat-readable request object?
+
+**Active checkpoint, P-51.** A (recommended): `ready`/`take`/`wait`/`cancel`,
+one terminal consumption, then retain the returned data/resource independently.
+B: repeat-readable result with a new explicit forget/dispose lifetime. Both
+must preserve instance ownership and bounded storage through provider retirement.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
