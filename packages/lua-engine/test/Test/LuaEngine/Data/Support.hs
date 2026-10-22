@@ -586,6 +586,7 @@ driverSource =
       , "    request.wait(self.hs[key])"
       , "    out = fmt(request.take(self.hs[key]))"
       , "  elseif p.op == 'length' then"
+      , "    request.wait(self.hs[key])"
       , "    local r = request.take(self.hs[key])"
       , "    out = r.status .. ' ' .. #r.value .. ' ' .. hex(r.value, 4) .. ' ' .. hex(r.value:sub(-4), 4)"
       , "  elseif p.op == 'block' then fx.block(key) out = 'released'"

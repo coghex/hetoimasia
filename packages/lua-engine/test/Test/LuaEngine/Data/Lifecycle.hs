@@ -142,6 +142,9 @@ cancelling = describe "cancelling" $ do
       command session vm "i" "wait_take" "a"
       line ← lineStarting session "cmd wait_take a "
       line `shouldSatisfy` textInfix "status=success"
+      -- b has settled too before it is cancelled: nothing orders its read against a's take.
+      command session vm "i" "wait" "b"
+      awaitNote session "cmd wait b 0"
       command session vm "i" "cancel" "b"
       awaitNote session "cmd cancel b already_settled"
 

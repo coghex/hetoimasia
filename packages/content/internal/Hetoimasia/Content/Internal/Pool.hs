@@ -118,7 +118,7 @@ import Hetoimasia.Content.Internal.Inventory.Types (Inventory, ReadFailure)
 import Hetoimasia.Content.Internal.Inventory.Read (readVerified)
 import Hetoimasia.Content.Internal.Root (ContentRoot)
 import Hetoimasia.Content.Internal.Types (ContentDefect (..), Defect (..))
-import Hetoimasia.Foundation.Resource (composeCleanup)
+import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailureLabel, cleanupFailuresInContext, composeCleanup)
 import Hetoimasia.Foundation.Worker
   ( StartOutcome (Started, StartRejected, StartupFailed)
   , StopToken
@@ -497,14 +497,22 @@ isHealthy pool = do
   st ← readTVar (poolState pool)
   pure (psPhase st == PoolOpen && isNothing (psFailure st))
 
--- | What an exit of a worker from an open pool is, as a failure with its context.
+-- | What an exit of a worker from an open pool is, as a failure with its context. When the worker
+-- ended by an exception, that exception is kept beside the defect with every cleanup failure it had
+-- retained, so none of the evidence of the termination is lost in the wrapping.
 exitFailure ∷ Either (ExceptionWithContext SomeException) () → IO (ExceptionWithContext SomeException)
 exitFailure outcome = do
   let defect = case outcome of
         Right () → ReadWorkerEndedOpen
         Left (ExceptionWithContext _ failure) → ReadWorkerTerminated (displayException failure)
   raised ← tryWithContext @SomeException (throwIO (ContentDefect defect))
-  either pure (\() → throwIO (ContentDefect defect)) raised
+  primary ← either pure (\() → throwIO (ContentDefect defect)) raised
+  case outcome of
+    Right () → pure primary
+    Left terminated@(ExceptionWithContext trail _) → do
+      let retained = [(cleanupFailureLabel found, cleanupFailureException found) | found ← cleanupFailuresInContext trail]
+      composed ← composeCleanup (Just primary) (("content read worker termination", terminated) : retained)
+      pure (fromMaybe primary composed)
 
 -- | The next job, or 'Nothing' when this worker should end.
 takeNext ∷ ReadPool → StopToken → STM (Maybe Job)

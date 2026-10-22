@@ -196,6 +196,30 @@ failing = describe "a defect" $ do
         ContentDefect (ReadWorkerTerminated _) → pure ()
         other → expectationFailure ("expected the worker's termination, found " <> show other)
 
+  it "keeps the cleanup evidence of an unexpectedly terminated reader in the pool's failure" $ do
+    probe ← newProbe
+    closeGate probe "a.bin"
+    let terminatedWithEvidence _ _ = do
+          Left primary ← tryWithContext @SomeException (throwIO ThreadKilled)
+          Left secondary ← tryWithContext @SomeException (throwIO (userError "reader close failure"))
+          composed ← composeCleanup (Just primary) [("injected reader close", secondary)]
+          rethrowIO (fromMaybe primary composed)
+    withInventory [("a.bin", "a"), ("b.bin", "b")] $ \_ inventory → do
+      outcomes ← newOutcomes
+      ExceptionWithContext trail failure ←
+        failsWith @ContentDefect $
+          withReadPoolUsing (poolOf 1 4) (probeReader probe terminatedWithEvidence) $ \pool → do
+            running ← accepted pool (request inventory outcomes OrdinaryRead 64 "a.bin")
+            awaitStarted probe 1
+            atomically (cancel running) `shouldReturn` CancelInFlight
+            openGate probe "a.bin"
+            _ ← awaitSTM (awaitFailure pool)
+            pure ()
+      case failure of
+        ContentDefect (ReadWorkerTerminated _) → pure ()
+        other → expectationFailure ("expected the worker's termination, found " <> show other)
+      map cleanupFailureLabel (cleanupFailuresInContext trail) `shouldContain` ["injected reader close"]
+
   it "keeps the reader's cleanup evidence and a queued sink's failure beside it" $ do
     probe ← newProbe
     closeGate probe "a.bin"
