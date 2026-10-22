@@ -354,6 +354,8 @@ spec = describe "the module loader on a scheduled owner" $ do
         acquired ← readIORef (rigAcquired rig)
         released ← readIORef (rigReleased rig)
         length released `shouldBe` length acquired
+        -- The root that was queued was never admitted, so nobody was asked for its source.
+        acquired `shouldSatisfy` notElem (ident "fresh")
 
     it "starts no further root once a stop is asked in the middle of an advance" $
       bounded . withLoader 4 [echoer] $ \fixture rig control owner endpoint → do
