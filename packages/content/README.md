@@ -797,7 +797,8 @@ submit            ∷ ReadPool → ReadRequest → STM (Either SubmitRefusal Rea
 cancel            ∷ ReadTicket → STM CancelOutcome
 retired           ∷ ReadTicket → STM Bool
 status            ∷ ReadPool → STM PoolStatus
-awaitFailure      ∷ ReadPool → STM (ExceptionWithContext SomeException)
+awaitFailure      ∷ ReadPool → STM (ExceptionWithContext SomeException)   -- the first failure
+poolFailureEvidence ∷ ReadPool → STM [(Text, ExceptionWithContext SomeException)]  -- what was recorded beside it
 ```
 
 ### Ownership and lifetime
@@ -862,10 +863,18 @@ nothing. Streaming and hash workspace is the reader's, bounded by the inventory'
 
 An expected outcome of a verified read is data for the sink (`ReadFailed`, classified as for `readVerified`). Anything
 else that a reader or a sink raises is a defect: the job's sink is told (`ReadDefect`), every queued job is withdrawn
-and told, the pool latches the first defect with its context and cleanup evidence (`awaitFailure`, composable into a supervised wait), refuses all later jobs
+and told, the pool latches the first defect with its context and cleanup evidence (`awaitFailure`, composable into a supervised wait; the evidence recorded beside it is `poolFailureEvidence`), refuses all later jobs
 (`PoolHasFailed`), and the worker ends with the defect, which the pool's own worker group reports. Nothing restarts. The assembly
 observes the latch with `awaitFailure` in a supervised wait; every consumer sees it as refused submissions and as the
 `ReadDefect` its jobs were told; and the scope rethrows the latched failure if its body returned. 
+
+#### The failure latch
+
+The latch is two fields of the one pool state: the **first failure**, set once by the transaction that finds none (it also withdraws the queue in
+that transaction), and an **append-only evidence list**. Every later failure and every failure raised while telling a queued job is added by
+`appendEvidence`, which reads the current list in its own transaction and appends, so additions made by different workers at once are all kept; nothing
+reads the latch in one step and writes it back in another. The scope composes the first failure with the list when it rethrows or reports it. These
+are the only writers of the latch: the first-failure branch and the two appends in `latchFailure`.
 
 #### Every way out keeps its failure and its evidence
 
@@ -878,8 +887,8 @@ accounted, whether the pool is open or draining:
 | A reader or sink raises, before or after the scope closed the pool | latched with its context and cleanup evidence; the scope rethrows it |
 | A worker is terminated by an asynchronous exception the scope did not send, or the drain's cancellation arrives with cleanup evidence retained | latched as `ReadWorkerTerminated` with the exception and every cleanup failure it retained |
 | A worker returns, or is asked to stop from outside, while the pool is open | latched as `ReadWorkerEndedOpen`; nothing accepted waits behind a pool that stopped running |
-| A second worker fails after the first | kept as cleanup evidence beside the first, which stays the pool's failure |
-| A queued sink raises while the pool is telling it (close or failure) | kept beside the failure being told, in what is latched and in what the worker raises |
+| A second worker fails after the first | appended to the evidence list beside the first, which stays the pool's failure |
+| A queued sink raises while the pool is telling it (close or failure) | appended to the evidence list, and kept beside the failure being told in what the worker raises |
 | The body fails | its failure is primary; a failure a worker had latched is kept beside it as `content read pool worker failure`, and the group's own report of the workers rides on it |
 | The body returns | the latched failure is rethrown; otherwise the group's report is read and any worker that failed, was cancelled or retained a cleanup failure is raised as `ReadWorkerReportedUnclean` with that evidence |
 | The scope's thread is killed | the group cancels the workers and drains them; the interrupted job is settled `ReadAbandoned` |
@@ -888,7 +897,7 @@ accounted, whether the pool is open or draining:
 
 | State | Owner | Writers | Readers | Lifetime |
 |---|---|---|---|---|
-| Pool state (phase, failure, queue, counters) | the `withReadPool` scope | consumers (`reserveSlot`, `releaseSlot`, `submit`, `cancel`), workers (issuance, settlement), close | anyone, via `status` | one scope; never reused |
+| Pool state (phase, first failure, evidence list, queue, counters) | the `withReadPool` scope | consumers (`reserveSlot`, `releaseSlot`, `submit`, `cancel`), workers (issuance, settlement), close | anyone, via `status` | one scope; never reused |
 | A job's state | the pool | `submit`, `cancel`, the worker that took it, close | the consumer (`retired`), workers | from `submit` to done or withdrawn; the ticket outlives it as a value |
 | Workers | the pool's worker group | the group | the group's report | started with the scope, drained at its exit |
 
