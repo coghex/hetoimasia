@@ -13,19 +13,25 @@ bounded, strict reader. Once the root is open nothing is a pathname, and nothing
 is cached: when a callback returns, every descriptor it used is closed.
 
 The package reads. It creates, truncates, links and mounts nothing. It hashes
-nothing, validates no logical path (Unicode, normalization, exact case) and
-builds no inventory: those are the layers above it (LFE-5, LFE-6), which use
-the traversal and read boundary documented here.
+nothing and builds no inventory: whole-folder inventory (LFE-6) is the layer
+above, which uses the traversal and read boundary documented here and the
+logical identity policy below. The native roots validate no logical path:
+`Hetoimasia.Content.Identity` (LFE-5, below) is the separate pure layer that
+turns a literal reference or an observed name into a logical identity, so the
+two never depend on one another.
 
-It depends on `hetoimasia-foundation` and on boot libraries (`base`,
-`bytestring`, `stm`) only: no Lua, graphics, console, game or sample package.
+It depends on `hetoimasia-foundation`, on boot libraries (`base`, `bytestring`,
+`containers`, `stm`, `text`) and on the pinned Unicode data packages
+`unicode-data` and `unicode-transforms` (see
+[Pinned Unicode data](#pinned-unicode-data)): no Lua, graphics, console, game
+or sample package.
 
 ## Layout
 
 | Component | Directory | Role |
 |---|---|---|
-| `library` | `src/` | The public facade, `Hetoimasia.Content`. A closed export list: no name constructor, no descriptor, no adapter, no seam. |
-| `library internal` (private) | `internal/` | The implementation, shared by the facade and this package's own suite and visible to no client. `Native` holds the adapter record and the test seam; `Root`, `Gate`, `Access`, `Errno` and `Types` hold the rest. |
+| `library` | `src/` | The public facades: `Hetoimasia.Content` (native roots) and `Hetoimasia.Content.Identity` (logical identity), each a closed export list: no name constructor, no descriptor, no adapter, no seam, no constructor of a checked identity value. |
+| `library internal` (private) | `internal/` | The implementation, shared by the facades and this package's own suite and visible to no client. `Native` holds the adapter record and the test seam; `Root`, `Gate`, `Access`, `Errno` and `Types` hold the rest of the native layer; `Identity.Unicode`, `Identity.Types`, `Identity.Reference` and `Identity.Mapping` hold the identity policy. |
 | C shim | `cbits/hetoimasia_content.c` | Every raw descriptor operation, about 150 lines. Each function returns the negated `errno` on failure, so Haskell never reads `errno` after a safe foreign call. |
 | `test-suite content-tests` | `test/`, `test-cbits/` | Registered as the non-optional CPU validation group `test.content`. |
 
@@ -281,6 +287,225 @@ Neither is ever reported as missing content.
 * Nothing accumulates between operations. The suite checks the exact
   acquisition and close counts, not process-wide totals.
 
+## Logical content identity (LFE-5)
+
+`Hetoimasia.Content.Identity` is the pure naming boundary above the native
+roots: the one policy that turns a literal reference or an observed directory
+entry into a logical identity, so that a host file system's permissive spelling
+rules never choose the engine's. It reads no file, opens nothing, prints
+nothing, exits nothing and keeps no registry; it needs no root handle, opener,
+Lua VM, worker, graphics or application assembly, and the package still depends
+on the foundation and boot libraries plus the pinned Unicode data below. The
+M1 assembly (LFE-6) composes it with the roots documented above.
+
+```haskell
+identityLimits   ∷ Int → Int → Int → Int → Either LimitsRefusal IdentityLimits
+rootKey          ∷ ByteString → Either RootKeyRefusal RootKey
+
+parseReference     ∷ IdentityLimits → RootKey → ByteString → Either ReferenceRefusal ContentKey
+parseReferenceText ∷ IdentityLimits → RootKey → Text → Either ReferenceRefusal ContentKey
+contentKeyRoot, contentKeyPath ∷ ContentKey → …
+logicalPathBytes, logicalPathSegments ∷ LogicalPath → …
+
+buildMapping   ∷ IdentityLimits → RootKey → [ObservedEntry] → Either InventoryRefusal NativeMapping
+lookupPath     ∷ NativeMapping → LogicalPath → Maybe MappedEntry
+mappingEntries ∷ NativeMapping → [MappedEntry]
+mappedNative   ∷ MappedEntry → NonEmpty NativeName     -- exactly what the opener takes
+```
+
+`IdentityLimits`, `RootKey`, `LogicalPath`, `NativeMapping` and `MappedEntry`
+are abstract: a client builds them only through the check that guards them. No
+M1 number is defined here. The caller passes the limits it was configured with
+(M1: 1,024 UTF-8 bytes per relative path, 255 per segment, 32 segments, and the
+entry allowance the inventory owns); the suite passes those numbers explicitly
+as test inputs and also exercises smaller profiles. `identityLimits` requires
+the path, segment and segment-count limits to be at least one, the entry
+allowance at least zero, and a segment limit no larger than the path limit or
+than `NativeName`'s 1023 bytes, so every accepted segment can be a native name.
+
+### The grammar
+
+A reference is non-empty UTF-8 with non-empty segments separated only by `/`,
+validated completely from the bytes as supplied before any file system is
+consulted. It is refused for a leading, trailing or repeated slash; a `.` or
+`..` segment; a backslash, a colon, NUL or any other control character; and
+malformed UTF-8, which is never decoded with replacement. Nothing is trimmed,
+expanded, completed or searched: no `~` or environment expansion, no URL, drive,
+network or absolute-path reading, no relative-to-importer resolution, no
+extension and no `init.lua`. Spaces and punctuation stay literal. The launch
+root's spelling is outside this grammar, and the selected root is supplied
+separately as a `RootKey`.
+
+* **Control characters** are Unicode General_Category Cc: U+0000–U+001F, U+007F
+  and U+0080–U+009F (U+0000 is reported as NUL). Format characters (U+200B,
+  U+202E, U+FEFF…), U+2028/U+2029 and noncharacters stay literal, and a leading
+  U+FEFF is not stripped. The suite covers the boundaries U+001F, U+007F, U+0080
+  and U+009F refused and U+0020 and U+00A0 accepted.
+* **Malformed UTF-8** is everything RFC 3629 and Unicode Table 3-7 reject:
+  overlong forms (`C0 AF`, `E0 80 AE`), encoded surrogates (`ED A0 80`), code
+  points above U+10FFFF (`F4 90 80 80`), truncated sequences and stray
+  continuation or invalid lead bytes. An overlong `/`, `.`, `\`, `:` or NUL is
+  malformed and never becomes that character. The refusal carries the byte
+  offset of the first ill-formed sequence.
+* **The order of checks** is the order of `ReferenceReason`: empty; total bytes
+  against the path limit; segment count (from the separators, before anything
+  is split); leading, trailing and repeated slashes; then each segment in turn
+  (its bytes against the segment limit, `.`/`..`, UTF-8, forbidden characters,
+  its NFC form against the segment limit and against the grammar again); and
+  last the NFC path against the path limit. Raw bounds therefore run before any
+  decoding or normalization, and an input past the path limit is refused on its
+  length alone.
+
+### Identity: NFC, exact case
+
+Each valid segment is normalized to NFC, and the root-relative NFC path is the
+logical key within its root. Canonically equivalent composed and decomposed
+spellings match; case is significant, so `images/Hero.png` never selects
+`images/hero.png`. There is no compatibility normalization and no case folding
+in lookup. The policy applies equally to authored references and to observed
+inventory names, directories included. A `ContentKey` is the root together with
+the path: paths in different roots are different keys and never override each
+other. Two distinct legal names for one hard-linked file are distinct path
+identities; the mapping sees names, never inodes. File contents, Lua source,
+data bytes and display strings are untouched.
+
+The returned identity is itself checked against the grammar, not assumed to
+survive normalization: singleton canonical decompositions turn non-ASCII input
+into ASCII (U+212A KELVIN SIGN becomes `K`, U+037E becomes `;`), U+0958 expands
+from 3 to 6 UTF-8 bytes (composition exclusion) and `e` + U+0301 shrinks from 3
+to 2. The suite sweeps every scalar value as a one-character segment and
+requires each identity to satisfy the grammar and to be idempotent.
+
+### The checked mapping
+
+`buildMapping` takes caller-supplied observed entries: each is its path below
+the root as exact native byte components (never joined, split, trimmed or
+re-encoded) and whether it is a file or a directory. Entries of any other
+native kind are refused by the enumerator (D-11), not by this policy. It builds
+an immutable tree and returns either a complete `NativeMapping` or an
+`InventoryRefusal` naming the selected root; nothing partial is ever published,
+and the caller owns the result and its lifetime.
+
+* **Sibling collisions.** Distinct siblings that collide after NFC
+  (`SameNormalization`) or under Unicode canonical caseless matching
+  (`SameCaseless`) are refused with both native names, both kinds and the NFC
+  path of their directory: file/file, directory/directory and file/directory.
+  Canonical caseless matching is Unicode D145, `NFD(toCasefold(NFD(x)))` with
+  default full case folding (`CaseFolding.txt` statuses C and F, never the
+  locale-specific T mappings). It is used only to refuse ambiguity, never as a
+  lookup identity. The same name in different parent directories is not a
+  collision.
+* **Ancestors take part.** Every ancestor component of every supplied path is
+  a sibling in the check whether or not it was supplied as an entry: native
+  `Hero/a` and `hero/b` collide at the root with no directory entry supplied.
+  Directories therefore need not be supplied; supplying one marks it supplied
+  (`mappedSupplied`), and an empty directory is addressable only if it was.
+* **Structural refusals.** Inconsistent entries are refused, never repaired or
+  deduplicated: the same exact native path twice (`DuplicateEntry`), a path
+  below an entry supplied as a non-directory (`BelowNonDirectory`), a
+  non-directory that other paths pass through (`NonDirectoryHasChildren`), a
+  `.` or `..` component including the OS self and parent pseudo-entries (their
+  exclusion is the LFE-6 enumerator's job), an empty component, an embedded
+  `/`, NUL, backslash, colon or control character, and invalid UTF-8. Invalid
+  native UTF-8 is bad inventory, not an entry to omit.
+* **Lookup is exact.** `lookupPath` walks the NFC names; a path differing only in
+  case, or one the inventory does not hold, is `Nothing`. There is no
+  case-insensitive fallback and no fallback to a native spelling. `mappedNative`
+  returns the observed components byte for byte as `NativeName`s, so the later
+  no-follow opener is never asked to guess from a normalized request.
+
+### Bounds
+
+Each supplied/native path and its NFC form must fit the path limit, each
+segment its limit, and the path its segment count; the check counts encoded
+bytes, separators included, never characters or code units, and neither
+normalization's shrinkage nor a native file system's larger limit excuses an
+over-limit original. Inventory validation applies to the whole relative native
+spelling, not only to its names. Sums are capped at the limit so a long list is
+never summed in full. `buildMapping` consumes its entries one at a time and
+stops at the first refusal and at one entry past the allowance
+(`TooManyEntries`), so an unbounded enumeration is never materialized; the
+aggregate 10,000-entry budget including the root is the inventory's (LFE-6).
+Derived scratch is bounded by the accepted input: a segment is at most the
+segment limit, and its caseless key is at most `maxCaselessExpansion` (four)
+code points per code point, a figure the suite sweeps over every scalar value.
+There is no cache, no tuning option and no silent truncation.
+
+### Refusal classification
+
+The three outcomes are distinct and carry bounded information, so the later
+callers apply the approved policy; this slice implements no Lua admission,
+escalation or exit code.
+
+| Outcome | Type | Later handling (D-60, D-61) |
+|---|---|---|
+| Malformed or over-limit reference | `ReferenceRefusal` with `ReferenceReason` | bad hook arguments are ordinary Lua errors even for optional loads; a bad manifest entry fails boot; a bad top-level import fails its required load |
+| Invalid or colliding inventory | `InventoryRefusal` with `InventoryReason` | fails boot |
+| Well-formed path, no exact-case match | `lookupPath` returns `Nothing` | missing content under the existing content failure rules; never a fallback |
+
+Every refusal names the root it was for and keeps at most 64 bytes of the
+offending input, copied into a buffer of its own (`Excerpt`: the bytes and the
+length of the whole), so a refusal never keeps an arbitrarily large rejected
+input alive; a name inside a diagnostic is shown escaped and never decoded. File
+changes, file types and no-follow races are separate native outcomes, not claims
+a valid name makes.
+
+### Pinned Unicode data
+
+The tables come from one recorded Unicode version, independent of the locale,
+the OS and the compiler:
+
+| Operation | Source | Unicode data version |
+|---|---|---|
+| NFC and NFD | `unicode-transforms ==0.4.0.1` | 17.0.0, read at run time from `unicode-data` |
+| Full case folding (C and F) | `unicode-data ==0.8.0` (`toCaseFoldString`) | 17.0.0 |
+
+`unicode-transforms`'s own description still says 14.0.0, the version it was
+generated for; it holds no table of its own, and consults `unicode-data` for
+decompositions, combining classes and Hangul, so the version in effect is
+`unicode-data`'s. The suite checks every row of `NormalizationTest-17.0.0` and
+every line of `CaseFolding-17.0.0` (both under `test/data/` with their
+provenance), so a table that is not 17.0.0 fails there. `text` is used as a
+container only: its own case tables are not consulted. Nothing links ICU or an
+operating-system Unicode library.
+
+The build holds the version fixed three ways: the cabal file bounds
+`unicode-data` and `unicode-transforms` to exactly these versions, the
+repository pins the Hackage index (`index-state` in `cabal.project.common`),
+and the reference vectors fail on any drift. Moving to another Unicode version
+is a deliberate edit of those bounds, the vector files and `unicodeDataVersion`.
+Normalization and case folding are separate operations (UAX #15; the Unicode
+case-mapping FAQ): the key uses both, `NFD`, fold, `NFD`, and lowercasing alone
+would be insufficient.
+
+### State and ownership
+
+| State | Owner | Readers | Writers | Thread | Lifetime |
+|---|---|---|---|---|---|
+| `IdentityLimits`, `RootKey`, `LogicalPath`, `ContentKey`, refusals | the caller | anyone | none (immutable) | any | until dropped |
+| `NativeMapping`, `MappedEntry` | the caller of `buildMapping` | anyone | none (immutable; a build is local to its call) | any | until dropped |
+| The caseless key of a segment | the thunk of the one `CheckedSegment` | `buildMapping` | none | the building thread | the build call |
+
+There is no global registry, cache or mutable state, and no teardown. An
+enumeration that must be consumed lazily (the entry allowance) is consumed by
+`buildMapping` on the calling thread and released with the call.
+
+### Evidence
+
+Collision, grammar, bounds and lookup examples run on pure values and supplied
+entries, which stand in wherever a file system cannot hold the names; they are
+labelled as such and never claimed to prove native behavior. The "native trees"
+examples create real names in a temporary directory the example owns, enumerate
+them with the content service above, build the mapping from what the operating
+system reported and open the files by the mapped components. A real
+case-colliding pair, a real canonically-equivalent pair and a real non-UTF-8
+name need a file system that keeps them: Linux CI does; the local macOS APFS
+folds the first two, normalizes the second and refuses the third, so those
+three examples are reported pending locally with the reason, and the
+supplied-entry examples remain the evidence. A separately compiled client proves
+the public identity interface hides every constructor, and that the package
+names no Lua, console, game or sample dependency.
+
 ## Platforms
 
 Linux and macOS: the suite runs locally on macOS and on Linux CI, and
@@ -337,6 +562,12 @@ Evidence classes, by what exercises them:
 | Cancellation, drain, exit-cancel, ownership transfer | yes (real descriptors, gated) | |
 | Public boundary | separately compiled client | |
 
+The identity examples (`--match Identity`) are described under
+[Evidence](#evidence); their reference data, `NormalizationTest-17.0.0` and
+`CaseFolding-17.0.0` extracts with their provenance in the header, is under
+`test/data/`. They reach the Unicode operations through the private library and
+the policy through the public `Hetoimasia.Content.Identity`.
+
 Each negative control that matters (removing `O_NOFOLLOW`, the post-open type
 check, the exit's wait, the cycle rule, the close of a failed handover, the
 marking of a reader dead, a gate count leaked by a failed operation, and others)
@@ -350,7 +581,8 @@ example instead of holding the process. The standalone Lua runner
 ## Out of scope
 
 The M1 manifest and profile; the Lua library; command-line launch integration;
-logical path validation (LFE-5); whole-folder inventory policy, numeric M1
+Lua admission, escalation and exit codes for the identity refusals; whole-folder
+inventory policy, numeric M1
 accounting, SHA-256 and fingerprint comparison (LFE-6); background file workers,
 request and result slots, module caches, textures and VM composition; new
 symlink exceptions, hard-link or mount bans, automatic root switching,
