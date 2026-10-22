@@ -134,7 +134,31 @@ modelSpec = describe "what a decode charges" $ do
       map (fmap toInteger) expected `shouldBe` decodeReservations preflighted
       peak ← peakBytes (outcomeLedger outcome)
       peak `shouldBe` outcomeSourceBytes outcome + sum (map snd expected)
-      toInteger peak `shouldBe` decodePeakBytes preflighted
+      toInteger peak `shouldBe` decodePeakBytes (outcomeSourceBytes outcome) preflighted
+
+  it "reconciles the peak to the input's whole backing allocation when the PNG is a view into a larger buffer" $ do
+    png ← fixtureBytes "interlaced-rgba8.png"
+    let backing = ByteString.replicate (3 * mebi) 0 <> png <> ByteString.replicate mebi 0
+        view = ByteString.take (ByteString.length png) (ByteString.drop (3 * mebi) backing)
+    -- The view keeps the whole of its backing buffer alive, so the caller
+    -- charges the buffer, not the view's length.
+    let (backingFp, backingOffset, _) = ByteString.toForeignPtr backing
+        (viewFp, viewOffset, viewLength) = ByteString.toForeignPtr view
+    (unsafeForeignPtrToPtr viewFp `plusPtr` viewOffset) `shouldBe` (unsafeForeignPtrToPtr backingFp `plusPtr` backingOffset `plusPtr` (3 * mebi))
+    viewLength `shouldBe` ByteString.length png
+    ledger ← m1Bank
+    charged ← chargeCaller ledger (ByteString.length backing)
+    charged `shouldBe` True
+    preflighted ← case preflightPng m1PngLimits decodeAsset view of
+      Right accepted → pure accepted
+      Left refusal → expectationFailure (show refusal) >> fail "refused"
+    result ← decodeBounded (ledgerAccount ledger) preflighted
+    either (\refusal → expectationFailure (show refusal)) (const (pure ())) result
+    peak ← peakBytes ledger
+    toInteger peak `shouldBe` decodePeakBytes (ByteString.length backing) preflighted
+    toInteger peak - decodeWorkspaceBytes preflighted `shouldBe` toInteger (ByteString.length backing)
+    -- Counting only the view would understate what the bank held.
+    toInteger peak `shouldSatisfy` (> decodePeakBytes (ByteString.length view) preflighted)
 
   it "charges the output before the scratch and the scratch before the scanlines, each before its allocation" $ do
     -- A bank that refuses the stage after the one named shows that the earlier
@@ -188,7 +212,7 @@ maximaSpec = describe "real decodes at the approved dimensions" $ do
       image ← either (\refusal → expectationFailure (show refusal) >> fail "refused") pure result
       map ByteString.length (decodedLevels image) `shouldBe` [16 * mebi]
       peak ← peakBytes ledger
-      toInteger peak `shouldBe` decodePeakBytes preflighted
+      toInteger peak `shouldBe` decodePeakBytes (ByteString.length bytes) preflighted
       peak `shouldSatisfy` (<= m1WorkspaceBytes)
       live ← liveBytes ledger
       live `shouldBe` ByteString.length bytes + 16 * mebi
@@ -229,7 +253,7 @@ capacitySpec = describe "a bank too small for a stage" $ do
 
   it "does not turn a refusal for the bank into one for the image: the same image decodes in a bank that fits" $ do
     (bytes, preflighted) ← zeroImage image
-    ledger ← newLedger (fromInteger (decodePeakBytes preflighted))
+    ledger ← newLedger (fromInteger (decodePeakBytes (ByteString.length bytes) preflighted))
     _ ← chargeCaller ledger (ByteString.length bytes)
     result ← decodeBounded (ledgerAccount ledger) preflighted
     either (const (expectationFailure "refused in a bank of exactly its peak")) (const (pure ())) result
@@ -429,12 +453,12 @@ handoffSpec = describe "the output's hand-over" $ do
     liveBytes ledger >>= (`shouldBe` 0)
     -- The bank's peak is the decode's, or the hand-over's if that is larger.
     peak ← peakBytes ledger
-    toInteger peak `shouldBe` max (decodePeakBytes preflighted) (toInteger (ByteString.length bytes + 2 * outputBytes))
+    toInteger peak `shouldBe` max (decodePeakBytes (ByteString.length bytes) preflighted) (toInteger (ByteString.length bytes + 2 * outputBytes))
 
   it "leaves the level charged when the consumer's staging copy does not fit, until the consumer disposes of it" $ do
     bytes ← fixtureBytes "rgba16.png"
     Right preflighted ← pure (preflightPng m1PngLimits decodeAsset bytes)
-    let capacity = fromInteger (decodePeakBytes preflighted)
+    let capacity = fromInteger (decodePeakBytes (ByteString.length bytes) preflighted)
     ledger ← newLedger capacity
     _ ← chargeCaller ledger (ByteString.length bytes)
     Right _ ← decodeBounded (ledgerAccount ledger) preflighted

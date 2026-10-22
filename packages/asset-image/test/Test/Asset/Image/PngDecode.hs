@@ -278,7 +278,7 @@ scaleSpec = describe "at scale" $ do
     let straight = [(narrow16 r, narrow16 g, narrow16 b, narrow16 a) | y ← [0 .. h - 1], x ← [0 .. w - 1], let (r, g, b, a) = noisePixel x y]
     straight `shouldMatchPremultiplied` image
     peak ← peakBytes ledger
-    toInteger peak `shouldBe` decodePeakBytes preflighted
+    toInteger peak `shouldBe` decodePeakBytes (ByteString.length png) preflighted
     -- The allocator's total is the buffers charged and the inflater's output
     -- pieces (as many bytes as it inflated), nothing else of size.
     let charged = sum (map snd (decodeReservations preflighted))

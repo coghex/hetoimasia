@@ -57,8 +57,13 @@
 -- gained nothing: every grant the call took was released. The caller's own
 -- charges are the caller's: the encoded input ('preflightSource') is charged
 -- by whoever read it, from before the call until they drop it, and the
--- decoder neither charges nor releases it. 'decodePeakBytes' is the most the
--- bank holds while this decode runs, input included.
+-- decoder neither charges nor releases it. What is charged is the input's
+-- /backing allocation/, which a 'ByteString' view keeps alive whole: a PNG
+-- that is a slice of a larger buffer costs the larger buffer, so
+-- @ByteString.length (preflightSource pf)@ is only a lower bound, and only the
+-- caller knows the allocation. 'decodeWorkspaceBytes' is the decoder's own
+-- peak; 'decodePeakBytes' adds the input charge the caller states, and is the
+-- most the bank holds while this decode runs.
 --
 -- == The hand-over of the output
 --
@@ -124,10 +129,10 @@
 -- +-----------------------+---------------------------+-------------------------+------------------------------+
 -- | Buffer                | Allocated by              | Size                    | Held from → until            |
 -- +=======================+===========================+=========================+==============================+
--- | Encoded input         | the caller                | at most the source      | before the call → the        |
--- |                       |                           | limit (32 MiB)          | caller drops it. Shared by   |
--- |                       |                           |                         | the IDAT, PLTE and tRNS      |
--- |                       |                           |                         | slices; never copied         |
+-- | Encoded input         | the caller                | the view is at most the | before the call → the        |
+-- |                       |                           | source limit (32 MiB);  | caller drops it. Shared by   |
+-- |                       |                           | the charge is its whole | the IDAT, PLTE and tRNS      |
+-- |                       |                           | backing allocation      | slices; never copied         |
 -- +-----------------------+---------------------------+-------------------------+------------------------------+
 -- | Output level          | 'StageOutput' reservation | width × height × 4,     | reserved first → the caller  |
 -- |                       | then @create@             | at most 16 MiB          | disposes of it               |
@@ -158,7 +163,9 @@
 -- image, the chunk concatenation and the palette-expanded image of the
 -- general decoder do not exist here. The peak is at conversion, when the
 -- encoded input, the output, the scratch and the scanlines are all live:
--- @source + output + scratch + scanlines@ ('decodePeakBytes'). At the M1
+-- @input + output + scratch + scanlines@ ('decodePeakBytes', where the input
+-- is its backing allocation: a PNG read into a buffer of its own length, as
+-- the texture pipeline does, is its length). At the M1
 -- maxima that is, for the largest family (2,048 × 2,048 RGBA16, Adam7, with a
 -- 32 MiB source) 32 MiB + 16 MiB + 173,056 B + 16 KiB + 33,558,272 B, about
 -- 80.2 MiB, under the 128 MiB bank by 47.8 MiB; the README tabulates every
@@ -187,6 +194,7 @@ module Hetoimasia.Asset.Image.PngDecode
     -- * What a decode charges
   , decodeReservations
   , decodeReservationsFor
+  , decodeWorkspaceBytes
   , decodePeakBytes
   , fixedScratchBytes
   , m1WorkspaceBytes
@@ -240,7 +248,6 @@ import Hetoimasia.Asset.Image.PngPreflight
   , preflightInterlace
   , preflightLimits
   , preflightPalette
-  , preflightSource
   , preflightTransparency
   , preflightWidth
   )
@@ -276,12 +283,20 @@ decodeReservationsFor colour depth interlace w h =
   where
     plan = planFor colour depth interlace w h
 
+-- | The most the decoder itself holds live: every reservation of
+-- 'decodeReservations' (they overlap at conversion), without the encoded
+-- input, which is the caller's charge.
+decodeWorkspaceBytes ∷ PngPreflight → Integer
+decodeWorkspaceBytes = sum . map snd . decodeReservations
+
 -- | The most live payload bytes the bank holds while this decode runs: the
--- encoded input the caller has charged, plus every reservation of
--- 'decodeReservations' (they overlap at conversion). A staging copy the
--- pipeline makes after the call is not included.
-decodePeakBytes ∷ PngPreflight → Integer
-decodePeakBytes pf = toInteger (ByteString.length (preflightSource pf)) + sum (map snd (decodeReservations pf))
+-- caller's charge for the encoded input's backing allocation (stated as the
+-- first argument, because a view into a larger buffer keeps the whole buffer
+-- alive and only the caller knows its size; never less than
+-- @ByteString.length (preflightSource pf)@), plus 'decodeWorkspaceBytes'. A
+-- staging copy the pipeline makes after the call is not included.
+decodePeakBytes ∷ Int → PngPreflight → Integer
+decodePeakBytes inputBytes pf = toInteger inputBytes + decodeWorkspaceBytes pf
 
 -- | The three charges and the zero row they include, as exact sizes.
 data Plan = Plan
