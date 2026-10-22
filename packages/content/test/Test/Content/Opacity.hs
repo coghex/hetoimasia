@@ -23,7 +23,7 @@ import System.FilePath ((</>))
 import System.Process (proc, readCreateProcessWithExitCode)
 import Test.Content.Support (withTree, writeBytes)
 import Test.Hspec
-import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withPackageClient)
+import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withStorePackageClient)
 
 spec ∷ Spec
 spec = describe "Content package boundary" $ do
@@ -99,8 +99,12 @@ spec = describe "Content package boundary" $ do
 withClient ∷ String → String → ((Mode → IO Client) → IO ()) → IO ()
 -- | The facade is exposed by its unit id: a package with a private sublibrary
 -- registers every component under one package name, so the name alone matches
--- more than one unit and the compiler's choice among them is not stable.
-withClient = withPackageClient ["base", "bytestring", "hetoimasia-content-0.1.0.0-inplace"]
+-- more than one unit and the compiler's choice among them is not stable. The
+-- private sublibrary depends on the Unicode data packages from Hackage (the
+-- logical identity policy), so the compiler also needs the dependency store to
+-- resolve the unit graph; the client is still compiled with every other package
+-- hidden.
+withClient = withStorePackageClient ["base", "bytestring", "hetoimasia-content-0.1.0.0-inplace"]
 
 constructorClient ∷ String
 constructorClient =
