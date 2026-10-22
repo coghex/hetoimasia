@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-59/Q-2n: startup inventory and byte verification.
+The current checkpoint is P-60/Q-2o: launcher root resolution and anchored reads.
+D-62 accepts whole-folder startup hashing and exact-byte verification on loads.
 D-61 accepts Unicode NFC filename identity, exact case and collision rejection.
 D-60 accepts literal root-relative paths without shortcuts or filename search.
 D-59 accepts pre-admission module-limit refusal and required dependency-limit failure.
@@ -1858,6 +1859,39 @@ File bytes are untouched. D-60's grammar and D-10/D-11's version/no-link rules
 remain. The manager presented normalization, collision checking, mappings and
 platform tests as the cost. The owner chose Unicode names over ASCII-only
 content filenames. Numeric limits and launcher-root spelling remain open.
+
+### D-62. Hash every regular content file before Lua and verify later loaded bytes
+
+**Delivery:** M1; bounded startup inventory without a private content snapshot.
+
+Owner answer, **2026-10-22 02:04:19 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: hash whole folder (Rec.)
+
+Authenticated relay: `het-manager`, message `wg2mqd7fw73akfhmhcxqakykcw`,
+posted **2026-10-22 02:04:20.019 UTC** in `#het-luafirst`, replying to Q-2n
+message `g5u4pchgkssqejs2mryysxvpia`.
+
+Accept P-59's A: before Lua, validate the selected content tree and SHA-256-hash
+every regular file, including hidden and unused files. Retain bounded paths,
+native mappings, lengths and digests, not a private byte snapshot. No ignore
+list, extension filter or authored asset list. Invalid, unreadable or detectably
+changing files and exceeded inventory limits fail boot even for unused files.
+
+Later loads verify the exact bytes delivered; metadata cannot replace hashing.
+Same-length edits fail, while timestamp-only changes or identical-byte
+replacement are acceptable when the path remains legal. Manifest bytes used
+for launch must match the pinned version. Missing/changed/new paths retain
+D-10's rules; already-loaded objects remain original. Scan timing is not an
+atomic snapshot of the entire filesystem, and safe native opening is separate.
+
+The manager presented the cost as reading every file twice, the absence of
+a Lua loading screen during the initial scan, and keeping junk outside the
+game folder. Precisely, every file is read during the scan; requested files
+are read again on each uncached load, while an unused file needs no second
+read. This records P-59's approved behavior without turning the cost shorthand
+into a mandatory extra read. The owner chose this over a manifest file list.
 
 ## Proposals
 
@@ -4990,7 +5024,7 @@ These standards supply algorithms, not an already implemented content provider.
 
 ### P-59. Inventory and hash the selected content tree before starting Lua
 
-**Unapproved; active checkpoint Q-2n. Delivery: M1.** D-10 chose startup
+**A accepted by D-62 through Q-2n. Delivery: M1.** D-10 chose startup
 fingerprints rather than a private content snapshot. Recommend A: walk the
 entire selected game content root before Lua, apply D-11/D-60/D-61's entry and
 name checks, and fingerprint every regular file, including hidden files and
@@ -5057,6 +5091,75 @@ from the exact verified buffer. The repository already uses SHA-256 for native
 shader-toolchain fingerprints (`packages/gpu-vulkan/native/README.md`); that is
 algorithm/dependency evidence, not a content-provider implementation or a reason
 for the content service to depend on the graphics toolchain.
+
+### P-60. Resolve the launcher-selected folder once and retain its directory owner
+
+**Unapproved; active checkpoint Q-2o. Delivery: M1.** D-11 explicitly left
+launcher root selection separate from its ban on internal symbolic links.
+Recommend A: the owner may give the launcher a native relative or absolute
+directory path, including symlinks in that selection path. Resolve it once,
+open the actual directory and establish its identity before reading the manifest
+or inventory. Relative launcher paths use the launch working directory;
+Lua content paths never do. The launcher does not itself expand shell syntax
+or change the process working directory. Report the selected/resolved root
+in startup diagnostics so the launch target is reviewable.
+
+The session owns a protected directory handle to that actual root, not merely
+a canonical pathname string. A later rename of the root, replacement of its
+old pathname or retargeting of the selection symlink does not select a new
+root. Continue against the originally opened directory if it remains readable;
+ordinary missing/changed-content failures still apply to its contents. There
+is no path watcher or automatic reopening of another root. This is a pinned
+directory identity, not a snapshot of the directory's mutable contents.
+
+All inventory and later content opens are anchored to this owner. Apply the
+checked native-name mapping and refuse symbolic links at every component below
+the root, including the final file, during the actual open. Establish directory
+and regular-file types on opened objects; do not rely on a prior `exists`,
+`canonicalize` or link check followed by an unrestricted pathname read.
+Hold each operation's intermediate/native handles until the read no longer
+needs them, verify the same opened file's bytes under D-62, then retire them.
+Observed path/type/name changes that invalidate a mapped entry fail that scan
+or load; they are not silently normalized into a new session identity.
+
+Use qualified native directory-relative/no-follow operations on each supported
+platform. No string-prefix containment test or weaker ordinary-open fallback
+counts as this implementation. A platform/filesystem that cannot supply the
+required behavior refuses the root at startup with a clear unsupported-root
+diagnostic. The exact native adapter and flags require implementation evidence;
+this proposal does not declare an untested Haskell helper race-safe.
+
+Root and operation handles have explicit resource ownership. A root may close
+only after its scan/load workers have actually retired, including cancellation
+and late completions; asking them to stop is not sufficient. Partial boot
+failure closes all acquired handles through protected cleanup. Failed cleanup
+retains the established fatal/reporting policy. Lua receives content identities
+and service results, never native directory handles or ambient path access.
+
+Alternative B uses the same anchored internal-read protocol but rejects any
+symlink in the launcher selection path as well. The owner must supply a fully
+resolved path without symlinked ancestors. It removes that launch convenience,
+but does not eliminate the native ownership/no-follow work inside the root.
+
+A is recommended because selecting a root is an explicit owner/launcher action;
+it need not have the same spelling restrictions as script-supplied path arguments
+inside Lua. Its cost is stable directory ownership, platform-specific opening
+and race/cancellation tests. A renamed selected folder can remain active until
+restart, and retargeting a launch symlink deliberately has no live effect.
+This preserves D-2's trusted-content model; it does not claim containment of a
+hostile OS actor performing arbitrary concurrent filesystem/mount changes.
+Hard-link/mount policy and numerical open-handle limits remain separate.
+
+Qualification covers a symlink-selected root, root rename and symlink retarget,
+replacement of an internal directory or final file by a link during controlled
+open boundaries, rejected non-regular entries, exact-name mapping, read failure,
+and cancellation/boot failure with live handles. Coordinate races explicitly,
+not with timing sleeps. The
+[POSIX open/openat specification](https://pubs.opengroup.org/onlinepubs/9799919799/functions/open.html)
+provides directory-relative and no-follow primitives; using them safely for
+every component and qualifying the platform adapter is additional work. The
+current runner's `Runner/Source.hs` reads explicit files with `withBinaryFile`;
+it is not this scoped provider and must not be treated as one.
 
 ## Open questions
 
@@ -5161,12 +5264,18 @@ Raw file bytes remain unchanged. Numeric path limits remain open.
 
 #### Q-2n. Fingerprint the whole selected content tree or an explicit file list?
 
-**Active checkpoint, P-59.** A (recommended): before Lua, hash all regular
-files in the selected root into a bounded inventory, then verify the exact
-bytes used by each later load. Hidden and unused files count; startup failures
-and scan cost precede the Lua loading screen. B: fingerprint only an authored
-manifest file list and make unlisted files unavailable. Neither route adopts
-first-use fingerprints or a private content snapshot.
+Resolved by D-62: P-59's A, hash every regular file before Lua into a bounded
+inventory and verify exact bytes on later loads. Hidden/unused files count;
+initial scan failures/cost precede the Lua loading screen. No authored file
+list, first-use fingerprinting or private byte snapshot.
+
+#### Q-2o. May launcher root selection resolve symlinks before anchoring the session?
+
+**Active checkpoint, P-60.** A (recommended): resolve the explicitly selected
+native folder once, including selection-path symlinks, then retain that actual
+directory owner for all no-follow content operations. Renames/retargeting do
+not select another root. B: also reject symlinks in the launcher selection
+path; both require anchored native reads and actual-retirement cleanup.
 
 ### Q-3. What is the generic executable's boot and session contract?
 
