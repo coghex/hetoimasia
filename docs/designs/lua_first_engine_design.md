@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-63/Q-6n: scene colour and rectangle values.
+The current checkpoint is P-64/Q-6o: assigning logical content-result ticks.
+D-66 accepts opaque sRGB byte backgrounds and checked fractional rectangles.
 D-65 accepts static PNG colour textures with one level and no animation/options.
 D-64 accepts hard-linked files and mounted subtrees with per-path identity.
 D-63 accepts resolving the launch path once and retaining the actual root owner.
@@ -1981,6 +1982,37 @@ P-62 and D-47/D-48/D-50. The manager presented PNG export, uncompressed storage
 and no mip-assisted downscaling as costs. The owner chose PNG alone over PNG
 plus KTX2. Existing Haskell KTX2/BC7/mip features remain available; this is a
 Lua-surface restriction, not their removal.
+
+### D-66. Scenes use opaque sRGB byte colours and finite fractional rectangles
+
+**Delivery:** M1; scene value and validation contract.
+
+Owner answer, **2026-10-22 02:25:51 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: sRGB 0..255 (Rec.)
+
+Authenticated relay: `het-manager`, message `mhj3tixr859x3w7axxnd363bis`,
+posted **2026-10-22 02:25:51.416 UTC** in `#het-luafirst`, replying to Q-6n
+message `q2xvm444c263qkjw4iiygpw75a`.
+
+Accept P-63's A and its full shared proposal: each scene supplies three whole
+sRGB colour values in `0..255`, converted to linear light with clear alpha 1.
+The manager illustrated that sRGB mid-grey corresponds to about 0.22 linear;
+the binding uses the defined transfer conversion, not that rounded example.
+Backgrounds are opaque, PNG transparency blends over them, and engine-drawn
+windows use black before their first scene. An empty sprite list just clears.
+
+Finite integer/fractional logical-pixel coordinates are allowed, including
+negative/offscreen positions clipped by the view. Sizes are strictly positive;
+there is no snapping, clamping or mirror-by-negative-size behavior. Checked
+single-precision conversion and bounds refuse invalid/collapsed geometry.
+Invalid values, unknown fields or invalid textures refuse the entire scene
+and keep the old one under D-46's error policy.
+
+The owner chose familiar sRGB byte colours over linear-light fractions, with
+the conversion/8-bit precision cost and the opaque-background restriction.
+Exact table shapes and numeric geometry bounds remain for the API package.
 
 ## Proposals
 
@@ -5375,7 +5407,7 @@ this design turn ran no decoder, GPU or native tests.
 
 ### P-63. Use opaque sRGB byte colours and fractional logical-pixel rectangles
 
-**Unapproved; active checkpoint Q-6n. Delivery: M1.** Recommend A: an authored
+**A accepted by D-66 through Q-6n. Delivery: M1.** Recommend A: an authored
 scene supplies an explicit opaque background colour as three whole numeric
 RGB values in `0..255`, interpreted as sRGB. Both Lua integer values and
 exactly integral floats in range are accepted; strings and fractional colour
@@ -5437,6 +5469,74 @@ values, and whole-publication refusal retaining the old scene. The renderer's
 to the backend's linear clear (`Snapshot.hs`, `Vulkan/Frame.hs`, native
 `Recording/Layer.hs`). The binding's byte-colour conversion, opaque restriction
 and geometry preflight are new API behavior, not existing Lua features.
+
+### P-64. Let logical loads choose a future tick offset, defaulting to the next tick
+
+**Unapproved; active checkpoint Q-6o. Delivery: M1.** D-9/D-42 require assigned
+logical content results but have not selected the Lua-facing assignment rule.
+Recommend A: a logical data/module request may supply a positive whole-number
+tick offset; omission means 1. At admission the engine fixes the target as the
+current logical tick plus that offset, and assigns a unique increasing sequence
+position. Lua chooses the offset, never the sequence or native completion order.
+Exact argument spelling and integer/range limits follow in the API package.
+
+Logical init is before tick 1, with assignment origin 0, so its default request
+is due at tick 1. A request made at tick 10 with offset 30 is due at tick 40.
+This is a scheduled visibility point, not a timeout or a number of wall-clock
+seconds. Requests begin their eligible background source work after admission;
+data verification can finish early, while new module top-level evaluation waits
+for its assigned chain position under D-58. Boot entry/dependency evaluation
+before init remains the separate boot phase and needs no synthetic result tick.
+
+Before the assigned position, ordinary success/failure is held and readiness
+is pending. At that position, an unfinished result holds logical progress,
+without skipped ticks, larger `dt`, placeholder results or automatic timeout;
+UI continues independently. Optional data changes failure handling, not this
+timing rule: a still-pending optional result also holds its assigned position.
+Early cancellation remains the existing winning cancellation exception; it
+does not erase D-57's continuing shared module job or its evaluation obligation.
+Accepted requests cannot be retimed; a later retry is a new admission, with
+normal cancellation, result-consumption and retirement obligations.
+
+**Shared module timing refinement:** a VM-owned job has the earliest evaluation
+position contributed by any admitted external request or eligible dependency
+chain. A new waiter with an earlier future target can advance a queued job;
+it never duplicates evaluation. Once contributed, that position is not moved
+later by cancelling the waiter. Every external request retains its own assigned
+result position, even if the shared job completes earlier. D-58's earlier
+dependency promotion and immediate lookup of already-cached exports still apply.
+This extension of D-57/D-58 must be approved explicitly with the timing policy.
+
+Reject zero, negative, fractional, overflowing or over-limit offsets before
+admission with an ordinary Lua error; allocate no request or provider work.
+Sequence capacity/overflow must likewise never wrap into a reused position;
+exact finite bounds and refusal classification belong to the bounds package.
+UI requests remain arrival-settled; supplying a logical offset to one is an
+ordinary Lua error, not an ignored option. D-44 still prohibits logical texture
+requests. No cross-role result bus, world state or replay product is added.
+
+Alternative B gives every logical request offset 1 with no override. It reuses
+the default host assignment with less API surface, but even a room prefetch
+must hold the very next tick if its work is late; authors cannot schedule a
+later visibility point. Module dependency promotion and shared-job lifetime
+still need their approved ordering, not duplicate loads.
+
+A is recommended to make logical background loading useful before content is
+needed. Its cost is explicit lead-time planning and retaining request slots
+until their scheduled results can be taken; a far-future target cannot reveal
+an early result just because the source finished. The late-result stall remains
+deliberate, and scheduling farther ahead never guarantees timely native work.
+
+Qualification covers default/explicit offsets from init and updates, held early
+success/failure, late required/optional results, unique sequence ordering,
+invalid offsets, both cancellation orders, UI-option refusal and joining a
+later queued module with an earlier target without duplicate evaluation. The
+[host request contract](../../packages/scripting-lua/README.md#settling-on-arrival-and-at-an-assigned-tick)
+already has application-assigned `DueSlot` and defaults to the next tick.
+Its current assignment callback receives `RequestInfo`, not the request's Lua
+arguments. The new binding must carry validated assignment metadata through a
+narrow owner-controlled admission path; exposing this option is integration
+work, not a claim that the existing callback already accepts it.
 
 ## Open questions
 
@@ -5856,12 +5956,18 @@ normal content-failure handling. Existing Haskell codec features remain availabl
 
 #### Q-6n. Author background colours as sRGB bytes or linear-light fractions?
 
-**Active checkpoint, P-63.** A (recommended): three whole sRGB values `0..255`,
-converted to linear clear with opaque alpha. B: three finite linear-light
-values `0..1`. Both propose explicit scene colour, initial opaque black,
-fractional finite logical-pixel rectangles with positive extents, strict checked
-conversion and atomic refusal of invalid publication. Exact table shapes and
-numeric geometry bounds follow in the API package.
+Resolved by D-66: P-63's A and shared proposal, sRGB whole values `0..255`,
+opaque clear, initial black, finite fractional/negative logical-pixel positions,
+positive sizes and checked whole-scene refusal. Exact table shapes and numeric
+geometry bounds remain in the API package.
+
+#### Q-6o. May Lua select a logical load's future result tick?
+
+**Active checkpoint, P-64.** A (recommended): positive tick offset, default 1,
+fixed at admission with engine-assigned sequence; late required or optional
+results hold that position. Explicitly refine shared modules to use the earliest
+contributed evaluation position while each waiter retains its delivery position.
+B: always the next tick, without an override. UI remains arrival-settled.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
