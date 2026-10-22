@@ -12,11 +12,16 @@
 -- "Test.Lua.Boundary.Loader.Threads").
 module Test.Lua.Boundary.Loader (spec) where
 
+import Control.Concurrent (myThreadId)
 import Control.Monad (forM_)
+import Data.IORef (readIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Owner
-import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
+import Hetoimasia.Scripting.Lua.Internal.Module (Lead (..), callEntryWith)
+import Hetoimasia.Scripting.Lua.Internal.Owner (ownedHost)
+import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VRecord))
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldNotBe, shouldSatisfy)
 import Test.Lua.Boundary.Loader.Support
 
 -- | The identities an advance settled, in order.
@@ -88,6 +93,8 @@ spec = describe "the module loader" $ do
         traced rig >>= (`shouldBe` ["shared", "true:true"])
         -- The very table a hook later imports, and the one the VM holds for the identity.
         statusOfName owned "shared" >>= (\status → status `shouldSatisfy` isReady)
+        shared ← readyOf owned "shared"
+        retrieveExport owned (ident "shared") >>= (`shouldBe` Just (ExportReady shared))
         ledger owned >>= (`shouldSatisfy` balanced)
         acquired rig >>= (`shouldBe` map ident ["a", "shared", "b"])
 
@@ -109,6 +116,38 @@ spec = describe "the module loader" $ do
         acquired rig >>= (`shouldBe` map ident ["a", "b"])
         released rig >>= (`shouldBe` map ident ["a", "b"])
         ledger owned >>= (`shouldSatisfy` balanced)
+
+    it "joins an identity that is evaluating or pending instead of taking a second interest in its source" $
+      withRig $ \rig owned → do
+        _ ← admit owned "a"
+        _ ← supply rig owned "a" ["local b = import('b')", "return {}"]
+        _ ← advance owned
+        statusOfName owned "a" >>= (`shouldBe` ModuleEvaluating)
+        statusOfName owned "b" >>= (`shouldBe` ModulePending)
+        admit owned "a" >>= (`shouldBe` RootJoined)
+        admit owned "b" >>= (`shouldBe` RootJoined)
+        acquired rig >>= (`shouldBe` map ident ["a", "b"])
+        counts ← moduleLoaderCounts owned
+        (countPending counts, countEvaluating counts) `shouldBe` (1, 1)
+
+    it "gives an export module evaluated without the loader no import: the loader is opt-in" $
+      withRig $ \rig owned → do
+        outcome ← evaluateExport owned (ExportSource (ident "legacy") "legacy" (lua ["trace.mark(type(import))", "return {}"]))
+        outcome `shouldSatisfy` \case ExportReady _ → True; _ → False
+        traced rig >>= (`shouldBe` ["nil"])
+
+    it "runs every seam on the owner's thread or a callback of its VM, and only the owner releases" $
+      withRig $ \rig owned → do
+        owner ← myThreadId
+        _ ← supply rig owned "b" ["return {}"]
+        _ ← supply rig owned "a" ["local b = import('b')", "return {}"]
+        _ ← admit owned "a"
+        _ ← advance owned
+        threads ← readIORef (rigThreads rig)
+        forM_ [thread | ("release", thread) ← threads] (`shouldBe` owner)
+        forM_ [thread | ("eligible", thread) ← threads] (`shouldBe` owner)
+        -- The resolver and the acquire of a dependency run inside the callback an import is.
+        forM_ [thread | ("resolve", thread) ← threads] (`shouldNotBe` owner)
 
     it "does not let a later root overtake the current one when its source arrives first" $
       withRig $ \rig owned → do
@@ -358,6 +397,55 @@ spec = describe "the module loader" $ do
         failureOf owned "yields" >>= \failed → boundaryReason failed `shouldBe` UnscheduledYield
         statusOfName owned "after" >>= (`shouldSatisfy` isReady)
         ledger owned >>= (`shouldSatisfy` balanced)
+
+  describe "a facade stashed in shared exports" $
+    it "gives a module's top level no engine service, and gives it to a hook that calls the same closure" $
+      withRigAt (\config → config {vmModules = [hookDriver]}) $ \rig owned → do
+        -- The first module keeps the facade a hook is handed in its own exports.
+        _ ←
+          supply
+            rig
+            owned
+            "keeper"
+            [ "local M = {}"
+            , "M.build = function(context) return { acquire = function() return svc.acquire() end } end"
+            , "M.gameplay = { init = function(self, api)"
+            , "  M.stash = api"
+            , "  if M.invoke then trace.mark('hook:' .. tostring(M.stash.acquire())) end"
+            , "end }"
+            , "return M"
+            ]
+        _ ← admit owned "keeper"
+        _ ← advance owned
+        keeper ← readyOf owned "keeper"
+        driverHandle ← loadedModule owned (ModuleRef "driver" "1") >>= maybe (error "no driver") pure
+        capture ← captureBehavior owned keeper "gameplay" (FacadeBuilt keeper "build" (VRecord [])) >>= either (error . show) pure
+        let runHook' = callEntryWith (LeadCaptured driverHandle "call_init" (capturedHandle capture) HookInit) (ownedHost owned) driverHandle "init" [VInteger 0]
+        _ ← runHook'
+        -- A module evaluated later reaches the facade through the shared exports and calls it
+        -- at its top level: refused as an ordinary error, before the binding's action.
+        _ ←
+          supply
+            rig
+            owned
+            "later"
+            [ "local keeper = import('keeper')"
+            , "trace.mark('stash:' .. type(keeper.stash))"
+            , "local ok, err = pcall(keeper.stash.acquire)"
+            , "trace.mark('later:' .. tostring(ok) .. ':' .. tostring(err))"
+            , "keeper.invoke = true"
+            , "return {}"
+            ]
+        _ ← admit owned "later"
+        _ ← advance owned
+        marked ← traced rig
+        take 1 marked `shouldBe` ["stash:table"]
+        marked `shouldSatisfy` any (\line → "later:false:" `Text.isPrefixOf` line && "no service while a module's top level runs" `Text.isInfixOf` line)
+        actions rig >>= (`shouldBe` 0)
+        -- The same closure, called by a hook, acts.
+        _ ← runHook'
+        traced rig >>= (`shouldSatisfy` elem "hook:1")
+        actions rig >>= (`shouldBe` 1)
 
   describe "the resolver's refusals" $ do
     it "are ordinary Lua errors before any identity, source interest or frame, and do not latch a failure" $

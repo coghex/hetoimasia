@@ -47,6 +47,7 @@ module Test.Lua.Boundary.Loader.Support
   , balanced
   ) where
 
+import Control.Concurrent (ThreadId, myThreadId)
 import Control.Exception (SomeException, fromException, throwIO, try)
 import Control.Monad (forM_)
 import Data.ByteString (ByteString)
@@ -92,6 +93,8 @@ data Rig = Rig
   , rigReentered ∷ !(IORef [Text])
     -- ^ How each of those attempts ended.
   , rigResolverFails ∷ !(IORef Bool)
+  , rigThreads ∷ !(IORef [(Text, ThreadId)])
+    -- ^ The thread each seam ran on, newest first, by seam and operation.
   , rigPhase ∷ !ModulePhase
   }
 
@@ -110,6 +113,7 @@ newRig =
     <*> newIORef Nothing
     <*> newIORef []
     <*> newIORef False
+    <*> newIORef []
     <*> newModulePhase
 
 -- | The identity of a module of the game's root by its path.
@@ -155,13 +159,16 @@ rigLibraries = [LibraryBase, LibraryString, LibraryTable, LibraryMath, LibraryCo
 rigLoader ∷ Rig → LoaderConfig
 rigLoader rig =
   (loaderConfig supplier resolver)
-    { loaderEligible = \identity → maybe True (Set.member identity) <$> readIORef (rigEligible rig)
+    { loaderEligible = \identity → do
+        noteThread rig "eligible"
+        maybe True (Set.member identity) <$> readIORef (rigEligible rig)
     , loaderPhase = Just (rigPhase rig)
     }
   where
     supplier =
       SourceSupplier
         { supplierAcquire = \identity → do
+            noteThread rig "acquire"
             reenterIfAsked rig "acquire"
             failing ← Set.member identity <$> readIORef (rigAcquireFails rig)
             if failing
@@ -170,11 +177,13 @@ rigLoader rig =
                 atomicModifyIORef' (rigAcquired rig) (\held → (identity : held, ()))
                 Map.findWithDefault SourcePending identity <$> readIORef (rigAvailable rig)
         , supplierRelease = \identity → do
+            noteThread rig "release"
             atomicModifyIORef' (rigReleased rig) (\held → (identity : held, ()))
             failing ← Set.member identity <$> readIORef (rigReleaseFails rig)
             if failing then ioError (userError "the supplier failed to release") else pure ()
         }
     resolver context path root = do
+      noteThread rig "resolve"
       reenterIfAsked rig "resolve"
       boom ← readIORef (rigResolverFails rig)
       if boom then ioError (userError "the resolver failed") else pure ()
@@ -189,6 +198,12 @@ rigLoader rig =
             if Text.null path || ".." `Text.isInfixOf` path || "/" `Text.isPrefixOf` path
               then Left ("malformed path " <> path)
               else Right (ResolvedAddress (rootAt chosen path) (chosen <> ":" <> path))
+
+-- | Note the thread a seam runs on.
+noteThread ∷ Rig → Text → IO ()
+noteThread rig what = do
+  thread ← myThreadId
+  atomicModifyIORef' (rigThreads rig) (\held → ((what, thread) : held, ()))
 
 -- | When the example asked for it, try to run Lua on the owner's VM from inside a seam,
 -- and note how that ended: it is refused as a re-entry, not left waiting for the
