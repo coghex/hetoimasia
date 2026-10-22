@@ -49,7 +49,9 @@ instance subscribe a function to a provider's events: owned by the instance, del
 producers that never call Lua, and, on a logical owner, admitted at the tick and place the application assigned. See
 [Provider events](#provider-events). **The script runner** (LUA-27, LUA-28) runs a list of Lua files to completion as the instances of one
 named VM, on the elapsed clock or on logical ticks, publishes the instances' start and end events, and answers a bounded report: the library the `lua` subcommand and a windowed application
-share. See [The script runner](#the-script-runner). Any
+share. See [The script runner](#the-script-runner). **Ordered import chains** (LFE-9) let export modules `import` one another: a module
+suspends on a dependency's verified source and resumes on its VM's owner, one chain at a time, in the order the coordinator
+admitted the roots. See [Ordered import chains](#ordered-import-chains-the-module-loader). Any
 concrete game namespace and the confined path are later slices of
 [the Lua runtime design](../../docs/lua_runtime_design.md). What is here is the
 boundary they will be built on, and the evidence that it holds.
@@ -1231,14 +1233,14 @@ Precompiled binary chunks are refused (the chunk is loaded in text mode only), a
 arbitrary-source load API is added. The table, and the functions, tables and cycles reachable
 from it, are retained **in the VM**: nothing is serialized, deep-copied or put through the
 copied-value schemas, and ordinary Lua graph cycles are permitted (import dependency cycles
-are the later loader's). Other keys of the table are unrestricted library exports. Module
+are reported by [the module loader](#ordered-import-chains-the-module-loader)). Other keys of the table are unrestricted library exports. Module
 globals stay in the module's own environment; mutable exports, closures and upvalues and the
 permitted shared library tables keep the trusted same-VM semantics Lua gives them. This is
 neither hostile-code isolation nor a rollback: what a chunk did before it failed is not undone.
 
 ### Identity, sticky failure and bounds
 
-An `ExportIdentity` is opaque bytes the caller chose (for the later loader, root plus canonical
+An `ExportIdentity` is opaque bytes the caller chose (for the module loader, the root plus the canonical
 path). It is compared exactly, never truncated or hashed into a key, and never forced into the
 legacy 128-byte `ModuleRef`; one that is empty or longer than 4096 bytes is refused, not
 shortened. What a record or a handle retains is a **copy that owns its bytes**, so a short slice of a
@@ -1248,7 +1250,7 @@ large buffer pins nothing after the call. The source label used in diagnostics i
   the same table, or the same failure, and runs nothing. A failed identity is never retried with
   replacement bytes. Another VM has its own environment, result, failure and state.
 * **Ceilings** come from the owner's `ExportLimits`; the M1 profile's are 1 MiB of supplied
-  source and 256 identities per VM (`Hetoimasia.LuaEngine.Behavior.exportLimits`). Failed
+  source, 256 identities per VM and, for the module loader, a chain of 32 frames (`Hetoimasia.LuaEngine.Behavior.exportLimits`). Failed
   records and any in progress count, and nothing is evicted, retried or kept as history. A
   source one byte over is **never compiled**: while room remains it is a failed record that counts,
   `ModuleRefused (SourceTooLarge n)`, distinguishable from an evaluation failure. A *new*
@@ -1361,6 +1363,257 @@ allocator's budget over an evaluation, a capture and a release that checks every
 and the stack after each failure. `Test.Lua.Opacity` adds external clients: the handles cannot be
 forged, no raw table or registry reference is reachable, and a client using the whole interface
 links and runs.
+
+## Ordered import chains: the module loader
+
+An opt-in, engine-managed way to evaluate the [export modules](#export-modules-and-captured-behaviors)
+when a module can discover a dependency while it runs (LFE-9, D-56 to D-59, D-75, D-77, D-80). The
+synchronous `evaluateExport` is unchanged and gives its module no `import`; the global-entry
+modules, tasks and instances are untouched. A module the loader evaluates is source text under a
+stable identity, run once as a Lua coroutine of the VM in an environment of its own, and it
+**returns one table** exactly as an export module does. What is new is that the module can call
+`import(path [, root_id])`, and that the call can **suspend the importing coroutine** until the
+dependency's verified source has arrived and its own module has finished, without blocking the
+VM's owner.
+
+The loader is the VM owner's. It compiles, evaluates, resumes, publishes and releases only on the
+owner's thread, under the VM's gate, through the same protected foreign-call boundary as every
+other operation; a provider thread, a coordinator or a hook can ask nothing of it directly and is
+refused with `VmNotOwned`. It adds no filesystem read, no worker, no per-instance request ticket
+and no scheduler of its own: where source comes from, how an `import` becomes an identity, and
+when a root may begin are three narrow seams the application injects, and the production
+coordinator that drives them is a later slice's (LFE-11).
+
+### The seams
+
+`VmConfig` takes `vmLoader`, a `LoaderConfig`:
+
+| Seam | What it does | Where it runs |
+| --- | --- | --- |
+| `SourceSupplier` | `supplierAcquire identity` registers the loader's interest in an identity's source, exactly once per identity the loader holds a record of, and answers `SourcePending`, `SourceVerified bytes` or `SourceFailure reason` for what is known now; `supplierRelease identity` ends that interest exactly once, when the bytes were consumed, the source failed, or the loader stopped. An acquire that raises took no interest. | acquire: the owner's thread (a root's admission) or the callback an `import` is (a dependency's); release: the owner's thread. Never blocking, and refused (`VmReentered`) if it asks the same VM for anything |
+| `AddressResolver` | `ImportContext -> path -> Maybe root -> IO (Either reason ResolvedAddress)`: turns an import's arguments, and the context of the **module whose code the `import` was made from**, into the canonical identity and a bounded label. `Left` is an ordinary Lua argument error. Production path, Unicode and root validation, and the approved lexical-root resolution, stay behind it (LFE-12) | the callback an `import` is, unmasked |
+| `loaderEligible` | whether the coordinator allows the root at the head of the queue to begin now | the owner's thread, only when no chain is active |
+
+`ModulePhase` (`newModulePhase`, `modulePhaseActive`) is a flag the loader sets while a module's top
+level runs, readable without asking the VM for anything, for the application's own preconditions
+(below).
+
+### A chain
+
+A coordinator admits **roots** (`admitRoot`) in the order it chooses, a logical tick and sequence
+order or a UI request-admission order, and the loader keeps that order. It adds no priority, phase
+or second scheduler. The source of an admitted root is asked for at once (reads may overlap), but a
+root begins only when it is at the head of the queue, `loaderEligible` allows it and its source has
+arrived: **source arrival alone never starts a root and never lets a later root overtake the
+current one.** `deliverSource` records an arrived answer; it evaluates nothing. `advanceLoader` is
+the one operation that runs Lua. One **chain** is active per VM:
+
+1. The root's source is compiled (text only, the same bounds as an export module) into a coroutine
+   in an environment of its own, and its first segment runs.
+2. `import(path)` resolves to an identity. A **ready** identity returns the very table the VM holds
+   for it. A failed, cyclic or unsuspendable one is a failure (below). Otherwise the importing
+   coroutine is **suspended**, once every Haskell frame has returned (the yield is made in C, as an
+   error is, with a continuation that returns the exports or raises the error); the dependency's
+   source is asked for if it was not already; and the loader goes on.
+3. When the dependency's source has arrived the dependency runs as the next frame, **depth first, in
+   Lua's import call order**, and when it ends the importer is resumed with its exports (or its
+   failure). An identity that is already pending, because it was admitted as a later root, is
+   evaluated **within the active chain**, once, rather than waiting behind its importer or running
+   twice; its own turn in the queue later finds an outcome and evaluates nothing. Its request is not
+   settled here: the outcome is reported (`advanceSettled`, `lookupModule`) for the coordinator to
+   deliver at its own position.
+4. `advanceLoader` returns when the chain is finished, waits for a source (`BlockedSource`), or the
+   head of the queue is not eligible (`BlockedIneligible`), and says which identities came to an
+   outcome and how deep the chain is. A chain that is not finished is not forgotten: it holds its
+   frames until a source is delivered and the loader is advanced again, or until it is stopped.
+
+A module that never yields still blocks its owner while it runs: nothing here preempts trusted Lua.
+`pcall`, `xpcall` and metamethods called from Lua code suspend like any other call. A raw
+`coroutine.yield()` at a module's top level suspends it to no one and fails the module
+(`UnscheduledYield`). A scheduler yield or wait an application registered is never granted to a module chunk: the call is
+refused before it suspends anything, as a fault of the call (`SuspendRefused SuspendOutsideTask`) that fails the module. The module
+environment is the filtered global surface plus `import`; no C `require`, no binary chunk and no
+extra library entry point is added.
+
+### `import` outside module evaluation
+
+In a hook, or in a helper a module exported and a hook called, `import` is the **immediate lookup**:
+a ready identity returns its exports, a failed identity raises its cached failure, and an identity
+that is absent, pending, evaluating or stopped raises an ordinary `module_not_ready` error. It reads
+no source, starts no work, takes no record, and never suspends. The default root is the one captured
+from the module the closure belongs to, even when its helper runs in another instance's hook.
+
+### Where Lua cannot suspend
+
+An import of an identity that is **not ready** where Lua cannot yield never yields another
+coroutine and never blocks. It is refused before anything is admitted (no record, no slot, no source
+interest) with an ordinary Lua error, **and it fails the containing admitted load even if the script
+catches the error**: `ModuleRefused (ImportNotSuspendable why dependency)`. A ready identity is still
+returned in those places, and a failed one still reports its cached failure.
+
+| Where the import was called from | Outcome |
+| --- | --- |
+| the module's own coroutine, including across `pcall`, `xpcall`, a metamethod called from Lua code, and a to-be-closed handler Lua lets yield | suspends |
+| a coroutine the script created (`coroutine.wrap`, `coroutine.create`), including its to-be-closed handlers run by `coroutine.close` | `SuspendOtherCoroutine` |
+| a `table.sort` comparator, a `string.gsub` replacement callback, a finalizer, a metamethod reached from a library function | `SuspendNotYieldable` |
+| the closing of a module that failed or was stopped | a lookup like a hook's: `module_not_ready` |
+
+`import` is not finalizer-eligible. Called from a finalizer while the VM is closing it is refused like any binding the
+registration did not list (`FinalizerRefused`, kept as close evidence); called from a finalizer at any other time it is a
+lookup like a hook's, and a not-ready identity there is the `ImportNotSuspendable` case above.
+
+### What an import refuses, and what it condemns
+
+| Case | Lua sees | The containing load |
+| --- | --- | --- |
+| path or root argument malformed, a root the resolver refuses (unknown, disabled) | an ordinary error, raised before any identity slot, source interest or frame exists | **not** failed by it |
+| a dependency that failed (source, syntax, runtime, return shape, dependency, cycle, limit) | an ordinary error | failed with `DependencyFailed label fault`, even if caught |
+| an identity already on the chain | an ordinary error naming the chain, `ImportCycle [a, b, a]`; **no extra frame is allocated for the edge that closes it** | failed |
+| a new dependency when the owner holds as many identities as it may | an ordinary error | failed with `ImportCacheFull`; the dependency has no record |
+| a new dependency that would make the chain longer than it may be | an ordinary error | failed with `ImportChainTooDeep`; the dependency has no record |
+| not ready where Lua cannot suspend | an ordinary error | failed with `ImportNotSuspendable` |
+| a call the module made to a registered binding that refused it as a fault of the call | the error the binding raised | failed with that fault, even if the script caught the error; the owner is not ended |
+| a Haskell failure that reached a callback (an application seam that raised, an engine defect) | an error, caught or not | **not** the module's: raised from the operation, see below |
+
+A failure of a dependency propagates up the chain: each importer fails with `DependencyFailed`, and
+each dependency that **completed** before the failure stays ready and usable; its exports are not
+rolled back and a later importer reuses them without evaluating them again. There is no retry,
+eviction, partial export publication or rollback of what a module already did.
+
+### Identities, records and the bounds
+
+The loader keeps **no second cache**. Pending and evaluating identities are records of the same
+table as ready and failed ones ([identity, sticky failure and bounds](#identity-sticky-failure-and-bounds)),
+and the records are what `evaluateExport`, `retrieveExport` and `lookupModule` answer from. Every
+record counts against the identity bound until the VM ends. The M1 values come from the profile
+(`Hetoimasia.LuaEngine.Behavior.exportLimits`): 256 identities counting pending, evaluating, ready and
+failed entries; 1 MiB of source in a module; a chain of 32 frames, the root included (the 33rd is
+`ImportChainTooDeep 32`). `ExportLimits` now carries the chain depth as `exportMaxChainDepth`.
+
+* A **new root** past the bound is refused with `RootRefused (RootCacheFull n)`: no record, no source
+  asked for, no slot. A root or a dependency the owner **already holds** is reused at any fill:
+  `RootSettled` for a ready or failed one, `RootJoined` for a pending or evaluating one (queued as a
+  root if it was only a dependency), with no second interest in its source.
+* Source past the bound is **never copied, kept or compiled**: it is a failed record that counts,
+  `SourceTooLarge`, and its interest ends at once. What is held for pending identities is bounded by
+  the identity bound times the source bound, and each answer is dropped when its frame has been
+  compiled.
+* A dependency over a limit **fails its importer**; the loader never waits for room that a permanent
+  limit will never give, and never evicts.
+* Failures are sticky and the first one is kept: source (`SourceUnavailable`, `SourceTooLarge`),
+  syntax and runtime (`ScriptFailed`), return shape (`ExportShapeRefused`), dependency, cycle, limit,
+  `UnscheduledYield`. A module's failure is data; it ends neither the chain's other roots nor the owner.
+
+### The phase of a module's top level
+
+A module's top level has a phase of its own. It does not inherit the authority of the instance whose
+hook happened to start the work: tables, functions, imports, pure helpers and allowed output are its
+surface, and an engine service the application guards with `withPrecondition` reads
+`modulePhaseActive` and refuses as an ordinary Lua error **before its action**: the action counter
+stays at zero, and the module can catch the error and go on. A function a module defines may use
+the service later, when a hook calls it; that includes a helper a module exported, and a facade a
+hook stashed in the shared exports and a module's top level later reached for. Concrete facades and
+output bindings are installed by LFE-12; the phase is the integration point they use.
+
+### Stop and what it leaves
+
+`stopModuleLoader` (the owner's lifetime does it too, before the VM closes) closes admission first,
+then closes every suspended module on the owner, innermost first, running its pending to-be-closed
+variables; withdraws every source interest once (withdrawing an interest tells the supplier the loader no longer wants the source;
+what a read the supplier has already started still needs stays the supplier's to retain until that read is over); drops every
+delivered answer that was not used;
+empties the queue; and marks every identity that was pending or evaluating **stopped**
+(`ModuleStopped`, `ExportStopped`). A stop is not a failure: it is a disposition distinct from the
+sticky content failures, so a later required-failure integration cannot mistake it for a module that
+failed, and no module is required to finish. A late or duplicate source cannot resume or publish
+anything (`SourceAfterStop`, `SourceDuplicate`, `SourceUnwanted`). Stop is terminal and idempotent;
+what completed stays readable, and hooks still import it. Every failure of closing a coroutine or
+releasing an interest is attempted, kept, and raised together after the stop, the first as the primary
+failure and the others as cleanup evidence, and the loader is stopped regardless; a failed close is
+not retried.
+
+### Failures of the engine and the application
+
+A Haskell failure that reaches a callback while a chain runs (a supplier or resolver that raises, a
+re-entry refused, an allocation that fails in a handler) is raised from `advanceLoader` in preference
+to whatever Lua reported, even if the script caught the stand-in error, and it is never turned into
+a catchable content error. The chain is abandoned: every suspended frame is closed on the owner, its
+identity recorded as failed (`the evaluation was abandoned`), and a table a segment had already kept
+is released. Failures closing the frames and releasing interests are kept beside the primary one as
+cleanup evidence. Memory running out inside a segment is a classified failure of the module
+(`ScriptFailed`), never a crash. After an abandonment the loader is usable: identities that were
+only pending stay pending, and are asked for by whichever chain next needs them or withdrawn by stop.
+
+### Ownership, threads and lifetimes
+
+| What | Owner and thread | Made by | Ends by | Bound | If it fails or is stopped | Released when | Proved by |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| identity record | the VM's owner, under its gate | `admitRoot` (before the supplier is asked) or the import handler | terminal: ready (table anchored), failed, stopped | `exportMaxIdentities`, pending and failed counted | failed is sticky and first-kept; stopped is `ExportStopped` | at VM close (never evicted) | `Loader`, `Limits`, `Stop` |
+| source interest and the answer it holds | owner (acquire: owner thread or a callback of this VM) | supplier `acquire`, counted after it answers | consumed (bytes compiled), failed, stopped | one per pending identity; answer bytes at most the source bound | released once, failure kept as evidence | `supplierRelease` at the first of consumption, failure or stop | `acquired == released + held` in every `Loader`, `Stop`, `Failures` example's `balanced` |
+| module frame (coroutine anchored in a task slot) | the owner | `startFrame` compiling the delivered source | returns, fails, or closed by stop or abandonment | chain depth, 32 under M1 | closed with its to-be-closed variables run; errors are evidence | the slot is emptied on every end; `liveTaskReferences == chain depth` | `Stop` (each depth), `Failures` |
+| export table slot | the owner | a frame returned exactly one plain table | the VM closes | one per ready identity | a table a segment kept is released if the module is condemned or the operation fails | released at once on condemnation; else at VM close | `Loader`, `Failures`, the allocator sweep |
+| `import` closure and context | the VM's Lua state | the frame's environment | with the module's environment | one per evaluated identity | none | collected with the environment; the context number stays bounded by the identity bound | `Loader` (hooks, facade) |
+| pending import (the importer's wait) | the owner | the import handler noting the dependency | the dependency has an outcome, or stop | one per chain frame | resumed with the failure, or closed | when the frame ends | `Loader`, `Stop` |
+| evidence not yet raised | the owner | closing or releasing that failed | raised at the end of the operation | bounded by the frames closed | the first is primary | raised exactly once | `Failures`, `Stop` |
+
+### Hosting it on a scheduled owner
+
+A [scheduled owner](#the-scheduled-owner) created with `scheduledLoader = Just plan`
+(`Hetoimasia.Scripting.Lua.Loading`) hosts the loader on the worker that runs its VM. The plan carries
+the supplier, the resolver and the bound of the inbox. `scheduledLoaderEndpoint` hands out the side any thread may
+use without blocking:
+
+* `submitRoot endpoint request due` leaves a root: `DueUi` (eligible at once, in the order submitted) or
+  `DueTick t` (eligible once the owner's logical tick reaches `t`). Logical roots must be submitted in non-decreasing
+  tick order (`SubmitOutOfOrder`), so the loader's queue order is the logical order.
+* `notifySource endpoint identity answer` leaves what a provider found. A second notification for an identity
+  that is still waiting is a duplicate and changes nothing.
+* `loaderOutcome`, `awaitLoaderOutcome` (an STM action to compose with `awaitSupervised`), `loaderRefusals` and
+  `loaderDiagnostics` read what the owner published: admitted (a root reads as admitted from the moment its submission
+  is accepted, so one the owner never got to is told from one nobody sent), ready or failed with the very handle or
+  sticky fault, refused (nothing was recorded for it; the last `planBound` refusals are kept), or stopped.
+
+Both queues are **bounded by admitted work** (`planBound` roots and as many arrived answers); a full inbox refuses
+(`SubmitFull`, `NotifyFull`) and nothing is dropped or grown. The owner waits for the inbox beside the scheduler's own
+work, and at each boundary admits what was submitted, delivers what arrived, and advances the loader, so every
+compile, evaluation, resume, publication and Lua-reference release happens on the owner's thread **between two scheduler
+turns**: hooks and stop requests go on while a chain waits for a source, another owner is not affected, and a
+non-yielding module still blocks its own owner.
+
+A **due logical chain holds the next tick.** While a `DueTick` root whose tick has been reached has no outcome the owner
+asks to be held at the following tick, in the same transaction that read the tick, so the scheduler does not apply a grant
+that would begin it: the tick is not complete and nothing advances past the obligation. The hold is one need whatever the
+number of roots, and is given back when the last due root has an outcome or the owner exits. A UI chain holds nothing.
+When the owner exits the inbox closes, the loader is stopped on the owner's thread, every outcome that was only admitted
+is published as stopped, and the hold is given back. `LoaderPlanRefused` names, before anything starts, a bound below
+one and a VM configuration that already names a loader.
+
+### What is not here
+
+The production content reads and file workers, the per-instance module waiters and their cancellation policy, atomic
+request and identity reservation, the 16 MiB source bank and an assigned-tick settlement (LFE-10, LFE-11); the complete
+lexical-root, content, time and output facades (LFE-12); startup, session failure and quit policy (LFE-13);
+unavailable-state interception (LFE-26); hot reload, mods, hostile-code isolation and replay guarantees. The loader does
+not preempt a non-yielding module.
+
+### What proves it
+
+`Test.Lua.Boundary.Loader` (`lua-host-tests`, real interpreter, an injected supplier and resolver, nothing sleeps): depth-first
+order read from what modules marked; one shared table; a later root never overtaking; eligibility injected; a pending
+dependency reused within the chain; every sticky failure kept across a later import; a caught failure still condemning;
+completed dependencies surviving a failed parent; cycles with their chain and no extra frame; one example for each
+context where Lua cannot suspend and the contexts where it can; resolver refusals that latch nothing; the immediate lookup
+of a hook; the phase of a top level with a helper and a stashed facade; the seams' threads.
+`Test.Lua.Boundary.Loader.Limits` (each bound at and one past it, pending and failed identities charged, reuse at any
+fill), `Loader.Stop` (a chain stopped at each depth, idempotence, late and duplicate answers, failing closes and releases
+kept as evidence), `Loader.Failures` (a supplier, a resolver and a release that raise; an allocator budget swept over a
+chain so that every point of exhaustion is classified and the ledger balanced) and `Loader.Threads` (an answer from another
+thread, every other thread refused, hooks and stop served while a chain waits, an independent VM unaffected, a seam's
+re-entry refused). `Test.Lua.Opacity` adds an external client that composes injected sources and the loader through the
+public owner alone. `Test.LuaRuntime.Loading` (`lua-runtime-tests`) runs the hosted loader on real supervised scheduled
+owners: a chain waiting for another thread's source while a hook runs, an independent owner, the tick hold with a
+positive control, the bounded inbox, and the owner's exit. `Test.LuaEngine.Loader` (`lua-engine-tests`) configures a real
+owner from the fixed M1 profile and shows a chain of 32 and 256 identities and nothing more.
 
 ## Tasks and the coroutine library
 
@@ -3478,10 +3731,16 @@ read the ledger.
 
 ### The reply, the resource and the defect
 
-A request admitted this way takes the service's contract for its reply (`checkReplyFor`):
+A request admitted this way takes the service's contract for its reply (`checkReplyFor`). The reply is first
+evaluated to its constructor inside the same guard that evaluates what it holds, on the provider's thread: one that
+throws when it is first looked at (a failure whose strict message is an error) is a provider defect here and a
+refused value on the generic path, and an asynchronous exception is never taken for either. What is measured is
+the record the script will be handed:
 
 * a `ProviderResult` is checked against the owner's value limits and the endpoint's schema, the value against the
-  admission's ceilings, and the record a script is handed (the admission's frame) against the owner's;
+  admission's ceilings, and the record a script is handed (the admission's frame) against the owner's. The
+  admission's combiner shapes that record only for a result whose resource the owner builds into the reserved lease
+  (a `ProviderResource` of a request that reserved one); a plain result is measured, and handed, as it is;
 * a `ProviderExpected` failure must carry a code the admission lists, a root and path within their byte bound, and
   an envelope that fits: a message is cut at a character, visibly (`...`), to its bound until it does;
 * a `ProviderResource value recipe` is a result whose resource the instance is to own: the owner builds the recipe
@@ -3565,7 +3824,7 @@ holding the tick, the offset refused on arrival, the ceiling and exhausted numbe
 has nowhere to go); required and optional failure with the latch independent of reads, caught errors and late cancels;
 every kind of defect; the result lease built, kept live after a take, released with the instance, discharged unused and
 released when cancelled after adoption; immediate completion during submission, revocation during the handoff,
-late, duplicate and unknown completions, and a disposal that fails; handles across two instances; and the races a review found, one example each: a credit release that raises at a settlement, at a withdrawal and in the owner's exit; a second reply while a resource waits to be built; credits that transfer to a resource built after its request was cancelled; a resource whose building failed while a stage's retirement is pending; a resource adopted for a result nobody took when the epoch changes; a latch carried to the end of the instance; a defect that arrives while the owner is exiting; the registry of handles claimed by owners that start together; and the owner's bound across generic and opt-in requests. `lua-host-tests`
+late, duplicate and unknown completions, and a disposal that fails; handles across two instances; and the races a review found, one example each: a credit release that raises at a settlement, at a withdrawal and in the owner's exit; a second reply while a resource waits to be built; credits that transfer to a resource built after its request was cancelled; a resource whose building failed while a stage's retirement is pending; a resource adopted for a result nobody took when the epoch changes; a latch carried to the end of the instance; a defect that arrives while the owner is exiting; the registry of handles claimed by owners that start together; the owner's bound across generic and opt-in requests; a reply that throws as it is first looked at; and a plain result of a request that reserved a lease, measured as handed. `lua-host-tests`
 pin `withArgumentCheck`. The cancellation and cleanup windows are the kind an asynchronous-exception race can hide on
 one platform, so CI, which runs them on Linux, is the evidence for them and a local pass is not.
 

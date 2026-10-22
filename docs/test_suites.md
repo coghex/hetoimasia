@@ -69,7 +69,8 @@ cabal test hetoimasia-tests --test-show-details=direct
   in general a new example belongs in the component spec that owns the
   behaviour it asserts. `lua-host-tests`
   (`packages/scripting-lua/test/`) owns two components: the bridge's own
-  examples, and `Protocol` (`Test.Lua.Protocol.Spec`), the pure task,
+  examples (the module loader's, LFE-9, among them: `--test-options='--match "the module loader"'`, `"the loader's"`,
+  `"stopping the loader"` and `"failures of the engine"`), and `Protocol` (`Test.Lua.Protocol.Spec`), the pure task,
   admission, request, subscription, epoch, failure, and stop model in the
   package's private `model` sublibrary. Select the model's examples with
   `--test-options='--match Protocol'`; they construct no interpreter, and the
@@ -82,7 +83,8 @@ cabal test hetoimasia-tests --test-show-details=direct
   `Test.LuaRuntime.Spec`, group `test.scripting-lua-runtime`) owns the runtime
   adapter's examples: readiness, identity, submission and its bounds,
   settlement, host failures, stop, independent owners, and the refused reply
-  wait from a Lua callback, with real VMs under a real `withSupervision`, plus
+  wait from a Lua callback, with real VMs under a real `withSupervision`, the module loader hosted on a scheduled
+  owner (`Test.LuaRuntime.Loading`, `--match 'module loader on a scheduled owner'`, LFE-9), plus
   the adapter's dependency closure, which needs no VM. It selects and fails on
   an empty selection the same way.
   `lua-engine-tests` (`packages/lua-engine/test/`, composed by `Test.LuaEngine.Spec`,
@@ -90,12 +92,14 @@ cabal test hetoimasia-tests --test-show-details=direct
   configuration boundary (LFE-3): the strict manifest parser's accepted examples,
   byte and nesting limits, syntax and schema refusals and exact tick conversion, the
   fixed M1 profile and its smaller validated test profiles, and the package's
-  dependency and import boundary; the manifest and entry boot checkpoint (LFE-6) composed with the content inventory over real temporary folders (`Test.LuaEngine.Boot`); and the M1 request adapter (LFE-7, `Test.LuaEngine.Request.*`):
-  the busy record, the exact `ready`/`take`/`cancel`/`wait` records, handles and phases,
-  the profile's limits, a texture lease, and required and optional failure, over real Lua
-  instances on a supervised owner with controlled fake providers. The manifest, profile and boot
-  examples start no Lua; the request examples start no window or GPU.
-  A new manifest or profile example belongs there, in the component spec that owns it.
+  dependency and import boundary, the manifest and entry boot checkpoint (LFE-6)
+  composed with the content inventory over real temporary folders (`Test.LuaEngine.Boot`), the M1
+  behavior selection and the export-module and loader ceilings the profile gives a VM, and the M1 request adapter
+  (LFE-7, `Test.LuaEngine.Request.*`): the busy record, the exact `ready`/`take`/`cancel`/`wait` records, handles
+  and phases, the profile's limits, a texture lease, and required and optional failure, over real Lua instances on
+  a supervised owner with controlled fake providers. It starts no window or GPU; its one example of the Lua host's
+  module loader under the fixed profile (`Test.LuaEngine.Loader`, LFE-9) starts an in-process Lua owner. A new
+  manifest or profile example belongs there, in the component spec that owns it.
   `lua-runtime-tests` also owns the host's opt-in admission (`Test.LuaRuntime.Admission.*`)
   and `lua-host-tests` the argument checks (`Test.Lua.Boundary.ArgumentChecks`).
   `content-tests` (`packages/content/test/`, composed by `Test.Content.Spec`, group
