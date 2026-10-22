@@ -3731,10 +3731,16 @@ read the ledger.
 
 ### The reply, the resource and the defect
 
-A request admitted this way takes the service's contract for its reply (`checkReplyFor`):
+A request admitted this way takes the service's contract for its reply (`checkReplyFor`). The reply is first
+evaluated to its constructor inside the same guard that evaluates what it holds, on the provider's thread: one that
+throws when it is first looked at (a failure whose strict message is an error) is a provider defect here and a
+refused value on the generic path, and an asynchronous exception is never taken for either. What is measured is
+the record the script will be handed:
 
 * a `ProviderResult` is checked against the owner's value limits and the endpoint's schema, the value against the
-  admission's ceilings, and the record a script is handed (the admission's frame) against the owner's;
+  admission's ceilings, and the record a script is handed (the admission's frame) against the owner's. The
+  admission's combiner shapes that record only for a result whose resource the owner builds into the reserved lease
+  (a `ProviderResource` of a request that reserved one); a plain result is measured, and handed, as it is;
 * a `ProviderExpected` failure must carry a code the admission lists, a root and path within their byte bound, and
   an envelope that fits: a message is cut at a character, visibly (`...`), to its bound until it does;
 * a `ProviderResource value recipe` is a result whose resource the instance is to own: the owner builds the recipe
@@ -3818,7 +3824,7 @@ holding the tick, the offset refused on arrival, the ceiling and exhausted numbe
 has nowhere to go); required and optional failure with the latch independent of reads, caught errors and late cancels;
 every kind of defect; the result lease built, kept live after a take, released with the instance, discharged unused and
 released when cancelled after adoption; immediate completion during submission, revocation during the handoff,
-late, duplicate and unknown completions, and a disposal that fails; handles across two instances; and the races a review found, one example each: a credit release that raises at a settlement, at a withdrawal and in the owner's exit; a second reply while a resource waits to be built; credits that transfer to a resource built after its request was cancelled; a resource whose building failed while a stage's retirement is pending; a resource adopted for a result nobody took when the epoch changes; a latch carried to the end of the instance; a defect that arrives while the owner is exiting; the registry of handles claimed by owners that start together; and the owner's bound across generic and opt-in requests. `lua-host-tests`
+late, duplicate and unknown completions, and a disposal that fails; handles across two instances; and the races a review found, one example each: a credit release that raises at a settlement, at a withdrawal and in the owner's exit; a second reply while a resource waits to be built; credits that transfer to a resource built after its request was cancelled; a resource whose building failed while a stage's retirement is pending; a resource adopted for a result nobody took when the epoch changes; a latch carried to the end of the instance; a defect that arrives while the owner is exiting; the registry of handles claimed by owners that start together; the owner's bound across generic and opt-in requests; a reply that throws as it is first looked at; and a plain result of a request that reserved a lease, measured as handed. `lua-host-tests`
 pin `withArgumentCheck`. The cancellation and cleanup windows are the kind an asynchronous-exception race can hide on
 one platform, so CI, which runs them on Linux, is the evidence for them and a local pass is not.
 
