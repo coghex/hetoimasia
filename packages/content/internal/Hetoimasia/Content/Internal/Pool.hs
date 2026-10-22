@@ -125,6 +125,7 @@ import Hetoimasia.Foundation.Worker
   , Result (Cancelled, Failed, Succeeded)
   , StartOutcome (Started, StartRejected, StartupFailed)
   , StopToken
+  , Worker
   , WorkerCancelled (WorkerCancelled)
   , closeWorkerGroup
   , startWorker
@@ -172,6 +173,9 @@ type VerifiedRead = ContentKey → Int → IO (Either ReadFailure ByteString)
 data PoolHooks = PoolHooks
   { hookWorkerStart ∷ !(Int → IO ())
   -- ^ Before worker @i@ (from zero) is started.
+  , hookWorkerStarted ∷ !(Int → Worker () → IO ())
+  -- ^ After worker @i@ was started, with its handle: for a test that stops or cancels one from
+  -- outside the scope.
   , hookIssued ∷ !(ContentKey → IO ())
   -- ^ A worker took the job off the queue and has not yet asked the reader to open anything.
   , hookRead ∷ !(ContentKey → IO ())
@@ -182,7 +186,7 @@ data PoolHooks = PoolHooks
 
 -- | No hooks.
 noHooks ∷ PoolHooks
-noHooks = PoolHooks (\_ → pure ()) (\_ → pure ()) (\_ → pure ()) (\_ → pure ())
+noHooks = PoolHooks (\_ → pure ()) (\_ _ → pure ()) (\_ → pure ()) (\_ → pure ()) (\_ → pure ())
 
 -- Jobs ------------------------------------------------------------------------------------
 
@@ -352,7 +356,7 @@ withPoolWith hooks spec reader body = withWorkerGroup $ \group → do
       forM_ [0 .. poolWorkers spec - 1] $ \index → do
         hookWorkerStart hooks index
         startWorker group (workerDefinition (Text.pack ("content-read-" <> show index)) (\_ → pure ()) (\token () → runWorker pool token)) >>= \case
-          Started _ → pure ()
+          Started worker → hookWorkerStarted hooks index worker
           StartupFailed _ _ → throwIO (ContentDefect (ReadWorkerNotStarted index))
           StartRejected _ → throwIO (ContentDefect (ReadWorkerNotStarted index))
       body pool

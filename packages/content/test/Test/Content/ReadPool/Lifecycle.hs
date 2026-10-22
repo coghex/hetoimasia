@@ -12,13 +12,13 @@ import Data.Text (Text)
 import qualified Data.ByteString.Char8 as BC
 import Hetoimasia.Content.Identity (ContentKey, contentKeyPath, logicalPathBytes)
 import Hetoimasia.Content.Inventory (readVerified)
-import Hetoimasia.Content.Internal.Types (ContentDefect (ContentDefect), Defect (ReadWorkerTerminated))
+import Hetoimasia.Content.Internal.Types (ContentDefect (ContentDefect), Defect (ReadWorkerEndedOpen, ReadWorkerTerminated))
 
 import Hetoimasia.Foundation.Resource (cleanupFailureLabel, cleanupFailuresInContext, composeCleanup)
 import Hetoimasia.Content.Internal.Native (Boundary (ReadOpened), productionSeam)
 import Hetoimasia.Content.Internal.Pool (PoolHooks (..), noHooks, withPoolWith)
 import Hetoimasia.Content.ReadPool
-import Hetoimasia.Foundation.Worker (Completion (..), GroupReport (..), Result (..), WorkerCancelled (..), WorkerEvidence (GroupExit), workerEvidenceInContext)
+import Hetoimasia.Foundation.Worker (requestStop, Completion (..), GroupReport (..), Result (..), WorkerCancelled (..), WorkerEvidence (GroupExit), workerEvidenceInContext)
 import Test.Content.Inventory.Support (baseSpec, limitsFrom, populate, rootPath, withLayout, withScanned)
 import Test.Content.ReadPool.Support
 import Test.Content.Support
@@ -340,6 +340,35 @@ exits = describe "every exit keeps its failure and its evidence" $ do
             throwIO (userError "body failure after the latch")
       show failure `shouldContain` "body failure after the latch"
       map cleanupFailureLabel (cleanupFailuresInContext trail) `shouldContain` ["content read pool worker failure"]
+
+  it "a worker asked to stop from outside while the pool is open serves what is queued, then fails the pool so nothing later waits behind it" $ do
+    probe ← newProbe
+    closeGate probe "a.bin"
+    workers ← newEmptyMVar
+    let hooks = noHooks {hookWorkerStarted = \_ worker → putMVar workers worker}
+    withInventory [("a.bin", "a"), ("b.bin", "b")] $ \root inventory → do
+      outcomes ← newOutcomes
+      ExceptionWithContext _ failure ←
+        failsWith @ContentDefect $
+          withPoolWith hooks (poolOf 1 4) (probeReader probe (readVerified inventory root)) $ \pool → do
+            worker ← readMVar workers
+            _ ← accepted pool (request inventory outcomes OrdinaryRead 64 "a.bin")
+            awaitStarted probe 1
+            queued ← accepted pool (request inventory outcomes OrdinaryRead 64 "b.bin")
+            -- The stop is asked of the worker, not by the scope. It finishes the work accepted
+            -- before the stop and then, seeing the stop with the pool open and idle, ends.
+            atomically (requestStop worker)
+            openGate probe "a.bin"
+            awaitRetired queued
+            _ ← awaitSTM (awaitFailure pool)
+            map snd <$> seenOutcomes outcomes `shouldReturn` [SeenBytes "a", SeenBytes "b"]
+            -- Nothing runs jobs any more: a later request is refused, not left pending.
+            _ ← atomically (reserveSlot pool)
+            refused ← atomically (submit pool (request inventory outcomes OrdinaryRead 64 "a.bin"))
+            case refused of
+              Left (PoolHasFailed _) → pure ()
+              _ → expectationFailure "expected the failed pool to refuse"
+      failure `shouldBe` ContentDefect ReadWorkerEndedOpen
 
   it "a second worker's failure is kept beside the first, which stays the pool's failure" $ do
     probe ← newProbe
