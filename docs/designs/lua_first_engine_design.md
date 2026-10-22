@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-74/Q-16: numeric ceilings and worker accounting.
+The current checkpoint is P-75/Q-8: vision and prior-epic reconciliation.
+D-77 accepts the six-part fixed M1 ceilings and worker-accounting package.
 D-76 accepts the six-part remaining service API and record-schema package.
 D-75 accepts the five-part core Lua module/behavior/request API package.
 D-74 accepts the five-part concrete launch-command and JSON manifest package.
@@ -70,7 +71,8 @@ needs explicit reconciliation; this entry does not request a duplicate epic.
 - **Done when:** P-40's acceptance is met: actual textured output with offscreen
   and native-window evidence, real async/lifecycle/error behavior, orderly quit,
   and the two-instance integration test through the new bindings/composition.
-  Exact APIs, commands and one-PR slice boundaries remain open. A state call
+  D-74–D-77 settle commands, APIs and bounds; one-PR slice boundaries remain
+  open. A state call
   reports unavailability and ends the session through protected cleanup.
 - **Users and operators:** game and mod authors, the owner running their
   content, and maintainers of the reusable engine and its Lua interfaces.
@@ -134,6 +136,14 @@ No build, probe or desktop session ran for this draft.
   trusted milestone delivered, but still requires the confined branch and
   successful platform qualification. No separate Lua-first epic was found.
   Recheck overlap at readiness.
+- Read-only reconciliation refresh on **2026-10-22**: #145 remains open,
+  titled "Establish isolated UI and gameplay Lua execution", last updated
+  2026-10-21 14:28:03 UTC. Its body records LUA-8/#500 delivered and accepted
+  but still says all thirty-one children and successful confinement on both
+  platforms are required. Its seven unfiled process-branch slices remain
+  unchecked. #500 is closed; the only open issues remain #145 and #446.
+  P-75 proposes an explicit scope revision, not a claim that the old completion
+  condition has been met. No new overlapping Lua-first epic was found.
 
 ## Desired experience and scope
 
@@ -147,8 +157,9 @@ D-43 further narrows delivery to the textured-quad M1 defined in P-40. Real
 boot, filtering, content loading, instance ownership, clocks, failure handling
 and window/texture/2D scene integration remain. Mod activation and compatibility,
 general input, widgets/fonts, advanced presentation and hot-swap are later work
-whose designs do not block M1. Exact M1 bindings, vision/epic reconciliation and
-delivery order remain to be settled. D-42's runtime reconciliation applies
+whose designs do not block M1. D-74–D-77 settle the concrete M1 interface and
+bounds; vision/epic reconciliation and delivery order remain to be settled.
+D-42's runtime reconciliation applies
 within D-43's delivery allocation; earlier broader scope is historical.
 
 This design session changes only this document. Production code, tracker
@@ -2310,6 +2321,36 @@ single unavailable-state guard; strict validation/expected failure codes.
 The quad composition was shown before signoff, not added as an unexplained
 implementation interpretation afterwards. Numeric ceilings and worker/resource
 accounting remain the next explicit contract.
+
+### D-77. Use the approved fixed M1 ceilings and worker accounting
+
+**Delivery:** M1 limits, admission, provider workers and retirement accounting.
+
+Owner answer, **2026-10-22 05:20:41 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> Approve all six (Rec.)
+
+Authenticated relay: `het-manager`, message `euwd2egbtsck5d4c6p4v56b53w`,
+posted **2026-10-22 05:20:41.618 UTC** in `#het-luafirst`, replying to Q-16
+message `tpduukyenxg49hcb2y94qzhfpn`.
+
+All six parts of P-74 are accepted: inventory/module limits; instance,
+request, value and diagnostic limits; graphics/PNG/native budgets; owned
+workers and stage queues; numeric/time/exhaustion rules; and refusal/failure
+classification with qualification obligations. The tables and accounting
+rules in P-74 are the normative numeric profile. These are fixed M1 assembly
+limits, not Lua configuration or a hard process-memory/preemption guarantee.
+
+Before asking, the manager showed the owner a summary table covering folder,
+module, instance/request, data, copied-value/scene, PNG, texture, window,
+sprite and failure-text limits; two I/O workers, one decode worker and two
+texture lanes, with active dependencies ahead of prefetch; and the practical
+costs. Those included unused oversized files failing boot, resizing PNGs above
+2048, splitting data at 8 MiB, early busy refusal from conservative texture
+reservations, and the absence of a total Lua memory cap. The alternative
+"Revise limits" was not chosen. No runtime, allocation or native evidence is
+claimed by this signoff; implementation must establish P-74's proof obligations.
 
 ## Proposals
 
@@ -6879,8 +6920,8 @@ ceilings and worker/resource accounting need the next explicit package.
 
 ### P-74. Fix a bounded M1 profile and account for work through actual retirement
 
-**Unapproved; active checkpoint Q-16. Delivery: M1.** Recommend the following
-six-part profile. These are proposed engineering limits, not measured performance
+**All six parts accepted by D-77 through Q-16. Delivery: M1.** The following
+six-part profile fixes engineering limits, not measured performance
 promises. They are fixed by the M1 assembly, without Lua/manifest/environment
 overrides. Smaller injected test profiles must pass the same consistency
 validation. Existing commands/general-library configurations stay unchanged.
@@ -7080,6 +7121,223 @@ textures hold capacity; maximum native geometry is not guaranteed allocatable;
 and worker/decoder accounting requires real work. These are not hostile-code
 containment or whole-Lua/process/driver memory caps. Changed limits or tunability
 need a package revision, not silent relaxation during implementation.
+
+### P-75. Reconcile the vision and close the delivered trusted arc explicitly
+
+**Unapproved; active checkpoint Q-8.** Recommend all five parts below. These
+are proposed reconciliation text and dispositions, recorded here only. Approval
+selects their meaning; it does not authorize this designer to edit other
+documents or mutate the tracker during this session. The manager can arrange
+the authorized publication/processing follow-up after signoff. Stable principle,
+decision and slice IDs, prior quotations and qualification evidence survive.
+
+#### 1. V-1: the Lua game is the application; the engine remains generic
+
+Replace V-1's opening paragraph with:
+
+> Build a modular Haskell engine using Lua for game authoring and Vulkan for
+> the first graphics backend, with independent 2D and 3D renderers. The generic
+> executable assembles services and starts a game's Lua content without
+> game-specific Haskell. The Lua game is the application: it defines game
+> rules, authored data, assets and orchestration through narrow engine services.
+> Engine packages never import concrete games. Use narrow services and opaque
+> handles, not a universal EngineEnv, service locator or mutable global
+> registry. An application-wide monad must not conceal dependency ownership.
+
+Append to that paragraph:
+
+> Owner direction of 2026-10-21: the later gameplay-state arc is engine-held
+> and Lua-defined. The Lua-first textured-quad milestone deliberately has no
+> gameplay state store; state-service calls report unavailability and stop
+> the session. This deferral does not assign an authoritative world to Lua
+> tables or promise rollback of Lua mutations. The milestone's scope and
+> service contracts are in the Lua-first engine design, D-41–D-43.
+
+The rest of V-1, including math and subsystem boundaries, stays applicable.
+Haskell still owns native threads, protected lifetimes, resource accounting,
+graphics completion and service construction. A Lua-facing facade is an
+instance-bound collection of granted functions, not an engine-wide Haskell
+environment. No sample's concrete game schema migrates into engine packages.
+
+#### 2. V-9 and related principles: trusted filtered Lua, with honest M1 limits
+
+Change V-9's title to **Responsive trusted Lua domains with filtered services**.
+Replace its first four paragraphs (through the confinement-verdict paragraph,
+before the D-23 determinism paragraph) with:
+
+> Own independent logical and UI/presentation execution domains with bounded
+> scheduling and communication. Owner direction of 2026-10-21 treats game and
+> mod Lua alike as trusted, in-process code. Both use the same filtered
+> standard-library policy and engine-provided content services. Scripts receive
+> no ambient OS, filesystem, network, process-launching or native-loader API.
+> The Lua-first design specifies the removed functions, content-root access
+> and phase/instance checks; mod activation is later work, not part of M1.
+>
+> Filtering is not hostile-code containment. A trusted script can hang its VM
+> or exhaust application memory. Cooperative budgets, provider accounting,
+> distinct VMs and module environments are not hard execution or memory limits.
+> Direct bindings cannot synchronously enter another VM owner. Dependencies
+> remain held until actual completion; cancellation is not proof of retirement.
+>
+> Confined processes are no longer a requirement for trusted game/mod delivery
+> or completion of the delivered trusted Lua arc. LUA-9–LUA-13, LUA-16 and
+> LUA-17 are deferred outside the active roadmap by the revised trust decision.
+> LUA-14/LUA-15 remain delivered feasibility investigations with inconclusive
+> verdicts, not qualified containment. If hostile-code support is requested
+> later, it needs an explicit new scope/readiness decision and successful
+> platform qualification before dependent confinement work; there is no
+> unconfined fallback for content admitted as untrusted.
+>
+> An ordinary logical-role failure stops that role while a healthy UI can
+> report it until exit. In M1 the UI receives lifecycle/failure status, not
+> a world snapshot: there is no engine-held gameplay state to freeze or roll
+> back. UI-role failure, engine/provider/cleanup failure, or a call to the
+> unavailable state service ends the session. The Lua-first startup gate and
+> one-role rules define the cases where no healthy UI can continue. Callback
+> threads remain runtime machinery, not cancellation endpoints.
+
+Keep the existing D-23 paragraph as the **later authoritative-simulation
+direction and existing sample's qualified contract**, with this explicit
+paragraph immediately after it:
+
+> For Lua-first M1, retain exact fixed logical tick duration, stable scheduled
+> effect positions and assigned result delivery; late work delays progress
+> without skipping ticks or stretching dt. The logical VM runs ordinary Lua
+> hooks and module/data loads with Lua-local state, while the UI has its own
+> elapsed clock. M1 has no state store, committed-world/digest/replay API,
+> engine RNG or seeded-stream guarantee; math.random and math.randomseed are
+> removed in both roles. It claims no whole-session or cross-run gameplay
+> determinism. The existing lua-domains sample retains its own D-23/D-48
+> qualification, including the limit on late independent failures. Its state
+> transactions, replay and seeded streams are not M1 services.
+
+Keep the D-27 cleanup paragraph unchanged: failed init, lost handles, absent
+or throwing shutdown cannot bypass engine-owned retirement. Preserve the
+historical D-12–D-14 and D-23 decisions in the old design, with links to the
+new scope qualification rather than rewritten old quotes.
+
+For V-4, append this scoped clarification:
+
+> Lua-first M1 distinguishes pre-admission busy refusal with no work started,
+> ordinary Lua validation/phase/ownership errors, accepted optional content
+> failure, and latched required failure. Catching or ignoring a required
+> failure does not clear it. Whole-scene refusal keeps the previous complete
+> scene; it does not roll back arbitrary Lua or resource effects. Engine and
+> cleanup failures retain fatal authority and primary/secondary evidence.
+
+For V-5, qualify the old "a simulation driver is deferred" sentence with:
+
+> Lua-first M1 introduces a logical Lua tick driver, not a gameplay-state
+> simulation/commit service. UI publishes copied latest scenes independently
+> of logical completion. Service workers, results and retirement bookkeeping
+> have explicit finite ownership and admission budgets.
+
+V-2/V-3/V-6/V-8/V-10 retain their boundaries. In particular, Lua release does
+not retire GPU use, a window's native close requests whole-session quit by
+D-51, and ending one test instance must not invalidate its peer. That session
+quit policy does not weaken independent resource ownership. Headless tests
+do not establish the rendered result; Linux and local macOS need their own
+evidence. No new hard latency or platform support claim is added.
+
+#### 3. Preserve the old Lua design as a completed trusted foundation
+
+Proposed current-status wording for `docs/lua_runtime_design.md`:
+
+> Trusted milestone delivered and owner-accepted at b7f3b56e on 2026-10-21.
+> The owner's later trust decision treats game and mod Lua alike as trusted.
+> LUA-9–LUA-13, LUA-16 and LUA-17 are deferred outside this completed trusted
+> milestone; they are not implemented or qualified. Q-5 remains unresolved
+> technical evidence for any future hostile-code arc, not a prerequisite for
+> Lua-first M1 or later trusted-mod activation. The new Lua-first design is
+> the named consumer of this delivered foundation and governs its M1 profile.
+
+Reconcile the old design's current status, seven deferred ledger annotations,
+epic completion wording and next-session handoff consistently with that text.
+Preserve all thirty-one LUA IDs, dependencies as historical/later-arc material,
+accepted historical decisions and delivered receipts. Do not mark the seven
+as done, erase the original threat model, or rename an inconclusive verdict
+successful. Add dated supersession notes to conflicting current requirements.
+Any later revival requires owner scope/readiness signoff and renewed assessment
+of then-current platform evidence; old unsuccessful proofs never unlock it.
+
+Existing Lua host/runner/sample contracts continue to describe implemented
+behavior. M1 may add narrow profile and admission facilities, but does not
+silently change the existing `lua` command's library policy, general host's
+failure semantics, sample's state contract or existing configurable limits.
+
+#### 4. Revise #145's scope, close that arc, and use a separate M1 epic
+
+Recommend renaming #145 to **Establish trusted UI and gameplay Lua execution**
+and revising its current goal/completion requirement to the delivered trusted
+foundation, before closing it as completed under that revised scope. Proposed
+leading reconciliation text:
+
+> Owner scope revision: trusted UI/gameplay Lua delivery is complete through
+> LUA-8, #500 / PR #509, b7f3b56e, accepted 2026-10-21. Game and mod Lua are
+> now both trusted. The seven unfiled confinement slices LUA-9–LUA-13, LUA-16
+> and LUA-17 are deferred outside this epic's required scope. Their code was
+> not delivered; Linux/macOS feasibility verdicts remain inconclusive. Closing
+> this revised epic records the trusted foundation's completion, not completion
+> of the original all-thirty-one-slice confinement contract. The Lua-first
+> textured-quad M1 is a separate consumer arc governed by its own design and
+> acceptance; it reuses this host/runtime instead of recreating it.
+
+Keep the completed child references and seven explicitly deferred entries.
+Replace the live "all thirty-one required" and process-acceptance obligations
+with the revised required trusted scope; retain the original contract through
+the dated history/design record. Do not check deferred boxes, create placeholder
+confinement issues, or reinterpret the two feasibility deliveries as successful
+deployment. #145's old no-graphics acceptance remains true of its delivered
+foundation; it does not prohibit the separate Lua-first consumer.
+
+After M1 readiness, process this document's EPIC as a **new M1-only tracker**
+with #145 as its delivered predecessor, not as a new Lua host/confinement epic.
+Existing #446 remains separately deferred and is not a prerequisite for a
+full-image textured rectangle. Trusted mod activation, the generic state store,
+hot-swap and broader presentation/input remain later arcs; this does not create
+or order them. Recheck for overlapping work again during readiness/processing.
+
+Alternative considered: keep #145 open as a combined future confinement and
+M1 umbrella. It retains a misleading required-scope mixture and makes M1
+completion depend on work the owner explicitly deferred. Reusing #145 for M1
+would also mix delivered foundational acceptance with a new graphics consumer.
+Recommend the explicit revised closure and separate epic for clear completion.
+
+#### 5. Reconciliation handoff, costs and next checkpoint
+
+The manager's follow-up should apply approved wording to vision/old-design
+current sections and reconcile #145 before the M1 epic is filed. It should
+also arrange a narrowly scoped, owner-authorized standalone MEMORY.md update:
+that file is test/tool-read and cannot be landed by this document's docs-push.
+Proposed replacement meaning for its Lua status/trust/Q-5 entries:
+
+> The trusted Lua foundation is delivered and owner-accepted. Game and mod Lua
+> now share a trusted in-process, filtered-library policy. Confinement is
+> deferred outside active trusted delivery; its inconclusive platform findings
+> remain preserved for any later hostile-code investigation. Lua-first M1
+> designs a textured quad with a real logical VM and no gameplay state store
+> or mod activation. Its design records current readiness and next steps.
+
+Preserve MEMORY's expensive platform facts and "never weaken isolation to turn
+an inconclusive proof into support" rule. Do not fold unrelated memory or
+vision cleanup into this reconciliation. The old vision's documentation-lane
+sentence is already superseded by AGENTS; that is not a new design decision.
+Historical guide reports remain snapshot-scoped evidence, not rewritten to
+claim they reviewed this later scope.
+
+Costs and limits for signoff: trusted mods no longer have a mandatory planned
+hostile-code boundary; they may hang their VM or exhaust memory. A future
+untrusted product would need a newly authorized qualification arc. #145 closes
+only after an explicit scope reduction, not because its original seven missing
+deliveries somehow happened. M1 will have a new epic, and documentation/tracker
+bookkeeping must be reconciled before filing it. None of this adds a state
+store, replay system or mod activation back into the quad milestone.
+
+After this package is approved, Q-9 proposes dependency-ordered, one-PR M1
+slices with concrete observable acceptance, compatibility and ownership
+boundaries. Slice decomposition and final readiness are separate signoffs;
+this package selects no issue bodies, labels, implementation or automatic
+publication authority outside this document.
 
 ## Open questions
 
@@ -7588,15 +7846,13 @@ escalation follow.
 
 ### Q-8. How should the prior vision and Lua epic be reconciled?
 
-The manager proposes that V-9 and Q-5 cease to require confined processes for
-trusted mods, and LUA-9–13/16/17 cease to be required for that purpose, while
-LUA-14/LUA-15 verdicts remain historical evidence. The manager also reads V-1
-as making the Lua game the application with engine-held generic state. D-41 now
-defers that store: propose milestone wording about Lua consuming engine services
-without gameplay-state implementation, preserving the later-arc direction.
-These are proposals to present as exact reconciliation text for owner signoff.
-Do not edit `docs/vision.md`, the old design or #145 in this session. Decide
-the new arc's relationship to #145 before readiness or tracker processing.
+**Active checkpoint, P-75.** Approve the five-part reconciliation package or
+name revisions: V-1's Lua application boundary; V-9/V-4/V-5's trusted M1
+qualifications; the old Lua design's delivered/deferred status; explicit
+scope reduction and closure of #145 with a separate M1 epic; and the controlled
+documentation/tracker handoff. Exact proposed text and costs are in P-75.
+No vision, prior-design, memory or tracker mutation occurs in this session.
+Q-9 delivery slices follow this owner decision; readiness is not implied.
 
 ### Q-9. What is the accepted delivery order and final scope?
 
@@ -7654,12 +7910,10 @@ example. Numeric ceilings and worker/resource accounting continue in Q-16.
 
 ### Q-16. Approve the fixed M1 limits and worker/accounting profile?
 
-**Active checkpoint, P-74.** Approve all six parts or name revisions: content/
-module limits; instance/request/result budgets; texture/window/scene/native
-GPU bounds; owned workers and bounded stage queues; numeric/time/exhaustion
-rules; and failure classification/qualification. These are M1 assembly limits,
-not a Lua tuning API or hard whole-process containment. Next are Q-8 vision/
-#145 reconciliation and Q-9 dependency-ordered one-PR delivery slices.
+Resolved by D-77: all six P-74 parts approved after the numeric/worker summary
+and costs were presented. These are fixed M1 assembly limits, not a tuning API
+or hard whole-process containment. Next are Q-8 vision/#145 reconciliation
+and Q-9 dependency-ordered one-PR delivery slices.
 
 ## Verification strategy
 
