@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-51/Q-6k: one-shot request result consumption.
+The current checkpoint is P-52/Q-6l: the data-file result exposed to Lua.
+D-54 accepts one-shot request results with explicit terminal consumption.
 D-53 accepts recoverable busy admission with atomic reservations.
 D-52 accepts required failure escalation at eligible settlement.
 D-51 accepts one window slot per UI instance and the M1 close/control policy.
@@ -1611,6 +1612,33 @@ The owner chose A rather than current-host fault-on-full behavior. P-50's
 distinction from permanent invalid requests and native/engine/cleanup failures
 remains; this is not a blanket conversion of host faults to busy. Numeric
 budgets and the exact public result shape remain API work.
+
+### D-54. Consume each accepted request result once
+
+**Delivery:** M1.
+
+Owner answer, **2026-10-22 00:56:04 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: take once (Rec.)
+
+Authenticated relay: `het-manager`, message `2p4yvv5bptcvdzmq3f8q7xd2kw`,
+posted **2026-10-22 00:56:04.216 UTC** in `#het-luafirst`, replying to Q-6k
+message `f6jg35gjwt3c6k7w2xieneekkn`.
+
+Accept P-51's A: ready checks without consuming; take reports pending without
+consuming, then returns a terminal result once and ends the request handle.
+Wait suspends cooperatively without taking and is forbidden in init/shutdown.
+Only the requesting instance uses the request; consumed/foreign-handle use
+retains the host call-fault behavior. Taking a successful result does not
+release its resource lease. Capacity frees only after terminal consumption
+and provider retirement, with automatic cleanup of uncollected results at
+instance/session end. Required-failure timing and busy admission stay as decided.
+
+The manager presented the authoring cost of taking every terminal result,
+including cancellations. The owner chose A rather than a repeat-readable
+result object with a dispose lifetime. Module exports are not one-shot request
+results; their import/cache contract remains separate.
 
 ## Proposals
 
@@ -4229,7 +4257,7 @@ behavior the existing API can be assumed to provide.
 
 ### P-51. Consume each accepted request's terminal result once
 
-**Unapproved; active checkpoint Q-6k. Delivery: M1.** Recommend A: reuse the
+**A accepted by D-54 through Q-6k. Delivery: M1.** Recommend A: reuse the
 host's `ready`, `take`, `wait` and `cancel` behavior for accepted data/texture/
 window requests, under the new integration's namespace/result schemas. D-53's
 busy response contains no request handle and is not a pending request. A
@@ -4291,6 +4319,58 @@ and `Hetoimasia.Scripting.Lua.Request.requestBindings` implement these four
 operations, including pending takes and terminal handle retirement. D-52/D-53's
 required-failure and busy-admission policies still require new integration work;
 reusing result operations does not claim those changes already exist.
+
+### P-52. Data loading returns a bounded copy of the file's bytes
+
+**Unapproved; active checkpoint Q-6l. Delivery: M1.** Recommend A: a data-file
+request reads one scoped content file and succeeds with its complete bytes as
+a Lua string. Preserve bytes exactly, including embedded zero bytes, invalid
+UTF-8, byte-order marks and line endings; do not decode, normalize, parse or
+execute the file. Paths/IDs remain validated text. Both logical and presentation
+instances use this data service under their existing result timing and grants.
+
+Use D-10/D-11's startup identity/fingerprint and no-link path rules on the
+actual bytes read. Enforce the data-file/result size bound while reading and
+before exposing the result, including the request envelope's overhead. An
+oversized file fails as a bounded content result under D-12/D-52, not as a
+truncated success or a temporary admission-busy response. Exact limits belong
+to the common budgets/API specification. D-53 admission and D-54 consumption,
+cancel/wait rules remain unchanged.
+
+Each request reads/verifies its own bytes; M1 introduces no engine data-file
+cache or open-file/stream handle for Lua. On take, Lua receives an ordinary
+copied string, with no native resource lease to release. Native file handles,
+buffers and request accounting retire through the provider's cleanup. The
+string Lua retains afterwards has ordinary Lua memory lifetime; per-result
+limits are not a bound on all memory a trusted script may retain. Authors may
+cache or parse their own data using pure Lua and the already approved module
+mechanism, without granting ambient filesystem access.
+
+This is data input, not another script-loading route. D-5's removed `load`,
+`loadfile`, `dofile` and package mechanisms stay removed; Lua source evaluation
+uses the separate engine module loader with D-7/D-8's identity/effect rules.
+No JSON schema, serialization framework, gameplay state store, saved-data
+writer or general file I/O is added by this result type.
+
+Alternative B provides an engine-parsed structured format, such as JSON,
+alongside or instead of raw bytes. It gives authors ready-to-use tables but
+requires a chosen format and contracts for null, integer/float range, duplicate
+keys, nesting/size bounds and failure locations. If chosen, present that exact
+format/value contract for signoff rather than inferring it from the deferred
+state-store decisions. Byte loading alone does not rule out a later parser
+service or authored pure-Lua parser.
+
+A is recommended because it completes reusable scoped data access without
+coupling the engine to a game's data format. Its cost is explicit: Lua authors
+must validate text encoding and parse structured data themselves, and repeated
+requests repeat I/O/copying. Qualification covers byte-for-byte results with
+NUL/non-UTF-8 content, empty files, exact/over-limit sizes, changed content,
+required/optional failures and provider cleanup on cancellation.
+
+Evidence: the [Lua value boundary](../../packages/scripting-lua/README.md)
+already distinguishes byte-string and UTF-8-text schemas over Lua's string
+type and bounds copied values. The scoped filesystem provider and result-size
+accounting are new M1 integration work; no existing ambient Lua I/O is reused.
 
 ## Open questions
 
@@ -4629,10 +4709,15 @@ D-52; native/engine/cleanup failures are not relabelled busy.
 
 #### Q-6k. Consume a request result once or keep a repeat-readable request object?
 
-**Active checkpoint, P-51.** A (recommended): `ready`/`take`/`wait`/`cancel`,
-one terminal consumption, then retain the returned data/resource independently.
-B: repeat-readable result with a new explicit forget/dispose lifetime. Both
-must preserve instance ownership and bounded storage through provider retirement.
+Resolved by D-54: P-51's A, `ready`/`take`/`wait`/`cancel` with one terminal
+consumption, retaining returned data/resources under their own lifetimes.
+Repeat-readable request objects with a dispose lifetime were not chosen.
+
+#### Q-6l. Does a data-file request return bytes or engine-parsed structured data?
+
+**Active checkpoint, P-52.** A (recommended): a bounded byte-for-byte Lua string,
+no parsing/execution, cache or open-file handle. B: design a parsed format/value
+contract now. Both preserve scoped reading, content checks and result timing.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
