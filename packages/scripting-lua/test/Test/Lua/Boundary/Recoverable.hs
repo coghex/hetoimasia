@@ -24,7 +24,7 @@ import Data.Text.Encoding (encodeUtf8)
 import Data.Text.Unsafe (lengthWord8)
 import Data.Word (Word64)
 import GHC.Conc (getAllocationCounter)
-import Hetoimasia.Scripting.Lua.Internal.Binding (argumentReason)
+import Hetoimasia.Scripting.Lua.Internal.Binding (argumentReason, ordinaryRule)
 import Hetoimasia.Scripting.Lua.Internal.Owner
   ( OwnerConfig (..)
   , defaultOwnerConfig
@@ -617,6 +617,7 @@ disciplineSpec = describe "discipline" $ do
                 { ownerBudget = Just budget
                 , ownerRegistration = registrationOf fx
                 , ownerGranted = ["checked", "plain"]
+                , ownerLimits = either (error . show) id (valueLimits 65536 64 4096)
                 }
             )
             $ \owned → do
@@ -625,8 +626,10 @@ disciplineSpec = describe "discipline" $ do
                 [ ("caught", "assert(pcall(checked.add, 1.5, 2) == false)")
                 , ("arity", "assert(pcall(checked.echo_list) == false)")
                 , ("valid", "assert(checked.add(1, 2) == 3)")
-                , -- Valid, and under pcall: the interpreter or host running out of what the copy needs is a fault of the call, never an ordinary error pcall hides.
-                  ("copy", "local ok, err = pcall(checked.echo_list, {1, 2, 3, 4, 5, 6, 7, 8}); assert(ok, tostring(err))")
+                , -- Under pcall, and deep enough that reading it has to grow the stack: the
+                  -- copy running out of stack is a fault of the call, never an ordinary
+                  -- error pcall hides, and what is refused for its type is the ordinary one.
+                  ("deep", "local t = 1; for i = 1, 30 do t = {t} end; local ok, err = pcall(checked.echo_list, t); assert(ok == false and err:find('expected number', 1, true), tostring(err))")
                 , ("busy", "checked.admit(1)")
                 ]
                 $ \(label, source) → do
@@ -643,7 +646,7 @@ disciplineSpec = describe "discipline" $ do
     kinds `shouldSatisfy` elem "caught:ok"
     -- Memory ran out where the refusal was built, and was a fault of the call.
     kinds `shouldSatisfy` elem "caught:memory at the boundary"
-    kinds `shouldSatisfy` any (Text.isPrefixOf "copy:memory")
+    kinds `shouldSatisfy` elem "deep:memory at the boundary"
 
 classified ∷ Either SomeException a → Text
 classified = \case
@@ -652,7 +655,6 @@ classified = \case
     | Just (fault ∷ LuaFault) ← fromException failure, faultKind fault == MemoryExhausted → "memory in Lua"
     | Just (fault ∷ BoundaryFault) ← fromException failure → case boundaryReason fault of
         ScriptFailed MemoryExhausted _ → "memory at the boundary"
-        ValueRefused found | refusalRule found `elem` [RuleStack, RuleMemory] → "memory reading the copy"
         other → "unclassified " <> Text.pack (show other)
     | otherwise → "unclassified " <> Text.pack (show failure)
 
@@ -682,6 +684,16 @@ reasonSpec = describe "a refusal's reason" $ do
       fmap refusalRule (refusal fault) `shouldBe` Just (RuleBytesLimit refusalReasonLimit)
       (before - after) `shouldSatisfy` (< 2000000)
       logged fx >>= (`shouldBe` [])
+
+  it "makes every rule of a script's own value an ordinary error, and keeps the interpreter's running out of what the copy needs a fault" $ do
+    let rules =
+          [ RuleBytesLimit 1, RuleDepthLimit 1, RuleElementLimit 1, RuleCycle, RuleUnsupportedType "function", RuleMetatable
+          , RuleKeyType, RuleWrongType "a" "b", RuleFloatForInteger, RuleInvalidUtf8, RuleNilInTable, RuleNotASequence
+          , RuleNotARecord, RuleUnknownField "f", RuleMissingField "f", RuleDuplicateField "f", RuleArity 1 2
+          , RuleForeignHandle, RuleHandleType "a" "b", RuleRetiredHandle "a", RuleUnknownCapability "a"
+          ]
+    forM_ rules $ \rule → ordinaryRule rule `shouldBe` True
+    forM_ [RuleStack, RuleMemory] $ \rule → ordinaryRule rule `shouldBe` False
 
   it "says nothing past the bound of anything the script gave, whatever its names are" $ do
     let giant = Text.replicate 100000 "n"
