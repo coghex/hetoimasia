@@ -64,7 +64,7 @@ module Hetoimasia.Scripting.Lua.Request
 
 import Control.Concurrent.STM (atomically)
 import Control.Exception (mask, mask_, rethrowIO)
-import Control.Monad (unless)
+import Control.Monad (unless, void)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import GHC.Stack (HasCallStack)
@@ -138,7 +138,7 @@ startRequest context name arguments afterCompletion = do
     handed ← guarded (restore (endpointSubmit endpoint (Submission arguments completion info)))
     case handed of
       Left failure → do
-        atomically (withdrawAdmission service (admittedIdentity found))
+        void (atomically (withdrawAdmission service (admittedIdentity found)))
         rethrowIO failure
       Right provided → do
         atomically (commitSubmitted service (admittedIdentity found) provided [afterCompletion])

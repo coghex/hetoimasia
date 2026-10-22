@@ -45,10 +45,11 @@ module Hetoimasia.Scripting.Lua.Provider.Serve
 
 import Control.Concurrent.STM (STM, atomically, retry)
 import Control.Exception
-  ( ExceptionWithContext
+  ( ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , mask_
   , rethrowIO
+  , someExceptionContext
   , tryWithContext
   , uninterruptibleMask_
   )
@@ -253,11 +254,17 @@ providerBoundary service scheduler hasInstances leaseHost evidence onCleanupFail
   discarded ← discardAdopted service leaseHost
   defects ← atomically (takeDefects service)
   defective ← forM defects defectOf
+  -- A provider's credit release that raised is cleanup evidence: fatal under every policy.
+  released ← atomically (takeCleanup service)
+  let cleanupEvidence = [("lua credit release", ExceptionWithContext (someExceptionContext one) one) | one ← released]
+  unless (null cleanupEvidence) $ do
+    modifyIORef' evidence (<> cleanupEvidence)
+    onCleanupFailure
   served ← if hasInstances then pure False else serveWatchOnly service scheduler
   woke ← atomically (ticksWakeSettled (psTicks service) (settledNumber service))
   after ← atomically (workPendingCount service)
   raiseFirst evidence "lua provider boundary" (defective <> adopted <> discarded <> swept <> told)
-  pure (woke || served || before /= after || not (null cleanup) || adopting || not (null defects))
+  pure (woke || served || before /= after || not (null cleanup) || adopting || not (null defects) || not (null released))
 
 -- | Whether the owner has anything to do for its requests, and a wait to compose into its
 -- wait for work: a task whose request has settled, a provider's account that is no longer

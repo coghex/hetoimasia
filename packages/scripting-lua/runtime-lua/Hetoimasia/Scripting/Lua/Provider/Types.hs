@@ -866,6 +866,9 @@ data PState = PState
     -- ^ The resource replies the owner has yet to build into their leases.
   , pDefects ∷ ![Text]
     -- ^ The provider defects the owner has yet to raise, oldest first, each bounded.
+  , pCleanup ∷ ![SomeException]
+    -- ^ The failures of providers' credit releases on the owner's thread, oldest first, at most sixteen:
+    -- cleanup evidence the owner keeps at its next boundary, fatal as any is.
   , pDiscards ∷ ![(Word64, Word64)]
     -- ^ The adopted leases, by instance and key, of requests that settled without delivering the
     -- resource to their script (cancelled, or ended by an epoch): nothing can reach them, and the

@@ -62,6 +62,7 @@ module Hetoimasia.Scripting.Lua.Provider.State
   , takeTerminal
   , releaseSettled
   , takeDefects
+  , takeCleanup
   , takeDiscards
   , takePendingAdoptions
   , finishAdoption
@@ -380,6 +381,7 @@ newProviderState owner label key limits grant endpoints subscriptions ticks inst
         , pHeld = Map.empty
         , pAdopting = Map.empty
         , pDefects = []
+        , pCleanup = []
         , pDiscards = []
         , pForget = Map.empty
         }
@@ -617,16 +619,22 @@ commitSubmitted service identity provided disposals = do
 -- is settled or invalidated, and the capacity is free again, every bank the opt-in admission
 -- reserved with it included: the credits are returned unused, the reserved lease discharged, the
 -- places in the ledger given back and a resource reply it had already received dropped.
-withdrawAdmission ∷ ProviderState → RequestId → STM ()
+--
+-- A credit whose release raises does not keep the rest from being taken back: each release is its
+-- own undoable step, the removal of the unsubmitted work and of everything independent of the credit
+-- is committed whatever it raised, and what was raised is answered, for the caller to keep beside
+-- the failure that made the withdrawal necessary.
+withdrawAdmission ∷ ProviderState → RequestId → STM [SomeException]
 withdrawAdmission service identity = do
   st ← readTVar (psVar service)
   let gated = Map.lookup identity (pRecs st) >>= recGated
   mapM_ (ticksRelease (psTicks service)) gated
-  case Map.lookup identity (pHeld st) of
-    Nothing → pure ()
+  failures ← case Map.lookup identity (pHeld st) of
+    Nothing → pure []
     Just held → do
-      forM_ (heldCredits held) (`creditRelease` CreditUnused)
+      released ← forM (heldCredits held) (\credit → releaseCredit credit CreditUnused)
       forM_ ((,) <$> psLeases service <*> heldLease held) (uncurry abandon)
+      pure (catMaybes released)
   writeTVar (psVar service) st
     { pSession = withdrawRequest identity (pSession st)
     , pRecs = Map.delete identity (pRecs st)
@@ -636,6 +644,13 @@ withdrawAdmission service identity = do
     , pHeld = Map.delete identity (pHeld st)
     , pAdopting = unclaimed (Map.delete identity) (pAdopting st)
     }
+  pure failures
+
+-- | Give a credit back, once: what the provider's release raises is answered and not raised, with
+-- what the release wrote undone, so one provider's failure never keeps another's credit, a lease or a
+-- place charged.
+releaseCredit ∷ Credit → CreditEnd → STM (Maybe SomeException)
+releaseCredit credit end = (Nothing <$ creditRelease credit end) `catchSTM` (pure . Just)
 
 -- The opt-in admission ----------------------------------------------------------------
 
@@ -907,7 +922,9 @@ releaseSettled service = do
           else pure held
       if reaped && isNothing record
         then do
-          forM_ (heldCredits held') (`creditRelease` CreditSettled)
+          released ← forM (heldCredits held') (\credit → releaseCredit credit CreditSettled)
+          unless (null (catMaybes released)) $
+            modifyTVar' (psVar service) (\now → now {pCleanup = take defectLimit (pCleanup now <> catMaybes released)})
           pure kept
         else pure (Map.insert identity held' kept)
 
@@ -929,6 +946,13 @@ takeDiscards service = do
   st ← readTVar (psVar service)
   writeTVar (psVar service) st {pDiscards = []}
   pure (pDiscards st)
+
+-- | The failures of providers' credit releases the owner has yet to keep as cleanup evidence, taken.
+takeCleanup ∷ ProviderState → STM [SomeException]
+takeCleanup service = do
+  st ← readTVar (psVar service)
+  writeTVar (psVar service) st {pCleanup = []}
+  pure (pCleanup st)
 
 -- | The provider defects the owner has yet to raise, taken, oldest first.
 takeDefects ∷ ProviderState → STM [Text]
@@ -958,7 +982,16 @@ finishAdoption service identity adopting = do
         Just record → isNothing (recEnded record) && maybe False (isNothing . requestSettlement) (Map.lookup identity (sessionRequests (pSession st)))
         Nothing → False
   if not waiting
-    then Nothing <$ writeTVar (psVar service) st {pAdopting = Map.delete identity (pAdopting st)}
+    then -- The request is no longer waiting for it, but the resource was built: its credits that
+         -- transfer are the resource's from here, whatever becomes of it, and the lease it was
+         -- built into is released by the caller, which returns them.
+      Nothing
+        <$ writeTVar
+          (psVar service)
+          st
+            { pAdopting = Map.delete identity (pAdopting st)
+            , pHeld = Map.adjust (\held → held {heldLease = Nothing, heldCredits = filter (not . creditTransfers) (heldCredits held)}) identity (pHeld st)
+            }
     else do
       writeTVar (psVar service) st
         { pRecs = Map.adjust (\record → record {recAdopted = True}) identity (pRecs st)
@@ -1033,12 +1066,13 @@ checkReplyFor limits schema ask reply = case ask of
       other → other
     optedIn opted = case reply of
       ProviderFailure _ → pure (CheckedDefect "the provider answered a failure with no code its service supplies")
-      ProviderExpected found → pure (expected opted found)
+      ProviderExpected found → guardedVerdict (expected opted found)
       ProviderResult value → result opted value Nothing
       ProviderResource value recipe → result opted value (Just recipe)
     result opted value recipe = do
       let frame found = admitSuccessFrame opted (maybe found (\make → make found 0) (admitCombine opted))
-          withinCeilings found = either (const False) (const True) (valuesFootprint (admitReplyLimits opted) [found])
+          -- The ceilings are the crossing's: the complete record a script is handed.
+          withinCeilings found = fitsLimits (admitReplyLimits opted) (frame found)
       judged ← judgeWith frame withinCeilings limits schema (ProviderResult value)
       pure $ case judged of
         CheckedResult bytes found → case recipe of
@@ -1052,13 +1086,22 @@ checkReplyFor limits schema ask reply = case ask of
       | any (longerThan (admitPathBytes opted)) (catMaybes [expectedRoot found, expectedPath found]) = CheckedDefect "the provider answered a failure whose root or path is over its bound"
       | otherwise = maybe (CheckedDefect "the provider answered a failure whose envelope cannot be delivered within the limits") CheckedExpected (fitFailure opted found)
     longerThan bound text = ByteString.length (Encoding.encodeUtf8 text) > bound
+    -- The verdict on a failure is evaluated here, inside the guard, as a result's is: a field that
+    -- throws when it is first looked at is a provider defect, and an asynchronous exception is
+    -- never taken for one.
+    guardedVerdict verdict =
+      guarded (pure verdict) >>= \case
+        Right found → pure found
+        Left failure@(ExceptionWithContext _ raised)
+          | Just (async ∷ SomeAsyncException) ← fromException raised → throwIO async
+          | otherwise → CheckedDefect . ("the provider answered a failure that could not be evaluated: " <>) . Text.take 200 <$> renderCaught failure
     -- The failure's envelope as a script is handed it must fit the owner's ceilings. A message
     -- that makes it too long is cut at a character, visibly, until it does.
     fitFailure opted found = go (admitMessageBytes opted)
       where
         go bound =
           let candidate = found {expectedMessage = truncateVisibly bound (expectedMessage found)}
-           in if fitsLimits limits (admitFailureFrame opted candidate)
+           in if fitsLimits limits (admitFailureFrame opted candidate) && fitsLimits (admitReplyLimits opted) (admitFailureFrame opted candidate)
                 then Just candidate
                 else if bound <= 0 then Nothing else go (bound `div` 2)
 
@@ -1167,6 +1210,11 @@ replyTo service identity checked = do
       unsettled = maybe False (isNothing . requestSettlement) (Map.lookup identity (sessionRequests session))
       record = Map.lookup identity (pRecs st)
   case (checked, record) of
+    -- A reply that comes while a resource reply is waiting to be built is a duplicate whatever it
+    -- is: the first accepted completion is the one, and nothing replaces it.
+    _ | Map.member identity (pAdopting st) → do
+          writeTVar (psVar service) st {pCounts = (pCounts st) {countDuplicateHeld = countDuplicateHeld (pCounts st) + 1}}
+          pure ReplyLate
     (CheckedDefect why, Just _)
       | unsettled → do
           writeTVar (psVar service) $
@@ -1789,7 +1837,7 @@ workWaiting service = do
       polling = [obligation | work ← works, workWantsCancel work, not (workEnded work), isNothing (workFailure work), obligation ← retainedObligations (workRetained work)]
   changed ← forM polling $ \obligation →
     (\reading → case reading of ProviderPending → False; _ → True) <$> pollObligation obligation
-  pure (over || untold || or changed || any (not . adoptingClaimed) (Map.elems (pAdopting st)) || not (null (pDefects st)) || not (null (pDiscards st)))
+  pure (over || untold || or changed || any (not . adoptingClaimed) (Map.elems (pAdopting st)) || not (null (pDefects st)) || not (null (pCleanup st)) || not (null (pDiscards st)))
 
 -- Reading --------------------------------------------------------------------------------
 

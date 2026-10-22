@@ -39,6 +39,7 @@ module Test.LuaRuntime.Admission.Support
   , updateAdmitter
   , initWaiter
   , shutdownStarter
+  , oneShotStarter
 
     -- * Owners
   , acmdSource
@@ -85,7 +86,7 @@ import Hetoimasia.Scripting.Lua.Value
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfLog), defaultSchedulerBounds, schedRegistration, startScheduled)
-import Test.LuaRuntime.Support (failExample)
+import Test.LuaRuntime.Support (Gated (..), failExample)
 
 -- The fixture --------------------------------------------------------------------------------
 
@@ -501,6 +502,17 @@ shutdownStarter =
          , "end"
          ]
 
+-- | A one-shot instance whose @run@ starts a request and returns.
+oneShotStarter ∷ ModuleSource
+oneShotStarter =
+  hooksModule
+    "oneshotstarter"
+    [ "function run(self, api)"
+    , "  local r, err = ad.start('path', 1, nil)"
+    , "  fx.record('run started ' .. tostring(r ~= nil))"
+    , "end"
+    ]
+
 -- Owners ---------------------------------------------------------------------------------------
 
 -- | The commands an instance is told, as a record.
@@ -577,10 +589,10 @@ acommandWith fixture owner name op key endpoint n offset = do
     DeliveryAccepted _ → pure ()
     other → failExample ("expected the command accepted, found " <> show other)
 
--- | The provider proves every piece of work over, and the examples that leave something
--- outstanding end however they end.
+-- | The provider proves every piece of work over and every gate a script is held at goes on, however the
+-- example ends, so a failing example unwinds instead of leaving the owner inside a call it waits for.
 settleAll ∷ AFix → IO a → IO a
-settleAll fixture body = body `finally` finishAll (afFake fixture)
+settleAll fixture body = body `finally` (openAllGates (afBase fixture) >> finishAll (afFake fixture))
 
 -- Reading ---------------------------------------------------------------------------------------
 

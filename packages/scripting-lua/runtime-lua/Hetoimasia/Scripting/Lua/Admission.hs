@@ -104,7 +104,7 @@ module Hetoimasia.Scripting.Lua.Admission
   ) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Exception (mask, mask_, rethrowIO)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), mask, mask_, rethrowIO, someExceptionContext)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Data.Word (Word64)
@@ -175,11 +175,11 @@ startAdmitted context ask name arguments afterCompletion = do
             -- Taking the admission back runs the provider's credit releases: one that raises is
             -- kept beside the failure that made it necessary, which stays the primary.
             withdrawn ← guarded (atomically (withdrawAdmission service (admittedIdentity found)))
-            case withdrawn of
-              Right () → rethrowIO failure
-              Left secondary → do
-                composed ← composeCleanup (Just failure) [("lua credit release", secondary)]
-                maybe (rethrowIO failure) rethrowIO composed
+            let secondaries = case withdrawn of
+                  Right raised → [("lua credit release", ExceptionWithContext (someExceptionContext one) one) | one ← raised]
+                  Left other → [("lua credit release", other)]
+            composed ← composeCleanup (Just failure) secondaries
+            maybe (rethrowIO failure) rethrowIO composed
           Right provided → do
             atomically (commitSubmitted service (admittedIdentity found) provided [afterCompletion])
             -- A request revoked while the provider was being handed it has interest to withdraw

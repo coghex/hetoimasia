@@ -91,6 +91,16 @@ spec = describe "failure" $ do
           (bytesOf [(CopiedValueBytes, 64), (DataBytes, 64), (SceneInputBytes, 64)])
           (ProviderResult (VText (Text.replicate 200 "x")))
       , Defect
+          "a list whose value fits the byte bound but whose complete success record does not"
+          "ints"
+          (bytesOf [(CopiedValueBytes, 64), (DataBytes, 64), (SceneInputBytes, 64)])
+          (ProviderResult (VList [VInteger 1, VInteger 2]))
+      , Defect
+          "a failure whose complete record passes the byte bound"
+          "data"
+          (bytesOf [(CopiedValueBytes, 64), (DataBytes, 64), (SceneInputBytes, 64)])
+          (ProviderExpected (ExpectedFailure "not_found" "m" Nothing Nothing))
+      , Defect
           "a list over the copied-value element bound"
           "ints"
           (counts [(SceneSprites, 1), (CopiedValueElements, 12)])
