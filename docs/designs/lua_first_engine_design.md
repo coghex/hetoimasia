@@ -77,7 +77,7 @@ concrete precondition
 - [x] LFE-13. Coordinate role startup gates, failure policy and session stop — [#527]
 - [x] LFE-26. Expose UI status, quit and the unavailable-state guard — [#528]
 - [x] LFE-14. Preflight static PNG structure and bounded inflation — [#529]
-- [ ] LFE-15. Decode the approved PNG variants within accounted workspace
+- [x] LFE-15. Decode the approved PNG variants within accounted workspace — [#530]
 - [ ] LFE-16. Own texture pipeline lanes, leases and byte reservations
 - [ ] LFE-17. Finish texture requests through real GPU readiness
 - [ ] LFE-18. Create and retire instance-owned windows asynchronously
