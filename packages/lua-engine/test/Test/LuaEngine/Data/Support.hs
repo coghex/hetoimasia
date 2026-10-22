@@ -43,6 +43,7 @@ module Test.LuaEngine.Data.Support
   , Timing (..)
   , Vm (..)
   , startVm
+  , startVmWith
   , vmDiagnostics
   , awaitVmDiagnostic
   , awaitCharged
@@ -62,6 +63,8 @@ module Test.LuaEngine.Data.Support
   , requestFailureOf
   , awaitPhase
   , awaitGate
+  , holdUntilReleased
+  , releaseHeld
   , poolReading
   , awaitPool
 
@@ -385,7 +388,13 @@ handleType = "dreq"
 -- | A VM over the session's pool: its own byte bank (the profile's per-VM limit) and handle
 -- registry, one owner on this timing. The pool and its workers are the session's.
 startVm ∷ Session → LuaRuntime → Text → Timing → IO Vm
-startVm session runtime label timing = do
+startVm session = startVmWith session id
+
+-- | The same, with the endpoint the grant names wrapped by the example: a wrapper that observes or
+-- holds the provider's completion from outside it. The wrapper is the example's, and says so where
+-- it is used.
+startVmWith ∷ Session → (RequestEndpoint → RequestEndpoint) → LuaRuntime → Text → Timing → IO Vm
+startVmWith session wrap runtime label timing = do
   handles ← newRequestHandles
   requests ← either (\refused → assertFailure ("the profile was refused: " <> show refused)) pure (m1Requests (ssProfile session) handles)
   bank ← newByteBankFor (ssProfile session)
@@ -407,7 +416,7 @@ startVm session runtime label timing = do
           }
       grant =
         RequestGrant
-          [dataEndpoint service]
+          [wrap (dataEndpoint service)]
           64
           (if timing == OnArrival then SettleOnArrival else SettleAtAssignedTick Nothing)
       spec =
@@ -503,6 +512,15 @@ openGates ∷ Session → IO ()
 openGates session = do
   held ← readIORef (ssGates session)
   mapM_ (void . (`tryPutMVar` ())) held
+
+-- | Hold the calling thread (a worker, from a wrapper the example wrote) until the example releases
+-- the name. Every name is released when the example ends however it ends.
+holdUntilReleased ∷ Session → Text → IO ()
+holdUntilReleased session name = gateIn (ssGates session) name >>= readMVar
+
+-- | Release a thread held by 'holdUntilReleased'.
+releaseHeld ∷ Session → Text → IO ()
+releaseHeld session name = gateIn (ssGates session) name >>= void . (`tryPutMVar` ())
 
 -- | Wait until a script is inside the call that holds this gate.
 awaitGate ∷ Session → Text → IO ()

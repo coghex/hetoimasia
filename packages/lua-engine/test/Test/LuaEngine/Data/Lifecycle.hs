@@ -15,6 +15,7 @@ import Hetoimasia.Content.ReadPool (PoolStatus (..))
 import Hetoimasia.LuaEngine.Profile (CountLimit (..), fixedM1Profile)
 import Hetoimasia.Scripting.Lua.Instance (InstanceTicket, pollInstance, waitInstance)
 import Hetoimasia.Scripting.Lua.Provider (ProviderDiagnostics (..))
+import Hetoimasia.Scripting.Lua.Provider (Completion (..), RequestEndpoint (..), Submission (..))
 import Hetoimasia.Scripting.Lua.Scheduled (retireScheduled)
 import Test.Hspec
 import Test.LuaEngine.Data.Support
@@ -98,6 +99,34 @@ cancelling = describe "cancelling" $ do
       command session vm "i" "kept" "a"
       awaitNote session "cmd kept a bytes(64)=010101010101010101010101010101010101010101010101"
 
+  it "accounts a taken result at the owner's boundary even while its worker is still inside the sink: the claim on the slot has ended, retirement is the worker's own (a wrapper holds the worker after the reply was accepted)" $
+    withSession fixedM1Profile (1, 2) realReader layout $ \session _ runtime → do
+      let holding endpoint =
+            endpoint
+              { endpointSubmit = \submission →
+                  endpointSubmit
+                    endpoint
+                    submission
+                      { submissionCompletion = Completion $ \reply → do
+                          answer ← completeRequest (submissionCompletion submission) reply
+                          note session "published"
+                          holdUntilReleased session "worker" >> pure answer
+                      }
+              }
+      vm ← startVmWith session holding runtime "held worker" OnArrival
+      admitDriver session vm "i"
+      start session vm "i" "a" "f1.bin" Nothing
+      awaitNote session "published"
+      -- The reply was accepted and the worker is held inside the sink: the request can be taken.
+      command session vm "i" "wait_take" "a"
+      line ← lineStarting session "cmd wait_take a "
+      line `shouldSatisfy` textInfix "status=success"
+      -- The bytes and the slot are accounted at the owner's boundary though the job is not done.
+      awaitCharged vm 0
+      awaitPool session (\s → statusReserved s == 0 && statusActive s == 1 && statusLive s == 0)
+      releaseHeld session "worker"
+      awaitPool session (\s → statusActive s == 0)
+
   it "still completes and cancels with every place of the instance held: completions need no free request slot" $
     withSession (counts [(RequestsPerInstance, 2)]) (1, 4) realReader layout $ \session _ runtime → do
       vm ← startVm session runtime "full" OnArrival
@@ -136,8 +165,13 @@ teardown = describe "teardown" $ do
       awaitVmDiagnostic vm (\d → rdHeld d >= 1)
       pollInstance ticket >>= (`shouldSatisfy` isNothing)
       charged vm `shouldReturn` 192
+      -- What the work of a request borrowed is disposed of once that work is over: the two finished
+      -- requests' disposals have run, and the disposal of the read still inside the reader has not.
+      awaitHistory session (\seen → length (filter (== "disposed") seen) >= 2)
+      length . filter (== "disposed") <$> history session `shouldReturn` 2
       openGate (ssProbe session) "f1.bin"
       awaitSettled ticket
+      awaitHistory session (\seen → length (filter (== "disposed") seen) == 3)
       -- The instance's pending and unconsumed data are gone; its peer's result is untouched.
       awaitCharged vm 64
       command session vm "j" "wait_take" "c"
