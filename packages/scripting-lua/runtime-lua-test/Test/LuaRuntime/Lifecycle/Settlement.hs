@@ -17,7 +17,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Lifecycle.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEntered, releaseGate, awaitScheduledTerminal)
-import Test.LuaRuntime.Support (Gated (..), bounded, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (Gated (..), bounded, cancelPending, withBoundary, withBoundaryOpening)
 
 takenAs ∷ Int → Text
 takenAs number = "{accepted=true,receipt=" <> Text.pack (show number) <> "}"
@@ -120,7 +120,9 @@ spec = describe "settlement" $ do
       holdOwner targetFx owner
       ask callerFx caller "cmdr" "pause" (Just tid) Nothing >>= (`shouldBe` takenAs 0)
       -- Cancelled while the owner is inside a segment: what had been accepted is not applied.
-      cancelScheduled owner
+      -- The cancellation is delivered by a helper thread that is not ordered with the
+      -- release, so the segment is let go only once it is pending against the owner.
+      cancelPending (cancelScheduled owner)
       releaseOwner targetFx
       void (awaitScheduledTerminal control owner)
       first ← receiptResult callerFx caller "cmdr" 0

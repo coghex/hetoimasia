@@ -145,8 +145,13 @@ spec = describe "host failures" $ do
       inflight ← submit endpoint "block_call" [VText "go"] >>= accepted
       awaitEntered fixture "go"
       queued ← forM [1, 2 ∷ Int] $ \n → submit endpoint "echo" [VInteger (fromIntegral n)] >>= accepted
-      cancelOwner owner
       -- A cancellation is never delivered inside Lua: it lands when the call returns.
+      -- It is delivered by a helper thread that is not ordered with the release, and
+      -- a call let go before that helper has begun its delivery returns as an ordinary
+      -- one: there is nothing pending to land, the owner takes the stop request
+      -- recorded with the cancellation, and ends as stopped. So the call is let go only
+      -- once the cancellation is pending against the owner that holds it.
+      cancelPending (cancelOwner owner)
       releaseGate fixture "go"
       awaitTerminal control owner >>= (`shouldSatisfy` \case WorkerStopped → True; _ → False)
       settleOutcome inflight >>= (`shouldSatisfy` isDiscard ExitCancelled Started)
