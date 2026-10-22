@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-62/Q-6m: the M1 texture-file profile.
+The current checkpoint is P-63/Q-6n: scene colour and rectangle values.
+D-65 accepts static PNG colour textures with one level and no animation/options.
 D-64 accepts hard-linked files and mounted subtrees with per-path identity.
 D-63 accepts resolving the launch path once and retaining the actual root owner.
 D-62 accepts whole-folder startup hashing and exact-byte verification on loads.
@@ -1955,6 +1956,31 @@ refusals remain, with no hostile-OS containment claim.
 The manager presented outside aliases, scan time and repeated work as the
 cost. The owner chose this over rejecting hard links and mount crossings.
 Native qualification and numerical bounds remain delivery work.
+
+### D-65. M1 Lua textures accept static PNG colour images only
+
+**Delivery:** M1; narrow Lua profile over the real image/upload services.
+
+Owner answer, **2026-10-22 02:17:12 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: static PNG (Rec.)
+
+Authenticated relay: `het-manager`, message `pqsdzx9m3tmdcjsan8zups66ta`,
+posted **2026-10-22 02:17:12.713 UTC** in `#het-luafirst`, replying to Q-6m
+message `fajw2wqpz59cir8chyguugrfn6`.
+
+Accept P-62's A: recognize static PNG by its verified bytes and use the existing
+colour decoder to produce one RGBA8 sRGB level with linear-light premultiplied
+alpha. Refuse animation-marked PNGs; non-PNG, malformed and oversized images
+follow the required/optional content-failure rules. No generated mipmaps,
+HDR/data-texture/colour options or animation playback are exposed in M1 Lua.
+
+Readiness, ownership, cancellation and provider bounds remain as specified in
+P-62 and D-47/D-48/D-50. The manager presented PNG export, uncompressed storage
+and no mip-assisted downscaling as costs. The owner chose PNG alone over PNG
+plus KTX2. Existing Haskell KTX2/BC7/mip features remain available; this is a
+Lua-surface restriction, not their removal.
 
 ## Proposals
 
@@ -5288,7 +5314,7 @@ describes mounted subtree relationships. Neither is a symbolic-link traversal.
 
 ### P-62. Expose static PNG colour textures for M1
 
-**Unapproved; active checkpoint Q-6m. Delivery: M1.** Recommend A: the Lua
+**A accepted by D-65 through Q-6m. Delivery: M1.** Recommend A: the Lua
 texture request accepts static PNG images through the existing `asset-image`
 PNG decoder, always as `ColourImage`. Select by the verified bytes' PNG
 signature, not the filename extension. There is no format hint, extension
@@ -5346,6 +5372,71 @@ existing [image codec contract](../../packages/asset-image/README.md) and
 and composed rendering evidence. The new signature dispatch, animation refusal,
 provider bounds and Lua lifecycle still need their own integration evidence;
 this design turn ran no decoder, GPU or native tests.
+
+### P-63. Use opaque sRGB byte colours and fractional logical-pixel rectangles
+
+**Unapproved; active checkpoint Q-6n. Delivery: M1.** Recommend A: an authored
+scene supplies an explicit opaque background colour as three whole numeric
+RGB values in `0..255`, interpreted as sRGB. Both Lua integer values and
+exactly integral floats in range are accepted; strings and fractional colour
+values are not coerced. For example, `(128, 128, 128)` is the familiar sRGB
+mid-grey value, not linear-light `0.5`. The binding converts those channels to
+linear light for the renderer's clear value and supplies alpha 1. The actual
+table keys/shape remain part of the consolidated API package.
+
+No authored background alpha or transparent-window feature is exposed in M1.
+PNG alpha still blends correctly over the opaque background under D-50/D-65.
+An empty sprite list is a valid background-only scene. Each published scene
+must provide its colour; there is no implicit inheritance from an older scene.
+Before the first publication, a window that is ready to draw uses opaque black
+and no sprites. This specifies engine-produced content, not an assurance that
+the OS has already displayed a frame when window creation reports ready.
+
+Shared rectangle proposal for either colour option: `x`, `y`, width and height
+are finite Lua numbers in D-50's logical-pixel units. Integers and fractions
+are accepted; positions may be negative or outside the window, and width and
+height must be strictly positive. Offscreen parts are clipped by the window's
+view rather than clamped, moved or resized by the Lua binding. A fully
+offscreen valid sprite is harmless. Zero/negative extents are errors, not a
+hide or mirror command. Remove a sprite from the next scene to hide it.
+
+Convert geometry to the renderer's single-precision representation with
+checked ranges and arithmetic; reject non-finite, out-of-bounds or collapsed
+geometry after conversion instead of silently accepting overflow/underflow.
+Fractional positions are not rounded to whole pixels and D-50's no-snap policy
+remains. Single-precision rounding and nearest sampling still affect rasterized
+edges; no exact arbitrary-precision positioning is promised. Concrete numeric
+coordinate/extent bounds join the forthcoming bounds package.
+
+Bad colour, geometry, unknown fields or invalid texture ownership/readiness
+refuse the entire publication as an ordinary Lua error under D-46, preserving
+the previous complete scene. No clamping, ignored bad sprite or partial update.
+The API package will enumerate the supported fields; this checkpoint establishes
+strict validation, not an open-ended scene table. A caught publication error
+leaves the instance usable; an uncaught error follows the normal UI failure
+policy. Engine/cleanup failures retain their existing authority.
+
+Alternative B uses three finite linear-light RGB values in `0..1` directly,
+still with fixed alpha 1 and the same geometry/validation/default-black rules.
+It matches the renderer's numerical clear input without conversion and allows
+finer authored background precision, but authors must convert ordinary sRGB
+colour-picker values themselves. Neither option adds HDR, tint controls or
+desktop transparency.
+
+A is recommended for Lua UI authors because common image-editor colours can
+be used directly and PNG/clear colour interpretation is explicit. Its cost is
+one defined conversion and 8-bit authored background precision; opaque-only
+backgrounds are the shared M1 restriction. Fractional rectangles support smooth
+authored motion but do not guarantee pixel-perfect edges at every scale.
+
+Qualification covers byte-grey clear against matching opaque PNG colour,
+transparent PNG over the background, initial black and empty scenes, fractional
+and negative positions, viewport clipping, zero/negative/NaN/infinite/overflow
+values, and whole-publication refusal retaining the old scene. The renderer's
+`ClearColour` contains four floats in `[0,1]`; its Vulkan adapter forwards them
+to the backend's linear clear (`Snapshot.hs`, `Vulkan/Frame.hs`, native
+`Recording/Layer.hs`). The binding's byte-colour conversion, opaque restriction
+and geometry preflight are new API behavior, not existing Lua features.
 
 ## Open questions
 
@@ -5759,11 +5850,18 @@ the manager's parser-library example adds no selected library deliverable.
 
 #### Q-6m. Static PNG colour textures alone or the existing KTX2 profile too?
 
-**Active checkpoint, P-62.** A (recommended): static PNG, fixed colour decoding,
-one RGBA8 sRGB level, no generated mips/options/animation; signature dispatch,
-bounds and normal content-failure handling. B: also expose the existing KTX2
-sRGB RGBA8/BC7 profile with authored levels and device fallback. A narrows the
-Lua surface only; existing Haskell codec/rendering features remain available.
+Resolved by D-65: P-62's A, static PNG with fixed colour decoding to one RGBA8
+sRGB level, no generated mips/options/animation, signature dispatch, bounds and
+normal content-failure handling. Existing Haskell codec features remain available.
+
+#### Q-6n. Author background colours as sRGB bytes or linear-light fractions?
+
+**Active checkpoint, P-63.** A (recommended): three whole sRGB values `0..255`,
+converted to linear clear with opaque alpha. B: three finite linear-light
+values `0..1`. Both propose explicit scene colour, initial opaque black,
+fractional finite logical-pixel rectangles with positive extents, strict checked
+conversion and atomic refusal of invalid publication. Exact table shapes and
+numeric geometry bounds follow in the API package.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
