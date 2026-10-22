@@ -107,12 +107,21 @@ def raw_data(pixels, depth, colour, interlace):
     return data
 
 
-def png(pixels, depth, colour, interlace=0, before_idat=(), idat_pieces=1, payload=None):
-    """A PNG of rows of pixel tuples; each tuple holds one value per channel."""
+def png(pixels, depth, colour, interlace=0, before_idat=(), idat_pieces=1, payload=None, idat_size=None,
+        empty_idat=False):
+    """A PNG of rows of pixel tuples; each tuple holds one value per channel.
+
+    The compressed stream is split into `idat_pieces` IDAT chunks, or into
+    chunks of `idat_size` bytes when that is given; `empty_idat` puts an empty
+    IDAT chunk before, between and after them.
+    """
     height, width = len(pixels), len(pixels[0])
     compressed = payload if payload is not None else zlib.compress(raw_data(pixels, depth, colour, interlace), 9)
-    step = -(-len(compressed) // idat_pieces)
-    idats = b"".join(chunk(b"IDAT", compressed[i:i + step]) for i in range(0, len(compressed), step))
+    step = idat_size if idat_size else -(-len(compressed) // idat_pieces)
+    pieces = [compressed[i:i + step] for i in range(0, len(compressed), step)]
+    if empty_idat:
+        pieces = [b""] + [q for piece in pieces for q in (piece, b"")]
+    idats = b"".join(chunk(b"IDAT", piece) for piece in pieces)
     return SIGNATURE + ihdr(width, height, depth, colour, interlace) + b"".join(before_idat) + idats + chunk(b"IEND", b"")
 
 
@@ -186,6 +195,48 @@ GREY8 = grey([[0, 128, 255], [17, 64, 200]])
 RGB8 = [[(255, 0, 0), (0, 255, 0)], [(0, 0, 255), (12, 34, 56)]]
 RGBA8 = [[(255, 0, 0, 255), (0, 255, 0, 128), (0, 0, 255, 0)],
          [(200, 100, 50, 64), (255, 255, 255, 255), (1, 2, 3, 4)]]
+
+
+ALPHAS16 = [0, 129, 32896, 65535, 386, 65534]
+
+
+def grid(width, height, pixel):
+    """Rows of pixel tuples, pixel(x, y) at column x of row y."""
+    return [[pixel(x, y) for x in range(width)] for y in range(height)]
+
+
+def rgba16(x, y):
+    return ((x * 7919 + y * 10477) % 65536, (x * 3571 + y * 9001 + 129) % 65536, (65535 - x * 4099 - y * 257) % 65536,
+            ALPHAS16[(x + y) % 6])
+
+
+def grey_alpha16(x, y):
+    return ((x * 13001 + y * 977) % 65536, ALPHAS16[(2 * x + y) % 6])
+
+
+def rgb16_keyed(x, y):
+    # Key (20300, 5, 0x1234): keyed where x mod 3 = 1, y is even and
+    # x + y is not a multiple of 4; (x + y) mod 4 = 0 shares only the key's
+    # blue high byte.
+    return ((x % 3) * 20000 + 300, (y % 2) * 30000 + 5, 0x1234 if (x + y) % 4 else 0x12FF)
+
+
+def grey16_keyed(x, y):
+    # Key 0x2222: samples are multiples of 0x1111, bumped to share only the
+    # key's high byte where (x + y) is a multiple of 3.
+    return (((x * 5 + y) % 7) * 0x1111 + (0 if (x + y) % 3 else 0x00FF),)
+
+
+def rgb8_odd(x, y):
+    return (x * 15, y * 19, (x * y) % 256)
+
+
+def filters_rgb8(x, y):
+    return (x * 19 + y, y * 23 + x, (x * y * 7) % 256)
+
+
+def palette_entries(count):
+    return [(i, 255 - i, (i * 7) % 256) for i in range(count)]
 
 
 def interlaced_rgba(x, y):
@@ -271,6 +322,50 @@ def fixtures():
         "alpha-binary.png": png([[(10, 20, 30, 0), (40, 50, 60, 255)], [(70, 80, 90, 255), (1, 2, 3, 0)]], 8, RGBA),
         "alpha-one.png": png([[(10, 20, 30, 255), (40, 50, 60, 1)]], 8, RGBA),
         "alpha-254.png": png([[(10, 20, 30, 0), (40, 50, 60, 254)]], 8, RGBA),
+        # 16-bit Adam7 with alpha and with colour keys, over odd extents.
+        "adam7-rgba16.png": png(grid(9, 7, rgba16), 16, RGBA, interlace=1),
+        "adam7-grey-alpha16.png": png(grid(5, 3, grey_alpha16), 16, GREY_ALPHA, interlace=1),
+        "adam7-rgb16-trns.png": png(grid(7, 5, rgb16_keyed), 16, RGB, interlace=1,
+                                    before_idat=[rgb_key(20300, 5, 0x1234)]),
+        "adam7-grey16-trns.png": png(grid(6, 6, grey16_keyed), 16, GREY, interlace=1,
+                                     before_idat=[grey_key(0x2222)]),
+        # Narrow and odd extents: Adam7 passes with no columns or no rows.
+        "adam7-palette1-3x1.png": png(grey([[1, 0, 1]]), 1, PALETTE, interlace=1,
+                                      before_idat=[plte([(10, 20, 30), (200, 100, 50)]), chunk(b"tRNS", bytes([128]))]),
+        "adam7-grey8-1x1.png": png(grey([[77]]), 8, GREY, interlace=1),
+        "adam7-rgb8-1x9.png": png(grid(1, 9, lambda x, y: (y * 20, 255 - y * 20, y * 3 + 1)), 8, RGB, interlace=1),
+        "adam7-grey4-9x1.png": png(grey([[x * 3 % 16 for x in range(9)]]), 4, GREY, interlace=1),
+        "adam7-rgba8-2x2.png": png([[(255, 0, 0, 255), (0, 255, 0, 200)], [(0, 0, 255, 100), (9, 9, 9, 0)]], 8, RGBA,
+                                   interlace=1),
+        "adam7-palette4-trns-6x4.png": png(grid(6, 4, lambda x, y: ((x * 3 + y * 5) % 16,)), 4, PALETTE, interlace=1,
+                                           before_idat=[plte([(i * 16, 255 - i * 16, i * 3) for i in range(16)]),
+                                                        chunk(b"tRNS", bytes([255, 200, 100, 50, 0]))]),
+        "adam7-grey2-13x11-trns.png": png(grid(13, 11, lambda x, y: ((x * x + y) % 4,)), 2, GREY, interlace=1,
+                                          before_idat=[grey_key(3)]),
+        "adam7-grey4-11x9.png": png(grid(11, 9, lambda x, y: ((x * 5 + y * 7) % 16,)), 4, GREY, interlace=1),
+        "adam7-rgb8-17x13.png": png(grid(17, 13, rgb8_odd), 8, RGB, interlace=1),
+        "adam7-palette8-10x10.png": png(grid(10, 10, lambda x, y: ((x * 23 + y * 7) % 200,)), 8, PALETTE, interlace=1,
+                                        before_idat=[plte(palette_entries(200))]),
+        "adam7-grey-alpha8-3x3.png": png(grid(3, 3, lambda x, y: (x * 100 + y * 20, 255 - x * 50 - y * 40)), 8,
+                                         GREY_ALPHA, interlace=1),
+        # Every filter type (the row index mod 5) at every pixel size in bytes.
+        "filters-rgba16.png": png(grid(11, 12, rgba16), 16, RGBA),
+        "filters-rgb8.png": png(grid(13, 11, filters_rgb8), 8, RGB),
+        "filters-grey1.png": png(grid(21, 11, lambda x, y: (1 if (x * 7 + y * 3) % 5 < 2 else 0,)), 1, GREY),
+        "filters-grey-alpha8.png": png(grid(9, 10, lambda x, y: (x * 27 + y, 255 - x * 13 - y * 7)), 8, GREY_ALPHA),
+        "filters-palette2.png": png(grid(17, 9, lambda x, y: ((x + 2 * y) % 4,)), 2, PALETTE,
+                                    before_idat=[plte([(0, 0, 0), (255, 0, 0), (0, 255, 0), (0, 0, 255)])]),
+        "filters-grey16.png": png(grid(7, 9, lambda x, y: ((x * 9533 + y * 701) % 65536,)), 16, GREY),
+        # The same image as filters-rgb8.png with its compressed stream cut
+        # at every byte, and with empty IDAT chunks between the pieces.
+        "idat-single-bytes.png": png(grid(13, 11, filters_rgb8), 8, RGB, idat_size=1),
+        "idat-empty-chunks.png": png(grid(13, 11, filters_rgb8), 8, RGB, idat_size=7, empty_idat=True),
+        # Compressed ancillary chunks whose payloads are not zlib streams: a
+        # decoder that inflated them would fail.
+        "rgb8-garbage-text.png": png(RGB8, 8, RGB, before_idat=[
+            chunk(b"zTXt", b"Comment\0\0" + bytes([0xFF, 0xEE, 0xDD, 0xCC, 0xBB])),
+            chunk(b"iTXt", b"Title\0\x01\0en\0t\0" + bytes([0xFF, 0xEE, 0xDD, 0xCC, 0xBB])),
+            chunk(b"iCCP", b"profile\0\0" + bytes([0xFF, 0xEE, 0xDD, 0xCC, 0xBB]))]),
         # Refusals.
         "corrupt-stream.png": png(RGB8, 8, RGB, payload=corrupt),
         "short-stream.png": png(RGB8, 8, RGB, payload=short_payload),
@@ -278,6 +373,11 @@ def fixtures():
                                               before_idat=[plte([(1, 2, 3), (4, 5, 6)])]),
         "no-palette.png": png(grey([[0, 1]]), 8, PALETTE),
         "rgb-depth4.png": png([[(1, 2, 3), (4, 5, 6)]], 4, RGB),
+        # A row whose filter type is 5, which the specification does not define.
+        "invalid-filter.png": png(RGB8, 8, RGB, payload=zlib.compress(
+            bytes(raw_data(RGB8, 8, RGB, 0)[:7]) + bytes([5]) + raw_data(RGB8, 8, RGB, 0)[8:], 9)),
+        # A palette chunk whose length is not a whole number of entries.
+        "palette-length-4.png": png(grey([[0, 1]]), 8, PALETTE, before_idat=[chunk(b"PLTE", bytes([1, 2, 3, 4]))]),
         "zero-width.png": SIGNATURE + ihdr(0, 1, 8, RGB) + chunk(b"IDAT", zlib.compress(b"\0", 9)) + chunk(b"IEND", b""),
     }
 

@@ -13,6 +13,7 @@ Haskell code, with their own levels (AST-2).
 | --- | --- |
 | `Hetoimasia.Asset.Image.Png` | `pngDecoder ∷ ImageKind → Decoder DecodedImage`; `decodePng ∷ ImageKind → Asset → ByteString → Either AssetRefusal DecodedImage` |
 | `Hetoimasia.Asset.Image.PngPreflight` | `preflightPng ∷ PngLimits → Asset → ByteString → Either PngRefusal PngPreflight`; `PngLimits`, `pngLimits ∷ PngLimitSettings → Either LimitsRefusal PngLimits`, `m1PngLimits`; `PngRefusal` (`PngRefusalClass`: `UnsupportedFormat`, `MalformedPng`, `ExceededLimit LimitKind`); `PngPreflight` and its accessors |
+| `Hetoimasia.Asset.Image.PngDecode` | `decodeBounded ∷ PayloadAccount → PngPreflight → IO (Either PngRefusal DecodedImage)`; `PayloadAccount` (`reservePayload`, `releasePayload`), `PayloadStage` (`StageOutput`, `StageScratch`, `StageWorking`), `PayloadCleanupFailure`; `decodeReservations`, `decodeReservationsFor`, `decodePeakBytes`, `fixedScratchBytes`, `m1WorkspaceBytes` |
 | `Hetoimasia.Asset.Image.Mips` | `MipRequest` (`mipCoverage`), `Coverage` (`CoverageFromMark`, `PreserveCoverage`, `PlainAverages`), `mipRequest`; `generateMips ∷ MipRequest → DecodedImage → Either Text DecodedImage`; `mipmapped ∷ MipRequest → Decoder DecodedImage → Decoder DecodedImage` |
 | `Hetoimasia.Asset.Image.Ktx2` | `Ktx2Image` (`Ktx2Rgba8`, `Ktx2Bc7`), `ktx2DecodedImage`; `ktx2Decoder ∷ ImageKind → Decoder Ktx2Image`; `decodeKtx2 ∷ ImageKind → Asset → ByteString → Either AssetRefusal Ktx2Image` |
 | `Hetoimasia.Asset.Image.Bc7` | `Bc7Format` (`Bc7Srgb`, `Bc7Linear`); `Bc7Image` and `bc7Image ∷ Asset → Bc7Format → Word32 → Word32 → [ByteString] → Either AssetRefusal Bc7Image`, `bc7DecodedImage`; `decodeBc7 ∷ Bc7Image → DecodedImage`; `Bc7Support`, `bc7Fallback ∷ Bc7Support → Bc7Image → Bc7Fallback`, `fallbackImage`, `fallbackSoftwareDecode` |
@@ -253,15 +254,261 @@ output piece. The bundled C zlib is used; `cabal.project.common` keeps a system
 libz out of the build. These figures cover the preflight only: the complete
 decoder's workspace is not accounted here.
 
-### Obligations on LFE-15
+### The decoding stage
 
-Preflight does not bound the decoder. The decoding stage must decode from
-`preflightSource` (or the `preflightImageData` slices) with an inflation bounded
-by the inflation limit in `preflightLimits`, rather than the general decoder,
-which inflates without a limit and builds its full chunk list, or establish an
-equally bounded path for any later inflation; and it must account for the RGBA8
-output (`preflightRgba8Bytes`) and its own intermediates. This slice claims no
-complete-pipeline or GPU-readiness bound.
+Preflight does not bound a decoder. [The bounded decode](#bounded-png-decode)
+is the stage that does: it decodes from `preflightSource` with its own
+inflation, held to the inflation limit in `preflightLimits` again, never the
+unbounded general decoder, and accounts for the RGBA8 output and every
+intermediate it allocates.
+
+## Bounded PNG decode
+
+`Hetoimasia.Asset.Image.PngDecode` is the decoding stage of the M1 Lua texture
+profile (design D-65, D-77; LFE-15), over a `PngPreflight`. It is opt-in:
+`pngDecoder` and `decodePng` are unchanged and still decode through
+JuicyPixels, and so are the KTX2, BC7 and mip entry points. It imports no Lua
+engine, profile, graphics package, console or registry; the limits are the
+preflight's, and the byte account is a handle the caller passes.
+
+```haskell
+decodeBounded ∷ PayloadAccount → PngPreflight → IO (Either PngRefusal DecodedImage)
+
+data PayloadAccount = PayloadAccount
+  { reservePayload ∷ PayloadStage → Int → IO Bool
+  , releasePayload ∷ PayloadStage → Int → IO ()
+  }
+```
+
+### What it decodes
+
+Every variant the preflight accepts: greyscale at 1, 2, 4, 8 and 16 bits,
+palette at 1, 2, 4 and 8, RGB, greyscale-alpha and RGBA at 8 and 16, each
+non-interlaced or Adam7. There is no first-frame fallback, no trial codec
+dispatch and no narrowing of a format. The result is one `DecodedImage` of the
+file's width and height with exactly one level: tightly packed RGBA8, top row
+first, no padding and no mip chain, in `TexelRgba8Srgb`, each colour channel
+premultiplied once in linear light by its texel's alpha and alpha unchanged,
+with `decodedBinaryAlpha` as everywhere. The texel contract is the colour-image
+contract above, applied exactly once: transparency keys and palette alpha at the
+stored depth, 16-bit rounding to nearest, palette indices checked against the
+palette. Opaque channels stay unchanged and alpha zero makes the channels zero.
+There is no data-image, HDR or colour-profile option; `gAMA`, `cHRM`, `sRGB`,
+`iCCP` and every other ignored chunk never change a texel and are never
+decompressed (a decoder that inflated a compressed ancillary chunk would fail
+on the suite's fixture whose `zTXt`, `iTXt` and `iCCP` payloads are not zlib
+streams, and would allocate a 256 MiB expansion for its decompression-bomb
+`iCCP`).
+
+It is not a wrapper around JuicyPixels. That decoder inflates a lazy stream,
+concatenates its chunks, builds a sample vector and then a second image: none of
+that can be accounted from here, and its allocation behaviour is not a bound
+(see [Dependency audit](#dependency-audit)). This stage inflates, unfilters and
+converts its own way: the IDAT slices are fed to the zlib inflater as they are,
+one output piece at a time, into one working buffer; each scanline is
+unfiltered where it lies in that buffer; each pixel is written, premultiplied,
+to its final place in the output, and for Adam7 to the place its pass gives it.
+There is no sample vector, no pass image, no concatenation of the encoded data
+and no second copy of anything.
+
+### The accounting contract
+
+The caller passes a `PayloadAccount` onto its pipeline's byte bank. The decoder
+asks the account for each buffer's bytes, *before* allocating it; a refused
+reservation is a refusal of class `ExceededLimit LimitWorkspaceBytes` and the
+buffer is never allocated. The reservations are `decodeReservations`, in this
+order:
+
+| Stage | Bytes | Released |
+| --- | --- | --- |
+| `StageOutput` | the RGBA8 level, `preflightRgba8Bytes` | not on success: it is the result. On every other outcome |
+| `StageScratch` | `fixedScratchBytes` (173,056) plus the widest row | before the call returns |
+| `StageWorking` | the filtered scanlines, `preflightScanlineBytes` | before the call returns |
+
+`fixedScratchBytes` is the inflater's state and window (8 KiB and 32 KiB,
+rounded up from zlib's 7,116-byte state), two inflater output pieces (the one
+being copied and the next, 32 KiB each), the shared premultiplication table
+(64 KiB, charged on every call though it is shared) and the palette table
+(1 KiB). The widest row is the all-zero row above each pass's first.
+
+- **On success** the account has gained exactly `preflightRgba8Bytes` live
+  bytes. **On a refusal or any exception, asynchronous ones included**, it has
+  gained nothing: every grant the call took was released, in reverse order.
+- **The caller's own charges are the caller's.** The encoded input is charged by
+  whoever read it, from before the call until it drops it, and the decoder
+  neither charges nor releases it. What is charged is the input's *backing
+  allocation*: a `ByteString` view keeps its whole buffer alive, so a PNG that is
+  a slice of a larger buffer costs the larger buffer, `ByteString.length
+  (preflightSource pf)` is only a lower bound, and only the caller knows the
+  allocation. `decodeWorkspaceBytes` is the decoder's own peak;
+  `decodePeakBytes inputBytes` adds the input charge the caller states and is
+  the most the bank holds while the decode runs. (A PNG read into a buffer of
+  its own length, as the texture pipeline does, is charged its length; the
+  suite reconciles the peak both ways, including a slice of a larger buffer.)
+- **Hand-over.** The output reservation passes to the caller at the instant the
+  call returns. A caller that can be cancelled asynchronously calls the decoder
+  under `mask` (or `mask_`): the decoder's steps stay cancellable
+  (`allowInterrupt` runs once per inflater piece and per row, and the account's
+  calls may block) and no exception is delivered between its return and the
+  caller's recording of the image, so the caller never holds the charge without
+  the image. The caller then releases `StageOutput` with `preflightRgba8Bytes`
+  once nothing refers to the level.
+- **A staging copy** of the level (for the GPU provider, LFE-17) is a separate
+  payload the pipeline charges itself, over and above the output, until the copy
+  is retired. The decoder finishing does not free a buffer the consumer holds,
+  and the result is independent of the decoder's scratch, of the preflight and
+  of the encoded input: it is the level's own buffer, of exactly that length.
+  Dropping the source and the preflight frees them while the level lives.
+- **The scope.** Each reservation and its release form a scope with the failure
+  table of `Hetoimasia.Foundation.Resource` (this package depends on no
+  foundation): the body's failure propagates with its own type; a release that
+  fails after a successful body fails the call and the body's result is
+  discarded; if both fail, the body's failure propagates and every failed release
+  is retained beside it in a `PayloadCleanupFailure`, innermost first, which is
+  itself asynchronous if the body's failure was. A refused reservation runs no
+  release. The reservation runs under `mask` and a release under
+  `uninterruptibleMask_`, so an account's release must have a controlled
+  blocking duration.
+
+### Failures
+
+A refusal is a `PngRefusal` of one of the preflight's classes, naming the
+asset, with a bounded fixed-text reason, and no partial image. Beyond what the
+preflight established (this stage reinflates, so it repeats them):
+
+- `MalformedPng`: an image data stream that is corrupt, truncated or inflates to
+  fewer bytes than the header needs; **a scanline whose filter-type byte is not
+  0 to 4**; an indexed image whose first `PLTE` is missing or not a whole number
+  of three-byte entries; a palette index outside the palette. Each is found by an
+  explicit check or a typed error, never by catching an exception and never by
+  reading prose.
+- `ExceededLimit LimitInflatedBytes`: the second inflation produced more than the
+  inflation limit.
+- `ExceededLimit LimitWorkspaceBytes`: the account refused a reservation.
+
+Anything else is not a refusal and is never relabelled as one: an allocation
+failure, a fault in the inflater binding or the account, an asynchronous
+exception, and a failing release all propagate as exceptions. This is
+deliberately unlike `decodePng`'s `contained`, which turns every synchronous
+exception into a refusal. The result is evaluated completely before it is
+returned, so a late failure surfaces from the call and never from a value
+already reported as a success. The invalid-filter refusal is the bounded path's:
+JuicyPixels treats a filter-type byte above 4 as "none" and decodes the file,
+and `decodePng` still does, unchanged (the suite pins that).
+
+### Completion and abandonment
+
+When the call returns or throws, the decoder has stopped using every buffer it
+charged: the working buffer, the scratch and the inflater's input (the caller's
+own slices) are no longer touched, and the account has seen every release. The
+one thing it may still hold after an abandoned call is the inflater's native
+state, which the pinned `zlib` binding frees; that state is counted in
+`fixedScratchBytes` while the call runs and is not counted afterwards (see the
+exclusions below). A caller must not release the pipeline's workspace, or the
+encoded input, while a call is in progress: the call returning is the only
+evidence that it is done, and a cancellation request is not. There is no
+deadline and no hard interruption: a cancellation is delivered between steps,
+each of which does at most one inflater piece or one row of work. Delivery of
+the cancellation and the worker's execution slot are the texture pipeline's
+(LFE-16).
+
+### The live-buffer bound
+
+Every buffer the decoder allocates or retains, by operation:
+
+| Buffer | Allocated by | Size | Held from → until |
+| --- | --- | --- | --- |
+| Encoded input | the caller | the view is at most the source limit (32 MiB); the charge is its whole backing allocation | before the call → the caller drops it. Shared by the IDAT, `PLTE` and `tRNS` slices; never copied |
+| Output level | `StageOutput` reservation, then `create` | width × height × 4, at most 16 MiB | reserved first → the caller disposes of it |
+| Zero row | `mallocForeignPtrBytes` | the widest row's packed bytes, at most 16 KiB at 2,048 columns RGBA16 | scratch granted → end of call |
+| Palette table | `makePalette` | at most 256 × 4 bytes | scratch granted → end of call |
+| Inflater state | zlib's `inflateInit` (the binding) | about 7 KiB of state and a 32 KiB window | first input → end or failure of the stream |
+| Inflater output piece | the binding, per piece | at most 32 KiB; the next is allocated while this one is copied | produced → copied; at most two live |
+| Premultiplication table | a process-wide table, built in place | 64 KiB (built once, no intermediate list) | first use → process exit; charged on every call |
+| Scanlines | `StageWorking`, then `mallocForeignPtrBytes` | `preflightScanlineBytes` (filtered rows, every pass), at most the inflation limit | granted → the last row is written; unfiltered in place |
+
+Nothing else of size is allocated. The peak is at conversion, when the encoded
+input, the output, the scratch and the scanlines are all live:
+`input + output + scratch + scanlines`. At the approved maxima (a 2,048 × 2,048
+image, the 32 MiB source limit and the one RGBA8 output of 16 MiB) the peak of
+each family is:
+
+| Colour type | Depth | Scanlines, plain / Adam7 | Scratch | Peak, plain / Adam7 |
+| --- | --- | --- | --- | --- |
+| greyscale | 1 | 526,336 / 528,128 | 173,312 | 51,031,296 / 51,033,088 |
+| greyscale | 2 | 1,050,624 / 1,052,416 | 173,568 | 51,555,840 / 51,557,632 |
+| greyscale | 4 | 2,099,200 / 2,100,992 | 174,080 | 52,604,928 / 52,606,720 |
+| greyscale | 8 | 4,196,352 / 4,198,144 | 175,104 | 54,703,104 / 54,704,896 |
+| greyscale | 16 | 8,390,656 / 8,392,448 | 177,152 | 58,899,456 / 58,901,248 |
+| palette | 1 | 526,336 / 528,128 | 173,312 | 51,031,296 / 51,033,088 |
+| palette | 2 | 1,050,624 / 1,052,416 | 173,568 | 51,555,840 / 51,557,632 |
+| palette | 4 | 2,099,200 / 2,100,992 | 174,080 | 52,604,928 / 52,606,720 |
+| palette | 8 | 4,196,352 / 4,198,144 | 175,104 | 54,703,104 / 54,704,896 |
+| RGB | 8 | 12,584,960 / 12,586,752 | 179,200 | 63,095,808 / 63,097,600 |
+| RGB | 16 | 25,167,872 / 25,169,664 | 185,344 | 75,684,864 / 75,686,656 |
+| greyscale-alpha | 8 | 8,390,656 / 8,392,448 | 177,152 | 58,899,456 / 58,901,248 |
+| greyscale-alpha | 16 | 16,779,264 / 16,781,056 | 181,248 | 67,292,160 / 67,293,952 |
+| RGBA | 8 | 16,779,264 / 16,781,056 | 181,248 | 67,292,160 / 67,293,952 |
+| RGBA | 16 | 33,556,480 / 33,558,272 | 189,440 | 84,077,568 / **84,079,360** |
+
+The largest, 16-bit RGBA under Adam7, is 84,079,360 bytes (80.2 MiB), under the
+128 MiB bank (`m1WorkspaceBytes`) by 47.8 MiB; every scanline figure is under the
+40 MiB inflation limit, so no approved variant is refused for the bank. The
+slack also holds the preflight's slice descriptors, which the caller's
+`PngPreflight` retains (at most the chunk limit of them, 224 KiB at 4,096).
+With a staging copy of the output (16 MiB) still owned at hand-over, after the
+scanlines and scratch are released, the bank holds `source + 2 × output` at most
+(64 MiB with a 32 MiB source). The suite counts every figure above from the
+Adam7 pattern pixel by pixel, independently of the module, checks that the
+decoder's reservations equal that count in the order made, and decodes real
+images at the maxima.
+
+**What the figures exclude.** Allocator overhead; memory the collector has not
+yet returned for buffers already unreferenced (the working buffer after its
+release is garbage, not a live payload); the object graphs of the preflight and
+of the result; and driver or GPU memory. None of them is used to hide a live
+referenced payload: every buffer above is charged for exactly as long as the
+decoder or the caller refers to it. This is not a whole-process heap
+guarantee, and no measurement of resident memory, no garbage-collector timing
+and no catching of an allocation failure is part of the proof.
+
+### Dependency audit
+
+What the pinned dependencies actually allocate on every path this package reuses
+(`zlib` 0.7.1.1 with the bundled C zlib 1.3.2, `JuicyPixels` 3.3.9):
+
+- **JuicyPixels is not used for decoding on the bounded path.** Its
+  `decodePngWithPaletteAndMetadata` inflates with `Z.decompress` to a lazy
+  stream, concatenates its chunks into one strict buffer (a second copy of the
+  whole inflated data, overlapping the lazy chunks), builds a sample vector
+  (8- or 16-bit, `width × height × samples`) from it and then a palette or image
+  value on top; nothing in its interface bounds those, and none of it can be
+  charged. It treats a filter-type byte above 4 as "none". Its metadata
+  extraction (`extractMetadatas`) inflates `zTXt` chunks if its result is forced.
+  None of that is reached: the bounded path calls no JuicyPixels decoder, and
+  the only JuicyPixels function it runs is `pngComputeCrc`, the chunk CRC.
+- **The `zlib` binding's incremental interface** (`decompressIO`) allocates, per
+  stream, a `z_stream` (112 bytes) and, through C `inflateInit2`, zlib's inflate
+  state (about 7 KiB) and, on first output, a 32 KiB window; and, per output
+  piece, one `mallocByteString` of the piece size (32 KiB here). Input chunks
+  are handed over by reference and pinned, never copied. The state is freed by
+  `inflateEnd` when the stream ends or fails, and by a foreign-pointer
+  finalizer otherwise. Every step of the binding is run under `mask_` here, so
+  an asynchronous exception cannot arrive between the creation of the state and
+  the registration of its finalizer; each step does at most one output piece of
+  work.
+- **Slices of the caller's buffer** (the IDAT, `PLTE` and `tRNS` data of the
+  preflight) are views, not copies: they are counted by their backing allocation,
+  the encoded input, whose charge the caller holds until its last view ends.
+
+### The M1 assembly
+
+The assembly passes the fixed M1 limits (`m1PngLimits`, `m1WorkspaceBytes`) and
+its pipeline's account; nothing here is tunable and no limit is silently
+enlarged. A smaller validated profile or bank, which the suite uses, goes
+through the same arithmetic and refuses at the same stage. An injected-small-bank
+refusal is not a reason to refuse an approved M1 file under the production bank:
+the largest peak above is under the bank.
 
 ## BC7
 
@@ -539,14 +786,26 @@ KTX2 files bring their own levels and are out of this step's scope (AST-2).
 
 ## Owned state, threads and lifetimes
 
-None. Decoding is pure: it reads only the caller's bytes, writes no file,
-starts no thread and keeps nothing between calls. The premultiplication table
-and the BC7 partition and weight tables are constants shared by every decode.
-BC7 checking, decoding, the mark and the fallback step are pure too, as are
-KTX2 reading and mip generation: the same bytes and kind always give the same
-result, and the same image and request always give the same levels. The
-bounded PNG preflight is pure as well; its accounting is above. The
+The general decoders own none. They are pure: they read only the caller's
+bytes, write no file, start no thread and keep nothing between calls. The
+premultiplication table and the BC7 partition and weight tables are constants
+shared by every decode. BC7 checking, decoding, the mark and the fallback step
+are pure too, as are KTX2 reading and mip generation: the same bytes and kind
+always give the same result, and the same image and request always give the same
+levels. The bounded PNG preflight is pure as well; its accounting is above. The
 package holds no logger. A decoded image's bytes are the caller's.
+
+The bounded decode, `decodeBounded`, is effectful, and owns nothing beyond one
+call:
+
+| | |
+| --- | --- |
+| Owner | the call; there is no state between calls |
+| Readers and writers | the calling thread alone: the working buffer, the zero row, the palette table and the output are written by it and read by it |
+| Thread | the caller's; it starts none and shares nothing with another |
+| Lifetime | the working buffer, scratch and inflater input end with the call; the output level is the caller's from the return |
+| Reset and disposal | every reservation is released by the call on every outcome but a success's output; the inflater's native state is freed by the `zlib` binding (stream end or failure, or its finalizer) |
+| Accounting | the caller's `PayloadAccount`; the decoder holds no bank of its own |
 
 ## Tests
 
@@ -568,6 +827,20 @@ package or spelled out as stored blocks, and expected scanline sizes counted
 pixel by pixel), independently of the production parser, JuicyPixels and the
 formula the production code uses, over the committed fixtures where an existing
 file already holds the defect. Boundary cases use small injected limits.
+
+The bounded decode's examples run every fixture whose texels the suite states
+by hand through the complete entry (preflight, then decode in a byte ledger the
+suite models on a pipeline's bank), compare it with those texels and with the
+general decoder's colour image byte for byte, and check the account:
+`Test.Asset.Image.PayloadLedger` records every grant, refusal and release in
+order, with the caller's own charges (the input, a staging copy) through the same
+ledger so the peak is the whole bank's. The expected charges are counted in the
+suite from the Adam7 pattern, not taken from the module; the bytes the thread
+allocated while it decoded are measured against what was charged, so a copy the
+account never saw shows. Cancellation examples coordinate with MVars and the
+thread's own status, with no sleeps, and wait for their child threads to
+terminate. `PngDecodeClient` compiles a separate client against the public
+modules alone.
 
 Its BC7 fixture, `test/fixtures/bc7-reference.txt`, comes from
 `make_bc7_fixtures.py`, which builds blocks bit by bit (every partition of

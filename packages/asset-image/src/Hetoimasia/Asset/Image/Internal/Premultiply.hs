@@ -15,6 +15,7 @@
 module Hetoimasia.Asset.Image.Internal.Premultiply
   ( premultiplyChannel
   , premultiplyRgba8
+  , tableBytes
   )
 where
 
@@ -47,10 +48,21 @@ premultiplyRgba8 bytes = ByteString.unsafeCreate (4 * count) $ \pointer →
   where
     count = ByteString.length bytes `div` 4
 
--- | Indexed by alpha × 256 + channel.
+-- | Indexed by alpha × 256 + channel. It is written into its one 64 KiB buffer
+-- as it is computed: no list of its entries is ever built, so the table is the
+-- only allocation of any size it makes (the bounded decoder's allowance for
+-- shared helper data is this buffer).
 table ∷ ByteString
-table = ByteString.pack [entry alpha channel | alpha ← [0 .. 255], channel ← [0 .. 255]]
+table = ByteString.unsafeCreate tableBytes $ \pointer →
+  for_ [0 .. 255] $ \alpha →
+    for_ [0 .. 255] $ \channel →
+      pokeByteOff pointer (alpha * 256 + channel) (entry alpha channel)
 {-# NOINLINE table #-}
+
+-- | The size of the shared premultiplication table: every (alpha, channel)
+-- pair, one byte each.
+tableBytes ∷ Int
+tableBytes = 256 * 256
 
 entry ∷ Int → Int → Word8
 entry alpha channel
