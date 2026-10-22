@@ -3751,7 +3751,10 @@ the record the script will be handed:
 * a `ProviderResult` is checked against the owner's value limits and the endpoint's schema, the value against the
   admission's ceilings, and the record a script is handed (the admission's frame) against the owner's. The
   admission's combiner shapes that record only for a result whose resource the owner builds into the reserved lease
-  (a `ProviderResource` of a request that reserved one); a plain result is measured, and handed, as it is;
+  (a `ProviderResource` of a request that reserved one); a plain result is measured, and handed, as it is. The
+  value the engine keeps for a result whose resource is built is the provider's own, whatever the combiner hands
+  the script in its place, so it is bounded as well: as the plain record, against the owner's limits and the
+  admission's ceilings, before the schema is traversed, and its bytes are the larger of the two records';
 * a `ProviderExpected` failure must carry a code the admission lists, a root and path within their byte bound, and
   an envelope that fits: a message is cut at a character, visibly (`...`), to its bound until it does;
 * a `ProviderResource value recipe` is a result whose resource the instance is to own: the owner builds the recipe
@@ -3814,6 +3817,7 @@ ending: `wait` is for a serving instance, and an instance in `shutdown` is not t
 | --- | --- | --- | --- | --- |
 | `pHeld` (the ledger) | the service | the admission; the owner's thread (`takeTerminal`, `releaseSettled`, ending); never a provider | admission | from admission until taken or discarded and the work is reaped |
 | `Rec` metadata (`recAdmission`, `recFailure`, `recLease`, `recAdopted`) | the service | admission; the reply; adoption | settlement | with the record |
+| The provider's value, once validated (`adoptingValue` while a resource waits to be built; the settled `Payload`; a held completion) | the service | the checked reply | the take; the tick service | bounded as the plain record by the owner's limits and the admission's ceilings, whatever the combiner returns; until taken or discarded |
 | `pAdopting` | the service | a provider's reply (insert); the owner (claim, finish) | the owner's boundary | until built, failed or the request ends; a claimed entry is not dropped under the builder |
 | `pDiscards` | the service | `cancelOf`, the epoch | the owner's boundary | until released |
 | `pDefects` | the service | a provider's reply | the owner's boundary, or the retirement when no boundary follows | until raised; at most sixteen |
