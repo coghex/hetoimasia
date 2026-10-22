@@ -232,6 +232,9 @@ data JobState
   = JobQueued
   | -- | A worker took it. The flag says interest was withdrawn.
     JobIssued !Bool
+  | -- | A worker decided to hand the result to the sink, or is doing so. The slot's claim is
+    -- over; the job is not retired until the sink returned.
+    JobDelivering
   | JobDone
   | JobWithdrawn
 
@@ -410,7 +413,8 @@ data CancelOutcome
   = -- | It was still queued: it left the queue, no file was opened and its sink will not be
     -- called. It is retired.
     CancelWithdrawn
-  | -- | A worker already took it: it runs to its end, its sink is not called, and it retires then.
+  | -- | A worker already took it. Unless it had begun to hand the result over, its sink is not
+    -- called; either way it retires when the worker is done with it.
     CancelInFlight
   | -- | It had finished or been withdrawn.
     CancelTooLate
@@ -427,6 +431,7 @@ cancel (ReadTicket var job) =
       writeTVar (jobState job) JobWithdrawn
       pure CancelWithdrawn
     JobIssued _ → CancelInFlight <$ writeTVar (jobState job) (JobIssued True)
+    JobDelivering → pure CancelInFlight
     JobDone → pure CancelTooLate
     JobWithdrawn → pure CancelTooLate
 
@@ -502,16 +507,30 @@ runJob restore pool job = do
 
 -- | Hand the result to the sink unless interest was withdrawn, then mark the job done and release
 -- the execution slot. @pending@ is the failure to rethrow after, once the job is settled.
+--
+-- The decision to deliver and the end of the job's claim on its slot are one transaction, taken
+-- /before/ the sink is called: the consumer's reply may be accounted, and its slot released, as
+-- soon as the sink has run, and the job must by then no longer need it. The job is not /retired/
+-- until the sink has returned, so a consumer that reads retirement after withdrawing interest
+-- never sees the work over while a worker still holds the buffer it is about to hand over.
 settle ∷ ReadPool → Job → ReadResult → Maybe (ExceptionWithContext SomeException) → IO ()
 settle pool job result pending = do
-  withdrawn ← readTVarIO (jobState job) <&> \case JobIssued flag → flag; _ → False
+  deliver ← atomically $
+    readTVar (jobState job) >>= \case
+      JobIssued True → False <$ finish
+      JobIssued False → do
+        writeTVar (jobState job) JobDelivering
+        st ← readTVar (poolState pool)
+        writeTVar (poolState pool) st {psLive = psLive st - 1}
+        pure True
+      _ → pure False
   delivered ← tryWithContext @SomeException $ do
-    unless withdrawn (jobSink job result)
+    when deliver (jobSink job result)
     hookSettled (poolHooks pool) (jobKey job)
-  atomically $ do
+  when deliver $ atomically $ do
     writeTVar (jobState job) JobDone
     st ← readTVar (poolState pool)
-    writeTVar (poolState pool) st {psActive = psActive st - 1, psLive = psLive st - 1}
+    writeTVar (poolState pool) st {psActive = psActive st - 1}
   case (pending, delivered) of
     (Just failure, Right ()) → rethrowIO failure
     (Nothing, Right ()) → pure ()
@@ -519,6 +538,12 @@ settle pool job result pending = do
     (Just failure, Left sinkFailure) → do
       composed ← composeCleanup (Just failure) [("content read sink", sinkFailure)]
       rethrowIO (maybe failure id composed)
+  where
+    -- Interest was withdrawn before delivery: done at once, nothing to hand over.
+    finish = do
+      writeTVar (jobState job) JobDone
+      st ← readTVar (poolState pool)
+      writeTVar (poolState pool) st {psActive = psActive st - 1, psLive = psLive st - 1}
 
 -- | Run an action; if it raises a synchronous exception, do this with it, then raise it.
 onSynchronousFailure ∷ IO () → (SomeException → IO ()) → IO ()
