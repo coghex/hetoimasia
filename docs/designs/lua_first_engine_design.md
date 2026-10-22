@@ -79,7 +79,7 @@ concrete precondition
 - [x] LFE-14. Preflight static PNG structure and bounded inflation — [#529]
 - [x] LFE-15. Decode the approved PNG variants within accounted workspace — [#530]
 - [x] LFE-16. Own texture pipeline lanes, leases and byte reservations — [#531]
-- [ ] LFE-17. Finish texture requests through real GPU readiness
+- [x] LFE-17. Finish texture requests through real GPU readiness — [#532]
 - [ ] LFE-18. Create and retire instance-owned windows asynchronously
 - [ ] LFE-19. Validate and copy the fixed M1 scene schema
 - [ ] LFE-20. Publish scenes with completion-safe texture retention
