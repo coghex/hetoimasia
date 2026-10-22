@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-46/Q-6f: independent texture loads or shared backing.
+The current checkpoint is P-47/Q-6g: the M1 scene's exposed rendering surface.
+D-49 accepts independent texture loads without a shared texture cache.
 D-48 accepts explicit texture release and pending-load cancellation.
 D-47 accepts one texture request through usable GPU readiness.
 D-46 accepts copied scenes and protected texture retention.
@@ -1473,6 +1474,33 @@ safely. The manager presented the race-machinery cost and the need for authors
 to replace a scene to let go of its holds. The owner chose A rather than no
 early release in M1. This does not select shared backing, public window-close
 controls, module cancellation or exact API spelling.
+
+### D-49. M1 texture requests load independent resources
+
+**Delivery:** M1; shared texture backing deferred.
+
+Owner answer, **2026-10-22 00:14:50 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: independent (Rec.)
+
+Authenticated relay: `het-manager`, message `u7rcyesfjkkg6kn93p9gngt9n2`,
+posted **2026-10-22 00:14:50.351 UTC** in `#het-luafirst`, replying to Q-6f
+message `v4ifgav754ibeb95a36qksssda`.
+
+Accept P-46's A: each new request reads/verifies, decodes and uploads its own
+texture resource, even for the same path. An instance reuses a live lease
+across sprites/publications without loading per quad. Requests and resources
+remain independent across instances; there is no content-keyed resident or
+in-flight texture cache. Shared renderer/device infrastructure is unchanged.
+Every new load checks its bytes against the startup fingerprint, while an
+already-loaded texture remains original.
+
+The manager presented the duplicate-work/memory cost and preserving interfaces
+for later sharing. The owner chose independent loads rather than shared backing.
+The two-instance integration test loads the same path for both instances and
+proves ending one leaves the other's resource usable, subject to the approved
+role-failure policy. This does not change D-7's separate module-cache contract.
 
 ## Proposals
 
@@ -3807,7 +3835,7 @@ cancel/completion, repeated release, and scene-held retirement.
 
 ### P-46. Keep each M1 texture load independent, with shared backing deferred
 
-**Unapproved; active checkpoint Q-6f. Delivery: M1.** Recommend A: each new
+**A accepted by D-49 through Q-6f. Delivery: M1.** Recommend A: each new
 texture request is a separate load with its own fingerprint-checked read,
 decode/upload work and resulting instance-owned lease/native texture identity.
 Two requests for the same root/path do not coalesce or reuse a resident GPU
@@ -3856,6 +3884,65 @@ already support both owned and shared acquisitions, with different lifetime
 meanings. Neither that mechanism nor a shared module export supplies a content-
 keyed texture cache. This proposal selects the M1 provider policy; the native
 renderer and host remain reusable for later shared resources.
+
+### P-47. Expose a clear colour and an ordered list of UI texture rectangles
+
+**Unapproved; active checkpoint Q-6g. Delivery: M1.** Recommend A: the Lua
+scene has a clear colour and a bounded ordered list of sprites. Each sprite
+names its ready texture lease and a finite destination rectangle (position
+and positive width/height). It draws that texture's entire image without
+stretching the scene itself to fit the window. A list of any supported size,
+including empty, is real scene data; the engine does not hard-code a particular
+quad, asset, position or count. An empty list clears the window and removes
+its published texture references, subject to D-46's retirement holds.
+
+Use the renderer's UI logical-pixel space: origin at the upper left, X right,
+Y down; UI scale fixed to 1 in M1. The current per-axis content scale converts
+those units to framebuffer pixels. These are not raw framebuffer pixels and
+are not promised to equal window-coordinate units on every platform; the
+existing renderer's distinction is retained. The engine supplies one view
+covering the current framebuffer and adjusts its extent/metrics on resize or
+content-scale changes without Lua republishing an unchanged scene. Sprite
+coordinates/sizes stay as authored; there is no automatic centering, stretching
+or layout. Zero framebuffer extent suspends drawing safely until drawable.
+
+The list draws in order, later sprites over earlier ones, using the existing
+texture-alpha blending contract. Map it to one window pass, one UI layer with
+equal depth keys, full-image UVs, white tint, the default textured material,
+nearest filtering, brightness 1 and pixel snap off. Clear colour follows the
+existing renderer's colour contract; exact field names/encoding and numeric
+limits are fixed in the API specification. No world camera, depth ordering,
+rotation/shear, UV cropping, authored tint/filter settings, clipping tables,
+animation tables, retained chunks, custom materials or offscreen-target Lua
+bindings are exposed in this M1 surface.
+
+These are limits on the new Lua interface, not removals from the Haskell
+renderer. Keep the conversion to its ordinary validated snapshot explicit and
+reusable, with D-46's copied whole-scene publication, ready/owned texture checks
+and whole-call refusal. Pixel/offscreen qualification can use that same scene
+conversion without adding a public Lua offscreen API. This is a window scene
+description, not a gameplay store or widget toolkit.
+
+Alternative B exposes a broader selection of the renderer's existing passes,
+views, cameras, layers and sprite options now. It offers richer authored scenes
+but expands the Lua schema, bounds, validation, defaults and rendering evidence
+needed for M1. If chosen, ask which additions are needed and present the revised
+surface for signoff; do not silently expose the entire native API.
+
+A is recommended because it is a useful, data-driven texture-rectangle surface
+over the real renderer and completes the approved visible milestone. Its cost
+is deliberate authoring limits: Lua cannot yet rotate/crop/tint sprites, choose
+world coordinates, or lay out through an exposed camera. Later extensions can
+add those capabilities through further design. Qualification needs more than
+the one-quad demo: two overlapping sprites for order, an empty scene for
+clearing/retirement, and resize/content-scale behavior without scene mutation.
+
+Evidence: [render-2d snapshots and mapping](../../packages/render-2d/README.md)
+already define UI layers in logical pixels, per-frame target metrics, nearest
+default sampling and painter order for equal depth keys. The
+[image2d sample](../../samples/image2d/README.md) demonstrates UI content scaling.
+The proposed Lua schema and its automatic full-window view adaptation remain
+M1 integration work, not delivered bindings.
 
 ## Open questions
 
@@ -4164,11 +4251,16 @@ cleanup stays mandatory, and release does not edit a scene that holds a texture.
 
 #### Q-6f. Do repeated texture loads share backing in M1?
 
-**Active checkpoint, P-46.** A (recommended): independent load/resource per
-request; reuse one's live lease explicitly and defer content-keyed sharing.
-B: add shared backing and design its cancellation, accounting and cache rules
-now. Both require distinct per-instance Lua leases, never borrowed module-global
-handles. The tradeoff is duplicate work/memory versus a new shared lifetime.
+Resolved by D-49: P-46's A, independent load/resource per request. Shared backing
+is deferred, with its duplicate-work/memory cost acknowledged. The two-instance
+test uses the same content path while proving separate ownership/lifetime.
+
+#### Q-6g. What scene surface does M1 expose to Lua?
+
+**Active checkpoint, P-47.** A (recommended): clear colour plus an ordered list
+of full-texture destination rectangles in UI logical pixels, automatically
+mapped to a full-window view. B: select a broader native-renderer surface now
+and sign off its exact additions. D-46's copied publication applies either way.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
