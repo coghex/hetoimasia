@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-64/Q-6o: assigning logical content-result ticks.
+The current checkpoint is P-65/Q-6p: role-specific clocks and cooperative waits.
+D-67 accepts logical request tick offsets and earliest shared-module evaluation.
 D-66 accepts opaque sRGB byte backgrounds and checked fractional rectangles.
 D-65 accepts static PNG colour textures with one level and no animation/options.
 D-64 accepts hard-linked files and mounted subtrees with per-path identity.
@@ -2013,6 +2014,37 @@ and keep the old one under D-46's error policy.
 The owner chose familiar sRGB byte colours over linear-light fractions, with
 the conversion/8-bit precision cost and the opaque-background restriction.
 Exact table shapes and numeric geometry bounds remain for the API package.
+
+### D-67. Logical requests choose a tick offset, defaulting to one
+
+**Delivery:** M1; explicit result assignment and shared-module scheduling.
+
+Owner answer, **2026-10-22 02:30:11 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: choose a tick offset (Rec.)
+
+Authenticated relay: `het-manager`, message `8c6jivzuvakbnirzd6bjwbihjn`,
+posted **2026-10-22 02:30:11.397 UTC** in `#het-luafirst`, replying to Q-6o
+message `c8kxtbzcfcbfe372i6fmpizha6`.
+
+Accept P-64's A: logical data/module requests may select a positive tick offset,
+default 1, fixed at admission with an engine-assigned sequence. Init uses
+origin 0; tick 10 plus offset 30 means tick 40. Background source work may begin
+after admission, but ordinary results remain hidden until the assigned position.
+Late required or optional results hold that position under the established
+clock policy; cancellation retains its existing exception. No retiming.
+
+The shared VM module job uses the earliest evaluation position contributed by
+an admitted request or dependency. An earlier joining waiter can advance queued
+evaluation without duplicating it; cancellation does not move it later. Each
+waiter retains its own result position, with D-58's immediate cache lookup
+remaining available. UI remains arrival-settled and refuses tick offsets.
+
+The manager presented prefetching, the init/10+30 examples and earliest shared
+module work, with lead-time planning and held capacity as costs. The owner
+chose explicit offsets over always-next-tick delivery. Exact names, ranges,
+sequence exhaustion and narrow assignment integration remain delivery work.
 
 ## Proposals
 
@@ -5472,7 +5504,7 @@ and geometry preflight are new API behavior, not existing Lua features.
 
 ### P-64. Let logical loads choose a future tick offset, defaulting to the next tick
 
-**Unapproved; active checkpoint Q-6o. Delivery: M1.** D-9/D-42 require assigned
+**A accepted by D-67 through Q-6o. Delivery: M1.** D-9/D-42 require assigned
 logical content results but have not selected the Lua-facing assignment rule.
 Recommend A: a logical data/module request may supply a positive whole-number
 tick offset; omission means 1. At admission the engine fixes the target as the
@@ -5537,6 +5569,73 @@ Its current assignment callback receives `RequestInfo`, not the request's Lua
 arguments. The new binding must carry validated assignment metadata through a
 narrow owner-controlled admission path; exposing this option is integration
 work, not a claim that the existing callback already accepts it.
+
+### P-65. Expose each role's own clock and cooperative duration waits
+
+**Unapproved; active checkpoint Q-6p. Delivery: M1.** Recommend A: expose
+role-specific clock reads and waits through the existing scheduler. A logical
+instance reads its current integer tick and the fixed tick duration in seconds,
+and may wait a positive whole number of logical ticks. Init observes tick 0;
+later reads reflect the most recent begun tick. Real delays while a future
+tick is held do not advance that clock. A logical instance cannot read elapsed,
+wall/calendar or CPU time, or request an elapsed-duration wait.
+
+A UI instance reads elapsed seconds from an engine-owned monotonic origin set
+when that VM starts root initialization. All instances in that VM share the
+origin; creating the second test instance does not reset it. At each hook or
+resumed coroutine segment's entry, sample elapsed time once and hold that value
+for reads throughout the segment. The first root-init segment sees zero;
+later samples include actual elapsed initialization/loader/native delays.
+This does not redefine D-17's cadence origin or update `dt`: those retain their
+approved scheduling meaning. No wall clock, date, timezone or CPU timer is added.
+
+UI may wait a positive finite duration in seconds. Convert it to the host's
+duration representation by rounding upward to its unit, with checked range;
+do not turn a tiny positive duration into a zero wait. The deadline starts at
+the actual scheduler wait request, not an earlier segment-entry clock sample.
+Becoming due makes the continuation eligible; it may resume later because of
+other work. A logical tick wait similarly becomes eligible at its future
+tick and obeys FIFO service, without promising an exact wall-clock wake time.
+
+Both roles retain cooperative yield and D-54's request wait. Engine-scheduled
+yield/duration/request waits are available only in suspendable update/event
+execution, never init or shutdown. Clock reads are allowed in lifecycle hooks,
+including finite init/shutdown, but neither clock access nor general engine
+waits are allowed during module top-level evaluation under D-8. The special
+resumable import protocol remains separate. Wrong-role calls, invalid values
+and forbidden-phase calls are ordinary Lua errors before starting a wait;
+an uncaught error still follows the existing role/boot failure policy.
+
+A wait suspends the current invocation; it does not create another update,
+rewrite the invocation's original `dt` on resume or run a nested event loop.
+Existing one-active-invocation/cadence coalescing and owner cleanup remain.
+Yield rejoins the eligible FIFO queue under D-42; it is not a render-frame
+callback, a guaranteed next tick or preemption of a non-yielding script.
+Engine stop cancels ordinary continuations through established cleanup; no
+script-owned timer thread or independent timer-resource lifetime is exposed.
+
+Alternative B exposes only the existing update `dt`, cooperative yield and
+request readiness/wait in M1, with no explicit clock query or duration wait.
+Authors maintain elapsed/tick counters in their own updates and implement
+delayed actions there. It reduces the Lua API surface but makes short transient
+sequences less direct despite the scheduler already supporting timed waits.
+
+A is recommended because the two real clocks accepted in D-42 can support
+ordinary Lua routines without new gameplay-state concepts. Its cost is a
+precise origin/sample/unit contract and role/phase validation; a long UI segment
+reads a stale sample until it yields or ends, and a due timer can resume late.
+The logical tick/duration pair gives logical time without floating-point tick
+accumulation. Numeric limits and concrete function names follow in the API
+package. This does not add a cross-VM clock/data bus or deterministic UI replay.
+
+Qualification uses injected clocks and explicit scheduler gates for init zero,
+shared origin, stable within-segment reads, refreshed reads after resume,
+held logical ticks, early timer wakes, late resumes, role/phase refusal and
+shutdown. The [host scheduler contract](../../packages/scripting-lua/README.md)
+already provides logical/elapsed waits and owner-thread observation; its public
+wait operation takes integer ticks or nanoseconds. Seconds conversion, sampled
+Lua clock reads and M1 eligibility checks are new integration work over those
+services, not new native sleep calls from Lua.
 
 ## Open questions
 
@@ -5963,11 +6062,18 @@ geometry bounds remain in the API package.
 
 #### Q-6o. May Lua select a logical load's future result tick?
 
-**Active checkpoint, P-64.** A (recommended): positive tick offset, default 1,
-fixed at admission with engine-assigned sequence; late required or optional
-results hold that position. Explicitly refine shared modules to use the earliest
-contributed evaluation position while each waiter retains its delivery position.
-B: always the next tick, without an override. UI remains arrival-settled.
+Resolved by D-67: P-64's A, positive tick offset defaulting to 1, fixed assigned
+positions and late-result holds. Shared module jobs use the earliest contributed
+evaluation position while each waiter retains its result position. UI remains
+arrival-settled; exact bounds and assignment integration remain open.
+
+#### Q-6p. Expose role-specific clock reads and duration waits in M1?
+
+**Active checkpoint, P-65.** A (recommended): logical tick/fixed-duration reads
+and tick waits; UI segment-sampled monotonic seconds and duration waits; both
+cooperative yield/request wait with strict role/phase eligibility. B: only
+update `dt`, yield and request waits, with authored update counters for delays.
+Neither permits init/shutdown waits or ambient wall/CPU time.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
