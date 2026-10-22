@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-48/Q-6h: M1 window count, controls and close policy.
+The current checkpoint is P-49/Q-6i: when required asynchronous failures escalate.
+D-51 accepts one window slot per UI instance and the M1 close/control policy.
 D-50 accepts the clear-colour and ordered texture-rectangle scene surface.
 D-49 accepts independent texture loads without a shared texture cache.
 D-48 accepts explicit texture release and pending-load cancellation.
@@ -1529,6 +1530,32 @@ of M1. Existing Haskell renderer capabilities remain intact.
 The owner chose A rather than a broader renderer subset. The manager presented
 overlap, clearing and resizing qualification in addition to the quad demo.
 Exact field spelling, colour encoding and numeric budgets remain API work.
+
+### D-51. M1 gives each UI instance one window slot
+
+**Delivery:** M1; independent window close/reopen and broader controls deferred.
+
+Owner answer, **2026-10-22 00:22:47 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: one per instance (Rec.)
+
+Authenticated relay: `het-manager`, message `mxfacka4eux3xmdg7dpjp8itp2`,
+posted **2026-10-22 00:22:47.710 UTC** in `#het-luafirst`, replying to Q-6h
+message `8ssuyqtgfhsi9iuusdkdiqsgxw`.
+
+Accept P-48's A and shared rules: one pending/live/retiring window slot per UI
+instance, not one global window. A second request is a Lua error before native
+work. Pending creation is cancellable, first settlement wins, and the slot is
+reusable only after actual retirement. A successful window remains until
+instance end or session quit; M1 has no independent close/reopen operation.
+The visible/decorated/resizable window and limited Lua controls follow P-48.
+Native user close requests orderly whole-session quit, including during startup;
+cleanup destruction does not itself synthesize a quit for a healthy peer.
+
+The manager presented the shared rules, no-second-preview/tool-window cost and
+listed qualification. The owner chose A rather than several windows per
+instance. The reusable Haskell host retains its broader capabilities.
 
 ## Proposals
 
@@ -3974,7 +4001,7 @@ M1 integration work, not delivered bindings.
 
 ### P-48. One window slot per presentation instance, with session-level close
 
-**Unapproved; active checkpoint Q-6h. Delivery: M1.** Recommend A: each
+**A accepted by D-51 through Q-6h. Delivery: M1.** Recommend A: each
 presentation instance may have at most one outstanding window creation/live
 window. The limit belongs to the instance, not a global current-window variable;
 the integration/test harness can host separate windows for separate instances.
@@ -4027,6 +4054,66 @@ and surfaces native close requests to application policy; a native close
 callback neither destroys a window nor exits the process by itself. The new
 composition must implement the policy above while preserving the delivered
 protected native/graphics lifetime, not add Lua to native callbacks.
+
+### P-49. Escalate a required asynchronous failure when its result settles
+
+**Unapproved; active checkpoint Q-6i. Delivery: M1.** D-12 says a required
+load failure fails its requesting operation, but does not settle whether Lua
+must first read the asynchronous result. Recommend A: a required request's
+failure latches an attributed failure of its requesting instance when the
+failure becomes eligible to settle. The scheduler applies the failure at its
+next safe boundary, before further ordinary Lua work for the failed owner.
+Ignoring the request, discarding its handle, or catching a result-inspection
+error cannot clear the latch. It does not interrupt a currently running
+non-yielding Lua segment or undo its earlier resource/plain-Lua effects.
+
+For presentation, eligibility is the existing arrival/first-settlement rule;
+for logical requests it is the assigned tick/sequence, never early provider
+arrival. A held early failure therefore does not leak into logical execution
+before its assigned position. Once effective, use D-42's role policy: logical
+failure stops logical work while healthy UI may report it; UI failure ends
+the session. A failure that closes the startup gate still uses D-18/D-42's
+boot-failure rules. This adds no world transaction, rollback or deferred
+state-store fault semantics.
+
+This covers accepted asynchronous required data/texture/window work. Modules
+remain required under D-12; their exact import/evaluation API is separate, but
+any required request stage owned by a runtime instance follows the same rule.
+Pre-instance bootstrap/entry-loading failure is a boot failure, not an
+unattributed request attached to a nonexistent instance.
+
+An explicitly optional data/texture content failure remains a bounded failure
+result Lua may inspect and handle; it does not latch instance failure. Optional
+does not admit changed bytes, hide provider-code/engine/cleanup failures or
+turn a window/module into an optional load. Successful results, optional
+failures and winning intentional cancellations remain under ordinary request
+accounting even if Lua never collects them. Capacity is not freed merely by
+losing a Lua reference.
+
+D-48/D-51 cancellation still uses first settlement: if cancellation wins, there
+is no required failure to escalate; if failure wins, cancelling later cannot
+erase it. Native/provider cleanup continues through its actual retirement and
+retains failures. The terminal failure outcome remains even if another stop
+reason arrives afterwards, subject to D-20's explicit second-signal exception.
+
+Alternative B makes failure depend on Lua observing the result: an unobserved
+required failure can remain stored while the instance keeps running. It gives
+authors more control over when to confront an error but makes required loads
+possible to ignore indefinitely. If selected, revise the required-load/failure
+contract explicitly before accepting it; do not disguise it as mere API syntax.
+
+A is recommended because 'required' then has a reliable meaning independent
+of whether an author remembers to poll. Its cost is deliberate: speculative
+data/texture work must be marked optional up front or cancelled before failure
+settles; an unobserved required failure can stop the role/session. Qualification
+must cover failure with no waiter or result read, optional failure, both cancel/
+failure orders, and early logical failure held until its assigned tick.
+
+Evidence: the [host request service](../../packages/scripting-lua/README.md)
+already returns provider failure as result data and distinguishes arrival from
+assigned-tick settlement. It does not itself establish this launcher's required-
+content policy. Required-failure latching/supervision is additional M1 integration
+work and must preserve the existing safe-boundary and retirement guarantees.
 
 ## Open questions
 
@@ -4347,11 +4434,16 @@ The broader-renderer alternative was not chosen; D-46 publication still applies.
 
 #### Q-6h. How many windows and which window controls does M1 expose?
 
-**Active checkpoint, P-48.** A (recommended): one pending/live/retiring window
-slot per presentation instance, creation and pending cancellation, native close
-requests whole-session quit, no independent close or advanced controls. B:
-multiple windows per instance under a finite bound with the same close policy.
-Both preserve per-window scenes, per-instance cleanup and native retirement.
+Resolved by D-51: P-48's A and shared rules, one slot per UI instance,
+cancellable creation, native-close-means-session-quit, no independent close/
+reopen or broader Lua controls. Several windows per instance were not chosen.
+
+#### Q-6i. Does a required asynchronous failure stop its owner without a result read?
+
+**Active checkpoint, P-49.** A (recommended): latch failure at eligible
+settlement and escalate at a safe boundary even if Lua never reads the result.
+B: defer failure until Lua observes it, requiring an explicit revision of the
+required-load contract. Optional results and cancellation retain their distinctions.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
