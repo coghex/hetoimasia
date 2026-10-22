@@ -57,6 +57,7 @@ module Test.LuaEngine.Data.Support
   , grantStep
   , awaitEnd
   , awaitFailure
+  , instanceTicket
   , requestFailureOf
   , awaitPhase
   , awaitGate
@@ -566,7 +567,9 @@ driverSource =
       , "    out = r.status .. ' ' .. #r.value .. ' ' .. hex(r.value, 4) .. ' ' .. hex(r.value:sub(-4), 4)"
       , "  elseif p.op == 'block' then fx.block(key) out = 'released'"
       , "  end"
-      , "  fx.record(self.name .. ' ' .. p.op .. ' ' .. key .. ' ' .. out)"
+      , "  local tag = ''"
+      , "  if p.path and p.op ~= 'start' and p.op ~= 'pstart' then tag = ' #' .. p.path end"
+      , "  fx.record(self.name .. ' ' .. p.op .. ' ' .. key .. ' ' .. out .. tag)"
       , "end"
       , "function init(self, api)"
       , "  self.hs = {}"
@@ -697,6 +700,10 @@ awaitFailure session name = do
   pure $ case resultOutcome settlement of
     InstanceFailed failure → Just failure
     _ → Nothing
+
+-- | The ticket of an instance admitted under this name: wait on it to see the instance settle.
+instanceTicket ∷ Session → Text → IO InstanceTicket
+instanceTicket session name = (Map.! name) <$> readIORef (ssTickets session)
 
 -- | The endpoint and attributed text of a required request's failure.
 requestFailureOf ∷ Maybe InstanceFailure → Maybe (Text, Text)

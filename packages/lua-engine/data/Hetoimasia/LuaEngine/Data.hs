@@ -63,6 +63,8 @@ module Hetoimasia.LuaEngine.Data
   , newByteBankFor
   , byteBankLimit
   , byteBankCharged
+  , reserveBytes
+  , returnBytes
   , ByteBankDefect (..)
   , PoolRefusal (..)
   , EndpointDefect (..)
@@ -195,16 +197,18 @@ newtype ByteBankDefect = ByteBankDefect Text
 
 instance Exception ByteBankDefect
 
--- | Charge these bytes if they fit. Checked arithmetic: the request is compared with the room
+-- | Charge these bytes if they fit, in the transaction of the admission that asks (a credit's
+-- reserve). Checked arithmetic: the request is compared with the room
 -- left, so nothing is added that could wrap.
-chargeBytes ∷ ByteBank → Word64 → STM Bool
-chargeBytes bank wanted = do
+reserveBytes ∷ ByteBank → Word64 → STM Bool
+reserveBytes bank wanted = do
   charged ← readTVar (bankCharged bank)
   if wanted > bankLimit bank - charged
     then pure False
     else True <$ writeTVar (bankCharged bank) (charged + wanted)
 
--- | Return bytes that were charged.
+-- | Return bytes that were charged, once, at the end the host names (a credit's release). Returning
+-- more than is charged is an engine defect and raises.
 returnBytes ∷ ByteBank → Word64 → STM ()
 returnBytes bank given = do
   charged ← readTVar (bankCharged bank)
@@ -343,7 +347,7 @@ bytesCredit ∷ ByteBank → Word64 → Credit
 bytesCredit bank len =
   Credit
     { creditName = "data bytes"
-    , creditReserve = chargeBytes bank len
+    , creditReserve = reserveBytes bank len
     , creditRelease = \_ → returnBytes bank len
     , creditTransfers = False
     }
