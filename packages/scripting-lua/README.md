@@ -165,6 +165,7 @@ the first allocation of the operation is unprotected.
 | `luaL_ref`, `luaL_unref` | `safe`, by the flag | the fixtures' registry probe only |
 | `lua_tolstring` | `safe`, by the flag | reading a string error value |
 | `hetoimasia_lua_publish`, `hetoimasia_lua_getglobal`, `hetoimasia_lua_requiref` | `safe` | publishing a callback, reading a global, opening a library — each one protected call |
+| `hetoimasia_lua_filter_m1` | `safe` | filtering the M1 library profile's open libraries — one protected call, no argument crosses it |
 | `hetoimasia_lua_newstate` | `unsafe` | creating the interpreter |
 | `lua_gettop`, `lua_settop`, `lua_type`, `lua_typename`, `lua_isinteger`, `lua_tointegerx`, `lua_tonumberx`, `lua_pushboolean`, `lua_pushlightuserdata`, `lua_touserdata`, `lua_remove` | `unsafe`, fixed | stack bookkeeping, rendering, and the callback entry |
 
@@ -494,10 +495,12 @@ failure is raised, and a failure of that close is retained beside it.
 ```haskell
 withVmOwner ∷ VmConfig → (OwnedVm → IO r) → IO r
 data VmConfig = VmConfig
-  { vmLibraries ∷ [Library], vmInitialChunks ∷ [(ChunkName, ByteString)]
+  { vmLibraries ∷ [Library], vmLibraryProfile ∷ Maybe LibraryProfile
+  , vmInitialChunks ∷ [(ChunkName, ByteString)]
   , vmOwnerName ∷ Text, vmRegistration ∷ Registration, vmPolicy ∷ [Text]
   , vmValueLimits ∷ ValueLimits, vmModules ∷ [ModuleSource] }
 vmConfig    ∷ [Library] → VmConfig
+vmProfileConfig ∷ LibraryProfile → VmConfig
 evalOwned   ∷ OwnedVm → ChunkName → ByteString → IO ()
 callOwned   ∷ OwnedVm → Text → IO ()
 loadModule  ∷ OwnedVm → ModuleSource → IO ModuleHandle
@@ -665,7 +668,12 @@ no scope, and nothing about reentry, cancellation or the exit matrix changes.
 `Test.Lua.Owner.*` hold each part of this to expected values written in the
 tests. The exit matrix; partial construction at each step, with an allocator
 budget swept so that memory runs out at the state's allocation, while a library
-opens and while a chunk runs; cancellation before, during initialization, the
+opens and while a chunk runs, for an explicit list and for the M1 profile (which
+`Test.Lua.Owner.Profile` also pins on real Lua: every exclusion through every
+alias, from the first chunk and from a module with no chunk before it, the exact
+surface left, ordinary caught and uncaught errors, permitted computation,
+unchanged explicit-list and empty-library owners, independent profiled and general
+owners, and the refusal of a profile with a library list); cancellation before, during initialization, the
 body and the close, repeated, and with a failing close, with the cancellation
 delivered by coordinated blocking and never by sleeping; the shutdown phase and
 an empty allowlist, a denied callback performing no action and leaving evidence
@@ -752,10 +760,101 @@ the globals runs. A policy naming a namespace the registration does not declare
 installing end construction like any other initialization failure: the VM is
 closed through the same close and the body never runs. Which standard libraries a
 script can reach is the owner's explicit set (`coroutine` is selectable like the
-others; `utf8` is not offered), and the debug library an owner opens
-has no `sethook`, because a hook is script-defined Lua that Lua would run while a
-fault's traceback is being recorded; the base library brings `dofile`
-and `loadfile`, so an owner that must not read the disk does not open it.
+others; `utf8` is not offered), or the set of a library profile (below), and the
+debug library an owner opens has no `sethook`, because a hook is script-defined
+Lua that Lua would run while a fault's traceback is being recorded. Opening the
+base library through an explicit list brings `load`, `loadfile`, `dofile` and
+`collectgarbage` with it, as Lua ships them: an owner that must not read the disk
+or compile source selects the M1 library profile (below), which is not an
+explicit list, rather than leaving the base library out.
+
+### The M1 library profile
+
+`vmLibraryProfile = Just LibraryProfileM1` (`vmProfileConfig LibraryProfileM1`
+builds such a configuration) selects the filtered standard-library surface of the
+M1 application's Lua owners, whichever role the owner has (D-5, D-69; LFE-1). It
+is opt-in: `vmLibraries`, the empty list, and the standalone `lua` command are as
+they were, and nothing filters an explicit `LibraryBase`, `LibraryString` or
+`LibraryMath`.
+
+```haskell
+withVmOwner (vmProfileConfig LibraryProfileM1) $ \owner →
+  evalOwned owner (chunkName "check") "assert(load == nil and os == nil and string.dump == nil)"
+```
+
+**Installation order.** The profile is installed inside protected construction:
+the interpreter is allocated, the profile's libraries open, the profile removes
+what it excludes, and only then does anything an application supplies run — the
+after-libraries step of a fixture, the granted bindings (`vmPolicy`), the initial
+chunks, the initial modules. The first authored code, a chunk or a module's
+top-level code, therefore already sees the filtered surface, and so does a module
+loaded from the body later.
+
+**The surface.** A profiled owner has exactly these standard libraries, and
+nothing else:
+
+| Library | Kept | Removed |
+| --- | --- | --- |
+| base (`_G`) | `_G`, `_VERSION`, `assert`, `error`, `getmetatable`, `ipairs`, `next`, `pairs`, `pcall`, `print`, `rawequal`, `rawget`, `rawlen`, `rawset`, `select`, `setmetatable`, `tonumber`, `tostring`, `type`, `warn`, `xpcall` | `load`, `loadfile`, `dofile`, `collectgarbage` |
+| `string` | `byte`, `char`, `find`, `format`, `gmatch`, `gsub`, `len`, `lower`, `match`, `pack`, `packsize`, `rep`, `reverse`, `sub`, `unpack`, `upper` | `dump` |
+| `table` | `concat`, `insert`, `move`, `pack`, `remove`, `sort`, `unpack` | — |
+| `math` | every function and constant of the bundled interpreter's `math` except those removed | `random`, `randomseed` |
+| `coroutine` | `close`, `create`, `isyieldable`, `resume`, `running`, `status`, `wrap`, `yield` | — |
+| `os`, `io`, `package` with `require`, `debug` | — | never opened: absent in full, with no search path, searcher or native loader |
+
+The removal is made on the library tables themselves, once, after they open. The
+string metatable's index is the `string` table, the registry's loaded-module table
+holds the same tables, and a module's environment reads through to the globals,
+so `rawget(_G, name)`, `_G` and `_ENV`, a module's environment,
+`getmetatable('').__index` and `('').dump` all find the name absent, and the
+`next`/`pairs` enumeration of each table does not list it. `package` and `debug`
+are absent, so a script has no way to the registry or to reopen an omitted
+library. Granted namespaces cannot bring a name back: the registration refuses
+the standard names (`os`, `io`, `load`, `loadfile`, `dofile`, `debug`, `package`,
+`require`, `collectgarbage` and the rest). This is about the supplied standard
+library: trusted Lua may define ordinary functions or tables with the same
+names.
+
+`print` and `warn` keep Lua's stock behaviour under the profile alone: `print`
+writes to the process's standard output, and `warn` writes to its standard error
+once a script has switched warnings on with `warn('@on')`. Bounded, rebound
+script output is a later slice (D-71, LFE-12), not something the profile
+delivers; filtering removes the ambient OS functions, not every way a process
+writes.
+
+**Errors.** A call to a removed function is an ordinary Lua operation on a
+missing value: `pcall` catches it, and later permitted computation goes on. An
+uncaught one follows the existing attributed Lua fault path — a `LuaFault` from an
+initial chunk, a `BoundaryFault` with a `ScriptFailed` reason from an entry
+point — and is not a latched host failure or a new refusal. The profile ships no
+random generator and makes no determinism claim; a script that needs one writes
+its own seeded one.
+
+**Profile and library list.** A profile owns the owner's whole standard-library
+set, so it cannot be combined with an explicit list. A configuration that selects
+a profile and also names libraries (`LibraryIo`, `LibraryOs`, `LibraryPackage`,
+`LibraryDebug`, or any other) is refused at construction, before any library
+opens or authored code runs, with a `BoundaryFault` of operation `OpenLibraries`
+and reason `ProfileWithLibraries`, through the same construction failure path as
+any other failed step: the VM is closed and the body never runs.
+
+**The protected boundary.** The filtering is one call, `hetoimasia_lua_filter_m1`,
+made as a single `lua_pcall` like `hetoimasia_lua_requiref`: the names it writes
+are built inside the protected frame, no argument crosses it, and a failure — a
+status Lua reports, or a library table missing — is classified like any other
+failed call (`MemoryExhausted` for memory, otherwise `CallFailed`), attributed to
+the stage `profile LibraryProfileM1`, and ends construction through the same
+close. Two independent owners never share a library table, so a profiled owner
+cannot receive a capability another owner opens, and opening, using or closing
+either leaves the other's surface as it was. The profile adds no dependency and
+exposes no Lua state, stack index, registry reference or native pointer.
+
+**What this is not.** Filtering removes ambient OS functions and arbitrary-source
+loading. It is not hostile-code containment: a trusted script can still hang its
+owner or exhaust the process's memory, and cooperative budgets are not hard
+limits. Engine-provided imports, bounded output, a module loader, content roots,
+services and the `run` command are later slices; none is delivered by this
+profile.
 
 ### Modules and entry points
 
@@ -866,6 +965,121 @@ just as observable. A Haskell failure raised by the action itself keeps #460's
 contract and is not converted: it is re-raised at the owner's boundary with its
 own type and context.
 
+### Recoverable refusals
+
+A binding is **generic** unless its registration opts it in: every refusal above is a
+fault of the call a script cannot hide. Two public functions of
+`Hetoimasia.Scripting.Lua.Registration` opt one binding in, and nothing else does; there is
+no owner-wide or catch-all switch.
+
+- `recoverableRefusals binding` makes the refusals the host makes **before the action** an
+  ordinary Lua error: a wrong number of arguments, a value of the wrong shape, type or
+  encoding, a value past a limit, and a capability that is not of the declared type, was
+  not issued by this VM, or that the application's own check reports retired.
+- `withPrecondition check binding` does that too, and has `check` run first. A precondition
+  is `OwnerContexts -> IO (Maybe Text)`: `Nothing` lets the call go on, `Just reason`
+  refuses it. It runs before the host asks whether a scheduler operation can suspend and
+  before any argument is read, so an adapter can refuse a wait made where it is not allowed
+  (a finite call, a hook that may not wait, the wrong instance) before the host reports
+  anything. Several preconditions run in the order they were added, and the first refusal
+  wins.
+
+**What the script sees.** An ordinary Lua error whose value is a string,
+`binding: reason`, where `binding` is `namespace.name` and `reason` is at most 256 bytes
+(`refusalReasonLimit`, the bound of a command's rejection) of UTF-8, cut at a character.
+The host's own reasons are short fixed phrases, for example
+`checked.add: argument 1: a float where an integer is declared` or
+`checked.echo_list: argument 1[2]: expected number, found string`; anything of the script's
+own in them, a field name, is cut to 32 characters first, so nothing unbounded is copied. The message is built under a fixed allowance of its
+own, not the owner's value limits, so even the smallest valid byte limit cannot turn a
+refusal the script caught into a fault. A
+precondition's reason is its own and is carried whole when it is within the bound. One
+longer is not truncated: it is a defect of the application, and is a typed
+`BoundaryFault` of the call (`ValueRefused`, `RuleBytesLimit 256`) whether or not the
+binding is opted in. `pcall` catches the error and the invocation goes on and can succeed;
+raised and uncaught it is the script's own error, reported where any is reported
+(`LuaFault`, or `ScriptFailed CallFailed` for a call or task), and under the task's, call's
+or instance's existing policy. There is no `BoundaryFault` and nothing retained on the VM
+for it.
+
+**No action.** A refused call never ran its action: no provider or native work, no
+request accepted, no resource published, and the action counter of the examples stays at
+zero. It is not a rollback: what the same invocation's earlier Lua and earlier actions did
+stands.
+
+**Where the facts come from.** A precondition checks engine-owned state: the
+`OwnerContexts` it is handed (the lifecycle and request contexts the owner was configured
+with, never a value the script supplied) or what the application captured when it built the
+registration. It never reads an argument, a Lua-visible table or a global registry, so a
+script rewriting a global, a field or a metatable cannot change what it decides: the
+same-VM, wrong-instance example rewrites every Lua-visible name it can and is still
+refused. Validation runs no authored metamethod and no coercion: the reader that copies
+arguments is the one every binding uses.
+
+**Error versus data.** A refusal is an error. A *response* is data. A binding whose action
+declares results `[SOptional x, SOptional (SRecord [("code", SText), ("message", SText)])]`
+and returns `nil, {code = "busy", message = text}` has answered, successfully, that it
+admitted nothing: the call is an ordinary success, the checked, bounded result path carries
+it, no handle exists, nothing is retained, and a later call may succeed. Nothing retries
+it. The host never turns its own full-capacity exception into one: that is the engine's
+refusal and keeps its own contract. What admits work atomically and owns capacity is the
+request and lease facade, not this mechanism.
+
+**What stays fatal**, opted in or not: an application's own failure (an action's, a
+precondition's, a liveness check's) with its type and context; an asynchronous
+cancellation; an internal bridge defect; an allocation or encoding failure; the refusal of
+a *result* and every failure after the action ran; the host's own refusal of a scheduler
+operation once the preconditions have passed (`SuspendRefused`, for a call that is not in a
+task, in another coroutine, or where Lua cannot suspend); and `NotYetSupported`, for a
+binding the owner has no context to deliver, which is decided before any precondition
+runs. An opted-in binding does not make its effectful action recoverable: nothing wraps the
+action, and the VM's recorded failure is never cleared. A refusal that is caught records
+nothing, so it cannot erase a fault a generic binding already recorded, a deliberately
+latched failure or an application's failure, and a later success, busy answer or caught
+refusal cannot either; the operation that ran the script still raises it, with the effect
+(`BindingRan`) of everything that followed.
+
+**Finalizers.** Lua turns an error raised in a `__gc` finalizer into a warning and tells
+nobody, so an ordinary refusal there would be silent, where a generic binding's is recorded
+and fails the operation or is kept as cleanup evidence. A refusal of an opted-in binding
+therefore keeps the recorded fault whenever a finalizer may be the caller: for every call
+made while the VM is closing, and for any call made while the collector is not running,
+which is how Lua presents a running finalizer (it answers every collector request with its
+internal stop) and also how a script that stopped the collector looks. The cost of that
+conservative reading is only that a script which stopped its own collector gets the fault
+it always got. A finalizer-eligible binding can be opted in, and the closing finalizer's
+refusal is retained as cleanup evidence exactly as before.
+
+**Compatibility.** Every binding constructor still builds the generic binding; the
+existing examples are unchanged beside the new ones, and the foreign-call protections hold
+on the new path: the message is built by the protected push that results use (an
+allocation failure is a status, never a Lua error raised from a Haskell frame), the C
+closure raises it only after every Haskell frame has returned, the stack and temporary
+references are balanced on every path, and the registration's finalizer, scheduler and
+missing-context refusals are the ones in force. A scheduler operation opted in refuses
+before it reports any suspension, and the same operation not opted in keeps the order
+and the typed fault described under [Where it cannot reach a scheduler](#where-it-cannot-reach-a-scheduler).
+
+A small client, built from the public modules alone:
+
+```haskell
+import Hetoimasia.Scripting.Lua.Registration
+
+checked, tick ∷ Binding
+checked = recoverableRefusals (snapshotQuery "double" [SInteger] [SInteger] double)
+tick = withPrecondition engineOpen (stateOperation "tick" [] [] (\_ → pure []))
+  where
+    engineOpen _ = (\open → if open then Nothing else Just "engine closed") <$> readIORef engineState
+```
+
+```lua
+local ok, err = pcall(app.double, 1.5)
+-- ok == false, err == "app.double: argument 1: a float where an integer is declared"
+print(app.double(21))   -- 42: the invocation went on
+```
+
+`Test.Lua.Opacity` compiles, links and runs exactly such a client.
+
 ### Fault evidence
 
 A `BoundaryFault` is an ordinary Haskell exception, produced with no Lua run to
@@ -963,11 +1177,14 @@ deliver lifecycle operations); lifecycle operations delivered to an owner with a
 refused, their action never run, to one without;
 independent owners on separate threads with different policies; installation;
 discipline, with the allocator's budget swept across installation, loading,
-calling and marshalling; and the dependency closure. `Test.Lua.Opacity` adds
+calling and marshalling; the opted-in bindings' recoverable refusals
+(`Test.Lua.Boundary.Recoverable`, beside the generic ones, and
+`Test.LuaRuntime.Recoverable` under real supervision); and the dependency closure. `Test.Lua.Opacity` adds
 negative clients that forge a handle or a capability, reach for a binding's
-closure or for a Lua state, and a positive client built from the public modules
-alone that constructs a registration and an owner's policy, loads a module, calls
-an entry point and observes a typed refusal.
+closure or for a Lua state, and positive clients built from the public modules
+alone: one constructs a registration and an owner's policy, loads a module, calls
+an entry point and observes a typed refusal, and one opts a binding in to
+recoverable refusals.
 
 ## Tasks and the coroutine library
 
