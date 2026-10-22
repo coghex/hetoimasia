@@ -147,6 +147,7 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.scripting-lua` | `cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct` | no | no | any |
 | `test.scripting-lua-runtime` | `cabal test hetoimasia-scripting-lua:lua-runtime-tests --test-show-details=direct` | no | no | any |
 | `test.lua-domains` | `cabal test hetoimasia-sample-lua-domains:lua-domains-tests --test-show-details=direct` | no | no | any |
+| `test.lua-engine` | `cabal test --project-file cabal.project.cpu hetoimasia-lua-engine:lua-engine-tests --test-show-details=direct` | no | no | any |
 | `test.lua-confinement-linux` | `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct` | yes | no | `Linux` |
 | `test.vulkan` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct` | no | no | any |
 | `test.vulkan-diagnostics` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-details=direct` | no | no | any |
@@ -295,6 +296,21 @@ and like `test.vulkan` its command names `cabal.project.cpu` and the group
 declares that file beside `cabal.project.common`: the library depends on `base`
 alone, and running its suite through the CPU project is what shows it needs no
 native prerequisite. See [the package's contract](../packages/math/README.md).
+
+`test.lua-engine` runs the Lua-first engine package's own suite, `lua-engine-tests`:
+the strict format-1 manifest parsed from supplied bytes -- its accepted examples, the
+byte limit at 65,536 and one past it, the nesting limit at eight containers and nine,
+every syntax refusal (byte order mark, malformed UTF-8, unpaired surrogate escapes,
+comments, trailing commas and data, non-object roots, duplicate keys after escape
+decoding), the exact numeric reading of `format`, every schema refusal and the fixed
+order refusals are decided in, and `tick_seconds` as exact decimal nanoseconds -- and
+the fixed M1 profile of limits against an independently written expectation, with its
+smaller validated test profiles and the profiles it refuses. It performs no IO and
+starts no Lua, window or GPU. It is mandatory but outside the floor, like `test.math`,
+and its command names `cabal.project.cpu`; the group declares that file beside
+`cabal.project.common`. CI routes it to the `haskell-engine` worker and publishes its
+receipt like every other group that worker owns. See
+[the package's contract](../packages/lua-engine/README.md).
 
 `test.asset-image` runs the asset-image package's own suite: committed fixture
 PNGs — every colour type at every bit depth, 16-bit files, palette `tRNS`
@@ -885,7 +901,7 @@ Each worker is declared once, to the planner:
 
 ```bash
 python3 tools/validation/plan.py --base origin/master --head HEAD \
-  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,test.render-api,test.render-2d,test.render-2d-oracle,smoke.console \
+  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.lua-engine,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,test.render-api,test.render-2d,test.render-2d-oracle,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native,test.glfw-wayland \
   --worker vulkan=cpu+display:test.vulkan-headless,test.vulkan-native,test.vulkan-wayland
@@ -1050,7 +1066,7 @@ class to every execution:
 
 | Job | Runner class | Groups, in order |
 | --- | --- | --- |
-| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.scripting-lua-runtime`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.asset-image`, `test.render-api`, `test.render-2d`, `smoke.console` |
+| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.scripting-lua-runtime`, `test.lua-engine`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.asset-image`, `test.render-api`, `test.render-2d`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native`, `test.glfw-wayland` |
 | `vulkan` | `cpu`, `display` | `test.vulkan-headless`, `test.vulkan-native`, `test.vulkan-wayland` |

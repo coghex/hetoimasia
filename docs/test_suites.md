@@ -13,6 +13,7 @@ cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct
 cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct
 cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct
 cabal test hetoimasia-scripting-lua:lua-runtime-tests --test-show-details=direct
+cabal test --project-file cabal.project.cpu hetoimasia-lua-engine:lua-engine-tests --test-show-details=direct
 cabal test hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct
 cabal test hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-math:math-tests --test-show-details=direct
@@ -83,6 +84,13 @@ cabal test hetoimasia-tests --test-show-details=direct
   wait from a Lua callback, with real VMs under a real `withSupervision`, plus
   the adapter's dependency closure, which needs no VM. It selects and fails on
   an empty selection the same way.
+  `lua-engine-tests` (`packages/lua-engine/test/`, composed by `Test.LuaEngine.Spec`,
+  group `test.lua-engine`, the CPU project) owns the Lua-first engine's pure
+  configuration boundary (LFE-3): the strict manifest parser's accepted examples,
+  byte and nesting limits, syntax and schema refusals and exact tick conversion, the
+  fixed M1 profile and its smaller validated test profiles, and the package's
+  dependency and import boundary. It performs no IO and starts no Lua, window or GPU.
+  A new manifest or profile example belongs there, in the component spec that owns it.
   Selectors moved with their examples: on the root suite, `--match Runtime`,
   `Resources`, `Recovery`, `Workers`, `Messaging`, `Logging`, `Failures`, and
   `GLFW` now select nothing and fail; on `runtime-tests`, `--match Supervision`
