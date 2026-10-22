@@ -83,7 +83,7 @@ concrete precondition
 - [x] LFE-18. Create and retire instance-owned windows asynchronously — [#533]
 - [x] LFE-19. Validate and copy the fixed M1 scene schema — [#534]
 - [x] LFE-20. Publish scenes with completion-safe texture retention — [#535]
-- [ ] LFE-21. Expose the complete UI-only graphics facade
+- [x] LFE-21. Expose the complete UI-only graphics facade — [#536]
 - [ ] LFE-22. Assemble the generic run command and Lua quad content
 - [ ] LFE-23. Qualify integrated failure and two-instance ownership headlessly
 - [ ] LFE-24. Verify Lua-authored output through offscreen pixels
