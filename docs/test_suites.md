@@ -17,6 +17,7 @@ cabal test --project-file cabal.project.cpu hetoimasia-lua-engine:lua-engine-tes
 cabal test hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct
 cabal test hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-math:math-tests --test-show-details=direct
+cabal test --project-file cabal.project.cpu hetoimasia-content:content-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-asset-image:asset-image-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-render-api:render-api-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-render-2d:render-2d-tests --test-show-details=direct
