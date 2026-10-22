@@ -114,6 +114,27 @@ spec = describe "the package and import boundary" $ do
     [file <> ": " <> name | (file, name) ← imported, not (permittedRequest name)] `shouldBe` []
     [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
 
+  it "has a data sublibrary over the profile, the request adapter, the content package and the host's public modules, and nothing else" $ do
+    (sort <$> fieldEntries "library data" "build-depends:")
+      `shouldReturn` [ "base"
+                     , "bytestring"
+                     , "hetoimasia-content"
+                     , "hetoimasia-lua-engine"
+                     , "hetoimasia-lua-engine:request"
+                     , "hetoimasia-scripting-lua"
+                     , "hetoimasia-scripting-lua:runtime-lua"
+                     , "stm"
+                     , "text"
+                     ]
+    fieldEntries "library data" "exposed-modules:" `shouldReturn` ["Hetoimasia.LuaEngine.Data"]
+
+  it "imports, in the data sublibrary, only the profile, the request adapter, the content package's public modules, the host's public modules and base libraries: no private module, window, GPU, console, sample or game" $ do
+    sources ← sourcesUnder "data"
+    sources `shouldSatisfy` ((>= 1) . length)
+    imported ← importedBy sources
+    [file <> ": " <> name | (file, name) ← imported, not (permittedData name)] `shouldBe` []
+    [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
+
   it "lets only the behavior selection import the Lua host and runtime, and only their public modules" $ do
     sources ← sourcesUnder "src"
     imported ← importedBy sources
@@ -175,6 +196,18 @@ spec = describe "the package and import boundary" $ do
         || "GHC." `isPrefixOf` name
         || name `elem` ["Hetoimasia.LuaEngine.Profile"]
         || "Hetoimasia.Scripting.Lua." `isPrefixOf` name
+    permittedData name =
+      "Data." `isPrefixOf` name
+        || "GHC." `isPrefixOf` name
+        || "Control." `isPrefixOf` name
+        || name
+          `elem` [ "Hetoimasia.LuaEngine.Profile"
+                 , "Hetoimasia.LuaEngine.Request"
+                 , "Hetoimasia.Content.Identity"
+                 , "Hetoimasia.Content.Inventory"
+                 , "Hetoimasia.Content.ReadPool"
+                 ]
+        || "Hetoimasia.Scripting.Lua." `isPrefixOf` name
     permittedSuite name =
       name
         `elem` [ "Hetoimasia.LuaEngine.Manifest"
@@ -182,6 +215,8 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.LuaEngine.Boot"
                , "Hetoimasia.LuaEngine.Profile"
                , "Hetoimasia.LuaEngine.Request"
+               , "Hetoimasia.LuaEngine.Data"
+               , "Hetoimasia.Content.ReadPool"
                , "Hetoimasia.Foundation.Time"
                , "Hetoimasia.Foundation.Log"
                , "Hetoimasia.Foundation.Resource"
