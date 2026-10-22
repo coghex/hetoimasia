@@ -79,6 +79,7 @@ module Hetoimasia.Scripting.Lua.Lease.State
   , reserve
   , register
   , abandon
+  , retainFailed
   , recordRetirement
   , deferDisposal
 
@@ -371,6 +372,15 @@ abandon leases key =
         | not (retainedPending (slotRetained slot)) → Nothing
         | otherwise → Just slot {slotPhase = SlotReleased}
       _ → Just slot
+
+-- | A reservation whose building failed and whose rollback could not be proven: a stage's release
+-- raised, so what it held may not be retired. The slot stays, failed, and keeps its charge; nothing is
+-- reported as reclaimed, and whatever was charged beside it (the credits that were to transfer to the
+-- resource) stays charged with it. The failure is the evidence.
+retainFailed ∷ Leases → Word64 → ExceptionWithContext SomeException → STM ()
+retainFailed leases key failure =
+  modifyTVar' (leasesState leases) $ \state →
+    state {lsSlots = Map.adjust (\slot → slot {slotPhase = SlotFailed failure, slotHolding = Nothing}) key (lsSlots state)}
 
 -- | Whether a slot is still charged: reserved, live, releasing, or released with a provider's retirement
 -- of what it held still to complete. A slot is gone once nothing is charged to it any more.
@@ -677,7 +687,10 @@ adoptReserved host number key build = mask $ \_ → do
         rendered ← renderCaught (cleanupFailureException cleanup)
         pure ("a rollback release failed: " <> cleanupFailureLabel cleanup <> ": " <> rendered)
       atomically $ do
-        abandon leases key
+        -- A rollback release that raised leaves the resource's retirement unproven: the reservation
+        -- stays charged, failed, and so do the credits beside it. Without one, it is given back (unless a
+        -- stage's retirement is pending, which keeps it).
+        if null (cleanupFailuresInContext context) then abandon leases key else retainFailed leases key failure
         forM_ notes (noteScope leases number)
       pure (Left failure)
 

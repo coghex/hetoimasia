@@ -7,7 +7,7 @@ module Test.LuaRuntime.Admission.Races (spec) where
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, throwSTM, writeTVar)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException, throwIO)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException, throwIO, toException)
 import Control.Monad (forM, void)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
@@ -23,7 +23,7 @@ import Hetoimasia.Scripting.Lua.Value (Schema (SText), Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Admission.Support
 import Test.LuaRuntime.Instance.Support (admitWith, awaitSettled, expectControl, failureOf', idOf, moduleNamed, sf)
-import Test.LuaRuntime.Request.Support (Submitted (..), answerResult, answerWith, awaitDiagnostic, diagnostics, finishWork, fakeEndpoint, fakeEndpointOf, onCancel, onSubmit, submissionAt)
+import Test.LuaRuntime.Request.Support (Submitted (..), answerResult, answerWith, awaitDiagnostic, diagnostics, finishWork, fakeEndpoint, fakeEndpointOf, failWorkWith, onCancel, onSubmit, submissionAt)
 import Test.LuaRuntime.Scheduled.Support (awaitEntered, awaitScheduledTerminal, releaseGate)
 import Test.LuaRuntime.Support (Broken (Broken), bounded, brokenIs, expectFatal, requiredPolicy, tryExpected, withBoundary)
 
@@ -408,3 +408,112 @@ spec = describe "races" $ do
         awaitNote fixture "cmd start a started"
         answerWith (afFake fixture) 0 (ProviderResource (VText "small") (Adoption (\_ → resourceFor fixture "r1"))) >>= (`shouldBe` ReplyAdoption)
         awaitNote fixture "acquire r1"
+
+  describe "a release, retirement or rollback that fails while a resource is cleaned up" $ do
+    -- A transferring credit of a bank of one, and the policy of an owner that reserves a lease for it.
+    let transferring fixture bank = setPolicy fixture (\held -> held {polLease = Just InstanceOwned, polCredits = [bankCredit "pixels" True bank]})
+        -- A resource whose own release raises before it could give its credit back.
+        breakingResource fixture name = do
+          _ ← acquirePart name (releaseRank 0) (() <$ note fixture ("acquire " <> name)) (\_ → throwIO (Broken ("release " <> name)))
+          pure name
+
+    it "keeps the credits charged when a rollback release raises: the primary and the cleanup failure are both kept" $ bounded $ do
+      fixture ← newAFix 4
+      bank ← newBank 1
+      transferring fixture bank
+      let failing =
+            Adoption $ \_ → do
+              _ ← breakingResource fixture "texture"
+              restoredStep (throwIO (Broken "adopt"))
+              pure ("never" ∷ Text)
+      ExceptionWithContext context failure ← expectFatal $ \control runtime → settleAll fixture $ do
+        owner ← arrival fixture runtime "rollback raises"
+        admitAdmitter fixture owner "i" "admitter"
+        acommandWith fixture owner "i" "start" "a" (Just "res") (Just 1) Nothing
+        awaitNote fixture "cmd start a started"
+        _ ← answerWith (afFake fixture) 0 (ProviderResource (VInteger 5) failing)
+        awaitScheduledTerminal control owner
+      failure `shouldSatisfy` brokenIs "adopt"
+      length (cleanupFailuresInContext context) `shouldSatisfy` (>= 1)
+      -- Retirement of the resource is unproven: nothing was given back.
+      bankLog bank >>= (`shouldBe` [])
+      bankAvailable bank >>= (`shouldBe` 0)
+
+    it "keeps the credits charged when an adopted resource's release raises as its instance ends" $ bounded $ do
+      fixture ← newAFix 4
+      bank ← newBank 1
+      transferring fixture bank
+      ExceptionWithContext context _ ← expectFatal $ \control runtime → settleAll fixture $ do
+        owner ← arrival fixture runtime "release raises"
+        admitAdmitter fixture owner "i" "admitter"
+        acommandWith fixture owner "i" "start" "a" (Just "res") (Just 1) Nothing
+        awaitNote fixture "cmd start a started"
+        _ ← answerWith (afFake fixture) 0 (ProviderResource (VInteger 5) (Adoption (\_ → breakingResource fixture "r1")))
+        awaitNote fixture "acquire r1"
+        awaitLeaseSummary fixture "i" ((== 1) . summaryLive)
+        _ ← expectControl (afBase fixture) owner "i" InstanceStop
+        awaitScheduledTerminal control owner
+      length (cleanupFailuresInContext context) `shouldSatisfy` (>= 1)
+      bankLog bank >>= (`shouldBe` [])
+      bankAvailable bank >>= (`shouldBe` 0)
+
+    it "keeps the credits charged when the resource built after its request was cancelled raises as it is released" $ bounded $ do
+      fixture ← newAFix 4
+      bank ← newBank 1
+      endpoint ← newIORef Nothing
+      entered ← newEmptyMVar
+      proceed ← newEmptyMVar
+      transferring fixture bank
+      let building =
+            Adoption $ \_ → do
+              _ <-
+                acquirePart
+                  "texture"
+                  (releaseRank 0)
+                  (void (tryPutMVar entered ()) >> readMVar proceed)
+                  (\_ → throwIO (Broken "release texture"))
+              pure ("texture" ∷ Text)
+      ExceptionWithContext context _ ← expectFatal $ \control runtime → settleAll fixture $ do
+        owner ← arrival fixture runtime "cancelled release raises"
+        writeIORef endpoint (Just (scheduledEndpoint owner))
+        admitAdmitter fixture owner "i" "admitter"
+        acommandWith fixture owner "i" "start" "a" (Just "res") (Just 1) Nothing
+        awaitNote fixture "cmd start a started"
+        _ ← answerWith (afFake fixture) 0 (ProviderResource (VInteger 5) building)
+        readMVar entered
+        readIORef endpoint >>= maybe (pure ()) (void . advanceRequestEpoch)
+        putMVar proceed ()
+        awaitScheduledTerminal control owner
+      length (cleanupFailuresInContext context) `shouldSatisfy` (>= 1)
+      bankLog bank >>= (`shouldBe` [])
+      bankAvailable bank >>= (`shouldBe` 0)
+
+    it "keeps the credits charged when a stage's retirement is reported failed by its provider" $ bounded $ do
+      fixture ← newAFix 4
+      bank ← newBank 1
+      transferring fixture bank
+      let failing =
+            Adoption $ \retirements → do
+              _ <-
+                acquirePart
+                  "texture"
+                  (releaseRank 0)
+                  (() <$ note fixture "acquire texture")
+                  ( \_ → do
+                      found ← submissionAt (afFake fixture) 0
+                      retireAsynchronously retirements "texture" (readTVar (sbRetirement found))
+                  )
+              restoredStep (throwIO (Broken "adopt"))
+              pure ("never" ∷ Text)
+      ExceptionWithContext _ failure ← expectFatal $ \control runtime → settleAll fixture $ do
+        owner ← arrival fixture runtime "retirement failed"
+        admitAdmitter fixture owner "i" "admitter"
+        acommandWith fixture owner "i" "start" "a" (Just "res") (Just 1) Nothing
+        awaitNote fixture "cmd start a started"
+        _ ← answerWith (afFake fixture) 0 (ProviderResource (VInteger 5) failing)
+        awaitDiagnostic owner ((== 0) . rdOutstanding)
+        failWorkWith (afFake fixture) 0 (toException (Broken "retire texture"))
+        awaitScheduledTerminal control owner
+      failure `shouldSatisfy` (\_ → True)
+      bankLog bank >>= (`shouldBe` [])
+      bankAvailable bank >>= (`shouldBe` 0)
