@@ -1117,12 +1117,18 @@ checkEvaluated limits schema ask reply = case ask of
             Just make | adopting → make found 0
             _ → found
           frame found = admitSuccessFrame opted (combined found)
-          -- The ceilings are the crossing's: the complete record a script is handed.
-          withinCeilings found = fitsLimits (admitReplyLimits opted) (frame found)
+          -- What is retained is the provider's own value, whatever the combiner hands the script in its
+          -- place: for a result whose resource is built, that value too is bounded by the owner's limits
+          -- and the admission's ceilings, as the plain record it would be.
+          plain found = admitSuccessFrame opted found
+          retainedFits found = not adopting || (fitsLimits limits (plain found) && fitsLimits (admitReplyLimits opted) (plain found))
+          retainedBytes found = either (const 0) id (valuesFootprint limits [VRecord (plain found)])
+          -- The ceilings are the crossing's: the complete record a script is handed, and the value kept.
+          withinCeilings found = fitsLimits (admitReplyLimits opted) (frame found) && retainedFits found
       judged ← judgeWith frame withinCeilings limits schema (ProviderResult value)
       pure $ case judged of
         CheckedResult bytes found → case recipe of
-          Just made | isJust (admitLease opted) → CheckedResource bytes found made
+          Just made | adopting → CheckedResource (max bytes (retainedBytes found)) found made
           _ → CheckedResult bytes found
         CheckedOversize _ → CheckedDefect "the provider's result is over the ceilings its service declares"
         CheckedMalformed why → CheckedDefect (Text.take 480 why)

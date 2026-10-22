@@ -382,3 +382,29 @@ spec = describe "races" $ do
         answerWith (afFake fixture) 0 (ProviderResult (VText (Text.replicate 300 "x"))) >>= (`shouldBe` ReplyDefective)
         awaitScheduledTerminal control owner
       (fromException failure ∷ Maybe ProviderDefect) `shouldSatisfy` (/= Nothing)
+
+  describe "a resource reply whose combiner hands the script something small in place of the value" $ do
+    let grantOf fixture = RequestGrant [fakeEndpointOf (afFake fixture) "path" SText, fakeEndpoint (afFake fixture) "res"] 8 SettleOnArrival
+    it "is a provider defect when the value the engine keeps is over the ceilings, though the record handed is not" $ bounded $ do
+      fixture ← newAFix 4
+      setPolicy fixture (\held -> held {polLease = Just InstanceOwned, polCombine = Just (\_ _ → VInteger 0), polReplyBytes = 128})
+      ExceptionWithContext _ failure ← expectFatal $ \control runtime → settleAll fixture $ do
+        owner ← startAdmitting fixture runtime "resource over" [admitter] aConfig (grantOf fixture) requiredPolicy
+        admitAdmitter fixture owner "i" "admitter"
+        acommand fixture owner "i" "start" "a"
+        awaitNote fixture "cmd start a started"
+        answerWith (afFake fixture) 0 (ProviderResource (VText (Text.replicate 100000 "x")) (Adoption (\_ → resourceFor fixture "r1"))) >>= (`shouldBe` ReplyDefective)
+        awaitScheduledTerminal control owner
+      (fromException failure ∷ Maybe ProviderDefect) `shouldSatisfy` (/= Nothing)
+      historyCount fixture "acquire r1" >>= (`shouldBe` 0)
+
+    it "adopts a value within the ceilings, and the owner builds the resource" $ bounded $ do
+      fixture ← newAFix 4
+      setPolicy fixture (\held -> held {polLease = Just InstanceOwned, polCombine = Just (\_ _ → VInteger 0), polReplyBytes = 128})
+      withBoundary $ \_ runtime → settleAll fixture $ do
+        owner ← startAdmitting fixture runtime "resource within" [admitter] aConfig (grantOf fixture) requiredPolicy
+        admitAdmitter fixture owner "i" "admitter"
+        acommand fixture owner "i" "start" "a"
+        awaitNote fixture "cmd start a started"
+        answerWith (afFake fixture) 0 (ProviderResource (VText "small") (Adoption (\_ → resourceFor fixture "r1"))) >>= (`shouldBe` ReplyAdoption)
+        awaitNote fixture "acquire r1"
