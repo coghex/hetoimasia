@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-69/Q-6t: Lua's orderly whole-session quit operation.
+The current checkpoint is P-70/Q-6u: whether M1 exposes window-size observation.
+D-72 accepts an idempotent whole-session quit request that returns normally.
 D-71 accepts bounded print/warn output without a separate Lua logging API.
 D-70 accepts UI-only polling of copied session status sampled per segment.
 D-69 defers engine randomness and removes standard RNG calls in both M1 VMs.
@@ -2171,6 +2172,39 @@ The manager presented the lack of levels/structured fields, truncation and
 blocking on slow output as costs. The owner chose the small print/warn surface
 over a structured Lua logging service. Existing Haskell logging remains;
 its Lua service is deferred, not removed from the engine.
+
+### D-72. Lua requests orderly whole-session quit, then returns to its hook
+
+**Delivery:** M1 session control; no Lua force-exit or per-instance control API.
+
+Owner answer, **2026-10-22 03:19:38 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: request, then return (Rec.)
+
+Authenticated relay: `het-manager`, message `iyc3ugrwnjbwyyqstuj3erc7ma`,
+posted **2026-10-22 03:19:38.792 UTC** in `#het-luafirst`, replying to Q-6t
+message `nmib65b8m349kuivk2r9ctgtt2`.
+
+Accept P-69's A: a no-argument/no-result operation in either VM's lifecycle
+hooks, including init/shutdown, latches normal whole-session stop and returns.
+It uses no request slot, cannot return busy and is harmless when repeated.
+Module-top-level calls remain ordinary Lua errors. The manager's `quit()`
+spelling describes the operation; its final namespace remains for the API
+package, as the proposal stated.
+
+After the latch, new content/window/texture requests and scene publications
+are Lua errors before native action; release, cancel, print and warn retain
+their existing rules. The current hook continues until return or a scheduler
+boundary. Catching cannot undo the stop, no further ordinary continuation
+resumes after stop applies, and init success cannot reopen the startup gate.
+Existing failure precedence, safe shutdown eligibility and actual resource
+retirement remain mandatory. This is no synchronous completion receipt.
+
+The manager presented the need to return promptly and the second Ctrl-C
+escape for a hang. The owner chose a returning request over immediate hook
+termination. D-20 still covers both SIGINT and SIGTERM, and failure after a
+quit request can still make the orderly process outcome fail.
 
 ## Proposals
 
@@ -5973,7 +6007,7 @@ work, not a claim that the current runner already implements this proposal.
 
 ### P-69. Make Lua quit an idempotent stop request that returns normally
 
-**Unapproved; active checkpoint Q-6t. Delivery: M1.** D-20 already requires
+**A accepted by D-72 through Q-6t. Delivery: M1.** D-20 already requires
 orderly whole-session quit, failure-dominant exit status and no Lua force-exit.
 Recommend A: a no-argument, no-result quit operation latches the session's
 normal-stop request and returns to the current Lua hook. The spelling belongs
@@ -6046,6 +6080,58 @@ already apply controls at safe boundaries, stop future grants, retire pending
 requests and distinguish stop from cleanup completion. The no-store launcher
 must wire a narrow whole-session binding and admission gate; this proposal
 does not expose the existing runner's wider instance-control namespace.
+
+### P-70. Defer Lua window-size observation while retaining native resize handling
+
+**Unapproved; active checkpoint Q-6u. Delivery: M1 boundary / later presentation.**
+D-45 lets Lua request a title and initial size; D-50 keeps the renderer's
+full-window view current as native geometry changes. Neither decision yet
+grants Lua a read of current window/view geometry. Recommend A: no window-size
+or render-view-metrics read in M1, and no resize callback/subscription. The
+window request's success returns the owned ready window resource, not a
+continuously updated metrics table. Texture dimensions remain available under
+D-47; this does not remove that accepted result.
+
+Lua publishes rectangles at explicit logical-pixel coordinates and dimensions.
+The engine continues to update its viewport and framebuffer/content-scale
+mapping on resize, clips out-of-view rectangles and suspends drawing at zero
+framebuffer extent. It neither stretches the scene to fill the window nor
+recenters or relays out sprites. An unchanged static scene needs no republish
+to keep rendering with the current native metrics. Close still requests session
+quit under D-51; general input/window controls remain deferred.
+
+The requested initial window size is an authored preference, not a report of
+the actual current viewport. Native platforms may choose a different extent,
+and D-50 already distinguishes renderer logical pixels from window screen
+coordinates. A does not permit a fabricated current-size field copied from the
+request. A future metrics read can be added without changing scene ownership,
+texture lifetime or these coordinate rules.
+
+Alternative B adds a narrow UI-only read of the owned ready window's current
+render-view extent in the same logical units as its sprites, without general
+input, resize callbacks or window mutation controls. It allows Lua to center
+or fit a quad by polling and republishing. Its coherent sampling, unavailable/
+zero-extent representation, ready-resource/phase validation and exact schema
+would be settled in the API package; it must derive from renderer metrics,
+not assume GLFW's window size is the same unit on every platform.
+
+A is recommended for the explicitly scoped textured-quad milestone. Cost:
+Lua cannot automatically recenter, fill or otherwise adapt authored layout
+to the actual window size; authors choose fixed rectangles, and resizing may
+expose more background or clip more of the scene. This is a deliberate M1
+authoring limit, not a claim that responsive layout is unnecessary later.
+Choosing B buys that immediate ability at the cost of another observation
+binding and platform/resize qualification.
+
+The existing M1 evidence still checks automatic viewport adaptation, content
+scale, zero-size suspension and restoration without mutating the Lua scene.
+No test may infer current size from the requested initial size. Evidence:
+[GLFW observations](../glfw.md#observations) publish sampled logical extent,
+framebuffer extent and content scale with explicit unavailable values;
+P-47/D-50 preserve the renderer's distinct coordinate mapping. These native
+facilities remain available to the engine whichever Lua boundary is chosen.
+After this scope choice, proceed to the consolidated M1 API/manifest/bounds
+contracts, then Q-8 vision/#145 reconciliation and Q-9 delivery slices.
 
 ## Open questions
 
@@ -6505,12 +6591,19 @@ fatal sink failure and no separate structured Lua logger in M1.
 
 #### Q-6t. Does orderly session quit return or terminate the invocation?
 
-**Active checkpoint, P-69.** A (recommended): either role's hook latches an
-idempotent whole-session stop without a request slot, then returns normally;
-authors return promptly and avoid new work. Module-top calls are refused,
-shutdown calls are harmless, and existing failure/cleanup precedence remains.
-B: a protected terminal control operation ends the invocation immediately,
-requiring its own pcall/coroutine and interrupted-init/shutdown semantics.
+Resolved by D-72: P-69's A, either role's lifecycle hook requests whole-session
+stop without a slot/busy result and returns normally. Repeats are harmless;
+module-top calls are refused. Authors must return promptly; failure precedence
+and safe-boundary/actual-retirement rules remain.
+
+#### Q-6u. Defer Lua window-size reads or expose a narrow view-extent query?
+
+**Active checkpoint, P-70.** A (recommended): keep M1 rectangles explicitly
+positioned/sized, with native viewport adaptation but no Lua metrics read or
+resize callback. Cost: no automatic Lua layout for actual window size.
+B: add UI polling of the owned ready window's render-view extent, with its
+observation/schema contract in the API package. Both preserve D-50 coordinates,
+native resize/zero-size safety and D-51 close-to-quit.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
