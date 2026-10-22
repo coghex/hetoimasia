@@ -11,6 +11,7 @@ packages:
   packages/render-2d-oracle
   packages/runtime
   packages/scripting-lua
+  packages/lua-engine
   samples/lua-domains
   packages/glfw
   packages/gpu-vulkan/model

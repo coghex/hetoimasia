@@ -80,6 +80,12 @@ package hetoimasia-sample-scene3d-app
 package hetoimasia-scripting-lua
   ghc-options: -Werror -j
 
+-- The Lua-first engine's manifest and fixed M1 profile (LFE-3) is held to the same
+-- policy. It needs no GLFW or Vulkan, so both `cabal.project` and
+-- `cabal.project.cpu` list it; `cabal.project.vulkan` does not until LFE-22.
+package hetoimasia-lua-engine
+  ghc-options: -Werror -j
+
 -- The two-domain Lua sample (LUA-29, D-44) is held to the same policy. It needs no
 -- GLFW or Vulkan, so both `cabal.project` and `cabal.project.cpu` list it.
 package hetoimasia-sample-lua-domains
