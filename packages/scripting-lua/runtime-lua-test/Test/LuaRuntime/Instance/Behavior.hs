@@ -241,6 +241,21 @@ spec = describe "M1 behavior instances" $ do
           resultPhase settled `shouldBe` Stopped
           logged fixture >>= (`shouldBe` ["init", "shutdown stopped"])
 
+    it "gives a module's top level no facade and no instance: only a hook is handed one" $ bounded $
+      withDefaults
+        [ exportOf
+            "toplevel"
+            [ record <> "('top level: api=' .. tostring(api) .. ' self=' .. tostring(self))"
+            , "return { gameplay = { init = function(self, api) " <> record <> "('hook: api=' .. type(api)) end } }"
+            ]
+        ]
+        $ \fixture _ owner → do
+          -- The top level ran when the owner started, before any instance existed.
+          logged fixture >>= (`shouldBe` ["top level: api=nil self=nil"])
+          _ ← admitBehavior fixture owner "t" (requestFor "toplevel" "gameplay" (facadeNamed "t") logicalRule)
+          awaitPhase fixture owner "t" Active
+          logged fixture >>= (`shouldBe` ["top level: api=nil self=nil", "hook: api=table"])
+
     it "installs self.api for an instance with no init, and runs no init for it" $ bounded $
       withDefaults
         [exportOf "noinit" ["return { gameplay = { update = function(self, dt) " <> record <> "('api=' .. self.api.name) end } }"]]

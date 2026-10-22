@@ -39,6 +39,17 @@
 -- export. Later changes to the behavior table or the export table do not reach a
 -- capture.
 --
+-- = Evaluation versus hook context
+--
+-- The facility grants no engine resource authority to a module's top level merely
+-- because a caller has an instance facade: a facade is injected into a capture and
+-- reaches only the hooks, as their second argument and @self.api@, and a module's
+-- top level has no way to see one. It starts no service and owns no instance. The
+-- later import and phase checks (LFE-9, LFE-12) need to tell the two apart, and the
+-- VM's run context does: while an export module's top level runs, its entry is
+-- absent (@Nothing@, as for any module being loaded); while a captured hook runs it
+-- names the hook's entry. That is the explicit boundary they build on.
+--
 -- = Lifetime
 --
 -- Export tables last as long as the VM. A capture lasts until it is released or
