@@ -147,10 +147,12 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.scripting-lua` | `cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct` | no | no | any |
 | `test.scripting-lua-runtime` | `cabal test hetoimasia-scripting-lua:lua-runtime-tests --test-show-details=direct` | no | no | any |
 | `test.lua-domains` | `cabal test hetoimasia-sample-lua-domains:lua-domains-tests --test-show-details=direct` | no | no | any |
+| `test.lua-engine` | `cabal test --project-file cabal.project.cpu hetoimasia-lua-engine:lua-engine-tests --test-show-details=direct` | no | no | any |
 | `test.lua-confinement-linux` | `cabal test hetoimasia-scripting-lua:linux-confinement-probe --test-show-details=direct` | yes | no | `Linux` |
 | `test.vulkan` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct` | no | no | any |
 | `test.vulkan-diagnostics` | `cabal test --project-file cabal.project.cpu hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-details=direct` | no | no | any |
 | `test.math` | `cabal test --project-file cabal.project.cpu hetoimasia-math:math-tests --test-show-details=direct` | no | no | any |
+| `test.content` | `cabal test --project-file cabal.project.cpu hetoimasia-content:content-tests --test-show-details=direct` | no | no | any |
 | `test.asset-image` | `cabal test --project-file cabal.project.cpu hetoimasia-asset-image:asset-image-tests --test-show-details=direct` | no | no | any |
 | `test.render-api` | `cabal test --project-file cabal.project.cpu hetoimasia-render-api:render-api-tests --test-show-details=direct` | no | no | any |
 | `test.render-2d` | `cabal test --project-file cabal.project.cpu hetoimasia-render-2d:render-2d-tests --test-show-details=direct` | no | no | any |
@@ -295,6 +297,46 @@ and like `test.vulkan` its command names `cabal.project.cpu` and the group
 declares that file beside `cabal.project.common`: the library depends on `base`
 alone, and running its suite through the CPU project is what shows it needs no
 native prerequisite. See [the package's contract](../packages/math/README.md).
+
+`test.lua-engine` runs the Lua-first engine package's own suite, `lua-engine-tests`:
+the strict format-1 manifest parsed from supplied bytes -- its accepted examples, the
+byte limit at 65,536 and one past it, the nesting limit at eight containers and nine,
+every syntax refusal (byte order mark, malformed UTF-8, unpaired surrogate escapes,
+comments, trailing commas and data, non-object roots, duplicate keys after escape
+decoding), the exact numeric reading of `format`, every schema refusal and the fixed
+order refusals are decided in, and `tick_seconds` as exact decimal nanoseconds -- and
+the fixed M1 profile of limits against an independently written expectation, with its
+smaller validated test profiles and the profiles it refuses. It performs no IO and
+starts no Lua, window or GPU. It is mandatory but outside the floor, like `test.math`,
+and its command names `cabal.project.cpu`; the group declares that file beside
+`cabal.project.common`. CI routes it to the `haskell-engine` worker and publishes its
+receipt like every other group that worker owns. See
+[the package's contract](../packages/lua-engine/README.md).
+
+`test.content` runs the content package's own suite over temporary trees each
+example owns: a launch path that is relative, absolute or reached through
+symbolic links opens one directory whose identity the root keeps, so renaming
+it, replacing its old path or retargeting the selection link never switches an
+open root; every component below the root, the final file included, is opened
+without following a symbolic link and its type checked on the opened object,
+with links refused wherever they sit, a component or the final file swapped for
+a link at a controlled open boundary refused without the outside sentinel ever
+being read (a check-then-open control reads it under the same swap), a FIFO
+refused without waiting for a writer and a socket classified as a forbidden
+type whichever errno the open reports; strict bounded reads and enumeration
+with lossless names, hard-linked files under both names, entries that changed
+since they were observed, and a directory repeating on its active ancestor
+chain refused with its chain; and the lifecycle, where a root closes only after
+every borrowing operation has retired, a cancellation never shortens that wait
+or is lost, every descriptor is closed exactly once on every path, and a failed
+close is retained beside the primary failure. Mount crossings and directory
+cycles use injected native identities, because the suite creates no mount, and
+permission-bit cases run only where the effective user lacks the override
+(Linux CI runs as root, which ignores the bits), so an injected permission
+denial covers them there. It is mandatory but outside the floor, like
+`test.math`, and runs through `cabal.project.cpu`: the library depends on the
+foundation and on boot libraries, and the suite needs no display. See
+[the package's contract](../packages/content/README.md).
 
 `test.asset-image` runs the asset-image package's own suite: committed fixture
 PNGs — every colour type at every bit depth, 16-bit files, palette `tRNS`
@@ -885,7 +927,7 @@ Each worker is declared once, to the planner:
 
 ```bash
 python3 tools/validation/plan.py --base origin/master --head HEAD \
-  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,test.render-api,test.render-2d,test.render-2d-oracle,smoke.console \
+  --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.lua-engine,test.vulkan,test.vulkan-diagnostics,test.math,test.content,test.asset-image,test.render-api,test.render-2d,test.render-2d-oracle,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native,test.glfw-wayland \
   --worker vulkan=cpu+display:test.vulkan-headless,test.vulkan-native,test.vulkan-wayland
@@ -1050,7 +1092,7 @@ class to every execution:
 
 | Job | Runner class | Groups, in order |
 | --- | --- | --- |
-| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.scripting-lua-runtime`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.asset-image`, `test.render-api`, `test.render-2d`, `smoke.console` |
+| `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.scripting-lua-runtime`, `test.lua-engine`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.content`, `test.asset-image`, `test.render-api`, `test.render-2d`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native`, `test.glfw-wayland` |
 | `vulkan` | `cpu`, `display` | `test.vulkan-headless`, `test.vulkan-native`, `test.vulkan-wayland` |
@@ -2466,7 +2508,7 @@ contributes, one `--toolchain` each:
 toolchain=(--toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)")
 while IFS= read -r entry; do toolchain+=(--toolchain "$entry"); done < <(python3 tools/native/native.py toolchain)
 python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin "${toolchain[@]}" \
-  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,test.render-api,test.render-2d,test.vulkan-headless,test.vulkan-native,smoke.console,test.workflow,test.glfw-native \
+  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.vulkan,test.vulkan-diagnostics,test.math,test.content,test.asset-image,test.render-api,test.render-2d,test.vulkan-headless,test.vulkan-native,smoke.console,test.workflow,test.glfw-native \
   --json > plan.json
 python3 -I tools/validation/run.py test.workflow --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \
@@ -2590,7 +2632,7 @@ REQUEST
 python3 tools/validation/plan.py --base origin/master --head HEAD --runner-os Darwin \
   --toolchain "ghc=$(ghc --numeric-version)" --toolchain "cabal=$(cabal --numeric-version)" \
   --request-file request.txt \
-  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.vulkan,test.vulkan-diagnostics,test.math,test.asset-image,test.render-api,test.render-2d,test.vulkan-headless,test.vulkan-native,smoke.console,test.workflow,test.glfw-native,test.macos-confinement \
+  --worker local=cpu+display:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.vulkan,test.vulkan-diagnostics,test.math,test.content,test.asset-image,test.render-api,test.render-2d,test.vulkan-headless,test.vulkan-native,smoke.console,test.workflow,test.glfw-native,test.macos-confinement \
   --json > plan.json
 python3 -I tools/validation/run.py test.macos-confinement --plan plan.json --receipts receipts \
   --worker local --runner-class cpu --runner-class display \
