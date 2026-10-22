@@ -62,7 +62,7 @@ concrete precondition
 ## Processing status
 
 - [x] EPIC. Draw a textured quad from Lua over reusable engine services — [#514]
-- [ ] LFE-1. Install the explicit filtered M1 library profile
+- [x] LFE-1. Install the explicit filtered M1 library profile — [#515]
 - [ ] LFE-2. Add opt-in recoverable binding validation and refusal
 - [ ] LFE-3. Parse the strict manifest and validate the fixed M1 profile
 - [ ] LFE-4. Own anchored native content roots and no-follow reads
