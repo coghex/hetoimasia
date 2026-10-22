@@ -107,6 +107,8 @@ library bridge
         Hetoimasia.Scripting.Lua.Internal.ExportTypes
         Hetoimasia.Scripting.Lua.Internal.Fault
         Hetoimasia.Scripting.Lua.Internal.Library
+        Hetoimasia.Scripting.Lua.Internal.Loader
+        Hetoimasia.Scripting.Lua.Internal.LoaderTypes
         Hetoimasia.Scripting.Lua.Internal.Marshal
         Hetoimasia.Scripting.Lua.Internal.Module
         Hetoimasia.Scripting.Lua.Internal.Owner
@@ -309,6 +311,12 @@ test-suite lua-host-tests
         Test.Lua.Boundary.Independence
         Test.Lua.Boundary.Installation
         Test.Lua.Boundary.Lifecycle
+        Test.Lua.Boundary.Loader
+        Test.Lua.Boundary.Loader.Failures
+        Test.Lua.Boundary.Loader.Limits
+        Test.Lua.Boundary.Loader.Stop
+        Test.Lua.Boundary.Loader.Support
+        Test.Lua.Boundary.Loader.Threads
         Test.Lua.Boundary.Modules
         Test.Lua.Boundary.Recoverable
         Test.Lua.Boundary.Registration
@@ -361,6 +369,7 @@ test-suite lua-host-tests
     build-tool-depends: hetoimasia-scripting-lua:lua-hazard
     build-depends:
         base >=4.22 && <4.23,
+        HUnit >=1.6 && <1.7,
         bytestring >=0.12 && <0.13,
         containers >=0.8 && <0.9,
         directory >=1.3 && <1.4,

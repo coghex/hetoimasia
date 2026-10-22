@@ -393,4 +393,53 @@ int hetoimasia_lua_task_close(lua_State *L, lua_Integer slot, int *present, int 
 /* How many tasks are anchored. */
 int hetoimasia_lua_task_count(lua_State *L, long *count);
 
+/* ------------------------------------------------------------------------ */
+/* Loader frames                                                             */
+/* ------------------------------------------------------------------------ */
+
+/*
+** Make the coroutine of an export module that may suspend on an `import`: load the
+** text `source` (a precompiled chunk is refused) in an environment of its own that
+** reads through to the globals and holds an `import` closure bound to `context`,
+** anchor a coroutine for it in task slot `task_slot` and move the chunk into it. One
+** protected call with the collector held, so nothing executes. `*load_status` is the
+** status loading the chunk answered (a rejected chunk is LUA_ERRSYNTAX with its
+** message on the stack), `*created` is 1 once the coroutine is anchored. The stack
+** gains one value: the message of a rejected chunk, the error of a failed call, or nil.
+*/
+int hetoimasia_lua_loader_new(
+  lua_State *L, const char *source, size_t source_length, const char *chunk,
+  lua_Integer task_slot, lua_Integer context, int *load_status, int *created);
+
+/* How a loader frame is resumed. */
+enum {
+  HETOIMASIA_RESUME_START = 0,  /* run the chunk from its start */
+  HETOIMASIA_RESUME_EXPORTS = 1,/* answer a suspended `import` with an export table */
+  HETOIMASIA_RESUME_ERROR = 2   /* answer a suspended `import` with a message to raise */
+};
+
+/*
+** Run the next segment of the loader frame in `task_slot`: from its start, or from
+** the `import` it suspended in, answered with the export table in `resume_slot` or
+** with `message`. One protected call; the coroutine runs inside it under
+** `lua_resume`, which contains its errors.
+**
+** `*outcome` says how the segment ended (an HETOIMASIA_TASK_ value). A chunk that
+** returned is judged as an export module's is: `*shape` is what it returned, and
+** when it returned exactly one plain table that table is kept in export slot
+** `export_slot` (`*stored`). A failed segment leaves its coroutine dead and anchored,
+** closed by `hetoimasia_lua_task_cleanup`, with `*segment_status` the status and
+** `trace` the traceback. `*resumed` is 1 once the coroutine ran: a failure before
+** then executed nothing.
+*/
+int hetoimasia_lua_loader_resume(
+  lua_State *L, lua_Integer task_slot, lua_Integer export_slot, int mode, lua_Integer resume_slot,
+  const char *message, size_t message_length,
+  char *trace, size_t trace_capacity, size_t *trace_length,
+  int *outcome, int *segment_status, int *shape, int *result_type, int *stored, int *resumed);
+
+/* Push the export table kept in `slot` by raw access (nil when none), and set `*type`
+** to its Lua type (LUA_TNONE when the export table is missing). */
+int hetoimasia_lua_export_push(lua_State *L, lua_Integer slot, int *type);
+
 #endif

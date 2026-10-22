@@ -39,6 +39,14 @@ module Hetoimasia.Scripting.Lua.Internal.Marshal
   , attachFacade
   , pushExportField
   , pushCaptured
+    -- * Loader frames
+  , importInstallAt
+  , LoaderCreated (..)
+  , newLoaderCoroutine
+  , LoaderResume (..)
+  , LoaderSegment (..)
+  , resumeLoaderSegment
+  , pushExportTable
     -- * Tasks
   , newTaskCoroutine
   , taskThread
@@ -233,6 +241,44 @@ foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_context"
 foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_call"
   c_call ∷ State → CInt → CInt → Ptr CChar → CSize → Ptr CSize → IO StatusCode
 
+foreign import ccall safe "hetoimasia_lua_bridge.h hetoimasia_lua_import_install"
+  c_import_install ∷ State → StablePtr a → Ptr CInt → IO StatusCode
+
+foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_loader_new"
+  c_loader_new
+    ∷ State
+    → Ptr CChar
+    → CSize
+    → Ptr CChar
+    → Int64
+    → Int64
+    → Ptr CInt
+    → Ptr CInt
+    → IO StatusCode
+
+foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_loader_resume"
+  c_loader_resume
+    ∷ State
+    → Int64
+    → Int64
+    → CInt
+    → Int64
+    → Ptr CChar
+    → CSize
+    → Ptr CChar
+    → CSize
+    → Ptr CSize
+    → Ptr CInt
+    → Ptr CInt
+    → Ptr CInt
+    → Ptr CInt
+    → Ptr CInt
+    → Ptr CInt
+    → IO StatusCode
+
+foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_export_push"
+  c_export_push ∷ State → Int64 → Ptr CInt → IO StatusCode
+
 -- | What reading values off the stack came to.
 data Reading
   = -- | The protected call itself failed, with Lua's status; its error value is
@@ -369,6 +415,134 @@ installBindingAt state carried space name yielding acquired =
   ByteString.unsafeUseAsCStringLen (Text.encodeUtf8 space) $ \(spacePointer, spaceSize) →
     ByteString.unsafeUseAsCStringLen (Text.encodeUtf8 name) $ \(namePointer, nameSize) →
       c_install_binding state carried spacePointer (fromIntegral spaceSize) namePointer (fromIntegral nameSize) (if yielding then 1 else 0) acquired
+
+-- | Keep a stable pointer's function as the carrier every module's @import@ reaches,
+-- with the same ownership report as publishing a global.
+importInstallAt ∷ State → StablePtr a → Ptr CInt → IO StatusCode
+importInstallAt = c_import_install
+
+-- | What making a loader frame's coroutine came to.
+data LoaderCreated = LoaderCreated
+  { createdStatus ∷ !StatusCode
+    -- ^ The protected call's status; on failure its error value is on the stack.
+  , createdChunkStatus ∷ !StatusCode
+    -- ^ Loading the chunk: not 'LUA_OK' for a rejected chunk, whose message is on
+    -- the stack.
+  , createdCoroutine ∷ !Bool
+    -- ^ The coroutine is anchored in its task slot with the chunk in it. Nothing has
+    -- executed.
+  }
+
+-- | Make the coroutine of an export module that may suspend on an @import@, in an
+-- environment of its own with an @import@ closure bound to a context. The stack
+-- gains one value: the error, the chunk's message or nil.
+newLoaderCoroutine ∷ State → ByteString → Text → Int → Int → IO LoaderCreated
+newLoaderCoroutine state source chunk slot context =
+  ByteString.unsafeUseAsCStringLen source $ \(sourcePointer, sourceSize) →
+    ByteString.unsafeUseAsCStringLen (Text.encodeUtf8 ("=" <> chunk <> "\0")) $ \(chunkPointer, _) →
+      alloca $ \loadStatus →
+        alloca $ \created → do
+          status ←
+            c_loader_new state sourcePointer (fromIntegral sourceSize) chunkPointer (fromIntegral slot) (fromIntegral context) loadStatus created
+          chunkStatus ← peek loadStatus
+          made ← peek created
+          pure (LoaderCreated status (StatusCode chunkStatus) (made /= 0))
+
+-- | What a loader frame is resumed with.
+data LoaderResume
+  = -- | The start of its chunk.
+    ResumeStart
+  | -- | The @import@ it suspended in, answered with the export table in this slot.
+    ResumeExports !Int
+  | -- | The @import@ it suspended in, answered with an error to raise: its message.
+    ResumeError !ByteString
+
+-- | What running a segment of a loader frame came to.
+data LoaderSegment = LoaderSegment
+  { loaderStatus ∷ !StatusCode
+    -- ^ The protected call's status; on failure its error value is on the stack.
+  , loaderOutcome ∷ !SegmentOutcome
+    -- ^ How the segment ended: 'SegmentCompleted', 'SegmentYielded', 'SegmentFailed'
+    -- or 'SegmentUnresumable'. A completed chunk is judged by 'loaderShape'.
+  , loaderSegmentStatus ∷ !StatusCode
+    -- ^ The status of a failed segment.
+  , loaderShape ∷ !Int
+    -- ^ What a completed chunk returned: the C @HETOIMASIA_EXPORT_@ code.
+  , loaderResultType ∷ !Int
+  , loaderStored ∷ !Bool
+    -- ^ A completed chunk's one plain table is in its export slot.
+  , loaderResumed ∷ !Bool
+    -- ^ The coroutine ran. If not, nothing executed.
+  , loaderTrace ∷ !(Maybe Text)
+  }
+
+-- | Run the next segment of the loader frame in a task slot.
+resumeLoaderSegment ∷ State → Int → Int → LoaderResume → IO LoaderSegment
+resumeLoaderSegment state taskSlot exportSlot how =
+  ByteString.unsafeUseAsCStringLen message $ \(messagePointer, messageSize) →
+    allocaBytes traceLimit $ \trace →
+      alloca $ \traceLength →
+        alloca $ \outcome →
+          alloca $ \segmentStatus →
+            alloca $ \shape →
+              alloca $ \resultType →
+                alloca $ \stored →
+                  alloca $ \resumed → do
+                    status ←
+                      c_loader_resume
+                        state
+                        (fromIntegral taskSlot)
+                        (fromIntegral exportSlot)
+                        mode
+                        (fromIntegral resumeSlot)
+                        messagePointer
+                        (fromIntegral messageSize)
+                        trace
+                        (fromIntegral traceLimit)
+                        traceLength
+                        outcome
+                        segmentStatus
+                        shape
+                        resultType
+                        stored
+                        resumed
+                    how' ← peek outcome
+                    failed ← peek segmentStatus
+                    shape' ← peek shape
+                    type' ← peek resultType
+                    kept ← peek stored
+                    ran ← peek resumed
+                    traced ← readTrace trace traceLength
+                    pure
+                      LoaderSegment
+                        { loaderStatus = status
+                        , loaderOutcome = case how' ∷ CInt of
+                            0 → SegmentCompleted
+                            1 → SegmentYielded
+                            2 → SegmentFailed
+                            _ → SegmentUnresumable
+                        , loaderSegmentStatus = StatusCode failed
+                        , loaderShape = fromIntegral shape'
+                        , loaderResultType = fromIntegral type'
+                        , loaderStored = kept /= 0
+                        , loaderResumed = ran /= 0
+                        , loaderTrace = traced
+                        }
+  where
+    (mode, resumeSlot, message) = case how of
+      ResumeStart → (0, 0, ByteString.empty)
+      ResumeExports slot → (1, slot, ByteString.empty)
+      ResumeError text → (2, 0, text)
+
+-- | Push the export table kept in a slot, nil when there is none; its Lua type
+-- code, @-1@ when the export table is missing altogether.
+pushExportTable ∷ State → Int → IO (StatusCode, Int)
+pushExportTable state slot =
+  alloca $ \kind → do
+    poke kind (-1)
+    status ← c_export_push state (fromIntegral slot) kind
+    found ← peek kind
+    pure (status, fromIntegral found)
 
 -- | The bound on a traceback, in bytes.
 traceLimit ∷ Int
