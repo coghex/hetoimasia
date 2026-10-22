@@ -97,6 +97,21 @@ data Boundary
   | AfterRead
   | DrainStarted
   -- ^ The root's exit closed admission and is about to wait for borrows.
+  | ScanEntryCharged !Int
+  -- ^ An inventory scan read an entry and charged it against the entry
+  -- allowance; the count includes the root and this entry.
+  | ScanFileOpened ![NativeName]
+  -- ^ A scan holds the file open and has read its metadata, not yet its bytes.
+  | ScanFileHashed ![NativeName]
+  -- ^ A scan read and hashed the whole file and has not recorded it.
+  | ScanBeforePublish
+  -- ^ The traversal is complete and every handle is closed; the inventory is
+  -- about to be assembled and published.
+  | ReadOpened ![NativeName]
+  -- ^ A verified read holds the file open and has checked its length, but has
+  -- not read its bytes.
+  | ReadBeforeCompare ![NativeName]
+  -- ^ A verified read has the bytes and has not compared their digest.
   deriving (Eq, Show)
 
 -- | An adapter and its boundary hooks.

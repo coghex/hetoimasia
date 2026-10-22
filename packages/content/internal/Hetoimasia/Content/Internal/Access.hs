@@ -37,6 +37,7 @@ module Hetoimasia.Content.Internal.Access
   , withEntryFile
   , withEntryDirectory
   , readChunk
+  , readInto
   , fileMetadata
   , readEntry
   , directoryIdentity
@@ -384,14 +385,26 @@ fileMetadata reader = do
 readChunk ∷ FileReader → Int → IO BS.ByteString
 readChunk reader size = do
   assertLive (fileLive reader)
+  when (size < 1) (throwIO (ContentDefect (BadChunkSize size)))
+  chunk ← BSI.createUptoN size $ \buffer → readInto reader buffer size
+  pure (if BS.length chunk < size then BS.copy chunk else chunk)
+
+-- | Up to @size@ bytes from the opened file, written to the caller's buffer,
+-- which must hold @size@ bytes; the count read, zero at the end of the file. A
+-- short count is not the end. It is 'readChunk' for a caller that owns the
+-- destination, and obeys the same bounds: the request must be at least one byte
+-- and at most the root's read-chunk limit.
+readInto ∷ FileReader → Ptr Word8 → Int → IO Int
+readInto reader buffer size = do
+  assertLive (fileLive reader)
   let root = fileRoot reader
       bound = limitReadChunk (rootLimits root)
   when (size < 1) (throwIO (ContentDefect (BadChunkSize size)))
   when (size > bound) (refuse root (fileTrail reader) (LimitExceeded ReadChunk bound))
   hook root BeforeRead
-  chunk ← BSI.createUptoN size $ \buffer → performRead root reader buffer size
+  got ← performRead root reader buffer size
   hook root AfterRead
-  pure (if BS.length chunk < size then BS.copy chunk else chunk)
+  pure got
 
 performRead ∷ ContentRoot → FileReader → Ptr Word8 → Int → IO Int
 performRead root reader buffer size =
