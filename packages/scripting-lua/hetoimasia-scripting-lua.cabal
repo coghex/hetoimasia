@@ -400,7 +400,9 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Accounting.Waits
         Test.LuaRuntime.Accounting.Windows
         Test.LuaRuntime.Admission.Banks
+        Test.LuaRuntime.Admission.Failure
         Test.LuaRuntime.Admission.Release
+        Test.LuaRuntime.Admission.Timing
         Test.LuaRuntime.Admission.Spec
         Test.LuaRuntime.Admission.Support
         Test.LuaRuntime.Callbacks
