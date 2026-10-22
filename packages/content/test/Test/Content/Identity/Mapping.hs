@@ -15,6 +15,8 @@
 module Test.Content.Identity.Mapping (spec) where
 
 import Control.Exception (IOException, evaluate, try)
+import Data.Int (Int64)
+import GHC.Conc (getAllocationCounter, setAllocationCounter)
 import Control.Monad (forM)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -402,16 +404,58 @@ diagnostics = describe "bounded diagnostics" $ do
         problem `shouldBe` EntryTooDeep 33 32
         BS.length (excerptBytes shown) `shouldSatisfy` (\n → n > 0 && n <= excerptCap)
       other → expectationFailure ("unexpected: " <> show other)
+  it "allocates no more than the excerpt to describe a huge rejected component, however large" $ do
+    -- the buffer is built before the measurement; only the work of the refusal is counted
+    huge <- evaluate (BS.replicate (16 * 1024 * 1024) 0x61)
+    entryAllocation <- allocatedBy $ case buildMapping m1 rootA [nativeEntry ObservedFile ["dir", huge]] of
+      Left (InventoryRefusal _ (InvalidEntry shown problem)) → evaluate (BS.length (excerptBytes shown) + excerptLength shown + length (show problem))
+      other → fail ("unexpected: " <> either show (const "built") other)
+    referenceAllocation <- allocatedBy $ case parseReference m1 rootA huge of
+      Left refusal → evaluate (BS.length (excerptBytes (refusalReference refusal)) + length (show refusal))
+      Right key → fail ("accepted: " <> show key)
+    -- a copy of the large component, even once, would be 16 MiB; the allowance is generous
+    -- for the refusal's own small structures
+    (entryAllocation < 256 * 1024, referenceAllocation < 256 * 1024) `shouldBe` (True, True)
+  it "allocates no more than the excerpt to describe a huge component deep in a path" $ do
+    huge <- evaluate (BS.replicate (16 * 1024 * 1024) 0x62)
+    allocation <- allocatedBy $ case buildMapping m1 rootA [nativeEntry ObservedFile ["a", "b", huge, "c"]] of
+      Left (InventoryRefusal _ (InvalidEntry shown _)) → evaluate (BS.length (excerptBytes shown))
+      other → fail ("unexpected: " <> either show (const "built") other)
+    allocation `shouldSatisfy` (< 256 * 1024)
   it "shows names escaped and never decoded" $ do
     show (keyOf rootA (utf8 "caf\xe9")) `shouldContain` "caf\\xc3\\xa9"
   it "renders an excerpt with the true length when it was cut" $
     case parseReference m1 rootA (BS.replicate 2000 0x61) of
       Left refusal → renderExcerpt (refusalReference refusal) `shouldContain` "(2000 bytes)"
       Right _ → expectationFailure "accepted"
+  it "does not overflow at the largest limits the constructor accepts" $ do
+    -- a segment-count limit of maxBound once made 'limit + 1' wrap and the entry read as empty
+    let widest = limits maxBound 255 maxBound maxBound
+        nearly = limits (maxBound - 1) 255 (maxBound - 1) (maxBound - 1)
+    mapM_
+      ( \theLimits → do
+          mapping <- either (\r → fail (show r)) pure (buildMapping theLimits rootA [file ["a"], file ["b", "c"]])
+          mappingSize mapping `shouldBe` 2
+          fmap (logicalPathBytes . contentKeyPath) (parseReference theLimits rootA "a/b") `shouldBe` Right "a/b"
+          case buildMapping theLimits rootA [nativeEntry ObservedFile [bytes [0xff]]] of
+            Left (InventoryRefusal _ (InvalidEntry _ problem)) → problem `shouldBe` BadComponent 0 (SegmentMalformedUtf8 0)
+            other → expectationFailure ("unexpected: " <> either show (const "built") other)
+      )
+      [widest, nearly]
+    -- and an infinite component list is still described by a bounded prefix under a huge limit
+    result <- bounded (evaluate (fmap inventoryReason (either Just (const Nothing) (buildMapping (limits 1024 255 3 10) rootA [nativeEntry ObservedFile (map (BC.pack . show) [1 ∷ Int ..])]))))
+    fmap (\r → case r of InvalidEntry _ p → Just p; _ → Nothing) result `shouldBe` Just (Just (EntryTooDeep 4 3))
   it "bounds a root key" $ do
     rootKey "" `shouldBe` Left EmptyRootKey
     rootKey (BS.replicate (maxRootKeyBytes + 1) 0x61) `shouldBe` Left (RootKeyTooLong (maxRootKeyBytes + 1))
     fmap rootKeyBytes (rootKey (BS.replicate maxRootKeyBytes 0x61)) `shouldBe` Right (BS.replicate maxRootKeyBytes 0x61)
+
+-- | The bytes the calling thread allocates while the action runs to completion.
+allocatedBy ∷ IO a → IO Int64
+allocatedBy action = do
+  setAllocationCounter 0
+  _ ← action
+  negate <$> getAllocationCounter
 
 -- | Whether two byte strings are views of one buffer.
 sharesBuffer ∷ ByteString → ByteString → Bool

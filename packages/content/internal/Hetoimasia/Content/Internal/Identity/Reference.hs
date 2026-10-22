@@ -126,11 +126,12 @@ classify c
   where
     code = fromEnum c
 
--- | A sum that stops growing past a cap, so a long list is never summed in full.
+-- | A sum that stops growing past a cap, so a long list is never summed in
+-- full, and that saturates at 'maxBound' instead of wrapping.
 sumCapped ∷ Int → [Int] → Int
 sumCapped cap = go 0
   where
     go acc [] = acc
     go acc (x : xs)
       | acc > cap = acc
-      | otherwise = go (acc + x) xs
+      | otherwise = go (addSaturating acc x) xs

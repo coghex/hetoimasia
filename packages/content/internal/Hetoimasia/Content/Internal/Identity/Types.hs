@@ -33,6 +33,8 @@ module Hetoimasia.Content.Internal.Identity.Types
   , excerpt
   , excerptOfPath
   , excerptCap
+  , addSaturating
+  , segmentAllowance
   , renderExcerpt
 
     -- * Reference refusals
@@ -168,20 +170,30 @@ excerptCap = 64
 excerpt ∷ ByteString → Excerpt
 excerpt bytes = Excerpt (BS.copy (BS.take excerptCap bytes)) (BS.length bytes)
 
--- | The excerpt of the path the components spell, joined by @/@, without
--- joining more than the excerpt keeps. The length is that of the whole and
--- saturates at 'maxBound'.
+-- | The excerpt of the path the components spell, joined by @/@. Each component
+-- is cut to the budget that remains before anything is joined, so the work and
+-- the allocation are bounded by the excerpt, however large a component is. The
+-- length is that of the whole and saturates at 'maxBound'.
 excerptOfPath ∷ [ByteString] → Excerpt
-excerptOfPath components = Excerpt (BS.copy (BS.take excerptCap (BS.intercalate "/" (takeEnough excerptCap components)))) total
+excerptOfPath components = Excerpt (BS.copy (BS.take excerptCap (BS.intercalate "/" (sliced excerptCap components)))) total
   where
     total = case components of
       [] → 0
-      _ → foldr (\c acc → saturatingAdd (BS.length c) (saturatingAdd 1 acc)) 0 components - 1
-    takeEnough _ [] = []
-    takeEnough budget (c : rest)
+      _ → foldr (\c acc → addSaturating (BS.length c) (addSaturating 1 acc)) 0 components - 1
+    sliced _ [] = []
+    sliced budget (c : rest)
       | budget <= 0 = []
-      | otherwise = c : takeEnough (budget - BS.length c - 1) rest
-    saturatingAdd a b = let s = a + b in if s < a then maxBound else s
+      | otherwise = let piece = BS.take budget c in piece : sliced (budget - BS.length piece - 1) rest
+
+-- | The sum of two non-negative counts, stopping at 'maxBound' instead of
+-- wrapping.
+addSaturating ∷ Int → Int → Int
+addSaturating a b = if b > maxBound - a then maxBound else a + b
+
+-- | One more than the segment limit, without wrapping: how many leading
+-- components of an entry are worth looking at to learn that it is too deep.
+segmentAllowance ∷ IdentityLimits → Int
+segmentAllowance limits = addSaturating (limitSegments limits) 1
 
 renderExcerpt ∷ Excerpt → String
 renderExcerpt (Excerpt bytes total) =

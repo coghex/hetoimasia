@@ -207,7 +207,7 @@ buildMapping limits root = go 0 emptyLevel
     go count tree (entry : rest)
       | count >= limitEntries limits = Left (refusal (TooManyEntries (limitEntries limits)))
       | otherwise = do
-          components ← first (refusal . InvalidEntry (excerptOfPath (take (limitSegments limits + 1) (observedPath entry)))) (validateEntry limits entry)
+          components ← first (refusal . InvalidEntry (excerptOfPath (take (segmentAllowance limits) (observedPath entry)))) (validateEntry limits entry)
           tree' ← first refusal (insertEntry entry components tree)
           go (count + 1) tree' rest
 
@@ -219,14 +219,14 @@ validateEntry limits entry
   | rawBytes > limitPathBytes limits = Left (EntryTooLong rawBytes (limitPathBytes limits))
   | otherwise = do
       checked ← traverse component (zip [0 ..] components)
-      let normalizedBytes = sumCapped (limitPathBytes limits) (map (BS.length . componentNfc) checked) + depth - 1
+      let normalizedBytes = addSaturating (sumCapped (limitPathBytes limits) (map (BS.length . componentNfc) checked)) (depth - 1)
       if normalizedBytes > limitPathBytes limits
         then Left (EntryNormalizedTooLong normalizedBytes (limitPathBytes limits))
         else Right checked
   where
-    components = take (limitSegments limits + 1) (observedPath entry)
+    components = take (segmentAllowance limits) (observedPath entry)
     depth = length components
-    rawBytes = sumCapped (limitPathBytes limits) (map BS.length components) + depth - 1
+    rawBytes = addSaturating (sumCapped (limitPathBytes limits) (map BS.length components)) (depth - 1)
     component (index, bytes) = case checkSegment limits bytes of
       Left problem → Left (BadComponent index problem)
       Right checked →
