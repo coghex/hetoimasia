@@ -52,6 +52,7 @@ module Test.LuaRuntime.Support
   , libraries
     -- * Coordination
   , awaitBlockedOnSTM
+  , cancelPending
   , withModules
   , withChunks
   , failureOf
@@ -86,17 +87,18 @@ import Control.Exception
   , try
   , tryWithContext
   )
-import Control.Monad (void)
+import Control.Monad (unless, void)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, atomicModifyIORef', atomicWriteIORef, newIORef, readIORef)
 import Data.Maybe (isJust)
 import Data.Unique (Unique, newUnique)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
-import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (ThreadBlocked), threadStatus)
+import GHC.Conc (BlockReason (BlockedOnException, BlockedOnSTM), ThreadStatus (ThreadBlocked), listThreads, threadStatus)
 import Hetoimasia.Foundation.Log
   ( LogEntry
   , Logger
@@ -725,6 +727,41 @@ awaitBlockedOnSTM thread =
   threadStatus thread >>= \case
     ThreadBlocked BlockedOnSTM → pure ()
     _ → yield >> awaitBlockedOnSTM thread
+
+-- | Request an owner's cancellation with the given action, and do not go on until that
+-- cancellation is demonstrably pending against the owner. Releasing a held call after this
+-- is releasing it with a cancellation waiting for it, never before.
+--
+-- A cancellation request is delivered by a helper thread that 'cancelOwner' and
+-- 'cancelScheduled' fork before they return and that is not ordered with anything the
+-- example does next. While the owner is inside a native call, or an uninterruptible
+-- region, the helper's @throwTo@ cannot complete: it is blocked in the delivery
+-- (@BlockedOnException@) until the owner can take it. A helper that has only been forked,
+-- or has not yet begun its @throwTo@, has shown nothing, and a call released then returns
+-- as an ordinary one before there is anything to land. So this waits for a thread that
+-- did not exist before the request and is now blocked in a delivery.
+--
+-- That thread is the owner's helper and nothing else. Threads that existed before the
+-- request, such as an unrelated blocked thrower left by an earlier example or by another
+-- owner, are excluded by identity and never count, which a count of all blocked throwers
+-- cannot tell. The helper is the only thread a request creates that throws, it makes
+-- exactly one @throwTo@, and its target is the worker it was forked for: a request forks
+-- one helper, and later requests fork nothing. The example also requests no other
+-- cancellation and no other throw while it waits. A helper that has finished without ever
+-- being seen blocked would mean the delivery was not held against the owner, and the wait
+-- then never ends; the example's bound ends it.
+--
+-- The wait is on the thread's status and never on time. A cancellation that never becomes
+-- pending leaves the example here until its bound expires.
+cancelPending ∷ IO () → IO ()
+cancelPending cancel = do
+  before ← Set.fromList <$> listThreads
+  cancel
+  let wait = do
+        now ← listThreads
+        statuses ← traverse threadStatus [thread | thread ← now, thread `Set.notMember` before]
+        unless (ThreadBlocked BlockedOnException `elem` statuses) (yield >> wait)
+  wait
 
 -- | The same owner configuration loading these modules.
 withModules ∷ [ModuleSource] → OwnerSpec → OwnerSpec
