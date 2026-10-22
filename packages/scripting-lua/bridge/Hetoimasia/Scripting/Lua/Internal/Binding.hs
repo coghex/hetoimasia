@@ -39,10 +39,12 @@ module Hetoimasia.Scripting.Lua.Internal.Binding
   , valueHandler
   , retiredIn
   , ensureValues
+  , argumentReason
   ) where
 
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, catch, evaluate, fromException, toException)
+import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, catch, evaluate, fromException, throwIO, toException, try)
 import Control.Monad (foldM, forM_, unless, when)
+import Data.Foldable (for_)
 import Data.List (nub)
 import Data.Maybe (fromMaybe, isNothing)
 import Data.Text (Text)
@@ -52,13 +54,14 @@ import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure, withOperationContext)
 import Hetoimasia.Scripting.Lua.Internal.Boundary
 import Hetoimasia.Scripting.Lua.Internal.Call (reportFault)
-import Hetoimasia.Scripting.Lua.Internal.Callback (Handler, installBinding)
+import Hetoimasia.Scripting.Lua.Internal.Callback (Handler, failedResults, installBinding)
 import Hetoimasia.Scripting.Lua.Internal.Fault (CallRefusal (CallRefusal), classify, fromApplication, luaComponent, raisedByApplication, renderFailure)
 import Hetoimasia.Scripting.Lua.Internal.Marshal
 import Hetoimasia.Scripting.Lua.Internal.Registration
 import Hetoimasia.Scripting.Lua.Internal.Value
 import Hetoimasia.Scripting.Lua.Internal.Vm
-  ( Vm
+  ( Phase (Closing)
+  , Vm
   , markValuesPrepared
   , noteActionRun
   , activeTask
@@ -69,6 +72,7 @@ import Hetoimasia.Scripting.Lua.Internal.Vm
   , runContext
   , valuesPrepared
   , vmIdentity
+  , vmPhase
   , withOpenVm
   )
 import Lua (NumResults (NumResults), State, StatusCode, fromStackIndex, lua_gettop, lua_settop, data LUA_OK)
@@ -124,6 +128,18 @@ callOperation = operation "call-binding"
 valueHandler ∷ HasCallStack ⇒ Boundary → Vm → Text → Binding → Handler
 valueHandler boundary vm space binding state restore = do
   entry ← lua_gettop state
+  -- Whether a refusal may be an ordinary Lua error. Not when a finalizer may be the
+  -- caller: Lua turns an error raised in one into a warning and says nothing, so
+  -- a refusal that recorded nothing would be silent. Every call while the VM
+  -- closes is a finalizer's, and Lua holds the collector while a finalizer runs
+  -- and a script can stop it, so a call made with the collector stopped keeps
+  -- the recorded fault too: it errs the way that is observable.
+  ordinary ← if bindingRecoverable binding
+    then do
+      phase ← vmPhase vm
+      running ← collectorRunning state
+      pure (phase /= Closing && running)
+    else pure False
   let context = boundaryContext boundary
       limits = boundaryLimits boundary
       declared = bindingArguments binding
@@ -157,9 +173,52 @@ valueHandler boundary vm space binding state restore = do
         runs ← operationActionRuns vm
         pure (if runs > 0 then BindingRan else LuaRan)
       refuseArguments ∷ ∀ b. Int → [PathStep] → ValueRule → Int → IO b
-      refuseArguments index path rule visited = do
-        effect ← current
-        faulted (ValueRefused (ValueRefusal Arguments index path rule visited)) effect
+      refuseArguments index path rule visited
+        -- An opted-in binding's refusal of what the script gave it is an ordinary
+        -- Lua error, unless it is Lua or the host running out of what the copy
+        -- needs. Nothing is recorded on the VM for it.
+        | ordinary && ordinaryRule rule = throwIO (OrdinaryRefusal (argumentReason index path rule))
+        | otherwise = do
+            effect ← current
+            faulted (ValueRefused (ValueRefusal Arguments index path rule visited)) effect
+      -- A precondition's refusal. Too long a reason is a defect of the application,
+      -- a fault of the call whether or not the binding is opted in.
+      refusePrecondition ∷ ∀ b. Text → IO b
+      refusePrecondition reason
+        | lengthWord8 reason > refusalReasonLimit = do
+            effect ← current
+            faulted (ValueRefused (ValueRefusal Results 1 [] (RuleBytesLimit refusalReasonLimit) 0)) effect
+        | ordinary = throwIO (OrdinaryRefusal reason)
+        | otherwise = do
+            effect ← current
+            faulted (BindingRefused reason) effect
+      -- The ordinary Lua error: the stack as it was on entry, the refusal's text on
+      -- top, and the count that makes the C closure raise the value on top once
+      -- every Haskell frame has returned. The text is built by the protected push
+      -- the results use, so an allocation failure is a status and not a longjmp
+      -- out of this frame, and it keeps the fault such a failure has.
+      raiseOrdinary ∷ Text → IO NumResults
+      raiseOrdinary reason = do
+        lua_settop state entry
+        let message = qualified <> ": " <> reason
+        encoded ← case encodeValues context limits [VText message] of
+          Left rule → do
+            effect ← current
+            faulted (ValueRefused (ValueRefusal Results 1 [] rule 0)) effect
+          Right bytes → pure bytes
+        pushed ← pushValues state limits encoded 1
+        case pushed of
+          Pushed → do
+            serviceCollector state
+            pure failedResults
+          PushStatus status → do
+            value ← renderFailure state entry
+            lua_settop state entry
+            effect ← current
+            faulted (ScriptFailed (classify status) value) effect
+          PushMalformed which → do
+            effect ← current
+            faulted (InternalError (Text.pack ("a refusal could not be built: " <> show which))) effect
       refuseResults ∷ ∀ b. Int → [PathStep] → ValueRule → IO b
       refuseResults index path rule = faulted (ValueRefused (ValueRefusal Results index path rule 0)) BindingRan
       statusFault ∷ ∀ b. StatusCode → IO b
@@ -194,114 +253,213 @@ valueHandler boundary vm space binding state restore = do
           effect ← current
           faulted (NotYetSupported (bindingKind binding)) effect
     action → do
-      -- A scheduler operation is refused first, wherever it cannot reach the
-      -- scheduler, before anything of its arguments is read.
-      case action of
-        SuspendAction _ → do
-          refusal ← suspensionRefusal vm state
-          forM_ refusal $ \why → do
-            effect ← current
-            faulted (SuspendRefused why) effect
-        _ → pure ()
-      top ← fromIntegral . fromStackIndex <$> lua_gettop state
-      when (top /= length declared) $
-        refuseArguments 0 [] (RuleArity (length declared) top) 0
-      raws ← do
-        copied ← readValues state limits (vmIdentity vm) 1 top
-        case copied of
-          ReadStatus status → statusFault status
-          ReadRefused rule index visited → refuseArguments index [] rule visited
-          ReadCopied bytes visited → case decodeValues top bytes of
-            Left why → faulted (InternalError why) =<< current
-            Right found → pure (found, visited)
-      let (found, visited) = raws
-      values ← traverse
-        ( \(index, schema, raw) → case conformRaw context schema raw of
-            Left (path, rule) → refuseArguments index path rule visited
-            Right value → pure value
-        )
-        (zip3 [1 ..] declared found)
-      -- Every handle is checked for having ended before the action, except the one an
-      -- explicit release is given: it was checked above for being this VM's, of the
-      -- declared type, and its binding's only argument, and ending is what it answers.
-      unless (acceptsRetired binding) $
-        forM_ (zip [1 ..] values) $ \(index, value) → do
-          -- The application's own check is application code, like the action: it
-          -- runs unmasked.
-          retired ← restore (retiredIn boundary value)
-          forM_ retired $ \(path, typeName) →
-            refuseArguments index path (RuleRetiredHandle typeName) visited
-      let runAction ∷ IO [Value] → IO NumResults
-          runAction compute = do
-              -- Counted before it starts, so a fault of anything the action does is
-              -- one that happened after an action ran.
-              noteActionRun vm
-              -- A refusal the script caught and went on from is the operation's failure
-              -- (C1), and an action is about to run after it: what it reports as having
-              -- happened has to include that.
-              amendEscape vm upgradeEffect
-              -- The engine's own refusal of this call, raised by its API from inside
-              -- the action, is a fault of the call and not the application's failure.
-              -- It is caught outside the mark the action's failures get, so the mark
-              -- never reaches it.
-              produced ← compute `catch` \(CallRefusal why) → faulted (BindingRefused why) BindingRan
-              let expected = bindingResults binding
-              -- Bounded first: an action that built far more than the limits allow is
-              -- refused after visiting what the limits allow, plus one.
-              either (refuseResults 0 []) pure (checkLimits limits produced)
-              when (length produced /= length expected) $
-                refuseResults 0 [] (RuleArity (length expected) (length produced))
-              forM_ (zip3 [1 ..] expected produced) $ \(index, schema, value) →
-                case conformValue context schema value of
-                  Left (path, rule) → refuseResults index path rule
-                  Right () → pure ()
-              encoded ← case encodeValues context limits produced of
-                Left rule → refuseResults 0 [] rule
-                Right bytes → pure bytes
-              pushed ← pushValues state limits encoded (length produced)
-              case pushed of
-                Pushed → do
-                  -- Back to the script: what building its results allocated while the
-                  -- collector was held is paid now.
-                  serviceCollector state
-                  pure (NumResults (fromIntegral (length produced)))
-                PushStatus status → do
-                  value ← renderFailure state entry
-                  lua_settop state entry
-                  faulted (ScriptFailed (classify status) value) BindingRan
-                PushMalformed which → faulted (InternalError (Text.pack ("a result could not be built: " <> show which))) BindingRan
+      -- Everything up to the action, where an opted-in binding's ordinary refusal
+      -- is raised as the one private exception this catches, and nothing else is.
+      -- An opted-in binding's preconditions come first, before anything else of the
+      -- call: before the host asks whether a scheduler operation can suspend, and
+      -- before an argument is read. They are the application's own code, so they
+      -- run unmasked and what they raise is the application's failure.
+      checked ← try $ do
+        let owner = OwnerContexts (boundaryLifecycle boundary) (boundaryRequests boundary)
+        for_ (bindingPreconditions binding) $ \check → do
+          verdict ← fromApplication $ do
+            found ← restore (check owner)
+            found <$ evaluate (maybe () (\reason → lengthWord8 reason `seq` ()) found)
+          forM_ verdict refusePrecondition
+        -- A scheduler operation is refused next, wherever it cannot reach the
+        -- scheduler, before anything of its arguments is read.
+        case action of
+          SuspendAction _ → do
+            refusal ← suspensionRefusal vm state
+            forM_ refusal $ \why → do
+              effect ← current
+              faulted (SuspendRefused why) effect
+          _ → pure ()
+        top ← fromIntegral . fromStackIndex <$> lua_gettop state
+        when (top /= length declared) $
+          refuseArguments 0 [] (RuleArity (length declared) top) 0
+        raws ← do
+          copied ← readValues state limits (vmIdentity vm) 1 top
+          case copied of
+            ReadStatus status → statusFault status
+            ReadRefused rule index visited → refuseArguments index [] rule visited
+            ReadCopied bytes visited → case decodeValues top bytes of
+              Left why → faulted (InternalError why) =<< current
+              Right found → pure (found, visited)
+        let (found, visited) = raws
+        values ← traverse
+          ( \(index, schema, raw) → case conformRaw context schema raw of
+              Left (path, rule) → refuseArguments index path rule visited
+              Right value → pure value
+          )
+          (zip3 [1 ..] declared found)
+        -- Every handle is checked for having ended before the action, except the one an
+        -- explicit release is given: it was checked above for being this VM's, of the
+        -- declared type, and its binding's only argument, and ending is what it answers.
+        unless (acceptsRetired binding) $
+          forM_ (zip [1 ..] values) $ \(index, value) → do
+            -- The application's own check is application code, like the action: it
+            -- runs unmasked.
+            retired ← restore (retiredIn boundary value)
+            forM_ retired $ \(path, typeName) →
+              refuseArguments index path (RuleRetiredHandle typeName) visited
+        pure values
+      case checked of
+        Left (OrdinaryRefusal reason) → raiseOrdinary reason
+        Right values → do
+          let runAction ∷ IO [Value] → IO NumResults
+              runAction compute = do
+                  -- Counted before it starts, so a fault of anything the action does is
+                  -- one that happened after an action ran.
+                  noteActionRun vm
+                  -- A refusal the script caught and went on from is the operation's failure
+                  -- (C1), and an action is about to run after it: what it reports as having
+                  -- happened has to include that.
+                  amendEscape vm upgradeEffect
+                  -- The engine's own refusal of this call, raised by its API from inside
+                  -- the action, is a fault of the call and not the application's failure.
+                  -- It is caught outside the mark the action's failures get, so the mark
+                  -- never reaches it.
+                  produced ← compute `catch` \(CallRefusal why) → faulted (BindingRefused why) BindingRan
+                  let expected = bindingResults binding
+                  -- Bounded first: an action that built far more than the limits allow is
+                  -- refused after visiting what the limits allow, plus one.
+                  either (refuseResults 0 []) pure (checkLimits limits produced)
+                  when (length produced /= length expected) $
+                    refuseResults 0 [] (RuleArity (length expected) (length produced))
+                  forM_ (zip3 [1 ..] expected produced) $ \(index, schema, value) →
+                    case conformValue context schema value of
+                      Left (path, rule) → refuseResults index path rule
+                      Right () → pure ()
+                  encoded ← case encodeValues context limits produced of
+                    Left rule → refuseResults 0 [] rule
+                    Right bytes → pure bytes
+                  pushed ← pushValues state limits encoded (length produced)
+                  case pushed of
+                    Pushed → do
+                      -- Back to the script: what building its results allocated while the
+                      -- collector was held is paid now.
+                      serviceCollector state
+                      pure (NumResults (fromIntegral (length produced)))
+                    PushStatus status → do
+                      value ← renderFailure state entry
+                      lua_settop state entry
+                      faulted (ScriptFailed (classify status) value) BindingRan
+                    PushMalformed which → faulted (InternalError (Text.pack ("a result could not be built: " <> show which))) BindingRan
 
-      case action of
-        SuspendAction suspend → do
-          -- No application code runs: the task's coroutine is suspended once this
-          -- handler returns, and the host is told what the script asked for.
-          noteSuspension vm $ case suspend of
-            SuspendYield → SuspensionYield
-            SuspendWait kind → SuspensionWait kind space (bindingName binding) values
-          pure (NumResults 0)
-        -- What the action returns is evaluated inside the mark: a failure hidden in
-        -- a lazy result is the application's, whenever it would have surfaced.
-        -- The bounded check reaches every part of a result that can cross, and
-        -- stops at a limit, so an endless result costs no more than a large one.
-        ValuesAction run →
-          runAction . fromApplication $ do
-            returned ← restore (run values)
-            returned <$ evaluate (checkLimits limits returned)
-        ReleaseAction run →
-          runAction . fromApplication $ do
-            returned ← restore (run values)
-            returned <$ evaluate (checkLimits limits returned)
-        CommandAction run →
-          runAction $ do
-            answer ← fromApplication (restore (run values) >>= evaluate)
-            case answer of
-              Accepted → pure [VBoolean True, VNil]
-              Rejected reason
-                -- Its length in bytes without copying it: the text is the application's
-                -- and may be as large as memory allows.
-                | lengthWord8 reason > commandReasonLimit →
-                    refuseResults 2 [] (RuleBytesLimit commandReasonLimit)
-                | otherwise → pure [VBoolean False, VText reason]
+          case action of
+            SuspendAction suspend → do
+              -- No application code runs: the task's coroutine is suspended once this
+              -- handler returns, and the host is told what the script asked for.
+              noteSuspension vm $ case suspend of
+                SuspendYield → SuspensionYield
+                SuspendWait kind → SuspensionWait kind space (bindingName binding) values
+              pure (NumResults 0)
+            -- What the action returns is evaluated inside the mark: a failure hidden in
+            -- a lazy result is the application's, whenever it would have surfaced.
+            -- The bounded check reaches every part of a result that can cross, and
+            -- stops at a limit, so an endless result costs no more than a large one.
+            ValuesAction run →
+              runAction . fromApplication $ do
+                returned ← restore (run values)
+                returned <$ evaluate (checkLimits limits returned)
+            ReleaseAction run →
+              runAction . fromApplication $ do
+                returned ← restore (run values)
+                returned <$ evaluate (checkLimits limits returned)
+            CommandAction run →
+              runAction $ do
+                answer ← fromApplication (restore (run values) >>= evaluate)
+                case answer of
+                  Accepted → pure [VBoolean True, VNil]
+                  Rejected reason
+                    -- Its length in bytes without copying it: the text is the application's
+                    -- and may be as large as memory allows.
+                    | lengthWord8 reason > commandReasonLimit →
+                        refuseResults 2 [] (RuleBytesLimit commandReasonLimit)
+                    | otherwise → pure [VBoolean False, VText reason]
+
+
+-- | The refusal of an opted-in binding that Lua is to see as an ordinary error:
+-- why, bounded. Thrown by the checks before an action and caught around them and
+-- nowhere else, so it never reaches the operation's boundary.
+newtype OrdinaryRefusal = OrdinaryRefusal Text
+  deriving (Show)
+
+instance Exception OrdinaryRefusal
+
+-- | Whether an opted-in binding's refusal under this rule is an ordinary Lua
+-- error. Running out of stack or memory for the copy is not a refusal of the
+-- script's value: it is the interpreter's, and keeps its fault.
+ordinaryRule ∷ ValueRule → Bool
+ordinaryRule = \case
+  RuleStack → False
+  RuleMemory → False
+  _ → True
+
+-- | What a refused argument is called to Lua, within 'refusalReasonLimit' bytes.
+-- Nothing of the script's is copied past a few characters: a field name is cut
+-- before it is joined to anything.
+argumentReason ∷ Int → [PathStep] → ValueRule → Text
+argumentReason index path rule = boundReason (subject <> ": " <> ruleReason rule)
+  where
+    subject
+      | index == 0 = "the arguments"
+      | otherwise = "argument " <> Text.pack (show index) <> foldMap step path
+    step = \case
+      AtIndex position → "[" <> Text.pack (show position) <> "]"
+      AtField name → "." <> clip name
+
+-- | What a rule says, in a few words.
+ruleReason ∷ ValueRule → Text
+ruleReason = \case
+  RuleBytesLimit limit → "more than " <> count limit <> " bytes"
+  RuleDepthLimit limit → "nested deeper than " <> count limit
+  RuleElementLimit limit → "more than " <> count limit <> " values"
+  RuleCycle → "a table contains itself"
+  RuleUnsupportedType name → "a " <> clip name <> " cannot be passed"
+  RuleMetatable → "a table has a metatable"
+  RuleKeyType → "a table key is neither an integer nor a string"
+  RuleStack → "no stack to read it"
+  RuleMemory → "no memory to read it"
+  RuleWrongType declared found → "expected " <> clip declared <> ", found " <> clip found
+  RuleFloatForInteger → "a float where an integer is declared"
+  RuleInvalidUtf8 → "text that is not valid UTF-8"
+  RuleNilInTable → "a nil in a table"
+  RuleNotASequence → "not a sequence"
+  RuleNotARecord → "not a record"
+  RuleUnknownField name → "unknown field " <> clip name
+  RuleMissingField name → "missing field " <> clip name
+  RuleDuplicateField name → "field " <> clip name <> " twice"
+  RuleArity declared found → "expected " <> count declared <> " values, found " <> count found
+  RuleForeignHandle → "a handle another VM issued"
+  RuleHandleType declared found → "expected a " <> clip declared <> " handle, found a " <> clip found <> " handle"
+  RuleRetiredHandle name → "a " <> clip name <> " handle that has ended"
+  RuleUnknownCapability name → "unknown handle type " <> clip name
+  where
+    count = Text.pack . show
+
+-- | The first few characters of a name.
+clip ∷ Text → Text
+clip name
+  | Text.compareLength name clipLength == GT = Text.take clipLength name <> "..."
+  | otherwise = name
+  where
+    clipLength = 32
+
+-- | At most 'refusalReasonLimit' bytes of UTF-8, cut at a character.
+boundReason ∷ Text → Text
+boundReason text
+  | lengthWord8 text <= refusalReasonLimit = text
+  | otherwise = Text.pack (go 0 (Text.unpack (Text.take refusalReasonLimit text)))
+  where
+    go ∷ Int → String → String
+    go _ [] = []
+    go used (character : rest)
+      | used' > refusalReasonLimit = []
+      | otherwise = character : go used' rest
+      where
+        used' = used + lengthWord8 (Text.singleton character)
 
 -- | The first capability in a value whose type the application's own check
 -- refuses, with where it is. Checked in order, before the binding's action.

@@ -113,6 +113,12 @@ module Hetoimasia.Scripting.Lua.Registration
   , confinedEligible
   , finalizerEligible
   , withoutDirectPath
+  , recoverableRefusals
+  , withPrecondition
+  , Precondition
+  , OwnerContexts (..)
+  , refusalReasonLimit
+  , bindingRecoverable
   , bindingName
   , bindingKind
   , bindingArguments
@@ -148,6 +154,8 @@ import Data.Text (Text)
 import Hetoimasia.Scripting.Lua.Internal.Registration hiding
   ( bindingArguments
   , bindingConfined
+  , bindingPreconditions
+  , bindingRecoverable
   , bindingDirect
   , bindingFinalizer
   , bindingKind
@@ -214,3 +222,8 @@ bindingConfined = Internal.bindingConfined
 -- | Whether the binding is eligible to run from a Lua finalizer.
 bindingFinalizer ∷ Binding → Bool
 bindingFinalizer = Internal.bindingFinalizer
+
+-- | Whether the binding is opted in to ordinary Lua errors for the refusals made
+-- before its action ('recoverableRefusals', 'withPrecondition').
+bindingRecoverable ∷ Binding → Bool
+bindingRecoverable = Internal.bindingRecoverable
