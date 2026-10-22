@@ -85,7 +85,7 @@ concrete precondition
 - [x] LFE-20. Publish scenes with completion-safe texture retention — [#535]
 - [x] LFE-21. Expose the complete UI-only graphics facade — [#536]
 - [x] LFE-22. Assemble the generic run command and Lua quad content — [#537]
-- [ ] LFE-23. Qualify integrated failure and two-instance ownership headlessly
+- [x] LFE-23. Qualify integrated failure and two-instance ownership headlessly — [#538]
 - [ ] LFE-24. Verify Lua-authored output through offscreen pixels
 - [ ] LFE-25. Qualify native windows, independent retirement and quit
 
