@@ -6,24 +6,24 @@ module Test.LuaRuntime.Admission.Races (spec) where
 
 import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
-import Control.Concurrent.STM (atomically, modifyTVar', throwSTM)
+import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, throwSTM, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException, throwIO)
 import Control.Monad (forM, void)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Hetoimasia.Foundation.Resource (acquirePart, cleanupFailureLabel, cleanupFailuresInContext, releaseRank)
+import Hetoimasia.Foundation.Resource (acquirePart, cleanupFailureLabel, cleanupFailuresInContext, releaseRank, restoredStep)
 import Hetoimasia.Scripting.Lua.Admission
 import Hetoimasia.Scripting.Lua.Instance
-import Hetoimasia.Scripting.Lua.Lease (Ownership (..), ScopeSummary (..))
+import Hetoimasia.Scripting.Lua.Lease (Ownership (..), Retirements (..), ScopeSummary (..), instanceLeases)
 import Hetoimasia.Scripting.Lua.Provider
 import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
-import Hetoimasia.Scripting.Lua.Value (Value (VInteger))
+import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Admission.Support
-import Test.LuaRuntime.Instance.Support (admitWith, awaitSettled, expectControl, failureOf', moduleNamed, sf)
-import Test.LuaRuntime.Request.Support (answerResult, answerWith, awaitDiagnostic, diagnostics, finishWork, onCancel, onSubmit)
+import Test.LuaRuntime.Instance.Support (admitWith, awaitSettled, expectControl, failureOf', idOf, moduleNamed, sf)
+import Test.LuaRuntime.Request.Support (Submitted (..), answerResult, answerWith, awaitDiagnostic, diagnostics, finishWork, onCancel, onSubmit, submissionAt)
 import Test.LuaRuntime.Scheduled.Support (awaitEntered, awaitScheduledTerminal, releaseGate)
 import Test.LuaRuntime.Support (Broken (Broken), bounded, brokenIs, expectFatal, requiredPolicy, tryExpected, withBoundary)
 
@@ -34,6 +34,23 @@ arrival fixture runtime label =
 
 spec ∷ Spec
 spec = describe "races" $ do
+  describe "a provider's defect that arrives while the owner is exiting" $ do
+    it "is kept as the owner's failure: the instances' end and the retirement raise it as the boundary does" $ bounded $ do
+      fixture ← newAFix 4
+      ExceptionWithContext _ failure ← expectFatal $ \control runtime → settleAll fixture $ do
+        owner ← startAdmitting fixture runtime "defect at exit" [shutdownBlocker] aConfig (admissionGrant fixture 8 SettleOnArrival) requiredPolicy
+        admitAdmitter fixture owner "i" "shutdownblocker"
+        acommand fixture owner "i" "start" "a"
+        awaitNote fixture "cmd start a started"
+        retireScheduled owner
+        -- The instance is inside its shutdown, before its requests are revoked: a reply that breaks the
+        -- endpoint's schema arrives now, and no boundary of the owner runs again.
+        awaitEntered (sf (afBase fixture)) "s"
+        answerWith (afFake fixture) 0 (ProviderResult (VText "not an integer")) >>= (`shouldBe` ReplyDefective)
+        releaseGate (sf (afBase fixture)) "s"
+        awaitScheduledTerminal control owner
+      (fromException failure ∷ Maybe ProviderDefect) `shouldSatisfy` (/= Nothing)
+
   describe "a withdrawal whose credit release raises" $ do
     it "still takes the unsubmitted work back, keeps both failures, and lets the owner end" $ bounded $ do
       fixture ← newAFix 4
@@ -239,3 +256,93 @@ spec = describe "races" $ do
         let started = [owner | Right (ScheduledStarted owner) ← outcomes]
             refused = [rendered | Left failure ← outcomes, let rendered = show failure, "the registry already serves an owner" `Text.isInfixOf` Text.pack rendered]
         (length started, length refused) `shouldBe` (1, attempts - 1)
+
+  describe "a resource whose building failed while a stage's retirement is pending" $ do
+    it "keeps the credits that were to transfer charged until the stage is retired and its slot is gone" $ bounded $ do
+      fixture ← newAFix 4
+      bank ← newBank 1
+      chargedAtRelease ← newTVarIO []
+      identity ← newTVarIO Nothing
+      -- A credit that notes, as it is given back, how many holdings the instance is still charged for.
+      let observing =
+            (bankCredit "pixels" True bank)
+              { creditRelease = \end → do
+                  modifyTVar' (bkLeft bank) (+ 1)
+                  holder ← readTVar identity
+                  charged ← maybe (pure (-1)) (fmap summaryCharged . instanceLeases (afLeases fixture)) holder
+                  modifyTVar' chargedAtRelease (<> [(Text.pack (show end), charged)])
+              }
+      setPolicy fixture (\held → held {polLease = Just InstanceOwned, polCredits = [observing]})
+      let failing =
+            Adoption $ \retirements → do
+              _ ←
+                acquirePart
+                  "texture"
+                  (releaseRank 0)
+                  (() <$ note fixture "acquire texture")
+                  ( \_ → do
+                      note fixture "retire texture"
+                      -- The provider retires it when it retires its work on the request, and not before:
+                      -- the slot keeps its charge until then.
+                      found ← submissionAt (afFake fixture) 0
+                      retireAsynchronously retirements "texture" (readTVar (sbRetirement found))
+                  )
+              restoredStep (throwIO (Broken "adopt"))
+              pure ("never" ∷ Text)
+      ExceptionWithContext _ failure ← expectFatal $ \control runtime → settleAll fixture $ do
+        owner ← arrival fixture runtime "failed building"
+        admitAdmitter fixture owner "i" "admitter"
+        atomically . writeTVar identity . Just =<< idOf (afBase fixture) "i"
+        acommandWith fixture owner "i" "start" "a" (Just "res") (Just 1) Nothing
+        awaitNote fixture "cmd start a started"
+        _ ← answerWith (afFake fixture) 0 (ProviderResource (VInteger 5) failing)
+        awaitNote fixture "retire texture"
+        -- The request is gone with its instance's ending, and only the provider's retirement is outstanding.
+        awaitDiagnostic owner ((== 0) . rdOutstanding)
+        bankAvailable bank >>= (`shouldBe` 0)
+        finishWork (afFake fixture) 0
+        awaitScheduledTerminal control owner
+      failure `shouldSatisfy` brokenIs "adopt"
+      -- Given back once, and only when nothing was charged to the instance any more.
+      atomically (readTVar chargedAtRelease) >>= (`shouldBe` [("CreditSettled", 0)])
+      bankAvailable bank >>= (`shouldBe` 1)
+
+  describe "the owner's one bound across generic and opt-in requests" $ do
+    it "counts the result of a generic request the epoch cancelled and nobody took as a place an opt-in request cannot have" $ bounded $ do
+      fixture ← newAFix 4
+      withBoundary $ \_ runtime → settleAll fixture $ do
+        owner ← startAdmitting fixture runtime "one place" [admitter] aConfig (admissionGrant fixture 1 SettleOnArrival) requiredPolicy
+        admitAdmitter fixture owner "i" "admitter"
+        acommand fixture owner "i" "gstart" "g"
+        awaitNote fixture "cmd gstart g started"
+        void (advanceRequestEpoch (scheduledEndpoint owner))
+        finishWork (afFake fixture) 0
+        awaitDiagnostic owner ((== 0) . rdWorkPending)
+        -- The cancelled result is still retained, and the owner's only place is still held.
+        d ← diagnostics owner
+        rdOutstanding d `shouldBe` 1
+        acommand fixture owner "i" "start" "a"
+        awaitNote fixture "cmd start a busy:busy"
+        historyCount fixture "cmd start a started" >>= (`shouldBe` 0)
+
+    it "counts an opt-in request whose result was taken and whose provider work is not retired as a place a generic request cannot have" $ bounded $ do
+      fixture ← newAFix 4
+      withBoundary $ \_ runtime → settleAll fixture $ do
+        owner ← startAdmitting fixture runtime "one place held" [admitter] aConfig (admissionGrant fixture 1 SettleOnArrival) requiredPolicy
+        admitAdmitter fixture owner "i" "admitter"
+        acommand fixture owner "i" "start" "a"
+        awaitNote fixture "cmd start a started"
+        acommand fixture owner "i" "cancel" "a"
+        awaitNote fixture "cmd cancel a cancelled"
+        acommand fixture owner "i" "take" "a"
+        awaitNote fixture "cmd take a {status=cancelled}"
+        -- Taken, but the provider has not proved its work over: the place is still the request's.
+        d ← diagnostics owner
+        rdHeld d `shouldBe` 1
+        -- A generic request has no place either: the call is refused, and refusing it fails the instance.
+        acommand fixture owner "i" "pgstart" "g"
+        awaitNote fixture "cmd pgstart g refused"
+        -- The instance's ending waits for the provider to retire the cancelled request's work.
+        finishWork (afFake fixture) 0
+        settlement ← awaitSettled (afBase fixture) "i"
+        fmap (Text.isInfixOf "all 1 places are held" . Text.pack . show . failureError) (failureOf' settlement) `shouldBe` Just True

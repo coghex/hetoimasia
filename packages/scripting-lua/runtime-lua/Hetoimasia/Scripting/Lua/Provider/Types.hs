@@ -518,6 +518,10 @@ data Held = Held
     -- ^ The credits still charged.
   , heldLease ∷ !(Maybe Word64)
     -- ^ The key of the reserved result lease, until it is adopted or discharged.
+  , heldRetiring ∷ !(Maybe Word64)
+    -- ^ The key of a lease slot whose building failed and whose rolled-back stages are still being
+    -- retired by their provider: the slot keeps its charge until they are, and the request's credits
+    -- stay charged with it.
   }
 
 -- | A provider's resource reply that the owner has yet to build into its reserved lease.

@@ -40,6 +40,7 @@ module Test.LuaRuntime.Admission.Support
   , initWaiter
   , shutdownStarter
   , oneShotStarter
+  , shutdownBlocker
 
     -- * Owners
   , acmdSource
@@ -79,7 +80,7 @@ import Hetoimasia.Scripting.Lua.Lending (Lending, newLending)
 import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Provider
 import Hetoimasia.Scripting.Lua.Registration
-import Hetoimasia.Scripting.Lua.Request (requestHandleValue)
+import Hetoimasia.Scripting.Lua.Request (requestHandleValue, startRequest)
 import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled hiding (Policy (..))
 import Hetoimasia.Scripting.Lua.Value
@@ -271,6 +272,11 @@ adNamespace fixture =
               Started handle → [requestHandleValue "areq" handle, VNil]
               Unavailable bank → [VNil, VRecord [("code", VText "busy"), ("message", VText (renderBank bank))]]
           _ → pure []
+    , -- A generic request: no handle is kept, and its result is retained by the model until taken or the instance ends.
+      recoverableRefusals $
+        asynchronousNativeRequestIn "gen_start" [SText, SInteger] [] $ \context arguments → case arguments of
+          [VText endpoint, VInteger n] → [] <$ startRequest context endpoint [VInteger n] (pure ())
+          _ → pure []
     , recoverableRefusals $
         asynchronousNativeRequestIn "ready" [SCapability "areq"] [SBoolean] $ \context arguments → case arguments of
           [VCapability handle] → (\settled → [VBoolean settled]) <$> readyAdmitted context (capabilityKey handle)
@@ -363,6 +369,12 @@ prelude =
   , "    if not ok then out = 'error ' .. tostring(r)"
   , "    elseif r then self.hs[key] = r out = 'started'"
   , "    else out = 'busy:' .. err.code .. ' ' .. err.message end"
+  , "  elseif p.op == 'gstart' then"
+  , "    ad.gen_start(p.endpoint or 'path', p.n or 0)"
+  , "    out = 'started'"
+  , "  elseif p.op == 'pgstart' then"
+  , "    local ok = pcall(ad.gen_start, p.endpoint or 'path', p.n or 0)"
+  , "    out = ok and 'started' or 'refused'"
   , "  elseif p.op == 'ready' then out = tostring(ad.ready(self.hs[key]))"
   , "  elseif p.op == 'take' then out = fmt(ad.take(self.hs[key]))"
   , "  elseif p.op == 'ptake' then"
@@ -499,6 +511,19 @@ shutdownStarter =
          , "function shutdown(self, reason)"
          , "  local ok, err = pcall(ad.start, 'path', 98, nil)"
          , "  fx.record('shutdown start ' .. tostring(ok) .. ' ' .. tostring(err))"
+         , "end"
+         ]
+
+-- | An instance whose @shutdown@ is held at the gate @s@, so that its owner's exit is under way while the
+-- instance still has its requests.
+shutdownBlocker ∷ ModuleSource
+shutdownBlocker =
+  hooksModule "shutdownblocker" $
+    prelude
+      <> [ "function init(self, api) self.hs = {} connect(self, api) end"
+         , "function shutdown(self, reason)"
+         , "  fx.block('s')"
+         , "  fx.record('shutdown unblocked')"
          , "end"
          ]
 

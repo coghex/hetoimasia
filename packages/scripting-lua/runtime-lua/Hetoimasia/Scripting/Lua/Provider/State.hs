@@ -211,7 +211,7 @@ import Hetoimasia.Scripting.Lua.Internal.Value
   , conformValue
   , valuesFootprint
   )
-import Hetoimasia.Scripting.Lua.Lease.State (Leases, Refusal (CapacityExhausted), Scope (scopeOpen), abandon, readScope, renderCaught, reserve)
+import Hetoimasia.Scripting.Lua.Lease.State (Leases, Refusal (CapacityExhausted), Scope (scopeOpen), abandon, readScope, renderCaught, reserve, slotPresent)
 import Hetoimasia.Scripting.Lua.Retention
   ( Ended (..)
   , Obligation (Obligation)
@@ -494,6 +494,17 @@ chargedPlaces st =
         `Set.union` Set.fromList [recIdentity record | record ← Map.elems (pRecs st), isJust (recEnded record)]
     )
 
+-- | The places the owner's one bound is on, whatever kind of request holds them: the places 'chargedPlaces'
+-- counts, and the opt-in requests whose results were taken or discarded but whose provider work is not
+-- yet retired. A request is counted once, whichever of the two accounts holds it.
+ownerPlaces ∷ PState → Int
+ownerPlaces st =
+  Set.size
+    ( Set.fromList (Map.keys (sessionRequests (pSession st)))
+        `Set.union` Set.fromList [recIdentity record | record ← Map.elems (pRecs st), isJust (recEnded record)]
+        `Set.union` Map.keysSet (pHeld st)
+    )
+
 -- | Whether the owner and the requester are taking requests at all, as a cheap look before the
 -- application's assignment is asked anything: a request refused as closed asks nobody.
 admissible ∷ ProviderState → Requester → STM Bool
@@ -543,7 +554,7 @@ admit service requester endpoint placement = do
                   Nothing → issueHolder (pSession st)
                 bound = psBound service
             case acceptRequestFor holder (RequestName number) (EndpointId (endpointName endpoint)) withHolder of
-              _ | chargedPlaces st >= bound → refuse (RequestsFull bound)
+              _ | ownerPlaces st >= bound → refuse (RequestsFull bound)
               (_, Left (CapReached OutstandingRequests full)) → refuse (RequestsFull full)
               (_, Left _) → refuse RequestsClosed
               (session, Right identity) → do
@@ -783,7 +794,8 @@ admitOptIn service requester endpoint ask = (OptInAccepted <$> attempt) `catchST
           ledger = Map.size (pHeld st)
       when (mine >= admitPerInstance ask) (stop' (StopBank (BankInstanceRequests (admitPerInstance ask))))
       when (ledger >= admitPerVm ask) (stop' (StopBank (BankVmRequests (admitPerVm ask))))
-      when (ledger >= psBound service) (stop' (StopBank (BankOwnerRequests (psBound service))))
+      -- The owner's one bound counts every request's place, a generic request's retained result included.
+      when (ownerPlaces st >= psBound service) (stop' (StopBank (BankOwnerRequests (psBound service))))
       let (holder, withHolder) = case Map.lookup requester (pHolders st) of
             Just held → (held, pSession st)
             Nothing → issueHolder (pSession st)
@@ -841,7 +853,7 @@ admitOptIn service requester endpoint ask = (OptInAccepted <$> attempt) `catchST
         , pWork = Map.insert identity work (pWork st)
         , pHolders = Map.insert requester holder (pHolders st)
         , pDue = maybe id (\due → Map.insert due identity) slot (pDue st)
-        , pHeld = Map.insert identity (Held requester (admitCredits ask) leaseKey) (pHeld st)
+        , pHeld = Map.insert identity (Held requester (admitCredits ask) leaseKey Nothing) (pHeld st)
         , pNext = number + 1
         , pCounts = (pCounts st) {countAdmitted = countAdmitted (pCounts st) + 1}
         }
@@ -920,7 +932,12 @@ releaseSettled service = do
             forM_ ((,) <$> psLeases service <*> heldLease held) (uncurry abandon)
             pure held {heldLease = Nothing}
           else pure held
-      if reaped && isNothing record
+      -- A resource whose building failed keeps its credits charged until its rolled-back stages are
+      -- retired and its slot is gone.
+      retiring ← case (psLeases service, heldRetiring held') of
+        (Just leases, Just key) → slotPresent leases key
+        _ → pure False
+      if reaped && isNothing record && not retiring
         then do
           released ← forM (heldCredits held') (\credit → releaseCredit credit CreditSettled)
           unless (null (catMaybes released)) $
@@ -1004,12 +1021,17 @@ finishAdoption service identity adopting = do
 -- | Building a request's resource failed: the reservation was given back by the building, and the
 -- request no longer holds a lease. The failure is the owner's to raise.
 failAdoption ∷ ProviderState → RequestId → STM ()
-failAdoption service identity =
-  modifyTVar' (psVar service) $ \st →
-    st
-      { pHeld = Map.adjust (\held → held {heldLease = Nothing}) identity (pHeld st)
-      , pAdopting = Map.delete identity (pAdopting st)
-      }
+failAdoption service identity = do
+  st ← readTVar (psVar service)
+  -- The building rolled its stages back; a stage whose retirement the provider has yet to finish keeps the
+  -- slot, and with it the credits that were to transfer, charged until it does.
+  retained ← case (psLeases service, Map.lookup identity (pHeld st) >>= heldLease) of
+    (Just leases, Just key) → slotPresent leases key
+    _ → pure False
+  writeTVar (psVar service) st
+    { pHeld = Map.adjust (\held → held {heldLease = Nothing, heldRetiring = if retained then heldLease held else Nothing}) identity (pHeld st)
+    , pAdopting = Map.delete identity (pAdopting st)
+    }
 
 -- Answering ---------------------------------------------------------------------------
 
@@ -1839,7 +1861,10 @@ workWaiting service = do
       polling = [obligation | work ← works, workWantsCancel work, not (workEnded work), isNothing (workFailure work), obligation ← retainedObligations (workRetained work)]
   changed ← forM polling $ \obligation →
     (\reading → case reading of ProviderPending → False; _ → True) <$> pollObligation obligation
-  pure (over || untold || or changed || any (not . adoptingClaimed) (Map.elems (pAdopting st)) || not (null (pDefects st)) || not (null (pCleanup st)) || not (null (pDiscards st)))
+  -- A failed resource's slot that is gone: the credits kept charged with it are the owner's to give back.
+  gone ← forM [key | held ← Map.elems (pHeld st), Just key ← [heldRetiring held]] $ \key →
+    maybe (pure False) (\leases → not <$> slotPresent leases key) (psLeases service)
+  pure (over || untold || or changed || or gone || any (not . adoptingClaimed) (Map.elems (pAdopting st)) || not (null (pDefects st)) || not (null (pCleanup st)) || not (null (pDiscards st)))
 
 -- Reading --------------------------------------------------------------------------------
 

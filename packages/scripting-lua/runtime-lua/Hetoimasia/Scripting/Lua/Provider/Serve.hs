@@ -298,11 +298,15 @@ retireProvider ∷ ProviderState → IO ([ExceptionWithContext SomeException], [
 retireProvider service = mask_ $ do
   _ ← atomically (closeSTM service)
   told ← tellProviders service
-  cleanup ← uninterruptibleMask_ (settleAll [])
-  pure (told, cleanup)
+  (cleanup, defects) ← uninterruptibleMask_ (settleAll [] [])
+  -- A defect in a reply that came while the instances were ending or the owner was waiting is a failure
+  -- of the host like one found at a boundary, and the owner's end keeps it with the others.
+  defective ← forM defects defectOf
+  pure (defective <> told, cleanup)
   where
-    settleAll acc = do
+    settleAll acc found = do
       failures ← serviceProvider service
+      fresh ← atomically (takeDefects service)
       done ← atomically $ do
         pending ← anyWorkPending service
         ready ← workWaiting service
@@ -311,7 +315,10 @@ retireProvider service = mask_ $ do
       -- A tell that was claimed while the work was still being handed over is made now.
       late ← tellProviders service
       let acc' = acc <> failures <> [("lua request cancel", failure) | failure ← late]
-      if done then pure acc' else settleAll acc'
+          found' = found <> fresh
+      -- A reply that ended the last work and was a defect is recorded in that same transaction, after
+      -- the take above and before the check that found nothing pending: taken once more.
+      if done then (,) acc' . (found' <>) <$> atomically (takeDefects service) else settleAll acc' found'
 
 -- | Replace the generation of the owner's records (P-9): every outstanding request settles,
 -- once, as cancelled by the epoch change, and the provider work on all of them is to be told.

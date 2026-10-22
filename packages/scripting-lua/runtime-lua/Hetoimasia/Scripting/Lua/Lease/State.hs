@@ -62,6 +62,7 @@ module Hetoimasia.Scripting.Lua.Lease.State
   , Holding (..)
   , Obligation (..)
   , Slot (..)
+  , slotPresent
   , SlotPhase (..)
   , Scope (..)
   , LeaseState (..)
@@ -370,6 +371,11 @@ abandon leases key =
         | not (retainedPending (slotRetained slot)) → Nothing
         | otherwise → Just slot {slotPhase = SlotReleased}
       _ → Just slot
+
+-- | Whether a slot is still charged: reserved, live, releasing, or released with a provider's retirement
+-- of what it held still to complete. A slot is gone once nothing is charged to it any more.
+slotPresent ∷ Leases → Word64 → STM Bool
+slotPresent leases key = Map.member key . lsSlots <$> readTVar (leasesState leases)
 
 -- | Record a retirement the provider has yet to complete, charged to the slot the
 -- release belongs to. A slot that is gone cannot be charged: the retirement is
