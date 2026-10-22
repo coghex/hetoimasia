@@ -8,16 +8,17 @@
 -- reported pending, so neither variant passes vacuously.
 module Test.Content.Inventory.Scan (spec) where
 
-import Control.Exception (ExceptionWithContext (ExceptionWithContext))
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), IOException, try)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.List (sort)
 import Hetoimasia.Content
-import Hetoimasia.Content.Identity (InventoryReason (..), EntryProblem (..), SegmentProblem (..), Forbidden (..))
+import Hetoimasia.Content.Identity (EntryProblem (..), Forbidden (..), InventoryReason (..), SegmentProblem (..))
 import Hetoimasia.Content.Internal.Native
 import Hetoimasia.Content.Inventory
 import System.FilePath ((</>))
 import System.Posix.Files (createNamedPipe, createSymbolicLink, setFileMode, ownerReadMode, ownerWriteMode, unionFileModes)
+import qualified System.Posix.IO.ByteString as Raw
 import System.Posix.User (getEffectiveUserID)
 import Test.Content.Inventory.Support
 import Test.Content.Support
@@ -134,13 +135,51 @@ spec = do
         _ ← asserting rig
         pure ()
 
-    it "refuses an invalid name, even on an unused file" $
+    it "refuses an invalid name, even on an unused file, before any sibling is read" $
       withLayout $ \tree → do
         populate (rootPath tree) [("fine.txt", "x"), ("bad:name.txt", "unused")]
-        outcome ← scanning productionSeam limits (rootPath tree)
+        (seam, rig) ← recordingSeam
+        outcome ← scanning seam limits (rootPath tree)
         case fmap inventoryFailureReason (either Just (const Nothing) outcome) of
           Just (Identity (InvalidEntry _ (BadComponent 0 (SegmentForbidden Colon 3 _)))) → pure ()
           other → expectationFailure ("expected an invalid-name refusal, got " <> show other)
+        -- the listing is judged as a whole before any entry of it is opened
+        requestSizes <$> events rig `shouldReturn` []
+
+    it "refuses two siblings that collide by canonical caseless comparison, before reading either (supplied names)" $
+      withLayout $ \tree → do
+        seam ← supplyingEntries [("Stra\xc3\x9f" <> "e", KindRegular), ("STRASSE", KindRegular)]
+        outcome ← scanning seam limits (rootPath tree)
+        case fmap inventoryFailureReason (either Just (const Nothing) outcome) of
+          Just (Identity (SiblingCollision _)) → pure ()
+          other → expectationFailure ("expected a sibling collision, got " <> show other)
+
+    it "refuses a name that is not valid UTF-8 as bad inventory, never decoding it (supplied name)" $
+      withLayout $ \tree → do
+        seam ← supplyingEntries [(BS.pack [0xff, 0xfe, 0x61], KindRegular)]
+        outcome ← scanning seam limits (rootPath tree)
+        case fmap inventoryFailureReason (either Just (const Nothing) outcome) of
+          Just (Identity (InvalidEntry _ (BadComponent 0 (SegmentMalformedUtf8 0)))) → pure ()
+          other → expectationFailure ("expected a malformed-name refusal, got " <> show other)
+
+    it "refuses a real name that is not valid UTF-8, where the filesystem holds one" $
+      withLayout $ \tree → do
+        created ← try @IOException (Raw.createFile (BC.pack (rootPath tree) <> "/" <> BS.pack [0xff, 0xfe, 0x61]) 0o600 >>= Raw.closeFd)
+        case created of
+          Left _ → pendingWith "this filesystem refuses a file name that is not valid UTF-8 (APFS does); the supplied-name example above covers the refusal"
+          Right () → do
+            outcome ← scanning productionSeam limits (rootPath tree)
+            case fmap inventoryFailureReason (either Just (const Nothing) outcome) of
+              Just (Identity (InvalidEntry _ (BadComponent 0 (SegmentMalformedUtf8 0)))) → pure ()
+              other → expectationFailure ("expected a malformed-name refusal, got " <> show other)
+
+    it "refuses an unsupported native open as unsupported, naming the errno (injected)" $
+      withLayout $ \tree → do
+        populate (rootPath tree) [("odd.bin", "x")]
+        let unsupported = denyingOpen "odd.bin" 22 productionSeam
+        outcome ← scanning unsupported limits (rootPath tree)
+        fmap inventoryFailureReason (either Just (const Nothing) outcome) `shouldBe` Just (Content (Unsupported 22))
+        fmap inventoryFailurePath (either Just (const Nothing) outcome) `shouldBe` Just (names ["odd.bin"])
 
     it "refuses a symbolic link inside the folder, even a dangling one, naming the path" $
       withLayout $ \tree → do
