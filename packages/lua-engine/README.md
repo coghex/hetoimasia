@@ -1,28 +1,32 @@
 # hetoimasia-lua-engine
 
-The Lua-first engine's **pure configuration boundary** (LFE-3 of
+The Lua-first engine's **configuration boundary and role policy** (LFE-3 and LFE-8 of
 [the design](../../docs/designs/lua_first_engine_design.md)): a strict parser for
 the format-1 launch manifest `hetoimasia.json`, from supplied bytes to a
-resolved role, entry and tick configuration, and the **fixed M1 profile** of
-limits with validated, smaller test profiles.
+resolved role, entry and tick configuration, the **fixed M1 profile** of
+limits with validated, smaller test profiles, and the **M1 behavior selection**: which
+export field each role selects, the exact cadence rules and the export-module ceilings.
 
 It opens no folder, reads no file, starts no Lua, worker, window or GPU, prints
 nothing, exits nowhere and performs no IO. Every function is pure and returns
 a plain value or a bounded refusal.
 
 The library depends on `hetoimasia-foundation` (its `Duration`, checked
-nanoseconds from 1 to 2^64 − 1) and on `array`, `base`, `bytestring`,
-`containers` and `text`. It depends on no GLFW, Vulkan, console, sample or
-game package, and it imports no module that performs IO. Later slices add
-the content layer (LFE-4 to LFE-6), Lua adapters and role composition to this
+nanoseconds from 1 to 2^64 − 1), on the Lua host and its runtime
+(`hetoimasia-scripting-lua` and its `runtime-lua` sublibrary, for the behavior
+selection only: the manifest and the profile import nothing of them) and on `array`,
+`base`, `bytestring`, `containers` and `text`. It depends on no GLFW, Vulkan, console,
+sample or game package, and it imports no module that performs IO. Later slices add
+the content layer (LFE-4 to LFE-6) and the rest of the role composition to this
 package; they are not here.
 
 | Module | Contents |
 | --- | --- |
 | `Hetoimasia.LuaEngine.Manifest` | `parseManifest`, `parseManifestWith`; `Manifest`, `RoleSelection`, `declaredEntries`; every refusal type |
 | `Hetoimasia.LuaEngine.Profile` | `fixedM1Profile`, `validateProfile`; the limit types and their accessors; the derived values |
+| `Hetoimasia.LuaEngine.Behavior` | `behaviorField`, `exportLimits`, `cadenceOf`, `behaviorRequest`; `CadenceRefusal` |
 
-Every other module is hidden. A client imports these two.
+Every other module is hidden. A client imports these three.
 
 ## The manifest
 
@@ -209,13 +213,66 @@ attainable.
 | `OutputWithinTextureBytesPerUi`, `TextureBytesPerUiWithinSession`, `OutputWithinPipelineWorkspace`, `InflatedScanlinesWithinPipelineWorkspace` | one image's output fits a UI instance's bytes, which fit the session's, and fits the pipeline workspace with the inflated scanlines |
 | `FrameSlotsAggregateHoldsWindow`, `FrameSlotsAggregateWithinTargets` | the aggregate holds one window's slots and no more than all targets could use |
 
+## The M1 behavior selection
+
+LFE-8 adds the policy that sits over the Lua runtime's generic behavior mechanism
+([`hetoimasia-scripting-lua`](../scripting-lua/README.md#export-modules-and-captured-behaviors)).
+That mechanism evaluates an export module, keeps its returned table in the VM, validates a behavior's
+fixed schema and captures its hooks for an instance; it knows no role. This module is the M1 choice made
+over it, and it is as pure as the rest: it evaluates nothing and starts no VM. It imports only the
+Lua host's and runtime's public modules, which a boundary example checks.
+
+| Function | What it decides |
+| --- | --- |
+| `behaviorField role` | the export field a role selects: `gameplay` or `presentation`, read by raw access; nothing else in the table is looked at |
+| `exportLimits profile` | the source and identity ceilings of a VM's export modules, from the profile: `ModuleSourceBytes` (1 MiB) and `ModuleIdentitiesPerVm` (256), failed and in-progress ones counted |
+| `cadenceOf role shape` | the interval a behavior's `update` falls due on, from what its table read as, or the first `CadenceRefusal` |
+| `behaviorRequest role identity label facade name class` | the request that admits an instance of a role's behavior: the field, the injected facade and the role's rule |
+
+The role and the facade are the caller's: the assembly supplies the role, and the facade is the narrow
+per-instance value the later service package builds. Nothing a module's returned table says chooses
+either. The manifest's tick duration keeps its full positive 64-bit range: gameplay's cadence is a whole
+number of ticks of whatever tick duration the owner was configured with, and nothing here defaults or
+changes one.
+
+### Cadence
+
+Applied to a behavior that has an `update` hook. A behavior without one has no cadence, stays alive until
+it is stopped, and has neither cadence field: either is an error (`CadenceWithoutUpdate`).
+
+| Role | `every_ticks` | `every_seconds` |
+| --- | --- | --- |
+| gameplay | optional, default 1; a Lua **integer** from 1 through 2^63 − 1 | refused (`FieldNotAllowed`) |
+| presentation | refused (`FieldNotAllowed`) | **required**; a Lua integer or float, finite and positive |
+
+* A tick count must be an integer. An integer-valued float such as `1.0`, a numeric string, zero, a negative
+  number and a table are refused (`TicksNotInteger`, `TicksNotPositive`); nothing is coerced. 2^63 is not an
+  integer (Lua reads it as a float), so overflow is refused too.
+* Seconds convert **exactly**: the value the Lua number represents (an integer's, or the exact rational a
+  double is) times 1,000,000,000, rounded **upward**, must be a positive 64-bit count of nanoseconds
+  (`SecondsTooLarge` otherwise). The conversion is `Integer` arithmetic, never a floating product that could
+  overflow or round down, and never the source literal: `0.1` is the nearest double to a tenth, which is
+  slightly above it, so it converts to `100000001` ns. A positive input below a nanosecond is one nanosecond,
+  never zero. There is no default interval for a UI.
+* The result is an `Interval` (`LogicalTicks`, or `ElapsedEvery`) the runtime resolves exactly or not at all
+  through its existing scheduler; there is no new timer and no change to `dt`.
+
+### What proves it
+
+`Test.LuaEngine.Behavior`: the field of each role; the limits from the fixed profile and a smaller validated
+one; the gameplay endpoints (1 and 2^63 − 1), the refusals of zero, negatives, floats of any value, strings and
+tables, and of seconds; presentation's mandatory interval, finite and positive checks, sub-nanosecond input
+rounded upward, `0.1`, the largest accepted count and the first refused one, checked against an independently
+written integer oracle over the doubles on both sides of the boundary and across a spread of magnitudes; the
+no-update behaviors; and the request carrying the role's rule.
+
 ## Deferred, by design
 
 Not here, and not claimed: opening `hetoimasia.json`, anchored roots, the full
 literal Unicode path identities, inventory and presence checks and SHA-256
 verification (LFE-4 to LFE-6); the CLI `run` dispatch and exit mapping (LFE-22);
-Lua evaluation, behavior and cadence capture, instance and service facades,
-workers and session startup; live codec, texture and GPU budgets and their
+the loader and import resolution (LFE-9), the concrete content, time, graphics and status
+service facades and their metadata and grant policy (LFE-12), workers and session startup; live codec, texture and GPU budgets and their
 enforcement; time sampling and scheduling; mods, metadata extensions, alternate
 manifest formats, defaults or relaxed parsing.
 
@@ -227,8 +284,10 @@ manifest formats, defaults or relaxed parsing.
 cabal test --project-file cabal.project.cpu hetoimasia-lua-engine:lua-engine-tests --test-show-details=direct
 ```
 
-It performs no IO and starts no Lua, window or GPU. It covers the accepted
+It performs no IO and starts no Lua, window or GPU (the Lua host's behavior mechanism is
+tested in its own suites). It covers the accepted
 examples, every syntax and schema refusal with the limits at their boundary and
 one past, the exact tick endpoints and forbidden forms, every fixed value against
 an independently written expectation, valid smaller profiles and refused ones,
-and this package's dependency and import boundary.
+the behavior selection's cadence rules and numeric boundaries, and this package's
+dependency and import boundary.

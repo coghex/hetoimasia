@@ -883,6 +883,10 @@ module's environment, so no lookup metamethod can supply or hide one:
   nothing faults;
 - one that is present and is not a function is a fault, required or optional.
 
+An opt-in alternative that **returns a table** the VM keeps as it is, instead of declaring entry points to call, is
+[export modules](#export-modules-and-captured-behaviors); the global-entry modules above are unchanged and remain the
+mode every existing caller uses.
+
 ### Values
 
 Values cross as bounded copies, in both directions: a binding's arguments and
@@ -1185,6 +1189,162 @@ closure or for a Lua state, and positive clients built from the public modules
 alone: one constructs a registration and an owner's policy, loads a module, calls
 an entry point and observes a typed refusal, and one opts a binding in to
 recoverable refusals.
+
+## Export modules and captured behaviors
+
+An opt-in facility beside the global-entry modules above. Those modules, `ModuleSource`,
+`loadModule`, `callEntry` and the named-entry lookup are exactly as documented and are not
+replaced: nothing below changes what an existing caller, instance, task or the `lua` runner
+does. A module here is source text the application supplies under a stable identity whose
+chunk **returns one table**, which the VM keeps as it is.
+
+Everything in this section runs on the VM's owner, through the same protected foreign-call
+boundary as every other operation: no Lua longjmp crosses Haskell and no Haskell exception
+crosses C. The handles are values that name a slot of one VM's registry and are checked on
+every use; no raw Lua state, stack index, registry reference, native pointer or unrestricted
+cross-VM value API is exposed.
+
+### The export table
+
+`evaluateExport` loads the supplied text in a private module environment that reads through to
+the owner's globals (so [the M1 library profile](#the-m1-library-profile) has already removed
+what it removes before any authored code runs), runs it, and requires **exactly one** returned
+value, a table with **no metatable**. These are module failures, kept as the identity's outcome:
+
+| The chunk | Failure |
+| --- | --- |
+| returns nothing | `ExportShapeRefused ExportNoResult` |
+| returns `nil` | `ExportNil` |
+| returns a boolean, number, string, function | `ExportNotTable` naming the type |
+| returns more than one value, an extra `nil` included | `ExportMultiple` |
+| returns a table with a metatable, protected or not | `ExportMetatable` |
+| fails to parse, is a precompiled chunk, or raises | `ScriptFailed`, the attributed protected Lua-failure path (traceback bounded) |
+
+Precompiled binary chunks are refused (the chunk is loaded in text mode only), and no
+arbitrary-source load API is added. The table, and the functions, tables and cycles reachable
+from it, are retained **in the VM**: nothing is serialized, deep-copied or put through the
+copied-value schemas, and ordinary Lua graph cycles are permitted (import dependency cycles
+are the later loader's). Other keys of the table are unrestricted library exports. Module
+globals stay in the module's own environment; mutable exports, closures and upvalues and the
+permitted shared library tables keep the trusted same-VM semantics Lua gives them. This is
+neither hostile-code isolation nor a rollback: what a chunk did before it failed is not undone.
+
+### Identity, sticky failure and bounds
+
+An `ExportIdentity` is opaque bytes the caller chose (for the later loader, root plus canonical
+path). It is compared exactly, never truncated or hashed into a key, and never forced into the
+legacy 128-byte `ModuleRef`; one that is empty or longer than 4096 bytes is refused, not
+shortened. What a record or a handle retains is a **copy that owns its bytes**, so a short slice of a
+large buffer pins nothing after the call. The source label used in diagnostics is bounded separately.
+
+* **Once per identity per VM.** Asking again, with `evaluateExport` or `retrieveExport`, answers
+  the same table, or the same failure, and runs nothing. A failed identity is never retried with
+  replacement bytes. Another VM has its own environment, result, failure and state.
+* **Ceilings** come from the owner's `ExportLimits`; the M1 profile's are 1 MiB of supplied
+  source and 256 identities per VM (`Hetoimasia.LuaEngine.Behavior.exportLimits`). Failed
+  records and any in progress count, and nothing is evicted, retried or kept as history. A
+  source one byte over is **never compiled**: while room remains it is a failed record that counts,
+  `ModuleRefused (SourceTooLarge n)`, distinguishable from an evaluation failure. A *new*
+  identity at a full ceiling is refused, `ModuleRefused (TooManyExports n)`, with no record and
+  nothing evaluated. Retrieval of an existing identity consumes nothing.
+* The ceiling counts only identities of this facility. Global-entry modules, including the
+  instance driver an instance-hosting owner loads, keep their own bound (`maxModules`) and use
+  no slot.
+* The source bytes are not kept: the interpreter copies what it compiles, and a record holds the
+  identity, the outcome and the table.
+* A failure that happens before the chunk can start (memory running out as its environment is
+  made) is raised and charges nothing, so the identity can be asked for again. A Haskell
+  failure that reached a callback while the chunk ran is raised in preference to whatever Lua
+  reported, even if the script caught it with `pcall`, and the identity is recorded as failed
+  with no table kept.
+
+`VmConfig` takes `vmExports` (evaluated after the modules, in order, at initialization; one that
+fails is a recorded failure and does not end construction) and `vmExportLimits`.
+
+### A selected behavior
+
+`captureBehavior` validates one field of an export table as a **behavior** and captures it for
+one instance. It is selected by raw access and read by a raw traversal of the behavior table
+that stops after the entry that proves a field outside the schema, so **at most six entries
+are visited**: no `__index`, `pairs`, length or conversion metamethod runs, and nothing walks the
+library exports around it.
+
+* The field must be a table with no metatable. Its only keys are `init`, `update`, `shutdown`,
+  `every_ticks` and `every_seconds`; a key that is not text, or not one of these, and a hook
+  that is neither absent nor a function, are refused (`BehaviorProblem`). A table with a `__call`
+  metamethod is not a function.
+* An unselected role that is invalid is not a failure of the module or of another role.
+* The answer reports which hooks exist and how each cadence field *reads* (`CadenceField`:
+  absent, a Lua integer, a Lua float, or another type), with no conversion applied. What a
+  cadence means is the application's: `hetoimasia-lua-engine` applies the M1 rules.
+* No hook runs during validation or capture.
+
+A behavior that does not fit is returned as data and holds nothing; an allocation that fails on the
+way is a fault and holds nothing either.
+
+### What a capture holds
+
+A capture holds, by a slot of a registry table only the bridge reaches: the very `init`, `update`
+and `shutdown` functions (absence included), a fresh ordinary `self` table whose `api` is the
+facade, and the facade. The **facade** is the injection seam for the later M1 service
+namespaces. A `FacadeSource` names where it comes from, and it is made **last**, after the behavior
+has validated and been captured (so a facade builder never runs for a behavior that is refused):
+
+* `FacadeValue v`: a copy of the value `v`, made fresh for this capture alone within the owner's
+  value limits (a capability the application's own check retires, or an oversize value, is refused).
+  Data only: it cannot carry a function.
+* `FacadeField export key`: the table a retained export module holds under `key`, used as it is: one
+  existing facade reference shared by every capture that names it.
+* `FacadeBuilt export key v`: built for this capture alone by calling the function the export module
+  holds under `key` with a copy of `v` (the instance's context). It returns the facade table, which may
+  carry closures bound to this instance. The builder is the engine's own Lua, runs under the protected
+  call and its traceback handler, and what it raises, or returns that is no table, fails the capture,
+  which is released.
+
+Whichever it is, the same Lua table is `init`'s `api` and `self.api`. It is an ordinary Lua table in
+Lua's hands: assigning to `self` or the facade cannot replace the engine's captured hooks, another
+capture's tables or its attribution. A source naming a field that is absent, or of the wrong type
+(`FacadeFieldMissing`, `FacadeNotATable`, `FacadeBuilderNotAFunction`), or an export handle that is not
+this owner's, is refused with no effect and holds nothing.
+
+Replacing or removing a field of the behavior table, replacing the role table, or editing a cadence
+field afterwards changes nothing a capture does; a later capture reads the table as it is then.
+Capturing a function does not freeze its upvalues or the shared exports: mutable upvalues and
+shared state stay ordinary Lua, and `self` stays separate.
+
+The hooks are run by the runtime through a driver, never looked up again by name: see
+[M1 behavior instances](#m1-behavior-instances-opt-in).
+
+### Reference lifetimes
+
+| What | Made by | Held until | Released by | Refused or safe when |
+| --- | --- | --- | --- | --- |
+| export table | `evaluateExport` success, in one protected call | the VM closes | VM close; released at once if the evaluation fails afterwards | foreign owner `ExportHandleForeign`; slot not held `ExportHandleStale`; closed `VmClosed` |
+| failed record | evaluation or return-shape failure, oversize source | the VM closes | VM close | holds no Lua value; counts against the ceiling |
+| in-progress record | before the chunk starts | the call returns | replaced by the outcome; a failure or cancellation marks it failed (a failure before the chunk starts removes it) | never observable from another call |
+| capture | `captureBehavior`, the one store being the last step | `releaseBehavior`, or the VM closes | `releaseBehavior` (idempotent), the instance's end, VM close | foreign `CaptureHandleForeign`; released or never made `CaptureHandleStale`; closed `VmClosed` |
+| hook, `self`, facade in a coroutine | the running or suspended invocation's stack | the coroutine is closed or returns | the ending closes its coroutines before it releases the capture | a coroutine keeps them alive in Lua until then; release never invalidates a use under way |
+| temporary stack values | each call | the call returns | every call restores its entry depth, success or failure | checked by the examples' stack and registry-slot probes |
+
+Slots are issued once and never reused, so a stale handle names an empty slot and can never be
+mistaken for a later capture's. A reference count alone proves nothing about who may use a
+reference; the owner, closed-VM and slot checks above do.
+
+### What proves it
+
+`Test.Lua.Boundary.Exports` (host examples, `lua-host-tests`): exactly-one-plain-table
+refusals and sticky failure with the side effect counted by a binding; attribution and effect;
+private environment; the filtered library; independence across owners; the 256-identity and 1 MiB
+ceilings at and one past, failed records counted, instance-driver module not counted; long
+identities kept distinct; each schema refusal holding no reference; raw access (a metamethod
+installed after the fact is never called); captured functions unmoved by later edits; fresh
+`self` and shared upvalues; release, stale, forged and foreign references; two hundred
+construct-and-end cycles returning the registry and stack to where they began; every use refused
+after the lifetime; a callback's failure raised through `pcall`; and a one-byte sweep of the
+allocator's budget over an evaluation, a capture and a release that checks every reference, record
+and the stack after each failure. `Test.Lua.Opacity` adds external clients: the handles cannot be
+forged, no raw table or registry reference is reachable, and a client using the whole interface
+links and runs.
 
 ## Tasks and the coroutine library
 
@@ -2460,6 +2620,83 @@ invocations (`terminationUnstarted`), and lets go of a tick it held.
 **Arithmetic.** An accrued duration, a tick or a deadline that cannot be represented fails the instance
 (`ErrorCadence`, at `StageUpdate`), attributably: nothing wraps, no timer demand is left and no tick is
 held.
+
+### M1 behavior instances (opt-in)
+
+Beside the instances above, which run the hooks a global-entry module defines and are
+unchanged, an owner that hosts instances admits **behavior instances** with
+`admitBehaviorInstance`: an instance of a behavior in an [export table](#export-modules-and-captured-behaviors)
+the owner holds. The request, `BehaviorRequest`, names the export module by its identity, the
+field of its table that holds the behavior, the **facade** the instance is injected with, and the
+application's rule that resolves the behavior's cadence from what its table read as. The facade is a
+`BehaviorFacade`: data (`FacadeData`), the table an export module holds (`FacadeShared`), or what a
+function an export module holds builds from a value for this instance (`FacadeBuilder`), so a facade can
+carry closures bound to its instance; the export modules it names are looked up by identity when the
+instance starts. It has no event
+grants and no connections, is no one-shot, and is admitted with the same live place and result
+reservation as any instance. `InstanceRequest`'s constructor and every existing caller are untouched.
+
+The owner's thread does the rest when it starts the instance, in this order and before any hook:
+
+1. find the export module (`retrieveExport`): none held is `ErrorExportMissing`; one that failed is
+   `ErrorExportFailed`, the module's own sticky fault;
+2. select, validate and capture the behavior (`captureBehavior`): a table that does not fit is
+   `ErrorBehavior`, a facade past the owner's value limits or an allocation that fails is
+   `ErrorFault`;
+3. resolve the cadence: the rule is applied to the shape once. A refusal, an interval that does not
+   resolve (exactly or not at all, as at any admission), an interval for a behavior with no `update`,
+   and an `update` with no interval are each `ErrorCadence`;
+4. run `init(self, api)` when the table has one, where `api` is the same table as `self.api`, the
+   facade. An absent `init` is a successful empty initialization, and `self.api` exists regardless.
+
+Each of 1 to 3 fails the instance at the stage **`StageConstruct`**, distinct from an `init`
+failure (`StageInit`) and from a module's failure, with no hook run, `shutdown` skipped as for any
+instance whose `init` never succeeded, and whatever was captured released. A failure at `init`
+is `StageInit` as always, and runs no later hook.
+
+An instance without an `update` hook has no cadence: it stays alive until it is stopped, has no
+public event subscription, and is not a new natural-completion mode. One with an `update` hook
+is periodic on the interval the rule resolved, through the same cadence machinery, scheduler and
+`dt` as any periodic instance: logical `dt` is the duration granted since the last update finished, and
+an elapsed refresh merges late demand and is handed the actual elapsed time, independent of
+rendering. `update(self, dt_seconds)`, `shutdown(self, reason)` with the strings `stopped`,
+`failed` and `completed`, one invocation at a time, pause, resume, stop, the suspension of an
+`update` in a wait and the refusal of a wait or yield in `init` and `shutdown` are all the existing
+instance contract.
+
+**Hooks are captured, not looked up.** The driver, a module of the owner's loaded beside the
+instance driver's, is called with the captured hook, `self` and the facade pushed after it, so
+nothing is looked up again by field or global: replacing a field of the behavior, replacing the
+role table or editing a cadence field afterwards changes nothing an instance does, and a later
+instance reads the table as it is then. Mutable upvalues stay Lua. The legacy instance driver's
+`api` (`connect`, `subscribe`, `unsubscribe`) is **not** handed to a behavior and is not part of this
+surface; the one binding the behavior driver calls is the instance layer's own `delta`.
+
+**Progress.** An `init` that is entered and then interrupted by a failure of the host or a cancellation
+settles the instance as *started* (`Discard … Started`) with `shutdown` skipped, as for the legacy path;
+the behavior path records this itself, separately from the legacy driver's record, which a behavior
+never makes.
+
+**The behavior driver and the module bound.** The driver that runs captured hooks is a module of the
+owner's like the instance driver, and counts against the same `maxModules` bound. It is loaded only
+for an owner that holds export modules (`vmExports`), so an owner that hosts instances and holds none
+keeps every module slot it had: 255 application modules and the instance driver still fit.
+`admitBehaviorInstance` on an owner without one fails at construction with `ModuleNotLoaded`.
+
+**Release.** What an instance captured is released whichever way it ends: after its `shutdown`
+decision, with the rest of what the instance holds, on the owner's thread and without entering
+Lua, so Lua being unsafe to enter keeps no reference. A release that fails is cleanup evidence
+that ends the owner, as a lease release's does. An invocation still running or suspended keeps its
+values alive in Lua until its coroutine is closed, which an ending does first.
+
+`Test.LuaRuntime.Instance.Behavior` runs these on real supervised scheduled owners under the
+injected clock and fake timer: the hooks, self and facade; shared upvalues and a peer outliving
+another's end; the capture surviving every later edit while a later instance captures what is
+there; no-update behaviors; every construction refusal at `StageConstruct` with no hook run; a
+failed `init` and its references let go (read by a weak table, since a captured `self` is
+reachable only through its capture); waits refused in `init` and `shutdown`; a suspended `update`
+closed on stop; an `update` failure ending only its instance; an elapsed update on the owner's clock;
+and the ceilings on an instance-hosting owner, at 256 identities and a 1 MiB source and one byte over.
 
 ### Failure and escalation
 
