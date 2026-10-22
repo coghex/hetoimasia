@@ -17,7 +17,7 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEntered, awaitScheduledTerminal, releaseGate)
-import Test.LuaRuntime.Support (bounded, Broken (Broken), brokenIs, expectFatal, expectFatalOpening, failExample, Gated (..), optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, Broken (Broken), brokenIs, cancelPending, expectFatal, expectFatalOpening, failExample, Gated (..), optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- | Whether a retained failure is the application's own, of this name.
 brokenAmong ∷ Text.Text → ExceptionWithContext SomeException → Bool
@@ -143,7 +143,7 @@ spec = describe "failures" $ do
         -- The disposal is running, uninterruptibly, and fails when it is let go; the owner is
         -- cancelled meanwhile.
         awaitEntered (sf fixture) "dispose"
-        cancelScheduled owner
+        cancelPending (cancelScheduled owner)
         releaseGate (sf fixture) "dispose"
         awaitScheduledTerminal control owner
       [cleanupFailureException found | found ← cleanupFailuresInContext context] `shouldSatisfy` any (brokenAmong "disposal")
