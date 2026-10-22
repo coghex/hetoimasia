@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-53/Q-2h: module dependency loading without blocking hooks.
+The current checkpoint is P-54/Q-2i: ownership and cancellation of shared module loads.
+D-56 accepts resumable module-level imports and explicit loading from hooks.
 D-55 accepts bounded byte-for-byte data-file results.
 D-54 accepts one-shot request results with explicit terminal consumption.
 D-53 accepts recoverable busy admission with atomic reservations.
@@ -1665,6 +1666,35 @@ The manager presented the own-parser/repeated-I/O cost and illustrated parsing
 with a shipped Lua JSON/CSV library. That example does not select a library or
 add an engine-shipped parser deliverable. The owner chose raw bytes rather
 than engine-parsed data. Script loading remains a separate controlled path.
+
+### D-56. Module dependencies are imported in Lua through a resumable loader
+
+**Delivery:** M1; new protected module-loader integration required.
+
+Owner answer, **2026-10-22 01:12:14 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: import() in Lua (Rec.)
+
+Authenticated relay: `het-manager`, message `zhh9gu5dvr35qwehaezfc55yxe`,
+posted **2026-10-22 01:12:14.896 UTC** in `#het-luafirst`, replying to Q-2h
+message `aarj3fyhazh9iu5z6b48r8fsiw`.
+
+Accept P-53's A: dependencies are discovered through imports in Lua, without
+a separate dependency list. During engine-managed module evaluation an import
+may suspend the loader and resume with completed exports. Entries and their
+dependencies finish before init under the boot gate. Hooks can get already-
+loaded modules immediately; uncached modules require an explicit asynchronous
+request and later use. Init may request but never wait; an immediate uncached
+hook lookup is refused.
+
+Logical runtime evaluation respects its assigned service position, holding
+progress there when dependencies are late; protected VM-owner evaluation,
+D-7's once/cache/cycle/failure rules and D-8's top-level effect limits remain.
+The manager presented the resumable-loader/scheduling cost and the fact that
+a non-yielding module may still hang its VM. The owner chose imports in Lua
+rather than a declared dependency list. Shared-load ownership/cancellation,
+limits and exact module API details remain open.
 
 ## Proposals
 
@@ -4400,7 +4430,7 @@ accounting are new M1 integration work; no existing ambient Lua I/O is reused.
 
 ### P-53. Discover dependencies through resumable module-level imports
 
-**Unapproved; active checkpoint Q-2h. Delivery: M1.** D-7/D-8 allow a module
+**A accepted by D-56 through Q-2h. Delivery: M1.** D-7/D-8 allow a module
 to import dependencies at top level, while D-9 requires real runtime loading
 and D-15 forbids waiting in init. The missing choice is how dependency reads
 and evaluation fit those boundaries. Recommend A: a module-level engine import
@@ -4466,6 +4496,79 @@ callback boundary refuses VM re-entry. The new loader must extend a narrow
 owner-controlled path and qualify suspension, effect eligibility, cycles,
 logical visibility and independent UI progress before being called delivered.
 
+### P-54. The VM owns an admitted module load; instances own their waiters
+
+**Unapproved; active checkpoint Q-2i. Delivery: M1.** Recommend A: maintain
+one bounded loader/cache entry per `(content root, path)` in each VM. Requests
+for the same pending module join that load; they never evaluate it twice or
+receive partial exports. Each instance has its own request/waiter, but the VM
+owns the source/dependency work and evaluation continuation from admission.
+This implements D-7's shared module identity, distinct from D-49's intentionally
+independent texture loads.
+
+Cancelling a module request, or ending its requesting instance, withdraws only
+that waiter. It cannot cancel a peer's request or the admitted module job.
+**Even the last waiter leaving does not stop the module load while the VM
+continues.** It completes into the ready/failed cache for later importers.
+Cancellation still obeys settlement ordering and cannot erase a failure that
+already settled for that waiter. A cancelled waiter never receives exports.
+No implicit retry or rollback of top-level logs/shared-table changes occurs.
+
+An admitted logical module job retains its assigned evaluation obligation even
+if all external waiters leave. It can still hold logical progress at that
+position until dependencies/evaluation finish, while UI runs independently.
+Cancelling the waiter is therefore not a promise to eliminate its loader work
+or tick delay. New top-level execution never moves early because of cancellation.
+Pending imports from another module also remain dependencies of that module's
+load, with D-7's cycle-chain rejection; an external waiter leaving cannot break
+that internal dependency.
+
+On ordinary source/evaluation failure, keep D-7's failed cache entry. Every
+still-active required waiter fails through its own eligible settlement under
+D-52. If none remain, retain an attributed loader diagnostic and failed entry
+without inventing a new instance failure; a later request encounters that cached
+failure and fails normally. A boot entry/dependency failure still fails boot.
+Actual engine/provider-code/cleanup failure remains fatal regardless of waiter
+count. A successful job publishes its complete exports into the VM cache,
+shared by later importers as already decided.
+
+Keep ownership/accounting explicit: the VM's load-job and module-cache bounds
+account for the continuing shared work and cached outcome. A waiter's request
+slot may retire after its settlement is consumed/discarded and its subscription
+is detached safely; that means only the subscription ended, not the module job.
+The job's reads, callbacks and continuation remain charged to their VM owner
+until genuinely settled/retired. Do not leave them attached to a dead instance,
+silently transfer an instance's native obligation at cancellation, or hide them
+in an unbounded background queue. Exact bounds and admission/result API follow.
+
+When the VM/session itself stops, stop admitting or resuming ordinary module
+evaluation, cancel pending provider interest and retire all actual source work
+through protected cleanup. There is no requirement to finish executing modules
+for a VM that is ending. A currently non-yielding trusted chunk remains the
+existing non-preemptible case; never claim it stopped or cleaned up early.
+This VM-owned loader state is not a new module-lifetime resource-acquisition
+scope: D-8 still prohibits textures/windows/data-service acquisition at top level.
+
+Alternative B abandons a module load when its last dependent/waiter leaves.
+It can save work but requires cancellation states for partly evaluated modules,
+the disposition of their failed/abandoned cache entries and already-completed
+dependencies, and a rule consistent with once-per-VM evaluation and no rollback.
+If chosen, design that revision explicitly before adopting it.
+
+A is recommended because one instance's lifetime should not poison or restart
+the shared module another instance may import later. Its cost is deliberate:
+cancelled interest can leave work, logs/shared-table effects and logical tick
+delay until the module finishes or the VM stops, consuming bounded VM capacity.
+Qualification covers joining one evaluation from two instances, ending one or
+all waiters, cached success/failure afterwards, assigned-position execution with
+no waiters, cycle detection and shutdown while dependency reads are outstanding.
+
+Evidence: the [host request service](../../packages/scripting-lua/README.md)
+distinguishes cancellation of interest from provider retirement, but it does
+not supply this shared module-job owner. D-7 and D-56 require new per-VM loader
+state; the subscription-versus-job accounting proposed here must be implemented
+and qualified explicitly, not inferred from existing request cleanup.
+
 ## Open questions
 
 ### Q-1. Which filtered standard-library profile applies to every script?
@@ -4529,11 +4632,17 @@ failure authority and D-10's version checks remain intact.
 
 #### Q-2h. Discover module dependencies through imports or declare them before evaluation?
 
-**Active checkpoint, P-53.** A (recommended): protected resumable module-level
-imports, with explicit asynchronous requests for uncached modules from hooks.
-B: non-executable dependency lists loaded first, with top-level imports limited
-to declared completed dependencies. Both preserve finite init, cache/cycle/failure
-rules and logical effect timing; shared-load cancellation remains to be designed.
+Resolved by D-56: P-53's A, protected resumable module-level imports and explicit
+asynchronous requests for uncached modules from hooks. No separate dependency
+list. Finite init, cache/cycle/failure rules and logical effect timing remain.
+
+#### Q-2i. Does a shared module load continue after its last requester leaves?
+
+**Active checkpoint, P-54.** A (recommended): the VM owns the admitted job;
+instances cancel only their waiters, and work/cache settlement continues while
+the VM lives. B: abandon after the last dependent leaves and design partial-
+evaluation/cache cancellation semantics. A explicitly retains possible logical
+tick delay and effects after all external waiters cancel.
 
 ### Q-3. What is the generic executable's boot and session contract?
 
