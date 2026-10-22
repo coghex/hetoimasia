@@ -466,9 +466,11 @@ draining = describe "the drain" $ do
       awaitDone scope
       mapM_ awaitDone killers
       activeNow probe `shouldReturn` 0
-      -- The read finished its work; its delivery was withdrawn by the cancellation that landed
-      -- as it left the uninterruptible gate, so the job is told it was abandoned.
-      map snd <$> seenOutcomes outcomes `shouldReturn` [SeenAbandoned]
+      -- The job was settled exactly once. Whether the cancellation (delivered by the group's own
+      -- helper thread, asynchronously) reached the worker as it left the gate decides which: the
+      -- read's bytes, or the job told it was abandoned. Both are the drain doing its work.
+      outcomes' ← map snd <$> seenOutcomes outcomes
+      outcomes' `shouldSatisfy` (`elem` [[SeenAbandoned], [SeenBytes "a"]])
 
   it "ends the root's scope only after the pool's, so a started read keeps its root" $ do
     pause ← newPause
