@@ -108,7 +108,6 @@ spec = describe "the package and import boundary" $ do
       `shouldBe` [ "Hetoimasia.Scripting.Lua.Instance"
                  , "Hetoimasia.Scripting.Lua.Owner"
                  , "Hetoimasia.Scripting.Lua.Scheduled"
-                 , "Hetoimasia.Scripting.Lua.Value"
                  ]
 
   it "is used by its own suite only through its public modules, the Lua host's and the foundation's time values" $ do

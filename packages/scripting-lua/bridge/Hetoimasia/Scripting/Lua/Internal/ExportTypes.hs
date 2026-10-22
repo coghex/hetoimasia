@@ -23,6 +23,8 @@ module Hetoimasia.Scripting.Lua.Internal.ExportTypes
   , ExportRecord (..)
   , ExportState (..)
   , newExportState
+    -- * Facades
+  , FacadeSource (..)
     -- * Behaviors
   , CadenceField (..)
   , BehaviorShape (..)
@@ -39,7 +41,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import Hetoimasia.Scripting.Lua.Internal.Boundary (BoundaryFault)
-import Hetoimasia.Scripting.Lua.Internal.Value (VmIdentity)
+import Hetoimasia.Scripting.Lua.Internal.Value (Value, VmIdentity)
 
 -- | The stable identity an export module is known by within one VM: opaque
 -- bytes the caller chose, compared exactly. It is never truncated, hashed or
@@ -139,6 +141,26 @@ data ExportState = ExportState
 
 newExportState ∷ ExportLimits → IO ExportState
 newExportState limits = ExportState limits <$> newIORef Map.empty <*> newIORef Set.empty
+
+-- | Where a capture's facade comes from: the narrow seam through which the later
+-- entry adapter injects the instance-bound services without this facility knowing
+-- any of them. Whatever it names becomes the capture's @api@ and @self.api@, the
+-- same Lua value, and is an ordinary Lua table in Lua's hands.
+data FacadeSource
+  = -- | A copy of this value, made fresh for this capture, within the owner's value
+    -- limits. Data only: it cannot carry a function or a retained table.
+    FacadeValue !Value
+  | -- | The table a retained export module holds under this field, used as it is: an
+    -- existing facade reference, shared by every capture that names it.
+    FacadeField !ExportHandle !Text
+  | -- | Built for this capture alone by calling the function a retained export module
+    -- holds under this field with a copy of this value (the instance's context),
+    -- which returns the facade table. This is how a facade carries closures bound to
+    -- its instance. The function is the engine's own, run only after the behavior has
+    -- validated and been captured, and what it raises or returns that is no table
+    -- fails the capture, releasing it.
+    FacadeBuilt !ExportHandle !Text !Value
+  deriving (Eq, Show)
 
 -- | How a cadence field of a behavior read, with no conversion applied: the
 -- application decides what it accepts.

@@ -426,6 +426,7 @@ module Hetoimasia.Scripting.Lua.Instance
   , resolveInterval
   , InstanceRequest (..)
   , BehaviorRequest (..)
+  , BehaviorFacade (..)
   , InstanceAdmission (..)
   , InstanceId (..)
   , admitInstance
@@ -481,6 +482,7 @@ module Hetoimasia.Scripting.Lua.Instance
 
 import Control.Concurrent.STM (STM, atomically, readTVar, retry)
 import Control.Exception (evaluate)
+import qualified Data.ByteString as ByteString
 import qualified Data.Map.Strict as Map
 import Data.List (nub)
 import Data.Text (Text)
@@ -496,7 +498,7 @@ import Hetoimasia.Scripting.Lua.Internal.Value (Context (..), VmIdentity (VmIden
 import Hetoimasia.Scripting.Lua.Runtime.Shared (compact, compactName, compactRef, refuseCallbackWait)
 import Hetoimasia.Scripting.Lua.Runtime.Types (Payload (WithinBounds))
 import Hetoimasia.Scripting.Lua.Provider.Types (ProviderState (psEvents))
-import Hetoimasia.Scripting.Lua.Owner (ModuleRef (ModuleRef))
+import Hetoimasia.Scripting.Lua.Owner (ExportIdentity (ExportIdentity), ModuleRef (ModuleRef))
 import Hetoimasia.Scripting.Lua.Scheduled.Types (Control (controlHooks, controlInstances, controlLabel, controlLimits, controlOwner, controlProvider), ScheduledEndpoint (ScheduledEndpoint))
 import Hetoimasia.Scripting.Lua.Scheduler (ControlResult)
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VRecord, VText))
@@ -539,10 +541,15 @@ admitBehaviorInstance (ScheduledEndpoint control) request = case controlInstance
   where
     compacted =
       request
-        { behaviorLabel = compactName (behaviorLabel request)
+        { behaviorExport = ownedIdentity (behaviorExport request)
+        , behaviorLabel = compactName (behaviorLabel request)
         , behaviorSelect = Text.copy (behaviorSelect request)
         , behaviorName = compactName <$> behaviorName request
         }
+
+-- | An identity in a buffer of its own: the request keeps it until the instance settles.
+ownedIdentity ∷ ExportIdentity → ExportIdentity
+ownedIdentity (ExportIdentity bytes) = ExportIdentity (ByteString.copy bytes)
 
 -- | Deliver an event to the function an instance connected to a source, without
 -- waiting, from any thread. The payload is checked against the owner's limits and

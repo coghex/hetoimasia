@@ -20,6 +20,7 @@ module Hetoimasia.Scripting.Lua.Instance.Types
   , resolveInterval
   , InstanceRequest (..)
   , BehaviorRequest (..)
+  , BehaviorFacade (..)
   , EventSource (..)
 
     -- * Where an instance is
@@ -250,10 +251,10 @@ data BehaviorRequest = BehaviorRequest
     -- and no key.
   , behaviorSelect ∷ !Text
     -- ^ The field of the export table that holds the behavior.
-  , behaviorFacade ∷ !Value
-    -- ^ The facade this instance's @init@ is handed as its second argument and its
-    -- @self.api@ holds: copied into a fresh Lua value for this instance alone, within
-    -- the owner's value limits.
+  , behaviorFacade ∷ !BehaviorFacade
+    -- ^ Where this instance's facade comes from: the value its @init@ is handed as its
+    -- second argument and its @self.api@ holds. Made on the owner's thread after the
+    -- behavior validated.
   , behaviorCadence ∷ BehaviorShape → Either Text (Maybe Interval)
     -- ^ What the behavior's cadence is, from what its table read as: the
     -- application's rule, applied once, on the owner's thread, before @init@. 'Nothing'
@@ -263,6 +264,22 @@ data BehaviorRequest = BehaviorRequest
   , behaviorName ∷ !(Maybe Text)
   , behaviorClass ∷ !ServiceClass
   }
+
+-- | Where an M1 behavior instance's facade comes from: the narrow seam through which the
+-- later entry adapter injects the instance-bound services. The export modules it names
+-- are ones the owner holds, by identity, and are looked up when the instance starts.
+data BehaviorFacade
+  = -- | A copy of this value, made fresh for this instance, within the owner's value limits.
+    -- Data only.
+    FacadeData !Value
+  | -- | The table the export module holds under this field, used as it is: one existing facade
+    -- shared by every instance that names it.
+    FacadeShared !ExportIdentity !Text
+  | -- | Built for this instance alone by the function the export module holds under this
+    -- field, called with a copy of this value (the instance's context): a table that may
+    -- carry closures bound to the instance.
+    FacadeBuilder !ExportIdentity !Text !Value
+  deriving (Eq, Show)
 
 -- | An event source the owner offers, by name, and the shape of the payload it
 -- delivers. In this slice a source is a seam for tests: nothing but the

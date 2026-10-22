@@ -9,6 +9,7 @@
 -- own, and the real M1 rule is tested where it lives.
 module Test.LuaRuntime.Instance.Behavior (spec) where
 
+import Control.Exception (ExceptionWithContext (ExceptionWithContext))
 import Control.Monad (forM_, void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -26,7 +27,9 @@ import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfTimer), awaitEffect, awaitRegistrations, defaultSchedulerBounds, setClock)
 import Test.LuaRuntime.Scheduler.Support (fireReg, liveRegs, nanoseconds)
-import Test.LuaRuntime.Support (Gated (..), bounded, failExample, requiredPolicy, withBoundaryOpening)
+import Hetoimasia.Scripting.Lua.Runtime (CallFault (ModuleNotLoaded), Discard (Discard), ExitKind (ExitFailed), Progress (Started))
+import Test.LuaRuntime.Scheduled.Support (awaitScheduledTerminal)
+import Test.LuaRuntime.Support (Gated (..), bounded, brokenIs, expectFatal, failExample, requiredPolicy, withBoundaryOpening)
 
 -- Building exports ------------------------------------------------------------------
 
@@ -53,7 +56,7 @@ elapsedRule shape
       other → Left ("every_seconds: " <> Text.pack (show other))
 
 -- | The request for the behavior this module's field holds.
-requestFor ∷ ByteString → Text → Value → (BehaviorShape → Either Text (Maybe Interval)) → BehaviorRequest
+requestFor ∷ ByteString → Text → BehaviorFacade → (BehaviorShape → Either Text (Maybe Interval)) → BehaviorRequest
 requestFor identity select facade rule =
   BehaviorRequest
     { behaviorExport = ExportIdentity identity
@@ -67,8 +70,8 @@ requestFor identity select facade rule =
 
 -- | The facade a name stands for: a record, so that the examples can tell instances
 -- apart by what their hooks read from it.
-facadeNamed ∷ Text → Value
-facadeNamed name = VRecord [("name", VText name)]
+facadeNamed ∷ Text → BehaviorFacade
+facadeNamed name = FacadeData (VRecord [("name", VText name)])
 
 -- | Admit a behavior instance, expecting it accepted, under this name.
 admitBehavior ∷ IFixture → ScheduledOwner → Text → BehaviorRequest → IO InstanceTicket
@@ -86,6 +89,12 @@ withExports exports limits body = do
         spec' = base {scheduledVm = (scheduledVm base) {vmExports = exports, vmExportLimits = limits}}
     owner ← startWith fixture runtime spec'
     body fixture control owner
+
+-- | The specification of an owner whose export modules are evaluated at start.
+exportedSpec ∷ IFixture → [ExportSource] → ScheduledSpec
+exportedSpec fixture exports =
+  let base = instanceSpec fixture "behavior" [] (testConfig instanceBounds') requiredPolicy defaultSchedulerBounds
+   in base {scheduledVm = (scheduledVm base) {vmExports = exports, vmExportLimits = defaultExportLimits}}
 
 -- | The same with the default ceilings.
 withDefaults ∷ [ExportSource] → (IFixture → RuntimeControl → ScheduledOwner → IO a) → IO a
@@ -265,13 +274,96 @@ spec = describe "M1 behavior instances" $ do
           grantEach control owner [1]
           logged fixture >>= (`shouldBe` ["api=seen"])
 
+  describe "facades" $ do
+    it "injects a facade whose closures are bound to its own instance, built per instance by an export module's function, the same table in init and self.api" $ bounded $
+      withDefaults
+        [ exportOf
+            "services"
+            [ "return { build = function(context)"
+            , "  local name = context.name"
+            , "  return { name = name, ping = function() " <> record <> "('ping ' .. name) end }"
+            , "end }"
+            ]
+        , exportOf
+            "bound"
+            [ "return { gameplay = { init = function(self, api)"
+            , "  " <> record <> "('init ' .. api.name .. ' same=' .. tostring(rawequal(self.api, api)))"
+            , "  api.ping()"
+            , "end } }"
+            ]
+        ]
+        $ \fixture _ owner → do
+          let built name = FacadeBuilder (ExportIdentity "services") "build" (VRecord [("name", VText name)])
+          _ ← admitBehavior fixture owner "a" (requestFor "bound" "gameplay" (built "a") logicalRule)
+          awaitPhase fixture owner "a" Active
+          _ ← admitBehavior fixture owner "b" (requestFor "bound" "gameplay" (built "b") logicalRule)
+          awaitPhase fixture owner "b" Active
+          logged fixture >>= (`shouldBe` ["init a same=true", "ping a", "init b same=true", "ping b"])
+
+    it "shares an existing facade table between the instances that name it" $ bounded $
+      withDefaults
+        [ exportOf "services" ["return { shared = { id = 7 } }"]
+        , exportOf "shares" ["return { gameplay = { init = function(self, api) " <> record <> "('init ' .. api.id) end } }"]
+        ]
+        $ \fixture _ owner → do
+          _ ← admitBehavior fixture owner "a" (requestFor "shares" "gameplay" (FacadeShared (ExportIdentity "services") "shared") logicalRule)
+          awaitPhase fixture owner "a" Active
+          logged fixture >>= (`shouldBe` ["init 7"])
+
+    it "fails at construction when the facade's export module is not held, or its builder fails, running no hook and holding nothing" $ bounded $
+      withDefaults
+        [ exportOf "services" ["return { build = function() error('builder failed') end }"]
+        , exportOf "plain" ["return { gameplay = { init = function() " <> record <> "('ran') end } }"]
+        ]
+        $ \fixture _ owner → do
+          _ ← admitBehavior fixture owner "missing" (requestFor "plain" "gameplay" (FacadeShared (ExportIdentity "absent") "x") logicalRule)
+          missing ← awaitSettled fixture "missing" >>= failureIn
+          failureStage missing `shouldBe` StageConstruct
+          failureError missing `shouldSatisfy` \case ErrorExportMissing _ → True; _ → False
+          _ ← admitBehavior fixture owner "broken" (requestFor "plain" "gameplay" (FacadeBuilder (ExportIdentity "services") "build" (VText "x")) logicalRule)
+          broken ← awaitSettled fixture "broken" >>= failureIn
+          failureStage broken `shouldBe` StageConstruct
+          failureError broken `shouldSatisfy` \case ErrorFault _ → True; _ → False
+          logged fixture >>= (`shouldBe` [])
+
+  describe "interruption and capacity" $ do
+    it "reports an interrupted init as started, skipping the shutdown, when the host fails inside it" $ bounded $ do
+      fixture ← newIFixture
+      ExceptionWithContext _ raised ← expectFatal $ \control runtime → do
+        let exports = [exportOf "initfail" ["return { gameplay = { init = function() " <> record <> "('init') fx.fail('boom') end, shutdown = function() " <> record <> "('shutdown') end } }"]]
+        owner ← startWith fixture runtime (exportedSpec fixture exports)
+        _ ← admitBehavior fixture owner "a" (requestFor "initfail" "gameplay" (facadeNamed "a") logicalRule)
+        awaitScheduledTerminal control owner
+      raised `shouldSatisfy` brokenIs "boom"
+      settled ← tickOf fixture "a" >>= pollInstance
+      fmap resultOutcome settled `shouldSatisfy` \case
+        Just (InstanceDiscarded (Discard ExitFailed Started)) → True
+        _ → False
+      fmap (terminationShutdown . resultTermination) settled `shouldBe` Just ShutdownSkippedNoInit
+      logged fixture >>= (`shouldBe` ["init"])
+
+    it "keeps every module slot of an owner that hosts instances and holds no export module" $ bounded $ do
+      fixture ← newIFixture
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
+        -- 255 application modules and the instance driver are the 256 the bound allows.
+        let modules = [ModuleSource (ModuleRef (Text.pack ("legacy" <> show n)) "1") "x = 1" [] | n ← [1 .. 255 ∷ Int]]
+        owner ← startInstances fixture runtime "capacity" modules (testConfig instanceBounds') requiredPolicy
+        _ ← pure owner
+        pure ()
+
   describe "construction refusals" $ do
     let noHooksRan ∷ IFixture → InstanceSettlement → IO ()
         noHooksRan fixture settled = do
           logged fixture >>= (`shouldBe` [])
           terminationShutdown (resultTermination settled) `shouldBe` ShutdownSkippedNoInit
-    it "fails an instance of an export module the owner does not hold, at construction, before any hook" $ bounded $
+    it "fails an instance of an export module the owner does not hold, at construction, before any hook, and one of an owner that holds none for want of the driver" $ bounded $ do
       withDefaults [] $ \fixture _ owner → do
+        -- Without export modules the behavior driver is not loaded, which costs no module slot.
+        _ ← admitBehavior fixture owner "m" (requestFor "absent" "gameplay" (facadeNamed "m") logicalRule)
+        failure ← awaitSettled fixture "m" >>= failureIn
+        failureStage failure `shouldBe` StageConstruct
+        failureError failure `shouldSatisfy` \case ErrorFault (ModuleNotLoaded _) → True; _ → False
+      withDefaults [exportOf "elsewhere" ["return {}"]] $ \fixture _ owner → do
         _ ← admitBehavior fixture owner "m" (requestFor "absent" "gameplay" (facadeNamed "m") logicalRule)
         settled ← awaitSettled fixture "m"
         failure ← failureIn settled
@@ -343,7 +435,7 @@ spec = describe "M1 behavior instances" $ do
     it "fails an instance whose facade is past the owner's value limits, at construction, running nothing" $ bounded $
       withDefaults [exportOf "small" ["return { gameplay = { init = function() " <> record <> "('ran') end } }"]] $ \fixture _ owner → do
         let large = VRecord [("name", VText (Text.replicate 200000 "x")), ("number", VInteger 1)]
-        _ ← admitBehavior fixture owner "big" (requestFor "small" "gameplay" large logicalRule)
+        _ ← admitBehavior fixture owner "big" (requestFor "small" "gameplay" (FacadeData large) logicalRule)
         settled ← awaitSettled fixture "big"
         failure ← failureIn settled
         failureStage failure `shouldBe` StageConstruct

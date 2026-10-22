@@ -1475,7 +1475,6 @@ typedef struct {
   lua_Integer capture_slot;
   const char *select;
   size_t select_length;
-  int has_facade;
   int64_t *report;
   char *name;
   size_t name_capacity;
@@ -1502,7 +1501,6 @@ static int capture_body(lua_State *L)
 {
   capture_arguments *a = (capture_arguments *) lua_touserdata(L, 1);
   int64_t *r = a->report;
-  int facade = a->has_facade ? 2 : 0;
   int export_index;
   int selected;
   int record;
@@ -1618,15 +1616,9 @@ static int capture_body(lua_State *L)
     return 0;
   }
 
-  /* Fresh `self`, holding the facade as `api`; and the facade itself, which is
-  ** what init is handed. */
+  /* A fresh `self`. The facade is attached afterwards, once the behavior is known
+  ** to be valid and the owner has built it (`hetoimasia_lua_capture_attach`). */
   lua_createtable(L, 0, 1);
-  if (facade) {
-    lua_pushvalue(L, facade);
-    lua_setfield(L, -2, "api");
-    lua_pushvalue(L, facade);
-    lua_setfield(L, record, "api");
-  }
   lua_setfield(L, record, "self");
 
   lua_rawgetp(L, LUA_REGISTRYINDEX, &captures_key);
@@ -1642,7 +1634,7 @@ static int capture_body(lua_State *L)
 int hetoimasia_lua_behavior_capture(
   lua_State *L,
   lua_Integer export_slot, const char *select, size_t select_length,
-  lua_Integer capture_slot, int has_facade,
+  lua_Integer capture_slot,
   int64_t *report, char *name, size_t name_capacity)
 {
   capture_arguments a;
@@ -1657,7 +1649,6 @@ int hetoimasia_lua_behavior_capture(
   a.capture_slot = capture_slot;
   a.select = select;
   a.select_length = select_length;
-  a.has_facade = has_facade;
   a.report = report;
   a.name = name;
   a.name_capacity = name_capacity;
@@ -1666,15 +1657,98 @@ int hetoimasia_lua_behavior_capture(
     gc_release(L, held);
     return LUA_ERRMEM;
   }
-  /* The facade, when there is one, is the value on top of the stack: it is
-  ** handed to the protected body as its second argument and stays where it is
-  ** for the caller to remove. */
   lua_pushcfunction(L, capture_body);
   lua_pushlightuserdata(L, &a);
-  if (has_facade) {
-    lua_pushvalue(L, -3);
+  status = lua_pcall(L, 1, 0, 0);
+  gc_release(L, held);
+  return status;
+}
+
+/* The facade on top of the stack becomes the capture's `api` and its `self.api`:
+** the same table, which `init` is handed. */
+static int attach_body(lua_State *L)
+{
+  lua_Integer slot = lua_tointeger(L, 1);
+  int *attached = (int *) lua_touserdata(L, 2);
+  int record;
+  *attached = 0;
+  lua_rawgetp(L, LUA_REGISTRYINDEX, &captures_key);
+  if (!lua_istable(L, -1)) {
+    return 0;
   }
-  status = lua_pcall(L, has_facade ? 2 : 1, 0, 0);
+  lua_rawgeti(L, -1, slot);
+  if (!lua_istable(L, -1)) {
+    return 0;
+  }
+  /* The frame is [slot, flag, facade, captures, record]. */
+  record = lua_gettop(L);
+  lua_pushvalue(L, 3);
+  lua_setfield(L, record, "api");
+  lua_getfield(L, record, "self");
+  lua_pushvalue(L, 3);
+  lua_setfield(L, -2, "api");
+  *attached = 1;
+  return 0;
+}
+
+int hetoimasia_lua_capture_attach(lua_State *L, lua_Integer slot, int *attached)
+{
+  gc_hold_t held = gc_hold(L);
+  int status;
+  *attached = 0;
+  if (!lua_checkstack(L, 10)) {
+    gc_release(L, held);
+    return LUA_ERRMEM;
+  }
+  lua_pushcfunction(L, attach_body);
+  lua_pushinteger(L, slot);
+  lua_pushlightuserdata(L, attached);
+  /* A copy of the facade, which is the stack's top on entry, is the third argument. */
+  lua_pushvalue(L, -4);
+  status = lua_pcall(L, 3, 0, 0);
+  gc_release(L, held);
+  return status;
+}
+
+/* The value an export table holds under a key, pushed, by raw access. */
+static int field_body(lua_State *L)
+{
+  lua_Integer slot = lua_tointeger(L, 1);
+  const char *key = (const char *) lua_touserdata(L, 2);
+  size_t length = (size_t) lua_tointeger(L, 3);
+  int *type = (int *) lua_touserdata(L, 4);
+  *type = LUA_TNONE;
+  lua_rawgetp(L, LUA_REGISTRYINDEX, &exports_key);
+  if (!lua_istable(L, -1)) {
+    lua_pushnil(L);
+    return 1;
+  }
+  lua_rawgeti(L, -1, slot);
+  if (!lua_istable(L, -1)) {
+    lua_pushnil(L);
+    return 1;
+  }
+  lua_pushlstring(L, key, length);
+  lua_rawget(L, -2);
+  *type = lua_type(L, -1);
+  return 1;
+}
+
+int hetoimasia_lua_export_field(lua_State *L, lua_Integer slot, const char *key, size_t length, int *type)
+{
+  gc_hold_t held = gc_hold(L);
+  int status;
+  *type = LUA_TNONE;
+  if (!lua_checkstack(L, 8)) {
+    gc_release(L, held);
+    return LUA_ERRMEM;
+  }
+  lua_pushcfunction(L, field_body);
+  lua_pushinteger(L, slot);
+  lua_pushlightuserdata(L, (void *) key);
+  lua_pushinteger(L, (lua_Integer) length);
+  lua_pushlightuserdata(L, type);
+  status = lua_pcall(L, 4, 1, 0);
   gc_release(L, held);
   return status;
 }

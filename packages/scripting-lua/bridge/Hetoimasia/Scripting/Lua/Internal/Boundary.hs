@@ -171,6 +171,14 @@ data ModuleProblem
   | -- | A capture handle whose behavior is no longer held: released, or never
     -- made by this owner.
     CaptureHandleStale
+  | -- | A facade source whose export table has no such field: the field's name.
+    FacadeFieldMissing !Text
+  | -- | A facade source that is not what it must be: a table for an existing
+    -- facade and for what a builder returns, a function for a builder. What it
+    -- was, by Lua type name.
+    FacadeNotATable !Text
+  | -- | A facade builder that is not a function. What it was.
+    FacadeBuilderNotAFunction !Text
   deriving (Eq, Show)
 
 -- | What an export module's chunk returned instead of exactly one plain table.

@@ -36,6 +36,8 @@ module Hetoimasia.Scripting.Lua.Internal.Marshal
   , captureReferences
   , BehaviorReport (..)
   , captureBehaviorFields
+  , attachFacade
+  , pushExportField
   , pushCaptured
     -- * Tasks
   , newTaskCoroutine
@@ -210,7 +212,13 @@ foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_capture_count"
 
 foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_behavior_capture"
   c_behavior_capture
-    ∷ State → Int64 → Ptr CChar → CSize → Int64 → CInt → Ptr Int64 → Ptr CChar → CSize → IO StatusCode
+    ∷ State → Int64 → Ptr CChar → CSize → Int64 → Ptr Int64 → Ptr CChar → CSize → IO StatusCode
+
+foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_capture_attach"
+  c_capture_attach ∷ State → Int64 → Ptr CInt → IO StatusCode
+
+foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_export_field"
+  c_export_field ∷ State → Int64 → Ptr CChar → CSize → Ptr CInt → IO StatusCode
 
 foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_capture_push"
   c_capture_push ∷ State → Int64 → CInt → Ptr CInt → IO StatusCode
@@ -593,10 +601,30 @@ data BehaviorReport = BehaviorReport
     -- ^ The key that is not in the schema, bounded.
   }
 
--- | Validate a field of an export table as a behavior and capture it. When there
--- is a facade it is the value on top of the stack, and stays there.
-captureBehaviorFields ∷ State → Int → ByteString → Int → Bool → IO (StatusCode, BehaviorReport)
-captureBehaviorFields state exportSlot select captureSlot facade =
+-- | Make the value on top of the stack, which stays there, a capture's facade.
+-- Whether there was a capture to attach it to.
+attachFacade ∷ State → Int → IO (StatusCode, Bool)
+attachFacade state slot =
+  alloca $ \attached → do
+    poke attached 0
+    status ← c_capture_attach state (fromIntegral slot) attached
+    found ← peek attached
+    pure (status, found /= 0)
+
+-- | Push the value an export table holds under a key, by raw access; its Lua type
+-- code, @-1@ when the export is not held.
+pushExportField ∷ State → Int → ByteString → IO (StatusCode, Int)
+pushExportField state slot key =
+  ByteString.unsafeUseAsCStringLen key $ \(pointer, size) →
+    alloca $ \kind → do
+      poke kind (-1)
+      status ← c_export_field state (fromIntegral slot) pointer (fromIntegral size) kind
+      found ← peek kind
+      pure (status, fromIntegral found)
+
+-- | Validate a field of an export table as a behavior and capture it.
+captureBehaviorFields ∷ State → Int → ByteString → Int → IO (StatusCode, BehaviorReport)
+captureBehaviorFields state exportSlot select captureSlot =
   ByteString.unsafeUseAsCStringLen select $ \(selectPointer, selectSize) →
     allocaArray reportFields $ \report →
       allocaBytes nameCapacity $ \name → do
@@ -607,7 +635,6 @@ captureBehaviorFields state exportSlot select captureSlot facade =
             selectPointer
             (fromIntegral selectSize)
             (fromIntegral captureSlot)
-            (if facade then 1 else 0)
             report
             name
             (fromIntegral nameCapacity)

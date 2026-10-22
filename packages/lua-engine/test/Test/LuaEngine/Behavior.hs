@@ -12,7 +12,7 @@ import Hetoimasia.Foundation.Time (durationNanoseconds)
 import Hetoimasia.LuaEngine.Behavior
 import Hetoimasia.LuaEngine.Manifest (Role (..))
 import Hetoimasia.LuaEngine.Profile
-import Hetoimasia.Scripting.Lua.Instance (BehaviorRequest (..), Interval (..))
+import Hetoimasia.Scripting.Lua.Instance (BehaviorFacade (FacadeData), BehaviorRequest (..), Interval (..))
 import Hetoimasia.Scripting.Lua.Owner
   ( BehaviorShape (..)
   , CadenceField (..)
@@ -162,9 +162,9 @@ spec = describe "the M1 behavior selection" $ do
 
   describe "the request" $ do
     it "carries the role's field, the injected facade and the role's rule, applied to what a table read as" $ do
-      let request = behaviorRequest Presentation (ExportIdentity "root/main.lua") "main.lua" (VText "facade") (Just "ui") OrdinaryClass
+      let request = behaviorRequest Presentation (ExportIdentity "root/main.lua") "main.lua" (FacadeData (VText "facade")) (Just "ui") OrdinaryClass
       behaviorSelect request `shouldBe` "presentation"
-      behaviorFacade request `shouldBe` VText "facade"
+      behaviorFacade request `shouldBe` FacadeData (VText "facade")
       behaviorExport request `shouldBe` ExportIdentity "root/main.lua"
       behaviorName request `shouldBe` Just "ui"
       fmap (fmap (\interval → case interval of ElapsedEvery duration → durationNanoseconds duration; _ → 0)) (behaviorCadence request (withUpdate FieldAbsent (FieldFloat 0.5)))

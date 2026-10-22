@@ -291,9 +291,8 @@ enum {
 ** only fields `init`, `update`, `shutdown`, `every_ticks` and `every_seconds`,
 ** each hook absent or a function.
 **
-** On success the capture holds the very hook functions, a fresh `self` table
-** holding the facade as `api`, and the facade. When `has_facade` is non-zero the
-** facade is the value on top of the stack, which is left there. `report` is
+** On success the capture holds the very hook functions and a fresh `self` table;
+** the facade is attached next, by `hetoimasia_lua_capture_attach`. `report` is
 ** HETOIMASIA_REPORT_FIELDS values; `name` is where a key that is not in the
 ** schema is named, `name_capacity` bytes. Nothing is stored unless the report's
 ** problem is HETOIMASIA_BEHAVIOR_NONE and its stored flag is 1.
@@ -301,8 +300,21 @@ enum {
 int hetoimasia_lua_behavior_capture(
   lua_State *L,
   lua_Integer export_slot, const char *select, size_t select_length,
-  lua_Integer capture_slot, int has_facade,
+  lua_Integer capture_slot,
   int64_t *report, char *name, size_t name_capacity);
+
+/*
+** Make the value on top of the stack, which is left there, the capture's facade:
+** the capture's `api`, and the `api` field of its `self`, the same value. `*attached`
+** is 1 when there was a capture to attach it to.
+*/
+int hetoimasia_lua_capture_attach(lua_State *L, lua_Integer slot, int *attached);
+
+/*
+** Push the value the export table in `slot` holds under `key`, by raw access, and set
+** `*type` to its Lua type (LUA_TNONE when the export is not held, nil pushed).
+*/
+int hetoimasia_lua_export_field(lua_State *L, lua_Integer slot, const char *key, size_t length, int *type);
 
 /* What pushing a captured hook found. */
 enum {

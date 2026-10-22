@@ -182,6 +182,7 @@ module Hetoimasia.Scripting.Lua.Owner
   , retrieveExport
 
     -- * Captured behaviors
+  , FacadeSource (..)
   , Hook (..)
   , CaptureHandle
   , Captured (..)
@@ -280,6 +281,7 @@ import Hetoimasia.Scripting.Lua.Internal.ExportTypes
   , Captured (..)
   , ExportHandle
   , ExportIdentity (..)
+  , FacadeSource (..)
   , ExportLimits (..)
   , ExportOutcome (..)
   , ExportSource (..)
@@ -528,7 +530,7 @@ retrieveExport owned = Export.retrieveExport (ownedHost owned)
 -- functions, a fresh @self@ table whose @api@ is the facade, and the facade, until
 -- 'releaseBehavior' or the VM's close; later changes to the tables it was read
 -- from do not reach it. The owner's thread only.
-captureBehavior ∷ HasCallStack ⇒ OwnedVm → ExportHandle → Text → Value → IO (Either BehaviorProblem Captured)
+captureBehavior ∷ HasCallStack ⇒ OwnedVm → ExportHandle → Text → FacadeSource → IO (Either BehaviorProblem Captured)
 captureBehavior owned = Export.captureBehavior (ownedHost owned)
 
 -- | Let go of a capture. Idempotent; refused for a handle another owner issued.

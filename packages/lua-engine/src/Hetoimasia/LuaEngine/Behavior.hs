@@ -55,7 +55,7 @@ import Hetoimasia.LuaEngine.Profile
   , bytesLimit
   , countLimit
   )
-import Hetoimasia.Scripting.Lua.Instance (BehaviorRequest (..), Interval (..))
+import Hetoimasia.Scripting.Lua.Instance (BehaviorFacade, BehaviorRequest (..), Interval (..))
 import Hetoimasia.Scripting.Lua.Owner
   ( BehaviorShape (..)
   , CadenceField (..)
@@ -63,7 +63,6 @@ import Hetoimasia.Scripting.Lua.Owner
   , ExportLimits (..)
   )
 import Hetoimasia.Scripting.Lua.Scheduled (ServiceClass)
-import Hetoimasia.Scripting.Lua.Value (Value)
 
 -- | The field of a module's export table that holds a role's behavior. Selected by
 -- raw access: nothing else in the table is looked at.
@@ -168,7 +167,7 @@ cadenceOf role shape
 --
 -- The role and the facade are the caller's: nothing a module's metadata says chooses
 -- either.
-behaviorRequest ∷ Role → ExportIdentity → Text → Value → Maybe Text → ServiceClass → BehaviorRequest
+behaviorRequest ∷ Role → ExportIdentity → Text → BehaviorFacade → Maybe Text → ServiceClass → BehaviorRequest
 behaviorRequest role identity label facade name serviceClass =
   BehaviorRequest
     { behaviorExport = identity

@@ -349,7 +349,7 @@ import Hetoimasia.Scripting.Lua.Instance.Types
   , newInstances
   , validateInstanceConfig
   )
-import Hetoimasia.Scripting.Lua.Owner (ModuleRef (moduleRefName), VmConfig (vmLifecycle, vmModules, vmOwnerName, vmPolicy, vmRegistration, vmRequests, vmValueLimits))
+import Hetoimasia.Scripting.Lua.Owner (ModuleRef (moduleRefName), VmConfig (vmExports, vmLifecycle, vmModules, vmOwnerName, vmPolicy, vmRegistration, vmRequests, vmValueLimits))
 import Hetoimasia.Scripting.Lua.Registration (registration, registrationCapabilityTypes, registrationNamespaces)
 import Hetoimasia.Scripting.Lua.Runtime.Shared
 import Hetoimasia.Scripting.Lua.Runtime.Types
@@ -561,7 +561,13 @@ startScheduledOwner runtime spec = do
           base
             { vmRegistration = merged
             , vmPolicy = vmPolicy base <> [driverNamespaceName]
-            , vmModules = vmModules base <> [driverSource (instanceSources instanceConfig) [(eventName endpoint, eventPayload endpoint) | (grant, _) ← toList subscriptions, endpoint ← grantEvents grant], behaviorDriverSource]
+            , -- The behavior driver is an engine module like the instance driver, and counts
+              -- against the same module bound, so it is loaded only for an owner that holds
+              -- export modules: an owner without any keeps every module slot it ever had.
+              vmModules =
+                vmModules base
+                  <> [driverSource (instanceSources instanceConfig) [(eventName endpoint, eventPayload endpoint) | (grant, _) ← toList subscriptions, endpoint ← grantEvents grant]]
+                  <> [behaviorDriverSource | not (null (vmExports base))]
             }
   scheduler ←
     newScheduler

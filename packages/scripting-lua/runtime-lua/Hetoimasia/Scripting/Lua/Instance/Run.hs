@@ -129,6 +129,7 @@ import Hetoimasia.Scripting.Lua.Owner
   , Captured (capturedHandle, capturedShape)
   , ExportIdentity (ExportIdentity)
   , ExportOutcome (ExportFailed, ExportReady)
+  , FacadeSource (FacadeBuilt, FacadeField, FacadeValue)
   , Hook (HookInit, HookShutdown, HookUpdate)
   , ModuleRef (moduleRefName)
   , OwnedVm
@@ -302,6 +303,10 @@ data InstanceHost = InstanceHost
   , ihLive ∷ !(IORef (Map TaskId Live))
   , ihEndings ∷ !(IORef (Map Word64 Ending))
   , ihCreated ∷ !(IORef (Set.Set Word64))
+  , ihEntered ∷ !(IORef (Set.Set Word64))
+    -- ^ The M1 behavior instances whose @init@ was entered: what an interrupted @init@
+    -- is told apart by from a construction that never ran a hook. The legacy driver's
+    -- record ('ihCreated') is not made for a behavior, so progress is not read from it.
   , ihMode ∷ !(IORef ExitMode)
   , ihToFinish ∷ !(IORef (Set.Set Word64))
     -- ^ Instances whose invocation's coroutine the scheduler closed: each is ended
@@ -350,6 +355,7 @@ newInstanceHost control instances escalate host owned driver behaviorDriver hand
   InstanceHost control instances escalate owned driver behaviorDriver handles tasks extra
     <$> newIORef Map.empty
     <*> newIORef Map.empty
+    <*> newIORef Set.empty
     <*> newIORef Set.empty
     <*> newIORef Serving
     <*> newIORef Set.empty
@@ -642,14 +648,18 @@ startBehavior ih cell behavior = do
     case ihBehaviorDriver ih of
       Nothing → constructFailed (ErrorFault (ModuleNotLoaded behaviorDriverRef))
       Just driver → do
-        found ← settledOrRaise (ihExtra ih) (withRunning ih (icId cell) (Owner.retrieveExport owned (behaviorExport request)))
-        case found of
-          Left fault → constructFailed (ErrorFault fault)
-          Right Nothing → constructFailed (ErrorExportMissing (identityText (behaviorExport request)))
-          Right (Just (ExportFailed fault)) → constructFailed (ErrorExportFailed fault)
-          Right (Just (ExportReady export)) → do
+        found ← retrieved (behaviorExport request)
+        -- The facade's export module, when it names one, is found as the behavior's is.
+        facadeFound ← case behaviorFacade request of
+          FacadeData value → pure (Right (FacadeValue value))
+          FacadeShared identity key → fmap (\handle → FacadeField handle key) <$> retrieved identity
+          FacadeBuilder identity key context → fmap (\handle → FacadeBuilt handle key context) <$> retrieved identity
+        case (found, facadeFound) of
+          (Left failure, _) → constructFailed failure
+          (_, Left failure) → constructFailed failure
+          (Right export, Right facade) → do
             made ← mask_ $ do
-              attempted ← settledOrRaise (ihExtra ih) (withRunning ih (icId cell) (Owner.captureBehavior owned export (behaviorSelect request) (behaviorFacade request)))
+              attempted ← settledOrRaise (ihExtra ih) (withRunning ih (icId cell) (Owner.captureBehavior owned export (behaviorSelect request) facade))
               case attempted of
                 Right (Right capture) →
                   atomically (writeTVar (bcResolved behavior) (Just (BehaviorResolved (capturedHandle capture) (capturedShape capture) EventOnly Nothing)))
@@ -663,6 +673,14 @@ startBehavior ih cell behavior = do
     owned = ihOwned ih
     request = bcRequest behavior
     constructFailed = failInstance ih cell Initializing StageConstruct
+    -- The export module the owner holds under an identity, or why this instance fails.
+    retrieved identity = do
+      found ← settledOrRaise (ihExtra ih) (withRunning ih (icId cell) (Owner.retrieveExport owned identity))
+      pure $ case found of
+        Left fault → Left (ErrorFault fault)
+        Right Nothing → Left (ErrorExportMissing (identityText identity))
+        Right (Just (ExportFailed fault)) → Left (ErrorExportFailed fault)
+        Right (Just (ExportReady export)) → Right export
     identityText (ExportIdentity bytes) = Text.take 128 (Text.decodeUtf8Lenient bytes)
     -- The cadence is the application's rule applied to what the table read as, once,
     -- before @init@: an update hook needs an interval and an interval needs an update
@@ -682,6 +700,8 @@ startBehavior ih cell behavior = do
     initialize driver capture kind cadence = do
       let shape = capturedShape capture
       atomically (writeTVar (bcResolved behavior) (Just (BehaviorResolved (capturedHandle capture) shape kind cadence)))
+      -- From here a hook may have run: an interruption of @init@ is progress made.
+      when (shapeInit shape) $ modifyIORef' (ihEntered ih) (Set.insert (icId cell))
       ran ←
         if shapeInit shape
           then settledOrRaise (ihExtra ih) (withRunning ih (icId cell) (callEntryWith (LeadCaptured driver behaviorInit (capturedHandle capture) HookInit) (ownedHost owned) driver behaviorInit [VInteger (fromIntegral (icId cell))]))
@@ -1823,6 +1843,7 @@ settleEnding ih cell = do
   state ← readTVarIO (icState cell)
   mode ← readIORef (ihMode ih)
   created ← Set.member (icId cell) <$> readIORef (ihCreated ih)
+  entered ← Set.member (icId cell) <$> readIORef (ihEntered ih)
   held ← Map.lookup (icId cell) <$> readIORef (ihEndings ih)
   scope ← case ihLeases ih of
     Nothing → pure Nothing
@@ -1844,7 +1865,7 @@ settleEnding ih cell = do
       exitKind = case mode of
         Unorderly kind → kind
         _ → ExitFailed
-      reached = if isInitialized state || created || hookStarted (endShutdown ending) then Started else NotStarted
+      reached = if isInitialized state || created || entered || hookStarted (endShutdown ending) then Started else NotStarted
       failure = case (endPrimary ending, shutdownFailure) of
         (Just (Primary phase stage err), secondary) → Just (describe phase stage err ([(StageShutdown, e) | Just e ← [secondary]] <> releases))
         (Nothing, Just err) → Just (describe Stopping StageShutdown err releases)
@@ -1901,6 +1922,7 @@ settleEnding ih cell = do
     forM_ (ihLeases ih) $ \lh → atomically (dissolveScope (lhLeases lh) (icId cell))
     modifyIORef' (ihEndings ih) (Map.delete (icId cell))
     modifyIORef' (ihCreated ih) (Set.delete (icId cell))
+    modifyIORef' (ihEntered ih) (Set.delete (icId cell))
     tell restore mode won failure
   where
     -- The ending is accounted for once the application has been told and has answered: not

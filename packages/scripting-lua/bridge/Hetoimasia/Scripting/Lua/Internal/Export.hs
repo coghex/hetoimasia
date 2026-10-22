@@ -72,7 +72,7 @@ module Hetoimasia.Scripting.Lua.Internal.Export
   ) where
 
 import Control.Exception (onException)
-import Control.Monad (void, when)
+import Control.Monad (unless, void, when)
 import qualified Data.ByteString as ByteString
 import Data.IORef (modifyIORef', readIORef)
 import qualified Data.Map.Strict as Map
@@ -99,7 +99,7 @@ import Hetoimasia.Scripting.Lua.Internal.Vm
   , vmIdentity
   , withOpenVm
   )
-import Lua (StatusCode, lua_gettop, lua_settop, data LUA_OK)
+import Lua (StatusCode, fromTypeCode, lua_gettop, lua_settop, lua_type, data LUA_OK, data LUA_TTABLE)
 
 evaluateOperation, captureOperation, releaseOperation, lookupOperation ∷ Operation
 evaluateOperation = operation "evaluate-export"
@@ -153,7 +153,7 @@ evaluateExport host source =
         refuse (InvalidExportIdentity maxExportIdentityBytes)
       records ← readIORef (exportRecords held)
       case Map.lookup identity records of
-        Just (ExportHeld slot) → pure (ExportReady (ExportHandle (vmIdentity vm) slot identity))
+        Just (ExportHeld slot) → pure (ExportReady (ExportHandle (vmIdentity vm) slot (storedKey records)))
         Just (ExportBroken fault) → pure (ExportFailed fault)
         -- Nothing leaves a record behind in this state: an evaluation that
         -- cannot finish records its failure first.
@@ -165,7 +165,7 @@ evaluateExport host source =
             then do
               -- Never compiled or run; the identity is charged and stays failed.
               let fault = faultFor host EvaluateExport label (ModuleRefused (SourceTooLarge (exportMaxSourceBytes limits)))
-              modifyIORef' (exportRecords held) (Map.insert identity (ExportBroken fault))
+              modifyIORef' (exportRecords held) (Map.insert kept (ExportBroken fault))
               pure (ExportFailed fault)
             else evaluate state entry
   where
@@ -174,14 +174,19 @@ evaluateExport host source =
     limits = exportLimits held
     identity = exportIdentity source
     ExportIdentity raw = identity
+    -- What the records and handles retain is a copy that owns its bytes: a small slice
+    -- of a large buffer would otherwise keep the whole buffer alive until the VM
+    -- closes, and the identity bound would bound nothing.
+    kept = ExportIdentity (ByteString.copy raw)
+    storedKey records = maybe kept (fst . (`Map.elemAt` records)) (Map.lookupIndex identity records)
     label = exportLabel source
     broken why = faultFor host EvaluateExport label (InternalError why)
     evaluate state entry = do
       -- Anything that can fail before the chunk is made happens first, so that a
       -- failure there charges no identity.
       ensureValues vm state
-      modifyIORef' (exportRecords held) (Map.insert identity ExportEvaluating)
-      let abandon = modifyIORef' (exportRecords held) (Map.insert identity (ExportBroken (broken "the evaluation was abandoned")))
+      modifyIORef' (exportRecords held) (Map.insert kept ExportEvaluating)
+      let abandon = modifyIORef' (exportRecords held) (Map.insert kept (ExportBroken (broken "the evaluation was abandoned")))
       -- A failure before the chunk could start (memory running out as the
       -- environment is made) executed nothing: it is raised, and the identity is
       -- not charged, so it can be asked for again.
@@ -199,7 +204,7 @@ evaluateExport host source =
               -- reported, as everywhere else: raised, and the identity abandoned.
               raiseEscape vm
               let fault = (faultFor host EvaluateExport label reason) {boundaryEffect = effect, boundaryTraceback = trace}
-              modifyIORef' (exportRecords held) (Map.insert identity (ExportBroken fault))
+              modifyIORef' (exportRecords held) (Map.insert kept (ExportBroken fault))
               pure fault
             -- Until the chunk starts nothing executes, so a failure before then
             -- says so.
@@ -237,8 +242,8 @@ evaluateExport host source =
                     -- the marker, and the chunk still returned its table: the
                     -- failure is the caller's, and the table is not kept.
                     raiseEscape vm `onException` void (releaseExport state slot)
-                    modifyIORef' (exportRecords held) (Map.insert identity (ExportHeld slot))
-                    pure (Right (ExportReady (ExportHandle (vmIdentity vm) slot identity)))
+                    modifyIORef' (exportRecords held) (Map.insert kept (ExportHeld slot))
+                    pure (Right (ExportReady (ExportHandle (vmIdentity vm) slot kept)))
       either (throwFailure luaComponent evaluateOperation []) pure attempted
     shapeOf evaluated = case evaluatedShape evaluated of
       0 → Nothing
@@ -256,7 +261,7 @@ retrieveExport host identity =
     records ← readIORef (exportRecords (hostExports host))
     pure $ case Map.lookup identity records of
       Nothing → Nothing
-      Just (ExportHeld slot) → Just (ExportReady (ExportHandle (vmIdentity (hostVm host)) slot identity))
+      Just (ExportHeld slot) → Just (ExportReady (ExportHandle (vmIdentity (hostVm host)) slot (maybe identity (fst . (`Map.elemAt` records)) (Map.lookupIndex identity records))))
       Just (ExportBroken fault) → Just (ExportFailed fault)
       Just ExportEvaluating → Nothing
 
@@ -299,19 +304,23 @@ countFailure host name status =
     blankFault (hostBoundary host) EvaluateExport (ScriptFailed (classify status) ErrorAbsent)
 
 -- | Validate the field @select@ of the export table a handle names as a behavior,
--- and capture it with the facade.
+-- and capture it with a facade.
 --
 -- Refused before anything runs, with 'NoEffect': a handle another owner issued,
--- one the owner holds no table for, a facade past the value limits or holding a
--- capability the application's own check retires, and a selector that is empty or
--- past 128 bytes. A behavior that does not fit the schema is not a fault: it is
--- answered as a 'BehaviorProblem' and nothing is held. An allocation that fails
--- on the way is a fault, with nothing held either.
+-- one the owner holds no table for (the facade source's included), a facade value
+-- past the value limits or holding a capability the application's own check
+-- retires, and a selector that is empty or past 128 bytes. A behavior that does
+-- not fit the schema is not a fault: it is answered as a 'BehaviorProblem' and
+-- nothing is held, and a facade builder is never run for it. An allocation that
+-- fails on the way is a fault, with nothing held either.
 --
 -- On success the capture is held until 'releaseBehavior' or the VM closes, and
 -- the answer says which hooks it has and how its cadence fields read. The facade
--- is copied into a fresh Lua value for this capture alone.
-captureBehavior ∷ HasCallStack ⇒ Host → ExportHandle → Text → Value → IO (Either BehaviorProblem Captured)
+-- is made last, after the behavior has validated and been captured: a copy of a
+-- value, an existing table of a retained export, or what a builder function of one
+-- returns ('FacadeSource'). If it cannot be made (a builder that raises, or
+-- returns no table) the capture is released and the failure raised.
+captureBehavior ∷ HasCallStack ⇒ Host → ExportHandle → Text → FacadeSource → IO (Either BehaviorProblem Captured)
 captureBehavior host export select facade =
   withOperationContext luaComponent captureOperation [("behavior", select)] $
     withOpenVm vm captureOperation $ \state → do
@@ -322,35 +331,62 @@ captureBehavior host export select facade =
               (blankFault boundary CaptureBehavior reason) {boundaryEffect = effect, boundaryChunk = labelOf select}
           refuse ∷ ∀ b. ModuleProblem → IO b
           refuse problem = fault (ModuleRefused problem) NoEffect
+          refuseValue ∷ ∀ b. ValueRule → IO b
+          refuseValue rule = fault (ValueRefused (ValueRefusal Arguments 1 [] rule 0)) NoEffect
+          -- A handle must be this owner's and name a table it holds.
+          held ∷ ExportHandle → IO ()
+          held handle = do
+            when (exportHandleVm handle /= vmIdentity vm) (refuse ExportHandleForeign)
+            records ← readIORef (exportRecords (hostExports host))
+            case Map.lookup (exportHandleIdentity handle) records of
+              Just (ExportHeld slot) | slot == exportHandleSlot handle → pure ()
+              _ → refuse ExportHandleStale
+          -- A value is within the limits and holds no retired capability, and is encoded
+          -- before anything is made, so that a refusal costs nothing.
+          encodedValue ∷ Value → IO ByteString.ByteString
+          encodedValue value = do
+            either refuseValue pure (checkLimits limits [value])
+            retired ← runCallback vm (retiredIn boundary value)
+            case retired of
+              Just (path, typeName) → fault (ValueRefused (ValueRefusal Arguments 1 path (RuleRetiredHandle typeName) 0)) NoEffect
+              Nothing → pure ()
+            either refuseValue pure (encodeValues (boundaryContext boundary) limits [value])
+          pushEncoded ∷ ByteString.ByteString → IO ()
+          pushEncoded encoded = do
+            pushed ← pushValues state limits encoded 1
+            case pushed of
+              Pushed → pure ()
+              PushStatus status → do
+                value ← renderFailure state entry
+                lua_settop state entry
+                fault (ScriptFailed (classify status) value) NoEffect
+              PushMalformed which → do
+                lua_settop state entry
+                fault (InternalError ("the facade could not be built: " <> Text.pack (show which))) NoEffect
+          -- A field of a retained export table, pushed, of the Lua type wanted.
+          pushField ∷ ExportHandle → Text → Int → (Text → ModuleProblem) → IO ()
+          pushField handle key wanted wrong = do
+            (status, found) ← pushExportField state (exportHandleSlot handle) (Text.encodeUtf8 key)
+            when (status /= LUA_OK) $ do
+              value ← renderFailure state entry
+              lua_settop state entry
+              fault (ScriptFailed (classify status) value) NoEffect
+            when (found /= wanted) $ do
+              lua_settop state entry
+              refuse (if found == 0 then FacadeFieldMissing key else wrong (luaTypeName found))
       when (exportHandleVm export /= vmIdentity vm) (refuse ExportHandleForeign)
-      records ← readIORef (exportRecords (hostExports host))
-      case Map.lookup (exportHandleIdentity export) records of
-        Just (ExportHeld slot) | slot == exportHandleSlot export → pure ()
-        _ → refuse ExportHandleStale
+      held export
       when (ByteString.null selector || ByteString.length selector > 128) $
         refuse (InvalidEntryName select)
-      let refuseFacade ∷ ∀ b. ValueRule → IO b
-          refuseFacade rule = fault (ValueRefused (ValueRefusal Arguments 1 [] rule 0)) NoEffect
-      either refuseFacade pure (checkLimits limits [facade])
-      retired ← runCallback vm (retiredIn boundary facade)
-      case retired of
-        Just (path, typeName) → fault (ValueRefused (ValueRefusal Arguments 1 path (RuleRetiredHandle typeName) 0)) NoEffect
-        Nothing → pure ()
-      encoded ← either refuseFacade pure (encodeValues (boundaryContext boundary) limits [facade])
+      -- What a facade needs checked, and encoded, is settled before the behavior is.
+      prepared ← case facade of
+        FacadeValue value → Just <$> encodedValue value
+        FacadeField handle _ → Nothing <$ held handle
+        FacadeBuilt handle _ context → held handle >> Just <$> encodedValue context
       ensureValues vm state
       setRunContext vm (labelOf select, "behavior", Nothing)
-      pushed ← pushValues state limits encoded 1
-      case pushed of
-        Pushed → pure ()
-        PushStatus status → do
-          value ← renderFailure state entry
-          lua_settop state entry
-          fault (ScriptFailed (classify status) value) NoEffect
-        PushMalformed which → do
-          lua_settop state entry
-          fault (InternalError ("the facade could not be built: " <> Text.pack (show which))) NoEffect
       slot ← nextModuleSlot vm
-      (status, report) ← captureBehaviorFields state (exportHandleSlot export) selector slot True
+      (status, report) ← captureBehaviorFields state (exportHandleSlot export) selector slot
       if status /= LUA_OK
         then do
           value ← renderFailure state entry
@@ -358,18 +394,49 @@ captureBehavior host export select facade =
           raiseEscape vm
           -- Nothing was published: the one store is the last step of the call.
           fault (ScriptFailed (classify status) value) NoEffect
-        else do
-          lua_settop state entry
-          if reportStored report
+        else
+          if not (reportStored report)
             then do
-              -- Published and tracked in one masked step; were anything to
-              -- interrupt it, what was stored is let go of.
-              (`onException` void (releaseCapture state slot)) $ do
+              lua_settop state entry
+              pure (Left (problemOfReport report))
+            else do
+              -- Stored, tracked and then given its facade; whatever fails from here lets
+              -- go of what was stored, so no failure leaves a capture nobody holds.
+              let undo = void (releaseCapture state slot) >> modifyIORef' (exportCaptures (hostExports host)) (Set.delete slot)
+              (`onException` undo) $ do
                 raiseEscape vm
                 modifyIORef' (exportCaptures (hostExports host)) (Set.insert slot)
-              let handle = CaptureHandle (vmIdentity vm) slot
-              pure (Right (Captured handle (shapeOfReport report)))
-            else pure (Left (problemOfReport report))
+                case (facade, prepared) of
+                  (FacadeValue _, Just encoded) → pushEncoded encoded
+                  (FacadeField handle key, _) → pushField handle key 5 FacadeNotATable
+                  (FacadeBuilt handle key _, Just encoded) → do
+                    pushField handle key 6 FacadeBuilderNotAFunction
+                    pushEncoded encoded
+                    -- The builder is the engine's own Lua: what it allocated while the
+                    -- collector was held is paid, and it runs under the traceback handler.
+                    serviceCollector state
+                    (called, trace) ← callProtected state 1 1
+                    effect ← effectNow vm
+                    when (called /= LUA_OK) $ do
+                      value ← renderFailure state entry
+                      lua_settop state entry
+                      raiseEscape vm
+                      throwFailure luaComponent captureOperation [] $
+                        (blankFault boundary CaptureBehavior (ScriptFailed (classify called) value))
+                          {boundaryEffect = effect, boundaryChunk = labelOf select, boundaryTraceback = trace}
+                    kind ← lua_type state (-1)
+                    when (kind /= LUA_TTABLE) $ do
+                      lua_settop state entry
+                      raiseEscape vm
+                      fault (ModuleRefused (FacadeNotATable (luaTypeName (fromIntegral (fromTypeCode kind))))) effect
+                  _ → fault (InternalError "a facade source was not prepared") NoEffect
+                (attached, wasAttached) ← attachFacade state slot
+                lua_settop state entry
+                when (attached /= LUA_OK) $
+                  fault (ScriptFailed (classify attached) ErrorAbsent) NoEffect
+                unless wasAttached $ fault (InternalError "the capture to attach a facade to is gone") NoEffect
+                raiseEscape vm
+              pure (Right (Captured (CaptureHandle (vmIdentity vm) slot) (shapeOfReport report)))
   where
     vm = hostVm host
     boundary = hostBoundary host
