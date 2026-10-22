@@ -77,8 +77,10 @@ import GHC.Foreign (withCStringLen)
 import GHC.IO.Encoding (getFileSystemEncoding)
 import Hetoimasia.Content.Internal.Access
 import Hetoimasia.Content.Internal.Native (productionSeam)
-import Hetoimasia.Content.Internal.Root (ContentRoot, rootReport, withContentRootWith)
-import Hetoimasia.Content.Internal.Types
+import Hetoimasia.Content.Internal.Root (ContentRoot, withContentRootWith)
+import qualified Hetoimasia.Content.Internal.Root as Root
+import Hetoimasia.Content.Internal.Types hiding (limitPathDepth, limitReadChunk)
+import qualified Hetoimasia.Content.Internal.Types as Types
 
 -- | Select, open and anchor the folder a launch path names, for the body.
 --
@@ -102,3 +104,18 @@ withContentRoot limits path body = do
 -- | 'withContentRoot' for a launch path already held as native bytes.
 withContentRootBytes ∷ ContentLimits → ByteString → (ContentRoot → IO r) → IO r
 withContentRootBytes = withContentRootWith productionSeam
+
+-- | What the launcher reports about the opened root.
+--
+-- A function and not a record label, so a client cannot rewrite a root's report
+-- (its identity is what the cycle rule and failure attribution compare).
+rootReport ∷ ContentRoot → RootReport
+rootReport = Root.rootReport
+
+-- | The most components a path or a traversal may have.
+limitPathDepth ∷ ContentLimits → Int
+limitPathDepth = Types.limitPathDepth
+
+-- | The most bytes one read may ask for.
+limitReadChunk ∷ ContentLimits → Int
+limitReadChunk = Types.limitReadChunk

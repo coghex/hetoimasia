@@ -202,6 +202,36 @@ spec = do
         _ ← asserting rig
         pure ()
 
+    it "keeps a failed body's failure and its cleanup evidence primary when a cancellation arrives during the wait" $
+      lifecycleTree $ \path → do
+        (recorded, rig) ← recordingSeam
+        counter ← newIORef 0
+        pause ← newPause
+        drainStarted ← newEmptyMVar
+        opVar ← newEmptyMVar
+        -- closes: 1 the qualification probe, 2 the operation's file, 3 the root
+        let seam = failNthClose counter 3 28 (onBoundary (announce drainStarted) (pauseWhen (== BeforeRead) pause recorded))
+        owner ← spawn $ withRootOwned seam defaultContentLimits path $ \root → do
+          operation ← spawn (readFirst root ["file.bin"])
+          putMVar opVar operation
+          awaitReached pause
+          fail "the body failed"
+        bounded (takeMVar drainStarted)
+        killer ← spawn (killThread (childThread owner))
+        awaitPendingThrow killer
+        resumePaused pause
+        outcome ← awaitOutcome owner
+        awaitDone killer
+        case outcome of
+          Left exception → do
+            show exception `shouldContain` "the body failed"
+            map closeKind (closeFailuresOf (cleanupFailures exception)) `shouldBe` [RootHandle]
+          Right _ → expectationFailure "the body's failure was lost"
+        operation ← bounded (takeMVar opVar)
+        awaitChild operation `shouldReturn` "0123"
+        _ ← asserting rig
+        pure ()
+
   describe "operations that are interrupted" $ do
     it "closes every handle once when a paused operation is cancelled, at each boundary" $
       forM_ [BeforeRead, AfterOpen 0 (name "file.bin"), OperationAdmitted] $ \boundary →

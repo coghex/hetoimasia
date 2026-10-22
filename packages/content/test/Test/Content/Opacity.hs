@@ -45,6 +45,24 @@ spec = describe "Content package boundary" $ do
       rejectedBecause outcome "GHC-61689"
       clientOutput outcome `shouldContain` "rootFd"
 
+  it "rejects a client that rewrites a root's report by record update" $
+    withClient "Client.hs" reportUpdateClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess → expectationFailure ("the client compiled, so a root's report can be rewritten:\n" <> clientOutput outcome)
+      clientOutput outcome `shouldContain` "rootReport"
+      clientOutput outcome `shouldNotContain` "Could not find module"
+
+  it "rejects a client that rewrites a limit by record update" $
+    withClient "Client.hs" limitUpdateClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess → expectationFailure ("the client compiled, so a limit can be set to a value contentLimits refuses:\n" <> clientOutput outcome)
+      clientOutput outcome `shouldContain` "limitPathDepth"
+      clientOutput outcome `shouldNotContain` "Could not find module"
+
   it "rejects a client that builds a reader from its parts" $
     withClient "Client.hs" readerConstructorClient $ \compile → do
       outcome ← compile Typecheck
@@ -116,6 +134,28 @@ rootDescriptorClient =
     , ""
     , "descriptor ∷ ContentRoot → ()"
     , "descriptor root = rootFd root `seq` ()"
+    ]
+
+reportUpdateClient ∷ String
+reportUpdateClient =
+  unlines
+    [ "module Client (rewritten) where"
+    , ""
+    , "import Hetoimasia.Content (ContentRoot, RootReport, rootReport)"
+    , ""
+    , "rewritten ∷ ContentRoot → RootReport → ContentRoot"
+    , "rewritten root report = root {rootReport = report}"
+    ]
+
+limitUpdateClient ∷ String
+limitUpdateClient =
+  unlines
+    [ "module Client (zeroed) where"
+    , ""
+    , "import Hetoimasia.Content (ContentLimits, limitPathDepth)"
+    , ""
+    , "zeroed ∷ ContentLimits → ContentLimits"
+    , "zeroed limits = limits {limitPathDepth = 0}"
     ]
 
 readerConstructorClient ∷ String

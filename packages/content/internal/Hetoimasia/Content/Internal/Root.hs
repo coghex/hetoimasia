@@ -171,10 +171,18 @@ qualify seam attributed fd identity =
 --
 -- The body's outcome is captured with its context and the exit then runs
 -- uninterruptibly, so a cancellation aimed at this thread while it waits cannot
--- shorten the wait. Once every borrower has retired the cancellation, if one is
--- pending, is delivered here, at the one interruptible point after the wait;
--- the enclosing resource scope then releases the descriptor with the
--- cancellation as its primary failure and any failed close retained beside it.
+-- shorten the wait. What follows the wait is the foundation's failure table:
+--
+-- * a body that returned: a cancellation that is pending is delivered here, at
+--   the one interruptible point after the wait, so it is the primary failure and
+--   the enclosing resource scope releases the descriptor with a failed close
+--   retained beside it;
+-- * a body that failed (or was itself cancelled): its exception, with every
+--   cleanup failure it already carries, stays primary and is rethrown as it was
+--   captured. A cancellation that arrived during the wait is not consumed: it
+--   stays pending and is delivered once the scope has finished, as it is after
+--   any foundation scope whose body failed.
+--
 -- The wait is the price of letting other threads borrow the root: an operation
 -- that never returns holds the exit.
 drainOnExit ∷ Seam → Gate → IO r → IO r
@@ -184,5 +192,6 @@ drainOnExit seam gate body = mask $ \restore → do
     closeAdmission gate
     seamBoundary seam DrainStarted
     awaitDrained gate
-  allowInterrupt
-  either rethrowIO pure outcome
+  case outcome of
+    Right result → allowInterrupt >> pure result
+    Left primary → rethrowIO primary
