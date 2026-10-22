@@ -1,0 +1,572 @@
+-- | The owned, bounded pool of verified-read workers (LFE-10).
+--
+-- A pool turns the synchronous 'Hetoimasia.Content.Inventory.readVerified' into asynchronous
+-- work for any number of consumers (raw data now; module sources and texture sources later)
+-- without becoming a general executor: it runs only verified reads of an anchored inventory,
+-- on a fixed number of worker threads, from a queue whose size is bounded by reservations the
+-- consumers made before they submitted.
+--
+-- = Who owns what
+--
+-- * The /pool/ is one 'withPool' scope. It starts its workers inside a foundation worker group
+--   and runs inside the scopes of the root and the inventory its reader borrows, so the group's
+--   drain finishes every started read before either of them can be released. The scope is never
+--   reopened.
+-- * A /consumer/ owns what it reserved. 'reserveSlot' takes one unit of queue capacity, with the
+--   consumer's other admission reservations and in the same transaction; 'releaseSlot' gives it
+--   back after the consumer has seen its job retire. A job can be submitted only against a
+--   reservation, so the queue, the active reads and the completions in flight are bounded by the
+--   reservations that exist, and a job that was accepted can never be refused or retried for want
+--   of room.
+-- * The /buffer/ of a successful read belongs to the verified reader until the sink is called with
+--   it; from then on the consumer owns that one allocation. The pool keeps no cache, no copy and
+--   no second reference.
+--
+-- = A job
+--
+-- @Queued@ (in the queue, no file touched) becomes @Issued@ (a worker took it; it may be cancelled
+-- but not withdrawn) and then @Done@ (the sink was called, or its call was suppressed because
+-- interest was withdrawn), or @Withdrawn@ (it left the queue before issuance, on a cancel or when
+-- the pool closed or failed). The three transitions out of @Queued@ and @Issued@ are STM
+-- transactions on the one pool state, so a cancel and an issuance cannot both win. 'retired' is
+-- true from @Done@ or @Withdrawn@ on: it is the per-job evidence a consumer's own retirement
+-- reading is made of, and the one a group drain or a worker's exit cannot give.
+--
+-- A worker releases its execution slot as soon as the sink returned. The sink is a consumer's
+-- non-blocking completion whose room the consumer reserved when it admitted the job (for the Lua
+-- provider, the request's reserved result slot): a worker never waits for a logical due tick, a
+-- take, evaluation, decoding or another job.
+--
+-- = Failure
+--
+-- An expected outcome of a verified read ('ReadFailed') is data for the sink. Anything else a read
+-- or a sink raises is a defect: the job's sink is told ('ReadDefect'), every queued job is
+-- withdrawn and told, the pool latches the first defect (read by 'awaitFailure' and rethrown by the
+-- scope), no further job is accepted, and the worker ends with the defect so that supervision of
+-- the surrounding group sees it. Nothing restarts. An asynchronous exception ends the worker,
+-- settles the job it interrupted as abandoned, and is not a defect.
+module Hetoimasia.Content.Internal.Pool
+  ( -- * The pool
+    ReadPool
+  , PoolSpec (..)
+  , poolSpec
+  , PoolSpecRefusal (..)
+  , VerifiedRead
+  , withPool
+  , withPoolWith
+  , PoolHooks (..)
+  , noHooks
+
+    -- * Capacity
+  , reserveSlot
+  , releaseSlot
+
+    -- * Jobs
+  , ReadRequest (..)
+  , ReadPriority (..)
+  , ReadResult (..)
+  , SubmitRefusal (..)
+  , ReadTicket
+  , submit
+  , cancel
+  , CancelOutcome (..)
+  , retired
+  , ticketKey
+
+    -- * Observation
+  , PoolStatus (..)
+  , PoolPhase (..)
+  , status
+  , awaitFailure
+  ) where
+
+import Control.Concurrent.STM
+  ( STM
+  , TVar
+  , atomically
+  , newTVar
+  , newTVarIO
+  , readTVar
+  , readTVarIO
+  , retry
+  , throwSTM
+  , writeTVar
+  )
+import Control.Exception
+  ( ExceptionWithContext (ExceptionWithContext)
+  , SomeAsyncException (SomeAsyncException)
+  , SomeException
+  , fromException
+  , mask
+  , mask_
+  , rethrowIO
+  , throwIO
+  , tryWithContext
+  )
+import Control.Monad (forM, forM_, unless, when)
+import Data.ByteString (ByteString)
+import Data.Functor ((<&>))
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
+import Data.Word (Word64)
+import Hetoimasia.Content.Internal.Identity.Types (ContentKey)
+import Hetoimasia.Content.Internal.Inventory.Types (Inventory, ReadFailure)
+import Hetoimasia.Content.Internal.Inventory.Read (readVerified)
+import Hetoimasia.Content.Internal.Root (ContentRoot)
+import Hetoimasia.Content.Internal.Types (ContentDefect (..), Defect (..))
+import Hetoimasia.Foundation.Resource (composeCleanup)
+import Hetoimasia.Foundation.Worker
+  ( StartOutcome (Started, StartRejected, StartupFailed)
+  , StopToken
+  , closeWorkerGroup
+  , startWorker
+  , stopRequested
+  , withWorkerGroup
+  , workerDefinition
+  )
+import qualified Data.Text as Text
+
+-- The specification -----------------------------------------------------------------------
+
+-- | The two numbers a pool is built from. Nothing here is a default: the assembly passes the
+-- profile's worker count (two for M1) and the queue capacity its consumers' reservations add up
+-- to.
+data PoolSpec = PoolSpec
+  { specWorkers ∷ !Int
+  -- ^ Worker threads: the most reads in flight at once.
+  , specSlots ∷ !Int
+  -- ^ The most jobs queued, issued or finishing at once: the capacity 'reserveSlot' hands out.
+  }
+  deriving (Eq, Show)
+
+-- | Why a specification is not usable.
+data PoolSpecRefusal
+  = -- | Fewer than one worker.
+    WorkersNotPositive !Int
+  | -- | Fewer than one slot.
+    SlotsNotPositive !Int
+  deriving (Eq, Show)
+
+-- | Check a specification.
+poolSpec ∷ Int → Int → Either PoolSpecRefusal PoolSpec
+poolSpec workers slots
+  | workers < 1 = Left (WorkersNotPositive workers)
+  | slots < 1 = Left (SlotsNotPositive slots)
+  | otherwise = Right (PoolSpec workers slots)
+
+-- | How verified bytes are produced for a key within a byte allowance:
+-- @'readVerified' inventory root@ in production. A caller that supplies its own (to gate or fail a
+-- read in a test) is responsible for what it borrows outliving the pool.
+type VerifiedRead = ContentKey → Int → IO (Either ReadFailure ByteString)
+
+-- | Coordination points of the pool's own transitions, for this package's tests. Production
+-- uses 'noHooks'. A hook runs on the thread making the transition, outside any transaction.
+data PoolHooks = PoolHooks
+  { hookWorkerStart ∷ !(Int → IO ())
+  -- ^ Before worker @i@ (from zero) is started.
+  , hookIssued ∷ !(ContentKey → IO ())
+  -- ^ A worker took the job off the queue and has not yet asked the reader to open anything.
+  , hookRead ∷ !(ContentKey → IO ())
+  -- ^ The reader returned (bytes, refusal or exception) and nothing was published yet.
+  , hookSettled ∷ !(ContentKey → IO ())
+  -- ^ The sink returned (or was suppressed) and the job is not yet marked done.
+  }
+
+-- | No hooks.
+noHooks ∷ PoolHooks
+noHooks = PoolHooks (\_ → pure ()) (\_ → pure ()) (\_ → pure ()) (\_ → pure ())
+
+-- Jobs ------------------------------------------------------------------------------------
+
+-- | Which queued job a worker takes first. Within a class the oldest accepted job goes first.
+data ReadPriority
+  = -- | The read an active dependency chain is waiting for: ahead of unrelated prefetch. The
+    -- class is the consumer's to assign (module loading, LFE-11); raw data is never this.
+    DependencyProgress
+  | -- | Any other read.
+    OrdinaryRead
+  deriving (Eq, Ord, Show, Bounded, Enum)
+
+-- | What a consumer asks of the pool.
+data ReadRequest = ReadRequest
+  { requestKey ∷ !ContentKey
+  , requestAllowance ∷ !Int
+  -- ^ The most bytes this read may return: the consumer's own already-reserved bounded
+  -- allowance, never below zero. The pool imposes none of its own.
+  , requestPriority ∷ !ReadPriority
+  , requestSink ∷ ReadResult → IO ()
+  -- ^ How the outcome is handed over. It must not block or wait for anything the consumer's own
+  -- owner provides, and the consumer reserved room for what it does before submitting; it is
+  -- called at most once, on a worker's thread, and never for a job whose interest was withdrawn
+  -- after issuance.
+  }
+
+-- | What a job came to.
+data ReadResult
+  = -- | The whole verified buffer. It is the consumer's from here.
+    ReadSucceeded !ByteString
+  | -- | An expected refusal of the verified read, classified by the content layer.
+    ReadFailed !ReadFailure
+  | -- | The reader or a sink raised something that is not an expected outcome: an engine or
+    -- provider defect. It is also latched on the pool and rethrown by its scope.
+    ReadDefect !SomeException
+  | -- | The job was issued or queued when the pool closed, or a worker was cancelled under it,
+    -- without interest having been withdrawn: no read result exists.
+    ReadAbandoned
+
+-- | Why a job was not accepted. The pool was not able to take any job at all.
+data SubmitRefusal
+  = -- | The pool's scope is ending or ended.
+    PoolIsClosed
+  | -- | A worker or sink failed earlier; that failure.
+    PoolHasFailed !SomeException
+
+-- | The consumer's record of one accepted job.
+data ReadTicket = ReadTicket !(TVar PoolState) !Job
+
+-- | The key the ticket reads.
+ticketKey ∷ ReadTicket → ContentKey
+ticketKey (ReadTicket _ job) = jobKey job
+
+data JobState
+  = JobQueued
+  | -- | A worker took it. The flag says interest was withdrawn.
+    JobIssued !Bool
+  | JobDone
+  | JobWithdrawn
+
+data Job = Job
+  { jobKey ∷ !ContentKey
+  , jobAllowance ∷ !Int
+  , jobOrder ∷ !(Int, Word64)
+  , jobSink ∷ ReadResult → IO ()
+  , jobState ∷ !(TVar JobState)
+  }
+
+-- The state ---------------------------------------------------------------------------------
+
+-- | Whether the scope still accepts jobs.
+data PoolPhase = PoolOpen | PoolClosed
+  deriving (Eq, Show)
+
+-- | The whole state of one pool, in one variable, so every invariant is a property of a
+-- transaction and not of an interleaving.
+--
+-- Owner: the pool's scope. Writers: consumers ('reserveSlot', 'releaseSlot', 'submit', 'cancel')
+-- and workers (issuance and settlement), always in STM. Readers: anyone, through 'status'.
+-- Invariant: @queued <= live <= reserved <= capacity@ and @active <= live@.
+data PoolState = PoolState
+  { psPhase ∷ !PoolPhase
+  , psFailure ∷ !(Maybe SomeException)
+  , psQueue ∷ !(Map (Int, Word64) Job)
+  , psNext ∷ !Word64
+  , psReserved ∷ !Int
+  , psLive ∷ !Int
+  , psActive ∷ !Int
+  }
+
+-- | The pool.
+data ReadPool = ReadPool
+  { poolSpecOf ∷ !PoolSpec
+  , poolState ∷ !(TVar PoolState)
+  , poolReader ∷ VerifiedRead
+  , poolHooks ∷ !PoolHooks
+  }
+
+-- | A coherent reading of the pool.
+data PoolStatus = PoolStatus
+  { statusPhase ∷ !PoolPhase
+  , statusFailed ∷ !Bool
+  , statusWorkers ∷ !Int
+  , statusCapacity ∷ !Int
+  , statusReserved ∷ !Int
+  -- ^ Slots consumers hold.
+  , statusQueued ∷ !Int
+  -- ^ Jobs waiting for a worker.
+  , statusActive ∷ !Int
+  -- ^ Jobs a worker took and has not finished.
+  , statusLive ∷ !Int
+  -- ^ Queued and active.
+  }
+  deriving (Eq, Show)
+
+-- | Read the pool in one transaction.
+status ∷ ReadPool → STM PoolStatus
+status pool = do
+  st ← readTVar (poolState pool)
+  pure
+    PoolStatus
+      { statusPhase = psPhase st
+      , statusFailed = maybe False (const True) (psFailure st)
+      , statusWorkers = specWorkers (poolSpecOf pool)
+      , statusCapacity = specSlots (poolSpecOf pool)
+      , statusReserved = psReserved st
+      , statusQueued = Map.size (psQueue st)
+      , statusActive = psActive st
+      , statusLive = psLive st
+      }
+
+-- | Wait, in STM, for the first defect a worker or sink raised, so a supervisor can compose it
+-- into a supervised wait.
+awaitFailure ∷ ReadPool → STM SomeException
+awaitFailure pool = readTVar (poolState pool) >>= maybe retry pure . psFailure
+
+-- The scope -------------------------------------------------------------------------------
+
+-- | Run a body over a pool of verified reads of this inventory through this root.
+--
+-- Call it inside the root's scope: the root and the inventory are borrowed for every read, and
+-- the scope's exit drains every started read before it returns, so the root closes after them.
+withPool ∷ PoolSpec → Inventory → ContentRoot → (ReadPool → IO a) → IO a
+withPool spec inventory root = withPoolWith noHooks spec (readVerified inventory root)
+
+-- | 'withPool' over a reader the caller supplies and hooks.
+--
+-- The scope, in order: the worker group; the pool state; the workers, each started with
+-- registration checked; the body. On any exit the pool closes first (admission stops and every
+-- queued job is withdrawn and told it was abandoned), then the group drains: every read already
+-- started runs to its end, with its job settled, before the borrowed dependencies unwind. A body
+-- that returned while a worker had failed rethrows that failure.
+withPoolWith ∷ PoolHooks → PoolSpec → VerifiedRead → (ReadPool → IO a) → IO a
+withPoolWith hooks spec reader body = withWorkerGroup $ \group → do
+  var ← newTVarIO (PoolState PoolOpen Nothing Map.empty 0 0 0 0)
+  let pool = ReadPool spec var reader hooks
+  result ← mask $ \restore → do
+    outcome ← tryWithContext @SomeException $ restore $ do
+      forM_ [0 .. specWorkers spec - 1] $ \index → do
+        hookWorkerStart hooks index
+        startWorker group (workerDefinition (Text.pack ("content-read-" <> show index)) (\_ → pure ()) (\token () → runWorker pool token)) >>= \case
+          Started _ → pure ()
+          StartupFailed _ _ → throwIO (ContentDefect (ReadWorkerNotStarted index))
+          StartRejected _ → throwIO (ContentDefect (ReadWorkerNotStarted index))
+      body pool
+    -- The pool closes whether or not the body ended well; a failure closing is kept beside the
+    -- primary one.
+    closed ← tryWithContext @SomeException (closePool pool)
+    case (outcome, closed) of
+      (Right value, Right ()) → pure (Right value)
+      (Right _, Left closing) → pure (Left closing)
+      (Left primary, Right ()) → pure (Left primary)
+      (Left primary@(ExceptionWithContext _ _), Left closing) → do
+        composed ← composeCleanup (Just primary) [("content read pool close", closing)]
+        pure (Left (maybe primary id composed))
+  case result of
+    Left failure → rethrowIO failure
+    Right value → do
+      -- A worker's failure after the body began its return is still the scope's failure.
+      _ ← closeWorkerGroup group
+      latched ← readTVarIO var
+      maybe (pure value) throwIO (psFailure latched)
+
+-- Capacity -------------------------------------------------------------------------------
+
+-- | Take one unit of queue capacity, in the consumer's admission transaction. 'False' when none is
+-- left. It does not depend on the pool's phase: a pool that has closed or failed refuses at
+-- 'submit', where the consumer can tell it from a full queue.
+reserveSlot ∷ ReadPool → STM Bool
+reserveSlot pool = do
+  st ← readTVar (poolState pool)
+  if psReserved st >= specSlots (poolSpecOf pool)
+    then pure False
+    else True <$ writeTVar (poolState pool) st {psReserved = psReserved st + 1}
+
+-- | Give a unit of capacity back, once, after the job it was reserved for has retired. Releasing
+-- one while every reserved unit is held by a live job, or more than were reserved, is a defect
+-- of the caller and raises.
+releaseSlot ∷ ReadPool → STM ()
+releaseSlot pool = do
+  st ← readTVar (poolState pool)
+  when (psReserved st <= psLive st) $ throwSTM (ContentDefect ReadSlotReleasedWhileLive)
+  writeTVar (poolState pool) st {psReserved = psReserved st - 1}
+
+-- Submitting and cancelling ----------------------------------------------------------------
+
+-- | Accept a job against a reserved slot, or say why the pool cannot take any. Never blocks, opens
+-- nothing, and never waits for a worker. A job beyond the reservations, or with a negative
+-- allowance, is a defect of the caller and raises; the transaction then leaves nothing behind.
+submit ∷ ReadPool → ReadRequest → STM (Either SubmitRefusal ReadTicket)
+submit pool request = do
+  when (requestAllowance request < 0) $ throwSTM (ContentDefect (BadReadCeiling (requestAllowance request)))
+  st ← readTVar (poolState pool)
+  case (psFailure st, psPhase st) of
+    (Just failure, _) → pure (Left (PoolHasFailed failure))
+    (_, PoolClosed) → pure (Left PoolIsClosed)
+    _ → do
+      when (psLive st >= psReserved st) $ throwSTM (ContentDefect ReadSubmittedWithoutSlot)
+      state ← newTVar JobQueued
+      let order = (fromEnum (requestPriority request), psNext st)
+          job = Job (requestKey request) (requestAllowance request) order (requestSink request) state
+      writeTVar
+        (poolState pool)
+        st
+          { psQueue = Map.insert order job (psQueue st)
+          , psNext = psNext st + 1
+          , psLive = psLive st + 1
+          }
+      pure (Right (ReadTicket (poolState pool) job))
+
+-- | What withdrawing interest in a job came to.
+data CancelOutcome
+  = -- | It was still queued: it left the queue, no file was opened and its sink will not be
+    -- called. It is retired.
+    CancelWithdrawn
+  | -- | A worker already took it: it runs to its end, its sink is not called, and it retires then.
+    CancelInFlight
+  | -- | It had finished or been withdrawn.
+    CancelTooLate
+  deriving (Eq, Show)
+
+-- | Withdraw interest in a job. This and issuance are transactions on one state, so exactly one of
+-- them wins a job that is still queued.
+cancel ∷ ReadTicket → STM CancelOutcome
+cancel (ReadTicket var job) =
+  readTVar (jobState job) >>= \case
+    JobQueued → do
+      st ← readTVar var
+      writeTVar var st {psQueue = Map.delete (jobOrder job) (psQueue st), psLive = psLive st - 1}
+      writeTVar (jobState job) JobWithdrawn
+      pure CancelWithdrawn
+    JobIssued _ → CancelInFlight <$ writeTVar (jobState job) (JobIssued True)
+    JobDone → pure CancelTooLate
+    JobWithdrawn → pure CancelTooLate
+
+-- | Whether the job has retired: its sink has been called (or suppressed), or it was withdrawn.
+-- A pure reading with no write, as a retirement reading must be.
+retired ∷ ReadTicket → STM Bool
+retired (ReadTicket _ job) =
+  readTVar (jobState job) >>= \case
+    JobDone → pure True
+    JobWithdrawn → pure True
+    _ → pure False
+
+-- Workers -------------------------------------------------------------------------------
+
+-- | A worker: take the oldest job of the strongest class, read it, settle it; until the pool
+-- closes or fails, or the worker is asked to stop with nothing queued.
+--
+-- The whole loop is masked and a read runs unmasked inside it, so the only places an asynchronous
+-- exception can arrive are the wait for a job (nothing is issued yet) and the read itself (whose
+-- job is then settled as abandoned). A job taken off the queue is therefore always settled.
+runWorker ∷ ReadPool → StopToken → IO ()
+runWorker pool token = mask $ \restore →
+  let loop =
+        atomically (takeNext pool token) >>= \case
+          Nothing → pure ()
+          Just job → do
+            runJob restore pool job `onSynchronousFailure` latchFailure pool
+            loop
+   in loop
+
+-- | The next job, or 'Nothing' when this worker should end.
+takeNext ∷ ReadPool → StopToken → STM (Maybe Job)
+takeNext pool token = do
+  st ← readTVar (poolState pool)
+  case Map.minView (psQueue st) of
+    Just (job, rest) → do
+      writeTVar (poolState pool) st {psQueue = rest, psActive = psActive st + 1}
+      -- Issuance: from here a cancel finds the job in a worker's hands.
+      writeTVar (jobState job) (JobIssued False)
+      pure (Just job)
+    Nothing
+      | psPhase st /= PoolOpen || maybe False (const True) (psFailure st) → pure Nothing
+      | otherwise → do
+          stopping ← stopRequested token
+          if stopping then pure Nothing else retry
+
+-- | What a worker found when it ran an issued job.
+data Ran
+  = -- | Interest was withdrawn before the reader was asked for anything: no file was touched.
+    Skipped
+  | Read !(Either ReadFailure ByteString)
+
+-- | Read one issued job and settle it, always: the reader's return, a failure, or an asynchronous
+-- exception each end in 'settle', which marks the job done after its sink was called or suppressed.
+runJob ∷ (∀ x. IO x → IO x) → ReadPool → Job → IO ()
+runJob restore pool job = do
+  outcome ← tryWithContext @SomeException $ restore $ do
+    hookIssued (poolHooks pool) (jobKey job)
+    withdrawn ← readTVarIO (jobState job) <&> \case JobIssued flag → flag; _ → False
+    if withdrawn
+      then pure Skipped
+      else do
+        found ← poolReader pool (jobKey job) (jobAllowance job)
+        hookRead (poolHooks pool) (jobKey job)
+        pure (Read found)
+  case outcome of
+    Right Skipped → settle pool job ReadAbandoned Nothing
+    Right (Read (Right bytes)) → settle pool job (ReadSucceeded bytes) Nothing
+    Right (Read (Left refusal)) → settle pool job (ReadFailed refusal) Nothing
+    Left caught@(ExceptionWithContext _ failure)
+      | Just (SomeAsyncException _) ← fromException failure → settle pool job ReadAbandoned (Just caught)
+      | otherwise → settle pool job (ReadDefect failure) (Just caught)
+
+-- | Hand the result to the sink unless interest was withdrawn, then mark the job done and release
+-- the execution slot. @pending@ is the failure to rethrow after, once the job is settled.
+settle ∷ ReadPool → Job → ReadResult → Maybe (ExceptionWithContext SomeException) → IO ()
+settle pool job result pending = do
+  withdrawn ← readTVarIO (jobState job) <&> \case JobIssued flag → flag; _ → False
+  delivered ← tryWithContext @SomeException $ do
+    unless withdrawn (jobSink job result)
+    hookSettled (poolHooks pool) (jobKey job)
+  atomically $ do
+    writeTVar (jobState job) JobDone
+    st ← readTVar (poolState pool)
+    writeTVar (poolState pool) st {psActive = psActive st - 1, psLive = psLive st - 1}
+  case (pending, delivered) of
+    (Just failure, Right ()) → rethrowIO failure
+    (Nothing, Right ()) → pure ()
+    (Nothing, Left sinkFailure) → rethrowIO sinkFailure
+    (Just failure, Left sinkFailure) → do
+      composed ← composeCleanup (Just failure) [("content read sink", sinkFailure)]
+      rethrowIO (maybe failure id composed)
+
+-- | Run an action; if it raises a synchronous exception, do this with it, then raise it.
+onSynchronousFailure ∷ IO () → (SomeException → IO ()) → IO ()
+onSynchronousFailure action handler =
+  tryWithContext @SomeException action >>= \case
+    Right () → pure ()
+    Left caught@(ExceptionWithContext _ failure) → do
+      unless (isAsynchronous failure) $ mask_ (handler failure)
+      rethrowIO caught
+  where
+    isAsynchronous failure = case fromException failure of
+      Just (SomeAsyncException _) → True
+      Nothing → False
+
+-- | The first defect: latch it, refuse every later job, and tell every queued job so that none
+-- stays pending.
+latchFailure ∷ ReadPool → SomeException → IO ()
+latchFailure pool failure = do
+  withdrawn ← atomically $ do
+    st ← readTVar (poolState pool)
+    case psFailure st of
+      Just _ → pure []
+      Nothing → withdrawQueue pool st {psFailure = Just failure}
+  tellAll withdrawn (ReadDefect failure)
+
+-- | Close admission and withdraw what is queued, telling each job it was abandoned.
+closePool ∷ ReadPool → IO ()
+closePool pool = mask_ $ do
+  withdrawn ← atomically $ do
+    st ← readTVar (poolState pool)
+    withdrawQueue pool st {psPhase = PoolClosed}
+  tellAll withdrawn ReadAbandoned
+
+-- | Empty the queue into the withdrawn state, in the same transaction that records the new state.
+withdrawQueue ∷ ReadPool → PoolState → STM [Job]
+withdrawQueue pool st = do
+  let jobs = Map.elems (psQueue st)
+  forM_ jobs $ \job → writeTVar (jobState job) JobWithdrawn
+  writeTVar (poolState pool) st {psQueue = Map.empty, psLive = psLive st - length jobs}
+  pure jobs
+
+-- | Tell every job in order; each is told whatever another's sink raised, and the first failure is
+-- raised with the others kept beside it.
+tellAll ∷ [Job] → ReadResult → IO ()
+tellAll jobs result = do
+  outcomes ← forM jobs $ \job → tryWithContext @SomeException (jobSink job result)
+  case [failure | Left failure ← outcomes] of
+    [] → pure ()
+    first : others → do
+      composed ← composeCleanup (Just first) [("content read sink", other) | other ← others]
+      rethrowIO (maybe first id composed)

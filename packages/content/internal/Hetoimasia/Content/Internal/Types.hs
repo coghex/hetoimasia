@@ -325,6 +325,13 @@ data Defect
     InventoryLimitsExceedRoot !LimitKind !Int !Int
   | -- | The scan's own records disagree with one another: an engine defect.
     InventoryInconsistent !String
+  | -- | A worker of a read pool was not started: its index. The pool's scope ends.
+    ReadWorkerNotStarted !Int
+  | -- | A job was submitted to a read pool with no reserved slot left for it.
+    ReadSubmittedWithoutSlot
+  | -- | A read pool's slot was released while every reserved slot was held by a live job, or
+    -- more slots were released than were reserved.
+    ReadSlotReleasedWhileLive
   deriving (Eq, Show)
 
 newtype ContentDefect = ContentDefect Defect
