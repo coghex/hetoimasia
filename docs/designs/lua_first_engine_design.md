@@ -6,14 +6,15 @@ quad in a rendered window, with a real logical runtime running stub content;
 mod-aware foundations without mod activation; no ECS/gameplay store.**
 This document carries request `user-het-luafirst-20261021-1435`.
 
-Design state: `exploring`
+Design state: `ready for issue processing`
 
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-P-76/Q-9 is approved by the manager under D-78, with D-80's LFE-13/LFE-26
-split and lifecycle-review requirements. The readiness audit below passes;
-the final explicit readiness record is with the manager under that process grant.
+D-81 records explicit manager readiness signoff under D-78's owner grant.
+P-76/Q-9 is approved with D-80's LFE-13/LFE-26 split and lifecycle-review
+requirements. Processing begins with the M1-only epic, then one child per
+invocation in ledger order; each complete artifact needs manager approval.
 D-79 confirms P-75/Q-8's wording and authorizes the narrow vision/prior-design
 publication; the manager owns #145 and MEMORY follow-up.
 D-77 accepts the six-part fixed M1 ceilings and worker-accounting package.
@@ -2490,6 +2491,35 @@ The manager approved coverage/dependency order with two explicit changes:
 Record/apply the split, publish the draft with docs-push, then finish the
 readiness audit. These requirements change process boundaries/evidence, not
 the accepted Lua contract, budgets, failure authority or deferred scope.
+
+### D-81. Mark the design ready and authorize one-artifact-at-a-time processing
+
+**Delivery:** readiness and tracker-processing authority; solving remains unauthorized.
+
+Authenticated manager signoff at **2026-10-22 05:43:10 UTC**:
+`het-manager`, message `aag5b9fcfmqkbdff2h26zqb7ni`, posted
+**2026-10-22 05:43:10.472 UTC**, replying to the completed audit/readiness
+request `dde6j7s7tz96tu63rf74hz3rbw`. Under D-78 and the owner's standing
+grant, the manager explicitly states:
+
+> the Lua-first M1 design is 'ready for issue processing'
+
+The manager cites the 26-slice audit, consistent ledger/dependencies, complete
+M1 contract coverage, landed reconciliation, closed #145, merged #513 and
+clean links/diff, with every behavioral decision owner-signed. Record this
+state and land it through docs-push.
+
+The manager also explicitly invokes process-design-doc in this same session:
+the new M1-only epic first, #145 as its delivered predecessor, then one child
+per invocation in ledger order. Post each complete draft in `#het-luafirst`
+and obtain `het-manager` signoff before creating it. The manager has the
+owner's standing issue-approval grant for these artifacts; escalate only design
+gaps. No blanket artifact approval is inferred. Child specs include acceptance,
+boundaries and D-80's lifecycle invariant/sweep requirements where applicable.
+The manager arranges canonical approve-issue review of filed children. Solving
+is not authorized; the manager will ask the owner separately. This explicitly
+supersedes the original no-tracker-mutation restriction only for approved
+artifacts in this request, not other issues, labels or implementation work.
 
 ## Proposals
 
@@ -7613,10 +7643,10 @@ finish the readiness audit after publication. No tracker creation occurs here.
 
 ## Readiness audit
 
-**2026-10-22, audit of the D-79/D-80 plan at `7c3a67caef`: passes.** Final
-explicit readiness recording is routed to `het-manager` under the owner's
-D-78 process grant. No further behavior choice is proposed and no owner
-question is needed unless that review identifies a design gap.
+**2026-10-22, audit of the D-79/D-80 plan at `7c3a67caef`: passes.** The audit
+landed at `8612044b22`; D-81 records explicit manager readiness signoff under
+the owner's D-78 process grant. No behavior gap remains. A future material
+design revision resets readiness and returns the changed choice to the owner.
 
 | Requirement | Evidence and disposition |
 | --- | --- |
@@ -7639,9 +7669,9 @@ owner; process signoff cannot silently relax an accepted requirement.
 
 Q-10 and the L-STATE/L-MODS/L-RELOAD/L-PRESENTATION entries remain deliberately
 deferred. They do not block M1 readiness and create no future issues now.
-Review/issue processing remains a later manager-directed workflow. Its epic
-and each child require separate tracker approval; readiness authorizes neither
-implementation nor automatic issue creation.
+D-81 now authorizes the manager-directed process-design-doc workflow. Its epic
+and each child still require separate tracker approval; readiness authorizes
+neither implementation nor automatic issue creation.
 
 ## Open questions
 
