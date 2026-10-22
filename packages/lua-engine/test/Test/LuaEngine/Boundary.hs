@@ -98,16 +98,29 @@ spec = describe "the package and import boundary" $ do
     [file <> ": " <> name | (file, name) ← imported, not (permitted name)] `shouldBe` []
     [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
 
-  it "is used by its own suite only through the two public modules" $ do
+  it "has a request sublibrary over the profile and the host's public modules, and nothing else" $ do
+    (sort <$> fieldEntries "library request" "build-depends:")
+      `shouldReturn` ["base", "bytestring", "hetoimasia-lua-engine", "hetoimasia-scripting-lua", "hetoimasia-scripting-lua:runtime-lua", "text"]
+    fieldEntries "library request" "exposed-modules:" `shouldReturn` ["Hetoimasia.LuaEngine.Request"]
+
+  it "imports, in the request sublibrary, only the profile, the host's public modules and base libraries: no private module, no content, window, GPU, console, sample or game" $ do
+    sources ← sourcesUnder "request"
+    sources `shouldSatisfy` ((>= 1) . length)
+    imported ← importedBy sources
+    [file <> ": " <> name | (file, name) ← imported, not (permittedRequest name)] `shouldBe` []
+    [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
+
+  it "is used by its own suite only through public modules: the manifest, the profile, the request adapter and the host's public interface" $ do
     sources ← sourcesUnder "test"
     sources `shouldSatisfy` ((>= 7) . length)
     imported ← importedBy sources
     [ file <> ": " <> name
       | (file, name) ← imported
       , "Hetoimasia." `isPrefixOf` name
-      , name `notElem` ["Hetoimasia.LuaEngine.Manifest", "Hetoimasia.LuaEngine.Profile", "Hetoimasia.Foundation.Time"]
+      , not (permittedSuite name)
       ]
       `shouldBe` []
+    [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
 
   it "is listed by the ordinary and CPU projects, held to -Werror, and not by the Vulkan project" $ do
     root ← above "cabal.project"
@@ -129,3 +142,20 @@ spec = describe "the package and import boundary" $ do
       "Data." `isPrefixOf` name
         || "Hetoimasia.LuaEngine." `isPrefixOf` name
         || name == "Hetoimasia.Foundation.Time"
+    permittedRequest name =
+      "Data." `isPrefixOf` name
+        || "GHC." `isPrefixOf` name
+        || name `elem` ["Hetoimasia.LuaEngine.Profile"]
+        || "Hetoimasia.Scripting.Lua." `isPrefixOf` name
+    permittedSuite name =
+      name
+        `elem` [ "Hetoimasia.LuaEngine.Manifest"
+               , "Hetoimasia.LuaEngine.Profile"
+               , "Hetoimasia.LuaEngine.Request"
+               , "Hetoimasia.Foundation.Time"
+               , "Hetoimasia.Foundation.Log"
+               , "Hetoimasia.Foundation.Resource"
+               , "Hetoimasia.Runtime.Logging"
+               , "Hetoimasia.Runtime.Supervision"
+               ]
+        || "Hetoimasia.Scripting.Lua." `isPrefixOf` name
