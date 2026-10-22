@@ -10,7 +10,7 @@
 -- profile, and an image data stream that inflates to at least the scanline
 -- bytes the header needs and at most the inflation budget. Decoding and
 -- conversion to RGBA8, and the accounting of their live buffers, are the
--- next stage's (LFE-15); see "Obligations on the decoding stage" below.
+-- next stage's (LFE-15); see "The decoding stage" below.
 --
 -- == The limits
 --
@@ -120,15 +120,15 @@
 -- one output piece; this package does not measure it. These figures are the
 -- preflight's alone: the complete decoder's workspace is not accounted here.
 --
--- == Obligations on the decoding stage
+-- == The decoding stage
 --
--- Preflight does not bound the decoder. LFE-15 must decode from
--- 'preflightSource' (or the 'preflightImageData' slices) using an inflation
--- bounded by 'inflateLimit' of 'preflightLimits' — it may not hand the bytes
--- to the unbounded general decoder, which inflates without a limit and
--- builds its full chunk list — or establish an equally bounded path for any
--- later inflation, and must account for the RGBA8 output
--- ('preflightRgba8Bytes') and its own intermediates itself.
+-- Preflight does not bound a decoder. 'Hetoimasia.Asset.Image.PngDecode.decodeBounded'
+-- is the stage that does: it decodes from 'preflightSource' (the
+-- 'preflightImageData' slices) with its own inflation, held to 'inflateLimit'
+-- of 'preflightLimits' again, never the unbounded general decoder, and
+-- accounts for the RGBA8 output ('preflightRgba8Bytes') and every
+-- intermediate it allocates. The workspace of the whole pipeline is that
+-- module's to describe.
 module Hetoimasia.Asset.Image.PngPreflight
   ( -- * Limits
     PngLimits
@@ -189,7 +189,7 @@ import Hetoimasia.Asset.Image.Internal.PngGeometry
   , interlaceOfCode
   , scanlineBytes
   )
-import Hetoimasia.Asset.Image.Internal.PngInflate (Corruption (..), Inflation (..), inflateBounded)
+import Hetoimasia.Asset.Image.Internal.PngInflate (Inflation (..), corruptionReason, inflateBounded)
 import Hetoimasia.Asset.Image.Internal.PngStructure (ColourKey (..), colourKey)
 
 -- | The resource a limit bounds, and so which limit a refusal exceeded.
@@ -208,6 +208,10 @@ data LimitKind
     LimitRgba8Bytes
   | -- | Decompressed scanline bytes, filter bytes included.
     LimitInflatedBytes
+  | -- | The pipeline's CPU payload bank, not a field of 'PngLimits': the bank
+    -- belongs to the caller's 'Hetoimasia.Asset.Image.PngDecode.PayloadAccount',
+    -- and only a decode that the account refuses names it.
+    LimitWorkspaceBytes
   deriving (Eq, Ord, Show, Enum, Bounded)
 
 -- | The seven limits as the caller states them, before validation.
@@ -325,6 +329,7 @@ limitName = \case
   LimitPixels → "pixel count"
   LimitRgba8Bytes → "RGBA8 byte"
   LimitInflatedBytes → "inflated byte"
+  LimitWorkspaceBytes → "workspace byte"
 
 -- | Why a PNG was refused: the three content classes a texture provider
 -- maps (unsupported format, invalid image, too large).
@@ -605,13 +610,6 @@ checkGeometry refuse limits w h scanline
   | otherwise = Right ()
   where
     exceeded kind = Left . refuse (ExceededLimit kind)
-
-corruptionReason ∷ Corruption → Text
-corruptionReason = \case
-  TruncatedStream → "the image data stream ends before its end marker"
-  DictionaryRequiredByStream → "the image data stream requires a preset dictionary"
-  DictionaryMismatchInStream → "the image data stream names a preset dictionary"
-  MalformedStream → "the image data stream is corrupt"
 
 number ∷ (Show a, Integral a) ⇒ a → Text
 number = Text.pack . show . toInteger
