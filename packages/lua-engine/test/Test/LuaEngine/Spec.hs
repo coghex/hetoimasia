@@ -2,6 +2,7 @@
 module Test.LuaEngine.Spec (spec) where
 
 import qualified Test.LuaEngine.Behavior as Behavior
+import qualified Test.LuaEngine.Boot as Boot
 import qualified Test.LuaEngine.Boundary as Boundary
 import qualified Test.LuaEngine.Loader as Loader
 import qualified Test.LuaEngine.Manifest.Examples as Examples
@@ -19,5 +20,6 @@ spec = describe "LuaEngine" $ do
   Tick.spec
   Profile.spec
   Behavior.spec
+  Boot.spec
   Loader.spec
   Boundary.spec

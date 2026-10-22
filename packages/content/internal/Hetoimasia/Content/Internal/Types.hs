@@ -315,6 +315,16 @@ data Defect
   -- ^ A reader was used from a thread other than the one that was lent it.
   | BadChunkSize !Int
   | ProviderDefect !NativeOp !String
+  | -- | A byte ceiling below zero was passed to a verified read.
+    BadReadCeiling !Int
+  | -- | An inventory was used with a root of another native identity than the
+    -- one it was built for.
+    InventoryRootMismatch
+  | -- | Inventory limits that the root they are used with cannot honour: the
+    -- kind, the inventory's value and the root's.
+    InventoryLimitsExceedRoot !LimitKind !Int !Int
+  | -- | The scan's own records disagree with one another: an engine defect.
+    InventoryInconsistent !String
   deriving (Eq, Show)
 
 newtype ContentDefect = ContentDefect Defect

@@ -235,7 +235,7 @@ Lua host's and runtime's public modules, which a boundary example checks.
 | Function | What it decides |
 | --- | --- |
 | `behaviorField role` | the export field a role selects: `gameplay` or `presentation`, read by raw access; nothing else in the table is looked at |
-| `exportLimits profile` | the source and identity ceilings of a VM's export modules, from the profile: `ModuleSourceBytes` (1 MiB) and `ModuleIdentitiesPerVm` (256), failed and in-progress ones counted |
+| `exportLimits profile` | the source, identity and chain ceilings of a VM's export modules and of the Lua host's module loader (LFE-9), from the profile: `ModuleSourceBytes` (1 MiB), `ModuleIdentitiesPerVm` (256), failed and in-progress ones counted, and `ModuleChainDepth` (32), the root counted; the loader holds exactly these, and `Test.LuaEngine.Loader` runs a real owner configured from the fixed profile |
 | `cadenceOf role shape` | the interval a behavior's `update` falls due on, from what its table read as, or the first `CadenceRefusal` |
 | `behaviorRequest role identity label facade name class` | the request that admits an instance of a role's behavior: the field, the injected facade and the role's rule |
 

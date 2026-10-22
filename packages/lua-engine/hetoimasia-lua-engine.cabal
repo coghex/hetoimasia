@@ -1,7 +1,7 @@
 cabal-version: 3.16
 name: hetoimasia-lua-engine
 version: 0.1.0.0
-synopsis: The Lua-first engine's manifest, fixed M1 profile and behavior selection
+synopsis: The Lua-first engine's manifest, fixed M1 profile, behavior selection and boot checkpoint
 description:
     The Lua-first engine's configuration boundary and role policy. The manifest
     and profile (LFE-3) are pure: a strict, bounded parser for the format-1
@@ -10,10 +10,14 @@ description:
     validated, smaller test profiles. The behavior selection (LFE-8) is the M1
     policy over the Lua runtime's generic behavior mechanism: which export field
     each role selects, the cadence rules and their exact conversions, and the
-    export-module ceilings the profile gives a VM. None of it opens a folder,
-    starts Lua, a worker, a window or a GPU, or performs IO. It depends on the
-    foundation's time values and the Lua host and its runtime's public modules,
-    and on no GLFW, Vulkan, console, sample or game package.
+    export-module ceilings the profile gives a VM. The boot checkpoint (LFE-6)
+    composes the parser with the generic content inventory before any authored
+    Lua: the manifest bytes parsed are the bytes the scan pinned, and every
+    declared entry names an inventoried regular file; it reads only through the
+    verified read the caller passes in. None of it starts Lua, a worker, a
+    window or a GPU. It depends on the foundation's time values, the content
+    package and the Lua host and its runtime's public modules, and on no GLFW,
+    Vulkan, console, sample or game package.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan
@@ -38,6 +42,7 @@ library
     hs-source-dirs: src
     exposed-modules:
         Hetoimasia.LuaEngine.Behavior
+        Hetoimasia.LuaEngine.Boot
         Hetoimasia.LuaEngine.Manifest
         Hetoimasia.LuaEngine.Profile
     -- The manifest's syntax, schema, tick and result types, and the profile's
@@ -56,6 +61,7 @@ library
         array >=0.5 && <0.6,
         bytestring >=0.12 && <0.13,
         containers >=0.8 && <0.9,
+        hetoimasia-content ==0.1.0.0,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-scripting-lua,
         hetoimasia-scripting-lua:runtime-lua,
@@ -70,6 +76,7 @@ test-suite lua-engine-tests
     hs-source-dirs: test
     other-modules:
         Test.LuaEngine.Behavior
+        Test.LuaEngine.Boot
         Test.LuaEngine.Boundary
         Test.LuaEngine.Loader
         Test.LuaEngine.Manifest.Examples
@@ -84,9 +91,13 @@ test-suite lua-engine-tests
         bytestring >=0.12 && <0.13,
         directory >=1.3 && <1.4,
         filepath >=1.5 && <1.6,
+        hetoimasia-content ==0.1.0.0,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-lua-engine ==0.1.0.0,
         hetoimasia-scripting-lua,
         hetoimasia-scripting-lua:runtime-lua,
+        hetoimasia-test-support ==0.1.0.0,
         hspec >=2.11 && <3,
+        process >=1.6 && <1.7,
+        temporary >=1.3 && <1.4,
         text >=2.1 && <2.2

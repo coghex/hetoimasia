@@ -11,6 +11,13 @@ import qualified Test.Content.Identity.Boundary as IdentityBoundary
 import qualified Test.Content.Identity.Mapping as IdentityMapping
 import qualified Test.Content.Identity.Reference as IdentityReference
 import qualified Test.Content.Identity.Unicode as IdentityUnicode
+import qualified Test.Content.Inventory.Aliases as InventoryAliases
+import qualified Test.Content.Inventory.Boundary as InventoryBoundary
+import qualified Test.Content.Inventory.Changes as InventoryChanges
+import qualified Test.Content.Inventory.Lifecycle as InventoryLifecycle
+import qualified Test.Content.Inventory.Limits as InventoryLimits
+import qualified Test.Content.Inventory.Reading as InventoryReading
+import qualified Test.Content.Inventory.Scan as InventoryScan
 import qualified Test.Content.Lifecycle as Lifecycle
 import qualified Test.Content.Links as Links
 import qualified Test.Content.Names as Names
@@ -35,3 +42,11 @@ spec = do
     describe "Unicode" IdentityUnicode.spec
     describe "Mapping" IdentityMapping.spec
     describe "Identity boundary" IdentityBoundary.spec
+  describe "Inventory" $ do
+    describe "Scan" InventoryScan.spec
+    describe "Limits" InventoryLimits.spec
+    describe "Changes" InventoryChanges.spec
+    describe "Aliases" InventoryAliases.spec
+    describe "Reading" InventoryReading.spec
+    describe "Lifecycle" InventoryLifecycle.spec
+    describe "Inventory boundary" InventoryBoundary.spec

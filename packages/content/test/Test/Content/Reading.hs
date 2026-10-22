@@ -141,6 +141,9 @@ spec = do
             ExceptionWithContext _ negative ← failsWith (readChunk reader (-3))
             negative `shouldBe` ContentDefect (BadChunkSize (-3))
             failureKindOf (readChunk reader 9) `shouldReturn` LimitExceeded ReadChunk 8
+            -- refused on the bound alone: nothing is allocated for a request this size
+            failureKindOf (readChunk reader maxBound) `shouldReturn` LimitExceeded ReadChunk 8
+            failureKindOf (readChunk reader (10 ^ (12 ∷ Int))) `shouldReturn` LimitExceeded ReadChunk 8
             readChunk reader 8 `shouldReturn` "01234567"
 
     it "refuses a reader used after its callback, instead of reaching a reused descriptor" $

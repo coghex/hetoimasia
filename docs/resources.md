@@ -1154,6 +1154,14 @@ value and context:
 | Some | Some | The primary, with every cleanup failure retained beside it in observation order |
 | None | Some | The first cleanup failure's exception as primary, with every failure, that first one included, retained — as when only a release fails in a scope, so the outcome is the failure and inspectable cleanup evidence at once |
 
+The Lua host's module loader is a second such owner. Stopping it, or abandoning a chain after a failure,
+closes each suspended module's coroutine on the owner's thread, which runs the module's pending to-be-closed
+variables and so arbitrary Lua, and releases each source interest the supplier holds; every close and every release
+is attempted, the failures are kept, and `composeCleanup` makes the first the primary failure with the rest retained
+beside it, exactly as for the VM's own close. A failed close is terminal and is not retried. See "Ordered import
+chains" in `packages/scripting-lua/README.md` for the owner, thread, bound and release condition of everything the
+loader holds.
+
 That is the failure table above, from failures the caller caught. Each cleanup
 failure is issued a fresh identity at the call, so identities are ordered by when
 they were recorded and a payload never changes afterwards, which is the invariant
