@@ -8,6 +8,9 @@ import qualified Test.Asset.Image.Fixtures as Fixtures
 import qualified Test.Asset.Image.Ktx2 as Ktx2
 import qualified Test.Asset.Image.Mips as Mips
 import qualified Test.Asset.Image.Png as Png
+import qualified Test.Asset.Image.PngDecode as PngDecode
+import qualified Test.Asset.Image.PngDecodeBudget as PngDecodeBudget
+import qualified Test.Asset.Image.PngDecodeClient as PngDecodeClient
 import qualified Test.Asset.Image.PngPreflight as PngPreflight
 import qualified Test.Asset.Image.PngPreflightClient as PngPreflightClient
 import qualified Test.Asset.Image.PngPreflightInflation as PngPreflightInflation
@@ -24,6 +27,9 @@ spec = describe "AssetImage" $ do
   PngPreflight.spec
   PngPreflightInflation.spec
   PngPreflightClient.spec
+  PngDecode.spec
+  PngDecodeBudget.spec
+  PngDecodeClient.spec
   Bc7.spec
   Bc7Opacity.spec
   Mips.spec

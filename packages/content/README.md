@@ -12,26 +12,28 @@ of the object they actually opened, and lend the result to a callback as a
 bounded, strict reader. Once the root is open nothing is a pathname, and nothing
 is cached: when a callback returns, every descriptor it used is closed.
 
-The package reads. It creates, truncates, links and mounts nothing. It hashes
-nothing and builds no inventory: whole-folder inventory (LFE-6) is the layer
-above, which uses the traversal and read boundary documented here and the
-logical identity policy below. The native roots validate no logical path:
+The package reads. It creates, truncates, links and mounts nothing. The native
+roots hash nothing and build no inventory: whole-folder inventory and verified
+reads (LFE-6, [below](#whole-folder-inventory-and-verified-reads-lfe-6)) are the
+layer above, which uses the traversal and read boundary documented here and the
+logical identity policy. The native roots validate no logical path:
 `Hetoimasia.Content.Identity` (LFE-5, below) is the separate pure layer that
 turns a literal reference or an observed name into a logical identity, so the
 two never depend on one another.
 
 It depends on `hetoimasia-foundation`, on boot libraries (`base`, `bytestring`,
-`containers`, `stm`, `text`) and on the pinned Unicode data packages
+`containers`, `stm`, `text`), on the pinned Unicode data packages
 `unicode-data` and `unicode-transforms` (see
-[Pinned Unicode data](#pinned-unicode-data)): no Lua, graphics, console, game
-or sample package.
+[Pinned Unicode data](#pinned-unicode-data)) and, for the inventory's SHA-256, on
+`cryptohash-sha256` (see [Hash dependency](#hash-dependency)): no Lua, graphics,
+console, game or sample package.
 
 ## Layout
 
 | Component | Directory | Role |
 |---|---|---|
-| `library` | `src/` | The public facades: `Hetoimasia.Content` (native roots) and `Hetoimasia.Content.Identity` (logical identity), each a closed export list: no name constructor, no descriptor, no adapter, no seam, no constructor of a checked identity value. |
-| `library internal` (private) | `internal/` | The implementation, shared by the facades and this package's own suite and visible to no client. `Native` holds the adapter record and the test seam; `Root`, `Gate`, `Access`, `Errno` and `Types` hold the rest of the native layer; `Identity.Unicode`, `Identity.Types`, `Identity.Reference` and `Identity.Mapping` hold the identity policy. |
+| `library` | `src/` | The public facades: `Hetoimasia.Content` (native roots), `Hetoimasia.Content.Identity` (logical identity) and `Hetoimasia.Content.Inventory` (the inventory and verified reads), each a closed export list: no name constructor, no descriptor, no adapter, no seam, no constructor of a checked identity value, an inventory, a digest or a set of limits. |
+| `library internal` (private) | `internal/` | The implementation, shared by the facades and this package's own suite and visible to no client. `Native` holds the adapter record and the test seam; `Root`, `Gate`, `Access`, `Errno` and `Types` hold the rest of the native layer; `Identity.Unicode`, `Identity.Types`, `Identity.Reference` and `Identity.Mapping` hold the identity policy; `Inventory.Types`, `Inventory.Scan`, `Inventory.Read` and `Inventory.Outcome` hold the inventory. |
 | C shim | `cbits/hetoimasia_content.c` | Every raw descriptor operation, about 150 lines. Each function returns the negated `errno` on failure, so Haskell never reads `errno` after a safe foreign call. |
 | `test-suite content-tests` | `test/`, `test-cbits/` | Registered as the non-optional CPU validation group `test.content`. |
 
@@ -506,6 +508,277 @@ supplied-entry examples remain the evidence. A separately compiled client proves
 the public identity interface hides every constructor, and that the package
 names no Lua, console, game or sample dependency.
 
+## Whole-folder inventory and verified reads (LFE-6)
+
+`Hetoimasia.Content.Inventory` is the layer above the native roots and the
+identity policy: one bounded scan of the whole folder at startup, and the only
+way bytes leave an inventoried file afterwards. It composes the traversal and
+read boundary documented above with the logical identity policy, hashes every
+regular file with a streaming SHA-256, and returns one immutable `Inventory`.
+It knows no manifest schema, role, Lua module or special file name, and imports
+neither Lua nor graphics.
+
+```haskell
+inventoryLimits ∷ InventorySpec → Either InventoryLimitsRefusal InventoryLimits
+scanInventory   ∷ InventoryLimits → RootKey → ContentRoot → IO (Either InventoryFailure Inventory)
+
+inspectEntry    ∷ Inventory → ContentKey → Presence        -- Absent | PresentDirectory | PresentFile length
+bytesMatch      ∷ Inventory → ContentKey → ByteString → Bool
+listInventory   ∷ Inventory → [InventoryEntry]             -- path, kind, and for a file its length and digest
+readVerified    ∷ Inventory → ContentRoot → ContentKey → Int → IO (Either ReadFailure ByteString)
+```
+
+This is a content *version for one session*, not an atomic snapshot of the
+filesystem and not containment of a hostile one. Authors keep the folder stable
+while it boots; neither metadata checks nor a per-file hash establish that the
+whole tree was in one state.
+
+### Limits
+
+`InventorySpec` carries seven plain numbers and `inventoryLimits` checks them.
+The package holds **no default**: the M1 assembly passes the approved values
+(see `hetoimasia-lua-engine`'s `contentConfiguration`), and the suite passes the
+same numbers explicitly, plus smaller profiles through the same check.
+
+| Field | Meaning | M1 value |
+|---|---|---|
+| `specEntries` | Entries, the root and every directory and file path included | 10,000 |
+| `specSegments` | Segments of a relative path; the root is depth zero | 32 |
+| `specPathBytes` | UTF-8 bytes of a relative path, on the native/supplied and the NFC form | 1,024 |
+| `specSegmentBytes` | Bytes of one segment, on both forms | 255 |
+| `specFileBytes` | Bytes of one regular file | 64 MiB |
+| `specRootBytes` | Bytes summed over every regular-file path of a root, a hard-link alias charged once per name | 1 GiB |
+| `specBufferBytes` | The streaming read buffer, the most one read asks for | 64 KiB |
+
+KiB, MiB and GiB are powers of 1024. Every value must be at least one; the
+identity policy must accept the path, segment and segment-count limits (a
+segment no larger than the path or than a native name, so every accepted segment
+can be a native name); and one file may not be allowed more than the whole root.
+The identity policy is given an entry allowance one smaller than `specEntries`,
+because the root is not an addressable entry. The scan also requires the root it
+is given to honour the inventory: the root's read chunk must hold the buffer and
+its path depth the segment limit, or the call is refused as misuse
+(`InventoryLimitsExceedRoot`).
+
+All arithmetic is checked before anything is retained or allocated: lengths are
+compared with the budget by subtraction from what remains, never by an addition
+that could wrap. These are service bounds, not a total Lua or process memory cap.
+
+### What the scan does
+
+1. Holds the root through one `withDirectory` for the whole walk, so the root
+   cannot close under it. The root is the first entry counted.
+2. Reads a directory to its end, charging each entry against the allowance *as it
+   is read*. The entry that crosses the allowance is refused and nothing after it
+   is read, so an enormous directory is never materialized. At most the
+   remaining allowance is ever held across all active levels.
+3. Checks the listing as a whole before opening any of it: every entry is a
+   regular file or a directory (a symbolic link, FIFO, socket or device refuses
+   the scan), every name and path is valid under the identity policy and within
+   the path, segment and depth bounds, and no two siblings collide by
+   normalization or canonical caseless comparison. A refusal therefore precedes
+   any hashing in that directory.
+4. Opens the entries in the byte order of their native names, each beneath the
+   directory stream that listed it (never by pathname), so a file or directory
+   that is no longer what it was listed as is a changed mapping. Directories are
+   enumerated depth first, one stream per active level.
+5. For a regular file: reads its size from the opened object, refuses it before
+   reading anything if the size exceeds the per-file limit or would take the
+   root's total past its budget, then reads exactly that many bytes in requests
+   of at most the buffer, hashing each chunk as it arrives, and probes **one
+   byte** past the end. A byte there means the file grew.
+6. After the whole walk, with every handle closed, builds the checked mapping of
+   all entries and publishes the inventory. Nothing is returned before then.
+
+There is no extension filter, ignore list, authored asset list, mod discovery or
+cross-device skip. Hidden, empty and unused files are scanned like any other.
+Nothing is decoded, parsed or evaluated, and no module-cache slot exists.
+An unused file that is malformed Lua or a malformed PNG is inventoried; an
+unused file that is unreadable, oddly named, linked or oversized refuses the
+scan.
+
+### Workspace and handles
+
+All figures follow from the accepted limits:
+
+| Resource | Bound |
+|---|---|
+| Descriptors | The root's, a stream for the root and for each directory above the deepest entry, and one file: at most `specSegments + 2` |
+| Entries retained | At most `specEntries`; the mapping, the record of facts and the observed list are each bounded by it |
+| Read workspace | One chunk of at most `specBufferBytes`, plus the single probe byte |
+| Digest state | One SHA-256 context per file in flight, a fixed small size independent of the file |
+| Bytes read beyond what a file was charged | At most one (the probe) |
+| Diagnostic evidence | The root's launch path (at most 4,096 bytes), a path of at most `specSegments + 1` components of at most 1,023 bytes each, and 64-byte excerpts from the identity policy |
+
+### What can change under a scan
+
+Detected, and refused with the path and the reason (`Changed`, or the content
+layer's own `MappingChanged`): an entry that is no longer the kind it was listed
+as, or is gone; a file whose size at open differs from the bytes read; a read
+that ends before the expected length; a byte after it; a size that differs after
+the read; an unreadable file or directory; and an unsupported native operation.
+Growth is refused after at most one byte beyond the length the file was charged
+for. A scan is never retried.
+
+Not detected, by design: an entry added to or removed from a directory *after it
+was listed*; a file edited behind the hash after it was read; an edit that keeps
+the length and lands after the last read of that file. Each is found when the
+affected file is next read through `readVerified`, or by restarting. The
+inventory records the bytes observed for each file, not an atomic snapshot of
+the tree.
+
+### Outcomes of a scan
+
+`scanInventory` returns an ordinary refusal as a `Left InventoryFailure`: the root
+(launch path and native identity), the root-relative path, and the reason.
+
+| Reason | Meaning |
+|---|---|
+| `Content kind` | The content layer's refusal: `Unreadable`, `ForbiddenLink`, `ForbiddenType`, `Unsupported`, `DirectoryCycle` (with its chain), `MappingChanged`, `LimitExceeded PathDepth` |
+| `Identity reason` | The identity policy's: an invalid name or path, a path over a bound, a sibling collision |
+| `Exceeded bound observed limit` | The entry allowance, the per-file bytes or the per-root bytes |
+| `Changed change` | `LengthChanged`, `Truncated`, `Grew` |
+
+Everything else propagates as an exception: a cancellation, misuse of the API
+(`ContentDefect`), a defect of the native provider, and **any ordinary refusal
+that carries retained cleanup evidence**, which is rethrown as the exception it
+was captured as (`InventoryFailure` or `ContentFailure`) with the failed close
+beside it, readable with `cleanupFailures`. A failed close is never reported as
+missing or changed content.
+
+The package takes no logger and writes nothing: the evidence above is for the
+boundary that handles the refusal (the launcher), which reports a propagated
+failure once, as [the logging guide](../../docs/logging.md#module-authoring-guide)
+requires.
+
+### The inventory
+
+An `Inventory` is immutable and holds, for the root it was built for: the
+checked mapping of every directory and file (logical NFC path to the exact native
+components that open it), each regular file's byte length and SHA-256, the entry
+and byte totals, and the limits and root key it was built under. It holds no
+handle and no copy of any file's bytes. A path added to the folder later is not
+in it.
+
+| State | Owner | Readers | Writers | Thread | Lifetime |
+|---|---|---|---|---|---|
+| Scan state (counters, observed entries, facts) | The `scanInventory` call | The call | The call | The caller's | The call; dropped on return or failure |
+| Descriptors of a scan | The content layer's scopes | The walk | None | The caller's | Each closed once when its scope unwinds |
+| `Inventory` | The caller | Any thread | None | Any | Until dropped |
+
+There is no registry, cache, descriptor cache, worker pool or queue. The scan
+runs on the calling thread.
+
+### Questions asked of an inventory
+
+* `inspectEntry` answers from the inventory alone: `Absent` for a path the scan
+  did not see, one that differs in case, or a key of another root;
+  `PresentDirectory`; or `PresentFile length`. It returns no handle and no
+  pathname and is never a reason to skip hashing.
+* `bytesMatch` is true when the supplied bytes have the inventoried length and
+  SHA-256 of a regular file. It reads nothing.
+* `listInventory` lists every entry with its kind and, for a file, length and
+  digest, without native components.
+
+### Verified reads
+
+`readVerified inventory root key ceiling` decides in this order:
+
+1. A negative ceiling, or a root of another native identity than the inventory's,
+   is misuse and throws (`BadReadCeiling`, `InventoryRootMismatch`).
+2. From the inventory alone, before any open or read: a key that is not an
+   inventoried regular file is `ReadNotFound` (an absent path, a case mismatch, a
+   path added after startup, another root's key, **and a directory**, which never
+   opens or enumerates and never succeeds); an inventoried length above the
+   ceiling is `ReadTooLarge length ceiling`.
+3. Otherwise it opens the file by its **exact native spelling**: every directory on
+   the path, the root's included, is enumerated and the entry whose native name
+   equals the recorded one byte for byte is opened beneath the stream that listed
+   it, from the root's retained descriptor. A filesystem that folds case or treats
+   canonically equivalent names as one would resolve a different spelling to the
+   same object; here a file renamed `Hero.png` → `hero.png` is `Missing` however
+   the filesystem would have resolved the old name. The cost is one enumeration of
+   each directory on the path, stopping at the match; a different entry that vanishes
+   while the directory is listed says nothing about this file and is skipped. It then compares the opened
+   object's length with the inventoried one, and only then allocates one buffer of
+   exactly that length.
+4. It reads exactly that many bytes into the buffer in requests of at most the
+   buffer bound, hashing each chunk from the same buffer, probes one byte past the
+   end, checks the length again, and compares the SHA-256 with the inventory's.
+5. Only then does it return the buffer.
+
+| Outcome | When |
+|---|---|
+| `Right bytes` | The exact bytes, with the inventoried length and digest |
+| `ReadNotFound` | See 2 above |
+| `ReadTooLarge` | Inventoried length above the ceiling; decided before any I/O |
+| `ReadChanged Missing` | The file or a directory above it is gone, or is no longer spelled as it was observed (a case-only rename included) |
+| `ReadChanged (Retyped kind)` | The path no longer resolves to a regular file through no-follow opens: a link, a directory, a file where a directory was |
+| `ReadChanged (LengthChanged ..)`, `Truncated`, `Grew`, `DigestMismatch` | The content differs; growth past the ceiling is a content change, found at the length check before any buffer is allocated for it, or after at most the probe byte |
+| `ReadIoError kind` | An expected access or read error (`Unreadable`, `Unsupported`) |
+
+The delivered bytes are the exact bytes that were verified, from the one open
+that was hashed; there is no hash followed by a second open, no stat-only trust
+and no partially verified result. A file replaced after it was opened is still
+read from the object that was opened; the *next* read opens the path again and
+finds what is there. A timestamp-only or permission change, or identical bytes
+replacing the file at a legal path, succeeds: native inode, device, mount and
+mtime are not content-version keys, and metadata never replaces hashing. Bytes
+already delivered are an immutable `ByteString` and do not change if the file is
+edited later. There is no watcher, retarget, retry, automatic reload, placeholder
+or path addition. Cancellation, misuse, defects and failed cleanup propagate as
+exceptions, never as one of these outcomes. A content change found while the file
+is open is raised inside the open scope and becomes a value only after cleanup
+succeeded: if the close then fails, the `ReadFailure` propagates as the primary
+exception with the failed close beside it (`cleanupFailures`); a failed close after a
+successful read throws and delivers no bytes.
+
+The result and its buffer belong to the caller. The service keeps no global
+content cache; a later provider's byte banks and worker accounting are its own.
+
+### Invariants
+
+| Subject | Owner | Acquired / tracked at | Cancellation window | Release / publication check |
+|---|---|---|---|---|
+| Traversal entries | The scan state | Charged as each entry is read, before it is retained; refused at the crossing entry | Anywhere; the state is dropped | Count ≤ allowance at every charge; final mapping built under the same allowance |
+| Traversal bytes | The scan state | Charged once per file, from the opened object's size, before the first read | Anywhere | Total ≤ root budget by subtraction; actual bytes read equal the charge or the scan is refused |
+| Handles | The content layer's scopes | Each acquisition is registered in the same masked step; the walk holds the root for its duration | Anywhere | Each closed once; a failed close is evidence beside the primary failure |
+| Digest and read buffer | The file in flight | One chunk and one context per file, one result buffer per read | Anywhere | Dropped with the call; a result buffer is returned only after the digest matched |
+| Inventory publication | The caller, after return | Assembled after every handle is closed and every check passed | Before publication nothing exists | The only value returned is the complete one |
+| Verified-byte handoff | The caller | The buffer is allocated after the length check, bounded by the ceiling | Before the return nothing is delivered | Returned only after the digest matched and the handles closed |
+
+### Hash dependency
+
+SHA-256 is `cryptohash-sha256 >=0.11.102 && <0.12`, in the private library
+alone; the resolved version under the pinned `index-state` is 0.11.102.1. The
+native shader toolchain's lazy `sha256File` is evidence for the algorithm only:
+this package imports no graphics package, reads no pathname lazily and hashes no
+bytes of a file it did not read through its own open.
+
+### Evidence
+
+Native evidence runs on real files in a temporary tree; injected evidence is
+named as such and proves the handling of what the adapter reports, never the
+operating system.
+
+| Evidence | Native | Injected |
+|---|---|---|
+| Scan of root, directories, files, empty, hidden and unused files; digests against independently known vectors | yes | |
+| Entry, depth, path, segment, file and root bounds at their edges and one past; aliases charged per name | yes (the real 10,000 and 32 included) | NFC growth of a name, an enormous directory |
+| Growth, truncation, edits behind the scan, entries swapped between listing and opening | yes (mutations at named boundaries) | an early end of file; a size that disagrees after the read |
+| Hard links, outside-name edits | yes | |
+| Mounted subtrees, directory cycles | | adapter identity override (no mount is created) |
+| Unreadable file | `chmod` where the effective user cannot bypass it, reported pending as root | adapter errno (the variant Linux CI runs, as root) |
+| Read errors, close errors, unsupported opens | | adapter |
+| Non-UTF-8 and colliding names | where the filesystem holds them | supplied names |
+| Root rename, retargeted selection link, independent roots | yes | |
+| Cancellation at each scan and read gate, exit waiting, failed cleanup | yes (real descriptors, gated; the failed close is reported after a real close) | |
+| Public boundary | separately compiled client | |
+
+Which variant ran is visible in the suite's output: an example that needs a
+condition the machine lacks is reported pending with the reason, and the
+injected example beside it covers the refusal.
+
 ## Platforms
 
 Linux and macOS: the suite runs locally on macOS and on Linux CI, and
@@ -562,6 +835,9 @@ Evidence classes, by what exercises them:
 | Cancellation, drain, exit-cancel, ownership transfer | yes (real descriptors, gated) | |
 | Public boundary | separately compiled client | |
 
+The inventory examples (`--match Inventory`, with the components `Scan`, `Limits`, `Changes`, `Aliases`, `Reading`, `Lifecycle` and `Inventory boundary`) are described under
+[Evidence](#evidence-1); they reach the implementation through the private library so a recording seam can count acquisitions and closes, hold a scan or a read at a named boundary, and mutate the folder there.
+
 The identity examples (`--match Identity`) are described under
 [Evidence](#evidence); their reference data, `NormalizationTest-17.0.0` and
 `CaseFolding-17.0.0` extracts with their provenance in the header, is under
@@ -580,11 +856,11 @@ example instead of holding the process. The standalone Lua runner
 
 ## Out of scope
 
-The M1 manifest and profile; the Lua library; command-line launch integration;
-Lua admission, escalation and exit codes for the identity refusals; whole-folder
-inventory policy, numeric M1
-accounting, SHA-256 and fingerprint comparison (LFE-6); background file workers,
-request and result slots, module caches, textures and VM composition; new
-symlink exceptions, hard-link or mount bans, automatic root switching,
-snapshots, watchers, hostile-OS confinement and further platforms; privileged
-mount or device setup.
+The M1 manifest and profile (the boot checkpoint that reads them is
+`hetoimasia-lua-engine`'s); the Lua library; command-line launch integration;
+Lua admission, escalation and exit codes for the identity, inventory and read
+outcomes; background file workers, request and result slots, byte banks, module
+caches, textures and VM composition; a persistent trusted hash cache, a watcher
+or any background inventory refresh; snapshots of all bytes; new symlink
+exceptions, hard-link or mount bans, automatic root switching, hostile-OS
+confinement and further platforms; privileged mount or device setup.

@@ -14,8 +14,14 @@ description:
     separate step on an already decoded image. KTX2 files carrying RGBA8 or
     BC7 levels are read by pure code inside an accepted profile, with their
     own levels: straight-alpha colour RGBA8 is premultiplied at load, and BC7
-    blocks are returned as stored. Decoding is pure, owns no state, starts no
-    thread, reads no file and logs nothing; the library depends on no
+    blocks are returned as stored. The general decoders are pure, own no state,
+    start no thread, read no file and log nothing. An opt-in bounded path for
+    static PNGs preflights a file under caller-supplied limits and decodes it
+    with its own inflater and rasterizer, charging every buffer to a
+    caller-supplied byte account before it is allocated and leaving the account
+    as its contract says on every outcome; it is effectful only in calling that
+    account and in the inflater's native state, owns no state beyond one call,
+    starts no thread, reads no file and logs nothing. The library depends on no
     foundation, GPU, GLFW, render or runtime package.
 license: GPL-3.0-only
 license-file: LICENSE
@@ -57,6 +63,7 @@ library
         Hetoimasia.Asset.Image.Ktx2
         Hetoimasia.Asset.Image.Mips
         Hetoimasia.Asset.Image.Png
+        Hetoimasia.Asset.Image.PngDecode
         Hetoimasia.Asset.Image.PngPreflight
     -- One BC7 block's texels, the premultiplication table and its
     -- application to RGBA8 levels, the structural checks that run before
@@ -67,7 +74,10 @@ library
         Hetoimasia.Asset.Image.Internal.MipChain
         Hetoimasia.Asset.Image.Internal.PngGeometry
         Hetoimasia.Asset.Image.Internal.PngInflate
+        Hetoimasia.Asset.Image.Internal.PngRaster
         Hetoimasia.Asset.Image.Internal.PngStructure
+        Hetoimasia.Asset.Image.Internal.PngUnfilter
+        Hetoimasia.Asset.Image.Internal.PngWorkspace
         Hetoimasia.Asset.Image.Internal.Premultiply
         Hetoimasia.Asset.Image.Internal.Texels
     build-depends:
@@ -92,11 +102,16 @@ test-suite asset-image-tests
     other-modules:
         Test.Asset.Image.Bc7
         Test.Asset.Image.Bc7Opacity
+        Test.Asset.Image.DecodeSupport
         Test.Asset.Image.Fixtures
         Test.Asset.Image.Ktx2
         Test.Asset.Image.Mips
+        Test.Asset.Image.PayloadLedger
         Test.Asset.Image.Png
         Test.Asset.Image.PngBuilder
+        Test.Asset.Image.PngDecode
+        Test.Asset.Image.PngDecodeBudget
+        Test.Asset.Image.PngDecodeClient
         Test.Asset.Image.PngPreflight
         Test.Asset.Image.PngPreflightClient
         Test.Asset.Image.PngPreflightInflation

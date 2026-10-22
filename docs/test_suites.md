@@ -90,8 +90,18 @@ cabal test hetoimasia-tests --test-show-details=direct
   configuration boundary (LFE-3): the strict manifest parser's accepted examples,
   byte and nesting limits, syntax and schema refusals and exact tick conversion, the
   fixed M1 profile and its smaller validated test profiles, and the package's
-  dependency and import boundary. It performs no IO and starts no Lua, window or GPU.
-  A new manifest or profile example belongs there, in the component spec that owns it.
+  dependency and import boundary, and the manifest and entry boot checkpoint (LFE-6)
+  composed with the content inventory over real temporary folders (`Test.LuaEngine.Boot`). It
+  starts no Lua, window or GPU. A new manifest or profile example belongs there, in the
+  component spec that owns it.
+  `content-tests` (`packages/content/test/`, composed by `Test.Content.Spec`, group
+  `test.content`, the CPU project) owns the content package's anchored native roots, its
+  logical identity policy and, from LFE-6, its bounded whole-folder inventory and verified
+  reads, over temporary trees each example owns. Select a component with
+  `--test-options='--match <Component>'`: `Roots`, `Links`, `Reading`, `Enumeration`,
+  `Lifecycle`, `Opacity`, `Identity`, or `Inventory` with its components `Scan`, `Limits`,
+  `Changes`, `Aliases`, `Reading`, `Lifecycle` and `Inventory boundary`. A new inventory
+  or verified-read example belongs there, in the component that owns the behavior.
   Selectors moved with their examples: on the root suite, `--match Runtime`,
   `Resources`, `Recovery`, `Workers`, `Messaging`, `Logging`, `Failures`, and
   `GLFW` now select nothing and fail; on `runtime-tests`, `--match Supervision`

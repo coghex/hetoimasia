@@ -15,6 +15,7 @@
 module Hetoimasia.Asset.Image.Internal.Texels
   ( rgba8Level
   , binaryAlpha
+  , narrow
   )
 where
 
