@@ -66,9 +66,11 @@
 -- result is demanded, an asynchronous exception included, and the caller
 -- (the texture provider) decides its authority. In particular this does not
 -- copy 'Hetoimasia.Asset.Image.Png.decodePng', which turns every synchronous
--- exception into a refusal. The result is built strictly: demanding it to
--- weak head normal form has already done all the work, and no value in it
--- holds a suspended computation, inflater state or inflater output.
+-- exception into a refusal. The result is deeply evaluated ('rnf') before it
+-- is returned, so demanding it to weak head normal form has already done all
+-- the work: no value in it holds a suspended computation, inflater state or
+-- inflater output. That includes the caller's 'Asset', which the result
+-- carries: an exception raised by evaluating it propagates from here.
 --
 -- == What a successful preflight holds
 --
@@ -345,8 +347,11 @@ data PngRefusal = PngRefusal
   }
   deriving (Eq, Show)
 
+instance NFData PngRefusalClass where
+  rnf cls = cls `seq` ()
+
 instance NFData PngRefusal where
-  rnf refusal = refusal `seq` ()
+  rnf refusal = rnf (pngRefusedAsset refusal) `seq` rnf (pngRefusalClass refusal) `seq` rnf (pngRefusalReason refusal)
 
 -- | A PNG that passed 'preflightPng' under the limits it names, with the
 -- header information bounded decoding needs. See the module description for
@@ -371,10 +376,23 @@ data PngPreflight = PngPreflight
   }
   deriving (Eq, Show)
 
--- Every field is strict and its elements are evaluated slices and numbers,
--- so weak head normal form of the list spines (built by the scan) is whole.
 instance NFData PngPreflight where
-  rnf pf = pf `seq` foldr seq () (pfImageData pf) `seq` foldr seq () (pfTransparency pf)
+  rnf pf =
+    rnf (pfAsset pf)
+      `seq` rnf (pfLimits pf)
+      `seq` rnf (pfSource pf)
+      `seq` rnf (pfWidth pf)
+      `seq` rnf (pfHeight pf)
+      `seq` rnf (pfColour pf)
+      `seq` rnf (pfDepth pf)
+      `seq` rnf (pfInterlace pf)
+      `seq` rnf (pfScanlineBytes pf)
+      `seq` rnf (pfInflatedBytes pf)
+      `seq` rnf (pfRgba8Bytes pf)
+      `seq` rnf (pfImageData pf)
+      `seq` rnf (pfPalette pf)
+      `seq` rnf (pfTransparency pf)
+      `seq` rnf (pfColourKey pf)
 
 -- | The asset the preflight is for.
 preflightAsset ∷ PngPreflight → Asset
@@ -487,9 +505,9 @@ preflightPng limits asset bytes = strictly $ do
       , pfColourKey = colourKey (juicyColour colour) (map Lazy.fromStrict (scannedTransparency scanned))
       }
   where
-    -- The result is demanded whole: the refusal or the preflight is evaluated
-    -- (its fields are strict) before the 'Either' is returned.
-    strictly = either (\refusal → refusal `seq` Left refusal) (\done → done `seq` Right done)
+    -- The result is demanded whole: the refusal or the preflight is deeply
+    -- evaluated before the 'Either' is returned.
+    strictly = either (\refusal → rnf refusal `seq` Left refusal) (\done → rnf done `seq` Right done)
     refuse cls reason = PngRefusal {pngRefusedAsset = asset, pngRefusalClass = cls, pngRefusalReason = reason}
     checkSource
       | ByteString.length bytes > sourceLimit limits =

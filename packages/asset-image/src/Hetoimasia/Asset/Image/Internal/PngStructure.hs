@@ -30,6 +30,7 @@ import Codec.Picture.Png.Internal.Type
   , pngSignature
   , tRNSSignature
   )
+import Control.DeepSeq (NFData (rnf))
 import Data.Binary (get)
 import Data.Binary.Get (runGetOrFail)
 import Data.ByteString (ByteString)
@@ -48,6 +49,9 @@ data ColourKey
   = GreyKey !Word16
   | RgbKey !Word16 !Word16 !Word16
   deriving (Eq, Show)
+
+instance NFData ColourKey where
+  rnf key = key `seq` ()
 
 -- | The header of a PNG whose framing, header and image data stream are
 -- sound, with its colour key if it has one; or the reason they are not.

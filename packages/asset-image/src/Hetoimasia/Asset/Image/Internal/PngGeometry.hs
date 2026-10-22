@@ -19,6 +19,7 @@ module Hetoimasia.Asset.Image.Internal.PngGeometry
   )
 where
 
+import Control.DeepSeq (NFData (rnf))
 import Data.Word (Word8)
 
 -- | The five colour types the PNG specification defines.
@@ -35,6 +36,12 @@ data PngInterlace
   = InterlaceNone
   | InterlaceAdam7
   deriving (Eq, Ord, Show, Enum, Bounded)
+
+instance NFData PngColourType where
+  rnf colour = colour `seq` ()
+
+instance NFData PngInterlace where
+  rnf interlace = interlace `seq` ()
 
 -- | The colour type a header's colour-type byte names, if it names one.
 colourTypeOfCode ∷ Word8 → Maybe PngColourType

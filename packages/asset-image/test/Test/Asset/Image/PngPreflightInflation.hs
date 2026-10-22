@@ -28,6 +28,7 @@ import Data.Word (Word8)
 import Foreign.ForeignPtr (ForeignPtr)
 import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
 import Foreign.Ptr (plusPtr)
+import GHC.Exts.Heap (Box, GenClosure (..), asBox, getBoxedClosureData)
 import Hetoimasia.Asset (Asset (..), AssetId (..), Provenance (..))
 import Hetoimasia.Asset.Image.PngPreflight
 import System.IO.Unsafe (unsafePerformIO)
@@ -42,6 +43,7 @@ spec = describe "PngPreflight inflation and ownership" $ do
   boundariesSpec
   corruptionSpec
   ownershipSpec
+  deepSpec
   faultSpec
 
 -- | A 1 × 1 greyscale image needs two scanline bytes, so every stream below
@@ -222,6 +224,52 @@ ownershipSpec = describe "ownership and evaluation" $ do
           start = unsafeForeignPtrToPtr sliceFp `plusPtr` sliceOffset
           origin = unsafeForeignPtrToPtr wholeFp `plusPtr` wholeOffset
        in sliceLength == 0 || (start >= origin && start `plusPtr` sliceLength <= origin `plusPtr` wholeLength)
+
+-- | Nothing nested inside a returned value is left to be evaluated later by a
+-- consumer: weak head normal form of the result is complete evaluation.
+deepSpec ∷ Spec
+deepSpec = describe "deep evaluation of the returned value" $ do
+  it "evaluates the carried asset before returning, on every outcome" $ do
+    -- A path whose tail is an exception: a result that only reached weak head
+    -- normal form would return, and fail later in whoever reads the asset.
+    let lazyAsset = Asset (AssetId "probe") (FromFile ('x' : error "deferred path"))
+        image = header 1 1 8 0
+    forM_ [imagePng image 2, "not a PNG", assemble [ihdrChunk image, chunk "IDAT" (ByteString.pack [1 .. 9]), chunk "IEND" ""]] $ \bytes → do
+      outcome ← try (evaluate (preflightPng m1PngLimits lazyAsset bytes))
+      case outcome of
+        Left (ErrorCall message) → message `shouldBe` "deferred path"
+        Right _ → expectationFailure "the result was returned with the asset still unevaluated"
+
+  it "leaves nothing unevaluated inside the colour key, palette, transparency and image data" $ do
+    result ← evaluate (preflightPng m1PngLimits asset (imagePngWith [chunk "tRNS" (ByteString.pack [0, 128])] (header 1 1 8 0) 2 0))
+    accepted ← shouldBeAccepted result
+    preflightColourKey accepted `shouldBe` Just (GreyKey 128)
+    -- The key (down to its fields) and each retained slice are constructors,
+    -- not thunks; a slice's buffer is a byte array, so only its constructor is
+    -- examined.
+    key ← evaluate (preflightColourKey accepted)
+    keyEvaluated ← evaluatedValue (asBox key)
+    imageData ← evaluate (preflightImageData accepted)
+    transparency ← evaluate (preflightTransparency accepted)
+    slicesEvaluated ← mapM (isConstructor . asBox) (imageData <> transparency)
+    (keyEvaluated, and slicesEvaluated) `shouldBe` (True, True)
+  where
+    -- A closure that is a constructor, following the indirection an updated
+    -- thunk leaves, and not a thunk: its pointer fields too.
+    evaluatedValue ∷ Box → IO Bool
+    evaluatedValue box =
+      resolved box >>= \case
+        ConstrClosure {ptrArgs = fields} → and <$> mapM evaluatedValue fields
+        _ → pure False
+    isConstructor box =
+      resolved box >>= \case
+        ConstrClosure {} → pure True
+        _ → pure False
+    resolved box =
+      getBoxedClosureData box >>= \case
+        IndClosure {indirectee = next} → resolved next
+        BlackholeClosure {indirectee = next} → resolved next
+        other → pure other
 
 -- Faults are not content refusals.
 faultSpec ∷ Spec

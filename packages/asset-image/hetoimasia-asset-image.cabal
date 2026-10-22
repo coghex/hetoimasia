@@ -111,6 +111,7 @@ test-suite asset-image-tests
         bytestring >=0.12 && <0.13,
         deepseq >=1.5.1 && <1.6,
         filepath >=1.5 && <1.6,
+        ghc-heap >=9.14 && <9.15,
         hspec >=2.11 && <3,
         hetoimasia-asset ==0.1.0.0,
         hetoimasia-asset-image ==0.1.0.0,
