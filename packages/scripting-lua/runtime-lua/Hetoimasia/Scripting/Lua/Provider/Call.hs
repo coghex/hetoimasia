@@ -27,7 +27,7 @@ module Hetoimasia.Scripting.Lua.Provider.Call
 
 import Control.Concurrent.STM (atomically, readTVar)
 import Control.Exception (Exception, throwIO)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Data.Word (Word64)
@@ -100,11 +100,11 @@ newRequestHandles = RequestHandles <$> newIORef Nothing
 
 -- | The owner takes the registry. Answers whether it was free: a registry serves one owner.
 bindRequestHandles ∷ RequestHandles → ProviderState → IO Bool
-bindRequestHandles (RequestHandles var) service = do
-  held ← readIORef var
-  case held of
-    Just _ → pure False
-    Nothing → True <$ writeIORef var (Just service)
+bindRequestHandles (RequestHandles var) service =
+  -- One atomic step: of any number of owners that claim the registry together exactly one wins.
+  atomicModifyIORef' var $ \held → case held of
+    Just _ → (held, False)
+    Nothing → (Just service, True)
 
 -- | Whether a handle names a request the running instance holds: it exists (its settlement has
 -- not been taken, its requester has not ended) and it is the caller's. A handle that is another

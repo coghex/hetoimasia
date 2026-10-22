@@ -855,14 +855,15 @@ takeDeliveryFailure cell = do
 takeRequestFailure ∷ ICell → STM (Maybe (Text, Text, InstancePhase))
 takeRequestFailure cell = do
   state ← readTVar (icState cell)
-  case isRequestFailure state of
-    -- An instance that is ending is not failed from here: the latch is left where it is, for its settlement
-    -- to keep as the failure (or beside the failure) the instance ends with.
-    Just _ | isStopped state || isTerminal (isPhase state) → pure Nothing
-    Nothing → pure Nothing
-    Just (endpoint, reason) → do
-      writeTVar (icState cell) state {isRequestFailure = Nothing}
-      pure (Just (endpoint, reason, isPhase state))
+  pure $ case isRequestFailure state of
+    -- An instance that is ending is not failed from here: the latch is left where it is, for its settlement to
+    -- keep as the failure (or beside the failure) the instance ends with.
+    Just _ | isStopped state || isTerminal (isPhase state) → Nothing
+    Nothing → Nothing
+    -- Read and not cleared: the latch is the instance's until its failure is recorded, and recording it
+    -- marks the instance as ending, which is what keeps the latch from being applied twice. A cancellation
+    -- between this reading and that recording leaves it where the next boundary, or the settlement, finds it.
+    Just (endpoint, reason) → Just (endpoint, reason, isPhase state)
 
 -- | Admit the instance's next invocation as a task, if it has one and may start it.
 admitNext ∷ InstanceHost → ICell → IO ()
@@ -1890,7 +1891,16 @@ settleEnding ih cell = do
       -- A required request's failure that was latched and not yet applied when the instance ended is
       -- never lost: it is the failure when nothing else is primary, and evidence beside the primary when
       -- something is.
-      latched = [(StageRequest endpoint, ErrorRequest endpoint why) | Just (endpoint, why) ← [isRequestFailure state]]
+      latched =
+        [ (StageRequest endpoint, ErrorRequest endpoint why)
+        | Just (endpoint, why) ← [isRequestFailure state]
+        , not (appliedAsPrimary endpoint why)
+        ]
+      -- The failure the instance already ended with is the latched one, applied by the dispatch: it is
+      -- not told again beside itself.
+      appliedAsPrimary endpoint why = case endPrimary ending of
+        Just (Primary _ _ (ErrorRequest appliedEndpoint appliedWhy)) → appliedEndpoint == endpoint && appliedWhy == why
+        _ → False
       failure = case (endPrimary ending, shutdownFailure) of
         (Just (Primary phase stage err), secondary) → Just (describe phase stage err ([(StageShutdown, e) | Just e ← [secondary]] <> latched <> releases))
         (Nothing, secondary) | (stage, err) : rest ← latched → Just (describe (isPhase state) stage err ([(StageShutdown, e) | Just e ← [secondary]] <> rest <> releases))

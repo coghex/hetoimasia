@@ -216,7 +216,11 @@ serviceProvider service = mask_ $ do
     atomically (mapM_ (failWorkOnce identity) (take 1 failures))
     pure [(label, failure) | failure ← failures]
   atomically (reapWorks service)
-  pure (polled <> concat disposed)
+  -- A provider's credit release that raised, wherever it was made (the reap above, an ending, an epoch,
+  -- the owner's exit), is cleanup evidence here, so every path that services the provider keeps it:
+  -- the boundary's and the retirement of the instances and of the owner alike.
+  released ← atomically (takeCleanup service)
+  pure (polled <> concat disposed <> [("lua credit release", ExceptionWithContext (someExceptionContext one) one) | one ← released])
   where
     failWorkOnce identity = failWork service identity
 
@@ -254,17 +258,11 @@ providerBoundary service scheduler hasInstances leaseHost evidence onCleanupFail
   discarded ← discardAdopted service leaseHost
   defects ← atomically (takeDefects service)
   defective ← forM defects defectOf
-  -- A provider's credit release that raised is cleanup evidence: fatal under every policy.
-  released ← atomically (takeCleanup service)
-  let cleanupEvidence = [("lua credit release", ExceptionWithContext (someExceptionContext one) one) | one ← released]
-  unless (null cleanupEvidence) $ do
-    modifyIORef' evidence (<> cleanupEvidence)
-    onCleanupFailure
   served ← if hasInstances then pure False else serveWatchOnly service scheduler
   woke ← atomically (ticksWakeSettled (psTicks service) (settledNumber service))
   after ← atomically (workPendingCount service)
   raiseFirst evidence "lua provider boundary" (defective <> adopted <> discarded <> swept <> told)
-  pure (woke || served || before /= after || not (null cleanup) || adopting || not (null defects) || not (null released))
+  pure (woke || served || before /= after || not (null cleanup) || adopting || not (null defects))
 
 -- | Whether the owner has anything to do for its requests, and a wait to compose into its
 -- wait for work: a task whose request has settled, a provider's account that is no longer

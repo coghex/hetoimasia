@@ -1669,7 +1669,9 @@ advanceEpochSTM service = do
                       settledCancel = (SettledCancelled CancelledByEpochChange, CancelledByEpochChange)
                       st' = st {pSession = session, pWork = Map.adjust (\work → work {workWantsCancel = True}) identity (pWork st)}
                   pure ((if completed then endWork identity st' else st') {pDiscards = pDiscards st' <> adoptedOf record}, kept <> [released {recEnded = Just settledCancel}], cancelled + 1, discarded)
-            _ → pure (st {pWork = Map.adjust (\work → if workEnded work then work else work {workWantsCancel = True}) identity (pWork st)}, kept, cancelled, discarded + 1)
+            -- A result nobody took is discarded with the epoch: a resource built for it can no longer be reached,
+            -- and is released like one built for a request cancelled.
+            _ → pure (st {pWork = Map.adjust (\work → if workEnded work then work else work {workWantsCancel = True}) identity (pWork st), pDiscards = pDiscards st <> adoptedOf record}, kept, cancelled, discarded + 1)
 
 -- | The owner has exited: nothing is admitted after it. Every request still held is revoked,
 -- the holds on ticks are given back, the provider's work on all of them is to be told, and
