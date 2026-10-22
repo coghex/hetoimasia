@@ -69,7 +69,7 @@ concrete precondition
 - [x] LFE-5. Validate literal Unicode content identities — [#519]
 - [x] LFE-6. Build and verify the bounded whole-folder inventory — [#520]
 - [x] LFE-7. Reserve M1 requests and results atomically — [#521]
-- [ ] LFE-8. Retain VM-local module exports and captured behaviors
+- [x] LFE-8. Retain VM-local module exports and captured behaviors — [#522]
 - [ ] LFE-9. Resume ordered module import chains on their VM owner
 - [ ] LFE-10. Load raw data through owned bounded file workers
 - [ ] LFE-11. Join shared module jobs and deliver them at assigned positions
