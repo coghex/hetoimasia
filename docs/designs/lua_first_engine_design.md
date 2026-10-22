@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-58/Q-2m: filename case and Unicode identity.
+The current checkpoint is P-59/Q-2n: startup inventory and byte verification.
+D-61 accepts Unicode NFC filename identity, exact case and collision rejection.
 D-60 accepts literal root-relative paths without shortcuts or filename search.
 D-59 accepts pre-admission module-limit refusal and required dependency-limit failure.
 D-58 accepts one import chain per VM and queued-dependency evaluation timing.
@@ -1828,8 +1829,35 @@ invalid manifest entries fail boot before Lua. Invalid module-level imports
 fail the required load. Valid but missing/changed files retain their content
 failure classification. The manager presented the cost of always writing
 from the root without shortcuts. The owner chose literal paths over accepting
-and normalizing shortcuts. Filename case/Unicode rules and numeric limits
-remain separate; this decision does not supply race-safe filesystem opening.
+and normalizing shortcuts. D-61 subsequently settles filename case/Unicode
+rules; numeric limits and race-safe filesystem opening remain separate.
+
+### D-61. Unicode filenames share canonical identity but require exact case
+
+**Delivery:** M1; checked filename identity for every content service.
+
+Owner answer, **2026-10-22 01:58:39 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: Unicode names (Rec.)
+
+Authenticated relay: `het-manager`, message `hgmzif33mzxfvifszpjtwfhpv6`,
+posted **2026-10-22 01:58:39.080 UTC** in `#het-luafirst`, replying to Q-2m
+message `xjcvrcw9gytkahyu56qjmxh6js`.
+
+Accept P-58's A: UTF-8 filename segments normalize to NFC, so composed and
+decomposed forms share an identity, while lookup requires exact case.
+`Hero.png` never finds `hero.png`. Startup rejects sibling names colliding by
+normalization or canonical caseless comparison, naming both entries. A valid
+case-mismatched request is missing content under the existing failure rules.
+
+The checked inventory maps logical names to observed native entries; native
+lookup cannot override the logical identity. Module caches, fingerprints and
+content requests use the same keys, with fixed documented Unicode tables.
+File bytes are untouched. D-60's grammar and D-10/D-11's version/no-link rules
+remain. The manager presented normalization, collision checking, mappings and
+platform tests as the cost. The owner chose Unicode names over ASCII-only
+content filenames. Numeric limits and launcher-root spelling remain open.
 
 ## Proposals
 
@@ -4897,7 +4925,7 @@ path resolver; this is new content-service behavior, not an existing host API.
 
 ### P-58. Use case-sensitive Unicode filenames with canonical identity
 
-**Unapproved; active checkpoint Q-2m. Delivery: M1.** Recommend A: permit
+**A accepted by D-61 through Q-2m. Delivery: M1.** Recommend A: permit
 Unicode filenames satisfying D-60, normalize each filename segment to Unicode
 NFC for logical identity, and require case-sensitive matching of that identity.
 Apply the same conversion to manifest paths, Lua references and names found
@@ -4959,6 +4987,76 @@ data results. The meaning of NFC and canonical equivalence comes from
 separate operation described in the
 [Unicode case-mapping FAQ](https://www.unicode.org/faq/casemap_charprop.html).
 These standards supply algorithms, not an already implemented content provider.
+
+### P-59. Inventory and hash the selected content tree before starting Lua
+
+**Unapproved; active checkpoint Q-2n. Delivery: M1.** D-10 chose startup
+fingerprints rather than a private content snapshot. Recommend A: walk the
+entire selected game content root before Lua, apply D-11/D-60/D-61's entry and
+name checks, and fingerprint every regular file, including hidden files and
+files the scripts may never request. No automatic extension filter, ignore
+list or separate authored asset list is introduced. M1 still enables only the
+one explicitly selected game root, not discovered mod folders.
+
+Stream each file through a SHA-256 digest with a bounded read buffer; retain
+its root-relative identity, native-entry mapping, byte length and digest in
+a bounded inventory. Do not retain a private copy of the tree or decode images,
+parse data or evaluate modules during this pass. Fingerprinting a Lua file
+does not allocate a module-cache slot. The manifest used for launch must be
+the same bytes pinned for it, not a preliminary parse of one revision followed
+by fingerprinting another. Exact entry/path/per-file/total-byte limits belong
+to the bounds package; exceeding any inventory limit fails boot explicitly.
+
+An unreadable file, invalid entry, naming collision, detected change during
+the scan or inability to complete within those bounds fails boot with an
+attributed diagnostic, even for a file the game would not have requested.
+Do not silently omit it or automatically retry the scan. This pass precedes
+the root-init gate and the Lua loading screen under D-18; large trees can
+therefore delay any authored window. A content folder should contain the files
+the author intends to ship, rather than unrelated development/build output.
+
+On each later uncached byte load, open the inventoried path under the eventual
+race-safe no-link protocol, bound the read and verify its length and digest
+against the inventory. Only the exact verified bytes may be passed to Lua,
+the module evaluator or the image decoder; never hash one open and consume
+another unchecked read. Keep only that request's bounded buffers/resources,
+then retire them under their provider owner. Metadata alone never permits
+skipping byte verification. Same-length edits are detected; a timestamp-only
+change or replacement by identical bytes is acceptable if the checked path
+still resolves legally. This is content identity, not a promise to preserve
+the original file's native inode identity.
+
+A missing/changed inventoried file is refused under D-10 and required/optional
+load rules. A new path cannot join the session inventory. Already-cached
+modules and already-loaded textures remain their original objects, as decided;
+new data/texture requests read and verify again. No watcher, automatic reload,
+background inventory refresh or persistent trusted hash cache is added.
+
+The initial scan records the bytes observed for each file, not an atomic
+snapshot of the whole directory tree. Authors must leave the content stable
+during boot; detected concurrent changes fail boot, and later loads still
+verify their bytes. This is not hostile-filesystem containment. Root anchoring,
+link/race handling and native opening must be qualified separately; hashing
+alone does not prove that the read stayed inside its enabled root.
+
+Alternative B adds an explicit manifest list of content files and fingerprints
+only those files; unlisted files are unavailable even if present in the folder.
+It reduces hashing of unrelated files but requires authors to maintain the
+complete list, including runtime-discovered module dependencies, data and
+textures. It would need a concrete manifest/list and directory-validation
+contract before adoption; it does not allow a first-use fingerprint that
+silently accepts edits made after startup.
+
+A is recommended for the folder-based launch contract because runtime loading
+needs no duplicate authored asset/dependency list. Its cost is reading every
+file before Lua and again when requested, retaining bounded metadata, and
+failing boot for unusable unused files. Qualification covers hidden/unrequested
+files, scan failures and bounds, same-size edits, metadata-only changes,
+identical replacement, missing/new paths, matching manifest bytes, and delivery
+from the exact verified buffer. The repository already uses SHA-256 for native
+shader-toolchain fingerprints (`packages/gpu-vulkan/native/README.md`); that is
+algorithm/dependency evidence, not a content-provider implementation or a reason
+for the content service to depend on the graphics toolchain.
 
 ## Open questions
 
@@ -5057,11 +5155,18 @@ Unicode and numeric path limits were explicitly left open.
 
 #### Q-2m. Unicode filename identity or an ASCII-only content namespace?
 
-**Active checkpoint, P-58.** A (recommended): Unicode NFC identity, exact case
-lookup and startup rejection of normalized/caseless collisions, using a checked
-inventory-to-native mapping. B: printable ASCII filenames only, exact case and
-ASCII-case collision rejection. A costs Unicode handling and qualification;
-B requires renaming non-ASCII content files. Numeric path limits remain open.
+Resolved by D-61: P-58's A, Unicode NFC identity, exact case lookup and startup
+rejection of normalized/caseless collisions through a checked inventory mapping.
+Raw file bytes remain unchanged. Numeric path limits remain open.
+
+#### Q-2n. Fingerprint the whole selected content tree or an explicit file list?
+
+**Active checkpoint, P-59.** A (recommended): before Lua, hash all regular
+files in the selected root into a bounded inventory, then verify the exact
+bytes used by each later load. Hidden and unused files count; startup failures
+and scan cost precede the Lua loading screen. B: fingerprint only an authored
+manifest file list and make unlisted files unavailable. Neither route adopts
+first-use fingerprints or a private content snapshot.
 
 ### Q-3. What is the generic executable's boot and session contract?
 
