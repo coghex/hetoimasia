@@ -189,6 +189,18 @@ spec = do
         fmap inventoryFailureReason (either Just (const Nothing) outcome) `shouldBe` Just (Content ForbiddenLink)
         fmap inventoryFailurePath (either Just (const Nothing) outcome) `shouldBe` Just (names ["sub", "dangling"])
 
+    it "refuses a link among a directory's entries before hashing any sibling of it" $
+      withLayout $ \tree → do
+        populate (rootPath tree) [("a.txt", "sibling that sorts first")]
+        createSymbolicLink "a.txt" (rootPath tree </> "z-link")
+        (seam, rig) ← recordingSeam
+        outcome ← scanning seam limits (rootPath tree)
+        fmap inventoryFailureReason (either Just (const Nothing) outcome) `shouldBe` Just (Content ForbiddenLink)
+        fmap inventoryFailurePath (either Just (const Nothing) outcome) `shouldBe` Just (names ["z-link"])
+        requestSizes <$> events rig `shouldReturn` []
+        _ ← asserting rig
+        pure ()
+
     it "refuses a type that is not a file or a directory (a FIFO), without waiting for a writer" $
       withLayout $ \tree → do
         populate (rootPath tree) [("real.txt", "x")]

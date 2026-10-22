@@ -10,6 +10,7 @@
 module Test.Content.Inventory.Boundary (spec) where
 
 import qualified Data.ByteString.Char8 as BC
+import Data.List (isInfixOf)
 import System.Directory (createDirectory)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
@@ -52,6 +53,12 @@ spec = describe "Inventory package boundary" $ do
         ExitSuccess → expectationFailure ("the client compiled, so the private library is reachable:\n" <> clientOutput outcome)
       clientOutput outcome `shouldContain` "hidden package"
       clientOutput outcome `shouldContain` "hetoimasia-content-0.1.0.0:internal"
+
+  it "names its hash dependency once, with the qualified bounds, and no graphics toolchain" $ do
+    cabal ← readFile "hetoimasia-content.cabal"
+    [line | line ← lines cabal, "cryptohash-sha256" `isInfixOf` line]
+      `shouldBe` ["        cryptohash-sha256 >=0.11.102 && <0.12,"]
+    [line | line ← lines cabal, "gpu-vulkan" `isInfixOf` line || "shader-toolchain" `isInfixOf` line] `shouldBe` []
 
   it "accepts and runs a client that scans, asks, and reads verified bytes through the public interface alone" $
     withTree $ \tree →
