@@ -301,8 +301,8 @@ lookupPath mapping path = walk [] (NonEmpty.toList (pathSegments path)) (mapping
               }
         _ → walk (before <> [nodeNative node]) rest (nodeChildren node)
 
--- | Every entry the mapping can address, supplied or implied, in the order of
--- their logical paths.
+-- | Every entry the mapping can address, supplied or implied, depth first, the
+-- children of each directory in the byte order of their NFC names.
 mappingEntries ∷ NativeMapping → [MappedEntry]
 mappingEntries mapping = walk [] [] (mappingTree mapping)
   where
