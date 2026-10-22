@@ -12,7 +12,8 @@ Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
 P-76/Q-9 is approved by the manager under D-78, with D-80's LFE-13/LFE-26
-split and lifecycle-review requirements. Final readiness audit follows.
+split and lifecycle-review requirements. The readiness audit below passes;
+the final explicit readiness record is with the manager under that process grant.
 D-79 confirms P-75/Q-8's wording and authorizes the narrow vision/prior-design
 publication; the manager owns #145 and MEMORY follow-up.
 D-77 accepts the six-part fixed M1 ceilings and worker-accounting package.
@@ -101,9 +102,9 @@ inserts new LFE-26 after LFE-13, preserving LFE-14–LFE-25 IDs and their order.
 - **Done when:** P-40's acceptance is met: actual textured output with offscreen
   and native-window evidence, real async/lifecycle/error behavior, orderly quit,
   and the two-instance integration test through the new bindings/composition.
-  D-74–D-77 settle commands, APIs and bounds; one-PR slice boundaries remain
-  open. A state call
-  reports unavailability and ends the session through protected cleanup.
+  D-74–D-77 settle commands, APIs and bounds; D-80 settles one-PR boundaries.
+  A state call reports unavailability and ends the session through protected
+  cleanup.
 - **Users and operators:** game and mod authors, the owner running their
   content, and maintainers of the reusable engine and its Lua interfaces.
 - **Arc label:** None proposed.
@@ -174,6 +175,15 @@ No build, probe or desktop session ran for this draft.
   unchecked. #500 is closed; the only open issues remain #145 and #446.
   P-75 proposes an explicit scope revision, not a claim that the old completion
   condition has been met. No new overlapping Lua-first epic was found.
+- Final read-only readiness refresh, **2026-10-22**, after publication
+  `7c3a67caef`: #145 is closed under the confirmed title "Establish trusted UI
+  and gameplay Lua execution" (closed 05:32:13 UTC); its body preserves the
+  completed/deferred split and no longer requires all thirty-one deliveries.
+  The manager also completed the separate MEMORY reconciliation, PR #513,
+  merged at `aa378b04d38298320121a2a56751dcca4e511e85` (05:36:41 UTC).
+  The only open issue is #446; there is no overlapping open M1 epic. The
+  designer made neither tracker nor MEMORY mutation. Vision and prior-design
+  reconciliation, this plan and D-79/D-80 are published at `7c3a67caef`.
 
 ## Desired experience and scope
 
@@ -188,7 +198,7 @@ boot, filtering, content loading, instance ownership, clocks, failure handling
 and window/texture/2D scene integration remain. Mod activation and compatibility,
 general input, widgets/fonts, advanced presentation and hot-swap are later work
 whose designs do not block M1. D-74–D-77 settle the concrete M1 interface and
-bounds; vision/epic reconciliation and delivery order remain to be settled.
+bounds; D-79/D-80 settle vision/epic reconciliation and delivery order.
 D-42's runtime reconciliation applies
 within D-43's delivery allocation; earlier broader scope is historical.
 
@@ -7601,6 +7611,38 @@ not permission to relax the contract.
 D-79 releases the wording/publication hold. D-80 supplies manager Q-9 signoff;
 finish the readiness audit after publication. No tracker creation occurs here.
 
+## Readiness audit
+
+**2026-10-22, audit of the D-79/D-80 plan at `7c3a67caef`: passes.** Final
+explicit readiness recording is routed to `het-manager` under the owner's
+D-78 process grant. No further behavior choice is proposed and no owner
+question is needed unless that review identifies a design gap.
+
+| Requirement | Evidence and disposition |
+| --- | --- |
+| Observable goal/completion | P-40/D-43: actual Lua quad with a real logical stub, async services, protected cleanup, offscreen/native output and two-instance qualification; LFE-22–LFE-25 complete integration evidence. |
+| Scope and exclusions | D-41–D-43 and delivery tags preserve later state/mod/hot-swap/input/presentation work; state guard is terminal, not an M1 store. |
+| Settled M1 behavior | D-5–D-77 plus accepted P-38/P-40 and scope precedence cover filtering, roots, modules, lifecycle, clocks, services, schemas, numeric limits and accounting. Historical "later question" references resolve through these later decisions; they are not new active choices. |
+| Approved process decomposition | D-80 records manager signoff under D-78, LFE-13/LFE-26 split and review-invariant requirements. All 26 titles match the ledger; every dependency precedes its consumer, including LFE-26 inserted after LFE-13. |
+| Compatibility and migration | Existing host/runner/sample contracts and CPU floor remain; new M1 profile/API is explicit. No save schema, data migration, replay guarantee or compatibility range is invented for deferred arcs. |
+| Ownership/failure/evidence | Each slice names its consumer boundary, owner/test family and observable acceptance. D-80 requires invariant tables and same-shape sweeps on lifecycle work. Pixel/native evidence is required, not inferred from headless success. |
+| Vision and prior arc | D-79 text landed in vision and old Lua design at 7c3a67caef. Confirmed blocks match P-75 verbatim; old D-23/D-27 paragraphs and seven unfinished confinement IDs remain preserved. |
+| Tracker deduplication | Live #145 is closed under revised trusted scope; only #446 remains open and is unrelated to full-image quad delivery. New M1 epic uses the completed foundation and awaits authorized processing. |
+| Durable record and checks | No missing local Markdown link targets; git diff whitespace check passed; ledger/dependency and #145 24-delivered/7-deferred counts checked. No runtime, build, native, memory-bound or performance proof is claimed by this documentation audit. |
+
+Remaining engineering obligations are assigned to slices, not unanswered
+product decisions: choose pinned compatible parser/Unicode/codec mechanisms,
+prove no-follow native adapters and bounded decode allocations, extend narrow
+Lua admission/evaluation interfaces, and qualify the actual runtime/graphics
+composition. A failed proof that requires changing behavior returns to the
+owner; process signoff cannot silently relax an accepted requirement.
+
+Q-10 and the L-STATE/L-MODS/L-RELOAD/L-PRESENTATION entries remain deliberately
+deferred. They do not block M1 readiness and create no future issues now.
+Review/issue processing remains a later manager-directed workflow. Its epic
+and each child require separate tracker approval; readiness authorizes neither
+implementation nor automatic issue creation.
+
 ## Open questions
 
 ### Q-1. Which filtered standard-library profile applies to every script?
@@ -7933,10 +7975,10 @@ initial-world option. Do not continue this question in the current milestone.
 
 ### Q-6. Which services and UI behavior does Lua drive in this arc?
 
-Under D-43, settle M1 window/texture/2D scene bindings, time, diagnostics,
-readiness, lifecycle and native close/resize behavior. General input, text/
-widgets, advanced presentation, 3D/audio are later work. Haskell retains native
-threading and GPU lifetime obligations; M1 needs concrete safe boundaries.
+Resolved for M1 by D-44–D-77, including exact schemas and numeric bounds.
+General input, text/widgets, advanced presentation, 3D/audio are later work.
+Haskell retains native threading and GPU lifetime obligations. The following
+subquestions preserve each individual answer and its original scope.
 
 #### Q-6a. Are graphics/input services presentation-only or available to both roles?
 
@@ -8120,7 +8162,7 @@ Resolved by D-80 under D-78's manager process authority: the plan is accepted
 with LFE-13 split, new LFE-26 and explicit lifecycle invariant/sweep requirements.
 Mod activation, state, general input and hot-swap remain outside M1. No new
 persistence/migration behavior is introduced. This is plan signoff, not issue
-creation or PR approval; final readiness audit follows.
+creation or PR approval; the readiness audit above records the final checks.
 
 ### Q-10. Investigate deliberate script hot-swapping
 
@@ -8205,7 +8247,7 @@ D-43 makes this document's eventual epic and `LFE-N` slices M1-only.
 Later design areas remain recorded here for continuity, without blocking the
 M1 epic or being silently scheduled inside it. P-40 records the approved allocation.
 
-**Accepted under P-76/D-80; final readiness audit pending.** Each section below
+**Accepted under P-76/D-80; readiness audit recorded above.** Each section below
 is one issue/worktree/reviewable code PR, including its own focused tests.
 Documentation lands through docs-push and is linked from that PR before review;
 it is not a separate implementation slice or a reason to rerun CI. No slice
