@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-71/Q-13: the concrete launch command and manifest.
+The current checkpoint is P-72/Q-14: module, behavior and request API schemas.
+D-74 accepts the five-part concrete launch-command and JSON manifest package.
 D-73 defers Lua window-size reads and resize callbacks from M1.
 D-72 accepts an idempotent whole-session quit request that returns normally.
 D-71 accepts bounded print/warn output without a separate Lua logging API.
@@ -2231,6 +2232,32 @@ The manager presented the lack of automatic centering or fitting on resize
 as the cost. The owner chose deferral over a UI-only size poll and directed
 the design onward to concrete API/manifest/bounds, vision/#145 reconciliation
 and one-PR delivery slices. Native resize/retirement qualification remains.
+
+### D-74. Use the approved run command and strict format-1 JSON manifest
+
+**Delivery:** M1 concrete launcher contract.
+
+Owner answer, **2026-10-22 03:30:12 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> Approve all five (Rec.)
+
+Authenticated relay: `het-manager`, message `cj72dswwkm9h684q8i5pgj6gwi`,
+posted **2026-10-22 03:30:12.443 UTC** in `#het-luafirst`, replying to Q-13
+message `ysx9eiayd4gnpd8r6npuy9p99w`.
+
+Accept all five P-71 parts: `hetoimasia run [--] GAME_ROOT` and compatibility
+with existing commands; bounded strict root `hetoimasia.json`; the format-1
+schema/stable ASCII ID; optional role/clock/entry declarations with the default
+pair and common-entry fallback; and quoted exact decimal `tick_seconds` with
+nanosecond range and no default. The examples, invalid-input rules and absence
+of M1 mod declarations are part of that concrete contract.
+
+The manager summarized all five parts, the minimal JSON example and the costs:
+no comments, unknown fields fail, quoted time without an exact `1/60` fraction,
+and strict parser work. The offered revision route mentioned TOML/YAML, command
+spelling and a rate in Hz; the owner selected none and approved the package.
+This does not yet approve the Lua function/result schemas or remaining bounds.
 
 ## Proposals
 
@@ -6161,7 +6188,7 @@ contracts, then Q-8 vision/#145 reconciliation and Q-9 delivery slices.
 
 ### P-71. Fix the M1 launch command and strict declarative JSON manifest
 
-**Unapproved; active checkpoint Q-13. Delivery: M1.** This is one proposed
+**All five parts accepted by D-74 through Q-13. Delivery: M1.** This is one
 five-part contract for explicit package signoff, not five inferred decisions.
 It makes D-13/D-14/D-16 concrete without implementing L-MODS or moving cadence
 out of Lua. Recommend approving all five parts below, or revising the named
@@ -6302,6 +6329,213 @@ fallbacks, unsupported fields/revisions/mod declarations, anchored manifest
 fingerprinting, path/ID refusals, exact time endpoints and unchanged old commands.
 No game-specific Haskell, new tracker artifact or execution probe is required
 to approve this authored-data contract.
+
+### P-72. Fix module exports, behavior authoring and the shared request protocol
+
+**Unapproved; active checkpoint Q-14. Delivery: M1.** Recommend approving the
+following five-part core Lua API contract as a package, or revising named
+parts. These names become actual API spellings only on approval. The next
+package fills in data/texture/window/scene/time/status function schemas using
+this protocol, then fixes remaining bounds and provides the full quad example.
+
+#### 1. Modules and behavior tables
+
+Each source chunk runs in its own filtered module environment and returns
+exactly one plain export table with no metatable. Global assignments are
+private to that module; shared exports and mutable standard-library tables
+remain subject to the trusted same-VM model. This is not hostile-code isolation.
+Exports may contain ordinary Lua functions/tables, including Lua table cycles;
+they are not serialized, deeply copied or constrained to the deferred state
+store's value schema. D-7's rejected cycles are import dependency cycles, not
+ordinary Lua table graphs. A missing/non-table/multiple return or metatable on
+the export table is a sticky required-module failure.
+
+The selected `gameplay` or `presentation` export must itself be a plain table.
+Its only permitted fields are `init`, `update`, `shutdown`, `every_ticks` and
+`every_seconds`, read without invoking metamethods. Hook fields are absent or
+functions. Gameplay with update allows `every_ticks`, a positive whole number
+defaulting to 1, and refuses `every_seconds`; presentation with update requires
+positive finite `every_seconds` and refuses `every_ticks`. Without update,
+either cadence field is an error. The existing exact cadence/elapsed rounding
+and numeric-range details are finalized in the bounds package, not inferred
+from this naming choice. No `run`, setup, resize or event-subscription hook is
+introduced. An update-free behavior remains valid but M1 supplies no public
+event subscription API to wake it.
+
+Validate/capture the selected hook references and cadence before init, once
+for the instance's life. Later mutation of the exported behavior table cannot
+replace a running instance's hooks or cadence; mutable upvalues and ordinary
+module/self state remain Lua-owned. Other export keys are unrestricted library
+exports and unselected role exports are not treated as active behaviors.
+Put helper functions outside the behavior table and per-instance data in self.
+
+#### 2. Instance self and API access
+
+Create a fresh ordinary `self` table for each instance, initially containing
+`self.api`. Call `init(self, api)`, `update(self, dt_seconds)` and
+`shutdown(self, reason)`; the init argument is the same facade initially stored
+in `self.api`. This makes API access possible even when init is omitted. The
+facade includes copied `role`, `content_id` and opaque session-scoped
+`instance_id` strings plus the narrow service namespaces. It is not a native
+pointer, public registry or general instance-control handle.
+
+Each facade's service closures remain bound to its instance, checking the
+active execution phase/instance on every call. Passing another instance's
+facade or handles through a shared export does not grant authority; such calls
+are ordinary Lua errors before native action. Metadata and Lua table mutation
+cannot change engine attribution, grants or stored hook references. Scripts
+may overwrite their own `self.api` or facade fields as ordinary Lua data but
+must retain needed references themselves. That does not mutate the facade of
+another instance or any private Haskell service registration.
+
+The facade is supplied by the entry adapter; Haskell still injects narrow
+services, with no application-wide EngineEnv/service locator. General module
+top level receives only the filtered library/import/output surface and the
+unavailable-state boundary whose exact spelling follows in the service package.
+Keeping a facade in a module does not waive D-8's module-phase restrictions.
+`dt_seconds` keeps D-17's logical/elapsed meaning. Shutdown reason spelling and
+failure/status records are finalized with the service package.
+
+#### 3. Content addresses and module calls
+
+Expose `import(path [, root_id])` in each module environment. The default root
+is captured from that module, even when its helper function later calls import
+inside another instance's hook; it is never relative to the source directory.
+Explicit root IDs override it. This avoids a helper importing a different
+module merely because a different instance called the helper. Only the game's
+root is enabled in M1; a syntactically valid but unknown/disabled root ID is an
+ordinary argument error, without filesystem work. Paths and IDs keep D-60/
+D-61/D-74 validation and normalization. No native path or search fallback.
+
+During engine-managed module evaluation, import may suspend the loader until
+the dependency exports are ready. In hooks it returns the same already-loaded
+export table immediately. A valid uncached or still-loading hook lookup raises
+an ordinary `module_not_ready` Lua error, starts no work and never waits. A
+known failed module remains failed: importing it is a required-module failure,
+latched for the active instance or enclosing module evaluation even if caught;
+it cannot become a successful retry or optional lookup.
+
+Expose `api.content.module(path [, options])` for hook-requested loading.
+Options is an absent-or-plain table accepting only `root` and `tick_offset`.
+Here default root means the facade's instance content ID, because this is an
+instance-owned request. A shared library needing its own different root must
+name it explicitly; this distinction from the module-bound import is part of
+the contract. The logical offset defaults to 1 under D-67; presentation refuses
+the field. Modules accept no `optional` option. New loads, joins and cached
+success/failure follow D-7/D-57–D-59; even a cached request's result uses its
+assigned logical position. Immediate successful import remains separate from
+the request's later settlement. Bad arguments and pre-admission permanent
+module limits raise ordinary Lua errors; accepted dependency failures remain
+required failures under D-52.
+
+#### 4. Common admission and one-shot result schema
+
+All new request-producing functions use dot calls, returning two values:
+`request, nil` on acceptance, or `nil, {code="busy", message=TEXT}` for D-53's
+recoverable capacity refusal. No work/handle exists in the busy case. The
+request is an opaque instance-owned handle, not a numeric ID, forged table or
+resource whose GC triggers native release. Retain it until its terminal result
+is consumed; losing the Lua reference does not reclaim capacity early.
+
+Use the following common operations for module/data/texture/window requests:
+
+| Operation | Return and effect |
+| --- | --- |
+| `api.request.ready(request)` | Boolean settlement readiness; consumes nothing. |
+| `api.request.take(request)` | One of the records below; terminal take invalidates the request handle. |
+| `api.request.wait(request)` | No results; cooperatively resumes when settled, without consuming. Update-only in the exposed M1 lifecycle; init/shutdown refused. |
+| `api.request.cancel(request)` | `"cancelled"` when this call wins settlement, otherwise `"already_settled"`; terminal cancellation still needs take. |
+
+Exact take records:
+
+```lua
+{status = "pending"}
+{status = "success", value = VALUE}
+{status = "failure", error = {code = CODE, message = TEXT, root = ID, path = PATH}}
+{status = "cancelled"}
+```
+
+Fields absent from a variant are absent, not false or empty placeholders.
+Failure root/path are present for content requests and omitted for window
+creation; service-specific value shapes and error-code vocabulary follow in
+the next package. Message text is bounded diagnostic context, not a string
+authors should parse. The record/envelope is a fresh Lua table. Mutating it
+does not alter request settlement; resource handles inside retain their owners.
+`take` on pending consumes nothing; consuming any terminal variant ends the
+handle. Foreign/consumed/wrong-kind handles and wrong phases are ordinary Lua
+errors before work. Catching does not clear D-52's independently latched
+required failure; ordinary running Lua is not promised a chance to inspect a
+required failure before its owner stops. Cancellation after failure cannot
+erase it. Capacity remains held until consumption plus actual retirement.
+
+#### 5. Module values stay inside their VM
+
+For a successful module request, `value` is precisely the cached export table,
+the same table that import returns in that VM. Mutating that table is shared
+module state under D-7; only the outer take record is a copy. Do not serialize
+functions/tables through the host's copied provider-value channel. Native
+workers deliver verified source/results to the owner; the VM-owned loader and
+waiter machinery retain/retrieve exports on that owner thread and release
+their own references on consumption/end. The VM cache keeps its approved
+VM-lifetime reference; another VM receives its separately evaluated exports.
+Cancellation consumes no exports and never poisons the shared job/cache.
+
+Core authoring example (no rendering yet):
+
+```lua
+local util = import("lua/util.lua")
+local function start_room(self)
+  local request, refusal = self.api.content.module(
+    "lua/room.lua", {tick_offset = 3})
+  if not request then
+    assert(refusal.code == "busy")
+    return -- self.want_room stays true for a later update
+  end
+  self.request, self.want_room = request, false
+end
+return {
+  gameplay = {
+    every_ticks = 1,
+    init = function(self, api)
+      self.util = util
+      self.want_room = true
+      start_room(self)
+    end,
+    update = function(self, dt_seconds)
+      local api = self.api
+      if self.want_room then start_room(self) end
+      if self.request and api.request.ready(self.request) then
+        local result = api.request.take(self.request)
+        self.request = nil
+        if result.status == "success" then self.room = result.value end
+      end
+    end
+  },
+  presentation = {} -- valid idle behavior; the full quad follows next package
+}
+```
+
+The example shows module/result identity, role exports and an authored busy
+retry in later updates. Once accepted, the request's assigned position stays
+fixed; it is not retimed on subsequent updates. This is not the complete demo
+and adds no engine-side retry mechanism.
+
+**Recommendation and costs.** One consistent request protocol makes data and
+graphics calls predictable while preserving module identity. Costs: strict
+behavior fields, dot-call conventions and explicit take/ownership accounting;
+two explicit default-root rules for lexical imports versus instance requests;
+known failed imports are fatal rather than a probing API; and new VM-side
+export retention beyond the current copied-value provider interface. The
+owner may revise any part, including names, before approval.
+
+**Evidence/qualification.** The [Lua host](../../packages/scripting-lua/README.md)
+already has private module environments, fresh self, per-instance request
+ownership and ready/take/wait/cancel, but does not already expose this return-
+table loader or facade/result schema. Tests must distinguish fresh envelopes
+from shared exports, captured hooks from mutable tables, module-root import
+from instance-root requests, failed-cache from not-ready lookup, wrong owners,
+phase errors and the two-instance/shared-VM path. No new native/GPU probe is
+needed to qualify these Lua-facing ownership and value contracts.
 
 ## Open questions
 
@@ -6859,12 +7093,18 @@ by D-44.
 
 ### Q-13. Approve the concrete M1 launch command and manifest package?
 
-**Active checkpoint, P-71.** Approve all five parts, or identify revisions:
-`hetoimasia run [--] GAME_ROOT` with unchanged existing commands; bounded strict
-`hetoimasia.json`; format-1 fields and stable ASCII ID; optional role/clock/entry
-array with default pair/common-entry fallback; exact decimal-text seconds and
-nanosecond range with no tick default. This leaves the Lua API and remaining
-resource/time bounds for the next package, not implicit implementation choices.
+Resolved by D-74: all five P-71 parts approved, including the command,
+strict JSON schema, role/entry selection and exact decimal-text tick duration.
+The Lua API and remaining bounds are not implicitly approved by that answer.
+
+### Q-14. Approve the core Lua module, behavior and request API package?
+
+**Active checkpoint, P-72.** Approve all five parts or identify revisions:
+plain module exports/captured strict behaviors; fresh self with an instance-bound
+API facade; module-bound import versus instance-owned asynchronous module
+requests; common admission and one-shot result records; VM-local shared export
+values inside copied result envelopes. Service-specific functions/records and
+remaining bounds follow before the complete quad/API contract is settled.
 
 ## Verification strategy
 
