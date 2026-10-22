@@ -319,6 +319,18 @@ boundsSpec = describe "the value limits" $ do
       run owned "assert(#checked.echo_list({1, 2, 3}) == 3)"
     logged fx >>= (`shouldBe` ["echo_list", "echo_list"])
 
+  it "builds the refusal under a bound of its own, so a small valid byte limit does not make a caught refusal a fault" $ do
+    fx ← newFx
+    -- Two integers fit in 18 bytes; every refusal message below is longer.
+    withOwnerOf (limited fx 18 8 4096) $ \owned → do
+      run owned (caught "checked.add(1.5, 2)" "checked.add: argument 1: a float where an integer is declared")
+      run owned "assert(checked.add(1, 2) == 3)"
+      writeIORef (fxPhase fx) "init"
+      run owned (caught "checked.in_phase(1)" "checked.in_phase: wrong phase: init")
+      writeIORef (fxReason fx) (Text.replicate refusalReasonLimit "r")
+      run owned (caught "checked.vet(1)" ("checked.vet: " <> Text.replicate refusalReasonLimit "r"))
+    logged fx >>= (`shouldBe` ["add"])
+
   it "accepts a copy at the depth limit and refuses one past it" $ do
     fx ← newFx
     withOwnerOf (limited fx 65536 2 4096) $ \owned → do

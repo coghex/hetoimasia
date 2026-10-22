@@ -229,12 +229,16 @@ valueHandler boundary vm space binding state restore = do
       raiseOrdinary reason = do
         lua_settop state entry
         let message = qualified <> ": " <> reason
-        encoded ← case encodeValues context limits [VText message] of
+            -- The owner's limits bound what crosses for the script's values; the
+            -- diagnostic has a bound of its own, so that a small, valid limit cannot
+            -- turn a refusal the script caught into a fault of the call.
+            allowance = either (const limits) id diagnosticLimits
+        encoded ← case encodeValues context allowance [VText message] of
           Left rule → do
             effect ← current
             faulted (ValueRefused (ValueRefusal Results 1 [] rule 0)) effect
           Right bytes → pure bytes
-        pushed ← pushValues state limits encoded 1
+        pushed ← pushValues state allowance encoded 1
         case pushed of
           Pushed → do
             serviceCollector state
@@ -407,6 +411,12 @@ valueHandler boundary vm space binding state restore = do
                         refuseResults 2 [] (RuleBytesLimit commandReasonLimit)
                     | otherwise → pure [VBoolean False, VText reason]
 
+
+-- | What the message of an ordinary refusal is encoded and pushed under: one string
+-- of at most a qualified name (129 bytes), a separator and 'refusalReasonLimit' bytes,
+-- with room to spare, whatever limits the owner crosses its script's values under.
+diagnosticLimits ∷ Either LimitsRefusal ValueLimits
+diagnosticLimits = valueLimits 1024 2 8
 
 -- | The refusal of an opted-in binding that Lua is to see as an ordinary error:
 -- why, bounded. Thrown by the checks before an action and caught around them and
