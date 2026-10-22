@@ -526,7 +526,7 @@ scanChunks limits refuse bytes
           case header' of
             Just ihdr → Right Scanned {scannedHeader = ihdr, scannedImageData = reverse idat', scannedPalette = palette', scannedTransparency = reverse transparency'}
             Nothing → Left (refuse MalformedPng "the PNG has no IHDR chunk")
-      | otherwise = go next (count + 1) header' idat' palette' transparency'
+      | otherwise = body `seq` go next (count + 1) header' idat' palette' transparency'
       where
         remaining = total - offset
         declared = word32 offset
