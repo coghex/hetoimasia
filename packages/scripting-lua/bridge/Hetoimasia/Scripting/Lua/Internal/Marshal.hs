@@ -31,6 +31,7 @@ module Hetoimasia.Scripting.Lua.Internal.Marshal
   , newTaskCoroutine
   , taskThread
   , threadYieldable
+  , collectorRunning
   , SegmentOutcome (..)
   , Segment (..)
   , resumeSegment
@@ -111,6 +112,10 @@ foreign import ccall unsafe "hetoimasia_lua_values.h hetoimasia_lua_task_thread"
 -- Unsafe: it only reads a thread's status.
 foreign import ccall unsafe "hetoimasia_lua_values.h hetoimasia_lua_yieldable"
   c_yieldable ∷ State → IO CInt
+
+-- Unsafe: it only reads the collector's state.
+foreign import ccall unsafe "hetoimasia_lua_values.h hetoimasia_lua_collector_running"
+  c_collector_running ∷ State → IO CInt
 
 foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_task_resume"
   c_task_resume
@@ -492,6 +497,12 @@ taskThread state slot = c_task_thread state (fromIntegral slot)
 -- the state it is given: a callback asks it of the thread that called it.
 threadYieldable ∷ State → IO Bool
 threadYieldable state = (/= 0) <$> c_yieldable state
+
+-- | Whether the collector is running. Lua holds it while one of a script's
+-- finalizers runs, and a script can stop it, so a handler that finds it stopped
+-- cannot rule out that a finalizer is its caller. Runs no Lua.
+collectorRunning ∷ State → IO Bool
+collectorRunning state = (/= 0) <$> c_collector_running state
 
 -- | How a segment of a task ended.
 data SegmentOutcome

@@ -109,10 +109,17 @@ import Data.Maybe (isJust)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
+import qualified Data.Text as Text
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Resource (composeCleanup)
 import Hetoimasia.Scripting.Lua.Internal.Binding (installRegistration)
-import Hetoimasia.Scripting.Lua.Internal.Boundary (Boundary (Boundary))
+import Hetoimasia.Foundation.Failure (operation, throwFailure)
+import Hetoimasia.Scripting.Lua.Internal.Boundary
+  ( Boundary (Boundary)
+  , FaultOperation (OpenLibraries)
+  , FaultReason (ProfileWithLibraries)
+  , blankFault
+  )
 import Hetoimasia.Scripting.Lua.Internal.Call (ChunkName, callGlobal, evalChunk)
 import Hetoimasia.Scripting.Lua.Internal.Module (Host, ModuleSource, loadModule, newHost)
 import Hetoimasia.Scripting.Lua.Internal.Registration
@@ -126,7 +133,8 @@ import Hetoimasia.Scripting.Lua.Internal.Registration
   , qualifiedName
   )
 import Hetoimasia.Scripting.Lua.Internal.Value (ValueLimits, defaultValueLimits)
-import Hetoimasia.Scripting.Lua.Internal.Library (Library)
+import Hetoimasia.Scripting.Lua.Internal.Fault (luaComponent)
+import Hetoimasia.Scripting.Lua.Internal.Library (Library, LibraryProfile)
 import Hetoimasia.Scripting.Lua.Internal.Vm
   ( CallbackScope
   , FinalizerPolicy (FinalizersAllow)
@@ -137,6 +145,7 @@ import Hetoimasia.Scripting.Lua.Internal.Vm
   , closeVm
   , noCallbackScope
   , openLibraries
+  , openProfile
   , vmIdentity
   )
 
@@ -151,7 +160,12 @@ import Hetoimasia.Scripting.Lua.Internal.Vm
 data OwnerConfig = OwnerConfig
   { ownerLibraries ∷ ![Library]
     -- ^ Exactly the standard libraries the VM opens, in order. The empty list
-    -- opens none.
+    -- opens none. Must be empty when 'ownerProfile' is set.
+  , ownerProfile ∷ !(Maybe LibraryProfile)
+    -- ^ A library profile the VM opens in place of an explicit list, filtered
+    -- before 'ownerAfterLibraries' and so before any binding, initial chunk or
+    -- module. Nothing by default. A profile together with a non-empty
+    -- 'ownerLibraries' ends construction with a typed refusal.
   , ownerChunks ∷ ![(ChunkName, ByteString)]
     -- ^ The initial chunks, loaded and run in order inside the lifetime.
   , ownerAllowlist ∷ !(Set Text)
@@ -192,6 +206,7 @@ defaultOwnerConfig ∷ [Library] → OwnerConfig
 defaultOwnerConfig libraries =
   OwnerConfig
     { ownerLibraries = libraries
+    , ownerProfile = Nothing
     , ownerChunks = []
     , ownerAllowlist = Set.empty
     , ownerBudget = Nothing
@@ -253,7 +268,7 @@ withOwnedVm config body = mask $ \restore → do
   host ← newHost vm boundary
   ran ← tryWithContext @SomeException $ restore $ do
     ownerAfterAllocation config vm
-    openLibraries vm (ownerLibraries config)
+    openStandardLibraries boundary vm config
     ownerAfterLibraries config vm
     -- Before any initial chunk or module can run, and inside the lifetime, so a
     -- failure here ends construction like any other step.
@@ -269,6 +284,21 @@ withOwnedVm config body = mask $ \restore → do
   -- is left pending to supersede it when the owner stops being masked.
   late ← pendingCancellation
   finish ran closed late
+
+-- | Open the owner's standard libraries: its explicit list, or its profile.
+--
+-- A profile owns the whole set, so one selected together with a list is refused
+-- here, before a library opens and so before any authored code can run, and the
+-- refusal ends construction like any other failed step: the VM is closed through
+-- the same close.
+openStandardLibraries ∷ HasCallStack ⇒ Boundary → Vm → OwnerConfig → IO ()
+openStandardLibraries boundary vm config = case ownerProfile config of
+  Nothing → openLibraries vm (ownerLibraries config)
+  Just profile
+    | null (ownerLibraries config) → openProfile vm profile
+    | otherwise →
+        throwFailure luaComponent (operation "open-libraries") [("profile", Text.pack (show profile))] $
+          blankFault boundary OpenLibraries (ProfileWithLibraries profile (ownerLibraries config))
 
 -- | Take every cancellation still pending against the owner, and answer the
 -- first, which is the one the owner raises. Later ones are absorbed by it: the

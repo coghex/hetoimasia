@@ -306,6 +306,7 @@ test-suite lua-host-tests
         Test.Lua.Boundary.Installation
         Test.Lua.Boundary.Lifecycle
         Test.Lua.Boundary.Modules
+        Test.Lua.Boundary.Recoverable
         Test.Lua.Boundary.Registration
         Test.Lua.Boundary.Release
         Test.Lua.Boundary.Requests
@@ -325,6 +326,7 @@ test-suite lua-host-tests
         Test.Lua.Owner.Independence
         Test.Lua.Owner.Matrix
         Test.Lua.Owner.Ownership
+        Test.Lua.Owner.Profile
         Test.Lua.Owner.Scope
         Test.Lua.Owner.Shutdown
         Test.Lua.Owner.Spec
@@ -447,6 +449,7 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Lifecycle.Spec
         Test.LuaRuntime.Lifecycle.Support
         Test.LuaRuntime.Readiness
+        Test.LuaRuntime.Recoverable
         Test.LuaRuntime.Request.Admission
         Test.LuaRuntime.Request.Epoch
         Test.LuaRuntime.Request.Failures

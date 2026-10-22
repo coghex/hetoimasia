@@ -11,6 +11,7 @@ import qualified Test.Lua.Boundary.Independence
 import qualified Test.Lua.Boundary.Installation
 import qualified Test.Lua.Boundary.Lifecycle
 import qualified Test.Lua.Boundary.Modules
+import qualified Test.Lua.Boundary.Recoverable
 import qualified Test.Lua.Boundary.Registration
 import qualified Test.Lua.Boundary.Release
 import qualified Test.Lua.Boundary.Requests
@@ -20,6 +21,7 @@ import qualified Test.Lua.Boundary.Values
 spec ∷ Spec
 spec = describe "the value boundary" $ do
   Test.Lua.Boundary.Bindings.spec
+  Test.Lua.Boundary.Recoverable.spec
   Test.Lua.Boundary.Registration.spec
   Test.Lua.Boundary.Release.spec
   Test.Lua.Boundary.Values.spec

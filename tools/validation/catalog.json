@@ -303,6 +303,28 @@
       "optional": false
     },
     {
+      "id": "test.lua-engine",
+      "description": "Portable Hspec contracts for the Lua-first engine's pure configuration boundary (LFE-3): the strict format-1 launch manifest parsed from supplied bytes, and the fixed M1 profile of limits. The manifest examples with both role orders, the common and per-role entry fallbacks, every one-role variant and the absent vms, with the selected and every declared entry and the exact bytes kept; the byte limit at 65,536 and one past it and the nesting limit at eight containers and nine, each told apart from the schema refusal a well-formed document would get; refused byte order marks, malformed UTF-8, unpaired surrogate escapes, comments, trailing commas and data, non-object roots, control characters, invalid escapes, numbers and literals; duplicate keys after escape decoding at every object, decided before any map is built; the exact numeric reading of format, which accepts every token whose decimal value is exactly 1 and refuses the rest without binary floating point or size-derived work; the identifier grammar, every schema refusal, and a refusal that does not depend on member order; tick_seconds as exact decimal nanoseconds with both endpoints, every forbidden form and overflow; every fixed profile value against an independently written expectation in its unit, the derived values, valid smaller injected profiles and profiles refused as not positive, above the fixed value, overflowing or inconsistent; and the package and import boundary. It runs through the CPU project, performs no IO and starts no Lua, window or GPU.",
+      "command": [
+        "cabal",
+        "test",
+        "--project-file",
+        "cabal.project.cpu",
+        "hetoimasia-lua-engine:lua-engine-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-lua-engine:test:lua-engine-tests",
+      "inputs": [
+        "cabal.project.common",
+        "cabal.project.cpu"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": false
+    },
+    {
       "id": "test.content",
       "description": "Headless Hspec contracts for the content package's anchored native roots, over temporary trees each example owns. A launch path that is relative, absolute or reached through symbolic links opens one directory whose identity and descriptor the root keeps, so renaming it, replacing its old path or retargeting the selection link never switches an open root, while a root opened afterwards selects the new target; every component below the root, the final file included, is opened without following a symbolic link and its type checked on the opened object, with internal links to the same root, to outside targets and dangling ones refused, a component or the final file swapped for a link at a controlled open boundary refused without the outside sentinel ever being read (a check-then-open control reads it under the same swap), a FIFO refused without waiting for a writer and a socket classified as a forbidden type whichever errno the native open reports, plus device kinds, permission denial and missing entries through the adapter seam; strict bounded reads and metadata from the opened object across short reads, read errors, early stop and a pathname replaced mid-read; enumeration with each entry's own kind, lossless non-UTF-8 names (a real one where the filesystem accepts it, a supplied one elsewhere), both names of a hard link as separate paths, entries that changed since they were observed, a depth bound, a directory that reports another device still traversed, and a directory repeating on its active ancestor chain refused with its chain while a repeat on another branch is allowed (identity injected, since no mount is created); and the lifecycle: a root closes only after every borrowing operation has retired and refuses new ones once its exit begins, a cancellation of the exiting thread neither shortens that wait nor is lost, cancellation at each boundary and with a cancellation pending as an open returns closes every descriptor exactly once through the stream when it owns the descriptor, a failed close is retained beside the primary failure and the remaining closes still run, two roots and two concurrent borrowers do not disturb one another, and repeated success, refusal and cancellation return to the starting descriptor count by exact acquisition and close accounting at the adapter seam. A separately compiled client proves the public API hides the name constructor, raw descriptors, reader constructors and the private adapter library. It runs through the CPU project and needs no display.",
       "command": [

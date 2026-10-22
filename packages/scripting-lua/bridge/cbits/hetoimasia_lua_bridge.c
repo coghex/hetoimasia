@@ -350,6 +350,62 @@ int hetoimasia_lua_requiref(
   return lua_pcall(L, 3, 1, 0);
 }
 
+/* Remove `name` from the table at absolute index `table`, by raw access so no
+** metamethod runs. The key is allocated here, which is why this is only called
+** from a protected body. */
+static void remove_field(lua_State *L, int table, const char *name)
+{
+  lua_pushstring(L, name);
+  lua_pushnil(L);
+  lua_rawset(L, table);
+}
+
+/* The library table `name` of the globals, which the profile opened first. A
+** missing or replaced one is a failure of the profile, not a silent skip: the
+** filtered names would otherwise survive in it. */
+static int library_table(lua_State *L, int globals, const char *name)
+{
+  lua_pushstring(L, name);
+  lua_rawget(L, globals);
+  if (!lua_istable(L, -1)) {
+    return luaL_error(L, "the M1 library profile found no %s library to filter", name);
+  }
+  return lua_gettop(L);
+}
+
+static int filter_m1_body(lua_State *L)
+{
+  int globals;
+  int library;
+
+  lua_settop(L, 0);
+  lua_pushglobaltable(L);
+  globals = lua_gettop(L);
+  remove_field(L, globals, "load");
+  remove_field(L, globals, "loadfile");
+  remove_field(L, globals, "dofile");
+  remove_field(L, globals, "collectgarbage");
+
+  library = library_table(L, globals, "string");
+  remove_field(L, library, "dump");
+  lua_settop(L, globals);
+
+  library = library_table(L, globals, "math");
+  remove_field(L, library, "random");
+  remove_field(L, library, "randomseed");
+  lua_settop(L, globals);
+  return 0;
+}
+
+int hetoimasia_lua_filter_m1(lua_State *L)
+{
+  if (!lua_checkstack(L, 8)) {
+    return LUA_ERRMEM;
+  }
+  lua_pushcfunction(L, filter_m1_body);
+  return lua_pcall(L, 0, 0, 0);
+}
+
 /*
 ** The debug library, without `sethook`.
 **
