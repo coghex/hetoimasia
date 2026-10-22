@@ -78,7 +78,7 @@ concrete precondition
 - [x] LFE-26. Expose UI status, quit and the unavailable-state guard — [#528]
 - [x] LFE-14. Preflight static PNG structure and bounded inflation — [#529]
 - [x] LFE-15. Decode the approved PNG variants within accounted workspace — [#530]
-- [ ] LFE-16. Own texture pipeline lanes, leases and byte reservations
+- [x] LFE-16. Own texture pipeline lanes, leases and byte reservations — [#531]
 - [ ] LFE-17. Finish texture requests through real GPU readiness
 - [ ] LFE-18. Create and retire instance-owned windows asynchronously
 - [ ] LFE-19. Validate and copy the fixed M1 scene schema
