@@ -57,6 +57,7 @@ module Test.LuaRuntime.Admission.Support
   , leaseSummary
   , awaitLeaseSummary
   , heldBy
+  , lineStarting
   ) where
 
 import Control.Concurrent (yield)
@@ -284,7 +285,7 @@ adNamespace fixture =
               CancelAlreadySettled → pure [VText "already_settled"]
           _ → pure []
     , withPrecondition serving (waitOperation "wait" WaitSettlement [SCapability "areq"])
-    , stateOperation "lease_use" [SCapability "res"] [SText] $ \arguments → case arguments of
+    , recoverableRefusals $ stateOperation "lease_use" [SCapability "res"] [SText] $ \arguments → case arguments of
         [VCapability handle] → do
           name ← withLease (afLeases fixture) (capabilityKey handle) pure
           note fixture ("use " <> name)
@@ -411,6 +412,11 @@ prelude =
   , "    local ok, err = pcall(ad.take, 42)"
   , "    local ok2, err2 = pcall(ad.ready)"
   , "    out = c .. ' ' .. tostring(ok) .. ' ' .. tostring(ok2)"
+  , "  elseif p.op == 'pbad' then"
+  , "    local _, arity = pcall(ad.take)"
+  , "    local _, kind = pcall(ad.take, 5)"
+  , "    local _, wrong = pcall(ad.lease_use, self.hs[key])"
+  , "    out = tostring(arity) .. ' | ' .. tostring(kind) .. ' | ' .. tostring(wrong)"
   , "  elseif p.op == 'block' then"
   , "    fx.block(key)"
   , "    out = 'unblocked'"
@@ -476,7 +482,6 @@ initWaiter =
          , "function shutdown(self, reason)"
          , "  local ok, err = pcall(ad.wait, self.hs['a'])"
          , "  fx.record('shutdown wait ' .. tostring(ok) .. ' ' .. tostring(err))"
-         , "  local r = ad.start('path', 99, nil)"
          , "end"
          ]
 
@@ -595,3 +600,11 @@ heldBy fixture owner name = do
   identity ← idOf (afBase fixture) name
   d ← diagnostics owner
   pure (Map.findWithDefault 0 (instanceLocal identity) (rdHeldBy d))
+
+-- | Wait, without sleeping, for a line a script recorded that starts with this, and answer it.
+lineStarting ∷ AFix → Text → IO Text
+lineStarting fixture prefix = do
+  seen ← history fixture
+  case filter (Text.isPrefixOf prefix) seen of
+    line : _ → pure line
+    [] → yield >> lineStarting fixture prefix
