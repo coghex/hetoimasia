@@ -57,6 +57,7 @@ library
         Hetoimasia.Asset.Image.Ktx2
         Hetoimasia.Asset.Image.Mips
         Hetoimasia.Asset.Image.Png
+        Hetoimasia.Asset.Image.PngPreflight
     -- One BC7 block's texels, the premultiplication table and its
     -- application to RGBA8 levels, the structural checks that run before
     -- JuicyPixels, and the conversion of its output to RGBA8; and the mip
@@ -64,6 +65,8 @@ library
     other-modules:
         Hetoimasia.Asset.Image.Internal.Bc7Block
         Hetoimasia.Asset.Image.Internal.MipChain
+        Hetoimasia.Asset.Image.Internal.PngGeometry
+        Hetoimasia.Asset.Image.Internal.PngInflate
         Hetoimasia.Asset.Image.Internal.PngStructure
         Hetoimasia.Asset.Image.Internal.Premultiply
         Hetoimasia.Asset.Image.Internal.Texels
@@ -93,6 +96,11 @@ test-suite asset-image-tests
         Test.Asset.Image.Ktx2
         Test.Asset.Image.Mips
         Test.Asset.Image.Png
+        Test.Asset.Image.PngBuilder
+        Test.Asset.Image.PngPreflight
+        Test.Asset.Image.PngPreflightClient
+        Test.Asset.Image.PngPreflightInflation
+        Test.Asset.Image.PreflightSupport
         Test.Asset.Image.Premultiply
         Test.Asset.Image.Refusals
         Test.Asset.Image.Spec
@@ -103,6 +111,7 @@ test-suite asset-image-tests
         bytestring >=0.12 && <0.13,
         deepseq >=1.5.1 && <1.6,
         filepath >=1.5 && <1.6,
+        ghc-heap >=9.14 && <9.15,
         hspec >=2.11 && <3,
         hetoimasia-asset ==0.1.0.0,
         hetoimasia-asset-image ==0.1.0.0,

@@ -1,0 +1,136 @@
+cabal-version: 3.16
+name: hetoimasia-content
+version: 0.1.0.0
+synopsis: Anchored, no-follow native content roots for Hetoimasia
+description:
+    Resolves one launcher-selected folder once, keeps the directory it actually
+    named open for the rest of a scope, and reads beneath it through
+    directory-relative, no-follow native operations: every component below the
+    root, the final file included, is opened without following a symbolic link,
+    and its type is checked on the object that was opened. Directory
+    enumeration and file reads are bounded, strict and borrowed from the root's
+    lifetime, which closes only after every borrowing operation has retired.
+    Hard-linked files and mounted subtrees are content; a directory that
+    repeats on its own ancestor chain is refused with its path chain. The
+    library depends on the foundation and on base libraries alone: no
+    scripting, graphics, console, game or sample package. It hashes nothing,
+    validates no logical path and builds no inventory.
+license: GPL-3.0-only
+license-file: LICENSE
+author: Vincent Coghlan
+maintainer: Vincent Coghlan
+category: Game
+build-type: Simple
+tested-with: GHC ==9.14.1
+extra-doc-files: README.md
+extra-source-files: test/data/*.txt
+
+source-repository head
+    type: git
+    location: https://github.com/coghex/hetoimasia.git
+    subdir: packages/content
+
+common language
+    default-language: GHC2024
+    default-extensions: UnicodeSyntax OverloadedStrings
+    ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
+
+-- The public facade: a closed export list over the private implementation
+-- below. It exposes no constructor of a name, no descriptor, no adapter and no
+-- seam.
+library
+    import: language
+    hs-source-dirs: src
+    exposed-modules:
+        Hetoimasia.Content
+        Hetoimasia.Content.Identity
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        hetoimasia-content:internal
+
+-- The implementation, shared by the facade and by this package's own suite
+-- alone; being private, it is visible to no client. Its modules:
+--   Types: names, identities, limits, failures and defects.
+--   Native: the adapter record, the boundary hooks of the test seam, and the
+--     POSIX adapter over the C shim.
+--   Errno: the small errno classification.
+--   Gate: the admission gate that lets a root close only after every
+--     borrowing operation has retired.
+--   Root: root selection, anchoring, qualification and the draining exit.
+--   Access: directory-relative no-follow opens, enumeration and reads.
+library internal
+    import: language
+    visibility: private
+    hs-source-dirs: internal
+    exposed-modules:
+        Hetoimasia.Content.Internal.Access
+        Hetoimasia.Content.Internal.Errno
+        Hetoimasia.Content.Internal.Gate
+        Hetoimasia.Content.Internal.Identity.Mapping
+        Hetoimasia.Content.Internal.Identity.Reference
+        Hetoimasia.Content.Internal.Identity.Types
+        Hetoimasia.Content.Internal.Identity.Unicode
+        Hetoimasia.Content.Internal.Native
+        Hetoimasia.Content.Internal.Root
+        Hetoimasia.Content.Internal.Types
+    c-sources: cbits/hetoimasia_content.c
+    include-dirs: cbits
+    cc-options: -std=c11 -Wall -Wextra -Werror
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        unicode-data ==0.8.0,
+        unicode-transforms ==0.4.0.1,
+        hetoimasia-foundation ==0.1.0.0
+
+-- This package's own contracts, registered as the CPU validation group
+-- `test.content`. Every example runs against a temporary tree the example
+-- owns, headless, and reaches the implementation through the private library
+-- so a recording seam can count acquisitions and closes and hold an operation
+-- at a named boundary. The public-boundary examples compile a separate client
+-- against the public library alone.
+test-suite content-tests
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: test
+    other-modules:
+        Test.Content.Enumeration
+        Test.Content.Identity.Boundary
+        Test.Content.Identity.Mapping
+        Test.Content.Identity.Reference
+        Test.Content.Identity.Support
+        Test.Content.Identity.Unicode
+        Test.Content.Lifecycle
+        Test.Content.Links
+        Test.Content.Names
+        Test.Content.Opacity
+        Test.Content.Reading
+        Test.Content.Roots
+        Test.Content.Spec
+        Test.Content.Support
+        Test.Content.Types
+    c-sources: test-cbits/hetoimasia_content_test.c
+    include-dirs: test-cbits
+    cc-options: -std=c11 -Wall -Wextra -Werror
+    ghc-options: -threaded -rtsopts
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        directory >=1.3 && <1.4,
+        filepath >=1.5 && <1.6,
+        hspec >=2.11 && <3,
+        process >=1.6 && <1.7,
+        stm >=2.5.3 && <2.6,
+        temporary >=1.3 && <1.4,
+        text >=2.1 && <2.2,
+        unix >=2.8 && <2.9,
+        hetoimasia-content ==0.1.0.0,
+        hetoimasia-content:internal,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-test-support ==0.1.0.0

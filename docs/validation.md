@@ -329,13 +329,27 @@ since they were observed, and a directory repeating on its active ancestor
 chain refused with its chain; and the lifecycle, where a root closes only after
 every borrowing operation has retired, a cancellation never shortens that wait
 or is lost, every descriptor is closed exactly once on every path, and a failed
-close is retained beside the primary failure. Mount crossings and directory
+close is retained beside the primary failure. The logical identity policy is
+checked on pure values and supplied entries: the literal root-relative grammar
+with every refusal (slash shape, dot segments, backslash, colon, NUL and Cc
+controls at their boundaries, every ill-formed UTF-8 form, none decoded with
+replacement), composed and decomposed spellings sharing one NFC identity while
+case stays significant, the byte and segment-count bounds at and one beyond
+each edge for the raw and the NFC form, and a checked mapping to the exact
+observed native components that refuses sibling collisions by normalization or
+canonical caseless comparison, stops at its entry allowance and publishes no
+partial map; the Unicode tables are pinned at 17.0.0 and checked against the
+`NormalizationTest` and `CaseFolding` reference files of that version. A real
+temporary tree enumerated by the content service covers the names the file
+system can hold, and reports the others pending beside the supplied-entry
+evidence. Mount crossings and directory
 cycles use injected native identities, because the suite creates no mount, and
 permission-bit cases run only where the effective user lacks the override
 (Linux CI runs as root, which ignores the bits), so an injected permission
 denial covers them there. It is mandatory but outside the floor, like
 `test.math`, and runs through `cabal.project.cpu`: the library depends on the
-foundation and on boot libraries, and the suite needs no display. See
+foundation, on boot libraries and on the pinned Unicode data packages, and the
+suite needs no display. See
 [the package's contract](../packages/content/README.md).
 
 `test.asset-image` runs the asset-image package's own suite: committed fixture
