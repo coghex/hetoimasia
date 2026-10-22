@@ -22,7 +22,6 @@ import Data.Map.Strict (Map)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
-import Data.Word (Word64)
 import Hetoimasia.Runtime.Supervision (RuntimeControl, awaitSupervised)
 import Hetoimasia.Scripting.Lua.Instance (InstancePhase (Active))
 import Hetoimasia.Scripting.Lua.Loading
@@ -108,12 +107,6 @@ awaitDrained endpoint = do
   diagnostics ← loaderDiagnostics endpoint
   if loadingSubmitted diagnostics == 0 && loadingNotified diagnostics == 0 then pure () else yield >> awaitDrained endpoint
 
--- | Wait, without sleeping, until the owner holds this tick for a due chain.
-awaitHeld ∷ LoaderEndpoint → Maybe Word64 → IO ()
-awaitHeld endpoint wanted = do
-  diagnostics ← loaderDiagnostics endpoint
-  if loadingHeld diagnostics == wanted then pure () else yield >> awaitHeld endpoint wanted
-
 spec ∷ Spec
 spec = describe "the module loader on a scheduled owner" $ do
   it "waits for a source while the owner serves its hooks, and resumes on the owner when another thread's source arrives" $
@@ -172,23 +165,25 @@ spec = describe "the module loader on a scheduled owner" $ do
         loaderOutcome endpointA (ident "held") >>= (`shouldBe` Just OutcomeAdmitted)
 
   describe "the logical tick" $ do
-    it "holds the next tick while a due chain is unfinished, and lets it go when the chain ends" $
+    it "keeps the due tick open while a due chain is unfinished, and lets it go when the chain ends" $
       bounded . withLoader 4 [echoer] $ \fixture rig control owner endpoint → do
         have rig "due" ["local late = import('late')", "return { late = late }"]
         submitRoot endpoint (request "due") (DueTick 1) >>= (`shouldBe` SubmitAccepted)
-        -- The root owes tick 1, so the tick after it is held from the submission on, before the
-        -- owner has looked at anything; the root has not begun, for its tick has not been reached.
-        loaderDiagnostics endpoint >>= \found → loadingHeld found `shouldBe` Just 2
-        grantOne control owner
+        -- The root owes tick 1 from the submission on, before the owner has looked at anything; the
+        -- root has not begun, for its tick has not been reached.
+        loaderDiagnostics endpoint >>= \found → loadingHeld found `shouldBe` Just 1
+        _ ← grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1)
         awaitAsked rig 2
-        awaitHeld endpoint (Just 2)
+        atomically (scheduledTick (scheduledEndpoint owner)) >>= (`shouldBe` 1)
+        -- Tick 1 is applied and is not complete: its grant is outstanding while the chain waits.
+        atomically (ticksOutstanding (scheduledEndpoint owner)) >>= (`shouldBe` 1)
         -- The next grant is made and not applied; the owner serves another instance meanwhile.
         _ ← grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1)
         _ ← admit fixture owner "a" (moduleNamed "echoer")
         awaitCount fixture 1
         atomically (scheduledTick (scheduledEndpoint owner)) >>= (`shouldBe` 1)
-        atomically (ticksOutstanding (scheduledEndpoint owner)) >>= (`shouldBe` 1)
-        -- The source arrives; the chain ends; the tick is let go and the grant is applied.
+        atomically (ticksOutstanding (scheduledEndpoint owner)) >>= (`shouldBe` 2)
+        -- The source arrives; the chain ends; the tick is complete and the next grant is applied.
         _ ← notifySource endpoint (ident "late") (SourceVerified (Text.encodeUtf8 "return {}"))
         outcome ← awaitOutcome control endpoint "due"
         outcome `shouldSatisfy` \case OutcomeSettled (ModuleReady _) → True; _ → False
@@ -201,27 +196,28 @@ spec = describe "the module loader on a scheduled owner" $ do
         have rig "later" ["return {}"]
         submitRoot endpoint (request "later") (DueTick 5) >>= (`shouldBe` SubmitAccepted)
         grantOne control owner
-        -- Tick 5 is owed, so tick 6 is the one held; the grants before it are the example's own.
-        loaderDiagnostics endpoint >>= \found → loadingHeld found `shouldBe` Just 6
+        -- Tick 5 is owed; the grants before it are the example's own.
+        loaderDiagnostics endpoint >>= \found → loadingHeld found `shouldBe` Just 5
         _ ← grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1)
         _ ← admit fixture owner "a" (moduleNamed "echoer")
         awaitCount fixture 1
         _ ← awaitTicksComplete control owner
         atomically (scheduledTick (scheduledEndpoint owner)) >>= (`shouldBe` 2)
 
-    it "holds the due tick however many grants were queued before the owner looked, and finishes the due tick before the next begins" $
+    it "keeps the due tick open however many grants were queued before the owner looked, and finishes it before the next begins" $
       bounded . withLoader 4 [echoer, holder] $ \fixture rig control owner endpoint → do
         have rig "due" ["local late = import('late')", "return { late = late }"]
         holdOwner fixture owner
         submitRoot endpoint (request "due") (DueTick 1) >>= (`shouldBe` SubmitAccepted)
         -- Three grants are queued while the owner is inside a hook; the loader has not run.
         mapM_ (const (grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1))) [1 ∷ Int, 2, 3]
-        loaderDiagnostics endpoint >>= \found → loadingHeld found `shouldBe` Just 2
+        loaderDiagnostics endpoint >>= \found → loadingHeld found `shouldBe` Just 1
         releaseOwner fixture
         awaitAsked rig 2
-        -- Only tick 1 began: the grants that would have carried the owner past it wait.
+        -- Only tick 1 began, and it is not complete: the grants that would have carried the owner past
+        -- it wait behind it, and all three are outstanding.
         atomically (scheduledTick (scheduledEndpoint owner)) >>= (`shouldBe` 1)
-        atomically (ticksOutstanding (scheduledEndpoint owner)) >>= (`shouldBe` 2)
+        atomically (ticksOutstanding (scheduledEndpoint owner)) >>= (`shouldBe` 3)
         _ ← notifySource endpoint (ident "late") (SourceVerified (Text.encodeUtf8 "return {}"))
         outcome ← awaitOutcome control endpoint "due"
         outcome `shouldSatisfy` \case OutcomeSettled (ModuleReady _) → True; _ → False
@@ -236,25 +232,38 @@ spec = describe "the module loader on a scheduled owner" $ do
         submitRoot endpoint (request "due") (DueTick 1) >>= (`shouldBe` SubmitAccepted)
         -- Submitted again, later, before the owner drained either.
         submitRoot endpoint (request "due") (DueTick 10) >>= (`shouldBe` SubmitAccepted)
-        loaderDiagnostics endpoint >>= \found → loadingHeld found `shouldBe` Just 2
+        loaderDiagnostics endpoint >>= \found → loadingHeld found `shouldBe` Just 1
         releaseOwner fixture
-        grantOne control owner
+        _ ← grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1)
         awaitAsked rig 2
-        loaderDiagnostics endpoint >>= \found → loadingHeld found `shouldBe` Just 2
-        -- And again while the chain is suspended: still tick 1 that is owed, so tick 2 is held.
+        loaderDiagnostics endpoint >>= \found → loadingHeld found `shouldBe` Just 1
+        -- And again while the chain is suspended: still tick 1 that is owed.
         submitRoot endpoint (request "due") (DueTick 20) >>= (`shouldBe` SubmitAccepted)
         awaitDrained endpoint
-        loaderDiagnostics endpoint >>= \found → loadingHeld found `shouldBe` Just 2
+        loaderDiagnostics endpoint >>= \found → loadingHeld found `shouldBe` Just 1
         before ← length <$> logged fixture
         _ ← grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1)
         _ ← admit fixture owner "a" (moduleNamed "echoer")
         awaitCount fixture (before + 1)
         atomically (scheduledTick (scheduledEndpoint owner)) >>= (`shouldBe` 1)
+        atomically (ticksOutstanding (scheduledEndpoint owner)) >>= (`shouldBe` 2)
         _ ← notifySource endpoint (ident "late") (SourceVerified (Text.encodeUtf8 "return {}"))
         outcome ← awaitOutcome control endpoint "due"
         outcome `shouldSatisfy` \case OutcomeSettled (ModuleReady _) → True; _ → False
         _ ← awaitTicksComplete control owner
         atomically (scheduledTick (scheduledEndpoint owner)) >>= (`shouldBe` 2)
+        loaderDiagnostics endpoint >>= \found → loadingHeld found `shouldBe` Nothing
+
+    it "lets the due tick go when the owner exits with the chain unfinished" $
+      bounded . withLoader 4 [echoer] $ \_ rig control owner endpoint → do
+        have rig "due" ["local late = import('late')", "return {}"]
+        _ ← submitRoot endpoint (request "due") (DueTick 1)
+        _ ← grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1)
+        awaitAsked rig 2
+        atomically (ticksOutstanding (scheduledEndpoint owner)) >>= (`shouldBe` 1)
+        retireScheduled owner
+        _ ← awaitScheduledTerminal control owner
+        loaderOutcome endpoint (ident "due") >>= (`shouldBe` Just OutcomeStopped)
         loaderDiagnostics endpoint >>= \found → loadingHeld found `shouldBe` Nothing
 
     it "holds nothing for a chain a UI asked for" $
@@ -361,6 +370,24 @@ spec = describe "the module loader on a scheduled owner" $ do
         found `shouldSatisfy` elem "first:done"
         found `shouldSatisfy` notElem "second:ran"
         loaderOutcome endpoint (ident "second") >>= (`shouldBe` Just OutcomeStopped)
+
+    it "does not resume an importer, nor start a dependency, once a stop is asked while its dependency or the importer runs" $
+      bounded . withLoader 4 [echoer] $ \fixture rig control owner endpoint → do
+        have rig "importer" ["fx.record('importer:start')", "local dep = import('dep')", "fx.record('importer:resumed')", "return {}"]
+        have rig "dep" ["fx.record('dep:start')", "fx.block('mid')", "fx.record('dep:end')", "return {}"]
+        _ ← submitRoot endpoint (request "importer") DueUi
+        -- The dependency is running on the owner, inside its top level, with its importer suspended.
+        awaitEntered (sf fixture) "mid"
+        retireScheduled owner
+        releaseGate (sf fixture) "mid"
+        _ ← awaitScheduledTerminal control owner
+        found ← logged fixture
+        found `shouldSatisfy` elem "dep:end"
+        found `shouldSatisfy` notElem "importer:resumed"
+        loaderOutcome endpoint (ident "importer") >>= (`shouldBe` Just OutcomeStopped)
+        acquired ← readIORef (rigAcquired rig)
+        released ← readIORef (rigReleased rig)
+        length released `shouldBe` length acquired
 
   describe "a plan" $ do
     it "is refused before anything starts when its bound is below one, or the VM already names a loader" $

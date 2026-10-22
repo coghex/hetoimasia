@@ -494,11 +494,17 @@ drive loader state entry settled = loop
     config = loaderSettings loader
     limits = limitsOf loader
 
+    -- Every piece of module code the advance would run next passes through here first, so
+    -- that an owner that is stopping finds the chain where it stood.
     loop = do
-      s ← readState loader
-      case lsChain s of
-        [] → startRoot s
-        frame : _ → continueFrame frame
+      allowed ← application loader (loaderMayRun config >>= evaluate)
+      if not allowed
+        then pure BlockedNotAllowed
+        else do
+          s ← readState loader
+          case lsChain s of
+            [] → startRoot s
+            frame : _ → continueFrame frame
 
     -- The next root, if its turn has come.
     startRoot s = case Seq.viewl (lsQueue s) of

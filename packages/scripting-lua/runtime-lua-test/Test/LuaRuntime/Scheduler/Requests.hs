@@ -59,6 +59,66 @@ spec = describe "requests" $ do
       -- Tick 2 is the next one, and is not held.
       atomically (readTick (rigScheduler rig)) >>= (`shouldBe` 2)
 
+  describe "a tick the owner needs something finished before it is complete" $ do
+    it "applies the grant that reaches it and keeps that grant outstanding, with the grants behind it, until the need is met" $ do
+      rig ← newRig
+      atomically (oweTick (rigScheduler rig) 1)
+      replicateM_ 3 (granted rig 10)
+      _ ← turnsUntilIdle rig 8
+      -- Tick 1 began, and is not complete; nothing after it began.
+      atomically (readTick (rigScheduler rig)) >>= (`shouldBe` 1)
+      atomically (stepsOutstanding (rigScheduler rig)) >>= (`shouldBe` 3)
+      atomically (tickIsOwed (rigScheduler rig) 1) >>= (`shouldBe` True)
+      workAvailable rig >>= (`shouldBe` False)
+      atomically (releaseOwed (rigScheduler rig) 1)
+      workAvailable rig >>= (`shouldBe` True)
+      _ ← turnsUntilIdle rig 8
+      atomically (readTick (rigScheduler rig)) >>= (`shouldBe` 3)
+      atomically (stepsOutstanding (rigScheduler rig)) >>= (`shouldBe` 0)
+
+    it "keeps the open grant of the tick the scheduler is in when the need arrives while the grant's work runs" $ do
+      rig ← newRig
+      identity ← admit rig "a" OrdinaryClass OneShot
+      -- The task is woken by the first grant and, running in that tick, owes it.
+      script rig "a" [waitTicks "a" 1, atomically (oweTick (rigScheduler rig) 1) >> completed "a"]
+      _ ← turnsUntilIdle rig 4
+      phase rig identity >>= (`shouldBe` Just PhaseWaiting)
+      replicateM_ 2 (granted rig 10)
+      _ ← turnsUntilIdle rig 8
+      -- The task has ended, which would finish the grant; the need keeps it, and keeps the next one waiting.
+      phase rig identity >>= (`shouldSatisfy` \case Just (PhaseEnded _) → True; _ → False)
+      atomically (readTick (rigScheduler rig)) >>= (`shouldBe` 1)
+      atomically (stepsOutstanding (rigScheduler rig)) >>= (`shouldBe` 2)
+      atomically (releaseOwed (rigScheduler rig) 1)
+      _ ← turnsUntilIdle rig 8
+      atomically (readTick (rigScheduler rig)) >>= (`shouldBe` 2)
+      atomically (stepsOutstanding (rigScheduler rig)) >>= (`shouldBe` 0)
+
+    it "needs as many releases as needs, and a release past none changes nothing" $ do
+      rig ← newRig
+      atomically (oweTick (rigScheduler rig) 1 >> oweTick (rigScheduler rig) 1)
+      replicateM_ 2 (granted rig 10)
+      _ ← turnsUntilIdle rig 6
+      atomically (releaseOwed (rigScheduler rig) 1)
+      _ ← turnsUntilIdle rig 6
+      atomically (readTick (rigScheduler rig)) >>= (`shouldBe` 1)
+      atomically (releaseOwed (rigScheduler rig) 1 >> releaseOwed (rigScheduler rig) 1 >> releaseOwed (rigScheduler rig) 9)
+      atomically (tickIsOwed (rigScheduler rig) 1) >>= (`shouldBe` False)
+      _ ← turnsUntilIdle rig 6
+      atomically (readTick (rigScheduler rig)) >>= (`shouldBe` 2)
+      atomically (stepsOutstanding (rigScheduler rig)) >>= (`shouldBe` 0)
+
+    it "keeps nothing of a tick that was complete before the need arose" $ do
+      rig ← newRig
+      replicateM_ 2 (granted rig 10)
+      _ ← turnsUntilIdle rig 6
+      atomically (readTick (rigScheduler rig)) >>= (`shouldBe` 2)
+      atomically (oweTick (rigScheduler rig) 1)
+      _ ← granted rig 10
+      _ ← turnsUntilIdle rig 6
+      atomically (readTick (rigScheduler rig)) >>= (`shouldBe` 3)
+      atomically (stepsOutstanding (rigScheduler rig)) >>= (`shouldBe` 0)
+
   describe "a wait for a request" $ do
     it "is kept until the owner says the request has settled, and then wakes the task, handed nothing" $ do
       rig ← newRig

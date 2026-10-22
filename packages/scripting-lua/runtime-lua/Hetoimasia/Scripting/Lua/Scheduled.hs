@@ -399,8 +399,10 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , grantStep
   , holdTick
   , newScheduler
+  , oweTick
   , readDiagnostics
   , readTick
+  , releaseOwed
   , releaseTick
   , requestControl
   , requestWaiting
@@ -687,6 +689,8 @@ ticksFor scheduler stopping =
     { ticksNow = readTick scheduler
     , ticksHold = holdTick scheduler
     , ticksRelease = releaseTick scheduler
+    , ticksOwe = oweTick scheduler
+    , ticksOweRelease = releaseOwed scheduler
     , ticksWatch = watchTick scheduler
     , ticksOpen = do
         closed ← schedulerClosed scheduler

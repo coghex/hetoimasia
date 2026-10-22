@@ -56,6 +56,59 @@ spec = describe "stopping the loader" $ do
         (countInterestsHeld counts, countSourcesHeld counts, countQueued counts, countChainDepth counts, countEvaluating counts) `shouldBe` (0, 0, 0, 0, 0)
         released rig >>= \freed → (Set.fromList freed, length freed) `shouldBe` (Set.fromList (map ident ("held" : names)), depth + 1)
 
+  describe "an owner that stops allowing evaluation" $ do
+    it "does not resume an importer when its dependency finishes after the stop began, leaves it for the stop, and resumes it if allowed again" $
+      withRig $ \rig owned → do
+        _ ← supply rig owned "a" ["trace.mark('a:start')", "local b = import('b')", "trace.mark('a:got ' .. b.name)", "return {}"]
+        _ ← supply rig owned "b" ["trace.mark('b:start')", "trace.deny()", "trace.mark('b:end')", "return { name = 'b' }"]
+        _ ← admit owned "a"
+        report ← advance owned
+        advanceBlocked report `shouldBe` BlockedNotAllowed
+        -- The dependency finished (it was running); the importer did not resume.
+        traced rig >>= (`shouldBe` ["a:start", "b:start", "b:end"])
+        statusOfName owned "b" >>= (`shouldSatisfy` isReadyStatus)
+        statusOfName owned "a" >>= (`shouldBe` ModuleEvaluating)
+        -- Asking again changes nothing while it is not allowed.
+        again ← advance owned
+        advanceBlocked again `shouldBe` BlockedNotAllowed
+        traced rig >>= (`shouldBe` ["a:start", "b:start", "b:end"])
+        writeIORef (rigAllowed rig) True
+        resumed ← advance owned
+        advanceBlocked resumed `shouldBe` BlockedIdle
+        traced rig >>= (`shouldBe` ["a:start", "b:start", "b:end", "a:got b"])
+        ledger owned >>= (`shouldSatisfy` balanced)
+
+    it "starts no dependency after the stop began, and the stop finds it pending with its interest withdrawn" $
+      withRig $ \rig owned → do
+        _ ← supply rig owned "a" ["trace.mark('a:start')", "trace.deny()", "local b = import('b')", "trace.mark('a:got')", "return {}"]
+        _ ← supply rig owned "b" ["trace.mark('b:start')", "return {}"]
+        _ ← admit owned "a"
+        report ← advance owned
+        advanceBlocked report `shouldBe` BlockedNotAllowed
+        traced rig >>= (`shouldBe` ["a:start"])
+        statusOfName owned "b" >>= (`shouldBe` ModulePending)
+        stopped ← stopModuleLoader owned
+        stopFrames stopped `shouldBe` 1
+        traced rig >>= (`shouldBe` ["a:start"])
+        statusOfName owned "a" >>= (`shouldBe` ModuleStopped)
+        statusOfName owned "b" >>= (`shouldBe` ModuleStopped)
+        released rig >>= \freed → Set.fromList freed `shouldBe` Set.fromList [ident "a", ident "b"]
+        ledger owned >>= (`shouldSatisfy` balanced)
+
+    it "starts no root after the stop began" $
+      withRig $ \rig owned → do
+        _ ← supply rig owned "first" ["trace.mark('first:start')", "trace.deny()", "return {}"]
+        _ ← supply rig owned "second" ["trace.mark('second:start')", "return {}"]
+        _ ← admit owned "first"
+        _ ← admit owned "second"
+        report ← advance owned
+        advanceBlocked report `shouldBe` BlockedNotAllowed
+        traced rig >>= (`shouldBe` ["first:start"])
+        statusOfName owned "second" >>= (`shouldBe` ModulePending)
+        _ ← stopModuleLoader owned
+        statusOfName owned "second" >>= (`shouldBe` ModuleStopped)
+        traced rig >>= (`shouldBe` ["first:start"])
+
   it "marks what was only pending as stopped, withdraws its interest and publishes nothing of it" $
     withRig $ \rig owned → do
       _ ← admit owned "waiting"
@@ -158,3 +211,9 @@ spec = describe "stopping the loader" $ do
         found ← ledger owned
         (ledgerTasks found, balanced found) `shouldBe` (0, True)
         forM_ ["outer", "inner", "held"] $ \name → statusOfName owned name >>= (`shouldBe` ModuleStopped)
+
+-- | Whether a status is a ready module.
+isReadyStatus ∷ ModuleStatus → Bool
+isReadyStatus = \case
+  ModuleReady _ → True
+  _ → False

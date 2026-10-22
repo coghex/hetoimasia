@@ -99,6 +99,8 @@ data Rig = Rig
   , rigThreads ∷ !(IORef [(Text, ThreadId)])
     -- ^ The thread each seam ran on, newest first, by seam and operation.
   , rigPhase ∷ !ModulePhase
+  , rigAllowed ∷ !(IORef Bool)
+    -- ^ Whether the owner allows further evaluation ('loaderMayRun'); a module can ask it to stop allowing it.
   }
 
 newRig ∷ IO Rig
@@ -118,6 +120,7 @@ newRig =
     <*> newIORef False
     <*> newIORef []
     <*> newModulePhase
+    <*> newIORef True
 
 -- | The identity of a module of the game's root by its path.
 ident ∷ Text → ExportIdentity
@@ -142,6 +145,9 @@ rigRegistration rig = either (error . show) id (registration [] [tracing, servic
         , -- A binding that refuses what it is not given as a fault of the call, which a
           -- script cannot hide: not opted in to ordinary errors.
           stateOperation "strict" [SText] [] (\_ → pure [])
+        , -- The owner begins to stop while the module runs: what the loader may do next is then
+          -- asked of it, and it is not allowed.
+          stateOperation "deny" [] [] (\_ → writeIORef (rigAllowed rig) False >> pure [])
         ]
     -- A scheduler yield: a task's way to give control back, never a module chunk's.
     scheduler = namespace "sched" [yieldOperation "yield"]
@@ -171,6 +177,7 @@ rigLoader rig =
         noteThread rig "eligible"
         maybe True (Set.member identity) <$> readIORef (rigEligible rig)
     , loaderPhase = Just (rigPhase rig)
+    , loaderMayRun = readIORef (rigAllowed rig)
     }
   where
     supplier =

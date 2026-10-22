@@ -107,12 +107,19 @@ data LoaderConfig = LoaderConfig
   , loaderPhase ∷ !(Maybe ModulePhase)
     -- ^ Set while the loader runs a module's code, for an application's own
     -- preconditions to read.
+  , loaderMayRun ∷ !(IO Bool)
+    -- ^ Whether the owner allows further ordinary evaluation now. Asked before every
+    -- fresh piece of module code the loader would run in an advance: a root's start, a
+    -- dependency's start and an importer's resume alike. When it answers no the advance
+    -- returns 'BlockedNotAllowed' with everything where it was (no frame closed, no
+    -- interest withdrawn), for the owner's stop to find; Lua that is already running is
+    -- not preempted. A call that raises is the application's failure.
   }
 
--- | A loader over a supplier and a resolver, in which every root is always eligible and
--- no phase is published.
+-- | A loader over a supplier and a resolver, in which every root is always eligible, no
+-- phase is published and evaluation is always allowed.
 loaderConfig ∷ SourceSupplier → AddressResolver → LoaderConfig
-loaderConfig supplier resolver = LoaderConfig supplier resolver (const (pure True)) Nothing
+loaderConfig supplier resolver = LoaderConfig supplier resolver (const (pure True)) Nothing (pure True)
 
 -- | Whether a module's top level is running, readable by an application's own
 -- preconditions without asking the VM for anything. A module's top level runs in a
@@ -203,6 +210,9 @@ data Blocked
     BlockedIneligible !ExportIdentity
   | -- | The active chain, or the root about to start, waits for this identity's source.
     BlockedSource !ExportIdentity
+  | -- | The owner does not allow further evaluation now ('loaderMayRun'): the chain, if
+    -- there is one, stands where it was.
+    BlockedNotAllowed
   | -- | The loader has stopped.
     BlockedStopped
   deriving (Eq, Show)

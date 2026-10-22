@@ -35,19 +35,21 @@
 -- tick. Neither adds a priority, a phase or a second scheduler: source arrival never starts
 -- a root, only the loader's head-of-queue rule and this eligibility do.
 --
--- = A due chain holds the tick
+-- = A due chain keeps its tick open
 --
 -- A logical root owes its tick: tick @t@ is not complete until the root has come to an
--- outcome, so the tick after it does not begin first. The obligation is recorded in the
--- transaction that accepts the submission, from any thread, and the owner is held at the
--- tick after the due one (or after the current one, once the due one has passed) in that
--- same transaction, before the owner has looked at anything: the scheduler does not apply
--- a grant that would begin that tick, however many grants were queued meanwhile, so
--- nothing advances past the obligation. The hold is one need, for the earliest tick owed
--- by an unfinished root, taken and given back as that set changes, and given back when the
--- owner exits. A root that is submitted again keeps the earliest of its obligations and of
--- the ticks it may begin at; a later submission never postpones either. A UI chain owes
--- nothing: hooks and stop requests simply go on while its source is awaited. A
+-- outcome. The obligation is recorded in the transaction that accepts the submission, from
+-- any thread, and the owner asks the scheduler ('ticksOwe') to keep the tick open in that
+-- same transaction, before the owner has looked at anything. The grant that reaches the
+-- tick is applied and what it woke runs, and the grant is not finished: it stays
+-- outstanding, so nothing reports the tick complete, and no later grant is applied,
+-- however many were queued meanwhile, until the root has an outcome. The need is one, for
+-- the earliest tick owed by an unfinished root (or the current tick, once that has passed
+-- and its grant is still open), taken and given back as that set changes, and given back
+-- when the owner exits. A root that is submitted again keeps the earliest of its
+-- obligations and of the ticks it may begin at; a later submission never postpones
+-- either. A root submitted after its tick is complete has nothing left to keep. A UI chain
+-- owes nothing: hooks and stop requests simply go on while its source is awaited. A
 -- non-yielding module still blocks its owner; nothing here preempts trusted Lua.
 --
 -- = What is published
@@ -64,7 +66,7 @@
 -- producers and the owner admits, delivers and advances nothing more: what is queued is left
 -- for the exit. When the owner exits the loader is stopped on the owner's thread (its
 -- frames closed, its interests withdrawn), every outcome that was only admitted is
--- published as stopped, and the tick hold is given back.
+-- published as stopped, and the need is given back.
 module Hetoimasia.Scripting.Lua.Loading.State
   ( -- * Configuring
     LoaderPlan (..)
@@ -139,7 +141,7 @@ import Hetoimasia.Scripting.Lua.Owner
   , lookupModule
   , stopModuleLoader
   )
-import Hetoimasia.Scripting.Lua.Provider.Types (Ticks (ticksHold, ticksNow, ticksOpen, ticksRelease))
+import Hetoimasia.Scripting.Lua.Provider.Types (Ticks (ticksNow, ticksOpen, ticksOwe, ticksOweRelease))
 
 -- | What a scheduled owner's module loader is made from.
 data LoaderPlan = LoaderPlan
@@ -268,7 +270,7 @@ data LoadingState = LoadingState
   , lsRefusals ∷ !(TVar (Seq (ExportIdentity, RootRefusal)))
     -- ^ The last 'lsBound' roots the loader refused.
   , lsHeld ∷ !(TVar (Maybe Word64))
-    -- ^ The tick the owner holds for a due chain.
+    -- ^ The tick the owner owes to a due chain: kept open until the chain has an outcome.
   , lsSeen ∷ !(IORef (Maybe (Word64, Blocked)))
     -- ^ The tick and blocking reason of the last advance, to leave the loader alone when
     -- nothing that could change them has.
@@ -296,19 +298,19 @@ loadingConfig ls plan =
   (loaderConfig (planSupplier plan) (planResolver plan))
     { loaderEligible = eligible
     , loaderPhase = planPhase plan
+    , loaderMayRun = mayRun
     }
   where
     -- A root nobody gave a due is a dependency that was also asked for as a root, or one
     -- the coordinator admitted without: it waits for nothing.
-    -- Nothing begins once a stop is asked for: the root stays queued for the exit.
     eligible identity = atomically $ do
-      open ← readTVar (lsOpen ls)
-      admitting ← ticksOpen (lsTicks ls)
       due ← Map.lookup identity <$> readTVar (lsDues ls)
       case due of
-        _ | not (open && admitting) → pure False
         Just (Standing from _) → (>= from) <$> ticksNow (lsTicks ls)
         Nothing → pure True
+    -- Nothing is started or resumed once a stop is asked for, or the owner is exiting: whatever is
+    -- queued or suspended stays where it is for the exit.
+    mayRun = atomically ((&&) <$> readTVar (lsOpen ls) <*> ticksOpen (lsTicks ls))
 
 -- ---------------------------------------------------------------------------------
 -- From any thread
@@ -393,7 +395,7 @@ data LoadingDiagnostics = LoadingDiagnostics
   , loadingDue ∷ !Int
     -- ^ Roots admitted and without an outcome.
   , loadingHeld ∷ !(Maybe Word64)
-    -- ^ The tick held for a due chain.
+    -- ^ The tick owed to a due chain.
   }
   deriving (Eq, Show)
 
@@ -480,10 +482,10 @@ serviceLoading ls owned = do
       where
         identity = rootIdentity request
 
--- | Hold the tick after the earliest one an unfinished logical root owes (or after the
--- current one, once that has passed), and give the hold back when none is owed. One need,
--- whatever the number of roots; taken in the transaction that read the tick, for a tick
--- that has not begun.
+-- | Owe the earliest tick an unfinished logical root owes (or the current one, once that has
+-- passed), and give the need back when none is owed. One need, whatever the number of
+-- roots; taken in the transaction that read the tick. The scheduler keeps the grant that
+-- reaches the tick open, and applies no later one, until the need is given back.
 settleHold ∷ LoadingState → IO ()
 settleHold = atomically . settleHoldSTM
 
@@ -495,12 +497,10 @@ settleHoldSTM ls = do
   let owed = [at | Standing _ (Just at) ← Map.elems dues]
       wanted = case owed of
         [] → Nothing
-        _ | next < maxBound → Just (next + 1)
-          | otherwise → Nothing
-          where next = max (minimum owed) tick
+        _ → Just (max (minimum owed) tick)
   when (wanted /= held) $ do
-    forM_ held (ticksRelease (lsTicks ls))
-    forM_ wanted (ticksHold (lsTicks ls))
+    forM_ held (ticksOweRelease (lsTicks ls))
+    forM_ wanted (ticksOwe (lsTicks ls))
     writeTVar (lsHeld ls) wanted
 
 -- | Stop taking roots and sources. Part of the owner beginning to exit.
@@ -531,7 +531,7 @@ retireLoading ls owned = do
     writeTVar (lsSubmitted ls) Seq.empty
     writeTVar (lsNotified ls) Map.empty
     held ← readTVar (lsHeld ls)
-    forM_ held (ticksRelease (lsTicks ls))
+    forM_ held (ticksOweRelease (lsTicks ls))
     writeTVar (lsHeld ls) Nothing
   pure stopped
   where

@@ -514,13 +514,16 @@ data Requester
 
 -- The state --------------------------------------------------------------------------
 
--- | What the provider service needs of the owner's scheduler, so that it names none: the
--- tick, the need that a tick not begin, the owner's watch on a tick, whether producers
+-- | What the provider service and the module loader need of the owner's scheduler, so that they name none: the
+-- tick, the need that a tick not begin, the need that a tick not end, the owner's watch on a tick, whether producers
 -- are admitted, whether a task is gone, and waking the tasks that wait for a request.
 data Ticks = Ticks
   { ticksNow ∷ STM Word64
   , ticksHold ∷ Word64 → STM ()
   , ticksRelease ∷ Word64 → STM ()
+  , ticksOwe ∷ Word64 → STM ()
+    -- ^ The owner needs one more thing finished before this tick is complete: the grant that reaches it stays open.
+  , ticksOweRelease ∷ Word64 → STM ()
   , ticksWatch ∷ Word64 → STM ()
   , ticksOpen ∷ STM Bool
   , ticksTaskGone ∷ TaskId → STM Bool
