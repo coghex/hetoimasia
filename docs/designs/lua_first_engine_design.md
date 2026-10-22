@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-72/Q-14: module, behavior and request API schemas.
+The current checkpoint is P-73/Q-15: remaining service functions and records.
+D-75 accepts the five-part core Lua module/behavior/request API package.
 D-74 accepts the five-part concrete launch-command and JSON manifest package.
 D-73 defers Lua window-size reads and resize callbacks from M1.
 D-72 accepts an idempotent whole-session quit request that returns normally.
@@ -2258,6 +2259,31 @@ no comments, unknown fields fail, quoted time without an exact `1/60` fraction,
 and strict parser work. The offered revision route mentioned TOML/YAML, command
 spelling and a rate in Hz; the owner selected none and approved the package.
 This does not yet approve the Lua function/result schemas or remaining bounds.
+
+### D-75. Use the approved core Lua module, behavior and request API
+
+**Delivery:** M1 authoring, instance facade and asynchronous result contract.
+
+Owner answer, **2026-10-22 03:38:56 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> Approve all five (Rec.)
+
+Authenticated relay: `het-manager`, message `wfj63ze8d5zqnh9sqka7pi459n`,
+posted **2026-10-22 03:38:57.080 UTC** in `#het-luafirst`, replying to Q-14
+message `7upneqwp4vaim2v44djmfyk6ke`.
+
+Accept all five P-72 parts: plain module exports and captured strict behavior
+tables; fresh self with the instance-bound API facade; module-root imports
+versus instance-root asynchronous module requests; common dot-call admission
+and one-shot result records; and VM-local shared exports inside fresh result
+envelopes. These spellings and semantics are selected, including ordinary
+not-ready refusal versus latched required failure for a known failed import.
+
+The manager summarized all five parts with the room.lua busy-retry example
+and costs. The alternative revision route suggested method-call style or
+optional modules; the owner chose neither. Service-specific records/functions
+and remaining numeric/resource bounds still require their own approval.
 
 ## Proposals
 
@@ -6332,7 +6358,7 @@ to approve this authored-data contract.
 
 ### P-72. Fix module exports, behavior authoring and the shared request protocol
 
-**Unapproved; active checkpoint Q-14. Delivery: M1.** Recommend approving the
+**All five parts accepted by D-75 through Q-14. Delivery: M1.** Recommend approving the
 following five-part core Lua API contract as a package, or revising named
 parts. These names become actual API spellings only on approval. The next
 package fills in data/texture/window/scene/time/status function schemas using
@@ -6536,6 +6562,294 @@ from shared exports, captured hooks from mutable tables, module-root import
 from instance-root requests, failed-cache from not-ready lookup, wrong owners,
 phase errors and the two-instance/shared-VM path. No new native/GPU probe is
 needed to qualify these Lua-facing ownership and value contracts.
+
+### P-73. Complete the M1 service function and record schemas
+
+**Unapproved; active checkpoint Q-15. Delivery: M1.** Recommend all six parts
+below as the next API package. They use D-75's dot calls, per-instance facade,
+busy admission and request records. Numeric ceilings/accounting follow as a
+separate bounds package; no omitted limit means unlimited. This introduces no
+new service family beyond the already selected M1 surface.
+
+#### 1. Data and texture requests
+
+| Function | Options | Successful take's `value` |
+| --- | --- | --- |
+| `api.content.data(path [, options])` | `root`, `optional`, logical-only `tick_offset` | Complete file bytes as a Lua string. |
+| `api.content.texture(path [, options])` | `root`, `optional`; UI only | `{texture=HANDLE, width=INTEGER, height=INTEGER}` for a usable texture. |
+
+Omitted options means an empty plain table. `root` defaults to the requesting
+instance's content ID, `optional` is a boolean defaulting to false, and logical
+`tick_offset` defaults to 1. Presentation refuses `tick_offset`, even if its
+value is 1. Module requests retain D-75's narrower options without `optional`.
+Paths/roots follow D-75; dimensions are positive source texel counts, not a
+window extent. No decode/colour/filter/format options, data parser or cache.
+Request readiness still includes GPU upload/registration for textures and
+assigned delivery for logical data/modules.
+
+#### 2. Windows, copied scenes and texture release
+
+| Function | Contract |
+| --- | --- |
+| `api.window.open({title=TEXT, width=INTEGER, height=INTEGER})` | UI-only required request; its successful value is the owned window handle itself. All three fields required; initial dimensions are positive native window screen-coordinate units, not a current-size observation. |
+| `api.scene.publish(window, scene)` | UI-only; validate/copy/swap the whole scene to the caller's ready window, then return no results. No frame-display receipt. |
+| `api.texture.release(texture)` | UI-only non-waiting release: `"done"` if this first release completes retirement, `"retiring"` while retirement remains pending, `"already_released"` once a previously released texture is retired. |
+
+Window title is valid UTF-8 text without NUL or control characters; empty is
+allowed. Window requests have no optional flag, resize/close/reopen method or
+second slot. D-51/D-73 native close/resize policy remains. Scene shape:
+
+```lua
+{
+  clear = {r=0, g=0, b=0},
+  sprites = {
+    {texture=texture, x=32, y=32, width=256, height=256}
+  }
+}
+```
+
+Both top-level fields are required. Clear channels are whole numeric values
+0–255 under D-66, and sprites is a dense 1-based array (empty allowed).
+Each sprite requires exactly texture/x/y/width/height. Coordinates/dimensions
+retain D-50/D-66's logical-pixel, finite, checked Float32 conversion and
+positive-size rules. List order is painter order. There are no per-sprite
+defaults, opacity, tint, UVs or transform fields. Repeating a valid sprite
+table/texture in the array is allowed and copied at each position; Lua aliases
+do not become shared mutable scene nodes. Unknown fields, metatables, holes,
+wrong/released/foreign resources and invalid geometry refuse the whole call
+with an ordinary Lua error and leave the old scene intact.
+
+Release revokes the handle for new publication immediately; existing scenes
+and GPU work keep their approved holds. Repeat release never repeats cleanup,
+and can still report retiring. Wrong-kind/foreign/never-issued handles are
+ordinary errors; a genuine cleanup fault stays fatal. No window-release or
+independent close operation is added.
+
+#### 3. Time and cooperative waits
+
+| Function | Role/result |
+| --- | --- |
+| `api.time.tick()` | Gameplay only: current integer logical tick, init 0. |
+| `api.time.tick_seconds()` | Gameplay only: the fixed tick duration as Lua numeric seconds. |
+| `api.time.seconds()` | Presentation only: seconds since root-init origin, sampled per hook/resumed segment. |
+| `api.time.wait_ticks(n)` | Gameplay update only: positive whole future-tick wait, no results. |
+| `api.time.wait_seconds(seconds)` | Presentation update only: positive finite duration wait, no results. |
+| `api.time.yield()` | Either role's update: ordinary cooperative yield, no results. |
+
+Clock reads are valid in finite init/shutdown; waits/yield are not. All are
+refused during module evaluation, including through a captured facade. No
+wall/calendar/CPU time is exposed. Native waits never block the VM thread.
+Logical duration is exact nanoseconds internally; seconds and dt exposed to
+Lua are floating numeric approximations, not an alternate authoritative clock.
+Elapsed wait/cadence conversion rounds upward to a nanosecond with checked
+range, never to zero; deadlines, late resumption, sampled time and coalesced
+updates retain D-17/D-68. Numeric endpoints and overflow handling follow in
+the bounds package. No sleep, render callback or retiming API is added.
+
+#### 4. UI status and shutdown reason schema
+
+`api.session.status()` is the D-70 UI-only per-segment copied observation:
+
+```lua
+{
+  stopping = false,
+  gameplay = {present=true, initialized=true, phase="running", failed=false},
+  presentation = {present=true, initialized=true, phase="running", failed=false}
+}
+```
+
+An absent role is exactly `{present=false}`. A present role always has
+`initialized`, `phase` and `failed`; `initialized` means its own init succeeded,
+and remains a historical fact through stop/retirement. Phase is `"starting"`,
+`"ready"`, `"running"`, `"stopping"` or `"retired"`. Failure is a separate
+latched `failed=true` plus `failure` record, so it stays visible as phase
+advances from stopping to actually retired. A failed role cannot be ready or
+running. UI can be running while gameplay is starting/ready. Whole-session
+`stopping` does not become true solely because logical failure leaves healthy
+UI running; failure and session stop are distinct facts.
+
+Failure record has required `code`, `message`, `role`, `stage`; known
+`content_id`, `instance_id`, `path` and available `traceback` are present, absent
+otherwise. Do not fabricate an instance for module-only work. Role is gameplay
+or presentation. Stage is `"module"`, `"init"`, `"update"`, `"shutdown"`,
+`"request"`, `"cleanup"` or `"engine"`. Code is `"lua_error"`,
+`"module_error"`, `"required_request"`, `"host_failure"`,
+`"cleanup_failure"` or `"state_unavailable"`. Preserve the first role failure;
+later cleanup failures still appear in engine reporting and can end the session.
+No guarantee exists that Lua runs to observe a fatal engine failure or final
+phase. Messages/tracebacks are bounded text, without stack locals or history.
+
+`shutdown(self, reason)` uses the existing host's strings `"stopped"`,
+`"failed"`, `"completed"`. Normal session quit/signal/peer-driven retirement
+uses stopped; an instance's own failure uses failed when Lua cleanup is safe.
+Completed remains the host's natural-completion case, not a new public one-shot
+mode or a promise that an update-free M1 behavior completes automatically.
+Failed init/unsafe Lua still skip shutdown under the approved rules.
+
+#### 5. Quit and the unavailable-state boundary
+
+`api.session.quit()` is D-72's no-argument/no-result returning stop request,
+valid from either role's lifecycle hooks. There is no global quit alias,
+custom exit status/reason, per-instance stop, restart or pause binding.
+
+Expose a single global function `state(...)`, also available as `api.state(...)`,
+as the explicit unavailable-service boundary. Any call, with any arguments
+and in any phase, latches whole-session failure and orderly stop, with the
+first call reporting `state service not available in this milestone` to
+stderr, then raises a Lua
+error to end ordinary execution unless caught. Catching cannot clear the latch;
+the existing safe-boundary/cleanup and second-signal rules still apply. This
+special guard takes precedence over normal role/phase checks and repeats
+idempotently. It is not a fake table store or a declaration of future entity/
+schema functions; no `state.create` or other deferred state API is implemented.
+The global spelling makes the guard available during module evaluation without
+handing that phase an acquiring instance's full facade.
+
+Print/warn remain the global functions selected by D-71, not duplicated as
+API logger methods. The filtered standard library and pure authored helpers
+otherwise retain their approved surface. These aliases/names add no OS access.
+
+#### 6. Validation and expected failure vocabulary
+
+Service input records/options must be plain tables with exactly the documented
+keys, no metatables or coercion. Only nil/absence means an omitted optional
+field; false is valid where a boolean is declared, and empty text only where
+the text contract allows it. Numeric strings are not numbers. Arrays have
+exact contiguous integer keys and no named extras. Validate argument count,
+role/phase, ownership, input shape and permanent limits before admitting work.
+Too many arguments, mistaken colon calls, unsupported options and wrong types
+are ordinary Lua errors. No validation runs arbitrary authored metamethods.
+The state guard is the explicitly documented exception to ordinary validation.
+
+P-72's accepted-request `error.code` vocabulary is:
+
+| Code | Expected content/request failure |
+| --- | --- |
+| `not_found` | Requested path is absent from the startup inventory; newly added files do not become eligible. |
+| `content_changed` | Inventoried content is missing, changed, or no longer has a permitted no-follow type/mapping. |
+| `io_error` | Expected file-read/access failure. |
+| `too_large` | Source/data/image exceeds its applicable size/work limits. |
+| `unsupported_format` | Not the selected static PNG profile, including animated PNG. |
+| `invalid_image` | Malformed supported image input. |
+| `module_error` | Lua syntax/evaluation/exports failure. |
+| `module_cycle` | Rejected dependency cycle. |
+| `module_limit` | Accepted load discovers a cache/dependency-depth limit. |
+| `window_error` | Expected native window-creation refusal. |
+
+Content failure root/path identifies the failing content, including a dependency
+when known; otherwise retain the requested root/path. Message gives bounded
+detail such as a dependency chain, without a recursive arbitrary error graph.
+Before-admission permanent module-limit errors remain ordinary Lua errors
+without a request under D-59; they are not this accepted-failure record.
+Engine/provider defects, device/allocator faults and cleanup failures remain
+fatal host failures rather than being converted to optional content failures.
+Required requests still latch failure even if unread; optional data/texture
+failures are records for Lua. Cancellation uses its own take variant, and busy
+is an admission refusal, never a terminal accepted-request code.
+
+#### Complete common-entry quad example for this proposed API
+
+Use D-74's common-entry manifest, store this as `lua/main.lua`, and provide a
+static `images/quad.png`. The PNG is authored/test content, not approved art.
+Init starts both requests without waiting. Busy is retried by Lua in later
+updates; no accepted request is restarted. This example deliberately uses a
+fixed 256-by-256 rectangle and a 20 ms UI update cadence, neither an engine
+default nor a render-rate guarantee.
+
+```lua
+local function remember(self, key, request, refusal)
+  if request then self[key] = request
+  else assert(refusal.code == "busy") end
+end
+
+local function begin(self)
+  local api = self.api
+  if not self.window and not self.window_request then
+    remember(self, "window_request", api.window.open({
+      title="Lua quad", width=640, height=480
+    }))
+  end
+  if not self.image and not self.texture_request then
+    remember(self, "texture_request",
+      api.content.texture("images/quad.png"))
+  end
+end
+
+local function collect(self, request_key, value_key)
+  local api, request = self.api, self[request_key]
+  if not request or not api.request.ready(request) then return true end
+  local result = api.request.take(request)
+  self[request_key] = nil
+  if result.status == "success" then
+    self[value_key] = result.value
+    return true
+  elseif result.status == "cancelled" then
+    api.session.quit()
+    return false
+  else
+    -- These demo requests are required; their failure is already latched.
+    error(result.error.message)
+  end
+end
+
+return {
+  gameplay = {
+    every_ticks=1,
+    update=function(self, dt_seconds) end -- real logical owner, stub content
+  },
+  presentation = {
+    every_seconds=0.02,
+    init=function(self, api) begin(self) end,
+    update=function(self, dt_seconds)
+      local api = self.api
+      begin(self)
+      if not collect(self, "window_request", "window") then return end
+      if not collect(self, "texture_request", "image") then return end
+      local status = api.session.status()
+      if status.gameplay.present and status.gameplay.failed then
+        if self.window and not self.error_shown then
+          warn(status.gameplay.failure.message)
+          api.scene.publish(self.window, {
+            clear={r=96, g=0, b=0}, sprites={}
+          })
+          self.error_shown = true
+        end
+        return
+      end
+      if self.window and self.image and not self.drawn then
+        api.scene.publish(self.window, {
+          clear={r=24, g=24, b=24},
+          sprites={{texture=self.image.texture,
+                    x=32, y=32, width=256, height=256}}
+        })
+        self.drawn = true
+        api.texture.release(self.image.texture)
+        -- The published scene retains it through actual GPU use.
+      end
+    end
+  }
+}
+```
+
+Window close performs orderly whole-session quit through the engine. Optional
+shutdown is omitted: protected engine cleanup is still required. The error
+branch is a colour-only indication plus a warning, not a font/widget promise.
+An optional-data fallback uses the same result protocol with
+`api.content.data(path, {optional=true})` and inspects a failure record; it
+does not use pcall to undo required failure. Additional qualification fixtures
+must cover explicit quit, waits, failed loads and independent instances.
+
+**Recommendation/costs and evidence.** These functions directly expose the
+selected M1 services through the existing [Lua host](../../packages/scripting-lua/README.md),
+[window host](../glfw.md) and [renderer](../../packages/render-2d/README.md)
+contracts without claiming the new bindings already exist. Cost: strict
+record shapes and explicit asynchronous steps; floating Lua seconds versus
+exact engine duration; separate failure/retirement facts in status; and the
+deliberate unavailable-state function rather than an ECS-shaped stub.
+Qualification checks schema/phase/owner errors before action, copied scenes,
+readiness/results, time origins/waits, status/quit/guard precedence, and real
+offscreen/native quad evidence in the delivery slices. Remaining numeric
+ceilings and worker/resource accounting need the next explicit package.
 
 ## Open questions
 
@@ -7099,12 +7413,18 @@ The Lua API and remaining bounds are not implicitly approved by that answer.
 
 ### Q-14. Approve the core Lua module, behavior and request API package?
 
-**Active checkpoint, P-72.** Approve all five parts or identify revisions:
-plain module exports/captured strict behaviors; fresh self with an instance-bound
-API facade; module-bound import versus instance-owned asynchronous module
-requests; common admission and one-shot result records; VM-local shared export
-values inside copied result envelopes. Service-specific functions/records and
-remaining bounds follow before the complete quad/API contract is settled.
+Resolved by D-75: all five P-72 parts approved, including the module/behavior,
+facade, import/request root contexts and shared request/result schemas. The
+service-specific functions/records and remaining bounds continue in Q-15.
+
+### Q-15. Approve the remaining service functions and record schemas?
+
+**Active checkpoint, P-73.** Approve all six parts or identify revisions:
+data/texture calls and values; window/scene/release schemas; time/wait functions;
+status and shutdown reasons; session quit/unavailable-state spellings; strict
+validation and expected-failure codes. The complete quad example demonstrates
+their composition. Numeric ceilings and resource/worker accounting follow as
+their own package before vision/#145 reconciliation and one-PR slices.
 
 ## Verification strategy
 
