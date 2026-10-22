@@ -87,7 +87,7 @@ concrete precondition
 - [x] LFE-22. Assemble the generic run command and Lua quad content — [#537]
 - [x] LFE-23. Qualify integrated failure and two-instance ownership headlessly — [#538]
 - [x] LFE-24. Verify Lua-authored output through offscreen pixels — [#539]
-- [ ] LFE-25. Qualify native windows, independent retirement and quit
+- [x] LFE-25. Qualify native windows, independent retirement and quit — [#540]
 
 The twenty-six LFE slices below have manager process signoff under D-80;
 they are not approved issues or implementation authorization. Q-8 is confirmed
