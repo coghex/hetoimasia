@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-44/Q-6d: one texture request through usable GPU readiness.
+The current checkpoint is P-45/Q-6e: explicit texture release and load cancellation.
+D-47 accepts one texture request through usable GPU readiness.
 D-46 accepts copied scenes and protected texture retention.
 D-45 accepts Lua-requested asynchronous window creation.
 D-44 resolves Q-6a revision 2 with UI-only graphics; the original broader
@@ -1417,6 +1418,32 @@ alive through actual rendering/GPU use without extending released Lua handles.
 The manager presented the whole-scene copy cost. The owner chose A rather than
 engine-owned mutable scene objects. Scene fields, numeric limits and the
 remaining texture/request APIs are not selected by this answer.
+
+### D-47. One texture request succeeds with a usable GPU resource
+
+**Delivery:** M1.
+
+Owner answer, **2026-10-22 00:04:31 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: one ready request (Rec.)
+
+Authenticated relay: `het-manager`, message `quyia79czkkka7f6e3zmfu8vua`,
+posted **2026-10-22 00:04:31.441 UTC** in `#het-luafirst`, replying to Q-6d
+message `vcm8cygnnkbv5kc5deh6tsvz7a`.
+
+Accept P-44's A: one pending request covers fingerprint-checked reading,
+decoding, completed GPU upload and renderer registration. Success delivers a
+usable per-instance texture lease and image dimensions. Loading can progress
+before any window exists, so init requests window and texture independently
+and Lua publishes after both succeed. The required/optional rules cover the
+whole request; cancellation suppresses delivery and retains safe cleanup,
+including actual retirement after an already-started upload.
+
+The manager presented the cost: success waits for GPU readiness, without a
+separate decoded image or Lua-selected upload timing. The owner chose A rather
+than separate decode/upload operations. This does not choose format/options,
+cache sharing, explicit release or exact request API spelling.
 
 ## Proposals
 
@@ -3640,7 +3667,7 @@ validation are proposed integration work, not existing bindings.
 
 ### P-44. One texture request ends with a usable GPU texture lease
 
-**Unapproved; active checkpoint Q-6d. Delivery: M1.** Recommend A: a UI hook
+**A accepted by D-47 through Q-6d. Delivery: M1.** Recommend A: a UI hook
 requests a texture by scoped content path, and one pending request covers
 fingerprint-checked reading, decoding, upload and renderer registration. Success
 delivers an instance-owned texture lease plus its image dimensions only after
@@ -3688,6 +3715,66 @@ Registration of an already completed texture refreshes the table before
 returning. The image2d sample composes upload completion and registration in
 Haskell. The new asynchronous Lua provider must qualify these same stages,
 including cancellation during upload and progress before any window exists.
+
+### P-45. Let an instance release textures and cancel pending texture loads
+
+**Unapproved; active checkpoint Q-6e. Delivery: M1.** Recommend A: expose
+explicit early release of an instance's texture lease and cancellation of its
+pending texture request. Automatic cleanup at instance/session end remains
+mandatory; Lua need not call either for cleanup to be correct. These are ways
+to relinquish work/resources while the instance keeps running, not transfers
+to another instance or dependence on Lua garbage collection.
+
+Releasing a texture revokes its Lua lease immediately. New scene publications
+using it are refused. A previously accepted scene may keep showing it until a
+scene without it replaces it or its window ends; release does not secretly
+edit or blank that scene. Existing barriers, revision holds and GPU completion
+still determine actual retirement (D-46). Thus dropping a Lua reference, asking
+for release, and freeing GPU memory are distinct events. Authors who want to
+reclaim a displayed texture must also stop referencing it in the published
+scene. The release operation never waits in a hook for those holds to drain.
+
+Expose the host's distinction between release completed, retirement pending,
+and already released; exact Lua names remain open. Repeating release of one's
+own lease starts no second cleanup. It may observe retirement still pending or
+already complete. Wrong-instance/invalid handles are refused. A real cleanup
+failure remains fatal and recorded, never retried or reported as successful.
+Retiring resources keep their capacity charge until the provider proves them
+retired, so repeated acquire/release cannot evade the resource bounds.
+
+Cancelling a pending texture request intentionally withdraws interest; it is
+not a required-load failure. Presentation's existing first-settlement-wins
+rule applies: if cancellation wins, Lua receives a cancelled settlement and
+no texture lease; if success/failure settled first, cancellation reports that
+it was already settled and does not erase that result or a required failure.
+A successful lease is then handled through normal result consumption and
+release. Late provider completion cannot resurrect a cancelled request; all
+partial/undelivered resources remain engine-owned through retirement. Request
+capacity stays charged until its settlement is consumed/discarded and its
+provider retires. No busy wait or automatic retry is introduced.
+
+Alternative B exposes neither early texture release nor manual texture-load
+cancellation in M1: each acquired texture or admitted request is retained until
+its normal completion and instance/session cleanup. Internal shutdown
+cancellation remains real. This has fewer public operations but can accumulate
+resources in a long-lived instance during D-9's runtime loading, eventually
+hitting its bounds. It cannot be described as automatic reclamation when Lua
+merely drops a reference.
+
+A is recommended because resource lifetime must remain practical beyond the
+one static quad. Its cost is explicit cancellation races and retirement status
+in the binding contract, and the author must replace a scene to release its
+holds. This question covers textures only; public window-close controls,
+module-import cancellation/cache semantics and the common request API remain
+separate details. It does not add mod activation or texture-sharing features.
+
+Evidence: [instance leases and requests](../../packages/scripting-lua/README.md)
+already distinguish revoked leases from retained retirement and implement
+first-settlement-wins for elapsed requests. The
+[2D adapter](../../packages/render-2d-vulkan/README.md) keeps a released texture
+rendering while an adopted scene holds it and releases it behind the native
+barrier. New bindings must preserve those mechanisms and test both orders of
+cancel/completion, repeated release, and scene-held retirement.
 
 ## Open questions
 
@@ -3984,11 +4071,17 @@ retention. The mutable-scene-object alternative was not chosen. No ECS is added.
 
 #### Q-6d. Does one texture request cover reading through GPU readiness?
 
-**Active checkpoint, P-44.** A (recommended): one request succeeds only with
-a usable texture lease after verified read, decode, completed upload and
-registration. B: separate owned CPU-image and GPU-texture requests. Both retain
-D-46's ready-texture publication rule and protected cleanup; neither permits
-an unfinished texture to appear as a successful load.
+Resolved by D-47: P-44's A, one request through verified reading, decoding,
+completed upload and registration to a usable texture lease. Separate CPU-image
+and GPU-texture requests were not chosen. D-46's publication rule still applies.
+
+#### Q-6e. Can Lua relinquish textures and pending texture loads before instance end?
+
+**Active checkpoint, P-45.** A (recommended): explicit texture release and
+pending-load cancellation with protected retirement, truthful status and
+first-settlement-wins. B: no public early release/cancel in M1, retaining
+automatic instance/session cleanup. A does not silently remove a released
+texture from a scene that still holds it.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
