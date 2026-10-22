@@ -378,7 +378,7 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
       let atBoundary = do
             instanceStep ← maybe (pure False) serviceBoundary instances
             requestStep ← forM provider $ \service →
-              providerBoundary service scheduler (isJust instances) extra (forM_ instances endOwner)
+              providerBoundary service scheduler (isJust instances) leaseHost extra (forM_ instances endOwner)
             -- The module loader is looked at last at a boundary: what a hook or a settled request
             -- did there is part of what it is asked, and a chain it advances is not a task.
             loadStep ← forM (controlLoading control) $ \state → serviceLoading state owned

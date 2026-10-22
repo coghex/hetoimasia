@@ -306,13 +306,16 @@ comments, trailing commas and data, non-object roots, duplicate keys after escap
 decoding), the exact numeric reading of `format`, every schema refusal and the fixed
 order refusals are decided in, and `tick_seconds` as exact decimal nanoseconds -- and
 the fixed M1 profile of limits against an independently written expectation, with its
-smaller validated test profiles and the profiles it refuses -- and the manifest and
+smaller validated test profiles and the profiles it refuses -- the manifest and
 entry boot checkpoint (LFE-6) composed with the content inventory over real temporary
 folders: the content numbers derived from the fixed profile, the manifest at 65,536 bytes
 and one past, a missing, case-mismatched or directory manifest, a manifest parsed from
 revision A beside a scan that pinned revision B, every declared entry (a fully overridden
 common entry included) required to name an inventoried regular file, and a cancellation
-while the checkpoint holds the read. It starts no Lua, window or GPU, and the checkpoint
+while the checkpoint holds the read -- and, for the M1 request adapter, the busy
+record, the exact request records, handles, phases, the profile's limits and required and optional
+failure over real Lua instances on a supervised owner with controlled fake providers. The manifest,
+profile and boot examples start no Lua, and no example starts a window or a GPU; the checkpoint
 reads only through the verified read it is given. It is mandatory but outside the floor, like `test.math`,
 and its command names `cabal.project.cpu`; the group declares that file beside
 `cabal.project.common`. CI routes it to the `haskell-engine` worker and publishes its

@@ -102,6 +102,18 @@ spec = describe "the package and import boundary" $ do
     [file <> ": " <> name | (file, name) ← imported, not (permitted file name)] `shouldBe` []
     [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
 
+  it "has a request sublibrary over the profile and the host's public modules, and nothing else" $ do
+    (sort <$> fieldEntries "library request" "build-depends:")
+      `shouldReturn` ["base", "bytestring", "hetoimasia-lua-engine", "hetoimasia-scripting-lua", "hetoimasia-scripting-lua:runtime-lua", "text"]
+    fieldEntries "library request" "exposed-modules:" `shouldReturn` ["Hetoimasia.LuaEngine.Request"]
+
+  it "imports, in the request sublibrary, only the profile, the host's public modules and base libraries: no private module, no content, window, GPU, console, sample or game" $ do
+    sources ← sourcesUnder "request"
+    sources `shouldSatisfy` ((>= 1) . length)
+    imported ← importedBy sources
+    [file <> ": " <> name | (file, name) ← imported, not (permittedRequest name)] `shouldBe` []
+    [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
+
   it "lets only the behavior selection import the Lua host and runtime, and only their public modules" $ do
     sources ← sourcesUnder "src"
     imported ← importedBy sources
@@ -119,29 +131,17 @@ spec = describe "the package and import boundary" $ do
     sort (nub [name | (file, name) ← imported, file == "Boot.hs", "Hetoimasia.Content" `isPrefixOf` name])
       `shouldBe` ["Hetoimasia.Content", "Hetoimasia.Content.Identity", "Hetoimasia.Content.Inventory"]
 
-  it "is used by its own suite only through its public modules, the content package's, the Lua host's and the foundation's time values" $ do
+  it "is used by its own suite only through public modules: the manifest, the profile, the request adapter, the boot checkpoint, the content package's and the host's public interface" $ do
     sources ← sourcesUnder "test"
     sources `shouldSatisfy` ((>= 7) . length)
     imported ← importedBy sources
     [ file <> ": " <> name
       | (file, name) ← imported
       , "Hetoimasia." `isPrefixOf` name
-      , name
-          `notElem` [ "Hetoimasia.LuaEngine.Behavior"
-                    , "Hetoimasia.LuaEngine.Boot"
-                    , "Hetoimasia.LuaEngine.Manifest"
-                    , "Hetoimasia.LuaEngine.Profile"
-                    , "Hetoimasia.Foundation.Time"
-                    , "Hetoimasia.Scripting.Lua.Instance"
-                    , "Hetoimasia.Scripting.Lua.Owner"
-                    , "Hetoimasia.Scripting.Lua.Scheduled"
-                    , "Hetoimasia.Scripting.Lua.Value"
-                    , "Hetoimasia.Content"
-                    , "Hetoimasia.Content.Identity"
-                    , "Hetoimasia.Content.Inventory"
-                    ]
+      , not (permittedSuite name)
       ]
       `shouldBe` []
+    [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
 
   it "is listed by the ordinary and CPU projects, held to -Werror, and not by the Vulkan project" $ do
     root ← above "cabal.project"
@@ -170,3 +170,25 @@ spec = describe "the package and import boundary" $ do
         -- Only the boot checkpoint is over the content package, through its
         -- public modules.
         || (file == "Boot.hs" && name `elem` ["Hetoimasia.Content", "Hetoimasia.Content.Identity", "Hetoimasia.Content.Inventory"])
+    permittedRequest name =
+      "Data." `isPrefixOf` name
+        || "GHC." `isPrefixOf` name
+        || name `elem` ["Hetoimasia.LuaEngine.Profile"]
+        || "Hetoimasia.Scripting.Lua." `isPrefixOf` name
+    permittedSuite name =
+      name
+        `elem` [ "Hetoimasia.LuaEngine.Manifest"
+               , "Hetoimasia.LuaEngine.Behavior"
+               , "Hetoimasia.LuaEngine.Boot"
+               , "Hetoimasia.LuaEngine.Profile"
+               , "Hetoimasia.LuaEngine.Request"
+               , "Hetoimasia.Foundation.Time"
+               , "Hetoimasia.Foundation.Log"
+               , "Hetoimasia.Foundation.Resource"
+               , "Hetoimasia.Runtime.Logging"
+               , "Hetoimasia.Runtime.Supervision"
+               , "Hetoimasia.Content"
+               , "Hetoimasia.Content.Identity"
+               , "Hetoimasia.Content.Inventory"
+               ]
+        || "Hetoimasia.Scripting.Lua." `isPrefixOf` name

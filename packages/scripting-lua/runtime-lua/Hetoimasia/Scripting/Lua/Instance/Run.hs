@@ -830,7 +830,14 @@ dispatch ih cell = do
   surfaced ← atomically (takeDeliveryFailure cell)
   case surfaced of
     Just (endpoint, reason, phase) → failInstance ih cell phase (StageEvent endpoint) (ErrorDelivery endpoint reason)
-    Nothing → admitNext ih cell
+    Nothing → do
+      -- A required request that reached its eligible settlement with an expected failure fails
+      -- its instance here (D-52), at the owner's safe boundary and before any more of its
+      -- ordinary work, whether or not its script ever read the request.
+      latched ← atomically (takeRequestFailure cell)
+      case latched of
+        Just (endpoint, reason, phase) → failInstance ih cell phase (StageRequest endpoint) (ErrorRequest endpoint reason)
+        Nothing → admitNext ih cell
 
 -- | The instance's delivery failure, if a provider surfaced one and the instance is still taking
 -- anything, taken once, with the phase the instance was in.
@@ -842,6 +849,21 @@ takeDeliveryFailure cell = do
     Just (endpoint, reason) → do
       writeTVar (icState cell) state {isDeliveryFailure = Nothing}
       pure (if isStopped state || isTerminal (isPhase state) then Nothing else Just (endpoint, reason, isPhase state))
+
+-- | The instance's latched required-request failure, if the instance is still taking anything,
+-- taken once, with the phase the instance was in.
+takeRequestFailure ∷ ICell → STM (Maybe (Text, Text, InstancePhase))
+takeRequestFailure cell = do
+  state ← readTVar (icState cell)
+  pure $ case isRequestFailure state of
+    -- An instance that is ending is not failed from here: the latch is left where it is, for its settlement to
+    -- keep as the failure (or beside the failure) the instance ends with.
+    Just _ | isStopped state || isTerminal (isPhase state) → Nothing
+    Nothing → Nothing
+    -- Read and not cleared: the latch is the instance's until its failure is recorded, and recording it
+    -- marks the instance as ending, which is what keeps the latch from being applied twice. A cancellation
+    -- between this reading and that recording leaves it where the next boundary, or the settlement, finds it.
+    Just (endpoint, reason) → Just (endpoint, reason, isPhase state)
 
 -- | Admit the instance's next invocation as a task, if it has one and may start it.
 admitNext ∷ InstanceHost → ICell → IO ()
@@ -1866,8 +1888,22 @@ settleEnding ih cell = do
         Unorderly kind → kind
         _ → ExitFailed
       reached = if isInitialized state || created || entered || hookStarted (endShutdown ending) then Started else NotStarted
+      -- A required request's failure that was latched and not yet applied when the instance ended is
+      -- never lost: it is the failure when nothing else is primary, and evidence beside the primary when
+      -- something is.
+      latched =
+        [ (StageRequest endpoint, ErrorRequest endpoint why)
+        | Just (endpoint, why) ← [isRequestFailure state]
+        , not (appliedAsPrimary endpoint why)
+        ]
+      -- The failure the instance already ended with is the latched one, applied by the dispatch: it is
+      -- not told again beside itself.
+      appliedAsPrimary endpoint why = case endPrimary ending of
+        Just (Primary _ _ (ErrorRequest appliedEndpoint appliedWhy)) → appliedEndpoint == endpoint && appliedWhy == why
+        _ → False
       failure = case (endPrimary ending, shutdownFailure) of
-        (Just (Primary phase stage err), secondary) → Just (describe phase stage err ([(StageShutdown, e) | Just e ← [secondary]] <> releases))
+        (Just (Primary phase stage err), secondary) → Just (describe phase stage err ([(StageShutdown, e) | Just e ← [secondary]] <> latched <> releases))
+        (Nothing, secondary) | (stage, err) : rest ← latched → Just (describe (isPhase state) stage err ([(StageShutdown, e) | Just e ← [secondary]] <> rest <> releases))
         (Nothing, Just err) → Just (describe Stopping StageShutdown err releases)
         (Nothing, Nothing) → case releases of
           [] → Nothing

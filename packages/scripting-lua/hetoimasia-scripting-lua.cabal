@@ -204,6 +204,7 @@ library runtime-lua
     visibility: public
     hs-source-dirs: runtime-lua
     exposed-modules:
+        Hetoimasia.Scripting.Lua.Admission
         Hetoimasia.Scripting.Lua.Lease
         Hetoimasia.Scripting.Lua.Lending
         Hetoimasia.Scripting.Lua.Provider
@@ -234,6 +235,7 @@ library runtime-lua
         Hetoimasia.Scripting.Lua.Lending.Loan
         Hetoimasia.Scripting.Lua.Lifecycle.State
         Hetoimasia.Scripting.Lua.Loading.State
+        Hetoimasia.Scripting.Lua.Provider.Call
         Hetoimasia.Scripting.Lua.Provider.Events
         Hetoimasia.Scripting.Lua.Provider.Serve
         Hetoimasia.Scripting.Lua.Provider.State
@@ -305,6 +307,7 @@ test-suite lua-host-tests
     -- fail after its module was stored, which no script can do (see its header).
     c-sources: test/cbits/hetoimasia_lua_hooks.c
     other-modules:
+        Test.Lua.Boundary.ArgumentChecks
         Test.Lua.Boundary.Bindings
         Test.Lua.Boundary.Dependencies
         Test.Lua.Boundary.Discipline
@@ -412,6 +415,16 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Accounting.Support
         Test.LuaRuntime.Accounting.Waits
         Test.LuaRuntime.Accounting.Windows
+        Test.LuaRuntime.Admission.Banks
+        Test.LuaRuntime.Admission.Failure
+        Test.LuaRuntime.Admission.Handles
+        Test.LuaRuntime.Admission.Lease
+        Test.LuaRuntime.Admission.Races
+        Test.LuaRuntime.Admission.Release
+        Test.LuaRuntime.Admission.Settlement
+        Test.LuaRuntime.Admission.Timing
+        Test.LuaRuntime.Admission.Spec
+        Test.LuaRuntime.Admission.Support
         Test.LuaRuntime.Callbacks
         Test.LuaRuntime.Dependencies
         Test.LuaRuntime.Expected

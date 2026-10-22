@@ -337,6 +337,13 @@ valueHandler boundary vm space binding state restore = do
             retired ← restore (retiredIn boundary value)
             forM_ retired $ \(path, typeName) →
               refuseArguments index path (RuleRetiredHandle typeName) visited
+        -- The application's checks of the copied values come last, when the values are known to
+        -- be of the declared shapes and live: they decide what only the values carry.
+        for_ (bindingArgumentChecks binding) $ \check → do
+          verdict ← fromApplication $ do
+            answer ← restore (check owner values)
+            answer <$ evaluate (maybe () (\reason → lengthWord8 reason `seq` ()) answer)
+          forM_ verdict refusePrecondition
         pure values
       case checked of
         Left (OrdinaryRefusal reason) → raiseOrdinary reason

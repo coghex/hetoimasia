@@ -250,26 +250,6 @@ newLeases lending capacity
   | capacity < 1 = throwFailure runtimeComponent (operation "new-leases") [] (LeasesRefused (CapacityBelowOne capacity :| []))
   | otherwise = newLeasesHandle lending capacity
 
--- | What a release hands the engine when its resource is retired by a provider that
--- finishes later.
-data Retirements = Retirements
-  { retireAsynchronously ∷ Text → STM RetirementState → IO ()
-    -- ^ Record that the release has handed the resource to its provider, under a
-    -- label that names it in evidence, and say how to ask the provider where it has
-    -- got to. Called from the part's release: it never waits, and the reading
-    -- must not retry, and it only reads (what it writes is not kept). It may read TVars that
-    -- more than one reading shares. The lease keeps its charge, and its owner stays live, until
-    -- the reading says 'ProviderComplete' or 'ProviderFailed'.
-  , afterRetirement ∷ IO () → IO ()
-    -- ^ Hand over a dependency the retirements need. Called from the release of the
-    -- part that owns the dependency, which must be ranked after the parts being
-    -- retired: the disposal is run once every retirement the lease has recorded has
-    -- completed, uninterruptibly on the owner's thread and before the instance's stop
-    -- completion settles, and never before. At once, inside the release, if none is
-    -- pending. If a provider reports its retirement failed the disposal never runs: the
-    -- dependency is retained, as the resource is, and the failure is the evidence.
-  }
-
 -- | Acquire a resource the instance owns, through a staged assembly. See the module
 -- header for the three steps and their guarantees.
 --
@@ -323,14 +303,6 @@ acquireWith leases ownership build = do
           abandon leases key
           forM_ notes (noteScope leases number)
         rethrowIO failure
-
--- | What the release of a lease's parts is given to record a retirement with.
-retirementsFor ∷ Leases → Word64 → Retirements
-retirementsFor leases key =
-  Retirements
-    { retireAsynchronously = \label poll → atomically (recordRetirement leases key label poll)
-    , afterRetirement = \disposal → atomically (deferDisposal leases key disposal) >>= mapM_ id
-    }
 
 -- | Borrow the resource a lease holds, for the duration of the action.
 --

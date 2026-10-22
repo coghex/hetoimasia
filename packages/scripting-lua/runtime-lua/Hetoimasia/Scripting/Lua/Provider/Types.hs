@@ -46,6 +46,20 @@ module Hetoimasia.Scripting.Lua.Provider.Types
   , RequestGrantViolation (..)
   , RequestGrantRefused (..)
 
+    -- * The opt-in admission
+  , Necessity (..)
+  , Admission (..)
+  , admission
+  , Credit (..)
+  , CreditEnd (..)
+  , Bank (..)
+  , renderBank
+  , ExpectedFailure (..)
+  , Adoption (..)
+  , Held (..)
+  , Adopting (..)
+  , ProviderDefect (..)
+
     -- * What a provider implements
   , RequestEndpoint (..)
   , Submission (..)
@@ -103,16 +117,19 @@ import Data.Map.Strict (Map)
 import Data.Set (Set)
 import Data.Text (Text)
 import qualified Data.Text as Text
+import Data.Typeable (Typeable)
 import Data.Word (Word64)
+import Hetoimasia.Foundation.Resource (Assembly)
 import Hetoimasia.Scripting.Lua.Instance.Types (InstanceId, Instances)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (Epoch, RequestId (RequestId), RequestName (RequestName), SubscriptionId (SubscriptionId), SubscriptionName (SubscriptionName), TaskId)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Request (CancelCause, Reply, Settlement)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Session (ExitRecord, Session)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Subscription (OverloadPolicy (..))
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Value (Payload)
+import Hetoimasia.Scripting.Lua.Lease.State (Leases, Ownership, Retirements)
 import Hetoimasia.Scripting.Lua.Retention (Retained, RetirementState)
 import Hetoimasia.Scripting.Lua.Runtime.Types (OwnerId)
-import Hetoimasia.Scripting.Lua.Value (Schema, Value, ValueLimits)
+import Hetoimasia.Scripting.Lua.Value (Schema, Value (VText), ValueLimits)
 
 -- The grant ------------------------------------------------------------------------
 
@@ -177,6 +194,15 @@ data RequestInfo = RequestInfo
   , infoEndpoint ∷ !Text
   , infoNumber ∷ !Word64
     -- ^ The request's number, which is unique to its owner and never reissued.
+  , infoNecessity ∷ !(Maybe Necessity)
+    -- ^ Whether an expected failure of the request fails its instance. 'Nothing' for a request
+    -- that did not take the opt-in admission ('Admission').
+  , infoSource ∷ !(Maybe Text)
+    -- ^ The attributable source context the opt-in admission recorded for the request.
+  , infoOffset ∷ !(Maybe Word64)
+    -- ^ The tick offset a logical request was admitted with, validated and fixed at admission.
+  , infoDue ∷ !(Maybe DueSlot)
+    -- ^ The place a logical request's settlement is due at, assigned once at admission.
   }
   deriving (Eq, Show)
 
@@ -265,7 +291,18 @@ data ProviderReply
     ProviderResult !Value
   | -- | The provider's own failure, returned to the script as data.
     ProviderFailure !Text
-  deriving (Eq, Show)
+  | -- | An expected failure of the content or service, with the code its service supplies. Only
+    -- a request admitted through the opt-in 'Admission' takes it as such: its code must be
+    -- one of the request's 'admitExpectedCodes', or the reply is a provider defect. A request
+    -- that did not take the opt-in settles as the generic failure it would for a
+    -- 'ProviderFailure' of the message.
+    ProviderExpected !ExpectedFailure
+  | -- | A result whose resource the instance is to own: the value, and how the engine builds
+    -- the resource on the owner's thread into the lease the request reserved ('admitLease'),
+    -- at the owner's next boundary. A request that reserved no lease takes it as a plain
+    -- 'ProviderResult' of the value, and the recipe is never run.
+    ProviderResource !Value !Adoption
+  deriving (Show)
 
 -- | What became of an answer. Never an error: a duplicate, late or stale answer is evidence
 -- about the provider and is counted, and it still retires the provider's work.
@@ -283,7 +320,222 @@ data ReplyAnswer
     ReplyLate
   | -- | No such request: of a replaced epoch, taken back, or never issued. Counted.
     ReplyUnknown
+  | -- | The request reserved a result lease: the owner builds the resource into it on its
+    -- thread at its next boundary, and only then settles (or, on logical time, holds) the
+    -- result. Nothing is settled yet.
+    ReplyAdoption
+  | -- | A request admitted through the opt-in 'Admission' was answered with something its
+    -- service did not declare: a result over the ceilings or not of the endpoint's schema, or a
+    -- failure with no code the service supplies. This is a provider defect, never a
+    -- result and never a failure of the request: it fails the owner, once, at its next
+    -- boundary, and the work is proved over.
+    ReplyDefective
   deriving (Eq, Show)
+
+-- The opt-in admission --------------------------------------------------------------
+
+-- | Whether an expected failure of a request fails the instance that made it (D-52): the
+-- request's required or optional policy, which the service supplies.
+data Necessity
+  = -- | An expected failure, once it is eligible to settle, fails the instance, whether or not
+    -- its script ever reads the request.
+    RequiredRequest
+  | -- | An expected failure is a result for the script to read.
+    OptionalRequest
+  deriving (Eq, Show)
+
+-- | A bank of credit a provider declares for the requests it serves (a byte budget, a worker
+-- lane), reserved with the request and returned when its lifetime ends.
+--
+-- The bank is the provider's: the engine reserves it inside the one transaction that admits the
+-- request, so a reservation and the request are both made or neither is, and returns it exactly
+-- once, at the end named by 'CreditEnd', in a transaction on the owner's thread (or, for an
+-- admission taken back, on the thread that made it). Both actions run inside the engine's
+-- transactions: they only read and write the provider's own variables, never retry, and
+-- never run provider code that blocks.
+data Credit = Credit
+  { creditName ∷ !Text
+    -- ^ Named in the busy answer and in evidence. Bounded to 64 characters when it is shown.
+  , creditReserve ∷ STM Bool
+    -- ^ Take the credit: 'True' when it was available and is now held. A bank that is full
+    -- answers 'False'; whatever it wrote is undone with the rest of the admission.
+  , creditRelease ∷ CreditEnd → STM ()
+    -- ^ Give the credit back, once, with the reason. Never called for a credit that
+    -- 'creditTransfers' and whose request succeeded with a resource.
+  , creditTransfers ∷ !Bool
+    -- ^ Whether a request that succeeds with a resource ('ProviderResource', adopted into its
+    -- result lease) hands the credit to that resource: the provider's own release of the
+    -- resource gives it back, and the engine does not. A credit that does not transfer is the
+    -- request's, and is returned when the request is taken and its work is retired.
+  }
+
+-- | Why a credit is returned.
+data CreditEnd
+  = -- | The request was taken back before the provider was asked anything, or never reached
+    -- the provider: the credit was never used.
+    CreditUnused
+  | -- | The request's result was taken or discarded and the provider's work on it is retired.
+    CreditSettled
+  deriving (Eq, Show)
+
+-- | The bank that had no room for a request, which the answer names. Nothing was reserved.
+data Bank
+  = -- | The instance's accepted, unretired requests: the bound.
+    BankInstanceRequests !Int
+  | -- | The VM's accepted, unretired requests: the bound.
+    BankVmRequests !Int
+  | -- | The owner's request places (the grant's bound).
+    BankOwnerRequests !Int
+  | -- | The instance's lease capacity: the capacity and what is charged.
+    BankLeases !Int !Int
+  | -- | A provider-declared credit, by its name.
+    BankCredit !Text
+  deriving (Eq, Show)
+
+-- | A bank, as the bounded diagnostic a busy answer carries.
+renderBank ∷ Bank → Text
+renderBank = \case
+  BankInstanceRequests bound → "the instance holds all " <> Text.pack (show bound) <> " of its request places"
+  BankVmRequests bound → "the VM holds all " <> Text.pack (show bound) <> " of its request places"
+  BankOwnerRequests bound → "the owner holds all " <> Text.pack (show bound) <> " of its request places"
+  BankLeases capacity charged → "the instance's lease capacity is charged: " <> Text.pack (show charged) <> " of " <> Text.pack (show capacity)
+  BankCredit name → "the provider has no room in " <> Text.take 64 name
+
+-- | An expected failure of the content or service a request asked for: a code the service
+-- supplies, a bounded message, and for content the root and path that failed.
+data ExpectedFailure = ExpectedFailure
+  { expectedCode ∷ !Text
+  , expectedMessage ∷ !Text
+  , expectedRoot ∷ !(Maybe Text)
+  , expectedPath ∷ !(Maybe Text)
+  }
+  deriving (Eq, Show)
+
+-- | How the engine builds a request's resource into the lease the request reserved. Run once,
+-- on the owner's thread, uninterruptibly masked as an acquisition is, at the owner's boundary
+-- after the provider replied. A recipe that is never run (the request was cancelled first, its
+-- requester ended) leaves the resource with the provider's own work to retire; one that
+-- raises is a failure of application code, and ends the owner under its policy.
+data Adoption = ∀ a. Typeable a ⇒ Adoption (Retirements → Assembly a)
+
+instance Show Adoption where
+  show _ = "Adoption"
+
+-- | What an opt-in admission asks of the owner, beside the grant (D-52, D-53, D-54, D-67).
+--
+-- It is carried by one request and by nothing else: the owner's defaults, its generic
+-- requests and its full-capacity behaviour (a refusal that fails the call) are unchanged.
+data Admission = Admission
+  { admitNecessity ∷ !Necessity
+  , admitSource ∷ !Text
+    -- ^ Attributable source context: what the requester asked for, recorded with the request
+    -- and named when a required failure fails the instance. Bounded to 128 characters.
+  , admitOffset ∷ !(Maybe Word64)
+    -- ^ The tick offset of a logical request, positive; 'Nothing' is the default of one. An
+    -- owner that settles on arrival refuses one that is given.
+  , admitLogicalMaximum ∷ !Word64
+    -- ^ The ceiling of every logical tick, offset and sequence the admission assigns.
+  , admitPerInstance ∷ !Int
+    -- ^ The most accepted, unretired requests one instance holds.
+  , admitPerVm ∷ !Int
+    -- ^ The most the owner's VM holds, across its instances.
+  , admitReplyLimits ∷ !ValueLimits
+    -- ^ The ceilings a reply is checked against beside the owner's: a reply past them is a
+    -- provider defect ('ReplyDefective').
+  , admitExpectedCodes ∷ ![Text]
+    -- ^ The failure codes the request's service supplies: an expected failure with another is
+    -- a provider defect.
+  , admitMessageBytes ∷ !Int
+    -- ^ The most UTF-8 bytes of an expected failure's message; a longer one is cut at a
+    -- character, visibly.
+  , admitPathBytes ∷ !Int
+    -- ^ The most UTF-8 bytes of an expected failure's root or path; a longer one is a
+    -- provider defect, since cutting an identity would name another.
+  , admitCredits ∷ ![Credit]
+    -- ^ Provider-declared credits, reserved in this order with the request.
+  , admitLease ∷ !(Maybe Ownership)
+    -- ^ Reserve a result lease in the instance's lease scope, to be adopted when the provider
+    -- replies with a resource.
+  , admitCombine ∷ !(Maybe (Value → Word64 → Value))
+    -- ^ How the value a script is handed for a success holds the key of the adopted lease's
+    -- handle: the service's own shape (a record carrying the handle and its dimensions, or the
+    -- handle itself). 'Nothing' hands the provider's value as it is. Called with key 0 to measure
+    -- the envelope at reply time, so it must not change its size with the key.
+  , admitSuccessFrame ∷ Value → [(Text, Value)]
+    -- ^ The record a script is handed for a success of the value: the shape the reply is
+    -- measured against the owner's ceilings in. The service's own; the default is the generic
+    -- result record.
+  , admitFailureFrame ∷ ExpectedFailure → [(Text, Value)]
+    -- ^ The record a script is handed for an expected failure: the service's own; the default is
+    -- the generic failure record.
+  }
+
+-- | The shape of a success when the admission says nothing: the generic result record.
+defaultSuccessFrame ∷ Value → [(Text, Value)]
+defaultSuccessFrame value = [("status", VText "result"), ("value", value)]
+
+-- | The shape of an expected failure when the admission says nothing: the generic failure
+-- record, with the message as its reason.
+defaultFailureFrame ∷ ExpectedFailure → [(Text, Value)]
+defaultFailureFrame found = [("status", VText "failure"), ("reason", VText (expectedMessage found))]
+
+-- | An admission with these policies, no offset, no codes, no credits and no result lease.
+admission ∷ Necessity → Text → ValueLimits → Word64 → Int → Int → Admission
+admission requirement source limits ceilingValue perInstance perVm =
+  Admission
+    { admitNecessity = requirement
+    , admitSource = Text.take 128 source
+    , admitOffset = Nothing
+    , admitLogicalMaximum = ceilingValue
+    , admitPerInstance = perInstance
+    , admitPerVm = perVm
+    , admitReplyLimits = limits
+    , admitExpectedCodes = []
+    , admitMessageBytes = 2048
+    , admitPathBytes = 1024
+    , admitCredits = []
+    , admitLease = Nothing
+    , admitCombine = Nothing
+    , admitSuccessFrame = defaultSuccessFrame
+    , admitFailureFrame = defaultFailureFrame
+    }
+
+-- | A provider answered a request admitted through the opt-in 'Admission' with something its
+-- service did not declare. A failure of the engine's provider boundary, never an expected
+-- content failure: it ends the owner under its policy, whatever the request's requirement.
+newtype ProviderDefect = ProviderDefect Text
+  deriving (Eq, Show)
+
+instance Exception ProviderDefect
+
+-- | What the service holds of an opt-in request's banks, from its admission until the request
+-- is taken or discarded and the provider has retired its work. Written by admission and by
+-- transactions on the owner's thread only, never by a provider's completion: that is how a
+-- capacity a native thread frees reaches admission only at the owner's accounted boundary.
+data Held = Held
+  { heldRequester ∷ !Requester
+  , heldCredits ∷ ![Credit]
+    -- ^ The credits still charged.
+  , heldLease ∷ !(Maybe Word64)
+    -- ^ The key of the reserved result lease, until it is adopted or discharged.
+  , heldRetiring ∷ !(Maybe Word64)
+    -- ^ The key of a lease slot whose building failed and whose rolled-back stages are still being
+    -- retired by their provider: the slot keeps its charge until they are, and the request's credits
+    -- stay charged with it.
+  }
+
+-- | A provider's resource reply that the owner has yet to build into its reserved lease.
+data Adopting = Adopting
+  { adoptingKey ∷ !Word64
+  , adoptingInstance ∷ !Word64
+  , adoptingBuild ∷ !Adoption
+  , adoptingValue ∷ !Value
+  , adoptingBytes ∷ !Int
+  , adoptingClaimed ∷ !Bool
+    -- ^ The owner is building the resource now. A claimed entry stays until the building is
+    -- finished or failed, so the reservation it builds into is not discharged under it, and
+    -- nothing that ends the request drops it.
+  }
 
 -- Refusals --------------------------------------------------------------------------
 
@@ -307,6 +559,20 @@ data RequestRefusal
   | -- | The handle names no request: its settlement was taken, its requester ended, or it
     -- was never issued.
     RequestEnded
+  | -- | The opt-in admission is an instance's: a task is not one.
+    RequestNotAnInstance
+  | -- | An owner that settles on arrival takes no logical offset.
+    RequestOffsetOnArrival
+  | -- | The offset is not a positive integer.
+    RequestOffsetInvalid
+  | -- | The tick and the offset do not sum to a position within the numeric ceiling: the
+    -- ceiling.
+    RequestTickUnrepresentable !Word64
+  | -- | The owner has issued every request number the numeric ceiling allows: the ceiling.
+    RequestNumbersExhausted !Word64
+  | -- | The admission reserves a result lease, and the instance has no lease scope: the
+    -- owner was given no leases, or the instance is ending.
+    RequestNoLeaseScope
   deriving (Eq, Show)
 
 -- | A refusal as the reason a script reads.
@@ -320,6 +586,12 @@ renderRequestRefusal = \case
   RequestsFull bound → "request refused: all " <> Text.pack (show bound) <> " places are held"
   NotTheRequester → "request refused: the handle belongs to another requester"
   RequestEnded → "request refused: the handle names no request that is still held"
+  RequestNotAnInstance → "request refused: only an instance makes this request"
+  RequestOffsetOnArrival → "request refused: this request settles on arrival and takes no tick offset"
+  RequestOffsetInvalid → "request refused: the tick offset is not a positive integer"
+  RequestTickUnrepresentable highest → "request refused: the tick and offset pass the ceiling of " <> Text.pack (show highest)
+  RequestNumbersExhausted highest → "request refused: every request number up to " <> Text.pack (show highest) <> " has been issued"
+  RequestNoLeaseScope → "request refused: the instance has no lease scope to reserve a result lease in"
 
 -- Subscriptions ---------------------------------------------------------------------
 
@@ -547,6 +819,9 @@ data ProviderState = ProviderState
   , psEndpoints ∷ !(Map Text RequestEndpoint)
   , psTicks ∷ !Ticks
   , psInstances ∷ !(Maybe Instances)
+  , psLeases ∷ !(Maybe Leases)
+    -- ^ The leases the owner's instances hold their resources through, when it was given them:
+    -- what an admission reserves a result lease in.
   , psEvents ∷ !(Map Text EventEndpoint)
     -- ^ The event endpoints the owner offers, by name; none for an owner granted no subscriptions.
   , psSubscriptionBound ∷ !Int
@@ -591,6 +866,20 @@ data PState = PState
   , pEvents ∷ !EventCounts
   , pNextSub ∷ !Word64
     -- ^ The next subscription number. Never rewinds.
+  , pHeld ∷ !(Map RequestId Held)
+    -- ^ The banks the opt-in requests hold, by request: what per-instance and per-VM admission
+    -- counts. An entry leaves only in a transaction on the owner's thread ('releaseSettled').
+  , pAdopting ∷ !(Map RequestId Adopting)
+    -- ^ The resource replies the owner has yet to build into their leases.
+  , pDefects ∷ ![Text]
+    -- ^ The provider defects the owner has yet to raise, oldest first, each bounded.
+  , pCleanup ∷ ![SomeException]
+    -- ^ The failures of providers' credit releases on the owner's thread, oldest first, at most sixteen:
+    -- cleanup evidence the owner keeps at its next boundary, fatal as any is.
+  , pDiscards ∷ ![(Word64, Word64)]
+    -- ^ The adopted leases, by instance and key, of requests that settled without delivering the
+    -- resource to their script (cancelled, or ended by an epoch): nothing can reach them, and the
+    -- owner releases them at its next boundary.
   , pForget ∷ !(Map Word64 [Word64])
     -- ^ The numbers of the subscriptions an epoch change ended, by instance, that the instance's VM
     -- still holds a callback for: the owner has its driver let go of them at its next boundary,
@@ -613,6 +902,16 @@ data Rec = Rec
   , recEnded ∷ !(Maybe (Settlement Value, CancelCause))
     -- ^ How an epoch change settled it, for its script to take: the model's record was
     -- discarded with the epoch.
+  , recAdmission ∷ !(Maybe Admission)
+    -- ^ What the opt-in admission recorded for the request, fixed at its admission and never
+    -- read from anywhere a later callback could change.
+  , recFailure ∷ !(Maybe ExpectedFailure)
+    -- ^ The expected failure a failure settlement of an opt-in request carries.
+  , recLease ∷ !(Maybe Word64)
+    -- ^ The key of the result lease the admission reserved for it.
+  , recAdopted ∷ !Bool
+    -- ^ The resource was built into that lease: a success carries the lease, and taking it does
+    -- not release it.
   }
 
 -- | The accounting of a provider's work on one request.
@@ -757,12 +1056,20 @@ data ProviderCounts = ProviderCounts
   , countSettledAtTick ∷ !Int
   , countCancelledBeforeTick ∷ !Int
   , countEpochCancelled ∷ !Int
+  , countBusy ∷ !Int
+    -- ^ Opt-in admissions that found a bank full and reserved nothing.
+  , countDefects ∷ !Int
+    -- ^ Replies to opt-in requests that were provider defects.
+  , countLatched ∷ !Int
+    -- ^ Required failures that were latched on their instances.
+  , countAdopted ∷ !Int
+    -- ^ Resource replies built into their reserved leases.
   }
   deriving (Eq, Show)
 
 -- | Nothing happened yet.
 noCounts ∷ ProviderCounts
-noCounts = ProviderCounts 0 0 0 0 0 0 0 0
+noCounts = ProviderCounts 0 0 0 0 0 0 0 0 0 0 0 0
 
 -- | A reading of the service, taken in one transaction.
 data ProviderDiagnostics = ProviderDiagnostics
@@ -789,6 +1096,17 @@ data ProviderDiagnostics = ProviderDiagnostics
   , rdSettledAtTick ∷ !Int
   , rdCancelledBeforeTick ∷ !Int
   , rdEpochCancelled ∷ !Int
+  , rdBusy ∷ !Int
+  , rdHeld ∷ !Int
+    -- ^ Opt-in requests holding their banks: what per-instance and per-VM admission counts.
+  , rdHeldBy ∷ !(Map Word64 Int)
+    -- ^ The same, by instance.
+  , rdAdopting ∷ !Int
+    -- ^ Resource replies the owner has yet to build into their leases.
+  , rdDefects ∷ !Int
+    -- ^ Provider defects raised or still to be raised.
+  , rdLatched ∷ !Int
+  , rdAdopted ∷ !Int
   }
   deriving (Eq, Show)
 

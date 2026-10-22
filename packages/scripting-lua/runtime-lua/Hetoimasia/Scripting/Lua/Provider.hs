@@ -96,6 +96,8 @@ module Hetoimasia.Scripting.Lua.Provider
   , RetirementState (..)
   , Completion (..)
   , ProviderReply (..)
+  , ExpectedFailure (..)
+  , Adoption (..)
   , ReplyAnswer (..)
 
     -- * Subscriptions
@@ -116,6 +118,9 @@ module Hetoimasia.Scripting.Lua.Provider
     -- * The guard
   , guarded
 
+    -- * Qualification
+  , skipRequestNumbers
+
     -- * Epochs
   , EpochReport (..)
   , EpochChange (..)
@@ -129,13 +134,14 @@ module Hetoimasia.Scripting.Lua.Provider
   , subscriptionDiagnostics
   ) where
 
-import Control.Concurrent.STM (STM)
+import Control.Concurrent.STM (STM, atomically)
+import Data.Word (Word64)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Session (EpochChange (..))
 import Hetoimasia.Scripting.Lua.Retention (RetirementState (..))
 import Hetoimasia.Scripting.Lua.Provider.Serve (guarded)
 import qualified Hetoimasia.Scripting.Lua.Provider.Serve as Serve
 import Hetoimasia.Scripting.Lua.Provider.Events (subscriptionDiagnosticsSTM)
-import Hetoimasia.Scripting.Lua.Provider.State (EpochReport (..), diagnosticsSTM)
+import Hetoimasia.Scripting.Lua.Provider.State (EpochReport (..), diagnosticsSTM, skipNumbers)
 import Hetoimasia.Scripting.Lua.Provider.Types
 import Hetoimasia.Scripting.Lua.Scheduled.Types (Control (controlProvider), ScheduledEndpoint (ScheduledEndpoint))
 
@@ -158,6 +164,15 @@ advanceRequestEpoch ∷ ScheduledEndpoint → IO (Maybe EpochReport)
 advanceRequestEpoch (ScheduledEndpoint control) = case controlProvider control of
   Nothing → pure Nothing
   Just service → Serve.advanceRequestEpoch service
+
+-- | Move the owner's next request number forward to at least this one and answer the number the next
+-- request will be given, or 'Nothing' for an owner with no request service. The numbers never
+-- rewind and none is reissued: skipping leaves some unused. It exists so that a qualification
+-- brings the counters of an admission to their ceiling without issuing every number before it.
+skipRequestNumbers ∷ ScheduledEndpoint → Word64 → IO (Maybe Word64)
+skipRequestNumbers (ScheduledEndpoint control) wanted = case controlProvider control of
+  Nothing → pure Nothing
+  Just service → Just <$> atomically (skipNumbers service wanted)
 
 -- | A reading of the owner's request service in one transaction, or 'Nothing' for an owner
 -- with none.
