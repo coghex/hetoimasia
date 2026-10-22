@@ -37,10 +37,12 @@ module Hetoimasia.Scripting.Lua.Provider.State
     -- * Who asks
   , Caller (..)
   , callerOf
+  , callerPhaseOf
   , requesterOf
   , markClosing
   , unmarkClosing
   , peekNumber
+  , skipNumbers
 
     -- * Admitting
   , Placement (..)
@@ -50,9 +52,24 @@ module Hetoimasia.Scripting.Lua.Provider.State
   , commitSubmitted
   , withdrawAdmission
 
+    -- * The opt-in admission
+  , AdmissionDefect (..)
+  , OptIn (..)
+  , admitOptIn
+  , preflightOptIn
+  , Terminal (..)
+  , TakeTerminal (..)
+  , takeTerminal
+  , releaseSettled
+  , takeDefects
+  , takePendingAdoptions
+  , finishAdoption
+  , failAdoption
+
     -- * Answering
   , Checked (..)
   , checkReply
+  , checkReplyFor
   , replyTo
   , settlementFields
   , deliverable
@@ -98,36 +115,46 @@ module Hetoimasia.Scripting.Lua.Provider.State
 
 import Control.Concurrent.STM
   ( STM
+  , catchSTM
   , modifyTVar'
   , newTVarIO
+  , orElse
   , readTVar
+  , throwSTM
   , writeTVar
   )
 import Control.Exception
-  ( ExceptionWithContext (ExceptionWithContext)
+  ( Exception
+  , ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException
   , SomeException
   , fromException
   , throwIO
   )
-import Control.Monad (foldM, forM, forM_)
+import Control.Monad (foldM, forM, forM_, unless, when)
 import Data.List (nub)
 import Data.List.NonEmpty (NonEmpty)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
-import Data.Maybe (fromMaybe, isJust, isNothing)
+import Data.Maybe (catMaybes, fromMaybe, isJust, isNothing)
+import qualified Data.ByteString as ByteString
 import Data.Sequence ((|>))
 import Data.Text (Text)
 import qualified Data.Text as Text
+import qualified Data.Text.Encoding as Encoding
 import Data.Word (Word64)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (operation, throwFailure)
 import Hetoimasia.Scripting.Lua.Instance.Types
-  ( InstanceBounds (boundInvocationQueue)
-  , Instances (insBounds, insInbox, insRunning)
-  , Job (JobForget)
+  ( ICell (icId, icState)
+  , IState (isDispatchQueued, isPhase, isRequestFailure, isStopped)
+  , InstanceBounds (boundInvocationQueue)
+  , InstancePhase (Initializing)
+  , Instances (insBounds, insCells, insInbox, insRunning)
+  , Job (JobDispatch, JobForget)
+  , isTerminal
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Failure
   ( ReasonCode (ProviderFault, ValidationFault)
@@ -182,7 +209,7 @@ import Hetoimasia.Scripting.Lua.Internal.Value
   , conformValue
   , valuesFootprint
   )
-import Hetoimasia.Scripting.Lua.Lease.State (renderCaught)
+import Hetoimasia.Scripting.Lua.Lease.State (Leases, Refusal (CapacityExhausted), Scope (scopeOpen), abandon, readScope, renderCaught, reserve)
 import Hetoimasia.Scripting.Lua.Retention
   ( Ended (..)
   , Obligation (Obligation)
@@ -194,7 +221,7 @@ import Hetoimasia.Scripting.Lua.Retention
   , retain
   , sweep
   )
-import Hetoimasia.Scripting.Lua.Provider.Events (SubEnd (EndByEpoch, EndByOwner), awaiting, endSubs, requesterClosed)
+import Hetoimasia.Scripting.Lua.Provider.Events (SubEnd (EndByEpoch, EndByOwner), awaiting, cellOf, endSubs, requesterClosed)
 import Hetoimasia.Scripting.Lua.Provider.Types
 import Hetoimasia.Scripting.Lua.Owner (maxEntries)
 import Hetoimasia.Scripting.Lua.Registration (validName)
@@ -323,8 +350,9 @@ newProviderState
   → Maybe (SubscriptionGrant, Map Text EventEndpoint)
   → Ticks
   → Maybe Instances
+  → Maybe Leases
   → IO ProviderState
-newProviderState owner label key limits grant endpoints subscriptions ticks instances = do
+newProviderState owner label key limits grant endpoints subscriptions ticks instances leases = do
   session ← case newSession key (requestLimits limits (maybe 1 (boundInvocationQueue . insBounds) instances) grant (fst <$> subscriptions)) of
     Right made → pure made
     Left violations → throwFailure runtimeComponent (operation "new-provider") [] (SchedulerRefused (fmap LimitRefused violations))
@@ -348,6 +376,9 @@ newProviderState owner label key limits grant endpoints subscriptions ticks inst
         , pStaged = Map.empty
         , pEvents = noEventCounts
         , pNextSub = 1
+        , pHeld = Map.empty
+        , pAdopting = Map.empty
+        , pDefects = []
         , pForget = Map.empty
         }
   pure
@@ -360,6 +391,7 @@ newProviderState owner label key limits grant endpoints subscriptions ticks inst
       , psEndpoints = endpoints
       , psTicks = ticks
       , psInstances = instances
+      , psLeases = leases
       , psEvents = maybe Map.empty snd subscriptions
       , psSubscriptionBound = maybe 1 (grantSubscriptionBound . fst) subscriptions
       , psStagingBound = maybe 1 (grantStagingBound . fst) subscriptions
@@ -389,6 +421,27 @@ callerOf service = do
 -- | The number the next request will be given, for the application's assignment to be told.
 peekNumber ∷ ProviderState → STM Word64
 peekNumber service = pNext <$> readTVar (psVar service)
+
+-- | Move the next request number forward to at least this one, answering the number the next
+-- request will be given. The number never rewinds and no number is reissued: skipping only
+-- leaves some unused, which nothing observes but the ceiling the numbers are counted against. It
+-- is how a qualification brings the counter to its ceiling without issuing every number.
+skipNumbers ∷ ProviderState → Word64 → STM Word64
+skipNumbers service wanted = do
+  st ← readTVar (psVar service)
+  let next = max wanted (pNext st)
+  next <$ writeTVar (psVar service) st {pNext = next}
+
+-- | The phase of the instance whose code is running, if one is: what a hook that may not wait
+-- or may not start work reads. Engine-owned, never a script's claim.
+callerPhaseOf ∷ ProviderState → STM (Maybe InstancePhase)
+callerPhaseOf service = do
+  caller ← callerOf service
+  case (caller, psInstances service) of
+    (CallerInstance number, Just instances) → do
+      cells ← readTVar (insCells instances)
+      forM (Map.lookup number cells) (fmap isPhase . readTVar . icState)
+    _ → pure Nothing
 
 -- | The requester a caller is, if it is one.
 requesterOf ∷ Caller → Maybe Requester
@@ -502,6 +555,10 @@ admit service requester endpoint placement = do
                         , recHeld = Nothing
                         , recGated = dueTick <$> slot
                         , recEnded = Nothing
+                        , recAdmission = Nothing
+                        , recFailure = Nothing
+                        , recLease = Nothing
+                        , recAdopted = False
                         }
                     work =
                       Work
@@ -555,19 +612,352 @@ commitSubmitted service identity provided disposals = do
         _ → pure ProviderPending
 
 -- | Take back an admission whose handoff to the provider failed: it never reached it. Nothing
--- is settled or invalidated, and the capacity is free again.
+-- is settled or invalidated, and the capacity is free again, every bank the opt-in admission
+-- reserved with it included: the credits are returned unused, the reserved lease discharged, the
+-- places in the ledger given back and a resource reply it had already received dropped.
 withdrawAdmission ∷ ProviderState → RequestId → STM ()
 withdrawAdmission service identity = do
   st ← readTVar (psVar service)
   let gated = Map.lookup identity (pRecs st) >>= recGated
   mapM_ (ticksRelease (psTicks service)) gated
+  case Map.lookup identity (pHeld st) of
+    Nothing → pure ()
+    Just held → do
+      forM_ (heldCredits held) (`creditRelease` CreditUnused)
+      forM_ ((,) <$> psLeases service <*> heldLease held) (uncurry abandon)
   writeTVar (psVar service) st
     { pSession = withdrawRequest identity (pSession st)
     , pRecs = Map.delete identity (pRecs st)
     , pByNumber = Map.filter (/= identity) (pByNumber st)
     , pWork = Map.delete identity (pWork st)
     , pDue = Map.filter (/= identity) (pDue st)
+    , pHeld = Map.delete identity (pHeld st)
+    , pAdopting = unclaimed (Map.delete identity) (pAdopting st)
     }
+
+-- The opt-in admission ----------------------------------------------------------------
+
+-- | The engine could not keep an admission's or a settlement's bookkeeping consistent: a counter
+-- past what it holds after the admission was valid, a result lease reserved without the way to
+-- hand its handle to the script, a settlement an opt-in service never declared. A failure of the
+-- host, raised from the transaction it was found in: never a refusal, and never busy.
+newtype AdmissionDefect = AdmissionDefect Text
+  deriving (Eq, Show)
+
+instance Exception AdmissionDefect
+
+-- | Why an opt-in admission stopped, raised inside its one transaction so that everything it had
+-- reserved before is undone with it. Private to this module: nothing else raises it.
+data AdmitStop
+  = StopBank !Bank
+  | StopRefused !RequestRefusal
+  deriving (Show)
+
+instance Exception AdmitStop
+
+-- | What an opt-in admission came to.
+data OptIn
+  = -- | Accepted: every bank reserved, the place assigned, nothing else done yet.
+    OptInAccepted !Admitted
+  | -- | A temporary bank had no room: nothing at all was reserved.
+    OptInBusy !Bank
+  | -- | A permanent fact refuses it: nothing was reserved.
+    OptInRefused !RequestRefusal
+
+-- | The place of an opt-in request, or the permanent reason it has none: decided from what the
+-- caller read in one transaction, and the same for the preflight a binding's precondition makes
+-- and for the admission itself.
+--
+-- The reasons are decided in this order, and the order is the contract: the owner or the requester
+-- is not taking requests, the requester is no instance, the request numbers are exhausted, an
+-- owner that settles on arrival was given an offset, the offset is not positive, the tick and the
+-- offset do not sum to a position within the ceiling, that position has begun.
+optInSlot ∷ ProviderState → Requester → Admission → Bool → Word64 → Maybe InstancePhase → Word64 → Either RequestRefusal (Maybe DueSlot)
+optInSlot service requester ask taking now phase number
+  | not taking = Left RequestsClosed
+  | RequesterTask _ ← requester = Left RequestNotAnInstance
+  | number > admitLogicalMaximum ask = Left (RequestNumbersExhausted (admitLogicalMaximum ask))
+  | otherwise = case psTiming service of
+      SettleOnArrival
+        | isJust (admitOffset ask) → Left RequestOffsetOnArrival
+        | otherwise → Right Nothing
+      SettleAtAssignedTick _
+        | offset == 0 → Left RequestOffsetInvalid
+        | tick > toInteger (admitLogicalMaximum ask) → Left (RequestTickUnrepresentable (admitLogicalMaximum ask))
+        | tick <= toInteger now → Left RequestLate
+        | otherwise → Right (Just (DueSlot (fromInteger tick) number))
+        where
+          offset = fromMaybe 1 (admitOffset ask)
+          -- Init is before tick 1: its origin is 0 (D-67). Everything else is made at the tick
+          -- the owner is at.
+          origin = if phase == Just Initializing then 0 else now
+          tick = toInteger origin + toInteger offset
+
+-- | What a binding's precondition may know of an opt-in request before it asks: the permanent
+-- refusal the admission itself would make if it were asked now, read in one transaction. It
+-- reserves nothing and writes nothing. A bank that is merely full is not here: that is busy,
+-- an answer of the admission, and a fact that can change before it.
+preflightOptIn ∷ ProviderState → Requester → Admission → STM (Maybe RequestRefusal)
+preflightOptIn service requester ask = do
+  st ← readTVar (psVar service)
+  open ← ticksOpen (psTicks service)
+  closedRequester ← requesterClosed service requester
+  now ← ticksNow (psTicks service)
+  phase ← callerPhaseOf service
+  scope ← leaseScopeOpen service requester
+  let taking = not (pClosed st) && open && not closedRequester
+  pure $ case optInSlot service requester ask taking now phase (pNext st) of
+    Left why → Just why
+    Right _
+      | isJust (admitLease ask) && not scope → Just RequestNoLeaseScope
+      | otherwise → Nothing
+
+-- | Whether a requester has a lease scope that is taking reservations.
+leaseScopeOpen ∷ ProviderState → Requester → STM Bool
+leaseScopeOpen service = \case
+  RequesterInstance number | Just leases ← psLeases service → maybe False scopeOpen <$> readScope leases number
+  _ → pure False
+
+-- | Admit an opt-in request: every permanent check, then every bank, then the place, the model's
+-- acceptance, the reserved result lease, the provider's credits, the owner's hold on the due
+-- tick and the ledger's entry, all in the one transaction. A bank without room, or a permanent
+-- refusal, raises inside it, and everything it had reserved before is undone: no handle, no
+-- hold, no credit, no lease slot, no counter. The tick is read in the same transaction as the
+-- hold, so a request accepted for a tick is held before that tick can begin; the sequence is the
+-- request number it is given in the same transaction, never read apart from it.
+--
+-- The banks are decided in this order, and the order is the contract: the instance's accepted,
+-- unretired requests, the VM's, the owner's places, the model's, the instance's lease capacity,
+-- then each provider credit in the order they were declared. What is counted is the ledger, which
+-- only the owner's own transactions shorten, never a provider's completion.
+admitOptIn ∷ ProviderState → Requester → RequestEndpoint → Admission → STM OptIn
+admitOptIn service requester endpoint ask = (OptInAccepted <$> attempt) `catchSTM` stopped
+  where
+    stopped ∷ AdmitStop → STM OptIn
+    stopped stop = do
+      modifyTVar' (psVar service) $ \st →
+        st {pCounts = case stop of
+          StopBank _ → (pCounts st) {countBusy = countBusy (pCounts st) + 1}
+          StopRefused _ → (pCounts st) {countRefused = countRefused (pCounts st) + 1}}
+      pure $ case stop of
+        StopBank bank → OptInBusy bank
+        StopRefused why → OptInRefused why
+    stop' ∷ Exception e ⇒ e → STM a
+    stop' = throwSTM
+    attempt = do
+      st ← readTVar (psVar service)
+      open ← ticksOpen (psTicks service)
+      closedRequester ← requesterClosed service requester
+      now ← ticksNow (psTicks service)
+      phase ← callerPhaseOf service
+      let number = pNext st
+          taking = not (pClosed st) && open && not closedRequester
+      slot ← either (stop' . StopRefused) pure (optInSlot service requester ask taking now phase number)
+      when (number == maxBound) (stop' (AdmissionDefect "the request counter has no number after the last"))
+      when (isJust (admitLease ask) && isNothing (admitCombine ask)) $
+        stop' (AdmissionDefect "an admission that reserves a result lease says nothing of how its handle reaches the script")
+      instanceNumber ← case requester of
+        RequesterInstance found → pure found
+        RequesterTask _ → stop' (StopRefused RequestNotAnInstance)
+      let mine = length [() | held ← Map.elems (pHeld st), heldRequester held == requester]
+          ledger = Map.size (pHeld st)
+      when (mine >= admitPerInstance ask) (stop' (StopBank (BankInstanceRequests (admitPerInstance ask))))
+      when (ledger >= admitPerVm ask) (stop' (StopBank (BankVmRequests (admitPerVm ask))))
+      when (ledger >= psBound service) (stop' (StopBank (BankOwnerRequests (psBound service))))
+      let (holder, withHolder) = case Map.lookup requester (pHolders st) of
+            Just held → (held, pSession st)
+            Nothing → issueHolder (pSession st)
+      (session, identity) ← case acceptRequestFor holder (RequestName number) (EndpointId (endpointName endpoint)) withHolder of
+        (_, Left (CapReached OutstandingRequests full)) → stop' (StopBank (BankOwnerRequests full))
+        (_, Left _) → stop' (StopRefused RequestsClosed)
+        (accepted, Right found) → pure (accepted, found)
+      leaseKey ← case (admitLease ask, psLeases service) of
+        (Nothing, _) → pure Nothing
+        (Just _, Nothing) → stop' (StopRefused RequestNoLeaseScope)
+        (Just ownership, Just leases) → do
+          reserved ← reserve leases instanceNumber ownership
+          case reserved of
+            Right key → pure (Just key)
+            Left (CapacityExhausted capacity charged) → stop' (StopBank (BankLeases capacity charged))
+            Left _ → stop' (StopRefused RequestNoLeaseScope)
+      forM_ (admitCredits ask) $ \credit → do
+        -- A provider's bank never makes the admission wait: one that retries is full.
+        reserved ← creditReserve credit `orElse` pure False
+        unless reserved (stop' (StopBank (BankCredit (creditName credit))))
+      forM_ slot $ \due → ticksHold (psTicks service) (dueTick due) >> ticksWatch (psTicks service) (dueTick due)
+      let record =
+            Rec
+              { recNumber = number
+              , recIdentity = identity
+              , recRequester = requester
+              , recEndpoint = endpointName endpoint
+              , recSchema = endpointResult endpoint
+              , recDue = slot
+              , recHeld = Nothing
+              , recGated = dueTick <$> slot
+              , recEnded = Nothing
+              , recAdmission = Just ask
+              , recFailure = Nothing
+              , recLease = leaseKey
+              , recAdopted = False
+              }
+          work =
+            Work
+              { workNumber = number
+              , workRequester = requester
+              , workLabel = endpointName endpoint <> " request " <> Text.pack (show number)
+              , workProvider = Nothing
+              , workWantsCancel = False
+              , workCancelClaimed = False
+              , workEnded = False
+              , workFailure = Nothing
+              , workRetained = noRetained
+              , workSubscription = Nothing
+              }
+      writeTVar (psVar service) st
+        { pSession = session
+        , pRecs = Map.insert identity record (pRecs st)
+        , pByNumber = Map.insert number identity (pByNumber st)
+        , pWork = Map.insert identity work (pWork st)
+        , pHolders = Map.insert requester holder (pHolders st)
+        , pDue = maybe id (\due → Map.insert due identity) slot (pDue st)
+        , pHeld = Map.insert identity (Held requester (admitCredits ask) leaseKey) (pHeld st)
+        , pNext = number + 1
+        , pCounts = (pCounts st) {countAdmitted = countAdmitted (pCounts st) + 1}
+        }
+      pure (Admitted number identity requester slot)
+
+-- | A terminal result, as the service hands it to the adapter that makes the record a script
+-- is given: a success with the value the script is handed for it (the adopted lease's handle
+-- composed in), an expected failure, or a cancellation.
+data Terminal
+  = TerminalSuccess !Value
+  | TerminalFailure !ExpectedFailure
+  | TerminalCancelled
+  deriving (Show)
+
+-- | What taking an opt-in request found.
+data TakeTerminal
+  = TakeTerminalRefused !RequestRefusal
+  | -- | Not settled. Nothing was taken.
+    TakeTerminalPending
+  | -- | The terminal result, taken once. The handle names nothing now.
+    TakeTerminal !Terminal
+
+-- | Take an opt-in request's terminal result, once. Taking the record is the generic take; what
+-- it adds is the terminal in the shape the service declared, and the release of the banks the
+-- request held if its provider has already been accounted retired. Taking a success whose resource
+-- was adopted does not release the lease: the instance owns the resource, and the handle in the
+-- value is the script's way to it.
+takeTerminal ∷ ProviderState → Requester → Word64 → STM TakeTerminal
+takeTerminal service requester number = do
+  st ← readTVar (psVar service)
+  case reach requester number st of
+    Left why → pure (TakeTerminalRefused why)
+    Right record → do
+      answer ← takeOf service requester number
+      case answer of
+        TakeRefused why → pure (TakeTerminalRefused why)
+        TakePending → pure TakeTerminalPending
+        TakeSettled settlement → do
+          terminal ← case settlement of
+            SettledResult payload → pure (TerminalSuccess (composed record (payloadValue payload)))
+            SettledFailure _ → case recFailure record of
+              Just found → pure (TerminalFailure found)
+              Nothing → throwSTM (AdmissionDefect "an opt-in request settled as a failure that carries no declared failure")
+            SettledCancelled _ → pure TerminalCancelled
+          releaseSettled service
+          pure (TakeTerminal terminal)
+  where
+    composed record value = case (recAdmission record >>= admitCombine, recLease record, recAdopted record) of
+      (Just combine, Just key, True) → combine value key
+      _ → value
+
+-- | Give back what the opt-in requests no longer hold, on the owner's thread, where the owner
+-- accounts for it. A request's places and credits are given back when its result has been taken
+-- or discarded /and/ the provider's work on it has been reaped as retired; the lease it reserved
+-- and never used is discharged as soon as that work is retired and the request has settled
+-- or gone. A lease that was adopted is the instance's resource, and nothing here touches it. Never
+-- called from a provider's completion: a capacity a native thread frees is not visible to
+-- admission until the owner's next accounted boundary, or the take that finds it already
+-- accounted.
+releaseSettled ∷ ProviderState → STM ()
+releaseSettled service = do
+  st ← readTVar (psVar service)
+  kept ← foldM (settle st) Map.empty (Map.toList (pHeld st))
+  st' ← readTVar (psVar service)
+  writeTVar (psVar service) st' {pHeld = kept}
+  where
+    settle st kept (identity, held) = do
+      let reaped = Map.notMember identity (pWork st)
+          record = Map.lookup identity (pRecs st)
+          resolved = maybe True (isSettled st) record && Map.notMember identity (pAdopting st)
+      -- A reservation nothing will use any more: its work is retired and the request has
+      -- settled without a resource for it (or is gone).
+      held' ←
+        if reaped && resolved && isJust (heldLease held)
+          then do
+            forM_ ((,) <$> psLeases service <*> heldLease held) (uncurry abandon)
+            pure held {heldLease = Nothing}
+          else pure held
+      if reaped && isNothing record
+        then do
+          forM_ (heldCredits held') (`creditRelease` CreditSettled)
+          pure kept
+        else pure (Map.insert identity held' kept)
+
+-- | Drop entries from the resource replies waiting to be built, but never one the owner is
+-- building: the building finishes or fails it.
+unclaimed ∷ (Map RequestId Adopting → Map RequestId Adopting) → Map RequestId Adopting → Map RequestId Adopting
+unclaimed drop' held = Map.union (Map.filter adoptingClaimed held) (drop' (Map.filter (not . adoptingClaimed) held))
+
+-- | The provider defects the owner has yet to raise, taken, oldest first.
+takeDefects ∷ ProviderState → STM [Text]
+takeDefects service = do
+  st ← readTVar (psVar service)
+  writeTVar (psVar service) st {pDefects = []}
+  pure (pDefects st)
+
+-- | The resource replies the owner has yet to build into their leases, taken: each is the
+-- caller's to build, and to finish with 'finishAdoption' or 'failAdoption'.
+takePendingAdoptions ∷ ProviderState → STM [(RequestId, Adopting)]
+takePendingAdoptions service = do
+  st ← readTVar (psVar service)
+  let waiting = Map.filter (not . adoptingClaimed) (pAdopting st)
+  writeTVar (psVar service) st {pAdopting = Map.map (\adopting → adopting {adoptingClaimed = True}) (pAdopting st)}
+  pure (Map.toList (Map.map (\adopting → adopting {adoptingClaimed = True}) waiting))
+
+-- | The resource of a request was built into its reserved lease: the lease is live, the places
+-- the credits that transfer were held for belong to the resource now, and the result is applied as
+-- though the provider had just given it (held for its tick, or settled). A request that was
+-- cancelled or ended while the resource was being built is no longer waiting for it: answers
+-- 'Nothing', and the caller releases what it built.
+finishAdoption ∷ ProviderState → RequestId → Adopting → STM (Maybe ReplyAnswer)
+finishAdoption service identity adopting = do
+  st ← readTVar (psVar service)
+  let waiting = case Map.lookup identity (pRecs st) of
+        Just record → isNothing (recEnded record) && maybe False (isNothing . requestSettlement) (Map.lookup identity (sessionRequests (pSession st)))
+        Nothing → False
+  if not waiting
+    then Nothing <$ writeTVar (psVar service) st {pAdopting = Map.delete identity (pAdopting st)}
+    else do
+      writeTVar (psVar service) st
+        { pRecs = Map.adjust (\record → record {recAdopted = True}) identity (pRecs st)
+        , pHeld = Map.adjust (\held → held {heldLease = Nothing, heldCredits = filter (not . creditTransfers) (heldCredits held)}) identity (pHeld st)
+        , pAdopting = Map.delete identity (pAdopting st)
+        , pCounts = (pCounts st) {countAdopted = countAdopted (pCounts st) + 1}
+        }
+      Just <$> applyChecked service identity (CheckedResult (adoptingBytes adopting) (adoptingValue adopting))
+
+-- | Building a request's resource failed: the reservation was given back by the building, and the
+-- request no longer holds a lease. The failure is the owner's to raise.
+failAdoption ∷ ProviderState → RequestId → STM ()
+failAdoption service identity =
+  modifyTVar' (psVar service) $ \st →
+    st
+      { pHeld = Map.adjust (\held → held {heldLease = Nothing}) identity (pHeld st)
+      , pAdopting = Map.delete identity (pAdopting st)
+      }
 
 -- Answering ---------------------------------------------------------------------------
 
@@ -581,12 +971,34 @@ data Checked
     CheckedOversize !Int
   | -- | Not what the endpoint declares, or not evaluable: why.
     CheckedMalformed !Text
+  | -- | An expected failure of an opt-in request, with a code its service supplies, its message and
+    -- identities within the bounds.
+    CheckedExpected !ExpectedFailure
+  | -- | A result whose resource the owner is to build into the request's reserved lease: its
+    -- size, the value, and the recipe.
+    CheckedResource !Int !Value !Adoption
+  | -- | A provider defect: what an opt-in request's service did not declare, and why (bounded).
+    CheckedDefect !Text
 
 -- | Check a reply against the owner's value limits and the endpoint's schema, evaluating it
 -- fully inside the one guard, so a value that throws when it is first looked at is a
 -- malformed reply and not an exception loose in a transaction.
 checkReply ∷ ValueLimits → Schema → ProviderReply → IO Checked
-checkReply limits schema reply = fitted <$> checked
+checkReply limits schema = checkReplyFor limits schema Nothing
+
+-- | The same, for a request that may have been admitted through the opt-in 'Admission'.
+--
+-- A request that was not admitted so settles a reply the generic way: what is not within the
+-- limits or the schema settles it as a validation failure. One that was admitted so takes the
+-- service's contract: the value must be within the admission's ceilings and its envelope (the
+-- record a script is handed) within the owner's; an expected failure must carry a code the
+-- service supplies and a root and path within their bound (its message is cut, visibly, until
+-- the envelope fits); and a reply that is none of these is a provider defect, never a failure of
+-- the request and never an invented code.
+checkReplyFor ∷ ValueLimits → Schema → Maybe Admission → ProviderReply → IO Checked
+checkReplyFor limits schema ask reply = case ask of
+  Nothing → fitted <$> judgeWith resultFields (const True) limits schema (generic reply)
+  Just opted → optedIn opted
   where
     -- The one place a reason is fitted, whatever made the reply a failure: nothing reaches
     -- the model or the held completion whose record would not fit the limits.
@@ -594,10 +1006,62 @@ checkReply limits schema reply = fitted <$> checked
       CheckedFailure why → CheckedFailure (fitReason limits why)
       CheckedMalformed why → CheckedMalformed (fitReason limits why)
       other → other
-    checked = judgeReply limits schema reply
+    -- What a request that took no opt-in makes of the two replies it does not know: the failure
+    -- it would be, and a result without its resource.
+    generic = \case
+      ProviderExpected found → ProviderFailure (expectedMessage found)
+      ProviderResource value _ → ProviderResult value
+      other → other
+    optedIn opted = case reply of
+      ProviderFailure _ → pure (CheckedDefect "the provider answered a failure with no code its service supplies")
+      ProviderExpected found → pure (expected opted found)
+      ProviderResult value → result opted value Nothing
+      ProviderResource value recipe → result opted value (Just recipe)
+    result opted value recipe = do
+      let frame found = admitSuccessFrame opted (maybe found (\make → make found 0) (admitCombine opted))
+          withinCeilings found = either (const False) (const True) (valuesFootprint (admitReplyLimits opted) [found])
+      judged ← judgeWith frame withinCeilings limits schema (ProviderResult value)
+      pure $ case judged of
+        CheckedResult bytes found → case recipe of
+          Just made | isJust (admitLease opted) → CheckedResource bytes found made
+          _ → CheckedResult bytes found
+        CheckedOversize _ → CheckedDefect "the provider's result is over the ceilings its service declares"
+        CheckedMalformed why → CheckedDefect (Text.take 480 why)
+        _ → CheckedDefect "the provider's result could not be checked"
+    expected opted found
+      | expectedCode found `notElem` admitExpectedCodes opted = CheckedDefect ("the provider answered a failure whose code " <> Text.take 64 (expectedCode found) <> " its service does not supply")
+      | any (longerThan (admitPathBytes opted)) (catMaybes [expectedRoot found, expectedPath found]) = CheckedDefect "the provider answered a failure whose root or path is over its bound"
+      | otherwise = maybe (CheckedDefect "the provider answered a failure whose envelope cannot be delivered within the limits") CheckedExpected (fitFailure opted found)
+    longerThan bound text = ByteString.length (Encoding.encodeUtf8 text) > bound
+    -- The failure's envelope as a script is handed it must fit the owner's ceilings. A message
+    -- that makes it too long is cut at a character, visibly, until it does.
+    fitFailure opted found = go (admitMessageBytes opted)
+      where
+        go bound =
+          let candidate = found {expectedMessage = truncateVisibly bound (expectedMessage found)}
+           in if fitsLimits limits (admitFailureFrame opted candidate)
+                then Just candidate
+                else if bound <= 0 then Nothing else go (bound `div` 2)
 
-judgeReply ∷ ValueLimits → Schema → ProviderReply → IO Checked
-judgeReply limits schema = \case
+-- | Cut text to at most this many UTF-8 bytes, at a character, and visibly: the end of what is
+-- kept is an ellipsis, so a reader can tell the text was cut.
+truncateVisibly ∷ Int → Text → Text
+truncateVisibly bound text
+  | bytes text <= bound = text
+  | bound < 3 = Text.empty
+  | otherwise = go (bound - 3) text <> "..."
+  where
+    bytes = ByteString.length . Encoding.encodeUtf8
+    go room remaining = case Text.uncons remaining of
+      Just (character, rest)
+        | width character <= room → Text.cons character (go (room - width character) rest)
+      _ → Text.empty
+    width = ByteString.length . Encoding.encodeUtf8 . Text.singleton
+
+-- | Judge a reply: the record a script is handed for the value (its frame) is measured against
+-- the limits, the value against any ceilings beside them, and the value against the schema.
+judgeWith ∷ (Value → [(Text, Value)]) → (Value → Bool) → ValueLimits → Schema → ProviderReply → IO Checked
+judgeWith frame ceilings limits schema = \case
   ProviderFailure why → pure (CheckedFailure why)
   ProviderResult value → do
     judged ← guarded (pure (judge value))
@@ -606,11 +1070,13 @@ judgeReply limits schema = \case
       Left failure@(ExceptionWithContext _ raised)
         | Just (async ∷ SomeAsyncException) ← fromException raised → throwIO async
         | otherwise → CheckedMalformed . ("the result could not be evaluated: " <>) <$> renderCaught failure
+  other → pure (CheckedMalformed ("the reply is not a result or a failure: " <> Text.pack (take 32 (show other))))
   where
     -- What is measured is the record a script is handed on taking it, not the bare value, so
     -- that a result which is retained is a result that can be delivered within the limits.
-    judge value = case valuesFootprint limits [VRecord (resultFields value)] of
+    judge value = case valuesFootprint limits [VRecord (frame value)] of
       Left _ → CheckedOversize (limitBytes limits + 1)
+      Right _ | not (ceilings value) → CheckedOversize (limitBytes limits + 1)
       Right bytes → case conformValue plainContext schema value of
         Left (_, rule) → CheckedMalformed ("the result does not conform to the endpoint's schema: " <> Text.pack (show rule))
         Right () → CheckedResult bytes value
@@ -658,14 +1124,63 @@ deliverable limits schema settlement
 modelReply ∷ Checked → Reply Value
 modelReply = \case
   CheckedResult bytes value → ReplyResult (Payload bytes value)
+  CheckedResource bytes value _ → ReplyResult (Payload bytes value)
   CheckedFailure why → ReplyFailure (failureReason ProviderFault why)
+  CheckedExpected found → ReplyFailure (failureReason ProviderFault (expectedMessage found))
   -- The model settles an unsettled request as a failure, and never stores the value.
   CheckedOversize declared → ReplyResult (Payload declared VNil)
   CheckedMalformed why → ReplyFailure (failureReason ValidationFault why)
+  -- A defect settles nothing: it is never applied to an unsettled request, and for a settled one
+  -- the model refuses whatever it is given.
+  CheckedDefect why → ReplyFailure (failureReason ProviderFault why)
 
 -- | Answer a request. One transaction, never waiting.
+--
+-- A resource reply to a request that reserved a result lease is not applied yet: the owner builds
+-- the resource into the lease at its next boundary and applies the result then ('finishAdoption'),
+-- so a result is never visible, held or settled, before the instance owns what it names. A
+-- defect is recorded for the owner to raise, once, and settles nothing: the provider's work is
+-- proved over, and the request stays as it was until the owner's failure revokes it.
 replyTo ∷ ProviderState → RequestId → Checked → STM ReplyAnswer
 replyTo service identity checked = do
+  st ← readTVar (psVar service)
+  let session = pSession st
+      unsettled = maybe False (isNothing . requestSettlement) (Map.lookup identity (sessionRequests session))
+      record = Map.lookup identity (pRecs st)
+  case (checked, record) of
+    (CheckedDefect why, Just _)
+      | unsettled → do
+          writeTVar (psVar service) $
+            endWork identity st
+              { pDefects = pDefects st <> [Text.take 512 why]
+              , pCounts = (pCounts st) {countDefects = countDefects (pCounts st) + 1}
+              }
+          pure ReplyDefective
+    (CheckedResource bytes value build, Just found)
+      | unsettled
+      , Just key ← recLease found
+      , Just number ← instanceOf (recRequester found) →
+          if isJust (recHeld found) || Map.member identity (pAdopting st)
+            then do
+              writeTVar (psVar service) st {pCounts = (pCounts st) {countDuplicateHeld = countDuplicateHeld (pCounts st) + 1}}
+              pure ReplyLate
+            else do
+              writeTVar (psVar service) $
+                endWork identity st
+                  { pAdopting = Map.insert identity (Adopting key number build value bytes False) (pAdopting st)
+                  }
+              pure ReplyAdoption
+    _ → applyChecked service identity checked
+  where
+    instanceOf = \case
+      RequesterInstance number → Just number
+      RequesterTask _ → Nothing
+
+-- | Apply a checked reply to its request: hold it for its tick on an owner that settles at
+-- assigned ticks, or settle it. The one place a reply reaches the model, whether it arrived from
+-- a provider's thread or was completed by the owner after building its resource.
+applyChecked ∷ ProviderState → RequestId → Checked → STM ReplyAnswer
+applyChecked service identity checked = do
   st ← readTVar (psVar service)
   let session = pSession st
       reply = modelReply checked
@@ -673,6 +1188,9 @@ replyTo service identity checked = do
         CheckedOversize _ → True
         CheckedMalformed _ → True
         _ → False
+      failureOf = case checked of
+        CheckedExpected found → Just found
+        _ → Nothing
       unsettled = maybe False (isNothing . requestSettlement) (Map.lookup identity (sessionRequests session))
       record = Map.lookup identity (pRecs st)
       -- A completion is held while its place has not been served, whatever tick the owner has
@@ -696,7 +1214,7 @@ replyTo service identity checked = do
               session' = case checked of
                 CheckedOversize _ → counting (\counters → counters {countOversizePayloads = countOversizePayloads counters + 1}) session
                 _ → session
-              released = found {recHeld = Just held}
+              released = found {recHeld = Just held, recFailure = failureOf}
           released' ← dropGate service released
           writeTVar (psVar service) $
             endWork identity $
@@ -708,16 +1226,49 @@ replyTo service identity checked = do
           pure (if refusedValue then ReplyRefusedValue else ReplyHeld)
     _ → do
       let (session', answer) = applyReplyIn identity reply session
-          settled = endWork identity st {pSession = session'}
+          recorded = case (answer, record) of
+            (Right (), Just found) → Map.insert identity found {recFailure = failureOf} (pRecs st)
+            _ → pRecs st
+          settled = endWork identity st {pSession = session', pRecs = recorded}
       writeTVar (psVar service) $ case answer of
         Left (UnknownRequest _) → st {pSession = session'}
         _ → settled
+      -- A required request's expected failure, settled on arrival, fails its instance at the
+      -- owner's next safe boundary, read or not.
+      case (answer, record) of
+        (Right (), Just found) → latchRequired service found {recFailure = failureOf}
+        _ → pure ()
       pure $ case answer of
         Right () → if refusedValue then ReplyRefusedValue else ReplySettled
         Left (UnknownRequest _) → ReplyUnknown
         Left (PayloadTooLarge _ _) → ReplyRefusedValue
         Left (ReplyRefused _) → ReplyLate
         Left _ → ReplyLate
+
+-- | Fail the instance of a required request whose expected failure has just become eligible:
+-- latch it on the instance, once, and wake the owner to apply it at its next safe boundary. An
+-- instance that is ending, or already has a failure latched, takes none; a request that is not an
+-- instance's, optional, or not an expected failure is nothing to latch. The latch is the
+-- instance's, set here, and is never cleared by anything a script does: it is read by the owner
+-- only. Answers whether it latched one.
+latchRequired ∷ ProviderState → Rec → STM ()
+latchRequired service record = case (recAdmission record, recFailure record, recRequester record) of
+  (Just ask, Just failure, RequesterInstance number)
+    | admitRequirement ask == Required → do
+        found ← cellOf service number
+        forM_ found $ \(instances, cell) → do
+          state ← readTVar (icState cell)
+          unless (isStopped state || isTerminal (isPhase state) || isJust (isRequestFailure state)) $ do
+            writeTVar (icState cell) state
+              { isRequestFailure = Just (recEndpoint record, attributed ask failure)
+              , isDispatchQueued = True
+              }
+            unless (isDispatchQueued state) $
+              modifyTVar' (insInbox instances) (|> JobDispatch (icId cell))
+            modifyTVar' (psVar service) (\st → st {pCounts = (pCounts st) {countLatched = countLatched (pCounts st) + 1}})
+  _ → pure ()
+  where
+    attributed ask failure = "(" <> admitSource ask <> ") " <> expectedCode failure <> ": " <> expectedMessage failure
 
 -- | The provider has proved its work over: it replied. The model is told as soon as the
 -- request has settled, which for a held completion is when it is served or cancelled.
@@ -830,6 +1381,7 @@ cancelOf service requester number = do
                     { pSession = session
                     , pRecs = Map.insert (recIdentity record) released (pRecs st)
                     , pDue = Map.filter (/= recIdentity record) (pDue st)
+                    , pAdopting = unclaimed (Map.delete (recIdentity record)) (pAdopting st)
                     , pWork = Map.adjust (\work → work {workWantsCancel = True}) (recIdentity record) (pWork st)
                     , pCounts = if before then (pCounts st) {countCancelledBeforeTick = countCancelledBeforeTick (pCounts st) + 1} else pCounts st
                     }
@@ -899,6 +1451,9 @@ serveDue service identities = do
                 , pRecs = Map.insert identity record {recHeld = Nothing} (pRecs st)
                 , pCounts = (pCounts st) {countSettledAtTick = countSettledAtTick (pCounts st) + 1}
                 }
+            -- The completion became a settlement now: a required request's expected failure is
+            -- eligible, and fails its instance at the owner's next safe boundary.
+            latchRequired service record
             pure [recNumber record]
       _ → pure []
   pure (concat settled)
@@ -950,7 +1505,10 @@ endRequesterSTM service requester cause = do
           }
   ended ← endSubs service EndByOwner owned prelim
   -- An instance that ended needs nothing let go of: its VM is released with it.
-  writeTVar (psVar service) (retireEnded ended {pForget = foldr Map.delete (pForget ended) [number | RequesterInstance number ← [requester]]})
+  writeTVar (psVar service) (retireEnded ended {pForget = foldr Map.delete (pForget ended) [number | RequesterInstance number ← [requester]], pAdopting = unclaimed (\held → foldr Map.delete held gone) (pAdopting ended)})
+  -- What the requester had left uncollected is discarded now, on the owner's thread: the banks of
+  -- the requests whose providers have already retired are free from here.
+  releaseSettled service
   pure (EndReport (length mine) (length told))
 
 -- | The task requesters whose tasks are gone: ended, or no longer known to the scheduler.
@@ -1000,10 +1558,11 @@ advanceEpochSTM service = do
                 , pByNumber = Map.fromList [(recNumber record, recIdentity record) | record ← kept]
                 , pDue = Map.empty
                 , pHolders = Map.empty
+                , pAdopting = Map.filter adoptingClaimed (pAdopting cancelledState)
                 , pCounts = (pCounts cancelledState) {countEpochCancelled = countEpochCancelled (pCounts cancelledState) + cancelled}
                 }
       case advanceEpoch (pSession cancelledState) of
-        (_, Left _) → Nothing <$ writeTVar (psVar service) (committed (pSession cancelledState))
+        (_, Left _) → Nothing <$ (writeTVar (psVar service) (committed (pSession cancelledState)) >> releaseSettled service)
         (session, Right change) → do
           -- The model invalidated every subscription with the epoch's records; the service's
           -- records of them, the events held for them and the references in the queues go with
@@ -1021,6 +1580,7 @@ advanceEpochSTM service = do
             Nothing → pure ()
             Just instances → forM_ woken $ \number → modifyTVar' (insInbox instances) (|> JobForget number)
           writeTVar (psVar service) ended {pEvents = (pEvents ended) {evCleanupJobs = evCleanupJobs (pEvents ended) + length woken}}
+          releaseSettled service
           pure (Just (EpochReport change cancelled discarded))
   where
     cancelOne (st, kept, cancelled, discarded) record
@@ -1061,10 +1621,12 @@ closeSTM service = do
               , pHolders = Map.empty
               , pClosed = True
               , pExit = Just exit
+              , pAdopting = Map.filter adoptingClaimed (pAdopting withEnded)
               , pWork = Map.map (\work → if workEnded work then work else work {workWantsCancel = True}) (pWork withEnded)
               }
       ended ← endSubs service EndByOwner (Map.keys (pSubs prelim)) prelim
       writeTVar (psVar service) (retireEnded ended {pForget = Map.empty})
+      releaseSettled service
       pure (Just exit)
 
 -- The provider's work ------------------------------------------------------------------
@@ -1142,6 +1704,9 @@ reapWorks service = do
   writeTVar (psVar service) st
     { pWork = Map.filterWithKey (\identity work → not (forgettable identity work)) (pWork st)
     }
+  -- Work that is reaped here has been accounted at the owner's boundary: the banks of the requests
+  -- that were already taken or discarded are visible to admission from now on.
+  releaseSettled service
 
 -- | Whether the model still counts the provider's work on this request as outstanding.
 modelOwes ∷ Session Value → RequestId → Bool
@@ -1199,7 +1764,7 @@ workWaiting service = do
       polling = [obligation | work ← works, workWantsCancel work, not (workEnded work), isNothing (workFailure work), obligation ← retainedObligations (workRetained work)]
   changed ← forM polling $ \obligation →
     (\reading → case reading of ProviderPending → False; _ → True) <$> pollObligation obligation
-  pure (over || untold || or changed)
+  pure (over || untold || or changed || any (not . adoptingClaimed) (Map.elems (pAdopting st)) || not (null (pDefects st)))
 
 -- Reading --------------------------------------------------------------------------------
 
@@ -1230,4 +1795,11 @@ diagnosticsSTM service = do
       , rdSettledAtTick = countSettledAtTick counts
       , rdCancelledBeforeTick = countCancelledBeforeTick counts
       , rdEpochCancelled = countEpochCancelled counts
+      , rdBusy = countBusy counts
+      , rdHeld = Map.size (pHeld st)
+      , rdHeldBy = Map.fromListWith (+) [(number, 1) | held ← Map.elems (pHeld st), RequesterInstance number ← [heldRequester held]]
+      , rdAdopting = Map.size (pAdopting st)
+      , rdDefects = countDefects counts
+      , rdLatched = countLatched counts
+      , rdAdopted = countAdopted counts
       }

@@ -719,7 +719,14 @@ dispatch ih cell = do
   surfaced ← atomically (takeDeliveryFailure cell)
   case surfaced of
     Just (endpoint, reason, phase) → failInstance ih cell phase (StageEvent endpoint) (ErrorDelivery endpoint reason)
-    Nothing → admitNext ih cell
+    Nothing → do
+      -- A required request that reached its eligible settlement with an expected failure fails
+      -- its instance here (D-52), at the owner's safe boundary and before any more of its
+      -- ordinary work, whether or not its script ever read the request.
+      latched ← atomically (takeRequestFailure cell)
+      case latched of
+        Just (endpoint, reason, phase) → failInstance ih cell phase (StageEvent endpoint) (ErrorRequest endpoint reason)
+        Nothing → admitNext ih cell
 
 -- | The instance's delivery failure, if a provider surfaced one and the instance is still taking
 -- anything, taken once, with the phase the instance was in.
@@ -730,6 +737,17 @@ takeDeliveryFailure cell = do
     Nothing → pure Nothing
     Just (endpoint, reason) → do
       writeTVar (icState cell) state {isDeliveryFailure = Nothing}
+      pure (if isStopped state || isTerminal (isPhase state) then Nothing else Just (endpoint, reason, isPhase state))
+
+-- | The instance's latched required-request failure, if the instance is still taking anything,
+-- taken once, with the phase the instance was in.
+takeRequestFailure ∷ ICell → STM (Maybe (Text, Text, InstancePhase))
+takeRequestFailure cell = do
+  state ← readTVar (icState cell)
+  case isRequestFailure state of
+    Nothing → pure Nothing
+    Just (endpoint, reason) → do
+      writeTVar (icState cell) state {isRequestFailure = Nothing}
       pure (if isStopped state || isTerminal (isPhase state) then Nothing else Just (endpoint, reason, isPhase state))
 
 -- | Admit the instance's next invocation as a task, if it has one and may start it.

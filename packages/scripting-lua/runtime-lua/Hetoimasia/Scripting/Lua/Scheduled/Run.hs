@@ -368,7 +368,7 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
       let atBoundary = do
             instanceStep ← maybe (pure False) serviceBoundary instances
             requestStep ← forM provider $ \service →
-              providerBoundary service scheduler (isJust instances) extra (forM_ instances endOwner)
+              providerBoundary service scheduler (isJust instances) leaseHost extra (forM_ instances endOwner)
             let again = instanceStep || or requestStep
             -- A boundary that finds nothing more to do is the last of its settling: it ends when this
             -- returns. This is the owner's checkpoint, and nothing after it in the boundary can fail. The

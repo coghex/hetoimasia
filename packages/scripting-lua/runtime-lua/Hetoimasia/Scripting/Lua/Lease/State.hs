@@ -99,6 +99,10 @@ module Hetoimasia.Scripting.Lua.Lease.State
   , LeaseHost (..)
   , DrainReport (..)
   , drainScope
+  , Retirements (..)
+  , retirementsFor
+  , adoptReserved
+  , releaseKey
   , RetirementEnd (..)
   , serviceRetirements
   , Disposals (..)
@@ -122,8 +126,8 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, evaluate, fromException, mask_, throwIO, try)
-import Control.Monad (forM, when)
+import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, evaluate, fromException, mask, mask_, throwIO, try)
+import Control.Monad (forM, forM_, when)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List.NonEmpty (NonEmpty)
 import Data.List (sortOn)
@@ -134,10 +138,13 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Typeable (Typeable)
 import Data.Word (Word64)
+import GHC.Stack (HasCallStack)
+import Hetoimasia.Foundation.Resource (Assembly, cleanupFailureException, cleanupFailureLabel, cleanupFailuresInContext)
 import Hetoimasia.Foundation.Resource.OwnedCollection
   ( Member
   , OwnedCollection
   , OwnerCapability
+  , acquireOwnedMemberThen
   , retireOwnedMember
   )
 import Hetoimasia.Scripting.Lua.Lending.Loan (Lending)
@@ -581,16 +588,7 @@ drainScope host number = mask_ $ do
       , slotInstance slot == number
       , isLive (slotPhase slot)
       ]
-  results ← forM keys $ \key → do
-    started ← atomically (beginRelease leases (Just number) key)
-    case started of
-      StartLive (Holding member) → do
-        outcome ← guarded (retireOwnedMember (lhCollection host) (lhCapability host) member)
-        ended ← atomically (endRelease leases key (() <$ outcome))
-        pure $ case ended of
-          EndedFailed failure → Left failure
-          _ → Right ()
-      _ → pure (Right ())
+  results ← forM keys (releaseKey host number)
   let failures = [failure | Left failure ← results]
       released = length [() | Right () ← results]
   atomically $ modifyTVar' (leasesState leases) $ \state →
@@ -600,6 +598,82 @@ drainScope host number = mask_ $ do
     isLive = \case
       SlotLive → True
       _ → False
+
+-- | Release one live holding of an instance on the owner's thread: revoke the lease, retire
+-- its member through the owner's capability and record how it went. A holding already released
+-- is skipped. Masked by the caller, as the drain is.
+releaseKey ∷ LeaseHost → Word64 → Word64 → IO (Either (ExceptionWithContext SomeException) ())
+releaseKey host number key = do
+  let leases = lhLeases host
+  started ← atomically (beginRelease leases (Just number) key)
+  case started of
+    StartLive (Holding member) → do
+      outcome ← guarded (retireOwnedMember (lhCollection host) (lhCapability host) member)
+      ended ← atomically (endRelease leases key (() <$ outcome))
+      pure $ case ended of
+        EndedFailed failure → Left failure
+        _ → Right ()
+    _ → pure (Right ())
+
+-- | What a release hands the engine when its resource is retired by a provider that finishes
+-- later: see "Hetoimasia.Scripting.Lua.Lease".
+data Retirements = Retirements
+  { retireAsynchronously ∷ Text → STM RetirementState → IO ()
+    -- ^ Record that the release has handed the resource to its provider, under a label that
+    -- names it in evidence, and say how to ask the provider where it has got to. Called from
+    -- the part's release: it never waits, and the reading must not retry, and it only reads
+    -- (what it writes is not kept). It may read TVars that more than one reading shares. The
+    -- lease keeps its charge, and its owner stays live, until the reading says
+    -- 'ProviderComplete' or 'ProviderFailed'.
+  , afterRetirement ∷ IO () → IO ()
+    -- ^ Hand over a dependency the retirements need. Called from the release of the part that
+    -- owns the dependency, which must be ranked after the parts being retired: the disposal is
+    -- run once every retirement the lease has recorded has completed, uninterruptibly on the
+    -- owner's thread and before the instance's stop completion settles, and never before. At
+    -- once, inside the release, if none is pending. If a provider reports its retirement failed
+    -- the disposal never runs: the dependency is retained, as the resource is, and the failure
+    -- is the evidence.
+  }
+
+-- | What the release of the parts of one slot's lease is given to record a retirement with.
+retirementsFor ∷ Leases → Word64 → Retirements
+retirementsFor leases key =
+  Retirements
+    { retireAsynchronously = \label poll → atomically (recordRetirement leases key label poll)
+    , afterRetirement = \disposal → atomically (deferDisposal leases key disposal) >>= mapM_ id
+    }
+
+-- | Build the resource of a lease an admission reserved, into that reservation, on the owner's
+-- thread through the capability it holds, as a binding acquires through a lent one: the
+-- assembly's stages roll back exactly as they completed if one fails, and the member and its
+-- record come to exist together, in the masked step that registers the member. The reserved
+-- slot becomes live, and the capacity it was charged against is the one the live resource
+-- keeps. A failure leaves the reservation given back (unless a stage's retirement is pending, which
+-- keeps its charge), notes any rollback release that failed on the instance's scope as cleanup
+-- evidence, and is answered, whole, for the owner to raise.
+adoptReserved
+  ∷ (HasCallStack, Typeable a)
+  ⇒ LeaseHost
+  → Word64
+  → Word64
+  → (Retirements → Assembly a)
+  → IO (Either (ExceptionWithContext SomeException) ())
+adoptReserved host number key build = mask $ \_ → do
+  let leases = lhLeases host
+  outcome ←
+    guarded $
+      acquireOwnedMemberThen (lhCollection host) (lhCapability host) (build (retirementsFor leases key)) $ \member →
+        atomically (register leases key (Holding member))
+  case outcome of
+    Right () → pure (Right ())
+    Left failure@(ExceptionWithContext context _) → do
+      notes ← forM (cleanupFailuresInContext context) $ \cleanup → do
+        rendered ← renderCaught (cleanupFailureException cleanup)
+        pure ("a rollback release failed: " <> cleanupFailureLabel cleanup <> ": " <> rendered)
+      atomically $ do
+        abandon leases key
+        forM_ notes (noteScope leases number)
+      pure (Left failure)
 
 -- | The disposals of one slot whose last retirement has completed, to be run. The slot
 -- is kept until they have been, so that a disposal that fails can be retained on it:

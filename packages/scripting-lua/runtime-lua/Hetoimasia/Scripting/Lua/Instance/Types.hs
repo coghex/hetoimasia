@@ -431,6 +431,10 @@ data InstanceError
     -- and why. The simulation cannot go on as though it had been delivered, so the instance
     -- fails, and the application's escalation decides what that means for its peers.
     ErrorDelivery !Text !Text
+  | -- | A required request of the instance failed (D-52): the endpoint it asked, and what
+    -- failed, attributed to the request. Latched at the failure's eligible settlement, read or not,
+    -- and applied at the owner's next safe boundary before any more ordinary work.
+    ErrorRequest !Text !Text
   | -- | The cadence's own arithmetic could not be represented: a tick or a deadline
     -- past what a tick or an instant can be, or a logical duration granted that
     -- overflowed. Nothing wrapped; this is what happened.
@@ -747,6 +751,10 @@ data IState = IState
   , isDeliveryFailure ∷ !(Maybe (Text, Text))
     -- ^ The endpoint and why: a provider surfaced that it could not preserve an authoritative event of one of this
     -- instance's subscriptions: the owner fails the instance with it, once.
+  , isRequestFailure ∷ !(Maybe (Text, Text))
+    -- ^ The endpoint and the attributed failure of a required request that reached its eligible
+    -- settlement: latched there, whatever the script does or does not read, and applied by the
+    -- owner at its next safe boundary, once. The first one latched is the one the instance fails with.
   }
 
 -- | Where an instance's periodic update is.
@@ -789,7 +797,7 @@ unstartedCount kind state =
 
 -- | A fresh instance's state.
 initialState ∷ IState
-initialState = IState Initializing False Set.empty Seq.empty 0 0 0 Nothing False False False Nothing UpdateNone False noBaseline Nothing
+initialState = IState Initializing False Set.empty Seq.empty 0 0 0 Nothing False False False Nothing UpdateNone False noBaseline Nothing Nothing
 
 -- | What the owner's thread is asked to do, in the order the application asked.
 data Job
@@ -897,6 +905,7 @@ renderError = failureText . \case
   ErrorRelease released → "a release failed: " <> released
   ErrorCadence what → "cadence: " <> what
   ErrorDelivery endpoint why → "delivery to a subscription of " <> endpoint <> " failed: " <> why
+  ErrorRequest endpoint why → "a required request of " <> endpoint <> " failed: " <> why
 
 -- | A bounded rendering.
 failureText ∷ Text → Text

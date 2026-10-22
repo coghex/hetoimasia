@@ -96,6 +96,8 @@ module Hetoimasia.Scripting.Lua.Provider
   , RetirementState (..)
   , Completion (..)
   , ProviderReply (..)
+  , ExpectedFailure (..)
+  , Adoption (..)
   , ReplyAnswer (..)
 
     -- * Subscriptions

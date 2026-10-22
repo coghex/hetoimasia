@@ -49,18 +49,24 @@ import Control.Exception
   , SomeException
   , mask_
   , rethrowIO
+  , tryWithContext
   , uninterruptibleMask_
   )
 import Control.Monad (forM, unless, when)
+import Control.Concurrent.STM (readTVar)
 import Data.IORef (IORef, modifyIORef')
+import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import Data.Word (Word64)
+import Hetoimasia.Foundation.Failure (operation, throwFailure)
 import Hetoimasia.Foundation.Resource (composeCleanup)
+import Hetoimasia.Scripting.Lua.Lease.State (LeaseHost, adoptReserved, releaseKey)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Request (CancelCause (CancelledByTaskInvalidation))
 import Hetoimasia.Scripting.Lua.Retention (guarded)
 import Hetoimasia.Scripting.Lua.Provider.Events (nextStagedAfter)
 import Hetoimasia.Scripting.Lua.Provider.State
 import Hetoimasia.Scripting.Lua.Provider.Types
+import Hetoimasia.Scripting.Lua.Runtime.Shared (runtimeComponent)
 import Hetoimasia.Scripting.Lua.Scheduler
   ( CadenceFiring (FiredLogical)
   , Scheduler
@@ -102,6 +108,46 @@ raiseAmong label = \case
   first : others → do
     composed ← composeCleanup (Just first) [(label, other) | other ← others]
     maybe (rethrowIO first) rethrowIO composed
+
+-- | A provider defect as the failure the owner raises: the bounded diagnostic, with the context
+-- of the boundary that found it.
+defectOf ∷ Text → IO (ExceptionWithContext SomeException)
+defectOf why = do
+  raised ← tryWithContext @SomeException (throwFailure runtimeComponent (operation "provider-reply") [] (ProviderDefect why))
+  either pure (\() → throwFailure runtimeComponent (operation "provider-reply") [] (ProviderDefect why)) raised
+
+-- | Build the resources the providers replied with into the leases their requests reserved, on the
+-- owner's thread through the capability it holds: one at a time, each uninterrupted from the
+-- building to the recording that the lease is live and the result applied. A request that was
+-- cancelled or ended while its resource was being built gets the resource released at once. A
+-- recipe that raises is a failure of application code: the reservation is given back, and the failure
+-- is the owner's, after the others were built. Answers the failures, in order.
+adoptPending ∷ ProviderState → Maybe LeaseHost → IO [ExceptionWithContext SomeException]
+adoptPending service leaseHost = mask_ $ do
+  pending ← atomically (takePendingAdoptions service)
+  concat
+    <$> forM pending
+      ( \(identity, adopting) → case (leaseHost, adoptingBuild adopting) of
+          (Nothing, _) → do
+            -- The reservation was made in leases the owner was given, so it has a host: this is
+            -- the engine's own inconsistency.
+            atomically (failAdoption service identity)
+            raised ← tryWithContext @SomeException (throwFailure runtimeComponent (operation "adopt-resource") [] (userError "a result lease was reserved on an owner that holds no lease host"))
+            pure [failure | Left failure ← [raised]]
+          (Just host, Adoption build) → do
+            built ← adoptReserved host (adoptingInstance adopting) (adoptingKey adopting) build
+            case built of
+              Left failure → do
+                atomically (failAdoption service identity)
+                pure [failure]
+              Right () → do
+                applied ← atomically (finishAdoption service identity adopting)
+                case applied of
+                  Just _ → pure []
+                  Nothing → do
+                    released ← releaseKey host (adoptingInstance adopting) (adoptingKey adopting)
+                    pure [failure | Left failure ← [released]]
+      )
 
 -- Serving ----------------------------------------------------------------------------------
 
@@ -172,10 +218,11 @@ providerBoundary
   ∷ ProviderState
   → Scheduler v
   → Bool
+  → Maybe LeaseHost
   → IORef [(Text, ExceptionWithContext SomeException)]
   → IO ()
   → IO Bool
-providerBoundary service scheduler hasInstances evidence onCleanupFailure = mask_ $ do
+providerBoundary service scheduler hasInstances leaseHost evidence onCleanupFailure = mask_ $ do
   -- One masked step from the claims to their recording: a failure that servicing took out of
   -- the accounts, or a tell that was claimed, is recorded or raised before a cancellation can
   -- be delivered, so none is dropped.
@@ -186,11 +233,17 @@ providerBoundary service scheduler hasInstances evidence onCleanupFailure = mask
   unless (null cleanup) $ do
     modifyIORef' evidence (<> cleanup)
     onCleanupFailure
+  -- The resources the providers replied with are built into the leases their requests reserved,
+  -- on this thread, before the results they belong to can be held or settled.
+  adopting ← atomically (not . Map.null . pAdopting <$> readTVar (psVar service))
+  adopted ← adoptPending service leaseHost
+  defects ← atomically (takeDefects service)
+  defective ← forM defects defectOf
   served ← if hasInstances then pure False else serveWatchOnly service scheduler
   woke ← atomically (ticksWakeSettled (psTicks service) (settledNumber service))
   after ← atomically (workPendingCount service)
-  raiseFirst evidence "lua request cancel" (swept <> told)
-  pure (woke || served || before /= after || not (null cleanup))
+  raiseFirst evidence "lua provider boundary" (defective <> adopted <> swept <> told)
+  pure (woke || served || before /= after || not (null cleanup) || adopting || not (null defects))
 
 -- | Whether the owner has anything to do for its requests, and a wait to compose into its
 -- wait for work: a task whose request has settled, a provider's account that is no longer

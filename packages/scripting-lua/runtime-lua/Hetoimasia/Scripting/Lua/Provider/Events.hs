@@ -41,6 +41,7 @@ module Hetoimasia.Scripting.Lua.Provider.Events
   ( -- * Who may subscribe
     requesterClosed
   , awaiting
+  , cellOf
 
     -- * Subscribing
   , AdmittedSub (..)

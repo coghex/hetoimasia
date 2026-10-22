@@ -200,6 +200,7 @@ library runtime-lua
     visibility: public
     hs-source-dirs: runtime-lua
     exposed-modules:
+        Hetoimasia.Scripting.Lua.Admission
         Hetoimasia.Scripting.Lua.Lease
         Hetoimasia.Scripting.Lua.Lending
         Hetoimasia.Scripting.Lua.Provider
@@ -227,6 +228,7 @@ library runtime-lua
         Hetoimasia.Scripting.Lua.Runner.Types
         Hetoimasia.Scripting.Lua.Lending.Loan
         Hetoimasia.Scripting.Lua.Lifecycle.State
+        Hetoimasia.Scripting.Lua.Provider.Call
         Hetoimasia.Scripting.Lua.Provider.Events
         Hetoimasia.Scripting.Lua.Provider.Serve
         Hetoimasia.Scripting.Lua.Provider.State
