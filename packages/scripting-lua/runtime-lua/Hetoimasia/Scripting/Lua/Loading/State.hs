@@ -191,8 +191,10 @@ data LoaderOutcome
     OutcomeAdmitted
   | -- | Ready or failed: the status, with the very export handle or the sticky fault.
     OutcomeSettled !ModuleStatus
-  | -- | Pending or evaluating when the owner stopped.
+  | -- | Pending or evaluating when the owner stopped, or submitted and never admitted.
     OutcomeStopped
+  | -- | The loader refused the root before anything was recorded for it.
+    OutcomeRefused !RootRefusal
   deriving (Eq, Show)
 
 -- | Where roots and sources are left for one owner's loader, from any thread.
@@ -285,7 +287,12 @@ submitRootIn ls request due = atomically $ do
   admitting ← ticksOpen (lsTicks ls)
   queue ← readTVar (lsSubmitted ls)
   lastDue ← readTVar (lsLastDue ls)
-  let append = writeTVar (lsSubmitted ls) (queue |> Submission request due) >> pure SubmitAccepted
+  let -- Accepted roots read as admitted from this transaction on, so that a root that is
+      -- submitted and never drained (the owner exits first) is told from one nobody sent.
+      append = do
+        writeTVar (lsSubmitted ls) (queue |> Submission request due)
+        modifyTVar' (lsOutcomes ls) (Map.insertWith (\_ existing → existing) (rootIdentity request) OutcomeAdmitted)
+        pure SubmitAccepted
   if not (open && admitting)
     then pure SubmitClosed
     else
@@ -311,16 +318,29 @@ notifySourceIn ls identity answer = atomically $ do
       | Map.size waiting >= lsBound ls → pure NotifyFull
       | otherwise → writeTVar (lsNotified ls) (Map.insert identity answer waiting) >> pure NotifyAccepted
 
--- | What the owner published about a root, if anything.
+-- | What the owner published about a root, if anything: its outcome, or the refusal it was
+-- last refused with.
 outcomeIn ∷ LoadingState → ExportIdentity → IO (Maybe LoaderOutcome)
-outcomeIn ls identity = Map.lookup identity <$> readTVarIO (lsOutcomes ls)
+outcomeIn ls identity = atomically (outcomeSTM ls identity)
 
--- | What the owner published about a root once it has come to an outcome (ready, failed or
--- stopped), retrying until it has. For a caller to compose with its supervised wait, so that
--- the owner ending is an answer and not a hang.
+outcomeSTM ∷ LoadingState → ExportIdentity → STM (Maybe LoaderOutcome)
+outcomeSTM ls identity = do
+  found ← Map.lookup identity <$> readTVar (lsOutcomes ls)
+  refused ← readTVar (lsRefusals ls)
+  pure $ case found of
+    Just outcome → Just outcome
+    Nothing → OutcomeRefused . snd <$> lastMatch refused
+  where
+    lastMatch refused = case [r | r@(refusedIdentity, _) ← toList refused, refusedIdentity == identity] of
+      [] → Nothing
+      matches → Just (last matches)
+
+-- | What the owner published about a root once it has come to an outcome (ready, failed,
+-- stopped or refused), retrying until it has. For a caller to compose with its supervised
+-- wait, so that the owner ending is an answer and not a hang.
 awaitOutcomeIn ∷ LoadingState → ExportIdentity → STM LoaderOutcome
 awaitOutcomeIn ls identity = do
-  found ← Map.lookup identity <$> readTVar (lsOutcomes ls)
+  found ← outcomeSTM ls identity
   case found of
     Just OutcomeAdmitted → retry
     Just outcome → pure outcome
@@ -402,10 +422,12 @@ serviceLoading ls owned = do
       RootQueued → admitted state request due
       RootJoined → admitted state request due
       RootSettled status → modifyTVar' (lsOutcomes state) (Map.insert (identityOf request) (OutcomeSettled status))
-      RootRefused refusal →
+      RootRefused refusal → do
         modifyTVar' (lsRefusals state) $ \held →
           let next = held |> (identityOf request, refusal)
            in if Seq.length next > lsBound state then Seq.drop 1 next else next
+        -- Nothing was recorded for it: it no longer reads as admitted.
+        modifyTVar' (lsOutcomes state) (Map.update (\outcome → if outcome == OutcomeAdmitted then Nothing else Just outcome) (identityOf request))
       RootClosed → modifyTVar' (lsOutcomes state) (Map.insert (identityOf request) OutcomeStopped)
     admitted state request due = do
       modifyTVar' (lsDues state) (Map.insert (identityOf request) due)

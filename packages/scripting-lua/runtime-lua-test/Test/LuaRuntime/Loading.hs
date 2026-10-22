@@ -195,6 +195,18 @@ spec = describe "the module loader on a scheduled owner" $ do
         atomically (scheduledTick (scheduledEndpoint owner)) >>= (`shouldBe` 2)
         loaderDiagnostics endpoint >>= \found → loadingHeld found `shouldBe` Nothing
 
+    it "applies the same grant at once when no chain is due, so that the held tick above is not the example's own timing" $
+      bounded . withLoader 4 [echoer] $ \fixture rig control owner endpoint → do
+        have rig "later" ["return {}"]
+        submitRoot endpoint (request "later") (DueTick 5) >>= (`shouldBe` SubmitAccepted)
+        grantOne control owner
+        loaderDiagnostics endpoint >>= \found → loadingHeld found `shouldBe` Nothing
+        _ ← grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1)
+        _ ← admit fixture owner "a" (moduleNamed "echoer")
+        awaitCount fixture 1
+        _ ← awaitTicksComplete control owner
+        atomically (scheduledTick (scheduledEndpoint owner)) >>= (`shouldBe` 2)
+
     it "holds nothing for a chain a UI asked for" $
       bounded . withLoader 4 [echoer] $ \_ rig control owner endpoint → do
         have rig "ui" ["local late = import('late')", "return {}"]
@@ -224,6 +236,22 @@ spec = describe "the module loader on a scheduled owner" $ do
         awaitDrained endpoint
         submitRoot endpoint (request "late") (DueTick 3) >>= (`shouldBe` SubmitOutOfOrder 7)
         submitRoot endpoint (request "later") (DueTick 7) >>= (`shouldBe` SubmitAccepted)
+
+    it "reports a refusal as an outcome, and a root submitted and never drained as stopped when the owner exits" $
+      bounded . withLoader 4 [echoer, holder] $ \fixture _ control owner endpoint → do
+        let empty = ExportIdentity ""
+        submitRoot endpoint (RootRequest empty "empty") DueUi >>= (`shouldBe` SubmitAccepted)
+        awaitSupervised control (awaitLoaderOutcome endpoint empty) >>= (`shouldBe` OutcomeRefused (RootIdentityInvalid maxExportIdentityBytes))
+        loaderRefusals endpoint >>= (`shouldBe` [(empty, RootIdentityInvalid maxExportIdentityBytes)])
+        -- A root the owner never got to: told from one nobody sent, and stopped with the owner.
+        holdOwner fixture owner
+        submitRoot endpoint (request "queued") DueUi >>= (`shouldBe` SubmitAccepted)
+        loaderOutcome endpoint (ident "queued") >>= (`shouldBe` Just OutcomeAdmitted)
+        retireScheduled owner
+        releaseOwner fixture
+        _ ← awaitScheduledTerminal control owner
+        loaderOutcome endpoint (ident "queued") >>= (`shouldBe` Just OutcomeStopped)
+        loaderOutcome endpoint (ident "never sent") >>= (`shouldBe` Nothing)
 
     it "closes with the owner: nothing is taken, a waiting chain is stopped and its interests are given back" $
       bounded . withLoader 4 [echoer] $ \fixture rig control owner endpoint → do
