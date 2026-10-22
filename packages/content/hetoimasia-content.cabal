@@ -111,8 +111,12 @@ test-suite content-tests
         Test.Content.Identity.Reference
         Test.Content.Identity.Support
         Test.Content.Identity.Unicode
+        Test.Content.Inventory.Aliases
+        Test.Content.Inventory.Boundary
         Test.Content.Inventory.Changes
+        Test.Content.Inventory.Lifecycle
         Test.Content.Inventory.Limits
+        Test.Content.Inventory.Reading
         Test.Content.Inventory.Scan
         Test.Content.Inventory.Support
         Test.Content.Lifecycle
