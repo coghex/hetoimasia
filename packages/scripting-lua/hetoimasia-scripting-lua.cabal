@@ -107,6 +107,8 @@ library bridge
         Hetoimasia.Scripting.Lua.Internal.ExportTypes
         Hetoimasia.Scripting.Lua.Internal.Fault
         Hetoimasia.Scripting.Lua.Internal.Library
+        Hetoimasia.Scripting.Lua.Internal.Loader
+        Hetoimasia.Scripting.Lua.Internal.LoaderTypes
         Hetoimasia.Scripting.Lua.Internal.Marshal
         Hetoimasia.Scripting.Lua.Internal.Module
         Hetoimasia.Scripting.Lua.Internal.Owner
@@ -202,6 +204,7 @@ library runtime-lua
     visibility: public
     hs-source-dirs: runtime-lua
     exposed-modules:
+        Hetoimasia.Scripting.Lua.Admission
         Hetoimasia.Scripting.Lua.Lease
         Hetoimasia.Scripting.Lua.Lending
         Hetoimasia.Scripting.Lua.Provider
@@ -211,6 +214,7 @@ library runtime-lua
         Hetoimasia.Scripting.Lua.Runtime
         Hetoimasia.Scripting.Lua.Instance
         Hetoimasia.Scripting.Lua.Lifecycle
+        Hetoimasia.Scripting.Lua.Loading
         Hetoimasia.Scripting.Lua.Scheduled
         Hetoimasia.Scripting.Lua.Scheduler
     other-modules:
@@ -230,6 +234,8 @@ library runtime-lua
         Hetoimasia.Scripting.Lua.Runner.Types
         Hetoimasia.Scripting.Lua.Lending.Loan
         Hetoimasia.Scripting.Lua.Lifecycle.State
+        Hetoimasia.Scripting.Lua.Loading.State
+        Hetoimasia.Scripting.Lua.Provider.Call
         Hetoimasia.Scripting.Lua.Provider.Events
         Hetoimasia.Scripting.Lua.Provider.Serve
         Hetoimasia.Scripting.Lua.Provider.State
@@ -301,6 +307,7 @@ test-suite lua-host-tests
     -- fail after its module was stored, which no script can do (see its header).
     c-sources: test/cbits/hetoimasia_lua_hooks.c
     other-modules:
+        Test.Lua.Boundary.ArgumentChecks
         Test.Lua.Boundary.Bindings
         Test.Lua.Boundary.Dependencies
         Test.Lua.Boundary.Discipline
@@ -309,6 +316,12 @@ test-suite lua-host-tests
         Test.Lua.Boundary.Independence
         Test.Lua.Boundary.Installation
         Test.Lua.Boundary.Lifecycle
+        Test.Lua.Boundary.Loader
+        Test.Lua.Boundary.Loader.Failures
+        Test.Lua.Boundary.Loader.Limits
+        Test.Lua.Boundary.Loader.Stop
+        Test.Lua.Boundary.Loader.Support
+        Test.Lua.Boundary.Loader.Threads
         Test.Lua.Boundary.Modules
         Test.Lua.Boundary.Recoverable
         Test.Lua.Boundary.Registration
@@ -361,6 +374,7 @@ test-suite lua-host-tests
     build-tool-depends: hetoimasia-scripting-lua:lua-hazard
     build-depends:
         base >=4.22 && <4.23,
+        HUnit >=1.6 && <1.7,
         bytestring >=0.12 && <0.13,
         containers >=0.8 && <0.9,
         directory >=1.3 && <1.4,
@@ -401,6 +415,16 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Accounting.Support
         Test.LuaRuntime.Accounting.Waits
         Test.LuaRuntime.Accounting.Windows
+        Test.LuaRuntime.Admission.Banks
+        Test.LuaRuntime.Admission.Failure
+        Test.LuaRuntime.Admission.Handles
+        Test.LuaRuntime.Admission.Lease
+        Test.LuaRuntime.Admission.Races
+        Test.LuaRuntime.Admission.Release
+        Test.LuaRuntime.Admission.Settlement
+        Test.LuaRuntime.Admission.Timing
+        Test.LuaRuntime.Admission.Spec
+        Test.LuaRuntime.Admission.Support
         Test.LuaRuntime.Callbacks
         Test.LuaRuntime.Dependencies
         Test.LuaRuntime.Expected
@@ -453,6 +477,7 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Lifecycle.Settlement
         Test.LuaRuntime.Lifecycle.Spec
         Test.LuaRuntime.Lifecycle.Support
+        Test.LuaRuntime.Loading
         Test.LuaRuntime.Readiness
         Test.LuaRuntime.Recoverable
         Test.LuaRuntime.Request.Admission

@@ -181,6 +181,33 @@ module Hetoimasia.Scripting.Lua.Owner
   , evaluateExport
   , retrieveExport
 
+    -- * The module loader (opt-in)
+  , LoaderConfig (..)
+  , loaderConfig
+  , SourceSupplier (..)
+  , SourceAnswer (..)
+  , ImportContext (..)
+  , ResolvedAddress (..)
+  , AddressResolver
+  , ModulePhase
+  , newModulePhase
+  , modulePhaseActive
+  , RootRequest (..)
+  , RootAdmission (..)
+  , RootRefusal (..)
+  , SourceDelivery (..)
+  , ModuleStatus (..)
+  , Blocked (..)
+  , AdvanceReport (..)
+  , StopReport (..)
+  , LoaderCounts (..)
+  , admitRoot
+  , deliverSource
+  , advanceLoader
+  , lookupModule
+  , stopModuleLoader
+  , moduleLoaderCounts
+
     -- * Captured behaviors
   , FacadeSource (..)
   , Hook (..)
@@ -245,6 +272,7 @@ module Hetoimasia.Scripting.Lua.Owner
 import Data.ByteString (ByteString)
 import Data.Text (Text)
 import GHC.Stack (HasCallStack)
+import Hetoimasia.Foundation.Failure (operation, throwFailure)
 import Hetoimasia.Scripting.Lua.Internal.Boundary
   ( BoundaryFault (..)
   , Effect (..)
@@ -256,6 +284,7 @@ import Hetoimasia.Scripting.Lua.Internal.Boundary
   , SuspendRefusal (..)
   , TaskEnd (..)
   , TaskProblem (..)
+  , blankFault
   )
 import Hetoimasia.Scripting.Lua.Internal.Call (ChunkName, chunkName, chunkNameText)
 import Hetoimasia.Scripting.Lua.Internal.Fault
@@ -271,8 +300,31 @@ import Hetoimasia.Scripting.Lua.Internal.Fault
   , VmNotOwned (..)
   , VmReentered (..)
   , closeSourceLabel
+  , luaComponent
   )
 import qualified Hetoimasia.Scripting.Lua.Internal.Export as Export
+import qualified Hetoimasia.Scripting.Lua.Internal.Loader as Loader
+import Hetoimasia.Scripting.Lua.Internal.LoaderTypes
+  ( AddressResolver
+  , AdvanceReport (..)
+  , Blocked (..)
+  , ImportContext (..)
+  , LoaderConfig (..)
+  , LoaderCounts (..)
+  , ModulePhase
+  , ModuleStatus (..)
+  , ResolvedAddress (..)
+  , RootAdmission (..)
+  , RootRefusal (..)
+  , RootRequest (..)
+  , SourceAnswer (..)
+  , SourceDelivery (..)
+  , SourceSupplier (..)
+  , StopReport (..)
+  , loaderConfig
+  , modulePhaseActive
+  , newModulePhase
+  )
 import Hetoimasia.Scripting.Lua.Internal.ExportTypes
   ( BehaviorProblem (..)
   , BehaviorShape (..)
@@ -312,6 +364,7 @@ import Hetoimasia.Scripting.Lua.Internal.Owner
       , ownerLimits
       , ownerExportLimits
       , ownerExports
+      , ownerLoader
       , ownerModules
       , ownerName
       , ownerProfile
@@ -322,6 +375,7 @@ import Hetoimasia.Scripting.Lua.Internal.Owner
   , defaultOwnerConfig
   , evalOwned
   , ownedHost
+  , ownedLoader
   , withOwnedVm
   )
 import Hetoimasia.Scripting.Lua.Internal.Registration (LifecycleContext, Registration, RequestContext, emptyRegistration)
@@ -385,12 +439,18 @@ data VmConfig = VmConfig
     -- value of the application's runtime, which this library never reads. 'Nothing',
     -- the default, leaves both answering a typed 'NotYetSupported' fault whose action
     -- never runs.
+  , vmLoader ∷ Maybe LoaderConfig
+    -- ^ The owner's module loader: ordered import chains whose modules can @import@
+    -- and suspend on a dependency's verified source. 'Nothing', the default, gives an
+    -- owner none, and an export module evaluated by 'evaluateExport' has no @import@.
+    -- The loader's seams are the application's own: where source comes from, how an
+    -- import's path and root become an identity, and when a root may begin.
   }
 
 -- | A configuration over these libraries with no initial chunk, an empty
 -- registration, no exposed namespace, the default value limits and no module.
 vmConfig ∷ [Library] → VmConfig
-vmConfig libraries = VmConfig libraries Nothing [] "owner" emptyRegistration [] defaultValueLimits [] Nothing [] defaultExportLimits Nothing
+vmConfig libraries = VmConfig libraries Nothing [] "owner" emptyRegistration [] defaultValueLimits [] Nothing [] defaultExportLimits Nothing Nothing
 
 -- | A configuration over a library profile, otherwise as 'vmConfig' makes it.
 --
@@ -430,6 +490,7 @@ withVmOwnerScoped scope config =
       , ownerRequests = vmRequests config
       , ownerExports = vmExports config
       , ownerExportLimits = vmExportLimits config
+      , ownerLoader = vmLoader config
       }
 
 -- | Load a module from the owner's body, in an environment of its own.
@@ -537,3 +598,49 @@ captureBehavior owned = Export.captureBehavior (ownedHost owned)
 -- The owner's thread only.
 releaseBehavior ∷ HasCallStack ⇒ OwnedVm → CaptureHandle → IO ()
 releaseBehavior owned = Export.releaseBehavior (ownedHost owned)
+
+-- | The owner's loader, or the fault that it has none.
+loaderOf ∷ HasCallStack ⇒ OwnedVm → IO Loader.Loader
+loaderOf owned = case ownedLoader owned of
+  Just loader → pure loader
+  Nothing →
+    throwFailure luaComponent (operation "module-loader") [] $
+      (blankFault (Module.hostBoundary (ownedHost owned)) EvaluateExport (ModuleRefused NoModuleLoader))
+
+-- | Ask the owner's loader to evaluate a root. See "Hetoimasia.Scripting.Lua.Internal.Loader"
+-- for the loader's contract; the package README documents it. A new identity is
+-- recorded as pending, its source asked for through the supplier and it is queued
+-- after the roots already admitted. The owner's thread only.
+admitRoot ∷ HasCallStack ⇒ OwnedVm → RootRequest → IO RootAdmission
+admitRoot owned request = loaderOf owned >>= (`Loader.admitRoot` request)
+
+-- | Deliver the verified source, or the failure, the supplier found for an identity
+-- the loader asked about. It evaluates nothing: advance the loader. A delivery after the
+-- loader has stopped, for an identity it holds no interest in, or a second one for an
+-- identity, changes nothing. The owner's thread only.
+deliverSource ∷ HasCallStack ⇒ OwnedVm → ExportIdentity → SourceAnswer → IO SourceDelivery
+deliverSource owned identity answer = loaderOf owned >>= \loader → Loader.deliverSource loader identity answer
+
+-- | Run the loader as far as it can go: start the next eligible root whose source has
+-- arrived, evaluate dependencies depth first, resume importers with what they asked
+-- for. It returns when the chain waits for a source, the head of the queue is not
+-- eligible, or nothing is queued. The owner's thread only.
+advanceLoader ∷ HasCallStack ⇒ OwnedVm → IO AdvanceReport
+advanceLoader owned = loaderOf owned >>= Loader.advanceLoader
+
+-- | What an identity is: its exports, its sticky failure, pending, evaluating,
+-- stopped, or unknown. Evaluates nothing. The owner's thread only.
+lookupModule ∷ HasCallStack ⇒ OwnedVm → ExportIdentity → IO ModuleStatus
+lookupModule owned identity = loaderOf owned >>= \loader → Loader.lookupModule loader identity
+
+-- | Stop the owner's loader: admission closes, every suspended module is closed on the
+-- owner, every source interest is withdrawn and every identity that was pending or
+-- evaluating reads 'ModuleStopped'. Terminal and idempotent; the lifetime does it too
+-- before the VM closes. The owner's thread only.
+stopModuleLoader ∷ HasCallStack ⇒ OwnedVm → IO StopReport
+stopModuleLoader owned = loaderOf owned >>= Loader.stopLoader
+
+-- | The loader's own bookkeeping: identities by state, the active chain's depth and
+-- the source interests acquired, released and held.
+moduleLoaderCounts ∷ HasCallStack ⇒ OwnedVm → IO LoaderCounts
+moduleLoaderCounts owned = loaderOf owned >>= Loader.loaderCounts

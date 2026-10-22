@@ -63,15 +63,13 @@ module Hetoimasia.Scripting.Lua.Request
   ) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Exception (mask, mask_, rethrowIO, throwIO)
-import Control.Monad (unless)
+import Control.Exception (mask, mask_, rethrowIO)
+import Control.Monad (unless, void)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
-import Data.Word (Word64)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (operation, throwFailure)
-import Hetoimasia.Scripting.Lua.Instance.Types (InstanceId (InstanceId))
-import Hetoimasia.Scripting.Lua.Internal.Fault (CallRefusal (CallRefusal))
+import Hetoimasia.Scripting.Lua.Provider.Call (RequestHandle (RequestHandle), handleNumber, infoFor, refuse, requesterIn, serviceOf)
 import Hetoimasia.Scripting.Lua.Provider.Serve (guarded, raiseAmong, tellProviders)
 import Hetoimasia.Scripting.Lua.Provider.State
 import Hetoimasia.Scripting.Lua.Provider.Types
@@ -83,21 +81,12 @@ import Hetoimasia.Scripting.Lua.Registration
   , WaitKind (WaitSettlement)
   , asynchronousNativeRequestIn
   , capabilityType
-  , fromRequestContext
   , namespace
   , requestContext
   , waitOperation
   )
 import Hetoimasia.Scripting.Lua.Runtime.Shared (runtimeComponent)
 import Hetoimasia.Scripting.Lua.Value (Schema (..), Value (..), capability, capabilityKey)
-
--- | A request's handle: its number, which is unique to its owner and never reissued.
-newtype RequestHandle = RequestHandle Word64
-  deriving (Eq, Ord, Show)
-
--- | The request's number.
-handleNumber ∷ RequestHandle → Word64
-handleNumber (RequestHandle number) = number
 
 -- | The capability a script is handed for a request, of the declared type.
 requestHandleValue ∷ Text → RequestHandle → Value
@@ -114,24 +103,6 @@ requestHandleType name = capabilityType name (const (pure True))
 -- | What the owner's configuration carries so that its asynchronous requests are delivered.
 requestContextOf ∷ ProviderState → RequestContext
 requestContextOf = requestContext
-
--- | The service of the owner whose script called, read from the engine's own context. A
--- context that is not an owner's request service is the application's misuse of the library.
-serviceOf ∷ HasCallStack ⇒ RequestContext → IO ProviderState
-serviceOf context = case fromRequestContext context of
-  Just service → pure service
-  Nothing → throwFailure runtimeComponent (operation "request-context") [] (userError "the request context is not a request service")
-
--- | Refuse the call, as the engine: a fault of the call and not a failure of the
--- application's code.
-refuse ∷ RequestRefusal → IO a
-refuse = throwIO . CallRefusal . renderRequestRefusal
-
--- | Who is calling, or the refusal that nobody is.
-requesterIn ∷ ProviderState → IO Requester
-requesterIn service = do
-  caller ← atomically (callerOf service)
-  maybe (refuse NoRequester) pure (requesterOf caller)
 
 -- | Start a request of this endpoint and give the binding its handle.
 --
@@ -167,7 +138,7 @@ startRequest context name arguments afterCompletion = do
     handed ← guarded (restore (endpointSubmit endpoint (Submission arguments completion info)))
     case handed of
       Left failure → do
-        atomically (withdrawAdmission service (admittedIdentity found))
+        void (atomically (withdrawAdmission service (admittedIdentity found)))
         rethrowIO failure
       Right provided → do
         atomically (commitSubmitted service (admittedIdentity found) provided [afterCompletion])
@@ -175,18 +146,6 @@ startRequest context name arguments afterCompletion = do
         -- now that there is a provider to tell.
         raiseAmong "lua request cancel" =<< tellProviders service
         pure (RequestHandle (admittedNumber found))
-
--- | What a request is, for the application's assignment and for the provider.
-infoFor ∷ ProviderState → Requester → Text → Word64 → RequestInfo
-infoFor service requester name number =
-  RequestInfo
-    { infoOwner = psOwner service
-    , infoInstance = case requester of
-        RequesterInstance local → Just (InstanceId (psOwner service) local)
-        RequesterTask _ → Nothing
-    , infoEndpoint = name
-    , infoNumber = number
-    }
 
 -- | Where the application places the request, for an owner that settles at assigned ticks: its
 -- assignment, run here on the caller's thread before the request is admitted, inside the one

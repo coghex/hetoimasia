@@ -249,6 +249,9 @@ module Hetoimasia.Scripting.Lua.Scheduler
   , takeCadenceFirings
   , takeNextCadenceFiring
   , cadenceFiringsPending
+  , oweTick
+  , releaseOwed
+  , tickIsOwed
   , watchKey
   , watchTick
   , setWatch
@@ -564,6 +567,28 @@ releaseTick scheduler tick = modifyTVar' (schedState scheduler) (releaseTickIn t
 -- | Whether the owner needs something complete before this tick begins.
 tickIsHeld ∷ Scheduler v → Word64 → STM Bool
 tickIsHeld scheduler tick = tickHeld tick <$> readTVar (schedState scheduler)
+
+-- | The owner needs one more thing finished before this tick is complete. Never blocks.
+--
+-- Where 'holdTick' keeps a tick from beginning, this lets it begin and keeps it from
+-- ending: the grant that reaches the tick is applied, what it woke runs, and the grant is
+-- not finished, so 'stepsOutstanding' counts it and 'awaitStepsComplete' does not return
+-- for it, and no later grant is applied, until every need has been given back with
+-- 'releaseOwed'. That is how a tick waits for a module chain that is due in it. If the
+-- tick is the one the scheduler is in and its grant is open, that grant is kept now; a
+-- tick that is complete already has nothing left to keep. A scheduler that has stopped
+-- keeps nothing.
+oweTick ∷ Scheduler v → Word64 → STM ()
+oweTick scheduler tick = modifyTVar' (schedState scheduler) (oweTickIn tick)
+
+-- | One need for this tick is met, or can no longer arise. Giving back more than was taken
+-- changes nothing.
+releaseOwed ∷ Scheduler v → Word64 → STM ()
+releaseOwed scheduler tick = modifyTVar' (schedState scheduler) (releaseOwedIn tick)
+
+-- | Whether the owner needs something finished before this tick is complete.
+tickIsOwed ∷ Scheduler v → Word64 → STM Bool
+tickIsOwed scheduler tick = tickOwed tick <$> readTVar (schedState scheduler)
 
 -- Waiting for a request -----------------------------------------------------------
 
@@ -1235,6 +1260,8 @@ stopScheduler scheduler host = mask_ $ do
           , ssElapsed = Map.empty
           , ssRequestWaiters = Map.empty
           , ssGates = Map.empty
+          , ssOwed = Map.empty
+          , ssOwedHold = Map.empty
           , ssCadenceLogical = Map.empty
           , ssCadenceElapsed = Map.empty
           , ssFirings = Seq.empty

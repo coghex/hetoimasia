@@ -1,4 +1,5 @@
 #include "hetoimasia_lua_values.h"
+#include "hetoimasia_lua_bridge.h"
 
 #include <lauxlib.h>
 #include <stdio.h>
@@ -2107,6 +2108,309 @@ int hetoimasia_lua_task_count(lua_State *L, long *count)
   lua_pushcfunction(L, task_count_body);
   lua_pushlightuserdata(L, count);
   status = lua_pcall(L, 1, 0, 0);
+  gc_release(L, held);
+  return status;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Loader frames: export modules that can suspend on an `import`             */
+/* ------------------------------------------------------------------------ */
+
+/*
+** A loader frame is an export module's chunk run as a coroutine of the VM, anchored
+** in a task slot, in an environment of its own that reads through to the globals and
+** holds an `import` closure bound to the module. Every step that allocates is one
+** protected call; `lua_resume` contains its errors and answers a status.
+*/
+
+typedef struct {
+  const char *source;
+  size_t source_length;
+  const char *chunk;
+  lua_Integer task_slot;
+  lua_Integer context;
+  int load_status;
+  int created;
+} loader_new_arguments;
+
+static int loader_new_body(lua_State *L)
+{
+  loader_new_arguments *a = (loader_new_arguments *) lua_touserdata(L, 1);
+  lua_State *co;
+
+  lua_settop(L, 0);
+  luaL_checkstack(L, 12, "starting a module chunk");
+  lua_createtable(L, 0, 8);
+  lua_createtable(L, 0, 1);
+  lua_pushglobaltable(L);
+  lua_setfield(L, 2, "__index");
+  lua_setmetatable(L, 1);
+  if (!hetoimasia_lua_import_closure(L, a->context)) {
+    return luaL_error(L, "the import carrier is not installed");
+  }
+  lua_pushstring(L, "import");
+  lua_insert(L, -2);
+  /* Raw: the environment has no __newindex, and nothing may run here. */
+  lua_rawset(L, 1);
+
+  a->load_status = luaL_loadbufferx(L, a->source, a->source_length, a->chunk, "t");
+  if (a->load_status != LUA_OK) {
+    return 1;
+  }
+  lua_pushvalue(L, 1);
+  if (lua_setupvalue(L, 2, 1) == NULL) {
+    lua_pop(L, 1);
+  }
+  lua_rawgetp(L, LUA_REGISTRYINDEX, &tasks_key);
+  if (!lua_istable(L, -1)) {
+    return luaL_error(L, "the task table is missing");
+  }
+  co = lua_newthread(L);
+  lua_pushvalue(L, -1);
+  lua_rawseti(L, -3, a->task_slot);
+  lua_pop(L, 2);
+  if (!lua_checkstack(co, LUA_MINSTACK)) {
+    return luaL_error(L, "no stack for a module chunk");
+  }
+  lua_xmove(L, co, 1);
+  a->created = 1;
+  lua_pushnil(L);
+  return 1;
+}
+
+int hetoimasia_lua_loader_new(
+  lua_State *L, const char *source, size_t source_length, const char *chunk,
+  lua_Integer task_slot, lua_Integer context, int *load_status, int *created)
+{
+  loader_new_arguments a;
+  gc_hold_t held;
+  int status;
+
+  a.source = source;
+  a.source_length = source_length;
+  a.chunk = chunk;
+  a.task_slot = task_slot;
+  a.context = context;
+  a.load_status = LUA_OK;
+  a.created = 0;
+  *load_status = LUA_OK;
+  *created = 0;
+  /* Nothing executes here: the chunk is made and parsed, and its coroutine anchored. */
+  held = gc_hold(L);
+  if (!lua_checkstack(L, 6)) {
+    gc_release(L, held);
+    return LUA_ERRMEM;
+  }
+  lua_pushcfunction(L, loader_new_body);
+  lua_pushlightuserdata(L, &a);
+  status = lua_pcall(L, 1, 1, 0);
+  gc_release(L, held);
+  *load_status = a.load_status;
+  *created = a.created;
+  return status;
+}
+
+typedef struct {
+  lua_Integer task_slot;
+  lua_Integer export_slot;
+  int mode;
+  lua_Integer resume_slot;
+  const char *message;
+  size_t message_length;
+  char *trace;
+  size_t trace_capacity;
+  size_t *trace_length;
+  int resumed;
+  int outcome;
+  int segment_status;
+  int shape;
+  int result_type;
+  int stored;
+  gc_hold_t gc_held;
+} loader_resume_arguments;
+
+static void loader_resume_release(lua_State *L, loader_resume_arguments *a)
+{
+  if (a->gc_held.was) {
+    gc_release(L, a->gc_held);
+    a->gc_held.was = 0;
+  }
+}
+
+static int loader_resume_body(lua_State *L)
+{
+  loader_resume_arguments *a = (loader_resume_arguments *) lua_touserdata(L, 1);
+  lua_State *co;
+  int status;
+  int nresults = 0;
+  int nargs = 0;
+
+  lua_settop(L, 0);
+  luaL_checkstack(L, 12, "resuming a module chunk");
+  a->outcome = HETOIMASIA_TASK_UNRESUMABLE;
+  co = task_thread(L, a->task_slot);
+  if (co == NULL) {
+    return 0;
+  }
+  status = lua_status(co);
+  if (a->mode == 0 ? !(status == LUA_OK && lua_gettop(co) >= 1) : status != LUA_YIELD) {
+    return 0;
+  }
+  if (a->mode == 1) {
+    /* The dependency's export table, built before anything is pushed to the coroutine. */
+    lua_rawgetp(L, LUA_REGISTRYINDEX, &exports_key);
+    if (!lua_istable(L, -1)) {
+      return luaL_error(L, "the export table is missing");
+    }
+    lua_rawgeti(L, -1, a->resume_slot);
+    if (!lua_istable(L, -1)) {
+      return luaL_error(L, "the dependency's export table is missing");
+    }
+    lua_remove(L, -2);
+    if (!lua_checkstack(co, 4)) {
+      return luaL_error(L, "no stack to resume a module chunk");
+    }
+    lua_pushboolean(co, 1);
+    lua_xmove(L, co, 1);
+    nargs = 2;
+  } else if (a->mode == 2) {
+    /* Built on the main thread, where an allocation failure is contained by this
+    ** protected call; a failure raised on a suspended coroutine would reset it. */
+    lua_pushlstring(L, a->message, a->message_length);
+    if (!lua_checkstack(co, 4)) {
+      return luaL_error(L, "no stack to resume a module chunk");
+    }
+    lua_pushboolean(co, 0);
+    lua_xmove(L, co, 1);
+    nargs = 2;
+  }
+  /* Nothing has executed so far. */
+  a->resumed = 1;
+  loader_resume_release(L, a);
+  gc_service(L);
+  status = lua_resume(co, L, nargs, &nresults);
+  if (status == LUA_YIELD) {
+    lua_pop(co, nresults);
+    a->outcome = HETOIMASIA_TASK_YIELDED;
+    return 0;
+  }
+  if (status == LUA_OK) {
+    a->outcome = HETOIMASIA_TASK_COMPLETED;
+    task_unanchor(L, a->task_slot);
+    a->shape = HETOIMASIA_EXPORT_OK;
+    if (nresults == 0) {
+      a->shape = HETOIMASIA_EXPORT_NO_RESULT;
+    } else if (nresults > 1) {
+      a->shape = HETOIMASIA_EXPORT_MULTIPLE;
+    } else if (lua_isnil(co, -1)) {
+      a->shape = HETOIMASIA_EXPORT_NIL;
+    } else if (!lua_istable(co, -1)) {
+      a->shape = HETOIMASIA_EXPORT_NOT_TABLE;
+      a->result_type = lua_type(co, -1);
+    } else if (lua_getmetatable(co, -1)) {
+      lua_pop(co, 1);
+      a->shape = HETOIMASIA_EXPORT_METATABLE;
+    } else {
+      lua_xmove(co, L, 1);
+      nresults = 0;
+      lua_rawgetp(L, LUA_REGISTRYINDEX, &exports_key);
+      if (!lua_istable(L, -1)) {
+        return luaL_error(L, "the export table is missing");
+      }
+      lua_insert(L, -2);
+      lua_rawseti(L, -2, a->export_slot);
+      a->stored = 1;
+    }
+    return 0;
+  }
+  /* The coroutine is dead and its stack intact. It is closed by a call of its own, so
+  ** that what closing raises can be told from what the segment raised. */
+  *a->trace_length = build_traceback(co, 0, a->trace, a->trace_capacity);
+  a->outcome = HETOIMASIA_TASK_FAILED;
+  a->segment_status = status;
+  return 0;
+}
+
+int hetoimasia_lua_loader_resume(
+  lua_State *L, lua_Integer task_slot, lua_Integer export_slot, int mode, lua_Integer resume_slot,
+  const char *message, size_t message_length,
+  char *trace, size_t trace_capacity, size_t *trace_length,
+  int *outcome, int *segment_status, int *shape, int *result_type, int *stored, int *resumed)
+{
+  loader_resume_arguments a;
+  int status;
+
+  a.task_slot = task_slot;
+  a.export_slot = export_slot;
+  a.mode = mode;
+  a.resume_slot = resume_slot;
+  a.message = message;
+  a.message_length = message_length;
+  a.trace = trace;
+  a.trace_capacity = trace_capacity;
+  a.trace_length = trace_length;
+  a.resumed = 0;
+  a.outcome = HETOIMASIA_TASK_UNRESUMABLE;
+  a.segment_status = LUA_OK;
+  a.shape = HETOIMASIA_EXPORT_OK;
+  a.result_type = 0;
+  a.stored = 0;
+  *trace_length = 0;
+  *outcome = HETOIMASIA_TASK_UNRESUMABLE;
+  *segment_status = LUA_OK;
+  *shape = HETOIMASIA_EXPORT_OK;
+  *result_type = 0;
+  *stored = 0;
+  *resumed = 0;
+  /* Held until the coroutine is about to run: pushing what it is resumed with
+  ** executes nothing. */
+  a.gc_held = gc_hold(L);
+  if (!lua_checkstack(L, 6)) {
+    loader_resume_release(L, &a);
+    return LUA_ERRMEM;
+  }
+  lua_pushcfunction(L, loader_resume_body);
+  lua_pushlightuserdata(L, &a);
+  status = lua_pcall(L, 1, 0, 0);
+  loader_resume_release(L, &a);
+  *outcome = a.outcome;
+  *segment_status = a.segment_status;
+  *shape = a.shape;
+  *result_type = a.result_type;
+  *stored = a.stored;
+  *resumed = a.resumed;
+  return status;
+}
+
+/* Push the export table kept in `slot`, or nil, by raw access. */
+static int export_push_body(lua_State *L)
+{
+  lua_Integer slot = lua_tointeger(L, 1);
+  int *type = (int *) lua_touserdata(L, 2);
+  *type = LUA_TNONE;
+  lua_rawgetp(L, LUA_REGISTRYINDEX, &exports_key);
+  if (!lua_istable(L, -1)) {
+    lua_pushnil(L);
+    return 1;
+  }
+  lua_rawgeti(L, -1, slot);
+  *type = lua_type(L, -1);
+  return 1;
+}
+
+int hetoimasia_lua_export_push(lua_State *L, lua_Integer slot, int *type)
+{
+  gc_hold_t held = gc_hold(L);
+  int status;
+  *type = LUA_TNONE;
+  if (!lua_checkstack(L, 8)) {
+    gc_release(L, held);
+    return LUA_ERRMEM;
+  }
+  lua_pushcfunction(L, export_push_body);
+  lua_pushinteger(L, slot);
+  lua_pushlightuserdata(L, type);
+  status = lua_pcall(L, 2, 1, 0);
   gc_release(L, held);
   return status;
 }

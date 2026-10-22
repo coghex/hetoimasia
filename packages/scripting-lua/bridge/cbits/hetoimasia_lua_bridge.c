@@ -156,6 +156,65 @@ static int invoke_yield(lua_State *L)
   return lua_yield(L, 0);
 }
 
+/* The registry key the import carrier is kept under: the one Haskell handler every
+** module's `import` closure reaches. Nothing a script does can name it. */
+static char import_key;
+
+/*
+** The continuation of an `import` that suspended its coroutine. The loader resumed
+** the coroutine with two values: a boolean, and either the dependency's export
+** table (true) or a message (false). Raised or returned here, in C, with no Haskell
+** frame between this and the Lua function that called `import`.
+*/
+static int import_continue(lua_State *L, int status, lua_KContext context)
+{
+  (void) status;
+  (void) context;
+  if (lua_gettop(L) >= 2 && lua_toboolean(L, -2)) {
+    return 1;
+  }
+  if (lua_gettop(L) < 1) {
+    lua_pushnil(L);
+  }
+  return lua_error(L);
+}
+
+/*
+** The C closure of a module's `import`. Upvalue 1 is the carrier and upvalue 2 the
+** module's context, an integer the loader issued for it. The handler decides, with
+** every Haskell frame still to return, whether this call returns a table, raises an
+** error or suspends; a suspension is made here, afterwards, because `lua_yieldk`
+** unwinds with a `longjmp` exactly as `lua_error` does.
+*/
+int hetoimasia_lua_invoke_import(lua_State *L)
+{
+  int results;
+  lua_pushvalue(L, lua_upvalueindex(1));
+  lua_insert(L, 1);
+  lua_pushvalue(L, lua_upvalueindex(2));
+  lua_insert(L, 2);
+  results = hetoimasia_lua_enter(L);
+  if (results == HETOIMASIA_IMPORT_SUSPEND) {
+    return lua_yieldk(L, 0, 0, import_continue);
+  }
+  if (results < 0) {
+    return lua_error(L);
+  }
+  return results;
+}
+
+int hetoimasia_lua_import_closure(lua_State *L, lua_Integer context)
+{
+  lua_rawgetp(L, LUA_REGISTRYINDEX, &import_key);
+  if (!lua_isuserdata(L, -1)) {
+    lua_pop(L, 1);
+    return 0;
+  }
+  lua_pushinteger(L, context);
+  lua_pushcclosure(L, hetoimasia_lua_invoke_import, 2);
+  return 1;
+}
+
 /*
 ** Push the carrier metatable, building it before it is reachable.
 **
@@ -423,4 +482,37 @@ int hetoimasia_luaopen_debug(lua_State *L)
   lua_pushnil(L);
   lua_setfield(L, -2, "sethook");
   return results;
+}
+
+/*
+** Everything keeping the import carrier allocates, in one protected call. Ownership of
+** the stable pointer passes when the carrier gets its metatable, as for a binding.
+*/
+static int import_install_body(lua_State *L)
+{
+  HsStablePtr function = lua_touserdata(L, 1);
+  int *acquired = (int *) lua_touserdata(L, 2);
+  HsStablePtr *slot;
+
+  lua_settop(L, 0);
+  push_carrier_metatable(L);
+  slot = (HsStablePtr *) lua_newuserdatauv(L, sizeof(HsStablePtr), 0);
+  *slot = function;
+  lua_pushvalue(L, -2);
+  lua_setmetatable(L, -2);
+  *acquired = 1;
+  lua_rawsetp(L, LUA_REGISTRYINDEX, &import_key);
+  return 0;
+}
+
+int hetoimasia_lua_import_install(lua_State *L, HsStablePtr function, int *acquired)
+{
+  *acquired = 0;
+  if (!lua_checkstack(L, 8)) {
+    return LUA_ERRMEM;
+  }
+  lua_pushcfunction(L, import_install_body);
+  lua_pushlightuserdata(L, function);
+  lua_pushlightuserdata(L, acquired);
+  return lua_pcall(L, 2, 0, 0);
 }
