@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-65/Q-6p: role-specific clocks and cooperative waits.
+The current checkpoint is P-66/Q-6q: the M1 randomness surface.
+D-68 accepts role-specific clocks and cooperative waits with sampled UI time.
 D-67 accepts logical request tick offsets and earliest shared-module evaluation.
 D-66 accepts opaque sRGB byte backgrounds and checked fractional rectangles.
 D-65 accepts static PNG colour textures with one level and no animation/options.
@@ -2045,6 +2046,38 @@ The manager presented prefetching, the init/10+30 examples and earliest shared
 module work, with lead-time planning and held capacity as costs. The owner
 chose explicit offsets over always-next-tick delivery. Exact names, ranges,
 sequence exhaustion and narrow assignment integration remain delivery work.
+
+### D-68. Each role exposes its own clock and cooperative duration waits
+
+**Delivery:** M1; scheduler-backed time access without ambient OS clocks.
+
+Owner answer, **2026-10-22 02:35:19 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: own clock + waits (Rec.)
+
+Authenticated relay: `het-manager`, message `tba8rc9q6ev8wzfud42wwsirba`,
+posted **2026-10-22 02:35:19.881 UTC** in `#het-luafirst`, replying to Q-6p
+message `zvruky5s9uuajjdfqx5b85cby6`.
+
+Accept P-65's A: logical Lua reads its current tick and fixed tick length and
+waits a positive number of ticks; loading delays never advance logical time.
+UI Lua reads monotonic seconds from its VM's root-init origin, shared between
+instances, sampled once per hook/resumed segment, and may wait a positive
+duration in seconds. First root init reads zero; a due wait may resume late.
+The existing cadence/`dt` contract remains unchanged.
+
+Logical Lua has no elapsed-time API; neither role gets wall/calendar/CPU time.
+Clock reads belong to lifecycle hooks, not module top level. Engine-scheduled
+waits/yield remain forbidden in finite init/shutdown. Wrong-role, invalid and
+wrong-phase operations are Lua errors; waits resume the same invocation under
+existing scheduling/cleanup rather than creating updates or native Lua sleeps.
+
+The manager presented origins/units and stale time samples in long UI segments
+as costs. The owner chose clock reads and waits over the smaller `dt`/yield
+surface. P-65 also preserves request waits in that alternative; the manager's
+short option label did not propose removing the accepted D-54 request API.
+Exact names, numeric limits and integration remain delivery work.
 
 ## Proposals
 
@@ -5572,7 +5605,7 @@ work, not a claim that the existing callback already accepts it.
 
 ### P-65. Expose each role's own clock and cooperative duration waits
 
-**Unapproved; active checkpoint Q-6p. Delivery: M1.** Recommend A: expose
+**A accepted by D-68 through Q-6p. Delivery: M1.** Recommend A: expose
 role-specific clock reads and waits through the existing scheduler. A logical
 instance reads its current integer tick and the fixed tick duration in seconds,
 and may wait a positive whole number of logical ticks. Init observes tick 0;
@@ -5636,6 +5669,61 @@ already provides logical/elapsed waits and owner-thread observation; its public
 wait operation takes integer ticks or nanoseconds. Seconds conversion, sampled
 Lua clock reads and M1 eligibility checks are new integration work over those
 services, not new native sleep calls from Lua.
+
+### P-66. Defer engine randomness and remove ambient Lua RNG entry points in M1
+
+**Unapproved; active checkpoint Q-6q. Delivery: M1 scope / later RNG design.**
+P-1 carried forward the earlier two-domain sample's seeded-stream/separate-UI
+constraints, while D-42 explicitly deferred a new world RNG/replay subsystem
+and left randomness bindings open. This checkpoint reconciles that gap without
+designing gameplay state. Recommend A: remove `math.random` and `math.randomseed`
+from both M1 VMs before any authored module executes, in addition to D-5's
+selected library exclusions. Keep the other permitted math operations.
+
+M1 adds no engine RNG namespace, seed manifest/CLI field, automatic seed source,
+stream construction/splitting API or state-save/replay machinery. A script
+calling a removed function encounters an ordinary Lua error; it does not invoke
+D-42's special unavailable-state-service terminal guard. Normal caught/uncaught
+hook and module-load failure policies apply. The quad/logical-stub demo and
+two-instance qualification require no engine random source.
+
+Authors may implement or import a pure-Lua pseudorandom helper with an explicit
+seed and ordinary Lua-owned state, subject to the existing module/phase rules.
+This is permission for authored computation, not a shipped RNG library,
+algorithm choice or engine reproducibility guarantee. Sharing such a helper's
+mutable module state shares its sequence under D-7; authors who need separate
+sequences can use factories/instance-local state. No native entropy/time access
+is added for it. M1 does not enforce a prohibition on computing pseudorandom
+numbers in trusted Lua.
+
+The existing `lua-domains` sample and prior Lua D-23/D-44 remain unchanged as
+their own delivered contracts. Their application-owned seeded gameplay stream
+belongs with the later gameplay/state arc, and UI draws must not consume that
+stream when that arc is designed. This proposal specifically replaces P-1's
+possible reading as a requirement to deliver that engine stream in M1. It does
+not decide future stream ownership, algorithm, seeding or rollback semantics.
+
+Alternative B removes the standard RNG from logical Lua but retains UI
+`math.random`/`math.randomseed`, as in the earlier sample's role split. It gives
+UI authors an immediate conventional random source while still deferring the
+logical engine RNG. Its automatic/explicit seed policy and top-level eligibility
+would need a concrete follow-up contract, including any qualification of D-8's
+pure-helper module phase; choosing B is not silent approval of those details.
+
+A is recommended for the small service-driven milestone and a common filtered
+math surface without a new seeding service. Its cost is that existing scripts
+using either standard RNG function must change or wait for a later extension,
+even for cosmetic UI variation. Authors needing it now supply their own helper
+and seed rather than receiving one from the engine. This restriction does not
+make trusted Lua deterministic or contain a hostile script.
+
+Qualification checks removal before entry/dependency evaluation in both roles,
+normal math availability, ordinary error classification and continued module
+and instance isolation; no world digest/replay acceptance is added. Evidence:
+the [two-domain sample](../../samples/lua-domains/README.md) owns a SplitMix64
+stream in its committed/candidate world, strips the gameplay math RNG and leaves
+the UI math library's RNG available. That is sample-specific implementation,
+not an existing standalone generic service to wire into the no-store M1.
 
 ## Open questions
 
@@ -6069,11 +6157,17 @@ arrival-settled; exact bounds and assignment integration remain open.
 
 #### Q-6p. Expose role-specific clock reads and duration waits in M1?
 
-**Active checkpoint, P-65.** A (recommended): logical tick/fixed-duration reads
-and tick waits; UI segment-sampled monotonic seconds and duration waits; both
-cooperative yield/request wait with strict role/phase eligibility. B: only
-update `dt`, yield and request waits, with authored update counters for delays.
-Neither permits init/shutdown waits or ambient wall/CPU time.
+Resolved by D-68: P-65's A, logical tick/duration reads and tick waits, sampled
+UI monotonic seconds and duration waits, strict role/phase checks, and existing
+cooperative yield/request waits. No init/shutdown waits or wall/CPU clocks.
+
+#### Q-6q. Defer all engine/standard RNG access or retain standard UI randomness?
+
+**Active checkpoint, P-66.** A (recommended): remove `math.random` and
+`math.randomseed` in both M1 roles; no engine RNG/seed service now, authored
+explicitly seeded pure-Lua helpers allowed. B: keep standard UI RNG only and
+settle its seeding/phase contract next. Prior sample/gameplay-stream contracts
+remain intact for their own scope and the later arc.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
