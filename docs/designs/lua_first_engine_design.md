@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-54/Q-2i: ownership and cancellation of shared module loads.
+The current checkpoint is P-55/Q-2j: module evaluation order and queued dependencies.
+D-57 accepts VM-owned shared module jobs with per-instance waiters.
 D-56 accepts resumable module-level imports and explicit loading from hooks.
 D-55 accepts bounded byte-for-byte data-file results.
 D-54 accepts one-shot request results with explicit terminal consumption.
@@ -1693,8 +1694,40 @@ progress there when dependencies are late; protected VM-owner evaluation,
 D-7's once/cache/cycle/failure rules and D-8's top-level effect limits remain.
 The manager presented the resumable-loader/scheduling cost and the fact that
 a non-yielding module may still hang its VM. The owner chose imports in Lua
-rather than a declared dependency list. Shared-load ownership/cancellation,
-limits and exact module API details remain open.
+rather than a declared dependency list. D-57 subsequently settles shared-load
+ownership/cancellation; evaluation order, limits and exact module API remain open.
+
+### D-57. A module job belongs to its VM and outlives cancelled waiters
+
+**Delivery:** M1; bounded per-VM loader ownership and per-instance subscriptions.
+
+Owner answer, **2026-10-22 01:19:19 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: VM finishes it (Rec.)
+
+Authenticated relay: `het-manager`, message `ey9cchg738u6df4s5tgrgf2fzn`,
+posted **2026-10-22 01:19:19.578 UTC** in `#het-luafirst`, replying to Q-2i
+message `pxqdpe764z7n4r3gqaj8pnxemi`.
+
+Accept P-54's A: one shared module job per root/path per VM, with per-instance
+waiters. Cancelling a request or ending an instance removes only its waiter.
+Even with no waiters, the VM continues the load into its ready/failed cache;
+one instance cannot poison, restart or cancel another's shared module work.
+Ordinary failures fail active required requests at their eligible settlements;
+without waiters they are attributed, logged and cached, without retry or an
+invented instance failure. Engine/cleanup failures remain fatal.
+
+The job retains its logical evaluation obligation even with no waiters. Its
+work and cache have VM-owned bounds; a detached waiter's retirement does not
+claim the job has retired. VM/session stop drains actual provider work without
+requiring further ordinary module execution. D-8's top-level acquisition ban
+and the non-preemptible trusted-script limit remain unchanged.
+
+The manager presented the cost: unwanted loading, effects and tick delay may
+continue until completion or VM stop. The owner chose this over stopping at
+the last dependent's departure. Evaluation order, including a dependency that
+already has a later queued job, is the next explicit checkpoint P-55/Q-2j.
 
 ## Proposals
 
@@ -4498,7 +4531,7 @@ logical visibility and independent UI progress before being called delivered.
 
 ### P-54. The VM owns an admitted module load; instances own their waiters
 
-**Unapproved; active checkpoint Q-2i. Delivery: M1.** Recommend A: maintain
+**A accepted by D-57 through Q-2i. Delivery: M1.** Recommend A: maintain
 one bounded loader/cache entry per `(content root, path)` in each VM. Requests
 for the same pending module join that load; they never evaluate it twice or
 receive partial exports. Each instance has its own request/waiter, but the VM
@@ -4569,6 +4602,72 @@ not supply this shared module-job owner. D-7 and D-56 require new per-VM loader
 state; the subscription-versus-job accounting proposed here must be implemented
 and qualified explicitly, not inferred from existing request cleanup.
 
+### P-55. Evaluate one module dependency chain at a time in each VM
+
+**Unapproved; active checkpoint Q-2j. Delivery: M1.** Recommend A: serialize
+module evaluation within each VM. Independent root jobs start in assigned
+tick/sequence order for the logical VM, and admission order for the UI VM.
+An earlier root waiting for source bytes holds its place; faster I/O for a
+later root does not let that root's top-level code overtake it. Source reads
+may overlap within the eventual provider bounds, but evaluation follows this
+order. Each active module evaluates its imports depth-first, in Lua call order,
+resuming its own code only after each imported module has complete exports.
+
+An import reuses a ready cache entry or a failed entry under D-7. A missing
+dependency is loaded as part of the active chain. If that dependency already
+has a queued job, reuse that job and evaluate it now as a dependency, rather
+than waiting behind the importing root or creating a second evaluation. An
+import of a module already on the active chain is a cycle: reject it with the
+root/path chain, never expose partial exports or wait for the module itself.
+
+**This requires an explicit timing refinement to D-56/D-57.** For example,
+module A is due at logical tick 10 and imports B, which was independently
+requested for tick 12. B executes once as A's dependency at tick 10, and A can
+then finish. B's independent request still settles only at its own assigned
+tick/sequence position; it does not deliver a success or escalate its failure
+early. The ready/failed cache entry exists from the dependency evaluation, so
+an immediate cache lookup can encounter it before that separate request is
+due. A dependency failure affects A at A's position. B's later job obligation
+becomes delivery of the already computed outcome, not another evaluation or
+another wait for source bytes. Cancellation still removes only a waiter.
+
+Thus the earliest actual evaluation is at an eligible importing chain's
+position, or at the module's own scheduled root position if reached first;
+native arrival alone never starts logical top-level execution early. The
+owner must approve this qualification, rather than silently treating D-56's
+original timing sentence as if it already covered dependency promotion.
+
+Serialization applies to module evaluation, not every task in the VM. While
+the UI loader waits for I/O, eligible UI instance hooks and stop/control work
+can run through the existing scheduler. The loader resumes through that
+protected owner and obeys its service policy; no new hook priorities, authored
+phases or re-entrant Lua calls are introduced. Logical progress still waits
+when a due module chain is unfinished, while the separate UI VM can continue.
+The two VMs do not share an evaluation queue. D-8's effect limits, D-57's
+job ownership, and the absence of rollback for logs/shared Lua tables remain.
+
+Alternative B allows independent module evaluations to interleave while one
+waits for dependencies. This can reduce delay behind slow reads, especially
+in the UI VM, but requires rules for cross-job dependency waits, cycle
+detection and observable top-level effect order. Logical assigned positions
+would still constrain execution. If selected, design that contract explicitly.
+
+A is recommended for M1 because it gives authors a clear dependency order and
+avoids two suspended roots waiting on each other through separate jobs. Its
+cost is that one slow dependency delays unrelated module evaluation in that
+VM, even when the unrelated file is ready; it does not guarantee module
+completion time. Limits and capacity refusal inside a dependency chain are
+still open, and must not introduce a wait for capacity that only finishing
+that same chain could free.
+
+Qualification covers reversed source-completion order, nested imports, reuse
+of a later queued dependency without duplicate execution, separate ticket
+visibility/failure timing, cycle paths, cancellation of all external waiters,
+UI hook progress during source waits and VM stop. The existing host's FIFO
+ready ordinals govern scheduling (see the
+[host scheduler](../../packages/scripting-lua/README.md#policies)); they do not
+already provide this module queue or dependency-promotion protocol.
+
 ## Open questions
 
 ### Q-1. Which filtered standard-library profile applies to every script?
@@ -4638,11 +4737,20 @@ list. Finite init, cache/cycle/failure rules and logical effect timing remain.
 
 #### Q-2i. Does a shared module load continue after its last requester leaves?
 
-**Active checkpoint, P-54.** A (recommended): the VM owns the admitted job;
-instances cancel only their waiters, and work/cache settlement continues while
-the VM lives. B: abandon after the last dependent leaves and design partial-
-evaluation/cache cancellation semantics. A explicitly retains possible logical
-tick delay and effects after all external waiters cancel.
+Resolved by D-57: P-54's A, VM-owned jobs continue into the cache even without
+waiters. Cancellation ends only the requesting instance's subscription;
+continuing work/effects and logical delay remain possible until completion or
+VM stop. Queued-dependency evaluation order is a separate checkpoint.
+
+#### Q-2j. Serialize module evaluation chains or interleave independent loads?
+
+**Active checkpoint, P-55.** A (recommended): one active dependency chain per
+VM, ordered roots and depth-first imports; reuse a queued dependency within
+the active chain. Explicitly qualify D-56/D-57: a dependency may evaluate at
+its importer's earlier logical position while its independent request still
+settles at its own assigned position. B: interleave independent evaluations
+and design the cross-job wait/cycle/effect-order contract. A costs delay behind
+slow dependencies, including for unrelated modules whose source is ready.
 
 ### Q-3. What is the generic executable's boot and session contract?
 
