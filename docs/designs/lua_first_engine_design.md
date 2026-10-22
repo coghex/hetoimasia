@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-57/Q-2l: literal root-relative content paths.
+The current checkpoint is P-58/Q-2m: filename case and Unicode identity.
+D-60 accepts literal root-relative paths without shortcuts or filename search.
 D-59 accepts pre-admission module-limit refusal and required dependency-limit failure.
 D-58 accepts one import chain per VM and queued-dependency evaluation timing.
 D-57 accepts VM-owned shared module jobs with per-instance waiters.
@@ -1801,6 +1802,34 @@ failed entries consuming the session budget, and accepted loads failing on
 later dependencies. The owner chose refusal up front over failing the VM for
 pre-admission cache exhaustion. Concrete numbers and configuration remain open;
 the existing host's limits were evidence, not selected defaults for this loader.
+
+### D-60. Content paths are literal filenames relative to their content root
+
+**Delivery:** M1; common module/data/texture path grammar.
+
+Owner answer, **2026-10-22 01:51:49 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: literal root paths (Rec.)
+
+Authenticated relay: `het-manager`, message `nzxh26nypgkrtcsf47i2pun2xi`,
+posted **2026-10-22 01:51:49.403 UTC** in `#het-luafirst`, replying to Q-2l
+message `jcr2zzcnb9rb4q8tvwqfxu3b4w`.
+
+Accept P-57's A: paths such as `lua/util.lua` start at the selected content
+root, never the importing script's directory, and use `/` only. Empty paths,
+leading/trailing/repeated slashes, dot/parent segments, backslashes, colons,
+control characters and invalid UTF-8 are refused before filesystem work.
+There is no expansion, URL/absolute-path interpretation, working-directory
+search, extension insertion or directory-entry fallback.
+
+Bad hook arguments are ordinary Lua errors, including for optional loads;
+invalid manifest entries fail boot before Lua. Invalid module-level imports
+fail the required load. Valid but missing/changed files retain their content
+failure classification. The manager presented the cost of always writing
+from the root without shortcuts. The owner chose literal paths over accepting
+and normalizing shortcuts. Filename case/Unicode rules and numeric limits
+remain separate; this decision does not supply race-safe filesystem opening.
 
 ## Proposals
 
@@ -4813,7 +4842,7 @@ does not supply this pending/failed cache or dependency-limit supervision.
 
 ### P-57. Require literal root-relative paths instead of normalizing shortcuts
 
-**Unapproved; active checkpoint Q-2l. Delivery: M1.** Recommend A: every
+**A accepted by D-60 through Q-2l. Delivery: M1.** Recommend A: every
 module, data and texture reference names an explicit file relative to its
 selected content root, using `/` between nonempty path segments. For example,
 `lua/util.lua` names that file from the root, not from the importing script's
@@ -4865,6 +4894,71 @@ root-relative resolution from nested scripts, no extension/directory fallback,
 manifest validation and required/optional failure classification. The current
 Lua host accepts application-supplied module bytes and has no scoped content
 path resolver; this is new content-service behavior, not an existing host API.
+
+### P-58. Use case-sensitive Unicode filenames with canonical identity
+
+**Unapproved; active checkpoint Q-2m. Delivery: M1.** Recommend A: permit
+Unicode filenames satisfying D-60, normalize each filename segment to Unicode
+NFC for logical identity, and require case-sensitive matching of that identity.
+Apply the same conversion to manifest paths, Lua references and names found
+by the startup inventory. `images/Hero.png` does not match `images/hero.png`,
+even when the native filesystem would accept that spelling. The two canonical
+Unicode encodings of an accented name, such as a composed `é` and `e` plus
+combining acute, do name the same inventory entry. This answers the Unicode
+question left open by D-60; it does not permit dot-segment/path shortcuts.
+
+The inventory maps each logical name to its observed native directory entry;
+later opens use that mapping with D-10/D-11's checks. Never simply pass a
+normalized user string to a permissive native lookup and let it select another
+spelling. Do not rename files on disk. Every path segment, including directory
+names, participates. Shared module identity and all fingerprint/request keys
+use the same normalized root-relative path. This changes names only, never
+file contents, data-file bytes, Lua source text or authored display strings.
+
+Before Lua, reject distinct sibling entries that collide after NFC conversion
+or Unicode canonical caseless comparison, naming both entries and their root.
+For example, a root containing both `Hero.png` and `hero.png` is refused;
+case folding detects a collision, but never provides case-insensitive lookup.
+The same applies to file/directory collisions. Use a fixed, documented Unicode
+table version for the engine build, independent of locale; its concrete library
+and version belong to implementation qualification, not ambient OS settings.
+Reject non-UTF-8 or D-60-invalid inventory names rather than silently hiding
+them. This is a conservative unambiguous namespace, not a guarantee that every
+legal name can be copied to every possible filesystem. Native alias behavior
+must not bypass the checked inventory; platforms unable to address a root
+unambiguously must refuse it, not guess an entry.
+
+A well-formed reference whose case does not match is a missing-content result
+under the existing required/optional rules, not an alternate spelling that
+opens the file anyway. Cached module lookups use the same keys. All existing
+startup fingerprint, later changed-file refusal and no-symlink rules remain;
+the launcher spelling of the selected root folder is separate from names
+inside that root. Content IDs and numeric path limits remain in the forthcoming
+manifest/bounds contract, not inferred from filename rules.
+
+Alternative B restricts filenames inside registered content roots to printable
+ASCII satisfying D-60, with exact case lookup and rejection of ASCII-case
+collisions. Non-ASCII inventory names fail startup and non-ASCII references
+are invalid arguments. It needs no Unicode normalization/case-folding layer;
+authors rename accented and non-Latin filenames. Both profiles preserve spaces
+and other permitted characters literally, without trimming or expansion, and
+neither promises names unsupported by the destination filesystem will work.
+
+A is recommended so author-chosen international filenames need not be renamed
+for this milestone, while module identity is explicit across encodings. Its
+cost is Unicode normalization and collision checking, bounded mappings to
+native names, and platform qualification; ambiguous roots fail boot even if a
+particular filesystem can distinguish their entries. B is smaller if that
+authoring restriction is preferable for M1.
+
+Qualification covers composed/decomposed names sharing one module evaluation,
+case mismatch without native fallback, normalization/case collisions in files
+and directories, spaces preserved, invalid native names, and unchanged raw
+data results. The meaning of NFC and canonical equivalence comes from
+[Unicode UAX #15](https://www.unicode.org/reports/tr15/); case folding is a
+separate operation described in the
+[Unicode case-mapping FAQ](https://www.unicode.org/faq/casemap_charprop.html).
+These standards supply algorithms, not an already implemented content provider.
 
 ## Open questions
 
@@ -4957,11 +5051,17 @@ limits, and no waiting, eviction or retry. Temporary request pressure remains
 
 #### Q-2l. Require literal root-relative paths or normalize relative shortcuts?
 
-**Active checkpoint, P-57.** A (recommended): explicit file paths from the
-selected root, `/` separators, no empty/dot/parent segments or native-path
-shortcuts, and no extension/directory search. B: accept and normalize relative
-aliases to the same root-relative key. Filename repertoire, case/Unicode rules
-and numeric path limits remain separate naming-contract questions.
+Resolved by D-60: P-57's A, literal root-relative filenames, `/` separators,
+no dot/parent/native-path shortcuts and no extension/directory search. Case,
+Unicode and numeric path limits were explicitly left open.
+
+#### Q-2m. Unicode filename identity or an ASCII-only content namespace?
+
+**Active checkpoint, P-58.** A (recommended): Unicode NFC identity, exact case
+lookup and startup rejection of normalized/caseless collisions, using a checked
+inventory-to-native mapping. B: printable ASCII filenames only, exact case and
+ASCII-case collision rejection. A costs Unicode handling and qualification;
+B requires renaming non-ASCII content files. Numeric path limits remain open.
 
 ### Q-3. What is the generic executable's boot and session contract?
 
