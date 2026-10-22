@@ -21,6 +21,7 @@ module Test.Content.Identity.Support
   , collisionOf
   , exactly
   , scalars
+  , allocatedBy
   ) where
 
 import Data.Bifunctor (bimap)
@@ -28,6 +29,8 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
 import Data.Char (chr)
+import Data.Int (Int64)
+import GHC.Conc (getAllocationCounter, setAllocationCounter)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Word (Word8)
@@ -102,3 +105,11 @@ exactly segment total = BC.pack (go total)
 -- | Every Unicode scalar value.
 scalars ∷ [Char]
 scalars = [chr code | code ← [0 .. 0x10ffff], code < 0xd800 || code > 0xdfff]
+
+-- | The bytes the calling thread allocates while the action runs to completion.
+-- Inputs are built before the call, so only the work of the action is counted.
+allocatedBy ∷ IO a → IO Int64
+allocatedBy action = do
+  setAllocationCounter 0
+  _ ← action
+  negate <$> getAllocationCounter

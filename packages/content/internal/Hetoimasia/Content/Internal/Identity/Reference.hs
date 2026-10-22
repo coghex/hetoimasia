@@ -20,6 +20,7 @@ import Data.Word (Word8)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import Data.Text.Unsafe (lengthWord8)
 import Hetoimasia.Content.Internal.Identity.Types
 import Hetoimasia.Content.Internal.Identity.Unicode (caselessKey, decodeUtf8, nfc)
 
@@ -49,9 +50,22 @@ parseReference limits root reference = either refuse Right (check limits referen
     check = \l r → ContentKey root <$> checkReference l r
 
 -- | 'parseReference' for a reference held as text: its UTF-8 encoding is the
--- reference, so the bounds count encoded bytes, never characters.
+-- reference, so the bounds count encoded bytes, never characters. The encoded
+-- length of a 'Text' is known without encoding it, so an over-long one is
+-- refused on that length before any of it is copied, and its excerpt encodes
+-- only a bounded prefix.
 parseReferenceText ∷ IdentityLimits → RootKey → Text → Either ReferenceRefusal ContentKey
-parseReferenceText limits root = parseReference limits root . TE.encodeUtf8
+parseReferenceText limits root text
+  | size > limitPathBytes limits =
+      Left
+        ( ReferenceRefusal
+            root
+            (Excerpt (BS.copy (BS.take excerptCap (TE.encodeUtf8 (T.take excerptCap text)))) size)
+            (ReferenceTooLong size (limitPathBytes limits))
+        )
+  | otherwise = parseReference limits root (TE.encodeUtf8 text)
+  where
+    size = lengthWord8 text
 
 checkReference ∷ IdentityLimits → ByteString → Either ReferenceReason LogicalPath
 checkReference limits reference

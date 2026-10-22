@@ -15,8 +15,6 @@
 module Test.Content.Identity.Mapping (spec) where
 
 import Control.Exception (IOException, evaluate, try)
-import Data.Int (Int64)
-import GHC.Conc (getAllocationCounter, setAllocationCounter)
 import Control.Monad (forM)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -449,13 +447,6 @@ diagnostics = describe "bounded diagnostics" $ do
     rootKey "" `shouldBe` Left EmptyRootKey
     rootKey (BS.replicate (maxRootKeyBytes + 1) 0x61) `shouldBe` Left (RootKeyTooLong (maxRootKeyBytes + 1))
     fmap rootKeyBytes (rootKey (BS.replicate maxRootKeyBytes 0x61)) `shouldBe` Right (BS.replicate maxRootKeyBytes 0x61)
-
--- | The bytes the calling thread allocates while the action runs to completion.
-allocatedBy ∷ IO a → IO Int64
-allocatedBy action = do
-  setAllocationCounter 0
-  _ ← action
-  negate <$> getAllocationCounter
 
 -- | Whether two byte strings are views of one buffer.
 sharesBuffer ∷ ByteString → ByteString → Bool

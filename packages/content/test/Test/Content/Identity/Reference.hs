@@ -5,6 +5,7 @@
 -- bounds at and one beyond each edge, raw and normalized.
 module Test.Content.Identity.Reference (spec) where
 
+import Control.Exception (evaluate)
 import qualified Data.ByteString as BS
 import Data.Char (ord)
 import Data.List.NonEmpty (NonEmpty ((:|)))
@@ -411,6 +412,27 @@ textReferences = describe "text references" $ do
     fmap (const ()) (parseReferenceText m1 rootA (T.replicate 85 (T.pack "\x20ac"))) `shouldBe` Right ()
     attribution (parseReferenceText m1 rootA (T.replicate 86 (T.pack "\x20ac")))
       `shouldBe` Left (rootA, BadSegment 0 (SegmentTooLong 258 255))
+  it "refuses an over-long text on its encoded length alone, counting bytes of multibyte characters" $ do
+    attribution (parseReferenceText m1 rootA (T.replicate 513 (T.pack "\xe9")))
+      `shouldBe` Left (rootA, ReferenceTooLong 1026 1024)
+    attribution (parseReferenceText m1 rootA (T.replicate 1025 (T.pack "a")))
+      `shouldBe` Left (rootA, ReferenceTooLong 1025 1024)
+    attribution (parseReferenceText m1 rootA T.empty) `shouldBe` Left (rootA, EmptyReference)
+  it "keeps a bounded excerpt of an over-long text, with the length of the whole" $
+    case parseReferenceText m1 rootA (T.replicate 100000 (T.pack "\x20ac")) of
+      Left refusal → do
+        BS.length (excerptBytes (refusalReference refusal)) `shouldBe` excerptCap
+        excerptLength (refusalReference refusal) `shouldBe` 300000
+        refusalReason refusal `shouldBe` ReferenceTooLong 300000 1024
+      Right key → expectationFailure ("accepted: " <> show key)
+  it "allocates no more than the excerpt to refuse a huge text, however large" $ do
+    -- encoding 4 Mi characters of three bytes each would allocate 12 MiB
+    huge <- evaluate (T.replicate (4 * 1024 * 1024) (T.pack "\x20ac"))
+    _ ← evaluate (T.length huge)
+    textAllocation <- allocatedBy $ case parseReferenceText m1 rootA huge of
+      Left refusal → evaluate (BS.length (excerptBytes (refusalReference refusal)) + length (show refusal))
+      Right key → fail ("accepted: " <> show key)
+    textAllocation `shouldSatisfy` (< 256 * 1024)
   it "carries the root in the refusal" $ do
     attribution (parseReferenceText m1 rootB (T.pack "a:b"))
       `shouldBe` Left (rootB, BadSegment 0 (SegmentForbidden Colon 1 0x3a))
