@@ -3427,7 +3427,7 @@ records are [`hetoimasia-lua-engine`'s](../lua-engine/README.md#the-m1-request-a
 | Request record and terminal-result storage | the protocol model's session | `acceptRequestFor` | busy (`BankOwnerRequests`) when the model's cap is reached |
 | Accepted, unretired requests of the instance | the service's ledger (`pHeld`) | an entry for the request | busy (`BankInstanceRequests`) |
 | Accepted, unretired requests of the VM | the same ledger | the same entry | busy (`BankVmRequests`) |
-| The owner's places (the grant's bound) | the same ledger | the same entry | busy (`BankOwnerRequests`) |
+| The owner's places (the grant's bound) | every request's place at once: the same ledger, the model's outstanding requests and the cancelled results a generic request left untaken, each request counted once (`ownerPlaces`) | the same entry | busy (`BankOwnerRequests`) |
 | A result lease | `Leases`, the instance's lease capacity | `reserve`: a slot in `SlotConstructing` with the key the handle will have | busy (`BankLeases`) |
 | Provider credits | the provider's own STM variables | each `Credit`'s `creditReserve`, in the order declared | busy (`BankCredit`) |
 | The due position, for an owner on logical time | the scheduler's tick | `DueSlot (tick + offset) (request number)`, and the owner's hold on that tick | permanent refusal |
@@ -3463,9 +3463,11 @@ admission only at an accounted boundary (`D-77`).
 | Take of a terminal result, provider work still running | `takeTerminal` | nothing; the entry stays charged |
 | The provider proves its work over (reply, or its retirement reading) | the owner's next boundary: `sweepWorks`, `reapWorks`, then `releaseSettled` | the places and credits of a request already taken, at that boundary and not before; a retirement completed on a provider's thread is invisible until then |
 | The requester ends | `endRequesterSTM`, then `releaseSettled` | the requests it did not collect are discarded; their entries leave as their work is reaped |
-| An epoch change, the owner's exit | `advanceEpochSTM`, `closeSTM` | as above; what is cancelled for a script to take stays charged until it is taken |
+| An epoch change, the owner's exit | `advanceEpochSTM`, `closeSTM` | as above; what is cancelled for a script to take stays charged until it is taken. A resource already built for a result nobody took is queued for release with the epoch (`pDiscards`), on the owner's next boundary |
+| A resource whose building failed, a stage of which the provider is still retiring | `failAdoption`, then `releaseSettled` | nothing while the lease slot exists: the credits that were to transfer stay charged with it (`heldRetiring`), and are returned once the slot is gone and the request's work is reaped; the owner wakes for that |
 | An admission taken back (the provider could not be handed the request) | `withdrawAdmission` | everything at once: credits returned `CreditUnused`, the lease discharged |
 | A retirement that fails | the work's retained failure | nothing, ever: the place and credit stay charged and the failure is cleanup evidence |
+| A credit release that raises | `releaseSettled`, `withdrawAdmission` | the other credits and the place come back; the failure is cleanup evidence, kept on every path that services the provider: the boundary, the retirement of the instances and the owner's exit (`serviceProvider`) |
 
 A `Credit` is returned once, with the reason (`CreditUnused` or `CreditSettled`), except one that `creditTransfers`
 and whose request succeeded with a resource: that credit is the resource's, and the provider's own release of the
@@ -3492,7 +3494,10 @@ A request admitted this way takes the service's contract for its reply (`checkRe
   of another shape) is a **provider defect**: `ReplyDefective`. It is never a failure of the request, never given a
   code, never an optional content failure and never retained. It is recorded (bounded, at most sixteen), the work is
   proved over and the request stays unsettled; the owner raises it as a failure of the host
-  (`ProviderDefect`) at its next boundary, under its policy, for a required and an optional request alike. The
+  (`ProviderDefect`) at its next boundary, under its policy, for a required and an optional request alike. A
+  defect that arrives after the owner's last boundary (an instance inside its `shutdown`, the owner waiting for its
+  providers) is taken by the retirement and is the owner's failure like a provider that raised when told: the
+  first is the owner's if nothing failed before it, and every other is kept whole. The
   generic `requestBindings` path keeps settling a malformed or oversized reply as a `ValidationFault` failure.
 
 ### Timing
@@ -3516,7 +3521,10 @@ owner on arrival, at the position's tick on logical time. At that point the requ
 and one `JobDispatch`, and the owner fails the instance with `ErrorRequest` at its next safe boundary, before any
 more of the instance's ordinary work and without preempting a segment. The latch is the owner's, set in the
 transaction that made the settlement eligible; nothing a script does afterwards (reading, not reading, a caught
-`take` or `ready` error, a late `cancel`, which answers `already_settled`) touches it. A cancel that won before
+`take` or `ready` error, a late `cancel`, which answers `already_settled`) touches it. The owner only reads it to
+apply it: it stays on the instance until the instance is ending, so a cancellation between the reading and the
+recording of the failure leaves it for the next boundary or the settlement, which keeps a latch the instance ended
+with as its failure (or beside the failure it had), once. A cancel that won before
 eligibility prevents it, and a held failure is discarded unseen. `OptionalRequest` leaves the failure a result for the
 script. The failure reaches the application the way every instance failure does, through `instanceEscalate`; session
 and role escalation are the application's.
@@ -3524,7 +3532,7 @@ and role escalation are the application's.
 ### Handles and phases
 
 `admittedHandleType` (over the `RequestHandles` the owner is given with `scheduledRequestHandles`, made before the
-owner and taken by it, as the leases are) declares the handle capability type: a handle is live for the instance that
+owner and taken by it, as the leases are; of owners that start together exactly one takes it, in one atomic step) declares the handle capability type: a handle is live for the instance that
 holds it while its request exists. A handle that is another instance's, spent by a take, or never issued is refused
 by the value boundary before any action as a handle that has ended; the check reads the running instance, not
 anything a script supplied. `callerPhase` tells a precondition whether an instance is initializing, serving or
@@ -3538,8 +3546,10 @@ ending: `wait` is for a serving instance, and an instance in `shutdown` is not t
 | `Rec` metadata (`recAdmission`, `recFailure`, `recLease`, `recAdopted`) | the service | admission; the reply; adoption | settlement | with the record |
 | `pAdopting` | the service | a provider's reply (insert); the owner (claim, finish) | the owner's boundary | until built, failed or the request ends; a claimed entry is not dropped under the builder |
 | `pDiscards` | the service | `cancelOf`, the epoch | the owner's boundary | until released |
-| `pDefects` | the service | a provider's reply | the owner's boundary | until raised; at most sixteen |
-| `isRequestFailure` | the instance's cell | the settlement that made a failure eligible | the owner's dispatch | until applied, once |
+| `pDefects` | the service | a provider's reply | the owner's boundary, or the retirement when no boundary follows | until raised; at most sixteen |
+| `pCleanup` | the service | a credit release that raised | `serviceProvider`: every path that services the provider | until kept as cleanup evidence; at most sixteen |
+| `heldRetiring` (of `pHeld`) | the service | `failAdoption` | `releaseSettled`, `workWaiting` | until the failed building's lease slot is gone |
+| `isRequestFailure` | the instance's cell | the settlement that made a failure eligible | the owner's dispatch; the instance's settlement | until the instance is ending; applied once |
 | `RequestHandles` | the application | the owner binds it | the value boundary's liveness check | with the owner; serves one |
 
 ### What proves it
@@ -3555,7 +3565,7 @@ holding the tick, the offset refused on arrival, the ceiling and exhausted numbe
 has nowhere to go); required and optional failure with the latch independent of reads, caught errors and late cancels;
 every kind of defect; the result lease built, kept live after a take, released with the instance, discharged unused and
 released when cancelled after adoption; immediate completion during submission, revocation during the handoff,
-late, duplicate and unknown completions, and a disposal that fails; and handles across two instances. `lua-host-tests`
+late, duplicate and unknown completions, and a disposal that fails; handles across two instances; and the races a review found, one example each: a credit release that raises at a settlement, at a withdrawal and in the owner's exit; a second reply while a resource waits to be built; credits that transfer to a resource built after its request was cancelled; a resource whose building failed while a stage's retirement is pending; a resource adopted for a result nobody took when the epoch changes; a latch carried to the end of the instance; a defect that arrives while the owner is exiting; the registry of handles claimed by owners that start together; and the owner's bound across generic and opt-in requests. `lua-host-tests`
 pin `withArgumentCheck`. The cancellation and cleanup windows are the kind an asynchronous-exception race can hide on
 one platform, so CI, which runs them on Linux, is the evidence for them and a local pass is not.
 

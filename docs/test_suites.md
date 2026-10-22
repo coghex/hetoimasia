@@ -90,14 +90,22 @@ cabal test hetoimasia-tests --test-show-details=direct
   configuration boundary (LFE-3): the strict manifest parser's accepted examples,
   byte and nesting limits, syntax and schema refusals and exact tick conversion, the
   fixed M1 profile and its smaller validated test profiles, and the package's
-  dependency and import boundary; and the M1 request adapter (LFE-7, `Test.LuaEngine.Request.*`):
+  dependency and import boundary; the manifest and entry boot checkpoint (LFE-6) composed with the content inventory over real temporary folders (`Test.LuaEngine.Boot`); and the M1 request adapter (LFE-7, `Test.LuaEngine.Request.*`):
   the busy record, the exact `ready`/`take`/`cancel`/`wait` records, handles and phases,
   the profile's limits, a texture lease, and required and optional failure, over real Lua
-  instances on a supervised owner with controlled fake providers. The manifest and profile
-  examples perform no IO and start no Lua; the request examples start no window or GPU.
+  instances on a supervised owner with controlled fake providers. The manifest, profile and boot
+  examples start no Lua; the request examples start no window or GPU.
   A new manifest or profile example belongs there, in the component spec that owns it.
   `lua-runtime-tests` also owns the host's opt-in admission (`Test.LuaRuntime.Admission.*`)
   and `lua-host-tests` the argument checks (`Test.Lua.Boundary.ArgumentChecks`).
+  `content-tests` (`packages/content/test/`, composed by `Test.Content.Spec`, group
+  `test.content`, the CPU project) owns the content package's anchored native roots, its
+  logical identity policy and, from LFE-6, its bounded whole-folder inventory and verified
+  reads, over temporary trees each example owns. Select a component with
+  `--test-options='--match <Component>'`: `Roots`, `Links`, `Reading`, `Enumeration`,
+  `Lifecycle`, `Opacity`, `Identity`, or `Inventory` with its components `Scan`, `Limits`,
+  `Changes`, `Aliases`, `Reading`, `Lifecycle` and `Inventory boundary`. A new inventory
+  or verified-read example belongs there, in the component that owns the behavior.
   Selectors moved with their examples: on the root suite, `--match Runtime`,
   `Resources`, `Recovery`, `Workers`, `Messaging`, `Logging`, `Failures`, and
   `GLFW` now select nothing and fail; on `runtime-tests`, `--match Supervision`

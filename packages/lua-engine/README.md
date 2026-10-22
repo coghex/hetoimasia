@@ -1,15 +1,20 @@
 # hetoimasia-lua-engine
 
-The Lua-first engine's **configuration boundary and role policy** (LFE-3 and LFE-8 of
+The Lua-first engine's **configuration boundary and role policy** (LFE-3, LFE-6 and LFE-8 of
 [the design](../../docs/designs/lua_first_engine_design.md)): a strict parser for
 the format-1 launch manifest `hetoimasia.json`, from supplied bytes to a
 resolved role, entry and tick configuration, the **fixed M1 profile** of
-limits with validated, smaller test profiles, and the **M1 behavior selection**: which
-export field each role selects, the exact cadence rules and the export-module ceilings.
+limits with validated, smaller test profiles, the **M1 behavior selection**: which
+export field each role selects, the exact cadence rules and the export-module ceilings,
+and the **boot checkpoint**: the proof, before any authored Lua, that the manifest
+parsed is the manifest the content scan pinned and that every declared entry names an
+inventoried regular file.
 
-The library opens no folder, reads no file, starts no Lua, worker, window or GPU,
-prints nothing, exits nowhere and performs no IO. Every function is pure and
-returns a plain value or a bounded refusal. The **M1 request adapter**
+The library opens no folder, starts no Lua, worker, window or GPU, prints nothing and
+exits nowhere. Its manifest, profile and behavior modules perform no IO: every function
+is pure and returns a plain value or a bounded refusal. The boot checkpoint reads only
+through the verified read the caller passes it (normally the content inventory's), and
+imports no module that opens a file itself. The **M1 request adapter**
 (LFE-7) is the `request` sublibrary beside it, in a source directory of its own
 so that this one stays pure: see [below](#the-m1-request-adapter).
 
@@ -17,19 +22,21 @@ The library depends on `hetoimasia-foundation` (its `Duration`, checked
 nanoseconds from 1 to 2^64 − 1), on the Lua host and its runtime
 (`hetoimasia-scripting-lua` and its `runtime-lua` sublibrary, for the behavior
 selection only: the manifest and the profile import nothing of them) and on `array`,
-`base`, `bytestring`, `containers` and `text`. It depends on no GLFW, Vulkan, console,
-sample or game package, and it imports no module that performs IO. Later slices add
-the content layer (LFE-4 to LFE-6) and the rest of the role composition to this
-package; they are not here.
+`base`, `bytestring`, `containers` and `text`; and, for the boot checkpoint only, on the
+public modules of `hetoimasia-content` (the anchored root, the logical identity policy
+and the inventory). It depends on no GLFW, Vulkan, console, sample or game package, and it
+imports no module that performs IO of its own. Later slices add the rest of the role
+composition to this package; they are not here.
 
 | Module | Contents |
 | --- | --- |
 | `Hetoimasia.LuaEngine.Manifest` | `parseManifest`, `parseManifestWith`; `Manifest`, `RoleSelection`, `declaredEntries`; every refusal type |
 | `Hetoimasia.LuaEngine.Profile` | `fixedM1Profile`, `validateProfile`; the limit types and their accessors; the derived values |
 | `Hetoimasia.LuaEngine.Behavior` | `behaviorField`, `exportLimits`, `cadenceOf`, `behaviorRequest`; `CadenceRefusal` |
+| `Hetoimasia.LuaEngine.Boot` | `contentConfiguration`, `bootCheckpoint`, `bootCheckpointFrom`, `checkManifestPinned`; `Checkpoint`, `ResolvedEntry`, `BootRefusal` |
 | `Hetoimasia.LuaEngine.Request` (sublibrary `request`) | the M1 request policy over a validated profile and the exact common result adapter: `m1Requests`, `startM1`, `m1ArgumentCheck`, `m1RequestBindings` |
 
-Every other module is hidden. A client of the pure boundary imports the first three.
+Every other module is hidden. A client of the pure boundary imports the manifest, the profile and the behavior modules.
 
 ## The manifest
 
@@ -269,6 +276,84 @@ rounded upward, `0.1`, the largest accepted count and the first refused one, che
 written integer oracle over the doubles on both sides of the boundary and across a spread of magnitudes; the
 no-update behaviors; and the request carrying the role's rule.
 
+## The boot checkpoint
+
+`Hetoimasia.LuaEngine.Boot` is the small manifest-to-inventory check that runs after
+the content scan and before any authored Lua (LFE-6). It starts no VM, worker, pool,
+window or launcher command, parses and compiles no Lua, and claims nothing about the
+behavior of an entry. The launcher opens the content root once, scans it into an
+`Inventory` ([the content package](../content/README.md#whole-folder-inventory-and-verified-reads-lfe-6)),
+keeps the same anchored root for the session, and asks this module for the result.
+
+```haskell
+contentConfiguration ∷ Profile → Either ConfigurationRefusal ContentConfiguration
+bootCheckpoint       ∷ Profile → Inventory → VerifiedReader → IO (Either BootRefusal Checkpoint)
+bootCheckpointFrom   ∷ Profile → ContentRoot → Inventory → IO (Either BootRefusal Checkpoint)
+checkManifestPinned  ∷ Inventory → Manifest → Either BootRefusal ()
+```
+
+`contentConfiguration` is the only place the content layer's numbers come from: the
+fixed M1 profile gives 10,000 entries including the root, 32 segments, 1,024 path bytes
+and 255 per segment, 64 MiB per file, 1 GiB per root and a 64 KiB buffer, and a validated
+smaller profile gives smaller ones through the same check. The content package holds no
+default.
+
+A `VerifiedReader` is the narrow service the checkpoint reads the manifest through
+(`bootCheckpointFrom` passes the inventory's own `readVerified` over the open root). The
+checkpoint, in order:
+
+1. names `hetoimasia.json` exactly (a name the limits in force cannot hold is
+   `ManifestNameRefused`);
+2. asks the inventory alone: no such entry (including a root that holds only
+   `Hetoimasia.json`, and a valid manifest in the parent folder) is `ManifestAbsent`; a
+   directory at that name is `ManifestNotAFile`; an inventoried length above the 64 KiB
+   manifest limit is `ManifestOverLimit`, decided before a byte is read. No other
+   spelling and no other folder is searched;
+3. reads the pinned bytes through the verified reader within that limit (a refused read
+   is `ManifestReadRefused`, with the read's own outcome), compares them once more with
+   the inventoried length and digest (`ManifestNotPinned`), and **parses the manifest
+   from those bytes**, so the bytes parsed are the bytes pinned and nothing is ever
+   reserialized or compared as JSON (`ManifestRefused` carries the parser's refusal,
+   whose schema and depth behavior is unchanged);
+4. validates every declared entry text, in `declaredEntries` order, as a literal
+   root-relative reference under the content identity policy and requires it to name an
+   inventoried regular file: `EntryReferenceRefused`, `EntryAbsent` (including a case
+   mismatch) or `EntryNotAFile`. A common `entry` that every selected role overrides is
+   checked like any other.
+
+A `Checkpoint` carries the manifest, the manifest's content key, a `ResolvedEntry` (slot,
+text, key and inventoried length) for every declared entry, and the content key each
+selected role will load, gameplay before presentation. The later launcher consumes it
+under the root it already holds; this package neither starts those roles nor wires the
+`run` command.
+
+`checkManifestPinned` answers the other order: a `Manifest` parsed from revision A while
+the scan pinned revision B is refused with `ManifestNotPinned` however alike the two
+documents parse, because it compares the parsed manifest's exact bytes with the
+inventoried length and SHA-256.
+
+Ordinary refusals are values. Cancellation, misuse and a failing reader propagate as the
+exceptions they are; the checkpoint holds no handle and no buffer beyond the manifest
+bytes it was handed, which it keeps only inside the `Manifest` it returns, so there is
+nothing to release.
+
+### What proves it
+
+`Test.LuaEngine.Boot`, over real temporary folders and the packages' public interfaces
+only: the content configuration from the fixed profile (the approved numbers, read back)
+and from a validated smaller one; a common entry, separate entries with a fully overridden
+common entry, and both one-role arrangements; the manifest at exactly 65,536 bytes and one
+past it (refused before the reader is called), under the fixed and a smaller profile; a
+missing manifest, a case-mismatched one, one in the parent folder, a directory at its name;
+the A/B cases (a replaced manifest of the same or another length, valid or not, refused at
+the read; a manifest parsed from A beside a scan that pinned a valid or an equivalent B
+refused; the same bytes accepted; a reader that returns other bytes refused); every
+declared entry refused when it is an invalid reference, absent, a case mismatch or a
+directory; cancellation while the checkpoint holds the read, after which the root still
+closes and a fresh checkpoint is whole; a failing reader propagating; two folders booting
+independently; and a separately compiled client composing the root, the scan and the
+checkpoint through public modules.
+
 ## The M1 request adapter
 
 `Hetoimasia.LuaEngine.Request` (LFE-7, sublibrary `request`) is M1's policy and result adaptation over the host's
@@ -345,9 +430,8 @@ adapter. They build every fixture beside the suite from public host modules; non
 
 ## Deferred, by design
 
-Not here, and not claimed: opening `hetoimasia.json`, anchored roots, the full
-literal Unicode path identities, inventory and presence checks and SHA-256
-verification (LFE-4 to LFE-6); the CLI `run` dispatch and exit mapping (LFE-22);
+Not here, and not claimed: the CLI `run` dispatch and exit mapping (LFE-22), which will
+consume the boot checkpoint and retain the same anchored root;
 the loader and import resolution (LFE-9), the concrete content, time, graphics and status
 service facades (only the request adapter's common operations are here) and their metadata and grant policy (LFE-12), workers and session startup; live codec, texture and GPU budgets and their
 enforcement; time sampling and scheduling; mods, metadata extensions, alternate
@@ -361,10 +445,11 @@ manifest formats, defaults or relaxed parsing.
 cabal test --project-file cabal.project.cpu hetoimasia-lua-engine:lua-engine-tests --test-show-details=direct
 ```
 
-The manifest, profile and behavior examples perform no IO and start no Lua (the Lua host's behavior
+The manifest, profile and behavior examples perform no IO and start no Lua; the boot checkpoint's
+examples scan real temporary folders through the content package and evaluate nothing (the Lua host's behavior
 mechanism is tested in its own suites); the request adapter's examples start real Lua instances on a real
 supervised owner, with controlled fake providers, and no window or GPU. It covers the accepted
 examples, every syntax and schema refusal with the limits at their boundary and
 one past, the exact tick endpoints and forbidden forms, every fixed value against
 an independently written expectation, valid smaller profiles and refused ones,
-the behavior selection's cadence rules and numeric boundaries, the request adapter (see above), and this package's dependency and import boundary.
+the behavior selection's cadence rules and numeric boundaries, the boot checkpoint (see above), the request adapter (see above), and this package's dependency and import boundary.
