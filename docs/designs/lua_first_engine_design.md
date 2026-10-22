@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-70/Q-6u: whether M1 exposes window-size observation.
+The current checkpoint is P-71/Q-13: the concrete launch command and manifest.
+D-73 defers Lua window-size reads and resize callbacks from M1.
 D-72 accepts an idempotent whole-session quit request that returns normally.
 D-71 accepts bounded print/warn output without a separate Lua logging API.
 D-70 accepts UI-only polling of copied session status sampled per segment.
@@ -2205,6 +2206,31 @@ The manager presented the need to return promptly and the second Ctrl-C
 escape for a hang. The owner chose a returning request over immediate hook
 termination. D-20 still covers both SIGINT and SIGTERM, and failure after a
 quit request can still make the orderly process outcome fail.
+
+### D-73. Defer Lua window-size observation and responsive layout from M1
+
+**Delivery:** M1 boundary; later presentation observation API.
+
+Owner answer, **2026-10-22 03:25:35 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: defer size reads (Rec.)
+
+Authenticated relay: `het-manager`, message `8uemyzhbbeauhccfkezx9ahwp2`,
+posted **2026-10-22 03:25:35.796 UTC** in `#het-luafirst`, replying to Q-6u
+message `ewiidsbqpxxuecmdcngkecbs7s`.
+
+Accept P-70's A: M1 has no Lua size query or resize callback. Rectangles keep
+their authored logical-pixel positions and sizes while the engine updates the
+view, clips and suspends drawing at zero framebuffer extent. It does not
+stretch or recenter the scene; static scenes continue without republishing.
+The requested initial size is only a preference, never an actual-size report.
+Texture dimensions remain part of successful texture loading under D-47.
+
+The manager presented the lack of automatic centering or fitting on resize
+as the cost. The owner chose deferral over a UI-only size poll and directed
+the design onward to concrete API/manifest/bounds, vision/#145 reconciliation
+and one-PR delivery slices. Native resize/retirement qualification remains.
 
 ## Proposals
 
@@ -6083,7 +6109,7 @@ does not expose the existing runner's wider instance-control namespace.
 
 ### P-70. Defer Lua window-size observation while retaining native resize handling
 
-**Unapproved; active checkpoint Q-6u. Delivery: M1 boundary / later presentation.**
+**A accepted by D-73 through Q-6u. Delivery: M1 boundary / later presentation.**
 D-45 lets Lua request a title and initial size; D-50 keeps the renderer's
 full-window view current as native geometry changes. Neither decision yet
 grants Lua a read of current window/view geometry. Recommend A: no window-size
@@ -6132,6 +6158,150 @@ P-47/D-50 preserve the renderer's distinct coordinate mapping. These native
 facilities remain available to the engine whichever Lua boundary is chosen.
 After this scope choice, proceed to the consolidated M1 API/manifest/bounds
 contracts, then Q-8 vision/#145 reconciliation and Q-9 delivery slices.
+
+### P-71. Fix the M1 launch command and strict declarative JSON manifest
+
+**Unapproved; active checkpoint Q-13. Delivery: M1.** This is one proposed
+five-part contract for explicit package signoff, not five inferred decisions.
+It makes D-13/D-14/D-16 concrete without implementing L-MODS or moving cadence
+out of Lua. Recommend approving all five parts below, or revising the named
+part before recording a decision.
+
+#### 1. Command and compatibility
+
+Add `hetoimasia run GAME_ROOT`, with exactly one positional folder.
+`hetoimasia run -- GAME_ROOT` treats the following argument literally, including
+a leading hyphen; without `--`, a leading-hyphen argument is an unknown option.
+`hetoimasia run --help` alone prints help to stdout and exits 0. Missing/extra
+arguments and every other option fail as usage errors (2) before opening a
+root. No default folder, entry override, mod flag, seed, cadence override,
+window option or script-argument forwarding is introduced.
+
+Existing `lua`, `--smoke`, help and no-argument console behavior stay unchanged;
+the new window-capable path requires the explicit `run` command. Resolve the
+selected folder once under D-63, then use anchored reads for its manifest and
+inventory. Root/content/manifest failures are boot failures (1), not usage
+errors; existing fatal logging-configuration failure behavior stays unchanged.
+No directory traversal search for a manifest in parent folders is performed.
+
+#### 2. File, syntax and bounded parsing
+
+Read exactly `hetoimasia.json` at the root, with D-60/D-61's case/path rules.
+It is a non-executable UTF-8 JSON object, at most 65,536 bytes including
+whitespace, parsed before Lua. Reject BOM, malformed UTF-8, unpaired surrogate
+escapes, comments, trailing commas/data, duplicate object keys after JSON
+escape decoding, and nesting deeper than eight containers. Unknown fields,
+nulls and wrong types fail schema validation rather than being ignored or
+coerced. Object-member order is not a configuration precedence mechanism.
+
+Use [RFC 8259](https://www.rfc-editor.org/rfc/rfc8259) as the JSON syntax basis;
+the duplicate-key, Unicode and size/depth refusals above are this manifest's
+explicit stricter profile. Select a maintained parser and qualify duplicate
+detection before collapsing objects into maps; the choice of Haskell parser
+dependency is implementation work, not a claim of existing support. Retain
+the fingerprint of the exact parsed bytes under D-62; later scanning must not
+quietly substitute a changed manifest. No includes, interpolation or execution.
+
+#### 3. Root schema and stable identity
+
+The only top-level fields are:
+
+| Field | Contract |
+| --- | --- |
+| `format` | Required JSON number with exact integer value `1`; no string coercion. Other revisions fail boot. |
+| `id` | Required stable content ID: 1–64 ASCII characters matching `[a-z][a-z0-9_-]*`. Exact identity, no case folding or derivation from the folder name. |
+| `entry` | Optional common entry path, required wherever a selected role lacks an explicit entry. D-60/D-61 root-relative path grammar and normalization apply. |
+| `tick_seconds` | Required exactly when gameplay is present; decimal text as specified in part 5. Refused for presentation-only content. |
+| `vms` | Optional nonempty array of role declarations as specified in part 4. Omission selects both roles. |
+
+This `format` is the launcher manifest schema revision, not D-29's deferred
+game/mod API compatibility revision. No `mods`, dependencies, compatibility,
+asset list, window settings or arbitrary metadata fields are accepted in M1.
+Unicode file paths remain allowed; restricting the stable ID does not restrict
+those paths. All declared entry paths must name inventoried regular files,
+even if a common entry is overridden by every role; only selected entries are
+evaluated. Path syntax, presence and the whole-folder scan are checked before
+authored Lua, without pre-executing or pretending to validate Lua behavior.
+
+#### 4. Role declarations and entry selection
+
+Each `vms` element is an object with required `role` and `clock` strings and
+optional `entry`. Only `gameplay`/`logical` and `presentation`/`elapsed` pairs
+are accepted. Unknown/duplicate roles, mismatched clocks, extra fields and an
+explicit empty array fail boot. There are one or two declarations. Array order
+does not change D-18's concurrent startup or establish a dependency order.
+
+A role's explicit `entry` overrides the common entry; otherwise it uses the
+common entry. Missing both fails boot. When `vms` is absent, both fixed role/
+clock pairs use the required common entry. Each VM independently loads its
+selected module, which returns exports containing that role's named behavior
+(`gameplay` or `presentation`). Separate files still use named role exports;
+there is no bare-behavior shortcut or bootstrap VM. The selected behavior's
+hook/cadence validation remains D-15/D-17 and the forthcoming Lua API package.
+No other role is implicitly created to satisfy an entry's content.
+
+#### 5. Exact tick encoding and examples
+
+`tick_seconds` is a string of ASCII digits with an optional decimal point
+followed by 1–9 digits, e.g. `"0.01"`. No sign, exponent, spaces, fraction
+expression, JSON-number substitution or rounding is accepted. Require a
+positive exact number of nanoseconds no larger than `2^64 - 1`, matching the
+foundation duration representation; leading/trailing zero digits are harmless.
+There is no default duration. Later time/counter arithmetic must remain
+checked rather than wrapping; the remaining API bounds package covers those
+operations. Presentation cadence stays in its Lua behavior, not this file.
+
+Default two-VM example; the 10 ms value is authored example data, not a default:
+
+```json
+{
+  "format": 1,
+  "id": "example_game",
+  "entry": "lua/main.lua",
+  "tick_seconds": "0.01"
+}
+```
+
+Explicit pair with separate entries and no common entry:
+
+```json
+{
+  "format": 1,
+  "id": "example_game",
+  "tick_seconds": "0.01",
+  "vms": [
+    {"role": "gameplay", "clock": "logical", "entry": "lua/game.lua"},
+    {"role": "presentation", "clock": "elapsed", "entry": "lua/ui.lua"}
+  ]
+}
+```
+
+A presentation-only file has just the presentation declaration and omits
+`tick_seconds`; a gameplay-only file has just gameplay and retains the required
+tick text. Both may use a common `entry` fallback. All three arrangements and
+the omitted-`vms` default must be qualified before delivery.
+
+**Recommendation and costs.** This is a small machine-readable launch contract
+with exact time conversion and obvious failures for misspellings. Costs:
+JSON has no comments/trailing commas in this profile; authors quote decimal
+time and cannot request sub-nanosecond ticks or an exact `1/60` fraction;
+unknown future fields fail on older engines rather than being ignored. The
+bounded parser/root validation and existing-command compatibility need tests.
+An alternative format such as TOML, different command spelling or broader
+metadata is a revision of this package, not a second simultaneously accepted
+format. The owner may revise any of the five parts before signoff.
+
+**Evidence and qualification.** The current console dependency list does not
+already provide this JSON manifest loader. Its existing
+[`parseSeconds`](../../console/Hetoimasia/Console/Lua/Options.hs) validates
+positive decimal text to exact nanoseconds, and foundation `Duration` uses
+Word64 nanoseconds; reuse the pure contract through an appropriate dependency
+boundary rather than importing console internals into an engine library.
+Tests cover bounded parsing/duplicates/Unicode, all role arrangements and
+fallbacks, unsupported fields/revisions/mod declarations, anchored manifest
+fingerprinting, path/ID refusals, exact time endpoints and unchanged old commands.
+No game-specific Haskell, new tracker artifact or execution probe is required
+to approve this authored-data contract.
 
 ## Open questions
 
@@ -6598,12 +6768,10 @@ and safe-boundary/actual-retirement rules remain.
 
 #### Q-6u. Defer Lua window-size reads or expose a narrow view-extent query?
 
-**Active checkpoint, P-70.** A (recommended): keep M1 rectangles explicitly
-positioned/sized, with native viewport adaptation but no Lua metrics read or
-resize callback. Cost: no automatic Lua layout for actual window size.
-B: add UI polling of the owned ready window's render-view extent, with its
-observation/schema contract in the API package. Both preserve D-50 coordinates,
-native resize/zero-size safety and D-51 close-to-quit.
+Resolved by D-73: P-70's A, no M1 Lua size reads or resize callbacks. Fixed
+authored rectangles retain automatic native viewport adaptation and zero-size
+safety; requested geometry is never reported as actual. Responsive Lua layout
+waits for later presentation work.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
@@ -6688,6 +6856,15 @@ Q-6, Q-8, Q-9 and remaining milestone APIs, not the deferred Q-5 state agenda.
 Resolved by D-43: all six P-40 parts, acceptance and delivery tags approved.
 The original Q-6a remains unanswered; its M1-only revision 2/P-41 is resolved
 by D-44.
+
+### Q-13. Approve the concrete M1 launch command and manifest package?
+
+**Active checkpoint, P-71.** Approve all five parts, or identify revisions:
+`hetoimasia run [--] GAME_ROOT` with unchanged existing commands; bounded strict
+`hetoimasia.json`; format-1 fields and stable ASCII ID; optional role/clock/entry
+array with default pair/common-entry fallback; exact decimal-text seconds and
+nanosecond range with no tick default. This leaves the Lua API and remaining
+resource/time bounds for the next package, not implicit implementation choices.
 
 ## Verification strategy
 
