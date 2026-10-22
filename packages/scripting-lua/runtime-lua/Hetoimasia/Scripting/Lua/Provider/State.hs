@@ -1069,8 +1069,26 @@ checkReply limits schema = checkReplyFor limits schema Nothing
 -- service supplies and a root and path within their bound (its message is cut, visibly, until
 -- the envelope fits); and a reply that is none of these is a provider defect, never a failure of
 -- the request and never an invented code.
+--
+-- The reply itself is evaluated inside the guard before anything is read of it: a reply whose strict
+-- field throws when the constructor is first looked at (a failure whose message is an error, say) is a
+-- malformed reply, or a defect for an opt-in request, and never an exception loose on the provider's
+-- thread with the request left pending. An asynchronous exception is never taken for one.
 checkReplyFor ∷ ValueLimits → Schema → Maybe Admission → ProviderReply → IO Checked
-checkReplyFor limits schema ask reply = case ask of
+checkReplyFor limits schema ask given =
+  guarded (pure given) >>= \case
+    Right reply → checkEvaluated limits schema ask reply
+    Left failure@(ExceptionWithContext _ raised)
+      | Just (async ∷ SomeAsyncException) ← fromException raised → throwIO async
+      | otherwise → do
+          why ← renderCaught failure
+          pure $ case ask of
+            Nothing → CheckedMalformed (fitReason limits ("the reply could not be evaluated: " <> Text.take 200 why))
+            Just _ → CheckedDefect ("the provider's reply could not be evaluated: " <> Text.take 200 why)
+
+-- | 'checkReplyFor' of a reply that is evaluated to its constructor.
+checkEvaluated ∷ ValueLimits → Schema → Maybe Admission → ProviderReply → IO Checked
+checkEvaluated limits schema ask reply = case ask of
   Nothing → fitted <$> judgeWith resultFields (const True) limits schema (generic reply)
   Just opted → optedIn opted
   where
@@ -1092,7 +1110,13 @@ checkReplyFor limits schema ask reply = case ask of
       ProviderResult value → result opted value Nothing
       ProviderResource value recipe → result opted value (Just recipe)
     result opted value recipe = do
-      let frame found = admitSuccessFrame opted (maybe found (\make → make found 0) (admitCombine opted))
+      -- The combiner shapes what a script is handed only for a result whose resource the owner builds
+      -- into the reserved lease: a plain result is handed as it is, and it is that record that is measured.
+      let adopting = isJust recipe && isJust (admitLease opted)
+          combined found = case admitCombine opted of
+            Just make | adopting → make found 0
+            _ → found
+          frame found = admitSuccessFrame opted (combined found)
           -- The ceilings are the crossing's: the complete record a script is handed.
           withinCeilings found = fitsLimits (admitReplyLimits opted) (frame found)
       judged ← judgeWith frame withinCeilings limits schema (ProviderResult value)

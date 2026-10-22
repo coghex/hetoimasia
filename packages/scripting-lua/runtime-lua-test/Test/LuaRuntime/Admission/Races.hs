@@ -19,11 +19,11 @@ import Hetoimasia.Scripting.Lua.Lease (Ownership (..), Retirements (..), ScopeSu
 import Hetoimasia.Scripting.Lua.Provider
 import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
-import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
+import Hetoimasia.Scripting.Lua.Value (Schema (SText), Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Admission.Support
 import Test.LuaRuntime.Instance.Support (admitWith, awaitSettled, expectControl, failureOf', idOf, moduleNamed, sf)
-import Test.LuaRuntime.Request.Support (Submitted (..), answerResult, answerWith, awaitDiagnostic, diagnostics, finishWork, onCancel, onSubmit, submissionAt)
+import Test.LuaRuntime.Request.Support (Submitted (..), answerResult, answerWith, awaitDiagnostic, diagnostics, finishWork, fakeEndpoint, fakeEndpointOf, onCancel, onSubmit, submissionAt)
 import Test.LuaRuntime.Scheduled.Support (awaitEntered, awaitScheduledTerminal, releaseGate)
 import Test.LuaRuntime.Support (Broken (Broken), bounded, brokenIs, expectFatal, requiredPolicy, tryExpected, withBoundary)
 
@@ -228,6 +228,27 @@ spec = describe "races" $ do
         fmap (\failure → case failureError failure of ErrorRequest endpoint _ → endpoint; _ → "other") (failureOf' settlement) `shouldBe` Just "path"
 
   describe "a failure whose fields throw when they are first looked at" $ do
+    it "is a provider defect when the reply itself throws as it is first looked at, a strict field that is an error" $ bounded $ do
+      fixture ← newAFix 4
+      setPolicy fixture (\held → held {polNecessity = OptionalRequest})
+      ExceptionWithContext _ failure ← expectFatal $ \control runtime → settleAll fixture $ do
+        owner ← arrival fixture runtime "strict"
+        admitAdmitter fixture owner "i" "admitter"
+        acommand fixture owner "i" "start" "a"
+        awaitNote fixture "cmd start a started"
+        answerWith (afFake fixture) 0 (ProviderExpected (ExpectedFailure "not_found" (error "broken message") Nothing Nothing)) >>= (`shouldBe` ReplyDefective)
+        awaitScheduledTerminal control owner
+      (fromException failure ∷ Maybe ProviderDefect) `shouldSatisfy` (/= Nothing)
+
+    it "refuses the value of a generic request whose reply throws as it is first looked at, and the request does not stay pending" $ bounded $ do
+      fixture ← newAFix 4
+      withBoundary $ \_ runtime → settleAll fixture $ do
+        owner ← arrival fixture runtime "generic strict"
+        admitAdmitter fixture owner "i" "admitter"
+        acommand fixture owner "i" "gstart" "g"
+        awaitNote fixture "cmd gstart g started"
+        answerWith (afFake fixture) 0 (ProviderExpected (ExpectedFailure "not_found" (error "broken message") Nothing Nothing)) >>= (`shouldBe` ReplyRefusedValue)
+
     it "is a provider defect when it is delivered after the submission, not an exception on the provider's thread" $ bounded $ do
       fixture ← newAFix 4
       setPolicy fixture (\held → held {polNecessity = OptionalRequest})
@@ -346,3 +367,18 @@ spec = describe "races" $ do
         finishWork (afFake fixture) 0
         settlement ← awaitSettled (afBase fixture) "i"
         fmap (Text.isInfixOf "all 1 places are held" . Text.pack . show . failureError) (failureOf' settlement) `shouldBe` Just True
+
+  describe "a plain result of a request that reserved a lease" $ do
+    it "is measured as the record the script is handed, never as the combined record of an adopted resource" $ bounded $ do
+      fixture ← newAFix 4
+      -- A combiner that makes any value small, and a reply record that may take 128 bytes.
+      setPolicy fixture (\held -> held {polLease = Just InstanceOwned, polCombine = Just (\_ _ → VInteger 0), polReplyBytes = 128})
+      ExceptionWithContext _ failure ← expectFatal $ \control runtime → settleAll fixture $ do
+        let grant = RequestGrant [fakeEndpointOf (afFake fixture) "path" SText, fakeEndpoint (afFake fixture) "res"] 8 SettleOnArrival
+        owner ← startAdmitting fixture runtime "plain over" [admitter] aConfig grant requiredPolicy
+        admitAdmitter fixture owner "i" "admitter"
+        acommand fixture owner "i" "start" "a"
+        awaitNote fixture "cmd start a started"
+        answerWith (afFake fixture) 0 (ProviderResult (VText (Text.replicate 300 "x"))) >>= (`shouldBe` ReplyDefective)
+        awaitScheduledTerminal control owner
+      (fromException failure ∷ Maybe ProviderDefect) `shouldSatisfy` (/= Nothing)

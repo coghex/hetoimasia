@@ -103,12 +103,17 @@ data Policy = Policy
   , polSource ∷ !Text
   , polDisposal ∷ !(Maybe (IO ()))
     -- ^ What the request's work needs disposed of once the provider has proved it over, if not just noting it.
+  , polCombine ∷ !(Maybe (Value → Word64 → Value))
+    -- ^ How the value a script is handed for an adopted resource holds its lease's handle.
+  , polReplyBytes ∷ !Int
+    -- ^ The bytes a reply's record may take beside the owner's limits.
   }
 
 -- | A required request with the failure codes @not_found@ and @io_error@, no credit and no
 -- lease, four per instance and eight per VM, and the numeric ceiling of the profile.
 defaultPolicy ∷ Policy
-defaultPolicy = Policy RequiredRequest ["not_found", "io_error"] [] Nothing 4 8 9223372036854775807 "example" Nothing
+defaultPolicy =
+  Policy RequiredRequest ["not_found", "io_error"] [] Nothing 4 8 9223372036854775807 "example" Nothing (Just (\value key → VRecord [("v", value), ("lease", VCapability (capability "res" key))])) 65536
 
 -- | The instance fixture, the handles the owner leases and answers liveness through, the fake
 -- provider and the policy.
@@ -234,14 +239,14 @@ answerExpected fixture index code =
 admissionOf ∷ AFix → Maybe Int → IO Admission
 admissionOf fixture offset = do
   policy ← readIORef (afPolicy fixture)
-  limits ← pure (either (error . show) id (valueLimits 65536 8 4096))
+  limits ← pure (either (error . show) id (valueLimits (polReplyBytes policy) 8 4096))
   pure $
     (admission (polNecessity policy) (polSource policy) limits (polCeiling policy) (polPerInstance policy) (polPerVm policy))
       { admitOffset = fmap (\given → if given <= 0 then 0 else fromIntegral given) offset
       , admitExpectedCodes = polCodes policy
       , admitCredits = polCredits policy
       , admitLease = polLease policy
-      , admitCombine = Just (\value key → VRecord [("v", value), ("lease", VCapability (capability "res" key))])
+      , admitCombine = polCombine policy
       , admitSuccessFrame = \value → [("status", VText "success"), ("value", value)]
       , admitFailureFrame = \found →
           [ ("status", VText "failure")
