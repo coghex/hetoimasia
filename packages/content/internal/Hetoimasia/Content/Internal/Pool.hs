@@ -120,8 +120,12 @@ import Hetoimasia.Content.Internal.Root (ContentRoot)
 import Hetoimasia.Content.Internal.Types (ContentDefect (..), Defect (..))
 import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailureLabel, cleanupFailuresInContext, composeCleanup)
 import Hetoimasia.Foundation.Worker
-  ( StartOutcome (Started, StartRejected, StartupFailed)
+  ( Completion (completionCleanup, completionLabel, completionResult)
+  , GroupReport (reportDrained, reportExitedBeforeClosing, reportObservedFailures)
+  , Result (Cancelled, Failed, Succeeded)
+  , StartOutcome (Started, StartRejected, StartupFailed)
   , StopToken
+  , WorkerCancelled (WorkerCancelled)
   , closeWorkerGroup
   , startWorker
   , stopRequested
@@ -355,20 +359,60 @@ withPoolWith hooks spec reader body = withWorkerGroup $ \group → do
     -- The pool closes whether or not the body ended well; a failure closing is kept beside the
     -- primary one.
     closed ← tryWithContext @SomeException (closePool pool)
+    -- A failure a worker latched while the body ran is evidence of the exit whatever else ends it.
+    latched ← readTVarIO var
+    let kept = [("content read pool worker failure", found) | Just found ← [psFailure latched]]
     case (outcome, closed) of
       (Right value, Right ()) → pure (Right value)
-      (Right _, Left closing) → pure (Left closing)
-      (Left primary, Right ()) → pure (Left primary)
-      (Left primary@(ExceptionWithContext _ _), Left closing) → do
-        composed ← composeCleanup (Just primary) [("content read pool close", closing)]
-        pure (Left (maybe primary id composed))
+      (Right _, Left closing) → Left <$> withEvidence closing kept
+      (Left primary, Right ()) → Left <$> withEvidence primary kept
+      (Left primary, Left closing) → Left <$> withEvidence primary (("content read pool close", closing) : kept)
   case result of
     Left failure → rethrowIO failure
     Right value → do
-      -- A worker's failure after the body began its return is still the scope's failure.
-      _ ← closeWorkerGroup group
+      -- The body returned. A worker's failure from here on is still the scope's failure: the
+      -- report of the workers' own outcomes is read, and anything but a clean return is raised.
+      report ← closeWorkerGroup group
       latched ← readTVarIO var
-      maybe (pure value) rethrowIO (psFailure latched)
+      case psFailure latched of
+        Just failure → rethrowIO failure
+        Nothing →
+          unclean report >>= \case
+            Nothing → pure value
+            Just failure → rethrowIO failure
+
+orElseMaybe ∷ Maybe a → Maybe a → Maybe a
+orElseMaybe (Just x) _ = Just x
+orElseMaybe Nothing y = y
+
+-- | A failure with this evidence kept beside it, if there is any.
+withEvidence ∷ ExceptionWithContext SomeException → [(Text.Text, ExceptionWithContext SomeException)] → IO (ExceptionWithContext SomeException)
+withEvidence primary [] = pure primary
+withEvidence primary evidence = fromMaybe primary <$> composeCleanup (Just primary) evidence
+
+-- | What a group's report holds that is not a clean exit: a worker that failed or was cancelled
+-- or retained a cleanup failure. Raised when the body returned and no worker latched a failure,
+-- since a worker that was not asked to cancel and did not return cleanly is a failure of the pool.
+unclean ∷ GroupReport → IO (Maybe (ExceptionWithContext SomeException))
+unclean report = do
+  let summaries = reportExitedBeforeClosing report <> reportDrained report <> reportObservedFailures report
+      evidence =
+        concat
+          [ [(completionLabel found, raised) | raised ← resultFailure (completionResult found)]
+            <> [(cleanupFailureLabel cleanup, cleanupFailureException cleanup) | cleanup ← completionCleanup found]
+          | found ← summaries
+          ]
+  if null evidence
+    then pure Nothing
+    else do
+      raised ← tryWithContext @SomeException (throwIO (ContentDefect ReadWorkerReportedUnclean))
+      primary ← either pure (\() → throwIO (ContentDefect ReadWorkerReportedUnclean)) raised
+      Just <$> withEvidence primary evidence
+  where
+    resultFailure = \case
+      Succeeded () → []
+      Failed raised → [raised]
+      Cancelled raised → [raised]
 
 -- Capacity -------------------------------------------------------------------------------
 
@@ -474,14 +518,20 @@ runWorker ∷ ReadPool → StopToken → IO ()
 runWorker pool token = mask $ \restore → do
   outcome ← tryWithContext @SomeException (loop restore)
   healthy ← atomically (isHealthy pool)
-  ended ←
-    if healthy
-      then Just <$> (exitFailure outcome >>= latchFailure pool)
-      else pure Nothing
-  case (outcome, ended) of
-    (Left caught, Nothing) → rethrowIO caught
-    (_, Just failure) → rethrowIO failure
-    (Right (), Nothing) → pure ()
+  case outcome of
+    Right ()
+      -- Returned after the scope closed the pool, or after a failure was latched: a clean stop.
+      | not healthy → pure ()
+      | otherwise → exitFailure outcome >>= latchFailure pool >>= rethrowIO
+    Left caught@(ExceptionWithContext trail raised)
+      -- The scope's own cancellation of a worker, once the pool is closed or failed and with no
+      -- cleanup failure retained, is the drain doing its work.
+      | not healthy && isTeardown raised && null (cleanupFailuresInContext trail) → rethrowIO caught
+      -- A synchronous exception left a job already latched by 'onSynchronousFailure'.
+      | not (isAsynchronous raised) → rethrowIO caught
+      -- An asynchronous exception nobody in this scope sent, or one that retained cleanup
+      -- evidence, whether the pool is open or draining: the pool's failure, with the evidence kept.
+      | otherwise → exitFailure outcome >>= latchFailure pool >>= rethrowIO
   where
     loop ∷ (∀ x. IO x → IO x) → IO ()
     loop restore =
@@ -490,6 +540,14 @@ runWorker pool token = mask $ \restore → do
         Just job → do
           runJob restore pool job `onSynchronousFailure` latchFailure pool
           loop restore
+    isTeardown raised = case fromException raised of
+      Just WorkerCancelled → True
+      Nothing → False
+
+isAsynchronous ∷ SomeException → Bool
+isAsynchronous failure = case fromException failure of
+  Just (SomeAsyncException _) → True
+  Nothing → False
 
 -- | Open and with no latched failure.
 isHealthy ∷ ReadPool → STM Bool
@@ -606,10 +664,6 @@ onSynchronousFailure action handler =
     Left caught@(ExceptionWithContext _ failure)
       | isAsynchronous failure → rethrowIO caught
       | otherwise → mask_ (handler caught) >>= rethrowIO
-  where
-    isAsynchronous failure = case fromException failure of
-      Just (SomeAsyncException _) → True
-      Nothing → False
 
 -- | The first defect: latch it with its context, refuse every later job, and tell every queued job
 -- so that none stays pending. Answers the exception to raise: the defect itself, or, when telling a
@@ -622,7 +676,17 @@ latchFailure pool caught@(ExceptionWithContext _ failure) = do
       Just _ → pure Nothing
       Nothing → Just <$> withdrawQueue pool st {psFailure = Just caught}
   case withdrawn of
-    Nothing → pure caught
+    Nothing → do
+      -- Not the first: it is kept beside the first, which stays the pool's primary failure.
+      prior ← atomically (psFailure <$> readTVar (poolState pool))
+      case prior of
+        Just first → do
+          composed ← composeCleanup (Just first) [("content read subsequent failure", caught)]
+          atomically $ do
+            st ← readTVar (poolState pool)
+            writeTVar (poolState pool) st {psFailure = composed `orElseMaybe` psFailure st}
+        Nothing → pure ()
+      pure caught
     Just jobs →
       tellAll jobs (ReadDefect failure) >>= \case
         Nothing → pure caught

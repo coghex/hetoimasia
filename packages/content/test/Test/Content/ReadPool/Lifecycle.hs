@@ -4,16 +4,21 @@ module Test.Content.ReadPool.Lifecycle (spec) where
 
 import Control.Concurrent (killThread)
 import Control.Concurrent.STM (atomically)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, rethrowIO, throwIO, tryWithContext)
+import Control.Exception.Context (ExceptionContext)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
+import Control.Exception (AsyncException (ThreadKilled), Exception, ExceptionWithContext (ExceptionWithContext), SomeException, catch, fromException, rethrowIO, throwIO, tryWithContext)
 import Data.Maybe (fromMaybe)
+import Data.Text (Text)
+import qualified Data.ByteString.Char8 as BC
+import Hetoimasia.Content.Identity (ContentKey, contentKeyPath, logicalPathBytes)
 import Hetoimasia.Content.Inventory (readVerified)
 import Hetoimasia.Content.Internal.Types (ContentDefect (ContentDefect), Defect (ReadWorkerTerminated))
+
 import Hetoimasia.Foundation.Resource (cleanupFailureLabel, cleanupFailuresInContext, composeCleanup)
 import Hetoimasia.Content.Internal.Native (Boundary (ReadOpened), productionSeam)
 import Hetoimasia.Content.Internal.Pool (PoolHooks (..), noHooks, withPoolWith)
 import Hetoimasia.Content.ReadPool
-import Hetoimasia.Foundation.Worker (GroupReport (..), WorkerEvidence (GroupExit), workerEvidenceInContext)
+import Hetoimasia.Foundation.Worker (Completion (..), GroupReport (..), Result (..), WorkerCancelled (..), WorkerEvidence (GroupExit), workerEvidenceInContext)
 import Test.Content.Inventory.Support (baseSpec, limitsFrom, populate, rootPath, withLayout, withScanned)
 import Test.Content.ReadPool.Support
 import Test.Content.Support
@@ -36,6 +41,7 @@ spec = do
   closing
   notifying
   failing
+  exits
   starting
   draining
 
@@ -243,6 +249,165 @@ failing = describe "a defect" $ do
       show failure `shouldContain` "primary reader failure"
       map cleanupFailureLabel (cleanupFailuresInContext trail) `shouldContain` ["injected reader cleanup"]
       map cleanupFailureLabel (cleanupFailuresInContext trail) `shouldContain` ["content read sink"]
+
+-- Exits -----------------------------------------------------------------------------------
+
+-- | Every way a worker or the scope can leave, each with the failure and the cleanup evidence it
+-- carried: none of it may be lost to a normal-looking return.
+exits ∷ Spec
+exits = describe "every exit keeps its failure and its evidence" $ do
+  it "a reader terminated asynchronously with cleanup evidence after the scope closed the pool (normal drain)" $ do
+    probe ← newProbe
+    closeGate probe "a.bin"
+    pools ← newEmptyMVar
+    withInventory [("a.bin", "a")] $ \_ inventory → do
+      outcomes ← newOutcomes
+      scope ← spawn $
+        withReadPoolUsing (poolOf 1 2) (probeReader probe (evidenced ThreadKilled "reader close")) $ \pool → do
+          _ ← accepted pool (request inventory outcomes OrdinaryRead 64 "a.bin")
+          awaitStarted probe 1
+          putMVar pools pool
+      pool ← readMVar pools
+      -- The body returned and the pool is closed; only now does the started reader die.
+      awaitStatus pool (\s → statusPhase s == PoolClosed)
+      openGate probe "a.bin"
+      outcome ← awaitOutcome scope
+      case outcome of
+        Right () → expectationFailure "the scope returned success although a worker was terminated"
+        Left raised → case fromException raised of
+          Just (ExceptionWithContext trail failure) → do
+            failure `shouldBe` ContentDefect (ReadWorkerTerminated "thread killed")
+            map cleanupFailureLabel (cleanupFailuresInContext trail) `shouldContain` ["reader close"]
+          Nothing → expectationFailure ("expected the worker's termination, found " <> show raised)
+
+  it "a reader that raises with cleanup evidence after the scope closed the pool (normal drain)" $ do
+    probe ← newProbe
+    closeGate probe "a.bin"
+    pools ← newEmptyMVar
+    withInventory [("a.bin", "a")] $ \_ inventory → do
+      outcomes ← newOutcomes
+      scope ← spawn $
+        withReadPoolUsing (poolOf 1 2) (probeReader probe (evidenced (userError "reader defect") "reader close")) $ \pool → do
+          _ ← accepted pool (request inventory outcomes OrdinaryRead 64 "a.bin")
+          awaitStarted probe 1
+          putMVar pools pool
+      pool ← readMVar pools
+      awaitStatus pool (\s → statusPhase s == PoolClosed)
+      openGate probe "a.bin"
+      outcome ← awaitOutcome scope
+      case outcome of
+        Right () → expectationFailure "the scope returned success although a reader raised"
+        Left raised → case fromException raised of
+          Just (ExceptionWithContext trail failure) → do
+            show (failure ∷ IOError) `shouldContain` "reader defect"
+            map cleanupFailureLabel (cleanupFailuresInContext trail) `shouldContain` ["reader close"]
+          Nothing → expectationFailure ("expected the reader's failure, found " <> show raised)
+
+  it "a worker cancelled by a failing body keeps the evidence it retained in the group's report" $ do
+    probe ← newProbe
+    closeGate probe "a.bin"
+    withInventory [("a.bin", "a")] $ \_ inventory → do
+      outcomes ← newOutcomes
+      ExceptionWithContext trail failure ←
+        failsWith @IOError $
+          withReadPoolUsing (poolOf 1 2) (cancelledAround probe "reader close during cancel") $ \pool → do
+            _ ← accepted pool (request inventory outcomes OrdinaryRead 64 "a.bin")
+            awaitStarted probe 1
+            throwIO (userError "body failure")
+      show failure `shouldContain` "body failure"
+      case workerEvidenceInContext trail of
+        [GroupExit report] →
+          [ cleanupFailureLabel found
+          | summary ← reportDrained report <> reportExitedBeforeClosing report
+          , inner ← resultContexts (completionResult summary)
+          , found ← cleanupFailuresInContext inner
+          ]
+            `shouldContain` ["reader close during cancel"]
+        other → expectationFailure ("expected one group report, found " <> show (length other))
+
+  it "a failing body keeps a failure a worker latched while it ran" $ do
+    probe ← newProbe
+    closeGate probe "a.bin"
+    withInventory [("a.bin", "a")] $ \_ inventory → do
+      outcomes ← newOutcomes
+      ExceptionWithContext trail failure ←
+        failsWith @IOError $
+          withReadPoolUsing (poolOf 1 2) (probeReader probe (failingReader (userError "latched reader failure"))) $ \pool → do
+            _ ← accepted pool (request inventory outcomes OrdinaryRead 64 "a.bin")
+            awaitStarted probe 1
+            openGate probe "a.bin"
+            _ ← awaitSTM (awaitFailure pool)
+            throwIO (userError "body failure after the latch")
+      show failure `shouldContain` "body failure after the latch"
+      map cleanupFailureLabel (cleanupFailuresInContext trail) `shouldContain` ["content read pool worker failure"]
+
+  it "a second worker's failure is kept beside the first, which stays the pool's failure" $ do
+    probe ← newProbe
+    mapM_ (closeGate probe) ["a.bin", "b.bin"]
+    withInventory [("a.bin", "a"), ("b.bin", "b")] $ \_ inventory → do
+      outcomes ← newOutcomes
+      ExceptionWithContext trail failure ←
+        failsWith @IOError $
+          withReadPoolUsing (poolOf 2 4) (probeReader probe (\key _ → throwIO (userError ("reader failure " <> show (keyPathText key))))) $ \pool → do
+            _ ← accepted pool (request inventory outcomes OrdinaryRead 64 "a.bin")
+            _ ← accepted pool (request inventory outcomes OrdinaryRead 64 "b.bin")
+            awaitStarted probe 2
+            mapM_ (openGate probe) ["a.bin", "b.bin"]
+            -- Both readers raise; the scope ends only after both workers did.
+            awaitStatus pool (\s → statusActive s == 0 && statusLive s == 0 && statusFailed s)
+      show failure `shouldContain` "reader failure"
+      map cleanupFailureLabel (cleanupFailuresInContext trail) `shouldContain` ["content read subsequent failure"]
+
+  it "a queued sink that raises while the scope closes fails the scope" $ do
+    probe ← newProbe
+    closeGate probe "a.bin"
+    pools ← newEmptyMVar
+    withInventory [("a.bin", "a"), ("b.bin", "b")] $ \root inventory → do
+      outcomes ← newOutcomes
+      scope ← spawn $
+        withReadPoolUsing (poolOf 1 4) (probeReader probe (readVerified inventory root)) $ \pool → do
+          _ ← accepted pool (request inventory outcomes OrdinaryRead 64 "a.bin")
+          awaitStarted probe 1
+          _ ← accepted pool (ReadRequest (keyOf inventory "b.bin") 64 OrdinaryRead (\_ → throwIO (userError "queued sink failure")))
+          putMVar pools pool
+      -- The scope closed the pool and told the queued job, whose sink raised; the started read is
+      -- still to be drained, and then the scope fails.
+      pool ← readMVar pools
+      awaitStatus pool (\s → statusPhase s == PoolClosed)
+      openGate probe "a.bin"
+      outcome ← awaitOutcome scope
+      case outcome of
+        Right () → expectationFailure "the scope returned success although a queued sink raised"
+        Left raised → show raised `shouldContain` "queued sink failure"
+
+keyPathText ∷ ContentKey → String
+keyPathText = BC.unpack . logicalPathBytes . contentKeyPath
+
+-- | The context a worker's failed or cancelled outcome carries.
+resultContexts ∷ Result () → [ExceptionContext]
+resultContexts = \case
+  Failed (ExceptionWithContext inner _) → [inner]
+  Cancelled (ExceptionWithContext inner _) → [inner]
+  Succeeded () → []
+
+-- | A reader that raises this, with a cleanup failure of this label retained beside it.
+evidenced ∷ Exception e ⇒ e → Text → ContentKey → Int → IO a
+evidenced raised label _ _ = do
+  Left primary ← tryWithContext @SomeException (throwIO raised)
+  Left secondary ← tryWithContext @SomeException (throwIO (userError "cleanup failure"))
+  composed ← composeCleanup (Just primary) [(label, secondary)]
+  rethrowIO (fromMaybe primary composed)
+
+-- | A reader held at the probe's gate which, when the scope's drain cancels it, fails its own
+-- cleanup too: the cancellation arrives with cleanup evidence retained.
+cancelledAround ∷ Probe → Text → ContentKey → Int → IO a
+cancelledAround probe label key allowance =
+  probeReader probe (\_ _ → throwIO (userError "never reached")) key allowance
+    `catch` \WorkerCancelled → do
+      Left primary ← tryWithContext @SomeException (throwIO WorkerCancelled)
+      Left secondary ← tryWithContext @SomeException (throwIO (userError "cleanup failure"))
+      composed ← composeCleanup (Just primary) [(label, secondary)]
+      rethrowIO (fromMaybe primary composed)
 
 -- Starting -------------------------------------------------------------------------------
 

@@ -335,6 +335,10 @@ data Defect
   | -- | A worker of a read pool was terminated by an asynchronous exception while the pool was
     -- open: the exception, rendered.
     ReadWorkerTerminated !String
+  | -- | The workers of a read pool were reported to have ended otherwise than by returning after
+    -- the scope closed it: failed, cancelled without the scope's cancellation, or with a
+    -- retained cleanup failure. Their evidence is kept beside this.
+    ReadWorkerReportedUnclean
   | -- | A read pool accepted as many jobs as its sequence numbers can order: they never wrap.
     ReadSequenceExhausted
   | -- | A read pool's slot was released while every reserved slot was held by a live job, or
