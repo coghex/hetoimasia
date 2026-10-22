@@ -1,6 +1,7 @@
 -- | The Lua engine package's component specs, composed under one @LuaEngine@ group.
 module Test.LuaEngine.Spec (spec) where
 
+import qualified Test.LuaEngine.Behavior as Behavior
 import qualified Test.LuaEngine.Boundary as Boundary
 import qualified Test.LuaEngine.Manifest.Examples as Examples
 import qualified Test.LuaEngine.Manifest.Schema as Schema
@@ -18,4 +19,5 @@ spec = describe "LuaEngine" $ do
   Tick.spec
   Profile.spec
   Requests.spec
+  Behavior.spec
   Boundary.spec

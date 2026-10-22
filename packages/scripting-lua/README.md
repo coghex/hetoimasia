@@ -980,6 +980,13 @@ no owner-wide or catch-all switch.
   ordinary Lua error: a wrong number of arguments, a value of the wrong shape, type or
   encoding, a value past a limit, and a capability that is not of the declared type, was
   not issued by this VM, or that the application's own check reports retired.
+- `withArgumentCheck check binding` does that too, and has `check` run **after** the host's own checks of the arguments:
+  the arguments were copied, found to be of the declared shapes and within the limits, and every handle live. `check` is
+  `OwnerContexts -> [Value] -> IO (Maybe Text)` and is handed the copied values (never a Lua-visible table, so no
+  authored metamethod runs for it). It decides a fact only the values carry: that an integer is positive, that a sum
+  is representable, that a name is one the application knows. It refuses as an ordinary Lua error exactly as a
+  precondition does, runs no provider or native action, and its reason is bounded by the same 256 bytes. Checks and
+  preconditions run in the order they were added, the preconditions of a binding before its argument checks.
 - `withPrecondition check binding` does that too, and has `check` run first. A precondition
   is `OwnerContexts -> IO (Maybe Text)`: `Nothing` lets the call go on, `Just reason`
   refuses it. It runs before the host asks whether a scheduler operation can suspend and
@@ -2716,6 +2723,11 @@ captured; the `init` error is primary, nothing later replaces it, and what else 
 kept beside it (`failureSecondary`). There is no retry. An unhandled error in `run` or a callback fails the
 instance the same way, except that `shutdown` runs with the reason `failed`.
 
+A required request that settled with an expected failure fails its instance too, with `ErrorRequest` (the endpoint and
+the failure attributed to the request): it is latched when the failure becomes eligible, whether or not the script
+ever read the request, and applied at the owner's next safe boundary, before any more of the instance's ordinary work
+(see [Atomic request admission](#atomic-request-admission)).
+
 Isolation is the default: the instance ends and the owner's other instances run on. The engine cannot
 tell whether state the instances share was damaged, so the application is told of each failure on the
 owner's thread (`instanceEscalate`), after the instance has ended, and decides `Isolate` or `Escalate`,
@@ -3395,6 +3407,157 @@ and the cancel came first, the order of the places, holds shared between request
 determinism across arrival orders; and epochs. The protocol model's holders are pinned in `lua-host-tests`. The
 cancellation and cleanup windows are the kind an asynchronous-exception race can hide on one platform, so CI, which runs
 them on Linux, is the evidence for them and a local pass is not.
+
+## Atomic request admission
+
+`Hetoimasia.Scripting.Lua.Admission` (LFE-7, in `runtime-lua`) is the other way to start a request, and the only
+way a full bank is an answer and not a refusal. It is **opt-in, per request**: a binding's author asks
+`startAdmitted` with an `Admission`, and nothing else changes. The generic `startRequest`, `requestBindings`,
+`RequestGrant`'s defaults, the full-capacity refusal that fails the call (`Test.LuaRuntime.Request.Admission` pins
+it), subscriptions, the runner and every existing example keep their meaning beside it. Core `scripting-lua`
+imports nothing of `lua-engine`, content, graphics, the console or a game; the profile's limits and the M1
+records are [`hetoimasia-lua-engine`'s](../lua-engine/README.md#the-m1-request-adapter), which passes them in.
+
+### What asking reserves
+
+`startAdmitted` takes one transaction (`admitOptIn`), and only after it commits asks the provider anything. In it:
+
+| Bank | Owner of the count | Reserved by | Refused as |
+| --- | --- | --- | --- |
+| Request record and terminal-result storage | the protocol model's session | `acceptRequestFor` | busy (`BankOwnerRequests`) when the model's cap is reached |
+| Accepted, unretired requests of the instance | the service's ledger (`pHeld`) | an entry for the request | busy (`BankInstanceRequests`) |
+| Accepted, unretired requests of the VM | the same ledger | the same entry | busy (`BankVmRequests`) |
+| The owner's places (the grant's bound) | the same ledger | the same entry | busy (`BankOwnerRequests`) |
+| A result lease | `Leases`, the instance's lease capacity | `reserve`: a slot in `SlotConstructing` with the key the handle will have | busy (`BankLeases`) |
+| Provider credits | the provider's own STM variables | each `Credit`'s `creditReserve`, in the order declared | busy (`BankCredit`) |
+| The due position, for an owner on logical time | the scheduler's tick | `DueSlot (tick + offset) (request number)`, and the owner's hold on that tick | permanent refusal |
+
+A bank without room, or a permanent fact, raises inside the transaction and `catchSTM` undoes everything reserved
+before it: there is **no** handle, hold, credit, lease slot or counter left, the provider was asked nothing and the
+instance has no latent failure. That is the whole mechanism: no capacity is queried and then used, no exception is
+caught and relabelled, and no retry is queued. The order of the decisions is the contract: the owner or requester is
+not taking requests, the requester is a task, the request numbers are exhausted, an offset on an owner on arrival,
+an offset that is not positive, a tick and offset past the ceiling, a position that has begun, then the banks in the
+table's order. A credit that retries is full (`orElse`), so a provider's bank can never make the admission wait.
+
+Classification, which the tests pin separately:
+
+| What | Answer |
+| --- | --- |
+| A temporary bank is full | `Unavailable bank`: data. The binding hands the script `nil, {code="busy", message=TEXT}`. Never an error, never the instance's failure; a later call may succeed |
+| A permanent fact (wrong requester, closing, offset, ceiling, exhausted numbers, no lease scope) | `RequestRefusal`, a fault of the call raised before anything was reserved. A binding that wants an ordinary Lua error asks `preflightAdmission` in a [`withArgumentCheck`](#recoverable-refusals), which decides the same facts and reserves nothing |
+| The engine cannot keep its bookkeeping consistent after a valid admission (`AdmissionDefect`: the request counter has no number after the last, a result lease reserved with no way to hand its handle to the script) | a failure of the host, raised from the transaction; nothing is reserved |
+| A bank, provider or assignment that raises | the application's own failure, with its type; nothing is reserved. A provider that raises when handed the request is taken back whole, and a credit release that then raises is kept beside it |
+
+### When a bank comes back
+
+The ledger holds one entry for each accepted request, from its admission until its result has been taken or discarded
+**and** its provider's work has been reaped as retired. Losing the Lua reference, waiting, cancelling and the
+provider's reply do none of that alone. The entry is written by the admission and by transactions on the **owner's**
+thread, never by a provider's completion; that is how the credits a native thread frees reach a logical owner's
+admission only at an accounted boundary (`D-77`).
+
+| Event | Where it is accounted | What becomes visible to admission, and when |
+| --- | --- | --- |
+| Take of a terminal result, provider work already reaped | `takeTerminal`, on the owner's thread inside the Lua call | the places and credits, immediately: the next ask of the same call sees them |
+| Take of a terminal result, provider work still running | `takeTerminal` | nothing; the entry stays charged |
+| The provider proves its work over (reply, or its retirement reading) | the owner's next boundary: `sweepWorks`, `reapWorks`, then `releaseSettled` | the places and credits of a request already taken, at that boundary and not before; a retirement completed on a provider's thread is invisible until then |
+| The requester ends | `endRequesterSTM`, then `releaseSettled` | the requests it did not collect are discarded; their entries leave as their work is reaped |
+| An epoch change, the owner's exit | `advanceEpochSTM`, `closeSTM` | as above; what is cancelled for a script to take stays charged until it is taken |
+| An admission taken back (the provider could not be handed the request) | `withdrawAdmission` | everything at once: credits returned `CreditUnused`, the lease discharged |
+| A retirement that fails | the work's retained failure | nothing, ever: the place and credit stay charged and the failure is cleanup evidence |
+
+A `Credit` is returned once, with the reason (`CreditUnused` or `CreditSettled`), except one that `creditTransfers`
+and whose request succeeded with a resource: that credit is the resource's, and the provider's own release of the
+resource gives it back. A reserved lease nothing will use (the request failed, was cancelled, or got a result with no
+resource) is discharged by the same boundary once the provider's work is retired and the request has settled or
+gone; one that was adopted is the instance's live resource and is not touched. `rdHeld`, `rdHeldBy` and `rdBusy`
+read the ledger.
+
+### The reply, the resource and the defect
+
+A request admitted this way takes the service's contract for its reply (`checkReplyFor`):
+
+* a `ProviderResult` is checked against the owner's value limits and the endpoint's schema, the value against the
+  admission's ceilings, and the record a script is handed (the admission's frame) against the owner's;
+* a `ProviderExpected` failure must carry a code the admission lists, a root and path within their byte bound, and
+  an envelope that fits: a message is cut at a character, visibly (`...`), to its bound until it does;
+* a `ProviderResource value recipe` is a result whose resource the instance is to own: the owner builds the recipe
+  into the lease the request reserved on its own thread, uninterrupted, through the capability it holds
+  (`adoptReserved`), at its next boundary, and only then holds (on logical time) or settles the result. A cancel
+  that comes first drops an unclaimed recipe (the resource stays the provider's to retire); one that comes while the
+  recipe is being built finds the resource built and the owner releases it at once (`pDiscards`); a recipe that raises
+  rolls its stages back, gives the reservation back and is a failure of application code;
+* anything else (a `ProviderFailure` with no code, a code the service does not supply, a result over the ceilings or
+  of another shape) is a **provider defect**: `ReplyDefective`. It is never a failure of the request, never given a
+  code, never an optional content failure and never retained. It is recorded (bounded, at most sixteen), the work is
+  proved over and the request stays unsettled; the owner raises it as a failure of the host
+  (`ProviderDefect`) at its next boundary, under its policy, for a required and an optional request alike. The
+  generic `requestBindings` path keeps settling a malformed or oversized reply as a `ValidationFault` failure.
+
+### Timing
+
+On an owner on logical time the request's position is fixed once, inside the admission, from engine-owned values:
+the tick is 0 for an instance whose `init` is running and the owner's current tick otherwise (D-67), the offset is the
+admission's (default 1), and the sequence is the request number the same transaction issues. The tick and offset are
+added as integers and checked against `admitLogicalMaximum` (2^63 − 1 for M1) **before** acceptance, as is the
+request number. Numbers are never reissued and never wrap; a position the owner has begun is refused. The
+application's `AssignRequest` is not consulted for these requests, so there is no read-then-admit gap. A reply that
+arrives before its position is held and invisible to `ready`, `take` and `wait`; a late one holds the tick; a cancel
+before the position wins, whatever the provider delivered, discards the held value and releases the hold. An owner on
+elapsed time takes no offset and settles first-come. `RequestInfo` carries the metadata to the provider
+(`infoNecessity`, `infoSource`, `infoOffset`, `infoDue`). `skipRequestNumbers` moves the counter forward to bring it
+to its ceiling in a qualification without issuing every number before it.
+
+### Required failure
+
+An expected failure of a request admitted `RequiredRequest` becomes eligible when it settles: at the reply on an
+owner on arrival, at the position's tick on logical time. At that point the requester's cell gets `isRequestFailure`
+and one `JobDispatch`, and the owner fails the instance with `ErrorRequest` at its next safe boundary, before any
+more of the instance's ordinary work and without preempting a segment. The latch is the owner's, set in the
+transaction that made the settlement eligible; nothing a script does afterwards (reading, not reading, a caught
+`take` or `ready` error, a late `cancel`, which answers `already_settled`) touches it. A cancel that won before
+eligibility prevents it, and a held failure is discarded unseen. `OptionalRequest` leaves the failure a result for the
+script. The failure reaches the application the way every instance failure does, through `instanceEscalate`; session
+and role escalation are the application's.
+
+### Handles and phases
+
+`admittedHandleType` (over the `RequestHandles` the owner is given with `scheduledRequestHandles`, made before the
+owner and taken by it, as the leases are) declares the handle capability type: a handle is live for the instance that
+holds it while its request exists. A handle that is another instance's, spent by a take, or never issued is refused
+by the value boundary before any action as a handle that has ended; the check reads the running instance, not
+anything a script supplied. `callerPhase` tells a precondition whether an instance is initializing, serving or
+ending: `wait` is for a serving instance, and an instance in `shutdown` is not taking requests.
+
+### Owners, threads and lifetimes of what this adds
+
+| State | Owner | Written by | Read by | Lifetime |
+| --- | --- | --- | --- | --- |
+| `pHeld` (the ledger) | the service | the admission; the owner's thread (`takeTerminal`, `releaseSettled`, ending); never a provider | admission | from admission until taken or discarded and the work is reaped |
+| `Rec` metadata (`recAdmission`, `recFailure`, `recLease`, `recAdopted`) | the service | admission; the reply; adoption | settlement | with the record |
+| `pAdopting` | the service | a provider's reply (insert); the owner (claim, finish) | the owner's boundary | until built, failed or the request ends; a claimed entry is not dropped under the builder |
+| `pDiscards` | the service | `cancelOf`, the epoch | the owner's boundary | until released |
+| `pDefects` | the service | a provider's reply | the owner's boundary | until raised; at most sixteen |
+| `isRequestFailure` | the instance's cell | the settlement that made a failure eligible | the owner's dispatch | until applied, once |
+| `RequestHandles` | the application | the owner binds it | the value boundary's liveness check | with the owner; serves one |
+
+### What proves it
+
+`Test.LuaRuntime.Admission.*`, in `lua-runtime-tests`, run real instances on real supervised scheduled owners that
+lend their collection, hold leases and answer handle liveness, with the fake provider of the request examples, fake
+credit banks and fake lease resources, an injected clock and gates, never a sleep: each bank exhausted alone and in
+combination with zero left behind, competing admissions, a full ordinary bank that still drains; the release points
+(take before retirement, retirement before take, a retirement completed on a provider's thread invisible until the
+boundary, a lost reference, an instance that ends, a failed retirement, an admission taken back); the position
+(init at tick 0, default and explicit offsets, same-tick sequence order against reversed replies, a late provider
+holding the tick, the offset refused on arrival, the ceiling and exhausted numbers, an engine failure when the counter
+has nowhere to go); required and optional failure with the latch independent of reads, caught errors and late cancels;
+every kind of defect; the result lease built, kept live after a take, released with the instance, discharged unused and
+released when cancelled after adoption; immediate completion during submission, revocation during the handoff,
+late, duplicate and unknown completions, and a disposal that fails; and handles across two instances. `lua-host-tests`
+pin `withArgumentCheck`. The cancellation and cleanup windows are the kind an asynchronous-exception race can hide on
+one platform, so CI, which runs them on Linux, is the evidence for them and a local pass is not.
 
 ## Provider events
 

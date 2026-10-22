@@ -121,6 +121,8 @@ import Hetoimasia.Scripting.Lua.Internal.Boundary
   , blankFault
   )
 import Hetoimasia.Scripting.Lua.Internal.Call (ChunkName, callGlobal, evalChunk)
+import Hetoimasia.Scripting.Lua.Internal.Export (evaluateExport)
+import Hetoimasia.Scripting.Lua.Internal.ExportTypes (ExportLimits, ExportSource, defaultExportLimits)
 import Hetoimasia.Scripting.Lua.Internal.Module (Host, ModuleSource, loadModule, newHost)
 import Hetoimasia.Scripting.Lua.Internal.Registration
   ( Binding (bindingFinalizer, bindingName)
@@ -189,6 +191,12 @@ data OwnerConfig = OwnerConfig
     -- ^ The bounds on every value that crosses for this owner.
   , ownerModules ∷ ![ModuleSource]
     -- ^ The application-owned modules loaded after the initial chunks, in order.
+  , ownerExports ∷ ![ExportSource]
+    -- ^ The export modules evaluated after the modules, in order. A failed one is
+    -- a sticky failure of its identity, recorded and answered when it is asked
+    -- for; it does not end construction.
+  , ownerExportLimits ∷ !ExportLimits
+    -- ^ The source and identity ceilings the export modules are held to.
   , ownerCallbackScope ∷ !CallbackScope
     -- ^ What runs around each of the VM's callbacks, on the callback's thread.
     -- Nothing by default.
@@ -217,6 +225,8 @@ defaultOwnerConfig libraries =
     , ownerGranted = []
     , ownerLimits = defaultValueLimits
     , ownerModules = []
+    , ownerExports = []
+    , ownerExportLimits = defaultExportLimits
     , ownerCallbackScope = noCallbackScope
     , ownerLifecycle = Nothing
     , ownerRequests = Nothing
@@ -265,7 +275,7 @@ withOwnedVm config body = mask $ \restore → do
   -- interruptible until the handler below is installed.
   vm ← allocateVm (VmSpec (ownerBudget config) (Just self) (FinalizersAllow (finalizerAllowlist config)) (ownerCallbackScope config))
   let boundary = Boundary (ownerName config) (vmIdentity vm) (ownerRegistration config) (ownerLimits config) (ownerLifecycle config) (ownerRequests config)
-  host ← newHost vm boundary
+  host ← newHost vm boundary (ownerExportLimits config)
   ran ← tryWithContext @SomeException $ restore $ do
     ownerAfterAllocation config vm
     openStandardLibraries boundary vm config
@@ -275,6 +285,7 @@ withOwnedVm config body = mask $ \restore → do
     installRegistration boundary vm (ownerGranted config)
     traverse_ (uncurry (evalChunk vm)) (ownerChunks config)
     traverse_ (loadModule host) (ownerModules config)
+    traverse_ (evaluateExport host) (ownerExports config)
     body (OwnedVm vm host)
   -- The ordinary close: masked, once, never retried, and not uninterruptible
   -- beyond what a blocked finalizer needs.

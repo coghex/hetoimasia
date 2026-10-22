@@ -209,6 +209,45 @@
 -- representable fails the instance ('ErrorCadence', at 'StageUpdate'), without wrapping,
 -- and leaves no demand and no tick held.
 --
+-- = M1 behavior instances (opt-in)
+--
+-- Beside the instances above, which run the hooks a /global-entry/ module defines and are
+-- unchanged, an owner that hosts instances admits /behavior instances/ with
+-- 'admitBehaviorInstance': an instance of a behavior in the export table an export module
+-- returned ("Hetoimasia.Scripting.Lua.Owner", @vmExports@), held by the VM as real Lua
+-- values. The request ('BehaviorRequest') names the export module by its identity, the
+-- field of its table that holds the behavior, the facade the instance is injected with,
+-- and the application's rule for the behavior's cadence.
+--
+-- The owner's thread does the rest when it starts the instance, before any hook: it finds
+-- the export module, validates the selected behavior against the fixed schema by raw access
+-- and captures it (the very @init@, @update@ and @shutdown@ functions, a fresh @self@
+-- holding the facade as @self.api@, and the facade), resolves the cadence by applying the
+-- rule to what the table read as, and only then runs @init(self, api)@, where @api@ is the
+-- facade. A behavior without an @update@ hook has no cadence and stays alive until it is
+-- stopped; one with an @update@ hook is periodic on the interval the rule resolved, through
+-- the same cadence machinery as any periodic instance, and its @update(self, dt_seconds)@
+-- is handed the @dt@ of that machinery unchanged. @shutdown(self, reason)@ is the same
+-- strings and skip rules as above.
+--
+-- Everything the instance runs is what it captured: replacing or removing a field of the
+-- behavior table, replacing the role table in the export table or editing a cadence field
+-- afterwards changes nothing it does, and a later instance reads the table as it is then.
+-- Mutable upvalues and shared exports stay ordinary Lua; @self@ and the facade are its own.
+-- The hooks run through a driver of the owner's, not through a lookup by name, and the
+-- legacy instance driver's @api@ (@connect@, @subscribe@ and @unsubscribe@) is not handed to
+-- a behavior and is no part of this surface.
+--
+-- A failure before @init@ (no such export module; a module whose evaluation or return
+-- failed, stickily; a behavior that does not fit the schema; a cadence the rule refuses or
+-- that does not resolve; a facade past the owner's value limits) fails the instance at
+-- 'StageConstruct' with 'ErrorExportMissing', 'ErrorExportFailed', 'ErrorBehavior',
+-- 'ErrorCadence' or 'ErrorFault', which an @init@ failure ('StageInit') is distinct from: no
+-- hook ran, @shutdown@ is skipped as for any instance whose @init@ never succeeded, and what
+-- was captured is released. What the instance captured is released whichever way it ends,
+-- with the rest of what it holds; a coroutine still running or suspended on it keeps it in
+-- Lua until it is closed, which an ending does first.
+--
 -- = Failure
 --
 -- A failed @init@ fails that instance. No @update@, @run@, callback or @shutdown@
@@ -386,9 +425,12 @@ module Hetoimasia.Scripting.Lua.Instance
   , Cadence (..)
   , resolveInterval
   , InstanceRequest (..)
+  , BehaviorRequest (..)
+  , BehaviorFacade (..)
   , InstanceAdmission (..)
   , InstanceId (..)
   , admitInstance
+  , admitBehaviorInstance
 
     -- * Events
   , Delivery (..)
@@ -440,6 +482,7 @@ module Hetoimasia.Scripting.Lua.Instance
 
 import Control.Concurrent.STM (STM, atomically, readTVar, retry)
 import Control.Exception (evaluate)
+import qualified Data.ByteString as ByteString
 import qualified Data.Map.Strict as Map
 import Data.List (nub)
 import Data.Text (Text)
@@ -455,7 +498,7 @@ import Hetoimasia.Scripting.Lua.Internal.Value (Context (..), VmIdentity (VmIden
 import Hetoimasia.Scripting.Lua.Runtime.Shared (compact, compactName, compactRef, refuseCallbackWait)
 import Hetoimasia.Scripting.Lua.Runtime.Types (Payload (WithinBounds))
 import Hetoimasia.Scripting.Lua.Provider.Types (ProviderState (psEvents))
-import Hetoimasia.Scripting.Lua.Owner (ModuleRef)
+import Hetoimasia.Scripting.Lua.Owner (ExportIdentity (ExportIdentity), ModuleRef (ModuleRef))
 import Hetoimasia.Scripting.Lua.Scheduled.Types (Control (controlHooks, controlInstances, controlLabel, controlLimits, controlOwner, controlProvider), ScheduledEndpoint (ScheduledEndpoint))
 import Hetoimasia.Scripting.Lua.Scheduler (ControlResult)
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VRecord, VText))
@@ -480,6 +523,33 @@ admitInstance (ScheduledEndpoint control) request = case controlInstances contro
         , instanceName = compactName <$> instanceName request
         , instanceGrants = nub [grant | grant ← map compactName (instanceGrants request), Map.member grant (insSources instances) || offered grant]
         }
+
+-- | Admit an M1 behavior instance, without waiting, from any thread.
+--
+-- The instance takes a live place and a result reservation as any other does, and
+-- the owner's thread then finds the export module the request names, selects,
+-- validates and captures the behavior, resolves its cadence and runs its hooks, as
+-- the module header's M1 section describes. A behavior that fails any of that settles
+-- the instance as failed at 'StageConstruct', with no hook run and nothing held.
+-- Answers 'InstanceAdmissionClosed' for an owner that does not host instances.
+admitBehaviorInstance ∷ ScheduledEndpoint → BehaviorRequest → IO InstanceAdmission
+admitBehaviorInstance (ScheduledEndpoint control) request = case controlInstances control of
+  Nothing → pure InstanceAdmissionClosed
+  Just instances → do
+    kept ← evaluate compacted
+    atomically (State.admitBehavior instances (gateOf control) (controlOwner control) (compactRef (ModuleRef (Text.take 64 (behaviorLabel kept)) "export")) kept)
+  where
+    compacted =
+      request
+        { behaviorExport = ownedIdentity (behaviorExport request)
+        , behaviorLabel = compactName (behaviorLabel request)
+        , behaviorSelect = Text.copy (behaviorSelect request)
+        , behaviorName = compactName <$> behaviorName request
+        }
+
+-- | An identity in a buffer of its own: the request keeps it until the instance settles.
+ownedIdentity ∷ ExportIdentity → ExportIdentity
+ownedIdentity (ExportIdentity bytes) = ExportIdentity (ByteString.copy bytes)
 
 -- | Deliver an event to the function an instance connected to a source, without
 -- waiting, from any thread. The payload is checked against the owner's limits and

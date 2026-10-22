@@ -55,6 +55,13 @@ static char modules_key;
 /* The table the tasks' coroutines are anchored in, by slot. */
 static char tasks_key;
 
+/* The table the retained export tables of the opt-in export-module facility are
+** kept in, by slot, and the table the captured behaviors of its instances are
+** kept in, by slot. Slots are issued by the host and never reused, so a stale
+** reference names an empty slot and never someone else's. */
+static char exports_key;
+static char captures_key;
+
 /* Add to (or, with a negative amount, take from) what is owed. The key exists
 ** from the set-up, so setting it allocates nothing. */
 static long owed_add(lua_State *L, long bytes)
@@ -701,6 +708,12 @@ static int setup_body(lua_State *L)
   /* The coroutines of the tasks the host has started, by slot. */
   lua_createtable(L, 0, 0);
   lua_rawsetp(L, LUA_REGISTRYINDEX, &tasks_key);
+  /* The export-module facility's two tables, built before the handle metatable
+  ** is registered like the others: a failure here rebuilds them next time. */
+  lua_createtable(L, 0, 0);
+  lua_rawsetp(L, LUA_REGISTRYINDEX, &exports_key);
+  lua_createtable(L, 0, 0);
+  lua_rawsetp(L, LUA_REGISTRYINDEX, &captures_key);
   lua_rawsetp(L, LUA_REGISTRYINDEX, &modules_key);
   lua_rawsetp(L, LUA_REGISTRYINDEX, &handle_key);
   return 0;
@@ -1212,6 +1225,584 @@ int hetoimasia_lua_entry_lookup(
   status = lua_pcall(L, 1, 1, 0);
   *kind = a.kind;
   *found_module = a.found;
+  gc_release(L, held);
+  return status;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Export modules and captured behaviors                                     */
+/* ------------------------------------------------------------------------ */
+
+/*
+** The opt-in export-module facility keeps real Lua values in the VM: the table a
+** module's chunk returned, by slot, and what an instance captured of a behavior
+** table (its hook functions, its `self` and its facade), by slot. Neither is a
+** copy; both are anchored in tables only the bridge reaches, so nothing a script
+** does can name, replace or erase one. Every allocating step runs inside one
+** protected call with the collector held, like the module operations above.
+*/
+
+typedef struct {
+  const char *source;
+  size_t source_length;
+  const char *chunk;
+  lua_Integer slot;
+  int load_status;
+  int shape;
+  int result_type;
+  int stored;
+  int started;
+  gc_hold_t gc_held;
+} export_arguments;
+
+static void export_release_hold(lua_State *L, export_arguments *a)
+{
+  if (a->gc_held.was) {
+    gc_release(L, a->gc_held);
+    a->gc_held.was = 0;
+  }
+}
+
+static int export_body(lua_State *L)
+{
+  export_arguments *a = (export_arguments *) lua_touserdata(L, 1);
+  int results;
+
+  lua_settop(L, 0);
+  luaL_checkstack(L, 12, "evaluating an export module");
+  /* The module's own environment, reading through to the globals. */
+  lua_createtable(L, 0, 8);
+  lua_createtable(L, 0, 1);
+  lua_pushglobaltable(L);
+  lua_setfield(L, 2, "__index");
+  lua_setmetatable(L, 1);
+
+  a->load_status = luaL_loadbufferx(L, a->source, a->source_length, a->chunk, "t");
+  if (a->load_status != LUA_OK) {
+    export_release_hold(L, a);
+    return 1;
+  }
+  lua_pushvalue(L, 1);
+  if (lua_setupvalue(L, 2, 1) == NULL) {
+    lua_pop(L, 1);
+  }
+  /* Everything up to here executed nothing. */
+  export_release_hold(L, a);
+  a->started = 1;
+  gc_service(L);
+  lua_call(L, 0, LUA_MULTRET);
+
+  results = lua_gettop(L) - 1;
+  if (results == 0) {
+    a->shape = HETOIMASIA_EXPORT_NO_RESULT;
+  } else if (results > 1) {
+    /* An extra nil is still a second result. */
+    a->shape = HETOIMASIA_EXPORT_MULTIPLE;
+  } else if (lua_isnil(L, 2)) {
+    a->shape = HETOIMASIA_EXPORT_NIL;
+  } else if (!lua_istable(L, 2)) {
+    a->shape = HETOIMASIA_EXPORT_NOT_TABLE;
+    a->result_type = lua_type(L, 2);
+  } else if (lua_getmetatable(L, 2)) {
+    /* Raw: no metamethod is consulted. */
+    a->shape = HETOIMASIA_EXPORT_METATABLE;
+  } else {
+    a->shape = HETOIMASIA_EXPORT_OK;
+    lua_rawgetp(L, LUA_REGISTRYINDEX, &exports_key);
+    if (!lua_istable(L, -1)) {
+      return luaL_error(L, "the export table is missing");
+    }
+    lua_pushvalue(L, 2);
+    lua_rawseti(L, -2, a->slot);
+    a->stored = 1;
+  }
+  lua_pushnil(L);
+  return 1;
+}
+
+int hetoimasia_lua_export_load(
+  lua_State *L,
+  const char *source, size_t source_length, const char *chunk,
+  lua_Integer slot,
+  char *trace, size_t trace_capacity, size_t *trace_length,
+  int *load_status, int *shape, int *result_type, int *stored, int *started)
+{
+  export_arguments a;
+  int base;
+  int status;
+  trace_context context;
+  trace_context **extra;
+  trace_context *saved;
+
+  a.source = source;
+  a.source_length = source_length;
+  a.chunk = chunk;
+  a.slot = slot;
+  a.load_status = LUA_OK;
+  a.shape = HETOIMASIA_EXPORT_OK;
+  a.result_type = 0;
+  a.stored = 0;
+  a.started = 0;
+  a.gc_held.was = 0;
+  a.gc_held.before = 0;
+  *started = 0;
+  *trace_length = 0;
+  *load_status = LUA_OK;
+  *shape = HETOIMASIA_EXPORT_OK;
+  *result_type = 0;
+  *stored = 0;
+
+  /* Held until the chunk is about to run: the environment is made and the source
+  ** parsed without executing anything. */
+  a.gc_held = gc_hold(L);
+  if (!lua_checkstack(L, 6)) {
+    export_release_hold(L, &a);
+    return LUA_ERRMEM;
+  }
+  base = lua_gettop(L) + 1;
+  lua_pushcfunction(L, traceback_handler);
+  lua_pushcfunction(L, export_body);
+  lua_pushlightuserdata(L, &a);
+  context.buffer = trace;
+  context.capacity = trace_capacity;
+  context.length = trace_length;
+  extra = (trace_context **) lua_getextraspace(L);
+  saved = *extra;
+  *extra = &context;
+  status = lua_pcall(L, 1, 1, base);
+  *extra = saved;
+  export_release_hold(L, &a);
+  lua_remove(L, base);
+  *started = a.started;
+  *load_status = a.load_status;
+  *shape = a.shape;
+  *result_type = a.result_type;
+  *stored = a.stored;
+  return status;
+}
+
+/* Empty a slot of one of the two tables. */
+static int held_release_body(lua_State *L)
+{
+  lua_Integer slot = lua_tointeger(L, 1);
+  const void *key = lua_touserdata(L, 2);
+  lua_settop(L, 0);
+  lua_rawgetp(L, LUA_REGISTRYINDEX, key);
+  if (lua_istable(L, -1)) {
+    lua_pushnil(L);
+    lua_rawseti(L, -2, slot);
+  }
+  return 0;
+}
+
+static int held_release(lua_State *L, const void *key, lua_Integer slot)
+{
+  gc_hold_t held = gc_hold(L);
+  int status;
+  if (!lua_checkstack(L, 6)) {
+    gc_release(L, held);
+    return LUA_ERRMEM;
+  }
+  lua_pushcfunction(L, held_release_body);
+  lua_pushinteger(L, slot);
+  lua_pushlightuserdata(L, (void *) key);
+  status = lua_pcall(L, 2, 0, 0);
+  gc_release(L, held);
+  return status;
+}
+
+int hetoimasia_lua_export_release(lua_State *L, lua_Integer slot)
+{
+  return held_release(L, &exports_key, slot);
+}
+
+int hetoimasia_lua_capture_release(lua_State *L, lua_Integer slot)
+{
+  return held_release(L, &captures_key, slot);
+}
+
+static int held_count_body(lua_State *L)
+{
+  long *out = (long *) lua_touserdata(L, 1);
+  const void *key = lua_touserdata(L, 2);
+  long n = 0;
+  lua_rawgetp(L, LUA_REGISTRYINDEX, key);
+  if (lua_istable(L, -1)) {
+    lua_pushnil(L);
+    while (lua_next(L, -2)) {
+      n++;
+      lua_pop(L, 1);
+    }
+  }
+  *out = n;
+  return 0;
+}
+
+static int held_count(lua_State *L, const void *key, long *count)
+{
+  gc_hold_t held = gc_hold(L);
+  int status;
+  *count = 0;
+  if (!lua_checkstack(L, 8)) {
+    gc_release(L, held);
+    return LUA_ERRMEM;
+  }
+  lua_pushcfunction(L, held_count_body);
+  lua_pushlightuserdata(L, count);
+  lua_pushlightuserdata(L, (void *) key);
+  status = lua_pcall(L, 2, 0, 0);
+  gc_release(L, held);
+  return status;
+}
+
+int hetoimasia_lua_export_count(lua_State *L, long *count)
+{
+  return held_count(L, &exports_key, count);
+}
+
+int hetoimasia_lua_capture_count(lua_State *L, long *count)
+{
+  return held_count(L, &captures_key, count);
+}
+
+/* The fields a behavior table may have. The first three are the hooks, the last
+** two the cadence. */
+static const char *const behavior_keys[HETOIMASIA_BEHAVIOR_KEYS] = {
+  "init", "update", "shutdown", "every_ticks", "every_seconds"};
+
+typedef struct {
+  lua_Integer export_slot;
+  lua_Integer capture_slot;
+  const char *select;
+  size_t select_length;
+  int64_t *report;
+  char *name;
+  size_t name_capacity;
+} capture_arguments;
+
+/* How one cadence field read: absent, a Lua integer, a Lua float or something
+** else (whose Lua type is in `other`). */
+static void read_cadence(lua_State *L, int64_t *kind, int64_t *integer, int64_t *bits)
+{
+  if (lua_isinteger(L, -1)) {
+    *kind = HETOIMASIA_FIELD_INTEGER;
+    *integer = (int64_t) lua_tointeger(L, -1);
+  } else if (lua_type(L, -1) == LUA_TNUMBER) {
+    lua_Number number = lua_tonumber(L, -1);
+    *kind = HETOIMASIA_FIELD_FLOAT;
+    memcpy(bits, &number, sizeof(number) < sizeof(*bits) ? sizeof(number) : sizeof(*bits));
+  } else {
+    *kind = HETOIMASIA_FIELD_OTHER;
+    *integer = (int64_t) lua_type(L, -1);
+  }
+}
+
+static int capture_body(lua_State *L)
+{
+  capture_arguments *a = (capture_arguments *) lua_touserdata(L, 1);
+  int64_t *r = a->report;
+  int export_index;
+  int selected;
+  int record;
+  int count = 0;
+  int non_text = -1;
+  int unknown = 0;
+  int bad_hook = -1;
+  int bad_hook_type = 0;
+  int hooks = 0;
+  int type;
+
+  luaL_checkstack(L, 14, "capturing a behavior");
+  lua_rawgetp(L, LUA_REGISTRYINDEX, &exports_key);
+  if (!lua_istable(L, -1)) {
+    return luaL_error(L, "the export table is missing");
+  }
+  lua_rawgeti(L, -1, a->export_slot);
+  if (!lua_istable(L, -1)) {
+    r[HETOIMASIA_REPORT_PROBLEM] = HETOIMASIA_BEHAVIOR_NO_EXPORT;
+    return 0;
+  }
+  export_index = lua_gettop(L);
+  /* Raw access, so no metamethod of the export table decides what is selected. */
+  lua_pushlstring(L, a->select, a->select_length);
+  lua_rawget(L, export_index);
+  selected = lua_gettop(L);
+  type = lua_type(L, selected);
+  if (type == LUA_TNIL) {
+    r[HETOIMASIA_REPORT_PROBLEM] = HETOIMASIA_BEHAVIOR_MISSING;
+    return 0;
+  }
+  if (type != LUA_TTABLE) {
+    r[HETOIMASIA_REPORT_PROBLEM] = HETOIMASIA_BEHAVIOR_NOT_TABLE;
+    r[HETOIMASIA_REPORT_DETAIL] = type;
+    return 0;
+  }
+  if (lua_getmetatable(L, selected)) {
+    r[HETOIMASIA_REPORT_PROBLEM] = HETOIMASIA_BEHAVIOR_METATABLE;
+    return 0;
+  }
+  lua_createtable(L, 0, 5);
+  record = lua_gettop(L);
+
+  /* The fields are read by a raw traversal that stops after the one entry that
+  ** proves the table has a field of no schema: a behavior has five fields at
+  ** most, so no more than six entries are ever visited, and an arbitrary map is
+  ** never walked. */
+  lua_pushnil(L);
+  while (lua_next(L, selected)) {
+    count++;
+    if (lua_type(L, -2) != LUA_TSTRING) {
+      if (non_text < 0) {
+        non_text = lua_type(L, -2);
+      }
+    } else {
+      size_t length;
+      const char *key = lua_tolstring(L, -2, &length);
+      int index = -1;
+      int i;
+      for (i = 0; i < HETOIMASIA_BEHAVIOR_KEYS; i++) {
+        if (strlen(behavior_keys[i]) == length && memcmp(behavior_keys[i], key, length) == 0) {
+          index = i;
+          break;
+        }
+      }
+      if (index < 0) {
+        size_t keep = length < a->name_capacity ? length : a->name_capacity;
+        /* Of the unknown keys seen, the smallest is named. */
+        if (!unknown || keep < (size_t) r[HETOIMASIA_REPORT_NAME_LENGTH]
+            || (keep == (size_t) r[HETOIMASIA_REPORT_NAME_LENGTH] && memcmp(key, a->name, keep) < 0)) {
+          memcpy(a->name, key, keep);
+          r[HETOIMASIA_REPORT_NAME_LENGTH] = (int64_t) keep;
+        }
+        unknown = 1;
+      } else if (index < HETOIMASIA_HOOKS) {
+        if (lua_type(L, -1) != LUA_TFUNCTION) {
+          if (bad_hook < 0 || index < bad_hook) {
+            bad_hook = index;
+            bad_hook_type = lua_type(L, -1);
+          }
+        } else {
+          lua_pushvalue(L, -1);
+          lua_setfield(L, record, behavior_keys[index]);
+          hooks |= 1 << index;
+        }
+      } else if (index == HETOIMASIA_HOOKS) {
+        read_cadence(L, &r[HETOIMASIA_REPORT_TICKS_KIND], &r[HETOIMASIA_REPORT_TICKS_INTEGER], &r[HETOIMASIA_REPORT_TICKS_BITS]);
+      } else {
+        read_cadence(L, &r[HETOIMASIA_REPORT_SECONDS_KIND], &r[HETOIMASIA_REPORT_SECONDS_INTEGER], &r[HETOIMASIA_REPORT_SECONDS_BITS]);
+      }
+    }
+    lua_pop(L, 1);
+    if (count > HETOIMASIA_BEHAVIOR_KEYS) {
+      break;
+    }
+  }
+  lua_settop(L, record);
+
+  r[HETOIMASIA_REPORT_HOOKS] = hooks;
+  if (non_text >= 0) {
+    r[HETOIMASIA_REPORT_PROBLEM] = HETOIMASIA_BEHAVIOR_NON_TEXT_KEY;
+    r[HETOIMASIA_REPORT_DETAIL] = non_text;
+    return 0;
+  }
+  if (unknown) {
+    r[HETOIMASIA_REPORT_PROBLEM] = HETOIMASIA_BEHAVIOR_UNKNOWN_KEY;
+    return 0;
+  }
+  if (bad_hook >= 0) {
+    r[HETOIMASIA_REPORT_PROBLEM] = HETOIMASIA_BEHAVIOR_HOOK_NOT_FUNCTION;
+    r[HETOIMASIA_REPORT_DETAIL] = bad_hook;
+    r[HETOIMASIA_REPORT_DETAIL_TYPE] = bad_hook_type;
+    return 0;
+  }
+
+  /* A fresh `self`. The facade is attached afterwards, once the behavior is known
+  ** to be valid and the owner has built it (`hetoimasia_lua_capture_attach`). */
+  lua_createtable(L, 0, 1);
+  lua_setfield(L, record, "self");
+
+  lua_rawgetp(L, LUA_REGISTRYINDEX, &captures_key);
+  if (!lua_istable(L, -1)) {
+    return luaL_error(L, "the capture table is missing");
+  }
+  lua_pushvalue(L, record);
+  lua_rawseti(L, -2, a->capture_slot);
+  r[HETOIMASIA_REPORT_STORED] = 1;
+  return 0;
+}
+
+int hetoimasia_lua_behavior_capture(
+  lua_State *L,
+  lua_Integer export_slot, const char *select, size_t select_length,
+  lua_Integer capture_slot,
+  int64_t *report, char *name, size_t name_capacity)
+{
+  capture_arguments a;
+  gc_hold_t held;
+  int status;
+  int i;
+
+  for (i = 0; i < HETOIMASIA_REPORT_FIELDS; i++) {
+    report[i] = 0;
+  }
+  a.export_slot = export_slot;
+  a.capture_slot = capture_slot;
+  a.select = select;
+  a.select_length = select_length;
+  a.report = report;
+  a.name = name;
+  a.name_capacity = name_capacity;
+  held = gc_hold(L);
+  if (!lua_checkstack(L, 8)) {
+    gc_release(L, held);
+    return LUA_ERRMEM;
+  }
+  lua_pushcfunction(L, capture_body);
+  lua_pushlightuserdata(L, &a);
+  status = lua_pcall(L, 1, 0, 0);
+  gc_release(L, held);
+  return status;
+}
+
+/* The facade on top of the stack becomes the capture's `api` and its `self.api`:
+** the same table, which `init` is handed. */
+static int attach_body(lua_State *L)
+{
+  lua_Integer slot = lua_tointeger(L, 1);
+  int *attached = (int *) lua_touserdata(L, 2);
+  int record;
+  *attached = 0;
+  lua_rawgetp(L, LUA_REGISTRYINDEX, &captures_key);
+  if (!lua_istable(L, -1)) {
+    return 0;
+  }
+  lua_rawgeti(L, -1, slot);
+  if (!lua_istable(L, -1)) {
+    return 0;
+  }
+  /* The frame is [slot, flag, facade, captures, record]. */
+  record = lua_gettop(L);
+  lua_pushvalue(L, 3);
+  lua_setfield(L, record, "api");
+  lua_getfield(L, record, "self");
+  lua_pushvalue(L, 3);
+  lua_setfield(L, -2, "api");
+  *attached = 1;
+  return 0;
+}
+
+int hetoimasia_lua_capture_attach(lua_State *L, lua_Integer slot, int *attached)
+{
+  gc_hold_t held = gc_hold(L);
+  int status;
+  *attached = 0;
+  if (!lua_checkstack(L, 10)) {
+    gc_release(L, held);
+    return LUA_ERRMEM;
+  }
+  lua_pushcfunction(L, attach_body);
+  lua_pushinteger(L, slot);
+  lua_pushlightuserdata(L, attached);
+  /* A copy of the facade, which is the stack's top on entry, is the third argument. */
+  lua_pushvalue(L, -4);
+  status = lua_pcall(L, 3, 0, 0);
+  gc_release(L, held);
+  return status;
+}
+
+/* The value an export table holds under a key, pushed, by raw access. */
+static int field_body(lua_State *L)
+{
+  lua_Integer slot = lua_tointeger(L, 1);
+  const char *key = (const char *) lua_touserdata(L, 2);
+  size_t length = (size_t) lua_tointeger(L, 3);
+  int *type = (int *) lua_touserdata(L, 4);
+  *type = LUA_TNONE;
+  lua_rawgetp(L, LUA_REGISTRYINDEX, &exports_key);
+  if (!lua_istable(L, -1)) {
+    lua_pushnil(L);
+    return 1;
+  }
+  lua_rawgeti(L, -1, slot);
+  if (!lua_istable(L, -1)) {
+    lua_pushnil(L);
+    return 1;
+  }
+  lua_pushlstring(L, key, length);
+  lua_rawget(L, -2);
+  *type = lua_type(L, -1);
+  return 1;
+}
+
+int hetoimasia_lua_export_field(lua_State *L, lua_Integer slot, const char *key, size_t length, int *type)
+{
+  gc_hold_t held = gc_hold(L);
+  int status;
+  *type = LUA_TNONE;
+  if (!lua_checkstack(L, 8)) {
+    gc_release(L, held);
+    return LUA_ERRMEM;
+  }
+  lua_pushcfunction(L, field_body);
+  lua_pushinteger(L, slot);
+  lua_pushlightuserdata(L, (void *) key);
+  lua_pushinteger(L, (lua_Integer) length);
+  lua_pushlightuserdata(L, type);
+  status = lua_pcall(L, 4, 1, 0);
+  gc_release(L, held);
+  return status;
+}
+
+typedef struct {
+  lua_Integer slot;
+  int which;
+  int present;
+} capture_push_arguments;
+
+static int capture_push_body(lua_State *L)
+{
+  capture_push_arguments *a = (capture_push_arguments *) lua_touserdata(L, 1);
+  lua_settop(L, 0);
+  a->present = HETOIMASIA_CAPTURE_GONE;
+  lua_rawgetp(L, LUA_REGISTRYINDEX, &captures_key);
+  if (lua_istable(L, -1)) {
+    lua_rawgeti(L, -1, a->slot);
+    if (lua_istable(L, -1)) {
+      /* The record is at 2. The hook first, then `self`, then the facade: the
+      ** order a driver's function takes them in. */
+      a->present = HETOIMASIA_CAPTURE_NO_HOOK;
+      lua_getfield(L, 2, behavior_keys[a->which]);
+      if (lua_type(L, -1) == LUA_TFUNCTION) {
+        a->present = HETOIMASIA_CAPTURE_PUSHED;
+      }
+      lua_getfield(L, 2, "self");
+      lua_getfield(L, 2, "api");
+      return 3;
+    }
+  }
+  lua_pushnil(L);
+  lua_pushnil(L);
+  lua_pushnil(L);
+  return 3;
+}
+
+int hetoimasia_lua_capture_push(lua_State *L, lua_Integer slot, int which, int *present)
+{
+  capture_push_arguments a;
+  gc_hold_t held = gc_hold(L);
+  int status;
+  a.slot = slot;
+  a.which = which;
+  a.present = HETOIMASIA_CAPTURE_GONE;
+  *present = HETOIMASIA_CAPTURE_GONE;
+  if (which < 0 || which >= HETOIMASIA_HOOKS || !lua_checkstack(L, 8)) {
+    gc_release(L, held);
+    return LUA_ERRMEM;
+  }
+  lua_pushcfunction(L, capture_push_body);
+  lua_pushlightuserdata(L, &a);
+  status = lua_pcall(L, 1, 3, 0);
+  *present = a.present;
   gc_release(L, held);
   return status;
 }

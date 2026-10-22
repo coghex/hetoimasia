@@ -19,6 +19,8 @@ module Hetoimasia.Scripting.Lua.Instance.Types
   , Cadence (..)
   , resolveInterval
   , InstanceRequest (..)
+  , BehaviorRequest (..)
+  , BehaviorFacade (..)
   , EventSource (..)
 
     -- * Where an instance is
@@ -68,6 +70,10 @@ module Hetoimasia.Scripting.Lua.Instance.Types
     -- * Shared state
   , Instances (..)
   , ICell (..)
+  , BehaviorCell (..)
+  , BehaviorResolved (..)
+  , cellCadence
+  , cellKind
   , IState (..)
   , UpdateSlot (..)
   , pendingEvents
@@ -82,7 +88,7 @@ module Hetoimasia.Scripting.Lua.Instance.Types
   , failureText
   ) where
 
-import Control.Concurrent.STM (TVar, newTVarIO)
+import Control.Concurrent.STM (STM, TVar, newTVarIO, readTVar, readTVarIO)
 import Hetoimasia.Foundation.Time (Duration, ElapsedBaseline, durationNanoseconds, noBaseline, zeroDuration)
 import Control.Exception (Exception)
 import Data.List (nub)
@@ -99,7 +105,15 @@ import Data.Word (Word64)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (SubscriptionId, TaskId)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits (ServiceClass)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Task (TaskFailure)
-import Hetoimasia.Scripting.Lua.Owner (ModuleRef, maxEntries)
+import Hetoimasia.Scripting.Lua.Owner
+  ( BehaviorProblem
+  , BehaviorShape
+  , BoundaryFault
+  , CaptureHandle
+  , ExportIdentity
+  , ModuleRef
+  , maxEntries
+  )
 import Hetoimasia.Scripting.Lua.Registration (validName)
 import Hetoimasia.Scripting.Lua.Runtime.Types (CallFault, Discard, OwnerId)
 import Hetoimasia.Scripting.Lua.Scheduler (ControlResult)
@@ -220,6 +234,52 @@ data InstanceRequest = InstanceRequest
     -- ^ The event sources its @api@ may connect a function to, by name. Anything
     -- else it asks for is a script error: it has no other way to reach one.
   }
+
+-- | What an application admits as one M1 behavior instance: a behavior of a module
+-- the owner holds as an export module, selected, validated and captured on the
+-- owner's thread when the instance starts, before its @init@.
+--
+-- It is a separate request beside 'InstanceRequest', whose constructor existing
+-- callers apply positionally, and it changes nothing for them. The instance has no
+-- event grants and no connections: its @api@ is the injected facade and nothing the
+-- driver builds, and it is no one-shot.
+data BehaviorRequest = BehaviorRequest
+  { behaviorExport ∷ !ExportIdentity
+    -- ^ The export module the owner holds, by the identity it was evaluated under.
+  , behaviorLabel ∷ !Text
+    -- ^ How the instance's source is named in a snapshot and a failure: bounded,
+    -- and no key.
+  , behaviorSelect ∷ !Text
+    -- ^ The field of the export table that holds the behavior.
+  , behaviorFacade ∷ !BehaviorFacade
+    -- ^ Where this instance's facade comes from: the value its @init@ is handed as its
+    -- second argument and its @self.api@ holds. Made on the owner's thread after the
+    -- behavior validated.
+  , behaviorCadence ∷ BehaviorShape → Either Text (Maybe Interval)
+    -- ^ What the behavior's cadence is, from what its table read as: the
+    -- application's rule, applied once, on the owner's thread, before @init@. 'Nothing'
+    -- is an instance with no periodic update; a refusal fails the instance before any
+    -- hook runs. An instance without an @update@ hook is never given an interval, whatever
+    -- this answers.
+  , behaviorName ∷ !(Maybe Text)
+  , behaviorClass ∷ !ServiceClass
+  }
+
+-- | Where an M1 behavior instance's facade comes from: the narrow seam through which the
+-- later entry adapter injects the instance-bound services. The export modules it names
+-- are ones the owner holds, by identity, and are looked up when the instance starts.
+data BehaviorFacade
+  = -- | A copy of this value, made fresh for this instance, within the owner's value limits.
+    -- Data only.
+    FacadeData !Value
+  | -- | The table the export module holds under this field, used as it is: one existing facade
+    -- shared by every instance that names it.
+    FacadeShared !ExportIdentity !Text
+  | -- | Built for this instance alone by the function the export module holds under this
+    -- field, called with a copy of this value (the instance's context): a table that may
+    -- carry closures bound to the instance.
+    FacadeBuilder !ExportIdentity !Text !Value
+  deriving (Eq, Show)
 
 -- | An event source the owner offers, by name, and the shape of the payload it
 -- delivers. In this slice a source is a seam for tests: nothing but the
@@ -412,6 +472,10 @@ data HookStage
   | -- | A required request's expected failure, by the endpoint it asked: the instance was not in a
     -- hook, and the failure is the request's.
     StageRequest !Text
+  | -- | An M1 behavior instance's construction: finding its export module, selecting,
+    -- validating and capturing its behavior and resolving its cadence, on the owner's
+    -- thread, before any hook. Distinct from an @init@ failure: no hook ran.
+    StageConstruct
   deriving (Eq, Show)
 
 -- | What went wrong, as the host reports it.
@@ -438,6 +502,16 @@ data InstanceError
     -- failed, attributed to the request. Latched at the failure's eligible settlement, read or not,
     -- and applied at the owner's next safe boundary before any more ordinary work.
     ErrorRequest !Text !Text
+  | -- | The export module an M1 behavior instance names is not held by its owner: the
+    -- identity, as a bounded rendering.
+    ErrorExportMissing !Text
+  | -- | The export module an M1 behavior instance names failed, stickily, when it was
+    -- evaluated: its evaluation or what it returned. A fault of the module, not of the
+    -- behavior.
+    ErrorExportFailed !BoundaryFault
+  | -- | The behavior the instance selected does not fit the schema. A fault of the
+    -- selection, not of the module that holds it; no hook ran.
+    ErrorBehavior !BehaviorProblem
   | -- | The cadence's own arithmetic could not be represented: a tick or a deadline
     -- past what a tick or an instant can be, or a logical duration granted that
     -- overflowed. Nothing wrapped; this is what happened.
@@ -712,7 +786,40 @@ data ICell = ICell
     -- ^ Written once: when the instance ends, or when its owner exits.
   , icForgotten ∷ !(TVar Bool)
   , icReleased ∷ !(TVar Bool)
+  , icBehavior ∷ !(Maybe BehaviorCell)
+    -- ^ An M1 behavior instance's request and what the owner's thread made of it.
   }
+
+-- | An M1 behavior instance's part of its cell.
+data BehaviorCell = BehaviorCell
+  { bcRequest ∷ !BehaviorRequest
+  , bcResolved ∷ !(TVar (Maybe BehaviorResolved))
+    -- ^ Written once, by the owner's thread, after the behavior was validated and
+    -- captured and before @init@ runs; and never after.
+  }
+
+-- | What an M1 behavior instance's construction came to: the capture it holds, what
+-- its table read as, and the kind and cadence that follow from them.
+data BehaviorResolved = BehaviorResolved
+  { resolvedCapture ∷ !CaptureHandle
+  , resolvedShape ∷ !BehaviorShape
+  , resolvedKind ∷ !InstanceKind
+  , resolvedCadence ∷ !(Maybe Cadence)
+  }
+
+-- | The kind an instance has: for a behavior instance, what its construction
+-- resolved, and 'EventOnly' until it has.
+cellKind ∷ ICell → STM InstanceKind
+cellKind cell = case icBehavior cell of
+  Nothing → pure (icKind cell)
+  Just behavior → maybe EventOnly resolvedKind <$> readTVar (bcResolved behavior)
+
+-- | The cadence an instance has, fixed for its life: admission's, or for a behavior
+-- instance what its construction resolved.
+cellCadence ∷ ICell → IO (Maybe Cadence)
+cellCadence cell = case icBehavior cell of
+  Nothing → pure (icCadence cell)
+  Just behavior → (>>= resolvedCadence) <$> readTVarIO (bcResolved behavior)
 
 -- | What changes about an instance, all of it in one variable so a reading is
 -- coherent.
@@ -907,6 +1014,9 @@ renderError = failureText . \case
   ErrorRefusedWait failure → Text.pack (show failure)
   ErrorRelease released → "a release failed: " <> released
   ErrorCadence what → "cadence: " <> what
+  ErrorExportMissing identity → "the owner holds no export module " <> identity
+  ErrorExportFailed fault → "the export module failed: " <> Text.pack (show fault)
+  ErrorBehavior problem → "the selected behavior was refused: " <> Text.pack (show problem)
   ErrorDelivery endpoint why → "delivery to a subscription of " <> endpoint <> " failed: " <> why
   ErrorRequest endpoint why → "a required request of " <> endpoint <> " failed: " <> why
 
