@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-49/Q-6i: when required asynchronous failures escalate.
+The current checkpoint is P-50/Q-6j: admission when request/resource capacity is full.
+D-52 accepts required failure escalation at eligible settlement.
 D-51 accepts one window slot per UI instance and the M1 close/control policy.
 D-50 accepts the clear-colour and ordered texture-rectangle scene surface.
 D-49 accepts independent texture loads without a shared texture cache.
@@ -1556,6 +1557,33 @@ cleanup destruction does not itself synthesize a quit for a healthy peer.
 The manager presented the shared rules, no-second-preview/tool-window cost and
 listed qualification. The owner chose A rather than several windows per
 instance. The reusable Haskell host retains its broader capabilities.
+
+### D-52. A required asynchronous failure takes effect without a result read
+
+**Delivery:** M1.
+
+Owner answer, **2026-10-22 00:25:28 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: fail when settled (Rec.)
+
+Authenticated relay: `het-manager`, message `4et2a2k94yscdyw2sd3gch6vq2`,
+posted **2026-10-22 00:25:28.304 UTC** in `#het-luafirst`, replying to Q-6i
+message `rgjnxp479s88y669ddpevewds6`.
+
+Accept P-49's A: a failed required request latches attributed instance failure
+at eligible settlement even if Lua never reads it. Ignoring the handle or
+catching an inspection error cannot clear it. Apply it at the next safe
+scheduler boundary, not by preempting a non-yielding Lua segment. Presentation
+settles on arrival; logical results remain held until their assigned tick and
+sequence. The existing role/boot escalation and protected cleanup apply.
+
+Cancellation that wins prevents required failure; a later cancellation cannot
+erase an already settled failure. Optional content failures retain their
+separate result behavior. The manager presented the cost: speculative work
+must be optional or cancelled before failure settles. The owner chose A rather
+than failure only when Lua reads the result. Pre-admission capacity refusal
+and exact result APIs remain separate contracts.
 
 ## Proposals
 
@@ -4057,7 +4085,7 @@ protected native/graphics lifetime, not add Lua to native callbacks.
 
 ### P-49. Escalate a required asynchronous failure when its result settles
 
-**Unapproved; active checkpoint Q-6i. Delivery: M1.** D-12 says a required
+**A accepted by D-52 through Q-6i. Delivery: M1.** D-12 says a required
 load failure fails its requesting operation, but does not settle whether Lua
 must first read the asynchronous result. Recommend A: a required request's
 failure latches an attributed failure of its requesting instance when the
@@ -4114,6 +4142,63 @@ already returns provider failure as result data and distinguishes arrival from
 assigned-tick settlement. It does not itself establish this launcher's required-
 content policy. Required-failure latching/supervision is additional M1 integration
 work and must preserve the existing safe-boundary and retirement guarantees.
+
+### P-50. Refuse capacity-full admission with a bounded busy result
+
+**Unapproved; active checkpoint Q-6j. Delivery: M1.** Recommend A: before
+accepting a new asynchronous data/texture/window request, reserve its request
+slot and any required result-lease slot together. If a declared admission
+capacity is full, return a bounded `busy` refusal identifying the exhausted
+capacity (spelling still illustrative). Create no request handle, start no
+provider/native work and leave no reservation behind. Busy is not an instance
+failure, for required or optional requests: no load was accepted, so D-52's
+required-result failure latch does not apply.
+
+Lua must handle the refusal explicitly: consume settled results, relinquish
+unused textures, wait for actual retirement or try again in a later update.
+There is no hidden retry queue, automatic retry, busy-wait binding or promise
+that capacity will become free. Losing references does not reclaim resources;
+D-48/D-51 and the existing request accounting remain in force. An accepted
+request has its result capacity reserved, including a successful texture/window
+lease even if Lua never collects it. Settlement is not allowed to overbook
+capacity reserved by another accepted request.
+
+This distinction applies only to declared request/lease admission capacity.
+Wrong arguments, wrong role/ownership and D-51's second-window request remain
+their already specified errors; a request whose value exceeds a permanent
+supported bound is not labelled temporarily busy. Engine/provider-code failures,
+native allocation failure and cleanup faults are not converted to busy. Errors
+after acceptance retain the approved required/optional/fatal classification;
+an already accepted request never becomes an unaccepted admission refusal.
+Numeric budgets and internal loader-stage pressure remain explicit API/provider
+specification work, not an unbounded resource promise.
+
+Check/reservation must be atomic under the owning admission mechanism, with
+rollback of every reservation if admission cannot complete. A query-then-start
+race or catching a fatal host refusal after the fact is not this contract.
+Logical admission uses capacity released at the host's accounted scheduler
+boundaries, preserving D-42's conditional ordering rules rather than reading
+native completion timing through an unsynchronised side channel.
+
+Alternative B retains fault-on-full admission: exhausting request/lease slots
+fails the calling instance even if Lua catches the error, then the normal role
+policy applies. This matches the current generic host's refusal behavior and
+requires less new admission machinery, but a burst of loads or slowly retiring
+textures can stop a session instead of allowing Lua to pace its requests.
+
+A is recommended for real runtime loading with bounded resources. Its cost is
+a distinct admission result authors must handle and an atomic reservation path
+to qualify; it does not weaken the engine's existing fault semantics globally.
+The new integration must use an explicit safe admission facility, extending a
+narrow host interface if necessary. Qualification covers full capacity with
+zero provider calls, no partial reservation, eventual reuse after real
+retirement, and unchanged required-failure escalation after admission.
+
+Evidence: [host request admission and lease capacity](../../packages/scripting-lua/README.md)
+currently refuse full capacity as invocation faults, including a caught lease
+capacity error. They already retain slots through settlement consumption and
+provider retirement. The proposed non-fatal busy path is new M1 work, not a
+behavior the existing API can be assumed to provide.
 
 ## Open questions
 
@@ -4440,10 +4525,16 @@ reopen or broader Lua controls. Several windows per instance were not chosen.
 
 #### Q-6i. Does a required asynchronous failure stop its owner without a result read?
 
-**Active checkpoint, P-49.** A (recommended): latch failure at eligible
-settlement and escalate at a safe boundary even if Lua never reads the result.
-B: defer failure until Lua observes it, requiring an explicit revision of the
-required-load contract. Optional results and cancellation retain their distinctions.
+Resolved by D-52: P-49's A, failure at eligible settlement and safe-boundary
+escalation without requiring a result read. Optional results and winning
+cancellation remain distinct. Failure-on-read was not chosen.
+
+#### Q-6j. Is full admission capacity recoverable or instance-fatal?
+
+**Active checkpoint, P-50.** A (recommended): atomic reservation or a bounded
+busy refusal, no provider work, explicit Lua pacing, no failure for an unaccepted
+load. B: retain instance-fatal capacity refusal. Accepted required requests
+still follow D-52; busy does not relabel native or cleanup failures.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
