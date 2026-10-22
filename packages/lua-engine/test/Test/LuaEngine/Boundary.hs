@@ -1,9 +1,11 @@
 -- | The package and import boundary, read from the Cabal description and the
 -- imports rather than from what the examples happened to run: the library
--- depends on the foundation's time values and base libraries only, imports
--- nothing that performs IO, exposes two modules, needs no GLFW, Vulkan,
--- console, sample or game package, and is listed by the ordinary and CPU
--- projects and not by the Vulkan project (LFE-22 wires that).
+-- depends on the foundation's time values, the content package and base
+-- libraries only, imports no module that performs IO of its own (the boot
+-- checkpoint reads only through the content package's public interface),
+-- exposes three modules, needs no Lua, GLFW, Vulkan, console, sample or game
+-- package, and is listed by the ordinary and CPU projects and not by the
+-- Vulkan project (LFE-22 wires that).
 module Test.LuaEngine.Boundary (spec) where
 
 import Control.Monad (filterM)
@@ -83,29 +85,29 @@ importedBy sources = concat <$> mapM (\path → map ((,) (takeFileName path)) <$
 
 spec ∷ Spec
 spec = describe "the package and import boundary" $ do
-  it "has a library that depends on the foundation and base libraries, and nothing else" $
+  it "has a library that depends on the foundation, the content package and base libraries, and nothing else" $
     (sort <$> fieldEntries "library" "build-depends:")
-      `shouldReturn` ["array", "base", "bytestring", "containers", "hetoimasia-foundation", "text"]
+      `shouldReturn` ["array", "base", "bytestring", "containers", "hetoimasia-content", "hetoimasia-foundation", "text"]
 
-  it "exposes the manifest and the profile, and nothing else" $
+  it "exposes the boot checkpoint, the manifest and the profile, and nothing else" $
     fieldEntries "library" "exposed-modules:"
-      `shouldReturn` ["Hetoimasia.LuaEngine.Manifest", "Hetoimasia.LuaEngine.Profile"]
+      `shouldReturn` ["Hetoimasia.LuaEngine.Boot", "Hetoimasia.LuaEngine.Manifest", "Hetoimasia.LuaEngine.Profile"]
 
-  it "imports only pure data libraries, the foundation's time values and its own modules: no IO, no concurrency, no environment" $ do
+  it "imports only pure data libraries, the foundation's time values, the content package's public modules and its own modules: no IO of its own, no concurrency, no environment, no Lua" $ do
     sources ← sourcesUnder "src"
     sources `shouldSatisfy` ((>= 10) . length)
     imported ← importedBy sources
     [file <> ": " <> name | (file, name) ← imported, not (permitted name)] `shouldBe` []
     [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
 
-  it "is used by its own suite only through the two public modules" $ do
+  it "is used by its own suite only through its public modules and the content package's" $ do
     sources ← sourcesUnder "test"
     sources `shouldSatisfy` ((>= 7) . length)
     imported ← importedBy sources
     [ file <> ": " <> name
       | (file, name) ← imported
       , "Hetoimasia." `isPrefixOf` name
-      , name `notElem` ["Hetoimasia.LuaEngine.Manifest", "Hetoimasia.LuaEngine.Profile", "Hetoimasia.Foundation.Time"]
+      , name `notElem` ["Hetoimasia.LuaEngine.Boot", "Hetoimasia.LuaEngine.Manifest", "Hetoimasia.LuaEngine.Profile", "Hetoimasia.Foundation.Time", "Hetoimasia.Content", "Hetoimasia.Content.Identity", "Hetoimasia.Content.Inventory"]
       ]
       `shouldBe` []
 
@@ -129,3 +131,4 @@ spec = describe "the package and import boundary" $ do
       "Data." `isPrefixOf` name
         || "Hetoimasia.LuaEngine." `isPrefixOf` name
         || name == "Hetoimasia.Foundation.Time"
+        || name `elem` ["Hetoimasia.Content", "Hetoimasia.Content.Identity", "Hetoimasia.Content.Inventory"]
