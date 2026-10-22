@@ -395,7 +395,8 @@ diagnostics = describe "bounded diagnostics" $ do
     either (const Nothing) (Just . rootKeyBytes) (rootKey slice) `shouldBe` Just slice
     either (const True) (\key → sharesBuffer (rootKeyBytes key) large) (rootKey slice) `shouldBe` False
   it "does not enumerate an unbounded component list to describe an entry that is too deep" $ do
-    result <- bounded (evaluate (fmap inventoryReason (either Just (const Nothing) (buildMapping m1 rootA [nativeEntry ObservedFile (repeat "a")]))))
+    -- the list allocates as it is walked, so the bound can interrupt a regression
+    result <- bounded (evaluate (fmap inventoryReason (either Just (const Nothing) (buildMapping m1 rootA [nativeEntry ObservedFile (map (BC.pack . show) [1 ∷ Int ..])]))))
     case result of
       Just (InvalidEntry shown problem) → do
         problem `shouldBe` EntryTooDeep 33 32
