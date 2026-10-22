@@ -227,7 +227,7 @@ startTaskWith lead host handle name arguments =
           TaskStarted task <$> runSegment host StartTask startOperation task True state entry
   where
     vm = hostVm host
-    ref = Module.handleModule handle
+    ref = Module.attributedTo lead handle
 
 -- | Run a suspended task's next segment: it goes on from the yield or wait it
 -- stopped at, to the next, or to its return.

@@ -48,6 +48,7 @@ module Hetoimasia.Scripting.Lua.Internal.Module
   , callEntry
   , callEntryVia
   , callEntryWith
+  , attributedTo
   , entryPresent
   , Lead (..)
   , Prepared (..)
@@ -348,6 +349,14 @@ data Lead
     -- refused before anything runs.
     LeadCaptured !ModuleHandle !Text !CaptureHandle !Hook
 
+-- | The module a call is attributed to: the one whose code runs. A captured hook is the
+-- code of the export module it was captured from; anything else is the module the handle
+-- names.
+attributedTo ∷ Lead → ModuleHandle → ModuleRef
+attributedTo lead handle = case lead of
+  LeadCaptured _ _ capture _ → captureHandleSource capture
+  _ → handleModule handle
+
 -- | 'prepareEntry' with an optional lead. With a lead the stack holds the
 -- driver's function, then the entry point, then the arguments; the count is of
 -- everything after the driver's function.
@@ -463,7 +472,9 @@ prepareEntryWith lead host op operationName handle name arguments state entry = 
     boundary = hostBoundary host
     context = boundaryContext boundary
     limits = boundaryLimits boundary
-    ref = handleModule handle
+    -- The module the hook is the code of: a captured hook's is the export module it was
+    -- captured from, not the driver that calls it.
+    ref = attributedTo lead handle
     fault ∷ ∀ b. FaultReason → Effect → Maybe Text → IO b
     fault reason effect trace =
       throwFailure luaComponent operationName [] $
@@ -587,4 +598,4 @@ callEntryWith lead host handle name arguments =
                   pure (Returned values)
   where
     vm = hostVm host
-    ref = handleModule handle
+    ref = attributedTo lead handle

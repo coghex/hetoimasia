@@ -277,7 +277,7 @@ spec = describe "export modules" $ do
         runs first >>= (`shouldBe` 1)
         runs second >>= (`shouldBe` 1)
         -- And a handle of one is refused by the other.
-        outcome ← try @BoundaryFault (captureBehavior one kept "gameplay" (FacadeValue VNil))
+        outcome ← try @BoundaryFault (captureBehavior one kept "gameplay" (FacadeValue (VRecord [])))
         fmap boundaryReason (either Just (const Nothing) outcome) `shouldBe` Just (ModuleRefused ExportHandleForeign)
 
   describe "identities and limits" $ do
@@ -397,7 +397,7 @@ spec = describe "export modules" $ do
                 )
             )
             >>= ready
-        let shapeOf key = capturedShape <$> (captureBehavior owned export key (FacadeValue VNil) >>= captured)
+        let shapeOf key = capturedShape <$> (captureBehavior owned export key (FacadeValue (VRecord [])) >>= captured)
         shapeOf "gameplay" >>= (`shouldBe` BehaviorShape True True True (FieldInteger 3) FieldAbsent)
         shapeOf "presentation" >>= (`shouldBe` BehaviorShape False True False FieldAbsent (FieldFloat 0.5))
         shapeOf "integer_seconds" >>= (`shouldBe` BehaviorShape False False False FieldAbsent (FieldInteger 2))
@@ -433,7 +433,7 @@ spec = describe "export modules" $ do
             )
             >>= ready
         before ← holdings owned
-        let refused key = captureBehavior owned export key (FacadeValue (VText "facade"))
+        let refused key = captureBehavior owned export key (FacadeValue (VRecord [("name", VText "facade")]))
         refused "absent" >>= (`shouldBe` Left BehaviorMissing)
         refused "plain_number" >>= (`shouldBe` Left (BehaviorNotTable "number"))
         refused "with_meta" >>= (`shouldBe` Left BehaviorHasMetatable)
@@ -467,12 +467,12 @@ spec = describe "export modules" $ do
                 )
             )
             >>= ready
-        first ← captureBehavior owned export "gameplay" (FacadeValue VNil) >>= captured
+        first ← captureBehavior owned export "gameplay" (FacadeValue (VRecord [])) >>= captured
         -- Running the hook gives the export table an indexing metamethod; the
         -- selection of a role the table does not have must not call it.
         _ ← runHook owned handle (capturedHandle first) HookInit
-        captureBehavior owned export "presentation" (FacadeValue VNil) >>= (`shouldBe` Left BehaviorMissing)
-        captureBehavior owned export "gameplay" (FacadeValue VNil) >>= void'
+        captureBehavior owned export "presentation" (FacadeValue (VRecord [])) >>= (`shouldBe` Left BehaviorMissing)
+        captureBehavior owned export "gameplay" (FacadeValue (VRecord [])) >>= void'
         runs fixture >>= (`shouldBe` 0)
 
     it "does not take an invalid role the selection did not pick for a failure of the module or of another role" $ do
@@ -495,8 +495,8 @@ spec = describe "export modules" $ do
                 )
             )
             >>= ready
-        captureBehavior owned export "gameplay" (FacadeValue VNil) >>= void'
-        captureBehavior owned export "presentation" (FacadeValue VNil) >>= (`shouldBe` Left BehaviorHasMetatable)
+        captureBehavior owned export "gameplay" (FacadeValue (VRecord [])) >>= void'
+        captureBehavior owned export "presentation" (FacadeValue (VRecord [])) >>= (`shouldBe` Left BehaviorHasMetatable)
         retrieveExport owned (ExportIdentity "m") >>= (`shouldBe` Just (ExportReady export))
 
     it "captures the very functions: later replacement of the behavior's fields does not reach them" $ do
@@ -526,15 +526,15 @@ spec = describe "export modules" $ do
                 )
             )
             >>= ready
-        capture ← captureBehavior owned export "gameplay" (FacadeValue VNil) >>= captured
+        capture ← captureBehavior owned export "gameplay" (FacadeValue (VRecord [])) >>= captured
         _ ← runHook owned handle (capturedHandle capture) HookInit
         stateOf fixture >>= \state → Map.lookup "init" state `shouldBe` Just 1
         -- Replace everything the capture was read from: the capture is the
         -- original, and a later capture reads what is there now.
-        replacer ← captureBehavior owned export "replacer" (FacadeValue VNil) >>= captured
+        replacer ← captureBehavior owned export "replacer" (FacadeValue (VRecord [])) >>= captured
         _ ← runHook owned handle (capturedHandle replacer) HookInit
         releaseBehavior owned (capturedHandle replacer)
-        second ← captureBehavior owned export "gameplay" (FacadeValue VNil)
+        second ← captureBehavior owned export "gameplay" (FacadeValue (VRecord []))
         second `shouldBe` Left BehaviorMissing
         _ ← runHook owned handle (capturedHandle capture) HookInit
         state ← stateOf fixture
@@ -679,6 +679,52 @@ spec = describe "export modules" $ do
         _ ← pure fixture
         pure ()
 
+    it "refuses a copied facade that is not a table: nil and every scalar, before anything is captured" $
+      withBoth $ \_ owned _ _ behaviorHandle → do
+        before ← holdings owned
+        forM_ [(VNil, "nil"), (VBoolean True, "boolean"), (VInteger 3, "number"), (VFloat 1.5, "number"), (VText "x", "string"), (VBytes "x", "string")] $ \(scalar, name) → do
+          refused ← try @BoundaryFault (captureBehavior owned behaviorHandle "gameplay" (FacadeValue scalar))
+          fmap boundaryReason (either Just (const Nothing) refused) `shouldBe` Just (ModuleRefused (FacadeNotATable name))
+          fmap boundaryEffect (either Just (const Nothing) refused) `shouldBe` Just NoEffect
+        -- A list is a table, and so is an empty record.
+        _ ← captureBehavior owned behaviorHandle "gameplay" (FacadeValue (VList [VInteger 1])) >>= captured
+        holdings owned >>= \after → holdCaptures after `shouldBe` holdCaptures before + 1
+
+    it "attributes what a captured hook raises to the export module that holds it, not to the driver that calls it" $ do
+      fixture ← newFixture
+      withDriver fixture id $ \owned handle → do
+        export ←
+          evaluateExport
+            owned
+            ( exportOf
+                "attributed"
+                ( Text.unlines
+                    [ "return {"
+                    , "  scripted = { init = function() error('scripted boom') end, update = function() error('update boom') end, shutdown = function() error('shutdown boom') end },"
+                    , "  refused = { init = function() sample.add(1.5, 2) end, update = function() sample.add(1.5, 2) end, shutdown = function() sample.add(1.5, 2) end },"
+                    , "}"
+                    ]
+                )
+            )
+            >>= ready
+        let source = ModuleRef "attributed" "export"
+            raised capture hook = try @BoundaryFault (runHook owned handle (capturedHandle capture) hook) >>= \case
+              Left fault → pure fault
+              Right other → expectationFailure ("the hook did not fail: " <> show other) >> error "unreachable"
+        scripted ← captureBehavior owned export "scripted" (FacadeValue (VRecord [])) >>= captured
+        refused ← captureBehavior owned export "refused" (FacadeValue (VRecord [])) >>= captured
+        forM_ [(HookInit, "init"), (HookUpdate, "update"), (HookShutdown, "shutdown")] $ \(hook, entry) → do
+          scriptFault ← raised scripted hook
+          boundaryModule scriptFault `shouldBe` Just source
+          boundaryEntry scriptFault `shouldBe` Just entry
+          boundaryReason scriptFault `shouldSatisfy` \case ScriptFailed CallFailed (ErrorMessage message _) → Text.isInfixOf "boom" message; _ → False
+          -- A binding refusal from the authored chunk is attributed to it as well: the chunk
+          -- the call was made from is the module's own.
+          bindingFault ← raised refused hook
+          boundaryModule bindingFault `shouldBe` Just source
+          boundaryEntry bindingFault `shouldBe` Just entry
+          boundaryBinding bindingFault `shouldBe` Just ("sample", "add")
+
     it "runs no facade builder for a behavior that does not validate" $
       withBoth $ \fixture owned _ serviceHandle behaviorHandle → do
         captureBehavior owned behaviorHandle "bad" (FacadeBuilt serviceHandle "counted" VNil) >>= (`shouldBe` Left (BehaviorUnknownKey "bogus"))
@@ -686,13 +732,23 @@ spec = describe "export modules" $ do
         _ ← captureBehavior owned behaviorHandle "other" (FacadeBuilt serviceHandle "counted" VNil) >>= captured
         runs fixture >>= (`shouldBe` 1)
 
+  describe "a facade builder that catches a host failure" $ do
+    it "raises the saved failure whenever the builder ran, whatever fails after it, at every allocation of the call" $ do
+      results ← catchSweep
+      -- Nothing was reported as an ordinary construction failure or a success once the
+      -- host's callback had failed, and nothing was left held.
+      take 5 [text | CatchTrial _ _ _ (Just text) ← results] `shouldBe` []
+      let kinds = [kind | CatchTrial kind _ _ _ ← results]
+      kinds `shouldSatisfy` elem CatchRaised
+      kinds `shouldSatisfy` elem CatchFaulted
+
   describe "references" $ do
     it "holds a capture until it is released, releases once, and refuses a handle it no longer holds" $ do
       fixture ← newFixture
       withDriver fixture id $ \owned handle → do
         export ← evaluateExport owned (exportOf "m" "return { gameplay = { init = function() end } }") >>= ready
         baseline ← holdings owned
-        capture ← captureBehavior owned export "gameplay" (FacadeValue VNil) >>= captured
+        capture ← captureBehavior owned export "gameplay" (FacadeValue (VRecord [])) >>= captured
         mid ← holdings owned
         holdCaptures mid `shouldBe` 1
         holdSlots mid `shouldBe` [captureHandleSlot (capturedHandle capture)]
@@ -704,7 +760,7 @@ spec = describe "export modules" $ do
         outcome ← try @BoundaryFault (runHook owned handle (capturedHandle capture) HookInit)
         fmap boundaryReason (either Just (const Nothing) outcome) `shouldBe` Just (ModuleRefused CaptureHandleStale)
         -- Nor does a handle for a slot nothing ever held.
-        forged ← try @BoundaryFault (runHook owned handle (CaptureHandle (captureHandleVm (capturedHandle capture)) 99999) HookInit)
+        forged ← try @BoundaryFault (runHook owned handle (CaptureHandle (captureHandleVm (capturedHandle capture)) 99999 (captureHandleSource (capturedHandle capture))) HookInit)
         fmap boundaryReason (either Just (const Nothing) forged) `shouldBe` Just (ModuleRefused CaptureHandleStale)
         holdings owned >>= (`shouldBe` baseline)
 
@@ -714,14 +770,14 @@ spec = describe "export modules" $ do
       withDriver first id $ \one handleOne → withDriver second id $ \two handleTwo → do
         exportOne ← evaluateExport one (exportOf "m" "return { gameplay = {} }") >>= ready
         exportTwo ← evaluateExport two (exportOf "m" "return { gameplay = {} }") >>= ready
-        captureOne ← captureBehavior one exportOne "gameplay" (FacadeValue VNil) >>= captured
+        captureOne ← captureBehavior one exportOne "gameplay" (FacadeValue (VRecord [])) >>= captured
         foreignRelease ← try @BoundaryFault (releaseBehavior two (capturedHandle captureOne))
         fmap boundaryReason (either Just (const Nothing) foreignRelease) `shouldBe` Just (ModuleRefused CaptureHandleForeign)
         foreignRun ← try @BoundaryFault (runHook two handleTwo (capturedHandle captureOne) HookInit)
         fmap boundaryReason (either Just (const Nothing) foreignRun) `shouldBe` Just (ModuleRefused CaptureHandleForeign)
         -- The first is untouched.
         liveCaptureReferences (ownedHost one) >>= (`shouldBe` 1)
-        forged ← try @BoundaryFault (captureBehavior two exportTwo {exportHandleSlot = exportHandleSlot exportTwo + 100} "gameplay" (FacadeValue VNil))
+        forged ← try @BoundaryFault (captureBehavior two exportTwo {exportHandleSlot = exportHandleSlot exportTwo + 100} "gameplay" (FacadeValue (VRecord [])))
         fmap boundaryReason (either Just (const Nothing) forged) `shouldBe` Just (ModuleRefused ExportHandleStale)
         _ ← pure handleOne
         pure ()
@@ -743,7 +799,7 @@ spec = describe "export modules" $ do
       escaped ← newIORef Nothing
       withDriver fixture id $ \owned handle → do
         export ← evaluateExport owned (exportOf "m" "return { gameplay = {} }") >>= ready
-        capture ← captureBehavior owned export "gameplay" (FacadeValue VNil) >>= captured
+        capture ← captureBehavior owned export "gameplay" (FacadeValue (VRecord [])) >>= captured
         writeIORef escaped (Just (owned, handle, export, capture))
       Just (owned, handle, export, capture) ← readIORef escaped
       let closed ∷ IO a → IO ()
@@ -754,7 +810,7 @@ spec = describe "export modules" $ do
               other → expectationFailure ("not refused as closed: " <> either show (const "it succeeded") other)
       closed (evaluateExport owned (exportOf "n" "return {}"))
       closed (retrieveExport owned (ExportIdentity "m"))
-      closed (captureBehavior owned export "gameplay" (FacadeValue VNil))
+      closed (captureBehavior owned export "gameplay" (FacadeValue (VRecord [])))
       closed (releaseBehavior owned (capturedHandle capture))
       closed (runHook owned handle (capturedHandle capture) HookInit)
 
@@ -784,6 +840,78 @@ spec = describe "export modules" $ do
         (expected, expected `elem` seen) `shouldBe` (expected, True)
 
 -- Helpers ---------------------------------------------------------------------------
+
+-- | How a capture under a tight budget ended.
+data CatchKind = CatchRaised | CatchFaulted | CatchReturned
+  deriving (Eq, Show)
+
+-- | One budget's capture of a behavior with a builder that caught a host failure:
+-- how it ended, whether the host's callback had run, and what was wrong, if anything.
+data CatchTrial = CatchTrial CatchKind Bool Int (Maybe Text)
+
+-- | The exports of the builder example. Neither names @api@ or @self@, so the strings
+-- the capture attaches the facade with are made by the capture itself and can be the
+-- allocation that fails.
+catchSources ∷ (ExportSource, ExportSource)
+catchSources =
+  ( exportOf "services" "return { build = function(context) pcall(sample.fail, 'caught') return { a = 1, b = 2 } end }"
+  , exportOf "carrier" "return { gameplay = { init = function(s, a) end } }"
+  )
+
+catchTrial ∷ Int → IO (Maybe CatchTrial)
+catchTrial budget = do
+  fixture ← newFixture
+  built ← newIORef False
+  let config =
+        (defaultOwnerConfig libraries)
+          { ownerBudget = Just budget
+          , ownerRegistration = sampleRegistration fixture
+          , ownerGranted = ["sample"]
+          , ownerName = "tight"
+          }
+  outcome ← try @SomeException . withOwnedVm config $ \owned → do
+    writeIORef built True
+    let (services, carrier) = catchSources
+        evaluated source = try @SomeException (evaluateExport owned source)
+    first ← evaluated services
+    second ← evaluated carrier
+    case (first, second) of
+      (Right (ExportReady serviceHandle), Right (ExportReady carrierHandle)) → do
+        attempted ← try @SomeException (captureBehavior owned carrierHandle "gameplay" (FacadeBuilt serviceHandle "build" (VRecord [])))
+        callbackRan ← elem "fail" <$> logged fixture
+        left ← try @SomeException (liveCaptureReferences (ownedHost owned))
+        let kept = either (const 0) id left
+            kind = case attempted of
+              Right _ → CatchReturned
+              Left failure
+                | isJust (fromException failure ∷ Maybe IOError) → CatchRaised
+                | otherwise → CatchFaulted
+            wrong = case (attempted, callbackRan) of
+              (Right _, _) → Just "the capture returned although the host's callback had failed"
+              (Left failure, True)
+                | isJust (fromException failure ∷ Maybe IOError) → if kept /= 0 then Just "a capture was left held" else Nothing
+                | otherwise → Just ("the host's failure was replaced by " <> Text.pack (take 80 (show failure)))
+              (Left failure, False)
+                | exhausted failure → if kept /= 0 then Just "a capture was left held" else Nothing
+                | otherwise → Just ("unexpected failure " <> Text.pack (take 80 (show failure)))
+        pure (Just (CatchTrial kind callbackRan kept wrong))
+      _ → pure Nothing
+  case outcome of
+    Right trial → pure trial
+    Left failure → do
+      constructed ← readIORef built
+      if constructed then throwIO failure else pure Nothing
+
+catchSweep ∷ IO [CatchTrial]
+catchSweep = go (16000 ∷ Int) (0 ∷ Int) []
+  where
+    go budget raisedInARow gathered
+      | raisedInARow >= 40 || budget > 90000 = pure gathered
+      | otherwise = do
+          found ← catchTrial budget
+          case found of
+            Nothing → go (budget + 1) raisedInARow gathered
+            Just trial@(CatchTrial kind _ _ _) → go (budget + 1) (if kind == CatchRaised then raisedInARow + 1 else 0) (trial : gathered)
 
 void' ∷ Applicative f ⇒ a → f ()
 void' _ = pure ()

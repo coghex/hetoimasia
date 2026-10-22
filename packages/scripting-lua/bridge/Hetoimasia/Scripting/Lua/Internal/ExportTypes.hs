@@ -40,7 +40,7 @@ import qualified Data.Map.Strict as Map
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
-import Hetoimasia.Scripting.Lua.Internal.Boundary (BoundaryFault)
+import Hetoimasia.Scripting.Lua.Internal.Boundary (BoundaryFault, ModuleRef)
 import Hetoimasia.Scripting.Lua.Internal.Value (Value, VmIdentity)
 
 -- | The stable identity an export module is known by within one VM: opaque
@@ -87,6 +87,9 @@ data ExportHandle = ExportHandle
   { exportHandleVm ∷ !VmIdentity
   , exportHandleSlot ∷ !Int
   , exportHandleIdentity ∷ !ExportIdentity
+  , exportHandleSource ∷ !ModuleRef
+    -- ^ How the module is named when something it ran fails: its bounded label and
+    -- no version. Diagnostics only, and no key.
   }
   deriving (Eq, Show)
 
@@ -95,6 +98,9 @@ data ExportHandle = ExportHandle
 data CaptureHandle = CaptureHandle
   { captureHandleVm ∷ !VmIdentity
   , captureHandleSlot ∷ !Int
+  , captureHandleSource ∷ !ModuleRef
+    -- ^ The export module the hooks are the authored code of: what a script error or a
+    -- binding error from a hook is attributed to, not the driver that calls it.
   }
   deriving (Eq, Show)
 
@@ -127,7 +133,7 @@ data ExportOutcome
 data ExportRecord
   = -- | Being evaluated. Counted against the limit.
     ExportEvaluating
-  | ExportHeld !Int
+  | ExportHeld !Int !ModuleRef
   | ExportBroken !BoundaryFault
   deriving (Eq, Show)
 

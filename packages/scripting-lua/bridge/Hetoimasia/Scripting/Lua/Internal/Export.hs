@@ -125,9 +125,16 @@ labelOf label = Text.pack (go 0 (Text.unpack tamed))
 faultFor ∷ Host → FaultOperation → Text → FaultReason → BoundaryFault
 faultFor host op label reason =
   (blankFault (hostBoundary host) op reason)
-    { boundaryModule = Just (ModuleRef (labelOf label) "export")
-    , boundaryChunk = labelOf label
+    { boundaryModule = Just (sourceOf label)
+    , boundaryChunk = moduleChunk (sourceOf label)
     }
+
+-- | How an export module is named wherever its code is running or failing: its
+-- bounded label and the version @export@. The chunk its source is loaded under is
+-- the name that gives, as every module's is, so that the attribution of a script's
+-- own error and of a binding's refusal agree.
+sourceOf ∷ Text → ModuleRef
+sourceOf label = ModuleRef (labelOf label) "export"
 
 -- | Evaluate an export module, or answer what an identity already came to.
 --
@@ -153,7 +160,7 @@ evaluateExport host source =
         refuse (InvalidExportIdentity maxExportIdentityBytes)
       records ← readIORef (exportRecords held)
       case Map.lookup identity records of
-        Just (ExportHeld slot) → pure (ExportReady (ExportHandle (vmIdentity vm) slot (storedKey records)))
+        Just (ExportHeld slot source') → pure (ExportReady (ExportHandle (vmIdentity vm) slot (storedKey records) source'))
         Just (ExportBroken fault) → pure (ExportFailed fault)
         -- Nothing leaves a record behind in this state: an evaluation that
         -- cannot finish records its failure first.
@@ -191,9 +198,9 @@ evaluateExport host source =
       -- environment is made) executed nothing: it is raised, and the identity is
       -- not charged, so it can be asked for again.
       attempted ← (`onException` abandon) $ do
-        setRunContext vm (labelOf label, "export", Nothing)
+        setRunContext vm (moduleRefName (sourceOf label), "export", Nothing)
         slot ← nextModuleSlot vm
-        evaluated ← evaluateExportSource state (exportText source) (labelOf label) slot
+        evaluated ← evaluateExportSource state (exportText source) (moduleChunk (sourceOf label)) slot
         let started = evaluatedStarted evaluated
             failed ∷ FaultReason → Effect → Maybe Text → IO BoundaryFault
             failed reason effect trace = do
@@ -242,8 +249,8 @@ evaluateExport host source =
                     -- the marker, and the chunk still returned its table: the
                     -- failure is the caller's, and the table is not kept.
                     raiseEscape vm `onException` void (releaseExport state slot)
-                    modifyIORef' (exportRecords held) (Map.insert kept (ExportHeld slot))
-                    pure (Right (ExportReady (ExportHandle (vmIdentity vm) slot kept)))
+                    modifyIORef' (exportRecords held) (Map.insert kept (ExportHeld slot (sourceOf label)))
+                    pure (Right (ExportReady (ExportHandle (vmIdentity vm) slot kept (sourceOf label))))
       either (throwFailure luaComponent evaluateOperation []) pure attempted
     shapeOf evaluated = case evaluatedShape evaluated of
       0 → Nothing
@@ -261,7 +268,7 @@ retrieveExport host identity =
     records ← readIORef (exportRecords (hostExports host))
     pure $ case Map.lookup identity records of
       Nothing → Nothing
-      Just (ExportHeld slot) → Just (ExportReady (ExportHandle (vmIdentity (hostVm host)) slot (maybe identity (fst . (`Map.elemAt` records)) (Map.lookupIndex identity records))))
+      Just (ExportHeld slot source') → Just (ExportReady (ExportHandle (vmIdentity (hostVm host)) slot (maybe identity (fst . (`Map.elemAt` records)) (Map.lookupIndex identity records)) source'))
       Just (ExportBroken fault) → Just (ExportFailed fault)
       Just ExportEvaluating → Nothing
 
@@ -339,7 +346,7 @@ captureBehavior host export select facade =
             when (exportHandleVm handle /= vmIdentity vm) (refuse ExportHandleForeign)
             records ← readIORef (exportRecords (hostExports host))
             case Map.lookup (exportHandleIdentity handle) records of
-              Just (ExportHeld slot) | slot == exportHandleSlot handle → pure ()
+              Just (ExportHeld slot _) | slot == exportHandleSlot handle → pure ()
               _ → refuse ExportHandleStale
           -- A value is within the limits and holds no retired capability, and is encoded
           -- before anything is made, so that a refusal costs nothing.
@@ -378,9 +385,20 @@ captureBehavior host export select facade =
       held export
       when (ByteString.null selector || ByteString.length selector > 128) $
         refuse (InvalidEntryName select)
-      -- What a facade needs checked, and encoded, is settled before the behavior is.
+      -- What a facade needs checked, and encoded, is settled before the behavior is. A copied
+      -- facade is the table the capture promises: a record or a list, never nil or a scalar.
+      let tableOnly value = case value of
+            VRecord _ → pure ()
+            VList _ → pure ()
+            VNil → refuse (FacadeNotATable "nil")
+            VBoolean _ → refuse (FacadeNotATable "boolean")
+            VInteger _ → refuse (FacadeNotATable "number")
+            VFloat _ → refuse (FacadeNotATable "number")
+            VBytes _ → refuse (FacadeNotATable "string")
+            VText _ → refuse (FacadeNotATable "string")
+            VCapability _ → refuse (FacadeNotATable "userdata")
       prepared ← case facade of
-        FacadeValue value → Just <$> encodedValue value
+        FacadeValue value → tableOnly value >> (Just <$> encodedValue value)
         FacadeField handle _ → Nothing <$ held handle
         FacadeBuilt handle _ context → held handle >> Just <$> encodedValue context
       ensureValues vm state
@@ -417,6 +435,10 @@ captureBehavior host export select facade =
                     serviceCollector state
                     (called, trace) ← callProtected state 1 1
                     effect ← effectNow vm
+                    -- A host failure a callback recorded while the builder ran outranks anything
+                    -- that comes after, even if the builder caught Lua's side of it with
+                    -- @pcall@ and returned a table: raised first, whatever follows.
+                    when (called == LUA_OK) (raiseEscape vm)
                     when (called /= LUA_OK) $ do
                       value ← renderFailure state entry
                       lua_settop state entry
@@ -432,11 +454,15 @@ captureBehavior host export select facade =
                   _ → fault (InternalError "a facade source was not prepared") NoEffect
                 (attached, wasAttached) ← attachFacade state slot
                 lua_settop state entry
+                -- A builder ran if there was one: what a failure from here says had happened.
+                ran ← case facade of
+                  FacadeBuilt {} → effectNow vm
+                  _ → pure NoEffect
                 when (attached /= LUA_OK) $
-                  fault (ScriptFailed (classify attached) ErrorAbsent) NoEffect
-                unless wasAttached $ fault (InternalError "the capture to attach a facade to is gone") NoEffect
+                  fault (ScriptFailed (classify attached) ErrorAbsent) ran
+                unless wasAttached $ fault (InternalError "the capture to attach a facade to is gone") ran
                 raiseEscape vm
-              pure (Right (Captured (CaptureHandle (vmIdentity vm) slot) (shapeOfReport report)))
+              pure (Right (Captured (CaptureHandle (vmIdentity vm) slot (exportHandleSource export)) (shapeOfReport report)))
   where
     vm = hostVm host
     boundary = hostBoundary host
