@@ -112,6 +112,7 @@ import Hetoimasia.Scripting.Lua.Runtime.Types
   , ExitKind (ExitCancelled, ExitFailed, ExitStopped)
   , Payload (OverBound, WithinBounds)
   )
+import Hetoimasia.Scripting.Lua.Instance.Behavior (behaviorDriverRef)
 import Hetoimasia.Scripting.Lua.Instance.Driver (driverRef)
 import Hetoimasia.Scripting.Lua.Instance.Run
   ( ExitMode (Unorderly)
@@ -227,10 +228,10 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
     writeIORef handlesRef handles
     forM_ ((,) <$> controlInstances control <*> escalate) $ \(instances, decide) →
       forM_ (Map.lookup driverRef handles) $ \driver →
-        newInstanceHost control instances decide host owned driver handlesRef tasks extra leaseHost (controlProvider control) >>= writeIORef instanceRef . Just
+        newInstanceHost control instances decide host owned driver (Map.lookup behaviorDriverRef handles) handlesRef tasks extra leaseHost (controlProvider control) >>= writeIORef instanceRef . Just
     -- What each module defines is read now, from the modules as loaded, running none of their
     -- code, and published with readiness: the owner's query answers from it and it never changes.
-    defined ← forM (Map.toList (Map.delete driverRef handles)) $ \(ref, handle) → (,) ref <$> definedHooks owned handle
+    defined ← forM (Map.toList (Map.delete behaviorDriverRef (Map.delete driverRef handles))) $ \(ref, handle) → (,) ref <$> definedHooks owned handle
     atomically $ do
       writeTVar (controlHooks control) (Map.fromList defined)
       writeTVar handoff (Just control)

@@ -103,6 +103,8 @@ library bridge
         Hetoimasia.Scripting.Lua.Internal.Boundary
         Hetoimasia.Scripting.Lua.Internal.Call
         Hetoimasia.Scripting.Lua.Internal.Callback
+        Hetoimasia.Scripting.Lua.Internal.Export
+        Hetoimasia.Scripting.Lua.Internal.ExportTypes
         Hetoimasia.Scripting.Lua.Internal.Fault
         Hetoimasia.Scripting.Lua.Internal.Library
         Hetoimasia.Scripting.Lua.Internal.Marshal
@@ -212,6 +214,7 @@ library runtime-lua
         Hetoimasia.Scripting.Lua.Scheduled
         Hetoimasia.Scripting.Lua.Scheduler
     other-modules:
+        Hetoimasia.Scripting.Lua.Instance.Behavior
         Hetoimasia.Scripting.Lua.Instance.Driver
         Hetoimasia.Scripting.Lua.Instance.Run
         Hetoimasia.Scripting.Lua.Instance.State
@@ -301,6 +304,7 @@ test-suite lua-host-tests
         Test.Lua.Boundary.Bindings
         Test.Lua.Boundary.Dependencies
         Test.Lua.Boundary.Discipline
+        Test.Lua.Boundary.Exports
         Test.Lua.Boundary.Finalizers
         Test.Lua.Boundary.Independence
         Test.Lua.Boundary.Installation
@@ -419,6 +423,7 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Runner.Spec
         Test.LuaRuntime.Runner.Support
         Test.LuaRuntime.Instance.Basics
+        Test.LuaRuntime.Instance.Behavior
         Test.LuaRuntime.Instance.Boundary
         Test.LuaRuntime.Instance.ExitKind
         Test.LuaRuntime.Instance.Matrix

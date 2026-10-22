@@ -362,7 +362,17 @@ reference for every (channel, alpha) pair, exact at alpha 0 and 255, and data
 images byte-for-byte unchanged; the format, extent and single-level layout the
 upload endpoint takes; the binary-alpha cutout mark; and the refusal of empty,
 foreign, truncated, corrupt-stream and undecodable bytes, each result fully
-evaluated. It is mandatory but outside the floor, like `test.math`, and runs
+evaluated. It also holds the bounded static-PNG preflight (LFE-14) and the
+bounded decode that follows it (LFE-15): every fixture whose texels the suite
+states, including 16-bit Adam7 with alpha and keys, narrow and odd Adam7
+extents, every filter type at every pixel size and chunk boundaries, decoded
+through the complete entry to one premultiplied level equal to the general
+decoder's; a decode's charges to its caller's byte account counted
+independently, in order and before each allocation, at the approved maxima for
+every family and in real decodes there; and every outcome (refusal, bank or
+release fault, asynchronous cancellation, hand-over beside a staging copy)
+leaving the account as the contract says. It is mandatory but outside the floor,
+like `test.math`, and runs
 through `cabal.project.cpu` for the same reason. Its fixtures sit under the
 suite's own source directory, `packages/asset-image/test/`, so they are inputs
 derived from its component and a fixture-only change selects it. See

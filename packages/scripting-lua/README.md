@@ -883,6 +883,10 @@ module's environment, so no lookup metamethod can supply or hide one:
   nothing faults;
 - one that is present and is not a function is a fault, required or optional.
 
+An opt-in alternative that **returns a table** the VM keeps as it is, instead of declaring entry points to call, is
+[export modules](#export-modules-and-captured-behaviors); the global-entry modules above are unchanged and remain the
+mode every existing caller uses.
+
 ### Values
 
 Values cross as bounded copies, in both directions: a binding's arguments and
@@ -976,6 +980,13 @@ no owner-wide or catch-all switch.
   ordinary Lua error: a wrong number of arguments, a value of the wrong shape, type or
   encoding, a value past a limit, and a capability that is not of the declared type, was
   not issued by this VM, or that the application's own check reports retired.
+- `withArgumentCheck check binding` does that too, and has `check` run **after** the host's own checks of the arguments:
+  the arguments were copied, found to be of the declared shapes and within the limits, and every handle live. `check` is
+  `OwnerContexts -> [Value] -> IO (Maybe Text)` and is handed the copied values (never a Lua-visible table, so no
+  authored metamethod runs for it). It decides a fact only the values carry: that an integer is positive, that a sum
+  is representable, that a name is one the application knows. It refuses as an ordinary Lua error exactly as a
+  precondition does, runs no provider or native action, and its reason is bounded by the same 256 bytes. Checks and
+  preconditions run in the order they were added, the preconditions of a binding before its argument checks.
 - `withPrecondition check binding` does that too, and has `check` run first. A precondition
   is `OwnerContexts -> IO (Maybe Text)`: `Nothing` lets the call go on, `Just reason`
   refuses it. It runs before the host asks whether a scheduler operation can suspend and
@@ -1185,6 +1196,171 @@ closure or for a Lua state, and positive clients built from the public modules
 alone: one constructs a registration and an owner's policy, loads a module, calls
 an entry point and observes a typed refusal, and one opts a binding in to
 recoverable refusals.
+
+## Export modules and captured behaviors
+
+An opt-in facility beside the global-entry modules above. Those modules, `ModuleSource`,
+`loadModule`, `callEntry` and the named-entry lookup are exactly as documented and are not
+replaced: nothing below changes what an existing caller, instance, task or the `lua` runner
+does. A module here is source text the application supplies under a stable identity whose
+chunk **returns one table**, which the VM keeps as it is.
+
+Everything in this section runs on the VM's owner, through the same protected foreign-call
+boundary as every other operation: no Lua longjmp crosses Haskell and no Haskell exception
+crosses C. The handles are values that name a slot of one VM's registry and are checked on
+every use; no raw Lua state, stack index, registry reference, native pointer or unrestricted
+cross-VM value API is exposed.
+
+### The export table
+
+`evaluateExport` loads the supplied text in a private module environment that reads through to
+the owner's globals (so [the M1 library profile](#the-m1-library-profile) has already removed
+what it removes before any authored code runs), runs it, and requires **exactly one** returned
+value, a table with **no metatable**. These are module failures, kept as the identity's outcome:
+
+| The chunk | Failure |
+| --- | --- |
+| returns nothing | `ExportShapeRefused ExportNoResult` |
+| returns `nil` | `ExportNil` |
+| returns a boolean, number, string, function | `ExportNotTable` naming the type |
+| returns more than one value, an extra `nil` included | `ExportMultiple` |
+| returns a table with a metatable, protected or not | `ExportMetatable` |
+| fails to parse, is a precompiled chunk, or raises | `ScriptFailed`, the attributed protected Lua-failure path (traceback bounded) |
+
+Precompiled binary chunks are refused (the chunk is loaded in text mode only), and no
+arbitrary-source load API is added. The table, and the functions, tables and cycles reachable
+from it, are retained **in the VM**: nothing is serialized, deep-copied or put through the
+copied-value schemas, and ordinary Lua graph cycles are permitted (import dependency cycles
+are the later loader's). Other keys of the table are unrestricted library exports. Module
+globals stay in the module's own environment; mutable exports, closures and upvalues and the
+permitted shared library tables keep the trusted same-VM semantics Lua gives them. This is
+neither hostile-code isolation nor a rollback: what a chunk did before it failed is not undone.
+
+### Identity, sticky failure and bounds
+
+An `ExportIdentity` is opaque bytes the caller chose (for the later loader, root plus canonical
+path). It is compared exactly, never truncated or hashed into a key, and never forced into the
+legacy 128-byte `ModuleRef`; one that is empty or longer than 4096 bytes is refused, not
+shortened. What a record or a handle retains is a **copy that owns its bytes**, so a short slice of a
+large buffer pins nothing after the call. The source label used in diagnostics is bounded separately.
+
+* **Once per identity per VM.** Asking again, with `evaluateExport` or `retrieveExport`, answers
+  the same table, or the same failure, and runs nothing. A failed identity is never retried with
+  replacement bytes. Another VM has its own environment, result, failure and state.
+* **Ceilings** come from the owner's `ExportLimits`; the M1 profile's are 1 MiB of supplied
+  source and 256 identities per VM (`Hetoimasia.LuaEngine.Behavior.exportLimits`). Failed
+  records and any in progress count, and nothing is evicted, retried or kept as history. A
+  source one byte over is **never compiled**: while room remains it is a failed record that counts,
+  `ModuleRefused (SourceTooLarge n)`, distinguishable from an evaluation failure. A *new*
+  identity at a full ceiling is refused, `ModuleRefused (TooManyExports n)`, with no record and
+  nothing evaluated. Retrieval of an existing identity consumes nothing.
+* The ceiling counts only identities of this facility. Global-entry modules, including the
+  instance driver an instance-hosting owner loads, keep their own bound (`maxModules`) and use
+  no slot.
+* The source bytes are not kept: the interpreter copies what it compiles, and a record holds the
+  identity, the outcome and the table.
+* A failure that happens before the chunk can start (memory running out as its environment is
+  made) is raised and charges nothing, so the identity can be asked for again. A Haskell
+  failure that reached a callback while the chunk ran is raised in preference to whatever Lua
+  reported, even if the script caught it with `pcall`, and the identity is recorded as failed
+  with no table kept.
+
+`VmConfig` takes `vmExports` (evaluated after the modules, in order, at initialization; one that
+fails is a recorded failure and does not end construction) and `vmExportLimits`.
+
+### A selected behavior
+
+`captureBehavior` validates one field of an export table as a **behavior** and captures it for
+one instance. It is selected by raw access and read by a raw traversal of the behavior table
+that stops after the entry that proves a field outside the schema, so **at most six entries
+are visited**: no `__index`, `pairs`, length or conversion metamethod runs, and nothing walks the
+library exports around it.
+
+* The field must be a table with no metatable. Its only keys are `init`, `update`, `shutdown`,
+  `every_ticks` and `every_seconds`; a key that is not text, or not one of these, and a hook
+  that is neither absent nor a function, are refused (`BehaviorProblem`). A table with a `__call`
+  metamethod is not a function.
+* An unselected role that is invalid is not a failure of the module or of another role.
+* The answer reports which hooks exist and how each cadence field *reads* (`CadenceField`:
+  absent, a Lua integer, a Lua float, or another type), with no conversion applied. What a
+  cadence means is the application's: `hetoimasia-lua-engine` applies the M1 rules.
+* No hook runs during validation or capture.
+
+A behavior that does not fit is returned as data and holds nothing; an allocation that fails on the
+way is a fault and holds nothing either.
+
+### What a capture holds
+
+A capture holds, by a slot of a registry table only the bridge reaches: the very `init`, `update`
+and `shutdown` functions (absence included), a fresh ordinary `self` table whose `api` is the
+facade, and the facade. The **facade** is the injection seam for the later M1 service
+namespaces. A `FacadeSource` names where it comes from, and it is made **last**, after the behavior
+has validated and been captured (so a facade builder never runs for a behavior that is refused):
+
+* `FacadeValue v`: a copy of the value `v`, made fresh for this capture alone within the owner's
+  value limits (a capability the application's own check retires, or an oversize value, is refused).
+  Data only: it cannot carry a function. It must be a **table** (a record or a list): `nil` and every
+  scalar are refused (`FacadeNotATable`) before anything is captured, so `self.api` and `init`'s second
+  argument can never be a scalar.
+* `FacadeField export key`: the table a retained export module holds under `key`, used as it is: one
+  existing facade reference shared by every capture that names it.
+* `FacadeBuilt export key v`: built for this capture alone by calling the function the export module
+  holds under `key` with a copy of `v` (the instance's context). It returns the facade table, which may
+  carry closures bound to this instance. The builder is the engine's own Lua, runs under the protected
+  call and its traceback handler, and what it raises, or returns that is no table, fails the capture,
+  which is released.
+
+Whichever it is, the same Lua table is `init`'s `api` and `self.api`. It is an ordinary Lua table in
+Lua's hands: assigning to `self` or the facade cannot replace the engine's captured hooks, another
+capture's tables or its attribution. A source naming a field that is absent, or of the wrong type
+(`FacadeFieldMissing`, `FacadeNotATable`, `FacadeBuilderNotAFunction`), or an export handle that is not
+this owner's, is refused with no effect and holds nothing.
+
+Replacing or removing a field of the behavior table, replacing the role table, or editing a cadence
+field afterwards changes nothing a capture does; a later capture reads the table as it is then.
+Capturing a function does not freeze its upvalues or the shared exports: mutable upvalues and
+shared state stay ordinary Lua, and `self` stays separate.
+
+What a captured hook raises is attributed to **the export module that holds it** (its bounded label and the
+version `export`, with the hook's name as the entry), not to the driver that calls it: the module and entry of a
+script error, and of a binding's refusal made from the module's own code (the chunk it was loaded under matches
+the module's), are the same for `init`, for each segment of an `update`, including after a resume, and for
+`shutdown`. A host failure a callback recorded while a facade builder ran is raised before anything that fails
+after it (and a builder that catches Lua's side of it with `pcall` still cannot hide it).
+
+The hooks are run by the runtime through a driver, never looked up again by name: see
+[M1 behavior instances](#m1-behavior-instances-opt-in).
+
+### Reference lifetimes
+
+| What | Made by | Held until | Released by | Refused or safe when |
+| --- | --- | --- | --- | --- |
+| export table | `evaluateExport` success, in one protected call | the VM closes | VM close; released at once if the evaluation fails afterwards | foreign owner `ExportHandleForeign`; slot not held `ExportHandleStale`; closed `VmClosed` |
+| failed record | evaluation or return-shape failure, oversize source | the VM closes | VM close | holds no Lua value; counts against the ceiling |
+| in-progress record | before the chunk starts | the call returns | replaced by the outcome; a failure or cancellation marks it failed (a failure before the chunk starts removes it) | never observable from another call |
+| capture | `captureBehavior`, the one store being the last step | `releaseBehavior`, or the VM closes | `releaseBehavior` (idempotent), the instance's end, VM close | foreign `CaptureHandleForeign`; released or never made `CaptureHandleStale`; closed `VmClosed` |
+| hook, `self`, facade in a coroutine | the running or suspended invocation's stack | the coroutine is closed or returns | the ending closes its coroutines before it releases the capture | a coroutine keeps them alive in Lua until then; release never invalidates a use under way |
+| temporary stack values | each call | the call returns | every call restores its entry depth, success or failure | checked by the examples' stack and registry-slot probes |
+
+Slots are issued once and never reused, so a stale handle names an empty slot and can never be
+mistaken for a later capture's. A reference count alone proves nothing about who may use a
+reference; the owner, closed-VM and slot checks above do.
+
+### What proves it
+
+`Test.Lua.Boundary.Exports` (host examples, `lua-host-tests`): exactly-one-plain-table
+refusals and sticky failure with the side effect counted by a binding; attribution and effect;
+private environment; the filtered library; independence across owners; the 256-identity and 1 MiB
+ceilings at and one past, failed records counted, instance-driver module not counted; long
+identities kept distinct; each schema refusal holding no reference; raw access (a metamethod
+installed after the fact is never called); captured functions unmoved by later edits; fresh
+`self` and shared upvalues; release, stale, forged and foreign references; two hundred
+construct-and-end cycles returning the registry and stack to where they began; every use refused
+after the lifetime; a callback's failure raised through `pcall`; and a one-byte sweep of the
+allocator's budget over an evaluation, a capture and a release that checks every reference, record
+and the stack after each failure. `Test.Lua.Opacity` adds external clients: the handles cannot be
+forged, no raw table or registry reference is reachable, and a client using the whole interface
+links and runs.
 
 ## Tasks and the coroutine library
 
@@ -2461,6 +2637,83 @@ invocations (`terminationUnstarted`), and lets go of a tick it held.
 (`ErrorCadence`, at `StageUpdate`), attributably: nothing wraps, no timer demand is left and no tick is
 held.
 
+### M1 behavior instances (opt-in)
+
+Beside the instances above, which run the hooks a global-entry module defines and are
+unchanged, an owner that hosts instances admits **behavior instances** with
+`admitBehaviorInstance`: an instance of a behavior in an [export table](#export-modules-and-captured-behaviors)
+the owner holds. The request, `BehaviorRequest`, names the export module by its identity, the
+field of its table that holds the behavior, the **facade** the instance is injected with, and the
+application's rule that resolves the behavior's cadence from what its table read as. The facade is a
+`BehaviorFacade`: data (`FacadeData`), the table an export module holds (`FacadeShared`), or what a
+function an export module holds builds from a value for this instance (`FacadeBuilder`), so a facade can
+carry closures bound to its instance; the export modules it names are looked up by identity when the
+instance starts. It has no event
+grants and no connections, is no one-shot, and is admitted with the same live place and result
+reservation as any instance. `InstanceRequest`'s constructor and every existing caller are untouched.
+
+The owner's thread does the rest when it starts the instance, in this order and before any hook:
+
+1. find the export module (`retrieveExport`): none held is `ErrorExportMissing`; one that failed is
+   `ErrorExportFailed`, the module's own sticky fault;
+2. select, validate and capture the behavior (`captureBehavior`): a table that does not fit is
+   `ErrorBehavior`, a facade past the owner's value limits or an allocation that fails is
+   `ErrorFault`;
+3. resolve the cadence: the rule is applied to the shape once. A refusal, an interval that does not
+   resolve (exactly or not at all, as at any admission), an interval for a behavior with no `update`,
+   and an `update` with no interval are each `ErrorCadence`;
+4. run `init(self, api)` when the table has one, where `api` is the same table as `self.api`, the
+   facade. An absent `init` is a successful empty initialization, and `self.api` exists regardless.
+
+Each of 1 to 3 fails the instance at the stage **`StageConstruct`**, distinct from an `init`
+failure (`StageInit`) and from a module's failure, with no hook run, `shutdown` skipped as for any
+instance whose `init` never succeeded, and whatever was captured released. A failure at `init`
+is `StageInit` as always, and runs no later hook.
+
+An instance without an `update` hook has no cadence: it stays alive until it is stopped, has no
+public event subscription, and is not a new natural-completion mode. One with an `update` hook
+is periodic on the interval the rule resolved, through the same cadence machinery, scheduler and
+`dt` as any periodic instance: logical `dt` is the duration granted since the last update finished, and
+an elapsed refresh merges late demand and is handed the actual elapsed time, independent of
+rendering. `update(self, dt_seconds)`, `shutdown(self, reason)` with the strings `stopped`,
+`failed` and `completed`, one invocation at a time, pause, resume, stop, the suspension of an
+`update` in a wait and the refusal of a wait or yield in `init` and `shutdown` are all the existing
+instance contract.
+
+**Hooks are captured, not looked up.** The driver, a module of the owner's loaded beside the
+instance driver's, is called with the captured hook, `self` and the facade pushed after it, so
+nothing is looked up again by field or global: replacing a field of the behavior, replacing the
+role table or editing a cadence field afterwards changes nothing an instance does, and a later
+instance reads the table as it is then. Mutable upvalues stay Lua. The legacy instance driver's
+`api` (`connect`, `subscribe`, `unsubscribe`) is **not** handed to a behavior and is not part of this
+surface; the one binding the behavior driver calls is the instance layer's own `delta`.
+
+**Progress.** An `init` that is entered and then interrupted by a failure of the host or a cancellation
+settles the instance as *started* (`Discard … Started`) with `shutdown` skipped, as for the legacy path;
+the behavior path records this itself, separately from the legacy driver's record, which a behavior
+never makes.
+
+**The behavior driver and the module bound.** The driver that runs captured hooks is a module of the
+owner's like the instance driver, and counts against the same `maxModules` bound. It is loaded only
+for an owner that holds export modules (`vmExports`), so an owner that hosts instances and holds none
+keeps every module slot it had: 255 application modules and the instance driver still fit.
+`admitBehaviorInstance` on an owner without one fails at construction with `ModuleNotLoaded`.
+
+**Release.** What an instance captured is released whichever way it ends: after its `shutdown`
+decision, with the rest of what the instance holds, on the owner's thread and without entering
+Lua, so Lua being unsafe to enter keeps no reference. A release that fails is cleanup evidence
+that ends the owner, as a lease release's does. An invocation still running or suspended keeps its
+values alive in Lua until its coroutine is closed, which an ending does first.
+
+`Test.LuaRuntime.Instance.Behavior` runs these on real supervised scheduled owners under the
+injected clock and fake timer: the hooks, self and facade; shared upvalues and a peer outliving
+another's end; the capture surviving every later edit while a later instance captures what is
+there; no-update behaviors; every construction refusal at `StageConstruct` with no hook run; a
+failed `init` and its references let go (read by a weak table, since a captured `self` is
+reachable only through its capture); waits refused in `init` and `shutdown`; a suspended `update`
+closed on stop; an `update` failure ending only its instance; an elapsed update on the owner's clock;
+and the ceilings on an instance-hosting owner, at 256 identities and a 1 MiB source and one byte over.
+
 ### Failure and escalation
 
 A failed `init` fails that instance: no `update`, `run`, callback or `shutdown` ever runs on it, its
@@ -2469,6 +2722,11 @@ instance, its owner, its source module, the phase, the stage, the error and the 
 captured; the `init` error is primary, nothing later replaces it, and what else failed while it ended is
 kept beside it (`failureSecondary`). There is no retry. An unhandled error in `run` or a callback fails the
 instance the same way, except that `shutdown` runs with the reason `failed`.
+
+A required request that settled with an expected failure fails its instance too, with `ErrorRequest` (the endpoint and
+the failure attributed to the request): it is latched when the failure becomes eligible, whether or not the script
+ever read the request, and applied at the owner's next safe boundary, before any more of the instance's ordinary work
+(see [Atomic request admission](#atomic-request-admission)).
 
 Isolation is the default: the instance ends and the owner's other instances run on. The engine cannot
 tell whether state the instances share was damaged, so the application is told of each failure on the
@@ -3149,6 +3407,157 @@ and the cancel came first, the order of the places, holds shared between request
 determinism across arrival orders; and epochs. The protocol model's holders are pinned in `lua-host-tests`. The
 cancellation and cleanup windows are the kind an asynchronous-exception race can hide on one platform, so CI, which runs
 them on Linux, is the evidence for them and a local pass is not.
+
+## Atomic request admission
+
+`Hetoimasia.Scripting.Lua.Admission` (LFE-7, in `runtime-lua`) is the other way to start a request, and the only
+way a full bank is an answer and not a refusal. It is **opt-in, per request**: a binding's author asks
+`startAdmitted` with an `Admission`, and nothing else changes. The generic `startRequest`, `requestBindings`,
+`RequestGrant`'s defaults, the full-capacity refusal that fails the call (`Test.LuaRuntime.Request.Admission` pins
+it), subscriptions, the runner and every existing example keep their meaning beside it. Core `scripting-lua`
+imports nothing of `lua-engine`, content, graphics, the console or a game; the profile's limits and the M1
+records are [`hetoimasia-lua-engine`'s](../lua-engine/README.md#the-m1-request-adapter), which passes them in.
+
+### What asking reserves
+
+`startAdmitted` takes one transaction (`admitOptIn`), and only after it commits asks the provider anything. In it:
+
+| Bank | Owner of the count | Reserved by | Refused as |
+| --- | --- | --- | --- |
+| Request record and terminal-result storage | the protocol model's session | `acceptRequestFor` | busy (`BankOwnerRequests`) when the model's cap is reached |
+| Accepted, unretired requests of the instance | the service's ledger (`pHeld`) | an entry for the request | busy (`BankInstanceRequests`) |
+| Accepted, unretired requests of the VM | the same ledger | the same entry | busy (`BankVmRequests`) |
+| The owner's places (the grant's bound) | the same ledger | the same entry | busy (`BankOwnerRequests`) |
+| A result lease | `Leases`, the instance's lease capacity | `reserve`: a slot in `SlotConstructing` with the key the handle will have | busy (`BankLeases`) |
+| Provider credits | the provider's own STM variables | each `Credit`'s `creditReserve`, in the order declared | busy (`BankCredit`) |
+| The due position, for an owner on logical time | the scheduler's tick | `DueSlot (tick + offset) (request number)`, and the owner's hold on that tick | permanent refusal |
+
+A bank without room, or a permanent fact, raises inside the transaction and `catchSTM` undoes everything reserved
+before it: there is **no** handle, hold, credit, lease slot or counter left, the provider was asked nothing and the
+instance has no latent failure. That is the whole mechanism: no capacity is queried and then used, no exception is
+caught and relabelled, and no retry is queued. The order of the decisions is the contract: the owner or requester is
+not taking requests, the requester is a task, the request numbers are exhausted, an offset on an owner on arrival,
+an offset that is not positive, a tick and offset past the ceiling, a position that has begun, then the banks in the
+table's order. A credit that retries is full (`orElse`), so a provider's bank can never make the admission wait.
+
+Classification, which the tests pin separately:
+
+| What | Answer |
+| --- | --- |
+| A temporary bank is full | `Unavailable bank`: data. The binding hands the script `nil, {code="busy", message=TEXT}`. Never an error, never the instance's failure; a later call may succeed |
+| A permanent fact (wrong requester, closing, offset, ceiling, exhausted numbers, no lease scope) | `RequestRefusal`, a fault of the call raised before anything was reserved. A binding that wants an ordinary Lua error asks `preflightAdmission` in a [`withArgumentCheck`](#recoverable-refusals), which decides the same facts and reserves nothing |
+| The engine cannot keep its bookkeeping consistent after a valid admission (`AdmissionDefect`: the request counter has no number after the last, a result lease reserved with no way to hand its handle to the script) | a failure of the host, raised from the transaction; nothing is reserved |
+| A bank, provider or assignment that raises | the application's own failure, with its type; nothing is reserved. A provider that raises when handed the request is taken back whole, and a credit release that then raises is kept beside it |
+
+### When a bank comes back
+
+The ledger holds one entry for each accepted request, from its admission until its result has been taken or discarded
+**and** its provider's work has been reaped as retired. Losing the Lua reference, waiting, cancelling and the
+provider's reply do none of that alone. The entry is written by the admission and by transactions on the **owner's**
+thread, never by a provider's completion; that is how the credits a native thread frees reach a logical owner's
+admission only at an accounted boundary (`D-77`).
+
+| Event | Where it is accounted | What becomes visible to admission, and when |
+| --- | --- | --- |
+| Take of a terminal result, provider work already reaped | `takeTerminal`, on the owner's thread inside the Lua call | the places and credits, immediately: the next ask of the same call sees them |
+| Take of a terminal result, provider work still running | `takeTerminal` | nothing; the entry stays charged |
+| The provider proves its work over (reply, or its retirement reading) | the owner's next boundary: `sweepWorks`, `reapWorks`, then `releaseSettled` | the places and credits of a request already taken, at that boundary and not before; a retirement completed on a provider's thread is invisible until then |
+| The requester ends | `endRequesterSTM`, then `releaseSettled` | the requests it did not collect are discarded; their entries leave as their work is reaped |
+| An epoch change, the owner's exit | `advanceEpochSTM`, `closeSTM` | as above; what is cancelled for a script to take stays charged until it is taken |
+| An admission taken back (the provider could not be handed the request) | `withdrawAdmission` | everything at once: credits returned `CreditUnused`, the lease discharged |
+| A retirement that fails | the work's retained failure | nothing, ever: the place and credit stay charged and the failure is cleanup evidence |
+
+A `Credit` is returned once, with the reason (`CreditUnused` or `CreditSettled`), except one that `creditTransfers`
+and whose request succeeded with a resource: that credit is the resource's, and the provider's own release of the
+resource gives it back. A reserved lease nothing will use (the request failed, was cancelled, or got a result with no
+resource) is discharged by the same boundary once the provider's work is retired and the request has settled or
+gone; one that was adopted is the instance's live resource and is not touched. `rdHeld`, `rdHeldBy` and `rdBusy`
+read the ledger.
+
+### The reply, the resource and the defect
+
+A request admitted this way takes the service's contract for its reply (`checkReplyFor`):
+
+* a `ProviderResult` is checked against the owner's value limits and the endpoint's schema, the value against the
+  admission's ceilings, and the record a script is handed (the admission's frame) against the owner's;
+* a `ProviderExpected` failure must carry a code the admission lists, a root and path within their byte bound, and
+  an envelope that fits: a message is cut at a character, visibly (`...`), to its bound until it does;
+* a `ProviderResource value recipe` is a result whose resource the instance is to own: the owner builds the recipe
+  into the lease the request reserved on its own thread, uninterrupted, through the capability it holds
+  (`adoptReserved`), at its next boundary, and only then holds (on logical time) or settles the result. A cancel
+  that comes first drops an unclaimed recipe (the resource stays the provider's to retire); one that comes while the
+  recipe is being built finds the resource built and the owner releases it at once (`pDiscards`); a recipe that raises
+  rolls its stages back, gives the reservation back and is a failure of application code;
+* anything else (a `ProviderFailure` with no code, a code the service does not supply, a result over the ceilings or
+  of another shape) is a **provider defect**: `ReplyDefective`. It is never a failure of the request, never given a
+  code, never an optional content failure and never retained. It is recorded (bounded, at most sixteen), the work is
+  proved over and the request stays unsettled; the owner raises it as a failure of the host
+  (`ProviderDefect`) at its next boundary, under its policy, for a required and an optional request alike. The
+  generic `requestBindings` path keeps settling a malformed or oversized reply as a `ValidationFault` failure.
+
+### Timing
+
+On an owner on logical time the request's position is fixed once, inside the admission, from engine-owned values:
+the tick is 0 for an instance whose `init` is running and the owner's current tick otherwise (D-67), the offset is the
+admission's (default 1), and the sequence is the request number the same transaction issues. The tick and offset are
+added as integers and checked against `admitLogicalMaximum` (2^63 − 1 for M1) **before** acceptance, as is the
+request number. Numbers are never reissued and never wrap; a position the owner has begun is refused. The
+application's `AssignRequest` is not consulted for these requests, so there is no read-then-admit gap. A reply that
+arrives before its position is held and invisible to `ready`, `take` and `wait`; a late one holds the tick; a cancel
+before the position wins, whatever the provider delivered, discards the held value and releases the hold. An owner on
+elapsed time takes no offset and settles first-come. `RequestInfo` carries the metadata to the provider
+(`infoNecessity`, `infoSource`, `infoOffset`, `infoDue`). `skipRequestNumbers` moves the counter forward to bring it
+to its ceiling in a qualification without issuing every number before it.
+
+### Required failure
+
+An expected failure of a request admitted `RequiredRequest` becomes eligible when it settles: at the reply on an
+owner on arrival, at the position's tick on logical time. At that point the requester's cell gets `isRequestFailure`
+and one `JobDispatch`, and the owner fails the instance with `ErrorRequest` at its next safe boundary, before any
+more of the instance's ordinary work and without preempting a segment. The latch is the owner's, set in the
+transaction that made the settlement eligible; nothing a script does afterwards (reading, not reading, a caught
+`take` or `ready` error, a late `cancel`, which answers `already_settled`) touches it. A cancel that won before
+eligibility prevents it, and a held failure is discarded unseen. `OptionalRequest` leaves the failure a result for the
+script. The failure reaches the application the way every instance failure does, through `instanceEscalate`; session
+and role escalation are the application's.
+
+### Handles and phases
+
+`admittedHandleType` (over the `RequestHandles` the owner is given with `scheduledRequestHandles`, made before the
+owner and taken by it, as the leases are) declares the handle capability type: a handle is live for the instance that
+holds it while its request exists. A handle that is another instance's, spent by a take, or never issued is refused
+by the value boundary before any action as a handle that has ended; the check reads the running instance, not
+anything a script supplied. `callerPhase` tells a precondition whether an instance is initializing, serving or
+ending: `wait` is for a serving instance, and an instance in `shutdown` is not taking requests.
+
+### Owners, threads and lifetimes of what this adds
+
+| State | Owner | Written by | Read by | Lifetime |
+| --- | --- | --- | --- | --- |
+| `pHeld` (the ledger) | the service | the admission; the owner's thread (`takeTerminal`, `releaseSettled`, ending); never a provider | admission | from admission until taken or discarded and the work is reaped |
+| `Rec` metadata (`recAdmission`, `recFailure`, `recLease`, `recAdopted`) | the service | admission; the reply; adoption | settlement | with the record |
+| `pAdopting` | the service | a provider's reply (insert); the owner (claim, finish) | the owner's boundary | until built, failed or the request ends; a claimed entry is not dropped under the builder |
+| `pDiscards` | the service | `cancelOf`, the epoch | the owner's boundary | until released |
+| `pDefects` | the service | a provider's reply | the owner's boundary | until raised; at most sixteen |
+| `isRequestFailure` | the instance's cell | the settlement that made a failure eligible | the owner's dispatch | until applied, once |
+| `RequestHandles` | the application | the owner binds it | the value boundary's liveness check | with the owner; serves one |
+
+### What proves it
+
+`Test.LuaRuntime.Admission.*`, in `lua-runtime-tests`, run real instances on real supervised scheduled owners that
+lend their collection, hold leases and answer handle liveness, with the fake provider of the request examples, fake
+credit banks and fake lease resources, an injected clock and gates, never a sleep: each bank exhausted alone and in
+combination with zero left behind, competing admissions, a full ordinary bank that still drains; the release points
+(take before retirement, retirement before take, a retirement completed on a provider's thread invisible until the
+boundary, a lost reference, an instance that ends, a failed retirement, an admission taken back); the position
+(init at tick 0, default and explicit offsets, same-tick sequence order against reversed replies, a late provider
+holding the tick, the offset refused on arrival, the ceiling and exhausted numbers, an engine failure when the counter
+has nowhere to go); required and optional failure with the latch independent of reads, caught errors and late cancels;
+every kind of defect; the result lease built, kept live after a take, released with the instance, discharged unused and
+released when cancelled after adoption; immediate completion during submission, revocation during the handoff,
+late, duplicate and unknown completions, and a disposal that fails; and handles across two instances. `lua-host-tests`
+pin `withArgumentCheck`. The cancellation and cleanup windows are the kind an asynchronous-exception race can hide on
+one platform, so CI, which runs them on Linux, is the evidence for them and a local pass is not.
 
 ## Provider events
 

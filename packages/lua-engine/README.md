@@ -1,28 +1,35 @@
 # hetoimasia-lua-engine
 
-The Lua-first engine's **pure configuration boundary** (LFE-3 of
+The Lua-first engine's **configuration boundary and role policy** (LFE-3 and LFE-8 of
 [the design](../../docs/designs/lua_first_engine_design.md)): a strict parser for
 the format-1 launch manifest `hetoimasia.json`, from supplied bytes to a
-resolved role, entry and tick configuration, and the **fixed M1 profile** of
-limits with validated, smaller test profiles.
+resolved role, entry and tick configuration, the **fixed M1 profile** of
+limits with validated, smaller test profiles, and the **M1 behavior selection**: which
+export field each role selects, the exact cadence rules and the export-module ceilings.
 
-It opens no folder, reads no file, starts no Lua, worker, window or GPU, prints
-nothing, exits nowhere and performs no IO. Every function is pure and returns
-a plain value or a bounded refusal.
+The library opens no folder, reads no file, starts no Lua, worker, window or GPU,
+prints nothing, exits nowhere and performs no IO. Every function is pure and
+returns a plain value or a bounded refusal. The **M1 request adapter**
+(LFE-7) is the `request` sublibrary beside it, in a source directory of its own
+so that this one stays pure: see [below](#the-m1-request-adapter).
 
 The library depends on `hetoimasia-foundation` (its `Duration`, checked
-nanoseconds from 1 to 2^64 − 1) and on `array`, `base`, `bytestring`,
-`containers` and `text`. It depends on no GLFW, Vulkan, console, sample or
-game package, and it imports no module that performs IO. Later slices add
-the content layer (LFE-4 to LFE-6), Lua adapters and role composition to this
+nanoseconds from 1 to 2^64 − 1), on the Lua host and its runtime
+(`hetoimasia-scripting-lua` and its `runtime-lua` sublibrary, for the behavior
+selection only: the manifest and the profile import nothing of them) and on `array`,
+`base`, `bytestring`, `containers` and `text`. It depends on no GLFW, Vulkan, console,
+sample or game package, and it imports no module that performs IO. Later slices add
+the content layer (LFE-4 to LFE-6) and the rest of the role composition to this
 package; they are not here.
 
 | Module | Contents |
 | --- | --- |
 | `Hetoimasia.LuaEngine.Manifest` | `parseManifest`, `parseManifestWith`; `Manifest`, `RoleSelection`, `declaredEntries`; every refusal type |
 | `Hetoimasia.LuaEngine.Profile` | `fixedM1Profile`, `validateProfile`; the limit types and their accessors; the derived values |
+| `Hetoimasia.LuaEngine.Behavior` | `behaviorField`, `exportLimits`, `cadenceOf`, `behaviorRequest`; `CadenceRefusal` |
+| `Hetoimasia.LuaEngine.Request` (sublibrary `request`) | the M1 request policy over a validated profile and the exact common result adapter: `m1Requests`, `startM1`, `m1ArgumentCheck`, `m1RequestBindings` |
 
-Every other module is hidden. A client imports these two.
+Every other module is hidden. A client of the pure boundary imports the first three.
 
 ## The manifest
 
@@ -209,13 +216,140 @@ attainable.
 | `OutputWithinTextureBytesPerUi`, `TextureBytesPerUiWithinSession`, `OutputWithinPipelineWorkspace`, `InflatedScanlinesWithinPipelineWorkspace` | one image's output fits a UI instance's bytes, which fit the session's, and fits the pipeline workspace with the inflated scanlines |
 | `FrameSlotsAggregateHoldsWindow`, `FrameSlotsAggregateWithinTargets` | the aggregate holds one window's slots and no more than all targets could use |
 
+## The M1 behavior selection
+
+LFE-8 adds the policy that sits over the Lua runtime's generic behavior mechanism
+([`hetoimasia-scripting-lua`](../scripting-lua/README.md#export-modules-and-captured-behaviors)).
+That mechanism evaluates an export module, keeps its returned table in the VM, validates a behavior's
+fixed schema and captures its hooks for an instance; it knows no role. This module is the M1 choice made
+over it, and it is as pure as the rest: it evaluates nothing and starts no VM. It imports only the
+Lua host's and runtime's public modules, which a boundary example checks.
+
+| Function | What it decides |
+| --- | --- |
+| `behaviorField role` | the export field a role selects: `gameplay` or `presentation`, read by raw access; nothing else in the table is looked at |
+| `exportLimits profile` | the source and identity ceilings of a VM's export modules, from the profile: `ModuleSourceBytes` (1 MiB) and `ModuleIdentitiesPerVm` (256), failed and in-progress ones counted |
+| `cadenceOf role shape` | the interval a behavior's `update` falls due on, from what its table read as, or the first `CadenceRefusal` |
+| `behaviorRequest role identity label facade name class` | the request that admits an instance of a role's behavior: the field, the injected facade and the role's rule |
+
+The role and the facade are the caller's: the assembly supplies the role, and the facade is the narrow
+per-instance value the later service package builds. Nothing a module's returned table says chooses
+either. The manifest's tick duration keeps its full positive 64-bit range: gameplay's cadence is a whole
+number of ticks of whatever tick duration the owner was configured with, and nothing here defaults or
+changes one.
+
+### Cadence
+
+Applied to a behavior that has an `update` hook. A behavior without one has no cadence, stays alive until
+it is stopped, and has neither cadence field: either is an error (`CadenceWithoutUpdate`).
+
+| Role | `every_ticks` | `every_seconds` |
+| --- | --- | --- |
+| gameplay | optional, default 1; a Lua **integer** from 1 through 2^63 − 1 | refused (`FieldNotAllowed`) |
+| presentation | refused (`FieldNotAllowed`) | **required**; a Lua integer or float, finite and positive |
+
+* A tick count must be an integer. An integer-valued float such as `1.0`, a numeric string, zero, a negative
+  number and a table are refused (`TicksNotInteger`, `TicksNotPositive`); nothing is coerced. 2^63 is not an
+  integer (Lua reads it as a float), so overflow is refused too.
+* Seconds convert **exactly**: the value the Lua number represents (an integer's, or the exact rational a
+  double is) times 1,000,000,000, rounded **upward**, must be a positive 64-bit count of nanoseconds
+  (`SecondsTooLarge` otherwise). The conversion is `Integer` arithmetic, never a floating product that could
+  overflow or round down, and never the source literal: `0.1` is the nearest double to a tenth, which is
+  slightly above it, so it converts to `100000001` ns. A positive input below a nanosecond is one nanosecond,
+  never zero. There is no default interval for a UI.
+* The result is an `Interval` (`LogicalTicks`, or `ElapsedEvery`) the runtime resolves exactly or not at all
+  through its existing scheduler; there is no new timer and no change to `dt`.
+
+### What proves it
+
+`Test.LuaEngine.Behavior`: the field of each role; the limits from the fixed profile and a smaller validated
+one; the gameplay endpoints (1 and 2^63 − 1), the refusals of zero, negatives, floats of any value, strings and
+tables, and of seconds; presentation's mandatory interval, finite and positive checks, sub-nanosecond input
+rounded upward, `0.1`, the largest accepted count and the first refused one, checked against an independently
+written integer oracle over the doubles on both sides of the boundary and across a spread of magnitudes; the
+no-update behaviors; and the request carrying the role's rule.
+
+## The M1 request adapter
+
+`Hetoimasia.LuaEngine.Request` (LFE-7, sublibrary `request`) is M1's policy and result adaptation over the host's
+opt-in admission, [`Hetoimasia.Scripting.Lua.Admission`](../scripting-lua/README.md#atomic-request-admission). The
+host supplies the mechanism: one transaction that reserves a request's places, result lease and provider credits
+together or answers busy with nothing reserved, the timing assignment, the required-failure latch, the one-shot
+settlement and the cancellation race. This module supplies what is M1's. It depends on the profile, on `scripting-lua`
+and its `runtime-lua` and on base libraries, imports no private module of the host, and imports nothing of a game, a
+window, a GPU, the console or the content layer. It implements **no service**: a texture, data, module or window
+service builds its own request-producing binding from `startM1`, with its own endpoint, expected failure codes,
+credits and lease, and assembles the four operations under `api.request`.
+
+### Policy from the profile
+
+`m1Requests profile handles` reads, once, from a validated `Profile`: 16 accepted, unretired requests per instance
+and 64 per VM (`RequestsPerInstance`, `RequestsPerVm`; the 64 is **not** reduced to the 32 two instance slots reach, so
+the aggregate refusal is exercised with a validated smaller profile), the copied-value ceilings (`CopiedValueBytes`,
+`CopiedValueDepth`, `CopiedValueElements`), the 2 KiB message (`MessageBytes`), the path bound (`PathBytes`) and the
+numeric ceiling (`LuaIntegerMaximum`, 2^63 − 1: the largest tick, offset and request number). A smaller injected
+profile reaches the adapter only through `validateProfile`.
+
+### What a script sees
+
+A request-producing call, written by a service, is a dot call and answers two values: `request, nil` when accepted,
+or `nil, {code = "busy", message = TEXT}` when a temporary bank had no room (`m1StartResults`, `m1StartSchemas`). Busy
+is data: not an error, not the instance's failure, with no handle, provider action or partial reservation; a later
+call may succeed, nothing retries it, and the message is bounded by `MessageBytes`.
+
+The request is an opaque handle owned by the instance that made it, including across two instances of one VM
+(`m1HandleType`, over the `RequestHandles` the owner is given). The four operations (`m1RequestBindings`):
+
+| Operation | Answers |
+| --- | --- |
+| `ready(r)` | a Boolean; consumes nothing |
+| `take(r)` | `{status="pending"}`, consuming nothing; otherwise exactly one fresh record, and the handle is spent: `{status="success", value=VALUE}`, `{status="failure", error={code=CODE, message=TEXT, root=ID, path=PATH}}` or `{status="cancelled"}` |
+| `cancel(r)` | `"cancelled"` when this call won the settlement, `"already_settled"` when the request had settled |
+| `wait(r)` | no values; suspends cooperatively without blocking the VM thread and consumes nothing; refused in `init` and `shutdown` before waiting |
+
+Only the fields of the variant are present. A content failure carries `root` and `path`; a window failure omits them.
+The message is bounded diagnostic detail, cut at a character with a visible `...` to the profile's bound, and the whole
+envelope is measured against the owner's limits when the reply is accepted, so a settlement that is retained is one
+that can be delivered. Wrong arity, wrong type, wrong kind of handle, another instance's or a spent handle, and a wrong
+phase are ordinary Lua errors raised before any provider action (`recoverableRefusals`, and a precondition for the
+phase); an invocation that catches one can still succeed, and it cannot clear a required failure that was latched.
+Cancellation is itself a terminal result to take. The codes of a service's failures are the service's
+(`askCodes`); this module does not classify filesystem or image failures.
+
+### Permanent refusals
+
+Wrong role, phase or ownership, a malformed or unrepresentable offset and exhausted request numbers are permanent:
+ordinary Lua errors with no handle and no work, never busy. A service composes `m1ArgumentCheck` into its
+request-producing binding with `withArgumentCheck`, which decides them from the copied argument values and the
+engine's own state, before the action. A permanent refusal of the service's own (a second window while one is held, say)
+is a check of its own beside it, and stays distinguishable from a bank that is merely full. Exhaustion or arithmetic
+that fails after a valid admission is an engine failure, never a retroactive busy.
+
+### What is not here
+
+The content, data, module and texture services and their providers, the window service, the two-role startup and
+failure coordinator, session and role escalation, time and output APIs, native resource banks and retirement, real
+pacing and any claim of replay or cross-platform determinism. Fake providers prove the reservation and runtime
+boundary here, not later real-provider accounting.
+
+### What proves it
+
+`Test.LuaEngine.Request.*`, in `lua-engine-tests`, run real instances on a real supervised scheduled owner with a
+controlled fake provider, fake credit banks and fake lease resources, bindings written the way a facade writes them,
+and validated smaller profiles: the busy record and its bound; 16 per instance at the fixed profile and the VM bound
+through a profile whose instance bound is below it; every variant of the four operations; wrong phase, handle and
+kind; the texture lease built and kept live after a take; the numeric ceiling and the request numbers from the
+profile; the message, path and copied-value bounds, where a reply that breaks them is a provider defect and never an
+envelope; a service's own permanent refusal said apart from busy; and required and optional failure through the
+adapter. They build every fixture beside the suite from public host modules; none is imported from the host's suites.
+
 ## Deferred, by design
 
 Not here, and not claimed: opening `hetoimasia.json`, anchored roots, the full
 literal Unicode path identities, inventory and presence checks and SHA-256
 verification (LFE-4 to LFE-6); the CLI `run` dispatch and exit mapping (LFE-22);
-Lua evaluation, behavior and cadence capture, instance and service facades,
-workers and session startup; live codec, texture and GPU budgets and their
+the loader and import resolution (LFE-9), the concrete content, time, graphics and status
+service facades (only the request adapter's common operations are here) and their metadata and grant policy (LFE-12), workers and session startup; live codec, texture and GPU budgets and their
 enforcement; time sampling and scheduling; mods, metadata extensions, alternate
 manifest formats, defaults or relaxed parsing.
 
@@ -227,8 +361,10 @@ manifest formats, defaults or relaxed parsing.
 cabal test --project-file cabal.project.cpu hetoimasia-lua-engine:lua-engine-tests --test-show-details=direct
 ```
 
-It performs no IO and starts no Lua, window or GPU. It covers the accepted
+The manifest, profile and behavior examples perform no IO and start no Lua (the Lua host's behavior
+mechanism is tested in its own suites); the request adapter's examples start real Lua instances on a real
+supervised owner, with controlled fake providers, and no window or GPU. It covers the accepted
 examples, every syntax and schema refusal with the limits at their boundary and
 one past, the exact tick endpoints and forbidden forms, every fixed value against
 an independently written expectation, valid smaller profiles and refused ones,
-and this package's dependency and import boundary.
+the behavior selection's cadence rules and numeric boundaries, the request adapter (see above), and this package's dependency and import boundary.
