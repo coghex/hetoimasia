@@ -11,9 +11,10 @@
 -- binding that is not opted in latched is never erased by a later success.
 module Test.LuaRuntime.Recoverable (spec) where
 
+import Control.Concurrent (yield)
 import Control.Concurrent.MVar (readMVar, tryPutMVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), throwIO)
-import Control.Monad (void, when)
+import Control.Monad (unless, void, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
@@ -64,6 +65,7 @@ import Test.LuaRuntime.Support
   , withBoundaryOpening
   )
 import qualified Test.LuaRuntime.Support as Finite
+import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (ThreadBlocked), listThreads, threadStatus)
 
 -- The registration ---------------------------------------------------------------
 
@@ -161,6 +163,21 @@ unusedOpen ∷ IORef Bool
 unusedOpen = error "this owner's example reads no engine state"
 {-# NOINLINE unusedOpen #-}
 
+-- | Deliver a cancellation and wait until it is demonstrably pending: the helper that
+-- throws it is blocked delivering it to an owner that is inside a foreign call. Releasing
+-- a callback after this is releasing it with a cancellation queued, never before.
+cancelPending ∷ IO () → IO ()
+cancelPending cancel = do
+  before ← blockedThrowers
+  cancel
+  let wait = blockedThrowers >>= \now → unless (now > before) (yield >> wait)
+  wait
+  where
+    blockedThrowers = do
+      threads ← listThreads
+      statuses ← traverse threadStatus threads
+      pure (length [() | ThreadBlocked BlockedOnException ← statuses])
+
 call ∷ OwnerEndpoint → Text → [Value] → IO CallTicket
 call endpoint entry arguments = submitCall endpoint (ModuleRef "recov" "1") entry arguments >>= accepted
 
@@ -221,7 +238,7 @@ finiteSpec = describe "a finite call" $ do
       owner ← startOwner runtime (finiteOwner fixture "cancelled" requiredPolicy)
       inflight ← call (ownerEndpoint owner) "blocked" [VText "go"]
       Finite.awaitEntered fixture "go"
-      cancelOwner owner
+      cancelPending (cancelOwner owner)
       Finite.releaseGate fixture "go"
       awaitTerminal control owner >>= (`shouldSatisfy` \case WorkerStopped → True; _ → False)
       settleOutcome inflight >>= (`shouldSatisfy` isDiscard ExitCancelled Started)
