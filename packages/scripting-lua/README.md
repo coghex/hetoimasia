@@ -965,6 +965,119 @@ just as observable. A Haskell failure raised by the action itself keeps #460's
 contract and is not converted: it is re-raised at the owner's boundary with its
 own type and context.
 
+### Recoverable refusals
+
+A binding is **generic** unless its registration opts it in: every refusal above is a
+fault of the call a script cannot hide. Two public functions of
+`Hetoimasia.Scripting.Lua.Registration` opt one binding in, and nothing else does; there is
+no owner-wide or catch-all switch.
+
+- `recoverableRefusals binding` makes the refusals the host makes **before the action** an
+  ordinary Lua error: a wrong number of arguments, a value of the wrong shape, type or
+  encoding, a value past a limit, and a capability that is not of the declared type, was
+  not issued by this VM, or that the application's own check reports retired.
+- `withPrecondition check binding` does that too, and has `check` run first. A precondition
+  is `OwnerContexts -> IO (Maybe Text)`: `Nothing` lets the call go on, `Just reason`
+  refuses it. It runs before the host asks whether a scheduler operation can suspend and
+  before any argument is read, so an adapter can refuse a wait made where it is not allowed
+  (a finite call, a hook that may not wait, the wrong instance) before the host reports
+  anything. Several preconditions run in the order they were added, and the first refusal
+  wins.
+
+**What the script sees.** An ordinary Lua error whose value is a string,
+`binding: reason`, where `binding` is `namespace.name` and `reason` is at most 256 bytes
+(`refusalReasonLimit`, the bound of a command's rejection) of UTF-8, cut at a character.
+The host's own reasons are short fixed phrases, for example
+`checked.add: argument 1: a float where an integer is declared` or
+`checked.echo_list: argument 1[2]: expected number, found string`; anything of the script's
+own in them, a field name, is cut to 32 characters first, so nothing unbounded is copied. A
+precondition's reason is its own and is carried whole when it is within the bound. One
+longer is not truncated: it is a defect of the application, and is a typed
+`BoundaryFault` of the call (`ValueRefused`, `RuleBytesLimit 256`) whether or not the
+binding is opted in. `pcall` catches the error and the invocation goes on and can succeed;
+raised and uncaught it is the script's own error, reported where any is reported
+(`LuaFault`, or `ScriptFailed CallFailed` for a call or task), and under the task's, call's
+or instance's existing policy. There is no `BoundaryFault` and nothing retained on the VM
+for it.
+
+**No action.** A refused call never ran its action: no provider or native work, no
+request accepted, no resource published, and the action counter of the examples stays at
+zero. It is not a rollback: what the same invocation's earlier Lua and earlier actions did
+stands.
+
+**Where the facts come from.** A precondition checks engine-owned state: the
+`OwnerContexts` it is handed (the lifecycle and request contexts the owner was configured
+with, never a value the script supplied) or what the application captured when it built the
+registration. It never reads an argument, a Lua-visible table or a global registry, so a
+script rewriting a global, a field or a metatable cannot change what it decides: the
+same-VM, wrong-instance example rewrites every Lua-visible name it can and is still
+refused. Validation runs no authored metamethod and no coercion: the reader that copies
+arguments is the one every binding uses.
+
+**Error versus data.** A refusal is an error. A *response* is data. A binding whose action
+declares results `[SOptional x, SOptional (SRecord [("code", SText), ("message", SText)])]`
+and returns `nil, {code = "busy", message = text}` has answered, successfully, that it
+admitted nothing: the call is an ordinary success, the checked, bounded result path carries
+it, no handle exists, nothing is retained, and a later call may succeed. Nothing retries
+it. The host never turns its own full-capacity exception into one: that is the engine's
+refusal and keeps its own contract. What admits work atomically and owns capacity is the
+request and lease facade, not this mechanism.
+
+**What stays fatal**, opted in or not: an application's own failure (an action's, a
+precondition's, a liveness check's) with its type and context; an asynchronous
+cancellation; an internal bridge defect; an allocation or encoding failure; the refusal of
+a *result* and every failure after the action ran; the host's own refusal of a scheduler
+operation once the preconditions have passed (`SuspendRefused`, for a call that is not in a
+task, in another coroutine, or where Lua cannot suspend); and `NotYetSupported`, for a
+binding the owner has no context to deliver, which is decided before any precondition
+runs. An opted-in binding does not make its effectful action recoverable: nothing wraps the
+action, and the VM's recorded failure is never cleared. A refusal that is caught records
+nothing, so it cannot erase a fault a generic binding already recorded, a deliberately
+latched failure or an application's failure, and a later success, busy answer or caught
+refusal cannot either; the operation that ran the script still raises it, with the effect
+(`BindingRan`) of everything that followed.
+
+**Finalizers.** Lua turns an error raised in a `__gc` finalizer into a warning and tells
+nobody, so an ordinary refusal there would be silent, where a generic binding's is recorded
+and fails the operation or is kept as cleanup evidence. A refusal of an opted-in binding
+therefore keeps the recorded fault whenever a finalizer may be the caller: for every call
+made while the VM is closing, and for any call made while the collector is not running,
+which is how Lua presents a running finalizer (it answers every collector request with its
+internal stop) and also how a script that stopped the collector looks. The cost of that
+conservative reading is only that a script which stopped its own collector gets the fault
+it always got. A finalizer-eligible binding can be opted in, and the closing finalizer's
+refusal is retained as cleanup evidence exactly as before.
+
+**Compatibility.** Every binding constructor still builds the generic binding; the
+existing examples are unchanged beside the new ones, and the foreign-call protections hold
+on the new path: the message is built by the protected push that results use (an
+allocation failure is a status, never a Lua error raised from a Haskell frame), the C
+closure raises it only after every Haskell frame has returned, the stack and temporary
+references are balanced on every path, and the registration's finalizer, scheduler and
+missing-context refusals are the ones in force. A scheduler operation opted in refuses
+before it reports any suspension, and the same operation not opted in keeps the order
+and the typed fault described under [Where it cannot reach a scheduler](#where-it-cannot-reach-a-scheduler).
+
+A small client, built from the public modules alone:
+
+```haskell
+import Hetoimasia.Scripting.Lua.Registration
+
+checked, tick ∷ Binding
+checked = recoverableRefusals (snapshotQuery "double" [SInteger] [SInteger] double)
+tick = withPrecondition engineOpen (stateOperation "tick" [] [] (\_ → pure []))
+  where
+    engineOpen _ = (\open → if open then Nothing else Just "engine closed") <$> readIORef engineState
+```
+
+```lua
+local ok, err = pcall(app.double, 1.5)
+-- ok == false, err == "app.double: argument 1: a float where an integer is declared"
+print(app.double(21))   -- 42: the invocation went on
+```
+
+`Test.Lua.Opacity` compiles, links and runs exactly such a client.
+
 ### Fault evidence
 
 A `BoundaryFault` is an ordinary Haskell exception, produced with no Lua run to
@@ -1062,11 +1175,14 @@ deliver lifecycle operations); lifecycle operations delivered to an owner with a
 refused, their action never run, to one without;
 independent owners on separate threads with different policies; installation;
 discipline, with the allocator's budget swept across installation, loading,
-calling and marshalling; and the dependency closure. `Test.Lua.Opacity` adds
+calling and marshalling; the opted-in bindings' recoverable refusals
+(`Test.Lua.Boundary.Recoverable`, beside the generic ones, and
+`Test.LuaRuntime.Recoverable` under real supervision); and the dependency closure. `Test.Lua.Opacity` adds
 negative clients that forge a handle or a capability, reach for a binding's
-closure or for a Lua state, and a positive client built from the public modules
-alone that constructs a registration and an owner's policy, loads a module, calls
-an entry point and observes a typed refusal.
+closure or for a Lua state, and positive clients built from the public modules
+alone: one constructs a registration and an owner's policy, loads a module, calls
+an entry point and observes a typed refusal, and one opts a binding in to
+recoverable refusals.
 
 ## Tasks and the coroutine library
 
