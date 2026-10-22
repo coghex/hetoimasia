@@ -48,6 +48,10 @@ withEntryFile        ∷ DirectoryReader → DirectoryEntry → (FileReader → 
 nativeName           ∷ ByteString → Either NameRefusal NativeName
 ```
 
+`ContentRoot` and `ContentLimits` are abstract, and `rootReport`, `limitPathDepth` and `limitReadChunk` are functions rather than record labels, so a client
+cannot rewrite a root's report (its identity is what the cycle rule and failure
+attribution compare) or set a limit past what `contentLimits` accepts.
+
 Every result that is native-backed is borrowed: a reader exists for its callback
 and no longer. A `ByteString` returned by `readChunk` is copied out of the read
 and owns its memory, so it may be kept. There is no lazy I/O.
@@ -240,7 +244,7 @@ The scope's exit:
 1. closes admission, so an operation started from now on is refused
    (`ContentDefect RootNotAdmitting`);
 2. waits **uninterruptibly** until every operation already admitted has retired;
-3. delivers a cancellation of the exiting thread, if one is pending;
+3. if the body returned, delivers a cancellation of the exiting thread that is pending; if the body failed, its failure and the cleanup evidence it carries stay primary and the cancellation stays pending (see below);
 4. only then lets the resource scope release the root descriptor.
 
 The wait is *before* the final release and outside it, so no release body waits
@@ -252,10 +256,18 @@ operation that never returns holds its root's exit, and an operation must not
 wait for something the exiting thread would have to provide.
 
 **A cancellation of the exiting thread while it waits** does not shorten the
-wait and is not lost: it is delivered after the wait, the descriptor is then
-closed exactly once, and a failed close is retained as cleanup evidence on the
-cancellation (`CloseFailure` with kind `RootHandle`), where the caller reads it
-with `cleanupFailures`. It is never reported as missing content.
+wait and is not lost. The outcome follows the foundation's failure table:
+
+* the body returned: the cancellation is delivered after the wait as the primary
+  failure, the descriptor is then closed exactly once, and a failed close is
+  retained as cleanup evidence on the cancellation (`CloseFailure` with kind
+  `RootHandle`), where the caller reads it with `cleanupFailures`;
+* the body failed (or was itself cancelled): that exception, with every cleanup
+  failure it already carries, stays primary and is rethrown as it was captured;
+  the cancellation is not consumed and is delivered once the scope has finished,
+  as after any foundation scope whose body failed.
+
+Neither is ever reported as missing content.
 
 ### Bounds
 

@@ -16,8 +16,12 @@ or the launcher, which are not delivered by #518.
 | Toolchain | GHC 9.14.1, Cabal 3.18.1.0, Apple clang 21 | the qualified image |
 | Group | `test.content` run locally, `cabal.project.cpu` | `test.content` on the `haskell-engine` worker |
 
-The Linux column is filled by the pull request's CI run; the local column is
-what the author ran.
+The local column is what the author ran. The Linux column is the pull request's
+CI run on the validation container (head `4a0537fb`, the `haskell-engine` job):
+`content-tests` ran **114 examples, 0 failures, 2 pending**. The two pending are
+the real `chmod` cases, which a root user cannot exercise (their injected
+counterparts ran); every other example ran natively, including the real
+non-UTF-8 file name, which Linux accepts and APFS refuses.
 
 ## What the native calls did (macOS, observed)
 
@@ -77,10 +81,11 @@ No privileged mount or device was set up, and none is claimed.
 
 ## Negative controls
 
-Each change below was applied once to the final tree, the suite built and run
+Each change below was applied once to the tree, the suite built and run
 under a hard limit, and the source restored; none is committed. "Failed" counts
-the examples that went red (the Lua-free, headless suite has 111 examples and 1
-pending). Every control was caught.
+the examples that went red (the headless suite has 114 examples; 111 and 1
+pending locally on APFS when the first sixteen were run, before the two
+rounds-1 regressions below were added). Every control was caught.
 
 | Control | Change | Failed |
 |---|---|---|
@@ -100,6 +105,8 @@ pending). Every control was caught.
 | M14 | an enumerated file is opened as a plain path, not as the entry observed | 1 |
 | M15 | an intermediate component is not checked against the ancestor chain | 1 |
 | M16 | the exit closes admission after announcing the wait and does not wait | 4 |
+| M17 | a cancellation delivered after the wait replaces a failed body's exception (review round 1, P1) | 1: the failed body with cleanup evidence and a cancellation during the wait |
+| M18 | `rootReport`, `limitPathDepth` and `limitReadChunk` exported as record labels (review round 1, P2) | 2: the record-update clients |
 
 M13 is the control that matters for cleanup bounds: the exit's wait cannot be
 interrupted, so the suite runs each root scope on a child it waits for within a

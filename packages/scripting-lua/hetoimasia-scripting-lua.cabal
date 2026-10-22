@@ -326,6 +326,7 @@ test-suite lua-host-tests
         Test.Lua.Owner.Independence
         Test.Lua.Owner.Matrix
         Test.Lua.Owner.Ownership
+        Test.Lua.Owner.Profile
         Test.Lua.Owner.Scope
         Test.Lua.Owner.Shutdown
         Test.Lua.Owner.Spec
