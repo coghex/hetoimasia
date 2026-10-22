@@ -199,6 +199,126 @@ int hetoimasia_lua_call(
   char *trace, size_t trace_capacity, size_t *trace_length);
 
 /* ------------------------------------------------------------------------ */
+/* Export modules and captured behaviors                                     */
+/* ------------------------------------------------------------------------ */
+
+/* What an export module's chunk returned. */
+enum {
+  HETOIMASIA_EXPORT_OK = 0,        /* exactly one table with no metatable: kept */
+  HETOIMASIA_EXPORT_NO_RESULT = 1, /* no result */
+  HETOIMASIA_EXPORT_NIL = 2,       /* a single nil */
+  HETOIMASIA_EXPORT_NOT_TABLE = 3, /* a single value that is not a table */
+  HETOIMASIA_EXPORT_MULTIPLE = 4,  /* more than one result, an extra nil included */
+  HETOIMASIA_EXPORT_METATABLE = 5  /* a table with a metatable */
+};
+
+/*
+** Evaluate an export module: load the text `source` (a precompiled chunk is
+** refused) in an environment of its own that reads through to the globals, run
+** it, and keep the one plain table it returns in slot `slot` of a table the
+** bridge keeps in the registry. One protected call, under a message handler that
+** captures a bounded traceback, with the collector held until the chunk starts.
+**
+** `*load_status` is the status loading the chunk answered (a rejected chunk is
+** LUA_ERRSYNTAX with its message on the stack), `*shape` what the chunk returned
+** (an HETOIMASIA_EXPORT_ value) and `*result_type` the Lua type of a result that
+** is not a table. `*stored` is 1 once the table is in its slot; `*started` is 1
+** once the chunk began to run. The stack gains one value, the error or nil.
+*/
+int hetoimasia_lua_export_load(
+  lua_State *L,
+  const char *source, size_t source_length, const char *chunk,
+  lua_Integer slot,
+  char *trace, size_t trace_capacity, size_t *trace_length,
+  int *load_status, int *shape, int *result_type, int *stored, int *started);
+
+/* Empty an export slot, or a capture slot. Setting a key of an existing table to
+** nil allocates nothing; a status is answered anyway. */
+int hetoimasia_lua_export_release(lua_State *L, lua_Integer slot);
+int hetoimasia_lua_capture_release(lua_State *L, lua_Integer slot);
+
+/* How many export slots, or capture slots, are occupied. */
+int hetoimasia_lua_export_count(lua_State *L, long *count);
+int hetoimasia_lua_capture_count(lua_State *L, long *count);
+
+/* The fields of a behavior table: three hooks and two cadence fields. */
+#define HETOIMASIA_HOOKS 3
+#define HETOIMASIA_BEHAVIOR_KEYS 5
+
+/* How a cadence field read. */
+enum {
+  HETOIMASIA_FIELD_ABSENT = 0,
+  HETOIMASIA_FIELD_INTEGER = 1,
+  HETOIMASIA_FIELD_FLOAT = 2,
+  HETOIMASIA_FIELD_OTHER = 3 /* its Lua type is in the integer field */
+};
+
+/* The fields of the report a capture fills in. */
+enum {
+  HETOIMASIA_REPORT_PROBLEM = 0,
+  HETOIMASIA_REPORT_STORED = 1,
+  HETOIMASIA_REPORT_HOOKS = 2, /* bit 0 init, bit 1 update, bit 2 shutdown */
+  HETOIMASIA_REPORT_TICKS_KIND = 3,
+  HETOIMASIA_REPORT_TICKS_INTEGER = 4,
+  HETOIMASIA_REPORT_TICKS_BITS = 5, /* the float's bits */
+  HETOIMASIA_REPORT_SECONDS_KIND = 6,
+  HETOIMASIA_REPORT_SECONDS_INTEGER = 7,
+  HETOIMASIA_REPORT_SECONDS_BITS = 8,
+  HETOIMASIA_REPORT_DETAIL = 9,      /* a Lua type, or the index of a hook */
+  HETOIMASIA_REPORT_DETAIL_TYPE = 10, /* the Lua type of a hook that is not a function */
+  HETOIMASIA_REPORT_NAME_LENGTH = 11,
+  HETOIMASIA_REPORT_FIELDS = 12
+};
+
+/* Why a behavior was refused. */
+enum {
+  HETOIMASIA_BEHAVIOR_NONE = 0,
+  HETOIMASIA_BEHAVIOR_NO_EXPORT = 1,
+  HETOIMASIA_BEHAVIOR_MISSING = 2,
+  HETOIMASIA_BEHAVIOR_NOT_TABLE = 3,
+  HETOIMASIA_BEHAVIOR_METATABLE = 4,
+  HETOIMASIA_BEHAVIOR_NON_TEXT_KEY = 5,
+  HETOIMASIA_BEHAVIOR_UNKNOWN_KEY = 6,
+  HETOIMASIA_BEHAVIOR_HOOK_NOT_FUNCTION = 7
+};
+
+/*
+** Validate the field `select` of the export table in export slot `export_slot`
+** as a behavior, and capture it in capture slot `capture_slot`. Everything is
+** raw access and one bounded raw traversal of the behavior table: no
+** metamethod, indexing function or conversion runs, and at most six of its
+** entries are visited. The behavior must be a table with no metatable, and its
+** only fields `init`, `update`, `shutdown`, `every_ticks` and `every_seconds`,
+** each hook absent or a function.
+**
+** On success the capture holds the very hook functions, a fresh `self` table
+** holding the facade as `api`, and the facade. When `has_facade` is non-zero the
+** facade is the value on top of the stack, which is left there. `report` is
+** HETOIMASIA_REPORT_FIELDS values; `name` is where a key that is not in the
+** schema is named, `name_capacity` bytes. Nothing is stored unless the report's
+** problem is HETOIMASIA_BEHAVIOR_NONE and its stored flag is 1.
+*/
+int hetoimasia_lua_behavior_capture(
+  lua_State *L,
+  lua_Integer export_slot, const char *select, size_t select_length,
+  lua_Integer capture_slot, int has_facade,
+  int64_t *report, char *name, size_t name_capacity);
+
+/* What pushing a captured hook found. */
+enum {
+  HETOIMASIA_CAPTURE_GONE = 0,    /* no capture in the slot: nothing was kept */
+  HETOIMASIA_CAPTURE_NO_HOOK = 1, /* the capture has no such hook */
+  HETOIMASIA_CAPTURE_PUSHED = 2   /* the hook is a function */
+};
+
+/*
+** Push, in this order, the captured hook `which` (0 init, 1 update, 2 shutdown),
+** the capture's `self` and its facade: exactly three values, nil where there is
+** none. `*present` says what was found. One protected call, no script code.
+*/
+int hetoimasia_lua_capture_push(lua_State *L, lua_Integer slot, int which, int *present);
+
+/* ------------------------------------------------------------------------ */
 /* Tasks                                                                     */
 /* ------------------------------------------------------------------------ */
 

@@ -196,6 +196,33 @@ spec = describe "opacity across the package boundary" $ do
       rejectedBecause outcome "GHC-10237"
       clientOutput outcome `shouldContain` "ModuleHandle"
 
+  it "rejects a client that forges an export or capture handle, or reads the slot one names" $ do
+    withClient "Client.hs" exportHandleClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "GHC-10237"
+      clientOutput outcome `shouldContain` "ExportHandle"
+    withClient "Client.hs" captureHandleClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "GHC-10237"
+      clientOutput outcome `shouldContain` "CaptureHandle"
+
+  it "rejects a client asking the public module for a retained table, a registry reference or a stack index of an export" $
+    withClient "Client.hs" exportSurfaceClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export"
+
+  it "rejects a client reaching into the private export module" $
+    withClient "Client.hs" exportInternalsClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so the export internals are reachable:\n" <> clientOutput outcome)
+      clientOutput outcome `shouldContain` "Hetoimasia.Scripting.Lua.Internal.Export"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
   it "rejects a client that forges a capability, or stamps one with the VM that issued it" $
     withClient "Client.hs" capabilityForgeryClient $ \compile → do
       outcome ← compile Typecheck
@@ -286,6 +313,39 @@ spec = describe "opacity across the package boundary" $ do
                    , "script refusal effect = LuaRan"
                    , "unsupported = NotYetSupported LifecycleOperation"
                    , "handle after the lifetime = VmClosed"
+                   ]
+
+  it "accepts, links and runs a client evaluating export modules, capturing a behavior and releasing it, through the public owner alone" $
+    withClient "Main.hs" exportPublicClient $ \compile → do
+      outcome ← compile Link
+      case clientStatus outcome of
+        ExitSuccess → pure ()
+        status →
+          expectationFailure
+            ( "the export client must compile, but the compiler exited with "
+                <> show status
+                <> ":\n"
+                <> clientOutput outcome
+            )
+      (status, out, err) ←
+        readCreateProcessWithExitCode
+          (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
+          ""
+      status `shouldBe` ExitSuccess
+      err `shouldBe` ""
+      lines out
+        `shouldBe` [ "evaluated = kept"
+                   , "again = same table"
+                   , "retrieved = same table"
+                   , "unknown = Nothing"
+                   , "failed = ExportShapeRefused (ExportNotTable \"number\")"
+                   , "failed again = same failure"
+                   , "shape = BehaviorShape {shapeInit = True, shapeUpdate = True, shapeShutdown = False, shapeEveryTicks = FieldInteger 3, shapeEverySeconds = FieldAbsent}"
+                   , "missing role = BehaviorMissing"
+                   , "refused behavior = BehaviorUnknownKey \"extra\""
+                   , "released twice = ok"
+                   , "export after the lifetime = VmClosed"
+                   , "capture after the lifetime = VmClosed"
                    ]
 
   it "accepts, links and runs a client opting a binding in to recoverable refusals through the public modules alone" $
@@ -657,6 +717,121 @@ moduleHandleClient =
     , ""
     , "forged ∷ Maybe ModuleHandle"
     , "forged = Nothing"
+    ]
+
+exportHandleClient ∷ String
+exportHandleClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Owner (ExportHandle (ExportHandle, exportHandleSlot))"
+    , ""
+    , "forged ∷ Maybe ExportHandle"
+    , "forged = Nothing"
+    ]
+
+captureHandleClient ∷ String
+captureHandleClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Owner (CaptureHandle (CaptureHandle, captureHandleSlot))"
+    , ""
+    , "forged ∷ Maybe CaptureHandle"
+    , "forged = Nothing"
+    ]
+
+exportSurfaceClient ∷ String
+exportSurfaceClient =
+  unlines
+    [ "module Client (reached) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Owner (exportTable, exportReference, captureSelf, liveExportReferences, liveCaptureReferences, callBehavior)"
+    , ""
+    , "reached ∷ ()"
+    , "reached = ()"
+    ]
+
+exportInternalsClient ∷ String
+exportInternalsClient =
+  unlines
+    [ "module Client (reached) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Internal.Export (liveExportReferences, liveCaptureReferences)"
+    , ""
+    , "reached ∷ ()"
+    , "reached = ()"
+    ]
+
+-- | The export interface, used the way an application would.
+exportPublicClient ∷ String
+exportPublicClient =
+  unlines
+    [ "{-# LANGUAGE LambdaCase #-}"
+    , "{-# LANGUAGE OverloadedStrings #-}"
+    , "module Main (main) where"
+    , ""
+    , "import Control.Exception (try)"
+    , "import Hetoimasia.Scripting.Lua.Owner"
+    , "  ( BehaviorProblem (BehaviorMissing, BehaviorUnknownKey)"
+    , "  , Captured (capturedHandle, capturedShape)"
+    , "  , ExportIdentity (ExportIdentity)"
+    , "  , ExportOutcome (ExportFailed, ExportReady)"
+    , "  , ExportSource (ExportSource)"
+    , "  , Library (LibraryBase)"
+    , "  , VmClosed"
+    , "  , VmConfig (vmExports)"
+    , "  , boundaryReason"
+    , "  , captureBehavior"
+    , "  , evaluateExport"
+    , "  , releaseBehavior"
+    , "  , retrieveExport"
+    , "  , vmConfig"
+    , "  , withVmOwner"
+    , "  )"
+    , "import Hetoimasia.Scripting.Lua.Value (Value (VRecord, VText))"
+    , ""
+    , "main ∷ IO ()"
+    , "main = do"
+    , "  let initial = ExportSource (ExportIdentity \"main\") \"main\" \"return { gameplay = { init = function() end, update = function() end, every_ticks = 3 }, presentation = { extra = 1 } }\""
+    , "  escaped ← withVmOwner ((vmConfig [LibraryBase]) {vmExports = [initial]}) $ \\owned → do"
+    , "    first ← evaluateExport owned initial"
+    , "    export ← case first of"
+    , "      ExportReady handle → putStrLn \"evaluated = kept\" >> pure handle"
+    , "      ExportFailed fault → fail (show fault)"
+    , "    again ← evaluateExport owned (ExportSource (ExportIdentity \"main\") \"main\" \"error('never run')\")"
+    , "    putStrLn (\"again = \" <> (if again == first then \"same table\" else \"different\"))"
+    , "    retrieved ← retrieveExport owned (ExportIdentity \"main\")"
+    , "    putStrLn (\"retrieved = \" <> (if retrieved == Just first then \"same table\" else \"different\"))"
+    , "    retrieveExport owned (ExportIdentity \"other\") >>= \\unknown → putStrLn (\"unknown = \" <> show (fmap (const ()) unknown))"
+    , "    broken ← evaluateExport owned (ExportSource (ExportIdentity \"broken\") \"broken\" \"return 5\")"
+    , "    failure ← case broken of"
+    , "      ExportFailed fault → putStrLn (\"failed = \" <> show (boundaryReason fault)) >> pure broken"
+    , "      ExportReady _ → fail \"a number is no export table\""
+    , "    evaluateExport owned (ExportSource (ExportIdentity \"broken\") \"broken\" \"return {}\")"
+    , "      >>= \\retry → putStrLn (\"failed again = \" <> (if retry == failure then \"same failure\" else \"different\"))"
+    , "    capture ← captureBehavior owned export \"gameplay\" (VRecord [(\"name\", VText \"facade\")]) >>= \\case"
+    , "      Right found → putStrLn (\"shape = \" <> show (capturedShape found)) >> pure found"
+    , "      Left problem → fail (show problem)"
+    , "    captureBehavior owned export \"absent\" (VText \"x\") >>= \\case"
+    , "      Left BehaviorMissing → putStrLn \"missing role = BehaviorMissing\""
+    , "      other → fail (show (fmap capturedShape other))"
+    , "    captureBehavior owned export \"presentation\" (VText \"x\") >>= \\case"
+    , "      Left problem@(BehaviorUnknownKey _) → putStrLn (\"refused behavior = \" <> show problem)"
+    , "      other → fail (show (fmap capturedShape other))"
+    , "    releaseBehavior owned (capturedHandle capture)"
+    , "    releaseBehavior owned (capturedHandle capture)"
+    , "    putStrLn \"released twice = ok\""
+    , "    pure (owned, export, capture)"
+    , "  let (owned, export, capture) = escaped"
+    , "  try (evaluateExport owned initial) >>= \\case"
+    , "    Left closed → putStrLn (\"export after the lifetime = \" <> (const \"VmClosed\" (closed ∷ VmClosed)))"
+    , "    Right _ → putStrLn \"export after the lifetime = used\""
+    , "  try (captureBehavior owned export \"gameplay\" (VText \"x\")) >>= \\case"
+    , "    Left closed → putStrLn (\"capture after the lifetime = \" <> (const \"VmClosed\" (closed ∷ VmClosed)))"
+    , "    Right _ → putStrLn \"capture after the lifetime = used\""
+    , "  _ ← pure capture"
+    , "  pure ()"
     ]
 
 capabilityForgeryClient ∷ String

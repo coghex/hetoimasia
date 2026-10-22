@@ -27,6 +27,16 @@ module Hetoimasia.Scripting.Lua.Internal.Marshal
   , lookupEntry
   , moduleReferences
   , releaseModule
+    -- * Export modules and captured behaviors
+  , Evaluated (..)
+  , evaluateExportSource
+  , releaseExport
+  , releaseCapture
+  , exportReferences
+  , captureReferences
+  , BehaviorReport (..)
+  , captureBehaviorFields
+  , pushCaptured
     -- * Tasks
   , newTaskCoroutine
   , taskThread
@@ -50,12 +60,14 @@ module Hetoimasia.Scripting.Lua.Internal.Marshal
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Unsafe as ByteString
+import Data.Bits (testBit)
 import Data.Int (Int64)
 import Data.Text (Text)
 import qualified Data.Text.Encoding as Text
 import Data.Word (Word64)
 import Foreign.C (CChar, CInt (CInt), CLong, CSize (CSize))
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
+import Foreign.Marshal.Array (allocaArray, peekArray)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import Foreign.StablePtr (StablePtr)
 import Foreign.Storable (peek, poke)
@@ -166,6 +178,42 @@ foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_module_release
 
 foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_entry_lookup"
   c_entry_lookup ∷ State → Int64 → Ptr CChar → CSize → Ptr CInt → Ptr CInt → IO StatusCode
+
+foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_export_load"
+  c_export_load
+    ∷ State
+    → Ptr CChar
+    → CSize
+    → Ptr CChar
+    → Int64
+    → Ptr CChar
+    → CSize
+    → Ptr CSize
+    → Ptr CInt
+    → Ptr CInt
+    → Ptr CInt
+    → Ptr CInt
+    → Ptr CInt
+    → IO StatusCode
+
+foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_export_release"
+  c_export_release ∷ State → Int64 → IO StatusCode
+
+foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_capture_release"
+  c_capture_release ∷ State → Int64 → IO StatusCode
+
+foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_export_count"
+  c_export_count ∷ State → Ptr CLong → IO StatusCode
+
+foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_capture_count"
+  c_capture_count ∷ State → Ptr CLong → IO StatusCode
+
+foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_behavior_capture"
+  c_behavior_capture
+    ∷ State → Int64 → Ptr CChar → CSize → Int64 → CInt → Ptr Int64 → Ptr CChar → CSize → IO StatusCode
+
+foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_capture_push"
+  c_capture_push ∷ State → Int64 → CInt → Ptr CInt → IO StatusCode
 
 -- Safe: a collection step runs finalizers, which can call back into Haskell.
 foreign import ccall safe "hetoimasia_lua_values.h hetoimasia_lua_gc_service"
@@ -436,6 +484,165 @@ moduleReferences state =
     status ← c_module_count state count
     found ← peek count
     pure (if status /= LUA_OK then Left status else Right (fromIntegral found))
+
+-- | What evaluating an export module came to.
+data Evaluated = Evaluated
+  { evaluatedStatus ∷ !StatusCode
+    -- ^ The protected call's status; on failure its error value is on the stack.
+  , evaluatedChunkStatus ∷ !StatusCode
+    -- ^ Loading the chunk: not 'LUA_OK' for a rejected chunk, whose message is on
+    -- the stack.
+  , evaluatedShape ∷ !Int
+    -- ^ What the chunk returned: the C @HETOIMASIA_EXPORT_@ code.
+  , evaluatedResultType ∷ !Int
+    -- ^ The Lua type of a single result that is not a table.
+  , evaluatedStored ∷ !Bool
+    -- ^ The export table is in its slot.
+  , evaluatedStarted ∷ !Bool
+    -- ^ The chunk began to run. If not, nothing executed.
+  , evaluatedTrace ∷ !(Maybe Text)
+  }
+
+-- | Evaluate an export module's text in an environment of its own and keep the
+-- one plain table it returns in a slot of the export table. The stack gains one
+-- value, which is the error or the chunk's message or nil.
+evaluateExportSource ∷ State → ByteString → Text → Int → IO Evaluated
+evaluateExportSource state source chunk slot =
+  ByteString.unsafeUseAsCStringLen source $ \(sourcePointer, sourceSize) →
+    ByteString.unsafeUseAsCStringLen (Text.encodeUtf8 ("=" <> chunk <> "\0")) $ \(chunkPointer, _) →
+      allocaBytes traceLimit $ \trace →
+        alloca $ \traceLength →
+          alloca $ \loadStatus →
+            alloca $ \shape →
+              alloca $ \resultType →
+                alloca $ \stored →
+                  alloca $ \started → do
+                    status ←
+                      c_export_load
+                        state
+                        sourcePointer
+                        (fromIntegral sourceSize)
+                        chunkPointer
+                        (fromIntegral slot)
+                        trace
+                        (fromIntegral traceLimit)
+                        traceLength
+                        loadStatus
+                        shape
+                        resultType
+                        stored
+                        started
+                    ranChunk ← peek started
+                    chunkStatus ← peek loadStatus
+                    shape' ← peek shape
+                    type' ← peek resultType
+                    kept ← peek stored
+                    traced ← readTrace trace traceLength
+                    pure
+                      Evaluated
+                        { evaluatedStatus = status
+                        , evaluatedChunkStatus = StatusCode chunkStatus
+                        , evaluatedShape = fromIntegral shape'
+                        , evaluatedResultType = fromIntegral type'
+                        , evaluatedStored = kept /= 0
+                        , evaluatedStarted = ranChunk /= 0
+                        , evaluatedTrace = traced
+                        }
+
+-- | Empty an export slot, so its table is unreachable and its reference is gone.
+releaseExport ∷ State → Int → IO StatusCode
+releaseExport state slot = c_export_release state (fromIntegral slot)
+
+-- | Empty a capture slot, so what it held is unreachable and its references are
+-- gone.
+releaseCapture ∷ State → Int → IO StatusCode
+releaseCapture state slot = c_capture_release state (fromIntegral slot)
+
+-- | How many export slots are occupied: the references the bridge retains for
+-- export tables, one for each.
+exportReferences ∷ State → IO (Either StatusCode Int)
+exportReferences = counted c_export_count
+
+-- | How many capture slots are occupied: the references the bridge retains for
+-- captured behaviors, one for each.
+captureReferences ∷ State → IO (Either StatusCode Int)
+captureReferences = counted c_capture_count
+
+counted ∷ (State → Ptr CLong → IO StatusCode) → State → IO (Either StatusCode Int)
+counted count state =
+  alloca $ \out → do
+    poke out 0
+    status ← count state out
+    found ← peek out
+    pure (if status /= LUA_OK then Left status else Right (fromIntegral found))
+
+-- | What capturing a behavior found, as the C report states it.
+data BehaviorReport = BehaviorReport
+  { reportProblem ∷ !Int
+    -- ^ The C @HETOIMASIA_BEHAVIOR_@ code, 0 for none.
+  , reportStored ∷ !Bool
+  , reportHooks ∷ !(Bool, Bool, Bool)
+    -- ^ Whether @init@, @update@ and @shutdown@ are present, as functions.
+  , reportTicks ∷ !(Int, Int64, Int64)
+    -- ^ The @every_ticks@ field: how it read, its integer (or Lua type) and the
+    -- bits of its float.
+  , reportSeconds ∷ !(Int, Int64, Int64)
+  , reportDetail ∷ !Int
+  , reportDetailType ∷ !Int
+  , reportName ∷ !ByteString
+    -- ^ The key that is not in the schema, bounded.
+  }
+
+-- | Validate a field of an export table as a behavior and capture it. When there
+-- is a facade it is the value on top of the stack, and stays there.
+captureBehaviorFields ∷ State → Int → ByteString → Int → Bool → IO (StatusCode, BehaviorReport)
+captureBehaviorFields state exportSlot select captureSlot facade =
+  ByteString.unsafeUseAsCStringLen select $ \(selectPointer, selectSize) →
+    allocaArray reportFields $ \report →
+      allocaBytes nameCapacity $ \name → do
+        status ←
+          c_behavior_capture
+            state
+            (fromIntegral exportSlot)
+            selectPointer
+            (fromIntegral selectSize)
+            (fromIntegral captureSlot)
+            (if facade then 1 else 0)
+            report
+            name
+            (fromIntegral nameCapacity)
+        fields ← peekArray reportFields report
+        named ← case fields of
+          _ | status /= LUA_OK → pure ByteString.empty
+          [_, _, _, _, _, _, _, _, _, _, _, size] → ByteString.packCStringLen (name, fromIntegral size)
+          _ → pure ByteString.empty
+        pure (status, interpret fields named)
+  where
+    interpret fields named = case fields of
+      [problem, stored, hooks, tk, ti, tb, sk, si, sb, detail, detailType, _] →
+        BehaviorReport
+          { reportProblem = fromIntegral problem
+          , reportStored = stored /= 0
+          , reportHooks = (testBit hooks 0, testBit hooks 1, testBit hooks 2)
+          , reportTicks = (fromIntegral tk, ti, tb)
+          , reportSeconds = (fromIntegral sk, si, sb)
+          , reportDetail = fromIntegral detail
+          , reportDetailType = fromIntegral detailType
+          , reportName = named
+          }
+      _ → BehaviorReport 0 False (False, False, False) (0, 0, 0) (0, 0, 0) 0 0 ByteString.empty
+    reportFields = 12
+    nameCapacity = 64
+
+-- | Push a capture's hook, its @self@ and its facade. What was found is the
+-- C @HETOIMASIA_CAPTURE_@ code; the stack gains exactly three values.
+pushCaptured ∷ State → Int → Int → IO (StatusCode, Int)
+pushCaptured state slot which =
+  alloca $ \present → do
+    poke present 0
+    status ← c_capture_push state (fromIntegral slot) (fromIntegral which) present
+    found ← peek present
+    pure (status, fromIntegral found)
 
 -- | Pay what the host-side phases, which hold the collector, allocated since it
 -- was last paid, as a collection step. Where script code may run, and only there:

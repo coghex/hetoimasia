@@ -335,6 +335,7 @@ import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity
   )
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits (Quanta (..), Quantum (..), ServiceClass (..))
 import Hetoimasia.Scripting.Lua.Internal.Value (checkLimits)
+import Hetoimasia.Scripting.Lua.Instance.Behavior (behaviorDriverSource)
 import Hetoimasia.Scripting.Lua.Instance.Driver (connectNamespace, driverNamespaceName, driverSource)
 import Hetoimasia.Scripting.Lua.Instance.Run (gateOf)
 import Hetoimasia.Scripting.Lua.Instance.State (isInstanceTask)
@@ -560,7 +561,7 @@ startScheduledOwner runtime spec = do
           base
             { vmRegistration = merged
             , vmPolicy = vmPolicy base <> [driverNamespaceName]
-            , vmModules = vmModules base <> [driverSource (instanceSources instanceConfig) [(eventName endpoint, eventPayload endpoint) | (grant, _) ← toList subscriptions, endpoint ← grantEvents grant]]
+            , vmModules = vmModules base <> [driverSource (instanceSources instanceConfig) [(eventName endpoint, eventPayload endpoint) | (grant, _) ← toList subscriptions, endpoint ← grantEvents grant], behaviorDriverSource]
             }
   scheduler ←
     newScheduler
