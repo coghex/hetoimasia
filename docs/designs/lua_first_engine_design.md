@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-73/Q-15: remaining service functions and records.
+The current checkpoint is P-74/Q-16: numeric ceilings and worker accounting.
+D-76 accepts the six-part remaining service API and record-schema package.
 D-75 accepts the five-part core Lua module/behavior/request API package.
 D-74 accepts the five-part concrete launch-command and JSON manifest package.
 D-73 defers Lua window-size reads and resize callbacks from M1.
@@ -2284,6 +2285,31 @@ The manager summarized all five parts with the room.lua busy-retry example
 and costs. The alternative revision route suggested method-call style or
 optional modules; the owner chose neither. Service-specific records/functions
 and remaining numeric/resource bounds still require their own approval.
+
+### D-76. Use the approved remaining service APIs and records
+
+**Delivery:** M1 content/graphics/time/status/control binding schemas.
+
+Owner answer, **2026-10-22 04:14:58 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> Approve all six (Rec.)
+
+Authenticated relay: `het-manager`, message `qkwkkkxxm9xpmmfm7wnrg2is8e`,
+posted **2026-10-22 04:14:58.260 UTC** in `#het-luafirst`, replying to Q-15
+message `94ijx9tyijyjx936fbvmzi6vva`.
+
+Before asking, the manager showed the owner P-73's quad example in abridged
+form: behavior tables, begin/collect, status checking with a red clear on
+logical failure, and publication followed by texture release. It then
+summarized all six parts. The owner approved the package rather than Revise.
+
+Accept all six P-73 parts: data/texture functions/values; window, scene and
+release schemas; time/wait functions; UI status/shutdown records; quit and the
+single unavailable-state guard; strict validation/expected failure codes.
+The quad composition was shown before signoff, not added as an unexplained
+implementation interpretation afterwards. Numeric ceilings and worker/resource
+accounting remain the next explicit contract.
 
 ## Proposals
 
@@ -6565,7 +6591,7 @@ needed to qualify these Lua-facing ownership and value contracts.
 
 ### P-73. Complete the M1 service function and record schemas
 
-**Unapproved; active checkpoint Q-15. Delivery: M1.** Recommend all six parts
+**All six parts accepted by D-76 through Q-15. Delivery: M1.** Recommend all six parts
 below as the next API package. They use D-75's dot calls, per-instance facade,
 busy admission and request records. Numeric ceilings/accounting follow as a
 separate bounds package; no omitted limit means unlimited. This introduces no
@@ -6850,6 +6876,210 @@ Qualification checks schema/phase/owner errors before action, copied scenes,
 readiness/results, time origins/waits, status/quit/guard precedence, and real
 offscreen/native quad evidence in the delivery slices. Remaining numeric
 ceilings and worker/resource accounting need the next explicit package.
+
+### P-74. Fix a bounded M1 profile and account for work through actual retirement
+
+**Unapproved; active checkpoint Q-16. Delivery: M1.** Recommend the following
+six-part profile. These are proposed engineering limits, not measured performance
+promises. They are fixed by the M1 assembly, without Lua/manifest/environment
+overrides. Smaller injected test profiles must pass the same consistency
+validation. Existing commands/general-library configurations stay unchanged.
+KiB/MiB/GiB mean powers of 1024; arithmetic is checked before allocation/admission.
+
+#### 1. Inventory, paths and modules
+
+| Item | M1 ceiling |
+| --- | --- |
+| Manifest | D-74: 64 KiB and eight nested containers. |
+| Inventory | 10,000 entries including root, directories and every file path; depth 32 path segments. |
+| Content path | 1,024 UTF-8 bytes total; 255 per segment, checked on supplied/native and NFC forms. Native launch-root spelling is separate. |
+| Startup hashing | 64 MiB per regular file; 1 GiB summed file bytes per root, counting aliases per path; 64 KiB streaming buffer. |
+| Modules | 1 MiB source each; 256 cache identities per VM, pending/failed included; active import chain at most 32 modules. |
+| Uncompiled source buffers | 16 MiB per VM, including 1 MiB reserved for the active chain's next source rather than unrelated prefetch. |
+
+Unused/hidden entries participate; inventory/file/total/path excess fails boot
+before Lua. Later overlong path arguments are ordinary Lua errors before file
+work. Oversized module source fails an accepted load as too_large; cache/depth
+failure preserves D-59's pre-admission versus accepted-failure split. Chain
+depth includes its root; a closing cycle edge is reported without allocating
+another live module frame. Release source buffers after compilation/transfer
+when no longer needed. Compiled Lua objects/exports are VM memory, not claimed
+to fit the uncompiled-source bank; no private snapshot of all content is added.
+
+#### 2. Instances, requests, copied values and reports
+
+| Item | M1 ceiling |
+| --- | --- |
+| Assembly instances | Two per VM; the normal launcher still creates one root per declared role. Second slot qualifies reusable bindings in the Haskell harness, not public spawning/mod activation. |
+| Requests | 16 accepted/unretired per instance, 64 per VM, including unconsumed results and retiring providers. |
+| Data | 8 MiB per file/result; 64 MiB retained data-provider/result bytes per VM. |
+| Copied value crossing | 16 MiB encoded bytes, depth 8, 65,536 elements; family limits apply within that ceiling. |
+| Scene input | 4,096 sprites; 2 MiB encoded input; depth 4 and the exact fixed schema. |
+| Failure/status text | Message 2 KiB; traceback 8 KiB; complete role-failure record 16 KiB; opaque instance ID 128 UTF-8 bytes. |
+| Engine failure report | 64 KiB; retain at most 16 secondary cleanup summaries, each at most 2 KiB, plus omitted-count. First failure remains primary. |
+
+Reserve request/result bookkeeping atomically before acceptance. For data,
+reserve the inventoried size up to 8 MiB in the VM byte bank before reading;
+known missing/oversized content can become an accepted failure without an
+impossible payload reservation. Slot/record limits bound metadata separately.
+Take/discard plus actual provider retirement releases remaining native buffers
+and the request slot. A Lua string retained after take has ordinary Lua memory
+lifetime outside this bank. Module exports remain VM references, not serialized
+payloads charged according to arbitrary export-table contents. Logical-owner
+capacity credits become reusable at accounted scheduler boundaries under D-53,
+not directly from an unsynchronized native completion callback.
+
+Diagnostics truncate visibly at UTF-8 boundaries, keeping required codes and
+identity where present. A native cycle diagnostic can retain the bounded path
+chain; prioritize it and the first failure before secondary cleanup text.
+D-71's 4 KiB print/warn cap remains. Omitted report detail never erases failure
+accounting, and no unbounded diagnostic history is retained. Limits bound
+engine service payloads, not all Lua/process memory.
+
+#### 3. Texture, window, scene and GPU accounting
+
+| Item | M1 ceiling |
+| --- | --- |
+| PNG source | 32 MiB encoded bytes; 4,096 chunks. |
+| PNG geometry | Each axis 1–2,048 texels; 4,194,304 pixels; one RGBA8 output at most 16 MiB. |
+| Decode work | 40 MiB decompressed scanline bytes; 128 MiB accounted CPU payload/workspace per active texture pipeline. |
+| Textures | 16 pending/live/retiring textures and 128 MiB nominal RGBA8 bytes per UI instance; 256 MiB nominal bytes across the session. |
+| Windows | D-51's one pending/live/retiring slot per UI instance; title 512 UTF-8 bytes; requested width/height integers 1–4,096. |
+| Sprites | x/y in [-1,000,000, 1,000,000]; width/height in (0, 1,000,000], plus D-66 finite/Float32/non-collapse checks. |
+
+Reserve a texture slot and the maximum 16 MiB nominal output charge before
+acceptance; reduce the charge to its actual validated size at an accounted
+stage boundary. This may return busy even for an eventually small image.
+Do not read an unverified header early to evade reservation. Released-but-
+displayed and in-flight textures remain charged until actual retirement;
+D-49's independent loads each pay separately.
+
+The 128 MiB CPU workspace covers live engine payload buffers for that pipeline:
+encoded bytes, inflation/decoder intermediates, conversion output and staging
+copies while owned. It excludes allocator overhead, GC-retained garbage and
+driver memory. Validate dimensions, chunk count, scanline sizes and arithmetic
+before size-derived allocation; bound inflation while streaming, not after
+unbounded inflate. Do not decompress ignored metadata. Establish a conservative
+live-buffer bound for every approved PNG variant, including 16-bit/interlaced
+images. Extend the bounded decoder adapter if necessary; measured RSS or
+catching allocation failure afterwards is not proof. Do not silently remove
+an approved PNG variant to avoid this work.
+
+Select the existing validated GPU budget model with 2 target records, 2 frame
+slots per window/4 aggregate, 4 frameless batches, 2 generations per target,
+16 tracked images per generation, 2 GiB accounted native GPU bytes and 4,096
+accounted objects. Retain its 64-record reclaim pass, 32 progress actions per
+turn and 100 ms maximum idle backoff. These native budgets are separate from
+nominal texture bytes: staging/alignment/swapchain allocations also consume
+native resources. Preserve backend backpressure, completion and cleanup;
+budget exhaustion is not a successful allocation. Actual device/allocator/
+cleanup faults remain fatal.
+
+Native actual extents must meet device/backend limits; requested size is not
+an observation or guarantee of allocation. Unsupported native geometry cannot
+be silently clamped or reported as successful resizing. Zero extent still
+suspends drawing; unusable targets retain the native failure/retirement policy.
+Not every device is promised the maximum window or every resource at once.
+
+Keep one latest Lua scene per window, no publication FIFO. Use the existing
+derived adopted-revision limit: six per target with two frame slots, with
+deferred adoption when full. Intermediate publications may be superseded;
+adopted/in-flight revisions keep their holds. The latest copy and one bounded
+publication draft are separately accounted. Repeated publication must neither
+create an unbounded revision queue nor free references before retirement.
+
+#### 4. Worker ownership and bounded accepted-work queues
+
+The session owns two file-I/O workers, one CPU decode worker and two texture
+pipeline lanes spanning read/decode/upload/retirement. A lane retains its
+workspace reservation until its relevant buffers actually retire. Accepted
+requests may wait in bounded stage queues derived from existing reservations;
+there is no hidden retry queue for a request refused busy. GPU work stays on
+the graphics owner and window work on GLFW's owner; neither executes Lua.
+
+I/O workers return bounded verified buffers and release their execution slots
+before waiting on Lua evaluation, decoding or a logical due tick. Decode
+releases its execution slot at handoff; pipeline/buffer ownership persists
+through GPU completion. Never hold a worker while waiting for another job on
+the same pool. Module evaluation follows D-58 on its VM. Reserve the active
+chain's source lane so unrelated ready buffers cannot starve its dependency;
+lacking prefetch budget delays prefetch, not that chain.
+
+Within each stage use oldest eligible admitted work first, with active-chain
+dependency progress ahead of unrelated prefetch. This does not reorder Lua
+evaluation or logical result positions by file completion. Shared module jobs
+remain VM-owned even after every waiter leaves. Cache/request bounds cap all
+queued jobs; auxiliary lists/maps cannot grow without a corresponding admitted
+owner. Shared workers still offer no hard latency/preemption guarantee for
+filesystem/decoder calls or a non-yielding script.
+
+Reserve completion/cancellation/retirement bookkeeping on admission, so drain
+does not need a free ordinary request slot. Keep sinks, anchored roots, provider
+guards and native owners alive through actual use. Partial boot/stop withdraws
+queued work where possible and drains started work through protected cleanup
+before releasing providers/root handles. A cancellation acknowledgement or
+worker exit alone is not evidence that all native/GPU dependencies retired.
+
+#### 5. Numeric types, time and exhaustion
+
+Logical tick/cadence/offset/wait counts and generated public counter values
+use Lua integers through `2^63 - 1`; tick 0 is init and positive counts start
+at 1. Window and texture dimensions also use the integer subtype: `1.0` is
+refused where an integer is declared. D-66 clear channels retain their explicit
+integral-float allowance. Coordinates/elapsed seconds accept either numeric
+subtype but not strings, NaN or infinity.
+
+Keep D-74's full positive Word64 nanosecond range for manifest tick duration.
+Lua elapsed wait/cadence must be finite/positive and its exact represented
+value times 1,000,000,000, rounded upward, must fit that duration range.
+Convert with checked arithmetic, without overflow or accidentally rounding
+down. Check tick+offset, tick+wait and clock+duration before accepting calls;
+invalid/unrepresentable input is an ordinary Lua error before work. Seconds/dt
+are finite approximations, not a replacement for exact logical tick identity.
+
+Sequences and instance identities never wrap/reuse. Exhaustion before admission
+is an ordinary permanent-limit Lua error with no handle/work, not busy.
+Autonomous tick/clock exhaustion or internal checked-arithmetic failure after
+valid admission ends the session as an engine failure (1), without publishing
+wrapped time. Validate already-impossible initial pacing deadlines before Lua.
+Use injected near-limit clocks/counters, not long-running or hanging probes.
+
+#### 6. Classification, qualification and costs
+
+Temporary request/result/lease/byte reservation pressure is busy before
+acceptance, with no partial reservation/native work. Permanent malformed
+arguments and numeric/path/scene/pre-admission cache/sequence limits are
+ordinary Lua errors. Oversized/invalid content discovered for an accepted
+request uses too_large/module_limit/other expected-failure records under the
+required/optional policy. Stage backpressure never turns acceptance into busy.
+Engine/provider/cleanup faults remain fatal; these limits do not convert
+arbitrary Lua CPU/heap exhaustion into recoverable content errors.
+
+Qualify limit-and-one-past cases, failed multi-reservations with zero provider
+calls, cancellation/completion races, held logical results, full prefetch
+buffers with an active dependency, and full ordinary queues while cleanup
+drains. Prove one instance's cleanup preserves the other's resources and that
+released displayed textures remain charged. Use small injected limits plus
+real codec/offscreen/native paths; fake providers alone cannot qualify the arc.
+
+Evidence: the [Lua value boundary](../../packages/scripting-lua/README.md)
+supports crossings up to 16 MiB/depth 64/1,048,576 elements; an 8 MiB data
+result leaves envelope space inside its existing byte ceiling. Its module
+baseline is 256 identities/1 MiB source. Current
+[PNG checks](../../packages/asset-image/README.md) establish structural safety,
+not this allocation/inflation budget. The GPU budget model and scene ledger
+already derive bounded frame/generation/adoption state; image2d selects a
+2 GiB byte budget. These are starting points, not proof that M1 reservations
+and pools already exist.
+
+Recommend this fixed profile so implementation/verification have concrete
+limits without a tuning API. Costs: unused large files can fail boot; PNGs over
+2,048 per axis must be resized; large data split; at most two harness instances
+per VM; worst-case texture reservation can return busy early; displayed released
+textures hold capacity; maximum native geometry is not guaranteed allocatable;
+and worker/decoder accounting requires real work. These are not hostile-code
+containment or whole-Lua/process/driver memory caps. Changed limits or tunability
+need a package revision, not silent relaxation during implementation.
 
 ## Open questions
 
@@ -7419,12 +7649,17 @@ service-specific functions/records and remaining bounds continue in Q-15.
 
 ### Q-15. Approve the remaining service functions and record schemas?
 
-**Active checkpoint, P-73.** Approve all six parts or identify revisions:
-data/texture calls and values; window/scene/release schemas; time/wait functions;
-status and shutdown reasons; session quit/unavailable-state spellings; strict
-validation and expected-failure codes. The complete quad example demonstrates
-their composition. Numeric ceilings and resource/worker accounting follow as
-their own package before vision/#145 reconciliation and one-PR slices.
+Resolved by D-76: all six P-73 parts approved after the owner saw the quad
+example. Numeric ceilings and worker/resource accounting continue in Q-16.
+
+### Q-16. Approve the fixed M1 limits and worker/accounting profile?
+
+**Active checkpoint, P-74.** Approve all six parts or name revisions: content/
+module limits; instance/request/result budgets; texture/window/scene/native
+GPU bounds; owned workers and bounded stage queues; numeric/time/exhaustion
+rules; and failure classification/qualification. These are M1 assembly limits,
+not a Lua tuning API or hard whole-process containment. Next are Q-8 vision/
+#145 reconciliation and Q-9 dependency-ordered one-PR delivery slices.
 
 ## Verification strategy
 
