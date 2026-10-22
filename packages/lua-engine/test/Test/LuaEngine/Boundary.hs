@@ -167,6 +167,9 @@ spec = describe "the package and import boundary" $ do
         -- Only the behavior selection is over the Lua host's and runtime's public
         -- modules; the manifest and the profile import nothing of them.
         || (file == "Behavior.hs" && "Hetoimasia.Scripting.Lua." `isPrefixOf` name)
+        -- Only the boot checkpoint is over the content package, through its
+        -- public modules.
+        || (file == "Boot.hs" && name `elem` ["Hetoimasia.Content", "Hetoimasia.Content.Identity", "Hetoimasia.Content.Inventory"])
     permittedRequest name =
       "Data." `isPrefixOf` name
         || "GHC." `isPrefixOf` name
@@ -189,6 +192,3 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.Content.Inventory"
                ]
         || "Hetoimasia.Scripting.Lua." `isPrefixOf` name
-        -- Only the boot checkpoint is over the content package, through its
-        -- public modules.
-        || (file == "Boot.hs" && name `elem` ["Hetoimasia.Content", "Hetoimasia.Content.Identity", "Hetoimasia.Content.Inventory"])
