@@ -22,12 +22,12 @@ import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Scheduled
-import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VRecord, VText))
+import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VNil, VRecord, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfTimer), awaitEffect, awaitRegistrations, defaultSchedulerBounds, setClock)
 import Test.LuaRuntime.Scheduler.Support (fireReg, liveRegs, nanoseconds)
-import Hetoimasia.Scripting.Lua.Runtime (CallFault (ModuleNotLoaded), Discard (Discard), ExitKind (ExitFailed), Progress (Started))
+import Hetoimasia.Scripting.Lua.Runtime (CallFault (BoundaryFailed, ModuleNotLoaded), Discard (Discard), ExitKind (ExitFailed), Progress (Started))
 import Test.LuaRuntime.Scheduled.Support (awaitScheduledTerminal)
 import Test.LuaRuntime.Support (Gated (..), bounded, brokenIs, expectFatal, failExample, requiredPolicy, withBoundaryOpening)
 
@@ -325,6 +325,59 @@ spec = describe "M1 behavior instances" $ do
           failureStage broken `shouldBe` StageConstruct
           failureError broken `shouldSatisfy` \case ErrorFault _ → True; _ → False
           logged fixture >>= (`shouldBe` [])
+
+  describe "attribution and facade tables" $ do
+    it "attributes a failure of init, of a resumed update and of shutdown to the export module that holds the hook, with its entry" $ bounded $
+      withDefaults
+        [ exportOf
+            "attrib"
+            [ "return {"
+            , "  init_fails = { init = function() error('init boom') end },"
+            , "  update_fails = { every_ticks = 1, update = function() sched.wait_ticks(1) fx.record({}) end },"
+            , "  shutdown_fails = { init = function() end, shutdown = function() error('shutdown boom') end },"
+            , "}"
+            ]
+        ]
+        $ \fixture control owner → do
+          let source = ModuleRef "attrib" "export"
+              faultOfFailure failure = case failureError failure of
+                ErrorFault (BoundaryFailed fault) → pure fault
+                other → failExample ("not a fault of the boundary: " <> show other)
+          _ ← admitBehavior fixture owner "i" (requestFor "attrib" "init_fails" (facadeNamed "i") logicalRule)
+          initFailure ← awaitSettled fixture "i" >>= failureIn
+          failureStage initFailure `shouldBe` StageInit
+          initFault ← faultOfFailure initFailure
+          boundaryModule initFault `shouldBe` Just source
+          boundaryEntry initFault `shouldBe` Just "init"
+          -- An update that waits and then makes a refused call from the module's own code.
+          _ ← admitBehavior fixture owner "u" (requestFor "attrib" "update_fails" (facadeNamed "u") logicalRule)
+          awaitPhase fixture owner "u" Active
+          grantEach control owner [1, 1]
+          updateFailure ← awaitSettled fixture "u" >>= failureIn
+          failureStage updateFailure `shouldBe` StageUpdate
+          updateFault ← faultOfFailure updateFailure
+          boundaryModule updateFault `shouldBe` Just source
+          boundaryEntry updateFault `shouldBe` Just "update"
+          boundaryBinding updateFault `shouldBe` Just ("fx", "record")
+          _ ← admitBehavior fixture owner "s" (requestFor "attrib" "shutdown_fails" (facadeNamed "s") logicalRule)
+          awaitPhase fixture owner "s" Active
+          _ ← askControl fixture owner "s" InstanceStop
+          shutdownFailure ← awaitSettled fixture "s" >>= failureIn
+          failureStage shutdownFailure `shouldBe` StageShutdown
+          shutdownFault ← faultOfFailure shutdownFailure
+          boundaryModule shutdownFault `shouldBe` Just source
+          boundaryEntry shutdownFault `shouldBe` Just "shutdown"
+
+    it "fails at construction an instance whose copied facade is nil or a scalar, running no hook" $ bounded $
+      withDefaults [exportOf "tables" ["return { gameplay = { init = function() " <> record <> "('ran') end } }"]] $ \fixture _ owner → do
+        forM_ [("nil", VNil, "nil"), ("number", VInteger 3, "number"), ("text", VText "x", "string")] $ \(name, scalar, typeName) → do
+          _ ← admitBehavior fixture owner name (requestFor "tables" "gameplay" (FacadeData scalar) logicalRule)
+          failure ← awaitSettled fixture name >>= failureIn
+          failureStage failure `shouldBe` StageConstruct
+          case failureError failure of
+            ErrorFault (BoundaryFailed fault) → boundaryReason fault `shouldBe` ModuleRefused (FacadeNotATable typeName)
+            other → failExample ("not the facade refusal: " <> show other)
+        logged fixture >>= (`shouldBe` [])
 
   describe "interruption and capacity" $ do
     it "reports an interrupted init as started, skipping the shutdown, when the host fails inside it" $ bounded $ do

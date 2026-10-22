@@ -854,7 +854,7 @@ data CatchTrial = CatchTrial CatchKind Bool Int (Maybe Text)
 -- allocation that fails.
 catchSources ∷ (ExportSource, ExportSource)
 catchSources =
-  ( exportOf "services" "return { build = function(context) pcall(sample.fail, 'caught') return { a = 1, b = 2 } end }"
+  ( exportOf "services" "return { build = function(context) pcall(sample.fail, 'caught') local t = {} for i = 1, 200 do t[i] = i end return t end }"
   , exportOf "carrier" "return { gameplay = { init = function(s, a) end } }"
   )
 
