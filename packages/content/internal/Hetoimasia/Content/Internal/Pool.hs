@@ -80,6 +80,7 @@ module Hetoimasia.Content.Internal.Pool
   , PoolPhase (..)
   , status
   , awaitFailure
+  , poolFailureEvidence
   ) where
 
 import Control.Concurrent.STM
@@ -278,6 +279,10 @@ data PoolPhase = PoolOpen | PoolClosed
 data PoolState = PoolState
   { psPhase ∷ !PoolPhase
   , psFailure ∷ !(Maybe (ExceptionWithContext SomeException))
+  -- ^ The first failure: set once, by the transaction that finds none.
+  , psEvidence ∷ ![(Text.Text, ExceptionWithContext SomeException)]
+  -- ^ Every later failure and every failure raised while telling a job, in the order they were
+  -- recorded. Append-only: each is added by a transaction that reads the current list.
   , psQueue ∷ !(Map (Int, Word64) Job)
   , psNext ∷ !Word64
   , psReserved ∷ !Int
@@ -331,6 +336,26 @@ status pool = do
 awaitFailure ∷ ReadPool → STM (ExceptionWithContext SomeException)
 awaitFailure pool = readTVar (poolState pool) >>= maybe retry pure . psFailure
 
+-- | The evidence recorded beside the first failure so far, oldest first: later worker failures and
+-- failures raised while telling a queued job's sink.
+poolFailureEvidence ∷ ReadPool → STM [(Text.Text, ExceptionWithContext SomeException)]
+poolFailureEvidence pool = psEvidence <$> readTVar (poolState pool)
+
+-- | The one writer of the evidence list: it reads the current list in its own transaction and
+-- appends, so concurrent additions are all kept.
+appendEvidence ∷ ReadPool → Text.Text → ExceptionWithContext SomeException → STM ()
+appendEvidence pool label found = do
+  st ← readTVar (poolState pool)
+  writeTVar (poolState pool) st {psEvidence = psEvidence st <> [(label, found)]}
+
+-- | The latched failure with all the evidence recorded so far composed beside it, if one is latched.
+latchedFailure ∷ ReadPool → IO (Maybe (ExceptionWithContext SomeException))
+latchedFailure pool = do
+  st ← readTVarIO (poolState pool)
+  case psFailure st of
+    Nothing → pure Nothing
+    Just first → Just <$> withEvidence first (psEvidence st)
+
 -- The scope -------------------------------------------------------------------------------
 
 -- | Run a body over a pool of verified reads of this inventory through this root.
@@ -349,7 +374,7 @@ withPool spec inventory root = withPoolWith noHooks spec (readVerified inventory
 -- that returned while a worker had failed rethrows that failure.
 withPoolWith ∷ PoolHooks → PoolSpec → VerifiedRead → (ReadPool → IO a) → IO a
 withPoolWith hooks spec reader body = withWorkerGroup $ \group → do
-  var ← newTVarIO (PoolState PoolOpen Nothing Map.empty 0 0 0 0)
+  var ← newTVarIO (PoolState PoolOpen Nothing [] Map.empty 0 0 0 0)
   let pool = ReadPool spec var reader hooks
   result ← mask $ \restore → do
     outcome ← tryWithContext @SomeException $ restore $ do
@@ -364,8 +389,8 @@ withPoolWith hooks spec reader body = withWorkerGroup $ \group → do
     -- primary one.
     closed ← tryWithContext @SomeException (closePool pool)
     -- A failure a worker latched while the body ran is evidence of the exit whatever else ends it.
-    latched ← readTVarIO var
-    let kept = [("content read pool worker failure", found) | Just found ← [psFailure latched]]
+    latched ← latchedFailure pool
+    let kept = [("content read pool worker failure", found) | Just found ← [latched]]
     case (outcome, closed) of
       (Right value, Right ()) → pure (Right value)
       (Right _, Left closing) → Left <$> withEvidence closing kept
@@ -377,17 +402,13 @@ withPoolWith hooks spec reader body = withWorkerGroup $ \group → do
       -- The body returned. A worker's failure from here on is still the scope's failure: the
       -- report of the workers' own outcomes is read, and anything but a clean return is raised.
       report ← closeWorkerGroup group
-      latched ← readTVarIO var
-      case psFailure latched of
+      latched ← latchedFailure pool
+      case latched of
         Just failure → rethrowIO failure
         Nothing →
           unclean report >>= \case
             Nothing → pure value
             Just failure → rethrowIO failure
-
-orElseMaybe ∷ Maybe a → Maybe a → Maybe a
-orElseMaybe (Just x) _ = Just x
-orElseMaybe Nothing y = y
 
 -- | A failure with this evidence kept beside it, if there is any.
 withEvidence ∷ ExceptionWithContext SomeException → [(Text.Text, ExceptionWithContext SomeException)] → IO (ExceptionWithContext SomeException)
@@ -677,30 +698,19 @@ latchFailure pool caught@(ExceptionWithContext _ failure) = do
   withdrawn ← atomically $ do
     st ← readTVar (poolState pool)
     case psFailure st of
-      Just _ → pure Nothing
+      Just _ → do
+        -- Not the first: kept beside it, appended to the evidence as it now stands.
+        appendEvidence pool "content read subsequent failure" caught
+        pure Nothing
       Nothing → Just <$> withdrawQueue pool st {psFailure = Just caught}
   case withdrawn of
-    Nothing → do
-      -- Not the first: it is kept beside the first, which stays the pool's primary failure.
-      prior ← atomically (psFailure <$> readTVar (poolState pool))
-      case prior of
-        Just first → do
-          composed ← composeCleanup (Just first) [("content read subsequent failure", caught)]
-          atomically $ do
-            st ← readTVar (poolState pool)
-            writeTVar (poolState pool) st {psFailure = composed `orElseMaybe` psFailure st}
-        Nothing → pure ()
-      pure caught
+    Nothing → pure caught
     Just jobs →
       tellAll jobs (ReadDefect failure) >>= \case
         Nothing → pure caught
         Just notification → do
-          composed ← composeCleanup (Just caught) [("content read sink", notification)]
-          let final = fromMaybe caught composed
-          atomically $ do
-            st ← readTVar (poolState pool)
-            writeTVar (poolState pool) st {psFailure = Just final}
-          pure final
+          atomically (appendEvidence pool "content read sink" notification)
+          fromMaybe caught <$> composeCleanup (Just caught) [("content read sink", notification)]
 
 -- | Close admission and withdraw what is queued, telling each job it was abandoned.
 closePool ∷ ReadPool → IO ()

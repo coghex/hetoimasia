@@ -54,6 +54,7 @@ module Hetoimasia.Content.ReadPool
   , PoolPhase (..)
   , status
   , awaitFailure
+  , poolFailureEvidence
   ) where
 
 import Hetoimasia.Content.Internal.Inventory.Types (Inventory)

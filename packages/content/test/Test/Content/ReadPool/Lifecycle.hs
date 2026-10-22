@@ -3,7 +3,7 @@
 module Test.Content.ReadPool.Lifecycle (spec) where
 
 import Control.Concurrent (killThread)
-import Control.Concurrent.STM (atomically)
+import Control.Concurrent.STM (atomically, retry)
 import Control.Exception.Context (ExceptionContext)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Exception (AsyncException (ThreadKilled), Exception, ExceptionWithContext (ExceptionWithContext), SomeException, catch, fromException, rethrowIO, throwIO, tryWithContext)
@@ -245,7 +245,8 @@ failing = describe "a defect" $ do
             openGate probe "a.bin"
             awaitRetired queued
             _ ← awaitSTM (awaitFailure pool)
-            pure ()
+            awaitSTM (poolFailureEvidence pool >>= \found → if null found then retry else pure ())
+            map fst <$> atomically (poolFailureEvidence pool) `shouldReturn` ["content read sink"]
       show failure `shouldContain` "primary reader failure"
       map cleanupFailureLabel (cleanupFailuresInContext trail) `shouldContain` ["injected reader cleanup"]
       map cleanupFailureLabel (cleanupFailuresInContext trail) `shouldContain` ["content read sink"]
@@ -369,6 +370,35 @@ exits = describe "every exit keeps its failure and its evidence" $ do
               Left (PoolHasFailed _) → pure ()
               _ → expectationFailure "expected the failed pool to refuse"
       failure `shouldBe` ContentDefect ReadWorkerEndedOpen
+
+  it "keeps every addition to the failure latch: a second worker's failure recorded while the first is still telling a queued sink, and that sink's own failure" $ do
+    probe ← newProbe
+    mapM_ (closeGate probe) ["a.bin", "b.bin"]
+    held ← newGate
+    withInventory [("a.bin", "a"), ("b.bin", "b"), ("c.bin", "c")] $ \_ inventory → do
+      outcomes ← newOutcomes
+      ExceptionWithContext trail failure ←
+        failsWith @IOError $
+          withReadPoolUsing (poolOf 2 4) (probeReader probe (\key _ → throwIO (userError ("reader failure " <> keyPathText key)))) $ \pool → do
+            _ ← accepted pool (request inventory outcomes OrdinaryRead 64 "a.bin")
+            _ ← accepted pool (request inventory outcomes OrdinaryRead 64 "b.bin")
+            awaitStarted probe 2
+            _ ← accepted pool (ReadRequest (keyOf inventory "c.bin") 64 OrdinaryRead (\_ → holdAt held >> throwIO (userError "queued sink failure")))
+            -- The first reader fails and latches; it is now telling the queued job, whose sink holds.
+            openGate probe "a.bin"
+            awaitHeld held
+            -- The second fails and records itself while the first is still telling.
+            openGate probe "b.bin"
+            awaitSTM (poolFailureEvidence pool >>= \found → if null found then retry else pure ())
+            -- Only now does the queued sink fail, and the first worker records that.
+            releaseGate held
+            awaitSTM (poolFailureEvidence pool >>= \found → if length found < 2 then retry else pure ())
+            map fst <$> atomically (poolFailureEvidence pool)
+              `shouldReturn` ["content read subsequent failure", "content read sink"]
+      show failure `shouldContain` "reader failure a.bin"
+      let labels = map cleanupFailureLabel (cleanupFailuresInContext trail)
+      labels `shouldContain` ["content read subsequent failure"]
+      labels `shouldContain` ["content read sink"]
 
   it "a second worker's failure is kept beside the first, which stays the pool's failure" $ do
     probe ← newProbe
