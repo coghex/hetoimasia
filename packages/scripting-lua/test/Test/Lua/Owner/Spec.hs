@@ -7,6 +7,7 @@ import qualified Test.Lua.Owner.Construction
 import qualified Test.Lua.Owner.Independence
 import qualified Test.Lua.Owner.Matrix
 import qualified Test.Lua.Owner.Ownership
+import qualified Test.Lua.Owner.Profile
 import qualified Test.Lua.Owner.Scope
 import qualified Test.Lua.Owner.Shutdown
 
@@ -18,4 +19,5 @@ spec = describe "VM owner" $ do
   Test.Lua.Owner.Shutdown.spec
   Test.Lua.Owner.Scope.spec
   Test.Lua.Owner.Ownership.spec
+  Test.Lua.Owner.Profile.spec
   Test.Lua.Owner.Independence.spec

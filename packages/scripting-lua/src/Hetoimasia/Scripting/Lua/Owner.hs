@@ -6,6 +6,21 @@
 -- own 'Hetoimasia.Scripting.Lua.Bridge.closeVm' leaves closing to the caller,
 -- here nothing but the lifetime closes the VM, and a client cannot forget to.
 --
+-- = Library profiles
+--
+-- 'vmLibraries' is an explicit list. 'vmLibraryProfile' selects a named surface
+-- instead ('vmProfileConfig'); 'LibraryProfileM1' is the filtered surface of the
+-- M1 application's owners, either role: base, string, table, math and coroutine
+-- without @load@, @loadfile@, @dofile@, @collectgarbage@, @string.dump@,
+-- @math.random@ and @math.randomseed@, and no @os@, @io@, @package@, @require@ or
+-- @debug@. It is installed during protected construction, after the libraries
+-- open and before the bindings, the initial chunks and the modules, so the first
+-- authored code already sees the filtered surface. A profile owns the owner's
+-- whole library set: selecting one together with an explicit list is refused at
+-- construction with 'ProfileWithLibraries'. Owners that do not select a profile
+-- are unchanged, and owners are independent whether they do or not. The package
+-- README documents the exact surface.
+--
 -- = One owner per VM
 --
 -- The VM belongs to the thread that runs the lifetime, its execution owner.
@@ -165,6 +180,9 @@ module Hetoimasia.Scripting.Lua.Owner
 
     -- * Standard libraries
   , Library (..)
+  , LibraryProfile (..)
+  , profileLibraries
+  , vmProfileConfig
 
     -- * Chunk names
   , ChunkName
@@ -215,7 +233,7 @@ import Hetoimasia.Scripting.Lua.Internal.Fault
   , VmReentered (..)
   , closeSourceLabel
   )
-import Hetoimasia.Scripting.Lua.Internal.Library (Library (..))
+import Hetoimasia.Scripting.Lua.Internal.Library (Library (..), LibraryProfile (..), profileLibraries)
 import Hetoimasia.Scripting.Lua.Internal.Module
   ( CallResult (..)
   , EntryPoint (..)
@@ -238,6 +256,7 @@ import Hetoimasia.Scripting.Lua.Internal.Owner
       , ownerLimits
       , ownerModules
       , ownerName
+      , ownerProfile
       , ownerRegistration
       , ownerRequests
       )
@@ -262,7 +281,15 @@ import Hetoimasia.Scripting.Lua.Internal.Vm (CallbackScope (..), CallbackSite (.
 data VmConfig = VmConfig
   { vmLibraries ∷ [Library]
     -- ^ Exactly the standard libraries the VM opens, in order. There is no way
-    -- to open all of them at once, and the empty list opens none.
+    -- to open all of them at once, and the empty list opens none. Must be empty
+    -- when 'vmLibraryProfile' is set.
+  , vmLibraryProfile ∷ Maybe LibraryProfile
+    -- ^ A library profile in place of an explicit list. 'Nothing', the default of
+    -- 'vmConfig', opens exactly 'vmLibraries'. A profile owns the owner's whole
+    -- standard-library set, so selecting one together with a non-empty
+    -- 'vmLibraries' is refused at construction, before any authored code runs,
+    -- with a 'BoundaryFault' of reason 'ProfileWithLibraries'. See
+    -- 'vmProfileConfig'.
   , vmInitialChunks ∷ [(ChunkName, ByteString)]
     -- ^ The chunks loaded and run, in order, inside the lifetime and before the
     -- body: initialization. One that fails ends the lifetime with its failure,
@@ -296,7 +323,18 @@ data VmConfig = VmConfig
 -- | A configuration over these libraries with no initial chunk, an empty
 -- registration, no exposed namespace, the default value limits and no module.
 vmConfig ∷ [Library] → VmConfig
-vmConfig libraries = VmConfig libraries [] "owner" emptyRegistration [] defaultValueLimits [] Nothing Nothing
+vmConfig libraries = VmConfig libraries Nothing [] "owner" emptyRegistration [] defaultValueLimits [] Nothing Nothing
+
+-- | A configuration over a library profile, otherwise as 'vmConfig' makes it.
+--
+-- The profile's libraries are opened and filtered during protected construction,
+-- before the bindings, any initial chunk or any module, so the first authored
+-- code already sees the filtered surface. A small client:
+--
+-- > withVmOwner (vmProfileConfig LibraryProfileM1) $ \owner →
+-- >   evalOwned owner (chunkName "check") "assert(load == nil and os == nil and string.dump == nil)"
+vmProfileConfig ∷ LibraryProfile → VmConfig
+vmProfileConfig profile = (vmConfig []) {vmLibraryProfile = Just profile}
 
 -- | Run a body over a VM this owner constructs, and close the VM on every exit.
 --
@@ -313,7 +351,8 @@ withVmOwnerScoped ∷ HasCallStack ⇒ CallbackScope → VmConfig → (OwnedVm �
 withVmOwnerScoped scope config =
   withOwnedVm
     (defaultOwnerConfig (vmLibraries config))
-      { ownerChunks = vmInitialChunks config
+      { ownerProfile = vmLibraryProfile config
+      , ownerChunks = vmInitialChunks config
       , ownerName = vmOwnerName config
       , ownerRegistration = vmRegistration config
       , ownerGranted = vmPolicy config

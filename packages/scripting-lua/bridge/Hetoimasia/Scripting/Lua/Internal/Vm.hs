@@ -95,6 +95,8 @@ module Hetoimasia.Scripting.Lua.Internal.Vm
   , FinalizerPolicy (..)
   , allocateVm
   , openLibraries
+  , openProfile
+  , filterLibraries
   , failConstruction
   , cleanupEvidence
     -- * Finalizers
@@ -211,8 +213,10 @@ import Hetoimasia.Scripting.Lua.Internal.Fault
   )
 import Hetoimasia.Scripting.Lua.Internal.Library
   ( Library
+  , LibraryProfile (LibraryProfileM1)
   , libraryModuleName
   , libraryOpener
+  , profileLibraries
   )
 import Hetoimasia.Scripting.Lua.Internal.Marshal (TaskClosing (..), closeTaskCoroutine)
 import Hetoimasia.Scripting.Lua.Internal.Registration (WaitKind)
@@ -480,6 +484,46 @@ allocateVm spec = do
 openLibraries ∷ Vm → [Library] → IO ()
 openLibraries vm libraries =
   withOpenVm vm openOperation $ \state → traverse_ (openLibrary state) libraries
+
+-- | Open a profile's libraries and filter them, as one operation of the VM:
+-- under its gate, by its owner, restoring the stack it borrowed.
+--
+-- Each library opens as 'openLibraries' opens it. The filtering that follows is
+-- one protected Lua call, so the names it removes are built and the library
+-- tables are written with every allocation inside a protected frame; memory
+-- running out there is a status classified like any other failed call. Nothing
+-- authored runs between a library opening and its filtering, because this is a
+-- single operation of the VM that runs no chunk and no module.
+openProfile ∷ Vm → LibraryProfile → IO ()
+openProfile vm profile =
+  withOpenVm vm openOperation $ \state → do
+    traverse_ (openLibrary state) (profileLibraries profile)
+    filterProfile state profile
+
+-- | Filter the libraries a profile names that are already open, as one operation
+-- of the VM. 'openProfile' does this after opening them; it is separate for the
+-- fixtures that put a VM in a state the owner never does, to show how the
+-- filtering fails.
+filterLibraries ∷ Vm → LibraryProfile → IO ()
+filterLibraries vm profile = withOpenVm vm openOperation (`filterProfile` profile)
+
+-- | Remove the profile's excluded capabilities from the open libraries, with the
+-- whole removal inside one protected Lua call, restoring the stack it borrowed.
+filterProfile ∷ State → LibraryProfile → IO ()
+filterProfile state profile = do
+  entry ← lua_gettop state
+  status ← case profile of
+    LibraryProfileM1 → hetoimasia_lua_filter_m1 state
+  unless (status == LUA_OK) $ do
+    value ← renderFailure state entry
+    lua_settop state entry
+    throwFailure
+      luaComponent
+      openOperation
+      [("profile", showText profile)]
+      (LuaFault (classify status) ("profile " <> showText profile) value)
+  -- The protected call keeps nothing on success.
+  lua_settop state entry
 
 -- | End a VM's construction that failed: close the VM through 'closeVm', so a
 -- partly initialized state is torn down as a finished one is, and raise the
@@ -878,6 +922,13 @@ foreign import ccall safe "hetoimasia_lua_bridge.h hetoimasia_lua_close"
 -- anything, including something that calls back into Haskell.
 foreign import ccall safe "hetoimasia_lua_bridge.h hetoimasia_lua_requiref"
   hetoimasia_lua_requiref ∷ State → Ptr CChar → CFunction → CInt → IO StatusCode
+
+-- | Remove the M1 profile's excluded capabilities from the open libraries, with
+-- the whole operation inside one protected Lua call.
+--
+-- @safe@, like the other protected calls: it runs Lua.
+foreign import ccall safe "hetoimasia_lua_bridge.h hetoimasia_lua_filter_m1"
+  hetoimasia_lua_filter_m1 ∷ State → IO StatusCode
 
 showText ∷ Show a ⇒ a → Text
 showText = Text.pack . show

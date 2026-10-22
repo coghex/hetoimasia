@@ -288,6 +288,34 @@ spec = describe "opacity across the package boundary" $ do
                    , "handle after the lifetime = VmClosed"
                    ]
 
+  it "accepts, links and runs a client opting a binding in to recoverable refusals through the public modules alone" $
+    withClient "Main.hs" recoverablePublicClient $ \compile → do
+      outcome ← compile Link
+      case clientStatus outcome of
+        ExitSuccess → pure ()
+        status →
+          expectationFailure
+            ( "the recoverable-refusal client must compile, but the compiler exited with "
+                <> show status
+                <> ":\n"
+                <> clientOutput outcome
+            )
+      (status, out, err) ←
+        readCreateProcessWithExitCode
+          (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
+          ""
+      status `shouldBe` ExitSuccess
+      err `shouldBe` ""
+      lines out
+        `shouldBe` [ "caught = app.double: argument 1: a float where an integer is declared"
+                   , "next call = 42"
+                   , "actions run = 1"
+                   , "closed = app.tick: engine closed"
+                   , "open again = ticked"
+                   , "uncaught = ErrorMessage \"app.double: argument 1: a float where an integer is declared\" False"
+                   , "generic binding = refused by the fault it always was"
+                   ]
+
   it "finds the dependency store without reading a project it cannot write to" $
     withSystemTempDirectory "hetoimasia-readonly" $ \directory → do
       -- A checkout shaped like this one that the run may not write to: an
@@ -547,6 +575,77 @@ ownerPublicClient =
     , "    Right () → putStrLn \"another thread = ran\""
     , "    Left refusal → putStrLn (\"another thread = \" <> show refusal)"
     , "  putStrLn \"after another thread = still ran\""
+    ]
+
+-- | An application that opts a binding in to recoverable refusals and gives another
+-- a precondition reading the engine's own state, from the public modules alone: the
+-- private bridge's handlers, escapes and markers are not needed.
+recoverablePublicClient ∷ String
+recoverablePublicClient =
+  unlines
+    [ "{-# LANGUAGE LambdaCase #-}"
+    , "{-# LANGUAGE ScopedTypeVariables #-}"
+    , "{-# LANGUAGE OverloadedStrings #-}"
+    , "module Main (main) where"
+    , ""
+    , "import Control.Exception (try)"
+    , "import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)"
+    , "import Data.Text (Text)"
+    , "import qualified Data.Text as Text"
+    , "import Hetoimasia.Scripting.Lua.Owner"
+    , "  ( BoundaryFault"
+    , "  , Library (LibraryBase)"
+    , "  , LuaFault (faultValue)"
+    , "  , VmConfig (vmOwnerName, vmPolicy, vmRegistration)"
+    , "  , chunkName"
+    , "  , evalOwned"
+    , "  , vmConfig"
+    , "  , withVmOwner"
+    , "  )"
+    , "import Hetoimasia.Scripting.Lua.Registration"
+    , "  ( namespace"
+    , "  , recoverableRefusals"
+    , "  , registration"
+    , "  , snapshotQuery"
+    , "  , stateOperation"
+    , "  , withPrecondition"
+    , "  )"
+    , "import Hetoimasia.Scripting.Lua.Value (Schema (SInteger, SText), Value (VInteger, VText))"
+    , ""
+    , "main ∷ IO ()"
+    , "main = do"
+    , "  ran <- newIORef (0 ∷ Int)"
+    , "  -- What stands for the engine's own state: only the application writes it."
+    , "  engineOpen <- newIORef True"
+    , "  let say = stateOperation \"say\" [SText] [] (\\case [VText text] → putStrLn (Text.unpack text) >> pure []; _ → pure [])"
+    , "      double = snapshotQuery \"double\" [SInteger] [SInteger] $ \\case"
+    , "        [VInteger n] → modifyIORef' ran (+ 1) >> pure [VInteger (2 * n)]"
+    , "        _ → pure []"
+    , "      tick = stateOperation \"tick\" [] [] (\\_ → putStrLn \"open again = ticked\" >> pure [])"
+    , "      closedUnlessOpen _ = (\\open → if open then Nothing else Just (\"engine closed\" ∷ Text)) <$> readIORef engineOpen"
+    , "      generic = snapshotQuery \"generic\" [SInteger] [SInteger] (\\_ → pure [])"
+    , "  registered ← either (fail . show) pure . registration [] $"
+    , "    [namespace \"app\" [say, recoverableRefusals double, withPrecondition closedUnlessOpen tick, generic]]"
+    , "  let config = (vmConfig [LibraryBase]) {vmRegistration = registered, vmPolicy = [\"app\"], vmOwnerName = \"client\"}"
+    , "  withVmOwner config $ \\owned → do"
+    , "    let run name = evalOwned owned (chunkName name)"
+    , "    run \"caught\""
+    , "      \"local ok, err = pcall(app.double, 1.5); assert(ok == false); app.say('caught = ' .. err)\""
+    , "    run \"next\" \"app.say('next call = ' .. app.double(21))\""
+    , "    readIORef ran >>= \\held → putStrLn (\"actions run = \" <> show held)"
+    , "    writeIORef engineOpen False"
+    , "    run \"closed\" \"local ok, err = pcall(app.tick); assert(ok == false); app.say('closed = ' .. err)\""
+    , "    writeIORef engineOpen True"
+    , "    run \"open\" \"app.tick()\""
+    , "    uncaught ← try (run \"uncaught\" \"app.double(1.5)\")"
+    , "    case uncaught of"
+    , "      Left fault → putStrLn (\"uncaught = \" <> show (faultValue fault))"
+    , "      Right () → putStrLn \"uncaught = none\""
+    , "    -- A binding that is not opted in keeps the fault a script cannot hide."
+    , "    generic' ← try (run \"generic\" \"pcall(app.generic, 1.5)\")"
+    , "    case generic' of"
+    , "      Left (_ ∷ BoundaryFault) → putStrLn \"generic binding = refused by the fault it always was\""
+    , "      Right () → putStrLn \"generic binding = hidden\""
     ]
 
 moduleHandleClient ∷ String

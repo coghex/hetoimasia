@@ -56,6 +56,7 @@ module Hetoimasia.Scripting.Lua.Internal.Callback
   , installCallback
   , installBinding
   , escapeMarker
+  , failedResults
   ) where
 
 import Control.Exception (ExceptionWithContext, SomeException, mask, tryWithContext)
@@ -294,9 +295,13 @@ hetoimasiaEnter state = mask $ \restore → do
 
 foreign export ccall "hetoimasia_lua_enter" hetoimasiaEnter ∷ PreCFunction
 
--- | The result count that means "the value on top is the failure marker".
+-- | The result count that means "raise the value on top as a Lua error".
 --
--- Negative, because no real call returns a negative number of results.
+-- Negative, because no real call returns a negative number of results. The value
+-- is the failure marker when the failure was recorded on the VM. A handler that
+-- leaves a message instead, which it builds with a protected push, raises an
+-- ordinary Lua error that records nothing: a script can catch it, and the call
+-- it was caught in succeeds.
 failedResults ∷ NumResults
 failedResults = NumResults (-1)
 

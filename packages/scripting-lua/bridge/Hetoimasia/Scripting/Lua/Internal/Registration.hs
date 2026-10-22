@@ -40,6 +40,14 @@
 -- for and with which arguments. It is eligible for the direct path only. Where a
 -- call to one cannot reach a scheduler it is refused as a typed fault of the call.
 --
+-- = Recoverable refusals
+--
+-- A binding opted in with 'recoverableRefusals' or 'withPrecondition' reports what it
+-- refuses before its action, to a script that can catch it, as an ordinary Lua
+-- error, where any other binding's refusal is a typed fault of the call that a
+-- script cannot hide. See 'recoverableRefusals' for what that covers and
+-- "Hetoimasia.Scripting.Lua.Internal.Binding" for what it does not.
+--
 -- = Bounds
 --
 -- Every size a registration can have is bounded, and each bound is documented
@@ -76,6 +84,11 @@ module Hetoimasia.Scripting.Lua.Internal.Registration
   , confinedEligible
   , finalizerEligible
   , withoutDirectPath
+  , recoverableRefusals
+  , withPrecondition
+  , Precondition
+  , OwnerContexts (..)
+  , refusalReasonLimit
   , commandReasonLimit
   , commandResults
     -- * Namespaces and capability types
@@ -218,24 +231,29 @@ data Binding = Binding
     -- nothing by itself.
   , bindingFinalizer ∷ !Bool
     -- ^ Eligible to run when a Lua finalizer reaches it during the VM's close.
+  , bindingRecoverable ∷ !Bool
+    -- ^ Opted in to ordinary Lua errors for the refusals made before its action.
+    -- Never the default; see 'recoverableRefusals'.
+  , bindingPreconditions ∷ ![Precondition]
+    -- ^ Checked, in order, before anything else of a call: see 'withPrecondition'.
   , bindingAction ∷ Action
   }
 
 -- | A snapshot query: reads a view and answers values.
 snapshotQuery ∷ Text → [Schema] → [Schema] → ([Value] → IO [Value]) → Binding
 snapshotQuery name arguments results action =
-  Binding name SnapshotQuery arguments results True False False (ValuesAction action)
+  Binding name SnapshotQuery arguments results True False False False [] (ValuesAction action)
 
 -- | An owned state operation: mutates only the domain's documented state.
 stateOperation ∷ Text → [Schema] → [Schema] → ([Value] → IO [Value]) → Binding
 stateOperation name arguments results action =
-  Binding name OwnedStateOperation arguments results True False False (ValuesAction action)
+  Binding name OwnedStateOperation arguments results True False False False [] (ValuesAction action)
 
 -- | A command or UI intention: validates and admits, and answers acceptance or a
 -- bounded rejection ('commandResults').
 commandIntention ∷ Text → [Schema] → ([Value] → IO CommandResult) → Binding
 commandIntention name arguments action =
-  Binding name CommandOrUiIntention arguments commandResults True False False (CommandAction action)
+  Binding name CommandOrUiIntention arguments commandResults True False False False [] (CommandAction action)
 
 -- | An asynchronous native request: accepted and classified. A Lua call to it is
 -- refused as not yet supported, and the action never runs, from an owner that was
@@ -254,7 +272,7 @@ asynchronousNativeRequest name arguments results action = asynchronousNativeRequ
 -- work. Otherwise as 'asynchronousNativeRequest'.
 asynchronousNativeRequestIn ∷ Text → [Schema] → [Schema] → (RequestContext → [Value] → IO [Value]) → Binding
 asynchronousNativeRequestIn name arguments results action =
-  Binding name AsynchronousNativeRequest arguments results True False False (RequestAction action)
+  Binding name AsynchronousNativeRequest arguments results True False False False [] (RequestAction action)
 
 -- | A lifecycle operation: accepted and classified. A Lua call to it is refused as
 -- not yet supported, and the action never runs, from an owner that was configured
@@ -271,7 +289,7 @@ lifecycleOperation name arguments results action = lifecycleOperationIn name arg
 -- it. Otherwise as 'lifecycleOperation'.
 lifecycleOperationIn ∷ Text → [Schema] → [Schema] → (LifecycleContext → [Value] → IO [Value]) → Binding
 lifecycleOperationIn name arguments results action =
-  Binding name LifecycleOperation arguments results True False False (LifecycleAction action)
+  Binding name LifecycleOperation arguments results True False False False [] (LifecycleAction action)
 
 -- | What an owner is configured with so that its lifecycle operations are
 -- delivered: an opaque value of the application's runtime, which this host library
@@ -323,7 +341,7 @@ fromRequestContext (RequestContext held) = fromDynamic held
 -- handle of any other type, or given to any other binding, keeps the refusal.
 releaseOperation ∷ Text → Text → [Schema] → ([Value] → IO [Value]) → Binding
 releaseOperation name handleType results action =
-  Binding name OwnedStateOperation [SCapability handleType] results True False False (ReleaseAction action)
+  Binding name OwnedStateOperation [SCapability handleType] results True False False False [] (ReleaseAction action)
 
 -- | Whether a binding's action is run for a handle whose lease has ended: only an
 -- explicit release.
@@ -341,14 +359,14 @@ acceptsRetired binding = case bindingAction binding of
 -- trusted direct path only, and never for the confined path.
 yieldOperation ∷ Text → Binding
 yieldOperation name =
-  Binding name SchedulerOperation [] [] True False False (SuspendAction SuspendYield)
+  Binding name SchedulerOperation [] [] True False False False [] (SuspendAction SuspendYield)
 
 -- | A wait: control goes back with the wait the script asked for and its
 -- arguments, which the schemas bound like any other call's. The host reports
 -- them and waits for nothing itself. Refused wherever a yield is.
 waitOperation ∷ Text → WaitKind → [Schema] → Binding
 waitOperation name kind arguments =
-  Binding name SchedulerOperation arguments [] True False False (SuspendAction (SuspendWait kind))
+  Binding name SchedulerOperation arguments [] True False False False [] (SuspendAction (SuspendWait kind))
 
 -- | Whether a binding is a scheduler operation, which suspends the coroutine it
 -- is called from.
@@ -356,6 +374,51 @@ isSuspending ∷ Binding → Bool
 isSuspending binding = case bindingAction binding of
   SuspendAction _ → True
   _ → False
+
+-- | The most a refusal's reason may be, in bytes of UTF-8: what a precondition says
+-- when it refuses, and what the host says of a value it refused. The same bound
+-- as a command's rejection ('commandReasonLimit').
+refusalReasonLimit ∷ Int
+refusalReasonLimit = commandReasonLimit
+
+-- | What a precondition is handed: the contexts the owner whose script made the
+-- call was configured with, which are the engine's own and never a value the
+-- script supplied. 'Nothing' for a context the owner has none of.
+data OwnerContexts = OwnerContexts
+  { contextLifecycle ∷ !(Maybe LifecycleContext)
+  , contextRequests ∷ !(Maybe RequestContext)
+  }
+
+-- | A check made before a binding's action, and before anything of the call is
+-- read: 'Nothing' lets the call go on, 'Just' the reason refuses it. It runs
+-- no provider or native action, accepts no request and publishes nothing, and
+-- reads the role, phase or instance it checks from engine-owned state reached
+-- through what the owner was configured with, or captured when the registration
+-- was built; never from an argument or a Lua-visible table. A reason is at most
+-- 'refusalReasonLimit' bytes; a longer one is a typed fault of the call, because
+-- it is a defect of the application. An exception it raises is the application's
+-- own failure, as for any application code, and is not a refusal.
+type Precondition = OwnerContexts → IO (Maybe Text)
+
+-- | Opt the binding in to ordinary Lua errors for the refusals the host makes
+-- before the action runs: the wrong number of arguments, a value that is not of
+-- the declared shape or breaks a limit, and a capability that is foreign, of the
+-- wrong type or no longer live. Each reaches the script as a Lua error it can
+-- catch with @pcall@, and the call it was caught in goes on and can succeed; the
+-- action did not run. The host's own failures, the application's, and every
+-- refusal after the action keep the fault they have. Bindings that are not opted
+-- in are unchanged.
+recoverableRefusals ∷ Binding → Binding
+recoverableRefusals binding = binding {bindingRecoverable = True}
+
+-- | Opt the binding in ('recoverableRefusals') and have a precondition checked
+-- first. Preconditions of one binding run in the order they were added, before
+-- the host checks whether a scheduler operation can suspend, and before any
+-- argument is read, so an adapter can refuse a wait made where it is not allowed
+-- before the host reports anything.
+withPrecondition ∷ Precondition → Binding → Binding
+withPrecondition check binding =
+  binding {bindingRecoverable = True, bindingPreconditions = bindingPreconditions binding <> [check]}
 
 -- | Declare the binding eligible for the confined path. Refused when the
 -- registration is built if any schema it declares is not a bounded copied value.
