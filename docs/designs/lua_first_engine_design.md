@@ -74,7 +74,7 @@ concrete precondition
 - [x] LFE-10. Load raw data through owned bounded file workers — [#524]
 - [x] LFE-11. Join shared module jobs and deliver them at assigned positions — [#525]
 - [x] LFE-12. Bind per-instance content, request, time and output APIs — [#526]
-- [ ] LFE-13. Coordinate role startup gates, failure policy and session stop
+- [x] LFE-13. Coordinate role startup gates, failure policy and session stop — [#527]
 - [ ] LFE-26. Expose UI status, quit and the unavailable-state guard
 - [ ] LFE-14. Preflight static PNG structure and bounded inflation
 - [ ] LFE-15. Decode the approved PNG variants within accounted workspace
