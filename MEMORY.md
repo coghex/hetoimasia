@@ -12,10 +12,13 @@ checks merged work and changed issues against it and resumes from
 
 ## Where things stand
 
-- Lua: [runtime design](docs/lua_runtime_design.md), trusted milestone delivered
-  and owner-accepted 2026-10-21 (#500). The confined mod branch (LUA-9 to LUA-13,
-  LUA-16, LUA-17) waits on Q-5. The [Lua-first engine design](docs/designs/lua_first_engine_design.md)
-  is `exploring`; its questions go to `#het-luafirst`.
+- Lua: the trusted foundation ([runtime design](docs/lua_runtime_design.md)) is
+  delivered and owner-accepted 2026-10-21 (#500); #145 closed under its revised
+  trusted scope. Confinement (LUA-9 to LUA-13, LUA-16, LUA-17) is deferred outside
+  active delivery, not implemented. The [Lua-first engine design](docs/designs/lua_first_engine_design.md)
+  defines M1, a Lua-driven textured quad in a window with a real logical VM and
+  no gameplay state store or mod activation; it records its own readiness and
+  next steps, and its questions go to `#het-luafirst`.
 - Rendering: the [2D renderer design](docs/designs/render_2d_design.md) is delivered
   except deferred #446; [GPU backend contract](docs/gpu_backend.md);
   [samples](samples/README.md).
@@ -32,6 +35,11 @@ checks merged work and changed issues against it and resumes from
   dedicated type modules, module types under the owning module's directory
   (`Camera/Types.hs`), `Base`/`Types` under about 600 lines. `packages/math`
   imports no other local or graphics package.
+- 2026-10-21, [Lua-first design](docs/designs/lua_first_engine_design.md) D-2/D-5
+  and [V-9](docs/vision.md): game and mod Lua alike are trusted, in-process code
+  with one filtered standard library and no OS functionality. Filtering is not
+  containment: trusted Lua can hang its VM or exhaust memory. This supersedes the
+  2026-09-22 entry's "mods keep confined processes".
 - 2026-09-22: first-party game scripts are trusted and run in-process in the UI
   and gameplay VM owners
   ([Lua D-12](docs/lua_runtime_design.md#d-12-run-first-party-scripts-trusted-and-in-process));
@@ -56,15 +64,15 @@ checks merged work and changed issues against it and resumes from
 
 ## Open owner decisions
 
-- Q-5 on Linux ([verdict](docs/archive/lua_linux_confinement_verdict.md)): Ubuntu
-  24.04's `kernel.apparmor_restrict_unprivileged_userns=1` and the CI container
+- Q-5, deferred; it matters again only if hostile-code support is revived. On
+  Linux ([verdict](docs/archive/lua_linux_confinement_verdict.md)): Ubuntu 24.04's `kernel.apparmor_restrict_unprivileged_userns=1` and the CI container
   both deny usable unprivileged user namespaces. Options: relax the restriction,
   ship an AppArmor profile, a file-capability helper, or Landlock (unprivileged,
   no namespace), the one worth evaluating next.
-- Q-5 on macOS ([verdict](docs/archive/macos_confinement_verdict.md)): accept the
-  unsupported-SPI profile (`sandbox_init_with_parameters`,
+- Q-5 on macOS, deferred likewise ([verdict](docs/archive/macos_confinement_verdict.md)):
+  accept the unsupported-SPI profile (`sandbox_init_with_parameters`,
   `posix_spawnattr_setjetsam_ext`), accept App Sandbox's weaker contract, or drop
-  macOS from untrusted-mod targets.
+  macOS from any future untrusted-mod targets.
 - [Runtime tracing](docs/runtime_tracing_design.md): backend, viewer and cost
   choices; RTC-1 unprocessed.
 - #446, sampling an offscreen pass's target: deferred; Q-10 is settled before it
