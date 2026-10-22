@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-56/Q-2k: module capacity and dependency-limit failures.
+The current checkpoint is P-57/Q-2l: literal root-relative content paths.
+D-59 accepts pre-admission module-limit refusal and required dependency-limit failure.
 D-58 accepts one import chain per VM and queued-dependency evaluation timing.
 D-57 accepts VM-owned shared module jobs with per-instance waiters.
 D-56 accepts resumable module-level imports and explicit loading from hooks.
@@ -1766,7 +1767,40 @@ Eligible UI hooks and stop/control still run while the UI loader waits for
 source bytes. A due unfinished logical chain holds its tick, with the other
 VM independent. The manager explained the cost: a slow dependency delays
 unrelated module evaluation in that VM. The owner chose this over interleaved
-module loads. Capacity behavior and exact bounds remain to be settled.
+module loads. D-59 subsequently settles capacity failure behavior; exact bounds
+remain to be settled.
+
+### D-59. Refuse a full module cache before admission; fail accepted over-limit loads
+
+**Delivery:** M1; permanent module limits are distinct from temporary request pressure.
+
+Owner answer, **2026-10-22 01:45:58 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: refuse up front (Rec.)
+
+Authenticated relay: `het-manager`, message `8cwn9fqr4645y6h4cwifkw3vt6`,
+posted **2026-10-22 01:45:58.274 UTC** in `#het-luafirst`, replying to Q-2k
+message `hu475cjqaprwewihes8uuvwh4w`.
+
+Accept P-56's A: a new module requested with no cache capacity is refused
+before admission by an ordinary catchable Lua error naming the limit. It starts
+no work and creates no handle or cache entry. Existing cached modules and
+joining existing loads remain available subject to request capacity. Temporary
+request pressure still returns `busy` with atomic reservations.
+
+An accepted load can later fail on a discovered dependency's cache, source-size
+or depth limit. That is a required-load failure under the established timing,
+attribution and boot/runtime rules, with admitted failed entries retained.
+There is no waiting for cache space, eviction or retry. Completed dependencies
+stay cached; a never-admitted dependency gets no extra cache entry. Catching a
+failed required import cannot make its containing failed load succeed.
+
+The manager explained the cost: a permanent-limit error as well as `busy`,
+failed entries consuming the session budget, and accepted loads failing on
+later dependencies. The owner chose refusal up front over failing the VM for
+pre-admission cache exhaustion. Concrete numbers and configuration remain open;
+the existing host's limits were evidence, not selected defaults for this loader.
 
 ## Proposals
 
@@ -4709,7 +4743,7 @@ already provide this module queue or dependency-promotion protocol.
 
 ### P-56. Refuse permanent module limits without waiting for cache space
 
-**Unapproved; active checkpoint Q-2k. Delivery: M1.** D-7/D-57 retain module
+**A accepted by D-59 through Q-2k. Delivery: M1.** D-7/D-57 retain module
 identity and ready/failed outcomes until VM end. Unlike request slots, those
 entries do not become free after taking a result, cancelling a waiter or
 releasing a texture. Recommend A: use a bounded per-VM identity cache counting
@@ -4776,6 +4810,61 @@ Evidence: the current host's `Internal/Module.hs` bounds modules at 256 and
 each source at 1 MiB, and refuses before loading; those are existing facts,
 not automatically the new loader's selected numbers. Its loaded-handle map
 does not supply this pending/failed cache or dependency-limit supervision.
+
+### P-57. Require literal root-relative paths instead of normalizing shortcuts
+
+**Unapproved; active checkpoint Q-2l. Delivery: M1.** Recommend A: every
+module, data and texture reference names an explicit file relative to its
+selected content root, using `/` between nonempty path segments. For example,
+`lua/util.lua` names that file from the root, not from the importing script's
+directory. D-6 still determines the selected content root; concrete syntax
+for explicitly naming a root remains part of the API package.
+
+Reject an empty path, leading or trailing slash, repeated slash, a segment
+equal to `.` or `..`, backslash, colon, NUL or other control characters.
+Paths are valid UTF-8 text, never native byte paths. Do not trim whitespace,
+expand `~` or environment variables, interpret URLs, or search the process's
+working directory. Absolute paths, drive paths and network paths are not
+content references. Do not add an extension, search an `init.lua`, or try
+alternate filenames: `lua/util` names precisely a file called `util`, not
+`util.lua` or `util/init.lua`. File type/decoder eligibility is separate.
+
+This choice is about separator/dot-segment grammar and explicit file selection.
+Filename character repertoire beyond these exclusions, case matching,
+Unicode normalization/collision handling and numeric path limits still need
+their own concrete naming contract. In particular, accepting UTF-8 at this
+boundary is not a promise that every Unicode filename is portable across
+supported filesystems. The startup inventory and later opens must use the
+same eventual identity rules; no implementation may silently inherit a host
+filesystem's alias behavior as the Lua module-cache contract.
+
+Validate syntax before request admission or filesystem work. An invalid hook
+argument is an ordinary Lua error, including for optional loads; it is not
+`busy` or an optional missing-file result. Invalid entry references in the
+manifest fail validation before Lua. An invalid import inside engine-managed
+module evaluation fails that required import/load under D-59, without opening
+the path. A syntactically valid but unavailable file follows existing content
+failure rules; this grammar does not hide missing or changed files.
+
+Alternative B accepts convenient relative spellings such as `./lua/util.lua`,
+repeated separators, backslashes and `lua/helpers/../util.lua`, normalizes them
+to one root-relative key, and rejects any escape beyond the root. Root selection,
+explicit filenames and no ambient filesystem access remain the same. B needs
+precise normalization and diagnostic rules so aliases cannot create duplicate
+module evaluations, cache entries or fingerprint identities.
+
+A is recommended because authored references have an explicit spelling and
+one separator convention without a path-rewriting layer. Its cost is that
+authors must write the full path from the content root and change scripts
+using native separators or dot-segment shortcuts; imports do not become
+relative to their source file. This is a validation contract, not a substitute
+for D-11's actual no-symlink opening/retirement rules or proof against races.
+
+Qualification covers each refused spelling before native work, explicit
+root-relative resolution from nested scripts, no extension/directory fallback,
+manifest validation and required/optional failure classification. The current
+Lua host accepts application-supplied module bytes and has no scoped content
+path resolver; this is new content-service behavior, not an existing host API.
 
 ## Open questions
 
@@ -4861,12 +4950,18 @@ is request-admission order, as clarified by the manager's authenticated record.
 
 #### Q-2k. How does a full module cache or a dependency limit fail?
 
-**Active checkpoint, P-56.** A (recommended): permanent cache exhaustion before
-root admission is an ordinary Lua error, with no work started; an admitted
-chain hitting a dependency/source/depth limit fails the required load and
-caches admitted failures, without waiting, eviction or retry. Temporary
-request pressure still returns `busy`. B: permanent cache exhaustion fails
-the VM even before root admission. Concrete numeric bounds remain open.
+Resolved by D-59: P-56's A, a catchable pre-admission error for permanent module
+cache exhaustion, required-load failure for accepted dependency/source/depth
+limits, and no waiting, eviction or retry. Temporary request pressure remains
+`busy`. Concrete numeric bounds remain open.
+
+#### Q-2l. Require literal root-relative paths or normalize relative shortcuts?
+
+**Active checkpoint, P-57.** A (recommended): explicit file paths from the
+selected root, `/` separators, no empty/dot/parent segments or native-path
+shortcuts, and no extension/directory search. B: accept and normalize relative
+aliases to the same root-relative key. Filename repertoire, case/Unicode rules
+and numeric path limits remain separate naming-contract questions.
 
 ### Q-3. What is the generic executable's boot and session contract?
 
