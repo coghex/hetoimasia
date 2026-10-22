@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-52/Q-6l: the data-file result exposed to Lua.
+The current checkpoint is P-53/Q-2h: module dependency loading without blocking hooks.
+D-55 accepts bounded byte-for-byte data-file results.
 D-54 accepts one-shot request results with explicit terminal consumption.
 D-53 accepts recoverable busy admission with atomic reservations.
 D-52 accepts required failure escalation at eligible settlement.
@@ -1639,6 +1640,31 @@ The manager presented the authoring cost of taking every terminal result,
 including cancellations. The owner chose A rather than a repeat-readable
 result object with a dispose lifetime. Module exports are not one-shot request
 results; their import/cache contract remains separate.
+
+### D-55. Data requests return the complete file as raw bytes
+
+**Delivery:** M1.
+
+Owner answer, **2026-10-22 01:07:29 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: raw bytes (Rec.)
+
+Authenticated relay: `het-manager`, message `c4fgs7znbngtniwmkthk2fwgbw`,
+posted **2026-10-22 01:07:29.856 UTC** in `#het-luafirst`, replying to Q-6l
+message `gv3t6dxq7ncarze6qibve7j5w2`.
+
+Accept P-52's A: the whole file as a bounded Lua byte string, without decoding,
+normalization, parsing or execution. Each request reads and fingerprint-checks
+its own bytes; no data cache, stream or open-file handle is exposed. Oversized
+content fails under required/optional rules instead of truncating. Returned
+strings have ordinary Lua lifetime; native files/buffers retire through the
+provider, preserving request accounting and cleanup.
+
+The manager presented the own-parser/repeated-I/O cost and illustrated parsing
+with a shipped Lua JSON/CSV library. That example does not select a library or
+add an engine-shipped parser deliverable. The owner chose raw bytes rather
+than engine-parsed data. Script loading remains a separate controlled path.
 
 ## Proposals
 
@@ -4322,7 +4348,7 @@ reusing result operations does not claim those changes already exist.
 
 ### P-52. Data loading returns a bounded copy of the file's bytes
 
-**Unapproved; active checkpoint Q-6l. Delivery: M1.** Recommend A: a data-file
+**A accepted by D-55 through Q-6l. Delivery: M1.** Recommend A: a data-file
 request reads one scoped content file and succeeds with its complete bytes as
 a Lua string. Preserve bytes exactly, including embedded zero bytes, invalid
 UTF-8, byte-order marks and line endings; do not decode, normalize, parse or
@@ -4371,6 +4397,74 @@ Evidence: the [Lua value boundary](../../packages/scripting-lua/README.md)
 already distinguishes byte-string and UTF-8-text schemas over Lua's string
 type and bounds copied values. The scoped filesystem provider and result-size
 accounting are new M1 integration work; no existing ambient Lua I/O is reused.
+
+### P-53. Discover dependencies through resumable module-level imports
+
+**Unapproved; active checkpoint Q-2h. Delivery: M1.** D-7/D-8 allow a module
+to import dependencies at top level, while D-9 requires real runtime loading
+and D-15 forbids waiting in init. The missing choice is how dependency reads
+and evaluation fit those boundaries. Recommend A: a module-level engine import
+can suspend that module's loader continuation while a missing dependency's
+verified source is read/evaluated, then resume with its completed export table.
+An illustrative `local util = import("lua/util.lua")` therefore needs no second
+dependency list. Names may be computed by permitted Lua code; all references
+still obey the explicit content-root/path rules. Exact API spelling is open.
+
+This suspension belongs to an engine-managed module evaluation, not to an
+instance's init hook. Only the module-import mechanism may suspend that loader
+for dependency work; general clock/request waits and effectful service calls
+remain unavailable at module top level under D-8. The VM owner stays available
+to make required progress rather than blocking inside a filesystem binding.
+All Lua evaluation/resumption happens through the VM's protected owner; no
+native binding re-enters its own VM or runs Lua on a provider thread.
+
+Before root init, the launcher finishes loading/evaluating that role's entry
+and its discovered dependencies and validates the behavior as already required.
+Within lifecycle hooks, already-loaded exports can be obtained without waiting.
+An uncached runtime module is requested explicitly and becomes available later;
+init may start that request but cannot synchronously import-and-wait for it.
+An attempted uncached immediate lookup from a hook is refused, not a blocking
+shortcut. A later update/event can observe or cooperatively await completion
+and then use the cached exports. The module-request result/lookup API is still
+to be specified; it must keep Lua tables/functions inside their VM rather than
+send them through copied provider-value schemas.
+
+D-7 remains: one evaluation per root/path per VM, the same successful exports,
+cycles rejected with their path chain, failures retained without retry, and no
+partly initialized exports. D-8 still grants no acquiring instance's resource
+authority to a dependency. Top-level logs or mutations of already shared Lua
+tables are not rolled back. This makes evaluation timing observable: a logical
+runtime load must not execute new module top-level code before its assigned
+service position. If discovering/fetching dependencies then takes longer, hold
+logical progress there while the separate UI can continue; do not leak early
+effects or stretch/drop ticks. Presentation evaluates through its own safe
+arrival/scheduler boundaries. A trusted non-yielding module can still hang its
+VM; resumable I/O is not preemption or hostile-code containment.
+
+Alternative B requires a non-executable dependency declaration for each module,
+loaded before evaluating it. Top-level imports only look up those completed
+declared dependencies; undeclared imports are refused. This avoids suspension
+inside module evaluation but makes authors maintain dependency metadata beside
+their Lua and prevents discovering an unlisted dependency from executing code.
+It must still provide genuine runtime loading of the declared graph, preserve
+D-7 cache/failure rules and keep init finite. Its metadata format would need
+separate signoff if selected.
+
+A is recommended for the Lua-first direction because dependencies stay beside
+the code that uses them, with demand loading and once-per-VM exports intact.
+Its cost is substantial and explicit: a protected resumable loader, per-VM
+dependency/cache state, cycle detection and integration with logical service
+positions. It is not a wrapper around synchronous file reads. Shared in-flight
+imports, cancellation when callers go away, exact limits and the module API
+need subsequent concrete contracts whichever route is chosen; those are not
+silently decided by selecting this dependency mechanism.
+
+Evidence: the [current Lua host](../../packages/scripting-lua/README.md#modules-and-entry-points)
+loads application-supplied text into distinct module environments and exposes
+declared entry points, not this Lua-to-Lua export-table/import protocol. Its
+callback boundary refuses VM re-entry. The new loader must extend a narrow
+owner-controlled path and qualify suspension, effect eligibility, cycles,
+logical visibility and independent UI progress before being called delivered.
 
 ## Open questions
 
@@ -4432,6 +4526,14 @@ of the selected root, root registration and logical path grammar remain open.
 Resolved by D-12: loads required by default, with explicit optional data and
 textures returning structured failures. Modules stay required; host/cleanup
 failure authority and D-10's version checks remain intact.
+
+#### Q-2h. Discover module dependencies through imports or declare them before evaluation?
+
+**Active checkpoint, P-53.** A (recommended): protected resumable module-level
+imports, with explicit asynchronous requests for uncached modules from hooks.
+B: non-executable dependency lists loaded first, with top-level imports limited
+to declared completed dependencies. Both preserve finite init, cache/cycle/failure
+rules and logical effect timing; shared-load cancellation remains to be designed.
 
 ### Q-3. What is the generic executable's boot and session contract?
 
@@ -4715,9 +4817,9 @@ Repeat-readable request objects with a dispose lifetime were not chosen.
 
 #### Q-6l. Does a data-file request return bytes or engine-parsed structured data?
 
-**Active checkpoint, P-52.** A (recommended): a bounded byte-for-byte Lua string,
-no parsing/execution, cache or open-file handle. B: design a parsed format/value
-contract now. Both preserve scoped reading, content checks and result timing.
+Resolved by D-55: P-52's A, bounded byte-for-byte strings without parsing,
+execution, data caching or open-file handles. Engine-parsed data was not chosen;
+the manager's parser-library example adds no selected library deliverable.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
