@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-66/Q-6q: the M1 randomness surface.
+The current checkpoint is P-67/Q-6r: how UI Lua observes session status.
+D-69 defers engine randomness and removes standard RNG calls in both M1 VMs.
 D-68 accepts role-specific clocks and cooperative waits with sampled UI time.
 D-67 accepts logical request tick offsets and earliest shared-module evaluation.
 D-66 accepts opaque sRGB byte backgrounds and checked fractional rectangles.
@@ -2079,6 +2080,35 @@ surface. P-65 also preserves request waits in that alternative; the manager's
 short option label did not propose removing the accepted D-54 request API.
 Exact names, numeric limits and integration remain delivery work.
 
+### D-69. Defer randomness services and remove both standard RNG functions in M1
+
+**Delivery:** M1 library profile; engine RNG design belongs to a later arc.
+
+Owner answer, **2026-10-22 02:40:03 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: defer randomness (Rec.)
+
+Authenticated relay: `het-manager`, message `eei6bg2pvjz3ndc5khct6ypak2`,
+posted **2026-10-22 02:40:03.132 UTC** in `#het-luafirst`, replying to Q-6q
+message `hffzinq884pyzcbw4vvs8gzura`.
+
+Accept P-66's A: remove `math.random` and `math.randomseed` from both M1
+VMs before authored modules run, in addition to D-5's exclusions. Other
+permitted math remains. Calling a removed function is an ordinary Lua error,
+not the terminal unavailable-state-service guard. M1 adds no engine RNG,
+seed setting or replay guarantee; the quad and logical stub require none.
+
+Authors may write or import their own explicitly seeded pure-Lua generator
+with ordinary Lua-owned state. This promises neither a shipped helper nor an
+engine algorithm; shared module state still follows D-7. It does not make
+trusted Lua deterministic. Existing sample contracts remain in their own scope;
+P-1's earlier seeded-stream wording does not require an M1 engine stream.
+
+The manager presented the cost that cosmetic UI scripts using the standard
+RNG must change or bring their own generator. The owner chose deferral over
+retaining UI randomness. Future engine seeding/streams remain undecided.
+
 ## Proposals
 
 **Scope precedence:** D-41 supersedes the original state-store agenda. Accepted
@@ -2092,9 +2122,11 @@ delivery boundary supersedes earlier broad mod/input implementation scope.
 
 The exclusion choice is accepted by D-5; retain this proposal ID as its history.
 Ordinary computation and supported coroutine behavior remain the basis for
-authoring. The existing logical-domain seeded stream and separation from
-presentation randomness remain constraints. Exact output, diagnostic and time
-bindings still belong to Q-6; Q-1's answer does not settle their API.
+authoring. D-69 defers engine randomness from M1 and removes both standard RNG
+functions in both roles. The earlier sample's seeded gameplay stream and
+separate presentation randomness remain its own contract and later-arc context,
+not an M1 engine-service requirement. D-68 settles time semantics; exact API
+spellings, output and diagnostic bindings still belong to Q-6.
 
 ### P-2. Address content by an explicit root and a relative path
 
@@ -5672,7 +5704,7 @@ services, not new native sleep calls from Lua.
 
 ### P-66. Defer engine randomness and remove ambient Lua RNG entry points in M1
 
-**Unapproved; active checkpoint Q-6q. Delivery: M1 scope / later RNG design.**
+**A accepted by D-69 through Q-6q. Delivery: M1 scope / later RNG design.**
 P-1 carried forward the earlier two-domain sample's seeded-stream/separate-UI
 constraints, while D-42 explicitly deferred a new world RNG/replay subsystem
 and left randomness bindings open. This checkpoint reconciles that gap without
@@ -5724,6 +5756,79 @@ the [two-domain sample](../../samples/lua-domains/README.md) owns a SplitMix64
 stream in its committed/candidate world, strips the gameplay math RNG and leaves
 the UI math library's RNG available. That is sample-specific implementation,
 not an existing standalone generic service to wire into the no-store M1.
+
+### P-67. Let UI hooks poll a coherent copied session-status record
+
+**Unapproved; active checkpoint Q-6r. Delivery: M1.** D-18/D-19/D-42 already
+require startup and failure information for a Lua loading/error screen. They
+do not select a Lua delivery API. Recommend A: a synchronous, non-waiting
+status read in UI lifecycle hooks returns a plain copied record, sampled at
+the start of that hook or resumed segment. Repeated reads within the same
+segment see the same record; modifying a returned table cannot affect engine
+status or another reader. No status subscription, callback, event history or
+new cross-VM message bus is added.
+
+The record describes which roles are present, their initialization readiness
+and running/failed/stopping/actually-retired status, and whether whole-session
+stop has been requested. Absence of a logical role is explicit. During early
+UI execution the logical role can be starting or ready; ready means that its
+own initialization has succeeded, not that every requested asset has loaded
+or that game-specific work is complete. D-18's joint gate still controls
+the first logical tick. There is no detailed init progress, world data or
+arbitrary authored payload. Exact field names/enums and report limits belong
+to the consolidated API package, not the illustrative vocabulary here.
+
+After an ordinary post-boot logical failure, the surviving UI can read a
+latched bounded failure description with source/content and executing-instance
+attribution, role, stage, short explanation and available traceback, preserving
+D-19. It contains no stack locals or live Lua objects. The first failure is
+retained while retirement status advances; cleanup is not reported complete
+until actual retirement. A later fatal engine/cleanup failure still ends the
+session under existing policy. Independent stderr diagnostics remain required;
+UI status is not their replacement or an unlimited diagnostic log.
+
+The session supervisor owns and coherently publishes this bounded record;
+each UI segment captures a value from that publication without waiting for
+the logical VM, a request result or resource retirement. Readers may miss
+intermediate phases between polls. A latched logical failure remains visible
+while the healthy UI continues, but there is no promise of one observation
+per transition, a final hook or a final displayed frame on session exit.
+Stopping either owner never waits for Lua to acknowledge status. The record
+lives for the session; segment copies are ordinary Lua data and carry no
+native resource ownership.
+
+This cross-role status read is UI-only, including finite UI init/shutdown
+hooks. Module-top-level and logical-VM calls are ordinary Lua errors before
+reading the supervisor. This explicitly keeps UI arrival and wall-time-sensitive
+session observations out of logical Lua; it does not remove the logical role's
+own D-68 clock or the existing whole-session quit policy. Whether any further
+own-instance metadata is needed belongs to the API package. No synchronous
+cross-owner call is introduced.
+
+Alternative B delivers status-change callbacks to UI instances. That would
+let an otherwise event-driven UI react without an update cadence, but requires
+a separate bounded delivery, coalescing, ordering and instance-lifetime
+contract before implementation. Neither choice promises a callback from a
+failed UI or before fatal shutdown. B is not approval of an unbounded event
+queue or of detailed progress.
+
+A is recommended because M1 already has UI updates and only needs a latest
+loading/failure view. Its cost is that authors must poll from an update or
+other scheduled hook to notice a change; an event-driven UI with no such work
+will not be awakened by status alone. Long non-yielding segments see a stale
+sample, and brief intermediate phases may never be observed. Qualification
+checks coherent copied reads, stable per-segment sampling, absent-role and
+startup gates, sticky failure during unfinished retirement, independent UI
+continuation, forbidden-role/phase errors and teardown without acknowledgement.
+
+Evidence: P-14/P-15/P-38 record the accepted launcher policies. The
+[two-domain sample](../../samples/lua-domains/README.md) already separates
+supervision's failure/stop latch from task completion, but its world/status
+publication is not a ready-made no-store M1 API. The
+[Lua host](../../packages/scripting-lua/README.md) reports scheduled segment
+observations on the owner thread (`scheduledObserve`); exposing this new
+bounded launcher status still requires explicit supervisor publication and
+binding integration.
 
 ## Open questions
 
@@ -6163,11 +6268,20 @@ cooperative yield/request waits. No init/shutdown waits or wall/CPU clocks.
 
 #### Q-6q. Defer all engine/standard RNG access or retain standard UI randomness?
 
-**Active checkpoint, P-66.** A (recommended): remove `math.random` and
-`math.randomseed` in both M1 roles; no engine RNG/seed service now, authored
-explicitly seeded pure-Lua helpers allowed. B: keep standard UI RNG only and
-settle its seeding/phase contract next. Prior sample/gameplay-stream contracts
-remain intact for their own scope and the later arc.
+Resolved by D-69: P-66's A, remove `math.random` and `math.randomseed` in both
+M1 roles, with no engine RNG/seed service or replay guarantee. Authored seeded
+pure-Lua helpers remain possible. Prior sample/gameplay-stream contracts stay
+in their own scope and the later arc.
+
+#### Q-6r. Should UI Lua poll session status or receive status-change callbacks?
+
+**Active checkpoint, P-67.** A (recommended): UI-only lifecycle reads of a
+coherent copied latest status, sampled per hook/resumed segment, including
+role presence/readiness, running/failure/retirement and bounded latched failure
+detail. No progress channel or status-triggered wakeup; authors poll in
+scheduled hooks. B: add callbacks and design their bounded delivery/lifetime
+contract next. Logical/module-top calls are refused under A; neither choice
+changes startup, failure or stop policy.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
