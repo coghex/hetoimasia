@@ -165,6 +165,7 @@ the first allocation of the operation is unprotected.
 | `luaL_ref`, `luaL_unref` | `safe`, by the flag | the fixtures' registry probe only |
 | `lua_tolstring` | `safe`, by the flag | reading a string error value |
 | `hetoimasia_lua_publish`, `hetoimasia_lua_getglobal`, `hetoimasia_lua_requiref` | `safe` | publishing a callback, reading a global, opening a library — each one protected call |
+| `hetoimasia_lua_filter_m1` | `safe` | filtering the M1 library profile's open libraries — one protected call, no argument crosses it |
 | `hetoimasia_lua_newstate` | `unsafe` | creating the interpreter |
 | `lua_gettop`, `lua_settop`, `lua_type`, `lua_typename`, `lua_isinteger`, `lua_tointegerx`, `lua_tonumberx`, `lua_pushboolean`, `lua_pushlightuserdata`, `lua_touserdata`, `lua_remove` | `unsafe`, fixed | stack bookkeeping, rendering, and the callback entry |
 
@@ -494,10 +495,12 @@ failure is raised, and a failure of that close is retained beside it.
 ```haskell
 withVmOwner ∷ VmConfig → (OwnedVm → IO r) → IO r
 data VmConfig = VmConfig
-  { vmLibraries ∷ [Library], vmInitialChunks ∷ [(ChunkName, ByteString)]
+  { vmLibraries ∷ [Library], vmLibraryProfile ∷ Maybe LibraryProfile
+  , vmInitialChunks ∷ [(ChunkName, ByteString)]
   , vmOwnerName ∷ Text, vmRegistration ∷ Registration, vmPolicy ∷ [Text]
   , vmValueLimits ∷ ValueLimits, vmModules ∷ [ModuleSource] }
 vmConfig    ∷ [Library] → VmConfig
+vmProfileConfig ∷ LibraryProfile → VmConfig
 evalOwned   ∷ OwnedVm → ChunkName → ByteString → IO ()
 callOwned   ∷ OwnedVm → Text → IO ()
 loadModule  ∷ OwnedVm → ModuleSource → IO ModuleHandle
@@ -665,7 +668,12 @@ no scope, and nothing about reentry, cancellation or the exit matrix changes.
 `Test.Lua.Owner.*` hold each part of this to expected values written in the
 tests. The exit matrix; partial construction at each step, with an allocator
 budget swept so that memory runs out at the state's allocation, while a library
-opens and while a chunk runs; cancellation before, during initialization, the
+opens and while a chunk runs, for an explicit list and for the M1 profile (which
+`Test.Lua.Owner.Profile` also pins on real Lua: every exclusion through every
+alias, from the first chunk and from a module with no chunk before it, the exact
+surface left, ordinary caught and uncaught errors, permitted computation,
+unchanged explicit-list and empty-library owners, independent profiled and general
+owners, and the refusal of a profile with a library list); cancellation before, during initialization, the
 body and the close, repeated, and with a failing close, with the cancellation
 delivered by coordinated blocking and never by sleeping; the shutdown phase and
 an empty allowlist, a denied callback performing no action and leaving evidence
@@ -752,10 +760,101 @@ the globals runs. A policy naming a namespace the registration does not declare
 installing end construction like any other initialization failure: the VM is
 closed through the same close and the body never runs. Which standard libraries a
 script can reach is the owner's explicit set (`coroutine` is selectable like the
-others; `utf8` is not offered), and the debug library an owner opens
-has no `sethook`, because a hook is script-defined Lua that Lua would run while a
-fault's traceback is being recorded; the base library brings `dofile`
-and `loadfile`, so an owner that must not read the disk does not open it.
+others; `utf8` is not offered), or the set of a library profile (below), and the
+debug library an owner opens has no `sethook`, because a hook is script-defined
+Lua that Lua would run while a fault's traceback is being recorded. Opening the
+base library through an explicit list brings `load`, `loadfile`, `dofile` and
+`collectgarbage` with it, as Lua ships them: an owner that must not read the disk
+or compile source selects the M1 library profile (below), which is not an
+explicit list, rather than leaving the base library out.
+
+### The M1 library profile
+
+`vmLibraryProfile = Just LibraryProfileM1` (`vmProfileConfig LibraryProfileM1`
+builds such a configuration) selects the filtered standard-library surface of the
+M1 application's Lua owners, whichever role the owner has (D-5, D-69; LFE-1). It
+is opt-in: `vmLibraries`, the empty list, and the standalone `lua` command are as
+they were, and nothing filters an explicit `LibraryBase`, `LibraryString` or
+`LibraryMath`.
+
+```haskell
+withVmOwner (vmProfileConfig LibraryProfileM1) $ \owner →
+  evalOwned owner (chunkName "check") "assert(load == nil and os == nil and string.dump == nil)"
+```
+
+**Installation order.** The profile is installed inside protected construction:
+the interpreter is allocated, the profile's libraries open, the profile removes
+what it excludes, and only then does anything an application supplies run — the
+after-libraries step of a fixture, the granted bindings (`vmPolicy`), the initial
+chunks, the initial modules. The first authored code, a chunk or a module's
+top-level code, therefore already sees the filtered surface, and so does a module
+loaded from the body later.
+
+**The surface.** A profiled owner has exactly these standard libraries, and
+nothing else:
+
+| Library | Kept | Removed |
+| --- | --- | --- |
+| base (`_G`) | `_G`, `_VERSION`, `assert`, `error`, `getmetatable`, `ipairs`, `next`, `pairs`, `pcall`, `print`, `rawequal`, `rawget`, `rawlen`, `rawset`, `select`, `setmetatable`, `tonumber`, `tostring`, `type`, `warn`, `xpcall` | `load`, `loadfile`, `dofile`, `collectgarbage` |
+| `string` | `byte`, `char`, `find`, `format`, `gmatch`, `gsub`, `len`, `lower`, `match`, `pack`, `packsize`, `rep`, `reverse`, `sub`, `unpack`, `upper` | `dump` |
+| `table` | `concat`, `insert`, `move`, `pack`, `remove`, `sort`, `unpack` | — |
+| `math` | every function and constant of the bundled interpreter's `math` except those removed | `random`, `randomseed` |
+| `coroutine` | `close`, `create`, `isyieldable`, `resume`, `running`, `status`, `wrap`, `yield` | — |
+| `os`, `io`, `package` with `require`, `debug` | — | never opened: absent in full, with no search path, searcher or native loader |
+
+The removal is made on the library tables themselves, once, after they open. The
+string metatable's index is the `string` table, the registry's loaded-module table
+holds the same tables, and a module's environment reads through to the globals,
+so `rawget(_G, name)`, `_G` and `_ENV`, a module's environment,
+`getmetatable('').__index` and `('').dump` all find the name absent, and the
+`next`/`pairs` enumeration of each table does not list it. `package` and `debug`
+are absent, so a script has no way to the registry or to reopen an omitted
+library. Granted namespaces cannot bring a name back: the registration refuses
+the standard names (`os`, `io`, `load`, `loadfile`, `dofile`, `debug`, `package`,
+`require`, `collectgarbage` and the rest). This is about the supplied standard
+library: trusted Lua may define ordinary functions or tables with the same
+names.
+
+`print` and `warn` keep Lua's stock behaviour under the profile alone: `print`
+writes to the process's standard output, and `warn` writes to its standard error
+once a script has switched warnings on with `warn('@on')`. Bounded, rebound
+script output is a later slice (D-71, LFE-12), not something the profile
+delivers; filtering removes the ambient OS functions, not every way a process
+writes.
+
+**Errors.** A call to a removed function is an ordinary Lua operation on a
+missing value: `pcall` catches it, and later permitted computation goes on. An
+uncaught one follows the existing attributed Lua fault path — a `LuaFault` from an
+initial chunk, a `BoundaryFault` with a `ScriptFailed` reason from an entry
+point — and is not a latched host failure or a new refusal. The profile ships no
+random generator and makes no determinism claim; a script that needs one writes
+its own seeded one.
+
+**Profile and library list.** A profile owns the owner's whole standard-library
+set, so it cannot be combined with an explicit list. A configuration that selects
+a profile and also names libraries (`LibraryIo`, `LibraryOs`, `LibraryPackage`,
+`LibraryDebug`, or any other) is refused at construction, before any library
+opens or authored code runs, with a `BoundaryFault` of operation `OpenLibraries`
+and reason `ProfileWithLibraries`, through the same construction failure path as
+any other failed step: the VM is closed and the body never runs.
+
+**The protected boundary.** The filtering is one call, `hetoimasia_lua_filter_m1`,
+made as a single `lua_pcall` like `hetoimasia_lua_requiref`: the names it writes
+are built inside the protected frame, no argument crosses it, and a failure — a
+status Lua reports, or a library table missing — is classified like any other
+failed call (`MemoryExhausted` for memory, otherwise `CallFailed`), attributed to
+the stage `profile LibraryProfileM1`, and ends construction through the same
+close. Two independent owners never share a library table, so a profiled owner
+cannot receive a capability another owner opens, and opening, using or closing
+either leaves the other's surface as it was. The profile adds no dependency and
+exposes no Lua state, stack index, registry reference or native pointer.
+
+**What this is not.** Filtering removes ambient OS functions and arbitrary-source
+loading. It is not hostile-code containment: a trusted script can still hang its
+owner or exhaust the process's memory, and cooperative budgets are not hard
+limits. Engine-provided imports, bounded output, a module loader, content roots,
+services and the `run` command are later slices; none is delivered by this
+profile.
 
 ### Modules and entry points
 
