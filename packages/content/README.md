@@ -865,10 +865,24 @@ else that a reader or a sink raises is a defect: the job's sink is told (`ReadDe
 and told, the pool latches the first defect with its context and cleanup evidence (`awaitFailure`, composable into a supervised wait), refuses all later jobs
 (`PoolHasFailed`), and the worker ends with the defect, which the pool's own worker group reports. Nothing restarts. The assembly
 observes the latch with `awaitFailure` in a supervised wait; every consumer sees it as refused submissions and as the
-`ReadDefect` its jobs were told; and the scope rethrows the latched failure if its body returned. The scope's own exit is not a defect: it closes the pool before it stops or cancels a worker, and a worker cancelled then settles the job it interrupted as
-`ReadAbandoned`. A worker that ends while the pool is **open** and healthy for any other reason (asked to stop from outside, terminated by an asynchronous
-exception, or returning) fails the pool the same way, so nothing accepted waits behind a pool that has stopped running. A failure raised while telling a
-queued job's sink is kept beside the defect as cleanup evidence, in what the pool latches and in what the worker raises.
+`ReadDefect` its jobs were told; and the scope rethrows the latched failure if its body returned. 
+
+#### Every way out keeps its failure and its evidence
+
+The scope's own exit is not a defect: it closes the pool before it stops or cancels a worker, and a worker the drain cancels
+with nothing retained settles the job it interrupted as `ReadAbandoned`. Every other way a worker or the scope can leave is
+accounted, whether the pool is open or draining:
+
+| Exit | What is kept, and where |
+|---|---|
+| A reader or sink raises, before or after the scope closed the pool | latched with its context and cleanup evidence; the scope rethrows it |
+| A worker is terminated by an asynchronous exception the scope did not send, or the drain's cancellation arrives with cleanup evidence retained | latched as `ReadWorkerTerminated` with the exception and every cleanup failure it retained |
+| A worker returns, or is asked to stop from outside, while the pool is open | latched as `ReadWorkerEndedOpen`; nothing accepted waits behind a pool that stopped running |
+| A second worker fails after the first | kept as cleanup evidence beside the first, which stays the pool's failure |
+| A queued sink raises while the pool is telling it (close or failure) | kept beside the failure being told, in what is latched and in what the worker raises |
+| The body fails | its failure is primary; a failure a worker had latched is kept beside it as `content read pool worker failure`, and the group's own report of the workers rides on it |
+| The body returns | the latched failure is rethrown; otherwise the group's report is read and any worker that failed, was cancelled or retained a cleanup failure is raised as `ReadWorkerReportedUnclean` with that evidence |
+| The scope's thread is killed | the group cancels the workers and drains them; the interrupted job is settled `ReadAbandoned` |
 
 ### State
 
@@ -886,7 +900,8 @@ and the dependency class first; the slot reservations and their defects; a consu
 a queued cancel that opens no file, an in-flight cancel, and cancels between issuance and the read and between the read
 and publication (held at the pool's coordination hooks, never slept); closing with a started read finishing and delivering;
 a withdrawn job held unretired while its sink is told, on a close and on a failure; a reader defect, a worker terminated by an asynchronous exception under an open pool, and a sink failure latching the pool, with the reader's cleanup evidence and the sink's failure both kept; a partial startup drained; cancellation during a drain, including
-a read that cannot be interrupted; the root outliving a started read; and a separately compiled client composing a
+a read that cannot be interrupted; and each exit of the table above, with a reader terminated or failing after the scope closed the pool, a worker cancelled
+with cleanup evidence, a second worker's failure, a failing body beside a latched failure, and a queued sink raising as the scope closes; the root outliving a started read; and a separately compiled client composing a
 root, a scan and a pool from public modules alone, with the hooks, the specification constructor and its record update refused. Real-file evidence and injected evidence (a failing reader, the
 hooks) are named as such in the examples.
 
