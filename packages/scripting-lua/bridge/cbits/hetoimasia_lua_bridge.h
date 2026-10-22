@@ -96,6 +96,20 @@ int hetoimasia_lua_requiref(
   lua_State *L, const char *name, lua_CFunction opener, int global);
 
 /*
+** Remove the capabilities the M1 library profile excludes from the standard
+** libraries already open in `L`: `load`, `loadfile`, `dofile` and
+** `collectgarbage` from the globals, `string.dump` from the string library, and
+** `math.random` and `math.randomseed` from the math library. Every name is
+** removed from the shared library table itself, so the string metatable's index
+** and the registry's loaded-module table, which are those same tables, lose it
+** too.
+**
+** The whole operation is one `lua_pcall`, as `hetoimasia_lua_requiref` is, and
+** answers a Lua status code with the error value left on the stack on failure.
+*/
+int hetoimasia_lua_filter_m1(lua_State *L);
+
+/*
 ** How many carriers this process has finalized.
 **
 ** For this package's own fixtures: publishing exactly as many carriers as are
