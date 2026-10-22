@@ -136,7 +136,7 @@ Use `cabal build all`, the console smoke, and the focused
 `hetoimasia-scripting-lua:lua-runtime-tests`, `hetoimasia-lua-engine:lua-engine-tests`,
 `hetoimasia-gpu-vulkan-model:gpu-model-tests`,
 `hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests`, `hetoimasia-math:math-tests`,
-`hetoimasia-asset-image:asset-image-tests`,
+`hetoimasia-content:content-tests`, `hetoimasia-asset-image:asset-image-tests`,
 `hetoimasia-render-api:render-api-tests`, `hetoimasia-render-2d:render-2d-tests`, and
 `hetoimasia-tests` Hspec suites for
 the current components. Prefer Hspec for future integration and
