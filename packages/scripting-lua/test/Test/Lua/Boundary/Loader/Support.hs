@@ -136,6 +136,9 @@ rigRegistration rig = either (error . show) id (registration [] [tracing, servic
               [VText text] → atomicModifyIORef' (rigTrace rig) (\held → (text : held, ()))
               _ → pure ()
             pure []
+        , -- A binding that refuses what it is not given as a fault of the call, which a
+          -- script cannot hide: not opted in to ordinary errors.
+          stateOperation "strict" [SText] [] (\_ → pure [])
         ]
     -- A service a module's top level must not acquire: the precondition refuses it,
     -- as an ordinary Lua error before the action, while a module's top level runs.

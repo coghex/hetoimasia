@@ -101,7 +101,7 @@ module Hetoimasia.Scripting.Lua.Internal.Loader
   , module Hetoimasia.Scripting.Lua.Internal.LoaderTypes
   ) where
 
-import Control.Exception (ExceptionWithContext, SomeException, evaluate, onException, rethrowIO, tryWithContext)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, evaluate, fromException, onException, rethrowIO, tryWithContext)
 import Control.Monad (forM, forM_, unless, void, when)
 import qualified Data.ByteString as ByteString
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
@@ -122,7 +122,7 @@ import Hetoimasia.Scripting.Lua.Internal.Boundary
 import Hetoimasia.Scripting.Lua.Internal.Callback (Handler, failedResults, installImport, suspendResults)
 import Hetoimasia.Scripting.Lua.Internal.Export (faultFor, labelOf, shapeOfCode, sourceOf)
 import Hetoimasia.Scripting.Lua.Internal.ExportTypes
-import Hetoimasia.Scripting.Lua.Internal.Fault (classify, fromApplication, luaComponent, renderFailure)
+import Hetoimasia.Scripting.Lua.Internal.Fault (classify, fromApplication, luaComponent, raisedByApplication, renderFailure)
 import Hetoimasia.Scripting.Lua.Internal.LoaderTypes
 import Hetoimasia.Scripting.Lua.Internal.Marshal
 import Hetoimasia.Scripting.Lua.Internal.Module (Host (..), effectNow)
@@ -632,14 +632,26 @@ drive loader state entry settled = loop
       -- Lua has run: a Haskell failure that reached a callback outranks whatever Lua
       -- reported, whatever it did with the stand-in.
       escaped ← escapePending vm
-      when escaped $ do
-        -- A chunk that caught the stand-in and returned its table was kept by the segment:
-        -- the table is not kept, because the failure is the operation's.
-        when (loaderStored segment) (void (releaseExport state (frameModuleSlot frame)))
-        lua_settop state entry
-        raiseEscape vm
+      refusal ←
+        if escaped
+          then do
+            -- A chunk that caught the stand-in and returned its table was kept by the segment:
+            -- the table is not kept, because the failure is not the module's to hide.
+            when (loaderStored segment) (void (releaseExport state (frameModuleSlot frame)))
+            lua_settop state entry
+            raised ← tryWithContext @SomeException (raiseEscape vm)
+            case raised of
+              Right () → pure Nothing
+              Left failure → case faultOfModuleCall failure of
+                -- A refusal of a call the module made to a binding is a failure of the module
+                -- and cannot be hidden by what its code did with the error it saw. Anything
+                -- else that reached a callback is the engine's or the application's, and is
+                -- raised.
+                Just fault → pure (Just fault)
+                Nothing → rethrowIO failure
+          else pure Nothing
       current ← topFrame frame
-      afterSegment current (frameLatched current) noted segment
+      afterSegment current (frameLatched current) noted segment refusal
 
     leaveSegment = do
       setActiveTask vm Nothing
@@ -653,7 +665,12 @@ drive loader state entry settled = loop
         top : _ | frameIdentity top == frameIdentity frame → top
         _ → frame
 
-    afterSegment frame latched noted segment
+    afterSegment frame latched noted segment refusal
+      | Just fault ← refusal = do
+          -- The module called a binding and was refused; the coroutine is closed wherever it
+          -- stands, finished or suspended, and the module fails with the refusal.
+          closing ← closeAnchored host state entry (frameTaskSlot frame)
+          failFrame frame (fromMaybe fault latched) closing
       | loaderStatus segment /= LUA_OK = do
           -- The protected call itself failed: allocation failed making the answer or
           -- publishing the export table. A module failure of its own kind.
@@ -716,6 +733,23 @@ drive loader state entry settled = loop
       settle loader settled (frameIdentity frame) (ExportBroken fault)
       noteEvidence loader evidence
       loop
+
+-- | The refusal of a call a module made to a binding, if that is what a failure that
+-- reached a callback is: a fault of the call (a value refused, a call refused, a scheduler
+-- operation where none can suspend, a kind not yet delivered, a script error raised
+-- building a refusal), not marked as raised by application code. Whatever else reaches a
+-- callback (the application's own failure, an engine defect, a seam's re-entry) is not.
+faultOfModuleCall ∷ ExceptionWithContext SomeException → Maybe BoundaryFault
+faultOfModuleCall (ExceptionWithContext context exception) = case fromException exception of
+  Just fault
+    | not (raisedByApplication context) → case boundaryReason fault of
+        ValueRefused _ → Just fault
+        BindingRefused _ → Just fault
+        SuspendRefused _ → Just fault
+        NotYetSupported _ → Just fault
+        ScriptFailed _ _ → Just fault
+        _ → Nothing
+  _ → Nothing
 
 -- | Close every frame of the active chain, top first, recording each identity as
 -- abandoned, and answer the failures of closing them.

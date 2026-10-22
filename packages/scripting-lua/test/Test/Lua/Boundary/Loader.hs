@@ -238,6 +238,22 @@ spec = describe "the module loader" $ do
         -- Nothing of it was published.
         ledger owned >>= \found → ledgerExports found `shouldBe` 0
 
+    it "fails a module a binding refused as a fault of the call, even when its code caught the error, and goes on" $
+      withRig $ \rig owned → do
+        _ ← supply rig owned "refused" ["local ok = pcall(trace.strict, 5)", "trace.mark('caught ' .. tostring(ok))", "return {}"]
+        _ ← supply rig owned "after" (simple "after" [])
+        _ ← admit owned "refused"
+        _ ← admit owned "after"
+        report ← advance owned
+        advanceBlocked report `shouldBe` BlockedIdle
+        failed ← failureOf owned "refused"
+        case boundaryReason failed of
+          ValueRefused _ → pure ()
+          other → expectationFailure ("unexpected reason " <> show other)
+        statusOfName owned "after" >>= (`shouldSatisfy` isReady)
+        traced rig >>= (`shouldBe` ["caught false", "after"])
+        ledger owned >>= (`shouldSatisfy` balanced)
+
     it "fails the importer of a dependency that failed, keeps the dependencies that completed, and does not rerun them" $
       withRig $ \rig owned → do
         _ ← supply rig owned "good" (simple "good" [])
