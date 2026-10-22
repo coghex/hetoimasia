@@ -17,6 +17,8 @@
 -- a script makes with it is the script's own: it is never a value that crosses.
 module Hetoimasia.Scripting.Lua.Internal.Library
   ( Library (..)
+  , LibraryProfile (..)
+  , profileLibraries
   , libraryModuleName
   , libraryOpener
   ) where
@@ -57,6 +59,29 @@ data Library
     -- "Hetoimasia.Scripting.Lua.Owner".
     LibraryCoroutine
   deriving (Bounded, Enum, Eq, Ord, Show)
+
+-- | A named standard-library surface an owner selects in place of an explicit
+-- list. A profile owns the owner's whole standard-library set: an owner that
+-- selects one opens exactly the libraries 'profileLibraries' names, filtered as
+-- the profile says, and no other. Selecting a profile together with an explicit
+-- library list is refused at construction rather than combined.
+data LibraryProfile
+  = -- | The surface of the M1 application's Lua owners (D-5, D-69). The base,
+    -- string, table, math and coroutine libraries, with the capabilities that
+    -- reach outside the VM or arbitrary source removed from them:
+    -- @load@, @loadfile@, @dofile@, @collectgarbage@, @string.dump@,
+    -- @math.random@ and @math.randomseed@. @os@, @io@, @package@ with @require@,
+    -- and @debug@ are never opened. The filtering is applied to the library
+    -- tables themselves, once, after they open and before any authored code
+    -- runs, so no alias a script can reach retains a removed name.
+    LibraryProfileM1
+  deriving (Bounded, Enum, Eq, Ord, Show)
+
+-- | The libraries a profile opens, in order. The profile's filtering applies to
+-- these tables once they are all open.
+profileLibraries ∷ LibraryProfile → [Library]
+profileLibraries = \case
+  LibraryProfileM1 → [LibraryBase, LibraryString, LibraryTable, LibraryMath, LibraryCoroutine]
 
 -- | The debug library without @sethook@. A hook is script-defined Lua that Lua
 -- runs on a call, a return, a line or a count, including when it dispatches the

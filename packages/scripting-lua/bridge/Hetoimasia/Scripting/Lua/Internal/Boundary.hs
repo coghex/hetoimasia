@@ -39,6 +39,7 @@ import Control.Exception (Exception)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Internal.Fault (ErrorValue, FaultKind)
+import Hetoimasia.Scripting.Lua.Internal.Library (Library, LibraryProfile)
 import Hetoimasia.Scripting.Lua.Internal.Registration
   ( BindingKind
   , LifecycleContext
@@ -99,6 +100,9 @@ moduleChunk ref = Text.map tame (moduleRefName ref <> "@" <> moduleRefVersion re
 data FaultOperation
   = -- | Installing the registration's bindings in the VM.
     InstallBindings
+  | -- | Opening the owner's standard libraries, or installing its library
+    -- profile.
+    OpenLibraries
   | LoadModule
   | CallEntry
   | -- | A Lua call to a registered binding.
@@ -222,6 +226,11 @@ data FaultReason
     PolicyUnknownNamespace !Text
   | -- | A namespace's name is already a global that is not a table.
     NamespaceTaken !Text
+  | -- | An owner selected a library profile and also an explicit library list. A
+    -- profile owns the owner's whole standard-library set, so the list is refused
+    -- rather than opened beside it or filtered partly: the profile and the
+    -- libraries asked for.
+    ProfileWithLibraries !LibraryProfile ![Library]
   | -- | The boundary failed in a way only a bug explains: what happened.
     InternalError !Text
   deriving (Eq, Show)
