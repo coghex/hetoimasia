@@ -55,8 +55,10 @@ module Hetoimasia.Scripting.Lua.Internal.Callback
   , Installed
   , installCallback
   , installBinding
+  , installImport
   , escapeMarker
   , failedResults
+  , suspendResults
   ) where
 
 import Control.Exception (ExceptionWithContext, SomeException, mask, tryWithContext)
@@ -72,7 +74,7 @@ import Foreign.Storable (peek)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure, withOperationContext)
 import Hetoimasia.Scripting.Lua.Internal.Call (reportFault)
-import Hetoimasia.Scripting.Lua.Internal.Marshal (installBindingAt)
+import Hetoimasia.Scripting.Lua.Internal.Marshal (importInstallAt, installBindingAt)
 import Hetoimasia.Scripting.Lua.Internal.Fault (FinalizerRefused (FinalizerRefused), classify, luaComponent)
 import Hetoimasia.Scripting.Lua.Internal.Vm
   ( Phase (Closing)
@@ -194,6 +196,20 @@ installBinding vm space name yielding handler =
     qualified = space <> "." <> name
     publish state carried acquired = installBindingAt state carried space name yielding acquired
 
+-- | Install the handler every module's @import@ reaches, as a carrier kept in the
+-- registry. Each module's @import@ is a closure made over it and over the module's
+-- own context, so one handler serves every module of the VM.
+--
+-- It is reached by the name @import@, which is the name the VM's finalizer policy
+-- knows it by. Like a binding it borrows nothing that outlives the handler.
+--
+-- Unlike a binding's, the handler may answer 'suspendResults': the C closure then
+-- suspends the running coroutine once every Haskell frame has returned, to be
+-- resumed with the dependency's exports or an error to raise.
+installImport ∷ HasCallStack ⇒ Vm → Handler → IO ()
+installImport vm handler =
+  installWith vm [("binding", "import")] "import" importInstallAt handler (pure ())
+
 -- | The installation both public forms share: the release is retained before the
 -- function is published, and the stable pointer is freed here only when Lua
 -- never took it.
@@ -304,6 +320,11 @@ foreign export ccall "hetoimasia_lua_enter" hetoimasiaEnter ∷ PreCFunction
 -- it was caught in succeeds.
 failedResults ∷ NumResults
 failedResults = NumResults (-1)
+
+-- | The result count that means "suspend the running coroutine inside an @import@".
+-- Negative, like 'failedResults', and distinct from it: no real call returns either.
+suspendResults ∷ NumResults
+suspendResults = NumResults (-2)
 
 installOperation ∷ Operation
 installOperation = operation "install-callback"

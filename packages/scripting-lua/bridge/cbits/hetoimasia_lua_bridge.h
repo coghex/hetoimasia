@@ -118,6 +118,31 @@ int hetoimasia_lua_filter_m1(lua_State *L);
 */
 long hetoimasia_lua_carriers_finalized(void);
 
+/*
+** The result count a handler answers to suspend the running coroutine inside an
+** `import` call. Distinct from the failure marker's -1.
+*/
+#define HETOIMASIA_IMPORT_SUSPEND (-2)
+
+/*
+** Keep the Haskell function every module's `import` reaches, as a carrier in the
+** registry, with every allocation in one protected call. `acquired` is set to 1
+** once the stable pointer is the carrier's to free, exactly as for
+** `hetoimasia_lua_publish`; free the pointer when, and only when, it reports 0.
+*/
+int hetoimasia_lua_import_install(lua_State *L, HsStablePtr function, int *acquired);
+
+/*
+** Push a new `import` closure for the module whose loader context is `context`,
+** and answer 1; answer 0, pushing nothing, when no carrier was installed. Called
+** only from inside a protected body that has reserved stack, because making a
+** closure allocates.
+*/
+int hetoimasia_lua_import_closure(lua_State *L, lua_Integer context);
+
+/* The C function behind an `import` closure. */
+int hetoimasia_lua_invoke_import(lua_State *L);
+
 /* `luaopen_debug` without `sethook`; see the definition for why. */
 int hetoimasia_luaopen_debug(lua_State *L);
 

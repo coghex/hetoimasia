@@ -68,6 +68,8 @@ module Hetoimasia.Scripting.Lua.Internal.Binding
   , ensureValues
   , argumentReason
   , ordinaryRule
+  , boundReason
+  , diagnosticLimits
   ) where
 
 import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, catch, evaluate, fromException, throwIO, toException, try)

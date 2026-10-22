@@ -99,6 +99,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Behavior
         Test.LuaEngine.Boot
         Test.LuaEngine.Boundary
+        Test.LuaEngine.Loader
         Test.LuaEngine.Manifest.Examples
         Test.LuaEngine.Manifest.Schema
         Test.LuaEngine.Manifest.Syntax

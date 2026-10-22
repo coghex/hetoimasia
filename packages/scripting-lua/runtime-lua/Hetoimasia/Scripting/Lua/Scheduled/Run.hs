@@ -132,6 +132,7 @@ import Hetoimasia.Scripting.Lua.Instance.Run
   , settleEnded
   )
 import Hetoimasia.Scripting.Lua.Instance.Types (Escalation, InstanceFailure)
+import Hetoimasia.Scripting.Lua.Loading.State (closeLoading, loadingWork, retireLoading, serviceLoading)
 import Hetoimasia.Scripting.Lua.Provider.Serve (providerBoundary, providerWork, retireProvider)
 import Hetoimasia.Scripting.Lua.Provider.State (markClosing, unmarkClosing)
 import Hetoimasia.Scripting.Lua.Provider.Types (ProviderState (psTask), Requester (RequesterTask))
@@ -243,7 +244,7 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
   -- crowd of producers cannot starve the large one that settles the tickets: once
   -- it commits nothing is admitted, and the settlement runs against a state that
   -- no producer is changing.
-  atomically (writeTVar (controlClosing control) True)
+  atomically (writeTVar (controlClosing control) True >> forM_ (controlLoading control) closeLoading)
   -- Whether Lua may be entered for an instance again: only after an orderly stop.
   heldInstances ← readIORef instanceRef
   let heldInstances0 = heldInstances
@@ -305,6 +306,11 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
         Just (Right ended) → ended
         Just (Left failure) → ([failure], [])
         Nothing → ([], [])
+  -- The owner's module loader ends with it, on this thread and before the VM: its suspended
+  -- frames are closed, its source interests withdrawn, and the tick a due chain held is given
+  -- back. A failure of that is cleanup evidence, whatever else happened.
+  loadingEnd ← forM (controlLoading control) $ \state → retireLoading state owned
+  let loadingEvidence = [("lua loader stop", failure) | Just (Left failure) ← [loadingEnd]]
   earlier ← readIORef kept
   others ← readIORef extra
   let closeFailures =
@@ -338,6 +344,7 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
           <> others
           <> providerEvidence
           <> providerCleanup
+          <> loadingEvidence
           <> retirement
           <> [("lua task close", ExceptionWithContext (someExceptionContext failure) failure) | (_, failure) ← closeFailures]
       )
@@ -350,6 +357,8 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
     -- What an owner with a request service waits for beside its scheduler's work: a task whose
     -- request has settled, a provider's account that is no longer pending, disposals to run.
     requestWork = maybe retry providerWork provider
+    -- What the owner's module loader has been left: a submitted root or an arrived source.
+    loaderWork = maybe retry loadingWork (controlLoading control)
     -- Serve until a stop is requested, or until a turn reports a failure of
     -- cleanup: answers whether it was the latter.
     loop host kept extra instanceRef = do
@@ -357,8 +366,8 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
       -- Beside its other work the owner wakes for an accounting wait whose cut is fixed and which
       -- no acknowledgement has answered yet: an idle owner has no boundary to end until it is woken.
       atomically $ case instances of
-        Nothing → awaitWork scheduler `orElse` requestWork `orElse` awaitAcknowledgement control
-        Just ih → awaitWork scheduler `orElse` awaitInstanceWork ih `orElse` requestWork `orElse` awaitAcknowledgement control
+        Nothing → awaitWork scheduler `orElse` requestWork `orElse` loaderWork `orElse` awaitAcknowledgement control
+        Just ih → awaitWork scheduler `orElse` awaitInstanceWork ih `orElse` requestWork `orElse` loaderWork `orElse` awaitAcknowledgement control
       forM_ instances serviceInstances
       -- At each boundary, after the scheduler's work there, the owner accounts for
       -- what ended, looks at what its instances were asked and tries again what the
@@ -370,7 +379,10 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
             instanceStep ← maybe (pure False) serviceBoundary instances
             requestStep ← forM provider $ \service →
               providerBoundary service scheduler (isJust instances) leaseHost extra (forM_ instances endOwner)
-            let again = instanceStep || or requestStep
+            -- The module loader is looked at last at a boundary: what a hook or a settled request
+            -- did there is part of what it is asked, and a chain it advances is not a task.
+            loadStep ← forM (controlLoading control) $ \state → serviceLoading state owned
+            let again = instanceStep || or requestStep || or loadStep
             -- A boundary that finds nothing more to do is the last of its settling: it ends when this
             -- returns. This is the owner's checkpoint, and nothing after it in the boundary can fail. The
             -- sweep of what the providers and the leases had to hand over is the step just made, which

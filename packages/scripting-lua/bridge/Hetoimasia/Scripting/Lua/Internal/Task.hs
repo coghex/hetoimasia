@@ -66,6 +66,12 @@ module Hetoimasia.Scripting.Lua.Internal.Task
   , resumeTask
   , closeTask
   , liveTaskReferences
+    -- * For the module loader, which runs coroutines of its own beside tasks
+  , Cleanup (..)
+  , cleanUp
+  , closeAnchored
+  , evidenceOf
+  , raising
   ) where
 
 import Control.Exception (ExceptionWithContext, SomeException, rethrowIO, tryWithContext)
@@ -417,6 +423,18 @@ runSegment host op name task starting state entry = do
     vm = hostVm host
     ref = taskModule task
     slot = taskSlot task
+
+-- | Close the coroutine anchored in a slot, running its pending to-be-closed
+-- variables on the owner's thread, and answer what closing it failed with as cleanup
+-- evidence instead of raising it: each Haskell failure a closing handler's callback
+-- raised, and the error Lua reported unless that is only the stand-in for one of them.
+-- Terminal: the slot is emptied whatever the close did, so a failed close is not tried
+-- again. The caller names what is running, for a fault a handler raises.
+closeAnchored ∷ Host → State → StackIndex → Int → IO [(Text, ExceptionWithContext SomeException)]
+closeAnchored host state entry slot = do
+  (closing, escapes) ← withCleanupEscapes (hostVm host) (closeTaskCoroutine state slot)
+  failure ← closeFailure state entry closing
+  evidenceOf (closingMarker closing) escapes failure
 
 -- | Close a coroutine that is not suspended where the host left it, keeping what
 -- the close raised apart from the failure the operation has pending. Leaves the

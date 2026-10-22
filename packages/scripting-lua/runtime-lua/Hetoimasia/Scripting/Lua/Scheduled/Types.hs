@@ -54,6 +54,7 @@ import Data.Text (Text)
 import Data.Word (Word64)
 import Hetoimasia.Scripting.Lua.Instance.Types (Instances, ModuleHooks)
 import Hetoimasia.Scripting.Lua.Lifecycle.State (LifecycleState, abandonAll, sweepEndedTasks)
+import Hetoimasia.Scripting.Lua.Loading.State (LoadingState)
 import Hetoimasia.Scripting.Lua.Provider.Types (ProviderState)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (SubscriptionId, TaskId)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits (ServiceClass)
@@ -239,6 +240,10 @@ data Control = Control
     -- reads and the owner's thread writes: a constant amount of state, whatever number of waits
     -- were made, and one entry for each instance ending begun and not yet accounted for, which
     -- the instances' own bound limits.
+  , controlLoading ∷ !(Maybe LoadingState)
+    -- ^ What the owner's module loader holds, when it was given one: the bounded inbox any thread
+    -- leaves roots and arrived sources in, and the outcomes it published. Its exit stops the
+    -- loader and gives back the hold a due chain keeps on the logical tick.
   }
 
 -- | The accounting the owner keeps for the application's wait for it.

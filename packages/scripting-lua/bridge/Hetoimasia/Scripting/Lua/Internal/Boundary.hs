@@ -179,6 +179,29 @@ data ModuleProblem
     FacadeNotATable !Text
   | -- | A facade builder that is not a function. What it was.
     FacadeBuilderNotAFunction !Text
+  | -- | A module imported a dependency that failed, and so fails itself, even if its
+    -- code caught the error the import raised: the dependency's label and the fault
+    -- it failed with.
+    DependencyFailed !Text !BoundaryFault
+  | -- | A module imported an identity already on the active chain: the labels of the
+    -- chain from that identity down to the importer, and the identity again where
+    -- the edge closes. Never an extra frame.
+    ImportCycle ![Text]
+  | -- | A module imported a dependency the owner has no room to hold, failed and
+    -- in-progress identities counted: the bound and the dependency's label. No record
+    -- was made.
+    ImportCacheFull !Int !Text
+  | -- | A module imported a dependency that would make the chain longer than it may
+    -- be, the root included: the bound and the dependency's label. No record was made.
+    ImportChainTooDeep !Int !Text
+  | -- | A module imported a dependency that is not ready where Lua could not suspend
+    -- it, so nothing was admitted: why, and the dependency's label.
+    ImportNotSuspendable !SuspendRefusal !Text
+  | -- | The source supplier reported a failure for an identity: its label and the
+    -- supplier's bounded reason.
+    SourceUnavailable !Text !Text
+  | -- | The owner was configured without a module loader.
+    NoModuleLoader
   deriving (Eq, Show)
 
 -- | What an export module's chunk returned instead of exactly one plain table.

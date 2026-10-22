@@ -86,6 +86,7 @@ module Hetoimasia.Scripting.Lua.Internal.Owner
   , OwnedVm
   , ownedInternalVm
   , ownedHost
+  , ownedLoader
   , withOwnedVm
   , evalOwned
   , callOwned
@@ -104,6 +105,7 @@ import Control.Exception
   , tryWithContext
   )
 import Data.ByteString (ByteString)
+import Control.Monad (void)
 import Data.Foldable (traverse_)
 import Data.Maybe (isJust)
 import Data.Set (Set)
@@ -123,6 +125,8 @@ import Hetoimasia.Scripting.Lua.Internal.Boundary
 import Hetoimasia.Scripting.Lua.Internal.Call (ChunkName, callGlobal, evalChunk)
 import Hetoimasia.Scripting.Lua.Internal.Export (evaluateExport)
 import Hetoimasia.Scripting.Lua.Internal.ExportTypes (ExportLimits, ExportSource, defaultExportLimits)
+import Hetoimasia.Scripting.Lua.Internal.Loader (Loader, installLoader, newLoader, stopLoader)
+import Hetoimasia.Scripting.Lua.Internal.LoaderTypes (LoaderConfig)
 import Hetoimasia.Scripting.Lua.Internal.Module (Host, ModuleSource, loadModule, newHost)
 import Hetoimasia.Scripting.Lua.Internal.Registration
   ( Binding (bindingFinalizer, bindingName)
@@ -206,6 +210,11 @@ data OwnerConfig = OwnerConfig
   , ownerRequests ∷ !(Maybe RequestContext)
     -- ^ What delivers this owner's asynchronous requests. Nothing by default: they
     -- are refused as not yet supported.
+  , ownerLoader ∷ !(Maybe LoaderConfig)
+    -- ^ The module loader of this owner, whose modules can @import@ and suspend on a
+    -- dependency's source. Nothing by default: there is none, and an export module
+    -- evaluated by 'evaluateExport' has no @import@. The loader is stopped when the
+    -- lifetime ends, before the VM closes.
   }
 
 -- | An owner over these libraries with no initial chunk, an empty finalizer
@@ -230,6 +239,7 @@ defaultOwnerConfig libraries =
     , ownerCallbackScope = noCallbackScope
     , ownerLifecycle = Nothing
     , ownerRequests = Nothing
+    , ownerLoader = Nothing
     }
 
 -- | The names of the bindings a Lua finalizer may run during this owner's close:
@@ -255,15 +265,19 @@ finalizerAllowlist config =
 -- 'Hetoimasia.Scripting.Lua.Internal.Fault.VmNotOwned'. It names no Lua state,
 -- stack index, registry reference, coroutine, closure or native address, and no
 -- way to close the VM: only the lifetime closes it.
-data OwnedVm = OwnedVm !Vm !Host
+data OwnedVm = OwnedVm !Vm !Host !(Maybe Loader)
 
 -- | The bridge's own VM behind an owned one, for this package's fixtures.
 ownedInternalVm ∷ OwnedVm → Vm
-ownedInternalVm (OwnedVm vm _) = vm
+ownedInternalVm (OwnedVm vm _ _) = vm
 
 -- | What loads and calls modules in this owner's VM.
 ownedHost ∷ OwnedVm → Host
-ownedHost (OwnedVm _ host) = host
+ownedHost (OwnedVm _ host _) = host
+
+-- | The owner's module loader, if it was configured with one.
+ownedLoader ∷ OwnedVm → Maybe Loader
+ownedLoader (OwnedVm _ _ loader) = loader
 
 -- | Run a body over a VM this owner constructed, and close the VM on every
 -- exit. See the module header for the lifetime, the cancellation points and the
@@ -276,6 +290,7 @@ withOwnedVm config body = mask $ \restore → do
   vm ← allocateVm (VmSpec (ownerBudget config) (Just self) (FinalizersAllow (finalizerAllowlist config)) (ownerCallbackScope config))
   let boundary = Boundary (ownerName config) (vmIdentity vm) (ownerRegistration config) (ownerLimits config) (ownerLifecycle config) (ownerRequests config)
   host ← newHost vm boundary (ownerExportLimits config)
+  loader ← traverse (newLoader host) (ownerLoader config)
   ran ← tryWithContext @SomeException $ restore $ do
     ownerAfterAllocation config vm
     openStandardLibraries boundary vm config
@@ -283,10 +298,19 @@ withOwnedVm config body = mask $ \restore → do
     -- Before any initial chunk or module can run, and inside the lifetime, so a
     -- failure here ends construction like any other step.
     installRegistration boundary vm (ownerGranted config)
+    -- The loader's @import@ is reached by the modules it evaluates only, and no
+    -- module runs before the lifetime's body.
+    traverse_ installLoader loader
     traverse_ (uncurry (evalChunk vm)) (ownerChunks config)
     traverse_ (loadModule host) (ownerModules config)
     traverse_ (evaluateExport host) (ownerExports config)
-    body (OwnedVm vm host)
+    body (OwnedVm vm host loader)
+  -- The loader stops first, on this thread, with the VM still open: its suspended
+  -- coroutines close while the state and what its callbacks borrow are alive, and
+  -- every source interest is withdrawn. Its failures are close evidence.
+  stopped ← case loader of
+    Nothing → pure (Right ())
+    Just held → tryWithContext @SomeException (void (stopLoader held))
   -- The ordinary close: masked, once, never retried, and not uninterruptible
   -- beyond what a blocked finalizer needs.
   closed ← tryWithContext @SomeException (closeVm vm)
@@ -294,7 +318,7 @@ withOwnedVm config body = mask $ \restore → do
   -- of its own, so the close's evidence can be attached to the first and none
   -- is left pending to supersede it when the owner stops being masked.
   late ← pendingCancellation
-  finish ran closed late
+  finish ran stopped closed late
 
 -- | Open the owner's standard libraries: its explicit list, or its profile.
 --
@@ -338,9 +362,10 @@ finish
   ∷ Either (ExceptionWithContext SomeException) r
   → Either (ExceptionWithContext SomeException) ()
   → Either (ExceptionWithContext SomeException) ()
+  → Either (ExceptionWithContext SomeException) ()
   → IO r
-finish ran closed late = do
-  let evidence = either cleanupEvidence (const []) closed
+finish ran stopped closed late = do
+  let evidence = [("lua loader stop", failure) | Left failure ← [stopped]] <> either cleanupEvidence (const []) closed
   case (ran, late) of
     -- Cancelled after safe teardown, and nothing else was ending the lifetime
     -- as a cancellation: the cancellation is primary, carrying the evidence.
@@ -368,8 +393,8 @@ finish ran closed late = do
 
 -- | Load and run a chunk in the owner's VM.
 evalOwned ∷ HasCallStack ⇒ OwnedVm → ChunkName → ByteString → IO ()
-evalOwned (OwnedVm vm _) = evalChunk vm
+evalOwned (OwnedVm vm _ _) = evalChunk vm
 
 -- | Call a global function the owner's VM defines.
 callOwned ∷ HasCallStack ⇒ OwnedVm → Text → IO ()
-callOwned (OwnedVm vm _) = callGlobal vm
+callOwned (OwnedVm vm _ _) = callGlobal vm
