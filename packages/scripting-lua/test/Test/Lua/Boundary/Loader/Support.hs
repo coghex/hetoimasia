@@ -42,13 +42,15 @@ module Test.Lua.Boundary.Loader.Support
     -- * Reading outcomes
   , reasonIs
   , raised
+  , inThread
   , lua
   , Ledger (..)
   , ledger
   , balanced
   ) where
 
-import Control.Concurrent (ThreadId, myThreadId)
+import Control.Concurrent (ThreadId, forkIO, myThreadId)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, fromException, throwIO, try)
 import Control.Monad (forM_)
 import Data.ByteString (ByteString)
@@ -410,3 +412,15 @@ balanced found =
     && countInterestsHeld counts <= countPending counts
   where
     counts = ledgerCounts found
+
+-- | Run an action on a thread of its own and wait for it, raising here whatever it raised:
+-- a failed assertion of the example included, which must end the example and not just the
+-- thread it was made on.
+inThread ∷ IO a → IO a
+inThread action = do
+  done ← newEmptyMVar
+  _ ← forkIO (try action >>= putMVar done)
+  outcome ← takeMVar done
+  case outcome of
+    Left failure → throwIO (failure ∷ SomeException)
+    Right result → pure result

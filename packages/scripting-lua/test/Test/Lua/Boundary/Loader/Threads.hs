@@ -5,8 +5,6 @@
 -- from is refused, not left waiting.
 module Test.Lua.Boundary.Loader.Threads (spec) where
 
-import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (fromException)
 import Data.IORef (readIORef)
 import Hetoimasia.Scripting.Lua.Owner
@@ -23,20 +21,15 @@ spec = describe "the loader's threads" $ do
       advanceBlocked held `shouldBe` BlockedSource (ident "b")
       -- The provider's thread finds the source and tells the owner; it cannot touch the
       -- loader itself.
-      found ← newEmptyMVar
-      refusals ← newEmptyMVar
-      _ ← forkIO $ do
+      (refused, answer) ← inThread $ do
         delivered ← raised (deliverSource owned (ident "b") (SourceVerified (lua ["return { name = 'b' }"])))
         advanced ← raised (advanceLoader owned)
         admitted ← raised (admitRoot owned (RootRequest (ident "x") "game:x"))
         stopped ← raised (stopModuleLoader owned)
         counted ← raised (moduleLoaderCounts owned)
         looked ← raised (lookupModule owned (ident "b"))
-        let refused = [isNotOwned delivered, isNotOwned advanced, isNotOwned admitted, isNotOwned stopped, isNotOwned counted, isNotOwned looked]
-        putMVar refusals refused
-        putMVar found (SourceVerified (lua ["return { name = 'b' }"]))
-      answer ← takeMVar found
-      takeMVar refusals >>= (`shouldBe` replicate 6 True)
+        pure ([isNotOwned delivered, isNotOwned advanced, isNotOwned admitted, isNotOwned stopped, isNotOwned counted, isNotOwned looked], SourceVerified (lua ["return { name = 'b' }"]))
+      refused `shouldBe` replicate 6 True
       -- Nothing changed: the importer is still suspended, and nothing of b exists.
       traced rig >>= (`shouldBe` ["a:start"])
       statusOfName owned "b" >>= (`shouldBe` ModulePending)
@@ -67,27 +60,19 @@ spec = describe "the loader's threads" $ do
       (stopFrames report, stopWasStopped report) `shouldBe` (1, False)
       ledger owned >>= \found → (ledgerTasks found, balanced found) `shouldBe` (0, True)
 
-  it "does not make an independent VM wait for another's held source" $ do
-    otherResult ← newEmptyMVar
+  it "does not make an independent VM wait for another's held source" $
     withRig $ \rig owned → do
       _ ← admit owned "held"
       _ ← supply rig owned "held" ["local x = import('never')", "return {}"]
       blocked ← advance owned
       advanceBlocked blocked `shouldBe` BlockedSource (ident "never")
-      _ ← forkIO $ do
-        outcome ← raised . withRig $ \rig' owned' → do
-          _ ← supply rig' owned' "free" ["trace.mark('free')", "return {}"]
-          _ ← admit owned' "free"
-          _ ← advance owned'
-          status ← statusOfName owned' "free"
-          marks ← traced rig'
-          pure (status, marks)
-        putMVar otherResult outcome
-      done ← takeMVar otherResult
-      case done of
-        Right (ModuleReady _, marks) → marks `shouldBe` ["free"]
-        Right (other, _) → fail ("the independent VM did not finish: " <> show other)
-        Left failure → fail ("the independent VM failed: " <> show failure)
+      (status, marks) ← inThread . withRig $ \rig' owned' → do
+        _ ← supply rig' owned' "free" ["trace.mark('free')", "return {}"]
+        _ ← admit owned' "free"
+        _ ← advance owned'
+        (,) <$> statusOfName owned' "free" <*> traced rig'
+      status `shouldSatisfy` \case ModuleReady _ → True; _ → False
+      marks `shouldBe` ["free"]
       -- This one is still waiting where it was.
       statusOfName owned "held" >>= (`shouldBe` ModuleEvaluating)
 
