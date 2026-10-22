@@ -4,6 +4,7 @@
 module Test.LuaRuntime.Spec (spec) where
 
 import qualified Test.LuaRuntime.Accounting.Spec
+import qualified Test.LuaRuntime.Admission.Spec
 import qualified Test.LuaRuntime.Callbacks
 import qualified Test.LuaRuntime.Dependencies
 import qualified Test.LuaRuntime.Expected
@@ -46,6 +47,7 @@ spec = describe "the Lua runtime adapter" $ do
   Test.LuaRuntime.Instance.Spec.spec
   Test.LuaRuntime.Lifecycle.Spec.spec
   Test.LuaRuntime.Request.Spec.spec
+  Test.LuaRuntime.Admission.Spec.spec
   Test.LuaRuntime.Retention.Spec.spec
   Test.LuaRuntime.Subscription.Spec.spec
   Test.LuaRuntime.Runner.Spec.spec

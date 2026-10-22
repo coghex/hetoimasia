@@ -138,6 +138,8 @@ module Hetoimasia.Scripting.Lua.Registration
   , recoverableRefusals
   , withPrecondition
   , Precondition
+  , withArgumentCheck
+  , ArgumentCheck
   , OwnerContexts (..)
   , refusalReasonLimit
   , bindingRecoverable
@@ -175,6 +177,7 @@ module Hetoimasia.Scripting.Lua.Registration
 import Data.Text (Text)
 import Hetoimasia.Scripting.Lua.Internal.Registration hiding
   ( bindingArguments
+  , bindingArgumentChecks
   , bindingConfined
   , bindingPreconditions
   , bindingRecoverable

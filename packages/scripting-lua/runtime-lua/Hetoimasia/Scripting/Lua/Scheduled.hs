@@ -297,7 +297,7 @@ module Hetoimasia.Scripting.Lua.Scheduled
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (ExceptionWithContext, SomeException, evaluate, finally, mask, mask_, rethrowIO, tryWithContext)
-import Control.Monad (forM, forM_, join, when)
+import Control.Monad (forM, forM_, join, unless, when)
 import Data.Foldable (toList, traverse_)
 import Data.Maybe (isJust)
 import qualified Data.List.NonEmpty as NonEmpty
@@ -363,6 +363,7 @@ import Hetoimasia.Scripting.Lua.Runtime.Types
 import Hetoimasia.Scripting.Lua.Lease.State (LeasesRefused (LeasesRefused), LeasesViolation (..), Leases (leasesCapacity, leasesLending), bindLeasesHandle)
 import Hetoimasia.Scripting.Lua.Provider.State (newProviderState, validateGrant, validateSubscriptions)
 import Hetoimasia.Scripting.Lua.Provider.Types (EventEndpoint (..), RequestGrant, RequestGrantRefused (RequestGrantRefused), SubscriptionGrant (grantEvents), SubscriptionGrantRefused (SubscriptionGrantRefused), Ticks (..))
+import Hetoimasia.Scripting.Lua.Provider.Call (RequestHandles, RequestHandlesRefused (RequestHandlesRefused), bindRequestHandles)
 import Hetoimasia.Scripting.Lua.Request (requestContextOf)
 import Hetoimasia.Scripting.Lua.Lending.Loan (Lending, bindLending, sameLending)
 import Hetoimasia.Scripting.Lua.Scheduled.Run (runScheduledOwner)
@@ -457,6 +458,12 @@ data ScheduledSpec = ScheduledSpec
     -- ^ The asynchronous requests the owner's scripts may make of providers, and when their
     -- settlements reach Lua. 'Nothing', the default, leaves every asynchronous request, and a
     -- wait for one, refused as not yet supported. See "Hetoimasia.Scripting.Lua.Provider".
+  , scheduledRequestHandles ∷ Maybe RequestHandles
+    -- ^ The registry the owner answers the liveness of its opt-in requests' handles through, if
+    -- the application's bindings use one ("Hetoimasia.Scripting.Lua.Admission"): made before the
+    -- owner, closed over by the handle type the registration declares, and taken by the owner
+    -- when it is created. The owner must be granted a request service. A registry serves one
+    -- owner. 'Nothing', the default, leaves every opt-in handle dead.
   , scheduledSubscriptions ∷ Maybe SubscriptionGrant
     -- ^ The provider events the owner's instances may subscribe functions to (LUA-26), made over
     -- the request service: the owner must be granted one, and host instances. 'Nothing', the
@@ -485,6 +492,7 @@ scheduledSpec config worker bounds =
     , scheduledMemberLimit = defaultMemberLimit
     , scheduledLifecycle = Nothing
     , scheduledRequests = Nothing
+    , scheduledRequestHandles = Nothing
     , scheduledSubscriptions = Nothing
     }
 
@@ -604,8 +612,15 @@ startScheduledOwner runtime spec = do
   -- refused naming every reason.
   provider ← forM (scheduledRequests spec) $ \grant →
     case validateGrant (vmValueLimits config) grant of
-      Right endpoints → newProviderState owner label scope (vmValueLimits config) grant endpoints subscriptions (ticksFor scheduler stopping) ownInstances
+      Right endpoints → newProviderState owner label scope (vmValueLimits config) grant endpoints subscriptions (ticksFor scheduler stopping) ownInstances (scheduledLeases spec)
       Left refused → throwFailure runtimeComponent (operation "start-scheduled-owner") [] (RequestGrantRefused refused)
+  -- The registry that answers whether a handle is live is taken once the service exists, and
+  -- refused, before anything starts, if there is none or another owner has it.
+  forM_ (scheduledRequestHandles spec) $ \handles → case provider of
+    Nothing → throwFailure runtimeComponent (operation "start-scheduled-owner") [] (RequestHandlesRefused "the owner is granted no request service")
+    Just service → do
+      taken ← bindRequestHandles handles service
+      unless taken (throwFailure runtimeComponent (operation "start-scheduled-owner") [] (RequestHandlesRefused "the registry already serves an owner"))
   hooks ← newTVarIO Map.empty
   accounting ← newTVarIO newAccounting
   let bare = Control owner label (vmValueLimits config) scheduler cells faults begun closing exited stopping ownInstances Nothing provider hooks accounting

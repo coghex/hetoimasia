@@ -922,6 +922,7 @@ stageText = \case
   StageEvent source → "event " <> source
   StageShutdown → "shutdown"
   StageRelease → "release"
+  StageRequest endpoint → "request " <> endpoint
   StageConstruct → "construct"
 
 kindText ∷ InstanceError → Text
@@ -932,6 +933,7 @@ kindText = \case
   ErrorRefusedWait _ → "refused wait"
   ErrorRelease _ → "release failure"
   ErrorDelivery _ _ → "delivery failure"
+  ErrorRequest _ _ → "required request failure"
   ErrorCadence _ → "cadence failure"
   ErrorExportMissing _ → "missing export module"
   ErrorExportFailed _ → "export module failure"
