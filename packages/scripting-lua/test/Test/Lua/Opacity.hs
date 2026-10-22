@@ -223,6 +223,23 @@ spec = describe "opacity across the package boundary" $ do
       clientOutput outcome `shouldContain` "hidden package"
       clientOutput outcome `shouldNotContain` "cannot satisfy"
 
+  it "rejects a client asking the public module for the loader, its handler or its host" $
+    withClient "Client.hs" loaderSurfaceClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "does not export"
+
+  it "rejects a client reaching into the private loader module" $
+    withClient "Client.hs" loaderInternalsClient $ \compile → do
+      outcome ← compile Typecheck
+      case clientStatus outcome of
+        ExitFailure _ → pure ()
+        ExitSuccess →
+          expectationFailure
+            ("the client compiled, so the loader internals are reachable:\n" <> clientOutput outcome)
+      clientOutput outcome `shouldContain` "Hetoimasia.Scripting.Lua.Internal.Loader"
+      clientOutput outcome `shouldContain` "hidden package"
+      clientOutput outcome `shouldNotContain` "cannot satisfy"
+
   it "rejects a client that forges a capability, or stamps one with the VM that issued it" $
     withClient "Client.hs" capabilityForgeryClient $ \compile → do
       outcome ← compile Typecheck
@@ -313,6 +330,39 @@ spec = describe "opacity across the package boundary" $ do
                    , "script refusal effect = LuaRan"
                    , "unsupported = NotYetSupported LifecycleOperation"
                    , "handle after the lifetime = VmClosed"
+                   ]
+
+  it "accepts, links and runs a client composing injected sources and the owner's loader, through the public owner alone" $
+    withClient "Main.hs" loaderPublicClient $ \compile → do
+      outcome ← compile Link
+      case clientStatus outcome of
+        ExitSuccess → pure ()
+        status →
+          expectationFailure
+            ( "the loader client must compile, but the compiler exited with "
+                <> show status
+                <> ":\n"
+                <> clientOutput outcome
+            )
+      (status, out, err) ←
+        readCreateProcessWithExitCode
+          (proc (clientDirectory outcome </> "client") []) {cwd = Just (clientDirectory outcome)}
+          ""
+      status `shouldBe` ExitSuccess
+      err `shouldBe` ""
+      lines out
+        `shouldBe` [ "admitted = RootQueued"
+                   , "blocked = BlockedSource (ExportIdentity \"game:dep\")"
+                   , "chain = 1"
+                   , "another thread = VmNotOwned"
+                   , "delivered = SourceDelivered"
+                   , "settled = [ExportIdentity \"game:dep\",ExportIdentity \"game:root\"]"
+                   , "root = ready"
+                   , "interests = (2,2)"
+                   , "unknown root = ModuleUnknown"
+                   , "stopped = StopReport {stopIdentities = [], stopFrames = 0, stopWithdrawn = 0, stopWasStopped = False}"
+                   , "stopped again = True"
+                   , "late delivery = SourceAfterStop"
                    ]
 
   it "accepts, links and runs a client evaluating export modules, capturing a behavior and releasing it, through the public owner alone" $
@@ -833,6 +883,80 @@ exportPublicClient =
     , "    Right _ → putStrLn \"capture after the lifetime = used\""
     , "  _ ← pure capture"
     , "  pure ()"
+    ]
+
+loaderSurfaceClient ∷ String
+loaderSurfaceClient =
+  unlines
+    [ "module Client (reached) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Owner (Loader, loaderHost, importHandler, installLoader, newLoader)"
+    , ""
+    , "reached ∷ ()"
+    , "reached = ()"
+    ]
+
+loaderInternalsClient ∷ String
+loaderInternalsClient =
+  unlines
+    [ "module Client (reached) where"
+    , ""
+    , "import Hetoimasia.Scripting.Lua.Internal.Loader (newLoader, loaderHost)"
+    , ""
+    , "reached ∷ ()"
+    , "reached = ()"
+    ]
+
+-- | The module loader, used the way an application would: a supplier that holds a source
+-- until another thread finds it, a resolver, and the owner's thread delivering and advancing.
+loaderPublicClient ∷ String
+loaderPublicClient =
+  unlines
+    [ "{-# LANGUAGE OverloadedStrings #-}"
+    , "module Main (main) where"
+    , ""
+    , "import Control.Concurrent (forkIO)"
+    , "import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)"
+    , "import Control.Exception (try)"
+    , "import Data.Text.Encoding (encodeUtf8)"
+    , "import Hetoimasia.Scripting.Lua.Owner"
+    , ""
+    , "main ∷ IO ()"
+    , "main = do"
+    , "  let known = [(ExportIdentity \"game:root\", SourceVerified \"local dep = import('dep') return { dep = dep }\")]"
+    , "      supplier = SourceSupplier"
+    , "        { supplierAcquire = \\identity → pure (maybe SourcePending id (lookup identity known))"
+    , "        , supplierRelease = \\_ → pure ()"
+    , "        }"
+    , "      resolver _ path _ = pure (Right (ResolvedAddress (ExportIdentity (\"game:\" <> encodeUtf8 path)) (\"game:\" <> path)))"
+    , "  withVmOwner ((vmConfig [LibraryBase]) {vmLoader = Just (loaderConfig supplier resolver)}) $ \\owned → do"
+    , "    admitted ← admitRoot owned (RootRequest (ExportIdentity \"game:root\") \"game:root\")"
+    , "    putStrLn (\"admitted = \" <> show admitted)"
+    , "    held ← advanceLoader owned"
+    , "    putStrLn (\"blocked = \" <> show (advanceBlocked held))"
+    , "    putStrLn (\"chain = \" <> show (advanceChainDepth held))"
+    , "    -- The provider's thread finds the source and tells the owner. It may not touch the"
+    , "    -- loader itself."
+    , "    found ← newEmptyMVar"
+    , "    refused ← newEmptyMVar"
+    , "    _ ← forkIO $ do"
+    , "      outcome ← try (advanceLoader owned)"
+    , "      putMVar refused (either (\\(VmNotOwned _) → \"VmNotOwned\") (const \"ran\") outcome)"
+    , "      putMVar found (SourceVerified \"return { name = 'dep' }\")"
+    , "    answer ← takeMVar found"
+    , "    takeMVar refused >>= \\how → putStrLn (\"another thread = \" <> how)"
+    , "    delivered ← deliverSource owned (ExportIdentity \"game:dep\") answer"
+    , "    putStrLn (\"delivered = \" <> show delivered)"
+    , "    done ← advanceLoader owned"
+    , "    putStrLn (\"settled = \" <> show (map fst (advanceSettled done)))"
+    , "    status ← lookupModule owned (ExportIdentity \"game:root\")"
+    , "    putStrLn (\"root = \" <> (case status of ModuleReady _ → \"ready\"; other → show other))"
+    , "    counts ← moduleLoaderCounts owned"
+    , "    putStrLn (\"interests = \" <> show (countInterestsAcquired counts, countInterestsReleased counts))"
+    , "    lookupModule owned (ExportIdentity \"game:nobody\") >>= \\unknown → putStrLn (\"unknown root = \" <> show unknown)"
+    , "    stopModuleLoader owned >>= \\report → putStrLn (\"stopped = \" <> show report)"
+    , "    stopModuleLoader owned >>= \\report → putStrLn (\"stopped again = \" <> show (stopWasStopped report))"
+    , "    deliverSource owned (ExportIdentity \"game:dep\") answer >>= \\late → putStrLn (\"late delivery = \" <> show late)"
     ]
 
 capabilityForgeryClient ∷ String

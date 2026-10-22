@@ -213,6 +213,7 @@ library runtime-lua
         Hetoimasia.Scripting.Lua.Runtime
         Hetoimasia.Scripting.Lua.Instance
         Hetoimasia.Scripting.Lua.Lifecycle
+        Hetoimasia.Scripting.Lua.Loading
         Hetoimasia.Scripting.Lua.Scheduled
         Hetoimasia.Scripting.Lua.Scheduler
     other-modules:
@@ -232,6 +233,7 @@ library runtime-lua
         Hetoimasia.Scripting.Lua.Runner.Types
         Hetoimasia.Scripting.Lua.Lending.Loan
         Hetoimasia.Scripting.Lua.Lifecycle.State
+        Hetoimasia.Scripting.Lua.Loading.State
         Hetoimasia.Scripting.Lua.Provider.Events
         Hetoimasia.Scripting.Lua.Provider.Serve
         Hetoimasia.Scripting.Lua.Provider.State
@@ -462,6 +464,7 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Lifecycle.Settlement
         Test.LuaRuntime.Lifecycle.Spec
         Test.LuaRuntime.Lifecycle.Support
+        Test.LuaRuntime.Loading
         Test.LuaRuntime.Readiness
         Test.LuaRuntime.Recoverable
         Test.LuaRuntime.Request.Admission
