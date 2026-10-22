@@ -306,8 +306,14 @@ comments, trailing commas and data, non-object roots, duplicate keys after escap
 decoding), the exact numeric reading of `format`, every schema refusal and the fixed
 order refusals are decided in, and `tick_seconds` as exact decimal nanoseconds -- and
 the fixed M1 profile of limits against an independently written expectation, with its
-smaller validated test profiles and the profiles it refuses. It performs no IO and
-starts no Lua, window or GPU. It is mandatory but outside the floor, like `test.math`,
+smaller validated test profiles and the profiles it refuses -- and the manifest and
+entry boot checkpoint (LFE-6) composed with the content inventory over real temporary
+folders: the content numbers derived from the fixed profile, the manifest at 65,536 bytes
+and one past, a missing, case-mismatched or directory manifest, a manifest parsed from
+revision A beside a scan that pinned revision B, every declared entry (a fully overridden
+common entry included) required to name an inventoried regular file, and a cancellation
+while the checkpoint holds the read. It starts no Lua, window or GPU, and the checkpoint
+reads only through the verified read it is given. It is mandatory but outside the floor, like `test.math`,
 and its command names `cabal.project.cpu`; the group declares that file beside
 `cabal.project.common`. CI routes it to the `haskell-engine` worker and publishes its
 receipt like every other group that worker owns. See
@@ -342,7 +348,13 @@ partial map; the Unicode tables are pinned at 17.0.0 and checked against the
 `NormalizationTest` and `CaseFolding` reference files of that version. A real
 temporary tree enumerated by the content service covers the names the file
 system can hold, and reports the others pending beside the supplied-entry
-evidence. Mount crossings and directory
+evidence. Its bounded whole-folder inventory (LFE-6) is checked over
+real trees and explicit fault and mutation gates: every file hashed against
+independently known SHA-256 vectors, the entry, depth, path, segment, per-file and
+per-root bounds each at its edge and one past (aliases charged per name), growth,
+truncation and swaps between a listing and an opening, and the verified read that
+returns exactly the bytes the inventory holds, decides absent, directory and too-large
+keys before any open and delivers nothing on a refusal. Mount crossings and directory
 cycles use injected native identities, because the suite creates no mount, and
 permission-bit cases run only where the effective user lacks the override
 (Linux CI runs as root, which ignores the bits), so an injected permission
