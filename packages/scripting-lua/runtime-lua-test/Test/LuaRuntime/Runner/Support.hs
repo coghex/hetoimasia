@@ -18,6 +18,7 @@ module Test.LuaRuntime.Runner.Support
     -- * Scripts
   , lua
   , withScripts
+  , createExclusiveDirectory
   , scriptAt
   , noWait
     -- * Running
@@ -69,7 +70,7 @@ module Test.LuaRuntime.Runner.Support
 import Control.Concurrent (yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, readMVar, tryPutMVar)
 import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVar, retry, writeTVar)
-import Control.Exception (finally, throwIO)
+import Control.Exception (IOException, finally, throwIO, try)
 import Control.Monad (void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -78,7 +79,9 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Data.Time.Clock.POSIX (getPOSIXTime)
+import Data.Unique (hashUnique, newUnique)
 import Data.Word (Word64)
+import Hetoimasia.Foundation.Resource (withResource)
 import Hetoimasia.Foundation.Time (Duration, scriptedInstant, scriptedSource)
 import Hetoimasia.Foundation.Worker (GroupStatus (statusOutstanding))
 import Hetoimasia.Runtime.Supervision (RuntimeControl, workerGroupStatus)
@@ -92,6 +95,7 @@ import Hetoimasia.Scripting.Lua.Value (Schema (SInteger, SRecord, SText), Value 
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 import System.Directory (createDirectory, getTemporaryDirectory, removeDirectoryRecursive, removeFile)
 import System.IO (hClose, hFlush, openBinaryTempFile, stderr, stdout)
+import System.IO.Error (isAlreadyExistsError)
 import System.FilePath ((</>))
 import Test.LuaRuntime.Scheduled.Support (Clock (Clock), SFixture (..), awaitEntered, blockOn, newSFixture, releaseGate)
 import Test.LuaRuntime.Scheduler.Support (FakeTimer (..), Reg (regLive), allRegs, fireReg, nanoseconds)
@@ -178,15 +182,44 @@ lua ∷ [Text] → ByteString
 lua = Text.encodeUtf8 . Text.unlines
 
 -- | Run an example with a directory of its own holding these files, by name, and the paths they were
--- written to; the directory is removed afterwards.
+-- written to, in the order the files were given; the directory is removed afterwards, on every exit of
+-- the example, whether it returns, throws or is cancelled.
+--
+-- No other call is given the same directory, in this process or in any other that shares the temporary
+-- root, because the directory is allocated by 'createExclusiveDirectory': the creation itself fails if
+-- the path is taken, so the allocation never rests on a name that merely is unlikely to repeat. The name
+-- carries the clock and a per-call serial only to keep a taken candidate rare; it is not the guarantee.
+-- Test binaries run concurrently under one temporary root, so the guarantee has to hold across
+-- processes. The directory is owned by the 'withResource' scope: allocated under its mask and released
+-- by it, with no gap in which an exception leaves a created directory behind.
 withScripts ∷ [(FilePath, ByteString)] → ([FilePath] → IO a) → IO a
 withScripts files body = do
   base ← getTemporaryDirectory
-  started ← getPOSIXTime
-  let directory = base </> ("lua-runner-" <> show (round (started * 1000000000) ∷ Integer))
-  createDirectory directory
-  (mapM (\(name, bytes) → let path = directory </> name in ByteString.writeFile path bytes >> pure path) files >>= body)
-    `finally` removeDirectoryRecursive directory
+  withResource (createExclusiveDirectory base freshDirectoryName) removeDirectoryRecursive $ \directory →
+    mapM (\(name, bytes) → let path = directory </> name in ByteString.writeFile path bytes >> pure path) files >>= body
+
+-- | A candidate name for a script directory: the clock and a serial no other call in this process shares.
+-- Another process can produce the same name; 'createExclusiveDirectory' is what tells the two apart.
+freshDirectoryName ∷ IO FilePath
+freshDirectoryName = do
+  stamp ← getPOSIXTime
+  serial ← newUnique
+  pure ("lua-runner-" <> show (round (stamp * 1000000000) ∷ Integer) <> "-" <> show (hashUnique serial))
+
+-- | Create a directory under @base@ that did not exist, and answer its path. A candidate that is taken
+-- (the path exists, as a directory or as anything else) is left exactly as it is and the next candidate is
+-- tried, up to a bound; the bound's last refusal is then thrown. Any other failure to create, such as a
+-- @base@ that is not there, is thrown at once and the source of candidates is not asked again.
+createExclusiveDirectory ∷ FilePath → IO FilePath → IO FilePath
+createExclusiveDirectory base nextName = go (100 ∷ Int)
+  where
+    go remaining = do
+      directory ← (base </>) <$> nextName
+      try (createDirectory directory) >>= \case
+        Right () → pure directory
+        Left (failure ∷ IOException)
+          | isAlreadyExistsError failure, remaining > 1 → go (remaining - 1)
+          | otherwise → throwIO failure
 
 -- | A path in the directory, for a file an example does not write.
 scriptAt ∷ [FilePath] → Int → FilePath
