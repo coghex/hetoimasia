@@ -74,9 +74,11 @@ cabal test hetoimasia-runtime:runtime-tests --test-show-details=direct
 cabal test hetoimasia-glfw:glfw-tests --test-show-details=direct
 cabal test hetoimasia-scripting-lua:lua-host-tests --test-show-details=direct
 cabal test hetoimasia-scripting-lua:lua-runtime-tests --test-show-details=direct
+cabal test --project-file cabal.project.cpu hetoimasia-lua-engine:lua-engine-tests --test-show-details=direct
 cabal test hetoimasia-gpu-vulkan-model:gpu-model-tests --test-show-details=direct
 cabal test hetoimasia-gpu-vulkan-diagnostics:diagnostics-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-math:math-tests --test-show-details=direct
+cabal test --project-file cabal.project.cpu hetoimasia-content:content-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-asset-image:asset-image-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-render-api:render-api-tests --test-show-details=direct
 cabal test --project-file cabal.project.cpu hetoimasia-render-2d:render-2d-tests --test-show-details=direct
@@ -191,8 +193,10 @@ once. The options, the grammar of the numbers, the signal rule and the examples 
 | `packages/foundation/` | Logging, CPU scopes/collections, failures, recovery, workers and messaging | Buildable |
 | `packages/runtime/` | Application composition, reporting, supervision and inbox services | Buildable |
 | `packages/math/` | Vectors, 4×4 matrices, transforms, 2×3 affine transforms, look-at and perspective; depends on `base` alone | Buildable |
+| `packages/content/` | Anchored native content roots: a launch path resolved once, directory-relative no-follow opens with the type checked on the opened object, bounded strict reads and enumeration, and a root that closes only after every borrowing operation has retired; depends on the foundation and boot libraries | Buildable |
 | `packages/asset/` | Asset identity and provenance, decoded-asset types and the pure decoder interface; no codecs | Buildable |
 | `packages/asset-image/` | Image codecs: PNG to upload-ready RGBA8, premultiplied in linear light for colour, with the cutout mark | Buildable |
+| `packages/lua-engine/` | The Lua-first engine's pure configuration boundary: the strict format-1 launch manifest parsed from supplied bytes and the fixed M1 profile of limits; no IO, no Lua, no GLFW or Vulkan | Buildable |
 | `packages/glfw/` | Private binding, windows, monitors, input and separate runtime adapter components | Buildable; original arc and repairs complete |
 | `packages/render-api/` | Backend-independent rendering contracts: the opaque texture handle; depends on `base` alone | Buildable |
 | `packages/gpu-vulkan/model/` | Pure GPU retention, frame-ownership and recovery model | Buildable without a Vulkan SDK |
@@ -209,7 +213,7 @@ once. The options, the grammar of the numbers, the signal rule and the examples 
 | `integrations/` | Game adapters | Planned |
 | `packages/foundation/test/` | Foundation-owned headless Hspec contracts | Buildable without GLFW through `cabal.project.cpu` |
 | `packages/runtime/test/`, `packages/glfw/test/` | Package-owned runtime and headless GLFW contracts | Buildable |
-| `packages/scripting-lua/test/`, `packages/gpu-vulkan/model/test/`, `packages/math/test/`, `packages/asset-image/test/`, `packages/render-api/test/`, `packages/render-2d/test/`, `packages/render-2d-oracle/test/` | Package-owned Lua, GPU model, math, image-decoding, texture-handle, 2D frame and 2D oracle contracts | Buildable without GLFW through `cabal.project.cpu` |
+| `packages/scripting-lua/test/`, `packages/lua-engine/test/`, `packages/gpu-vulkan/model/test/`, `packages/math/test/`, `packages/content/test/`, `packages/asset-image/test/`, `packages/render-api/test/`, `packages/render-2d/test/`, `packages/render-2d-oracle/test/` | Package-owned Lua, Lua-engine manifest and profile, GPU model, math, image-decoding, texture-handle, 2D frame and 2D oracle contracts | Buildable without GLFW through `cabal.project.cpu` |
 | `test/` | Root console composition only | Buildable |
 | `packages/glfw/native-tests/` | Shared native Hspec fixture and platform verification | Cocoa locally; Linux X11 in CI |
 | `tools/test/` | Workflow, validation and provisioning Hspec examples | Buildable |
