@@ -32,8 +32,8 @@ console, game or sample package.
 
 | Component | Directory | Role |
 |---|---|---|
-| `library` | `src/` | The public facades: `Hetoimasia.Content` (native roots), `Hetoimasia.Content.Identity` (logical identity) and `Hetoimasia.Content.Inventory` (the inventory and verified reads), each a closed export list: no name constructor, no descriptor, no adapter, no seam, no constructor of a checked identity value, an inventory, a digest or a set of limits. |
-| `library internal` (private) | `internal/` | The implementation, shared by the facades and this package's own suite and visible to no client. `Native` holds the adapter record and the test seam; `Root`, `Gate`, `Access`, `Errno` and `Types` hold the rest of the native layer; `Identity.Unicode`, `Identity.Types`, `Identity.Reference` and `Identity.Mapping` hold the identity policy; `Inventory.Types`, `Inventory.Scan`, `Inventory.Read` and `Inventory.Outcome` hold the inventory. |
+| `library` | `src/` | The public facades: `Hetoimasia.Content` (native roots), `Hetoimasia.Content.Identity` (logical identity), `Hetoimasia.Content.Inventory` (the inventory and verified reads) and `Hetoimasia.Content.ReadPool` (the owned bounded verified-read workers), each a closed export list: no name constructor, no descriptor, no adapter, no seam, no pool hook, no constructor of a checked identity value, an inventory, a digest, a pool specification or a set of limits. |
+| `library internal` (private) | `internal/` | The implementation, shared by the facades and this package's own suite and visible to no client. `Native` holds the adapter record and the test seam; `Root`, `Gate`, `Access`, `Errno` and `Types` hold the rest of the native layer; `Identity.Unicode`, `Identity.Types`, `Identity.Reference` and `Identity.Mapping` hold the identity policy; `Inventory.Types`, `Inventory.Scan`, `Inventory.Read` and `Inventory.Outcome` hold the inventory; `Pool` holds the verified-read pool and its coordination hooks. |
 | C shim | `cbits/hetoimasia_content.c` | Every raw descriptor operation, about 150 lines. Each function returns the negated `errno` on failure, so Haskell never reads `errno` after a safe foreign call. |
 | `test-suite content-tests` | `test/`, `test-cbits/` | Registered as the non-optional CPU validation group `test.content`. |
 
@@ -779,6 +779,117 @@ Which variant ran is visible in the suite's output: an example that needs a
 condition the machine lacks is reported pending with the reason, and the
 injected example beside it covers the refusal.
 
+## The verified-read pool (LFE-10)
+
+`Hetoimasia.Content.ReadPool` runs [verified reads](#verified-reads) on owned worker threads, for any number of
+consumers, without becoming a general executor. It is the read service the raw-data provider
+([`hetoimasia-lua-engine`](../lua-engine/README.md#the-raw-data-provider-lfe-10)) uses now and module and texture sources
+use later; it knows no Lua, no request, no data limit and no file family. It reads only through `readVerified`, so a
+job's result is the exact buffer whose length and SHA-256 the inventory holds, or a structured refusal and no bytes.
+It keeps no cache, copies nothing, deduplicates nothing, retries nothing, polls nothing and starts no thread for a
+request.
+
+```haskell
+withReadPool      ∷ PoolSpec → Inventory → ContentRoot → (ReadPool → IO a) → IO a
+reserveSlot       ∷ ReadPool → STM Bool          -- in the consumer's own admission transaction
+releaseSlot       ∷ ReadPool → STM ()            -- after the job has retired
+submit            ∷ ReadPool → ReadRequest → STM (Either SubmitRefusal ReadTicket)
+cancel            ∷ ReadTicket → STM CancelOutcome
+retired           ∷ ReadTicket → STM Bool
+status            ∷ ReadPool → STM PoolStatus
+awaitFailure      ∷ ReadPool → STM (ExceptionWithContext SomeException)
+```
+
+### Ownership and lifetime
+
+The pool is one `withReadPool` scope, entered **inside** the root's scope: it starts `workers` threads in a foundation
+worker group, so the group's drain finishes every started read before the root (and the inventory it borrows) can be
+released. A consumer's lifetime is separate: the pool does not wait for, call or hold anything of a consumer except the
+`requestSink` it was handed with a job. The session owns **one** pool (two workers for M1) shared by every consumer and
+VM; nothing creates a pool per request, instance or VM.
+
+On any exit the scope first closes admission (a later `submit` answers `PoolIsClosed`), withdraws every queued job and
+tells its sink `ReadAbandoned`, and then drains: every read already started runs to its end and settles its job, with
+the root still open. A cancellation of the exiting thread neither shortens the wait nor is lost (the group's contract).
+A reader stuck in a blocking call keeps the scope, and so the root, live: there is no deadline.
+
+### Bounded work, reserved first
+
+`PoolSpec` has two numbers, validated by `poolSpec`: the worker count (the most reads in flight) and the slot capacity. A specification is read with the `specWorkers` and `specSlots` functions; it has no public record labels, so a validated specification cannot be rewritten by record update into one `poolSpec` refuses.
+A *slot* is one unit of queue capacity. A consumer takes one with `reserveSlot` in the transaction that admits its
+request, together with its other reservations, and returns it with `releaseSlot` after the job retired. `submit` is a
+non-blocking STM transaction that only enqueues, and it requires a reservation: a job beyond the reservations is a
+defect of the caller (`ReadSubmittedWithoutSlot`), as is releasing a slot a live job still needs
+(`ReadSlotReleasedWhileLive`), and neither leaves anything behind. So the queue, the active reads and the completions
+in flight are bounded by reservations that exist (`queued <= live <= reserved <= capacity`), an accepted job is never
+refused or retried for want of room, and a full ordinary request or result queue elsewhere cannot block a completion,
+a cancel or a drain.
+
+A job names its key, its **byte allowance** (the consumer's own already-reserved bound; the pool imposes none, so the
+data family's 8 MiB is not every consumer's), its `ReadPriority` and its sink. Workers take the oldest job of the
+strongest class: `DependencyProgress` (the read an active import chain waits for; assigned by module loading, LFE-11)
+before `OrdinaryRead`. Raw data is always `OrdinaryRead`.
+
+### A job
+
+| State | Meaning | Left by |
+|---|---|---|
+| queued | In the queue; no file touched | issuance (a worker took it) or `cancel` / close (withdrawn): one transaction on the pool state, so exactly one wins |
+| issued | A worker took it; interest may be withdrawn | the worker's settlement |
+| delivering | The worker decided to call the sink; the job's claim on its slot is over | the sink returning |
+| done | The sink returned, or its call was suppressed because interest was withdrawn | terminal |
+| notifying | Left the queue unissued because the pool closed or failed, and its sink is yet to be told; the slot claim is over, the job is **not** retired | the sink returning (then withdrawn); `cancel` before the call suppresses it |
+| withdrawn | Left the queue unissued with nothing to tell (a `cancel`), or was told after notifying | terminal |
+
+`retired` is true from done or withdrawn on, never while a withdrawn job's sink is still being told. It is the **per-job** evidence a consumer builds its retirement reading
+from; a worker's exit or the group's drain is not it. The slot's claim ends when the worker decides to deliver, in the
+same transaction, **before** the sink runs: the consumer may account the reply and release its slot as soon as the
+sink has run. The job is not retired until the sink has returned, so a consumer that withdrew interest and reads
+retirement never sees the work over while a worker still holds the buffer it was about to hand over.
+
+`cancel` answers `CancelWithdrawn` (queued: no file was ever opened and the sink will not be called), `CancelInFlight`
+(a worker has it: it runs to its end and its sink is suppressed unless it had begun to deliver) or `CancelTooLate`. An
+issued job whose interest is withdrawn before the reader was asked for anything skips the read.
+
+### The buffer
+
+`readVerified` allocates the buffer once, at the inventoried length, which the allowance check has already bounded, and
+returns that allocation. The worker passes the same `ByteString` to the sink: **no copy, no second reference**. From the
+sink call on the allocation is the consumer's, which charges it against its own bank; the pool charges nothing and keeps
+nothing. Streaming and hash workspace is the reader's, bounded by the inventory's buffer limit and the worker count.
+
+### Failure
+
+An expected outcome of a verified read is data for the sink (`ReadFailed`, classified as for `readVerified`). Anything
+else that a reader or a sink raises is a defect: the job's sink is told (`ReadDefect`), every queued job is withdrawn
+and told, the pool latches the first defect with its context and cleanup evidence (`awaitFailure`, composable into a supervised wait), refuses all later jobs
+(`PoolHasFailed`), and the worker ends with the defect, which the pool's own worker group reports. Nothing restarts. The assembly
+observes the latch with `awaitFailure` in a supervised wait; every consumer sees it as refused submissions and as the
+`ReadDefect` its jobs were told; and the scope rethrows the latched failure if its body returned. The scope's own exit is not a defect: it closes the pool before it stops or cancels a worker, and a worker cancelled then settles the job it interrupted as
+`ReadAbandoned`. A worker that ends while the pool is **open** and healthy for any other reason (asked to stop from outside, terminated by an asynchronous
+exception, or returning) fails the pool the same way, so nothing accepted waits behind a pool that has stopped running. A failure raised while telling a
+queued job's sink is kept beside the defect as cleanup evidence, in what the pool latches and in what the worker raises.
+
+### State
+
+| State | Owner | Writers | Readers | Lifetime |
+|---|---|---|---|---|
+| Pool state (phase, failure, queue, counters) | the `withReadPool` scope | consumers (`reserveSlot`, `releaseSlot`, `submit`, `cancel`), workers (issuance, settlement), close | anyone, via `status` | one scope; never reused |
+| A job's state | the pool | `submit`, `cancel`, the worker that took it, close | the consumer (`retired`), workers | from `submit` to done or withdrawn; the ticket outlives it as a value |
+| Workers | the pool's worker group | the group | the group's report | started with the scope, drained at its exit |
+
+### Evidence
+
+`Test.Content.ReadPool.*` (group `test.content`): exact bytes (empty, NUL, non-UTF-8, BOM, line endings) through real
+temporary roots; the allowance at, one past and absent; at most the configured reads at once, the oldest queued job next
+and the dependency class first; the slot reservations and their defects; a consumer releasing its slot inside the sink;
+a queued cancel that opens no file, an in-flight cancel, and cancels between issuance and the read and between the read
+and publication (held at the pool's coordination hooks, never slept); closing with a started read finishing and delivering;
+a withdrawn job held unretired while its sink is told, on a close and on a failure; a reader defect, a worker terminated by an asynchronous exception under an open pool, and a sink failure latching the pool, with the reader's cleanup evidence and the sink's failure both kept; a partial startup drained; cancellation during a drain, including
+a read that cannot be interrupted; the root outliving a started read; and a separately compiled client composing a
+root, a scan and a pool from public modules alone, with the hooks, the specification constructor and its record update refused. Real-file evidence and injected evidence (a failing reader, the
+hooks) are named as such in the examples.
+
 ## Platforms
 
 Linux and macOS: the suite runs locally on macOS and on Linux CI, and
@@ -837,6 +948,8 @@ Evidence classes, by what exercises them:
 
 The inventory examples (`--match Inventory`, with the components `Scan`, `Limits`, `Changes`, `Aliases`, `Reading`, `Lifecycle` and `Inventory boundary`) are described under
 [Evidence](#evidence-1); they reach the implementation through the private library so a recording seam can count acquisitions and closes, hold a scan or a read at a named boundary, and mutate the folder there.
+
+The pool examples (`--match ReadPool`, with the components `Jobs`, `Lifecycle` and `ReadPool boundary`) are described under [Evidence](#evidence-2); they gate a worker at the pool's coordination hooks and at a wrapped reader, never with a sleep.
 
 The identity examples (`--match Identity`) are described under
 [Evidence](#evidence); their reference data, `NormalizationTest-17.0.0` and
