@@ -990,7 +990,9 @@ no owner-wide or catch-all switch.
 The host's own reasons are short fixed phrases, for example
 `checked.add: argument 1: a float where an integer is declared` or
 `checked.echo_list: argument 1[2]: expected number, found string`; anything of the script's
-own in them, a field name, is cut to 32 characters first, so nothing unbounded is copied. A
+own in them, a field name, is cut to 32 characters first, so nothing unbounded is copied. The message is built under a fixed allowance of its
+own, not the owner's value limits, so even the smallest valid byte limit cannot turn a
+refusal the script caught into a fault. A
 precondition's reason is its own and is carried whole when it is within the bound. One
 longer is not truncated: it is a defect of the application, and is a typed
 `BoundaryFault` of the call (`ValueRefused`, `RuleBytesLimit 256`) whether or not the
