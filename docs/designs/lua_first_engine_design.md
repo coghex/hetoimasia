@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-47/Q-6g: the M1 scene's exposed rendering surface.
+The current checkpoint is P-48/Q-6h: M1 window count, controls and close policy.
+D-50 accepts the clear-colour and ordered texture-rectangle scene surface.
 D-49 accepts independent texture loads without a shared texture cache.
 D-48 accepts explicit texture release and pending-load cancellation.
 D-47 accepts one texture request through usable GPU readiness.
@@ -1501,6 +1502,33 @@ for later sharing. The owner chose independent loads rather than shared backing.
 The two-instance integration test loads the same path for both instances and
 proves ending one leaves the other's resource usable, subject to the approved
 role-failure policy. This does not change D-7's separate module-cache contract.
+
+### D-50. M1 scenes contain a clear colour and ordered texture rectangles
+
+**Delivery:** M1; richer Lua rendering controls deferred.
+
+Owner answer, **2026-10-22 00:20:21 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: texture rectangles (Rec.)
+
+Authenticated relay: `het-manager`, message `n9up9bwtak3asnsbp69rwr7fie`,
+posted **2026-10-22 00:20:21.504 UTC** in `#het-luafirst`, replying to Q-6g
+message `xkjjkq8vqf5najdjphvpk4md26`.
+
+Accept P-47's A: a clear colour and ordered sprite list, each sprite naming a
+ready texture and destination rectangle, showing its whole image. Later sprites
+draw over earlier ones with the existing alpha-blending contract; an empty
+list clears. UI logical pixels start at the top left, with content scale applied
+and the full-window view adapting to resize without stretching authored layout.
+Zero framebuffer size suspends drawing safely. Use full-image UVs, white tint,
+nearest filtering and P-47's other fixed settings; the richer Lua camera,
+transform, crop, tint/filter, animation/material and target controls stay out
+of M1. Existing Haskell renderer capabilities remain intact.
+
+The owner chose A rather than a broader renderer subset. The manager presented
+overlap, clearing and resizing qualification in addition to the quad demo.
+Exact field spelling, colour encoding and numeric budgets remain API work.
 
 ## Proposals
 
@@ -3887,7 +3915,7 @@ renderer and host remain reusable for later shared resources.
 
 ### P-47. Expose a clear colour and an ordered list of UI texture rectangles
 
-**Unapproved; active checkpoint Q-6g. Delivery: M1.** Recommend A: the Lua
+**A accepted by D-50 through Q-6g. Delivery: M1.** Recommend A: the Lua
 scene has a clear colour and a bounded ordered list of sprites. Each sprite
 names its ready texture lease and a finite destination rectangle (position
 and positive width/height). It draws that texture's entire image without
@@ -3943,6 +3971,62 @@ default sampling and painter order for equal depth keys. The
 [image2d sample](../../samples/image2d/README.md) demonstrates UI content scaling.
 The proposed Lua schema and its automatic full-window view adaptation remain
 M1 integration work, not delivered bindings.
+
+### P-48. One window slot per presentation instance, with session-level close
+
+**Unapproved; active checkpoint Q-6h. Delivery: M1.** Recommend A: each
+presentation instance may have at most one outstanding window creation/live
+window. The limit belongs to the instance, not a global current-window variable;
+the integration/test harness can host separate windows for separate instances.
+The pending, live and retiring phases all occupy that instance's slot until
+native/graphics retirement is proven. A second request while occupied is
+refused before native work as an ordinary Lua error. No hidden queue waits for
+the first window to disappear.
+
+Lua requests an ordinary visible, decorated, resizable window with title and
+initial positive logical size (D-45). Desktop move/resize/minimize/maximize and
+D-50's framebuffer/content-scale handling remain real. M1 exposes no Lua
+fullscreen, positioning, hide/show, title/size mutation or independent close
+control. Lua uses the existing whole-session quit operation to exit. This is
+the launcher's Lua binding policy, not a reduction of the reusable Haskell
+window host's capabilities.
+
+A native user close request for an M1 window requests orderly whole-session
+quit, including if it arrives during window creation or startup. Lua cannot
+veto it; D-20's exit precedence and protected teardown apply. This makes D-43's
+demonstration close rule concrete. Cleanup-induced destruction when an instance
+ends is not a new user close request: normal harness-controlled ending of one
+instance closes only its window/resources and does not itself stop its peer.
+Actual UI failure still follows the already approved whole-session policy.
+
+Expose cancellation of a pending window request with the same elapsed first-
+settlement rule as texture requests: a winning cancellation withdraws interest
+without a required-load failure; a prior success/failure remains settled and
+cannot be erased. Cancellation retains the slot until actual retirement.
+After it retires, that instance may request a new window. If success won first,
+there is no M1 independent close/reopen API: keep the window until instance end
+or quit the session. Losing the result/handle never frees the slot or leaks the
+native window; engine-owned cleanup remains responsible.
+
+Alternative B allows multiple windows per presentation instance under an
+explicit finite bound, keeping the same simple native-close-means-session-quit
+rule and limited controls. It supports extra views now but requires additional
+Lua admission/accounting, per-window scene/texture lifetime and native evidence.
+If chosen, settle the bound and revise this contract before recording it.
+
+A is recommended for the textured-quad milestone because it exercises real
+per-instance window ownership without adding multi-window authoring yet. Its
+cost is explicit: one script instance cannot make a tool palette or second
+preview window, nor close/reopen a successful window while continuing. Later
+window-management work may extend that surface. Qualification covers duplicate
+admission, cancellation/completion order, close during startup, teardown that
+does not synthesize a peer's quit, and retained retirement before slot reuse.
+
+Evidence: the [GLFW host](../glfw.md) already has bounded multi-window ownership
+and surfaces native close requests to application policy; a native close
+callback neither destroys a window nor exits the process by itself. The new
+composition must implement the policy above while preserving the delivered
+protected native/graphics lifetime, not add Lua to native callbacks.
 
 ## Open questions
 
@@ -4257,10 +4341,17 @@ test uses the same content path while proving separate ownership/lifetime.
 
 #### Q-6g. What scene surface does M1 expose to Lua?
 
-**Active checkpoint, P-47.** A (recommended): clear colour plus an ordered list
-of full-texture destination rectangles in UI logical pixels, automatically
-mapped to a full-window view. B: select a broader native-renderer surface now
-and sign off its exact additions. D-46's copied publication applies either way.
+Resolved by D-50: P-47's A, clear colour plus ordered full-texture rectangles
+in UI logical pixels, mapped to a full-window view with fixed M1 settings.
+The broader-renderer alternative was not chosen; D-46 publication still applies.
+
+#### Q-6h. How many windows and which window controls does M1 expose?
+
+**Active checkpoint, P-48.** A (recommended): one pending/live/retiring window
+slot per presentation instance, creation and pending cancellation, native close
+requests whole-session quit, no independent close or advanced controls. B:
+multiple windows per instance under a finite bound with the same close policy.
+Both preserve per-window scenes, per-instance cleanup and native retirement.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
