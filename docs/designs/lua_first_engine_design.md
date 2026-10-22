@@ -66,7 +66,7 @@ concrete precondition
 - [x] LFE-2. Add opt-in recoverable binding validation and refusal — [#516]
 - [x] LFE-3. Parse the strict manifest and validate the fixed M1 profile — [#517]
 - [x] LFE-4. Own anchored native content roots and no-follow reads — [#518]
-- [ ] LFE-5. Validate literal Unicode content identities
+- [x] LFE-5. Validate literal Unicode content identities — [#519]
 - [ ] LFE-6. Build and verify the bounded whole-folder inventory
 - [ ] LFE-7. Reserve M1 requests and results atomically
 - [ ] LFE-8. Retain VM-local module exports and captured behaviors
