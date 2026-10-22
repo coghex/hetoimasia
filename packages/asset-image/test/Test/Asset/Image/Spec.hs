@@ -8,6 +8,9 @@ import qualified Test.Asset.Image.Fixtures as Fixtures
 import qualified Test.Asset.Image.Ktx2 as Ktx2
 import qualified Test.Asset.Image.Mips as Mips
 import qualified Test.Asset.Image.Png as Png
+import qualified Test.Asset.Image.PngPreflight as PngPreflight
+import qualified Test.Asset.Image.PngPreflightClient as PngPreflightClient
+import qualified Test.Asset.Image.PngPreflightInflation as PngPreflightInflation
 import qualified Test.Asset.Image.Premultiply as Premultiply
 import qualified Test.Asset.Image.Refusals as Refusals
 import Test.Hspec (Spec, describe)
@@ -18,6 +21,9 @@ spec = describe "AssetImage" $ do
   Premultiply.spec
   Png.spec
   Refusals.spec
+  PngPreflight.spec
+  PngPreflightInflation.spec
+  PngPreflightClient.spec
   Bc7.spec
   Bc7Opacity.spec
   Mips.spec

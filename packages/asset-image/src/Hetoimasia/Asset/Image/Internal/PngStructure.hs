@@ -14,6 +14,7 @@
 module Hetoimasia.Asset.Image.Internal.PngStructure
   ( checkStructure
   , ColourKey (..)
+  , colourKey
   )
 where
 
@@ -29,6 +30,7 @@ import Codec.Picture.Png.Internal.Type
   , pngSignature
   , tRNSSignature
   )
+import Control.DeepSeq (NFData (rnf))
 import Data.Binary (get)
 import Data.Binary.Get (runGetOrFail)
 import Data.ByteString (ByteString)
@@ -36,7 +38,8 @@ import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Lazy as Lazy
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Data.Word (Word16, Word8)
+import Data.Word (Word16)
+import Hetoimasia.Asset.Image.Internal.PngGeometry (PngColourType (..), PngInterlace (..), allowedDepths, scanlineBytes)
 
 -- | A greyscale or truecolour image's @tRNS@ colour key: the sample values,
 -- at the image's own bit depth, of the one colour that is fully transparent.
@@ -46,6 +49,9 @@ data ColourKey
   = GreyKey !Word16
   | RgbKey !Word16 !Word16 !Word16
   deriving (Eq, Show)
+
+instance NFData ColourKey where
+  rnf key = key `seq` ()
 
 -- | The header of a PNG whose framing, header and image data stream are
 -- sound, with its colour key if it has one; or the reason they are not.
@@ -100,18 +106,9 @@ checkHeader ihdr
   | width ihdr == 0 || height ihdr == 0 = Left "the PNG's width or height is zero"
   | compressionMethod ihdr /= 0 = Left "the PNG names an unknown compression method"
   | filterMethod ihdr /= 0 = Left "the PNG names an unknown filter method"
-  | bitDepth ihdr `notElem` allowedDepths (colourType ihdr) =
+  | bitDepth ihdr `notElem` allowedDepths (geometryColour (colourType ihdr)) =
       Left ("the PNG's bit depth " <> tshow (bitDepth ihdr) <> " is not allowed for its colour type")
   | otherwise = Right ()
-
--- | The bit depths the PNG specification allows for each colour type.
-allowedDepths ∷ PngImageType → [Word8]
-allowedDepths = \case
-  PngGreyscale → [1, 2, 4, 8, 16]
-  PngTrueColour → [8, 16]
-  PngIndexedColor → [1, 2, 4, 8]
-  PngGreyscaleWithAlpha → [8, 16]
-  PngTrueColourWithAlpha → [8, 16]
 
 -- | The compressed stream must inflate, and to at least the bytes the
 -- header's extent, bit depth and interlacing need.
@@ -135,35 +132,28 @@ inflatedLength compressed =
     compressed
     0
 
--- | The size of the filtered image data: for each pass (one, or Adam7's
--- seven), one filter byte per row plus the row's packed samples.
+-- | The size of the filtered image data the header describes.
 filteredSize ∷ PngIHdr → Integer
-filteredSize ihdr = case interlaceMethod ihdr of
-  PngNoInterlace → pass w h
-  PngInterlaceAdam7 →
-    sum
-      [ pass (extent w column0 columnStep) (extent h row0 rowStep)
-      | (column0, columnStep, row0, rowStep) ← adam7
-      ]
-  where
-    w = toInteger (width ihdr)
-    h = toInteger (height ihdr)
-    bitsPerPixel = channels (colourType ihdr) * toInteger (bitDepth ihdr)
-    pass passWidth passHeight
-      | passWidth <= 0 || passHeight <= 0 = 0
-      | otherwise = passHeight * (1 + (passWidth * bitsPerPixel + 7) `div` 8)
-    extent size start step
-      | size <= start = 0
-      | otherwise = (size - start + step - 1) `div` step
-    adam7 = [(0, 8, 0, 8), (4, 8, 0, 8), (0, 4, 4, 8), (2, 4, 0, 4), (0, 2, 2, 4), (1, 2, 0, 2), (0, 1, 1, 2)]
+filteredSize ihdr =
+  scanlineBytes
+    (geometryInterlace (interlaceMethod ihdr))
+    (geometryColour (colourType ihdr))
+    (bitDepth ihdr)
+    (toInteger (width ihdr))
+    (toInteger (height ihdr))
 
-channels ∷ PngImageType → Integer
-channels = \case
-  PngGreyscale → 1
-  PngTrueColour → 3
-  PngIndexedColor → 1
-  PngGreyscaleWithAlpha → 2
-  PngTrueColourWithAlpha → 4
+geometryColour ∷ PngImageType → PngColourType
+geometryColour = \case
+  PngGreyscale → ColourGreyscale
+  PngTrueColour → ColourTruecolour
+  PngIndexedColor → ColourIndexed
+  PngGreyscaleWithAlpha → ColourGreyscaleAlpha
+  PngTrueColourWithAlpha → ColourTruecolourAlpha
+
+geometryInterlace ∷ PngInterlaceMethod → PngInterlace
+geometryInterlace = \case
+  PngNoInterlace → InterlaceNone
+  PngInterlaceAdam7 → InterlaceAdam7
 
 tshow ∷ Show a ⇒ a → Text
 tshow = Text.pack . show
