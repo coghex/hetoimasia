@@ -47,7 +47,7 @@ module Hetoimasia.Scripting.Lua.Provider.Types
   , RequestGrantRefused (..)
 
     -- * The opt-in admission
-  , Requirement (..)
+  , Necessity (..)
   , Admission (..)
   , admission
   , Credit (..)
@@ -194,7 +194,7 @@ data RequestInfo = RequestInfo
   , infoEndpoint ∷ !Text
   , infoNumber ∷ !Word64
     -- ^ The request's number, which is unique to its owner and never reissued.
-  , infoRequirement ∷ !(Maybe Requirement)
+  , infoNecessity ∷ !(Maybe Necessity)
     -- ^ Whether an expected failure of the request fails its instance. 'Nothing' for a request
     -- that did not take the opt-in admission ('Admission').
   , infoSource ∷ !(Maybe Text)
@@ -334,13 +334,14 @@ data ReplyAnswer
 
 -- The opt-in admission --------------------------------------------------------------
 
--- | Whether an expected failure of a request fails the instance that made it (D-52).
-data Requirement
+-- | Whether an expected failure of a request fails the instance that made it (D-52): the
+-- request's required or optional policy, which the service supplies.
+data Necessity
   = -- | An expected failure, once it is eligible to settle, fails the instance, whether or not
     -- its script ever reads the request.
-    Required
+    RequiredRequest
   | -- | An expected failure is a result for the script to read.
-    Optional
+    OptionalRequest
   deriving (Eq, Show)
 
 -- | A bank of credit a provider declares for the requests it serves (a byte budget, a worker
@@ -425,7 +426,7 @@ instance Show Adoption where
 -- It is carried by one request and by nothing else: the owner's defaults, its generic
 -- requests and its full-capacity behaviour (a refusal that fails the call) are unchanged.
 data Admission = Admission
-  { admitRequirement ∷ !Requirement
+  { admitNecessity ∷ !Necessity
   , admitSource ∷ !Text
     -- ^ Attributable source context: what the requester asked for, recorded with the request
     -- and named when a required failure fails the instance. Bounded to 128 characters.
@@ -479,10 +480,10 @@ defaultFailureFrame ∷ ExpectedFailure → [(Text, Value)]
 defaultFailureFrame found = [("status", VText "failure"), ("reason", VText (expectedMessage found))]
 
 -- | An admission with these policies, no offset, no codes, no credits and no result lease.
-admission ∷ Requirement → Text → ValueLimits → Word64 → Int → Int → Admission
+admission ∷ Necessity → Text → ValueLimits → Word64 → Int → Int → Admission
 admission requirement source limits ceilingValue perInstance perVm =
   Admission
-    { admitRequirement = requirement
+    { admitNecessity = requirement
     , admitSource = Text.take 128 source
     , admitOffset = Nothing
     , admitLogicalMaximum = ceilingValue
@@ -865,6 +866,10 @@ data PState = PState
     -- ^ The resource replies the owner has yet to build into their leases.
   , pDefects ∷ ![Text]
     -- ^ The provider defects the owner has yet to raise, oldest first, each bounded.
+  , pDiscards ∷ ![(Word64, Word64)]
+    -- ^ The adopted leases, by instance and key, of requests that settled without delivering the
+    -- resource to their script (cancelled, or ended by an epoch): nothing can reach them, and the
+    -- owner releases them at its next boundary.
   , pForget ∷ !(Map Word64 [Word64])
     -- ^ The numbers of the subscriptions an epoch change ended, by instance, that the instance's VM
     -- still holds a callback for: the owner has its driver let go of them at its next boundary,

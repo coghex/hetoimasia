@@ -62,6 +62,7 @@ module Hetoimasia.Scripting.Lua.Provider.State
   , takeTerminal
   , releaseSettled
   , takeDefects
+  , takeDiscards
   , takePendingAdoptions
   , finishAdoption
   , failAdoption
@@ -379,6 +380,7 @@ newProviderState owner label key limits grant endpoints subscriptions ticks inst
         , pHeld = Map.empty
         , pAdopting = Map.empty
         , pDefects = []
+        , pDiscards = []
         , pForget = Map.empty
         }
   pure
@@ -911,6 +913,20 @@ releaseSettled service = do
 unclaimed ∷ (Map RequestId Adopting → Map RequestId Adopting) → Map RequestId Adopting → Map RequestId Adopting
 unclaimed drop' held = Map.union (Map.filter adoptingClaimed held) (drop' (Map.filter (not . adoptingClaimed) held))
 
+-- | The adopted lease of a record whose result the script will never be handed, as the instance
+-- and key to release: the resource was built for a request that is cancelled.
+adoptedOf ∷ Rec → [(Word64, Word64)]
+adoptedOf record = case (recAdopted record, recLease record, recRequester record) of
+  (True, Just key, RequesterInstance number) → [(number, key)]
+  _ → []
+
+-- | The adopted leases to release, taken: each is the caller's to release on the owner's thread.
+takeDiscards ∷ ProviderState → STM [(Word64, Word64)]
+takeDiscards service = do
+  st ← readTVar (psVar service)
+  writeTVar (psVar service) st {pDiscards = []}
+  pure (pDiscards st)
+
 -- | The provider defects the owner has yet to raise, taken, oldest first.
 takeDefects ∷ ProviderState → STM [Text]
 takeDefects service = do
@@ -1254,7 +1270,7 @@ applyChecked service identity checked = do
 latchRequired ∷ ProviderState → Rec → STM ()
 latchRequired service record = case (recAdmission record, recFailure record, recRequester record) of
   (Just ask, Just failure, RequesterInstance number)
-    | admitRequirement ask == Required → do
+    | admitNecessity ask == RequiredRequest → do
         found ← cellOf service number
         forM_ found $ \(instances, cell) → do
           state ← readTVar (icState cell)
@@ -1382,6 +1398,7 @@ cancelOf service requester number = do
                     , pRecs = Map.insert (recIdentity record) released (pRecs st)
                     , pDue = Map.filter (/= recIdentity record) (pDue st)
                     , pAdopting = unclaimed (Map.delete (recIdentity record)) (pAdopting st)
+                    , pDiscards = pDiscards st <> adoptedOf record
                     , pWork = Map.adjust (\work → work {workWantsCancel = True}) (recIdentity record) (pWork st)
                     , pCounts = if before then (pCounts st) {countCancelledBeforeTick = countCancelledBeforeTick (pCounts st) + 1} else pCounts st
                     }
@@ -1595,7 +1612,7 @@ advanceEpochSTM service = do
                   let (session, _) = cancelRequestWith CancelledByEpochChange identity (pSession st)
                       settledCancel = (SettledCancelled CancelledByEpochChange, CancelledByEpochChange)
                       st' = st {pSession = session, pWork = Map.adjust (\work → work {workWantsCancel = True}) identity (pWork st)}
-                  pure ((if completed then endWork identity st' else st'), kept <> [released {recEnded = Just settledCancel}], cancelled + 1, discarded)
+                  pure ((if completed then endWork identity st' else st') {pDiscards = pDiscards st' <> adoptedOf record}, kept <> [released {recEnded = Just settledCancel}], cancelled + 1, discarded)
             _ → pure (st {pWork = Map.adjust (\work → if workEnded work then work else work {workWantsCancel = True}) identity (pWork st)}, kept, cancelled, discarded + 1)
 
 -- | The owner has exited: nothing is admitted after it. Every request still held is revoked,
@@ -1764,7 +1781,7 @@ workWaiting service = do
       polling = [obligation | work ← works, workWantsCancel work, not (workEnded work), isNothing (workFailure work), obligation ← retainedObligations (workRetained work)]
   changed ← forM polling $ \obligation →
     (\reading → case reading of ProviderPending → False; _ → True) <$> pollObligation obligation
-  pure (over || untold || or changed || any (not . adoptingClaimed) (Map.elems (pAdopting st)) || not (null (pDefects st)))
+  pure (over || untold || or changed || any (not . adoptingClaimed) (Map.elems (pAdopting st)) || not (null (pDefects st)) || not (null (pDiscards st)))
 
 -- Reading --------------------------------------------------------------------------------
 

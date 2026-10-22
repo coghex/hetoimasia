@@ -68,7 +68,7 @@ module Hetoimasia.Scripting.Lua.Admission
   ( -- * What a request asks
     Admission (..)
   , admission
-  , Requirement (..)
+  , Necessity (..)
   , Credit (..)
   , CreditEnd (..)
   , ExpectedFailure (..)
@@ -160,7 +160,7 @@ startAdmitted context ask name arguments afterCompletion = do
       OptInAccepted found → do
         let info =
               (infoFor service requester name (admittedNumber found))
-                { infoRequirement = Just (admitRequirement ask)
+                { infoNecessity = Just (admitNecessity ask)
                 , infoSource = Just (admitSource ask)
                 , infoOffset = admitOffset ask
                 , infoDue = admittedDue found

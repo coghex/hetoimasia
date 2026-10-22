@@ -54,6 +54,27 @@ library
         hetoimasia-foundation ==0.1.0.0,
         text >=2.1 && <2.2
 
+-- The M1 request adapter (LFE-7): the profile's request policy and the exact common result
+-- schema, over the host's opt-in admission. It lives in a sublibrary of its own, in a source
+-- directory of its own, because the library above is the pure configuration boundary and must
+-- stay one: it imports nothing that performs IO, and this does. It depends on the library for the
+-- profile, on the host and on the host's runtime adapter for the admission it adapts. It
+-- imports no module of a game, a window, a GPU, the console or the content layer.
+library request
+    import: language
+    visibility: public
+    default-extensions: OverloadedStrings
+    hs-source-dirs: request
+    exposed-modules:
+        Hetoimasia.LuaEngine.Request
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        text >=2.1 && <2.2,
+        hetoimasia-lua-engine ==0.1.0.0,
+        hetoimasia-scripting-lua ==0.1.0.0,
+        hetoimasia-scripting-lua:runtime-lua
+
 -- This package's own contracts, registered as the CPU validation group
 -- `test.lua-engine`. Hspec is the suite's alone.
 test-suite lua-engine-tests

@@ -76,7 +76,7 @@ infoFor service requester name number =
         RequesterTask _ → Nothing
     , infoEndpoint = name
     , infoNumber = number
-    , infoRequirement = Nothing
+    , infoNecessity = Nothing
     , infoSource = Nothing
     , infoOffset = Nothing
     , infoDue = Nothing

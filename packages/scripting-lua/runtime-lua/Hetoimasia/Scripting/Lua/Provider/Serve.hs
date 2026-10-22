@@ -149,6 +149,19 @@ adoptPending service leaseHost = mask_ $ do
                     pure [failure | Left failure ← [released]]
       )
 
+-- | Release the adopted leases of requests that settled without handing their script the resource
+-- (cancelled before the result was taken, or ended by an epoch): the resource was built for a
+-- request nobody can take it from, so nothing can reach it, and it is retired on this thread at
+-- once. Answers what the releases raised.
+discardAdopted ∷ ProviderState → Maybe LeaseHost → IO [ExceptionWithContext SomeException]
+discardAdopted service leaseHost = mask_ $ do
+  pending ← atomically (takeDiscards service)
+  case leaseHost of
+    Nothing → pure []
+    Just host → do
+      released ← forM pending (\(number, key) → releaseKey host number key)
+      pure [failure | Left failure ← released]
+
 -- Serving ----------------------------------------------------------------------------------
 
 -- | Serve a tick the owner has reached: the requests due at it or before are settled by the
@@ -235,14 +248,15 @@ providerBoundary service scheduler hasInstances leaseHost evidence onCleanupFail
     onCleanupFailure
   -- The resources the providers replied with are built into the leases their requests reserved,
   -- on this thread, before the results they belong to can be held or settled.
-  adopting ← atomically (not . Map.null . pAdopting <$> readTVar (psVar service))
+  adopting ← atomically ((\st → any (not . adoptingClaimed) (Map.elems (pAdopting st)) || not (null (pDiscards st))) <$> readTVar (psVar service))
   adopted ← adoptPending service leaseHost
+  discarded ← discardAdopted service leaseHost
   defects ← atomically (takeDefects service)
   defective ← forM defects defectOf
   served ← if hasInstances then pure False else serveWatchOnly service scheduler
   woke ← atomically (ticksWakeSettled (psTicks service) (settledNumber service))
   after ← atomically (workPendingCount service)
-  raiseFirst evidence "lua provider boundary" (defective <> adopted <> swept <> told)
+  raiseFirst evidence "lua provider boundary" (defective <> adopted <> discarded <> swept <> told)
   pure (woke || served || before /= after || not (null cleanup) || adopting || not (null defects))
 
 -- | Whether the owner has anything to do for its requests, and a wait to compose into its
