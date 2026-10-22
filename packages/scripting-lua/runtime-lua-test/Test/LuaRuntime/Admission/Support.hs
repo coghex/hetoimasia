@@ -31,6 +31,7 @@ module Test.LuaRuntime.Admission.Support
   , answerFailure
   , answerExpected
   , releaseLog
+  , resourceFor
 
     -- * The modules
   , admitter
@@ -98,12 +99,14 @@ data Policy = Policy
   , polPerVm ∷ !Int
   , polCeiling ∷ !Word64
   , polSource ∷ !Text
+  , polDisposal ∷ !(Maybe (IO ()))
+    -- ^ What the request's work needs disposed of once the provider has proved it over, if not just noting it.
   }
 
 -- | A required request with the failure codes @not_found@ and @io_error@, no credit and no
 -- lease, four per instance and eight per VM, and the numeric ceiling of the profile.
 defaultPolicy ∷ Policy
-defaultPolicy = Policy RequiredRequest ["not_found", "io_error"] [] Nothing 4 8 9223372036854775807 "example"
+defaultPolicy = Policy RequiredRequest ["not_found", "io_error"] [] Nothing 4 8 9223372036854775807 "example" Nothing
 
 -- | The instance fixture, the handles the owner leases and answers liveness through, the fake
 -- provider and the policy.
@@ -199,8 +202,8 @@ releaseLog ∷ AFix → Text → [Text] → Bool
 releaseLog _ name seen = ("release " <> name) `elem` seen
 
 -- | The fake resource of this name: one part that records its acquisition and its release.
-resourceAssembly ∷ AFix → Text → Assembly Text
-resourceAssembly fixture name = do
+resourceFor ∷ AFix → Text → Assembly Text
+resourceFor fixture name = do
   _ ←
     acquirePart
       name
@@ -212,7 +215,7 @@ resourceAssembly fixture name = do
 -- | The provider answers the nth request with this integer and a resource of this name.
 answerResource ∷ AFix → Int → Int → Text → IO ReplyAnswer
 answerResource fixture index n name =
-  answerWith (afFake fixture) index (ProviderResource (VInteger (fromIntegral n)) (Adoption (\_ → resourceAssembly fixture name)))
+  answerWith (afFake fixture) index (ProviderResource (VInteger (fromIntegral n)) (Adoption (\_ → resourceFor fixture name)))
 
 -- | The provider answers the nth request with a failure that has no code its service supplies.
 answerFailure ∷ AFix → Int → Text → IO ReplyAnswer
@@ -261,7 +264,8 @@ adNamespace fixture =
         asynchronousNativeRequestIn "start" [SText, SInteger, SOptional SInteger] startSchemas $ \context arguments → case arguments of
           VText endpoint : VInteger n : _ → do
             ask ← admissionOf fixture (offsetOf arguments)
-            started ← startAdmitted context ask endpoint [VInteger n] (note fixture ("disposed " <> Text.pack (show n)))
+            disposal ← polDisposal <$> readIORef (afPolicy fixture)
+            started ← startAdmitted context ask endpoint [VInteger n] (maybe (note fixture ("disposed " <> Text.pack (show n))) id disposal)
             pure $ case started of
               Started handle → [requestHandleValue "areq" handle, VNil]
               Unavailable bank → [VNil, VRecord [("code", VText "busy"), ("message", VText (renderBank bank))]]

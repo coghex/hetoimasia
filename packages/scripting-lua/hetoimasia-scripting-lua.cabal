@@ -404,6 +404,7 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Admission.Handles
         Test.LuaRuntime.Admission.Lease
         Test.LuaRuntime.Admission.Release
+        Test.LuaRuntime.Admission.Settlement
         Test.LuaRuntime.Admission.Timing
         Test.LuaRuntime.Admission.Spec
         Test.LuaRuntime.Admission.Support

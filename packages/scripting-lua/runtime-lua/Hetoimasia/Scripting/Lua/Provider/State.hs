@@ -1168,7 +1168,7 @@ replyTo service identity checked = do
       | unsettled → do
           writeTVar (psVar service) $
             endWork identity st
-              { pDefects = pDefects st <> [Text.take 512 why]
+              { pDefects = take defectLimit (pDefects st <> [Text.take 512 why])
               , pCounts = (pCounts st) {countDefects = countDefects (pCounts st) + 1}
               }
           pure ReplyDefective
@@ -1260,6 +1260,11 @@ applyChecked service identity checked = do
         Left (PayloadTooLarge _ _) → ReplyRefusedValue
         Left (ReplyRefused _) → ReplyLate
         Left _ → ReplyLate
+
+-- | How many provider defects are kept for the owner to raise: it fails with the first, and the rest are
+-- evidence; a provider that goes on answering wrongly cannot grow what the service keeps.
+defectLimit ∷ Int
+defectLimit = 16
 
 -- | Fail the instance of a required request whose expected failure has just become eligible:
 -- latch it on the instance, once, and wake the owner to apply it at its next safe boundary. An

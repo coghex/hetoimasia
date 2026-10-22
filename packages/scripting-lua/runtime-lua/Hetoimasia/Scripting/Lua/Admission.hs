@@ -110,6 +110,7 @@ import Data.Text (Text)
 import Data.Word (Word64)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (operation, throwFailure)
+import Hetoimasia.Foundation.Resource (composeCleanup)
 import Hetoimasia.Scripting.Lua.Instance.Types (InstancePhase (..))
 import Hetoimasia.Scripting.Lua.Lease.State (Retirements)
 import Hetoimasia.Scripting.Lua.Provider.Call
@@ -171,8 +172,14 @@ startAdmitted context ask name arguments afterCompletion = do
         handed ← guarded (restore (endpointSubmit endpoint (Submission arguments completion info)))
         case handed of
           Left failure → do
-            atomically (withdrawAdmission service (admittedIdentity found))
-            rethrowIO failure
+            -- Taking the admission back runs the provider's credit releases: one that raises is
+            -- kept beside the failure that made it necessary, which stays the primary.
+            withdrawn ← guarded (atomically (withdrawAdmission service (admittedIdentity found)))
+            case withdrawn of
+              Right () → rethrowIO failure
+              Left secondary → do
+                composed ← composeCleanup (Just failure) [("lua credit release", secondary)]
+                maybe (rethrowIO failure) rethrowIO composed
           Right provided → do
             atomically (commitSubmitted service (admittedIdentity found) provided [afterCompletion])
             -- A request revoked while the provider was being handed it has interest to withdraw
