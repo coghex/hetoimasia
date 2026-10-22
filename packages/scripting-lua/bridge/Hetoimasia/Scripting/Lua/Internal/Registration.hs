@@ -40,6 +40,14 @@
 -- for and with which arguments. It is eligible for the direct path only. Where a
 -- call to one cannot reach a scheduler it is refused as a typed fault of the call.
 --
+-- = Recoverable refusals
+--
+-- A binding opted in with 'recoverableRefusals' or 'withPrecondition' reports what it
+-- refuses before its action, to a script that can catch it, as an ordinary Lua
+-- error, where any other binding's refusal is a typed fault of the call that a
+-- script cannot hide. See 'recoverableRefusals' for what that covers and
+-- "Hetoimasia.Scripting.Lua.Internal.Binding" for what it does not.
+--
 -- = Bounds
 --
 -- Every size a registration can have is bounded, and each bound is documented

@@ -141,6 +141,8 @@ registrationOf fx = either (error . ("registration refused: " <>) . show) id (re
               (\owner → pure (if fmap (fromLifecycleContext @Text) (contextLifecycle owner) == Just (Just "owner A") then Nothing else Just "not owner A"))
               (stateOperation "owned_by_a" [] [] (\_ → note fx "owned_by_a" >> pure []))
           , finalizerEligible (recoverableRefusals (stateOperation "note_gc" [SText] [] (\_ → note fx "note_gc" >> pure [])))
+          , recoverableRefusals (lifecycleOperation "stop" [] [] (\_ → note fx "stop" >> pure []))
+          , withPrecondition (phaseIs fx "update") (lifecycleOperation "stop_checked" [] [] (\_ → note fx "stop_checked" >> pure []))
           ]
         ]
     plain =
@@ -533,6 +535,15 @@ fatalSpec = describe "what stays fatal" $ do
       -- The later actions ran, and the fault says an action followed it.
       boundaryEffect fault `shouldBe` BindingRan
       logged fx >>= (`shouldBe` ["admit", "add"])
+
+  it "keeps the refusal of a binding the owner has no context to deliver, before any precondition runs" $
+    withFx $ \fx owned → do
+      writeIORef (fxPhase fx) "init"
+      forM_ ["checked.stop", "checked.stop_checked"] $ \name → do
+        fault ← runFault owned ("pcall(" <> name <> ")")
+        boundaryReason fault `shouldBe` NotYetSupported LifecycleOperation
+      count (fxChecks fx) >>= (`shouldBe` 0)
+      logged fx >>= (`shouldBe` [])
 
   it "never lets a caught refusal replace an application failure" $
     withFx $ \_ owned → do

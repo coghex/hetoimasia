@@ -34,6 +34,33 @@
 -- 'Hetoimasia.Scripting.Lua.Internal.Boundary.BindingRan', because the action
 -- had run. A failure of the action itself is not converted: it is re-raised at
 -- the owner's boundary with its type and context, as for any callback.
+--
+-- = Recoverable refusals
+--
+-- A binding opted in with
+-- 'Hetoimasia.Scripting.Lua.Internal.Registration.recoverableRefusals' or
+-- 'Hetoimasia.Scripting.Lua.Internal.Registration.withPrecondition' refuses what it
+-- can before its action differently: its preconditions, run first (before the
+-- host asks whether a scheduler operation can suspend, and before an argument is
+-- read), and the refusals of step 2 and 3 are not thrown. The handler leaves a
+-- bounded message on the stack, built by the same protected push the results use,
+-- and answers 'failedResults'; the C closure raises it once every Haskell frame
+-- has returned, as it raises the marker, but nothing is recorded on the VM. Lua
+-- sees an ordinary error: @pcall@ catches it, the call it was caught in goes on and
+-- can succeed, and the action did not run. An uncaught one is the script's own
+-- error, and goes where any is reported.
+--
+-- What is not made recoverable: a precondition's or a validator's own exception,
+-- which is the application's failure; the interpreter or the host running out of
+-- stack or memory reading a value; a precondition's reason past
+-- 'Hetoimasia.Scripting.Lua.Internal.Registration.refusalReasonLimit', which is a
+-- defect of the application; the host's own refusal of a scheduler operation once
+-- the preconditions have passed; everything after the action; and a refusal reached
+-- from a finalizer. Lua turns an error raised in a finalizer into a warning and
+-- says nothing, so a call made while the VM closes, or while the collector is not
+-- running (which is how a running finalizer looks, and what a script that stopped
+-- it looks like), keeps the recorded fault. Nothing ever clears one: a recoverable
+-- refusal records nothing, and so removes nothing.
 module Hetoimasia.Scripting.Lua.Internal.Binding
   ( installRegistration
   , valueHandler

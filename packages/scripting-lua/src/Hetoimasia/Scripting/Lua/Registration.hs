@@ -63,6 +63,28 @@
 -- ('Hetoimasia.Scripting.Lua.Owner.SuspendRefused'), and is never eligible for
 -- the confined path.
 --
+-- = Recoverable refusals
+--
+-- A binding refuses a call before its action as a typed fault of the call, and a
+-- script that catches the Lua error it saw cannot hide the fault: the operation that
+-- ran the script raises it. 'recoverableRefusals' opts one binding out of that, and
+-- 'withPrecondition' opts one out and gives it an application check made first. For an
+-- opted-in binding the refusals the host makes before the action (a wrong number of
+-- arguments, a value of the wrong shape or past a limit, a capability that is not the
+-- declared one, foreign or no longer live) and a precondition's refusal reach the
+-- script as an ordinary Lua error with a bounded message, @binding: reason@, of at most
+-- 'refusalReasonLimit' bytes of reason. @pcall@ catches it, the invocation goes on and
+-- can succeed, and the action never ran. A precondition reads engine-owned state, not a
+-- script's: a context the owner was configured with ('OwnerContexts') or what the
+-- application captured. Busy, a response that no work was admitted, is data the action
+-- returns, @nil, {code = "busy", message = text}@ through a result schema, and never an
+-- error.
+--
+-- Nothing else becomes recoverable: an application's failure, a refusal after the
+-- action, the host's own failures, a precondition's exception, and a refusal reached
+-- from a finalizer keep the typed fault they have. An error a script caught never
+-- erases a fault already recorded. Bindings that are not opted in are unchanged.
+--
 -- = Names and bounds
 --
 -- A name is 1 to 64 ASCII letters, digits and underscores, not starting with a
