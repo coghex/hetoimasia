@@ -634,6 +634,44 @@ spec = describe "the module loader" $ do
           other → expectationFailure ("unexpected reason " <> show other)
         actions rig >>= (`shouldBe` 1)
 
+    it "keeps the phase over the to-be-closed variables that close a failed module's coroutine, and puts it back" $
+      withRig $ \rig owned → do
+        _ ←
+          supply
+            rig
+            owned
+            "f"
+            [ "local guard <close> = setmetatable({}, { __close = function() trace.mark('close:' .. tostring(pcall(svc.acquire))) end })"
+            , "error('boom')"
+            ]
+        _ ← admit owned "f"
+        _ ← advance owned
+        failureOf owned "f" >>= \failed → case boundaryReason failed of
+          ScriptFailed _ _ → pure ()
+          other → expectationFailure ("unexpected reason " <> show other)
+        traced rig >>= (`shouldBe` ["close:false"])
+        actions rig >>= (`shouldBe` 0)
+        modulePhaseActive (rigPhase rig) >>= (`shouldBe` False)
+
+    it "keeps the phase over the variables that close a suspended module on stop, and puts it back" $
+      withRig $ \rig owned → do
+        _ ←
+          supply
+            rig
+            owned
+            "s"
+            [ "local guard <close> = setmetatable({}, { __close = function() trace.mark('close:' .. tostring(pcall(svc.acquire))) end })"
+            , "local never = import('never')"
+            , "return {}"
+            ]
+        _ ← admit owned "s"
+        held ← advance owned
+        advanceBlocked held `shouldBe` BlockedSource (ident "never")
+        _ ← stopModuleLoader owned
+        traced rig >>= (`shouldBe` ["close:false"])
+        actions rig >>= (`shouldBe` 0)
+        modulePhaseActive (rigPhase rig) >>= (`shouldBe` False)
+
 -- | Whether a status is a ready module.
 isReady ∷ ModuleStatus → Bool
 isReady = \case

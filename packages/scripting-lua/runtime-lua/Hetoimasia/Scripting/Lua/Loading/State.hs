@@ -37,13 +37,18 @@
 --
 -- = A due chain holds the tick
 --
--- While a logical root that is due (its tick reached) has not come to an outcome, the
--- owner asks to be held at the next tick: the scheduler does not apply a grant that would
--- begin the next tick, so the chain's tick is not complete and nothing advances past the
--- obligation. The hold is one need, taken and given back as the set of such roots becomes
--- non-empty and empty, and given back when the owner exits. A UI chain holds nothing: hooks
--- and stop requests simply go on while its source is awaited. A non-yielding module still
--- blocks its owner; nothing here preempts trusted Lua.
+-- A logical root owes its tick: tick @t@ is not complete until the root has come to an
+-- outcome, so the tick after it does not begin first. The obligation is recorded in the
+-- transaction that accepts the submission, from any thread, and the owner is held at the
+-- tick after the due one (or after the current one, once the due one has passed) in that
+-- same transaction, before the owner has looked at anything: the scheduler does not apply
+-- a grant that would begin that tick, however many grants were queued meanwhile, so
+-- nothing advances past the obligation. The hold is one need, for the earliest tick owed
+-- by an unfinished root, taken and given back as that set changes, and given back when the
+-- owner exits. A root that is submitted again keeps the earliest of its obligations and of
+-- the ticks it may begin at; a later submission never postpones either. A UI chain owes
+-- nothing: hooks and stop requests simply go on while its source is awaited. A
+-- non-yielding module still blocks its owner; nothing here preempts trusted Lua.
 --
 -- = What is published
 --
@@ -55,8 +60,10 @@
 --
 -- = Exit
 --
--- When the owner exits the inbox closes, the loader is stopped on the owner's thread
--- (its frames closed, its interests withdrawn), every outcome that was only admitted is
+-- Once a stop has been asked of the owner, or it has begun to exit, the inbox is closed to
+-- producers and the owner admits, delivers and advances nothing more: what is queued is left
+-- for the exit. When the owner exits the loader is stopped on the owner's thread (its
+-- frames closed, its interests withdrawn), every outcome that was only admitted is
 -- published as stopped, and the tick hold is given back.
 module Hetoimasia.Scripting.Lua.Loading.State
   ( -- * Configuring
@@ -220,6 +227,27 @@ validatePlan ∷ Bool → LoaderPlan → [LoaderViolation]
 validatePlan configured plan =
   [LoaderBoundBelowOne (planBound plan) | planBound plan < 1] <> [LoaderAlreadyConfigured | configured]
 
+-- | What a root is owed and may begin at, from everything it was submitted as.
+data Standing = Standing
+  { standingFrom ∷ !Word64
+    -- ^ The logical tick it may begin at; zero when a UI asked for it.
+  , standingOwed ∷ !(Maybe Word64)
+    -- ^ The tick that is not complete until it has an outcome, if a logical root owes one.
+  }
+  deriving (Eq, Show)
+
+standingOf ∷ RootDue → Standing
+standingOf DueUi = Standing 0 Nothing
+standingOf (DueTick tick) = Standing tick (Just tick)
+
+-- | The earliest of each: a root submitted again is never made later or less owed.
+mergeStanding ∷ Standing → Standing → Standing
+mergeStanding (Standing from owed) (Standing from' owed') =
+  Standing (min from from') (case (owed, owed') of
+    (Just a, Just b) → Just (min a b)
+    (a, Nothing) → a
+    (Nothing, b) → b)
+
 -- | A root the owner has been asked for and has not admitted yet.
 data Submission = Submission !RootRequest !RootDue
 
@@ -232,9 +260,10 @@ data LoadingState = LoadingState
   , lsNotified ∷ !(TVar (Map.Map ExportIdentity SourceAnswer))
   , lsLastDue ∷ !(TVar (Maybe Word64))
     -- ^ The last logical tick submitted: later ones may not be lower.
-  , lsDues ∷ !(TVar (Map.Map ExportIdentity RootDue))
-    -- ^ The due of each admitted root that has not come to an outcome: what eligibility
-    -- reads.
+  , lsDues ∷ !(TVar (Map.Map ExportIdentity Standing))
+    -- ^ What each submitted root that has not come to an outcome is owed and may begin at:
+    -- what eligibility and the hold read. Written in the transaction that accepts the
+    -- submission, and taken out when the root has an outcome or the loader will not take it.
   , lsOutcomes ∷ !(TVar (Map.Map ExportIdentity LoaderOutcome))
   , lsRefusals ∷ !(TVar (Seq (ExportIdentity, RootRefusal)))
     -- ^ The last 'lsBound' roots the loader refused.
@@ -271,11 +300,15 @@ loadingConfig ls plan =
   where
     -- A root nobody gave a due is a dependency that was also asked for as a root, or one
     -- the coordinator admitted without: it waits for nothing.
-    eligible identity = do
-      due ← Map.lookup identity <$> readTVarIO (lsDues ls)
+    -- Nothing begins once a stop is asked for: the root stays queued for the exit.
+    eligible identity = atomically $ do
+      open ← readTVar (lsOpen ls)
+      admitting ← ticksOpen (lsTicks ls)
+      due ← Map.lookup identity <$> readTVar (lsDues ls)
       case due of
-        Just (DueTick tick) → (>= tick) <$> atomically (ticksNow (lsTicks ls))
-        _ → pure True
+        _ | not (open && admitting) → pure False
+        Just (Standing from _) → (>= from) <$> ticksNow (lsTicks ls)
+        Nothing → pure True
 
 -- ---------------------------------------------------------------------------------
 -- From any thread
@@ -292,6 +325,9 @@ submitRootIn ls request due = atomically $ do
       append = do
         writeTVar (lsSubmitted ls) (queue |> Submission request due)
         modifyTVar' (lsOutcomes ls) (Map.insertWith (\_ existing → existing) (rootIdentity request) OutcomeAdmitted)
+        -- What the root owes is recorded, and the tick held, before the owner looks at anything.
+        modifyTVar' (lsDues ls) (Map.insertWith (flip mergeStanding) (rootIdentity request) (standingOf due))
+        settleHoldSTM ls
         pure SubmitAccepted
   if not (open && admitting)
     then pure SubmitClosed
@@ -390,60 +426,78 @@ loadingWork ls = do
 -- that is not eligible is asked again when the logical tick moves.
 serviceLoading ∷ LoadingState → OwnedVm → IO Bool
 serviceLoading ls owned = do
-  (submitted, notified) ← atomically $ do
-    roots ← readTVar (lsSubmitted ls)
-    sources ← readTVar (lsNotified ls)
-    writeTVar (lsSubmitted ls) Seq.empty
-    writeTVar (lsNotified ls) Map.empty
-    pure (toList roots, Map.toList sources)
-  tick ← atomically (ticksNow (lsTicks ls))
-  seen ← readIORef (lsSeen ls)
-  let nothingNew = null submitted && null notified
-      unchanged = case seen of
-        Just (before, BlockedIneligible _) → before == tick
-        _ → True
-  settleHold ls
-  if nothingNew && unchanged
-    then pure False
-    else do
-      forM_ submitted $ \(Submission request due) → do
-        admission ← admitRoot owned request
-        atomically (recordAdmission ls request due admission)
-      forM_ notified $ \(identity, answer) → deliverSource owned identity answer
-      report ← advanceLoader owned
-      writeIORef (lsSeen ls) (Just (tick, advanceBlocked report))
-      atomically $ forM_ (advanceSettled report) $ \(identity, status) → do
+  -- Asked to stop, or exiting: nothing is drained, delivered or advanced, so that no module
+  -- runs after the request. What is queued stays for the exit.
+  taking ← atomically ((&&) <$> readTVar (lsOpen ls) <*> ticksOpen (lsTicks ls))
+  if taking then service else pure False
+  where
+    service = do
+      (submitted, notified) ← atomically $ do
+        roots ← readTVar (lsSubmitted ls)
+        sources ← readTVar (lsNotified ls)
+        writeTVar (lsSubmitted ls) Seq.empty
+        writeTVar (lsNotified ls) Map.empty
+        pure (toList roots, Map.toList sources)
+      tick ← atomically (ticksNow (lsTicks ls))
+      seen ← readIORef (lsSeen ls)
+      let nothingNew = null submitted && null notified
+          unchanged = case seen of
+            Just (before, BlockedIneligible _) → before == tick
+            _ → True
+      settleHold ls
+      if nothingNew && unchanged
+        then pure False
+        else do
+          forM_ submitted $ \(Submission request _) → do
+            admission ← admitRoot owned request
+            atomically (recordAdmission request admission)
+          forM_ notified $ \(identity, answer) → deliverSource owned identity answer
+          report ← advanceLoader owned
+          writeIORef (lsSeen ls) (Just (tick, advanceBlocked report))
+          atomically $ forM_ (advanceSettled report) $ \(identity, status) → do
+            modifyTVar' (lsDues ls) (Map.delete identity)
+            modifyTVar' (lsOutcomes ls) (Map.insert identity (OutcomeSettled status))
+          settleHold ls
+          pure (not nothingNew || not (null (advanceSettled report)))
+    -- What a root is owed was recorded when it was submitted; here it is kept for a root the
+    -- loader holds and taken out for one it will not run.
+    recordAdmission request admission = case admission of
+      RootQueued → pure ()
+      RootJoined → pure ()
+      RootSettled status → do
         modifyTVar' (lsDues ls) (Map.delete identity)
         modifyTVar' (lsOutcomes ls) (Map.insert identity (OutcomeSettled status))
-      settleHold ls
-      pure (not nothingNew || not (null (advanceSettled report)))
-  where
-    recordAdmission state request due admission = case admission of
-      RootQueued → admitted state request due
-      RootJoined → admitted state request due
-      RootSettled status → modifyTVar' (lsOutcomes state) (Map.insert (identityOf request) (OutcomeSettled status))
       RootRefused refusal → do
-        modifyTVar' (lsRefusals state) $ \held →
-          let next = held |> (identityOf request, refusal)
-           in if Seq.length next > lsBound state then Seq.drop 1 next else next
+        modifyTVar' (lsDues ls) (Map.delete identity)
+        modifyTVar' (lsRefusals ls) $ \held →
+          let next = held |> (identity, refusal)
+           in if Seq.length next > lsBound ls then Seq.drop 1 next else next
         -- Nothing was recorded for it: it no longer reads as admitted.
-        modifyTVar' (lsOutcomes state) (Map.update (\outcome → if outcome == OutcomeAdmitted then Nothing else Just outcome) (identityOf request))
-      RootClosed → modifyTVar' (lsOutcomes state) (Map.insert (identityOf request) OutcomeStopped)
-    admitted state request due = do
-      modifyTVar' (lsDues state) (Map.insert (identityOf request) due)
-      modifyTVar' (lsOutcomes state) (Map.insertWith (\_ existing → existing) (identityOf request) OutcomeAdmitted)
-    identityOf = rootIdentity
+        modifyTVar' (lsOutcomes ls) (Map.update (\outcome → if outcome == OutcomeAdmitted then Nothing else Just outcome) identity)
+      RootClosed → do
+        modifyTVar' (lsDues ls) (Map.delete identity)
+        modifyTVar' (lsOutcomes ls) (Map.insert identity OutcomeStopped)
+      where
+        identity = rootIdentity request
 
--- | Hold the next tick while a logical root that is due has no outcome, and give the hold
--- back when none is. One need, whatever the number of roots; taken in the transaction that
--- read the tick, for a tick that has not begun.
+-- | Hold the tick after the earliest one an unfinished logical root owes (or after the
+-- current one, once that has passed), and give the hold back when none is owed. One need,
+-- whatever the number of roots; taken in the transaction that read the tick, for a tick
+-- that has not begun.
 settleHold ∷ LoadingState → IO ()
-settleHold ls = atomically $ do
+settleHold = atomically . settleHoldSTM
+
+settleHoldSTM ∷ LoadingState → STM ()
+settleHoldSTM ls = do
   dues ← readTVar (lsDues ls)
   held ← readTVar (lsHeld ls)
   tick ← ticksNow (lsTicks ls)
-  let due = not (null [() | DueTick at ← Map.elems dues, at <= tick])
-      wanted = if due && tick < maxBound then Just (tick + 1) else Nothing
+  let owed = [at | Standing _ (Just at) ← Map.elems dues]
+      wanted = case owed of
+        [] → Nothing
+        _ | next < maxBound → Just (next + 1)
+          | otherwise → Nothing
+          where next = max (minimum owed) tick
   when (wanted /= held) $ do
     forM_ held (ticksRelease (lsTicks ls))
     forM_ wanted (ticksHold (lsTicks ls))

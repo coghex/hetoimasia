@@ -13,9 +13,11 @@
 --
 -- Every compile, evaluation, resume, cache publication and Lua-reference release happens
 -- on the owner's thread, between two of its scheduler turns, so hooks and stop requests
--- go on while a chain waits, and an independent owner never waits for it. A due logical
--- chain that is unfinished holds the next tick, so the scheduler cannot treat the tick as
--- complete or advance past the obligation. "Hetoimasia.Scripting.Lua.Loading.State" says
+-- go on while a chain waits, and an independent owner never waits for it. A logical
+-- root owes its tick from the moment it is submitted: the tick after it is held, however
+-- many grants are queued, until the root has an outcome, so the scheduler cannot treat the
+-- tick as complete or advance past the obligation. Once a stop is asked of the owner it
+-- admits, delivers and advances nothing more. "Hetoimasia.Scripting.Lua.Loading.State" says
 -- how, and the package README says what the loader guarantees.
 --
 -- This is the generic machinery. The production coordinator that admits roots for the
