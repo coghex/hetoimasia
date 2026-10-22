@@ -303,6 +303,28 @@
       "optional": false
     },
     {
+      "id": "test.lua-engine",
+      "description": "Portable Hspec contracts for the Lua-first engine's pure configuration boundary (LFE-3): the strict format-1 launch manifest parsed from supplied bytes, and the fixed M1 profile of limits. The manifest examples with both role orders, the common and per-role entry fallbacks, every one-role variant and the absent vms, with the selected and every declared entry and the exact bytes kept; the byte limit at 65,536 and one past it and the nesting limit at eight containers and nine, each told apart from the schema refusal a well-formed document would get; refused byte order marks, malformed UTF-8, unpaired surrogate escapes, comments, trailing commas and data, non-object roots, control characters, invalid escapes, numbers and literals; duplicate keys after escape decoding at every object, decided before any map is built; the exact numeric reading of format, which accepts every token whose decimal value is exactly 1 and refuses the rest without binary floating point or size-derived work; the identifier grammar, every schema refusal, and a refusal that does not depend on member order; tick_seconds as exact decimal nanoseconds with both endpoints, every forbidden form and overflow; every fixed profile value against an independently written expectation in its unit, the derived values, valid smaller injected profiles and profiles refused as not positive, above the fixed value, overflowing or inconsistent; and the package and import boundary. It runs through the CPU project, performs no IO and starts no Lua, window or GPU.",
+      "command": [
+        "cabal",
+        "test",
+        "--project-file",
+        "cabal.project.cpu",
+        "hetoimasia-lua-engine:lua-engine-tests",
+        "--test-show-details=direct"
+      ],
+      "component": "hetoimasia-lua-engine:test:lua-engine-tests",
+      "inputs": [
+        "cabal.project.common",
+        "cabal.project.cpu"
+      ],
+      "framework": "hspec",
+      "runner": "cpu",
+      "timeout_seconds": 1800,
+      "category": "test",
+      "optional": false
+    },
+    {
       "id": "test.asset-image",
       "description": "Portable Hspec contracts for the asset-image package's PNG decoder over committed fixture files whose texels the suite states by hand: every colour type at every bit depth, 16-bit components rounded to nearest, palette tRNS alpha, Adam7 interlacing, greyscale and RGB tRNS colour keys honoured at every bit depth by comparing stored samples before any reduction (malformed keys ignored), and colour-space chunks that change no texel; colour images premultiplied in linear light within one code value of an independent reference for every (channel, alpha) pair, exact at alpha 0 and 255, and data images byte-for-byte unchanged; the format, extent and single-level layout the GPU upload endpoint takes; the binary-alpha cutout mark; and the refusal, naming the asset, of empty, foreign, truncated, corrupt-stream and undecodable bytes, each result fully evaluated. It runs through the CPU project and needs no GPU.",
       "command": [
