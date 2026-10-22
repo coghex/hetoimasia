@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-60/Q-2o: launcher root resolution and anchored reads.
+The current checkpoint is P-61/Q-2p: hard links and mounted content directories.
+D-63 accepts resolving the launch path once and retaining the actual root owner.
 D-62 accepts whole-folder startup hashing and exact-byte verification on loads.
 D-61 accepts Unicode NFC filename identity, exact case and collision rejection.
 D-60 accepts literal root-relative paths without shortcuts or filename search.
@@ -1858,7 +1859,8 @@ content requests use the same keys, with fixed documented Unicode tables.
 File bytes are untouched. D-60's grammar and D-10/D-11's version/no-link rules
 remain. The manager presented normalization, collision checking, mappings and
 platform tests as the cost. The owner chose Unicode names over ASCII-only
-content filenames. Numeric limits and launcher-root spelling remain open.
+content filenames. D-63 subsequently settles launcher-root resolution;
+numeric limits remain open.
 
 ### D-62. Hash every regular content file before Lua and verify later loaded bytes
 
@@ -1892,6 +1894,37 @@ game folder. Precisely, every file is read during the scan; requested files
 are read again on each uncached load, while an unused file needs no second
 read. This records P-59's approved behavior without turning the cost shorthand
 into a mandatory extra read. The owner chose this over a manifest file list.
+
+### D-63. Resolve the launch path once and anchor the session to its actual directory
+
+**Delivery:** M1; native root ownership and no-follow content operations.
+
+Owner answer, **2026-10-22 02:08:27 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: resolve once (Rec.)
+
+Authenticated relay: `het-manager`, message `yk5r4wk2ynerqaa4fxsmfik8ie`,
+posted **2026-10-22 02:08:27.639 UTC** in `#het-luafirst`, replying to Q-2o
+message `is8vmftsqsr9esaheyukec4g4s`.
+
+Accept P-60's A: a native relative or absolute launch path may pass through
+symlinks; resolve and open the actual directory once before manifest/inventory
+work, report it and retain its protected directory owner for the session.
+Renaming the selected folder, replacing its old pathname or retargeting a
+selection symlink never switches the running session. Restart to select a new
+target. The original root remains usable if readable and its content checks pass.
+
+Internal operations remain anchored to that root, refuse symlinks at every
+component during opening, check opened object types, and verify the exact
+opened bytes. A prior pathname check followed by an unrestricted open is not
+the contract. Root/operation handles outlive their actual workers through
+cancellation and partial-boot cleanup; unsupported behavior refuses startup.
+
+The manager presented native adapters, handle ownership, race and cleanup tests
+as the cost. The owner chose this over banning symlinks in the launch path.
+Hard-link/mount policy and numeric handle limits remain separate; no immutable
+snapshot or hostile-filesystem containment is claimed.
 
 ## Proposals
 
@@ -5094,7 +5127,7 @@ for the content service to depend on the graphics toolchain.
 
 ### P-60. Resolve the launcher-selected folder once and retain its directory owner
 
-**Unapproved; active checkpoint Q-2o. Delivery: M1.** D-11 explicitly left
+**A accepted by D-63 through Q-2o. Delivery: M1.** D-11 explicitly left
 launcher root selection separate from its ban on internal symbolic links.
 Recommend A: the owner may give the launcher a native relative or absolute
 directory path, including symlinks in that selection path. Resolve it once,
@@ -5160,6 +5193,68 @@ provides directory-relative and no-follow primitives; using them safely for
 every component and qualifying the platform adapter is additional work. The
 current runner's `Runner/Source.hs` reads explicit files with `withBinaryFile`;
 it is not this scoped provider and must not be treated as one.
+
+### P-61. Treat hard-linked files and mounted directories as selected-root content
+
+**Unapproved; active checkpoint Q-2p. Delivery: M1.** Recommend A: the
+selected root defines a content namespace, not exclusive ownership of the
+underlying storage. A regular file reached through a legal inventoried path
+may have other hard-link names, inside or outside the root. A directory below
+the root may be a mounted filesystem or a bind-mounted subtree, provided the
+native provider can uphold D-63's opening and ownership contract there.
+The launcher/Lua service creates no links or mounts; these are arrangements
+the owner has already made. Internal symbolic links remain refused under D-11.
+
+Each root-relative path remains its own content identity. Two hard-link names
+for one Lua file are two modules under D-7, each evaluated once per VM; do not
+silently coalesce them by native file identity. Inventory entries, byte budgets
+and fingerprints count each path, even when storage is shared. Texture requests
+remain independent under D-49. An outside hard-link name is never a Lua lookup
+path, but editing the shared file through it can cause the next inside load
+to fail D-62's byte check. This is an explicit consequence of allowing hard links.
+
+Whole-root scanning includes reachable mounted content; it is not silently
+skipped as another device. Detect directory traversal cycles through native
+directory identity on the active ancestor chain and fail boot with the path
+chain, rather than recurring indefinitely. Reaching the same directory through
+separate non-cyclic paths does not merge their logical identities; ordinary
+inventory depth/count/byte limits still bound expansion. Native providers unable
+to establish the necessary identity or opening behavior refuse that root.
+
+No device or mount identifier becomes an additional content-version key under
+A. A later topology change grants no new logical paths and no exception to
+name/type/no-link checks or byte fingerprints. Missing or different content
+fails normally; identical-byte replacement through a still-legal inventoried
+path remains permitted by D-62. The root itself stays anchored under D-63.
+This is not a promise that mounted content remains available or that an
+external filesystem operation can be interrupted promptly.
+
+Alternative B rejects multiply linked regular files and refuses mount crossings
+below the selected root, at startup and later opens. Authors copy those files
+and place content directly in the selected tree. The selected root may itself
+live on another volume; B concerns crossings beneath it. It needs qualified
+native link-count and mount-boundary checks, including bind mounts rather than
+only a device-number comparison. It still does not establish containment
+against arbitrary hostile OS changes or make the content immutable.
+
+A is recommended for trusted owner-selected content: path identity and verified
+bytes already define what the session consumes, without requiring exclusive
+physical storage. Its cost is external aliases affecting those bytes, mounted
+storage affecting availability/scan duration, and duplicate work for aliased
+paths. B provides a stricter packaging restriction with extra native checks.
+Neither alternative changes D-11's rejection of symlinks, devices, sockets,
+pipes and other non-regular content entries.
+
+Qualification covers two hard-linked Lua paths keeping separate module caches,
+outside-name edits being refused on later reads, per-path inventory accounting,
+mounted subtree inclusion or refusal as selected, traversal cycles, and existing
+root/read cleanup. Qualify mount behavior in isolated supported-platform
+fixtures; classification/identity boundaries also need controlled tests without
+sleeps.
+For terminology, [POSIX link](https://pubs.opengroup.org/onlinepubs/9699919799/functions/link.html)
+defines another directory entry for an existing file, while the
+[Linux mount documentation](https://cdn.kernel.org/doc/html/latest/filesystems/sharedsubtree.html)
+describes mounted subtree relationships. Neither is a symbolic-link traversal.
 
 ## Open questions
 
@@ -5271,11 +5366,17 @@ list, first-use fingerprinting or private byte snapshot.
 
 #### Q-2o. May launcher root selection resolve symlinks before anchoring the session?
 
-**Active checkpoint, P-60.** A (recommended): resolve the explicitly selected
-native folder once, including selection-path symlinks, then retain that actual
-directory owner for all no-follow content operations. Renames/retargeting do
-not select another root. B: also reject symlinks in the launcher selection
-path; both require anchored native reads and actual-retirement cleanup.
+Resolved by D-63: P-60's A, resolve the native launch path once, including
+selection-path symlinks, retain the actual directory owner, and anchor internal
+no-follow reads to it. Renames/retargeting do not select another root.
+
+#### Q-2p. Permit hard links/mounted subtrees or require a stricter content layout?
+
+**Active checkpoint, P-61.** A (recommended): permit regular hard-linked files
+and mounted directories through the anchored namespace; identities and budgets
+remain per path, bytes are verified and traversal cycles refused. B: reject
+multiply linked files and mount crossings below the root using qualified native
+checks. Both retain D-11's symbolic-link and non-regular-entry refusal.
 
 ### Q-3. What is the generic executable's boot and session contract?
 
