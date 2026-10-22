@@ -1320,6 +1320,14 @@ int hetoimasia_lua_yieldable(lua_State *L)
   return lua_isyieldable(L);
 }
 
+int hetoimasia_lua_collector_running(lua_State *L)
+{
+  /* Exactly 1 is running. A script that stopped the collector gets 0, and while a
+  ** finalizer runs Lua holds the collector internally and answers -1 to every
+  ** request, so anything but 1 is not running. */
+  return lua_gc(L, LUA_GCISRUNNING) == 1;
+}
+
 /* A failed segment's coroutine is dead and its stack intact. Close it, which
 ** runs the to-be-closed variables it still holds, keeping the error it failed
 ** with on its stack for them as Lua requires. The failure is copied to `L` and,
