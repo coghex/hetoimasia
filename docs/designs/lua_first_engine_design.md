@@ -11,7 +11,8 @@ Design state: `exploring`
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
 in `#het-luafirst`. Only owner signoff turns a proposal into a decision.
-The current checkpoint is P-45/Q-6e: explicit texture release and load cancellation.
+The current checkpoint is P-46/Q-6f: independent texture loads or shared backing.
+D-48 accepts explicit texture release and pending-load cancellation.
 D-47 accepts one texture request through usable GPU readiness.
 D-46 accepts copied scenes and protected texture retention.
 D-45 accepts Lua-requested asynchronous window creation.
@@ -1444,6 +1445,34 @@ The manager presented the cost: success waits for GPU readiness, without a
 separate decoded image or Lua-selected upload timing. The owner chose A rather
 than separate decode/upload operations. This does not choose format/options,
 cache sharing, explicit release or exact request API spelling.
+
+### D-48. Lua may release its textures and cancel its pending texture loads
+
+**Delivery:** M1.
+
+Owner answer, **2026-10-22 00:10:37 UTC**, through AskUserQuestion in the
+manager's pane, verbatim:
+
+> A: explicit release (Rec.)
+
+Authenticated relay: `het-manager`, message `f4rjxykas9bjpazypfjbfyetje`,
+posted **2026-10-22 00:10:37.857 UTC** in `#het-luafirst`, replying to Q-6e
+message `ti5rpmk3gztru4kfny79x5vur6`.
+
+Accept P-45's A: Lua may relinquish its own texture lease or cancel its pending
+texture load while the instance runs. A released handle cannot enter new scenes;
+an already-published scene keeps its texture until replaced or its window ends.
+Release does not wait for the GPU and distinguishes completed retirement,
+retirement pending and already released. Repetition never runs cleanup twice;
+engine-owned automatic cleanup and retained capacity/retirement remain mandatory.
+
+Cancellation withdraws interest without itself becoming a required-load failure.
+Presentation's first settlement wins: an already settled result remains, and
+cancellation cannot erase a required failure. Partial/late work still retires
+safely. The manager presented the race-machinery cost and the need for authors
+to replace a scene to let go of its holds. The owner chose A rather than no
+early release in M1. This does not select shared backing, public window-close
+controls, module cancellation or exact API spelling.
 
 ## Proposals
 
@@ -3718,7 +3747,7 @@ including cancellation during upload and progress before any window exists.
 
 ### P-45. Let an instance release textures and cancel pending texture loads
 
-**Unapproved; active checkpoint Q-6e. Delivery: M1.** Recommend A: expose
+**A accepted by D-48 through Q-6e. Delivery: M1.** Recommend A: expose
 explicit early release of an instance's texture lease and cancellation of its
 pending texture request. Automatic cleanup at instance/session end remains
 mandatory; Lua need not call either for cleanup to be correct. These are ways
@@ -3775,6 +3804,58 @@ first-settlement-wins for elapsed requests. The
 rendering while an adopted scene holds it and releases it behind the native
 barrier. New bindings must preserve those mechanisms and test both orders of
 cancel/completion, repeated release, and scene-held retirement.
+
+### P-46. Keep each M1 texture load independent, with shared backing deferred
+
+**Unapproved; active checkpoint Q-6f. Delivery: M1.** Recommend A: each new
+texture request is a separate load with its own fingerprint-checked read,
+decode/upload work and resulting instance-owned lease/native texture identity.
+Two requests for the same root/path do not coalesce or reuse a resident GPU
+texture. Cancelling one request or releasing one lease cannot cancel/revoke the
+other's work or resource. D-48's scene holds and actual-retirement accounting
+remain unchanged. Shared renderer infrastructure is still shared; this choice
+concerns the loaded textures, not a device/renderer per request.
+
+An instance may reuse its own live lease in multiple sprites/publications;
+it does not load again for each quad. Repeatedly asking to load is an explicit
+new resource request and consumes capacity again. Another instance loads its
+own lease rather than using a handle placed in shared module exports. Resource
+loss still triggers no Lua-GC-dependent reclamation: explicit release and
+automatic instance cleanup remain the ownership contract.
+
+This preserves D-10 without a new cache-hit interpretation: a new request
+verifies the bytes it reads against the session fingerprint, while previously
+loaded textures remain their original content. A changed file can fail a new
+request even while an older texture is displayed. There is no idle texture
+cache, implicit reload or automatic retry. A deliberate later request remains
+subject to the same content rules; this does not change D-7's module cache.
+
+Alternative B adds engine sharing for the same content identity/options in M1:
+distinct instance leases may share resident texture backing and potentially
+in-flight loading. It saves duplicate decoding, uploads and GPU memory. It also
+needs an explicit shared-work owner and bounds, per-request cancellation and
+required/optional failure attribution, cache-hit fingerprint semantics, and a
+definition of when each lease's retirement/capacity completes while peers or
+scenes still retain the backing. If B is chosen, propose that concrete contract
+for signoff before treating any of these details as decided; never share Lua
+handles directly or let one instance revoke another's lease.
+
+A is recommended for M1 because independent requests fully exercise real
+instance ownership and cleanup without introducing a shared-cache lifetime in
+this milestone. The cost is deliberate: repeated requests duplicate CPU/GPU
+work and memory, so this is not a memory/performance optimization. A later
+sharing layer must preserve the approved request/lease behavior or explicitly
+revise it. Keep provider construction and ownership interfaces suitable for
+that extension, without claiming sharing is already implemented. The required
+two-instance test should request the same path, then cancel/end/release one
+owner and prove the peer's work/lease remains usable, subject to role-level
+failure escalation.
+
+Evidence: [instance leases](../../packages/scripting-lua/README.md#instance-leases)
+already support both owned and shared acquisitions, with different lifetime
+meanings. Neither that mechanism nor a shared module export supplies a content-
+keyed texture cache. This proposal selects the M1 provider policy; the native
+renderer and host remain reusable for later shared resources.
 
 ## Open questions
 
@@ -4077,11 +4158,17 @@ and GPU-texture requests were not chosen. D-46's publication rule still applies.
 
 #### Q-6e. Can Lua relinquish textures and pending texture loads before instance end?
 
-**Active checkpoint, P-45.** A (recommended): explicit texture release and
-pending-load cancellation with protected retirement, truthful status and
-first-settlement-wins. B: no public early release/cancel in M1, retaining
-automatic instance/session cleanup. A does not silently remove a released
-texture from a scene that still holds it.
+Resolved by D-48: P-45's A, explicit texture release and pending-load cancellation
+with protected retirement, truthful status and first-settlement-wins. Automatic
+cleanup stays mandatory, and release does not edit a scene that holds a texture.
+
+#### Q-6f. Do repeated texture loads share backing in M1?
+
+**Active checkpoint, P-46.** A (recommended): independent load/resource per
+request; reuse one's live lease explicitly and defer content-keyed sharing.
+B: add shared backing and design its cancellation, accounting and cache rules
+now. Both require distinct per-instance Lua leases, never borrowed module-global
+handles. The tradeoff is duplicate work/memory versus a new shared lifetime.
 
 ### Q-7. What is the default domain arrangement for games and mods?
 
