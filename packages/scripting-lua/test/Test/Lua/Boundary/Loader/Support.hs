@@ -127,7 +127,7 @@ rootAt ∷ Text → Text → ExportIdentity
 rootAt root path = ExportIdentity (encodeUtf8 (root <> ":" <> path))
 
 rigRegistration ∷ Rig → Registration
-rigRegistration rig = either (error . show) id (registration [] [tracing, service])
+rigRegistration rig = either (error . show) id (registration [] [tracing, service, scheduler])
   where
     tracing =
       namespace
@@ -141,6 +141,8 @@ rigRegistration rig = either (error . show) id (registration [] [tracing, servic
           -- script cannot hide: not opted in to ordinary errors.
           stateOperation "strict" [SText] [] (\_ → pure [])
         ]
+    -- A scheduler yield: a task's way to give control back, never a module chunk's.
+    scheduler = namespace "sched" [yieldOperation "yield"]
     -- A service a module's top level must not acquire: the precondition refuses it,
     -- as an ordinary Lua error before the action, while a module's top level runs.
     service =
@@ -233,7 +235,7 @@ rigConfig rig adjust =
   adjust
     (vmConfig rigLibraries)
       { vmRegistration = rigRegistration rig
-      , vmPolicy = ["trace", "svc"]
+      , vmPolicy = ["trace", "svc", "sched"]
       , vmOwnerName = "loader owner"
       , vmLoader = Just (rigLoader rig)
       }

@@ -256,6 +256,20 @@ spec = describe "the module loader" $ do
         -- Nothing of it was published.
         ledger owned >>= \found → ledgerExports found `shouldBe` 0
 
+    it "grants a module chunk no scheduler yield: the call is refused before it suspends anything, and the module fails" $
+      withRig $ \rig owned → do
+        _ ← supply rig owned "yielding" ["local ok = pcall(sched.yield)", "trace.mark('after ' .. tostring(ok))", "return {}"]
+        _ ← supply rig owned "after" (simple "after" [])
+        _ ← admit owned "yielding"
+        _ ← admit owned "after"
+        report ← advance owned
+        advanceBlocked report `shouldBe` BlockedIdle
+        failed ← failureOf owned "yielding"
+        boundaryReason failed `shouldBe` SuspendRefused SuspendOutsideTask
+        statusOfName owned "after" >>= (`shouldSatisfy` isReady)
+        traced rig >>= (`shouldBe` ["after false", "after"])
+        ledger owned >>= (`shouldSatisfy` balanced)
+
     it "refuses a precompiled chunk: only text is loaded" $
       withRig $ \rig owned → do
         _ ← admit owned "binary"

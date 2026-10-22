@@ -123,7 +123,7 @@ sweep budget = do
         (defaultOwnerConfig rigLibraries)
           { ownerBudget = Just budget
           , ownerRegistration = rigRegistration rig
-          , ownerGranted = ["trace", "svc"]
+          , ownerGranted = ["trace", "svc", "sched"]
           , ownerName = "tight"
           , ownerLoader = Just (rigLoader rig)
           }

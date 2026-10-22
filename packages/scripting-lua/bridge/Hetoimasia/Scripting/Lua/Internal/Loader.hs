@@ -137,7 +137,6 @@ import Hetoimasia.Scripting.Lua.Internal.Vm
   , noteTaskLive
   , raiseEscape
   , runCallback
-  , setActiveTask
   , setRunContext
   , takeSuspension
   , vmIdentity
@@ -620,7 +619,6 @@ drive loader state entry settled = loop
       setRunContext vm (moduleRefName (sourceOf (frameLabel frame)), "export", Nothing)
       thread ← taskThread state (frameTaskSlot frame)
       void (takeSuspension vm)
-      setActiveTask vm (Just thread)
       modifyState loader (\s → s {lsRunning = Just (Running thread), lsNoted = Nothing})
       forM_ (loaderPhase config) (`setModulePhase` True)
       segment ←
@@ -654,7 +652,6 @@ drive loader state entry settled = loop
       afterSegment current (frameLatched current) noted segment refusal
 
     leaveSegment = do
-      setActiveTask vm Nothing
       modifyState loader (\s → s {lsRunning = Nothing})
       forM_ (loaderPhase config) (`setModulePhase` False)
 
@@ -767,7 +764,6 @@ closeChain loader state entry recorded = do
     noteTaskEnded (vmOf loader) (frameTaskSlot frame)
     setRecord loader (frameIdentity frame) (recorded (frameLabel frame))
     pure closing
-  setActiveTask (vmOf loader) Nothing
   forM_ (loaderPhase (loaderSettings loader)) (`setModulePhase` False)
   modifyState loader (\st → st {lsChain = [], lsRunning = Nothing, lsNoted = Nothing})
   pure (concat evidence)
