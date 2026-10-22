@@ -130,6 +130,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Data.Spec
         Test.LuaEngine.Data.Support
         Test.LuaEngine.Data.Workers
+        Test.LuaEngine.Loader
         Test.LuaEngine.Manifest.Examples
         Test.LuaEngine.Manifest.Schema
         Test.LuaEngine.Manifest.Syntax

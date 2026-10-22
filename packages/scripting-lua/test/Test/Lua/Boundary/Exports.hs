@@ -304,7 +304,7 @@ spec = describe "export modules" $ do
     it "does not count global-entry modules, or the module of an owner that holds many, against the export identities" $ do
       fixture ← newFixture
       let modules = [ModuleSource (ModuleRef (Text.pack ("legacy" <> show n)) "1") "x = 1" [] | n ← [1 .. 40 ∷ Int]]
-          limits = ExportLimits {exportMaxSourceBytes = 1048576, exportMaxIdentities = 3}
+          limits = ExportLimits {exportMaxSourceBytes = 1048576, exportMaxIdentities = 3, exportMaxChainDepth = 32}
       withDriver fixture (\config → config {vmModules = modules, vmExportLimits = limits}) $ \owned _ → do
         forM_ ["a", "b", "c"] $ \identity → evaluateExport owned (exportOf identity "return {}") >>= void'
         refused ← try @BoundaryFault (evaluateExport owned (exportOf "d" "return {}"))
@@ -346,7 +346,7 @@ spec = describe "export modules" $ do
 
     it "refuses a new identity at a full ceiling with no record, and an oversized one while room remains" $ do
       fixture ← newFixture
-      let limits = ExportLimits {exportMaxSourceBytes = 16, exportMaxIdentities = 2}
+      let limits = ExportLimits {exportMaxSourceBytes = 16, exportMaxIdentities = 2, exportMaxChainDepth = 32}
       withDriver fixture (\config → config {vmExportLimits = limits}) $ \owned _ → do
         _ ← evaluateExport owned (exportOf "one" "return {}") >>= ready
         oversized ← evaluateExport owned (exportOf "two" "return {}  --  more than sixteen") >>= failedWith

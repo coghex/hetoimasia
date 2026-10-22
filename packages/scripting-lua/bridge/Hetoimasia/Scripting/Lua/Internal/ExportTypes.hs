@@ -11,6 +11,7 @@ module Hetoimasia.Scripting.Lua.Internal.ExportTypes
   , maxExportIdentityBytes
   , ExportLimits (..)
   , defaultExportLimits
+  , defaultMaxChainDepth
   , ExportSource (..)
     -- * References
   , ExportHandle (..)
@@ -57,17 +58,26 @@ maxExportIdentityBytes ∷ Int
 maxExportIdentityBytes = 4096
 
 -- | The ceilings an owner holds its export modules to: the source a new
--- evaluation may be given, and the identities the owner may hold, failed ones
--- and any in progress included. Both are at least one.
+-- evaluation may be given, the identities the owner may hold, failed ones
+-- and any in progress included, and how long the loader's import chain may be, the
+-- root counted. All are at least one.
 data ExportLimits = ExportLimits
   { exportMaxSourceBytes ∷ !Int
   , exportMaxIdentities ∷ !Int
+  , exportMaxChainDepth ∷ !Int
+    -- ^ The most module frames an import chain holds at once, root included. The
+    -- bound only the loader meets: the synchronous 'evaluateExport' has no chain.
   }
   deriving (Eq, Show)
 
--- | One mebibyte of source and 256 identities: the M1 profile's values.
+-- | One mebibyte of source, 256 identities and a chain of 32: the M1 profile's
+-- values.
 defaultExportLimits ∷ ExportLimits
-defaultExportLimits = ExportLimits 1048576 256
+defaultExportLimits = ExportLimits 1048576 256 defaultMaxChainDepth
+
+-- | The M1 profile's chain length: 32 module frames, the root included.
+defaultMaxChainDepth ∷ Int
+defaultMaxChainDepth = 32
 
 -- | An export module as the application supplies it.
 data ExportSource = ExportSource
@@ -135,6 +145,16 @@ data ExportRecord
     ExportEvaluating
   | ExportHeld !Int !ModuleRef
   | ExportBroken !BoundaryFault
+  | -- | Admitted to the loader and not yet evaluating: its source is wanted, or has
+    -- arrived and waits for its turn. Counted against the limit, and answered like an
+    -- identity that is being evaluated until it is one or the other.
+    ExportPending
+  | -- | Pending or evaluating when the loader stopped. Not a failure of the module:
+    -- stop drains work without requiring modules to finish, so later required-failure
+    -- handling cannot mistake it for a syntax, runtime, return-shape, source,
+    -- dependency, cycle or limit failure. Counted against the limit, and never
+    -- evaluated.
+    ExportStopped
   deriving (Eq, Show)
 
 -- | What an owner keeps for its export modules and the behaviors captured from

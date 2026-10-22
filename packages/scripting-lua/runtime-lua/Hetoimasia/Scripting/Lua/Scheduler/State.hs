@@ -78,6 +78,9 @@ module Hetoimasia.Scripting.Lua.Scheduler.State
   , holdTickIn
   , releaseTickIn
   , tickHeld
+  , oweTickIn
+  , releaseOwedIn
+  , tickOwed
 
     -- * Waiting for a request
   , requestWaitersOf
@@ -272,6 +275,12 @@ data SchedState v = SchedState
     -- ^ For each tick, how many things the owner needs complete before the tick begins. A
     -- grant that would reach a tick with a positive count is not applied: nothing of the
     -- tick has happened until the count is zero.
+  , ssOwed ∷ !(Map Word64 Int)
+    -- ^ For each tick, how many things the owner needs finished before the tick is complete.
+    -- The grant that reaches a tick with a positive count stays open, and no later grant is
+    -- applied, until the count is zero: the tick is applied and is not complete.
+  , ssOwedHold ∷ !(Map Word64 GrantId)
+    -- ^ The grant kept open for each owed tick that has been reached.
   , ssNextWait ∷ !Word64
   , ssCadenceLogical ∷ !(Map CadenceKey LogicalCadence)
   , ssCadenceElapsed ∷ !(Map CadenceKey ElapsedCadence)
@@ -324,6 +333,8 @@ initialState label session =
     , ssElapsed = Map.empty
     , ssRequestWaiters = Map.empty
     , ssGates = Map.empty
+    , ssOwed = Map.empty
+    , ssOwedHold = Map.empty
     , ssNextWait = 0
     , ssCadenceLogical = Map.empty
     , ssCadenceElapsed = Map.empty
@@ -402,7 +413,9 @@ workPending state =
     || grantWaiting
   where
     grantWaiting = case Seq.viewl (ssGrants state) of
-      grant :< _ → not (grantApplied grant) && not (tickHeld (ssTick state + 1) state)
+      -- A grant not yet applied that no need holds back, or one applied whose work and needs have all
+      -- ended since (a need given back from outside the turn), which a turn would now finish.
+      grant :< _ → if grantApplied grant then grantDue grant == 0 else not (tickHeld (ssTick state + 1) state)
       EmptyL → False
 
 slotFree ∷ SchedState v → Bool
@@ -864,7 +877,7 @@ settleGrants state = case Seq.viewl (ssGrants state) of
     | otherwise → (state, [])
 
 applyHead ∷ Grant → SchedState v → (SchedState v, [Event])
-applyHead grant state = (advanceCadences grant identityOfGrant tick (reachWatch identityOfGrant tick woken), wakeEvents)
+applyHead grant state = (keepOwed tick (advanceCadences grant identityOfGrant tick (reachWatch identityOfGrant tick woken)), wakeEvents)
   where
     (woken, wakeEvents) = foldl' advance (opened, []) (Map.toAscList (ssLogical state))
     tick = ssTick state + 1
@@ -944,6 +957,49 @@ releaseTickIn tick state = state {ssGates = Map.update lessen tick (ssGates stat
     lessen count
       | count <= 1 = Nothing
       | otherwise = Just (count - 1)
+
+-- | Whether the owner needs something finished before this tick is complete.
+tickOwed ∷ Word64 → SchedState v → Bool
+tickOwed tick state = Map.findWithDefault 0 tick (ssOwed state) > 0
+
+-- | The owner needs one more thing finished before this tick is complete. The grant that
+-- reaches the tick stays open until every such need has been given back; if the tick is
+-- the one the scheduler is in, and its grant is still open, that grant is kept open now.
+-- A tick that is complete already has nothing to keep.
+oweTickIn ∷ Word64 → SchedState v → SchedState v
+oweTickIn tick state = keepOwed tick state {ssOwed = Map.insertWith (+) tick 1 (ssOwed state)}
+
+-- | Keep the open grant of this tick open if the owner owes it, and the grant is the one
+-- the scheduler is in. Does nothing twice.
+keepOwed ∷ Word64 → SchedState v → SchedState v
+keepOwed tick state = case Seq.viewl (ssGrants state) of
+  grant :< _
+    | tickOwed tick state
+    , ssTick state == tick
+    , grantApplied grant
+    , not (Map.member tick (ssOwedHold state)) →
+        state
+          { ssOwedHold = Map.insert tick (GrantId (firstOpen state)) (ssOwedHold state)
+          , ssGrants = Seq.adjust' (\open → open {grantDue = grantDue open + 1}) 0 (ssGrants state)
+          }
+  _ → state
+
+-- | One thing the owner needed finished before this tick was complete has finished, or can
+-- no longer be needed. When none is left the grant kept open for the tick is let go, so
+-- that it can finish once its other work has. Never below none.
+releaseOwedIn ∷ Word64 → SchedState v → SchedState v
+releaseOwedIn tick state = case Map.lookup tick (ssOwed state) of
+  Nothing → state
+  Just count
+    | count > 1 → state {ssOwed = Map.insert tick (count - 1) (ssOwed state)}
+    | otherwise → case Map.lookup tick (ssOwedHold state) of
+        Just (GrantId number) →
+          state
+            { ssOwed = Map.delete tick (ssOwed state)
+            , ssOwedHold = Map.delete tick (ssOwedHold state)
+            , ssGrants = Seq.adjust' (\open → open {grantDue = max 0 (grantDue open - 1)}) (fromIntegral (number - firstOpen state)) (ssGrants state)
+            }
+        Nothing → state {ssOwed = Map.delete tick (ssOwed state)}
 
 -- Waiting for a request -----------------------------------------------------------
 

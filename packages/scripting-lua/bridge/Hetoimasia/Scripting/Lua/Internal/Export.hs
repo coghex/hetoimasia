@@ -69,6 +69,12 @@ module Hetoimasia.Scripting.Lua.Internal.Export
   , releaseBehavior
   , liveCaptureReferences
   , liveCaptureSlots
+    -- * For the module loader
+  , labelOf
+  , faultFor
+  , sourceOf
+  , luaTypeName
+  , shapeOfCode
   ) where
 
 import Control.Exception (onException)
@@ -165,6 +171,9 @@ evaluateExport host source =
         -- Nothing leaves a record behind in this state: an evaluation that
         -- cannot finish records its failure first.
         Just ExportEvaluating → pure (ExportFailed (broken "the evaluation did not finish"))
+        -- The loader's: it is evaluated there, in its turn, or never.
+        Just ExportPending → pure (ExportFailed (broken "the loader holds the identity and has not evaluated it"))
+        Just ExportStopped → pure (ExportFailed (broken "the loader stopped before the identity was evaluated"))
         Nothing → do
           when (Map.size records >= exportMaxIdentities limits) $
             refuse (TooManyExports (exportMaxIdentities limits))
@@ -252,13 +261,18 @@ evaluateExport host source =
                     modifyIORef' (exportRecords held) (Map.insert kept (ExportHeld slot (sourceOf label)))
                     pure (Right (ExportReady (ExportHandle (vmIdentity vm) slot kept (sourceOf label))))
       either (throwFailure luaComponent evaluateOperation []) pure attempted
-    shapeOf evaluated = case evaluatedShape evaluated of
-      0 → Nothing
-      1 → Just ExportNoResult
-      2 → Just ExportNil
-      3 → Just (ExportNotTable (luaTypeName (evaluatedResultType evaluated)))
-      4 → Just ExportMultiple
-      _ → Just ExportMetatable
+    shapeOf evaluated = shapeOfCode (evaluatedShape evaluated) (evaluatedResultType evaluated)
+
+-- | What a chunk returned, from the C code and the Lua type of a single result that is
+-- not a table: 'Nothing' for exactly one plain table.
+shapeOfCode ∷ Int → Int → Maybe ExportShape
+shapeOfCode code resultType = case code of
+  0 → Nothing
+  1 → Just ExportNoResult
+  2 → Just ExportNil
+  3 → Just (ExportNotTable (luaTypeName resultType))
+  4 → Just ExportMultiple
+  _ → Just ExportMetatable
 
 -- | What an identity came to, without evaluating anything: 'Nothing' for an
 -- identity the owner holds no record of. The owner's thread only.
@@ -271,6 +285,8 @@ retrieveExport host identity =
       Just (ExportHeld slot source') → Just (ExportReady (ExportHandle (vmIdentity (hostVm host)) slot (maybe identity (fst . (`Map.elemAt` records)) (Map.lookupIndex identity records)) source'))
       Just (ExportBroken fault) → Just (ExportFailed fault)
       Just ExportEvaluating → Nothing
+      Just ExportPending → Nothing
+      Just ExportStopped → Nothing
 
 -- | How many identities the owner holds a record of: held tables, failed
 -- identities and any in progress. What the identity limit counts.

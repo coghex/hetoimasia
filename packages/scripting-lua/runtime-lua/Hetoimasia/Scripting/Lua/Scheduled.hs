@@ -229,6 +229,7 @@ module Hetoimasia.Scripting.Lua.Scheduled
   , cancelScheduled
   , scheduledStatus
   , scheduledExitRecord
+  , scheduledLoaderEndpoint
 
     -- * Admitting tasks
   , ScheduledEndpoint
@@ -349,7 +350,7 @@ import Hetoimasia.Scripting.Lua.Instance.Types
   , newInstances
   , validateInstanceConfig
   )
-import Hetoimasia.Scripting.Lua.Owner (ModuleRef (moduleRefName), VmConfig (vmExports, vmLifecycle, vmModules, vmOwnerName, vmPolicy, vmRegistration, vmRequests, vmValueLimits))
+import Hetoimasia.Scripting.Lua.Owner (ModuleRef (moduleRefName), VmConfig (vmExports, vmLifecycle, vmLoader, vmModules, vmOwnerName, vmPolicy, vmRegistration, vmRequests, vmValueLimits))
 import Hetoimasia.Scripting.Lua.Registration (registration, registrationCapabilityTypes, registrationNamespaces)
 import Hetoimasia.Scripting.Lua.Runtime.Shared
 import Hetoimasia.Scripting.Lua.Runtime.Types
@@ -366,6 +367,7 @@ import Hetoimasia.Scripting.Lua.Provider.Types (EventEndpoint (..), RequestGrant
 import Hetoimasia.Scripting.Lua.Provider.Call (RequestHandles, RequestHandlesRefused (RequestHandlesRefused), bindRequestHandles)
 import Hetoimasia.Scripting.Lua.Request (requestContextOf)
 import Hetoimasia.Scripting.Lua.Lending.Loan (Lending, bindLending, sameLending)
+import Hetoimasia.Scripting.Lua.Loading.State (LoaderEndpoint (LoaderEndpoint), LoaderPlan, LoaderPlanRefused (LoaderPlanRefused), loadingConfig, newLoadingState, validatePlan)
 import Hetoimasia.Scripting.Lua.Scheduled.Run (runScheduledOwner)
 import Hetoimasia.Scripting.Lua.Scheduled.Shared (awaitWorkerEnded, propagateAll)
 import Hetoimasia.Scripting.Lua.Scheduled.Types
@@ -398,8 +400,10 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , grantStep
   , holdTick
   , newScheduler
+  , oweTick
   , readDiagnostics
   , readTick
+  , releaseOwed
   , releaseTick
   , requestControl
   , requestWaiting
@@ -469,6 +473,11 @@ data ScheduledSpec = ScheduledSpec
     -- the request service: the owner must be granted one, and host instances. 'Nothing', the
     -- default, leaves @api.subscribe@ refused as not yet supported. See
     -- "Hetoimasia.Scripting.Lua.Provider".
+  , scheduledLoader ∷ Maybe LoaderPlan
+    -- ^ The owner's module loader (LFE-9): ordered import chains whose modules suspend on a
+    -- dependency's verified source and resume on the owner's thread. 'Nothing', the default, gives
+    -- the owner none. It is the owner's loader, so the owner's VM configuration may not name one
+    -- ('Hetoimasia.Scripting.Lua.Owner.vmLoader'). See "Hetoimasia.Scripting.Lua.Loading".
   }
 
 -- | A configuration with the supplied defaults: the FIFO policy, the production
@@ -494,6 +503,7 @@ scheduledSpec config worker bounds =
     , scheduledRequests = Nothing
     , scheduledRequestHandles = Nothing
     , scheduledSubscriptions = Nothing
+    , scheduledLoader = Nothing
     }
 
 -- | How many live members an owner's collection holds by default.
@@ -549,6 +559,10 @@ startScheduledOwner runtime spec = do
     case validateSubscriptions (isJust (scheduledRequests spec)) (isJust (scheduledInstances spec)) (maybe 0 (length . instanceSources) (scheduledInstances spec)) grant of
       Right endpoints → pure (grant, endpoints)
       Left refused → throwFailure runtimeComponent (operation "start-scheduled-owner") [] (SubscriptionGrantRefused refused)
+  -- A loader plan is refused, naming every reason, before anything starts.
+  forM_ (scheduledLoader spec) $ \plan →
+    forM_ (NonEmpty.nonEmpty (validatePlan (isJust (vmLoader base)) plan)) $ \refused →
+      throwFailure runtimeComponent (operation "start-scheduled-owner") [] (LoaderPlanRefused (toList refused))
   hosted ← forM (scheduledInstances spec) $ \instanceConfig → do
     let bounds = scheduledBounds spec
         violations = validateInstanceConfig (boundRetainedResults bounds) (boundQueuedAdmissions bounds) instanceConfig
@@ -623,7 +637,9 @@ startScheduledOwner runtime spec = do
       unless taken (throwFailure runtimeComponent (operation "start-scheduled-owner") [] (RequestHandlesRefused "the registry already serves an owner"))
   hooks ← newTVarIO Map.empty
   accounting ← newTVarIO newAccounting
-  let bare = Control owner label (vmValueLimits config) scheduler cells faults begun closing exited stopping ownInstances Nothing provider hooks accounting
+  -- The loader's inbox, over what the scheduler offers of its tick.
+  loading ← forM (scheduledLoader spec) $ \plan → (,) plan <$> newLoadingState plan (ticksFor scheduler stopping)
+  let bare = Control owner label (vmValueLimits config) scheduler cells faults begun closing exited stopping ownInstances Nothing provider hooks accounting (snd <$> loading)
   -- A lifecycle grant is resolved against the owners it names before anything starts, and
   -- refused naming every reason.
   lifecycle ← forM (scheduledLifecycle spec) $ \grant →
@@ -647,7 +663,7 @@ startScheduledOwner runtime spec = do
                 -- everything that already ended the owner has done this.
                 (\held → atomically (settleAll held ExitFailed))
           )
-          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) (fmap (\(_, instanceConfig, _) → instanceEscalate instanceConfig) hosted) (scheduledLending spec) (scheduledLeases spec) (scheduledMemberLimit spec) config {vmLifecycle = lifecycleContextOf <$> lifecycle, vmRequests = requestContextOf <$> provider})
+          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) (fmap (\(_, instanceConfig, _) → instanceEscalate instanceConfig) hosted) (scheduledLending spec) (scheduledLeases spec) (scheduledMemberLimit spec) config {vmLifecycle = lifecycleContextOf <$> lifecycle, vmRequests = requestContextOf <$> provider, vmLoader = (\(plan, state) → loadingConfig state plan) <$> loading})
   -- Acquisition is masked from the worker's start to the endpoint's handoff, and
   -- only the readiness wait is restored, exactly as for a finite-call owner.
   mask $ \restore → do
@@ -688,6 +704,8 @@ ticksFor scheduler stopping =
     { ticksNow = readTick scheduler
     , ticksHold = holdTick scheduler
     , ticksRelease = releaseTick scheduler
+    , ticksOwe = oweTick scheduler
+    , ticksOweRelease = releaseOwed scheduler
     , ticksWatch = watchTick scheduler
     , ticksOpen = do
         closed ← schedulerClosed scheduler
@@ -704,6 +722,11 @@ ticksFor scheduler stopping =
     }
   where
     (<&>) = flip fmap
+
+-- | Where roots and sources are left for the owner's module loader, from any thread, if the
+-- owner was created with a plan.
+scheduledLoaderEndpoint ∷ ScheduledOwner → Maybe LoaderEndpoint
+scheduledLoaderEndpoint = fmap LoaderEndpoint . controlLoading . ownerControl
 
 -- | The owner's identity.
 scheduledIdentity ∷ ScheduledOwner → OwnerId
