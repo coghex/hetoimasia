@@ -1,16 +1,18 @@
 -- | The package and import boundary, read from the Cabal description and the
 -- imports rather than from what the examples happened to run: the library
--- depends on the foundation's time values, the content package and base
--- libraries only, imports no module that performs IO of its own (the boot
--- checkpoint reads only through the content package's public interface),
--- exposes three modules, needs no Lua, GLFW, Vulkan, console, sample or game
--- package, and is listed by the ordinary and CPU projects and not by the
--- Vulkan project (LFE-22 wires that).
+-- depends on the foundation's time values, the content package, the Lua host and
+-- its runtime and base libraries only, its manifest and profile import nothing
+-- that performs IO, its behavior selection imports only the Lua host's and
+-- runtime's public modules, its boot checkpoint imports only the content
+-- package's public modules (and reads only through them), it exposes four
+-- modules, needs no GLFW, Vulkan, console, sample or game package, and is listed
+-- by the ordinary and CPU projects and not by the Vulkan project (LFE-22 wires
+-- that).
 module Test.LuaEngine.Boundary (spec) where
 
 import Control.Monad (filterM)
 import Data.Char (isSpace)
-import Data.List (isInfixOf, isPrefixOf, sort)
+import Data.List (isInfixOf, isPrefixOf, nub, sort)
 import System.Directory (doesDirectoryExist, doesFileExist, listDirectory)
 import System.FilePath (takeExtension, takeFileName, (</>))
 import Test.Hspec
@@ -85,29 +87,59 @@ importedBy sources = concat <$> mapM (\path → map ((,) (takeFileName path)) <$
 
 spec ∷ Spec
 spec = describe "the package and import boundary" $ do
-  it "has a library that depends on the foundation, the content package and base libraries, and nothing else" $
+  it "has a library that depends on the foundation, the content package, the Lua host and its runtime, and base libraries, and nothing else" $
     (sort <$> fieldEntries "library" "build-depends:")
-      `shouldReturn` ["array", "base", "bytestring", "containers", "hetoimasia-content", "hetoimasia-foundation", "text"]
+      `shouldReturn` ["array", "base", "bytestring", "containers", "hetoimasia-content", "hetoimasia-foundation", "hetoimasia-scripting-lua", "hetoimasia-scripting-lua:runtime-lua", "text"]
 
-  it "exposes the boot checkpoint, the manifest and the profile, and nothing else" $
+  it "exposes the behavior selection, the boot checkpoint, the manifest and the profile, and nothing else" $
     fieldEntries "library" "exposed-modules:"
-      `shouldReturn` ["Hetoimasia.LuaEngine.Boot", "Hetoimasia.LuaEngine.Manifest", "Hetoimasia.LuaEngine.Profile"]
+      `shouldReturn` ["Hetoimasia.LuaEngine.Behavior", "Hetoimasia.LuaEngine.Boot", "Hetoimasia.LuaEngine.Manifest", "Hetoimasia.LuaEngine.Profile"]
 
   it "imports only pure data libraries, the foundation's time values, the content package's public modules and its own modules: no IO of its own, no concurrency, no environment, no Lua" $ do
     sources ← sourcesUnder "src"
     sources `shouldSatisfy` ((>= 10) . length)
     imported ← importedBy sources
-    [file <> ": " <> name | (file, name) ← imported, not (permitted name)] `shouldBe` []
+    [file <> ": " <> name | (file, name) ← imported, not (permitted file name)] `shouldBe` []
     [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
 
-  it "is used by its own suite only through its public modules and the content package's" $ do
+  it "lets only the behavior selection import the Lua host and runtime, and only their public modules" $ do
+    sources ← sourcesUnder "src"
+    imported ← importedBy sources
+    [file | (file, name) ← imported, "Hetoimasia.Scripting." `isPrefixOf` name, file /= "Behavior.hs"] `shouldBe` []
+    sort (nub [name | (file, name) ← imported, file == "Behavior.hs", "Hetoimasia.Scripting." `isPrefixOf` name])
+      `shouldBe` [ "Hetoimasia.Scripting.Lua.Instance"
+                 , "Hetoimasia.Scripting.Lua.Owner"
+                 , "Hetoimasia.Scripting.Lua.Scheduled"
+                 ]
+
+  it "lets only the boot checkpoint import the content package, and only its public modules" $ do
+    sources ← sourcesUnder "src"
+    imported ← importedBy sources
+    [file | (file, name) ← imported, "Hetoimasia.Content" `isPrefixOf` name, file /= "Boot.hs"] `shouldBe` []
+    sort (nub [name | (file, name) ← imported, file == "Boot.hs", "Hetoimasia.Content" `isPrefixOf` name])
+      `shouldBe` ["Hetoimasia.Content", "Hetoimasia.Content.Identity", "Hetoimasia.Content.Inventory"]
+
+  it "is used by its own suite only through its public modules, the content package's, the Lua host's and the foundation's time values" $ do
     sources ← sourcesUnder "test"
     sources `shouldSatisfy` ((>= 7) . length)
     imported ← importedBy sources
     [ file <> ": " <> name
       | (file, name) ← imported
       , "Hetoimasia." `isPrefixOf` name
-      , name `notElem` ["Hetoimasia.LuaEngine.Boot", "Hetoimasia.LuaEngine.Manifest", "Hetoimasia.LuaEngine.Profile", "Hetoimasia.Foundation.Time", "Hetoimasia.Content", "Hetoimasia.Content.Identity", "Hetoimasia.Content.Inventory"]
+      , name
+          `notElem` [ "Hetoimasia.LuaEngine.Behavior"
+                    , "Hetoimasia.LuaEngine.Boot"
+                    , "Hetoimasia.LuaEngine.Manifest"
+                    , "Hetoimasia.LuaEngine.Profile"
+                    , "Hetoimasia.Foundation.Time"
+                    , "Hetoimasia.Scripting.Lua.Instance"
+                    , "Hetoimasia.Scripting.Lua.Owner"
+                    , "Hetoimasia.Scripting.Lua.Scheduled"
+                    , "Hetoimasia.Scripting.Lua.Value"
+                    , "Hetoimasia.Content"
+                    , "Hetoimasia.Content.Identity"
+                    , "Hetoimasia.Content.Inventory"
+                    ]
       ]
       `shouldBe` []
 
@@ -127,8 +159,14 @@ spec = describe "the package and import boundary" $ do
     ("\"hetoimasia-lua-engine:lua-engine-tests\"" `isInfixOf` catalog) `shouldBe` True
     ("\"id\": \"test.lua-engine\"" `isInfixOf` catalog) `shouldBe` True
   where
-    permitted name =
+    permitted file name =
       "Data." `isPrefixOf` name
+        || "GHC." `isPrefixOf` name
         || "Hetoimasia.LuaEngine." `isPrefixOf` name
         || name == "Hetoimasia.Foundation.Time"
-        || name `elem` ["Hetoimasia.Content", "Hetoimasia.Content.Identity", "Hetoimasia.Content.Inventory"]
+        -- Only the behavior selection is over the Lua host's and runtime's public
+        -- modules; the manifest and the profile import nothing of them.
+        || (file == "Behavior.hs" && "Hetoimasia.Scripting.Lua." `isPrefixOf` name)
+        -- Only the boot checkpoint is over the content package, through its
+        -- public modules.
+        || (file == "Boot.hs" && name `elem` ["Hetoimasia.Content", "Hetoimasia.Content.Identity", "Hetoimasia.Content.Inventory"])

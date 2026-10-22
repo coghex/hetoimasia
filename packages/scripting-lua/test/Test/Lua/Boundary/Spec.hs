@@ -6,6 +6,7 @@ import Test.Hspec (Spec, describe)
 import qualified Test.Lua.Boundary.Bindings
 import qualified Test.Lua.Boundary.Dependencies
 import qualified Test.Lua.Boundary.Discipline
+import qualified Test.Lua.Boundary.Exports
 import qualified Test.Lua.Boundary.Finalizers
 import qualified Test.Lua.Boundary.Independence
 import qualified Test.Lua.Boundary.Installation
@@ -26,6 +27,7 @@ spec = describe "the value boundary" $ do
   Test.Lua.Boundary.Release.spec
   Test.Lua.Boundary.Values.spec
   Test.Lua.Boundary.Modules.spec
+  Test.Lua.Boundary.Exports.spec
   Test.Lua.Boundary.Tasks.spec
   Test.Lua.Boundary.Discipline.spec
   Test.Lua.Boundary.Finalizers.spec

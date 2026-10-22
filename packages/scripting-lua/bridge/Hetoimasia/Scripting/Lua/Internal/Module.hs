@@ -47,6 +47,8 @@ module Hetoimasia.Scripting.Lua.Internal.Module
   , loadModule
   , callEntry
   , callEntryVia
+  , callEntryWith
+  , attributedTo
   , entryPresent
   , Lead (..)
   , Prepared (..)
@@ -79,6 +81,7 @@ import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure, withOperationContext)
 import Hetoimasia.Scripting.Lua.Internal.Binding (ensureValues, retiredIn)
 import Hetoimasia.Scripting.Lua.Internal.Boundary
+import Hetoimasia.Scripting.Lua.Internal.ExportTypes (CaptureHandle (..), ExportLimits, ExportState, Hook, hookIndex, newExportState)
 import Hetoimasia.Scripting.Lua.Internal.Fault (ErrorValue (ErrorAbsent), classify, luaComponent, renderFailure)
 import Hetoimasia.Scripting.Lua.Internal.Marshal
 import Hetoimasia.Scripting.Lua.Internal.Registration
@@ -143,10 +146,13 @@ data Host = Host
   { hostVm ∷ !Vm
   , hostBoundary ∷ !Boundary
   , hostLoaded ∷ !(IORef (Map ModuleRef ModuleHandle))
+  , hostExports ∷ !ExportState
+    -- ^ The opt-in export-module facility's records, beside and apart from the
+    -- global-entry modules above: see "Hetoimasia.Scripting.Lua.Internal.Export".
   }
 
-newHost ∷ Vm → Boundary → IO Host
-newHost vm boundary = Host vm boundary <$> newIORef Map.empty
+newHost ∷ Vm → Boundary → ExportLimits → IO Host
+newHost vm boundary limits = Host vm boundary <$> newIORef Map.empty <*> newExportState limits
 
 -- | At most this many modules in one owner.
 maxModules ∷ Int
@@ -334,6 +340,22 @@ data Lead
   = NoLead
   | -- | The driver's module and its entry point.
     Lead !ModuleHandle !Text
+  | -- | The driver's module and its entry point, and the captured hook it is
+    -- handed in place of one looked up in a module: the hook, the capture's
+    -- @self@ and its facade are pushed after the driver's function, three values,
+    -- from the capture the handle names. A hook the capture has none of is
+    -- absent, as an optional entry point a module does not define is, and nothing
+    -- runs. A handle another owner issued, or one whose behavior was released, is
+    -- refused before anything runs.
+    LeadCaptured !ModuleHandle !Text !CaptureHandle !Hook
+
+-- | The module a call is attributed to: the one whose code runs. A captured hook is the
+-- code of the export module it was captured from; anything else is the module the handle
+-- names.
+attributedTo ∷ Lead → ModuleHandle → ModuleRef
+attributedTo lead handle = case lead of
+  LeadCaptured _ _ capture _ → captureHandleSource capture
+  _ → handleModule handle
 
 -- | 'prepareEntry' with an optional lead. With a lead the stack holds the
 -- driver's function, then the entry point, then the arguments; the count is of
@@ -343,32 +365,35 @@ prepareEntryWith
   ⇒ Lead → Host → FaultOperation → Operation → ModuleHandle → Text → [Value] → State → StackIndex → IO Prepared
 prepareEntryWith lead host op operationName handle name arguments state entry = do
   when (handleVm handle /= vmIdentity vm) (fault (ModuleRefused ModuleHandleForeign) NoEffect Nothing)
-  hookDeclared ← case [entryPoint | entryPoint ← handleEntries handle, entryName entryPoint == name] of
-    entryPoint : _ → pure entryPoint
-    [] → fault (ModuleRefused (EntryUndeclared name)) NoEffect Nothing
+  -- A captured hook is declared by no module: the driver's entry point declares
+  -- what is checked and built, and the hook is only handed to it.
+  hookDeclared ← case lead of
+    LeadCaptured {} → pure Nothing
+    _ → case [entryPoint | entryPoint ← handleEntries handle, entryName entryPoint == name] of
+      entryPoint : _ → pure (Just entryPoint)
+      [] → fault (ModuleRefused (EntryUndeclared name)) NoEffect Nothing
   declared ← case lead of
-    NoLead → pure hookDeclared
-    Lead driver driverName → do
-      when (handleVm driver /= vmIdentity vm) (fault (ModuleRefused ModuleHandleForeign) NoEffect Nothing)
-      case [entryPoint | entryPoint ← handleEntries driver, entryName entryPoint == driverName] of
-        entryPoint : _ → pure entryPoint
-        [] → fault (ModuleRefused (EntryUndeclared driverName)) NoEffect Nothing
+    NoLead → maybe (fault (InternalError "no declaration for the entry point") NoEffect Nothing) pure hookDeclared
+    Lead driver driverName → declaredOf driver driverName
+    LeadCaptured driver driverName capture _ → do
+      when (captureHandleVm capture /= vmIdentity vm) (fault (ModuleRefused CaptureHandleForeign) NoEffect Nothing)
+      declaredOf driver driverName
   setRunContext vm (moduleRefName ref, moduleRefVersion ref, Just name)
   case lead of
     NoLead → pure ()
-    Lead driver driverName → do
-      driving ← lookupEntry state (handleSlot driver) driverName
-      case driving of
-        LookupFunctionOnStack → pure ()
-        LookupStatus status → do
-          value ← renderFailure state entry
-          lua_settop state entry
-          raiseEscape vm
-          fault (ScriptFailed (classify status) value) NoEffect Nothing
-        _ → do
-          lua_settop state entry
-          fault (InternalError "the driver's entry point is not a function of its module") NoEffect Nothing
-  found ← lookupEntry state (handleSlot handle) name
+    Lead driver driverName → pushDriver driver driverName
+    LeadCaptured driver driverName _ _ → pushDriver driver driverName
+  found ← case lead of
+    LeadCaptured _ _ capture hook → do
+      (status, present) ← pushCaptured state (captureHandleSlot capture) (hookIndex hook)
+      pure $
+        if status /= LUA_OK
+          then LookupStatus status
+          else case present of
+            0 → LookupNoModule
+            1 → LookupAbsent
+            _ → LookupFunctionOnStack
+    _ → lookupEntry state (handleSlot handle) name
   case found of
     LookupStatus status → do
       value ← renderFailure state entry
@@ -377,13 +402,16 @@ prepareEntryWith lead host op operationName handle name arguments state entry = 
       fault (ScriptFailed (classify status) value) NoEffect Nothing
     LookupNoModule → do
       lua_settop state entry
-      fault (InternalError "the module's slot is empty") NoEffect Nothing
+      case lead of
+        LeadCaptured {} → fault (ModuleRefused CaptureHandleStale) NoEffect Nothing
+        _ → fault (InternalError "the module's slot is empty") NoEffect Nothing
     LookupAbsent → do
       lua_settop state entry
       raiseEscape vm
-      case entryRequirement hookDeclared of
-        Optional → pure PreparedAbsent
-        Required → fault (EntryMissing False) NoEffect Nothing
+      case (lead, hookDeclared) of
+        (LeadCaptured {}, _) → pure PreparedAbsent
+        (_, Just hook) | entryRequirement hook == Optional → pure PreparedAbsent
+        _ → fault (EntryMissing False) NoEffect Nothing
     LookupNotFunction → do
       lua_settop state entry
       fault EntryNotAFunction NoEffect Nothing
@@ -421,11 +449,32 @@ prepareEntryWith lead host op operationName handle name arguments state entry = 
     leading = case lead of
       NoLead → 0
       Lead {} → 1
+      -- The hook, the capture's self and its facade.
+      LeadCaptured {} → 3
+    declaredOf driver driverName = do
+      when (handleVm driver /= vmIdentity vm) (fault (ModuleRefused ModuleHandleForeign) NoEffect Nothing)
+      case [entryPoint | entryPoint ← handleEntries driver, entryName entryPoint == driverName] of
+        entryPoint : _ → pure entryPoint
+        [] → fault (ModuleRefused (EntryUndeclared driverName)) NoEffect Nothing
+    pushDriver driver driverName = do
+      driving ← lookupEntry state (handleSlot driver) driverName
+      case driving of
+        LookupFunctionOnStack → pure ()
+        LookupStatus status → do
+          value ← renderFailure state entry
+          lua_settop state entry
+          raiseEscape vm
+          fault (ScriptFailed (classify status) value) NoEffect Nothing
+        _ → do
+          lua_settop state entry
+          fault (InternalError "the driver's entry point is not a function of its module") NoEffect Nothing
     vm = hostVm host
     boundary = hostBoundary host
     context = boundaryContext boundary
     limits = boundaryLimits boundary
-    ref = handleModule handle
+    -- The module the hook is the code of: a captured hook's is the export module it was
+    -- captured from, not the driver that calls it.
+    ref = attributedTo lead handle
     fault ∷ ∀ b. FaultReason → Effect → Maybe Text → IO b
     fault reason effect trace =
       throwFailure luaComponent operationName [] $
@@ -549,4 +598,4 @@ callEntryWith lead host handle name arguments =
                   pure (Returned values)
   where
     vm = hostVm host
-    ref = handleModule handle
+    ref = attributedTo lead handle

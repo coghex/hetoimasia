@@ -29,6 +29,7 @@ module Hetoimasia.Scripting.Lua.Internal.Boundary
   , FaultReason (..)
   , Effect (..)
   , ModuleProblem (..)
+  , ExportShape (..)
   , TaskEnd (..)
   , TaskProblem (..)
   , SuspendRefusal (..)
@@ -104,6 +105,11 @@ data FaultOperation
     -- profile.
     OpenLibraries
   | LoadModule
+  | -- | Evaluating an export module: running its chunk and keeping the table it
+    -- returns.
+    EvaluateExport
+  | -- | Validating a selected behavior of an export table and capturing its hooks.
+    CaptureBehavior
   | CallEntry
   | -- | A Lua call to a registered binding.
     CallBinding
@@ -151,6 +157,42 @@ data ModuleProblem
     ModuleHandleForeign
   | -- | An entry point the module did not declare.
     EntryUndeclared !Text
+  | -- | An export identity that is empty or past the bound, in bytes: the bound.
+    InvalidExportIdentity !Int
+  | -- | A new export identity while the owner holds as many as it may, failed
+    -- and in-progress ones included: the bound. No record was made.
+    TooManyExports !Int
+  | -- | An export handle that another owner issued.
+    ExportHandleForeign
+  | -- | An export handle the owner holds no table for.
+    ExportHandleStale
+  | -- | A capture handle that another owner issued.
+    CaptureHandleForeign
+  | -- | A capture handle whose behavior is no longer held: released, or never
+    -- made by this owner.
+    CaptureHandleStale
+  | -- | A facade source whose export table has no such field: the field's name.
+    FacadeFieldMissing !Text
+  | -- | A facade source that is not what it must be: a table for an existing
+    -- facade and for what a builder returns, a function for a builder. What it
+    -- was, by Lua type name.
+    FacadeNotATable !Text
+  | -- | A facade builder that is not a function. What it was.
+    FacadeBuilderNotAFunction !Text
+  deriving (Eq, Show)
+
+-- | What an export module's chunk returned instead of exactly one plain table.
+data ExportShape
+  = -- | No result at all.
+    ExportNoResult
+  | -- | A single nil.
+    ExportNil
+  | -- | A single value that is not a table: its Lua type's name.
+    ExportNotTable !Text
+  | -- | More than one result, an extra nil included.
+    ExportMultiple
+  | -- | A table with a metatable.
+    ExportMetatable
   deriving (Eq, Show)
 
 -- | How a task ended, once it is not resumable any more.
@@ -222,6 +264,8 @@ data FaultReason
     -- allocate: Lua's own classification, and the error value rendered under a
     -- bound.
     ScriptFailed !FaultKind !ErrorValue
+  | -- | An export module's chunk did not return exactly one plain table.
+    ExportShapeRefused !ExportShape
   | -- | An owner's policy names a namespace the registration does not declare.
     PolicyUnknownNamespace !Text
   | -- | A namespace's name is already a global that is not a table.

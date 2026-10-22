@@ -113,17 +113,24 @@ import Hetoimasia.Scripting.Lua.Lease.State
   , retirementsReady
   , serviceRetirements
   )
-import Hetoimasia.Scripting.Lua.Internal.Module (EntryPoint (entryName), ModuleHandle (handleEntries), callEntryVia, entryPresent)
+import Hetoimasia.Scripting.Lua.Internal.Module (EntryPoint (entryName), Lead (LeadCaptured), ModuleHandle (handleEntries), callEntryVia, callEntryWith, entryPresent)
 import Hetoimasia.Scripting.Lua.Internal.Owner (ownedHost)
 import Hetoimasia.Scripting.Lua.Internal.Fault (raisedByApplication)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Failure (ReasonCode (ScriptFault), RecoverySafety (RecoverySafe), failureReason)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (TaskId)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Limits (ServiceClass (OrdinaryClass))
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Task (TaskFailure (TaskFailure))
-import Hetoimasia.Scripting.Lua.Internal.Task (startTaskVia)
+import Hetoimasia.Scripting.Lua.Internal.Task (startTaskCaptured, startTaskVia)
+import Hetoimasia.Scripting.Lua.Instance.Behavior (behaviorDriverRef, behaviorInit, behaviorShutdown, behaviorUpdate)
 import Hetoimasia.Scripting.Lua.Owner
-  ( BoundaryFault (boundaryTraceback)
+  ( BehaviorShape (shapeInit, shapeShutdown, shapeUpdate)
+  , BoundaryFault (boundaryTraceback)
   , CallResult (Returned)
+  , Captured (capturedHandle, capturedShape)
+  , ExportIdentity (ExportIdentity)
+  , ExportOutcome (ExportFailed, ExportReady)
+  , FacadeSource (FacadeBuilt, FacadeField, FacadeValue)
+  , Hook (HookInit, HookShutdown, HookUpdate)
   , ModuleRef (moduleRefName)
   , OwnedVm
   , Task
@@ -133,6 +140,8 @@ import Hetoimasia.Scripting.Lua.Owner
   , startTask
   )
 import qualified Hetoimasia.Scripting.Lua.Owner as Owner
+import qualified Data.Text as Text
+import qualified Data.Text.Encoding as Text
 import Hetoimasia.Scripting.Lua.Runtime.Types
   ( CallFault (BoundaryFailed, ModuleNotLoaded)
   , Discard (Discard)
@@ -285,12 +294,19 @@ data InstanceHost = InstanceHost
   , ihEscalate ∷ InstanceFailure → IO Escalation
   , ihOwned ∷ !OwnedVm
   , ihDriver ∷ !ModuleHandle
+  , ihBehaviorDriver ∷ !(Maybe ModuleHandle)
+    -- ^ The driver of M1 behavior instances, which runs a captured hook, loaded beside
+    -- the instance driver.
   , ihHandles ∷ !(IORef (Map ModuleRef ModuleHandle))
   , ihTasks ∷ !(IORef (Map TaskId Task))
   , ihExtra ∷ !(IORef [(Text, ExceptionWithContext SomeException)])
   , ihLive ∷ !(IORef (Map TaskId Live))
   , ihEndings ∷ !(IORef (Map Word64 Ending))
   , ihCreated ∷ !(IORef (Set.Set Word64))
+  , ihEntered ∷ !(IORef (Set.Set Word64))
+    -- ^ The M1 behavior instances whose @init@ was entered: what an interrupted @init@
+    -- is told apart by from a construction that never ran a hook. The legacy driver's
+    -- record ('ihCreated') is not made for a behavior, so progress is not read from it.
   , ihMode ∷ !(IORef ExitMode)
   , ihToFinish ∷ !(IORef (Set.Set Word64))
     -- ^ Instances whose invocation's coroutine the scheduler closed: each is ended
@@ -328,16 +344,18 @@ newInstanceHost
   → TaskHost Cursor
   → OwnedVm
   → ModuleHandle
+  → Maybe ModuleHandle
   → IORef (Map ModuleRef ModuleHandle)
   → IORef (Map TaskId Task)
   → IORef [(Text, ExceptionWithContext SomeException)]
   → Maybe LeaseHost
   → Maybe ProviderState
   → IO InstanceHost
-newInstanceHost control instances escalate host owned driver handles tasks extra leases provider =
-  InstanceHost control instances escalate owned driver handles tasks extra
+newInstanceHost control instances escalate host owned driver behaviorDriver handles tasks extra leases provider =
+  InstanceHost control instances escalate owned driver behaviorDriver handles tasks extra
     <$> newIORef Map.empty
     <*> newIORef Map.empty
+    <*> newIORef Set.empty
     <*> newIORef Set.empty
     <*> newIORef Serving
     <*> newIORef Set.empty
@@ -609,7 +627,100 @@ settleEnded ih = do
 
 -- | Make an instance and run its @init@.
 startInstance ∷ InstanceHost → ICell → IO ()
-startInstance ih cell = do
+startInstance ih cell = case icBehavior cell of
+  Just behavior → startBehavior ih cell behavior
+  Nothing → startModuleInstance ih cell
+
+-- | Make an M1 behavior instance and run its @init@: on the owner's thread, because
+-- the behavior is Lua, find the export module the request names, select, validate and
+-- capture the behavior, resolve its cadence from what its table read as, and only then
+-- run the captured @init@.
+--
+-- Every failure before @init@ is the instance's failure at 'StageConstruct', with no
+-- hook run and nothing held: what was captured is released as the instance ends, like
+-- everything an instance holds. The capture is recorded in the cell in the step that
+-- makes it, so no failure or cancellation can leave one nobody will release.
+startBehavior ∷ InstanceHost → ICell → BehaviorCell → IO ()
+startBehavior ih cell behavior = do
+  state ← readTVarIO (icState cell)
+  unless (isStopped state) $ do
+    forM_ (ihLeases ih) $ \lh → atomically (openScope (lhLeases lh) (icId cell))
+    case ihBehaviorDriver ih of
+      Nothing → constructFailed (ErrorFault (ModuleNotLoaded behaviorDriverRef))
+      Just driver → do
+        found ← retrieved (behaviorExport request)
+        -- The facade's export module, when it names one, is found as the behavior's is.
+        facadeFound ← case behaviorFacade request of
+          FacadeData value → pure (Right (FacadeValue value))
+          FacadeShared identity key → fmap (\handle → FacadeField handle key) <$> retrieved identity
+          FacadeBuilder identity key context → fmap (\handle → FacadeBuilt handle key context) <$> retrieved identity
+        case (found, facadeFound) of
+          (Left failure, _) → constructFailed failure
+          (_, Left failure) → constructFailed failure
+          (Right export, Right facade) → do
+            made ← mask_ $ do
+              attempted ← settledOrRaise (ihExtra ih) (withRunning ih (icId cell) (Owner.captureBehavior owned export (behaviorSelect request) facade))
+              case attempted of
+                Right (Right capture) →
+                  atomically (writeTVar (bcResolved behavior) (Just (BehaviorResolved (capturedHandle capture) (capturedShape capture) EventOnly Nothing)))
+                _ → pure ()
+              pure attempted
+            case made of
+              Left fault → constructFailed (ErrorFault fault)
+              Right (Left problem) → constructFailed (ErrorBehavior problem)
+              Right (Right capture) → resolveCadence driver capture
+  where
+    owned = ihOwned ih
+    request = bcRequest behavior
+    constructFailed = failInstance ih cell Initializing StageConstruct
+    -- The export module the owner holds under an identity, or why this instance fails.
+    retrieved identity = do
+      found ← settledOrRaise (ihExtra ih) (withRunning ih (icId cell) (Owner.retrieveExport owned identity))
+      pure $ case found of
+        Left fault → Left (ErrorFault fault)
+        Right Nothing → Left (ErrorExportMissing (identityText identity))
+        Right (Just (ExportFailed fault)) → Left (ErrorExportFailed fault)
+        Right (Just (ExportReady export)) → Right export
+    identityText (ExportIdentity bytes) = Text.take 128 (Text.decodeUtf8Lenient bytes)
+    -- The cadence is the application's rule applied to what the table read as, once,
+    -- before @init@: an update hook needs an interval and an interval needs an update
+    -- hook, and the interval resolves exactly or not at all, as at any admission.
+    resolveCadence driver capture =
+      case behaviorCadence request shape of
+        Left why → constructFailed (ErrorCadence why)
+        Right wanted → case (shapeUpdate shape, wanted) of
+          (False, Just _) → constructFailed (ErrorCadence "a cadence was given to a behavior that has no update hook")
+          (True, Nothing) → constructFailed (ErrorCadence "the behavior has an update hook and no interval")
+          (False, Nothing) → initialize driver capture EventOnly Nothing
+          (True, Just interval) → case resolveInterval (insTickDuration (ihInstances ih)) interval of
+            Left refusal → constructFailed (ErrorCadence (Text.pack (show refusal)))
+            Right cadence → initialize driver capture (Periodic interval) (Just cadence)
+      where
+        shape = capturedShape capture
+    initialize driver capture kind cadence = do
+      let shape = capturedShape capture
+      atomically (writeTVar (bcResolved behavior) (Just (BehaviorResolved (capturedHandle capture) shape kind cadence)))
+      -- From here a hook may have run: an interruption of @init@ is progress made.
+      when (shapeInit shape) $ modifyIORef' (ihEntered ih) (Set.insert (icId cell))
+      ran ←
+        if shapeInit shape
+          then settledOrRaise (ihExtra ih) (withRunning ih (icId cell) (callEntryWith (LeadCaptured driver behaviorInit (capturedHandle capture) HookInit) (ownedHost owned) driver behaviorInit [VInteger (fromIntegral (icId cell))]))
+          else pure (Right (Returned []))
+      case ran of
+        Left fault → failInstance ih cell Initializing StageInit (ErrorFault fault)
+        Right _ → do
+          atomically . modifyTVar' (icState cell) $ \current →
+            if isStopped current
+              then current
+              else current {isPhase = Active, isInitialized = True}
+          problem ← startCadence ih cell
+          case problem of
+            Just why → failInstance ih cell Active StageUpdate (ErrorCadence why)
+            Nothing → dispatch ih cell
+
+-- | Make an instance of a module the owner loaded and run its @init@.
+startModuleInstance ∷ InstanceHost → ICell → IO ()
+startModuleInstance ih cell = do
   state ← readTVarIO (icState cell)
   unless (isStopped state) $ do
     -- The scope exists before the instance's first hook, so every binding it calls
@@ -868,6 +979,19 @@ instanceSegment ih run number starting = do
             fmap ((,) reference) <$> startDelivery service identity
           _ → pure Nothing
       let slot = VInteger (fromIntegral number)
+          -- An M1 behavior's update runs the captured hook, which the instance holds
+          -- and nothing looks up again, handed the instance's own self and facade.
+          startBehaviorUpdate behavior = do
+            resolved ← readTVarIO (bcResolved behavior)
+            case (resolved, ihBehaviorDriver ih) of
+              (Just held, Just driver) →
+                updateDelta ih cell >>= \case
+                  Left why → pure (Left (ErrorCadence why))
+                  Right seconds → do
+                    atomically (writeTVar (insDelta (ihInstances ih)) (Just (number, seconds)))
+                    begin (withRunning ih number (startTaskCaptured (ownedHost (ihOwned ih)) driver behaviorUpdate (resolvedCapture held) HookUpdate [slot]))
+                      `finally` atomically (writeTVar (insDelta (ihInstances ih)) Nothing)
+              _ → pure (Left (ErrorFault (ModuleNotLoaded behaviorDriverRef)))
       outcome ← case starting of
         Just (InvokeEvent source (WithinBounds [event])) →
           begin $ withRunning ih number (startTask (ihOwned ih) (ihDriver ih) (eventEntry source) [slot, event])
@@ -888,6 +1012,7 @@ instanceSegment ih run number starting = do
           case Map.lookup (icModule cell) handles of
             Nothing → pure (Left (ErrorFault (ModuleNotLoaded (icModule cell))))
             Just handle → begin $ withRunning ih number (startTaskVia (ownedHost (ihOwned ih)) (ihDriver ih) "run" handle "run" [slot])
+        Just InvokeUpdate | Just behavior ← icBehavior cell → startBehaviorUpdate behavior
         Just InvokeUpdate → do
           handles ← readIORef (ihHandles ih)
           case Map.lookup (icModule cell) handles of
@@ -1012,7 +1137,8 @@ checkedTick tick interval
 startCadence ∷ InstanceHost → ICell → IO (Maybe Text)
 startCadence ih cell = do
   stopped ← isStopped <$> readTVarIO (icState cell)
-  case icCadence cell of
+  cadence ← cellCadence cell
+  case cadence of
     Just (CadenceTicks interval) | not stopped → do
       tick ← atomically (readTick (scheduler' ih))
       case checkedTick tick interval of
@@ -1033,7 +1159,7 @@ startCadence ih cell = do
 -- which the resume was applied or from the instant it was. An elapsed instance's
 -- baseline is rebased to this instant, so its @dt@ excludes the pause.
 resumeCadence ∷ InstanceHost → ICell → IO (Maybe Text)
-resumeCadence ih cell = case icCadence cell of
+resumeCadence ih cell = cellCadence cell >>= \case
   Just (CadenceTicks interval) → do
     tick ← atomically (readTick (scheduler' ih))
     case checkedTick tick interval of
@@ -1057,7 +1183,7 @@ resumeCadence ih cell = case icCadence cell of
 -- exact duration is converted once, here, which is the only rounding. Fixed as the
 -- update begins.
 updateDelta ∷ InstanceHost → ICell → IO (Either Text Double)
-updateDelta ih cell = case icCadence cell of
+updateDelta ih cell = cellCadence cell >>= \case
   Just (CadenceTicks _) →
     maybe (Left "the instance's logical accrual is gone") fits <$> atomically (cadenceAccrued (scheduler' ih) (cadenceKey cell))
   Just (CadenceElapsed _) → do
@@ -1204,7 +1330,7 @@ serveFiring ih (CadenceKey number, firing) = withCell ih number $ \cell → do
       if accepting && free
         then markDue >> dispatch ih cell
         else atomically (releaseCadenceHold (scheduler' ih) (cadenceKey cell))
-      when accepting $ case icCadence cell of
+      when accepting $ cellCadence cell >>= \case
         Just (CadenceTicks interval) → case checkedTick tick interval of
           Nothing → unrepresentable "the tick the next update is due at is not representable"
           Just target → atomically (armLogicalCadence (scheduler' ih) (cadenceKey cell) target)
@@ -1212,7 +1338,7 @@ serveFiring ih (CadenceKey number, firing) = withCell ih number $ \cell → do
     FiredElapsed deadline now → when accepting $ do
       -- At most one refresh is kept unstarted: demand that finds one is coalesced into it.
       when (isUpdate state == UpdateNone) (markDue >> dispatch ih cell)
-      case icCadence cell of
+      cellCadence cell >>= \case
         Just (CadenceElapsed interval) → case nextFuture deadline interval now of
           Nothing → unrepresentable "the deadline the next update is due at is not representable"
           Just next → atomically (armElapsedCadence (scheduler' ih) (cadenceKey cell) next)
@@ -1230,7 +1356,7 @@ admittedUpdate state = case isUpdate state of
 settleHolds ∷ InstanceHost → [CadenceKey] → IO Bool
 settleHolds ih skip = do
   cells ← Map.elems <$> readTVarIO (insCells (ihInstances ih))
-  or <$> forM cells (\cell → case icCadence cell of
+  or <$> forM cells (\cell → cellCadence cell >>= \case
     Just (CadenceTicks _) | cadenceKey cell `notElem` skip → settleHold ih cell
     _ → pure False)
 
@@ -1486,8 +1612,24 @@ finishEnding ih cell closed = do
         -- Decided once, here, and recorded: a @shutdown@ that was started and raised a
         -- failure of the host is not started again when the owner's exit comes back to
         -- the instance, and is settled as the hook that raised.
+        -- An M1 behavior's shutdown is the captured hook, run if the table had one when
+        -- it was captured, whatever the table is now.
+        decideBehavior behavior = do
+          resolved ← readTVarIO (bcResolved behavior)
+          case (resolved, ihBehaviorDriver ih) of
+            (Just held, Just driver)
+              | safe && not (shapeShutdown (resolvedShape held)) → record (ShutdownDecided ShutdownAbsent Nothing)
+              | safe → do
+                  record ShutdownBegun
+                  mask $ \restore → do
+                    ran ← restore (settledOrRaise (ihExtra ih) (withRunning ih (icId cell) (callEntryWith (LeadCaptured driver behaviorShutdown (resolvedCapture held) HookShutdown) (ownedHost (ihOwned ih)) driver behaviorShutdown [slot, VText reasonText])))
+                    record $ case ran of
+                      Left fault → ShutdownDecided ShutdownRaised (Just (ErrorFault fault))
+                      Right _ → ShutdownDecided ShutdownRan Nothing
+            _ → record (ShutdownDecided ShutdownSkippedUnsafe Nothing)
         decide
           | not (isInitialized state) = record (ShutdownDecided ShutdownSkippedNoInit Nothing)
+          | Just behavior ← icBehavior cell = decideBehavior behavior
           | otherwise = case handle of
               Just module' | safe → do
                 available ← hookAvailable ih module' "shutdown"
@@ -1554,6 +1696,8 @@ pendingOf ih number = do
 -- would be lost.
 drainInstance ∷ InstanceHost → ICell → IO ()
 drainInstance ih cell = mask_ $ do
+  -- An M1 behavior's capture goes first: its hooks, self and facade are the instance's own.
+  releaseCaptured ih cell
   -- Its requests end first, and the providers are told: they are asked to stop before what
   -- the instance's leases hold is released. The instance owns them, whichever invocation
   -- made them, and nothing else ends them but its end.
@@ -1570,6 +1714,25 @@ drainInstance ih cell = mask_ $ do
   -- A provider that raised when told is a failure of the host: raised once everything has
   -- been released, with the others kept whole.
   raiseFirst (ihExtra ih) "lua request cancel" told
+
+-- | Let go of what an M1 behavior instance captured: its hooks, @self@ and facade are
+-- no longer held by the VM. Idempotent, and it runs no Lua, so Lua being unsafe to enter
+-- does not keep a reference; a coroutine that is running or suspended on them keeps
+-- them in Lua itself until it is closed. A release that fails is cleanup evidence on the
+-- owner, as any release of an instance's is, and ends it.
+releaseCaptured ∷ InstanceHost → ICell → IO ()
+releaseCaptured ih cell = forM_ (icBehavior cell) $ \behavior → do
+  resolved ← readTVarIO (bcResolved behavior)
+  forM_ resolved $ \held → do
+    released ← guarded (Owner.releaseBehavior (ihOwned ih) (resolvedCapture held))
+    case released of
+      Right () → pure ()
+      Left failure@(ExceptionWithContext context raised)
+        | isJust (fromException raised ∷ Maybe SomeAsyncException) → rethrowIO failure
+        | raisedByApplication context → rethrowIO failure
+        | otherwise → do
+            modifyIORef' (ihExtra ih) (<> [("lua instance behavior release", failure)])
+            endOwner ih
 
 -- | A cleanup failure of the leases ends the owner at once, through supervision, with
 -- the evidence it was recorded as: admission, grants and control close and the scheduler
@@ -1680,6 +1843,7 @@ settleEnding ih cell = do
   state ← readTVarIO (icState cell)
   mode ← readIORef (ihMode ih)
   created ← Set.member (icId cell) <$> readIORef (ihCreated ih)
+  entered ← Set.member (icId cell) <$> readIORef (ihEntered ih)
   held ← Map.lookup (icId cell) <$> readIORef (ihEndings ih)
   scope ← case ihLeases ih of
     Nothing → pure Nothing
@@ -1701,7 +1865,7 @@ settleEnding ih cell = do
       exitKind = case mode of
         Unorderly kind → kind
         _ → ExitFailed
-      reached = if isInitialized state || created || hookStarted (endShutdown ending) then Started else NotStarted
+      reached = if isInitialized state || created || entered || hookStarted (endShutdown ending) then Started else NotStarted
       failure = case (endPrimary ending, shutdownFailure) of
         (Just (Primary phase stage err), secondary) → Just (describe phase stage err ([(StageShutdown, e) | Just e ← [secondary]] <> releases))
         (Nothing, Just err) → Just (describe Stopping StageShutdown err releases)
@@ -1758,6 +1922,7 @@ settleEnding ih cell = do
     forM_ (ihLeases ih) $ \lh → atomically (dissolveScope (lhLeases lh) (icId cell))
     modifyIORef' (ihEndings ih) (Map.delete (icId cell))
     modifyIORef' (ihCreated ih) (Set.delete (icId cell))
+    modifyIORef' (ihEntered ih) (Set.delete (icId cell))
     tell restore mode won failure
   where
     -- The ending is accounted for once the application has been told and has answered: not

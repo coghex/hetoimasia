@@ -7,6 +7,7 @@
 module Hetoimasia.Scripting.Lua.Instance.State
   ( Gate (..)
   , admitInstance
+  , admitBehavior
   , deliverEvent
   , requestInstanceControl
   , requestInstanceControlAt
@@ -33,7 +34,7 @@ module Hetoimasia.Scripting.Lua.Instance.State
   ) where
 
 import Control.Concurrent.STM (STM, modifyTVar', newTVar, readTVar, retry, writeTVar)
-import Control.Monad (unless, when)
+import Control.Monad (forM, unless, when)
 import Data.Foldable (toList)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
@@ -44,6 +45,7 @@ import Data.Text (Text)
 import Data.Word (Word64)
 import Hetoimasia.Scripting.Lua.Internal.Protocol.Identity (TaskId)
 import Hetoimasia.Scripting.Lua.Instance.Types
+import Hetoimasia.Scripting.Lua.Owner (ModuleRef)
 import Hetoimasia.Scripting.Lua.Runtime.Types (OwnerId)
 import Hetoimasia.Scripting.Lua.Scheduler (ControlResult (ControlNoLongerApplicable))
 import Hetoimasia.Scripting.Lua.Value (Value)
@@ -65,7 +67,29 @@ data Gate = Gate
 -- it. The owner's thread makes the instance's @self@ and runs its @init@; until it
 -- has, the instance is 'Initializing' and events can be accepted for it.
 admitInstance ∷ Instances → Gate → OwnerId → InstanceRequest → STM InstanceAdmission
-admitInstance instances gate owner request = do
+admitInstance instances gate owner = admitCell instances gate owner Nothing
+
+-- | Admit an M1 behavior instance: the same live place and result reservation as any
+-- other, with no event grants, and the behavior left for the owner's thread to find,
+-- validate and capture when it starts the instance. The module it is named by is the
+-- given reference, which only names it in a snapshot and a failure.
+admitBehavior ∷ Instances → Gate → OwnerId → ModuleRef → BehaviorRequest → STM InstanceAdmission
+admitBehavior instances gate owner source behavior =
+  admitCell
+    instances
+    gate
+    owner
+    (Just behavior)
+    InstanceRequest
+      { instanceModule = source
+      , instanceKind = EventOnly
+      , instanceName = behaviorName behavior
+      , instanceClass = behaviorClass behavior
+      , instanceGrants = []
+      }
+
+admitCell ∷ Instances → Gate → OwnerId → Maybe BehaviorRequest → InstanceRequest → STM InstanceAdmission
+admitCell instances gate owner behavior request = do
   open ← gateOpen gate
   live ← readTVar (insLive instances)
   retained ← readTVar (insRetained instances)
@@ -89,6 +113,7 @@ admitInstance instances gate owner request = do
           result ← newTVar Nothing
           forgotten ← newTVar False
           released ← newTVar False
+          held ← forM behavior $ \wanted → BehaviorCell wanted <$> newTVar Nothing
           let cell =
                 ICell
                   { icId = number
@@ -102,6 +127,7 @@ admitInstance instances gate owner request = do
                   , icResult = result
                   , icForgotten = forgotten
                   , icReleased = released
+                  , icBehavior = held
                   }
           modifyTVar' (insCells instances) (Map.insert number cell)
           writeTVar (insLive instances) (live + 1)
@@ -338,6 +364,7 @@ settleInstance instances cell settlement =
 snapshotOf ∷ Instances → Gate → OwnerId → Text → ICell → STM InstanceSnapshot
 snapshotOf instances gate owner label cell = do
   state ← readTVar (icState cell)
+  kind ← cellKind cell
   execution ← case isActive state of
     Nothing → pure ExecIdle
     Just task → gateExecution gate task
@@ -347,7 +374,7 @@ snapshotOf instances gate owner label cell = do
       , snapshotOwner = label
       , snapshotName = icName cell
       , snapshotModule = icModule cell
-      , snapshotKind = icKind cell
+      , snapshotKind = kind
       , snapshotPhase = isPhase state
       , snapshotExecution = execution
       , snapshotQueued = Seq.length (isQueue state) + pendingEvents state

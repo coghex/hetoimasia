@@ -1,15 +1,23 @@
 cabal-version: 3.16
 name: hetoimasia-lua-engine
 version: 0.1.0.0
-synopsis: The Lua-first engine's strict manifest and fixed M1 profile
+synopsis: The Lua-first engine's manifest, fixed M1 profile, behavior selection and boot checkpoint
 description:
-    The pure configuration boundary of the Lua-first engine (LFE-3): a strict,
-    bounded parser for the format-1 launch manifest @hetoimasia.json@, from
-    caller-supplied bytes to a resolved role, entry and tick configuration, and
-    the fixed M1 profile of limits with validated, smaller test profiles. It
-    opens no folder, starts no Lua, worker, window or GPU, and performs no IO.
-    It depends on the foundation's time values and on no GLFW, Vulkan, console,
-    sample or game package.
+    The Lua-first engine's configuration boundary and role policy. The manifest
+    and profile (LFE-3) are pure: a strict, bounded parser for the format-1
+    launch manifest @hetoimasia.json@, from caller-supplied bytes to a resolved
+    role, entry and tick configuration, and the fixed M1 profile of limits with
+    validated, smaller test profiles. The behavior selection (LFE-8) is the M1
+    policy over the Lua runtime's generic behavior mechanism: which export field
+    each role selects, the cadence rules and their exact conversions, and the
+    export-module ceilings the profile gives a VM. The boot checkpoint (LFE-6)
+    composes the parser with the generic content inventory before any authored
+    Lua: the manifest bytes parsed are the bytes the scan pinned, and every
+    declared entry names an inventoried regular file; it reads only through the
+    verified read the caller passes in. None of it starts Lua, a worker, a
+    window or a GPU. It depends on the foundation's time values, the content
+    package and the Lua host and its runtime's public modules, and on no GLFW,
+    Vulkan, console, sample or game package.
 license: GPL-3.0-only
 license-file: LICENSE
 author: Vincent Coghlan
@@ -33,6 +41,7 @@ library
     import: language
     hs-source-dirs: src
     exposed-modules:
+        Hetoimasia.LuaEngine.Behavior
         Hetoimasia.LuaEngine.Boot
         Hetoimasia.LuaEngine.Manifest
         Hetoimasia.LuaEngine.Profile
@@ -54,6 +63,8 @@ library
         containers >=0.8 && <0.9,
         hetoimasia-content ==0.1.0.0,
         hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-scripting-lua,
+        hetoimasia-scripting-lua:runtime-lua,
         text >=2.1 && <2.2
 
 -- This package's own contracts, registered as the CPU validation group
@@ -64,6 +75,7 @@ test-suite lua-engine-tests
     main-is: Main.hs
     hs-source-dirs: test
     other-modules:
+        Test.LuaEngine.Behavior
         Test.LuaEngine.Boot
         Test.LuaEngine.Boundary
         Test.LuaEngine.Manifest.Examples
@@ -81,6 +93,8 @@ test-suite lua-engine-tests
         hetoimasia-content ==0.1.0.0,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-lua-engine ==0.1.0.0,
+        hetoimasia-scripting-lua,
+        hetoimasia-scripting-lua:runtime-lua,
         hetoimasia-test-support ==0.1.0.0,
         hspec >=2.11 && <3,
         process >=1.6 && <1.7,
