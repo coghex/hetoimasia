@@ -588,7 +588,7 @@ the texture itself retired.
 | A texture owner's banks and role | one instance's bindings, from `newTextureOwner` (no registry) | admission, the decode stage's shrink, the lease and the pipeline's housekeeping | `ownerReading` | until its textures are retired; `closeTextureOwner` only stops new requests |
 | A lane and its workspace bank (128 MiB) | the pipeline | the read sink, the decoder's account, the handoff, the backend's buffer retirement | `readingLanes` | a job holds it from the start of its read until the backend stops reading the level |
 | A job (stage, buffers, withdrawn/stopping flags) | the pipeline | the same | diagnostics | from admission until the host returns its record; entries exist only for admitted requests |
-| A texture's `Cell` | the pipeline until a lease adopts it, then the lease | the backend's sink, the adoption recipe, the release | the retirement readings | exactly one party calls the backend's release, once |
+| A texture's `Cell` | the pipeline until the answer offers it, then the host (adopt or drop), then the lease | the backend's sink, the answer's offer, the adoption recipe, the release | the retirement readings | one transition per decision on the cell (offer, adopt, claim); exactly one party calls the backend's release, once |
 
 There are two session read workers (the shared pool, LFE-10), **one decode worker** and **two lanes**. No thread is made
 for a request, an instance or a VM.
@@ -622,11 +622,26 @@ polls and nothing sleeps, and closing never depends on the worker being alive.
 
 On the backend's usable registration the pipeline holds a `Cell` and answers the request with a resource the host builds,
 on the owner's thread, into the lease the admission reserved. Until that build runs the texture belongs to the cell and
-afterwards to the lease; the cell's state machine decides who may release it. If the host drops the build (the request was
-cancelled, its instance ended) it does not tell the provider, so the pipeline learns of it where the host does return a
-credit: a credit that transfers, returned unused, means no lease owns the texture, and the pipeline's housekeeping releases
-it and returns the charge only when the backend proves it retired. A lease built over a cell the pipeline already released
-returns its charges when that release retires.
+afterwards to the lease. Three decisions are made on the cell, each one transaction, so a texture is never both published and
+released:
+
+* **offer**: the answer that hands the host a resource first moves the cell from delivered to *offered*, in the same
+  transaction that reads whether the host still wants the job. A cell something already claimed (a shutdown) cannot be
+  offered, and the request is answered a failure; a job the host withdrew is answered nothing, and the withdrawal released the
+  cell;
+* **adopt**: the host's build moves an offered cell to adopted. The one other state it can find is claimed, and that only
+  after the host's own interest ended (the request was cancelled or its instance ended between the answer and the build),
+  which the host discovers atomically with the result and answers by releasing the lease it built, so its charges return when
+  the release retires;
+* **claim**: the pipeline may claim a cell nobody adopted (a failed upload, a withdrawn job, a request the host answered late
+  or refused, a build the host dropped); a **shutdown** (a failed pipeline, a closing scope) may claim only a cell nobody
+  *offered*; the lease claims an adopted one; exactly one party ever does, and it calls the backend once.
+
+So a shutdown never starts releasing a texture the host holds for adoption: that texture is adopted, and lives until its lease
+ends, or it is dropped (the host returns the credit unused) and the pipeline then releases it. The drain waits for an offered
+texture to be adopted or dropped. If the host drops the build it does not tell the provider, so the pipeline learns of it where
+the host does return a credit: a credit that transfers, returned unused, means no lease owns the texture, and the pipeline's
+housekeeping releases it and returns the charge only when the backend proves it retired.
 
 ### Release, cancellation and teardown
 
@@ -642,7 +657,7 @@ returns its charges when that release retires.
   active. A late texture is released once and never reaches the request.
 * Closing admission precedes every drain. The scope withdraws what has not started, tells started work to stop, then waits
   in STM, outside any uninterruptible release, for every read, decode and upload to retire and for every texture it still
-  holds to be released and proved retired; a cancellation delivered meanwhile is remembered and raised after. Only then does
+  holds to be released and proved retired, or, if it is offered, adopted or dropped; a cancellation delivered meanwhile is remembered and raised after. Only then does
   the group stop the worker, and only then may the pool, the inventory and the backend unwind. **The drain always runs**: admission
   closes in a transaction of its own, whatever the close step raised (a callback that raises, a cancellation delivered inside it)
   is retained as the first exception, the drain then meets every outstanding obligation, and the retained exception is raised
