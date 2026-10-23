@@ -97,7 +97,10 @@ cabal test hetoimasia-tests --test-show-details=direct
   behavior selection and the export-module and loader ceilings the profile gives a VM, and the M1 request adapter
   (LFE-7, `Test.LuaEngine.Request.*`): the busy record, the exact `ready`/`take`/`cancel`/`wait` records, handles
   and phases, the profile's limits, a texture lease, and required and optional failure, over real Lua instances on
-  a supervised owner with controlled fake providers. It starts no window or GPU; its one example of the Lua host's
+  a supervised owner with controlled fake providers. The owned texture pipeline (LFE-16, `Test.LuaEngine.Texture.*`) is
+  covered over a real content root, inventory and shared read pool, the real bounded PNG decoder and a gated fake upload
+  backend: the admission banks, the lanes, workers and queues, the stage-by-stage charges, cancellation at every stage,
+  failures, independent loads and release, the close and drain, and a separately compiled public client. It starts no window or GPU; its one example of the Lua host's
   module loader under the fixed profile (`Test.LuaEngine.Loader`, LFE-9) starts an in-process Lua owner. A new
   manifest or profile example belongs there, in the component spec that owns it.
   `lua-runtime-tests` also owns the host's opt-in admission (`Test.LuaRuntime.Admission.*`)
