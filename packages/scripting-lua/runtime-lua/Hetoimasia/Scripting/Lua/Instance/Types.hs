@@ -699,12 +699,23 @@ data InstanceConfig = InstanceConfig
     -- @run@, every segment a wait resumes, and its @shutdown@. It is where an application samples
     -- what a script must read as the same throughout a segment. It runs no Lua and its default does
     -- nothing; what it raises is a failure of the host.
+  , instanceOnFailing ∷ InstanceFailure → IO ()
+    -- ^ Told, on the owner's thread and once, as soon as an instance's ending begins with a failure: the
+    -- instance's primary failure, before its @shutdown@ runs, before what it holds is released and before the
+    -- retirements its providers owe it complete. 'instanceEscalate' is told when the instance has settled,
+    -- which waits for those retirements; this is the earlier notice, for an application whose policy must act
+    -- on a failure at once (close its admission, stop granting ticks) whatever a provider is slow to retire.
+    -- The record is the primary failure alone: 'failureSecondary' is empty, because nothing else has failed
+    -- yet, and the settled record 'instanceEscalate' is told carries what else did. An instance whose
+    -- failure arises only as it settles (a @shutdown@ that raises after a stop, a release that fails) is not
+    -- told here, and is told to 'instanceEscalate' alone. The default does nothing; what it raises is a
+    -- failure of the host.
   }
 
 -- | The default bounds, no event source, controls admitted on arrival, and an
 -- escalation that keeps every failure isolated.
 defaultInstanceConfig ∷ InstanceConfig
-defaultInstanceConfig = InstanceConfig defaultInstanceBounds [] Nothing AdmitOnArrival (const (pure Isolate)) (const (pure ()))
+defaultInstanceConfig = InstanceConfig defaultInstanceBounds [] Nothing AdmitOnArrival (const (pure Isolate)) (const (pure ())) (const (pure ()))
 
 -- | A configuration problem.
 data InstanceViolation
@@ -996,6 +1007,9 @@ data Instances = Instances
   , insOnSegment ∷ InstanceId → IO ()
     -- ^ What the application is told as an instance's hook begins or resumes
     -- ('instanceOnSegment').
+  , insOnFailing ∷ InstanceFailure → IO ()
+    -- ^ What the application is told as an instance's ending begins with a failure
+    -- ('instanceOnFailing').
   }
 
 -- | Make an owner's instance state.
@@ -1015,6 +1029,7 @@ newInstances config =
     <*> pure (instanceControlAdmission config)
     <*> newTVarIO Map.empty
     <*> pure (instanceOnSegment config)
+    <*> pure (instanceOnFailing config)
 
 -- | An error as one line of text, at most 'failureTextLimit' characters.
 renderError ∷ InstanceError → Text
