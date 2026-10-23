@@ -643,7 +643,14 @@ returns its charges when that release retires.
 * Closing admission precedes every drain. The scope withdraws what has not started, tells started work to stop, then waits
   in STM, outside any uninterruptible release, for every read, decode and upload to retire and for every texture it still
   holds to be released and proved retired; a cancellation delivered meanwhile is remembered and raised after. Only then does
-  the group stop the worker, and only then may the pool, the inventory and the backend unwind. Nothing is reported over while
+  the group stop the worker, and only then may the pool, the inventory and the backend unwind. **The drain always runs**: admission
+  closes in a transaction of its own, whatever the close step raised (a callback that raises, a cancellation delivered inside it)
+  is retained as the first exception, the drain then meets every outstanding obligation, and the retained exception is raised
+  after it with the drain's own beside it. The drain's own effects are protected the same way: an effect that raises
+  (synchronously: latched; by cancellation: kept) never stops the drain or the effects after it, and a synchronous fault of the
+  drain's own transaction, an engine defect it cannot get past, is latched and raised rather than retried into a hang. No
+  teardown effect swallows a cancellation: the pipeline's own release of a texture raises it to its caller, and a handler that
+  re-raises a failure latches it before it runs any effect that might raise. Nothing is reported over while
   the backend still holds a buffer.
 
 ### The backend port
