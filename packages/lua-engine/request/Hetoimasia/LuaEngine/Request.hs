@@ -62,7 +62,6 @@ module Hetoimasia.LuaEngine.Request
   , m1StartResults
   , m1StartSchemas
   , busyCode
-  , refusedCode
   , busyMessage
 
     -- * The common result adapter
@@ -243,9 +242,6 @@ data M1Start
   | -- | A temporary bank had no room: the bounded message of the busy answer. Nothing was
     -- accepted.
     M1Busy !Text
-  | -- | A credit of the endpoint said it can never be had: the bounded reason. Final, unlike busy.
-    -- Nothing was accepted.
-    M1Refused !Text
   deriving (Eq, Show)
 
 -- | Start a request of this endpoint, atomically: accepted, or busy with nothing reserved.
@@ -257,7 +253,6 @@ startM1 m1 ask context endpoint arguments afterCompletion = do
   pure $ case started of
     Started handle → M1Accepted handle
     Unavailable bank → M1Busy (busyMessage m1 bank)
-    Refused why → M1Refused (clipBytes (m1MessageBytes m1) why)
 
 -- | The bounded message of a busy answer for a bank.
 busyMessage ∷ M1Requests → Bank → Text
@@ -267,9 +262,6 @@ busyMessage m1 bank = clipBytes (m1MessageBytes m1) ("request capacity is not av
 busyCode ∷ Text
 busyCode = "busy"
 
--- | The code of a permanent refusal answer: nothing was accepted and asking again cannot change that.
-refusedCode ∷ Text
-refusedCode = "refused"
 
 -- | The check a service's request-producing binding makes of its copied arguments, before the action:
 -- every permanent fact the admission would refuse (the role's phase, an instance that is ending, an
@@ -288,7 +280,6 @@ m1StartResults ∷ Text → M1Start → [Value]
 m1StartResults handleType = \case
   M1Accepted handle → [requestHandleValue handleType handle, VNil]
   M1Busy message → [VNil, VRecord [("code", VText busyCode), ("message", VText message)]]
-  M1Refused message → [VNil, VRecord [("code", VText refusedCode), ("message", VText message)]]
 
 -- | The result schemas of a request-producing binding.
 m1StartSchemas ∷ Text → [Schema]

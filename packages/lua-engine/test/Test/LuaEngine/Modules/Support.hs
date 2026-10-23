@@ -30,6 +30,7 @@ module Test.LuaEngine.Modules.Support
   , diagnostics
   , awaitDiagnostics
   , betweenCheckAndAdmission
+  , runLookTask
   , contentPath
   , rewrite
   , key'
@@ -363,6 +364,14 @@ countNotes session wanted = length . filter (== wanted) <$> history session
 diagnostics ∷ Session → IO [Text]
 diagnostics session = reverse <$> readTVarIO (ssDiagnostics session)
 
+-- | Run the driver's @look@ entry as a task, which is no instance: it calls the lookup a kept module
+-- exposes, catching the error, as a hook would.
+runLookTask ∷ Vm → Text → Text → IO ()
+runLookTask vm name path =
+  admitScheduledTask (scheduledEndpoint (vmOwner vm)) (TaskRequest (ModuleRef "driver" "1") "look" [VText name, VText path] OrdinaryClass OneShot Nothing) >>= \case
+    TaskAccepted _ _ → pure ()
+    other → assertFailure ("expected the task accepted, found " <> take 80 (show other))
+
 -- | Do this once, on the next request's way from its argument check to its admission, as another
 -- thread would.
 betweenCheckAndAdmission ∷ Session → IO () → IO ()
@@ -604,7 +613,7 @@ bindings session coordinator =
         pure []
     fetching = withArgumentCheck check (fetchWith "fetch")
     -- A call that skipped the argument check: the admission decides on its own, with the same answers.
-    fetchingUnchecked = fetchWith "fetch_unchecked"
+    fetchingUnchecked = recoverableRefusals (fetchWith "fetch_unchecked")
     -- Another check of the same binding, after this one's, rejects: nothing of the first may be left behind.
     fetchingRejected = withArgumentCheck (\_ _ → pure (Just "rejected by a later check")) (withArgumentCheck check (fetchWith "fetch_rejected"))
     fetchWith name =
@@ -612,11 +621,10 @@ bindings session coordinator =
         case requestFrom session values of
           Left why → throwIO (userError (Text.unpack why))
           Right asked → do
+            -- A permanent refusal at the identity credit is raised by the host as an ordinary Lua error, which
+            -- this binding (opted in by its argument check) lets the script catch.
             started ← startModule coordinator asked context (note session "disposed")
-            case started of
-              StartAnswered answer → pure (m1StartResults handleType answer)
-              -- A permanent refusal is final data, distinct from busy: nothing was accepted and asking again cannot change that.
-              StartRefused why → pure (m1StartResults handleType (M1Refused why))
+            pure (m1StartResults handleType started)
     check owner values = case requestFrom session values of
       Left why → pure (Just why)
       Right asked → do
@@ -674,10 +682,14 @@ awaitGate session name = gateIn (ssEntered session) name >>= readMVar
 -- | The Lua the commands run. A table is shown with its keys in order; an export table by its @id@.
 driverSource ∷ ModuleSource
 driverSource =
-  ModuleSource (ModuleRef "driver" "1") (Text.encodeUtf8 (Text.unlines source)) hookEntries
+  ModuleSource (ModuleRef "driver" "1") (Text.encodeUtf8 (Text.unlines source)) (hookEntries <> [EntryPoint "look" Required [SText, SText] []])
   where
     source =
       [ "local shared = {}"
+      , "function look(name, path)"
+      , "  local ok = pcall(shared[name].lookup, path)"
+      , "  fx.record('task looked ' .. tostring(ok))"
+      , "end"
       , "local function describe(v, depth)"
       , "  local t = type(v)"
       , "  if t == 'string' then return v end"

@@ -287,6 +287,23 @@ failures = describe "a required failure" $ do
         command session vm "y" "lookup" "k0" [("path", VText "broken_second.lua")] Nothing
         awaitNote session "y lookup k0 failed module_error #broken_second.lua"
 
+  it "latches nothing when no instance's code is running: a task that caught the error is not an instance" $
+    withSession fixedM1Profile (2, 8) realReader layout $ \session _ runtime →
+      withVm session runtime "ui" (defaultOptions OnArrival) $ \vm → do
+        admitDriver session vm "x"
+        admitDriver session vm "y"
+        command session vm "x" "start" "ku" [] (Just (fetch "util.lua"))
+        awaitNote session "x start ku started"
+        command session vm "x" "keep" "ku" [("name", VText "util")] Nothing
+        awaitNote session "x keep ku {status=success,value=table(util)}"
+        command session vm "y" "start" "kb" [] (Just (fetch "bad.lua"))
+        _ ← awaitFailure session "y"
+        runLookTask vm "util" "bad.lua"
+        awaitHistory session (elem "task looked false")
+        -- The task caught the error and nothing was failed for it: the instance that holds the module still answers.
+        command session vm "x" "lookup" "k0" [("path", VText "bad.lua")] Nothing
+        awaitNote session "x lookup k0 failed module_error #bad.lua"
+
   it "stays an ordinary, catchable error for a plan that does not opt in: only the coordinator makes the failure required" $
     withSession fixedM1Profile (2, 8) realReader layout $ \session _ runtime →
       -- The plan as any generic caller has it: the coordinator's hooks, and the default for the observed lookup.

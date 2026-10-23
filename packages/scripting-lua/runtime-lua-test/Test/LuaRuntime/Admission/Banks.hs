@@ -143,7 +143,7 @@ spec = describe "banks" $ do
         d <- diagnostics owner
         (rdBusy d, rdHeld d, rdOutstanding d) `shouldBe` (1, 0, 0)
 
-    it "that are full for good refuse the request for good: final data, nothing reserved, no fault, and a bank that may empty is still busy" $ bounded $ do
+    it "that are full for good refuse the request for good, as an ordinary error the script catches, nothing reserved, and a bank that may empty is still busy" $ bounded $ do
       fixture ← newAFix 4
       first ← newBank 2
       let forGood = Credit {creditName = "for good", creditReserve = throwSTM (CreditRefused "nothing will ever return a place"), creditRelease = const (pure ()), creditTransfers = False}
@@ -152,9 +152,10 @@ spec = describe "banks" $ do
         owner ← arrival fixture 8 runtime "credit for good"
         admitAdmitter fixture owner "i" "admitter"
         acommand fixture owner "i" "pstart" "a"
-        awaitNote fixture "cmd pstart a refused:refused nothing will ever return a place"
+        -- Caught by the script's pcall: an ordinary error naming the reason, not busy data and not a fault.
+        awaitNote fixture "cmd pstart a error ad.start: request refused: nothing will ever return a place"
         -- The credit before it was undone with the admission, nothing reached the provider, and the
-        -- instance was not failed: it asks again, and is told the same, where a bank that may empty is busy.
+        -- instance went on: it asks again, and a request that can be had is started.
         bankAvailable first >>= (`shouldBe` 2)
         submissions (afFake fixture) >>= (`shouldBe` 0)
         d <- diagnostics owner
@@ -162,12 +163,30 @@ spec = describe "banks" $ do
         setPolicy fixture (\held → held {polCredits = [bankCredit "first" False first]})
         acommand fixture owner "i" "pstart" "b"
         awaitNote fixture "cmd pstart b started"
+        -- Where a bank may empty the answer stays busy data.
         empty ← newBank 0
         setPolicy fixture (\held → held {polCredits = [bankCredit "empty" False empty]})
         acommand fixture owner "i" "pstart" "c"
         awaitNote fixture "cmd pstart c busy:busy the provider has no room in empty"
 
-    it "bound the reason of a refusal a script reads, and a credit that never refuses keeps exactly its behavior" $ bounded $ do
+    it "that are full for good win over a full temporary bank: the refusal is decided before any bank is asked" $ bounded $ do
+      fixture ← newAFix 4
+      let forGood = Credit {creditName = "for good", creditReserve = throwSTM (CreditRefused "nothing will ever return a place"), creditRelease = const (pure ()), creditTransfers = False}
+      setPolicy fixture (\held → held {polPerInstance = 1})
+      withBoundary $ \_ runtime → settleAll fixture $ do
+        owner ← arrival fixture 8 runtime "refusal before banks"
+        admitAdmitter fixture owner "i" "admitter"
+        acommand fixture owner "i" "pstart" "a"
+        awaitNote fixture "cmd pstart a started"
+        -- The instance's one place is held: a request is busy ...
+        acommand fixture owner "i" "pstart" "b"
+        awaitNote fixture "cmd pstart b busy:busy the instance holds all 1 of its request places"
+        -- ... until the credit says it can never be had, and then it is refused, not busy, though that bank is still full.
+        setPolicy fixture (\held → held {polPerInstance = 1, polCredits = [forGood]})
+        acommand fixture owner "i" "pstart" "c"
+        awaitNote fixture "cmd pstart c error ad.start: request refused: nothing will ever return a place"
+
+    it "bound the reason of a refusal a script reads" $ bounded $ do
       fixture ← newAFix 4
       let wordy = Credit {creditName = "wordy", creditReserve = throwSTM (CreditRefused (Text.replicate 1000 "x")), creditRelease = const (pure ()), creditTransfers = False}
       setPolicy fixture (\held → held {polCredits = [wordy]})
@@ -175,7 +194,7 @@ spec = describe "banks" $ do
         owner ← arrival fixture 8 runtime "credit wordy"
         admitAdmitter fixture owner "i" "admitter"
         acommand fixture owner "i" "pstart" "a"
-        awaitNote fixture ("cmd pstart a refused:refused " <> Text.replicate refusalReasonBytes "x")
+        awaitNote fixture ("cmd pstart a error ad.start: request refused: " <> Text.replicate refusalReasonBytes "x")
 
     it "cannot be overbooked by two admissions that compete for the last unit" $ bounded $ do
       fixture ← newAFix 4

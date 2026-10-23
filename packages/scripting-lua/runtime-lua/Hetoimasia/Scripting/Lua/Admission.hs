@@ -109,7 +109,6 @@ import Control.Concurrent.STM (atomically)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), mask, mask_, rethrowIO, someExceptionContext)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
-import qualified Data.Text as Text
 import Data.Word (Word64)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (operation, throwFailure)
@@ -132,10 +131,6 @@ data Started
   | -- | Nothing was accepted: this bank had no room. No handle, no provider action, no partial
     -- reservation, no failure of the instance. Hand the script a busy answer.
     Unavailable !Bank
-  | -- | Nothing was accepted, and nothing will be: a credit said it can never be had
-    -- ('CreditRefused'), with this bounded reason. Final, where 'Unavailable' is recoverable data
-    -- the script may retry; no handle, provider action, partial reservation or failure of the instance.
-    Refused !Text
   deriving (Eq, Show)
 
 -- | Start a request of this endpoint with the opt-in admission, and give the binding its
@@ -152,7 +147,10 @@ data Started
 -- in its precondition, which decides the same facts and reserves nothing. An endpoint the grant
 -- does not name, a provider that raises when handed the request, a bank that raises, and a
 -- counter the engine cannot advance are failures of the host: the first of these before
--- anything was reserved, and the second with the admission taken back.
+-- anything was reserved, and the second with the admission taken back. A credit that is full
+-- /for good/ ('CreditRefused') refuses the request finally, before any bank is asked, so that a full
+-- temporary bank never turns it into busy: it is raised as an ordinary Lua error (a binding opted in to
+-- ordinary refusals) the script may catch, and as the fault of the call for any other binding.
 startAdmitted ∷ HasCallStack ⇒ RequestContext → Admission → Text → [Value] → IO () → IO Started
 startAdmitted context ask name arguments afterCompletion = do
   service ← serviceOf context
@@ -163,7 +161,10 @@ startAdmitted context ask name arguments afterCompletion = do
   mask $ \restore → do
     outcome ← atomically (admitOptIn service requester endpoint ask)
     case outcome of
-      OptInRefused (RequestCreditRefused why) → pure (Refused (Text.take refusalReasonBytes why))
+      -- A credit that is full for good: final, and not a fault of the call. Lua sees an ordinary error
+      -- naming the reason (a binding opted in to ordinary refusals), which it may catch and go on from;
+      -- nothing was reserved and nothing reached the provider.
+      OptInRefused refusal@(RequestCreditRefused _) → refuseOrdinarily refusal
       OptInRefused why → refuse why
       OptInBusy bank → pure (Unavailable bank)
       OptInAccepted found → do

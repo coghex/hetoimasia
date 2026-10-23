@@ -276,7 +276,6 @@ adNamespace fixture =
             pure $ case started of
               Started handle → [requestHandleValue "areq" handle, VNil]
               Unavailable bank → [VNil, VRecord [("code", VText "busy"), ("message", VText (renderBank bank))]]
-              Refused why → [VNil, VRecord [("code", VText "refused"), ("message", VText why)]]
           _ → pure []
     , -- A generic request: no handle is kept, and its result is retained by the model until taken or the instance ends.
       recoverableRefusals $
@@ -369,12 +368,12 @@ prelude =
   , "  local out = '?'"
   , "  if p.op == 'start' then"
   , "    local r, err = ad.start(p.endpoint or 'path', p.n or 0, p.offset)"
-  , "    if r then self.hs[key] = r out = 'started' else out = (err.code == 'busy' and 'busy:' or 'refused:') .. err.code end"
+  , "    if r then self.hs[key] = r out = 'started' else out = 'busy:' .. err.code end"
   , "  elseif p.op == 'pstart' then"
   , "    local ok, r, err = pcall(ad.start, p.endpoint or 'path', p.n or 0, p.offset)"
   , "    if not ok then out = 'error ' .. tostring(r)"
   , "    elseif r then self.hs[key] = r out = 'started'"
-  , "    else out = (err.code == 'busy' and 'busy:' or 'refused:') .. err.code .. ' ' .. err.message end"
+  , "    else out = 'busy:' .. err.code .. ' ' .. err.message end"
   , "  elseif p.op == 'gstart' then"
   , "    ad.gen_start(p.endpoint or 'path', p.n or 0)"
   , "    out = 'started'"

@@ -22,7 +22,6 @@ module Hetoimasia.LuaEngine.Modules.Wiring
   , moduleArguments
   , moduleAsk
   , startModule
-  , ModuleStart (..)
   , moduleArgumentCheck
     -- * Boot loads
   , BootRefusal (..)
@@ -352,44 +351,27 @@ identityCredit c identity =
 -- | Start a request for a module atomically: accepted, busy with nothing reserved, or refused for good.
 -- A new identity reserves its permanent place together with the request's own records, before the
 -- endpoint is handed anything and before a source is asked for; temporary pressure on the request or
--- result banks is the host's busy answer with no handle, read or partial reservation, and a full
--- identity cache is a refusal, decided by the credit in the same transaction.
-startModule ∷ HasCallStack ⇒ Coordinator → ModuleRequest → RequestContext → IO () → IO ModuleStart
+-- result banks is the host's busy answer with no handle, read or partial reservation. A cache that is
+-- full for good, or a coordinator that has closed, is refused by the identity credit in the same
+-- transaction, before any bank is asked: the host raises it as an ordinary Lua error (a binding that
+-- opted in to ordinary refusals) that the script may catch, never as busy.
+startModule ∷ HasCallStack ⇒ Coordinator → ModuleRequest → RequestContext → IO () → IO M1Start
 startModule c request context after = do
   ask <- moduleAsk c request
-  started <- startM1 (coordRequests c) ask context moduleEndpointName (moduleArguments request) after
-  pure $ case started of
-    M1Refused why -> StartRefused why
-    _ -> StartAnswered started
-
--- | What starting a request for a module came to: what the request host answered (accepted, or busy on a
--- temporary bank), or a permanent refusal. The identity cache never frees a place, so a place that is not
--- there is not there for good, and the credit that would have taken it says so in the transaction that
--- would have taken it: the answer is a refusal and never busy, whatever another thread did since the
--- argument check read the state. The argument check only reads.
-data ModuleStart
-  = -- | Accepted, or busy on a temporary bank: data the script may retry.
-    StartAnswered !M1Start
-  | -- | The identity cache is full for a new identity, or the coordinator has closed: the bounded reason.
-    -- Final.
-    StartRefused !Text
-  deriving (Eq, Show)
+  startM1 (coordRequests c) ask context moduleEndpointName (moduleArguments request) after
 
 -- | The argument check of a binding that builds the request from its copied arguments: the host's
--- permanent refusals first (role, phase, offset, ceiling, exhausted numbers), then this one's: a new
--- identity when the VM already holds every identity it may, or a coordinator that has closed. Each is
--- an ordinary Lua error before any admission, never busy. It only reads, reserves nothing and decides
--- nothing for good: a place that goes between this and the admission is refused by the credit that
--- would have taken it ('startModule'), so a later check of the same binding that rejects leaves
--- nothing behind.
+-- permanent refusals of the arguments and of what is visible about the caller (role, phase, offset,
+-- ceiling, exhausted numbers), each an ordinary Lua error before any admission, never busy. It reads
+-- nothing of the identity cache, reserves nothing and decides nothing for good: whether a new identity
+-- has a place is decided where the place is taken, by the identity credit of the admission, so a place
+-- that goes to another thread at any moment is still refused as what it is, and a later check of the
+-- same binding that rejects leaves nothing behind.
 moduleArgumentCheck ∷ Coordinator → ([Value] → ModuleRequest) → ArgumentCheck
 moduleArgumentCheck c requestOf owner values = do
   let request = requestOf values
   ask <- moduleAsk c request
-  hosts <- m1ArgumentCheck (coordRequests c) (const ask) owner values
-  case hosts of
-    Just why -> pure (Just why)
-    Nothing -> atomically (permanentRefusalSTM c (requestedKey request))
+  m1ArgumentCheck (coordRequests c) (const ask) owner values
 
 -- Boot loads --------------------------------------------------------------------------------------------
 
@@ -399,7 +381,8 @@ data BootRefusal
     BootClosed
   | -- | A new identity, and the VM holds all it may.
     BootCacheFull
-  | -- | Too many boot subscriptions are unsettled.
+  | -- | Too many boot subscriptions are unsettled, or the last place is held only by a request's reservation
+    -- that may still be given back: temporary, nothing was taken, ask again.
     BootBusy
   deriving (Eq, Show)
 

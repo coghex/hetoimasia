@@ -72,7 +72,8 @@ module Hetoimasia.Scripting.Lua.Internal.Binding
   , diagnosticLimits
   ) where
 
-import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, catch, evaluate, fromException, throwIO, toException, try)
+import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, evaluate, fromException, throwIO, toException, try)
+import qualified Control.Exception as Exception
 import Control.Monad (foldM, forM_, unless, when)
 import Data.Foldable (for_)
 import Data.List (nub)
@@ -85,7 +86,7 @@ import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure, withOp
 import Hetoimasia.Scripting.Lua.Internal.Boundary
 import Hetoimasia.Scripting.Lua.Internal.Call (reportFault)
 import Hetoimasia.Scripting.Lua.Internal.Callback (Handler, failedResults, installBinding)
-import Hetoimasia.Scripting.Lua.Internal.Fault (CallRefusal (CallRefusal), classify, fromApplication, luaComponent, raisedByApplication, renderFailure)
+import Hetoimasia.Scripting.Lua.Internal.Fault (CallRefusal (CallRefusal), OrdinaryCallRefusal (OrdinaryCallRefusal), classify, fromApplication, luaComponent, raisedByApplication, renderFailure)
 import Hetoimasia.Scripting.Lua.Internal.Marshal
 import Hetoimasia.Scripting.Lua.Internal.Registration
 import Hetoimasia.Scripting.Lua.Internal.Value
@@ -361,32 +362,41 @@ valueHandler boundary vm space binding state restore = do
                   -- the action, is a fault of the call and not the application's failure.
                   -- It is caught outside the mark the action's failures get, so the mark
                   -- never reaches it.
-                  produced ← compute `catch` \(CallRefusal why) → faulted (BindingRefused why) BindingRan
-                  let expected = bindingResults binding
-                  -- Bounded first: an action that built far more than the limits allow is
-                  -- refused after visiting what the limits allow, plus one.
-                  either (refuseResults 0 []) pure (checkLimits limits produced)
-                  when (length produced /= length expected) $
-                    refuseResults 0 [] (RuleArity (length expected) (length produced))
-                  forM_ (zip3 [1 ..] expected produced) $ \(index, schema, value) →
-                    case conformValue context schema value of
-                      Left (path, rule) → refuseResults index path rule
-                      Right () → pure ()
-                  encoded ← case encodeValues context limits produced of
-                    Left rule → refuseResults 0 [] rule
-                    Right bytes → pure bytes
-                  pushed ← pushValues state limits encoded (length produced)
-                  case pushed of
-                    Pushed → do
-                      -- Back to the script: what building its results allocated while the
-                      -- collector was held is paid now.
-                      serviceCollector state
-                      pure (NumResults (fromIntegral (length produced)))
-                    PushStatus status → do
-                      value ← renderFailure state entry
-                      lua_settop state entry
-                      faulted (ScriptFailed (classify status) value) BindingRan
-                    PushMalformed which → faulted (InternalError (Text.pack ("a result could not be built: " <> show which))) BindingRan
+                  outcome ←
+                    (Right <$> compute)
+                      `Exception.catches` [ Exception.Handler (\(CallRefusal why) → faulted (BindingRefused why) BindingRan)
+                                , -- The refusal that is final and not a fault: an ordinary Lua error for a binding
+                                  -- opted in to them, the fault of the call for any other.
+                                  Exception.Handler (\(OrdinaryCallRefusal why) → if ordinary then pure (Left why) else faulted (BindingRefused why) BindingRan)
+                                ]
+                  case outcome of
+                    Left why → raiseOrdinary why
+                    Right produced → do
+                      let expected = bindingResults binding
+                      -- Bounded first: an action that built far more than the limits allow is
+                      -- refused after visiting what the limits allow, plus one.
+                      either (refuseResults 0 []) pure (checkLimits limits produced)
+                      when (length produced /= length expected) $
+                        refuseResults 0 [] (RuleArity (length expected) (length produced))
+                      forM_ (zip3 [1 ..] expected produced) $ \(index, schema, value) →
+                        case conformValue context schema value of
+                          Left (path, rule) → refuseResults index path rule
+                          Right () → pure ()
+                      encoded ← case encodeValues context limits produced of
+                        Left rule → refuseResults 0 [] rule
+                        Right bytes → pure bytes
+                      pushed ← pushValues state limits encoded (length produced)
+                      case pushed of
+                        Pushed → do
+                          -- Back to the script: what building its results allocated while the
+                          -- collector was held is paid now.
+                          serviceCollector state
+                          pure (NumResults (fromIntegral (length produced)))
+                        PushStatus status → do
+                          value ← renderFailure state entry
+                          lua_settop state entry
+                          faulted (ScriptFailed (classify status) value) BindingRan
+                        PushMalformed which → faulted (InternalError (Text.pack ("a result could not be built: " <> show which))) BindingRan
 
           case action of
             SuspendAction suspend → do

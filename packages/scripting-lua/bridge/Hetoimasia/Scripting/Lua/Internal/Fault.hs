@@ -34,6 +34,7 @@ module Hetoimasia.Scripting.Lua.Internal.Fault
   , fromApplication
   , raisedByApplication
   , CallRefusal (..)
+  , OrdinaryCallRefusal (..)
     -- * Reading what a failed call left
   , classify
   , renderFailure
@@ -135,6 +136,23 @@ newtype CallRefusal = CallRefusal
   deriving (Eq, Show)
 
 instance Exception CallRefusal
+
+-- | The engine's own refusal of the call a binding's action is serving that Lua is to see as an
+-- /ordinary/ error, raised by the engine's API from inside that action, before it has any effect.
+--
+-- 'CallRefusal' is a fault of the call, which the script cannot hide. This is the refusal that is
+-- final but not a fault: for a binding opted in to ordinary refusals ('recoverableRefusals',
+-- 'withPrecondition', 'withArgumentCheck') the binding's handler catches it around the action and
+-- answers it as an ordinary Lua error with a bounded message, @binding: reason@, that @pcall@ catches
+-- and an invocation that caught it can go on from, recording nothing on the VM; for a binding that
+-- is not opted in it is a fault of the call, exactly as 'CallRefusal' is. Not exported by the public
+-- library, so application code cannot raise it.
+newtype OrdinaryCallRefusal = OrdinaryCallRefusal
+  { ordinaryReason ∷ Text
+  }
+  deriving (Eq, Show)
+
+instance Exception OrdinaryCallRefusal
 
 -- | How many bytes of a Lua error value are reported.
 --

@@ -683,6 +683,12 @@ data AdmitStop
 
 instance Exception AdmitStop
 
+-- | Raised to undo a credit that was only being asked whether it is full for good.
+data CreditProbed = CreditProbed
+  deriving (Show)
+
+instance Exception CreditProbed
+
 -- | What an opt-in admission came to.
 data OptIn
   = -- | Accepted: every bank reserved, the place assigned, nothing else done yet.
@@ -772,6 +778,15 @@ admitOptIn service requester endpoint ask = (OptInAccepted <$> attempt) `catchST
         StopRefused why → OptInRefused why
     stop' ∷ Exception e ⇒ e → STM a
     stop' = throwSTM
+    -- Whether the credit says it can never be had, with everything it wrote undone.
+    probeCredit ∷ Credit → STM (Maybe Text)
+    probeCredit credit =
+      ((creditReserve credit `orElse` pure False) *> throwSTM CreditProbed)
+        `catchSTM` \(caught ∷ SomeException) → case fromException caught of
+          Just CreditProbed → pure Nothing
+          Nothing → case fromException caught of
+            Just (CreditRefused why) → pure (Just why)
+            Nothing → throwSTM caught
     attempt = do
       st ← readTVar (psVar service)
       open ← ticksOpen (psTicks service)
@@ -790,6 +805,12 @@ admitOptIn service requester endpoint ask = (OptInAccepted <$> attempt) `catchST
       instanceNumber ← case requester of
         RequesterInstance found → pure found
         RequesterTask _ → stop' (StopRefused RequestNotAnInstance)
+      -- A credit that is full for good refuses before any bank is asked: waiting cannot help, so a full
+      -- temporary bank must not be the answer. Each credit is tried and undone, so nothing it wrote stays
+      -- and nothing is decided about a bank that may empty.
+      forM_ (admitCredits ask) $ \credit → do
+        refused ← probeCredit credit
+        forM_ refused $ \why → stop' (StopRefused (RequestCreditRefused why))
       let mine = length [() | held ← Map.elems (pHeld st), heldRequester held == requester]
           ledger = Map.size (pHeld st)
       when (mine >= admitPerInstance ask) (stop' (StopBank (BankInstanceRequests (admitPerInstance ask))))

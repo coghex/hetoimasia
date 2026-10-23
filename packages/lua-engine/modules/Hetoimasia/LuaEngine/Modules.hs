@@ -101,7 +101,6 @@ module Hetoimasia.LuaEngine.Modules
   , moduleArguments
   , moduleAsk
   , startModule
-  , ModuleStart (..)
   , moduleArgumentCheck
   , moduleCodes
 

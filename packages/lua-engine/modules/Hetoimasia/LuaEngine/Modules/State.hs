@@ -31,7 +31,6 @@ module Hetoimasia.LuaEngine.Modules.State
     -- * Reserving identities
   , reserveIdentitySTM
   , releaseIdentitySTM
-  , permanentRefusalSTM
   , reservedForLoaderSTM
     -- * Requests
   , Accepted (..)
@@ -600,14 +599,16 @@ failureFor st job fault =
 -- Requests ---------------------------------------------------------------------------------------------
 
 -- | The room for a new identity, taken in the transaction that admits the request that names it, which
--- is where the permanent decision is made: with room, the place is held; without, the credit says
--- whether waiting could help. The identity cache never frees a place, so a full cache, or a
--- coordinator that has closed, is final and the credit raises 'CreditRefused' (the host answers a
--- refusal, never busy); the argument check only reads, and cannot be raced past a decision it did not
--- make. The room is permanent: the identity is the VM's for its life, and the reservation is given
+-- is where the decision is made. With room, the place is held. Without, the cache is either full for
+-- good, when the VM's permanent entries (pending, evaluating, ready and failed jobs) fill it, or the
+-- room is held only by other admissions' reservations that can still be given back, when it is not.
+-- The first is final and the credit raises 'CreditRefused' (the host raises an ordinary Lua error, never
+-- busy, before any bank is asked); the second is temporary and the credit answers 'False' (busy, with
+-- nothing reserved). A coordinator that has closed is final. The argument check only reads. The room
+-- is permanent once a job takes it: the identity is the VM's for its life, and a reservation is given
 -- back only if the admission is taken back before the endpoint made the job. An identity that is held
--- already needs no room: the credit then holds nothing and gives nothing back, and the request joins
--- the job that exists. A reservation another request made for the identity is shared, counted.
+-- already needs no room: the credit holds nothing and gives nothing back, and the request joins the job
+-- that exists. A reservation another request made for the identity is shared, counted.
 reserveIdentitySTM ∷ Coordinator → ExportIdentity → STM Bool
 reserveIdentitySTM c identity = do
   st <- readState c
@@ -616,8 +617,9 @@ reserveIdentitySTM c identity = do
     (_, Just held) -> True <$ writeState c st {csPromised = Map.insert identity (held + 1) (csPromised st)}
     _
       | csPhase st /= Open -> throwSTM (CreditRefused closedReason)
+      | Map.size (csJobs st) >= limitIdentities (coordLimits c) -> throwSTM (CreditRefused (fullReason c))
       | identitiesUsed st < limitIdentities (coordLimits c) -> True <$ writeState c st {csPromised = Map.insert identity 1 (csPromised st)}
-      | otherwise -> throwSTM (CreditRefused (fullReason c))
+      | otherwise -> pure False
 
 closedReason ∷ Text
 closedReason = "the module loader has stopped and takes no more requests"
@@ -637,20 +639,6 @@ releaseIdentitySTM c identity = \case
           | n <= 1 = Nothing
           | otherwise = Just (n - 1)
     writeState c st {csPromised = Map.update giveBack identity (csPromised st)}
-
--- | A permanent reason the request would be refused: the coordinator has closed, or the identity is
--- new and the VM already holds every identity it may. Reads only. A pending or finished identity
--- needs no slot, so a full cache still answers lookups and joins.
-permanentRefusalSTM ∷ Coordinator → ContentKey → STM (Maybe Text)
-permanentRefusalSTM c key = do
-  st <- readState c
-  pure $
-    if csPhase st == Closed
-      then Just closedReason
-      else
-        if Map.member (moduleIdentity key) (csJobs st) || Map.member (moduleIdentity key) (csPromised st) || identitiesUsed st < limitIdentities (coordLimits c)
-          then Nothing
-          else Just (fullReason c)
 
 -- | How many identities the application has promised room for that the loader holds no record of,
 -- other than this one: the loader's 'loaderReserved'.
@@ -765,7 +753,9 @@ acceptBoot c key = do
       | csPhase st == Closed -> pure BootRefusedClosed
       | otherwise -> case Map.lookup identity (csJobs st) of
           Nothing
-            | not (Map.member identity (csPromised st)) && identitiesUsed st >= limitIdentities (coordLimits c) -> pure BootRefusedFull
+            | not (Map.member identity (csPromised st)) && Map.size (csJobs st) >= limitIdentities (coordLimits c) -> pure BootRefusedFull
+            -- The room is held only by admissions' reservations, which can still be given back: ask again.
+            | not (Map.member identity (csPromised st)) && identitiesUsed st >= limitIdentities (coordLimits c) -> pure BootRefusedBusy
             | csBootWaiters st >= limitBootWaiters (coordLimits c) -> pure BootRefusedBusy
             | otherwise -> do
                 var <- newTVar Nothing
