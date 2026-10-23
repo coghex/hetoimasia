@@ -64,6 +64,9 @@ cache = describe "the identity cache" $ do
         command session vm "x" "start" "k3" [] (Just (fetch "i3.lua"))
         awaitNote session "x start k3 started"
         awaitCounts vm (\c → jobsReady c == 2)
+        -- The third read is held at its gate: it has been admitted, which does not say that a worker has
+        -- entered the reader, so the baseline waits for all three accepted reads to have begun.
+        awaitStarted (ssProbe session) 3
         readsBefore ← readsStarted (ssProbe session)
         command session vm "x" "pstart" "k4" [] (Just (fetch "i4.lua"))
         line ← lineStartingWith session "x pstart k4 error"
@@ -127,6 +130,8 @@ pressure = describe "temporary pressure" $
         awaitHistory session (\seen → length (filter (Text.isPrefixOf "x start") seen) == 4)
         history session >>= \seen → length (filter (Text.isInfixOf "busy:busy:") seen) `shouldBe` 3
         counts' vm >>= \c → (jobsHeld c, waitersHeld c, promisedHeld c) `shouldBe` (1, 1, 0)
+        -- The accepted read is held at its gate; the admission does not say a worker has entered the reader.
+        awaitStarted (ssProbe session) 1
         readsStarted (ssProbe session) >>= (`shouldBe` 1)
         -- The permanent cache has two places left, so none was taken by the busy answers.
         command session vm "y" "start" "k2" [] (Just (fetch "i2.lua"))
