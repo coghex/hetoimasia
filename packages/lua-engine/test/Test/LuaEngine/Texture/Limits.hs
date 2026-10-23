@@ -28,6 +28,10 @@ spec = describe "limits" $ do
 keyOf ∷ Int → Text
 keyOf = Text.pack . ("k" <>) . show
 
+-- | The same answer for a load started under another key.
+withKey ∷ Text → Text → Text
+withKey line key = Text.replace " start z " (" start " <> key <> " ") line
+
 -- | What a refused load answers when a bank is named.
 busy ∷ Text → Text → Text
 busy name bank = name <> " start z busy:busy:request capacity is not available: " <> bank
@@ -45,6 +49,8 @@ fill session vm name n = forM_ [0 .. n - 1] $ \i → started session vm name (ke
 -- and the refusal is no failure of the instance.
 refusing ∷ Session → Vm → Text → Text → IO ()
 refusing session vm name bank = do
+  -- Reads accepted earlier are inside the reader, so no snapshot can see one move from queued to active.
+  awaitReadsEntered session
   pipelineBefore ← pipelineNow session
   owner ← ownerNow vm name
   sessionBefore ← sessionNow session
@@ -135,14 +141,17 @@ banks = describe "each bank, independently full" $ do
       closeGate (ssProbe session) "b.png"
       started session vm "i" "k0" "b.png"
       forM_ [1 .. 3] $ \i → started session vm "i" (keyOf i) "a.png"
-      loadAs session vm "i" "z" "a.png" >>= (`shouldBe` busy "i" "the provider has no room in texture bytes")
+      loadAs session vm "i" "z1" "a.png" >>= (`shouldBe` busy "i" "the provider has no room in texture bytes" `withKey` "z1")
+      -- k0's read is inside the reader (a cancel before that could withdraw it unissued and return its charge).
+      awaitReadsEntered session
       command session vm "i" "cancel" "k0"
       awaitNote session "i cancel k0 cancelled"
       command session vm "i" "take" "k0"
       awaitNote session "i take k0 {status=cancelled}"
       -- Consuming the cancellation is not the retirement of the read a worker has started.
       ownerNow vm "i" >>= (`shouldBe` OwnerReading 4 16384)
-      loadAs session vm "i" "z" "a.png" >>= (`shouldBe` busy "i" "the provider has no room in texture bytes")
+      -- A fresh key: the helper answers the oldest line of a key, so a reused key would read the first answer.
+      loadAs session vm "i" "z2" "a.png" >>= (`shouldBe` busy "i" "the provider has no room in texture bytes" `withKey` "z2")
       openGate (ssProbe session) "b.png"
       awaitOwner vm "i" (== OwnerReading 3 12288)
       started session vm "i" "y" "a.png"

@@ -1404,7 +1404,9 @@ handoff tp jid level width height = do
     (Nothing, effects) → runEffects tp effects
     (Just key, _) → do
       let upload = Upload {uploadSource = renderKey key, uploadWidth = width, uploadHeight = height, uploadTexels = level}
-      issued ← tryWithContext @SomeException (backendUpload (tpBackend tp) upload (sinkFor tp jid))
+      -- Evaluated inside the guard, for the same reason: a work record that throws when it is first
+      -- used is the backend raising as it was handed the level.
+      issued ← tryWithContext @SomeException (backendUpload (tpBackend tp) upload (sinkFor tp jid) >>= evaluate)
       case issued of
         Right work → do
           effects ← atomically $ do
@@ -1713,10 +1715,15 @@ releaseCellBy by cell = mask_ $ do
       CellAdopted | by == ByLease → True <$ writeTVar (cellState cell) CellClaimed
       _ → pure False
   when claimed $ do
-    outcome ← tryWithContext @SomeException (textureRelease (cellTexture cell))
-    atomically . writeTVar (cellState cell) $ case outcome of
+    -- Evaluated inside the guard: an action the backend returns that throws when it is looked at is
+    -- the release failing, now, and not an exception loose in whoever inspects the cell later.
+    outcome ← tryWithContext @SomeException (textureRelease (cellTexture cell) >>= evaluate)
+    -- The state is built and forced before it is stored: a lazily built state would throw in whoever
+    -- inspects the cell next, repeatedly, against unchanged state.
+    recorded ← evaluate $ case outcome of
       Right poll → CellReleasing poll
       Left failure → CellFailed failure
+    atomically (writeTVar (cellState cell) recorded)
     either rethrowIO (\_ → pure ()) outcome
 
 -- Closing and draining --------------------------------------------------------------------------------

@@ -152,7 +152,7 @@ spec = describe "the pipeline's end" $ do
     -- and that is fatal to the owner, as every cleanup failure is.
     show ownerFailure `shouldSatisfy` containsText "could not release the texture"
 
-  forM_ [("throws", PollThrows, "reading threw"), ("answers that the retirement failed", PollFails, "could not retire")] $ \(label, mode, expected) →
+  forM_ [("throws", PollThrows, "reading threw", "retirement failed"), ("answers that the retirement failed", PollFails, "could not retire", "retirement failed"), ("is a lazy error when the release returns it", PollLazy, "lazy reading", "lazy reading")] $ \(label, mode, expected, scopeText) →
     it ("does not retry a retirement reading that " <> label <> ": the failure is recorded once, the charge stays held and the drain goes on") $ do
       ExceptionWithContext _ ownerFailure ← fatalSession (config small layout) $ \session _ runtime → do
         seen ← newIORef Nothing
@@ -179,7 +179,7 @@ spec = describe "the pipeline's end" $ do
               )
         -- The scope ended (it did not loop on the reading) and raised the recorded failure.
         case outcome of
-          Left (ExceptionWithContext _ failure) → show failure `shouldSatisfy` containsText "retirement failed"
+          Left (ExceptionWithContext _ failure) → show failure `shouldSatisfy` containsText scopeText
           Right () → expectationFailure "the scope should have raised the failed retirement"
         -- The texture is not reported reclaimed: its charge is still held.
         readIORef seen >>= maybe (expectationFailure "the body never ran") (\nested → sessionNow nested `shouldReturn` 128)

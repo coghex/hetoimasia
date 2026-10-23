@@ -99,6 +99,7 @@ module Test.LuaEngine.Texture.Support
   , awaitGate
   , releaseGate
   , directRead
+  , awaitReadsEntered
   , setRaceClose
   , uploadFor
   , grantOne
@@ -617,6 +618,7 @@ registerTexture fake held = do
                 PollNormal → readTVar state
                 PollThrows → throwSTM (userError "the fake backend's reading threw")
                 PollFails → pure (ProviderFailed (toException (userError "the fake backend could not retire the texture")))
+                PollLazy → error "the fake backend's lazy reading"
           }
   answer ← sinkReady (heldSink held) texture
   pure (identity, answer)
@@ -675,6 +677,8 @@ data PollMode
     PollThrows
   | -- | The reading answers that the retirement failed.
     PollFails
+  | -- | The release returns a reading that throws when it is first looked at.
+    PollLazy
   deriving (Eq, Show)
 
 setPollMode ∷ Fake → PollMode → IO ()
@@ -929,6 +933,14 @@ openGates session = do
 -- | Wait until a script is inside the call that holds this gate.
 awaitGate ∷ Session → Text → IO ()
 awaitGate session name = gateIn (ssEntered session) name >>= readMVar
+
+-- | Wait until every read the pipeline has started is inside the reader: a read is queued in the pool
+-- or entered, and which one a snapshot sees depends on the workers' scheduling.
+awaitReadsEntered ∷ Session → IO ()
+awaitReadsEntered session = atomically $ do
+  entered ← length <$> readTVar (prStarted (ssProbe session))
+  reading ← pipelineReading (ssPipeline session)
+  unless (entered >= readingReading reading) retry
 
 -- | Close each request's owner right after its argument check passes, from now on.
 setRaceClose ∷ Session → Bool → IO ()

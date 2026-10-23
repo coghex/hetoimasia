@@ -58,6 +58,8 @@ lanes = describe "the lanes" $ do
       admitDriver session vm "i"
       closeGate (ssProbe session) "a.png"
       started session vm "i" "k0" "a.png"
+      -- The first read is inside the reader before the second request starts: entry order is then known.
+      awaitStarted (ssProbe session) 1
       started session vm "i" "k1" "b.png"
       started session vm "i" "k2" "c.png"
       started session vm "i" "k3" "d.png"
@@ -106,6 +108,7 @@ priority = describe "the shared pool's priority" $
       let probe = ssProbe session
       mapM_ (closeGate probe) ["c.png", "d.png", "b.png"]
       first ← directRead session OrdinaryRead "c.png"
+      awaitStarted probe 1
       second ← directRead session OrdinaryRead "d.png"
       awaitStarted probe 2
       -- Both workers are busy: the texture's read waits in the pool's queue, then a dependency read

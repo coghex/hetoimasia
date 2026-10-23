@@ -47,6 +47,7 @@ stages = describe "at each stage" $ do
       closeGate (ssProbe session) "a.png"
       forM_ ["k0", "k1", "k2"] $ \key → started session vm "i" key "a.png"
       awaitPipeline session ((== 1) . readingPending)
+      awaitStarted (ssProbe session) 2
       cancelled session vm "i" "k2"
       awaitPipeline session (\reading → readingPending reading == 0 && readingSettled reading == 1)
       readsStarted (ssProbe session) `shouldReturn` 2
