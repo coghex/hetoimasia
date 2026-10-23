@@ -205,6 +205,106 @@ spec = describe "close, bootstrap and the owner's end, at every seam" $ do
     problems ← atomically (leaked fake)
     problems `shouldBe` []
 
+  it "waits for the table's evidence of a cancelled registration's retirement without asking again until the owner progresses" $ do
+    fake ← newFake defaultFakeConfig
+    -- However the example ends, the batch's version ends too: the scope's drain waits for it.
+    withRigUnchecked fake $ \rig → (`finally` setVersionHolders fake 0) $ do
+      hold fake HoldRegister
+      probe ← newProbe
+      work ← submit rig probe 2 2 255
+      awaitPhase rig "registering"
+      awaitFake fake ((== 0) . readingActsQueued)
+      -- From here the owner runs only what the example grants, one action at a time.
+      hold fake HoldOwner
+      hold fake HoldReclaim
+      baseline ← eventCount fake "table read"
+      setVersionHolders fake 1
+      uploadCancel work
+      release fake HoldRegister
+      awaitFake fake ((== 1) . readingActsQueued)
+      grantOwner fake 1
+      awaitEvent fake "released"
+      -- The release ran; the job asks the table once, whether its slot is still mapped by a batch's version.
+      awaitFake fake ((== 1) . readingActsQueued)
+      grantOwner fake 1
+      -- The answer says it is. A second job is a barrier in the pump's order: the pump takes the first job's step
+      -- before it looks at this one, so when this one has been given its allocation the first has nothing more to
+      -- do. A first job that asked again, wake or no wake, has queued that ask before it.
+      other ← newProbe
+      _ ← submit rig other 2 2 255
+      awaitBackend rig (elem "allocating" . readingJobPhases)
+      queued ← atomically (readingActsQueued <$> readFake fake)
+      queued `shouldBe` 1
+      eventCount fake "table read" `shouldReturn` baseline + 1
+      -- The owner's progress is what lets it ask again: the batch's version ends, and the retirement is proved.
+      setVersionHolders fake 0
+      release fake HoldReclaim
+      release fake HoldOwner
+      _ ← awaitTerminal probe
+      pure ()
+
+  it "ends a retirement wait with the owner's end although no progress follows it" $ do
+    fake ← newFake defaultFakeConfig
+    outcome ← try @SomeException . withRigUnchecked fake $ \rig → (`finally` setVersionHolders fake 0) $ do
+      hold fake HoldRegister
+      probe ← newProbe
+      work ← submit rig probe 2 2 255
+      awaitPhase rig "registering"
+      awaitFake fake ((== 0) . readingActsQueued)
+      hold fake HoldOwner
+      hold fake HoldReclaim
+      baseline ← eventCount fake "table read"
+      setVersionHolders fake 1
+      uploadCancel work
+      release fake HoldRegister
+      awaitFake fake ((== 1) . readingActsQueued)
+      grantOwner fake 1
+      awaitEvent fake "released"
+      awaitFake fake ((== 1) . readingActsQueued)
+      grantOwner fake 1
+      awaitEventCount fake "table read" (baseline + 1)
+      -- The job waits for evidence nobody will now produce: the owner is gone, and gone without any change of the
+      -- model a wake watches.
+      endOwner fake "the device was lost"
+      _ ← awaitTerminal probe
+      awaitBackend rig ((== 0) . readingJobs)
+    -- A retirement nobody could prove is the scope's failure: nothing is reported reclaimed.
+    scopeRaised outcome
+
+  it "waits for the table's evidence of a released texture's retirement without asking again until the owner progresses" $ do
+    fake ← newFake defaultFakeConfig
+    withRigUnchecked fake $ \rig → (`finally` setVersionHolders fake 0) $ do
+      first ← newProbe
+      _ ← submit rig first 2 2 255
+      _ ← awaitTerminal first
+      keeper ← delivered first
+      second ← newProbe
+      _ ← submit rig second 2 2 255
+      _ ← awaitTerminal second
+      barrier ← delivered second
+      hold fake HoldOwner
+      hold fake HoldReclaim
+      setVersionHolders fake 1
+      baseline ← eventCount fake "table read"
+      _ ← textureRelease keeper
+      awaitFake fake ((== 1) . readingReleasesQueued)
+      grantOwner fake 1
+      awaitEvent fake "released"
+      awaitFake fake ((== 1) . readingActsQueued)
+      grantOwner fake 1
+      awaitEventCount fake "table read" (baseline + 1)
+      -- The answer says a batch's version still maps the slot. A second texture released now is a barrier in the
+      -- pump's order (textures are taken in the order they were made): when its release is queued, the first
+      -- texture has nothing more to do. One that asked again, wake or no wake, has queued that ask before it.
+      _ ← textureRelease barrier
+      awaitFake fake ((== 1) . readingReleasesQueued)
+      queued ← atomically (readingActsQueued <$> readFake fake)
+      queued `shouldBe` 0
+      eventCount fake "table read" `shouldReturn` baseline + 1
+      setVersionHolders fake 0
+      release fake HoldReclaim
+      release fake HoldOwner
+
   where
     -- The scope itself failed, with the backend's failure: not the example's own assertion.
     scopeRaised = \case

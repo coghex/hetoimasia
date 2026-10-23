@@ -32,6 +32,7 @@ module Test.LuaEngine.Graphics.Fake
   , setStanding
   , endOwner
   , setVersionHolders
+  , grantOwner
   , progress
 
     -- * Readings
@@ -166,6 +167,8 @@ data Fake = Fake
   , fMarked ∷ !(TVar (Set TextureRef))
   , fInjected ∷ !(TVar [Injection])
   , fNextGeneration ∷ !(TVar Word32)
+  , fGrants ∷ !(TVar Int)
+    -- ^ Actions the owner may run although 'HoldOwner' is on: one at a time, for an example that counts them.
   }
 
 newFake ∷ FakeConfig → IO Fake
@@ -188,6 +191,7 @@ newFake cfg =
     <*> newTVarIO Set.empty
     <*> newTVarIO []
     <*> newTVarIO 1
+    <*> newTVarIO 0
 
 -- Holds and injections ---------------------------------------------------------------------------------------
 
@@ -225,13 +229,17 @@ endOwner fake why = atomically $ do
     queued ← readTVar lane
     writeTVar lane []
     forM_ queued $ \pending → pendingRefuse pending (PortEnded why)
-  bump fake
+  -- No 'bump': the owner's end is readiness, not a change of the model a wake watches.
 
 -- | The owner recorded progress that no variable of the backend's shows: a completion, a disposal.
 progress ∷ Fake → IO ()
 progress fake = atomically (bump fake)
 
 -- | How many batches hold a table version that maps a released slot.
+-- | Let a held owner run this many more actions, in the order they were queued, and no more.
+grantOwner ∷ Fake → Int → IO ()
+grantOwner fake count = atomically (modifyTVar' (fGrants fake) (+ count))
+
 setVersionHolders ∷ Fake → Int → IO ()
 setVersionHolders fake count = atomically (writeTVar (fHolders fake) count >> bump fake)
 
@@ -380,7 +388,10 @@ fakePort fake =
             then pure (Left PortFull)
             else do
               cell ← newTVar Nothing
-              let finish outcome = writeTVar cell (Just outcome) >> bump fake
+              -- Queueing an action and answering it are not progress of the owner's model (the real port's wake is the
+              -- model's change, and the model does not hold its action queue): a wait that woke on its own ask's
+              -- answer would ask again at once, forever.
+              let finish outcome = writeTVar cell (Just outcome)
                   pending =
                     Pending
                       { pendingRun = \device → do
@@ -390,7 +401,6 @@ fakePort fake =
                       , pendingRefuse = finish . NotRun
                       }
               writeTVar lane (queued <> [pending])
-              bump fake
               pure (Right (Submitted (readTVar cell)))
 
 admitUpload ∷ Fake → Int → ByteString.ByteString → IO (Either AdmissionRefusal Int)
@@ -471,6 +481,7 @@ deviceFor fake =
                   bump fake
                   pure (Right (Registration (TextureRef slot generation) slot))
     , deviceTable = do
+        noteEvent fake "table read"
         raising ← atomically (takeInjection fake (\case RaiseTable → Just (); _ → Nothing))
         when (raising == Just ()) (throwIO (userError "injected: reading the table raised"))
         atomically (TableReading <$> readTVar (fBound fake) <*> readTVar (fRetiring fake))
@@ -527,15 +538,19 @@ ownerLoop fake = do
       bound ← readTVar (fBound fake)
       retiring ← readTVar (fRetiring fake)
       holders ← readTVar (fHolders fake)
+      grants ← readTVar (fGrants fake)
       states ← traverse (\(ticket, upload) → (,) (ticket, upload) <$> readTVar (upState upload)) (Map.toList uploads)
-      let canRun = standing == Running && not (on HoldOwner)
+      let canRun = standing == Running && (not (on HoldOwner) || grants > 0)
+          spendGrant = when (on HoldOwner) (writeTVar (fGrants fake) (grants - 1))
       case () of
         _
           | canRun, pending : rest ← acts → do
               writeTVar (fActs fake) rest
+              spendGrant
               pure (pendingRun pending (deviceFor fake))
           | canRun, not (on HoldAdoption), pending : rest ← releases → do
               writeTVar (fReleases fake) rest
+              spendGrant
               pure (pendingRun pending (deviceFor fake))
           | not (on HoldUploadStart), Just (ticket, upload) ← find' TicketQueued states → pure . atomically $ do
               writeTVar (upState upload) TicketUploading

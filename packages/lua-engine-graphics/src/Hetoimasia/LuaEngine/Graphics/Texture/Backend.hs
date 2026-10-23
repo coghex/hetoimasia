@@ -608,14 +608,28 @@ ownerEnded backend why = do
 ending ∷ State image ticket → Job image ticket → Bool
 ending st job = jCancel job || isJust (jFailure job) || sLifecycle st /= Running'
 
+-- | Whether a job's phase is part of its disposal: what it made is being taken apart and waited for.
+disposing ∷ Phase ticket → Bool
+disposing = \case
+  PDiscarding _ → True
+  PReleasing _ → True
+  PRetiring → True
+  PRetireChecking _ _ → True
+  PSettled → True
+  PEmitting → True
+  _ → False
+
 -- | One job's next step, if it has one.
 jobStep ∷ ∀ image ticket. Backend image ticket → Standing → JobId → Job image ticket → STM (Maybe Step)
 jobStep backend standing jid job = do
   st ← readTVar (bState backend)
   waiting ← case jWait job of
     Nothing → pure False
-    -- A job being ended waits for nothing: its cancellation is what it was waiting for.
-    Just _ | ending st job → pure False
+    -- A job being ended no longer waits for the progress that would have let it go on: its cancellation is what it
+    -- was waiting for, and the wait is dropped on the transition into disposal. A wait that is part of the disposal
+    -- (the table's evidence of a retirement) is the evidence it waits for and is never skipped; the owner's end,
+    -- which no progress will follow, ends it.
+    Just _ | isJust (sEnded st) || (ending st job && not (disposing (jPhase job))) → pure False
     Just wake → (wake >> pure False) `orElse` pure True
   if waiting
     then pure Nothing
