@@ -44,8 +44,8 @@ spec = describe "a shared module job" $ do
         reading ← counts vm
         (jobsHeld reading, waitersHeld reading, readsBegun reading) `shouldBe` (1, 2, 1)
         openGate (ssProbe session) "a.lua"
-        command session vm "a" "keep" "k" [("name", VText "ka")] Nothing
-        command session vm "b" "keep" "k" [("name", VText "kb")] Nothing
+        command session vm "a" "settled_keep" "k" [("name", VText "ka")] Nothing
+        command session vm "b" "settled_keep" "k" [("name", VText "kb")] Nothing
         awaitNote session "a keep k {status=success,value=table(a)}"
         awaitNote session "b keep k {status=success,value=table(a)}"
         command session vm "a" "same" "ka" [("other", VText "kb")] Nothing
@@ -63,8 +63,8 @@ spec = describe "a shared module job" $ do
         command session vm "a" "start" "k2" [] (Just (fetch "a.lua"))
         command session vm "b" "start" "k3" [] (Just (fetch "a.lua"))
         awaitNote session "b start k3 started"
-        command session vm "a" "env" "k1" [("name", VText "e1")] Nothing
-        command session vm "a" "env" "k2" [("name", VText "e2")] Nothing
+        command session vm "a" "settled_env" "k1" [("name", VText "e1")] Nothing
+        command session vm "a" "settled_env" "k2" [("name", VText "e2")] Nothing
         awaitNote session "a env k2 {status=success,value=table(a)}"
         command session vm "a" "same" "e1" [("other", VText "e2")] Nothing
         awaitNote session "a same e1 false"
@@ -72,7 +72,7 @@ spec = describe "a shared module job" $ do
         command session vm "a" "ptake" "k1" [] Nothing
         line ← lineStarting session "a ptake k1 error"
         line `shouldSatisfy` Text.isInfixOf "k1"
-        command session vm "b" "take" "k3" [] Nothing
+        command session vm "b" "settled_take" "k3" [] Nothing
         awaitNote session "b take k3 {status=success,value=table(a)}"
         readsStarted (ssProbe session) >>= (`shouldBe` 1)
         evalsOf session >>= (`shouldBe` ["eval a"])
@@ -85,8 +85,8 @@ spec = describe "a shared module job" $ do
         command session vm "a" "start" "k" [] (Just (fetch "cyc.lua"))
         command session vm "b" "start" "k" [] (Just (fetch "cyc.lua"))
         awaitNote session "b start k started"
-        command session vm "a" "keep" "k" [("name", VText "ka")] Nothing
-        command session vm "b" "keep" "k" [("name", VText "kb")] Nothing
+        command session vm "a" "settled_keep" "k" [("name", VText "ka")] Nothing
+        command session vm "b" "settled_keep" "k" [("name", VText "kb")] Nothing
         awaitNote session "b keep k {status=success,value=table(cyc)}"
         command session vm "a" "is_self" "ka" [("field", VText "self")] Nothing
         awaitNote session "a is_self ka true"
@@ -147,8 +147,8 @@ spec = describe "a shared module job" $ do
         command session vm "a" "start" "ku" [] (Just (fetch "util.lua"))
         command session vm "a" "start" "k1" [] (Just (fetch "a.lua"))
         awaitCounts vm (\c → jobsReady c == 2)
-        command session vm "a" "keep" "ku" [("name", VText "util")] Nothing
-        command session vm "a" "keep" "k1" [("name", VText "ta")] Nothing
+        command session vm "a" "settled_keep" "ku" [("name", VText "util")] Nothing
+        command session vm "a" "settled_keep" "k1" [("name", VText "ta")] Nothing
         awaitNote session "a keep k1 {status=success,value=table(a)}"
         command session vm "a" "call_same" "util" [("field", VText "lookup"), ("text", VText "a.lua"), ("other", VText "ta")] Nothing
         awaitNote session "a call_same util true"

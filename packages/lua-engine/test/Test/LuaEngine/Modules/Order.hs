@@ -74,7 +74,7 @@ spec = describe "evaluation order" $ do
             command session other "o" "start" "k9" [] (Just (fetch "u2.lua"))
             awaitNote session "o start k9 started"
             awaitCounts other (\c → jobsReady c == 1)
-            command session other "o" "take" "k9" [] Nothing
+            command session other "o" "settled_take" "k9" [] Nothing
             awaitNote session "o take k9 {status=success,value=table(u2)}"
             -- The waiting VM's stop is served: its instance shuts down while the source is held.
             stopInstance session vm "z"

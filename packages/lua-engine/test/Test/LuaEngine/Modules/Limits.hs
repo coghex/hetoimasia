@@ -5,8 +5,9 @@
 -- reserved, and an accepted load that meets a limit fails as a load, with what it completed kept.
 module Test.LuaEngine.Modules.Limits (spec) where
 
+import Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, tryPutMVar)
-import Control.Exception (finally, try)
+import Control.Exception (SomeException, finally, throwIO, try)
 import Control.Concurrent.STM (atomically)
 import Control.Monad (forM_, void)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
@@ -15,7 +16,7 @@ import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (CountLimit (ModuleChainDepth, ModuleIdentitiesPerVm, RequestsPerInstance), Profile)
 import Hetoimasia.Scripting.Lua.Admission (Credit (..), CreditEnd (..), CreditRefused (..))
 import Hetoimasia.Scripting.Lua.Loading (LoaderHooks (..), LoaderPlan (..))
-import Hetoimasia.Scripting.Lua.Owner (SourceAnswer (..), SourceSupplier (..))
+import Hetoimasia.Scripting.Lua.Owner (ExportIdentity, SourceAnswer (..), SourceSupplier (..))
 import Hetoimasia.Scripting.Lua.Provider (RequestEndpoint (..))
 import Hetoimasia.Scripting.Lua.Value (Value (VText))
 import Test.Hspec
@@ -172,7 +173,7 @@ loads = describe "an accepted load that meets a limit" $ do
         readsBefore ← readsStarted (ssProbe session)
         command session vm "z" "start" "k3" [] (Just (fetch "d1.lua"))
         awaitNote session "z start k3 started"
-        command session vm "z" "ready" "k3" [] Nothing
+        command session vm "z" "settled_ready" "k3" [] Nothing
         awaitNote session "z ready k3 true"
         readsStarted (ssProbe session) >>= (`shouldBe` readsBefore)
 
@@ -263,7 +264,7 @@ loads = describe "an accepted load that meets a limit" $ do
           putMVar gate ()
           awaitNote session "x start k1 started"
           awaitBootOutcome ticket >>= (`shouldBe` BootReady)
-          command session vm "x" "ready" "k1" [] Nothing
+          command session vm "x" "settled_ready" "k1" [] Nothing
           awaitNote session "x ready k1 true"
           counts' vm >>= \c → (jobsHeld c, promisedHeld c, jobsReady c) `shouldBe` (3, 0, 3)
           -- Counted once: a second new module is refused as a full cache.
@@ -447,16 +448,55 @@ refusals = describe "refusals told apart by what can change" $ do
             _ → expectationFailure "a ready module should stay readable after the stop"
         counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (1, 0)
 
-  it "answers the loader's ask for a source with a failure once it has closed, so that a chain never waits for a source that will not come" $
+  it "answers the loader's ask for a source with a failure once it has closed, and the interest it took is one the loader ends, once" $
     withSession tiny (2, 8) realReader layout $ \session _ runtime →
       withVm session runtime "ui" (defaultOptions OnArrival) $ \vm → do
         closeModuleCoordinator (vmCoordinator vm)
         -- The supplier the coordinator gave the loader, asked as the loader would ask for a dependency.
-        answer ← supplierAcquire (planSupplier (coordinatorPlan (vmCoordinator vm))) (moduleIdentity (key' session "i1.lua"))
+        let supplier = planSupplier (coordinatorPlan (vmCoordinator vm))
+            identity = moduleIdentity (key' session "i1.lua")
+        answer ← supplierAcquire supplier identity
         case answer of
           SourceFailure why → why `shouldSatisfy` Text.isInfixOf "stopped"
           other → expectationFailure ("expected the ask answered with a failure, found " <> show other)
-        counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (0, 0)
+        -- The failure is an interest like any other: it is held until the loader ends it, once.
+        counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (1, 0)
+        supplierRelease supplier identity
+        supplierRelease supplier identity `shouldThrow` anyException
+
+  it "lets a chain that asks for a dependency after the coordinator closed fail with the failure it is, and ends the interest the loader was answered, without a defect" $
+    withSession tiny (2, 8) realReader layout $ \session _ runtime → do
+      released ← newChan
+      withVm session runtime "ui" (defaultOptions OnArrival) {optPlan = reportingReleases released} $ \vm → do
+        admitDriver session vm "x"
+        command session vm "x" "start" "k1" [] (Just (fetch "held.lua"))
+        -- The module is running, with its dependency still to ask for.
+        awaitGate session "held"
+        closeModuleCoordinator (vmCoordinator vm)
+        releaseGate session "held"
+        -- The loader was answered the failure for d1.lua, and ended that interest: the release it made
+        -- reached the coordinator, which held it.
+        awaitRelease released (moduleIdentity (key' session "d1.lua")) >>= (`shouldSatisfy` either (const False) (const True))
+        counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (2, 0)
+        -- The owner is whole: it still serves the next hook.
+        command session vm "x" "lookup" "k0" [("path", VText "d2.lua")] Nothing
+        awaitNote session "x lookup k0 not_ready #d2.lua"
+
+  it "lets a root the loader admits after the coordinator closed fail with the failure it is, and ends the interest the loader was answered, without a defect" $
+    withSession tiny (2, 8) realReader layout $ \session _ runtime → do
+      released ← newChan
+      withVm session runtime "ui" (defaultOptions OnArrival) {optPlan = reportingReleases released} $ \vm → do
+        admitDriver session vm "x"
+        -- The owner is held inside a hook, so that the root a boot load submits is not yet admitted.
+        command session vm "x" "block" "hold" [] Nothing
+        awaitGate session "hold"
+        ticket ← bootNow session vm "i1.lua"
+        closeModuleCoordinator (vmCoordinator vm)
+        releaseGate session "hold"
+        awaitRelease released (moduleIdentity (key' session "i1.lua")) >>= (`shouldSatisfy` either (const False) (const True))
+        awaitBootOutcome ticket >>= (`shouldBe` BootStopped)
+        command session vm "x" "lookup" "k0" [("path", VText "d2.lua")] Nothing
+        awaitNote session "x lookup k0 not_ready #d2.lua"
 
   it "answers a request the coordinator closed under, between its admission and its acceptance, with the failure it is, and never leaves it pending" $ do
     gate ← newEmptyMVar
@@ -476,6 +516,20 @@ refusals = describe "refusals told apart by what can change" $ do
               endpoint `shouldBe` "module"
               why `shouldSatisfy` Text.isInfixOf "stopped"
             Nothing → expectationFailure ("expected the instance to fail with the request's failure, found " <> show failure)
+
+-- | The loader's plan with each release of a source interest reported, with how it ended, before it is
+-- raised again: a release the coordinator refuses is the loader's application failure.
+reportingReleases ∷ Chan (ExportIdentity, Either SomeException ()) → LoaderPlan → LoaderPlan
+reportingReleases told plan =
+  plan {planSupplier = supplier {supplierRelease = \identity → try (supplierRelease supplier identity) >>= \ended → writeChan told (identity, ended) >> either throwIO pure ended}}
+  where
+    supplier = planSupplier plan
+
+-- | How the release of this identity's interest ended, waiting for it to be made.
+awaitRelease ∷ Chan (ExportIdentity, Either SomeException ()) → ExportIdentity → IO (Either SomeException ())
+awaitRelease told wanted = do
+  (identity, ended) ← readChan told
+  if identity == wanted then pure ended else awaitRelease told wanted
 
 counts' ∷ Vm → IO Counts
 counts' = counts

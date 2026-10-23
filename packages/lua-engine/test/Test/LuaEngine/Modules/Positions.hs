@@ -160,9 +160,9 @@ noWaiters = describe "a job nobody waits for" $ do
         countNotes session "eval plain" >>= (`shouldBe` 1)
         command session vm "x" "start" "k2" [] (Just (fetch "plain.lua"))
         awaitNote session "x start k2 started"
-        command session vm "x" "ready" "k2" [] Nothing
+        command session vm "x" "settled_ready" "k2" [] Nothing
         awaitNote session "x ready k2 true"
-        command session vm "x" "take" "k2" [] Nothing
+        command session vm "x" "settled_take" "k2" [] Nothing
         awaitNote session "x take k2 {status=success,value=table(plain)}"
         readsStarted (ssProbe session) >>= (`shouldBe` 1)
         countNotes session "eval plain" >>= (`shouldBe` 1)
@@ -173,7 +173,7 @@ noWaiters = describe "a job nobody waits for" $ do
         admitDriver session vm "x"
         command session vm "x" "start" "k1" [] (Just (fetch "plain.lua"))
         awaitCounts vm (\c → jobsReady c == 1)
-        command session vm "x" "cancel" "k1" [] Nothing
+        command session vm "x" "settled_cancel" "k1" [] Nothing
         awaitNote session "x cancel k1 already_settled"
         command session vm "x" "take" "k1" [] Nothing
         awaitNote session "x take k1 {status=success,value=table(plain)}"
@@ -294,7 +294,7 @@ failures = describe "a required failure" $ do
         admitDriver session vm "y"
         command session vm "x" "start" "ku" [] (Just (fetch "util.lua"))
         awaitNote session "x start ku started"
-        command session vm "x" "keep" "ku" [("name", VText "util")] Nothing
+        command session vm "x" "settled_keep" "ku" [("name", VText "util")] Nothing
         awaitNote session "x keep ku {status=success,value=table(util)}"
         command session vm "y" "start" "kb" [] (Just (fetch "bad.lua"))
         _ ← awaitFailure session "y"
@@ -312,7 +312,7 @@ failures = describe "a required failure" $ do
         admitDriver session vm "y"
         command session vm "x" "start" "ku" [] (Just (fetch "util.lua"))
         awaitNote session "x start ku started"
-        command session vm "x" "keep" "ku" [("name", VText "util")] Nothing
+        command session vm "x" "settled_keep" "ku" [("name", VText "util")] Nothing
         awaitNote session "x keep ku {status=success,value=table(util)}"
         command session vm "y" "start" "kb" [] (Just (fetch "bad.lua"))
         _ ← awaitFailure session "y"
@@ -356,7 +356,7 @@ failures = describe "a required failure" $ do
         admitDriver session vm "z"
         command session vm "x" "start" "ku" [] (Just (fetch "util.lua"))
         awaitNote session "x start ku started"
-        command session vm "x" "keep" "ku" [("name", VText "util")] Nothing
+        command session vm "x" "settled_keep" "ku" [("name", VText "util")] Nothing
         awaitNote session "x keep ku {status=success,value=table(util)}"
         -- A failure is cached by a request nobody reads; the hook's import raises, caught or not,
         -- and the coordinator's lookup reports the same failure.

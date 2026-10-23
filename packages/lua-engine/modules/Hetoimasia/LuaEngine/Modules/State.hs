@@ -435,12 +435,15 @@ acquireSTM ∷ Coordinator → ExportIdentity → STM SourceAnswer
 acquireSTM c identity = do
   st <- readState c
   -- A coordinator that has closed will read nothing more: the ask is answered with the failure it is, so
-  -- that a chain is never left waiting for a source that will not come.
-  if csPhase st /= Open
-    then pure (SourceFailure (encodeSourceReason "io_error" closedReason))
-    else case Map.lookup identity (csJobs st) of
+  -- that a chain is never left waiting for a source that will not come. The loader holds an interest in
+  -- every source it was answered a failure for, and ends it with 'releaseSTM': the interest is taken here
+  -- like any other, on the job the identity has or on one made for it, and nothing is read for it.
+  let closed = csPhase st /= Open
+      stopped = SourceFailure (encodeSourceReason "io_error" closedReason)
+  case Map.lookup identity (csJobs st) of
     Just job
       | jobInterest job → defect "the loader asked for a source it already holds an interest in"
+      | closed → writeState c (setJob identity job {jobRecorded = True, jobInterest = True} st) >> pure stopped
       | otherwise → do
           let job1 = job {jobRecorded = True, jobInterest = True}
           case jobSource job of
@@ -460,12 +463,14 @@ acquireSTM c identity = do
         else do
           let (job0, st1) = admitJob c key True st
               job1 = job0 {jobInterest = True, jobNeeded = True}
-          case jobSource job1 of
-            SrcFailed sf → writeState c (setJob identity job1 {jobSource = SrcHanded} st1) >> pure (failureAnswer sf)
-            _ → do
-              writeState c (setJob identity job1 st1)
-              pump c
-              pure SourcePending
+          if closed
+            then writeState c (setJob identity job1 {jobOutcome = Stopped, jobSource = SrcGone} st1) >> pure stopped
+            else case jobSource job1 of
+              SrcFailed sf → writeState c (setJob identity job1 {jobSource = SrcHanded} st1) >> pure (failureAnswer sf)
+              _ → do
+                writeState c (setJob identity job1 st1)
+                pump c
+                pure SourcePending
 
 failureAnswer ∷ SourceProblem → SourceAnswer
 failureAnswer sf = SourceFailure (encodeSourceReason (problemCode sf) (problemMessage sf))

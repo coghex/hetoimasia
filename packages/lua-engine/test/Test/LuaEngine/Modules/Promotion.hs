@@ -121,9 +121,9 @@ spec = describe "a dependency requested for a later position" $ do
         openGate (ssProbe session) "ub.lua"
         awaitCounts vm (\c → jobsReady c == 2)
         evalsOf session >>= (`shouldBe` ["eval ub", "eval ua"])
-        command session vm "y" "take" "kb" [] Nothing
+        command session vm "y" "settled_take" "kb" [] Nothing
         awaitNote session "y take kb {status=success,value=table(ub)}"
-        command session vm "x" "take" "ka" [] Nothing
+        command session vm "x" "settled_take" "ka" [] Nothing
         awaitNote session "x take ka {status=success,value=table(ua)}"
         readsStarted (ssProbe session) >>= (`shouldBe` 2)
 

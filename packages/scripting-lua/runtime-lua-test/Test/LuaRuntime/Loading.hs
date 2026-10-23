@@ -80,6 +80,14 @@ awaitAsked rig wanted = go 0
       | seen >= wanted = pure ()
       | otherwise = readChan (rigAsked rig) >> go (seen + 1)
 
+-- | Wait, without sleeping, until the supplier has been asked for this very identity. The asks before
+-- it are consumed, so an example that waits for a later ask names it, instead of counting asks the
+-- earlier waits already consumed.
+awaitAskedFor ∷ Rig → ExportIdentity → IO ()
+awaitAskedFor rig wanted = do
+  asked ← readChan (rigAsked rig)
+  if asked == wanted then pure () else awaitAskedFor rig wanted
+
 -- | An owner of instances from these modules, with a loader.
 loaderSpec ∷ IFixture → Rig → Int → [ModuleSource] → ScheduledSpec
 loaderSpec fixture rig bound modules = loaderSpecWith fixture rig bound modules noLoaderHooks
@@ -412,14 +420,16 @@ spec = describe "the module loader on a scheduled owner" $ do
         submitRoot endpoint (request "due") (DueAt 3 0) >>= (`shouldBe` SubmitAccepted)
         -- Nothing is kept open: the tick is held, not owed, and the root has not begun.
         loaderDiagnostics endpoint >>= \found → loadingHeld found `shouldBe` Nothing
-        awaitAsked rig 1
+        awaitAskedFor rig (ident "due")
         grantOne control owner
         atomically (scheduledTick (scheduledEndpoint owner)) >>= (`shouldBe` 1)
         length <$> readIORef (rigAcquired rig) >>= (`shouldBe` 1)
         logged fixture >>= (`shouldSatisfy` notElem "due:start")
         -- Tick two is finished, tick three has not begun: the root starts now and reaches its dependency.
+        -- A tick's completion is seen before the owner serves the loader at its boundary, so the example
+        -- waits for the dependency's ask, which only the started root makes, before reading the log.
         grantOne control owner
-        awaitAsked rig 1
+        awaitAskedFor rig (ident "late")
         atomically (scheduledTick (scheduledEndpoint owner)) >>= (`shouldBe` 2)
         logged fixture >>= (`shouldSatisfy` elem "due:start")
         -- The grant that would reach tick three is accepted and not applied, while the owner goes on serving hooks.

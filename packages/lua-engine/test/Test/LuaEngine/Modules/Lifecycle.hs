@@ -171,7 +171,7 @@ peers = describe "peers" $
           counts second >>= \c → (jobsLive c, phaseNow c) `shouldBe` (1, Open)
           openGate (ssProbe session) "b.lua"
           awaitCounts second (\c → jobsReady c == 1)
-          command session second "y" "take" "k2" [] Nothing
+          command session second "y" "settled_take" "k2" [] Nothing
           awaitNote session "y take k2 {status=success,value=table(b)}"
           retireVm control second
           awaitDrained' second
@@ -229,7 +229,7 @@ callbacks = describe "completions" $ do
         admitDriver session vm "x"
         command session vm "x" "start" "k1" [] (Just (fetch "a.lua"))
         awaitCounts vm (\c → jobsReady c == 1)
-        command session vm "x" "take" "k1" [] Nothing
+        command session vm "x" "settled_take" "k1" [] Nothing
         awaitNote session "x take k1 {status=success,value=table(a)}"
         vmDiagnostics vm >>= \d → rdOutstanding d `shouldBe` 0
 
