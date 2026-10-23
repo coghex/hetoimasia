@@ -292,6 +292,9 @@ data Counts = Counts
   , countPoolHeld ∷ !Int
   , countDeferred ∷ !Int
   -- ^ Jobs whose read waits for room.
+  , countNeeded ∷ !Int
+  -- ^ Unfinished jobs the active chain waits for: its next source, and every module of the chain
+  -- that imported it.
   , countReadsStarted ∷ !Int
   -- ^ Reads handed to the pool, ever.
   , countPhase ∷ !Phase

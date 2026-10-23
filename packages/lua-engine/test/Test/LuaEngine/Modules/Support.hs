@@ -20,6 +20,7 @@ module Test.LuaEngine.Modules.Support
   , realReader
   , injectedIoError
   , injectedDefect
+  , fatalSession
   , Layout (..)
   , note
   , history
@@ -96,7 +97,7 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Exception (finally, throwIO)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, fromException, throwIO, tryWithContext)
 import Control.Monad (unless, void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -144,6 +145,7 @@ import Hetoimasia.Foundation.Log
   , unsafeComponent
   )
 import Hetoimasia.Foundation.Time (DurationRequirement (RequirePositive), durationFromNanoseconds)
+import Hetoimasia.LuaEngine.Behavior (exportLimits)
 import Hetoimasia.LuaEngine.Modules
 import Hetoimasia.LuaEngine.Profile
   ( ByteLimit (ActiveChainReserveBytes, CopiedValueBytes, ModuleSourceBytes, SourceBankBytes)
@@ -179,7 +181,7 @@ import System.Directory (createDirectoryIfMissing)
 import System.FilePath (takeDirectory, (</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Timeout (timeout)
-import Test.HUnit.Lang (assertFailure)
+import Test.HUnit.Lang (HUnitFailure, assertFailure)
 import Test.LuaEngine.Request.Profiles (bytesOf, smaller)
 
 -- The session --------------------------------------------------------------------------------
@@ -286,6 +288,17 @@ withSession profile (workers, slots) readerOf (Layout files) body =
         { metadataClock = pure (UTCTime (fromGregorian 2026 10 22) (secondsToDiffTime 43200))
         , metadataThread = pure "1"
         }
+
+-- | An example whose owner is expected to end in a failure of the application's own, which
+-- supervision raises at the boundary: answers the failure with its context. A failed assertion or
+-- the example's bound is not that failure, and is raised as itself.
+fatalSession ∷ Profile → (Int, Int) → ReaderOf → Layout → (Session → RuntimeControl → LuaRuntime → IO ()) → IO (ExceptionWithContext SomeException)
+fatalSession profile sizes readerOf layout body =
+  tryWithContext @SomeException (withSession profile sizes readerOf layout body) >>= \case
+    Left failure@(ExceptionWithContext _ raised)
+      | Just (_ ∷ HUnitFailure) ← fromException raised → throwIO raised
+      | otherwise → pure failure
+    Right () → assertFailure "expected the owner to fail, but the example returned"
 
 -- | How long an example may run, in microseconds.
 exampleBound ∷ Int
@@ -426,10 +439,16 @@ data VmOptions = VmOptions
   , optRequestBound ∷ !Int
   -- ^ The owner's request places.
   , optRole ∷ !Text
+  , optWrap ∷ RequestEndpoint → RequestEndpoint
+  -- ^ The endpoint the grant names, wrapped by the example: a wrapper that observes, duplicates or
+  -- fails the provider's completion from outside it. The wrapper is the example's, and says so
+  -- where it is used.
+  , optLogger ∷ Maybe Logger
+  -- ^ A logger of the example's own, instead of the session's.
   }
 
 defaultOptions ∷ Timing → VmOptions
-defaultOptions timing = VmOptions timing 4 2 64 "test"
+defaultOptions timing = VmOptions timing 4 2 64 "test" id Nothing
 
 -- | One VM: its owner, its coordinator and its loader endpoint.
 data Vm = Vm
@@ -459,7 +478,7 @@ withVm session runtime label options body = do
           , specInventory = ssInventory session
           , specPool = ssPool session
           , specResolve = resolver
-          , specLogger = ssLogger session
+          , specLogger = maybe (ssLogger session) id (optLogger options)
           , specRole = optRole options
           , specSlots = optSlots options
           , specBootWaiters = optBootWaiters options
@@ -480,10 +499,11 @@ withVm session runtime label options body = do
             , vmOwnerName = label
             , vmModules = [driverSource]
             , vmValueLimits = limits
+            , vmExportLimits = exportLimits (ssProfile session)
             }
         grant =
           RequestGrant
-            [coordinatorEndpoint coordinator]
+            [optWrap options (coordinatorEndpoint coordinator)]
             (optRequestBound options)
             (if optTiming options == OnArrival then SettleOnArrival else SettleAtAssignedTick Nothing)
         spec =

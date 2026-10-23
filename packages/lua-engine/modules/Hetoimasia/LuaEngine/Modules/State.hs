@@ -866,6 +866,7 @@ countsSTM c = do
       , countSlotsFree = csSlotsFree st
       , countPoolHeld = csPoolHeld st
       , countDeferred = count (\job -> case jobSource job of SrcNone -> isLive job && (jobRecorded job || jobRoot job) && fateIsRead (jobFate job); _ -> False)
+      , countNeeded = count (\job -> isLive job && jobNeeded job)
       , countReadsStarted = csReadsStarted st
       , countPhase = csPhase st
       , countPeaks = csPeaks st

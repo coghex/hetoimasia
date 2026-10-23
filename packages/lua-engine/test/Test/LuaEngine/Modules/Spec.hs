@@ -1,7 +1,9 @@
 -- | The module coordinator's examples (LFE-11), composed under one @Modules@ group.
 module Test.LuaEngine.Modules.Spec (spec) where
 
+import qualified Test.LuaEngine.Modules.Bank as Bank
 import qualified Test.LuaEngine.Modules.Basics as Basics
+import qualified Test.LuaEngine.Modules.Limits as Limits
 import qualified Test.LuaEngine.Modules.Order as Order
 import qualified Test.LuaEngine.Modules.Positions as Positions
 import qualified Test.LuaEngine.Modules.Promotion as Promotion
@@ -13,5 +15,7 @@ spec = describe "Modules" $ do
   Identities.spec
   Basics.spec
   Order.spec
+  Bank.spec
+  Limits.spec
   Promotion.spec
   Positions.spec
