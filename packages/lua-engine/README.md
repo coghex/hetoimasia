@@ -1113,8 +1113,9 @@ the host's handle check like any wrong-kind handle.
   the update's `dt` is fixed when it begins and is unchanged by its own waits, and a resumed update starts no second one.
   The check reads the clock once and the scheduler places the wait against a later reading: if the clock moved on so that the
   deadline is no longer representable, the scheduler refuses the wait, and that is **the engine's fact and not the script's**:
-  the application's `scheduledRefusedWait` (set to `facadeRefusedWait facade`), called at the boundary of the refused segment and
-  first there, before another segment is chosen or anything is acknowledged, reports it through the injected failure boundary and
+  the application's `scheduledRefusedWait` (set to `facadeRefusedWait facade`), called the moment the scheduler applies the refused
+  segment's report and before anything else runs (before the coroutine's own `__close` handlers, before the boundary, before an
+  accounting wait can be answered, before another segment), reports it through the injected failure boundary and
   raises it, ending the owner as a tick no Lua integer holds does, where the generic scheduler would have isolated an instance for a
   refusal no script caused. If the report of an engine failure itself raises, the engine failure stays primary and what the
   report raised is retained beside it (the primary and its cleanup evidence are composed, neither is dropped).
@@ -1177,7 +1178,7 @@ makes nothing over a profile below the least), each against what the facade's ow
 | --- | --- | --- | --- |
 | `InstanceIdBytes` | 6 (`minimumInstanceIdBytes`: `inst-1`) | the first identity the session issues; a later identity that does not fit is refused when it is declared (`IdTooLong`), never written | 5 refused; 6 makes a facade whose first instance is `inst-1`, and the tenth identity is refused |
 | `PrintWarnBytes` | `minimumPrintWarnBytes idBytes`: the longest warning prefix, `...` and a line end (242 + 4 for `InstanceIdBytes` 128; 167 + 4 for 6) | every line of a cut warning keeps the whole prefix and the marker ends the last of them; the longest prefix is an instance's (`lua warning role=presentation content=` + 64 + ` instance=` + `InstanceIdBytes`) or a module's with its label (the host keeps at most 128 bytes of it) | one below refused; the least keeps the format end to end, from a hook and from a module at the longest label |
-| `CopiedValueBytes` | `minimumContextBytes idBytes`: the bytes the host counts for the builder's context record (264 for 128) | the record `{role, content_id, instance_id}` is copied into the builder | one below refused; the least builds an instance's `api` |
+| `CopiedValueBytes` | `minimumCopiedValueBytes idBytes printBytes`: the largest of everything the facade makes cross, each with the host's header: one `print`/`warn` text (`PrintWarnBytes + 5`), an identity (`InstanceIdBytes + 5`), and the builder's context record (`minimumContextBytes`: 142 for an identity bound of 6, 264 for 128) | a text or record crosses as its payload and a header; the longest `out`/`err` call is the output bound and five bytes | one below refused; the least cuts and writes the longest `print` and `warn`, builds an instance's `api`, and turns a path or `import` too large to cross into an ordinary, catchable error |
 | `CopiedValueElements`, `CopiedValueDepth` | 4 and 1 | the same record | not separately checked: the profile's scene relation already keeps the elements at 12 or more and every limit positive, so neither can be below |
 | `InstancesPerVm`, `LuaIntegerMaximum`, `MessageBytes` | 1 | positive suffices: a one-instance VM, a tick ceiling of 1 and the message bound the facade does not format with | the profile's own positivity check |
 
