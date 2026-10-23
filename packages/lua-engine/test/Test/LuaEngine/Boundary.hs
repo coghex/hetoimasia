@@ -196,13 +196,19 @@ spec = describe "the package and import boundary" $ do
       `shouldBe` []
     [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
 
-  it "is listed by the ordinary and CPU projects, held to -Werror, and not by the Vulkan project" $ do
+  it "is listed by the ordinary and CPU projects, held to -Werror, and by the Vulkan project only as the graphics adapter's CPU closure" $ do
     root ← above "cabal.project"
     mapM_
       (\file → readFile (root </> file) >>= \listing → ("packages/lua-engine" `isInfixOf` listing) `shouldBe` True)
       ["cabal.project", "cabal.project.cpu"]
+    -- The Vulkan project lists it (LFE-17) because the graphics adapter implements the texture pipeline's port of
+    -- it; the adapter is what makes the Vulkan project name it, and the package itself stays free of Vulkan and GLFW.
     vulkan ← readFile (root </> "cabal.project.vulkan")
-    ("lua-engine" `isInfixOf` vulkan) `shouldBe` False
+    ("packages/lua-engine-graphics" `isInfixOf` vulkan) `shouldBe` True
+    ("packages/lua-engine\n" `isInfixOf` vulkan) `shouldBe` True
+    cabal ← readFile (root </> "packages" </> "lua-engine" </> "hetoimasia-lua-engine.cabal")
+    let dependencies = [line | line ← lines cabal, "hetoimasia-" `isInfixOf` line, not ("--" `isPrefixOf` dropWhile (== ' ') line)]
+    [line | line ← dependencies, any (`isInfixOf` line) ["glfw", "gpu-vulkan", "render-2d-vulkan", "lua-engine-graphics"]] `shouldBe` []
     common ← readFile (root </> "cabal.project.common")
     ("package hetoimasia-lua-engine\n  ghc-options: -Werror -j" `isInfixOf` common) `shouldBe` True
 
