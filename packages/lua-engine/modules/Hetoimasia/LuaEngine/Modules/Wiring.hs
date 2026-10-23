@@ -332,18 +332,18 @@ moduleAsk c request = do
     (m1Ask RequiredRequest ("module " <> pathText key))
       { askOffset = requestedOffset request
       , askCodes = moduleCodes
-      , askCredits = [identityCredit c | not held]
+      , askCredits = [identityCredit c identity | not held]
       }
   where
     key = requestedKey request
     identity = moduleIdentity key
 
-identityCredit ∷ Coordinator → Credit
-identityCredit c =
+identityCredit ∷ Coordinator → ExportIdentity → Credit
+identityCredit c identity =
   Credit
     { creditName = "module identity"
-    , creditReserve = reserveIdentitySTM c
-    , creditRelease = releaseIdentitySTM c
+    , creditReserve = reserveIdentitySTM c identity
+    , creditRelease = releaseIdentitySTM c identity
     , creditTransfers = False
     }
 

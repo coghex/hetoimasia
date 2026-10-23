@@ -61,6 +61,7 @@ import Control.Exception (SomeException, throwIO, toException)
 import Control.Monad (foldM, forM, forM_, unless, when)
 import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import Data.Maybe (isJust, isNothing)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -145,7 +146,7 @@ defect = throwSTM . ModuleDefect
 
 -- | How many identities are held or promised.
 identitiesUsed ∷ CState → Int
-identitiesUsed st = Map.size (csJobs st) + csPromised st
+identitiesUsed st = Map.size (csJobs st) + Set.size (csPromised st)
 
 -- | The position of a due, to compare: a request that waits for no tick stands before any placed one.
 dueRank ∷ RootDue → (Word64, Word64)
@@ -590,24 +591,29 @@ failureFor st job fault =
 -- Requests ---------------------------------------------------------------------------------------------
 
 -- | The room for a new identity, reserved in the transaction that admits the request that names it.
--- It is permanent: the identity is the VM's for its life, and the reservation is not given back when
--- the request ends, only when the admission is taken back before the endpoint was handed anything.
-reserveIdentitySTM ∷ Coordinator → STM Bool
-reserveIdentitySTM c = do
+-- It is permanent: the identity is the VM's for its life, and the reservation is given back only
+-- if the admission is taken back before the endpoint made the job. An identity that is held or
+-- reserved already needs no room (the ask was made before another thread's boot load named it): the
+-- credit then holds nothing and gives nothing back, and the request joins the job that exists.
+reserveIdentitySTM ∷ Coordinator → ExportIdentity → STM Bool
+reserveIdentitySTM c identity = do
   st <- readState c
-  if csPhase st == Open && identitiesUsed st < limitIdentities (coordLimits c)
-    then True <$ writeState c st {csPromised = csPromised st + 1}
-    else pure False
+  if Map.member identity (csJobs st) || Set.member identity (csPromised st)
+    then pure True
+    else
+      if csPhase st == Open && identitiesUsed st < limitIdentities (coordLimits c)
+        then True <$ writeState c st {csPromised = Set.insert identity (csPromised st)}
+        else pure False
 
--- | Give the reservation back if the request never reached the endpoint.
-releaseIdentitySTM ∷ Coordinator → CreditEnd → STM ()
-releaseIdentitySTM c = \case
-  CreditSettled → pure ()
+-- | Give the reservation back if the request never reached the endpoint. Once the endpoint made the
+-- job the room is the job's, and an admission taken back after that returns nothing.
+releaseIdentitySTM ∷ Coordinator → ExportIdentity → CreditEnd → STM ()
+releaseIdentitySTM c identity = \case
+  CreditSettled -> pure ()
   CreditUnused -> do
     st <- readState c
-    if csPromised st <= 0
-      then defect "an identity reservation was returned that had not been made"
-      else writeState c st {csPromised = csPromised st - 1}
+    when (Set.member identity (csPromised st)) $
+      writeState c st {csPromised = Set.delete identity (csPromised st)}
 
 -- | A permanent reason the request would be refused: the coordinator has closed, or the identity is
 -- new and the VM already holds every identity it may. Reads only. A pending or finished identity
@@ -629,7 +635,7 @@ reservedForLoaderSTM ∷ Coordinator → ExportIdentity → STM Int
 reservedForLoaderSTM c identity = do
   st <- readState c
   let unrecorded = length [() | (other, job) <- Map.toList (csJobs st), other /= identity, jobRoot job, not (jobRecorded job)]
-  pure (csPromised st + unrecorded)
+  pure (Set.size (Set.delete identity (csPromised st)) + unrecorded)
 
 -- | What accepting a request came to: the work to hand the host, and what to do after the commit.
 data Accepted = Accepted
@@ -658,11 +664,11 @@ acceptRequest c key due number completion = do
       Nothing -> defect "a request was accepted before a loader was attached"
       Just endpoint -> case Map.lookup identity (csJobs st) of
         Nothing -> do
-          when (csPromised st <= 0) $ defect "a request for a new identity was accepted without its reservation"
+          unless (Set.member identity (csPromised st)) $ defect "a request for a new identity was accepted without its reservation"
           let (job0, st1) = admitJob c key False st
           (work, waiter) <- subscribe identity number completion
           let job1 = job0 {jobRoot = True, jobDue = Just position, jobWaiters = Map.singleton number waiter}
-          writeState c (setJob identity job1 st1 {csPromised = csPromised st1 - 1})
+          writeState c (setJob identity job1 st1 {csPromised = Set.delete identity (csPromised st1)})
           queued <- submitReservedRoot endpoint (RootRequest identity (jobLabel job1)) position
           closedOr queued
           pump c

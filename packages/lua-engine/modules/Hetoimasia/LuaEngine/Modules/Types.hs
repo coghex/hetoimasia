@@ -62,6 +62,8 @@ import Control.Exception (Exception, SomeException)
 import Data.ByteString (ByteString)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Word (Word64)
 import Hetoimasia.Content.Identity (ContentKey)
@@ -234,7 +236,10 @@ data Peaks = Peaks
 data CState = CState
   { csPhase ∷ !Phase
   , csJobs ∷ !(Map ExportIdentity Job)
-  , csPromised ∷ !Int
+  , csPromised ∷ !(Set ExportIdentity)
+  -- ^ The identities a request's admission reserved room for and 'acceptRequest' has not yet turned
+  -- into a job. The room is the identity's own, so taking an admission back after the job exists
+  -- gives nothing back, and an admission taken back before it releases exactly its own reservation.
   , csSerial ∷ !Word64
   , csCharges ∷ !Charges
   , csSlotsFree ∷ !Int
@@ -253,7 +258,7 @@ newState slots =
   CState
     { csPhase = Open
     , csJobs = Map.empty
-    , csPromised = 0
+    , csPromised = Set.empty
     , csSerial = 0
     , csCharges = noCharges
     , csSlotsFree = slots
