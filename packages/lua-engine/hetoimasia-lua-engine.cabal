@@ -113,6 +113,41 @@ library data
         hetoimasia-scripting-lua ==0.1.0.0,
         hetoimasia-scripting-lua:runtime-lua
 
+-- The M1 texture pipeline (LFE-16): the endpoint that answers a request for a usable, instance-owned
+-- texture, the two lanes, the one decode worker and the reservations behind it, and the port the
+-- concrete graphics adapter (LFE-17) implements. It is a sublibrary of its own, in a source directory
+-- of its own, for the reason the data provider is: the library is the pure configuration boundary and
+-- imports nothing that performs IO, and this does. It depends on the request adapter for the policy, on
+-- the content package for the shared read pool, on the bounded PNG decoder for the decode, and on the
+-- host's public runtime modules for the provider and lease surface. It imports no module of a game, a
+-- window, a GPU, Vulkan, GLFW or the console, and installs nothing in a VM.
+library texture
+    import: language
+    visibility: public
+    default-extensions: OverloadedStrings
+    hs-source-dirs: texture
+    exposed-modules:
+        Hetoimasia.LuaEngine.Texture
+        Hetoimasia.LuaEngine.Texture.Backend
+    -- The per-texture banks and the pipeline's state machine, behind the facade.
+    other-modules:
+        Hetoimasia.LuaEngine.Texture.Banks
+        Hetoimasia.LuaEngine.Texture.Pipeline
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-asset ==0.1.0.0,
+        hetoimasia-asset-image ==0.1.0.0,
+        hetoimasia-content ==0.1.0.0,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-lua-engine ==0.1.0.0,
+        hetoimasia-lua-engine:request,
+        hetoimasia-scripting-lua ==0.1.0.0,
+        hetoimasia-scripting-lua:runtime-lua
+
 -- This package's own contracts, registered as the CPU validation group
 -- `test.lua-engine`. Hspec is the suite's alone.
 test-suite lua-engine-tests
@@ -144,8 +179,23 @@ test-suite lua-engine-tests
         Test.LuaEngine.Request.Support
         Test.LuaEngine.Spec
         Test.LuaEngine.Support
+        Test.LuaEngine.Texture.Cancellation
+        Test.LuaEngine.Texture.Client
+        Test.LuaEngine.Texture.Contract
+        Test.LuaEngine.Texture.Failures
+        Test.LuaEngine.Texture.Lifecycle
+        Test.LuaEngine.Texture.Limits
+        Test.LuaEngine.Texture.Ownership
+        Test.LuaEngine.Texture.Publication
+        Test.LuaEngine.Texture.Png
+        Test.LuaEngine.Texture.Spec
+        Test.LuaEngine.Texture.Stages
+        Test.LuaEngine.Texture.Teardown
+        Test.LuaEngine.Texture.Support
+        Test.LuaEngine.Texture.Workers
     build-depends:
         base >=4.22 && <4.23,
+        array >=0.5 && <0.6,
         bytestring >=0.12 && <0.13,
         containers >=0.8 && <0.9,
         directory >=1.3 && <1.4,
@@ -155,6 +205,7 @@ test-suite lua-engine-tests
         hetoimasia-lua-engine ==0.1.0.0,
         hetoimasia-lua-engine:data,
         hetoimasia-lua-engine:request,
+        hetoimasia-lua-engine:texture,
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-scripting-lua ==0.1.0.0,
         hetoimasia-scripting-lua:runtime-lua,
@@ -166,4 +217,5 @@ test-suite lua-engine-tests
         stm >=2.5.3 && <2.6,
         temporary >=1.3 && <1.4,
         text >=2.1 && <2.2,
-        time >=1.15 && <1.16
+        time >=1.15 && <1.16,
+        zlib >=0.7.1 && <0.8
