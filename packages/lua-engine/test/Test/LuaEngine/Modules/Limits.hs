@@ -5,6 +5,7 @@
 -- reserved, and an accepted load that meets a limit fails as a load, with what it completed kept.
 module Test.LuaEngine.Modules.Limits (spec) where
 
+import Control.Concurrent.STM (atomically)
 import qualified Data.ByteString.Char8 as Char8
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (CountLimit (ModuleChainDepth, ModuleIdentitiesPerVm, RequestsPerInstance), Profile)
@@ -27,6 +28,7 @@ layout =
          , ("g2.lua", "local d = import('g3.lua') return { id = 'g2', d = d }")
          , ("g3.lua", "local d = import('g4.lua') return { id = 'g3', d = d }")
          , ("r1.lua", "local d = import('d1.lua') local ok = pcall(import, 'd2.lua') return { id = 'r1', d = d }")
+         , ("held.lua", "fx.block('held') local d = import('d1.lua') local ok = pcall(import, 'd2.lua') return { id = 'held', d = d }")
          ]
 
 -- | Three identities, a chain of two.
@@ -164,6 +166,27 @@ loads = describe "an accepted load that meets a limit" $ do
         command session vm "z" "ready" "k3" [] Nothing
         awaitNote session "z ready k3 true"
         readsStarted (ssProbe session) >>= (`shouldBe` readsBefore)
+
+  it "counts the room promised to a boot load against a dependency discovered meanwhile, so the load that was accepted is never the one refused" $
+    withSession tiny (2, 8) realReader layout $ \session _ runtime →
+      withVm session runtime "ui" (defaultOptions OnArrival) $ \vm → do
+        admitDriver session vm "x"
+        command session vm "x" "start" "k1" [] (Just (fetch "held.lua"))
+        awaitGate session "held"
+        -- The owner is inside the module: the boot load is accepted from another thread, and its room
+        -- is promised before the loader holds a record of it.
+        ticket ← bootNow session vm "i1.lua"
+        releaseGate session "held"
+        failure ← awaitFailure session "x"
+        fmap snd (requestFailureOf failure) `shouldSatisfy` maybe False (Text.isInfixOf "module_limit")
+        awaitBootOutcome ticket >>= (`shouldBe` BootReady)
+        -- Three identities, none more: the module, the dependency that took the room it was given, and
+        -- the boot load that was promised the last; the second dependency was refused.
+        counts' vm >>= \c → (jobsHeld c, jobsReady c, jobsFailed c) `shouldBe` (3, 2, 1)
+        atomically (lookupImmediate (vmCoordinator vm) (moduleIdentity (key' session "d2.lua")))
+          >>= \found → case found of
+            ImmediateNotReady → pure ()
+            _ → expectationFailure "the refused dependency should have no entry"
 
 counts' ∷ Vm → IO Counts
 counts' = counts
