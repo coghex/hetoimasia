@@ -648,7 +648,9 @@ returns its charges when that release retires.
 
 ### The backend port
 
-`TextureSpec`'s numbers are read with accessors (`specLanes` and the rest); its record fields are not exported, so a client
+What a backend returns is evaluated inside the same guard that catches what it raises (the reading `textureRelease` answers, the
+work record `backendUpload` answers), and a cell's recorded state is built and forced before it is stored, so a value that throws
+when first looked at is the call failing, once, and never an exception loose in whoever inspects the cell later. `TextureSpec`'s numbers are read with accessors (`specLanes` and the rest); its record fields are not exported, so a client
 cannot build or update a specification of its own. `TextureBackend` has one operation, `backendUpload upload sink`, which must not block, and a sink with four calls: a usable
 registration (`sinkReady`, carrying a `BackendTexture` whose `textureRelease` is called at most once and answers the
 backend's own reading of its retirement, which only reads and which the pipeline guards as the host does: a reading that
