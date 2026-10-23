@@ -407,6 +407,12 @@ leaseNamespace fixture =
           note fixture ("use " <> name)
           pure [VText name]
         _ → pure []
+    , -- The same borrow, with a refusal handed back as data instead of raised as a fault of the call.
+      stateOperation "try_use" [SCapability "res"] [SText] $ \arguments → case arguments of
+        [VCapability handle] → do
+          answer ← withLeaseOr (lfLeases fixture) (capabilityKey handle) (pure . ("refused: " <>)) (\name → pure ("ok " <> (name ∷ Text)))
+          pure [VText answer]
+        _ → pure []
     , releaseOperation "release" "res" [SText] $ \arguments → case arguments of
         [VCapability handle] → do
           answer ← releaseLease (lfLeases fixture) (capabilityKey handle)
@@ -650,6 +656,8 @@ cachesHandle =
     , "      " <> record <> "('mine ' .. lease.use(self.mine))"
     , "      local ok = pcall(lease.use, cached)"
     , "      " <> record <> "('cached usable ' .. tostring(ok))"
+    , "      " <> record <> "('mine try ' .. lease.try_use(self.mine))"
+    , "      " <> record <> "('cached try ' .. lease.try_use(cached))"
     , "      lease.use(cached)"
     , "    end)"
     , "  end"

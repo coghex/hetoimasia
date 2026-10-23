@@ -148,6 +148,44 @@ library texture
         hetoimasia-scripting-lua ==0.1.0.0,
         hetoimasia-scripting-lua:runtime-lua
 
+-- The M1 scene schema (LFE-19): the plain-table scene a script hands over, checked and copied into
+-- bounded immutable CPU data, its sRGB and Float32 conversions, and the translation to the renderer's
+-- pure snapshot. It is a sublibrary of its own, in a source directory of its own, for the reason the
+-- texture pipeline is: the library is the pure configuration boundary and imports nothing that
+-- performs IO, and this borrows textures from an instance's leases. It depends on the profile for the
+-- limits, on the texture sublibrary for the instance's texture authority, on the host's public
+-- modules and runtime adapter for the values, bindings and leases, and on the pure renderer packages
+-- for the frame. It imports no module of a game, a window, a GPU, Vulkan, GLFW, the console or the
+-- oracle (which is a test dependency), and installs nothing in a VM.
+library scene
+    import: language
+    visibility: public
+    default-extensions: OverloadedStrings
+    hs-source-dirs: scene
+    exposed-modules:
+        Hetoimasia.LuaEngine.Scene
+    -- The limits, the types, the conversions and the translation, behind the facade.
+    other-modules:
+        Hetoimasia.LuaEngine.Scene.Binding
+        Hetoimasia.LuaEngine.Scene.Colour
+        Hetoimasia.LuaEngine.Scene.Geometry
+        Hetoimasia.LuaEngine.Scene.Limits
+        Hetoimasia.LuaEngine.Scene.Prepare
+        Hetoimasia.LuaEngine.Scene.Snapshot
+        Hetoimasia.LuaEngine.Scene.Types
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        text >=2.1 && <2.2,
+        hetoimasia-lua-engine ==0.1.0.0,
+        hetoimasia-lua-engine:texture,
+        hetoimasia-math ==0.1.0.0,
+        hetoimasia-render-2d ==0.1.0.0,
+        hetoimasia-render-api ==0.1.0.0,
+        hetoimasia-scripting-lua ==0.1.0.0,
+        hetoimasia-scripting-lua:runtime-lua
+
 -- This package's own contracts, registered as the CPU validation group
 -- `test.lua-engine`. Hspec is the suite's alone.
 test-suite lua-engine-tests
@@ -177,6 +215,15 @@ test-suite lua-engine-tests
         Test.LuaEngine.Request.Profiles
         Test.LuaEngine.Request.Spec
         Test.LuaEngine.Request.Support
+        Test.LuaEngine.Scene.Authority
+        Test.LuaEngine.Scene.Client
+        Test.LuaEngine.Scene.Failure
+        Test.LuaEngine.Scene.Limits
+        Test.LuaEngine.Scene.Numbers
+        Test.LuaEngine.Scene.Render
+        Test.LuaEngine.Scene.Schema
+        Test.LuaEngine.Scene.Spec
+        Test.LuaEngine.Scene.Support
         Test.LuaEngine.Spec
         Test.LuaEngine.Support
         Test.LuaEngine.Texture.Cancellation
@@ -200,12 +247,18 @@ test-suite lua-engine-tests
         containers >=0.8 && <0.9,
         directory >=1.3 && <1.4,
         filepath >=1.5 && <1.6,
+        hetoimasia-asset ==0.1.0.0,
         hetoimasia-content ==0.1.0.0,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-lua-engine ==0.1.0.0,
         hetoimasia-lua-engine:data,
         hetoimasia-lua-engine:request,
+        hetoimasia-lua-engine:scene,
         hetoimasia-lua-engine:texture,
+        hetoimasia-math ==0.1.0.0,
+        hetoimasia-render-2d ==0.1.0.0,
+        hetoimasia-render-2d-oracle ==0.1.0.0,
+        hetoimasia-render-api ==0.1.0.0,
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-scripting-lua ==0.1.0.0,
         hetoimasia-scripting-lua:runtime-lua,

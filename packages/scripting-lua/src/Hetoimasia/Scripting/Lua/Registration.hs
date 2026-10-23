@@ -139,10 +139,12 @@ module Hetoimasia.Scripting.Lua.Registration
   , withPrecondition
   , Precondition
   , withArgumentCheck
+  , withArgumentLimits
   , ArgumentCheck
   , OwnerContexts (..)
   , refusalReasonLimit
   , bindingRecoverable
+  , bindingArgumentLimits
   , bindingName
   , bindingKind
   , bindingArguments
@@ -178,6 +180,7 @@ import Data.Text (Text)
 import Hetoimasia.Scripting.Lua.Internal.Registration hiding
   ( bindingArguments
   , bindingArgumentChecks
+  , bindingArgumentLimits
   , bindingConfined
   , bindingPreconditions
   , bindingRecoverable
@@ -193,7 +196,7 @@ import Hetoimasia.Scripting.Lua.Internal.Registration hiding
   , registrationNamespaces
   )
 import qualified Hetoimasia.Scripting.Lua.Internal.Registration as Internal
-import Hetoimasia.Scripting.Lua.Value (Schema)
+import Hetoimasia.Scripting.Lua.Value (Schema, ValueLimits)
 
 -- The readings below are ordinary functions and not the record labels of the
 -- types they read: a label that is exported can be used in a record update, and
@@ -247,6 +250,11 @@ bindingConfined = Internal.bindingConfined
 -- | Whether the binding is eligible to run from a Lua finalizer.
 bindingFinalizer ∷ Binding → Bool
 bindingFinalizer = Internal.bindingFinalizer
+
+-- | The limits the binding's own arguments are bounded by beside the owner's, if it declared any
+-- ('withArgumentLimits').
+bindingArgumentLimits ∷ Binding → Maybe ValueLimits
+bindingArgumentLimits = Internal.bindingArgumentLimits
 
 -- | Whether the binding is opted in to ordinary Lua errors for the refusals made
 -- before its action ('recoverableRefusals', 'withPrecondition').
