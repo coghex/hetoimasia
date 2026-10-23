@@ -233,6 +233,16 @@ callbacks = describe "completions" $ do
         awaitNote session "x take k1 {status=success,value=table(a)}"
         vmDiagnostics vm >>= \d → rdOutstanding d `shouldBe` 0
 
+  it "of a handoff that fails takes the admission back whole: no identity stays reserved, no job is made, and the failure is the engine's" $ do
+    ExceptionWithContext _ failure ← fatalSession fixedM1Profile (2, 8) realReader layout $ \session control runtime →
+      withVm session runtime "refusing" (defaultOptions OnArrival) {optWrap = refusing} $ \vm → do
+        admitDriver session vm "x"
+        command session vm "x" "start" "k1" [] (Just (fetch "a.lua"))
+        ended ← tryWithContext @SomeException (awaitEnd control vm)
+        counts vm >>= \c → (promisedHeld c, jobsHeld c, waitersHeld c, readsBegun c) `shouldBe` (0, 0, 0, 0)
+        either rethrowIO (const (expectationFailure "the owner should have ended in a failure")) ended
+    show failure `shouldSatisfy` ("the handoff broke" `isInfixOfString`)
+
   it "that fail are the engine's failure, and the VM stops cleanly" $ do
     ExceptionWithContext _ failure ← fatalSession fixedM1Profile (2, 8) realReader layout $ \session control runtime →
       withVm session runtime "failing" (defaultOptions OnArrival) {optWrap = failing} $ \vm → do
@@ -252,6 +262,7 @@ callbacks = describe "completions" $ do
                     Completion (\reply → completeRequest (submissionCompletion submission) reply >> completeRequest (submissionCompletion submission) reply)
                 }
         }
+    refusing endpoint = endpoint {endpointSubmit = \_ → throwIO (userError "the handoff broke")}
     failing endpoint =
       endpoint
         { endpointSubmit = \submission →

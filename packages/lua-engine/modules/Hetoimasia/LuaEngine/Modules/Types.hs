@@ -291,6 +291,8 @@ data Counts = Counts
   , jobsFailed ∷ !Int
   , jobsStopped ∷ !Int
   , waitersHeld ∷ !Int
+  , promisedHeld ∷ !Int
+  -- ^ Identities a request's admission reserved room for and the endpoint has not yet made jobs of.
   , bytesOrdinary ∷ !Word64
   , bytesActive ∷ !Word64
   , slotsFree ∷ !Int

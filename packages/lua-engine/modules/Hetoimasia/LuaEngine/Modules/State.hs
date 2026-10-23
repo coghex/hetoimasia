@@ -867,6 +867,7 @@ countsSTM c = do
       , jobsFailed = count (\job -> case jobOutcome job of Failed _ _ -> True; _ -> False)
       , jobsStopped = count (\job -> case jobOutcome job of Stopped -> True; _ -> False)
       , waitersHeld = sum (map jobWaiterCount jobs)
+      , promisedHeld = Set.size (csPromised st)
       , bytesOrdinary = chargedOrdinary (csCharges st)
       , bytesActive = chargedActive (csCharges st)
       , slotsFree = csSlotsFree st

@@ -171,6 +171,11 @@ loads = describe "an accepted load that meets a limit" $ do
     withSession tiny (2, 8) realReader layout $ \session _ runtime →
       withVm session runtime "ui" (defaultOptions OnArrival) $ \vm → do
         admitDriver session vm "x"
+        admitDriver session vm "w"
+        -- The dependency is cached first, so that the module will not suspend on it: nothing gives the
+        -- owner a chance to admit the boot load before the module asks for a second dependency.
+        command session vm "w" "start" "k0" [] (Just (fetch "d1.lua"))
+        awaitCounts vm (\c → jobsReady c == 1)
         command session vm "x" "start" "k1" [] (Just (fetch "held.lua"))
         awaitGate session "held"
         -- The owner is inside the module: the boot load is accepted from another thread, and its room
@@ -180,8 +185,8 @@ loads = describe "an accepted load that meets a limit" $ do
         failure ← awaitFailure session "x"
         fmap snd (requestFailureOf failure) `shouldSatisfy` maybe False (Text.isInfixOf "module_limit")
         awaitBootOutcome ticket >>= (`shouldBe` BootReady)
-        -- Three identities, none more: the module, the dependency that took the room it was given, and
-        -- the boot load that was promised the last; the second dependency was refused.
+        -- Three identities, none more: the dependency, the module, and the boot load that was promised
+        -- the last; the second dependency was refused.
         counts' vm >>= \c → (jobsHeld c, jobsReady c, jobsFailed c) `shouldBe` (3, 2, 1)
         atomically (lookupImmediate (vmCoordinator vm) (moduleIdentity (key' session "d2.lua")))
           >>= \found → case found of
