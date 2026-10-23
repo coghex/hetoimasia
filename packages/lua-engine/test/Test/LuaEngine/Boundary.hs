@@ -7,7 +7,8 @@
 -- package's public modules (and reads only through them), it exposes four
 -- modules, needs no GLFW, Vulkan, console, sample or game package, and is listed
 -- by the ordinary and CPU projects and not by the Vulkan project (LFE-22 wires
--- that).
+-- that). Its request, data and texture sublibraries are each held to their own
+-- dependencies and public imports.
 module Test.LuaEngine.Boundary (spec) where
 
 import Control.Monad (filterM)
@@ -135,6 +136,37 @@ spec = describe "the package and import boundary" $ do
     [file <> ": " <> name | (file, name) ← imported, not (permittedData name)] `shouldBe` []
     [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
 
+  it "has a texture sublibrary over the profile, the request adapter, the content package, the bounded PNG decoder, the foundation and the host's public modules, and nothing else" $ do
+    (sort <$> fieldEntries "library texture" "build-depends:")
+      `shouldReturn` [ "base"
+                     , "bytestring"
+                     , "containers"
+                     , "hetoimasia-asset"
+                     , "hetoimasia-asset-image"
+                     , "hetoimasia-content"
+                     , "hetoimasia-foundation"
+                     , "hetoimasia-lua-engine"
+                     , "hetoimasia-lua-engine:request"
+                     , "hetoimasia-scripting-lua"
+                     , "hetoimasia-scripting-lua:runtime-lua"
+                     , "stm"
+                     , "text"
+                     ]
+    fieldEntries "library texture" "exposed-modules:" `shouldReturn` ["Hetoimasia.LuaEngine.Texture", "Hetoimasia.LuaEngine.Texture.Backend"]
+
+  it "imports, in the texture sublibrary, only the profile, the request adapter, the content package's, the decoder's, the foundation's and the host's public modules and base libraries: no private module, window, GPU, GLFW, Vulkan, console, sample or game" $ do
+    sources ← sourcesUnder "texture"
+    sources `shouldSatisfy` ((>= 4) . length)
+    imported ← importedBy sources
+    [file <> ": " <> name | (file, name) ← imported, not (permittedTexture name)] `shouldBe` []
+    [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
+
+  it "keeps the texture backend port free of the host: it imports the host's retirement state and nothing else of it" $ do
+    sources ← sourcesUnder "texture"
+    imported ← importedBy sources
+    sort (nub [name | (file, name) ← imported, file == "Backend.hs", "Hetoimasia." `isPrefixOf` name])
+      `shouldBe` ["Hetoimasia.Scripting.Lua.Provider"]
+
   it "lets only the behavior selection import the Lua host and runtime, and only their public modules" $ do
     sources ← sourcesUnder "src"
     imported ← importedBy sources
@@ -208,6 +240,29 @@ spec = describe "the package and import boundary" $ do
                  , "Hetoimasia.Content.ReadPool"
                  ]
         || "Hetoimasia.Scripting.Lua." `isPrefixOf` name
+    permittedTexture name =
+      "Data." `isPrefixOf` name
+        || "GHC." `isPrefixOf` name
+        || "Control." `isPrefixOf` name
+        || "Hetoimasia.LuaEngine.Texture" `isPrefixOf` name
+        || name
+          `elem` [ "Hetoimasia.LuaEngine.Profile"
+                 , "Hetoimasia.LuaEngine.Request"
+                 , "Hetoimasia.Content.Identity"
+                 , "Hetoimasia.Content.Inventory"
+                 , "Hetoimasia.Content.ReadPool"
+                 , "Hetoimasia.Foundation.Resource"
+                 , "Hetoimasia.Foundation.Worker"
+                 , "Hetoimasia.Asset"
+                 , "Hetoimasia.Asset.Image"
+                 , "Hetoimasia.Asset.Image.PngDecode"
+                 , "Hetoimasia.Asset.Image.PngPreflight"
+                 , "Hetoimasia.Scripting.Lua.Admission"
+                 , "Hetoimasia.Scripting.Lua.Lease"
+                 , "Hetoimasia.Scripting.Lua.Provider"
+                 , "Hetoimasia.Scripting.Lua.Registration"
+                 , "Hetoimasia.Scripting.Lua.Value"
+                 ]
     permittedSuite name =
       name
         `elem` [ "Hetoimasia.LuaEngine.Manifest"
@@ -216,6 +271,7 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.LuaEngine.Profile"
                , "Hetoimasia.LuaEngine.Request"
                , "Hetoimasia.LuaEngine.Data"
+               , "Hetoimasia.LuaEngine.Texture"
                , "Hetoimasia.Content.ReadPool"
                , "Hetoimasia.Foundation.Time"
                , "Hetoimasia.Foundation.Log"
