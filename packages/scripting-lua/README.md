@@ -3098,6 +3098,18 @@ the failure attributed to the request): it is latched when the failure becomes e
 ever read the request, and applied at the owner's next safe boundary, before any more of the instance's ordinary work
 (see [Atomic request admission](#atomic-request-admission)).
 
+**The earlier notice.** An instance's ending is *parked* when a provider has yet to retire something the instance released,
+and it settles, and `instanceEscalate` is told, only when every such retirement has completed, so a failure whose own provider
+is slow to retire is not told for as long. An application whose policy must act on a failure at once (close its admission, stop
+granting ticks, ask its owner to stop) is told earlier, through `instanceOnFailing` of the instance configuration (default:
+nothing): on the owner's thread, once, as the ending *begins* with a failure (an `init`, `update`, callback or `run` that failed, a
+wait the scheduler refused, a required request's failure, a construction refusal), before the `shutdown` hook runs and before the
+release and the retirements. The record is the primary failure alone, `failureSecondary` empty, since nothing else has failed yet;
+`instanceEscalate` is still told, with the settled record, which carries what else failed as the instance ended. A failure that
+arises only in settling (a `shutdown` that raises after a stop, a release that fails) is told to `instanceEscalate` alone. What the
+notice raises is a failure of the host, as for `instanceOnSegment`. The Lua-first engine's session coordinator is the application
+that uses it ([the session coordinator](../lua-engine/README.md#the-session-coordinator-lfe-13)).
+
 Isolation is the default: the instance ends and the owner's other instances run on. The engine cannot
 tell whether state the instances share was damaged, so the application is told of each failure on the
 owner's thread (`instanceEscalate`), after the instance has ended, and decides `Isolate` or `Escalate`,
