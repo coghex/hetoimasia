@@ -442,6 +442,7 @@ test-suite lua-runtime-tests
         Test.LuaRuntime.Runner.Production
         Test.LuaRuntime.Runner.Query
         Test.LuaRuntime.Runner.Retirement
+        Test.LuaRuntime.Runner.Scripts
         Test.LuaRuntime.Runner.Sources
         Test.LuaRuntime.Runner.Tables
         Test.LuaRuntime.Runner.Ticks
