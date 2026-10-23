@@ -467,7 +467,9 @@ One transaction admits a request (the host's `startAdmitted`) and reserves, befo
 | The file's known length in the VM's `ByteBank` (`data bytes`) | this service, one bank per VM: the profile's `RetainedDataBytesPerVm` (64 MiB), made only by `newByteBankFor`; `dataService` refuses a bank whose limit is not the profile's | an eligible file (a zero-byte file reserves none but still a slot) |
 | One queue slot of the session's pool (`io queue`) | the pool | an eligible file |
 
-A bank without room is the host's busy answer, naming the bank, with **no file work and nothing left reserved**
+A closure that lands between the argument check and the admission (the owner ended, or the pipeline began closing) is a permanent
+refusal, never busy: the liveness credit fails inside the admission, and `startTexture` answers `TextureRefused` with the reason
+(`TextureStarted` carries the host's answer otherwise); the facade raises it as the error it is. A bank without room is the host's busy answer, naming the bank, with **no file work and nothing left reserved**
 (`catchSTM` undoes a half-made reservation: a request that wins the bytes and loses the slot leaves no byte charged).
 Two VMs asking at once for the pool's last slot get exactly one acceptance. A path the inventory does not hold, and a file
 over the data ceiling (`DataBytes`, 8 MiB), are **not** busy: they are accepted with only their records and fail as
@@ -560,6 +562,7 @@ One atomic admission (the host's `startAdmitted`) reserves, before the provider 
 
 | Reservation | Bank | Returned |
 |---|---|---|
+| Owner liveness (nothing is reserved) | the texture owner is open and the pipeline is open, read in the admission's own transaction | n/a |
 | Request and result records, the owner's places | the host: 16 per instance, 64 per VM | the result taken **and** the work retired |
 | Result lease capacity | the instance's lease scope | with the instance's lease |
 | One texture slot | `texture slots`: 16 pending/live/retiring per UI instance | the texture proved retired |
