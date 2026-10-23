@@ -96,7 +96,12 @@ cabal test hetoimasia-tests --test-show-details=direct
   fixed M1 profile and its smaller validated test profiles, and the package's
   dependency and import boundary, the manifest and entry boot checkpoint (LFE-6)
   composed with the content inventory over real temporary folders (`Test.LuaEngine.Boot`), the M1
-  behavior selection and the export-module and loader ceilings the profile gives a VM, and the M1 request adapter
+  behavior selection and the export-module and loader ceilings the profile gives a VM, the session coordinator
+  (LFE-13, `Test.LuaEngine.Session.*`, `--match Session`: the pure model and its invariants after every step of every sequence of
+  five events, and real Lua on real owners the coordinator starts, with an injected clock, a fake timer, recording sinks and held
+  points: both `init` orders, validation before either root, stop and failure on each side of the gates, the clocks and their
+  limits, the failure policy, the evidence, the stop and drain, construction and cancellation, and a separately compiled client),
+  and the M1 request adapter
   (LFE-7, `Test.LuaEngine.Request.*`): the busy record, the exact `ready`/`take`/`cancel`/`wait` records, handles
   and phases, the profile's limits, a texture lease, and required and optional failure, over real Lua instances on
   a supervised owner with controlled fake providers. The owned texture pipeline (LFE-16, `Test.LuaEngine.Texture.*`) is

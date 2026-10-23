@@ -8,7 +8,8 @@ limits with validated, smaller test profiles, the **M1 behavior selection**: whi
 export field each role selects, the exact cadence rules and the export-module ceilings,
 and the **boot checkpoint**: the proof, before any authored Lua, that the manifest
 parsed is the manifest the content scan pinned and that every declared entry names an
-inventoried regular file.
+inventoried regular file; and the **session coordinator** (LFE-13), which composes the
+selected roles' VMs into one session and owns how they start, advance, fail and stop together.
 
 The library opens no folder, starts no Lua, worker, window or GPU, prints nothing and
 exits nowhere. Its manifest, profile and behavior modules perform no IO: every function
@@ -18,9 +19,11 @@ imports no module that opens a file itself. The **M1 request adapter**
 (LFE-7) is the `request` sublibrary beside it, in a source directory of its own
 so that this one stays pure: see [below](#the-m1-request-adapter). The **raw-data provider**
 (LFE-10) is the `data` sublibrary, the **module coordinator** (LFE-11) the `modules` sublibrary, the **texture
-pipeline** (LFE-16) the `texture` sublibrary and the **authoring facade** (LFE-12) the `facade` sublibrary, for the same reason:
+pipeline** (LFE-16) the `texture` sublibrary, the **authoring facade** (LFE-12) the `facade` sublibrary and the **session
+coordinator** (LFE-13) the `session` sublibrary, for the same reason:
 see [the data provider](#the-raw-data-provider-lfe-10), [the coordinator](#the-module-coordinator-lfe-11),
-[the texture pipeline](#the-texture-pipeline-lfe-16) and [the facade](#the-authoring-facade-lfe-12).
+[the texture pipeline](#the-texture-pipeline-lfe-16), [the facade](#the-authoring-facade-lfe-12) and
+[the session coordinator](#the-session-coordinator-lfe-13).
 
 The library depends on `hetoimasia-foundation` (its `Duration`, checked
 nanoseconds from 1 to 2^64 − 1), on the Lua host and its runtime
@@ -44,6 +47,7 @@ composition to this package; they are not here.
 | `Hetoimasia.LuaEngine.Texture`, `Hetoimasia.LuaEngine.Texture.Backend` (sublibrary `texture`) | the texture pipeline: `textureSpec`, `withTexturePipeline`, `newTextureOwner`, `textureService`, `textureEndpoint`, `textureKey`, `startTexture`, `textureArgumentCheck`, `withTexture`, `releaseTexture`; and the backend port `TextureBackend`, `Upload`, `UploadSink` |
 | `Hetoimasia.LuaEngine.Scene` (sublibrary `scene`) | the fixed M1 scene schema: `sceneLimits`, `prepareScene`, `PreparedScene`, `SceneContent`, `textureUses`, `SceneRefusal`, `sceneCandidate`, `initialContent`, `sceneSchema`, `sceneArgumentCheck`, `scenePublishBinding` |
 | `Hetoimasia.LuaEngine.Facade` (sublibrary `facade`) | the M1 authoring surface of one VM: `newFacade`, `FacadeSpec`, `FacadeEndpoints`, `installFacade`, `facadeInstanceConfig`, `facadeRequestEndpoints`, `declareInstance`, `forgetInstance`, `inventoryResolver`, `lexicalResolver`, `withOutput`, `writeAuthored`, `newInstanceIds` |
+| `Hetoimasia.LuaEngine.Session`, `.Session.Failure`, `.Session.Harness`, `.Session.Pacing`, `.Session.State` (sublibrary `session`) | the session coordinator: `runSession`, `SessionSpec`, `Session`, `sessionStatus`, `sessionOutcomeNow`, `requestStop`, `latchTerminalFailure`; the status and outcome vocabulary, the failure schema and its bounds, the pure pacing arithmetic and the pure state machine; the harness's seams |
 
 Every other module is hidden. A client of the pure boundary imports the manifest, the profile and the behavior modules.
 
@@ -1216,15 +1220,150 @@ failing sinks, shutdown output and a facade made in part (`Sinks`); and a separa
 own examples prove what it added for this: the caller's instance, the segment notification, the named module phase, the
 two-word elapsed wait and the shared bounded output.
 
+## The session coordinator (LFE-13)
+
+`Hetoimasia.LuaEngine.Session` (the `session` sublibrary) composes one or two roles' VMs into one **session**: how the
+roles start, advance, fail and stop together. It is the CPU Lua-engine layer's coordinator: it builds each selected role's
+VM from the pieces above (a [module coordinator](#the-module-coordinator-lfe-11), the [data service](#the-raw-data-provider-lfe-10),
+the [facade](#the-authoring-facade-lfe-12) and a supervised scheduled owner that hosts instances), evaluates the selected entries,
+admits the roots, runs the roots' `init`s and the clocks over the Lua host's own scheduler, applies the failure policy and drains
+through actual retirement. It adds no scheduling, no world, no progress channel and no event API; it installs no signal handler,
+exits no process and writes nothing to a standard stream. The Lua status, quit and unavailable-state bindings are LFE-26's, which
+consume the endpoints below; the launcher that opens the content root, makes the checkpoint and maps an outcome to an exit status is LFE-22's.
+
+```haskell
+runSession           ∷ SessionSpec → (Session → IO ()) → IO SessionOutcome   -- on the thread that owns the supervision control
+sessionStatus        ∷ Session → STM SessionStatus                            -- nonblocking, coherent, bounded
+sessionOutcomeNow    ∷ Session → STM SessionOutcome                           -- failure over interruption over success, as it stands
+requestStop          ∷ Session → StopKind → IO ()                             -- StopQuit | StopInterrupt: no slot, idempotent
+latchTerminalFailure ∷ Session → RoleFailure → IO Bool                        -- the unavailable-state guard's latch; True the first time
+```
+
+`runSession` makes the session's state first and hands the `Session` to the callback before any VM exists, so a stop, a status read
+or a terminal-failure latch can be wired to whoever needs them without waiting on a VM; the callback must not block. It then runs
+the session on the calling thread, which must be the thread that owns the supervision control, because its waits are supervised
+ones, and returns only once **every role has actually retired**. The handle's endpoints are safe from any thread, so a native
+event loop never waits for an `init` or a tick: the control and progress seam is the handle, not the driver.
+
+### What a composition injects
+
+`SessionSpec` holds, and the coordinator passes on narrowed, the services it is given; it reaches no global, no environment record and no registry.
+
+| Field | What it is |
+| --- | --- |
+| `sxProfile`, `sxCheckpoint` | the validated profile every bound is read from, and the boot checkpoint: the manifest and the entry each selected role loads, validated against the content scan before any Lua |
+| `sxInventory`, `sxPool` | the anchored content and the session's pool of verified reads, which outlives every owner |
+| `sxLogger`, `sxOutput` | the coordinator's diagnostics (lifecycle at info, a failure once at error, component `luaengine.session`), and the authored output, the caller's scope |
+| `sxClock`, `sxTimer` | the monotonic clock the owners, the facades and the pacing share, and what sleeps (the threaded runtime's timer manager in production, a hand-fired one in a test) |
+| `sxRuntime`, `sxControl` | the Lua runtime the owners start on, and the supervision control of the driving thread |
+| `sxHarness` | `noHarness` for a real composition; see [the harness](#the-harness) |
+
+The content identifier an instance requests under, and the one root the facades enable, is the inventory's root. The roles are the
+checkpoint's: gameplay (with the manifest's exact tick), presentation, or both, whatever order the manifest listed them in.
+
+### What a session does, in order
+
+1. **Preflight, before any Lua.** A harness asking for a second instance of a role the session lacks, and a first logical deadline the clock cannot count (the reading plus one tick), are refused here as an engine failure.
+2. **Build each role's VM**, gameplay first, in nested scopes that release in the opposite order and stop each owner (and wait for its worker to have ended) before the coordinator, pool and output it borrows.
+3. **Evaluate each selected entry and its imports** in its own VM (a common entry separately in each), running no root. A module that does not evaluate is a boot failure attributed to the module, with no instance.
+4. **Admit the roots.** Each admission is *intended* in the session's state, *issued* to the owner and *tracked*; the owner constructs and validates the behavior (the export, hook, captured schema and cadence) and, at the point its `init` would begin, a hook parks the owner at the **dispatch gate**.
+5. **Open the dispatch gate** when every role's first instance has been validated and admission is complete: both `init`s are dispatched to their own owners without either waiting for the other. A failure or stop before that aborts the gate and a parked owner ends without running its `init`.
+6. **Observe the `init`s succeed.** The presentation role is `running` as soon as its own `init` has succeeded (its cadence starts there). The gameplay role is `ready` and waits. The **start gate** opens in the transaction that records the last selected `init`'s success, if no role has failed and no stop was asked; a one-role session needs only its own.
+7. **Tick.** The pacing origin is the clock reading when the start gate opened. Tick *n* is due *n* tick durations after it. Each tick is granted by itself, at its own due time or as soon after as the owner is free: none is skipped, merged or shortened, and a slow hook or a late assigned result delays the next grant without advancing time. After each tick the coordinator waits for the owner's *accounting* (the endings the tick began, their shutdowns, escalations and retirements) before granting the next.
+8. **End.** A stop, a failure of a policy that ends the session, or an owner that ended each close admission; the owners are asked to stop; the roles drain; each role retires when its owner's worker has ended and its coordinator has been closed and has given back every slot and byte.
+
+### The gates
+
+| Gate | Waits for | Opens | Aborted or shut by |
+| --- | --- | --- | --- |
+| Dispatch | the first instance of every selected role constructed and validated, and admission complete | once, in the transaction that records the last of them | any stop, any failure; an aborted gate never opens, and a late validation cannot reopen it |
+| Start | every selected role's own `init` (every admitted instance of it) to have succeeded, the dispatch gate open | once, in the transaction of the last success, when nothing has failed or stopped | any stop, any failure that arrives first (a boot failure); a late success is remembered and cannot reopen it |
+
+### Phases, admission and the status record
+
+`sessionStatus` publishes the facts LFE-26 copies into a UI segment: whole-session `stopping`, each role's presence (an absent role is `Nothing`), `initialized` (its own `init` succeeded, every instance of it; historical, it never becomes false), `phase` and an independent latched `failure`.
+
+| Phase | Meaning | Reached |
+| --- | --- | --- |
+| `starting` | the role's own `init` has not succeeded | at the start |
+| `ready` | gameplay: its `init` succeeded, the start gate is closed | gameplay, on its own success |
+| `running` | presentation: at its own success; gameplay: when the start gate opens | never for a failed or stopping role |
+| `stopping` | admission closed, by a stop or by the role's own failure | in the transition that closes admission |
+| `retired` | the owner's worker has ended (VM closed, every instance settled, every provider's retirement complete), the coordinator is closed and drained and no admission is in flight | by the driver, never by a stop request, a worker's exit or a cancellation acknowledgement |
+
+A role's admission (`endpointAdmission` of its facade) is `open`, `stopping` or `closed`; a content request in a stopping or closed role is an ordinary Lua error before any action, never `busy`. A failure latches once per role and the first stays; a failed role's phase is `stopping` and then `retired`, never `ready` or `running`.
+
+### The failure policy (D-42)
+
+| What failed | Effect |
+| --- | --- |
+| an `init` of either role, an entry module, or the presentation role before the start gate opened | **boot failure**: both roles' admission closes and both owners are asked to stop in the same transition, without waiting for the other `init` to report; both gates close |
+| a logical script, module or required-request failure after the start | the logical role's admission and tick grants close and its owner is asked to stop; the **presentation role goes on** with its own services until the whole session exits; the session is not `stopping` |
+| a presentation failure, or the failure of a session's only role | the whole session stops |
+| an engine, host, provider, output-sink or cleanup failure of any owner (and an arithmetic limit: a tick past 2^63 − 1, a deadline past the clock) | the whole session stops; the failure is that role's if its owner is known |
+| `latchTerminalFailure` | the whole session stops; it is the guard's, not an ordinary role failure |
+| `requestStop` | the whole session stops; nothing is a failure |
+
+An eventual stop cannot erase an earlier failure: the outcome ranks **failure over interruption over a normal quit over success**, whatever order they arrive in, and the quit and interruption flags are kept beside it. A required request's failure latches at its eligible position whether or not Lua ever polled the request (the host's rule); the coordinator is told as the failing instance's ending begins and acts then, whatever a provider is slow to retire.
+
+### The failure record and the engine report
+
+A role's failure (`RoleFailure`) is the approved schema: `code` (`lua_error`, `module_error`, `required_request`, `host_failure`, `cleanup_failure`, `state_unavailable`), `message`, `role`, `stage` (`module`, `init`, `update`, `shutdown`, `request`, `cleanup`, `engine`), and, when known, `content_id`, `instance_id`, `path` and `traceback`; an unknown one is absent and no instance is invented for module-only work. Each text is cut at a UTF-8 code point to the profile's bound and a cut ends in a visible `...`: message 2 KiB, traceback 8 KiB, instance identity 128 bytes, the whole record 16 KiB (the traceback is shortened first, then the message, then the path).
+
+The **engine report** accounts for every failure the session was told of: the first failure of any kind is its primary, at most `SecondarySummaries` (16) later ones are kept as summaries of at most `SecondarySummaryBytes` (2 KiB), and the rest are counted in `erOmitted`; the report stays within `EngineReportBytes` (64 KiB) whatever the primary's text. `outFailures` lists each failed role's first failure in the order they latched.
+
+### The clocks
+
+* **Logical.** The pacing arithmetic is checked and pure ("Hetoimasia.LuaEngine.Session.Pacing"): a due time the clock cannot count and a tick past the largest a Lua integer holds (2^63 − 1; the first tick is 1) end the session as an engine failure, never a wrapped value. A first deadline that is already impossible is refused before any Lua. The tick a script reads is the owner's tick plus a base that is zero outside the harness.
+* **Elapsed.** The presentation role's cadence, `dt` and coalescing are the host's; its public `seconds()` origin is the root `init`'s start (the point the dispatch gate opened), its cadence starts from its own `init`'s success, and the two are never conflated.
+
+### Stop and drain
+
+`requestStop` is one transaction on the state, then non-blocking requests to the owners: it takes no request, task or result slot, and a second request changes nothing. Admission is closed *before* an owner is asked to stop, so a start or a grant that raced it is refused or lands before it; a grant is either issued before the logical role's stop or not at all (the check and the issue are one step under the lock that stop passes through). Work already inside a Lua segment finishes (nothing is preempted) and its calls to release, cancel and write output still work. Each eligible `shutdown` runs once, with `stopped` for a normal or peer-driven stop and `failed` for the instance's own failure, and is skipped for a failed `init` and where Lua is unsafe; a missing or failing hook never suppresses engine cleanup. A held provider read keeps its role live and unretired until it retires.
+
+### State, owners and lifetimes
+
+The coordinator adds no queue: an admission is at most two per role, one tick is in flight, and nothing is retried.
+
+| State | Owner | Writers | Readers | Thread | Lifetime and disposal |
+| --- | --- | --- | --- | --- | --- |
+| the session state (`SessionState`, one `TVar`) | the `runSession` call | every event is one transaction: the owners' threads (the dispatch hook, the failure and escalation callbacks, an engine failure), the driving thread (admission, `init` success, retirement, a fault, the unwind), any thread (a stop, the terminal latch) | the status and outcome endpoints, each facade's admission endpoint, the hook waiting at the dispatch gate, the driver | any | the call; none to dispose |
+| the stoppers (`TVar (Map Role (IO ()))`) | the call | the driving thread, once per role as its owner appears (a stop already asked is run then) | whoever applies a transition that reports the role to be stopped | any | the call |
+| the grant lock (`MVar ()`) | the call | the driver, around the issue of one grant | the stop of the logical role, which passes through it | the driving thread and any stopper | the call |
+| the seen set, the tracked instances and the early-notice set | the call | the owners' threads (first hook, early notice), the driving thread (tracking) | the owners' hooks and callbacks, the driver | owners, driving | the call; at most two instances per role |
+| the driver (mode, schedule, grant in flight, finalized roles, observed instances) and the pacing timer | the driving thread | the driving thread only | the driving thread | the driving thread | the `operate` scope; the timer is disposed on every exit |
+| a role's coordinator, data bank, facade and owner | the role's scopes | the driving thread builds and releases; the owner's thread runs in it | the services above | per owner | released in reverse order, the owner stopped and its worker awaited first |
+
+### The order of a turn, a stop and a failure
+
+| Sequence | In order |
+| --- | --- |
+| an instance's failure | the segment fails and the scheduler marks the task failed (a grant may now be finished) → at the boundary the instance layer begins the ending → **the coordinator is told** (state: failure latched, admission closed, policy applied; stoppers: grant lock, owner asked to stop, coordinator closed) → the `shutdown` hook (`failed`) → release and drain → the retirements providers owe (the ending waits parked) → the instance settles → the escalation (accounts what else failed, never a second failure) → the owner's accounting is acknowledged → the driver's wait for the tick's accounting returns → no further grant |
+| a stop | the state transition (flags, every admission closed, gates aborted or shut) → the grant lock (logical role) → every owner asked to stop → a running segment returns → each `shutdown` (`stopped`) → release and drain → providers retire → the owner's worker ends → the driver finalizes it (its outcome and any retained cleanup failure are accounted, the coordinator closed) → the role retires once the coordinator is drained and no admission is in flight |
+| a tick | the timer is armed for the due time → the wake → the clock is read → the check of the logical role's admission and the issue of the grant under the lock → the grant in flight → the scheduler finishes it (or the owner ends) → the owner's accounting → the schedule advances (a deadline the clock cannot count ends the session) |
+| startup | preflight → the roles built → entries evaluated → admissions intended, issued, tracked → admission complete → each owner constructs and validates and parks → the dispatch gate opens → `init`s run → the driver observes the successes → the start gate opens and the origin is read → ticks |
+
+### The host's failure notice
+
+The Lua host settles an instance's ending only after the providers it asked have retired, and tells the application's escalation then, so a failure whose own provider is slow would be unknown until it retired. The host therefore also tells the application, once, as an ending *begins* with a failure (`instanceOnFailing`, default: nothing), with the primary failure alone; the settled record the escalation is told adds what else failed. The coordinator acts on the first and accounts the second.
+
+### The harness
+
+`Hetoimasia.LuaEngine.Session.Harness` is what a test composes; none of it is reachable from a manifest or from Lua, and a real composition passes `noHarness`. It names the points of a session's life (`Built`, `Released`, `Intended`, `Issued`, `Tracking`, `Validating`, `Dispatched`, `GrantIntent`, `GrantIssued`, `OwnerEnded`) so a test can hold the thread that reaches one, or make it raise, to place a stop or a failure in an exact window; it asks for the second instance of a role on the same VM that the design keeps for qualifying reusable bindings (never public spawning); and it sets the tick counter's base, so the Lua integer ceiling is reached without granting 2^63 ticks. The second instance is validated with the first: both read the role's one captured export, so the owner's thread, parked once, cannot validate a peer behind it.
+
+### What proves it
+
+`Test.LuaEngine.Session.*` (group `test.lua-engine`) run real Lua on real supervised owners the coordinator starts, over a real content root, manifest, boot checkpoint, inventory and read pool, an injected clock and a fake timer, recording sinks and gates, and no sleep: the pure model (every gate, phase, admission and policy transition, and the invariants after every step of every sequence of five events); the startup (both `init` orders, the presentation role starting while a logical `init` is held in Lua and at the dispatch point, the common and per-role entries and either manifest order, each one-role session, a missing `init`, validation of an invalid cadence or module in either role starting neither, content requested during `init`); a stop or failure on each side of each gate (between intent and issuance, accepted and untracked, at the gate, while an `init` is held, just before the start gate would open, while a role is still being built); the clocks (exact ticks, a slow hook, no debt for the wait, first in first out with a yield, no overlapping update, the elapsed coalescing and `dt`, the two origins, the Lua ceiling and an impossible deadline before and after the start); the failure policy (a logical failure beside a healthy presentation role with no later grant, a required request nothing polled, a failure published while a provider holds the role, a presentation failure, a one-role failure, the terminal latch, a provider fault, a sink fault, a cleanup fault that ends a healthy presentation role, an optional failure and a caught validation error that do not); the evidence (the first failure kept, the multibyte bounds, failure over interruption); the stop and drain (every place taken, shared module jobs, a peer's holdings, the shutdown dispositions); construction and cancellation (every step released once, release failures kept beside the failure, the calling thread cancelled at four windows); and a separately compiled client that opens a root, makes the checkpoint and runs a session through public modules alone.
+
 ## Deferred, by design
 
 Not here, and not claimed: the CLI `run` dispatch and exit mapping (LFE-22), which will
 consume the boot checkpoint and retain the same anchored root;
 the concrete GPU upload and registration, native budgets, scene holds and the atomic publication of a prepared scene (LFE-17 to LFE-20), the public Lua graphics binding (LFE-21),
 the graphics and status service facades (the content, request, time and output surface is [the facade](#the-authoring-facade-lfe-12);
-the texture pipeline's typed endpoint is still its own) and the session's real role, grant and admission policy, the role gate and session
-startup that consume the boot load's outcome and supply the facade's injected endpoints (LFE-13), `api.session`, `quit` and the
-unavailable-state `state` guard (LFE-26); live codec, texture and GPU budgets and their
+the texture pipeline's typed endpoint is still its own), `api.session`, `quit` and the
+unavailable-state `state` guard (LFE-26), which consume [the session coordinator's](#the-session-coordinator-lfe-13) status, stop and terminal-failure endpoints,
+the launcher that opens the content root, makes the checkpoint, installs the signal handlers and maps the outcome to an exit status (LFE-22); live codec, texture and GPU budgets and their
 enforcement; real pacing; mods, metadata extensions, alternate manifest formats, defaults or relaxed parsing.
 
 ## Tests
@@ -1245,4 +1384,4 @@ injected upload backend (see above). It covers the accepted
 examples, every syntax and schema refusal with the limits at their boundary and
 one past, the exact tick endpoints and forbidden forms, every fixed value against
 an independently written expectation, valid smaller profiles and refused ones,
-the behavior selection's cadence rules and numeric boundaries, the boot checkpoint (see above), the request adapter (see above), the raw-data provider (see above), the module coordinator (see above), the texture pipeline (see above), the scene schema (see above), the authoring facade (see above), and this package's dependency and import boundary.
+the behavior selection's cadence rules and numeric boundaries, the boot checkpoint (see above), the request adapter (see above), the raw-data provider (see above), the module coordinator (see above), the texture pipeline (see above), the scene schema (see above), the authoring facade (see above), the session coordinator (see above), and this package's dependency and import boundary.
