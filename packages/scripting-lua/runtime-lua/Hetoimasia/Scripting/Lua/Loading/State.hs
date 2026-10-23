@@ -196,12 +196,14 @@ data LoaderHooks = LoaderHooks
   , hookReserved ∷ ExportIdentity → IO Int
     -- ^ How many identities other than this one the application has reserved room for and has not
     -- had admitted: the loader's 'loaderReserved'.
-  , hookObserved ∷ ExportIdentity → BoundaryFault → IO Text
+  , hookObserved ∷ ExportIdentity → BoundaryFault → IO (Maybe Text)
     -- ^ Code outside any module's evaluation (a hook, or a helper a hook called) looked up an
-    -- identity that has failed, with the fault it failed with: the attributed reason the instance
-    -- whose code ran fails with. The instance fails once the owner reaches its next safe boundary,
-    -- whatever the code did with the error the lookup raised; nothing fails when no instance's code
-    -- was running.
+    -- identity that has failed, with the fault it failed with. An application that makes the failure
+    -- required (the M1 coordinator) answers the attributed reason the instance whose code ran fails
+    -- with: it fails once the owner reaches its next safe boundary, whatever the code did with the
+    -- error the lookup raised, and nothing fails when no instance's code was running. 'Nothing' (what
+    -- 'noLoaderHooks' answers) leaves the lookup an ordinary, catchable error and the instance as it
+    -- was: the latch is opt-in.
   , hookExit ∷ IO ()
     -- ^ The owner is exiting and the loader has been stopped, on the owner's thread: the application
     -- ends its own work for the VM. Runs whatever the stop came to.
@@ -209,7 +211,7 @@ data LoaderHooks = LoaderHooks
 
 -- | Hooks that do nothing.
 noLoaderHooks ∷ LoaderHooks
-noLoaderHooks = LoaderHooks (pure ()) (\_ → pure ()) (\_ → pure ()) (const (pure 0)) (\_ _ → pure "(import) module_error: a required module failed") (pure ())
+noLoaderHooks = LoaderHooks (pure ()) (\_ → pure ()) (\_ → pure ()) (const (pure 0)) (\_ _ → pure Nothing) (pure ())
 
 defaultLoaderBound ∷ Int
 defaultLoaderBound = 64

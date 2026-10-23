@@ -540,8 +540,10 @@ instance Show ScheduledOwner where
 -- worker's fatal outcome propagate as supervision decides. See 'ScheduledStart' for
 -- the other endings.
 -- | The loader's configuration with what a lookup of a failed module means for the instance whose code
--- made it, outside any module's evaluation: that instance fails with the module's failure, whatever its
--- code does with the error the lookup raised (D-52's required failure, applied to a module).
+-- made it, outside any module's evaluation, when the plan's application makes that failure required
+-- ('hookObserved' answers a reason): that instance fails with the module's failure, whatever its code
+-- does with the error the lookup raised (D-52's required failure, applied to a module). A plan whose
+-- hook answers nothing, which is every plan that does not opt in, keeps the ordinary catchable error.
 observing ∷ Maybe Instances → LoaderPlan → LoaderConfig → LoaderConfig
 observing hosted plan config = case hosted of
   Nothing → config
@@ -549,7 +551,7 @@ observing hosted plan config = case hosted of
     config
       { loaderObserved = \identity fault → do
           reason ← hookObserved (planHooks plan) identity fault
-          void (atomically (latchRunningFailure instances "module" reason))
+          forM_ reason $ \why → void (atomically (latchRunningFailure instances "module" why))
       }
 
 startScheduledOwner ∷ HasCallStack ⇒ LuaRuntime → ScheduledSpec → IO ScheduledStart

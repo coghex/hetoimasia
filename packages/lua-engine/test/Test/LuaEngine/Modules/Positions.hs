@@ -10,6 +10,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as Char8
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
+import Hetoimasia.Scripting.Lua.Loading (LoaderHooks (hookObserved), LoaderPlan (planHooks), noLoaderHooks)
 import Hetoimasia.Scripting.Lua.Provider (ProviderDiagnostics (rdOutstanding))
 import Hetoimasia.Scripting.Lua.Value (Value (VText))
 import Test.Hspec
@@ -280,6 +281,25 @@ failures = describe "a required failure" $ do
         awaitNote session "y take ky {status=cancelled}"
         command session vm "y" "lookup" "k0" [("path", VText "broken_second.lua")] Nothing
         awaitNote session "y lookup k0 failed module_error #broken_second.lua"
+
+  it "stays an ordinary, catchable error for a plan that does not opt in: only the coordinator makes the failure required" $
+    withSession fixedM1Profile (2, 8) realReader layout $ \session _ runtime →
+      -- The plan as any generic caller has it: the coordinator's hooks, and the default for the observed lookup.
+      withVm session runtime "ui" (defaultOptions OnArrival) {optPlan = \plan → plan {planHooks = (planHooks plan) {hookObserved = hookObserved noLoaderHooks}}} $ \vm → do
+        admitDriver session vm "x"
+        admitDriver session vm "y"
+        command session vm "x" "start" "ku" [] (Just (fetch "util.lua"))
+        awaitNote session "x start ku started"
+        command session vm "x" "keep" "ku" [("name", VText "util")] Nothing
+        awaitNote session "x keep ku {status=success,value=table(util)}"
+        command session vm "y" "start" "kb" [] (Just (fetch "bad.lua"))
+        _ ← awaitFailure session "y"
+        command session vm "x" "call" "util" [("field", VText "lookup"), ("text", VText "bad.lua")] Nothing
+        line ← lineStartingWith session "x call util error"
+        line `shouldSatisfy` Text.isInfixOf "failed"
+        -- Caught, and the instance goes on: it still answers the next command.
+        command session vm "x" "lookup" "k0" [("path", VText "bad.lua")] Nothing
+        awaitNote session "x lookup k0 failed module_error #bad.lua"
 
   it "is told apart by identity when two modules fail with the same label and the same fault" $
     withSession fixedM1Profile (2, 8) realReader layout $ \session _ runtime →

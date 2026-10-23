@@ -499,11 +499,12 @@ blockedSTM = needJob
 -- | The attributed reason an instance fails with when its code, outside any module's evaluation, ran into
 -- the failure of an identity (even if it caught the error): the failure told as a request's expected
 -- failure is, with the content that failed.
-observedReasonSTM ∷ Coordinator → ExportIdentity → BoundaryFault → STM Text
+observedReasonSTM ∷ Coordinator → ExportIdentity → BoundaryFault → STM (Maybe Text)
 observedReasonSTM c identity fault = do
   st <- readState c
   let located = maybe (Nothing, Nothing) (\job -> (Just job, Just (failureFor st job fault))) (Map.lookup identity (csJobs st))
-  pure $ case located of
+  -- Every external module request is required (issue #525, requirement 6): the coordinator always opts in.
+  pure . Just $ case located of
     (_, Just failure) ->
       clipBytes messageLimit ("(import) " <> failureCode failure <> ": " <> failureMessage failure <> " [" <> failureRoot failure <> ":" <> failurePath failure <> "]")
     _ -> "(import) module_error: a required module failed"
