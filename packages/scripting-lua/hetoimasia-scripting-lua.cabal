@@ -308,6 +308,7 @@ test-suite lua-host-tests
     c-sources: test/cbits/hetoimasia_lua_hooks.c
     other-modules:
         Test.Lua.Boundary.ArgumentChecks
+        Test.Lua.Boundary.ArgumentLimits
         Test.Lua.Boundary.Bindings
         Test.Lua.Boundary.Dependencies
         Test.Lua.Boundary.Discipline

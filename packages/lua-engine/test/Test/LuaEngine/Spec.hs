@@ -12,6 +12,7 @@ import qualified Test.LuaEngine.Manifest.Syntax as Syntax
 import qualified Test.LuaEngine.Manifest.Tick as Tick
 import qualified Test.LuaEngine.Profile as Profile
 import qualified Test.LuaEngine.Request.Spec as Requests
+import qualified Test.LuaEngine.Scene.Spec as Scene
 import qualified Test.LuaEngine.Texture.Spec as Texture
 import Test.Hspec (Spec, describe)
 
@@ -25,6 +26,7 @@ spec = describe "LuaEngine" $ do
   Requests.spec
   Data.spec
   Texture.spec
+  Scene.spec
   Behavior.spec
   Boot.spec
   Loader.spec

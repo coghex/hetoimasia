@@ -300,6 +300,10 @@ spec = describe "acquiring" $ do
       entries ← history fixture
       entries `shouldSatisfy` elem "mine asset cache-asset"
       entries `shouldSatisfy` elem "cached usable false"
+      -- The same borrow handed back as data: its own resource is lent, another instance's is refused in the
+      -- same words as the fault, and the instance that asked is not faulted by asking.
+      entries `shouldSatisfy` elem "mine try ok asset cache-asset"
+      entries `shouldSatisfy` elem "cached try refused: the lease belongs to another instance"
       retireScheduled owner
       _ ← awaitScheduledTerminal control owner
       pure ()
