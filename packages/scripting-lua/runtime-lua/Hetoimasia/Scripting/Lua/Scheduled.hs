@@ -298,7 +298,7 @@ module Hetoimasia.Scripting.Lua.Scheduled
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (ExceptionWithContext, SomeException, evaluate, finally, mask, mask_, rethrowIO, tryWithContext)
-import Control.Monad (forM, forM_, join, unless, when)
+import Control.Monad (forM, forM_, join, unless, void, when)
 import Data.Foldable (toList, traverse_)
 import Data.Maybe (isJust)
 import qualified Data.List.NonEmpty as NonEmpty
@@ -339,7 +339,7 @@ import Hetoimasia.Scripting.Lua.Internal.Value (checkLimits)
 import Hetoimasia.Scripting.Lua.Instance.Behavior (behaviorDriverSource)
 import Hetoimasia.Scripting.Lua.Instance.Driver (connectNamespace, driverNamespaceName, driverSource)
 import Hetoimasia.Scripting.Lua.Instance.Run (gateOf)
-import Hetoimasia.Scripting.Lua.Instance.State (isInstanceTask)
+import Hetoimasia.Scripting.Lua.Instance.State (isInstanceTask, latchRunningFailure)
 import Hetoimasia.Scripting.Lua.Lifecycle (LifecycleGrant, LifecycleRefused (LifecycleRefused), lifecycleContextOf, newLifecycleState, resolveGrant)
 import Hetoimasia.Scripting.Lua.Instance.Types
   ( InstanceBounds (boundLiveInstances)
@@ -350,7 +350,7 @@ import Hetoimasia.Scripting.Lua.Instance.Types
   , newInstances
   , validateInstanceConfig
   )
-import Hetoimasia.Scripting.Lua.Owner (ModuleRef (moduleRefName), VmConfig (vmExports, vmLifecycle, vmLoader, vmModules, vmOwnerName, vmPolicy, vmRegistration, vmRequests, vmValueLimits))
+import Hetoimasia.Scripting.Lua.Owner (LoaderConfig (loaderObserved), ModuleRef (moduleRefName), VmConfig (vmExports, vmLifecycle, vmLoader, vmModules, vmOwnerName, vmPolicy, vmRegistration, vmRequests, vmValueLimits))
 import Hetoimasia.Scripting.Lua.Registration (registration, registrationCapabilityTypes, registrationNamespaces)
 import Hetoimasia.Scripting.Lua.Runtime.Shared
 import Hetoimasia.Scripting.Lua.Runtime.Types
@@ -367,7 +367,7 @@ import Hetoimasia.Scripting.Lua.Provider.Types (EventEndpoint (..), RequestGrant
 import Hetoimasia.Scripting.Lua.Provider.Call (RequestHandles, RequestHandlesRefused (RequestHandlesRefused), bindRequestHandles)
 import Hetoimasia.Scripting.Lua.Request (requestContextOf)
 import Hetoimasia.Scripting.Lua.Lending.Loan (Lending, bindLending, sameLending)
-import Hetoimasia.Scripting.Lua.Loading.State (LoaderEndpoint (LoaderEndpoint), LoaderPlan, LoaderPlanRefused (LoaderPlanRefused), loadingConfig, newLoadingState, validatePlan)
+import Hetoimasia.Scripting.Lua.Loading.State (LoaderEndpoint (LoaderEndpoint), LoaderHooks (hookObserved), LoaderPlan (planHooks), LoaderPlanRefused (LoaderPlanRefused), loadingConfig, newLoadingState, validatePlan)
 import Hetoimasia.Scripting.Lua.Scheduled.Run (runScheduledOwner)
 import Hetoimasia.Scripting.Lua.Scheduled.Shared (awaitWorkerEnded, propagateAll)
 import Hetoimasia.Scripting.Lua.Scheduled.Types
@@ -401,6 +401,7 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , holdTick
   , newScheduler
   , oweTick
+  , tickQuietBefore
   , readDiagnostics
   , readTick
   , releaseOwed
@@ -538,6 +539,21 @@ instance Show ScheduledOwner where
 -- and 'CallbackWaitRefused' from a thread running a Lua callback. A failure of initialization, a cancellation of the creator and another
 -- worker's fatal outcome propagate as supervision decides. See 'ScheduledStart' for
 -- the other endings.
+-- | The loader's configuration with what a lookup of a failed module means for the instance whose code
+-- made it, outside any module's evaluation, when the plan's application makes that failure required
+-- ('hookObserved' answers a reason): that instance fails with the module's failure, whatever its code
+-- does with the error the lookup raised (D-52's required failure, applied to a module). A plan whose
+-- hook answers nothing, which is every plan that does not opt in, keeps the ordinary catchable error.
+observing ∷ Maybe Instances → LoaderPlan → LoaderConfig → LoaderConfig
+observing hosted plan config = case hosted of
+  Nothing → config
+  Just instances →
+    config
+      { loaderObserved = \identity fault → do
+          reason ← hookObserved (planHooks plan) identity fault
+          forM_ reason $ \why → void (atomically (latchRunningFailure instances "module" why))
+      }
+
 startScheduledOwner ∷ HasCallStack ⇒ LuaRuntime → ScheduledSpec → IO ScheduledStart
 startScheduledOwner runtime spec = do
   refuseCallbackWait "start-scheduled-owner"
@@ -663,7 +679,7 @@ startScheduledOwner runtime spec = do
                 -- everything that already ended the owner has done this.
                 (\held → atomically (settleAll held ExitFailed))
           )
-          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) (fmap (\(_, instanceConfig, _) → instanceEscalate instanceConfig) hosted) (scheduledLending spec) (scheduledLeases spec) (scheduledMemberLimit spec) config {vmLifecycle = lifecycleContextOf <$> lifecycle, vmRequests = requestContextOf <$> provider, vmLoader = (\(plan, state) → loadingConfig state plan) <$> loading})
+          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) (fmap (\(_, instanceConfig, _) → instanceEscalate instanceConfig) hosted) (scheduledLending spec) (scheduledLeases spec) (scheduledMemberLimit spec) config {vmLifecycle = lifecycleContextOf <$> lifecycle, vmRequests = requestContextOf <$> provider, vmLoader = (\(plan, state) → observing (fmap (\(instances, _, _) → instances) hosted) plan (loadingConfig state plan)) <$> loading})
   -- Acquisition is masked from the worker's start to the endpoint's handoff, and
   -- only the readiness wait is restored, exactly as for a finite-call owner.
   mask $ \restore → do
@@ -706,6 +722,7 @@ ticksFor scheduler stopping =
     , ticksRelease = releaseTick scheduler
     , ticksOwe = oweTick scheduler
     , ticksOweRelease = releaseOwed scheduler
+    , ticksQuiet = tickQuietBefore scheduler
     , ticksWatch = watchTick scheduler
     , ticksOpen = do
         closed ← schedulerClosed scheduler

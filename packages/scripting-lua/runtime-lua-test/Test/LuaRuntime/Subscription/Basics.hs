@@ -484,6 +484,17 @@ spec = describe "on an owner on elapsed time" $ do
         awaitLine fixture "size a 5"
 
   describe "a refused subscribe" $ do
+    it "quotes a script's endpoint name in the refusal in UTF-8 bytes, cut between characters" $ bounded $ do
+      fixture ← newIFixture
+      fake ← newFakeEvents
+      withBoundary $ \_ runtime → eventsFinish fake $ do
+        owner ←
+          startSubscriber fixture runtime "refused name" [subscriber] subConfig SettleOnArrival (subGrant fake 1 16) requiredPolicy
+        _ ← admitWith fixture owner "w" (InstanceRequest (moduleNamed "subscriber") EventOnly (Just "w") OrdinaryClass ["cmd", "ticks"])
+        awaitPhase fixture owner "w" Active
+        commandWith fixture owner "w" "subscribe" "a" (Just (Text.replicate 64 "😀")) Nothing
+        -- 64 four-byte characters are 256 bytes: the refusal quotes the 16 that fit in 64 bytes.
+        refusalOf fixture "w" >>= (`shouldSatisfy` maybe False (Text.isInfixOf ("no event endpoint named " <> Text.replicate 16 "😀" <> " is granted")))
     it "is a fault of the call: an endpoint the instance was not granted, one the owner does not offer, and a full owner" $ bounded $ do
       fixture ← newIFixture
       fake ← newFakeEvents

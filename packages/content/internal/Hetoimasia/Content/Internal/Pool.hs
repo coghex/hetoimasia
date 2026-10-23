@@ -71,6 +71,7 @@ module Hetoimasia.Content.Internal.Pool
   , ReadTicket
   , submit
   , cancel
+  , withdrawQueued
   , CancelOutcome (..)
   , retired
   , ticketKey
@@ -515,6 +516,22 @@ cancel (ReadTicket var job) =
     JobDone → pure CancelTooLate
     JobNotifying _ → CancelInFlight <$ writeTVar (jobState job) (JobNotifying True)
     JobWithdrawn → pure CancelTooLate
+
+-- | Withdraw a job only if no worker has taken it. 'True' when it was still queued: it left the
+-- queue, no file was opened, its sink will not be called and it has retired. 'False' otherwise, with
+-- nothing changed: a worker holds it (or it finished), and its sink will still be called unless the
+-- consumer 'cancel's it. A consumer that must get its sink call back for every job a worker took
+-- (to return the slot it reserved from there) uses this and never 'cancel's an issued job. It and
+-- issuance are transactions on one state, so exactly one of them wins a job that is still queued.
+withdrawQueued ∷ ReadTicket → STM Bool
+withdrawQueued (ReadTicket var job) =
+  readTVar (jobState job) >>= \case
+    JobQueued → do
+      st ← readTVar var
+      writeTVar var st {psQueue = Map.delete (jobOrder job) (psQueue st), psLive = psLive st - 1}
+      writeTVar (jobState job) JobWithdrawn
+      pure True
+    _ → pure False
 
 -- | Whether the job has retired: its sink has been called (or suppressed), or it was withdrawn.
 -- A pure reading with no write, as a retirement reading must be.

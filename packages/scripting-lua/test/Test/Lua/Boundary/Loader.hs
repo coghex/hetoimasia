@@ -14,7 +14,7 @@ module Test.Lua.Boundary.Loader (spec) where
 
 import Control.Concurrent (myThreadId)
 import Control.Monad (forM_)
-import Data.IORef (readIORef)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Owner
@@ -32,7 +32,7 @@ settledIds = map fst . advanceSettled
 -- the fault the dependency failed with.
 dependencyOf ∷ BoundaryFault → Maybe (Text, BoundaryFault)
 dependencyOf fault = case boundaryReason fault of
-  ModuleRefused (DependencyFailed label inner) → Just (label, inner)
+  ModuleRefused (DependencyFailed label _ inner) → Just (label, inner)
   _ → Nothing
 
 -- | A module that marks, imports, and returns what it was given.
@@ -518,6 +518,30 @@ spec = describe "the module loader" $ do
         -- The helper belongs to a module of the mod root, so its import is a module of that root,
         -- whichever module's hook called it.
         traced rig >>= (`shouldSatisfy` any (Text.isInfixOf "module_not_ready: mod:x"))
+
+  describe "a lookup of a failed module outside any module's evaluation" $
+    it "tells the application, once for each lookup that finds the failure, whatever the hook does with the error" $ do
+      seen ← newIORef []
+      let observing config =
+            config
+              { vmModules = [hookDriver]
+              , vmLoader = fmap (\loader → loader {loaderObserved = \identity fault → modifyIORef' seen ((identity, boundaryReason fault) :)}) (vmLoader config)
+              }
+      withRigAt observing $ \rig owned → do
+        _ ← supply rig owned "bad" ["error('no')"]
+        _ ← supply rig owned "hook" ["return { gameplay = { init = function(self, api) local ok = pcall(import, 'bad') local again = pcall(import, 'bad') local absent = pcall(import, 'absent') trace.mark('caught:' .. tostring(ok) .. tostring(again) .. tostring(absent)) end } }"]
+        _ ← admit owned "bad"
+        _ ← admit owned "hook"
+        _ ← advance owned
+        runInit owned "hook"
+        -- The error was caught, and the script went on; the application was told all the same, for
+        -- the two lookups that found the failure and for no other.
+        traced rig >>= (`shouldSatisfy` elem "caught:falsefalsefalse")
+        found ← readIORef seen
+        map fst found `shouldBe` [ident "bad", ident "bad"]
+        forM_ found $ \(_, reason) → case reason of
+          ScriptFailed {} → pure ()
+          other → expectationFailure ("expected the module's own failure, found " <> show other)
 
   describe "the resolver's refusals" $ do
     it "are ordinary Lua errors before any identity, source interest or frame, and do not latch a failure" $

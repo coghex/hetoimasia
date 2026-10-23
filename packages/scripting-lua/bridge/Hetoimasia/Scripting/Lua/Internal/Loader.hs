@@ -93,6 +93,8 @@ module Hetoimasia.Scripting.Lua.Internal.Loader
   , loaderHost
     -- * Operations of the owner
   , admitRoot
+  , admitRootAt
+  , promoteRoot
   , deliverSource
   , advanceLoader
   , lookupModule
@@ -107,12 +109,11 @@ import qualified Data.ByteString as ByteString
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
-import Data.Sequence (Seq, ViewL (EmptyL, (:<)), (|>))
-import qualified Data.Sequence as Seq
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Data.Text.Unsafe (lengthWord8)
+import Data.Word (Word64)
 import Foreign.Ptr (nullPtr)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure, withOperationContext)
@@ -156,9 +157,14 @@ data Loader = Loader
 -- once.
 data LoaderState = LoaderState
   { lsOpen ∷ !Bool
-  , lsQueue ∷ !(Seq ExportIdentity)
-    -- ^ Roots admitted and not yet started, in the order the coordinator admitted
-    -- them.
+  , lsQueue ∷ !(Map.Map (RootOrder, Word64) ExportIdentity)
+    -- ^ Roots admitted and not yet started, by the order the coordinator gave them and, for
+    -- equal orders, the order it admitted them in.
+  , lsPlace ∷ !(Map.Map ExportIdentity (RootOrder, Word64))
+    -- ^ Where each queued root stands in 'lsQueue': exactly the queued identities.
+  , lsAdmitted ∷ !Word64
+    -- ^ How many roots have been queued: the arrival number that breaks ties between equal
+    -- orders. Never reused.
   , lsEntries ∷ !(Map.Map ExportIdentity Entry)
     -- ^ Exactly the identities whose record is pending.
   , lsChain ∷ ![Frame]
@@ -208,8 +214,9 @@ newtype Running = Running
   { runningThread ∷ State
   }
 
-admitOperation, deliverOperation, advanceOperation, lookupOperation, stopOperation, importOperation, countOperation ∷ Operation
+admitOperation, promoteOperation, deliverOperation, advanceOperation, lookupOperation, stopOperation, importOperation, countOperation ∷ Operation
 admitOperation = operation "admit-root"
+promoteOperation = operation "promote-root"
 deliverOperation = operation "deliver-source"
 advanceOperation = operation "advance-loader"
 lookupOperation = operation "lookup-module"
@@ -225,7 +232,9 @@ newLoader host config =
     <$> newIORef
       LoaderState
         { lsOpen = True
-        , lsQueue = Seq.empty
+        , lsQueue = Map.empty
+        , lsPlace = Map.empty
+        , lsAdmitted = 0
         , lsEntries = Map.empty
         , lsChain = []
         , lsRunning = Nothing
@@ -327,6 +336,7 @@ arrivalOfAnswer limits = \case
     | ByteString.length bytes > exportMaxSourceBytes limits → ArrivedOversize
     | otherwise → Arrived (ByteString.copy bytes)
   SourceFailure why → ArrivedFailed (boundReason why)
+  SourceNoRoom → ArrivedFailed "no room for the module"
 
 -- ---------------------------------------------------------------------------------
 -- Admission
@@ -343,7 +353,19 @@ arrivalOfAnswer limits = \case
 -- An acquire that raises takes back what this admission recorded and raises: the
 -- supplier holds no interest in an identity it did not acquire.
 admitRoot ∷ HasCallStack ⇒ Loader → RootRequest → IO RootAdmission
-admitRoot loader request =
+admitRoot loader request = admitRootWith loader request arrivalOrder False
+
+-- | 'admitRoot' for a root the coordinator has placed: it starts when no root with an
+-- earlier order is waiting (equal orders in the order admitted), whatever order its source
+-- arrived in. @reserved@ says the application reserved room for the identity when it
+-- accepted the root, counted by 'loaderReserved' until now, so the bound is not asked again:
+-- a root that was promised a record is never refused for want of one. The reservation is
+-- the application's to keep exact; an identity the loader already holds consumes none.
+admitRootAt ∷ HasCallStack ⇒ Loader → RootRequest → RootOrder → Bool → IO RootAdmission
+admitRootAt = admitRootWith
+
+admitRootWith ∷ HasCallStack ⇒ Loader → RootRequest → RootOrder → Bool → IO RootAdmission
+admitRootWith loader request order reserved =
   withOperationContext luaComponent admitOperation [("module", label)] $
     withOpenVm (vmOf loader) admitOperation $ \_ → do
       s ← readState loader
@@ -361,7 +383,7 @@ admitRoot loader request =
                 Just ExportEvaluating → enqueue identity >> pure RootJoined
                 Just _ → pure (RootSettled (statusOf loader records identity))
                 Nothing
-                  | Map.size records >= exportMaxIdentities (limitsOf loader) →
+                  | not reserved && Map.size records >= exportMaxIdentities (limitsOf loader) →
                       pure (RootRefused (RootCacheFull (exportMaxIdentities (limitsOf loader))))
                   | otherwise → do
                       let kept = ExportIdentity (ByteString.copy raw)
@@ -381,12 +403,61 @@ admitRoot loader request =
   where
     identity = rootIdentity request
     label = labelOf (rootLabel request)
-    enqueue key =
-      modifyState loader $ \st →
-        if any (== key) (lsQueue st) then st else st {lsQueue = lsQueue st |> key}
+    enqueue key = modifyState loader (queueAt order key)
     forget kept = do
       modifyIORef' (recordsRef loader) (Map.delete kept)
       modifyState loader (\st → st {lsEntries = Map.delete kept (lsEntries st)})
+
+-- | Queue an identity at an order, unless it is queued already. The arrival number is the
+-- loader's own and never reused.
+queueAt ∷ RootOrder → ExportIdentity → LoaderState → LoaderState
+queueAt order key st
+  | Map.member key (lsPlace st) = st
+  | otherwise =
+      let place = (order, lsAdmitted st)
+       in st
+            { lsQueue = Map.insert place key (lsQueue st)
+            , lsPlace = Map.insert key place (lsPlace st)
+            , lsAdmitted = lsAdmitted st + 1
+            }
+
+-- | Ask for a root that is pending or evaluating to start no later than this order.
+--
+-- A root queued after it moves up, keeping the arrival number that breaks ties; a dependency
+-- of the active chain that was never a root is queued at it, as admitting it would, so that its
+-- own turn finds an outcome and evaluates nothing. An order never moves later: a root that
+-- already stands at this order or earlier is untouched. The loader duplicates nothing: one
+-- record, one source interest, one evaluation, whatever is asked.
+promoteRoot ∷ HasCallStack ⇒ Loader → ExportIdentity → RootOrder → IO RootPromotion
+promoteRoot loader identity order =
+  withOperationContext luaComponent promoteOperation [] $
+    withOpenVm (vmOf loader) promoteOperation $ \_ → do
+      s ← readState loader
+      records ← readIORef (recordsRef loader)
+      if not (lsOpen s)
+        then pure PromotionUnknown
+        else case Map.lookup identity records of
+          Nothing → pure PromotionUnknown
+          Just ExportStopped → pure PromotionUnknown
+          Just ExportPending → place s
+          Just ExportEvaluating
+            | any ((== identity) . frameIdentity) (lsChain s) → pure PromotionNothingQueued
+            | otherwise → place s
+          Just _ → pure PromotionNothingQueued
+  where
+    place s = case Map.lookup identity (lsPlace s) of
+      Just (current, arrival)
+        | order < current → do
+            modifyState loader $ \st →
+              st
+                { lsQueue = Map.insert (order, arrival) identity (Map.delete (current, arrival) (lsQueue st))
+                , lsPlace = Map.insert identity (order, arrival) (lsPlace st)
+                }
+            pure PromotionMoved
+        | otherwise → pure PromotionNotEarlier
+      Nothing → do
+        modifyState loader (queueAt order identity)
+        pure PromotionMoved
 
 -- | Deliver what the supplier found for an identity the loader asked about. It only
 -- records the answer: nothing is compiled or evaluated until the loader is advanced.
@@ -432,7 +503,7 @@ loaderCounts loader =
         , countReady = count (\case ExportHeld {} → True; _ → False)
         , countFailed = count (\case ExportBroken _ → True; _ → False)
         , countStopped = count (== ExportStopped)
-        , countQueued = Seq.length (lsQueue s)
+        , countQueued = Map.size (lsQueue s)
         , countChainDepth = length (lsChain s)
         , countInterestsHeld = length (filter entryInterest (Map.elems (lsEntries s)))
         , countInterestsAcquired = lsAcquired s
@@ -507,9 +578,9 @@ drive loader state entry settled = loop
             frame : _ → continueFrame frame
 
     -- The next root, if its turn has come.
-    startRoot s = case Seq.viewl (lsQueue s) of
-      EmptyL → pure BlockedIdle
-      identity :< rest → do
+    startRoot s = case Map.minViewWithKey (lsQueue s) of
+      Nothing → pure BlockedIdle
+      Just ((_, identity), rest) → do
         records ← readIORef (recordsRef loader)
         case Map.lookup identity records of
           Just ExportPending → do
@@ -519,18 +590,21 @@ drive loader state entry settled = loop
               else case Map.lookup identity (lsEntries s) of
                 Just (Entry _ _ Awaiting) → pure (BlockedSource identity)
                 Just _ → do
-                  modifyState loader (\st → st {lsQueue = rest})
+                  unqueue identity rest
                   startFrame identity
                   loop
                 Nothing → do
                   -- A pending record always has its entry; this is a defect, made loud.
-                  modifyState loader (\st → st {lsQueue = rest})
+                  unqueue identity rest
                   settle loader settled identity (ExportBroken (brokenBecause loader "the root" "a pending identity had no source entry"))
                   loop
           -- Already an outcome, as a dependency of an earlier chain, or stopped.
           _ → do
-            modifyState loader (\st → st {lsQueue = rest})
+            unqueue identity rest
             loop
+
+    -- The head of the queue leaves it, whatever became of it.
+    unqueue identity rest = modifyState loader (\st → st {lsQueue = rest, lsPlace = Map.delete identity (lsPlace st)})
 
     -- Resume the frame on top of the chain, or find what it waits for.
     continueFrame frame = case frameWaiting frame of
@@ -540,7 +614,8 @@ drive loader state entry settled = loop
         case Map.lookup dependency records of
           Just (ExportHeld slot _) → resume frame (ResumeExports slot)
           Just (ExportBroken fault) → do
-            let reason = ModuleRefused (DependencyFailed label fault)
+            let ExportIdentity raw = dependency
+                reason = ModuleRefused (DependencyFailed label raw fault)
             latch frame (faultOfModule loader (frameLabel frame) reason LuaRan)
             resume frame (ResumeError (Text.encodeUtf8 (boundReason ("import: the module " <> label <> " failed"))))
           Just ExportPending → do
@@ -817,7 +892,7 @@ stopLoader loader =
           forM_ (Map.keys held) $ \identity → setRecord loader identity ExportStopped
           let interests = [identity | (identity, entry') ← Map.toList held, entryInterest entry']
           forM_ interests (releaseInterest loader)
-          modifyState loader (\s → s {lsEntries = Map.empty, lsQueue = Seq.empty})
+          modifyState loader (\s → s {lsEntries = Map.empty, lsQueue = Map.empty, lsPlace = Map.empty})
           records ← readIORef (recordsRef loader)
           let stopped = [identity | (identity, ExportStopped) ← Map.toList records]
           flushEvidence loader
@@ -907,18 +982,22 @@ importHandler loader state restore = do
                 current >>= fault (ModuleRefused (InvalidExportIdentity maxExportIdentityBytes))
               s ← readState loader
               records ← readIORef (recordsRef loader)
+              -- Roots the application accepted and has not had admitted hold room too.
+              reservedNow ← max 0 <$> fromApplication (restore (loaderReserved config identity >>= evaluate))
               let known = Map.lookup identity records
               case lsRunning s of
                 -- No chain is running Lua: a hook, or a helper a hook called. The
                 -- immediate lookup, which reads nothing and waits for nothing.
                 Nothing → case known of
                   Just (ExportHeld slot _) → pushReady slot
-                  Just (ExportBroken _) → raiseOrdinary ("the required module " <> target <> " failed")
+                  Just (ExportBroken failure) → do
+                    fromApplication (restore (loaderObserved config identity failure))
+                    raiseOrdinary ("the required module " <> target <> " failed")
                   _ → raiseOrdinary ("module_not_ready: " <> target)
                 Just running → case known of
                   Just (ExportHeld slot _) → pushReady slot
                   Just (ExportBroken failure) →
-                    condemn (ModuleRefused (DependencyFailed target failure)) ("the module " <> target <> " failed")
+                    condemn (ModuleRefused (DependencyFailed target raw failure)) ("the module " <> target <> " failed")
                   -- Never met while a chain runs: stopping closes the chain first. Refused rather
                   -- than waited for, in case it ever is.
                   Just ExportStopped → raiseOrdinary ("the loader stopped before the module " <> target <> " was evaluated")
@@ -935,15 +1014,18 @@ importHandler loader state restore = do
                           Just why →
                             condemn (ModuleRefused (ImportNotSuspendable why target)) ("the module " <> target <> " is not ready and Lua cannot suspend here")
                           Nothing
-                            | isNew known && Map.size records >= exportMaxIdentities limits →
+                            | isNew known && Map.size records + reservedNow >= exportMaxIdentities limits →
                                 condemn (ModuleRefused (ImportCacheFull (exportMaxIdentities limits) target)) ("no room for the module " <> target)
                             | length chain + 1 > exportMaxChainDepth limits →
                                 condemn (ModuleRefused (ImportChainTooDeep (exportMaxChainDepth limits) target)) ("the module " <> target <> " would make the chain longer than " <> Text.pack (show (exportMaxChainDepth limits)))
                             | otherwise → do
-                                when (isNew known) (admitDependency identity raw target)
-                                modifyState loader (\st → st {lsNoted = Just (identity, target)})
-                                lua_settop state entry
-                                pure suspendResults
+                                admitted ← if isNew known then admitDependency identity raw target else pure True
+                                if admitted
+                                  then do
+                                    modifyState loader (\st → st {lsNoted = Just (identity, target)})
+                                    lua_settop state entry
+                                    pure suspendResults
+                                  else condemn (ModuleRefused (ImportCacheFull (exportMaxIdentities limits) target)) ("no room for the module " <> target)
   where
     vm = vmOf loader
     host = loaderHost loader
@@ -963,6 +1045,7 @@ importHandler loader state restore = do
     takeThrough p chain = let (before, rest) = break p chain in before <> take 1 rest
     -- A new identity: tracked before the supplier is asked, so that a failure of the ask
     -- leaves nothing behind, and the interest recorded the moment it exists.
+    admitDependency ∷ ExportIdentity → ByteString.ByteString → Text → IO Bool
     admitDependency identity raw target = do
       let kept = ExportIdentity (ByteString.copy raw)
           forget = do
@@ -973,11 +1056,17 @@ importHandler loader state restore = do
       answer ←
         fromApplication (restore (supplierAcquire (loaderSupplier config) identity >>= evaluate))
           `onException` forget
-      modifyState loader $ \st →
-        st
-          { lsEntries = Map.adjust (\e → e {entryInterest = True, entryArrival = arrivalOfAnswer limits answer}) kept (lsEntries st)
-          , lsAcquired = lsAcquired st + 1
-          }
+      case answer of
+        -- The application's bound is the arbiter, in the step that takes the interest: whatever it
+        -- accepted from another thread since 'loaderReserved' was read has won the room.
+        SourceNoRoom → False <$ forget
+        _ → do
+          modifyState loader $ \st →
+            st
+              { lsEntries = Map.adjust (\e → e {entryInterest = True, entryArrival = arrivalOfAnswer limits answer}) kept (lsEntries st)
+              , lsAcquired = lsAcquired st + 1
+              }
+          pure True
 
 -- | Why Lua cannot suspend the coroutine that called import right here, if it cannot:
 -- it is a coroutine the script created, or Lua cannot yield where it is (a comparator,

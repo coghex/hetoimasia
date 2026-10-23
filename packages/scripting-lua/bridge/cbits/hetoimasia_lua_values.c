@@ -609,6 +609,26 @@ static int write_value(lua_State *L, writer *w, size_t depth)
       lua_setmetatable(L, -2);
       return 1;
     }
+    case 0x08: {
+      /* The export table the VM holds in a slot, by reference: the very table, not a copy.
+      ** A slot that holds no table is a malformed encoding, never a nil pushed in its place. */
+      uint64_t slot;
+      if (!have(w, 8)) {
+        return 0;
+      }
+      slot = load64(w->p);
+      w->p += 8;
+      lua_rawgetp(L, LUA_REGISTRYINDEX, &exports_key);
+      if (!lua_istable(L, -1)) {
+        return 0;
+      }
+      lua_rawgeti(L, -1, (lua_Integer) slot);
+      if (!lua_istable(L, -1)) {
+        return 0;
+      }
+      lua_remove(L, -2);
+      return 1;
+    }
     default:
       return 0;
   }

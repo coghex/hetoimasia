@@ -136,6 +136,29 @@ spec = describe "the package and import boundary" $ do
     [file <> ": " <> name | (file, name) ← imported, not (permittedData name)] `shouldBe` []
     [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
 
+  it "has a modules sublibrary over the profile, the request adapter, the content package, the foundation and the host's public modules, and nothing else" $ do
+    (sort <$> fieldEntries "library modules" "build-depends:")
+      `shouldReturn` [ "base"
+                     , "bytestring"
+                     , "containers"
+                     , "hetoimasia-content"
+                     , "hetoimasia-foundation"
+                     , "hetoimasia-lua-engine"
+                     , "hetoimasia-lua-engine:request"
+                     , "hetoimasia-scripting-lua"
+                     , "hetoimasia-scripting-lua:runtime-lua"
+                     , "stm"
+                     , "text"
+                     ]
+    fieldEntries "library modules" "exposed-modules:" `shouldReturn` ["Hetoimasia.LuaEngine.Modules"]
+
+  it "imports, in the modules sublibrary, only the profile, the request adapter, the content package's public modules, the foundation's logger and resource scope, the host's public modules and base libraries: no private module, window, GPU, console, sample or game" $ do
+    sources ← sourcesUnder "modules"
+    sources `shouldSatisfy` ((>= 6) . length)
+    imported ← importedBy sources
+    [file <> ": " <> name | (file, name) ← imported, not (permittedModules name)] `shouldBe` []
+    [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
+
   it "has a texture sublibrary over the profile, the request adapter, the content package, the bounded PNG decoder, the foundation and the host's public modules, and nothing else" $ do
     (sort <$> fieldEntries "library texture" "build-depends:")
       `shouldReturn` [ "base"
@@ -263,6 +286,21 @@ spec = describe "the package and import boundary" $ do
                  , "Hetoimasia.Content.ReadPool"
                  ]
         || "Hetoimasia.Scripting.Lua." `isPrefixOf` name
+    permittedModules name =
+      "Data." `isPrefixOf` name
+        || "GHC." `isPrefixOf` name
+        || "Control." `isPrefixOf` name
+        || "Hetoimasia.LuaEngine.Modules." `isPrefixOf` name
+        || name
+          `elem` [ "Hetoimasia.LuaEngine.Profile"
+                 , "Hetoimasia.LuaEngine.Request"
+                 , "Hetoimasia.Content.Identity"
+                 , "Hetoimasia.Content.Inventory"
+                 , "Hetoimasia.Content.ReadPool"
+                 , "Hetoimasia.Foundation.Log"
+                 , "Hetoimasia.Foundation.Resource"
+                 ]
+        || "Hetoimasia.Scripting.Lua." `isPrefixOf` name
     permittedTexture name =
       "Data." `isPrefixOf` name
         || "GHC." `isPrefixOf` name
@@ -310,6 +348,7 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.LuaEngine.Profile"
                , "Hetoimasia.LuaEngine.Request"
                , "Hetoimasia.LuaEngine.Data"
+               , "Hetoimasia.LuaEngine.Modules"
                , "Hetoimasia.LuaEngine.Texture"
                , "Hetoimasia.LuaEngine.Scene"
                , "Hetoimasia.Asset.Image"

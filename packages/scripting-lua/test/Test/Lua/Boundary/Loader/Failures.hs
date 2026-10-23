@@ -156,7 +156,7 @@ sweep budget = do
             (Right _, Right (ModuleReady _)) → Finished
             (Right _, Right (ModuleFailed fault)) → case boundaryReason fault of
               ScriptFailed _ _ → Failed
-              ModuleRefused (DependencyFailed _ _) → Failed
+              ModuleRefused (DependencyFailed _ _ _) → Failed
               ModuleRefused (SourceTooLarge _) → Wrong "the source bound answered"
               other → Wrong (show other)
             (Left _, _) → Raised

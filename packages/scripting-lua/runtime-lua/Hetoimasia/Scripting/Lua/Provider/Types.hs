@@ -70,6 +70,8 @@ module Hetoimasia.Scripting.Lua.Provider.Types
 
     -- * Refusals a script reads
   , RequestRefusal (..)
+  , CreditRefused (..)
+  , refusalReasonBytes
   , renderRequestRefusal
 
     -- * Subscriptions
@@ -355,10 +357,12 @@ data Necessity
 -- never run provider code that blocks.
 data Credit = Credit
   { creditName ∷ !Text
-    -- ^ Named in the busy answer and in evidence. Bounded to 64 characters when it is shown.
+    -- ^ Named in the busy answer and in evidence. Bounded to 64 bytes of UTF-8, cut between characters, when it is shown.
   , creditReserve ∷ STM Bool
     -- ^ Take the credit: 'True' when it was available and is now held. A bank that is full
-    -- answers 'False'; whatever it wrote is undone with the rest of the admission.
+    -- answers 'False', which is busy (waiting may help); whatever it wrote is undone with the rest of
+    -- the admission. A bank that is full /for good/ (nothing will ever return a place) raises
+    -- 'CreditRefused' with @throwSTM@ instead, which is a refusal that is final: see 'CreditRefused'.
   , creditRelease ∷ CreditEnd → STM ()
     -- ^ Give the credit back, once, with the reason. Never called for a credit that
     -- 'creditTransfers' and whose request succeeded with a resource.
@@ -368,6 +372,38 @@ data Credit = Credit
     -- resource gives it back, and the engine does not. A credit that does not transfer is the
     -- request's, and is returned when the request is taken and its work is retired.
   }
+
+-- | Raised by 'creditReserve' (with @throwSTM@) when the credit can never be had: the bank is full
+-- for good, or what it guards is gone. The admission is refused permanently with this reason and
+-- nothing reserved, which 'Hetoimasia.Scripting.Lua.Admission.startAdmitted' answers as
+-- 'Hetoimasia.Scripting.Lua.Admission.Refused', distinct from the busy answer a full bank that may
+-- empty gets and, unlike a refusal the engine makes of the call itself, not a fault of the call. The
+-- decision is the credit's, taken in the same transaction that would have taken the place. The
+-- reason is bounded to 'refusalReasonBytes' when it is shown. A credit that never raises it keeps
+-- exactly the behavior it had.
+newtype CreditRefused = CreditRefused Text
+  deriving (Eq, Show)
+
+instance Exception CreditRefused
+
+-- | The most of a credit's refusal reason that a script reads, in UTF-8 bytes.
+refusalReasonBytes ∷ Int
+refusalReasonBytes = 256
+
+-- | The longest prefix of the text that is at most this many bytes of UTF-8, cut between characters.
+boundUtf8 ∷ Int → Text → Text
+boundUtf8 limit = Text.pack . go 0 . Text.unpack
+  where
+    go used = \case
+      char : rest | used + width char <= limit → char : go (used + width char) rest
+      _ → []
+    width char
+      | code < 0x80 = 1
+      | code < 0x800 = 2
+      | code < 0x10000 = 3
+      | otherwise = 4
+      where
+        code = fromEnum char
 
 -- | Why a credit is returned.
 data CreditEnd
@@ -399,7 +435,7 @@ renderBank = \case
   BankVmRequests bound → "the VM holds all " <> Text.pack (show bound) <> " of its request places"
   BankOwnerRequests bound → "the owner holds all " <> Text.pack (show bound) <> " of its request places"
   BankLeases capacity charged → "the instance's lease capacity is charged: " <> Text.pack (show charged) <> " of " <> Text.pack (show capacity)
-  BankCredit name → "the provider has no room in " <> Text.take 64 name
+  BankCredit name → "the provider has no room in " <> boundUtf8 64 name
 
 -- | An expected failure of the content or service a request asked for: a code the service
 -- supplies, a bounded message, and for content the root and path that failed.
@@ -484,7 +520,7 @@ admission ∷ Necessity → Text → ValueLimits → Word64 → Int → Int → 
 admission requirement source limits ceilingValue perInstance perVm =
   Admission
     { admitNecessity = requirement
-    , admitSource = Text.take 128 source
+    , admitSource = boundUtf8 128 source
     , admitOffset = Nothing
     , admitLogicalMaximum = ceilingValue
     , admitPerInstance = perInstance
@@ -573,6 +609,8 @@ data RequestRefusal
   | -- | The admission reserves a result lease, and the instance has no lease scope: the
     -- owner was given no leases, or the instance is ending.
     RequestNoLeaseScope
+  | -- | A credit said it can never be had ('CreditRefused'): the reason it gave.
+    RequestCreditRefused !Text
   deriving (Eq, Show)
 
 -- | A refusal as the reason a script reads.
@@ -592,6 +630,7 @@ renderRequestRefusal = \case
   RequestTickUnrepresentable highest → "request refused: the tick and offset pass the ceiling of " <> Text.pack (show highest)
   RequestNumbersExhausted highest → "request refused: every request number up to " <> Text.pack (show highest) <> " has been issued"
   RequestNoLeaseScope → "request refused: the instance has no lease scope to reserve a result lease in"
+  RequestCreditRefused why → "request refused: " <> boundUtf8 refusalReasonBytes why
 
 -- Subscriptions ---------------------------------------------------------------------
 
@@ -769,7 +808,7 @@ renderSubscribeRefusal = \case
   NoSubscriber → "subscribe refused: no instance is running to receive the events"
   SubscriptionsClosed → "subscribe refused: the instance is no longer taking subscriptions"
   -- The name is a script's, as long as the owner's limits let a string be: what is quoted is cut.
-  EndpointNotGranted name → "subscribe refused: no event endpoint named " <> Text.take 64 name <> " is granted to this instance"
+  EndpointNotGranted name → "subscribe refused: no event endpoint named " <> boundUtf8 64 name <> " is granted to this instance"
   SubscriptionsFull bound → "subscribe refused: all " <> Text.pack (show bound) <> " places are held"
 
 -- Who asks ---------------------------------------------------------------------------
@@ -796,6 +835,10 @@ data Ticks = Ticks
   , ticksOwe ∷ Word64 → STM ()
     -- ^ The owner needs one more thing finished before this tick is complete: the grant that reaches it stays open.
   , ticksOweRelease ∷ Word64 → STM ()
+  , ticksQuiet ∷ Word64 → STM Bool
+    -- ^ Whether the scheduler stands at the boundary just before this tick: everything before it has
+    -- finished and it has not begun (or it is past, or zero). Where the owner starts the work it holds
+    -- the tick for.
   , ticksWatch ∷ Word64 → STM ()
   , ticksOpen ∷ STM Bool
   , ticksTaskGone ∷ TaskId → STM Bool

@@ -21,8 +21,11 @@ module Hetoimasia.Scripting.Lua.Internal.LoaderTypes
   , setModulePhase
     -- * Admissions and deliveries
   , RootRequest (..)
+  , RootOrder (..)
+  , arrivalOrder
   , RootAdmission (..)
   , RootRefusal (..)
+  , RootPromotion (..)
   , SourceDelivery (..)
     -- * Outcomes
   , ModuleStatus (..)
@@ -35,6 +38,7 @@ module Hetoimasia.Scripting.Lua.Internal.LoaderTypes
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Text (Text)
+import Data.Word (Word64)
 import Hetoimasia.Scripting.Lua.Internal.Boundary (BoundaryFault)
 import Hetoimasia.Scripting.Lua.Internal.ExportTypes (ExportHandle, ExportIdentity)
 
@@ -49,6 +53,12 @@ data SourceAnswer
   | -- | The source cannot be had: the supplier's bounded reason. The identity fails
     -- stickily, attributed to this.
     SourceFailure !Text
+  | -- | Only ever the answer to 'supplierAcquire' for a /dependency/: the application's own bound
+    -- on identities leaves no room for it, decided where the application keeps the bound, in the
+    -- same step that would have taken the interest. The loader keeps no record of the identity
+    -- and refuses the import as an ordinary, catchable limit; the supplier took no interest.
+    -- Delivered later, or answered for a root, it fails the identity like any refused source.
+    SourceNoRoom
   deriving (Eq, Show)
 
 -- | The narrow seam through which the loader gets verified source bytes.
@@ -107,6 +117,21 @@ data LoaderConfig = LoaderConfig
   , loaderPhase ∷ !(Maybe ModulePhase)
     -- ^ Set while the loader runs a module's code, for an application's own
     -- preconditions to read.
+  , loaderReserved ∷ !(ExportIdentity → IO Int)
+    -- ^ How many identities, other than the one asked about, the application has reserved room
+    -- for that the loader holds no record of yet: roots it accepted and has not admitted. They
+    -- count against the identity bound beside the records, so a dependency cannot take the
+    -- room an accepted root was promised and the root be refused after it was accepted. An
+    -- identity that is reserved itself is not counted against itself. Asked on the owner's
+    -- thread (an import's callback is one), and never negative. A call that raises is the
+    -- application's failure.
+  , loaderObserved ∷ !(ExportIdentity → BoundaryFault → IO ())
+    -- ^ Told, before the call raises, that code outside any module's evaluation (a hook, or a helper
+    -- a hook called) looked up an identity that has already failed, with the fault it failed with.
+    -- The call raises an ordinary Lua error, which that code may catch; what the lookup means for
+    -- the code that made it is the application's to decide here, in the same step, and no
+    -- catching can undo it. Asked on the owner's thread. A call that raises is the application's
+    -- failure.
   , loaderMayRun ∷ !(IO Bool)
     -- ^ Whether the owner allows further ordinary evaluation now. Asked before every
     -- fresh piece of module code the loader would run in an advance: a root's start, a
@@ -119,7 +144,7 @@ data LoaderConfig = LoaderConfig
 -- | A loader over a supplier and a resolver, in which every root is always eligible, no
 -- phase is published and evaluation is always allowed.
 loaderConfig ∷ SourceSupplier → AddressResolver → LoaderConfig
-loaderConfig supplier resolver = LoaderConfig supplier resolver (const (pure True)) Nothing (pure True)
+loaderConfig supplier resolver = LoaderConfig supplier resolver (const (pure True)) Nothing (const (pure 0)) (\_ _ → pure ()) (pure True)
 
 -- | Whether a module's top level is running, readable by an application's own
 -- preconditions without asking the VM for anything. A module's top level runs in a
@@ -145,6 +170,18 @@ data RootRequest = RootRequest
   }
   deriving (Eq, Show)
 
+-- | Where a root stands among the independent roots of its VM: the order the loader starts
+-- them in, smaller first, and for equal orders the root admitted first. A logical root's is
+-- its tick and the sequence of the request that contributed it; a UI root's, and every root
+-- 'admitRoot' admits, is 'arrivalOrder', so the loader's queue is first in, first out unless
+-- the coordinator says otherwise. The loader adds no priority beyond it.
+data RootOrder = RootOrder !Word64 !Word64
+  deriving (Eq, Ord, Show)
+
+-- | The order of a root whose place in the queue is the order it was admitted in.
+arrivalOrder ∷ RootOrder
+arrivalOrder = RootOrder 0 0
+
 -- | Why a root was refused before anything was admitted. Nothing was recorded, no
 -- source was asked for and no slot was taken.
 data RootRefusal
@@ -168,6 +205,18 @@ data RootAdmission
   | RootRefused !RootRefusal
   | -- | The loader has stopped and admits nothing.
     RootClosed
+  deriving (Eq, Show)
+
+-- | What asking the loader to start a root earlier came to.
+data RootPromotion
+  = -- | The root now stands at the order: it was queued later, or was only a dependency.
+    PromotionMoved
+  | -- | It already stands at this order or earlier. An order never moves later.
+    PromotionNotEarlier
+  | -- | The identity came to an outcome, or is the frame of the active chain: nothing is queued.
+    PromotionNothingQueued
+  | -- | The loader holds no record of the identity, or has stopped.
+    PromotionUnknown
   deriving (Eq, Show)
 
 -- | What delivering a source to the loader came to.

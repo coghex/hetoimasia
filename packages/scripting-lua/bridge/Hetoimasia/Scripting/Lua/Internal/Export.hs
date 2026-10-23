@@ -413,6 +413,7 @@ captureBehavior host export select facade =
             VBytes _ → refuse (FacadeNotATable "string")
             VText _ → refuse (FacadeNotATable "string")
             VCapability _ → refuse (FacadeNotATable "userdata")
+            VExportTable {} → refuse (FacadeNotATable "table")
       prepared ← case facade of
         FacadeValue value → tableOnly value >> (Just <$> encodedValue value)
         FacadeField handle _ → Nothing <$ held handle

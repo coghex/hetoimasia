@@ -15,6 +15,7 @@ module Hetoimasia.Scripting.Lua.Internal.ExportTypes
   , ExportSource (..)
     -- * References
   , ExportHandle (..)
+  , exportTableValue
   , CaptureHandle (..)
   , Hook (..)
   , hookIndex
@@ -42,7 +43,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import Hetoimasia.Scripting.Lua.Internal.Boundary (BoundaryFault, ModuleRef)
-import Hetoimasia.Scripting.Lua.Internal.Value (Value, VmIdentity)
+import Hetoimasia.Scripting.Lua.Internal.Value (Value (VExportTable), VmIdentity)
 
 -- | The stable identity an export module is known by within one VM: opaque
 -- bytes the caller chose, compared exactly. It is never truncated, hashed or
@@ -102,6 +103,12 @@ data ExportHandle = ExportHandle
     -- no version. Diagnostics only, and no key.
   }
   deriving (Eq, Show)
+
+-- | The export table a handle names, as a value that crosses into Lua by reference: the very
+-- table the VM holds, pushed on the owner, never a copy. Checked when it is encoded, against
+-- the VM that builds the crossing and the slot being held.
+exportTableValue ∷ ExportHandle → Value
+exportTableValue handle = VExportTable (exportHandleVm handle) (exportHandleSlot handle)
 
 -- | A behavior an instance captured: its hook functions, its @self@ and its
 -- facade, held by the VM. A value that names a slot of one VM, like the others.
