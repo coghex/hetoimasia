@@ -1626,7 +1626,7 @@ they did.
 * **A failed identity looked up outside a module's evaluation.** A hook (or a helper a hook called) that calls `import` for an
   identity that has failed gets an ordinary error it may catch, and `loaderObserved identity fault` is called first, on the
   owner's thread, with the fault. The scheduled owner wires it to the instance whose code is running: that instance is failed
-  with the module's attributed failure (`LoaderHooks.hookObserved` makes the reason) exactly as a required request's failure
+  with the module's attributed failure (`LoaderHooks.hookObserved` answers `Just reason` to opt in; `noLoaderHooks` answers `Nothing`, which keeps the ordinary catchable error for every plan that does not opt in) exactly as a required request's failure
   fails its instance, latched once and applied at the owner's next safe boundary, so catching the error cannot make it a
   success. Nothing fails when no instance's code was running.
 * **Placed roots on a scheduled owner.** `DueAt tick sequence` is a root placed at a position. It starts only once the
