@@ -696,7 +696,11 @@ backend that holds every upload and every release until the example says otherwi
 uploaded texels or GPU readiness: LFE-17 establishes those). Each bank is filled and refused with nothing left reserved,
 the fixed values are checked, the stages and cancellation windows are driven by gates and hooks, never by sleeping, and a
 separately compiled client composes the pipeline through public modules. `PipelineHooks` are this package's coordination
-points for those examples; production uses `noHooks`.
+points for those examples; production uses `noHooks`. Two rules keep the examples from hanging
+or racing: an example acts on a result only after the host's own reply (the script waits for it with `wait_take`; the
+pipeline settling a job is not the host having the answer), and every exit of an example or of a nested scope, an assertion
+failure included, opens every gate and hook it can hold and lets every backend answer what it owes before anything waits for
+the pipeline to drain.
 
 ## The module coordinator (LFE-11)
 
@@ -771,7 +775,9 @@ three things apart:
 * **room**: the place is held (counted per identity, and taken whole by the job's creation by whatever path: a request, a boot
   load, a dependency the chain found);
 * **full for good**: the VM's permanent entries (pending, evaluating, ready and failed jobs) fill the 256, or the coordinator has
-  closed. The cache never frees a place, so the credit raises `CreditRefused` and the host refuses the request **before any bank is
+  closed (for **every** request, a join of an identity it holds included, so that nothing is accepted that will never be answered;
+  a request the coordinator closes under between its admission and its acceptance is answered with the required failure it is, and
+  never left pending). The cache never frees a place, so the credit raises `CreditRefused` and the host refuses the request **before any bank is
   asked**, as an ordinary catchable Lua error naming the module limit (a binding opted in to ordinary refusals, which the LFE-12
   binding is: `pcall` catches it and the invocation can go on). No handle, job, read, hold or failed entry remains, it is not a fault of
   the call, not the instance's failure and not busy, and it wins over a full temporary bank in the same transaction;
@@ -780,7 +786,8 @@ three things apart:
   job it is `BootCacheFull`.
 
 Temporary banks (the instance's 16 and the VM's 64 request places, the owner's places, result storage, the unsettled boot loads) are
-`busy`, data, with nothing reserved. `startModule` is therefore plain `startM1` (accepted or busy); a permanent refusal is the host's
+`busy`, data, with nothing reserved. The loader's own ask for a source (`acquireSTM`) is answered with a failure once the coordinator has closed, so a chain never waits
+for a source that will not come. `startModule` is therefore plain `startM1` (accepted or busy); a permanent refusal is the host's
 ordinary error, raised from inside the admission, and the facade's binding (LFE-12) owns only the Lua spelling. `Limits` has a gated
 example of each of these, in both orders of a boot load and a request racing for the last place.
 
