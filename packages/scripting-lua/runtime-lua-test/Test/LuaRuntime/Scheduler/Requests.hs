@@ -119,6 +119,49 @@ spec = describe "requests" $ do
       atomically (readTick (rigScheduler rig)) >>= (`shouldBe` 3)
       atomically (stepsOutstanding (rigScheduler rig)) >>= (`shouldBe` 0)
 
+  describe "the boundary just before a tick" $ do
+    it "is the state where every earlier tick has begun and finished and this one has not begun; tick zero and a tick begun already are not waited for" $ do
+      rig ← newRig
+      let quiet = atomically . tickQuietBefore (rigScheduler rig)
+      mapM quiet [0, 1, 2, 3] >>= (`shouldBe` [True, True, False, False])
+      -- Tick two is held: tick one begins and finishes, and the scheduler stands just before two.
+      atomically (holdTick (rigScheduler rig) 2)
+      replicateM_ 2 (granted rig 10)
+      _ ← turnsUntilIdle rig 8
+      atomically (readTick (rigScheduler rig)) >>= (`shouldBe` 1)
+      mapM quiet [0, 1, 2, 3] >>= (`shouldBe` [True, True, True, False])
+      atomically (releaseTick (rigScheduler rig) 2)
+      _ ← turnsUntilIdle rig 8
+      atomically (readTick (rigScheduler rig)) >>= (`shouldBe` 2)
+      mapM quiet [1, 2, 3, 4] >>= (`shouldBe` [True, True, True, False])
+
+    it "is not reached while work is waiting to run: a task admitted and not yet run, or one whose grant has not finished" $ do
+      rig ← newRig
+      identity ← admit rig "a" OrdinaryClass OneShot
+      script rig "a" [waitTicks "a" 1, completed "a"]
+      -- Admitted, not yet run: tick one is not the next thing that happens.
+      atomically (tickQuietBefore (rigScheduler rig) 1) >>= (`shouldBe` False)
+      _ ← turnsUntilIdle rig 4
+      phase rig identity >>= (`shouldBe` Just PhaseWaiting)
+      atomically (tickQuietBefore (rigScheduler rig) 1) >>= (`shouldBe` True)
+      _ ← granted rig 10
+      _ ← turnsUntilIdle rig 6
+      -- The task woke by the grant ran to its end and the grant finished.
+      atomically (tickQuietBefore (rigScheduler rig) 2) >>= (`shouldBe` True)
+      phase rig identity >>= (`shouldSatisfy` \case Just (PhaseEnded _) → True; _ → False)
+
+    it "is not reached while an owed tick keeps its grant open" $ do
+      rig ← newRig
+      atomically (oweTick (rigScheduler rig) 1)
+      replicateM_ 2 (granted rig 10)
+      _ ← turnsUntilIdle rig 6
+      -- Tick one began and is not finished: the next tick is not the next thing that happens.
+      atomically (tickQuietBefore (rigScheduler rig) 2) >>= (`shouldBe` False)
+      atomically (releaseOwed (rigScheduler rig) 1)
+      _ ← turnsUntilIdle rig 6
+      atomically (readTick (rigScheduler rig)) >>= (`shouldBe` 2)
+      atomically (tickQuietBefore (rigScheduler rig) 3) >>= (`shouldBe` True)
+
   describe "a wait for a request" $ do
     it "is kept until the owner says the request has settled, and then wakes the task, handed nothing" $ do
       rig ← newRig

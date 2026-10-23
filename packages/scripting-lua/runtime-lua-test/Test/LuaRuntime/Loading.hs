@@ -82,9 +82,13 @@ awaitAsked rig wanted = go 0
 
 -- | An owner of instances from these modules, with a loader.
 loaderSpec ∷ IFixture → Rig → Int → [ModuleSource] → ScheduledSpec
-loaderSpec fixture rig bound modules =
+loaderSpec fixture rig bound modules = loaderSpecWith fixture rig bound modules noLoaderHooks
+
+-- | The same, with these hooks on the plan.
+loaderSpecWith ∷ IFixture → Rig → Int → [ModuleSource] → LoaderHooks → ScheduledSpec
+loaderSpecWith fixture rig bound modules hooks =
   (instanceSpec fixture "loading" modules (testConfig instanceBounds') requiredPolicy defaultSchedulerBounds)
-    { scheduledLoader = Just (planOf rig bound)
+    { scheduledLoader = Just ((planOf rig bound) {planHooks = hooks})
     }
 
 -- | An owner with a loader, over a body, whatever way the example ends opening every gate.
@@ -94,6 +98,16 @@ withLoader bound modules body = do
   rig ← newRig
   withBoundaryOpening [openAllGates fixture] $ \control runtime → do
     owner ← startWith fixture runtime (loaderSpec fixture rig bound modules)
+    endpoint ← maybe (failExample "the owner has no loader endpoint") pure (scheduledLoaderEndpoint owner)
+    body fixture rig control owner endpoint
+
+-- | An owner with a loader whose plan has these hooks, over a body, whatever way the example ends opening every gate.
+withLoaderHooks ∷ Int → [ModuleSource] → LoaderHooks → (IFixture → Rig → RuntimeControl → ScheduledOwner → LoaderEndpoint → IO a) → IO a
+withLoaderHooks bound modules hooks body = do
+  fixture ← newIFixture
+  rig ← newRig
+  withBoundaryOpening [openAllGates fixture] $ \control runtime → do
+    owner ← startWith fixture runtime (loaderSpecWith fixture rig bound modules hooks)
     endpoint ← maybe (failExample "the owner has no loader endpoint") pure (scheduledLoaderEndpoint owner)
     body fixture rig control owner endpoint
 
@@ -390,6 +404,104 @@ spec = describe "the module loader on a scheduled owner" $ do
         acquired ← readIORef (rigAcquired rig)
         released ← readIORef (rigReleased rig)
         length released `shouldBe` length acquired
+
+  describe "placed roots" $ do
+    it "holds the tick a placed root is due in until the root has an outcome, and starts it only when everything before that tick is finished" $
+      bounded . withLoader 4 [echoer] $ \fixture rig control owner endpoint → do
+        have rig "due" ["fx.record('due:start')", "local late = import('late')", "fx.record('due:done')", "return { late = late }"]
+        submitRoot endpoint (request "due") (DueAt 3 0) >>= (`shouldBe` SubmitAccepted)
+        -- Nothing is kept open: the tick is held, not owed, and the root has not begun.
+        loaderDiagnostics endpoint >>= \found → loadingHeld found `shouldBe` Nothing
+        awaitAsked rig 1
+        grantOne control owner
+        atomically (scheduledTick (scheduledEndpoint owner)) >>= (`shouldBe` 1)
+        length <$> readIORef (rigAcquired rig) >>= (`shouldBe` 1)
+        logged fixture >>= (`shouldSatisfy` notElem "due:start")
+        -- Tick two is finished, tick three has not begun: the root starts now and reaches its dependency.
+        grantOne control owner
+        awaitAsked rig 1
+        atomically (scheduledTick (scheduledEndpoint owner)) >>= (`shouldBe` 2)
+        logged fixture >>= (`shouldSatisfy` elem "due:start")
+        -- The grant that would reach tick three is accepted and not applied, while the owner goes on serving hooks.
+        _ ← grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1)
+        _ ← admit fixture owner "a" (moduleNamed "echoer")
+        awaitCount fixture 1
+        atomically (scheduledTick (scheduledEndpoint owner)) >>= (`shouldBe` 2)
+        _ ← notifySource endpoint (ident "late") (SourceVerified (Text.encodeUtf8 "return {}"))
+        outcome ← awaitOutcome control endpoint "due"
+        outcome `shouldSatisfy` \case OutcomeSettled (ModuleReady _) → True; _ → False
+        _ ← awaitTicksComplete control owner
+        atomically (scheduledTick (scheduledEndpoint owner)) >>= (`shouldBe` 3)
+        logged fixture >>= (`shouldSatisfy` elem "due:done")
+
+    it "starts roots by tick and sequence, whatever order they were submitted in, and an earlier place moves a queued root up" $
+      bounded . withLoader 8 [echoer] $ \fixture rig control owner endpoint → do
+        mapM_ (\name → have rig name ["fx.record('ran " <> name <> "')", "return {}"]) ["p", "q", "r", "s"]
+        mapM_ (\(name, tick, sequenceNumber) → submitRoot endpoint (request name) (DueAt tick sequenceNumber) >>= (`shouldBe` SubmitAccepted)) [("p", 5, 0), ("q", 3, 0), ("r", 8, 0), ("s", 7, 0)]
+        atomically (promoteSubmitted endpoint (ident "r") (DueAt 6 0)) >>= (`shouldBe` PromoteAccepted)
+        mapM_ (const (grantOne control owner)) [1 .. 8 ∷ Int]
+        found ← logged fixture
+        filter (Text.isPrefixOf "ran ") found `shouldBe` ["ran q", "ran p", "ran r", "ran s"]
+        -- A root with an outcome has nothing to move, and the owner stopping takes no more.
+        atomically (promoteSubmitted endpoint (ident "q") (DueAt 1 0)) >>= (`shouldBe` PromoteUnknown)
+        atomically (promoteSubmitted endpoint (ident "nobody") (DueAt 1 0)) >>= (`shouldBe` PromoteUnknown)
+        retireScheduled owner
+        _ ← awaitScheduledTerminal control owner
+        atomically (promoteSubmitted endpoint (ident "q") (DueAt 1 0)) >>= (`shouldBe` PromoteClosed)
+
+    it "moves the tick it holds with the earliest place, and never later" $
+      bounded . withLoader 4 [echoer] $ \_ rig control owner endpoint → do
+        have rig "late" ["local dep = import('dep')", "return {}"]
+        submitRoot endpoint (request "late") (DueAt 9 0) >>= (`shouldBe` SubmitAccepted)
+        atomically (promoteSubmitted endpoint (ident "late") (DueAt 4 0)) >>= (`shouldBe` PromoteAccepted)
+        atomically (promoteSubmitted endpoint (ident "late") (DueAt 6 0)) >>= (`shouldBe` PromoteAccepted)
+        mapM_ (const (grantOne control owner)) [1 .. 3 ∷ Int]
+        -- Everything before tick four is finished: the root has begun, and tick four is held for it.
+        awaitAsked rig 2
+        _ ← grantScheduledStep (scheduledEndpoint owner) (nanoseconds 1)
+        atomically (scheduledTick (scheduledEndpoint owner)) >>= (`shouldBe` 3)
+        _ ← notifySource endpoint (ident "dep") (SourceVerified (Text.encodeUtf8 "return {}"))
+        _ ← awaitOutcome control endpoint "late"
+        _ ← awaitTicksComplete control owner
+        atomically (scheduledTick (scheduledEndpoint owner)) >>= (`shouldBe` 4)
+
+    it "tells the application what the owner does: each outcome in the order it came, what the chain waits for, the room it has reserved, and the exit once" $ do
+      served ← newIORef (0 ∷ Int)
+      settledSeen ← newIORef ([] ∷ [[ExportIdentity]])
+      blockedSeen ← newIORef ([] ∷ [Blocked])
+      reservedAsked ← newIORef ([] ∷ [ExportIdentity])
+      exits ← newIORef (0 ∷ Int)
+      let hooks =
+            noLoaderHooks
+              { hookService = atomicModifyIORef' served (\n → (n + 1, ()))
+              , hookSettled = \found → atomicModifyIORef' settledSeen (\held → (held <> [map fst found], ()))
+              , hookBlocked = \found → atomicModifyIORef' blockedSeen (\held → (held <> [found], ()))
+              , hookReserved = \identity → atomicModifyIORef' reservedAsked (\held → (held <> [identity], 0))
+              , hookExit = atomicModifyIORef' exits (\n → (n + 1, ()))
+              }
+      bounded . withLoaderHooks 4 [echoer] hooks $ \_ rig control owner endpoint → do
+        have rig "main" ["local dep = import('dep')", "return { dep = dep }"]
+        _ ← submitRoot endpoint (request "main") DueUi
+        awaitAsked rig 2
+        _ ← notifySource endpoint (ident "dep") (SourceVerified (Text.encodeUtf8 "return {}"))
+        _ ← awaitOutcome control endpoint "main"
+        readIORef settledSeen >>= (`shouldBe` [[ident "dep", ident "main"]])
+        readIORef blockedSeen >>= \found → (found, found) `shouldSatisfy` \(held, _) → BlockedSource (ident "dep") `elem` held && last held == BlockedIdle
+        readIORef reservedAsked >>= (`shouldBe` [ident "dep"])
+        readIORef served >>= (`shouldSatisfy` (> 0))
+        readIORef exits >>= (`shouldBe` 0)
+        retireScheduled owner
+        _ ← awaitScheduledTerminal control owner
+        readIORef exits >>= (`shouldBe` 1)
+
+    it "wakes the owner for a poke, so that a failure a thread of its own could only record is raised on the owner" $ do
+      woken ← newChan
+      let hooks = noLoaderHooks {hookService = writeChan woken ()}
+      bounded . withLoaderHooks 4 [echoer] hooks $ \_ _ _ _ endpoint → do
+        atomically (pokeLoader endpoint)
+        readChan woken
+        atomically (pokeLoader endpoint)
+        readChan woken
 
   describe "a plan" $ do
     it "is refused before anything starts when its bound is below one, or the VM already names a loader" $

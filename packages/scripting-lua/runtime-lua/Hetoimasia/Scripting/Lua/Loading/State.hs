@@ -119,7 +119,7 @@ import Control.Concurrent.STM
   , writeTVar
   )
 import Control.Exception (Exception, ExceptionWithContext, SomeException, tryWithContext)
-import Control.Monad (forM, forM_, void, when)
+import Control.Monad (forM, forM_, unless, void, when)
 import Data.Foldable (toList)
 import Data.Maybe (fromMaybe)
 import Hetoimasia.Foundation.Resource (composeCleanup)
@@ -186,8 +186,9 @@ data LoaderHooks = LoaderHooks
     -- application raises a failure a thread of its own could only record. The owner wakes for it
     -- when 'pokeLoadingSTM' asks.
   , hookSettled ∷ [(ExportIdentity, ModuleStatus)] → IO ()
-    -- ^ After an advance, with the identities that came to an outcome in it (ready or failed, in
-    -- the order they did, dependencies included), once they are published to readers.
+    -- ^ After an advance that brought identities to an outcome, with them (ready or failed, in the
+    -- order they did, dependencies included), once they are published to readers. Not called for an
+    -- advance that settled nothing.
   , hookBlocked ∷ Blocked → IO ()
     -- ^ After an advance, with what it waits for.
   , hookReserved ∷ ExportIdentity → IO Int
@@ -610,7 +611,7 @@ serviceLoading ls owned = do
             modifyTVar' (lsDues ls) (Map.delete identity)
             modifyTVar' (lsOutcomes ls) (Map.insert identity (OutcomeSettled status))
           settleHold ls
-          hookSettled hooks (advanceSettled report)
+          unless (null (advanceSettled report)) (hookSettled hooks (advanceSettled report))
           hookBlocked hooks (advanceBlocked report)
           pure (not nothingNew || not (null (advanceSettled report)))
     isPlaced identity dues = case Map.lookup identity dues of
