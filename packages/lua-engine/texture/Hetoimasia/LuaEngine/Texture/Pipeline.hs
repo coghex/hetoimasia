@@ -48,8 +48,17 @@
 -- When the backend reports a usable registration, the pipeline holds a 'Cell' for it and answers the
 -- request with a resource the host builds, on the owner's thread, into the lease the admission
 -- reserved. Until that build runs the texture belongs to the cell, and afterwards to the lease. The
--- cell's state machine decides who may release it: the pipeline for a cell no lease adopted, the lease
--- for an adopted one, once. If the host drops the build (the request was cancelled, its instance ended)
+-- cell's state machine decides, in one transaction on the cell each time, who may do what with it:
+--
+-- * /offering/ it: the answer that hands the host a resource first moves the cell from delivered to
+--   offered. A cell something already claimed cannot be offered, and the answer is then a failure;
+-- * /adopting/ it: the host's build moves an offered cell to adopted;
+-- * /releasing/ it: the pipeline may claim a cell nobody offered (a shutdown, a failed upload) and, once
+--   the host's interest ended, an offered one; the lease may claim an adopted one; exactly once either way.
+--
+-- A shutdown therefore never starts releasing a cell it did not claim before the offer: an offered cell
+-- is the host's to adopt or drop, so a lease can never be built over a texture whose release has begun
+-- while its request still waits. If the host drops the build (the request was cancelled, its instance ended)
 -- it never tells the provider, so the pipeline learns of it where the host does return a credit: a
 -- credit that transfers and is returned unused means no lease owns the texture, and 'settleCharge'
 -- hands the cell to the pipeline's own housekeeping, which releases it and returns the charge only
@@ -381,6 +390,9 @@ data UploadPhase
 data CellState
   = -- | Delivered, reported usable, and owned by no lease yet.
     CellJob
+  | -- | The answer that hands the host a resource for it was given: the host adopts it or drops it, and
+    -- a shutdown does not release it.
+    CellOffered
   | -- | A lease owns it.
     CellAdopted
   | -- | Someone is calling the backend's release now.
@@ -503,11 +515,14 @@ data PipelineHooks = PipelineHooks
     -- ^ The decode worker took the job and has preflighted nothing.
   , hookDecoded ∷ !(ContentKey → IO ())
     -- ^ The level is decoded, charged to the lane and recorded on the job; the handoff is next.
+  , hookOffering ∷ !(ContentKey → IO ())
+    -- ^ The job settled with a delivered texture, and the answer that offers it to the host has not yet
+    -- decided: nothing about the texture was recorded as offered, claimed or adopted.
   }
 
 -- | No hooks.
 noHooks ∷ PipelineHooks
-noHooks = PipelineHooks (\_ → pure ()) (\_ → pure ())
+noHooks = PipelineHooks (\_ → pure ()) (\_ → pure ()) (\_ → pure ())
 
 -- | The numbers the pipeline was built with.
 pipelineSpec ∷ TexturePipeline → TextureSpec
@@ -548,7 +563,8 @@ newTextureOwner tp role = atomically $ do
 -- state; the decode workers, each started with registration checked; the body. On every exit the pipeline
 -- closes admission first, withdraws what has not started and tells the rest to stop, then /drains/: it
 -- waits, in STM and outside any uninterruptible release, until every started read, decode and upload has
--- retired and every delivered texture no lease owns has been released and proved retired; only then
+-- retired, every delivered texture nobody offered has been released and proved retired and every
+-- offered one has been adopted or dropped (and, if dropped, released and proved retired); only then
 -- does the group stop the worker, and only then may the pool, the inventory and the backend unwind. A
 -- cancellation delivered while it drains is remembered and raised once the drain is over.
 withTexturePipeline ∷ TextureSpec → TextureBackend → ReadPool → Inventory → (TexturePipeline → IO a) → IO a
@@ -885,6 +901,7 @@ settleCharge tp token charge = do
             -- The housekeeping latches the failure and keeps the charge held.
             ProviderFailed _ → defer st cell
         CellJob → defer st cell
+        CellOffered → defer st cell
         CellClaimed → defer st cell
   where
     defer st cell =
@@ -1280,6 +1297,8 @@ orphanStep tp token orphan =
     -- Nobody has released it: do it after this transaction. The claim inside 'releaseCell' is
     -- atomic, so two actors that both see this release it once.
     CellJob → pure (True, [releaseCell tp cell])
+    -- Offered, and the host returned the credit unused: it dropped the build.
+    CellOffered → pure (True, [releaseCell tp cell])
     CellClaimed → pure (False, [])
     CellAdopted → forget []
     CellFailed failure → forget [latchFailure tp "texture release" failure]
@@ -1565,14 +1584,17 @@ settledAnswer tp jid job = case jCell job of
         pure (releaseCell tp cell : answers)
     | Just (width, height) ← jDims job →
         pure
-          [ do
-              answer ← jReply job (ProviderResource (VRecord [("width", VInteger (fromIntegral width)), ("height", VInteger (fromIntegral height))]) (adoptionFor tp jid cell width height (jCharge job)))
-              case answer of
-                ReplyLate → releaseCell tp cell
-                ReplyUnknown → releaseCell tp cell
-                ReplyRefusedValue → latchDefect tp "the host refused a texture result" >> releaseCell tp cell
-                ReplyDefective → latchDefect tp "the host found a texture result defective" >> releaseCell tp cell
-                _ → pure ()
+          [ (hookOffering (tpHooks tp) (jKey job) >> offerCell tp jid cell) >>= \case
+              OfferWithdrawn → pure ()
+              OfferClaimed → () <$ jReply job (ProviderFailure "the texture pipeline stopped while the request was live")
+              OfferMade → do
+                answer ← jReply job (ProviderResource (VRecord [("width", VInteger (fromIntegral width)), ("height", VInteger (fromIntegral height))]) (adoptionFor tp jid cell width height (jCharge job)))
+                case answer of
+                  ReplyLate → releaseCell tp cell
+                  ReplyUnknown → releaseCell tp cell
+                  ReplyRefusedValue → latchDefect tp "the host refused a texture result" >> releaseCell tp cell
+                  ReplyDefective → latchDefect tp "the host found a texture result defective" >> releaseCell tp cell
+                  _ → pure ()
           ]
     | otherwise → pure [latchDefect tp "a texture was delivered for a job with no dimensions"]
   Nothing
@@ -1580,6 +1602,32 @@ settledAnswer tp jid job = case jCell job of
     | jStopping job → answerFor tp jid (ProviderFailure "the texture pipeline stopped while the request was live")
     | Just why ← jFailure job → answerFor tp jid (ProviderFailure ("the upload backend failed: " <> why))
     | otherwise → answerFor tp jid (ProviderFailure "the upload ended without a texture or a failure")
+
+-- | What offering a delivered texture to the host came to.
+data Offer
+  = -- | The cell is offered: the host decides, and nothing but its own drop or the end of its interest
+    -- releases it.
+    OfferMade
+  | -- | Somebody claimed it first (a shutdown): it cannot be offered, and the request is answered a failure.
+    OfferClaimed
+  | -- | The host's interest ended meanwhile: there is nobody to answer, and the withdrawal releases it.
+    OfferWithdrawn
+
+-- | The one decision that a delivered texture is handed to the host: the cell moves from delivered to
+-- offered in the same transaction that reads whether the host still wants it. After it, a shutdown
+-- cannot release the cell; before it, the offer cannot be made over a cell a shutdown claimed.
+offerCell ∷ TexturePipeline → JobId → Cell → IO Offer
+offerCell tp jid cell = atomically $ do
+  st ← readTVar (tpState tp)
+  let wanted = case Map.lookup jid (psJobs st) of
+        Just job → not (jWithdrawn job)
+        Nothing → False
+  readTVar (cellState cell) >>= \case
+    CellJob
+      | wanted → OfferMade <$ writeTVar (cellState cell) CellOffered
+      | otherwise → pure OfferWithdrawn
+    _ | wanted → pure OfferClaimed
+    _ → pure OfferWithdrawn
 
 -- | The delivered texture of a job nobody will adopt, as an effect to release it.
 releaseDeliveredCell ∷ TexturePipeline → JobId → STM [IO ()]
@@ -1644,6 +1692,7 @@ jobRetirement tp jid = do
             readTVar (cellState cell) >>= \case
               CellAdopted → pure ProviderComplete
               CellJob → pure ProviderPending
+              CellOffered → pure ProviderPending
               CellClaimed → pure ProviderPending
               CellReleasing poll → readRetirement poll
               CellFailed (ExceptionWithContext _ failure) → pure (ProviderFailed failure)
@@ -1652,7 +1701,14 @@ jobRetirement tp jid = do
 -- The texture ----------------------------------------------------------------------------------------
 
 -- | Who is releasing a cell.
-data Claimant = ByPipeline | ByLease
+data Claimant
+  = -- | The pipeline, because nobody wants the texture: the host's interest ended, a failed upload,
+    -- or the host dropped the build.
+    ByPipeline
+  | -- | A lease.
+    ByLease
+  | -- | A shutdown: it may claim only a texture nobody offered.
+    ByShutdown
   deriving (Eq)
 
 -- | The resource a lease holds for a texture: the backend's registration and what is needed to give
@@ -1666,9 +1722,12 @@ data TextureResource = TextureResource
   }
 
 -- | The recipe the host runs, on the owner's thread, to build the texture into the lease the request
--- reserved. It adopts the cell if no one has released it; if the pipeline already did (the request was
--- cancelled between the answer and the build) the lease is built over a texture whose release is
--- already under way, so its charges are returned when that release retires.
+-- reserved. It adopts the cell the answer offered; the one other thing the cell can be is claimed, and
+-- that only happens when the host's interest ended (the request was cancelled or its instance ended
+-- between the answer and the build), which is the host's to discover: it releases the lease it built,
+-- over a texture whose release is already under way, so its charges are returned when that release
+-- retires. A shutdown never claims an offered cell, so a request that still waits is never answered
+-- over a released texture.
 adoptionFor ∷ TexturePipeline → JobId → Cell → Word32 → Word32 → TextureCharge → Adoption
 adoptionFor _ _ cell width height charge =
   Adoption $ \retirements →
@@ -1677,7 +1736,7 @@ adoptionFor _ _ cell width height charge =
       (releaseRank 0)
       ( do
           atomically $ readTVar (cellState cell) >>= \case
-            CellJob → writeTVar (cellState cell) CellAdopted
+            CellOffered → writeTVar (cellState cell) CellAdopted
             _ → pure ()
           pure TextureResource {resourceTexture = cellTexture cell, resourceWidth = width, resourceHeight = height, resourceCell = cell, resourceCharge = charge}
       )
@@ -1713,8 +1772,16 @@ releaseResource retirements resource = do
 
 -- | Request the release of a cell on behalf of the pipeline.
 releaseCell ∷ TexturePipeline → Cell → IO ()
-releaseCell tp cell = do
-  outcome ← tryWithContext @SomeException (releaseCellBy ByPipeline cell)
+releaseCell = releaseCellFor ByPipeline
+
+-- | Request the release of a cell that nobody offered, on behalf of a shutdown. A cell already offered is
+-- left to the host: it is adopted, or dropped and then released by the pipeline.
+releaseUnoffered ∷ TexturePipeline → Cell → IO ()
+releaseUnoffered = releaseCellFor ByShutdown
+
+releaseCellFor ∷ Claimant → TexturePipeline → Cell → IO ()
+releaseCellFor by tp cell = do
+  outcome ← tryWithContext @SomeException (releaseCellBy by cell)
   case outcome of
     Right () → pure ()
     -- Recorded on the cell by 'releaseCellBy' either way. A synchronous failure is the pipeline's; a
@@ -1726,13 +1793,14 @@ releaseCell tp cell = do
 
 -- | Claim the cell for release if its state allows this claimant to, call the backend's release (never
 -- waiting) and record what it answered. Exactly one claimant ever calls the backend: the claim is one
--- transaction on the cell, and the pipeline may claim only a cell no lease adopted, the lease only an
--- adopted one.
+-- transaction on the cell, and the pipeline may claim a cell no lease adopted (a shutdown only one nobody
+-- offered), the lease only an adopted one.
 releaseCellBy ∷ Claimant → Cell → IO ()
 releaseCellBy by cell = mask_ $ do
   claimed ← atomically $
     readTVar (cellState cell) >>= \case
-      CellJob | by == ByPipeline → True <$ writeTVar (cellState cell) CellClaimed
+      CellJob | by /= ByLease → True <$ writeTVar (cellState cell) CellClaimed
+      CellOffered | by == ByPipeline → True <$ writeTVar (cellState cell) CellClaimed
       CellAdopted | by == ByLease → True <$ writeTVar (cellState cell) CellClaimed
       _ → pure False
   when claimed $ do
@@ -1757,9 +1825,9 @@ closeAndWithdraw tp = do
     modifyState tp (\st → st {psPhase = Closed})
     st ← readTVar (tpState tp)
     fmap concat . forM (Map.toAscList (psJobs st)) $ \(jid, job) → case jStage job of
-      -- A texture delivered and not yet adopted is the pipeline's to release: the host's build of
-      -- it, if it still comes, finds it released.
-      StageSettled → pure [releaseCell tp cell | Just cell ← [jCell job]]
+      -- A texture delivered and not yet offered is the shutdown's to release: the answer that was to offer
+      -- it finds it claimed and answers a failure. One already offered is the host's, to adopt or drop.
+      StageSettled → pure [releaseUnoffered tp cell | Just cell ← [jCell job]]
       _ → stopJob jid job
   runEffects tp effects
   where
@@ -1837,6 +1905,8 @@ drained tp = do
     Just cell →
       readTVar (cellState cell) >>= \case
         CellJob → pure True
+        -- Offered: the host adopts it or drops it, and a drop reaches the orphans.
+        CellOffered → pure True
         CellClaimed → pure True
         CellReleasing poll → readRetirement poll <&> \case ProviderPending → True; _ → False
         _ → pure False

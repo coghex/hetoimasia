@@ -186,6 +186,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Texture.Lifecycle
         Test.LuaEngine.Texture.Limits
         Test.LuaEngine.Texture.Ownership
+        Test.LuaEngine.Texture.Publication
         Test.LuaEngine.Texture.Png
         Test.LuaEngine.Texture.Spec
         Test.LuaEngine.Texture.Stages
