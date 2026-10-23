@@ -6,9 +6,9 @@
 module Test.LuaEngine.Modules.Limits (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, tryPutMVar)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, rethrowIO, tryWithContext)
+import Control.Exception (finally)
 import Control.Concurrent.STM (atomically)
-import Control.Monad (void)
+import Control.Monad (forM_, void)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.ByteString.Char8 as Char8
 import qualified Data.Text as Text
@@ -269,22 +269,55 @@ loads = describe "an accepted load that meets a limit" $ do
           line ← lineStartingWith session "x pstart k2 error"
           line `shouldSatisfy` Text.isInfixOf "module limit"
 
-  it "decides a request's permanent place with its argument check, so a boot load that arrives between the check and the admission is the one refused, and the request is never made busy" $
+  it "refuses the request for good, as data and not busy, when a boot load takes the last place between the argument check and the admission" $
     withSession tiny (2, 8) realReader layout $ \session _ runtime →
       withVm session runtime "ui" (defaultOptions OnArrival) $ \vm → do
         admitDriver session vm "x"
-        void (bootNow session vm "i2.lua" >>= awaitBootOutcome)
-        void (bootNow session vm "i3.lua" >>= awaitBootOutcome)
-        counts' vm >>= \c → jobsHeld c `shouldBe` 2
-        -- One place is left, so the check lets the request through and holds the place for it. A boot load
-        -- of another module arrives before the admission: it finds the place taken.
+        mapM_ (\path → bootNow session vm path >>= awaitBootOutcome >>= (`shouldBe` BootReady)) ["i2.lua", "i3.lua"]
+        -- One place is left, so the check, which only reads, lets the request through. A boot load of
+        -- another module takes the place before the admission does: the credit that would have taken it
+        -- is the one that says the cache is full for good.
         raced ← newIORef Nothing
         betweenCheckAndAdmission session (bootModule (vmCoordinator vm) (key' session "i1.lua") >>= writeIORef raced . Just . either Just (const Nothing))
-        command session vm "x" "start" "k1" [] (Just (fetch "i4.lua"))
-        awaitNote session "x start k1 started"
-        readIORef raced >>= (`shouldBe` Just (Just BootCacheFull))
+        command session vm "x" "pstart" "k1" [] (Just (fetch "i4.lua"))
+        line ← lineStartingWith session "x pstart k1 refused:"
+        line `shouldSatisfy` Text.isInfixOf "module limit"
+        line `shouldNotSatisfy` Text.isInfixOf "busy"
+        readIORef raced >>= (`shouldBe` Just Nothing)
         awaitCounts vm (\c → jobsReady c == 3)
-        counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (3, 0)
+        counts' vm >>= \c → (jobsHeld c, promisedHeld c, waitersHeld c) `shouldBe` (3, 0, 0)
+        -- Final: asking again is told the same, and the instance goes on.
+        command session vm "x" "pstart" "k2" [] (Just (fetch "i4.lua"))
+        line' ← lineStartingWith session "x pstart k2 error"
+        line' `shouldSatisfy` Text.isInfixOf "module limit"
+
+  it "keeps a temporarily busy answer busy, whatever another thread does to the identity cache meanwhile" $
+    withSession (Profiles.counts [(ModuleIdentitiesPerVm, 3), (ModuleChainDepth, 2), (RequestsPerInstance, 1)]) (3, 8) realReader layout $ \session _ runtime →
+      withVm session runtime "ui" (defaultOptions OnArrival) $ \vm → do
+        admitDriver session vm "x"
+        closeGate (ssProbe session) "i1.lua"
+        command session vm "x" "pstart" "k1" [] (Just (fetch "i1.lua"))
+        awaitNote session "x pstart k1 started"
+        -- The instance's one place is held, so the next request is busy; the boot load that fills the cache
+        -- in between changes nothing about why: the bank is asked first, and waiting could free it.
+        betweenCheckAndAdmission session (void (bootNow session vm "i2.lua"))
+        command session vm "x" "pstart" "k2" [] (Just (fetch "i3.lua"))
+        line ← lineStartingWith session "x pstart k2 busy:"
+        line `shouldSatisfy` Text.isInfixOf "busy:busy:"
+        counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (2, 0)
+
+  it "leaves nothing promised when a later check of the same binding rejects after this one passed" $
+    withSession tiny (2, 8) realReader layout $ \session _ runtime →
+      withVm session runtime "ui" (defaultOptions OnArrival) $ \vm → do
+        admitDriver session vm "x"
+        forM_ ["i1.lua", "i2.lua", "i3.lua", "i4.lua"] $ \path → do
+          command session vm "x" "rstart" "kr" [] (Just (fetch path))
+          line ← lineStartingWith session "x rstart kr error"
+          line `shouldSatisfy` Text.isInfixOf "rejected by a later check"
+        -- Four distinct modules were rejected after the check passed, and the cache has its three places.
+        counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (0, 0)
+        mapM_ (\path → command session vm "x" "pstart" "k" [] (Just (fetch path)) >> awaitNote session "x pstart k started") ["i1.lua"]
+        counts' vm >>= \c → promisedHeld c `shouldBe` 0
 
 -- | Refusals are told apart by what can change: what waiting can fix is busy, with nothing left
 -- reserved; what it cannot is a refusal, decided with the reservation it would have taken.
@@ -301,16 +334,16 @@ refusals = describe "refusals told apart by what can change" $ do
         awaitHistory session (any (Text.isInfixOf "busy:busy:"))
         counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (1, 0)
 
-  it "fails a call that skipped the check at a full cache with the refusal, never a busy answer" $ do
-    ExceptionWithContext _ failure ← fatalSession tiny (2, 8) realReader layout $ \session control runtime →
+  it "refuses a call that skipped the check at a full cache for good, as data and never busy: the credit decides alone" $
+    withSession tiny (2, 8) realReader layout $ \session _ runtime →
       withVm session runtime "ui" (defaultOptions OnArrival) $ \vm → do
         admitDriver session vm "x"
         mapM_ (\path → bootNow session vm path >>= awaitBootOutcome >>= (`shouldBe` BootReady)) ["i1.lua", "i2.lua", "i3.lua"]
         command session vm "x" "ustart" "k1" [] (Just (fetch "i4.lua"))
-        ended ← tryWithContext @SomeException (awaitEnd control vm)
-        either rethrowIO (const (expectationFailure "the owner should have ended in a failure")) ended
-    Text.pack (show failure) `shouldSatisfy` Text.isInfixOf "module limit"
-    Text.pack (show failure) `shouldNotSatisfy` Text.isInfixOf "busy"
+        line ← lineStartingWith session "x ustart k1 refused:"
+        line `shouldSatisfy` Text.isInfixOf "module limit"
+        line `shouldNotSatisfy` Text.isInfixOf "busy"
+        counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (3, 0)
 
   it "refuses a boot load at a full cache for good, and is busy only while boot loads are unsettled, with nothing taken either way" $
     withSession tiny (2, 8) realReader layout $ \session _ runtime →
@@ -331,7 +364,7 @@ refusals = describe "refusals told apart by what can change" $ do
         either (\refused → expectationFailure ("a held module should be answered, found " <> show refused)) (const (pure ())) again
         counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (3, 0)
 
-  it "refuses a request at a coordinator that has closed with the same ordinary error the check raises, and takes no place" $
+  it "refuses a request at a coordinator that has closed with the same ordinary error the check raises, and takes no place; a call that skipped the check is refused for good as data" $
     withSession tiny (2, 8) realReader layout $ \session _ runtime →
       withVm session runtime "ui" (defaultOptions OnArrival) $ \vm → do
         admitDriver session vm "x"
@@ -340,6 +373,10 @@ refusals = describe "refusals told apart by what can change" $ do
         line ← lineStartingWith session "x pstart k1 error"
         line `shouldSatisfy` Text.isInfixOf "stopped"
         line `shouldNotSatisfy` Text.isInfixOf "busy"
+        counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (0, 0)
+        command session vm "x" "ustart" "k2" [] (Just (fetch "i1.lua"))
+        line' ← lineStartingWith session "x ustart k2 refused:"
+        line' `shouldSatisfy` Text.isInfixOf "stopped"
         counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (0, 0)
 
 counts' ∷ Vm → IO Counts

@@ -70,6 +70,8 @@ module Hetoimasia.Scripting.Lua.Provider.Types
 
     -- * Refusals a script reads
   , RequestRefusal (..)
+  , CreditRefused (..)
+  , refusalReasonBytes
   , renderRequestRefusal
 
     -- * Subscriptions
@@ -358,7 +360,9 @@ data Credit = Credit
     -- ^ Named in the busy answer and in evidence. Bounded to 64 characters when it is shown.
   , creditReserve ∷ STM Bool
     -- ^ Take the credit: 'True' when it was available and is now held. A bank that is full
-    -- answers 'False'; whatever it wrote is undone with the rest of the admission.
+    -- answers 'False', which is busy (waiting may help); whatever it wrote is undone with the rest of
+    -- the admission. A bank that is full /for good/ (nothing will ever return a place) raises
+    -- 'CreditRefused' with @throwSTM@ instead, which is a refusal that is final: see 'CreditRefused'.
   , creditRelease ∷ CreditEnd → STM ()
     -- ^ Give the credit back, once, with the reason. Never called for a credit that
     -- 'creditTransfers' and whose request succeeded with a resource.
@@ -368,6 +372,23 @@ data Credit = Credit
     -- resource gives it back, and the engine does not. A credit that does not transfer is the
     -- request's, and is returned when the request is taken and its work is retired.
   }
+
+-- | Raised by 'creditReserve' (with @throwSTM@) when the credit can never be had: the bank is full
+-- for good, or what it guards is gone. The admission is refused permanently with this reason and
+-- nothing reserved, which 'Hetoimasia.Scripting.Lua.Admission.startAdmitted' answers as
+-- 'Hetoimasia.Scripting.Lua.Admission.Refused', distinct from the busy answer a full bank that may
+-- empty gets and, unlike a refusal the engine makes of the call itself, not a fault of the call. The
+-- decision is the credit's, taken in the same transaction that would have taken the place. The
+-- reason is bounded to 'refusalReasonBytes' when it is shown. A credit that never raises it keeps
+-- exactly the behavior it had.
+newtype CreditRefused = CreditRefused Text
+  deriving (Eq, Show)
+
+instance Exception CreditRefused
+
+-- | The most of a credit's refusal reason that a script reads.
+refusalReasonBytes ∷ Int
+refusalReasonBytes = 256
 
 -- | Why a credit is returned.
 data CreditEnd
@@ -573,6 +594,8 @@ data RequestRefusal
   | -- | The admission reserves a result lease, and the instance has no lease scope: the
     -- owner was given no leases, or the instance is ending.
     RequestNoLeaseScope
+  | -- | A credit said it can never be had ('CreditRefused'): the reason it gave.
+    RequestCreditRefused !Text
   deriving (Eq, Show)
 
 -- | A refusal as the reason a script reads.
@@ -592,6 +615,7 @@ renderRequestRefusal = \case
   RequestTickUnrepresentable highest → "request refused: the tick and offset pass the ceiling of " <> Text.pack (show highest)
   RequestNumbersExhausted highest → "request refused: every request number up to " <> Text.pack (show highest) <> " has been issued"
   RequestNoLeaseScope → "request refused: the instance has no lease scope to reserve a result lease in"
+  RequestCreditRefused why → "request refused: " <> Text.take refusalReasonBytes why
 
 -- Subscriptions ---------------------------------------------------------------------
 

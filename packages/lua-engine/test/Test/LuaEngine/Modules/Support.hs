@@ -582,7 +582,7 @@ bindings ∷ Session → Coordinator → [Namespace]
 bindings session coordinator =
   [ namespace "fx" [recording, blocking]
   , namespace "request" (m1RequestBindings (M1Service handleType moduleValueSchema))
-  , namespace "module" [fetching, fetchingUnchecked, looking]
+  , namespace "module" [fetching, fetchingUnchecked, fetchingRejected, looking]
   ]
   where
     recording =
@@ -603,9 +603,10 @@ bindings session coordinator =
           _ → pure ()
         pure []
     fetching = withArgumentCheck check (fetchWith "fetch")
-    -- A call that skipped the argument check: what the check would have refused or reserved is met by the
-    -- admission itself, and a permanent refusal there is a fault of the call.
+    -- A call that skipped the argument check: the admission decides on its own, with the same answers.
     fetchingUnchecked = fetchWith "fetch_unchecked"
+    -- Another check of the same binding, after this one's, rejects: nothing of the first may be left behind.
+    fetchingRejected = withArgumentCheck (\_ _ → pure (Just "rejected by a later check")) (withArgumentCheck check (fetchWith "fetch_rejected"))
     fetchWith name =
       asynchronousNativeRequestIn name [SText, SOptional SInteger] (m1StartSchemas handleType) $ \context values →
         case requestFrom session values of
@@ -614,7 +615,8 @@ bindings session coordinator =
             started ← startModule coordinator asked context (note session "disposed")
             case started of
               StartAnswered answer → pure (m1StartResults handleType answer)
-              StartRefused why → throwIO (userError (Text.unpack why))
+              -- A permanent refusal is final data, distinct from busy: nothing was accepted and asking again cannot change that.
+              StartRefused why → pure (m1StartResults handleType (M1Refused why))
     check owner values = case requestFrom session values of
       Left why → pure (Just why)
       Right asked → do
@@ -695,22 +697,30 @@ driverSource =
       , "  end"
       , "  return '{' .. table.concat(out, ',') .. '}'"
       , "end"
+      , "local function told(err)"
+      , "  return (err.code == 'busy' and 'busy:' or 'refused:') .. err.code .. ':' .. err.message"
+      , "end"
       , "local function run(self, p)"
       , "  local key = p.key or 'a'"
       , "  local out = '?'"
       , "  if p.op == 'start' then"
       , "    local r, err = module.fetch(p.path or 'a.lua', p.offset)"
-      , "    if r then self.hs[key] = r out = 'started' else out = 'busy:' .. err.code .. ':' .. err.message end"
+      , "    if r then self.hs[key] = r out = 'started' else out = told(err) end"
       , "  elseif p.op == 'pstart' then"
       , "    local ok, r, err = pcall(module.fetch, p.path or 'a.lua', p.offset)"
       , "    if not ok then out = 'error ' .. tostring(r)"
       , "    elseif r then self.hs[key] = r out = 'started'"
-      , "    else out = 'busy:' .. err.code .. ':' .. err.message end"
+      , "    else out = told(err) end"
+      , "  elseif p.op == 'rstart' then"
+      , "    local ok, r, err = pcall(module.fetch_rejected, p.path or 'a.lua', p.offset)"
+      , "    if not ok then out = 'error ' .. tostring(r)"
+      , "    elseif r then self.hs[key] = r out = 'started'"
+      , "    else out = told(err) end"
       , "  elseif p.op == 'ustart' then"
       , "    local ok, r, err = pcall(module.fetch_unchecked, p.path or 'a.lua', p.offset)"
       , "    if not ok then out = 'error ' .. tostring(r)"
       , "    elseif r then self.hs[key] = r out = 'started'"
-      , "    else out = 'busy:' .. err.code .. ':' .. err.message end"
+      , "    else out = told(err) end"
       , "  elseif p.op == 'ready' then out = tostring(request.ready(self.hs[key]))"
       , "  elseif p.op == 'take' then out = describe(request.take(self.hs[key]), 0)"
       , "  elseif p.op == 'ptake' then"
@@ -756,7 +766,7 @@ driverSource =
       , "  elseif p.op == 'block' then fx.block(key) out = 'released'"
       , "  end"
       , "  local tag = ''"
-      , "  if p.path and p.op ~= 'start' and p.op ~= 'pstart' and p.op ~= 'ustart' then tag = ' #' .. p.path end"
+      , "  if p.path and p.op ~= 'start' and p.op ~= 'pstart' and p.op ~= 'ustart' and p.op ~= 'rstart' then tag = ' #' .. p.path end"
       , "  fx.record((p.who or 'cmd') .. ' ' .. p.op .. ' ' .. key .. ' ' .. out .. tag)"
       , "end"
       , "function init(self, api)"

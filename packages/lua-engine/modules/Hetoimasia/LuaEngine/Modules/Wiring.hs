@@ -45,7 +45,7 @@ import Control.Concurrent.STM
   , throwSTM
   , writeTVar
   )
-import Control.Exception (Exception, onException, throwIO)
+import Control.Exception (Exception, throwIO)
 import Control.Monad (replicateM_, unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.Map.Strict as Map
@@ -349,46 +349,39 @@ identityCredit c identity =
     , creditTransfers = False
     }
 
--- | Start a request for a module atomically: accepted, or busy with nothing reserved. A new identity
--- reserves its permanent place together with the request's own records, before the endpoint is handed
--- anything and before a source is asked for; temporary pressure on the request, result or identity
--- banks is the host's busy answer with no handle, read or partial reservation.
+-- | Start a request for a module atomically: accepted, busy with nothing reserved, or refused for good.
+-- A new identity reserves its permanent place together with the request's own records, before the
+-- endpoint is handed anything and before a source is asked for; temporary pressure on the request or
+-- result banks is the host's busy answer with no handle, read or partial reservation, and a full
+-- identity cache is a refusal, decided by the credit in the same transaction.
 startModule ∷ HasCallStack ⇒ Coordinator → ModuleRequest → RequestContext → IO () → IO ModuleStart
 startModule c request context after = do
   ask <- moduleAsk c request
-  -- Whatever the admission comes to, the room its check reserved is adopted or given back; an exception
-  -- that leaves the admission undecided gives it back too.
-  started <-
-    startM1 (coordRequests c) ask context moduleEndpointName (moduleArguments request) after
-      `onException` atomically (releaseCheckSTM c (requestedKey request))
-  case started of
-    M1Busy _ -> do
-      -- Not accepted: the room the argument check reserved was not adopted, and is given back.
-      atomically (releaseCheckSTM c (requestedKey request))
-      -- The identity cache never frees a place, so a place that is gone is gone: if the admission met a
-      -- full cache, or a coordinator that closed, after the argument check let it through (another
-      -- thread's boot load took the last place in between), it was not a bank that would have room
-      -- later. The permanent state is read after the failed admission, and can only have grown.
-      atomically (permanentRefusalSTM c (requestedKey request)) >>= \case
-        Just why -> pure (StartRefused why)
-        Nothing -> pure (StartAnswered started)
-    M1Accepted _ -> pure (StartAnswered started)
+  started <- startM1 (coordRequests c) ask context moduleEndpointName (moduleArguments request) after
+  pure $ case started of
+    M1Refused why -> StartRefused why
+    _ -> StartAnswered started
 
--- | What starting a request for a module came to: what the request host answered, or a permanent
--- refusal. The argument check decides the permanent questions and holds the place, so only a call that
--- skipped the check meets one here: the caller fails that call with the reason, as the host fails a call
--- that skipped its own permanent checks, and never answers busy for what waiting cannot change.
+-- | What starting a request for a module came to: what the request host answered (accepted, or busy on a
+-- temporary bank), or a permanent refusal. The identity cache never frees a place, so a place that is not
+-- there is not there for good, and the credit that would have taken it says so in the transaction that
+-- would have taken it: the answer is a refusal and never busy, whatever another thread did since the
+-- argument check read the state. The argument check only reads.
 data ModuleStart
-  = -- | Accepted, or busy on a temporary bank.
+  = -- | Accepted, or busy on a temporary bank: data the script may retry.
     StartAnswered !M1Start
   | -- | The identity cache is full for a new identity, or the coordinator has closed: the bounded reason.
+    -- Final.
     StartRefused !Text
   deriving (Eq, Show)
 
 -- | The argument check of a binding that builds the request from its copied arguments: the host's
 -- permanent refusals first (role, phase, offset, ceiling, exhausted numbers), then this one's: a new
 -- identity when the VM already holds every identity it may, or a coordinator that has closed. Each is
--- an ordinary Lua error before any admission, never busy.
+-- an ordinary Lua error before any admission, never busy. It only reads, reserves nothing and decides
+-- nothing for good: a place that goes between this and the admission is refused by the credit that
+-- would have taken it ('startModule'), so a later check of the same binding that rejects leaves
+-- nothing behind.
 moduleArgumentCheck ∷ Coordinator → ([Value] → ModuleRequest) → ArgumentCheck
 moduleArgumentCheck c requestOf owner values = do
   let request = requestOf values
@@ -396,7 +389,7 @@ moduleArgumentCheck c requestOf owner values = do
   hosts <- m1ArgumentCheck (coordRequests c) (const ask) owner values
   case hosts of
     Just why -> pure (Just why)
-    Nothing -> atomically (reserveForCheckSTM c (requestedKey request))
+    Nothing -> atomically (permanentRefusalSTM c (requestedKey request))
 
 -- Boot loads --------------------------------------------------------------------------------------------
 

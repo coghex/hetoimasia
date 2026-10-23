@@ -71,6 +71,8 @@ module Hetoimasia.Scripting.Lua.Admission
   , Necessity (..)
   , Credit (..)
   , CreditEnd (..)
+  , CreditRefused (..)
+  , refusalReasonBytes
   , ExpectedFailure (..)
   , Adoption (..)
   , Retirements
@@ -107,6 +109,7 @@ import Control.Concurrent.STM (atomically)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), mask, mask_, rethrowIO, someExceptionContext)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
+import qualified Data.Text as Text
 import Data.Word (Word64)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (operation, throwFailure)
@@ -129,6 +132,10 @@ data Started
   | -- | Nothing was accepted: this bank had no room. No handle, no provider action, no partial
     -- reservation, no failure of the instance. Hand the script a busy answer.
     Unavailable !Bank
+  | -- | Nothing was accepted, and nothing will be: a credit said it can never be had
+    -- ('CreditRefused'), with this bounded reason. Final, where 'Unavailable' is recoverable data
+    -- the script may retry; no handle, provider action, partial reservation or failure of the instance.
+    Refused !Text
   deriving (Eq, Show)
 
 -- | Start a request of this endpoint with the opt-in admission, and give the binding its
@@ -156,6 +163,7 @@ startAdmitted context ask name arguments afterCompletion = do
   mask $ \restore → do
     outcome ← atomically (admitOptIn service requester endpoint ask)
     case outcome of
+      OptInRefused (RequestCreditRefused why) → pure (Refused (Text.take refusalReasonBytes why))
       OptInRefused why → refuse why
       OptInBusy bank → pure (Unavailable bank)
       OptInAccepted found → do

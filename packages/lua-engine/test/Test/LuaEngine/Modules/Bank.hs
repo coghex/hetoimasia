@@ -28,6 +28,13 @@ importing total name dependency = body <> Char8.replicate (total - ByteString.le
   where
     body = Char8.pack ("local d = import('" <> dependency <> "') fx.record('eval " <> name <> "') return { id = '" <> name <> "', d = d } --")
 
+-- | A module of exactly this many bytes that waits at a gate of its own name before it imports a
+-- dependency, so that an example decides when the dependency is discovered.
+gated ∷ Int → String → String → String → ByteString.ByteString
+gated total name gate dependency = body <> Char8.replicate (total - ByteString.length body) ' '
+  where
+    body = Char8.pack ("fx.block('" <> gate <> "') local d = import('" <> dependency <> "') fx.record('eval " <> name <> "') return { id = '" <> name <> "', d = d } --")
+
 layout ∷ Layout
 layout =
   Layout $
@@ -35,6 +42,7 @@ layout =
     ]
       <> [ ("main.lua", importing 100 "main" "dep.lua")
          , ("early.lua", importing 100 "early" "dep.lua")
+         , ("headgate.lua", gated 100 "head" "hg" "dep.lua")
          , ("late.lua", sized 100 "late")
          ]
 
@@ -185,7 +193,7 @@ workers = describe "the pool's workers" $
           awaitStarted (ssProbe session) 2
           command session other "o" "start" "kq1" [] (Just (fetch "q1.lua"))
           awaitNote session "o start kq1 started"
-          command session vm "x" "start" "km" [] (Just (fetch "main.lua"))
+          command session vm "x" "start" "km" [] (Just (fetch "headgate.lua"))
           awaitNote session "x start km started"
           command session other "o" "start" "kq2" [] (Just (fetch "q2.lua"))
           awaitNote session "o start kq2 started"
@@ -197,13 +205,16 @@ workers = describe "the pool's workers" $
           awaitCounts vm (\c → jobsNeeded c == 1)
           openGate (ssProbe session) "g1.lua"
           awaitStarted (ssProbe session) 4
-          startedPaths (ssProbe session) >>= (`shouldBe` ["g1.lua", "g2.lua", "main.lua", "q1.lua"])
+          -- The head's import is held at its gate, so the dependency cannot be discovered before the freed worker
+          -- has taken the next queued read: the four reads entered the reader in exactly this order.
+          startedPaths (ssProbe session) >>= (`shouldBe` ["g1.lua", "g2.lua", "headgate.lua", "q1.lua"])
+          releaseGate session "hg"
           -- The head imports the dependency, which is queued behind another neighbour read: it is
           -- the chain's next source now, and goes before it.
           awaitCounts vm (\c → jobsNeeded c == 2)
           openGate (ssProbe session) "g2.lua"
           awaitCounts vm (\c → jobsReady c == 2)
-          startedPaths (ssProbe session) >>= (`shouldSatisfy` (\paths → take 5 paths == ["g1.lua", "g2.lua", "main.lua", "q1.lua", "dep.lua"]))
+          startedPaths (ssProbe session) >>= (`shouldSatisfy` (\paths → take 5 paths == ["g1.lua", "g2.lua", "headgate.lua", "q1.lua", "dep.lua"]))
           maxActive (ssProbe session) >>= (`shouldBe` 2)
           openGate (ssProbe session) "q1.lua"
           awaitCounts other (\c → jobsReady c == 4)

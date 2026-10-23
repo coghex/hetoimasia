@@ -25,8 +25,8 @@
 --   if nobody wants it any more.
 -- * @csSlotsFree + number of jobs whose read is queued or in flight == csPoolHeld@ while the
 --   coordinator is open: the pool slots it holds are free or under a live job, never both.
--- * @csPromised@ holds the identities a request reserved room for, with how many asked and how many of
---   those are argument checks' (see 'Promise'), that no job exists for yet. The job's creation, by whatever path makes it (a request, a boot
+-- * @csPromised@ holds the identities a request's admission reserved room for, with how many asked,
+--   that no job exists for yet. The job's creation, by whatever path makes it (a request, a boot
 --   load, a dependency the chain discovered), takes the whole entry into the job in the same
 --   transaction, so an identity is never counted twice; an admission taken back gives up only its
 --   own reservation. @Map.size csJobs + Map.size csPromised@ never passes the identity bound.
@@ -53,7 +53,6 @@ module Hetoimasia.LuaEngine.Modules.Types
   , Phase (..)
   , Peaks (..)
   , CState (..)
-  , Promise (..)
   , newState
   , Coordinator (..)
   , Counts (..)
@@ -238,7 +237,7 @@ data Peaks = Peaks
 data CState = CState
   { csPhase ∷ !Phase
   , csJobs ∷ !(Map ExportIdentity Job)
-  , csPromised ∷ !(Map ExportIdentity Promise)
+  , csPromised ∷ !(Map ExportIdentity Int)
   -- ^ The identities a request's admission reserved room for and 'acceptRequest' has not yet turned
   -- into a job. The room is the identity's own, so taking an admission back after the job exists
   -- gives nothing back, and an admission taken back before it releases exactly its own reservation.
@@ -284,20 +283,6 @@ data Coordinator = Coordinator
   , coordLoader ∷ !(TVar (Maybe LoaderEndpoint))
   , coordState ∷ !(TVar CState)
   }
-
-
--- | The room reserved for an identity no job exists for yet. The permanent decision is taken, with the
--- reservation, by the request's argument check (so that a boot load that arrives afterwards finds the
--- room taken and is the one refused, and the request is never made busy by a cache that cannot free a
--- place); the admission then adopts that reservation instead of taking a second. A call that skipped
--- the check reserves in the admission as it always did.
-data Promise = Promise
-  { promiseCount ∷ !Int
-  -- ^ Reservations that have not been given back: the checks' and the admissions'.
-  , promiseChecked ∷ !Int
-  -- ^ Of those, the checks' that no admission has adopted yet.
-  }
-  deriving (Eq, Show)
 
 -- | A coherent reading of the coordinator, for observation.
 data Counts = Counts

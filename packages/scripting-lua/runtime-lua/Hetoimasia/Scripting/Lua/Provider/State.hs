@@ -814,7 +814,10 @@ admitOptIn service requester endpoint ask = (OptInAccepted <$> attempt) `catchST
             Left _ → stop' (StopRefused RequestNoLeaseScope)
       forM_ (admitCredits ask) $ \credit → do
         -- A provider's bank never makes the admission wait: one that retries is full.
-        reserved ← creditReserve credit `orElse` pure False
+        -- A credit that is full for good says so, and the refusal is final: it is not a bank that may empty.
+        reserved ←
+          (creditReserve credit `orElse` pure False)
+            `catchSTM` \(CreditRefused why) → stop' (StopRefused (RequestCreditRefused why))
         unless reserved (stop' (StopBank (BankCredit (creditName credit))))
       forM_ slot $ \due → ticksHold (psTicks service) (dueTick due) >> ticksWatch (psTicks service) (dueTick due)
       let record =
