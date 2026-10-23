@@ -86,6 +86,7 @@ module Hetoimasia.LuaEngine.Texture
   , noHooks
   , pipelineSpec
   , pipelineOpen
+  , pipelineDrained
   , PipelineReading (..)
   , LaneReading (..)
   , pipelineReading

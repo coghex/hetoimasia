@@ -79,6 +79,7 @@ module Hetoimasia.LuaEngine.Texture.Pipeline
   , pipelineSpec
   , newTextureOwner
   , pipelineOpen
+  , pipelineDrained
   , pipelineInventory
   , pipelineSession
 
@@ -1688,6 +1689,10 @@ drain tp = do
         Left caught → do
           atomicModifyIORef' pending (\held → (Just (fromMaybe caught held), ()))
           go pending
+
+-- | Whether nothing the pipeline started is left: the condition a closing scope waits for. Read-only.
+pipelineDrained ∷ TexturePipeline → STM Bool
+pipelineDrained = drained
 
 -- | Nothing left in flight.
 drained ∷ TexturePipeline → STM Bool

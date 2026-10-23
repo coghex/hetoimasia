@@ -6,6 +6,7 @@
 -- not cut the drain short.
 module Test.LuaEngine.Texture.Lifecycle (spec) where
 
+import Control.Concurrent.STM (atomically, retry)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, fromException, tryWithContext)
 import Control.Monad (void)
 import qualified Data.Text as Text
@@ -52,13 +53,15 @@ spec = describe "the pipeline's end" $ do
             reading ← pipelineNow nested
             say ("closed open=" <> Text.pack (show (readingOpen reading)) <> " uploading=" <> Text.pack (show (readingUploading reading)))
             held ← uploadN (ssFake nested) 0
+            -- The backend still holds the level: the condition the scope waits for is not met.
+            atomically (pipelineDrained (ssPipeline nested)) `shouldReturn` False
+            -- Recorded before the backend lets go, so nothing the scope does can precede it.
+            say "backend ending the upload"
             void (withdrawUpload (ssFake nested) held)
-            say "backend ended the upload"
         )
-      say "scope returned"
       seen ← history session
-      filter (\entry → "closed " `Text.isPrefixOf` entry || entry `elem` ["backend ended the upload", "scope returned"]) seen
-        `shouldBe` ["closed open=False uploading=1", "backend ended the upload", "scope returned"]
+      filter (\entry → "closed " `Text.isPrefixOf` entry || entry `elem` ["backend ending the upload", "nested scope returned"]) seen
+        `shouldBe` ["closed open=False uploading=1", "backend ending the upload", "nested scope returned"]
 
   it "drains with every normal bank full: the request place, the pipeline's accepted-work record and the instance's lease capacity are all held, and the drain still ends the work" $
     withSession ((config (smaller [(RequestsPerInstance, 1), (PngPixels, 1024), (PngAxisMaximum, 32)] bytes) layout) {cfgJobs = 1, cfgLeases = 1}) $ \session _ runtime → do
@@ -101,11 +104,17 @@ spec = describe "the pipeline's end" $ do
             awaitReleaseCalls (ssFake nested) 1
             releaseCalls (ssFake nested) `shouldReturn` [identity]
             note session "released while draining"
+            -- The texture is released and not retired: the condition the scope waits for is not met,
+            -- and it is met once the backend proves the retirement.
+            atomically (pipelineDrained (ssPipeline nested)) `shouldReturn` False
+            -- Recorded before the backend proves the retirement: the scope cannot have returned yet.
+            note session "backend proving retirement"
             retireTexture (ssFake nested) identity
+            atomically (pipelineDrained (ssPipeline nested) >>= \done → if done then pure () else retry)
         )
-      note session "scope returned"
       seen ← history session
-      filter (`elem` ["released while draining", "scope returned"]) seen `shouldBe` ["released while draining", "scope returned"]
+      filter (`elem` ["released while draining", "backend proving retirement", "nested scope returned"]) seen
+        `shouldBe` ["released while draining", "backend proving retirement", "nested scope returned"]
 
   it "keeps a fault raised while it drains, raises it when the scope ends, still waits for everything else, and reports the failed release to the owner whose request it was as cleanup evidence" $ do
     ExceptionWithContext _ ownerFailure ← fatalSession (config small layout) $ \session _ runtime → do

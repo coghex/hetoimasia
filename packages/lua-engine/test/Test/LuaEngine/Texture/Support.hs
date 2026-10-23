@@ -320,19 +320,25 @@ withSession cfg body =
 -- the nested ones and must end every instance it started on them; when it returns the nested scope
 -- closes admission and drains. @onClosed@ runs on a helper thread, once the nested pipeline has closed
 -- admission and while its scope is still draining, and is what lets the backend finish; the scope
--- cannot return before it has, and the helper's own failure is raised after.
+-- cannot return before it has, and the helper's own failure is raised after. The example's own log
+-- gets "nested scope returned" the moment the nested scope returned, so an example can say what the
+-- scope waited for.
 withNested ∷ Session → (Session → IO a) → (Session → IO ()) → IO a
 withNested session body onClosed = do
   fake ← newFake
   spec ← either (\refused → assertFailure ("texture spec refused: " <> show refused)) pure (textureSpec (ssProfile session) (cfgJobs (ssConfig session)))
   done ← newEmptyMVar
   value ←
-    withTexturePipelineWith (cfgHooks (ssConfig session)) spec (fakeBackend fake) (ssPool session) (ssInventory session) $ \pipeline → do
+    -- The janitor is armed only once the helper has finished, however it finished, so a helper that
+    -- fails cannot leave the backend holding what the scope waits for.
+    withJanitor fake . withTexturePipelineWith (cfgHooks (ssConfig session)) spec (fakeBackend fake) (ssPool session) (ssInventory session) $ \pipeline → do
       let nested = session {ssPipeline = pipeline, ssFake = fake}
       _ ← forkIO $ do
         atomically (pipelineOpen pipeline >>= \open → when open retry)
-        tryWithContext @SomeException (onClosed nested) >>= putMVar done
+        tryWithContext @SomeException (onClosed nested `finally` flushFake fake) >>= putMVar done
       body nested
+  -- The nested scope has returned: whatever the helper has recorded by now, it recorded before it.
+  note session "nested scope returned"
   readMVar done >>= either rethrowIO pure
   pure value
 
