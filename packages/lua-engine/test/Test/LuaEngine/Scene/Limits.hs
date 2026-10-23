@@ -18,6 +18,7 @@ import Hetoimasia.LuaEngine.Scene
 import Hetoimasia.Scripting.Lua.Lease (newLeases)
 import Hetoimasia.Scripting.Lua.Lending (newLending)
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VList, VRecord), limitBytes, limitDepth, limitElements)
+import System.Timeout (timeout)
 import Test.Hspec
 import Test.LuaEngine.Scene.Support
 
@@ -135,6 +136,8 @@ direct = describe "preparation itself" $
     prepareScene limits leases (candidate (replicate 3 (VRecord []))) >>= \case
       Left refusal → refusal `shouldBe` SceneRefusal AtSprites (TooManySprites 2)
       Right _ → expectationFailure "three sprites were accepted under a limit of two"
-    prepareScene limits leases (candidate (repeat (VRecord []))) >>= \case
-      Left refusal → refusal `shouldBe` SceneRefusal AtSprites (TooManySprites 2)
-      Right _ → expectationFailure "an endless list was accepted"
+    -- Bounded by a deadline of its own, so a preparation that walked the endless list fails here and does not hang.
+    timeout 10000000 (prepareScene limits leases (candidate (repeat (VRecord [])))) >>= \case
+      Just (Left refusal) → refusal `shouldBe` SceneRefusal AtSprites (TooManySprites 2)
+      Just (Right _) → expectationFailure "an endless list was accepted"
+      Nothing → expectationFailure "preparing an endless list did not stop at the sprite limit"
