@@ -31,7 +31,10 @@ spec = describe "composition from outside the packages" $ do
     withClient "Client.hs" ownerClient $ \compile → do
       outcome ← compile Typecheck
       rejectedBecause outcome "GHC-88464"
-    -- The numbers come from the profile: a client cannot build a specification of its own.
+    -- The numbers come from the profile: a client cannot build a specification of its own, nor change one.
+    withClient "Client.hs" updateClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "GHC-22385"
     withClient "Client.hs" specClient $ \compile → do
       outcome ← compile Typecheck
       rejectedBecause outcome "GHC-10237"
@@ -107,4 +110,15 @@ specClient =
     , ""
     , "forged ∷ Maybe TextureSpec"
     , "forged = Nothing"
+    ]
+
+updateClient ∷ String
+updateClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.LuaEngine.Texture (TextureSpec, specDecodeWorkers)"
+    , ""
+    , "forged ∷ TextureSpec → TextureSpec"
+    , "forged spec = spec {specDecodeWorkers = 0}"
     ]

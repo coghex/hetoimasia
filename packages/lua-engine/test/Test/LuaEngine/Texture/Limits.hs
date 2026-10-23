@@ -256,6 +256,20 @@ refusals = describe "permanent refusals" $ do
       d ← vmDiagnostics vm
       (rdBusy d, rdLatched d) `shouldBe` (0, 0)
 
+  it "refuse an instance whose facade boundary declared it logical, before any reservation or work: acquisition is presentation-instance hook work" $
+    withSession (config small layout) $ \session _ runtime → do
+      vm ← startVm session runtime "logical" OnArrival
+      admitModuleAs session vm LogicalRole "driver" "l"
+      pipelineBefore ← pipelineNow session
+      commandWith session vm "l" "pstart" "a" (Just (load "a.png"))
+      line ← lineStarting session "l pstart a "
+      line `shouldSatisfy` Text.isInfixOf "presentation-instance hook work"
+      pipelineNow session >>= (`shouldBe` pipelineBefore)
+      ownerNow vm "l" >>= (`shouldBe` OwnerReading 0 0)
+      readsStarted (ssProbe session) `shouldReturn` 0
+      d <- vmDiagnostics vm
+      (rdBusy d, rdLatched d) `shouldBe` (0, 0)
+
   it "take back every reservation when the provider raises as it is handed the request: the credits return unused and the pipeline keeps no job" $ do
     ExceptionWithContext _ failure ← fatalSession (config small layout) $ \session control runtime → do
       let raising endpoint = endpoint {endpointSubmit = \_ → note session "handing over" >> throwIO (userError "the provider refused the hand-over")}

@@ -25,8 +25,9 @@ spec = describe "ownership" $ do
 -- | Load, finish the upload and take the success under this key.
 acquire ∷ Session → Vm → Text → Text → Text → IO Word64
 acquire session vm name key path = do
-  started session vm name key path
+  -- Snapshot before the request starts: its upload can arrive before the script's acknowledgement does.
   count ← uploadsSeen (ssFake session)
+  started session vm name key path
   awaitUploads (ssFake session) (count + 1)
   identity ← uploadN (ssFake session) count >>= finishUpload (ssFake session)
   command session vm name "wait_take" key

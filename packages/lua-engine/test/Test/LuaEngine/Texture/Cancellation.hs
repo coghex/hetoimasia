@@ -7,7 +7,7 @@
 -- callback during submission, late and duplicate events, unconsumed success, and instance end.
 module Test.LuaEngine.Texture.Cancellation (spec) where
 
-import Control.Concurrent.MVar (MVar, newEmptyMVar, readMVar, tryPutMVar)
+import Control.Concurrent.MVar (readMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Monad (forM_, replicateM_, void)
 import qualified Data.ByteString as BS
@@ -26,15 +26,6 @@ spec = describe "cancellation" $ do
   orders
   events
   ending
-
--- | A hook that holds the decode worker until the example lets it go, and says when it arrived.
-data Gate = Gate {arrived ∷ MVar (), proceed ∷ MVar ()}
-
-newGate ∷ IO Gate
-newGate = Gate <$> newEmptyMVar <*> newEmptyMVar
-
-hold ∷ Gate → a → IO ()
-hold gate _ = void (tryPutMVar (arrived gate) ()) >> readMVar (proceed gate)
 
 cancelled ∷ Session → Vm → Text → Text → IO ()
 cancelled session vm name key = do
@@ -106,7 +97,7 @@ stages = describe "at each stage" $ do
 
   it "withdraws a request being decoded when the decode ends: no upload, the level released, the lane free" $ do
     gate ← newGate
-    withSession ((config small layout) {cfgHooks = noHooks {hookDecoding = hold gate}}) $ \session _ runtime → do
+    withSession ((config small layout) {cfgHooks = noHooks {hookDecoding = hold gate}, cfgRelease = releaseHeldGate gate}) $ \session _ runtime → do
       vm ← startVm session runtime "decoding" OnArrival
       admitDriver session vm "i"
       started session vm "i" "k0" "a.png"
@@ -122,7 +113,7 @@ stages = describe "at each stage" $ do
 
   it "withdraws a request whose level is decoded and charged but not yet handed over: the level is released and nothing is uploaded" $ do
     gate ← newGate
-    withSession ((config small layout) {cfgHooks = noHooks {hookDecoded = hold gate}}) $ \session _ runtime → do
+    withSession ((config small layout) {cfgHooks = noHooks {hookDecoded = hold gate}, cfgRelease = releaseHeldGate gate}) $ \session _ runtime → do
       vm ← startVm session runtime "decoded" OnArrival
       admitDriver session vm "i"
       started session vm "i" "k0" "a.png"
@@ -226,6 +217,30 @@ orders = describe "completion and cancellation in both orders" $ do
       line ← lineStarting session "i wait_take k0 "
       line `shouldBe` "i wait_take k0 {status=success,value={height=4,texture=<userdata>,width=8}}"
       lanesCharged session `shouldReturn` [0, 0]
+
+  it "survives the backend finishing, the result being taken and the request's record being returned before the submission call has returned" $
+    withSession (config small layout) $ \session _ runtime → do
+      vm ← startVm session runtime "issuing" OnArrival
+      admitDriver session vm "i"
+      setImmediate (ssFake session) (Just ImmediateReady)
+      setHoldSubmission (ssFake session) True
+      started session vm "i" "k0" "a.png"
+      awaitSubmitting (ssFake session) 1
+      -- Both events were delivered inside the call that has not returned: the job settled, the result
+      -- was adopted and taken, and the host returned the record, so the job is gone.
+      command session vm "i" "wait_take" "k0"
+      _ ← lineStarting session "i wait_take k0 "
+      awaitPipeline session ((== 0) . readingJobs)
+      setHoldSubmission (ssFake session) False
+      -- The pipeline is whole: the decode worker lives and a later request goes through.
+      setImmediate (ssFake session) Nothing
+      started session vm "i" "k1" "b.png"
+      awaitUploads (ssFake session) 2
+      uploadN (ssFake session) 1 >>= void . finishUpload (ssFake session)
+      command session vm "i" "wait_take" "k1"
+      _ ← lineStarting session "i wait_take k1 "
+      reading ← pipelineNow session
+      (readingFailed reading, readingDecodeWorkers reading) `shouldBe` (False, 1)
 
   it "cancels at the registration boundary: a request cancelled after the backend registered the texture and before the host built the lease releases it once, by the pipeline" $
     withSession (config small layout) $ \session _ runtime → do

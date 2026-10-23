@@ -28,6 +28,8 @@ module Hetoimasia.LuaEngine.Texture.Banks
     -- * One UI instance
   , TextureOwner
   , newOwner
+  , TextureRole (..)
+  , ownerRole
   , ownerNumber
   , ownerSession
   , ownerSlotLimit
@@ -77,8 +79,15 @@ sessionBytesCharged ∷ SessionBytes → STM Word64
 sessionBytesCharged = readTVar . sessionCharged
 
 -- | One UI instance's texture banks.
+-- | The role of the instance an owner stands for, declared by the facade boundary from the instance's
+-- immutable metadata, never read from Lua. Texture acquisition is presentation-instance hook work: an
+-- owner for a logical instance is refused before any reservation.
+data TextureRole = PresentationRole | LogicalRole
+  deriving (Eq, Show)
+
 data TextureOwner = TextureOwner
   { ownerNumber ∷ !Word64
+  , ownerRole ∷ !TextureRole
   , ownerSession ∷ !SessionBytes
   , ownerSlotLimit ∷ !Int
   , ownerSlots ∷ !(TVar Int)
@@ -92,9 +101,9 @@ instance Eq TextureOwner where
 
 -- | An owner with these limits, numbered by its pipeline. The numbers are issued in order and never
 -- again.
-newOwner ∷ Word64 → SessionBytes → Int → Word64 → STM TextureOwner
-newOwner number session slotLimit byteLimit =
-  TextureOwner number session slotLimit <$> newTVar 0 <*> pure byteLimit <*> newTVar 0 <*> newTVar True
+newOwner ∷ Word64 → SessionBytes → Int → Word64 → TextureRole → STM TextureOwner
+newOwner number session slotLimit byteLimit role =
+  TextureOwner number role session slotLimit <$> newTVar 0 <*> pure byteLimit <*> newTVar 0 <*> newTVar True
 
 -- | The texture slots the owner holds (pending, live and retiring).
 ownerSlotsCharged ∷ TextureOwner → STM Int

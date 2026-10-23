@@ -75,6 +75,13 @@ module Test.LuaEngine.Texture.Support
   , startVmWith
   , admitDriver
   , admitModule
+  , admitModuleAs
+  , Gate (..)
+  , newGate
+  , hold
+  , releaseHeldGate
+  , PollMode (..)
+  , setPollMode
   , ownerOf
   , stopInstance
   , command
@@ -123,9 +130,10 @@ import Control.Concurrent.STM
   , readTVar
   , readTVarIO
   , retry
+  , throwSTM
   , writeTVar
   )
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, fromException, rethrowIO, throwIO, tryWithContext)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, fromException, rethrowIO, throwIO, toException, tryWithContext)
 import Control.Monad (forM_, unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -214,12 +222,14 @@ data Config = Config
   , cfgLayout ∷ !Layout
   , cfgLeases ∷ !Int
   , cfgHooks ∷ !PipelineHooks
+  , cfgRelease ∷ IO ()
+    -- ^ Lets go of whatever gates the example's hooks hold, however the example ends.
   }
 
 -- | The usual configuration: a pool of two workers and sixteen slots, room for sixteen jobs and
 -- sixteen leases, the real reader behind the probe's gates.
 config ∷ Profile → Layout → Config
-config profile layout = Config profile (2, 16) 16 realReader layout 16 noHooks
+config profile layout = Config profile (2, 16) 16 realReader layout 16 noHooks (pure ())
 
 -- | How the pool's reader is made from the real one and the session's probe.
 type ReaderOf = Probe → Inventory → (ContentKey → Int → IO (Either ReadFailure ByteString)) → ContentKey → Int → IO (Either ReadFailure ByteString)
@@ -308,12 +318,26 @@ withSession cfg body =
                 runtime ← newLuaRuntime control
                 outcome ←
                   timeout exampleBound (body session control runtime)
-                    `finally` (writeIORef (ssOpened session) True >> openGates session >> openAllProbeGates probe >> flushFake fake)
+                    `finally` (writeIORef (ssOpened session) True >> openGates session >> openAllProbeGates probe >> cfgRelease cfg >> flushFake fake)
                 case outcome of
                   Just value → pure value
                   Nothing → do
                     seen ← history session
                     assertFailure ("the example did not finish within its bound; it had recorded: " <> show (reverse (take 12 (reverse seen))))
+
+-- | A point an example holds a worker at: the worker says it arrived and waits to be let go.
+data Gate = Gate {arrived ∷ MVar (), proceed ∷ MVar ()}
+
+newGate ∷ IO Gate
+newGate = Gate <$> newEmptyMVar <*> newEmptyMVar
+
+-- | A hook that holds its caller at the gate.
+hold ∷ Gate → a → IO ()
+hold gate _ = void (tryPutMVar (arrived gate) ()) >> readMVar (proceed gate)
+
+-- | Let whoever is held at the gate go, now and for good.
+releaseHeldGate ∷ Gate → IO ()
+releaseHeldGate = void . (`tryPutMVar` ()) . proceed
 
 -- | A second pipeline inside the example, over a backend of its own that no janitor answers, for the
 -- examples about the pipeline's own end. The body runs with a session whose pipeline and backend are
@@ -494,6 +518,7 @@ data Fake = Fake
   , fkFlush ∷ !(TVar Bool)
   , fkHold ∷ !(TVar Bool)
   , fkEntered ∷ !(TVar Int)
+  , fkPoll ∷ !(TVar PollMode)
   }
 
 newFake ∷ IO Fake
@@ -512,6 +537,7 @@ newFake =
     <*> newTVarIO False
     <*> newTVarIO False
     <*> newTVarIO 0
+    <*> newTVarIO PollNormal
 
 fakeBackend ∷ Fake → TextureBackend
 fakeBackend fake =
@@ -580,7 +606,11 @@ registerTexture fake held = do
               when raising $ throwIO (userError "the fake backend could not release the texture")
               auto ← readTVarIO (fkAuto fake)
               when auto (atomically (writeTVar state ProviderComplete))
-              pure (readTVar state)
+              mode ← readTVarIO (fkPoll fake)
+              pure $ case mode of
+                PollNormal → readTVar state
+                PollThrows → throwSTM (userError "the fake backend's reading threw")
+                PollFails → pure (ProviderFailed (toException (userError "the fake backend could not retire the texture")))
           }
   answer ← sinkReady (heldSink held) texture
   pure (identity, answer)
@@ -632,6 +662,18 @@ awaitReleaseCalls fake wanted = atomically $ do
   calls ← readTVar (fkReleases fake)
   unless (length calls >= wanted) retry
 
+-- | How a released texture's retirement reading answers.
+data PollMode
+  = PollNormal
+  | -- | The reading throws, as application code may.
+    PollThrows
+  | -- | The reading answers that the retirement failed.
+    PollFails
+  deriving (Eq, Show)
+
+setPollMode ∷ Fake → PollMode → IO ()
+setPollMode fake = atomically . writeTVar (fkPoll fake)
+
 -- | Hold every submission inside 'backendUpload' (the call entered, not returned) until it is let go.
 setHoldSubmission ∷ Fake → Bool → IO ()
 setHoldSubmission fake = atomically . writeTVar (fkHold fake)
@@ -660,7 +702,7 @@ texturesLive fake = atomically $ do
 -- it, or withdraws it when the engine cancelled it) and proves every texture retired, and keeps doing so until it is stopped. The
 -- pipeline's drain waits for the backend; the janitor is what lets a failing example end.
 flushFake ∷ Fake → IO ()
-flushFake fake = atomically (writeTVar (fkFlush fake) True >> writeTVar (fkAuto fake) True)
+flushFake fake = atomically (writeTVar (fkFlush fake) True >> writeTVar (fkAuto fake) True >> writeTVar (fkHold fake) False)
 
 withJanitor ∷ Fake → IO a → IO a
 withJanitor fake action = do
@@ -1027,8 +1069,12 @@ admitDriver session vm name = admitModule session vm "driver" name
 -- | Admit an instance of this module under this name, with a texture owner of that name, and wait
 -- until it is active.
 admitModule ∷ Session → Vm → Text → Text → IO ()
-admitModule session vm moduleName name = do
-  owner ← newTextureOwner (ssPipeline session)
+admitModule session vm = admitModuleAs session vm PresentationRole
+
+-- | The same, for an instance whose facade boundary declared this role.
+admitModuleAs ∷ Session → Vm → TextureRole → Text → Text → IO ()
+admitModuleAs session vm role moduleName name = do
+  owner ← newTextureOwner (ssPipeline session) role
   atomicModifyIORef' (vmOwners vm) (\held → (Map.insert name owner held, ()))
   admitInstance (scheduledEndpoint (vmOwner vm)) (InstanceRequest (ModuleRef moduleName "1") EventOnly (Just name) OrdinaryClass ["cmd"]) >>= \case
     InstanceAccepted identity ticket → do

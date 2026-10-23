@@ -67,6 +67,17 @@
 module Hetoimasia.LuaEngine.Texture.Pipeline
   ( -- * The specification
     TextureSpec (..)
+  , specProfile
+  , specJobs
+  , specIoWorkers
+  , specDecodeWorkers
+  , specLanes
+  , specWorkspace
+  , specSourceLimit
+  , specInitialNominal
+  , specInstanceSlots
+  , specInstanceBytes
+  , specSessionBytes
   , TextureSpecRefused (..)
   , textureSpec
 
@@ -116,6 +127,7 @@ import Control.Concurrent.STM
   ( STM
   , TVar
   , atomically
+  , catchSTM
   , newTVar
   , newTVarIO
   , readTVar
@@ -231,24 +243,43 @@ import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VRecord))
 -- | The numbers a pipeline is built from: the validated profile's limits, read once, and the one
 -- capacity the assembly chooses.
 data TextureSpec = TextureSpec
-  { specProfile ∷ !Profile
-  , specJobs ∷ !Int
+  { tsProfile ∷ !Profile
+  , tsJobs ∷ !Int
     -- ^ The accepted-work records the session holds at once: every accepted, unretired texture
     -- request, from admission until the host returns its record. Bounds every stage queue.
-  , specIoWorkers ∷ !Int
-  , specDecodeWorkers ∷ !Int
-  , specLanes ∷ !Int
-  , specWorkspace ∷ !Word64
+  , tsIoWorkers ∷ !Int
+  , tsDecodeWorkers ∷ !Int
+  , tsLanes ∷ !Int
+  , tsWorkspace ∷ !Word64
     -- ^ The accounted CPU payload one lane may hold.
-  , specSourceLimit ∷ !Word64
+  , tsSourceLimit ∷ !Word64
     -- ^ The PNG source limit, also the read's allowance.
-  , specInitialNominal ∷ !Word64
+  , tsInitialNominal ∷ !Word64
     -- ^ The nominal bytes reserved for a texture at admission: the largest RGBA8 output.
-  , specInstanceSlots ∷ !Int
-  , specInstanceBytes ∷ !Word64
-  , specSessionBytes ∷ !Word64
-  , specPngLimits ∷ !PngLimits
+  , tsInstanceSlots ∷ !Int
+  , tsInstanceBytes ∷ !Word64
+  , tsSessionBytes ∷ !Word64
+  , tsPngLimits ∷ !PngLimits
   }
+
+-- | The numbers, read. The record's own fields are not exported by the facade: a field selector is also
+-- a record update, and a client must not be able to write a specification of its own.
+specProfile ∷ TextureSpec → Profile
+specProfile = tsProfile
+
+specJobs, specIoWorkers, specDecodeWorkers, specLanes, specInstanceSlots ∷ TextureSpec → Int
+specJobs = tsJobs
+specIoWorkers = tsIoWorkers
+specDecodeWorkers = tsDecodeWorkers
+specLanes = tsLanes
+specInstanceSlots = tsInstanceSlots
+
+specWorkspace, specSourceLimit, specInitialNominal, specInstanceBytes, specSessionBytes ∷ TextureSpec → Word64
+specWorkspace = tsWorkspace
+specSourceLimit = tsSourceLimit
+specInitialNominal = tsInitialNominal
+specInstanceBytes = tsInstanceBytes
+specSessionBytes = tsSessionBytes
 
 -- | Why a profile could not be turned into a pipeline's numbers.
 data TextureSpecRefused
@@ -293,18 +324,18 @@ textureSpec profile jobs = do
       )
   Right
     TextureSpec
-      { specProfile = profile
-      , specJobs = jobs
-      , specIoWorkers = ioWorkers
-      , specDecodeWorkers = decodeWorkers
-      , specLanes = lanes
-      , specWorkspace = workspace
-      , specSourceLimit = source
-      , specInitialNominal = output
-      , specInstanceSlots = slots
-      , specInstanceBytes = perInstance
-      , specSessionBytes = perSession
-      , specPngLimits = limits
+      { tsProfile = profile
+      , tsJobs = jobs
+      , tsIoWorkers = ioWorkers
+      , tsDecodeWorkers = decodeWorkers
+      , tsLanes = lanes
+      , tsWorkspace = workspace
+      , tsSourceLimit = source
+      , tsInitialNominal = output
+      , tsInstanceSlots = slots
+      , tsInstanceBytes = perInstance
+      , tsSessionBytes = perSession
+      , tsPngLimits = limits
       }
   where
     count limit = let Count value = countLimit profile limit in value
@@ -356,6 +387,9 @@ data CellState
     CellReleasing !(STM RetirementState)
   | -- | The backend's release raised: the texture is never reported reclaimed.
     CellFailed !(ExceptionWithContext SomeException)
+  | -- | The backend's reading of the retirement failed, or threw: terminal, recorded once, and the
+    -- texture is never reported reclaimed.
+    CellRetirementFailed !SomeException
 
 -- | A texture the backend registered, and the one record of who may release it.
 data Cell = Cell
@@ -492,14 +526,14 @@ pipelineInventory = tpInventory
 pipelineOpen ∷ TexturePipeline → STM Bool
 pipelineOpen tp = (== Open) . psPhase <$> readTVar (tpState tp)
 
--- | A UI instance's texture banks, numbered by this pipeline. The instance's bindings hold it; the
--- pipeline keeps no list of owners.
-newTextureOwner ∷ TexturePipeline → IO TextureOwner
-newTextureOwner tp = atomically $ do
+-- | An instance's texture banks, numbered by this pipeline, with the role its facade boundary declared
+-- for it. The instance's bindings hold it; the pipeline keeps no list of owners.
+newTextureOwner ∷ TexturePipeline → TextureRole → IO TextureOwner
+newTextureOwner tp role = atomically $ do
   st ← readTVar (tpState tp)
   when (psOwners st == maxBound) $ throwSTM (TextureDefect "the texture owner numbers are exhausted")
   writeTVar (tpState tp) st {psOwners = psOwners st + 1}
-  newOwner (psOwners st) (tpSession tp) (specInstanceSlots (tpSpec tp)) (specInstanceBytes (tpSpec tp))
+  newOwner (psOwners st) (tpSession tp) (tsInstanceSlots (tpSpec tp)) (tsInstanceBytes (tpSpec tp)) role
 
 -- The scope ----------------------------------------------------------------------------------------
 
@@ -519,15 +553,15 @@ withTexturePipeline = withTexturePipelineWith noHooks
 -- | 'withTexturePipeline' with the coordination hooks of this package's tests.
 withTexturePipelineWith ∷ PipelineHooks → TextureSpec → TextureBackend → ReadPool → Inventory → (TexturePipeline → IO a) → IO a
 withTexturePipelineWith hooks spec backend pool inventory body = withWorkerGroup $ \group → do
-  var ← newTVarIO (PState Open Nothing [] Map.empty 0 0 Map.empty (Map.fromList [(lane, Lane Nothing 0) | lane ← [0 .. specLanes spec - 1]]) Map.empty 0 0 0 Map.empty 0)
-  session ← newSessionBytes (specSessionBytes spec)
+  var ← newTVarIO (PState Open Nothing [] Map.empty 0 0 Map.empty (Map.fromList [(lane, Lane Nothing 0) | lane ← [0 .. tsLanes spec - 1]]) Map.empty 0 0 0 Map.empty 0)
+  session ← newSessionBytes (tsSessionBytes spec)
   let tp = TexturePipeline spec hooks var backend pool inventory session
   result ← mask $ \restore → do
     outcome ← tryWithContext @SomeException $ restore $ do
       reading ← atomically (status pool)
-      when (statusWorkers reading /= specIoWorkers spec) $
-        throwIO (TextureDefect (Text.pack ("the read pool has " <> show (statusWorkers reading) <> " workers, not the profile's " <> show (specIoWorkers spec))))
-      forM_ [0 .. specDecodeWorkers spec - 1] $ \index →
+      when (statusWorkers reading /= tsIoWorkers spec) $
+        throwIO (TextureDefect (Text.pack ("the read pool has " <> show (statusWorkers reading) <> " workers, not the profile's " <> show (tsIoWorkers spec))))
+      forM_ [0 .. tsDecodeWorkers spec - 1] $ \index →
         startWorker group (workerDefinition (Text.pack ("texture-decode-" <> show index)) (\_ → pure ()) (\token () → runWorker tp token)) >>= \case
           Started _ → pure ()
           StartupFailed _ _ → throwIO (TextureDefect (Text.pack ("decode worker " <> show index <> " did not start")))
@@ -687,7 +721,7 @@ fateOf tp key = case inspectEntry (tpInventory tp) key of
   Absent → FateNotFound
   PresentDirectory → FateNotFound
   PresentFile len
-    | len > specSourceLimit (tpSpec tp) → FateTooLarge len
+    | len > tsSourceLimit (tpSpec tp) → FateTooLarge len
     | otherwise → FateRead len
 
 -- | Prepare one request's start: its token and its charge, kept until the submission consumes them
@@ -728,7 +762,7 @@ requestCredits tp prepared =
       }
   , Credit
       { creditName = "texture bytes"
-      , creditReserve = reserveNominal charge (specInitialNominal (tpSpec tp))
+      , creditReserve = reserveNominal charge (tsInitialNominal (tpSpec tp))
       , creditRelease = \_ → settleCharge tp token charge
       , creditTransfers = True
       }
@@ -759,7 +793,7 @@ requestCredits tp prepared =
 reserveRecord ∷ TexturePipeline → Word64 → STM Bool
 reserveRecord tp token = do
   st ← readTVar (tpState tp)
-  if psReserved st >= specJobs (tpSpec tp)
+  if psReserved st >= tsJobs (tpSpec tp)
     then pure False
     else do
       when (psOrderNext st == maxBound) $ throwSTM (TextureDefect "the texture admission order is exhausted")
@@ -795,6 +829,11 @@ isSettled job = case jStage job of
   StageSettled → True
   _ → False
 
+isUploading ∷ Job → Bool
+isUploading job = case jStage job of
+  StageUploading → True
+  _ → False
+
 -- | Return a request's texture charge when the host returns the request's credit (its request ended,
 -- or the admission was taken back), unless some other owner still has the texture:
 --
@@ -811,16 +850,24 @@ settleCharge tp token charge = do
       readTVar (cellState cell) >>= \case
         CellAdopted → pure ()
         CellFailed _ → pure ()
+        CellRetirementFailed _ → pure ()
         CellReleasing poll →
-          poll >>= \case
+          readRetirement poll >>= \case
             ProviderComplete → returnCharge charge
             ProviderPending → defer st cell
-            ProviderFailed _ → pure ()
+            -- The housekeeping latches the failure and keeps the charge held.
+            ProviderFailed _ → defer st cell
         CellJob → defer st cell
         CellClaimed → defer st cell
   where
     defer st cell =
       writeTVar (tpState tp) st {psOrphans = Map.insertWith (\_ old → old) token (Orphan cell charge) (psOrphans st)}
+
+-- | A backend's reading of a retirement, as the host reads one: it only reads, and what it throws is the
+-- retirement failing, not an exception loose in whoever polls it. Evaluated inside the guard.
+readRetirement ∷ STM RetirementState → STM RetirementState
+readRetirement poll =
+  (poll >>= \state → state `seq` pure state) `catchSTM` \failure → pure (ProviderFailed (failure ∷ SomeException))
 
 returnCharge ∷ TextureCharge → STM ()
 returnCharge charge = returnSlot charge >> returnNominal charge
@@ -893,7 +940,7 @@ notFound key = attributed key "not_found" "the path is not an inventoried file"
 
 tooLarge ∷ TexturePipeline → ContentKey → Word64 → ExpectedFailure
 tooLarge tp key len =
-  attributed key "too_large" ("the file is " <> Text.pack (show len) <> " bytes, over the PNG limit of " <> Text.pack (show (specSourceLimit (tpSpec tp))))
+  attributed key "too_large" ("the file is " <> Text.pack (show len) <> " bytes, over the PNG limit of " <> Text.pack (show (tsSourceLimit (tpSpec tp))))
 
 readFailure ∷ ContentKey → ReadOutcome → TexturePipeline → ExpectedFailure
 readFailure key outcome tp = case outcome of
@@ -979,7 +1026,7 @@ promoteWith tp = do
 
 startRead ∷ TexturePipeline → Int → JobId → Job → STM [IO ()]
 startRead tp lane jid job
-  | jLength job > specWorkspace (tpSpec tp) =
+  | jLength job > tsWorkspace (tpSpec tp) =
       failStage tp jid (ProviderExpected (attributed (jKey job) "too_large" "the file does not fit the pipeline's workspace"))
   | otherwise = do
       submitted ←
@@ -987,7 +1034,7 @@ startRead tp lane jid job
           (tpPool tp)
           ReadRequest
             { requestKey = jKey job
-            , requestAllowance = fromIntegral (specSourceLimit (tpSpec tp))
+            , requestAllowance = fromIntegral (tsSourceLimit (tpSpec tp))
             , requestPriority = OrdinaryRead
             , requestSink = readSink tp jid
             }
@@ -1171,9 +1218,22 @@ housekeeping tp = do
   (started, startEffects) ← promoteWith tp
   now ← readTVar (tpState tp)
   unowned ← forM (Map.toAscList (psOrphans now)) $ \(token, orphan) → orphanStep tp token orphan
+  -- A texture the pipeline released for a job nobody will adopt, whose retirement the backend cannot
+  -- prove: recorded once as the pipeline's failure, with the charge left held.
+  watched ← fmap concat . forM (Map.elems (psJobs now)) $ \job → case jCell job of
+    Just cell →
+      readTVar (cellState cell) >>= \case
+        CellReleasing poll →
+          readRetirement poll >>= \case
+            ProviderFailed failure → do
+              writeTVar (cellState cell) (CellRetirementFailed failure)
+              pure [(True, [latchDefect tp ("a texture's retirement failed: " <> Text.pack (show failure))])]
+            _ → pure []
+        _ → pure []
+    Nothing → pure []
   pure
-    ( not (null reaped) || started || any fst unowned
-    , concat reaped <> startEffects <> concatMap snd unowned
+    ( not (null reaped) || started || any fst unowned || not (null watched)
+    , concat reaped <> startEffects <> concatMap snd unowned <> concatMap snd watched
     )
 
 -- | One unowned texture: release it if nobody has, and return its charge once the backend proved it
@@ -1187,8 +1247,9 @@ orphanStep tp token orphan =
     CellClaimed → pure (False, [])
     CellAdopted → forget []
     CellFailed failure → forget [latchFailure tp "texture release" failure]
+    CellRetirementFailed failure → forget [latchDefect tp ("a texture's retirement failed: " <> Text.pack (show failure))]
     CellReleasing poll →
-      poll >>= \case
+      readRetirement poll >>= \case
         ProviderComplete → returnCharge (orphanCharge orphan) >> forget []
         ProviderPending → pure (False, [])
         ProviderFailed failure → forget [latchDefect tp ("a texture's retirement failed: " <> Text.pack (show failure))]
@@ -1223,7 +1284,7 @@ decodeStages tp restore jid job bytes lane = do
   let key = jKey job
       asset = Asset (AssetId (pathText key)) (FromMemory "verified content read")
   restore (hookDecoding (tpHooks tp) key)
-  preflight ← restore (evaluate (preflightPng (specPngLimits (tpSpec tp)) asset bytes))
+  preflight ← restore (evaluate (preflightPng (tsPngLimits (tpSpec tp)) asset bytes))
   case preflight of
     Left refusal → settleAs (ProviderExpected (refusalFailure key refusal))
     Right pf → do
@@ -1274,7 +1335,7 @@ reserveLane tp lane amount = do
     Nothing → throwSTM (TextureDefect "a decode reserved workspace on a lane that does not exist")
     Just found
       | amount < 0 → throwSTM (TextureDefect "a decode reserved a negative amount of workspace")
-      | fromIntegral amount > specWorkspace (tpSpec tp) - laneCharged found → pure False
+      | fromIntegral amount > tsWorkspace (tpSpec tp) - laneCharged found → pure False
       | otherwise → do
           writeTVar (tpState tp) st {psLanes = Map.insert lane found {laneCharged = laneCharged found + fromIntegral amount} (psLanes st)}
           pure True
@@ -1327,7 +1388,11 @@ handoff tp jid level width height = do
           effects ← atomically $ do
             st ← readTVar (tpState tp)
             case Map.lookup jid (psJobs st) of
-              Nothing → throwSTM (TextureDefect "an uploading job's record was lost")
+              -- The backend may deliver both events before the call returns, the job settle, its result
+              -- be adopted and taken, and the host return its record: there is then nothing left to
+              -- record the work against, and nothing the work still owes.
+              Nothing → pure []
+              Just job | not (isUploading job) → pure []
               Just job → do
                 let cancelNow = (jWithdrawn job || jStopping job) && not (jUploadCancelled job)
                     -- An event delivered while the call ran may have moved the job on: only a
@@ -1540,8 +1605,9 @@ jobRetirement tp jid = do
               CellAdopted → pure ProviderComplete
               CellJob → pure ProviderPending
               CellClaimed → pure ProviderPending
-              CellReleasing poll → poll
+              CellReleasing poll → readRetirement poll
               CellFailed (ExceptionWithContext _ failure) → pure (ProviderFailed failure)
+              CellRetirementFailed failure → pure (ProviderFailed failure)
 
 -- The texture ----------------------------------------------------------------------------------------
 
@@ -1594,8 +1660,10 @@ releaseResource retirements resource = do
       other → pure other
   case settled of
     CellFailed failure → rethrowIO failure
+    -- Its retirement already failed: the lease records that, whole, and keeps the charges held.
+    CellRetirementFailed failure → retireAsynchronously retirements "texture" (pure (ProviderFailed failure))
     CellReleasing poll → do
-      now ← atomically poll
+      now ← atomically (readRetirement poll)
       case now of
         ProviderComplete → atomically (returnCharge (resourceCharge resource))
         _ → do
@@ -1705,7 +1773,7 @@ drained tp = do
       readTVar (cellState cell) >>= \case
         CellJob → pure True
         CellClaimed → pure True
-        CellReleasing poll → poll <&> \case ProviderPending → True; _ → False
+        CellReleasing poll → readRetirement poll <&> \case ProviderPending → True; _ → False
         _ → pure False
     Nothing → pure False
   pure (idle && lanesFree && Map.null (psOrphans st) && not unretired)

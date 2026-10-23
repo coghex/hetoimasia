@@ -110,6 +110,7 @@ module Hetoimasia.LuaEngine.Texture
 
     -- * One UI instance's banks
   , TextureOwner
+  , TextureRole (..)
   , newTextureOwner
   , closeTextureOwner
   , OwnerReading (..)
@@ -145,6 +146,7 @@ module Hetoimasia.LuaEngine.Texture
 
 import Control.Concurrent.STM (STM, atomically)
 import Control.Exception (finally, mask, throwIO)
+import Control.Monad (when)
 import Data.ByteString (ByteString)
 import Data.Functor ((<&>))
 import Data.Text (Text)
@@ -178,9 +180,11 @@ import Hetoimasia.LuaEngine.Texture.Backend
 import Hetoimasia.LuaEngine.Texture.Banks
   ( BankDefect (..)
   , TextureOwner
+  , TextureRole (..)
   , closeOwner
   , ownerBytesCharged
   , ownerIsOpen
+  , ownerRole
   , ownerSession
   , ownerSlotsCharged
   )
@@ -297,6 +301,10 @@ pathText = Encoding.decodeUtf8With Encoding.lenientDecode . logicalPathBytes . c
 startTexture ∷ HasCallStack ⇒ TextureService → TextureRequest → RequestContext → IO M1Start
 startTexture service request context = mask $ \restore → do
   let pipeline = servicePipeline service
+  -- A call that skipped the argument check meets the role here, as a fault of the call, before anything
+  -- is prepared or reserved.
+  when (ownerRole (requestedOwner request) /= PresentationRole) $
+    throwIO (TextureDefect "texture acquisition is presentation-instance hook work")
   prepared ← prepareRequest pipeline (requestedOwner request) (requestedKey request)
   restore
     ( startM1
@@ -320,16 +328,19 @@ textureArgumentCheck service requestOf owner values = do
   refusal ← atomically $ do
     open ← pipelineOpen pipeline
     taking ← ownerIsOpen (requestedOwner request)
-    pure $
-      if ownerSession (requestedOwner request) /= pipelineSession pipeline
-        then Just "the texture owner belongs to another pipeline"
-        else
-          if not taking
-            then Just "the texture owner has ended"
-            else if not open then Just "the texture pipeline is stopping" else Nothing
+    pure $ refusalOf pipeline (requestedOwner request) open taking
   case refusal of
     Just why → pure (Just why)
     Nothing → m1ArgumentCheck (serviceRequests service) (askFor service . requestOf) owner values
+
+-- | The service's own permanent facts, in the order they are decided.
+refusalOf ∷ TexturePipeline → TextureOwner → Bool → Bool → Maybe Text
+refusalOf pipeline owner open taking
+  | ownerSession owner /= pipelineSession pipeline = Just "the texture owner belongs to another pipeline"
+  | ownerRole owner /= PresentationRole = Just "texture acquisition is presentation-instance hook work"
+  | not taking = Just "the texture owner has ended"
+  | not open = Just "the texture pipeline is stopping"
+  | otherwise = Nothing
 
 -- The endpoint --------------------------------------------------------------------------------------
 

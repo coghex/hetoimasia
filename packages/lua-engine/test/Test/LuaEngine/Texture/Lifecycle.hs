@@ -8,9 +8,14 @@ module Test.LuaEngine.Texture.Lifecycle (spec) where
 
 import Control.Concurrent.STM (atomically, retry)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, fromException, tryWithContext)
-import Control.Monad (void)
+import Control.Monad (forM_, void)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Text as Text
 import Data.Word (Word64)
+import Control.Concurrent.MVar (readMVar)
+import Control.Exception (try)
+import System.Timeout (timeout)
+import Test.HUnit.Lang (HUnitFailure)
 import Test.Hspec
 import Hetoimasia.LuaEngine.Profile (ByteLimit (..), CountLimit (..))
 import Test.LuaEngine.Request.Profiles (smaller)
@@ -146,6 +151,61 @@ spec = describe "the pipeline's end" $ do
     -- A texture whose release failed is never reported retired: the request's retirement reading says so,
     -- and that is fatal to the owner, as every cleanup failure is.
     show ownerFailure `shouldSatisfy` containsText "could not release the texture"
+
+  forM_ [("throws", PollThrows, "reading threw"), ("answers that the retirement failed", PollFails, "could not retire")] $ \(label, mode, expected) →
+    it ("does not retry a retirement reading that " <> label <> ": the failure is recorded once, the charge stays held and the drain goes on") $ do
+      ExceptionWithContext _ ownerFailure ← fatalSession (config small layout) $ \session _ runtime → do
+        seen ← newIORef Nothing
+        outcome ←
+          tryWithContext @SomeException $
+            withNested
+              session
+              ( \nested → do
+                  writeIORef seen (Just nested)
+                  vm ← startVm nested runtime "poll" OnArrival
+                  admitDriver nested vm "i"
+                  started nested vm "i" "k0" "a.png"
+                  awaitUploads (ssFake nested) 1
+                  held ← uploadN (ssFake nested) 0
+                  stopInstance nested vm "i"
+                  awaitUploadCancelled held
+              )
+              ( \nested → do
+                  setPollMode (ssFake nested) mode
+                  held ← uploadN (ssFake nested) 0
+                  identity ← finishUpload (ssFake nested) held
+                  awaitReleaseCalls (ssFake nested) 1
+                  releaseCalls (ssFake nested) `shouldReturn` [identity]
+              )
+        -- The scope ended (it did not loop on the reading) and raised the recorded failure.
+        case outcome of
+          Left (ExceptionWithContext _ failure) → show failure `shouldSatisfy` containsText "retirement failed"
+          Right () → expectationFailure "the scope should have raised the failed retirement"
+        -- The texture is not reported reclaimed: its charge is still held.
+        readIORef seen >>= maybe (expectationFailure "the body never ran") (\nested → sessionNow nested `shouldReturn` 128)
+      -- The owner whose request it was is told as cleanup evidence, as every cleanup failure is.
+      show ownerFailure `shouldSatisfy` containsText expected
+
+  it "unwinds the fixture when an example fails while a hook, a gate and a submission are held: nothing waits for what the failure left behind" $ do
+    gate ← newGate
+    submission ←
+      timeout 60000000 . try @HUnitFailure $
+        withSession ((config small layout) {cfgHooks = noHooks {hookDecoding = hold gate}, cfgRelease = releaseHeldGate gate}) $ \session _ runtime → do
+          vm ← startVm session runtime "unwinding" OnArrival
+          admitDriver session vm "i"
+          started session vm "i" "k0" "a.png"
+          readMVar (arrived gate)
+          expectationFailure "injected while the decode hook holds the worker"
+    holding ←
+      timeout 60000000 . try @HUnitFailure $
+        withSession (config small layout) $ \session _ runtime → do
+          vm ← startVm session runtime "unwinding" OnArrival
+          admitDriver session vm "i"
+          setHoldSubmission (ssFake session) True
+          started session vm "i" "k0" "a.png"
+          awaitSubmitting (ssFake session) 1
+          expectationFailure "injected while the backend's submission is held"
+    (either (const True) (const False) <$> submission, either (const True) (const False) <$> holding) `shouldBe` (Just True, Just True)
 
   it "is not started over a pool whose workers are not the profile's: nothing is started and the failure names it" $
     withSession ((config small layout) {cfgPool = (1, 16)}) (\_ _ _ → pure ())
