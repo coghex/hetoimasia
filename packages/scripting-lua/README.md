@@ -3110,6 +3110,18 @@ arises only in settling (a `shutdown` that raises after a stop, a release that f
 notice raises is a failure of the host, as for `instanceOnSegment`. The Lua-first engine's session coordinator is the application
 that uses it ([the session coordinator](../lua-engine/README.md#the-session-coordinator-lfe-13)).
 
+**Holding an instance after its construction.** A behavior instance is constructed, its behavior captured and
+validated and its cadence resolved on the owner's thread, one instance after another, and its `init` follows at once.
+An application that must know every instance it admitted is valid before any of them runs (a session that starts two
+roles, or an instance and its harness peer, together) cannot learn that from an instance whose `init` has already run:
+the first `init` may change what the instance behind it captures. `instanceHoldInit` of the instance configuration
+(default: hold nothing) is asked once per behavior instance, on the owner's thread, at exactly that point, and
+answering `True` holds the instance there. The owner goes on to the instances behind it, so nothing is parked. The
+application, having seen every instance come that far, releases them with `releaseHeldInstance` (idempotent, and
+nothing for an instance that was not held or has ended), and each begins on the owner's thread in its turn among the
+owner's jobs. A held instance whose owner is stopped before it was released settles as stopped, with shutdown
+disposition `ShutdownSkippedNoInit` and none of its hooks entered. What the question raises is a failure of the host.
+
 Isolation is the default: the instance ends and the owner's other instances run on. The engine cannot
 tell whether state the instances share was damaged, so the application is told of each failure on the
 owner's thread (`instanceEscalate`), after the instance has ended, and decides `Isolate` or `Escalate`,
