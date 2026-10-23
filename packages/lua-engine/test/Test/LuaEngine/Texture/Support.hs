@@ -82,6 +82,8 @@ module Test.LuaEngine.Texture.Support
   , releaseHeldGate
   , PollMode (..)
   , setPollMode
+  , setCancelKills
+  , setReleaseKills
   , ownerOf
   , stopInstance
   , command
@@ -136,7 +138,7 @@ import Control.Concurrent.STM
   , throwSTM
   , writeTVar
   )
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, fromException, rethrowIO, throwIO, toException, tryWithContext)
+import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, finally, fromException, rethrowIO, throwIO, toException, tryWithContext)
 import Control.Monad (forM_, unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -362,14 +364,14 @@ withNested session body onClosed = do
   value ←
     -- The janitor is armed only once the helper has finished, however it finished, so a helper that
     -- fails cannot leave the backend holding what the scope waits for.
-    withJanitor fake . withTexturePipelineWith (cfgHooks (ssConfig session)) spec (fakeBackend fake) (ssPool session) (ssInventory session) $ \pipeline → do
+    -- "nested scope returned" is recorded however the scope ended, the moment it did: whatever the helper has
+    -- recorded by then, it recorded before the scope could end.
+    (`finally` note session "nested scope returned") . withJanitor fake . withTexturePipelineWith (cfgHooks (ssConfig session)) spec (fakeBackend fake) (ssPool session) (ssInventory session) $ \pipeline → do
       let nested = session {ssPipeline = pipeline, ssFake = fake}
       _ ← forkIO $ do
         atomically (pipelineOpen pipeline >>= \open → when open retry)
         tryWithContext @SomeException (onClosed nested `finally` flushFake fake) >>= putMVar done
       body nested
-  -- The nested scope has returned: whatever the helper has recorded by now, it recorded before it.
-  note session "nested scope returned"
   readMVar done >>= either rethrowIO pure
   pure value
 
@@ -526,6 +528,8 @@ data Fake = Fake
   , fkHold ∷ !(TVar Bool)
   , fkEntered ∷ !(TVar Int)
   , fkPoll ∷ !(TVar PollMode)
+  , fkCancelKills ∷ !(TVar Bool)
+  , fkReleaseKills ∷ !(TVar Bool)
   }
 
 newFake ∷ IO Fake
@@ -545,6 +549,8 @@ newFake =
     <*> newTVarIO False
     <*> newTVarIO 0
     <*> newTVarIO PollNormal
+    <*> newTVarIO False
+    <*> newTVarIO False
 
 fakeBackend ∷ Fake → TextureBackend
 fakeBackend fake =
@@ -567,7 +573,13 @@ fakeBackend fake =
     atomically $ do
       holding ← readTVar (fkHold fake)
       when holding retry
-    pure (UploadWork (atomically (writeTVar (heldCancelled held) True)))
+    pure
+      ( UploadWork $ do
+          atomically (writeTVar (heldCancelled held) True)
+          -- A cancellation delivered inside the callback: raised as the exception, synchronously.
+          killing ← readTVarIO (fkCancelKills fake)
+          when killing (throwIO ThreadKilled)
+      )
 
 -- | The index-th upload, waiting for it to arrive.
 uploadN ∷ Fake → Int → IO Held
@@ -609,6 +621,8 @@ registerTexture fake held = do
           { textureIdentity = identity
           , textureRelease = do
               atomically (modifyTVar' (fkReleases fake) (<> [identity]))
+              killing ← readTVarIO (fkReleaseKills fake)
+              when killing (throwIO ThreadKilled)
               raising ← readTVarIO (fkRaiseRelease fake)
               when raising $ throwIO (userError "the fake backend could not release the texture")
               auto ← readTVarIO (fkAuto fake)
@@ -680,6 +694,14 @@ data PollMode
   | -- | The release returns a reading that throws when it is first looked at.
     PollLazy
   deriving (Eq, Show)
+
+-- | Make a cancellation of an upload raise a cancellation inside the callback.
+setCancelKills ∷ Fake → Bool → IO ()
+setCancelKills fake = atomically . writeTVar (fkCancelKills fake)
+
+-- | Make the backend's release raise a cancellation inside the call.
+setReleaseKills ∷ Fake → Bool → IO ()
+setReleaseKills fake = atomically . writeTVar (fkReleaseKills fake)
 
 setPollMode ∷ Fake → PollMode → IO ()
 setPollMode fake = atomically . writeTVar (fkPoll fake)

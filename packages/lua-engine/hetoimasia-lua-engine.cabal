@@ -189,6 +189,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Texture.Png
         Test.LuaEngine.Texture.Spec
         Test.LuaEngine.Texture.Stages
+        Test.LuaEngine.Texture.Teardown
         Test.LuaEngine.Texture.Support
         Test.LuaEngine.Texture.Workers
     build-depends:

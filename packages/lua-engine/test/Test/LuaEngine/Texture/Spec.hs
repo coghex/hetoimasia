@@ -9,6 +9,7 @@ import qualified Test.LuaEngine.Texture.Lifecycle as Lifecycle
 import qualified Test.LuaEngine.Texture.Limits as Limits
 import qualified Test.LuaEngine.Texture.Ownership as Ownership
 import qualified Test.LuaEngine.Texture.Stages as Stages
+import qualified Test.LuaEngine.Texture.Teardown as Teardown
 import qualified Test.LuaEngine.Texture.Workers as Workers
 import Test.Hspec (Spec, describe)
 
@@ -22,4 +23,5 @@ spec = describe "Texture" $ do
   Failures.spec
   Ownership.spec
   Lifecycle.spec
+  Teardown.spec
   Client.spec

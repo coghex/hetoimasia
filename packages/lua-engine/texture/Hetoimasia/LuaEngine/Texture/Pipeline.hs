@@ -1011,13 +1011,19 @@ decodeLossy = Encoding.decodeUtf8With Encoding.lenientDecode
 -- as the pipeline's (an effect is the engine's own call into the host or the backend, and a failure of
 -- either is fatal), and an asynchronous exception is raised after the rest ran.
 runEffects ∷ TexturePipeline → [IO ()] → IO ()
-runEffects tp effects = mask_ $ do
+runEffects tp effects = runEffectsKeeping tp effects >>= maybe (pure ()) rethrowIO
+
+-- | 'runEffects' that raises nothing: it runs every effect, latches each synchronous failure, and answers
+-- the first asynchronous one for the caller to raise when it is ready to. A teardown that must go on
+-- whatever an effect raised keeps what this answers and raises it after the last obligation is met.
+runEffectsKeeping ∷ TexturePipeline → [IO ()] → IO (Maybe (ExceptionWithContext SomeException))
+runEffectsKeeping tp effects = mask_ $ do
   outcomes ← forM effects (tryWithContext @SomeException)
   forM_ [failure | Left failure ← outcomes] $ \failure@(ExceptionWithContext _ raised) →
     unless (isAsynchronous raised) (latchFailure tp "texture pipeline effect" failure)
-  case [failure | Left failure@(ExceptionWithContext _ raised) ← outcomes, isAsynchronous raised] of
-    [] → pure ()
-    first : _ → rethrowIO first
+  pure (case [failure | Left failure@(ExceptionWithContext _ raised) ← outcomes, isAsynchronous raised] of
+    [] → Nothing
+    first : _ → Just first)
 
 isAsynchronous ∷ SomeException → Bool
 isAsynchronous failure = case fromException failure of
@@ -1202,7 +1208,10 @@ runWorker tp token = mask $ \restore → do
 failPipeline ∷ TexturePipeline → ExceptionWithContext SomeException → IO ()
 failPipeline tp failure = do
   latchFailure tp "texture decode worker" failure
-  mask_ (closeAndWithdraw tp)
+  -- The worker is already failing with its own exception, which is what is raised: whatever the close
+  -- raises is not allowed to replace it or to skip the rest of the close.
+  _ ← tryWithContext @SomeException (mask_ (closeAndWithdraw tp))
+  pure ()
 
 -- | The next thing for the worker to do, in one transaction. Housekeeping first, so a lane is never
 -- kept from a pending job by a decode; then the oldest buffer waiting for a decode; otherwise it
@@ -1297,8 +1306,10 @@ decodeJob tp restore jid job bytes lane = do
             settled ← failStage tp jid (ProviderFailure "the texture decode was interrupted or failed")
             (settled <>) <$> promote tp
           _ → pure []
-      runEffects tp effects
+      -- The failure is latched before any effect runs, so an effect that raises cannot keep it from being
+      -- recorded; the original is what is raised.
       unless (isAsynchronous raised) (latchFailure tp "texture decode" caught)
+      _ ← runEffectsKeeping tp effects
       rethrowIO caught
 
 decodeStages ∷ TexturePipeline → (∀ x. IO x → IO x) → JobId → Job → ByteString → Int → IO ()
@@ -1441,8 +1452,8 @@ handoff tp jid level width height = do
                 more ← promote tp
                 pure (released <> settled <> cells <> more)
               _ → pure []
-          runEffects tp effects
           unless (isAsynchronous raised) (latchFailure tp "texture backend upload" caught)
+          _ ← runEffectsKeeping tp effects
           rethrowIO caught
   where
     renderKey key = decodeLossy (rootKeyBytes (contentKeyRoot key)) <> ":" <> pathText key
@@ -1701,7 +1712,12 @@ releaseCell tp cell = do
   outcome ← tryWithContext @SomeException (releaseCellBy ByPipeline cell)
   case outcome of
     Right () → pure ()
-    Left failure@(ExceptionWithContext _ raised) → unless (isAsynchronous raised) (latchFailure tp "texture release" failure)
+    -- Recorded on the cell by 'releaseCellBy' either way. A synchronous failure is the pipeline's; a
+    -- cancellation is not swallowed here: it goes on to whoever ran this, which raises it after its
+    -- other effects.
+    Left failure@(ExceptionWithContext _ raised)
+      | isAsynchronous raised → rethrowIO failure
+      | otherwise → latchFailure tp "texture release" failure
 
 -- | Claim the cell for release if its state allows this claimant to, call the backend's release (never
 -- waiting) and record what it answered. Exactly one claimant ever calls the backend: the claim is one
@@ -1765,12 +1781,21 @@ closeAndWithdraw tp = do
 -- running, and no delivered texture unreleased or unretired. Runs the housekeeping itself, so it never
 -- depends on the worker being alive. Cancellation delivered meanwhile is remembered and raised at the
 -- end, so a drain is never cut short by it.
+--
+-- Nothing raised stops it: a cancellation delivered while it waits, and one raised by an effect it ran
+-- (the first of them is retained, the effects go on, and every outstanding obligation is still met),
+-- are raised once the drain is over. The one thing that does stop it is a synchronous fault of its own
+-- transaction: an engine defect it cannot get past, which retrying against unchanged state would only
+-- turn into a hang. That is latched and raised.
 drain ∷ TexturePipeline → IO ()
 drain tp = do
   pending ← newIORef (Nothing ∷ Maybe (ExceptionWithContext SomeException))
   go pending
   readIORef pending >>= maybe (pure ()) rethrowIO
   where
+    keep ∷ IORef (Maybe (ExceptionWithContext SomeException)) → ExceptionWithContext SomeException → IO ()
+    keep pending caught = atomicModifyIORef' pending (\held → (Just (fromMaybe caught held), ()))
+
     go ∷ IORef (Maybe (ExceptionWithContext SomeException)) → IO ()
     go pending = do
       stepped ← tryWithContext @SomeException . atomically $ do
@@ -1781,11 +1806,16 @@ drain tp = do
             done ← drained tp
             if done then pure Nothing else retry
       case stepped of
-        Right (Just effects) → runEffects tp effects >> go pending
-        Right Nothing → pure ()
-        Left caught → do
-          atomicModifyIORef' pending (\held → (Just (fromMaybe caught held), ()))
+        Right (Just effects) → do
+          raised ← runEffectsKeeping tp effects
+          mapM_ (keep pending) raised
           go pending
+        Right Nothing → pure ()
+        Left caught@(ExceptionWithContext _ raised)
+          -- Cancellation: remembered, and the wait resumes.
+          | isAsynchronous raised → keep pending caught >> go pending
+          -- A fault of the transaction itself: latched, raised, and the drain cannot go on.
+          | otherwise → latchFailure tp "texture pipeline drain" caught >> keep pending caught
 
 -- | Whether nothing the pipeline started is left: the condition a closing scope waits for. Read-only.
 pipelineDrained ∷ TexturePipeline → STM Bool
@@ -1807,5 +1837,19 @@ drained tp = do
     Nothing → pure False
   pure (idle && lanesFree && Map.null (psOrphans st) && not unretired)
 
+-- | Close admission, withdraw and tell, then drain: **the drain always runs**, whatever the close step
+-- raised, synchronously or by cancellation. The first exception is retained, every outstanding obligation is
+-- drained (the backend still borrows buffers until it says otherwise, and the scope must not unwind
+-- under it), and the retained exception is raised after, with the drain's own beside it.
 closeAndDrain ∷ TexturePipeline → IO ()
-closeAndDrain tp = mask_ (closeAndWithdraw tp) >> drain tp
+closeAndDrain tp = do
+  -- Admission closes in a transaction of its own, so a failure of the rest of the close cannot leave the
+  -- pipeline taking work while it drains.
+  _ ← tryWithContext @SomeException (atomically (modifyState tp (\st → st {psPhase = Closed})))
+  closing ← tryWithContext @SomeException (mask_ (closeAndWithdraw tp))
+  draining ← tryWithContext @SomeException (drain tp)
+  case (closing, draining) of
+    (Right (), Right ()) → pure ()
+    (Left first, Right ()) → rethrowIO first
+    (Right (), Left second) → rethrowIO second
+    (Left first, Left second) → composeCleanup (Just first) [("texture pipeline drain", second)] >>= maybe (rethrowIO first) rethrowIO
