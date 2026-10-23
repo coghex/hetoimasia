@@ -8,12 +8,13 @@
 module Test.LuaEngine.Session.Construction (spec) where
 
 import Control.Concurrent (forkIO, myThreadId, throwTo)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
+import Control.Concurrent.MVar (isEmptyMVar, newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Exception (AsyncException (ThreadKilled), SomeException, fromException, toException, try)
 import Control.Monad (void)
 import Data.List (sort)
 import qualified Data.Text as Text
 import Test.Hspec
+import Test.LuaEngine.Modules.Support (closeGate, openGate)
 import Test.LuaEngine.Session.Support
 
 spec ∷ Spec
@@ -76,6 +77,7 @@ spec = describe "construction" $ do
         )
         [Gameplay, Presentation]
   cancellation
+  drainage
   where
     messages = map eeMessage
     indexOf point points = lookup point (zip points [0 ∷ Int ..])
@@ -125,3 +127,37 @@ cancellation = describe "cancellation of the calling thread" $
     , ("while an owner is parked at the dispatch gate", Validating (InstanceKey Presentation 0), False)
     , ("while an owner is dispatched and its init is about to begin", Dispatched (InstanceKey Gameplay 0), True)
     ]
+
+-- Leaving the session by an exception --------------------------------------------------------------------------------------------
+
+drainage ∷ Spec
+drainage = describe "the coordinator's drainage on an exceptional exit" $
+  it "does not publish a role as retired, or return, while a read its coordinator started is still held" $
+    withSetup ((setup (roleScript printScript)) {suShape = GameplayAlone}) $ \env → do
+      recorder ← newRecorder
+      let path = "lua/main.lua"
+      closeGate (ssProbeOf env) path
+      self ← myThreadId
+      handle ← newEmptyMVar
+      observed ← newEmptyMVar
+      released ← newEmptyMVar
+      _ ← forkIO $ do
+        session ← readMVar handle
+        awaitReadOf env path
+        throwTo self ThreadKilled
+        -- the unwinding has ended the owner and is waiting for the held read: the role is still not retired
+        awaitPoint recorder (Draining Gameplay)
+        status ← statusNow session
+        putMVar observed (fmap rolePhase (gameplayOf status))
+        putMVar released ()
+        openGate (ssProbeOf env) path
+      result ← try (runSession (scenarioSpec env (recordingHarness recorder (sxHarness (seSpec env)))) (putMVar handle))
+      case result of
+        Left (found ∷ SomeException) → fromException found `shouldBe` Just ThreadKilled
+        Right _ → expectationFailure "the cancellation was lost"
+      -- the call did not return until the read had been let go
+      isEmptyMVar released `shouldReturn` False
+      takeMVar observed `shouldReturn` Just Stopping
+      session ← readMVar handle
+      status ← statusNow session
+      fmap rolePhase (gameplayOf status) `shouldBe` Just Retired

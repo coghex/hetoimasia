@@ -9,12 +9,15 @@
 -- under 'fatalSetup' and assert the session's own account inside the body.
 module Test.LuaEngine.Session.Failures (spec) where
 
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (displayException, throwIO)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
+import Control.Concurrent (forkIO, myThreadId, throwTo)
+import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, displayException, fromException, throwIO, toException, tryWithContext)
+import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, displayCleanupFailure)
 import Control.Monad (void)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
+import Data.List (isInfixOf)
 import Hetoimasia.Foundation.Log (unsafeComponent)
 import Hetoimasia.Foundation.Worker (workerDefinition)
 import Hetoimasia.Runtime.Supervision (Disposition (Required), Recognition (Unrecognized), Role (Service), SupervisedStart (WorkerStarted), WorkerPolicy (..), startSupervised)
@@ -290,6 +293,51 @@ hostFailures = describe "of the host" $ do
       outVerdict outcome `shouldBe` VerdictFailure
       fmap rfStage (outFailures outcome) `shouldBe` [OnUpdate]
 
+  it "accounts the owner's retained cleanup once when the driver itself fails, with the driver's failure first" $ do
+    _ ←
+      fatalSetup (setup (roleScript suspending)) {suShape = GameplayAlone} $ \env → do
+        let world = seWorld env
+        recorder ← newRecorder
+        failAt recorder (GrantIntent 2) (toException (userError "the driver failed"))
+        outcome ← runScenarioWith env (recordingHarness recorder noHarness) $ \session → do
+          awaitPhase session Gameplay Running
+          awaitRegistration world 1000
+          passTime world 1000000 (elem "suspended" <$> outLines world)
+          -- the second tick falls due: the driver raises at the grant, with a coroutine suspended in a failing close
+          nudge world 1000000
+          void (awaitRetired session)
+        outVerdict outcome `shouldBe` VerdictFailure
+        fmap eeCode (erPrimary (outEngine outcome)) `shouldBe` Just HostFailure
+        fmap (Text.isInfixOf "the driver failed" . eeMessage) (erPrimary (outEngine outcome)) `shouldBe` Just True
+        length [found | found ← erSecondary (outEngine outcome), eeCode found == CleanupFailure, Text.isInfixOf "close failed" (eeMessage found)] `shouldBe` 1
+    pure ()
+
+  it "carries the owner's retained cleanup beside a cancellation of the calling thread" $ do
+    _ ←
+      fatalSetup (setup (roleScript suspending)) {suShape = GameplayAlone} $ \env → do
+        let world = seWorld env
+        recorder ← newRecorder
+        holdAt recorder (GrantIntent 2)
+        self ← myThreadId
+        handle ← newEmptyMVar
+        _ ← forkIO $ do
+          session ← readMVar handle
+          awaitPhase session Gameplay Running
+          awaitRegistration world 1000
+          passTime world 1000000 (elem "suspended" <$> outLines world)
+          nudge world 1000000
+          awaitPoint recorder (GrantIntent 2)
+          throwTo self ThreadKilled
+          void (awaitStatus session statusStopping)
+          releaseHold recorder (GrantIntent 2)
+        result ← tryWithContext @SomeException (runSession (scenarioSpec env (recordingHarness recorder noHarness)) (putMVar handle))
+        case result of
+          Left (ExceptionWithContext attached raised) → do
+            fromException raised `shouldBe` Just ThreadKilled
+            map displayCleanupFailure (cleanupFailuresInContext attached) `shouldSatisfy` any ("close failed" `isInfixOf`)
+          Right _ → expectationFailure "the cancellation was lost"
+    pure ()
+
   it "ends the session when the host fails while the entries are still being evaluated, before any root is dispatched" $ do
     _ ←
       fatalSetup (setup (roleScript printScript {scPrelude = ["print('load')"]})) $ \env → do
@@ -324,6 +372,17 @@ hostFailures = describe "of the host" $ do
           fmap eeCode (erSecondary (outEngine outcome)) `shouldSatisfy` (CleanupFailure `elem`)
     pure ()
   where
+    suspending =
+      printScript
+        { scInit = []
+        , scUpdate =
+            [ "if api.time.tick() == 1 then"
+            , "  print('suspended')"
+            , "  local guard <close> = setmetatable({}, {__close = function() error('close failed') end})"
+            , "  api.time.wait_ticks(100)"
+            , "end"
+            ]
+        }
     closing =
       printScript
         { scInit = []

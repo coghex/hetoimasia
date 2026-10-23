@@ -345,6 +345,9 @@ data Env = Env
   , envSeen ∷ !(TVar (Set InstanceId))
   -- ^ The host instances whose first hook the gate has been told of.
   , envTracked ∷ !(TVar (Map.Map InstanceId Held))
+  , envAccounted ∷ !(TVar (Set Role))
+  -- ^ The roles whose owner's completion (its result and the cleanup it retained) the session has accounted: once
+  -- each, whichever path found the owner ended first, the driver or the scope that leaves it.
   , envEarly ∷ !(TVar (Set InstanceId))
   -- ^ The instances whose failure the owner reported as it began, so that its settlement is not told as a second one.
   , envRoles ∷ !(Map.Map Role RoleInfo)
@@ -625,12 +628,22 @@ withOwner env info owned coordinator holder facade body = mask $ \restore → do
         body RoleVm {rvInfo = info, rvCoordinator = coordinator, rvOwner = owner, rvEndpoint = endpoint, rvFacade = facade}
       stopped ← leaving
       interruptions ← awaitEnded restore owner
+      -- However the scope is left, the owner's completion is accounted (once, whichever path finds it first) and the
+      -- coordinator drained before anything the owner or its reads borrow is released and before the role can be
+      -- published as retired. Both go on through interruptions, as the wait for the owner does.
+      completion ← accountOwner env info owner
+      draining ← tryWithContext @SomeException (probeAt env (Draining role))
+      drained ← awaitDrainedThrough restore coordinator
       released ← tryWithContext @SomeException (probeAt env (Released role BuildOwner))
-      let failures = [f | Left f ← [outcome]] <> stopped <> interruptions <> [f | Left f ← [released]]
+      let failures = [f | Left f ← [outcome]] <> stopped <> interruptions <> [f | Left f ← [draining]] <> drained <> [f | Left f ← [released]]
+          -- what the owner ended with travels beside whatever is raised, whole
+          evidence =
+            [(cleanupFailureLabel item, cleanupFailureException item) | item ← completionCleanup completion]
+              <> [("lua owner", failed) | Worker.Failed failed ← [completionResult completion]]
       case (outcome, failures) of
         (Right value, []) → pure value
         _ → do
-          propagateAll failures
+          propagateAll failures evidence
           either rethrowIO pure outcome
   where
     spec = envSpec env
@@ -641,6 +654,17 @@ registerStopper ∷ Env → Role → IO () → IO ()
 registerStopper env role action = do
   atomically (modifyTVar' (sessionStoppers (envSession env)) (Map.insert role action))
   dischargeStops (envSession env)
+
+-- | Wait for the role's coordinator to have drained: every read it started has returned what it reserved. The
+-- coordinator is closed first (a stop does that), so nothing new starts. Interruptions are recorded in order and the
+-- wait goes on.
+awaitDrainedThrough ∷ (∀ x. IO x → IO x) → Coordinator → IO [ExceptionWithContext SomeException]
+awaitDrainedThrough restore coordinator = go []
+  where
+    go interruptions =
+      tryWithContext @SomeException (restore (atomically (awaitDrained coordinator))) >>= \case
+        Right () → pure (reverse interruptions)
+        Left interruption → go (interruption : interruptions)
 
 -- | Wait for the owner's worker to have ended, whatever supervision has latched: its raw completion.
 -- Interruptions are recorded in order and the wait goes on.
@@ -655,11 +679,11 @@ awaitEnded restore owner = go []
 -- | Raise what went wrong, in the order it happened, as one failure: a cancellation, if one was among
 -- them, is the one that propagates, otherwise the first is, and every other is kept whole as cleanup
 -- evidence beside it. Nothing to raise returns.
-propagateAll ∷ [ExceptionWithContext SomeException] → IO ()
-propagateAll failures = case lookup chosen indexed of
+propagateAll ∷ [ExceptionWithContext SomeException] → [(Text, ExceptionWithContext SomeException)] → IO ()
+propagateAll failures evidence = case lookup chosen indexed of
   Nothing → pure ()
   Just primary →
-    composeCleanup (Just primary) [("lua session", failure) | (index, failure) ← indexed, index /= chosen]
+    composeCleanup (Just primary) ([("lua session", failure) | (index, failure) ← indexed, index /= chosen] <> evidence)
       >>= maybe (rethrowIO primary) rethrowIO
   where
     indexed = zip [0 ∷ Int ..] failures
@@ -693,7 +717,8 @@ runSession spec onReady = do
   seen ← newTVarIO Set.empty
   tracked ← newTVarIO Map.empty
   early ← newTVarIO Set.empty
-  let env = Env spec session limits ids seen tracked early (Map.fromList [(riRole info, info) | info ← roles])
+  accounted ← newTVarIO Set.empty
+  let env = Env spec session limits ids seen tracked accounted early (Map.fromList [(riRole info, info) | info ← roles])
   onReady session
   logInfo (sxLogger spec) sessionComponent "session starting" [("roles", Text.intercalate "," (map (roleWord . riRole) roles))]
   result ← tryWithContext @SomeException $ case refusal of
@@ -797,12 +822,22 @@ operate env vms =
         <*> newIORef Set.empty
         <*> newIORef False
         <*> pure timer
-    stopped ← isStopping env
-    unless stopped (bootEntries env vms driver)
-    stopped' ← isStopping env
-    unless stopped' (forM_ vms (admitRole env))
-    void (applyEvent (envSession env) AdmissionComplete)
-    drive env vms driver
+    -- A failure of the driver itself (a probe, a stop that cannot be made, a defect) is recorded the moment it is
+    -- raised, as the first failure it is, and the scopes then unwind with the gates closed; a cancellation is not
+    -- recorded here and goes on, carrying whatever the owners ended with.
+    tryWithContext @SomeException (conduct' driver) >>= \case
+      Right () → pure ()
+      Left failure
+        | isAsync failure → rethrowIO failure
+        | otherwise → recordFailure env failure
+  where
+    conduct' driver = do
+      stopped ← isStopping env
+      unless stopped (bootEntries env vms driver)
+      stopped' ← isStopping env
+      unless stopped' (forM_ vms (admitRole env))
+      void (applyEvent (envSession env) AdmissionComplete)
+      drive env vms driver
 
 isStopping ∷ Env → IO Bool
 isStopping env = stStopping <$> readTVarIO (sessionState (envSession env))
@@ -1100,7 +1135,7 @@ act env vms driver = \case
     startPacing origin
   NextEnded role → forM_ (vmOf role) $ \vm → do
     probeAt env (OwnerEnded role)
-    accountOwner env vm
+    void (accountOwner env (rvInfo vm) (rvOwner vm))
     closeModuleCoordinator (rvCoordinator vm)
     modifyIORef' (dvFinalized driver) (Set.insert role)
   NextRetire role → void (applyEvent session (RoleRetired role))
@@ -1186,18 +1221,23 @@ act env vms driver = \case
 -- | Account for how a role's owner ended: a failure of the host, a cancellation or retained cleanup failures end
 -- the whole session and are attributed to the role. An engine failure the facade already reported at its
 -- boundary is not a new failure.
-accountOwner ∷ Env → RoleVm → IO ()
-accountOwner env vm = do
-  completion ← atomically (awaitCompletion (supervisedWorker (scheduledSupervised (rvOwner vm))))
-  let role = riRole (rvInfo vm)
+accountOwner ∷ Env → RoleInfo → ScheduledOwner → IO (Completion ())
+accountOwner env info owner = do
+  completion ← atomically (awaitCompletion (supervisedWorker (scheduledSupervised owner)))
+  let role = riRole info
       session = envSession env
-  case completionResult completion of
-    Worker.Succeeded _ → pure ()
-    Worker.Failed (ExceptionWithContext _ exception)
-      | isJust (fromException exception ∷ Maybe EngineFailure) → pure ()
-      | otherwise → void (applyEvent session (EngineFault (Just role) (engineEntry HostFailure (Just role) OnEngine (Text.pack (displayException exception)))))
-    Worker.Cancelled (ExceptionWithContext _ exception) →
-      void (applyEvent session (EngineFault (Just role) (engineEntry HostFailure (Just role) OnEngine ("the owner was cancelled: " <> Text.pack (displayException exception)))))
-  forM_ (completionCleanup completion) $ \item →
-    void . applyEvent session . EngineFault (Just role) $
-      engineEntry CleanupFailure (Just role) OnCleanup (cleanupFailureLabel item <> ": " <> Text.pack (displayCleanupFailure item))
+  first ← atomically $ do
+    accounted ← readTVar (envAccounted env)
+    if Set.member role accounted then pure False else True <$ writeTVar (envAccounted env) (Set.insert role accounted)
+  when first $ do
+    case completionResult completion of
+      Worker.Succeeded _ → pure ()
+      Worker.Failed (ExceptionWithContext _ exception)
+        | isJust (fromException exception ∷ Maybe EngineFailure) → pure ()
+        | otherwise → void (applyEvent session (EngineFault (Just role) (engineEntry HostFailure (Just role) OnEngine (Text.pack (displayException exception)))))
+      Worker.Cancelled (ExceptionWithContext _ exception) →
+        void (applyEvent session (EngineFault (Just role) (engineEntry HostFailure (Just role) OnEngine ("the owner was cancelled: " <> Text.pack (displayException exception)))))
+    forM_ (completionCleanup completion) $ \item →
+      void . applyEvent session . EngineFault (Just role) $
+        engineEntry CleanupFailure (Just role) OnCleanup (cleanupFailureLabel item <> ": " <> Text.pack (displayCleanupFailure item))
+  pure completion

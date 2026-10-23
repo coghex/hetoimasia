@@ -78,6 +78,9 @@ data Point
     OwnerEnded !Role
   | -- | A role's owner is about to be asked to stop, by whoever is discharging the stop the session owes it.
     StopHandoff !Role
+  | -- | A role's owner has ended and been accounted, and its coordinator is about to be waited for until it has
+    -- drained: every read it started has returned. Holding the thread here holds the role unretired.
+    Draining !Role
   | -- | The driver released a held instance and has not yet looked at anything else: holding it here is how an
     -- example keeps the driver from seeing an instance run.
     Resumed !InstanceKey
