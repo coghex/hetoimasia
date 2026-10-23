@@ -8,13 +8,14 @@ module Test.LuaEngine.Facade.Sinks (spec) where
 
 import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
-import Control.Concurrent.STM (atomically, readTVarIO)
-import Control.Exception (SomeException, finally, try)
-import Control.Monad (void)
+import Control.Concurrent.STM (atomically, readTVarIO, retry)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, fromException, throwIO, try, tryWithContext)
+import Control.Monad (void, when)
 import Data.ByteString (ByteString)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (isNothing)
 import qualified Data.Text as Text
+import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, withResource)
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.Scripting.Lua.Owner (LibraryProfile (LibraryProfileM1), vmProfileConfig)
 import Hetoimasia.Scripting.Lua.Registration (namespace)
@@ -73,6 +74,65 @@ spec = describe "authored output under contention and failure" $ do
             (void (awaitEnded control fvm)) `finally` (outLines world >>= writeIORef seen)
       readIORef seen >>= (`shouldBe` ["written, not flushed"])
       Text.pack (show raised) `shouldSatisfy` Text.isInfixOf "OutputFailure"
+  describe "a failed output" $ do
+    it "writes nothing after the sink failed, also for a writer that had passed the check and was waiting for the lock behind the one that failed" $ do
+      entered ← newEmptyMVar
+      gate ← newEmptyMVar
+      seen ← newIORef []
+      let sink =
+            OutputSink
+              { sinkLine = \line → do
+                  modifyIORef' seen (line :)
+                  void (tryPutMVar entered ())
+                  -- the first writer holds the lock in the sink until the example lets it fail
+                  when (line == "a") (readMVar gate >> throwIO (userError "the sink failed"))
+              , sinkFlush = pure ()
+              }
+      withOutput sink sink $ \output → do
+        resultA ← newEmptyMVar
+        resultB ← newEmptyMVar
+        ( do
+            _ ← forkIO (tryWithContext @SomeException (writeAuthored output Stdout ["a"]) >>= putMVar resultA)
+            bounded (takeMVar entered)
+            _ ← forkIO (tryWithContext @SomeException (writeAuthored output Stdout ["b"]) >>= putMVar resultB)
+            -- the second writer is counted, so it has passed the check that preceded the failure
+            bounded (atomically (outputInFlight output >>= \n → when (n < 2) retry))
+            putMVar gate ()
+            first ← bounded (takeMVar resultA)
+            second ← bounded (takeMVar resultB)
+            either (Text.pack . show) (const "written") first `shouldSatisfy` Text.isInfixOf "OutputFailure"
+            either (Text.pack . show) (const "written") second `shouldSatisfy` Text.isInfixOf "OutputFailure"
+          )
+          `finally` void (tryPutMVar gate ())
+      -- the sink was handed the line that failed, and the writer behind it never reached it
+      readIORef seen >>= (`shouldBe` ["a"])
+    it "keeps the cleanup failures of what the scope encloses, beside the body's failure, and raises the body's failure as itself" $ do
+      outcome ←
+        tryWithContext @SomeException . withOutput quietSink quietSink $ \_ →
+          withResource (pure ()) (\_ → throwIO (userError "cleanup inside")) (\_ → throwIO (userError "primary"))
+      case outcome of
+        Left (ExceptionWithContext carried raised) → do
+          show raised `shouldBe` show (userError "primary")
+          length (cleanupFailuresInContext carried) `shouldBe` 1
+        Right () → expectationFailure "the body's failure must be raised"
+    it "raises the failure of an enclosed cleanup as primary, with its evidence, when the body succeeded" $ do
+      outcome ←
+        tryWithContext @SomeException . withOutput quietSink quietSink $ \_ →
+          withResource (pure ()) (\_ → throwIO (userError "cleanup inside")) (\_ → pure ())
+      case outcome of
+        Left (ExceptionWithContext carried raised) → do
+          show raised `shouldBe` show (userError "cleanup inside")
+          length (cleanupFailuresInContext carried) `shouldBe` 1
+        Right () → expectationFailure "the enclosed cleanup's failure must be raised"
+    it "keeps the context a sink's failure was raised with, inside the failure that reports it" $ do
+      let sink = quietSink {sinkLine = \_ → withResource (pure ()) (\_ → throwIO (userError "sink cleanup")) (\_ → throwIO (userError "sink failed"))}
+      outcome ← withOutput sink sink $ \output → tryWithContext @SomeException (writeAuthored output Stdout ["x"])
+      case outcome of
+        Left (ExceptionWithContext _ raised)
+          | Just (OutputFailure Stdout (ExceptionWithContext carried cause)) ← fromException raised → do
+              show cause `shouldBe` show (userError "sink failed")
+              length (cleanupFailuresInContext carried) `shouldBe` 1
+        other → expectationFailure ("an OutputFailure for stdout was expected, found " <> either show (const "a write") other)
   describe "the scope that owns the sinks" $ do
     it "outlives the owner that writes to them: a shutdown hook that prints while the owner retires still finds its sink" $
       withWorld fixedM1Profile (Layout (("lua/main.lua", scriptSource script {scShutdown = ["print('goodbye')", "warn('goodbye')"]}) : files)) $ \world _ runtime → do
@@ -152,3 +212,7 @@ spec = describe "authored output under contention and failure" $ do
             void (awaitEnded control fvm)
       length reported `shouldBe` 1
       reported `shouldSatisfy` all (\(EngineFailure why) → "could not be bound" `Text.isInfixOf` why)
+
+-- | Sinks that write nowhere.
+quietSink ∷ OutputSink
+quietSink = OutputSink {sinkLine = \_ → pure (), sinkFlush = pure ()}

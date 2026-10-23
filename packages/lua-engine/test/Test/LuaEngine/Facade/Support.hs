@@ -28,6 +28,8 @@ module Test.LuaEngine.Facade.Support
   , setClock
   , advanceClock
   , setClockStep
+  , setFacadeLag
+  , failReports
   , setTickOverride
   , holdSink
   , releaseSink
@@ -106,7 +108,7 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Log (unsafeComponent)
-import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero, RequirePositive), durationFromNanoseconds, scriptedInstant, scriptedSource)
+import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero, RequirePositive), durationFromNanoseconds, durationNanoseconds, scriptedInstant, scriptedSource)
 import Hetoimasia.LuaEngine.Behavior (behaviorRequest)
 import Hetoimasia.LuaEngine.Boot (ContentConfiguration (..), contentConfiguration)
 import Hetoimasia.LuaEngine.Data (dataService, newByteBankFor)
@@ -172,6 +174,11 @@ data World = World
   -- ^ Every line a sink was handed, in the order it was handed, whether or not it was written.
   , wTickOverride ∷ !(IORef (Maybe Word64))
   -- ^ A tick the facade is told instead of the owner's, to inject a tick no Lua integer holds.
+  , wReportFails ∷ !(IORef Bool)
+  -- ^ Whether the injected boundary for engine failures raises, after recording the failure it was handed.
+  , wFacadeLag ∷ !(IORef Word64)
+  -- ^ How far behind the owner's clock the facade's own reads of it are: nothing, unless an example wants
+  -- the facade to check a wait against an earlier reading than the scheduler places it against.
   , wTimer ∷ !FakeTimer
   , wIds ∷ !InstanceIds
   , wControl ∷ !RuntimeControl
@@ -190,6 +197,8 @@ withWorld profile layout body = do
     clock ← newIORef 0
     step ← newIORef 0
     override ← newIORef Nothing
+    lag ← newIORef 0
+    reportFails ← newIORef False
     timer ← newFakeTimer
     ids ← newInstanceIds
     block ← newTVarIO Nothing
@@ -197,7 +206,7 @@ withWorld profile layout body = do
     flushFail ← newTVarIO False
     entered ← newTVarIO []
     withOutput (recording Stdout linesVar flushes block failOn flushFail entered) (recording Stderr linesVar flushes block failOn flushFail entered) $ \output →
-      body (World session profile output linesVar flushes admission failures clock step block failOn flushFail entered override timer ids control) control runtime
+      body (World session profile output linesVar flushes admission failures clock step block failOn flushFail entered override reportFails lag timer ids control) control runtime
   where
     recording stream linesVar flushes block failOn flushFail entered =
       OutputSink
@@ -313,6 +322,23 @@ clockDuration world = do
   step ← readIORef (wClockStep world)
   when (step /= 0) (atomicModifyIORef' (wClock world) (\current → (current + step, ())))
   either (\refused → assertFailure ("the clock is not a duration: " <> show refused)) pure (durationFromNanoseconds AllowZero (toInteger now))
+
+-- | The injected clock as the facade reads it: the owner's reading less the lag, so that an example can have the
+-- facade check a wait against an earlier moment than the scheduler places it at.
+laggingDuration ∷ World → IO Duration
+laggingDuration world = do
+  now ← clockDuration world
+  lag ← readIORef (wFacadeLag world)
+  let behind = max 0 (toInteger (durationNanoseconds now) - toInteger lag)
+  either (\refused → assertFailure ("the lagging clock is not a duration: " <> show refused)) pure (durationFromNanoseconds AllowZero behind)
+
+-- | From now on the injected boundary for engine failures raises after it has recorded one.
+failReports ∷ World → IO ()
+failReports world = writeIORef (wReportFails world) True
+
+-- | From now on the facade's reads of the clock are this many nanoseconds behind the owner's.
+setFacadeLag ∷ World → Word64 → IO ()
+setFacadeLag world = writeIORef (wFacadeLag world)
 
 -- The fake timer -----------------------------------------------------------------------------------
 
@@ -444,8 +470,11 @@ withFvm world runtime shape body = do
     let endpoints =
           FacadeEndpoints
             { endpointAdmission = readTVarIO (wAdmission world)
-            , endpointFailure = \failure → atomically (modifyTVar' (wFailures world) (<> [failure]))
-            , endpointClock = scriptedSource (scriptedInstant <$> clockDuration world)
+            , endpointFailure = \failure → do
+                atomically (modifyTVar' (wFailures world) (<> [failure]))
+                raising ← readIORef (wReportFails world)
+                when raising (throwIO (userError "the report of the failure failed"))
+            , endpointClock = scriptedSource (scriptedInstant <$> laggingDuration world)
             , endpointTick = readIORef (wTickOverride world) >>= maybe (join (readIORef tickRef)) pure
             }
     facade ←
@@ -476,6 +505,7 @@ withFvm world runtime shape body = do
             , scheduledLoader = Just (coordinatorPlan coordinator)
             , scheduledClock = scriptedSource (scriptedInstant <$> clockDuration world)
             , scheduledTimer = timerBackend (wTimer world)
+            , scheduledRefusedWait = facadeRefusedWait facade
             }
     started ← startScheduledOwner runtime spec
     owner ← case started of

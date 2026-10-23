@@ -180,6 +180,34 @@ spec = describe "output" $ do
       bytesOf cut `shouldBe` outputCallLimit
       cut `shouldSatisfy` all (Text.isPrefixOf "prefix: ")
       last cut `shouldSatisfy` Text.isSuffixOf truncationMarker
+    it "marks every line with the whole prefix when it cuts: the marker ends the last kept line, never stands alone, and a cut never splits a prefix" $ do
+      let prefix = "lua warning role=gameplay content=modules-test instance=inst-1: "
+          call n rest = Text.replicate n "x" <> rest
+          expected text = map (prefix <>) (Text.splitOn "\n" text)
+          check limit text = do
+            let written = authoredLinesWith limit prefix (Text.encodeUtf8 text)
+                full = expected text
+            written `shouldSatisfy` all (Text.isPrefixOf prefix)
+            bytesOf written `shouldSatisfy` (<= limit)
+            if bytesOf full <= limit
+              then written `shouldBe` full
+              else do
+                last written `shouldSatisfy` Text.isSuffixOf truncationMarker
+                init written `shouldBe` take (length written - 1) full
+      -- the call the review reproduced: a first line that nearly fills the bound, and a second after it
+      authoredLines prefix (Text.encodeUtf8 (call 4027 "\nnext")) `shouldSatisfy` all (Text.isPrefixOf prefix)
+      -- every length around the bound, with a break after it, several breaks, and none
+      forM_ [(n, rest) | n ← [3980 .. 4040], rest ← ["", "\n", "\nnext", "\n\n\nmore\nlines", "\8364\8364"]] $ \(n, rest) →
+        check outputCallLimit (call n rest)
+      -- a smaller bound, the same at every length around it
+      forM_ [(n, rest) | n ← [0 .. 120], rest ← ["", "\nnext", "\na\nb\nc"]] $ \(n, rest) →
+        check 128 (call n rest)
+      -- many short lines
+      check 300 (Text.intercalate "\n" (replicate 40 "line"))
+    it "lets the bound win when it cannot hold one prefix, the marker and a line end" $ do
+      let prefix = "a prefix of some length: "
+      forM_ [1 .. 30] $ \limit →
+        bytesOf (authoredLinesWith limit prefix "text\nmore") `shouldSatisfy` (<= limit)
     it "bounds a call to a smaller limit when asked to, as a validated smaller profile does" $ do
       let ls = authoredLinesWith 100 "p: " (Text.encodeUtf8 (Text.replicate 500 "z"))
       bytesOf ls `shouldBe` 100

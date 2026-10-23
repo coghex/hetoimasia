@@ -8,7 +8,9 @@
 module Test.LuaRuntime.Scheduled.Execution (spec) where
 
 import Control.Concurrent.STM (atomically)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), throwIO)
 import Control.Monad (forM_)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Text (Text)
 import Hetoimasia.Scripting.Lua.Scheduled
@@ -17,7 +19,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (fireReg, liveRegs, nanoseconds)
-import Test.LuaRuntime.Support (bounded, failExample, Gated (..), requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, Broken (Broken), brokenIs, expectFatal, failExample, Gated (..), requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- | A task of the module's @spin@ entry, which records a label and a number and
 -- yields, this many times.
@@ -170,6 +172,32 @@ spec = describe "tasks run as coroutines on a scheduled owner" $ do
           SettledRefused _ → pure ()
           other → failExample ("a wait for nothing must be refused, found " <> show other)
         retireScheduled owner
+
+  describe "the application told of a refused wait" $ do
+    it "is told of each wait the scheduler refused, in order, after the refused task settled; the task still fails as it did" $ bounded $ do
+      fixture ← newSFixture
+      told ← newIORef []
+      withBoundary $ \_ runtime → do
+        setClock fixture 18446744073709551615
+        owner ← startScheduled fixture runtime ((scheduled fixture "told" requiredPolicy defaultSchedulerBounds) {scheduledRefusedWait = \why → modifyIORef' told (why :)})
+        past ← admitTask' fixture owner "p" (request "sleep_wide" [VText "p", VInteger 0, VInteger 1] OrdinaryClass OneShot (Just "p"))
+        outcomeOf past >>= \settled → case settled of
+          SettledRefused _ → pure ()
+          other → failExample ("a wait past the clock's range must still be refused, found " <> show other)
+        zero ← admitTask' fixture owner "z" (request "sleep_wide" [VText "z", VInteger 0, VInteger 0] OrdinaryClass OneShot (Just "z"))
+        outcomeOf zero >>= \settled → case settled of
+          SettledRefused _ → pure ()
+          other → failExample ("a wait for nothing must still be refused, found " <> show other)
+        retireScheduled owner
+      readIORef told >>= (`shouldBe` [WaitDurationNotPositive, WaitDeadlineOverflow])
+    it "treats what the application raises as a failure of the host: the owner ends with it" $ bounded $ do
+      fixture ← newSFixture
+      ExceptionWithContext _ raised ← expectFatal $ \control runtime → do
+        setClock fixture 18446744073709551615
+        owner ← startScheduled fixture runtime ((scheduled fixture "raises" requiredPolicy defaultSchedulerBounds) {scheduledRefusedWait = \_ → throwIO (Broken "refused wait")})
+        _ ← admitTask' fixture owner "p" (request "sleep_wide" [VText "p", VInteger 0, VInteger 1] OrdinaryClass OneShot (Just "p"))
+        awaitScheduledTerminal control owner
+      raised `shouldSatisfy` brokenIs "refused wait"
 
   describe "budgets" $ do
     it "ends a turn at an expired budget without preempting a segment or reordering tasks, and attributes the overruns" $ bounded $ do

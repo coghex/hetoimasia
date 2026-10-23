@@ -19,12 +19,14 @@ module Hetoimasia.LuaEngine.Facade.Bindings
   , warnPrefix
   ) where
 
-import Control.Exception (throwIO)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, fromException, rethrowIO, throwIO, tryWithContext)
 import qualified Data.ByteString as ByteString
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Data.Word (Word64)
+import Hetoimasia.Foundation.Resource (composeCleanup)
 import Hetoimasia.LuaEngine.Facade.Caller (Caller (callerRecord), Calling (..), requireInstance, whoIsCalling)
 import Hetoimasia.LuaEngine.Facade.Types
   ( EngineFailure (EngineFailure)
@@ -58,12 +60,21 @@ instanceArgumentCheck facade rule owner values = do
     Left why → pure (Just why)
     Right caller → rule caller values
 
--- | Report an engine failure through the injected boundary, then raise it.
+-- | Report an engine failure through the injected boundary, then raise it. If the report itself raises, the
+-- engine failure is still the primary failure and what the report raised is retained beside it as cleanup
+-- evidence, so neither is lost; an asynchronous exception during the report is raised as it was.
 failEngine ∷ Facade → Text → IO a
 failEngine facade why = do
   let failure = EngineFailure why
-  endpointFailure (fcEndpoints facade) failure
-  throwIO failure
+  reported ← tryWithContext @SomeException (endpointFailure (fcEndpoints facade) failure)
+  case reported of
+    Right () → throwIO failure
+    Left raised@(ExceptionWithContext _ cause)
+      | isJust (fromException cause ∷ Maybe SomeAsyncException) → rethrowIO raised
+      | otherwise → do
+          primary ← tryWithContext @SomeException (throwIO failure)
+          composed ← composeCleanup (either Just (const Nothing) primary) [("lua facade failure report", raised)]
+          maybe (throwIO failure) rethrowIO composed
 
 -- | Refuse unless the caller's role is this one.
 requireRole ∷ Role → Text → Caller → Maybe Text

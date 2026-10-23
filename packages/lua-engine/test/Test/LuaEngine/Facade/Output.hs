@@ -6,6 +6,7 @@
 module Test.LuaEngine.Facade.Output (spec) where
 
 import Control.Concurrent.STM (readTVarIO)
+import Control.Monad (forM_)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.Text (Text)
@@ -168,6 +169,39 @@ spec = describe "authored output" $ do
         out ← outLines world
         err ← errLines world
         (written out, written err) `shouldBe` (128, 128)
+  it "marks every line of a warning with its whole prefix, however the call is cut: across a line break, in the first line, in a later one, and with many lines" $
+    withOneIn Gameplay fixedM1Profile
+      script
+        { scInit =
+            [ "warn('BEGIN') warn(string.rep('x', 4027) .. '\\nnext') warn('END')"
+            , "warn('BEGIN') warn(string.rep('y', 3990) .. '\\n' .. string.rep('z', 200) .. '\\nlast') warn('END')"
+            , "warn('BEGIN') warn('short\\nlines\\nonly') warn('END')"
+            , "warn('BEGIN') warn(string.rep('w\\n', 3000)) warn('END')"
+            , "warn('BEGIN') warn(string.rep('\\0', 5000)) warn('END')"
+            ]
+        }
+      files
+      $ \world _ _ _ → do
+        err ← errLines world
+        let prefix = "lua warning role=gameplay content=modules-test instance=inst-1: "
+        -- the raw lines, not lines with the prefix taken off: a line that lost its prefix, or kept part of it,
+        -- or is the marker alone, is not a line that starts with it
+        err `shouldSatisfy` (not . null)
+        err `shouldSatisfy` all (Text.isPrefixOf prefix)
+        let calls = callsBetween "BEGIN" "END" (map (Text.drop (Text.length prefix)) err)
+        length calls `shouldBe` 5
+        forM_ calls $ \call → do
+          written (map (prefix <>) call) `shouldSatisfy` (<= 4096)
+        -- the call that is cut ends in the marker on a prefixed line, and says nothing after it
+        case calls of
+          [reported, spread, short, many, nuls] → do
+            last reported `shouldSatisfy` Text.isSuffixOf "..."
+            reported `shouldSatisfy` ((== 1) . length)
+            last spread `shouldSatisfy` Text.isSuffixOf "..."
+            short `shouldBe` ["short", "lines", "only"]
+            last many `shouldSatisfy` Text.isSuffixOf "..."
+            last nuls `shouldSatisfy` Text.isSuffixOf "..."
+          other → expectationFailure ("five calls were expected, found " <> show (length other))
   it "gives a script no logger and no way to the engine's own bindings or the process's streams" $
     withOneIn Gameplay fixedM1Profile
       script

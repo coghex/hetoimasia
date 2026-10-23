@@ -21,11 +21,19 @@
 -- * A sink that raises is a failure of the host: the call raises it from the binding, so it ends the
 --   owner whatever Lua did with the stand-in error, and the output remembers the first failure so that
 --   no later call is written or retried through a sink that has failed. Nothing is ever reported through
---   the failed sink.
+--   the failed sink. The failure is checked and recorded /under the output's lock/: a writer that was
+--   waiting for the lock behind the one whose sink failed finds the failure when it gets it and touches
+--   neither sink, so a failed output has exactly one failed write and no write after it.
 -- * The scope that makes the output ('withOutput') is the owner of the in-flight calls: it closes the
 --   output to new calls when its body ends and waits for the calls already in the sink to return, so
 --   the sinks it borrowed are never released under a hook that is still writing. A hook that runs during
 --   an owner's shutdown still finds its sink: the scope outlives every owner that writes to it.
+-- * The scope is a 'withResourceLabelled' scope, so its body's failure is primary and keeps every cleanup
+--   failure the owners and the coordinator inside it retained; the close and drain is its release, and
+--   what it raises is retained beside the body's failure and not instead of it. Nothing here catches an
+--   exception and throws it again plainly: a failure is rethrown with the context it was caught with
+--   ('rethrowIO'), and a sink's failure is kept whole, context and all, inside the 'OutputFailure' that
+--   reports it.
 module Hetoimasia.LuaEngine.Facade.Output
   ( withOutput
   , writeAuthored
@@ -39,17 +47,20 @@ import Control.Concurrent.MVar (newMVar, withMVar)
 import Control.Concurrent.STM (STM, atomically, newTVarIO, readTVar, retry, throwSTM, writeTVar)
 import Control.Exception
   ( Exception
+  , ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException
   , SomeException
   , fromException
   , mask
-  , toException
+  , rethrowIO
   , throwIO
-  , try
+  , toException
+  , tryWithContext
   )
 import Control.Monad (unless, when)
 import Data.Maybe (isJust)
 import Data.Text (Text)
+import Hetoimasia.Foundation.Resource (withResourceLabelled)
 import Hetoimasia.LuaEngine.Facade.Types
   ( FacadeDefect (FacadeDefect)
   , Output (..)
@@ -58,9 +69,9 @@ import Hetoimasia.LuaEngine.Facade.Types
   , Stream (..)
   )
 
--- | An authored write the output could not make: the stream, and what the sink raised. It is a failure
--- of the host.
-data OutputFailure = OutputFailure !Stream !SomeException
+-- | An authored write the output could not make: the stream, and what the sink raised, with the context it
+-- was raised with. It is a failure of the host.
+data OutputFailure = OutputFailure !Stream !(ExceptionWithContext SomeException)
   deriving (Show)
 
 instance Exception OutputFailure
@@ -69,51 +80,50 @@ instance Exception OutputFailure
 -- for the calls in flight to return. The sinks belong to the caller, who releases them after this
 -- scope; this scope sees to it that no authored call is still using them.
 withOutput ∷ OutputSink → OutputSink → (Output → IO a) → IO a
-withOutput out err body = mask $ \restore → do
-  lock ← newMVar ()
-  state ← newTVarIO (OutputState True 0 Nothing)
-  let output = Output out err lock state
-  outcome ← try (restore (body output))
-  interrupted ← closeAndDrain output
-  case (outcome, interrupted) of
-    (Left failure, _) → throwIO (failure ∷ SomeException)
-    (Right _, Just cancellation) → throwIO cancellation
-    (Right value, Nothing) → pure value
+withOutput out err = withResourceLabelled "lua authored output scope" acquire closeAndDrain
+  where
+    acquire = do
+      lock ← newMVar ()
+      state ← newTVarIO (OutputState True 0 Nothing)
+      pure (Output out err lock state)
 
--- | Close the output to new calls and wait for the calls in flight, whatever interrupts the wait: an
--- interruption is remembered, the wait goes on until the output is idle, and the first is answered.
-closeAndDrain ∷ Output → IO (Maybe SomeException)
+-- | The release: close the output to new calls, then wait until no call is inside a sink. It runs
+-- uninterruptibly, as every release of a resource scope does, and so waits as long as a sink holds a
+-- writer.
+closeAndDrain ∷ Output → IO ()
 closeAndDrain output = do
   atomically (readTVar (outState output) >>= \st → writeTVar (outState output) st {stateOpen = False})
-  go Nothing
-  where
-    go remembered = do
-      waited ← try (atomically (idle output))
-      case waited of
-        Right () → pure remembered
-        Left interruption → go (maybe (Just interruption) Just remembered)
-    idle o = do
-      st ← readTVar (outState o)
-      when (stateInFlight st > 0) retry
+  atomically (outputInFlight output >>= \n → when (n > 0) retry)
 
 -- | Write one complete authored call: its lines, then the flush, under the output's lock. A sink that
--- raises is recorded once as the output's failure and raised as an 'OutputFailure'; an output that has
--- already failed raises that failure without touching a sink; a closed output is an engine defect
--- (a hook ran after the scope that owns the sinks ended).
+-- raises is recorded once as the output's failure, before the lock is released, and raised as an
+-- 'OutputFailure'; an output that has already failed raises that failure, checked again once the lock
+-- is held, without touching a sink; a closed output is an engine defect (a hook ran after the scope
+-- that owns the sinks ended). An asynchronous exception is not a failure of the sink: it is raised as
+-- it was, with its context, and the output goes on.
 writeAuthored ∷ Output → Stream → [Text] → IO ()
 writeAuthored output stream ls = mask $ \restore → do
   atomically (enter output)
-  written ← try (restore (withMVar (outLock output) (\_ → mapM_ (sinkLine sink) ls >> sinkFlush sink)))
-  atomically (leave output stream written)
-  case written of
-    Right () → pure ()
-    Left failure
-      | isJust (fromException failure ∷ Maybe SomeAsyncException) → throwIO failure
-      | otherwise → throwIO (OutputFailure stream failure)
+  written ← tryWithContext @SomeException (restore (withMVar (outLock output) (\_ → locked)))
+  atomically (leave output)
+  either rethrowIO pure written
   where
     sink = case stream of
       Stdout → outStdout output
       Stderr → outStderr output
+    -- With the lock held. The failure is looked for again, here, because the writer ahead may have failed
+    -- while this one waited; and it is recorded here, masked, before the lock goes to the next writer.
+    locked = mask $ \restoreSink → do
+      atomically (refuseIfFailed output)
+      attempted ← tryWithContext @SomeException (restoreSink (mapM_ (sinkLine sink) ls >> sinkFlush sink))
+      case attempted of
+        Right () → pure ()
+        Left failure@(ExceptionWithContext _ raised)
+          | isJust (fromException raised ∷ Maybe SomeAsyncException) → rethrowIO failure
+          | otherwise → do
+              let reported = toException (OutputFailure stream failure)
+              atomically (remember output reported)
+              throwIO reported
 
 -- | A call begins: counted if the output takes calls, otherwise refused with the failure it holds or as
 -- a defect.
@@ -126,21 +136,21 @@ enter output = do
       unless (stateOpen st) $ throwSTM (FacadeDefect "an authored call was made after the output's scope ended")
       writeTVar (outState output) st {stateInFlight = stateInFlight st + 1}
 
--- | A call ends: no longer counted, and a synchronous failure of the sink remembered if it is the first.
-leave ∷ Output → Stream → Either SomeException () → STM ()
-leave output stream written = do
+-- | The output's failure, if it has one: raised by a writer that holds the lock before it touches a sink.
+refuseIfFailed ∷ Output → STM ()
+refuseIfFailed output = readTVar (outState output) >>= maybe (pure ()) throwSTM . stateFailure
+
+-- | Remember the first failure of a sink.
+remember ∷ Output → SomeException → STM ()
+remember output failure = do
   st ← readTVar (outState output)
-  let failed = case written of
-        Left failure | not (isAsync failure) → Just (toException (OutputFailure stream failure))
-        _ → Nothing
-  writeTVar
-    (outState output)
-    st
-      { stateInFlight = stateInFlight st - 1
-      , stateFailure = maybe failed Just (stateFailure st)
-      }
-  where
-    isAsync failure = isJust (fromException failure ∷ Maybe SomeAsyncException)
+  writeTVar (outState output) st {stateFailure = maybe (Just failure) Just (stateFailure st)}
+
+-- | A call ends: no longer counted.
+leave ∷ Output → STM ()
+leave output = do
+  st ← readTVar (outState output)
+  writeTVar (outState output) st {stateInFlight = stateInFlight st - 1}
 
 -- | How many authored calls are inside a sink now.
 outputInFlight ∷ Output → STM Int

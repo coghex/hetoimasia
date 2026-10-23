@@ -297,6 +297,7 @@ module Hetoimasia.Scripting.Lua.Scheduled
 
     -- * Refused waits
   , CallbackWaitRefused (..)
+  , WaitRefusal (..)
   ) where
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
@@ -397,6 +398,7 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , TaskPhase (PhaseEnded)
   , TaskSpec (..)
   , TimerBackend
+  , WaitRefusal (..)
   , admitTask
   , awaitStepsComplete
   , fifoPolicy
@@ -440,6 +442,12 @@ data ScheduledSpec = ScheduledSpec
   , scheduledObserve ∷ SegmentContext → IO ()
     -- ^ Told, on the owner's thread, what each segment is about to be handed. An
     -- exception it raises is a failure of the host.
+  , scheduledRefusedWait ∷ WaitRefusal → IO ()
+    -- ^ Told, on the owner's thread, of each wait the scheduler refused, once the turn that refused it
+    -- has been accounted for: the task still failed and its instance still ended, as they always did.
+    -- It is for an application whose own bindings check a wait before they suspend and so treat a
+    -- refusal as the engine's fact (a clock that moved between the check and the placement). An
+    -- exception it raises is a failure of the host. The default does nothing.
   , scheduledInstances ∷ Maybe InstanceConfig
     -- ^ Script instances, when the owner hosts any: their bounds, the event
     -- sources it offers and the application's decision about an instance's
@@ -499,6 +507,7 @@ scheduledSpec config worker bounds =
     , scheduledClock = monotonicSource
     , scheduledTimer = systemTimerBackend
     , scheduledObserve = \_ → pure ()
+    , scheduledRefusedWait = \_ → pure ()
     , scheduledInstances = Nothing
     , scheduledLending = Nothing
     , scheduledLeases = Nothing
@@ -682,7 +691,7 @@ startScheduledOwner runtime spec = do
                 -- everything that already ended the owner has done this.
                 (\held → atomically (settleAll held ExitFailed))
           )
-          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) (fmap (\(_, instanceConfig, _) → instanceEscalate instanceConfig) hosted) (scheduledLending spec) (scheduledLeases spec) (scheduledMemberLimit spec) config {vmLifecycle = lifecycleContextOf <$> lifecycle, vmRequests = requestContextOf <$> provider, vmLoader = (\(plan, state) → observing (fmap (\(instances, _, _) → instances) hosted) plan (loadingConfig state plan)) <$> loading})
+          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) (scheduledRefusedWait spec) (fmap (\(_, instanceConfig, _) → instanceEscalate instanceConfig) hosted) (scheduledLending spec) (scheduledLeases spec) (scheduledMemberLimit spec) config {vmLifecycle = lifecycleContextOf <$> lifecycle, vmRequests = requestContextOf <$> provider, vmLoader = (\(plan, state) → observing (fmap (\(instances, _, _) → instances) hosted) plan (loadingConfig state plan)) <$> loading})
   -- Acquisition is masked from the worker's start to the endpoint's handoff, and
   -- only the readiness wait is restored, exactly as for a finite-call owner.
   mask $ \restore → do

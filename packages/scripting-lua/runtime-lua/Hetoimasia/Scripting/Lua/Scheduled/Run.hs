@@ -144,7 +144,8 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , StopReport (stopCloseFailures, stopTimerFailure)
   , TaskHost (..)
   , TaskRun (..)
-  , TurnReport (turnCloseFailures)
+  , TurnReport (turnCloseFailures, turnRefusedWaits)
+  , WaitRefusal
   , awaitWork
   , retainsEvidence
   , serviceTurnWith
@@ -164,14 +165,15 @@ runScheduledOwner
   → Control
   → TVar (Maybe Control)
   → (SegmentContext → IO ())
+  → (WaitRefusal → IO ())
   → Maybe (InstanceFailure → IO Escalation)
   → Maybe Lending
   → Maybe Leases
   → Int
   → VmConfig
   → IO ()
-runScheduledOwner stopping control handoff observe escalate lending leases members config = mask $ \restore → do
-  let body = serve stopping control handoff observe escalate config
+runScheduledOwner stopping control handoff observe refused escalate lending leases members config = mask $ \restore → do
+  let body = serve stopping control handoff observe refused escalate config
   outcome ←
     tryWithContext @SomeException . restore $ case lending of
       Nothing → withVmOwnerScoped noCallbackScope config (body Nothing)
@@ -189,8 +191,8 @@ runScheduledOwner stopping control handoff observe escalate lending leases membe
   either rethrowIO pure outcome
 
 -- | The body of the owner's lifetime.
-serve ∷ STM Bool → Control → TVar (Maybe Control) → (SegmentContext → IO ()) → Maybe (InstanceFailure → IO Escalation) → VmConfig → Maybe LeaseHost → OwnedVm → IO ()
-serve stopping control handoff observe escalate config leaseHost owned = mask $ \restore → do
+serve ∷ STM Bool → Control → TVar (Maybe Control) → (SegmentContext → IO ()) → (WaitRefusal → IO ()) → Maybe (InstanceFailure → IO Escalation) → VmConfig → Maybe LeaseHost → OwnedVm → IO ()
+serve stopping control handoff observe refused escalate config leaseHost owned = mask $ \restore → do
   tasks ← newIORef Map.empty
   handlesRef ← newIORef Map.empty
   instanceRef ← newIORef Nothing
@@ -400,6 +402,10 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
       mask_ $ do
         modifyIORef' kept (<> turnCloseFailures report)
         void (atomically (sweepForgotten control))
+      -- The application is told of each wait the turn refused, after the refused task and its instance
+      -- were accounted for and the turn's cleanup evidence was kept: what it raises is a failure of the
+      -- host, which ends the owner as any other does.
+      forM_ (turnRefusedWaits report) (refused . snd)
       halt ← atomically stopping
       retained ← (||) <$> (not . null <$> readIORef kept) <*> (not . null <$> readIORef extra)
       if halt || retained

@@ -7,10 +7,12 @@
 -- integer holds is an engine failure and is never wrapped.
 module Test.LuaEngine.Facade.Waits (spec) where
 
+import Control.Exception (ExceptionWithContext (ExceptionWithContext))
 import Data.ByteString (ByteString)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
+import Hetoimasia.Foundation.Resource (cleanupFailuresInContext)
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
@@ -179,7 +181,32 @@ spec = describe "waits" $ do
           awaitWaiting fvm 1
           phaseOf spawned >>= (`shouldNotBe` Nothing)
           outLines world >>= (`shouldBe` [])
-  describe "exhaustion" $
+  describe "a deadline the clock moves past between the facade's check and the scheduler's placement" $
+    it "is an engine failure through the injected boundary and not an isolated instance: the owner ends, and nothing resumes" $ do
+      (reported, _) ←
+        fatalWorld fixedM1Profile (Layout (("lua/main.lua", scriptSource script {scEverySeconds = "0.1", scUpdate = ["if self.ran then return end self.ran = true", "api.time.wait_seconds(1)", "print('resumed')"]}) : files)) $ \world _ runtime →
+          withFvm world runtime presentationShape $ \fvm → do
+            _ ← spawn world fvm "modules-test" mainPath
+            -- A second short of the end of the clock's range, as the scheduler reads it; the facade reads one
+            -- nanosecond earlier, where a second more is still counted.
+            setClock world (18446744073709551615 - 1000000000 + 1)
+            setFacadeLag world 1
+            pumpUntil world (not . null <$> failuresSeen world)
+            outLines world >>= (`shouldNotSatisfy` elem "resumed")
+      length reported `shouldBe` 1
+      reported `shouldSatisfy` all (\(EngineFailure why) → "refused a wait the facade had checked" `Text.isInfixOf` why)
+  describe "exhaustion" $ do
+    it "keeps the engine failure as the primary failure when the report of it raises too, with what the report raised retained beside it" $ do
+      (reported, ExceptionWithContext carried raised) ←
+        fatalWorld fixedM1Profile (Layout (("lua/main.lua", scriptSource script {scUpdate = ["print('tick ' .. api.time.tick())"]}) : files)) $ \world control runtime →
+          withFvm world runtime gameplayShape $ \fvm → do
+            _ ← spawn world fvm "modules-test" mainPath
+            setTickOverride world (Just 9223372036854775808)
+            failReports world
+            tickBy control fvm 1
+      length reported `shouldBe` 1
+      show raised `shouldSatisfy` Text.isInfixOf "past the largest Lua integer" . Text.pack
+      length (cleanupFailuresInContext carried) `shouldBe` 1
     it "is an engine failure through the injected boundary when a tick no Lua integer holds is asked for, and is never wrapped" $ do
       (reported, _) ←
         fatalWorld fixedM1Profile (Layout (("lua/main.lua", scriptSource script {scUpdate = ["print('tick ' .. api.time.tick())"]}) : files)) $ \world control runtime →

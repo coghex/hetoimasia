@@ -16,6 +16,16 @@
 -- line takes the application's prefix. One call writes at most 'outputCallLimit' bytes of UTF-8 in
 -- all, a line counting its bytes and one more for its end, the prefixes and the visible truncation
 -- marker included. Each line is one call of the application's sink.
+--
+-- = A prefix marks every line
+--
+-- When the application gives a prefix, every line that is written begins with the whole of it, the line
+-- a cut ends included: the marker is put at the end of the last line that is kept, which is a prefixed
+-- line, and is never a line of its own and never follows a cut prefix. (A call with no prefix is cut as
+-- the runner's own output is, by 'boundLines', with the marker alone on a line when that is where the
+-- cut falls.) A bound too small to hold one prefix, the marker and a line end cannot give this, and the
+-- call is then the first @limit - 1@ bytes of the prefix and the marker, cut at a character: the bound
+-- wins over the format, and the profiles the engine validates never give a bound that small.
 module Hetoimasia.Scripting.Lua.Output
   ( outputCallLimit
   , truncationMarker
@@ -26,6 +36,7 @@ module Hetoimasia.Scripting.Lua.Output
   ) where
 
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as ByteString
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
@@ -45,8 +56,44 @@ authoredLines = authoredLinesWith outputCallLimit
 -- | 'authoredLines' for a call that writes at most this many bytes: a smaller bound than the default is
 -- what a validated smaller profile gives.
 authoredLinesWith ∷ Int → Text → ByteString → [Text]
-authoredLinesWith limit prefix bytes =
-  boundLines limit (map ((tameLine prefix <>) . tameLine) (Text.splitOn "\n" (Text.decodeUtf8With Text.lenientDecode bytes)))
+authoredLinesWith limit prefix bytes
+  | Text.null safePrefix = boundLines limit bodies
+  | otherwise = boundPrefixed limit safePrefix bodies
+  where
+    safePrefix = tameLine prefix
+    bodies = map tameLine (Text.splitOn "\n" (Text.decodeUtf8With Text.lenientDecode bytes))
+
+-- | These lines, each after the prefix, as a call may write them: in total at most this many bytes, a line
+-- counting its bytes and one more for its end. Lines that fit are returned. Otherwise the lines that fit
+-- are kept with room beside them for a prefixed marker line, and the first line that does not fit is cut
+-- at a character so that the prefix, what is kept of it, the marker and the line's end fit, and no line
+-- follows it.
+boundPrefixed ∷ Int → Text → [Text] → [Text]
+boundPrefixed limit prefix bodies
+  | sum (map (size . (prefix <>)) bodies) <= limit = map (prefix <>) bodies
+  | limit < reserve = [takeBytes (limit - 1) (prefix <> truncationMarker)]
+  | otherwise = go limit bodies
+  where
+    size line = ByteString.length (Text.encodeUtf8 line) + 1
+    -- A line that holds only a prefix and the marker.
+    reserve = size (prefix <> truncationMarker)
+    go _ [] = [prefix <> truncationMarker]
+    go room (body : rest)
+      | size line <= room - reserve = line : go (room - size line) rest
+      | otherwise = [prefix <> takeBytes (room - reserve) body <> truncationMarker]
+      where
+        line = prefix <> body
+
+-- | The longest start of this text, cut at a character, of at most this many bytes of UTF-8.
+takeBytes ∷ Int → Text → Text
+takeBytes room = Text.pack . fit 0 . Text.unpack
+  where
+    fit _ [] = []
+    fit used (character : more)
+      | used + width > room = []
+      | otherwise = character : fit (used + width) more
+      where
+        width = ByteString.length (Text.encodeUtf8 (Text.singleton character))
 
 -- | The Lua that defines @render(prefix, ...)@, as lines of source: it converts each argument with
 -- @tostring@, joins them with a tab after the prefix, and cuts the result to 'outputCallLimit' bytes

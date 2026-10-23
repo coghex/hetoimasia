@@ -107,6 +107,7 @@ module Hetoimasia.LuaEngine.Facade
   , InstallRefused (..)
   , facadeInstanceConfig
   , facadeRequestEndpoints
+  , facadeRefusedWait
   , facadeExportLimits
   , lexicalResolver
   , inventoryResolver
@@ -167,6 +168,7 @@ import Hetoimasia.Scripting.Lua.Owner
   , VmConfig (..)
   )
 import Hetoimasia.Scripting.Lua.Provider (RequestEndpoint)
+import Hetoimasia.Scripting.Lua.Scheduled (WaitRefusal)
 import Hetoimasia.Scripting.Lua.Registration
   ( Binding
   , CapabilityType
@@ -409,6 +411,17 @@ facadeNamespace facade =
 facadeInstanceConfig ∷ Facade → InstanceConfig → InstanceConfig
 facadeInstanceConfig facade config =
   config {instanceOnSegment = \found → segmentStarted facade found >> instanceOnSegment config found}
+
+-- | What the application's 'scheduledRefusedWait' does for a facade: the scheduler refused a wait that the
+-- facade's own binding had checked and prepared, which can only be because the clock moved between the
+-- check and the placement (a deadline that was representable at the first reading was not at the
+-- second). That is the engine's fact and not the script's: it is reported through the injected failure
+-- boundary and raised, which is a failure of the host and ends the owner, as a tick no Lua integer
+-- holds does. Without it the generic scheduler would fail the task and the default policy would isolate
+-- an instance for a refusal no script caused.
+facadeRefusedWait ∷ Facade → WaitRefusal → IO ()
+facadeRefusedWait facade refusal =
+  failEngine facade ("the scheduler refused a wait the facade had checked: " <> Text.pack (show refusal))
 
 -- | The request endpoints to grant the owner: the module coordinator's and the data service's.
 facadeRequestEndpoints ∷ Facade → [RequestEndpoint]
