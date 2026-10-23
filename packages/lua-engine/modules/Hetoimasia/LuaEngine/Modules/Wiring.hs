@@ -45,7 +45,7 @@ import Control.Concurrent.STM
   , throwSTM
   , writeTVar
   )
-import Control.Exception (Exception, throwIO)
+import Control.Exception (Exception, onException, throwIO)
 import Control.Monad (replicateM_, unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.Map.Strict as Map
@@ -356,7 +356,11 @@ identityCredit c identity =
 startModule ∷ HasCallStack ⇒ Coordinator → ModuleRequest → RequestContext → IO () → IO ModuleStart
 startModule c request context after = do
   ask <- moduleAsk c request
-  started <- startM1 (coordRequests c) ask context moduleEndpointName (moduleArguments request) after
+  -- Whatever the admission comes to, the room its check reserved is adopted or given back; an exception
+  -- that leaves the admission undecided gives it back too.
+  started <-
+    startM1 (coordRequests c) ask context moduleEndpointName (moduleArguments request) after
+      `onException` atomically (releaseCheckSTM c (requestedKey request))
   case started of
     M1Busy _ -> do
       -- Not accepted: the room the argument check reserved was not adopted, and is given back.
