@@ -183,6 +183,7 @@ module Hetoimasia.Scripting.Lua.Lease
 
     -- * Using
   , withLease
+  , withLeaseOr
 
     -- * Releasing
   , releaseLease
@@ -311,19 +312,29 @@ acquireWith leases ownership build = do
 -- borrowing rules: it may borrow other live members, and must not let the resource
 -- escape.
 withLease ∷ (HasCallStack, Typeable a) ⇒ Leases → Word64 → (a → IO r) → IO r
-withLease leases key use = do
+withLease leases key = withLeaseOr leases key (throwIO . CallRefusal)
+
+-- | 'withLease' that hands the refusal to the caller as data, in the same words and for the same
+-- three reasons (the lease has ended, it is another instance's, it holds another type), instead of
+-- raising it as a fault of the call. It decides and borrows in one step on the calling thread, so
+-- the answer cannot go stale between a check and the use: a binding that opted in to ordinary Lua
+-- errors ('Hetoimasia.Scripting.Lua.Registration.withArgumentCheck') turns the text into one, with
+-- its action never run. Nothing else differs: a borrow that is not allowed to start, a lent
+-- capability that has ended and what @use@ raises are as they are for 'withLease'.
+withLeaseOr ∷ (HasCallStack, Typeable a) ⇒ Leases → Word64 → (Text → IO r) → (a → IO r) → IO r
+withLeaseOr leases key refused use = do
   loan ← lentToCallback (leasesLending leases)
   caller ← runningInstance leases
   found ← atomically (lookupSlot leases key)
   case found of
-    Nothing → refuse LeaseEnded
+    Nothing → refused (renderRefusal LeaseEnded)
     Just slot
-      | caller /= Just (slotInstance slot) → refuse NotTheOwner
+      | caller /= Just (slotInstance slot) → refused (renderRefusal NotTheOwner)
       | otherwise → case (slotPhase slot, slotHolding slot) of
           (SlotLive, Just (Holding member)) → case gcast member of
             Just typed → withLentMember loan typed use
-            Nothing → refuse WrongType
-          _ → refuse LeaseEnded
+            Nothing → refused (renderRefusal WrongType)
+          _ → refused (renderRefusal LeaseEnded)
 
 -- | What an explicit release answered.
 data ReleaseAnswer

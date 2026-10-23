@@ -7,8 +7,8 @@
 -- package's public modules (and reads only through them), it exposes four
 -- modules, needs no GLFW, Vulkan, console, sample or game package, and is listed
 -- by the ordinary and CPU projects and not by the Vulkan project (LFE-22 wires
--- that). Its request, data and texture sublibraries are each held to their own
--- dependencies and public imports.
+-- that). Its request, data, texture and scene sublibraries are each held to their own
+-- dependencies and public imports; the scene one imports no oracle, which is the suite's.
 module Test.LuaEngine.Boundary (spec) where
 
 import Control.Monad (filterM)
@@ -167,6 +167,29 @@ spec = describe "the package and import boundary" $ do
     sort (nub [name | (file, name) ← imported, file == "Backend.hs", "Hetoimasia." `isPrefixOf` name])
       `shouldBe` ["Hetoimasia.Scripting.Lua.Provider"]
 
+  it "has a scene sublibrary over the profile, the texture authority, the pure renderer packages and the host's public modules, and nothing else" $ do
+    (sort <$> fieldEntries "library scene" "build-depends:")
+      `shouldReturn` [ "base"
+                     , "bytestring"
+                     , "containers"
+                     , "hetoimasia-lua-engine"
+                     , "hetoimasia-lua-engine:texture"
+                     , "hetoimasia-math"
+                     , "hetoimasia-render-2d"
+                     , "hetoimasia-render-api"
+                     , "hetoimasia-scripting-lua"
+                     , "hetoimasia-scripting-lua:runtime-lua"
+                     , "text"
+                     ]
+    fieldEntries "library scene" "exposed-modules:" `shouldReturn` ["Hetoimasia.LuaEngine.Scene"]
+
+  it "imports, in the scene sublibrary, only the profile, the texture sublibrary, the renderer's and the math package's public modules, the host's public modules and base libraries: no oracle, private module, window, GPU, GLFW, Vulkan, content, console, sample or game" $ do
+    sources ← sourcesUnder "scene"
+    sources `shouldSatisfy` ((>= 7) . length)
+    imported ← importedBy sources
+    [file <> ": " <> name | (file, name) ← imported, not (permittedScene name)] `shouldBe` []
+    [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
+
   it "lets only the behavior selection import the Lua host and runtime, and only their public modules" $ do
     sources ← sourcesUnder "src"
     imported ← importedBy sources
@@ -263,6 +286,22 @@ spec = describe "the package and import boundary" $ do
                  , "Hetoimasia.Scripting.Lua.Registration"
                  , "Hetoimasia.Scripting.Lua.Value"
                  ]
+    permittedScene name =
+      "Data." `isPrefixOf` name
+        || "GHC." `isPrefixOf` name
+        || "Control." `isPrefixOf` name
+        || "Hetoimasia.LuaEngine.Scene" `isPrefixOf` name
+        || name
+          `elem` [ "Hetoimasia.LuaEngine.Profile"
+                 , "Hetoimasia.LuaEngine.Texture"
+                 , "Hetoimasia.Math.Affine2"
+                 , "Hetoimasia.Math.Vector"
+                 , "Hetoimasia.Render.Api.Texture"
+                 , "Hetoimasia.Scripting.Lua.Lease"
+                 , "Hetoimasia.Scripting.Lua.Registration"
+                 , "Hetoimasia.Scripting.Lua.Value"
+                 ]
+        || "Hetoimasia.Render.TwoD." `isPrefixOf` name
     permittedSuite name =
       name
         `elem` [ "Hetoimasia.LuaEngine.Manifest"
@@ -272,6 +311,12 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.LuaEngine.Request"
                , "Hetoimasia.LuaEngine.Data"
                , "Hetoimasia.LuaEngine.Texture"
+               , "Hetoimasia.LuaEngine.Scene"
+               , "Hetoimasia.Asset.Image"
+               , "Hetoimasia.Math.Affine2"
+               , "Hetoimasia.Math.Vector"
+               , "Hetoimasia.Render.Api.Texture"
+               , "Hetoimasia.Render.Api.Texture.Backend"
                , "Hetoimasia.Content.ReadPool"
                , "Hetoimasia.Foundation.Time"
                , "Hetoimasia.Foundation.Log"
@@ -283,3 +328,4 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.Content.Inventory"
                ]
         || "Hetoimasia.Scripting.Lua." `isPrefixOf` name
+        || "Hetoimasia.Render.TwoD." `isPrefixOf` name
