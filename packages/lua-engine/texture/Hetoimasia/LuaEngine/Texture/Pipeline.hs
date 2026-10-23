@@ -515,6 +515,9 @@ data PipelineHooks = PipelineHooks
     -- ^ The decode worker took the job and has preflighted nothing.
   , hookDecoded ∷ !(ContentKey → IO ())
     -- ^ The level is decoded, charged to the lane and recorded on the job; the handoff is next.
+  , hookCancelling ∷ !(ContentKey → IO ())
+    -- ^ The host's telling that its interest in a job was withdrawn reached the pipeline, which has not
+    -- yet recorded it.
   , hookOffering ∷ !(ContentKey → IO ())
     -- ^ The job settled with a delivered texture, and the answer that offers it to the host has not yet
     -- decided: nothing about the texture was recorded as offered, claimed or adopted.
@@ -522,7 +525,7 @@ data PipelineHooks = PipelineHooks
 
 -- | No hooks.
 noHooks ∷ PipelineHooks
-noHooks = PipelineHooks (\_ → pure ()) (\_ → pure ()) (\_ → pure ())
+noHooks = PipelineHooks (\_ → pure ()) (\_ → pure ()) (\_ → pure ()) (\_ → pure ())
 
 -- | The numbers the pipeline was built with.
 pipelineSpec ∷ TexturePipeline → TextureSpec
@@ -1589,12 +1592,17 @@ settledAnswer tp jid job = case jCell job of
               OfferClaimed → () <$ jReply job (ProviderFailure "the texture pipeline stopped while the request was live")
               OfferMade → do
                 answer ← jReply job (ProviderResource (VRecord [("width", VInteger (fromIntegral width)), ("height", VInteger (fromIntegral height))]) (adoptionFor tp jid cell width height (jCharge job)))
+                -- Whatever the host did not take is the pipeline's to release: it answered a request that had
+                -- ended, or refused the value.
+                let declined = releaseCell tp cell
                 case answer of
-                  ReplyLate → releaseCell tp cell
-                  ReplyUnknown → releaseCell tp cell
-                  ReplyRefusedValue → latchDefect tp "the host refused a texture result" >> releaseCell tp cell
-                  ReplyDefective → latchDefect tp "the host found a texture result defective" >> releaseCell tp cell
-                  _ → pure ()
+                  ReplySettled → pure ()
+                  ReplyHeld → pure ()
+                  ReplyAdoption → pure ()
+                  ReplyRefusedValue → latchDefect tp "the host refused a texture result" >> declined
+                  ReplyDefective → latchDefect tp "the host found a texture result defective" >> declined
+                  ReplyLate → declined
+                  ReplyUnknown → declined
           ]
     | otherwise → pure [latchDefect tp "a texture was delivered for a job with no dimensions"]
   Nothing
@@ -1643,6 +1651,8 @@ releaseDeliveredCell tp jid = do
 -- retirement reading is.
 cancelJob ∷ TexturePipeline → JobId → IO ()
 cancelJob tp jid = do
+  key ← atomically (fmap jKey . Map.lookup jid . psJobs <$> readTVar (tpState tp))
+  mapM_ (hookCancelling (tpHooks tp)) key
   effects ← atomically $ do
     modifyState tp (\st → st {psJobs = Map.adjust (\job → job {jWithdrawn = True}) jid (psJobs st)})
     withdrawJob tp jid
