@@ -1537,8 +1537,13 @@ the service later, when a hook calls it; that includes a helper a module exporte
 hook stashed in the shared exports and a module's top level later reached for. The phase also covers the closing of a
 module's coroutine: the to-be-closed variables a failed module's coroutine runs when it is closed, and those of a
 suspended one the loader's stop closes, are the module's own code and run under it, so a guarded service is refused there
-as at the top level. The flag is put back as it was however the closing ends. Concrete facades and
-output bindings are installed by LFE-12; the phase is the integration point they use.
+as at the top level. The flag is put back as it was however the closing ends. The phase also says **which module** is running:
+`modulePhaseModule` answers the `ImportContext` (the identity the module was admitted under, and its label) of the frame whose
+code runs, from the loader's own record and never from anything a script said, for a segment of its top level, of a dependency
+it imported, and of the closing of its coroutine alike, and `Nothing` outside every module (a hook, a task). It is put back as it
+was, like the flag. An application's binding reads it to name the module that called it: `hetoimasia-lua-engine`'s facade
+attributes a `warn` made while a module is evaluated to that module. Concrete facades and output bindings are installed by
+LFE-12 in `hetoimasia-lua-engine`'s `facade` sublibrary, over this phase.
 
 ### Stop and what it leaves
 
@@ -1664,8 +1669,8 @@ they did.
 
 The content reads and file workers, the per-request module waiters, the atomic request and identity reservation, the source
 bank and an assigned-position settlement are the application's: `hetoimasia-lua-engine`'s module coordinator composes them over
-this loader and the [request admission](#atomic-request-admission) (LFE-11). The complete lexical-root, content, time and output
-facades (LFE-12); startup, session failure and quit policy (LFE-13); unavailable-state interception (LFE-26); hot reload, mods,
+this loader and the [request admission](#atomic-request-admission) (LFE-11). The lexical-root, content, time and output
+facades are `hetoimasia-lua-engine`'s (LFE-12), over the seams here; startup, session failure and quit policy (LFE-13); unavailable-state interception (LFE-26); hot reload, mods,
 hostile-code isolation and replay guarantees. The loader does not preempt a non-yielding module.
 
 ### What proves it
@@ -2545,13 +2550,23 @@ that work caused.
 A script waits through a wait operation the application registered with `waitOperation`:
 its first argument, an integer, is the number of ticks of a `WaitLogical` wait or the
 nanoseconds of a `WaitElapsed` one; anything else is read as none and refused by the
-scheduler as a wait for nothing, so the operation's schema should require one integer.
+scheduler as a wait for nothing, so the operation's schema should require one integer. A `WaitElapsed` wait for a count a Lua
+integer cannot hold (past 2^63 - 1 nanoseconds, through the 2^64 - 1 a `Duration` holds) takes **two** integers instead, the high
+and the low 32 bits of the count, each from 0 to 2^32 - 1 (`waitOperation "wait_wide" WaitElapsed [SInteger, SInteger]`); the
+single-integer form is unchanged, and anything else, a half out of range included, is read as none and refused. A deadline the
+clock cannot count is refused as a wait that cannot be represented; nothing wraps.
 `grantScheduledStep` and `requestTaskControl` are the scheduler's `grantStep` and
 `requestControl` for this owner. A resumed coroutine receives no value, so what the wait
 that ended earned (the tick reached and the granted duration, or the elapsed time) is told
 to the application on the owner's thread, before the segment that follows
 (`scheduledObserve`); a binding that should answer a script's question about its tick keeps
 what it was told where it reads it.
+
+`scheduledRefusedWait` is told, on the owner's thread, of each wait the scheduler refused (a `WaitRefusal`), once the turn that
+refused it has been accounted for: the task still failed and its instance still ended exactly as before, and the default does
+nothing. It is for an application whose own bindings check a wait before they suspend and so treat a refusal as the engine's fact
+(a clock that moved between the check and the placement): what it raises is a failure of the host and ends the owner as any
+other does.
 
 ### Waiting for the owner's accounting
 
@@ -2842,6 +2857,13 @@ rather than being dropped.
 callback)`, which connects a function to an event source the instance was granted (`instanceGrants`)
 and is a script error for any other. The event a callback receives is a table with `source`,
 `sequence`, `tick` and `payload`.
+
+**The segment notification.** `InstanceConfig`'s `instanceOnSegment` is told, on the owner's thread and just before the Lua runs,
+whose segment is about to begin: the instance's initialization (once, whether or not its behavior has an `init`), the first
+segment of an update, a callback or a `run`, every segment a wait resumes, and its `shutdown`. It runs no Lua, and what it raises is a
+failure of the host (the hook it was told of never runs). It is where an application samples what a script must read as the same
+throughout a segment: the Lua-first engine's facade takes the presentation clock's sample there. The default does nothing, and no
+existing caller is changed.
 
 ### One invocation at a time
 
@@ -3897,7 +3919,9 @@ owner and taken by it, as the leases are; of owners that start together exactly 
 holds it while its request exists. A handle that is another instance's, spent by a take, or never issued is refused
 by the value boundary before any action as a handle that has ended; the check reads the running instance, not
 anything a script supplied. `callerPhase` tells a precondition whether an instance is initializing, serving or
-ending: `wait` is for a serving instance, and an instance in `shutdown` is not taking requests.
+ending: `wait` is for a serving instance, and an instance in `shutdown` is not taking requests. `callerInstance` tells a binding **which** instance's code is running, by the `InstanceId` its
+owner issued, or `Nothing` for a module's top level, a task's segment or no Lua of an instance: the engine's reading, never a script's
+claim, so an application can tell an instance's own call from a facade another instance's code reached.
 
 ### Owners, threads and lifetimes of what this adds
 
@@ -4267,7 +4291,13 @@ with the visible marker `...` (counted in the bound), and any Lua string is acce
 invalid sequence replaced, is split at its line breaks, and has its control characters (an embedded NUL included) replaced by `\xNN`
 escapes, a tab excepted. The script cuts the text to the same number of bytes before it crosses, so the value boundary cannot refuse it for
 length, and the runner bounds what it writes again after decoding and escaping, which can make the text longer (a NUL byte becomes four
-characters, an invalid byte three).
+characters, an invalid byte three). The bounding and the escaping are `Hetoimasia.Scripting.Lua.Output`, shared with the Lua-first
+engine's facade (which rebinds `print` and `warn` for its own owners with an engine-made prefix on each `warn` line, counted in the
+same bound, and a smaller bound when a validated profile gives one): `authoredLines prefix bytes`, `authoredLinesWith limit`, and the
+Lua of the conversion and cut (`renderFunctionLines`). The runner's own output is exactly what it was. When a prefix is given, **every line begins with the whole prefix, the line a cut
+ends included**: the marker is appended to the last kept (prefixed) line, never a line of its own and never after a cut prefix; a
+bound too small to hold a prefix, the marker and a line end is the bound winning over the format. A call with no prefix is cut as
+the runner's output is.
 
 The rules for every write: a sink is handed one line at a time, with no line break and no control character in it but a tab; a script's
 text and every other text a script can influence (a name, an error, a traceback, a path) has its control characters replaced and is then cut
