@@ -717,7 +717,7 @@ withModuleCoordinator ∷ ModuleSpec → (Coordinator → IO a) → IO a        
 coordinatorPlan       ∷ Coordinator → LoaderPlan                           -- the owner's scheduledLoader
 coordinatorEndpoint   ∷ Coordinator → RequestEndpoint                      -- the grant's "module" endpoint
 attachLoader          ∷ Coordinator → LoaderEndpoint → IO ()               -- once, right after the owner starts
-startModule           ∷ Coordinator → ModuleRequest → RequestContext → IO () → IO ModuleStart
+startModule           ∷ Coordinator → ModuleRequest → RequestContext → IO () → IO M1Start
 moduleArgumentCheck   ∷ Coordinator → ([Value] → ModuleRequest) → ArgumentCheck
 bootModule            ∷ Coordinator → ContentKey → IO (Either BootRefusal BootTicket)
 lookupImmediate       ∷ Coordinator → ExportIdentity → STM ImmediateLookup
@@ -761,22 +761,41 @@ endpoint is handed anything and before a source is asked for; temporary pressure
 answer with no handle, read or partial reservation. A request that joins a held identity needs no identity slot (a full cache
 still answers lookups and joins) but still needs request capacity.
 
-The permanent decision is taken **with its reservation, in the argument check**: `moduleArgumentCheck` refuses a new identity at
-a full cache as an ordinary Lua error and otherwise holds the place for the request in one transaction, so a boot load that
-arrives before the admission finds the place taken and is the one refused (`BootCacheFull`), and the cache, which never frees a
-place, can never make an accepted request busy. The admission *adopts* that place (`reserveIdentitySTM`) instead of taking a
-second; `startModule` gives it back if the admission is busy on a temporary bank or raises (`releaseCheckSTM`), and answers
-`StartRefused` only for a call that skipped the check and met a full cache or a closed coordinator, which the caller fails as a
-fault of the call (the host does the same for a call that skipped its own permanent checks), never as a busy answer.
+The permanent decision is taken **where the place is actually taken**, by the identity credit of the admission, in the same
+transaction; **the argument check only reads and decides nothing about the cache**. `moduleArgumentCheck` is the host's check of
+the arguments and of what is visible about the caller (role, phase, offset, ceiling, request numbers), each an ordinary Lua error
+before any work; it neither reserves nor refuses on cache state, so a later check of the same binding that rejects leaves nothing
+behind and a place that goes to another thread at any moment is still refused as what it is. The credit (`reserveIdentitySTM`) tells
+three things apart:
 
-What can change decides the answer, on every path: a temporary bank (the instance's, the VM's or the owner's places, result
-storage, the unsettled boot loads) is `busy` with nothing reserved; what waiting cannot fix is a refusal made with its
-reservation (a new identity at a full cache, `BootCacheFull`, a closed coordinator, `BootClosed`), and a dependency the
-chain discovers at the limit fails the accepted chain (`module_limit`). `Limits` (`refusals told apart by what can change`)
-has an example of each, and of a call that skipped the check meeting each.
+* **room**: the place is held (counted per identity, and taken whole by the job's creation by whatever path: a request, a boot
+  load, a dependency the chain found);
+* **full for good**: the VM's permanent entries (pending, evaluating, ready and failed jobs) fill the 256, or the coordinator has
+  closed. The cache never frees a place, so the credit raises `CreditRefused` and the host refuses the request **before any bank is
+  asked**, as an ordinary catchable Lua error naming the module limit (a binding opted in to ordinary refusals, which the LFE-12
+  binding is: `pcall` catches it and the invocation can go on). No handle, job, read, hold or failed entry remains, it is not a fault of
+  the call, not the instance's failure and not busy, and it wins over a full temporary bank in the same transaction;
+* **room held only by other admissions' reservations**, which can still be given back: the credit answers `False`, which is the
+  host's `busy` with nothing reserved. A boot load meeting the same state is `BootBusy` (ask again); once the place is a permanent
+  job it is `BootCacheFull`.
 
-A new module at a full cache is **refused before any work**, as an ordinary catchable Lua error from `moduleArgumentCheck`
-(the host's own role, phase and offset checks run first), with no failed entry allocated. A dependency that a running module
+Temporary banks (the instance's 16 and the VM's 64 request places, the owner's places, result storage, the unsettled boot loads) are
+`busy`, data, with nothing reserved. `startModule` is therefore plain `startM1` (accepted or busy); a permanent refusal is the host's
+ordinary error, raised from inside the admission, and the facade's binding (LFE-12) owns only the Lua spelling. `Limits` has a gated
+example of each of these, in both orders of a boot load and a request racing for the last place.
+
+What can change decides the answer, on every path: a temporary bank is `busy`; what waiting cannot fix is a refusal (a new identity
+at a full cache, `BootCacheFull`, a closed coordinator, `BootClosed`), and a dependency the chain discovers at the limit fails the
+accepted chain (`module_limit`).
+
+The coordinator's loader plan (`coordinatorPlan`) **opts in to the host's failed-lookup latch**: its `hookObserved` answers the
+attributed failure, so a hook (or a helper a hook called) that `pcall`-imports an identity that has failed still fails its instance
+with the module's attributed failure, whatever it did with the error, and nothing fails when no instance's code is running (a task's
+lookup latches nothing). A plan that does not opt in keeps the ordinary catchable error. `Positions` proves all three through
+`coordinatorPlan` on a real scheduled owner.
+
+A new module at a full cache is **refused before any work**, as an ordinary catchable Lua error naming the module limit, with
+no failed entry allocated. A dependency that a running module
 discovers at the limit, or past the chain depth or the source limit, fails the **accepted** chain (`module_limit`,
 `too_large`), with the dependency given no entry and what the chain completed kept. Taking or cancelling a waiter never frees a
 permanent identity: nothing is evicted, restarted or retried. The room reserved for an accepted root counts against the
@@ -843,7 +862,7 @@ state, which refuses to republish, resurrect a waiter or reach the closed VM.
 
 | State | Owner and thread | Created / tracked | Bound | Cancellation windows | Terminal / released when | Proved by |
 | --- | --- | --- | --- | --- | --- | --- |
-| identity reservation (`csPromised`) | the coordinator; the admitting hook's thread | reserved by the request's argument check (`reserveForCheckSTM`) and adopted by the admission's identity credit, or reserved by the credit for a call that skipped the check | identities less held | busy on a temporary bank or an exception gives the check's place back (`releaseCheckSTM`); the admission taken back before the endpoint is handed anything | consumed whole by the job's creation, whichever path makes the job (a request, a boot load, a dependency the chain found), so an identity is never counted twice; or its own reservation returned by `CreditUnused` exactly once (reservations of one identity are counted, so one admission taken back never removes another's) | `Limits` (room promised to a boot load; promise turned into the boot load's job; dependency refused after an interleaved acceptance), `Stages` |
+| identity reservation (`csPromised`) | the coordinator; the admitting hook's thread | the admission's identity credit (`reserveIdentitySTM`); the argument check reserves nothing | identities less held | the admission taken back before the endpoint is handed anything | consumed whole by the job's creation, whichever path makes the job (a request, a boot load, a dependency the chain found), so an identity is never counted twice; or its own count returned by `CreditUnused` exactly once (reservations of one identity are counted, so one admission taken back never removes another's) | `Limits` (room promised to a boot load; promise turned into the boot load's job; dependency refused after an interleaved acceptance; both orders of a boot load and a request for the last place), `Stages` |
 | job entry (`csJobs`) | the coordinator; the owner's thread, with sinks and withdrawals in STM | `acceptRequest`, a boot load, or the loader asking for a dependency's source | 256 per VM, permanent | none: a job is never withdrawn | at the VM's end (`Stopped` if unfinished) | `Basics`, `Positions`, `Lifecycle` |
 | waiter | the job; created by the endpoint's submit | `acceptRequest`, atomically with the join | the request banks (16 per instance, 64 per VM) | cancel, instance end and publication, each once | replied or detached, whichever comes first; the host releases the request place after take and retirement | `Positions`, `Lifecycle` |
 | evaluation position (`jobDue`) | the job | the earliest contributed position | one per job | never moves later; promotion races cancellation | the job's outcome | `Positions`, `Promotion` |
