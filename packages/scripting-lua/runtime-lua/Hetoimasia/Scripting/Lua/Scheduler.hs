@@ -273,6 +273,7 @@ module Hetoimasia.Scripting.Lua.Scheduler
   , grantsAccepted
   , grantsFinished
   , retainsEvidence
+  , takeRefusedWaits
   , stepsOutstanding
   , awaitStepsComplete
   , readTick
@@ -771,6 +772,18 @@ grantsFinished scheduler = (\state → ssNextGrant state - fromIntegral (outstan
 -- | Whether the scheduler holds the failure of a close that no report has yet carried to
 -- the owner's end: cleanup evidence, fatal under every policy, which ends the owner
 -- as soon as its turn reports it.
+-- | Take the waits the scheduler refused since the last call, oldest first: the task, and why. The
+-- owner calls it at each boundary, first, so that a refusal it treats as fatal is dealt with at the
+-- boundary of the segment that caused it, before the boundary acknowledges anything and before another
+-- segment is chosen. A refused wait has already failed its task; this is notice, and not a second
+-- failure, and a report of the turn names it as well.
+takeRefusedWaits ∷ Scheduler v → STM [(TaskId, WaitRefusal)]
+takeRefusedWaits scheduler = do
+  state ← readTVar (schedState scheduler)
+  let (refused, next) = takeRefusals state
+  writeTVar (schedState scheduler) next
+  pure refused
+
 retainsEvidence ∷ Scheduler v → STM Bool
 retainsEvidence scheduler = (\state → not (null (ssEvidence state)) || not (null (ssDelivered state))) <$> readTVar (schedState scheduler)
 

@@ -25,9 +25,17 @@
 -- the runner's own output is, by 'boundLines', with the marker alone on a line when that is where the
 -- cut falls.) A bound too small to hold one prefix, the marker and a line end cannot give this, and the
 -- call is then the first @limit - 1@ bytes of the prefix and the marker, cut at a character: the bound
--- wins over the format, and the profiles the engine validates never give a bound that small.
+-- wins over the format. An application that needs the format validates its bound against what the
+-- format takes before it uses it (the Lua-first engine's facade does, when it is made).
+--
+-- = The least bound there is
+--
+-- A call that is cut ends in the marker and a line end, so no bound below 'minimumOutputLimit' can hold
+-- one: such a call writes nothing, and the Lua that cuts a call before it crosses keeps no more than the
+-- marker, never a negative number of bytes.
 module Hetoimasia.Scripting.Lua.Output
   ( outputCallLimit
+  , minimumOutputLimit
   , truncationMarker
   , authoredLines
   , authoredLinesWith
@@ -57,11 +65,17 @@ authoredLines = authoredLinesWith outputCallLimit
 -- what a validated smaller profile gives.
 authoredLinesWith ∷ Int → Text → ByteString → [Text]
 authoredLinesWith limit prefix bytes
+  | limit < minimumOutputLimit = []
   | Text.null safePrefix = boundLines limit bodies
   | otherwise = boundPrefixed limit safePrefix bodies
   where
     safePrefix = tameLine prefix
     bodies = map tameLine (Text.splitOn "\n" (Text.decodeUtf8With Text.lenientDecode bytes))
+
+-- | The smallest bound a call can be given: the marker and the line end that follows it. Below it nothing,
+-- not even a call that is cut, fits, and 'authoredLinesWith' writes nothing.
+minimumOutputLimit ∷ Int
+minimumOutputLimit = ByteString.length (Text.encodeUtf8 truncationMarker) + 1
 
 -- | These lines, each after the prefix, as a call may write them: in total at most this many bytes, a line
 -- counting its bytes and one more for its end. Lines that fit are returned. Otherwise the lines that fit
@@ -112,7 +126,11 @@ renderFunctionLinesWith limit =
   , "  local parts = {}"
   , "  for i = 1, select('#', ...) do parts[i] = tostring((select(i, ...))) end"
   , "  local text = prefix .. concat(parts, '\\t')"
-  , "  if #text > limit then text = sub(text, 1, limit - #marker) .. marker end"
+  , "  if #text > limit then"
+  , "    local keep = limit - #marker"
+  , "    if keep < 0 then keep = 0 end"
+  , "    text = sub(text, 1, keep) .. marker"
+  , "  end"
   , "  return text"
   , "end"
   ]

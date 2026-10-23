@@ -5,6 +5,7 @@ import qualified Test.LuaEngine.Facade.Authoring as Authoring
 import qualified Test.LuaEngine.Facade.Client as Client
 import qualified Test.LuaEngine.Facade.Clocks as Clocks
 import qualified Test.LuaEngine.Facade.Imports as Imports
+import qualified Test.LuaEngine.Facade.Limits as Limits
 import qualified Test.LuaEngine.Facade.Output as Output
 import qualified Test.LuaEngine.Facade.Ownership as Ownership
 import qualified Test.LuaEngine.Facade.Requests as Requests
@@ -25,3 +26,4 @@ spec = describe "Facade" $ do
   Sinks.spec
   Client.spec
   Validation.spec
+  Limits.spec

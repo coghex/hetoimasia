@@ -443,9 +443,10 @@ data ScheduledSpec = ScheduledSpec
     -- ^ Told, on the owner's thread, what each segment is about to be handed. An
     -- exception it raises is a failure of the host.
   , scheduledRefusedWait ∷ WaitRefusal → IO ()
-    -- ^ Told, on the owner's thread, of each wait the scheduler refused, once the turn that refused it
-    -- has been accounted for: the task still failed and its instance still ended, as they always did.
-    -- It is for an application whose own bindings check a wait before they suspend and so treat a
+    -- ^ Told, on the owner's thread, of each wait the scheduler refused, at the boundary of the segment
+    -- that asked for it and first there: before the boundary looks at an instance, a provider or the
+    -- loader, before it can acknowledge an accounting wait, and before the scheduler chooses another
+    -- segment. The task still failed and its instance still ends, as they always did. It is for an application whose own bindings check a wait before they suspend and so treat a
     -- refusal as the engine's fact (a clock that moved between the check and the placement). An
     -- exception it raises is a failure of the host. The default does nothing.
   , scheduledInstances ∷ Maybe InstanceConfig

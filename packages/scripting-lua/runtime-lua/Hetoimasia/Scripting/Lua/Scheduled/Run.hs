@@ -144,10 +144,11 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , StopReport (stopCloseFailures, stopTimerFailure)
   , TaskHost (..)
   , TaskRun (..)
-  , TurnReport (turnCloseFailures, turnRefusedWaits)
+  , TurnReport (turnCloseFailures)
   , WaitRefusal
   , awaitWork
   , retainsEvidence
+  , takeRefusedWaits
   , serviceTurnWith
   , stopScheduler
   )
@@ -378,6 +379,12 @@ serve stopping control handoff observe refused escalate config leaseHost owned =
       -- requests have settled are woken, the providers' accounts are polled, and the
       -- requesters whose tasks are gone are ended.
       let atBoundary = do
+            -- A wait the scheduler refused at the segment that just ended is dealt with first: the
+            -- application is told before this boundary looks at an instance, a provider or the loader,
+            -- before it can acknowledge an accounting wait, and before the scheduler chooses another
+            -- segment. What the application raises is a failure of the host and leaves the turn here,
+            -- so nothing later in the boundary or the turn acknowledges, dispatches or commits.
+            atomically (takeRefusedWaits scheduler) >>= mapM_ (refused . snd)
             instanceStep ← maybe (pure False) serviceBoundary instances
             requestStep ← forM provider $ \service →
               providerBoundary service scheduler (isJust instances) leaseHost extra (forM_ instances endOwner)
@@ -402,10 +409,6 @@ serve stopping control handoff observe refused escalate config leaseHost owned =
       mask_ $ do
         modifyIORef' kept (<> turnCloseFailures report)
         void (atomically (sweepForgotten control))
-      -- The application is told of each wait the turn refused, after the refused task and its instance
-      -- were accounted for and the turn's cleanup evidence was kept: what it raises is a failure of the
-      -- host, which ends the owner as any other does.
-      forM_ (turnRefusedWaits report) (refused . snd)
       halt ← atomically stopping
       retained ← (||) <$> (not . null <$> readIORef kept) <*> (not . null <$> readIORef extra)
       if halt || retained

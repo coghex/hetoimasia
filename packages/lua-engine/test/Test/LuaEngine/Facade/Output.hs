@@ -162,13 +162,14 @@ spec = describe "authored output" $ do
             last yarn `shouldSatisfy` Text.isSuffixOf "..."
             written (map (prefix <>) nulWarn) `shouldSatisfy` (<= 4096)
           (printed, warned) → expectationFailure ("expected six printed calls and two warned, found " <> show (length printed) <> " and " <> show (length warned))
-    withOneIn Gameplay (bytesOf [(PrintWarnBytes, 128)])
+    -- the least bound the facade is made over: a profile below it is refused (see "the bounds the facade formats with")
+    withOneIn Gameplay (bytesOf [(PrintWarnBytes, fromIntegral (minimumPrintWarnBytes 128))])
       script {scInit = ["print(string.rep('z', 1000))", "warn(string.rep('w', 1000))"]}
       files
       $ \world _ _ _ → do
         out ← outLines world
         err ← errLines world
-        (written out, written err) `shouldBe` (128, 128)
+        (written out, written err) `shouldBe` (minimumPrintWarnBytes 128, minimumPrintWarnBytes 128)
   it "marks every line of a warning with its whole prefix, however the call is cut: across a line break, in the first line, in a later one, and with many lines" $
     withOneIn Gameplay fixedM1Profile
       script

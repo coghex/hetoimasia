@@ -97,6 +97,9 @@ module Hetoimasia.LuaEngine.Facade
   , newFacade
   , facadeRole
   , facadeLimits
+  , minimumInstanceIdBytes
+  , minimumPrintWarnBytes
+  , minimumContextBytes
     -- * Instances
   , Declared (..)
   , DeclareRefused (..)
@@ -122,6 +125,7 @@ module Hetoimasia.LuaEngine.Facade
 
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, writeTVar)
 import Data.List (nub)
+import Data.Maybe (listToMaybe)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -131,7 +135,14 @@ import Hetoimasia.Content.Inventory (Inventory, inventoryIdentityLimits, invento
 import Hetoimasia.Foundation.Time (Duration)
 import Hetoimasia.LuaEngine.Behavior (exportLimits)
 import Hetoimasia.LuaEngine.Data (DataService, dataEndpoint)
-import Hetoimasia.LuaEngine.Facade.Bindings (callingIn, failEngine, warnPrefix)
+import Hetoimasia.LuaEngine.Facade.Bindings
+  ( callingIn
+  , failEngine
+  , minimumContextBytes
+  , minimumInstanceIdBytes
+  , minimumPrintWarnBytes
+  , warnPrefix
+  )
 import Hetoimasia.LuaEngine.Facade.Caller
   ( BindOutcome (..)
   , DeclareOutcome (..)
@@ -217,6 +228,10 @@ data FacadeRefused
     GameplayNeedsTickDuration
   | -- | No enabled root, or one that is not an identifier.
     RootsRefused ![Text]
+  | -- | A bound of the profile that is below what the facade's own formatting needs: the name of the
+    -- limit, the value the profile gave and the least it may be ('minimumInstanceIdBytes',
+    -- 'minimumPrintWarnBytes', 'minimumContextBytes').
+    LimitBelowFormatting !Text !Int !Int
   deriving (Eq, Show)
 
 -- | Make one VM's facade. It holds nothing that needs releasing: what it borrows belongs to the scopes
@@ -227,6 +242,7 @@ newFacade spec = case limits of
   Right found
     | fsRole spec == Gameplay && fsTickDuration spec == Nothing → pure (Left GameplayNeedsTickDuration)
     | null (fsRoots spec) || not (all validRootId (fsRoots spec)) → pure (Left (RootsRefused (fsRoots spec)))
+    | Just refused ← belowFormatting found → pure (Left refused)
     | otherwise → do
         registry ← newRegistry
         origin ← newTVarIO Nothing
@@ -266,6 +282,23 @@ newFacade spec = case limits of
     machine name value
       | value <= fromIntegral (maxBound ∷ Int) = Right (fromIntegral value)
       | otherwise = Left (FacadeLimitNotRepresentable name)
+    -- The context record is also four elements and one level deep; the profile's own relations keep the element
+    -- bound at 12 or more (a scene of one sprite) and every bound positive, so neither can be below it.
+    -- Every bound the facade formats with is checked against the least its own format needs, in this order,
+    -- and the first that is below it is the refusal. A profile below one could not keep the format the facade
+    -- promises (an identity that fits, a warning that names its writer on every line, a context the builder
+    -- can be handed), so no facade is made over it.
+    belowFormatting found =
+      listToMaybe
+        [ LimitBelowFormatting name given least
+        | (name, given, least) ←
+            [ ("InstanceIdBytes", limitInstanceIdBytes found, minimumInstanceIdBytes)
+            , ("PrintWarnBytes", limitPrintBytes found, minimumPrintWarnBytes (limitInstanceIdBytes found))
+            , ("CopiedValueBytes", copiedBytes, minimumContextBytes (limitInstanceIdBytes found))
+            ]
+        , given < least
+        ]
+    copiedBytes = let Bytes n = bytesLimit profile CopiedValueBytes in fromIntegral (min n (fromIntegral (maxBound ∷ Int)))
 
 -- | The VM's role.
 facadeRole ∷ Facade → Role

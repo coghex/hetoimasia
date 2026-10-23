@@ -10,7 +10,7 @@ import qualified Data.Text.Encoding as Text
 import Data.IORef (newIORef, readIORef)
 import Hetoimasia.Foundation.Log (LogEntry (entryComponent, entryMessage), componentText)
 import Hetoimasia.Scripting.Lua.Runner
-import Hetoimasia.Scripting.Lua.Output (authoredLines, authoredLinesWith, renderFunctionLines, renderFunctionLinesWith)
+import Hetoimasia.Scripting.Lua.Output (authoredLines, authoredLinesWith, minimumOutputLimit, renderFunctionLines, renderFunctionLinesWith)
 import Hetoimasia.Scripting.Lua.Runner.Internal (outputLines)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldContain, shouldNotContain, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Runner.Support
@@ -208,6 +208,18 @@ spec = describe "output" $ do
       let prefix = "a prefix of some length: "
       forM_ [1 .. 30] $ \limit →
         bytesOf (authoredLinesWith limit prefix "text\nmore") `shouldSatisfy` (<= limit)
+    it "has a least bound, the marker and a line end: under it nothing is written, at it the cut call is the marker alone, and no bound is exceeded" $ do
+      minimumOutputLimit `shouldBe` 4
+      forM_ [(-3) .. 3] $ \limit →
+        forM_ ["", "pfx: "] $ \prefix →
+          authoredLinesWith limit prefix "some text\nmore" `shouldBe` []
+      authoredLinesWith 4 "" "some text" `shouldBe` ["..."]
+      authoredLinesWith 4 "" "x" `shouldBe` ["x"]
+      forM_ [0 .. 40] $ \limit →
+        forM_ ["", "pfx: "] $ \prefix →
+          bytesOf (authoredLinesWith limit prefix "some text\nmore\nlines of it") `shouldSatisfy` (<= max 0 limit)
+      -- the Lua that cuts a call before it crosses never asks for a negative number of bytes
+      Text.unlines (renderFunctionLinesWith 1) `shouldSatisfy` Text.isInfixOf "if keep < 0 then keep = 0 end"
     it "bounds a call to a smaller limit when asked to, as a validated smaller profile does" $ do
       let ls = authoredLinesWith 100 "p: " (Text.encodeUtf8 (Text.replicate 500 "z"))
       bytesOf ls `shouldBe` 100

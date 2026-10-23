@@ -54,6 +54,7 @@ module Hetoimasia.Scripting.Lua.Scheduler.State
   , retainEvidence
   , deliverEvidence
   , acknowledgeEvidence
+  , takeRefusals
 
     -- * Time
   , settleGrants
@@ -296,6 +297,10 @@ data SchedState v = SchedState
   , ssPhase ∷ !Phase
   , ssCounts ∷ !Diagnostics
   , ssSites ∷ !(Map (TaskKind, Text) Int)
+  , ssRefusals ∷ !(Seq (TaskId, WaitRefusal))
+    -- ^ The waits refused since the owner last looked, oldest first. They are kept here, in the transaction
+    -- that refuses them, so that the owner can deal with a refusal at the boundary of the segment that
+    -- caused it, before it acknowledges anything or lets another task run; a turn's report names them too.
   , ssEvidence ∷ !(Seq (TaskId, SomeException))
     -- ^ Failures of closes that have been made and not yet reported: kept here,
     -- not in a turn's local accumulator, so an exception that ends the turn cannot
@@ -373,6 +378,7 @@ initialState label session =
           , diagTick = 0
           }
     , ssSites = Map.empty
+    , ssRefusals = Seq.empty
     , ssEvidence = Seq.empty
     , ssDelivered = Seq.empty
     , ssToClose = Set.empty
@@ -506,6 +512,10 @@ retainEvidence failures state = state {ssEvidence = foldl' (|>) (ssEvidence stat
 deliverEvidence ∷ SchedState v → ([(TaskId, SomeException)], SchedState v)
 deliverEvidence state =
   (toList (ssEvidence state), state {ssEvidence = Seq.empty, ssDelivered = ssEvidence state})
+
+-- | Take the waits refused since the last look, oldest first.
+takeRefusals ∷ SchedState v → ([(TaskId, WaitRefusal)], SchedState v)
+takeRefusals state = (toList (ssRefusals state), state {ssRefusals = Seq.empty})
 
 -- | A new turn has started, so the last report was received.
 acknowledgeEvidence ∷ SchedState v → SchedState v
@@ -738,7 +748,8 @@ applyReport identity reading report state = case report of
 
     refuse why =
       let failure = TaskFailure (failureReason ValidationFault ("wait refused: " <> refusalText why)) RecoverySafe
-       in ( counting (\counts → counts {diagRefusedWaits = bump (diagRefusedWaits counts)}) (failTaskIn True identity failure state)
+          failed = counting (\counts → counts {diagRefusedWaits = bump (diagRefusedWaits counts)}) (failTaskIn True identity failure state)
+       in ( failed {ssRefusals = ssRefusals failed |> (identity, why)}
           , [WaitRefused identity why, Failed identity failure]
           )
 

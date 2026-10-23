@@ -29,6 +29,7 @@ module Test.LuaEngine.Facade.Support
   , advanceClock
   , setClockStep
   , setFacadeLag
+  , attemptFvm
   , failReports
   , setTickOverride
   , holdSink
@@ -99,7 +100,7 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, fromException, throwIO, tryWithContext)
+import Control.Exception (Exception, ExceptionWithContext (ExceptionWithContext), SomeException, catch, finally, fromException, throwIO, tryWithContext)
 import Control.Monad (forM_, join, replicateM_, void, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
@@ -444,7 +445,23 @@ requiredPolicy = WorkerPolicy Supervision.Service Supervision.Required (unsafeCo
 -- injected with the world's controlled endpoints, and an owner that carries it. The coordinator is
 -- closed and the owner stopped however the body ends.
 withFvm ∷ World → LuaRuntime → VmShape → (Fvm → IO a) → IO a
-withFvm world runtime shape body = do
+withFvm world runtime shape body =
+  withFvmRefusing world runtime shape body `catch` \(RefusedFacade refused) → assertFailure ("the facade was refused: " <> show refused)
+
+-- | What making a facade over this world's profile comes to, without an example's body: the refusal, or that a
+-- VM of this shape was made and its owner started and stopped.
+attemptFvm ∷ World → LuaRuntime → VmShape → IO (Either FacadeRefused ())
+attemptFvm world runtime shape =
+  (Right <$> withFvmRefusing world runtime shape (\_ → pure ())) `catch` \(RefusedFacade refused) → pure (Left refused)
+
+-- | A facade the profile does not allow, as an exception only 'withFvm' and 'attemptFvm' ever see.
+newtype RefusedFacade = RefusedFacade FacadeRefused
+  deriving (Show)
+
+instance Exception RefusedFacade
+
+withFvmRefusing ∷ World → LuaRuntime → VmShape → (Fvm → IO a) → IO a
+withFvmRefusing world runtime shape body = do
   handles ← newRequestHandles
   requests ← either (\refused → assertFailure ("the profile was refused: " <> show refused)) pure (m1Requests profile handles)
   phase ← newModulePhase
@@ -492,7 +509,7 @@ withFvm world runtime shape body = do
           , fsIds = wIds world
           , fsTickDuration = tickDuration
           }
-        >>= either (\refused → assertFailure ("the facade was refused: " <> show refused)) pure
+        >>= either (throwIO . RefusedFacade) pure
     let base = (vmProfileConfig LibraryProfileM1) {vmOwnerName = "facade-" <> roleText}
     config ← either (\refused → assertFailure ("the facade was not installed: " <> show refused)) pure (installFacade facade [] [] base)
     let grant = RequestGrant (facadeRequestEndpoints facade) 64 (if shRole shape == Gameplay then SettleAtAssignedTick Nothing else SettleOnArrival)
