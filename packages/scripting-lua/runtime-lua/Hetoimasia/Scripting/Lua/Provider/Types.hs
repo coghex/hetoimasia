@@ -796,6 +796,10 @@ data Ticks = Ticks
   , ticksOwe ∷ Word64 → STM ()
     -- ^ The owner needs one more thing finished before this tick is complete: the grant that reaches it stays open.
   , ticksOweRelease ∷ Word64 → STM ()
+  , ticksQuiet ∷ Word64 → STM Bool
+    -- ^ Whether the scheduler stands at the boundary just before this tick: everything before it has
+    -- finished and it has not begun (or it is past, or zero). Where the owner starts the work it holds
+    -- the tick for.
   , ticksWatch ∷ Word64 → STM ()
   , ticksOpen ∷ STM Bool
   , ticksTaskGone ∷ TaskId → STM Bool

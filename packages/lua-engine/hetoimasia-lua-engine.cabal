@@ -113,6 +113,41 @@ library data
         hetoimasia-scripting-lua ==0.1.0.0,
         hetoimasia-scripting-lua:runtime-lua
 
+-- The M1 module-job coordinator (LFE-11): one VM-owned load job for each module, the waiters that
+-- join it and receive its outcome at their own assigned positions, and the source stage that feeds
+-- it from the session's pool of verified reads. It is a sublibrary of its own, in a source directory
+-- of its own, for the reason the request adapter is: the library is the pure configuration boundary
+-- and imports nothing that performs IO, and this does. It depends on the request adapter for the
+-- policy, on the content package for the inventory and the pool, and on the host's public runtime
+-- modules for the loader and the provider surface. It imports no module of a game, a window, a GPU or
+-- the console, and installs nothing in a VM.
+library modules
+    import: language
+    visibility: public
+    default-extensions: OverloadedStrings
+    hs-source-dirs: modules
+    exposed-modules:
+        Hetoimasia.LuaEngine.Modules
+    other-modules:
+        Hetoimasia.LuaEngine.Modules.Address
+        Hetoimasia.LuaEngine.Modules.Bank
+        Hetoimasia.LuaEngine.Modules.Failure
+        Hetoimasia.LuaEngine.Modules.State
+        Hetoimasia.LuaEngine.Modules.Types
+        Hetoimasia.LuaEngine.Modules.Wiring
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-content ==0.1.0.0,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-lua-engine ==0.1.0.0,
+        hetoimasia-lua-engine:request,
+        hetoimasia-scripting-lua ==0.1.0.0,
+        hetoimasia-scripting-lua:runtime-lua
+
 -- This package's own contracts, registered as the CPU validation group
 -- `test.lua-engine`. Hspec is the suite's alone.
 test-suite lua-engine-tests
@@ -135,6 +170,9 @@ test-suite lua-engine-tests
         Test.LuaEngine.Manifest.Schema
         Test.LuaEngine.Manifest.Syntax
         Test.LuaEngine.Manifest.Tick
+        Test.LuaEngine.Modules.Basics
+        Test.LuaEngine.Modules.Spec
+        Test.LuaEngine.Modules.Support
         Test.LuaEngine.Profile
         Test.LuaEngine.Request.Contract
         Test.LuaEngine.Request.Failure
@@ -154,6 +192,7 @@ test-suite lua-engine-tests
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-lua-engine ==0.1.0.0,
         hetoimasia-lua-engine:data,
+        hetoimasia-lua-engine:modules,
         hetoimasia-lua-engine:request,
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-scripting-lua ==0.1.0.0,

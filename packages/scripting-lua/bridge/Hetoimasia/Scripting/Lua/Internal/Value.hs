@@ -124,6 +124,11 @@ data Value
   | -- | A record: field names and their values.
     VRecord ![(Text, Value)]
   | VCapability !Capability
+  | -- | The export table a VM keeps in this export slot (LFE-11). Not a copy: when it
+    -- crosses into Lua the very table the VM holds is pushed, on the owner, so functions,
+    -- cycles and shared upvalues stay as they are. It is a name for a slot of one VM, checked
+    -- against the VM that builds it and against the slot being held; Lua never reads one back.
+    VExportTable !VmIdentity !Int
   deriving (Eq, Show)
 
 -- | What a value is declared to be.
@@ -146,6 +151,8 @@ data Schema
     SOptional Schema
   | -- | A capability of the application type of this name.
     SCapability Text
+  | -- | The export table of a module the VM holds, by reference (see 'VExportTable').
+    SExportTable
   deriving (Eq, Show)
 
 -- | How deeply a schema nests: a scalar is 0.
@@ -405,6 +412,7 @@ describeSchema = \case
   SRecord _ → "record"
   SOptional inner → "optional " <> describeSchema inner
   SCapability name → "capability " <> name
+  SExportTable → "export table"
 
 describeValue ∷ Value → Text
 describeValue = \case
@@ -417,6 +425,7 @@ describeValue = \case
   VList _ → "list"
   VRecord _ → "record"
   VCapability capability → "capability " <> capabilityTypeName capability
+  VExportTable {} → "export table"
 
 -- | Check a copy the reader made against a schema, and read it as a 'Value'.
 --
@@ -519,6 +528,9 @@ conformValue context = go []
         | otherwise → case contextTypeNumber context expected of
             Just _ → Right ()
             Nothing → Left (reverse path, RuleUnknownCapability expected)
+      -- Whose table it is is checked where it crosses into Lua ('encodeValues'), the one place that
+      -- knows the VM; a reply is checked here without one.
+      (SExportTable, VExportTable {}) → Right ()
       _ → wrong path schema value
 
 -- | Whether values are within the limits, stopping at the first one passed. The
@@ -558,6 +570,7 @@ valuesFootprint limits values = fst <$> foldM (\acc value → walk 1 value acc) 
       VBytes bytes → 5 + ByteString.length bytes
       VText text → 5 + lengthWord8 text
       VCapability _ → 21
+      VExportTable {} → 9
       VNil → 1
       VBoolean _ → 1
       _ → 9
@@ -603,6 +616,10 @@ encodeOne context limits depth = \case
     number ← maybe (Left (RuleUnknownCapability (capabilityTypeName capability))) Right (contextTypeNumber context (capabilityTypeName capability))
     let VmIdentity identity = issuer
     Right (Builder.word8 0x07 <> Builder.word64LE identity <> Builder.word32LE number <> Builder.word64LE (capabilityKey capability), 21, 1)
+  VExportTable issuer slot
+    | issuer /= contextVm context → Left RuleForeignHandle
+    | slot < 0 → Left (RuleUnsupportedType "export table")
+    | otherwise → Right (Builder.word8 0x08 <> Builder.word64LE (fromIntegral slot), 9, 1)
   where
     isNil = \case
       VNil → True

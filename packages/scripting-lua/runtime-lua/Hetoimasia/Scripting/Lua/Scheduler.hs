@@ -252,6 +252,7 @@ module Hetoimasia.Scripting.Lua.Scheduler
   , oweTick
   , releaseOwed
   , tickIsOwed
+  , tickQuietBefore
   , watchKey
   , watchTick
   , setWatch
@@ -585,6 +586,13 @@ oweTick scheduler tick = modifyTVar' (schedState scheduler) (oweTickIn tick)
 -- changes nothing.
 releaseOwed ∷ Scheduler v → Word64 → STM ()
 releaseOwed scheduler tick = modifyTVar' (schedState scheduler) (releaseOwedIn tick)
+
+-- | Whether the scheduler stands at the boundary just before this tick: every tick before it has
+-- begun and finished and nothing is ready or waiting to start. With 'holdTick' on the tick that is
+-- where the owner runs the work that must be complete before the tick begins (a module job due in
+-- it); a tick that has begun already, and tick zero, answer 'True'. Reads, and changes nothing.
+tickQuietBefore ∷ Scheduler v → Word64 → STM Bool
+tickQuietBefore scheduler tick = tickQuietIn tick <$> readTVar (schedState scheduler)
 
 -- | Whether the owner needs something finished before this tick is complete.
 tickIsOwed ∷ Scheduler v → Word64 → STM Bool

@@ -177,6 +177,7 @@ module Hetoimasia.Scripting.Lua.Owner
   , defaultExportLimits
   , maxExportIdentityBytes
   , ExportHandle
+  , exportTableValue
   , ExportOutcome (..)
   , evaluateExport
   , retrieveExport
@@ -193,8 +194,11 @@ module Hetoimasia.Scripting.Lua.Owner
   , newModulePhase
   , modulePhaseActive
   , RootRequest (..)
+  , RootOrder (..)
+  , arrivalOrder
   , RootAdmission (..)
   , RootRefusal (..)
+  , RootPromotion (..)
   , SourceDelivery (..)
   , ModuleStatus (..)
   , Blocked (..)
@@ -202,6 +206,8 @@ module Hetoimasia.Scripting.Lua.Owner
   , StopReport (..)
   , LoaderCounts (..)
   , admitRoot
+  , admitRootAt
+  , promoteRoot
   , deliverSource
   , advanceLoader
   , lookupModule
@@ -315,12 +321,15 @@ import Hetoimasia.Scripting.Lua.Internal.LoaderTypes
   , ModuleStatus (..)
   , ResolvedAddress (..)
   , RootAdmission (..)
+  , RootOrder (..)
+  , RootPromotion (..)
   , RootRefusal (..)
   , RootRequest (..)
   , SourceAnswer (..)
   , SourceDelivery (..)
   , SourceSupplier (..)
   , StopReport (..)
+  , arrivalOrder
   , loaderConfig
   , modulePhaseActive
   , newModulePhase
@@ -339,6 +348,7 @@ import Hetoimasia.Scripting.Lua.Internal.ExportTypes
   , ExportSource (..)
   , Hook (..)
   , defaultExportLimits
+  , exportTableValue
   , maxExportIdentityBytes
   )
 import Hetoimasia.Scripting.Lua.Internal.Library (Library (..), LibraryProfile (..), profileLibraries)
@@ -613,6 +623,20 @@ loaderOf owned = case ownedLoader owned of
 -- after the roots already admitted. The owner's thread only.
 admitRoot ∷ HasCallStack ⇒ OwnedVm → RootRequest → IO RootAdmission
 admitRoot owned request = loaderOf owned >>= (`Loader.admitRoot` request)
+
+-- | 'admitRoot' for a root the coordinator has placed: it starts when no root with an earlier
+-- order is waiting, equal orders in the order admitted, whatever order the sources arrived in.
+-- @reserved@ says the application reserved room for the identity when it accepted the root
+-- ('loaderReserved'), so the identity bound is not asked again. The owner's thread only.
+admitRootAt ∷ HasCallStack ⇒ OwnedVm → RootRequest → RootOrder → Bool → IO RootAdmission
+admitRootAt owned request order reserved = loaderOf owned >>= \loader → Loader.admitRootAt loader request order reserved
+
+-- | Ask for a pending or evaluating identity to start no later than this order: queue it there
+-- if it was only a dependency, move it up if it was queued later, leave it alone if it stands
+-- there or earlier. Never later, never a second record, source interest or evaluation. The
+-- owner's thread only.
+promoteRoot ∷ HasCallStack ⇒ OwnedVm → ExportIdentity → RootOrder → IO RootPromotion
+promoteRoot owned identity order = loaderOf owned >>= \loader → Loader.promoteRoot loader identity order
 
 -- | Deliver the verified source, or the failure, the supplier found for an identity
 -- the loader asked about. It evaluates nothing: advance the loader. A delivery after the

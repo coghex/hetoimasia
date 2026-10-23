@@ -401,6 +401,7 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , holdTick
   , newScheduler
   , oweTick
+  , tickQuietBefore
   , readDiagnostics
   , readTick
   , releaseOwed
@@ -706,6 +707,7 @@ ticksFor scheduler stopping =
     , ticksRelease = releaseTick scheduler
     , ticksOwe = oweTick scheduler
     , ticksOweRelease = releaseOwed scheduler
+    , ticksQuiet = tickQuietBefore scheduler
     , ticksWatch = watchTick scheduler
     , ticksOpen = do
         closed ← schedulerClosed scheduler
