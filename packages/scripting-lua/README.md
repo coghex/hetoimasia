@@ -1022,6 +1022,11 @@ raised and uncaught it is the script's own error, reported where any is reported
 or instance's existing policy. There is no `BoundaryFault` and nothing retained on the VM
 for it.
 
+One refusal is ordinary though it is made after the action began: a credit of a request admission that says it is full for good
+([`CreditRefused`](#what-asking-reserves)). The engine raises it from inside `startAdmitted`, before it has any effect, as
+`OrdinaryCallRefusal`; an opted-in binding's handler answers it with the same ordinary error (`binding: request refused: WHY`),
+and a binding that is not opted in keeps the fault of the call. Nothing else the action does becomes recoverable.
+
 **No action.** A refused call never ran its action: no provider or native work, no
 request accepted, no resource published, and the action counter of the examples stays at
 zero. It is not a rollback: what the same invocation's earlier Lua and earlier actions did
@@ -3755,7 +3760,7 @@ records are [`hetoimasia-lua-engine`'s](../lua-engine/README.md#the-m1-request-a
 | Accepted, unretired requests of the VM | the same ledger | the same entry | busy (`BankVmRequests`) |
 | The owner's places (the grant's bound) | every request's place at once: the same ledger, the model's outstanding requests and the cancelled results a generic request left untaken, each request counted once (`ownerPlaces`) | the same entry | busy (`BankOwnerRequests`) |
 | A result lease | `Leases`, the instance's lease capacity | `reserve`: a slot in `SlotConstructing` with the key the handle will have | busy (`BankLeases`) |
-| Provider credits | the provider's own STM variables | each `Credit`'s `creditReserve`, in the order declared | busy (`BankCredit`) |
+| Provider credits | the provider's own STM variables | each `Credit`'s `creditReserve`, in the order declared | busy (`BankCredit`), or, for a credit that raises `CreditRefused`, a final refusal decided before any bank (below) |
 | The due position, for an owner on logical time | the scheduler's tick | `DueSlot (tick + offset) (request number)`, and the owner's hold on that tick | permanent refusal |
 
 A bank without room, or a permanent fact, raises inside the transaction and `catchSTM` undoes everything reserved
@@ -3764,13 +3769,16 @@ instance has no latent failure. That is the whole mechanism: no capacity is quer
 caught and relabelled, and no retry is queued. The order of the decisions is the contract: the owner or requester is
 not taking requests, the requester is a task, the request numbers are exhausted, an offset on an owner on arrival,
 an offset that is not positive, a tick and offset past the ceiling, a position that has begun, then the banks in the
-table's order. A credit that retries is full (`orElse`), so a provider's bank can never make the admission wait.
+table's order, except one thing: a credit that says it can **never** be had (`CreditRefused`, below) is asked first, with
+everything it wrote undone, so that a full temporary bank is never the answer to a request that waiting cannot help. A credit that retries is full
+(`orElse`), so a provider's bank can never make the admission wait.
 
 Classification, which the tests pin separately:
 
 | What | Answer |
 | --- | --- |
 | A temporary bank is full | `Unavailable bank`: data. The binding hands the script `nil, {code="busy", message=TEXT}`. Never an error, never the instance's failure; a later call may succeed |
+| A credit that is full **for good** (nothing will ever return a place: a permanent bank that is exhausted) | the credit raises `CreditRefused why` from `creditReserve` (with `throwSTM`), in the transaction that would have taken the place. The admission is refused **finally and not as a fault**: `startAdmitted` raises `OrdinaryCallRefusal`, which a binding opted in to ordinary refusals ([`recoverableRefusals`, `withPrecondition`, `withArgumentCheck`](#recoverable-refusals)) shows as an ordinary Lua error `binding: request refused: WHY` (bounded to `refusalReasonBytes` = 256) that `pcall` catches and an invocation that caught it can go on from, recording nothing on the VM; for a binding that is not opted in it is the fault of the call, as any `RequestRefusal`. Nothing is reserved, nothing reaches the provider and no latent failure is left; it is decided before any bank is asked, so it wins over a full temporary bank. A credit that answers `False` is a bank that may empty: busy data, as before. A credit that never raises `CreditRefused` behaves exactly as it did |
 | A permanent fact (wrong requester, closing, offset, ceiling, exhausted numbers, no lease scope) | `RequestRefusal`, a fault of the call raised before anything was reserved. A binding that wants an ordinary Lua error asks `preflightAdmission` in a [`withArgumentCheck`](#recoverable-refusals), which decides the same facts and reserves nothing |
 | The engine cannot keep its bookkeeping consistent after a valid admission (`AdmissionDefect`: the request counter has no number after the last, a result lease reserved with no way to hand its handle to the script) | a failure of the host, raised from the transaction; nothing is reserved |
 | A bank, provider or assignment that raises | the application's own failure, with its type; nothing is reserved. A provider that raises when handed the request is taken back whole, and a credit release that then raises is kept beside it |
