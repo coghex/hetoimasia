@@ -458,6 +458,7 @@ module Hetoimasia.Scripting.Lua.Instance
   , waitInstance
   , awaitInstance
   , forgetInstance
+  , releaseHeldInstance
   , InstanceSettlement (..)
   , LeaseOutcome (..)
   , InstanceOutcome (..)
@@ -649,6 +650,12 @@ awaitInstance ∷ HasCallStack ⇒ RuntimeControl → InstanceTicket → IO Inst
 awaitInstance supervision ticket = do
   refuseCallbackWait "await-instance"
   awaitSupervised supervision (State.observeInstance ticket >>= maybe retry pure)
+
+-- | Release an instance that 'instanceHoldInit' held after its construction: its @init@ begins on the
+-- owner's thread, in its turn among the owner's jobs. An instance that was not held, was released already or
+-- has ended takes nothing from it, so it is safe to repeat.
+releaseHeldInstance ∷ InstanceTicket → IO ()
+releaseHeldInstance = atomically . State.releaseHeld
 
 -- | Withdraw interest in an instance's result. An ended instance gives its
 -- reservation back now, a live one when it ends.

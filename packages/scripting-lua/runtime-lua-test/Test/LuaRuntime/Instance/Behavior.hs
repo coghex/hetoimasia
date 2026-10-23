@@ -19,7 +19,7 @@ import qualified Data.Text as Text
 import Data.IORef (atomicModifyIORef')
 import Data.Word (Word64)
 import qualified Data.Text.Encoding as Text
-import Hetoimasia.Runtime.Supervision (RuntimeControl)
+import Hetoimasia.Runtime.Supervision (RuntimeControl, WorkerStatus (WorkerStopped))
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Scheduled
@@ -98,6 +98,19 @@ withNotified exports body = do
   withBoundaryOpening [openAllGates fixture] $ \control runtime → do
     let told found = atomicModifyIORef' (sfLog (sf fixture)) (\held → (("segment " <> Text.pack (show (instanceLocal found))) : held, ()))
         config = (testConfig instanceBounds') {instanceOnSegment = told}
+        base = instanceSpec fixture "behavior" [] config requiredPolicy defaultSchedulerBounds
+        spec' = base {scheduledVm = (scheduledVm base) {vmExports = exports, vmExportLimits = defaultExportLimits}}
+    owner ← startWith fixture runtime spec'
+    body fixture control owner
+
+-- | An owner whose instances are held after their construction until the example releases them, telling the
+-- log which instance was held, over a body.
+withHolding ∷ [ExportSource] → (IFixture → RuntimeControl → ScheduledOwner → IO a) → IO a
+withHolding exports body = do
+  fixture ← newIFixture
+  withBoundaryOpening [openAllGates fixture] $ \control runtime → do
+    let held found = True <$ atomicModifyIORef' (sfLog (sf fixture)) (\entries → (("held " <> Text.pack (show (instanceLocal found))) : entries, ()))
+        config = (testConfig instanceBounds') {instanceHoldInit = held}
         base = instanceSpec fixture "behavior" [] config requiredPolicy defaultSchedulerBounds
         spec' = base {scheduledVm = (scheduledVm base) {vmExports = exports, vmExportLimits = defaultExportLimits}}
     owner ← startWith fixture runtime spec'
@@ -330,6 +343,57 @@ spec = describe "M1 behavior instances" $ do
         awaitScheduledTerminal control owner
       raised `shouldSatisfy` brokenIs "notification"
       logged fixture >>= (`shouldBe` [])
+
+  describe "an instance held after its construction" $ do
+    let selfEditing =
+          exportOf
+            "selfediting"
+            [ "local behavior"
+            , "behavior = {"
+            , "  every_ticks = 1,"
+            , "  init = function(self, api)"
+            , "    " <> record <> "('init ' .. api.name)"
+            , "    behavior.every_ticks = 0"
+            , "  end,"
+            , "  update = function() end,"
+            , "}"
+            , "return { gameplay = behavior }"
+            ]
+    it "validates every instance it holds before any of them runs, then begins each when released, in the order the application chose" $ bounded $
+      withHolding [selfEditing] $ \fixture _ owner → do
+        a ← admitBehavior fixture owner "a" (requestFor "selfediting" "gameplay" (facadeNamed "alpha") logicalRule)
+        b ← admitBehavior fixture owner "b" (requestFor "selfediting" "gameplay" (facadeNamed "beta") logicalRule)
+        awaitEffect (sf fixture) "held 2"
+        -- Both were constructed and validated, and neither has run a line of its own.
+        logged fixture >>= (`shouldBe` ["held 1", "held 2"])
+        phaseOf fixture owner "a" >>= (`shouldBe` Just Initializing)
+        phaseOf fixture owner "b" >>= (`shouldBe` Just Initializing)
+        releaseHeldInstance a
+        awaitPhase fixture owner "a" Active
+        -- The first one's init edits the behavior table; the one behind it captured it before that, so it is valid.
+        releaseHeldInstance b
+        awaitPhase fixture owner "b" Active
+        logged fixture >>= (`shouldBe` ["held 1", "held 2", "init alpha", "init beta"])
+        -- Releasing again, or an instance that was never held, changes nothing.
+        releaseHeldInstance a
+        logged fixture >>= (`shouldBe` ["held 1", "held 2", "init alpha", "init beta"])
+
+    it "settles an instance still held as stopped when its owner is stopped, with no init run and none of its hooks entered" $ bounded $
+      withHolding [selfEditing] $ \fixture control owner → do
+        _ ← admitBehavior fixture owner "a" (requestFor "selfediting" "gameplay" (facadeNamed "alpha") logicalRule)
+        awaitEffect (sf fixture) "held 1"
+        retireScheduled owner
+        awaitScheduledTerminal control owner >>= (`shouldSatisfy` \case WorkerStopped → True; _ → False)
+        settled ← awaitSettled fixture "a"
+        resultOutcome settled `shouldSatisfy` \case InstanceStopped → True; _ → False
+        terminationShutdown (resultTermination settled) `shouldBe` ShutdownSkippedNoInit
+        logged fixture >>= (`shouldBe` ["held 1"])
+
+    it "does not hold an instance by default: the instance begins as soon as it is constructed" $ bounded $
+      withDefaults [selfEditing] $ \fixture _ owner → do
+        _ ← admitBehavior fixture owner "a" (requestFor "selfediting" "gameplay" (facadeNamed "alpha") logicalRule)
+        awaitPhase fixture owner "a" Active
+        logged fixture >>= (`shouldBe` ["init alpha"])
 
   describe "facades" $ do
     it "injects a facade whose closures are bound to its own instance, built per instance by an export module's function, the same table in init and self.api" $ bounded $

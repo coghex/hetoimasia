@@ -474,6 +474,10 @@ drainBacklog ih restore = do
   where
     run = \case
       JobStart number → withCell ih number (startInstance ih)
+      JobResumeInit number → withCell ih number $ \cell → do
+        begin ← atomically (swapTVar (icHeldInit cell) Nothing)
+        state ← readTVarIO (icState cell)
+        forM_ begin $ \continue → unless (isStopped state) continue
       JobDispatch number → withCell ih number $ \cell → do
         atomically (modifyTVar' (icState cell) (\state → state {isDispatchQueued = False}))
         dispatch ih cell
@@ -698,6 +702,14 @@ startBehavior ih cell behavior = do
       where
         shape = capturedShape capture
     initialize driver capture kind cadence = do
+      -- The application may hold an instance here, the behavior valid and nothing authored run, until it has
+      -- seen every instance it admitted come this far: the owner goes on to the instances behind it, and the
+      -- held one begins when it is released, in its turn among the jobs.
+      held ← insHoldInit (ihInstances ih) (InstanceId (controlOwner (ihControl ih)) (icId cell))
+      if held
+        then atomically (writeTVar (icHeldInit cell) (Just (begin driver capture kind cadence)))
+        else begin driver capture kind cadence
+    begin driver capture kind cadence = do
       let shape = capturedShape capture
       -- An instance's initialization begins here whether or not its behavior has an @init@, so the
       -- application is told once, here, and not when a hook is entered.

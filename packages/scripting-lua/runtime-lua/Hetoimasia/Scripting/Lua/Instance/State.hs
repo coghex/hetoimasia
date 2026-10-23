@@ -32,6 +32,7 @@ module Hetoimasia.Scripting.Lua.Instance.State
   , settleInstance
   , takeJobs
   , awaitJobs
+  , releaseHeld
   ) where
 
 import Control.Concurrent.STM (STM, modifyTVar', newTVar, readTVar, retry, writeTVar)
@@ -115,6 +116,7 @@ admitCell instances gate owner behavior request = do
           forgotten ← newTVar False
           released ← newTVar False
           held ← forM behavior $ \wanted → BehaviorCell wanted <$> newTVar Nothing
+          heldInit ← newTVar Nothing
           let cell =
                 ICell
                   { icId = number
@@ -129,6 +131,7 @@ admitCell instances gate owner behavior request = do
                   , icForgotten = forgotten
                   , icReleased = released
                   , icBehavior = held
+                  , icHeldInit = heldInit
                   }
           modifyTVar' (insCells instances) (Map.insert number cell)
           writeTVar (insLive instances) (live + 1)
@@ -360,6 +363,15 @@ settleInstance instances cell settlement =
       forgotten ← readTVar (icForgotten cell)
       when forgotten (releaseResult instances cell)
       pure True
+
+-- | Release an instance that was held after its construction ('Hetoimasia.Scripting.Lua.Instance.instanceHoldInit'):
+-- its @init@ begins on the owner's thread in its turn among the jobs, unless the instance has ended by then. An
+-- instance that was not held, or has settled, takes nothing from it.
+releaseHeld ∷ InstanceTicket → STM ()
+releaseHeld (InstanceTicket instances cell _) = do
+  settled ← isJust <$> readTVar (icResult cell)
+  held ← readTVar (icHeldInit cell)
+  when (not settled && isJust held) $ modifyTVar' (insInbox instances) (|> JobResumeInit (icId cell))
 
 -- | A coherent reading of one instance.
 snapshotOf ∷ Instances → Gate → OwnerId → Text → ICell → STM InstanceSnapshot

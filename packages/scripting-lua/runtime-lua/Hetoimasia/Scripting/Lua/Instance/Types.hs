@@ -710,12 +710,21 @@ data InstanceConfig = InstanceConfig
     -- failure arises only as it settles (a @shutdown@ that raises after a stop, a release that fails) is not
     -- told here, and is told to 'instanceEscalate' alone. The default does nothing; what it raises is a
     -- failure of the host.
+  , instanceHoldInit ∷ InstanceId → IO Bool
+    -- ^ Asked, on the owner's thread and once per behavior instance, when the instance has been
+    -- constructed, its behavior captured and validated and its cadence resolved, and before anything
+    -- authored of it has run. Answering 'True' holds the instance there: its @init@ does not begin, and
+    -- the owner goes on to the instances behind it, until the application releases it
+    -- ('Hetoimasia.Scripting.Lua.Instance.releaseHeldInstance'). An application that must know that every
+    -- instance it admitted is valid before any of them runs asks this of each and releases them together.
+    -- A held instance whose owner is stopped settles as stopped without its @init@ having run. The
+    -- default answers 'False' and holds nothing; what it raises is a failure of the host.
   }
 
 -- | The default bounds, no event source, controls admitted on arrival, and an
 -- escalation that keeps every failure isolated.
 defaultInstanceConfig ∷ InstanceConfig
-defaultInstanceConfig = InstanceConfig defaultInstanceBounds [] Nothing AdmitOnArrival (const (pure Isolate)) (const (pure ())) (const (pure ()))
+defaultInstanceConfig = InstanceConfig defaultInstanceBounds [] Nothing AdmitOnArrival (const (pure Isolate)) (const (pure ())) (const (pure ())) (const (pure False))
 
 -- | A configuration problem.
 data InstanceViolation
@@ -805,6 +814,9 @@ data ICell = ICell
   , icReleased ∷ !(TVar Bool)
   , icBehavior ∷ !(Maybe BehaviorCell)
     -- ^ An M1 behavior instance's request and what the owner's thread made of it.
+  , icHeldInit ∷ !(TVar (Maybe (IO ())))
+    -- ^ What an instance held after its construction ('instanceHoldInit') does when it is released: the
+    -- rest of its start. Written and taken on the owner's thread; empty for an instance not held.
   }
 
 -- | An M1 behavior instance's part of its cell.
@@ -930,6 +942,8 @@ initialState = IState Initializing False Set.empty Seq.empty 0 0 0 Nothing False
 data Job
   = -- | Make the instance and run its @init@.
     JobStart !Word64
+  | -- | Run the @init@ of an instance that was held after its construction.
+    JobResumeInit !Word64
   | -- | Look at the instance's queue: an event was accepted, or its invocation can
     -- go on.
     JobDispatch !Word64
@@ -1010,6 +1024,8 @@ data Instances = Instances
   , insOnFailing ∷ InstanceFailure → IO ()
     -- ^ What the application is told as an instance's ending begins with a failure
     -- ('instanceOnFailing').
+  , insHoldInit ∷ InstanceId → IO Bool
+    -- ^ What the application is asked once a behavior instance is constructed ('instanceHoldInit').
   }
 
 -- | Make an owner's instance state.
@@ -1030,6 +1046,7 @@ newInstances config =
     <*> newTVarIO Map.empty
     <*> pure (instanceOnSegment config)
     <*> pure (instanceOnFailing config)
+    <*> pure (instanceHoldInit config)
 
 -- | An error as one line of text, at most 'failureTextLimit' characters.
 renderError ∷ InstanceError → Text

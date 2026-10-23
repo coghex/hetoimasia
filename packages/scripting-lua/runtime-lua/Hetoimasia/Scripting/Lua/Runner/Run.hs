@@ -306,6 +306,7 @@ begin internals runtime config = do
                     , instanceControlAdmission = if tickVm then AdmitLogically else AdmitOnArrival
                     , instanceEscalate = \_ → pure Isolate
                     , instanceOnSegment = \_ → pure ()
+                    , instanceHoldInit = \_ → pure False
                     , instanceOnFailing = \_ → pure ()
                     }
             , scheduledLifecycle = Just (lifecycleGrant [GrantTarget GrantedSelf [PermitInspect, PermitControl] (if tickVm then Just assign else Nothing)])
