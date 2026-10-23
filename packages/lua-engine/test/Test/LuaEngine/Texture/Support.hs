@@ -272,6 +272,9 @@ data Session = Session
   , ssIds ∷ !(IORef (Map Text InstanceId))
   , ssTickets ∷ !(IORef (Map Text InstanceTicket))
   , ssConfig ∷ !Config
+  , ssFakes ∷ !(TVar [Fake])
+    -- ^ Every backend the example has made, nested ones included: the one janitor watches them all, and
+    -- the end of the example flushes them all.
   , ssRace ∷ !(IORef Bool)
     -- ^ When set, the owner is closed right after its argument check passes: a closure that lands
     -- between the check and the admission.
@@ -309,7 +312,8 @@ withSession cfg body =
       probe ← newProbe
       fake ← newFake
       spec ← either (\refused → assertFailure ("pool refused: " <> show refused)) pure (uncurry poolSpec (cfgPool cfg))
-      withJanitor fake $
+      fakes ← newTVarIO [fake]
+      withJanitor fakes $
         withReadPoolUsing spec (cfgReader cfg probe inventory (readVerified inventory root)) $ \pool →
           withTexturePipelineWith (cfgHooks cfg) textureSpec' (fakeBackend fake) pool inventory $ \pipeline → do
             session ←
@@ -321,13 +325,14 @@ withSession cfg body =
                 <*> newIORef Map.empty
                 <*> newIORef Map.empty
                 <*> pure cfg
+                <*> pure fakes
                 <*> newIORef False
             withLoggingLifetime quietLogger $ \lifetime →
               withSupervision lifetime $ \control → do
                 runtime ← newLuaRuntime control
                 outcome ←
                   timeout exampleBound (body session control runtime)
-                    `finally` (writeIORef (ssOpened session) True >> openGates session >> openAllProbeGates probe >> cfgRelease cfg >> flushFake fake)
+                    `finally` (writeIORef (ssOpened session) True >> openGates session >> openAllProbeGates probe >> cfgRelease cfg >> (readTVarIO fakes >>= mapM_ flushFake))
                 case outcome of
                   Just value → pure value
                   Nothing → do
@@ -359,6 +364,8 @@ releaseHeldGate = void . (`tryPutMVar` ()) . proceed
 withNested ∷ Session → (Session → IO a) → (Session → IO ()) → IO a
 withNested session body onClosed = do
   fake ← newFake
+  -- Watched by the session's janitor from now on, so the end of the example unwinds it however the scope ended.
+  atomically (modifyTVar' (ssFakes session) (fake :))
   spec ← either (\refused → assertFailure ("texture spec refused: " <> show refused)) pure (textureSpec (ssProfile session) (cfgJobs (ssConfig session)))
   done ← newEmptyMVar
   value ←
@@ -366,7 +373,7 @@ withNested session body onClosed = do
     -- fails cannot leave the backend holding what the scope waits for.
     -- "nested scope returned" is recorded however the scope ended, the moment it did: whatever the helper has
     -- recorded by then, it recorded before the scope could end.
-    (`finally` note session "nested scope returned") . withJanitor fake . withTexturePipelineWith (cfgHooks (ssConfig session)) spec (fakeBackend fake) (ssPool session) (ssInventory session) $ \pipeline → do
+    (`finally` note session "nested scope returned") . withTexturePipelineWith (cfgHooks (ssConfig session)) spec (fakeBackend fake) (ssPool session) (ssInventory session) $ \pipeline → do
       let nested = session {ssPipeline = pipeline, ssFake = fake}
       _ ← forkIO $ do
         atomically (pipelineOpen pipeline >>= \open → when open retry)
@@ -736,8 +743,8 @@ texturesLive fake = atomically $ do
 flushFake ∷ Fake → IO ()
 flushFake fake = atomically (writeTVar (fkFlush fake) True >> writeTVar (fkAuto fake) True >> writeTVar (fkHold fake) False)
 
-withJanitor ∷ Fake → IO a → IO a
-withJanitor fake action = do
+withJanitor ∷ TVar [Fake] → IO a → IO a
+withJanitor fakesVar action = do
   done ← newEmptyMVar
   thread ← forkIO (janitor `finally` putMVar done ())
   action `finally` stop thread done
@@ -746,27 +753,33 @@ withJanitor fake action = do
     stop thread done = killThread thread >> readMVar done
     janitor = do
       work ← atomically $ do
-        flushing ← readTVar (fkFlush fake)
-        unless flushing retry
-        terminal ← readTVar (fkTerminal fake)
-        buffers ← readTVar (fkBuffers fake)
-        held ← readTVar (fkHeld fake)
-        textures ← readTVar (fkTextures fake)
-        pending ← fmap concat . mapM (\(identity, state) → (\s → [identity | isPending s]) <$> readTVar state) $ Map.toList textures
-        let open = [found | found ← held, not (Set.member (heldIndex found) terminal)]
-            unretired = [found | found ← held, Set.member (heldIndex found) terminal, not (Set.member (heldIndex found) buffers)]
-        when (null open && null unretired && null pending) retry
-        pure (open, unretired, pending)
-      forM_ (first3 work) $ \found → do
-        cancelled ← uploadCancelled found
-        if cancelled then void (withdrawUpload fake found) else void (finishUpload fake found)
-      forM_ (second3 work) (void . retireBuffers fake)
-      forM_ (third3 work) (retireTexture fake)
+        fakes ← readTVar fakesVar
+        found ← concat <$> mapM gather fakes
+        when (null found) retry
+        pure found
+      forM_ work $ \(fake, open, unretired, pending) → do
+        forM_ open $ \held → do
+          cancelled ← uploadCancelled held
+          if cancelled then void (withdrawUpload fake held) else void (finishUpload fake held)
+        forM_ unretired (void . retireBuffers fake)
+        forM_ pending (retireTexture fake)
       janitor
+    -- What a flushed backend still owes: uploads without their terminal event, borrowed levels not yet
+    -- retired, and released textures not yet proved retired.
+    gather fake = do
+      flushing ← readTVar (fkFlush fake)
+      if not flushing
+        then pure []
+        else do
+          terminal ← readTVar (fkTerminal fake)
+          buffers ← readTVar (fkBuffers fake)
+          held ← readTVar (fkHeld fake)
+          textures ← readTVar (fkTextures fake)
+          pending ← fmap concat . mapM (\(identity, state) → (\reading → [identity | isPending reading]) <$> readTVar state) $ Map.toList textures
+          let open = [found | found ← held, not (Set.member (heldIndex found) terminal)]
+              unretired = [found | found ← held, Set.member (heldIndex found) terminal, not (Set.member (heldIndex found) buffers)]
+          pure [(fake, open, unretired, pending) | not (null open && null unretired && null pending)]
     isPending = \case ProviderPending → True; _ → False
-    first3 (a, _, _) = a
-    second3 (_, b, _) = b
-    third3 (_, _, c) = c
 
 -- VMs -----------------------------------------------------------------------------------------------------
 
