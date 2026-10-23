@@ -936,6 +936,16 @@ count is at most the element limit plus one. Each limit is pinned at the limit
 and one past it in `Test.Lua.Boundary.Bindings`, `Test.Lua.Boundary.Modules` and
 `Test.Lua.Boundary.Values`.
 
+**A binding's own bound (LFE-19).** `withArgumentLimits limits binding` bounds the crossing of that binding's
+arguments by `limits` as well as by the owner's: for each of bytes, depth and elements the reader applies the smaller of the
+two, while it reads, and stops at the first limit it reaches (a refusal visits at most the limit plus one element). It can only
+tighten: a binding limit above the owner's changes nothing, and it leaves the binding's results and every other binding to the
+owner's limits. The refusal is the one the owner's limits give, an ordinary Lua error for a binding that is opted in
+([Recoverable refusals](#recoverable-refusals)) and a typed fault of the call otherwise, so a family of values with a smaller
+ceiling than the owner's (a scene's 2 MiB inside the common 16 MiB) is refused at its own ceiling and never admitted at the
+common one first. `bindingArgumentLimits` reads it back. `Test.Lua.Boundary.ArgumentLimits` pins it at the limit and one past,
+for a huge input, the stack and registry balance and an allocator budget swept over the read and the refusal.
+
 ### Handles
 
 A capability is an opaque identity the application hands its scripts: a type it
@@ -3311,6 +3321,13 @@ through `leaseLive` (declare the type with `leaseCapabilityType`), that its leas
 `withLease leases key action` borrows the held resource for the action, under the collection's borrowing
 rules, and is refused for a lease of another type or another instance.
 
+`withLeaseOr leases key refused action` is the same borrow with the refusal handed back as data: it decides and borrows in
+one step on the calling thread, and for a lease that has ended, another instance's or of another type it calls `refused` with
+the same bounded reason `withLease` raises as a fault of the call, instead of raising. A binding that opted in to
+[recoverable refusals](#recoverable-refusals) turns that text into an ordinary Lua error with its action never run (the scene
+preparation of LFE-19 does), so a script's use of a peer's texture is a refusal `pcall` catches rather than a fault of the call. What the
+borrow itself raises (a loan that has ended, a defect, a cancellation) is raised as for `withLease`.
+
 ### Early release and its answers
 
 A script may release a handle early through a binding built with `releaseOperation`
@@ -3778,7 +3795,7 @@ Classification, which the tests pin separately:
 | What | Answer |
 | --- | --- |
 | A temporary bank is full | `Unavailable bank`: data. The binding hands the script `nil, {code="busy", message=TEXT}`. Never an error, never the instance's failure; a later call may succeed |
-| A credit that is full **for good** (nothing will ever return a place: a permanent bank that is exhausted) | the credit raises `CreditRefused why` from `creditReserve` (with `throwSTM`), in the transaction that would have taken the place. The admission is refused **finally and not as a fault**: `startAdmitted` raises `OrdinaryCallRefusal`, which a binding opted in to ordinary refusals ([`recoverableRefusals`, `withPrecondition`, `withArgumentCheck`](#recoverable-refusals)) shows as an ordinary Lua error `binding: request refused: WHY` (bounded to `refusalReasonBytes` = 256) that `pcall` catches and an invocation that caught it can go on from, recording nothing on the VM; for a binding that is not opted in it is the fault of the call, as any `RequestRefusal`. Nothing is reserved, nothing reaches the provider and no latent failure is left; it is decided before any bank is asked, so it wins over a full temporary bank. A credit that answers `False` is a bank that may empty: busy data, as before. A credit that never raises `CreditRefused` behaves exactly as it did |
+| A credit that is full **for good** (nothing will ever return a place: a permanent bank that is exhausted) | the credit raises `CreditRefused why` from `creditReserve` (with `throwSTM`), in the transaction that would have taken the place. The admission is refused **finally and not as a fault**: `startAdmitted` raises `OrdinaryCallRefusal`, which a binding opted in to ordinary refusals ([`recoverableRefusals`, `withPrecondition`, `withArgumentCheck`](#recoverable-refusals)) shows as an ordinary Lua error `binding: request refused: WHY` (the reason bounded to `refusalReasonBytes` = 256 **bytes of UTF-8**, cut between characters, so it is always delivered as the ordinary error it is) that `pcall` catches and an invocation that caught it can go on from, recording nothing on the VM; for a binding that is not opted in it is the fault of the call, as any `RequestRefusal`. Nothing is reserved, nothing reaches the provider and no latent failure is left; it is decided before any bank is asked, so it wins over a full temporary bank. A credit that answers `False` is a bank that may empty: busy data, as before. A credit that never raises `CreditRefused` behaves exactly as it did |
 | A permanent fact (wrong requester, closing, offset, ceiling, exhausted numbers, no lease scope) | `RequestRefusal`, a fault of the call raised before anything was reserved. A binding that wants an ordinary Lua error asks `preflightAdmission` in a [`withArgumentCheck`](#recoverable-refusals), which decides the same facts and reserves nothing |
 | The engine cannot keep its bookkeeping consistent after a valid admission (`AdmissionDefect`: the request counter has no number after the last, a result lease reserved with no way to hand its handle to the script) | a failure of the host, raised from the transaction; nothing is reserved |
 | A bank, provider or assignment that raises | the application's own failure, with its type; nothing is reserved. A provider that raises when handed the request is taken back whole, and a credit release that then raises is kept beside it |

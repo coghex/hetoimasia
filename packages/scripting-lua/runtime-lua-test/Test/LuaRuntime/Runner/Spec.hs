@@ -13,6 +13,7 @@ import qualified Test.LuaRuntime.Runner.Output
 import qualified Test.LuaRuntime.Runner.Production
 import qualified Test.LuaRuntime.Runner.Query
 import qualified Test.LuaRuntime.Runner.Retirement
+import qualified Test.LuaRuntime.Runner.Scripts
 import qualified Test.LuaRuntime.Runner.Sources
 import qualified Test.LuaRuntime.Runner.Tables
 import qualified Test.LuaRuntime.Runner.Ticks
@@ -20,6 +21,7 @@ import Test.Hspec (Spec, describe)
 
 spec ∷ Spec
 spec = describe "Runner" $ do
+  Test.LuaRuntime.Runner.Scripts.spec
   Test.LuaRuntime.Runner.Sources.spec
   Test.LuaRuntime.Runner.Kinds.spec
   Test.LuaRuntime.Runner.Output.spec
