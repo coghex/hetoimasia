@@ -336,6 +336,7 @@ arrivalOfAnswer limits = \case
     | ByteString.length bytes > exportMaxSourceBytes limits → ArrivedOversize
     | otherwise → Arrived (ByteString.copy bytes)
   SourceFailure why → ArrivedFailed (boundReason why)
+  SourceNoRoom → ArrivedFailed "no room for the module"
 
 -- ---------------------------------------------------------------------------------
 -- Admission
@@ -613,7 +614,8 @@ drive loader state entry settled = loop
         case Map.lookup dependency records of
           Just (ExportHeld slot _) → resume frame (ResumeExports slot)
           Just (ExportBroken fault) → do
-            let reason = ModuleRefused (DependencyFailed label fault)
+            let ExportIdentity raw = dependency
+                reason = ModuleRefused (DependencyFailed label raw fault)
             latch frame (faultOfModule loader (frameLabel frame) reason LuaRan)
             resume frame (ResumeError (Text.encodeUtf8 (boundReason ("import: the module " <> label <> " failed"))))
           Just ExportPending → do
@@ -988,12 +990,14 @@ importHandler loader state restore = do
                 -- immediate lookup, which reads nothing and waits for nothing.
                 Nothing → case known of
                   Just (ExportHeld slot _) → pushReady slot
-                  Just (ExportBroken _) → raiseOrdinary ("the required module " <> target <> " failed")
+                  Just (ExportBroken failure) → do
+                    fromApplication (restore (loaderObserved config identity failure))
+                    raiseOrdinary ("the required module " <> target <> " failed")
                   _ → raiseOrdinary ("module_not_ready: " <> target)
                 Just running → case known of
                   Just (ExportHeld slot _) → pushReady slot
                   Just (ExportBroken failure) →
-                    condemn (ModuleRefused (DependencyFailed target failure)) ("the module " <> target <> " failed")
+                    condemn (ModuleRefused (DependencyFailed target raw failure)) ("the module " <> target <> " failed")
                   -- Never met while a chain runs: stopping closes the chain first. Refused rather
                   -- than waited for, in case it ever is.
                   Just ExportStopped → raiseOrdinary ("the loader stopped before the module " <> target <> " was evaluated")
@@ -1015,10 +1019,13 @@ importHandler loader state restore = do
                             | length chain + 1 > exportMaxChainDepth limits →
                                 condemn (ModuleRefused (ImportChainTooDeep (exportMaxChainDepth limits) target)) ("the module " <> target <> " would make the chain longer than " <> Text.pack (show (exportMaxChainDepth limits)))
                             | otherwise → do
-                                when (isNew known) (admitDependency identity raw target)
-                                modifyState loader (\st → st {lsNoted = Just (identity, target)})
-                                lua_settop state entry
-                                pure suspendResults
+                                admitted ← if isNew known then admitDependency identity raw target else pure True
+                                if admitted
+                                  then do
+                                    modifyState loader (\st → st {lsNoted = Just (identity, target)})
+                                    lua_settop state entry
+                                    pure suspendResults
+                                  else condemn (ModuleRefused (ImportCacheFull (exportMaxIdentities limits) target)) ("no room for the module " <> target)
   where
     vm = vmOf loader
     host = loaderHost loader
@@ -1038,6 +1045,7 @@ importHandler loader state restore = do
     takeThrough p chain = let (before, rest) = break p chain in before <> take 1 rest
     -- A new identity: tracked before the supplier is asked, so that a failure of the ask
     -- leaves nothing behind, and the interest recorded the moment it exists.
+    admitDependency ∷ ExportIdentity → ByteString.ByteString → Text → IO Bool
     admitDependency identity raw target = do
       let kept = ExportIdentity (ByteString.copy raw)
           forget = do
@@ -1048,11 +1056,17 @@ importHandler loader state restore = do
       answer ←
         fromApplication (restore (supplierAcquire (loaderSupplier config) identity >>= evaluate))
           `onException` forget
-      modifyState loader $ \st →
-        st
-          { lsEntries = Map.adjust (\e → e {entryInterest = True, entryArrival = arrivalOfAnswer limits answer}) kept (lsEntries st)
-          , lsAcquired = lsAcquired st + 1
-          }
+      case answer of
+        -- The application's bound is the arbiter, in the step that takes the interest: whatever it
+        -- accepted from another thread since 'loaderReserved' was read has won the room.
+        SourceNoRoom → False <$ forget
+        _ → do
+          modifyState loader $ \st →
+            st
+              { lsEntries = Map.adjust (\e → e {entryInterest = True, entryArrival = arrivalOfAnswer limits answer}) kept (lsEntries st)
+              , lsAcquired = lsAcquired st + 1
+              }
+          pure True
 
 -- | Why Lua cannot suspend the coroutine that called import right here, if it cannot:
 -- it is a coroutine the script created, or Lua cannot yield where it is (a comparator,

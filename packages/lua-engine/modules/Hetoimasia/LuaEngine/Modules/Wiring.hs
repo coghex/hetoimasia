@@ -256,6 +256,7 @@ coordinatorPlan c =
             BlockedSource identity -> atomically (blockedSTM c identity)
             _ -> pure ()
         , hookReserved = atomically . reservedForLoaderSTM c
+        , hookObserved = \identity fault -> atomically (observedReasonSTM c identity fault)
         , hookExit = atomically (closeSTM c)
         }
 

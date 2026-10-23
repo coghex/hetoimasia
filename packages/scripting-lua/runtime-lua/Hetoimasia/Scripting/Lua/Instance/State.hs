@@ -28,6 +28,7 @@ module Hetoimasia.Scripting.Lua.Instance.State
   , isInstanceTask
   , takeDelta
   , beginEnding
+  , latchRunningFailure
   , settleInstance
   , takeJobs
   , awaitJobs
@@ -451,6 +452,27 @@ takeDelta instances number = do
   case pending of
     Just (owner, seconds) | owner == number && running == Just number → seconds <$ writeTVar (insDelta instances) Nothing
     _ → pure (-1)
+
+-- | Fail the instance whose code is running with the failure of a required module it ran into
+-- outside any module's evaluation: latched on the instance, once, and applied by the owner at its next
+-- safe boundary exactly as a required request's failure is at its settlement, whatever the code does
+-- with the error it was raised as. Nothing when no instance's code is running, or the instance is
+-- ending or already has a failure latched. Answers whether it latched one.
+latchRunningFailure ∷ Instances → Text → Text → STM Bool
+latchRunningFailure instances endpoint reason = do
+  running ← readTVar (insRunning instances)
+  cells ← readTVar (insCells instances)
+  case running >>= \number → Map.lookup number cells of
+    Nothing → pure False
+    Just cell → do
+      state ← readTVar (icState cell)
+      if isStopped state || isTerminal (isPhase state) || isJust (isRequestFailure state)
+        then pure False
+        else do
+          writeTVar (icState cell) state {isRequestFailure = Just (endpoint, reason), isDispatchQueued = True}
+          unless (isDispatchQueued state) $
+            modifyTVar' (insInbox instances) (|> JobDispatch (icId cell))
+          pure True
 
 -- | Begin ending an instance, once: admission and delivery close, the connections
 -- are revoked and what had not begun is discarded. Answers what that revoked and

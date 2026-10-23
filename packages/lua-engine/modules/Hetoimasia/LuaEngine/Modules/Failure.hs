@@ -16,6 +16,7 @@ module Hetoimasia.LuaEngine.Modules.Failure
   , sourceCodes
   , encodeSourceReason
   , innermostFault
+  , dependencyIdentities
   , failureOfFault
   , clipBytes
   , messageLimit
@@ -72,9 +73,16 @@ encodeSourceReason code message = code <> ":" <> message
 -- walked through, outermost first.
 innermostFault ∷ BoundaryFault → ([Text], BoundaryFault)
 innermostFault fault = case boundaryReason fault of
-  ModuleRefused (DependencyFailed label inner) →
+  ModuleRefused (DependencyFailed label _ inner) →
     let (labels, cause) = innermostFault inner in (label : labels, cause)
   _ → ([], fault)
+
+-- | The identities, as bytes, of the dependencies a fault was reached through, outermost first. The
+-- last is the dependency whose own failure is the cause; none means the fault is the module's own.
+dependencyIdentities ∷ BoundaryFault → [ByteString.ByteString]
+dependencyIdentities fault = case boundaryReason fault of
+  ModuleRefused (DependencyFailed _ identity inner) → identity : dependencyIdentities inner
+  _ → []
 
 -- | The failure a fault is told as. The first label is the module that was asked for; the root and
 -- path are those of the failing content, which the caller locates (the requested content when it
@@ -107,7 +115,7 @@ classify = \case
     ImportCacheFull bound label → ("module_limit", "no room for the module " <> label <> ": the VM holds " <> shown bound <> " module identities")
     ImportChainTooDeep bound label → ("module_limit", "the module " <> label <> " would make the import chain longer than " <> shown bound)
     ImportNotSuspendable _ label → ("module_error", "the module " <> label <> " was imported where Lua cannot suspend")
-    DependencyFailed label _ → ("module_error", "the dependency " <> label <> " failed")
+    DependencyFailed label _ _ → ("module_error", "the dependency " <> label <> " failed")
     other → ("module_error", "the module was refused: " <> Text.pack (show other))
   ScriptFailed _ value → ("module_error", "the module raised an error: " <> renderError value)
   ExportShapeRefused shape → ("module_error", "the module did not return exactly one plain table: " <> renderShape shape)

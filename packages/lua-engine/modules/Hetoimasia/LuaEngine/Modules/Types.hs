@@ -25,8 +25,11 @@
 --   if nobody wants it any more.
 -- * @csSlotsFree + number of jobs whose read is queued or in flight == csPoolHeld@ while the
 --   coordinator is open: the pool slots it holds are free or under a live job, never both.
--- * @csPromised@ counts identity reservations a request's admission made and 'acceptRequest' has not
---   yet turned into a job; @Map.size csJobs + csPromised@ never passes the identity bound.
+-- * @csPromised@ holds the identities a request's admission reserved room for, with how many asked,
+--   that no job exists for yet. The job's creation, by whatever path makes it (a request, a boot
+--   load, a dependency the chain discovered), takes the whole entry into the job in the same
+--   transaction, so an identity is never counted twice; an admission taken back gives up only its
+--   own reservation. @Map.size csJobs + Map.size csPromised@ never passes the identity bound.
 -- * A job's waiters are exactly the requests that subscribed to it and have neither been answered nor
 --   withdrawn; a waiter is answered or withdrawn once, whichever comes first.
 -- * Jobs are never removed: an identity is permanent for the VM's life (no eviction, restart or retry).
@@ -62,8 +65,6 @@ import Control.Exception (Exception, SomeException)
 import Data.ByteString (ByteString)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Data.Set (Set)
-import qualified Data.Set as Set
 import Data.Text (Text)
 import Data.Word (Word64)
 import Hetoimasia.Content.Identity (ContentKey)
@@ -236,7 +237,7 @@ data Peaks = Peaks
 data CState = CState
   { csPhase ∷ !Phase
   , csJobs ∷ !(Map ExportIdentity Job)
-  , csPromised ∷ !(Set ExportIdentity)
+  , csPromised ∷ !(Map ExportIdentity Int)
   -- ^ The identities a request's admission reserved room for and 'acceptRequest' has not yet turned
   -- into a job. The room is the identity's own, so taking an admission back after the job exists
   -- gives nothing back, and an admission taken back before it releases exactly its own reservation.
@@ -258,7 +259,7 @@ newState slots =
   CState
     { csPhase = Open
     , csJobs = Map.empty
-    , csPromised = Set.empty
+    , csPromised = Map.empty
     , csSerial = 0
     , csCharges = noCharges
     , csSlotsFree = slots

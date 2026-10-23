@@ -6,6 +6,8 @@
 module Test.LuaEngine.Modules.Positions (spec) where
 
 import Control.Monad (forM_, void)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Char8 as Char8
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.Scripting.Lua.Provider (ProviderDiagnostics (rdOutstanding))
@@ -24,7 +26,16 @@ layout =
     , ("second.lua", "return { id = 'second' }")
     , ("broken_first.lua", "local second = import('broken_second.lua') return { id = 'broken_first' }")
     , ("broken_second.lua", "error('second is broken')")
+    , (Char8.unpack (longName "1.lua"), "this is not lua")
+    , (Char8.unpack (longName "2.lua"), "this is not lua")
+    , ("imp_one.lua", "local d = import('" <> longName "1.lua" <> "') return { id = 'one', d = d }")
+    , ("imp_two.lua", "local d = import('" <> longName "2.lua" <> "') return { id = 'two', d = d }")
     ]
+
+-- | Two paths whose labels are the same once the diagnostic label's bound has cut them: they share
+-- 144 bytes, in segments within the path's own bound. Both files are the same broken source, so each import fails with an equal fault.
+longName ∷ ByteString → ByteString
+longName suffix = Char8.concat (replicate 4 (Char8.replicate 35 'a' <> "/")) <> suffix
 
 spec ∷ Spec
 spec = describe "positions and waiters" $ do
@@ -270,6 +281,18 @@ failures = describe "a required failure" $ do
         command session vm "y" "lookup" "k0" [("path", VText "broken_second.lua")] Nothing
         awaitNote session "y lookup k0 failed module_error #broken_second.lua"
 
+  it "is told apart by identity when two modules fail with the same label and the same fault" $
+    withSession fixedM1Profile (2, 8) realReader layout $ \session _ runtime →
+      withVm session runtime "ui" (defaultOptions OnArrival) $ \vm → do
+        -- Each importer's failure names the content that failed for it, not the first with an equal fault.
+        forM_ [("imp_one.lua", "1.lua"), ("imp_two.lua", "2.lua")] $ \(importer, failing) → do
+          outcome ← bootNow session vm importer >>= awaitBootOutcome
+          case outcome of
+            BootFailed failure → do
+              failurePath failure `shouldBe` Text.pack (Char8.unpack (longName failing))
+              failureCode failure `shouldBe` "module_error"
+            other → expectationFailure ("expected the boot load to fail, found " <> show other)
+
   it "is classified by its cause, with the content that failed, however many modules import it" $
     withSession fixedM1Profile (2, 8) realReader layout $ \session _ runtime →
       withVm session runtime "ui" (defaultOptions OnArrival) $ \vm → do
@@ -283,11 +306,12 @@ failures = describe "a required failure" $ do
             why `shouldSatisfy` Text.isInfixOf "broken_second.lua"
           Nothing → expectationFailure ("expected a request failure, found " <> show failure)
 
-  it "cannot be made a success by catching the error of a lookup: a failed identity stays failed" $
+  it "fails the instance whose code looked it up, even when that code caught the error, and only that instance" $
     withSession fixedM1Profile (2, 8) realReader layout $ \session _ runtime →
       withVm session runtime "ui" (defaultOptions OnArrival) $ \vm → do
         admitDriver session vm "x"
         admitDriver session vm "y"
+        admitDriver session vm "z"
         command session vm "x" "start" "ku" [] (Just (fetch "util.lua"))
         awaitNote session "x start ku started"
         command session vm "x" "keep" "ku" [("name", VText "util")] Nothing
@@ -297,14 +321,22 @@ failures = describe "a required failure" $ do
         command session vm "y" "start" "kb" [] (Just (fetch "bad.lua"))
         _ ← awaitFailure session "y"
         command session vm "x" "call" "util" [("field", VText "lookup"), ("text", VText "bad.lua")] Nothing
+        -- The call catches the error it was raised as, and the script goes on, so the failure that
+        -- ends the instance is not the script's to launder into a success.
         line ← lineStartingWith session "x call util error"
         line `shouldSatisfy` Text.isInfixOf "failed"
-        command session vm "x" "lookup" "k0" [("path", VText "bad.lua")] Nothing
-        awaitNote session "x lookup k0 failed module_error #bad.lua"
-        command session vm "x" "call" "util" [("field", VText "lookup"), ("text", VText "plain.lua")] Nothing
-        line' ← lineStartingWith session "x call util error"
-        _ ← pure line'
-        pure ()
+        failure ← awaitFailure session "x"
+        case requestFailureOf failure of
+          Just (endpoint, why) → do
+            endpoint `shouldBe` "module"
+            why `shouldSatisfy` Text.isInfixOf "module_error"
+            why `shouldSatisfy` Text.isInfixOf "bad.lua"
+          Nothing → expectationFailure ("expected the instance to fail with the module's failure, found " <> show failure)
+        -- The other instance is untouched, and the identity still reads as the failure it is.
+        command session vm "z" "lookup" "k0" [("path", VText "bad.lua")] Nothing
+        awaitNote session "z lookup k0 failed module_error #bad.lua"
+        command session vm "z" "lookup" "k0" [("path", VText "plain.lua")] Nothing
+        awaitNote session "z lookup k0 not_ready #plain.lua"
 
 boot ∷ Spec
 boot = describe "boot loads" $ do

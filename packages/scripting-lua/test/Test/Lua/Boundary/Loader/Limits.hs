@@ -9,6 +9,8 @@
 module Test.Lua.Boundary.Loader.Limits (spec) where
 
 import Control.Monad (forM_)
+import Data.IORef (modifyIORef')
+import qualified Data.Map.Strict as Map
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as Char8
 import Data.Text (Text)
@@ -81,6 +83,22 @@ spec = describe "the loader's bounds" $ do
         countReady counts `shouldBe` 1
         countFailed counts `shouldBe` 2
 
+    it "refuses a dependency the application's own bound has no room for, in the step that would take its interest, with nothing recorded" $
+      bounded 1024 3 8 $ \rig owned → do
+        modifyIORef' (rigAvailable rig) (Map.insert (ident "b") SourceNoRoom)
+        _ ← supply rig owned "a" ["local ok = pcall(import, 'b')", "return {}"]
+        _ ← admit owned "a"
+        report ← advance owned
+        advanceBlocked report `shouldBe` BlockedIdle
+        failed ← failureOf owned "a"
+        case boundaryReason failed of
+          ModuleRefused (ImportCacheFull 3 "game:b") → pure ()
+          other → error ("unexpected " <> show other)
+        statusOfName owned "b" >>= (`shouldBe` ModuleUnknown)
+        -- The supplier took no interest, so none is ended.
+        released rig >>= (`shouldSatisfy` notElem (ident "b"))
+        ledger owned >>= (`shouldSatisfy` balanced)
+
     it "fails a module whose dependency does not fit, allocates nothing for it, and does not wait for room" $
       bounded 1024 2 8 $ \rig owned → do
         _ ← supply rig owned "a" ["local ok = pcall(import, 'b')", "return {}"]
@@ -130,7 +148,7 @@ spec = describe "the loader's bounds" $ do
         _ ← advance owned
         boundaryReason <$> failureOf owned "big" >>= (`shouldBe` ModuleRefused (SourceTooLarge 64))
         failureOf owned "a" >>= \failed → case boundaryReason failed of
-          ModuleRefused (DependencyFailed "game:big" _) → pure ()
+          ModuleRefused (DependencyFailed "game:big" _ _) → pure ()
           other → error ("unexpected " <> show other)
         ledger owned >>= (`shouldSatisfy` balanced)
 
@@ -155,7 +173,7 @@ spec = describe "the loader's bounds" $ do
         acquired rig >>= (`shouldBe` map ident ["n1", "n2", "n3", "n4"])
         -- Each importer above fails with it.
         forM_ ["n3", "n2", "n1"] $ \name → failureOf owned name >>= \failed → case boundaryReason failed of
-          ModuleRefused (DependencyFailed _ _) → pure ()
+          ModuleRefused (DependencyFailed _ _ _) → pure ()
           other → error ("unexpected " <> show other)
         ledger owned >>= (`shouldSatisfy` balanced)
 

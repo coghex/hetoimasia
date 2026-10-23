@@ -37,6 +37,7 @@ module Hetoimasia.Scripting.Lua.Internal.Boundary
   ) where
 
 import Control.Exception (Exception)
+import Data.ByteString (ByteString)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Internal.Fault (ErrorValue, FaultKind)
@@ -181,8 +182,9 @@ data ModuleProblem
     FacadeBuilderNotAFunction !Text
   | -- | A module imported a dependency that failed, and so fails itself, even if its
     -- code caught the error the import raised: the dependency's label and the fault
-    -- it failed with.
-    DependencyFailed !Text !BoundaryFault
+    -- it failed with, and the bytes of the dependency's identity: the label is bounded and so
+    -- can be shared by two identities, the identity cannot.
+    DependencyFailed !Text !ByteString !BoundaryFault
   | -- | A module imported an identity already on the active chain: the labels of the
     -- chain from that identity down to the importer, and the identity again where
     -- the edge closes. Never an extra frame.

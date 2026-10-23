@@ -44,6 +44,7 @@ module Hetoimasia.LuaEngine.Modules.State
   , releaseSTM
   , publishSTM
   , blockedSTM
+  , observedReasonSTM
   , closeSTM
     -- * Failures
   , recordDefectSTM
@@ -61,7 +62,6 @@ import Control.Exception (SomeException, throwIO, toException)
 import Control.Monad (foldM, forM, forM_, unless, when)
 import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
-import qualified Data.Set as Set
 import Data.Maybe (isJust, isNothing)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -97,8 +97,10 @@ import Hetoimasia.LuaEngine.Modules.Bank
 import Hetoimasia.LuaEngine.Modules.Failure
   ( ModuleFailure (..)
   , encodeSourceReason
+  , dependencyIdentities
   , failureOfFault
-  , innermostFault
+  , clipBytes
+  , messageLimit
   )
 import Hetoimasia.LuaEngine.Modules.Types
 import Hetoimasia.Scripting.Lua.Admission (CreditEnd (..))
@@ -113,11 +115,9 @@ import Hetoimasia.Scripting.Lua.Loading
   , submitReservedRoot
   )
 import Hetoimasia.Scripting.Lua.Owner
-  ( BoundaryFault (boundaryReason)
+  ( BoundaryFault
   , ExportHandle
-  , FaultReason (ModuleRefused)
-  , ModuleProblem (DependencyFailed)
-  , ExportIdentity
+  , ExportIdentity (..)
   , ModuleStatus (..)
   , RootRequest (..)
   , SourceAnswer (..)
@@ -146,7 +146,7 @@ defect = throwSTM . ModuleDefect
 
 -- | How many identities are held or promised.
 identitiesUsed ∷ CState → Int
-identitiesUsed st = Map.size (csJobs st) + Set.size (csPromised st)
+identitiesUsed st = Map.size (csJobs st) + Map.size (csPromised st)
 
 -- | The position of a due, to compare: a request that waits for no tick stands before any placed one.
 dueRank ∷ RootDue → (Word64, Word64)
@@ -178,9 +178,11 @@ failureOfFate c = \case
 shown ∷ Show a ⇒ a → Text
 shown = Text.pack . show
 
--- | A new job for a key. Its source is a failure already known, or waits for a read.
+-- | A new job for a key. Its source is a failure already known, or waits for a read. The room the job
+-- takes is the room a request may already have reserved for the identity: the reservation becomes the
+-- job, whichever path creates it.
 admitJob ∷ Coordinator → ContentKey → Bool → CState → (Job, CState)
-admitJob c key recorded st = (job, st {csSerial = csSerial st + 1})
+admitJob c key recorded st = (job, st {csSerial = csSerial st + 1, csPromised = Map.delete (moduleIdentity key) (csPromised st)})
   where
     fate = fateOf c key
     job =
@@ -446,16 +448,21 @@ acquireSTM c identity = do
             _ → defect "the loader asked for a source that is no longer held"
     Nothing → do
       key <- maybe (defect "the loader asked for an identity no content address made") pure (identityKey (coordInventory c) identity)
-      when (identitiesUsed st >= limitIdentities (coordLimits c)) $
-        defect "the loader recorded a dependency the identity bound has no room for"
-      let (job0, st1) = admitJob c key True st
-          job1 = job0 {jobInterest = True, jobNeeded = True}
-      case jobSource job1 of
-        SrcFailed sf → writeState c (setJob identity job1 {jobSource = SrcHanded} st1) >> pure (failureAnswer sf)
-        _ → do
-          writeState c (setJob identity job1 st1)
-          pump c
-          pure SourcePending
+      -- The identity bound is decided here, in the transaction that would take the interest: a boot load
+      -- or request another thread was accepted for since the loader read 'loaderReserved' has the room,
+      -- and this dependency is the one refused, as the ordinary limit it is. An identity a request
+      -- already reserved room for needs none.
+      if not (Map.member identity (csPromised st)) && identitiesUsed st >= limitIdentities (coordLimits c)
+        then pure SourceNoRoom
+        else do
+          let (job0, st1) = admitJob c key True st
+              job1 = job0 {jobInterest = True, jobNeeded = True}
+          case jobSource job1 of
+            SrcFailed sf → writeState c (setJob identity job1 {jobSource = SrcHanded} st1) >> pure (failureAnswer sf)
+            _ → do
+              writeState c (setJob identity job1 st1)
+              pump c
+              pure SourcePending
 
 failureAnswer ∷ SourceProblem → SourceAnswer
 failureAnswer sf = SourceFailure (encodeSourceReason (problemCode sf) (problemMessage sf))
@@ -489,6 +496,18 @@ releaseSTM c identity = do
 blockedSTM ∷ Coordinator → ExportIdentity → STM ()
 blockedSTM = needJob
 
+-- | The attributed reason an instance fails with when its code, outside any module's evaluation, ran into
+-- the failure of an identity (even if it caught the error): the failure told as a request's expected
+-- failure is, with the content that failed.
+observedReasonSTM ∷ Coordinator → ExportIdentity → BoundaryFault → STM Text
+observedReasonSTM c identity fault = do
+  st <- readState c
+  let located = maybe (Nothing, Nothing) (\job -> (Just job, Just (failureFor st job fault))) (Map.lookup identity (csJobs st))
+  pure $ case located of
+    (_, Just failure) ->
+      clipBytes messageLimit ("(import) " <> failureCode failure <> ": " <> failureMessage failure <> " [" <> failureRoot failure <> ":" <> failurePath failure <> "]")
+    _ -> "(import) module_error: a required module failed"
+
 -- Publication ----------------------------------------------------------------------------------------
 
 -- | The loader came to an outcome for these identities, in the order they did. Each is published once:
@@ -499,16 +518,11 @@ publishSTM ∷ Coordinator → [(ExportIdentity, ModuleStatus)] → STM [IO ()]
 publishSTM c settled = concat <$> forM settled (publishOne c covered)
   where
     -- A dependency's failure that an importer settled in the same advance failed with is the importer's
-    -- to report: it is the cause the importer's own failure names, not a second failure.
-    covered = concat [dependencyCauses fault | (_, ModuleFailed fault) <- settled]
+    -- to report: it is the cause the importer's own failure names, not a second failure. Told apart by
+    -- identity: two modules can fail with equal faults.
+    covered = concat [map ExportIdentity (dependencyIdentities fault) | (_, ModuleFailed fault) <- settled]
 
--- | The faults of the dependencies a fault was reached through, outermost first.
-dependencyCauses ∷ BoundaryFault → [BoundaryFault]
-dependencyCauses fault = case boundaryReason fault of
-  ModuleRefused (DependencyFailed _ inner) -> inner : dependencyCauses inner
-  _ -> []
-
-publishOne ∷ Coordinator → [BoundaryFault] → (ExportIdentity, ModuleStatus) → STM [IO ()]
+publishOne ∷ Coordinator → [ExportIdentity] → (ExportIdentity, ModuleStatus) → STM [IO ()]
 publishOne c covered (identity, status) = do
   st <- readState c
   case Map.lookup identity (csJobs st) of
@@ -533,7 +547,7 @@ publishOne c covered (identity, status) = do
           -- Diagnosed at most once, and only when nothing waits for it and no importer that failed with
           -- it as its cause carries the report.
           diagnose = case failed of
-            Just (fault, failure) | nobody && not (jobDiagnosed job) && fault `notElem` covered -> Just (fault, failure)
+            Just (fault, failure) | nobody && not (jobDiagnosed job) && identity `notElem` covered -> Just (fault, failure)
             _ -> Nothing
           job' =
             job
@@ -572,21 +586,15 @@ answerWith completion reply = do
     ReplyUnknown -> pure ()
     other -> throwModuleDefect ("a module answer was refused: " <> shown other)
 
--- | What a fault is told as, with the failing content located among the jobs by the fault of the
--- cause: the dependency that failed first, or the module itself.
+-- | What a fault is told as, with the failing content located by identity: the module's own for its
+-- own failure, and for a dependency's the identity the fault names at the bottom of its chain.
 failureFor ∷ CState → Job → BoundaryFault → ModuleFailure
 failureFor st job fault =
   failureOfFault (jobLabel job) located fault
   where
-    (_, cause) = innermostFault fault
-    located =
-      case [ (rootText (jobKey other), pathText (jobKey other))
-           | other <- Map.elems (csJobs st)
-           , Failed found _ <- [jobOutcome other]
-           , found == cause
-           ] of
-        found : _ -> found
-        [] -> (rootText (jobKey job), pathText (jobKey job))
+    located = case reverse (dependencyIdentities fault) of
+      raw : _ | Just other <- Map.lookup (ExportIdentity raw) (csJobs st) -> (rootText (jobKey other), pathText (jobKey other))
+      _ -> (rootText (jobKey job), pathText (jobKey job))
 
 -- Requests ---------------------------------------------------------------------------------------------
 
@@ -598,12 +606,15 @@ failureFor st job fault =
 reserveIdentitySTM ∷ Coordinator → ExportIdentity → STM Bool
 reserveIdentitySTM c identity = do
   st <- readState c
-  if Map.member identity (csJobs st) || Set.member identity (csPromised st)
+  if Map.member identity (csJobs st)
     then pure True
     else
-      if csPhase st == Open && identitiesUsed st < limitIdentities (coordLimits c)
-        then True <$ writeState c st {csPromised = Set.insert identity (csPromised st)}
-        else pure False
+      if Map.member identity (csPromised st)
+        then True <$ writeState c st {csPromised = Map.adjust (+ 1) identity (csPromised st)}
+        else
+          if csPhase st == Open && identitiesUsed st < limitIdentities (coordLimits c)
+            then True <$ writeState c st {csPromised = Map.insert identity 1 (csPromised st)}
+            else pure False
 
 -- | Give the reservation back if the request never reached the endpoint. Once the endpoint made the
 -- job the room is the job's, and an admission taken back after that returns nothing.
@@ -612,8 +623,8 @@ releaseIdentitySTM c identity = \case
   CreditSettled -> pure ()
   CreditUnused -> do
     st <- readState c
-    when (Set.member identity (csPromised st)) $
-      writeState c st {csPromised = Set.delete identity (csPromised st)}
+    -- Only this admission's own reservation: another request may still be counting on the room.
+    writeState c st {csPromised = Map.update (\n -> if n > 1 then Just (n - 1) else Nothing) identity (csPromised st)}
 
 -- | A permanent reason the request would be refused: the coordinator has closed, or the identity is
 -- new and the VM already holds every identity it may. Reads only. A pending or finished identity
@@ -635,7 +646,7 @@ reservedForLoaderSTM ∷ Coordinator → ExportIdentity → STM Int
 reservedForLoaderSTM c identity = do
   st <- readState c
   let unrecorded = length [() | (other, job) <- Map.toList (csJobs st), other /= identity, jobRoot job, not (jobRecorded job)]
-  pure (Set.size (Set.delete identity (csPromised st)) + unrecorded)
+  pure (Map.size (Map.delete identity (csPromised st)) + unrecorded)
 
 -- | What accepting a request came to: the work to hand the host, and what to do after the commit.
 data Accepted = Accepted
@@ -664,11 +675,11 @@ acceptRequest c key due number completion = do
       Nothing -> defect "a request was accepted before a loader was attached"
       Just endpoint -> case Map.lookup identity (csJobs st) of
         Nothing -> do
-          unless (Set.member identity (csPromised st)) $ defect "a request for a new identity was accepted without its reservation"
+          unless (Map.member identity (csPromised st)) $ defect "a request for a new identity was accepted without its reservation"
           let (job0, st1) = admitJob c key False st
           (work, waiter) <- subscribe identity number completion
           let job1 = job0 {jobRoot = True, jobDue = Just position, jobWaiters = Map.singleton number waiter}
-          writeState c (setJob identity job1 st1 {csPromised = Set.delete identity (csPromised st1)})
+          writeState c (setJob identity job1 st1)
           queued <- submitReservedRoot endpoint (RootRequest identity (jobLabel job1)) position
           closedOr queued
           pump c
@@ -742,7 +753,7 @@ acceptBoot c key = do
       | csPhase st == Closed -> pure BootRefusedClosed
       | otherwise -> case Map.lookup identity (csJobs st) of
           Nothing
-            | identitiesUsed st >= limitIdentities (coordLimits c) -> pure BootRefusedFull
+            | not (Map.member identity (csPromised st)) && identitiesUsed st >= limitIdentities (coordLimits c) -> pure BootRefusedFull
             | csBootWaiters st >= limitBootWaiters (coordLimits c) -> pure BootRefusedBusy
             | otherwise -> do
                 var <- newTVar Nothing
@@ -867,7 +878,7 @@ countsSTM c = do
       , jobsFailed = count (\job -> case jobOutcome job of Failed _ _ -> True; _ -> False)
       , jobsStopped = count (\job -> case jobOutcome job of Stopped -> True; _ -> False)
       , waitersHeld = sum (map jobWaiterCount jobs)
-      , promisedHeld = Set.size (csPromised st)
+      , promisedHeld = Map.size (csPromised st)
       , bytesOrdinary = chargedOrdinary (csCharges st)
       , bytesActive = chargedActive (csCharges st)
       , slotsFree = csSlotsFree st

@@ -127,11 +127,13 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import Data.Sequence (Seq, (|>))
 import qualified Data.Sequence as Seq
+import Data.Text (Text)
 import Data.Word (Word64)
 import Hetoimasia.Scripting.Lua.Owner
   ( AddressResolver
   , AdvanceReport (advanceBlocked, advanceSettled)
   , Blocked (BlockedIneligible)
+  , BoundaryFault
   , ExportIdentity
   , LoaderConfig (..)
   , ModulePhase
@@ -194,6 +196,12 @@ data LoaderHooks = LoaderHooks
   , hookReserved ∷ ExportIdentity → IO Int
     -- ^ How many identities other than this one the application has reserved room for and has not
     -- had admitted: the loader's 'loaderReserved'.
+  , hookObserved ∷ ExportIdentity → BoundaryFault → IO Text
+    -- ^ Code outside any module's evaluation (a hook, or a helper a hook called) looked up an
+    -- identity that has failed, with the fault it failed with: the attributed reason the instance
+    -- whose code ran fails with. The instance fails once the owner reaches its next safe boundary,
+    -- whatever the code did with the error the lookup raised; nothing fails when no instance's code
+    -- was running.
   , hookExit ∷ IO ()
     -- ^ The owner is exiting and the loader has been stopped, on the owner's thread: the application
     -- ends its own work for the VM. Runs whatever the stop came to.
@@ -201,7 +209,7 @@ data LoaderHooks = LoaderHooks
 
 -- | Hooks that do nothing.
 noLoaderHooks ∷ LoaderHooks
-noLoaderHooks = LoaderHooks (pure ()) (\_ → pure ()) (\_ → pure ()) (const (pure 0)) (pure ())
+noLoaderHooks = LoaderHooks (pure ()) (\_ → pure ()) (\_ → pure ()) (const (pure 0)) (\_ _ → pure "(import) module_error: a required module failed") (pure ())
 
 defaultLoaderBound ∷ Int
 defaultLoaderBound = 64

@@ -173,7 +173,7 @@ import Hetoimasia.Runtime.Supervision
 import qualified Hetoimasia.Runtime.Supervision as Supervision
 import Hetoimasia.Scripting.Lua.Admission (Necessity (..), admittedHandleType, newRequestHandles)
 import Hetoimasia.Scripting.Lua.Instance
-import Hetoimasia.Scripting.Lua.Loading (LoaderEndpoint)
+import Hetoimasia.Scripting.Lua.Loading (LoaderEndpoint, LoaderPlan)
 import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Provider
 import Hetoimasia.Scripting.Lua.Registration
@@ -448,10 +448,13 @@ data VmOptions = VmOptions
   -- where it is used.
   , optLogger ∷ Maybe Logger
   -- ^ A logger of the example's own, instead of the session's.
+  , optPlan ∷ LoaderPlan → LoaderPlan
+  -- ^ The loader plan the coordinator made, as the example wants to observe it from outside (an
+  -- example's hook that interleaves another thread at an exact point of the loader's own call).
   }
 
 defaultOptions ∷ Timing → VmOptions
-defaultOptions timing = VmOptions timing 4 2 64 "test" id Nothing
+defaultOptions timing = VmOptions timing 4 2 64 "test" id Nothing id
 
 -- | One VM: its owner, its coordinator and its loader endpoint.
 data Vm = Vm
@@ -514,7 +517,7 @@ withVm session runtime label options body = do
             { scheduledInstances = Just (defaultInstanceConfig {instanceBounds = InstanceBounds 8 16 8 8, instanceSources = [commandSource]})
             , scheduledRequestHandles = Just handles
             , scheduledRequests = Just grant
-            , scheduledLoader = Just (coordinatorPlan coordinator)
+            , scheduledLoader = Just (optPlan options (coordinatorPlan coordinator))
             }
     started ← startScheduledOwner runtime spec
     owner ← case started of

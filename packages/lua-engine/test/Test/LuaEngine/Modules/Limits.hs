@@ -5,10 +5,16 @@
 -- reserved, and an accepted load that meets a limit fails as a load, with what it completed kept.
 module Test.LuaEngine.Modules.Limits (spec) where
 
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, tryPutMVar)
+import Control.Exception (finally)
 import Control.Concurrent.STM (atomically)
+import Control.Monad (void)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.ByteString.Char8 as Char8
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (CountLimit (ModuleChainDepth, ModuleIdentitiesPerVm, RequestsPerInstance), Profile)
+import Hetoimasia.Scripting.Lua.Loading (LoaderHooks (..), LoaderPlan (..))
+import Hetoimasia.Scripting.Lua.Provider (RequestEndpoint (..))
 import Hetoimasia.Scripting.Lua.Value (Value (VText))
 import Test.Hspec
 import Test.LuaEngine.Modules.Support
@@ -192,6 +198,75 @@ loads = describe "an accepted load that meets a limit" $ do
           >>= \found → case found of
             ImmediateNotReady → pure ()
             _ → expectationFailure "the refused dependency should have no entry"
+
+  it "refuses the dependency, and not the load already accepted, when the load is accepted between the loader's reading of the reserved room and its asking for the source" $
+    withSession tiny (2, 8) realReader layout $ \session _ runtime → do
+      raced ← newIORef Nothing
+      tickets ← newIORef []
+      let afterReading plan =
+            plan
+              { planHooks =
+                  (planHooks plan)
+                    { hookReserved = \identity → do
+                        seen ← hookReserved (planHooks plan) identity
+                        -- The window: the room was counted, nothing has asked for the source yet.
+                        armed ← readIORef raced
+                        case armed of
+                          Just act | identity == moduleIdentity (key' session "d2.lua") → do
+                            writeIORef raced Nothing
+                            act
+                          _ → pure ()
+                        pure seen
+                    }
+              }
+      withVm session runtime "ui" (defaultOptions OnArrival) {optPlan = afterReading} $ \vm → do
+        admitDriver session vm "x"
+        admitDriver session vm "w"
+        command session vm "w" "start" "k0" [] (Just (fetch "d1.lua"))
+        awaitCounts vm (\c → jobsReady c == 1)
+        command session vm "x" "start" "k1" [] (Just (fetch "held.lua"))
+        awaitGate session "held"
+        -- Two identities are held (d1 and held) and one place is left: the boot load takes it as the
+        -- module asks for its second dependency, which the loader's count still showed room for.
+        writeIORef raced (Just (bootNow session vm "i1.lua" >>= \ticket → modifyIORef' tickets (ticket :)))
+        releaseGate session "held"
+        failure ← awaitFailure session "x"
+        fmap snd (requestFailureOf failure) `shouldSatisfy` maybe False (Text.isInfixOf "module_limit")
+        readIORef tickets >>= \accepted → case accepted of
+          [ticket] → awaitBootOutcome ticket >>= (`shouldBe` BootReady)
+          other → expectationFailure ("expected one boot load, found " <> show (length other))
+        counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (3, 0)
+        atomically (lookupImmediate (vmCoordinator vm) (moduleIdentity (key' session "i1.lua")))
+          >>= \found → case found of
+            ImmediateReady _ → pure ()
+            _ → expectationFailure "the accepted boot load should be ready"
+
+  it "turns the room a request reserved into the boot load's job, so the identity is counted once and the boot join is never refused at the limit" $ do
+    gate ← newEmptyMVar
+    let holding endpoint = endpoint {endpointSubmit = \submission → readMVar gate >> endpointSubmit endpoint submission}
+    withSession tiny (2, 8) realReader layout $ \session _ runtime →
+      withVm session runtime "ui" (defaultOptions OnArrival) {optWrap = holding} $ \vm →
+        -- The gate is opened whatever the example finds, so that a failure of the example is not a
+        -- hang of the owner it holds.
+        (`finally` void (tryPutMVar gate ())) $ do
+          admitDriver session vm "x"
+          -- Two identities held, so the third place is the request's alone.
+          mapM_ (\path → bootNow session vm path >>= awaitBootOutcome >>= (`shouldBe` BootReady)) ["i2.lua", "i3.lua"]
+          command session vm "x" "start" "k1" [] (Just (fetch "i1.lua"))
+          awaitCounts vm (\c → promisedHeld c == 1)
+          -- The boot load of the same identity arrives before the request reaches the endpoint.
+          ticket ← bootNow session vm "i1.lua"
+          counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (3, 0)
+          putMVar gate ()
+          awaitNote session "x start k1 started"
+          awaitBootOutcome ticket >>= (`shouldBe` BootReady)
+          command session vm "x" "ready" "k1" [] Nothing
+          awaitNote session "x ready k1 true"
+          counts' vm >>= \c → (jobsHeld c, promisedHeld c, jobsReady c) `shouldBe` (3, 0, 3)
+          -- Counted once: a second new module is refused as a full cache.
+          command session vm "x" "pstart" "k2" [] (Just (fetch "i4.lua"))
+          line ← lineStartingWith session "x pstart k2 error"
+          line `shouldSatisfy` Text.isInfixOf "module limit"
 
 counts' ∷ Vm → IO Counts
 counts' = counts

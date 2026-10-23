@@ -53,6 +53,12 @@ data SourceAnswer
   | -- | The source cannot be had: the supplier's bounded reason. The identity fails
     -- stickily, attributed to this.
     SourceFailure !Text
+  | -- | Only ever the answer to 'supplierAcquire' for a /dependency/: the application's own bound
+    -- on identities leaves no room for it, decided where the application keeps the bound, in the
+    -- same step that would have taken the interest. The loader keeps no record of the identity
+    -- and refuses the import as an ordinary, catchable limit; the supplier took no interest.
+    -- Delivered later, or answered for a root, it fails the identity like any refused source.
+    SourceNoRoom
   deriving (Eq, Show)
 
 -- | The narrow seam through which the loader gets verified source bytes.
@@ -119,6 +125,13 @@ data LoaderConfig = LoaderConfig
     -- identity that is reserved itself is not counted against itself. Asked on the owner's
     -- thread (an import's callback is one), and never negative. A call that raises is the
     -- application's failure.
+  , loaderObserved ∷ !(ExportIdentity → BoundaryFault → IO ())
+    -- ^ Told, before the call raises, that code outside any module's evaluation (a hook, or a helper
+    -- a hook called) looked up an identity that has already failed, with the fault it failed with.
+    -- The call raises an ordinary Lua error, which that code may catch; what the lookup means for
+    -- the code that made it is the application's to decide here, in the same step, and no
+    -- catching can undo it. Asked on the owner's thread. A call that raises is the application's
+    -- failure.
   , loaderMayRun ∷ !(IO Bool)
     -- ^ Whether the owner allows further ordinary evaluation now. Asked before every
     -- fresh piece of module code the loader would run in an advance: a root's start, a
@@ -131,7 +144,7 @@ data LoaderConfig = LoaderConfig
 -- | A loader over a supplier and a resolver, in which every root is always eligible, no
 -- phase is published and evaluation is always allowed.
 loaderConfig ∷ SourceSupplier → AddressResolver → LoaderConfig
-loaderConfig supplier resolver = LoaderConfig supplier resolver (const (pure True)) Nothing (const (pure 0)) (pure True)
+loaderConfig supplier resolver = LoaderConfig supplier resolver (const (pure True)) Nothing (const (pure 0)) (\_ _ → pure ()) (pure True)
 
 -- | Whether a module's top level is running, readable by an application's own
 -- preconditions without asking the VM for anything. A module's top level runs in a
