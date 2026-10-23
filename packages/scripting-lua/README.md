@@ -2562,14 +2562,18 @@ to the application on the owner's thread, before the segment that follows
 (`scheduledObserve`); a binding that should answer a script's question about its tick keeps
 what it was told where it reads it.
 
-`scheduledRefusedWait` is told, on the owner's thread, of each wait the scheduler refused (a `WaitRefusal`), **at the boundary of
-the segment that asked for it and first there**: the scheduler keeps each refusal in its state, in the transaction that refuses
-it (`takeRefusedWaits` takes them, oldest first), and the owner's boundary step takes them before it looks at an instance, a
-provider or the loader, before it can write an acknowledgement that answers an accounting wait, and before the scheduler chooses
-another segment. The task still failed and its instance still ends exactly as before, and the default does nothing. It is for an
-application whose own bindings check a wait before they suspend and so treat a refusal as the engine's fact (a clock that moved
-between the check and the placement): what it raises is a failure of the host, leaves the turn at that boundary, and ends the
-owner as any other does, with no peer dispatched and no accounting acknowledged after the refusal.
+`scheduledRefusedWait` is told, on the owner's thread, of each wait the scheduler refused (a `WaitRefusal`), **at the moment the
+scheduler applies the report that asked for it and before anything else runs**: it is the owner's answer to the scheduler's
+`hostRefused` (a required field of `TaskHost`, called from the scheduler's `runSegment` the moment the report is applied). The
+order of a turn is: the segment runs; its report is applied (a refused wait is created here, and nowhere else); **the host is told**;
+the budget's overrun is accounted; the continuation the report left is closed (the script's own `__close` handlers run); then the next
+boundary (instances, providers, the loader and, last, the acknowledgement of an accounting wait), and only then another segment is
+chosen. Nothing is kept for a later look: the notice is a call, not a queue, so a host that ignores it (every standalone `serviceTurn`
+caller does, by saying so in its `TaskHost`) retains nothing. The task still failed and its instance still ends exactly as before, and
+the default does nothing. It is for an application whose own bindings check a wait before they suspend and so treat a refusal as the
+engine's fact (a clock that moved between the check and the placement): what it raises is a failure of the host and leaves the turn
+there, with the close the refusal left still owed (the scheduler's stop makes it), so a script's handler cannot keep the failure from
+being reported, no peer is dispatched and no accounting is acknowledged after it.
 
 ### Waiting for the owner's accounting
 
