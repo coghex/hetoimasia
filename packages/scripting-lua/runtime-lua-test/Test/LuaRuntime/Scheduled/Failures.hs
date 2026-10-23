@@ -311,10 +311,24 @@ spec = describe "host failures, failure and cancellation" $ do
 
     it "keeps a closing failure as cleanup evidence on a cancelled owner, which is fatal" $ bounded $ do
       fixture ← newSFixture
-      ExceptionWithContext context failure ← expectFatal $ \control runtime → do
+      ExceptionWithContext context failure ← expectFatalOpening [openAllGates fixture] $ \control runtime → do
         owner ← startScheduled fixture runtime (scheduled fixture "cancelled badly" requiredPolicy defaultSchedulerBounds)
         _ ← admitTask' fixture owner "bad" (request "closes_badly" [VText "b"] OrdinaryClass OneShot Nothing)
         awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
+        -- A cancel request is also a stop request, and an idle owner wakes on it: an owner
+        -- that reaches its stop check before the helper that delivers the cancellation has
+        -- landed it exits in order, and the close that fails is then the primary failure,
+        -- not cleanup evidence on a cancelled worker. So the owner is held where only the
+        -- cancellation reaches it: the application's observer, which runs on the owner's
+        -- thread before every segment, waits at a gate nothing opens, as the task admitted
+        -- next makes the owner start one. The owner's thread is blocked in Haskell, which a
+        -- cancellation interrupts, and the cancellation is the only way out of it, so it
+        -- lands before the owner can reach its stop check, however late its helper runs.
+        -- Holding a callback inside Lua would not do: that is a safe foreign call, and the
+        -- delivery does not complete until it returns.
+        writeIORef (sfObserver fixture) (\_ → blockOn fixture "hold")
+        _ ← admitTask' fixture owner "trigger" (request "echo" [VInteger 1] OrdinaryClass OneShot Nothing)
+        awaitEntered fixture "hold"
         cancelScheduled owner
         awaitScheduledTerminal control owner
       -- A worker that was cancelled and whose cleanup failed ends fatally, as the
