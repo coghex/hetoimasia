@@ -17,7 +17,8 @@ through the verified read the caller passes it (normally the content inventory's
 imports no module that opens a file itself. The **M1 request adapter**
 (LFE-7) is the `request` sublibrary beside it, in a source directory of its own
 so that this one stays pure: see [below](#the-m1-request-adapter). The **raw-data provider**
-(LFE-10) is the `data` sublibrary, for the same reason: see [below](#the-raw-data-provider-lfe-10).
+(LFE-10) is the `data` sublibrary, for the same reason: see [below](#the-raw-data-provider-lfe-10). The **texture pipeline**
+(LFE-16) is the `texture` sublibrary: see [below](#the-texture-pipeline-lfe-16).
 
 The library depends on `hetoimasia-foundation` (its `Duration`, checked
 nanoseconds from 1 to 2^64 − 1), on the Lua host and its runtime
@@ -37,6 +38,7 @@ composition to this package; they are not here.
 | `Hetoimasia.LuaEngine.Boot` | `contentConfiguration`, `bootCheckpoint`, `bootCheckpointFrom`, `checkManifestPinned`; `Checkpoint`, `ResolvedEntry`, `BootRefusal` |
 | `Hetoimasia.LuaEngine.Request` (sublibrary `request`) | the M1 request policy over a validated profile and the exact common result adapter: `m1Requests`, `startM1`, `m1ArgumentCheck`, `m1RequestBindings` |
 | `Hetoimasia.LuaEngine.Data` (sublibrary `data`) | the raw-data provider over the content package's read pool and the per-VM byte bank: `dataService`, `dataEndpoint`, `dataKey`, `startData`, `dataArgumentCheck`, `newByteBankFor` |
+| `Hetoimasia.LuaEngine.Texture`, `Hetoimasia.LuaEngine.Texture.Backend` (sublibrary `texture`) | the texture pipeline: `textureSpec`, `withTexturePipeline`, `newTextureOwner`, `textureService`, `textureEndpoint`, `textureKey`, `startTexture`, `textureArgumentCheck`, `withTexture`, `releaseTexture`; and the backend port `TextureBackend`, `Upload`, `UploadSink` |
 
 Every other module is hidden. A client of the pure boundary imports the manifest, the profile and the behavior modules.
 
@@ -525,13 +527,148 @@ delivery order; queued and in-progress cancels; an early held result against a c
 read; one instance or VM ending while another carries on; an owner stopped repeatedly; every place held yet completions
 still landing; and a pool that is down when a request is handed over.
 
+## The texture pipeline (LFE-16)
+
+`Hetoimasia.LuaEngine.Texture` (the `texture` sublibrary) answers a request for a **usable, instance-owned texture**: one
+operation covering a verified read, a static PNG decode, an upload and a registration. It is a composable typed endpoint,
+not a Lua API: the eventual graphics facade (LFE-21) parses its arguments with `textureKey`, builds its binding from
+`startTexture` beside `textureArgumentCheck`, registers the handle type `texture` over its `Leases`, and binds
+`releaseTexture` to `release`. Nothing is installed in a VM. It imports the profile, the [request
+adapter](#the-m1-request-adapter), the content package's public modules, the [bounded PNG
+decoder](../asset-image/README.md#bounded-png-decode), the foundation's resource and worker modules and the host's public
+modules, and nothing of a game, window, GPU, Vulkan, GLFW or console. **It cannot succeed without a backend**:
+`TextureBackend` is injected (below), and the concrete implementation is LFE-17's; a fake backend is a test fixture only.
+
+### What a script receives
+
+A successful `take` yields `{status = "success", value = {texture = HANDLE, width = INTEGER, height = INTEGER}}` with the
+instance's opaque texture lease and the source dimensions (`textureValueSchema`). Success is made only by the backend's
+evidence that the upload completed **and** the registration is usable; a decoded image, an accepted submission or an
+allocated native handle is none of that. It promises no displayed frame and no window, and works before any window exists.
+An expected failure carries one of `textureCodes` with the root and path: `not_found`, `content_changed`, `io_error`,
+`too_large` (a file over 32 MiB, or a decode over a limit, the lane's workspace included), `unsupported_format` (not a PNG,
+or animated) and `invalid_image`. A malformed address, a wrong phase and a closed owner are ordinary Lua errors before any
+admission. Required is the default and optional is explicit; there is no tick offset. A backend, device, allocator, reader or
+cleanup fault is a provider defect: it fails the owner, required or optional alike, is never given a code and never busy.
+
+### What is reserved, and when
+
+One atomic admission (the host's `startAdmitted`) reserves, before the provider is handed anything:
+
+| Reservation | Bank | Returned |
+|---|---|---|
+| Request and result records, the owner's places | the host: 16 per instance, 64 per VM | the result taken **and** the work retired |
+| Result lease capacity | the instance's lease scope | with the instance's lease |
+| One texture slot | `texture slots`: 16 pending/live/retiring per UI instance | the texture proved retired |
+| 16 MiB of nominal RGBA8 bytes | `texture bytes`: 128 MiB per instance and 256 MiB per session, taken from both or neither | shrunk to `width * height * 4` once the decode validated the dimensions; the remainder returned when the texture is proved retired |
+| One accepted-work record | `texture jobs`: the session's job capacity (`textureSpec`), which bounds every stage queue | the request taken and its work retired |
+| One queue slot of the shared read pool | `io queue` | the request taken and its read retired (only for a file that will be read) |
+
+A bank without room is the host's busy answer, naming the bank, with **no file open, no decode, no backend call and nothing
+left reserved**; a refusal that races other admissions takes nothing from them, because every reservation is made in one STM
+transaction. The 16 MiB is reserved without reading a header, so a small image can be refused busy while larger
+reservations are held: accepted behavior. A file the inventory does not hold, or one over 32 MiB, is accepted and fails
+without a worker. The slot and the nominal bytes **transfer** to the texture when a lease adopts it: they are not returned
+when the request is taken, when the pipeline's CPU buffers retire or when Lua loses its handle, but when the backend proves
+the texture itself retired.
+
+### The pieces and who owns them
+
+| State | Owner | Writers | Readers | Lifetime and disposal |
+|---|---|---|---|---|
+| The pipeline's one state (`PState`: jobs, lanes, orphans, latch) | the pipeline scope, `withTexturePipeline` | the host's admission and credit release, the read workers' sinks, the decode worker, the backend's sink calls, the drain; always STM | `pipelineReading` | the scope; the drain waits for every started stage before it returns |
+| A texture owner's banks | one UI instance's bindings, from `newTextureOwner` (no registry) | admission, the decode stage's shrink, the lease and the pipeline's housekeeping | `ownerReading` | until its textures are retired; `closeTextureOwner` only stops new requests |
+| A lane and its workspace bank (128 MiB) | the pipeline | the read sink, the decoder's account, the handoff, the backend's buffer retirement | `readingLanes` | a job holds it from the start of its read until the backend stops reading the level |
+| A job (stage, buffers, withdrawn/stopping flags) | the pipeline | the same | diagnostics | from admission until the host returns its record; entries exist only for admitted requests |
+| A texture's `Cell` | the pipeline until a lease adopts it, then the lease | the backend's sink, the adoption recipe, the release | the retirement readings | exactly one party calls the backend's release, once |
+
+There are two session read workers (the shared pool, LFE-10), **one decode worker** and **two lanes**. No thread is made
+for a request, an instance or a VM.
+
+### A job
+
+```
+Pending --lane--> Reading --sink--> DecodeWait --worker--> Decoding --handoff--> Uploading --> Settled
+   (any stage --> Settled when withdrawn, refused or failed)
+```
+
+* **Pending**: accepted and waiting for a lane; no workspace, no file. The oldest admitted job starts first (the order is
+  fixed inside the admission transaction).
+* **Reading**: the lane's workspace is charged the file's known length and the read goes to the shared pool with the
+  texture's 32 MiB allowance. Reads use the ordinary class; the pool's priority for an active module dependency is
+  untouched. The read worker's execution slot is free as soon as the sink returned.
+* **DecodeWait / Decoding**: the one decode worker preflights the PNG (`preflightPng`), shrinks the nominal charge in one
+  transaction, and decodes with `decodeBounded` onto the lane's workspace bank. The input is released and dropped at the
+  handoff, the one place the pipeline stops holding it.
+* **Uploading**: the decoded level is borrowed by the backend and charged to the lane until the backend retires it.
+* **Settled**: the job holds no lane, workspace or buffer. **A job is never answered to the host before it is Settled**:
+  the host reads an answer as proof the provider's work is over, so answering while a lane still charges the job's buffers
+  would end the request's work early.
+
+The lane is released, and the next pending job started, in the transaction that settles a job. Transitions no event drives
+(a read cancelled after its worker took it retires without calling its sink; a delivered texture no lease will own) are
+driven by the decode worker's loop and, at close, by the drain: both run the same housekeeping step in STM, so nothing
+polls and nothing sleeps, and closing never depends on the worker being alive.
+
+### A texture nobody owns yet
+
+On the backend's usable registration the pipeline holds a `Cell` and answers the request with a resource the host builds,
+on the owner's thread, into the lease the admission reserved. Until that build runs the texture belongs to the cell and
+afterwards to the lease; the cell's state machine decides who may release it. If the host drops the build (the request was
+cancelled, its instance ended) it does not tell the provider, so the pipeline learns of it where the host does return a
+credit: a credit that transfers, returned unused, means no lease owns the texture, and the pipeline's housekeeping releases
+it and returns the charge only when the backend proves it retired. A lease built over a cell the pipeline already released
+returns its charges when that release retires.
+
+### Release, cancellation and teardown
+
+* `releaseTexture` revokes the instance's authority for new scenes at once, asks the backend to release once and never
+  waits. It answers `done` when this first release itself completes retirement, `retiring` for a first or repeated release
+  while retirement is pending, and `already_released` after an earlier release actually retired. A release that raised is
+  retained, is fatal, runs no native cleanup again and is the answer to every later release. Another instance's handle is
+  refused by the existing handle boundary before any backend action. A scene that already holds the texture keeps it: the
+  backend's retirement reading is the evidence, and the slot and bytes stay charged until it says so.
+* Cancelling withdraws interest. Unstarted work is withdrawn (pending, or queued in the pool before any file is opened);
+  started work is retired safely: a read runs to its end with its sink suppressed, a decode finishes and discards, an
+  upload is told to cancel and the backend still owes the end of the work. Consuming a cancellation releases nothing that is
+  active. A late texture is released once and never reaches the request.
+* Closing admission precedes every drain. The scope withdraws what has not started, tells started work to stop, then waits
+  in STM, outside any uninterruptible release, for every read, decode and upload to retire and for every texture it still
+  holds to be released and proved retired; a cancellation delivered meanwhile is remembered and raised after. Only then does
+  the group stop the worker, and only then may the pool, the inventory and the backend unwind. Nothing is reported over while
+  the backend still holds a buffer.
+
+### The backend port
+
+`TextureBackend` has one operation, `backendUpload upload sink`, which must not block, and a sink with four calls: a usable
+registration (`sinkReady`, carrying a `BackendTexture` whose `textureRelease` is called at most once and answers the
+backend's own reading of its retirement), a failure, a withdrawal, and the retirement of the borrowed level. A backend
+delivers exactly one terminal event and one retirement per accepted upload. Ownership changes only at `SinkTaken`: a
+`SinkLate` answer took nothing, and what the backend passed stays its own. The backend outlives the pipeline and every
+texture it delivered.
+
+### Failure latch
+
+The pipeline's first failure is latched with later ones appended as evidence, by one transaction that reads the current
+value (`latchFailure`), so concurrent failures are all kept; the scope raises it, composed with a close failure and the
+worker group's report, and `awaitPipelineFailure` lets the assembly's supervisor see it.
+
+### What proves it
+
+`Test.LuaEngine.Texture.*` (group `test.lua-engine`) run real instances on real supervised owners and leases, a real
+temporary content root, inventory and pool behind gates, the real bounded decoder over generated PNGs, and an **injected**
+backend that holds every upload and every release until the example says otherwise (it proves ownership transitions, not
+uploaded texels or GPU readiness: LFE-17 establishes those). Each bank is filled and refused with nothing left reserved,
+the fixed values are checked, the stages and cancellation windows are driven by gates and hooks, never by sleeping, and a
+separately compiled client composes the pipeline through public modules. `PipelineHooks` are this package's coordination
+points for those examples; production uses `noHooks`.
+
 ## Deferred, by design
 
 Not here, and not claimed: the CLI `run` dispatch and exit mapping (LFE-22), which will
 consume the boot checkpoint and retain the same anchored root;
-the loader and import resolution (LFE-9), the concrete content, time, graphics and status
-service facades (only the request adapter's common operations are here) and their metadata and grant policy (LFE-12), workers and session startup; live codec, texture and GPU budgets and their
-enforcement; time sampling and scheduling; mods, metadata extensions, alternate
+the concrete GPU upload and registration, native budgets and scene holds (LFE-17 to LFE-20), the public Lua graphics binding (LFE-21), the loader and import resolution (LFE-9), the concrete content, time, graphics and status
+service facades (only the request adapter's common operations are here) and their metadata and grant policy (LFE-12), workers and session startup; the native GPU budgets; time sampling and scheduling; mods, metadata extensions, alternate
 manifest formats, defaults or relaxed parsing.
 
 ## Tests
@@ -546,8 +683,9 @@ The manifest, profile and behavior examples perform no IO and start no Lua; the 
 examples scan real temporary folders through the content package and evaluate nothing (the Lua host's behavior
 mechanism is tested in its own suites); the request adapter's examples start real Lua instances on a real
 supervised owner, with controlled fake providers, and no window or GPU; the raw-data provider's examples do the same over a real
-content root, inventory and read pool (see above). It covers the accepted
+content root, inventory and read pool (see above), and the texture pipeline's over that and the real bounded PNG decoder with an
+injected upload backend (see above). It covers the accepted
 examples, every syntax and schema refusal with the limits at their boundary and
 one past, the exact tick endpoints and forbidden forms, every fixed value against
 an independently written expectation, valid smaller profiles and refused ones,
-the behavior selection's cadence rules and numeric boundaries, the boot checkpoint (see above), the request adapter (see above), the raw-data provider (see above), and this package's dependency and import boundary.
+the behavior selection's cadence rules and numeric boundaries, the boot checkpoint (see above), the request adapter (see above), the raw-data provider (see above), the texture pipeline (see above), and this package's dependency and import boundary.
