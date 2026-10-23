@@ -696,7 +696,11 @@ backend that holds every upload and every release until the example says otherwi
 uploaded texels or GPU readiness: LFE-17 establishes those). Each bank is filled and refused with nothing left reserved,
 the fixed values are checked, the stages and cancellation windows are driven by gates and hooks, never by sleeping, and a
 separately compiled client composes the pipeline through public modules. `PipelineHooks` are this package's coordination
-points for those examples; production uses `noHooks`.
+points for those examples; production uses `noHooks`. Two rules keep the examples from hanging
+or racing: an example acts on a result only after the host's own reply (the script waits for it with `wait_take`; the
+pipeline settling a job is not the host having the answer), and every exit of an example or of a nested scope, an assertion
+failure included, opens every gate and hook it can hold and lets every backend answer what it owes before anything waits for
+the pipeline to drain.
 
 ## The module coordinator (LFE-11)
 
