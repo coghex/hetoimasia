@@ -30,14 +30,21 @@ module Hetoimasia.Scripting.Lua.Loading
   , loaderPlan
   , defaultLoaderBound
   , RootDue (..)
+  , LoaderHooks (..)
+  , noLoaderHooks
   , LoaderPlanRefused (..)
   , LoaderViolation (..)
     -- * The endpoint
   , LoaderEndpoint
   , SubmitAnswer (..)
   , submitRoot
+  , submitReservedRoot
+  , PromoteAnswer (..)
+  , promoteSubmitted
+  , pokeLoader
   , NotifyAnswer (..)
   , notifySource
+  , notifySourceNow
   , LoaderOutcome (..)
   , loaderOutcome
   , awaitLoaderOutcome
@@ -48,21 +55,28 @@ module Hetoimasia.Scripting.Lua.Loading
 
 import Hetoimasia.Scripting.Lua.Loading.State
   ( LoaderEndpoint (..)
+  , LoaderHooks (..)
   , LoaderOutcome (..)
   , LoaderPlan (..)
   , LoaderPlanRefused (..)
   , LoaderViolation (..)
   , LoadingDiagnostics (..)
   , NotifyAnswer (..)
+  , PromoteAnswer (..)
   , RootDue (..)
   , SubmitAnswer (..)
   , defaultLoaderBound
   , awaitOutcomeIn
   , diagnosticsIn
   , loaderPlan
+  , noLoaderHooks
   , notifySourceIn
+  , notifySourceSTM
   , outcomeIn
+  , pokeLoadingSTM
+  , promoteRootSTM
   , refusalsIn
+  , submitReservedRootSTM
   , submitRootIn
   )
 import Control.Concurrent.STM (STM)
@@ -73,6 +87,29 @@ import Hetoimasia.Scripting.Lua.Owner (ExportIdentity, RootRefusal, RootRequest,
 -- ('SubmitOutOfOrder'), so the loader's queue is in logical order.
 submitRoot ∷ LoaderEndpoint → RootRequest → RootDue → IO SubmitAnswer
 submitRoot (LoaderEndpoint state) = submitRootIn state
+
+-- | 'submitRoot' for a root whose identity the application reserved room for when it accepted it,
+-- in the application's own transaction: the root is accepted if and only if that transaction
+-- commits, and the loader does not ask its identity bound of it again. The place a logical root
+-- stands at ('DueAt') is its tick and sequence.
+submitReservedRoot ∷ LoaderEndpoint → RootRequest → RootDue → STM SubmitAnswer
+submitReservedRoot (LoaderEndpoint state) = submitReservedRootSTM state
+
+-- | Say that a root submitted and not finished is placed no later than this, in the application's
+-- own transaction. A place only ever moves earlier. The owner gives it to the loader at its next
+-- boundary, and the tick the earliest placed root holds follows it. No second record, interest or
+-- evaluation is made.
+promoteSubmitted ∷ LoaderEndpoint → ExportIdentity → RootDue → STM PromoteAnswer
+promoteSubmitted (LoaderEndpoint state) = promoteRootSTM state
+
+-- | Ask the owner to run the plan's 'hookService' at its next boundary, waking it for it: where an
+-- application raises a failure that a thread of its own could only record.
+pokeLoader ∷ LoaderEndpoint → STM ()
+pokeLoader (LoaderEndpoint state) = pokeLoadingSTM state
+
+-- | 'notifySource', in the provider's own transaction.
+notifySourceNow ∷ LoaderEndpoint → ExportIdentity → SourceAnswer → STM NotifyAnswer
+notifySourceNow (LoaderEndpoint state) = notifySourceSTM state
 
 -- | Leave the source a provider found, or its failure, for the owner to deliver. Never
 -- blocks. A second notification for an identity that is still waiting changes nothing.

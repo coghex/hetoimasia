@@ -15,6 +15,7 @@ module Hetoimasia.Scripting.Lua.Provider.Call
   , serviceOf
   , requesterIn
   , refuse
+  , refuseOrdinarily
   , infoFor
 
     -- * Handle liveness
@@ -34,7 +35,7 @@ import Data.Word (Word64)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (operation, throwFailure)
 import Hetoimasia.Scripting.Lua.Instance.Types (InstanceId (InstanceId))
-import Hetoimasia.Scripting.Lua.Internal.Fault (CallRefusal (CallRefusal))
+import Hetoimasia.Scripting.Lua.Internal.Fault (CallRefusal (CallRefusal), OrdinaryCallRefusal (OrdinaryCallRefusal))
 import Hetoimasia.Scripting.Lua.Provider.State
 import Hetoimasia.Scripting.Lua.Provider.Types
 import Hetoimasia.Scripting.Lua.Registration (RequestContext, fromRequestContext)
@@ -59,6 +60,12 @@ serviceOf context = case fromRequestContext context of
 -- application's code.
 refuse ∷ RequestRefusal → IO a
 refuse = throwIO . CallRefusal . renderRequestRefusal
+
+-- | Refuse the call, as the engine, with a refusal that is final and not a fault: for a binding opted in
+-- to ordinary refusals Lua sees an ordinary error it may catch and go on from, for any other binding it
+-- is the fault of the call 'refuse' raises.
+refuseOrdinarily ∷ RequestRefusal → IO a
+refuseOrdinarily = throwIO . OrdinaryCallRefusal . renderRequestRefusal
 
 -- | Who is calling, or the refusal that nobody is.
 requesterIn ∷ ProviderState → IO Requester

@@ -10,6 +10,7 @@ import qualified Test.LuaEngine.Manifest.Examples as Examples
 import qualified Test.LuaEngine.Manifest.Schema as Schema
 import qualified Test.LuaEngine.Manifest.Syntax as Syntax
 import qualified Test.LuaEngine.Manifest.Tick as Tick
+import qualified Test.LuaEngine.Modules.Spec as Modules
 import qualified Test.LuaEngine.Profile as Profile
 import qualified Test.LuaEngine.Request.Spec as Requests
 import qualified Test.LuaEngine.Scene.Spec as Scene
@@ -25,6 +26,7 @@ spec = describe "LuaEngine" $ do
   Profile.spec
   Requests.spec
   Data.spec
+  Modules.spec
   Texture.spec
   Scene.spec
   Behavior.spec

@@ -79,6 +79,7 @@ module Hetoimasia.Scripting.Lua.Scheduler.State
   , releaseTickIn
   , tickHeld
   , oweTickIn
+  , tickQuietIn
   , releaseOwedIn
   , tickOwed
 
@@ -957,6 +958,24 @@ releaseTickIn tick state = state {ssGates = Map.update lessen tick (ssGates stat
     lessen count
       | count <= 1 = Nothing
       | otherwise = Just (count - 1)
+
+-- | Whether the scheduler stands at the boundary just before this tick: every tick before it has
+-- begun and finished, nothing is ready or waiting to start, and this tick has not begun. A tick
+-- the scheduler has begun already is not waited for (it is past), and tick zero has nothing
+-- before it. The owner's own module work for a tick is started at this point and held there
+-- ('holdTickIn'), so that it is finished before any of the tick's work begins.
+tickQuietIn ∷ Word64 → SchedState v → Bool
+tickQuietIn tick state
+  | tick == 0 || ssTick state >= tick = True
+  | ssTick state + 1 /= tick = False
+  | otherwise = finishedGrant && noReadyTask && noStartableAdmission
+  where
+    session = ssSession state
+    finishedGrant = case Seq.viewl (ssGrants state) of
+      grant :< _ → not (grantApplied grant) || grantDue grant == 0
+      EmptyL → True
+    noReadyTask = not (any ((== Ready) . taskState) (Map.elems (sessionTasks session)))
+    noStartableAdmission = Seq.null (sessionQueued session) || not (slotFree state)
 
 -- | Whether the owner needs something finished before this tick is complete.
 tickOwed ∷ Word64 → SchedState v → Bool

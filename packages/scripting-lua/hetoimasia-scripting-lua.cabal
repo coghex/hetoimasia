@@ -312,6 +312,7 @@ test-suite lua-host-tests
         Test.Lua.Boundary.Bindings
         Test.Lua.Boundary.Dependencies
         Test.Lua.Boundary.Discipline
+        Test.Lua.Boundary.ExportTable
         Test.Lua.Boundary.Exports
         Test.Lua.Boundary.Finalizers
         Test.Lua.Boundary.Independence
@@ -320,6 +321,7 @@ test-suite lua-host-tests
         Test.Lua.Boundary.Loader
         Test.Lua.Boundary.Loader.Failures
         Test.Lua.Boundary.Loader.Limits
+        Test.Lua.Boundary.Loader.Placed
         Test.Lua.Boundary.Loader.Stop
         Test.Lua.Boundary.Loader.Support
         Test.Lua.Boundary.Loader.Threads

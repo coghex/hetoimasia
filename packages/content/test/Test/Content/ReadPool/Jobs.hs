@@ -224,6 +224,28 @@ cancelling = describe "withdrawing interest" $ do
         startedPaths probe `shouldReturn` ["a.bin"]
         map fst <$> seenOutcomes outcomes `shouldReturn` ["a.bin"]
 
+  it "withdraws a queued job only, and leaves a job a worker took to deliver to its sink" $ do
+    probe ← newProbe
+    closeGate probe "a.bin"
+    withInventory [("a.bin", "a"), ("b.bin", "b")] $ \root inventory →
+      withReadPoolUsing (poolOf 1 4) (probeReader probe (readVerified inventory root)) $ \pool → do
+        outcomes ← newOutcomes
+        running ← accepted pool (request inventory outcomes OrdinaryRead 64 "a.bin")
+        awaitStarted probe 1
+        queued ← accepted pool (request inventory outcomes OrdinaryRead 64 "b.bin")
+        -- The job a worker holds is not withdrawn, and nothing of it changes: its sink is still called.
+        atomically (withdrawQueued running) `shouldReturn` False
+        atomically (retired running) `shouldReturn` False
+        -- The queued one leaves the queue without a file being opened.
+        atomically (withdrawQueued queued) `shouldReturn` True
+        atomically (retired queued) `shouldReturn` True
+        atomically (withdrawQueued queued) `shouldReturn` False
+        openGate probe "a.bin"
+        awaitRetired running
+        map fst <$> seenOutcomes outcomes `shouldReturn` ["a.bin"]
+        startedPaths probe `shouldReturn` ["a.bin"]
+        atomically (withdrawQueued running) `shouldReturn` False
+
   it "lets a read already started run to its end and suppresses its sink" $ do
     probe ← newProbe
     closeGate probe "a.bin"

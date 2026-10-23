@@ -45,6 +45,7 @@ module Hetoimasia.Content.ReadPool
   , ReadTicket
   , submit
   , cancel
+  , withdrawQueued
   , CancelOutcome (..)
   , retired
   , ticketKey
