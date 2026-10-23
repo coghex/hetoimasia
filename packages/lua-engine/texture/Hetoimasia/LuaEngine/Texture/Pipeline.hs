@@ -475,6 +475,8 @@ data PState = PState
   , psOwners ∷ !Word64
   , psLate ∷ !Word64
   , psWorkers ∷ !Int
+  , psDrainSteps ∷ !Int
+    -- ^ How many times the drain has begun a step: it is the evidence that a drain started and went on.
   , psAdmissions ∷ !(Map Word64 Word64)
     -- ^ The admission order of each reserved record, from its reservation to its return.
   , psOrderNext ∷ !Word64
@@ -555,7 +557,7 @@ withTexturePipeline = withTexturePipelineWith noHooks
 -- | 'withTexturePipeline' with the coordination hooks of this package's tests.
 withTexturePipelineWith ∷ PipelineHooks → TextureSpec → TextureBackend → ReadPool → Inventory → (TexturePipeline → IO a) → IO a
 withTexturePipelineWith hooks spec backend pool inventory body = withWorkerGroup $ \group → do
-  var ← newTVarIO (PState Open Nothing [] Map.empty 0 0 Map.empty (Map.fromList [(lane, Lane Nothing 0) | lane ← [0 .. tsLanes spec - 1]]) Map.empty 0 0 0 Map.empty 0)
+  var ← newTVarIO (PState Open Nothing [] Map.empty 0 0 Map.empty (Map.fromList [(lane, Lane Nothing 0) | lane ← [0 .. tsLanes spec - 1]]) Map.empty 0 0 0 0 Map.empty 0)
   session ← newSessionBytes (tsSessionBytes spec)
   let tp = TexturePipeline spec hooks var backend pool inventory session
   result ← mask $ \restore → do
@@ -678,6 +680,8 @@ data PipelineReading = PipelineReading
   , readingOrphans ∷ !Int
   , readingLate ∷ !Word64
   , readingDecodeWorkers ∷ !Int
+  , readingDrainSteps ∷ !Int
+    -- ^ Steps the drain has begun.
   , readingPrepared ∷ !Int
     -- ^ Start calls in flight: requests prepared and not yet taken or dropped.
   }
@@ -705,6 +709,7 @@ pipelineReading tp = do
       , readingOrphans = Map.size (psOrphans st)
       , readingLate = psLate st
       , readingDecodeWorkers = psWorkers st
+      , readingDrainSteps = psDrainSteps st
       , readingPrepared = Map.size (psPrepared st)
       }
   where
@@ -1798,6 +1803,7 @@ drain tp = do
 
     go ∷ IORef (Maybe (ExceptionWithContext SomeException)) → IO ()
     go pending = do
+      atomically (modifyState tp (\st → st {psDrainSteps = psDrainSteps st + 1}))
       stepped ← tryWithContext @SomeException . atomically $ do
         (progressed, effects) ← housekeeping tp
         if progressed || not (null effects)

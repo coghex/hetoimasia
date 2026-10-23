@@ -7,6 +7,7 @@
 -- that raises after it. One gated example per site.
 module Test.LuaEngine.Texture.Teardown (spec) where
 
+import Control.Concurrent.MVar (readMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, tryWithContext)
 import Control.Monad (forM_, void)
@@ -33,7 +34,10 @@ spec = describe "teardown cut by cancellation" $ do
                 setCancelKills (ssFake nested) True
             )
             ( \nested → do
-                -- The close has run and its callbacks raised: the drain must still be waiting on the backend.
+                -- The close has run and its callbacks raised. The drain must begin all the same: waiting for it
+                -- is evidence it did (a drain that was skipped never counts a step), and it is still
+                -- waiting on the backend.
+                awaitPipeline nested ((>= 1) . readingDrainSteps)
                 atomically (pipelineDrained (ssPipeline nested)) `shouldReturn` False
                 note session "backend ending the uploads"
                 forM_ [0, 1] $ \index → uploadN (ssFake nested) index >>= void . withdrawUpload (ssFake nested)
@@ -44,35 +48,42 @@ spec = describe "teardown cut by cancellation" $ do
         `shouldBe` ["backend ending the uploads", "nested scope returned"]
     pure ()
 
-  it "completes the drain when an effect the drain runs raises cancellation: the other obligations are still met before it is raised" $ do
+  it "completes the drain when an effect the drain runs raises cancellation: it goes on, and the other obligations are still met before it is raised" $ do
     killFirst ← killsFirstCompletion
-    ExceptionWithContext _ _ ← fatalSession (config small layout) $ \session _ runtime → do
-      outcome ←
-        tryWithContext @SomeException $
-          withNested
-            session
-            ( \nested → do
-                vm ← startVmWith nested killFirst runtime "drain-kill" OnArrival
-                admitDriver nested vm "i"
-                closeGate (ssProbe session) "a.png"
-                commandWith nested vm "i" "start" "k0" (Just (Load "a.png" True))
-                awaitStarted (ssProbe session) 1
-                commandWith nested vm "i" "start" "k1" (Just (Load "b.png" True))
-                awaitUploads (ssFake nested) 1
-            )
-            ( \nested → do
-                -- The first request's read retires: whoever reaps it answers the request, and the answer
-                -- raises. The second request's upload is still held, and the scope must still wait for it.
-                openGate (ssProbe session) "a.png"
-                awaitPipeline nested (\reading → readingSettled reading >= 1)
-                atomically (pipelineDrained (ssPipeline nested)) `shouldReturn` False
-                note session "backend ending the upload"
-                uploadN (ssFake nested) 0 >>= void . withdrawUpload (ssFake nested)
-            )
-      raisedIs ThreadKilled outcome
-      seen ← history session
-      filter (`elem` ["backend ending the upload", "nested scope returned"]) seen
-        `shouldBe` ["backend ending the upload", "nested scope returned"]
+    gate ← newGate
+    ExceptionWithContext _ _ ←
+      fatalSession ((config small layout) {cfgHooks = noHooks {hookDecoding = hold gate}, cfgRelease = releaseHeldGate gate}) $ \session _ runtime → do
+        outcome ←
+          tryWithContext @SomeException $
+            withNested
+              session
+              ( \nested → do
+                  vm ← startVmWith nested killFirst runtime "drain-kill" OnArrival
+                  admitDriver nested vm "i"
+                  closeGate (ssProbe session) "a.png"
+                  commandWith nested vm "i" "start" "k0" (Just (Load "a.png" True))
+                  awaitStarted (ssProbe session) 1
+                  -- The second request's decode holds the decode worker at the gate, so nothing but the
+                  -- drain can reap the first request's read.
+                  commandWith nested vm "i" "start" "k1" (Just (Load "b.png" True))
+                  readMVar (arrived gate)
+              )
+              ( \nested → do
+                  awaitPipeline nested ((>= 1) . readingDrainSteps)
+                  stepsBefore ← readingDrainSteps <$> pipelineNow nested
+                  -- The first request's read retires; the drain reaps it and answers it, and the answer
+                  -- raises. The drain must take another step: that is the evidence it went on.
+                  openGate (ssProbe session) "a.png"
+                  awaitPipeline nested (\reading → readingSettled reading >= 1 && readingDrainSteps reading > stepsBefore)
+                  -- The second request's decode is still held: the scope has not been let go.
+                  atomically (pipelineDrained (ssPipeline nested)) `shouldReturn` False
+                  note session "decode being let go"
+                  releaseHeldGate gate
+              )
+        raisedIs ThreadKilled outcome
+        seen ← history session
+        filter (`elem` ["decode being let go", "nested scope returned"]) seen
+          `shouldBe` ["decode being let go", "nested scope returned"]
     pure ()
 
   it "latches a synchronous decode failure even when the answer effect it then runs raises cancellation" $ do
@@ -82,8 +93,10 @@ spec = describe "teardown cut by cancellation" $ do
         vm ← startVmWith session killFirst runtime "latch-first" OnArrival
         admitDriver session vm "i"
         commandWith session vm "i" "start" "k0" (Just (Load "a.png" True))
-        -- Latched before the effect that raises: it is not lost to it.
-        awaitPipeline session readingFailed
+        -- Latched before the effect that raises, so it is the pipeline's first failure: the decode defect,
+        -- not the cancellation the effect then raised.
+        first ← atomically (awaitPipelineFailure (ssPipeline session))
+        show first `shouldSatisfy` isInfixOf' "decode hook defect"
     pure ()
 
   it "does not swallow a cancellation raised by the pipeline's own release of a texture: it reaches the caller, and the failure is recorded on the cell" $ do
@@ -119,3 +132,8 @@ killsFirstCompletion = do
           killing ← atomicModifyIORef' first (\held → (False, held))
           endpointSubmit endpoint (if killing then submission {submissionCompletion = Completion (\_ → throwIO ThreadKilled)} else submission)
       }
+
+isInfixOf' ∷ String → String → Bool
+isInfixOf' needle = any (\suffix → take (length needle) suffix == needle) . suffixes
+  where
+    suffixes text = [drop n text | n ← [0 .. length text]]
