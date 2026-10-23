@@ -282,7 +282,6 @@ library session
     exposed-modules:
         Hetoimasia.LuaEngine.Session
         Hetoimasia.LuaEngine.Session.Failure
-        Hetoimasia.LuaEngine.Session.Harness
         Hetoimasia.LuaEngine.Session.Pacing
         Hetoimasia.LuaEngine.Session.State
     -- The driver and the construction, the timer and the handle, behind the facade.
@@ -303,9 +302,24 @@ library session
         hetoimasia-lua-engine:facade,
         hetoimasia-lua-engine:modules,
         hetoimasia-lua-engine:request,
+        hetoimasia-lua-engine:session-harness,
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-scripting-lua ==0.1.0.0,
         hetoimasia-scripting-lua:runtime-lua
+
+-- The session coordinator's test seams, in a library no one outside this package can depend on: a probe that
+-- holds or fails a window, a second instance of a role, and a tick counter that starts near the Lua integer
+-- ceiling. The public session library shows the harness as an abstract type and 'noHarness'; the constructor
+-- and its fields are reachable from this package's own test suite alone.
+library session-harness
+    import: language
+    visibility: private
+    hs-source-dirs: session-harness
+    exposed-modules:
+        Hetoimasia.LuaEngine.Session.Harness
+    build-depends:
+        base >=4.22 && <4.23,
+        hetoimasia-lua-engine ==0.1.0.0
 
 -- This package's own contracts, registered as the CPU validation group
 -- `test.lua-engine`. Hspec is the suite's alone.
@@ -413,6 +427,7 @@ test-suite lua-engine-tests
         hetoimasia-lua-engine:request,
         hetoimasia-lua-engine:scene,
         hetoimasia-lua-engine:session,
+        hetoimasia-lua-engine:session-harness,
         hetoimasia-lua-engine:texture,
         hetoimasia-math ==0.1.0.0,
         hetoimasia-render-2d ==0.1.0.0,

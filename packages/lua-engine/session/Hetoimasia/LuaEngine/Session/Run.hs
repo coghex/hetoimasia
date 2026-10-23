@@ -90,6 +90,7 @@ import Control.Exception
   , finally
   , fromException
   , mask
+  , mask_
   , rethrowIO
   , throwIO
   , tryWithContext
@@ -116,7 +117,7 @@ import Hetoimasia.Foundation.Resource
   , withResource
   , withResourceLabelled
   )
-import Hetoimasia.Foundation.Time (Duration, deadlineReached, readInstant)
+import Hetoimasia.Foundation.Time (Duration, Instant, deadlineReached, readInstant)
 import Hetoimasia.Foundation.Worker (Completion (..), awaitCompletion)
 import qualified Hetoimasia.Foundation.Worker as Worker
 import Hetoimasia.LuaEngine.Behavior (behaviorRequest)
@@ -168,13 +169,14 @@ import Hetoimasia.LuaEngine.Profile
   )
 import Hetoimasia.LuaEngine.Request (m1Requests)
 import Hetoimasia.LuaEngine.Session.Failure
+import Hetoimasia.LuaEngine.Session.Harness
 import Hetoimasia.LuaEngine.Session.Pacing
 import Hetoimasia.LuaEngine.Session.State
 import Hetoimasia.LuaEngine.Session.Timer (Timer, clearTimerWake, disposeTimer, newTimer, syncTimer, timerWoken)
 import Hetoimasia.LuaEngine.Session.Types
 import Hetoimasia.Runtime.Supervision
-  ( Disposition (Optional)
-  , Recognition (Recognized, Unrecognized)
+  ( Disposition (Required)
+  , Recognition (Unrecognized)
   , WorkerPolicy (..)
   , awaitSupervised
   , supervisedWorker
@@ -188,7 +190,6 @@ import Hetoimasia.Scripting.Lua.Instance
   , InstanceConfig (..)
   , InstanceFailure (failureInstance)
   , InstanceId (..)
-  , InstanceOutcome (..)
   , InstancePhase (..)
   , InstanceSettlement (..)
   , InstanceSnapshot (..)
@@ -199,6 +200,7 @@ import Hetoimasia.Scripting.Lua.Instance
   , defaultInstanceConfig
   , inspectInstance
   , pollInstance
+  , releaseHeldInstance
   )
 import Hetoimasia.Scripting.Lua.Owner (LibraryProfile (LibraryProfileM1), VmConfig (vmOwnerName), newModulePhase, vmProfileConfig)
 import Hetoimasia.Scripting.Lua.Provider (RequestGrant (..), RequestTiming (SettleAtAssignedTick, SettleOnArrival))
@@ -231,24 +233,36 @@ sessionComponent = unsafeComponent "luaengine.session"
 
 -- Applying events -----------------------------------------------------------------------------------
 
--- | Apply one event in one transaction, then perform the effects it reports. The effects run after the
--- transaction has committed, so the admission they depend on is already closed when an owner is asked
--- to stop.
+-- | Apply one event in one transaction, then perform the stops the session now owes. The transaction records
+-- that a stop is owed in the same step that closes the admission it follows, and the stop is recorded as done
+-- only once it is, so a thread that is cancelled between the two (or an owner that does not exist yet) leaves the
+-- stop owed rather than lost: the driver, and the next event applied by anyone, perform it.
+--
+-- The handoff runs masked. The one place it can be interrupted is a blocking step inside a stop (the grant
+-- lock), and an interruption there leaves the stop owed.
 applyEvent ∷ Session → Event → IO Answer
-applyEvent session event = do
-  (before, after, answer, effects) ← atomically $ do
+applyEvent session event = mask_ $ do
+  (before, after, answer) ← atomically $ do
     current ← readTVar (sessionState session)
-    let (next, found, todo) = step event current
+    let (next, found, _) = step event current
     writeTVar (sessionState session) next
-    pure (current, next, found, todo)
+    pure (current, next, found)
   -- The owners are asked to stop first, and what the transition meant is said afterwards, so a diagnostic that
   -- cannot be written never keeps an owner from being asked.
-  ( forM_ effects $ \(StopRoles roles) → do
-      stoppers ← readTVarIO (sessionStoppers session)
-      forM_ roles (\role → sequence_ (Map.lookup role stoppers))
-    )
-    `finally` report session event before after answer
+  dischargeStops session `finally` report session event before after answer
   pure answer
+
+-- | Perform every stop the session owes whose owner exists, and record each as done. Idempotent: what stops an
+-- owner can be run twice.
+dischargeStops ∷ Session → IO ()
+dischargeStops session = do
+  owed ← stStopPending <$> readTVarIO (sessionState session)
+  stoppers ← readTVarIO (sessionStoppers session)
+  forM_ (Set.toList owed) $ \role →
+    forM_ (Map.lookup role stoppers) $ \stopper → do
+      sessionProbe session (StopHandoff role)
+      stopper
+      atomically (modifyTVar' (sessionState session) (\current → let (next, _, _) = step (StopperRan role) current in next))
 
 -- | Say what a transition meant, once, at the boundary that applies it: a failure when it latches for
 -- the first time, a stop when the session first stops, the gate when it opens.
@@ -375,13 +389,26 @@ awaitTracked env role inst = do
         Just found | rsIntents found > 0 → retry
         _ → pure Nothing
 
--- | Told, on the owner's thread, just before an instance's hook begins. The first time it is told of an
--- instance is its initialization: the behavior has been found, captured, validated and its cadence
--- resolved, and nothing authored has run. The owner parks here until the dispatch gate decides: opened,
--- when every first instance has been validated and admission is complete, or aborted by a stop or a
--- failure, when the @init@ must not run and the owner ends.
-gateInit ∷ Env → Role → InstanceId → IO ()
-gateInit env role inst = do
+-- | Asked, on the owner's thread and once per instance, when the instance has been constructed, its behavior
+-- found, captured and validated and its cadence resolved, and nothing authored has run. The instance is held
+-- there: the session records it as validated, and the owner goes on to the instance behind it. The driver
+-- releases every held instance together when the dispatch gate opens, which is when every instance of every
+-- role has been validated and admission is complete; an aborted gate releases none, and a held instance ends
+-- with its owner, its @init@ never having run.
+holdInit ∷ Env → Role → InstanceId → IO Bool
+holdInit env role inst =
+  atomically (awaitTracked env role inst) >>= \case
+    Nothing → throwIO (SessionRefused "an instance the session did not admit was constructed")
+    Just held → do
+      probeAt env (Validating (hdKey held))
+      void (applyEvent (envSession env) (Validated (hdKey held)))
+      pure True
+
+-- | Told, on the owner's thread, just before an instance's hook begins. The first time it is told of an instance
+-- is its initialization, after it was released: the probe names the point, and holding the thread here holds the
+-- @init@ without running a line of Lua.
+dispatched ∷ Env → Role → InstanceId → IO ()
+dispatched env role inst = do
   first ← atomically $ do
     seen ← readTVar (envSeen env)
     if Set.member inst seen
@@ -389,14 +416,7 @@ gateInit env role inst = do
       else True <$ writeTVar (envSeen env) (Set.insert inst seen)
   when first $
     atomically (awaitTracked env role inst)
-      >>= maybe (throwIO (SessionRefused "an instance the session did not admit began its init")) (decide . hdKey)
-  where
-    decide key = do
-      probeAt env (Validating key)
-      void (applyEvent (envSession env) (Validated key))
-      opened ← atomically (stateOf env >>= maybe retry pure . dispatchDecision)
-      unless opened (throwIO SessionAborted)
-      probeAt env (Dispatched key)
+      >>= maybe (throwIO (SessionRefused "an instance the session did not admit began its init")) (probeAt env . Dispatched . hdKey)
 
 -- | Told, on the owner's thread and once, as an instance's ending begins with a failure: before its @shutdown@, its
 -- release and the retirements its providers owe it, which its settlement waits for. The failure latches here, at
@@ -444,18 +464,15 @@ schedulerBounds =
     , boundServiceBudget = Nothing
     }
 
--- | The owners' supervision policy: optional, so that the abort of the dispatch gate (which ends an owner
--- by an exception the coordinator raises itself) is a failure supervision commits as the owner being
--- unavailable and the session answers as data; every other failure of an owner is unrecognized and so
--- fatal, and supervision delivers it as it does for any worker.
+-- | The owners' supervision policy: required, and no failure of an owner is recognized, so supervision delivers it
+-- as it does for any worker and the session accounts for it when the owner is finalized.
 ownerPolicy ∷ WorkerPolicy
 ownerPolicy =
   WorkerPolicy
     { policyRole = Supervision.Service
-    , policyDisposition = Optional
+    , policyDisposition = Required
     , policyComponent = sessionComponent
-    , policyClassifier = \(ExceptionWithContext _ exception) →
-        pure (if isJust (fromException exception ∷ Maybe SessionAborted) then Recognized else Unrecognized)
+    , policyClassifier = \_ → pure Unrecognized
     }
 
 -- | Run a body over one role's VM. The scopes nest as the owner needs them: the coordinator outside,
@@ -521,9 +538,13 @@ withRoleVm env info body = do
                 , instanceOnFailing = failingFor env role
                 }
             withFacadeSample = facadeInstanceConfig facade instanceBase
-            -- The gate is told before the facade samples the presentation clock, so the clock's origin is
-            -- the instant the @init@ is dispatched, not the instant it was parked.
-            instances = withFacadeSample {instanceOnSegment = \inst → gateInit env role inst >> instanceOnSegment withFacadeSample inst}
+            -- The probe is told before the facade samples the presentation clock, so the clock's origin is the
+            -- instant the @init@ begins.
+            instances =
+              withFacadeSample
+                { instanceOnSegment = \inst → dispatched env role inst >> instanceOnSegment withFacadeSample inst
+                , instanceHoldInit = holdInit env role
+                }
             timing = if role == Gameplay then SettleAtAssignedTick Nothing else SettleOnArrival
             owned =
               (scheduledSpec config ownerPolicy schedulerBounds)
@@ -585,8 +606,16 @@ withOwner env info owned coordinator holder facade body = mask $ \restore → do
             when (role == Gameplay) (withMVar (sessionGrantLock (envSession env)) (\() → pure ()))
             retireScheduled owner
             closeModuleCoordinator coordinator
-          -- On the way out, whichever way: the gates close first, so an owner parked at one can end.
-          leaving = applyEvent (envSession env) Unwind >> stopOwner
+          -- On the way out, whichever way: the gates close, and the owner is asked to stop until it has been. The stop
+          -- is idempotent and its one blocking step is interruptible, so an interruption of it is recorded and the
+          -- stop made again, never given up: an owner nobody asked to stop would end this scope's wait never.
+          leaving = do
+            closed ← tryWithContext @SomeException (applyEvent (envSession env) Unwind)
+            (either (: []) (const []) closed <>) <$> untilStopped []
+          untilStopped interruptions =
+            tryWithContext @SomeException stopOwner >>= \case
+              Right () → pure (reverse interruptions)
+              Left interruption → untilStopped (interruption : interruptions)
       outcome ← tryWithContext @SomeException . restore $ do
         atomically (writeTVar holder (Just endpoint))
         loader ← maybe (throwIO (SessionRefused "the owner has no loader endpoint")) pure (scheduledLoaderEndpoint owner)
@@ -594,10 +623,10 @@ withOwner env info owned coordinator holder facade body = mask $ \restore → do
         probeAt env (Built role BuildOwner)
         registerStopper env role stopOwner
         body RoleVm {rvInfo = info, rvCoordinator = coordinator, rvOwner = owner, rvEndpoint = endpoint, rvFacade = facade}
-      stopped ← tryWithContext @SomeException leaving
+      stopped ← leaving
       interruptions ← awaitEnded restore owner
       released ← tryWithContext @SomeException (probeAt env (Released role BuildOwner))
-      let failures = [f | Left f ← [outcome]] <> [f | Left f ← [stopped]] <> interruptions <> [f | Left f ← [released]]
+      let failures = [f | Left f ← [outcome]] <> stopped <> interruptions <> [f | Left f ← [released]]
       case (outcome, failures) of
         (Right value, []) → pure value
         _ → do
@@ -607,12 +636,11 @@ withOwner env info owned coordinator holder facade body = mask $ \restore → do
     spec = envSpec env
     role = riRole info
 
--- | Register what stops a role's owner. A stop that was asked for before the owner existed is run now.
+-- | Register what stops a role's owner. A stop that was owed before the owner existed is performed now.
 registerStopper ∷ Env → Role → IO () → IO ()
 registerStopper env role action = do
   atomically (modifyTVar' (sessionStoppers (envSession env)) (Map.insert role action))
-  state ← readTVarIO (sessionState (envSession env))
-  when (roleAdmit role state /= AdmitOpen) action
+  dischargeStops (envSession env)
 
 -- | Wait for the owner's worker to have ended, whatever supervision has latched: its raw completion.
 -- Interruptions are recorded in order and the wait goes on.
@@ -660,7 +688,7 @@ runSession spec onReady = do
   lock ← newMVar ()
   stoppers ← newTVarIO Map.empty
   cell ← newTVarIO (newSessionState limits counted)
-  let session = Session cell stoppers (sxLogger spec) lock
+  let session = Session cell stoppers (sxLogger spec) (harnessProbe (sxHarness spec)) lock
   ids ← newInstanceIds
   seen ← newTVarIO Set.empty
   tracked ← newTVarIO Map.empty
@@ -766,6 +794,8 @@ operate env vms =
         <*> newIORef Set.empty
         <*> newIORef Set.empty
         <*> newIORef Set.empty
+        <*> newIORef Set.empty
+        <*> newIORef False
         <*> pure timer
     stopped ← isStopping env
     unless stopped (bootEntries env vms driver)
@@ -859,7 +889,10 @@ data Mode = Supervised | Raw
 
 -- | What the driver does next.
 data Next
-  = NextEnded !Role
+  = NextStops
+  | NextRelease ![Held]
+  | NextOrigin !Instant
+  | NextEnded !Role
   | NextRetire !Role
   | NextInit ![Held]
   | NextSettled ![Held]
@@ -878,6 +911,10 @@ data Driver = Driver
   , dvFinalized ∷ !(IORef (Set Role))
   , dvInit ∷ !(IORef (Set InstanceKey))
   , dvSettled ∷ !(IORef (Set InstanceKey))
+  , dvReleased ∷ !(IORef (Set InstanceKey))
+  -- ^ The held instances the driver has released.
+  , dvOriginTaken ∷ !(IORef Bool)
+  -- ^ Whether the schedule has been derived from the origin the start gate recorded.
   , dvTimer ∷ !Timer
   }
 
@@ -954,9 +991,25 @@ nextStep env vms driver = do
   settled ← readIORef (dvSettled driver)
   schedule ← readIORef (dvSchedule driver)
   inFlight ← readIORef (dvInFlight driver)
+  released ← readIORef (dvReleased driver)
+  originTaken ← readIORef (dvOriginTaken driver)
   pure $ do
     held ← Map.elems <$> readTVar (envTracked env)
     state ← stateOf env
+    stoppers ← readTVar (sessionStoppers (envSession env))
+    -- A stop the session owes whose owner exists is performed first, so one whose performer was cancelled is not lost.
+    let owing = any (`Map.member` stoppers) (Set.toList (stStopPending state))
+        -- The dispatch gate opened: the instances held after their validation are released, together, unless
+        -- their role has stopped taking work.
+        toRelease =
+          [ item
+          | dispatchDecision state == Just True
+          , not (stStopping state)
+          , item ← held
+          , hdKey item `Set.notMember` released
+          , roleAdmit (ikRole (hdKey item)) state == AdmitOpen
+          ]
+        origin = if originTaken then Nothing else stOrigin state
     ended ← firstSTM [ended' vm | vm ← vms, riRole (rvInfo vm) `Set.notMember` finalized]
     retiring ← firstSTM [retire state vm | vm ← vms, riRole (rvInfo vm) `Set.member` finalized, rsPhaseOf state vm /= Retired]
     started ← catMaybes <$> mapM (observe inited Active) held
@@ -970,6 +1023,9 @@ nextStep env vms driver = do
       _ → pure (False, False)
     case () of
       _
+        | owing → pure NextStops
+        | not (null toRelease) → pure (NextRelease toRelease)
+        | Just instant ← origin → pure (NextOrigin instant)
         | Just role ← ended → pure (NextEnded role)
         | Just role ← retiring → pure (NextRetire role)
         | not (null started) → pure (NextInit started)
@@ -1016,6 +1072,14 @@ ownerEnded vm = (awaitCompletion (supervisedWorker (scheduledSupervised (rvOwner
 act ∷ Env → [RoleVm] → Driver → Next → IO ()
 act env vms driver = \case
   NextDone → pure ()
+  NextStops → dischargeStops session
+  NextRelease items → forM_ items $ \item → do
+    modifyIORef' (dvReleased driver) (Set.insert (hdKey item))
+    releaseHeldInstance (hdTicket item)
+    probeAt env (Resumed (hdKey item))
+  NextOrigin origin → do
+    writeIORef (dvOriginTaken driver) True
+    startPacing origin
   NextEnded role → forM_ (vmOf role) $ \vm → do
     probeAt env (OwnerEnded role)
     accountOwner env vm
@@ -1048,16 +1112,17 @@ act env vms driver = \case
     session = envSession env
     spec = envSpec env
     vmOf role = find ((== role) . riRole . rvInfo) vms
-    initialized settlement = case resultOutcome settlement of
-      InstanceFailed _ → False
-      _ → terminationShutdown (resultTermination settlement) /= ShutdownSkippedNoInit
+    -- Whether an instance's @init@ ever succeeded is a historical fact the host keeps in the instance's shutdown
+    -- disposition: it is "skipped, no init" exactly when the @init@ never succeeded, whatever the instance
+    -- failed in afterwards, and whatever the driver happened to see of it while it lived.
+    initialized settlement = terminationShutdown (resultTermination settlement) /= ShutdownSkippedNoInit
     initSucceeded item = do
-      answer ← applyEvent session (InitSucceeded (hdKey item))
-      when (answer == Opened) openStart
-    -- The start gate opened: the pacing origin is the clock's reading now, so the time the @init@s took earns
-    -- no logical time and leaves no debt.
-    openStart = forM_ (vmOf Gameplay) $ \vm → forM_ (riTick (rvInfo vm)) $ \tick → do
-      origin ← readInstant (sxClock spec)
+      now ← readInstant (sxClock spec)
+      void (applyEvent session (InitSucceeded (hdKey item) now))
+    -- The start gate opened: the pacing origin is the clock's reading taken just before the transition that
+    -- opened it, so the time the @init@s took earns no logical time and leaves no debt, and nothing the
+    -- transition's diagnostics wait for moves it.
+    startPacing origin = forM_ (vmOf Gameplay) $ \vm → forM_ (riTick (rvInfo vm)) $ \tick →
       case startSchedule (harnessTickBase (sxHarness spec)) origin tick of
         Left fault → void (applyEvent session (EngineFault (Just Gameplay) (engineEntry HostFailure (Just Gameplay) OnEngine (pacingFaultText fault))))
         Right schedule → writeIORef (dvSchedule driver) (Just schedule)
@@ -1101,8 +1166,8 @@ act env vms driver = \case
         _ → pure ()
 
 -- | Account for how a role's owner ended: a failure of the host, a cancellation or retained cleanup failures end
--- the whole session and are attributed to the role. The abort of the dispatch gate, and an engine failure the
--- facade already reported at its boundary, are not new failures.
+-- the whole session and are attributed to the role. An engine failure the facade already reported at its
+-- boundary is not a new failure.
 accountOwner ∷ Env → RoleVm → IO ()
 accountOwner env vm = do
   completion ← atomically (awaitCompletion (supervisedWorker (scheduledSupervised (rvOwner vm))))
@@ -1111,7 +1176,6 @@ accountOwner env vm = do
   case completionResult completion of
     Worker.Succeeded _ → pure ()
     Worker.Failed (ExceptionWithContext _ exception)
-      | isJust (fromException exception ∷ Maybe SessionAborted) → pure ()
       | isJust (fromException exception ∷ Maybe EngineFailure) → pure ()
       | otherwise → void (applyEvent session (EngineFault (Just role) (engineEntry HostFailure (Just role) OnEngine (Text.pack (displayException exception)))))
     Worker.Cancelled (ExceptionWithContext _ exception) →

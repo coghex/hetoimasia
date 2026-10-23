@@ -17,9 +17,10 @@
 --
 -- 1. builds each selected role's VM (a module coordinator, the data service, the facade, a scheduled
 --    owner hosting instances) and evaluates its entry and imports, running no root;
--- 2. admits each role's root instance; no root's @init@ is dispatched until every selected entry,
---    export, hook and cadence has been validated, and then the roots' @init@s run on their own owners
---    without either waiting for the other;
+-- 2. admits each role's instances and holds each one after the host has constructed it and validated
+--    its behavior, hooks, captured schema and cadence; no @init@ runs until every instance of every
+--    selected role has been validated, and then they are released together and the roots' @init@s run on
+--    their own owners without either waiting for the other;
 -- 3. runs the presentation role from its own @init@'s success, and the gameplay role from the joint
 --    start gate, with real-time ticks of exactly the manifest's duration, none skipped or shortened,
 --    each followed by the owner's own accounting; and
@@ -77,6 +78,7 @@ module Hetoimasia.LuaEngine.Session
   ) where
 
 import Hetoimasia.LuaEngine.Session.Failure
+import Hetoimasia.LuaEngine.Session.Harness (Harness, noHarness)
 import Hetoimasia.LuaEngine.Session.Run
 import Hetoimasia.LuaEngine.Session.State
 import Hetoimasia.LuaEngine.Session.Types

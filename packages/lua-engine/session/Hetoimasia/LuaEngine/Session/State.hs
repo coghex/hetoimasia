@@ -22,14 +22,22 @@
 -- = The gates
 --
 -- * The /dispatch gate/ stands between validation and the roots' @init@s. It is closed until the first
---   instance of every selected role has been constructed and validated (the host tells the session at
---   the point its @init@ would begin) and admission is complete; it then opens, once, and both @init@s
---   run without either waiting for the other to finish. It is aborted, for good, by a stop or a
---   failure, and an aborted gate never opens.
+--   instance admitted, of every selected role, has been constructed and validated (the host holds each
+--   one there and tells the session) and admission is complete; it then opens, once, and the held
+--   instances are released, so both @init@s run without either waiting for the other to finish. It is
+--   aborted, for good, by a stop or a failure, and an aborted gate never opens: a held instance is never
+--   released and ends with its owner, its @init@ never having run.
 -- * The /start gate/ stands between the @init@s and the first logical tick. It opens, once, in the
 --   transaction that records the last selected @init@'s success, if no role has failed and no stop has
 --   been asked; a one-role session needs only its own. It is shut, for good, by a stop or a failure
 --   that arrives first. A late success cannot reopen a shut gate.
+--
+-- = Effects owed
+--
+-- A transition that closes a role's admission also records that the role's owner is owed a stop
+-- ('stStopPending'), in the same transaction. Whoever applies the transition performs the stop and then
+-- records it ('StopperRan'); a stop whose performer was cancelled, or whose owner did not exist yet, stays
+-- owed, and the driver performs it. The stop is idempotent, so a stop done twice is a stop done once.
 --
 -- = The phases
 --
@@ -77,18 +85,10 @@ import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import qualified Data.Set as Set
 import Data.Set (Set)
+import Hetoimasia.Foundation.Time (Instant)
 import Hetoimasia.LuaEngine.Manifest (Role (..))
+import Hetoimasia.LuaEngine.Session.Harness (InstanceKey (..))
 import Hetoimasia.LuaEngine.Session.Failure
-
--- Keys ---------------------------------------------------------------------------------------------
-
--- | One instance of the session: its role and its slot in that role's VM. Slot 0 is the root every
--- role has; slot 1 is the harness's second instance, where a composition asks for one.
-data InstanceKey = InstanceKey
-  { ikRole ∷ !Role
-  , ikSlot ∷ !Int
-  }
-  deriving (Eq, Ord, Show)
 
 -- Vocabulary ----------------------------------------------------------------------------------------
 
@@ -139,11 +139,15 @@ data SessionState = SessionState
   { stRoles ∷ !(Map Role RoleState)
   , stDispatch ∷ !DispatchGate
   , stExpected ∷ !(Set InstanceKey)
-  -- ^ The instances whose validation the dispatch gate waits for: the first of every role.
+  -- ^ The instances whose validation the dispatch gate waits for: every instance of every role.
   , stValidated ∷ !(Set InstanceKey)
   , stAdmitted ∷ !Bool
   -- ^ Admission is complete: every instance the composition asked for has been accepted.
   , stStart ∷ !StartGate
+  , stOrigin ∷ !(Maybe Instant)
+  -- ^ The clock's reading taken just before the transition that opened the start gate: the pacing origin.
+  , stStopPending ∷ !(Set Role)
+  -- ^ The roles whose owner is owed a stop that has not been performed.
   , stStopping ∷ !Bool
   -- ^ Whole-session stopping.
   , stQuit ∷ !Bool
@@ -164,10 +168,12 @@ newSessionState limits roles =
   SessionState
     { stRoles = Map.fromList [(role, RoleState n Set.empty Starting AdmitOpen Nothing 0) | (role, n) ← roles]
     , stDispatch = DispatchClosed
-    , stExpected = Set.fromList [InstanceKey role 0 | (role, _) ← roles]
+    , stExpected = Set.fromList [InstanceKey role slot | (role, n) ← roles, slot ← [0 .. n - 1]]
     , stValidated = Set.empty
     , stAdmitted = False
     , stStart = StartClosed
+    , stOrigin = Nothing
+    , stStopPending = Set.empty
     , stStopping = False
     , stQuit = False
     , stInterrupt = False
@@ -215,8 +221,11 @@ data Event
     Tracked !Role
   | -- | The admission the intent stood for was not accepted.
     Abandoned !Role
-  | -- | An instance's @init@ has succeeded.
-    InitSucceeded !InstanceKey
+  | -- | An instance's @init@ has succeeded; the clock's reading taken just before, which is the pacing origin
+    -- if this success opens the start gate.
+    InitSucceeded !InstanceKey !Instant
+  | -- | The stop a role's owner was owed has been performed.
+    StopperRan !Role
   | -- | A role failed (an instance of it, or its entry module): its bounded record, and what else failed as it ended.
     LatchFailure !Role !RoleFailure ![EngineEntry]
   | -- | What else failed as an instance of a role ended, after its own failure was latched: accounted in the
@@ -272,7 +281,8 @@ step event state = case event of
     _ → (state, Refused, [])
   Tracked role → quiet (adjustRole role (\found → found {rsIntents = max 0 (rsIntents found - 1)}) state)
   Abandoned role → quiet (adjustRole role (\found → found {rsIntents = max 0 (rsIntents found - 1)}) state)
-  InitSucceeded key → initSucceeded key state
+  InitSucceeded key now → initSucceeded key now state
+  StopperRan role → quiet state {stStopPending = Set.delete role (stStopPending state)}
   LatchFailure role failure secondary → latchFailure role failure secondary state
   EndingAccounted _ secondary →
     quiet state {stEngine = foldl' (flip (noteEngine (stLimits state))) (stEngine state) secondary}
@@ -288,7 +298,7 @@ step event state = case event of
       let latched = state {stTerminal = Just failure, stEngine = noteEngine (stLimits state) (roleFailureEntry failure) (stEngine state)}
        in wholeStop latched (Latched True)
   RoleRetired role →
-    quiet (adjustRole role (\found → found {rsPhase = Retired, rsAdmit = AdmitClosed}) state)
+    quiet (adjustRole role (\found → found {rsPhase = Retired, rsAdmit = AdmitClosed}) state {stStopPending = Set.delete role (stStopPending state)})
   Unwind → wholeStop state Done
   where
     quiet next = (next, Done, [])
@@ -300,13 +310,17 @@ openDispatch state
       state {stDispatch = DispatchOpen}
   | otherwise = state
 
+-- | Record that these roles' owners are owed a stop.
+owing ∷ [Role] → SessionState → SessionState
+owing roles state = state {stStopPending = foldr Set.insert (stStopPending state) roles}
+
 adjustRole ∷ Role → (RoleState → RoleState) → SessionState → SessionState
 adjustRole role change state = state {stRoles = Map.adjust change role (stRoles state)}
 
 -- | An instance's @init@ succeeded. The fact is recorded whatever else has happened; the role moves to
 -- @ready@ or @running@ and the start gate opens only if nothing has failed or stopped.
-initSucceeded ∷ InstanceKey → SessionState → (SessionState, Answer, [Effect])
-initSucceeded key state = case Map.lookup (ikRole key) (stRoles state) of
+initSucceeded ∷ InstanceKey → Instant → SessionState → (SessionState, Answer, [Effect])
+initSucceeded key now state = case Map.lookup (ikRole key) (stRoles state) of
   Nothing → (state, Done, [])
   Just found →
     let recorded = found {rsInited = Set.insert (ikSlot key) (rsInited found)}
@@ -318,7 +332,7 @@ initSucceeded key state = case Map.lookup (ikRole key) (stRoles state) of
         state1 = state {stRoles = Map.insert (ikRole key) advanced (stRoles state)}
      in if startable state1
           then
-            let opened = state1 {stStart = StartOpen}
+            let opened = state1 {stStart = StartOpen, stOrigin = Just now}
                 started = opened {stRoles = Map.adjust (\r → if rsPhase r == Ready then r {rsPhase = Running} else r) Gameplay (stRoles opened)}
              in (started, Opened, [])
           else (state1, Done, [])
@@ -367,7 +381,7 @@ closeRole ∷ Role → SessionState → (SessionState, [Effect])
 closeRole role state = case Map.lookup role (stRoles state) of
   Just found
     | rsAdmit found == AdmitOpen →
-        ( state {stRoles = Map.insert role found {rsAdmit = AdmitStopping, rsPhase = stopped found} (stRoles state)}
+        ( owing [role] state {stRoles = Map.insert role found {rsAdmit = AdmitStopping, rsPhase = stopped found} (stRoles state)}
         , [StopRoles [role]]
         )
     | otherwise → (state {stRoles = Map.insert role found {rsPhase = stopped found} (stRoles state)}, [])
@@ -380,7 +394,7 @@ closeRole role state = case Map.lookup role (stRoles state) of
 -- not reported again.
 wholeStop ∷ SessionState → Answer → (SessionState, Answer, [Effect])
 wholeStop state answer =
-  ( closed {stStopping = True}
+  ( owing reported closed {stStopping = True}
   , answer
   , [StopRoles reported | not (null reported)]
   )

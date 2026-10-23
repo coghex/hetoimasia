@@ -271,6 +271,25 @@ hostFailures = describe "of the host" $ do
         fmap (Text.isInfixOf "the foreign worker failed" . eeMessage) (erPrimary (outEngine outcome)) `shouldBe` Just True
     pure ()
 
+  it "keeps the success of an init the driver was not looking at when its instance went on to fail" $
+    withSetup ((setup (roleScript printScript {scUpdate = ["error('the first refresh fails')"]})) {suShape = PresentationAlone}) $ \env → do
+      let world = seWorld env
+      recorder ← newRecorder
+      holdAt recorder (Resumed (InstanceKey Presentation 0))
+      outcome ← runScenarioWith env (recordingHarness recorder noHarness) $ \session → do
+        awaitPoint recorder (Resumed (InstanceKey Presentation 0))
+        -- the init succeeds and the first refresh fails while the driver, which released the instance, is not looking
+        pumpUntil world (elem "init presentation" <$> outLines world)
+        awaitRegistration world 1000000
+        passTime world 1000000000 (maybe False roleFailed . presentationOf <$> statusNow session)
+        releaseHold recorder (Resumed (InstanceKey Presentation 0))
+        void (awaitRetired session)
+        status ← statusNow session
+        fmap roleInitialized (presentationOf status) `shouldBe` Just True
+        fmap rolePhase (presentationOf status) `shouldBe` Just Retired
+      outVerdict outcome `shouldBe` VerdictFailure
+      fmap rfStage (outFailures outcome) `shouldBe` [OnUpdate]
+
   it "ends the session when the host fails while the entries are still being evaluated, before any root is dispatched" $ do
     _ ←
       fatalSetup (setup (roleScript printScript {scPrelude = ["print('load')"]})) $ \env → do

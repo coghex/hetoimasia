@@ -4,7 +4,7 @@
 -- cancellation and release still possible, and a role retired only when what it holds has actually retired.
 module Test.LuaEngine.Session.Stop (spec) where
 
-import Control.Concurrent (forkIO)
+import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Monad (replicateM_, void)
 import qualified Data.Text as Text
@@ -19,6 +19,7 @@ spec = describe "stop and drain" $ do
   sharedJobs
   peers
   shutdowns
+  handoff
 
 -- A stop with everything full ---------------------------------------------------------------------------------------------------
 
@@ -187,3 +188,27 @@ shutdowns = describe "shutdown" $ do
       filter ("shutdown gameplay" `Text.isPrefixOf`) out `shouldSatisfy` (`elem` [[], ["shutdown gameplay stopped"]])
       length (filter ("shutdown" `Text.isPrefixOf`) out) `shouldSatisfy` (<= 1)
       outVerdict outcome `shouldBe` VerdictFailure
+
+-- The handoff of a stop --------------------------------------------------------------------------------------------------------
+
+handoff ∷ Spec
+handoff = describe "the handoff of a stop to the owners" $ do
+  it "is finished by the driver when the thread that applied the stop was cancelled in the middle of it, and the stop is performed once more, harmlessly, by whoever finds it owed" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      let world = seWorld env
+      recorder ← newRecorder
+      holdAt recorder (StopHandoff Gameplay)
+      outcome ← runScenarioWith env (recordingHarness recorder noHarness) $ \session → do
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        stopper ← forkIO (requestStop session StopQuit)
+        -- the stop is committed and its first owner is about to be asked: the thread is cancelled right there
+        awaitPoint recorder (StopHandoff Gameplay)
+        killThread stopper
+        releaseHold recorder (StopHandoff Gameplay)
+        void (awaitRetired session)
+      out ← outLines world
+      out `shouldSatisfy` elem "shutdown gameplay stopped"
+      out `shouldSatisfy` elem "shutdown presentation stopped"
+      outRetired outcome `shouldBe` True
+      outVerdict outcome `shouldBe` VerdictSuccess

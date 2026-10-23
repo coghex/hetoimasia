@@ -250,6 +250,7 @@ spec = describe "the package and import boundary" $ do
                      , "hetoimasia-lua-engine:facade"
                      , "hetoimasia-lua-engine:modules"
                      , "hetoimasia-lua-engine:request"
+                     , "hetoimasia-lua-engine:session-harness"
                      , "hetoimasia-runtime"
                      , "hetoimasia-scripting-lua"
                      , "hetoimasia-scripting-lua:runtime-lua"
@@ -259,10 +260,26 @@ spec = describe "the package and import boundary" $ do
     fieldEntries "library session" "exposed-modules:"
       `shouldReturn` [ "Hetoimasia.LuaEngine.Session"
                      , "Hetoimasia.LuaEngine.Session.Failure"
-                     , "Hetoimasia.LuaEngine.Session.Harness"
                      , "Hetoimasia.LuaEngine.Session.Pacing"
                      , "Hetoimasia.LuaEngine.Session.State"
                      ]
+
+  it "keeps the session's test seams in a private sublibrary that no public library exposes, whose only dependencies are base and the configuration boundary" $ do
+    -- the stanza says it is private
+    stanza ← stanzaBody "library session-harness"
+    stanza `shouldSatisfy` any (\line → "visibility:" `isInfixOf` line && "private" `isInfixOf` line)
+    fieldEntries "library session-harness" "exposed-modules:" `shouldReturn` ["Hetoimasia.LuaEngine.Session.Harness"]
+    (sort <$> fieldEntries "library session-harness" "build-depends:") `shouldReturn` ["base", "hetoimasia-lua-engine"]
+    -- no public library lists the harness module, and the harness is a type the session shows abstractly
+    mapM_
+      ( \header → do
+          exposed ← fieldEntries header "exposed-modules:"
+          exposed `shouldSatisfy` notElem "Hetoimasia.LuaEngine.Session.Harness"
+      )
+      ["library session"]
+    sources ← sourcesUnder "session-harness"
+    imported ← importedBy sources
+    sort (nub [name | (_, name) ← imported, "Hetoimasia." `isPrefixOf` name]) `shouldBe` ["Hetoimasia.LuaEngine.Manifest"]
 
   it "imports, in the session sublibrary, only the configuration boundary, the facade and the services it composes, the content package's, the foundation's and the runtime's public modules, the host's public modules and base libraries: no texture, scene, private module, window, GPU, GLFW, Vulkan, console, sample or game" $ do
     sources ← sourcesUnder "session"

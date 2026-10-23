@@ -42,6 +42,14 @@ spec = describe "composition from outside the packages" $ do
     withClient "Client.hs" harnessClient $ \compile → do
       outcome ← compile Typecheck
       rejectedBecause outcome "GHC-10237"
+
+  it "keeps the near-limit tick seam out of every client: the harness is an abstract type, its constructor and fields are in a library of the package no one outside it can depend on" $ do
+    withClient "Client.hs" tickBaseImportClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "GHC-10237"
+    withClient "Client.hs" tickBaseUpdateClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "GHC-22385"
   where
     withClient = withStorePackageClient ["base", "bytestring", "text", "stm", "hetoimasia-content-0.1.0.0-inplace", "hetoimasia-foundation-0.1.0.0-inplace", "hetoimasia-runtime-0.1.0.0-inplace", "hetoimasia-scripting-lua-0.1.0.0-inplace", "hetoimasia-scripting-lua-0.1.0.0-inplace-runtime-lua", "hetoimasia-lua-engine-0.1.0.0-inplace", "hetoimasia-lua-engine-0.1.0.0-inplace-facade", "hetoimasia-lua-engine-0.1.0.0-inplace-session"]
     manifest = "{\"format\":1,\"id\":\"client\",\"entry\":\"main.lua\",\"vms\":[{\"role\":\"presentation\",\"clock\":\"elapsed\"}]}"
@@ -125,6 +133,30 @@ handleClient =
     , ""
     , "reach ∷ Maybe Session"
     , "reach = Nothing"
+    ]
+
+-- | A client that asks the public module for the tick base field.
+tickBaseImportClient ∷ String
+tickBaseImportClient =
+  unlines
+    [ "module Client (reach) where"
+    , ""
+    , "import Hetoimasia.LuaEngine.Session (Harness (harnessTickBase, harnessSecond))"
+    , ""
+    , "reach ∷ Maybe Harness"
+    , "reach = Nothing"
+    ]
+
+-- | A client that sets the tick base on the one harness a public composition can name.
+tickBaseUpdateClient ∷ String
+tickBaseUpdateClient =
+  unlines
+    [ "module Client (reach) where"
+    , ""
+    , "import Hetoimasia.LuaEngine.Session (Harness, noHarness)"
+    , ""
+    , "reach ∷ Harness"
+    , "reach = noHarness {harnessTickBase = 9223372036854775806}"
     ]
 
 harnessClient ∷ String

@@ -47,6 +47,13 @@ gameplayOnly = newSessionState limits [(Gameplay, 1)]
 presentationOnly ∷ SessionState
 presentationOnly = newSessionState limits [(Presentation, 1)]
 
+-- | An instance's @init@ succeeded when the injected clock read this many nanoseconds.
+initAt ∷ Integer → InstanceKey → Event
+initAt n key = InitSucceeded key (instant n)
+
+initOk ∷ InstanceKey → Event
+initOk = initAt 0
+
 g0, p0 ∷ InstanceKey
 g0 = InstanceKey Gameplay 0
 p0 = InstanceKey Presentation 0
@@ -94,8 +101,14 @@ gates = describe "the dispatch gate" $ do
     dispatchDecision (applied [Validated g0, Validated p0] both) `shouldBe` Nothing
     dispatchDecision (applied [AdmissionComplete] both) `shouldBe` Nothing
 
-  it "ignores the validation of a second instance, which it does not wait for" $
-    dispatchDecision (applied [Validated (InstanceKey Gameplay 1), Validated g0, AdmissionComplete] (newSessionState limits [(Gameplay, 2)])) `shouldBe` Just True
+  it "waits for every instance of every role, a second instance included, before it opens" $ do
+    let two = newSessionState limits [(Gameplay, 2)]
+        g1 = InstanceKey Gameplay 1
+    dispatchDecision (applied [Validated g0, AdmissionComplete] two) `shouldBe` Nothing
+    dispatchDecision (applied [Validated g1, AdmissionComplete] two) `shouldBe` Nothing
+    mapM_
+      (\events → dispatchDecision (applied events two) `shouldBe` Just True)
+      (permutations' [Validated g0, Validated g1, AdmissionComplete])
 
   it "is aborted for good by a stop or a failure, and a late validation cannot open it" $ do
     let stopped = applied [Validated g0, Stop StopQuit] both
@@ -116,10 +129,10 @@ startGate = describe "the start gate and the phases" $ do
   let opened = validated
 
   it "starts presentation on its own success and gameplay waiting, ready, for the joint gate" $ do
-    let state = applied (opened <> [InitSucceeded p0]) both
+    let state = applied (opened <> [initOk p0]) both
     phasesOf' state `shouldBe` (Just Starting, Just Running)
     stStart state `shouldBe` StartClosed
-    let ready = applied (opened <> [InitSucceeded g0]) both
+    let ready = applied (opened <> [initOk g0]) both
     phasesOf' ready `shouldBe` (Just Ready, Just Starting)
 
   it "opens, once, in the transaction of the last success, whichever order they come in" $ do
@@ -130,31 +143,42 @@ startGate = describe "the start gate and the phases" $ do
           phasesOf' state `shouldBe` (Just Running, Just Running)
           length (filter (== Opened) answers) `shouldBe` 1
       )
-      (permutations' [InitSucceeded g0, InitSucceeded p0])
+      (permutations' [initOk g0, initOk p0])
 
   it "needs only its own init in a one-role session" $ do
-    let (state, answers, _) = runAll (opened' gameplayOnly <> [InitSucceeded g0]) gameplayOnly
+    let (state, answers, _) = runAll (opened' gameplayOnly <> [initOk g0]) gameplayOnly
     stStart state `shouldBe` StartOpen
     answers `shouldSatisfy` elem Opened
     phasesOf' state `shouldBe` (Just Running, Nothing)
-    let (state', answers', _) = runAll (opened' presentationOnly <> [InitSucceeded p0]) presentationOnly
+    let (state', answers', _) = runAll (opened' presentationOnly <> [initOk p0]) presentationOnly
     stStart state' `shouldBe` StartOpen
     answers' `shouldSatisfy` elem Opened
     phasesOf' state' `shouldBe` (Nothing, Just Running)
 
   it "does not open for a late success once the gate is shut, but remembers the success" $ do
-    let state = applied (opened <> [InitSucceeded p0, Stop StopQuit, InitSucceeded g0]) both
+    let state = applied (opened <> [initOk p0, Stop StopQuit, initOk g0]) both
     stStart state `shouldBe` StartShut
     phasesOf' state `shouldBe` (Just Stopping, Just Stopping)
     roleInitializedOf Gameplay state `shouldBe` Just True
     roleInitializedOf Presentation state `shouldBe` Just True
 
+  it "takes the pacing origin from the transition that opens the start gate, whichever success it is, and never changes it" $ do
+    mapM_
+      ( \(events, origin) → do
+          let state = applied (opened <> events) both
+          stOrigin state `shouldBe` Just (instant origin)
+      )
+      [([initAt 10 g0, initAt 30 p0], 30), ([initAt 30 g0, initAt 10 p0], 10)]
+    -- a success after the gate opened, or one that arrives once the session stops, moves nothing
+    stOrigin (applied (opened <> [initAt 10 p0, initAt 30 g0, initAt 99 g0]) both) `shouldBe` Just (instant 30)
+    stOrigin (applied (opened <> [initAt 10 p0, Stop StopQuit, initAt 30 g0]) both) `shouldBe` Nothing
+
   it "counts a role initialized only once every instance of it has succeeded" $ do
     let two = newSessionState limits [(Gameplay, 2)]
-        state = applied [InitSucceeded g0] two
+        state = applied [initOk g0] two
     roleInitializedOf Gameplay state `shouldBe` Just False
     stStart state `shouldBe` StartClosed
-    let done = applied [Validated g0, AdmissionComplete, InitSucceeded g0, InitSucceeded (InstanceKey Gameplay 1)] two
+    let done = applied [Validated g0, Validated (InstanceKey Gameplay 1), AdmissionComplete, initOk g0, initOk (InstanceKey Gameplay 1)] two
     roleInitializedOf Gameplay done `shouldBe` Just True
     stStart done `shouldBe` StartOpen
   where
@@ -172,10 +196,10 @@ roleInitializedOf role state = case role of
 
 policy ∷ Spec
 policy = describe "the failure policy" $ do
-  let ready = validated <> [InitSucceeded g0, InitSucceeded p0]
+  let ready = validated <> [initOk g0, initOk p0]
 
   it "makes a failure before the start gate opens a boot failure that stops both roles at once" $ do
-    let events = validated <> [InitSucceeded p0, LatchFailure Gameplay (failure Gameplay OnInit "init failed") []]
+    let events = validated <> [initOk p0, LatchFailure Gameplay (failure Gameplay OnInit "init failed") []]
         (state, answers, effects) = runAll events both
     stStopping state `shouldBe` True
     stStart state `shouldBe` StartShut
@@ -204,9 +228,9 @@ policy = describe "the failure policy" $ do
     effects `shouldBe` [StopRoles [Gameplay, Presentation]]
 
   it "ends the whole session for the failure of a session's only role" $ do
-    let events = [Validated g0, AdmissionComplete, InitSucceeded g0, LatchFailure Gameplay (failure Gameplay OnUpdate "boom") []]
+    let events = [Validated g0, AdmissionComplete, initOk g0, LatchFailure Gameplay (failure Gameplay OnUpdate "boom") []]
     stStopping (applied events gameplayOnly) `shouldBe` True
-    stStopping (applied [Validated p0, AdmissionComplete, InitSucceeded p0, LatchFailure Presentation (failure Presentation OnUpdate "ui") []] presentationOnly) `shouldBe` True
+    stStopping (applied [Validated p0, AdmissionComplete, initOk p0, LatchFailure Presentation (failure Presentation OnUpdate "ui") []] presentationOnly) `shouldBe` True
 
   it "ends a previously healthy presentation role when the logical role's cleanup then fails" $ do
     let (state, _, effects) =
@@ -228,8 +252,8 @@ policy = describe "the failure policy" $ do
           applied
             ( validated
                 <> [ LatchFailure Gameplay first []
-                   , InitSucceeded g0
-                   , InitSucceeded p0
+                   , initOk g0
+                   , initOk p0
                    , LatchFailure Gameplay (failure Gameplay OnShutdown "second") []
                    , Stop StopInterrupt
                    ]
@@ -339,7 +363,7 @@ ranking = describe "the outcome" $ do
     let status = statusOf gameplayOnly
     statusPresentation status `shouldBe` Nothing
     fmap rolePhase (statusGameplay status) `shouldBe` Just Starting
-    let failedOne = statusOf (applied (validated <> [InitSucceeded g0, InitSucceeded p0, LatchFailure Gameplay (failure Gameplay OnUpdate "x") []]) both)
+    let failedOne = statusOf (applied (validated <> [initOk g0, initOk p0, LatchFailure Gameplay (failure Gameplay OnUpdate "x") []]) both)
     statusStopping failedOne `shouldBe` False
     fmap roleFailed (statusGameplay failedOne) `shouldBe` Just True
     fmap roleFailed (statusPresentation failedOne) `shouldBe` Just False
@@ -355,7 +379,7 @@ admission = describe "admission" $ do
 
   it "refuses an intent from a role that has stopped taking work, and from a stopped session" $ do
     answersOf [Stop StopQuit, Intend Gameplay] both `shouldBe` [Done, Refused]
-    answersOf [LatchFailure Gameplay (failure Gameplay OnUpdate "x") [], Intend Gameplay, Intend Presentation] (applied (validated <> [InitSucceeded g0, InitSucceeded p0]) both)
+    answersOf [LatchFailure Gameplay (failure Gameplay OnUpdate "x") [], Intend Gameplay, Intend Presentation] (applied (validated <> [initOk g0, initOk p0]) both)
       `shouldBe` [Latched True, Refused, Done]
 
   it "never lets the count of intents go below zero" $ do
@@ -381,12 +405,14 @@ invariants = describe "every order of events" $ do
       [ Validated g0
       , Validated p0
       , AdmissionComplete
-      , InitSucceeded g0
-      , InitSucceeded p0
+      , initOk g0
+      , initOk p0
       , LatchFailure Gameplay (failure Gameplay OnUpdate "g") []
       , LatchFailure Presentation (failure Presentation OnUpdate "p") []
       , Stop StopQuit
       , Stop StopInterrupt
+      , StopperRan Gameplay
+      , StopperRan Presentation
       ]
 
 -- | Every sequence of up to this many events from a menu.
@@ -403,8 +429,8 @@ violations = go both
     go _ [] = []
     go state (event : rest) =
       let (next, _, _) = step event state
-       in [show event <> ": " <> why | why ← check state next] <> go next rest
-    check prior afterwards =
+       in [show event <> ": " <> why | why ← check event state next] <> go next rest
+    check event prior afterwards =
       concat
         [ -- each gate is decided once
           [ "the dispatch gate changed after it was decided" | stDispatch prior /= DispatchClosed, stDispatch afterwards /= stDispatch prior ]
@@ -419,6 +445,13 @@ violations = go both
         , -- a failed role is never ready or running, and keeps its first failure
           [ "a failed role is ready or running" | found ← Map.elems (stRoles afterwards), isJust (rsFailure found), rsPhase found `elem` [Ready, Running] ]
         , [ "a role's first failure changed" | role ← [Gameplay, Presentation], Just first ← [Map.lookup role (stRoles prior) >>= rsFailure], (Map.lookup role (stRoles afterwards) >>= rsFailure) /= Just first ]
+        , -- a stop is owed to a role that does not take work, and is dropped only when it is performed or the role has retired
+          [ "a stop is owed to a role that takes work" | role ← Set.toList (stStopPending afterwards), roleAdmit role afterwards == AdmitOpen ]
+        , [ "an owed stop was dropped" | role ← Set.toList (stStopPending prior), role `Set.notMember` stStopPending afterwards, not (performs event role) ]
+        , -- the pacing origin is recorded by the transition that opens the start gate, once
+          [ "the origin changed after it was recorded" | isJust (stOrigin prior), stOrigin afterwards /= stOrigin prior ]
+        , [ "the origin was recorded without the gate opening" | stOrigin prior == Nothing, isJust (stOrigin afterwards), not opening ]
+        , [ "the gate opened without recording the origin" | opening, stOrigin afterwards == Nothing ]
         , -- the ranking never goes down
           [ "the verdict went down" | outVerdict (outcomeOf afterwards) < outVerdict (outcomeOf prior) ]
         , -- a failure prior the start gate opened ends the whole session
@@ -426,6 +459,10 @@ violations = go both
         ]
       where
         opening = stStart afterwards == StartOpen && stStart prior /= StartOpen
+        performs by role = case by of
+          StopperRan done → done == role
+          RoleRetired done → done == role
+          _ → False
 
 -- The failure schema ---------------------------------------------------------------------------------------------------
 

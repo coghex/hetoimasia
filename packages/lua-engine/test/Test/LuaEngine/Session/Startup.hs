@@ -201,6 +201,39 @@ validation = describe "validation before either root is dispatched" $ do
           rfInstance found `shouldSatisfy` (/= Nothing)
         other → expectationFailure ("expected one failure, found " <> show other)
 
+  it "validates every instance of the role before any init runs, so a first init that edits the behavior cannot invalidate the second after the roots have run" $
+    withSetup
+      (setup (roleScript printScript))
+        { suShape = GameplayAlone
+        , suEntries = Just ("lua/game.lua", "lua/ui.lua")
+        , suHarness = noHarness {harnessSecond = [Gameplay]}
+        , suFiles =
+            [ ( "lua/game.lua"
+              , luaMain
+                  [ "local behavior"
+                  , "behavior = {"
+                  , "  every_ticks = 1,"
+                  , "  init = function(self, api) print('init ' .. api.instance_id) behavior.every_ticks = 0 end,"
+                  , "  update = function() end,"
+                  , "}"
+                  , "return { gameplay = behavior }"
+                  ]
+              )
+            , ("lua/ui.lua", roleScript printScript)
+            ]
+        }
+      $ \env → do
+        let world = seWorld env
+        outcome ← runScenario env $ \session → do
+          awaitPhase session Gameplay Running
+          requestStop session StopQuit
+          void (awaitRetired session)
+        out ← outLines world
+        -- both captured the behavior before either init ran, so the second is valid whatever the first did
+        filter (Text.isPrefixOf "init") out `shouldBe` ["init inst-1", "init inst-2"]
+        outFailures outcome `shouldBe` []
+        outVerdict outcome `shouldBe` VerdictSuccess
+
   it "starts neither root when the first role's cadence is invalid either" $
     withSetup
       (setup (roleScript printScript))

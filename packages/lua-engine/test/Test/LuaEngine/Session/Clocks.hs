@@ -6,10 +6,12 @@
 -- the example says it is.
 module Test.LuaEngine.Session.Clocks (spec) where
 
-import Control.Monad (void)
+import Control.Concurrent.STM (atomically, newTVarIO, readTVar, retry, writeTVar)
+import Control.Monad (void, when)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
+import Hetoimasia.Foundation.Log (LogEntry (entryMessage), callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.LuaEngine.Session.Pacing (luaTickCeiling)
 import Test.Hspec
 import Test.LuaEngine.Session.Support
@@ -94,6 +96,25 @@ logical = describe "the logical clock" $ do
         passTime world 1000000 ((>= 1) . length <$> linesWith "tick" world)
         out' ← linesWith "tick" world
         take 1 out' `shouldBe` ["tick 1 dt 0.001000000"]
+        requestStop session StopQuit
+
+  it "takes the origin before the gate's own diagnostics can delay it: a logger held at the gate's opening owes the time it held" $
+    withSetup ((setup (roleScript ticking)) {suShape = GameplayAlone}) $ \env → do
+      let world = seWorld env
+      held ← newTVarIO True
+      let logger =
+            mkLogger defaultLogFilter . callbackSink $ \entry →
+              when (entryMessage entry == "start gate opened") (atomically (readTVar held >>= \isHeld → when isHeld retry))
+          env' = env {seSpec = (seSpec env) {sxLogger = logger}}
+      void . runScenario env' $ \session → do
+        -- the gate has opened in the state; the driver is stuck in the logger that says so
+        awaitPhase session Gameplay Running
+        advanceClock world 5000000
+        atomically (writeTVar held False)
+        -- five ticks of the time that passed while the diagnostic was held are owed, each granted by itself
+        passTime world 1000000 ((>= 5) . length <$> linesWith "tick" world)
+        out ← linesWith "tick" world
+        take 5 out `shouldBe` ["tick 1 dt 0.001000000", "tick 2 dt 0.001000000", "tick 3 dt 0.001000000", "tick 4 dt 0.001000000", "tick 5 dt 0.001000000"]
         requestStop session StopQuit
 
 -- Two instances on one VM -----------------------------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 -- | What a session is made from and what it hands back. Hidden: "Hetoimasia.LuaEngine.Session" is the
--- public view, and "Hetoimasia.LuaEngine.Session.Harness" the harness-only one.
+-- public view. The harness's seams are in a private sublibrary, "Hetoimasia.LuaEngine.Session.Harness".
 --
 -- = Who owns what
 --
@@ -17,17 +17,10 @@ module Hetoimasia.LuaEngine.Session.Types
   ( -- * The composition
     SessionSpec (..)
 
-    -- * The harness's seams
-  , Harness (..)
-  , noHarness
-  , Point (..)
-  , BuildStep (..)
-
     -- * The handle
   , Session (..)
 
     -- * Failures of the coordinator itself
-  , SessionAborted (..)
   , SessionRefused (..)
   ) where
 
@@ -36,7 +29,6 @@ import Control.Concurrent.STM (TVar)
 import Control.Exception (Exception)
 import Data.Map.Strict (Map)
 import Data.Text (Text)
-import Data.Word (Word64)
 import Hetoimasia.Content.Inventory (Inventory)
 import Hetoimasia.Content.ReadPool (ReadPool)
 import Hetoimasia.Foundation.Log (Logger)
@@ -45,7 +37,8 @@ import Hetoimasia.LuaEngine.Boot (Checkpoint)
 import Hetoimasia.LuaEngine.Facade (Output)
 import Hetoimasia.LuaEngine.Manifest (Role)
 import Hetoimasia.LuaEngine.Profile (Profile)
-import Hetoimasia.LuaEngine.Session.State (InstanceKey, SessionState)
+import Hetoimasia.LuaEngine.Session.Harness (Harness, Point)
+import Hetoimasia.LuaEngine.Session.State (SessionState)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduler (TimerBackend)
@@ -77,54 +70,6 @@ data SessionSpec = SessionSpec
   -- ^ The harness's seams: 'noHarness' for a real composition.
   }
 
--- | Where a harness may look, and what it may add. None of it is reachable from a manifest or from
--- Lua, and a real composition passes 'noHarness'.
-data Harness = Harness
-  { harnessSecond ∷ ![Role]
-  -- ^ The roles that get a second instance of their selected behavior on the same VM, the slot the
-  -- design keeps for qualifying reusable bindings. Never public spawning.
-  , harnessTickBase ∷ !Word64
-  -- ^ The tick number the composition counts from: zero in production. A test of the Lua integer ceiling
-  -- starts near it, because reaching 2^63 - 1 by granting ticks is infeasible.
-  , harnessProbe ∷ Point → IO ()
-  -- ^ Told at each named point, on the thread that reaches it. A probe may block (to hold a window
-  -- open) or raise (to inject a failure); it is never called with a lock held that a stop needs.
-  }
-
--- | A harness with nothing in it.
-noHarness ∷ Harness
-noHarness = Harness [] 0 (const (pure ()))
-
--- | The steps a role's VM is made in, and released in the opposite order.
-data BuildStep = BuildCoordinator | BuildData | BuildFacade | BuildOwner
-  deriving (Eq, Ord, Show, Enum, Bounded)
-
--- | A named point of the session's life.
-data Point
-  = -- | A step of a role's construction has completed.
-    Built !Role !BuildStep
-  | -- | A step of a role's construction has been released.
-    Released !Role !BuildStep
-  | -- | An instance's admission has been intended and not yet issued.
-    Intended !InstanceKey
-  | -- | An instance's admission was accepted and not yet tracked.
-    Issued !InstanceKey
-  | -- | An instance is tracked.
-    Tracking !InstanceKey
-  | -- | An instance is constructed and validated and its @init@ is about to be dispatched, on its
-    -- owner's thread.
-    Validating !InstanceKey
-  | -- | The dispatch gate opened for an instance and its @init@ is about to begin: the owner's thread is
-    -- here, and holding it holds the @init@ in flight without running a line of Lua.
-    Dispatched !InstanceKey
-  | -- | A tick is about to be granted, the check made and nothing issued.
-    GrantIntent !Word64
-  | -- | A tick was granted.
-    GrantIssued !Word64
-  | -- | A role's owner has ended and is about to be finalized.
-    OwnerEnded !Role
-  deriving (Eq, Show)
-
 -- | The handle to a session, made before any VM exists.
 data Session = Session
   { sessionState ∷ !(TVar SessionState)
@@ -133,17 +78,12 @@ data Session = Session
   -- transition that reports the role to be stopped.
   , sessionLogger ∷ !Logger
   -- ^ The coordinator's diagnostics: lifecycle at info, a failure once at error.
+  , sessionProbe ∷ Point → IO ()
+  -- ^ The harness's probe, told at the points of the session's life ('noHarness' tells nothing).
   , sessionGrantLock ∷ !(MVar ())
   -- ^ Held by the driver around the issuing of a tick grant, and passed through by a stop of the
   -- logical role before it asks the owner to stop: a grant is either issued before the stop or not at all.
   }
-
--- | Raised in an owner's thread, from the hook that gates a root's @init@, when the gate is aborted: the
--- @init@ does not run, and the owner ends. Recognized by the owners' policy, so it is not a failure.
-data SessionAborted = SessionAborted
-  deriving (Eq, Show)
-
-instance Exception SessionAborted
 
 -- | The composition could not be made: a bound below what the engine needs, a service that was
 -- refused. A failure of the host's, with its reason; nothing of the script's.
