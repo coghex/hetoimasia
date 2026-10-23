@@ -75,7 +75,10 @@ spec = describe "output" $ do
   describe "one call" $ do
     it "joins its arguments' tostring forms with a tab and ends the line" $ do
       (out, _) ← printing ["print(1, nil, true, 'x', 2.5)"]
-      startingWith "1" out `shouldBe` ["1\tnil\ttrue\tx\t2.5"]
+      -- The output sink also receives the runner's status tables, whose rows begin with the process-wide runtime
+      -- number, so a prefix filter would match a row whenever that number begins with 1. Drop the tables and keep
+      -- every other line, so extra or missing script output still fails.
+      scriptLines out `shouldBe` ["1\tnil\ttrue\tx\t2.5"]
     it "writes at most a documented number of bytes, cut with a visible marker" $ do
       (out, err) ← printing ["print('L:' .. string.rep('x', 100000))", "warn('W:' .. string.rep('y', 100000))"]
       case startingWith "L:" out of
