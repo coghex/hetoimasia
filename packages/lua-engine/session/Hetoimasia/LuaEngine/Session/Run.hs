@@ -810,32 +810,50 @@ isStopping env = stStopping <$> readTVarIO (sessionState (envSession env))
 -- Evaluating the entries ---------------------------------------------------------------------------------
 
 -- | Evaluate each selected entry, with its imports, in its own VM, running no instance. Every boot load is
--- asked before any is waited for, so the VMs evaluate side by side; a failure of either is a boot failure
--- and neither root is ever dispatched.
+-- asked before any is waited for, so the VMs evaluate side by side. A failure is a boot failure and neither
+-- root is ever dispatched: it is latched, and its policy applied, the moment its entry's outcome arrives,
+-- whichever entry that is and whatever the other is still doing. The wait ends when every entry has answered or
+-- the session is stopping, in which case what is left is drained by the owners' stop and the scopes that
+-- follow it.
 bootEntries ∷ Env → [RoleVm] → Driver → IO ()
 bootEntries env vms driver = do
   asked ← forM vms $ \vm → (,) vm <$> bootModule (rvCoordinator vm) (riEntry (rvInfo vm))
-  outcomes ← forM asked $ \(vm, ticket) → case ticket of
-    Left refusal → pure (vm, Left (Text.pack (show refusal)))
-    Right found → do
-      outcome ← waitFor env vms driver ((Just <$> awaitBoot found) `orElse` (stateOf env >>= \s → if stStopping s then pure Nothing else retry))
-      pure (vm, maybe (Right BootStopped) Right outcome)
-  forM_ outcomes $ \(vm, outcome) → do
-    let info = rvInfo vm
-        failed text path = do
-          let record =
-                boundFailure
-                  (envLimits env)
-                  (newRoleFailure ModuleError OnModule (riRole info) text)
-                    { rfContent = Just (riContent info)
-                    , rfPath = Just path
-                    }
-          void (applyEvent (envSession env) (LatchFailure (riRole info) record []))
-    case outcome of
-      Left text → failed ("the entry module's boot load was refused: " <> text) (riEntryPath info)
-      Right BootReady → pure ()
-      Right BootStopped → pure ()
-      Right (BootFailed found) → failed (Modules.failureMessage found) (Modules.failurePath found)
+  pending ← fmap catMaybes . forM asked $ \(vm, ticket) → case ticket of
+    Left refusal → Nothing <$ failed vm ("the entry module's boot load was refused: " <> Text.pack (show refusal)) (riEntryPath (rvInfo vm)) Nothing
+    Right found → pure (Just (vm, found))
+  collect pending
+  where
+    collect [] = pure ()
+    collect pending = do
+      arrived ← waitFor env vms driver (firstArrival pending)
+      case arrived of
+        Nothing → pure ()
+        Just ((vm, outcome), rest) → do
+          case outcome of
+            BootReady → pure ()
+            BootStopped → pure ()
+            BootFailed found → failed vm (Modules.failureMessage found) (Modules.failurePath found) (Modules.failureTraceback found)
+          collect rest
+    -- The first entry to have answered, with the entries still to answer; or, while none has, whether the session
+    -- is stopping.
+    firstArrival = go []
+      where
+        go _ [] = stateOf env >>= \s → if stStopping s then pure Nothing else retry
+        go passed ((vm, found) : rest) =
+          ((Just <$> awaitBoot found) `orElse` pure Nothing) >>= \case
+            Just outcome → pure (Just ((vm, outcome), reverse passed <> rest))
+            Nothing → go ((vm, found) : passed) rest
+    failed vm text path traceback = do
+      let info = rvInfo vm
+          record =
+            boundFailure
+              (envLimits env)
+              (newRoleFailure ModuleError OnModule (riRole info) text)
+                { rfContent = Just (riContent info)
+                , rfPath = Just path
+                , rfTraceback = traceback
+                }
+      void (applyEvent (envSession env) (LatchFailure (riRole info) record []))
 
 -- Admitting the instances ---------------------------------------------------------------------------------
 
@@ -1075,7 +1093,7 @@ act env vms driver = \case
   NextStops → dischargeStops session
   NextRelease items → forM_ items $ \item → do
     modifyIORef' (dvReleased driver) (Set.insert (hdKey item))
-    releaseHeldInstance (hdTicket item)
+    void (releaseHeldInstance (hdTicket item))
     probeAt env (Resumed (hdKey item))
   NextOrigin origin → do
     writeIORef (dvOriginTaken driver) True

@@ -70,6 +70,7 @@ module Hetoimasia.Scripting.Lua.Instance.Types
     -- * Shared state
   , Instances (..)
   , ICell (..)
+  , HeldInit (..)
   , BehaviorCell (..)
   , BehaviorResolved (..)
   , cellCadence
@@ -814,10 +815,29 @@ data ICell = ICell
   , icReleased ∷ !(TVar Bool)
   , icBehavior ∷ !(Maybe BehaviorCell)
     -- ^ An M1 behavior instance's request and what the owner's thread made of it.
-  , icHeldInit ∷ !(TVar (Maybe (IO ())))
-    -- ^ What an instance held after its construction ('instanceHoldInit') does when it is released: the
-    -- rest of its start. Written and taken on the owner's thread; empty for an instance not held.
+  , icHeldInit ∷ !(TVar HeldInit)
+    -- ^ Where an instance is in being held after its construction ('instanceHoldInit').
   }
+
+-- | The states of an instance's hold, and the transitions between them. The rest of the instance's start is
+-- registered before the application is asked, so a release can never arrive before there is something to release,
+-- and a release is recorded in the same transaction that queues the job that acts on it, so it is queued once.
+--
+-- > NotHeld ──register──▶ HeldBegin ──answer False──▶ NotHeld (the start runs at once)
+-- >                          │ └─answer True─▶ HeldBegin (held)
+-- >                          └─release (any time after registration)─▶ ReleasedBegin (one job queued)
+-- > ReleasedBegin ──the job on the owner's thread──▶ NotHeld (the start runs, unless the instance has stopped)
+-- > anything ──the instance settles, or the answer is False──▶ NotHeld (a later release is nothing)
+--
+-- A release in 'ReleasedBegin' or 'NotHeld' changes nothing, so any number of releases, from any threads, queue at
+-- most one job. Written in STM, taken on the owner's thread.
+data HeldInit
+  = -- | Not held: nothing to release.
+    NotHeld
+  | -- | The rest of the start, registered; not released.
+    HeldBegin !(IO ())
+  | -- | The same, released: its job is queued, and no other will be.
+    ReleasedBegin !(IO ())
 
 -- | An M1 behavior instance's part of its cell.
 data BehaviorCell = BehaviorCell

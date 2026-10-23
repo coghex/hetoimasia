@@ -652,9 +652,11 @@ awaitInstance supervision ticket = do
   awaitSupervised supervision (State.observeInstance ticket >>= maybe retry pure)
 
 -- | Release an instance that 'instanceHoldInit' held after its construction: its @init@ begins on the
--- owner's thread, in its turn among the owner's jobs. An instance that was not held, was released already or
--- has ended takes nothing from it, so it is safe to repeat.
-releaseHeldInstance ∷ InstanceTicket → IO ()
+-- owner's thread, in its turn among the owner's jobs. The release is recorded and its one job queued in a single
+-- transaction, so any number of releases, from any threads, queue one job between them. An instance that was not
+-- held, was released already or has ended takes nothing from it. Answers whether this call is the one that
+-- released the instance.
+releaseHeldInstance ∷ InstanceTicket → IO Bool
 releaseHeldInstance = atomically . State.releaseHeld
 
 -- | Withdraw interest in an instance's result. An ended instance gives its

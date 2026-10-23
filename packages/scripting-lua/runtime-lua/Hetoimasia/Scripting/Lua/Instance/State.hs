@@ -116,7 +116,7 @@ admitCell instances gate owner behavior request = do
           forgotten ← newTVar False
           released ← newTVar False
           held ← forM behavior $ \wanted → BehaviorCell wanted <$> newTVar Nothing
-          heldInit ← newTVar Nothing
+          heldInit ← newTVar NotHeld
           let cell =
                 ICell
                   { icId = number
@@ -358,6 +358,7 @@ settleInstance instances cell settlement =
     Just _ → pure False
     Nothing → do
       writeTVar (icResult cell) (Just settlement)
+      writeTVar (icHeldInit cell) NotHeld
       modifyTVar' (icState cell) (\state → state {isPhase = resultPhase settlement, isStopped = True, isActive = Nothing, isConnections = Set.empty, isQueue = Seq.empty, isPending = Nothing, isUpdate = UpdateNone})
       modifyTVar' (insLive instances) (subtract 1)
       forgotten ← readTVar (icForgotten cell)
@@ -367,11 +368,16 @@ settleInstance instances cell settlement =
 -- | Release an instance that was held after its construction ('Hetoimasia.Scripting.Lua.Instance.instanceHoldInit'):
 -- its @init@ begins on the owner's thread in its turn among the jobs, unless the instance has ended by then. An
 -- instance that was not held, or has settled, takes nothing from it.
-releaseHeld ∷ InstanceTicket → STM ()
+releaseHeld ∷ InstanceTicket → STM Bool
 releaseHeld (InstanceTicket instances cell _) = do
   settled ← isJust <$> readTVar (icResult cell)
-  held ← readTVar (icHeldInit cell)
-  when (not settled && isJust held) $ modifyTVar' (insInbox instances) (|> JobResumeInit (icId cell))
+  readTVar (icHeldInit cell) >>= \case
+    HeldBegin begin | not settled → do
+      -- recorded and queued in one transaction: one release queues one job, however many are made
+      writeTVar (icHeldInit cell) (ReleasedBegin begin)
+      modifyTVar' (insInbox instances) (|> JobResumeInit (icId cell))
+      pure True
+    _ → pure False
 
 -- | A coherent reading of one instance.
 snapshotOf ∷ Instances → Gate → OwnerId → Text → ICell → STM InstanceSnapshot

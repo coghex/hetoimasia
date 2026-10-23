@@ -11,6 +11,8 @@ module Test.LuaEngine.Session.Startup (spec) where
 
 import Control.Monad (void)
 import Data.List (isInfixOf)
+import Data.Maybe (catMaybes)
+import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Test.Hspec
@@ -250,6 +252,53 @@ validation = describe "validation before either root is dispatched" $ do
         out `shouldBe` []
         fmap rfRole (outFailures outcome) `shouldBe` [Gameplay]
         fmap rfStage (outFailures outcome) `shouldBe` [OnModule]
+
+  it "latches a boot failure the moment its entry answers, in either role, while the other role's entry is still being read" $
+    mapM_
+      ( \(failing, brokenPath, heldPath) →
+          withSetup
+            (setup (roleScript printScript))
+              { suEntries = Just ("lua/game.lua", "lua/ui.lua")
+              , suFiles =
+                  [ ("lua/game.lua", if brokenPath == "lua/game.lua" then luaMain ["return {"] else roleScript printScript)
+                  , ("lua/ui.lua", if brokenPath == "lua/ui.lua" then luaMain ["return {"] else roleScript printScript)
+                  ]
+              }
+            $ \env → do
+              let world = seWorld env
+              closeGate (ssProbeOf env) (fromString heldPath)
+              outcome ← runScenario env $ \session → do
+                awaitReadOf env (fromString heldPath)
+                -- the peer's entry is held in the middle of its read; the failure is published and the session stops anyway
+                status ← awaitStatus session (\found → any roleFailed (catMaybes [statusGameplay found, statusPresentation found]))
+                statusStopping status `shouldBe` True
+                openGate (ssProbeOf env) (fromString heldPath)
+                void (awaitRetired session)
+              out ← outLines world
+              out `shouldBe` []
+              fmap rfRole (outFailures outcome) `shouldBe` [failing]
+              fmap rfStage (outFailures outcome) `shouldBe` [OnModule]
+      )
+      ([(Gameplay, "lua/game.lua", "lua/ui.lua"), (Presentation, "lua/ui.lua", "lua/game.lua")] ∷ [(Role, FilePath, FilePath)])
+
+  it "carries the traceback of a module-only boot failure into the role's failure record, with no instance" $
+    withSetup
+      (setup (roleScript printScript))
+        { suShape = GameplayAlone
+        , suEntries = Just ("lua/game.lua", "lua/ui.lua")
+        , suFiles =
+            [ ("lua/game.lua", luaMain ["local function inner() error('entry boom') end", "local function outer() inner() end", "outer()"])
+            , ("lua/ui.lua", roleScript printScript)
+            ]
+        }
+      $ \env → do
+        outcome ← runScenario env $ \session → void (awaitRetired session)
+        case outFailures outcome of
+          [found] → do
+            rfInstance found `shouldBe` Nothing
+            rfMessage found `shouldSatisfy` Text.isInfixOf "entry boom"
+            rfTraceback found `shouldSatisfy` maybe False (Text.isInfixOf "inner")
+          other → expectationFailure ("expected one failure, found " <> show other)
 
   it "starts neither root when an entry does not evaluate, and attributes the failure to the module, with no instance" $
     withSetup

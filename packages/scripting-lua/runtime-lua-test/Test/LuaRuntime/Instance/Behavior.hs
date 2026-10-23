@@ -10,7 +10,8 @@
 module Test.LuaRuntime.Instance.Behavior (spec) where
 
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), throwIO)
-import Control.Monad (forM_, void)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Monad (forM, forM_, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as Char8
@@ -106,10 +107,18 @@ withNotified exports body = do
 -- | An owner whose instances are held after their construction until the example releases them, telling the
 -- log which instance was held, over a body.
 withHolding ∷ [ExportSource] → (IFixture → RuntimeControl → ScheduledOwner → IO a) → IO a
-withHolding exports body = do
+withHolding = withHoldingUsing (\_ → pure ())
+
+-- | The same, with something the owner's thread does in the callback after it has said it holds the instance and
+-- before it answers.
+withHoldingUsing ∷ (InstanceId → IO ()) → [ExportSource] → (IFixture → RuntimeControl → ScheduledOwner → IO a) → IO a
+withHoldingUsing inCallback exports body = do
   fixture ← newIFixture
   withBoundaryOpening [openAllGates fixture] $ \control runtime → do
-    let held found = True <$ atomicModifyIORef' (sfLog (sf fixture)) (\entries → (("held " <> Text.pack (show (instanceLocal found))) : entries, ()))
+    let held found = do
+          atomicModifyIORef' (sfLog (sf fixture)) (\entries → (("held " <> Text.pack (show (instanceLocal found))) : entries, ()))
+          inCallback found
+          pure True
         config = (testConfig instanceBounds') {instanceHoldInit = held}
         base = instanceSpec fixture "behavior" [] config requiredPolicy defaultSchedulerBounds
         spec' = base {scheduledVm = (scheduledVm base) {vmExports = exports, vmExportLimits = defaultExportLimits}}
@@ -368,14 +377,14 @@ spec = describe "M1 behavior instances" $ do
         logged fixture >>= (`shouldBe` ["held 1", "held 2"])
         phaseOf fixture owner "a" >>= (`shouldBe` Just Initializing)
         phaseOf fixture owner "b" >>= (`shouldBe` Just Initializing)
-        releaseHeldInstance a
+        releaseHeldInstance a >>= (`shouldBe` True)
         awaitPhase fixture owner "a" Active
         -- The first one's init edits the behavior table; the one behind it captured it before that, so it is valid.
-        releaseHeldInstance b
+        releaseHeldInstance b >>= (`shouldBe` True)
         awaitPhase fixture owner "b" Active
         logged fixture >>= (`shouldBe` ["held 1", "held 2", "init alpha", "init beta"])
-        -- Releasing again, or an instance that was never held, changes nothing.
-        releaseHeldInstance a
+        -- Releasing again changes nothing.
+        releaseHeldInstance a >>= (`shouldBe` False)
         logged fixture >>= (`shouldBe` ["held 1", "held 2", "init alpha", "init beta"])
 
     it "settles an instance still held as stopped when its owner is stopped, with no init run and none of its hooks entered" $ bounded $
@@ -387,6 +396,45 @@ spec = describe "M1 behavior instances" $ do
         settled ← awaitSettled fixture "a"
         resultOutcome settled `shouldSatisfy` \case InstanceStopped → True; _ → False
         terminationShutdown (resultTermination settled) `shouldBe` ShutdownSkippedNoInit
+        logged fixture >>= (`shouldBe` ["held 1"])
+
+    it "is released correctly by a release that arrives while the application is still being asked: the callback has said it holds the instance and has not answered" $ bounded $ do
+      answer ← newEmptyMVar
+      withHoldingUsing (\_ → takeMVar answer) [selfEditing] $ \fixture _ owner → do
+        a ← admitBehavior fixture owner "a" (requestFor "selfediting" "gameplay" (facadeNamed "alpha") logicalRule)
+        awaitEffect (sf fixture) "held 1"
+        -- the application has published that it is ready and releases before it has answered
+        releaseHeldInstance a >>= (`shouldBe` True)
+        logged fixture >>= (`shouldBe` ["held 1"])
+        putMVar answer ()
+        awaitPhase fixture owner "a" Active
+        logged fixture >>= (`shouldBe` ["held 1", "init alpha"])
+
+    it "queues one job however many releases are made while the owner cannot consume them, and runs the init once" $ bounded $ do
+      stuck ← newEmptyMVar
+      -- the owner's thread is inside the callback of the second instance while the first is released over and over
+      withHoldingUsing (\found → when (instanceLocal found == 2) (takeMVar stuck)) [selfEditing] $ \fixture _ owner → do
+        a ← admitBehavior fixture owner "a" (requestFor "selfediting" "gameplay" (facadeNamed "alpha") logicalRule)
+        _ ← admitBehavior fixture owner "b" (requestFor "selfediting" "gameplay" (facadeNamed "beta") logicalRule)
+        awaitEffect (sf fixture) "held 2"
+        answers ← forM [1 .. 200 ∷ Int] (const (releaseHeldInstance a))
+        filter id answers `shouldBe` [True]
+        putMVar stuck ()
+        awaitPhase fixture owner "a" Active
+        logCount fixture "init alpha" >>= (`shouldBe` 1)
+
+    it "ignores a release that arrives after the owner was stopped or the instance settled, and a stop that arrives while the application is being asked ends the instance without its init" $ bounded $ do
+      answer ← newEmptyMVar
+      withHoldingUsing (\_ → takeMVar answer) [selfEditing] $ \fixture control owner → do
+        a ← admitBehavior fixture owner "a" (requestFor "selfediting" "gameplay" (facadeNamed "alpha") logicalRule)
+        awaitEffect (sf fixture) "held 1"
+        -- the owner is asked to stop while it is inside the callback
+        retireScheduled owner
+        putMVar answer ()
+        awaitScheduledTerminal control owner >>= (`shouldSatisfy` \case WorkerStopped → True; _ → False)
+        settled ← awaitSettled fixture "a"
+        terminationShutdown (resultTermination settled) `shouldBe` ShutdownSkippedNoInit
+        releaseHeldInstance a >>= (`shouldBe` False)
         logged fixture >>= (`shouldBe` ["held 1"])
 
     it "does not hold an instance by default: the instance begins as soon as it is constructed" $ bounded $

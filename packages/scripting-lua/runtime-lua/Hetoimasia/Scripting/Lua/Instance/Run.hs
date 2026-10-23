@@ -475,9 +475,11 @@ drainBacklog ih restore = do
     run = \case
       JobStart number → withCell ih number (startInstance ih)
       JobResumeInit number → withCell ih number $ \cell → do
-        begin ← atomically (swapTVar (icHeldInit cell) Nothing)
+        held ← atomically (swapTVar (icHeldInit cell) NotHeld)
         state ← readTVarIO (icState cell)
-        forM_ begin $ \continue → unless (isStopped state) continue
+        case held of
+          ReleasedBegin begin | not (isStopped state) → begin
+          _ → pure ()
       JobDispatch number → withCell ih number $ \cell → do
         atomically (modifyTVar' (icState cell) (\state → state {isDispatchQueued = False}))
         dispatch ih cell
@@ -705,10 +707,18 @@ startBehavior ih cell behavior = do
       -- The application may hold an instance here, the behavior valid and nothing authored run, until it has
       -- seen every instance it admitted come this far: the owner goes on to the instances behind it, and the
       -- held one begins when it is released, in its turn among the jobs.
+      -- The rest of the start is registered before the application is asked, so that a release it makes while it is
+      -- still being asked (it may publish that it is ready, and release, before it answers) finds something to
+      -- release. An answer of no takes the registration back and runs the start at once; a release that
+      -- raced it queued a job that finds nothing and does nothing.
+      atomically (writeTVar (icHeldInit cell) (HeldBegin (begin driver capture kind cadence)))
       held ← insHoldInit (ihInstances ih) (InstanceId (controlOwner (ihControl ih)) (icId cell))
-      if held
-        then atomically (writeTVar (icHeldInit cell) (Just (begin driver capture kind cadence)))
-        else begin driver capture kind cadence
+      unless held $ do
+        registered ← atomically (swapTVar (icHeldInit cell) NotHeld)
+        case registered of
+          HeldBegin start → start
+          ReleasedBegin start → start
+          NotHeld → pure ()
     begin driver capture kind cadence = do
       let shape = capturedShape capture
       -- An instance's initialization begins here whether or not its behavior has an @init@, so the
