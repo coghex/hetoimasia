@@ -262,7 +262,6 @@ busyMessage m1 bank = clipBytes (m1MessageBytes m1) ("request capacity is not av
 busyCode ∷ Text
 busyCode = "busy"
 
-
 -- | The check a service's request-producing binding makes of its copied arguments, before the action:
 -- every permanent fact the admission would refuse (the role's phase, an instance that is ending, an
 -- offset that is not positive or passes the ceiling with the tick, request numbers that are
