@@ -64,6 +64,9 @@ module Test.LuaEngine.Modules.Support
   , awaitTick
   , tickOf
   , retireVm
+  , askRetire
+  , openEverything
+  , failingLogger
   , awaitEnd
   , awaitOwnerEnded
   , awaitFailure
@@ -678,6 +681,14 @@ driverSource =
       , "    shared[p.name or key] = r.value"
       , "    out = describe(r, 0)"
       , "  elseif p.op == 'same' then out = tostring(rawequal(shared[key], shared[p.other]))"
+      , "  elseif p.op == 'start_block' then"
+      , "    local r, err = module.fetch(p.path or 'a.lua', p.offset)"
+      , "    if r then self.hs[key] = r end"
+      , "    fx.block(p.name or key)"
+      , "    out = 'released'"
+      , "  elseif p.op == 'call_same' then"
+      , "    local ok, r = pcall(shared[key][p.field], p.text)"
+      , "    out = ok and tostring(rawequal(r, shared[p.other])) or ('error ' .. tostring(r))"
       , "  elseif p.op == 'is_self' then out = tostring(rawequal(shared[key][p.field], shared[key]))"
       , "  elseif p.op == 'env' then"
       , "    local r = request.take(self.hs[key])"
@@ -804,8 +815,26 @@ awaitTick control vm wanted = awaitSupervised control $ do
   unless (now == wanted) retry
 
 -- | Ask the owner to stop, and wait for it to be over.
-retireVm ∷ Vm → IO ()
-retireVm vm = retireScheduled (vmOwner vm) >> awaitOwnerEnded vm
+retireVm ∷ RuntimeControl → Vm → IO ()
+retireVm control vm = askRetire vm >> void (awaitEnd control vm)
+
+-- | Ask the owner to stop, without waiting.
+askRetire ∷ Vm → IO ()
+askRetire = retireScheduled . vmOwner
+
+-- | Open every gate there is: the probe's and the scripts'.
+openEverything ∷ Session → IO ()
+openEverything session = openGates session >> openAllProbeGates (ssProbe session)
+
+-- | A logger whose sink fails with this text: a diagnostic that cannot be written.
+failingLogger ∷ Text → Logger
+failingLogger why = mkLoggerWith defaultLogFilter metadata (callbackSink (\_ → throwIO (userError (Text.unpack why))))
+  where
+    metadata =
+      MetadataProviders
+        { metadataClock = pure (UTCTime (fromGregorian 2026 10 22) (secondsToDiffTime 43200))
+        , metadataThread = pure "1"
+        }
 
 -- | The owner's request service, read in one transaction.
 vmDiagnostics ∷ Vm → IO ProviderDiagnostics

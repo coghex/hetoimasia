@@ -173,6 +173,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Modules.Bank
         Test.LuaEngine.Modules.Basics
         Test.LuaEngine.Modules.Identities
+        Test.LuaEngine.Modules.Lifecycle
         Test.LuaEngine.Modules.Limits
         Test.LuaEngine.Modules.Order
         Test.LuaEngine.Modules.Positions

@@ -3,6 +3,7 @@ module Test.LuaEngine.Modules.Spec (spec) where
 
 import qualified Test.LuaEngine.Modules.Bank as Bank
 import qualified Test.LuaEngine.Modules.Basics as Basics
+import qualified Test.LuaEngine.Modules.Lifecycle as Lifecycle
 import qualified Test.LuaEngine.Modules.Limits as Limits
 import qualified Test.LuaEngine.Modules.Order as Order
 import qualified Test.LuaEngine.Modules.Positions as Positions
@@ -17,5 +18,6 @@ spec = describe "Modules" $ do
   Order.spec
   Bank.spec
   Limits.spec
+  Lifecycle.spec
   Promotion.spec
   Positions.spec
