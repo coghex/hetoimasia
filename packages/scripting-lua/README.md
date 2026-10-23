@@ -3117,10 +3117,20 @@ roles, or an instance and its harness peer, together) cannot learn that from an 
 the first `init` may change what the instance behind it captures. `instanceHoldInit` of the instance configuration
 (default: hold nothing) is asked once per behavior instance, on the owner's thread, at exactly that point, and
 answering `True` holds the instance there. The owner goes on to the instances behind it, so nothing is parked. The
-application, having seen every instance come that far, releases them with `releaseHeldInstance` (idempotent, and
-nothing for an instance that was not held or has ended), and each begins on the owner's thread in its turn among the
-owner's jobs. A held instance whose owner is stopped before it was released settles as stopped, with shutdown
-disposition `ShutdownSkippedNoInit` and none of its hooks entered. What the question raises is a failure of the host.
+application, having seen every instance come that far, releases them with `releaseHeldInstance`, and each begins on
+the owner's thread in its turn among the owner's jobs. What the question raises is a failure of the host.
+
+A hold is a small state machine in the instance's cell, and every transition is one transaction:
+
+| State | Event | Next state | What happens |
+| --- | --- | --- | --- |
+| not held | the instance is validated | held (registered) | the rest of its start is registered **before** the application is asked, so a release can never arrive before there is something to release |
+| held (registered) | the answer is `False` | not held | the registration is taken back and the start runs at once; a release that raced the answer queued a job that will find nothing and do nothing |
+| held (registered) | the answer is `True` | held | the owner goes on |
+| held (registered) | `releaseHeldInstance`, at any time after the registration (including while the application is still being asked) | released | the release is recorded and its one job queued in the same transaction; the call answers `True` |
+| released | `releaseHeldInstance` again, from any thread | released | nothing is queued; the call answers `False`: one hold queues at most one job, however many releases are made |
+| released | the job runs on the owner's thread | not held | the start runs, unless the instance has stopped, in which case nothing runs |
+| any | the instance settles, or its owner is stopped | not held | a held or released instance settles as stopped with shutdown disposition `ShutdownSkippedNoInit` and none of its hooks entered; a later release is nothing and answers `False` |
 
 Isolation is the default: the instance ends and the owner's other instances run on. The engine cannot
 tell whether state the instances share was damaged, so the application is told of each failure on the
