@@ -314,7 +314,11 @@ revision A beside a scan that pinned revision B, every declared entry (a fully o
 common entry included) required to name an inventoried regular file, and a cancellation
 while the checkpoint holds the read -- and, for the M1 request adapter, the busy
 record, the exact request records, handles, phases, the profile's limits and required and optional
-failure over real Lua instances on a supervised owner with controlled fake providers. The owned texture pipeline (LFE-16) is covered over a real content root, inventory and shared read pool, the real bounded PNG decoder and a gated fake upload backend: every admission bank independently full and refused as busy with nothing reserved and no work done, the lanes, workers and queues, the charges stage by stage, cancellation at every stage, the expected and fatal failures, independent loads and explicit release, the pipeline's close and drain, and a separately compiled client. The manifest,
+failure over real Lua instances on a supervised owner with controlled fake providers. The owned texture pipeline (LFE-16) is covered over a real content root, inventory and shared read pool, the real bounded PNG decoder and a gated fake upload backend: every admission bank independently full and refused as busy with nothing reserved and no work done, the lanes, workers and queues, the charges stage by stage, cancellation at every stage, the expected and fatal failures, independent loads and explicit release, the pipeline's close and drain, and a separately compiled client -- and, for the module coordinator (LFE-11),
+real modules through real VMs on supervised scheduled owners over a real content root, inventory and read pool with the
+production reader behind gates: shared jobs joined by per-request waiters and answered with the very table, evaluation by
+admission or placed position, a dependency evaluated once within its importer's chain, the source bank and its reserve, the
+identity cache and request pressure, stop and defects, and a separately compiled client. The manifest,
 profile and boot examples start no Lua, and no example starts a window or a GPU; the checkpoint
 reads only through the verified read it is given. It is mandatory but outside the floor, like `test.math`,
 and its command names `cabal.project.cpu`; the group declares that file beside
