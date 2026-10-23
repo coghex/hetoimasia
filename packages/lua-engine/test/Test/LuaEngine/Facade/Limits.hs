@@ -11,10 +11,10 @@ import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as Char8
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
-import Hetoimasia.LuaEngine.Profile (ByteLimit (CopiedValueBytes, DataBytes, InstanceIdBytes, PrintWarnBytes, SceneInputBytes), Profile)
+import Hetoimasia.LuaEngine.Profile (ByteLimit (CopiedValueBytes, DataBytes, InstanceIdBytes, PrintWarnBytes, SceneInputBytes), CountLimit (InstancesPerVm, LuaIntegerMaximum), Profile)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
-import Test.LuaEngine.Request.Profiles (bytesOf)
+import Test.LuaEngine.Request.Profiles (bytesOf, counts)
 
 files ∷ [(FilePath, ByteString)]
 files = [("data.bin", "xx")]
@@ -67,6 +67,14 @@ spec = describe "the bounds the facade formats with" $ do
           let calls = [line | line ← err, "..." `Text.isSuffixOf` line]
           length calls `shouldBe` 2
           sum [ByteString.length (Text.encodeUtf8 line) + 1 | line ← takeWhile (prefix `Text.isPrefixOf`) err] `shouldSatisfy` (<= least)
+  describe "the limits for which positive is enough" $ do
+    it "makes a facade over a VM of one instance: the second declaration is refused with that bound" $
+      withOneIn Gameplay (counts [(InstancesPerVm, 1)]) script {scInit = ["print(api.instance_id)"]} files $ \world _ fvm _ → do
+        outLines world >>= (`shouldBe` ["inst-1"])
+        declareInstance (fvFacade fvm) "modules-test" >>= \declared → either Just (const Nothing) declared `shouldBe` Just (TooManyInstances 1)
+    it "makes a facade whose tick ceiling is one: tick 0 is read, as the first tick a wait or a request can reach" $
+      withOneIn Gameplay (counts [(LuaIntegerMaximum, 1)]) script {scInit = ["print(api.time.tick())"]} files $ \world _ _ _ →
+        outLines world >>= (`shouldBe` ["0"])
   describe "CopiedValueBytes" $ do
     let least = minimumContextBytes 128
         profileAt n = bytesOf [(CopiedValueBytes, fromIntegral n), (DataBytes, 64), (SceneInputBytes, 64)]
