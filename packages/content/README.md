@@ -795,6 +795,7 @@ reserveSlot       ∷ ReadPool → STM Bool          -- in the consumer's own ad
 releaseSlot       ∷ ReadPool → STM ()            -- after the job has retired
 submit            ∷ ReadPool → ReadRequest → STM (Either SubmitRefusal ReadTicket)
 cancel            ∷ ReadTicket → STM CancelOutcome
+withdrawQueued    ∷ ReadTicket → STM Bool         -- cancel only a job no worker has taken
 retired           ∷ ReadTicket → STM Bool
 status            ∷ ReadPool → STM PoolStatus
 awaitFailure      ∷ ReadPool → STM (ExceptionWithContext SomeException)   -- the first failure
@@ -851,6 +852,13 @@ retirement never sees the work over while a worker still holds the buffer it was
 `cancel` answers `CancelWithdrawn` (queued: no file was ever opened and the sink will not be called), `CancelInFlight`
 (a worker has it: it runs to its end and its sink is suppressed unless it had begun to deliver) or `CancelTooLate`. An
 issued job whose interest is withdrawn before the reader was asked for anything skips the read.
+
+`withdrawQueued` is the half of `cancel` a consumer that must get its sink back uses (LFE-11's module coordinator, which
+returns the slot it reserved from its sink): it answers `True` for a job that was still queued, which leaves the queue with no
+file opened, never calls its sink and is retired, and `False` for every other job, a job a worker holds included, with nothing
+changed, so that the sink of an issued job is still called. It and issuance are transactions on the one pool state, so exactly
+one of them wins a queued job. A consumer that promotes a queued read to the `DependencyProgress` class withdraws it this way
+and submits it again in the same transaction, keeping its slot reservation: one read, however it is promoted.
 
 ### The buffer
 
