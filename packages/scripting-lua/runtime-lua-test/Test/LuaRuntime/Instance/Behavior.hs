@@ -112,13 +112,17 @@ withHolding = withHoldingUsing (\_ → pure ())
 -- | The same, with something the owner's thread does in the callback after it has said it holds the instance and
 -- before it answers.
 withHoldingUsing ∷ (InstanceId → IO ()) → [ExportSource] → (IFixture → RuntimeControl → ScheduledOwner → IO a) → IO a
-withHoldingUsing inCallback exports body = do
+withHoldingUsing = withHoldingAnswering True
+
+-- | The same, answering this: 'False' declines to hold.
+withHoldingAnswering ∷ Bool → (InstanceId → IO ()) → [ExportSource] → (IFixture → RuntimeControl → ScheduledOwner → IO a) → IO a
+withHoldingAnswering answered inCallback exports body = do
   fixture ← newIFixture
   withBoundaryOpening [openAllGates fixture] $ \control runtime → do
     let held found = do
           atomicModifyIORef' (sfLog (sf fixture)) (\entries → (("held " <> Text.pack (show (instanceLocal found))) : entries, ()))
           inCallback found
-          pure True
+          pure answered
         config = (testConfig instanceBounds') {instanceHoldInit = held}
         base = instanceSpec fixture "behavior" [] config requiredPolicy defaultSchedulerBounds
         spec' = base {scheduledVm = (scheduledVm base) {vmExports = exports, vmExportLimits = defaultExportLimits}}
@@ -436,6 +440,20 @@ spec = describe "M1 behavior instances" $ do
         terminationShutdown (resultTermination settled) `shouldBe` ShutdownSkippedNoInit
         releaseHeldInstance a >>= (`shouldBe` False)
         logged fixture >>= (`shouldBe` ["held 1"])
+
+    it "begins the instance once when the application declines to hold it after a release arrived during the question" $ bounded $ do
+      answer ← newEmptyMVar
+      let plain = exportOf "plain" ["return { gameplay = { init = function() " <> record <> "('init plain') end } }"]
+      withHoldingAnswering False (\found → when (instanceLocal found == 1) (takeMVar answer)) [selfEditing, plain] $ \fixture _ owner → do
+        a ← admitBehavior fixture owner "a" (requestFor "selfediting" "gameplay" (facadeNamed "alpha") logicalRule)
+        awaitEffect (sf fixture) "held 1"
+        releaseHeldInstance a >>= (`shouldBe` True)
+        putMVar answer ()
+        awaitPhase fixture owner "a" Active
+        -- the job the release queued is ahead of the next instance's start, which has run when this line appears
+        _ ← admitBehavior fixture owner "b" (requestFor "plain" "gameplay" (facadeNamed "beta") logicalRule)
+        awaitEffect (sf fixture) "init plain"
+        logCount fixture "init alpha" >>= (`shouldBe` 1)
 
     it "does not hold an instance by default: the instance begins as soon as it is constructed" $ bounded $
       withDefaults [selfEditing] $ \fixture _ owner → do
