@@ -177,7 +177,10 @@ workers = describe "the pool's workers" $
           admitDriver session other "o"
           forM_ ["g1.lua", "g2.lua", "q1.lua"] (closeGate (ssProbe session))
           -- The neighbour's reads occupy both workers, and an older read of its own waits behind them.
+          -- One at a time, so that which worker takes which read is not the example's race: the order the
+          -- reads entered the reader is then the order they were submitted in.
           command session other "o" "start" "kg1" [] (Just (fetch "g1.lua"))
+          awaitStarted (ssProbe session) 1
           command session other "o" "start" "kg2" [] (Just (fetch "g2.lua"))
           awaitStarted (ssProbe session) 2
           command session other "o" "start" "kq1" [] (Just (fetch "q1.lua"))

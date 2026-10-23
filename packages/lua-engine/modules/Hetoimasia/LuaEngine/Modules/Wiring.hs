@@ -22,6 +22,7 @@ module Hetoimasia.LuaEngine.Modules.Wiring
   , moduleArguments
   , moduleAsk
   , startModule
+  , ModuleStart (..)
   , moduleArgumentCheck
     -- * Boot loads
   , BootRefusal (..)
@@ -81,7 +82,7 @@ import Hetoimasia.LuaEngine.Profile
 import Hetoimasia.LuaEngine.Request
   ( M1Ask (..)
   , M1Requests
-  , M1Start
+  , M1Start (..)
   , m1Ask
   , m1ArgumentCheck
   , m1Profile
@@ -352,10 +353,32 @@ identityCredit c identity =
 -- reserves its permanent place together with the request's own records, before the endpoint is handed
 -- anything and before a source is asked for; temporary pressure on the request, result or identity
 -- banks is the host's busy answer with no handle, read or partial reservation.
-startModule ∷ HasCallStack ⇒ Coordinator → ModuleRequest → RequestContext → IO () → IO M1Start
+startModule ∷ HasCallStack ⇒ Coordinator → ModuleRequest → RequestContext → IO () → IO ModuleStart
 startModule c request context after = do
   ask <- moduleAsk c request
-  startM1 (coordRequests c) ask context moduleEndpointName (moduleArguments request) after
+  started <- startM1 (coordRequests c) ask context moduleEndpointName (moduleArguments request) after
+  case started of
+    M1Busy _ -> do
+      -- Not accepted: the room the argument check reserved was not adopted, and is given back.
+      atomically (releaseCheckSTM c (requestedKey request))
+      -- The identity cache never frees a place, so a place that is gone is gone: if the admission met a
+      -- full cache, or a coordinator that closed, after the argument check let it through (another
+      -- thread's boot load took the last place in between), it was not a bank that would have room
+      -- later. The permanent state is read after the failed admission, and can only have grown.
+      atomically (permanentRefusalSTM c (requestedKey request)) >>= \case
+        Just why -> pure (StartRefused why)
+        Nothing -> pure (StartAnswered started)
+    M1Accepted _ -> pure (StartAnswered started)
+
+-- | What starting a request for a module came to: what the request host answered, or a permanent
+-- refusal that became true after the argument check passed — to be raised as the same ordinary,
+-- catchable error the argument check raises, never as a busy answer a script would retry.
+data ModuleStart
+  = -- | Accepted, or busy on a temporary bank.
+    StartAnswered !M1Start
+  | -- | The identity cache is full for a new identity, or the coordinator has closed: the bounded reason.
+    StartRefused !Text
+  deriving (Eq, Show)
 
 -- | The argument check of a binding that builds the request from its copied arguments: the host's
 -- permanent refusals first (role, phase, offset, ceiling, exhausted numbers), then this one's: a new
@@ -368,7 +391,7 @@ moduleArgumentCheck c requestOf owner values = do
   hosts <- m1ArgumentCheck (coordRequests c) (const ask) owner values
   case hosts of
     Just why -> pure (Just why)
-    Nothing -> atomically (permanentRefusalSTM c (requestedKey request))
+    Nothing -> atomically (reserveForCheckSTM c (requestedKey request))
 
 -- Boot loads --------------------------------------------------------------------------------------------
 

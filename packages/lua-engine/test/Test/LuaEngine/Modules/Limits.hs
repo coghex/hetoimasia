@@ -122,7 +122,7 @@ pressure = describe "temporary pressure" $
         mapM_ (\key → command session vm "x" "start" key [] (Just (fetch "i2.lua"))) ["a", "b", "c"]
         awaitHistory session (\seen → length (filter (Text.isPrefixOf "x start") seen) == 4)
         history session >>= \seen → length (filter (Text.isInfixOf "busy:busy:") seen) `shouldBe` 3
-        counts' vm >>= \c → (jobsHeld c, waitersHeld c) `shouldBe` (1, 1)
+        counts' vm >>= \c → (jobsHeld c, waitersHeld c, promisedHeld c) `shouldBe` (1, 1, 0)
         readsStarted (ssProbe session) >>= (`shouldBe` 1)
         -- The permanent cache has two places left, so none was taken by the busy answers.
         command session vm "y" "start" "k2" [] (Just (fetch "i2.lua"))
@@ -267,6 +267,23 @@ loads = describe "an accepted load that meets a limit" $ do
           command session vm "x" "pstart" "k2" [] (Just (fetch "i4.lua"))
           line ← lineStartingWith session "x pstart k2 error"
           line `shouldSatisfy` Text.isInfixOf "module limit"
+
+  it "decides a request's permanent place with its argument check, so a boot load that arrives between the check and the admission is the one refused, and the request is never made busy" $
+    withSession tiny (2, 8) realReader layout $ \session _ runtime →
+      withVm session runtime "ui" (defaultOptions OnArrival) $ \vm → do
+        admitDriver session vm "x"
+        void (bootNow session vm "i2.lua" >>= awaitBootOutcome)
+        void (bootNow session vm "i3.lua" >>= awaitBootOutcome)
+        counts' vm >>= \c → jobsHeld c `shouldBe` 2
+        -- One place is left, so the check lets the request through and holds the place for it. A boot load
+        -- of another module arrives before the admission: it finds the place taken.
+        raced ← newIORef Nothing
+        betweenCheckAndAdmission session (bootModule (vmCoordinator vm) (key' session "i1.lua") >>= writeIORef raced . Just . either Just (const Nothing))
+        command session vm "x" "start" "k1" [] (Just (fetch "i4.lua"))
+        awaitNote session "x start k1 started"
+        readIORef raced >>= (`shouldBe` Just (Just BootCacheFull))
+        awaitCounts vm (\c → jobsReady c == 3)
+        counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (3, 0)
 
 counts' ∷ Vm → IO Counts
 counts' = counts

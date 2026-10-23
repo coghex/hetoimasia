@@ -29,6 +29,7 @@ module Test.LuaEngine.Modules.Support
   , countNotes
   , diagnostics
   , awaitDiagnostics
+  , betweenCheckAndAdmission
   , contentPath
   , rewrite
   , key'
@@ -104,6 +105,7 @@ import Control.Concurrent.STM
   )
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, fromException, throwIO, tryWithContext)
 import Control.Monad (unless, void, when)
+import Data.Maybe (isNothing)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
@@ -210,6 +212,9 @@ data Session = Session
   , ssOpened ∷ !(IORef Bool)
   , ssIds ∷ !(IORef (Map Text InstanceId))
   , ssTickets ∷ !(IORef (Map Text InstanceTicket))
+  , ssBetween ∷ !(IORef (Maybe (IO ())))
+  -- ^ What another thread does between a request's argument check passing and its admission, once: set
+  -- by an example that needs that exact interleaving, and run by the test binding's check.
   }
 
 -- | How the pool's reader is made from the real one and the session's probe.
@@ -278,6 +283,7 @@ withSession profile (workers, slots) readerOf (Layout files) body =
             <*> newIORef False
             <*> newIORef Map.empty
             <*> newIORef Map.empty
+            <*> newIORef Nothing
         withLoggingLifetime quietLogger $ \lifetime →
           withSupervision lifetime $ \control → do
             runtime ← newLuaRuntime control
@@ -356,6 +362,11 @@ countNotes session wanted = length . filter (== wanted) <$> history session
 -- | The diagnostics the coordinators wrote, oldest first, one line each.
 diagnostics ∷ Session → IO [Text]
 diagnostics session = reverse <$> readTVarIO (ssDiagnostics session)
+
+-- | Do this once, on the next request's way from its argument check to its admission, as another
+-- thread would.
+betweenCheckAndAdmission ∷ Session → IO () → IO ()
+betweenCheckAndAdmission session action = writeIORef (ssBetween session) (Just action)
 
 -- | Block until the coordinators have written this many diagnostics. A diagnostic is written after the
 -- transaction that decided it, on whichever thread published the outcome, so a count read at the
@@ -598,10 +609,18 @@ bindings session coordinator =
             Left why → throwIO (userError (Text.unpack why))
             Right asked → do
               started ← startModule coordinator asked context (note session "disposed")
-              pure (m1StartResults handleType started)
+              case started of
+                StartAnswered answer → pure (m1StartResults handleType answer)
+                -- The same ordinary error the argument check raises.
+                StartRefused why → throwIO (userError (Text.unpack why))
     check owner values = case requestFrom session values of
       Left why → pure (Just why)
-      Right asked → moduleArgumentCheck coordinator (const asked) owner values
+      Right asked → do
+        checked ← moduleArgumentCheck coordinator (const asked) owner values
+        -- The window between the check and the admission, in which another thread may act.
+        when (isNothing checked) $
+          atomicModifyIORef' (ssBetween session) (\pending → (Nothing, pending)) >>= sequence_
+        pure checked
     looking =
       stateOperation "lookup" [SText] [SText] $ \arguments → case arguments of
         [VText path] → case resolve session path Nothing of

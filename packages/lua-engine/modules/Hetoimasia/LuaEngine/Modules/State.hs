@@ -45,6 +45,8 @@ module Hetoimasia.LuaEngine.Modules.State
   , publishSTM
   , blockedSTM
   , observedReasonSTM
+  , reserveForCheckSTM
+  , releaseCheckSTM
   , closeSTM
     -- * Failures
   , recordDefectSTM
@@ -599,23 +601,56 @@ failureFor st job fault =
 
 -- Requests ---------------------------------------------------------------------------------------------
 
--- | The room for a new identity, reserved in the transaction that admits the request that names it.
--- It is permanent: the identity is the VM's for its life, and the reservation is given back only
--- if the admission is taken back before the endpoint made the job. An identity that is held or
--- reserved already needs no room (the ask was made before another thread's boot load named it): the
--- credit then holds nothing and gives nothing back, and the request joins the job that exists.
+-- | The room for a new identity, taken in the transaction that admits the request that names it. The
+-- room was normally reserved already, by the request's argument check ('reserveForCheckSTM'): the
+-- admission adopts it, and holds the same room, not a second. A call that skipped the check reserves
+-- here, and meets a full cache as the host's busy answer, which 'startModule' turns into the refusal it
+-- is. The room is permanent: the identity is the VM's for its life, and the reservation is given back
+-- only if the admission is taken back before the endpoint made the job. An identity that is held
+-- already needs no room: the credit then holds nothing and gives nothing back, and the request joins
+-- the job that exists.
 reserveIdentitySTM ∷ Coordinator → ExportIdentity → STM Bool
 reserveIdentitySTM c identity = do
   st <- readState c
-  if Map.member identity (csJobs st)
-    then pure True
-    else
-      if Map.member identity (csPromised st)
-        then True <$ writeState c st {csPromised = Map.adjust (+ 1) identity (csPromised st)}
-        else
-          if csPhase st == Open && identitiesUsed st < limitIdentities (coordLimits c)
-            then True <$ writeState c st {csPromised = Map.insert identity 1 (csPromised st)}
-            else pure False
+  case (Map.member identity (csJobs st), Map.lookup identity (csPromised st)) of
+    (True, _) -> pure True
+    (_, Just promise)
+      | promiseChecked promise > 0 -> True <$ writeState c st {csPromised = Map.insert identity promise {promiseChecked = promiseChecked promise - 1} (csPromised st)}
+      | otherwise -> True <$ writeState c st {csPromised = Map.insert identity promise {promiseCount = promiseCount promise + 1} (csPromised st)}
+    _ ->
+      if csPhase st == Open && identitiesUsed st < limitIdentities (coordLimits c)
+        then True <$ writeState c st {csPromised = Map.insert identity (Promise 1 0) (csPromised st)}
+        else pure False
+
+-- | The permanent decision of a request, taken with its reservation in one transaction: the reason the
+-- request is refused (the coordinator has closed, or the identity is new and the VM already holds every
+-- identity it may), or nothing and the room reserved. A held identity needs none, and a full cache
+-- still answers lookups and joins. Called by the argument check; the admission adopts the room.
+reserveForCheckSTM ∷ Coordinator → ContentKey → STM (Maybe Text)
+reserveForCheckSTM c key = do
+  st <- readState c
+  let identity = moduleIdentity key
+  refused <- permanentRefusalSTM c key
+  case refused of
+    Just why -> pure (Just why)
+    Nothing
+      | Map.member identity (csJobs st) -> pure Nothing
+      | otherwise -> do
+          let promise = maybe (Promise 1 1) (\held -> held {promiseCount = promiseCount held + 1, promiseChecked = promiseChecked held + 1}) (Map.lookup identity (csPromised st))
+          Nothing <$ writeState c st {csPromised = Map.insert identity promise (csPromised st)}
+
+-- | Give back the room a check reserved if the admission that was to adopt it did not (it met a
+-- temporary bank and was busy, or was refused): nothing is left promised for a request that was not
+-- made. A reservation an admission adopted, or that a job has taken, is not this one's to return.
+releaseCheckSTM ∷ Coordinator → ContentKey → STM ()
+releaseCheckSTM c key = do
+  st <- readState c
+  let identity = moduleIdentity key
+      giveBack promise
+        | promiseChecked promise <= 0 = Just promise
+        | promiseCount promise <= 1 = Nothing
+        | otherwise = Just promise {promiseCount = promiseCount promise - 1, promiseChecked = promiseChecked promise - 1}
+  writeState c st {csPromised = Map.update giveBack identity (csPromised st)}
 
 -- | Give the reservation back if the request never reached the endpoint. Once the endpoint made the
 -- job the room is the job's, and an admission taken back after that returns nothing.
@@ -625,7 +660,10 @@ releaseIdentitySTM c identity = \case
   CreditUnused -> do
     st <- readState c
     -- Only this admission's own reservation: another request may still be counting on the room.
-    writeState c st {csPromised = Map.update (\n -> if n > 1 then Just (n - 1) else Nothing) identity (csPromised st)}
+    let giveBack promise
+          | promiseCount promise <= 1 = Nothing
+          | otherwise = Just promise {promiseCount = promiseCount promise - 1, promiseChecked = min (promiseChecked promise) (promiseCount promise - 1)}
+    writeState c st {csPromised = Map.update giveBack identity (csPromised st)}
 
 -- | A permanent reason the request would be refused: the coordinator has closed, or the identity is
 -- new and the VM already holds every identity it may. Reads only. A pending or finished identity
@@ -637,7 +675,7 @@ permanentRefusalSTM c key = do
     if csPhase st == Closed
       then Just "the module loader has stopped and takes no more requests"
       else
-        if Map.member (moduleIdentity key) (csJobs st) || identitiesUsed st < limitIdentities (coordLimits c)
+        if Map.member (moduleIdentity key) (csJobs st) || Map.member (moduleIdentity key) (csPromised st) || identitiesUsed st < limitIdentities (coordLimits c)
           then Nothing
           else Just ("module limit: the VM already holds all " <> shown (limitIdentities (coordLimits c)) <> " module identities")
 
