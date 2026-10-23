@@ -332,12 +332,24 @@ withSession cfg body =
                 runtime ← newLuaRuntime control
                 outcome ←
                   timeout exampleBound (body session control runtime)
-                    `finally` (writeIORef (ssOpened session) True >> openGates session >> openAllProbeGates probe >> cfgRelease cfg >> (readTVarIO fakes >>= mapM_ flushFake))
+                    `finally` releaseEverything session
                 case outcome of
                   Just value → pure value
                   Nothing → do
                     seen ← history session
                     assertFailure ("the example did not finish within its bound; it had recorded: " <> show (reverse (take 12 (reverse seen))))
+
+-- | Open every gate and hook an example can hold a worker at, and let every backend answer what it still
+-- owes: the script gates, the reader's, the config's hooks, and the janitor's flush of each backend made
+-- (nested ones included). It runs on every exit of an example or of a nested scope, assertion failures
+-- among them, before anything waits for the pipeline to drain.
+releaseEverything ∷ Session → IO ()
+releaseEverything session = do
+  writeIORef (ssOpened session) True
+  openGates session
+  openAllProbeGates (ssProbe session)
+  cfgRelease (ssConfig session)
+  readTVarIO (ssFakes session) >>= mapM_ flushFake
 
 -- | A point an example holds a worker at: the worker says it arrived and waits to be let go.
 data Gate = Gate {arrived ∷ MVar (), proceed ∷ MVar ()}
@@ -377,7 +389,7 @@ withNested session body onClosed = do
       let nested = session {ssPipeline = pipeline, ssFake = fake}
       _ ← forkIO $ do
         atomically (pipelineOpen pipeline >>= \open → when open retry)
-        tryWithContext @SomeException (onClosed nested `finally` flushFake fake) >>= putMVar done
+        tryWithContext @SomeException (onClosed nested `finally` releaseEverything session) >>= putMVar done
       body nested
   readMVar done >>= either rethrowIO pure
   pure value

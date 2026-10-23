@@ -13,6 +13,7 @@ import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (E
 import Control.Monad (forM_, void)
 import Data.IORef (atomicModifyIORef', newIORef)
 import Test.Hspec
+import Test.HUnit.Lang (HUnitFailure (..))
 import Hetoimasia.Scripting.Lua.Provider (Completion (..), RequestEndpoint (..), Submission (..))
 import Test.LuaEngine.Texture.Contract (layout, small)
 import Test.LuaEngine.Texture.Support
@@ -116,7 +117,53 @@ spec = describe "teardown cut by cancellation" $ do
       raisedIs ThreadKilled (void outcome `seq` fmap (const ()) outcome)
       length <$> releaseCalls (ssFake session) `shouldReturn` 1
     pure ()
+
+  describe "a nested scope that fails while a hook gate is held" $ do
+    it "opens every gate before it waits for the drain when its helper fails an assertion: the failure is raised and the scope returns" $ do
+      gate ← newGate
+      ExceptionWithContext _ _ ← fatalSession ((config small layout) {cfgHooks = noHooks {hookDecoding = hold gate}, cfgRelease = releaseHeldGate gate}) $ \session _ runtime → do
+        outcome ←
+          tryWithContext @SomeException $
+            withNested
+              session
+              ( \nested → do
+                  vm ← startVm nested runtime "inject-helper" OnArrival
+                  admitDriver nested vm "i"
+                  commandWith nested vm "i" "start" "k0" (Just (Load "a.png" True))
+                  -- The decode worker is held at the gate when the scope closes.
+                  readMVar (arrived gate)
+              )
+              (\_ → expectationFailure "injected helper failure")
+        injected "injected helper failure" outcome
+        seen ← history session
+        seen `shouldContain` ["nested scope returned"]
+      pure ()
+
+    it "opens every gate before it waits for the drain when its body fails an assertion: the failure is raised and the scope returns" $ do
+      gate ← newGate
+      ExceptionWithContext _ _ ← fatalSession ((config small layout) {cfgHooks = noHooks {hookDecoding = hold gate}, cfgRelease = releaseHeldGate gate}) $ \session _ runtime → do
+        outcome ←
+          tryWithContext @SomeException $
+            withNested
+              session
+              ( \nested → do
+                  vm ← startVm nested runtime "inject-body" OnArrival
+                  admitDriver nested vm "i"
+                  commandWith nested vm "i" "start" "k0" (Just (Load "a.png" True))
+                  readMVar (arrived gate)
+                  expectationFailure "injected body failure"
+              )
+              (\_ → pure ())
+        injected "injected body failure" outcome
+        seen <- history session
+        seen `shouldContain` ["nested scope returned"]
+      pure ()
   where
+    injected expected outcome = case outcome of
+      Left (ExceptionWithContext _ raised)
+        | Just (HUnitFailure _ reason) ← fromException raised → show reason `shouldSatisfy` isInfixOf' expected
+      Left (ExceptionWithContext _ raised) → expectationFailure ("the scope raised something else: " <> show raised)
+      Right () → expectationFailure "the scope should have raised the injected failure"
     raisedIs expected outcome = case outcome of
       Left (ExceptionWithContext _ raised) → (fromException raised ∷ Maybe AsyncException) `shouldBe` Just expected
       Right _ → expectationFailure "the scope should have raised the cancellation"

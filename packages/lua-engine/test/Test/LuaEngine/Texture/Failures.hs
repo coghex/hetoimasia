@@ -86,8 +86,9 @@ content = describe "expected content failures" $ do
       awaitNote session "i start k started"
       awaitPipeline session ((== 1) . readingSettled)
       ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 4096)
-      command session vm "i" "take" "k"
-      _ ← lineStarting session "i take k "
+      -- The pipeline settling is not the host's: it has the reply once the script can wait for it.
+      command session vm "i" "wait_take" "k"
+      _ ← lineStarting session "i wait_take k "
       awaitOwner vm "i" (== OwnerReading 0 0)
 
   it "is content_changed when the file is not what the scan pinned, and a texture loaded before stays valid" $
@@ -217,8 +218,8 @@ workspace = describe "the lane's workspace bank" $
       -- the workspace refused the decode.
       ownerNow vm "i" >>= (`shouldBe` OwnerReading 1 128)
       lanesCharged session `shouldReturn` [0, 0]
-      command session vm "i" "take" "k"
-      line ← lineStarting session "i take k "
+      command session vm "i" "wait_take" "k"
+      line ← lineStarting session "i wait_take k "
       line `shouldSatisfy` Text.isInfixOf "code=too_large,"
       awaitOwner vm "i" (== OwnerReading 0 0)
       uploadsSeen (ssFake session) `shouldReturn` 0
