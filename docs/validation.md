@@ -319,7 +319,10 @@ failure over real Lua instances on a supervised owner with controlled fake provi
 real modules through real VMs on supervised scheduled owners over a real content root, inventory and read pool with the
 production reader behind gates: shared jobs joined by per-request waiters and answered with the very table, evaluation by
 admission or placed position, a dependency evaluated once within its importer's chain, the source bank and its reserve, the
-identity cache and request pressure, stop and defects, and a separately compiled client. The manifest,
+identity cache and request pressure, stop and defects, and a separately compiled client -- and, for the authoring facade (LFE-12),
+the accepted authoring example on real Lua, every call's schema in every role and phase, instance ownership, the lexical and
+instance-rooted content addresses, the request records, the role clocks and waits under an injected clock and fake timer, print
+and warn with their exact bound, and the sinks under contention and failure, with recording sinks and nothing slept. The manifest,
 profile and boot examples start no Lua, and no example starts a window or a GPU; the checkpoint
 reads only through the verified read it is given. It is mandatory but outside the floor, like `test.math`,
 and its command names `cabal.project.cpu`; the group declares that file beside

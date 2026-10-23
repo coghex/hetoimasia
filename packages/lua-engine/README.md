@@ -17,9 +17,10 @@ through the verified read the caller passes it (normally the content inventory's
 imports no module that opens a file itself. The **M1 request adapter**
 (LFE-7) is the `request` sublibrary beside it, in a source directory of its own
 so that this one stays pure: see [below](#the-m1-request-adapter). The **raw-data provider**
-(LFE-10) is the `data` sublibrary, the **module coordinator** (LFE-11) the `modules` sublibrary and the **texture
-pipeline** (LFE-16) the `texture` sublibrary, for the same reason: see [the data provider](#the-raw-data-provider-lfe-10),
-[the coordinator](#the-module-coordinator-lfe-11) and [the texture pipeline](#the-texture-pipeline-lfe-16).
+(LFE-10) is the `data` sublibrary, the **module coordinator** (LFE-11) the `modules` sublibrary, the **texture
+pipeline** (LFE-16) the `texture` sublibrary and the **authoring facade** (LFE-12) the `facade` sublibrary, for the same reason:
+see [the data provider](#the-raw-data-provider-lfe-10), [the coordinator](#the-module-coordinator-lfe-11),
+[the texture pipeline](#the-texture-pipeline-lfe-16) and [the facade](#the-authoring-facade-lfe-12).
 
 The library depends on `hetoimasia-foundation` (its `Duration`, checked
 nanoseconds from 1 to 2^64 − 1), on the Lua host and its runtime
@@ -42,6 +43,7 @@ composition to this package; they are not here.
 | `Hetoimasia.LuaEngine.Modules` (sublibrary `modules`) | the module-job coordinator over the loader, the request protocol and the read pool: `withModuleCoordinator`, `coordinatorPlan`, `coordinatorEndpoint`, `attachLoader`, `moduleKey`, `startModule`, `moduleArgumentCheck`, `bootModule`, `lookupImmediate`, `coordinatorCounts`, `awaitDrained` |
 | `Hetoimasia.LuaEngine.Texture`, `Hetoimasia.LuaEngine.Texture.Backend` (sublibrary `texture`) | the texture pipeline: `textureSpec`, `withTexturePipeline`, `newTextureOwner`, `textureService`, `textureEndpoint`, `textureKey`, `startTexture`, `textureArgumentCheck`, `withTexture`, `releaseTexture`; and the backend port `TextureBackend`, `Upload`, `UploadSink` |
 | `Hetoimasia.LuaEngine.Scene` (sublibrary `scene`) | the fixed M1 scene schema: `sceneLimits`, `prepareScene`, `PreparedScene`, `SceneContent`, `textureUses`, `SceneRefusal`, `sceneCandidate`, `initialContent`, `sceneSchema`, `sceneArgumentCheck`, `scenePublishBinding` |
+| `Hetoimasia.LuaEngine.Facade` (sublibrary `facade`) | the M1 authoring surface of one VM: `newFacade`, `FacadeSpec`, `FacadeEndpoints`, `installFacade`, `facadeInstanceConfig`, `facadeRequestEndpoints`, `declareInstance`, `forgetInstance`, `inventoryResolver`, `lexicalResolver`, `withOutput`, `writeAuthored`, `newInstanceIds` |
 
 Every other module is hidden. A client of the pure boundary imports the manifest, the profile and the behavior modules.
 
@@ -438,9 +440,9 @@ adapter. They build every fixture beside the suite from public host modules; non
 ## The raw-data provider (LFE-10)
 
 `Hetoimasia.LuaEngine.Data` (the `data` sublibrary) answers a request for the exact bytes of an inventoried file. It is a
-**composable typed endpoint**, not a Lua API: the eventual `api.content.data(path [, options])` (LFE-12) parses its
-arguments with `dataKey`, builds its binding from `startData` and `dataArgumentCheck`, and declares `dataValueSchema`
-(a byte string) for the common `take`. Nothing here is installed in a VM, and no temporary public Lua spelling exists; the
+**composable typed endpoint**, not a Lua API: `api.content.data(path [, options])` of [the facade](#the-authoring-facade-lfe-12)
+(LFE-12) parses its arguments with `dataKey`, builds its binding from `startData` and `dataArgumentCheck`, and declares `dataValueSchema`
+(a byte string) for the common `take`. Nothing here is installed in a VM; the
 examples drive it through a binding of their own. It imports the profile, the [request adapter](#the-m1-request-adapter),
 the content package's public modules (`Identity`, `Inventory`, `ReadPool`) and the host's public modules, and nothing of a
 game, window, GPU or console.
@@ -712,9 +714,9 @@ nothing of the others: the Lua host's [ordered import chains](../scripting-lua/R
 assigned positions, the required-failure latch, the cancellation race), and the content package's
 [verified-read pool](../content/README.md#the-verified-read-pool-lfe-10). It adds what is M1's alone: the identity cache's
 accounting, the source bank, the join of requests onto jobs and the policy for when each thing happens. Like the data provider
-it is a **composable typed endpoint**, not a Lua API: the eventual `api.content.module(path [, options])` and the module-bound
-`import` (LFE-12) parse their arguments, resolve the address through the content boundary and call `startModule`,
-`moduleArgumentCheck` and `lookupImmediate`. It installs nothing in a VM, and no production fake provider, ambient filesystem
+it is a **composable typed endpoint**, not a Lua API: `api.content.module(path [, options])` and the module-bound
+`import` of [the facade](#the-authoring-facade-lfe-12) (LFE-12) parse their arguments, resolve the address through the content boundary and call `startModule`,
+`moduleArgumentCheck` and the loader's own immediate lookup. It installs nothing in a VM, and no production fake provider, ambient filesystem
 loader or game-specific code is in it.
 
 ```haskell
@@ -998,17 +1000,194 @@ and a separately compiled client (`Client`). The host's own examples prove the p
 `Test.Lua.Boundary.ArgumentLimits` and the non-throwing lease borrow in `Test.LuaRuntime.Instance.Lease.*`. Oracle evidence proves CPU
 semantics, not a displayed pixel.
 
+## The authoring facade (LFE-12)
+
+`Hetoimasia.LuaEngine.Facade` (the `facade` sublibrary) is the M1 Lua authoring surface of one VM: the table an instance's
+hooks are handed as `api`, the lexical-root `import`, the role clocks and cooperative waits, and bounded `print` and `warn`,
+bound over the [request adapter](#the-m1-request-adapter), the [data provider](#the-raw-data-provider-lfe-10) and the
+[module coordinator](#the-module-coordinator-lfe-11) that already exist. It is the first slice that installs anything in a
+VM. It adds no service, no provider, no cache, no timer and no queue; it checks what a script asked, calls the service, and
+shapes the answer. It imports no texture, scene, graphics, console or game module.
+
+### What the facade gives a script
+
+`init(self, api)`, `update(self, dt_seconds)` and `shutdown(self, reason)` are called as before. `api` is the table `self.api`
+holds (the same table, also when the behavior has no `init`): fresh for each instance, ordinary Lua, and holding
+
+| Field | Value |
+| --- | --- |
+| `api.role`, `api.content_id`, `api.instance_id` | copied strings: `"gameplay"` or `"presentation"`; the content identifier the instance requests under by default; an opaque identity of at most 128 UTF-8 bytes, unique in the session and never reused. It is not a thread, a pointer or an authority |
+| `api.content.module(path [, options])` | `options` is `nil`, absent or a plain table with only `root` and `tick_offset` |
+| `api.content.data(path [, options])` | `options` is `nil`, absent or a plain table with only `root`, `tick_offset` and `optional` |
+| `api.request.ready(r)`, `take(r)`, `wait(r)`, `cancel(r)` | the [common operations](#what-a-script-sees) of the request adapter, for module and data requests alike |
+| `api.time.tick()`, `tick_seconds()`, `seconds()`, `wait_ticks(n)`, `wait_seconds(seconds)`, `yield()` | the role clocks and the waits, below |
+
+`print`, `warn` and `import(path [, root_id])` are globals. Nothing else is added: no logger, no file handle, no clock but
+these, no session control (`api.session`, `quit` and the unavailable-state `state` are LFE-26).
+
+**Calls and validation.** Every call is a dot call with exactly its declared arguments, counted as Lua counts them (an
+explicit `nil` is an argument; `api.content.module(path, nil)` is a call with its options omitted, `api.time.tick(nil)` has
+an extra argument). A colon call, a missing or extra argument, a value of the wrong type or subtype (`1.0` is not `1`, a
+numeric string is not a number), a table with a missing, unknown or non-text key, with a hole, a cycle or any metatable, a
+foreign, spent or wrong-kind handle, the wrong role or phase and a permanent numeric or path limit are all **ordinary Lua
+errors**: raised before any provider is asked, any file is looked at, any place is reserved or anything is suspended; `pcall`
+catches them, the invocation goes on, and a required failure latched independently is not cleared by catching one. Only `nil`
+or absence omits a field: `false` is a value. No authored metamethod runs while a table is read, and no module's export
+graph is walked. The error's text begins with the name of the engine binding that refused
+(`hetoimasia_engine.content_module: ...`): the reason is the contract and the name is diagnostic. A request that a
+temporary bank cannot hold is not an error but data: the call returns exactly `request, nil` when accepted and `nil,
+{code = "busy", message = TEXT}` when not; nothing is retried by the engine.
+
+| Call | Module top level | `init` | update | `shutdown` |
+| --- | --- | --- | --- | --- |
+| `content.module`, `content.data` | refused | yes | yes | refused |
+| `request.ready`, `take`, `cancel` | refused | yes | yes | yes |
+| `request.wait`, `time.yield` | refused | refused | yes | refused |
+| `time.tick`, `tick_seconds` | refused | gameplay | gameplay | gameplay |
+| `time.seconds` | refused | presentation | presentation | presentation |
+| `time.wait_ticks` | refused | refused | gameplay | refused |
+| `time.wait_seconds` | refused | refused | presentation | refused |
+
+"Update" is any serving segment, a callback included. A refused module top level means every call, through a facade a hook
+left in a shared export as well. A content request is also refused, as an ordinary error and never as `busy`, when the
+session's admission is stopping or closed: busy is a capacity answer, and a stopping session will have no more room later.
+
+### Content roots
+
+Two calls name content, and their default roots are different on purpose.
+
+* `import(path [, root_id])` belongs to a **module**. Its default root is the root of the module whose code makes the call,
+  captured when that module was evaluated: a shared helper keeps it whichever instance's hook runs it. A path is from the root,
+  never from the source directory or the caller. `import` is installed by the Lua host's loader before any authored code and
+  resolved by `lexicalResolver` (made for the coordinator with `inventoryResolver`); the loader's rules apply
+  ([import outside module evaluation](../scripting-lua/README.md#import-outside-module-evaluation)). Called in a hook, a ready
+  identity returns its cached table; an identity that was never asked for or has not finished raises the string
+  `import: module_not_ready: ROOT:PATH` (so `pcall` code tells it from an argument error, which is `import: REASON`), starts no
+  work, allocates no identity, joins no job and never waits; a known failed identity raises an ordinary error and latches the
+  required failure of the running instance, caught or not. An invalid `import` while a module is evaluated is an ordinary
+  error: uncaught, it fails that required load as any error in a module does; caught, it fails nothing.
+* `content.module(path [, options])` and `content.data(path [, options])` belong to an **instance**. Their default root is
+  the facade's `content_id`.
+
+An explicit root overrides either default. A root is an identifier of 1 to 64 ASCII characters of `[a-z][a-z0-9_-]*`; an
+identifier the session does not enable (in M1 only the game's root is enabled) and an enabled one it holds no content for are
+both argument errors, decided without looking at a file. A path follows the content layer's identity policy and nothing else:
+valid UTF-8, each segment in NFC, exact case, literal `/` separators, no empty, leading or trailing separator, no `.` or `..`
+segment, no backslash, colon or control character, no absolute, URL or expansion form, at most 32 segments, 1,024 bytes and
+255 bytes a segment on the supplied and the normalized forms. There is no extension fallback, no search of another place and
+no native case lookup.
+
+### Requests and their records
+
+`content.module` takes `tick_offset` (a Lua integer from 1 to 2^63 - 1, default 1) from a gameplay instance and refuses the
+field from a presentation instance, even as 1; `content.data` also takes `optional` (a boolean, default `false`). A gameplay
+request is placed at the tick the instance is at (0 in `init`) plus the offset, checked against the numeric ceiling before
+admission. The records are the request adapter's, unchanged: `take` answers `{status = "pending"}`, `{status = "success", value =
+VALUE}`, `{status = "failure", error = {code, message, root, path}}` or `{status = "cancelled"}`, with only the fields of the
+variant, a fresh table each time. A module's `VALUE` is the very table the VM caches (functions, cycles and all), so the
+envelope is a copy and the value is shared state; a data request's is the file's bytes as a Lua string. Failure codes are the
+services': `not_found`, `content_changed`, `io_error`, `too_large`, `module_error`, `module_cycle`, `module_limit`.
+Because a binding declares one result shape, the operations exist for each kind of request handle (`module_request`,
+`data_request`) and the facade's closures pick the right one by the handle they were returned for; any other value is refused by
+the host's handle check like any wrong-kind handle.
+
+### Clocks and waits
+
+* **Gameplay** reads the logical tick: `tick()` is a Lua integer, 0 in a root's `init`, read live from the owner's scheduler
+  through the injected endpoint, so only a begun tick advances it and no load or native delay can; `tick_seconds()` is the
+  fixed tick duration as numeric seconds. A tick no Lua integer holds is never wrapped or clamped: it is an engine failure,
+  reported through the injected failure boundary and raised from the call.
+* **Presentation** reads `seconds()`, the elapsed time since an origin set when the VM begins its first instance's
+  initialization (so that instance's first segment reads `0.0`; a second instance shares the origin). It is **sampled**: the
+  facade is told at every hook entry and every resumed segment (`instanceOnSegment`, wired by `facadeInstanceConfig`), and
+  every read inside the segment answers that sample however the clock moves meanwhile. A finite `init` or `shutdown` is sampled
+  too. A sample is a finite approximation, never an authority for a deadline, and sampling does not redefine the cadence's
+  origin or `dt`.
+* `wait_ticks(n)` takes a Lua integer from 1 whose target tick is itself a Lua integer; `wait_seconds(seconds)` takes an
+  integer or a float that is finite and positive; a string, `NaN`, an infinity, zero and a negative number are errors. The
+  exact value the number represents times 1,000,000,000, rounded **upward** (a tiny positive value is one nanosecond, never
+  zero; `0.1` is `100000001` ns), must be a positive 64-bit count, and the injected clock now plus that count must be
+  representable: otherwise the call is an ordinary error before anything is suspended. The count reaches the scheduler as the
+  two 32-bit halves of the number (a wait through 2^64 - 1 ns is accepted though a Lua integer stops at 2^63 - 1). The deadline
+  is placed when the wait is requested, not from the segment's sample; an early wake resumes nothing and resumption may be late;
+  the update's `dt` is fixed when it begins and is unchanged by its own waits, and a resumed update starts no second one.
+* `yield()` gives control back; all three waits are refused outside an update before anything is suspended.
+
+### Output
+
+`print` converts its arguments with `tostring`, joins them with a tab and writes the line to the stdout sink with no prefix.
+`warn` does the same to the stderr sink, each line marked by an engine-made prefix that names the role, the content and the
+instance whose hook is running (`lua warning role=ROLE content=CONTENT instance=ID: `), or, while a module is evaluated, the
+role and the module (`lua warning role=ROLE module=ROOT:PATH: `): a shared helper called in a hook is attributed to the
+executing instance, and a module evaluation invents no instance. The context comes from the engine and never from a field a
+script can write. `@on` and `@off` are plain text. One complete call writes at most the profile's `PrintWarnBytes` (4,096)
+bytes of UTF-8, prefixes, escapes, line ends and the visible truncation marker included: the Lua side cuts the text before it
+crosses, and the Haskell side decodes it (invalid UTF-8 replaced), splits it at its line breaks, escapes the control
+characters but a tab, prefixes each line and bounds the whole again (`Hetoimasia.Scripting.Lua.Output`, the runner's own
+mechanism, whose output is unchanged). A `tostring` that raises is an ordinary error with nothing written.
+
+The sinks are the session's `Output` (`withOutput`, one for every VM): a whole call is written under one lock and flushed before
+the lock is released, so calls never interleave, a call is in order with the same owner's others and cross-VM order is the order
+of execution; there is no queue, drop, retry or rate limit, and a slow sink blocks its writers. A sink that raises is a failure of
+the host: the call raises it, so it ends the owner whatever Lua did with the stand-in error, and no later call is written or
+retried through a sink that has failed; nothing is reported through it. Returning does not promise the bytes are durable.
+Authored output bypasses log filtering and cannot suppress an engine failure's diagnostics.
+
+### What an assembly does
+
+```haskell
+withOutput out err $ \output →                -- the sinks' scope: outermost
+  withModuleCoordinator spec{specResolve = inventoryResolver inventory [gameRoot], specPhase = Just phase} $ \coordinator → do
+    facade ← newFacade FacadeSpec{..}         -- role, request policy, coordinator, data service, output, endpoints, phase, roots
+    config ← installFacade facade [] [] (vmProfileConfig LibraryProfileM1)
+    -- grant (facadeRequestEndpoints facade); scheduledInstances = Just (facadeInstanceConfig facade ...)
+    declared ← declareInstance facade gameRoot -- then admit (behaviorRequest ... (declaredFacade declared) ...)
+```
+
+`installFacade` registers the hidden namespace and the two request handle types, adds the initial chunk that rebinds `print`
+and `warn` and defines the builder, adds the builder's export module and sets the export and copied-value ceilings from the
+profile. The facade's own module takes one place beyond the profile's 256 authored identities in the loader (the coordinator,
+not the loader, enforces the 256). The scopes nest as the owners need them: the **owner stops first**, so a `shutdown` that
+prints still finds its sink, then the coordinator and pool, then the output. `forgetInstance` removes an instance's record and
+sample once its settlement is observed.
+
+### State, owners and lifetimes
+
+| State | Owner and thread | Written by | Read by | Bound | Released when |
+| --- | --- | --- | --- | --- | --- |
+| `Registry` (declared and bound instances) | the facade; STM | `declareInstance` and `forgetInstance` (the application), the builder's one `bind` call (the owner's thread) | every binding a hook calls | `InstancesPerVm` (2) records | `forgetInstance`, or the facade's scope |
+| presentation origin and per-instance samples | the facade; STM | `instanceOnSegment` on the owner's thread | `seconds()` | one origin; one sample per declared instance | `forgetInstance`; the origin with the facade |
+| `Output` (sinks' lock, in-flight count, first failure) | `withOutput`'s scope | every authored call, on its owner's thread | the scope's drain | the sinks' own | the scope closes the output to new calls and waits for calls in a sink to return |
+| the hidden namespace, the builder and the facade closures | the VM; Lua | the initial chunk, once; the builder, once per instance | the hooks | one builder per VM | the builder takes itself out of the globals when taken; closures and their weak request-kind table are collected with the facade table |
+| the module being evaluated (`ModulePhase`) | the Lua host's loader | the loader, around every segment of a module's code | `warn`'s prefix, the facade's module-phase refusals | one | put back as it was however the segment ends |
+
+### What proves it
+
+`Test.LuaEngine.Facade.*` (group `test.lua-engine`) run real instances on real supervised scheduled owners over a real content
+root, inventory and read pool, the real data service and module coordinator, an injected clock and fake timer and recording sinks
+(no example sleeps): the accepted P-72 example with a forced `busy`, an explicit retry from a later update and one load delivered
+at its fixed offset (`Authoring`); every schema of every call table-driven, in every role and phase, with nil against false,
+`1` against `1.0`, numeric strings, metatables, consumed and wrong-kind handles and a stopping session (`Validation`); two
+instances sharing a VM, a facade or handle passed between them, overwritten metadata and hooks, and a facade kept by a module
+(`Ownership`); the lexical resolver over supplied contexts, a shared helper, `module_not_ready` with no work, a latched failed
+import, NFC and case, no extension fallback and refusals before any provider (`Imports`); every record and its omissions, a wait
+that consumes nothing, cancellation, the shared table in a fresh envelope, bytes kept as they are, busy and stopping
+(`Requests`); the clocks, held loads and the shared origin (`Clocks`); wait endpoints, conversions, deadlines, early and late
+wakes and exhaustion (`Waits`); print, warn, context, escaping and the exact bound (`Output`); serialization, flushing, slow and
+failing sinks, shutdown output and a facade made in part (`Sinks`); and a separately compiled client (`Client`). The Lua host's
+own examples prove what it added for this: the caller's instance, the segment notification, the named module phase, the
+two-word elapsed wait and the shared bounded output.
+
 ## Deferred, by design
 
 Not here, and not claimed: the CLI `run` dispatch and exit mapping (LFE-22), which will
 consume the boot checkpoint and retain the same anchored root;
 the concrete GPU upload and registration, native budgets, scene holds and the atomic publication of a prepared scene (LFE-17 to LFE-20), the public Lua graphics binding (LFE-21),
-the concrete content, time, graphics and status service facades (only the request adapter's common operations and the typed
-endpoints of the data provider, the module coordinator and the texture pipeline are here) and their metadata and grant policy,
-the lexical-root `import` and `api.content.module` spellings (LFE-12), the role gate and session startup that consume
-the boot load's outcome (LFE-13); live codec, texture and GPU budgets and their
-enforcement; time sampling and scheduling; mods, metadata extensions, alternate
-manifest formats, defaults or relaxed parsing.
+the graphics and status service facades (the content, request, time and output surface is [the facade](#the-authoring-facade-lfe-12);
+the texture pipeline's typed endpoint is still its own) and the session's real role, grant and admission policy, the role gate and session
+startup that consume the boot load's outcome and supply the facade's injected endpoints (LFE-13), `api.session`, `quit` and the
+unavailable-state `state` guard (LFE-26); live codec, texture and GPU budgets and their
+enforcement; real pacing; mods, metadata extensions, alternate manifest formats, defaults or relaxed parsing.
 
 ## Tests
 
@@ -1028,4 +1207,4 @@ injected upload backend (see above). It covers the accepted
 examples, every syntax and schema refusal with the limits at their boundary and
 one past, the exact tick endpoints and forbidden forms, every fixed value against
 an independently written expectation, valid smaller profiles and refused ones,
-the behavior selection's cadence rules and numeric boundaries, the boot checkpoint (see above), the request adapter (see above), the raw-data provider (see above), the module coordinator (see above), the texture pipeline (see above), the scene schema (see above), and this package's dependency and import boundary.
+the behavior selection's cadence rules and numeric boundaries, the boot checkpoint (see above), the request adapter (see above), the raw-data provider (see above), the module coordinator (see above), the texture pipeline (see above), the scene schema (see above), the authoring facade (see above), and this package's dependency and import boundary.
