@@ -699,6 +699,9 @@ startBehavior ih cell behavior = do
         shape = capturedShape capture
     initialize driver capture kind cadence = do
       let shape = capturedShape capture
+      -- An instance's initialization begins here whether or not its behavior has an @init@, so the
+      -- application is told once, here, and not when a hook is entered.
+      insOnSegment (ihInstances ih) (InstanceId (controlOwner (ihControl ih)) (icId cell))
       atomically (writeTVar (bcResolved behavior) (Just (BehaviorResolved (capturedHandle capture) shape kind cadence)))
       -- From here a hook may have run: an interruption of @init@ is progress made.
       when (shapeInit shape) $ modifyIORef' (ihEntered ih) (Set.insert (icId cell))
@@ -745,7 +748,7 @@ startModuleInstance ih cell = do
                 declared ← hookAvailable ih handle "init"
                 ran ←
                   if declared
-                    then settledOrRaise (ihExtra ih) (withRunning ih (icId cell) (callEntryVia (ownedHost (ihOwned ih)) (ihDriver ih) "init" handle "init" [VInteger (fromIntegral (icId cell))]))
+                    then settledOrRaise (ihExtra ih) (withSegment ih (icId cell) (callEntryVia (ownedHost (ihOwned ih)) (ihDriver ih) "init" handle "init" [VInteger (fromIntegral (icId cell))]))
                     else pure (Right (Returned []))
                 case ran of
                   Left fault → failInstance ih cell Initializing StageInit (ErrorFault fault)
@@ -767,6 +770,16 @@ withRunning ∷ InstanceHost → Word64 → IO a → IO a
 withRunning ih number action = do
   atomically (writeTVar (insRunning (ihInstances ih)) (Just number))
   action `finally` atomically (writeTVar (insRunning (ihInstances ih)) Nothing)
+
+-- | 'withRunning' for the Lua of a hook: the application is told first, on the owner's thread, that
+-- this instance's code is about to begin a segment (an @init@, the first segment of an update, a
+-- callback or a @run@, every segment a wait resumes, a @shutdown@). What an application samples there
+-- is the state of the world as that segment began, and it is stable for the segment. What the
+-- callback raises is a failure of the host.
+withSegment ∷ InstanceHost → Word64 → IO a → IO a
+withSegment ih number action = do
+  insOnSegment (ihInstances ih) (InstanceId (controlOwner (ihControl ih)) number)
+  withRunning ih number action
 
 -- | Run this on behalf of the instance whose invocation the task is, if it is one: what the
 -- scheduler runs of a task that is no segment of it (closing its coroutine, which runs the
@@ -1011,16 +1024,16 @@ instanceSegment ih run number starting = do
                   Left why → pure (Left (ErrorCadence why))
                   Right seconds → do
                     atomically (writeTVar (insDelta (ihInstances ih)) (Just (number, seconds)))
-                    begin (withRunning ih number (startTaskCaptured (ownedHost (ihOwned ih)) driver behaviorUpdate (resolvedCapture held) HookUpdate [slot]))
+                    begin (withSegment ih number (startTaskCaptured (ownedHost (ihOwned ih)) driver behaviorUpdate (resolvedCapture held) HookUpdate [slot]))
                       `finally` atomically (writeTVar (insDelta (ihInstances ih)) Nothing)
               _ → pure (Left (ErrorFault (ModuleNotLoaded behaviorDriverRef)))
       outcome ← case starting of
         Just (InvokeEvent source (WithinBounds [event])) →
-          begin $ withRunning ih number (startTask (ihOwned ih) (ihDriver ih) (eventEntry source) [slot, event])
+          begin $ withSegment ih number (startTask (ihOwned ih) (ihDriver ih) (eventEntry source) [slot, event])
         Just (InvokeEvent _ _) → pure (Left (ErrorMissingEntry "an event"))
         Just (InvokeSubscription endpoint _) → case taken of
           Just (reference, started) →
-            begin . withRunning ih number $
+            begin . withSegment ih number $
               startTask
                 (ihOwned ih)
                 (ihDriver ih)
@@ -1033,7 +1046,7 @@ instanceSegment ih run number starting = do
           handles ← readIORef (ihHandles ih)
           case Map.lookup (icModule cell) handles of
             Nothing → pure (Left (ErrorFault (ModuleNotLoaded (icModule cell))))
-            Just handle → begin $ withRunning ih number (startTaskVia (ownedHost (ihOwned ih)) (ihDriver ih) "run" handle "run" [slot])
+            Just handle → begin $ withSegment ih number (startTaskVia (ownedHost (ihOwned ih)) (ihDriver ih) "run" handle "run" [slot])
         Just InvokeUpdate | Just behavior ← icBehavior cell → startBehaviorUpdate behavior
         Just InvokeUpdate → do
           handles ← readIORef (ihHandles ih)
@@ -1048,14 +1061,14 @@ instanceSegment ih run number starting = do
                   -- The delta is left for the driver to take through its binding, as the
                   -- update's first segment begins, and is not left behind if that never does.
                   atomically (writeTVar (insDelta (ihInstances ih)) (Just (number, seconds)))
-                  begin (withRunning ih number (startTaskVia (ownedHost (ihOwned ih)) (ihDriver ih) "run" handle "update" [slot]))
+                  begin (withSegment ih number (startTaskVia (ownedHost (ihOwned ih)) (ihDriver ih) "run" handle "update" [slot]))
                     `finally` atomically (writeTVar (insDelta (ihInstances ih)) Nothing)
         Nothing → do
           held ← Map.lookup (runTask run) <$> readIORef (ihTasks ih)
           case held of
             Nothing → pure (Left (ErrorRefusedWait (TaskFailure (failureReason ScriptFault "the invocation's continuation is not held by its owner") RecoverySafe)))
             Just task → do
-              resumed ← settledOrRaise (ihExtra ih) (withRunning ih number (resumeTask (ihOwned ih) task))
+              resumed ← settledOrRaise (ihExtra ih) (withSegment ih number (resumeTask (ihOwned ih) task))
               case resumed of
                 Left fault → do
                   modifyIORef' (ihTasks ih) (Map.delete (runTask run))
@@ -1644,7 +1657,7 @@ finishEnding ih cell closed = do
               | safe → do
                   record ShutdownBegun
                   mask $ \restore → do
-                    ran ← restore (settledOrRaise (ihExtra ih) (withRunning ih (icId cell) (callEntryWith (LeadCaptured driver behaviorShutdown (resolvedCapture held) HookShutdown) (ownedHost (ihOwned ih)) driver behaviorShutdown [slot, VText reasonText])))
+                    ran ← restore (settledOrRaise (ihExtra ih) (withSegment ih (icId cell) (callEntryWith (LeadCaptured driver behaviorShutdown (resolvedCapture held) HookShutdown) (ownedHost (ihOwned ih)) driver behaviorShutdown [slot, VText reasonText])))
                     record $ case ran of
                       Left fault → ShutdownDecided ShutdownRaised (Just (ErrorFault fault))
                       Right _ → ShutdownDecided ShutdownRan Nothing
@@ -1662,7 +1675,7 @@ finishEnding ih cell closed = do
                     -- A cancellation lands inside the hook, and leaves it recorded as started,
                     -- or after what it answered is recorded: never between the two.
                     mask $ \restore → do
-                      ran ← restore (settledOrRaise (ihExtra ih) (withRunning ih (icId cell) (callEntryVia (ownedHost (ihOwned ih)) (ihDriver ih) "shutdown" module' "shutdown" [slot, VText reasonText])))
+                      ran ← restore (settledOrRaise (ihExtra ih) (withSegment ih (icId cell) (callEntryVia (ownedHost (ihOwned ih)) (ihDriver ih) "shutdown" module' "shutdown" [slot, VText reasonText])))
                       record $ case ran of
                         Left fault → ShutdownDecided ShutdownRaised (Just (ErrorFault fault))
                         Right _ → ShutdownDecided ShutdownRan Nothing

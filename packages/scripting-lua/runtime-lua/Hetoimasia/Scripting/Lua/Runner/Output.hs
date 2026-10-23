@@ -28,8 +28,8 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Hetoimasia.Scripting.Lua.Registration (Namespace, namespace, stateOperation)
+import Hetoimasia.Scripting.Lua.Output (renderFunctionLines)
 import Hetoimasia.Scripting.Lua.Runner.Render (outputLines)
-import Hetoimasia.Scripting.Lua.Runner.Types (outputCallLimit, truncationMarker)
 import Hetoimasia.Scripting.Lua.Value (Schema (SBytes), Value (VBytes))
 
 -- | The name of the runner's own namespace of two bindings: @out@ and @err@. The initial chunk
@@ -58,14 +58,9 @@ outputChunk =
     [ "local out, err = " <> outputNamespaceName <> ".out, " <> outputNamespaceName <> ".err"
     , outputNamespaceName <> " = nil"
     , "local tostring, concat, select, sub = tostring, table.concat, select, string.sub"
-    , "local limit, marker = " <> Text.pack (show outputCallLimit) <> ", " <> Text.pack (show (Text.unpack truncationMarker))
-    , "local function render(prefix, ...)"
-    , "  local parts = {}"
-    , "  for i = 1, select('#', ...) do parts[i] = tostring((select(i, ...))) end"
-    , "  local text = prefix .. concat(parts, '\\t')"
-    , "  if #text > limit then text = sub(text, 1, limit - #marker) .. marker end"
-    , "  return text"
-    , "end"
-    , "print = function(...) out(render('', ...)) end"
+    ]
+    <> renderFunctionLines
+    <>
+    [ "print = function(...) out(render('', ...)) end"
     , "warn = function(...) err(render('Lua warning: ', ...)) end"
     ]

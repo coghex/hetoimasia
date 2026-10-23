@@ -625,6 +625,30 @@ spec = describe "the module loader" $ do
         marked ← traced rig
         marked `shouldSatisfy` any ("bad:false:" `Text.isPrefixOf`)
 
+  describe "the module whose code runs" $ do
+    it "is named by the loader over a top level, over an import it made, over the variables that close it, and nobody's over a hook" $
+      withRigAt (\config → config {vmModules = [hookDriver]}) $ \rig owned → do
+        _ ← supply rig owned "inner" ["trace.module()", "return {}"]
+        _ ←
+          supply
+            rig
+            owned
+            "outer"
+            [ "trace.module()"
+            , "local inner = import('inner')"
+            , "trace.module()"
+            , "return { gameplay = { init = function(self, api) trace.module() end } }"
+            ]
+        _ ← supply rig owned "failing" ["local guard <close> = setmetatable({}, { __close = function() trace.module() end })", "error('boom')"]
+        _ ← admit owned "outer"
+        _ ← admit owned "failing"
+        _ ← advance owned
+        traced rig >>= (`shouldBe` ["module:game:outer", "module:game:inner", "module:game:outer", "module:game:failing"])
+        runInit owned "outer"
+        traced rig >>= (`shouldBe` ["module:game:outer", "module:game:inner", "module:game:outer", "module:game:failing", "module:none"])
+        modulePhaseModule (rigPhase rig) >>= (`shouldBe` Nothing)
+        modulePhaseActive (rigPhase rig) >>= (`shouldBe` False)
+
   describe "the phase of a module's top level" $ do
     it "refuses an engine service as an ordinary error before its action, and allows it to a helper called from a hook" $
       withRigAt (\config → config {vmModules = [hookDriver]}) $ \rig owned → do

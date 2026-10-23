@@ -67,11 +67,19 @@ countOf = \case
   [VInteger n] | n >= 0 → fromIntegral n
   _ → 0
 
--- | A wait's first argument as nanoseconds, read the same way.
+-- | A wait's arguments as nanoseconds, read the same way. An integer is the whole count, which a Lua
+-- integer limits to 2^63 - 1; a pair of integers, each from 0 to 2^32 - 1, is the count's high and low
+-- 32 bits, which reaches every count a 'Duration' holds, through 2^64 - 1. Anything else is read as none.
 durationOf ∷ [Value] → Duration
 durationOf = \case
   [VInteger n] | n >= 0, Right duration ← durationFromNanoseconds AllowZero (toInteger n) → duration
+  [VInteger high, VInteger low]
+    | inWord high
+    , inWord low
+    , Right duration ← durationFromNanoseconds AllowZero (toInteger high * 4294967296 + toInteger low) → duration
   _ → zeroDuration
+  where
+    inWord word = word >= 0 && word < 4294967296
 
 -- | Close a suspended task's coroutine, once, on this thread. A failure of the
 -- close is raised, for the scheduler to keep as evidence.

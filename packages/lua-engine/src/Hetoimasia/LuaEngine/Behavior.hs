@@ -37,6 +37,7 @@ module Hetoimasia.LuaEngine.Behavior
   , CadenceKey (..)
   , CadenceRefusal (..)
   , cadenceOf
+  , elapsedDuration
     -- * Instances
   , behaviorRequest
   ) where
@@ -44,7 +45,7 @@ module Hetoimasia.LuaEngine.Behavior
 import Data.Int (Int64)
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Hetoimasia.Foundation.Time (DurationRejected (..), DurationRequirement (RequirePositive), durationFromNanoseconds)
+import Hetoimasia.Foundation.Time (Duration, DurationRejected (..), DurationRequirement (RequirePositive), durationFromNanoseconds)
 import Hetoimasia.LuaEngine.Manifest (Role (..))
 import Hetoimasia.LuaEngine.Profile
   ( ByteLimit (ModuleSourceBytes)
@@ -149,16 +150,26 @@ cadenceOf role shape
     -- arithmetic, never by floating multiplication.
     elapsedSeconds = \case
       FieldAbsent → Left SecondsRequired
-      FieldInteger whole
-        | whole <= 0 → Left SecondsNotPositive
-        | otherwise → nanoseconds (toInteger whole * nanosecondsPerSecond)
-      FieldFloat number
-        | isNaN number || isInfinite number → Left SecondsNotFinite
-        | number <= 0 → Left SecondsNotPositive
-        | otherwise → nanoseconds (ceiling (toRational number * fromInteger nanosecondsPerSecond))
-      other → Left (SecondsNotNumber other)
+      other → ElapsedEvery <$> elapsedDuration other
+
+-- | A number of seconds a script wrote, as the exact positive count of nanoseconds it names: either
+-- Lua number, finite and positive, its exact value times 1,000,000,000 rounded /upward/ by checked
+-- integer arithmetic, never by floating multiplication and never to zero. It is the conversion of a
+-- presentation cadence and of a presentation wait, so that one rule serves both. A value that is
+-- not a number is 'SecondsNotNumber', one past the positive 64-bit range 'SecondsTooLarge'.
+elapsedDuration ∷ CadenceField → Either CadenceRefusal Duration
+elapsedDuration = \case
+  FieldInteger whole
+    | whole <= 0 → Left SecondsNotPositive
+    | otherwise → nanoseconds (toInteger whole * nanosecondsPerSecond)
+  FieldFloat number
+    | isNaN number || isInfinite number → Left SecondsNotFinite
+    | number <= 0 → Left SecondsNotPositive
+    | otherwise → nanoseconds (ceiling (toRational number * fromInteger nanosecondsPerSecond))
+  other → Left (SecondsNotNumber other)
+  where
     nanoseconds count = case durationFromNanoseconds RequirePositive count of
-      Right duration → Right (ElapsedEvery duration)
+      Right duration → Right duration
       Left DurationNegative → Left SecondsNotPositive
       Left DurationZero → Left SecondsNotPositive
       Left _ → Left SecondsTooLarge

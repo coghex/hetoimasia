@@ -8,16 +8,21 @@
 module Test.LuaRuntime.Scheduled.Execution (spec) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Monad (forM_)
+import Control.Concurrent (forkIO, killThread, yield)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryReadMVar)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), finally, throwIO)
+import Control.Monad (forM_, replicateM_, void, when)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Text (Text)
 import Hetoimasia.Scripting.Lua.Scheduled
+import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
 import Hetoimasia.Scripting.Lua.Scheduler (Candidate (..), PolicyView (..), servable)
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (fireReg, liveRegs, nanoseconds)
-import Test.LuaRuntime.Support (bounded, failExample, Gated (..), requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, Broken (Broken), brokenIs, expectFatal, failExample, Gated (..), requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- | A task of the module's @spin@ entry, which records a label and a number and
 -- yields, this many times.
@@ -136,6 +141,145 @@ spec = describe "tasks run as coroutines on a scheduled owner" $ do
         outcomeOf ticket >>= (`shouldBe` Just [VInteger 500]) . taskReturned
         effects fixture >>= (`shouldBe` ["s before", "s after 2:500:0"])
         retireScheduled owner
+
+  describe "elapsed time past a Lua integer" $ do
+    it "waits for a count of nanoseconds given as its two 32-bit halves, through the whole Word64 range, exactly" $ bounded $ do
+      fixture ← newSFixture
+      withBoundary $ \_ runtime → do
+        setClock fixture 1000
+        owner ← startScheduled fixture runtime (scheduled fixture "wide" requiredPolicy defaultSchedulerBounds)
+        -- 2^63 + 5 nanoseconds: more than a Lua integer holds, within the 2^64 - 1 a duration holds.
+        ticket ← admitTask' fixture owner "w" (request "sleep_wide" [VText "w", VInteger 2147483648, VInteger 5] OrdinaryClass OneShot (Just "w"))
+        awaitRegistrations fixture 1
+        setClock fixture (1000 + 9223372036854775808 + 4)
+        liveRegs (sfTimer fixture) >>= mapM_ fireReg
+        awaitRegistrations fixture 2
+        effects fixture >>= (`shouldBe` ["w before"])
+        setClock fixture (1000 + 9223372036854775808 + 5)
+        liveRegs (sfTimer fixture) >>= mapM_ fireReg
+        _ ← outcomeOf ticket
+        effects fixture >>= (`shouldBe` ["w before", "w after 2"])
+        retireScheduled owner
+
+    it "refuses a pair that is not two words as a wait for nothing, and a deadline past the clock's range as a refused wait, never as a wrapped one" $ bounded $ do
+      fixture ← newSFixture
+      withBoundary $ \_ runtime → do
+        setClock fixture 18446744073709551615
+        owner ← startScheduled fixture runtime (scheduled fixture "range" requiredPolicy defaultSchedulerBounds)
+        past ← admitTask' fixture owner "p" (request "sleep_wide" [VText "p", VInteger 0, VInteger 1] OrdinaryClass OneShot (Just "p"))
+        outcomeOf past >>= \settled → case settled of
+          SettledRefused _ → pure ()
+          other → failExample ("a wait past the clock's range must be refused, found " <> show other)
+        zero ← admitTask' fixture owner "z" (request "sleep_wide" [VText "z", VInteger 0, VInteger 0] OrdinaryClass OneShot (Just "z"))
+        outcomeOf zero >>= \settled → case settled of
+          SettledRefused _ → pure ()
+          other → failExample ("a wait for nothing must be refused, found " <> show other)
+        retireScheduled owner
+
+  describe "the application told of a refused wait" $ do
+    it "is told of each wait the scheduler refused, in order; the task still fails as it did" $ bounded $ do
+      fixture ← newSFixture
+      told ← newIORef []
+      withBoundary $ \_ runtime → do
+        setClock fixture 18446744073709551615
+        owner ← startScheduled fixture runtime ((scheduled fixture "told" requiredPolicy defaultSchedulerBounds) {scheduledRefusedWait = \why → modifyIORef' told (why :)})
+        past ← admitTask' fixture owner "p" (request "sleep_wide" [VText "p", VInteger 0, VInteger 1] OrdinaryClass OneShot (Just "p"))
+        outcomeOf past >>= \settled → case settled of
+          SettledRefused _ → pure ()
+          other → failExample ("a wait past the clock's range must still be refused, found " <> show other)
+        zero ← admitTask' fixture owner "z" (request "sleep_wide" [VText "z", VInteger 0, VInteger 0] OrdinaryClass OneShot (Just "z"))
+        outcomeOf zero >>= \settled → case settled of
+          SettledRefused _ → pure ()
+          other → failExample ("a wait for nothing must still be refused, found " <> show other)
+        retireScheduled owner
+      readIORef told >>= (`shouldBe` [WaitDurationNotPositive, WaitDeadlineOverflow])
+    it "deals with a refused wait at the boundary of its own segment: the peer behind the refused task is not chosen until the application has been told" $ bounded $ do
+      fixture ← newSFixture
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
+        setClock fixture 18446744073709551615
+        owner ← startScheduled fixture runtime ((scheduled fixture "boundary" requiredPolicy defaultSchedulerBounds) {scheduledRefusedWait = \_ → blockOn fixture "refusal"})
+        ( do
+          _ ← holding fixture owner $ do
+            refused ← admitTask' fixture owner "a" (request "sleep_wide" [VText "a", VInteger 0, VInteger 1] OrdinaryClass OneShot (Just "a"))
+            peer ← admitTask' fixture owner "b" (request "once" [VText "b"] OrdinaryClass OneShot (Just "b"))
+            pure (refused, peer)
+          awaitEntered fixture "refusal"
+          -- the owner is held in the application's answer, at the refused segment's boundary: the refused task has
+          -- run its segment, and the peer that was ready behind it has not been chosen
+          effects fixture >>= \ran → (elem "a before" ran, elem "b" ran) `shouldBe` (True, False)
+          releaseGate fixture "refusal"
+          awaitEffect fixture "b"
+          )
+          `finally` (openAllGates fixture >> retireScheduled owner)
+    it "does not acknowledge the owner's accounting at the boundary of a refused wait until the application has been told" $ bounded $ do
+      fixture ← newSFixture
+      withBoundaryOpening [openAllGates fixture] $ \control runtime → do
+        setClock fixture 18446744073709551615
+        owner ← startScheduled fixture runtime ((scheduled fixture "acknowledges" requiredPolicy defaultSchedulerBounds) {scheduledRefusedWait = \_ → blockOn fixture "refusal"})
+        -- the waiter is a thread of the example's own: it is killed however the example ends
+        waiterRef ← newIORef Nothing
+        ( do
+          -- the owner is held at the start of the refused task's segment, after the boundary that came before it
+          writeIORef (sfObserver fixture) $ \context → when (contextName context == Just "a") (blockOn fixture "segment")
+          ticket ← admitTask' fixture owner "a" (request "sleep_wide" [VText "a", VInteger 0, VInteger 1] OrdinaryClass OneShot (Just "a"))
+          awaitEntered fixture "segment"
+          -- a wait that begins here needs an acknowledgement written after it began: the first is the one at the
+          -- boundary that follows the refused segment
+          accounted ← newEmptyMVar
+          waiter ← forkIO (awaitScheduledAccounting control owner >>= putMVar accounted)
+          writeIORef waiterRef (Just waiter)
+          let parked = threadStatus waiter >>= \case
+                ThreadBlocked BlockedOnSTM → pure True
+                ThreadFinished → pure False
+                ThreadDied → pure False
+                _ → yield >> parked
+          parked >>= (`shouldBe` True)
+          releaseGate fixture "segment"
+          awaitEntered fixture "refusal"
+          -- the owner is in the application's answer at that boundary: it has written no acknowledgement yet
+          replicateM_ 500 yield
+          tryReadMVar accounted >>= (`shouldBe` Nothing)
+          releaseGate fixture "refusal"
+          takeMVar accounted >>= (`shouldBe` AccountingComplete)
+          void (outcomeOf ticket)
+          )
+          `finally` (readIORef waiterRef >>= mapM_ killThread >> openAllGates fixture >> retireScheduled owner)
+    it "tells the application before the refused task's own close handlers run: a handler cannot keep the refusal from being reported" $ bounded $ do
+      fixture ← newSFixture
+      withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
+        setClock fixture 18446744073709551615
+        owner ← startScheduled fixture runtime ((scheduled fixture "closing" requiredPolicy defaultSchedulerBounds) {scheduledRefusedWait = \_ → blockOn fixture "refusal"})
+        ( do
+          ticket ← admitTask' fixture owner "a" (request "refused_closing" [VText "a", VInteger 0, VInteger 1] OrdinaryClass OneShot (Just "a"))
+          awaitEntered fixture "refusal"
+          -- the task ran up to its refused wait and its continuation is suspended with a handler to run when it is
+          -- closed: the application is being told, and the handler has not run
+          effects fixture >>= \ran → (elem "a before" ran, elem "a closed" ran) `shouldBe` (True, False)
+          releaseGate fixture "refusal"
+          _ ← outcomeOf ticket
+          -- once the application has answered, the close is made and the handler runs
+          awaitEffect fixture "a closed"
+          )
+          `finally` (openAllGates fixture >> retireScheduled owner)
+    it "leaves the turn when the application raises at that boundary: the peer behind the refused task never runs" $ bounded $ do
+      fixture ← newSFixture
+      ExceptionWithContext _ raised ← expectFatal $ \control runtime → do
+        setClock fixture 18446744073709551615
+        owner ← startScheduled fixture runtime ((scheduled fixture "leaves" requiredPolicy defaultSchedulerBounds) {scheduledRefusedWait = \_ → throwIO (Broken "refused wait")})
+        ( do
+            _ ← holding fixture owner $ do
+              _ ← admitTask' fixture owner "a" (request "sleep_wide" [VText "a", VInteger 0, VInteger 1] OrdinaryClass OneShot (Just "a"))
+              admitTask' fixture owner "b" (request "once" [VText "b"] OrdinaryClass OneShot (Just "b"))
+            -- the refused task's own segment has run whatever the application does; the owner is then asked to retire,
+            -- so that an application that does not raise ends the example at once instead of leaving it waiting for an
+            -- owner that never fails
+            awaitEffect fixture "a before"
+            retireScheduled owner
+            _ ← awaitScheduledTerminal control owner
+            effects fixture >>= (`shouldSatisfy` notElem "b")
+          )
+          `finally` (openAllGates fixture >> retireScheduled owner)
+      raised `shouldSatisfy` brokenIs "refused wait"
 
   describe "budgets" $ do
     it "ends a turn at an expired budget without preempting a segment or reordering tasks, and attributes the overruns" $ bounded $ do

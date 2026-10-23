@@ -10,6 +10,7 @@ import qualified Data.Text.Encoding as Text
 import Data.IORef (newIORef, readIORef)
 import Hetoimasia.Foundation.Log (LogEntry (entryComponent, entryMessage), componentText)
 import Hetoimasia.Scripting.Lua.Runner
+import Hetoimasia.Scripting.Lua.Output (authoredLines, authoredLinesWith, minimumOutputLimit, renderFunctionLines, renderFunctionLinesWith)
 import Hetoimasia.Scripting.Lua.Runner.Internal (outputLines)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldContain, shouldNotContain, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Runner.Support
@@ -168,6 +169,67 @@ spec = describe "output" $ do
         written lines' `shouldSatisfy` (<= outputCallLimit)
         written lines' `shouldSatisfy` (> 0)
 
+  describe "the shared bounded output (LFE-12)" $ do
+    it "is the runner's own output when it takes no prefix, so that nothing the runner wrote changes" $
+      forM_ ["a\nb", "tab\there\1ctrl\0nul", "bad \255\254 bytes", "", Text.encodeUtf8 (Text.replicate 5000 "\8364")] $ \bytes →
+        authoredLines "" bytes `shouldBe` outputLines bytes
+    it "gives every line the prefix, makes the prefix safe too, and counts it, the line ends and the marker in the bound" $ do
+      authoredLines "w: " "one\ntwo" `shouldBe` ["w: one", "w: two"]
+      authoredLines "bad\1: " "x" `shouldBe` ["bad\\x01: x"]
+      let cut = authoredLines "prefix: " (Text.encodeUtf8 (Text.replicate 5000 "y"))
+      bytesOf cut `shouldBe` outputCallLimit
+      cut `shouldSatisfy` all (Text.isPrefixOf "prefix: ")
+      last cut `shouldSatisfy` Text.isSuffixOf truncationMarker
+    it "marks every line with the whole prefix when it cuts: the marker ends the last kept line, never stands alone, and a cut never splits a prefix" $ do
+      let prefix = "lua warning role=gameplay content=modules-test instance=inst-1: "
+          call n rest = Text.replicate n "x" <> rest
+          expected text = map (prefix <>) (Text.splitOn "\n" text)
+          check limit text = do
+            let written = authoredLinesWith limit prefix (Text.encodeUtf8 text)
+                full = expected text
+            written `shouldSatisfy` all (Text.isPrefixOf prefix)
+            bytesOf written `shouldSatisfy` (<= limit)
+            if bytesOf full <= limit
+              then written `shouldBe` full
+              else do
+                last written `shouldSatisfy` Text.isSuffixOf truncationMarker
+                init written `shouldBe` take (length written - 1) full
+      -- the call the review reproduced: a first line that nearly fills the bound, and a second after it
+      authoredLines prefix (Text.encodeUtf8 (call 4027 "\nnext")) `shouldSatisfy` all (Text.isPrefixOf prefix)
+      -- every length around the bound, with a break after it, several breaks, and none
+      forM_ [(n, rest) | n ← [3980 .. 4040], rest ← ["", "\n", "\nnext", "\n\n\nmore\nlines", "\8364\8364"]] $ \(n, rest) →
+        check outputCallLimit (call n rest)
+      -- a smaller bound, the same at every length around it
+      forM_ [(n, rest) | n ← [0 .. 120], rest ← ["", "\nnext", "\na\nb\nc"]] $ \(n, rest) →
+        check 128 (call n rest)
+      -- many short lines
+      check 300 (Text.intercalate "\n" (replicate 40 "line"))
+    it "lets the bound win when it cannot hold one prefix, the marker and a line end" $ do
+      let prefix = "a prefix of some length: "
+      forM_ [1 .. 30] $ \limit →
+        bytesOf (authoredLinesWith limit prefix "text\nmore") `shouldSatisfy` (<= limit)
+    it "has a least bound, the marker and a line end: under it nothing is written, at it the cut call is the marker alone, and no bound is exceeded" $ do
+      minimumOutputLimit `shouldBe` 4
+      forM_ [(-3) .. 3] $ \limit →
+        forM_ ["", "pfx: "] $ \prefix →
+          authoredLinesWith limit prefix "some text\nmore" `shouldBe` []
+      authoredLinesWith 4 "" "some text" `shouldBe` ["..."]
+      authoredLinesWith 4 "" "x" `shouldBe` ["x"]
+      forM_ [0 .. 40] $ \limit →
+        forM_ ["", "pfx: "] $ \prefix →
+          bytesOf (authoredLinesWith limit prefix "some text\nmore\nlines of it") `shouldSatisfy` (<= max 0 limit)
+      -- the Lua that cuts a call before it crosses never asks for a negative number of bytes
+      Text.unlines (renderFunctionLinesWith 1) `shouldSatisfy` Text.isInfixOf "if keep < 0 then keep = 0 end"
+    it "bounds a call to a smaller limit when asked to, as a validated smaller profile does" $ do
+      let ls = authoredLinesWith 100 "p: " (Text.encodeUtf8 (Text.replicate 500 "z"))
+      bytesOf ls `shouldBe` 100
+      last ls `shouldSatisfy` Text.isSuffixOf truncationMarker
+      authoredLinesWith 100 "" "short" `shouldBe` ["short"]
+    it "defines the Lua that cuts a call to the same bound before it crosses, with the marker counted" $ do
+      let source = Text.unlines renderFunctionLines
+      source `shouldSatisfy` Text.isInfixOf (Text.pack (show outputCallLimit))
+      Text.unlines (renderFunctionLinesWith 64) `shouldSatisfy` Text.isInfixOf "local limit, marker = 64, "
+
   it "keeps the runner's own diagnostics in the logger under one component, and script output, tables and reports out of it" $ bounded $ do
     fixture ← newRFixture
     entries ← newIORef []
@@ -191,3 +253,7 @@ scriptLines = go
 
 forM' ∷ [a] → (a → IO ()) → IO ()
 forM' items body = mapM_ body items
+
+-- | The bytes a call wrote: each line and the line end that follows it.
+bytesOf ∷ [Text] → Int
+bytesOf ls = sum [ByteString.length (Text.encodeUtf8 line) + 1 | line ← ls]

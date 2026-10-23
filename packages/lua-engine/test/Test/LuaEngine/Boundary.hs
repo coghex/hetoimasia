@@ -7,7 +7,7 @@
 -- package's public modules (and reads only through them), it exposes four
 -- modules, needs no GLFW, Vulkan, console, sample or game package, and is listed
 -- by the ordinary and CPU projects and not by the Vulkan project (LFE-22 wires
--- that). Its request, data, texture and scene sublibraries are each held to their own
+-- that). Its request, data, modules, texture, scene and facade sublibraries are each held to their own
 -- dependencies and public imports; the scene one imports no oracle, which is the suite's.
 module Test.LuaEngine.Boundary (spec) where
 
@@ -213,6 +213,31 @@ spec = describe "the package and import boundary" $ do
     [file <> ": " <> name | (file, name) ← imported, not (permittedScene name)] `shouldBe` []
     [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
 
+  it "has a facade sublibrary over the profile, the request adapter, the data provider, the module coordinator, the content package, the foundation and the host's public modules, and nothing else" $ do
+    (sort <$> fieldEntries "library facade" "build-depends:")
+      `shouldReturn` [ "base"
+                     , "bytestring"
+                     , "containers"
+                     , "hetoimasia-content"
+                     , "hetoimasia-foundation"
+                     , "hetoimasia-lua-engine"
+                     , "hetoimasia-lua-engine:data"
+                     , "hetoimasia-lua-engine:modules"
+                     , "hetoimasia-lua-engine:request"
+                     , "hetoimasia-scripting-lua"
+                     , "hetoimasia-scripting-lua:runtime-lua"
+                     , "stm"
+                     , "text"
+                     ]
+    fieldEntries "library facade" "exposed-modules:" `shouldReturn` ["Hetoimasia.LuaEngine.Facade"]
+
+  it "imports, in the facade sublibrary, only the configuration boundary, the three services it binds, the content package's and the foundation's public modules, the host's public modules and base libraries: no texture, scene, private module, window, GPU, GLFW, Vulkan, console, sample or game" $ do
+    sources ← sourcesUnder "facade"
+    sources `shouldSatisfy` ((>= 8) . length)
+    imported ← importedBy sources
+    [file <> ": " <> name | (file, name) ← imported, not (permittedFacade name)] `shouldBe` []
+    [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
+
   it "lets only the behavior selection import the Lua host and runtime, and only their public modules" $ do
     sources ← sourcesUnder "src"
     imported ← importedBy sources
@@ -346,6 +371,25 @@ spec = describe "the package and import boundary" $ do
                  , "Hetoimasia.Scripting.Lua.Value"
                  ]
         || "Hetoimasia.Render.TwoD." `isPrefixOf` name
+    permittedFacade name =
+      "Data." `isPrefixOf` name
+        || "GHC." `isPrefixOf` name
+        || "Control." `isPrefixOf` name
+        || "Hetoimasia.LuaEngine.Facade" `isPrefixOf` name
+        || name
+          `elem` [ "Hetoimasia.LuaEngine.Behavior"
+                 , "Hetoimasia.LuaEngine.Boot"
+                 , "Hetoimasia.LuaEngine.Data"
+                 , "Hetoimasia.LuaEngine.Manifest"
+                 , "Hetoimasia.LuaEngine.Modules"
+                 , "Hetoimasia.LuaEngine.Profile"
+                 , "Hetoimasia.LuaEngine.Request"
+                 , "Hetoimasia.Content.Identity"
+                 , "Hetoimasia.Content.Inventory"
+                 , "Hetoimasia.Foundation.Resource"
+                 , "Hetoimasia.Foundation.Time"
+                 ]
+        || "Hetoimasia.Scripting.Lua." `isPrefixOf` name
     permittedSuite name =
       name
         `elem` [ "Hetoimasia.LuaEngine.Manifest"
@@ -355,6 +399,7 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.LuaEngine.Request"
                , "Hetoimasia.LuaEngine.Data"
                , "Hetoimasia.LuaEngine.Modules"
+               , "Hetoimasia.LuaEngine.Facade"
                , "Hetoimasia.LuaEngine.Texture"
                , "Hetoimasia.LuaEngine.Scene"
                , "Hetoimasia.Asset.Image"

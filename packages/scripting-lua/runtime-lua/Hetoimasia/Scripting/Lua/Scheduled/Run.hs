@@ -145,6 +145,7 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , TaskHost (..)
   , TaskRun (..)
   , TurnReport (turnCloseFailures)
+  , WaitRefusal
   , awaitWork
   , retainsEvidence
   , serviceTurnWith
@@ -164,14 +165,15 @@ runScheduledOwner
   → Control
   → TVar (Maybe Control)
   → (SegmentContext → IO ())
+  → (WaitRefusal → IO ())
   → Maybe (InstanceFailure → IO Escalation)
   → Maybe Lending
   → Maybe Leases
   → Int
   → VmConfig
   → IO ()
-runScheduledOwner stopping control handoff observe escalate lending leases members config = mask $ \restore → do
-  let body = serve stopping control handoff observe escalate config
+runScheduledOwner stopping control handoff observe refused escalate lending leases members config = mask $ \restore → do
+  let body = serve stopping control handoff observe refused escalate config
   outcome ←
     tryWithContext @SomeException . restore $ case lending of
       Nothing → withVmOwnerScoped noCallbackScope config (body Nothing)
@@ -189,8 +191,8 @@ runScheduledOwner stopping control handoff observe escalate lending leases membe
   either rethrowIO pure outcome
 
 -- | The body of the owner's lifetime.
-serve ∷ STM Bool → Control → TVar (Maybe Control) → (SegmentContext → IO ()) → Maybe (InstanceFailure → IO Escalation) → VmConfig → Maybe LeaseHost → OwnedVm → IO ()
-serve stopping control handoff observe escalate config leaseHost owned = mask $ \restore → do
+serve ∷ STM Bool → Control → TVar (Maybe Control) → (SegmentContext → IO ()) → (WaitRefusal → IO ()) → Maybe (InstanceFailure → IO Escalation) → VmConfig → Maybe LeaseHost → OwnedVm → IO ()
+serve stopping control handoff observe refused escalate config leaseHost owned = mask $ \restore → do
   tasks ← newIORef Map.empty
   handlesRef ← newIORef Map.empty
   instanceRef ← newIORef Nothing
@@ -203,6 +205,9 @@ serve stopping control handoff observe escalate config leaseHost owned = mask $ 
   let host =
         TaskHost
           { hostRun = runSegment control observe owned identity label handlesRef tasks extra instanceRef
+          , -- A refused wait is the application's to treat as it likes, and it is told when the scheduler
+            -- applies the report: before the continuation is closed, before accounting, before any peer.
+            hostRefused = \_ why → refused why
           , -- The coroutine is closed first. The instance whose invocation it was is
             -- ended after that, whatever the close did: it is told only when the
             -- close was not interrupted, which an exit settles as discarded.

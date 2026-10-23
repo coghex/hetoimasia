@@ -12,7 +12,7 @@ import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Admission.Support
-import Test.LuaRuntime.Instance.Support (awaitPhase, awaitSettled, expectControl)
+import Test.LuaRuntime.Instance.Support (awaitPhase, awaitSettled, expectControl, idOf)
 import Test.LuaRuntime.Request.Support (answerResult, awaitCancelled, awaitDiagnostic, diagnostics, finishWork, submissions)
 import Test.LuaRuntime.Support (bounded, requiredPolicy, withBoundary)
 
@@ -44,6 +44,22 @@ spec = describe "handles" $ do
       awaitNote fixture "cmd ready a false"
       awaitPhase (afBase fixture) owner "j" Active
       submissions (afFake fixture) >>= (`shouldBe` 1)
+
+  it "are told apart from the caller by the engine: the instance whose code runs is the one the owner issued it, whichever instance of the VM asks" $ bounded $ do
+    fixture ← newAFix 4
+    withBoundary $ \_ runtime → settleAll fixture $ do
+      owner ← arrival fixture [admitter] runtime "callers"
+      admitAdmitter fixture owner "i" "admitter"
+      admitAdmitter fixture owner "j" "admitter"
+      first ← idOf (afBase fixture) "i"
+      second ← idOf (afBase fixture) "j"
+      acommand fixture owner "i" "who" "a"
+      awaitNote fixture ("cmd who a " <> Text.pack (show (instanceLocal first)))
+      acommand fixture owner "j" "who" "a"
+      awaitNote fixture ("cmd who a " <> Text.pack (show (instanceLocal second)))
+      instanceLocal first `shouldSatisfy` (/= instanceLocal second)
+      -- the identity is the owner's, with the owner's name in it
+      first `shouldSatisfy` (\found → instanceOwner found == instanceOwner second)
 
   it "are spent by the take of the terminal result: the handle names nothing afterwards" $ bounded $ do
     fixture ← newAFix 4

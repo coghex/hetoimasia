@@ -194,6 +194,7 @@ schedRegistration fixture = ok (registration [] [sched, fx])
         [ yieldOperation "yield"
         , waitOperation "wait_ticks" WaitLogical [SInteger]
         , waitOperation "wait_ns" WaitElapsed [SInteger]
+        , waitOperation "wait_ns_wide" WaitElapsed [SInteger, SInteger]
         ]
     fx =
       namespace
@@ -348,10 +349,12 @@ tasksEntries =
   , required "forever" [SText] []
   , required "wait_ticks" [SText, SInteger] [SInteger]
   , required "sleep" [SText, SInteger] [SInteger]
+  , required "sleep_wide" [SText, SInteger, SInteger] [SInteger]
   , required "fault" [SText] []
   , required "host_fail" [SText] []
   , required "block_in" [SText] []
   , required "closes_cleanly" [SText] []
+  , required "refused_closing" [SText, SInteger, SInteger] [SInteger]
   , required "closes_badly" [SText] []
   , required "controls" [SText, SText, SText] []
   , required "echo" [SInteger] [SInteger]
@@ -396,6 +399,13 @@ tasksSource =
     , "  fx.record(label .. ' after ' .. kind .. ':' .. a .. ':' .. b)"
     , "  return a"
     , "end"
+    , "function sleep_wide(label, high, low)"
+    , "  fx.record(label .. ' before')"
+    , "  sched.wait_ns_wide(high, low)"
+    , "  local kind, a, b = fx.resume()"
+    , "  fx.record(label .. ' after ' .. kind)"
+    , "  return a"
+    , "end"
     , "function fault(label) fx.record(label) error('task boom') end"
     , "function host_fail(kind) fx.fail(kind) end"
     , "function block_in(name) fx.record('block ' .. name) fx.block(name) fx.record('unblocked ' .. name) end"
@@ -411,6 +421,12 @@ tasksSource =
     , "function delayed(label, n)"
     , "  for i = 1, n do fx.delay() fx.record(label .. i) sched.yield() end"
     , "  return n"
+    , "end"
+    , "function refused_closing(label, high, low)"
+    , "  local guard <close> = setmetatable({}, {__close = function() fx.record(label .. ' closed') end})"
+    , "  fx.record(label .. ' before')"
+    , "  sched.wait_ns_wide(high, low)"
+    , "  fx.record(label .. ' resumed')"
     , "end"
     , "function closes_cleanly(label)"
     , "  local guard <close> = setmetatable({}, {__close = function() fx.record(label .. ' closed') end})"

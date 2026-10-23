@@ -693,12 +693,18 @@ data InstanceConfig = InstanceConfig
     -- has ended. It decides, and its default keeps the failure isolated. What it
     -- raises is a failure of the host. It cannot hide or replace the cleanup
     -- evidence of the owner, which is fatal whatever it answers.
+  , instanceOnSegment ∷ InstanceId → IO ()
+    -- ^ Told, on the owner's thread and just before the Lua of an instance's hook begins or
+    -- resumes, whose instance it is: its @init@, the first segment of an update, a callback or a
+    -- @run@, every segment a wait resumes, and its @shutdown@. It is where an application samples
+    -- what a script must read as the same throughout a segment. It runs no Lua and its default does
+    -- nothing; what it raises is a failure of the host.
   }
 
 -- | The default bounds, no event source, controls admitted on arrival, and an
 -- escalation that keeps every failure isolated.
 defaultInstanceConfig ∷ InstanceConfig
-defaultInstanceConfig = InstanceConfig defaultInstanceBounds [] Nothing AdmitOnArrival (const (pure Isolate))
+defaultInstanceConfig = InstanceConfig defaultInstanceBounds [] Nothing AdmitOnArrival (const (pure Isolate)) (const (pure ()))
 
 -- | A configuration problem.
 data InstanceViolation
@@ -987,6 +993,9 @@ data Instances = Instances
     -- ^ The accepted requests assigned a tick the owner has not begun, by their place
     -- in the input sequence, which is their order: each holds a reservation like any
     -- accepted request, so they are bounded by 'boundInstanceControls'.
+  , insOnSegment ∷ InstanceId → IO ()
+    -- ^ What the application is told as an instance's hook begins or resumes
+    -- ('instanceOnSegment').
   }
 
 -- | Make an owner's instance state.
@@ -1005,6 +1014,7 @@ newInstances config =
     <*> newTVarIO Nothing
     <*> pure (instanceControlAdmission config)
     <*> newTVarIO Map.empty
+    <*> pure (instanceOnSegment config)
 
 -- | An error as one line of text, at most 'failureTextLimit' characters.
 renderError ∷ InstanceError → Text

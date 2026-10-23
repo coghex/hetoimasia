@@ -142,6 +142,11 @@ rigRegistration rig = either (error . show) id (registration [] [tracing, servic
               [VText text] → atomicModifyIORef' (rigTrace rig) (\held → (text : held, ()))
               _ → pure ()
             pure []
+        , -- The module whose code is running, as the loader says it: written beside the marks.
+          stateOperation "module" [] [] $ \_ → do
+            current ← modulePhaseModule (rigPhase rig)
+            atomicModifyIORef' (rigTrace rig) (\held → (("module:" <> maybe "none" importerLabel current) : held, ()))
+            pure []
         , -- A binding that refuses what it is not given as a fault of the call, which a
           -- script cannot hide: not opted in to ordinary errors.
           stateOperation "strict" [SText] [] (\_ → pure [])

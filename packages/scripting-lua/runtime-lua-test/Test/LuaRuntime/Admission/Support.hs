@@ -282,6 +282,11 @@ adNamespace fixture =
         asynchronousNativeRequestIn "gen_start" [SText, SInteger] [] $ \context arguments → case arguments of
           [VText endpoint, VInteger n] → [] <$ startRequest context endpoint [VInteger n] (pure ())
           _ → pure []
+    , -- Who is calling, as the engine knows it: the local number of the instance whose code runs, or 0.
+      asynchronousNativeRequestIn "who" [] [SInteger] $ \context _ →
+        callerInstance context >>= \case
+          Just found → pure [VInteger (fromIntegral (instanceLocal found))]
+          Nothing → pure [VInteger 0]
     , recoverableRefusals $
         asynchronousNativeRequestIn "ready" [SCapability "areq"] [SBoolean] $ \context arguments → case arguments of
           [VCapability handle] → (\settled → [VBoolean settled]) <$> readyAdmitted context (capabilityKey handle)
@@ -380,6 +385,7 @@ prelude =
   , "  elseif p.op == 'pgstart' then"
   , "    local ok = pcall(ad.gen_start, p.endpoint or 'path', p.n or 0)"
   , "    out = ok and 'started' or 'refused'"
+  , "  elseif p.op == 'who' then out = tostring(ad.who())"
   , "  elseif p.op == 'ready' then out = tostring(ad.ready(self.hs[key]))"
   , "  elseif p.op == 'take' then out = fmt(ad.take(self.hs[key]))"
   , "  elseif p.op == 'ptake' then"

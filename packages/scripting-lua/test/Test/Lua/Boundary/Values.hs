@@ -139,6 +139,22 @@ spec = describe "values and schemas" $ do
       checkLimits (ValueLimits 65536 8 2) [VRecord (repeat ("a", VNil))] `shouldBe` Left (RuleElementLimit 2)
       checkLimits (ValueLimits 65536 8 2) [VList (repeat VNil)] `shouldBe` Left (RuleElementLimit 2)
 
+    it "counts the context record the Lua-first facade hands its builder: 142 bytes at the smallest identity bound, four elements, one level, at the bound and one past" $ do
+      let record = VRecord [("role", VText "presentation"), ("content_id", VText (Text.replicate 64 "c")), ("instance_id", VText "inst-1")]
+      -- five for the record; for each field five and its name, and five and its length for the text
+      valuesFootprint (ValueLimits 65536 8 4096) [record] `shouldBe` Right (5 + (5 + 4) + (5 + 12) + (5 + 10) + (5 + 64) + (5 + 11) + (5 + 6))
+      valuesFootprint (ValueLimits 65536 8 4096) [record] `shouldBe` Right 142
+      checkLimits (ValueLimits 142 1 4) [record] `shouldBe` Right ()
+      checkLimits (ValueLimits 141 1 4) [record] `shouldBe` Left (RuleBytesLimit 141)
+      checkLimits (ValueLimits 142 1 3) [record] `shouldBe` Left (RuleElementLimit 3)
+      checkLimits (ValueLimits 142 1 4) [VList [record]] `shouldBe` Left (RuleDepthLimit 1)
+      -- a text argument is its length and a five-byte header, at the bound and one past: the call to the facade's output
+      -- binding carries at most the output bound and that header, and an identity is carried as the same
+      valuesFootprint (ValueLimits 65536 8 4096) [VBytes (ByteString.replicate 300 120)] `shouldBe` Right 305
+      valuesFootprint (ValueLimits 65536 8 4096) [VText (Text.replicate 6 "i")] `shouldBe` Right 11
+      checkLimits (ValueLimits 305 1 1) [VBytes (ByteString.replicate 300 120)] `shouldBe` Right ()
+      checkLimits (ValueLimits 304 1 1) [VBytes (ByteString.replicate 300 120)] `shouldBe` Left (RuleBytesLimit 304)
+
     it "is bounded in depth, at the bound and one past" $ do
       encodedWith 65536 2 4096 [VList [VList [VInteger 1]]] `shouldSatisfy` (not . isLeft)
       encodedWith 65536 2 4096 [VList [VList [VList []]]] `shouldBe` Left (RuleDepthLimit 2)

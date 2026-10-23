@@ -7,7 +7,9 @@ module Test.LuaRuntime.Scheduler.Logical (spec) where
 import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
-import Control.Monad (forever, void)
+import Control.Monad (forM_, forever, void)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
+import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Runtime.Supervision (awaitSupervised)
 import Hetoimasia.Scripting.Lua.Scheduler
@@ -151,6 +153,36 @@ spec = describe "logical time" $ do
     -- The victim ended while its continuation was suspended, so it was closed.
     map fst <$> closedTasks rig >>= (`shouldBe` [victim])
 
+  describe "the host told of a refused wait" $ do
+    it "is told when the report is applied, in order: before the refused task's continuation is closed, before the budget and before the next task's segment" $ do
+      rig ← newRig
+      events ← newIORef []
+      let note entry = modifyIORef' events (entry :)
+      writeIORef (rigRefusedHook rig) (\identity why → note ("refused " <> Text.pack (show (identity, why))))
+      writeIORef (rigCloseHook rig) (\identity → note ("closed " <> Text.pack (show identity)))
+      first ← admit rig "first" OrdinaryClass OneShot
+      _ ← admit rig "second" OrdinaryClass OneShot
+      script rig "first" [waitFor "first" 0]
+      script rig "second" [note "second ran" >> pure (ReportCompleted "second")]
+      _ ← turn rig
+      reverse <$> readIORef events
+        >>= (`shouldBe` ["refused " <> Text.pack (show (first, WaitDurationNotPositive)), "closed " <> Text.pack (show first), "second ran"])
+    it "keeps nothing for a standalone caller that ignores it: a hundred refused waits through bounds of one are each told once, and the scheduler still admits" $ do
+      rig ← newRigWith defaultOptions {optBounds = defaultBounds {boundActiveTasks = 1, boundQueuedAdmissions = 1, boundRetainedResults = 1}}
+      told ← newIORef (0 ∷ Int)
+      writeIORef (rigRefusedHook rig) (\_ _ → modifyIORef' told (+ 1))
+      forM_ [1 .. 100 ∷ Int] $ \n → do
+        let name = "refused-" <> Text.pack (show n)
+        identity ← admit rig name OrdinaryClass OneShot
+        script rig name [waitFor name 0]
+        _ ← turn rig
+        -- the application consumes the result, as a standalone caller does, and nothing else is kept for it
+        observe rig identity >>= \case
+          Just (ResultFailed _) → pure ()
+          other → failExample ("expected a failed result, found " <> show other)
+      readIORef told >>= (`shouldBe` 100)
+      counts ← diagnostics rig
+      diagRefusedWaits counts `shouldBe` 100
   it "refuses a wait that cannot be represented, and fails its task with a typed failure rather than waiting" $ do
     rig ← newRig
     zeroTicks ← admit rig "zero-ticks" OrdinaryClass OneShot

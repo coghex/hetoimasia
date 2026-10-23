@@ -85,6 +85,7 @@ module Hetoimasia.Scripting.Lua.Admission
   , preflightAdmission
   , CallerPhase (..)
   , callerPhase
+  , callerInstance
 
     -- * Settling
   , Terminal (..)
@@ -113,7 +114,7 @@ import Data.Word (Word64)
 import GHC.Stack (HasCallStack)
 import Hetoimasia.Foundation.Failure (operation, throwFailure)
 import Hetoimasia.Foundation.Resource (composeCleanup)
-import Hetoimasia.Scripting.Lua.Instance.Types (InstancePhase (..))
+import Hetoimasia.Scripting.Lua.Instance.Types (InstanceId (InstanceId), InstancePhase (..))
 import Hetoimasia.Scripting.Lua.Lease.State (Retirements)
 import Hetoimasia.Scripting.Lua.Provider.Call
 import Hetoimasia.Scripting.Lua.Provider.Serve (guarded, raiseAmong, tellProviders)
@@ -230,6 +231,18 @@ callerPhase context = do
     Active → CallerServing
     Paused → CallerServing
     _ → CallerEnding
+
+-- | The instance whose code is running, by the identity its owner issued it, or 'Nothing' when none
+-- is: a module's top level, a task's segment, or no Lua of an instance. It is the engine's reading of
+-- who is calling, never a script's claim, and an application's binding reads it to tell an instance's
+-- own call from a facade that another instance's code reached.
+callerInstance ∷ HasCallStack ⇒ RequestContext → IO (Maybe InstanceId)
+callerInstance context = do
+  service ← serviceOf context
+  caller ← atomically (callerOf service)
+  pure $ case caller of
+    CallerInstance number → Just (InstanceId (psOwner service) number)
+    _ → Nothing
 
 -- | What taking a request found.
 data Taken

@@ -18,7 +18,9 @@ module Hetoimasia.Scripting.Lua.Internal.LoaderTypes
   , ModulePhase
   , newModulePhase
   , modulePhaseActive
+  , modulePhaseModule
   , setModulePhase
+  , setModulePhaseModule
     -- * Admissions and deliveries
   , RootRequest (..)
   , RootOrder (..)
@@ -151,17 +153,28 @@ loaderConfig supplier resolver = LoaderConfig supplier resolver (const (pure Tru
 -- phase of its own, and acquires no engine service: the application's bindings refuse,
 -- as an ordinary Lua error before their action, whatever authority a facade or a helper
 -- they were reached through would give them in a hook.
-newtype ModulePhase = ModulePhase (IORef Bool)
+data ModulePhase = ModulePhase !(IORef Bool) !(IORef (Maybe ImportContext))
 
 newModulePhase ∷ IO ModulePhase
-newModulePhase = ModulePhase <$> newIORef False
+newModulePhase = ModulePhase <$> newIORef False <*> newIORef Nothing
 
 -- | Whether a module's top level is running now.
 modulePhaseActive ∷ ModulePhase → IO Bool
-modulePhaseActive (ModulePhase ref) = readIORef ref
+modulePhaseActive (ModulePhase ref _) = readIORef ref
+
+-- | The module whose code is running now, while a module's top level (or the closing of its
+-- coroutine) runs: the identity it was admitted under and its label, from the loader's own record of
+-- the frame it is running and never from anything a script said. 'Nothing' when no module's code is
+-- running. It is what an application's binding reads to name the module that called it, as it reads
+-- the instance whose hook is running to name that one.
+modulePhaseModule ∷ ModulePhase → IO (Maybe ImportContext)
+modulePhaseModule (ModulePhase _ ref) = readIORef ref
 
 setModulePhase ∷ ModulePhase → Bool → IO ()
-setModulePhase (ModulePhase ref) = writeIORef ref
+setModulePhase (ModulePhase ref _) = writeIORef ref
+
+setModulePhaseModule ∷ ModulePhase → Maybe ImportContext → IO ()
+setModulePhaseModule (ModulePhase _ ref) = writeIORef ref
 
 -- | A root the coordinator asks the loader to evaluate.
 data RootRequest = RootRequest

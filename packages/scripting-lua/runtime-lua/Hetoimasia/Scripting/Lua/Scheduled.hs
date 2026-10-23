@@ -130,7 +130,10 @@
 -- calling a wait operation the application registered ('waitOperation'): its first
 -- argument, an integer, is the number of ticks of a 'WaitLogical' wait or the
 -- nanoseconds of a 'WaitElapsed' one; anything else is read as none and refused as
--- a wait for nothing, so the operation's schema should require one integer.
+-- a wait for nothing, so the operation's schema should require one integer. A
+-- 'WaitElapsed' wait whose count passes a Lua integer (2^63 - 1 nanoseconds, to the
+-- 2^64 - 1 a 'Duration' holds) carries it as two integers, the high and the low 32
+-- bits, each from 0 to 2^32 - 1; the schema of such an operation requires two.
 --
 -- A resumed coroutine receives no value, so what the wait that ended earned (the
 -- tick reached and the logical duration granted since it began, or the time
@@ -294,6 +297,7 @@ module Hetoimasia.Scripting.Lua.Scheduled
 
     -- * Refused waits
   , CallbackWaitRefused (..)
+  , WaitRefusal (..)
   ) where
 
 import Control.Concurrent.STM (STM, atomically, modifyTVar', newTVar, newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
@@ -394,6 +398,7 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , TaskPhase (PhaseEnded)
   , TaskSpec (..)
   , TimerBackend
+  , WaitRefusal (..)
   , admitTask
   , awaitStepsComplete
   , fifoPolicy
@@ -437,6 +442,14 @@ data ScheduledSpec = ScheduledSpec
   , scheduledObserve ∷ SegmentContext → IO ()
     -- ^ Told, on the owner's thread, what each segment is about to be handed. An
     -- exception it raises is a failure of the host.
+  , scheduledRefusedWait ∷ WaitRefusal → IO ()
+    -- ^ Told, on the owner's thread, of each wait the scheduler refused, at the moment the scheduler
+    -- applies the report that asked for it and before anything else runs: before the coroutine it left
+    -- suspended is closed (a close runs the script's own handlers), before any boundary step looks at an
+    -- instance, a provider or the loader, before an accounting wait can be answered, and before another
+    -- segment is chosen. The task still failed and its instance still ends, as they always did. It is for an application whose own bindings check a wait before they suspend and so treat a
+    -- refusal as the engine's fact (a clock that moved between the check and the placement). An
+    -- exception it raises is a failure of the host. The default does nothing.
   , scheduledInstances ∷ Maybe InstanceConfig
     -- ^ Script instances, when the owner hosts any: their bounds, the event
     -- sources it offers and the application's decision about an instance's
@@ -496,6 +509,7 @@ scheduledSpec config worker bounds =
     , scheduledClock = monotonicSource
     , scheduledTimer = systemTimerBackend
     , scheduledObserve = \_ → pure ()
+    , scheduledRefusedWait = \_ → pure ()
     , scheduledInstances = Nothing
     , scheduledLending = Nothing
     , scheduledLeases = Nothing
@@ -679,7 +693,7 @@ startScheduledOwner runtime spec = do
                 -- everything that already ended the owner has done this.
                 (\held → atomically (settleAll held ExitFailed))
           )
-          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) (fmap (\(_, instanceConfig, _) → instanceEscalate instanceConfig) hosted) (scheduledLending spec) (scheduledLeases spec) (scheduledMemberLimit spec) config {vmLifecycle = lifecycleContextOf <$> lifecycle, vmRequests = requestContextOf <$> provider, vmLoader = (\(plan, state) → observing (fmap (\(instances, _, _) → instances) hosted) plan (loadingConfig state plan)) <$> loading})
+          (\_ held → runScheduledOwner stopping held handoff (scheduledObserve spec) (scheduledRefusedWait spec) (fmap (\(_, instanceConfig, _) → instanceEscalate instanceConfig) hosted) (scheduledLending spec) (scheduledLeases spec) (scheduledMemberLimit spec) config {vmLifecycle = lifecycleContextOf <$> lifecycle, vmRequests = requestContextOf <$> provider, vmLoader = (\(plan, state) → observing (fmap (\(instances, _, _) → instances) hosted) plan (loadingConfig state plan)) <$> loading})
   -- Acquisition is masked from the worker's start to the endpoint's handoff, and
   -- only the readiness wait is restored, exactly as for a finite-call owner.
   mask $ \restore → do

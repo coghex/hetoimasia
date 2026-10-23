@@ -1030,6 +1030,12 @@ serviceTurnWith atBoundary scheduler host = do
           (found, applied) ← apply Nothing
           now ← if budget /= Nothing then Just <$> readInstant (schedClock config) else pure Nothing
           pure (found, applied, now)
+      -- A refused wait is told to the host here, as soon as the report is applied and before anything else
+      -- runs: closing the continuation it left (the script's own handlers run), the budget, the boundary and
+      -- any other segment all come after. Nothing is kept for later: the host is called, or it ignores it.
+      forM_ events $ \case
+        WaitRefused refusedTask why → hostRefused host refusedTask why
+        Failed _ _ → pure ()
       let overran = case (after, deadline) of
             (Just now, Just limit) → now > limit
             _ → False

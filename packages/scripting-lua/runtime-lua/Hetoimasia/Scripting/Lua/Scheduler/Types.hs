@@ -217,6 +217,14 @@ data TaskHost v = TaskHost
     -- ^ Close the task's suspended continuation, once. A synchronous exception
     -- is the closing failure: it is retained as evidence beside the settlement
     -- and never discarded, and the task is cancelled all the same.
+  , hostRefused ∷ TaskId → WaitRefusal → IO ()
+    -- ^ Told that a wait was refused, at the moment its segment's report was applied: the task has
+    -- failed and nothing else has happened since. It is called before the continuation the refusal left
+    -- is closed (a close runs the script's own handlers), before the turn's budget is looked at, before
+    -- the boundary that follows and before any other segment, so a host that treats a refusal as fatal
+    -- reports it before anything the script can do. It is a call and not a queue: nothing is kept for a
+    -- host that ignores it. An exception it raises is a failure of the host and propagates out of the
+    -- turn; the close the refusal left owed stays owed, and 'stopScheduler' makes it.
   }
 
 -- | What a wait that ended hands the task on its next segment. Fixed when the
