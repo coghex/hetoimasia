@@ -11,8 +11,8 @@
 # the window integration package, or turns the GLFW package's Vulkan interop
 # component on — so an ordinary `cabal build all`, with either of the other two
 # project files, neither resolves nor links the Vulkan binding. The validation
-# groups `test.vulkan-headless`, `test.vulkan-native` and `test.vulkan-wayland`
-# run through it.
+# groups `test.vulkan-headless`, `test.vulkan-native`, `test.vulkan-wayland` and
+# `test.vulkan-lua-engine-native` run through it.
 #
 # `build` compiles the named components, and nothing else. `test.vulkan-native`
 # and `test.vulkan-wayland` run it as their preparation stage, so the
@@ -22,7 +22,8 @@
 # `test` builds and runs the named test suites. `test.vulkan-headless` runs the
 # native backend's `native-tests` and `shader-tests`, the window integration's
 # `integration-tests`, the samples' suites and the 2D renderer's recorder's
-# `render-2d-vulkan-tests` through it: none of them opens a window,
+# `render-2d-vulkan-tests` and the Lua-first engine's graphics adapter's
+# `lua-engine-graphics-tests` through it: none of them opens a window,
 # acquires a display or a session, or creates a device, and none reads consent.
 # Every argument after `--` reaches every suite as a test option.
 #
@@ -290,7 +291,9 @@ roots = ["tools/vulkan", "tools/native", "tools/display",
          "packages/gpu-vulkan/diagnostics", "packages/gpu-vulkan/model",
          "packages/runtime", "packages/foundation", "packages/math", "tools/test-support",
          "packages/render-2d-vulkan", "packages/render-2d", "packages/render-api",
-         "packages/render-2d-oracle", "packages/asset", "packages/asset-image"]
+         "packages/render-2d-oracle", "packages/asset", "packages/asset-image",
+         "packages/lua-engine-graphics", "packages/lua-engine", "packages/scripting-lua",
+         "packages/content"]
 files = ["cabal.project.vulkan", "cabal.project.common",
          "tools/toolchain/binding.pin", "tools/ci-image/toolchain.pin"]
 

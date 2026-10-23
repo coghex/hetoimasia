@@ -165,9 +165,10 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.macos-confinement` | `cabal test hetoimasia-scripting-lua:macos-confinement-probe --test-show-details=direct` | yes | no | any (component Darwin-only) |
 | `test.glfw-native` | `cabal test glfw-native-tests --test-show-details=direct` | no | no | any |
 | `test.glfw-wayland` | `cabal test glfw-native-tests --test-show-details=direct --test-option=--match --test-option=/GLFW native/on an isolated Wayland session/` | no | no | any |
-| `test.vulkan-headless` | `bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:native-tests hetoimasia-gpu-vulkan-native:test:shader-tests hetoimasia-gpu-vulkan-glfw:test:integration-tests hetoimasia-sample-triangle:test:triangle-tests hetoimasia-sample-sprites:test:sprites-tests hetoimasia-sample-image2d:test:image2d-tests hetoimasia-sample-scene3d:test:scene3d-tests hetoimasia-render-2d-vulkan:test:render-2d-vulkan-tests` | no | no | any |
+| `test.vulkan-headless` | `bash tools/vulkan/run.sh test hetoimasia-gpu-vulkan-native:test:native-tests hetoimasia-gpu-vulkan-native:test:shader-tests hetoimasia-gpu-vulkan-glfw:test:integration-tests hetoimasia-sample-triangle:test:triangle-tests hetoimasia-sample-sprites:test:sprites-tests hetoimasia-sample-image2d:test:image2d-tests hetoimasia-sample-scene3d:test:scene3d-tests hetoimasia-render-2d-vulkan:test:render-2d-vulkan-tests hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests` | no | no | any |
 | `test.vulkan-native` | `bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete` | no | no | any |
 | `test.vulkan-wayland` | `bash tools/display/wayland.sh -- bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete` | no | no | any |
+| `test.vulkan-lua-engine-native` | `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete` | no | no | any |
 
 *Platforms* is the group's `platforms` declaration: *any* is the ordinary group,
 which declares nothing and is applicable everywhere. A plan taken on a platform
@@ -567,6 +568,38 @@ resume ([gpu_backend.md](gpu_backend.md#pacing-suspension-and-fairness)),
 which [#357](https://github.com/coghex/hetoimasia/issues/357) added. It declares no `platforms`,
 as `test.glfw-wayland` does not: the compositor exists only on Linux, and no
 worker runs it elsewhere. `test.vulkan-native` is unchanged.
+
+`test.vulkan-lua-engine-native` is the Lua-first engine's graphics adapter on a
+real device with no window (LFE-17, #532). `tools/vulkan/run.sh native` runs one
+component, and the window integration's suite is another component, so the
+adapter's real-device suite has a group of its own:
+
+```json
+"command": ["bash", "tools/vulkan/run.sh", "native", "hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests", "--", "--complete"],
+"preparation": {"command": ["bash", "tools/vulkan/run.sh", "build", "hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests"], "timeout_seconds": 3600},
+"runner": "display",
+"timeout_seconds": 30
+```
+
+It follows the native-suite rules (GLFW's session on the process main thread with
+Hspec on another; the ambient Vulkan environment cleared; the diagnostic capture's
+verdict after the last teardown; the run refuses to start without consent), with
+the consent, environment and qualified-loader checks reimplemented in the
+package because the repository forbids importing another component's spec
+helpers. It opens no window: its session is started without a surface, and on
+macOS the consent is the one the other native suites take, supplied on the run's
+own command. Its inputs name the adapter, the CPU Lua-engine closure it
+implements a port of (`packages/lua-engine/`, `packages/scripting-lua/`,
+`packages/content/`), the renderer, the window integration and the native
+backend, so a change to any of them selects it. `--complete` runs the whole
+profile with no configuration reading, as the window integration's suite does,
+and the run writes its evidence record, `lua-engine-graphics-native.md` — exact
+revision, the source digest `run.sh` computes (whose roots include the adapter and
+its CPU closure), the command, the platform and driver manifest, the validation
+outcome and the native accounting each example measured — into the group's evidence
+directory. The CPU Lua-engine, content and codec packages stay free of Vulkan and
+GLFW dependencies: the group, like the headless group's
+`lua-engine-graphics-tests`, is reached through `cabal.project.vulkan` alone.
 
 Every validation-enabled instance either group creates enables the Khronos
 layer's **synchronization validation** through its own create info
@@ -973,7 +1006,7 @@ python3 tools/validation/plan.py --base origin/master --head HEAD \
   --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.lua-engine,test.vulkan,test.vulkan-diagnostics,test.math,test.content,test.asset-image,test.render-api,test.render-2d,test.render-2d-oracle,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native,test.glfw-wayland \
-  --worker vulkan=cpu+display:test.vulkan-headless,test.vulkan-native,test.vulkan-wayland
+  --worker vulkan=cpu+display:test.vulkan-headless,test.vulkan-native,test.vulkan-wayland,test.vulkan-lua-engine-native
 ```
 
 Before producing a plan, the planner refuses — naming every problem — a worker
@@ -1138,7 +1171,7 @@ class to every execution:
 | `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.scripting-lua-runtime`, `test.lua-engine`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.content`, `test.asset-image`, `test.render-api`, `test.render-2d`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native`, `test.glfw-wayland` |
-| `vulkan` | `cpu`, `display` | `test.vulkan-headless`, `test.vulkan-native`, `test.vulkan-wayland` |
+| `vulkan` | `cpu`, `display` | `test.vulkan-headless`, `test.vulkan-native`, `test.vulkan-wayland`, `test.vulkan-lua-engine-native` |
 
 A worker runs every group it still has to execute and continues past a failure,
 so the aggregate sees a receipt for each of them rather than inferring the rest
