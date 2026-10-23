@@ -10,6 +10,7 @@ import qualified Data.Text.Encoding as Text
 import Data.IORef (newIORef, readIORef)
 import Hetoimasia.Foundation.Log (LogEntry (entryComponent, entryMessage), componentText)
 import Hetoimasia.Scripting.Lua.Runner
+import Hetoimasia.Scripting.Lua.Output (authoredLines, authoredLinesWith, renderFunctionLines, renderFunctionLinesWith)
 import Hetoimasia.Scripting.Lua.Runner.Internal (outputLines)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldContain, shouldNotContain, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Runner.Support
@@ -168,6 +169,27 @@ spec = describe "output" $ do
         written lines' `shouldSatisfy` (<= outputCallLimit)
         written lines' `shouldSatisfy` (> 0)
 
+  describe "the shared bounded output (LFE-12)" $ do
+    it "is the runner's own output when it takes no prefix, so that nothing the runner wrote changes" $
+      forM_ ["a\nb", "tab\there\1ctrl\0nul", "bad \255\254 bytes", "", Text.encodeUtf8 (Text.replicate 5000 "\8364")] $ \bytes →
+        authoredLines "" bytes `shouldBe` outputLines bytes
+    it "gives every line the prefix, makes the prefix safe too, and counts it, the line ends and the marker in the bound" $ do
+      authoredLines "w: " "one\ntwo" `shouldBe` ["w: one", "w: two"]
+      authoredLines "bad\1: " "x" `shouldBe` ["bad\\x01: x"]
+      let cut = authoredLines "prefix: " (Text.encodeUtf8 (Text.replicate 5000 "y"))
+      bytesOf cut `shouldBe` outputCallLimit
+      cut `shouldSatisfy` all (Text.isPrefixOf "prefix: ")
+      last cut `shouldSatisfy` Text.isSuffixOf truncationMarker
+    it "bounds a call to a smaller limit when asked to, as a validated smaller profile does" $ do
+      let ls = authoredLinesWith 100 "p: " (Text.encodeUtf8 (Text.replicate 500 "z"))
+      bytesOf ls `shouldBe` 100
+      last ls `shouldSatisfy` Text.isSuffixOf truncationMarker
+      authoredLinesWith 100 "" "short" `shouldBe` ["short"]
+    it "defines the Lua that cuts a call to the same bound before it crosses, with the marker counted" $ do
+      let source = Text.unlines renderFunctionLines
+      source `shouldSatisfy` Text.isInfixOf (Text.pack (show outputCallLimit))
+      Text.unlines (renderFunctionLinesWith 64) `shouldSatisfy` Text.isInfixOf "local limit, marker = 64, "
+
   it "keeps the runner's own diagnostics in the logger under one component, and script output, tables and reports out of it" $ bounded $ do
     fixture ← newRFixture
     entries ← newIORef []
@@ -191,3 +213,7 @@ scriptLines = go
 
 forM' ∷ [a] → (a → IO ()) → IO ()
 forM' items body = mapM_ body items
+
+-- | The bytes a call wrote: each line and the line end that follows it.
+bytesOf ∷ [Text] → Int
+bytesOf ls = sum [ByteString.length (Text.encodeUtf8 line) + 1 | line ← ls]

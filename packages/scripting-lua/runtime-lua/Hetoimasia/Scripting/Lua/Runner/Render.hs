@@ -33,6 +33,7 @@ module Hetoimasia.Scripting.Lua.Runner.Render
 
     -- * Script output
   , outputLines
+  , boundLines
   ) where
 
 import Data.ByteString (ByteString)

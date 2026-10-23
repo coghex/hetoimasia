@@ -130,7 +130,10 @@
 -- calling a wait operation the application registered ('waitOperation'): its first
 -- argument, an integer, is the number of ticks of a 'WaitLogical' wait or the
 -- nanoseconds of a 'WaitElapsed' one; anything else is read as none and refused as
--- a wait for nothing, so the operation's schema should require one integer.
+-- a wait for nothing, so the operation's schema should require one integer. A
+-- 'WaitElapsed' wait whose count passes a Lua integer (2^63 - 1 nanoseconds, to the
+-- 2^64 - 1 a 'Duration' holds) carries it as two integers, the high and the low 32
+-- bits, each from 0 to 2^32 - 1; the schema of such an operation requires two.
 --
 -- A resumed coroutine receives no value, so what the wait that ended earned (the
 -- tick reached and the logical duration granted since it began, or the time

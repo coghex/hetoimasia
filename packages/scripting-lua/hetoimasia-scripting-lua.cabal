@@ -215,6 +215,7 @@ library runtime-lua
         Hetoimasia.Scripting.Lua.Instance
         Hetoimasia.Scripting.Lua.Lifecycle
         Hetoimasia.Scripting.Lua.Loading
+        Hetoimasia.Scripting.Lua.Output
         Hetoimasia.Scripting.Lua.Scheduled
         Hetoimasia.Scripting.Lua.Scheduler
     other-modules:

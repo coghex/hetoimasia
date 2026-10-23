@@ -193,6 +193,7 @@ module Hetoimasia.Scripting.Lua.Owner
   , ModulePhase
   , newModulePhase
   , modulePhaseActive
+  , modulePhaseModule
   , RootRequest (..)
   , RootOrder (..)
   , arrivalOrder
@@ -332,6 +333,7 @@ import Hetoimasia.Scripting.Lua.Internal.LoaderTypes
   , arrivalOrder
   , loaderConfig
   , modulePhaseActive
+  , modulePhaseModule
   , newModulePhase
   )
 import Hetoimasia.Scripting.Lua.Internal.ExportTypes

@@ -9,13 +9,14 @@
 -- own, and the real M1 rule is tested where it lives.
 module Test.LuaRuntime.Instance.Behavior (spec) where
 
-import Control.Exception (ExceptionWithContext (ExceptionWithContext))
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), throwIO)
 import Control.Monad (forM_, void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as Char8
 import Data.Text (Text)
 import qualified Data.Text as Text
+import Data.IORef (atomicModifyIORef')
 import Data.Word (Word64)
 import qualified Data.Text.Encoding as Text
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
@@ -25,11 +26,11 @@ import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VNil, VRecord, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
-import Test.LuaRuntime.Scheduled.Support (SFixture (sfTimer), awaitEffect, awaitRegistrations, defaultSchedulerBounds, setClock)
+import Test.LuaRuntime.Scheduled.Support (SFixture (sfLog, sfTimer), awaitEffect, awaitRegistrations, defaultSchedulerBounds, setClock)
 import Test.LuaRuntime.Scheduler.Support (fireReg, liveRegs, nanoseconds)
 import Hetoimasia.Scripting.Lua.Runtime (CallFault (BoundaryFailed, ModuleNotLoaded), Discard (Discard), ExitKind (ExitFailed), Progress (Started))
 import Test.LuaRuntime.Scheduled.Support (awaitScheduledTerminal)
-import Test.LuaRuntime.Support (Gated (..), bounded, brokenIs, expectFatal, failExample, requiredPolicy, withBoundaryOpening)
+import Test.LuaRuntime.Support (Broken (Broken), Gated (..), bounded, brokenIs, expectFatal, failExample, requiredPolicy, withBoundaryOpening)
 
 -- Building exports ------------------------------------------------------------------
 
@@ -87,6 +88,18 @@ withExports exports limits body = do
   withBoundaryOpening [openAllGates fixture] $ \control runtime → do
     let base = instanceSpec fixture "behavior" [] (testConfig instanceBounds') requiredPolicy defaultSchedulerBounds
         spec' = base {scheduledVm = (scheduledVm base) {vmExports = exports, vmExportLimits = limits}}
+    owner ← startWith fixture runtime spec'
+    body fixture control owner
+
+-- | An owner whose instances tell the log of every segment of a hook, over a body.
+withNotified ∷ [ExportSource] → (IFixture → RuntimeControl → ScheduledOwner → IO a) → IO a
+withNotified exports body = do
+  fixture ← newIFixture
+  withBoundaryOpening [openAllGates fixture] $ \control runtime → do
+    let told found = atomicModifyIORef' (sfLog (sf fixture)) (\held → (("segment " <> Text.pack (show (instanceLocal found))) : held, ()))
+        config = (testConfig instanceBounds') {instanceOnSegment = told}
+        base = instanceSpec fixture "behavior" [] config requiredPolicy defaultSchedulerBounds
+        spec' = base {scheduledVm = (scheduledVm base) {vmExports = exports, vmExportLimits = defaultExportLimits}}
     owner ← startWith fixture runtime spec'
     body fixture control owner
 
@@ -273,6 +286,50 @@ spec = describe "M1 behavior instances" $ do
           awaitPhase fixture owner "n" Active
           grantEach control owner [1]
           logged fixture >>= (`shouldBe` ["api=seen"])
+
+  describe "the notification of a hook's segments" $ do
+    it "tells the application whose segment begins before the Lua of an init, of an update's first segment, of each segment a wait resumes and of a shutdown" $ bounded $
+      withNotified
+        [ exportOf
+            "waiter"
+            [ "return { gameplay = {"
+            , "  every_ticks = 1,"
+            , "  init = function(self, api) " <> record <> "('init') end,"
+            , "  update = function(self, dt) " <> record <> "('update') sched.wait_ticks(1) " <> record <> "('resumed') end,"
+            , "  shutdown = function(self, reason) " <> record <> "('shutdown') end,"
+            , "} }"
+            ]
+        ]
+        $ \fixture control owner → do
+          _ ← admitBehavior fixture owner "w" (requestFor "waiter" "gameplay" (facadeNamed "w") logicalRule)
+          awaitPhase fixture owner "w" Active
+          logged fixture >>= (`shouldBe` ["segment 1", "init"])
+          grantEach control owner [1]
+          logged fixture >>= (`shouldBe` ["segment 1", "init", "segment 1", "update"])
+          grantEach control owner [1]
+          logged fixture >>= (`shouldBe` ["segment 1", "init", "segment 1", "update", "segment 1", "resumed"])
+          _ ← askControl fixture owner "w" InstanceStop
+          _ ← awaitSettled fixture "w"
+          logged fixture >>= (`shouldBe` ["segment 1", "init", "segment 1", "update", "segment 1", "resumed", "segment 1", "shutdown"])
+    it "tells it once when an instance begins initializing even if its behavior has no init" $ bounded $
+      withNotified
+        [exportOf "bare" ["return { gameplay = { every_ticks = 1, update = function(self, dt) " <> record <> "('update') end } }"]]
+        $ \fixture _ owner → do
+          _ ← admitBehavior fixture owner "b" (requestFor "bare" "gameplay" (facadeNamed "b") logicalRule)
+          awaitPhase fixture owner "b" Active
+          logged fixture >>= (`shouldBe` ["segment 1"])
+
+    it "treats what the notification raises as a failure of the host: the owner ends with it, and the hook it was told of never runs" $ bounded $ do
+      fixture ← newIFixture
+      ExceptionWithContext _ raised ← expectFatal $ \control runtime → do
+        let config = (testConfig instanceBounds') {instanceOnSegment = \_ → throwIO (Broken "notification")}
+            base = instanceSpec fixture "behavior" [] config requiredPolicy defaultSchedulerBounds
+            spec' = base {scheduledVm = (scheduledVm base) {vmExports = [exportOf "bare" ["return { gameplay = { init = function() " <> record <> "('init') end } }"]], vmExportLimits = defaultExportLimits}}
+        owner ← startWith fixture runtime spec'
+        _ ← admitBehavior fixture owner "a" (requestFor "bare" "gameplay" (facadeNamed "a") logicalRule)
+        awaitScheduledTerminal control owner
+      raised `shouldSatisfy` brokenIs "notification"
+      logged fixture >>= (`shouldBe` [])
 
   describe "facades" $ do
     it "injects a facade whose closures are bound to its own instance, built per instance by an export module's function, the same table in init and self.api" $ bounded $

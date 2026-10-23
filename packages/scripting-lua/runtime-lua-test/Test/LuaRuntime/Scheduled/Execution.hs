@@ -137,6 +137,40 @@ spec = describe "tasks run as coroutines on a scheduled owner" $ do
         effects fixture >>= (`shouldBe` ["s before", "s after 2:500:0"])
         retireScheduled owner
 
+  describe "elapsed time past a Lua integer" $ do
+    it "waits for a count of nanoseconds given as its two 32-bit halves, through the whole Word64 range, exactly" $ bounded $ do
+      fixture ← newSFixture
+      withBoundary $ \_ runtime → do
+        setClock fixture 1000
+        owner ← startScheduled fixture runtime (scheduled fixture "wide" requiredPolicy defaultSchedulerBounds)
+        -- 2^63 + 5 nanoseconds: more than a Lua integer holds, within the 2^64 - 1 a duration holds.
+        ticket ← admitTask' fixture owner "w" (request "sleep_wide" [VText "w", VInteger 2147483648, VInteger 5] OrdinaryClass OneShot (Just "w"))
+        awaitRegistrations fixture 1
+        setClock fixture (1000 + 9223372036854775808 + 4)
+        liveRegs (sfTimer fixture) >>= mapM_ fireReg
+        awaitRegistrations fixture 2
+        effects fixture >>= (`shouldBe` ["w before"])
+        setClock fixture (1000 + 9223372036854775808 + 5)
+        liveRegs (sfTimer fixture) >>= mapM_ fireReg
+        _ ← outcomeOf ticket
+        effects fixture >>= (`shouldBe` ["w before", "w after 2"])
+        retireScheduled owner
+
+    it "refuses a pair that is not two words as a wait for nothing, and a deadline past the clock's range as a refused wait, never as a wrapped one" $ bounded $ do
+      fixture ← newSFixture
+      withBoundary $ \_ runtime → do
+        setClock fixture 18446744073709551615
+        owner ← startScheduled fixture runtime (scheduled fixture "range" requiredPolicy defaultSchedulerBounds)
+        past ← admitTask' fixture owner "p" (request "sleep_wide" [VText "p", VInteger 0, VInteger 1] OrdinaryClass OneShot (Just "p"))
+        outcomeOf past >>= \settled → case settled of
+          SettledRefused _ → pure ()
+          other → failExample ("a wait past the clock's range must be refused, found " <> show other)
+        zero ← admitTask' fixture owner "z" (request "sleep_wide" [VText "z", VInteger 0, VInteger 0] OrdinaryClass OneShot (Just "z"))
+        outcomeOf zero >>= \settled → case settled of
+          SettledRefused _ → pure ()
+          other → failExample ("a wait for nothing must be refused, found " <> show other)
+        retireScheduled owner
+
   describe "budgets" $ do
     it "ends a turn at an expired budget without preempting a segment or reordering tasks, and attributes the overruns" $ bounded $ do
       let workload bounds = do

@@ -702,7 +702,7 @@ drive loader state entry settled = loop
       void (takeSuspension vm)
       modifyState loader (\s → s {lsRunning = Just (Running thread), lsNoted = Nothing})
       segment ←
-        phased (resumeLoaderSegment state (frameTaskSlot frame) (frameModuleSlot frame) how)
+        phased frame (resumeLoaderSegment state (frameTaskSlot frame) (frameModuleSlot frame) how)
           `onException` leaveSegment
       leaveSegment
       noted ← lsNoted <$> readState loader
@@ -735,8 +735,8 @@ drive loader state entry settled = loop
 
     -- Closing a module's coroutine runs its pending to-be-closed variables, which are the
     -- module's own code: the application's precondition holds for them as for its top level.
-    phased ∷ IO x → IO x
-    phased = inModulePhase config
+    phased ∷ Frame → IO x → IO x
+    phased frame = inModulePhase config (Just (ImportContext (frameIdentity frame) (frameLabel frame)))
 
     -- The frame as the chain holds it now: an import may have condemned it.
     topFrame frame = do
@@ -749,14 +749,14 @@ drive loader state entry settled = loop
       | Just fault ← refusal = do
           -- The module called a binding and was refused; the coroutine is closed wherever it
           -- stands, finished or suspended, and the module fails with the refusal.
-          closing ← phased (closeAnchored host state entry (frameTaskSlot frame))
+          closing ← phased frame (closeAnchored host state entry (frameTaskSlot frame))
           failFrame frame (fromMaybe fault latched) closing
       | loaderStatus segment /= LUA_OK = do
           -- The protected call itself failed: allocation failed making the answer or
           -- publishing the export table. A module failure of its own kind.
           value ← renderFailure state entry
           lua_settop state entry
-          closing ← phased (closeAnchored host state entry (frameTaskSlot frame))
+          closing ← phased frame (closeAnchored host state entry (frameTaskSlot frame))
           effect ← if loaderResumed segment then effectNow vm else pure NoEffect
           when (loaderStored segment) (void (releaseExport state (frameModuleSlot frame)))
           failFrame frame (fromMaybe (faultOfModule loader (frameLabel frame) (ScriptFailed (classify (loaderStatus segment)) value) effect) latched) closing
@@ -770,7 +770,7 @@ drive loader state entry settled = loop
               -- A coroutine suspended to no one: the script called coroutine.yield at
               -- the top level of a module, which would never be resumed.
               lua_settop state entry
-              closing ← phased (closeAnchored host state entry (frameTaskSlot frame))
+              closing ← phased frame (closeAnchored host state entry (frameTaskSlot frame))
               effect ← effectNow vm
               failFrame frame (fromMaybe (faultOfModule loader (frameLabel frame) UnscheduledYield effect) latched) closing
           SegmentCompleted → do
@@ -789,7 +789,7 @@ drive loader state entry settled = loop
           SegmentFailed → do
             -- The coroutine is closed apart from the segment, so what closing it raised
             -- is told from what the segment did.
-            cleanup ← phased (cleanUp host state entry (frameTaskSlot frame))
+            cleanup ← phased frame (cleanUp host state entry (frameTaskSlot frame))
             value ← renderFailure state entry
             lua_settop state entry
             effect ← effectNow vm
@@ -797,7 +797,7 @@ drive loader state entry settled = loop
             failFrame frame (fromMaybe natural latched) (cleanupEvidence cleanup)
           _ → do
             lua_settop state entry
-            closing ← phased (closeAnchored host state entry (frameTaskSlot frame))
+            closing ← phased frame (closeAnchored host state entry (frameTaskSlot frame))
             effect ← effectNow vm
             failFrame frame (fromMaybe (faultOfModule loader (frameLabel frame) (TaskRefused TaskNotSuspended) effect) latched) closing
 
@@ -834,13 +834,15 @@ faultOfModuleCall (ExceptionWithContext context exception) = case fromException 
 -- | Run an action with the application's module phase set, and put it back as it was
 -- however the action ends: the module's code runs under it, its top level and the
 -- to-be-closed variables closing its coroutine run, alike.
-inModulePhase ∷ LoaderConfig → IO a → IO a
-inModulePhase config action = case loaderPhase config of
+inModulePhase ∷ LoaderConfig → Maybe ImportContext → IO a → IO a
+inModulePhase config context action = case loaderPhase config of
   Nothing → action
   Just phase → do
     before ← modulePhaseActive phase
+    beforeModule ← modulePhaseModule phase
     setModulePhase phase True
-    action `finally` setModulePhase phase before
+    setModulePhaseModule phase context
+    action `finally` (setModulePhase phase before >> setModulePhaseModule phase beforeModule)
 
 -- | Close every frame of the active chain, top first, recording each identity as
 -- abandoned, and answer the failures of closing them.
@@ -854,7 +856,7 @@ closeChain loader state entry recorded = do
   s ← readState loader
   evidence ← forM (lsChain s) $ \frame → do
     setRunContext (vmOf loader) (moduleRefName (sourceOf (frameLabel frame)), "export", Nothing)
-    closing ← inModulePhase (loaderSettings loader) (closeAnchored (loaderHost loader) state entry (frameTaskSlot frame))
+    closing ← inModulePhase (loaderSettings loader) (Just (ImportContext (frameIdentity frame) (frameLabel frame))) (closeAnchored (loaderHost loader) state entry (frameTaskSlot frame))
     noteTaskEnded (vmOf loader) (frameTaskSlot frame)
     setRecord loader (frameIdentity frame) (recorded (frameLabel frame))
     pure closing

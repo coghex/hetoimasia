@@ -305,6 +305,7 @@ begin internals runtime config = do
                     , instanceTickDuration = runnerTick config
                     , instanceControlAdmission = if tickVm then AdmitLogically else AdmitOnArrival
                     , instanceEscalate = \_ → pure Isolate
+                    , instanceOnSegment = \_ → pure ()
                     }
             , scheduledLifecycle = Just (lifecycleGrant [GrantTarget GrantedSelf [PermitInspect, PermitControl] (if tickVm then Just assign else Nothing)])
             , scheduledRequests =
