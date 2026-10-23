@@ -618,7 +618,10 @@ withOwner env info owned coordinator holder facade body = mask $ \restore → do
           untilStopped interruptions =
             tryWithContext @SomeException stopOwner >>= \case
               Right () → pure (reverse interruptions)
-              Left interruption → untilStopped (interruption : interruptions)
+              -- only an interruption is made good by asking again; a failure of the stop itself is kept and not repeated
+              Left interruption
+                | isAsync interruption → untilStopped (interruption : interruptions)
+                | otherwise → pure (reverse (interruption : interruptions))
       outcome ← tryWithContext @SomeException . restore $ do
         atomically (writeTVar holder (Just endpoint))
         loader ← maybe (throwIO (SessionRefused "the owner has no loader endpoint")) pure (scheduledLoaderEndpoint owner)
@@ -664,7 +667,9 @@ awaitDrainedThrough restore coordinator = go []
     go interruptions =
       tryWithContext @SomeException (restore (atomically (awaitDrained coordinator))) >>= \case
         Right () → pure (reverse interruptions)
-        Left interruption → go (interruption : interruptions)
+        Left interruption
+          | isAsync interruption → go (interruption : interruptions)
+          | otherwise → pure (reverse (interruption : interruptions))
 
 -- | Wait for the owner's worker to have ended, whatever supervision has latched: its raw completion.
 -- Interruptions are recorded in order and the wait goes on.
