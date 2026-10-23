@@ -6,13 +6,14 @@
 module Test.LuaEngine.Modules.Limits (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, tryPutMVar)
-import Control.Exception (finally)
+import Control.Exception (finally, try)
 import Control.Concurrent.STM (atomically)
 import Control.Monad (forM_, void)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.ByteString.Char8 as Char8
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (CountLimit (ModuleChainDepth, ModuleIdentitiesPerVm, RequestsPerInstance), Profile)
+import Hetoimasia.Scripting.Lua.Admission (Credit (..), CreditEnd (..), CreditRefused (..))
 import Hetoimasia.Scripting.Lua.Loading (LoaderHooks (..), LoaderPlan (..))
 import Hetoimasia.Scripting.Lua.Provider (RequestEndpoint (..))
 import Hetoimasia.Scripting.Lua.Value (Value (VText))
@@ -379,6 +380,30 @@ refusals = describe "refusals told apart by what can change" $ do
         line ← lineStartingWith session "x ustart k1 error"
         line `shouldSatisfy` Text.isInfixOf "module limit"
         line `shouldNotSatisfy` Text.isInfixOf "busy"
+        counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (3, 0)
+
+  it "tells the identity credit's three answers apart when asked directly: room, room held only by reservations (busy), full for good (refused)" $
+    withSession tiny (2, 8) realReader layout $ \session _ runtime →
+      withVm session runtime "ui" (defaultOptions OnArrival) $ \vm → do
+        mapM_ (\path → bootNow session vm path >>= awaitBootOutcome >>= (`shouldBe` BootReady)) ["i2.lua", "i3.lua"]
+        let credit path = identityCredit (vmCoordinator vm) (moduleIdentity (key' session path))
+            ask path = try @CreditRefused (atomically (creditReserve (credit path)))
+        -- One place is left, and the first request takes it: its reservation holds it, which can be given back.
+        ask "i1.lua" >>= (`shouldBe` Right True)
+        counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (2, 1)
+        -- Another new identity finds the room held only by a reservation: busy, not refused, nothing taken.
+        ask "i4.lua" >>= (`shouldBe` Right False)
+        counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (2, 1)
+        -- The reservation is given back, and the same ask now has room.
+        atomically (creditRelease (credit "i1.lua") CreditUnused)
+        counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (2, 0)
+        ask "i4.lua" >>= (`shouldBe` Right True)
+        atomically (creditRelease (credit "i4.lua") CreditUnused)
+        -- Once the last place is a permanent entry, the answer is final.
+        bootNow session vm "i1.lua" >>= awaitBootOutcome >>= (`shouldBe` BootReady)
+        ask "i5.lua" >>= \answer → answer `shouldSatisfy` either (\(CreditRefused why) → Text.isInfixOf "module limit" why) (const False)
+        -- An identity the VM holds needs no place, full or not.
+        ask "i1.lua" >>= (`shouldBe` Right True)
         counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (3, 0)
 
   it "refuses a boot load at a full cache for good, and is busy only while boot loads are unsettled, with nothing taken either way" $

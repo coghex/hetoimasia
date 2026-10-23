@@ -21,6 +21,7 @@ module Hetoimasia.LuaEngine.Modules.Wiring
   , moduleKey
   , moduleArguments
   , moduleAsk
+  , identityCredit
   , startModule
   , moduleArgumentCheck
     -- * Boot loads
@@ -339,6 +340,11 @@ moduleAsk c request = do
     key = requestedKey request
     identity = moduleIdentity key
 
+-- | The credit a request for a new identity reserves with its admission: a place among the VM's permanent
+-- identities. 'creditReserve' answers 'True' with the place held (or nothing to hold, for an identity the VM
+-- already holds), 'False' when the room is held only by other admissions' reservations that can still be given
+-- back (busy), and raises 'CreditRefused' when the VM's permanent entries fill the cache or the coordinator has
+-- closed (final). Public so that the decision can be asked directly, in either order, without a request.
 identityCredit ∷ Coordinator → ExportIdentity → Credit
 identityCredit c identity =
   Credit

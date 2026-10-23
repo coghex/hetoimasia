@@ -101,6 +101,7 @@ module Hetoimasia.LuaEngine.Modules
   , moduleArguments
   , moduleAsk
   , startModule
+  , identityCredit
   , moduleArgumentCheck
   , moduleCodes
 
