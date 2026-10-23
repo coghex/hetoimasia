@@ -70,7 +70,8 @@ cabal test hetoimasia-tests --test-show-details=direct
   behaviour it asserts. `lua-host-tests`
   (`packages/scripting-lua/test/`) owns two components: the bridge's own
   examples (the module loader's, LFE-9, among them: `--test-options='--match "the module loader"'`, `"the loader's"`,
-  `"stopping the loader"` and `"failures of the engine"`), and `Protocol` (`Test.Lua.Protocol.Spec`), the pure task,
+  `"stopping the loader"` and `"failures of the engine"`; LFE-11's placed roots, `"placed roots"`, and the export table crossing
+  into Lua by reference, `"an export table crossing"`), and `Protocol` (`Test.Lua.Protocol.Spec`), the pure task,
   admission, request, subscription, epoch, failure, and stop model in the
   package's private `model` sublibrary. Select the model's examples with
   `--test-options='--match Protocol'`; they construct no interpreter, and the
@@ -84,7 +85,8 @@ cabal test hetoimasia-tests --test-show-details=direct
   adapter's examples: readiness, identity, submission and its bounds,
   settlement, host failures, stop, independent owners, and the refused reply
   wait from a Lua callback, with real VMs under a real `withSupervision`, the module loader hosted on a scheduled
-  owner (`Test.LuaRuntime.Loading`, `--match 'module loader on a scheduled owner'`, LFE-9), plus
+  owner (`Test.LuaRuntime.Loading`, `--match 'module loader on a scheduled owner'`, LFE-9; its `placed roots` examples are
+  LFE-11's), the scheduler's `tickQuietBefore` (`Test.LuaRuntime.Scheduler.Requests`), plus
   the adapter's dependency closure, which needs no VM. It selects and fails on
   an empty selection the same way.
   `lua-engine-tests` (`packages/lua-engine/test/`, composed by `Test.LuaEngine.Spec`,
@@ -97,7 +99,10 @@ cabal test hetoimasia-tests --test-show-details=direct
   behavior selection and the export-module and loader ceilings the profile gives a VM, and the M1 request adapter
   (LFE-7, `Test.LuaEngine.Request.*`): the busy record, the exact `ready`/`take`/`cancel`/`wait` records, handles
   and phases, the profile's limits, a texture lease, and required and optional failure, over real Lua instances on
-  a supervised owner with controlled fake providers. It starts no window or GPU; its one example of the Lua host's
+  a supervised owner with controlled fake providers. The owned texture pipeline (LFE-16, `Test.LuaEngine.Texture.*`) is
+  covered over a real content root, inventory and shared read pool, the real bounded PNG decoder and a gated fake upload
+  backend: the admission banks, the lanes, workers and queues, the stage-by-stage charges, cancellation at every stage,
+  failures, independent loads and release, the close and drain, and a separately compiled public client, and the module coordinator (LFE-11, `Test.LuaEngine.Modules.*`, `--match Modules`): real modules through real VMs on supervised scheduled owners over a real content root, inventory and read pool, with the production reader behind gates and nothing slept, and a separately compiled client. It starts no window or GPU; its one example of the Lua host's
   module loader under the fixed profile (`Test.LuaEngine.Loader`, LFE-9) starts an in-process Lua owner. A new
   manifest or profile example belongs there, in the component spec that owns it.
   `lua-runtime-tests` also owns the host's opt-in admission (`Test.LuaRuntime.Admission.*`)
