@@ -61,10 +61,10 @@ stopping = describe "stopping a VM" $ do
           -- again; the other VM's own stay with it.
           awaitDrained' vm
           readsStarted (ssProbe session) >>= (`shouldBe` 2)
-          counts vm >>= \c → (countStopped c, countOrdinary c, countPoolHeld c, countPhase c) `shouldBe` (1, 0, 0, Closed)
+          counts vm >>= \c → (jobsStopped c, bytesOrdinary c, slotsHeld c, phaseNow c) `shouldBe` (1, 0, 0, Closed)
           vmDiagnostics vm >>= \d → rdOutstanding d `shouldBe` 0
           openEverything session
-          awaitCounts other (\c → countReady c == 2)
+          awaitCounts other (\c → jobsReady c == 2)
           evalsOf session >>= (`shouldBe` [])
 
   it "lets a read a worker holds finish, drops its bytes and returns its slot, and never evaluates it" $
@@ -77,10 +77,10 @@ stopping = describe "stopping a VM" $ do
         awaitStarted (ssProbe session) 1
         retireVm control vm
         -- The read is in a worker's hands: it is still charged, and the slot is still held.
-        counts vm >>= \c → (countPhase c, countOrdinary c > 0, countPoolHeld c) `shouldBe` (Closed, True, 1)
+        counts vm >>= \c → (phaseNow c, bytesOrdinary c > 0, slotsHeld c) `shouldBe` (Closed, True, 1)
         openGate (ssProbe session) "a.lua"
         awaitDrained' vm
-        counts vm >>= \c → (countOrdinary c, countPoolHeld c, countReady c, countStopped c) `shouldBe` (0, 0, 0, 1)
+        counts vm >>= \c → (bytesOrdinary c, slotsHeld c, jobsReady c, jobsStopped c) `shouldBe` (0, 0, 0, 1)
         evalsOf session >>= (`shouldBe` [])
         poolReading session >>= \reading → statusReserved reading `shouldBe` 0
 
@@ -93,24 +93,24 @@ stopping = describe "stopping a VM" $ do
         command session vm "x" "start" "k2" [] (Just (fetch "s2.lua"))
         awaitNote session "x start k2 started"
         awaitStarted (ssProbe session) 1
-        counts vm >>= \c → countDeferred c `shouldBe` 1
+        counts vm >>= \c → readsDeferred c `shouldBe` 1
         retireVm control vm
         openGate (ssProbe session) "s1.lua"
         awaitDrained' vm
         readsStarted (ssProbe session) >>= (`shouldBe` 1)
-        counts vm >>= \c → (countOrdinary c, countPoolHeld c) `shouldBe` (0, 0)
+        counts vm >>= \c → (bytesOrdinary c, slotsHeld c) `shouldBe` (0, 0)
 
   it "is idempotent: closing and retiring again change nothing and raise nothing, a ready module stays readable and nothing new is admitted" $
     withSession fixedM1Profile (2, 8) realReader layout $ \session control runtime →
       withVm session runtime "stopping" (defaultOptions OnArrival) $ \vm → do
         admitDriver session vm "x"
         command session vm "x" "start" "k1" [] (Just (fetch "a.lua"))
-        awaitCounts vm (\c → countReady c == 1)
+        awaitCounts vm (\c → jobsReady c == 1)
         retireVm control vm
         awaitDrained' vm
         forM_ [1 .. 3 ∷ Int] (const (closeModuleCoordinator (vmCoordinator vm)))
         retireVm control vm
-        counts vm >>= \c → (countReady c, countPhase c, countPoolHeld c) `shouldBe` (1, Closed, 0)
+        counts vm >>= \c → (jobsReady c, phaseNow c, slotsHeld c) `shouldBe` (1, Closed, 0)
         found ← atomically (lookupImmediate (vmCoordinator vm) (moduleIdentity (key' session "a.lua")))
         case found of
           ImmediateReady _ → pure ()
@@ -129,7 +129,7 @@ stopping = describe "stopping a VM" $ do
         releaseGate session "m"
         void (awaitEnd control vm)
         awaitDrained' vm
-        counts vm >>= \c → (countOrdinary c, countPoolHeld c, countWaiters c) `shouldBe` (0, 0, 0)
+        counts vm >>= \c → (bytesOrdinary c, slotsHeld c, waitersHeld c) `shouldBe` (0, 0, 0)
         vmDiagnostics vm >>= \d → rdOutstanding d `shouldBe` 0
   where
     smallLayout =
@@ -150,13 +150,13 @@ peers = describe "peers" $
           command session first "x" "start" "k1" [] (Just (fetch "a.lua"))
           command session second "y" "start" "k2" [] (Just (fetch "b.lua"))
           awaitNote session "y start k2 started"
-          awaitCounts first (\c → countReady c == 1)
+          awaitCounts first (\c → jobsReady c == 1)
           retireVm control first
           awaitDrained' first
           -- The first has gone; the second's job is untouched and finishes.
-          counts second >>= \c → (countLive c, countPhase c) `shouldBe` (1, Open)
+          counts second >>= \c → (jobsLive c, phaseNow c) `shouldBe` (1, Open)
           openGate (ssProbe session) "b.lua"
-          awaitCounts second (\c → countReady c == 1)
+          awaitCounts second (\c → jobsReady c == 1)
           command session second "y" "take" "k2" [] Nothing
           awaitNote session "y take k2 {status=success,value=table(b)}"
           retireVm control second
@@ -190,7 +190,7 @@ defects = describe "a defect" $ do
         fmap snd (requestFailureOf failure) `shouldSatisfy` maybe False (Text.isInfixOf "io_error")
         -- Another instance of the same VM is unaffected.
         command session vm "y" "start" "k2" [] (Just (fetch "a.lua"))
-        awaitCounts vm (\c → countReady c == 1)
+        awaitCounts vm (\c → jobsReady c == 1)
 
   it "of the diagnostic sink is fatal, and the VM still gives back what it held" $ do
     ExceptionWithContext _ failure ← fatalSession fixedM1Profile (2, 8) realReader layout $ \session control runtime →
@@ -214,7 +214,7 @@ callbacks = describe "completions" $ do
       withVm session runtime "twice" (defaultOptions OnArrival) {optWrap = duplicated} $ \vm → do
         admitDriver session vm "x"
         command session vm "x" "start" "k1" [] (Just (fetch "a.lua"))
-        awaitCounts vm (\c → countReady c == 1)
+        awaitCounts vm (\c → jobsReady c == 1)
         command session vm "x" "take" "k1" [] Nothing
         awaitNote session "x take k1 {status=success,value=table(a)}"
         vmDiagnostics vm >>= \d → rdOutstanding d `shouldBe` 0

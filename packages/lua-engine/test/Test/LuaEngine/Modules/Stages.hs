@@ -40,13 +40,13 @@ stages = describe "the stages of a source" $ do
         command session vm "x" "start_block" "k1" [("name", VText "hold")] (Just (fetch "a.lua"))
         awaitGate session "hold"
         awaitFinished (ssProbe session) 1
-        awaitCounts vm (\c → countOrdinary c > 0)
+        awaitCounts vm (\c → bytesOrdinary c > 0)
         evalsOf session >>= (`shouldBe` [])
         releaseGate session "hold"
-        awaitCounts vm (\c → countReady c == 1)
+        awaitCounts vm (\c → jobsReady c == 1)
         evalsOf session >>= (`shouldBe` ["eval a"])
         readsStarted (ssProbe session) >>= (`shouldBe` 1)
-        awaitCounts vm (\c → countOrdinary c == 0)
+        awaitCounts vm (\c → bytesOrdinary c == 0)
 
   it "may be a failure known before the loader holds a record: the load fails as an accepted one" $
     withSession fixedM1Profile (2, 8) realReader layout $ \session _ runtime →
@@ -70,9 +70,9 @@ stages = describe "the stages of a source" $ do
           command session vm "x" "take" key [] Nothing
           awaitNote session ("x take " <> key <> " {status=cancelled}")
         awaitVmDiagnostic vm (\d → rdOutstanding d == 0)
-        counts vm >>= \c → (countJobs c, countWaiters c, countReadsStarted c) `shouldBe` (1, 0, 1)
+        counts vm >>= \c → (jobsHeld c, waitersHeld c, readsBegun c) `shouldBe` (1, 0, 1)
         openGate (ssProbe session) "a.lua"
-        awaitCounts vm (\c → countReady c == 1)
+        awaitCounts vm (\c → jobsReady c == 1)
         evalsOf session >>= (`shouldBe` ["eval a"])
   where
     evalsOf session = filter (Text.isPrefixOf "eval") <$> history session

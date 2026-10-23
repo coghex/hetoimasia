@@ -855,21 +855,21 @@ countsSTM c = do
       count p = length (filter p jobs)
   pure
     Counts
-      { countJobs = length jobs
-      , countLive = count isLive
-      , countReady = count (\job -> case jobOutcome job of Ready _ -> True; _ -> False)
-      , countFailed = count (\job -> case jobOutcome job of Failed _ _ -> True; _ -> False)
-      , countStopped = count (\job -> case jobOutcome job of Stopped -> True; _ -> False)
-      , countWaiters = sum (map jobWaiterCount jobs)
-      , countOrdinary = chargedOrdinary (csCharges st)
-      , countActive = chargedActive (csCharges st)
-      , countSlotsFree = csSlotsFree st
-      , countPoolHeld = csPoolHeld st
-      , countDeferred = count (\job -> case jobSource job of SrcNone -> isLive job && (jobRecorded job || jobRoot job) && fateIsRead (jobFate job); _ -> False)
-      , countNeeded = count (\job -> isLive job && jobNeeded job)
-      , countReadsStarted = csReadsStarted st
-      , countPhase = csPhase st
-      , countPeaks = csPeaks st
+      { jobsHeld = length jobs
+      , jobsLive = count isLive
+      , jobsReady = count (\job -> case jobOutcome job of Ready _ -> True; _ -> False)
+      , jobsFailed = count (\job -> case jobOutcome job of Failed _ _ -> True; _ -> False)
+      , jobsStopped = count (\job -> case jobOutcome job of Stopped -> True; _ -> False)
+      , waitersHeld = sum (map jobWaiterCount jobs)
+      , bytesOrdinary = chargedOrdinary (csCharges st)
+      , bytesActive = chargedActive (csCharges st)
+      , slotsFree = csSlotsFree st
+      , slotsHeld = csPoolHeld st
+      , readsDeferred = count (\job -> case jobSource job of SrcNone -> isLive job && (jobRecorded job || jobRoot job) && fateIsRead (jobFate job); _ -> False)
+      , jobsNeeded = count (\job -> isLive job && jobNeeded job)
+      , readsBegun = csReadsStarted st
+      , phaseNow = csPhase st
+      , peaksSeen = csPeaks st
       }
   where
     fateIsRead = \case

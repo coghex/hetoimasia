@@ -280,25 +280,25 @@ data Coordinator = Coordinator
 
 -- | A coherent reading of the coordinator, for observation.
 data Counts = Counts
-  { countJobs ∷ !Int
-  , countLive ∷ !Int
-  , countReady ∷ !Int
-  , countFailed ∷ !Int
-  , countStopped ∷ !Int
-  , countWaiters ∷ !Int
-  , countOrdinary ∷ !Word64
-  , countActive ∷ !Word64
-  , countSlotsFree ∷ !Int
-  , countPoolHeld ∷ !Int
-  , countDeferred ∷ !Int
+  { jobsHeld ∷ !Int
+  , jobsLive ∷ !Int
+  , jobsReady ∷ !Int
+  , jobsFailed ∷ !Int
+  , jobsStopped ∷ !Int
+  , waitersHeld ∷ !Int
+  , bytesOrdinary ∷ !Word64
+  , bytesActive ∷ !Word64
+  , slotsFree ∷ !Int
+  , slotsHeld ∷ !Int
+  , readsDeferred ∷ !Int
   -- ^ Jobs whose read waits for room.
-  , countNeeded ∷ !Int
+  , jobsNeeded ∷ !Int
   -- ^ Unfinished jobs the active chain waits for: its next source, and every module of the chain
   -- that imported it.
-  , countReadsStarted ∷ !Int
+  , readsBegun ∷ !Int
   -- ^ Reads handed to the pool, ever.
-  , countPhase ∷ !Phase
-  , countPeaks ∷ !Peaks
+  , phaseNow ∷ !Phase
+  , peaksSeen ∷ !Peaks
   }
   deriving (Eq, Show)
 

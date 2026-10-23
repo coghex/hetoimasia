@@ -45,7 +45,7 @@ budget reserveBytes bankBytes = withSource 100 reserveBytes bankBytes
 
 -- | The peaks the coordinator has read back.
 peaks ∷ Vm → IO Peaks
-peaks vm = countPeaks <$> counts vm
+peaks vm = peaksSeen <$> counts vm
 
 isInfixOfText ∷ Text.Text → Text.Text → Bool
 isInfixOfText = Text.isInfixOf
@@ -69,21 +69,21 @@ reserve = describe "the reserve for the active chain" $ do
         -- The head's read holds the whole ordinary region: the prefetch waits where it was admitted,
         -- and was accepted, not made busy.
         awaitStarted (ssProbe session) 1
-        counts vm >>= \c → (countOrdinary c, countActive c, countDeferred c, countReadsStarted c) `shouldBe` (100, 0, 1, 1)
+        counts vm >>= \c → (bytesOrdinary c, bytesActive c, readsDeferred c, readsBegun c) `shouldBe` (100, 0, 1, 1)
         openGate (ssProbe session) "main.lua"
         -- The head is compiled and its bytes returned; the prefetch takes the room that frees; the
         -- dependency the head imports is read through the reserve, with the ordinary region full.
         awaitStarted (ssProbe session) 3
-        awaitCounts vm (\c → countOrdinary c == 100 && countActive c == 100)
-        counts vm >>= \c → countDeferred c `shouldBe` 0
+        awaitCounts vm (\c → bytesOrdinary c == 100 && bytesActive c == 100)
+        counts vm >>= \c → readsDeferred c `shouldBe` 0
         startedPaths (ssProbe session) >>= (`shouldBe` ["main.lua", "f1.lua", "dep.lua"])
         openGate (ssProbe session) "dep.lua"
-        awaitCounts vm (\c → countReady c == 2 && countActive c == 0)
+        awaitCounts vm (\c → jobsReady c == 2 && bytesActive c == 0)
         history session >>= (`shouldSatisfy` (\seen → "eval dep" `elem` seen && "eval main" `elem` seen))
         openGate (ssProbe session) "f1.lua"
-        awaitCounts vm (\c → countReady c == 3 && countOrdinary c == 0)
+        awaitCounts vm (\c → jobsReady c == 3 && bytesOrdinary c == 0)
         peaks vm >>= \p → (peakTotal p, peakOrdinary p, peakActive p) `shouldBe` (200, 100, 100)
-        counts vm >>= \c → countSlotsFree c `shouldBe` 4
+        counts vm >>= \c → slotsFree c `shouldBe` 4
 
   it "holds sources far ahead of their positions without starving the chain that is due, and starts the rest as room frees" $
     withSession (budget 100 200) (4, 16) realReader layout $ \session control runtime →
@@ -95,21 +95,21 @@ reserve = describe "the reserve for the active chain" $ do
         -- The first source is read and held for its tick, filling the ordinary region; the second
         -- waits for room, accepted.
         awaitFinished (ssProbe session) 1
-        counts vm >>= \c → (countOrdinary c, countDeferred c, countReadsStarted c) `shouldBe` (100, 1, 1)
+        counts vm >>= \c → (bytesOrdinary c, readsDeferred c, readsBegun c) `shouldBe` (100, 1, 1)
         forM_ [1, 2 ∷ Int] (const (grantOne control vm))
         -- Tick three is held for the first; its dependency is read through the reserve.
-        awaitCounts vm (\c → countReady c == 2)
+        awaitCounts vm (\c → jobsReady c == 2)
         peaks vm >>= \p → (peakTotal p <= 200, peakOrdinary p <= 100, peakActive p <= 100) `shouldBe` (True, True, True)
         awaitFinished (ssProbe session) 3
-        awaitCounts vm (\c → countDeferred c == 0 && countOrdinary c == 100)
+        awaitCounts vm (\c → readsDeferred c == 0 && bytesOrdinary c == 100)
         forM_ [3 .. 7 ∷ Int] (const (grantOne control vm))
-        awaitCounts vm (\c → countReady c == 3)
+        awaitCounts vm (\c → jobsReady c == 3)
         grantOne control vm
         command session vm "x" "take" "k1" [] Nothing
         awaitNote session "x take k1 {status=success,value=table(early)}"
         command session vm "x" "take" "k2" [] Nothing
         awaitNote session "x take k2 {status=success,value=table(late)}"
-        awaitCounts vm (\c → countOrdinary c == 0 && countActive c == 0)
+        awaitCounts vm (\c → bytesOrdinary c == 0 && bytesActive c == 0)
 
   it "fails a source over the module limit, or absent, as an accepted load without reserving a byte or starting a read" $
     withSession (budget 100 200) (2, 8) realReader bigLayout $ \session _ runtime →
@@ -125,10 +125,10 @@ reserve = describe "the reserve for the active chain" $ do
         fmap snd (requestFailureOf yFailure) `shouldSatisfy` maybe False (isInfix "not_found")
         readsStarted (ssProbe session) >>= (`shouldBe` 0)
         peaks vm >>= \p → (peakTotal p, peakSlots p) `shouldBe` (0, 0)
-        counts vm >>= \c → (countFailed c, countOrdinary c, countActive c) `shouldBe` (2, 0, 0)
+        counts vm >>= \c → (jobsFailed c, bytesOrdinary c, bytesActive c) `shouldBe` (2, 0, 0)
         -- A module of exactly the limit is read.
         command session vm "w" "start" "k3" [] (Just (fetch "exact.lua"))
-        awaitCounts vm (\c → countReady c == 1)
+        awaitCounts vm (\c → jobsReady c == 1)
   where
     bigLayout =
       Layout
@@ -151,19 +151,19 @@ slots = describe "the slots the coordinator holds" $
         -- One slot is in use by the head's read; prefetch may not take the last, so both wait,
         -- accepted.
         awaitStarted (ssProbe session) 1
-        counts vm >>= \c → (countSlotsFree c, countDeferred c, countReadsStarted c) `shouldBe` (1, 2, 1)
+        counts vm >>= \c → (slotsFree c, readsDeferred c, readsBegun c) `shouldBe` (1, 2, 1)
         openGate (ssProbe session) "main.lua"
         -- The head's slot comes back and the first prefetch takes it; the head, compiled, imports a
         -- dependency, which takes the last: the second prefetch waits.
         awaitStarted (ssProbe session) 3
-        awaitCounts vm (\c → countActive c == 100 && countSlotsFree c == 0)
-        counts vm >>= \c → countDeferred c `shouldBe` 1
+        awaitCounts vm (\c → bytesActive c == 100 && slotsFree c == 0)
+        counts vm >>= \c → readsDeferred c `shouldBe` 1
         startedPaths (ssProbe session) >>= \paths → (take 1 paths, sort (drop 1 paths)) `shouldBe` (["main.lua"], ["dep.lua", "p1.lua"])
         openGate (ssProbe session) "dep.lua"
         openGate (ssProbe session) "p1.lua"
-        awaitCounts vm (\c → countReady c == 4)
+        awaitCounts vm (\c → jobsReady c == 4)
         peaks vm >>= \p → peakSlots p `shouldBe` 2
-        counts vm >>= \c → countSlotsFree c `shouldBe` 2
+        counts vm >>= \c → slotsFree c `shouldBe` 2
 
 workers ∷ Spec
 workers = describe "the pool's workers" $
@@ -189,16 +189,16 @@ workers = describe "the pool's workers" $
           maxActive (ssProbe session) >>= (`shouldBe` 2)
           -- The chain waits for its head's source: that read, queued behind older prefetch, goes
           -- first when a worker frees.
-          awaitCounts vm (\c → countNeeded c == 1)
+          awaitCounts vm (\c → jobsNeeded c == 1)
           openGate (ssProbe session) "g1.lua"
           awaitStarted (ssProbe session) 4
           startedPaths (ssProbe session) >>= (`shouldBe` ["g1.lua", "g2.lua", "main.lua", "q1.lua"])
           -- The head imports the dependency, which is queued behind another neighbour read: it is
           -- the chain's next source now, and goes before it.
-          awaitCounts vm (\c → countNeeded c == 2)
+          awaitCounts vm (\c → jobsNeeded c == 2)
           openGate (ssProbe session) "g2.lua"
-          awaitCounts vm (\c → countReady c == 2)
+          awaitCounts vm (\c → jobsReady c == 2)
           startedPaths (ssProbe session) >>= (`shouldSatisfy` (\paths → take 5 paths == ["g1.lua", "g2.lua", "main.lua", "q1.lua", "dep.lua"]))
           maxActive (ssProbe session) >>= (`shouldBe` 2)
           openGate (ssProbe session) "q1.lua"
-          awaitCounts other (\c → countReady c == 4)
+          awaitCounts other (\c → jobsReady c == 4)

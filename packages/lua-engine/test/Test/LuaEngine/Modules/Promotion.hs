@@ -89,7 +89,7 @@ spec = describe "a dependency requested for a later position" $ do
         awaitNote session "x start kx started"
         awaitNote session "y start ky started"
         forM_ [1 .. 3 ∷ Int] (const (grantOne control vm))
-        awaitCounts vm (\c → countFailed c == 2)
+        awaitCounts vm (\c → jobsFailed c == 2)
         evalsOf session >>= (`shouldBe` ["eval fb"])
         grantOne control vm
         xFailure ← awaitFailure session "x"
@@ -119,7 +119,7 @@ spec = describe "a dependency requested for a later position" $ do
         command session vm "y" "ready" "kb" [] Nothing
         awaitNote session "y ready kb false"
         openGate (ssProbe session) "ub.lua"
-        awaitCounts vm (\c → countReady c == 2)
+        awaitCounts vm (\c → jobsReady c == 2)
         evalsOf session >>= (`shouldBe` ["eval ub", "eval ua"])
         command session vm "y" "take" "kb" [] Nothing
         awaitNote session "y take kb {status=success,value=table(ub)}"
@@ -146,7 +146,7 @@ spec = describe "a dependency requested for a later position" $ do
         admitDriver session vm "x"
         command session vm "x" "start" "k1" [] (Just (fetch "chain1.lua"))
         command session vm "x" "start" "k2" [] (Just (fetch "top.lua"))
-        awaitCounts vm (\c → countReady c == 8)
+        awaitCounts vm (\c → jobsReady c == 8)
         evalsOf session
           >>= ( `shouldBe`
                   [ "eval chain4", "eval chain3", "eval chain2", "eval chain1"
@@ -165,7 +165,7 @@ spec = describe "a dependency requested for a later position" $ do
         awaitFinished (ssProbe session) 1
         finishedPaths (ssProbe session) >>= (`shouldBe` ["main.lua"])
         openGate (ssProbe session) "dep.lua"
-        awaitCounts vm (\c → countReady c == 2)
+        awaitCounts vm (\c → jobsReady c == 2)
         evalsOf session >>= (`shouldBe` ["eval dep", "eval main"])
         readsStarted (ssProbe session) >>= (`shouldBe` 2)
 
@@ -180,5 +180,5 @@ spec = describe "a dependency requested for a later position" $ do
             endpoint `shouldBe` "module"
             why `shouldSatisfy` Text.isInfixOf "module_cycle"
           Nothing → expectationFailure ("expected a request failure, found " <> show failure)
-        counts vm >>= \c → (countFailed c, countReady c) `shouldBe` (2, 0)
+        counts vm >>= \c → (jobsFailed c, jobsReady c) `shouldBe` (2, 0)
         evalsOf session >>= (`shouldBe` [])

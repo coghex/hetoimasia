@@ -51,14 +51,14 @@ cache = describe "the identity cache" $ do
         command session vm "x" "start" "k2" [] (Just (fetch "i2.lua"))
         command session vm "x" "start" "k3" [] (Just (fetch "i3.lua"))
         awaitNote session "x start k3 started"
-        awaitCounts vm (\c → countReady c == 2)
+        awaitCounts vm (\c → jobsReady c == 2)
         readsBefore ← readsStarted (ssProbe session)
         command session vm "x" "pstart" "k4" [] (Just (fetch "i4.lua"))
         line ← lineStartingWith session "x pstart k4 error"
         line `shouldSatisfy` Text.isInfixOf "module limit"
         -- Nothing was done for it: no read, no entry of any kind, no reservation left behind.
         readsStarted (ssProbe session) >>= (`shouldBe` readsBefore)
-        counts' vm >>= \c → (countJobs c, countFailed c) `shouldBe` (3, 0)
+        counts' vm >>= \c → (jobsHeld c, jobsFailed c) `shouldBe` (3, 0)
         -- A pending identity is joined, a ready one answered, without a slot of their own.
         command session vm "y" "start" "k3" [] (Just (fetch "i3.lua"))
         awaitNote session "y start k3 started"
@@ -66,9 +66,9 @@ cache = describe "the identity cache" $ do
         awaitNote session "y start k1 started"
         command session vm "y" "lookup" "k0" [("path", VText "i1.lua")] Nothing
         awaitNote session "y lookup k0 ready #i1.lua"
-        counts' vm >>= \c → (countJobs c, countWaiters c) `shouldBe` (3, 2)
+        counts' vm >>= \c → (jobsHeld c, waitersHeld c) `shouldBe` (3, 2)
         openGate (ssProbe session) "i3.lua"
-        awaitCounts vm (\c → countReady c == 3)
+        awaitCounts vm (\c → jobsReady c == 3)
         -- The cache stays full: nothing is evicted and nothing waits for room.
         command session vm "y" "pstart" "k5" [] (Just (fetch "i4.lua"))
         line' ← lineStartingWith session "y pstart k5 error"
@@ -88,11 +88,11 @@ cache = describe "the identity cache" $ do
           command session vm "x" "cancel" key [] Nothing
           awaitNote session ("x cancel " <> key <> " cancelled")
         forM_' ["bad1.lua", "bad2.lua", "i1.lua"] (openGate (ssProbe session))
-        awaitCounts vm (\c → countFailed c == 2 && countReady c == 1)
+        awaitCounts vm (\c → jobsFailed c == 2 && jobsReady c == 1)
         command session vm "x" "pstart" "k4" [] (Just (fetch "i2.lua"))
         line ← lineStartingWith session "x pstart k4 error"
         line `shouldSatisfy` Text.isInfixOf "module limit"
-        counts' vm >>= \c → countJobs c `shouldBe` 3
+        counts' vm >>= \c → jobsHeld c `shouldBe` 3
   where
     forM_' items action = mapM_ action items
 
@@ -109,7 +109,7 @@ pressure = describe "temporary pressure" $
         mapM_ (\key → command session vm "x" "start" key [] (Just (fetch "i2.lua"))) ["a", "b", "c"]
         awaitHistory session (\seen → length (filter (Text.isPrefixOf "x start") seen) == 4)
         history session >>= \seen → length (filter (Text.isInfixOf "busy:busy:") seen) `shouldBe` 3
-        counts' vm >>= \c → (countJobs c, countWaiters c) `shouldBe` (1, 1)
+        counts' vm >>= \c → (jobsHeld c, waitersHeld c) `shouldBe` (1, 1)
         readsStarted (ssProbe session) >>= (`shouldBe` 1)
         -- The permanent cache has two places left, so none was taken by the busy answers.
         command session vm "y" "start" "k2" [] (Just (fetch "i2.lua"))
@@ -128,12 +128,12 @@ loads = describe "an accepted load that meets a limit" $ do
         admitDriver session vm "x"
         admitDriver session vm "y"
         command session vm "x" "start" "k1" [] (Just (fetch "e1.lua"))
-        awaitCounts vm (\c → countReady c == 3)
+        awaitCounts vm (\c → jobsReady c == 3)
         command session vm "y" "start" "k2" [] (Just (fetch "g1.lua"))
         failure ← awaitFailure session "y"
         fmap snd (requestFailureOf failure) `shouldSatisfy` maybe False (Text.isInfixOf "module_limit")
         -- The fourth module was never given a record.
-        counts' vm >>= \c → (countJobs c, countFailed c, countReady c) `shouldBe` (6, 3, 3)
+        counts' vm >>= \c → (jobsHeld c, jobsFailed c, jobsReady c) `shouldBe` (6, 3, 3)
         command session vm "x" "lookup" "k0" [("path", VText "g4.lua")] Nothing
         awaitNote session "x lookup k0 not_ready #g4.lua"
 
@@ -144,13 +144,13 @@ loads = describe "an accepted load that meets a limit" $ do
         admitDriver session vm "y"
         admitDriver session vm "z"
         command session vm "x" "start" "k1" [] (Just (fetch "r2.lua"))
-        awaitCounts vm (\c → countReady c == 1)
+        awaitCounts vm (\c → jobsReady c == 1)
         command session vm "y" "start" "k2" [] (Just (fetch "r1.lua"))
         failure ← awaitFailure session "y"
         fmap snd (requestFailureOf failure) `shouldSatisfy` maybe False (Text.isInfixOf "module_limit")
         -- The module that completed before the limit was met stays cached, and the one that
         -- would have been the fourth has no entry.
-        counts' vm >>= \c → (countJobs c, countReady c, countFailed c) `shouldBe` (3, 2, 1)
+        counts' vm >>= \c → (jobsHeld c, jobsReady c, jobsFailed c) `shouldBe` (3, 2, 1)
         command session vm "z" "lookup" "k0" [("path", VText "d2.lua")] Nothing
         awaitNote session "z lookup k0 not_ready #d2.lua"
         readsBefore ← readsStarted (ssProbe session)

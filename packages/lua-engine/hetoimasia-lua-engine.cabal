@@ -172,6 +172,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Manifest.Tick
         Test.LuaEngine.Modules.Bank
         Test.LuaEngine.Modules.Basics
+        Test.LuaEngine.Modules.Client
         Test.LuaEngine.Modules.Identities
         Test.LuaEngine.Modules.Lifecycle
         Test.LuaEngine.Modules.Limits

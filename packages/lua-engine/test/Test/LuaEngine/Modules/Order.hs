@@ -52,7 +52,7 @@ spec = describe "evaluation order" $ do
           awaitNote session "x ready k2 false"
           evalsOf session >>= (`shouldBe` [])
           openGate (ssProbe session) "u1.lua"
-          awaitCounts vm (\c → countReady c == 3)
+          awaitCounts vm (\c → jobsReady c == 3)
           evalsOf session >>= (`shouldBe` ["eval u1", "eval u2", "eval u3"])
           finishedPaths (ssProbe session) >>= (`shouldBe` ["u3.lua", "u2.lua", "u1.lua"])
 
@@ -73,15 +73,15 @@ spec = describe "evaluation order" $ do
             -- The other VM loads a module through the same pool meanwhile.
             command session other "o" "start" "k9" [] (Just (fetch "u2.lua"))
             awaitNote session "o start k9 started"
-            awaitCounts other (\c → countReady c == 1)
+            awaitCounts other (\c → jobsReady c == 1)
             command session other "o" "take" "k9" [] Nothing
             awaitNote session "o take k9 {status=success,value=table(u2)}"
             -- The waiting VM's stop is served: its instance shuts down while the source is held.
             stopInstance session vm "z"
             awaitNote session "shutdown stopped"
-            counts vm >>= \c → (countLive c, countReady c) `shouldBe` (1, 0)
+            counts vm >>= \c → (jobsLive c, jobsReady c) `shouldBe` (1, 0)
             openGate (ssProbe session) "u1.lua"
-            awaitCounts vm (\c → countReady c == 1)
+            awaitCounts vm (\c → jobsReady c == 1)
 
   describe "on an owner that settles at assigned ticks" $ do
     it "does not let a later ready root overtake an earlier one that waits for its source" $
@@ -116,13 +116,13 @@ spec = describe "evaluation order" $ do
           awaitFinished (ssProbe session) 2
           forM_ [1 .. 3 ∷ Int] (const (grantOne control vm))
           evalsOf session >>= (`shouldBe` [])
-          counts vm >>= \c → (countLive c, countReady c, countFailed c) `shouldBe` (2, 0, 0)
+          counts vm >>= \c → (jobsLive c, jobsReady c, jobsFailed c) `shouldBe` (2, 0, 0)
           command session vm "x" "ready" "k1" [] Nothing
           awaitNote session "x ready k1 false"
           grantOne control vm
           -- Everything before tick five has finished: both roots are evaluated, the failing one
           -- fails its own request only when its tick is served.
-          awaitCounts vm (\c → countReady c == 1 && countFailed c == 1)
+          awaitCounts vm (\c → jobsReady c == 1 && jobsFailed c == 1)
           tickOf vm >>= (`shouldBe` 4)
           grantOne control vm
           failure ← awaitFailure session "y"

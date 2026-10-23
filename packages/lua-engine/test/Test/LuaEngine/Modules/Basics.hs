@@ -42,7 +42,7 @@ spec = describe "a shared module job" $ do
         awaitNote session "b start k started"
         awaitStarted (ssProbe session) 1
         reading ← counts vm
-        (countJobs reading, countWaiters reading, countReadsStarted reading) `shouldBe` (1, 2, 1)
+        (jobsHeld reading, waitersHeld reading, readsBegun reading) `shouldBe` (1, 2, 1)
         openGate (ssProbe session) "a.lua"
         command session vm "a" "keep" "k" [("name", VText "ka")] Nothing
         command session vm "b" "keep" "k" [("name", VText "kb")] Nothing
@@ -59,7 +59,7 @@ spec = describe "a shared module job" $ do
         admitDriver session vm "a"
         admitDriver session vm "b"
         command session vm "a" "start" "k1" [] (Just (fetch "a.lua"))
-        awaitCounts vm (\c → countReady c == 1)
+        awaitCounts vm (\c → jobsReady c == 1)
         command session vm "a" "start" "k2" [] (Just (fetch "a.lua"))
         command session vm "b" "start" "k3" [] (Just (fetch "a.lua"))
         awaitNote session "b start k3 started"
@@ -107,12 +107,12 @@ spec = describe "a shared module job" $ do
           admitDriver session second "b"
           command session first "a" "start" "k" [] (Just (fetch "a.lua"))
           command session second "b" "start" "k" [] (Just (fetch "a.lua"))
-          awaitCounts first (\c → countReady c == 1)
-          awaitCounts second (\c → countReady c == 1)
+          awaitCounts first (\c → jobsReady c == 1)
+          awaitCounts second (\c → jobsReady c == 1)
           evalsOf session >>= (`shouldBe` ["eval a", "eval a"])
           readsStarted (ssProbe session) >>= (`shouldBe` 2)
-          counts first >>= \c → countJobs c `shouldBe` 1
-          counts second >>= \c → countJobs c `shouldBe` 1
+          counts first >>= \c → jobsHeld c `shouldBe` 1
+          counts second >>= \c → jobsHeld c `shouldBe` 1
 
   it "is looked up by what is held and nothing else: ready, failed, or not ready, with no work, entry or position for a module that is not" $
     withSession fixedM1Profile (2, 8) realReader layout $ \session _ runtime →
@@ -125,20 +125,20 @@ spec = describe "a shared module job" $ do
               ImmediateReady _ → "ready"
               ImmediateFailed failure → "failed " <> failureCode failure
         lookupOf "a.lua" >>= (`shouldBe` "not_ready") . describeLookup
-        counts vm >>= \c → (countJobs c, countWaiters c, countReadsStarted c) `shouldBe` (0, 0, 0)
+        counts vm >>= \c → (jobsHeld c, waitersHeld c, readsBegun c) `shouldBe` (0, 0, 0)
         -- A module the owner is running is not ready either, and asking changes nothing.
         command session vm "a" "start" "k1" [] (Just (fetch "m.lua"))
         awaitGate session "m"
         lookupOf "m.lua" >>= (`shouldBe` "not_ready") . describeLookup
         lookupOf "b.lua" >>= (`shouldBe` "not_ready") . describeLookup
-        counts vm >>= \c → countJobs c `shouldBe` 1
+        counts vm >>= \c → jobsHeld c `shouldBe` 1
         releaseGate session "m"
-        awaitCounts vm (\c → countReady c == 1)
+        awaitCounts vm (\c → jobsReady c == 1)
         lookupOf "m.lua" >>= (`shouldBe` "ready") . describeLookup
         command session vm "z" "start" "k2" [] (Just (fetch "bad.lua"))
         _ ← awaitFailure session "z"
         lookupOf "bad.lua" >>= (`shouldBe` "failed module_error") . describeLookup
-        counts vm >>= \c → (countJobs c, countReady c, countFailed c) `shouldBe` (2, 1, 1)
+        counts vm >>= \c → (jobsHeld c, jobsReady c, jobsFailed c) `shouldBe` (2, 1, 1)
 
   it "is the table a hook's import returns: the same one the request hands over" $
     withSession fixedM1Profile (2, 8) realReader layout $ \session _ runtime →
@@ -146,7 +146,7 @@ spec = describe "a shared module job" $ do
         admitDriver session vm "a"
         command session vm "a" "start" "ku" [] (Just (fetch "util.lua"))
         command session vm "a" "start" "k1" [] (Just (fetch "a.lua"))
-        awaitCounts vm (\c → countReady c == 2)
+        awaitCounts vm (\c → jobsReady c == 2)
         command session vm "a" "keep" "ku" [("name", VText "util")] Nothing
         command session vm "a" "keep" "k1" [("name", VText "ta")] Nothing
         awaitNote session "a keep k1 {status=success,value=table(a)}"

@@ -598,11 +598,13 @@ serviceLoading ls owned = do
       if nothingNew && unchanged
         then pure False
         else do
-          forM_ submitted $ \(Submission request due reserved) → do
+          admittedSettled ← fmap concat . forM submitted $ \(Submission request due reserved) → do
             -- Placed where it stands now: a root promoted before it was drained is admitted there.
             standing ← atomically (Map.findWithDefault (standingOf due) (rootIdentity request) <$> readTVar (lsDues ls))
             admission ← admitRootAt owned request (orderOf standing) reserved
             atomically (recordAdmission request admission)
+            -- A root whose identity already had an outcome is told of it like any other that came to one.
+            pure [(rootIdentity request, status) | RootSettled status ← [admission]]
           forM_ promoted $ \(identity, order) → void (promoteRoot owned identity order)
           forM_ notified $ \(identity, answer) → deliverSource owned identity answer
           report ← advanceLoader owned
@@ -611,9 +613,10 @@ serviceLoading ls owned = do
             modifyTVar' (lsDues ls) (Map.delete identity)
             modifyTVar' (lsOutcomes ls) (Map.insert identity (OutcomeSettled status))
           settleHold ls
-          unless (null (advanceSettled report)) (hookSettled hooks (advanceSettled report))
+          let settledNow = admittedSettled <> advanceSettled report
+          unless (null settledNow) (hookSettled hooks settledNow)
           hookBlocked hooks (advanceBlocked report)
-          pure (not nothingNew || not (null (advanceSettled report)))
+          pure (not nothingNew || not (null settledNow))
     isPlaced identity dues = case Map.lookup identity dues of
       Just (Placed {}) → True
       _ → False

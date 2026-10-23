@@ -44,10 +44,10 @@ earliest = describe "the earliest position a request contributed" $ do
         command session vm "y" "start" "ky" [] (Just (fetchAt 10 "m.lua"))
         awaitNote session "x start kx started"
         awaitNote session "y start ky started"
-        counts vm >>= \c → (countJobs c, countWaiters c) `shouldBe` (1, 2)
+        counts vm >>= \c → (jobsHeld c, waitersHeld c) `shouldBe` (1, 2)
         command session vm "y" "cancel" "ky" [] Nothing
         awaitNote session "y cancel ky cancelled"
-        counts vm >>= \c → (countJobs c, countWaiters c) `shouldBe` (1, 1)
+        counts vm >>= \c → (jobsHeld c, waitersHeld c) `shouldBe` (1, 1)
         forM_ [1 .. 9 ∷ Int] (const (grantOne control vm))
         -- The job is evaluated at tick ten's boundary, which only the cancelled waiter's position
         -- put it at.
@@ -78,7 +78,7 @@ earliest = describe "the earliest position a request contributed" $ do
         awaitFinished (ssProbe session) 3
         command session vm "x" "start" "kp2" [] (Just (fetchAt 2 "p.lua"))
         awaitNote session "x start kp2 started"
-        counts vm >>= \c → (countJobs c, countWaiters c) `shouldBe` (3, 4)
+        counts vm >>= \c → (jobsHeld c, waitersHeld c) `shouldBe` (3, 4)
         forM_ [1 .. 5 ∷ Int] (const (grantOne control vm))
         history session >>= \seen → filter (Text.isPrefixOf "eval") seen `shouldBe` ["eval p", "eval q", "eval r"]
   where
@@ -105,9 +105,9 @@ noWaiters = describe "a job nobody waits for" $ do
         awaitNote session "x take k1 {status=cancelled}"
         -- The request's place is given back; the job, which nothing waits for, is not.
         awaitVmDiagnostic vm (\d → rdOutstanding d == 0)
-        counts vm >>= \c → (countJobs c, countLive c, countWaiters c) `shouldBe` (1, 1, 0)
+        counts vm >>= \c → (jobsHeld c, jobsLive c, waitersHeld c) `shouldBe` (1, 1, 0)
         openGate (ssProbe session) "plain.lua"
-        awaitCounts vm (\c → countReady c == 1)
+        awaitCounts vm (\c → jobsReady c == 1)
         countNotes session "eval plain" >>= (`shouldBe` 1)
         command session vm "x" "start" "k2" [] (Just (fetch "plain.lua"))
         awaitNote session "x start k2 started"
@@ -156,7 +156,7 @@ noWaiters = describe "a job nobody waits for" $ do
         command session vm "x" "cancel" "k1" [] Nothing
         awaitNote session "x cancel k1 cancelled"
         openGate (ssProbe session) "bad.lua"
-        awaitCounts vm (\c → countFailed c == 1)
+        awaitCounts vm (\c → jobsFailed c == 1)
         diagnostics session >>= \seen → length seen `shouldBe` 1
         diagnostics session >>= \seen → seen `shouldSatisfy` all (\line → "code=module_error" `Text.isInfixOf` line && "path=bad.lua" `Text.isInfixOf` line)
         -- The instance that cancelled is healthy.
@@ -183,7 +183,7 @@ failures = describe "a required failure" $ do
         grantOne control vm
         grantOne control vm
         -- The job fails before tick three begins; neither request is due.
-        awaitCounts vm (\c → countFailed c == 1)
+        awaitCounts vm (\c → jobsFailed c == 1)
         tickOf vm >>= (`shouldBe` 2)
         diagnostics session >>= (`shouldBe` [])
         grantOne control vm
@@ -240,7 +240,7 @@ boot = describe "boot loads" $ do
         good ← bootNow session vm "first.lua"
         awaitBootOutcome good >>= (`shouldBe` BootReady)
         tickOf vm >>= (`shouldBe` 0)
-        counts vm >>= \c → (countJobs c, countReady c, countWaiters c) `shouldBe` (2, 2, 0)
+        counts vm >>= \c → (jobsHeld c, jobsReady c, waitersHeld c) `shouldBe` (2, 2, 0)
         bad ← bootNow session vm "broken_first.lua"
         outcome ← awaitBootOutcome bad
         case outcome of
