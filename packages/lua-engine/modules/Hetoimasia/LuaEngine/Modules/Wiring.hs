@@ -32,6 +32,7 @@ module Hetoimasia.LuaEngine.Modules.Wiring
   , lookupImmediate
   , coordinatorCounts
   , awaitDrained
+  , coordinatorLimits
   ) where
 
 import Control.Concurrent.STM
@@ -415,3 +416,7 @@ coordinatorCounts = countsSTM
 -- no byte charged. Composes with the application's supervised wait.
 awaitDrained ∷ Coordinator → STM ()
 awaitDrained c = drainedSTM c >>= \done -> unless done retry
+
+-- | The numbers the coordinator works to, read once from its profile.
+coordinatorLimits ∷ Coordinator → Limits
+coordinatorLimits = coordLimits

@@ -85,6 +85,9 @@ module Hetoimasia.LuaEngine.Modules
   , closeModuleCoordinator
   , attachLoader
   , awaitDrained
+  , coordinatorLimits
+  , Limits (..)
+  , BankLimits (..)
 
     -- * What the owner is given
   , coordinatorPlan
@@ -126,6 +129,7 @@ module Hetoimasia.LuaEngine.Modules
   ) where
 
 import Hetoimasia.LuaEngine.Modules.Address (identityKey, moduleIdentity, moduleLabel)
+import Hetoimasia.LuaEngine.Modules.Bank (BankLimits (..))
 import Hetoimasia.LuaEngine.Modules.Failure (ModuleFailure (..), moduleCodes)
 import Hetoimasia.LuaEngine.Modules.State (ImmediateLookup (..))
 import Hetoimasia.LuaEngine.Modules.Types
@@ -134,6 +138,7 @@ import Hetoimasia.LuaEngine.Modules.Types
   , Coordinator
   , Counts (..)
   , ImportResolver
+  , Limits (..)
   , ModuleDefect (..)
   , Peaks (..)
   , Phase (..)

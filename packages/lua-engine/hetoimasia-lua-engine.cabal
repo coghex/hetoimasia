@@ -179,6 +179,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Modules.Positions
         Test.LuaEngine.Modules.Promotion
         Test.LuaEngine.Modules.Spec
+        Test.LuaEngine.Modules.Stages
         Test.LuaEngine.Modules.Support
         Test.LuaEngine.Profile
         Test.LuaEngine.Request.Contract
