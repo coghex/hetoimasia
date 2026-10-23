@@ -59,6 +59,7 @@ module Hetoimasia.Scripting.Lua.Internal.Value
   , defaultValueLimits
   , valueLimitMaxima
   , valueLimits
+  , narrowedBy
   , LimitsRefusal (..)
     -- * Why a value is refused
   , Side (..)
@@ -230,6 +231,13 @@ valueLimits bytes depth elements = do
       | value < 1 = Left (LimitTooSmall name value)
       | value > maximal = Left (LimitTooLarge name value maximal)
       | otherwise = Right ()
+
+-- | The limits that hold when a crossing is bounded by both: for each of bytes, depth and elements, the
+-- smaller. Every limit of either is at least 1 and at most the maxima, so the result is a valid
+-- configuration without a second check.
+narrowedBy ∷ ValueLimits → ValueLimits → ValueLimits
+narrowedBy (ValueLimits bytes depth elements) (ValueLimits bytes' depth' elements') =
+  ValueLimits (min bytes bytes') (min depth depth') (min elements elements')
 
 -- | Which side of a crossing a refusal concerns.
 data Side = Arguments | Results

@@ -88,6 +88,7 @@ module Hetoimasia.Scripting.Lua.Internal.Registration
   , withPrecondition
   , Precondition
   , withArgumentCheck
+  , withArgumentLimits
   , ArgumentCheck
   , OwnerContexts (..)
   , refusalReasonLimit
@@ -144,6 +145,7 @@ import Hetoimasia.Scripting.Lua.Internal.Value
   , schemaDepth
   , schemaDuplicateField
   , schemaFieldCount
+  , ValueLimits
   )
 
 -- | The classification of a binding (P-4).
@@ -241,24 +243,27 @@ data Binding = Binding
   , bindingArgumentChecks ∷ ![ArgumentCheck]
     -- ^ Checked, in order, after the arguments were read and found to be of the declared shapes
     -- and live, and before the action: see 'withArgumentCheck'.
+  , bindingArgumentLimits ∷ !(Maybe ValueLimits)
+    -- ^ A bound on the arguments' crossing that is tighter than the owner's, or not: see
+    -- 'withArgumentLimits'. 'Nothing' is the owner's, which is every binding's default.
   , bindingAction ∷ Action
   }
 
 -- | A snapshot query: reads a view and answers values.
 snapshotQuery ∷ Text → [Schema] → [Schema] → ([Value] → IO [Value]) → Binding
 snapshotQuery name arguments results action =
-  Binding name SnapshotQuery arguments results True False False False [] [] (ValuesAction action)
+  Binding name SnapshotQuery arguments results True False False False [] [] Nothing (ValuesAction action)
 
 -- | An owned state operation: mutates only the domain's documented state.
 stateOperation ∷ Text → [Schema] → [Schema] → ([Value] → IO [Value]) → Binding
 stateOperation name arguments results action =
-  Binding name OwnedStateOperation arguments results True False False False [] [] (ValuesAction action)
+  Binding name OwnedStateOperation arguments results True False False False [] [] Nothing (ValuesAction action)
 
 -- | A command or UI intention: validates and admits, and answers acceptance or a
 -- bounded rejection ('commandResults').
 commandIntention ∷ Text → [Schema] → ([Value] → IO CommandResult) → Binding
 commandIntention name arguments action =
-  Binding name CommandOrUiIntention arguments commandResults True False False False [] [] (CommandAction action)
+  Binding name CommandOrUiIntention arguments commandResults True False False False [] [] Nothing (CommandAction action)
 
 -- | An asynchronous native request: accepted and classified. A Lua call to it is
 -- refused as not yet supported, and the action never runs, from an owner that was
@@ -277,7 +282,7 @@ asynchronousNativeRequest name arguments results action = asynchronousNativeRequ
 -- work. Otherwise as 'asynchronousNativeRequest'.
 asynchronousNativeRequestIn ∷ Text → [Schema] → [Schema] → (RequestContext → [Value] → IO [Value]) → Binding
 asynchronousNativeRequestIn name arguments results action =
-  Binding name AsynchronousNativeRequest arguments results True False False False [] [] (RequestAction action)
+  Binding name AsynchronousNativeRequest arguments results True False False False [] [] Nothing (RequestAction action)
 
 -- | A lifecycle operation: accepted and classified. A Lua call to it is refused as
 -- not yet supported, and the action never runs, from an owner that was configured
@@ -294,7 +299,7 @@ lifecycleOperation name arguments results action = lifecycleOperationIn name arg
 -- it. Otherwise as 'lifecycleOperation'.
 lifecycleOperationIn ∷ Text → [Schema] → [Schema] → (LifecycleContext → [Value] → IO [Value]) → Binding
 lifecycleOperationIn name arguments results action =
-  Binding name LifecycleOperation arguments results True False False False [] [] (LifecycleAction action)
+  Binding name LifecycleOperation arguments results True False False False [] [] Nothing (LifecycleAction action)
 
 -- | What an owner is configured with so that its lifecycle operations are
 -- delivered: an opaque value of the application's runtime, which this host library
@@ -346,7 +351,7 @@ fromRequestContext (RequestContext held) = fromDynamic held
 -- handle of any other type, or given to any other binding, keeps the refusal.
 releaseOperation ∷ Text → Text → [Schema] → ([Value] → IO [Value]) → Binding
 releaseOperation name handleType results action =
-  Binding name OwnedStateOperation [SCapability handleType] results True False False False [] [] (ReleaseAction action)
+  Binding name OwnedStateOperation [SCapability handleType] results True False False False [] [] Nothing (ReleaseAction action)
 
 -- | Whether a binding's action is run for a handle whose lease has ended: only an
 -- explicit release.
@@ -364,14 +369,14 @@ acceptsRetired binding = case bindingAction binding of
 -- trusted direct path only, and never for the confined path.
 yieldOperation ∷ Text → Binding
 yieldOperation name =
-  Binding name SchedulerOperation [] [] True False False False [] [] (SuspendAction SuspendYield)
+  Binding name SchedulerOperation [] [] True False False False [] [] Nothing (SuspendAction SuspendYield)
 
 -- | A wait: control goes back with the wait the script asked for and its
 -- arguments, which the schemas bound like any other call's. The host reports
 -- them and waits for nothing itself. Refused wherever a yield is.
 waitOperation ∷ Text → WaitKind → [Schema] → Binding
 waitOperation name kind arguments =
-  Binding name SchedulerOperation arguments [] True False False False [] [] (SuspendAction (SuspendWait kind))
+  Binding name SchedulerOperation arguments [] True False False False [] [] Nothing (SuspendAction (SuspendWait kind))
 
 -- | Whether a binding is a scheduler operation, which suspends the coroutine it
 -- is called from.
@@ -433,6 +438,16 @@ withArgumentCheck check binding =
 -- in are unchanged.
 recoverableRefusals ∷ Binding → Binding
 recoverableRefusals binding = binding {bindingRecoverable = True}
+
+-- | Bound the crossing of this binding's arguments by these limits as well as the owner's. The reader
+-- applies, for each of bytes, depth and elements, the smaller of the two, while it reads: a call
+-- over a limit of the binding is refused at that limit exactly as one over the owner's is (a fault of
+-- the call, or an ordinary Lua error for a binding that is opted in), after visiting at most the
+-- limit plus one element. A limit of the binding above the owner's changes nothing, so this can only
+-- tighten, never widen what the owner admits. It bounds the arguments only: the results, and every
+-- other binding, keep the owner's limits.
+withArgumentLimits ∷ ValueLimits → Binding → Binding
+withArgumentLimits limits binding = binding {bindingArgumentLimits = Just limits}
 
 -- | Opt the binding in ('recoverableRefusals') and have a precondition checked
 -- first. Preconditions of one binding run in the order they were added, before

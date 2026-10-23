@@ -173,6 +173,8 @@ valueHandler boundary vm space binding state restore = do
     else pure False
   let context = boundaryContext boundary
       limits = boundaryLimits boundary
+      -- What the arguments are read under: the owner's limits, tightened by the binding's own.
+      argumentLimits = maybe limits (narrowedBy limits) (bindingArgumentLimits binding)
       declared = bindingArguments binding
       qualified = qualifiedName space (bindingName binding)
       faulted ∷ ∀ b. FaultReason → Effect → IO b
@@ -314,7 +316,7 @@ valueHandler boundary vm space binding state restore = do
         when (top /= length declared) $
           refuseArguments 0 [] (RuleArity (length declared) top) 0
         raws ← do
-          copied ← readValues state limits (vmIdentity vm) 1 top
+          copied ← readValues state argumentLimits (vmIdentity vm) 1 top
           case copied of
             ReadStatus status → statusFault status
             ReadRefused rule index visited → refuseArguments index [] rule visited

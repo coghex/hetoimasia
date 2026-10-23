@@ -140,6 +140,7 @@ module Hetoimasia.LuaEngine.Texture
     -- * Using and releasing
   , TextureView (..)
   , withTexture
+  , withTextureOr
   , TextureRelease (..)
   , releaseTexture
   , releaseWord
@@ -197,6 +198,7 @@ import Hetoimasia.Scripting.Lua.Lease
   , ReleaseAnswer (..)
   , releaseLease
   , withLease
+  , withLeaseOr
   )
 import Hetoimasia.Scripting.Lua.Provider
   ( Completion (..)
@@ -397,6 +399,14 @@ data TextureView = TextureView
 -- adopted it stays valid for that scene, which the backend holds until it proves otherwise.
 withTexture ∷ HasCallStack ⇒ Leases → Word64 → (TextureView → IO r) -> IO r
 withTexture leases key use = withLease leases key $ \resource →
+  use (TextureView (textureIdentity (resourceTexture resource)) (resourceWidth resource) (resourceHeight resource))
+
+-- | 'withTexture' that hands the refusal to the caller as data instead of raising it: the same three
+-- reasons (the lease has ended, it is another instance's, it holds another type), as bounded text, for
+-- the binding that turns an expected refusal into an ordinary Lua error before its action. It decides and
+-- borrows in one step on the calling thread. The scene preparation (LFE-19) is its client.
+withTextureOr ∷ HasCallStack ⇒ Leases → Word64 → (Text → IO r) → (TextureView → IO r) → IO r
+withTextureOr leases key refused use = withLeaseOr leases key refused $ \resource →
   use (TextureView (textureIdentity (resourceTexture resource)) (resourceWidth resource) (resourceHeight resource))
 
 -- | What an explicit release answered, in the words the later binding uses.

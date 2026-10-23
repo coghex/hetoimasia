@@ -229,12 +229,15 @@ data Config = Config
   , cfgHooks ∷ !PipelineHooks
   , cfgRelease ∷ IO ()
     -- ^ Lets go of whatever gates the example's hooks hold, however the example ends.
+  , cfgExtra ∷ Vm → [Namespace]
+    -- ^ Namespaces the example's own bindings add to every VM, granted to its owner. They may close over the
+    -- VM's leases; the owner is not yet running when they are made.
   }
 
 -- | The usual configuration: a pool of two workers and sixteen slots, room for sixteen jobs and
 -- sixteen leases, the real reader behind the probe's gates.
 config ∷ Profile → Layout → Config
-config profile layout = Config profile (2, 16) 16 realReader layout 16 noHooks (pure ())
+config profile layout = Config profile (2, 16) 16 realReader layout 16 noHooks (pure ()) (const [])
 
 -- | How the pool's reader is made from the real one and the session's probe.
 type ReaderOf = Probe → Inventory → (ContentKey → Int → IO (Either ReadFailure ByteString)) → ContentKey → Int → IO (Either ReadFailure ByteString)
@@ -832,7 +835,8 @@ startVmWith session wrap runtime label timing = do
   let vm' = Vm (error "owner not started") service leases owners
       registered =
         either (error . ("registration refused: " <>) . show) id $
-          registration [admittedHandleType handles requestHandleType, leaseCapabilityType leases textureHandleType] (bindings session vm' requests)
+          registration [admittedHandleType handles requestHandleType, leaseCapabilityType leases textureHandleType] (bindings session vm' requests <> extras)
+      extras = cfgExtra (ssConfig session) vm'
       Bytes copied = bytesLimit (ssProfile session) CopiedValueBytes
       Count depth = countLimit (ssProfile session) CopiedValueDepth
       Count elements = countLimit (ssProfile session) CopiedValueElements
@@ -840,7 +844,7 @@ startVmWith session wrap runtime label timing = do
       vm =
         (vmConfig [LibraryBase, LibraryString, LibraryTable, LibraryMath])
           { vmRegistration = registered
-          , vmPolicy = ["fx", "request", "tex"]
+          , vmPolicy = ["fx", "request", "tex"] <> map namespaceName extras
           , vmOwnerName = label
           , vmModules = [driverSource, enderSource, failingSource]
           , vmValueLimits = limits
@@ -1077,6 +1081,9 @@ driverSource =
       , "    local r = request.take(self.hs[key])"
       , "    if r.status == 'success' then self.ts[key] = r.value.texture end"
       , "    out = fmt(r)"
+      , "  elseif p.op == 'eval' then"
+      , "    local f, err = load('local self, key, fmt = ...\\n' .. p.path, 'eval')"
+      , "    if f then out = tostring(f(self, key, fmt)) else out = 'compile ' .. tostring(err) end"
       , "  elseif p.op == 'use' then out = tostring(tex.use(self.ts[key]))"
       , "  elseif p.op == 'puse' then"
       , "    local ok, r = pcall(tex.use, self.ts[key])"

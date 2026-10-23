@@ -41,6 +41,7 @@ composition to this package; they are not here.
 | `Hetoimasia.LuaEngine.Data` (sublibrary `data`) | the raw-data provider over the content package's read pool and the per-VM byte bank: `dataService`, `dataEndpoint`, `dataKey`, `startData`, `dataArgumentCheck`, `newByteBankFor` |
 | `Hetoimasia.LuaEngine.Modules` (sublibrary `modules`) | the module-job coordinator over the loader, the request protocol and the read pool: `withModuleCoordinator`, `coordinatorPlan`, `coordinatorEndpoint`, `attachLoader`, `moduleKey`, `startModule`, `moduleArgumentCheck`, `bootModule`, `lookupImmediate`, `coordinatorCounts`, `awaitDrained` |
 | `Hetoimasia.LuaEngine.Texture`, `Hetoimasia.LuaEngine.Texture.Backend` (sublibrary `texture`) | the texture pipeline: `textureSpec`, `withTexturePipeline`, `newTextureOwner`, `textureService`, `textureEndpoint`, `textureKey`, `startTexture`, `textureArgumentCheck`, `withTexture`, `releaseTexture`; and the backend port `TextureBackend`, `Upload`, `UploadSink` |
+| `Hetoimasia.LuaEngine.Scene` (sublibrary `scene`) | the fixed M1 scene schema: `sceneLimits`, `prepareScene`, `PreparedScene`, `SceneContent`, `textureUses`, `SceneRefusal`, `sceneCandidate`, `initialContent`, `sceneSchema`, `sceneArgumentCheck`, `scenePublishBinding` |
 
 Every other module is hidden. A client of the pure boundary imports the manifest, the profile and the behavior modules.
 
@@ -787,7 +788,7 @@ three things apart:
 
 Temporary banks (the instance's 16 and the VM's 64 request places, the owner's places, result storage, the unsettled boot loads) are
 `busy`, data, with nothing reserved. The loader's own ask for a source (`acquireSTM`) is answered with a failure once the coordinator has closed, so a chain never waits
-for a source that will not come. `startModule` is therefore plain `startM1` (accepted or busy); a permanent refusal is the host's
+for a source that will not come. That failure is an interest like any other (the loader holds one for every failure it is answered and ends it with `supplierRelease`): it is taken on the identity's job, or on a stopped job made for it within the identity bound (else `SourceNoRoom`), so the release the loader makes is always one the coordinator holds. `startModule` is therefore plain `startM1` (accepted or busy); a permanent refusal is the host's
 ordinary error, raised from inside the admission, and the facade's binding (LFE-12) owns only the Lua spelling. `Limits` has a gated
 example of each of these, in both orders of a boot load and a request racing for the last place.
 
@@ -898,11 +899,110 @@ the loader's record, repeated request and cancel, the fixed profile's numbers an
 (`Client`). The host's own examples prove the mechanisms the coordinator relies on, in `lua-host-tests` and `lua-runtime-tests`
 (see [the loader chapter](../scripting-lua/README.md#placed-roots-lfe-11)).
 
+## The scene schema (LFE-19)
+
+`Hetoimasia.LuaEngine.Scene` (the `scene` sublibrary) turns the table a script hands over into **bounded, immutable CPU data** for the
+publication that follows (LFE-20), or refuses it whole. It starts no window, GPU or native action, publishes nothing, acquires no hold
+on any texture and installs nothing in a VM. Its dependencies are the profile, the texture sublibrary's authority check, the host's
+public modules and the pure renderer packages; the oracle is a test dependency only.
+
+### What a script writes
+
+```lua
+{
+  clear = {r = 0, g = 0, b = 0},
+  sprites = {
+    {texture = texture, x = 32, y = 32, width = 256, height = 256}
+  }
+}
+```
+
+Exactly those fields and no others at every level; `sprites` is a dense list (empty allowed) and nothing has a default. A colour channel
+is a Lua integer, or a float that is exactly a whole number, from 0 to 255 (sRGB); a coordinate is a finite number from -1,000,000 to
+1,000,000; a width or height is finite, greater than zero and at most 1,000,000; `texture` is the calling instance's own texture
+handle. A table used in several places is copied at each of them and each sprite keeps its place. Nothing is coerced, clamped,
+rounded, snapped or skipped: a numeric string, a boolean, a fractional channel, NaN, an infinity or an out-of-range value is refused.
+
+### How it is read, and the limits
+
+The host reads the table raw under the scene's own limits (`sceneValueLimits`, applied with the binding's
+`withArgumentLimits`): **2 MiB** encoded, depth **4**, and the elements of a maximal scene (6 + 6 per sprite, so 4,096 sprites is 24,582),
+all inside the common 16 MiB, depth 8 and 65,536. The reader applies the smaller of the owner's and the binding's limit while it
+copies and stops at the first one it reaches, so a huge or sparse table is refused at a limit and never copied first and checked after;
+a metatable (an empty or protected one included), a cycle, a hole, a non-index key, a wrong type, a nil required value, a missing or
+extra field and a handle that is not a live texture handle of this VM are refused by the host's value rules, with no metamethod run. By
+the host's accounting a scene of `n` sprites is exactly `82 + 116 n` bytes. A profile can shrink any of these (`validateProfile`), which
+is how a limit the fixed schema cannot reach before another one refuses it is exercised. `prepareScene` also checks the sprite count itself,
+walking at most one past the limit, for a client that builds the value without the host.
+
+### Colour and geometry
+
+A channel becomes linear light by the sRGB transfer function (byte 128 is about 0.2159, not 0.5; 0 and 255 are exactly 0 and 1) with an
+alpha of 1. A rectangle is converted to the renderer's 32-bit floats and checked as the quad the renderer places (the unit square through
+the sprite's transform, in the UI's logical space): the origin and the origin plus the width, the height and both must be finite, a
+positive extent must not be zero as a 32-bit float, and the far edge of either axis must not round back onto the origin. A tiny
+rectangle at a large origin is therefore refused, not made to disappear. Fractions and negative or offscreen positions are kept; how
+the renderer later maps the logical space to a target is its own contract and never makes a prepared scene invalid.
+
+### Texture authority
+
+Each distinct texture is borrowed once through the calling instance's own lease (`withTextureOr`: it decides and borrows in one step on
+the calling thread) and its complete backend identity and dimensions are copied. A lease that has ended or is retiring, another
+instance's (a peer in the same VM included), or of another type is a refusal, not an exception; a defect or a cancellation inside the
+borrow is raised as itself. A capability that is not an authentic texture capability of this VM never reaches this check: the host's
+boundary refuses it.
+
+**Success is a check of current authority, not a grant.** A `PreparedScene` holds no hold on any texture and cannot extend an
+instance's authority. The instance can release a texture, or end, the next moment. The publication (LFE-20) must, in the step that
+publishes, revalidate and hold each of `textureUses` through `preparedOwner`'s leases, and publish atomically against release and end;
+`useView` is the identity it was checked against, and it never resolves a stale one to a newer texture.
+
+### Refusal
+
+`scenePublishBinding` (and `sceneArgumentCheck` for a binding of one's own) refuses a candidate as **an ordinary Lua error** before the
+action: `namespace.name: scene.sprites[3].width: an extent is greater than zero`, at most 160 bytes of fixed words and numbers and never
+anything of the authored value. `pcall` catches it and the next valid candidate can be prepared; nothing is latched. Uncaught, it is the
+script's own error under the host's existing classification of an ordinary Lua error: the calling instance fails with that bounded
+message. The check keeps nothing (a binding's closure is shared by owners), so the action prepares the same copied value again on the same
+thread, and a refusal there is a `SceneDefect`, the engine's own failure and fatal. The sink is called only on complete success; a sink
+that fails ends the owner, and a later success never clears it.
+
+### The renderer's frame
+
+`sceneCandidate resolve metrics content` builds the existing pure snapshot: one window pass cleared to the opaque colour, one
+full-window view of the supplied target metrics (camera at the origin, zoom 1; UI scale 1, pixel snap off, nearest filter, brightness
+100%, written out), and one UI layer of the sprites in order. Each sprite places the unit square at its origin with its width and height,
+shows the whole image with the neutral tint, the default sampler and material, no clip, frame table, parameter, translucent override or
+additive flag. Every sprite has depth key 0, so the renderer's order (ascending depth key, then submission) is the script's list order,
+later over earlier through its premultiplied blend. The caller supplies how a backend identity becomes the renderer's handle (it is the
+backend's) and the target's metrics; a resize is a new candidate from the same content, a zero framebuffer extent a valid empty viewport,
+and nothing in the content knows the window. `initialContent` is the opaque black empty scene a window shows before its first publication.
+
+### Owners, threads and lifetime
+
+| What | Owner | Thread | Lifetime and cleanup |
+| --- | --- | --- | --- |
+| the copied argument | the host's call | the VM's, inside the binding call | bounded by the scene limits as it is read; dropped when the call returns or raises |
+| the draft (accumulating sprites, textures already borrowed) | `prepareScene` | the calling thread | local to the call; dropped on success, refusal or exception; no history, queue or cache |
+| a texture's borrow | the instance's lease | the calling thread | for the copy of its identity and dimensions only; nothing is retained |
+| the `PreparedScene` | its receiver (the sink) | any | immutable; holds the owner's `Leases`, no hold; ends when dropped |
+
+### What proves it
+
+`Test.LuaEngine.Scene.*` (group `test.lua-engine`) run a real instance that owns a real texture on a real supervised owner, the real
+pipeline and decoder with an injected backend, and a controlled sink: the exact example, boundary values and shared tables (`Schema`),
+every refusal with the sink and the previous scene untouched and no metamethod run (`Schema`, `Numbers`), the limits at the limit and one
+past under the fixed and smaller profiles (`Limits`), texture authority including a peer in the same VM, release, instance end and the
+later consumer (`Authority`), pcall, uncaught, copying and a failing sink (`Failure`), the renderer's validation, plan and oracle (`Render`)
+and a separately compiled client (`Client`). The host's own examples prove the per-binding limit and the stack and registry balance in
+`Test.Lua.Boundary.ArgumentLimits` and the non-throwing lease borrow in `Test.LuaRuntime.Instance.Lease.*`. Oracle evidence proves CPU
+semantics, not a displayed pixel.
+
 ## Deferred, by design
 
 Not here, and not claimed: the CLI `run` dispatch and exit mapping (LFE-22), which will
 consume the boot checkpoint and retain the same anchored root;
-the concrete GPU upload and registration, native budgets and scene holds (LFE-17 to LFE-20), the public Lua graphics binding (LFE-21),
+the concrete GPU upload and registration, native budgets, scene holds and the atomic publication of a prepared scene (LFE-17 to LFE-20), the public Lua graphics binding (LFE-21),
 the concrete content, time, graphics and status service facades (only the request adapter's common operations and the typed
 endpoints of the data provider, the module coordinator and the texture pipeline are here) and their metadata and grant policy,
 the lexical-root `import` and `api.content.module` spellings (LFE-12), the role gate and session startup that consume
@@ -928,4 +1028,4 @@ injected upload backend (see above). It covers the accepted
 examples, every syntax and schema refusal with the limits at their boundary and
 one past, the exact tick endpoints and forbidden forms, every fixed value against
 an independently written expectation, valid smaller profiles and refused ones,
-the behavior selection's cadence rules and numeric boundaries, the boot checkpoint (see above), the request adapter (see above), the raw-data provider (see above), the module coordinator (see above), the texture pipeline (see above), and this package's dependency and import boundary.
+the behavior selection's cadence rules and numeric boundaries, the boot checkpoint (see above), the request adapter (see above), the raw-data provider (see above), the module coordinator (see above), the texture pipeline (see above), the scene schema (see above), and this package's dependency and import boundary.

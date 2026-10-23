@@ -936,6 +936,16 @@ count is at most the element limit plus one. Each limit is pinned at the limit
 and one past it in `Test.Lua.Boundary.Bindings`, `Test.Lua.Boundary.Modules` and
 `Test.Lua.Boundary.Values`.
 
+**A binding's own bound (LFE-19).** `withArgumentLimits limits binding` bounds the crossing of that binding's
+arguments by `limits` as well as by the owner's: for each of bytes, depth and elements the reader applies the smaller of the
+two, while it reads, and stops at the first limit it reaches (a refusal visits at most the limit plus one element). It can only
+tighten: a binding limit above the owner's changes nothing, and it leaves the binding's results and every other binding to the
+owner's limits. The refusal is the one the owner's limits give, an ordinary Lua error for a binding that is opted in
+([Recoverable refusals](#recoverable-refusals)) and a typed fault of the call otherwise, so a family of values with a smaller
+ceiling than the owner's (a scene's 2 MiB inside the common 16 MiB) is refused at its own ceiling and never admitted at the
+common one first. `bindingArgumentLimits` reads it back. `Test.Lua.Boundary.ArgumentLimits` pins it at the limit and one past,
+for a huge input, the stack and registry balance and an allocator budget swept over the read and the refusal.
+
 ### Handles
 
 A capability is an opaque identity the application hands its scripts: a type it
@@ -3310,6 +3320,13 @@ The value boundary has already checked that a handle was issued by this VM, is o
 through `leaseLive` (declare the type with `leaseCapabilityType`), that its lease has not ended.
 `withLease leases key action` borrows the held resource for the action, under the collection's borrowing
 rules, and is refused for a lease of another type or another instance.
+
+`withLeaseOr leases key refused action` is the same borrow with the refusal handed back as data: it decides and borrows in
+one step on the calling thread, and for a lease that has ended, another instance's or of another type it calls `refused` with
+the same bounded reason `withLease` raises as a fault of the call, instead of raising. A binding that opted in to
+[recoverable refusals](#recoverable-refusals) turns that text into an ordinary Lua error with its action never run (the scene
+preparation of LFE-19 does), so a script's use of a peer's texture is a refusal `pcall` catches rather than a fault of the call. What the
+borrow itself raises (a loan that has ended, a defect, a cancellation) is raised as for `withLease`.
 
 ### Early release and its answers
 
