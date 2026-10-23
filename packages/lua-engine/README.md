@@ -17,8 +17,9 @@ through the verified read the caller passes it (normally the content inventory's
 imports no module that opens a file itself. The **M1 request adapter**
 (LFE-7) is the `request` sublibrary beside it, in a source directory of its own
 so that this one stays pure: see [below](#the-m1-request-adapter). The **raw-data provider**
-(LFE-10) is the `data` sublibrary, for the same reason: see [below](#the-raw-data-provider-lfe-10). The **texture pipeline**
-(LFE-16) is the `texture` sublibrary: see [below](#the-texture-pipeline-lfe-16).
+(LFE-10) is the `data` sublibrary, the **module coordinator** (LFE-11) the `modules` sublibrary and the **texture
+pipeline** (LFE-16) the `texture` sublibrary, for the same reason: see [the data provider](#the-raw-data-provider-lfe-10),
+[the coordinator](#the-module-coordinator-lfe-11) and [the texture pipeline](#the-texture-pipeline-lfe-16).
 
 The library depends on `hetoimasia-foundation` (its `Duration`, checked
 nanoseconds from 1 to 2^64 − 1), on the Lua host and its runtime
@@ -38,6 +39,7 @@ composition to this package; they are not here.
 | `Hetoimasia.LuaEngine.Boot` | `contentConfiguration`, `bootCheckpoint`, `bootCheckpointFrom`, `checkManifestPinned`; `Checkpoint`, `ResolvedEntry`, `BootRefusal` |
 | `Hetoimasia.LuaEngine.Request` (sublibrary `request`) | the M1 request policy over a validated profile and the exact common result adapter: `m1Requests`, `startM1`, `m1ArgumentCheck`, `m1RequestBindings` |
 | `Hetoimasia.LuaEngine.Data` (sublibrary `data`) | the raw-data provider over the content package's read pool and the per-VM byte bank: `dataService`, `dataEndpoint`, `dataKey`, `startData`, `dataArgumentCheck`, `newByteBankFor` |
+| `Hetoimasia.LuaEngine.Modules` (sublibrary `modules`) | the module-job coordinator over the loader, the request protocol and the read pool: `withModuleCoordinator`, `coordinatorPlan`, `coordinatorEndpoint`, `attachLoader`, `moduleKey`, `startModule`, `moduleArgumentCheck`, `bootModule`, `lookupImmediate`, `coordinatorCounts`, `awaitDrained` |
 | `Hetoimasia.LuaEngine.Texture`, `Hetoimasia.LuaEngine.Texture.Backend` (sublibrary `texture`) | the texture pipeline: `textureSpec`, `withTexturePipeline`, `newTextureOwner`, `textureService`, `textureEndpoint`, `textureKey`, `startTexture`, `textureArgumentCheck`, `withTexture`, `releaseTexture`; and the backend port `TextureBackend`, `Upload`, `UploadSink` |
 
 Every other module is hidden. A client of the pure boundary imports the manifest, the profile and the behavior modules.
@@ -646,7 +648,9 @@ returns its charges when that release retires.
 
 ### The backend port
 
-`TextureSpec`'s numbers are read with accessors (`specLanes` and the rest); its record fields are not exported, so a client
+What a backend returns is evaluated inside the same guard that catches what it raises (the reading `textureRelease` answers, the
+work record `backendUpload` answers), and a cell's recorded state is built and forced before it is stored, so a value that throws
+when first looked at is the call failing, once, and never an exception loose in whoever inspects the cell later. `TextureSpec`'s numbers are read with accessors (`specLanes` and the rest); its record fields are not exported, so a client
 cannot build or update a specification of its own. `TextureBackend` has one operation, `backendUpload upload sink`, which must not block, and a sink with four calls: a usable
 registration (`sinkReady`, carrying a `BackendTexture` whose `textureRelease` is called at most once and answers the
 backend's own reading of its retirement, which only reads and which the pipeline guards as the host does: a reading that
@@ -672,12 +676,176 @@ the fixed values are checked, the stages and cancellation windows are driven by 
 separately compiled client composes the pipeline through public modules. `PipelineHooks` are this package's coordination
 points for those examples; production uses `noHooks`.
 
+## The module coordinator (LFE-11)
+
+`Hetoimasia.LuaEngine.Modules` (the `modules` sublibrary) is the M1 composition of three mechanisms that each know
+nothing of the others: the Lua host's [ordered import chains](../scripting-lua/README.md#ordered-import-chains-the-module-loader)
+(one chain at a time per VM, depth first, suspending an importer on a dependency's source), the host's
+[atomic request admission](../scripting-lua/README.md#atomic-request-admission) (a request and its result reserved together,
+assigned positions, the required-failure latch, the cancellation race), and the content package's
+[verified-read pool](../content/README.md#the-verified-read-pool-lfe-10). It adds what is M1's alone: the identity cache's
+accounting, the source bank, the join of requests onto jobs and the policy for when each thing happens. Like the data provider
+it is a **composable typed endpoint**, not a Lua API: the eventual `api.content.module(path [, options])` and the module-bound
+`import` (LFE-12) parse their arguments, resolve the address through the content boundary and call `startModule`,
+`moduleArgumentCheck` and `lookupImmediate`. It installs nothing in a VM, and no production fake provider, ambient filesystem
+loader or game-specific code is in it.
+
+```haskell
+withModuleCoordinator ∷ ModuleSpec → (Coordinator → IO a) → IO a          -- reserves its pool slots; closes on exit
+coordinatorPlan       ∷ Coordinator → LoaderPlan                           -- the owner's scheduledLoader
+coordinatorEndpoint   ∷ Coordinator → RequestEndpoint                      -- the grant's "module" endpoint
+attachLoader          ∷ Coordinator → LoaderEndpoint → IO ()               -- once, right after the owner starts
+startModule           ∷ Coordinator → ModuleRequest → RequestContext → IO () → IO M1Start
+moduleArgumentCheck   ∷ Coordinator → ([Value] → ModuleRequest) → ArgumentCheck
+bootModule            ∷ Coordinator → ContentKey → IO (Either BootRefusal BootTicket)
+lookupImmediate       ∷ Coordinator → ExportIdentity → STM ImmediateLookup
+```
+
+One coordinator belongs to one VM and is made before its owner (the owner's configuration is `scheduledLoader = Just
+(coordinatorPlan c)`, `scheduledRequests` granting `coordinatorEndpoint c`, and `vmExportLimits` from
+`Hetoimasia.LuaEngine.Behavior.exportLimits` so that the loader and the coordinator hold one set of numbers); the owner's
+loader endpoint is given to it with `attachLoader` before any instance is admitted. It lives inside the session's pool scope
+and outside its owner: stop the owner first.
+
+### A job, and its waiters
+
+A module is one **job** for the VM whoever names it: a request from an instance, a request from another, an `import` a
+running module made, a boot load. Concurrent requests join it, including requests from one instance, and the job reads,
+compiles and evaluates the module once, publishing a complete export table or a sticky failure, never a partial export. The
+job is the loader's own record (`pending` → `evaluating` → `ready` or `failed`) beside the coordinator's job entry, with **no
+second cache**: the coordinator's table holds a job's waiters, source stage and position, never its exports. Another VM has its
+own coordinator, jobs, source accounting and exports.
+
+Each external request is a **waiter** of the job, with its own request and result record, its instance attribution and its own
+assigned position (a logical request's tick and sequence, fixed when it was admitted; a presentation request settles on
+arrival). Every module request is required. **Cancelling a request, or ending its instance, withdraws only that
+subscription.** The job goes on: with no waiter left it still reads what it needs, evaluates at the earliest position any
+request contributed, and caches its outcome until the VM stops; its dependencies, source work, effects and logical delay are
+not cancelled by the departure of whoever first asked.
+
+A success is `{status = "success", value = EXPORTS}` where `EXPORTS` is **precisely the table the VM caches**: the reply
+carries a reference to the VM's export slot (`VExportTable`, checked against the VM and the slot where it crosses into
+Lua), and the owner pushes the very table under the protected boundary. Functions, cyclic tables and shared upvalues
+therefore survive; nothing is serialized, and mutating the table is the trusted shared state of D-7. Only the outer record is a
+fresh table, so mutating it changes no settlement. No Lua reference is made for a waiter or a result: the VM's cache reference
+is never released before the VM, so there is nothing to release per waiter, and a take spends only its own handle.
+
+### Admission, identities and the cache
+
+`startModule` is `startM1` with one credit when the identity is new: its place among the VM's **permanent** identities
+(256 under the fixed profile, counting pending, evaluating, ready and failed entries). The credit is reserved in the same
+transaction as the request's records, its place among the instance's 16 and the VM's 64, and its result storage, before the
+endpoint is handed anything and before a source is asked for; temporary pressure on any of those banks is the host's `busy`
+answer with no handle, read or partial reservation. A request that joins a held identity needs no identity slot (a full cache
+still answers lookups and joins) but still needs request capacity.
+
+A new module at a full cache is **refused before any work**, as an ordinary catchable Lua error from `moduleArgumentCheck`
+(the host's own role, phase and offset checks run first), with no failed entry allocated. A dependency that a running module
+discovers at the limit, or past the chain depth or the source limit, fails the **accepted** chain (`module_limit`,
+`too_large`), with the dependency given no entry and what the chain completed kept. Taking or cancelling a waiter never frees a
+permanent identity: nothing is evicted, restarted or retried. The room reserved for an accepted root counts against the
+loader's bound until the loader holds its record (`loaderReserved`), so a dependency cannot take it first. That count is a
+fast path, not the arbiter: a dependency's room is decided by the coordinator in the same transaction that would take its
+interest (`acquireSTM` answers `SourceNoRoom`), so a request or boot load accepted from another thread after the loader read
+`loaderReserved` has the room and the dependency is the one refused, as the ordinary limit it is.
+
+### When a job evaluates
+
+A logical job stands at the **earliest position any admitted request contributed**; it is never made later, so it survives the
+cancellation of the request that set it, and an earlier waiter that joins moves a queued job up (`promoteSubmitted`) without
+duplicating it. Independent roots start in (tick, sequence) order whatever order they were admitted or their sources arrived in;
+a presentation VM starts them in request-admission order. A root at position (T, s) starts only when the scheduler stands just
+before tick T with every earlier tick finished (`ticksQuiet`), and **holds tick T** (`ticksHold`) until it has an outcome, so
+it finishes before any work of tick T begins and a hook of that tick finds the cache complete. Arriving source never starts a
+root, never lets a later root overtake an earlier one that waits for its source, and never exposes an outcome early.
+
+A dependency that is also requested for a later position is evaluated **once, within the importing chain, at the importer's
+position**; its own request is answered with the existing outcome at its own position (the host holds a logical answer until
+then, and settles a presentation request when the outcome is published). A dependency's failure is the importer's at the
+importer's position and never the dependency's own request's before its time. Boot loads use the same identity, chain and
+reads with no waiter, no result position and no tick.
+
+### The source stage
+
+Source is read by the pool's two workers, which overlap, into a **per-VM bank of 16 MiB uncompiled source with 1 MiB reserved for
+the active chain's next source**. A read is charged its inventoried length before it starts. Unrelated prefetch may use only
+the bank less the reserve, so ready prefetch can never starve the dependency the chain waits for; the active chain's next source
+may use the reserve. A source over the module limit, or a path the inventory does not hold, is an accepted-load failure
+(`too_large`, `not_found`) with no read and no byte reserved. A read that does not fit yet waits among the admitted jobs,
+bounded by the identity cache, and neither takes the reserve nor turns acceptance into `busy`.
+
+The coordinator holds `specSlots` of the pool's slots for its life (one of them for the active chain alone), so it never waits for
+capacity that only finishing the chain could release, and a worker never waits for anything: its sink stores and hands over the
+verified buffer, returns the slot and starts the next read that fits, in one transaction. A job is read at the pool's
+`OrdinaryRead` class until the chain waits for it; then a queued read is withdrawn and queued again as `DependencyProgress`,
+keeping its slot and its charge, and a read a worker holds is left to finish: one read, one charge, however a dependency is
+promoted or reused. Released source is returned to the bank the moment the loader has compiled it (`supplierRelease`), before
+the parent waits for its next dependency; the loader's copy of the bytes is the one allocation the charge stands for.
+
+### Failures
+
+A module's own failure is data. It fails the requests that wait for it, each at its own eligible settlement and whether or not
+its script reads it, with the code of the **cause** (`not_found`, `content_changed`, `io_error`, `too_large`, `module_error`,
+`module_cycle`, `module_limit`), a message bounded at 2 KiB, the root and path of the content that failed (the dependency, when
+the cause is one) and the chain it was reached through. A failure with **nobody waiting** is one attributed, bounded diagnostic
+through the logger the coordinator was given (component `luaengine.modules`), at most once per failed identity and not for a
+dependency whose importer in the same advance carries the report; it fails no instance. A defect of the engine, the pool, a
+worker, a completion or the diagnostic sink is not a module failure: the first is recorded where it happened and raised on the
+owner at its next boundary, fatal whatever the waiter count.
+
+### Stop and lifetime
+
+An owner's exit stops the loader first (every suspended module closed on the owner, every source interest withdrawn) and then
+closes the coordinator, which is idempotent and never waits: admission closes; every pending or evaluating job reads `Stopped`;
+boot loads are told; reads no worker has taken are withdrawn without a file being opened (`withdrawQueued`) and the bytes that
+arrived for nobody are dropped; the slots no read holds go back to the pool. A read a worker holds finishes, and its sink drops
+the buffer, returns its charge and its slot; `awaitDrained` is the proof that all of it has happened. The pool's own scope drains
+every started read before the root and the inventory it borrows are released, so a late sink touches only the coordinator's own
+state, which refuses to republish, resurrect a waiter or reach the closed VM.
+
+### State, owners and lifetimes
+
+| State | Owner and thread | Created / tracked | Bound | Cancellation windows | Terminal / released when | Proved by |
+| --- | --- | --- | --- | --- | --- | --- |
+| identity reservation (`csPromised`) | the coordinator; the admitting hook's thread | the identity credit in the admission transaction | identities less held | the admission taken back before the endpoint is handed anything | consumed whole by the job's creation, whichever path makes the job (a request, a boot load, a dependency the chain found), so an identity is never counted twice; or its own reservation returned by `CreditUnused` exactly once (reservations of one identity are counted, so one admission taken back never removes another's) | `Limits` (room promised to a boot load; promise turned into the boot load's job; dependency refused after an interleaved acceptance), `Stages` |
+| job entry (`csJobs`) | the coordinator; the owner's thread, with sinks and withdrawals in STM | `acceptRequest`, a boot load, or the loader asking for a dependency's source | 256 per VM, permanent | none: a job is never withdrawn | at the VM's end (`Stopped` if unfinished) | `Basics`, `Positions`, `Lifecycle` |
+| waiter | the job; created by the endpoint's submit | `acceptRequest`, atomically with the join | the request banks (16 per instance, 64 per VM) | cancel, instance end and publication, each once | replied or detached, whichever comes first; the host releases the request place after take and retirement | `Positions`, `Lifecycle` |
+| evaluation position (`jobDue`) | the job | the earliest contributed position | one per job | never moves later; promotion races cancellation | the job's outcome | `Positions`, `Promotion` |
+| tick hold (`lsGate`) | the hosted loader, per owner | the earliest placed root's tick, recomputed in the transaction that changes it | one hold | promotion moves it earlier; the owner's exit gives it back | the root's outcome | the host's `Loading` examples, `Promotion` |
+| source reservation (`csCharges`) | the coordinator; reserved by the owner's thread or a sink | the read's start | 16 MiB, 1 MiB reserved | the read's sink, the loader's release and the VM's close | `supplierRelease`, or the sink of a read nobody wants | `Bank`, `Lifecycle` |
+| pool slot (`csSlotsFree`, `csPoolHeld`) | the coordinator, holding the pool's reservations | `withModuleCoordinator` | `specSlots`, one for the active chain | a read withdrawn while queued | the read's sink, or the close | `Bank`, `Stages` |
+| read ticket | the job; the pool owns the read | `startRead`, `needJob` | one per job | `withdrawQueued` before issuance only | the sink, or withdrawal | `Bank`, `Lifecycle` |
+| export reference | the VM's cache | the loader, in one protected call | one per ready identity | none | the VM's end, never earlier | the host's `ExportTable` examples |
+
+### What proves it
+
+`Test.LuaEngine.Modules.*` (group `test.lua-engine`) run real VMs on real supervised scheduled owners over a real temporary
+content root, inventory and pool, with the production reader behind gates and nothing slept: two instances joining one pending
+identity and receiving the very table after one read and one evaluation, a cached request answered without a read, fresh
+envelopes, functions, cycles and shared upvalues, another VM evaluating independently, and the three outcomes of a lookup
+(`Basics`); sources arriving in reverse order, hooks and stop served while the loader waits, an independent VM unaffected,
+a later ready root unable to overtake, and nothing started or exposed early (`Order`); A due at 10 importing B requested for 12,
+for success and failure and for a presentation owner, longer depth-first chains, a shared base evaluated once, a queued
+dependency reused, and a cycle (`Promotion`); a position kept when its waiter cancels, roots ordered by tick and sequence with
+an earlier request moving a queued job up, a job finishing and caching with no waiter, one bounded diagnostic, required
+failures at each request's own position, and boot loads (`Positions`); the reserve, the slots and the pool's workers, with the
+most ever held read back (`Bank`); the full cache, request pressure that is busy atomically, and the limits an accepted load
+meets (`Limits`); stop, peers, defects of the engine and duplicate or failing completions (`Lifecycle`); a source arriving before
+the loader's record, repeated request and cancel, the fixed profile's numbers and the specifications that are refused
+(`Stages`); and a separately compiled client composing the root, the pool and the coordinator through public modules
+(`Client`). The host's own examples prove the mechanisms the coordinator relies on, in `lua-host-tests` and `lua-runtime-tests`
+(see [the loader chapter](../scripting-lua/README.md#placed-roots-lfe-11)).
+
 ## Deferred, by design
 
 Not here, and not claimed: the CLI `run` dispatch and exit mapping (LFE-22), which will
 consume the boot checkpoint and retain the same anchored root;
-the concrete GPU upload and registration, native budgets and scene holds (LFE-17 to LFE-20), the public Lua graphics binding (LFE-21), the loader and import resolution (LFE-9), the concrete content, time, graphics and status
-service facades (only the request adapter's common operations are here) and their metadata and grant policy (LFE-12), workers and session startup; the native GPU budgets; time sampling and scheduling; mods, metadata extensions, alternate
+the concrete GPU upload and registration, native budgets and scene holds (LFE-17 to LFE-20), the public Lua graphics binding (LFE-21),
+the concrete content, time, graphics and status service facades (only the request adapter's common operations and the typed
+endpoints of the data provider, the module coordinator and the texture pipeline are here) and their metadata and grant policy,
+the lexical-root `import` and `api.content.module` spellings (LFE-12), the role gate and session startup that consume
+the boot load's outcome (LFE-13); live codec, texture and GPU budgets and their
+enforcement; time sampling and scheduling; mods, metadata extensions, alternate
 manifest formats, defaults or relaxed parsing.
 
 ## Tests
@@ -692,9 +860,10 @@ The manifest, profile and behavior examples perform no IO and start no Lua; the 
 examples scan real temporary folders through the content package and evaluate nothing (the Lua host's behavior
 mechanism is tested in its own suites); the request adapter's examples start real Lua instances on a real
 supervised owner, with controlled fake providers, and no window or GPU; the raw-data provider's examples do the same over a real
-content root, inventory and read pool (see above), and the texture pipeline's over that and the real bounded PNG decoder with an
+content root, inventory and read pool (see above), the module coordinator's run real modules through real VMs over the
+same (see above), and the texture pipeline's over that and the real bounded PNG decoder with an
 injected upload backend (see above). It covers the accepted
 examples, every syntax and schema refusal with the limits at their boundary and
 one past, the exact tick endpoints and forbidden forms, every fixed value against
 an independently written expectation, valid smaller profiles and refused ones,
-the behavior selection's cadence rules and numeric boundaries, the boot checkpoint (see above), the request adapter (see above), the raw-data provider (see above), the texture pipeline (see above), and this package's dependency and import boundary.
+the behavior selection's cadence rules and numeric boundaries, the boot checkpoint (see above), the request adapter (see above), the raw-data provider (see above), the module coordinator (see above), the texture pipeline (see above), and this package's dependency and import boundary.

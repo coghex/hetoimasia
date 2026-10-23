@@ -915,6 +915,13 @@ capability. The rules:
 - Functions, coroutines, light userdata, and userdata that is not a capability of
   this VM are refused with a typed reason; so is a table key that is neither an
   integer nor a string.
+- One value crosses **by reference**, and only into Lua (LFE-11): `VExportTable`, declared by `SExportTable`, names the
+  [export table](#export-modules-and-captured-behaviors) a VM holds in a slot, and the owner pushes **the very table**, under the
+  protected boundary, where a copy would have been built. Functions, cycles and shared upvalues reach Lua as they are; nothing
+  is serialized and nothing is retained for the crossing. `exportTableValue` makes one from an `ExportHandle`. It is checked
+  where it crosses (the VM that builds the crossing must be the one that issued it, `RuleForeignHandle`; a slot that holds no table is
+  an `InternalError`, never a nil) and its size is that of a number, 9 bytes. A script cannot make one, a read from Lua never
+  yields one, and an endpoint's result schema may declare it where a capability is refused, because it names no handle.
 
 A crossing is bounded by bytes, depth and elements, which together cover all the
 values of one call's arguments or one call's results: by default 64 KiB, depth 8
@@ -1390,7 +1397,7 @@ coordinator that drives them is a later slice's (LFE-11).
 
 | Seam | What it does | Where it runs |
 | --- | --- | --- |
-| `SourceSupplier` | `supplierAcquire identity` registers the loader's interest in an identity's source, exactly once per identity the loader holds a record of, and answers `SourcePending`, `SourceVerified bytes` or `SourceFailure reason` for what is known now; `supplierRelease identity` ends that interest exactly once, when the bytes were consumed, the source failed, or the loader stopped. An acquire that raises took no interest. | acquire: the owner's thread (a root's admission) or the callback an `import` is (a dependency's); release: the owner's thread. Never blocking, and refused (`VmReentered`) if it asks the same VM for anything |
+| `SourceSupplier` | `supplierAcquire identity` registers the loader's interest in an identity's source, exactly once per identity the loader holds a record of, and answers `SourcePending`, `SourceVerified bytes`, `SourceFailure reason` or, for a **dependency** only, `SourceNoRoom` (the application's own identity bound has no room, decided in the step that would take the interest: the loader keeps no record, the supplier took no interest and none is ended, and the import is refused as `ImportCacheFull`) for what is known now; `supplierRelease identity` ends that interest exactly once, when the bytes were consumed, the source failed, or the loader stopped. An acquire that raises took no interest. | acquire: the owner's thread (a root's admission) or the callback an `import` is (a dependency's); release: the owner's thread. Never blocking, and refused (`VmReentered`) if it asks the same VM for anything |
 | `AddressResolver` | `ImportContext -> path -> Maybe root -> IO (Either reason ResolvedAddress)`: turns an import's arguments, and the context of the **module whose code the `import` was made from**, into the canonical identity and a bounded label. `Left` is an ordinary Lua argument error. Production path, Unicode and root validation, and the approved lexical-root resolution, stay behind it (LFE-12) | the callback an `import` is, unmasked |
 | `loaderEligible` | whether the coordinator allows the root at the head of the queue to begin now | the owner's thread, only when no chain is active |
 
@@ -1467,7 +1474,7 @@ lookup like a hook's, and a not-ready identity there is the `ImportNotSuspendabl
 | Case | Lua sees | The containing load |
 | --- | --- | --- |
 | path or root argument malformed, a root the resolver refuses (unknown, disabled) | an ordinary error, raised before any identity slot, source interest or frame exists | **not** failed by it |
-| a dependency that failed (source, syntax, runtime, return shape, dependency, cycle, limit) | an ordinary error | failed with `DependencyFailed label fault`, even if caught |
+| a dependency that failed (source, syntax, runtime, return shape, dependency, cycle, limit) | an ordinary error | failed with `DependencyFailed label identity fault`, even if caught; the identity is the dependency's own, because a label is bounded and two identities can share one |
 | an identity already on the chain | an ordinary error naming the chain, `ImportCycle [a, b, a]`; **no extra frame is allocated for the edge that closes it** | failed |
 | a new dependency when the owner holds as many identities as it may | an ordinary error | failed with `ImportCacheFull`; the dependency has no record |
 | a new dependency that would make the chain longer than it may be | an ordinary error | failed with `ImportChainTooDeep`; the dependency has no record |
@@ -1599,13 +1606,52 @@ exits the inbox closes, the loader is stopped on the owner's thread, every outco
 stopped, and the need is given back. `LoaderPlanRefused` names, before anything starts, a bound below
 one and a VM configuration that already names a loader.
 
+### Placed roots (LFE-11)
+
+The module coordinator (`Hetoimasia.LuaEngine.Modules` in `hetoimasia-lua-engine`) drives the loader with these generic
+additions; none of them knows what a request, a tick offset or a content root is, and `admitRoot` and `submitRoot` behave as
+they did.
+
+* **Order.** `admitRootAt` admits a root with a `RootOrder tick sequence`: independent roots start in order, equal orders in the
+  order admitted, whatever order their sources arrived in; `admitRoot` is the order every root had before (first in, first out).
+  `promoteRoot` asks for a pending or evaluating identity to start no later than an order: a root queued later moves up (keeping
+  the arrival number that breaks ties), a dependency of the active chain that was never a root is queued at it (so its own turn
+  finds an outcome and evaluates nothing), and an order never moves later. No second record, source interest or evaluation is
+  made: the loader answers `PromotionMoved`, `PromotionNotEarlier`, `PromotionNothingQueued` or `PromotionUnknown`.
+* **Reserved room.** `loaderReserved identity` is the number of identities, other than that one, the application has promised
+  room for and the loader holds no record of yet. It counts against the identity bound beside the records, so a dependency
+  cannot take the room an accepted root was promised and the root be refused after it was accepted; a root admitted from its
+  reservation (`admitRootAt … True`) is not asked the bound again. The count is read before the supplier is asked, so it
+  is a fast path: the supplier's `SourceNoRoom` is the arbiter for a dependency, and a root accepted between the two wins.
+* **A failed identity looked up outside a module's evaluation.** A hook (or a helper a hook called) that calls `import` for an
+  identity that has failed gets an ordinary error it may catch, and `loaderObserved identity fault` is called first, on the
+  owner's thread, with the fault. The scheduled owner wires it to the instance whose code is running: that instance is failed
+  with the module's attributed failure (`LoaderHooks.hookObserved` makes the reason) exactly as a required request's failure
+  fails its instance, latched once and applied at the owner's next safe boundary, so catching the error cannot make it a
+  success. Nothing fails when no instance's code was running.
+* **Placed roots on a scheduled owner.** `DueAt tick sequence` is a root placed at a position. It starts only once the
+  scheduler stands just before the tick (`ticksQuiet`, `tickQuietBefore`: every earlier tick begun and finished, nothing ready or
+  waiting to start, this tick not begun), and the tick is **held** (`ticksHold`: the grant that would reach it waits, with the
+  grants behind it) until the root has an outcome. This is the stronger sibling of `DueTick`, which lets the tick begin and keeps
+  its grant open: a placed root finishes before any work of its tick begins. The owner keeps one hold, for the earliest tick a
+  placed root is due in that has not begun, recomputed in the transaction that changes it. `promoteSubmitted` says a submitted
+  root is placed no later than a position, in the application's own transaction; the owner gives it to the loader at its
+  next boundary, and the hold follows. `submitReservedRoot` and `notifySourceNow` are the same operations in the caller's own
+  transaction; `pokeLoader` wakes the owner to run the plan's hook.
+* **Hooks.** `LoaderHooks` is what the owner tells the application as it serves the loader, on its own thread, outside Lua:
+  `hookService` before every service (where a failure a thread of the application's could only record is raised), `hookSettled`
+  with the identities that came to an outcome, dependencies included, in the order they did (not for an advance that settled
+  nothing), `hookBlocked` with what an advance waits for, `hookReserved` and `hookExit` once the loader is stopped. A hook that
+  raises is a failure of application code. The inbox's bounds (`planBound`) cover roots, arrived sources and promotions, each
+  keyed by identity, so an application with an identity bound never meets a full inbox.
+
 ### What is not here
 
-The production content reads and file workers, the per-instance module waiters and their cancellation policy, atomic
-request and identity reservation, the 16 MiB source bank and an assigned-tick settlement (LFE-10, LFE-11); the complete
-lexical-root, content, time and output facades (LFE-12); startup, session failure and quit policy (LFE-13);
-unavailable-state interception (LFE-26); hot reload, mods, hostile-code isolation and replay guarantees. The loader does
-not preempt a non-yielding module.
+The content reads and file workers, the per-request module waiters, the atomic request and identity reservation, the source
+bank and an assigned-position settlement are the application's: `hetoimasia-lua-engine`'s module coordinator composes them over
+this loader and the [request admission](#atomic-request-admission) (LFE-11). The complete lexical-root, content, time and output
+facades (LFE-12); startup, session failure and quit policy (LFE-13); unavailable-state interception (LFE-26); hot reload, mods,
+hostile-code isolation and replay guarantees. The loader does not preempt a non-yielding module.
 
 ### What proves it
 
@@ -1625,6 +1671,17 @@ public owner alone. `Test.LuaRuntime.Loading` (`lua-runtime-tests`) runs the hos
 owners: a chain waiting for another thread's source while a hook runs, an independent owner, the tick hold with a
 positive control, the bounded inbox, and the owner's exit. `Test.LuaEngine.Loader` (`lua-engine-tests`) configures a real
 owner from the fixed M1 profile and shows a chain of 32 and 256 identities and nothing more.
+
+`Test.Lua.Boundary.Loader.Placed` (`lua-host-tests`) pins the placed roots on a real interpreter: roots started by order
+whatever order they were admitted or their sources arrived in, equal orders in the order admitted, a later ready root never
+overtaking, first in first out for `admitRoot`, a root moved up keeping its tie-break and starting first with no second record,
+interest or evaluation, an order never moved later, a dependency queued so that its own turn runs nothing, what has nothing to
+move, and the reserved room: counted against a dependency, not asked of a reserved root, not counted against itself.
+`Test.Lua.Boundary.ExportTable` pushes an export table into Lua by reference (the same table each time, its cycle, function and
+upvalue as they are) and refuses another VM's table and a slot that holds none. `Test.LuaRuntime.Loading` (`lua-runtime-tests`)
+adds the placed roots on real owners: the tick held until the root has an outcome and the root started only when everything
+before it is finished, roots started by tick and sequence with an earlier place moving a queued one up, the hold moving earlier and
+never later, the hooks, and the poke; `Test.LuaRuntime.Scheduler.Requests` pins `tickQuietBefore`.
 
 ## Tasks and the coroutine library
 
@@ -2254,6 +2311,11 @@ satisfied the wait is applied, so a later grant or a delayed dispatch cannot cha
 wait for no ticks, or one whose end tick is not representable, is refused. A duration that
 cannot be represented fails that task with a typed failure; nothing wraps, and the rest of
 the step stands.
+
+`tickQuietBefore scheduler tick` reads the boundary just before a tick: every earlier tick has begun and finished, nothing is
+ready or waiting to start, and this tick has not begun (a tick that has begun already, and tick zero, answer true). With
+`holdTick` on that tick it is where an owner runs the work that must be finished before the tick begins, which is how the module
+loader starts a root placed at a tick ([placed roots](#placed-roots-lfe-11)).
 
 `awaitStepsComplete` is the STM condition "every accepted grant is applied and finished".
 Composed with `awaitSupervised` it is how an application observes tick completion without
