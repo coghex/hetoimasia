@@ -76,7 +76,9 @@ reserve = describe "the reserve for the active chain" $ do
         awaitStarted (ssProbe session) 3
         awaitCounts vm (\c → bytesOrdinary c == 100 && bytesActive c == 100)
         counts vm >>= \c → readsDeferred c `shouldBe` 0
-        startedPaths (ssProbe session) >>= (`shouldBe` ["main.lua", "f1.lua", "dep.lua"])
+        -- The prefetch was started by the head's own sink and the dependency by the owner, a moment
+        -- later: two workers may enter the reader in either order, so the pair is read as a set.
+        startedPaths (ssProbe session) >>= \paths → (take 1 paths, sort (drop 1 paths)) `shouldBe` (["main.lua"], ["dep.lua", "f1.lua"])
         openGate (ssProbe session) "dep.lua"
         awaitCounts vm (\c → jobsReady c == 2 && bytesActive c == 0)
         history session >>= (`shouldSatisfy` (\seen → "eval dep" `elem` seen && "eval main" `elem` seen))
