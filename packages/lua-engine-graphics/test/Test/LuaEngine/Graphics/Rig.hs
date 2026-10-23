@@ -24,7 +24,12 @@ module Test.LuaEngine.Graphics.Rig
   , awaitEvents
   , terminals
   , sinkEvents
+  , Forked (..)
+  , forkScope
+  , assertBefore
   , gateReady
+  , raiseFromReady
+  , raiseFromTerminal
   , openReady
   , answerReady
   , delivered
@@ -42,9 +47,13 @@ import Control.Concurrent.STM
   , readTVar
   , readTVarIO
   , retry
+  , swapTVar
   , writeTVar
   )
-import Control.Exception (finally)
+import Control.Concurrent (ThreadId, forkIO)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Exception (SomeException, finally, throwIO, try)
+import Data.List (findIndex)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Control.Monad (forM_, unless)
 import Data.ByteString (ByteString)
@@ -151,10 +160,14 @@ data Probe = Probe
   , probeGate ∷ !(TVar Bool)
     -- ^ While set, 'sinkReady' does not return.
   , probeAnswer ∷ !(TVar SinkAnswer)
+  , probeReadyRaises ∷ !(TVar (Maybe SomeException))
+    -- ^ Raised by 'sinkReady' after it recorded the texture.
+  , probeTerminalRaises ∷ !(TVar (Maybe SomeException))
+    -- ^ Raised by the first terminal call (failed or withdrawn), after it recorded the event.
   }
 
 newProbe ∷ IO Probe
-newProbe = Probe <$> newTVarIO [] <*> newTVarIO Nothing <*> newTVarIO False <*> newTVarIO SinkTaken
+newProbe = Probe <$> newTVarIO [] <*> newTVarIO Nothing <*> newTVarIO False <*> newTVarIO SinkTaken <*> newTVarIO Nothing <*> newTVarIO Nothing
 
 -- | The sink over this probe, whose every call is also written into the fake's event log.
 probeSink ∷ Fake → Probe → UploadSink
@@ -166,16 +179,51 @@ probeSink fake probe =
         atomically (readTVar (probeGate probe) >>= \gated → if gated then retry else pure ())
         answer ← readTVarIO (probeAnswer probe)
         atomically (modifyTVar' (probeEvents probe) (<> [(if answer == SinkLate then SeReadyLate else SeReady) (textureIdentity texture)]))
+        raising ← atomically (swapTVar (probeReadyRaises probe) Nothing)
+        forM_ raising throwIO
         pure answer
-    , sinkFailed = \(UploadFailure why) → note "sink failed" (SeFailed why)
-    , sinkWithdrawn = note "sink withdrawn" SeWithdrawn
+    , sinkFailed = \(UploadFailure why) → note "sink failed" (SeFailed why) <* raiseTerminal
+    , sinkWithdrawn = note "sink withdrawn" SeWithdrawn <* raiseTerminal
     , sinkBuffersRetired = note "sink buffers retired" SeBuffersRetired
     }
   where
+    raiseTerminal = atomically (swapTVar (probeTerminalRaises probe) Nothing) >>= \raising → forM_ raising throwIO
     note line event = do
       noteEvent fake line
       atomically (modifyTVar' (probeEvents probe) (<> [event]))
       readTVarIO (probeAnswer probe) >>= \answer → pure (if answer == SinkLate then SinkLate else SinkTaken)
+
+-- | A scope run on a thread of its own, for an example that must act while the scope is still inside its exit.
+data Forked a = Forked
+  { forkedThread ∷ !ThreadId
+  , forkedJoin ∷ IO (Either SomeException a)
+    -- ^ Waits for the scope's outcome, and then for the thread to have ended.
+  }
+
+forkScope ∷ IO a → IO (Forked a)
+forkScope scope = do
+  result ← newEmptyMVar
+  done ← newEmptyMVar
+  thread ← forkIO ((try @SomeException scope >>= putMVar result) `finally` putMVar done ())
+  pure Forked {forkedThread = thread, forkedJoin = takeMVar result <* takeMVar done}
+
+-- | The first event of the fake's log with this prefix came before the first with that one: an order the log
+-- records, not an instant a thread happened to be observed at.
+assertBefore ∷ Fake → Text → Text → IO ()
+assertBefore fake earlier later = do
+  seen ← events fake
+  let at prefix = findIndex (Text.isPrefixOf prefix) seen
+  case (at earlier, at later) of
+    (Just first, Just second) | first < second → pure ()
+    found → assertFailure ("expected '" <> Text.unpack earlier <> "' before '" <> Text.unpack later <> "', the log read " <> show found <> ": " <> show seen)
+
+-- | Make the next 'sinkReady' raise this once it has recorded the texture.
+raiseFromReady ∷ Probe → SomeException → IO ()
+raiseFromReady probe = atomically . writeTVar (probeReadyRaises probe) . Just
+
+-- | Make the next terminal call raise this once it has recorded its event.
+raiseFromTerminal ∷ Probe → SomeException → IO ()
+raiseFromTerminal probe = atomically . writeTVar (probeTerminalRaises probe) . Just
 
 -- | Hold the next 'sinkReady' inside the call.
 gateReady ∷ Probe → IO ()

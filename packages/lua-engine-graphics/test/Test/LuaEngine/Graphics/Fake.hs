@@ -59,6 +59,7 @@ import Control.Concurrent.STM
   , readTVar
   , readTVarIO
   , retry
+  , throwSTM
   , writeTVar
   )
 import Control.Exception (SomeException, finally, throwIO, try)
@@ -104,9 +105,11 @@ data Injection
   | FailRegister !Fault
   | FailRelease !Fault
   | RaiseRelease
+  | RaiseMark
   | AdmitPressure !Int
   | AdmitFault !AdmissionRefusal
   | LoseUploads
+  | RaiseTable
   deriving (Eq, Show)
 
 data FakeConfig = FakeConfig
@@ -359,7 +362,10 @@ fakePort fake =
     , portWatch = do
         epoch ← readTVar (fEpoch fake)
         pure (readTVar (fEpoch fake) >>= \now → when (now == epoch) retry)
-    , portMarkReleased = \ref → modifyTVar' (fMarked fake) (Set.insert ref)
+    , portMarkReleased = \ref → do
+        raising ← takeInjection fake (\case RaiseMark → Just (); _ → Nothing)
+        when (raising == Just ()) (throwSTM (userError "injected: marking the release raised"))
+        modifyTVar' (fMarked fake) (Set.insert ref)
     }
   where
     cfg = fConfig fake
@@ -464,7 +470,10 @@ deviceFor fake =
                   record fake ("registered " <> tshow image <> " slot " <> tshow slot <> " alpha " <> tshow (levelBinaryAlpha level))
                   bump fake
                   pure (Right (Registration (TextureRef slot generation) slot))
-    , deviceTable = atomically (TableReading <$> readTVar (fBound fake) <*> readTVar (fRetiring fake))
+    , deviceTable = do
+        raising ← atomically (takeInjection fake (\case RaiseTable → Just (); _ → Nothing))
+        when (raising == Just ()) (throwIO (userError "injected: reading the table raised"))
+        atomically (TableReading <$> readTVar (fBound fake) <*> readTVar (fRetiring fake))
     , deviceRelease = \registration → do
         noteEvent fake "release attempted"
         raising ← atomically (takeInjection fake (\case RaiseRelease → Just (); _ → Nothing))

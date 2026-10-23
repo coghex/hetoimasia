@@ -74,6 +74,7 @@ module Hetoimasia.LuaEngine.Graphics.Texture.Backend
 
 import Control.Concurrent.STM
   ( STM
+  , catchSTM
   , TVar
   , atomically
   , newTVar
@@ -178,6 +179,8 @@ data Boot
   | -- | Not bound at the last reading: read again when the owner's progress moves.
     BootWaiting !(STM ())
   | BootReady
+  | -- | Nothing more will be read: the owner ended, or reading the table failed. Texture work cannot start.
+    BootStopped
 
 -- | One accepted upload, from 'backendUpload' to its terminal event.
 data Job image ticket = Job
@@ -376,12 +379,16 @@ awaitBound backend = do
   atomically . modifySTMState backend $ \st → case sBoot st of
     BootIdle → st {sBoot = BootPending}
     _ → st
-  atomically $ do
+  outcome ← atomically $ do
     st ← readTVar (bState backend)
-    case (sBoot st, sEnded st) of
-      (BootReady, _) → pure ()
-      (_, Just _) → pure ()
+    case (sBoot st, sFailure st, sEnded st) of
+      (BootReady, _, _) → pure (Right ())
+      (_, Just failure, _) → pure (Left failure)
+      (_, _, Just why) → Left <$> staged ("the graphics owner ended before the texture table was bound: " <> why)
       _ → retry
+  either rethrowIO pure outcome
+  where
+    staged why = pure (ExceptionWithContext mempty (toException (BackendDefect why)))
 
 -- | Wait, in STM, for the first failure the backend latched: a defect, a raised action, a cleanup that
 -- failed. A supervisor composes it into a supervised wait.
@@ -477,6 +484,13 @@ faultText = \case
   FaultFatal why → why
 
 -- | An exception recorded as evidence by a transaction, which has no context of its own to attach.
+-- | The logical release of a registered texture, at once. A port that raises here is a failure to record, not a
+-- reason to skip what follows it: the release is still requested, and a close still drains; the raise is latched.
+markReleased ∷ Backend image ticket → Registration → STM ()
+markReleased backend registration =
+  portMarkReleased (bPort backend) (registrationRef registration)
+    `catchSTM` \raised → latchSTM backend "marking a texture released" (plain raised)
+
 plain ∷ SomeException → ExceptionWithContext SomeException
 plain = ExceptionWithContext mempty
 
@@ -558,10 +572,17 @@ firstJust ∷ [STM (Maybe a)] → STM (Maybe a)
 firstJust = foldr (\candidate rest → candidate >>= maybe rest (pure . Just)) (pure Nothing)
 
 -- | Note the owner's end once, whichever way it was learned.
-noteEnded ∷ Backend image ticket → Text → STM ()
+noteEnded ∷ Backend image ticket → Text → STM Bool
 noteEnded backend why = do
   st ← readTVar (bState backend)
-  when (sEnded st == Nothing) (ownerEnded backend why)
+  case sEnded st of
+    Nothing → True <$ ownerEnded backend why
+    Just _ → pure False
+
+-- | A step for having learned of the owner's end, if it was news: learning it again changes nothing, so it must not
+-- count as progress, or the pump would run forever on an end it has already taken in.
+endedStep ∷ Backend image ticket → Text → STM (Maybe Step)
+endedStep backend why = (\news → if news then Just StepProgress else Nothing) <$> noteEnded backend why
 
 -- | The owner has ended: nothing more will run on its thread, and what it made is retired by its own
 -- teardown, which this backend cannot prove. Every unfinished job fails and every texture not proved
@@ -569,7 +590,15 @@ noteEnded backend why = do
 ownerEnded ∷ Backend image ticket → Text → STM ()
 ownerEnded backend why = do
   st ← readTVar (bState backend)
-  writeTVar (bState backend) st {sEnded = Just why, sJobs = Map.map (failWith ("the graphics owner ended: " <> why)) (sJobs st)}
+  writeTVar
+    (bState backend)
+    st
+      { sEnded = Just why
+      , sJobs = Map.map (failWith ("the graphics owner ended: " <> why)) (sJobs st)
+      , sBoot = case sBoot st of
+          BootReady → BootReady
+          _ → BootStopped
+      }
   forM_ (Map.elems (sTextures st)) $ \tex → do
     stage ← readTVar (tStage tex)
     unless (terminalStage stage) $
@@ -653,6 +682,9 @@ jobStep backend standing jid job = do
               -- The table's bootstrap is read once, when the first upload needs it, and read again as the owner
               -- progresses until it is bound. Nothing is registered before it is.
               BootIdle → Just StepProgress <$ modifySTMState backend (\now → now {sBoot = BootPending})
+              -- It will never be bound (the owner ended, or reading the table failed and was latched): the job
+              -- fails now rather than waiting for a table nobody will bind.
+              BootStopped → failAt PUploaded "the texture table was never bound"
               _ → pure Nothing
       PRegistering wake sub → outcomeOf sub $ \case
         Returned Nothing → advance PRegistered
@@ -692,6 +724,10 @@ jobStep backend standing jid job = do
           wake ← portWatch (bPort backend)
           portAct (bPort backend) (\device → deviceTable device) >>= \case
             Right sub → Just StepProgress <$ setPhase backend jid (PRetireChecking wake sub)
+            -- Retirement can no longer be proved once the owner is gone: the job settles failed, not retired.
+            Left (PortEnded why) → do
+              _ ← noteEnded backend why
+              cleanupFailed ("the graphics owner ended before the texture was proved retired: " <> why)
             Left refusal → refused refusal
       PRetireChecking wake sub → outcomeOf sub $ \case
         Returned reading
@@ -732,7 +768,7 @@ jobStep backend standing jid job = do
     refused = \case
       PortFull → pure Nothing
       PortNotStarted → pure Nothing
-      PortEnded why → Just StepProgress <$ noteEnded backend why
+      PortEnded why → endedStep backend why
 
 refusalText ∷ PortRefusal → Text
 refusalText = \case
@@ -747,27 +783,34 @@ bootStep ∷ Backend image ticket → STM (Maybe Step)
 bootStep backend = readTVar (bState backend) >>= \st → case sBoot st of
   BootIdle → pure Nothing
   BootReady → pure Nothing
+  BootStopped → pure Nothing
   BootPending → do
     wake ← portWatch (bPort backend)
     portAct (bPort backend) (\device → deviceTable device) >>= \case
-      Right sub → Just StepProgress <$ writeTVar (bState backend) st {sBoot = BootChecking wake sub}
-      Left (PortEnded why) → Just StepProgress <$ noteEnded backend why
+      Right sub → Just StepProgress <$ setBoot (BootChecking wake sub)
+      Left (PortEnded why) → endedStep backend why
       Left _ → pure Nothing
   BootChecking wake sub →
     submittedOutcome sub >>= \case
       Nothing → pure Nothing
       Just (Returned reading) →
-        Just StepProgress <$ writeTVar (bState backend) st {sBoot = if tablePlaceholderWritten reading then BootReady else BootWaiting wake}
+        Just StepProgress <$ setBoot (if tablePlaceholderWritten reading then BootReady else BootWaiting wake)
       Just (Raised raised) → do
+        -- A table that cannot be read is a failure of the provider, latched: assembly raises it and texture work
+        -- is never admitted over a table nobody could read.
         latchSTM backend "reading the texture table" (plain raised)
-        Just StepProgress <$ writeTVar (bState backend) st {sBoot = BootWaiting wake}
-      Just (NotRun (PortEnded why)) → Just StepProgress <$ noteEnded backend why
-      Just (NotRun _) → Just StepProgress <$ writeTVar (bState backend) st {sBoot = BootPending}
+        Just StepProgress <$ setBoot BootStopped
+      Just (NotRun (PortEnded why)) → endedStep backend why
+      Just (NotRun _) → Just StepProgress <$ setBoot BootPending
   BootWaiting wake → do
     waiting ← (wake >> pure False) `orElse` pure True
     if waiting
       then pure Nothing
-      else Just StepProgress <$ writeTVar (bState backend) st {sBoot = BootPending}
+      else Just StepProgress <$ setBoot BootPending
+  where
+    -- Every write is to the state as it is now, never to the snapshot above: a latch or an end noted a moment ago is
+    -- in the current state, and a write of the snapshot would erase it.
+    setBoot next = modifySTMState backend (\now → now {sBoot = next})
 
 modifySTMState ∷ Backend image ticket → (State image ticket → State image ticket) → STM ()
 modifySTMState backend f = readTVar (bState backend) >>= writeTVar (bState backend) . f
@@ -795,7 +838,7 @@ beginDisposal backend jid job = do
     (Nothing, Nothing) → Just StepProgress <$ setPhase backend jid PSettled
   where
     ended why = do
-      noteEnded backend why
+      _ ← noteEnded backend why
       Just StepProgress
         <$ modifyJob
           backend
@@ -890,6 +933,8 @@ submitUpload backend jid = do
             Left caught@(ExceptionWithContext _ (SomeException raised)) → do
               latchSTM backend "admitting the texture's upload" caught
               modifyJob backend jid (\found -> (failWith ("admitting the upload raised: " <> Text.pack (show raised)) found) {jPhase = PAllocated})
+          -- Recorded first, so the job is settled whatever follows; a cancellation of the pump is not swallowed.
+          either rethrowIfAsync (const (pure ())) admitted
 
 -- | Offer the registered texture. The pipeline's answer decides who owns it.
 deliver ∷ ∀ image ticket. Backend image ticket → JobId → TexId → Registration → UploadSink → IO ()
@@ -909,18 +954,24 @@ deliver backend jid tid registration sink = do
       case answered of
         Right SinkTaken → atomically $ do
           stage ← readTVar (tStage offered)
-          writeTVar (tStage offered) $ case stage of
-            TexOfferedReleased → TexReleaseRequested
-            _ → TexLive
+          -- An offer a close found in flight was marked released by the close ('closeAndDrain'), and no offer
+          -- begins once a close has: a job that has begun to end disposes instead of offering. One the owner's end
+          -- already failed stays failed.
+          case stage of
+            TexOffered → writeTVar (tStage offered) TexLive
+            TexOfferedReleased → writeTVar (tStage offered) TexReleaseRequested
+            _ → pure ()
           modifySTMState backend (\st → st {sJobs = Map.delete jid (sJobs st)})
         Right SinkLate → atomically $ do
           -- The pipeline ended the job: it took nothing, and the texture is still the backend's.
           modifySTMState backend (\st → st {sTextures = Map.delete tid (sTextures st), sLate = sLate st + 1})
           modifyJob backend jid (\found → found {jLate = True, jCancel = True, jPhase = PRegistered})
-        Left caught@(ExceptionWithContext _ (SomeException raised)) → atomically $ do
-          latchSTM backend "answering the pipeline's sink" caught
-          modifySTMState backend (\st → st {sTextures = Map.delete tid (sTextures st)})
-          modifyJob backend jid (\found → (failWith ("the sink raised: " <> Text.pack (show raised)) found) {jPhase = PRegistered})
+        Left caught@(ExceptionWithContext _ (SomeException raised)) → do
+          atomically $ do
+            latchSTM backend "answering the pipeline's sink" caught
+            modifySTMState backend (\st → st {sTextures = Map.delete tid (sTextures st)})
+            modifyJob backend jid (\found → (failWith ("the sink raised: " <> Text.pack (show raised)) found) {jPhase = PRegistered})
+          rethrowIfAsync caught
 
 textureIdentityOf ∷ Registration → Word64
 textureIdentityOf = Port.textureIdentity . registrationRef
@@ -940,6 +991,14 @@ emitTerminal backend jid job = do
       Right SinkTaken → pure ()
       Left caught → latchSTM backend "delivering the terminal event" caught
     modifySTMState backend (\st → st {sJobs = Map.delete jid (sJobs st)})
+  either rethrowIfAsync (const (pure ())) answered
+
+-- | After an exception was recorded and the state settled around it: a cancellation of the pump is raised again,
+-- not swallowed as the failure of the one step it interrupted.
+rethrowIfAsync ∷ ExceptionWithContext SomeException → IO ()
+rethrowIfAsync caught@(ExceptionWithContext _ raised) = case fromException raised of
+  Just (SomeAsyncException _) → rethrowIO caught
+  Nothing → pure ()
 
 -- Textures ---------------------------------------------------------------------------------------------------
 
@@ -966,7 +1025,7 @@ releaseTexture backend tex = do
   pure (retirementOf (tStage tex))
   where
     request next = do
-      portMarkReleased (bPort backend) (registrationRef (tRegistration tex))
+      markReleased backend (tRegistration tex)
       writeTVar (tStage tex) next
 
 retirementOf ∷ TVar TexStage → STM RetirementState
@@ -985,7 +1044,7 @@ textureStep backend tid tex = do
       portRelease (bPort backend) (releaseAction (tRegistration tex)) >>= \case
         Right sub → Just StepProgress <$ writeTVar (tStage tex) (TexReleasing sub)
         Left (PortEnded why) → do
-          noteEnded backend why
+          _ ← noteEnded backend why
           Just StepProgress <$ failTexture ("the graphics owner ended before the release ran: " <> why)
         Left _ → pure Nothing
     TexReleasing sub →
@@ -1008,7 +1067,7 @@ textureStep backend tid tex = do
           portAct (bPort backend) (\device → deviceTable device) >>= \case
             Right sub → Just StepProgress <$ writeTVar (tStage tex) (TexChecking fresh sub)
             Left (PortEnded why) → do
-              noteEnded backend why
+              _ ← noteEnded backend why
               Just StepProgress <$ failTexture ("the graphics owner ended before the texture was proved retired: " <> why)
             Left _ → pure Nothing
     TexChecking wake sub →
@@ -1047,8 +1106,12 @@ closeAndDrain backend = do
       stage ← readTVar (tStage tex)
       case stage of
         TexLive → do
-          portMarkReleased (bPort backend) (registrationRef (tRegistration tex))
+          markReleased backend (tRegistration tex)
           writeTVar (tStage tex) TexReleaseRequested
+        -- An offer in flight is released when it is taken ('deliver'); when it is refused it is the job's.
+        TexOffered → do
+          markReleased backend (tRegistration tex)
+          writeTVar (tStage tex) TexOfferedReleased
         _ → pure ()
   remembered ← newIORef Nothing
   let keep caught = atomicModifyIORef' remembered (\held → (Just (fromMaybe caught held), ()))

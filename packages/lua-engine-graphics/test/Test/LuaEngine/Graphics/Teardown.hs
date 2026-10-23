@@ -3,10 +3,9 @@
 -- remembered and raised after; and it neither closes the shared owner nor disturbs a peer's texture.
 module Test.LuaEngine.Graphics.Teardown (spec) where
 
-import Control.Concurrent (forkIO, throwTo)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryReadMVar)
+import Control.Concurrent (throwTo)
 import Control.Concurrent.STM (atomically, retry)
-import Control.Exception (AsyncException (UserInterrupt), SomeException, try)
+import Control.Exception (AsyncException (UserInterrupt))
 import Hetoimasia.LuaEngine.Graphics.Texture.Backend (BackendReading (..))
 import Hetoimasia.LuaEngine.Graphics.Texture.Port (Standing (..))
 import Hetoimasia.LuaEngine.Texture.Backend (BackendTexture (..), RetirementState (..))
@@ -37,48 +36,43 @@ spec = describe "the backend's scope ends in dependency order" $ do
 
   it "waits for the table's evidence when it closes, and returns the moment the evidence is in" $ do
     fake ← newFake defaultFakeConfig
-    finished ← newEmptyMVar
     withFakeOwner fake . bounded $ do
-      _ ← forkIO $ do
-        outcome ← try @SomeException . withBackendOnRaw fake $ \rig → do
+      forked ← forkScope $ do
+        withBackendOnRaw fake $ \rig → do
           probe ← newProbe
           _ ← submit rig probe 2 2 255
           _ ← awaitTerminal probe
           hold fake HoldReclaim
           setVersionHolders fake 1
-        putMVar finished outcome
+        noteEvent fake "scope returned"
       -- The scope has closed and released the texture; a batch still maps its slot.
       awaitEvent fake "released"
-      tryReadMVar finished >>= \case
-        Nothing → pure ()
-        Just _ → expectationFailure "the scope returned although a batch still held the texture's version"
+      noteEvent fake "evidence supplied"
       setVersionHolders fake 0
       release fake HoldReclaim
-      takeMVar finished >>= either (\failure → expectationFailure (show failure)) pure
+      forkedJoin forked >>= either (\failure → expectationFailure (show failure)) pure
+      assertBefore fake "evidence supplied" "scope returned"
 
   it "remembers a cancellation delivered while it waits, finishes the drain, and raises it after" $ do
     fake ← newFake defaultFakeConfig
-    finished ← newEmptyMVar
     withFakeOwner fake . bounded $ do
-      thread ← forkIO $ do
-        outcome ← try @SomeException . withBackendOnRaw fake $ \rig → do
+      forked ← forkScope $ do
+        withBackendOnRaw fake $ \rig → do
           probe ← newProbe
           _ ← submit rig probe 2 2 255
           _ ← awaitTerminal probe
           hold fake HoldReclaim
           setVersionHolders fake 1
-        putMVar finished outcome
+        noteEvent fake "scope returned"
       awaitEvent fake "released"
-      throwTo thread UserInterrupt
-      tryReadMVar finished >>= \case
-        Nothing → pure ()
-        Just _ → expectationFailure "the scope returned although a batch still held the texture's version"
+      throwTo (forkedThread forked) UserInterrupt
+      noteEvent fake "evidence supplied"
       setVersionHolders fake 0
       release fake HoldReclaim
-      takeMVar finished >>= \case
+      forkedJoin forked >>= \case
         Left _ → pure ()
         Right () → expectationFailure "the cancellation was lost"
-      -- The drain ran to its end first: nothing native is left.
+      -- The drain ran to its end first: the evidence was in before the scope left, and nothing native is left.
       problems ← atomically (leaked fake)
       problems `shouldBe` []
 
