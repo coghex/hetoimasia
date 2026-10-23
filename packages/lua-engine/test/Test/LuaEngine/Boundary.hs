@@ -483,6 +483,7 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.Foundation.Time"
                , "Hetoimasia.Foundation.Log"
                , "Hetoimasia.Foundation.Resource"
+               , "Hetoimasia.Foundation.Worker"
                , "Hetoimasia.Runtime.Logging"
                , "Hetoimasia.Runtime.Supervision"
                , "Hetoimasia.Content"
