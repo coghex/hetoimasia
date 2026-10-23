@@ -588,7 +588,7 @@ the texture itself retired.
 | A texture owner's banks and role | one instance's bindings, from `newTextureOwner` (no registry) | admission, the decode stage's shrink, the lease and the pipeline's housekeeping | `ownerReading` | until its textures are retired; `closeTextureOwner` only stops new requests |
 | A lane and its workspace bank (128 MiB) | the pipeline | the read sink, the decoder's account, the handoff, the backend's buffer retirement | `readingLanes` | a job holds it from the start of its read until the backend stops reading the level |
 | A job (stage, buffers, withdrawn/stopping flags) | the pipeline | the same | diagnostics | from admission until the host returns its record; entries exist only for admitted requests |
-| A texture's `Cell` | the pipeline until a lease adopts it, then the lease | the backend's sink, the adoption recipe, the release | the retirement readings | exactly one party calls the backend's release, once |
+| A texture's `Cell` | the pipeline until the answer offers it, then the host (adopt or drop), then the lease | the backend's sink, the answer's offer, the adoption recipe, the release | the retirement readings | one transition per decision on the cell (offer, adopt, claim); exactly one party calls the backend's release, once |
 
 There are two session read workers (the shared pool, LFE-10), **one decode worker** and **two lanes**. No thread is made
 for a request, an instance or a VM.
@@ -622,11 +622,26 @@ polls and nothing sleeps, and closing never depends on the worker being alive.
 
 On the backend's usable registration the pipeline holds a `Cell` and answers the request with a resource the host builds,
 on the owner's thread, into the lease the admission reserved. Until that build runs the texture belongs to the cell and
-afterwards to the lease; the cell's state machine decides who may release it. If the host drops the build (the request was
-cancelled, its instance ended) it does not tell the provider, so the pipeline learns of it where the host does return a
-credit: a credit that transfers, returned unused, means no lease owns the texture, and the pipeline's housekeeping releases
-it and returns the charge only when the backend proves it retired. A lease built over a cell the pipeline already released
-returns its charges when that release retires.
+afterwards to the lease. Three decisions are made on the cell, each one transaction, so a texture is never both published and
+released:
+
+* **offer**: the answer that hands the host a resource first moves the cell from delivered to *offered*, in the same
+  transaction that reads whether the host still wants the job. A cell something already claimed (a shutdown) cannot be
+  offered, and the request is answered a failure; a job the host withdrew is answered nothing, and the withdrawal released the
+  cell;
+* **adopt**: the host's build moves an offered cell to adopted. The one other state it can find is claimed, and that only
+  after the host's own interest ended (the request was cancelled or its instance ended between the answer and the build),
+  which the host discovers atomically with the result and answers by releasing the lease it built, so its charges return when
+  the release retires;
+* **claim**: the pipeline may claim a cell nobody adopted (a failed upload, a withdrawn job, a request the host answered late
+  or refused, a build the host dropped); a **shutdown** (a failed pipeline, a closing scope) may claim only a cell nobody
+  *offered*; the lease claims an adopted one; exactly one party ever does, and it calls the backend once.
+
+So a shutdown never starts releasing a texture the host holds for adoption: that texture is adopted, and lives until its lease
+ends, or it is dropped (the host returns the credit unused) and the pipeline then releases it. The drain waits for an offered
+texture to be adopted or dropped. If the host drops the build it does not tell the provider, so the pipeline learns of it where
+the host does return a credit: a credit that transfers, returned unused, means no lease owns the texture, and the pipeline's
+housekeeping releases it and returns the charge only when the backend proves it retired.
 
 ### Release, cancellation and teardown
 
@@ -642,7 +657,7 @@ returns its charges when that release retires.
   active. A late texture is released once and never reaches the request.
 * Closing admission precedes every drain. The scope withdraws what has not started, tells started work to stop, then waits
   in STM, outside any uninterruptible release, for every read, decode and upload to retire and for every texture it still
-  holds to be released and proved retired; a cancellation delivered meanwhile is remembered and raised after. Only then does
+  holds to be released and proved retired, or, if it is offered, adopted or dropped; a cancellation delivered meanwhile is remembered and raised after. Only then does
   the group stop the worker, and only then may the pool, the inventory and the backend unwind. **The drain always runs**: admission
   closes in a transaction of its own, whatever the close step raised (a callback that raises, a cancellation delivered inside it)
   is retained as the first exception, the drain then meets every outstanding obligation, and the retained exception is raised
@@ -681,7 +696,11 @@ backend that holds every upload and every release until the example says otherwi
 uploaded texels or GPU readiness: LFE-17 establishes those). Each bank is filled and refused with nothing left reserved,
 the fixed values are checked, the stages and cancellation windows are driven by gates and hooks, never by sleeping, and a
 separately compiled client composes the pipeline through public modules. `PipelineHooks` are this package's coordination
-points for those examples; production uses `noHooks`.
+points for those examples; production uses `noHooks`. Two rules keep the examples from hanging
+or racing: an example acts on a result only after the host's own reply (the script waits for it with `wait_take`; the
+pipeline settling a job is not the host having the answer), and every exit of an example or of a nested scope, an assertion
+failure included, opens every gate and hook it can hold and lets every backend answer what it owes before anything waits for
+the pipeline to drain.
 
 ## The module coordinator (LFE-11)
 
@@ -702,7 +721,7 @@ withModuleCoordinator ∷ ModuleSpec → (Coordinator → IO a) → IO a        
 coordinatorPlan       ∷ Coordinator → LoaderPlan                           -- the owner's scheduledLoader
 coordinatorEndpoint   ∷ Coordinator → RequestEndpoint                      -- the grant's "module" endpoint
 attachLoader          ∷ Coordinator → LoaderEndpoint → IO ()               -- once, right after the owner starts
-startModule           ∷ Coordinator → ModuleRequest → RequestContext → IO () → IO ModuleStart
+startModule           ∷ Coordinator → ModuleRequest → RequestContext → IO () → IO M1Start
 moduleArgumentCheck   ∷ Coordinator → ([Value] → ModuleRequest) → ArgumentCheck
 bootModule            ∷ Coordinator → ContentKey → IO (Either BootRefusal BootTicket)
 lookupImmediate       ∷ Coordinator → ExportIdentity → STM ImmediateLookup
@@ -746,22 +765,41 @@ endpoint is handed anything and before a source is asked for; temporary pressure
 answer with no handle, read or partial reservation. A request that joins a held identity needs no identity slot (a full cache
 still answers lookups and joins) but still needs request capacity.
 
-The permanent decision is taken **with its reservation, in the argument check**: `moduleArgumentCheck` refuses a new identity at
-a full cache as an ordinary Lua error and otherwise holds the place for the request in one transaction, so a boot load that
-arrives before the admission finds the place taken and is the one refused (`BootCacheFull`), and the cache, which never frees a
-place, can never make an accepted request busy. The admission *adopts* that place (`reserveIdentitySTM`) instead of taking a
-second; `startModule` gives it back if the admission is busy on a temporary bank or raises (`releaseCheckSTM`), and answers
-`StartRefused` only for a call that skipped the check and met a full cache or a closed coordinator, which the caller fails as a
-fault of the call (the host does the same for a call that skipped its own permanent checks), never as a busy answer.
+The permanent decision is taken **where the place is actually taken**, by the identity credit of the admission, in the same
+transaction; **the argument check only reads and decides nothing about the cache**. `moduleArgumentCheck` is the host's check of
+the arguments and of what is visible about the caller (role, phase, offset, ceiling, request numbers), each an ordinary Lua error
+before any work; it neither reserves nor refuses on cache state, so a later check of the same binding that rejects leaves nothing
+behind and a place that goes to another thread at any moment is still refused as what it is. The credit (`reserveIdentitySTM`) tells
+three things apart:
 
-What can change decides the answer, on every path: a temporary bank (the instance's, the VM's or the owner's places, result
-storage, the unsettled boot loads) is `busy` with nothing reserved; what waiting cannot fix is a refusal made with its
-reservation (a new identity at a full cache, `BootCacheFull`, a closed coordinator, `BootClosed`), and a dependency the
-chain discovers at the limit fails the accepted chain (`module_limit`). `Limits` (`refusals told apart by what can change`)
-has an example of each, and of a call that skipped the check meeting each.
+* **room**: the place is held (counted per identity, and taken whole by the job's creation by whatever path: a request, a boot
+  load, a dependency the chain found);
+* **full for good**: the VM's permanent entries (pending, evaluating, ready and failed jobs) fill the 256, or the coordinator has
+  closed. The cache never frees a place, so the credit raises `CreditRefused` and the host refuses the request **before any bank is
+  asked**, as an ordinary catchable Lua error naming the module limit (a binding opted in to ordinary refusals, which the LFE-12
+  binding is: `pcall` catches it and the invocation can go on). No handle, job, read, hold or failed entry remains, it is not a fault of
+  the call, not the instance's failure and not busy, and it wins over a full temporary bank in the same transaction;
+* **room held only by other admissions' reservations**, which can still be given back: the credit answers `False`, which is the
+  host's `busy` with nothing reserved. A boot load meeting the same state is `BootBusy` (ask again); once the place is a permanent
+  job it is `BootCacheFull`.
 
-A new module at a full cache is **refused before any work**, as an ordinary catchable Lua error from `moduleArgumentCheck`
-(the host's own role, phase and offset checks run first), with no failed entry allocated. A dependency that a running module
+Temporary banks (the instance's 16 and the VM's 64 request places, the owner's places, result storage, the unsettled boot loads) are
+`busy`, data, with nothing reserved. `startModule` is therefore plain `startM1` (accepted or busy); a permanent refusal is the host's
+ordinary error, raised from inside the admission, and the facade's binding (LFE-12) owns only the Lua spelling. `Limits` has a gated
+example of each of these, in both orders of a boot load and a request racing for the last place.
+
+What can change decides the answer, on every path: a temporary bank is `busy`; what waiting cannot fix is a refusal (a new identity
+at a full cache, `BootCacheFull`, a closed coordinator, `BootClosed`), and a dependency the chain discovers at the limit fails the
+accepted chain (`module_limit`).
+
+The coordinator's loader plan (`coordinatorPlan`) **opts in to the host's failed-lookup latch**: its `hookObserved` answers the
+attributed failure, so a hook (or a helper a hook called) that `pcall`-imports an identity that has failed still fails its instance
+with the module's attributed failure, whatever it did with the error, and nothing fails when no instance's code is running (a task's
+lookup latches nothing). A plan that does not opt in keeps the ordinary catchable error. `Positions` proves all three through
+`coordinatorPlan` on a real scheduled owner.
+
+A new module at a full cache is **refused before any work**, as an ordinary catchable Lua error naming the module limit, with
+no failed entry allocated. A dependency that a running module
 discovers at the limit, or past the chain depth or the source limit, fails the **accepted** chain (`module_limit`,
 `too_large`), with the dependency given no entry and what the chain completed kept. Taking or cancelling a waiter never frees a
 permanent identity: nothing is evicted, restarted or retried. The room reserved for an accepted root counts against the
@@ -828,7 +866,7 @@ state, which refuses to republish, resurrect a waiter or reach the closed VM.
 
 | State | Owner and thread | Created / tracked | Bound | Cancellation windows | Terminal / released when | Proved by |
 | --- | --- | --- | --- | --- | --- | --- |
-| identity reservation (`csPromised`) | the coordinator; the admitting hook's thread | reserved by the request's argument check (`reserveForCheckSTM`) and adopted by the admission's identity credit, or reserved by the credit for a call that skipped the check | identities less held | busy on a temporary bank or an exception gives the check's place back (`releaseCheckSTM`); the admission taken back before the endpoint is handed anything | consumed whole by the job's creation, whichever path makes the job (a request, a boot load, a dependency the chain found), so an identity is never counted twice; or its own reservation returned by `CreditUnused` exactly once (reservations of one identity are counted, so one admission taken back never removes another's) | `Limits` (room promised to a boot load; promise turned into the boot load's job; dependency refused after an interleaved acceptance), `Stages` |
+| identity reservation (`csPromised`) | the coordinator; the admitting hook's thread | the admission's identity credit (`reserveIdentitySTM`); the argument check reserves nothing | identities less held | the admission taken back before the endpoint is handed anything | consumed whole by the job's creation, whichever path makes the job (a request, a boot load, a dependency the chain found), so an identity is never counted twice; or its own count returned by `CreditUnused` exactly once (reservations of one identity are counted, so one admission taken back never removes another's) | `Limits` (room promised to a boot load; promise turned into the boot load's job; dependency refused after an interleaved acceptance; both orders of a boot load and a request for the last place), `Stages` |
 | job entry (`csJobs`) | the coordinator; the owner's thread, with sinks and withdrawals in STM | `acceptRequest`, a boot load, or the loader asking for a dependency's source | 256 per VM, permanent | none: a job is never withdrawn | at the VM's end (`Stopped` if unfinished) | `Basics`, `Positions`, `Lifecycle` |
 | waiter | the job; created by the endpoint's submit | `acceptRequest`, atomically with the join | the request banks (16 per instance, 64 per VM) | cancel, instance end and publication, each once | replied or detached, whichever comes first; the host releases the request place after take and retirement | `Positions`, `Lifecycle` |
 | evaluation position (`jobDue`) | the job | the earliest contributed position | one per job | never moves later; promotion races cancellation | the job's outcome | `Positions`, `Promotion` |
