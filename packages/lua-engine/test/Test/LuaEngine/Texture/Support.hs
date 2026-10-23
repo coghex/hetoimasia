@@ -99,6 +99,8 @@ module Test.LuaEngine.Texture.Support
   , awaitGate
   , releaseGate
   , directRead
+  , setRaceClose
+  , uploadFor
   , grantOne
   , leaseSummary
   , awaitLeaseSummary
@@ -267,6 +269,9 @@ data Session = Session
   , ssIds ∷ !(IORef (Map Text InstanceId))
   , ssTickets ∷ !(IORef (Map Text InstanceTicket))
   , ssConfig ∷ !Config
+  , ssRace ∷ !(IORef Bool)
+    -- ^ When set, the owner is closed right after its argument check passes: a closure that lands
+    -- between the check and the admission.
   }
 
 scanSpec ∷ InventorySpec
@@ -313,6 +318,7 @@ withSession cfg body =
                 <*> newIORef Map.empty
                 <*> newIORef Map.empty
                 <*> pure cfg
+                <*> newIORef False
             withLoggingLifetime quietLogger $ \lifetime →
               withSupervision lifetime $ \control → do
                 runtime ← newLuaRuntime control
@@ -862,12 +868,20 @@ bindings session vm _ =
           case asked of
             Left why → throwIO (userError (Text.unpack why))
             Right request → do
-              started ← startTexture service request context
-              pure (m1StartResults requestHandleType started)
+              startTexture service request context >>= \case
+                TextureStarted started → pure (m1StartResults requestHandleType started)
+                -- The scaffold hands it back as data under a code of its own: a permanent refusal is not busy.
+                TextureRefused why → pure [VNil, VRecord [("code", VText "refused"), ("message", VText why)]]
     check owner values =
       requestFrom values >>= \case
         Left why → pure (Just why)
-        Right request → textureArgumentCheck service (const request) owner values
+        Right request →
+          textureArgumentCheck service (const request) owner values >>= \case
+            Nothing → do
+              racing ← readIORef (ssRace session)
+              when racing (closeTextureOwner (requestedOwner request))
+              pure Nothing
+            refused → pure refused
     using =
       recoverableRefusals $
         stateOperation "use" [SCapability textureHandleType] [SInteger] $ \arguments → case arguments of
@@ -915,6 +929,19 @@ openGates session = do
 -- | Wait until a script is inside the call that holds this gate.
 awaitGate ∷ Session → Text → IO ()
 awaitGate session name = gateIn (ssEntered session) name >>= readMVar
+
+-- | Close each request's owner right after its argument check passes, from now on.
+setRaceClose ∷ Session → Bool → IO ()
+setRaceClose session = writeIORef (ssRace session)
+
+-- | The upload of this path (the source ends with it), waiting for it to arrive: uploads arrive in the
+-- order the workers finish, which is not the order the requests were made.
+uploadFor ∷ Fake → Text → IO Held
+uploadFor fake path = atomically $ do
+  seen ← readTVar (fkHeld fake)
+  case [found | found ← seen, path `Text.isSuffixOf` uploadSource (heldUpload found)] of
+    found : _ → pure found
+    [] → retry
 
 -- | Let the script that is inside the call holding this gate go on.
 releaseGate ∷ Session → Text → IO ()

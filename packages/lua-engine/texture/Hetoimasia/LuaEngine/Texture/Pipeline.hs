@@ -108,6 +108,8 @@ module Hetoimasia.LuaEngine.Texture.Pipeline
   , prepareRequest
   , forgetPrepared
   , requestCredits
+  , ownerLiveName
+  , ownerAndPipelineLive
   , fateOf
   , textureCodes
 
@@ -755,6 +757,12 @@ modifyState tp change = readTVar (tpState tp) >>= writeTVar (tpState tp) . chang
 requestCredits ∷ TexturePipeline → Prepared → [Credit]
 requestCredits tp prepared =
   [ Credit
+      { creditName = ownerLiveName
+      , creditReserve = ownerAndPipelineLive tp (chargeOwner charge)
+      , creditRelease = \_ → pure ()
+      , creditTransfers = False
+      }
+  , Credit
       { creditName = "texture slots"
       , creditReserve = reserveSlot charge
       , creditRelease = \_ → settleCharge tp token charge
@@ -786,6 +794,20 @@ requestCredits tp prepared =
   where
     token = prepToken prepared
     charge = prepCharge prepared
+
+-- | The name of the admission's first credit, which reserves nothing and says whether the owner still
+-- takes requests and the pipeline is open: read in the admission's own transaction, so a closure that
+-- lands between the argument check and the admission cannot let a request reserve for a closed owner.
+-- A bank that answers no here is busy to the host; 'Hetoimasia.LuaEngine.Texture.startTexture' reads
+-- the same facts again and reports the permanent refusal it was.
+ownerLiveName ∷ Text
+ownerLiveName = "texture owner"
+
+ownerAndPipelineLive ∷ TexturePipeline → TextureOwner → STM Bool
+ownerAndPipelineLive tp owner = do
+  open ← pipelineOpen tp
+  taking ← ownerIsOpen owner
+  pure (open && taking)
 
 -- | Take one of the pipeline's accepted-work records, if one is left, and place the request in the
 -- admission order, in the one transaction that admits it: the stage queues serve the oldest first, and

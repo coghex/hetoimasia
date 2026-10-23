@@ -133,6 +133,7 @@ module Hetoimasia.LuaEngine.Texture
   , textureKey
   , TextureRequest (..)
   , textureAsk
+  , TextureStart (..)
   , startTexture
   , textureArgumentCheck
 
@@ -170,7 +171,7 @@ import Hetoimasia.Content.Inventory
 import Hetoimasia.LuaEngine.Request
   ( M1Ask (..)
   , M1Requests
-  , M1Start
+  , M1Start (..)
   , m1Ask
   , m1ArgumentCheck
   , m1Profile
@@ -292,30 +293,50 @@ askFor _ request =
 pathText ∷ ContentKey → Text
 pathText = Encoding.decodeUtf8With Encoding.lenientDecode . logicalPathBytes . contentKeyPath
 
+-- | What starting a texture request came to.
+data TextureStart
+  = -- | The host's answer: accepted, or busy with nothing reserved.
+    TextureStarted !M1Start
+  | -- | A permanent refusal that reached the admission after the argument check passed (the owner was
+    -- closed, or the pipeline began closing, in between): nothing was reserved and no work was done. The
+    -- facade raises it as the error it is.
+    TextureRefused !Text
+  deriving (Eq, Show)
+
 -- | Start a texture request atomically: accepted, or busy with nothing reserved, no file opened and no
--- backend call. Permanent refusals are the argument check's ('textureArgumentCheck'); a call that skipped
--- it meets them here as a fault of the call.
+-- backend call. Permanent refusals are the argument check's ('textureArgumentCheck'); one that lands
+-- after it passed is the admission's own and comes back as 'TextureRefused', never as busy. A call that
+-- skipped the check meets the role here, as a fault of the call.
 --
 -- The request's token and charge are prepared before the admission and dropped after it, whatever it
 -- came to, so the pipeline keeps nothing for a request that was refused.
-startTexture ∷ HasCallStack ⇒ TextureService → TextureRequest → RequestContext → IO M1Start
+startTexture ∷ HasCallStack ⇒ TextureService → TextureRequest → RequestContext → IO TextureStart
 startTexture service request context = mask $ \restore → do
   let pipeline = servicePipeline service
-  -- A call that skipped the argument check meets the role here, as a fault of the call, before anything
-  -- is prepared or reserved.
-  when (ownerRole (requestedOwner request) /= PresentationRole) $
+      owner = requestedOwner request
+  when (ownerRole owner /= PresentationRole) $
     throwIO (TextureDefect "texture acquisition is presentation-instance hook work")
-  prepared ← prepareRequest pipeline (requestedOwner request) (requestedKey request)
-  restore
-    ( startM1
-        (serviceRequests service)
-        (textureAsk service request prepared)
-        context
-        textureEndpointName
-        [VInteger (fromIntegral (prepToken prepared))]
-        (pure ())
-    )
-    `finally` forgetPrepared pipeline (prepToken prepared)
+  prepared ← prepareRequest pipeline owner (requestedKey request)
+  started ←
+    restore
+      ( startM1
+          (serviceRequests service)
+          (textureAsk service request prepared)
+          context
+          textureEndpointName
+          [VInteger (fromIntegral (prepToken prepared))]
+          (pure ())
+      )
+      `finally` forgetPrepared pipeline (prepToken prepared)
+  case started of
+    -- The first credit answered no: read the same facts again to tell a permanent refusal from a bank
+    -- that was merely full when it was asked.
+    M1Busy _ → do
+      (open, taking) ← atomically ((,) <$> pipelineOpen pipeline <*> ownerIsOpen owner)
+      pure $ case refusalOf pipeline owner open taking of
+        Just why → TextureRefused why
+        Nothing → TextureStarted started
+    other → pure (TextureStarted other)
 
 -- | The argument check of a binding that builds the request from its copied arguments: the service's
 -- own permanent facts (the owner belongs to this pipeline and has not been closed, the pipeline is

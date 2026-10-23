@@ -320,8 +320,9 @@ ending = describe "instance end" $ do
       started session vm "i" "k0" "a.png"
       started session vm "j" "k0" "b.png"
       awaitUploads (ssFake session) 2
-      first ← uploadN (ssFake session) 0
-      second ← uploadN (ssFake session) 1
+      -- Uploads arrive in the order the workers finish: each is found by its own path.
+      first ← uploadFor (ssFake session) "a.png"
+      second ← uploadFor (ssFake session) "b.png"
       stopInstance session vm "i"
       awaitUploadCancelled first
       uploadCancelled second `shouldReturn` False

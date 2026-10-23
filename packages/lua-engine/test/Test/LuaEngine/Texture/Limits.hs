@@ -223,7 +223,8 @@ fixedValues = describe "the fixed profile's values" $ do
       loadAs session vm "i" "z" "a.png" >>= (`shouldBe` busy "i" "the provider has no room in texture bytes")
       -- The first two reads decode a two by two image and shrink their 16 MiB to 16 bytes each.
       openGate (ssProbe session) "a.png"
-      awaitOwner vm "i" (\reading → ownerNominalHeld reading < 128 * 1048576)
+      -- Room for one more full reservation, not merely less than a full bank.
+      awaitOwner vm "i" (\reading → 128 * 1048576 - ownerNominalHeld reading >= 16 * 1048576)
       started session vm "i" "y" "a.png"
 
 -- | A request the service refuses is an ordinary Lua error before any admission, never busy, and
@@ -269,6 +270,22 @@ refusals = describe "permanent refusals" $ do
       readsStarted (ssProbe session) `shouldReturn` 0
       d <- vmDiagnostics vm
       (rdBusy d, rdLatched d) `shouldBe` (0, 0)
+
+  it "refuse, as a permanent refusal and not as busy, a request whose owner is closed between the argument check and the admission: nothing is reserved and no work is done" $
+    withSession (config small layout) $ \session _ runtime → do
+      vm ← startVm session runtime "closing" OnArrival
+      admitDriver session vm "i"
+      pipelineBefore ← pipelineNow session
+      setRaceClose session True
+      commandWith session vm "i" "pstart" "a" (Just (load "a.png"))
+      line ← lineStarting session "i pstart a "
+      -- The facade got a permanent refusal back, with its reason: not the host's busy answer.
+      line `shouldBe` "i pstart a busy:refused:the texture owner has ended"
+      pipelineNow session >>= (`shouldBe` pipelineBefore)
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 0 0)
+      readsStarted (ssProbe session) `shouldReturn` 0
+      d <- vmDiagnostics vm
+      rdLatched d `shouldBe` 0
 
   it "take back every reservation when the provider raises as it is handed the request: the credits return unused and the pipeline keeps no job" $ do
     ExceptionWithContext _ failure ← fatalSession (config small layout) $ \session control runtime → do
