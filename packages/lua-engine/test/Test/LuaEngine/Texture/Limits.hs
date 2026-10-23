@@ -5,12 +5,13 @@
 -- made before anything is read, and concurrent admissions that cannot take capacity from one another.
 module Test.LuaEngine.Texture.Limits (spec) where
 
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), throwIO)
 import Control.Monad (forM_, when)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Content.ReadPool (PoolStatus (..))
 import Hetoimasia.LuaEngine.Profile (ByteLimit (..), CountLimit (..), fixedM1Profile)
-import Hetoimasia.Scripting.Lua.Provider (ProviderDiagnostics (..))
+import Hetoimasia.Scripting.Lua.Provider (ProviderDiagnostics (..), RequestEndpoint (..))
 import Test.Hspec
 import Test.LuaEngine.Request.Profiles (smaller)
 import Test.LuaEngine.Texture.Contract (layout, loadAs, small, started)
@@ -20,6 +21,7 @@ import Test.LuaEngine.Texture.Support
 spec ∷ Spec
 spec = describe "limits" $ do
   banks
+  refusals
   concurrency
   fixedValues
 
@@ -223,3 +225,52 @@ fixedValues = describe "the fixed profile's values" $ do
       openGate (ssProbe session) "a.png"
       awaitOwner vm "i" (\reading → ownerNominalHeld reading < 128 * 1048576)
       started session vm "i" "y" "a.png"
+
+-- | A request the service refuses is an ordinary Lua error before any admission, never busy, and
+-- leaves nothing reserved and nothing done.
+refusals ∷ Spec
+refusals = describe "permanent refusals" $ do
+  it "refuse a malformed address, a closed owner and a request from a hook that is ending as ordinary errors before any admission: never busy, nothing reserved, no work" $
+    withSession (config small layout) $ \session _ runtime → do
+      vm ← startVm session runtime "refusals" OnArrival
+      admitDriver session vm "i"
+      admitModule session vm "ender" "e"
+      pipelineBefore ← pipelineNow session
+      commandWith session vm "i" "pstart" "a" (Just (load "a//b.png"))
+      line ← lineStarting session "i pstart a "
+      line `shouldSatisfy` Text.isPrefixOf "i pstart a error "
+      line `shouldSatisfy` Text.isInfixOf "address refused"
+      owner ← ownerOf vm "i"
+      closeTextureOwner owner
+      commandWith session vm "i" "pstart" "b" (Just (load "a.png"))
+      closed ← lineStarting session "i pstart b "
+      closed `shouldSatisfy` Text.isInfixOf "the texture owner has ended"
+      -- An instance asking from its shutdown hook is refused by the host's own phase check.
+      stopInstance session vm "e"
+      -- The host's phase check refuses it, and says why.
+      shutdownLine ← lineStarting session "shutdown load false "
+      shutdownLine `shouldBe` "shutdown load false tex.load: request refused: the owner is no longer taking requests"
+      pipelineNow session >>= (`shouldBe` pipelineBefore)
+      readsStarted (ssProbe session) `shouldReturn` 0
+      uploadsSeen (ssFake session) `shouldReturn` 0
+      d ← vmDiagnostics vm
+      (rdBusy d, rdLatched d) `shouldBe` (0, 0)
+
+  it "take back every reservation when the provider raises as it is handed the request: the credits return unused and the pipeline keeps no job" $ do
+    ExceptionWithContext _ failure ← fatalSession (config small layout) $ \session control runtime → do
+      let raising endpoint = endpoint {endpointSubmit = \_ → note session "handing over" >> throwIO (userError "the provider refused the hand-over")}
+      vm ← startVmWith session raising runtime "raising" OnArrival
+      admitDriver session vm "i"
+      commandWith session vm "i" "start" "k" (Just (load "a.png"))
+      awaitNote session "handing over"
+      -- The admission held its banks when the provider was handed the request, and is taken back whole.
+      awaitVmDiagnostic vm (\d → rdHeld d == 0)
+      -- Nothing stays reserved anywhere: the admission was taken back whole.
+      ownerNow vm "i" >>= (`shouldBe` OwnerReading 0 0)
+      sessionNow session `shouldReturn` 0
+      pipelineNow session >>= \reading → (readingReserved reading, readingJobs reading, readingPrepared reading) `shouldBe` (0, 0, 0)
+      statusReserved <$> poolReading session `shouldReturn` 0
+      readsStarted (ssProbe session) `shouldReturn` 0
+      _ ← awaitEnd control vm
+      pure ()
+    show failure `shouldSatisfy` Text.isInfixOf "the provider refused the hand-over" . Text.pack

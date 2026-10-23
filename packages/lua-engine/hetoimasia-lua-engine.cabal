@@ -180,6 +180,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Spec
         Test.LuaEngine.Support
         Test.LuaEngine.Texture.Cancellation
+        Test.LuaEngine.Texture.Client
         Test.LuaEngine.Texture.Contract
         Test.LuaEngine.Texture.Failures
         Test.LuaEngine.Texture.Lifecycle
@@ -187,6 +188,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Texture.Ownership
         Test.LuaEngine.Texture.Png
         Test.LuaEngine.Texture.Spec
+        Test.LuaEngine.Texture.Stages
         Test.LuaEngine.Texture.Support
         Test.LuaEngine.Texture.Workers
     build-depends:

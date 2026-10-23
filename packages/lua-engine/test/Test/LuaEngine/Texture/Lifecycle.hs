@@ -9,9 +9,21 @@ module Test.LuaEngine.Texture.Lifecycle (spec) where
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, fromException, tryWithContext)
 import Control.Monad (void)
 import qualified Data.Text as Text
+import Data.Word (Word64)
 import Test.Hspec
-import Test.LuaEngine.Texture.Contract (layout, small, started)
+import Hetoimasia.LuaEngine.Profile (ByteLimit (..), CountLimit (..))
+import Test.LuaEngine.Request.Profiles (smaller)
+import Test.LuaEngine.Texture.Contract (layout, loadAs, small, started)
 import Test.LuaEngine.Texture.Support
+
+bytes ∷ [(ByteLimit, Word64)]
+bytes =
+  [ (PngEncodedBytes, 65536)
+  , (PngInflatedScanlineBytes, 65536)
+  , (PngPipelineWorkspaceBytes, 1048576)
+  , (TextureBytesPerUiInstance, 16384)
+  , (TextureBytesPerSession, 32768)
+  ]
 
 containsText ∷ String → String → Bool
 containsText needle = any (\suffix → take (length needle) suffix == needle) . tails'
@@ -47,6 +59,27 @@ spec = describe "the pipeline's end" $ do
       seen ← history session
       filter (\entry → "closed " `Text.isPrefixOf` entry || entry `elem` ["backend ended the upload", "scope returned"]) seen
         `shouldBe` ["closed open=False uploading=1", "backend ended the upload", "scope returned"]
+
+  it "drains with every normal bank full: the request place, the pipeline's accepted-work record and the instance's lease capacity are all held, and the drain still ends the work" $
+    withSession ((config (smaller [(RequestsPerInstance, 1), (PngPixels, 1024), (PngAxisMaximum, 32)] bytes) layout) {cfgJobs = 1, cfgLeases = 1}) $ \session _ runtime → do
+      withNested
+        session
+        ( \nested → do
+            vm ← startVm nested runtime "full" OnArrival
+            admitDriver nested vm "i"
+            started nested vm "i" "k0" "a.png"
+            loadAs nested vm "i" "z" "b.png" >>= (`shouldSatisfy` Text.isInfixOf "busy")
+            awaitUploads (ssFake nested) 1
+            held ← uploadN (ssFake nested) 0
+            stopInstance nested vm "i"
+            awaitUploadCancelled held
+        )
+        ( \nested → do
+            held ← uploadN (ssFake nested) 0
+            void (withdrawUpload (ssFake nested) held)
+        )
+      note session "drained"
+      history session >>= (`shouldSatisfy` elem "drained")
 
   it "releases a texture delivered while it drains, once, and does not return until the backend proves it retired" $
     withSession (config small layout) $ \session _ runtime → do

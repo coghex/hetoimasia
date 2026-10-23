@@ -269,7 +269,9 @@ events = describe "late and duplicate events" $
       failUpload (ssFake session) held "a device loss after the fact" >>= (`shouldBe` SinkLate)
       sinkWithdrawn (heldSink held) >>= (`shouldBe` SinkLate)
       readingAfter ← pipelineNow session
-      readingLate readingAfter `shouldBe` readingLate readingBefore + 4
+      -- One for the registration, one for the buffers, two for a failure (the fake retires the buffers
+      -- first, as a backend must) and one for a withdrawal.
+      readingLate readingAfter `shouldBe` readingLate readingBefore + 5
       -- The texture the second registration carried was never taken: the pipeline asks for no release,
       -- and the first texture is the only one the engine owns.
       releaseCalls (ssFake session) `shouldReturn` []
@@ -318,3 +320,19 @@ ending = describe "instance end" $ do
       command session vm "j" "use" "k0"
       awaitNote session ("j use k0 " <> Text.pack (show identity))
       ownerNow vm "j" >>= (`shouldBe` OwnerReading 1 128)
+
+  it "releases a texture whose instance's shutdown hook raises: the engine's cleanup does not depend on the script" $
+    withSession (config small layout) $ \session _ runtime → do
+      vm ← startVm session runtime "shutdown" OnArrival
+      admitModule session vm "failing" "f"
+      awaitNote session "failing started"
+      awaitUploads (ssFake session) 1
+      identity ← uploadN (ssFake session) 0 >>= finishUpload (ssFake session)
+      awaitLeaseSummary session vm "f" ((== 1) . summaryLive)
+      stopInstance session vm "f"
+      awaitReleaseCalls (ssFake session) 1
+      releaseCalls (ssFake session) `shouldReturn` [identity]
+      ownerNow vm "f" >>= (`shouldBe` OwnerReading 1 128)
+      retireTexture (ssFake session) identity
+      awaitOwner vm "f" (== OwnerReading 0 0)
+      sessionNow session `shouldReturn` 0

@@ -143,6 +143,7 @@ import Data.Functor ((<&>))
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.List (sortOn)
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -408,6 +409,10 @@ data Job = Job
   , jBuffersRetired ∷ !Bool
   , jDims ∷ !(Maybe (Word32, Word32))
   , jCell ∷ !(Maybe Cell)
+  , jOrder ∷ !Word64
+    -- ^ Where the admission transaction placed the request: stage queues serve the oldest first.
+  , jFailure ∷ !(Maybe Text)
+    -- ^ What the backend said when it reported a failure.
   }
 
 -- | A delivered texture no lease owns, awaiting its release and retirement, with the charge that is
@@ -430,6 +435,9 @@ data PState = PState
   , psOwners ∷ !Word64
   , psLate ∷ !Word64
   , psWorkers ∷ !Int
+  , psAdmissions ∷ !(Map Word64 Word64)
+    -- ^ The admission order of each reserved record, from its reservation to its return.
+  , psOrderNext ∷ !Word64
     -- ^ Decode workers running now.
   }
 
@@ -507,7 +515,7 @@ withTexturePipeline = withTexturePipelineWith noHooks
 -- | 'withTexturePipeline' with the coordination hooks of this package's tests.
 withTexturePipelineWith ∷ PipelineHooks → TextureSpec → TextureBackend → ReadPool → Inventory → (TexturePipeline → IO a) → IO a
 withTexturePipelineWith hooks spec backend pool inventory body = withWorkerGroup $ \group → do
-  var ← newTVarIO (PState Open Nothing [] Map.empty 0 0 Map.empty (Map.fromList [(lane, Lane Nothing 0) | lane ← [0 .. specLanes spec - 1]]) Map.empty 0 0 0)
+  var ← newTVarIO (PState Open Nothing [] Map.empty 0 0 Map.empty (Map.fromList [(lane, Lane Nothing 0) | lane ← [0 .. specLanes spec - 1]]) Map.empty 0 0 0 Map.empty 0)
   session ← newSessionBytes (specSessionBytes spec)
   let tp = TexturePipeline spec hooks var backend pool inventory session
   result ← mask $ \restore → do
@@ -600,6 +608,8 @@ data PipelineReading = PipelineReading
   , readingOrphans ∷ !Int
   , readingLate ∷ !Word64
   , readingDecodeWorkers ∷ !Int
+  , readingPrepared ∷ !Int
+    -- ^ Start calls in flight: requests prepared and not yet taken or dropped.
   }
   deriving (Eq, Show)
 
@@ -625,6 +635,7 @@ pipelineReading tp = do
       , readingOrphans = Map.size (psOrphans st)
       , readingLate = psLate st
       , readingDecodeWorkers = psWorkers st
+      , readingPrepared = Map.size (psPrepared st)
       }
   where
     jobNumber (JobId number) = number
@@ -689,7 +700,7 @@ requestCredits tp prepared =
       }
   , Credit
       { creditName = "texture jobs"
-      , creditReserve = reserveRecord tp
+      , creditReserve = reserveRecord tp token
       , creditRelease = \_ → releaseRecord tp token
       , creditTransfers = False
       }
@@ -708,13 +719,24 @@ requestCredits tp prepared =
     token = prepToken prepared
     charge = prepCharge prepared
 
--- | Take one of the pipeline's accepted-work records, if one is left.
-reserveRecord ∷ TexturePipeline → STM Bool
-reserveRecord tp = do
+-- | Take one of the pipeline's accepted-work records, if one is left, and place the request in the
+-- admission order, in the one transaction that admits it: the stage queues serve the oldest first, and
+-- the oldest is the one the host admitted first, not the one that was prepared first.
+reserveRecord ∷ TexturePipeline → Word64 → STM Bool
+reserveRecord tp token = do
   st ← readTVar (tpState tp)
   if psReserved st >= specJobs (tpSpec tp)
     then pure False
-    else True <$ writeTVar (tpState tp) st {psReserved = psReserved st + 1}
+    else do
+      when (psOrderNext st == maxBound) $ throwSTM (TextureDefect "the texture admission order is exhausted")
+      writeTVar
+        (tpState tp)
+        st
+          { psReserved = psReserved st + 1
+          , psAdmissions = Map.insert token (psOrderNext st) (psAdmissions st)
+          , psOrderNext = psOrderNext st + 1
+          }
+      pure True
 
 -- | Give the record back and forget the job, once the job is over. A job that is not 'StageSettled'
 -- here is an engine defect: the host returns a record only after the request's work was proved over,
@@ -726,7 +748,13 @@ releaseRecord tp token = do
     Just job | not (isSettled job) → throwSTM (TextureDefect "a job's record was returned while it still holds a lane")
     _ → pure ()
   when (psReserved st <= 0) $ throwSTM (TextureDefect "an accepted-work record was returned that was not reserved")
-  writeTVar (tpState tp) st {psJobs = Map.delete (JobId token) (psJobs st), psReserved = psReserved st - 1}
+  writeTVar
+    (tpState tp)
+    st
+      { psJobs = Map.delete (JobId token) (psJobs st)
+      , psReserved = psReserved st - 1
+      , psAdmissions = Map.delete token (psAdmissions st)
+      }
 
 isSettled ∷ Job → Bool
 isSettled job = case jStage job of
@@ -787,6 +815,7 @@ submitJob tp token reply = mask_ $ do
       effects ← atomically $ do
         st ← readTVar (tpState tp)
         when (psPhase st /= Open) $ throwSTM (TextureDefect "the texture pipeline is closed")
+        order ← maybe (throwSTM (TextureDefect "a texture job was submitted that the admission did not place")) pure (Map.lookup token (psAdmissions st))
         writeTVar
           (tpState tp)
           st
@@ -810,6 +839,8 @@ submitJob tp token reply = mask_ $ do
                     , jBuffersRetired = False
                     , jDims = Nothing
                     , jCell = Nothing
+                    , jOrder = order
+                    , jFailure = Nothing
                     }
                   (psJobs st)
             }
@@ -904,7 +935,7 @@ promoteWith ∷ TexturePipeline → STM (Bool, [IO ()])
 promoteWith tp = do
   st ← readTVar (tpState tp)
   let free = [lane | (lane, found) ← Map.toList (psLanes st), isNothing (laneJob found)]
-      pending = [(jid, job) | (jid, job) ← Map.toAscList (psJobs st), StagePending ← [jStage job]]
+      pending = sortOn (jOrder . snd) [(jid, job) | (jid, job) ← Map.toAscList (psJobs st), StagePending ← [jStage job]]
   case (psPhase st, free, pending) of
     (Open, lane : _, (jid, job) : _) → do
       effects ← startRead tp lane jid job
@@ -1080,7 +1111,7 @@ nextWork tp token = do
     then pure (WorkDid effects)
     else do
       st ← readTVar (tpState tp)
-      case [(jid, job, bytes) | (jid, job) ← Map.toAscList (psJobs st), StageDecodeWait bytes ← [jStage job], isJust (jLane job)] of
+      case sortOn (\(_, job, _) → jOrder job) [(jid, job, bytes) | (jid, job) ← Map.toAscList (psJobs st), StageDecodeWait bytes ← [jStage job], isJust (jLane job)] of
         (jid, job, bytes) : _
           | Just lane ← jLane job → do
               writeTVar (tpState tp) st {psJobs = Map.insert jid job {jStage = StageDecoding} (psJobs st)}
@@ -1362,13 +1393,13 @@ uploadEvent tp jid ev = do
     terminal job failure
       | jTerminal job = late
       | otherwise = do
-          modifyState tp (\now → now {psJobs = Map.adjust (\found → found {jTerminal = True}) jid (psJobs now)})
+          modifyState tp (\now → now {psJobs = Map.adjust (\found → found {jTerminal = True, jFailure = failure}) jid (psJobs now)})
           effects ← case failure of
             Just why → pure [latchDefect tp ("the upload backend failed: " <> why)]
             Nothing
               | jWithdrawn job || jStopping job → pure []
               | otherwise → pure [latchDefect tp "the upload backend withdrew an upload nobody cancelled"]
-          (SinkTaken,) . (effects <>) <$> finishIfDone job {jTerminal = True}
+          (SinkTaken,) . (effects <>) <$> finishIfDone job {jTerminal = True, jFailure = failure}
     -- When both the terminal event and the retirement of the borrowed level have arrived the job
     -- holds nothing: settle it, start the next job on the lane, and only then answer.
     finishIfDone job
@@ -1408,6 +1439,7 @@ settledAnswer tp jid job = case jCell job of
   Nothing
     | jWithdrawn job → pure []
     | jStopping job → answerFor tp jid (ProviderFailure "the texture pipeline stopped while the request was live")
+    | Just why ← jFailure job → answerFor tp jid (ProviderFailure ("the upload backend failed: " <> why))
     | otherwise → answerFor tp jid (ProviderFailure "the upload ended without a texture or a failure")
 
 -- | The delivered texture of a job nobody will adopt, as an effect to release it.

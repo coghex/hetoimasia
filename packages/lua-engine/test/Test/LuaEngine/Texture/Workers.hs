@@ -52,6 +52,28 @@ lanes = describe "the lanes" $ do
       readsStarted (ssProbe session) `shouldReturn` 3
       maxActive (ssProbe session) >>= (`shouldSatisfy` (<= 2))
 
+  it "starts waiting work oldest first, in the order the admissions were made, as lanes free" $
+    withSession (config small layout) $ \session _ runtime → do
+      vm ← startVm session runtime "order" OnArrival
+      admitDriver session vm "i"
+      closeGate (ssProbe session) "a.png"
+      started session vm "i" "k0" "a.png"
+      started session vm "i" "k1" "b.png"
+      started session vm "i" "k2" "c.png"
+      started session vm "i" "k3" "d.png"
+      awaitUploads (ssFake session) 1
+      awaitPipeline session (\reading → readingReading reading == 1 && readingUploading reading == 1 && readingPending reading == 2)
+      startedPaths (ssProbe session) >>= (`shouldBe` ["a.png", "b.png"])
+      -- The freed lane goes to the oldest waiting request, and then the next.
+      first ← uploadN (ssFake session) 0
+      _ ← finishUpload (ssFake session) first
+      awaitUploads (ssFake session) 2
+      startedPaths (ssProbe session) >>= (`shouldBe` ["a.png", "b.png", "c.png"])
+      second ← uploadN (ssFake session) 1
+      _ ← finishUpload (ssFake session) second
+      awaitStarted (ssProbe session) 4
+      startedPaths (ssProbe session) >>= (`shouldBe` ["a.png", "b.png", "c.png", "d.png"])
+
   it "has exactly two read workers, two lanes and one decode worker" $
     withSession (config small layout) $ \session _ _ → do
       awaitPipeline session ((== 1) . readingDecodeWorkers)

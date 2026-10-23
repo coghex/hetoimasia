@@ -74,6 +74,7 @@ module Test.LuaEngine.Texture.Support
   , startVm
   , startVmWith
   , admitDriver
+  , admitModule
   , ownerOf
   , stopInstance
   , command
@@ -736,7 +737,7 @@ startVmWith session wrap runtime label timing = do
           { vmRegistration = registered
           , vmPolicy = ["fx", "request", "tex"]
           , vmOwnerName = label
-          , vmModules = [driverSource]
+          , vmModules = [driverSource, enderSource, failingSource]
           , vmValueLimits = limits
           }
       grant =
@@ -984,13 +985,46 @@ commandSource =
         ]
     )
 
+-- | An instance that asks for a texture from its @shutdown@ hook, where a request is refused, and
+-- records what came of it. Its texture owner is named @e@.
+enderSource ∷ ModuleSource
+enderSource =
+  ModuleSource (ModuleRef "ender" "1") (Text.encodeUtf8 (Text.unlines source)) hookEntries
+  where
+    source =
+      [ "function init(self, api) end"
+      , "function shutdown(self, reason)"
+      , "  local ok, err = pcall(tex.load, 'e', 'a.png', nil)"
+      , "  fx.record('shutdown load ' .. tostring(ok) .. ' ' .. tostring(err))"
+      , "end"
+      ]
+
+-- | An instance that starts a texture request in @init@ and whose @shutdown@ hook raises. Its texture
+-- owner is named @f@.
+failingSource ∷ ModuleSource
+failingSource =
+  ModuleSource (ModuleRef "failing" "1") (Text.encodeUtf8 (Text.unlines source)) hookEntries
+  where
+    source =
+      [ "function init(self, api)"
+      , "  self.r = tex.load('f', 'a.png', nil)"
+      , "  fx.record('failing started')"
+      , "end"
+      , "function shutdown(self, reason) error('shutdown boom') end"
+      ]
+
 -- | Admit an instance of the driver under this name, with a texture owner of that name, and wait
 -- until it is active.
 admitDriver ∷ Session → Vm → Text → IO ()
-admitDriver session vm name = do
+admitDriver session vm name = admitModule session vm "driver" name
+
+-- | Admit an instance of this module under this name, with a texture owner of that name, and wait
+-- until it is active.
+admitModule ∷ Session → Vm → Text → Text → IO ()
+admitModule session vm moduleName name = do
   owner ← newTextureOwner (ssPipeline session)
   atomicModifyIORef' (vmOwners vm) (\held → (Map.insert name owner held, ()))
-  admitInstance (scheduledEndpoint (vmOwner vm)) (InstanceRequest (ModuleRef "driver" "1") EventOnly (Just name) OrdinaryClass ["cmd"]) >>= \case
+  admitInstance (scheduledEndpoint (vmOwner vm)) (InstanceRequest (ModuleRef moduleName "1") EventOnly (Just name) OrdinaryClass ["cmd"]) >>= \case
     InstanceAccepted identity ticket → do
       atomicModifyIORef' (ssIds session) (\held → (Map.insert name identity held, ()))
       atomicModifyIORef' (ssTickets session) (\held → (Map.insert name ticket held, ()))
