@@ -88,6 +88,31 @@ library request
         hetoimasia-scripting-lua ==0.1.0.0,
         hetoimasia-scripting-lua:runtime-lua
 
+-- The M1 raw-data provider (LFE-10): the endpoint that answers a request for a file's exact bytes
+-- through the content package's read pool, and the per-VM byte bank that bounds what it retains. It
+-- is a sublibrary of its own, in a source directory of its own, for the reason the request adapter
+-- is: the library is the pure configuration boundary and imports nothing that performs IO, and this
+-- does. It depends on the request adapter for the policy, on the content package for the pool and
+-- the inventory, and on the host's public runtime modules for the provider surface. It imports no
+-- module of a game, a window, a GPU or the console, and installs nothing in a VM.
+library data
+    import: language
+    visibility: public
+    default-extensions: OverloadedStrings
+    hs-source-dirs: data
+    exposed-modules:
+        Hetoimasia.LuaEngine.Data
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-content ==0.1.0.0,
+        hetoimasia-lua-engine ==0.1.0.0,
+        hetoimasia-lua-engine:request,
+        hetoimasia-scripting-lua ==0.1.0.0,
+        hetoimasia-scripting-lua:runtime-lua
+
 -- This package's own contracts, registered as the CPU validation group
 -- `test.lua-engine`. Hspec is the suite's alone.
 test-suite lua-engine-tests
@@ -99,6 +124,12 @@ test-suite lua-engine-tests
         Test.LuaEngine.Behavior
         Test.LuaEngine.Boot
         Test.LuaEngine.Boundary
+        Test.LuaEngine.Data.Contract
+        Test.LuaEngine.Data.Lifecycle
+        Test.LuaEngine.Data.Limits
+        Test.LuaEngine.Data.Spec
+        Test.LuaEngine.Data.Support
+        Test.LuaEngine.Data.Workers
         Test.LuaEngine.Loader
         Test.LuaEngine.Manifest.Examples
         Test.LuaEngine.Manifest.Schema
@@ -122,6 +153,7 @@ test-suite lua-engine-tests
         hetoimasia-content ==0.1.0.0,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-lua-engine ==0.1.0.0,
+        hetoimasia-lua-engine:data,
         hetoimasia-lua-engine:request,
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-scripting-lua ==0.1.0.0,
@@ -130,6 +162,7 @@ test-suite lua-engine-tests
         hspec >=2.11 && <3,
         HUnit >=1.6 && <1.7,
         process >=1.6 && <1.7,
+        unix >=2.8 && <2.9,
         stm >=2.5.3 && <2.6,
         temporary >=1.3 && <1.4,
         text >=2.1 && <2.2,

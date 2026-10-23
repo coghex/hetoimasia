@@ -45,6 +45,7 @@ library
         Hetoimasia.Content
         Hetoimasia.Content.Identity
         Hetoimasia.Content.Inventory
+        Hetoimasia.Content.ReadPool
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
@@ -77,6 +78,7 @@ library internal
         Hetoimasia.Content.Internal.Inventory.Scan
         Hetoimasia.Content.Internal.Inventory.Types
         Hetoimasia.Content.Internal.Native
+        Hetoimasia.Content.Internal.Pool
         Hetoimasia.Content.Internal.Root
         Hetoimasia.Content.Internal.Types
     c-sources: cbits/hetoimasia_content.c
@@ -123,6 +125,10 @@ test-suite content-tests
         Test.Content.Links
         Test.Content.Names
         Test.Content.Opacity
+        Test.Content.ReadPool.Boundary
+        Test.Content.ReadPool.Jobs
+        Test.Content.ReadPool.Lifecycle
+        Test.Content.ReadPool.Support
         Test.Content.Reading
         Test.Content.Roots
         Test.Content.Spec

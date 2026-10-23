@@ -3,7 +3,8 @@
 -- Select one with @--match@: @Names@, @Types@, @Roots@, @Links@, @Reading@,
 -- @Enumeration@, @Lifecycle@, @Opacity@, or, for the logical identity policy,
 -- @Identity@ (with the components @Reference@, @Unicode@, @Mapping@ and
--- @Identity boundary@).
+-- @Identity boundary@), or, for the verified-read worker pool, @ReadPool@ (with the
+-- components @Jobs@, @Lifecycle@ and @ReadPool boundary@).
 module Test.Content.Spec (spec) where
 
 import qualified Test.Content.Enumeration as Enumeration
@@ -22,6 +23,9 @@ import qualified Test.Content.Lifecycle as Lifecycle
 import qualified Test.Content.Links as Links
 import qualified Test.Content.Names as Names
 import qualified Test.Content.Opacity as Opacity
+import qualified Test.Content.ReadPool.Boundary as PoolBoundary
+import qualified Test.Content.ReadPool.Jobs as PoolJobs
+import qualified Test.Content.ReadPool.Lifecycle as PoolLifecycle
 import qualified Test.Content.Reading as Reading
 import qualified Test.Content.Roots as Roots
 import qualified Test.Content.Types as Types
@@ -50,3 +54,7 @@ spec = do
     describe "Reading" InventoryReading.spec
     describe "Lifecycle" InventoryLifecycle.spec
     describe "Inventory boundary" InventoryBoundary.spec
+  describe "ReadPool" $ do
+    describe "Jobs" PoolJobs.spec
+    describe "Lifecycle" PoolLifecycle.spec
+    describe "ReadPool boundary" PoolBoundary.spec
