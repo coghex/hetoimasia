@@ -548,7 +548,10 @@ allocated native handle is none of that. It promises no displayed frame and no w
 An expected failure carries one of `textureCodes` with the root and path: `not_found`, `content_changed`, `io_error`,
 `too_large` (a file over 32 MiB, or a decode over a limit, the lane's workspace included), `unsupported_format` (not a PNG,
 or animated) and `invalid_image`. A malformed address, a wrong phase and a closed owner are ordinary Lua errors before any
-admission. Required is the default and optional is explicit; there is no tick offset. A backend, device, allocator, reader or
+admission. Texture acquisition is **presentation-instance hook work**: each instance's `TextureOwner` carries the role its facade
+boundary declared for it (`newTextureOwner pipeline role`, from the instance's immutable metadata, never from Lua), and an owner
+for a logical instance is refused before any reservation. Required is the default and optional is explicit; there is no tick
+offset. A backend, device, allocator, reader or
 cleanup fault is a provider defect: it fails the owner, required or optional alike, is never given a code and never busy.
 
 ### What is reserved, and when
@@ -577,7 +580,7 @@ the texture itself retired.
 | State | Owner | Writers | Readers | Lifetime and disposal |
 |---|---|---|---|---|
 | The pipeline's one state (`PState`: jobs, lanes, orphans, latch) | the pipeline scope, `withTexturePipeline` | the host's admission and credit release, the read workers' sinks, the decode worker, the backend's sink calls, the drain; always STM | `pipelineReading` | the scope; the drain waits for every started stage before it returns |
-| A texture owner's banks | one UI instance's bindings, from `newTextureOwner` (no registry) | admission, the decode stage's shrink, the lease and the pipeline's housekeeping | `ownerReading` | until its textures are retired; `closeTextureOwner` only stops new requests |
+| A texture owner's banks and role | one instance's bindings, from `newTextureOwner` (no registry) | admission, the decode stage's shrink, the lease and the pipeline's housekeeping | `ownerReading` | until its textures are retired; `closeTextureOwner` only stops new requests |
 | A lane and its workspace bank (128 MiB) | the pipeline | the read sink, the decoder's account, the handoff, the backend's buffer retirement | `readingLanes` | a job holds it from the start of its read until the backend stops reading the level |
 | A job (stage, buffers, withdrawn/stopping flags) | the pipeline | the same | diagnostics | from admission until the host returns its record; entries exist only for admitted requests |
 | A texture's `Cell` | the pipeline until a lease adopts it, then the lease | the backend's sink, the adoption recipe, the release | the retirement readings | exactly one party calls the backend's release, once |
@@ -640,9 +643,12 @@ returns its charges when that release retires.
 
 ### The backend port
 
-`TextureBackend` has one operation, `backendUpload upload sink`, which must not block, and a sink with four calls: a usable
+`TextureSpec`'s numbers are read with accessors (`specLanes` and the rest); its record fields are not exported, so a client
+cannot build or update a specification of its own. `TextureBackend` has one operation, `backendUpload upload sink`, which must not block, and a sink with four calls: a usable
 registration (`sinkReady`, carrying a `BackendTexture` whose `textureRelease` is called at most once and answers the
-backend's own reading of its retirement), a failure, a withdrawal, and the retirement of the borrowed level. A backend
+backend's own reading of its retirement, which only reads and which the pipeline guards as the host does: a reading that
+throws or answers failed is a failed retirement, recorded once as the pipeline's failure, terminal for that texture, with its
+charge left held and the drain going on), a failure, a withdrawal, and the retirement of the borrowed level. A backend
 delivers exactly one terminal event and one retirement per accepted upload. Ownership changes only at `SinkTaken`: a
 `SinkLate` answer took nothing, and what the backend passed stays its own. The backend outlives the pipeline and every
 texture it delivered.
