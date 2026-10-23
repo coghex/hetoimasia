@@ -1111,6 +1111,12 @@ the host's handle check like any wrong-kind handle.
   two 32-bit halves of the number (a wait through 2^64 - 1 ns is accepted though a Lua integer stops at 2^63 - 1). The deadline
   is placed when the wait is requested, not from the segment's sample; an early wake resumes nothing and resumption may be late;
   the update's `dt` is fixed when it begins and is unchanged by its own waits, and a resumed update starts no second one.
+  The check reads the clock once and the scheduler places the wait against a later reading: if the clock moved on so that the
+  deadline is no longer representable, the scheduler refuses the wait, and that is **the engine's fact and not the script's**:
+  the application's `scheduledRefusedWait` (set to `facadeRefusedWait facade`) reports it through the injected failure boundary and
+  raises it, ending the owner as a tick no Lua integer holds does, where the generic scheduler would have isolated an instance for a
+  refusal no script caused. If the report of an engine failure itself raises, the engine failure stays primary and what the
+  report raised is retained beside it (the primary and its cleanup evidence are composed, neither is dropped).
 * `yield()` gives control back; all three waits are refused outside an update before anything is suspended.
 
 ### Output
@@ -1126,12 +1132,30 @@ crosses, and the Haskell side decodes it (invalid UTF-8 replaced), splits it at 
 characters but a tab, prefixes each line and bounds the whole again (`Hetoimasia.Scripting.Lua.Output`, the runner's own
 mechanism, whose output is unchanged). A `tostring` that raises is an ordinary error with nothing written.
 
+**Every line of a warning begins with the whole of its prefix, whatever is cut.** When a `warn` is longer than its bound, the
+lines that fit are kept with room beside them for a prefixed marker; the first line that does not fit is cut at a character,
+after its prefix, and ends in the marker (`...`); nothing follows it. So the marker is never a line of its own and never follows
+a half prefix: a call of 4,027 characters and a second line writes one prefixed line ending in `...`, and no `next`. (`print`
+has no prefix and is cut as the runner's own output is, where the marker may stand alone on a line.) A bound too small to hold
+one prefix, the marker and a line end, which no validated profile gives, is the first bytes of the prefix and the marker: the
+bound wins over the format.
+
 The sinks are the session's `Output` (`withOutput`, one for every VM): a whole call is written under one lock and flushed before
 the lock is released, so calls never interleave, a call is in order with the same owner's others and cross-VM order is the order
 of execution; there is no queue, drop, retry or rate limit, and a slow sink blocks its writers. A sink that raises is a failure of
 the host: the call raises it, so it ends the owner whatever Lua did with the stand-in error, and no later call is written or
-retried through a sink that has failed; nothing is reported through it. Returning does not promise the bytes are durable.
+retried through a sink that has failed; nothing is reported through it. The failure is checked and recorded **under the lock**: a
+writer that was waiting for the lock behind the one whose sink failed finds the failure when it holds the lock and touches
+neither sink, so a failed output has exactly one failed write and none after it. The failure is kept whole, with the context
+it was raised with, inside the `OutputFailure` that reports it. Returning does not promise the bytes are durable. A call that
+the owner's cancellation interrupts inside a sink may have written only some of its lines (the write is not masked, so that a
+stuck sink cannot make its writer uninterruptible); the interruption is not a sink failure and is not remembered as one.
 Authored output bypasses log filtering and cannot suppress an engine failure's diagnostics.
+
+`withOutput` is a `withResourceLabelled` scope ([resource contract](../../docs/resources.md)): the body's failure is primary and
+keeps every cleanup failure the owners and the coordinator inside it retained, the close and drain is its release (uninterruptible,
+as every release is), and what the release raises would be retained beside the body's failure and not instead of it. Nothing in
+the facade catches an exception and throws it again plainly; a failure is rethrown with the context it was caught with.
 
 ### What an assembly does
 
@@ -1140,7 +1164,8 @@ withOutput out err $ \output →                -- the sinks' scope: outermost
   withModuleCoordinator spec{specResolve = inventoryResolver inventory [gameRoot], specPhase = Just phase} $ \coordinator → do
     facade ← newFacade FacadeSpec{..}         -- role, request policy, coordinator, data service, output, endpoints, phase, roots
     config ← installFacade facade [] [] (vmProfileConfig LibraryProfileM1)
-    -- grant (facadeRequestEndpoints facade); scheduledInstances = Just (facadeInstanceConfig facade ...)
+    -- grant (facadeRequestEndpoints facade); scheduledInstances = Just (facadeInstanceConfig facade ...);
+    -- scheduledRefusedWait = facadeRefusedWait facade
     declared ← declareInstance facade gameRoot -- then admit (behaviorRequest ... (declaredFacade declared) ...)
 ```
 
