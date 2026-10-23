@@ -112,8 +112,10 @@ import Hetoimasia.Scripting.Lua.Loading
   , submitReservedRoot
   )
 import Hetoimasia.Scripting.Lua.Owner
-  ( BoundaryFault
+  ( BoundaryFault (boundaryReason)
   , ExportHandle
+  , FaultReason (ModuleRefused)
+  , ModuleProblem (DependencyFailed)
   , ExportIdentity
   , ModuleStatus (..)
   , RootRequest (..)
@@ -493,19 +495,29 @@ blockedSTM = needJob
 -- hold until the request's own position), boot loads are told, and a failure nobody waits for is
 -- diagnosed. Answers and diagnostics are returned for the caller to run after the commit.
 publishSTM ∷ Coordinator → [(ExportIdentity, ModuleStatus)] → STM [IO ()]
-publishSTM c settled = concat <$> forM settled (publishOne c)
+publishSTM c settled = concat <$> forM settled (publishOne c covered)
+  where
+    -- A dependency's failure that an importer settled in the same advance failed with is the importer's
+    -- to report: it is the cause the importer's own failure names, not a second failure.
+    covered = concat [dependencyCauses fault | (_, ModuleFailed fault) <- settled]
 
-publishOne ∷ Coordinator → (ExportIdentity, ModuleStatus) → STM [IO ()]
-publishOne c (identity, status) = do
+-- | The faults of the dependencies a fault was reached through, outermost first.
+dependencyCauses ∷ BoundaryFault → [BoundaryFault]
+dependencyCauses fault = case boundaryReason fault of
+  ModuleRefused (DependencyFailed _ inner) -> inner : dependencyCauses inner
+  _ -> []
+
+publishOne ∷ Coordinator → [BoundaryFault] → (ExportIdentity, ModuleStatus) → STM [IO ()]
+publishOne c covered (identity, status) = do
   st <- readState c
   case Map.lookup identity (csJobs st) of
-    Just job | isLive job → case status of
-      ModuleReady handle → settle st job (Ready handle) (replyReady handle) BootReady Nothing
-      ModuleFailed fault →
+    Just job | isLive job -> case status of
+      ModuleReady handle -> settle st job (Ready handle) (replyReady handle) BootReady Nothing
+      ModuleFailed fault ->
         let failure = failureFor st job fault
          in settle st job (Failed fault failure) (replyFailed job failure) (BootFailed failure) (Just (fault, failure))
-      _ → pure []
-    _ → pure []
+      _ -> pure []
+    _ -> pure []
   where
     settle st job outcome reply boot failed = do
       waiters <- forM (Map.elems (jobWaiters job)) $ \waiter -> do
@@ -517,8 +529,10 @@ publishOne c (identity, status) = do
           _ -> pure []
       forM_ (jobBoots job) $ \ticket -> writeTVar ticket (Just boot)
       let nobody = Map.null (jobWaiters job) && null (jobBoots job)
+          -- Diagnosed at most once, and only when nothing waits for it and no importer that failed with
+          -- it as its cause carries the report.
           diagnose = case failed of
-            Just (fault, failure) | nobody && not (jobDiagnosed job) -> Just (fault, failure)
+            Just (fault, failure) | nobody && not (jobDiagnosed job) && fault `notElem` covered -> Just (fault, failure)
             _ -> Nothing
           job' =
             job

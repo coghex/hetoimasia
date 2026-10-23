@@ -67,6 +67,9 @@ module Test.LuaEngine.Modules.Support
   , awaitOwnerEnded
   , awaitFailure
   , instanceTicket
+  , requestFailureOf
+  , bootNow
+  , awaitBootOutcome
   , awaitVmDiagnostic
   , vmDiagnostics
   , awaitPhase
@@ -276,7 +279,7 @@ withSession profile (workers, slots) readerOf (Layout files) body =
               Just value → pure value
               Nothing → do
                 seen ← history session
-                assertFailure ("the example did not finish within its bound; it had recorded: " <> show (reverse (take 12 (reverse seen))))
+                assertFailure ("the example did not finish within its bound; it had recorded: " <> show (reverse (take 60 (reverse seen))))
   where
     metadata =
       MetadataProviders
@@ -655,6 +658,14 @@ driverSource =
       , "    shared[p.name or key] = r.value"
       , "    out = describe(r, 0)"
       , "  elseif p.op == 'same' then out = tostring(rawequal(shared[key], shared[p.other]))"
+      , "  elseif p.op == 'is_self' then out = tostring(rawequal(shared[key][p.field], shared[key]))"
+      , "  elseif p.op == 'env' then"
+      , "    local r = request.take(self.hs[key])"
+      , "    shared[p.name or key] = r"
+      , "    out = describe(r, 0)"
+      , "  elseif p.op == 'wait_probe' then"
+      , "    request.wait(self.hs[key])"
+      , "    out = 'lookup=' .. module.lookup(p.path or 'a.lua') .. ' other_ready=' .. tostring(request.ready(self.hs[p.other]))"
       , "  elseif p.op == 'field' then"
       , "    local ok, r = pcall(function() return shared[key][p.field] end)"
       , "    out = ok and describe(r, 1) or ('error ' .. tostring(r))"
@@ -765,9 +776,10 @@ grantStep vm = do
 tickOf ∷ Vm → IO Word64
 tickOf vm = atomically (scheduledTick (scheduledEndpoint (vmOwner vm)))
 
--- | Block, in STM, until the VM's logical tick is this.
-awaitTick ∷ Vm → Word64 → IO ()
-awaitTick vm wanted = atomically $ do
+-- | Block, in STM and under supervision, until the VM's logical tick is this: an owner that fails
+-- meanwhile raises its failure here instead of leaving the example waiting.
+awaitTick ∷ RuntimeControl → Vm → Word64 → IO ()
+awaitTick control vm wanted = awaitSupervised control $ do
   now ← scheduledTick (scheduledEndpoint (vmOwner vm))
   unless (now == wanted) retry
 
@@ -824,6 +836,21 @@ awaitFailure session name = do
 -- | The ticket of an instance admitted under this name: wait on it to see the instance settle.
 instanceTicket ∷ Session → Text → IO InstanceTicket
 instanceTicket session name = (Map.! name) <$> readIORef (ssTickets session)
+
+-- | The endpoint and attributed text of a required request's failure.
+requestFailureOf ∷ Maybe InstanceFailure → Maybe (Text, Text)
+requestFailureOf failure = case fmap failureError failure of
+  Just (ErrorRequest endpoint why) → Just (endpoint, why)
+  _ → Nothing
+
+-- | Ask for the boot load of a path, expecting it accepted.
+bootNow ∷ Session → Vm → ByteString → IO BootTicket
+bootNow session vm path =
+  bootModule (vmCoordinator vm) (key' session path) >>= either (\refused → assertFailure ("expected the boot load accepted, found " <> show refused)) pure
+
+-- | Wait, in STM, for a boot load's outcome.
+awaitBootOutcome ∷ BootTicket → IO BootOutcome
+awaitBootOutcome = atomically . awaitBoot
 
 -- | The coordinator, read in one transaction.
 counts ∷ Vm → IO Counts
