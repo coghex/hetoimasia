@@ -425,20 +425,45 @@ refusals = describe "refusals told apart by what can change" $ do
         either (\refused → expectationFailure ("a held module should be answered, found " <> show refused)) (const (pure ())) again
         counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (3, 0)
 
-  it "refuses a request at a coordinator that has closed with the same ordinary error the check raises, and takes no place; a call that skipped the check is refused the same way" $
+  it "refuses every request at a coordinator that has closed, a join of an identity it holds included, with the same ordinary error, and takes no place" $
     withSession tiny (2, 8) realReader layout $ \session _ runtime →
       withVm session runtime "ui" (defaultOptions OnArrival) $ \vm → do
         admitDriver session vm "x"
+        -- A module loaded before the stop: asking for it again would be a join, which needs no place.
+        command session vm "x" "start" "k0" [] (Just (fetch "i2.lua"))
+        awaitNote session "x start k0 started"
+        awaitCounts vm (\c → jobsReady c == 1)
         closeModuleCoordinator (vmCoordinator vm)
-        command session vm "x" "pstart" "k1" [] (Just (fetch "i1.lua"))
-        line ← lineStartingWith session "x pstart k1 error"
-        line `shouldSatisfy` Text.isInfixOf "stopped"
-        line `shouldNotSatisfy` Text.isInfixOf "busy"
-        counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (0, 0)
-        command session vm "x" "ustart" "k2" [] (Just (fetch "i1.lua"))
-        line' ← lineStartingWith session "x ustart k2 error"
-        line' `shouldSatisfy` Text.isInfixOf "stopped"
-        counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (0, 0)
+        forM_ [("pstart", "i2.lua"), ("pstart", "i1.lua"), ("ustart", "i2.lua"), ("ustart", "i1.lua")] $ \(op, path) → do
+          command session vm "x" op "kc" [] (Just (fetch path))
+          line ← lineStartingWith session ("x " <> op <> " kc error")
+          line `shouldSatisfy` Text.isInfixOf "stopped"
+          line `shouldNotSatisfy` Text.isInfixOf "busy"
+        -- The module it held is still readable, and nothing was taken.
+        atomically (lookupImmediate (vmCoordinator vm) (moduleIdentity (key' session "i2.lua")))
+          >>= \found → case found of
+            ImmediateReady _ → pure ()
+            _ → expectationFailure "a ready module should stay readable after the stop"
+        counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (1, 0)
+
+  it "answers a request the coordinator closed under, between its admission and its acceptance, with the failure it is, and never leaves it pending" $ do
+    gate ← newEmptyMVar
+    let holding endpoint = endpoint {endpointSubmit = \submission → readMVar gate >> endpointSubmit endpoint submission}
+    withSession tiny (2, 8) realReader layout $ \session _ runtime →
+      withVm session runtime "ui" (defaultOptions OnArrival) {optWrap = holding} $ \vm →
+        (`finally` void (tryPutMVar gate ())) $ do
+          admitDriver session vm "x"
+          command session vm "x" "start" "k1" [] (Just (fetch "i1.lua"))
+          awaitCounts vm (\c → promisedHeld c == 1)
+          closeModuleCoordinator (vmCoordinator vm)
+          putMVar gate ()
+          -- The request is a required one, and it is told: its instance fails with the module failure.
+          failure ← awaitFailure session "x"
+          case requestFailureOf failure of
+            Just (endpoint, why) → do
+              endpoint `shouldBe` "module"
+              why `shouldSatisfy` Text.isInfixOf "stopped"
+            Nothing → expectationFailure ("expected the instance to fail with the request's failure, found " <> show failure)
 
 counts' ∷ Vm → IO Counts
 counts' = counts

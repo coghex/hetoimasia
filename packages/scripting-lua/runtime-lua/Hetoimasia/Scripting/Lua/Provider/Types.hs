@@ -386,9 +386,24 @@ newtype CreditRefused = CreditRefused Text
 
 instance Exception CreditRefused
 
--- | The most of a credit's refusal reason that a script reads.
+-- | The most of a credit's refusal reason that a script reads, in UTF-8 bytes.
 refusalReasonBytes ∷ Int
 refusalReasonBytes = 256
+
+-- | The longest prefix of the text that is at most this many bytes of UTF-8, cut between characters.
+boundUtf8 ∷ Int → Text → Text
+boundUtf8 limit = Text.pack . go 0 . Text.unpack
+  where
+    go used = \case
+      char : rest | used + width char <= limit → char : go (used + width char) rest
+      _ → []
+    width char
+      | code < 0x80 = 1
+      | code < 0x800 = 2
+      | code < 0x10000 = 3
+      | otherwise = 4
+      where
+        code = fromEnum char
 
 -- | Why a credit is returned.
 data CreditEnd
@@ -615,7 +630,7 @@ renderRequestRefusal = \case
   RequestTickUnrepresentable highest → "request refused: the tick and offset pass the ceiling of " <> Text.pack (show highest)
   RequestNumbersExhausted highest → "request refused: every request number up to " <> Text.pack (show highest) <> " has been issued"
   RequestNoLeaseScope → "request refused: the instance has no lease scope to reserve a result lease in"
-  RequestCreditRefused why → "request refused: " <> Text.take refusalReasonBytes why
+  RequestCreditRefused why → "request refused: " <> boundUtf8 refusalReasonBytes why
 
 -- Subscriptions ---------------------------------------------------------------------
 

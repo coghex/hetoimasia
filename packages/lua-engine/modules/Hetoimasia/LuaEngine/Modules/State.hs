@@ -572,6 +572,18 @@ replyFailed _ failure =
       , expectedPath = Just (failurePath failure)
       }
 
+-- | The answer to a request the stopped coordinator cannot serve: a required failure, so that nothing waits
+-- for an answer that will not come.
+stoppedReply ∷ ContentKey → ProviderReply
+stoppedReply key =
+  ProviderExpected
+    ExpectedFailure
+      { expectedCode = "module_error"
+      , expectedMessage = "the module loader stopped before the request was served"
+      , expectedRoot = Just (rootText key)
+      , expectedPath = Just (pathText key)
+      }
+
 replyReady ∷ ExportHandle → ProviderReply
 replyReady = ProviderResult . exportTableValue
 
@@ -612,11 +624,13 @@ failureFor st job fault =
 reserveIdentitySTM ∷ Coordinator → ExportIdentity → STM Bool
 reserveIdentitySTM c identity = do
   st <- readState c
-  case (Map.member identity (csJobs st), Map.lookup identity (csPromised st)) of
+  -- A coordinator that has closed takes no request, a join included: the answer would never come.
+  if csPhase st /= Open
+    then throwSTM (CreditRefused closedReason)
+    else case (Map.member identity (csJobs st), Map.lookup identity (csPromised st)) of
     (True, _) -> pure True
     (_, Just held) -> True <$ writeState c st {csPromised = Map.insert identity (held + 1) (csPromised st)}
     _
-      | csPhase st /= Open -> throwSTM (CreditRefused closedReason)
       | Map.size (csJobs st) >= limitIdentities (coordLimits c) -> throwSTM (CreditRefused (fullReason c))
       | identitiesUsed st < limitIdentities (coordLimits c) -> True <$ writeState c st {csPromised = Map.insert identity 1 (csPromised st)}
       | otherwise -> pure False
@@ -670,7 +684,9 @@ acceptRequest c key due number completion = do
   let identity = moduleIdentity key
       position = maybe DueUi (\slot -> DueAt (dueTick slot) (dueSequence slot)) due
   if csPhase st == Closed
-    then pure (Accepted finished [])
+    -- The coordinator closed between this request's admission and now (the credit refuses a request that
+    -- meets it closed): the request is answered at once with the failure it is, never left pending.
+    then pure (Accepted finished [answerWith completion (stoppedReply key)])
     else case loader of
       Nothing -> defect "a request was accepted before a loader was attached"
       Just endpoint -> case Map.lookup identity (csJobs st) of
@@ -703,7 +719,7 @@ acceptRequest c key due number completion = do
             pure (Accepted work [])
           Ready handle -> pure (Accepted finished [answerWith completion (replyReady handle)])
           Failed _ failure -> pure (Accepted finished [answerWith completion (replyFailed job failure)])
-          Stopped -> pure (Accepted finished [])
+          Stopped -> pure (Accepted finished [answerWith completion (stoppedReply key)])
   where
     closedOr = \case
       SubmitAccepted -> pure ()

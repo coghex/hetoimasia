@@ -186,15 +186,26 @@ spec = describe "banks" $ do
         acommand fixture owner "i" "pstart" "c"
         awaitNote fixture "cmd pstart c error ad.start: request refused: nothing will ever return a place"
 
-    it "bound the reason of a refusal a script reads" $ bounded $ do
+    it "bound the reason of a refusal a script reads in bytes, cut between characters, so it is always delivered as the ordinary error it is" $ bounded $ do
       fixture ← newAFix 4
-      let wordy = Credit {creditName = "wordy", creditReserve = throwSTM (CreditRefused (Text.replicate 1000 "x")), creditRelease = const (pure ()), creditTransfers = False}
-      setPolicy fixture (\held → held {polCredits = [wordy]})
+      let wordy reason = Credit {creditName = "wordy", creditReserve = throwSTM (CreditRefused reason), creditRelease = const (pure ()), creditTransfers = False}
+      setPolicy fixture (\held → held {polCredits = [wordy (Text.replicate 1000 "x")]})
       withBoundary $ \_ runtime → settleAll fixture $ do
         owner ← arrival fixture 8 runtime "credit wordy"
         admitAdmitter fixture owner "i" "admitter"
         acommand fixture owner "i" "pstart" "a"
         awaitNote fixture ("cmd pstart a error ad.start: request refused: " <> Text.replicate refusalReasonBytes "x")
+        -- A reason of four-byte characters, past the bound in bytes though not in characters: cut at 64 of them, not 256,
+        -- delivered as an ordinary error that pcall catches, and the invocation goes on.
+        setPolicy fixture (\held → held {polCredits = [wordy (Text.replicate refusalReasonBytes "😀")]})
+        acommand fixture owner "i" "pstart" "b"
+        awaitNote fixture ("cmd pstart b error ad.start: request refused: " <> Text.replicate (refusalReasonBytes `div` 4) "😀")
+        setPolicy fixture (\held → held {polCredits = [wordy (Text.replicate 100 "é" <> "😀")]})
+        acommand fixture owner "i" "pstart" "c"
+        awaitNote fixture ("cmd pstart c error ad.start: request refused: " <> Text.replicate 100 "é" <> "😀")
+        setPolicy fixture (\held → held {polCredits = []})
+        acommand fixture owner "i" "pstart" "d"
+        awaitNote fixture "cmd pstart d started"
 
     it "cannot be overbooked by two admissions that compete for the last unit" $ bounded $ do
       fixture ← newAFix 4

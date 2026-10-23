@@ -48,7 +48,6 @@ import Control.Concurrent.STM
 import Control.Exception (Exception, throwIO)
 import Control.Monad (replicateM_, unless, when)
 import Data.ByteString (ByteString)
-import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
@@ -324,27 +323,27 @@ moduleArguments request =
   , VBytes (logicalPathBytes (contentKeyPath (requestedKey request)))
   ]
 
--- | The ask the host admits: the requirement, the source, the offset, the codes, and the one credit a
--- request for a new identity needs: its place among the VM's permanent identities. A request that
--- joins an identity the VM already holds needs none, so a full cache still answers joins and lookups.
+-- | The ask the host admits: the requirement, the source, the offset, the codes, and the one credit every
+-- request carries: the identity credit, which takes a place among the VM's permanent identities for a new
+-- identity, holds nothing for an identity the VM already holds (so a full cache still answers joins and
+-- lookups), and for every request, a join included, refuses a coordinator that has closed.
 moduleAsk ∷ Coordinator → ModuleRequest → IO M1Ask
-moduleAsk c request = do
-  held <- atomically (Map.member identity . csJobs <$> readTVar (coordState c))
+moduleAsk c request =
   pure
     (m1Ask RequiredRequest ("module " <> pathText key))
       { askOffset = requestedOffset request
       , askCodes = moduleCodes
-      , askCredits = [identityCredit c identity | not held]
+      , askCredits = [identityCredit c identity]
       }
   where
     key = requestedKey request
     identity = moduleIdentity key
 
--- | The credit a request for a new identity reserves with its admission: a place among the VM's permanent
--- identities. 'creditReserve' answers 'True' with the place held (or nothing to hold, for an identity the VM
+-- | The credit every request reserves with its admission: a place among the VM's permanent identities for a
+-- new identity. 'creditReserve' answers 'True' with the place held (or nothing to hold, for an identity the VM
 -- already holds), 'False' when the room is held only by other admissions' reservations that can still be given
--- back (busy), and raises 'CreditRefused' when the VM's permanent entries fill the cache or the coordinator has
--- closed (final). Public so that the decision can be asked directly, in either order, without a request.
+-- back (busy), and raises 'CreditRefused' when the coordinator has closed, for any identity, or the VM's
+-- permanent entries fill the cache, for a new one (final). Public so that the decision can be asked directly, in either order, without a request.
 identityCredit ∷ Coordinator → ExportIdentity → Credit
 identityCredit c identity =
   Credit
