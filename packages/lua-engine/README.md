@@ -788,7 +788,7 @@ three things apart:
 
 Temporary banks (the instance's 16 and the VM's 64 request places, the owner's places, result storage, the unsettled boot loads) are
 `busy`, data, with nothing reserved. The loader's own ask for a source (`acquireSTM`) is answered with a failure once the coordinator has closed, so a chain never waits
-for a source that will not come. `startModule` is therefore plain `startM1` (accepted or busy); a permanent refusal is the host's
+for a source that will not come. That failure is an interest like any other (the loader holds one for every failure it is answered and ends it with `supplierRelease`): it is taken on the identity's job, or on a stopped job made for it within the identity bound (else `SourceNoRoom`), so the release the loader makes is always one the coordinator holds. `startModule` is therefore plain `startM1` (accepted or busy); a permanent refusal is the host's
 ordinary error, raised from inside the admission, and the facade's binding (LFE-12) owns only the Lua spelling. `Limits` has a gated
 example of each of these, in both orders of a boot load and a request racing for the last place.
 
