@@ -148,6 +148,12 @@ spec = describe "values and schemas" $ do
       checkLimits (ValueLimits 141 1 4) [record] `shouldBe` Left (RuleBytesLimit 141)
       checkLimits (ValueLimits 142 1 3) [record] `shouldBe` Left (RuleElementLimit 3)
       checkLimits (ValueLimits 142 1 4) [VList [record]] `shouldBe` Left (RuleDepthLimit 1)
+      -- a text argument is its length and a five-byte header, at the bound and one past: the call to the facade's output
+      -- binding carries at most the output bound and that header, and an identity is carried as the same
+      valuesFootprint (ValueLimits 65536 8 4096) [VBytes (ByteString.replicate 300 120)] `shouldBe` Right 305
+      valuesFootprint (ValueLimits 65536 8 4096) [VText (Text.replicate 6 "i")] `shouldBe` Right 11
+      checkLimits (ValueLimits 305 1 1) [VBytes (ByteString.replicate 300 120)] `shouldBe` Right ()
+      checkLimits (ValueLimits 304 1 1) [VBytes (ByteString.replicate 300 120)] `shouldBe` Left (RuleBytesLimit 304)
 
     it "is bounded in depth, at the bound and one past" $ do
       encodedWith 65536 2 4096 [VList [VList [VInteger 1]]] `shouldSatisfy` (not . isLeft)

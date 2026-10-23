@@ -354,6 +354,7 @@ tasksEntries =
   , required "host_fail" [SText] []
   , required "block_in" [SText] []
   , required "closes_cleanly" [SText] []
+  , required "refused_closing" [SText, SInteger, SInteger] [SInteger]
   , required "closes_badly" [SText] []
   , required "controls" [SText, SText, SText] []
   , required "echo" [SInteger] [SInteger]
@@ -420,6 +421,12 @@ tasksSource =
     , "function delayed(label, n)"
     , "  for i = 1, n do fx.delay() fx.record(label .. i) sched.yield() end"
     , "  return n"
+    , "end"
+    , "function refused_closing(label, high, low)"
+    , "  local guard <close> = setmetatable({}, {__close = function() fx.record(label .. ' closed') end})"
+    , "  fx.record(label .. ' before')"
+    , "  sched.wait_ns_wide(high, low)"
+    , "  fx.record(label .. ' resumed')"
     , "end"
     , "function closes_cleanly(label)"
     , "  local guard <close> = setmetatable({}, {__close = function() fx.record(label .. ' closed') end})"

@@ -148,7 +148,6 @@ import Hetoimasia.Scripting.Lua.Scheduler
   , WaitRefusal
   , awaitWork
   , retainsEvidence
-  , takeRefusedWaits
   , serviceTurnWith
   , stopScheduler
   )
@@ -206,6 +205,9 @@ serve stopping control handoff observe refused escalate config leaseHost owned =
   let host =
         TaskHost
           { hostRun = runSegment control observe owned identity label handlesRef tasks extra instanceRef
+          , -- A refused wait is the application's to treat as it likes, and it is told when the scheduler
+            -- applies the report: before the continuation is closed, before accounting, before any peer.
+            hostRefused = \_ why → refused why
           , -- The coroutine is closed first. The instance whose invocation it was is
             -- ended after that, whatever the close did: it is told only when the
             -- close was not interrupted, which an exit settles as discarded.
@@ -379,12 +381,6 @@ serve stopping control handoff observe refused escalate config leaseHost owned =
       -- requests have settled are woken, the providers' accounts are polled, and the
       -- requesters whose tasks are gone are ended.
       let atBoundary = do
-            -- A wait the scheduler refused at the segment that just ended is dealt with first: the
-            -- application is told before this boundary looks at an instance, a provider or the loader,
-            -- before it can acknowledge an accounting wait, and before the scheduler chooses another
-            -- segment. What the application raises is a failure of the host and leaves the turn here,
-            -- so nothing later in the boundary or the turn acknowledges, dispatches or commits.
-            atomically (takeRefusedWaits scheduler) >>= mapM_ (refused . snd)
             instanceStep ← maybe (pure False) serviceBoundary instances
             requestStep ← forM provider $ \service →
               providerBoundary service scheduler (isJust instances) leaseHost extra (forM_ instances endOwner)

@@ -91,6 +91,8 @@ data Rig = Rig
   , rigClosed ∷ !(IORef [(TaskId, ThreadId)])
   , rigCloseFailures ∷ !(IORef (Map TaskId SomeException))
   , rigCloseHook ∷ !(IORef (TaskId → IO ()))
+  , rigRefusedHook ∷ !(IORef (TaskId → WaitRefusal → IO ()))
+    -- ^ What the host does when told of a refused wait.
   , rigClock ∷ !(IORef Word64)
   , rigClockHook ∷ !(IORef (IO ()))
     -- ^ Run at every reading of the injected clock, before it answers.
@@ -138,6 +140,7 @@ newRigWith options = do
   closed ← newIORef []
   closeFailures ← newIORef Map.empty
   closeHook ← newIORef (const (pure ()))
+  refusedHook ← newIORef (\_ _ → pure ())
   clock ← newIORef 0
   clockHook ← newIORef (pure ())
   timer ← newFakeTimer
@@ -169,8 +172,9 @@ newRigWith options = do
               readIORef closeHook >>= \hook → hook identity
               failures ← readIORef closeFailures
               maybe (pure ()) throwIO (Map.lookup identity failures)
+          , hostRefused = \identity why → readIORef refusedHook >>= \hook → hook identity why
           }
-  pure (Rig scheduler host logRef handedRef scripts closed closeFailures closeHook clock clockHook timer stop)
+  pure (Rig scheduler host logRef handedRef scripts closed closeFailures closeHook refusedHook clock clockHook timer stop)
 
 -- Scripts ----------------------------------------------------------------------
 

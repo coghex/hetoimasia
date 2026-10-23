@@ -243,6 +243,7 @@ spec = describe "elapsed time and the owned timer" $ do
                         0 → ReportWaitElapsed "waiter" (nanoseconds 2000000)
                         _ → ReportCompleted "waiter"
                   , hostClose = \_ → pure ()
+                  , hostRefused = \_ _ → pure ()
                   }
           _ ← atomically (admitTask scheduler (taskSpec "waiter" OrdinaryClass OneShot))
           let untilResumed = do
@@ -272,6 +273,7 @@ spec = describe "elapsed time and the owned timer" $ do
             TaskHost
               { hostRun = \_ → pure (ReportWaitElapsed "waiter" (nanoseconds (3600 * 1000 * 1000 * 1000)))
               , hostClose = \_ → pure ()
+              , hostRefused = \_ _ → pure ()
               }
       newScheduler config >>= \case
         Left refused → failExample (show refused)

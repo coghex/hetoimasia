@@ -100,6 +100,7 @@ module Hetoimasia.LuaEngine.Facade
   , minimumInstanceIdBytes
   , minimumPrintWarnBytes
   , minimumContextBytes
+  , minimumCopiedValueBytes
     -- * Instances
   , Declared (..)
   , DeclareRefused (..)
@@ -139,6 +140,7 @@ import Hetoimasia.LuaEngine.Facade.Bindings
   ( callingIn
   , failEngine
   , minimumContextBytes
+  , minimumCopiedValueBytes
   , minimumInstanceIdBytes
   , minimumPrintWarnBytes
   , warnPrefix
@@ -230,7 +232,7 @@ data FacadeRefused
     RootsRefused ![Text]
   | -- | A bound of the profile that is below what the facade's own formatting needs: the name of the
     -- limit, the value the profile gave and the least it may be ('minimumInstanceIdBytes',
-    -- 'minimumPrintWarnBytes', 'minimumContextBytes').
+    -- 'minimumPrintWarnBytes', 'minimumCopiedValueBytes').
     LimitBelowFormatting !Text !Int !Int
   deriving (Eq, Show)
 
@@ -294,7 +296,7 @@ newFacade spec = case limits of
         | (name, given, least) ←
             [ ("InstanceIdBytes", limitInstanceIdBytes found, minimumInstanceIdBytes)
             , ("PrintWarnBytes", limitPrintBytes found, minimumPrintWarnBytes (limitInstanceIdBytes found))
-            , ("CopiedValueBytes", copiedBytes, minimumContextBytes (limitInstanceIdBytes found))
+            , ("CopiedValueBytes", copiedBytes, minimumCopiedValueBytes (limitInstanceIdBytes found) (limitPrintBytes found))
             ]
         , given < least
         ]

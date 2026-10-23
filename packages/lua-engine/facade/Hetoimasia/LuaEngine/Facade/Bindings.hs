@@ -20,6 +20,7 @@ module Hetoimasia.LuaEngine.Facade.Bindings
   , minimumInstanceIdBytes
   , minimumPrintWarnBytes
   , minimumContextBytes
+  , minimumCopiedValueBytes
   ) where
 
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, fromException, rethrowIO, throwIO, tryWithContext)
@@ -158,8 +159,17 @@ minimumPrintWarnBytes idBytes = max instanceForm moduleForm + bytesOfText "..." 
     instanceForm = bytesOfText warnLead + longestRole + bytesOfText contentLead + contentIdBytes + bytesOfText instanceLead + idBytes + bytesOfText warnEnd
     moduleForm = bytesOfText warnLead + longestRole + bytesOfText moduleLead + moduleLabelBytes + bytesOfText warnEnd
 
--- | The fewest bytes the profile's bound on a copied value may be, given its bound on an identity: the bytes the host
--- counts for the context record the builder is handed (a record of five bytes and, for each of @role@,
+-- | The fewest bytes the profile's bound on a copied value may be, given its bounds on an identity and on one
+-- @print@ or @warn@: the largest of everything the facade itself makes cross the value boundary, each with the
+-- header the host adds to it. These are the text of one call to @out@ or @err@ (at most the print bound, and a text
+-- argument has a five-byte header), an identity handed to @check@ or @bind@ (a text, the same header), and the
+-- context record the builder is handed ('minimumContextBytes'). What a script passes in as the path or the
+-- options of a content request is the script's, and a value too large to cross is an ordinary error there.
+minimumCopiedValueBytes ∷ Int → Int → Int
+minimumCopiedValueBytes idBytes printBytes = maximum [minimumContextBytes idBytes, printBytes + 5, idBytes + 5]
+
+-- | The fewest bytes the profile's bound on a copied value may be for the builder's context alone, given its
+-- bound on an identity: the bytes the host counts for the context record the builder is handed (a record of five bytes and, for each of @role@,
 -- @content_id@ and @instance_id@, a key of five bytes and its name and a text of five bytes and its length).
 minimumContextBytes ∷ Int → Int
 minimumContextBytes idBytes =

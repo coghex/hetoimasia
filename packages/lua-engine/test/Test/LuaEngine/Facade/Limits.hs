@@ -76,14 +76,57 @@ spec = describe "the bounds the facade formats with" $ do
       withOneIn Gameplay (counts [(LuaIntegerMaximum, 1)]) script {scInit = ["print(api.time.tick())"]} files $ \world _ _ _ →
         outLines world >>= (`shouldBe` ["0"])
   describe "CopiedValueBytes" $ do
-    let least = minimumContextBytes 128
-        profileAt n = bytesOf [(CopiedValueBytes, fromIntegral n), (DataBytes, 64), (SceneInputBytes, 64)]
-    it "has a least that is what the host counts for the context record, written out by hand: 142 at the smallest identity bound, 264 at the largest" $ do
+    let idBytes = minimumInstanceIdBytes
+        printBytes = minimumPrintWarnBytes idBytes
+        least = minimumCopiedValueBytes idBytes printBytes
+        profileAt n =
+          bytesOf
+            [ (InstanceIdBytes, fromIntegral idBytes)
+            , (PrintWarnBytes, fromIntegral printBytes)
+            , (CopiedValueBytes, fromIntegral n)
+            , (DataBytes, 64)
+            , (SceneInputBytes, 64)
+            ]
+    it "has a least that is the largest of what the facade makes cross, each with the header the host adds: one print or warn's text, an identity, and the context record" $ do
+      -- 171 bytes of output and a five-byte header; the context record needs only 142; an identity needs 11
+      minimumCopiedValueBytes 6 171 `shouldBe` 176
+      -- the default output bound dominates at its own size, and the context at a small one
+      minimumCopiedValueBytes 128 4096 `shouldBe` 4101
+      minimumCopiedValueBytes 128 100 `shouldBe` 264
+    it "has a context record whose least is what the host counts for it, written out by hand: 142 at the smallest identity bound, 264 at the largest" $ do
       minimumContextBytes minimumInstanceIdBytes `shouldBe` 142
       minimumContextBytes 128 `shouldBe` 264
-    it "is refused one below the context record the builder is handed" $
+    it "is refused one below the largest crossing the facade makes" $
       attempt (profileAt (least - 1)) `shouldReturn` Left (LimitBelowFormatting "CopiedValueBytes" (least - 1) least)
-    it "at the least, makes a facade that builds an instance's api" $
-      withOneIn Presentation (profileAt least) script {scInit = ["print(api.role, api.content_id, api.instance_id)"]} files $ \world _ _ _ →
-        outLines world >>= (`shouldBe` ["presentation\tmodules-test\tinst-1"])
-
+    it "is refused one below the output a call may carry, at a bound where only that is short of the context record" $
+      -- a record of 142 fits in 150; the longest print, at the smallest output bound, and its header does not
+      attempt (bytesOf [(InstanceIdBytes, fromIntegral idBytes), (PrintWarnBytes, fromIntegral printBytes), (CopiedValueBytes, 150), (DataBytes, 64), (SceneInputBytes, 64)])
+        `shouldReturn` Left (LimitBelowFormatting "CopiedValueBytes" 150 least)
+    it "at the least, keeps every crossing inside it: the longest print and warn are cut and written, and what a script passes in that cannot cross is an ordinary error that leaves the instance well" $
+      withOneIn Gameplay (profileAt least) script
+        { scInit =
+            [ "print(string.rep('p', 5000))"
+            , "warn(string.rep('w', 5000))"
+            , "print(api.role, api.content_id, api.instance_id)"
+            , "print((select(2, pcall(api.content.module, string.rep('a', 600)))) ~= nil)"
+            , "print((select(2, pcall(import, string.rep('b', 600)))) ~= nil)"
+            ]
+        , scUpdate = ["print('alive')"]
+        }
+        files
+        $ \world control fvm _ → do
+          tickBy control fvm 1
+          out ← outLines world
+          err ← errLines world
+          -- the longest print: cut to the bound, ending in the marker
+          case out of
+            first : _ → do
+              Text.length first + 1 `shouldBe` printBytes
+              first `shouldSatisfy` Text.isSuffixOf "..."
+            [] → expectationFailure "nothing was printed"
+          err `shouldSatisfy` (not . null)
+          err `shouldSatisfy` all (Text.isPrefixOf "lua warning role=gameplay content=modules-test instance=inst-1: ")
+          out `shouldSatisfy` elem "gameplay\tmodules-test\tinst-1"
+          -- the oversize path and the oversize import were refused as errors the script caught, and the instance went on
+          out `shouldSatisfy` (\found → length (filter (== "true") found) == 2)
+          out `shouldSatisfy` elem "alive"
