@@ -6,6 +6,7 @@
 -- content failures, never busy, and fatal whatever the request's policy.
 module Test.LuaEngine.Texture.Failures (spec) where
 
+import Control.Concurrent.STM (atomically)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException)
 import Control.Monad (forM_)
 import qualified Data.ByteString as BS
@@ -163,6 +164,24 @@ faults = describe "the engine's own faults" $ do
       _ ← awaitEnd control vm
       pure ()
     (fromException failure ∷ Maybe ProviderDefect) `shouldSatisfy` (/= Nothing)
+
+  it "keep every fault, not only the first: two uploads that fail are both on the pipeline's record, the first as its failure and the other as evidence beside it" $ do
+    ExceptionWithContext _ _ ← fatalSession (config small files) $ \session control runtime → do
+      vm ← startVm session runtime "two" OnArrival
+      admitDriver session vm "i"
+      commandWith session vm "i" "start" "k0" (Just (Load "a.png" True))
+      commandWith session vm "i" "start" "k1" (Just (Load "b.png" True))
+      awaitUploads (ssFake session) 2
+      first ← uploadN (ssFake session) 0
+      second ← uploadN (ssFake session) 1
+      _ ← failUpload (ssFake session) first "device one"
+      _ ← failUpload (ssFake session) second "device two"
+      (latched, evidence) ← atomically ((,) <$> awaitPipelineFailure (ssPipeline session) <*> pipelineFailureEvidence (ssPipeline session))
+      show latched `shouldSatisfy` Text.isInfixOf "device one" . Text.pack
+      map (Text.pack . show . snd) evidence `shouldSatisfy` any (Text.isInfixOf "device two")
+      _ ← awaitEnd control vm
+      pure ()
+    pure ()
 
   it "are a provider defect when the backend raises as it is handed a level (an allocator failure, injected)" $ do
     ExceptionWithContext _ failure ← fatalSession (config small files) $ \session control runtime → do

@@ -189,9 +189,12 @@ import Hetoimasia.Content.ReadPool
   , submit
   )
 import qualified Hetoimasia.Content.ReadPool as ReadPool
-import Hetoimasia.Foundation.Resource (acquirePart, composeCleanup, releaseRank)
+import Hetoimasia.Foundation.Resource (acquirePart, cleanupFailureException, cleanupFailureLabel, composeCleanup, releaseRank)
 import Hetoimasia.Foundation.Worker
-  ( StartOutcome (Started, StartRejected, StartupFailed)
+  ( Completion (completionCleanup, completionLabel, completionResult)
+  , GroupReport (reportDrained, reportExitedBeforeClosing, reportObservedFailures)
+  , Result (Cancelled, Failed, Succeeded)
+  , StartOutcome (Started, StartRejected, StartupFailed)
   , StopToken
   , WorkerCancelled (WorkerCancelled)
   , closeWorkerGroup
@@ -540,9 +543,39 @@ withTexturePipelineWith hooks spec backend pool inventory body = withWorkerGroup
   case result of
     Left failure → rethrowIO failure
     Right value → do
-      _ ← closeWorkerGroup group
+      -- The body returned. A failure the pipeline latched is still the scope's; failing that, the
+      -- group's report of its workers' own outcomes is read, and anything but a clean exit is raised.
+      report ← closeWorkerGroup group
       latched ← latchedFailure tp
-      maybe (pure value) rethrowIO latched
+      case latched of
+        Just failure → rethrowIO failure
+        Nothing →
+          unclean report >>= \case
+            Nothing → pure value
+            Just failure → rethrowIO failure
+
+-- | What a worker group's report holds that is not a clean exit: a worker that failed, was cancelled or
+-- retained a cleanup failure. Raised when the body returned and no failure was latched, since a worker
+-- that was not asked to cancel and did not return cleanly is a failure of the pipeline.
+unclean ∷ GroupReport → IO (Maybe (ExceptionWithContext SomeException))
+unclean report = do
+  let summaries = reportExitedBeforeClosing report <> reportDrained report <> reportObservedFailures report
+      evidence =
+        concat
+          [ [(completionLabel found, raised) | raised ← resultFailure (completionResult found)]
+            <> [(cleanupFailureLabel cleanup, cleanupFailureException cleanup) | cleanup ← completionCleanup found]
+          | found ← summaries
+          ]
+  if null evidence
+    then pure Nothing
+    else do
+      primary ← defect "a decode worker's report was not a clean exit"
+      Just <$> withEvidence primary evidence
+  where
+    resultFailure = \case
+      Succeeded () → []
+      Failed raised → [raised]
+      Cancelled raised → [raised]
 
 withEvidence ∷ ExceptionWithContext SomeException → [(Text, ExceptionWithContext SomeException)] → IO (ExceptionWithContext SomeException)
 withEvidence primary [] = pure primary
