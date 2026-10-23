@@ -375,8 +375,9 @@ startModule c request context after = do
     M1Accepted _ -> pure (StartAnswered started)
 
 -- | What starting a request for a module came to: what the request host answered, or a permanent
--- refusal that became true after the argument check passed — to be raised as the same ordinary,
--- catchable error the argument check raises, never as a busy answer a script would retry.
+-- refusal. The argument check decides the permanent questions and holds the place, so only a call that
+-- skipped the check meets one here: the caller fails that call with the reason, as the host fails a call
+-- that skipped its own permanent checks, and never answers busy for what waiting cannot change.
 data ModuleStart
   = -- | Accepted, or busy on a temporary bank.
     StartAnswered !M1Start

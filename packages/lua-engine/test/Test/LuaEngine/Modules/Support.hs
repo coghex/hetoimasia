@@ -582,7 +582,7 @@ bindings ∷ Session → Coordinator → [Namespace]
 bindings session coordinator =
   [ namespace "fx" [recording, blocking]
   , namespace "request" (m1RequestBindings (M1Service handleType moduleValueSchema))
-  , namespace "module" [fetching, looking]
+  , namespace "module" [fetching, fetchingUnchecked, looking]
   ]
   where
     recording =
@@ -602,17 +602,19 @@ bindings session coordinator =
             readMVar gate
           _ → pure ()
         pure []
-    fetching =
-      withArgumentCheck check $
-        asynchronousNativeRequestIn "fetch" [SText, SOptional SInteger] (m1StartSchemas handleType) $ \context values →
-          case requestFrom session values of
-            Left why → throwIO (userError (Text.unpack why))
-            Right asked → do
-              started ← startModule coordinator asked context (note session "disposed")
-              case started of
-                StartAnswered answer → pure (m1StartResults handleType answer)
-                -- The same ordinary error the argument check raises.
-                StartRefused why → throwIO (userError (Text.unpack why))
+    fetching = withArgumentCheck check (fetchWith "fetch")
+    -- A call that skipped the argument check: what the check would have refused or reserved is met by the
+    -- admission itself, and a permanent refusal there is a fault of the call.
+    fetchingUnchecked = fetchWith "fetch_unchecked"
+    fetchWith name =
+      asynchronousNativeRequestIn name [SText, SOptional SInteger] (m1StartSchemas handleType) $ \context values →
+        case requestFrom session values of
+          Left why → throwIO (userError (Text.unpack why))
+          Right asked → do
+            started ← startModule coordinator asked context (note session "disposed")
+            case started of
+              StartAnswered answer → pure (m1StartResults handleType answer)
+              StartRefused why → throwIO (userError (Text.unpack why))
     check owner values = case requestFrom session values of
       Left why → pure (Just why)
       Right asked → do
@@ -704,6 +706,11 @@ driverSource =
       , "    if not ok then out = 'error ' .. tostring(r)"
       , "    elseif r then self.hs[key] = r out = 'started'"
       , "    else out = 'busy:' .. err.code .. ':' .. err.message end"
+      , "  elseif p.op == 'ustart' then"
+      , "    local ok, r, err = pcall(module.fetch_unchecked, p.path or 'a.lua', p.offset)"
+      , "    if not ok then out = 'error ' .. tostring(r)"
+      , "    elseif r then self.hs[key] = r out = 'started'"
+      , "    else out = 'busy:' .. err.code .. ':' .. err.message end"
       , "  elseif p.op == 'ready' then out = tostring(request.ready(self.hs[key]))"
       , "  elseif p.op == 'take' then out = describe(request.take(self.hs[key]), 0)"
       , "  elseif p.op == 'ptake' then"
@@ -749,7 +756,7 @@ driverSource =
       , "  elseif p.op == 'block' then fx.block(key) out = 'released'"
       , "  end"
       , "  local tag = ''"
-      , "  if p.path and p.op ~= 'start' and p.op ~= 'pstart' then tag = ' #' .. p.path end"
+      , "  if p.path and p.op ~= 'start' and p.op ~= 'pstart' and p.op ~= 'ustart' then tag = ' #' .. p.path end"
       , "  fx.record((p.who or 'cmd') .. ' ' .. p.op .. ' ' .. key .. ' ' .. out .. tag)"
       , "end"
       , "function init(self, api)"
