@@ -148,6 +148,46 @@ library modules
         hetoimasia-scripting-lua ==0.1.0.0,
         hetoimasia-scripting-lua:runtime-lua
 
+-- The M1 authoring facade (LFE-12): what an instance's hooks are handed (the content, request and time
+-- services bound to the instance), the lexical-root import's resolver, and bounded print and warn. It
+-- is a sublibrary of its own, in a source directory of its own, for the reason the request adapter is:
+-- the library is the pure configuration boundary and imports nothing that performs IO, and this does.
+-- It depends on the request adapter, the data provider and the module coordinator for the services it
+-- binds, on the content package for the address policy and on the host's public modules for the
+-- bindings it installs. It imports no module of a game, a window, a GPU, Vulkan, GLFW or the console,
+-- no texture or scene module, and installs nothing until an assembly asks it to.
+library facade
+    import: language
+    visibility: public
+    default-extensions: OverloadedStrings
+    hs-source-dirs: facade
+    exposed-modules:
+        Hetoimasia.LuaEngine.Facade
+    -- The bindings, the Lua the engine runs before authored code and the resolver, behind the facade.
+    other-modules:
+        Hetoimasia.LuaEngine.Facade.Bindings
+        Hetoimasia.LuaEngine.Facade.Caller
+        Hetoimasia.LuaEngine.Facade.Content
+        Hetoimasia.LuaEngine.Facade.Output
+        Hetoimasia.LuaEngine.Facade.Request
+        Hetoimasia.LuaEngine.Facade.Source
+        Hetoimasia.LuaEngine.Facade.Time
+        Hetoimasia.LuaEngine.Facade.Types
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-content ==0.1.0.0,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-lua-engine ==0.1.0.0,
+        hetoimasia-lua-engine:data,
+        hetoimasia-lua-engine:modules,
+        hetoimasia-lua-engine:request,
+        hetoimasia-scripting-lua ==0.1.0.0,
+        hetoimasia-scripting-lua:runtime-lua
+
 -- The M1 texture pipeline (LFE-16): the endpoint that answers a request for a usable, instance-owned
 -- texture, the two lanes, the one decode worker and the reservations behind it, and the port the
 -- concrete graphics adapter (LFE-17) implements. It is a sublibrary of its own, in a source directory
@@ -238,6 +278,18 @@ test-suite lua-engine-tests
         Test.LuaEngine.Data.Spec
         Test.LuaEngine.Data.Support
         Test.LuaEngine.Data.Workers
+        Test.LuaEngine.Facade.Authoring
+        Test.LuaEngine.Facade.Client
+        Test.LuaEngine.Facade.Clocks
+        Test.LuaEngine.Facade.Spec
+        Test.LuaEngine.Facade.Imports
+        Test.LuaEngine.Facade.Output
+        Test.LuaEngine.Facade.Ownership
+        Test.LuaEngine.Facade.Requests
+        Test.LuaEngine.Facade.Sinks
+        Test.LuaEngine.Facade.Support
+        Test.LuaEngine.Facade.Validation
+        Test.LuaEngine.Facade.Waits
         Test.LuaEngine.Loader
         Test.LuaEngine.Manifest.Examples
         Test.LuaEngine.Manifest.Schema
@@ -299,6 +351,7 @@ test-suite lua-engine-tests
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-lua-engine ==0.1.0.0,
         hetoimasia-lua-engine:data,
+        hetoimasia-lua-engine:facade,
         hetoimasia-lua-engine:modules,
         hetoimasia-lua-engine:request,
         hetoimasia-lua-engine:scene,

@@ -16,6 +16,7 @@ module Test.LuaEngine.Modules.Support
   ( -- * The session
     Session (..)
   , withSession
+  , withSessionLimits
   , ReaderOf
   , realReader
   , injectedIoError
@@ -120,10 +121,11 @@ import qualified Data.Text.Encoding as Text
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (UTCTime (UTCTime), secondsToDiffTime)
 import Data.Word (Word64)
-import Hetoimasia.Content (FailureKind (Unreadable), defaultContentLimits, withContentRoot)
+import Hetoimasia.Content (ContentLimits, FailureKind (Unreadable), defaultContentLimits, withContentRoot)
 import Hetoimasia.Content.Identity (ContentKey, contentKeyPath, logicalPathBytes, parseReference, rootKey)
 import Hetoimasia.Content.Inventory
   ( Inventory
+  , InventoryLimits
   , InventorySpec (..)
   , ReadFailure (..)
   , ReadOutcome (ReadIoError)
@@ -262,12 +264,19 @@ withSource source reserve bank =
 -- this many workers and slots whose reader is made by the given function; real supervision.
 -- However the example ends the gates are opened, so a failing example fails instead of waiting.
 withSession ∷ Profile → (Int, Int) → ReaderOf → Layout → (Session → RuntimeControl → LuaRuntime → IO a) → IO a
-withSession profile (workers, slots) readerOf (Layout files) body =
+withSession = withSessionLimits Nothing
+
+-- | The same over these content and inventory limits, when given (the profile's own, for an example that
+-- needs the fixed M1 path ceilings), and the examples' small ones otherwise.
+withSessionLimits ∷ Maybe (ContentLimits, InventoryLimits) → Profile → (Int, Int) → ReaderOf → Layout → (Session → RuntimeControl → LuaRuntime → IO a) → IO a
+withSessionLimits given profile (workers, slots) readerOf (Layout files) body =
   withSystemTempDirectory "hetoimasia-lua-engine-modules" $ \tree → do
     mapM_ (\(path, bytes) → createDirectoryIfMissing True (takeDirectory (tree </> path)) >> ByteString.writeFile (tree </> path) bytes) files
-    limits ← either (\refused → assertFailure ("scan limits refused: " <> show refused)) pure (inventoryLimits scanSpec)
+    (contentBounds, limits) ← case given of
+      Just found → pure found
+      Nothing → either (\refused → assertFailure ("scan limits refused: " <> show refused)) (pure . (,) defaultContentLimits) (inventoryLimits scanSpec)
     root' ← either (\refused → assertFailure ("root key refused: " <> show refused)) pure (rootKey "modules-test")
-    withContentRoot defaultContentLimits tree $ \root → do
+    withContentRoot contentBounds tree $ \root → do
       inventory ← scanInventory limits root' root >>= either (\refused → assertFailure ("scan refused: " <> show refused)) pure
       probe ← newProbe
       spec ← either (\refused → assertFailure ("pool refused: " <> show refused)) pure (poolSpec workers slots)

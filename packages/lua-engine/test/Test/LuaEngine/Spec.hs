@@ -5,6 +5,7 @@ import qualified Test.LuaEngine.Behavior as Behavior
 import qualified Test.LuaEngine.Boot as Boot
 import qualified Test.LuaEngine.Boundary as Boundary
 import qualified Test.LuaEngine.Data.Spec as Data
+import qualified Test.LuaEngine.Facade.Spec as Facade
 import qualified Test.LuaEngine.Loader as Loader
 import qualified Test.LuaEngine.Manifest.Examples as Examples
 import qualified Test.LuaEngine.Manifest.Schema as Schema
@@ -29,6 +30,7 @@ spec = describe "LuaEngine" $ do
   Modules.spec
   Texture.spec
   Scene.spec
+  Facade.spec
   Behavior.spec
   Boot.spec
   Loader.spec
