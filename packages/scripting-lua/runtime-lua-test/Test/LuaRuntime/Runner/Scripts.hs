@@ -2,11 +2,11 @@
 -- or in any other that shares the temporary root, removed on every exit of the example.
 module Test.LuaRuntime.Runner.Scripts (spec) where
 
-import Control.Concurrent (forkFinally, killThread)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
+import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, retry)
-import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, fromException, throwIO, try)
-import Control.Monad (forM, forM_)
+import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, catch, finally, fromException, mask, throwIO, try, uninterruptibleMask_)
+import Control.Monad (forM, forM_, void)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as Char8
@@ -47,46 +47,65 @@ candidates names = do
           [] → error "the source of candidates ran out")
   pure (next, readIORef asked)
 
+-- | Start a worker for each action, run the body while they run, then open the gate they wait on and wait
+-- for every worker to terminate before this returns. The workers are started under a mask and the body
+-- runs unmasked inside it, so no exit of the body (a failed assertion, an exception, a cancellation
+-- delivered to the example) can leave a worker running or a worker unstarted-but-registered: the gate is
+-- opened and the workers are joined, uninterruptibly because each ends once the gate is open, on every
+-- path. Answers the body's outcome and each worker's, so the caller raises the workers' failures (the
+-- cause of any check they fail) before the body's, and so never swallows either.
+withWorkers ∷ MVar () → [IO ()] → ([ThreadId] → IO a) → IO (Either SomeException a, [Either SomeException ()])
+withWorkers gate actions body = mask $ \restore → do
+  started ←
+    forM actions $ \action → do
+      done ← newEmptyMVar
+      thread ← forkIOWithUnmask (\unmask → try (unmask action) >>= putMVar done)
+      pure (thread, done)
+  outcome ← try (restore (body (map fst started)))
+  _ ← tryPutMVar gate ()
+  outcomes ← uninterruptibleMask_ (mapM (takeMVar . snd) started)
+  pure (outcome, outcomes)
+
+-- | Whether this is the cancellation 'killThread' delivers.
+cancelled ∷ SomeException → Bool
+cancelled failure = fromException failure == Just ThreadKilled
+
+-- | Raise the first failure among the workers', then the body's, and otherwise answer the body's result.
+settled ∷ (Either SomeException a, [Either SomeException ()]) → IO a
+settled (outcome, outcomes) = do
+  forM_ outcomes (either throwIO pure)
+  either throwIO pure outcome
+
 spec ∷ Spec
 spec = describe "script directories" $ do
   it "gives callers that hold their directories at once a directory each, with their own files, all removed afterwards" $ bounded $ do
     -- Every caller holds its directory until all of them have one, so none can be given a path another
-    -- has already let go of. The callers are joined, and the directories are read, whatever the checks find.
+    -- has already let go of. A caller that is not given a directory exits instead of arriving.
     release ← newEmptyMVar
     arrived ← newTVarIO []
     exited ← newTVarIO (0 ∷ Int)
-    finished ← forM [1 .. callers] $ \n → do
-      done ← newEmptyMVar
-      _ ←
-        forkFinally
-          ( withScripts [("shared.lua", contentOf n), ("own-" <> show n <> ".lua", contentOf n)] $ \paths → do
-              atomically (modifyTVar' arrived ((n, paths) :))
-              readMVar release
-          )
-          (\outcome → atomically (modifyTVar' exited (+ 1)) >> putMVar done outcome)
-      pure done
     base ← getTemporaryDirectory
-    -- A caller that failed to be given a directory never arrives: it has exited instead.
-    checked ← try $ do
-      held ← atomically $ do
-        found ← readTVar arrived
-        gone ← readTVar exited
-        if length found + gone < callers then retry else pure found
-      length held `shouldBe` callers
-      let directories = [takeDirectory (scriptAt paths 0) | (_, paths) ← held]
-      Set.size (Set.fromList directories) `shouldBe` callers
-      forM_ held $ \(n, paths) → do
-        let directory = takeDirectory (scriptAt paths 0)
-        doesDirectoryExist directory `shouldReturn` True
-        sort <$> listDirectory directory `shouldReturn` sort ["shared.lua", "own-" <> show n <> ".lua"]
-        mapM ByteString.readFile paths `shouldReturn` [contentOf n, contentOf n]
-        takeDirectory directory `shouldBe` dropTrailingPathSeparator base
-      pure directories
-    putMVar release ()
-    outcomes ← mapM takeMVar finished
-    -- A caller's own failure is the cause of any check it fails, so it is raised first.
-    forM_ outcomes (either throwIO pure)
-    directories ← either (\failure → throwIO (failure ∷ SomeException)) pure checked
+    let caller n =
+          withScripts [("shared.lua", contentOf n), ("own-" <> show n <> ".lua", contentOf n)] (\paths → do
+            atomically (modifyTVar' arrived ((n, paths) :))
+            readMVar release)
+            `finally` atomically (modifyTVar' exited (+ 1))
+    directories ←
+      withWorkers release (map caller [1 .. callers]) (\_ → do
+        held ← atomically $ do
+          found ← readTVar arrived
+          gone ← readTVar exited
+          if length found + gone < callers then retry else pure found
+        length held `shouldBe` callers
+        let directories = [takeDirectory (scriptAt paths 0) | (_, paths) ← held]
+        Set.size (Set.fromList directories) `shouldBe` callers
+        forM_ held $ \(n, paths) → do
+          let directory = takeDirectory (scriptAt paths 0)
+          doesDirectoryExist directory `shouldReturn` True
+          sort <$> listDirectory directory `shouldReturn` sort ["shared.lua", "own-" <> show n <> ".lua"]
+          mapM ByteString.readFile paths `shouldReturn` [contentOf n, contentOf n]
+          takeDirectory directory `shouldBe` dropTrailingPathSeparator base
+        pure directories) >>= settled
     forM_ directories $ \directory → doesDirectoryExist directory `shouldReturn` False
 
   it "removes the directory when the example throws" $ bounded $ do
@@ -100,24 +119,24 @@ spec = describe "script directories" $ do
   it "removes the directory when the example is cancelled while it holds it" $ bounded $ do
     entered ← newEmptyMVar
     unheld ← newEmptyMVar
-    done ← newEmptyMVar
-    worker ←
-      forkFinally
-        (withScripts [("a.lua", contentOf 0)] (\paths → putMVar entered (Right (takeDirectory (scriptAt paths 0))) >> readMVar unheld))
-        (\outcome → tryPutMVar entered (Left outcome) >> putMVar done outcome)
-    -- The worker is released whatever the checks find, so that it has terminated before the example ends.
-    checked ← try $ do
-      held ← takeMVar entered
-      case held of
-        Left outcome → fail ("the caller was not given a directory: " <> show outcome)
-        Right directory → do
-          doesDirectoryExist directory `shouldReturn` True
-          killThread worker
-          outcome ← takeMVar done
-          outcome `shouldSatisfy` either (\failure → fromException failure == Just ThreadKilled) (const False)
-          doesDirectoryExist directory `shouldReturn` False
-    _ ← tryPutMVar unheld ()
-    either (\failure → throwIO (failure ∷ SomeException)) pure checked
+    -- A worker that is not given a directory says so, instead of leaving the example waiting for it.
+    let holder =
+          withScripts [("a.lua", contentOf 0)] (\paths → putMVar entered (Right (takeDirectory (scriptAt paths 0))) >> readMVar unheld)
+            `catch` \failure → void (tryPutMVar entered (Left failure)) >> throwIO (failure ∷ SomeException)
+    (checked, outcomes) ←
+      withWorkers unheld [holder] $ \threads → do
+        held ← takeMVar entered
+        case held of
+          Left failure → fail ("the caller was not given a directory: " <> show failure)
+          Right directory → do
+            doesDirectoryExist directory `shouldReturn` True
+            mapM_ killThread threads
+            pure directory
+    -- Both are read once the worker has terminated: it was cancelled, and its directory is gone.
+    forM_ [failure | Left failure ← outcomes, not (cancelled failure)] throwIO
+    directory ← either throwIO pure checked
+    outcomes `shouldSatisfy` all (either cancelled (const False))
+    doesDirectoryExist directory `shouldReturn` False
 
   it "passes over a candidate that is taken and leaves it, and what it holds, as it was" $ bounded $ do
     withScripts [("a.lua", contentOf 0)] $ \paths → do
