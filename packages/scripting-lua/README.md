@@ -2562,11 +2562,14 @@ to the application on the owner's thread, before the segment that follows
 (`scheduledObserve`); a binding that should answer a script's question about its tick keeps
 what it was told where it reads it.
 
-`scheduledRefusedWait` is told, on the owner's thread, of each wait the scheduler refused (a `WaitRefusal`), once the turn that
-refused it has been accounted for: the task still failed and its instance still ended exactly as before, and the default does
-nothing. It is for an application whose own bindings check a wait before they suspend and so treat a refusal as the engine's fact
-(a clock that moved between the check and the placement): what it raises is a failure of the host and ends the owner as any
-other does.
+`scheduledRefusedWait` is told, on the owner's thread, of each wait the scheduler refused (a `WaitRefusal`), **at the boundary of
+the segment that asked for it and first there**: the scheduler keeps each refusal in its state, in the transaction that refuses
+it (`takeRefusedWaits` takes them, oldest first), and the owner's boundary step takes them before it looks at an instance, a
+provider or the loader, before it can write an acknowledgement that answers an accounting wait, and before the scheduler chooses
+another segment. The task still failed and its instance still ends exactly as before, and the default does nothing. It is for an
+application whose own bindings check a wait before they suspend and so treat a refusal as the engine's fact (a clock that moved
+between the check and the placement): what it raises is a failure of the host, leaves the turn at that boundary, and ends the
+owner as any other does, with no peer dispatched and no accounting acknowledged after the refusal.
 
 ### Waiting for the owner's accounting
 
@@ -4297,7 +4300,9 @@ same bound, and a smaller bound when a validated profile gives one): `authoredLi
 Lua of the conversion and cut (`renderFunctionLines`). The runner's own output is exactly what it was. When a prefix is given, **every line begins with the whole prefix, the line a cut
 ends included**: the marker is appended to the last kept (prefixed) line, never a line of its own and never after a cut prefix; a
 bound too small to hold a prefix, the marker and a line end is the bound winning over the format. A call with no prefix is cut as
-the runner's output is.
+the runner's output is. **No call fits under `minimumOutputLimit`** (the marker and a line end, 4 bytes): below it
+`authoredLinesWith` writes nothing, and the Lua that cuts a call before it crosses keeps at most the marker, never a negative
+count. An application that needs the prefixed format validates its bound against what the format takes before using it.
 
 The rules for every write: a sink is handed one line at a time, with no line break and no control character in it but a tab; a script's
 text and every other text a script can influence (a name, an error, a traceback, a path) has its control characters replaced and is then cut
