@@ -357,7 +357,7 @@ data Necessity
 -- never run provider code that blocks.
 data Credit = Credit
   { creditName ∷ !Text
-    -- ^ Named in the busy answer and in evidence. Bounded to 64 characters when it is shown.
+    -- ^ Named in the busy answer and in evidence. Bounded to 64 bytes of UTF-8, cut between characters, when it is shown.
   , creditReserve ∷ STM Bool
     -- ^ Take the credit: 'True' when it was available and is now held. A bank that is full
     -- answers 'False', which is busy (waiting may help); whatever it wrote is undone with the rest of
@@ -435,7 +435,7 @@ renderBank = \case
   BankVmRequests bound → "the VM holds all " <> Text.pack (show bound) <> " of its request places"
   BankOwnerRequests bound → "the owner holds all " <> Text.pack (show bound) <> " of its request places"
   BankLeases capacity charged → "the instance's lease capacity is charged: " <> Text.pack (show charged) <> " of " <> Text.pack (show capacity)
-  BankCredit name → "the provider has no room in " <> Text.take 64 name
+  BankCredit name → "the provider has no room in " <> boundUtf8 64 name
 
 -- | An expected failure of the content or service a request asked for: a code the service
 -- supplies, a bounded message, and for content the root and path that failed.
@@ -520,7 +520,7 @@ admission ∷ Necessity → Text → ValueLimits → Word64 → Int → Int → 
 admission requirement source limits ceilingValue perInstance perVm =
   Admission
     { admitNecessity = requirement
-    , admitSource = Text.take 128 source
+    , admitSource = boundUtf8 128 source
     , admitOffset = Nothing
     , admitLogicalMaximum = ceilingValue
     , admitPerInstance = perInstance
@@ -808,7 +808,7 @@ renderSubscribeRefusal = \case
   NoSubscriber → "subscribe refused: no instance is running to receive the events"
   SubscriptionsClosed → "subscribe refused: the instance is no longer taking subscriptions"
   -- The name is a script's, as long as the owner's limits let a string be: what is quoted is cut.
-  EndpointNotGranted name → "subscribe refused: no event endpoint named " <> Text.take 64 name <> " is granted to this instance"
+  EndpointNotGranted name → "subscribe refused: no event endpoint named " <> boundUtf8 64 name <> " is granted to this instance"
   SubscriptionsFull bound → "subscribe refused: all " <> Text.pack (show bound) <> " places are held"
 
 -- Who asks ---------------------------------------------------------------------------

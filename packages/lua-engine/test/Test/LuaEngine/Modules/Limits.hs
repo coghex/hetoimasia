@@ -15,6 +15,7 @@ import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (CountLimit (ModuleChainDepth, ModuleIdentitiesPerVm, RequestsPerInstance), Profile)
 import Hetoimasia.Scripting.Lua.Admission (Credit (..), CreditEnd (..), CreditRefused (..))
 import Hetoimasia.Scripting.Lua.Loading (LoaderHooks (..), LoaderPlan (..))
+import Hetoimasia.Scripting.Lua.Owner (SourceAnswer (..), SourceSupplier (..))
 import Hetoimasia.Scripting.Lua.Provider (RequestEndpoint (..))
 import Hetoimasia.Scripting.Lua.Value (Value (VText))
 import Test.Hspec
@@ -445,6 +446,17 @@ refusals = describe "refusals told apart by what can change" $ do
             ImmediateReady _ → pure ()
             _ → expectationFailure "a ready module should stay readable after the stop"
         counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (1, 0)
+
+  it "answers the loader's ask for a source with a failure once it has closed, so that a chain never waits for a source that will not come" $
+    withSession tiny (2, 8) realReader layout $ \session _ runtime →
+      withVm session runtime "ui" (defaultOptions OnArrival) $ \vm → do
+        closeModuleCoordinator (vmCoordinator vm)
+        -- The supplier the coordinator gave the loader, asked as the loader would ask for a dependency.
+        answer ← supplierAcquire (planSupplier (coordinatorPlan (vmCoordinator vm))) (moduleIdentity (key' session "i1.lua"))
+        case answer of
+          SourceFailure why → why `shouldSatisfy` Text.isInfixOf "stopped"
+          other → expectationFailure ("expected the ask answered with a failure, found " <> show other)
+        counts' vm >>= \c → (jobsHeld c, promisedHeld c) `shouldBe` (0, 0)
 
   it "answers a request the coordinator closed under, between its admission and its acceptance, with the failure it is, and never leaves it pending" $ do
     gate ← newEmptyMVar

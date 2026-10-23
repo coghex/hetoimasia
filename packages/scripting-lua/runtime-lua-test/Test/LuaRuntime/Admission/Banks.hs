@@ -15,7 +15,7 @@ import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Admission.Support
-import Test.LuaRuntime.Request.Support (answerResult, awaitCancelled, awaitDiagnostic, diagnostics, finishWork, submissions)
+import Test.LuaRuntime.Request.Support (Submitted (..), answerResult, awaitCancelled, awaitDiagnostic, diagnostics, finishWork, submissionAt, submissions)
 import Test.LuaRuntime.Scheduled.Support (awaitScheduledTerminal)
 import Test.LuaRuntime.Support (Broken (Broken), brokenIs, bounded, expectFatal, requiredPolicy, withBoundary)
 
@@ -168,6 +168,23 @@ spec = describe "banks" $ do
         setPolicy fixture (\held → held {polCredits = [bankCredit "empty" False empty]})
         acommand fixture owner "i" "pstart" "c"
         awaitNote fixture "cmd pstart c busy:busy the provider has no room in empty"
+
+    it "name themselves in a busy answer in UTF-8 bytes, cut between characters" $ bounded $ do
+      fixture ← newAFix 4
+      empty ← newBank 0
+      setPolicy fixture (\held → held {polCredits = [bankCredit (Text.replicate 64 "é") False empty], polSource = Text.replicate 100 "😀"})
+      withBoundary $ \_ runtime → settleAll fixture $ do
+        owner ← arrival fixture 8 runtime "credit name"
+        admitAdmitter fixture owner "i" "admitter"
+        acommand fixture owner "i" "pstart" "a"
+        -- 64 two-byte characters are 128 bytes: the name is shown as the 32 that fit in 64 bytes.
+        awaitNote fixture ("cmd pstart a busy:busy the provider has no room in " <> Text.replicate 32 "é")
+        -- A source of four-byte characters is kept as the 32 that fit in 128 bytes, once a request is admitted.
+        setPolicy fixture (\held → held {polCredits = []})
+        acommand fixture owner "i" "pstart" "b"
+        awaitNote fixture "cmd pstart b started"
+        info ← sbInfo <$> submissionAt (afFake fixture) 0
+        infoSource info `shouldBe` Just (Text.replicate 32 "😀")
 
     it "that are full for good win over a full temporary bank: the refusal is decided before any bank is asked" $ bounded $ do
       fixture ← newAFix 4

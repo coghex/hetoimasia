@@ -434,7 +434,11 @@ changeText = \case
 acquireSTM ∷ Coordinator → ExportIdentity → STM SourceAnswer
 acquireSTM c identity = do
   st <- readState c
-  case Map.lookup identity (csJobs st) of
+  -- A coordinator that has closed will read nothing more: the ask is answered with the failure it is, so
+  -- that a chain is never left waiting for a source that will not come.
+  if csPhase st /= Open
+    then pure (SourceFailure (encodeSourceReason "io_error" closedReason))
+    else case Map.lookup identity (csJobs st) of
     Just job
       | jobInterest job → defect "the loader asked for a source it already holds an interest in"
       | otherwise → do
