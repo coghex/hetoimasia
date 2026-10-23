@@ -93,6 +93,11 @@ cache = describe "the identity cache" $ do
         line ← lineStartingWith session "x pstart k4 error"
         line `shouldSatisfy` Text.isInfixOf "module limit"
         counts' vm >>= \c → jobsHeld c `shouldBe` 3
+        -- A full cache still answers lookups of what it holds, failures included.
+        command session vm "x" "lookup" "k0" [("path", VText "bad1.lua")] Nothing
+        awaitNote session "x lookup k0 failed module_error #bad1.lua"
+        command session vm "x" "lookup" "k0" [("path", VText "i1.lua")] Nothing
+        awaitNote session "x lookup k0 ready #i1.lua"
   where
     forM_' items action = mapM_ action items
 

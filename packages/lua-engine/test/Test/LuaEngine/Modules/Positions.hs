@@ -5,7 +5,7 @@
 -- phase has no tick.
 module Test.LuaEngine.Modules.Positions (spec) where
 
-import Control.Monad (forM_)
+import Control.Monad (forM_, void)
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.Scripting.Lua.Provider (ProviderDiagnostics (rdOutstanding))
@@ -66,6 +66,43 @@ earliest = describe "the earliest position a request contributed" $ do
         countNotes session "eval m" >>= (`shouldBe` 1)
         readsStarted (ssProbe session) >>= (`shouldBe` 1)
 
+  it "is kept when the instance that contributed it ends: evaluation stays due then, and the request of the instance that remains is answered at its own" $
+    withSession fixedM1Profile (2, 8) realReader layout $ \session control runtime →
+      withVm session runtime "logical" (defaultOptions AtAssignedTick) $ \vm → do
+        admitDriver session vm "x"
+        admitDriver session vm "y"
+        command session vm "x" "start" "kx" [] (Just (fetchAt 12 "m.lua"))
+        command session vm "y" "start" "ky" [] (Just (fetchAt 10 "m.lua"))
+        awaitNote session "x start kx started"
+        awaitNote session "y start ky started"
+        stopInstance session vm "y"
+        awaitCounts vm (\c → waitersHeld c == 1)
+        forM_ [1 .. 9 ∷ Int] (const (grantOne control vm))
+        awaitGate session "m"
+        tickOf vm >>= (`shouldBe` 9)
+        releaseGate session "m"
+        grantOne control vm
+        grantOne control vm
+        grantOne control vm
+        command session vm "x" "take" "kx" [] Nothing
+        awaitNote session "x take kx {status=success,value=table(m)}"
+        countNotes session "eval m" >>= (`shouldBe` 1)
+
+  it "is not moved later by a waiter that asks for a later position after the one that set it cancelled" $
+    withSession fixedM1Profile (2, 8) realReader layout $ \session control runtime →
+      withVm session runtime "logical" (defaultOptions AtAssignedTick) $ \vm → do
+        admitDriver session vm "x"
+        admitDriver session vm "y"
+        command session vm "x" "start" "kx" [] (Just (fetchAt 5 "m.lua"))
+        command session vm "x" "cancel" "kx" [] Nothing
+        awaitNote session "x cancel kx cancelled"
+        command session vm "y" "start" "ky" [] (Just (fetchAt 9 "m.lua"))
+        awaitNote session "y start ky started"
+        forM_ [1 .. 4 ∷ Int] (const (grantOne control vm))
+        awaitGate session "m"
+        tickOf vm >>= (`shouldBe` 4)
+        releaseGate session "m"
+
   it "orders independent roots by tick and sequence whatever order they were admitted in, and an earlier request moves a queued job up" $
     withSession fixedM1Profile (2, 8) realReader orderLayout $ \session control runtime →
       withVm session runtime "logical" (defaultOptions AtAssignedTick) $ \vm → do
@@ -118,6 +155,17 @@ noWaiters = describe "a job nobody waits for" $ do
         readsStarted (ssProbe session) >>= (`shouldBe` 1)
         countNotes session "eval plain" >>= (`shouldBe` 1)
 
+  it "cannot be withdrawn from a request already answered: the cancel finds it settled, and the result is still the request's to take" $
+    withSession fixedM1Profile (2, 8) realReader layout $ \session _ runtime →
+      withVm session runtime "ui" (defaultOptions OnArrival) $ \vm → do
+        admitDriver session vm "x"
+        command session vm "x" "start" "k1" [] (Just (fetch "plain.lua"))
+        awaitCounts vm (\c → jobsReady c == 1)
+        command session vm "x" "cancel" "k1" [] Nothing
+        awaitNote session "x cancel k1 already_settled"
+        command session vm "x" "take" "k1" [] Nothing
+        awaitNote session "x take k1 {status=success,value=table(plain)}"
+
   it "holds its retained position on a logical owner with no waiter left, and finishes there" $
     withSession fixedM1Profile (2, 8) realReader layout $ \session control runtime →
       withVm session runtime "logical" (defaultOptions AtAssignedTick) $ \vm → do
@@ -126,6 +174,9 @@ noWaiters = describe "a job nobody waits for" $ do
         awaitNote session "x start k1 started"
         command session vm "x" "cancel" "k1" [] Nothing
         awaitNote session "x cancel k1 cancelled"
+        command session vm "x" "take" "k1" [] Nothing
+        awaitNote session "x take k1 {status=cancelled}"
+        awaitVmDiagnostic vm (\d → rdOutstanding d == 0)
         forM_ [1 .. 4 ∷ Int] (const (grantOne control vm))
         awaitGate session "m"
         tickOf vm >>= (`shouldBe` 4)
@@ -195,6 +246,29 @@ failures = describe "a required failure" $ do
         forM_ [4 .. 6 ∷ Int] (const (grantOne control vm))
         yFailure ← awaitFailure session "y"
         fmap fst (requestFailureOf yFailure) `shouldBe` Just "module"
+
+  it "is not delivered to a request cancelled before its position, though the failure was held for it from the moment it came" $
+    withSession fixedM1Profile (2, 8) realReader layout $ \session control runtime →
+      withVm session runtime "logical" (defaultOptions AtAssignedTick) $ \vm → do
+        admitDriver session vm "x"
+        admitDriver session vm "y"
+        command session vm "x" "start" "kx" [] (Just (fetchAt 3 "broken_first.lua"))
+        command session vm "y" "start" "ky" [] (Just (fetchAt 6 "broken_second.lua"))
+        awaitNote session "x start kx started"
+        awaitNote session "y start ky started"
+        forM_ [1, 2 ∷ Int] (const (grantOne control vm))
+        awaitCounts vm (\c → jobsFailed c == 2)
+        grantOne control vm
+        void (awaitFailure session "x")
+        forM_ [4, 5 ∷ Int] (const (grantOne control vm))
+        -- The failure has been held for the second request since tick three; its cancel wins.
+        command session vm "y" "cancel" "ky" [] Nothing
+        awaitNote session "y cancel ky cancelled"
+        grantOne control vm
+        command session vm "y" "take" "ky" [] Nothing
+        awaitNote session "y take ky {status=cancelled}"
+        command session vm "y" "lookup" "k0" [("path", VText "broken_second.lua")] Nothing
+        awaitNote session "y lookup k0 failed module_error #broken_second.lua"
 
   it "is classified by its cause, with the content that failed, however many modules import it" $
     withSession fixedM1Profile (2, 8) realReader layout $ \session _ runtime →

@@ -84,6 +84,20 @@ stopping = describe "stopping a VM" $ do
         evalsOf session >>= (`shouldBe` [])
         poolReading session >>= \reading → statusReserved reading `shouldBe` 0
 
+  it "drops the bytes of a source that arrived and waits for a position far ahead, returning its charge and its slot" $
+    withSession fixedM1Profile (2, 8) realReader layout $ \session control runtime →
+      withVm session runtime "stopping" (defaultOptions AtAssignedTick) $ \vm → do
+        admitDriver session vm "x"
+        command session vm "x" "start" "k1" [] (Just (fetchAt 50 "a.lua"))
+        awaitNote session "x start k1 started"
+        awaitFinished (ssProbe session) 1
+        counts vm >>= \c → (bytesOrdinary c > 0, slotsHeld c) `shouldBe` (True, 4)
+        retireVm control vm
+        awaitDrained' vm
+        counts vm >>= \c → (bytesOrdinary c, slotsHeld c, jobsStopped c, jobsReady c) `shouldBe` (0, 0, 1, 0)
+        evalsOf session >>= (`shouldBe` [])
+        poolReading session >>= \reading → statusReserved reading `shouldBe` 0
+
   it "starts no deferred read once it has stopped, whatever room frees" $
     withSession (withSource 100 100 200) (2, 8) realReader smallLayout $ \session control runtime →
       withVm session runtime "stopping" (defaultOptions OnArrival) $ \vm → do
