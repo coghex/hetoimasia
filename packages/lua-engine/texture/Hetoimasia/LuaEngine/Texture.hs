@@ -76,7 +76,18 @@
 -- texture in many sprites, and cannot use or release another instance's.
 module Hetoimasia.LuaEngine.Texture
   ( -- * The pipeline
-    TextureSpec (..)
+    TextureSpec
+  , specProfile
+  , specJobs
+  , specIoWorkers
+  , specDecodeWorkers
+  , specLanes
+  , specWorkspace
+  , specSourceLimit
+  , specInitialNominal
+  , specInstanceSlots
+  , specInstanceBytes
+  , specSessionBytes
   , TextureSpecRefused (..)
   , textureSpec
   , TexturePipeline

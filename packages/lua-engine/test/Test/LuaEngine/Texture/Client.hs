@@ -24,13 +24,17 @@ spec = describe "composition from outside the packages" $ do
         (status, out, err) ← readCreateProcessWithExitCode (proc (clientDirectory outcome </> "client") [tree]) ""
         (status, out, err) `shouldBe` (ExitSuccess, "(2,1)\n", "")
 
-  it "keeps a texture's resource record and a texture owner's banks out of a client's reach" $ do
+  it "keeps a texture's resource record, a texture owner's banks and the pipeline's numbers out of a client's reach" $ do
     withClient "Client.hs" resourceClient $ \compile → do
       outcome ← compile Typecheck
       rejectedBecause outcome "GHC-61689"
     withClient "Client.hs" ownerClient $ \compile → do
       outcome ← compile Typecheck
       rejectedBecause outcome "GHC-88464"
+    -- The numbers come from the profile: a client cannot build a specification of its own.
+    withClient "Client.hs" specClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "GHC-10237"
   where
     withClient = withStorePackageClient ["base", "bytestring", "stm", "hetoimasia-content-0.1.0.0-inplace", "hetoimasia-lua-engine-0.1.0.0-inplace", "hetoimasia-lua-engine-0.1.0.0-inplace-texture"]
     a </> b = a <> "/" <> b
@@ -92,4 +96,15 @@ ownerClient =
     , ""
     , "forged ∷ TextureOwner → Int"
     , "forged owner = ownerSlotLimit owner"
+    ]
+
+specClient ∷ String
+specClient =
+  unlines
+    [ "module Client (forged) where"
+    , ""
+    , "import Hetoimasia.LuaEngine.Texture (TextureSpec (TextureSpec))"
+    , ""
+    , "forged ∷ Maybe TextureSpec"
+    , "forged = Nothing"
     ]
