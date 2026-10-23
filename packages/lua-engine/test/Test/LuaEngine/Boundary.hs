@@ -386,6 +386,7 @@ spec = describe "the package and import boundary" $ do
                  , "Hetoimasia.LuaEngine.Request"
                  , "Hetoimasia.Content.Identity"
                  , "Hetoimasia.Content.Inventory"
+                 , "Hetoimasia.Foundation.Resource"
                  , "Hetoimasia.Foundation.Time"
                  ]
         || "Hetoimasia.Scripting.Lua." `isPrefixOf` name
