@@ -85,8 +85,14 @@ package hetoimasia-scripting-lua
 
 -- The Lua-first engine's manifest and fixed M1 profile (LFE-3) is held to the same
 -- policy. It needs no GLFW or Vulkan, so both `cabal.project` and
--- `cabal.project.cpu` list it; `cabal.project.vulkan` does not until LFE-22.
+-- `cabal.project.cpu` list it; `cabal.project.vulkan` lists it, with the Lua host and the
+-- content package it depends on, as the local closure of the graphics adapter (LFE-17).
 package hetoimasia-lua-engine
+  ghc-options: -Werror -j
+
+-- The Lua-first engine's graphics adapter (LFE-17) is held to the same policy. Like the native and
+-- integration packages above, it is named only by `cabal.project.vulkan`.
+package hetoimasia-lua-engine-graphics
   ghc-options: -Werror -j
 
 -- The two-domain Lua sample (LUA-29, D-44) is held to the same policy. It needs no

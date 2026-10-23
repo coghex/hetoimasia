@@ -436,7 +436,7 @@
     },
     {
       "id": "test.vulkan-headless",
-      "description": "Vulkan-linked headless Hspec contracts, executed rather than only built, through cabal.project.vulkan against the provisioned native prefix: the native backend's profile and roots decisions over a stand-in native layer (native-tests), its shader contract against the provisioned compiler (shader-tests), the window integration's controller over the GLFW package's scripted seam (integration-tests), the triangle sample's pipeline cache over stand-in builders (triangle-tests), the sprites sample's scene, probe oracle, fixtures and PNG writer (sprites-tests), the scene3d sample's scene, cameras built with the math package, independent probe oracle and PNG writer (scene3d-tests), and the 2D renderer's Vulkan recorder over a stand-in native layer (render-2d-vulkan-tests): the scissor rule against viewportContains, the push-constant packing, the attribute descriptions against the 64-byte instance layout, the sampler-choice mapping, the pure frame work of targets, metrics, mappings and scissors, and the recorded command order, the drawing-order instance bytes at their ring offsets, mixed samplers in one draw, empty scissors recording no draw, pipelines per format, and the refusals of an unknown target, invalid or disagreeing metrics, an unmappable view and a full ring, none of which records a clear or a draw. None acquires a display, a GLFW session, or a device, and none reads desktop consent; the headers and loader are build and link prerequisites only.",
+      "description": "Vulkan-linked headless Hspec contracts, executed rather than only built, through cabal.project.vulkan against the provisioned native prefix: the native backend's profile and roots decisions over a stand-in native layer (native-tests), its shader contract against the provisioned compiler (shader-tests), the window integration's controller over the GLFW package's scripted seam (integration-tests), the triangle sample's pipeline cache over stand-in builders (triangle-tests), the sprites sample's scene, probe oracle, fixtures and PNG writer (sprites-tests), the scene3d sample's scene, cameras built with the math package, independent probe oracle and PNG writer (scene3d-tests), the Lua-first engine's graphics adapter over an injected owner and completion boundary (lua-engine-graphics-tests): every stage of a texture request withheld in turn, cancellation and instance end at each boundary, faults that keep their severity, native pressure, release and retirement, the end of its scope, the native configuration the fixed M1 profile maps to and the composition with the real read pool, decoder, pipeline and a real Lua owner, and the 2D renderer's Vulkan recorder over a stand-in native layer (render-2d-vulkan-tests): the scissor rule against viewportContains, the push-constant packing, the attribute descriptions against the 64-byte instance layout, the sampler-choice mapping, the pure frame work of targets, metrics, mappings and scissors, and the recorded command order, the drawing-order instance bytes at their ring offsets, mixed samplers in one draw, empty scissors recording no draw, pipelines per format, and the refusals of an unknown target, invalid or disagreeing metrics, an unmappable view and a full ring, none of which records a clear or a draw. None acquires a display, a GLFW session, or a device, and none reads desktop consent; the headers and loader are build and link prerequisites only.",
       "command": [
         "bash",
         "tools/vulkan/run.sh",
@@ -448,7 +448,8 @@
         "hetoimasia-sample-sprites:test:sprites-tests",
         "hetoimasia-sample-image2d:test:image2d-tests",
         "hetoimasia-sample-scene3d:test:scene3d-tests",
-        "hetoimasia-render-2d-vulkan:test:render-2d-vulkan-tests"
+        "hetoimasia-render-2d-vulkan:test:render-2d-vulkan-tests",
+        "hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests"
       ],
       "component": "hetoimasia-gpu-vulkan-glfw:test:integration-tests",
       "inputs": [
@@ -463,6 +464,10 @@
         "packages/render-2d/",
         "packages/render-api/",
         "packages/math/",
+        "packages/lua-engine-graphics/",
+        "packages/lua-engine/",
+        "packages/scripting-lua/",
+        "packages/content/",
         "tools/ci-image/",
         "tools/native/",
         "tools/toolchain/binding.pin",
@@ -567,6 +572,61 @@
       "optional": false
     },
     {
+      "id": "test.vulkan-lua-engine-native",
+      "description": "The Lua-first engine's graphics adapter on a real device, with no window: the production host over the loader integration, started without a surface, with the validation layer and synchronization validation enabled, in which a small asymmetric PNG is loaded through the pipeline's verified reading and bounded decoding and the production backend and, after the request reports success, resolved through the session's one table and renderer in a frame-less offscreen batch and read back (every pixel the render-2d oracle determines, and four hand-stated corner probes for orientation and alpha); the largest legal level, 2,048 by 2,048, accepted through the configured staging; the same content loaded independently for two instances, one ended, the other's texels read back again; a delayed completion and a cancellation coordinated through a gated port over the same session and the real native work drained; and the model's native accounting returning to rest. GLFW's session is on the process main thread with Hspec on another, the ambient Vulkan environment is cleared, the run refuses to start without consent, the loader is held to the qualified one, and the run fails on any validation error or incomplete diagnostic capture after the last teardown or a destruction out of order. It writes its evidence record into the group's evidence directory. Its executable is built in a separate preparation stage; its native execution is measured alone under a 30-second watchdog. On Linux the command starts its own isolated X11 display; on macOS it needs the desktop opt-in on its own command, given under the owner's standing approval for runs an issue or pull request needs, and opens no window.",
+      "command": [
+        "bash",
+        "tools/vulkan/run.sh",
+        "native",
+        "hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests",
+        "--",
+        "--complete"
+      ],
+      "preparation": {
+        "command": [
+          "bash",
+          "tools/vulkan/run.sh",
+          "build",
+          "hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests"
+        ],
+        "timeout_seconds": 3600
+      },
+      "component": "hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests",
+      "inputs": [
+        "cabal.project.common",
+        "cabal.project.vulkan",
+        "packages/lua-engine-graphics/",
+        "packages/lua-engine/",
+        "packages/scripting-lua/",
+        "packages/content/",
+        "packages/asset/",
+        "packages/asset-image/",
+        "packages/render-2d-vulkan/",
+        "packages/render-2d/",
+        "packages/render-2d-oracle/",
+        "packages/render-api/",
+        "packages/math/",
+        "packages/gpu-vulkan/native/",
+        "packages/gpu-vulkan/glfw/",
+        "packages/gpu-vulkan/model/",
+        "packages/gpu-vulkan/diagnostics/",
+        "packages/glfw/",
+        "packages/runtime/",
+        "packages/foundation/",
+        "tools/ci-image/",
+        "tools/display/",
+        "tools/native/",
+        "tools/toolchain/binding.pin",
+        "tools/test-support/",
+        "tools/vulkan/"
+      ],
+      "framework": "hspec",
+      "runner": "display",
+      "timeout_seconds": 30,
+      "category": "test",
+      "optional": false
+    },
+    {
       "id": "test.workflow",
       "description": "Hspec examples driving the documentation landing helper, this planner and runner, the CI image builder, and the native recipe helper against temporary Git repositories; the quruntul adapter's agreement with this catalog; and the boundary that keeps the Vulkan project out of the mandatory floor, holds its three groups to their commands and routing, and holds the compatibility summary to the retained records it quotes.",
       "command": [
@@ -610,7 +670,10 @@
         "samples/sprites/renderer/test/Main.hs",
         "samples/image2d/renderer/test/Main.hs",
         "samples/scene3d/renderer/test/Main.hs",
-        "packages/render-2d-vulkan/test/Main.hs"
+        "packages/render-2d-vulkan/test/Main.hs",
+        "packages/lua-engine-graphics/hetoimasia-lua-engine-graphics.cabal",
+        "packages/lua-engine-graphics/test/Main.hs",
+        "packages/lua-engine-graphics/native-test/Test/LuaEngine/Graphics/Native/Session.hs"
       ],
       "framework": "hspec",
       "runner": "cpu",

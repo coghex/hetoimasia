@@ -132,7 +132,7 @@ readByTheseExamples =
     <> map snd bridgeRecords
     <> map snd rootsRecords
     <> headlessMains
-    <> [nativeSuiteMain]
+    <> [nativeSuiteMain, luaEngineNativeSession, luaEngineGraphicsPackage </> "hetoimasia-lua-engine-graphics.cabal", "cabal.project.common"]
 
 -- | The two project files every mandatory validation group runs through.
 ordinaryProjects ∷ [FilePath]
@@ -158,7 +158,17 @@ siblingSourcesAbsent =
   "the Vulkan packages' sources are checkout-only and absent here, as in an unpacked source \
   \distribution; this check runs from a checkout, which is where the workflow group runs it"
 
--- | The mains of the eight suites the headless group runs.
+-- | The Lua-first engine's graphics adapter (LFE-17). It depends on the native package, the window integration and
+-- the 2D renderer's Vulkan recorder, so it resolves the binding, and the Vulkan project is the only one that may
+-- name it; it lists the CPU Lua-engine closure it implements a port of beside it.
+luaEngineGraphicsPackage ∷ String
+luaEngineGraphicsPackage = "packages/lua-engine-graphics"
+
+-- | The adapter's real-device suite's session, which holds the complete profile's rules.
+luaEngineNativeSession ∷ FilePath
+luaEngineNativeSession = luaEngineGraphicsPackage </> "native-test/Test/LuaEngine/Graphics/Native/Session.hs"
+
+-- | The mains of the nine suites the headless group runs.
 headlessMains ∷ [FilePath]
 headlessMains =
   [ nativePackage </> "test/RootsMain.hs"
@@ -169,15 +179,18 @@ headlessMains =
   , "samples/image2d/renderer/test/Main.hs"
   , "samples/scene3d/renderer/test/Main.hs"
   , render2dVulkanPackage </> "test/Main.hs"
+  , luaEngineGraphicsPackage </> "test/Main.hs"
   ]
 
--- | The three validation groups that run through the Vulkan project: the
--- headless suites, and the native suite's profile on an isolated X11 display
--- and on the isolated headless Wayland compositor.
-headlessGroup, nativeGroup, waylandGroup ∷ String
+-- | The four validation groups that run through the Vulkan project: the
+-- headless suites, the native suite's profile on an isolated X11 display
+-- and on the isolated headless Wayland compositor, and the Lua-first engine's
+-- graphics adapter on a real device with no window.
+headlessGroup, nativeGroup, waylandGroup, luaEngineNativeGroup ∷ String
 headlessGroup = "test.vulkan-headless"
 nativeGroup = "test.vulkan-native"
 waylandGroup = "test.vulkan-wayland"
+luaEngineNativeGroup = "test.vulkan-lua-engine-native"
 
 -- | The native backend package. Like the proof it resolves the binding and the
 -- Vulkan headers, so the Vulkan project is the only one that may name it.
@@ -229,10 +242,11 @@ samplePackages =
 -- packages, the GLFW package whose interop component it enables, the local
 -- dependency closure of the native package and that component, the pure
 -- render-2d packages the recorder records and the integration's native suite
--- judges it with, and the test-only support library the native package's
--- shader suite uses. All but the first eleven are ordinary packages the other
--- projects list too, and with the interop flag off none of them depends on the
--- binding.
+-- judges it with, the test-only support library the native package's
+-- shader suite uses, the Lua-first engine's graphics adapter (LFE-17) and the CPU
+-- closure it implements a port of. All but the first eleven and the adapter are ordinary packages
+-- the other projects list too, and with the interop flag off none of them depends
+-- on the binding.
 vulkanProject ∷ [String]
 vulkanProject =
   [ nativePackage
@@ -252,6 +266,10 @@ vulkanProject =
        , "packages/render-2d"
        , "packages/render-2d-oracle"
        , "tools/test-support"
+       , luaEngineGraphicsPackage
+       , "packages/lua-engine"
+       , "packages/scripting-lua"
+       , "packages/content"
        ]
 
 -- | The Hackage package that is the Vulkan binding. Nothing the mandatory floor
@@ -353,11 +371,11 @@ spec = describe "The Vulkan project boundary" $ do
     script `shouldContain` "VULKAN_FLAG_SAFE_FOREIGN_CALLS"
     script `shouldContain` "VULKAN_FLAG_DARWIN_LIB_DIRS"
 
-  it "declares exactly the headless, native and Wayland groups through the Vulkan project, all required and off the floor" $ do
+  it "declares exactly the headless, native, Wayland and Lua-engine native groups through the Vulkan project, all required and off the floor" $ do
     catalog ← readFile "tools/validation/catalog.json"
     -- A group may declare the Vulkan project's files as *inputs* — the
     -- workflow group does, because this module reads them — but only these
-    -- three may run a command that selects the project. One more would put a Vulkan
+    -- four may run a command that selects the project. One more would put a Vulkan
     -- build where nothing accounts for it; one on the floor would build the
     -- binding for every change.
     case parseJson catalog of
@@ -373,7 +391,7 @@ spec = describe "The Vulkan project boundary" $ do
                       <> maybe [] id (field "preparation" group >>= stringsAt "command")
               , any (\word → any (`isInfixOf` word) [runner, "cabal.project.vulkan", "vulkan-proof"]) words'
               ]
-        reaching `shouldBe` [headlessGroup, nativeGroup, waylandGroup]
+        reaching `shouldBe` [headlessGroup, nativeGroup, waylandGroup, luaEngineNativeGroup]
         filter (`elem` reaching) floor' `shouldBe` []
         forM_ reaching $ \identifier → do
           group ← catalogGroup identifier
@@ -396,6 +414,7 @@ spec = describe "The Vulkan project boundary" $ do
                  , "hetoimasia-sample-image2d:test:image2d-tests"
                  , "hetoimasia-sample-scene3d:test:scene3d-tests"
                  , "hetoimasia-render-2d-vulkan:test:render-2d-vulkan-tests"
+                 , "hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests"
                  ]
     -- And the runner's test mode starts no display: the only display it
     -- ever starts is the native mode's.
@@ -405,7 +424,7 @@ spec = describe "The Vulkan project boundary" $ do
     filter ("x11.sh" `isInfixOf`) testMode `shouldBe` []
 
   it "fails each headless suite on a selection that matches none of its examples" $ do
-    -- The group runs eight suites under one command, so one of them passing
+    -- The group runs nine suites under one command, so one of them passing
     -- empty — every example filtered away by a selector or an ambient Hspec
     -- setting — would leave a passing receipt that asserted nothing for it.
     -- Each suite's main has to refuse an empty selection itself.
@@ -463,10 +482,10 @@ spec = describe "The Vulkan project boundary" $ do
     (group >>= stringsAt "inputs") `shouldBe` (native >>= stringsAt "inputs")
     (group >>= field "component" >>= asString) `shouldBe` (native >>= field "component" >>= asString)
 
-  it "routes all three groups to a worker whose loop starts no display around them" $ do
+  it "routes all four groups to a worker whose loop starts no display around them" $ do
     workflow ← lines <$> readFile ".github/workflows/validation.yml"
-    -- The plan step's declaration: both classes, all three groups, one worker.
-    workflow `shouldSatisfy` any ("--worker \"vulkan=cpu+display:test.vulkan-headless,test.vulkan-native,test.vulkan-wayland\"" `isInfixOf`)
+    -- The plan step's declaration: both classes, all four groups, one worker.
+    workflow `shouldSatisfy` any ("--worker \"vulkan=cpu+display:test.vulkan-headless,test.vulkan-native,test.vulkan-wayland,test.vulkan-lua-engine-native\"" `isInfixOf`)
     -- Each native group's command starts its own display inside the timed
     -- execution, so the job must not start a second one around run.py.
     let job = takeWhile (not . ("  seed-dependencies:" `isPrefixOf`)) (dropWhile (/= "  vulkan:") workflow)
@@ -474,6 +493,47 @@ spec = describe "The Vulkan project boundary" $ do
     active `shouldSatisfy` (not . null)
     filter ("tools/display/" `isInfixOf`) active `shouldBe` []
     active `shouldSatisfy` any ("--runner-class display" `isInfixOf`)
+
+  it "prepares the Lua-first engine's adapter suite apart from its execution, watches that execution for thirty seconds, and runs it with the complete profile's rules" $ do
+    group ← catalogGroup luaEngineNativeGroup
+    (group >>= field "runner" >>= asString) `shouldBe` Just "display"
+    (group >>= field "timeout_seconds") `shouldBe` Just (JNumber 30)
+    (group >>= stringsAt "command")
+      `shouldBe` Just ["bash", runner, "native", "hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests", "--", "--complete"]
+    (group >>= field "preparation" >>= stringsAt "command")
+      `shouldBe` Just ["bash", runner, "build", "hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests"]
+    (group >>= field "component" >>= asString) `shouldBe` Just "hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests"
+    -- The group's inputs name the adapter and its CPU dependency closure, so a change to any of them selects it.
+    inputs ← maybe (fail "the group has no inputs") pure (group >>= stringsAt "inputs")
+    forM_ ["packages/lua-engine-graphics/", "packages/lua-engine/", "packages/scripting-lua/", "packages/content/", "packages/render-2d-vulkan/", "packages/gpu-vulkan/glfw/", "packages/gpu-vulkan/native/"] $ \input →
+      (input, input `elem` inputs) `shouldBe` (input, True)
+    present ← doesFileExist luaEngineNativeSession
+    if not present
+      then pendingWith siblingSourcesAbsent
+      else do
+        session ← readFile luaEngineNativeSession
+        -- The same rules the window integration's native suite holds its complete profile to: configuration
+        -- reading is left out and an empty selection fails.
+        session `shouldContain` "evalSpec defaultConfig {configFailOnEmpty = True}"
+        session `shouldContain` "configFailOnEmpty = True"
+
+  it "lists the Lua-first engine's graphics adapter and its CPU dependency closure in the Vulkan project, and holds it to the warning policy" $ do
+    declared ← projectPackages "cabal.project.vulkan"
+    forM_ [luaEngineGraphicsPackage, "packages/lua-engine", "packages/scripting-lua", "packages/content"] $ \entry →
+      (entry, entry `elem` declared) `shouldBe` (entry, True)
+    shared ← doesFileExist "cabal.project.common"
+    if not shared
+      then pendingWith "cabal.project.common is checkout-only and absent here, as in an unpacked source distribution; this check runs from a checkout"
+      else do
+        common ← readFile "cabal.project.common"
+        -- A -Werror stanza like every local package's, and no other project names the adapter.
+        map trim (lines common) `shouldContain` ["package hetoimasia-lua-engine-graphics"]
+        common `shouldContain` "package hetoimasia-lua-engine-graphics\n  ghc-options: -Werror -j"
+    forM_ ordinaryProjects $ \path → do
+      present ← doesFileExist path
+      when present $ do
+        others ← projectPackages path
+        (path, filter (== luaEngineGraphicsPackage) others) `shouldBe` (path, [])
 
   it "no longer offers the proof route, and builds nothing under the retired proof harness" $ do
     workflow ← lines <$> readFile ".github/workflows/ci-image.yml"
@@ -519,7 +579,7 @@ spec = describe "The Vulkan project boundary" $ do
           \distribution; this independence check runs from a checkout, which is where the mandatory floor runs it"
       else forM_ ordinaryProjects $ \path → do
         declared ← projectPackages path
-        (path, filter (\entry → any (`isPrefixOf` entry) ([retiredProof, nativePackage, integrationPackage] <> samplePackages)) declared)
+        (path, filter (\entry → any (`isPrefixOf` entry) ([retiredProof, nativePackage, integrationPackage, luaEngineGraphicsPackage] <> samplePackages)) declared)
           `shouldBe` (path, [])
         -- The diagnostics package is the header-free half: it is in both, and
         -- the dependency check below is what holds it free of the binding.

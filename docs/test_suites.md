@@ -129,9 +129,17 @@ cabal test hetoimasia-tests --test-show-details=direct
   triangle, sprites, image2d and scene3d samples, build only through `cabal.project.vulkan`, by
   `bash tools/vulkan/run.sh`. Its test mode runs their headless suites
   (`native-tests`, `shader-tests`, `integration-tests`, `triangle-tests`,
-  `sprites-tests`, `image2d-tests`, `scene3d-tests`, `render-2d-vulkan-tests`) — the
+  `sprites-tests`, `image2d-tests`, `scene3d-tests`, `render-2d-vulkan-tests`,
+  and the Lua-first engine's graphics adapter's `lua-engine-graphics-tests`) — the
   group `test.vulkan-headless` — and needs no consent. The native suite `vulkan-native-tests` (`test.vulkan-native`) opens
   windows and presents on macOS, so it takes the same desktop opt-in, under the
   same standing approval, as `glfw-native-tests`; on Linux its runner starts an
   isolated X11 display, and `test.vulkan-wayland` runs it on the isolated
   headless Wayland compositor. See [gpu_backend.md](gpu_backend.md#the-native-suite).
+  The adapter's real-device suite `lua-engine-graphics-native-tests`
+  (`packages/lua-engine-graphics`, group `test.vulkan-lua-engine-native`) enters
+  the same kind of session without opening a window: it starts the production
+  graphics owner with no surface, loads real PNGs through the texture pipeline and
+  the production backend, and reads the device's evidence back. It takes the same
+  consent, and is built in the group's preparation stage and run, unbuilt, by
+  `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete`.

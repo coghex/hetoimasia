@@ -106,6 +106,10 @@ checkoutOnly =
   , ("samples/scene3d/renderer/test/Main.hs", "VulkanProof.hs checks the scene3d sample's suite fails an empty selection, as a sibling package's source")
   , ("packages/render-2d-vulkan/test/Main.hs", "VulkanProof.hs checks the 2D recorder's suite fails an empty selection, as a sibling package's source")
   , ("packages/gpu-vulkan/glfw/native-test/Main.hs", "VulkanProof.hs checks the native suite's complete profile, as a sibling package's source")
+  , ("packages/lua-engine-graphics/hetoimasia-lua-engine-graphics.cabal", "VulkanProof.hs reads the Lua-first engine's graphics adapter's dependencies beside the ordinary projects, as a sibling package")
+  , ("packages/lua-engine-graphics/test/Main.hs", "VulkanProof.hs checks the adapter's suite fails an empty selection, as a sibling package's source")
+  , ("packages/lua-engine-graphics/native-test/Test/LuaEngine/Graphics/Native/Session.hs", "VulkanProof.hs checks the adapter's native suite runs its complete profile without configuration reading, as a sibling package's source")
+  , ("cabal.project.common", "VulkanProof.hs reads the warning policy it declares for the adapter beside the project files it is included by")
   , ( "packages/glfw/hetoimasia-glfw.cabal"
     , "VulkanProof.hs reads the GLFW package's interop flag and dependencies beside the ordinary projects, as a sibling package"
     )
