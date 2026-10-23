@@ -28,6 +28,7 @@ module Test.LuaEngine.Modules.Support
   , awaitHistory
   , countNotes
   , diagnostics
+  , awaitDiagnostics
   , contentPath
   , rewrite
   , key'
@@ -97,11 +98,12 @@ import Control.Concurrent.STM
   , modifyTVar'
   , newTVarIO
   , readTVar
+  , readTVarIO
   , retry
   , writeTVar
   )
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, fromException, throwIO, tryWithContext)
-import Control.Monad (unless, void)
+import Control.Monad (unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
@@ -201,7 +203,7 @@ data Session = Session
   , ssPool ∷ !ReadPool
   , ssProbe ∷ !Probe
   , ssLog ∷ !(IORef [Text])
-  , ssDiagnostics ∷ !(IORef [Text])
+  , ssDiagnostics ∷ !(TVar [Text])
   , ssLogger ∷ !Logger
   , ssGates ∷ !(IORef (Map Text (MVar ())))
   , ssEntered ∷ !(IORef (Map Text (MVar ())))
@@ -263,8 +265,8 @@ withSession profile (workers, slots) readerOf (Layout files) body =
       inventory ← scanInventory limits root' root >>= either (\refused → assertFailure ("scan refused: " <> show refused)) pure
       probe ← newProbe
       spec ← either (\refused → assertFailure ("pool refused: " <> show refused)) pure (poolSpec workers slots)
-      diagnosticLog ← newIORef []
-      let logger = mkLoggerWith defaultLogFilter metadata (callbackSink (\entry → atomicModifyIORef' diagnosticLog (\held → (formatEntry defaultFormatOptions entry : held, ()))))
+      diagnosticLog ← newTVarIO []
+      let logger = mkLoggerWith defaultLogFilter metadata (callbackSink (\entry → atomically (modifyTVar' diagnosticLog (formatEntry defaultFormatOptions entry :))))
       withReadPoolUsing spec (readerOf probe inventory (readVerified inventory root)) $ \pool → do
         session ←
           Session profile tree inventory pool probe
@@ -353,7 +355,16 @@ countNotes session wanted = length . filter (== wanted) <$> history session
 
 -- | The diagnostics the coordinators wrote, oldest first, one line each.
 diagnostics ∷ Session → IO [Text]
-diagnostics session = reverse <$> readIORef (ssDiagnostics session)
+diagnostics session = reverse <$> readTVarIO (ssDiagnostics session)
+
+-- | Block until the coordinators have written this many diagnostics. A diagnostic is written after the
+-- transaction that decided it, on whichever thread published the outcome, so a count read at the
+-- decision is not a count of what was written: the example waits for the write it expects, and for a
+-- diagnostic it expects not to be written it reads the decision ('jobsDiagnosed'), which cannot lag.
+awaitDiagnostics ∷ Session → Int → IO ()
+awaitDiagnostics session wanted = atomically $ do
+  written ← readTVar (ssDiagnostics session)
+  when (length written < wanted) retry
 
 -- The probe -----------------------------------------------------------------------------------
 

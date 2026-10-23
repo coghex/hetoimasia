@@ -291,6 +291,9 @@ data Counts = Counts
   , jobsReady ∷ !Int
   , jobsFailed ∷ !Int
   , jobsStopped ∷ !Int
+  , jobsDiagnosed ∷ !Int
+  -- ^ Failed jobs whose no-waiter diagnostic was decided: at the outcome's own transaction, so a job that is
+  -- not counted here will never be diagnosed, however late the diagnostic of one that is gets written.
   , waitersHeld ∷ !Int
   , promisedHeld ∷ !Int
   -- ^ Identities a request's admission reserved room for and the endpoint has not yet made jobs of.

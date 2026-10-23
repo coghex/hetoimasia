@@ -220,6 +220,7 @@ noWaiters = describe "a job nobody waits for" $ do
         awaitNote session "x cancel k1 cancelled"
         openGate (ssProbe session) "bad.lua"
         awaitCounts vm (\c → jobsFailed c == 1)
+        awaitDiagnostics session 1
         diagnostics session >>= \seen → length seen `shouldBe` 1
         diagnostics session >>= \seen → seen `shouldSatisfy` all (\line → "code=module_error" `Text.isInfixOf` line && "path=bad.lua" `Text.isInfixOf` line)
         -- The instance that cancelled is healthy.
@@ -229,6 +230,8 @@ noWaiters = describe "a job nobody waits for" $ do
         command session vm "y" "start" "k2" [] (Just (fetch "bad.lua"))
         failure ← awaitFailure session "y"
         fmap fst (requestFailureOf failure) `shouldBe` Just "module"
+        -- The decision was taken once, with the outcome; the one diagnostic was written before this.
+        counts vm >>= \c → jobsDiagnosed c `shouldBe` 1
         diagnostics session >>= \seen → length seen `shouldBe` 1
         readsStarted (ssProbe session) >>= (`shouldBe` 1)
 
@@ -248,6 +251,8 @@ failures = describe "a required failure" $ do
         -- The job fails before tick three begins; neither request is due.
         awaitCounts vm (\c → jobsFailed c == 1)
         tickOf vm >>= (`shouldBe` 2)
+        -- Requests wait for the job: no diagnostic was decided, so none can be written.
+        counts vm >>= \c → jobsDiagnosed c `shouldBe` 0
         diagnostics session >>= (`shouldBe` [])
         grantOne control vm
         xFailure ← awaitFailure session "x"
@@ -375,7 +380,9 @@ boot = describe "boot loads" $ do
             failurePath failure `shouldBe` "broken_second.lua"
           other → expectationFailure ("expected a boot failure, found " <> show other)
         tickOf vm >>= (`shouldBe` 0)
-        -- Nothing was asked of a request place, and no diagnostic is written for a boot failure.
+        -- Nothing was asked of a request place, and no diagnostic is written for a boot failure: it was
+        -- decided with the outcome that no diagnostic is owed.
+        counts vm >>= \c → jobsDiagnosed c `shouldBe` 0
         diagnostics session >>= (`shouldBe` [])
         vmDiagnostics vm >>= \d → rdOutstanding d `shouldBe` 0
         -- A boot load of a module already cached answers from the cache.

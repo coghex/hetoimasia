@@ -469,13 +469,16 @@ spec = describe "the module loader on a scheduled owner" $ do
       served ← newIORef (0 ∷ Int)
       settledSeen ← newIORef ([] ∷ [[ExportIdentity]])
       blockedSeen ← newIORef ([] ∷ [Blocked])
+      -- Each service ends in the hook that tells what the chain waits for, after the hook that tells what
+      -- settled; the outcome is published before either, so the example waits on this one.
+      blockedTold ← newChan
       reservedAsked ← newIORef ([] ∷ [ExportIdentity])
       exits ← newIORef (0 ∷ Int)
       let hooks =
             noLoaderHooks
               { hookService = atomicModifyIORef' served (\n → (n + 1, ()))
               , hookSettled = \found → atomicModifyIORef' settledSeen (\held → (held <> [map fst found], ()))
-              , hookBlocked = \found → atomicModifyIORef' blockedSeen (\held → (held <> [found], ()))
+              , hookBlocked = \found → atomicModifyIORef' blockedSeen (\held → (held <> [found], ())) >> writeChan blockedTold found
               , hookReserved = \identity → atomicModifyIORef' reservedAsked (\held → (held <> [identity], 0))
               , hookExit = atomicModifyIORef' exits (\n → (n + 1, ()))
               }
@@ -485,6 +488,12 @@ spec = describe "the module loader on a scheduled owner" $ do
         awaitAsked rig 2
         _ ← notifySource endpoint (ident "dep") (SourceVerified (Text.encodeUtf8 "return {}"))
         _ ← awaitOutcome control endpoint "main"
+        -- The service that settled both modules has told the application what settled and then what the
+        -- chain waits for (nothing): wait for that, and only then read what the hooks recorded.
+        let untilIdleAfterWaiting waited = do
+              told ← readChan blockedTold
+              if waited && told == BlockedIdle then pure () else untilIdleAfterWaiting (waited || told == BlockedSource (ident "dep"))
+        untilIdleAfterWaiting False
         readIORef settledSeen >>= (`shouldBe` [[ident "dep", ident "main"]])
         readIORef blockedSeen >>= \found → (found, found) `shouldSatisfy` \(held, _) → BlockedSource (ident "dep") `elem` held && last held == BlockedIdle
         readIORef reservedAsked >>= (`shouldBe` [ident "dep"])

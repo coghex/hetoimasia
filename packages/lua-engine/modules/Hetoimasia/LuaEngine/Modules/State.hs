@@ -878,6 +878,7 @@ countsSTM c = do
       , jobsReady = count (\job -> case jobOutcome job of Ready _ -> True; _ -> False)
       , jobsFailed = count (\job -> case jobOutcome job of Failed _ _ -> True; _ -> False)
       , jobsStopped = count (\job -> case jobOutcome job of Stopped -> True; _ -> False)
+      , jobsDiagnosed = count jobDiagnosed
       , waitersHeld = sum (map jobWaiterCount jobs)
       , promisedHeld = Map.size (csPromised st)
       , bytesOrdinary = chargedOrdinary (csCharges st)
