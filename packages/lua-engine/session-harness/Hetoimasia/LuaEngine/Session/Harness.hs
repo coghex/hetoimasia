@@ -77,6 +77,9 @@ data OwnerHandles = OwnerHandles
   -- ^ Ask the owner to stop, as its supervisor would.
   , ownerCancel ∷ IO ()
   -- ^ Cancel the owner's worker.
+  , ownerSettled ∷ IO ()
+  -- ^ Wait until the owner's worker has published its terminal completion, which supervision has not necessarily
+  -- handled: the way a test makes several outcomes pending together.
   }
 
 -- | A protection of the teardown protocol that a negative control can remove, one production site each.
@@ -113,6 +116,9 @@ data Protection
     -- Removed, the request policy has no session gate, and only the early read of the facade and the closed coordinator
     -- stand between a request and a closure that has committed.
     ProtectRequestGate
+  | -- | The accounting of a finished tick is one more thing the driver's single wait observes. Removed, the driver
+    -- waits for it by itself, and nothing else is observed while a held provider retirement extends it.
+    ProtectAccountingEvent
   deriving (Eq, Show)
 
 -- | The steps a role's VM is made in, and released in the opposite order.
@@ -160,6 +166,12 @@ data Point
   | -- | A content request found the session's admission open at the facade's argument check, and its admission
     -- is about to be made by the host in another step: the point to hold to see a closure commit in between.
     RequestChecked !Role
+  | -- | An instance of this role has settled as a failure and the application is about to be told, on the owner's
+    -- thread: holding it holds the owner's accounting of the ending, which the tick's accounting waits for.
+    Escalating !Role
+  | -- | Only with 'ProtectAccountingEvent' removed: the driver is about to wait, by itself and without observing anything
+    -- else, for the accounting of a finished tick.
+    AccountingWait
   | -- | Only with 'ProtectGrantAtomic' removed: the check was made in one transaction and the grant is about to be
     -- issued in another.
     GrantChecked !Word64

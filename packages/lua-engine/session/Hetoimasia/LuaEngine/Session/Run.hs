@@ -144,7 +144,7 @@ import Hetoimasia.Foundation.Resource
   , displayCleanupFailure
   )
 import Hetoimasia.Foundation.Time (Duration, Instant, deadlineReached, readInstant)
-import Hetoimasia.Foundation.Worker (Completion (..), awaitCompletion)
+import Hetoimasia.Foundation.Worker (Completion (..), awaitCompletion, workerId)
 import qualified Hetoimasia.Foundation.Worker as Worker
 import Hetoimasia.LuaEngine.Behavior (behaviorRequest)
 import Hetoimasia.LuaEngine.Boot (Checkpoint (..))
@@ -243,6 +243,9 @@ import Hetoimasia.Scripting.Lua.Scheduled
   , SchedulerBounds (..)
   , ServiceClass (OrdinaryClass)
   , awaitScheduledAccounting
+  , scheduledAccountingStep
+  , unwatchScheduledAccounting
+  , watchScheduledAccounting
   , cancelScheduled
   , grantScheduledStep
   , grantScheduledStepSTM
@@ -689,6 +692,7 @@ failingFor env role failure = do
 -- after a stop, a release that fails) is latched here, by the same policy.
 escalateFor ∷ Env → Role → InstanceFailure → IO Escalation
 escalateFor env role failure = do
+  probeAt env (Escalating role)
   tracked ← atomically (awaitTracked env role (failureInstance failure))
   let info = envRoles env Map.! role
       (record, secondary) =
@@ -980,7 +984,7 @@ withOwner env info owned coordinator holder facade body = mask $ \restore → do
           late = removed env ProtectRegistration
       unless late registerOwner
       outcome ← tryWithContext @SomeException . restore $ do
-        harnessOwner (sxHarness spec) role (OwnerHandles (retireScheduled owner) (cancelScheduled owner))
+        harnessOwner (sxHarness spec) role (OwnerHandles (retireScheduled owner) (cancelScheduled owner) (void (atomically (awaitCompletion worker))))
         probeAt env (Built role BuildOwner)
         when late (mask_ registerOwner)
         atomically (writeTVar holder (Just endpoint))
@@ -1604,10 +1608,13 @@ data Next
   | NextSay !Diag
   | NextWake
   | NextFinished
+  | NextAccounted !AccountingWait
   | NextDone
 
--- | A grant that was issued and not yet accounted for, or one the scheduler answered full.
-data InFlight = Granted | Full
+-- | A grant that was issued and not yet finished, one the scheduler answered full, or a tick that has finished and
+-- whose accounting the driver is watching for as one more thing its single wait observes (a held provider retirement
+-- can extend that accounting for as long as it likes, and nothing else waits behind it).
+data InFlight = Granted | Full | Accounting
 
 -- | The driver's own state, which only the driver reads or writes.
 data Driver = Driver
@@ -1626,7 +1633,7 @@ data Driver = Driver
 -- | The driver: wait for what happens, in one transaction composed with supervision, and act on it, until
 -- every role has finished.
 drive ∷ Env → [RoleVm] → Driver → IO ()
-drive env vms driver = loop
+drive env vms driver = loop `finally` forM_ (find ((== Gameplay) . riRole . rvInfo) vms) (atomically . unwatchScheduledAccounting . rvOwner)
   where
     spec = envSpec env
     loop = do
@@ -1668,20 +1675,39 @@ waitFor env vms driver stm = readIORef (dvMode driver) >>= \case
             supervisionFailed env vms failure
             atomically stm
 
--- | Supervision delivered a failure. If one of this session's owners has the fatal status, its own outcome will
--- be accounted when it is finalized, once; otherwise the failure was another worker's, and the session ends
--- because of it.
+-- | Supervision delivered a failure. A session owner's own outcome is accounted when it is finalized, once, from its
+-- raw completion; every other worker's failure the delivery carries is accounted here, each by the identity of the
+-- worker whose outcome it is, and the session ends because of it.
+--
+-- Which failures are another worker's is read from the outcomes' own identities, never from which owner looks fatal
+-- or from the order a batch was committed in. A delivery is the latched primary with every other failure the
+-- invocation committed retained beside it, each with its worker's id; the primary is never repeated among them. So a
+-- fatal owner of the session that is not among the retained ones is the primary, and the primary is then the
+-- owner's, accounted at its finalization; when every fatal owner is among the retained ones, or none is fatal, the
+-- primary is another worker's. Each foreign failure carries a key made of its worker's id, so that a repeated
+-- delivery accounts it once.
 supervisionFailed ∷ Env → [RoleVm] → Caught → IO ()
-supervisionFailed env vms failure = do
+supervisionFailed env vms failure@(ExceptionWithContext context _) = do
   -- A failure supervision latched ends the session whoever's it is: the gates close and every owner is asked to
   -- stop now, which also ends a wait for an entry whose owner can no longer evaluate it.
   void (applyEvent (envSession env) Unwind)
-  statuses ← atomically (forM vms (\vm → Supervision.workerStatus (scheduledSupervised (rvOwner vm))))
-  let ours = any isFatal statuses
-  unless ours $ do
-    evidence ← evidenceFrom env True failure
-    void (commit (envSession env) (Account evidence))
+  owners ← atomically (forM vms (\vm → (,) (workerOf vm) <$> Supervision.workerStatus (scheduledSupervised (rvOwner vm))))
+  let retained = Supervision.supervisedFailuresInContext context
+      retainedIds = map Supervision.failedWorker retained
+      ownerIds = map fst owners
+      primaryIsOurs = or [isFatal status | (wid, status) ← owners, wid `notElem` retainedIds]
+      strangers = [found | found ← retained, Supervision.failedSeverity found == Supervision.Fatal, Supervision.failedWorker found `notElem` ownerIds]
+  primary ← if primaryIsOurs then pure [] else evidenceFrom env True failure
+  others ← forM strangers $ \found →
+    keyed (evidenceKeyOf ("supervised worker " <> show (Supervision.failedWorker found)))
+      <$> caughtEvidence HostFailure Nothing OnEngine ("another worker failed: " <> Supervision.failedLabel found) (Supervision.failedException found)
+  let evidence = primary <> concat others
+  unless (null evidence) (void (commit (envSession env) (Account evidence)))
   where
+    workerOf vm = workerId (supervisedWorker (scheduledSupervised (rvOwner vm)))
+    keyed key = \case
+      first : rest → first {evKey = Just key} : rest
+      [] → []
     isFatal = \case
       Supervision.WorkerFatal _ → True
       _ → False
@@ -1722,8 +1748,14 @@ nextStep env vms driver = do
       (Just _, Nothing) | open → timerWoken (dvTimer driver)
       _ → pure False
     outstanding ← case (inFlight, find ((== Gameplay) . riRole . rvInfo) vms) of
+      (Just Accounting, _) → pure (False, False)
       (Just _, Just vm) → (,) <$> ((== 0) <$> ticksOutstanding (rvEndpoint vm)) <*> ownerEnded vm
       _ → pure (False, False)
+    -- the accounting of a finished tick, watched since it finished: the last thing the wait looks at, so that every
+    -- stop, role step, instance event and diagnostic comes first
+    accounted ← case (inFlight, find ((== Gameplay) . riRole . rvInfo) vms) of
+      (Just Accounting, Just vm) → (Just <$> scheduledAccountingStep (rvOwner vm)) `orElse` pure Nothing
+      _ → pure Nothing
     case () of
       _
         | owing → pure NextStops
@@ -1736,6 +1768,7 @@ nextStep env vms driver = do
         | Just diag ← say → pure (NextSay diag)
         | woken → clearTimerWake (dvTimer driver) >> pure NextWake
         | fst outstanding || snd outstanding → pure NextFinished
+        | Just found ← accounted → pure (NextAccounted found)
         | otherwise → retry
   where
     observe inited want item
@@ -1791,9 +1824,39 @@ act env vms driver = \case
     forM_ schedule $ \current → when (deadlineReached now (scDue current)) (grant current)
   NextFinished → do
     inFlight ← readIORef (dvInFlight driver)
+    mode ← readIORef (dvMode driver)
+    case (inFlight, mode, vmOf Gameplay) of
+      -- (a negative control: the driver waits for the accounting by itself, as a blocking call)
+      (Just Granted, Supervised, Just vm) | removed env ProtectAccountingEvent → do
+        writeIORef (dvInFlight driver) Nothing
+        probeAt env AccountingWait
+        waited ← tryWithContext @SomeException (awaitScheduledAccounting (sxControl spec) (rvOwner vm)) >>= \case
+          Right found → pure found
+          Left failure
+            | isAsync failure → rethrowIO failure
+            | otherwise → do
+                writeIORef (dvMode driver) Raw
+                supervisionFailed env vms failure
+                pure AccountingOwnerEnded
+        schedule ← readIORef (dvSchedule driver)
+        case (waited, schedule) of
+          (AccountingComplete, Just current) → case afterGrant current of
+            Left fault → void (applyEvent session (EngineFault (Just Gameplay) (engineEntry HostFailure (Just Gameplay) OnEngine (pacingFaultText fault))))
+            Right next → writeIORef (dvSchedule driver) (Just next)
+          _ → pure ()
+      -- the tick's accounting is watched from here and observed by the driver's one wait; the next grant waits for it
+      (Just Granted, Supervised, Just vm) → do
+        atomically (watchScheduledAccounting (rvOwner vm))
+        writeIORef (dvInFlight driver) (Just Accounting)
+      _ → writeIORef (dvInFlight driver) Nothing
+  NextAccounted waited → do
+    forM_ (vmOf Gameplay) (atomically . unwatchScheduledAccounting . rvOwner)
     writeIORef (dvInFlight driver) Nothing
-    case inFlight of
-      Just Granted → account
+    schedule ← readIORef (dvSchedule driver)
+    case (waited, schedule) of
+      (AccountingComplete, Just current) → case afterGrant current of
+        Left fault → void (applyEvent session (EngineFault (Just Gameplay) (engineEntry HostFailure (Just Gameplay) OnEngine (pacingFaultText fault))))
+        Right next → writeIORef (dvSchedule driver) (Just next)
       _ → pure ()
   where
     session = envSession env
@@ -1832,25 +1895,3 @@ act env vms driver = \case
           Just GrantClosed → pure ()
           Just GrantNotPositive →
             void (applyEvent session (EngineFault (Just Gameplay) (engineEntry HostFailure (Just Gameplay) OnEngine "a tick duration the manifest checked was not positive")))
-    -- The tick has finished; its accounting (the endings it began, their shutdowns, their escalations and
-    -- their retirements) is waited for before the next tick is granted, so no tick is granted after a
-    -- failure that tick caused has been latched. A completed tick is not a commit.
-    account = forM_ (vmOf Gameplay) $ \vm → do
-      mode ← readIORef (dvMode driver)
-      waited ← case mode of
-        Raw → pure AccountingOwnerEnded
-        Supervised →
-          tryWithContext @SomeException (awaitScheduledAccounting (sxControl spec) (rvOwner vm)) >>= \case
-            Right found → pure found
-            Left failure
-              | isAsync failure → rethrowIO failure
-              | otherwise → do
-                  writeIORef (dvMode driver) Raw
-                  supervisionFailed env vms failure
-                  pure AccountingOwnerEnded
-      schedule ← readIORef (dvSchedule driver)
-      case (waited, schedule) of
-        (AccountingComplete, Just current) → case afterGrant current of
-          Left fault → void (applyEvent session (EngineFault (Just Gameplay) (engineEntry HostFailure (Just Gameplay) OnEngine (pacingFaultText fault))))
-          Right next → writeIORef (dvSchedule driver) (Just next)
-        _ → pure ()

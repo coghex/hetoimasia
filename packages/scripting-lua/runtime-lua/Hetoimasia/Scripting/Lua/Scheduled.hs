@@ -269,6 +269,9 @@ module Hetoimasia.Scripting.Lua.Scheduled
   , awaitTicksComplete
   , AccountingWait (..)
   , awaitScheduledAccounting
+  , watchScheduledAccounting
+  , scheduledAccountingStep
+  , unwatchScheduledAccounting
   , scheduledTick
   , ticksOutstanding
 
@@ -1113,30 +1116,45 @@ data AccountingWait
 awaitScheduledAccounting ∷ HasCallStack ⇒ RuntimeControl → ScheduledOwner → IO AccountingWait
 awaitScheduledAccounting supervision owner = do
   refuseCallbackWait "await-scheduled-accounting"
-  let control = ownerControl owner
   -- The snapshot is committed once, before the supervised wait, so a retry of the wait
   -- or the handling of an outcome inside it cannot move it. The watch is cleared however
   -- the wait ends, in the cleanup of the same masked region that registered it.
   mask $ \restore → do
-    atomically (watchAccounting control)
-    restore (awaitSupervised supervision (accounted control))
-      `finally` atomically (unwatchAccounting control)
-  where
-    -- Only the owner's termination ends the wait with 'AccountingOwnerEnded', and supervision
-    -- handles an owner's outcome, a fatal one rethrown, before this transaction runs: so an owner
-    -- that is exiting (stopped, or failing with an outcome not yet published) neither completes
-    -- the wait nor ends it. It waits for the exit. Completion is the owner's acknowledgement,
-    -- written by the owner's thread after it has kept every failure it caught: the wait decides
-    -- nothing about failures in flight.
-    accounted control = do
-      status ← workerStatus (ownerWorker owner)
-      case status of
-        WorkerLive → do
-          exiting ← (||) <$> schedulerClosed (controlScheduler control) <*> controlStopping control
-          if exiting
-            then retry
-            else accountingReady control >> pure AccountingComplete
-        _ → pure AccountingOwnerEnded
+    atomically (watchScheduledAccounting owner)
+    restore (awaitSupervised supervision (scheduledAccountingStep owner))
+      `finally` atomically (unwatchScheduledAccounting owner)
+
+-- | The three parts of 'awaitScheduledAccounting' as transactions (D-86), for an application that waits for
+-- several things in one supervised wait of its own and so cannot block in this one. 'watchScheduledAccounting' takes
+-- the snapshot of the grants accepted so far, once; the wait is 'scheduledAccountingStep' composed into the
+-- application's own transaction under 'awaitSupervised', which retries until the accounting is complete or the
+-- owner has ended, exactly as 'awaitScheduledAccounting' does; 'unwatchScheduledAccounting' clears the watch however
+-- the wait ends, and is harmless without one. 'awaitScheduledAccounting' is these three, in that order. The
+-- application keeps the single-pending rule of supervised waits: it makes the wait in its one supervised wait,
+-- and not from a Lua callback.
+watchScheduledAccounting ∷ ScheduledOwner → STM ()
+watchScheduledAccounting = watchAccounting . ownerControl
+
+-- | The wait itself: see 'watchScheduledAccounting'. Only the owner's termination ends it with
+-- 'AccountingOwnerEnded', and supervision handles an owner's outcome, a fatal one rethrown, before this transaction
+-- runs: so an owner that is exiting (stopped, or failing with an outcome not yet published) neither completes the
+-- wait nor ends it. It waits for the exit. Completion is the owner's acknowledgement, written by the owner's thread
+-- after it has kept every failure it caught: the wait decides nothing about failures in flight.
+scheduledAccountingStep ∷ ScheduledOwner → STM AccountingWait
+scheduledAccountingStep owner = do
+  let control = ownerControl owner
+  status ← workerStatus (ownerWorker owner)
+  case status of
+    WorkerLive → do
+      exiting ← (||) <$> schedulerClosed (controlScheduler control) <*> controlStopping control
+      if exiting
+        then retry
+        else accountingReady control >> pure AccountingComplete
+    _ → pure AccountingOwnerEnded
+
+-- | Clear the watch: see 'watchScheduledAccounting'.
+unwatchScheduledAccounting ∷ ScheduledOwner → STM ()
+unwatchScheduledAccounting = unwatchAccounting . ownerControl
 
 -- | The logical tick reached.
 scheduledTick ∷ ScheduledEndpoint → STM Word64

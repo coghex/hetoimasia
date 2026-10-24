@@ -6,7 +6,7 @@
 -- Every example coordinates with gates and with threads parked in STM, never a sleep.
 module Test.LuaRuntime.Accounting.Waits (spec) where
 
-import Control.Concurrent.STM (atomically, retry)
+import Control.Concurrent.STM (atomically, newTVarIO, orElse, readTVar, retry, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), finally)
 import Control.Monad (forM_, replicateM_, void, when)
 import Data.IORef (readIORef, writeIORef)
@@ -52,6 +52,32 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
         -- Every grant it captured is finished, and a wait with nothing outstanding returns again.
         atomically (ticksOutstanding (scheduledEndpoint owner)) >>= (`shouldBe` 0)
         awaitScheduledAccounting control owner >>= (`shouldBe` AccountingComplete)
+        retireScheduled owner
+
+    it "is the same wait made from its three parts in the caller's own supervised wait, beside a state of the caller's (D-86)" $ bounded $ do
+      fixture ← newSFixture
+      withBoundary $ \control runtime → releasing fixture [] $ do
+        owner ← startPlain fixture runtime "parts" requiredPolicy defaultSchedulerBounds
+        flag ← newTVarIO False
+        let parts = (Right <$> scheduledAccountingStep owner) `orElse` (readTVar flag >>= \set → if set then pure (Left ()) else retry)
+        -- with nothing outstanding the step is the completion the wait returns
+        atomically (watchScheduledAccounting owner)
+        Supervision.awaitSupervised control parts >>= (`shouldBe` Right AccountingComplete)
+        atomically (unwatchScheduledAccounting owner)
+        -- with a grant held the accounting is pending, and the caller's own alternative is what the one wait returns
+        -- (the wait the caller makes by itself would not return); the watch is cleared and nothing is left behind
+        before ← atomically (scheduledDiagnostics (scheduledEndpoint owner))
+        holdingSafely fixture owner $ do
+          grant owner 1
+          atomically (watchScheduledAccounting owner)
+          atomically (writeTVar flag True)
+          Supervision.awaitSupervised control parts >>= (`shouldBe` Left ())
+          atomically (unwatchScheduledAccounting owner)
+          -- clearing is harmless when repeated
+          atomically (unwatchScheduledAccounting owner)
+        awaitScheduledAccounting control owner >>= (`shouldBe` AccountingComplete)
+        after ← atomically (scheduledDiagnostics (scheduledEndpoint owner))
+        diagTick after `shouldBe` diagTick before + 1
         retireScheduled owner
 
     it "waits for the grants it captured, however many, and for the tasks they woke" $ bounded $ do
