@@ -131,7 +131,7 @@ import Hetoimasia.Scripting.Lua.Registration
 import Hetoimasia.Scripting.Lua.Runtime
 import Hetoimasia.Scripting.Lua.Value
 import System.IO.Unsafe (unsafePerformIO)
-import System.Timeout (timeout)
+import System.Timeout (Timeout, timeout)
 import GHC.Stack (HasCallStack)
 import Test.HUnit.Lang (FailureReason (Reason), HUnitFailure (HUnitFailure), assertFailure)
 import Test.Hspec (Expectation, expectationFailure)
@@ -213,7 +213,7 @@ expectFatal body =
 -- | Run a boundary that may end in a failure of the application's own, answering how
 -- it ended, as 'withBoundaryOpening' lets the gates go. What it may fail with is the
 -- application's own failure: a failed assertion of the example, or the example's
--- 'bounded' timeout, is never taken for it, and is raised as itself.
+-- 'bounded' expiry or a 'timeout', is never taken for it, and is raised as itself.
 tryBoundaryOpening ∷ [IO ()] → (RuntimeControl → LuaRuntime → IO a) → IO (Either (ExceptionWithContext SomeException) a)
 tryBoundaryOpening openers body = tryExpected (withBoundaryOpening openers body)
 
@@ -233,6 +233,7 @@ tryExpected action =
     Left (ExceptionWithContext _ failure)
       | Just (_ ∷ HUnitFailure) ← fromException failure → throwIO failure
       | Just BoundExpired ← fromException failure → throwIO failure
+      | Just (_ ∷ Timeout) ← fromException failure → throwIO failure
     outcome → pure outcome
 
 -- | Fail the example as a failed assertion, with this message and the source location of the
