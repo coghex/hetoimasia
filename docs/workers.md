@@ -43,6 +43,9 @@ startWorker     ∷ WorkerGroup → WorkerDefinition r → IO (StartOutcome r)
 startWorkerWith ∷ WorkerGroup → WorkerDefinition r
                 → (Worker r → IO ()) → (Worker r → STM a)
                 → IO (Either StartRejection (Worker r, a))
+startWorkerWithIO ∷ WorkerGroup → WorkerDefinition r
+                  → (Worker r → IO ()) → (Worker r → IO a)
+                  → IO (Either StartRejection (Worker r, a))
 data StartOutcome r = Started (Worker r) | StartupFailed (Worker r) (Completion r)
                     | StartRejected StartRejection
 data StartRejection = RegistrationClosed
@@ -120,10 +123,14 @@ and a run action. `startWorkerWith` performs the handoff in this order:
 3. **Preparation.** The caller's `prepare` runs with the caller's masking state
    and the worker handle, before any child user code. A later supervisor
    registers its own policy for the worker here.
-4. **Wait.** The gate opens and the caller's `wait` transaction runs with the
-   caller's masking state, cancellably. It is ordinary STM, so a supervisor can
-   combine `awaitStartup` with any other condition in one transaction, and its
-   result is returned with the handle.
+4. **Wait.** The gate opens and the caller's `wait` runs with the caller's
+   masking state, cancellably. For `startWorkerWith` it is one STM transaction,
+   so a supervisor can combine `awaitStartup` with any other condition, and its
+   result is returned with the handle. `startWorkerWithIO` takes an `IO` wait
+   instead, for a supervisor that must act between waits — commit a sibling's
+   failure, say — while the new worker is still starting and before it is
+   drained; `startWorkerWith` is `startWorkerWithIO` with the transaction run by
+   `atomically`.
 
 If `prepare` or `wait` fails or is cancelled, cancellation of the worker is
 requested and the starter waits — absorbing further interruptions — until the
