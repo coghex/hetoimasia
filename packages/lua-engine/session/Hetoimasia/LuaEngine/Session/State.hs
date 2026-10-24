@@ -543,7 +543,10 @@ transition event state = case event of
   InstanceEscalated host role failure secondary
     | Set.member host (stEarly state) → quiet state {stEngine = foldl' (flip (noteEngine (stLimits state))) (stEngine state) secondary}
     | otherwise → latchFailure role failure secondary state {stEarly = Set.insert host (stEarly state)}
-  Acquired role built → quiet (adjustRole role (\found → found {rsAcquired = Set.insert built (rsAcquired found)}) state)
+  Acquired role built
+    -- a role that retired acquires nothing more
+    | maybe False ((== Retired) . rsPhase) (Map.lookup role (stRoles state)) → quiet state
+    | otherwise → quiet (adjustRole role (\found → found {rsAcquired = Set.insert built (rsAcquired found)}) state)
   OwnerFinalized role evidence facts →
     -- an owner that ended while its admission was open was not asked to by the session: that is an external stop,
     -- and the whole session closes
@@ -559,8 +562,13 @@ transition event state = case event of
      in if askedBy then quiet next else wholeStop next Done
   Drained role → quiet (adjustRole role (\found → found {rsDrained = True}) state)
   ReleasesDone role evidence →
-    let marked = adjustRole role (\found → found {rsReleased = True, rsReleaseFailed = rsReleaseFailed found || not (null evidence)}) state
-        (next, _) = accountEvidence (Just role) evidence marked
+    -- the attempts are claimed once: a second submission of them adds nothing, and cannot undo a retirement
+    let already = maybe False rsReleased (Map.lookup role (stRoles state))
+        relevant = if already then [item | item ← evidence, isJust (evKey item)] else evidence
+        marked
+          | already = state
+          | otherwise = adjustRole role (\found → found {rsReleased = True, rsReleaseFailed = rsReleaseFailed found || not (null evidence)}) state
+        (next, _) = accountEvidence (Just role) relevant marked
      in quiet next
   StopHanded role →
     quiet (adjustRole role (\found → found {rsStopHanded = True}) state {stStops = Seq.filter (/= role) (stStops state)})

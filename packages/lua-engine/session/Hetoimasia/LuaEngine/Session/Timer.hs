@@ -7,6 +7,14 @@
 -- or disposed is stale and ignored. What sleeps is the 'TimerBackend' the composition injects (the
 -- threaded runtime's timer manager in production, a hand-fired one in a test), so no example sleeps.
 --
+-- = The backend's blocking contract
+--
+-- Arming and cancelling run under the repository's uninterruptible discipline, as a release does, so the backend the
+-- composition injects must give them the same controlled blocking: both are finite, neither waits for another thread
+-- or for the expiry, and a cancel that raises is a failure of that cleanup, accounted by the session. Masking does not
+-- make arbitrary injected IO safe. The disposal itself is a registered finite release the session runs once, after every
+-- role has finished, never inside a wait or a drain.
+--
 -- Owner: the coordinator's driver. Written by the driver (arming, disposing) and by the backend's wake
 -- (the flag); read by the driver. Lifetime: the driver's scope; disposed on every way out of it.
 module Hetoimasia.LuaEngine.Session.Timer

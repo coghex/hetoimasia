@@ -491,6 +491,18 @@ keepRaw env failure =
   modifyIORef' (envRaw env) $ \kept →
     kept <> [RawEvidence (Just (EvidenceCleanup item)) label inner | (item, label, inner) ← cleanupOf failure, Just (EvidenceCleanup item) `notElem` map reKey kept]
 
+-- | The most exceptions the session keeps whole: the first cancellation and the first failure are always kept, and so
+-- is anything while there is room, so that repeated cancellation cannot grow what is kept without end. What an
+-- exception carries is accounted whether or not the exception itself is kept.
+retainLimit ∷ Int
+retainLimit = 32
+
+-- | Keep an exception for the end, within the limit.
+store ∷ Env → Retained → IO ()
+store env item = modifyIORef' (envRetained env) $ \kept →
+  let firstOfKind = not (any (\other → isAsync (rtCaught other) == isAsync (rtCaught item)) kept)
+   in if firstOfKind || length kept < retainLimit then kept <> [item] else kept
+
 -- | Account an exception, keep it, and mark it. If it is already accounted, the copy kept is refreshed with the
 -- context the scopes it passed through added, and only what is new in that context is accounted. Never raises. The
 -- boundary probe (a protected point beside the commit, not inside it) is told, so a test can hold or fail the
@@ -508,7 +520,7 @@ adopt env failure = mask_ $ do
       serial ← nextSerial env
       let marked = mark serial failure
       evidence ← evidenceFrom env True failure
-      modifyIORef' (envRetained env) (<> [Retained serial marked])
+      store env (Retained serial marked)
       keepRaw env failure
       void (commit (envSession env) (Account evidence))
       pure marked
@@ -532,7 +544,7 @@ retainQuiet env failure = mask_ $ do
   serial ← nextSerial env
   let marked = mark serial failure
   evidence ← evidenceFrom env True failure
-  modifyIORef' (envRetained env) (<> [Retained serial marked])
+  store env (Retained serial marked)
   keepRaw env failure
   void (commit (envSession env) (Account evidence))
 

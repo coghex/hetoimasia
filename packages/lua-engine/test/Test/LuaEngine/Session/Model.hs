@@ -6,12 +6,15 @@
 -- checked after every step of every sequence.
 module Test.LuaEngine.Session.Model (spec) where
 
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), toException)
+import Control.Exception.Context (emptyExceptionContext)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, listToMaybe)
 import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
+import Hetoimasia.Foundation.Resource (cleanupFailureId, cleanupFailuresInContext, composeCleanup)
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero, RequirePositive), Instant, durationFromNanoseconds, scriptedInstant)
 import Hetoimasia.LuaEngine.Manifest (Role (..))
 import Hetoimasia.LuaEngine.Profile (ByteLimit (RoleFailureRecordBytes), fixedM1Profile)
@@ -28,6 +31,8 @@ spec = describe "model" $ do
   policy
   ranking
   admission
+  teardown
+  mutants
   invariants
   failures
   report
@@ -452,15 +457,28 @@ sequencesOf menu n = concat [sequencesLength menu k | k ← [0 .. n]]
     sequencesLength _ 0 = [[]]
     sequencesLength items k = [item : rest | item ← items, rest ← sequencesLength items (k - 1)]
 
+-- | A transition function: the real one, or a mutant with one protection removed.
+type Stepper = Event → SessionState → (SessionState, Answer)
+
 -- | The invariants broken anywhere along one sequence: empty when it keeps them all.
 violations ∷ [Event] → [String]
-violations = go both
+violations = violationsWith step
+
+-- | The same, over a transition function.
+violationsWith ∷ Stepper → [Event] → [String]
+violationsWith stepper = go both Set.empty
   where
-    go _ [] = []
-    go state (event : rest) =
-      let (next, _) = step event state
-       in [show event <> ": " <> why | why ← check event state next] <> go next rest
-    check event prior afterwards =
+    go _ _ [] = []
+    go state seen (event : rest) =
+      let (next, _) = stepper event state
+          seen' = seen `Set.union` Set.fromList (keysOf event)
+       in [show event <> ": " <> why | why ← check seen event state next] <> go next seen' rest
+    keysOf = \case
+      Account items → [identity | Evidence (Just identity) _ ← items]
+      OwnerFinalized _ items _ → [identity | Evidence (Just identity) _ ← items]
+      ReleasesDone _ items → [identity | Evidence (Just identity) _ ← items]
+      _ → []
+    check seen event prior afterwards =
       concat
         [ -- each gate is decided once
           [ "the dispatch gate changed after it was decided" | stDispatch prior /= DispatchClosed, stDispatch afterwards /= stDispatch prior ]
@@ -491,6 +509,17 @@ violations = go both
           [ "the verdict went down" | outVerdict (outcomeOf afterwards) < outVerdict (outcomeOf prior) ]
         , -- a failure prior the start gate opened ends the whole session
           [ "a failure prior the start gate opened did not stop the session" | any (isJust . rsFailure) (Map.elems (stRoles afterwards)), stStart afterwards /= StartOpen, not (stStopping afterwards) ]
+        , -- a stopping session owes a stop to every owner not yet asked, not accounted and not retired, once each
+          [ "a stopping session owes " <> show role <> " no stop" | stStopping afterwards, (role, found) ← Map.toList (stRoles afterwards), rsPhase found /= Retired, not (rsStopHanded found), not (rsOwnerEnded found), role `notElem` owedStops afterwards ]
+        , [ "a stop is owed twice" | owedStops afterwards /= Set.toList (Set.fromList (owedStops afterwards)) ]
+        , -- a role is retired only when retirement is proven
+          [ "a role retired without proof: " <> show role | (role, found) ← Map.toList (stRoles afterwards), rsPhase found == Retired, not (proven found) ]
+        , -- what a settlement proved is kept: an init that succeeded stays, a fact once written is not rewritten
+          [ "an init success was withdrawn" | (role, found) ← Map.toList (stRoles prior), Just later ← [Map.lookup role (stRoles afterwards)], not (rsInited found `Set.isSubsetOf` rsInited later) ]
+        , [ "a fact was rewritten" | (role, found) ← Map.toList (stRoles prior), Just later ← [Map.lookup role (stRoles afterwards)], (slot, fact) ← Map.toList (rsFacts found), Map.lookup slot (rsFacts later) /= Just fact ]
+        , -- evidence is counted by its identity: the identities only grow, and a repeated one adds nothing
+          [ "an evidence identity was withdrawn" | not (stEvidence prior `Set.isSubsetOf` stEvidence afterwards) ]
+        , [ "evidence already accounted was counted again" | Account items ← [event], not (null items), all (\item → maybe False (`Set.member` seen) (evKey item)) items, reportAccounted (stEngine afterwards) /= reportAccounted (stEngine prior) ]
         ]
       where
         opening = stStart afterwards == StartOpen && stStart prior /= StartOpen
@@ -502,6 +531,216 @@ violations = go both
           OwnerFinalized done _ _ → done == role
           RoleRetired done → done == role
           _ → False
+        proven found =
+          rsAdmit found == AdmitClosed
+            && rsIntents found == 0
+            && (BuildOwner `Set.notMember` rsAcquired found || rsOwnerEnded found)
+            && (BuildCoordinator `Set.notMember` rsAcquired found || rsDrained found)
+            && (Set.null (rsAcquired found) || (rsReleased found && not (rsReleaseFailed found)))
+
+-- The teardown ----------------------------------------------------------------------------------------------------------
+
+-- | The ways a role's owner and coordinator are acquired, and the evidence it ends with.
+acquired ∷ [Event]
+acquired = [Acquired Gameplay built | built ← [BuildCoordinator, BuildData, BuildFacade, BuildOwner]]
+
+-- | Identities as the foundation issues them: each cleanup failure it retains is given a fresh one.
+freshKeys ∷ Int → IO [EvidenceKey]
+freshKeys n = do
+  let caught' message = ExceptionWithContext emptyExceptionContext (toException (userError message))
+  composed ← composeCleanup (Just (caught' "primary")) [("release", caught' "failed") | _ ← [1 .. n]]
+  pure (maybe [] (\(ExceptionWithContext carried _) → [EvidenceCleanup (cleanupFailureId item) | item ← cleanupFailuresInContext carried]) composed)
+
+factRan ∷ InstanceFact
+factRan = InstanceFact True FactShutdownRan EndedStopped
+
+teardown ∷ Spec
+teardown = describe "the teardown" $ do
+  it "publishes a retirement only once the owner is accounted, the coordinator drained and the releases attempted without a failure" $ do
+    let stopped = applied (acquired <> [Stop StopQuit]) gameplayOnly
+        retiredAfter events = phaseOfRole Gameplay (applied (events <> [RoleRetired Gameplay]) stopped)
+        ended = OwnerFinalized Gameplay [] [(g0, factRan)]
+    retiredAfter [] `shouldBe` Just Stopping
+    retiredAfter [ended] `shouldBe` Just Stopping
+    retiredAfter [ended, Drained Gameplay] `shouldBe` Just Stopping
+    retiredAfter [Drained Gameplay, ReleasesDone Gameplay []] `shouldBe` Just Stopping
+    retiredAfter [ended, Drained Gameplay, ReleasesDone Gameplay [evidenceOf (engineEntry CleanupFailure (Just Gameplay) OnCleanup "release failed")]] `shouldBe` Just Stopping
+    retiredAfter [ended, Drained Gameplay, ReleasesDone Gameplay []] `shouldBe` Just Retired
+    answersOf [RoleRetired Gameplay] stopped `shouldBe` [Refused]
+
+  it "refuses to publish the retirement of a role that still takes work, or has an admission outstanding" $ do
+    answersOf [RoleRetired Gameplay] gameplayOnly `shouldBe` [Refused]
+    answersOf [Intend Gameplay, Stop StopQuit, RoleRetired Gameplay] gameplayOnly `shouldBe` [Done, Done, Refused]
+
+  it "holds a role that acquired nothing retirable as soon as it is closed, since it holds nothing" $
+    phaseOfRole Gameplay (applied [Stop StopQuit, RoleRetired Gameplay] gameplayOnly) `shouldBe` Just Retired
+
+  it "keeps a release failure on the role: it is accounted, and the role is finished but never retired" $ do
+    let failed = ReleasesDone Gameplay [evidenceOf (engineEntry CleanupFailure (Just Gameplay) OnCleanup "release failed")]
+        state = applied (acquired <> [Stop StopQuit, OwnerFinalized Gameplay [] [(g0, factRan)], Drained Gameplay, failed, RoleRetired Gameplay]) gameplayOnly
+    phaseOfRole Gameplay state `shouldBe` Just Stopping
+    rolesFinished state `shouldBe` True
+    allRolesRetired state `shouldBe` False
+    outVerdict (outcomeOf state) `shouldBe` VerdictFailure
+
+  it "owes the stop of every owner not yet asked when a cleanup fault arrives during the logical role's retirement, before anything else" $ do
+    let logicalFailed = validated <> [initOk g0, initOk p0, LatchFailure Gameplay (failure Gameplay OnUpdate "boom") []]
+        state = applied (logicalFailed <> [StopHanded Gameplay, ReleasesDone Gameplay [evidenceOf (engineEntry CleanupFailure (Just Gameplay) OnCleanup "release failed")]]) both
+    owedStops state `shouldBe` [Presentation]
+    stStopping state `shouldBe` True
+
+  it "keeps a stop owed until it is handed over or the owner's completion makes it unnecessary, and owes it once" $ do
+    let stopped = applied [Stop StopQuit, Stop StopInterrupt, Unwind] both
+    owedStops stopped `shouldBe` [Gameplay, Presentation]
+    owedStops (applied [StopHanded Gameplay] stopped) `shouldBe` [Presentation]
+    -- a stop already handed over is not owed again by a later closure
+    owedStops (applied [StopHanded Gameplay, Unwind] stopped) `shouldBe` [Presentation]
+    -- the completion of an owner settles what was owed it, and a later closure owes it nothing
+    owedStops (applied [OwnerFinalized Presentation [] [], Unwind] stopped) `shouldBe` [Gameplay]
+
+  it "records a stop primitive that raised once, keeps the stop owed and never retries it in the model" $ do
+    let defect = StopDefect Gameplay (engineEntry HostFailure (Just Gameplay) OnEngine "the stop raised")
+        state = applied [defect, defect] gameplayOnly
+    reportAccounted (stEngine state) `shouldBe` 1
+    owedStops state `shouldBe` [Gameplay]
+    stStopDefects state `shouldBe` Set.fromList [Gameplay]
+
+  it "ends the whole session when an owner ends that nobody asked to stop, and records neither a quit nor a failure of it" $ do
+    let state = applied (validated <> [OwnerFinalized Presentation [] []]) both
+    stStopping state `shouldBe` True
+    stQuit state `shouldBe` False
+    owedStops state `shouldBe` [Gameplay]
+
+  it "counts one failure for one identity however many times it is seen, and counts equal text with different identities twice" $ do
+    keys ← freshKeys 2
+    let entryNamed text = engineEntry CleanupFailure (Just Gameplay) OnCleanup text
+        distinct = [Evidence (Just identity) (entryNamed "same text") | identity ← keys]
+        first = take 1 distinct
+        once = applied [Account first] both
+        repeated = applied [Account first, Account first] both
+        twice = applied [Account distinct] both
+    reportAccounted (stEngine repeated) `shouldBe` reportAccounted (stEngine once)
+    reportAccounted (stEngine twice) `shouldBe` 2
+
+  it "writes each diagnostic under a stable identity that one caller alone can claim, and keeps it until it is done" $ do
+    let said = applied [Stop StopQuit] both
+        waiting = pendingDiagnostics said
+    map dgSay waiting `shouldSatisfy` any ((== "session stopping") . sayMessage)
+    let identity = maybe 0 dgId (listToMaybe waiting)
+    answersOf [DiagClaim identity, DiagClaim identity] said `shouldBe` [Done, Refused]
+    -- an interrupted attempt is kept as data, marked unfinished, and is not pending again
+    let interrupted = applied [DiagClaim identity, DiagInterrupt identity] said
+    pendingDiagnostics interrupted `shouldSatisfy` all ((/= identity) . dgId)
+    length (stDiags interrupted) `shouldBe` length (stDiags said)
+    length (stDiags (applied [DiagClaim identity, DiagDone identity] said)) `shouldBe` length (stDiags said) - 1
+
+  it "submits the same end again without duplicating its accounting, failure order or stops" $ do
+    let ended = OwnerFinalized Gameplay [evidenceOf (engineEntry CleanupFailure (Just Gameplay) OnCleanup "close failed")] [(g0, factRan)]
+        once = applied (validated <> [initOk g0, ended]) both
+        again = applied (validated <> [initOk g0, ended, ended, ended]) both
+    reportAccounted (stEngine again) `shouldBe` reportAccounted (stEngine once)
+    stFailureOrder again `shouldBe` stFailureOrder once
+    owedStops again `shouldBe` owedStops once
+
+  it "keeps every invariant, retirement and evidence included, after every step of every sequence of five events" $ do
+    keys ← freshKeys 1
+    let menu' =
+          [ Stop StopQuit
+          , Unwind
+          , OwnerFinalized Gameplay [evidenceOf (engineEntry CleanupFailure (Just Gameplay) OnCleanup "close failed")] [(g0, factRan)]
+          , Drained Gameplay
+          , ReleasesDone Gameplay []
+          , ReleasesDone Gameplay [evidenceOf (engineEntry CleanupFailure (Just Gameplay) OnCleanup "release failed")]
+          , RoleRetired Gameplay
+          , StopHanded Gameplay
+          , Account [Evidence (listToMaybe keys) (engineEntry CleanupFailure Nothing OnCleanup "carried")]
+          , StopDefect Gameplay (engineEntry HostFailure (Just Gameplay) OnEngine "the stop raised")
+          ]
+        starting = acquired
+        broken = [(events, why) | events ← sequencesOf menu' 5, let why = violationsFrom starting events, not (null why)]
+    broken `shouldBe` []
+
+-- The mutants --------------------------------------------------------------------------------------------------------------
+
+-- | The same checks, from a state that has already acquired a role's components.
+violationsFrom ∷ [Event] → [Event] → [String]
+violationsFrom prefix events = violationsWith step (prefix <> events)
+
+-- | The invariants that tie a claim to its payload, checked along a stream of events.
+claimWithoutPayload ∷ [Event] → [String]
+claimWithoutPayload = go gameplayOnly
+  where
+    go _ [] = []
+    go state (event : rest) =
+      let (next, _) = step event state
+          claimed = (rsOwnerEnded <$> Map.lookup Gameplay (stRoles next)) == Just True
+          payload = Map.member 0 (maybe Map.empty rsFacts (Map.lookup Gameplay (stRoles next))) && reportAccounted (stEngine next) >= 1
+       in ["the owner is claimed accounted before its evidence and facts: " <> show event | claimed, not payload] <> go next rest
+
+mutants ∷ Spec
+mutants = describe "each protection removed, which the model's own checks detect (negative controls)" $ do
+  let bothClosed = [Stop StopQuit]
+      ended = OwnerFinalized Gameplay [evidenceOf (engineEntry CleanupFailure (Just Gameplay) OnCleanup "close failed")] [(g0, factRan)]
+
+  it "retires a role without proof when the eligibility is not required" $ do
+    let early event state = case event of
+          RoleRetired role → (adjustRole' role (\found → found {rsPhase = Retired, rsAdmit = AdmitClosed}) state, Done)
+          _ → step event state
+        stream = acquired <> bothClosed <> [RoleRetired Gameplay]
+    violationsWith step stream `shouldBe` []
+    violationsWith early stream `shouldSatisfy` any (isInfixOf' "retired without proof")
+
+  it "leaves the peer running when a cleanup fault does not widen the stop set" $ do
+    let narrow event state = case (event, step event state) of
+          (ReleasesDone {}, (next, answer)) → (next {stStops = stStops state}, answer)
+          (other, found) | isAccount other → let (next, answer) = found in (next {stStops = stStops state}, answer)
+          (_, found) → found
+        isAccount = \case
+          Account _ → True
+          _ → False
+        stream = validated <> [initOk g0, initOk p0, LatchFailure Gameplay (failure Gameplay OnUpdate "boom") [], StopHanded Gameplay, ReleasesDone Gameplay [evidenceOf (engineEntry CleanupFailure (Just Gameplay) OnCleanup "release failed")]]
+    violationsWith step stream `shouldBe` []
+    violationsWith narrow stream `shouldSatisfy` any (isInfixOf' "owes Presentation no stop")
+
+  it "forgets a stop that was never handed over when it is dropped without proof" $ do
+    let dropping event state = case event of
+          Stop kind → let (next, answer) = step (Stop kind) state in (next {stStops = mempty}, answer)
+          _ → step event state
+    violationsWith step bothClosed `shouldBe` []
+    violationsWith dropping bothClosed `shouldSatisfy` any (isInfixOf' "owes")
+
+  it "lets a late success reopen a shut gate when the closure is not remembered" $ do
+    let reopening event state = case (event, step event state) of
+          (InitSucceeded _ (Just origin), (next, answer)) | stStopping state → (next {stStart = StartOpen, stOrigin = Just origin}, answer)
+          (_, found) → found
+        stream = validated <> [initOk p0, Stop StopQuit, initOk g0]
+    violationsWith step stream `shouldBe` []
+    violationsWith reopening stream `shouldSatisfy` any (isInfixOf' "start gate")
+
+  it "claims an owner accounted before its evidence and its facts are in when the end is committed in pieces" $ do
+    let atomic = acquired <> [ended]
+        pieces = acquired <> [OwnerFinalized Gameplay [] [], Account [evidenceOf (engineEntry CleanupFailure (Just Gameplay) OnCleanup "close failed")], OwnerFinalized Gameplay [] [(g0, factRan)]]
+    claimWithoutPayload atomic `shouldBe` []
+    claimWithoutPayload pieces `shouldSatisfy` (not . null)
+
+  it "counts a failure again when its identity is not kept" $ do
+    keys ← freshKeys 1
+    let item = Evidence (listToMaybe keys) (engineEntry CleanupFailure Nothing OnCleanup "carried")
+        forgetting event state = case event of
+          Account items → step (Account [i {evKey = Nothing} | i ← items]) state
+          _ → step event state
+        stream = [Account [item], Account [item]]
+    violationsWith step stream `shouldBe` []
+    violationsWith forgetting stream `shouldSatisfy` any (isInfixOf' "counted again")
+
+  it "ranks an interruption over a failure when the ranking is inverted" $ do
+    let inverted found = if stInterrupt found then VerdictInterrupted else outVerdict (outcomeOf found)
+        ended' = applied [Stop StopInterrupt, EngineFault Nothing (engineEntry HostFailure Nothing OnEngine "failed")] both
+    outVerdict (outcomeOf ended') `shouldBe` VerdictFailure
+    inverted ended' `shouldBe` VerdictInterrupted
+  where
+    adjustRole' role change state = state {stRoles = Map.adjust change role (stRoles state)}
+    isInfixOf' needle haystack = Text.isInfixOf (Text.pack needle) (Text.pack haystack)
 
 -- The failure schema ---------------------------------------------------------------------------------------------------
 

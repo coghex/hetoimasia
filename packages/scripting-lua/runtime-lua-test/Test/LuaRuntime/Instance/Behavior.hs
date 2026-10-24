@@ -461,6 +461,55 @@ spec = describe "M1 behavior instances" $ do
         awaitPhase fixture owner "a" Active
         logged fixture >>= (`shouldBe` ["init alpha"])
 
+  describe "the protections of the hold, each removed in a model of it (negative controls)" $ do
+    -- The hold is a small state machine: the application is asked, may release at any time after the host registered
+    -- the rest of the start, and a stop settles the instance. The host's protections are three: it registers the
+    -- rest of the start before it asks, it queues one resume however many releases are made, and a stop wins over a
+    -- late release. The model below makes each transition twice, as the host does and with one protection removed,
+    -- and one oracle, applied to both, says whether the start was lost, run twice, run after a stop, or queued without
+    -- bound. What the host does is proved above, against the real owner; this shows that the proof can fail.
+    let ran = foldl (\held step -> step held) holdStart
+        ok held = holdBegun held == 1 && holdQueued held <= 1 && not (holdAfterStop held)
+        -- the host: registered before the question, a release coalesced, a stop wins
+        host =
+          HoldImpl
+            { implRegister = \held -> held {holdState = HoldRegistered}
+            , implRelease = \held -> case holdState held of
+                HoldRegistered | not (holdStopped held) -> held {holdState = HoldReleased, holdQueued = holdQueued held + 1}
+                _ -> held
+            , implConsume = \held -> case holdState held of
+                HoldReleased | not (holdStopped held) -> held {holdState = HoldNone, holdBegun = holdBegun held + 1, holdQueued = max 0 (holdQueued held - 1)}
+                HoldReleased -> held {holdState = HoldNone, holdQueued = max 0 (holdQueued held - 1)}
+                _ -> held
+            , implStop = \held -> held {holdStopped = True, holdState = HoldNone}
+            }
+        late = host {implRegister = id}
+        uncoalesced = host {implRelease = \held -> case holdState held of HoldRegistered -> held {holdState = HoldReleased, holdQueued = holdQueued held + 1}; HoldReleased -> held {holdQueued = holdQueued held + 1}; _ -> held}
+        stopLoses = host {implConsume = \held -> case holdState held of HoldReleased -> held {holdState = HoldNone, holdBegun = holdBegun held + 1, holdQueued = max 0 (holdQueued held - 1), holdAfterStop = holdStopped held}; _ -> held}
+        asked impl = [implRegister impl]
+    it "lose no release that arrives while the application is being asked, with the host's order, and lose it when the registration comes after the question" $ do
+      let scenario impl = ran (asked impl <> [implRelease impl, implConsume impl])
+          registeredAfterRelease impl = ran [implRelease impl, implRegister impl, implConsume impl]
+      ok (scenario host) `shouldBe` True
+      ok (registeredAfterRelease late) `shouldBe` False
+      holdBegun (registeredAfterRelease late) `shouldBe` 0
+
+    it "queue one resume however many releases are made, and queue one for each when releases are not coalesced" $ do
+      let scenario impl = ran (asked impl <> replicate 200 (implRelease impl))
+      holdQueued (scenario host) `shouldBe` 1
+      holdQueued (scenario uncoalesced) `shouldBe` 200
+      ok (ran (asked host <> replicate 200 (implRelease host) <> [implConsume host])) `shouldBe` True
+
+    it "begin nothing for a release that races a stop, and begin the instance after the stop when the stop does not win" $ do
+      let racing impl = ran [implRegister impl, implRelease impl, \held -> held {holdStopped = True}, implConsume impl]
+      -- the host: the stop wins, the queued resume finds an ended instance and does nothing
+      holdBegun (racing host) `shouldBe` 0
+      holdAfterStop (racing host) `shouldBe` False
+      -- without the protection the same interleaving begins the instance after it was stopped, which the oracle detects
+      holdBegun (racing stopLoses) `shouldBe` 1
+      holdAfterStop (racing stopLoses) `shouldBe` True
+      ok (racing stopLoses) `shouldBe` False
+
   describe "facades" $ do
     it "injects a facade whose closures are bound to its own instance, built per instance by an export module's function, the same table in init and self.api" $ bounded $
       withDefaults
@@ -824,3 +873,28 @@ spec = describe "M1 behavior instances" $ do
           ErrorExportFailed fault → boundaryReason fault `shouldBe` ModuleRefused (SourceTooLarge 1048576)
           other → failExample ("not the oversized source: " <> show other)
         logged fixture >>= (`shouldBe` ["exact ran"])
+
+-- | The model of an instance's hold: where the rest of its start is, how many resumes are queued, how many times the
+-- start began, and whether a stop settled it.
+data HoldState = HoldNone | HoldRegistered | HoldReleased
+  deriving (Eq, Show)
+
+data Hold = Hold
+  { holdState :: HoldState
+  , holdQueued :: Int
+  , holdBegun :: Int
+  , holdStopped :: Bool
+  , holdAfterStop :: Bool
+  }
+  deriving (Eq, Show)
+
+holdStart :: Hold
+holdStart = Hold HoldNone 0 0 False False
+
+-- | The transitions of the hold, as one implementation makes them.
+data HoldImpl = HoldImpl
+  { implRegister :: Hold -> Hold
+  , implRelease :: Hold -> Hold
+  , implConsume :: Hold -> Hold
+  , implStop :: Hold -> Hold
+  }
