@@ -2946,6 +2946,33 @@ resolved; this scope approval does not itself claim implementation correctness,
 runtime evidence or fresh readiness. The manager retains the #527 amendment
 and re-approval handoff. No other behavior or delivery boundary changes.
 
+### D-84. Add a third opt-in host seam for the D-82 peer-stop barrier
+
+**Delivery:** LFE-13 / #527 / PR #567; extends D-83's cross-package scope.
+
+Owner answer, **2026-10-24 16:52 UTC**, directly to `het-manager`, verbatim
+choice:
+
+> Approve as D-83 extension (Recommended)
+
+Authenticated relay: `het-manager`, message `mg453yzhxtdfemk8d6ap4dug76` in `#hetoimasia`.
+
+Context: D-82/T1 requires the session to ask every registered peer to stop
+before waiting for a failed starter to unwind. `startScheduledOwner`'s
+readiness-failure path in `hetoimasia-scripting-lua` performs its own
+`stopSupervised` and `awaitWorkerEnded` before it raises, so the session cannot
+act first without a hook inside that path.
+
+Accept one further opt-in seam on the same terms as D-83: a `ScheduledSpec`
+field, **default no-op**, invoked on the starter's thread immediately before
+that wait, so the session can hand off its stop-only barrier to registered
+peers. Its callback-failure handling follows D-82 and D-83: a throw is a host
+failure recorded as evidence and never erases the original readiness failure.
+Existing generic callers, the runner and the samples keep their behavior, which
+host tests prove. It is documented in `packages/scripting-lua/README.md`. No
+other behavior or delivery boundary changes; this records scope only, not
+implementation correctness or readiness.
+
 ## Proposals
 
 **Scope precedence:** D-41 supersedes the original state-store agenda. Accepted
