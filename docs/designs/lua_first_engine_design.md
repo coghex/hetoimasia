@@ -2998,6 +2998,37 @@ caller's own `TVar` check. It is documented in `packages/scripting-lua/README.md
 The session commits its admission check and the grant in one transaction. This
 records scope only, not implementation correctness or readiness.
 
+### D-86. Export the accounting-wait STM pieces so the session driver never blocks
+
+**Delivery:** LFE-13 / #527 / PR #567; extends D-83-D-85's cross-package scope.
+
+Owner answer, **2026-10-24 20:12 UTC**, directly to `het-manager`, verbatim
+choice:
+
+> Approve D-86
+
+Authenticated relay: `het-manager`, message `ik22kif8c9gs8398ex9hh3wdya` in `#hetoimasia`.
+
+Context: PR #567's review found that the session driver blocked in
+`awaitScheduledAccounting` while a provider retirement was held, contrary to
+D-82 (the single driver never makes a blocking wait that a held retirement can
+extend). The wait is private STM over `awaitSupervised`. Supervised waits are
+single-pending, so neither a helper thread nor an interrupting wait can stand
+in for it.
+
+Accept a purely additive export from `hetoimasia-scripting-lua`'s `Scheduled`
+module: `watchScheduledAccounting :: ScheduledOwner -> STM ()`,
+`scheduledAccountingStep :: ScheduledOwner -> STM AccountingWait`, which retries
+until accounting is ready or the owner has ended, exactly as today, and
+`unwatchScheduledAccounting :: ScheduledOwner -> STM ()`.
+`awaitScheduledAccounting` is redefined over them with unchanged behavior, and
+every existing caller is unchanged. A host test proves the pieces compose with a
+caller's own STM. They are documented in `packages/scripting-lua/README.md`. The
+session driver watches once when a tick finishes and observes accounting as an
+alternative inside its one lifecycle transaction, at lower priority than stops
+and role steps. This records scope only, not implementation correctness or
+readiness.
+
 ## Proposals
 
 **Scope precedence:** D-41 supersedes the original state-store agenda. Accepted

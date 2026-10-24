@@ -207,6 +207,15 @@ a short watchdog, bounded TERM grace, and KILL of only the owned process group.
 No automatic retry. Validate deliberate hangs and escalation in a separately
 selected optional probe. Do not weaken production retirement or resource
 cleanup guarantees to let a test return. This harness is a recommendation;
-the existing in-process timeout ceilings have not been replaced. The lab now
+the existing in-process timeout ceilings have not been replaced. The one the
+Lua runtime adapter's examples use (`Test.LuaRuntime.Support.bounded`) does not
+rely on a single interruption: a protected wait (a drain, a retirement) takes the
+exception and carries on, so it interrupts the example again every ten seconds
+(at most the limit) until the example has ended, opens the gates the example
+registered from a thread of its own, and fails an example that returns only
+after its bound expired. A failure the example raised itself after its gates
+were opened is reported with the expiry, not in its place. A thread that cannot
+be interrupted at all, or an example of another suite whose bound is a single
+`timeout`, is still not ended by it. The lab now
 provides an external guardian for its selected child executions, including
 parent-death cleanup; ordinary direct Cabal test commands do not use it.

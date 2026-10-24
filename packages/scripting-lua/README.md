@@ -2606,6 +2606,18 @@ for a failure, had `instanceEscalate` called **and returned**. An application de
 commit, or a stop's outcome, on it: `awaitTicksComplete` can return while any of those still
 lies ahead on the owner's thread.
 
+Its three parts are exported as transactions (D-86) for an application that must observe the accounting
+beside other things in the one supervised wait it makes, and so cannot block in this one while a
+retirement a provider owes holds it: `watchScheduledAccounting` takes the snapshot, once;
+`scheduledAccountingStep` is the wait itself, a transaction that retries until the accounting is
+complete or the owner has ended and otherwise answers `AccountingComplete` or `AccountingOwnerEnded`;
+`unwatchScheduledAccounting` clears the watch, harmlessly when repeated and however the wait ended.
+`awaitScheduledAccounting` is these three in that order (watch, then `awaitSupervised` over the step,
+then the clear in the cleanup of the same masked region) and behaves as before; callers of it are
+unchanged. The application keeps the single-pending rule of supervised waits: it composes the step
+into its own transaction under its one `awaitSupervised`, and does not call it from a Lua callback
+or from the owner's own thread.
+
 - *Who may call it.* It is a supervised wait like every other, composed with
   `awaitSupervised` and called on the application thread that owns the `RuntimeControl`
   (`docs/supervision.md`: the control is owned by the application thread, the drain status

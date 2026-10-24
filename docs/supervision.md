@@ -20,7 +20,7 @@ The module depends on `base`, `stm`, `text`, the foundation package's public
 modules, and the runtime's own [logging lifetime](logging.md#logging-lifetime)
 and [reporting adapter](logging.md#recovery-and-terminal-reports). It does not
 reimplement worker ownership, stop, cancellation delivery, or the drain; it
-calls `withWorkerGroup`, `startWorkerWith`, `observeCompletion`, and
+calls `withWorkerGroup`, `startWorkerWithIO`, `observeCompletion`, and
 `closeWorkerGroup` as they are.
 
 ## Public interface
@@ -134,13 +134,34 @@ The code that starts a worker decides its policy, per worker, when it calls
 its preparation step, so supervision owns the worker's policy before any of the
 worker's own code runs. Its startup wait is a supervised wait: in one
 transaction it reads the fatal latch and every other supervised worker's
-terminal state as well as the new worker's startup. It is woken, and gives up
-waiting, when a failure is already latched or another worker's outcome is fatal
-without consulting a classifier — any failure of a required worker, or failed
-cleanup. The new worker is then cancelled and drained by `startWorkerWith`
-before the start unwinds, that worker counts as stopped by its owner, and the
-fatal failure is handled and rethrown. An owner cancellation of the wait drains
-the new worker the same way and propagates.
+terminal state as well as the new worker's startup. It is woken when a failure
+is already latched or another worker has a published failure (failed cleanup,
+or a failure a classifier judges). The wait does not end there: it handles the
+outcomes as a checkpoint does, before it looks at the new worker's own
+acknowledgement — so also for a worker that acknowledged and whose waiter has
+not run yet — and before anything is drained. Each is classified outside STM and
+committed with its observed worker in one transaction, so the failed worker's
+`workerStatus` reports its terminal status as soon as the failure is published,
+however long the new worker is held, and not only after the new worker has been
+drained.
+
+- A tolerated failure (an optional worker, recognized) is committed as
+  `WorkerUnavailable` with its one warning, and the wait goes on. The new worker
+  is neither stopped nor cancelled by it, and its start completes as before.
+- A fatal failure (any failure of a required worker, a failure the classifier
+  does not recognize or raises on, or failed cleanup) is committed and latched,
+  which asks every worker still pending to stop, the new one included, in the
+  same transaction, and the wait ends. The new worker is then cancelled and
+  drained by `startWorkerWithIO` before the start unwinds, that worker counts as
+  stopped by its owner, and the latched failure is rethrown once the drain has
+  ended; a latch delivered again is not committed again.
+- An owner cancellation of the wait, including one that reaches a classifier
+  the wait is running, commits and classifies nothing more: the new worker is
+  drained and the cancellation propagates as itself, carrying the abandoned
+  start and the worker's cleanup failures.
+- A failure first published after the wait has stopped, while the new worker is
+  already draining, is handled by the checkpoint that follows the drain, as at
+  [closing](#closing); closing's own ordering is unchanged.
 
 Once startup ends, the new worker's own outcome, if it already has one, is
 handled exactly once, after any failed startup has drained:
@@ -457,6 +478,14 @@ to reuse. They cover:
 
 - a required failure waking an active supervised wait and a startup wait, with
   the new worker drained before the start unwinds;
+- a sibling's failure committed before the new worker is drained: a required
+  sibling, and an optional one the classifier does not recognize, are
+  `WorkerFatal` from another thread while the new worker is held where only the
+  example releases it, and a recognized optional sibling is `WorkerUnavailable`
+  with its one warning while the held worker's start then completes unstopped;
+  an owner cancellation of the start, during a classifier and after a tolerated
+  commit, classifies and commits nothing more
+  (`packages/runtime/test/Test/Runtime/Supervision/Startup.hs`);
 - a ready failure handled before simultaneously ready caller work, which stays
   unconsumed;
 - optional and required startup failures handled exactly once;
