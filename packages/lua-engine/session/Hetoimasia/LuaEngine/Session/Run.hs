@@ -192,7 +192,7 @@ import Hetoimasia.LuaEngine.Profile
   , Count (Count)
   , countLimit
   )
-import Hetoimasia.LuaEngine.Request (m1Requests)
+import Hetoimasia.LuaEngine.Request (m1Requests, withM1Gate)
 import Hetoimasia.LuaEngine.Session.Failure
 import Hetoimasia.LuaEngine.Session.Harness
 import Hetoimasia.LuaEngine.Session.Pacing
@@ -437,10 +437,14 @@ stateOf = readTVar . sessionState . envSession
 admissionOf ∷ Env → Role → IO AdmissionState
 admissionOf env role = do
   state ← readTVarIO (sessionState (envSession env))
-  pure $ case roleAdmit role state of
-    AdmitOpen → AdmissionOpen
-    AdmitStopping → AdmissionStopping
-    AdmitClosed → AdmissionClosed
+  let found = case roleAdmit role state of
+        AdmitOpen → AdmissionOpen
+        AdmitStopping → AdmissionStopping
+        AdmitClosed → AdmissionClosed
+  -- (this read is a hint that refuses early; the decision is the admission's own gate, read in the transaction that
+  -- admits the request, so a closure that commits after this read refuses the request for good)
+  when (found == AdmissionOpen) (probeAt env (RequestChecked role))
+  pure found
 
 -- Protected steps -----------------------------------------------------------------------------------------
 
@@ -778,7 +782,8 @@ ownerPolicy =
 withRoleVm ∷ Env → RoleInfo → (RoleVm → IO a) → IO a
 withRoleVm env info body = do
   handles ← newRequestHandles
-  requests ← either (refuse "the request policy" . Text.pack . show) pure (m1Requests profile handles)
+  requests0 ← either (refuse "the request policy" . Text.pack . show) pure (m1Requests profile handles)
+  let requests = if removed env ProtectRequestGate then requests0 else withM1Gate ((== AdmitOpen) . roleAdmit (riRole info) <$> stateOf env) requests0
   phase ← newModulePhase
   holder ← newTVarIO Nothing
   let moduleSpec =

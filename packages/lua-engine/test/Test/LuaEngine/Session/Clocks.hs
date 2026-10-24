@@ -7,6 +7,7 @@
 module Test.LuaEngine.Session.Clocks (spec) where
 
 import Control.Concurrent (forkIO)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, retry, writeTVar)
 import Control.Monad (void, when)
 import Data.Text (Text)
@@ -21,6 +22,7 @@ spec ∷ Spec
 spec = describe "clocks" $ do
   logical
   grantClosure
+  requestClosure
   interleaving
   elapsed
   limits
@@ -154,6 +156,54 @@ grantClosure = describe "the tick grant and the closure" $ do
   describe "with the check and the grant made in two transactions (a negative control)" $
     it "grants a tick after the closure committed, which the proof above detects" $
       grantAcrossClosure [ProtectGrantAtomic] (GrantChecked 1) >>= (`shouldBe` [1])
+
+-- | A content request whose admission the session's closure beat: the request found the session open at the facade's
+-- argument check, the closure committed while nobody had handed the owner its stop or closed the coordinator (the
+-- closing thread is held after its commit, and the driver is held while the tick that makes the request runs), and the
+-- host then admitted the request. The lines the script printed about the request.
+requestAcrossClosure ∷ [Protection] → IO [Text]
+requestAcrossClosure removedProtections =
+  withSetup (addFile ("lua/x.bin", "x") ((setup (roleScript requesting)) {suShape = GameplayAlone})) $ \env → do
+    let world = seWorld env
+    recorder ← newRecorder
+    seen ← newIORef []
+    holdAt recorder (GrantIssued 1)
+    holdAt recorder (RequestChecked Gameplay)
+    holdAt recorder (Committed "Stop")
+    _ ← runCaught env ((recordingHarness recorder noHarness) {harnessRemoved = removedProtections}) $ \_ session → do
+      awaitPhase session Gameplay Running
+      awaitRegistration world 1000
+      nudge world 1000000
+      -- the first tick is running its request and the driver, which would pay a stop, is held
+      awaitPoint recorder (GrantIssued 1)
+      awaitPoint recorder (RequestChecked Gameplay)
+      void (forkIO (requestStop session StopQuit))
+      awaitPoint recorder (Committed "Stop")
+      found ← historyNow session
+      historyStopped found `shouldBe` []
+      releaseHold recorder (RequestChecked Gameplay)
+      pumpUntil world (any ("request " `Text.isPrefixOf`) <$> outLines world)
+      outLines world >>= writeIORef seen . filter ("request " `Text.isPrefixOf`)
+      releaseHold recorder (Committed "Stop")
+      releaseHold recorder (GrantIssued 1)
+      void (awaitRetired session)
+    readIORef seen
+  where
+    requesting =
+      printScript
+        { scInit = []
+        , scShutdown = []
+        , scUpdate = ["if api.time.tick() == 1 then local ok = pcall(function() return api.content.data('lua/x.bin') end); print('request ' .. tostring(ok)) end"]
+        }
+
+requestClosure ∷ Spec
+requestClosure = describe "a content request and the closure" $ do
+  it "refuses, as an ordinary error a script catches, a request whose admission the closure beat, though the facade had found the session open" $
+    requestAcrossClosure [] >>= (`shouldBe` ["request false"])
+
+  describe "with no session gate on the request policy (a negative control)" $
+    it "accepts a request after the closure committed, which the proof above detects" $
+      requestAcrossClosure [ProtectRequestGate] >>= (`shouldBe` ["request true"])
 
 -- Two instances on one VM -----------------------------------------------------------------------------------------------
 

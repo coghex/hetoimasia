@@ -6,8 +6,9 @@ module Test.LuaRuntime.Scheduled.Settlement (spec) where
 
 import Control.Concurrent (forkIO, yield)
 import Control.Concurrent.MVar (modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, takeMVar)
-import Control.Concurrent.STM (atomically, newTVarIO, orElse, readTVarIO, retry, writeTVar)
+import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
 import Control.Monad (forM, forM_, replicateM, replicateM_, void)
+import Data.List (nub)
 import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Owner (BoundaryFault (boundaryReason), FaultReason (ScriptFailed, ValueRefused), FaultKind (CallFailed), ModuleRef (ModuleRef))
 import Hetoimasia.Scripting.Lua.Runtime
@@ -203,6 +204,9 @@ spec = describe "admission and settlement" $ do
                                               granted@(GrantAccepted _) → pure (Just granted)
                                               _ → retry)
                                           `orElse` pure Nothing
+        -- a decision the application's own state closed grants nothing and leaves the owner's grants as they were
+        decided ← newTVarIO True
+        atomically (readTVar decided >>= \isClosed → if isClosed then pure Nothing else Just <$> grantScheduledStepSTM endpoint (nanoseconds 5)) >>= (`shouldBe` Nothing)
         open ← newTVarIO False
         composed open >>= (`shouldBe` Just (GrantAccepted (GrantId 0)))
         readTVarIO open `shouldReturn` True
@@ -216,6 +220,45 @@ spec = describe "admission and settlement" $ do
         readTVarIO closed `shouldReturn` False
         atomically (grantScheduledStepSTM endpoint (nanoseconds 5)) >>= (`shouldBe` GrantClosed)
         grantScheduledStep endpoint (nanoseconds 5) >>= (`shouldBe` GrantClosed)
+
+    it "serializes a closure of the application's with grants decided from it: every grant is accepted before the closure or sees it" $ bounded $ do
+      fixture ← newSFixture
+      withBoundary $ \_ runtime → do
+        let bounds = defaultSchedulerBounds {boundOutstandingGrants = 4096}
+        owner ← startScheduled fixture runtime (scheduled fixture "stm race" requiredPolicy bounds)
+        let endpoint = scheduledEndpoint owner
+        takesGrants ← newTVarIO True
+        accepted' ← newTVarIO (0 ∷ Int)
+        acceptedAtClose ← newTVarIO Nothing
+        answers ← forM [1 .. 64 ∷ Int] $ \_ → do
+          done ← newEmptyMVar
+          _ ← forkIO $ do
+            results ← replicateM 16 $ atomically $ do
+              takes ← readTVar takesGrants
+              if takes
+                then
+                  grantScheduledStepSTM endpoint (nanoseconds 5) >>= \case
+                    GrantAccepted found → modifyTVar' accepted' (+ 1) >> pure (Just found)
+                    _ → pure Nothing
+                else pure Nothing
+            putMVar done results
+          pure done
+        closer ← newEmptyMVar
+        _ ← forkIO $ do
+          yield
+          atomically (writeTVar takesGrants False >> readTVar accepted' >>= writeTVar acceptedAtClose . Just)
+          putMVar closer ()
+        found ← concat <$> mapM takeMVar answers
+        takeMVar closer
+        total ← readTVarIO accepted'
+        atClose ← readTVarIO acceptedAtClose
+        -- nothing was accepted after the closure committed, and the scheduler issued exactly those grants, once each
+        atClose `shouldBe` Just total
+        length [() | Just _ ← found] `shouldBe` total
+        let ids = [identity | Just (GrantId identity) ← found]
+        length ids `shouldBe` total
+        length (nub ids) `shouldBe` total
+        retireScheduled owner
 
   describe "exactly-once settlement under races" $ do
     it "settles every accepted task once across a thousand admissions racing control requests and a stop" $ bounded $ do

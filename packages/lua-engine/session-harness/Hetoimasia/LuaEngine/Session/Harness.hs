@@ -109,6 +109,10 @@ data Protection
   | -- | The check that the logical role takes ticks and the scheduler's acceptance of the grant are one transaction.
     -- Removed, they are two, with the point 'GrantChecked' between them, so a closure can commit between the two.
     ProtectGrantAtomic
+  | -- | A content request is admitted only while the session takes new work, decided in the transaction that admits it.
+    -- Removed, the request policy has no session gate, and only the early read of the facade and the closed coordinator
+    -- stand between a request and a closure that has committed.
+    ProtectRequestGate
   deriving (Eq, Show)
 
 -- | The steps a role's VM is made in, and released in the opposite order.
@@ -153,6 +157,9 @@ data Point
   | -- | A tick is about to be granted: nothing checked and nothing issued. The check and the grant are one
     -- transaction, so there is no point between them.
     GrantIntent !Word64
+  | -- | A content request found the session's admission open at the facade's argument check, and its admission
+    -- is about to be made by the host in another step: the point to hold to see a closure commit in between.
+    RequestChecked !Role
   | -- | Only with 'ProtectGrantAtomic' removed: the check was made in one transaction and the grant is about to be
     -- issued in another.
     GrantChecked !Word64
