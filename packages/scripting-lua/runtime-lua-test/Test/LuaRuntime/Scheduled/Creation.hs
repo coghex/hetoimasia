@@ -4,10 +4,10 @@
 -- created and retired across cycles without an identity being issued twice.
 module Test.LuaRuntime.Scheduled.Creation (spec) where
 
-import Control.Concurrent (forkIO, killThread)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryTakeMVar)
-import Control.Exception (AsyncException (ThreadKilled), SomeException, fromException, throwIO, try)
-import Control.Monad (forM, forM_, replicateM)
+import Control.Concurrent (forkIO, killThread, throwTo, yield)
+import Control.Concurrent.MVar (isEmptyMVar, newEmptyMVar, putMVar, takeMVar, tryTakeMVar)
+import Control.Exception (AsyncException (ThreadKilled, UserInterrupt), SomeException, fromException, throwIO, try)
+import Control.Monad (forM, forM_, replicateM, replicateM_)
 import Data.ByteString (ByteString)
 import Data.List (isInfixOf)
 import Data.Maybe (isNothing)
@@ -85,6 +85,9 @@ spec = describe "creation, readiness and identity" $ do
       starter ← forkIO (try @SomeException (startScheduledOwner runtime config) >>= putMVar returned)
       awaitEntered fixture "init"
       killThread starter
+      -- the hook raised, and the starter still waits for its worker: it has not returned while the worker is held
+      replicateM_ 1000 yield
+      isEmptyMVar returned >>= (`shouldBe` True)
       releaseGate fixture "init"
       takeMVar returned >>= \case
         Left failure → do
@@ -92,6 +95,24 @@ spec = describe "creation, readiness and identity" $ do
           fromException failure `shouldBe` Just ThreadKilled
           map displayCleanupFailure (cleanupFailures failure) `shouldSatisfy` any (isInfixOf "the hook failed")
         Right _ → failExample "the start was cancelled and should not have returned an owner"
+
+  it "does not let an exception of an asynchronous type that the hook itself threw take the place of the failure that abandoned the start" $ bounded $ do
+    fixture ← newSFixture
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
+      let config =
+            (withChunks (initial "fx.block('init')") (scheduled fixture "abandoned, hook throws a kill" requiredPolicy defaultSchedulerBounds))
+              {scheduledOnStartAbandoned = throwIO ThreadKilled}
+      returned ← newEmptyMVar
+      starter ← forkIO (try @SomeException (startScheduledOwner runtime config) >>= putMVar returned)
+      awaitEntered fixture "init"
+      -- the start is abandoned by an interrupt delivered to the starter; the hook then throws a kill of its own
+      throwTo starter UserInterrupt
+      releaseGate fixture "init"
+      takeMVar returned >>= \case
+        Left failure → do
+          fromException failure `shouldBe` Just UserInterrupt
+          map displayCleanupFailure (cleanupFailures failure) `shouldSatisfy` any (isInfixOf "thread killed")
+        Right _ → failExample "the start was interrupted and should not have returned an owner"
 
   it "abandons a start as it always did when the application says nothing: the cancellation is raised as itself once the worker has ended" $ bounded $ do
     fixture ← newSFixture

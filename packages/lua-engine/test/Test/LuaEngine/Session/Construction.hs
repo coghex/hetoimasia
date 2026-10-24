@@ -261,10 +261,32 @@ abandonedStarts = describe "a start that is abandoned part way" $ do
         historyStopped found `shouldBe` [Gameplay]
         status ← statusNow session
         statusStopping status `shouldBe` True
+        -- a stop requested concurrently with the hook finds the pass done and changes nothing: repeating it is harmless
+        requestStop session StopQuit
+        again ← historyNow session
+        historyStopped again `shouldBe` [Gameplay]
         releaseHold recorder (StartAbandoned Presentation)
         releaseSink world
       raisedKilled ended `shouldBe` True
       outcome ← outcomeNow session
+      outRetired outcome `shouldBe` True
+
+  it "accounts a failure of the abandonment's own point as a failure of the host, once, and does not displace the cancellation that abandoned the start" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      let world = seWorld env
+      recorder ← newRecorder
+      holdSink world "held start"
+      failAt recorder (StartAbandoned Presentation) (toException (userError "the point failed"))
+      let harness = (recordingHarness recorder noHarness) {harnessStartChunk = [(Presentation, "print('held start')")]}
+      (ended, session) ← runCaught env harness $ \driver _ → do
+        awaitSinkEntered world "held start"
+        throwTo driver ThreadKilled
+        awaitBlockedOnSTM driver
+        releaseSink world
+      raisedKilled ended `shouldBe` True
+      outcome ← outcomeNow session
+      length [message | message ← outcomeMessages outcome, Text.isInfixOf "the point failed" message] `shouldBe` 1
+      fmap eeCode (erPrimary (outEngine outcome)) `shouldBe` Just HostFailure
       outRetired outcome `shouldBe` True
 
   describe "with the abandonment not told (a negative control)" $

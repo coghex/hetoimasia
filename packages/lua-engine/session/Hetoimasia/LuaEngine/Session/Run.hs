@@ -868,11 +868,23 @@ withRoleVm env info body = do
 -- | Told, on the starter's thread, when this role's start is abandoned (D-82/T1): the session closes and every
 -- registered peer is handed its stop now, before the starter waits for its partly started worker to end. The point
 -- is told afterwards, so a test holds the starter here and finds the receipts.
+--
+-- Nothing it does raises into the host: a failure of its own (the point told after the pass raised) is accounted here as a
+-- failure of the host, once, and a cancellation that lands in it is retained for the end. The stops were handed over before
+-- either could happen, and the readiness failure the host is about to raise is never displaced.
 abandonedStart ∷ Env → Role → IO ()
-abandonedStart env role = do
-  void (commit (envSession env) Unwind)
-  stopPass (envSession env)
-  probeAt env (StartAbandoned role)
+abandonedStart env role = mask_ $ do
+  told ← tryWithContext @SomeException $ do
+    void (commit (envSession env) Unwind)
+    stopPass (envSession env)
+    probeAt env (StartAbandoned role)
+  case told of
+    Right () → pure ()
+    Left failure
+      | isAsync failure → retainQuiet env failure
+      | otherwise → do
+          evidence ← caughtEvidence HostFailure (Just role) OnEngine "the abandonment of a start could not be told" failure
+          void (commit (envSession env) (Account evidence))
 
 -- | Start a role's owner, register it with the lifecycle record in the same masked step, run a body, and on every
 -- way out run the session's protocol before the scopes it borrows from are released.

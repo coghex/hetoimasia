@@ -373,7 +373,7 @@ import Hetoimasia.Scripting.Lua.Request (requestContextOf)
 import Hetoimasia.Scripting.Lua.Lending.Loan (Lending, bindLending, sameLending)
 import Hetoimasia.Scripting.Lua.Loading.State (LoaderEndpoint (LoaderEndpoint), LoaderHooks (hookObserved), LoaderPlan (planHooks), LoaderPlanRefused (LoaderPlanRefused), loadingConfig, newLoadingState, validatePlan)
 import Hetoimasia.Scripting.Lua.Scheduled.Run (runScheduledOwner)
-import Hetoimasia.Scripting.Lua.Scheduled.Shared (awaitWorkerEnded, propagateAll)
+import Hetoimasia.Scripting.Lua.Scheduled.Shared (awaitWorkerEnded, propagateBeside)
 import Hetoimasia.Scripting.Lua.Scheduled.Types
 import Hetoimasia.Scripting.Lua.Scheduler
   ( AdmitAnswer (Admitted, AdmitRefused)
@@ -721,9 +721,11 @@ startScheduledOwner runtime spec = do
           Left failure → do
             stopSupervised worker
             -- the application is told before the starter waits, so what it must stop first is stopped first
+            -- (a failure of the callback is a failure of the host kept beside the failure of the start: it never takes
+            -- its place, whatever its type, and it does not skip the wait for the worker)
             told ← tryWithContext @SomeException (scheduledOnStartAbandoned spec)
             interruptions ← awaitWorkerEnded restore worker
-            propagateAll (failure : either pure (const []) told <> interruptions)
+            propagateBeside [("start abandoned callback", raised) | Left raised ← [told]] (failure : interruptions)
             rethrowIO failure
         case ready of
           Just held → do
