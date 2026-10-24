@@ -2505,6 +2505,20 @@ level keeps creation pending, as a held segment keeps the worker (D-27); the wai
 uninterruptible mask. This is what lets an application release what the owner's bindings borrow as soon as creation
 has returned or raised.
 
+**Telling the application of an abandoned start (D-84).** The creator waits for the worker it started, and a worker held
+in its initialization can make that long. An application that owns other owners which the failure must stop first
+(the Lua-first session coordinator is one) is told earlier, through `scheduledOnStartAbandoned` of the specification
+(default: nothing): once, on the creator's thread, when a start that has not handed out an owner is abandoned (its
+readiness wait failed or was cancelled), after the worker was asked to stop and **before** the creator waits for it to have
+ended. It runs masked, so it must be finite and must not wait. What it raises is a failure of the host, kept as evidence beside
+the failure of the start (and beside a real cancellation of the creator): it never takes the place of the readiness failure, whatever
+its type (an exception of an asynchronous type the callback itself threw was not delivered to the creator and is evidence, not a
+cancellation), and it does not skip the creator's wait for its worker, so a creator never gets an exception back while the worker
+it started still runs Lua. It
+is not told when creation returns an owner, when an initialization that fails ends creation under the owner's policy
+(`ScheduledUnavailable`, `ScheduledEnded`), or when the configuration is refused before a worker starts. The creator
+that does not set it behaves exactly as before.
+
 ### Identity
 
 An owner has the `OwnerId` its `LuaRuntime` issues, from the one counter finite-call
