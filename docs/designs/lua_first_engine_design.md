@@ -2973,6 +2973,31 @@ host tests prove. It is documented in `packages/scripting-lua/README.md`. No
 other behavior or delivery boundary changes; this records scope only, not
 implementation correctness or readiness.
 
+### D-85. Export an STM grant so admission and the tick grant commit together
+
+**Delivery:** LFE-13 / #527 / PR #567; extends D-83/D-84's cross-package scope.
+
+Owner answer, **2026-10-24 18:01 UTC**, directly to `het-manager`, verbatim
+choice:
+
+> Approve (Recommended)
+
+Authenticated relay: `het-manager`, message `None` in `#hetoimasia`.
+
+Context: PR #567's review found that the session's admission check and the
+scheduler's tick grant ran in separate transactions, so a session closure
+could commit between them and a tick could still be granted after closure.
+`grantScheduledStep` runs `atomically` inside `hetoimasia-scripting-lua`'s IO
+API, so the session cannot compose with it.
+
+Accept one purely additive export: `grantScheduledStepSTM :: ScheduledEndpoint
+-> Duration -> STM GrantAnswer`, with `grantScheduledStep` redefined as
+`atomically . grantScheduledStepSTM`. No behavior changes and every existing
+caller is unchanged. A host test proves the export composes atomically with a
+caller's own `TVar` check. It is documented in `packages/scripting-lua/README.md`.
+The session commits its admission check and the grant in one transaction. This
+records scope only, not implementation correctness or readiness.
+
 ## Proposals
 
 **Scope precedence:** D-41 supersedes the original state-store agenda. Accepted
