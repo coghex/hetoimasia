@@ -6,6 +6,7 @@
 -- the example says it is.
 module Test.LuaEngine.Session.Clocks (spec) where
 
+import Control.Concurrent (forkIO)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, retry, writeTVar)
 import Control.Monad (void, when)
 import Data.Text (Text)
@@ -19,6 +20,7 @@ import Test.LuaEngine.Session.Support
 spec ∷ Spec
 spec = describe "clocks" $ do
   logical
+  grantClosure
   interleaving
   elapsed
   limits
@@ -116,6 +118,42 @@ logical = describe "the logical clock" $ do
         out ← linesWith "tick" world
         take 5 out `shouldBe` ["tick 1 dt 0.001000000", "tick 2 dt 0.001000000", "tick 3 dt 0.001000000", "tick 4 dt 0.001000000", "tick 5 dt 0.001000000"]
         requestStop session StopQuit
+
+-- The tick grant and the closure -------------------------------------------------------------------------------------------
+
+-- | Close the session with the closing thread held between its commit and the stop it owes the owner, while the driver
+-- is held at this point of a grant about to be made; then let the driver go. The ticks granted are answered.
+grantAcrossClosure ∷ [Protection] → Point → IO [Word64]
+grantAcrossClosure removedProtections held =
+  withSetup ((setup (roleScript ticking)) {suShape = GameplayAlone}) $ \env → do
+    let world = seWorld env
+    recorder ← newRecorder
+    holdAt recorder held
+    holdAt recorder (Committed "Stop")
+    _ ← runCaught env ((recordingHarness recorder noHarness) {harnessRemoved = removedProtections}) $ \_ session → do
+      awaitPhase session Gameplay Running
+      awaitRegistration world 1000
+      -- the first tick is due and the driver is about to grant it
+      nudge world 1000000
+      awaitPoint recorder held
+      -- the closure commits while the driver is held; the closing thread owes the owner its stop and has not handed it
+      void (forkIO (requestStop session StopQuit))
+      awaitPoint recorder (Committed "Stop")
+      found ← historyNow session
+      historyStopped found `shouldBe` []
+      releaseHold recorder held
+      releaseHold recorder (Committed "Stop")
+      void (awaitRetired session)
+    grantsIssued recorder
+
+grantClosure ∷ Spec
+grantClosure = describe "the tick grant and the closure" $ do
+  it "grants no tick the closure beat, even while the closing thread has not yet handed its stop to the owner" $
+    grantAcrossClosure [] (GrantIntent 1) >>= (`shouldBe` [])
+
+  describe "with the check and the grant made in two transactions (a negative control)" $
+    it "grants a tick after the closure committed, which the proof above detects" $
+      grantAcrossClosure [ProtectGrantAtomic] (GrantChecked 1) >>= (`shouldBe` [1])
 
 -- Two instances on one VM -----------------------------------------------------------------------------------------------
 

@@ -14,6 +14,8 @@ module Hetoimasia.Scripting.Lua.Scheduled.Shared
   , waitReport
   , waitReportFor
   , awaitWorkerEnded
+  , awaitWorkerCompleted
+  , workerFailures
   , propagateAll
   , propagateBeside
   ) where
@@ -29,7 +31,7 @@ import Control.Exception
   , tryWithContext
   )
 import Control.Concurrent.STM (atomically)
-import Control.Monad (void, when)
+import Control.Monad (when)
 import Data.IORef (IORef, modifyIORef', readIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -37,7 +39,7 @@ import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailureLabel, cleanupFailuresInContext, composeCleanup)
-import Hetoimasia.Foundation.Worker (awaitCompletion)
+import Hetoimasia.Foundation.Worker (Completion (..), Result (..), awaitCompletion)
 import Hetoimasia.Runtime.Supervision (SupervisedWorker, supervisedWorker)
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero), durationFromNanoseconds, zeroDuration)
 import Hetoimasia.Scripting.Lua.Internal.Fault (raisedByApplication)
@@ -130,12 +132,26 @@ settledOrRaise extra action = do
 -- ended, so what the worker used (sinks, bindings, a VM's dependencies) is never released under a Lua
 -- call that is still running. A stuck segment keeps the wait pending, as it keeps the worker (D-27).
 awaitWorkerEnded ∷ (∀ x. IO x → IO x) → SupervisedWorker () → IO [ExceptionWithContext SomeException]
-awaitWorkerEnded restore worker = go []
+awaitWorkerEnded restore worker = snd <$> awaitWorkerCompleted restore worker
+
+-- | The same wait, answering the worker's terminal completion with the interruptions, so that what the worker's own end
+-- failed with (its initialization, its VM's cleanup) is not discarded by a caller that has more to say about the
+-- worker's start.
+awaitWorkerCompleted ∷ (∀ x. IO x → IO x) → SupervisedWorker () → IO (Completion (), [ExceptionWithContext SomeException])
+awaitWorkerCompleted restore worker = go []
   where
     go interruptions =
-      tryWithContext @SomeException (restore (atomically (void (awaitCompletion (supervisedWorker worker))))) >>= \case
-        Right () → pure (reverse interruptions)
+      tryWithContext @SomeException (restore (atomically (awaitCompletion (supervisedWorker worker)))) >>= \case
+        Right completion → pure (completion, reverse interruptions)
         Left interruption → go (interruption : interruptions)
+
+-- | What a worker's terminal completion failed with: its failure or the cancellation that ended it, each with the
+-- context (the origin and the cleanup evidence) it ended with. A success has none.
+workerFailures ∷ Completion r → [ExceptionWithContext SomeException]
+workerFailures completion = case completionResult completion of
+  Succeeded _ → []
+  Failed failure → [failure]
+  Cancelled failure → [failure]
 
 -- | Raise what went wrong, in the order it happened, as one failure: a cancellation, if one was among
 -- them, is the one that propagates (as itself), otherwise the first is, and every other is kept whole as

@@ -264,6 +264,7 @@ module Hetoimasia.Scripting.Lua.Scheduled
 
     -- * Time
   , grantScheduledStep
+  , grantScheduledStepSTM
   , TickWait (..)
   , awaitTicksComplete
   , AccountingWait (..)
@@ -373,7 +374,7 @@ import Hetoimasia.Scripting.Lua.Request (requestContextOf)
 import Hetoimasia.Scripting.Lua.Lending.Loan (Lending, bindLending, sameLending)
 import Hetoimasia.Scripting.Lua.Loading.State (LoaderEndpoint (LoaderEndpoint), LoaderHooks (hookObserved), LoaderPlan (planHooks), LoaderPlanRefused (LoaderPlanRefused), loadingConfig, newLoadingState, validatePlan)
 import Hetoimasia.Scripting.Lua.Scheduled.Run (runScheduledOwner)
-import Hetoimasia.Scripting.Lua.Scheduled.Shared (awaitWorkerEnded, propagateBeside)
+import Hetoimasia.Scripting.Lua.Scheduled.Shared (awaitWorkerCompleted, propagateBeside, workerFailures)
 import Hetoimasia.Scripting.Lua.Scheduled.Types
 import Hetoimasia.Scripting.Lua.Scheduler
   ( AdmitAnswer (Admitted, AdmitRefused)
@@ -724,8 +725,14 @@ startScheduledOwner runtime spec = do
             -- (a failure of the callback is a failure of the host kept beside the failure of the start: it never takes
             -- its place, whatever its type, and it does not skip the wait for the worker)
             told ← tryWithContext @SomeException (scheduledOnStartAbandoned spec)
-            interruptions ← awaitWorkerEnded restore worker
-            propagateBeside [("start abandoned callback", raised) | Left raised ← [told]] (failure : interruptions)
+            (completion, interruptions) ← awaitWorkerCompleted restore worker
+            -- what the worker itself ended with (its initialization or its VM's cleanup failing, once it was let go on)
+            -- is a failure of what was acquired, and is kept beside the failure of the start, never in its place
+            propagateBeside
+              ( [("start abandoned callback", raised) | Left raised ← [told]]
+                  <> [("lua scheduled worker", terminal) | terminal ← workerFailures completion]
+              )
+              (failure : interruptions)
             rethrowIO failure
         case ready of
           Just held → do
@@ -960,7 +967,15 @@ forgetControl (ControlReceipt (ControlTicket _ _ forget)) = atomically forget
 
 -- | Grant a logical step. Never blocks, from any thread.
 grantScheduledStep ∷ ScheduledEndpoint → Duration → IO GrantAnswer
-grantScheduledStep (ScheduledEndpoint control) duration = atomically (grantStep (controlScheduler control) duration)
+grantScheduledStep endpoint = atomically . grantScheduledStepSTM endpoint
+
+-- | The same grant as a transaction, so that an application can decide to grant and grant in one atomic step with state
+-- of its own (D-85): the application's check and the scheduler's acceptance see one snapshot, and a closure of the
+-- application's committed before the transaction is seen by it, and one committed after it finds the grant accepted.
+-- It never retries and never blocks; what it answers is what 'grantScheduledStep' answers, which is this transaction
+-- run by itself.
+grantScheduledStepSTM ∷ ScheduledEndpoint → Duration → STM GrantAnswer
+grantScheduledStepSTM (ScheduledEndpoint control) = grantStep (controlScheduler control)
 
 -- | How a wait for tick completion ended.
 data TickWait

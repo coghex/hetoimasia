@@ -209,14 +209,21 @@ barrier = describe "the all-owner stop barrier" $ do
     ( \(reversed, leaving) →
         it ("hands every constructed owner its stop before the first wait, " <> orderName reversed <> ", the driver " <> leavingName leaving) $
           withSetup (setup (roleScript printScript)) {suReversed = reversed} $ \env → do
+            let world = seWorld env
             recorder ← newRecorder
+            -- the logical owner is parked in a hook of the host: it cannot end, so the teardown has an owner to wait for
+            -- and the first wait is certain to begin; the other role is free to end during the pass
+            holdAt recorder (Dispatched (InstanceKey Gameplay 0))
             holdAt recorder (Awaiting Gameplay)
-            when' (leaving == Threw) (failAt recorder (Intended (InstanceKey Gameplay 0)) (toException (userError "the driver failed")))
+            -- (the driver throws when the other role's init is accounted, which the parked owner never reaches)
+            when' (leaving == Threw) $ do
+              holdAt recorder (Committed "InitSucceeded")
+              failAt recorder (Committed "InitSucceeded") (toException (userError "the driver failed"))
             (ended, session) ← runCaught env (recording recorder []) $ \driver session → do
-              when' (leaving == Cancelled) $ do
-                awaitPhase session Gameplay Running
-                awaitPhase session Presentation Running
-                throwTo driver ThreadKilled
+              awaitPoint recorder (Dispatched (InstanceKey Gameplay 0))
+              case leaving of
+                Cancelled → pumpUntil world (elem "init presentation" <$> outLines world) >> throwTo driver ThreadKilled
+                Threw → releaseHold recorder (Committed "InitSucceeded")
               -- the barrier ran and the first wait is about to begin: both owners have their stop, and nothing is retired
               awaitPoint recorder (Awaiting Gameplay)
               found ← historyNow session
@@ -225,6 +232,7 @@ barrier = describe "the all-owner stop barrier" $ do
               statusStopping status `shouldBe` True
               retiredBoth status `shouldBe` False
               releaseHold recorder (Awaiting Gameplay)
+              releaseHold recorder (Dispatched (InstanceKey Gameplay 0))
             raisedBy leaving ended
             found ← outcomeNow session
             outRetired found `shouldBe` True
@@ -263,16 +271,20 @@ barrier = describe "the all-owner stop barrier" $ do
   describe "with the barrier removed (a negative control)" $ do
     it "hands the innermost scope's owner alone its stop before the first wait, which is what the proof above detects" $
       withSetup (setup (roleScript printScript)) $ \env → do
+        let world = seWorld env
         recorder ← newRecorder
+        -- the innermost scope's owner is parked in a hook of the host, so that scope's wait is certain to begin
+        holdAt recorder (Dispatched (InstanceKey Presentation 0))
         holdAt recorder (Awaiting Presentation)
         (ended, session) ← runCaught env (recording recorder [ProtectBarrier]) $ \driver session → do
-          awaitPhase session Gameplay Running
-          awaitPhase session Presentation Running
+          awaitPoint recorder (Dispatched (InstanceKey Presentation 0))
+          pumpUntil world (elem "init gameplay" <$> outLines world)
           throwTo driver ThreadKilled
           awaitPoint recorder (Awaiting Presentation)
           found ← historyNow session
           historyStopped found `shouldBe` [Presentation]
           releaseHold recorder (Awaiting Presentation)
+          releaseHold recorder (Dispatched (InstanceKey Presentation 0))
         raisedBy Cancelled ended
         -- the other scope stops its owner afterwards, so the session still ends
         found ← outcomeNow session
@@ -337,10 +349,15 @@ waits = describe "masking and waits" $ do
                     Awaiting _ → getMaskingState >>= \state → readIORef states >>= writeIORef states . (<> [state])
                     _ → pure ()
               }
+      let world = seWorld env
+      -- an owner parked in a hook of the host makes the wait certain to happen; it is let go once the wait was observed
+      holdAt recorder (Dispatched (InstanceKey Presentation 0))
       (ended, _) ← runCaught env harness $ \driver session → do
-        awaitPhase session Gameplay Running
-        awaitPhase session Presentation Running
+        awaitPoint recorder (Dispatched (InstanceKey Presentation 0))
+        pumpUntil world (elem "init gameplay" <$> outLines world)
         throwTo driver ThreadKilled
+        awaitPoint recorder (Awaiting Presentation)
+        releaseHold recorder (Dispatched (InstanceKey Presentation 0))
         void (awaitRetired session)
       raisedBy Cancelled ended
       masks ← readIORef states

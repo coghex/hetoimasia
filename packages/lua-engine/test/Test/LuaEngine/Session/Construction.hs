@@ -271,6 +271,24 @@ abandonedStarts = describe "a start that is abandoned part way" $ do
       outcome ← outcomeNow session
       outRetired outcome `shouldBe` True
 
+  it "accounts what the abandoned start's worker itself ended with, as a failure beside the cancellation that abandoned the start" $ do
+    _ ← fatalSetup (setup (roleScript printScript)) $ \env → do
+        let world = seWorld env
+        recorder ← newRecorder
+        holdSink world "held start"
+        let harness = (recordingHarness recorder noHarness) {harnessStartChunk = [(Presentation, "print('held start'); error('start failed after the hold')")]}
+        (ended, session) ← runCaught env harness $ \driver _ → do
+          awaitSinkEntered world "held start"
+          throwTo driver ThreadKilled
+          awaitBlockedOnSTM driver
+          releaseSink world
+        raisedKilled ended `shouldBe` True
+        outcome ← outcomeNow session
+        length [message | message ← outcomeMessages outcome, Text.isInfixOf "start failed after the hold" message] `shouldBe` 1
+        outVerdict outcome `shouldBe` VerdictFailure
+        outRetired outcome `shouldBe` True
+    pure ()
+
   it "accounts a failure of the abandonment's own point as a failure of the host, once, and does not displace the cancellation that abandoned the start" $
     withSetup (setup (roleScript printScript)) $ \env → do
       let world = seWorld env

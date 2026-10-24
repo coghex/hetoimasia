@@ -106,6 +106,9 @@ data Protection
   | -- | The registered peers are handed their stops from inside an abandoned start, before the starter waits for its
     -- worker. Removed, they are handed them after the start has raised.
     ProtectStartAbandon
+  | -- | The check that the logical role takes ticks and the scheduler's acceptance of the grant are one transaction.
+    -- Removed, they are two, with the point 'GrantChecked' between them, so a closure can commit between the two.
+    ProtectGrantAtomic
   deriving (Eq, Show)
 
 -- | The steps a role's VM is made in, and released in the opposite order.
@@ -147,8 +150,12 @@ data Point
   | -- | The dispatch gate opened for an instance, it was released, and its @init@ is about to begin: the
     -- owner's thread is here, and holding it holds the @init@ in flight without running a line of Lua.
     Dispatched !InstanceKey
-  | -- | A tick is about to be granted, the check made and nothing issued.
+  | -- | A tick is about to be granted: nothing checked and nothing issued. The check and the grant are one
+    -- transaction, so there is no point between them.
     GrantIntent !Word64
+  | -- | Only with 'ProtectGrantAtomic' removed: the check was made in one transaction and the grant is about to be
+    -- issued in another.
+    GrantChecked !Word64
   | -- | A tick was granted.
     GrantIssued !Word64
   | -- | The session is closed and its stops are owed, and the all-owner barrier is about to run: this is the point

@@ -6,7 +6,7 @@ module Test.LuaRuntime.Scheduled.Settlement (spec) where
 
 import Control.Concurrent (forkIO, yield)
 import Control.Concurrent.MVar (modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, takeMVar)
-import Control.Concurrent.STM (atomically)
+import Control.Concurrent.STM (atomically, newTVarIO, orElse, readTVarIO, retry, writeTVar)
 import Control.Monad (forM, forM_, replicateM, replicateM_, void)
 import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Owner (BoundaryFault (boundaryReason), FaultReason (ScriptFailed, ValueRefused), FaultKind (CallFailed), ModuleRef (ModuleRef))
@@ -20,7 +20,7 @@ import Hetoimasia.Scripting.Lua.Runtime
 import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Scheduler (ReasonCode (ValidationFault), TaskFailure (failureReasonOf), reasonCode)
 import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
-import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
+import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
 import Test.LuaRuntime.Support (bounded, failExample, Gated (..), requiredPolicy, withBoundary, withBoundaryOpening)
@@ -190,6 +190,32 @@ spec = describe "admission and settlement" $ do
         requestTaskControl (scheduledEndpoint owner) (ticketTask ticket) RequestStop >>= \case
           TaskControlClosed → pure ()
           other → failExample ("expected control to be closed, found " <> show other)
+
+  describe "the grant as a transaction (D-85)" $ do
+    it "answers what the grant does by itself, and composes with the application's own state in one atomic step" $ bounded $ do
+      fixture ← newSFixture
+      withBoundary $ \control runtime → do
+        owner ← startScheduled fixture runtime (scheduled fixture "stm grants" requiredPolicy defaultSchedulerBounds)
+        let endpoint = scheduledEndpoint owner
+            -- the application's own state is written and the grant is made in one transaction, which is undone, with the
+            -- write, when the grant is not accepted
+            composed flag = atomically $ (writeTVar flag True >> grantScheduledStepSTM endpoint (nanoseconds 5) >>= \case
+                                              granted@(GrantAccepted _) → pure (Just granted)
+                                              _ → retry)
+                                          `orElse` pure Nothing
+        open ← newTVarIO False
+        composed open >>= (`shouldBe` Just (GrantAccepted (GrantId 0)))
+        readTVarIO open `shouldReturn` True
+        -- the same grant by itself continues from it: one scheduler, one count
+        grantScheduledStep endpoint (nanoseconds 5) >>= (`shouldBe` GrantAccepted (GrantId 1))
+        retireScheduled owner
+        _ ← awaitScheduledTerminal control owner
+        closed ← newTVarIO False
+        composed closed >>= (`shouldBe` Nothing)
+        -- nothing of the transaction is seen: the write that preceded the refused grant was undone with it
+        readTVarIO closed `shouldReturn` False
+        atomically (grantScheduledStepSTM endpoint (nanoseconds 5)) >>= (`shouldBe` GrantClosed)
+        grantScheduledStep endpoint (nanoseconds 5) >>= (`shouldBe` GrantClosed)
 
   describe "exactly-once settlement under races" $ do
     it "settles every accepted task once across a thousand admissions racing control requests and a stop" $ bounded $ do

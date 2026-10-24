@@ -124,7 +124,7 @@ import Control.Monad (forM, forM_, unless, void, when)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
-import Data.Maybe (catMaybes, isJust, listToMaybe)
+import Data.Maybe (catMaybes, isJust, listToMaybe, mapMaybe)
 import qualified Data.Set as Set
 import Data.Set (Set)
 import Data.Text (Text)
@@ -244,6 +244,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
   , awaitScheduledAccounting
   , cancelScheduled
   , grantScheduledStep
+  , grantScheduledStepSTM
   , retireScheduled
   , scheduledEndpoint
   , scheduledLoaderEndpoint
@@ -483,10 +484,12 @@ evidenceFrom env primary failure@(ExceptionWithContext _ raised) = do
   tails ← if isAsync failure && removed env ProtectCancellationEvidence then pure [] else contextEvidence failure
   pure (head' <> tails)
 
--- | The cleanup failures an exception carries in its context, each as the evidence it is, by the identity it was issued.
+-- | The cleanup failures an exception carries in its context, each as the evidence it is, by the identity it was issued,
+-- whether it is carried by the exception itself, by what the timer's backend raised (which keeps the original and its
+-- context inside), or by a cleanup failure that is itself such a wrapper, to any depth.
 contextEvidence ∷ Caught → IO [Evidence]
 contextEvidence failure =
-  forM (cleanupOf failure) $ \(item, label, ExceptionWithContext _ inner) → do
+  forM (cleanupDeep failure) $ \(item, label, ExceptionWithContext _ inner) → do
     entry ← settledEntry CleanupFailure Nothing OnCleanup (label <> ": " <> Text.pack (displayException inner))
     pure (Evidence (Just (evidenceKeyOf item)) entry)
 
@@ -517,11 +520,31 @@ cleanupOf ∷ Caught → [(CleanupFailureId, Text, Caught)]
 cleanupOf (ExceptionWithContext context _) =
   [(cleanupFailureId item, cleanupFailureLabel item, cleanupFailureException item) | item ← cleanupFailuresInContext context]
 
+-- | The cleanup failures an exception carries and every wrapper of the timer's backend hides, each once by its
+-- identity. A 'BackendRaised' keeps the original exception with the context it carried; whether it is the exception
+-- itself or one of the cleanup failures beside it, what the original carried is carried too.
+cleanupDeep ∷ Caught → [(CleanupFailureId, Text, Caught)]
+cleanupDeep failure = once Set.empty (direct <> concatMap cleanupDeep wrapped)
+  where
+    once _ [] = []
+    once seen (entry@(item, _, _) : rest)
+      | evidenceKeyOf item `Set.member` seen = once seen rest
+      | otherwise = entry : once (Set.insert (evidenceKeyOf item) seen) rest
+    direct = cleanupOf failure
+    wrapped = mapMaybe backendInner (failure : [inner | (_, _, inner) ← direct])
+
+-- | What the timer's backend raised, as the original exception with its context.
+backendInner ∷ Caught → Maybe Caught
+backendInner (ExceptionWithContext _ raised) = case fromException raised of
+  Just (ArmRaised inner) → Just inner
+  Just (CancelRaised inner) → Just inner
+  Nothing → Nothing
+
 -- | Keep what an exception carries raw, so the final exception can carry it, once for each identity.
 keepRaw ∷ Env → Caught → IO ()
 keepRaw env failure =
   modifyIORef' (envRaw env) $ \kept →
-    kept <> [RawEvidence (Just (evidenceKeyOf item)) label inner | (item, label, inner) ← cleanupOf failure, Just (evidenceKeyOf item) `notElem` map reKey kept]
+    kept <> [RawEvidence (Just (evidenceKeyOf item)) label inner | (item, label, inner) ← cleanupDeep failure, Just (evidenceKeyOf item) `notElem` map reKey kept]
 
 -- | The most exceptions the session keeps whole: the first cancellation and the first failure are always kept, and so
 -- is anything while there is room, so that repeated cancellation cannot grow what is kept without end. What an
@@ -1353,7 +1376,7 @@ raiseRetained env = do
     (Nothing, []) → pure ()
   where
     raiseWith chosen retained raws = do
-      let known = Set.fromList [evidenceKeyOf item | kept ← retained, (item, _, _) ← cleanupOf (rtCaught kept)]
+      let known = Set.fromList [evidenceKeyOf item | kept ← retained, (item, _, _) ← cleanupDeep (rtCaught kept)]
           beside = [("lua session", rtCaught other) | other ← retained, rtSerial other /= rtSerial chosen]
           extra = [(label, inner) | RawEvidence key label inner ← raws, maybe True (`Set.notMember` known) key]
       composeCleanup (Just (rtCaught chosen)) (beside <> extra) >>= maybe (rethrowIO (rtCaught chosen)) rethrowIO
@@ -1767,15 +1790,22 @@ act env vms driver = \case
       case startSchedule (harnessTickBase (sxHarness spec)) origin tick of
         Left fault → void (applyEvent session (EngineFault (Just Gameplay) (engineEntry HostFailure (Just Gameplay) OnEngine (pacingFaultText fault))))
         Right schedule → writeIORef (dvSchedule driver) (Just schedule)
-    -- Grant the next tick: the check of the logical role's admission and the issuing. A grant checked just before a
-    -- stop lands is refused by the stopped owner (the grant is closed), so a grant is either issued before the owner
-    -- is stopped or never accepted, and no lock is held across injected work.
+    -- Grant the next tick: the check of the logical role's admission and the scheduler's acceptance are one transaction
+    -- (D-85), so a closure committed before it is seen by it and a grant it accepts was accepted before the closure, and
+    -- no lock is held across injected work. (A negative control makes them two, with a point between.)
     grant current = forM_ (vmOf Gameplay) $ \vm → case nextTickNumber current of
       Left fault → void (applyEvent session (EngineFault (Just Gameplay) (engineEntry HostFailure (Just Gameplay) OnEngine (pacingFaultText fault))))
       Right number → do
         probeAt env (GrantIntent number)
-        open ← atomically (gameplayTakes env)
-        answer ← if open then Just <$> grantScheduledStep (rvEndpoint vm) (scTick current) else pure Nothing
+        answer ←
+          if removed env ProtectGrantAtomic
+            then do
+              open ← atomically (gameplayTakes env)
+              probeAt env (GrantChecked number)
+              if open then Just <$> grantScheduledStep (rvEndpoint vm) (scTick current) else pure Nothing
+            else atomically $ do
+              open ← gameplayTakes env
+              if open then Just <$> grantScheduledStepSTM (rvEndpoint vm) (scTick current) else pure Nothing
         case answer of
           Nothing → pure ()
           Just (GrantAccepted _) → writeIORef (dvInFlight driver) (Just Granted) >> probeAt env (GrantIssued number)

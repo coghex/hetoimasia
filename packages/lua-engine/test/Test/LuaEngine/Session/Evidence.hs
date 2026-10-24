@@ -204,13 +204,14 @@ cancellations = describe "the cleanup a cancellation carries" $ do
       recorder ← newRecorder
       cancelled ← cancellationWith ["carried by the first"]
       failWith recorder (Built Presentation BuildOwner) cancelled
-      holdAt recorder (Awaiting Presentation)
+      -- the teardown's first boundary is always told, and holds the driver while the first cancellation is cleaned up
+      holdAt recorder Unwinding
       (ended, session) ← runCaught env (recording recorder []) $ \driver _ → do
-        awaitPoint recorder (Awaiting Presentation)
+        awaitPoint recorder Unwinding
         -- a second and a third cancellation land while the first is being cleaned up
         throwTo driver ThreadKilled
         throwTo driver ThreadKilled
-        releaseHold recorder (Awaiting Presentation)
+        releaseHold recorder Unwinding
       case ended of
         Left (ExceptionWithContext attached _) → map displayCleanupFailure (cleanupFailuresInContext attached) `shouldSatisfy` any (Text.isInfixOf "carried by the first" . Text.pack)
         Right _ → expectationFailure "the cancellation was lost"
@@ -406,6 +407,47 @@ releases = describe "the cleanup failures a failed release carries" $ do
       found ← outcomeNow session
       outVerdict found `shouldBe` VerdictFailure
       length [entry | entry ← entriesOf found, eeCode entry == CleanupFailure, Text.isInfixOf "pacing timer" (eeMessage entry)] `shouldBe` 1
+
+  it "accounts every cleanup failure the backend's cancel carries when the timer is disposed of with a registration armed, each once" $
+    withSetup (setup (roleScript printScript)) {suShape = GameplayAlone} $ \env → do
+      let world = seWorld env
+      carried ← composedWith "timer cancel failed" ["disposal cleanup one", "disposal cleanup two"]
+      let failing = case worldTimer world of
+            TimerBackend arm → TimerBackend $ \microseconds wake → arm microseconds wake >>= \cancel → pure (cancel >> rethrowIO carried)
+          env' = env {seSpec = (seSpec env) {sxTimer = failing}}
+      (ended, session) ← runCaught env' noHarness $ \driver session → do
+        awaitPhase session Gameplay Running
+        awaitRegistration world 1000
+        -- the driver is cancelled with a registration armed, so the final disposal cancels it and the backend raises
+        throwTo driver ThreadKilled
+        void (awaitRetired session)
+      raisedKilled ended `shouldBe` True
+      found ← outcomeNow session
+      outVerdict found `shouldBe` VerdictFailure
+      mapM_
+        (\wanted → length [entry | entry ← entriesOf found, Text.isInfixOf wanted (eeMessage entry)] `shouldBe` 1)
+        ["timer cancel failed", "disposal cleanup one", "disposal cleanup two"]
+
+  it "accounts the cleanup the hook and the backend each carry when the timer's release fails twice, to any depth" $
+    withSetup (setup (roleScript printScript)) {suShape = GameplayAlone} $ \env → do
+      let world = seWorld env
+      viaBackend ← composedWith "timer cancel failed" ["backend cleanup one", "backend cleanup two"]
+      viaHook ← composedWith "timer hook failed" ["hook cleanup one"]
+      let failing = case worldTimer world of
+            TimerBackend arm → TimerBackend $ \microseconds wake → arm microseconds wake >>= \cancel → pure (cancel >> rethrowIO viaBackend)
+          env' = env {seSpec = (seSpec env) {sxTimer = failing}}
+      recorder ← newRecorder
+      failWith recorder (Released ReleaseTimer) viaHook
+      (ended, session) ← runCaught env' (recording recorder []) $ \driver session → do
+        awaitPhase session Gameplay Running
+        awaitRegistration world 1000
+        throwTo driver ThreadKilled
+        void (awaitRetired session)
+      raisedKilled ended `shouldBe` True
+      found ← outcomeNow session
+      mapM_
+        (\wanted → length [entry | entry ← entriesOf found, Text.isInfixOf wanted (eeMessage entry)] `shouldBe` 1)
+        ["timer cancel failed", "timer hook failed", "backend cleanup one", "backend cleanup two", "hook cleanup one"]
 
   it "accounts the cleanup failures a failing sink's exception carries" $
     withSetup (setup (roleScript printScript)) $ \env → do

@@ -5,7 +5,7 @@
 module Test.LuaRuntime.Scheduled.Creation (spec) where
 
 import Control.Concurrent (forkIO, killThread, throwTo, yield)
-import Control.Concurrent.MVar (isEmptyMVar, newEmptyMVar, putMVar, takeMVar, tryTakeMVar)
+import Control.Concurrent.MVar (isEmptyMVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryTakeMVar)
 import Control.Exception (AsyncException (ThreadKilled, UserInterrupt), SomeException, fromException, throwIO, try)
 import Control.Monad (forM, forM_, replicateM, replicateM_)
 import Data.ByteString (ByteString)
@@ -128,6 +128,32 @@ spec = describe "creation, readiness and identity" $ do
           fromException failure `shouldBe` Just ThreadKilled
           map displayCleanupFailure (cleanupFailures failure) `shouldBe` []
         Right _ → failExample "the start was cancelled and should not have returned an owner"
+
+  it "keeps what the worker itself ended with beside the failure that abandoned the start, whether or not the application is told" $ bounded $ do
+    mapM_
+      ( \(label, hook) → do
+          fixture ← newSFixture
+          returned ← newEmptyMVar
+          -- (the worker's failure is also latched by supervision, which the boundary raises when it closes: not what is
+          -- asserted, and what the boundary raises must not be mistaken for an assertion of this example)
+          _ ← try @SomeException $ withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
+            let config =
+                  (withChunks (initial "fx.block('init'); error('init failed after the hold')") (scheduled fixture label requiredPolicy defaultSchedulerBounds))
+                    {scheduledOnStartAbandoned = hook}
+            starter ← forkIO (try @SomeException (startScheduledOwner runtime config) >>= putMVar returned)
+            awaitEntered fixture "init"
+            -- the start is abandoned while the initialization is held, and the initialization then fails
+            killThread starter
+            releaseGate fixture "init"
+            _ ← readMVar returned
+            pure ()
+          readMVar returned >>= \case
+            Left failure → do
+              fromException failure `shouldBe` Just ThreadKilled
+              map displayCleanupFailure (cleanupFailures failure) `shouldSatisfy` any (isInfixOf "init failed after the hold")
+            Right _ → failExample "the start was cancelled and should not have returned an owner"
+      )
+      [("worker failed, default hook", pure ()), ("worker failed, hook raised", throwIO (userError "the hook failed"))]
 
   it "tells nobody of a start that is not abandoned, and by default nothing" $ bounded $ do
     fixture ← newSFixture
