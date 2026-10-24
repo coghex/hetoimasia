@@ -297,6 +297,27 @@ policy = describe "the failure policy" $ do
     reportAccounted (stEngine state) `shouldBe` 2
     roleFailure' Gameplay state `shouldBe` Just (failure Gameplay OnUpdate "boom")
 
+  it "commits an owner's end once: the claim, every entry and every init its settlements prove, and a second commit adds nothing" $ do
+    let entries = [engineEntry CleanupFailure (Just Gameplay) OnCleanup "first", engineEntry CleanupFailure (Just Gameplay) OnCleanup "second"]
+        ended = OwnerFinalized Gameplay entries [g0]
+        once = applied (validated <> [ended]) both
+        twice = applied (validated <> [ended, ended]) both
+    map eeMessage (erSecondary (stEngine once)) `shouldSatisfy` (\found → "second" `elem` found)
+    stAccounted once `shouldBe` Set.fromList [Gameplay]
+    reportAccounted (stEngine twice) `shouldBe` reportAccounted (stEngine once)
+    -- the init the settlement proves is recorded, with no clock, and opens nothing
+    roleInitializedOf Gameplay once `shouldBe` Just True
+    stStart once `shouldBe` StartShut
+
+  it "latches an instance's failure once, marking it told in the same step, whichever notice comes first" $ do
+    let failed = failure Gameplay OnUpdate "boom"
+        entry = engineEntry CleanupFailure (Just Gameplay) OnShutdown "shutdown failed"
+    -- told as the ending began, then settled: one latch, the settlement adds only what else failed
+    answersOf [InstanceFailing "i" Gameplay failed [], InstanceEscalated "i" Gameplay failed [entry]] both `shouldBe` [Latched True, Done]
+    -- settled without having been told early: latched then, and marked, so a repeat adds nothing
+    answersOf [InstanceEscalated "i" Gameplay failed [], InstanceEscalated "i" Gameplay failed [entry]] both `shouldBe` [Latched True, Done]
+    stEarly (applied [InstanceEscalated "i" Gameplay failed []] both) `shouldBe` Set.fromList ["i"]
+
   it "accounts every engine fault, keeping the first as the primary, sixteen summaries and the count of the rest" $ do
     let faults = [EngineFault (Just Gameplay) (engineEntry CleanupFailure (Just Gameplay) OnCleanup (Text.pack ("cleanup " <> show n))) | n ← [1 .. 40 ∷ Int]]
         state = applied faults both
@@ -419,6 +440,9 @@ invariants = describe "every order of events" $ do
       , Stop StopInterrupt
       , Settled (OweStop Gameplay)
       , Settled (OweStop Presentation)
+      , InstanceFailing "inst" Gameplay (failure Gameplay OnUpdate "g") []
+      , InstanceEscalated "inst" Gameplay (failure Gameplay OnUpdate "g") []
+      , OwnerFinalized Gameplay [engineEntry CleanupFailure (Just Gameplay) OnCleanup "close failed"] [g0]
       ]
 
 -- | Every sequence of up to this many events from a menu.
@@ -454,6 +478,11 @@ violations = go both
         , -- a stop is owed to a role that does not take work, and is dropped only when it is performed or the role has retired
           [ "a stop is owed to a role that takes work" | role ← owedStops afterwards, roleAdmit role afterwards == AdmitOpen ]
         , [ "an owed stop was dropped" | role ← owedStops prior, role `notElem` owedStops afterwards, not (performs event role) ]
+        , -- the claim that an owner was accounted, and the marker that an instance's failure was told, only grow
+          [ "the accounted claim was withdrawn" | not (stAccounted prior `Set.isSubsetOf` stAccounted afterwards) ]
+        , [ "the told marker was withdrawn" | not (stEarly prior `Set.isSubsetOf` stEarly afterwards) ]
+        , -- an owner's end, and what a settlement proves, open no gate
+          [ "an owner's end opened the start gate" | opening, isFinalized event ]
         , -- the pacing origin is recorded by the transition that opens the start gate, once
           [ "the origin changed after it was recorded" | isJust (stOrigin prior), stOrigin afterwards /= stOrigin prior ]
         , [ "the origin was recorded without the gate opening" | stOrigin prior == Nothing, isJust (stOrigin afterwards), not opening ]
@@ -465,6 +494,9 @@ violations = go both
         ]
       where
         opening = stStart afterwards == StartOpen && stStart prior /= StartOpen
+        isFinalized = \case
+          OwnerFinalized {} → True
+          _ → False
         performs by role = case by of
           Settled (OweStop done) → done == role
           RoleRetired done → done == role
