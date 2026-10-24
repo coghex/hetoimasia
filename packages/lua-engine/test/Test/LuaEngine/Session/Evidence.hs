@@ -6,7 +6,8 @@
 module Test.LuaEngine.Session.Evidence (spec) where
 
 import Control.Concurrent (throwTo)
-import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), rethrowIO, throwIO, toException)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
+import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, rethrowIO, throwIO, toException, tryWithContext)
 import Control.Exception.Context (emptyExceptionContext)
 import Control.Monad (void, when)
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -25,6 +26,7 @@ spec = describe "evidence" $ do
   sources
   releases
   histories
+  otherSessions
   it "keeps a role's first failure and its attribution while a later failure of the same role is accounted beside it" $
     withSetup
       ( (setup (roleScript printScript {scInit = [], scUpdate = ["if api.role == 'gameplay' and api.instance_id == 'inst-1' then error('first failure') end"], scShutdown = ["if api.instance_id == 'inst-2' then error('second failure') end"]}))
@@ -146,6 +148,74 @@ cancellationWith ∷ [Text.Text] → IO Caught
 cancellationWith messages =
   composeCleanup (Just (ExceptionWithContext emptyExceptionContext (toException ThreadKilled))) [("release", caught message) | message ← messages]
     >>= maybe (throwIO (userError "no exception was composed")) pure
+
+-- An exception that crosses from one session to another -------------------------------------------------------------------
+
+-- | What the session did with an exception an earlier or an inner session raised, which it catches and raises again: it
+-- is not one this session has accounted, whatever the mark it carries says, so it is accounted and raised as this
+-- session's own.
+otherSessions ∷ Spec
+otherSessions = describe "an exception another session raised" $ do
+  mapM_
+    ( \(label, first) →
+        it ("is accounted and raised again by a later session that catches it and rethrows it from its callback: " <> label) $
+          withSetup (setup (roleScript printScript)) $ \env → do
+            earlier ← tryWithContext @SomeException (runSession (scenarioSpec env noHarness) (\_ → first))
+            carried ← case earlier of
+              Left found → pure found
+              Right _ → throwIO (userError "the first session did not raise")
+            handle ← newEmptyMVar
+            later ← tryWithContext @SomeException (runSession (scenarioSpec env noHarness) (\session → putMVar handle session >> rethrowIO carried))
+            case (later, carried) of
+              (Left (ExceptionWithContext _ raised), ExceptionWithContext _ original) → show raised `shouldBe` show original
+              (Right _, _) → expectationFailure "the second session took the exception for one it had accounted, and returned"
+            session ← readMVar handle
+            found ← outcomeNow session
+            outRetired found `shouldBe` True
+    )
+    [ ("a failure", throwIO (userError "the first session's callback failed"))
+    , ("a cancellation", throwIO ThreadKilled)
+    ]
+
+  it "is not taken for the later session's own timer backend failing when it is one the earlier session's timer backend raised" $
+    withSetup (setup (roleScript printScript)) {suShape = GameplayAlone} $ \env → do
+      let world = seWorld env
+          failing = case worldTimer world of
+            TimerBackend arm → TimerBackend $ \microseconds wake → arm microseconds wake >>= \cancel → pure (cancel >> throwIO (userError "the earlier timer's cancel failed"))
+          env' = env {seSpec = (seSpec env) {sxTimer = failing}}
+      (earlier, _) ← runCaught env' noHarness $ \_ session → do
+        awaitPhase session Gameplay Running
+        awaitRegistration world 1000
+        requestStop session StopQuit
+        void (awaitRetired session)
+      carried ← case earlier of
+        Left found → pure found
+        Right _ → throwIO (userError "the earlier session did not raise the timer backend's failure")
+      handle ← newEmptyMVar
+      later ← tryWithContext @SomeException (runSession (scenarioSpec env noHarness) (\session → putMVar handle session >> rethrowIO carried))
+      case later of
+        Left (ExceptionWithContext _ raised) → show raised `shouldSatisfy` Text.isInfixOf "pacing timer" . Text.pack
+        Right _ → expectationFailure "the later session returned"
+      session ← readMVar handle
+      found ← outcomeNow session
+      -- an exception like any other of this session, not a failure of its own timer's cleanup
+      [() | entry ← entriesOf found, eeCode entry == CleanupFailure, Text.isInfixOf "pacing timer" (eeMessage entry)] `shouldBe` []
+      [() | entry ← entriesOf found, eeCode entry == HostFailure, Text.isInfixOf "the earlier timer's cancel failed" (eeMessage entry)] `shouldSatisfy` (not . null)
+
+  it "is accounted by an outer session when an inner one raises it from the outer session's callback, and the outer outcome is a failure" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      handle ← newEmptyMVar
+      outer ←
+        tryWithContext @SomeException . runSession (scenarioSpec env noHarness) $ \session → do
+          putMVar handle session
+          void (runSession (scenarioSpec env noHarness) (\_ → throwIO (userError "the inner session's callback failed")))
+      case outer of
+        Left (ExceptionWithContext _ raised) → show raised `shouldSatisfy` Text.isInfixOf "the inner session's callback failed" . Text.pack
+        Right _ → expectationFailure "the outer session took the inner session's exception for one it had accounted, and returned"
+      session ← readMVar handle
+      found ← outcomeNow session
+      outVerdict found `shouldBe` VerdictFailure
+      outcomeMessages found `shouldSatisfy` any (Text.isInfixOf "the inner session's callback failed")
 
 -- What a cancellation carries --------------------------------------------------------------------------------------------------
 

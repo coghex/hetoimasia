@@ -122,6 +122,7 @@ import Control.Exception
 import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
 import Control.Exception.Context (addExceptionAnnotation, getExceptionAnnotations)
 import Control.Monad (forM, forM_, unless, void, when)
+import Data.Unique (Unique, newUnique)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (find)
 import qualified Data.Map.Strict as Map
@@ -198,7 +199,7 @@ import Hetoimasia.LuaEngine.Session.Failure
 import Hetoimasia.LuaEngine.Session.Harness
 import Hetoimasia.LuaEngine.Session.Pacing
 import Hetoimasia.LuaEngine.Session.State
-import Hetoimasia.LuaEngine.Session.Timer (BackendRaised (..), Timer, clearTimerWake, disposeTimer, newTimer, syncTimer, timerWoken)
+import Hetoimasia.LuaEngine.Session.Timer (BackendRaised (..), Timer, backendOwner, clearTimerWake, disposeTimer, newTimer, syncTimer, timerWoken)
 import Hetoimasia.LuaEngine.Session.Types
 import Hetoimasia.Runtime.Supervision
   ( Disposition (Required)
@@ -393,13 +394,17 @@ data RawEvidence = RawEvidence !(Maybe EvidenceKey) !Text !Caught
 reKey ∷ RawEvidence → Maybe EvidenceKey
 reKey (RawEvidence key _ _) = key
 
--- | The mark an exception carries once the session has accounted it, so that no scope it passes through accounts it
--- again. Its serial finds the copy the session keeps.
-newtype Accounted = Accounted Int
-  deriving (Show)
+-- | The mark an exception carries once a session has accounted it, so that no scope of that session it passes through
+-- accounts it again. The session's own identity says whose mark it is, and its serial finds the copy that session keeps:
+-- an exception a session raised and another session catches (nested, successive, or rethrown from a callback) carries a
+-- mark that is not the catching session's, which that session has not accounted, and accounts as its own.
+data Accounted = Accounted !Unique !Int
+
+instance Show Accounted where
+  show (Accounted _ serial) = "Accounted #" <> show serial
 
 instance ExceptionAnnotation Accounted where
-  displayExceptionAnnotation (Accounted serial) = "accounted by the session as #" <> show serial
+  displayExceptionAnnotation (Accounted _ serial) = "accounted by a session as #" <> show serial
 
 -- | What every step of the session shares. Nothing here is global: it is made by 'runSession' and
 -- passed to what needs it.
@@ -415,6 +420,8 @@ data Env = Env
   , envRetained ∷ !(IORef [Retained])
   -- ^ Owner: the session's protected paths. Written when an exception is caught on one, read at the very end.
   , envSerial ∷ !(IORef Int)
+  , envIdentity ∷ !Unique
+  -- ^ This run's identity: the marks it makes carry it, and it reads no mark that does not.
   , envRaw ∷ !(IORef [RawEvidence])
   }
 
@@ -469,14 +476,13 @@ sessionGate env role =
 nextSerial ∷ Env → IO Int
 nextSerial env = atomicModifyIORef' (envSerial env) (\n → (n + 1, n))
 
--- | The serial an exception was accounted under, if it was.
-accountedSerial ∷ Caught → Maybe Int
-accountedSerial (ExceptionWithContext context _) = case getExceptionAnnotations context of
-  Accounted serial : _ → Just serial
-  [] → Nothing
+-- | The serial an exception was accounted under by this session, if it was; a mark of another session is not read.
+accountedSerial ∷ Env → Caught → Maybe Int
+accountedSerial env (ExceptionWithContext context _) =
+  listToMaybe [serial | Accounted identity serial ← getExceptionAnnotations context, identity == envIdentity env]
 
-mark ∷ Int → Caught → Caught
-mark serial (ExceptionWithContext context exception) = ExceptionWithContext (addExceptionAnnotation (Accounted serial) context) exception
+mark ∷ Env → Int → Caught → Caught
+mark env serial (ExceptionWithContext context exception) = ExceptionWithContext (addExceptionAnnotation (Accounted (envIdentity env) serial) context) exception
 
 -- | The engine entry for a text, forced before it is committed: a message whose rendering raises is replaced by a
 -- statement of that, so that the evaluation of a user's formatter is never part of accounting, and a thunk never
@@ -497,8 +503,9 @@ evidenceFrom env primary failure@(ExceptionWithContext _ raised) = do
     if not primary
       then pure []
       else case fromException raised of
-        Just backend → backendEvidence env backend
-        Nothing
+        -- (only the run's own timer's failure: one that reached it from another run is an exception like any other)
+        Just backend | backendOwner backend == envIdentity env → backendEvidence env backend
+        _
           | isAsync failure → pure []
           | otherwise → (\entry → [evidenceOf entry]) <$> settledEntry HostFailure Nothing OnEngine (Text.pack (displayException raised))
   -- (a negative control removes the accounting of what a cancellation carries)
@@ -527,11 +534,11 @@ caughtEvidence code role stage label failure@(ExceptionWithContext _ raised) = d
 -- of its arm a failure of the host, and what either carried is accounted beside it.
 backendEvidence ∷ Env → BackendRaised → IO [Evidence]
 backendEvidence _ = \case
-  CancelRaised inner@(ExceptionWithContext _ raised) → do
+  CancelRaised _ inner@(ExceptionWithContext _ raised) → do
     entry ← settledEntry CleanupFailure Nothing OnCleanup ("pacing timer: " <> Text.pack (displayException raised))
     carried ← contextEvidence inner
     pure (evidenceOf entry : carried)
-  ArmRaised inner@(ExceptionWithContext _ raised) → do
+  ArmRaised _ inner@(ExceptionWithContext _ raised) → do
     entry ← settledEntry HostFailure Nothing OnEngine ("the pacing timer's backend raised when it was armed: " <> Text.pack (displayException raised))
     carried ← contextEvidence inner
     pure (evidenceOf entry : carried)
@@ -557,8 +564,8 @@ cleanupDeep failure = once Set.empty (direct <> concatMap cleanupDeep wrapped)
 -- | What the timer's backend raised, as the original exception with its context.
 backendInner ∷ Caught → Maybe Caught
 backendInner (ExceptionWithContext _ raised) = case fromException raised of
-  Just (ArmRaised inner) → Just inner
-  Just (CancelRaised inner) → Just inner
+  Just (ArmRaised _ inner) → Just inner
+  Just (CancelRaised _ inner) → Just inner
   Nothing → Nothing
 
 -- | Keep what an exception carries raw, so the final exception can carry it, once for each identity.
@@ -585,7 +592,7 @@ store env item = modifyIORef' (envRetained env) $ \kept →
 -- thread right after the commit; its own failure is retained without a further probe.
 adopt ∷ Env → Caught → IO Caught
 adopt env failure = mask_ $ do
-  marked ← case accountedSerial failure of
+  marked ← case accountedSerial env failure of
     Just serial → do
       modifyIORef' (envRetained env) (map (\kept → if rtSerial kept == serial then kept {rtCaught = failure} else kept))
       evidence ← evidenceFrom env False failure
@@ -594,7 +601,7 @@ adopt env failure = mask_ $ do
       pure failure
     Nothing → do
       serial ← nextSerial env
-      let marked = mark serial failure
+      let marked = mark env serial failure
       evidence ← evidenceFrom env True failure
       store env (Retained serial marked)
       keepRaw env failure
@@ -618,7 +625,7 @@ boundary env point = tryWithContext @SomeException (probeAt env point) >>= eithe
 retainQuiet ∷ Env → Caught → IO ()
 retainQuiet env failure = mask_ $ do
   serial ← nextSerial env
-  let marked = mark serial failure
+  let marked = mark env serial failure
   evidence ← evidenceFrom env True failure
   store env (Retained serial marked)
   keepRaw env failure
@@ -1347,8 +1354,9 @@ runSession spec onReady = do
   tracked ← newTVarIO Map.empty
   retained ← newIORef []
   serial ← newIORef 0
+  identity ← newUnique
   raw ← newIORef []
-  let env = Env spec session limits ids seen tracked (Map.fromList [(riRole info, info) | info ← roles]) retained serial raw
+  let env = Env spec session limits ids seen tracked (Map.fromList [(riRole info, info) | info ← roles]) retained serial identity raw
   -- The outer continuation is installed before the handle is given away, before any diagnostic, clock or construction.
   mask $ \restore → do
     registerSessionRelease env ReleaseComposition (sessionRelease session ReleaseComposition)
@@ -1453,7 +1461,7 @@ preflight env roles
 operate ∷ Env → [RoleVm] → IO ()
 operate env vms = do
   timer ← mask_ $ do
-    made ← newTimer (sxTimer (envSpec env))
+    made ← newTimer (envIdentity env) (sxTimer (envSpec env))
     registerSessionRelease env ReleaseTimer (sessionRelease (envSession env) ReleaseTimer `both` disposeTimer made)
     pure made
   driver ←

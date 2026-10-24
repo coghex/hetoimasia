@@ -20,6 +20,7 @@
 module Hetoimasia.LuaEngine.Session.Timer
   ( Timer
   , BackendRaised (..)
+  , backendOwner
   , newTimer
   , syncTimer
   , disposeTimer
@@ -32,6 +33,7 @@ import Control.Exception (Exception (displayException), ExceptionWithContext (Ex
 import Control.Monad (when)
 import Data.Foldable (traverse_)
 import Data.Text (Text)
+import Data.Unique (Unique)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Time (Duration, Instant, MonotonicSource, deadlineReached, readInstant, remainingUntil)
@@ -42,11 +44,20 @@ import Hetoimasia.Scripting.Lua.Scheduler (TimerBackend (..), registrationMicros
 -- action itself throws is a failure of that cleanup, as the foundation's contract has it for a release). The timer
 -- raises it as a synchronous exception that keeps the original, with the context it carried, and says which call it
 -- came from, so that the driver's accounting cannot mistake it for a cancellation of the caller.
+--
+-- It names the timer's owner, the run that made the timer, so that one that reaches another run (rethrown from a
+-- callback, say) is not mistaken there for that run's own backend failing.
 data BackendRaised
   = -- | The backend's arm raised.
-    ArmRaised !(ExceptionWithContext SomeException)
+    ArmRaised !Unique !(ExceptionWithContext SomeException)
   | -- | The cancel action it handed out raised.
-    CancelRaised !(ExceptionWithContext SomeException)
+    CancelRaised !Unique !(ExceptionWithContext SomeException)
+
+-- | The run whose timer's backend raised it.
+backendOwner ∷ BackendRaised → Unique
+backendOwner = \case
+  ArmRaised owner _ → owner
+  CancelRaised owner _ → owner
 
 instance Show BackendRaised where
   show = Text.unpack . describeRaised
@@ -56,8 +67,8 @@ instance Exception BackendRaised where
 
 describeRaised ∷ BackendRaised → Text
 describeRaised = \case
-  ArmRaised (ExceptionWithContext _ raised) → "the pacing timer's backend raised when it was armed: " <> Text.pack (displayException raised)
-  CancelRaised (ExceptionWithContext _ raised) → "the pacing timer's backend raised when a registration was cancelled: " <> Text.pack (displayException raised)
+  ArmRaised _ (ExceptionWithContext _ raised) → "the pacing timer's backend raised when it was armed: " <> Text.pack (displayException raised)
+  CancelRaised _ (ExceptionWithContext _ raised) → "the pacing timer's backend raised when a registration was cancelled: " <> Text.pack (displayException raised)
 
 -- | Run the backend's call, and keep what it raised, whole, as what the backend raised.
 guardBackend ∷ (ExceptionWithContext SomeException → BackendRaised) → IO a → IO a
@@ -80,11 +91,13 @@ data Timer = Timer
   { timerBackend ∷ !TimerBackend
   , timerState ∷ !(TVar TimerState)
   , timerFlag ∷ !(TVar Bool)
+  , timerOwner ∷ !Unique
+  -- ^ The run that made the timer: what a failure of its backend is marked with.
   }
 
 -- | A timer with nothing armed.
-newTimer ∷ TimerBackend → IO Timer
-newTimer backend = Timer backend <$> newTVarIO (TimerState 0 Nothing Nothing False) <*> newTVarIO False
+newTimer ∷ Unique → TimerBackend → IO Timer
+newTimer owner backend = Timer backend <$> newTVarIO (TimerState 0 Nothing Nothing False) <*> newTVarIO False <*> pure owner
 
 -- | Whether a wake has arrived that has not been looked at.
 timerWoken ∷ Timer → STM Bool
@@ -120,7 +133,7 @@ arm timer deadline remaining = uninterruptibleMask_ $ do
     writeTVar (timerState timer) state {tsGeneration = issued, tsLive = Just (Registration issued deadline), tsCancel = Nothing}
     pure issued
   cancel ←
-    guardBackend ArmRaised (backendArm (timerBackend timer) (registrationMicroseconds remaining) (wake timer generation))
+    guardBackend (ArmRaised (timerOwner timer)) (backendArm (timerBackend timer) (registrationMicroseconds remaining) (wake timer generation))
       `onException` atomically (forget timer generation)
   atomically $ do
     state ← readTVar (timerState timer)
@@ -146,7 +159,7 @@ cancelLive timer = uninterruptibleMask_ $ do
     state ← readTVar (timerState timer)
     writeTVar (timerState timer) state {tsLive = Nothing, tsCancel = Nothing}
     pure (tsCancel state)
-  traverse_ (guardBackend CancelRaised) cancel
+  traverse_ (guardBackend (CancelRaised (timerOwner timer))) cancel
 
 -- | End the timer for good: cancel what is armed and ignore every wake and every request to arm.
 disposeTimer ∷ Timer → IO ()
@@ -156,4 +169,4 @@ disposeTimer timer = uninterruptibleMask_ $ do
     writeTVar (timerState timer) state {tsLive = Nothing, tsCancel = Nothing, tsDisposed = True}
     writeTVar (timerFlag timer) False
     pure (tsCancel state)
-  traverse_ (guardBackend CancelRaised) cancel
+  traverse_ (guardBackend (CancelRaised (timerOwner timer))) cancel
