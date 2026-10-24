@@ -56,6 +56,9 @@ data Harness = Harness
   , harnessOwner ∷ Role → OwnerHandles → IO ()
   -- ^ Told, on the thread that registered an owner, once it is registered: what a test needs to stop or cancel that
   -- owner from outside the session, as another party would. It runs no Lua and must not block.
+  , harnessStartChunk ∷ ![(Role, String)]
+  -- ^ Lua a role's VM runs in its initialization, before its owner is ready: a test holds it in the authored output
+  -- to hold the start of that owner in its readiness wait.
   , harnessHideSettlement ∷ InstanceKey → Bool
   -- ^ Injects a fault of the host's contract: the instance's settlement is treated as missing when its owner has ended.
   , harnessRemoved ∷ ![Protection]
@@ -66,7 +69,7 @@ data Harness = Harness
 
 -- | A harness with nothing in it.
 noHarness ∷ Harness
-noHarness = Harness [] 0 (const (pure ())) (const (pure ())) (\_ _ → pure ()) (const False) []
+noHarness = Harness [] 0 (const (pure ())) (const (pure ())) (\_ _ → pure ()) [] (const False) []
 
 -- | What a party outside the session can do to an owner it did not make.
 data OwnerHandles = OwnerHandles
@@ -100,6 +103,9 @@ data Protection
     ProtectReleaseSource
   | -- | Every wait of the protocol is interruptible. Removed, the wait for an owner is uninterruptibly masked.
     ProtectInterruptibleWait
+  | -- | The registered peers are handed their stops from inside an abandoned start, before the starter waits for its
+    -- worker. Removed, they are handed them after the start has raised.
+    ProtectStartAbandon
   deriving (Eq, Show)
 
 -- | The steps a role's VM is made in, and released in the opposite order.
@@ -120,6 +126,9 @@ data Release
 data Point
   = -- | A step of a role's construction is about to be acquired, and nothing of it exists yet.
     Acquiring !Role !BuildStep
+  | -- | A role's start is abandoned, on the starter's thread: the session is closed and every registered peer has been
+    -- handed its stop, and the starter has not yet begun to wait for its worker to end.
+    StartAbandoned !Role
   | -- | A step of a role's construction has completed, and what it made is registered with the session's
     -- lifecycle record: from here a failure or a stop finds it.
     Built !Role !BuildStep

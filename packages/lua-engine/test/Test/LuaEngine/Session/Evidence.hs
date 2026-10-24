@@ -6,12 +6,13 @@
 module Test.LuaEngine.Session.Evidence (spec) where
 
 import Control.Concurrent (throwTo)
-import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), throwIO, toException)
+import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), rethrowIO, throwIO, toException)
 import Control.Exception.Context (emptyExceptionContext)
-import Control.Monad (void)
+import Control.Monad (void, when)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as Text
+import Hetoimasia.Foundation.Log (LogEntry (entryMessage), callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, composeCleanup, displayCleanupFailure)
 import Hetoimasia.Scripting.Lua.Scheduler (TimerBackend (..))
 import Test.Hspec
@@ -22,6 +23,7 @@ spec = describe "evidence" $ do
   cancellations
   rawCompletions
   sources
+  releases
   histories
   it "keeps a role's first failure and its attribution while a later failure of the same role is accounted beside it" $
     withSetup
@@ -324,6 +326,96 @@ sources = describe "where a failure comes from" $ do
             Map.member (InstanceKey Gameplay 0) (historyFacts kept) `shouldBe` not hidden
       )
       [(True, VerdictFailure), (False, VerdictSuccess)]
+
+-- What a failed release carries --------------------------------------------------------------------------------------------------
+
+-- | An exception that carries these cleanup failures beside itself, as a release does that unwound through scopes.
+composedWith ∷ Text.Text → [Text.Text] → IO Caught
+composedWith primary carried =
+  composeCleanup (Just (caught primary)) [("inner release", caught message) | message ← carried]
+    >>= maybe (throwIO (userError "no exception was composed")) pure
+
+releases ∷ Spec
+releases = describe "the cleanup failures a failed release carries" $ do
+  it "accounts the release's own failure and every cleanup failure it carries, each once, when the session ends normally" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      recorder ← newRecorder
+      carried ← composedWith "the facade's release failed" ["first carried", "second carried", "third carried"]
+      failWith recorder (Released (ReleaseBuild Gameplay BuildFacade)) carried
+      (ended, session) ← runCaught env (recording recorder []) $ \_ session → do
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        requestStop session StopQuit
+        void (awaitStatus session (maybe False ((== Retired) . rolePhase) . presentationOf))
+      ended `shouldSatisfy` either (const False) (const True)
+      found ← outcomeNow session
+      length (entriesOf found) `shouldBe` 4
+      length [entry | entry ← entriesOf found, Text.isInfixOf "carried" (eeMessage entry)] `shouldBe` 3
+      length [entry | entry ← entriesOf found, Text.isInfixOf "the facade's release failed" (eeMessage entry)] `shouldBe` 1
+
+  it "accounts the same when the driver is cancelled, and raises the cancellation with all of it beside it" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      recorder ← newRecorder
+      carried ← composedWith "the facade's release failed" ["first carried", "second carried"]
+      failWith recorder (Released (ReleaseBuild Gameplay BuildFacade)) carried
+      (ended, session) ← runCaught env (recording recorder []) $ \driver session → do
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        throwTo driver ThreadKilled
+        void (awaitStatus session (maybe False ((== Retired) . rolePhase) . presentationOf))
+      raisedKilled ended `shouldBe` True
+      found ← outcomeNow session
+      length (entriesOf found) `shouldBe` 3
+      case ended of
+        Left (ExceptionWithContext attached _) → map displayCleanupFailure (cleanupFailuresInContext attached) `shouldSatisfy` any (Text.isInfixOf "first carried" . Text.pack)
+        Right _ → expectationFailure "the cancellation was lost"
+
+  it "accounts both the hook and the backend when the timer's release fails twice, as the two halves of one release" $
+    withSetup (setup (roleScript printScript)) {suShape = GameplayAlone} $ \env → do
+      let world = seWorld env
+          failing = case worldTimer world of
+            TimerBackend arm → TimerBackend $ \microseconds wake → arm microseconds wake >>= \cancel → pure (cancel >> throwIO (userError "timer cancel failed"))
+          env' = env {seSpec = (seSpec env) {sxTimer = failing}}
+      recorder ← newRecorder
+      failAt recorder (Released ReleaseTimer) (toException (userError "timer hook failed"))
+      (ended, session) ← runCaught env' (recording recorder []) $ \driver session → do
+        awaitPhase session Gameplay Running
+        awaitRegistration world 1000
+        throwTo driver ThreadKilled
+        void (awaitRetired session)
+      raisedKilled ended `shouldBe` True
+      found ← outcomeNow session
+      outcomeMessages found `shouldSatisfy` any (Text.isInfixOf "timer hook failed")
+      outcomeMessages found `shouldSatisfy` any (Text.isInfixOf "timer cancel failed")
+
+  it "counts a cancel the pacing timer's backend raises while the session runs as a failure of that cleanup, even of an asynchronous type, and not as a cancellation" $
+    withSetup (setup (roleScript printScript)) {suShape = GameplayAlone} $ \env → do
+      let world = seWorld env
+          failing = case worldTimer world of
+            TimerBackend arm → TimerBackend $ \microseconds wake → arm microseconds wake >>= \cancel → pure (cancel >> throwIO ThreadKilled)
+          env' = env {seSpec = (seSpec env) {sxTimer = failing}}
+      (ended, session) ← runCaught env' noHarness $ \_ session → do
+        awaitPhase session Gameplay Running
+        awaitRegistration world 1000
+        -- the stop closes the logical role's ticks, and the driver cancels the registration it armed
+        requestStop session StopQuit
+        void (awaitRetired session)
+      -- what the backend raised is raised as itself, a failure of the cleanup, not as a cancellation of the caller
+      raisedKilled ended `shouldBe` False
+      raisedMessage ended `shouldSatisfy` Text.isInfixOf "pacing timer"
+      found ← outcomeNow session
+      outVerdict found `shouldBe` VerdictFailure
+      length [entry | entry ← entriesOf found, eeCode entry == CleanupFailure, Text.isInfixOf "pacing timer" (eeMessage entry)] `shouldBe` 1
+
+  it "accounts the cleanup failures a failing sink's exception carries" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      carried ← composedWith "the sink failed" ["sink cleanup one", "sink cleanup two"]
+      let logger = mkLogger defaultLogFilter . callbackSink $ \entry → when (entryMessage entry == "session starting") (rethrowIO carried)
+          env' = env {seSpec = (seSpec env) {sxLogger = logger}}
+      (_, session) ← runCaught env' noHarness $ \_ session → void (awaitStatus session statusStopping)
+      found ← outcomeNow session
+      outcomeMessages found `shouldSatisfy` any (Text.isInfixOf "sink cleanup one")
+      outcomeMessages found `shouldSatisfy` any (Text.isInfixOf "sink cleanup two")
 
 -- What the settlements prove -----------------------------------------------------------------------------------------------------
 

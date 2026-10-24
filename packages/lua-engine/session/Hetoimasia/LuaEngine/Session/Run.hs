@@ -197,7 +197,7 @@ import Hetoimasia.LuaEngine.Session.Failure
 import Hetoimasia.LuaEngine.Session.Harness
 import Hetoimasia.LuaEngine.Session.Pacing
 import Hetoimasia.LuaEngine.Session.State
-import Hetoimasia.LuaEngine.Session.Timer (Timer, clearTimerWake, disposeTimer, newTimer, syncTimer, timerWoken)
+import Hetoimasia.LuaEngine.Session.Timer (BackendRaised (..), Timer, clearTimerWake, disposeTimer, newTimer, syncTimer, timerWoken)
 import Hetoimasia.LuaEngine.Session.Types
 import Hetoimasia.Runtime.Supervision
   ( Disposition (Required)
@@ -228,7 +228,7 @@ import Hetoimasia.Scripting.Lua.Instance
   , pollInstance
   , releaseHeldInstance
   )
-import Hetoimasia.Scripting.Lua.Owner (LibraryProfile (LibraryProfileM1), VmConfig (vmOwnerName), newModulePhase, vmProfileConfig)
+import Hetoimasia.Scripting.Lua.Owner (LibraryProfile (LibraryProfileM1), VmConfig (vmInitialChunks, vmOwnerName), chunkName, newModulePhase, vmProfileConfig)
 import Hetoimasia.Scripting.Lua.Provider (RequestGrant (..), RequestTiming (SettleAtAssignedTick, SettleOnArrival))
 import Hetoimasia.Scripting.Lua.Scheduled
   ( AccountingWait (AccountingComplete, AccountingOwnerEnded)
@@ -309,9 +309,10 @@ stopPassOf session roles = mask_ $ do
         -- A coordinator that is registered before its owner exists is closed now, and the stop stays owed to the
         -- owner, which the pass made when it is registered will find.
         Right () → when (isJust (regCompletion registered)) (void (commit session (StopHanded role)))
-        Left (ExceptionWithContext _ raised) → do
+        Left defect@(ExceptionWithContext _ raised) → do
           entry ← settledEntry HostFailure (Just role) OnEngine ("the owner could not be asked to stop: " <> Text.take 512 (Text.pack (displayException raised)))
-          void (commit session (StopDefect role entry))
+          carried ← contextEvidence defect
+          void (commit session (StopDefect role entry carried))
 
 -- | The stops owed that the pass has not already found defective: a primitive that raised is attempted once, recorded,
 -- kept owed and never retried, so a defect cannot make the pass spin.
@@ -466,19 +467,50 @@ settledEntry code role stage text =
 
 -- | The evidence a caught exception carries: its cleanup failures, each by the identity it already had, and, for
 -- an exception that is not a cancellation, the exception itself as a failure of the engine. A cancellation is not a
--- failure of the engine.
+-- failure of the engine. What the timer's backend raised is a failure of that cleanup or of the backend, whatever its
+-- type, because it was raised, not delivered.
 evidenceFrom ∷ Env → Bool → Caught → IO [Evidence]
 evidenceFrom env primary failure@(ExceptionWithContext _ raised) = do
   head' ←
-    if primary && not (isAsync failure)
-      then (\entry → [evidenceOf entry]) <$> settledEntry HostFailure Nothing OnEngine (Text.pack (displayException raised))
-      else pure []
+    if not primary
+      then pure []
+      else case fromException raised of
+        Just backend → backendEvidence env backend
+        Nothing
+          | isAsync failure → pure []
+          | otherwise → (\entry → [evidenceOf entry]) <$> settledEntry HostFailure Nothing OnEngine (Text.pack (displayException raised))
   -- (a negative control removes the accounting of what a cancellation carries)
-  let carried = if isAsync failure && removed env ProtectCancellationEvidence then [] else cleanupOf failure
-  tails ← forM carried $ \(item, label, ExceptionWithContext _ inner) → do
+  tails ← if isAsync failure && removed env ProtectCancellationEvidence then pure [] else contextEvidence failure
+  pure (head' <> tails)
+
+-- | The cleanup failures an exception carries in its context, each as the evidence it is, by the identity it was issued.
+contextEvidence ∷ Caught → IO [Evidence]
+contextEvidence failure =
+  forM (cleanupOf failure) $ \(item, label, ExceptionWithContext _ inner) → do
     entry ← settledEntry CleanupFailure Nothing OnCleanup (label <> ": " <> Text.pack (displayException inner))
     pure (Evidence (Just (evidenceKeyOf item)) entry)
-  pure (head' <> tails)
+
+-- | What an injected callback or release raised, as evidence: the exception itself under this code, stage and label,
+-- and every cleanup failure its context carries, each by its identity. The one place a caught failure of the session's
+-- own cleanup, a stop, a sink or a settlement becomes evidence, so that none of them drops what it carried.
+caughtEvidence ∷ FailureCode → Maybe Role → FailureStage → Text → Caught → IO [Evidence]
+caughtEvidence code role stage label failure@(ExceptionWithContext _ raised) = do
+  primary ← settledEntry code role stage (label <> ": " <> Text.pack (displayException raised))
+  carried ← contextEvidence failure
+  pure (evidenceOf primary : carried)
+
+-- | What the timer's backend raised, whole: a failure of the backend's cancel is a failure of that cleanup, a failure
+-- of its arm a failure of the host, and what either carried is accounted beside it.
+backendEvidence ∷ Env → BackendRaised → IO [Evidence]
+backendEvidence _ = \case
+  CancelRaised inner@(ExceptionWithContext _ raised) → do
+    entry ← settledEntry CleanupFailure Nothing OnCleanup ("pacing timer: " <> Text.pack (displayException raised))
+    carried ← contextEvidence inner
+    pure (evidenceOf entry : carried)
+  ArmRaised inner@(ExceptionWithContext _ raised) → do
+    entry ← settledEntry HostFailure Nothing OnEngine ("the pacing timer's backend raised when it was armed: " <> Text.pack (displayException raised))
+    carried ← contextEvidence inner
+    pure (evidenceOf entry : carried)
 
 -- | The cleanup failures an exception carries, with the identities they were issued.
 cleanupOf ∷ Caught → [(CleanupFailureId, Text, Caught)]
@@ -791,7 +823,10 @@ withRoleVm env info body = do
           pure made
         probeAt env (Built role BuildFacade)
         let base = (vmProfileConfig LibraryProfileM1) {vmOwnerName = "session-" <> roleWord role}
-        config ← either (refuse "the facade's installation" . Text.pack . show) pure (installFacade facade [] [] base)
+            -- (a test's chunk runs after the facade rebinds @print@, so that it can be held in the authored output)
+            started = [(chunkName "harness start", Text.encodeUtf8 (Text.pack source)) | (which, source) ← harnessStartChunk harness, which == role]
+        installed ← either (refuse "the facade's installation" . Text.pack . show) pure (installFacade facade [] [] base)
+        let config = installed {vmInitialChunks = vmInitialChunks installed <> started}
         let Count live = countLimit profile InstancesPerVm
             Count perVm = countLimit profile RequestsPerVm
             liveBound = fromIntegral live
@@ -820,6 +855,7 @@ withRoleVm env info body = do
                 , scheduledClock = sxClock spec
                 , scheduledTimer = sxTimer spec
                 , scheduledRefusedWait = facadeRefusedWait facade
+                , scheduledOnStartAbandoned = if removed env ProtectStartAbandon then pure () else abandonedStart env role
                 }
         withOwner env info owned coordinator holder facade body
   where
@@ -828,6 +864,15 @@ withRoleVm env info body = do
     profile = sxProfile spec
     role = riRole info
     refuse what why = throwIO (SessionRefused (what <> " was refused: " <> why))
+
+-- | Told, on the starter's thread, when this role's start is abandoned (D-82/T1): the session closes and every
+-- registered peer is handed its stop now, before the starter waits for its partly started worker to end. The point
+-- is told afterwards, so a test holds the starter here and finds the receipts.
+abandonedStart ∷ Env → Role → IO ()
+abandonedStart env role = do
+  void (commit (envSession env) Unwind)
+  stopPass (envSession env)
+  probeAt env (StartAbandoned role)
 
 -- | Start a role's owner, register it with the lifecycle record in the same masked step, run a body, and on every
 -- way out run the session's protocol before the scopes it borrows from are released.
@@ -991,9 +1036,9 @@ finalizeRole env role = mask_ $ do
       Right (Just _) | sessionHidden session (hdKey item) → missing item
       Right (Just settlement) → pure (Just (hdKey item, factOf settlement), [])
       Right Nothing → missing item
-      Left (ExceptionWithContext _ raised) → do
-        entry ← settledEntry HostFailure (Just role) OnEngine ("an instance's settlement could not be read: " <> Text.take 512 (Text.pack (displayException raised)))
-        pure (Nothing, [evidenceOf entry])
+      Left unread → do
+        evidence ← caughtEvidence HostFailure (Just role) OnEngine "an instance's settlement could not be read" unread
+        pure (Nothing, evidence)
   ended ← maybe (pure []) completionEvidence completion
   forM_ completion (keepCompletion env)
   let evidence = ended <> concatMap snd proven
@@ -1065,9 +1110,9 @@ runReleases ∷ Env → Role → IO ()
 runReleases env role = mask_ $ do
   registry ← readTVarIO (sessionRegistry session)
   failures ← attemptAll env (maybe [] regReleases (Map.lookup role (regRoles registry)))
-  evidence ← forM failures $ \(label, failure@(ExceptionWithContext _ raised)) → do
+  evidence ← fmap concat . forM failures $ \(label, failure) → do
     modifyIORef' (envRaw env) (<> [RawEvidence Nothing label failure])
-    evidenceOf <$> settledEntry CleanupFailure (Just role) OnCleanup (label <> ": " <> Text.pack (displayException raised))
+    caughtEvidence CleanupFailure (Just role) OnCleanup label failure
   void (commit session (ReleasesDone role evidence))
   where
     session = envSession env
@@ -1081,9 +1126,9 @@ runSessionReleases env = mask_ $ do
     writeTVar (sessionRegistry session) registry {regSession = []}
     pure (regSession registry)
   failures ← attemptAll env releases
-  evidence ← forM failures $ \(label, failure@(ExceptionWithContext _ raised)) → do
+  evidence ← fmap concat . forM failures $ \(label, failure) → do
     modifyIORef' (envRaw env) (<> [RawEvidence Nothing label failure])
-    evidenceOf <$> settledEntry CleanupFailure Nothing OnCleanup (label <> ": " <> Text.pack (displayException raised))
+    caughtEvidence CleanupFailure Nothing OnCleanup label failure
   unless (null evidence) (void (commit session (Account evidence)))
   where
     session = envSession env
@@ -1176,7 +1221,8 @@ forwardOne env diag = mask $ \restore → do
           | otherwise → do
               void (commit session (DiagDone (dgId diag)))
               entry ← settledEntry HostFailure Nothing OnEngine ("a diagnostic could not be written: " <> Text.take 512 (Text.pack (displayException raised)))
-              Nothing <$ commit session (DiagnosticFailed entry)
+              carried ← contextEvidence failure
+              Nothing <$ commit session (DiagnosticFailed entry carried)
   where
     session = envSession env
     write (Say level message fields) = (case level of SayInfo → logInfo; SayError → logError) (sessionLogger session) sessionComponent message fields
@@ -1441,28 +1487,43 @@ admitRole env vm = forM_ [0 .. riInstances (rvInfo vm) - 1] (admitOne env vm)
 
 admitOne ∷ Env → RoleVm → Int → IO ()
 admitOne env vm slot = mask $ \restore → do
-  granted ← applyEvent session (Intend role)
+  -- The intent is a recovery-style commit: no probe is told inside it. From the moment it is committed it is resolved
+  -- exactly once, by being tracked or abandoned, whatever follows it (the probe beside it included), so the role can
+  -- always retire.
+  granted ← commit session (Intend role)
   unless (granted == Refused) $ do
-    declared ←
-      declareInstance (rvFacade vm) (riContent info) >>= \case
-        Left refused → abandon Nothing >> throwIO (SessionRefused ("an instance could not be declared: " <> Text.pack (show refused)))
-        Right found → pure found
-    restore (probeAt env (Intended key)) `onFailure` abandon (Just (declaredId declared))
-    admitted ← admitBehaviorInstance (rvEndpoint vm) (request declared) `onFailure` abandon (Just (declaredId declared))
-    case admitted of
-      InstanceAccepted identity ticket → do
-        -- The owner may already be starting the instance; its first hook waits for the tracking below, so
-        -- nothing it does can run before it is tracked, whatever lands in this window.
-        let track = do
-              atomically (modifyTVar' (envTracked env) (Map.insert identity (Held key identity ticket (declaredId declared))))
-              void (commit session (Tracked role))
-        restore (probeAt env (Issued key)) `finally` track
-        restore (probeAt env (Tracking key))
-      other → do
-        abandon (Just (declaredId declared))
-        case other of
-          InstanceAdmissionClosed → pure ()
-          _ → throwIO (SessionRefused ("an instance was not admitted: " <> Text.pack (take 200 (show other))))
+    settled ← newIORef False
+    identity ← newIORef Nothing
+    let abandon = do
+          already ← atomicModifyIORef' settled (\done → (True, done))
+          unless already $ do
+            readIORef identity >>= mapM_ (forgetInstance (rvFacade vm))
+            void (commit session (Abandoned role))
+        protected action = tryWithContext @SomeException action >>= either (\failure → abandon >> rethrowIO failure) pure
+    protected $ do
+      restore (probeAt env (Committed "Intend"))
+      declared ←
+        declareInstance (rvFacade vm) (riContent info) >>= \case
+          Left refused → throwIO (SessionRefused ("an instance could not be declared: " <> Text.pack (show refused)))
+          Right found → pure found
+      writeIORef identity (Just (declaredId declared))
+      restore (probeAt env (Intended key))
+      admitted ← admitBehaviorInstance (rvEndpoint vm) (request declared)
+      case admitted of
+        InstanceAccepted found ticket → do
+          -- The owner may already be starting the instance; its first hook waits for the tracking below, so
+          -- nothing it does can run before it is tracked, whatever lands in this window.
+          let track = do
+                atomically (modifyTVar' (envTracked env) (Map.insert found (Held key found ticket (declaredId declared))))
+                already ← atomicModifyIORef' settled (\done → (True, done))
+                unless already (void (commit session (Tracked role)))
+          restore (probeAt env (Issued key)) `finally` track
+          restore (probeAt env (Tracking key))
+        other → do
+          abandon
+          case other of
+            InstanceAdmissionClosed → pure ()
+            _ → throwIO (SessionRefused ("an instance was not admitted: " <> Text.pack (take 200 (show other))))
   where
     session = envSession env
     info = rvInfo vm
@@ -1471,10 +1532,6 @@ admitOne env vm slot = mask $ \restore → do
     request declared =
       behaviorRequest role (moduleIdentity (riEntry info)) (riEntryPath info) (declaredFacade declared) (Just (declaredId declared)) ordinary
     ordinary = OrdinaryClass
-    abandon identity = do
-      forM_ identity (forgetInstance (rvFacade vm))
-      void (commit session (Abandoned role))
-    onFailure action cleanup = tryWithContext @SomeException action >>= either (\failure → cleanup >> rethrowIO failure) pure
 
 -- Driving ------------------------------------------------------------------------------------------------------
 

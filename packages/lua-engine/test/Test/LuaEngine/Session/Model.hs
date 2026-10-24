@@ -599,7 +599,7 @@ teardown = describe "the teardown" $ do
     owedStops (applied [OwnerFinalized Presentation [] [], Unwind] stopped) `shouldBe` [Gameplay]
 
   it "records a stop primitive that raised once, keeps the stop owed and never retries it in the model" $ do
-    let defect = StopDefect Gameplay (engineEntry HostFailure (Just Gameplay) OnEngine "the stop raised")
+    let defect = StopDefect Gameplay (engineEntry HostFailure (Just Gameplay) OnEngine "the stop raised") []
         state = applied [defect, defect] gameplayOnly
     reportAccounted (stEngine state) `shouldBe` 1
     owedStops state `shouldBe` [Gameplay]
@@ -654,7 +654,7 @@ teardown = describe "the teardown" $ do
           , RoleRetired Gameplay
           , StopHanded Gameplay
           , Account [Evidence (listToMaybe keys) (engineEntry CleanupFailure Nothing OnCleanup "carried")]
-          , StopDefect Gameplay (engineEntry HostFailure (Just Gameplay) OnEngine "the stop raised")
+          , StopDefect Gameplay (engineEntry HostFailure (Just Gameplay) OnEngine "the stop raised") []
           ]
         starting = acquired
         broken = [(events, why) | events ← sequencesOf menu' 5, let why = violationsFrom starting events, not (null why)]

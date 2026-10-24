@@ -400,8 +400,9 @@ data Event
     ReleasesDone !Role ![Evidence]
   | -- | A stop was handed to its owner.
     StopHanded !Role
-  | -- | A stop primitive raised: recorded once, and the stop stays owed.
-    StopDefect !Role !EngineEntry
+  | -- | A stop primitive raised: recorded once, with the cleanup failures its exception carried, and the stop stays
+    -- owed.
+    StopDefect !Role !EngineEntry ![Evidence]
   | -- | A diagnostic was taken to be written: it must be pending.
     DiagClaim !Int
   | -- | A diagnostic was written, or given up.
@@ -413,8 +414,9 @@ data Event
     -- are new is decided in the step.
     Account ![Evidence]
   | -- | A diagnostic could not be written. It is a failure of the engine, recorded without a diagnostic of its own, so
-    -- a sink that always raises cannot make the session say more and more about it.
-    DiagnosticFailed !EngineEntry
+    -- a sink that always raises cannot make the session say more and more about it. The cleanup failures the sink's
+    -- exception carried are accounted with it.
+    DiagnosticFailed !EngineEntry ![Evidence]
   | -- | The engine, the host, a provider, a sink or cleanup failed, concerning this role's owner when
     -- one is known.
     EngineFault !(Maybe Role) !EngineEntry
@@ -504,7 +506,7 @@ diagnostics event before after answer =
       InstanceFailing {} → True
       InstanceEscalated {} → True
       Terminal _ → True
-      DiagnosticFailed _ → True
+      DiagnosticFailed {} → True
       _ → False
     failed role failure =
       Say
@@ -577,9 +579,11 @@ transition event state = case event of
      in quiet next
   StopHanded role →
     quiet (adjustRole role (\found → found {rsStopHanded = True}) state {stStops = Seq.filter (/= role) (stStops state)})
-  StopDefect role entry
+  StopDefect role entry carried
     | Set.member role (stStopDefects state) → quiet state
-    | otherwise → engineFault (Just role) entry state {stStopDefects = Set.insert role (stStopDefects state)}
+    | otherwise →
+        let (marked, _) = engineFault (Just role) entry state {stStopDefects = Set.insert role (stStopDefects state)}
+         in quiet (fst (accountEvidence (Just role) carried marked))
   DiagClaim identity → case findDiag identity state of
     Just diag | dgState diag == DiagPending → quiet (setDiag identity DiagInFlight state)
     _ → (state, Refused)
@@ -588,7 +592,9 @@ transition event state = case event of
     Just diag | dgState diag == DiagInFlight → quiet (setDiag identity DiagInterrupted state)
     _ → quiet state
   Account evidence → quiet (fst (accountEvidence Nothing evidence state))
-  DiagnosticFailed entry → engineFault Nothing entry state
+  DiagnosticFailed entry carried →
+    let (marked, _) = engineFault Nothing entry state
+     in quiet (fst (accountEvidence Nothing carried marked))
   EngineFault role entry → engineFault role entry state
   Stop kind →
     let marked = case kind of
@@ -792,12 +798,12 @@ eventName = \case
   Drained _ → "Drained"
   ReleasesDone _ _ → "ReleasesDone"
   StopHanded _ → "StopHanded"
-  StopDefect _ _ → "StopDefect"
+  StopDefect {} → "StopDefect"
   DiagClaim _ → "DiagClaim"
   DiagDone _ → "DiagDone"
   DiagInterrupt _ → "DiagInterrupt"
   Account _ → "Account"
-  DiagnosticFailed _ → "DiagnosticFailed"
+  DiagnosticFailed {} → "DiagnosticFailed"
   EngineFault _ _ → "EngineFault"
   Stop _ → "Stop"
   Terminal _ → "Terminal"

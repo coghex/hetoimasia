@@ -492,6 +492,14 @@ data ScheduledSpec = ScheduledSpec
     -- dependency's verified source and resume on the owner's thread. 'Nothing', the default, gives
     -- the owner none. It is the owner's loader, so the owner's VM configuration may not name one
     -- ('Hetoimasia.Scripting.Lua.Owner.vmLoader'). See "Hetoimasia.Scripting.Lua.Loading".
+  , scheduledOnStartAbandoned ∷ IO ()
+    -- ^ Told once, on the starter's thread, when a start that has not handed out an owner is
+    -- abandoned (its readiness wait failed or was cancelled, and the creator is about to be handed
+    -- the failure): after the worker was asked to stop and before the starter waits for that worker to
+    -- have ended, which a worker held in its initialization can make long. It is for an application
+    -- that owns other owners the failure must stop first. It runs masked, so it must be finite and
+    -- must not wait; what it raises is kept as a failure of the host beside the failure of the start.
+    -- The default does nothing.
   }
 
 -- | A configuration with the supplied defaults: the FIFO policy, the production
@@ -519,6 +527,7 @@ scheduledSpec config worker bounds =
     , scheduledRequestHandles = Nothing
     , scheduledSubscriptions = Nothing
     , scheduledLoader = Nothing
+    , scheduledOnStartAbandoned = pure ()
     }
 
 -- | How many live members an owner's collection holds by default.
@@ -711,8 +720,10 @@ startScheduledOwner runtime spec = do
           Right found → pure found
           Left failure → do
             stopSupervised worker
+            -- the application is told before the starter waits, so what it must stop first is stopped first
+            told ← tryWithContext @SomeException (scheduledOnStartAbandoned spec)
             interruptions ← awaitWorkerEnded restore worker
-            propagateAll (failure : interruptions)
+            propagateAll (failure : either pure (const []) told <> interruptions)
             rethrowIO failure
         case ready of
           Just held → do

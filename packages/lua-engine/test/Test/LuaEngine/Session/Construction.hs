@@ -96,6 +96,8 @@ spec = describe "construction" $ do
   cancellation
   drainage
   acquisition
+  abandonedStarts
+  intents
   registrations
   callbacks
   drainProof
@@ -237,6 +239,96 @@ acquisition = describe "failing or cancelled at each step of the acquisition" $
       Map.null (historyFacts history) `shouldBe` True
       status ← statusNow session
       retiredBoth status `shouldBe` True
+
+-- A start that is abandoned ----------------------------------------------------------------------------------------------------
+
+abandonedStarts ∷ Spec
+abandonedStarts = describe "a start that is abandoned part way" $ do
+  it "hands every registered peer its stop from inside the abandonment, before the starter waits for its worker to end" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      let world = seWorld env
+      recorder ← newRecorder
+      -- the presentation owner's start is held in its readiness wait, inside the authored output
+      holdSink world "held start"
+      holdAt recorder (StartAbandoned Presentation)
+      let harness = (recordingHarness recorder noHarness) {harnessStartChunk = [(Presentation, "print('held start')")]}
+      (ended, session) ← runCaught env harness $ \driver session → do
+        awaitSinkEntered world "held start"
+        throwTo driver ThreadKilled
+        -- the starter is in its hook, which runs before it begins to wait for the held worker: the peer has its stop
+        awaitPoint recorder (StartAbandoned Presentation)
+        found ← historyNow session
+        historyStopped found `shouldBe` [Gameplay]
+        status ← statusNow session
+        statusStopping status `shouldBe` True
+        releaseHold recorder (StartAbandoned Presentation)
+        releaseSink world
+      raisedKilled ended `shouldBe` True
+      outcome ← outcomeNow session
+      outRetired outcome `shouldBe` True
+
+  describe "with the abandonment not told (a negative control)" $
+    it "leaves the peer unstopped for as long as the starter waits for its held worker, which the proof above detects" $
+      withSetup (setup (roleScript printScript)) $ \env → do
+        let world = seWorld env
+        recorder ← newRecorder
+        holdSink world "held start"
+        let harness = (recordingHarness recorder noHarness) {harnessStartChunk = [(Presentation, "print('held start')")], harnessRemoved = [ProtectStartAbandon]}
+        (ended, session) ← runCaught env harness $ \driver session → do
+          awaitSinkEntered world "held start"
+          throwTo driver ThreadKilled
+          -- the starter has stopped its worker and waits for it, held in the output: nobody has stopped the peer
+          awaitBlockedOnSTM driver
+          found ← historyNow session
+          historyStopped found `shouldBe` []
+          points ← recorded recorder
+          [() | StartAbandoned _ ← points] `shouldBe` []
+          releaseSink world
+        raisedKilled ended `shouldBe` True
+        -- the guard around the start stops the peer once the starter returns, so the session still ends
+        outcome ← outcomeNow session
+        outRetired outcome `shouldBe` True
+
+-- The intent of an admission, from its commit ----------------------------------------------------------------------------------
+
+intents ∷ Spec
+intents = describe "the intent of an admission" $ do
+  it "is resolved, and every role retires, when the probe beside its commit throws" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      recorder ← newRecorder
+      failAt recorder (Committed "Intend") (toException (userError "the probe failed"))
+      (ended, session) ← runCaught env (recordingHarness recorder noHarness) $ \_ session → void (awaitStatus session statusStopping)
+      raisedMessage ended `shouldSatisfy` Text.isInfixOf "the probe failed"
+      outcome ← outcomeNow session
+      outRetired outcome `shouldBe` True
+      history ← historyNow session
+      Map.null (historyFacts history) `shouldBe` True
+
+  it "is resolved, and every role retires, when the driver is cancelled right after its commit" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      recorder ← newRecorder
+      holdAt recorder (Committed "Intend")
+      (ended, session) ← runCaught env (recordingHarness recorder noHarness) $ \driver _ → do
+        awaitPoint recorder (Committed "Intend")
+        throwTo driver ThreadKilled
+      raisedKilled ended `shouldBe` True
+      outcome ← outcomeNow session
+      outRetired outcome `shouldBe` True
+      outVerdict outcome `shouldBe` VerdictSuccess
+
+  it "is resolved when the probe beside the second role's intent throws, with the first role's root already tracked" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      recorder ← newRecorder
+      -- the second Intend: let the first through by failing only once the gameplay root is tracked
+      holdAt recorder (Tracking (InstanceKey Gameplay 0))
+      (ended, session) ← runCaught env (recordingHarness recorder noHarness) $ \_ session → do
+        awaitPoint recorder (Tracking (InstanceKey Gameplay 0))
+        failAt recorder (Committed "Intend") (toException (userError "the second probe failed"))
+        releaseHold recorder (Tracking (InstanceKey Gameplay 0))
+        void (awaitStatus session statusStopping)
+      raisedMessage ended `shouldSatisfy` Text.isInfixOf "the second probe failed"
+      outcome ← outcomeNow session
+      outRetired outcome `shouldBe` True
 
 -- | A harness that records, with this protection removed, and tells where the owners can be stopped from outside.
 registrationControl ∷ Recorder → TVar (Map.Map Role OwnerHandles) → Harness
