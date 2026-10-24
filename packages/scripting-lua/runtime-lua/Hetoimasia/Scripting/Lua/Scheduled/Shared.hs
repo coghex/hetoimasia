@@ -15,6 +15,7 @@ module Hetoimasia.Scripting.Lua.Scheduled.Shared
   , waitReportFor
   , awaitWorkerEnded
   , propagateAll
+  , propagateBeside
   ) where
 
 import Control.Exception
@@ -140,10 +141,17 @@ awaitWorkerEnded restore worker = go []
 -- them, is the one that propagates (as itself), otherwise the first is, and every other is kept whole as
 -- cleanup evidence beside it. Nothing to raise returns.
 propagateAll ∷ [ExceptionWithContext SomeException] → IO ()
-propagateAll failures = case lookup chosen indexed of
+propagateAll = propagateBeside []
+
+-- | The same, with failures of the application's own callbacks that are kept beside whatever is raised and are never
+-- the one raised, whatever their type: an exception of an asynchronous type that a callback itself threw was not
+-- delivered to the creator, so it is evidence of that callback's failure, not a cancellation. Nothing to raise (no
+-- failure of the start) returns, and the callbacks' failures with it.
+propagateBeside ∷ [(Text, ExceptionWithContext SomeException)] → [ExceptionWithContext SomeException] → IO ()
+propagateBeside evidence failures = case lookup chosen indexed of
   Nothing → pure ()
   Just primary →
-    composeCleanup (Just primary) [("lua scheduled owner", failure) | (index, failure) ← indexed, index /= chosen]
+    composeCleanup (Just primary) ([("lua scheduled owner", failure) | (index, failure) ← indexed, index /= chosen] <> evidence)
       >>= maybe (rethrowIO primary) rethrowIO
   where
     indexed = zip [0 ∷ Int ..] failures

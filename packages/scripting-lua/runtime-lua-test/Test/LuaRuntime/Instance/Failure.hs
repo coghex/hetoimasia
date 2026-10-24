@@ -4,7 +4,7 @@
 module Test.LuaRuntime.Instance.Failure (spec) where
 
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException)
-import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, retry)
+import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
 import Data.Maybe (isJust)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Resource (cleanupFailureLabel, cleanupFailuresInContext)
@@ -120,6 +120,57 @@ spec = describe "failure" $ do
       awaitEffect (sf fixture) "init 2"
       expectDelivered fixture owner "b" 1
       awaitEffect (sf fixture) "tick 2 n=1 seq=0 t=0 count=1"
+
+  it "tells the application of a failure as the ending begins, once, before the shutdown runs, and tells it again when the instance has settled" $ bounded $ do
+    fixture ← newIFixture
+    early ← newTVarIO []
+    late ← newTVarIO []
+    let config =
+          (testConfig instanceBounds')
+            { instanceOnFailing = \failure → logged fixture >>= \seen → atomically (modifyTVar' early ((failure, seen) :))
+            , instanceEscalate = \failure → atomically (modifyTVar' late (failure :)) >> pure Isolate
+            }
+    withBoundary $ \_ runtime → do
+      owner ← startInstances fixture runtime "early notice" [failCallback] config requiredPolicy
+      _ ← admit fixture owner "a" (moduleNamed "failcallback")
+      awaitPhase fixture owner "a" Active
+      expectDelivered fixture owner "a" 1
+      settled ← awaitSettled fixture "a"
+      identity ← idOf fixture "a"
+      told ← atomically (readTVar late >>= \seen → if null seen then retry else pure seen)
+      map failureInstance told `shouldBe` [identity]
+      held ← atomically (readTVar early)
+      case held of
+        [(failure, seen)] → do
+          failureInstance failure `shouldBe` identity
+          failureStage failure `shouldBe` StageEvent "tick"
+          failureMessage failure `shouldSatisfy` Text.isInfixOf "callback boom"
+          length (failureSecondary failure) `shouldBe` 0
+          -- told before the instance's shutdown ran
+          seen `shouldSatisfy` notElem "shutdown 1 failed"
+        other → failExample ("expected one early notice, found " <> show (length other))
+      terminationShutdown (resultTermination settled) `shouldBe` ShutdownRan
+      logged fixture >>= (`shouldSatisfy` elem "shutdown 1 failed")
+
+  it "does not tell the application early of a failure that arises only as the instance settles" $ bounded $ do
+    fixture ← newIFixture
+    early ← newTVarIO (0 ∷ Int)
+    late ← newTVarIO []
+    let config =
+          (testConfig instanceBounds')
+            { instanceOnFailing = \_ → atomically (modifyTVar' early (+ 1))
+            , instanceEscalate = \failure → atomically (modifyTVar' late (failure :)) >> pure Isolate
+            }
+    withBoundary $ \_ runtime → do
+      owner ← startInstances fixture runtime "late failure" [yieldShutdown] config requiredPolicy
+      _ ← admit fixture owner "a" (moduleNamed "yieldshutdown")
+      awaitPhase fixture owner "a" Active
+      settleControl fixture owner "a" InstanceStop >>= (`shouldBe` ControlApplied)
+      settled ← awaitSettled fixture "a"
+      resultPhase settled `shouldBe` Failed
+      told ← atomically (readTVar late >>= \seen → if null seen then retry else pure seen)
+      map failureStage told `shouldBe` [StageShutdown]
+      readTVarIO early >>= (`shouldBe` 0)
 
   it "fails an instance whose callback asked for a wait the scheduler refused, runs its shutdown, and leaves its peer running" $ bounded $ do
     fixture ← newIFixture
