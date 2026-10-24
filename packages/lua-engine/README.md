@@ -1330,6 +1330,8 @@ Every change to the session is one `Event` committed by one masked primitive, `a
 * an effect that **raises** is recorded as a failure of the engine (a diagnostic that cannot be written is recorded without a diagnostic of its own, so a sink that always raises cannot loop), the effect is given up and the queue goes on;
 * an effect whose performer is **interrupted** leaves a stop owed and puts a diagnostic back at the front, and the interruption is raised after the state is consistent;
 * the commit is masked: the only interruptible points are the blocking steps inside an effect.
+* **a recovery or cancellation path only commits.** The paths that run when something has already gone wrong or the calling thread is being cancelled (the queue's own recovery, the owner scope's unwind and finalization, the retirement sweep, the recording of a composition failure) commit their event and never run the queue: the next normal step runs it, or the one final drain that `runSession` makes after the cancellation has propagated out of every scope and the retirements are published. Stops run before diagnostics, so a diagnostic that blocks cannot delay an owner's stop, and a stop that failed is settled before its failure is committed, so nothing is retried;
+* **a failure and all the cleanup failures attached to it are one event**, committed whole before any effect runs.
 
 So an event is never half applied and nothing it owed is lost: the harness's `Committed` point sits between the commit and its effects, and the examples cancel the committer there, inside a stop and inside a diagnostic.
 
