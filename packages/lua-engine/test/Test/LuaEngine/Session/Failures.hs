@@ -10,15 +10,16 @@
 module Test.LuaEngine.Session.Failures (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
+import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVarIO, writeTVar)
 import Control.Concurrent (forkIO, myThreadId, throwTo)
-import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, displayException, fromException, throwIO, toException, tryWithContext)
+import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, displayException, fromException, throwIO, toException, try, tryWithContext)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, displayCleanupFailure)
-import Control.Monad (void)
+import Control.Monad (void, when)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Data.List (isInfixOf)
-import Hetoimasia.Foundation.Log (unsafeComponent)
+import Hetoimasia.Foundation.Log (LogEntry (entryMessage), Logger, callbackSink, defaultLogFilter, mkLogger, unsafeComponent)
 import Hetoimasia.Foundation.Worker (workerDefinition)
 import Hetoimasia.Runtime.Supervision (Disposition (Required), Recognition (Unrecognized), Role (Service), SupervisedStart (WorkerStarted), WorkerPolicy (..), startSupervised)
 import Test.Hspec
@@ -338,6 +339,98 @@ hostFailures = describe "of the host" $ do
           Right _ → expectationFailure "the cancellation was lost"
     pure ()
 
+  mapM_
+    ( \message →
+        it ("finishes every teardown step when a cancellation lands and the diagnostic sink raises for \"" <> Text.unpack message <> "\"") $ do
+          _ ←
+            fatalSetup (setup (roleScript suspending)) {suShape = GameplayAlone} $ \env → do
+              let world = seWorld env
+              armed ← newTVarIO False
+              let env' = env {seSpec = (seSpec env) {sxLogger = throwingLogger armed message}}
+              recorder ← newRecorder
+              holdAt recorder (GrantIntent 2)
+              self ← myThreadId
+              handle ← newEmptyMVar
+              _ ← forkIO $ do
+                session ← readMVar handle
+                awaitPhase session Gameplay Running
+                awaitRegistration world 1000
+                passTime world 1000000 (elem "suspended" <$> outLines world)
+                nudge world 1000000
+                awaitPoint recorder (GrantIntent 2)
+                atomically (writeTVar armed True)
+                throwTo self ThreadKilled
+                void (awaitStatus session statusStopping)
+                releaseHold recorder (GrantIntent 2)
+              result ← tryWithContext @SomeException (runSession (scenarioSpec env' (recordingHarness recorder noHarness)) (putMVar handle))
+              case result of
+                Left (ExceptionWithContext attached raised) → do
+                  -- the cancellation is what is raised, with the owner's retained cleanup beside it
+                  fromException raised `shouldBe` Just ThreadKilled
+                  map displayCleanupFailure (cleanupFailuresInContext attached) `shouldSatisfy` any ("close failed" `isInfixOf`)
+                Right _ → expectationFailure "the cancellation was lost"
+              -- the drain was reached and the role retired, whatever the sink did
+              points ← recorded recorder
+              points `shouldSatisfy` elem (Draining Gameplay)
+              session ← readMVar handle
+              status ← statusNow session
+              fmap rolePhase (gameplayOf status) `shouldBe` Just Retired
+              -- and the cleanup was accounted once, even when writing about it failed
+              found ← atomically (sessionOutcomeNow session)
+              length [entry | entry ← maybe [] pure (erPrimary (outEngine found)) <> erSecondary (outEngine found), eeCode entry == CleanupFailure, Text.isInfixOf "close failed" (eeMessage entry)] `shouldBe` 1
+          pure ()
+    )
+    ["session stopping", "session engine failure"]
+
+  mapM_
+    ( \message →
+        it ("records a driver failure and every retained cleanup when the diagnostic sink raises for \"" <> Text.unpack message <> "\"") $ do
+          _ ←
+            fatalSetup (setup (roleScript suspending)) {suShape = GameplayAlone} $ \env → do
+              let world = seWorld env
+              armed ← newTVarIO True
+              let env' = env {seSpec = (seSpec env) {sxLogger = throwingLogger armed message}}
+              recorder ← newRecorder
+              failAt recorder (GrantIntent 2) (toException (userError "the driver failed"))
+              outcome ← runScenarioWith env' (recordingHarness recorder noHarness) $ \session → do
+                awaitPhase session Gameplay Running
+                awaitRegistration world 1000
+                passTime world 1000000 (elem "suspended" <$> outLines world)
+                nudge world 1000000
+                void (awaitRetired session)
+              let entries = maybe [] pure (erPrimary (outEngine outcome)) <> erSecondary (outEngine outcome)
+              outVerdict outcome `shouldBe` VerdictFailure
+              outRetired outcome `shouldBe` True
+              fmap eeCode (erPrimary (outEngine outcome)) `shouldBe` Just HostFailure
+              length [entry | entry ← entries, eeCode entry == CleanupFailure, Text.isInfixOf "close failed" (eeMessage entry)] `shouldBe` 1
+              entries `shouldSatisfy` any (Text.isInfixOf "a diagnostic could not be written" . eeMessage)
+          pure ()
+    )
+    ["session stopping", "session engine failure", "session ended"]
+
+  it "keeps the success of an init the driver was not looking at when the session is cancelled instead of resumed" $
+    withSetup ((setup (roleScript printScript {scUpdate = ["error('the first refresh fails')"]})) {suShape = PresentationAlone}) $ \env → do
+      let world = seWorld env
+      recorder ← newRecorder
+      holdAt recorder (Resumed (InstanceKey Presentation 0))
+      self ← myThreadId
+      handle ← newEmptyMVar
+      _ ← forkIO $ do
+        session ← readMVar handle
+        awaitPoint recorder (Resumed (InstanceKey Presentation 0))
+        pumpUntil world (elem "init presentation" <$> outLines world)
+        awaitRegistration world 1000000
+        passTime world 1000000000 (maybe False roleFailed . presentationOf <$> statusNow session)
+        throwTo self ThreadKilled
+      result ← try (runSession (scenarioSpec env (recordingHarness recorder noHarness)) (putMVar handle))
+      case result of
+        Left (found ∷ SomeException) → fromException found `shouldBe` Just ThreadKilled
+        Right _ → expectationFailure "the cancellation was lost"
+      session ← readMVar handle
+      status ← statusNow session
+      fmap roleInitialized (presentationOf status) `shouldBe` Just True
+      fmap rolePhase (presentationOf status) `shouldBe` Just Retired
+
   it "ends the session when the host fails while the entries are still being evaluated, before any root is dispatched" $ do
     _ ←
       fatalSetup (setup (roleScript printScript {scPrelude = ["print('load')"]})) $ \env → do
@@ -372,6 +465,13 @@ hostFailures = describe "of the host" $ do
           fmap eeCode (erSecondary (outEngine outcome)) `shouldSatisfy` (CleanupFailure `elem`)
     pure ()
   where
+    -- A logger whose sink raises, once armed, for the entries with this message.
+    throwingLogger ∷ TVar Bool → Text → Logger
+    throwingLogger armed message =
+      mkLogger defaultLogFilter . callbackSink $ \entry →
+        when (entryMessage entry == message) $ do
+          live ← readTVarIO armed
+          when live (throwIO (userError "the diagnostic sink failed"))
     suspending =
       printScript
         { scInit = []

@@ -241,7 +241,13 @@ sessionComponent = unsafeComponent "luaengine.session"
 -- The handoff runs masked. The one place it can be interrupted is a blocking step inside a stop (the grant
 -- lock), and an interruption there leaves the stop owed.
 applyEvent ∷ Session → Event → IO Answer
-applyEvent session event = mask_ $ do
+applyEvent = applyEventWith True
+
+-- | The same, saying what the transition meant (or not). A diagnostic is an injected effect that can fail: a
+-- failure to write one is recorded as a failure of the engine (in the state, without trying to write about it) and
+-- never raised from here, so it cannot keep the caller from the obligations that follow the transition.
+applyEventWith ∷ Bool → Session → Event → IO Answer
+applyEventWith loud session event = mask_ $ do
   (before, after, answer) ← atomically $ do
     current ← readTVar (sessionState session)
     let (next, found, _) = step event current
@@ -249,8 +255,20 @@ applyEvent session event = mask_ $ do
     pure (current, next, found)
   -- The owners are asked to stop first, and what the transition meant is said afterwards, so a diagnostic that
   -- cannot be written never keeps an owner from being asked.
-  dischargeStops session `finally` report session event before after answer
+  dischargeStops session `finally` when loud (diagnose session (report session event before after answer))
   pure answer
+
+-- | Run an action that writes a diagnostic. A failure other than an interruption is not raised: it is recorded in the
+-- state as a failure of the engine, which ends the session, and the caller goes on.
+diagnose ∷ Session → IO () → IO ()
+diagnose session action =
+  tryWithContext @SomeException action >>= \case
+    Right () → pure ()
+    Left failure@(ExceptionWithContext _ raised)
+      | isAsync failure → rethrowIO failure
+      | otherwise →
+          void . applyEventWith False session . EngineFault Nothing $
+            engineEntry HostFailure Nothing OnEngine ("a diagnostic could not be written: " <> Text.take 512 (Text.pack (displayException raised)))
 
 -- | Perform every stop the session owes whose owner exists, and record each as done. Idempotent: what stops an
 -- owner can be run twice.
@@ -634,11 +652,11 @@ withOwner env info owned coordinator holder facade body = mask $ \restore → do
       -- However the scope is left, the owner's completion is accounted (once, whichever path finds it first) and the
       -- coordinator drained before anything the owner or its reads borrow is released and before the role can be
       -- published as retired. Both go on through interruptions, as the wait for the owner does.
-      completion ← accountOwner env info owner
+      (completion, accounting) ← finalizeOwner env info owner
       draining ← tryWithContext @SomeException (probeAt env (Draining role))
       drained ← awaitDrainedThrough restore coordinator
       released ← tryWithContext @SomeException (probeAt env (Released role BuildOwner))
-      let failures = [f | Left f ← [outcome]] <> stopped <> interruptions <> [f | Left f ← [draining]] <> drained <> [f | Left f ← [released]]
+      let failures = [f | Left f ← [outcome]] <> stopped <> interruptions <> accounting <> [f | Left f ← [draining]] <> drained <> [f | Left f ← [released]]
           -- what the owner ended with travels beside whatever is raised, whole
           evidence =
             [(cleanupFailureLabel item, cleanupFailureException item) | item ← completionCleanup completion]
@@ -725,23 +743,28 @@ runSession spec onReady = do
   accounted ← newTVarIO Set.empty
   let env = Env spec session limits ids seen tracked accounted early (Map.fromList [(riRole info, info) | info ← roles])
   onReady session
-  logInfo (sxLogger spec) sessionComponent "session starting" [("roles", Text.intercalate "," (map (roleWord . riRole) roles))]
+  diagnose session (logInfo (sxLogger spec) sessionComponent "session starting" [("roles", Text.intercalate "," (map (roleWord . riRole) roles))])
   result ← tryWithContext @SomeException $ case refusal of
     Just why → void (applyEvent session (EngineFault Nothing (engineEntry HostFailure Nothing OnEngine why)))
     Nothing → conduct env roles
   case result of
     Right () → pure ()
     Left failure
-      | isAsync failure → sweepRetired session >> rethrowIO failure
+      | isAsync failure → do
+          -- the cancellation is what is raised; whatever publishing the retirements raised is kept beside it
+          swept ← sweepRetired session
+          composeCleanup (Just failure) [("lua session", other) | other ← swept] >>= maybe (rethrowIO failure) rethrowIO
       | otherwise → recordFailure env failure
-  sweepRetired session
-  outcome ← atomically (outcomeOf <$> readTVar cell)
-  logInfo
-    (sxLogger spec)
-    sessionComponent
-    "session ended"
-    [("verdict", Text.pack (show (outVerdict outcome))), ("failures", Text.pack (show (length (outFailures outcome))))]
-  pure outcome
+  swept ← sweepRetired session
+  forM_ swept (recordFailure env)
+  diagnose session $ do
+    ended ← atomically (outcomeOf <$> readTVar cell)
+    logInfo
+      (sxLogger spec)
+      sessionComponent
+      "session ended"
+      [("verdict", Text.pack (show (outVerdict ended))), ("failures", Text.pack (show (length (outFailures ended))))]
+  atomically (outcomeOf <$> readTVar cell)
 
 -- | The roles a checkpoint selects, with what each loads, or why it cannot be read.
 rolesOf ∷ SessionSpec → Either Text [RoleInfo]
@@ -760,11 +783,18 @@ rolesOf spec = case manifestRoles manifest of
 
 -- | Mark every role not yet retired as retired. It runs only after every scope has been left, so whatever a role
 -- acquired has been released: a role that was never built holds nothing.
-sweepRetired ∷ Session → IO ()
+sweepRetired ∷ Session → IO [ExceptionWithContext SomeException]
 sweepRetired session = do
   state ← readTVarIO (sessionState session)
-  forM_ (Map.toList (stRoles state)) $ \(role, found) →
-    when (rsPhase found /= Retired) (void (applyEvent session (RoleRetired role)))
+  collecting [void (applyEvent session (RoleRetired role)) | (role, found) ← Map.toList (stRoles state), rsPhase found /= Retired]
+
+-- | Run each of these, whatever the others do: every failure, interruptions included, is collected in order and none
+-- stops the rest. The caller raises or records what it collected.
+collecting ∷ [IO ()] → IO [ExceptionWithContext SomeException]
+collecting actions = fmap concat . forM actions $ \action →
+  tryWithContext @SomeException action >>= \case
+    Right () → pure []
+    Left failure → pure [failure]
 
 -- | A failure of the composition itself is the session's: a host failure of the engine, with whatever
 -- cleanup failed beside it.
@@ -1140,9 +1170,14 @@ act env vms driver = \case
     startPacing origin
   NextEnded role → forM_ (vmOf role) $ \vm → do
     probeAt env (OwnerEnded role)
-    void (accountOwner env (rvInfo vm) (rvOwner vm))
+    (_, finalizing) ← finalizeOwner env (rvInfo vm) (rvOwner vm)
     closeModuleCoordinator (rvCoordinator vm)
     modifyIORef' (dvFinalized driver) (Set.insert role)
+    -- the role is finalized whatever finalizing raised; a cancellation among it is raised first, otherwise the first
+    case (filter isAsync finalizing, finalizing) of
+      (found : _, _) → rethrowIO found
+      (_, found : _) → rethrowIO found
+      _ → pure ()
   NextRetire role → void (applyEvent session (RoleRetired role))
   NextInit items → forM_ items $ \item → do
     modifyIORef' (dvInit driver) (Set.insert (hdKey item))
@@ -1153,7 +1188,7 @@ act env vms driver = \case
       Just settlement → do
         modifyIORef' (dvSettled driver) (Set.insert (hdKey item))
         already ← Set.member (hdKey item) <$> readIORef (dvInit driver)
-        when (not already && initialized settlement) $ do
+        when (not already && initializedBy settlement) $ do
           modifyIORef' (dvInit driver) (Set.insert (hdKey item))
           initSucceeded item
   NextWake → do
@@ -1170,10 +1205,6 @@ act env vms driver = \case
     session = envSession env
     spec = envSpec env
     vmOf role = find ((== role) . riRole . rvInfo) vms
-    -- Whether an instance's @init@ ever succeeded is a historical fact the host keeps in the instance's shutdown
-    -- disposition: it is "skipped, no init" exactly when the @init@ never succeeded, whatever the instance
-    -- failed in afterwards, and whatever the driver happened to see of it while it lived.
-    initialized settlement = terminationShutdown (resultTermination settlement) /= ShutdownSkippedNoInit
     initSucceeded item = do
       now ← readInstant (sxClock spec)
       void (applyEvent session (InitSucceeded (hdKey item) now))
@@ -1223,26 +1254,57 @@ act env vms driver = \case
           Right next → writeIORef (dvSchedule driver) (Just next)
         _ → pure ()
 
--- | Account for how a role's owner ended: a failure of the host, a cancellation or retained cleanup failures end
--- the whole session and are attributed to the role. An engine failure the facade already reported at its
--- boundary is not a new failure.
-accountOwner ∷ Env → RoleInfo → ScheduledOwner → IO (Completion ())
-accountOwner env info owner = do
+-- | Finalize a role's owner, on whichever path finds it ended first (the driver, or the scope that leaves it): collect
+-- its raw completion; account how it ended once (a failure of the host, a cancellation or retained cleanup failures
+-- end the whole session and are attributed to the role; an engine failure the facade already reported at its
+-- boundary is not a new failure); and then reconcile what is only known once an instance has ended. Every step is
+-- run whatever the others do, and what any of them raised (a diagnostic that cannot be written, a probe, an
+-- interruption) is returned for the caller to raise or record, so no obligation after this one is skipped.
+finalizeOwner ∷ Env → RoleInfo → ScheduledOwner → IO (Completion (), [ExceptionWithContext SomeException])
+finalizeOwner env info owner = do
   completion ← atomically (awaitCompletion (supervisedWorker (scheduledSupervised owner)))
   let role = riRole info
       session = envSession env
   first ← atomically $ do
     accounted ← readTVar (envAccounted env)
     if Set.member role accounted then pure False else True <$ writeTVar (envAccounted env) (Set.insert role accounted)
-  when first $ do
-    case completionResult completion of
-      Worker.Succeeded _ → pure ()
-      Worker.Failed (ExceptionWithContext _ exception)
-        | isJust (fromException exception ∷ Maybe EngineFailure) → pure ()
-        | otherwise → void (applyEvent session (EngineFault (Just role) (engineEntry HostFailure (Just role) OnEngine (Text.pack (displayException exception)))))
-      Worker.Cancelled (ExceptionWithContext _ exception) →
-        void (applyEvent session (EngineFault (Just role) (engineEntry HostFailure (Just role) OnEngine ("the owner was cancelled: " <> Text.pack (displayException exception)))))
-    forM_ (completionCleanup completion) $ \item →
-      void . applyEvent session . EngineFault (Just role) $
-        engineEntry CleanupFailure (Just role) OnCleanup (cleanupFailureLabel item <> ": " <> Text.pack (displayCleanupFailure item))
-  pure completion
+  accounting ←
+    if first
+      then
+        collecting $
+          [ case completionResult completion of
+              Worker.Succeeded _ → pure ()
+              Worker.Failed (ExceptionWithContext _ exception)
+                | isJust (fromException exception ∷ Maybe EngineFailure) → pure ()
+                | otherwise → void (applyEvent session (EngineFault (Just role) (engineEntry HostFailure (Just role) OnEngine (Text.pack (displayException exception)))))
+              Worker.Cancelled (ExceptionWithContext _ exception) →
+                void (applyEvent session (EngineFault (Just role) (engineEntry HostFailure (Just role) OnEngine ("the owner was cancelled: " <> Text.pack (displayException exception)))))
+          ]
+            <> [ void . applyEvent session . EngineFault (Just role) $
+                   engineEntry CleanupFailure (Just role) OnCleanup (cleanupFailureLabel item <> ": " <> Text.pack (displayCleanupFailure item))
+               | item ← completionCleanup completion
+               ]
+      else pure []
+  reconciled ← reconcileInits env info
+  pure (completion, accounting <> reconciled)
+
+-- | Whether an instance's @init@ ever succeeded, which is a historical fact the host keeps in the instance's shutdown
+-- disposition: it is "skipped, no init" exactly when the @init@ never succeeded, whatever the instance failed in
+-- afterwards, and whatever the driver happened to see of it while it lived.
+initializedBy ∷ InstanceSettlement → Bool
+initializedBy settlement = terminationShutdown (resultTermination settlement) /= ShutdownSkippedNoInit
+
+-- | Record the @init@ success of every tracked instance of this role that has settled, if the driver did not see it:
+-- the fact is the host's record, so it is read on every path that finalizes the owner, normal or not. Recording it
+-- twice changes nothing, and once the owner has ended and the session is stopping it can open no gate.
+reconcileInits ∷ Env → RoleInfo → IO [ExceptionWithContext SomeException]
+reconcileInits env info = do
+  held ← filter ((== riRole info) . ikRole . hdKey) . Map.elems <$> readTVarIO (envTracked env)
+  collecting
+    [ pollInstance (hdTicket item) >>= \case
+        Just settlement | initializedBy settlement → do
+          now ← readInstant (sxClock (envSpec env))
+          void (applyEvent (envSession env) (InitSucceeded (hdKey item) now))
+        _ → pure ()
+    | item ← held
+    ]
