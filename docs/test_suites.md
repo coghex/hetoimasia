@@ -100,7 +100,9 @@ cabal test hetoimasia-tests --test-show-details=direct
   (LFE-13, `Test.LuaEngine.Session.*`, `--match Session`: the pure model and its invariants after every step of every sequence of
   five events, and real Lua on real owners the coordinator starts, with an injected clock, a fake timer, recording sinks and held
   points: both `init` orders, validation before either root, stop and failure on each side of the gates, the clocks and their
-  limits, the failure policy, the evidence, the stop and drain, construction and cancellation, and a separately compiled client),
+  limits, the failure policy, the evidence, the stop and drain, construction and cancellation at every step of every acquisition, the
+  teardown protocol of every exit (the all-owner stop barrier, one accounting commit, the drain proof, the registered releases and a retirement
+  published only when proven, each with a control that removes the protection it proves), and a separately compiled client),
   and the M1 request adapter
   (LFE-7, `Test.LuaEngine.Request.*`): the busy record, the exact `ready`/`take`/`cancel`/`wait` records, handles
   and phases, the profile's limits, a texture lease, and required and optional failure, over real Lua instances on
