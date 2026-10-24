@@ -6,7 +6,12 @@ quad in a rendered window, with a real logical runtime running stub content;
 mod-aware foundations without mod activation; no ECS/gameplay store.**
 This document carries request `user-het-luafirst-20261021-1435`.
 
-Design state: `ready for issue processing`
+Design state: `exploring`
+
+**2026-10-24 amendment:** D-82 specifies the owner-requested LFE-13 teardown
+protocol for #527 / PR #567. Q-17 reserves approval of its two public host
+seams. Fresh readiness applies to this amendment; D-81's original signoff and
+all 26 filed-child ledger entries remain historical facts, not reopened work.
 
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
@@ -2520,6 +2525,396 @@ The manager arranges canonical approve-issue review of filed children. Solving
 is not authorized; the manager will ask the owner separately. This explicitly
 supersedes the original no-tracker-mutation restriction only for approved
 artifacts in this request, not other issues, labels or implementation work.
+
+### D-82. Make session teardown a protected protocol across all constructed owners
+
+**Delivery:** LFE-13 / [#527](https://github.com/coghex/hetoimasia/issues/527),
+normative amendment before further solving of
+[PR #567](https://github.com/coghex/hetoimasia/pull/567).
+
+Owner direction of **2026-10-23**, quoted in the manager's design brief:
+
+> Spec the teardown, then solve
+
+Authenticated relay: `het-manager`, message `ipqje335hb2ev26gfywiaikei6`,
+**2026-10-24 06:51:58.403 UTC**, in `#het-luafirst`, request
+`user-het-luafirst-20261021-1435`. The brief explicitly delegates this normative
+protocol, requires publication before more solving, and reserves genuine
+owner choices as open questions. This is the requested technical specification,
+not a claim that the owner approved the two new public host seams: **Q-17
+remains open**. The manager owns the #527 amendment and fresh approval route;
+this document edit grants no code, issue or PR mutation.
+
+#### Evidence and precedence
+
+Read against immutable **master `62e260bbde095f3e8a7a798da6626af4c169ae44`**
+and **PR head `942257657b173158ce3728dc46d1a6d4c7da676c`**. Links below pin
+those snapshots; PR code is evidence of the gap, not delivered behavior.
+The [#527 approving specification](https://github.com/coghex/hetoimasia/issues/527#issuecomment-6335381810)
+already requires all-instance validation before init, real retirement,
+bounded evidence and failure over interruption over success. D-82 makes the
+mechanism and its proof obligations precise. It preserves D-14–D-20, D-27,
+D-42–D-43, D-52, D-70, D-72, D-76–D-77 and D-80; no state store, Lua
+preemption, new shutdown order, signal handler or force-exit API is added.
+
+| Source | Verified consequence for this protocol |
+| --- | --- |
+| PR [`Session/Run.hs:252`](https://github.com/coghex/hetoimasia/blob/942257657b173158ce3728dc46d1a6d4c7da676c/packages/lua-engine/session/Hetoimasia/LuaEngine/Session/Run.hs#L252), [`State.hs:398`](https://github.com/coghex/hetoimasia/blob/942257657b173158ce3728dc46d1a6d4c7da676c/packages/lua-engine/session/Hetoimasia/LuaEngine/Session/State.hs#L398) | Keep the atomic event/owed-effects model and atomic owner-finalization bundle. `commitEvent` also calls a probe; it is **not** a recovery primitive. |
+| PR [`Run.hs:644`](https://github.com/coghex/hetoimasia/blob/942257657b173158ce3728dc46d1a6d4c7da676c/packages/lua-engine/session/Hetoimasia/LuaEngine/Session/Run.hs#L644), [`Run.hs:853`](https://github.com/coghex/hetoimasia/blob/942257657b173158ce3728dc46d1a6d4c7da676c/packages/lua-engine/session/Hetoimasia/LuaEngine/Session/Run.hs#L853) | `leaving` stops its local owner and waits; nested presentation-before-gameplay unwind cannot supply a session-wide stop barrier. A successful owner start also precedes the fallible `Built` probe and stopper registration. |
+| PR [`Run.hs:759`](https://github.com/coghex/hetoimasia/blob/942257657b173158ce3728dc46d1a6d4c7da676c/packages/lua-engine/session/Hetoimasia/LuaEngine/Session/Run.hs#L759), [`Run.hs:818`](https://github.com/coghex/hetoimasia/blob/942257657b173158ce3728dc46d1a6d4c7da676c/packages/lua-engine/session/Hetoimasia/LuaEngine/Session/Run.hs#L818) | Outer failure accounting, retirement sweep and final effects need one protected continuation. Saving an asynchronous exception alone loses its cleanup context. Merely reaching the sweep proves no retirement. |
+| Master [`Scheduled.hs:776`](https://github.com/coghex/hetoimasia/blob/62e260bbde095f3e8a7a798da6626af4c169ae44/packages/scripting-lua/runtime-lua/Hetoimasia/Scripting/Lua/Scheduled.hs#L776), [`Supervision.hs:597`](https://github.com/coghex/hetoimasia/blob/62e260bbde095f3e8a7a798da6626af4c169ae44/packages/runtime/src/Hetoimasia/Runtime/Supervision.hs#L597) | Owner stop is a non-waiting STM request; use that capability before any owner wait. Supervised waits can redeliver a latched fault; raw completion remains separately observable (`Worker/Observation.hs:118`). |
+| Master [`Modules/Wiring.hs:160`](https://github.com/coghex/hetoimasia/blob/62e260bbde095f3e8a7a798da6626af4c169ae44/packages/lua-engine/modules/Hetoimasia/LuaEngine/Modules/Wiring.hs#L160), [`Wiring.hs:425`](https://github.com/coghex/hetoimasia/blob/62e260bbde095f3e8a7a798da6626af4c169ae44/packages/lua-engine/modules/Hetoimasia/LuaEngine/Modules/Wiring.hs#L425) | Coordinator close withdraws queued reads without waiting. `awaitDrained` separately proves returned slots and bytes; close or owner completion alone is insufficient. |
+| Master [`Content/Internal/Pool.hs:370`](https://github.com/coghex/hetoimasia/blob/62e260bbde095f3e8a7a798da6626af4c169ae44/packages/content/internal/Hetoimasia/Content/Internal/Pool.hs#L370), [`Worker/Group.hs:94`](https://github.com/coghex/hetoimasia/blob/62e260bbde095f3e8a7a798da6626af4c169ae44/packages/foundation/internal/Hetoimasia/Foundation/Worker/Group.hs#L94) | A pool's scope closes then drains workers before borrowed roots unwind. Protected group drainage retains interruption and keeps waiting; it does not free live borrowers. |
+| Master [`Resource/Cleanup.hs:222`](https://github.com/coghex/hetoimasia/blob/62e260bbde095f3e8a7a798da6626af4c169ae44/packages/foundation/internal/Hetoimasia/Foundation/Resource/Cleanup.hs#L222), [`docs/resources.md:89`](https://github.com/coghex/hetoimasia/blob/62e260bbde095f3e8a7a798da6626af4c169ae44/docs/resources.md#L89) | Scope releases run uninterruptibly and require controlled blocking. Drains belong in protected owner continuations, **never** in those release callbacks. Caller-run cleanup composes original exception context. |
+
+All seven canonical reviews were read. Their findings map to the checklist
+below: [round 1](https://github.com/coghex/hetoimasia/pull/567#issuecomment-6375764026)
+(commit gap, all-instance validation, init history, origin, public harness),
+[round 2](https://github.com/coghex/hetoimasia/pull/567#issuecomment-6376389649)
+(held-init handoff, first boot failure, repeated release, traceback),
+[round 3](https://github.com/coghex/hetoimasia/pull/567#issuecomment-6376817672)
+(raw completion and coordinator drain),
+[round 4](https://github.com/coghex/hetoimasia/pull/567#issuecomment-6377175705)
+(fallible accounting and exceptional init history),
+[round 5](https://github.com/coghex/hetoimasia/pull/567#issuecomment-6377483333)
+(claim/evidence atomicity, early-failure deduplication, clock-free history),
+[round 6](https://github.com/coghex/hetoimasia/pull/567#issuecomment-6379553564)
+(recursive effects and incomplete composition accounting), and
+[round 7](https://github.com/coghex/hetoimasia/pull/567#issuecomment-6379852538)
+(all-owner barrier, protected outer sweep, cancellation's cleanup context).
+
+#### T1. Own the unwind before exposing anything
+
+There is one session lifecycle record, owned by the composition. It records
+the selected roles/expected instances, construction intents and acquired
+handles, accepted-but-not-yet-tracked tickets, closed admission/gates, pending
+stop obligations, raw completions and accounting identities, drain proofs,
+release outcomes, historical facts and bounded reports. The driver and host
+callbacks may submit events; readers see coherent snapshots. No callback
+owns the authoritative teardown sequence. This record outlives every role
+scope and remains readable through an already-published session handle after
+the driver returns or throws. It is fresh per session and never resets in place.
+
+Install the outer masked exception/cleanup continuation **before** `onReady`,
+initial diagnostics, clocks or construction. Protect each acquired component
+and register its stop/drain obligations before any probe, callback, further
+acquisition or exposure. A successful owner start must become discoverable to
+the session's stop barrier without an interruptible gap. A partially started
+owner that never returns a handle remains the starter's protected obligation;
+the session must stop already registered peers before waiting for that starter
+to finish unwinding. The composition must therefore guard the failure inside
+the acquisition continuation, not only catch it after nested scopes return.
+
+Construction/admission has intent, accepted-and-tracked, or abandoned states.
+Closure forbids new intent; an earlier intent either fails/abandons or
+registers its successful acquisition and immediately participates in the closed
+session's stop protocol. No accepted ticket is forgotten before its settlement
+and facts are accounted. The role's expected instance set includes the second
+harness instance before any init; neither a failure nor cancellation silently
+removes it from the readiness requirement. Public APIs gain no test-only tick
+initializer or internal VM handle.
+
+#### T2. Select the stop set, then complete the barrier
+
+| Trigger | Stop set and continuation |
+| --- | --- |
+| All roots complete normally, or the composition body finishes | Close the whole session; stop every constructed owner, even an already completed one; run T3–T7 and return the ranked outcome. An event-driven root is not completed merely because it has no update. |
+| Ordinary logical instance failure **after the joint startup gate opened**, with healthy presentation present | Latch the attributed failure, close logical admission/grants and stop **all instances of that logical owner**. Run its retirement protocol while presentation remains serviced. Do not close presentation or shared providers it still needs. Eventual session outcome is failure. |
+| Boot/validation/init failure; presentation or one-role failure; engine, host, provider, sink or cleanup failure | Close the whole session immediately. A boot failure never waits for another entry/init to report before this closure. An engine/cleanup fault during logical-only retirement expands the stop set to all roles before the next wait. |
+| Normal quit, `StopQuit`, orderly `StopInterrupt`, external owner stop | Close the whole session idempotently and run the same protocol. Preserve the stop kind and outcome precedence. An unsolicited owner stop while the session is active cannot leave the peer running without a driver; an unexpected cancelled/failed owner completion remains a host failure. |
+| Driver/caller/probe/clock throws, including before or during construction | Capture the exception and its context, close the whole session, run the protocol for everything actually acquired, then use T5's propagation rule. A failure before any role exists still updates the exposed session record. |
+| Driver receives asynchronous cancellation at any step | Retain the first cancellation and its context; close/expand to the whole session; resume mandatory cleanup from recorded obligations. Cancellation does not itself fabricate an engine failure. Inspect and account its attached cleanup failures. |
+| Second stop signal forces process exit | D-20's explicit exception: cleanup/publication may be skipped. LFE-13 does not install this signal path, implement a timeout, or kill Lua. |
+
+**Barrier order:** (1) atomically close affected admission, tick grants and
+unopened startup gates, and record each owed stop; (2) request stop from **every
+constructed owner in the stop set**, including those in outer/nested scopes;
+(3) close their module-coordinator admission and withdraw queued unissued
+interests; (4) record the completed handoffs. Only then may teardown await
+**any** owner, provider or coordinator. The pass uses stable role order
+(logical then presentation, skipping absent roles) only for host bookkeeping;
+it promises no relative Lua shutdown order. Repeating the pass is harmless.
+
+Steps 2–4 contain only finite non-waiting stop/close primitives and masked
+bookkeeping. No logging, clock, probe, Lua, waiting MVar, `throwTo`, callback or
+provider drain is permitted between the first and last stop. Serialize tick
+grant admission with closure through state transitions; do not hold a grant
+lock across injected work and then require that lock to stop a peer. A normal
+stop caller or owner callback can perform this finite pass but never waits
+for itself or invokes a diagnostic sink. After late construction succeeds,
+repeat the pass for its registered handle before any subsequent wait.
+
+A synchronous defect in a stop primitive is recorded, and the pass still
+attempts every other stop/close. Do not retry a throwing primitive recursively
+or declare its handoff successful. Keep its failed obligation visible until
+independent terminal evidence resolves it; retain dependencies while it can
+still have borrowers. The production primitives must satisfy the finite,
+idempotent contract; injection probes test the surrounding boundaries and may
+not replace a real stop with an exception. A defective stop offers no liveness
+guarantee and is not permission to free a running VM.
+
+#### T3. Drain, account, release, publish — on every path
+
+After T2, each affected role follows this dependency order. Peers may progress
+concurrently; a slow role must not prevent accounting a peer already terminal.
+
+1. **Keep service dependencies alive.** Let the owner perform eligible shutdown,
+   revoke/withdraw its work and retire its instances/VM. Preserve module supplier,
+   data service, read pool, anchored content root/inventory and output/provider
+   endpoints until their last borrower has actually finished. Continue servicing
+   the healthy UI during logical-only retirement; do not synchronously block
+   the sole session driver on the logical owner's drain.
+2. **Observe raw owner completion and every tracked settlement.** A supervision
+   fault is recorded once, then cleanup observes raw completion predicates,
+   without re-entering a supervised wait that continually rethrows the latch.
+   Own-owner failures are accounted from their completion; foreign supervision
+   failures are accounted at delivery. Each accepted ticket must have a terminal
+   settlement or an explicit host-contract failure; silently ignoring a missing
+   settlement is forbidden. Never release result retention before observation.
+3. **Account one complete bundle.** From that evidence derive all primary/cleanup
+   entries, shutdown dispositions and proven init successes. One recovery commit
+   writes the bundle and its accounted marker together. An existing marker
+   suppresses the same evidence, not newly discovered outer cleanup. A new fatal
+   entry expands T2 to surviving peers before another wait. No clock, report
+   sink or probe is needed to derive or commit this bundle.
+4. **Prove module/provider drainage.** Coordinator closure is already requested;
+   await its real drained predicate (no outstanding slots or charged bytes),
+   including VM-lifetime module work with no remaining instance waiter.
+   Withdraw unissued reads; started reads and their sinks finish and return
+   their holdings. Owner completion alone is not this proof. Account later
+   pool/provider defects once and run the expanded barrier when required.
+5. **Finish local scopes.** Release components whose borrowers are proven gone;
+   attempt each registered finite release once, retain every thrown cleanup
+   failure and continue other independent releases. Timer disposal invalidates
+   all wake generations before invoking its finite cancel action. A timer,
+   facade, probe or other scope-exit failure passes through protected accounting,
+   not an unprotected `recordFailure` followed by a best-effort sweep.
+6. **Commit actual retirement.** Require: construction/admission intents resolved;
+   no runnable owner/instance; raw completion and settlements accounted; all
+   owned provider/module work, bytes and slots retired; local dependency releases
+   accounted, and no unresolved ownership remaining. Commit the phase and these
+   facts atomically before any optional notification. A stopped worker, failed
+   release attempt or exited lexical scope alone cannot justify `retired`.
+   If a throwing release leaves retirement unproven, retain failed/stopping
+   status and that uncertainty; do not manufacture a success receipt.
+7. **Finish the outer scope under protection.** Account the composition exception
+   and every newly attached cleanup entry together; sweep only eligible,
+   unrecorded retirements using recovery commits; finish required session-owned
+   resource cleanup; then return/rethrow under T5. Repeated cancellation cannot
+   jump from primary accounting past secondary evidence or retirement.
+
+The `runSession` read pool/root/output in #527 are **borrowed**, not transferred
+to it. It must await its own outstanding interests and sink deliveries, not
+close the shared pool while healthy presentation uses it. The assembly outside
+`runSession` closes/drains the actual pool before releasing inventory/root and
+closes output last after producers stop. Session-local `retired` does not claim
+that these borrowed shared services were destroyed. Pool shutdown failures
+after `runSession` returns remain assembly/launcher failure evidence and make
+the eventual exit fail; no exception may release a root while its reads run.
+This preserves the current pool scope contract rather than introducing a
+second pool owner in LFE-13.
+
+#### T4. Keep atomic commits; restrict effects during recovery
+
+Retain one pure state transition and **one masked, non-retrying STM commit
+primitive**. Normal and recovery entry points use that primitive. In one event
+it commits all of: state/failure/stop rank; gates/admission; event identities and
+deduplication/accounting markers; every fact and bounded evidence item the event
+proves; and the pending effects those changes owe. Claims cannot precede their
+payload. Force the bounded transition data before exposing the committed state;
+do not leave later evaluation of a user formatter as part of accounting.
+
+Keep a retained pending-effects queue. Stop obligations are coalesced by owner
+identity and serviced ahead of diagnostics. A stop remains owed until its
+handoff succeeds or independent completion proves it unnecessary. Diagnostic
+entries have stable event identities and pending/in-flight/finished states;
+claim and acknowledgement are protected, with an explicit interrupted outcome.
+There is no invisible local-list ownership that dies with a cancelled committer.
+Concurrent callers cannot issue the same diagnostic attempt concurrently.
+One transition may be submitted again without duplicating failure order,
+shutdown work, early-notice markers or completion accounting. Retention is
+bounded by the fixed role/instance/transition set and D-77 report limits;
+repeated stop, repeated notice, sink failure or repeated cancellation cannot
+grow an unbounded queue or recursively generate diagnostic diagnostics.
+
+**Recovery commits run no effects at all:** no `Committed` probe, logger, clock,
+stop wrapper or recursive queue runner. Mandatory stops use T2's separate finite
+pass. Completion accounting, unwind, captured cleanup, historical reconciliation
+and retirement use recovery commits. A normal callback/request-stop path may
+commit and pay stops; only the driver outside owner callbacks runs diagnostic
+effects. No effect runner owns a lock needed by a recovery commit or stop pass.
+
+Once teardown begins, suspend diagnostic forwarding until mandatory drainage,
+accounting and eligible retirement publication finish. Sink/probe calls are
+not prerequisites for any of those facts. On a non-cancelled final path the
+driver makes one protected attempt at each pending diagnostic after cleanup;
+a synchronous sink failure becomes a bounded engine failure without another
+diagnostic-to-that-sink obligation. On cancellation, retain the diagnostic data
+but mark unfinished forwarding interrupted and propagate after cleanup: do not
+retry an interrupted/blocked sink before cancellation can escape. A write that
+was interrupted may already have written bytes; promise neither exactly-once
+external output nor automatic replay. This rule concerns session diagnostics,
+not D-71's authored synchronous `print`/`warn` contract. LFE-22 renders the bounded
+session failure independently; #527 must expose it without needing a sink call.
+
+Test probes sit outside the commit primitive in protected boundary wrappers.
+Their failures/cancellations are captured without skipping the next mandatory
+step. The all-stop barrier itself has no injectable blocking hook; observe it
+through state/owner stop receipts, and gate immediately before the pass or at
+the first subsequent wait. Never execute a teardown probe again merely to
+retry the cleanup operation it observed.
+
+#### T5. Preserve failure evidence independently of control flow
+
+The first committed role failure stays that role's primary failure; later
+entries are secondary. Boot failure preserves its available Lua traceback.
+The session's first committed failure stays primary in its bounded report;
+cleanup/engine failures can raise the outcome to failure but cannot replace
+earlier attributed evidence. Stop outcome precedence remains **failure >
+interruption > success**, including a failure discovered after quit/interrupt.
+Do not confuse that outcome ranking with the exception to propagate.
+
+The exception record keeps `ExceptionWithContext`, not only `SomeException`.
+On **every caught exit**, including a cancellation, inspect
+`cleanupFailuresInContext`; account its cleanup entries before continuing.
+Use stable evidence identities (including foundation cleanup identities) so
+the same cleanup seen in a worker completion and propagated scope context
+appears once. Distinct failures with identical text remain distinct. The
+early instance-failure notice and later settlement share a primary identity;
+the latter still contributes new cleanup. Claimed/accounted sets and bounded
+summaries commit together. Do not stringify exceptions to deduplicate them.
+
+Keep the first received driver cancellation for eventual rethrow as itself,
+with its original type/value/context and additional retained cleanup via the
+foundation composition API. A prior synchronous failure remains in status and
+as retained context; cancellation does not erase it. If no cancellation arrived,
+preserve the original thrown driver/construction exception with cleanup beside
+it. A normal session exit returns its ranked outcome after accounting failures.
+Unexpected owner cancellation is still a host failure under #527; expected
+orderly retirement is not. Further interruptions do not replace the chosen
+exception, but their attached cleanup must still be inspected and deduplicated.
+Raw driver cancellation is propagated, not translated into a returned success
+or an invented signal code; the signal adapter separately requests
+`StopInterrupt`. A new synchronous failure during final diagnostic forwarding
+is accounted before the outcome is read. A cancellation there skips further
+forwarding and escapes with all already-accounted cleanup attached.
+
+Exception type alone does not identify delivery: an exception explicitly
+thrown **by an uninterruptible release**, even `ThreadKilled`, is a cleanup
+failure under the foundation contract, not evidence of external cancellation.
+Likewise a host hook that throws is a host failure, and an injected sink/clock/
+probe defect cannot become an ordinary Lua failure. Session callbacks must
+perform finite bookkeeping only; a throwing callback is captured in owner
+completion, with the original instance evidence preserved. No new clock read
+is permitted merely to reconcile teardown history. No caught exception may
+abort the remaining independent cleanup steps or recursively invoke effects.
+
+Use the existing D-77/P-74 bounds: role message **2 KiB**, traceback **8 KiB**,
+whole role failure **16 KiB**, instance text **128 UTF-8 bytes**; engine report
+**64 KiB**, at most **16 secondary summaries of 2 KiB**, with omitted count.
+Overflow still latches failure and increments the omitted count; it never
+drops the failure bit or masquerades as success. These bound rendered/status
+data, not the foundation's structured exception context or all Lua memory.
+Retain raw evidence through final propagation/accounting without copying an
+ever-growing history into the status or pending-effect queue.
+
+#### T6. Historical facts do not depend on a successful driver observation
+
+For every admitted instance retain its actual shutdown disposition and
+termination reason, once. Derive init success from the host settlement that
+proves it (including an absent optional init completing successfully), even if
+the instance subsequently failed, was stopped, or its driver was cancelled
+before seeing it active. The host's `ShutdownSkippedNoInit` means no successful
+init; `ShutdownSkippedUnsafe` after successful init does not undo that success.
+Do not infer initialized merely from a failure/retirement phase. Missing evidence
+is an explicit host-contract fault, never an invented fact.
+
+Account these facts with the terminal bundle on every exit. The role's
+historical `initialized` is true only when every expected instance's successful
+init is proven; a never-constructed expected instance cannot satisfy it. Facts
+are monotone, and teardown reconciliation never reads a clock, opens a startup
+gate, releases a held init or admits ticks. Only live startup may commit its
+just-sampled pacing origin immediately with joint-gate opening, before any
+diagnostic. After closure, a late success updates history only. Shutdown is
+at most once, with existing stopped/failed/completed reasons and skip rules;
+there is no second attempt after a throwing hook and no cross-instance order.
+
+#### T7. Mask bookkeeping, not unbounded waits
+
+Use `mask` around ownership transfer, exception capture, each complete evidence
+bundle, the outer cleanup continuation and finite stop passes. The state commit
+does not use STM `retry`, blocking locks or injected IO. Waits for completion,
+provider retirement and coordinator drainage must remain interruptible: run
+them through the enclosing `restore` with a handler installed, or as blocking
+STM under `MaskedInterruptible`; catch cancellation, retain its context, run
+any newly required stop pass and resume the outstanding wait. Never turn a
+cancelled wait into a completion receipt. A wait interrupted repeatedly still
+has only one outstanding obligation, not recursively nested finalizers.
+
+GHC's `restore` restores the **incoming** mask; it does not guarantee `Unmasked`.
+`mask` permits delivery at interruptible operations; `uninterruptibleMask`
+does not. `interruptible`/`allowInterrupt` cannot escape an already
+uninterruptible caller. Consequently the session's blocking entry/cleanup
+continuation must not be called under `MaskedUninterruptible`; reject that
+entry before acquiring session resources. Existing short resource releases
+retain the repository's uninterruptible discipline; never put a drain, Lua
+close, logger/probe or arbitrary timer backend wait in them. These semantics
+follow [GHC's `Control.Exception` documentation](https://ghc.gitlab.haskell.org/ghc/doc/libraries/base-4.22.0.0-inplace/Control-Exception.html#v:mask).
+
+Timer arm/cancel adapters used in an uninterruptible scope must have the same
+controlled-blocking contract as a release; arbitrary injected IO is not made
+safe by masking it. Lua-owned native/coroutine close remains on its owner thread
+under the host's caller-run cleanup discipline. Composition only waits for
+that owner; it never enters or frees a VM from the driver to hasten retirement.
+Do not add `uninterruptibleMask` around a session, owner await, coordinator
+drain or final diagnostic pass. Every release's blocking argument belongs in
+D-80's invariant table, including the timer backend.
+
+This removes teardown-induced uninterruptible hangs; it does **not** promise
+termination of trusted non-yielding Lua, a stuck native provider, or a release
+that violates its contract. Interrupted protected cleanup can continue waiting
+for such a borrower rather than free underneath it. D-20's separately implemented
+forced process exit is the escape; a timeout proves neither completion nor
+permission to destroy resources. No stronger liveness claim is made here.
+
+#### T8. Host integration scope is reserved to Q-17
+
+The protocol requires prompt failure latching before slow retirement, and
+validation of every selected behavior/cadence before any init. PR #567 adds
+`instanceOnFailing`, `instanceHoldInit` and `releaseHeldInstance` to achieve
+those existing requirements. Their public cross-package scope is **proposed,
+not authorized by D-82**. Q-17 states the exact recommended contracts; the
+teardown ordering, evidence and masking requirements above apply regardless
+of how the owner resolves those seams. Neither existing generic callers nor
+the runner/sample may silently acquire M1 startup/failure policy.
+
+#### T9. Required boundary proofs
+
+These are acceptance obligations, **not tests claimed to pass**. Extend the
+existing `Test.LuaEngine.Session.*` Hspec families in PR #567 and public host
+tests if Q-17 is accepted. Use coordinated gates, explicit receipts and raw
+completion evidence, never timing sleeps. Each test must assert both the
+ordering and final facts/evidence, not merely that the call returned. Include
+a negative control that removes the protection being proved. The PR-body
+invariant table cites concrete test names and every matching production site.
+
+| Rule / review source | Required gated test and assertions |
+| --- | --- |
+| T1 acquisition/admission handoff; R1/R2 | `Construction`: fail/cancel before and after each acquisition, owner start, registration, accepted ticket/tracking and validation publication. Every constructed owner is found and stopped; no live ticket or provider interest escapes; never-acquired resources have no release. Test `onReady` and initial diagnostic failures too. |
+| T1/T6 full pre-init barrier; R1/R2 | `Startup` and host `Instance.Behavior`: invalid second harness instance runs no init; hold another boot entry while its peer fails and prove immediate closure with traceback; release races callback return; repeated release enqueues at most one resume; stop wins late release/init success. |
+| T2 global stop barrier; R7 | `Stop`: cancel/throw with both owners constructed, hold presentation completion or retirement indefinitely at a test gate, and observe **both stop receipts before opening that gate**. Repeat with role nesting reversed, construction partly complete, and each role as the slow one. No diagnostic/probe gate can sit between the two stops. |
+| T2 role policy; T3 progress | `Failures`: ordinary post-start logical failure retires logical while real UI updates continue. Inject cleanup failure during that drain and observe UI stop before the next wait. Boot/UI/one-role/engine failures stop all; absent roles and the second instance are covered. |
+| T3 raw completion; R3/R4 | `Evidence`: a suspended coroutine's close fails during cancellation; inspect raw completion and preserve its failure exactly once. Cause supervision to latch first; cleanup still observes terminal evidence without repeated supervised exceptions. Missing settlement is fatal, not silently skipped. |
+| T3 drain proof; R3/R7 | `Construction`/`Stop`: gate an issued module read (including no remaining waiter), data read and sink completion. Stop suppresses queued work, but `retired` and root release remain false until actual byte/slot/provider retirement. Logical-only drain leaves shared pool/UI usable. |
+| T3 protected releases/sweep; R4/R6/R7 | `Failures`: independently throw at timer cancel, local release and outer composition exit; cancel at each surrounding boundary. All other releases and eligible retirements still occur, evidence is complete, and a failed release is not assumed to prove retirement. |
+| T4 atomic bundle; R1/R5/R6 | `Commit`: gate/cancel immediately after failure, owner-finalized and composition-failed commits. The marker, **all** secondary entries, history and owed stops are already present together. Retry observation changes no counts; test the outer path, not only owner scopes. |
+| T4 non-recursive effects; R6 | `Commit`/`Failures`: permanently throwing sink or boundary probe cannot recurse, duplicate failure, suppress real stop or prevent retirement. Interrupt a blocked diagnostic; no automatic retry delays cleanup or rethrow. Concurrent callers claim one attempt; pending status is retained. |
+| T5 cancellation context; R7 | `Evidence`: cancel the driver while timer disposal throws; same cancellation escapes with inspectable cleanup and failure outcome/status. Repeat with multiple cleanup entries, repeated cancellation and the same entry seen through completion plus outer context. Distinct equal-text failures both count. |
+| T5 source and bounds | `Evidence`: explicit async-typed exception from an uninterruptible release is cleanup failure; true driver cancellation alone is not host failure. Oversized primary/traceback and more than 16 secondaries retain the failure latch, bounded summaries and exact omitted count. |
+| T6 history and origin; R1/R4/R5 | `Startup`/`Clocks`/`Failures`: init succeeds, then driver is cancelled before observing it; settlement still records success. Clock throws if called during reconciliation: no call occurs. Failed/no-init and unsafe shutdown dispositions remain distinct. A blocked startup diagnostic cannot shift the origin; late init cannot reopen closed gates. |
+| T7 masking and waits | `Stop`/`Construction`: observe masking state; reject uninterruptibly masked entry before acquisition. Cancel while blocked at owner completion, coordinator drain and provider retirement; cleanup retains cancellation, keeps dependencies and proceeds after the gate opens. Assert actual releases contain no such waits. |
+| T2/T5 final outcomes | `Stop`/`Failures`: normal completion, quit, interrupt, external owner stop, unexpected owner cancellation and synchronous driver throw in all role arrangements. Failure after quit/interrupt wins; forced-exit behavior remains outside this suite. |
+| T4/T6 model and API boundary; R1–R7 | `Model` checks atomic facts/claims, monotone history, no reopening, owed stops until handoff/proof, bounded effect multiplicity and retirement eligibility. `Client` compiles against public interfaces; no exported test-only tick/control seam. Q-17 host defaults preserve existing runner/sample behavior. |
 
 ## Proposals
 
@@ -7643,6 +8038,12 @@ finish the readiness audit after publication. No tracker creation occurs here.
 
 ## Readiness audit
 
+**2026-10-24 amendment:** readiness is reopened only for D-82 / LFE-13 and
+Q-17's host-contract scope. The owner-directed protocol is published before
+more solving; the manager must reconcile #527 and arrange fresh approval.
+The original audit below is retained with its snapshot and date. No code or
+runtime validation is claimed by this documentation amendment.
+
 **2026-10-22, audit of the D-79/D-80 plan at `7c3a67caef`: passes.** The audit
 landed at `8612044b22`; D-81 records explicit manager readiness signoff under
 the owner's D-78 process grant. No behavior gap remains. A future material
@@ -8247,6 +8648,50 @@ and costs were presented. These are fixed M1 assembly limits, not a tuning API
 or hard whole-process containment. Next are Q-8 vision/#145 reconciliation
 and Q-9 dependency-ordered one-PR delivery slices.
 
+### Q-17. Include both opt-in public host seams in LFE-13?
+
+**Open — owner decision; affected slice LFE-13 / #527 / PR #567.** The design
+brief expressly reserves cross-package contract choices. The approved #527
+behavior requires the capabilities below, but the PR's public API additions
+have no separate recorded scope signoff. Publishing D-82 does not grant it.
+Recommend approving **both** with these narrow contracts; approve or revise
+each separately if needed. The manager obtains the answer before re-approving
+an implementation that depends on them.
+
+1. **`instanceOnFailing`: recommended in #527.** An opt-in, default no-op host
+   callback on the VM owner's thread, at most once for an instance's first
+   primary failure, after its ending/closed admission is committed and before
+   shutdown/provider retirement can block. It reports the primary only; later
+   `instanceEscalate`/settlement supplies cleanup. Failure arising only during
+   shutdown/retirement is reported at settlement. The session callback performs
+   T4's finite commit/stop-only work; a callback throw is host failure and cannot
+   erase the original instance failure. This lets failure policy stop tick
+   admission promptly while resources still retire. Cost: a second notification
+   lifecycle, deduplication, callback-failure and slow-provider race tests.
+   Alternative: a separate approved host prerequisite with the same capability;
+   waiting for final settlement would weaken #527 and is not an accepted fallback.
+2. **`instanceHoldInit` plus `releaseHeldInstance`: recommended in #527.** Opt-in,
+   default no hold; after behavior/cadence capture and validation, park the
+   instance's init continuation without parking the owner thread. Register that
+   continuation **before** the callback can publish readiness. Release is
+   idempotent/coalesced and owner-thread scheduled, never caller-thread Lua.
+   Stop/failed construction wins over late release; release racing callback
+   return cannot lose or duplicate init. Callback throws are host failures.
+   All selected instances, including the second harness slot, validate before
+   the session releases any init. Existing runner/sample/default callers keep
+   their current start behavior. Cost: public lifecycle API, held-continuation
+   ownership and release/stop/callback races. Alternative: a separately approved
+   host prerequisite; sequential init or weakening all-instance validation is
+   not an accepted fallback.
+
+Evidence: PR [`Instance/Types.hs:703`](https://github.com/coghex/hetoimasia/blob/942257657b173158ce3728dc46d1a6d4c7da676c/packages/scripting-lua/runtime-lua/Hetoimasia/Scripting/Lua/Instance/Types.hs#L703),
+[`Instance/Run.hs:709`](https://github.com/coghex/hetoimasia/blob/942257657b173158ce3728dc46d1a6d4c7da676c/packages/scripting-lua/runtime-lua/Hetoimasia/Scripting/Lua/Instance/Run.hs#L709),
+[`Instance/State.hs:368`](https://github.com/coghex/hetoimasia/blob/942257657b173158ce3728dc46d1a6d4c7da676c/packages/scripting-lua/runtime-lua/Hetoimasia/Scripting/Lua/Instance/State.hs#L368),
+and [`Instance/Run.hs:1625`](https://github.com/coghex/hetoimasia/blob/942257657b173158ce3728dc46d1a6d4c7da676c/packages/scripting-lua/runtime-lua/Hetoimasia/Scripting/Lua/Instance/Run.hs#L1625).
+No public arbitrary hook framework, scheduler replacement or M1 policy in
+generic defaults is proposed. D-82's remaining protocol is specified and
+published now, as directed, without waiting for this answer.
+
 ## Verification strategy
 
 D-43 accepts P-40's M1 acceptance boundary and two-instance qualification.
@@ -8531,6 +8976,10 @@ replace boundary tests, prove performance or establish confinement.
 #### LFE-13. Coordinate role startup gates, failure policy and session stop
 
 - **Depends on:** LFE-3, LFE-12.
+- **Teardown amendment:** D-82/T1–T9 is normative for #527 / PR #567; use its
+  all-owner stop barrier, atomic accounting, protected drain/retirement sequence
+  and boundary-proof checklist. Q-17 reserves the two public host seams for
+  owner scope approval; the manager reconciles/re-approves #527 before solving.
 - **Boundary:** generic one/two-role session composition, concurrent root inits,
   UI starts on own readiness, logical ticks wait for the joint gate; fixed
   FIFO cadence over the existing scheduler. Internal narrow stop/failure/status
