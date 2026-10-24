@@ -69,6 +69,7 @@ module Hetoimasia.LuaEngine.Session.Run
   , latchTerminalFailure
   ) where
 
+import Control.Applicative ((<|>))
 import Control.Concurrent.MVar (newMVar, withMVar)
 import Control.Concurrent.STM
   ( STM
@@ -234,27 +235,39 @@ sessionComponent = unsafeComponent "luaengine.session"
 
 -- Applying events -----------------------------------------------------------------------------------
 
--- | The one masked primitive that changes the session: commit an event.
+-- | The one primitive that changes the session: commit an event.
 --
 -- __Contract.__ In one STM transaction the pure 'step' changes everything the event means (the failure latch, the
 -- phase, the gates, the markers 'stEarly' and 'stAccounted', the historical facts the event proves) and appends to
--- the queue of effects owed ('stOwed') the stops and the diagnostics the event owes; after the commit the queue is
--- run. The commit runs masked: the one place it can be interrupted is a blocking step inside an effect, and an
--- interruption there leaves the effect owed (a stop) or puts it back (a diagnostic), so nothing the event meant is
--- ever lost or half applied. An effect that raises is recorded as a failure of the engine and the queue goes on, so
--- the caller is never kept from the obligations that follow; only an interruption is raised, after the state is
--- consistent. The queue is run by the committer, by the driver, by stopper registration and by every teardown
--- path, so an effect whose performer was cancelled is performed by the next one.
+-- the queue of effects owed ('stOwed') the stops and the diagnostics the event owes. That is the commit
+-- ('commitEvent'), and it is all a recovery or a cancellation path ever does: it never runs the queue, so a stop or a
+-- diagnostic that blocks or raises cannot keep the path from the obligations that follow it.
+--
+-- A normal step ('applyEvent') commits and then runs the queue, masked. The queue is also run by the driver, by
+-- stopper registration, and once, in the final teardown drain, after a cancellation has propagated out of every scope.
+-- An effect that raises is recorded as a failure of the engine and the queue goes on; an interruption leaves a stop
+-- owed and puts a diagnostic back, and is raised after the state is consistent. The stops run before the
+-- diagnostics, so a diagnostic cannot delay an owner's stop.
 applyEvent ∷ Session → Event → IO Answer
 applyEvent session event = mask_ $ do
-  answer ← atomically $ do
-    current ← readTVar (sessionState session)
-    let (next, found) = step event current
-    writeTVar (sessionState session) next
-    pure found
-  sessionProbe session (Committed (Text.unpack (eventName event)))
+  answer ← commitEvent session event
   runOwed session
   pure answer
+
+-- | Commit an event and tell the probe (the harness's boundary between a commit and its effects). It runs no effect.
+commitEvent ∷ Session → Event → IO Answer
+commitEvent session event = do
+  answer ← commitSilently session event
+  sessionProbe session (Committed (Text.unpack (eventName event)))
+  pure answer
+
+-- | Commit an event: the one transaction, nothing else. Recovery paths use this directly.
+commitSilently ∷ Session → Event → IO Answer
+commitSilently session event = atomically $ do
+  current ← readTVar (sessionState session)
+  let (next, found) = step event current
+  writeTVar (sessionState session) next
+  pure found
 
 -- | Run the queue of effects owed until nothing runnable is left. A stop whose owner does not exist yet is not
 -- runnable and stays owed; registering the owner's stopper makes it so.
@@ -269,18 +282,19 @@ runOwed session = do
         | isAsync failure → do
             -- an interruption leaves a stop owed and puts a diagnostic back, then goes on being raised
             case owed of
-              OweSay _ → void (applyEventQuietly session (Requeued owed))
+              OweSay _ → void (commitSilently session (Requeued owed))
               OweStop _ → pure ()
             rethrowIO failure
         | otherwise → do
             -- a failure of an effect is a failure of the engine, recorded without a diagnostic of its own when it
-            -- was a diagnostic that failed; the effect is given up so the queue goes on
-            void . applyEventQuietly session $ case owed of
+            -- was a diagnostic that failed; the effect is given up first, then the failure committed, and the
+            -- loop that called us goes on with what is left: nothing here runs the queue
+            settle owed
+            void . commitSilently session $ case owed of
               OweSay _ → DiagnosticFailed (engineEntry HostFailure Nothing OnEngine ("a diagnostic could not be written: " <> Text.take 512 (Text.pack (displayException raised))))
               OweStop role → EngineFault (Just role) (engineEntry HostFailure (Just role) OnEngine ("the owner could not be asked to stop: " <> Text.take 512 (Text.pack (displayException raised))))
-            settle owed
     settle owed = case owed of
-      OweStop _ → void (applyEventQuietly session (Settled owed))
+      OweStop _ → void (commitSilently session (Settled owed))
       OweSay _ → pure () -- claimed when it was taken
     effect = \case
       OweStop role → do
@@ -295,11 +309,17 @@ claimOwed ∷ Session → STM (Maybe Owed)
 claimOwed session = do
   state <- readTVar (sessionState session)
   stoppers <- readTVar (sessionStoppers session)
-  case find (runnable stoppers) (toList (stOwed state)) of
+  let queue = toList (stOwed state)
+  case find (runnable stoppers) (filter isStop queue) <|> find (runnable stoppers) queue of
     Just owed@(OweSay _) → do
       writeTVar (sessionState session) (fst (step (Settled owed) state))
       pure (Just owed)
     other → pure other
+
+isStop ∷ Owed → Bool
+isStop = \case
+  OweStop _ → True
+  OweSay _ → False
 
 runnable ∷ Map.Map Role (IO ()) → Owed → Bool
 runnable stoppers = \case
@@ -310,17 +330,6 @@ runnable stoppers = \case
 hasRunnable ∷ Map.Map Role (IO ()) → SessionState → Bool
 hasRunnable stoppers state = any (runnable stoppers) (toList (stOwed state))
 
--- | Commit an event and run the queue without telling the probe: the commits that record a failure of an effect.
-applyEventQuietly ∷ Session → Event → IO Answer
-applyEventQuietly session event = mask_ $ do
-  answer ← atomically $ do
-    current ← readTVar (sessionState session)
-    let (next, found) = step event current
-    writeTVar (sessionState session) next
-    pure found
-  runOwed session
-  pure answer
-
 -- | Run an action that writes a diagnostic the queue does not carry ("session starting", "session ended"). A failure
 -- other than an interruption is recorded as a failure of the engine and not raised.
 diagnose ∷ Session → IO () → IO ()
@@ -330,7 +339,7 @@ diagnose session action =
     Left failure@(ExceptionWithContext _ raised)
       | isAsync failure → rethrowIO failure
       | otherwise →
-          void . applyEventQuietly session . DiagnosticFailed $
+          void . applyEvent session . DiagnosticFailed $
             engineEntry HostFailure Nothing OnEngine ("a diagnostic could not be written: " <> Text.take 512 (Text.pack (displayException raised)))
 
 -- | The status the session publishes now: coherent, bounded and nonblocking. A reader that polls may
@@ -651,7 +660,7 @@ withOwner env info owned coordinator holder facade body = mask $ \restore → do
           -- is idempotent and its one blocking step is interruptible, so an interruption of it is recorded and the
           -- stop made again, never given up: an owner nobody asked to stop would end this scope's wait never.
           leaving = do
-            closed ← tryWithContext @SomeException (applyEvent (envSession env) Unwind)
+            closed ← tryWithContext @SomeException (commitEvent (envSession env) Unwind)
             (either (: []) (const []) closed <>) <$> untilStopped []
           untilStopped interruptions =
             tryWithContext @SomeException stopOwner >>= \case
@@ -672,7 +681,7 @@ withOwner env info owned coordinator holder facade body = mask $ \restore → do
       -- However the scope is left, the owner's completion is accounted (once, whichever path finds it first) and the
       -- coordinator drained before anything the owner or its reads borrow is released and before the role can be
       -- published as retired. Both go on through interruptions, as the wait for the owner does.
-      (completion, accounting) ← finalizeOwner env info owner
+      (completion, accounting) ← finalizeOwner (void . commitEvent (envSession env)) env info owner
       draining ← tryWithContext @SomeException (probeAt env (Draining role))
       drained ← awaitDrainedThrough restore coordinator
       released ← tryWithContext @SomeException (probeAt env (Released role BuildOwner))
@@ -765,16 +774,21 @@ runSession spec onReady = do
   result ← tryWithContext @SomeException $ case refusal of
     Just why → void (applyEvent session (EngineFault Nothing (engineEntry HostFailure Nothing OnEngine why)))
     Nothing → conduct env roles
-  case result of
-    Right () → pure ()
+  -- A failure of the composition is committed whole (the primary and every cleanup failure attached to it) before any
+  -- effect runs, and a cancellation is remembered, not yet raised. Then the retirements are published and the queue is
+  -- drained once, after the cancellation has propagated out of every scope; only then is anything raised.
+  cancelled ← case result of
+    Right () → pure Nothing
     Left failure
-      | isAsync failure → do
-          -- the cancellation is what is raised; whatever publishing the retirements raised is kept beside it
-          swept ← sweepRetired session
-          composeCleanup (Just failure) [("lua session", other) | other ← swept] >>= maybe (rethrowIO failure) rethrowIO
-      | otherwise → recordFailure env failure
+      | isAsync failure → pure (Just failure)
+      | otherwise → Nothing <$ recordFailure env failure
   swept ← sweepRetired session
-  forM_ swept (recordFailure env)
+  drained ← collecting [runOwed session]
+  let interrupted = filter isAsync (swept <> drained)
+  case (cancelled, interrupted) of
+    (Just failure, _) → composeCleanup (Just failure) [("lua session", other) | other ← swept <> drained] >>= maybe (rethrowIO failure) rethrowIO
+    (Nothing, other : _) → rethrowIO other
+    (Nothing, []) → pure ()
   diagnose session $ do
     ended ← atomically (outcomeOf <$> readTVar cell)
     logInfo
@@ -804,7 +818,7 @@ rolesOf spec = case manifestRoles manifest of
 sweepRetired ∷ Session → IO [ExceptionWithContext SomeException]
 sweepRetired session = do
   state ← readTVarIO (sessionState session)
-  collecting [void (applyEvent session (RoleRetired role)) | (role, found) ← Map.toList (stRoles state), rsPhase found /= Retired]
+  collecting [void (commitEvent session (RoleRetired role)) | (role, found) ← Map.toList (stRoles state), rsPhase found /= Retired]
 
 -- | Run each of these, whatever the others do: every failure, interruptions included, is collected in order and none
 -- stops the rest. The caller raises or records what it collected.
@@ -817,12 +831,13 @@ collecting actions = fmap concat . forM actions $ \action →
 -- | A failure of the composition itself is the session's: a host failure of the engine, with whatever
 -- cleanup failed beside it.
 recordFailure ∷ Env → ExceptionWithContext SomeException → IO ()
-recordFailure env failure@(ExceptionWithContext _ exception) = do
-  let session = envSession env
-      primary = engineEntry HostFailure Nothing OnEngine (Text.pack (displayException exception))
-      cleanup = [cleanupEntry Nothing item | item ← cleanupOf failure]
-  void (applyEvent session (EngineFault Nothing primary))
-  forM_ cleanup (void . applyEvent session . EngineFault Nothing)
+recordFailure env failure = void (commitEvent (envSession env) (CompositionFailed (compositionEntries failure)))
+
+-- | The primary failure of the composition and every cleanup failure attached to it, as the engine entries one event
+-- commits together.
+compositionEntries ∷ ExceptionWithContext SomeException → [EngineEntry]
+compositionEntries failure@(ExceptionWithContext _ exception) =
+  engineEntry HostFailure Nothing OnEngine (Text.pack (displayException exception)) : [cleanupEntry Nothing item | item ← cleanupOf failure]
 
 -- | The cleanup failures an exception carries, as engine entries for a role.
 cleanupOf ∷ ExceptionWithContext SomeException → [(Text, ExceptionWithContext SomeException)]
@@ -966,7 +981,7 @@ admitOne env vm slot = mask $ \restore → do
         -- nothing it does can run before it is tracked, whatever lands in this window.
         let track = do
               atomically (modifyTVar' (envTracked env) (Map.insert identity (Held key identity ticket (declaredId declared))))
-              void (applyEvent session (Tracked role))
+              void (commitSilently session (Tracked role))
         restore (probeAt env (Issued key)) `finally` track
         restore (probeAt env (Tracking key))
       other → do
@@ -984,7 +999,7 @@ admitOne env vm slot = mask $ \restore → do
     ordinary = OrdinaryClass
     abandon identity = do
       forM_ identity (forgetInstance (rvFacade vm))
-      void (applyEvent session (Abandoned role))
+      void (commitSilently session (Abandoned role))
     onFailure action cleanup = tryWithContext @SomeException action >>= either (\failure → cleanup >> rethrowIO failure) pure
 
 -- Driving ------------------------------------------------------------------------------------------------------
@@ -1073,15 +1088,14 @@ waitFor env vms driver stm = readIORef (dvMode driver) >>= \case
 -- be accounted when it is finalized, once; otherwise the failure was another worker's, and the session ends
 -- because of it.
 supervisionFailed ∷ Env → [RoleVm] → ExceptionWithContext SomeException → IO ()
-supervisionFailed env vms failure@(ExceptionWithContext _ exception) = do
+supervisionFailed env vms failure = do
   -- A failure supervision latched ends the session whoever's it is: the gates close and every owner is asked to
   -- stop now, which also ends a wait for an entry whose owner can no longer evaluate it.
-  void (applyEvent (envSession env) Unwind)
+  void (commitEvent (envSession env) Unwind)
   statuses ← atomically (forM vms (\vm → Supervision.workerStatus (scheduledSupervised (rvOwner vm))))
   let ours = any isFatal statuses
-  unless ours $ do
-    void (applyEvent (envSession env) (EngineFault Nothing (engineEntry HostFailure Nothing OnEngine (Text.pack (displayException exception)))))
-    forM_ (cleanupOf failure) (void . applyEvent (envSession env) . EngineFault Nothing . cleanupEntry Nothing)
+  unless ours $
+    void (commitEvent (envSession env) (CompositionFailed (compositionEntries failure)))
   where
     isFatal = \case
       Supervision.WorkerFatal _ → True
@@ -1188,7 +1202,7 @@ act env vms driver = \case
     startPacing origin
   NextEnded role → forM_ (vmOf role) $ \vm → do
     probeAt env (OwnerEnded role)
-    (_, finalizing) ← finalizeOwner env (rvInfo vm) (rvOwner vm)
+    (_, finalizing) ← finalizeOwner (void . applyEvent session) env (rvInfo vm) (rvOwner vm)
     closeModuleCoordinator (rvCoordinator vm)
     modifyIORef' (dvFinalized driver) (Set.insert role)
     -- the role is finalized whatever finalizing raised; a cancellation among it is raised first, otherwise the first
@@ -1280,8 +1294,8 @@ act env vms driver = \case
 -- and no clock is read: an @init@ that succeeded is a historical fact the host keeps in the instance's shutdown
 -- disposition, committed with the settlement that proves it. What reading a settlement raised is returned for the
 -- caller to raise or record, and the commit is made whatever it was.
-finalizeOwner ∷ Env → RoleInfo → ScheduledOwner → IO (Completion (), [ExceptionWithContext SomeException])
-finalizeOwner env info owner = do
+finalizeOwner ∷ (Event → IO ()) → Env → RoleInfo → ScheduledOwner → IO (Completion (), [ExceptionWithContext SomeException])
+finalizeOwner commit env info owner = do
   completion ← atomically (awaitCompletion (supervisedWorker (scheduledSupervised owner)))
   held ← filter ((== role) . ikRole . hdKey) . Map.elems <$> readTVarIO (envTracked env)
   proven ← forM held $ \item →
@@ -1301,7 +1315,7 @@ finalizeOwner env info owner = do
           <> [ engineEntry CleanupFailure (Just role) OnCleanup (cleanupFailureLabel item <> ": " <> Text.pack (displayCleanupFailure item))
              | item ← completionCleanup completion
              ]
-  committed ← collecting [void (applyEvent (envSession env) (OwnerFinalized role entries (concatMap fst proven)))]
+  committed ← collecting [commit (OwnerFinalized role entries (concatMap fst proven))]
   pure (completion, concatMap snd proven <> committed)
   where
     role = riRole info

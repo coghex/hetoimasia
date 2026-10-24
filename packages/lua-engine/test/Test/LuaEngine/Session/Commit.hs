@@ -8,8 +8,8 @@
 module Test.LuaEngine.Session.Commit (spec) where
 
 import Control.Concurrent (forkIO, killThread, myThreadId, throwTo)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
-import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVarIO, writeTVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
+import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, toException, try, tryWithContext)
 import Control.Monad (void, when)
 import Data.List (isInfixOf)
@@ -20,10 +20,12 @@ import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, displayCleanupF
 import Hetoimasia.Foundation.Time (readInstant, scriptedSource)
 import Test.Hspec
 import Test.LuaEngine.Session.Support
+import Test.Support.Bounded (bounded)
 
 spec ∷ Spec
 spec = describe "the one commit" $ do
   boundaries
+  recovery
   facts
 
 -- | A gameplay script whose tick-1 update suspends with a closing handler that fails.
@@ -121,6 +123,100 @@ boundaries = describe "at each boundary between a commit and its effects" $ do
       messages ← readTVarIO written
       length (filter (== "start gate opened") messages) `shouldBe` 1
 
+-- Recovery and cancellation only commit --------------------------------------------------------------------------------------------
+
+recovery ∷ Spec
+recovery = describe "a recovery or a cancellation path only commits" $ do
+  it "reaches the unwind and stops the owners while the diagnostic that was interrupted is still blocked, and writes it in the final drain" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      let world = seWorld env
+      written ← newTVarIO ([] ∷ [Text])
+      blocked ← newTVarIO True
+      self ← myThreadId
+      let logger =
+            mkLogger defaultLogFilter . callbackSink $ \entry → do
+              let message = entryMessage entry
+              here ← myThreadId
+              -- the driver says that the start gate opened, and the sink does not return
+              when (message == "start gate opened" && here == self) $
+                atomically (readTVar blocked >>= \held → when held retry)
+              atomically (modifyTVar' written (message :))
+          env' = env {seSpec = (seSpec env) {sxLogger = logger}}
+      handle ← newEmptyMVar
+      _ ← forkIO $ do
+        session ← readMVar handle
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        -- the driver is in the sink: it is cancelled there
+        throwTo self ThreadKilled
+        -- the owners are stopped by the unwinding while the sink is still blocked, so the diagnostic cannot have been
+        -- retried before the cancellation propagated
+        pumpUntil world ((\out → "shutdown gameplay stopped" `elem` out && "shutdown presentation stopped" `elem` out) <$> outLines world)
+        atomically (writeTVar blocked False)
+      result ← try (runSession (scenarioSpec env' noHarness) (putMVar handle))
+      case result of
+        Left (found ∷ SomeException) → fromException found `shouldBe` Just ThreadKilled
+        Right _ → expectationFailure "the cancellation was lost"
+      messages ← readTVarIO written
+      length (filter (== "start gate opened") messages) `shouldBe` 1
+
+  it "gives up a stop effect that keeps failing after recording it once, and goes on" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      recorder ← newRecorder
+      failAt recorder (StopHandoff Gameplay) (toException (userError "the gameplay stop failed"))
+      failAt recorder (StopHandoff Presentation) (toException (userError "the presentation stop failed"))
+      self ← myThreadId
+      handle ← newEmptyMVar
+      done ← newEmptyMVar
+      _ ← forkIO $ do
+        session ← readMVar handle
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        -- every attempt to ask an owner to stop fails: each is recorded and given up, not retried without end
+        void (try @SomeException (requestStop session StopQuit))
+        putMVar done ()
+        void (awaitOutcome session (\found → length [entry | entry ← entriesOf found, Text.isInfixOf "could not be asked to stop" (eeMessage entry)] >= 2))
+        -- nothing can now stop the owners but the scope that leaves them: the calling thread is cancelled
+        throwTo self ThreadKilled
+      result ← try (runSession (scenarioSpec env (recordingHarness recorder noHarness)) (putMVar handle))
+      case result of
+        Left (found ∷ SomeException) → fromException found `shouldBe` Just ThreadKilled
+        Right _ → expectationFailure "the cancellation was lost"
+      bounded (takeMVar done)
+      session ← readMVar handle
+      found ← atomically (sessionOutcomeNow session)
+      length [entry | entry ← entriesOf found, Text.isInfixOf "could not be asked to stop" (eeMessage entry)] `shouldBe` 2
+
+  it "commits a composition failure and every cleanup failure attached to it whole, and publishes the retirements, before an interruption of its diagnostic is raised" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      interrupted ← newTVarIO False
+      let logger =
+            mkLogger defaultLogFilter . callbackSink $ \entry →
+              when (entryMessage entry == "session engine failure") $ do
+                already ← readTVarIO interrupted
+                when (not already) $ do
+                  atomically (writeTVar interrupted True)
+                  throwIO ThreadKilled
+          env' = env {seSpec = (seSpec env) {sxLogger = logger}}
+      recorder ← newRecorder
+      failAt recorder (Built Presentation BuildOwner) (toException (userError "construction failed"))
+      failAt recorder (Released Gameplay BuildFacade) (toException (userError "the gameplay facade's release failed"))
+      failAt recorder (Released Presentation BuildCoordinator) (toException (userError "the presentation coordinator's release failed"))
+      handle ← newEmptyMVar
+      result ← try (runSession (scenarioSpec env' (recordingHarness recorder noHarness)) (putMVar handle))
+      case result of
+        Left (found ∷ SomeException) → fromException found `shouldBe` Just ThreadKilled
+        Right _ → expectationFailure "the interruption of the diagnostic was lost"
+      session ← readMVar handle
+      status ← statusNow session
+      -- the retirements were published before the interruption was raised
+      phasesOf status `shouldBe` (Just Retired, Just Retired)
+      found ← atomically (sessionOutcomeNow session)
+      -- and the primary and both attached release failures are in the report, committed together
+      reportAccountedOf found `shouldBe` 3
+      map eeMessage (entriesOf found) `shouldSatisfy` any (Text.isInfixOf "the gameplay facade's release failed")
+      map eeMessage (entriesOf found) `shouldSatisfy` any (Text.isInfixOf "the presentation coordinator's release failed")
+
 -- The facts a commit proves ------------------------------------------------------------------------------------------
 
 facts ∷ Spec
@@ -172,3 +268,12 @@ facts = describe "the facts a commit carries" $ do
       status ← statusNow session
       fmap roleInitialized (presentationOf status) `shouldBe` Just True
       fmap rolePhase (presentationOf status) `shouldBe` Just Retired
+
+-- | Block until the outcome the session holds satisfies this.
+awaitOutcome ∷ Session → (SessionOutcome → Bool) → IO SessionOutcome
+awaitOutcome session wanted = bounded . atomically $ do
+  found ← sessionOutcomeNow session
+  if wanted found then pure found else retry
+
+reportAccountedOf ∷ SessionOutcome → Int
+reportAccountedOf found = length (entriesOf found) + erOmitted (outEngine found)

@@ -269,6 +269,9 @@ data Event
     Settled !Owed
   | -- | A diagnostic that was claimed and whose performer was cancelled goes back to the front of the queue.
     Requeued !Owed
+  | -- | The composition failed: the primary failure and every cleanup failure attached to it, as one event, so the
+    -- evidence is committed whole before any effect runs.
+    CompositionFailed ![EngineEntry]
   | -- | A diagnostic could not be written. It is a failure of the engine, recorded without a diagnostic of its own, so
     -- a sink that always raises cannot make the session say more and more about it.
     DiagnosticFailed !EngineEntry
@@ -347,6 +350,7 @@ diagnostics event before after answer =
       (Terminal failure, Latched True) → [failed (Just (rfRole failure)) failure]
       (EngineFault role entry, Latched True) → [engineFailure role entry]
       (OwnerFinalized role (entry : _) _, _) | erPrimary (stEngine before) == Nothing → [engineFailure (Just role) entry]
+      (CompositionFailed (entry : _), _) | erPrimary (stEngine before) == Nothing → [engineFailure Nothing entry]
       (_, Opened) → [Say SayInfo "start gate opened" []]
       _ → []
     failed role failure =
@@ -399,6 +403,10 @@ transition event state = case event of
      in quiet proven
   Settled owed → quiet state {stOwed = settleOne owed (stOwed state)}
   Requeued owed → quiet state {stOwed = owed Seq.<| stOwed state}
+  CompositionFailed entries ->
+    let folded = foldl' (\s entry -> let (n, _, _) = engineFault Nothing entry s in n) state entries
+        first = erPrimary (stEngine state) == Nothing && not (null entries)
+     in (folded, if null entries then Done else Latched first, [])
   DiagnosticFailed entry → engineFault Nothing entry state
   EngineFault role entry → engineFault role entry state
   Stop kind →
@@ -439,6 +447,7 @@ eventName = \case
   OwnerFinalized {} → "OwnerFinalized"
   Settled _ → "Settled"
   Requeued _ → "Requeued"
+  CompositionFailed _ → "CompositionFailed"
   DiagnosticFailed _ → "DiagnosticFailed"
   EngineFault _ _ → "EngineFault"
   Stop _ → "Stop"
