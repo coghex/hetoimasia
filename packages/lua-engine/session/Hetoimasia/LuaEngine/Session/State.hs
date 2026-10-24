@@ -32,12 +32,20 @@
 --   been asked; a one-role session needs only its own. It is shut, for good, by a stop or a failure
 --   that arrives first. A late success cannot reopen a shut gate.
 --
--- = Effects owed
+-- = The one commit, and the effects it owes
 --
--- A transition that closes a role's admission also records that the role's owner is owed a stop
--- ('stStopPending'), in the same transaction. Whoever applies the transition performs the stop and then
--- records it ('StopperRan'); a stop whose performer was cancelled, or whose owner did not exist yet, stays
--- owed, and the driver performs it. The stop is idempotent, so a stop done twice is a stop done once.
+-- Every change to the session is one 'Event' applied by 'step' in one STM transaction, and 'step' is the only
+-- function that changes a 'SessionState'. A transition changes /everything/ its event means in that one step:
+-- the failure latch, the phase, the gates, the marker that an instance's failure was already told ('stEarly'),
+-- the claim that an owner's completion was accounted ('stAccounted') and the historical facts the event proves
+-- (an @init@ that succeeded). It also appends to 'stOwed', in the same step, the effects the event owes: the stop
+-- of an owner whose admission it closed ('OweStop') and the diagnostics it means ('OweSay'). Nothing the event
+-- means is left to a step after it, so there is no window in which half of it has happened.
+--
+-- The owed effects are performed by whoever runs the queue (the committer, the driver, every teardown path), one
+-- at a time, each recorded as done only after it was performed. An effect that raises is recorded as a failure of
+-- the engine and the queue goes on; an effect whose performer was cancelled stays owed (a stop) or is put back (a
+-- diagnostic) for the next one. A stop is idempotent, so a stop done twice is a stop done once.
 --
 -- = The phases
 --
@@ -69,7 +77,11 @@ module Hetoimasia.LuaEngine.Session.State
     -- * Transitions
   , Event (..)
   , Answer (..)
-  , Effect (..)
+  , Say (..)
+  , SayLevel (..)
+  , Owed (..)
+  , owedStops
+  , eventName
   , step
 
     -- * What it publishes
@@ -83,8 +95,14 @@ module Hetoimasia.LuaEngine.Session.State
 
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
+import qualified Data.Sequence as Seq
+import Data.Sequence (Seq)
 import qualified Data.Set as Set
 import Data.Set (Set)
+import Data.Foldable (toList)
+import Data.Maybe (fromMaybe)
+import Data.Text (Text)
+import qualified Data.Text as Text
 import Hetoimasia.Foundation.Time (Instant)
 import Hetoimasia.LuaEngine.Manifest (Role (..))
 import Hetoimasia.LuaEngine.Session.Harness (InstanceKey (..))
@@ -146,8 +164,14 @@ data SessionState = SessionState
   , stStart ∷ !StartGate
   , stOrigin ∷ !(Maybe Instant)
   -- ^ The clock's reading taken just before the transition that opened the start gate: the pacing origin.
-  , stStopPending ∷ !(Set Role)
-  -- ^ The roles whose owner is owed a stop that has not been performed.
+  , stOwed ∷ !(Seq Owed)
+  -- ^ The effects the transitions so far owe and nobody has performed: the stops, in the order the admissions
+  -- closed, and the diagnostics, in the order they were meant.
+  , stAccounted ∷ !(Set Role)
+  -- ^ The roles whose owner's completion has been accounted, once each.
+  , stEarly ∷ !(Set Text)
+  -- ^ The instances whose failure the owner told the session of as the ending began, so that the settlement tells
+  -- it nothing new.
   , stStopping ∷ !Bool
   -- ^ Whole-session stopping.
   , stQuit ∷ !Bool
@@ -173,7 +197,9 @@ newSessionState limits roles =
     , stAdmitted = False
     , stStart = StartClosed
     , stOrigin = Nothing
-    , stStopPending = Set.empty
+    , stOwed = Seq.empty
+    , stAccounted = Set.empty
+    , stEarly = Set.empty
     , stStopping = False
     , stQuit = False
     , stInterrupt = False
@@ -221,16 +247,31 @@ data Event
     Tracked !Role
   | -- | The admission the intent stood for was not accepted.
     Abandoned !Role
-  | -- | An instance's @init@ has succeeded; the clock's reading taken just before, which is the pacing origin
-    -- if this success opens the start gate.
-    InitSucceeded !InstanceKey !Instant
-  | -- | The stop a role's owner was owed has been performed.
-    StopperRan !Role
-  | -- | A role failed (an instance of it, or its entry module): its bounded record, and what else failed as it ended.
+  | -- | An instance's @init@ has succeeded. The clock's reading taken just before is the pacing origin if this
+    -- success opens the start gate; a success proved by an instance's settlement after the gate can no longer
+    -- open (a stopped session) carries none, and opens nothing.
+    InitSucceeded !InstanceKey !(Maybe Instant)
+  | -- | A role failed (its entry module, or an instance of it that is not known to the host): its bounded record,
+    -- and what else failed as it ended.
     LatchFailure !Role !RoleFailure ![EngineEntry]
-  | -- | What else failed as an instance of a role ended, after its own failure was latched: accounted in the
-    -- engine report and nothing more, since the role already has its failure.
-    EndingAccounted !Role ![EngineEntry]
+  | -- | The host told the session, as an instance's ending began, that the instance failed: the failure is latched,
+    -- and the instance marked as told in the same step, so that its settlement adds only what else failed.
+    InstanceFailing !Text !Role !RoleFailure ![EngineEntry]
+  | -- | The host told the session, when an instance settled, of its failure: if it was told as the ending began,
+    -- what else failed is accounted and nothing more; otherwise it is latched, and the instance marked, as if it
+    -- had been told then.
+    InstanceEscalated !Text !Role !RoleFailure ![EngineEntry]
+  | -- | A role's owner has ended. In one step: the claim that its completion is accounted (once, whichever path
+    -- found it first), every failure and retained cleanup it ended with, and the @init@s the settlements of its
+    -- instances prove, which the session records as historical facts.
+    OwnerFinalized !Role ![EngineEntry] ![InstanceKey]
+  | -- | An effect owed was performed, or given up: a stop, or a diagnostic already claimed.
+    Settled !Owed
+  | -- | A diagnostic that was claimed and whose performer was cancelled goes back to the front of the queue.
+    Requeued !Owed
+  | -- | A diagnostic could not be written. It is a failure of the engine, recorded without a diagnostic of its own, so
+    -- a sink that always raises cannot make the session say more and more about it.
+    DiagnosticFailed !EngineEntry
   | -- | The engine, the host, a provider, a sink or cleanup failed, concerning this role's owner when
     -- one is known.
     EngineFault !(Maybe Role) !EngineEntry
@@ -258,16 +299,77 @@ data Answer
     Latched !Bool
   deriving (Eq, Show)
 
--- | What the one who applied a transition must now do, after the transaction has committed.
-newtype Effect = StopRoles [Role]
+-- | The effects a transition owes, performed after it has committed by whoever runs the queue.
+data Owed
+  = -- | The owner of this role is to be asked to stop. Idempotent.
+    OweStop !Role
+  | -- | A diagnostic to write.
+    OweSay !Say
   deriving (Eq, Show)
 
--- | Apply one event.
+-- | A diagnostic, as data: what the session means to say, written by the logger it was given.
+data Say = Say
+  { sayLevel ∷ !SayLevel
+  , sayMessage ∷ !Text
+  , sayFields ∷ ![(Text, Text)]
+  }
+  deriving (Eq, Show)
+
+data SayLevel = SayInfo | SayError
+  deriving (Eq, Show)
+
+-- | The roles whose stop is still owed, in the order they were recorded.
+owedStops ∷ SessionState → [Role]
+owedStops state = [role | OweStop role ← toList (stOwed state)]
+
+-- | Apply one event: the one function that changes a 'SessionState'.
 --
--- Every stop and every failure closes admission /in this transition/, and only then reports the owners
--- to stop, so nothing is asked to stop before the session says it takes no more work.
-step ∷ Event → SessionState → (SessionState, Answer, [Effect])
-step event state = case event of
+-- Every stop and every failure closes admission /in this transition/, and records the stop owed in the same
+-- step, so nothing is asked to stop before the session says it takes no more work and no stop can be lost between
+-- the two. The diagnostics the event means are appended after the stops it owes.
+step ∷ Event → SessionState → (SessionState, Answer)
+step event state =
+  let (next, answer, _) = transition event state
+      said = diagnostics event state next answer
+   in (next {stOwed = stOwed next <> Seq.fromList (map OweSay said)}, answer)
+
+-- | What an event means, as the diagnostics it owes. Pure: it reads the state before and after.
+diagnostics ∷ Event → SessionState → SessionState → Answer → [Say]
+diagnostics event before after answer =
+  firstly <> [Say SayInfo "session stopping" [("quit", flag (stQuit after)), ("interrupt", flag (stInterrupt after))] | stopped]
+  where
+    stopped = stStopping after && not (stStopping before)
+    flag = Text.toLower . Text.pack . show
+    firstly = case (event, answer) of
+      (LatchFailure role failure _, Latched True) → [failed (Just role) failure]
+      (InstanceFailing _ role failure _, Latched True) → [failed (Just role) failure]
+      (InstanceEscalated _ role failure _, Latched True) → [failed (Just role) failure]
+      (Terminal failure, Latched True) → [failed (Just (rfRole failure)) failure]
+      (EngineFault role entry, Latched True) → [engineFailure role entry]
+      (OwnerFinalized role (entry : _) _, _) | erPrimary (stEngine before) == Nothing → [engineFailure (Just role) entry]
+      (_, Opened) → [Say SayInfo "start gate opened" []]
+      _ → []
+    failed role failure =
+      Say
+        SayError
+        "role failed"
+        [ ("role", maybe "-" roleWord role)
+        , ("code", codeWord (rfCode failure))
+        , ("stage", stageWord (rfStage failure))
+        , ("instance", fromMaybe "-" (rfInstance failure))
+        ]
+    engineFailure role entry =
+      Say
+        SayError
+        "session engine failure"
+        [ ("code", codeWord (eeCode entry))
+        , ("stage", stageWord (eeStage entry))
+        , ("role", maybe (maybe "-" roleWord (eeRole entry)) roleWord role)
+        ]
+
+-- | The transition itself. Its third component is the stops it owes, which 'step' has already recorded in the state.
+transition ∷ Event → SessionState → (SessionState, Answer, [Role])
+transition event state = case event of
   Validated key
     | stDispatch state /= DispatchClosed → quiet state
     | otherwise → quiet (openDispatch state {stValidated = Set.insert key (stValidated state)})
@@ -282,10 +384,22 @@ step event state = case event of
   Tracked role → quiet (adjustRole role (\found → found {rsIntents = max 0 (rsIntents found - 1)}) state)
   Abandoned role → quiet (adjustRole role (\found → found {rsIntents = max 0 (rsIntents found - 1)}) state)
   InitSucceeded key now → initSucceeded key now state
-  StopperRan role → quiet state {stStopPending = Set.delete role (stStopPending state)}
   LatchFailure role failure secondary → latchFailure role failure secondary state
-  EndingAccounted _ secondary →
-    quiet state {stEngine = foldl' (flip (noteEngine (stLimits state))) (stEngine state) secondary}
+  InstanceFailing host role failure secondary
+    | Set.member host (stEarly state) → quiet state
+    | otherwise → latchFailure role failure secondary state {stEarly = Set.insert host (stEarly state)}
+  InstanceEscalated host role failure secondary
+    | Set.member host (stEarly state) → quiet state {stEngine = foldl' (flip (noteEngine (stLimits state))) (stEngine state) secondary}
+    | otherwise → latchFailure role failure secondary state {stEarly = Set.insert host (stEarly state)}
+  OwnerFinalized role entries inits ->
+    let accounted
+          | Set.member role (stAccounted state) = state
+          | otherwise = foldl' (\s entry → let (n, _, _) = engineFault (Just role) entry s in n) state {stAccounted = Set.insert role (stAccounted state)} entries
+        proven = foldl' (\s key → let (n, _, _) = initSucceeded key Nothing s in n) accounted inits
+     in quiet proven
+  Settled owed → quiet state {stOwed = settleOne owed (stOwed state)}
+  Requeued owed → quiet state {stOwed = owed Seq.<| stOwed state}
+  DiagnosticFailed entry → engineFault Nothing entry state
   EngineFault role entry → engineFault role entry state
   Stop kind →
     let marked = case kind of
@@ -298,10 +412,39 @@ step event state = case event of
       let latched = state {stTerminal = Just failure, stEngine = noteEngine (stLimits state) (roleFailureEntry failure) (stEngine state)}
        in wholeStop latched (Latched True)
   RoleRetired role →
-    quiet (adjustRole role (\found → found {rsPhase = Retired, rsAdmit = AdmitClosed}) state {stStopPending = Set.delete role (stStopPending state)})
-  Unwind → wholeStop state Done
+    quiet (adjustRole role (\found → found {rsPhase = Retired, rsAdmit = AdmitClosed}) state {stOwed = Seq.filter (/= OweStop role) (stOwed state)})
+  Unwind -> wholeStop state Done
   where
     quiet next = (next, Done, [])
+
+-- | Take an effect off the queue: a stop leaves it altogether (it is queued once), a diagnostic leaves once, so two
+-- identical lines meant twice are written twice.
+settleOne ∷ Owed → Seq Owed → Seq Owed
+settleOne owed queue = case owed of
+  OweStop _ → Seq.filter (/= owed) queue
+  OweSay _ → maybe queue (`Seq.deleteAt` queue) (Seq.elemIndexL owed queue)
+
+-- | The name of an event, for the harness's points and for logs.
+eventName ∷ Event → Text
+eventName = \case
+  Validated _ → "Validated"
+  AdmissionComplete → "AdmissionComplete"
+  Intend _ → "Intend"
+  Tracked _ → "Tracked"
+  Abandoned _ → "Abandoned"
+  InitSucceeded _ _ → "InitSucceeded"
+  LatchFailure {} → "LatchFailure"
+  InstanceFailing {} → "InstanceFailing"
+  InstanceEscalated {} → "InstanceEscalated"
+  OwnerFinalized {} → "OwnerFinalized"
+  Settled _ → "Settled"
+  Requeued _ → "Requeued"
+  DiagnosticFailed _ → "DiagnosticFailed"
+  EngineFault _ _ → "EngineFault"
+  Stop _ → "Stop"
+  Terminal _ → "Terminal"
+  RoleRetired _ → "RoleRetired"
+  Unwind → "Unwind"
 
 -- | Open the dispatch gate if every instance it waits for has been validated and admission is complete.
 openDispatch ∷ SessionState → SessionState
@@ -312,14 +455,18 @@ openDispatch state
 
 -- | Record that these roles' owners are owed a stop.
 owing ∷ [Role] → SessionState → SessionState
-owing roles state = state {stStopPending = foldr Set.insert (stStopPending state) roles}
+owing roles state = state {stOwed = foldl' record (stOwed state) roles}
+  where
+    record queue role
+      | OweStop role `elem` toList queue = queue
+      | otherwise = queue Seq.|> OweStop role
 
 adjustRole ∷ Role → (RoleState → RoleState) → SessionState → SessionState
 adjustRole role change state = state {stRoles = Map.adjust change role (stRoles state)}
 
 -- | An instance's @init@ succeeded. The fact is recorded whatever else has happened; the role moves to
 -- @ready@ or @running@ and the start gate opens only if nothing has failed or stopped.
-initSucceeded ∷ InstanceKey → Instant → SessionState → (SessionState, Answer, [Effect])
+initSucceeded ∷ InstanceKey → Maybe Instant → SessionState → (SessionState, Answer, [Role])
 initSucceeded key now state = case Map.lookup (ikRole key) (stRoles state) of
   Nothing → (state, Done, [])
   Just found →
@@ -330,12 +477,13 @@ initSucceeded key now state = case Map.lookup (ikRole key) (stRoles state) of
               recorded {rsPhase = case ikRole key of Presentation → Running; Gameplay → Ready}
           | otherwise = recorded
         state1 = state {stRoles = Map.insert (ikRole key) advanced (stRoles state)}
-     in if startable state1
-          then
-            let opened = state1 {stStart = StartOpen, stOrigin = Just now}
-                started = opened {stRoles = Map.adjust (\r → if rsPhase r == Ready then r {rsPhase = Running} else r) Gameplay (stRoles opened)}
-             in (started, Opened, [])
-          else (state1, Done, [])
+     in case now of
+          Just origin
+            | startable state1 →
+                let opened = state1 {stStart = StartOpen, stOrigin = Just origin}
+                    started = opened {stRoles = Map.adjust (\r → if rsPhase r == Ready then r {rsPhase = Running} else r) Gameplay (stRoles opened)}
+                 in (started, Opened, [])
+          _ → (state1, Done, [])
 
 -- | Whether the start gate may open now: closed, nothing stopped or failed, the dispatch gate
 -- open and every selected role's own @init@ done.
@@ -353,7 +501,7 @@ startable state =
 -- failure if the start gate has not opened, which ends the whole session; after that a presentation
 -- failure, or the failure of a session's only role, ends the whole session too, and a logical failure
 -- beside a healthy presentation role stops the logical role alone.
-latchFailure ∷ Role → RoleFailure → [EngineEntry] → SessionState → (SessionState, Answer, [Effect])
+latchFailure ∷ Role → RoleFailure → [EngineEntry] → SessionState → (SessionState, Answer, [Role])
 latchFailure role failure secondary state = case Map.lookup role (stRoles state) of
   Nothing → (state, Done, [])
   Just found →
@@ -377,12 +525,12 @@ latchFailure role failure secondary state = case Map.lookup role (stRoles state)
              in (next, Latched first, effects)
 
 -- | Close one role's admission now, reporting its owner to be stopped if it was taking work.
-closeRole ∷ Role → SessionState → (SessionState, [Effect])
+closeRole ∷ Role → SessionState → (SessionState, [Role])
 closeRole role state = case Map.lookup role (stRoles state) of
   Just found
     | rsAdmit found == AdmitOpen →
         ( owing [role] state {stRoles = Map.insert role found {rsAdmit = AdmitStopping, rsPhase = stopped found} (stRoles state)}
-        , [StopRoles [role]]
+        , [role]
         )
     | otherwise → (state {stRoles = Map.insert role found {rsPhase = stopped found} (stRoles state)}, [])
   Nothing → (state, [])
@@ -392,11 +540,11 @@ closeRole role state = case Map.lookup role (stRoles state) of
 -- | End the whole session: every role's admission closes, both gates close for good, and every role
 -- that was taking work is reported to be stopped. Idempotent in its effects: a role already stopping is
 -- not reported again.
-wholeStop ∷ SessionState → Answer → (SessionState, Answer, [Effect])
+wholeStop ∷ SessionState → Answer → (SessionState, Answer, [Role])
 wholeStop state answer =
   ( owing reported closed {stStopping = True}
   , answer
-  , [StopRoles reported | not (null reported)]
+  , reported
   )
   where
     roles = Map.toList (stRoles state)
@@ -413,7 +561,7 @@ wholeStop state answer =
 
 -- | An engine, host, provider, sink or cleanup failure ends the whole session. It is accounted in the
 -- engine report, and, when it concerns a role's owner, it is that role's failure if the role has none.
-engineFault ∷ Maybe Role → EngineEntry → SessionState → (SessionState, Answer, [Effect])
+engineFault ∷ Maybe Role → EngineEntry → SessionState → (SessionState, Answer, [Role])
 engineFault role entry state =
   let report = noteEngine (stLimits state) entry (stEngine state)
       state1 = state {stEngine = report}

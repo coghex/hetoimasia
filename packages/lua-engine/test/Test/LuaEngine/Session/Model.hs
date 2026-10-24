@@ -49,7 +49,7 @@ presentationOnly = newSessionState limits [(Presentation, 1)]
 
 -- | An instance's @init@ succeeded when the injected clock read this many nanoseconds.
 initAt ∷ Integer → InstanceKey → Event
-initAt n key = InitSucceeded key (instant n)
+initAt n key = InitSucceeded key (Just (instant n))
 
 initOk ∷ InstanceKey → Event
 initOk = initAt 0
@@ -63,8 +63,13 @@ runAll ∷ [Event] → SessionState → (SessionState, [Answer], [Effect])
 runAll events initial = foldl' go (initial, [], []) events
   where
     go (state, answers, effects) event =
-      let (next, answer, reported) = step event state
-       in (next, answers <> [answer], effects <> reported)
+      let (next, answer) = step event state
+          added = [role | role ← owedStops next, role `notElem` owedStops state]
+       in (next, answers <> [answer], effects <> [StopRoles added | not (null added)])
+
+-- | The stops a transition owed, as the examples read them: the owners to be asked, in the order they were recorded.
+newtype Effect = StopRoles [Role]
+  deriving (Eq, Show)
 
 applied ∷ [Event] → SessionState → SessionState
 applied events initial = let (state, _, _) = runAll events initial in state
@@ -285,8 +290,9 @@ policy = describe "the failure policy" $ do
 
   it "accounts what else failed as an instance ended in the report without latching a second failure" $ do
     let entry = engineEntry CleanupFailure (Just Gameplay) OnShutdown "shutdown failed"
-        state = applied [LatchFailure Gameplay (failure Gameplay OnUpdate "boom") [], EndingAccounted Gameplay [entry]] both
-    answersOf [LatchFailure Gameplay (failure Gameplay OnUpdate "boom") [], EndingAccounted Gameplay [entry]] both `shouldBe` [Latched True, Done]
+        told = [InstanceFailing "inst" Gameplay (failure Gameplay OnUpdate "boom") [], InstanceEscalated "inst" Gameplay (failure Gameplay OnUpdate "boom") [entry]]
+        state = applied told both
+    answersOf told both `shouldBe` [Latched True, Done]
     erSecondary (stEngine state) `shouldBe` [entry]
     reportAccounted (stEngine state) `shouldBe` 2
     roleFailure' Gameplay state `shouldBe` Just (failure Gameplay OnUpdate "boom")
@@ -411,8 +417,8 @@ invariants = describe "every order of events" $ do
       , LatchFailure Presentation (failure Presentation OnUpdate "p") []
       , Stop StopQuit
       , Stop StopInterrupt
-      , StopperRan Gameplay
-      , StopperRan Presentation
+      , Settled (OweStop Gameplay)
+      , Settled (OweStop Presentation)
       ]
 
 -- | Every sequence of up to this many events from a menu.
@@ -428,7 +434,7 @@ violations = go both
   where
     go _ [] = []
     go state (event : rest) =
-      let (next, _, _) = step event state
+      let (next, _) = step event state
        in [show event <> ": " <> why | why ← check event state next] <> go next rest
     check event prior afterwards =
       concat
@@ -446,8 +452,8 @@ violations = go both
           [ "a failed role is ready or running" | found ← Map.elems (stRoles afterwards), isJust (rsFailure found), rsPhase found `elem` [Ready, Running] ]
         , [ "a role's first failure changed" | role ← [Gameplay, Presentation], Just first ← [Map.lookup role (stRoles prior) >>= rsFailure], (Map.lookup role (stRoles afterwards) >>= rsFailure) /= Just first ]
         , -- a stop is owed to a role that does not take work, and is dropped only when it is performed or the role has retired
-          [ "a stop is owed to a role that takes work" | role ← Set.toList (stStopPending afterwards), roleAdmit role afterwards == AdmitOpen ]
-        , [ "an owed stop was dropped" | role ← Set.toList (stStopPending prior), role `Set.notMember` stStopPending afterwards, not (performs event role) ]
+          [ "a stop is owed to a role that takes work" | role ← owedStops afterwards, roleAdmit role afterwards == AdmitOpen ]
+        , [ "an owed stop was dropped" | role ← owedStops prior, role `notElem` owedStops afterwards, not (performs event role) ]
         , -- the pacing origin is recorded by the transition that opens the start gate, once
           [ "the origin changed after it was recorded" | isJust (stOrigin prior), stOrigin afterwards /= stOrigin prior ]
         , [ "the origin was recorded without the gate opening" | stOrigin prior == Nothing, isJust (stOrigin afterwards), not opening ]
@@ -460,7 +466,7 @@ violations = go both
       where
         opening = stStart afterwards == StartOpen && stStart prior /= StartOpen
         performs by role = case by of
-          StopperRan done → done == role
+          Settled (OweStop done) → done == role
           RoleRetired done → done == role
           _ → False
 

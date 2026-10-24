@@ -76,6 +76,9 @@ data Point
     GrantIssued !Word64
   | -- | A role's owner has ended and is about to be finalized.
     OwnerEnded !Role
+  | -- | An event has been committed, in one transaction, and the effects it owes have not been run: holding the
+    -- thread here, or raising from it, leaves every one of them owed.
+    Committed !String
   | -- | A role's owner is about to be asked to stop, by whoever is discharging the stop the session owes it.
     StopHandoff !Role
   | -- | A role's owner has ended and been accounted, and its coordinator is about to be waited for until it has

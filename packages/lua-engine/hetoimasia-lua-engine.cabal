@@ -385,6 +385,8 @@ test-suite lua-engine-tests
         Test.LuaEngine.Scene.Spec
         Test.LuaEngine.Scene.Support
         Test.LuaEngine.Session.Client
+        Test.LuaEngine.Session.Commit
+        Test.LuaEngine.Session.Commit
         Test.LuaEngine.Session.Clocks
         Test.LuaEngine.Session.Construction
         Test.LuaEngine.Session.Evidence

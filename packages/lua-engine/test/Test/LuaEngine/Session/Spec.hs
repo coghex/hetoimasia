@@ -3,6 +3,7 @@ module Test.LuaEngine.Session.Spec (spec) where
 
 import qualified Test.LuaEngine.Session.Client as Client
 import qualified Test.LuaEngine.Session.Clocks as Clocks
+import qualified Test.LuaEngine.Session.Commit as Commit
 import qualified Test.LuaEngine.Session.Construction as Construction
 import qualified Test.LuaEngine.Session.Evidence as Evidence
 import qualified Test.LuaEngine.Session.Failures as Failures
@@ -20,4 +21,5 @@ spec = describe "Session" $ do
   Evidence.spec
   Stop.spec
   Construction.spec
+  Commit.spec
   Client.spec
