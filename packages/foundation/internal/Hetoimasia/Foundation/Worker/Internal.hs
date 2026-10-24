@@ -78,6 +78,7 @@ module Hetoimasia.Foundation.Worker.Internal
   , StartRejection (..)
   , startWorker
   , startWorkerWith
+  , startWorkerWithIO
 
     -- * Requests
   , requestStop
@@ -145,7 +146,7 @@ import Hetoimasia.Foundation.Worker.Outcome
   , WorkerSummary
   )
 import Hetoimasia.Foundation.Worker.Requests (requestCancel, requestStop)
-import Hetoimasia.Foundation.Worker.Startup (startWorker, startWorkerWith)
+import Hetoimasia.Foundation.Worker.Startup (startWorker, startWorkerWith, startWorkerWithIO)
 import Hetoimasia.Foundation.Worker.Types
   ( GroupProbe (..)
   , GroupStatus (..)

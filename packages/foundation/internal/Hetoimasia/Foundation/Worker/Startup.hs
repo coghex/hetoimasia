@@ -3,7 +3,8 @@
 --
 -- This module belongs to the package's private @internal@ sublibrary and is
 -- not exposed even there: "Hetoimasia.Foundation.Worker.Internal" re-exports
--- 'startWorker' and 'startWorkerWith' for the rest of the package. It is
+-- 'startWorker', 'startWorkerWith', and 'startWorkerWithIO' for the rest of the
+-- package. It is
 -- private because 'register', 'runChild', and 'publish' write group state no
 -- client can name.
 --
@@ -25,6 +26,7 @@
 module Hetoimasia.Foundation.Worker.Startup
   ( startWorker
   , startWorkerWith
+  , startWorkerWithIO
   , register
   , runChild
   , publish
@@ -76,6 +78,20 @@ startWorker group definition = do
 -- | Start a worker with an explicit preparation step and a caller-composed
 -- startup wait.
 --
+-- This is 'startWorkerWithIO' whose wait is one STM transaction. The handoff,
+-- the cancellation of a failed wait, and the evidence a failure carries are
+-- described there.
+startWorkerWith
+  ∷ WorkerGroup
+  → WorkerDefinition r
+  → (Worker r → IO ())
+  → (Worker r → STM a)
+  → IO (Either StartRejection (Worker r, a))
+startWorkerWith group definition prepare wait = startWorkerWithIO group definition prepare (atomically . wait)
+
+-- | Start a worker with an explicit preparation step and a caller-supplied
+-- startup wait that may run 'IO'.
+--
 -- The handoff, in order:
 --
 -- 1. Registration: in one transaction the group is checked for open
@@ -89,8 +105,11 @@ startWorker group definition = do
 --    before any of the child's user code. A later supervisor registers its
 --    own policy for the worker here.
 -- 4. The gate opens and @wait@ runs with the caller's masking state. It is an
---    STM transaction the caller composes, typically 'awaitStartup' combined
---    with another condition, and its result is returned with the handle.
+--    action the caller composes, typically 'awaitStartup' in a transaction
+--    alone or combined with another condition, and its result is returned
+--    with the handle. A caller that must act in 'IO' while the new worker is
+--    starting, and still before the worker is drained, does it here: it may
+--    run 'IO' between waits and wait again.
 --
 -- If @prepare@ or @wait@ fails or is cancelled, cancellation of the worker is
 -- requested and the starter waits, absorbing further interruptions, until the
@@ -101,13 +120,13 @@ startWorker group definition = do
 --
 -- A @wait@ that returns without acknowledgement leaves the worker running and
 -- owned by the group.
-startWorkerWith
+startWorkerWithIO
   ∷ WorkerGroup
   → WorkerDefinition r
   → (Worker r → IO ())
-  → (Worker r → STM a)
+  → (Worker r → IO a)
   → IO (Either StartRejection (Worker r, a))
-startWorkerWith group (WorkerDefinition label startup) prepare wait = mask $ \restore → do
+startWorkerWithIO group (WorkerDefinition label startup) prepare wait = mask $ \restore → do
   declared ← evaluate label
   reserved ← atomically (register group declared)
   case reserved of
@@ -123,7 +142,7 @@ startWorkerWith group (WorkerDefinition label startup) prepare wait = mask $ \re
       handoff ← trySome $ do
         restore (prepare worker)
         atomically (writeTVar (entryGate entry) True)
-        restore (atomically (wait worker))
+        restore (wait worker)
       case handoff of
         Right waited → pure (Right (worker, waited))
         Left failure → do

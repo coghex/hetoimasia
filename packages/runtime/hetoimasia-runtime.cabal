@@ -72,6 +72,7 @@ test-suite runtime-tests
         Test.Runtime.Reporting
         Test.Runtime.ResourceSmoke
         Test.Runtime.Supervision
+        Test.Runtime.Supervision.Startup
         Test.Runtime.Supervision.Support
         Test.Runtime.UpdatePolicy
     default-language: GHC2024

@@ -109,6 +109,7 @@ import Hetoimasia.Foundation.Worker
   , requestStop
   , startWorker
   , startWorkerWith
+  , startWorkerWithIO
   , withWorkerGroup
   , workerDefinition
   , workerEvidenceInContext
@@ -143,6 +144,8 @@ spec = describe "Workers" $ do
       (boundedExample testCancelledStartupWait)
     it "prepares before any child code and drains the child when a composed wait fails"
       (boundedExample testComposedWaitFailure)
+    it "runs the caller's IO wait while the child is starting, and drains the child when that wait fails"
+      (boundedExample testIoWaitActsBeforeDrain)
     it "cancels and drains the fork it owns when preparation fails"
       (boundedExample testPreparationFailure)
     it "reports acknowledgement and completion ready together"
@@ -454,6 +457,39 @@ testComposedWaitFailure = do
     Right _ → expectationFailure "the composed wait's failure must propagate"
   readIORef trace
     >>= (`shouldBe` ["prepared", "prepared done", "child startup", "acquire child", "release child"])
+  void (tryPutMVar never ())
+
+testIoWaitActsBeforeDrain ∷ Expectation
+testIoWaitActsBeforeDrain = do
+  trace ← newTrace
+  entered ← newEmptyMVar
+  never ← newEmptyMVar
+  outcome ← tryWithContext $ withWorkerGroup $ \group →
+    startWorkerWithIO
+      group
+      ( workerDefinition
+          "io-wait"
+          ( \_ → do
+              liftIO (record trace "child startup")
+              resource trace "child"
+              liftIO (putMVar entered () >> takeMVar never)
+          )
+          (\_ () → record trace "run")
+      )
+      (\_ → pure ())
+      ( \_ → do
+          -- The child is starting, held; the wait acts in IO before anything is drained.
+          takeMVar entered
+          record trace "wait acted"
+          throwIO (Broken "io wait failed")
+      )
+  caught ← expectFailure outcome
+  caught `shouldSatisfy` isException (Broken "io wait failed")
+  case contextOf caught of
+    AbandonedStart summary : _ → kindOf summary `shouldBe` CancelledKind
+    _ → expectationFailure "expected the abandoned start as evidence"
+  readIORef trace
+    >>= (`shouldBe` ["child startup", "acquire child", "wait acted", "release child"])
   void (tryPutMVar never ())
 
 testPreparationFailure ∷ Expectation
