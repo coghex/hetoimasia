@@ -166,9 +166,6 @@ data Point
   | -- | A content request found the session's admission open at the facade's argument check, and its admission
     -- is about to be made by the host in another step: the point to hold to see a closure commit in between.
     RequestChecked !Role
-  | -- | An instance of this role has settled as a failure and the application is about to be told, on the owner's
-    -- thread: holding it holds the owner's accounting of the ending, which the tick's accounting waits for.
-    Escalating !Role
   | -- | Only with 'ProtectAccountingEvent' removed: the driver is about to wait, by itself and without observing anything
     -- else, for the accounting of a finished tick.
     AccountingWait

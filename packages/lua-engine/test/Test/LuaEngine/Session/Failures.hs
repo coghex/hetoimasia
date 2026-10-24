@@ -160,71 +160,152 @@ logicalFailure = describe "of the logical role after the start" $ do
           fmap roleFailed (gameplayOf status') `shouldBe` Just True
           requestStop session StopQuit
 
--- | How the logical role's accounting is made to last while the presentation role is stopped.
-data Holding
-  = -- | A tick of the logical role fails and the owner is held in telling the application of the settled failure.
-    HeldInEscalation
-  | -- | A tick finishes and the driver's accounting of it is awaited, however long that takes: the point told where
-    -- the driver would wait by itself is held (only with the event removed does the driver wait by itself).
-    HeldInAccountingWait
+-- | What the proof about a held retirement observed.
+data HeldRetirement = HeldRetirement
+  { hrGrants ∷ ![Word64]
+  -- ^ The ticks granted, while the retirement was held.
+  , hrUpdates ∷ !Int
+  -- ^ How many times the presentation role updated while it was held.
+  , hrPublished ∷ !Bool
+  -- ^ Whether the presentation role's history was published after it was stopped, without opening the gate.
+  , hrRetired ∷ !Bool
+  -- ^ Whether the presentation role was retired, without opening the gate.
+  , hrStops ∷ ![Test.LuaEngine.Session.Support.Role]
+  -- ^ The owners that had been handed their stop, without opening the gate.
+  , hrLogicalRetired ∷ !Bool
+  -- ^ Whether the logical role was retired, without opening the gate.
+  }
+  deriving (Eq, Show)
 
--- | Whether the presentation role's history is published and the role retired while the logical role's accounting is
--- held, after the presentation role was stopped.
-presentationWhileAccountingHeld ∷ Holding → [Protection] → IO (Bool, Bool)
-presentationWhileAccountingHeld holding removedProtections =
-  withSetup (setup (roleScript printScript {scInit = [], scUpdate = ["if api.role == 'gameplay' then print('tick ' .. api.time.tick()) end", "if api.role == 'gameplay' and " <> failing <> " then error('boom') end"]})) $ \env → do
-    let world = seWorld env
-    recorder ← newRecorder
-    handles ← newTVarIO Map.empty
-    published ← newIORef (False, False)
-    case holding of
-      HeldInEscalation → holdAt recorder (Escalating Gameplay)
-      HeldInAccountingWait → holdAt recorder AccountingWait
-    let harness = (recordingHarness recorder noHarness) {harnessRemoved = removedProtections, harnessOwner = \role found → atomically (modifyTVar' handles (Map.insert role found))}
-        readPublished session = do
-          found ← historyNow session
-          status ← statusNow session
-          writeIORef published (any ((== Presentation) . ikRole) (Map.keys (historyFacts found)), fmap rolePhase (presentationOf status) == Just Retired)
-    _ ← runCaught env harness $ \_ session → do
-      awaitPhase session Gameplay Running
-      awaitPhase session Presentation Running
-      awaitRegistration world 1000
-      nudge world 1000000
-      case holding of
-        HeldInEscalation → awaitPoint recorder (Escalating Gameplay)
-        HeldInAccountingWait
-          | null removedProtections → pumpUntil world (elem "tick 1" <$> outLines world)
-          | otherwise → awaitPoint recorder AccountingWait
-      requestStop session StopQuit
-      -- the logical role's accounting is held; the presentation role is not, and must not wait behind it
-      if null removedProtections
-        then awaitPhase session Presentation Retired >> readPublished session
-        else do
-          -- (the control: the driver waits for the accounting by itself, so nothing else is observed meanwhile, and
-          -- the presentation role's owner has ended and is not accounted)
-          found ← readTVarIO handles
-          forM_ (Map.lookup Presentation found) ownerSettled
-          readPublished session
-      releaseHold recorder (Escalating Gameplay)
-      releaseHold recorder AccountingWait
-      void (awaitRetired session)
-    readIORef published
-  where
-    failing = case holding of
-      HeldInEscalation → "true"
-      HeldInAccountingWait → "false"
+-- | A logical tick finishes whose instance ending owes a provider's retirement, held at a test gate: the first
+-- instance of the logical role fails, the role's policy ends its second instance too, and that one holds a read the pool
+-- has not returned, which its shutdown and so the tick's accounting wait for. While the gate is held the presentation
+-- role keeps updating and is stopped; what was observed before the gate is opened.
+heldRetirement ∷ [Protection] → IO HeldRetirement
+heldRetirement removedProtections =
+  withSetup
+    ( addFile
+        ("lua/slow.bin", "slow")
+        ( (setup
+            ( roleScript
+                printScript
+                  { scInit = ["if api.role == 'gameplay' and api.instance_id == 'inst-2' then self.request = api.content.data('lua/slow.bin', {tick_offset = 50}) end"]
+                  , scUpdate = ["if api.role == 'gameplay' and api.instance_id == 'inst-1' then error('boom') end", "if api.role == 'presentation' then print('ui update') end"]
+                  , scShutdown = ["print('shutdown ' .. api.role .. ' ' .. reason)"]
+                  }
+            )
+          )
+            { suHarness = noHarness {harnessSecond = [Gameplay]}
+            }
+        )
+    )
+    $ \env → do
+      let world = seWorld env
+          probe = ssProbeOf env
+      closeGate probe "lua/slow.bin"
+      recorder ← newRecorder
+      handles ← newTVarIO Map.empty
+      observed ← newIORef (HeldRetirement [] 0 False False [] False)
+      let harness = (recordingHarness recorder noHarness) {harnessRemoved = removedProtections, harnessSecond = [Gameplay], harnessOwner = \role found → atomically (modifyTVar' handles (Map.insert role found))}
+          countUpdates = length . filter (== "ui update") <$> outLines world
+      _ ← runCaught env harness $ \_ session → do
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        awaitReadOf env "lua/slow.bin"
+        awaitRegistration world 1000
+        -- the first tick: the first instance fails, and the second, which holds the read, is ended with it
+        nudge world 1000000
+        void (awaitStatus session (maybe False roleFailed . gameplayOf))
+        -- the tick has finished and its accounting is awaited (in the control, by the driver by itself)
+        if null removedProtections then pure () else awaitPoint recorder AccountingWait
+        -- the presentation role goes on updating
+        seenBefore ← countUpdates
+        passTime world 1000000000 ((> seenBefore) <$> countUpdates)
+        updates ← countUpdates
+        requestStop session StopQuit
+        found ← readTVarIO handles
+        if null removedProtections
+          then awaitPhase session Presentation Retired
+          else forM_ (Map.lookup Presentation found) ownerSettled
+        history ← historyNow session
+        status ← statusNow session
+        points ← recorded recorder
+        writeIORef
+          observed
+          HeldRetirement
+            { hrGrants = [number | GrantIssued number ← points]
+            , hrUpdates = updates - seenBefore
+            , hrPublished = any ((== Presentation) . ikRole) (Map.keys (historyFacts history))
+            , hrRetired = fmap rolePhase (presentationOf status) == Just Retired
+            , hrStops = historyStopped history
+            , hrLogicalRetired = fmap rolePhase (gameplayOf status) == Just Retired
+            }
+        openGate probe "lua/slow.bin"
+        void (awaitRetired session)
+      readIORef observed
+
+-- | The driver is cancelled while it watches the accounting of a finished tick that a provider's retirement holds: the
+-- session unwinds through the watch (cleared on the way out), keeps the cancellation, and retires every role once the
+-- retirement completes.
+cancelledWhileWatched ∷ IO (Either Caught SessionOutcome, Bool)
+cancelledWhileWatched =
+  withSetup
+    ( addFile
+        ("lua/slow.bin", "slow")
+        ( (setup
+            ( roleScript
+                printScript
+                  { scInit = ["if api.role == 'gameplay' and api.instance_id == 'inst-2' then self.request = api.content.data('lua/slow.bin', {tick_offset = 50}) end"]
+                  , scUpdate = ["if api.role == 'gameplay' and api.instance_id == 'inst-1' then error('boom') end"]
+                  , scShutdown = ["print('shutdown ' .. api.role .. ' ' .. reason)"]
+                  }
+            )
+          )
+            { suHarness = noHarness {harnessSecond = [Gameplay]}
+            }
+        )
+    )
+    $ \env → do
+      let world = seWorld env
+          probe = ssProbeOf env
+      closeGate probe "lua/slow.bin"
+      recorder ← newRecorder
+      (ended, session) ← runCaught env ((recordingHarness recorder noHarness) {harnessSecond = [Gameplay]}) $ \driver session → do
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        awaitReadOf env "lua/slow.bin"
+        awaitRegistration world 1000
+        nudge world 1000000
+        void (awaitStatus session (maybe False roleFailed . gameplayOf))
+        -- the finished tick's accounting is watched and held by the retirement
+        throwTo driver ThreadKilled
+        void (awaitStatus session statusStopping)
+        openGate probe "lua/slow.bin"
+        void (awaitRetired session)
+      found ← outcomeNow session
+      pure (ended, outRetired found)
 
 accountingHeld ∷ Spec
-accountingHeld = describe "the logical role's accounting held and the presentation role" $ do
-  it "publishes the presentation role's history and retires it while the owner is held in accounting a failed tick's ending" $
-    presentationWhileAccountingHeld HeldInEscalation [] >>= (`shouldBe` (True, True))
+accountingHeld = describe "a provider's retirement held after a logical tick has finished" $ do
+  it "unwinds a cancellation of the driver through the watched accounting, retiring every role once the retirement completes" $ do
+    (ended, retired) ← cancelledWhileWatched
+    raisedKilled ended `shouldBe` True
+    retired `shouldBe` True
 
-  it "publishes the presentation role's history and retires it while a finished tick's accounting is awaited" $
-    presentationWhileAccountingHeld HeldInAccountingWait [] >>= (`shouldBe` (True, True))
+  it "grants no further tick, keeps the presentation role updating, and stops every owner and publishes and retires the presentation role without the gate opened, leaving the logical role unretired" $ do
+    found ← heldRetirement []
+    hrGrants found `shouldBe` [1]
+    hrUpdates found `shouldSatisfy` (>= 1)
+    hrPublished found `shouldBe` True
+    hrRetired found `shouldBe` True
+    hrStops found `shouldBe` [Gameplay, Presentation]
+    hrLogicalRetired found `shouldBe` False
 
   describe "with the driver waiting for the accounting by itself (a negative control)" $
-    it "leaves the presentation role unpublished and unretired for as long as the accounting is awaited, which the proof above detects" $
-      presentationWhileAccountingHeld HeldInAccountingWait [ProtectAccountingEvent] >>= (`shouldBe` (False, False))
+    it "leaves the presentation role unpublished and unretired while the retirement is held, which the proof above detects" $ do
+      found ← heldRetirement [ProtectAccountingEvent]
+      hrPublished found `shouldBe` False
+      hrRetired found `shouldBe` False
 
 -- The rest of the session ---------------------------------------------------------------------------------------------------------
 

@@ -8,15 +8,16 @@
 -- after the grant finished the example shows tick completion has returned meanwhile.
 module Test.LuaRuntime.Accounting.Windows (spec) where
 
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, tryReadMVar)
-import Control.Concurrent.STM (atomically, writeTVar)
+import Control.Concurrent (forkIO)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryReadMVar)
+import Control.Concurrent.STM (atomically, newTVarIO, orElse, readTVar, retry, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException, throwIO)
 import Control.Monad (forM_, void, when)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Maybe (isJust)
 import Hetoimasia.Scripting.Lua.Value (Value (VText))
 import qualified Data.Text as Text
-import Hetoimasia.Runtime.Supervision (WorkerStatus (WorkerUnavailable))
+import Hetoimasia.Runtime.Supervision (WorkerStatus (WorkerUnavailable), awaitSupervised)
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Lease
 import Hetoimasia.Scripting.Lua.Scheduled
@@ -126,6 +127,40 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         tickOf base "r" >>= pollInstance >>= (`shouldSatisfy` \case Nothing → True; Just _ → False)
         completeRetirement fixture "async-res"
         answer waiting >>= (`shouldBe` AccountingComplete)
+        settled ← awaitSettled base "r"
+        resultPhase settled `shouldBe` Failed
+        retireScheduled owner
+
+    it "gives a caller's own alternative the one supervised wait while a provider owes a retirement, and the step answers only once it completes (D-86)" $ bounded $ do
+      fixture ← newLFix 4
+      let base = lfBase fixture
+      withBoundary $ \control runtime → releasing (sf (lfBase fixture)) [] $ providersFinish fixture $ do
+        owner ← startLeased fixture runtime "retirement parts" [refusedLeased] leaseConfig requiredPolicy
+        _ ← admit base owner "r" (moduleNamed "refusedleased")
+        awaitPhase base owner "r" Active
+        liveFor fixture "r" 1
+        expectDelivered base owner "r" 1
+        awaitDiagnosticsWaiting owner
+        grant owner 1
+        -- The ending is parked on the provider; the grant is finished; the owner is idle.
+        awaitSummary fixture "r" ((== 1) . summaryPending)
+        awaitTicksComplete control owner >>= (`shouldBe` TicksCompleted)
+        awaitIdle (sf base)
+        -- The caller's own state ranks above the step: it is what the one wait returns while the retirement is owed.
+        wanted ← newTVarIO True
+        let parts = (Left <$> (readTVar wanted >>= \set → if set then pure () else retry)) `orElse` (Right <$> scheduledAccountingStep owner)
+        atomically (watchScheduledAccounting owner)
+        awaitSupervised control parts >>= (`shouldBe` Left ())
+        atomically (unwatchScheduledAccounting owner)
+        -- Without it the step does not answer until the retirement completes, and then answers the completion.
+        atomically (writeTVar wanted False)
+        answered ← newEmptyMVar
+        atomically (watchScheduledAccounting owner)
+        _ ← forkIO (awaitSupervised control parts >>= putMVar answered)
+        tryReadMVar answered >>= (`shouldBe` Nothing)
+        completeRetirement fixture "async-res"
+        takeMVar answered >>= (`shouldBe` Right AccountingComplete)
+        atomically (unwatchScheduledAccounting owner)
         settled ← awaitSettled base "r"
         resultPhase settled `shouldBe` Failed
         retireScheduled owner

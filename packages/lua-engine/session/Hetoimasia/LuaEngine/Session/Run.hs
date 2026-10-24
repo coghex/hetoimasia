@@ -692,7 +692,6 @@ failingFor env role failure = do
 -- after a stop, a release that fails) is latched here, by the same policy.
 escalateFor ∷ Env → Role → InstanceFailure → IO Escalation
 escalateFor env role failure = do
-  probeAt env (Escalating role)
   tracked ← atomically (awaitTracked env role (failureInstance failure))
   let info = envRoles env Map.! role
       (record, secondary) =

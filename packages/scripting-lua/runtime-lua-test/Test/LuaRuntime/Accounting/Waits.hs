@@ -334,6 +334,22 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
       let ExceptionWithContext _ raised = failure
       raised `shouldSatisfy` brokenIs "bang"
 
+    it "handles a pending owner outcome, and rethrows a fatal one, before the step can answer, when the step is made in the caller's own supervised wait (D-86)" $ bounded $ do
+      fixture ← newSFixture
+      failure ← expectFatal $ \control runtime → releasing fixture [] $ do
+        owner ← startPlain fixture runtime "ready parts" requiredPolicy defaultSchedulerBounds
+        other ← startPlain fixture runtime "failing parts" requiredPolicy defaultSchedulerBounds
+        _ ← admitTask' fixture other "bang" (request "host_fail" [VText "bang"] OrdinaryClass OneShot Nothing)
+        atomically $ do
+          status ← workerGroupStatus control
+          when (any awaitingFailing (statusOutstanding status)) retry
+        -- the step is ready all the same, and is not what the one wait answers
+        atomically (watchScheduledAccounting owner)
+        void (Supervision.awaitSupervised control (scheduledAccountingStep owner))
+        failExample "the step answered instead of the wait rethrowing the fatal failure"
+      let ExceptionWithContext _ raised = failure
+      raised `shouldSatisfy` brokenIs "bang"
+
     it "ends with an owner that failed recognizably, and not with a completion, once supervision has handled it" $ bounded $ do
       fixture ← newSFixture
       withBoundary $ \control runtime → releasing fixture [] $ do
