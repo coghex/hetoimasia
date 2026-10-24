@@ -76,7 +76,6 @@ module Hetoimasia.LuaEngine.Request
   , terminalRecord
   ) where
 
-import Control.Concurrent.STM (STM, throwSTM)
 import qualified Data.ByteString as ByteString
 import Data.Int (Int64)
 import Data.Text (Text)
@@ -130,10 +129,10 @@ data M1Requests = M1Requests
   , m1ReplyLimits ∷ !ValueLimits
   , m1MessageBytes ∷ !Int
   , m1PathBytes ∷ !Int
-  , m1Gate ∷ !(Maybe (STM Bool))
-  -- ^ Whether the session still takes new work, read in the transaction that admits a request, or 'Nothing' for a
-  -- policy that has no session. A closed gate refuses the request for good, as an ordinary Lua error, before any bank
-  -- is asked.
+  , m1Gate ∷ !(Maybe Credit)
+  -- ^ The credit that reads whether the session still takes new work, in the transaction that admits a request, or
+  -- 'Nothing' for a policy that has no session. It is reserved first and raises 'CreditRefused' when the session takes
+  -- no new work: a final refusal, an ordinary Lua error, before any bank is asked.
   }
 
 -- | Why the profile could not be turned into the limits of requests.
@@ -215,7 +214,7 @@ m1Admission m1 ask =
     , admitExpectedCodes = askCodes ask
     , admitMessageBytes = m1MessageBytes m1
     , admitPathBytes = m1PathBytes m1
-    , admitCredits = maybe id ((:) . gateCredit) (m1Gate m1) (askCredits ask)
+    , admitCredits = maybe id (:) (m1Gate m1) (askCredits ask)
     , admitLease = fst <$> askLease ask
     , admitCombine = snd <$> askLease ask
     , admitSuccessFrame = m1SuccessFrame
@@ -223,21 +222,11 @@ m1Admission m1 ask =
     }
 
 -- | The same policy under a session that decides whether new work is taken (D-82: the session's closure closes
--- admission in the one transaction that records it). The gate is read inside the transaction that admits each request,
--- so a request is accepted before a closure committed or refused for good by it, whatever has or has not yet been
--- handed to the owner or the coordinator.
-withM1Gate ∷ STM Bool → M1Requests → M1Requests
+-- admission in the one transaction that records it). The credit is the session's: it reads the session's state inside
+-- the transaction that admits each request and holds nothing, so a request is accepted before a closure committed or
+-- refused for good by it, whatever has or has not yet been handed to the owner or the coordinator.
+withM1Gate ∷ Credit → M1Requests → M1Requests
 withM1Gate gate m1 = m1 {m1Gate = Just gate}
-
--- | The credit that reads the gate: nothing to hold, a final refusal when the session takes no new work.
-gateCredit ∷ STM Bool → Credit
-gateCredit gate =
-  Credit
-    { creditName = "session admission"
-    , creditReserve = gate >>= \open → if open then pure True else throwSTM (CreditRefused "the session is stopping: no request starts")
-    , creditRelease = \_ → pure ()
-    , creditTransfers = False
-    }
 
 -- | The record a script is handed for a success: @{status = "success", value = VALUE}@.
 m1SuccessFrame ∷ Value → [(Text, Value)]

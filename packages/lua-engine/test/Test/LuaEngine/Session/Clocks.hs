@@ -125,8 +125,8 @@ logical = describe "the logical clock" $ do
 
 -- | Close the session with the closing thread held between its commit and the stop it owes the owner, while the driver
 -- is held at this point of a grant about to be made; then let the driver go. The ticks granted are answered.
-grantAcrossClosure ∷ [Protection] → Point → IO [Word64]
-grantAcrossClosure removedProtections held =
+grantAcrossClosure ∷ [Protection] → Point → Bool → IO [Word64]
+grantAcrossClosure removedProtections held expectIssued =
   withSetup ((setup (roleScript ticking)) {suShape = GameplayAlone}) $ \env → do
     let world = seWorld env
     recorder ← newRecorder
@@ -144,6 +144,9 @@ grantAcrossClosure removedProtections held =
       found ← historyNow session
       historyStopped found `shouldBe` []
       releaseHold recorder held
+      -- a grant that is wrongly accepted is accepted while the closing thread is still held: wait for it, so that the
+      -- closing thread cannot get ahead of the driver
+      when expectIssued (awaitPoint recorder (GrantIssued 1))
       releaseHold recorder (Committed "Stop")
       void (awaitRetired session)
     grantsIssued recorder
@@ -151,11 +154,11 @@ grantAcrossClosure removedProtections held =
 grantClosure ∷ Spec
 grantClosure = describe "the tick grant and the closure" $ do
   it "grants no tick the closure beat, even while the closing thread has not yet handed its stop to the owner" $
-    grantAcrossClosure [] (GrantIntent 1) >>= (`shouldBe` [])
+    grantAcrossClosure [] (GrantIntent 1) False >>= (`shouldBe` [])
 
   describe "with the check and the grant made in two transactions (a negative control)" $
     it "grants a tick after the closure committed, which the proof above detects" $
-      grantAcrossClosure [ProtectGrantAtomic] (GrantChecked 1) >>= (`shouldBe` [1])
+      grantAcrossClosure [ProtectGrantAtomic] (GrantChecked 1) True >>= (`shouldBe` [1])
 
 -- | A content request whose admission the session's closure beat: the request found the session open at the facade's
 -- argument check, the closure committed while nobody had handed the owner its stop or closed the coordinator (the

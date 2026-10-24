@@ -99,6 +99,7 @@ import Control.Concurrent.STM
   , readTVar
   , readTVarIO
   , retry
+  , throwSTM
   , writeTVar
   )
 import Control.Exception
@@ -207,7 +208,7 @@ import Hetoimasia.Runtime.Supervision
   , supervisedWorker
   )
 import qualified Hetoimasia.Runtime.Supervision as Supervision
-import Hetoimasia.Scripting.Lua.Admission (newRequestHandles)
+import Hetoimasia.Scripting.Lua.Admission (Credit (..), CreditRefused (..), newRequestHandles)
 import Hetoimasia.Scripting.Lua.Instance
   ( Escalation (Isolate)
   , InstanceAdmission (..)
@@ -445,6 +446,19 @@ admissionOf env role = do
   -- admits the request, so a closure that commits after this read refuses the request for good)
   when (found == AdmissionOpen) (probeAt env (RequestChecked role))
   pure found
+
+-- | The credit a role's request policy reserves first: nothing to hold, and a final refusal (an ordinary Lua error, never
+-- busy) when the role takes no new work, read in the transaction that admits the request.
+sessionGate ∷ Env → Role → Credit
+sessionGate env role =
+  Credit
+    { creditName = "session admission"
+    , creditReserve = do
+        state ← stateOf env
+        if roleAdmit role state == AdmitOpen then pure True else throwSTM (CreditRefused "the session is stopping: no request starts")
+    , creditRelease = \_ → pure ()
+    , creditTransfers = False
+    }
 
 -- Protected steps -----------------------------------------------------------------------------------------
 
@@ -783,7 +797,7 @@ withRoleVm ∷ Env → RoleInfo → (RoleVm → IO a) → IO a
 withRoleVm env info body = do
   handles ← newRequestHandles
   requests0 ← either (refuse "the request policy" . Text.pack . show) pure (m1Requests profile handles)
-  let requests = if removed env ProtectRequestGate then requests0 else withM1Gate ((== AdmitOpen) . roleAdmit (riRole info) <$> stateOf env) requests0
+  let requests = if removed env ProtectRequestGate then requests0 else withM1Gate (sessionGate env (riRole info)) requests0
   phase ← newModulePhase
   holder ← newTVarIO Nothing
   let moduleSpec =
