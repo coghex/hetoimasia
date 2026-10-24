@@ -549,7 +549,7 @@ freshKeys ∷ Int → IO [EvidenceKey]
 freshKeys n = do
   let caught' message = ExceptionWithContext emptyExceptionContext (toException (userError message))
   composed ← composeCleanup (Just (caught' "primary")) [("release", caught' "failed") | _ ← [1 .. n]]
-  pure (maybe [] (\(ExceptionWithContext carried _) → [EvidenceCleanup (cleanupFailureId item) | item ← cleanupFailuresInContext carried]) composed)
+  pure (maybe [] (\(ExceptionWithContext carried _) → [evidenceKeyOf (cleanupFailureId item) | item ← cleanupFailuresInContext carried]) composed)
 
 factRan ∷ InstanceFact
 factRan = InstanceFact True FactShutdownRan EndedStopped

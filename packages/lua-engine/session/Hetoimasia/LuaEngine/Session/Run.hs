@@ -309,9 +309,9 @@ stopPassOf session roles = mask_ $ do
         -- A coordinator that is registered before its owner exists is closed now, and the stop stays owed to the
         -- owner, which the pass made when it is registered will find.
         Right () → when (isJust (regCompletion registered)) (void (commit session (StopHanded role)))
-        Left (ExceptionWithContext _ raised) →
-          void . commit session . StopDefect role $
-            engineEntry HostFailure (Just role) OnEngine ("the owner could not be asked to stop: " <> Text.take 512 (Text.pack (displayException raised)))
+        Left (ExceptionWithContext _ raised) → do
+          entry ← settledEntry HostFailure (Just role) OnEngine ("the owner could not be asked to stop: " <> Text.take 512 (Text.pack (displayException raised)))
+          void (commit session (StopDefect role entry))
 
 -- | The stops owed that the pass has not already found defective: a primitive that raised is attempted once, recorded,
 -- kept owed and never retried, so a defect cannot make the pass spin.
@@ -477,7 +477,7 @@ evidenceFrom env primary failure@(ExceptionWithContext _ raised) = do
   let carried = if isAsync failure && removed env ProtectCancellationEvidence then [] else cleanupOf failure
   tails ← forM carried $ \(item, label, ExceptionWithContext _ inner) → do
     entry ← settledEntry CleanupFailure Nothing OnCleanup (label <> ": " <> Text.pack (displayException inner))
-    pure (Evidence (Just (EvidenceCleanup item)) entry)
+    pure (Evidence (Just (evidenceKeyOf item)) entry)
   pure (head' <> tails)
 
 -- | The cleanup failures an exception carries, with the identities they were issued.
@@ -489,7 +489,7 @@ cleanupOf (ExceptionWithContext context _) =
 keepRaw ∷ Env → Caught → IO ()
 keepRaw env failure =
   modifyIORef' (envRaw env) $ \kept →
-    kept <> [RawEvidence (Just (EvidenceCleanup item)) label inner | (item, label, inner) ← cleanupOf failure, Just (EvidenceCleanup item) `notElem` map reKey kept]
+    kept <> [RawEvidence (Just (evidenceKeyOf item)) label inner | (item, label, inner) ← cleanupOf failure, Just (evidenceKeyOf item) `notElem` map reKey kept]
 
 -- | The most exceptions the session keeps whole: the first cancellation and the first failure are always kept, and so
 -- is anything while there is room, so that repeated cancellation cannot grow what is kept without end. What an
@@ -849,7 +849,15 @@ withOwner
   → IO a
 withOwner env info owned coordinator holder facade body = mask $ \restore → do
   restore (probeAt env (Acquiring role BuildOwner))
-  started ← startScheduledOwner (sxRuntime spec) owned
+  -- The start is guarded where it is made: if it fails or is cancelled, the session closes and the peers already
+  -- registered are handed their stops at once, as the exception leaves the starter, before any scope it crosses.
+  started ←
+    tryWithContext @SomeException (startScheduledOwner (sxRuntime spec) owned) >>= \case
+      Right found → pure found
+      Left failure → do
+        void (commit (envSession env) Unwind)
+        stopPass (envSession env)
+        rethrowIO failure
   case started of
     ScheduledUnavailable failure → rethrowIO failure
     ScheduledRejected → throwIO (SessionRefused "the owner was rejected")
@@ -1014,7 +1022,7 @@ finalizeRole env role = mask_ $ do
     cleanup found =
       forM (completionCleanup found) $ \item → do
         entry ← settledEntry CleanupFailure (Just role) OnCleanup (cleanupFailureLabel item <> ": " <> Text.pack (displayCleanupFailure item))
-        pure (Evidence (Just (EvidenceCleanup (cleanupFailureId item))) entry)
+        pure (Evidence (Just (evidenceKeyOf (cleanupFailureId item))) entry)
 
 -- | Keep an owner's completion raw, to travel beside whatever is raised: its failure once, its cleanup by identity.
 keepCompletion ∷ Env → Completion () → IO ()
@@ -1022,9 +1030,9 @@ keepCompletion env found =
   modifyIORef' (envRaw env) $ \kept →
     kept
       <> [RawEvidence Nothing "lua owner" failed | Worker.Failed failed ← [completionResult found], isJust (fromException (exceptionOf failed) ∷ Maybe EngineFailure) == False]
-      <> [ RawEvidence (Just (EvidenceCleanup (cleanupFailureId item))) (cleanupFailureLabel item) (cleanupFailureException item)
+      <> [ RawEvidence (Just (evidenceKeyOf (cleanupFailureId item))) (cleanupFailureLabel item) (cleanupFailureException item)
          | item ← completionCleanup found
-         , Just (EvidenceCleanup (cleanupFailureId item)) `notElem` map reKey kept
+         , Just (evidenceKeyOf (cleanupFailureId item)) `notElem` map reKey kept
          ]
   where
     exceptionOf (ExceptionWithContext _ raised) = raised
@@ -1261,16 +1269,18 @@ finish env restore result = do
   runSessionReleases env
   cancelled ← any (isAsync . rtCaught) <$> readIORef (envRetained env)
   unless cancelled $ do
-    completed ← restore (forwardFinal env)
+    completed ← guarded (restore (forwardFinal env))
     when completed $ do
       ended ← atomically (outcomeOf <$> readTVar (sessionState session))
       void . commit session . Note $
         Say SayInfo "session ended" [("verdict", Text.pack (show (outVerdict ended))), ("failures", Text.pack (show (length (outFailures ended))))]
-      void (restore (forwardFinal env))
+      void (guarded (restore (forwardFinal env)))
   raiseRetained env
   atomically (outcomeOf <$> readTVar (sessionState session))
   where
     session = envSession env
+    -- an exception that lands outside the forwarding itself is retained like any other, and ends the forwarding
+    guarded action = tryWithContext @SomeException action >>= either (\failure → False <$ retain env failure) pure
 
 -- | Raise what the session retained, if anything: the first cancellation as itself, otherwise the first exception
 -- caught, with every other exception and every cleanup failure not already in its context kept whole beside it.
@@ -1285,7 +1295,7 @@ raiseRetained env = do
     (Nothing, []) → pure ()
   where
     raiseWith chosen retained raws = do
-      let known = Set.fromList [EvidenceCleanup item | kept ← retained, (item, _, _) ← cleanupOf (rtCaught kept)]
+      let known = Set.fromList [evidenceKeyOf item | kept ← retained, (item, _, _) ← cleanupOf (rtCaught kept)]
           beside = [("lua session", rtCaught other) | other ← retained, rtSerial other /= rtSerial chosen]
           extra = [(label, inner) | RawEvidence key label inner ← raws, maybe True (`Set.notMember` known) key]
       composeCleanup (Just (rtCaught chosen)) (beside <> extra) >>= maybe (rethrowIO (rtCaught chosen)) rethrowIO

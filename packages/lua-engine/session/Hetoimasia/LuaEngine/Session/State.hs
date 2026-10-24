@@ -71,7 +71,8 @@ module Hetoimasia.LuaEngine.Session.State
   , StartGate (..)
 
     -- * Evidence and history
-  , EvidenceKey (..)
+  , EvidenceKey
+  , evidenceKeyOf
   , Evidence (..)
   , evidenceOf
   , EndKind (..)
@@ -123,7 +124,6 @@ import Data.Foldable (toList)
 import Data.Maybe (fromMaybe, isJust)
 import Data.Text (Text)
 import qualified Data.Text as Text
-import Hetoimasia.Foundation.Resource (CleanupFailureId)
 import Hetoimasia.Foundation.Time (Instant)
 import Hetoimasia.LuaEngine.Manifest (Role (..))
 import Hetoimasia.LuaEngine.Session.Harness (BuildStep (..), InstanceKey (..))
@@ -159,10 +159,15 @@ data StartGate = StartClosed | StartOpen | StartShut
 -- Evidence and history --------------------------------------------------------------------------------
 
 -- | The identity a piece of evidence already has, so that the same cleanup failure seen on a worker's completion,
--- on a scope's context and on an exception that carried it is one entry. A distinct failure that renders the same
--- way is a distinct identity; no exception is ever compared by its text.
-newtype EvidenceKey = EvidenceCleanup CleanupFailureId
+-- on a scope's context and on an exception that carried it is one entry. It is an opaque token the effectful layer
+-- makes from the identity the foundation issued when it retained the failure ('evidenceKeyOf'); a distinct failure
+-- that renders the same way has a distinct identity, and no exception is ever compared by its text.
+newtype EvidenceKey = EvidenceKey Text
   deriving (Eq, Ord, Show)
+
+-- | The key of a foundation identity. The identity is compared as itself, not as the exception it names.
+evidenceKeyOf ∷ Show identity ⇒ identity → EvidenceKey
+evidenceKeyOf = EvidenceKey . Text.pack . show
 
 -- | One failure to account: an engine entry and, when it already had an identity, that identity.
 data Evidence = Evidence
