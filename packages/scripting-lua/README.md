@@ -2514,7 +2514,9 @@ ended. It runs masked, so it must be finite and must not wait. What it raises is
 the failure of the start (and beside a real cancellation of the creator): it never takes the place of the readiness failure, whatever
 its type (an exception of an asynchronous type the callback itself threw was not delivered to the creator and is evidence, not a
 cancellation), and it does not skip the creator's wait for its worker, so a creator never gets an exception back while the worker
-it started still runs Lua. It
+it started still runs Lua. What the worker itself ended with (its initialization or its VM's cleanup failing once it was let
+go on) is kept beside the failure of the start in the same way: the creator's wait keeps the worker's terminal completion, and
+a failure or a cancellation in it is evidence, never the exception that is raised. It
 is not told when creation returns an owner, when an initialization that fails ends creation under the owner's policy
 (`ScheduledUnavailable`, `ScheduledEnded`), or when the configuration is refused before a worker starts. The creator
 that does not set it behaves exactly as before.
@@ -2570,7 +2572,11 @@ and the low 32 bits of the count, each from 0 to 2^32 - 1 (`waitOperation "wait_
 single-integer form is unchanged, and anything else, a half out of range included, is read as none and refused. A deadline the
 clock cannot count is refused as a wait that cannot be represented; nothing wraps.
 `grantScheduledStep` and `requestTaskControl` are the scheduler's `grantStep` and
-`requestControl` for this owner. A resumed coroutine receives no value, so what the wait
+`requestControl` for this owner. `grantScheduledStepSTM` (D-85) is the same grant as a transaction, and
+`grantScheduledStep` is `atomically` of it: an application that decides whether to grant from state of its own (the Lua-first
+session coordinator closes its logical role's ticks and grants in one transaction) reads that state and grants in one atomic
+step, so a closure it committed before is seen by the grant and a grant it accepted was accepted before a closure committed
+after. It never retries or blocks, and what it answers is what `grantScheduledStep` answers; existing callers are unchanged. A resumed coroutine receives no value, so what the wait
 that ended earned (the tick reached and the granted duration, or the elapsed time) is told
 to the application on the owner's thread, before the segment that follows
 (`scheduledObserve`); a binding that should answer a script's question about its tick keeps
