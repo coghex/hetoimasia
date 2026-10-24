@@ -23,6 +23,9 @@ module Test.LuaRuntime.Support
   , expectFatalOpening
   , bounded
   , boundedAfter
+  , BoundExpired (..)
+  , boundExpiredMessage
+  , expectObserved
     -- * The fixture
   , Fixture (..)
   , newFixture
@@ -79,8 +82,9 @@ import Control.Exception
   , ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , bracket_
-  , finally
+  , displayException
   , fromException
+  , mask
   , onException
   , throw
   , throwIO
@@ -129,7 +133,7 @@ import Hetoimasia.Scripting.Lua.Value
 import System.IO.Unsafe (unsafePerformIO)
 import System.Timeout (Timeout, timeout)
 import GHC.Stack (HasCallStack)
-import Test.HUnit.Lang (HUnitFailure, assertFailure)
+import Test.HUnit.Lang (FailureReason (Reason), HUnitFailure (HUnitFailure), assertFailure)
 import Test.Hspec (Expectation, expectationFailure)
 
 -- Failures ---------------------------------------------------------------------
@@ -209,7 +213,7 @@ expectFatal body =
 -- | Run a boundary that may end in a failure of the application's own, answering how
 -- it ended, as 'withBoundaryOpening' lets the gates go. What it may fail with is the
 -- application's own failure: a failed assertion of the example, or the example's
--- 'bounded' timeout, is never taken for it, and is raised as itself.
+-- 'bounded' expiry or a 'timeout', is never taken for it, and is raised as itself.
 tryBoundaryOpening ∷ [IO ()] → (RuntimeControl → LuaRuntime → IO a) → IO (Either (ExceptionWithContext SomeException) a)
 tryBoundaryOpening openers body = tryExpected (withBoundaryOpening openers body)
 
@@ -228,6 +232,7 @@ tryExpected action =
   tryWithContext action >>= \case
     Left (ExceptionWithContext _ failure)
       | Just (_ ∷ HUnitFailure) ← fromException failure → throwIO failure
+      | Just BoundExpired ← fromException failure → throwIO failure
       | Just (_ ∷ Timeout) ← fromException failure → throwIO failure
     outcome → pure outcome
 
@@ -271,32 +276,94 @@ alongsideOpening openers helper main' = do
     Just failure → throwIO failure
     Nothing → either throwIO pure outcome
 
+-- | Raised in the thread of an example whose bound has expired. It is the bound's own
+-- interruption: an example takes no failure of its own for it, and 'tryExpected' raises it as
+-- itself.
+data BoundExpired = BoundExpired
+  deriving (Show)
+
+instance Exception BoundExpired
+
 -- | Stop an example that has already hung. Never a concurrency assertion. As the limit
 -- expires, the gates the example registered with 'withBoundaryOpening' are opened from a
 -- thread of their own: an example parked in a protected wait for a held callback cannot
 -- do it for itself, and the exception that interrupts it does not end that wait. The
 -- expiry is recorded before they are opened, and an example that returns once they are
 -- open has still not finished within its bound.
+--
+-- The example is interrupted with 'BoundExpired' when the limit expires, and again after every
+-- further 'regrace' until it has ended. One interruption is not enough: a protected wait (the
+-- script runner's retirement, the drain of a worker being started) takes the exception and
+-- carries on, and the example then goes on to whatever it does next, which can be a wait nothing
+-- will end, as an unbounded 'takeMVar' of what a helper was to hand over is once the helper has
+-- been stopped. An example that is still running after the gates are open is therefore ended by
+-- the next interruption, at the wait it is in, and fails with the bound's failure; a failure the
+-- example raised itself after its gates were opened is reported with it, never in its place.
+-- Nothing here waits for the example to end by itself: a thread that cannot be interrupted at
+-- all is the one case a bound cannot end.
 bounded ∷ Expectation → Expectation
 bounded = boundedAfter exampleBound exampleBound
 
 -- | 'bounded' with the time its gates are opened at apart from the limit the example is
--- interrupted at, so that the examples of the helper itself can have the gates opened first.
+-- interrupted at, so that the examples of the helper itself can have the gates opened first
+-- or last.
 boundedAfter ∷ Int → Int → Expectation → Expectation
-boundedAfter openAfter limit action = do
+boundedAfter openAfter limit action = mask $ \restore → do
   example ← myThreadId
   finished ← newEmptyMVar
   expired ← newIORef False
   _ ← forkIO (timeout openAfter (readMVar finished) >>= maybe (atomicWriteIORef expired True >> openAtBound example) pure)
-  outcome ← timeout limit action `finally` putMVar finished ()
+  interrupting ← forkIO (interruptUntil finished expired example limit regrace)
+  outcome ← try @SomeException (restore action)
+  -- Whatever the interrupting thread is doing, it ends before the example does: it may be
+  -- waiting to deliver an interruption to a thread that is masked now.
+  putMVar finished ()
+  killThread interrupting
   opened ← readIORef expired
   case outcome of
-    Just () | not opened → pure ()
-    _ → expectationFailure "the example did not finish within its bound"
+    Right () | not opened → pure ()
+    Right () → expectationFailure boundExpiredMessage
+    Left failure
+      | Just BoundExpired ← fromException failure → expectationFailure boundExpiredMessage
+      | opened → expectationFailure (boundExpiredMessage <> "\nThe example had failed with: " <> describeFailure failure)
+      | otherwise → throwIO failure
   where
     openAtBound example = do
       held ← readIORef openersAtBound
       sequence_ (concat [openers | (thread, _, openers) ← held, thread == example])
+    -- Long enough for an example that was let go at the limit to end by itself.
+    regrace = min limit (10 * 1000 * 1000)
+
+-- | A failure of the example as its report says it: an assertion's message, anything else as
+-- it displays itself.
+describeFailure ∷ SomeException → String
+describeFailure failure = case fromException failure of
+  Just (HUnitFailure _ (Reason message)) → message
+  _ → displayException failure
+
+-- | What the bound's expiry failure begins with.
+boundExpiredMessage ∷ String
+boundExpiredMessage = "the example did not finish within its bound"
+
+-- | Interrupt the example when its limit expires, and again after every 'regrace' until it has ended.
+interruptUntil ∷ MVar () → IORef Bool → ThreadId → Int → Int → IO ()
+interruptUntil finished expired example limit regrace = wait limit
+  where
+    wait microseconds =
+      timeout microseconds (readMVar finished) >>= \case
+        Just () → pure ()
+        Nothing → do
+          atomicWriteIORef expired True
+          throwTo example BoundExpired
+          wait regrace
+
+-- | What the helper of an example handed over before the call returned, or the failure of the
+-- example, naming what was missing, when it handed nothing. A helper puts its observation before
+-- it opens the gate the call is held at, so the call that returned because the helper let it go
+-- finds it there; one that returned because the bound opened the gate does not, and must fail with
+-- the observation it lacked rather than wait for what a stopped helper will never put.
+expectObserved ∷ HasCallStack ⇒ String → MVar a → IO a
+expectObserved missing observed = tryTakeMVar observed >>= maybe (failExample missing) pure
 
 -- | How long an example may run, in microseconds.
 exampleBound ∷ Int

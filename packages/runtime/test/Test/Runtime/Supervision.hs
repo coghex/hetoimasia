@@ -57,6 +57,7 @@ import Hetoimasia.Runtime.Logging (recordedReports)
 import Hetoimasia.Runtime.Reporting (ReportResult (..))
 import Hetoimasia.Runtime.Supervision
 import Test.Runtime.Supervision.Support
+import qualified Test.Runtime.Supervision.Startup as Startup
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 
 spec ∷ Spec
@@ -74,6 +75,8 @@ spec = describe "Supervision" $ do
       (boundedSupervision testOptionalStartupFailureOnce)
     it "propagates a required startup failure once and never commits it again"
       (boundedSupervision testRequiredStartupFailureOnce)
+
+  Startup.spec
 
   describe "Classification" $ do
     it "distinguishes finite-job completion from an expected exit after a requested stop"

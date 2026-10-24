@@ -3,12 +3,14 @@
 -- hang in the protected teardown that waits for the callbacks they hold.
 module Test.LuaRuntime.Gates (spec) where
 
-import Control.Concurrent.MVar (newEmptyMVar, readMVar, tryPutMVar, tryReadMVar)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), throwIO, try)
-import Control.Monad (forM_, void)
+import Control.Concurrent (forkIO, killThread, threadDelay)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, throwIO, try)
+import Control.Monad (forM_, forever, void)
+import Data.List (isInfixOf)
 import Hetoimasia.Scripting.Lua.Runtime (ownerEndpoint)
 import Hetoimasia.Scripting.Lua.Value
-import Test.HUnit.Lang (HUnitFailure)
+import Test.HUnit.Lang (FailureReason (Reason), HUnitFailure (HUnitFailure))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Support
 
@@ -57,3 +59,46 @@ spec = describe "the gates a boundary opens when an example fails" $ do
       withBoundaryOpening [void (tryPutMVar gate' ())] $ \_ _ → readMVar gate'
     outcome `shouldSatisfy` either (const True) (const False)
 
+  it "fails an example whose bound expired inside a protected wait that took the interruption, and that then waits for what nothing will provide, and does not hang" $ bounded $ do
+    absorbed ← newEmptyMVar
+    released ← newEmptyMVar
+    nothing ← newEmptyMVar @()
+    -- Something that could still put what the example waits for, so that the wait is not
+    -- found blocked for good and ended by the runtime: it is the bound that must end it.
+    keeper ← forkIO (forever (tryReadMVar nothing >> threadDelay 50000))
+    -- The gates are let go once the protected wait has taken the interruption, as the script
+    -- runner's retirement is let go by the bound's openers; the example then fails the way a
+    -- retirement does (with its own failure, the interruption absorbed), and waits for what a
+    -- stopped helper was to hand over.
+    outcome ←
+      ( try @HUnitFailure . boundedAfter 100000 100000 $
+          withBoundaryOpening [readMVar absorbed >> void (tryPutMVar released ())] $ \_ _ → do
+            ExceptionWithContext _ primary ←
+              tryExpected (protectedWait absorbed released >> throwIO (Broken "primary"))
+                >>= either pure (\_ → failExample "the protected wait did not raise its failure")
+            primary `shouldSatisfy` brokenIs "primary"
+            takeMVar nothing
+      )
+        `finally` killThread keeper
+    outcome `shouldSatisfy` either expired (const False)
+
+  it "reports the failure an example raised itself once its gates were opened, with the bound's expiry and not in its place" $ bounded $ do
+    gate' ← newEmptyMVar
+    outcome ← try @HUnitFailure . boundedAfter 100000 (60 * 1000 * 1000) $
+      withBoundaryOpening [void (tryPutMVar gate' ())] $ \_ _ → readMVar gate' >> failExample "its own failure"
+    outcome `shouldSatisfy` either (\failure → expired failure && reasonOf failure "its own failure") (const False)
+
+-- | A wait that nothing but its release ends: it takes every interruption and carries on, and
+-- says so the first time.
+protectedWait ∷ MVar () → MVar () → IO ()
+protectedWait absorbed released = loop
+  where
+    loop = try @SomeException (readMVar released) >>= either (\_ → void (tryPutMVar absorbed ()) >> loop) pure
+
+-- | The failure is the bound's expiry.
+expired ∷ HUnitFailure → Bool
+expired failure = reasonOf failure boundExpiredMessage
+
+reasonOf ∷ HUnitFailure → String → Bool
+reasonOf (HUnitFailure _ (Reason message)) text = text `isInfixOf` message
+reasonOf _ _ = False

@@ -62,7 +62,7 @@ spec = describe "readiness" $ do
         )
         ( do
             owner ← startOwner runtime (withModules [loader] (quickSpec fixture "loading" ["app"]))
-            takeMVar observed >>= (`shouldBe` ["loaded"])
+            expectObserved "the helper never saw the module recorded itself before creation returned: the bound let the load go first" observed >>= (`shouldBe` ["loaded"])
             noted fixture >>= (`shouldBe` ["loaded"])
             retireOwner owner
         )
@@ -131,7 +131,7 @@ spec = describe "readiness" $ do
             owner ←
               startOwner runtime $
                 withChunks [(chunkName "slow", Text.encodeUtf8 "app.block('init')")] (quickSpec fixture "slow" ["app"])
-            takeMVar observed >>= (`shouldBe` [True])
+            expectObserved "the helper never read the acknowledged worker before creation returned: the bound let the initial chunk go first" observed >>= (`shouldBe` [True])
             retireOwner owner
         )
 
