@@ -53,6 +53,16 @@
 -- only then warned about or rethrown in 'IO'. A failure that arrives after a
 -- transaction committed is handled at the next checkpoint.
 --
+-- __Starting is a supervised wait.__ While 'startSupervised' waits for the new
+-- worker's startup, it handles every other worker's published failure the same
+-- way, and before it drains anything: a failed worker's 'workerStatus' is
+-- readable as soon as its failure is published, however long the new worker is
+-- held, and does not wait for the new worker to end. A tolerated failure goes
+-- on being waited through; a fatal one latches, stops every pending worker, and
+-- ends the wait, after which the new worker is drained and the latched failure
+-- is rethrown. A failure first published once that drain has begun is handled
+-- after it, as at closing.
+--
 -- +------------------------------------------------------------+-------------------------------------------------------------+
 -- | Terminal outcome                                           | Status                                                      |
 -- +============================================================+=============================================================+
@@ -223,7 +233,6 @@ import Control.Concurrent.STM
   , newTVarIO
   , readTVar
   , readTVarIO
-  , throwSTM
   , writeTVar
   )
 import Control.Exception
@@ -237,6 +246,7 @@ import Control.Exception
   , mask_
   , rethrowIO
   , someExceptionContext
+  , throwIO
   , toException
   , tryWithContext
   )
@@ -286,7 +296,7 @@ import Hetoimasia.Foundation.Worker
   , pollCompletion
   , requestCancel
   , requestStop
-  , startWorkerWith
+  , startWorkerWithIO
   , withWorkerGroup
   , workerEvidenceInContext
   , workerId
@@ -526,11 +536,23 @@ instance Exception StartupInterrupted
 -- | Start a worker under a policy and wait for its startup through a supervised
 -- wait.
 --
--- The policy is registered before any of the worker's code runs. The wait also
--- wakes when an already-registered worker's outcome is certainly fatal —
--- required, or with failed cleanup — or when a fatal failure is already
--- latched; the new worker is then drained before this rethrows that failure. An
--- owner cancellation of the wait drains it too.
+-- The policy is registered before any of the worker's code runs. While the
+-- start waits, every other registered worker's published failure is handled
+-- here, in the same way as at 'checkRuntime' and before the new worker's own
+-- acknowledgement is looked at: it is classified and committed, so that the
+-- failed worker's 'workerStatus' is readable at once, however long the new
+-- worker is held, and not only after it has been drained. A tolerated failure
+-- (an optional worker, recognized) is committed with its one warning and the
+-- wait goes on; the new worker is not stopped or cancelled by it. A fatal
+-- failure latches and asks every worker still pending, the new one included, to
+-- stop, and the wait then ends: the new worker is drained before this rethrows
+-- the latched failure. An owner cancellation of the wait, or of a classifier
+-- the wait is running, commits nothing more: the new worker is drained and the
+-- cancellation propagates as itself.
+--
+-- A failure first published after the wait has ended (the new worker is
+-- already draining) is handled by the checkpoint that follows the drain, as at
+-- closing.
 --
 -- Once startup has ended, the worker's own outcome, if it already has one, is
 -- handled here exactly once: a startup failure after the worker drained, or a
@@ -549,12 +571,24 @@ startSupervised (RuntimeControl group state) policy definition = do
         managed ← newManaged worker policy
         atomically $ modifyTVar' (supervisionPending state) (sortOn managedId . (<> [managed]))
         writeIORef registered (Just managed)
+      -- The failure check precedes the worker's own acknowledgement, so it
+      -- also wins for a worker that has acknowledged but whose waiter has not
+      -- run yet. The commit is made before the wait ends and the worker is
+      -- drained, because a held worker keeps the drain from ending.
       wait worker = do
-        latched ← isJust <$> readTVar (supervisionLatch state)
-        others ← filter (\(managed, _, _) → managedId managed /= workerId worker) <$> pendingOutcomes state
-        when (latched || any certainlyFatal others) (throwSTM StartupInterrupted)
-        awaitStartup worker
-  started ← tryWithContext (startWorkerWith group definition prepare wait)
+        step ← atomically $ do
+          latched ← isJust <$> readTVar (supervisionLatch state)
+          others ← filter (\(managed, _, _) → managedId managed /= workerId worker) <$> pendingOutcomes state
+          if latched || any failing others
+            then pure (Left others)
+            else Right <$> awaitStartup worker
+        case step of
+          Right startup → pure startup
+          Left others → do
+            settle state others
+            latched ← isJust <$> readTVarIO (supervisionLatch state)
+            if latched then throwIO StartupInterrupted else wait worker
+  started ← tryWithContext (startWorkerWithIO group definition prepare wait)
   case started of
     Left failure@(ExceptionWithContext _ exception) → do
       readIORef registered >>= traverse_ (\managed → atomically (writeTVar (managedRequested managed) True))
@@ -574,11 +608,11 @@ startSupervised (RuntimeControl group state) policy definition = do
         WorkerUnavailable failure → WorkerStartUnavailable handle failure
         _ → WorkerStarted handle
   where
-    -- Fatal without consulting a classifier: failed cleanup, or any failure of
-    -- a required worker.
-    certainlyFatal (managed, summary, owner) = case judge (managedPolicy managed) owner summary of
+    -- A failure the start handles before it ends its wait: failed cleanup, or
+    -- one a classifier judges.
+    failing (managed, summary, owner) = case judge (managedPolicy managed) owner summary of
       FatalNow _ → True
-      Classify _ → policyDisposition (managedPolicy managed) == Required
+      Classify _ → True
       _ → False
 
 newManaged ∷ Worker r → WorkerPolicy → IO Managed

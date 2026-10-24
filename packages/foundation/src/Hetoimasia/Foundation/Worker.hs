@@ -89,6 +89,7 @@ module Hetoimasia.Foundation.Worker
   , StartRejection (..)
   , startWorker
   , startWorkerWith
+  , startWorkerWithIO
 
     -- * Requests
   , requestStop

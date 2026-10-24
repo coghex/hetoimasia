@@ -144,6 +144,7 @@ supportedClient =
     , "  , StartRejection (RegistrationClosed)"
     , "  , startWorker"
     , "  , startWorkerWith"
+    , "  , startWorkerWithIO"
     , "  , requestStop"
     , "  , requestCancel"
     , "  , WorkerCancelled (WorkerCancelled)"

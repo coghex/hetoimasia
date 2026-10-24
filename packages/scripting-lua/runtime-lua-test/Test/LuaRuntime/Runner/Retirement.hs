@@ -9,7 +9,7 @@
 module Test.LuaRuntime.Runner.Retirement (spec) where
 
 import Control.Concurrent (myThreadId, throwTo)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryReadMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, tryReadMVar)
 import Control.Concurrent.STM (atomically, retry)
 import Control.Exception (AsyncException (ThreadKilled), Exception, ExceptionWithContext (ExceptionWithContext), finally, fromException, throwIO)
 import Control.Monad (void)
@@ -24,7 +24,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Runner.Support
 import qualified Test.LuaRuntime.Support as Base
-import Test.LuaRuntime.Support (awaitBlockedOnSTM, bounded, Broken (Broken), brokenIs, expectFatalOpening, failExample, Gated (..), quickSpec, startOwner, submit, tryExpected, withBoundaryOpening)
+import Test.LuaRuntime.Support (awaitBlockedOnSTM, bounded, Broken (Broken), brokenIs, expectFatalOpening, expectObserved, failExample, Gated (..), quickSpec, startOwner, submit, tryExpected, withBoundaryOpening)
 
 -- | What a test throws to the runner's thread to cancel it.
 data Cancelling = Cancelling
@@ -71,7 +71,7 @@ spec = describe "retirement" $ do
           (void (run fixture runtime (config fixture [noWait (scriptAt paths 0)])) `finally` (markReturned fixture >> putMVar returned ()))
       -- The original failure propagated, and only after the hook ran to its end and wrote.
       failure `shouldSatisfy` brokenIs "host"
-      takeMVar observed `shouldReturn` (True, True)
+      expectObserved "the helper never observed the run waiting for the held owner: the latch was not delivered to the runner's thread before the bound let the owner go" observed `shouldReturn` (True, True)
       expectWrittenBeforeReturn fixture "after"
 
   it "completes before the run propagates a failure another supervised worker latched during startup" $ bounded $ do
@@ -100,7 +100,7 @@ spec = describe "retirement" $ do
           )
           (void (run fixture runtime (config fixture [noWait (scriptAt paths 0)])) `finally` (markReturned fixture >> putMVar returned ()))
       failure `shouldSatisfy` brokenIs "host"
-      takeMVar observed `shouldReturn` (True, True)
+      expectObserved "the helper never observed the other worker's failure while the owner was held: its terminal status was not readable until the owner was let go" observed `shouldReturn` (True, True)
       expectWrittenBeforeReturn fixture "after"
 
   it "completes before the run is cancelled during startup" $ bounded $ do
@@ -128,7 +128,7 @@ spec = describe "retirement" $ do
         case outcome of
           Left (ExceptionWithContext _ raised) → (fromException raised ∷ Maybe Cancelling) `shouldSatisfy` isJust
           Right _ → failExample "the run returned instead of being cancelled"
-        takeMVar observed `shouldReturn` (True, True)
+        expectObserved "the helper never observed the run waiting for the held owner after the cancellation: the bound let the owner go first" observed `shouldReturn` (True, True)
         expectWrittenBeforeReturn fixture "after"
 
   it "is not cut short by a cancellation while it waits for a held segment: the owner has ended before the cancellation propagates" $ bounded $ do
@@ -156,7 +156,7 @@ spec = describe "retirement" $ do
         case outcome of
           Left (ExceptionWithContext _ raised) → (fromException raised ∷ Maybe Cancelling) `shouldSatisfy` isJust
           Right _ → failExample "the run returned instead of being cancelled"
-        takeMVar observed `shouldReturn` (True, True)
+        expectObserved "the helper never observed the run waiting for the held segment after the cancellation: the bound let the segment go first" observed `shouldReturn` (True, True)
         expectWrittenBeforeReturn fixture "after"
 
   it "keeps draining when cleanup after a failure of the runner's own thread is interrupted, and keeps both failures" $ bounded $ do
@@ -187,7 +187,7 @@ spec = describe "retirement" $ do
                 openGate fixture "shutdown"
             )
             (tryExpected (run fixture runtime failingTable) `finally` (markReturned fixture >> putMVar returned ()))
-        takeMVar observed `shouldReturn` (True, True)
+        expectObserved "the helper never observed the run waiting for the held owner after it was interrupted: the bound let the owner go first" observed `shouldReturn` (True, True)
         expectWrittenBeforeReturn fixture "after"
         case outcome of
           Left (ExceptionWithContext context raised) → do
