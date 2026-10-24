@@ -9,9 +9,9 @@ This document carries request `user-het-luafirst-20261021-1435`.
 Design state: `exploring`
 
 **2026-10-24 amendment:** D-82 specifies the owner-requested LFE-13 teardown
-protocol for #527 / PR #567. Q-17 reserves approval of its two public host
-seams. Fresh readiness applies to this amendment; D-81's original signoff and
-all 26 filed-child ledger entries remain historical facts, not reopened work.
+protocol for #527 / PR #567. D-83 resolves Q-17 by approving both public host
+seams in #527. Fresh readiness still applies to this amendment; D-81's original
+signoff and all 26 filed-child ledger entries remain historical facts, not reopened work.
 
 Owner repository: `coghex/hetoimasia`; publication branch: `master`.
 Started 2026-10-21 by `het-designer-1`. Questions and owner-answer relays belong
@@ -2541,9 +2541,10 @@ Authenticated relay: `het-manager`, message `ipqje335hb2ev26gfywiaikei6`,
 `user-het-luafirst-20261021-1435`. The brief explicitly delegates this normative
 protocol, requires publication before more solving, and reserves genuine
 owner choices as open questions. This is the requested technical specification,
-not a claim that the owner approved the two new public host seams: **Q-17
-remains open**. The manager owns the #527 amendment and fresh approval route;
-this document edit grants no code, issue or PR mutation.
+not a claim that the owner had approved the two new public host seams at
+publication: Q-17 was reserved and is now resolved by D-83. The manager owns
+the #527 amendment and fresh approval route; this document edit grants no code,
+issue or PR mutation.
 
 #### Evidence and precedence
 
@@ -2877,23 +2878,23 @@ for such a borrower rather than free underneath it. D-20's separately implemente
 forced process exit is the escape; a timeout proves neither completion nor
 permission to destroy resources. No stronger liveness claim is made here.
 
-#### T8. Host integration scope is reserved to Q-17
+#### T8. Host integration scope approved by D-83
 
 The protocol requires prompt failure latching before slow retirement, and
 validation of every selected behavior/cadence before any init. PR #567 adds
 `instanceOnFailing`, `instanceHoldInit` and `releaseHeldInstance` to achieve
-those existing requirements. Their public cross-package scope is **proposed,
-not authorized by D-82**. Q-17 states the exact recommended contracts; the
-teardown ordering, evidence and masking requirements above apply regardless
-of how the owner resolves those seams. Neither existing generic callers nor
-the runner/sample may silently acquire M1 startup/failure policy.
+those existing requirements. D-82 originally reserved their public cross-package
+scope to Q-17; **D-83 now approves both in #527**, with exactly the narrow
+contracts retained under Q-17 and unchanged defaults. The teardown ordering,
+evidence and masking requirements above remain unchanged. Neither existing
+generic callers nor the runner/sample may silently acquire M1 startup/failure policy.
 
 #### T9. Required boundary proofs
 
 These are acceptance obligations, **not tests claimed to pass**. Extend the
 existing `Test.LuaEngine.Session.*` Hspec families in PR #567 and public host
-tests if Q-17 is accepted. Use coordinated gates, explicit receipts and raw
-completion evidence, never timing sleeps. Each test must assert both the
+tests for the seams approved by D-83. Use coordinated gates, explicit receipts
+and raw completion evidence, never timing sleeps. Each test must assert both the
 ordering and final facts/evidence, not merely that the call returned. Include
 a negative control that removes the protection being proved. The PR-body
 invariant table cites concrete test names and every matching production site.
@@ -2915,6 +2916,35 @@ invariant table cites concrete test names and every matching production site.
 | T7 masking and waits | `Stop`/`Construction`: observe masking state; reject uninterruptibly masked entry before acquisition. Cancel while blocked at owner completion, coordinator drain and provider retirement; cleanup retains cancellation, keeps dependencies and proceeds after the gate opens. Assert actual releases contain no such waits. |
 | T2/T5 final outcomes | `Stop`/`Failures`: normal completion, quit, interrupt, external owner stop, unexpected owner cancellation and synchronous driver throw in all role arrangements. Failure after quit/interrupt wins; forced-exit behavior remains outside this suite. |
 | T4/T6 model and API boundary; R1–R7 | `Model` checks atomic facts/claims, monotone history, no reopening, owed stops until handoff/proof, bounded effect multiplicity and retirement eligibility. `Client` compiles against public interfaces; no exported test-only tick/control seam. Q-17 host defaults preserve existing runner/sample behavior. |
+
+### D-83. Include both opt-in host seams in LFE-13 with unchanged defaults
+
+**Delivery:** LFE-13 / #527 / PR #567; resolves Q-17's cross-package scope.
+
+Owner answer, **2026-10-24 14:36:31 UTC**, directly to `het-manager`,
+verbatim choice:
+
+> Approve both (Recommended)
+
+Authenticated relay: `het-manager`, message `42ph97psmhzpuxcf8pc384si42`,
+posted **2026-10-24 14:36:32.073 UTC** in `#het-luafirst`, replying to the
+D-82 completion message `gdpa2ffxxz9yx4qczcr9jg7y5e`. The relay explicitly
+approves both seams in #527's scope with exactly Q-17/D-82's narrow contracts
+and unchanged defaults, and states that nothing else changes.
+
+Accept both parts of Q-17 as retained below: `instanceOnFailing` supplies the
+early primary-failure notice before shutdown/provider retirement; and
+`instanceHoldInit` plus `releaseHeldInstance` supplies the registered, parked,
+idempotently released init continuation without blocking the owner thread.
+Their callback-failure, notification/settlement deduplication, validation,
+release/stop-race and owner-thread requirements are part of the approval.
+Defaults remain no-op/no-hold, preserving existing generic callers and the
+runner/sample. Both seams are in LFE-13, not separate prerequisite issues.
+
+D-82's teardown protocol and proof obligations remain unchanged. Q-17 is
+resolved; this scope approval does not itself claim implementation correctness,
+runtime evidence or fresh readiness. The manager retains the #527 amendment
+and re-approval handoff. No other behavior or delivery boundary changes.
 
 ## Proposals
 
@@ -8038,9 +8068,9 @@ finish the readiness audit after publication. No tracker creation occurs here.
 
 ## Readiness audit
 
-**2026-10-24 amendment:** readiness is reopened only for D-82 / LFE-13 and
-Q-17's host-contract scope. The owner-directed protocol is published before
-more solving; the manager must reconcile #527 and arrange fresh approval.
+**2026-10-24 amendment:** readiness is reopened only for D-82 / LFE-13;
+D-83 resolves Q-17's host-contract scope. The owner-directed protocol is
+published before more solving; the manager must reconcile #527 and arrange fresh approval.
 The original audit below is retained with its snapshot and date. No code or
 runtime validation is claimed by this documentation amendment.
 
@@ -8650,13 +8680,11 @@ and Q-9 dependency-ordered one-PR delivery slices.
 
 ### Q-17. Include both opt-in public host seams in LFE-13?
 
-**Open — owner decision; affected slice LFE-13 / #527 / PR #567.** The design
-brief expressly reserves cross-package contract choices. The approved #527
-behavior requires the capabilities below, but the PR's public API additions
-have no separate recorded scope signoff. Publishing D-82 does not grant it.
-Recommend approving **both** with these narrow contracts; approve or revise
-each separately if needed. The manager obtains the answer before re-approving
-an implementation that depends on them.
+**Resolved by D-83 — both approved in LFE-13 / #527 / PR #567.** The owner
+approved both on 2026-10-24 at 14:36:31 UTC, with exactly these narrow contracts
+and unchanged defaults. The original recommendation, costs and alternatives
+are retained below as the approved scope's history; no further Q-17 answer is
+pending. The manager owns the issue amendment and re-approval handoff.
 
 1. **`instanceOnFailing`: recommended in #527.** An opt-in, default no-op host
    callback on the VM owner's thread, at most once for an instance's first
@@ -8689,8 +8717,8 @@ Evidence: PR [`Instance/Types.hs:703`](https://github.com/coghex/hetoimasia/blob
 [`Instance/State.hs:368`](https://github.com/coghex/hetoimasia/blob/942257657b173158ce3728dc46d1a6d4c7da676c/packages/scripting-lua/runtime-lua/Hetoimasia/Scripting/Lua/Instance/State.hs#L368),
 and [`Instance/Run.hs:1625`](https://github.com/coghex/hetoimasia/blob/942257657b173158ce3728dc46d1a6d4c7da676c/packages/scripting-lua/runtime-lua/Hetoimasia/Scripting/Lua/Instance/Run.hs#L1625).
 No public arbitrary hook framework, scheduler replacement or M1 policy in
-generic defaults is proposed. D-82's remaining protocol is specified and
-published now, as directed, without waiting for this answer.
+generic defaults is proposed. D-82's remaining protocol was published before
+this answer, as directed, and is unchanged by D-83.
 
 ## Verification strategy
 
@@ -8978,8 +9006,8 @@ replace boundary tests, prove performance or establish confinement.
 - **Depends on:** LFE-3, LFE-12.
 - **Teardown amendment:** D-82/T1–T9 is normative for #527 / PR #567; use its
   all-owner stop barrier, atomic accounting, protected drain/retirement sequence
-  and boundary-proof checklist. Q-17 reserves the two public host seams for
-  owner scope approval; the manager reconciles/re-approves #527 before solving.
+  and boundary-proof checklist. D-83 resolves Q-17 and approves both public
+  host seams in this slice; the manager reconciles/re-approves #527 before solving.
 - **Boundary:** generic one/two-role session composition, concurrent root inits,
   UI starts on own readiness, logical ticks wait for the joint gate; fixed
   FIFO cadence over the existing scheduler. Internal narrow stop/failure/status
