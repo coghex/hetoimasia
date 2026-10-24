@@ -56,6 +56,7 @@ module Hetoimasia.LuaEngine.Session
   , Session
   , sessionStatus
   , sessionOutcomeNow
+  , sessionHistory
   , requestStop
   , latchTerminalFailure
 
@@ -75,6 +76,12 @@ module Hetoimasia.LuaEngine.Session
   , roleWord
   , EngineEntry (..)
   , EngineReport (..)
+  , History (..)
+  , DiagState (..)
+  , InstanceFact (..)
+  , ShutdownFact (..)
+  , EndKind (..)
+  , InstanceKey (..)
   ) where
 
 import Hetoimasia.LuaEngine.Session.Failure

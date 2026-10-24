@@ -27,6 +27,13 @@ module Test.LuaEngine.Session.Support
     -- * Running
   , runScenario
   , runScenarioWith
+  , runCaught
+  , Caught
+  , historyNow
+  , outcomeMessages
+  , raisedMessage
+  , raisedKilled
+  , awaitBlockedOnException
   , scenarioSpec
   , awaitStatus
   , awaitPhase
@@ -65,6 +72,7 @@ module Test.LuaEngine.Session.Support
   , holdAt
   , releaseHold
   , failAt
+  , failWith
 
     -- * Re-exports
   , module Test.LuaEngine.Facade.Support
@@ -74,10 +82,12 @@ module Test.LuaEngine.Session.Support
   , module Hetoimasia.LuaEngine.Session.Failure
   ) where
 
-import Control.Concurrent (forkIO, killThread, yield)
+import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, yield)
+import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
-import Control.Exception (ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, finally, fromException, mask, onException, throwIO, try, tryWithContext)
+import Control.Exception.Context (emptyExceptionContext)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, displayException, finally, fromException, mask, onException, rethrowIO, throwIO, try, tryWithContext)
 import Test.HUnit.Lang (HUnitFailure)
 import Control.Monad (unless, void, when)
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -270,6 +280,80 @@ runScenarioWith env harness scenario = do
       takeMVar terminated
       either throwIO (const (pure outcome)) result
 
+-- | An exception with the context it was raised with.
+type Caught = ExceptionWithContext SomeException
+
+-- | Run the session on this thread and a scenario on another, which is handed this thread's identity (to cancel it where
+-- an example means to) and the session. Answers what the session raised or returned, with the handle. The scenario is
+-- always waited for, and what it raises is raised here: a failed assertion in it is never swallowed. A session that
+-- never exposed its handle (its entry was refused) cannot be run with this.
+runCaught ∷ SessionEnv → Harness → (ThreadId → Session → IO ()) → IO (Either Caught SessionOutcome, Session)
+runCaught env harness scenario = do
+  driver ← myThreadId
+  handleVar ← newEmptyMVar
+  resultVar ← newEmptyMVar
+  terminated ← newEmptyMVar
+  thread ← mask $ \restore →
+    forkIO $
+      ( do
+          session ← readMVar handleVar
+          result ← try (restore (scenario driver session))
+          case result of
+            Left (failure ∷ SomeException) → do
+              status ← statusNow session
+              out ← outLines (seWorld env)
+              hPutStrLn stderr ("scenario failed with " <> show failure <> "\n  status: " <> show status <> "\n  stdout: " <> show out)
+              requestStop session StopQuit
+              putMVar resultVar (Left failure)
+            Right () → putMVar resultVar (Right ())
+          releaseSink (seWorld env)
+          openEverything (wSession (seWorld env))
+      )
+        `finally` putMVar terminated ()
+  ended ← tryWithContext @SomeException (runSession (scenarioSpec env harness) (putMVar handleVar))
+  finished ← try (bounded (readMVar resultVar))
+  case finished of
+    Left (ErrorCall why) → do
+      killThread thread
+      takeMVar terminated
+      throwIO (ErrorCall ("the scenario did not finish after the session ended: " <> why))
+    Right result → do
+      takeMVar terminated
+      either throwIO (const (pure ())) result
+  session ← readMVar handleVar
+  pure (ended, session)
+
+-- | The history the session holds now.
+historyNow ∷ Session → IO History
+historyNow = atomically . sessionHistory
+
+-- | Wait until a thread is blocked in a throw to a thread that is not interruptible: it cannot have delivered anything.
+awaitBlockedOnException ∷ ThreadId → IO ()
+awaitBlockedOnException thread = bounded loop
+  where
+    loop =
+      threadStatus thread >>= \case
+        ThreadBlocked BlockedOnException → pure ()
+        ThreadFinished → throwIO (userError "the thread ended instead of blocking in its throw")
+        ThreadDied → throwIO (userError "the thread died instead of blocking in its throw")
+        _ → yield >> loop
+
+-- | What a session raised, as text; empty if it returned.
+raisedMessage ∷ Either Caught SessionOutcome → Text
+raisedMessage = \case
+  Left (ExceptionWithContext _ raised) → Text.pack (displayException raised)
+  Right _ → ""
+
+-- | Whether what the session raised is a cancellation of the calling thread.
+raisedKilled ∷ Either Caught SessionOutcome → Bool
+raisedKilled = \case
+  Left (ExceptionWithContext _ raised) → fromException raised == Just ThreadKilled
+  Right _ → False
+
+-- | Every message the outcome's engine report accounts for, the primary first.
+outcomeMessages ∷ SessionOutcome → [Text]
+outcomeMessages found = map eeMessage (maybe [] pure (erPrimary (outEngine found)) <> erSecondary (outEngine found))
+
 -- | Block until the status satisfies this.
 awaitStatus ∷ Session → (SessionStatus → Bool) → IO SessionStatus
 awaitStatus session wanted = bounded . atomically $ do
@@ -391,7 +475,7 @@ data Recorder = Recorder
   { rcPoints ∷ !(TVar [Point])
   , rcHolds ∷ !(TVar (Map Text Bool))
   -- ^ A point's name held (True) or not.
-  , rcFails ∷ !(TVar (Map Text SomeException))
+  , rcFails ∷ !(TVar (Map Text Caught))
   }
 
 newRecorder ∷ IO Recorder
@@ -412,7 +496,14 @@ recordingHarness recorder base =
         atomically (modifyTVar' (rcPoints recorder) (point :))
         atomically (readTVar (rcHolds recorder) >>= \holds → when (Map.lookup name holds == Just True) retry)
         raised ← Map.lookup name <$> readTVarIO (rcFails recorder)
-        maybe (pure ()) throwIO raised
+        maybe (pure ()) rethrowIO raised
+    , -- a release is finite and never held: the recorder notes it and raises what an example made it raise
+      harnessRelease = \release → do
+        harnessRelease base release
+        let point = Released release
+        atomically (modifyTVar' (rcPoints recorder) (point :))
+        raised ← Map.lookup (pointName point) <$> readTVarIO (rcFails recorder)
+        maybe (pure ()) rethrowIO raised
     }
 
 -- | A point as a name an example can hold or fail it by.
@@ -435,4 +526,8 @@ releaseHold recorder point = atomically (modifyTVar' (rcHolds recorder) (Map.ins
 
 -- | Make the thread that reaches this point raise this.
 failAt ∷ Recorder → Point → SomeException → IO ()
-failAt recorder point failure = atomically (modifyTVar' (rcFails recorder) (Map.insert (pointName point) failure))
+failAt recorder point failure = failWith recorder point (ExceptionWithContext emptyExceptionContext failure)
+
+-- | The same, raising an exception that carries the context it was caught with: the cleanup failures it carries stay.
+failWith ∷ Recorder → Point → Caught → IO ()
+failWith recorder point failure = atomically (modifyTVar' (rcFails recorder) (Map.insert (pointName point) failure))

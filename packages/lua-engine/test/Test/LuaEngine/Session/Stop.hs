@@ -4,9 +4,12 @@
 -- cancellation and release still possible, and a role retired only when what it holds has actually retired.
 module Test.LuaEngine.Session.Stop (spec) where
 
-import Control.Concurrent (forkIO, killThread)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (forkIO, killThread, throwTo)
+import Control.Concurrent.MVar (isEmptyMVar, newEmptyMVar, putMVar, takeMVar)
+import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), MaskingState (MaskedUninterruptible), fromException, getMaskingState, toException, try, uninterruptibleMask_)
 import Control.Monad (replicateM_, void)
+import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.List (elemIndex)
 import qualified Data.Text as Text
 import Test.Hspec
 import Test.LuaEngine.Modules.Support (closeGate, openGate)
@@ -19,7 +22,8 @@ spec = describe "stop and drain" $ do
   sharedJobs
   peers
   shutdowns
-  handoff
+  barrier
+  waits
 
 -- A stop with everything full ---------------------------------------------------------------------------------------------------
 
@@ -189,26 +193,216 @@ shutdowns = describe "shutdown" $ do
       length (filter ("shutdown" `Text.isPrefixOf`) out) `shouldSatisfy` (<= 1)
       outVerdict outcome `shouldBe` VerdictFailure
 
--- The handoff of a stop --------------------------------------------------------------------------------------------------------
+-- The all-owner stop barrier ----------------------------------------------------------------------------------------------------
 
-handoff ∷ Spec
-handoff = describe "the handoff of a stop to the owners" $ do
-  it "is finished by the driver when the thread that applied the stop was cancelled in the middle of it, and the stop is performed once more, harmlessly, by whoever finds it owed" $
+-- | How a driver leaves.
+data Leaving = Cancelled | Threw
+  deriving (Eq, Show)
+
+-- | A harness that records, and the example's own changes to it.
+recording ∷ Recorder → [Protection] → Harness
+recording recorder removedProtections = (recordingHarness recorder noHarness) {harnessRemoved = removedProtections}
+
+barrier ∷ Spec
+barrier = describe "the all-owner stop barrier" $ do
+  mapM_
+    ( \(reversed, leaving) →
+        it ("hands every constructed owner its stop before the first wait, " <> orderName reversed <> ", the driver " <> leavingName leaving) $
+          withSetup (setup (roleScript printScript)) {suReversed = reversed} $ \env → do
+            recorder ← newRecorder
+            holdAt recorder (Awaiting Gameplay)
+            when' (leaving == Threw) (failAt recorder (Intended (InstanceKey Gameplay 0)) (toException (userError "the driver failed")))
+            (ended, session) ← runCaught env (recording recorder []) $ \driver session → do
+              when' (leaving == Cancelled) $ do
+                awaitPhase session Gameplay Running
+                awaitPhase session Presentation Running
+                throwTo driver ThreadKilled
+              -- the barrier ran and the first wait is about to begin: both owners have their stop, and nothing is retired
+              awaitPoint recorder (Awaiting Gameplay)
+              found ← historyNow session
+              historyStopped found `shouldBe` [Gameplay, Presentation]
+              status ← statusNow session
+              statusStopping status `shouldBe` True
+              retiredBoth status `shouldBe` False
+              releaseHold recorder (Awaiting Gameplay)
+            raisedBy leaving ended
+            found ← outcomeNow session
+            outRetired found `shouldBe` True
+    )
+    [(reversed, leaving) | reversed ← [False, True], leaving ← [Cancelled, Threw]]
+
+  mapM_
+    ( \(reversed, slow) →
+        it ("stops the peer of a role whose owner does not end, while that owner is held: " <> orderName reversed <> ", " <> show slow <> " slow") $
+          withSetup (setup (roleScript printScript)) {suReversed = reversed} $ \env → do
+            let world = seWorld env
+                fast = if slow == Gameplay then Presentation else Gameplay
+            recorder ← newRecorder
+            -- the slow role's owner is parked in a hook of the host: it cannot end, and cannot see a stop
+            holdAt recorder (Dispatched (InstanceKey slow 0))
+            (ended, session) ← runCaught env (recording recorder []) $ \driver session → do
+              awaitPoint recorder (Dispatched (InstanceKey slow 0))
+              pumpUntil world (elem ("init " <> roleWord fast) <$> outLines world)
+              throwTo driver ThreadKilled
+              -- the barrier stops the fast role while the slow one is held: its shutdown runs and it is retired
+              pumpUntil world (elem ("shutdown " <> roleWord fast <> " stopped") <$> outLines world)
+              status <- statusNow session
+              fmap rolePhase (pickRole slow status) `shouldBe` Just Stopping
+              fmap roleFailed (pickRole slow status) `shouldBe` Just False
+              releaseHold recorder (Dispatched (InstanceKey slow 0))
+            raisedBy Cancelled ended
+            out <- outLines world
+            out `shouldSatisfy` elem ("shutdown " <> roleWord slow <> " stopped")
+            found <- outcomeNow session
+            outRetired found `shouldBe` True
+            outFailures found `shouldBe` []
+    )
+    [(reversed, slow) | reversed ← [False, True], slow ← [Gameplay, Presentation]]
+
+  -- the control: with the barrier removed each scope stops its own owner alone, and the protection's absence shows
+  describe "with the barrier removed (a negative control)" $ do
+    it "hands the innermost scope's owner alone its stop before the first wait, which is what the proof above detects" $
+      withSetup (setup (roleScript printScript)) $ \env → do
+        recorder ← newRecorder
+        holdAt recorder (Awaiting Presentation)
+        (ended, session) ← runCaught env (recording recorder [ProtectBarrier]) $ \driver session → do
+          awaitPhase session Gameplay Running
+          awaitPhase session Presentation Running
+          throwTo driver ThreadKilled
+          awaitPoint recorder (Awaiting Presentation)
+          found ← historyNow session
+          historyStopped found `shouldBe` [Presentation]
+          releaseHold recorder (Awaiting Presentation)
+        raisedBy Cancelled ended
+        -- the other scope stops its owner afterwards, so the session still ends
+        found ← outcomeNow session
+        outRetired found `shouldBe` True
+
+    it "leaves the peer of a held owner running, which the behavioural proof above detects" $
+      withSetup (setup (roleScript printScript)) $ \env → do
+        let world = seWorld env
+        recorder ← newRecorder
+        holdAt recorder (Dispatched (InstanceKey Presentation 0))
+        (ended, _) ← runCaught env (recording recorder [ProtectBarrier]) $ \driver _ → do
+          awaitPoint recorder (Dispatched (InstanceKey Presentation 0))
+          pumpUntil world (elem "init gameplay" <$> outLines world)
+          throwTo driver ThreadKilled
+          awaitPoint recorder (Awaiting Presentation)
+          out ← outLines world
+          out `shouldSatisfy` notElem "shutdown gameplay stopped"
+          releaseHold recorder (Dispatched (InstanceKey Presentation 0))
+        raisedBy Cancelled ended
+        out ← outLines world
+        out `shouldSatisfy` elem "shutdown gameplay stopped"
+  where
+    orderName reversed = if reversed then "presentation listed first" else "gameplay listed first"
+    leavingName = \case
+      Cancelled → "cancelled"
+      Threw → "throwing"
+    when' condition action = if condition then action else pure ()
+    pickRole role status = if role == Gameplay then statusGameplay status else statusPresentation status
+
+-- | The session raised what leaving the way it did raises: a cancellation as itself, or the driver's own failure.
+raisedBy ∷ Leaving → Either Caught SessionOutcome → Expectation
+raisedBy leaving ended = case (leaving, ended) of
+  (Cancelled, Left (ExceptionWithContext _ raised)) → fromException raised `shouldBe` Just ThreadKilled
+  (Threw, Left (ExceptionWithContext _ raised)) → show raised `shouldSatisfy` Text.isInfixOf "the driver failed" . Text.pack
+  (_, Right _) → expectationFailure "the exception was lost"
+
+-- Waits stay interruptible ---------------------------------------------------------------------------------------------------------------
+
+waits ∷ Spec
+waits = describe "masking and waits" $ do
+  it "refuses an entry that is uninterruptibly masked before it acquires anything, and tells nobody" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      recorder ← newRecorder
+      told ← newIORef False
+      result ← try (uninterruptibleMask_ (runSession (scenarioSpec env (recording recorder [])) (\_ → writeIORef told True)))
+      case result of
+        Left (SessionRefused why) → why `shouldSatisfy` Text.isInfixOf "uninterruptibly masked"
+        Right _ → expectationFailure "an uninterruptibly masked entry was accepted"
+      readIORef told `shouldReturn` False
+      recorded recorder `shouldReturn` []
+
+  it "runs the protocol's waits under the caller's own mask, never an uninterruptible one" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      recorder ← newRecorder
+      states ← newIORef []
+      let base = recording recorder []
+          harness =
+            base
+              { harnessProbe = \point → do
+                  harnessProbe base point
+                  case point of
+                    Awaiting _ → getMaskingState >>= \state → readIORef states >>= writeIORef states . (<> [state])
+                    _ → pure ()
+              }
+      (ended, _) ← runCaught env harness $ \driver session → do
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        throwTo driver ThreadKilled
+        void (awaitRetired session)
+      raisedBy Cancelled ended
+      masks ← readIORef states
+      masks `shouldSatisfy` (not . null)
+      masks `shouldSatisfy` notElem MaskedUninterruptible
+
+  describe "the wait for an owner" $ do
+    mapM_
+      ( \(removedProtections, label, interruptible) →
+          it label $
+            withSetup (setup (roleScript printScript)) $ \env → do
+              let world = seWorld env
+              recorder ← newRecorder
+              holdAt recorder (Dispatched (InstanceKey Presentation 0))
+              delivered ← newEmptyMVar
+              (ended, _) ← runCaught env ((recording recorder removedProtections)) $ \driver _ → do
+                awaitPoint recorder (Dispatched (InstanceKey Presentation 0))
+                pumpUntil world (elem "init gameplay" <$> outLines world)
+                throwTo driver ThreadKilled
+                awaitPoint recorder (Awaiting Presentation)
+                -- a second cancellation is sent while the wait is outstanding
+                thrower ← forkIO (throwTo driver ThreadKilled >> putMVar delivered ())
+                if interruptible
+                  then bounded (takeMVar delivered)
+                  else do
+                    -- the wait is uninterruptible: the thrower is blocked in its throw and nothing was delivered
+                    awaitBlockedOnException thrower
+                    isEmptyMVar delivered `shouldReturn` True
+                    -- withdraw the throw that cannot land, so that it does not land after the example
+                    killThread thrower
+                releaseHold recorder (Dispatched (InstanceKey Presentation 0))
+              raisedKilled ended `shouldBe` True
+      )
+      [ ([], "is interruptible: a cancellation sent while it is outstanding is delivered at once, and retained", True)
+      , ([ProtectInterruptibleWait], "is not interruptible when the protection is removed (a negative control), which the proof above detects", False)
+      ]
+
+  it "keeps waiting for an owner that does not end through every cancellation, and releases only after it has" $
     withSetup (setup (roleScript printScript)) $ \env → do
       let world = seWorld env
       recorder ← newRecorder
-      holdAt recorder (StopHandoff Gameplay)
-      outcome ← runScenarioWith env (recordingHarness recorder noHarness) $ \session → do
-        awaitPhase session Gameplay Running
-        awaitPhase session Presentation Running
-        stopper ← forkIO (requestStop session StopQuit)
-        -- the stop is committed and its first owner is about to be asked: the thread is cancelled right there
-        awaitPoint recorder (StopHandoff Gameplay)
-        killThread stopper
-        releaseHold recorder (StopHandoff Gameplay)
-        void (awaitRetired session)
-      out ← outLines world
-      out `shouldSatisfy` elem "shutdown gameplay stopped"
-      out `shouldSatisfy` elem "shutdown presentation stopped"
-      outRetired outcome `shouldBe` True
-      outVerdict outcome `shouldBe` VerdictSuccess
+      holdAt recorder (Dispatched (InstanceKey Presentation 0))
+      (ended, _) ← runCaught env (recording recorder []) $ \driver session → do
+        awaitPoint recorder (Dispatched (InstanceKey Presentation 0))
+        pumpUntil world (elem "init gameplay" <$> outLines world)
+        throwTo driver ThreadKilled
+        awaitPoint recorder (Awaiting Presentation)
+        -- the wait is interrupted again and again, and is still the one outstanding wait: nothing of the held role is
+        -- retired or released while its owner is held
+        replicateM_ 3 (throwTo driver ThreadKilled)
+        status ← statusNow session
+        fmap rolePhase (statusPresentation status) `shouldBe` Just Stopping
+        soFar ← recorded recorder
+        [built | Released (ReleaseBuild Presentation built) ← soFar] `shouldBe` []
+        releaseHold recorder (Dispatched (InstanceKey Presentation 0))
+      raisedBy Cancelled ended
+      points ← recorded recorder
+      -- every release of a role came after that role's owner had ended
+      mapM_
+        ( \role → do
+            let endedAt = elemIndex (OwnerEnded role) points
+                releasedAt = [index | (index, Released (ReleaseBuild released _)) ← zip [0 ∷ Int ..] points, released == role]
+            endedAt `shouldSatisfy` maybe False (\index → all (> index) releasedAt)
+        )
+        [Gameplay, Presentation]

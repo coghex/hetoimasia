@@ -5,13 +5,24 @@
 -- the two arrive.
 module Test.LuaEngine.Session.Evidence (spec) where
 
+import Control.Concurrent (throwTo)
+import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), throwIO, toException)
+import Control.Exception.Context (emptyExceptionContext)
 import Control.Monad (void)
+import Data.IORef (newIORef, readIORef, writeIORef)
+import qualified Data.Map.Strict as Map
 import qualified Data.Text as Text
+import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, composeCleanup, displayCleanupFailure)
+import Hetoimasia.Scripting.Lua.Scheduler (TimerBackend (..))
 import Test.Hspec
 import Test.LuaEngine.Session.Support
 
 spec ∷ Spec
 spec = describe "evidence" $ do
+  cancellations
+  rawCompletions
+  sources
+  histories
   it "keeps a role's first failure and its attribution while a later failure of the same role is accounted beside it" $
     withSetup
       ( (setup (roleScript printScript {scInit = [], scUpdate = ["if api.role == 'gameplay' and api.instance_id == 'inst-1' then error('first failure') end"], scShutdown = ["if api.instance_id == 'inst-2' then error('second failure') end"]}))
@@ -116,3 +127,243 @@ spec = describe "evidence" $ do
         outRetired now `shouldBe` False
         fmap rfRole (outFailures now) `shouldBe` [Gameplay]
         requestStop session StopQuit
+
+-- | A harness that records, with these protections removed.
+recording ∷ Recorder → [Protection] → Harness
+recording recorder removedProtections = (recordingHarness recorder noHarness) {harnessRemoved = removedProtections}
+
+entriesOf ∷ SessionOutcome → [EngineEntry]
+entriesOf outcome = maybe [] pure (erPrimary (outEngine outcome)) <> erSecondary (outEngine outcome)
+
+-- | An exception with the context it was caught with, as a probe throws it.
+caught ∷ Text.Text → Caught
+caught message = ExceptionWithContext emptyExceptionContext (toException (userError (Text.unpack message)))
+
+-- | A cancellation that carries these cleanup failures, as one that unwound through scopes whose releases failed does.
+cancellationWith ∷ [Text.Text] → IO Caught
+cancellationWith messages =
+  composeCleanup (Just (ExceptionWithContext emptyExceptionContext (toException ThreadKilled))) [("release", caught message) | message ← messages]
+    >>= maybe (throwIO (userError "no exception was composed")) pure
+
+-- What a cancellation carries --------------------------------------------------------------------------------------------------
+
+cancellations ∷ Spec
+cancellations = describe "the cleanup a cancellation carries" $ do
+  it "raises the cancellation as itself with the timer's failed disposal beside it, and makes the outcome a failure" $
+      withSetup (setup (roleScript printScript)) {suShape = GameplayAlone} $ \env → do
+        let world = seWorld env
+            failing = case worldTimer world of
+              TimerBackend arm → TimerBackend $ \microseconds wake → arm microseconds wake >>= \cancel → pure (cancel >> throwIO (userError "timer cancel failed"))
+            env' = env {seSpec = (seSpec env) {sxTimer = failing}}
+        (ended, session) ← runCaught env' noHarness $ \driver session → do
+          awaitPhase session Gameplay Running
+          awaitRegistration world 1000
+          throwTo driver ThreadKilled
+          void (awaitRetired session)
+        case ended of
+          Left (ExceptionWithContext attached raised) → do
+            raisedMessage ended `shouldSatisfy` (not . Text.null)
+            show raised `shouldSatisfy` (== "thread killed") . Text.unpack . Text.pack
+            map displayCleanupFailure (cleanupFailuresInContext attached) `shouldSatisfy` any (Text.isInfixOf "timer cancel failed" . Text.pack)
+          Right _ → expectationFailure "the cancellation was lost"
+        found ← outcomeNow session
+        outVerdict found `shouldBe` VerdictFailure
+        length [entry | entry ← entriesOf found, Text.isInfixOf "timer cancel failed" (eeMessage entry)] `shouldBe` 1
+        outRetired found `shouldBe` True
+
+  it "accounts every cleanup failure a cancellation carries, once each, whatever its text, and does not make the cancellation a failure of the engine" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      recorder ← newRecorder
+      cancelled ← cancellationWith ["same text", "same text", "another"]
+      failWith recorder (Built Presentation BuildOwner) cancelled
+      (ended, session) ← runCaught env (recording recorder []) $ \_ session → void (awaitStatus session retiredBoth)
+      raisedKilled ended `shouldBe` True
+      found ← outcomeNow session
+      -- distinct failures with identical text both count; the cancellation itself is none
+      length (entriesOf found) `shouldBe` 3
+      length [entry | entry ← entriesOf found, Text.isInfixOf "same text" (eeMessage entry)] `shouldBe` 2
+      mapM_ (\entry → eeCode entry `shouldBe` CleanupFailure) (entriesOf found)
+      outVerdict found `shouldBe` VerdictFailure
+
+  describe "with the accounting of what a cancellation carries removed (a negative control)" $
+    it "loses what the cancellation carried and reports a success, which the proof above detects" $
+      withSetup (setup (roleScript printScript)) $ \env → do
+        recorder ← newRecorder
+        cancelled ← cancellationWith ["same text", "another"]
+        failWith recorder (Built Presentation BuildOwner) cancelled
+        (ended, session) ← runCaught env (recording recorder [ProtectCancellationEvidence]) $ \_ session → void (awaitStatus session retiredBoth)
+        raisedKilled ended `shouldBe` True
+        found ← outcomeNow session
+        entriesOf found `shouldBe` []
+        outVerdict found `shouldBe` VerdictSuccess
+
+  it "keeps the first cancellation as the one raised when more arrive while the session unwinds, and loses none of the cleanup" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      recorder ← newRecorder
+      cancelled ← cancellationWith ["carried by the first"]
+      failWith recorder (Built Presentation BuildOwner) cancelled
+      holdAt recorder (Awaiting Presentation)
+      (ended, session) ← runCaught env (recording recorder []) $ \driver _ → do
+        awaitPoint recorder (Awaiting Presentation)
+        -- a second and a third cancellation land while the first is being cleaned up
+        throwTo driver ThreadKilled
+        throwTo driver ThreadKilled
+        releaseHold recorder (Awaiting Presentation)
+      case ended of
+        Left (ExceptionWithContext attached _) → map displayCleanupFailure (cleanupFailuresInContext attached) `shouldSatisfy` any (Text.isInfixOf "carried by the first" . Text.pack)
+        Right _ → expectationFailure "the cancellation was lost"
+      raisedKilled ended `shouldBe` True
+      found ← outcomeNow session
+      length [entry | entry ← entriesOf found, Text.isInfixOf "carried by the first" (eeMessage entry)] `shouldBe` 1
+
+-- | A suspended coroutine whose close fails when the owner retires.
+suspending ∷ Script
+suspending =
+  printScript
+    { scInit = []
+    , scUpdate =
+        [ "if api.time.tick() == 1 then"
+        , "  print('suspended')"
+        , "  local guard <close> = setmetatable({}, {__close = function() error('close failed') end})"
+        , "  api.time.wait_ticks(100)"
+        , "end"
+        ]
+    }
+
+-- | Run a gameplay-only session whose owner retires with a failing close, under the given protections, and answer its
+-- outcome. The owner's failure is one supervision raises at its boundary as well, hence the setup.
+retiringWithFailingClose ∷ [Protection] → IO SessionOutcome
+retiringWithFailingClose removedProtections = do
+  result ← newIORef Nothing
+  _ ←
+    fatalSetup (setup (roleScript suspending)) {suShape = GameplayAlone} $ \env → do
+      let world = seWorld env
+      recorder ← newRecorder
+      (_, session) ← runCaught env (recording recorder removedProtections) $ \_ session → do
+        awaitPhase session Gameplay Running
+        awaitRegistration world 1000
+        passTime world 1000000 (elem "suspended" <$> outLines world)
+        requestStop session StopQuit
+        void (awaitStatus session (maybe False ((== Retired) . rolePhase) . gameplayOf))
+      outcomeNow session >>= writeIORef result . Just
+  readIORef result >>= maybe (throwIO (userError "the example did not finish")) pure
+
+rawCompletions ∷ Spec
+rawCompletions = describe "the evidence of how an owner ended" $ do
+  it "is read from its raw completion, whatever supervision has latched, and counted once" $ do
+    found ← retiringWithFailingClose []
+    length [entry | entry ← entriesOf found, eeCode entry == CleanupFailure, Text.isInfixOf "close failed" (eeMessage entry)] `shouldBe` 1
+    outVerdict found `shouldBe` VerdictFailure
+
+  describe "with the raw completion not read (a negative control)" $
+    it "loses the cleanup the owner retained, which the proof above detects" $ do
+      found ← retiringWithFailingClose [ProtectRawCompletion]
+      length [entry | entry ← entriesOf found, eeCode entry == CleanupFailure, Text.isInfixOf "close failed" (eeMessage entry)] `shouldBe` 0
+
+-- Where a failure comes from, and what bounds it ----------------------------------------------------------------------------------
+
+sources ∷ Spec
+sources = describe "where a failure comes from" $ do
+  it "counts an exception of an asynchronous type that a release itself raised as a failure of that cleanup, and the session still returns" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      recorder ← newRecorder
+      failAt recorder (Released (ReleaseBuild Gameplay BuildFacade)) (toException ThreadKilled)
+      (ended, session) ← runCaught env (recording recorder []) $ \_ session → do
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        requestStop session StopQuit
+        void (awaitStatus session (maybe False ((== Stopping) . rolePhase) . gameplayOf))
+        void (awaitStatus session (maybe False ((== Retired) . rolePhase) . presentationOf))
+      -- it was a failure of a release, not a cancellation of the caller: the call returns
+      ended `shouldSatisfy` either (const False) (const True)
+      found ← outcomeNow session
+      outVerdict found `shouldBe` VerdictFailure
+      length [entry | entry ← entriesOf found, eeCode entry == CleanupFailure, Text.isInfixOf "gameplay" (eeMessage entry)] `shouldBe` 1
+
+  it "does not make a cancellation of the caller alone a failure of the host" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      (ended, session) ← runCaught env noHarness $ \driver session → do
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        throwTo driver ThreadKilled
+        void (awaitRetired session)
+      raisedKilled ended `shouldBe` True
+      found ← outcomeNow session
+      outVerdict found `shouldBe` VerdictSuccess
+      outFailures found `shouldBe` []
+      erPrimary (outEngine found) `shouldBe` Nothing
+
+  it "keeps a failure of the engine and counts every one beyond the sixteen summaries, never dropping the failure bit" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      recorder ← newRecorder
+      cause ← composeCleanup (Just (caught "construction failed")) [("release", caught (Text.pack ("cleanup " <> show n))) | n ← [1 .. 20 ∷ Int]]
+      maybe (pure ()) (failWith recorder (Built Presentation BuildOwner)) cause
+      (_, session) ← runCaught env (recording recorder []) $ \_ session → void (awaitStatus session retiredBoth)
+      found ← outcomeNow session
+      let report = outEngine found
+      outVerdict found `shouldBe` VerdictFailure
+      fmap (Text.isInfixOf "construction failed" . eeMessage) (erPrimary report) `shouldBe` Just True
+      length (erSecondary report) `shouldBe` 16
+      erOmitted report `shouldBe` 4
+      reportAccounted report `shouldBe` 21
+
+  it "carries a missing settlement as a failure of the host's contract, never silently, and an intact one as nothing" $
+    mapM_
+      ( \(hidden, expected) →
+          withSetup (setup (roleScript printScript)) {suShape = GameplayAlone} $ \env → do
+            let harness = noHarness {harnessHideSettlement = \key → hidden && key == InstanceKey Gameplay 0}
+            (ended, session) ← runCaught env harness $ \_ session → do
+              awaitPhase session Gameplay Running
+              requestStop session StopQuit
+              void (awaitRetired session)
+            ended `shouldSatisfy` either (const False) (const True)
+            found ← outcomeNow session
+            outVerdict found `shouldBe` expected
+            outcomeMessages found `shouldSatisfy` (\messages → any (Text.isInfixOf "had no settlement") messages == hidden)
+            kept ← historyNow session
+            Map.member (InstanceKey Gameplay 0) (historyFacts kept) `shouldBe` not hidden
+      )
+      [(True, VerdictFailure), (False, VerdictSuccess)]
+
+-- What the settlements prove -----------------------------------------------------------------------------------------------------
+
+historyOfKey ∷ Session → InstanceKey → IO (Maybe InstanceFact)
+historyOfKey session key = Map.lookup key . historyFacts <$> historyNow session
+
+histories ∷ Spec
+histories = describe "the history a settlement proves" $ do
+  it "tells a shutdown skipped because the init never succeeded from every other ending" $
+    withSetup (setup (roleScript printScript {scInit = ["if api.role == 'presentation' then error('ui init failed') end"]})) $ \env → do
+      (_, session) ← runCaught env noHarness $ \_ session → void (awaitRetired session)
+      failedInit ← historyOfKey session (InstanceKey Presentation 0)
+      -- no success, and a shutdown skipped because none ran
+      fmap ifInitialized failedInit `shouldBe` Just False
+      fmap ifShutdown failedInit `shouldBe` Just FactShutdownSkippedNoInit
+      fmap ifEnded failedInit `shouldBe` Just EndedFailed
+
+  it "keeps an init that succeeded when the instance went on to fail" $
+    withSetup ((setup (roleScript printScript {scInit = [], scUpdate = ["error('boom')"]})) {suShape = GameplayAlone}) $ \env → do
+      let world = seWorld env
+      (_, session) ← runCaught env noHarness $ \_ session → do
+        awaitPhase session Gameplay Running
+        awaitRegistration world 1000
+        nudge world 1000000
+        void (awaitRetired session)
+      failedLater ← historyOfKey session (InstanceKey Gameplay 0)
+      fmap ifInitialized failedLater `shouldBe` Just True
+      fmap ifEnded failedLater `shouldBe` Just EndedFailed
+      fmap ifShutdown failedLater `shouldSatisfy` (/= Just FactShutdownSkippedNoInit)
+
+  it "tells an instance whose owner ended by a failure of the host, after its init, from one whose init never succeeded" $ do
+    _ ←
+      fatalSetup (setup (roleScript printScript {scInit = [], scUpdate = ["if api.role == 'presentation' then print('ui update') end"]})) $ \env → do
+        let world = seWorld env
+        failSinkOn world "ui update"
+        (_, session) ← runCaught env noHarness $ \_ session → do
+          awaitPhase session Presentation Running
+          nudge world 1000000000
+          void (awaitRetired session)
+        unsafe ← historyOfKey session (InstanceKey Presentation 0)
+        fmap ifInitialized unsafe `shouldBe` Just True
+        fmap ifShutdown unsafe `shouldBe` Just FactShutdownSkippedUnsafe
+    pure ()

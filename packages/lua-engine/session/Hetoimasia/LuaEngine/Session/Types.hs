@@ -8,36 +8,46 @@
 -- * The 'SessionSpec' is data: the services a composition injects. The coordinator reaches no global,
 --   no environment record and no registry; each service is a field here and is passed on, narrowed,
 --   to what needs it.
--- * The 'Session' handle is made first, before any VM, and lives for the call that made it. Its one
---   state variable holds the pure state of "Hetoimasia.LuaEngine.Session.State"; its other variable
---   holds the actions that stop each role's owner, registered by the thread that started the owner and
---   run by whichever thread applies a transition that reports a role to be stopped. Both variables are
---   written only by transactions that check and change them together.
+-- * The 'Session' handle is the session's lifecycle record. It is made first, before any VM, is fresh for
+--   each session and is never reset, and it outlives every role's scope: a reader holding the handle sees
+--   a coherent snapshot after the driver has returned or thrown. Its state variable holds the pure state of
+--   "Hetoimasia.LuaEngine.Session.State". Its registry holds, for each role, what the session needs to
+--   stop and to prove retired what was acquired: the finite stop of the owner and of the coordinator that
+--   serves it, the raw completion of the owner, the proof that the coordinator has drained, and the finite
+--   releases of the acquired components. Both variables are written only by transactions that check and
+--   change them together (a registration is committed with the fact that the component was acquired), by the
+--   thread that acquired the component; the stop pass, the retirement protocol and the status readers read
+--   them, on whichever thread runs them.
 module Hetoimasia.LuaEngine.Session.Types
   ( -- * The composition
     SessionSpec (..)
 
     -- * The handle
   , Session (..)
+  , Registry (..)
+  , emptyRegistry
+  , Registered (..)
+  , RoleRelease (..)
 
     -- * Failures of the coordinator itself
   , SessionRefused (..)
   ) where
 
-import Control.Concurrent.MVar (MVar)
-import Control.Concurrent.STM (TVar)
+import Control.Concurrent.STM (STM, TVar)
 import Control.Exception (Exception)
+import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
 import Data.Text (Text)
 import Hetoimasia.Content.Inventory (Inventory)
 import Hetoimasia.Content.ReadPool (ReadPool)
 import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.Foundation.Time (MonotonicSource)
+import Hetoimasia.Foundation.Worker (Completion)
 import Hetoimasia.LuaEngine.Boot (Checkpoint)
 import Hetoimasia.LuaEngine.Facade (Output)
 import Hetoimasia.LuaEngine.Manifest (Role)
 import Hetoimasia.LuaEngine.Profile (Profile)
-import Hetoimasia.LuaEngine.Session.Harness (Harness, Point)
+import Hetoimasia.LuaEngine.Session.Harness (Harness, InstanceKey, Point, Protection, Release)
 import Hetoimasia.LuaEngine.Session.State (SessionState)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
@@ -73,16 +83,50 @@ data SessionSpec = SessionSpec
 -- | The handle to a session, made before any VM exists.
 data Session = Session
   { sessionState ∷ !(TVar SessionState)
-  , sessionStoppers ∷ !(TVar (Map Role (IO ())))
-  -- ^ What stops each role's owner: registered once the owner exists, run by whoever applies the
-  -- transition that reports the role to be stopped.
+  , sessionRegistry ∷ !(TVar Registry)
+  -- ^ What the session acquired, role by role, and how each is stopped, proven drained and released.
   , sessionLogger ∷ !Logger
-  -- ^ The coordinator's diagnostics: lifecycle at info, a failure once at error.
+  -- ^ The coordinator's diagnostics: lifecycle at info, a failure once at error. Written only by the driver,
+  -- outside every owner callback, stop pass and recovery commit.
   , sessionProbe ∷ Point → IO ()
   -- ^ The harness's probe, told at the points of the session's life ('noHarness' tells nothing).
-  , sessionGrantLock ∷ !(MVar ())
-  -- ^ Held by the driver around the issuing of a tick grant, and passed through by a stop of the
-  -- logical role before it asks the owner to stop: a grant is either issued before the stop or not at all.
+  , sessionRelease ∷ Release → IO ()
+  -- ^ The harness's finite release, run with each registered release ('noHarness' runs nothing).
+  , sessionRemoved ∷ ![Protection]
+  -- ^ The protections a negative control removed ('noHarness' removes none).
+  , sessionHidden ∷ InstanceKey → Bool
+  -- ^ The settlements a test injected the loss of ('noHarness' hides none).
+  }
+
+-- | What the session holds for each role and for itself. Registered by the thread that acquired a component,
+-- in the transaction that records the acquisition, so a stop or a failure that follows finds it.
+data Registry = Registry
+  { regRoles ∷ !(Map Role Registered)
+  , regSession ∷ ![RoleRelease]
+  -- ^ The session-level finite releases still to run (the pacing timer, the outermost scope), the first to run first.
+  }
+
+emptyRegistry ∷ Registry
+emptyRegistry = Registry Map.empty []
+
+-- | One role's acquired components.
+data Registered = Registered
+  { regStop ∷ !(IO ())
+  -- ^ The finite, non-waiting stop: the owner's request to stop if it exists, and the close of the coordinator's
+  -- admission with the withdrawal of the reads no worker took. Idempotent.
+  , regCompletion ∷ !(Maybe (STM (Maybe (Completion ()))))
+  -- ^ The owner's raw completion, once it has one; 'Nothing' for a role whose owner was never started.
+  , regDrained ∷ !(Maybe (STM Bool))
+  -- ^ Whether the coordinator has given back every slot and byte, when there is one.
+  , regReleases ∷ ![RoleRelease]
+  -- ^ The role's finite releases, the last acquired first.
+  }
+
+-- | A finite release the session registered with the acquisition it undoes. It runs once, uninterruptibly, after
+-- the owners and providers that borrowed what it releases have finished, and never waits.
+data RoleRelease = RoleRelease
+  { rrWhich ∷ !Release
+  , rrAction ∷ !(IO ())
   }
 
 -- | The composition could not be made: a bound below what the engine needs, a service that was

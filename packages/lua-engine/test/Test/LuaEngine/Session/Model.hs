@@ -299,11 +299,11 @@ policy = describe "the failure policy" $ do
 
   it "commits an owner's end once: the claim, every entry and every init its settlements prove, and a second commit adds nothing" $ do
     let entries = [engineEntry CleanupFailure (Just Gameplay) OnCleanup "first", engineEntry CleanupFailure (Just Gameplay) OnCleanup "second"]
-        ended = OwnerFinalized Gameplay entries [g0]
+        ended = OwnerFinalized Gameplay (map evidenceOf entries) [(g0, InstanceFact True FactShutdownRan EndedStopped)]
         once = applied (validated <> [ended]) both
         twice = applied (validated <> [ended, ended]) both
     map eeMessage (erSecondary (stEngine once)) `shouldSatisfy` (\found → "second" `elem` found)
-    stAccounted once `shouldBe` Set.fromList [Gameplay]
+    (rsOwnerEnded <$> Map.lookup Gameplay (stRoles once)) `shouldBe` Just True
     reportAccounted (stEngine twice) `shouldBe` reportAccounted (stEngine once)
     -- the init the settlement proves is recorded, with no clock, and opens nothing
     roleInitializedOf Gameplay once `shouldBe` Just True
@@ -438,11 +438,11 @@ invariants = describe "every order of events" $ do
       , LatchFailure Presentation (failure Presentation OnUpdate "p") []
       , Stop StopQuit
       , Stop StopInterrupt
-      , Settled (OweStop Gameplay)
-      , Settled (OweStop Presentation)
+      , StopHanded Gameplay
+      , StopHanded Presentation
       , InstanceFailing "inst" Gameplay (failure Gameplay OnUpdate "g") []
       , InstanceEscalated "inst" Gameplay (failure Gameplay OnUpdate "g") []
-      , OwnerFinalized Gameplay [engineEntry CleanupFailure (Just Gameplay) OnCleanup "close failed"] [g0]
+      , OwnerFinalized Gameplay [evidenceOf (engineEntry CleanupFailure (Just Gameplay) OnCleanup "close failed")] [(g0, InstanceFact True FactShutdownRan EndedStopped)]
       ]
 
 -- | Every sequence of up to this many events from a menu.
@@ -479,7 +479,7 @@ violations = go both
           [ "a stop is owed to a role that takes work" | role ← owedStops afterwards, roleAdmit role afterwards == AdmitOpen ]
         , [ "an owed stop was dropped" | role ← owedStops prior, role `notElem` owedStops afterwards, not (performs event role) ]
         , -- the claim that an owner was accounted, and the marker that an instance's failure was told, only grow
-          [ "the accounted claim was withdrawn" | not (stAccounted prior `Set.isSubsetOf` stAccounted afterwards) ]
+          [ "the accounted claim was withdrawn" | role ← [Gameplay, Presentation], (rsOwnerEnded <$> Map.lookup role (stRoles prior)) == Just True, (rsOwnerEnded <$> Map.lookup role (stRoles afterwards)) /= Just True ]
         , [ "the told marker was withdrawn" | not (stEarly prior `Set.isSubsetOf` stEarly afterwards) ]
         , -- an owner's end, and what a settlement proves, open no gate
           [ "an owner's end opened the start gate" | opening, isFinalized event ]
@@ -498,7 +498,8 @@ violations = go both
           OwnerFinalized {} → True
           _ → False
         performs by role = case by of
-          Settled (OweStop done) → done == role
+          StopHanded done → done == role
+          OwnerFinalized done _ _ → done == role
           RoleRetired done → done == role
           _ → False
 

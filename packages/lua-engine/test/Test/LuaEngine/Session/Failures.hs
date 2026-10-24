@@ -10,7 +10,9 @@
 module Test.LuaEngine.Session.Failures (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
-import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVarIO, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVarIO, writeTVar)
+import qualified Data.Map.Strict as Map
+import Hetoimasia.Scripting.Lua.Scheduler (TimerBackend (..))
 import Control.Concurrent (forkIO, myThreadId, throwTo)
 import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, displayException, fromException, throwIO, toException, try, tryWithContext)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, displayCleanupFailure)
@@ -32,6 +34,8 @@ spec = describe "failures" $ do
   otherFailures
   hostFailures
   notFailures
+  releases
+  outcomes
 
 linesWith ∷ Text → World → IO [Text]
 linesWith prefix world = filter (prefix `Text.isPrefixOf`) <$> outLines world
@@ -300,13 +304,16 @@ hostFailures = describe "of the host" $ do
         let world = seWorld env
         recorder ← newRecorder
         failAt recorder (GrantIntent 2) (toException (userError "the driver failed"))
-        outcome ← runScenarioWith env (recordingHarness recorder noHarness) $ \session → do
+        (ended, session) ← runCaught env (recordingHarness recorder noHarness) $ \_ session → do
           awaitPhase session Gameplay Running
           awaitRegistration world 1000
           passTime world 1000000 (elem "suspended" <$> outLines world)
           -- the second tick falls due: the driver raises at the grant, with a coroutine suspended in a failing close
           nudge world 1000000
-          void (awaitRetired session)
+          void (awaitStatus session statusStopping)
+        -- what the driver raised is what the call raises, with the owner's retained cleanup beside it, once
+        raisedMessage ended `shouldSatisfy` Text.isInfixOf "the driver failed"
+        outcome ← outcomeNow session
         outVerdict outcome `shouldBe` VerdictFailure
         fmap eeCode (erPrimary (outEngine outcome)) `shouldBe` Just HostFailure
         fmap (Text.isInfixOf "the driver failed" . eeMessage) (erPrimary (outEngine outcome)) `shouldBe` Just True
@@ -392,12 +399,14 @@ hostFailures = describe "of the host" $ do
               let env' = env {seSpec = (seSpec env) {sxLogger = throwingLogger armed message}}
               recorder ← newRecorder
               failAt recorder (GrantIntent 2) (toException (userError "the driver failed"))
-              outcome ← runScenarioWith env' (recordingHarness recorder noHarness) $ \session → do
+              (ended, session) ← runCaught env' (recordingHarness recorder noHarness) $ \_ session → do
                 awaitPhase session Gameplay Running
                 awaitRegistration world 1000
                 passTime world 1000000 (elem "suspended" <$> outLines world)
                 nudge world 1000000
-                void (awaitRetired session)
+                void (awaitStatus session statusStopping)
+              raisedMessage ended `shouldSatisfy` Text.isInfixOf "the driver failed"
+              outcome ← outcomeNow session
               let entries = maybe [] pure (erPrimary (outEngine outcome)) <> erSecondary (outEngine outcome)
               outVerdict outcome `shouldBe` VerdictFailure
               outRetired outcome `shouldBe` True
@@ -520,3 +529,202 @@ notFailures = describe "that are not failures" $ do
         out `shouldSatisfy` elem "caught false"
         outVerdict outcome `shouldBe` VerdictSuccess
         outFailures outcome `shouldBe` []
+
+-- The finite releases of a role ---------------------------------------------------------------------------------------------------
+
+-- | A harness that records, with these protections removed.
+recording ∷ Recorder → Harness
+recording recorder = recordingHarness recorder noHarness
+
+releases ∷ Spec
+releases = describe "the releases a role registered" $ do
+  it "ends the whole session, with the healthy presentation role asked to stop, when a release of the retiring logical role fails; the logical role is not published retired" $
+    withSetup (setup (roleScript (failingAt 2))) $ \env → do
+      let world = seWorld env
+      recorder ← newRecorder
+      failAt recorder (Released (ReleaseBuild Gameplay BuildFacade)) (toException (userError "the gameplay facade's release failed"))
+      (ended, session) ← runCaught env (recording recorder) $ \_ session → do
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        awaitRegistration world 1000
+        passTime world 2000000 ((>= 2) . length <$> linesWith "tick" world)
+        -- the logical role fails, retires; one of its releases fails; the whole session is then asked to stop
+        void (awaitStatus session (maybe False ((== Retired) . rolePhase) . presentationOf))
+      ended `shouldSatisfy` either (const False) (const True)
+      out ← outLines world
+      out `shouldSatisfy` elem "shutdown presentation stopped"
+      found ← outcomeNow session
+      outVerdict found `shouldBe` VerdictFailure
+      outcomeMessages found `shouldSatisfy` any (Text.isInfixOf "the gameplay facade's release failed")
+      history ← historyNow session
+      historyStopped history `shouldBe` [Gameplay, Presentation]
+      status ← statusNow session
+      fmap rolePhase (gameplayOf status) `shouldBe` Just Stopping
+      fmap rolePhase (presentationOf status) `shouldBe` Just Retired
+      outRetired found `shouldBe` False
+
+  it "attempts every other release when one fails: each of the two roles' four, the timer's and the composition's" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      recorder ← newRecorder
+      failAt recorder (Released (ReleaseBuild Presentation BuildData)) (toException (userError "a release failed"))
+      (ended, session) ← runCaught env (recording recorder) $ \_ session → do
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        requestStop session StopQuit
+        void (awaitStatus session (maybe False ((== Retired) . rolePhase) . gameplayOf))
+      ended `shouldSatisfy` either (const False) (const True)
+      points ← recorded recorder
+      let releasedWhich = [release | Released release ← points]
+      length releasedWhich `shouldBe` 10
+      releasedWhich `shouldSatisfy` elem ReleaseTimer
+      releasedWhich `shouldSatisfy` elem ReleaseComposition
+      found ← outcomeNow session
+      outVerdict found `shouldBe` VerdictFailure
+      status ← statusNow session
+      -- the role whose release failed is not proven retired; the other is
+      fmap rolePhase (presentationOf status) `shouldBe` Just Stopping
+      fmap rolePhase (gameplayOf status) `shouldBe` Just Retired
+
+  describe "with the attempts given up at the first failure (a negative control)" $
+    it "leaves the releases behind the failed one unattempted, which the proof above detects" $
+      withSetup (setup (roleScript printScript)) $ \env → do
+        recorder ← newRecorder
+        failAt recorder (Released (ReleaseBuild Presentation BuildData)) (toException (userError "a release failed"))
+        (_, session) ← runCaught env ((recording recorder) {harnessRemoved = [ProtectReleases]}) $ \_ session → do
+          awaitPhase session Gameplay Running
+          awaitPhase session Presentation Running
+          requestStop session StopQuit
+          void (awaitStatus session (maybe False ((== Retired) . rolePhase) . gameplayOf))
+        points ← recorded recorder
+        -- the presentation coordinator's release came after the failed one and was never attempted
+        length [() | Released _ ← points] `shouldBe` 9
+        [() | Released (ReleaseBuild Presentation BuildCoordinator) ← points] `shouldBe` []
+        found ← outcomeNow session
+        outVerdict found `shouldBe` VerdictFailure
+
+  describe "with an exception of an asynchronous type taken for a cancellation (a negative control)" $
+    it "raises a cancellation for what a release itself raised, which the proof of its source detects" $
+      withSetup (setup (roleScript printScript)) $ \env → do
+        recorder ← newRecorder
+        failAt recorder (Released (ReleaseBuild Gameplay BuildFacade)) (toException ThreadKilled)
+        (ended, _) ← runCaught env ((recording recorder) {harnessRemoved = [ProtectReleaseSource]}) $ \_ session → do
+          awaitPhase session Gameplay Running
+          awaitPhase session Presentation Running
+          requestStop session StopQuit
+        raisedKilled ended `shouldBe` True
+
+  it "accounts a failure of the outermost release of the composition, and every role is still retired" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      recorder ← newRecorder
+      failAt recorder (Released ReleaseComposition) (toException (userError "the outer scope failed to exit"))
+      (ended, session) ← runCaught env (recording recorder) $ \_ session → do
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        requestStop session StopQuit
+        void (awaitRetired session)
+      ended `shouldSatisfy` either (const False) (const True)
+      found ← outcomeNow session
+      outVerdict found `shouldBe` VerdictFailure
+      outcomeMessages found `shouldSatisfy` any (Text.isInfixOf "the outer scope failed to exit")
+      outRetired found `shouldBe` True
+
+  it "accounts a failure to cancel the pacing timer, raises it, and still retires every role" $
+    withSetup (setup (roleScript printScript)) {suShape = GameplayAlone} $ \env → do
+      let world = seWorld env
+          failing = case worldTimer world of
+            TimerBackend arm → TimerBackend $ \microseconds wake → arm microseconds wake >>= \cancel → pure (cancel >> throwIO (userError "timer cancel failed"))
+          env' = env {seSpec = (seSpec env) {sxTimer = failing}}
+      (ended, session) ← runCaught env' noHarness $ \_ session → do
+        awaitPhase session Gameplay Running
+        awaitRegistration world 1000
+        requestStop session StopQuit
+        void (awaitRetired session)
+      raisedMessage ended `shouldSatisfy` Text.isInfixOf "timer cancel failed"
+      found ← outcomeNow session
+      outVerdict found `shouldBe` VerdictFailure
+      outcomeMessages found `shouldSatisfy` any (Text.isInfixOf "timer cancel failed")
+      outRetired found `shouldBe` True
+
+  mapM_
+    ( \point →
+        it ("goes on to release and retire every role when the driver is cancelled right after " <> show point) $
+          withSetup (setup (roleScript printScript)) $ \env → do
+            recorder ← newRecorder
+            holdAt recorder point
+            (ended, session) ← runCaught env (recording recorder) $ \driver session → do
+              awaitPhase session Gameplay Running
+              awaitPhase session Presentation Running
+              requestStop session StopQuit
+              awaitPoint recorder point
+              throwTo driver ThreadKilled
+              releaseHold recorder point
+            raisedKilled ended `shouldBe` True
+            found ← outcomeNow session
+            outRetired found `shouldBe` True
+            outVerdict found `shouldBe` VerdictSuccess
+            points ← recorded recorder
+            length [() | Released _ ← points] `shouldBe` 10
+    )
+    [Committed "OwnerFinalized", Committed "Drained", Committed "ReleasesDone", Committed "RoleRetired"]
+
+-- How a session ends -------------------------------------------------------------------------------------------------------------
+
+outcomes ∷ Spec
+outcomes = describe "how a session ends, in every arrangement of roles" $
+  mapM_
+    ( \shape → do
+        let roles = case shape of
+              BothRoles' → [Gameplay, Presentation]
+              GameplayAlone → [Gameplay]
+              PresentationAlone → [Presentation]
+            first = if shape == PresentationAlone then Presentation else Gameplay
+            running session = mapM_ (\role → awaitPhase session role Running) roles
+        describe (show shape) $ do
+          it "returns a success after a quit" $
+            withSetup (setup (roleScript printScript)) {suShape = shape} $ \env → do
+              outcome ← runScenario env $ \session → running session >> requestStop session StopQuit
+              outVerdict outcome `shouldBe` VerdictSuccess
+              outRetired outcome `shouldBe` True
+          it "returns an interruption after an interrupt" $
+            withSetup (setup (roleScript printScript)) {suShape = shape} $ \env → do
+              outcome ← runScenario env $ \session → running session >> requestStop session StopInterrupt
+              outVerdict outcome `shouldBe` VerdictInterrupted
+          it "closes the whole session when an owner is stopped by someone else, and makes that neither a failure nor a quit" $
+            withSetup (setup (roleScript printScript)) {suShape = shape} $ \env → do
+              handles ← newTVarIO Map.empty
+              let harness = noHarness {harnessOwner = \role found → atomically (modifyTVar' handles (Map.insert role found))}
+              (ended, session) ← runCaught env harness $ \_ session → do
+                running session
+                found ← readTVarIO handles
+                maybe (expectationFailure "no owner was told") ownerStop (Map.lookup first found)
+                void (awaitRetired session)
+              ended `shouldSatisfy` either (const False) (const True)
+              outcome ← outcomeNow session
+              outVerdict outcome `shouldBe` VerdictSuccess
+              outQuit outcome `shouldBe` False
+              out ← outLines (seWorld env)
+              -- the peer is not left running without a driver
+              length [line | line ← out, "shutdown" `Text.isPrefixOf` line] `shouldBe` length roles
+          it "is a failure of the host when an owner is cancelled, which nothing asked for" $
+            withSetup (setup (roleScript printScript)) {suShape = shape} $ \env → do
+              handles ← newTVarIO Map.empty
+              let harness = noHarness {harnessOwner = \role found → atomically (modifyTVar' handles (Map.insert role found))}
+              (_, session) ← runCaught env harness $ \_ session → do
+                running session
+                found ← readTVarIO handles
+                maybe (expectationFailure "no owner was told") ownerCancel (Map.lookup first found)
+                void (awaitRetired session)
+              outcome ← outcomeNow session
+              outVerdict outcome `shouldBe` VerdictFailure
+              outcomeMessages outcome `shouldSatisfy` any (Text.isInfixOf "cancelled")
+          it "raises what the driver threw when it throws, whichever role is built last, with every role retired" $
+            withSetup (setup (roleScript printScript)) {suShape = shape} $ \env → do
+              recorder ← newRecorder
+              failAt recorder (Intended (InstanceKey first 0)) (toException (userError "the driver failed"))
+              (ended, session) ← runCaught env (recording recorder) $ \_ session → void (awaitStatus session statusStopping)
+              raisedMessage ended `shouldSatisfy` Text.isInfixOf "the driver failed"
+              outcome ← outcomeNow session
+              outVerdict outcome `shouldBe` VerdictFailure
+              outRetired outcome `shouldBe` True
+    )
+    [BothRoles', GameplayAlone, PresentationAlone]
