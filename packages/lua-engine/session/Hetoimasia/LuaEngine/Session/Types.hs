@@ -86,8 +86,12 @@ data Session = Session
   , sessionRegistry ∷ !(TVar Registry)
   -- ^ What the session acquired, role by role, and how each is stopped, proven drained and released.
   , sessionLogger ∷ !Logger
-  -- ^ The coordinator's diagnostics: lifecycle at info, a failure once at error. Written only by the driver,
-  -- outside every owner callback, stop pass and recovery commit.
+  -- ^ The coordinator's diagnostics: lifecycle at info, a failure once at error. Written only by the session's writer
+  -- thread (D-87), never by the driver, an owner callback, a stop pass or a recovery commit. It is borrowed: an abandoned
+  -- writer may still be using it until 'sessionWriterEnd' says it has ended.
+  , sessionWriterEnd ∷ !(STM Bool)
+  -- ^ Whether the diagnostics writer, and the helper that cancels it, have ended (or were never started). The call never
+  -- waits for it; whoever owns the logger joins it before releasing the logger.
   , sessionProbe ∷ Point → IO ()
   -- ^ The harness's probe, told at the points of the session's life ('noHarness' tells nothing).
   , sessionRelease ∷ Release → IO ()

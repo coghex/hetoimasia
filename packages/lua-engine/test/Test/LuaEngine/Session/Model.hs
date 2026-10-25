@@ -918,30 +918,67 @@ report = describe "the engine report" $ do
 
 diagnosticEvidence ∷ Spec
 diagnosticEvidence = describe "the diagnostics' evidence" $ do
-  it "records the diagnostics not delivered as a count and the first sixteen, each cut to a summary's bound, and never as the session's failure" $ do
-    let said = foldl' (\state n → fst (step (Note (Say SayInfo (Text.pack ("note " <> show n) <> Text.replicate 5000 "z") [])) state)) both [1 .. 40 ∷ Int]
-        (abandoned, _) = step DiagAbandoned said
-        evidence = stDiagEvidence abandoned
+  let notes n = foldl' (\state i → fst (step (Note (Say SayInfo (Text.pack ("note " <> show i) <> Text.replicate 5000 "z") [])) state)) both [1 .. n ∷ Int]
+
+  it "records the diagnostics not delivered at the cut-off as an exact count and the first sixteen, each cut to a summary's bound, with the cause, and never as the session's failure" $ do
+    let said = notes 40
+        (cut, _) = step (DiagCutOff "the cause") said
+        evidence = stDiagEvidence cut
     deUndelivered evidence `shouldBe` length (stDiags said)
     length (deUndeliveredFirst evidence) `shouldBe` limitSecondary limits
     map utf8Bytes (deUndeliveredFirst evidence) `shouldSatisfy` all (<= limitSummary limits)
     -- the first ones, in the order they were meant
     take 1 (deUndeliveredFirst evidence) `shouldSatisfy` all (Text.isPrefixOf "note 1")
-    -- the data stays in the queue, and the verdict is untouched
-    length (stDiags abandoned) `shouldBe` length (stDiags said)
-    outVerdict (outcomeOf abandoned) `shouldBe` VerdictSuccess
-    erPrimary (outEngine (outcomeOf abandoned)) `shouldBe` Nothing
+    deCause evidence `shouldBe` Just "the cause"
+    -- the queue is closed and empty, and the verdict, the failures and the report are untouched
+    stDiags cut `shouldBe` mempty
+    outVerdict (outcomeOf cut) `shouldBe` VerdictSuccess
+    erPrimary (outEngine (outcomeOf cut)) `shouldBe` Nothing
+    erSecondary (outEngine (outcomeOf cut)) `shouldBe` []
+    erOmitted (outEngine (outcomeOf cut)) `shouldBe` 0
 
-  it "records a sink that failed as a count and the first sixteen, beside a failure the session already has, which stays the primary" $ do
+  it "cuts an undelivered message that is multibyte visibly, at a code point, within the bound" $ do
+    let multibyte = Text.replicate 3000 "\x20AC"
+        said = fst (step (Note (Say SayInfo multibyte [])) both)
+        evidence = stDiagEvidence (fst (step (DiagCutOff "the cause") said))
+    case deUndeliveredFirst evidence of
+      [kept] → do
+        utf8Bytes kept `shouldSatisfy` (<= limitSummary limits)
+        Text.isSuffixOf "..." kept `shouldBe` True
+        Text.all (`elem` ['\x20AC', '.']) kept `shouldBe` True
+      other → expectationFailure ("expected one undelivered message, found " <> show (length other))
+
+  it "counts a diagnostic meant after the cut-off directly, drops none, and lets a late acknowledgement or sink failure change nothing" $ do
+    let said = notes 3
+        (cut, _) = step (DiagCutOff "the cause") said
+        identity = 0
+        late = foldl' (\state event → fst (step event state)) cut [DiagClaim identity, DiagDone identity, DiagInterrupt identity, DiagSinkFailed "late"]
+        meant = fst (step (Note (Say SayInfo "after the cut-off" [])) cut)
+    deUndelivered (stDiagEvidence meant) `shouldBe` deUndelivered (stDiagEvidence cut) + 1
+    deUndeliveredFirst (stDiagEvidence meant) `shouldSatisfy` elem "after the cut-off"
+    stDiags meant `shouldBe` mempty
+    outcomeOf late `shouldBe` outcomeOf cut
+    historyOf late `shouldBe` historyOf cut
+    -- a second cut-off adds nothing
+    fst (step (DiagCutOff "again") cut) `shouldBe` cut
+
+  it "records a sink that failed as a count and the first eight, beside a failure the session already has, which stays the primary" $ do
     let failed = fst (step (LatchFailure Gameplay (newRoleFailure LuaError OnUpdate Gameplay "boom") []) both)
         sunk = foldl' (\state n → fst (step (DiagSinkFailed (Text.pack (show n) <> Text.replicate 5000 "s")) state)) failed [1 .. 40 ∷ Int]
         evidence = stDiagEvidence sunk
     deSinkFailures evidence `shouldBe` 40
-    length (deSinkFirst evidence) `shouldBe` limitSecondary limits
+    length (deSinkFirst evidence) `shouldBe` limitSecondary limits `div` 2
     map utf8Bytes (deSinkFirst evidence) `shouldSatisfy` all (<= limitSummary limits)
-    sum (map utf8Bytes (deSinkFirst evidence <> deUndeliveredFirst evidence)) `shouldSatisfy` (<= limitReport limits)
     fmap eeCode (erPrimary (outEngine (outcomeOf sunk))) `shouldBe` Just LuaError
+    erSecondary (outEngine (outcomeOf sunk)) `shouldBe` erSecondary (outEngine (outcomeOf failed))
+    erOmitted (outEngine (outcomeOf sunk)) `shouldBe` 0
     stStopping sunk `shouldBe` stStopping failed
+
+  it "keeps the whole record within the engine report's bound" $ do
+    let cut = fst (step (DiagCutOff (Text.replicate 5000 "c")) (notes 40))
+        sunk = foldl' (\state n → fst (step (DiagSinkFailed (Text.pack (show n) <> Text.replicate 5000 "s")) state)) cut [1 .. 40 ∷ Int]
+        evidence = stDiagEvidence sunk
+    sum (map utf8Bytes (deSinkFirst evidence <> deUndeliveredFirst evidence <> maybe [] pure (deCause evidence))) `shouldSatisfy` (<= limitReport limits)
 
   it "is not a failure of the session, and stops nothing, when a sink fails with nothing else wrong" $ do
     let sunk = fst (step (DiagSinkFailed "the sink failed") both)

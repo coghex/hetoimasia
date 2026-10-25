@@ -177,6 +177,11 @@ data Point
   | -- | Only with 'ProtectAccountingEvent' removed: the driver is about to wait, by itself and without observing anything
     -- else, for the accounting of a finished tick.
     AccountingWait
+  | -- | The diagnostics writer is about to be started, and nothing of it exists yet: a failure here is a failure of the
+    -- composition, and a writer that was never started is never cancelled.
+    WriterStarting
+  | -- | The diagnostics writer has been started and is registered: from here the session's end finds it and cuts it off.
+    WriterStarted
   | -- | Only with 'ProtectAbandon' removed: the call is about to wait, by itself, for the diagnostics writer to write the
     -- queue.
     WriterWait

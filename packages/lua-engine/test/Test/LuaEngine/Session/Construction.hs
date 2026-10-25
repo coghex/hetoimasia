@@ -487,14 +487,15 @@ callbacks = describe "the callback and the first diagnostic" $ do
       readTVarIO blocked `shouldReturn` True
       status ← statusNow session
       retiredBoth status `shouldBe` True
+      -- the writer was cancelled where it was, with the sink still held: it ended, was asked for the note once, and the note
+      -- is recorded as not delivered
+      bounded (atomically (sessionDiagnosticsEnded session >>= \over → when (not over) retry))
+      readTVarIO blocked `shouldReturn` True
       atomically (writeTVar blocked False)
-      -- the writer was cancelled where it was: the note stays as data, marked unfinished, was asked for once, and is recorded
-      bounded . atomically $ do
-        found ← sessionHistory session
-        when (("session starting", DiagInterrupted) `notElem` historyDiagnostics found) retry
       readTVarIO written `shouldReturn` 1
       found ← outcomeNow session
       deUndeliveredFirst (outDiagnostics found) `shouldSatisfy` elem "session starting"
+      deCause (outDiagnostics found) `shouldBe` Just "the caller was cancelled"
   where
     blockForever = atomically retry
 

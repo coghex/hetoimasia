@@ -203,8 +203,10 @@ effects = describe "the effects a commit owes" $ do
       -- each diagnostic was attempted once: none was retried, and a failure to write one made no diagnostic of its own;
       -- a failure of the sink is evidence and ends nothing
       seen `shouldBe` nub seen
-      deSinkFailures (outDiagnostics outcome) `shouldSatisfy` (>= 1)
-      deSinkFailures (outDiagnostics outcome) `shouldSatisfy` (<= length seen - 1)
+      -- the first diagnostic after the note failed, and the sink was written no more: what was meant later is undelivered
+      deSinkFailures (outDiagnostics outcome) `shouldBe` 1
+      length seen `shouldBe` 2
+      deUndeliveredFirst (outDiagnostics outcome) `shouldSatisfy` elem "session stopping"
       entriesOf outcome `shouldBe` []
       outRetired outcome `shouldBe` True
       outVerdict outcome `shouldBe` VerdictSuccess
@@ -255,9 +257,9 @@ effects = describe "the effects a commit owes" $ do
       readTVarIO blocked `shouldReturn` True
       found ← outcomeNow session
       deUndeliveredFirst (outDiagnostics found) `shouldSatisfy` elem "start gate opened"
-      bounded . atomically $ do
-        history ← sessionHistory session
-        when (("start gate opened", DiagInterrupted) `notElem` historyDiagnostics history) retry
+      -- the write was cancelled where it was, with the sink still held: the writer ended, and asked for it once
+      bounded (atomically (sessionDiagnosticsEnded session >>= \over → when (not over) retry))
+      readTVarIO blocked `shouldReturn` True
       atomically (writeTVar blocked False)
       readTVarIO attempts `shouldReturn` 1
 

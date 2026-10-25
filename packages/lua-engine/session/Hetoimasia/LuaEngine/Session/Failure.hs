@@ -289,40 +289,46 @@ fitRecord limits failure = foldl' (flip ($)) failure shrinkers
 -- The diagnostics' evidence ----------------------------------------------------------------------
 
 -- | What became of the session's diagnostics, which is evidence and never the session's failure: a sink that raised or
--- was cancelled, and the diagnostics that were not delivered when the session returned (a writer still blocked in the
--- sink is abandoned, not waited for). Each is a count and the first entries, at most 'limitSecondary' of them, each cut
--- to a summary's bound, so the record stays within the engine report's bound beside the report (two lists of sixteen
--- summaries of 2 KiB are the 64 KiB the report is held to).
+-- was cancelled, and the diagnostics that were not delivered when the session cut its writer off (a writer still blocked
+-- in the sink is abandoned, not waited for), with the cause. Each list is an exact count and the first entries, cut
+-- visibly to a summary's bound: at most 'limitSecondary' undelivered and half as many sink failures, so the record is
+-- within 'limitReport' beside its cause (256 bytes). It takes no secondary-summary slot and no part of the report's
+-- omitted count.
 data DiagEvidence = DiagEvidence
   { deSinkFailures ∷ !Int
   , deSinkFirst ∷ ![Text]
   , deUndelivered ∷ !Int
   , deUndeliveredFirst ∷ ![Text]
+  , deCause ∷ !(Maybe Text)
+  -- ^ Why diagnostics were left undelivered: the first cause the session recorded.
   }
   deriving (Eq, Show)
 
 -- | No diagnostic has failed or gone undelivered.
 emptyDiagEvidence ∷ DiagEvidence
-emptyDiagEvidence = DiagEvidence 0 [] 0 []
+emptyDiagEvidence = DiagEvidence 0 [] 0 [] Nothing
 
 -- | Account for one failed or cancelled write.
 noteSinkFailure ∷ FailureLimits → Text → DiagEvidence → DiagEvidence
 noteSinkFailure limits message evidence =
   evidence
     { deSinkFailures = deSinkFailures evidence + 1
-    , deSinkFirst = keepFirst limits (deSinkFirst evidence) [message]
+    , deSinkFirst = keepFirst limits (max 1 (limitSecondary limits `div` 2)) (deSinkFirst evidence) [message]
     }
 
--- | Account for the diagnostics not delivered, by message.
-noteUndelivered ∷ FailureLimits → [Text] → DiagEvidence → DiagEvidence
-noteUndelivered limits messages evidence =
+-- | Account for the diagnostics not delivered, by message, and why. The count is exact; the first entries are kept.
+noteUndelivered ∷ FailureLimits → Text → [Text] → DiagEvidence → DiagEvidence
+noteUndelivered limits cause messages evidence =
   evidence
     { deUndelivered = deUndelivered evidence + length messages
-    , deUndeliveredFirst = keepFirst limits (deUndeliveredFirst evidence) messages
+    , deUndeliveredFirst = keepFirst limits (limitSecondary limits) (deUndeliveredFirst evidence) messages
+    , deCause = case deCause evidence of
+        Nothing | not (null messages) → Just (truncateText 256 cause)
+        kept → kept
     }
 
-keepFirst ∷ FailureLimits → [Text] → [Text] → [Text]
-keepFirst limits kept new = kept <> map (truncateText (limitSummary limits)) (take (max 0 (limitSecondary limits - length kept)) new)
+keepFirst ∷ FailureLimits → Int → [Text] → [Text] → [Text]
+keepFirst limits room kept new = kept <> map (truncateText (limitSummary limits)) (take (max 0 (room - length kept)) new)
 
 -- The engine report -------------------------------------------------------------------------------
 

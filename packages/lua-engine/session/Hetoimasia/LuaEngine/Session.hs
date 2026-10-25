@@ -57,6 +57,7 @@ module Hetoimasia.LuaEngine.Session
   , sessionStatus
   , sessionOutcomeNow
   , sessionHistory
+  , sessionDiagnosticsEnded
   , requestStop
   , latchTerminalFailure
 

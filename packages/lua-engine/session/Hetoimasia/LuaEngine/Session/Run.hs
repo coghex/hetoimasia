@@ -96,6 +96,7 @@ module Hetoimasia.LuaEngine.Session.Run
   , sessionHistory
   , requestStop
   , latchTerminalFailure
+  , sessionDiagnosticsEnded
   ) where
 
 import Control.Concurrent (ThreadId, forkIO, forkIOWithUnmask, throwTo, yield)
@@ -361,6 +362,14 @@ sessionOutcomeNow session = outcomeOf <$> readTVar (sessionState session)
 sessionHistory ∷ Session → STM History
 sessionHistory session = historyOf <$> readTVar (sessionState session)
 
+-- | Whether the diagnostics writer, and the helper that cancels it, have ended, or were never started. The call to
+-- 'runSession' never waits for the writer (D-87): a writer still blocked in the sink is cancelled and abandoned, and may
+-- outlive the call. Its end stays observable here, so that whoever owns the logger (the assembly, after the producers have
+-- stopped) can join it before the logger is released; a sink stuck for good is then the application quit watchdog's case.
+-- The writer's end, failure or cancellation never reaches the driver and never becomes the exception that propagates.
+sessionDiagnosticsEnded ∷ Session → STM Bool
+sessionDiagnosticsEnded = sessionWriterEnd
+
 -- | Ask for a stop. It takes no slot and cannot be refused: one transaction closes the whole session's
 -- admission and its tick grants, and then each owner is asked to stop without waiting. Idempotent. A
 -- failure that is already latched stays the outcome; an interruption outranks a normal quit.
@@ -440,19 +449,23 @@ data Env = Env
   , envWriter ∷ !Writer
   }
 
--- | The session's diagnostics writer: the one thread that calls the sink. Owner: 'runSession', which starts it before
--- anything else and ends it last. Readers and writers: the writer reads the queue the lifecycle record holds and
--- commits each attempt's claim and acknowledgement there; the driver reads 'wrDefects' in its one wait and
--- 'wrEnded' once, at the end; nothing else touches it. Lifetime: one session. It never resets.
+-- | The session's diagnostics writer: the one thread that calls the sink. Owner: 'runSession', which starts it in a masked
+-- step after its outer continuation is installed and before the first diagnostic, and cuts it off after the last role has
+-- retired. Readers and writers: the writer reads the queue the lifecycle record holds and commits each attempt's claim
+-- and acknowledgement there; the call reads 'wrEnded' and 'wrHelper' through 'sessionDiagnosticsEnded'; nothing else
+-- touches it. It is not in the stop set and nothing in the stop pass touches it. Lifetime: it may outlive the call, which
+-- never waits for it, and its end is observable after the call returns ('sessionDiagnosticsEnded'): whoever owns the
+-- logger it borrows (the assembly, after the producers have stopped) joins it before the logger is released. It never
+-- resets.
 data Writer = Writer
   { wrPhase ∷ !(TVar WriterPhase)
   , wrThread ∷ !(IORef (Maybe ThreadId))
   -- ^ The writer's thread, for the cancellation that abandons it.
   , wrEnded ∷ !(TVar Bool)
-  -- ^ The thread has returned (or never ran: a composition whose driver writes itself).
-  , wrDefects ∷ !(TVar [Caught])
-  -- ^ What escaped one attempt on the writer's thread other than the sink's own failure: a defect of the engine's own.
-  -- The driver raises it, as it raised what the sink raised when the driver was the writer.
+  -- ^ The thread has returned (or never ran: a composition whose driver writes itself, or one that never started it).
+  , wrHelper ∷ !(TVar Bool)
+  -- ^ The helper that delivers the cancellation has returned (or none was made): delivery can block for as long as the
+  -- writer is inside an uninterruptible region or a foreign call, and it never runs on the requesting thread.
   }
 
 -- | What the writer does when the queue is empty.
@@ -1315,25 +1328,36 @@ blockUntilStep env scope = do
 
 -- Diagnostics ---------------------------------------------------------------------------------------------
 
+-- | What one attempt at a diagnostic came to.
+data Forwarded
+  = -- | Written and acknowledged.
+    Forwarded
+  | -- | Another caller holds the attempt, or the diagnostic is gone (the cut-off).
+    Unclaimed
+  | -- | The sink raised: recorded as evidence.
+    WriteFailed
+  | -- | The write was cancelled: the data stays, marked unfinished.
+    WriteCancelled !Caught
+
 -- | Write one diagnostic the queue holds: claimed (so no other caller issues the same attempt), written,
 -- acknowledged. A failure of the sink is evidence, never the session's failure, recorded without a diagnostic of its
 -- own; a cancellation of the write leaves the data in the queue marked unfinished and is answered, not raised. All of
 -- it is masked except the write itself, which stays interruptible. The only callers are the session's writer and, under
 -- the negative control that removes it, the driver.
-forwardOne ∷ Env → Diag → IO (Maybe Caught)
+forwardOne ∷ Env → Diag → IO Forwarded
 forwardOne env diag = mask $ \restore → do
   claimed ← commit session (DiagClaim (dgId diag))
   if claimed == Refused
-    then pure Nothing
+    then pure Unclaimed
     else
       tryWithContext @SomeException (restore (write (dgSay diag))) >>= \case
-        Right () → Nothing <$ commit session (DiagDone (dgId diag))
+        Right () → Forwarded <$ commit session (DiagDone (dgId diag))
         Left failure
-          | isAsync failure → Just failure <$ commit session (DiagInterrupt (dgId diag))
+          | isAsync failure → WriteCancelled failure <$ commit session (DiagInterrupt (dgId diag))
           | otherwise → do
               void (commit session (DiagDone (dgId diag)))
               text ← sinkFailureText "a diagnostic could not be written" failure
-              Nothing <$ commit session (DiagSinkFailed text)
+              WriteFailed <$ commit session (DiagSinkFailed text)
   where
     session = envSession env
     write (Say level message fields) = (case level of SayInfo → logInfo; SayError → logError) (sessionLogger session) sessionComponent message fields
@@ -1355,10 +1379,11 @@ driverWritesFor removedProtections = ProtectOffDriver `elem` removedProtections 
 driverWrites ∷ Env → Bool
 driverWrites = driverWritesFor . sessionRemoved . envSession
 
--- | The writer's body: one attempt at each diagnostic the queue holds, in order, until the writer is abandoned. The sink
--- is called from here and nowhere else, so a sink that holds a write holds this thread and no other. A write the sink
--- raised, or that was cancelled, is evidence (see 'forwardOne') and the next diagnostic is written; what escapes an
--- attempt otherwise (a defect of the engine's own) is handed to the driver, and the writer ends: nothing is retried.
+-- | The writer's body: one attempt at each diagnostic the queue holds, in order, until the writer is cut off. The sink is
+-- called from here and nowhere else, so a sink that holds a write holds this thread and no other. After a sink failure,
+-- or a cancellation the session did not ask for, the sink is not written again: what is meant later is left in the queue
+-- to be recorded as undelivered. Nothing that happens here reaches the driver: the writer's end, failure or cancellation
+-- is evidence at most, never an exception that propagates.
 writeQueued ∷ Env → IO ()
 writeQueued env = do
   next ← atomically $ do
@@ -1369,46 +1394,38 @@ writeQueued env = do
       (WriterOpen, Just diag) → pure (Just diag)
       (WriterOpen, Nothing) → retry
   forM_ next $ \diag →
-    tryWithContext @SomeException (attempt diag) >>= \case
-      Right True → writeQueued env
-      Right False → pure ()
-      -- the only asynchronous exception this thread is thrown is the abandonment
+    tryWithContext @SomeException (forwardOne env diag) >>= \case
+      Right Forwarded → writeQueued env
+      Right Unclaimed → writeQueued env
+      Right WriteFailed → pure ()
+      Right (WriteCancelled cancelled) → do
+        abandoned ← (== WriterClosed) <$> readTVarIO (wrPhase writer)
+        unless abandoned (record "a diagnostic write was cancelled" cancelled)
+      -- the only asynchronous exception this thread is thrown is the cut-off
       Left defect | isAsync defect → pure ()
-      Left defect → handOver defect
+      Left defect → record "the diagnostics writer failed" defect
   where
     writer = envWriter env
-    session = envSession env
-    handOver caught = atomically (modifyTVar' (wrDefects writer) (<> [caught]))
-    -- whether to go on
-    attempt diag =
-      forwardOne env diag >>= \case
-        Nothing → pure True
-        Just cancelled → do
-          abandoned ← (== WriterClosed) <$> readTVarIO (wrPhase writer)
-          if abandoned
-            then pure False
-            else do
-              text ← sinkFailureText "a diagnostic write was cancelled" cancelled
-              True <$ commit session (DiagSinkFailed text)
+    record label caught = sinkFailureText label caught >>= void . commit (envSession env) . DiagSinkFailed
 
--- | Start the session's writer. Called once, masked, before anything else is done; the thread runs unmasked (the
--- write is interruptible), and records that it has ended however it does.
+-- | Start the session's writer, in the masked step that follows the installation of the outer continuation and precedes
+-- the first diagnostic. The thread runs unmasked (the write is interruptible), and records that it has ended however it
+-- does. A failure to start it is a failure of the composition, not of a sink; a writer that was never started is never
+-- cancelled.
 startWriter ∷ Env → IO ()
 startWriter env = unless (driverWrites env) $ do
+  probeAt env WriterStarting
+  atomically (writeTVar (wrEnded writer) False)
   thread ← forkIOWithUnmask $ \unmask →
-    unmask (writeQueued env) `finally` atomically (writeTVar (wrEnded (envWriter env)) True)
-  writeIORef (wrThread (envWriter env)) (Just thread)
+    unmask (writeQueued env) `finally` atomically (writeTVar (wrEnded writer) True)
+  writeIORef (wrThread writer) (Just thread)
+  probeAt env WriterStarted
+  where
+    writer = envWriter env
 
--- | The writer of a composition: running unless the driver writes itself.
-newWriter ∷ [Protection] → IO Writer
-newWriter removedProtections = Writer <$> newTVarIO WriterOpen <*> newIORef Nothing <*> newTVarIO (driverWritesFor removedProtections) <*> newTVarIO []
-
--- | Take what escaped the writer, for the driver to raise.
-takeWriterDefects ∷ Env → IO [Caught]
-takeWriterDefects env = atomically $ do
-  found ← readTVar (wrDefects (envWriter env))
-  writeTVar (wrDefects (envWriter env)) []
-  pure found
+-- | The writer of a composition: not running until it is started.
+newWriter ∷ IO Writer
+newWriter = Writer <$> newTVarIO WriterOpen <*> newIORef Nothing <*> newTVarIO True <*> newTVarIO True
 
 -- | Wait until the queue is written, or the writer has ended. Interruptible: it runs through the caller's @restore@. Only
 -- under the negative control that removes the abandonment.
@@ -1418,9 +1435,9 @@ awaitWritten env = atomically $ do
   state ← stateOf env
   check (ended || not (diagnosticsOutstanding state))
 
--- | Let the writer have the scheduler a bounded number of times, and wait for nothing: a writer that is not blocked in
--- the sink writes what was queued last meanwhile, and one that is blocked is not waited for. Nothing depends on how it
--- ends; what is not delivered is recorded.
+-- | Let the writer have the scheduler a bounded number of times, and wait for nothing: a writer that is not blocked can
+-- write the last notes meanwhile, and one that is blocked is not waited for. This is a poll that always ends, not a wait on
+-- the sink; nothing depends on how it ends, and what is not delivered is recorded.
 grace ∷ Env → IO ()
 grace env = go (graceYields ∷ Int)
   where
@@ -1435,14 +1452,22 @@ grace env = go (graceYields ∷ Int)
 graceYields ∷ Int
 graceYields = 1000
 
--- | The session is returning: the writer is cancelled, and nothing waits for it (the cancellation is thrown from a
--- thread of its own, because a sink that is uninterruptibly masked would hold the thrower). A write in hand that
--- is interruptible is cancelled and its data stays, marked unfinished; one that is not finishes by itself and the
--- writer ends.
+-- | Cut the writer off: it writes nothing more, and the cancellation is delivered to it from a helper thread, because
+-- delivery can block for as long as the writer is inside an uninterruptible region or a foreign call, and it never runs
+-- on the requesting thread. The caller waits for neither. An interruptible write is cancelled where it is; one that is
+-- not finishes by itself and the writer ends. Done once. The end of both threads is observable ('sessionDiagnosticsEnded').
 abandonWriter ∷ Env → IO ()
 abandonWriter env = do
-  atomically (writeTVar (wrPhase (envWriter env)) WriterClosed)
-  readIORef (wrThread (envWriter env)) >>= mapM_ (\thread → void (forkIO (throwTo thread WriterAbandoned)))
+  first ← atomically $ do
+    phase ← readTVar (wrPhase writer)
+    writeTVar (wrPhase writer) WriterClosed
+    pure (phase == WriterOpen)
+  when first $
+    readIORef (wrThread writer) >>= mapM_ (\thread → do
+      atomically (writeTVar (wrHelper writer) False)
+      void (forkIO (throwTo thread WriterAbandoned `finally` atomically (writeTVar (wrHelper writer) True))))
+  where
+    writer = envWriter env
 
 -- | The driver writes what is pending, on its own thread and outside every callback, stop pass and recovery commit.
 -- Only under the negative controls that remove the writer. An interruption of the write is raised after the queue is
@@ -1452,8 +1477,9 @@ forwardPending env = do
   next ← atomically (listToMaybe . pendingDiagnostics <$> stateOf env)
   forM_ next $ \diag →
     forwardOne env diag >>= \case
-      Just interruption → rethrowIO interruption
-      Nothing → forwardPending env
+      WriteCancelled interruption → rethrowIO interruption
+      WriteFailed → pure ()
+      _ → forwardPending env
 
 -- | The final path of a driver that writes itself (a negative control): one protected attempt at each diagnostic still
 -- pending, after the cleanup. A sink that raises is accounted and the rest are still written. A cancellation stops the
@@ -1466,8 +1492,9 @@ forwardFinal env = do
     Nothing → pure True
     Just diag →
       forwardOne env diag >>= \case
-        Just interruption → False <$ retain env interruption
-        Nothing → forwardFinal env
+        WriteCancelled interruption → False <$ retain env interruption
+        WriteFailed → pure True
+        _ → forwardFinal env
 
 -- | Whether a driver that writes itself (a negative control) may write diagnostics now: nothing has failed and nothing
 -- is stopping. Once a failure or a stop is latched, the queue is held until the final path.
@@ -1501,8 +1528,8 @@ runSession spec onReady = do
       counted = [(riRole info, riInstances info) | info ← roles]
   registry ← newTVarIO emptyRegistry
   cell ← newTVarIO (newSessionState limits counted)
-  writer ← newWriter (harnessRemoved (sxHarness spec))
-  let session = Session cell registry (sxLogger spec) (harnessProbe (sxHarness spec)) (harnessRelease (sxHarness spec)) (harnessRemoved (sxHarness spec)) (harnessHideSettlement (sxHarness spec))
+  writer ← newWriter
+  let session = Session cell registry (sxLogger spec) ((&&) <$> readTVar (wrEnded writer) <*> readTVar (wrHelper writer)) (harnessProbe (sxHarness spec)) (harnessRelease (sxHarness spec)) (harnessRemoved (sxHarness spec)) (harnessHideSettlement (sxHarness spec))
   ids ← newInstanceIds
   seen ← newTVarIO Set.empty
   tracked ← newTVarIO Map.empty
@@ -1512,18 +1539,21 @@ runSession spec onReady = do
   raw ← newIORef []
   let env = Env spec session limits ids seen tracked (Map.fromList [(riRole info, info) | info ← roles]) retained serial identity raw writer
   -- The outer continuation is installed before the handle is given away, before any diagnostic, clock or construction.
-  -- The writer is the first thing it starts: from here on a diagnostic is data in the lifecycle record, and nothing the
-  -- driver does waits for it to be written.
+  -- The writer is started in the next masked step, before the first diagnostic: from there on a diagnostic is data in the
+  -- lifecycle record, and nothing the driver does waits for it to be written. A failure to start it is a failure of the
+  -- composition.
   mask $ \restore → do
-    startWriter env
     registerSessionRelease env ReleaseComposition (sessionRelease session ReleaseComposition)
-    result ← tryWithContext @SomeException . restore $ do
-      onReady session
-      void (commit session (Note (Say SayInfo "session starting" [("roles", Text.intercalate "," (map (roleWord . riRole) roles))])))
-      when (driverWrites env) (forwardPending env)
-      case refusal of
-        Just why → void (applyEvent session (EngineFault Nothing (engineEntry HostFailure Nothing OnEngine why)))
-        Nothing → conduct env roles
+    started ← tryWithContext @SomeException (startWriter env)
+    result ← case started of
+      Left failure → pure (Left failure)
+      Right () → tryWithContext @SomeException . restore $ do
+        onReady session
+        void (commit session (Note (Say SayInfo "session starting" [("roles", Text.intercalate "," (map (roleWord . riRole) roles))])))
+        when (driverWrites env) (forwardPending env)
+        case refusal of
+          Just why → void (applyEvent session (EngineFault Nothing (engineEntry HostFailure Nothing OnEngine why)))
+          Nothing → conduct env roles
     finish env restore result `onException` abandonWriter env
 
 -- | However the composition came out: account its exception whole with every cleanup failure attached to it, run the
@@ -1539,7 +1569,6 @@ finish env restore result = do
   forM_ (either pure (const []) result) (void . adopt env)
   teardown env restore Nothing
   runSessionReleases env
-  surfaceDefects
   cancelled ← any (isAsync . rtCaught) <$> readIORef (envRetained env)
   if driverWrites env
     then unless cancelled $ do
@@ -1553,17 +1582,17 @@ finish env restore result = do
       if removed env ProtectAbandon
         then probeAt env WriterWait >> void (guarded (True <$ restore (awaitWritten env)))
         else unless cancelled (grace env)
+      -- the cut-off: one commit closes the queue and records what was not acknowledged; then the writer is cancelled, and
+      -- nothing waits for it
       abandonWriter env
-      void (commit session DiagAbandoned)
-  surfaceDefects
+      void . commit session . DiagCutOff $
+        if cancelled then "the caller was cancelled" else "the session returned with the diagnostics writer still working"
   raiseRetained env
   atomically (outcomeOf <$> readTVar (sessionState session))
   where
     session = envSession env
     -- an exception that lands outside the forwarding itself is retained like any other, and ends the forwarding
     guarded action = tryWithContext @SomeException action >>= either (\failure → False <$ retain env failure) pure
-    -- what escaped the writer is retained like what escaped the sink when the driver was the writer
-    surfaceDefects = takeWriterDefects env >>= mapM_ (retain env)
     -- the verdict is said once everything before it has been done
     ended = do
       outcome ← atomically (outcomeOf <$> readTVar (sessionState session))
@@ -1790,7 +1819,6 @@ data Next
   | NextInit ![Held]
   | NextSettled ![Held]
   | NextSay !Diag
-  | NextDefect !Caught
   | NextWake
   | NextFinished
   | NextAccounted !AccountingWait
@@ -1899,9 +1927,8 @@ supervisionFailed env vms failure@(ExceptionWithContext context _) = do
 
 -- | The transaction the driver waits in. The first that applies is the answer: a stop owed that can be handed over,
 -- a release of the held instances, the pacing origin, the next step of a role's retirement, an @init@ that
--- succeeded, an instance that ended, whether every role has finished, what escaped the diagnostics writer (and, under
--- the negative control that removes the writer, a diagnostic to write while nothing has failed), the timer's wake
--- while ticks are due, a grant that has finished.
+-- succeeded, an instance that ended, whether every role has finished, (under the negative control that removes the writer,
+-- a diagnostic to write while nothing has failed), the timer's wake while ticks are due, a grant that has finished.
 nextStep ∷ Env → [RoleVm] → Driver → IO (STM Next)
 nextStep env vms driver = do
   inited ← readIORef (dvInit driver)
@@ -1914,7 +1941,6 @@ nextStep env vms driver = do
     held ← Map.elems <$> readTVar (envTracked env)
     state ← stateOf env
     owing ← stopsRunnable (envSession env)
-    defects ← readTVar (wrDefects (envWriter env))
     -- The dispatch gate opened: the instances held after their validation are released, together, unless
     -- their role has stopped taking work.
     let toRelease =
@@ -1952,7 +1978,6 @@ nextStep env vms driver = do
         | not (null started) → pure (NextInit started)
         | not (null stopped) → pure (NextSettled stopped)
         | rolesFinished state → pure NextDone
-        | found : _ ← defects → pure (NextDefect found)
         | Just diag ← say → pure (NextSay diag)
         | woken → clearTimerWake (dvTimer driver) >> pure NextWake
         | fst outstanding || snd outstanding → pure NextFinished
@@ -1993,12 +2018,9 @@ act env vms driver = \case
     startPacing origin
   NextRole found → performStep env (probeAt env) found
   NextSay diag →
-    forwardOne env diag >>= maybe (pure ()) rethrowIO
-  -- what escaped the writer is raised here, as what the sink raised was when the driver was the writer
-  NextDefect _ →
-    takeWriterDefects env >>= \case
-      found : rest → mapM_ (retain env) rest >> rethrowIO found
-      [] → pure ()
+    forwardOne env diag >>= \case
+      WriteCancelled interruption → rethrowIO interruption
+      _ → pure ()
   NextInit items → forM_ items $ \item → do
     modifyIORef' (dvInit driver) (Set.insert (hdKey item))
     initSucceeded item

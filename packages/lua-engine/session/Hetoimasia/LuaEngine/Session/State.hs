@@ -284,6 +284,8 @@ data SessionState = SessionState
   -- ^ The terminal failure the unavailable-state guard latches.
   , stDiagEvidence ∷ !DiagEvidence
   -- ^ What became of the diagnostics: evidence, never the session's failure.
+  , stDiagClosed ∷ !Bool
+  -- ^ The queue is cut off: nothing more is queued, and what is meant is counted as undelivered.
   , stLimits ∷ !FailureLimits
   }
   deriving (Eq, Show)
@@ -313,6 +315,7 @@ newSessionState limits roles =
     , stEngine = emptyReport
     , stTerminal = Nothing
     , stDiagEvidence = emptyDiagEvidence
+    , stDiagClosed = False
     , stLimits = limits
     }
 
@@ -426,9 +429,11 @@ data Event
     -- recorded without a diagnostic of its own, so a sink that always raises cannot make the session say more and more
     -- about it. The text carries the cleanup failures the sink's exception carried.
     DiagSinkFailed !Text
-  | -- | The writer is abandoned (the session has returned, or its caller was cancelled): every diagnostic not delivered
-    -- is recorded as undelivered, by message, and stays in the queue as data.
-    DiagAbandoned
+  | -- | The cut-off, with its cause: the session has retired every role and is returning, or its caller was cancelled. One
+    -- commit closes the queue and records every diagnostic not yet acknowledged (pending, claimed or in the sink) as
+    -- undelivered, by message. A diagnostic meant later is counted there directly, and a late acknowledgement or sink
+    -- failure from the writer changes nothing.
+    DiagCutOff !Text
   | -- | The engine, the host, a provider, a sink or cleanup failed, concerning this role's owner when
     -- one is known.
     EngineFault !(Maybe Role) !EngineEntry
@@ -498,7 +503,10 @@ boundEvent limits = \case
 
 -- | Append diagnostics to the queue under stable identities.
 enqueue ∷ [Say] → SessionState → SessionState
-enqueue said state = foldl' add state said
+enqueue said state
+  -- after the cut-off nothing is queued: what the session means is counted as undelivered, so none is dropped
+  | stDiagClosed state = state {stDiagEvidence = noteUndelivered (stLimits state) "the diagnostics were cut off" (map sayMessage said) (stDiagEvidence state)}
+  | otherwise = foldl' add state said
   where
     add current say =
       current
@@ -615,9 +623,18 @@ transition event state = case event of
     Just diag | dgState diag == DiagInFlight → quiet (setDiag identity DiagInterrupted state)
     _ → quiet state
   Account evidence → quiet (fst (accountEvidence Nothing evidence state))
-  DiagSinkFailed message → quiet state {stDiagEvidence = noteSinkFailure (stLimits state) message (stDiagEvidence state)}
-  DiagAbandoned →
-    quiet state {stDiagEvidence = noteUndelivered (stLimits state) [sayMessage (dgSay diag) | diag ← toList (stDiags state)] (stDiagEvidence state)}
+  DiagSinkFailed message
+    | stDiagClosed state → quiet state
+    | otherwise → quiet state {stDiagEvidence = noteSinkFailure (stLimits state) message (stDiagEvidence state)}
+  DiagCutOff cause
+    | stDiagClosed state → quiet state
+    | otherwise →
+        quiet
+          state
+            { stDiagClosed = True
+            , stDiags = Seq.empty
+            , stDiagEvidence = noteUndelivered (stLimits state) cause [sayMessage (dgSay diag) | diag ← toList (stDiags state)] (stDiagEvidence state)
+            }
   EngineFault role entry → engineFault role entry state
   Stop kind →
     let marked = case kind of
@@ -827,7 +844,7 @@ eventName = \case
   DiagInterrupt _ → "DiagInterrupt"
   Account _ → "Account"
   DiagSinkFailed _ → "DiagSinkFailed"
-  DiagAbandoned → "DiagAbandoned"
+  DiagCutOff _ → "DiagCutOff"
   EngineFault _ _ → "EngineFault"
   Stop _ → "Stop"
   Terminal _ → "Terminal"

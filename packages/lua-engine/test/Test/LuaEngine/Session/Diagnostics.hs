@@ -18,10 +18,10 @@
 -- writer, as it did).
 module Test.LuaEngine.Session.Diagnostics (spec) where
 
-import Control.Concurrent (forkIO, killThread, throwTo)
+import Control.Concurrent (forkIO, killThread, myThreadId, throwTo)
 import Control.Concurrent.MVar (MVar, isEmptyMVar, newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
-import Control.Exception (AsyncException (ThreadKilled), SomeException, finally, mask, onException, throwIO, try)
+import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, finally, fromException, mask, onException, throwIO, toException, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (void, when)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -35,6 +35,8 @@ spec ∷ Spec
 spec = describe "diagnostics" $ do
   classes
   failing
+  free
+  construction
   controls
 
 -- | A logger whose sink holds the write of each entry with one of these messages until it is let go, and then, if told
@@ -42,22 +44,35 @@ spec = describe "diagnostics" $ do
 data Held = Held
   { heldLogger ∷ !Logger
   , heldEntered ∷ !(TVar [Text])
-  -- ^ The messages whose write has begun, newest first.
+  -- ^ The messages held or failed whose write has begun, newest first.
+  , heldAll ∷ !(TVar [Text])
+  -- ^ Every message whose write has begun, newest first.
   , heldGate ∷ !(TVar Bool)
   , heldFails ∷ !(TVar Bool)
   }
 
 holding ∷ [Text] → IO Held
-holding messages = do
+holding = holdingWith False
+
+-- | The same, with the sink holding inside an uninterruptible region: a cancellation cannot reach it until it returns.
+holdingUninterruptibly ∷ [Text] → IO Held
+holdingUninterruptibly = holdingWith True
+
+holdingWith ∷ Bool → [Text] → IO Held
+holdingWith uninterruptibly messages = do
   entered ← newTVarIO []
+  everything ← newTVarIO []
   gate ← newTVarIO True
   fails ← newTVarIO False
-  let sink entry = when (entryMessage entry `elem` messages) $ do
-        atomically (modifyTVar' entered (entryMessage entry :))
-        atomically (readTVar gate >>= \held → when held retry)
-        failing' ← readTVarIO fails
-        when failing' (throwIO (userError "the sink failed"))
-  pure (Held (mkLogger defaultLogFilter (callbackSink sink)) entered gate fails)
+  let wait = atomically (readTVar gate >>= \held → when held retry)
+      sink entry = do
+        atomically (modifyTVar' everything (entryMessage entry :))
+        when (entryMessage entry `elem` messages) $ do
+          atomically (modifyTVar' entered (entryMessage entry :))
+          if uninterruptibly then uninterruptibleMask_ wait else wait
+          failing' ← readTVarIO fails
+          when failing' (throwIO (userError "the sink failed"))
+  pure (Held (mkLogger defaultLogFilter (callbackSink sink)) entered everything gate fails)
 
 -- | A logger whose sink fails the write of each entry with one of these messages, at once.
 failingAt ∷ [Text] → IO Held
@@ -129,10 +144,88 @@ undelivered = deUndeliveredFirst . outDiagnostics
 mentions ∷ Text → SessionOutcome → Bool
 mentions text outcome = any (Text.isInfixOf text) (deSinkFirst (outDiagnostics outcome) <> undelivered outcome)
 
+-- | What a session shows from the outside: its outcome, its status and its history.
+snapshot ∷ Session → IO (SessionOutcome, SessionStatus, History)
+snapshot session = (,,) <$> outcomeNow session <*> statusNow session <*> historyNow session
+
+-- | Block until the diagnostics writer has ended.
+awaitWriterEnd ∷ Session → IO ()
+awaitWriterEnd session = bounded (atomically (sessionDiagnosticsEnded session >>= \over → when (not over) retry))
+
 -- The classes of site ------------------------------------------------------------------------------------------------
 
 classes ∷ Spec
 classes = describe "with the logger held at" $ do
+  -- Blocked during teardown, from before the stop, in the sink as an interruptible block and as an uninterruptible region:
+  -- everything the lifecycle owes completes without the gate opened, the outcome carries the exact undelivered record and its
+  -- cause, and opening the gate after the call returned lets the writer actually end and changes nothing the session shows.
+  mapM_
+    ( \(name, make, cancelsAtOnce) →
+        it ("a sink blocked " <> name <> " from before a stop: every owner's stop, accounting, drain, retirement and the call's return complete without the gate opened, and the late end of the writer changes nothing") $
+          withSetup (setup (roleScript printScript)) $ \env → do
+            held ← make ["start gate opened"]
+            outcome ← runHeld (loggedBy held env) noHarness $ \session returning → whileHeld held $ do
+              awaitEntered held "start gate opened"
+              requestStop session StopQuit
+              found ← awaitReturn returning
+              outRetired found `shouldBe` True
+              historyNow session >>= \history → historyStopped history `shouldBe` [Gameplay, Presentation]
+              out ← outLines (seWorld env)
+              out `shouldSatisfy` elem "shutdown gameplay stopped"
+              out `shouldSatisfy` elem "shutdown presentation stopped"
+              isHeld held `shouldReturn` True
+              -- a cancellable block ends at once; one inside an uninterruptible region cannot be reached, and the call did not wait
+              if cancelsAtOnce
+                then awaitWriterEnd session
+                else atomically (sessionDiagnosticsEnded session) `shouldReturn` False
+              shown ← snapshot session
+              letGo held
+              awaitWriterEnd session
+              shownLater ← snapshot session
+              shownLater `shouldBe` shown
+            -- the exact record: what was in the sink, and what was queued behind it, in order, with the cause
+            deUndelivered (outDiagnostics outcome) `shouldBe` 3
+            undelivered outcome `shouldBe` ["start gate opened", "session stopping", "session ended"]
+            deCause (outDiagnostics outcome) `shouldBe` Just "the session returned with the diagnostics writer still working"
+            deSinkFailures (outDiagnostics outcome) `shouldBe` 0
+            outVerdict outcome `shouldBe` VerdictSuccess
+    )
+    [("interruptibly", holding, True), ("uninterruptibly", holdingUninterruptibly, False)]
+
+  it "a sink blocked from before a failure, uninterruptibly: the failure is latched and published, the owner retired and the call returned without the gate opened" $
+    withSetup ((setup (roleScript printScript {scInit = [], scUpdate = ["error('boom')"]})) {suShape = GameplayAlone}) $ \env → do
+      held ← holdingUninterruptibly ["session starting"]
+      let world = seWorld env
+      outcome ← runHeld (loggedBy held env) noHarness $ \session returning → whileHeld held $ do
+        awaitEntered held "session starting"
+        awaitPhase session Gameplay Running
+        awaitRegistration world 1000
+        nudge world 1000000
+        found ← awaitReturn returning
+        fmap rfRole (outFailures found) `shouldBe` [Gameplay]
+        outRetired found `shouldBe` True
+        isHeld held `shouldReturn` True
+        atomically (sessionDiagnosticsEnded session) `shouldReturn` False
+        letGo held
+        awaitWriterEnd session
+      outVerdict outcome `shouldBe` VerdictFailure
+      fmap eeCode (erPrimary (outEngine outcome)) `shouldBe` Just LuaError
+      undelivered outcome `shouldSatisfy` elem "role failed"
+      deSinkFailures (outDiagnostics outcome) `shouldBe` 0
+
+  it "a sink blocked while the session is healthy: logical ticks and the presentation role's updates go on" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      held ← holding ["start gate opened"]
+      let world = seWorld env
+      _ ← runHeld (loggedBy held env) noHarness $ \session returning → whileHeld held $ do
+        awaitEntered held "start gate opened"
+        awaitRegistration world 1000
+        passTime world 3000000 ((>= 3) . length . filter (Text.isPrefixOf "update gameplay") <$> outLines world)
+        passTime world 1000000000 (any (Text.isPrefixOf "update presentation") <$> outLines world)
+        isHeld held `shouldReturn` True
+        requestStop session StopQuit
+        void (awaitReturn returning)
+      pure ()
   it "the first note of the session: both roles are built, validated and started, a stop retires them, the call returns, and the note is recorded undelivered" $
     withSetup (setup (roleScript printScript)) $ \env → do
       held ← holding ["session starting"]
@@ -217,10 +310,9 @@ classes = describe "with the logger held at" $ do
       found ← outcomeNow session
       outRetired found `shouldBe` True
       undelivered found `shouldSatisfy` elem "session stopping"
-      -- the writer was cancelled where it was, and the write is not written again
-      bounded . atomically $ do
-        history ← sessionHistory session
-        when (("session stopping", DiagInterrupted) `notElem` historyDiagnostics history) retry
+      -- the writer was cancelled where it was, with the sink still held: it ended, and the write is not written again
+      bounded (atomically (sessionDiagnosticsEnded session >>= \over → when (not over) retry))
+      isHeld held `shouldReturn` True
       letGo held
       timesEntered held "session stopping" `shouldReturn` 1
 
@@ -306,6 +398,10 @@ failing = describe "with a sink that fails" $ do
       mentions "a diagnostic could not be written" outcome `shouldBe` True
       deSinkFailures (outDiagnostics outcome) `shouldBe` 1
       timesEntered held "start gate opened" `shouldReturn` 1
+      -- after a failure the sink is written no more: what was meant later is counted as undelivered
+      readTVarIO (heldAll held) >>= \attempted → reverse attempted `shouldBe` ["session starting", "start gate opened"]
+      undelivered outcome `shouldSatisfy` elem "session stopping"
+      deCause (outDiagnostics outcome) `shouldSatisfy` (/= Nothing)
 
   it "is evidence beside a failure the session already has, which stays the primary" $
     withSetup ((setup (roleScript printScript {scInit = [], scUpdate = ["error('boom')"]})) {suShape = GameplayAlone}) $ \env → do
@@ -322,6 +418,63 @@ failing = describe "with a sink that fails" $ do
       -- "role failed" was attempted once, and the failure of the sink is not in the engine report at all
       timesEntered held "role failed" `shouldReturn` 1
       mentions "a diagnostic could not be written" outcome `shouldBe` True
+
+-- A free sink ----------------------------------------------------------------------------------------------------------
+
+free ∷ Spec
+free = describe "with a sink that is free" $ do
+  it "does not count what was acknowledged before the cut-off, and counts only what was pending then" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      held ← holding ["never"]
+      outcome ← runScenario (loggedBy held env) $ \session → do
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        -- the two diagnostics of the start are acknowledged and gone from the queue
+        bounded . atomically $ do
+          history ← sessionHistory session
+          when (any ((`elem` ["session starting", "start gate opened"]) . fst) (historyDiagnostics history)) retry
+        requestStop session StopQuit
+        void (awaitRetired session)
+      undelivered outcome `shouldSatisfy` all (`notElem` ["session starting", "start gate opened"])
+      deSinkFailures (outDiagnostics outcome) `shouldBe` 0
+      readTVarIO (heldAll held) >>= \attempted → take 2 (reverse attempted) `shouldBe` ["session starting", "start gate opened"]
+
+-- The writer's start ---------------------------------------------------------------------------------------------------
+
+construction ∷ Spec
+construction = describe "the writer's start" $ do
+  it "is a failure of the composition when it cannot be made, before anything exists, and the sink is never asked" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      held ← holding ["never"]
+      recorder ← newRecorder
+      failAt recorder WriterStarting (toException (userError "the writer could not be started"))
+      result ← tryWithContext @SomeException (runSession (scenarioSpec (loggedBy held env) (recordingHarness recorder noHarness)) (\_ → pure ()))
+      case result of
+        Left (ExceptionWithContext _ raised) → show raised `shouldSatisfy` Text.isInfixOf "the writer could not be started" . Text.pack
+        Right _ → expectationFailure "the failure of the composition was lost"
+      points ← recorded recorder
+      points `shouldSatisfy` elem WriterStarting
+      points `shouldSatisfy` notElem WriterStarted
+      [point | point ← points, isBuilding point] `shouldBe` []
+      readTVarIO (heldAll held) `shouldReturn` []
+
+  it "is cut off when the caller is cancelled right after it is registered: the cancellation escapes, with nothing built and the sink unasked" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      held ← holding ["never"]
+      recorder ← newRecorder
+      holdAt recorder WriterStarted
+      driver ← myThreadId
+      _ ← forkIO $ do
+        awaitPoint recorder WriterStarted
+        throwTo driver ThreadKilled
+        releaseHold recorder WriterStarted
+      result ← tryWithContext @SomeException (runSession (scenarioSpec (loggedBy held env) (recordingHarness recorder noHarness)) (\_ → pure ()))
+      case result of
+        Left (ExceptionWithContext _ raised) → fromException raised `shouldBe` Just ThreadKilled
+        Right _ → expectationFailure "the cancellation was lost"
+      points ← recorded recorder
+      [point | point ← points, isBuilding point] `shouldBe` []
+      readTVarIO (heldAll held) >>= \attempted → attempted `shouldSatisfy` all (`notElem` ["start gate opened"])
 
 -- The negative controls -----------------------------------------------------------------------------------------------
 
@@ -371,8 +524,10 @@ controls = describe "with a protection removed (a negative control)" $ do
           letGo held
           void (awaitReturn returning)
         outRetired outcome `shouldBe` True
-  where
-    isBuilding = \case
-      Acquiring {} → True
-      Built {} → True
-      _ → False
+
+-- | A point of construction: something of a role is being acquired or has been.
+isBuilding ∷ Point → Bool
+isBuilding = \case
+  Acquiring {} → True
+  Built {} → True
+  _ → False
