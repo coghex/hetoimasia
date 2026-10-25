@@ -218,11 +218,28 @@ them into the backend's validated model belongs to the graphics composition.
 A test builds one by changing a copy of `profileSpec fixedM1Profile` and
 validating it. `validateProfile` checks, in order, that the derived products fit
 64 bits (`DerivedOverflow`), that every limit is positive and **no larger than
-its fixed value** (`LimitNotPositive`, `LimitAboveFixed`), and that the
-relations below hold (`RelationBroken`). A profile can only shrink; no value is
-clamped. The 64-per-VM request limit is not "corrected" to fit 16 per instance
+its fixed value** (`LimitNotPositive`, `LimitAboveFixed`), that every limit is
+**at least the least the engine's own schema, format and crossings need of it**
+(`LimitBelowMinimum`, below), and that the relations below hold
+(`RelationBroken`). A profile can only shrink; no value is clamped. The 64-per-VM request limit is not "corrected" to fit 16 per instance
 times 2 instances: independently bounded maxima need not be simultaneously
 attainable.
+
+#### The least each limit may be (`Hetoimasia.LuaEngine.Profile.Minimum`)
+
+Most limits are **caps on what comes in** (a manifest, a module's source, a data file, a PNG, a request, a scene, a window, a native budget): a cap too small to hold any real input refuses content, loudly and early, and breaks nothing the engine makes itself, so the least such a cap may be is the least positive value, one. A few limits are **bounds on what the engine itself writes or hands across**; a bound below the least its own schema, format or crossing needs would be a promise it cannot keep, and validation refuses it (`LimitBelowMinimum LIMIT GIVEN LEAST`, after the ceilings and before the relations), so a profile it accepts is one the engine can use without a second refusal at the point of use:
+
+| Limit | Least | Why |
+| --- | --- | --- |
+| `RoleFailureRecordBytes` | 37 (`schemaWordsBytes`: the longest code `state_unavailable` 17, stage `shutdown` 8 and role `presentation` 12) | a failure record's schema words cannot be shortened; every text is cut away first, so the whole-record cap holds for every code, stage and role only from here up (round 9's finding: a bound of 2 was accepted) |
+| `InstanceIdBytes` | 6 (`minimumInstanceIdBytes`) | the first identity the session issues |
+| `PrintWarnBytes` | `minimumPrintWarnBytes` of the identity bound | a warning must be able to name its writer, end in the marker and a line end |
+| `CopiedValueBytes` | `minimumCopiedValueBytes` of the identity and print bounds | what the facade itself makes cross the value boundary |
+| `CopiedValueElements` | `sceneFixedElements + sceneElementsPerSprite` (12) | a scene of one sprite must be able to cross |
+| `PngPipelineWorkspaceBytes`, `TextureBytesPerUiInstance`, `TextureBytesPerSession` | 4 (`rgba8BytesPerPixel`) | a texture holds at least one RGBA8 pixel |
+| every other byte, count and duration limit | 1 (1 ns) | a cap on what comes in, or on a text cut visibly to it; the relations then keep them consistent (the smallest legal profile, every limit at its least, satisfies all of them) |
+
+The facade's own check of the first four (`LimitBelowFormatting`) is a guard that no validated profile reaches; the other bounds the session and its services check (`NotRepresentable`: a value that does not fit a machine integer; the texture pipeline's job capacity and PNG limits; the scene limits) are unreachable for a validated profile because every ceiling is within the machine integers and every least is at least one. The examples (`Profile`, *the least each limit may be*) accept each limit at its least and refuse it one below, for every limit.
 
 | Relation | Meaning |
 | --- | --- |
@@ -1176,8 +1193,7 @@ withOutput out err $ \output →                -- the sinks' scope: outermost
     declared ← declareInstance facade gameRoot -- then admit (behaviorRequest ... (declaredFacade declared) ...)
 ```
 
-**The bounds the facade formats with are checked when it is made** (`newFacade` answers `LimitBelowFormatting NAME GIVEN LEAST` and
-makes nothing over a profile below the least), each against what the facade's own format needs:
+**The bounds the facade formats with are refused by the profile's own validation** (`LimitBelowMinimum`; the facade's `newFacade` keeps `LimitBelowFormatting NAME GIVEN LEAST` as a guard that no validated profile reaches), each against what the facade's own format needs:
 
 | Limit | Least | Why | Boundary examples (`Facade.Limits`) |
 | --- | --- | --- | --- |
