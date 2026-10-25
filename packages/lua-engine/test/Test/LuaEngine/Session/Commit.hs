@@ -194,13 +194,20 @@ effects = describe "the effects a commit owes" $ do
             atomically (modifyTVar' attempts (entryMessage entry :))
             when (entryMessage entry /= "session starting") (throwIO (userError "the sink failed"))
           env' = env {seSpec = (seSpec env) {sxLogger = mkLogger defaultLogFilter (callbackSink sink)}}
-      outcome ← runScenario env' $ \session → void (awaitRetired session)
+      outcome ← runScenario env' $ \session → do
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        requestStop session StopQuit
+        void (awaitRetired session)
       seen ← reverse <$> readTVarIO attempts
-      -- each diagnostic was attempted once: none was retried, and a failure to write one made no diagnostic of its own
+      -- each diagnostic was attempted once: none was retried, and a failure to write one made no diagnostic of its own;
+      -- a failure of the sink is evidence and ends nothing
       seen `shouldBe` nub seen
-      length [entry | entry ← entriesOf outcome, Text.isInfixOf "a diagnostic could not be written" (eeMessage entry)] `shouldBe` length seen - 1
+      deSinkFailures (outDiagnostics outcome) `shouldSatisfy` (>= 1)
+      deSinkFailures (outDiagnostics outcome) `shouldSatisfy` (<= length seen - 1)
+      entriesOf outcome `shouldBe` []
       outRetired outcome `shouldBe` True
-      outVerdict outcome `shouldBe` VerdictFailure
+      outVerdict outcome `shouldBe` VerdictSuccess
 
   it "does not recurse or repeat a boundary probe that fails every time, or let it keep the owners from stopping or the roles from retiring" $
     withSetup (setup (roleScript printScript)) $ \env → do
@@ -225,7 +232,7 @@ effects = describe "the effects a commit owes" $ do
       outRetired found `shouldBe` True
       length [entry | entry ← entriesOf found, Text.isInfixOf "the probe failed" (eeMessage entry)] `shouldBe` 4
 
-  it "does not write a diagnostic again when the caller is cancelled while the writer holds it: the data stays in flight, and the cleanup runs meanwhile" $
+  it "does not write a diagnostic again when the caller is cancelled while the writer holds it: the write is cancelled, the data stays unfinished and recorded, and the cleanup runs meanwhile" $
     withSetup (setup (roleScript printScript)) $ \env → do
       attempts ← newTVarIO (0 ∷ Int)
       blocked ← newTVarIO True
@@ -241,17 +248,17 @@ effects = describe "the effects a commit owes" $ do
         throwTo driver ThreadKilled
         -- the owners are stopped and retired by the unwinding while the sink is still blocked
         void (awaitRetired session)
-        history ← historyNow session
-        historyDiagnostics history `shouldSatisfy` elem ("start gate opened", DiagInFlight)
       raisedKilled ended `shouldBe` True
       out ← outLines (seWorld env)
       out `shouldSatisfy` elem "shutdown gameplay stopped"
-      -- the call returned with the sink still blocked; the writer finishes the one write by itself
+      -- the call returned with the sink still blocked; the writer was cancelled where it was, and recorded
       readTVarIO blocked `shouldReturn` True
-      atomically (writeTVar blocked False)
+      found ← outcomeNow session
+      deUndeliveredFirst (outDiagnostics found) `shouldSatisfy` elem "start gate opened"
       bounded . atomically $ do
-        found ← sessionHistory session
-        when ("start gate opened" `elem` map fst (historyDiagnostics found)) retry
+        history ← sessionHistory session
+        when (("start gate opened", DiagInterrupted) `notElem` historyDiagnostics history) retry
+      atomically (writeTVar blocked False)
       readTVarIO attempts `shouldReturn` 1
 
   describe "with the recovery path allowed to write (a negative control)" $

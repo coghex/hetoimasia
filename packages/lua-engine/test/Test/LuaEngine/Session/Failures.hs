@@ -648,7 +648,13 @@ hostFailures = describe "of the host" $ do
               outRetired outcome `shouldBe` True
               fmap eeCode (erPrimary (outEngine outcome)) `shouldBe` Just HostFailure
               length [entry | entry ← entries, eeCode entry == CleanupFailure, Text.isInfixOf "close failed" (eeMessage entry)] `shouldBe` 1
-              entries `shouldSatisfy` any (Text.isInfixOf "a diagnostic could not be written" . eeMessage)
+              -- the sink's failure is evidence and not an entry of the engine report; for the last note the writer may have been
+              -- abandoned before it was asked, and then the note is recorded as not delivered
+              ( any (Text.isInfixOf "a diagnostic could not be written") (deSinkFirst (outDiagnostics outcome))
+                  || any (Text.isInfixOf message) (deUndeliveredFirst (outDiagnostics outcome))
+                )
+                `shouldBe` True
+              entries `shouldSatisfy` all (not . Text.isInfixOf "a diagnostic could not be written" . eeMessage)
           pure ()
     )
     ["session stopping", "session engine failure", "session ended"]

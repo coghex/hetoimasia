@@ -282,6 +282,8 @@ data SessionState = SessionState
   , stEngine ∷ !EngineReport
   , stTerminal ∷ !(Maybe RoleFailure)
   -- ^ The terminal failure the unavailable-state guard latches.
+  , stDiagEvidence ∷ !DiagEvidence
+  -- ^ What became of the diagnostics: evidence, never the session's failure.
   , stLimits ∷ !FailureLimits
   }
   deriving (Eq, Show)
@@ -310,6 +312,7 @@ newSessionState limits roles =
     , stFailureOrder = []
     , stEngine = emptyReport
     , stTerminal = Nothing
+    , stDiagEvidence = emptyDiagEvidence
     , stLimits = limits
     }
 
@@ -419,10 +422,13 @@ data Event
     -- and every cleanup failure attached to it or to a cancellation, each by the identity it had. Which of them
     -- are new is decided in the step.
     Account ![Evidence]
-  | -- | A diagnostic could not be written. It is a failure of the engine, recorded without a diagnostic of its own, so
-    -- a sink that always raises cannot make the session say more and more about it. The cleanup failures the sink's
-    -- exception carried are accounted with it.
-    DiagnosticFailed !EngineEntry ![Evidence]
+  | -- | A diagnostic could not be written, or its write was cancelled. It is evidence and never the session's failure,
+    -- recorded without a diagnostic of its own, so a sink that always raises cannot make the session say more and more
+    -- about it. The text carries the cleanup failures the sink's exception carried.
+    DiagSinkFailed !Text
+  | -- | The writer is abandoned (the session has returned, or its caller was cancelled): every diagnostic not delivered
+    -- is recorded as undelivered, by message, and stays in the queue as data.
+    DiagAbandoned
   | -- | The engine, the host, a provider, a sink or cleanup failed, concerning this role's owner when
     -- one is known.
     EngineFault !(Maybe Role) !EngineEntry
@@ -524,7 +530,6 @@ diagnostics event before after answer =
       InstanceFailing {} → True
       InstanceEscalated {} → True
       Terminal _ → True
-      DiagnosticFailed {} → True
       _ → False
     failed role failure =
       Say
@@ -610,9 +615,9 @@ transition event state = case event of
     Just diag | dgState diag == DiagInFlight → quiet (setDiag identity DiagInterrupted state)
     _ → quiet state
   Account evidence → quiet (fst (accountEvidence Nothing evidence state))
-  DiagnosticFailed entry carried →
-    let (marked, _) = engineFault Nothing entry state
-     in quiet (fst (accountEvidence Nothing carried marked))
+  DiagSinkFailed message → quiet state {stDiagEvidence = noteSinkFailure (stLimits state) message (stDiagEvidence state)}
+  DiagAbandoned →
+    quiet state {stDiagEvidence = noteUndelivered (stLimits state) [sayMessage (dgSay diag) | diag ← toList (stDiags state)] (stDiagEvidence state)}
   EngineFault role entry → engineFault role entry state
   Stop kind →
     let marked = case kind of
@@ -821,7 +826,8 @@ eventName = \case
   DiagDone _ → "DiagDone"
   DiagInterrupt _ → "DiagInterrupt"
   Account _ → "Account"
-  DiagnosticFailed {} → "DiagnosticFailed"
+  DiagSinkFailed _ → "DiagSinkFailed"
+  DiagAbandoned → "DiagAbandoned"
   EngineFault _ _ → "EngineFault"
   Stop _ → "Stop"
   Terminal _ → "Terminal"
@@ -880,6 +886,9 @@ data SessionOutcome = SessionOutcome
   -- ^ Each failed role's first failure, in the order they latched; the head is the primary.
   , outEngine ∷ !EngineReport
   , outTerminal ∷ !(Maybe RoleFailure)
+  , outDiagnostics ∷ !DiagEvidence
+  -- ^ The diagnostics a sink failed to write and the ones not delivered when the session returned. Evidence: it never
+  -- changes the verdict.
   , outQuit ∷ !Bool
   , outInterrupted ∷ !Bool
   , outRetired ∷ !Bool
@@ -895,6 +904,7 @@ outcomeOf state =
     , outFailures = [failure | role ← stFailureOrder state, Just found ← [Map.lookup role (stRoles state)], Just failure ← [rsFailure found]]
     , outEngine = stEngine state
     , outTerminal = stTerminal state
+    , outDiagnostics = stDiagEvidence state
     , outQuit = stQuit state
     , outInterrupted = stInterrupt state
     , outRetired = allRolesRetired state

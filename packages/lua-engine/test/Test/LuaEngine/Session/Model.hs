@@ -37,6 +37,7 @@ spec = describe "model" $ do
   invariants
   failures
   report
+  diagnosticEvidence
   pacing
 
 -- Fixtures ---------------------------------------------------------------------------------------------
@@ -912,6 +913,41 @@ report = describe "the engine report" $ do
     total `shouldSatisfy` (<= limitReport limits)
     mapM_ (\entry → utf8Bytes (eeMessage entry) `shouldSatisfy` (<= limitSummary limits)) (erSecondary built)
     reportAccounted built `shouldBe` 17
+
+-- The diagnostics' evidence ---------------------------------------------------------------------------------------------
+
+diagnosticEvidence ∷ Spec
+diagnosticEvidence = describe "the diagnostics' evidence" $ do
+  it "records the diagnostics not delivered as a count and the first sixteen, each cut to a summary's bound, and never as the session's failure" $ do
+    let said = foldl' (\state n → fst (step (Note (Say SayInfo (Text.pack ("note " <> show n) <> Text.replicate 5000 "z") [])) state)) both [1 .. 40 ∷ Int]
+        (abandoned, _) = step DiagAbandoned said
+        evidence = stDiagEvidence abandoned
+    deUndelivered evidence `shouldBe` length (stDiags said)
+    length (deUndeliveredFirst evidence) `shouldBe` limitSecondary limits
+    map utf8Bytes (deUndeliveredFirst evidence) `shouldSatisfy` all (<= limitSummary limits)
+    -- the first ones, in the order they were meant
+    take 1 (deUndeliveredFirst evidence) `shouldSatisfy` all (Text.isPrefixOf "note 1")
+    -- the data stays in the queue, and the verdict is untouched
+    length (stDiags abandoned) `shouldBe` length (stDiags said)
+    outVerdict (outcomeOf abandoned) `shouldBe` VerdictSuccess
+    erPrimary (outEngine (outcomeOf abandoned)) `shouldBe` Nothing
+
+  it "records a sink that failed as a count and the first sixteen, beside a failure the session already has, which stays the primary" $ do
+    let failed = fst (step (LatchFailure Gameplay (newRoleFailure LuaError OnUpdate Gameplay "boom") []) both)
+        sunk = foldl' (\state n → fst (step (DiagSinkFailed (Text.pack (show n) <> Text.replicate 5000 "s")) state)) failed [1 .. 40 ∷ Int]
+        evidence = stDiagEvidence sunk
+    deSinkFailures evidence `shouldBe` 40
+    length (deSinkFirst evidence) `shouldBe` limitSecondary limits
+    map utf8Bytes (deSinkFirst evidence) `shouldSatisfy` all (<= limitSummary limits)
+    sum (map utf8Bytes (deSinkFirst evidence <> deUndeliveredFirst evidence)) `shouldSatisfy` (<= limitReport limits)
+    fmap eeCode (erPrimary (outEngine (outcomeOf sunk))) `shouldBe` Just LuaError
+    stStopping sunk `shouldBe` stStopping failed
+
+  it "is not a failure of the session, and stops nothing, when a sink fails with nothing else wrong" $ do
+    let sunk = fst (step (DiagSinkFailed "the sink failed") both)
+    outVerdict (outcomeOf sunk) `shouldBe` VerdictSuccess
+    stStopping sunk `shouldBe` False
+    stStops sunk `shouldBe` stStops both
 
 -- Pacing ---------------------------------------------------------------------------------------------------------------------
 

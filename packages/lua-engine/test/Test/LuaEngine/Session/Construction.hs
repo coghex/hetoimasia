@@ -442,21 +442,26 @@ callbacks = describe "the callback and the first diagnostic" $ do
       status ← statusNow session
       retiredBoth status `shouldBe` True
 
-  it "accounts a sink that fails for the first diagnostic as a failure of the engine, raises nothing, and retires what it built" $
+  it "records a sink that fails for the first diagnostic as evidence, raises nothing, goes on, and retires what it built" $
     withSetup (setup (roleScript printScript)) $ \env → do
       let logger =
             mkLogger defaultLogFilter . callbackSink $ \entry →
               when (entryMessage entry == "session starting") (throwIO (userError "the sink failed"))
           env' = env {seSpec = (seSpec env) {sxLogger = logger}}
-      (ended, session) ← runCaught env' noHarness $ \_ session → void (awaitRetired session)
-      -- the failure is accounted, not raised: the writer is not the driver, so nothing waited for the first note
+      (ended, session) ← runCaught env' noHarness $ \_ session → do
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        requestStop session StopQuit
+        void (awaitRetired session)
+      -- the failure is recorded, not raised, and it ended nothing: the writer is not the driver, so nothing waited for the
+      -- first note
       ended `shouldSatisfy` either (const False) (const True)
       outcome ← outcomeNow session
-      outVerdict outcome `shouldBe` VerdictFailure
-      outcomeMessages outcome `shouldSatisfy` any (Text.isInfixOf "a diagnostic could not be written")
+      outVerdict outcome `shouldBe` VerdictSuccess
+      deSinkFirst (outDiagnostics outcome) `shouldSatisfy` any (Text.isInfixOf "a diagnostic could not be written")
       outRetired outcome `shouldBe` True
 
-  it "returns a cancellation of the caller while the writer holds the first note, and leaves the writer to finish it by itself, once" $
+  it "returns a cancellation of the caller while the writer holds the first note: the write is cancelled once, and recorded as not delivered" $
     withSetup (setup (roleScript printScript)) $ \env → do
       blocked ← newTVarIO True
       written ← newTVarIO (0 ∷ Int)
@@ -483,11 +488,13 @@ callbacks = describe "the callback and the first diagnostic" $ do
       status ← statusNow session
       retiredBoth status `shouldBe` True
       atomically (writeTVar blocked False)
-      -- the writer finished its one write by itself: the note is written, and was asked for once
+      -- the writer was cancelled where it was: the note stays as data, marked unfinished, was asked for once, and is recorded
       bounded . atomically $ do
         found ← sessionHistory session
-        when ("session starting" `elem` map fst (historyDiagnostics found)) retry
+        when (("session starting", DiagInterrupted) `notElem` historyDiagnostics found) retry
       readTVarIO written `shouldReturn` 1
+      found ← outcomeNow session
+      deUndeliveredFirst (outDiagnostics found) `shouldSatisfy` elem "session starting"
   where
     blockForever = atomically retry
 

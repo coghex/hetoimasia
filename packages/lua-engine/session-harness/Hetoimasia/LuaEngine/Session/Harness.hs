@@ -123,6 +123,10 @@ data Protection
     -- only caller. Removed, there is no writer, and the driver writes the diagnostics itself, as it did: after the
     -- callback returns, whenever it has nothing else to do, and after the cleanup.
     ProtectOffDriver
+  | -- | The session returns without waiting for the writer: after retirement is published, a writer still in the sink is
+    -- cancelled and not waited for, and what it had not delivered is recorded. Removed, the call waits for the writer to
+    -- write the queue, as it did, with the point 'WriterWait' before it waits.
+    ProtectAbandon
   deriving (Eq, Show)
 
 -- | The steps a role's VM is made in, and released in the opposite order.
@@ -173,6 +177,9 @@ data Point
   | -- | Only with 'ProtectAccountingEvent' removed: the driver is about to wait, by itself and without observing anything
     -- else, for the accounting of a finished tick.
     AccountingWait
+  | -- | Only with 'ProtectAbandon' removed: the call is about to wait, by itself, for the diagnostics writer to write the
+    -- queue.
+    WriterWait
   | -- | Only with 'ProtectGrantAtomic' removed: the check was made in one transaction and the grant is about to be
     -- issued in another.
     GrantChecked !Word64

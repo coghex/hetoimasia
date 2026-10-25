@@ -44,6 +44,12 @@ module Hetoimasia.LuaEngine.Session.Failure
   , boundFailure
   , recordBytes
 
+    -- * The diagnostics' evidence
+  , DiagEvidence (..)
+  , emptyDiagEvidence
+  , noteSinkFailure
+  , noteUndelivered
+
     -- * The engine report
   , EngineEntry (..)
   , EngineReport (..)
@@ -279,6 +285,44 @@ fitRecord limits failure = foldl' (flip ($)) failure shrinkers
           Just text → set f (nonEmpty (truncateText (max 0 (utf8Bytes text - over f)) text))
     over f = recordBytes f - limitRecord limits
     nonEmpty text = if Text.null text then Nothing else Just text
+
+-- The diagnostics' evidence ----------------------------------------------------------------------
+
+-- | What became of the session's diagnostics, which is evidence and never the session's failure: a sink that raised or
+-- was cancelled, and the diagnostics that were not delivered when the session returned (a writer still blocked in the
+-- sink is abandoned, not waited for). Each is a count and the first entries, at most 'limitSecondary' of them, each cut
+-- to a summary's bound, so the record stays within the engine report's bound beside the report (two lists of sixteen
+-- summaries of 2 KiB are the 64 KiB the report is held to).
+data DiagEvidence = DiagEvidence
+  { deSinkFailures ∷ !Int
+  , deSinkFirst ∷ ![Text]
+  , deUndelivered ∷ !Int
+  , deUndeliveredFirst ∷ ![Text]
+  }
+  deriving (Eq, Show)
+
+-- | No diagnostic has failed or gone undelivered.
+emptyDiagEvidence ∷ DiagEvidence
+emptyDiagEvidence = DiagEvidence 0 [] 0 []
+
+-- | Account for one failed or cancelled write.
+noteSinkFailure ∷ FailureLimits → Text → DiagEvidence → DiagEvidence
+noteSinkFailure limits message evidence =
+  evidence
+    { deSinkFailures = deSinkFailures evidence + 1
+    , deSinkFirst = keepFirst limits (deSinkFirst evidence) [message]
+    }
+
+-- | Account for the diagnostics not delivered, by message.
+noteUndelivered ∷ FailureLimits → [Text] → DiagEvidence → DiagEvidence
+noteUndelivered limits messages evidence =
+  evidence
+    { deUndelivered = deUndelivered evidence + length messages
+    , deUndeliveredFirst = keepFirst limits (deUndeliveredFirst evidence) messages
+    }
+
+keepFirst ∷ FailureLimits → [Text] → [Text] → [Text]
+keepFirst limits kept new = kept <> map (truncateText (limitSummary limits)) (take (max 0 (limitSecondary limits - length kept)) new)
 
 -- The engine report -------------------------------------------------------------------------------
 

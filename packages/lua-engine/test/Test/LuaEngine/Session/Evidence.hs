@@ -7,6 +7,7 @@ module Test.LuaEngine.Session.Evidence (spec) where
 
 import Control.Concurrent (throwTo)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
+import Control.Concurrent.STM (atomically, retry)
 import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, rethrowIO, throwIO, toException, tryWithContext)
 import Control.Exception.Context (emptyExceptionContext)
 import Control.Monad (void, when)
@@ -18,6 +19,7 @@ import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, composeCleanup,
 import Hetoimasia.Scripting.Lua.Scheduler (TimerBackend (..))
 import Test.Hspec
 import Test.LuaEngine.Session.Support
+import Test.Support.Bounded (bounded)
 
 spec ∷ Spec
 spec = describe "evidence" $ do
@@ -524,10 +526,16 @@ releases = describe "the cleanup failures a failed release carries" $ do
       carried ← composedWith "the sink failed" ["sink cleanup one", "sink cleanup two"]
       let logger = mkLogger defaultLogFilter . callbackSink $ \entry → when (entryMessage entry == "session starting") (rethrowIO carried)
           env' = env {seSpec = (seSpec env) {sxLogger = logger}}
-      (_, session) ← runCaught env' noHarness $ \_ session → void (awaitStatus session statusStopping)
+      (_, session) ← runCaught env' noHarness $ \_ session → do
+        -- the sink's failure is evidence: the session is not ended by it
+        bounded . atomically $ do
+          found ← sessionOutcomeNow session
+          when (deSinkFailures (outDiagnostics found) == 0) retry
+        requestStop session StopQuit
       found ← outcomeNow session
-      outcomeMessages found `shouldSatisfy` any (Text.isInfixOf "sink cleanup one")
-      outcomeMessages found `shouldSatisfy` any (Text.isInfixOf "sink cleanup two")
+      outVerdict found `shouldBe` VerdictSuccess
+      deSinkFirst (outDiagnostics found) `shouldSatisfy` any (Text.isInfixOf "sink cleanup one")
+      deSinkFirst (outDiagnostics found) `shouldSatisfy` any (Text.isInfixOf "sink cleanup two")
 
 -- What the settlements prove -----------------------------------------------------------------------------------------------------
 
