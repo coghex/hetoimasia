@@ -389,6 +389,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Session.Commit
         Test.LuaEngine.Session.Clocks
         Test.LuaEngine.Session.Construction
+        Test.LuaEngine.Session.Diagnostics
         Test.LuaEngine.Session.Evidence
         Test.LuaEngine.Session.Failures
         Test.LuaEngine.Session.Model

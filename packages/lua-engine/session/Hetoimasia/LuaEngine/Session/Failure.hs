@@ -17,11 +17,15 @@
 --
 -- = The bounds
 --
--- The message, the traceback, the opaque instance identity and the path are each cut to their
--- profile bound, and the whole record is held to the profile's record bound (16 KiB) by shortening the
--- traceback first, then the message, then the path. The record's size is the sum of the UTF-8 bytes of
--- its text fields. A cut ends in a visible @...@ and never splits a code point; a bound too small to
--- hold the marker is simply the first bytes.
+-- Every text field is cut to its own bound: the message, the traceback, the opaque instance identity
+-- and the path to the profile's, and the content identifier to the 64 bytes the manifest allows one
+-- (it is not a profile number, because a validated identifier cannot exceed it; a record built by a
+-- caller that did not validate one is cut all the same). The whole record is then held to the profile's
+-- record bound (16 KiB) by shortening the traceback first, then the message, then the path, then the
+-- instance identity, then the content identifier. The record's size is the sum of the UTF-8 bytes of
+-- every text it holds, the schema's words included, so no field escapes the count. A cut ends in a
+-- visible @...@ and never splits a code point; a bound too small to hold the marker is simply the first
+-- bytes. Only a record bound smaller than the schema's own words (code, stage, role) cannot be met.
 module Hetoimasia.LuaEngine.Session.Failure
   ( -- * The schema
     FailureCode (..)
@@ -161,6 +165,8 @@ data FailureLimits = FailureLimits
   , limitTraceback ∷ !Int
   , limitRecord ∷ !Int
   , limitInstance ∷ !Int
+  , limitContent ∷ !Int
+  -- ^ The bytes of a content identifier: the manifest's 64, not a profile number.
   , limitPath ∷ !Int
   , limitReport ∷ !Int
   , limitSecondary ∷ !Int
@@ -178,6 +184,7 @@ failureLimitsOf profile =
     , limitTraceback = bytes TracebackBytes
     , limitRecord = bytes RoleFailureRecordBytes
     , limitInstance = bytes InstanceIdBytes
+    , limitContent = contentIdBytes
     , limitPath = bytes PathBytes
     , limitReport = bytes EngineReportBytes
     , limitSecondary = let Count n = countLimit profile SecondarySummaries in clamp n
@@ -186,6 +193,11 @@ failureLimitsOf profile =
   where
     bytes limit = let Bytes n = bytesLimit profile limit in clamp n
     clamp n = fromIntegral (min n (fromIntegral (maxBound ∷ Int)))
+
+-- | The longest content identifier the manifest admits ('Hetoimasia.LuaEngine.Manifest.ContentId': 1 to 64
+-- ASCII characters).
+contentIdBytes ∷ Int
+contentIdBytes = 64
 
 -- | The marker a cut ends in.
 marker ∷ Text
@@ -230,36 +242,41 @@ recordBytes failure =
     , maybe 0 utf8Bytes (rfTraceback failure)
     ]
 
--- | A failure held to the bounds: each field to its own, then the whole to the record's, shortening the
--- traceback, then the message, then the path. Codes, role, stage and the known identities stay.
+-- | A failure held to the bounds: each text field to its own, then the whole to the record's, shortening
+-- the traceback, then the message, then the path, then the instance identity, then the content
+-- identifier. The code, role and stage are words of the schema and stay.
 boundFailure ∷ FailureLimits → RoleFailure → RoleFailure
 boundFailure limits failure = fitRecord limits each
   where
     each =
       failure
         { rfMessage = truncateText (limitMessage limits) (rfMessage failure)
+        , rfContent = truncateText (limitContent limits) <$> rfContent failure
         , rfInstance = truncateText (limitInstance limits) <$> rfInstance failure
         , rfPath = truncateText (limitPath limits) <$> rfPath failure
         , rfTraceback = truncateText (limitTraceback limits) <$> rfTraceback failure
         }
 
+-- | Shrink the fields, in order, each by only what the record is still over by. Every text 'recordBytes'
+-- counts that is not a schema word has a place in the list.
 fitRecord ∷ FailureLimits → RoleFailure → RoleFailure
-fitRecord limits failure
-  | excess <= 0 = failure
-  | otherwise = shrinkPath (shrinkMessage (shrinkTraceback failure))
+fitRecord limits failure = foldl' (flip ($)) failure shrinkers
   where
-    excess = recordBytes failure - limitRecord limits
-    shrinkTraceback f = case rfTraceback f of
-      Nothing → f
-      Just text → f {rfTraceback = nonEmpty (truncateText (max 0 (utf8Bytes text - over f)) text)}
+    shrinkers =
+      [ shrinkOptional rfTraceback (\f v → f {rfTraceback = v})
+      , shrinkMessage
+      , shrinkOptional rfPath (\f v → f {rfPath = v})
+      , shrinkOptional rfInstance (\f v → f {rfInstance = v})
+      , shrinkOptional rfContent (\f v → f {rfContent = v})
+      ]
     shrinkMessage f
       | over f <= 0 = f
       | otherwise = f {rfMessage = truncateText (max 0 (utf8Bytes (rfMessage f) - over f)) (rfMessage f)}
-    shrinkPath f
+    shrinkOptional get set f
       | over f <= 0 = f
-      | otherwise = case rfPath f of
+      | otherwise = case get f of
           Nothing → f
-          Just text → f {rfPath = nonEmpty (truncateText (max 0 (utf8Bytes text - over f)) text)}
+          Just text → set f (nonEmpty (truncateText (max 0 (utf8Bytes text - over f)) text))
     over f = recordBytes f - limitRecord limits
     nonEmpty text = if Text.null text then Nothing else Just text
 

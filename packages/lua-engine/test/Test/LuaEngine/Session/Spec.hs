@@ -5,6 +5,7 @@ import qualified Test.LuaEngine.Session.Client as Client
 import qualified Test.LuaEngine.Session.Clocks as Clocks
 import qualified Test.LuaEngine.Session.Commit as Commit
 import qualified Test.LuaEngine.Session.Construction as Construction
+import qualified Test.LuaEngine.Session.Diagnostics as Diagnostics
 import qualified Test.LuaEngine.Session.Evidence as Evidence
 import qualified Test.LuaEngine.Session.Failures as Failures
 import qualified Test.LuaEngine.Session.Model as Model
@@ -22,4 +23,5 @@ spec = describe "Session" $ do
   Stop.spec
   Construction.spec
   Commit.spec
+  Diagnostics.spec
   Client.spec

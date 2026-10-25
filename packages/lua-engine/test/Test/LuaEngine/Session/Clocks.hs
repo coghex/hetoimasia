@@ -9,6 +9,7 @@ module Test.LuaEngine.Session.Clocks (spec) where
 import Control.Concurrent (forkIO)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, retry, writeTVar)
+import Control.Exception (finally)
 import Control.Monad (void, when)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -102,7 +103,7 @@ logical = describe "the logical clock" $ do
         take 1 out' `shouldBe` ["tick 1 dt 0.001000000"]
         requestStop session StopQuit
 
-  it "takes the origin before the gate's own diagnostics can delay it: a logger held at the gate's opening owes the time it held" $
+  it "takes the origin from the gate's opening, not from when its diagnostic is written: a logger held at the gate's opening delays no tick" $
     withSetup ((setup (roleScript ticking)) {suShape = GameplayAlone}) $ \env → do
       let world = seWorld env
       held ← newTVarIO True
@@ -110,12 +111,11 @@ logical = describe "the logical clock" $ do
             mkLogger defaultLogFilter . callbackSink $ \entry →
               when (entryMessage entry == "start gate opened") (atomically (readTVar held >>= \isHeld → when isHeld retry))
           env' = env {seSpec = (seSpec env) {sxLogger = logger}}
-      void . runScenario env' $ \session → do
-        -- the gate has opened in the state; the driver is stuck in the logger that says so
+      void . runScenario env' $ \session → (`finally` atomically (writeTVar held False)) $ do
+        -- the gate has opened in the state; the writer is stuck in the logger that says so, and the driver is not
         awaitPhase session Gameplay Running
         advanceClock world 5000000
-        atomically (writeTVar held False)
-        -- five ticks of the time that passed while the diagnostic was held are owed, each granted by itself
+        -- five ticks of the time that passed since the gate opened are owed, each granted by itself, with the logger held
         passTime world 1000000 ((>= 5) . length <$> linesWith "tick" world)
         out ← linesWith "tick" world
         take 5 out `shouldBe` ["tick 1 dt 0.001000000", "tick 2 dt 0.001000000", "tick 3 dt 0.001000000", "tick 4 dt 0.001000000", "tick 5 dt 0.001000000"]

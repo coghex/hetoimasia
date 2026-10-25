@@ -14,7 +14,7 @@ module Test.LuaEngine.Session.Commit (spec) where
 import Control.Concurrent (forkIO, myThreadId, throwTo)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
-import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, toException, try)
+import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, onException, throwIO, toException, try)
 import Control.Exception.Context (emptyExceptionContext)
 import Control.Monad (void, when)
 import Data.List (isInfixOf, nub)
@@ -225,7 +225,7 @@ effects = describe "the effects a commit owes" $ do
       outRetired found `shouldBe` True
       length [entry | entry ← entriesOf found, Text.isInfixOf "the probe failed" (eeMessage entry)] `shouldBe` 4
 
-  it "does not write a diagnostic again when the thread writing it was interrupted: the data stays, marked unfinished, and the cleanup runs first" $
+  it "does not write a diagnostic again when the caller is cancelled while the writer holds it: the data stays in flight, and the cleanup runs meanwhile" $
     withSetup (setup (roleScript printScript)) $ \env → do
       attempts ← newTVarIO (0 ∷ Int)
       blocked ← newTVarIO True
@@ -235,38 +235,24 @@ effects = describe "the effects a commit owes" $ do
                 atomically (modifyTVar' attempts (+ 1))
                 atomically (readTVar blocked >>= \held → when held retry)
           env' = env {seSpec = (seSpec env) {sxLogger = logger}}
-      (ended, session) ← runCaught env' noHarness $ \driver session → do
-        -- the driver is in the sink: it is cancelled there
+      (ended, session) ← runCaught env' noHarness $ \driver session → (`onException` atomically (writeTVar blocked False)) $ do
+        -- the writer is in the sink: the caller is cancelled while it is
         bounded (atomically (readTVar attempts >>= \n → when (n == 0) retry))
         throwTo driver ThreadKilled
         -- the owners are stopped and retired by the unwinding while the sink is still blocked
         void (awaitRetired session)
-        atomically (writeTVar blocked False)
+        history ← historyNow session
+        historyDiagnostics history `shouldSatisfy` elem ("start gate opened", DiagInFlight)
       raisedKilled ended `shouldBe` True
       out ← outLines (seWorld env)
       out `shouldSatisfy` elem "shutdown gameplay stopped"
+      -- the call returned with the sink still blocked; the writer finishes the one write by itself
+      readTVarIO blocked `shouldReturn` True
+      atomically (writeTVar blocked False)
+      bounded . atomically $ do
+        found ← sessionHistory session
+        when ("start gate opened" `elem` map fst (historyDiagnostics found)) retry
       readTVarIO attempts `shouldReturn` 1
-      history ← historyNow session
-      historyDiagnostics history `shouldSatisfy` elem ("start gate opened", DiagInterrupted)
-
-  it "writes nothing while the unwinding stops and retires the owners, and leaves the diagnostic of the closure pending for the end" $
-    withSetup (setup (roleScript printScript)) $ \env → do
-      entered ← newTVarIO False
-      let logger =
-            mkLogger defaultLogFilter . callbackSink $ \entry →
-              when (entryMessage entry == "session stopping") (atomically (writeTVar entered True))
-          env' = env {seSpec = (seSpec env) {sxLogger = logger}}
-      (ended, session) ← runCaught env' noHarness $ \driver session → do
-        awaitPhase session Gameplay Running
-        awaitPhase session Presentation Running
-        throwTo driver ThreadKilled
-        void (awaitRetired session)
-      raisedKilled ended `shouldBe` True
-      -- a cancellation skips the final forwarding: the sink was never asked, and the data is kept pending
-      readTVarIO entered `shouldReturn` False
-      history ← historyNow session
-      historyDiagnostics history `shouldSatisfy` elem ("session stopping", DiagPending)
-      historyStopped history `shouldBe` [Gameplay, Presentation]
 
   describe "with the recovery path allowed to write (a negative control)" $
     it "writes the diagnostic of the closure before any owner has its stop, which the proof above detects" $

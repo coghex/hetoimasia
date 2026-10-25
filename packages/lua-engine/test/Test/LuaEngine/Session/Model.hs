@@ -8,6 +8,7 @@ module Test.LuaEngine.Session.Model (spec) where
 
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), toException)
 import Control.Exception.Context (emptyExceptionContext)
+import Control.Monad ((<=<))
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, listToMaybe)
 import qualified Data.Set as Set
@@ -51,6 +52,27 @@ gameplayOnly = newSessionState limits [(Gameplay, 1)]
 
 presentationOnly ∷ SessionState
 presentationOnly = newSessionState limits [(Presentation, 1)]
+
+-- | A failure whose every text is far beyond every bound.
+everything ∷ RoleFailure
+everything =
+  (newRoleFailure LuaError OnUpdate Presentation (Text.replicate 30000 "m"))
+    { rfContent = Just (Text.replicate 20000 "c")
+    , rfInstance = Just (Text.replicate 20000 "i")
+    , rfPath = Just (Text.replicate 20000 "p")
+    , rfTraceback = Just (Text.replicate 30000 "t")
+    }
+
+-- | The text fields of the failure record: its name, how an example makes the field this text, how many bytes the record
+-- holds in it, and the bound it is cut to.
+fields ∷ [(String, Text → RoleFailure → RoleFailure, RoleFailure → Int, FailureLimits → Int)]
+fields =
+  [ ("message", \text record → record {rfMessage = text}, utf8Bytes . rfMessage, limitMessage)
+  , ("content identifier", \text record → record {rfContent = Just text}, maybe 0 utf8Bytes . rfContent, limitContent)
+  , ("instance identity", \text record → record {rfInstance = Just text}, maybe 0 utf8Bytes . rfInstance, limitInstance)
+  , ("path", \text record → record {rfPath = Just text}, maybe 0 utf8Bytes . rfPath, limitPath)
+  , ("traceback", \text record → record {rfTraceback = Just text}, maybe 0 utf8Bytes . rfTraceback, limitTraceback)
+  ]
 
 -- | An instance's @init@ succeeded when the injected clock read this many nanoseconds.
 initAt ∷ Integer → InstanceKey → Event
@@ -789,6 +811,79 @@ failures = describe "the failure schema" $ do
     rfStage bounded `shouldBe` OnUpdate
     rfContent bounded `shouldBe` Just "game"
     Text.isSuffixOf "..." (rfMessage bounded) `shouldBe` True
+
+  -- One example for each text field of the record: the field alone is far beyond every bound, and the record that comes
+  -- out is within the record's, with the field cut at its own bound and a visible marker, and nothing else touched.
+  mapM_
+    ( \(name, oversize, lengthOf, ownBound) →
+        it ("cuts the " <> name <> " to its own bound and holds the record to its bound when it alone is oversized") $ do
+          let huge = Text.replicate 30000 "x"
+              bounded' = boundFailure limits (oversize huge (newRoleFailure LuaError OnUpdate Gameplay "short"))
+          lengthOf bounded' `shouldSatisfy` (<= ownBound limits)
+          lengthOf bounded' `shouldSatisfy` (> 0)
+          recordBytes bounded' `shouldSatisfy` (<= limitRecord limits)
+          -- everything else the record said is as it was
+          rfCode bounded' `shouldBe` LuaError
+          rfRole bounded' `shouldBe` Gameplay
+          rfStage bounded' `shouldBe` OnUpdate
+    )
+    fields
+
+  -- The whole record counts every field, whichever it is that is large: with a record bound anywhere above the schema's own
+  -- words, the record that comes out is within it, and the fields give way in the order the schema names.
+  it "counts every field in the record bound, at every record bound, and shortens the content identifier last" $ do
+    let full =
+          (newRoleFailure LuaError OnUpdate Gameplay (Text.replicate 5000 "m"))
+            { rfContent = Just (Text.replicate 5000 "c")
+            , rfInstance = Just (Text.replicate 5000 "i")
+            , rfPath = Just (Text.replicate 9000 "p")
+            , rfTraceback = Just (Text.replicate 20000 "t")
+            }
+        wordsBytes = recordBytes (newRoleFailure LuaError OnUpdate Gameplay "")
+        records = [wordsBytes .. wordsBytes + 40] <> [wordsBytes + 41, wordsBytes + 48 .. limitRecord limits + 4000]
+    mapM_
+      ( \bound → do
+          let tight = limits {limitRecord = bound}
+              found = boundFailure tight full
+          recordBytes found `shouldSatisfy` (<= bound)
+      )
+      records
+    -- with room for all but a few bytes, only the last field to give way is touched
+    let nearly = limits {limitRecord = recordBytes (boundFailure limits full) - 1}
+        shortened = boundFailure nearly full
+    rfContent shortened `shouldBe` rfContent (boundFailure limits full)
+    recordBytes shortened `shouldSatisfy` (<= limitRecord nearly)
+
+  it "keeps a record that is within every bound as it was" $ do
+    let small =
+          (newRoleFailure ModuleError OnModule Presentation "no such module")
+            { rfContent = Just "game"
+            , rfInstance = Just "inst-3"
+            , rfPath = Just "lua/main.lua"
+            , rfTraceback = Just "stack traceback:\n\tmain.lua:1"
+            }
+    boundFailure limits small `shouldBe` small
+
+  -- The state bounds what an event carries, so no caller owes the bound and nothing it stores, publishes or says is longer.
+  mapM_
+    ( \(name, event, stored) →
+        it ("bounds the failure a " <> name <> " event carries before the state stores it") $ do
+          let (next, _) = step event both
+              kept = stored next
+          fmap recordBytes kept `shouldSatisfy` maybe False (<= limitRecord limits)
+          fmap (maybe 0 utf8Bytes . rfContent) kept `shouldSatisfy` maybe False (<= limitContent limits)
+          fmap (maybe 0 utf8Bytes . rfInstance) kept `shouldSatisfy` maybe False (<= limitInstance limits)
+          fmap (maybe 0 utf8Bytes . rfPath) kept `shouldSatisfy` maybe False (<= limitPath limits)
+          fmap (maybe 0 utf8Bytes . rfTraceback) kept `shouldSatisfy` maybe False (<= limitTraceback limits)
+          fmap (utf8Bytes . rfMessage) kept `shouldSatisfy` maybe False (<= limitMessage limits)
+          -- the engine report holds the failure's message, itself cut
+          maybe 0 (utf8Bytes . eeMessage) (erPrimary (stEngine next)) `shouldSatisfy` (<= limitRecord limits)
+    )
+    [ ("LatchFailure", LatchFailure Presentation everything [], rsFailure <=< Map.lookup Presentation . stRoles)
+    , ("InstanceFailing", InstanceFailing "host-1" Presentation everything [], rsFailure <=< Map.lookup Presentation . stRoles)
+    , ("InstanceEscalated", InstanceEscalated "host-1" Presentation everything [], rsFailure <=< Map.lookup Presentation . stRoles)
+    , ("Terminal", Terminal everything, stTerminal)
+    ]
 
   it "spells the schema's codes, stages and roles as approved" $ do
     map codeWord [minBound .. maxBound]

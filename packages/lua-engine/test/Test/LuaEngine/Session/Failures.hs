@@ -25,6 +25,7 @@ import Data.List (isInfixOf)
 import Hetoimasia.Foundation.Log (LogEntry (entryMessage), Logger, callbackSink, defaultLogFilter, mkLogger, unsafeComponent)
 import Hetoimasia.Foundation.Worker (awaitCompletion, workerDefinition)
 import Hetoimasia.Runtime.Supervision (Disposition (Required), Recognition (Unrecognized), Role (Service), SupervisedStart (WorkerStarted), WorkerPolicy (..), startSupervised, supervisedWorker)
+import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Test.Hspec
 import Test.LuaEngine.Modules.Support (closeGate, injectedDefect, openGate)
 import Test.LuaEngine.Session.Support
@@ -359,6 +360,52 @@ otherFailures = describe "that end the whole session" $ do
       outVerdict outcome `shouldBe` VerdictFailure
       outFailures outcome `shouldBe` []
       fmap rfRole (outTerminal outcome) `shouldBe` Just Presentation
+
+  -- The terminal failure comes in by the public endpoint, built by whoever calls it: every text of it is counted in the
+  -- bound of the record that is published, one example for each field, and one for all of them at once.
+  mapM_
+    ( \(name, oversize, bytesIn, ownBound) →
+        it ("publishes a terminal failure whose " <> name <> " the caller built far beyond its bound within the record's bound") $
+          withSetup (setup (roleScript printScript)) $ \env → do
+            outcome ← runScenario env $ \session → do
+              awaitPhase session Gameplay Running
+              awaitPhase session Presentation Running
+              void (latchTerminalFailure session (oversize (Text.replicate 20000 "x") (newRoleFailure StateUnavailable OnUpdate Presentation "state is unavailable")))
+              void (awaitRetired session)
+            case outTerminal outcome of
+              Nothing → expectationFailure "the terminal failure was not published"
+              Just found → do
+                recordBytes found `shouldSatisfy` (<= limitRecord published)
+                bytesIn found `shouldSatisfy` (<= ownBound published)
+                bytesIn found `shouldSatisfy` (> 0)
+            -- and the engine report, which carries the message, stays within the record's bound as well
+            maybe 0 (utf8Bytes . eeMessage) (erPrimary (outEngine outcome)) `shouldSatisfy` (<= limitRecord published)
+    )
+    [ ("message", \text failure → failure {rfMessage = text}, utf8Bytes . rfMessage, limitMessage)
+    , ("content identifier", \text failure → failure {rfContent = Just text}, maybe 0 utf8Bytes . rfContent, limitContent)
+    , ("instance identity", \text failure → failure {rfInstance = Just text}, maybe 0 utf8Bytes . rfInstance, limitInstance)
+    , ("path", \text failure → failure {rfPath = Just text}, maybe 0 utf8Bytes . rfPath, limitPath)
+    , ("traceback", \text failure → failure {rfTraceback = Just text}, maybe 0 utf8Bytes . rfTraceback, limitTraceback)
+    ]
+
+  it "publishes a terminal failure whose every text is beyond its bound within the record's bound" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      let huge = Text.replicate 20000 "x"
+      outcome ← runScenario env $ \session → do
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        void
+          ( latchTerminalFailure
+              session
+              (newRoleFailure StateUnavailable OnUpdate Presentation huge)
+                { rfContent = Just huge
+                , rfInstance = Just huge
+                , rfPath = Just huge
+                , rfTraceback = Just huge
+                }
+          )
+        void (awaitRetired session)
+      fmap recordBytes (outTerminal outcome) `shouldSatisfy` maybe False (<= limitRecord published)
 
 -- Failures of the host --------------------------------------------------------------------------------------------------------------
 
@@ -917,3 +964,7 @@ outcomes = describe "how a session ends, in every arrangement of roles" $
               outRetired outcome `shouldBe` True
     )
     [BothRoles', GameplayAlone, PresentationAlone]
+
+-- | The bounds a session publishes failures within.
+published ∷ FailureLimits
+published = failureLimitsOf fixedM1Profile

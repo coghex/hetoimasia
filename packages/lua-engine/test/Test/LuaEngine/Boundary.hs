@@ -298,6 +298,26 @@ spec = describe "the package and import boundary" $ do
     sort (nub [name | (file, name) ← imported, file `elem` pure', "Hetoimasia.Scripting." `isPrefixOf` name])
       `shouldBe` ["Hetoimasia.Scripting.Lua.Instance", "Hetoimasia.Scripting.Lua.Runtime"]
 
+  it "calls the session's logger in one place, the attempt to write one diagnostic, and reaches it by no other path in the session sublibrary" $ do
+    sources ← sourcesUnder "session"
+    contents ← mapM (\path → (,) (takeFileName path) <$> readFile path) sources
+    let mentions word =
+          sort
+            [ name
+            | (name, text) ← contents
+            , line ← lines text
+            , not ("--" `isPrefixOf` trim line)
+            , not ("import " `isPrefixOf` line)
+            , word `isInfixOf` line
+            ]
+    -- the sink is called by name on one line of one module (the attempt, which only the writer and the negative controls make)
+    mentions "logInfo" `shouldBe` ["Run.hs"]
+    mentions "logError" `shouldBe` ["Run.hs"]
+    -- the session's logger is a field and is read where that attempt is made; the specification's is handed on twice: to the
+    -- session record, and to the module coordinator, whose diagnostic is written on the owner's own thread
+    mentions "sessionLogger" `shouldBe` ["Run.hs", "Types.hs"]
+    mentions "sxLogger" `shouldBe` ["Run.hs", "Run.hs", "Types.hs"]
+
   it "lets only the behavior selection import the Lua host and runtime, and only their public modules" $ do
     sources ← sourcesUnder "src"
     imported ← importedBy sources

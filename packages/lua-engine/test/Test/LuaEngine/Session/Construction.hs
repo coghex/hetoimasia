@@ -442,23 +442,21 @@ callbacks = describe "the callback and the first diagnostic" $ do
       status ← statusNow session
       retiredBoth status `shouldBe` True
 
-  it "accounts a sink that fails for the first diagnostic as a failure of the engine, and builds nothing" $
+  it "accounts a sink that fails for the first diagnostic as a failure of the engine, raises nothing, and retires what it built" $
     withSetup (setup (roleScript printScript)) $ \env → do
-      recorder ← newRecorder
       let logger =
             mkLogger defaultLogFilter . callbackSink $ \entry →
               when (entryMessage entry == "session starting") (throwIO (userError "the sink failed"))
           env' = env {seSpec = (seSpec env) {sxLogger = logger}}
-      (ended, session) ← runCaught env' (recordingHarness recorder noHarness) $ \_ session → void (awaitStatus session statusStopping)
-      -- the failure is accounted, not raised, and nothing was constructed
+      (ended, session) ← runCaught env' noHarness $ \_ session → void (awaitRetired session)
+      -- the failure is accounted, not raised: the writer is not the driver, so nothing waited for the first note
       ended `shouldSatisfy` either (const False) (const True)
       outcome ← outcomeNow session
       outVerdict outcome `shouldBe` VerdictFailure
       outcomeMessages outcome `shouldSatisfy` any (Text.isInfixOf "a diagnostic could not be written")
-      points ← recorded recorder
-      [point | point <- points, isBuilding point] `shouldBe` []
+      outRetired outcome `shouldBe` True
 
-  it "keeps a first diagnostic that a cancellation interrupted as unfinished data, and does not retry it" $
+  it "returns a cancellation of the caller while the writer holds the first note, and leaves the writer to finish it by itself, once" $
     withSetup (setup (roleScript printScript)) $ \env → do
       blocked ← newTVarIO True
       written ← newTVarIO (0 ∷ Int)
@@ -471,27 +469,27 @@ callbacks = describe "the callback and the first diagnostic" $ do
       handle ← newEmptyMVar
       driver ← myThreadId
       _ ← forkIO $ do
-        session ← readMVar handle
-        -- the driver is inside the sink: it is cancelled there
+        _ ← readMVar handle
+        -- the writer is inside the sink: the caller is cancelled while it is
         bounded (atomically (readTVar written >>= \n → when (n == 0) retry))
         throwTo driver ThreadKilled
-        void (awaitStatus session statusStopping)
-        atomically (writeTVar blocked False)
       result ← try (runSession (scenarioSpec env' noHarness) (putMVar handle))
       case result of
         Left (raised ∷ SomeException) → fromException raised `shouldBe` Just ThreadKilled
         Right _ → expectationFailure "the cancellation was lost"
       session ← readMVar handle
-      -- the sink was asked once, and the data stays in the queue, marked interrupted
+      -- the call returned with the sink still holding the note, and every role retired
+      readTVarIO blocked `shouldReturn` True
+      status ← statusNow session
+      retiredBoth status `shouldBe` True
+      atomically (writeTVar blocked False)
+      -- the writer finished its one write by itself: the note is written, and was asked for once
+      bounded . atomically $ do
+        found ← sessionHistory session
+        when ("session starting" `elem` map fst (historyDiagnostics found)) retry
       readTVarIO written `shouldReturn` 1
-      found ← historyNow session
-      historyDiagnostics found `shouldSatisfy` elem ("session starting", DiagInterrupted)
   where
     blockForever = atomically retry
-    isBuilding = \case
-      Acquiring {} → True
-      Built {} → True
-      _ → False
 
 -- Draining before retirement ---------------------------------------------------------------------------------------------------------
 

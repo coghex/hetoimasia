@@ -92,6 +92,7 @@ module Hetoimasia.LuaEngine.Session.State
   , DiagState (..)
   , Diag (..)
   , pendingDiagnostics
+  , diagnosticsOutstanding
   , quiet
 
     -- * Transitions
@@ -359,6 +360,11 @@ retirable role state = case Map.lookup role (stRoles state) of
 pendingDiagnostics ∷ SessionState → [Diag]
 pendingDiagnostics state = [diag | diag ← toList (stDiags state), dgState diag == DiagPending]
 
+-- | Whether any diagnostic is waiting to be written or is being written now. An interrupted one is neither: it is kept
+-- as data and is not written again.
+diagnosticsOutstanding ∷ SessionState → Bool
+diagnosticsOutstanding state = any ((/= DiagInterrupted) . dgState) (toList (stDiags state))
+
 -- Transitions ---------------------------------------------------------------------------------------
 
 -- | What happened.
@@ -467,10 +473,22 @@ owedStops = toList . stStops
 -- step, so nothing is asked to stop before the session says it takes no more work and no stop can be lost between
 -- the two. The diagnostics the event means are appended after.
 step ∷ Event → SessionState → (SessionState, Answer)
-step event state =
-  let (next, answer) = transition event state
+step raw state =
+  let event = boundEvent (stLimits state) raw
+      (next, answer) = transition event state
       said = diagnostics event state next answer
    in (enqueue said next, answer)
+
+-- | The event with the failure it carries held to the bounds. The state stores, publishes and says only a
+-- bounded record whoever built the event, so no caller owes the bound; it is idempotent, so a record a
+-- caller already bounded is unchanged.
+boundEvent ∷ FailureLimits → Event → Event
+boundEvent limits = \case
+  LatchFailure role failure secondary → LatchFailure role (boundFailure limits failure) secondary
+  InstanceFailing host role failure secondary → InstanceFailing host role (boundFailure limits failure) secondary
+  InstanceEscalated host role failure secondary → InstanceEscalated host role (boundFailure limits failure) secondary
+  Terminal failure → Terminal (boundFailure limits failure)
+  other → other
 
 -- | Append diagnostics to the queue under stable identities.
 enqueue ∷ [Say] → SessionState → SessionState

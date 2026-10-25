@@ -119,6 +119,10 @@ data Protection
   | -- | The accounting of a finished tick is one more thing the driver's single wait observes. Removed, the driver
     -- waits for it by itself, and nothing else is observed while a held provider retirement extends it.
     ProtectAccountingEvent
+  | -- | No step of the driver, the stop pass or the teardown calls the logger: the session's own writer is the sink's
+    -- only caller. Removed, there is no writer, and the driver writes the diagnostics itself, as it did: after the
+    -- callback returns, whenever it has nothing else to do, and after the cleanup.
+    ProtectOffDriver
   deriving (Eq, Show)
 
 -- | The steps a role's VM is made in, and released in the opposite order.
