@@ -20,12 +20,12 @@ import Data.Word (Word64)
 import Hetoimasia.Foundation.Resource (cleanupFailureId, cleanupFailuresInContext, composeCleanup)
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero, RequirePositive), Instant, durationFromNanoseconds, scriptedInstant)
 import Hetoimasia.LuaEngine.Manifest (Role (..))
-import Hetoimasia.LuaEngine.Profile (ByteLimit (EngineReportBytes, RoleFailureRecordBytes, SecondarySummaryBytes), CountLimit (SecondarySummaries), Profile, fixedM1Profile)
+import Hetoimasia.LuaEngine.Profile (ByteLimit (EngineReportBytes, RoleFailureRecordBytes, SecondarySummaryBytes), CountLimit (SecondarySummaries), Profile, codeWords, fixedM1Profile, roleWords, schemaWordsBytes, stageWords)
 import Hetoimasia.LuaEngine.Session.Failure
 import Hetoimasia.LuaEngine.Session.Pacing
 import Hetoimasia.LuaEngine.Session.State
 import Test.Hspec
-import Test.LuaEngine.Request.Profiles (bytesOf, smaller)
+import Test.LuaEngine.Request.Profiles (bytesOf, smallestLegalProfile, smaller)
 
 spec ∷ Spec
 spec = describe "model" $ do
@@ -887,6 +887,32 @@ failures = describe "the failure schema" $ do
     , ("InstanceEscalated", InstanceEscalated "host-1" Presentation everything [], rsFailure <=< Map.lookup Presentation . stRoles)
     , ("Terminal", Terminal everything, stTerminal)
     ]
+
+  -- Round 9's finding: a record bound the profile accepted could be below the schema's own words, which no cut can shorten.
+  -- Validation now refuses it (the least is the longest code, stage and role together), and the record is held to the
+  -- smallest bound it accepts for every code, stage and role.
+  it "has the schema's words in the profile as the session spells them, and the least record bound is exactly their longest together" $ do
+    codeWords `shouldBe` map codeWord [minBound .. maxBound]
+    stageWords `shouldBe` map stageWord [minBound .. maxBound]
+    roleWords `shouldBe` map roleWord [Gameplay, Presentation]
+    let words' = [recordBytes (newRoleFailure code stage role "") | code ← [minBound .. maxBound], stage ← [minBound .. maxBound], role ← [Gameplay, Presentation]]
+    maximum words' `shouldBe` schemaWordsBytes
+    limitRecord (failureLimitsOf smallestLegalProfile) `shouldBe` schemaWordsBytes
+
+  it "holds every record to the smallest record bound validation accepts, whatever its code, stage and role and however large its texts" $ do
+    let tightest = failureLimitsOf smallestLegalProfile
+        huge = Text.replicate 5000 "x"
+        loaded code stage role =
+          (newRoleFailure code stage role huge)
+            { rfContent = Just huge
+            , rfInstance = Just huge
+            , rfPath = Just huge
+            , rfTraceback = Just huge
+            }
+    mapM_
+      ( \(code, stage, role) → recordBytes (boundFailure tightest (loaded code stage role)) `shouldSatisfy` (<= limitRecord tightest)
+      )
+      [(code, stage, role) | code ← [minBound .. maxBound], stage ← [minBound .. maxBound], role ← [Gameplay, Presentation]]
 
   it "spells the schema's codes, stages and roles as approved" $ do
     map codeWord [minBound .. maxBound]

@@ -495,7 +495,6 @@ content = describe "content requested during init" $ do
           -- the presentation role goes on while the logical tick waits for its content
           passTime world 1000000000 (elem "update presentation 0" <$> outLines world)
           openGate probe "lua/data.bin"
-          void (awaitOutputLines world 1)
           passTime world 0 (elem "update gameplay 1" <$> outLines world)
           out ← outLines world
           let ui = positionOf "update presentation 0" out

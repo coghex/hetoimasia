@@ -55,6 +55,7 @@ module Test.LuaEngine.Session.Support
 
     -- * Driving the clock
   , nudge
+  , nudgeArmed
   , addFile
   , awaitRegistration
   , awaitRetired
@@ -435,6 +436,11 @@ tickMillis = (* 1000000)
 -- | Move the injected clock on and wake the timers once, with nothing to wait for.
 nudge ∷ World → Word → IO ()
 nudge world nanoseconds = advanceClock world (fromIntegral nanoseconds) >> fireTimers world
+
+-- | Wait for the timer registration of exactly this many microseconds to be live, and then move the clock on and wake the
+-- timers once: the wake cannot be lost to a registration that is not yet made.
+nudgeArmed ∷ World → Int → Word → IO ()
+nudgeArmed world micros nanoseconds = awaitRegistration world micros >> nudge world nanoseconds
 
 -- | A setup with one more file in its content tree.
 addFile ∷ (FilePath, ByteString) → Setup → Setup

@@ -75,7 +75,7 @@ atBoundary removedProtections point look = do
       void . runCaught env (recording recorder removedProtections) $ \_ session → do
         awaitPhase session Gameplay Running
         awaitRegistration world 1000
-        passTime world 1000000 ((>= 1) . length . filter (Text.isPrefixOf "suspended") <$> outLines world)
+        passTime world 1000000 (any (Text.isPrefixOf "suspended") <$> outLines world)
         requestStop session StopQuit
         awaitPoint recorder point
         look session
@@ -163,7 +163,7 @@ boundaries = describe "at each boundary between a commit and its effects" $ do
         (ended, session) ← runCaught env (recording recorder []) $ \driver session → do
           awaitPhase session Gameplay Running
           awaitRegistration world 1000
-          passTime world 1000000 ((>= 1) . length . filter (Text.isPrefixOf "suspended") <$> outLines world)
+          passTime world 1000000 (any (Text.isPrefixOf "suspended") <$> outLines world)
           requestStop session StopQuit
           -- the owner ended and its end was committed whole: the thread that committed it is cancelled right there
           awaitPoint recorder (Committed "OwnerFinalized")

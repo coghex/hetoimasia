@@ -4,10 +4,10 @@
 -- created and retired across cycles without an identity being issued twice.
 module Test.LuaRuntime.Scheduled.Creation (spec) where
 
-import Control.Concurrent (forkIO, killThread, throwTo, yield)
+import Control.Concurrent (forkIO, killThread, throwTo)
 import Control.Concurrent.MVar (isEmptyMVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryTakeMVar)
 import Control.Exception (AsyncException (ThreadKilled, UserInterrupt), SomeException, fromException, throwIO, try)
-import Control.Monad (forM, forM_, replicateM, replicateM_)
+import Control.Monad (forM, forM_, replicateM)
 import Data.ByteString (ByteString)
 import Data.List (isInfixOf)
 import Data.Maybe (isNothing)
@@ -78,15 +78,17 @@ spec = describe "creation, readiness and identity" $ do
   it "keeps what the hook raises as a failure of the host beside the failure of the start, never in place of it" $ bounded $ do
     fixture ← newSFixture
     withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
+      hookRan ← newEmptyMVar
       let config =
             (withChunks (initial "fx.block('init')") (scheduled fixture "abandoned, hook raises" requiredPolicy defaultSchedulerBounds))
-              {scheduledOnStartAbandoned = throwIO (userError "the hook failed")}
+              {scheduledOnStartAbandoned = putMVar hookRan () >> throwIO (userError "the hook failed")}
       returned ← newEmptyMVar
       starter ← forkIO (try @SomeException (startScheduledOwner runtime config) >>= putMVar returned)
       awaitEntered fixture "init"
       killThread starter
-      -- the hook raised, and the starter still waits for its worker: it has not returned while the worker is held
-      replicateM_ 1000 yield
+      -- the hook has been called and raised, and the starter still waits for its worker: it has not returned while the
+      -- worker is held
+      takeMVar hookRan
       isEmptyMVar returned >>= (`shouldBe` True)
       releaseGate fixture "init"
       takeMVar returned >>= \case

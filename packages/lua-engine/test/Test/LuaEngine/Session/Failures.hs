@@ -75,7 +75,7 @@ logicalFailure = describe "of the logical role after the start" $ do
         awaitPhase session Gameplay Running
         awaitPhase session Presentation Running
         awaitRegistration world 1000
-        passTime world 2000000 ((>= 2) . length <$> linesWith "tick" world)
+        passTime world 2000000 (elem "tick 2" <$> outLines world)
         -- the failure is latched, and published, whatever the retirement has reached
         status ← awaitStatus session (maybe False roleFailed . gameplayOf)
         statusStopping status `shouldBe` False
@@ -96,7 +96,7 @@ logicalFailure = describe "of the logical role after the start" $ do
         fmap rolePhase (gameplayOf retired) `shouldBe` Just Retired
         fmap roleFailed (gameplayOf retired) `shouldBe` Just True
         -- the presentation role goes on with its own services, and the logical role is granted nothing more
-        nudge world 5000000
+        advanceClock world 5000000
         passTime world 1000000000 (elem "ui update" <$> outLines world)
         -- the probe is told after the grant commits, and what the tick did can be seen before that: wait for it
         awaitPoint recorder (GrantIssued 2)
@@ -322,7 +322,7 @@ otherFailures = describe "that end the whole session" $ do
       outcome ← runScenario env $ \session → do
         awaitPhase session Gameplay Running
         awaitPhase session Presentation Running
-        nudge world 1000000000
+        nudgeArmed world 1000000 1000000000
         status ← awaitStatus session (maybe False roleFailed . presentationOf)
         statusStopping status `shouldBe` True
         fmap roleFailed (gameplayOf status) `shouldBe` Just False
@@ -347,7 +347,7 @@ otherFailures = describe "that end the whole session" $ do
       let world = seWorld env
       outcome ← runScenario env $ \session → do
         awaitPhase session Presentation Running
-        nudge world 1000000000
+        nudgeArmed world 1000000 1000000000
         void (awaitRetired session)
       outVerdict outcome `shouldBe` VerdictFailure
       fmap rfRole (outFailures outcome) `shouldBe` [Presentation]
@@ -422,8 +422,14 @@ hostFailures = describe "of the host" $ do
         (addFile ("lua/boom.bin", "x") (setup entry)) {suReader = injectedDefect ["lua/boom.bin"] (userError "the pool's reader failed")}
         $ \env → do
           let world = seWorld env
+              probe = ssProbeOf env
+          -- the faulty read is held at the pool's gate until both roles are running, so that it cannot fail the session first
+          closeGate probe "lua/boom.bin"
           outcome ← runScenario env $ \session → do
+            awaitPhase session Gameplay Running
             awaitPhase session Presentation Running
+            awaitReadOf env "lua/boom.bin"
+            openGate probe "lua/boom.bin"
             void (awaitRetired session)
           out ← outLines world
           out `shouldSatisfy` elem "shutdown presentation stopped"
@@ -441,7 +447,7 @@ hostFailures = describe "of the host" $ do
         failSinkOn world "ui update"
         outcome ← runScenario env $ \session → do
           awaitPhase session Presentation Running
-          nudge world 1000000000
+          nudgeArmed world 1000000 1000000000
           void (awaitRetired session)
         -- the output failed: nothing more is written through it, the stopped role's shutdown line included
         out ← outLines world
@@ -549,7 +555,7 @@ hostFailures = describe "of the host" $ do
           awaitRegistration world 1000
           passTime world 1000000 (elem "suspended" <$> outLines world)
           -- the second tick falls due: the driver raises at the grant, with a coroutine suspended in a failing close
-          nudge world 1000000
+          nudgeArmed world 1000 1000000
           void (awaitStatus session statusStopping)
         -- what the driver raised is what the call raises, with the owner's retained cleanup beside it, once
         raisedMessage ended `shouldSatisfy` Text.isInfixOf "the driver failed"
@@ -573,7 +579,7 @@ hostFailures = describe "of the host" $ do
           awaitPhase session Gameplay Running
           awaitRegistration world 1000
           passTime world 1000000 (elem "suspended" <$> outLines world)
-          nudge world 1000000
+          nudgeArmed world 1000 1000000
           awaitPoint recorder (GrantIntent 2)
           throwTo self ThreadKilled
           void (awaitStatus session statusStopping)
@@ -603,7 +609,7 @@ hostFailures = describe "of the host" $ do
                 awaitPhase session Gameplay Running
                 awaitRegistration world 1000
                 passTime world 1000000 (elem "suspended" <$> outLines world)
-                nudge world 1000000
+                nudgeArmed world 1000 1000000
                 awaitPoint recorder (GrantIntent 2)
                 atomically (writeTVar armed True)
                 throwTo self ThreadKilled
@@ -643,7 +649,7 @@ hostFailures = describe "of the host" $ do
                 awaitPhase session Gameplay Running
                 awaitRegistration world 1000
                 passTime world 1000000 (elem "suspended" <$> outLines world)
-                nudge world 1000000
+                nudgeArmed world 1000 1000000
                 void (awaitStatus session statusStopping)
               raisedMessage ended `shouldSatisfy` Text.isInfixOf "the driver failed"
               outcome ← outcomeNow session
@@ -793,7 +799,7 @@ releases = describe "the releases a role registered" $ do
         awaitPhase session Gameplay Running
         awaitPhase session Presentation Running
         awaitRegistration world 1000
-        passTime world 2000000 ((>= 2) . length <$> linesWith "tick" world)
+        passTime world 2000000 (elem "tick 2" <$> outLines world)
         -- the logical role fails, retires; one of its releases fails; the whole session is then asked to stop
         void (awaitStatus session (maybe False ((== Retired) . rolePhase) . presentationOf))
       ended `shouldSatisfy` either (const False) (const True)

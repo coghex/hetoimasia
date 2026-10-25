@@ -260,7 +260,7 @@ classes = describe "with the logger held at" $ do
       _ ← runHeld (loggedBy held env) noHarness $ \session returning → whileHeld held $ do
         awaitEntered held "start gate opened"
         awaitRegistration world 1000
-        passTime world 3000000 ((>= 3) . length . filter (Text.isPrefixOf "update gameplay") <$> outLines world)
+        passTime world 3000000 (elem "update gameplay 3" <$> outLines world)
         passTime world 1000000000 (any (Text.isPrefixOf "update presentation") <$> outLines world)
         isHeld held `shouldReturn` True
         requestStop session StopQuit
@@ -671,9 +671,11 @@ controls = describe "with a protection removed (a negative control)" $ do
           awaitEntered held "start gate opened"
           requestStop session StopQuit
           -- both owners have stopped and run their shutdowns, and the driver, in the sink, has accounted neither
-          out ← awaitOutputLines world 4
-          out `shouldSatisfy` elem "shutdown gameplay stopped"
-          out `shouldSatisfy` elem "shutdown presentation stopped"
+          -- (the owners' own lines say it: nothing in the state does, the driver being in the sink)
+          let awaitShutdowns = do
+                out ← outLines world
+                if "shutdown gameplay stopped" `elem` out && "shutdown presentation stopped" `elem` out then pure () else yield >> awaitShutdowns
+          bounded awaitShutdowns
           status ← statusNow session
           retiredBoth status `shouldBe` False
           letGo held
@@ -707,7 +709,7 @@ controls = describe "with a protection removed (a negative control)" $ do
           requestStop session StopQuit
           -- both notes of the start were written by the time the call is about to cut the diagnostics off
           awaitPoint recorder CuttingOff
-          bounded . atomically $ readTVar (heldAll held) >>= \attempted → when (length attempted < 2) retry
+          bounded . atomically $ readTVar (heldAll held) >>= \attempted → when (not (all (`elem` attempted) ["session starting", "start gate opened"])) retry
           releaseHold recorder CuttingOff
         undelivered outcome `shouldSatisfy` elem "session starting"
 

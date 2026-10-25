@@ -46,7 +46,7 @@ fullCapacity = describe "with every place taken" $ do
           -- the first refresh asks until the places are full, each request held in the pool
           passTime world 1000000000 (any (Text.isPrefixOf "filled") <$> outLines world)
           -- the second refresh is parked in its output while the session is stopped, repeatedly, from several threads
-          nudge world 1000000000
+          nudgeArmed world 1000000 1000000000
           awaitSinkEntered world "second"
           done ← newEmptyMVar
           replicateM_ 4 . forkIO $ do

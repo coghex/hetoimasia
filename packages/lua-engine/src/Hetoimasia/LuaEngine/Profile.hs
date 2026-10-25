@@ -8,7 +8,8 @@
 -- ('profileSpec' of 'fixedM1Profile') and passing it to 'validateProfile',
 -- which refuses a value that is not positive, a value above the fixed ceiling
 -- (so a profile can only shrink), a derived product that does not fit 64 bits,
--- and a relation that does not hold. Nothing is clamped.
+-- a value below the least the engine's own schema, format and crossings need
+-- of it, and a relation that does not hold. Nothing is clamped.
 --
 -- Every limit is one constructor of 'ByteLimit', 'CountLimit' or
 -- 'DurationLimit'; read it with 'bytesLimit', 'countLimit' or 'durationLimit'.
@@ -36,6 +37,29 @@ module Hetoimasia.LuaEngine.Profile
   , ProfileError (..)
   , Relation (..)
   , DerivedValue (..)
+
+    -- * The least each limit may be
+  , minimumBytes
+  , minimumCount
+  , minimumDuration
+  , schemaWordsBytes
+  , minimumInstanceIdBytes
+  , minimumPrintWarnBytes
+  , minimumCopiedValueBytes
+  , minimumContextBytes
+
+    -- * The facade's format
+  , codeWords
+  , stageWords
+  , roleWords
+  , warnLead
+  , contentLead
+  , instanceLead
+  , moduleLead
+  , warnEnd
+  , moduleLabelBytes
+  , contentIdBytes
+  , bytesOfText
 
     -- * Specifications
   , ProfileSpec (..)
@@ -66,4 +90,5 @@ module Hetoimasia.LuaEngine.Profile
   ) where
 
 import Hetoimasia.LuaEngine.Profile.Limits
+import Hetoimasia.LuaEngine.Profile.Minimum
 import Hetoimasia.LuaEngine.Profile.Validate

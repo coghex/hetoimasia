@@ -27,7 +27,7 @@ import Test.LuaRuntime.Instance.Lease.Support
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (awaitDiagnostics, awaitEffect, awaitEntered, awaitIdle, awaitScheduledTerminal, blockOn, defaultSchedulerBounds, releaseGate, setClockHook)
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (bounded, Broken (Broken), brokenIs, expectFatal, failExample, optionalPolicy, requiredPolicy, tryExpected, withBoundary)
+import Test.LuaRuntime.Support (awaitBlockedOnSTM, bounded, Broken (Broken), brokenIs, expectFatal, failExample, optionalPolicy, requiredPolicy, tryExpected, withBoundary)
 
 -- | What a wait ended with, failing if it raised.
 answer ∷ PendingWait → IO AccountingWait
@@ -156,7 +156,9 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         atomically (writeTVar wanted False)
         answered ← newEmptyMVar
         atomically (watchScheduledAccounting owner)
-        _ ← forkIO (awaitSupervised control parts >>= putMVar answered)
+        waiter ← forkIO (awaitSupervised control parts >>= putMVar answered)
+        -- the wait is parked in its transaction, and has not answered: the retirement is still owed
+        bounded (awaitBlockedOnSTM waiter)
         tryReadMVar answered >>= (`shouldBe` Nothing)
         completeRetirement fixture "async-res"
         takeMVar answered >>= (`shouldBe` Right AccountingComplete)

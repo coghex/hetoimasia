@@ -109,10 +109,16 @@ spec = describe "evidence" $ do
   it "ranks an interruption over a normal quit when both are asked, whichever comes first" $
     mapM_
       ( \order → withSetup (setup (roleScript printScript)) $ \env → do
-          outcome ← runScenario env $ \session → do
+          recorder ← newRecorder
+          holdAt recorder CuttingOff
+          outcome ← runScenarioWith env (recordingHarness recorder noHarness) $ \session → do
             awaitPhase session Gameplay Running
             awaitPhase session Presentation Running
             mapM_ (requestStop session) order
+            -- every role has retired and the call is about to cut the diagnostics off: both requests have committed, and the
+            -- outcome the call returns is read after them
+            awaitPoint recorder CuttingOff
+            releaseHold recorder CuttingOff
           outVerdict outcome `shouldBe` VerdictInterrupted
           outQuit outcome `shouldBe` True
           outInterrupted outcome `shouldBe` True
@@ -573,7 +579,7 @@ histories = describe "the history a settlement proves" $ do
         failSinkOn world "ui update"
         (_, session) ← runCaught env noHarness $ \_ session → do
           awaitPhase session Presentation Running
-          nudge world 1000000000
+          nudgeArmed world 1000000 1000000000
           void (awaitRetired session)
         unsafe ← historyOfKey session (InstanceKey Presentation 0)
         fmap ifInitialized unsafe `shouldBe` Just True

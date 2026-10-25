@@ -57,7 +57,7 @@ logical = describe "the logical clock" $ do
         awaitPhase session Gameplay Running
         awaitRegistration world 1000
         -- three ticks of wall time pass at once: three ticks are granted, not one stretched tick
-        passTime world 3000000 ((>= 3) . length <$> linesWith "tick" world)
+        passTime world 3000000 (elem "tick 3 dt 0.001000000" <$> outLines world)
         out ← linesWith "tick" world
         take 3 out `shouldBe` ["tick 1 dt 0.001000000", "tick 2 dt 0.001000000", "tick 3 dt 0.001000000"]
         -- the probe is told after the grant commits, and the tick's output can be seen before that: wait for it
@@ -80,7 +80,7 @@ logical = describe "the logical clock" $ do
         advanceClock world 4000000
         fireTimers world
         releaseSink world
-        pumpUntil world ((>= 5) . length <$> linesWith "tick" world)
+        pumpUntil world (elem "tick 5 dt 0.001000000" <$> outLines world)
         out ← linesWith "tick" world
         map (Text.takeWhile (/= ' ') . Text.drop 5) (take 5 out) `shouldBe` ["1", "2", "3", "4", "5"]
         requestStop session StopQuit
@@ -100,7 +100,7 @@ logical = describe "the logical clock" $ do
         awaitRegistration world 1000
         out ← linesWith "tick" world
         out `shouldBe` []
-        passTime world 1000000 ((>= 1) . length <$> linesWith "tick" world)
+        passTime world 1000000 (elem "tick 1 dt 0.001000000" <$> outLines world)
         out' ← linesWith "tick" world
         take 1 out' `shouldBe` ["tick 1 dt 0.001000000"]
         requestStop session StopQuit
@@ -118,7 +118,7 @@ logical = describe "the logical clock" $ do
         awaitPhase session Gameplay Running
         advanceClock world 5000000
         -- five ticks of the time that passed since the gate opened are owed, each granted by itself, with the logger held
-        passTime world 1000000 ((>= 5) . length <$> linesWith "tick" world)
+        passTime world 1000000 (elem "tick 5 dt 0.001000000" <$> outLines world)
         out ← linesWith "tick" world
         take 5 out `shouldBe` ["tick 1 dt 0.001000000", "tick 2 dt 0.001000000", "tick 3 dt 0.001000000", "tick 4 dt 0.001000000", "tick 5 dt 0.001000000"]
         requestStop session StopQuit
@@ -225,7 +225,7 @@ interleaving = describe "two admitted instances" $ do
         void . runScenario env $ \session → do
           awaitPhase session Gameplay Running
           awaitRegistration world 1000
-          passTime world 1000000 ((>= 4) . length <$> outLines world)
+          passTime world 1000000 (elem "b inst-2 1" <$> outLines world)
           out ← outLines world
           take 4 out `shouldBe` ["a inst-1 1", "a inst-2 1", "b inst-1 1", "b inst-2 1"]
           requestStop session StopQuit
@@ -290,8 +290,7 @@ limits = describe "arithmetic at the limits" $ do
         awaitRegistration world 1000
         passTime world 1000000 (elem "tick 9223372036854775807 dt 0.001000000" <$> outLines world)
         -- the next tick is past what a Lua integer holds: the clock offers it, and the session ends
-        advanceClock world 1000000
-        fireTimers world
+        passTime world 1000000 (retiredBoth <$> statusNow session)
         void (awaitRetired session)
       out ← linesWith "tick" world
       out `shouldBe` ["tick 9223372036854775807 dt 0.001000000"]

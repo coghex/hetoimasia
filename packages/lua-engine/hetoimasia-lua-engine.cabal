@@ -55,6 +55,7 @@ library
         Hetoimasia.LuaEngine.Manifest.Types
         Hetoimasia.LuaEngine.Profile.Fixed
         Hetoimasia.LuaEngine.Profile.Limits
+        Hetoimasia.LuaEngine.Profile.Minimum
         Hetoimasia.LuaEngine.Profile.Validate
     build-depends:
         base >=4.22 && <4.23,
