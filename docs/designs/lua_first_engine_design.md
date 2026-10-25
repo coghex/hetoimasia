@@ -3029,6 +3029,34 @@ alternative inside its one lifecycle transaction, at lower priority than stops
 and role steps. This records scope only, not implementation correctness or
 readiness.
 
+### D-87. Write diagnostics through a session-owned writer; abandon a stuck sink at teardown
+
+**Delivery:** LFE-13 / #527 / PR #567; amends D-82 T4 (diagnostic sink contract).
+
+Owner answer, **2026-10-25 00:29 UTC**, directly to `het-manager`, verbatim
+choice:
+
+> Abandon and record (Recommended)
+
+Authenticated relay: `het-manager`, message `hhrg5jgakznmv3sj4n7wjjmgps` in `#hetoimasia`.
+
+Context: PR #567's review found that the single session driver wrote each
+diagnostic to the sink itself, so a sink that blocked also blocked stop,
+accounting and retirement. That is contrary to D-82's rule that diagnostics
+never gate lifecycle.
+
+Decision: diagnostics are written by a **dedicated writer thread owned by the
+session**, registered and torn down as D-82 requires. It drains the session's
+pending-diagnostics queue, so the driver only enqueues and never waits on the
+sink. At teardown, after retirement is published, a writer still blocked in the
+sink is **abandoned**: it is cancelled and not waited for. Every diagnostic not
+delivered is **recorded** in the session's bounded failure/evidence record as an
+undelivered-diagnostics entry (a count plus the first entries within the
+record's bound), never dropped silently. A sink failure or cancellation is
+evidence, never the session's primary failure. Lifecycle (stop, accounting,
+retirement, the session's return) never waits on the sink. D-82's other rules
+are unchanged.
+
 ## Proposals
 
 **Scope precedence:** D-41 supersedes the original state-store agenda. Accepted
