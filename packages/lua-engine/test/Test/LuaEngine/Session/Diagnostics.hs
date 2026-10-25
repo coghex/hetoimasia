@@ -18,13 +18,14 @@
 -- writer, as it did).
 module Test.LuaEngine.Session.Diagnostics (spec) where
 
-import Control.Concurrent (forkIO, killThread, myThreadId, throwTo)
+import Control.Concurrent (forkIO, killThread, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (MVar, isEmptyMVar, newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
-import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, finally, fromException, mask, onException, throwIO, toException, try, tryWithContext, uninterruptibleMask_)
+import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, displayException, finally, fromException, mask, onException, throwIO, toException, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (void, when)
 import Data.Text (Text)
 import qualified Data.Text as Text
+import GHC.Conc (getUncaughtExceptionHandler, setUncaughtExceptionHandler)
 import Hetoimasia.Foundation.Log (LogEntry (entryMessage), Logger, callbackSink, defaultLogFilter, mkLogger)
 import Test.Hspec
 import Test.LuaEngine.Modules.Support (closeGate, openEverything, openGate)
@@ -37,6 +38,7 @@ spec = describe "diagnostics" $ do
   failing
   free
   construction
+  machine
   controls
 
 -- | A logger whose sink holds the write of each entry with one of these messages until it is let go, and then, if told
@@ -49,6 +51,8 @@ data Held = Held
   -- ^ Every message whose write has begun, newest first.
   , heldGate ∷ !(TVar Bool)
   , heldFails ∷ !(TVar Bool)
+  , heldAsync ∷ !(TVar Bool)
+  -- ^ A failure raises an exception of an asynchronous type: the sink's own cancellation.
   }
 
 holding ∷ [Text] → IO Held
@@ -64,6 +68,7 @@ holdingWith uninterruptibly messages = do
   everything ← newTVarIO []
   gate ← newTVarIO True
   fails ← newTVarIO False
+  asynchronously ← newTVarIO False
   let wait = atomically (readTVar gate >>= \held → when held retry)
       sink entry = do
         atomically (modifyTVar' everything (entryMessage entry :))
@@ -71,8 +76,9 @@ holdingWith uninterruptibly messages = do
           atomically (modifyTVar' entered (entryMessage entry :))
           if uninterruptibly then uninterruptibleMask_ wait else wait
           failing' ← readTVarIO fails
-          when failing' (throwIO (userError "the sink failed"))
-  pure (Held (mkLogger defaultLogFilter (callbackSink sink)) entered everything gate fails)
+          asynchronous ← readTVarIO asynchronously
+          when failing' (if asynchronous then throwIO ThreadKilled else throwIO (userError "the sink failed"))
+  pure (Held (mkLogger defaultLogFilter (callbackSink sink)) entered everything gate fails asynchronously)
 
 -- | A logger whose sink fails the write of each entry with one of these messages, at once.
 failingAt ∷ [Text] → IO Held
@@ -80,6 +86,23 @@ failingAt messages = do
   held ← holding messages
   atomically (writeTVar (heldGate held) False >> writeTVar (heldFails held) True)
   pure held
+
+-- | A logger whose sink is cancelled, as if by someone else (an exception of an asynchronous type), for each entry with
+-- one of these messages, at once.
+cancellingAt ∷ [Text] → IO Held
+cancellingAt messages = do
+  held ← failingAt messages
+  atomically (writeTVar (heldAsync held) True)
+  pure held
+
+-- | Run a body that is handed what the uncaught-exception handler was told about the diagnostics writer's abandonment, the
+-- handler being the process's and put back after.
+withUncaught ∷ (IO [Text] → IO a) → IO a
+withUncaught body = do
+  seen ← newTVarIO []
+  old ← getUncaughtExceptionHandler
+  setUncaughtExceptionHandler (\caught → atomically (modifyTVar' seen (Text.pack (displayException caught) :)))
+  body (filter (Text.isInfixOf "WriterAbandoned") <$> readTVarIO seen) `finally` setUncaughtExceptionHandler old
 
 -- | The session with this logger.
 loggedBy ∷ Held → SessionEnv → SessionEnv
@@ -298,10 +321,17 @@ classes = describe "with the logger held at" $ do
   it "the diagnostic of the closure when the caller is cancelled: the unwinding stops and retires the owners, the call returns with the sink held, and the write is cancelled once and recorded" $
     withSetup (setup (roleScript printScript)) $ \env → do
       held ← holding ["session stopping"]
-      (ended, session) ← runCaught (loggedBy held env) noHarness $ \driver session → (`onException` letGo held) $ do
+      recorder ← newRecorder
+      holdAt recorder CuttingOff
+      (ended, session) ← runCaught (loggedBy held env) (recordingHarness recorder noHarness) $ \driver session → (`onException` letGo held) $ do
         awaitPhase session Gameplay Running
         awaitPhase session Presentation Running
         throwTo driver ThreadKilled
+        -- every role has retired and the call is about to cut the diagnostics off: the writer is in the sink for the
+        -- closure's note, which the example has seen it enter
+        awaitPoint recorder CuttingOff
+        awaitEntered held "session stopping"
+        releaseHold recorder CuttingOff
       -- the cancellation is what was raised, and the call returned with the sink still holding the write
       raisedKilled ended `shouldBe` True
       isHeld held `shouldReturn` True
@@ -310,8 +340,10 @@ classes = describe "with the logger held at" $ do
       found ← outcomeNow session
       outRetired found `shouldBe` True
       undelivered found `shouldSatisfy` elem "session stopping"
+      deCause (outDiagnostics found) `shouldBe` Just "the caller was cancelled"
+      recorded recorder >>= \points → points `shouldSatisfy` elem (WriterCutOff True)
       -- the writer was cancelled where it was, with the sink still held: it ended, and the write is not written again
-      bounded (atomically (sessionDiagnosticsEnded session >>= \over → when (not over) retry))
+      awaitWriterEnd session
       isHeld held `shouldReturn` True
       letGo held
       timesEntered held "session stopping" `shouldReturn` 1
@@ -319,15 +351,21 @@ classes = describe "with the logger held at" $ do
   it "the final note: the call returns without it, retired, and the note is recorded undelivered" $
     withSetup (setup (roleScript printScript)) $ \env → do
       held ← holding ["session ended"]
-      outcome ← runHeld (loggedBy held env) noHarness $ \session returning → whileHeld held $ do
+      recorder ← newRecorder
+      holdAt recorder CuttingOff
+      outcome ← runHeld (loggedBy held env) (recordingHarness recorder noHarness) $ \session returning → whileHeld held $ do
         awaitPhase session Gameplay Running
         awaitPhase session Presentation Running
         requestStop session StopQuit
+        -- the writer is in the sink for the final note when the call cuts the diagnostics off
+        awaitPoint recorder CuttingOff
+        awaitEntered held "session ended"
+        releaseHold recorder CuttingOff
         void (awaitReturn returning)
         isHeld held `shouldReturn` True
       outRetired outcome `shouldBe` True
       outVerdict outcome `shouldBe` VerdictSuccess
-      undelivered outcome `shouldSatisfy` elem "session ended"
+      undelivered outcome `shouldBe` ["session ended"]
 
   it "the module coordinator's warning for a failure nobody waits for, written on the owner's own thread: the stops are handed at once and the peer role retires" $
     withSetup
@@ -407,11 +445,19 @@ failing = describe "with a sink that fails" $ do
     withSetup ((setup (roleScript printScript {scInit = [], scUpdate = ["error('boom')"]})) {suShape = GameplayAlone}) $ \env → do
       held ← failingAt ["role failed"]
       let world = seWorld env
-      outcome ← runScenario (loggedBy held env) $ \session → do
+      recorder ← newRecorder
+      holdAt recorder CuttingOff
+      outcome ← runScenarioWith (loggedBy held env) (recordingHarness recorder noHarness) $ \session → do
         awaitPhase session Gameplay Running
         awaitRegistration world 1000
         nudge world 1000000
         void (awaitRetired session)
+        -- the writer has met the sink's failure before the call cuts the diagnostics off
+        awaitPoint recorder CuttingOff
+        bounded . atomically $ do
+          found ← sessionOutcomeNow session
+          when (deSinkFailures (outDiagnostics found) == 0) retry
+        releaseHold recorder CuttingOff
       outVerdict outcome `shouldBe` VerdictFailure
       fmap rfRole (outFailures outcome) `shouldBe` [Gameplay]
       fmap eeCode (erPrimary (outEngine outcome)) `shouldBe` Just LuaError
@@ -476,6 +522,103 @@ construction = describe "the writer's start" $ do
       [point | point ← points, isBuilding point] `shouldBe` []
       readTVarIO (heldAll held) >>= \attempted → attempted `shouldSatisfy` all (`notElem` ["start gate opened"])
 
+-- The writer as a state machine -----------------------------------------------------------------------------------------
+
+-- | A session with a sink that fails, once, the write of the entry with this message, and a driver held at the cut-off until
+-- the writer has met the failure (or the cancellation): the whole session, both roles, started and then stopped.
+sinkFailureRun ∷ SessionEnv → Held → [Protection] → IO SessionOutcome
+sinkFailureRun env held removedProtections = do
+  recorder ← newRecorder
+  holdAt recorder CuttingOff
+  runScenarioWith (loggedBy held env) (recordingHarness recorder noHarness {harnessRemoved = removedProtections}) $ \session → do
+    awaitPhase session Gameplay Running
+    awaitPhase session Presentation Running
+    requestStop session StopQuit
+    void (awaitRetired session)
+    -- the writer has met the sink's failure before the call cuts the diagnostics off
+    awaitPoint recorder CuttingOff
+    bounded . atomically $ do
+      found ← sessionOutcomeNow session
+      when (deSinkFailures (outDiagnostics found) == 0) retry
+    releaseHold recorder CuttingOff
+
+-- | The states of the writer, and the transitions between them, each proved with the sink held or failed at a gate the
+-- example owns and synchronized on the sink's entry or exit; the table of them is in the pull request, and the controls
+-- below break each once.
+machine ∷ Spec
+machine = describe "the writer, transition by transition" $ do
+  it "writing → failed-undelivered: a write the sink raised for is kept, with its failure, and counted as undelivered in the exact record, with the ones meant after it; the writer writes no more" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      held ← failingAt ["start gate opened"]
+      outcome ← sinkFailureRun env held []
+      deSinkFailures (outDiagnostics outcome) `shouldBe` 1
+      undelivered outcome `shouldBe` ["start gate opened", "session stopping", "session ended"]
+      deUndelivered (outDiagnostics outcome) `shouldBe` 3
+      readTVarIO (heldAll held) >>= \attempted → reverse attempted `shouldBe` ["session starting", "start gate opened"]
+      outVerdict outcome `shouldBe` VerdictSuccess
+
+  it "writing → cancelled-undelivered: a write the sink's own cancellation ended is evidence and undelivered, the session goes on, and the writer ends" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      held ← cancellingAt ["start gate opened"]
+      outcome ← sinkFailureRun env held []
+      deSinkFailures (outDiagnostics outcome) `shouldBe` 1
+      deSinkFirst (outDiagnostics outcome) `shouldSatisfy` any (Text.isInfixOf "a diagnostic write was cancelled")
+      undelivered outcome `shouldBe` ["start gate opened", "session stopping", "session ended"]
+      outVerdict outcome `shouldBe` VerdictSuccess
+
+  it "writing → delivered: a write that returned is acknowledged, and not counted" $
+    withSetup (setup (roleScript printScript)) $ \env → do
+      held ← holding ["never"]
+      outcome ← runScenario (loggedBy held env) $ \session → do
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        bounded . atomically $ do
+          history ← sessionHistory session
+          when (any ((`elem` ["session starting", "start gate opened"]) . fst) (historyDiagnostics history)) retry
+        requestStop session StopQuit
+        void (awaitRetired session)
+      undelivered outcome `shouldSatisfy` all (`notElem` ["session starting", "start gate opened"])
+
+  it "idle-wait → abandoned: a writer that has written all it had is cut off while it waits, ends, and no exception escapes its thread" $
+    withSetup (setup (roleScript printScript)) $ \env → withUncaught $ \uncaught → do
+      held ← holding ["never"]
+      recorder ← newRecorder
+      holdAt recorder CuttingOff
+      outcome ← runHeld (loggedBy held env) (recordingHarness recorder noHarness) $ \session returning → whileHeld held $ do
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        requestStop session StopQuit
+        awaitPoint recorder CuttingOff
+        -- everything was written and acknowledged: the writer is idle, in its wait
+        bounded . atomically $ do
+          history ← sessionHistory session
+          when (not (null (historyDiagnostics history))) retry
+        releaseHold recorder CuttingOff
+        void (awaitReturn returning)
+        awaitWriterEnd session
+      undelivered outcome `shouldBe` []
+      deUndelivered (outDiagnostics outcome) `shouldBe` 0
+      uncaught >>= (`shouldBe` [])
+
+  it "delivered → abandoned: a writer cut off between two writes, parked on its own thread, is caught by the one handler, ends, and the diagnostics it never claimed are counted exactly" $
+    withSetup (setup (roleScript printScript)) $ \env → withUncaught $ \uncaught → do
+      held ← holding ["never"]
+      recorder ← newRecorder
+      holdAt recorder WriterBetween
+      outcome ← runHeld (loggedBy held env) (recordingHarness recorder noHarness) $ \session returning → whileHeld held $ do
+        -- the writer has acknowledged the first note and is parked before it waits for the next
+        awaitPoint recorder WriterBetween
+        awaitPhase session Gameplay Running
+        awaitPhase session Presentation Running
+        requestStop session StopQuit
+        void (awaitReturn returning)
+        awaitWriterEnd session
+        releaseHold recorder WriterBetween
+      -- none of the later diagnostics was ever claimed, and each is counted once
+      undelivered outcome `shouldBe` ["start gate opened", "session stopping", "session ended"]
+      deUndelivered (outDiagnostics outcome) `shouldBe` 3
+      uncaught >>= (`shouldBe` [])
+
 -- The negative controls -----------------------------------------------------------------------------------------------
 
 controls ∷ Spec
@@ -524,6 +667,74 @@ controls = describe "with a protection removed (a negative control)" $ do
           letGo held
           void (awaitReturn returning)
         outRetired outcome `shouldBe` True
+
+  describe "each transition of the writer broken once" $ do
+    it "acknowledgement removed (writing → delivered): what the sink wrote is counted as not delivered, which the example above detects" $
+      withSetup (setup (roleScript printScript)) $ \env → do
+        held ← holding ["never"]
+        recorder ← newRecorder
+        holdAt recorder CuttingOff
+        outcome ← runScenarioWith (loggedBy held env) (recordingHarness recorder noHarness {harnessRemoved = [ProtectAcknowledge]}) $ \session → do
+          awaitPhase session Gameplay Running
+          awaitPhase session Presentation Running
+          requestStop session StopQuit
+          -- both notes of the start were written by the time the call is about to cut the diagnostics off
+          awaitPoint recorder CuttingOff
+          bounded . atomically $ readTVar (heldAll held) >>= \attempted → when (length attempted < 2) retry
+          releaseHold recorder CuttingOff
+        undelivered outcome `shouldSatisfy` elem "session starting"
+
+    it "failure not kept (writing → failed-undelivered): the diagnostic the sink raised for is missing from the undelivered record, which the example above detects" $
+      withSetup (setup (roleScript printScript)) $ \env → do
+        held ← failingAt ["start gate opened"]
+        outcome ← sinkFailureRun env held [ProtectKeepFailed]
+        deSinkFailures (outDiagnostics outcome) `shouldBe` 1
+        undelivered outcome `shouldSatisfy` notElem "start gate opened"
+
+    it "the sink's own cancellation forgotten (writing → cancelled-undelivered): no evidence of it, which the example above detects" $
+      withSetup (setup (roleScript printScript)) $ \env → do
+        held ← cancellingAt ["start gate opened"]
+        recorder ← newRecorder
+        holdAt recorder CuttingOff
+        outcome ← runScenarioWith (loggedBy held env) (recordingHarness recorder noHarness {harnessRemoved = [ProtectCancelEvidence]}) $ \session → do
+          awaitPhase session Gameplay Running
+          awaitPhase session Presentation Running
+          requestStop session StopQuit
+          void (awaitRetired session)
+          awaitPoint recorder CuttingOff
+          -- the sink has been asked for the entry it cancelled
+          awaitEntered held "start gate opened"
+          awaitWriterEnd session
+          releaseHold recorder CuttingOff
+        deSinkFailures (outDiagnostics outcome) `shouldBe` 0
+
+    it "one handler removed (idle/writing/between → abandoned): the abandonment of a writer parked between two writes escapes its thread, which the example above detects" $
+      withSetup (setup (roleScript printScript)) $ \env → withUncaught $ \uncaught → do
+        held ← holding ["never"]
+        recorder ← newRecorder
+        holdAt recorder WriterBetween
+        _ ← runHeld (loggedBy held env) (recordingHarness recorder noHarness {harnessRemoved = [ProtectWriterCatch]}) $ \session returning → whileHeld held $ do
+          awaitPoint recorder WriterBetween
+          awaitPhase session Gameplay Running
+          awaitPhase session Presentation Running
+          requestStop session StopQuit
+          void (awaitReturn returning)
+          awaitWriterEnd session
+          releaseHold recorder WriterBetween
+        -- the exception reaches the process's handler on the writer's thread, a moment after the thread has ended
+        let awaitSeen = uncaught >>= \seen → when (null seen) (yield >> awaitSeen)
+        bounded awaitSeen
+        uncaught >>= \seen → seen `shouldSatisfy` (not . null)
+
+    it "registration removed (the cut-off finds the writer): no thread is found to cancel, which the example above detects" $
+      withSetup (setup (roleScript printScript)) $ \env → do
+        held ← holding ["start gate opened"]
+        recorder ← newRecorder
+        _ ← runHeld (loggedBy held env) (recordingHarness recorder noHarness {harnessRemoved = [ProtectWriterRegistration]}) $ \session returning → whileHeld held $ do
+          awaitEntered held "start gate opened"
+          requestStop session StopQuit
+          void (awaitReturn returning)
+        recorded recorder >>= \points → points `shouldSatisfy` elem (WriterCutOff False)
 
 -- | A point of construction: something of a role is being acquired or has been.
 isBuilding ∷ Point → Bool

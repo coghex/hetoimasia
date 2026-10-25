@@ -9,6 +9,8 @@ module Test.LuaEngine.Session.Model (spec) where
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), toException)
 import Control.Exception.Context (emptyExceptionContext)
 import Control.Monad ((<=<))
+import Data.Foldable (toList)
+import Data.List (find)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, listToMaybe)
 import qualified Data.Set as Set
@@ -952,7 +954,7 @@ diagnosticEvidence = describe "the diagnostics' evidence" $ do
     let said = notes 3
         (cut, _) = step (DiagCutOff "the cause") said
         identity = 0
-        late = foldl' (\state event → fst (step event state)) cut [DiagClaim identity, DiagDone identity, DiagInterrupt identity, DiagSinkFailed "late"]
+        late = foldl' (\state event → fst (step event state)) cut [DiagClaim identity, DiagDone identity, DiagInterrupt identity, DiagFailedWrite identity "late", DiagSinkFailed "late"]
         meant = fst (step (Note (Say SayInfo "after the cut-off" [])) cut)
     deUndelivered (stDiagEvidence meant) `shouldBe` deUndelivered (stDiagEvidence cut) + 1
     deUndeliveredFirst (stDiagEvidence meant) `shouldSatisfy` elem "after the cut-off"
@@ -979,6 +981,34 @@ diagnosticEvidence = describe "the diagnostics' evidence" $ do
         sunk = foldl' (\state n → fst (step (DiagSinkFailed (Text.pack (show n) <> Text.replicate 5000 "s")) state)) cut [1 .. 40 ∷ Int]
         evidence = stDiagEvidence sunk
     sum (map utf8Bytes (deSinkFirst evidence <> deUndeliveredFirst evidence <> maybe [] pure (deCause evidence))) `shouldSatisfy` (<= limitReport limits)
+
+  it "keeps a diagnostic the sink raised for, failed, with the failure in one commit, and counts it as undelivered at the cut-off exactly once" $ do
+    let said = notes 3
+        identity = case toList (stDiags said) of
+          first : _ → dgId first
+          [] → 0
+        claimed = fst (step (DiagClaim identity) said)
+        failedWrite = fst (step (DiagFailedWrite identity "the sink raised") claimed)
+        (cut, _) = step (DiagCutOff "the cause") failedWrite
+    -- the failure is evidence and the entry is kept, no longer pending and not outstanding
+    deSinkFailures (stDiagEvidence failedWrite) `shouldBe` 1
+    fmap dgState (find ((== identity) . dgId) (toList (stDiags failedWrite))) `shouldBe` Just DiagFailed
+    length (pendingDiagnostics failedWrite) `shouldBe` length (stDiags said) - 1
+    -- at the cut-off every entry, the failed one included, is counted once
+    deUndelivered (stDiagEvidence cut) `shouldBe` length (stDiags said)
+    deSinkFailures (stDiagEvidence cut) `shouldBe` 1
+    -- a failure that arrives after the cut-off, or for an entry that is not in flight, changes nothing
+    fst (step (DiagFailedWrite identity "late") cut) `shouldBe` cut
+    fst (step (DiagFailedWrite identity "never claimed") said) `shouldBe` said
+
+  it "detects a cut-off that forgets the entries nobody had claimed (a mutant of the transition)" $ do
+    let said = notes 5
+        claimed = fst (step (DiagClaim 0) said)
+        counted = deUndelivered . stDiagEvidence . fst . step (DiagCutOff "the cause")
+        forgetful state = length [diag | diag ← toList (stDiags state), dgState diag /= DiagPending]
+    -- the transition counts all five, pending included; the mutant counts one
+    counted claimed `shouldBe` 5
+    forgetful claimed `shouldBe` 1
 
   it "is not a failure of the session, and stops nothing, when a sink fails with nothing else wrong" $ do
     let sunk = fst (step (DiagSinkFailed "the sink failed") both)

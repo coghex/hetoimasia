@@ -127,6 +127,21 @@ data Protection
     -- cancelled and not waited for, and what it had not delivered is recorded. Removed, the call waits for the writer to
     -- write the queue, as it did, with the point 'WriterWait' before it waits.
     ProtectAbandon
+  | -- | A write the sink raised for is kept, with the failure, for the undelivered accounting, in one commit. Removed, it
+    -- is acknowledged like a success and the failure recorded beside it, so the diagnostic is lost to the count.
+    ProtectKeepFailed
+  | -- | A write that returned is acknowledged, and so is not counted. Removed, it is never acknowledged.
+    ProtectAcknowledge
+  | -- | A write the sink cancelled, when the session did not ask for it, is evidence. Removed, it is taken for the
+    -- session's own abandonment and forgotten.
+    ProtectCancelEvidence
+  | -- | One handler wraps the whole writer loop, so that its abandonment is caught wherever it lands: while the writer
+    -- waits, while it writes and between the two. Removed, only the write is protected, and an abandonment that lands
+    -- elsewhere escapes the thread to the uncaught-exception handler.
+    ProtectWriterCatch
+  | -- | The writer's thread is registered, in the step that starts it, for the cut-off to find. Removed, an idle writer
+    -- is never cancelled.
+    ProtectWriterRegistration
   deriving (Eq, Show)
 
 -- | The steps a role's VM is made in, and released in the opposite order.
@@ -182,6 +197,16 @@ data Point
     WriterStarting
   | -- | The diagnostics writer has been started and is registered: from here the session's end finds it and cuts it off.
     WriterStarted
+  | -- | The call has waited, if it was going to, and is about to cut the diagnostics off: the queue is closed, what was not
+    -- acknowledged is recorded, and the writer is cancelled. Holding the driver here lets an example see the writer in
+    -- the state it means to cut off.
+    CuttingOff
+  | -- | The writer is cut off: told once, on the caller's thread, with whether a registered writer thread was found to
+    -- cancel (false for a writer that was never started).
+    WriterCutOff !Bool
+  | -- | The writer has acknowledged a write and is about to wait for the next, on its own thread: the point between two
+    -- of its states.
+    WriterBetween
   | -- | Only with 'ProtectAbandon' removed: the call is about to wait, by itself, for the diagnostics writer to write the
     -- queue.
     WriterWait

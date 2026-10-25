@@ -1351,13 +1351,18 @@ forwardOne env diag = mask $ \restore → do
     then pure Unclaimed
     else
       tryWithContext @SomeException (restore (write (dgSay diag))) >>= \case
-        Right () → Forwarded <$ commit session (DiagDone (dgId diag))
+        -- (a negative control: a write that returned is never acknowledged, and so is counted as not delivered)
+        Right () → Forwarded <$ unless (removed env ProtectAcknowledge) (void (commit session (DiagDone (dgId diag))))
         Left failure
           | isAsync failure → WriteCancelled failure <$ commit session (DiagInterrupt (dgId diag))
           | otherwise → do
-              void (commit session (DiagDone (dgId diag)))
               text ← sinkFailureText "a diagnostic could not be written" failure
-              WriteFailed <$ commit session (DiagSinkFailed text)
+              -- one commit keeps the diagnostic, failed, for the undelivered accounting and records the failure
+              -- (a negative control acknowledges it like a success and records the failure beside it)
+              if removed env ProtectKeepFailed
+                then void (commit session (DiagDone (dgId diag))) >> void (commit session (DiagSinkFailed text))
+                else void (commit session (DiagFailedWrite (dgId diag) text))
+              pure WriteFailed
   where
     session = envSession env
     write (Say level message fields) = (case level of SayInfo → logInfo; SayError → logError) (sessionLogger session) sessionComponent message fields
@@ -1379,11 +1384,20 @@ driverWritesFor removedProtections = ProtectOffDriver `elem` removedProtections 
 driverWrites ∷ Env → Bool
 driverWrites = driverWritesFor . sessionRemoved . envSession
 
--- | The writer's body: one attempt at each diagnostic the queue holds, in order, until the writer is cut off. The sink is
--- called from here and nowhere else, so a sink that holds a write holds this thread and no other. After a sink failure,
--- or a cancellation the session did not ask for, the sink is not written again: what is meant later is left in the queue
--- to be recorded as undelivered. Nothing that happens here reaches the driver: the writer's end, failure or cancellation
--- is evidence at most, never an exception that propagates.
+-- | The writer's body: the states of a writer, as a machine with one exit through one handler.
+--
+-- * /idle/: wait for a pending diagnostic (an STM wait) or for the writer to be cut off;
+-- * /writing/: claim it and call the sink (the only call of the sink in a session);
+-- * /delivered/: the sink returned and the write was acknowledged, then /idle/ again;
+-- * /failed/: the sink raised: the diagnostic is kept, failed, and counted as undelivered at the cut-off, the failure is
+--   evidence, and the writer ends (the sink is written no more);
+-- * /cancelled/: the write was cancelled by someone but the session (the sink's own cancellation): the diagnostic is kept,
+--   interrupted, the cancellation is evidence, and the writer ends;
+-- * /abandoned/: the session cut the writer off, at any point (idle, writing, between two writes): it ends, and the
+--   cut-off has already recorded what was not acknowledged.
+--
+-- Nothing that happens here reaches the driver: the writer's end, failure or cancellation is evidence at most, never an
+-- exception that propagates (see 'writerThread', whose handler wraps this whole loop).
 writeQueued ∷ Env → IO ()
 writeQueued env = do
   next ← atomically $ do
@@ -1394,19 +1408,33 @@ writeQueued env = do
       (WriterOpen, Just diag) → pure (Just diag)
       (WriterOpen, Nothing) → retry
   forM_ next $ \diag →
-    tryWithContext @SomeException (forwardOne env diag) >>= \case
-      Right Forwarded → writeQueued env
-      Right Unclaimed → writeQueued env
-      Right WriteFailed → pure ()
-      Right (WriteCancelled cancelled) → do
+    forwardOne env diag >>= \case
+      Forwarded → probeAt env WriterBetween >> writeQueued env
+      Unclaimed → writeQueued env
+      WriteFailed → pure ()
+      WriteCancelled cancelled → do
         abandoned ← (== WriterClosed) <$> readTVarIO (wrPhase writer)
-        unless abandoned (record "a diagnostic write was cancelled" cancelled)
-      -- the only asynchronous exception this thread is thrown is the cut-off
-      Left defect | isAsync defect → pure ()
-      Left defect → record "the diagnostics writer failed" defect
+        -- (a negative control: a cancellation the sink raised is taken for the session's own and forgotten)
+        unless (abandoned || removed env ProtectCancelEvidence) (record "a diagnostic write was cancelled" cancelled)
   where
     writer = envWriter env
     record label caught = sinkFailureText label caught >>= void . commit (envSession env) . DiagSinkFailed
+
+-- | The writer's thread: one handler wraps the whole loop, so that the abandonment is caught wherever it lands (while the
+-- writer waits, while it writes, between the two), and an exception that is not the abandonment is evidence, never an
+-- exception that escapes the thread to the uncaught-exception handler (which would write to a standard stream).
+writerThread ∷ Env → (∀ x. IO x → IO x) → IO ()
+writerThread env unmask
+  -- (a negative control: no handler at the thread's boundary)
+  | removed env ProtectWriterCatch = unmask (writeQueued env)
+  | otherwise =
+      tryWithContext @SomeException (unmask (writeQueued env)) >>= \case
+        Right () → pure ()
+        -- the only asynchronous exception this thread is thrown is the cut-off
+        Left caught | isAsync caught → pure ()
+        Left caught → do
+          text ← sinkFailureText "the diagnostics writer failed" caught
+          void (commit (envSession env) (DiagSinkFailed text))
 
 -- | Start the session's writer, in the masked step that follows the installation of the outer continuation and precedes
 -- the first diagnostic. The thread runs unmasked (the write is interruptible), and records that it has ended however it
@@ -1417,8 +1445,9 @@ startWriter env = unless (driverWrites env) $ do
   probeAt env WriterStarting
   atomically (writeTVar (wrEnded writer) False)
   thread ← forkIOWithUnmask $ \unmask →
-    unmask (writeQueued env) `finally` atomically (writeTVar (wrEnded writer) True)
-  writeIORef (wrThread writer) (Just thread)
+    writerThread env unmask `finally` atomically (writeTVar (wrEnded writer) True)
+  -- (a negative control: the thread is not registered, and an idle writer is never found to be cancelled)
+  unless (removed env ProtectWriterRegistration) (writeIORef (wrThread writer) (Just thread))
   probeAt env WriterStarted
   where
     writer = envWriter env
@@ -1462,10 +1491,12 @@ abandonWriter env = do
     phase ← readTVar (wrPhase writer)
     writeTVar (wrPhase writer) WriterClosed
     pure (phase == WriterOpen)
-  when first $
-    readIORef (wrThread writer) >>= mapM_ (\thread → do
+  when first $ do
+    registered ← readIORef (wrThread writer)
+    boundary env (WriterCutOff (isJust registered))
+    forM_ registered $ \thread → do
       atomically (writeTVar (wrHelper writer) False)
-      void (forkIO (throwTo thread WriterAbandoned `finally` atomically (writeTVar (wrHelper writer) True))))
+      void (forkIO (throwTo thread WriterAbandoned `finally` atomically (writeTVar (wrHelper writer) True)))
   where
     writer = envWriter env
 
@@ -1584,9 +1615,10 @@ finish env restore result = do
         else unless cancelled (grace env)
       -- the cut-off: one commit closes the queue and records what was not acknowledged; then the writer is cancelled, and
       -- nothing waits for it
-      abandonWriter env
+      boundary env CuttingOff
       void . commit session . DiagCutOff $
         if cancelled then "the caller was cancelled" else "the session returned with the diagnostics writer still working"
+      abandonWriter env
   raiseRetained env
   atomically (outcomeOf <$> readTVar (sessionState session))
   where

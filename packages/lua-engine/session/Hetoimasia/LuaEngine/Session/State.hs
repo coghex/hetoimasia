@@ -237,7 +237,13 @@ data RoleState = RoleState
   deriving (Eq, Show)
 
 -- | Where a diagnostic is.
-data DiagState = DiagPending | DiagInFlight | DiagInterrupted
+data DiagState
+  = DiagPending
+  | DiagInFlight
+  | -- | The write was cancelled: the data stays and is not written again.
+    DiagInterrupted
+  | -- | The sink raised: the data stays and is not written again. Failed and interrupted entries are undelivered.
+    DiagFailed
   deriving (Eq, Show)
 
 -- | A diagnostic with a stable identity and its state, kept until it has finished.
@@ -366,10 +372,10 @@ retirable role state = case Map.lookup role (stRoles state) of
 pendingDiagnostics ∷ SessionState → [Diag]
 pendingDiagnostics state = [diag | diag ← toList (stDiags state), dgState diag == DiagPending]
 
--- | Whether any diagnostic is waiting to be written or is being written now. An interrupted one is neither: it is kept
--- as data and is not written again.
+-- | Whether any diagnostic is waiting to be written or is being written now. An interrupted or a failed one is neither:
+-- it is kept as data, counted as undelivered at the cut-off, and is not written again.
 diagnosticsOutstanding ∷ SessionState → Bool
-diagnosticsOutstanding state = any ((/= DiagInterrupted) . dgState) (toList (stDiags state))
+diagnosticsOutstanding state = any ((`elem` [DiagPending, DiagInFlight]) . dgState) (toList (stDiags state))
 
 -- Transitions ---------------------------------------------------------------------------------------
 
@@ -425,6 +431,9 @@ data Event
     -- and every cleanup failure attached to it or to a cancellation, each by the identity it had. Which of them
     -- are new is decided in the step.
     Account ![Evidence]
+  | -- | The sink raised for this diagnostic: one commit marks it failed, which keeps it for the undelivered accounting, and
+    -- records the failure as evidence (see 'DiagSinkFailed'). After the cut-off it changes nothing.
+    DiagFailedWrite !Int !Text
   | -- | A diagnostic could not be written, or its write was cancelled. It is evidence and never the session's failure,
     -- recorded without a diagnostic of its own, so a sink that always raises cannot make the session say more and more
     -- about it. The text carries the cleanup failures the sink's exception carried.
@@ -623,6 +632,12 @@ transition event state = case event of
     Just diag | dgState diag == DiagInFlight → quiet (setDiag identity DiagInterrupted state)
     _ → quiet state
   Account evidence → quiet (fst (accountEvidence Nothing evidence state))
+  DiagFailedWrite identity message
+    | stDiagClosed state → quiet state
+    | otherwise → case findDiag identity state of
+        Just diag | dgState diag == DiagInFlight →
+          quiet (setDiag identity DiagFailed state) {stDiagEvidence = noteSinkFailure (stLimits state) message (stDiagEvidence state)}
+        _ → quiet state
   DiagSinkFailed message
     | stDiagClosed state → quiet state
     | otherwise → quiet state {stDiagEvidence = noteSinkFailure (stLimits state) message (stDiagEvidence state)}
@@ -843,6 +858,7 @@ eventName = \case
   DiagDone _ → "DiagDone"
   DiagInterrupt _ → "DiagInterrupt"
   Account _ → "Account"
+  DiagFailedWrite _ _ → "DiagFailedWrite"
   DiagSinkFailed _ → "DiagSinkFailed"
   DiagCutOff _ → "DiagCutOff"
   EngineFault _ _ → "EngineFault"
