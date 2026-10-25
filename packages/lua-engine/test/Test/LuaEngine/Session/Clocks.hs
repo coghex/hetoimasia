@@ -60,6 +60,8 @@ logical = describe "the logical clock" $ do
         passTime world 3000000 ((>= 3) . length <$> linesWith "tick" world)
         out ← linesWith "tick" world
         take 3 out `shouldBe` ["tick 1 dt 0.001000000", "tick 2 dt 0.001000000", "tick 3 dt 0.001000000"]
+        -- the probe is told after the grant commits, and the tick's output can be seen before that: wait for it
+        awaitPoint recorder (GrantIssued 3)
         grants ← grantsIssued recorder
         take 3 grants `shouldBe` [1, 2, 3]
         requestStop session StopQuit

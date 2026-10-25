@@ -98,6 +98,8 @@ logicalFailure = describe "of the logical role after the start" $ do
         -- the presentation role goes on with its own services, and the logical role is granted nothing more
         nudge world 5000000
         passTime world 1000000000 (elem "ui update" <$> outLines world)
+        -- the probe is told after the grant commits, and what the tick did can be seen before that: wait for it
+        awaitPoint recorder (GrantIssued 2)
         grants ← grantsIssued recorder
         grants `shouldBe` [1, 2]
         ticks ← linesWith "tick" world
@@ -217,6 +219,8 @@ heldRetirement removedProtections =
         -- the first tick: the first instance fails, and the second, which holds the read, is ended with it
         nudge world 1000000
         void (awaitStatus session (maybe False roleFailed . gameplayOf))
+        -- the probe is told after the grant commits, and the owner's failure can be seen before that: wait for it
+        awaitPoint recorder (GrantIssued 1)
         -- the tick has finished and its accounting is awaited (in the control, by the driver by itself)
         if null removedProtections then pure () else awaitPoint recorder AccountingWait
         -- the presentation role goes on updating
