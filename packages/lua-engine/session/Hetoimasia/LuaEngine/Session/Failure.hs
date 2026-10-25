@@ -49,6 +49,8 @@ module Hetoimasia.LuaEngine.Session.Failure
   , emptyDiagEvidence
   , noteSinkFailure
   , noteUndelivered
+  , evidenceBytes
+  , primaryBytes
 
     -- * The engine report
   , EngineEntry (..)
@@ -290,10 +292,10 @@ fitRecord limits failure = foldl' (flip ($)) failure shrinkers
 
 -- | What became of the session's diagnostics, which is evidence and never the session's failure: a sink that raised or
 -- was cancelled, and the diagnostics that were not delivered when the session cut its writer off (a writer still blocked
--- in the sink is abandoned, not waited for), with the cause. Each list is an exact count and the first entries, cut
--- visibly to a summary's bound: at most 'limitSecondary' undelivered and half as many sink failures, so the record is
--- within 'limitReport' beside its cause (256 bytes). It takes no secondary-summary slot and no part of the report's
--- omitted count.
+-- in the sink is abandoned, not waited for), with the cause. The counts are exact. The texts are the first entries, and
+-- every one of them is paid for out of the same budget as the engine report, so that the whole record is within the
+-- profile's 'limitReport' for every validated profile: see 'evidenceShare'. It takes no secondary-summary slot and no part
+-- of the report's omitted count.
 data DiagEvidence = DiagEvidence
   { deSinkFailures ∷ !Int
   , deSinkFirst ∷ ![Text]
@@ -308,12 +310,33 @@ data DiagEvidence = DiagEvidence
 emptyDiagEvidence ∷ DiagEvidence
 emptyDiagEvidence = DiagEvidence 0 [] 0 [] Nothing
 
+-- | The bytes the engine report's first entry may keep: what is left of the report's bound once the secondary summaries
+-- are paid for, and never more than a record.
+primaryBytes ∷ FailureLimits → Int
+primaryBytes limits = min (limitRecord limits) (max 0 (limitReport limits - limitSecondary limits * limitSummary limits))
+
+-- | The bytes the diagnostics' evidence may keep in all: the report's bound less the most the engine report can keep (its
+-- first entry and every secondary summary). Zero for a profile whose summaries fill the report.
+evidenceBytes ∷ FailureLimits → Int
+evidenceBytes limits = max 0 (limitReport limits - (primaryBytes limits + limitSecondary limits * limitSummary limits))
+
+-- | How many texts of each kind the evidence keeps: the undelivered ones, the failed writes, and the cause.
+undeliveredEntries, sinkEntries ∷ FailureLimits → Int
+undeliveredEntries = limitSecondary
+sinkEntries limits = max 1 (limitSecondary limits `div` 2)
+
+-- | The bytes of one text of the evidence: the budget divided evenly between every text it can keep, so that the evidence
+-- is within its budget whatever order, and whatever mix, the texts arrive in. A text is cut visibly to it, or not kept at
+-- all (the count still is) when the share is nothing.
+evidenceShare ∷ FailureLimits → Int
+evidenceShare limits = evidenceBytes limits `div` (undeliveredEntries limits + sinkEntries limits + 1)
+
 -- | Account for one failed or cancelled write.
 noteSinkFailure ∷ FailureLimits → Text → DiagEvidence → DiagEvidence
 noteSinkFailure limits message evidence =
   evidence
     { deSinkFailures = deSinkFailures evidence + 1
-    , deSinkFirst = keepFirst limits (max 1 (limitSecondary limits `div` 2)) (deSinkFirst evidence) [message]
+    , deSinkFirst = keepFirst (entryBytes limits) (sinkEntries limits) (deSinkFirst evidence) [message]
     }
 
 -- | Account for the diagnostics not delivered, by message, and why. The count is exact; the first entries are kept.
@@ -321,14 +344,21 @@ noteUndelivered ∷ FailureLimits → Text → [Text] → DiagEvidence → DiagE
 noteUndelivered limits cause messages evidence =
   evidence
     { deUndelivered = deUndelivered evidence + length messages
-    , deUndeliveredFirst = keepFirst limits (limitSecondary limits) (deUndeliveredFirst evidence) messages
+    , deUndeliveredFirst = keepFirst (entryBytes limits) (undeliveredEntries limits) (deUndeliveredFirst evidence) messages
     , deCause = case deCause evidence of
-        Nothing | not (null messages) → Just (truncateText 256 cause)
+        Nothing | not (null messages), causeBytes limits > 0 → Just (truncateText (causeBytes limits) cause)
         kept → kept
     }
 
-keepFirst ∷ FailureLimits → Int → [Text] → [Text] → [Text]
-keepFirst limits room kept new = kept <> map (truncateText (limitSummary limits)) (take (max 0 (room - length kept)) new)
+-- | The bytes of an entry's text, and of the cause.
+entryBytes, causeBytes ∷ FailureLimits → Int
+entryBytes limits = min (limitSummary limits) (evidenceShare limits)
+causeBytes limits = min 256 (evidenceShare limits)
+
+keepFirst ∷ Int → Int → [Text] → [Text] → [Text]
+keepFirst bytes room kept new
+  | bytes <= 0 = kept
+  | otherwise = kept <> map (truncateText bytes) (take (max 0 (room - length kept)) new)
 
 -- The engine report -------------------------------------------------------------------------------
 
@@ -365,13 +395,12 @@ emptyReport = EngineReport Nothing [] 0
 -- summary's bound.
 noteEngine ∷ FailureLimits → EngineEntry → EngineReport → EngineReport
 noteEngine limits entry report = case erPrimary report of
-  Nothing → report {erPrimary = Just entry {eeMessage = truncateText primaryBytes (eeMessage entry)}}
+  Nothing → report {erPrimary = Just entry {eeMessage = truncateText (primaryBytes limits) (eeMessage entry)}}
   Just _
     | length (erSecondary report) < limitSecondary limits →
         report {erSecondary = erSecondary report <> [entry {eeMessage = truncateText (limitSummary limits) (eeMessage entry)}]}
     | otherwise → report {erOmitted = erOmitted report + 1}
   where
-    primaryBytes = min (limitRecord limits) (max 0 (limitReport limits - limitSecondary limits * limitSummary limits))
 
 -- | How many failures the report accounts for.
 reportAccounted ∷ EngineReport → Int

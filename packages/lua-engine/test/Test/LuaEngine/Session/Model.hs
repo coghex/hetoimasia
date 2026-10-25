@@ -20,12 +20,12 @@ import Data.Word (Word64)
 import Hetoimasia.Foundation.Resource (cleanupFailureId, cleanupFailuresInContext, composeCleanup)
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero, RequirePositive), Instant, durationFromNanoseconds, scriptedInstant)
 import Hetoimasia.LuaEngine.Manifest (Role (..))
-import Hetoimasia.LuaEngine.Profile (ByteLimit (RoleFailureRecordBytes), fixedM1Profile)
+import Hetoimasia.LuaEngine.Profile (ByteLimit (EngineReportBytes, RoleFailureRecordBytes, SecondarySummaryBytes), CountLimit (SecondarySummaries), Profile, fixedM1Profile)
 import Hetoimasia.LuaEngine.Session.Failure
 import Hetoimasia.LuaEngine.Session.Pacing
 import Hetoimasia.LuaEngine.Session.State
 import Test.Hspec
-import Test.LuaEngine.Request.Profiles (bytesOf)
+import Test.LuaEngine.Request.Profiles (bytesOf, smaller)
 
 spec ∷ Spec
 spec = describe "model" $ do
@@ -1010,11 +1010,79 @@ diagnosticEvidence = describe "the diagnostics' evidence" $ do
     counted claimed `shouldBe` 5
     forgetful claimed `shouldBe` 1
 
+  -- Every text the engine report and the diagnostics' evidence keep is paid for out of one bound, the profile's
+  -- EngineReportBytes, for every validated profile: the smallest legal one (every limit one) among them. One example for
+  -- each kind of text, each driven far past what it can keep, and one for all of them together.
+  mapM_
+    ( \(profileName, profile) →
+        mapM_
+          ( \(kind, events) →
+              it ("keeps every text of the report and the evidence within EngineReportBytes at " <> profileName <> ": " <> kind) $ do
+                let tight = failureLimitsOf profile
+                    drive = foldl' (\state event → fst (step event state)) (newSessionState tight [(Gameplay, 1), (Presentation, 1)])
+                    outcome = outcomeOf (drive (events tight))
+                    texts = reportTexts outcome
+                sum (map utf8Bytes texts) `shouldSatisfy` (<= limitReport tight)
+                -- the counts are exact whatever the texts could keep
+                deUndelivered (outDiagnostics outcome) `shouldBe` expectedUndelivered kind
+                deSinkFailures (outDiagnostics outcome) `shouldBe` expectedSinkFailures kind
+          )
+          kinds
+    )
+    evidenceProfiles
+
   it "is not a failure of the session, and stops nothing, when a sink fails with nothing else wrong" $ do
     let sunk = fst (step (DiagSinkFailed "the sink failed") both)
     outVerdict (outcomeOf sunk) `shouldBe` VerdictSuccess
     stStopping sunk `shouldBe` False
     stStops sunk `shouldBe` stStops both
+
+-- | The texts of the engine report and of the diagnostics' evidence an outcome keeps.
+reportTexts ∷ SessionOutcome → [Text]
+reportTexts outcome =
+  maybe [] (pure . eeMessage) (erPrimary (outEngine outcome))
+    <> map eeMessage (erSecondary (outEngine outcome))
+    <> deSinkFirst (outDiagnostics outcome)
+    <> deUndeliveredFirst (outDiagnostics outcome)
+    <> maybe [] pure (deCause (outDiagnostics outcome))
+
+-- | Validated profiles whose report is smaller and smaller, down to the smallest legal one.
+evidenceProfiles ∷ [(String, Profile)]
+evidenceProfiles =
+  [ ("the fixed profile", fixedM1Profile)
+  , ("a report of 1 KiB with four summaries of 128 bytes", smaller [(SecondarySummaries, 4)] [(EngineReportBytes, 1024), (SecondarySummaryBytes, 128)])
+  , ("a report of 100 bytes with three summaries of 20", smaller [(SecondarySummaries, 3)] [(EngineReportBytes, 100), (SecondarySummaryBytes, 20)])
+  , ("a report of 64 bytes with one summary of 64", smaller [(SecondarySummaries, 1)] [(EngineReportBytes, 64), (SecondarySummaryBytes, 64)])
+  , ("the smallest legal profile: a report of 1 byte with one summary of 1", smaller [(SecondarySummaries, 1)] [(EngineReportBytes, 1), (SecondarySummaryBytes, 1)])
+  ]
+
+-- | Each kind of text, and the events that drive it far past what it can keep (more than any count, each text larger
+-- than any bound).
+kinds ∷ [(String, FailureLimits → [Event])]
+kinds =
+  [ ("the undelivered diagnostics and their cause (before and after the cut-off)", \_ → notes 40 <> [DiagCutOff huge] <> notes 40)
+  , ("the sink failures", \_ → [DiagSinkFailed huge | _ ← [1 .. 40 ∷ Int]])
+  , ("the cause alone", \_ → notes 1 <> [DiagCutOff huge])
+  , ("the first entry of the engine report", \_ → [EngineFault Nothing (engineEntry HostFailure Nothing OnEngine huge)])
+  , ("the cleanup entries of the engine report", \_ → [EngineFault (Just Gameplay) (engineEntry CleanupFailure (Just Gameplay) OnCleanup huge) | _ ← [1 .. 40 ∷ Int]])
+  , ("the secondary summaries of the engine report", \_ → LatchFailure Gameplay (newRoleFailure LuaError OnUpdate Gameplay huge) [engineEntry CleanupFailure (Just Gameplay) OnCleanup huge | _ ← [1 .. 40 ∷ Int]] : [])
+  , ("all of them together", \_ → LatchFailure Gameplay (newRoleFailure LuaError OnUpdate Gameplay huge) [engineEntry CleanupFailure (Just Gameplay) OnCleanup huge | _ ← [1 .. 40 ∷ Int]] : [DiagSinkFailed huge | _ ← [1 .. 40 ∷ Int]] <> notes 40 <> [DiagCutOff huge] <> notes 40 <> [DiagSinkFailed huge])
+  ]
+  where
+    huge = Text.replicate 5000 "x"
+    notes n = [Note (Say SayInfo (Text.pack ("note " <> show i) <> huge) []) | i ← [1 .. n ∷ Int]]
+
+-- | How many diagnostics a kind leaves undelivered, and how many sink failures it records, exactly.
+expectedUndelivered, expectedSinkFailures ∷ String → Int
+expectedUndelivered kind
+  | kind `elem` ["the undelivered diagnostics and their cause (before and after the cut-off)"] = 80
+  | kind == "the cause alone" = 1
+  | kind == "all of them together" = 80 + 2
+  | otherwise = 0
+expectedSinkFailures kind
+  | kind == "the sink failures" = 40
+  | kind == "all of them together" = 40
+  | otherwise = 0
 
 -- Pacing ---------------------------------------------------------------------------------------------------------------------
 

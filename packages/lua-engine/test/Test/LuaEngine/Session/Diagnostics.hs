@@ -28,7 +28,9 @@ import qualified Data.Text as Text
 import GHC.Conc (getUncaughtExceptionHandler, setUncaughtExceptionHandler)
 import Hetoimasia.Foundation.Log (LogEntry (entryMessage), Logger, callbackSink, defaultLogFilter, mkLogger)
 import Test.Hspec
+import Hetoimasia.LuaEngine.Profile (ByteLimit (EngineReportBytes, SecondarySummaryBytes), CountLimit (SecondarySummaries))
 import Test.LuaEngine.Modules.Support (closeGate, openEverything, openGate)
+import Test.LuaEngine.Request.Profiles (smaller)
 import Test.LuaEngine.Session.Support
 import Test.Support.Bounded (bounded)
 
@@ -215,6 +217,21 @@ classes = describe "with the logger held at" $ do
     )
     [("interruptibly", holding, True), ("uninterruptibly", holdingUninterruptibly, False)]
 
+  it "a sink blocked at the smallest legal profile (a report of one byte, one summary of one byte): the counts are exact, no text is kept, and the record is within EngineReportBytes" $
+    withSetup ((setup (roleScript printScript)) {suProfile = smaller [(SecondarySummaries, 1)] [(EngineReportBytes, 1), (SecondarySummaryBytes, 1)]}) $ \env → do
+      held ← holding ["start gate opened"]
+      outcome ← runHeld (loggedBy held env) noHarness $ \session returning → whileHeld held $ do
+        awaitEntered held "start gate opened"
+        requestStop session StopQuit
+        void (awaitReturn returning)
+      -- the three diagnostics the held sink left are counted exactly, and the budget keeps none of their texts
+      deUndelivered (outDiagnostics outcome) `shouldBe` 3
+      undelivered outcome `shouldBe` []
+      deCause (outDiagnostics outcome) `shouldBe` Nothing
+      outRetired outcome `shouldBe` True
+      let kept = maybe [] (pure . eeMessage) (erPrimary (outEngine outcome)) <> map eeMessage (erSecondary (outEngine outcome)) <> deSinkFirst (outDiagnostics outcome) <> undelivered outcome <> maybe [] pure (deCause (outDiagnostics outcome))
+      sum (map Text.length kept) `shouldSatisfy` (<= 1)
+
   it "a sink blocked from before a failure, uninterruptibly: the failure is latched and published, the owner retired and the call returned without the gate opened" $
     withSetup ((setup (roleScript printScript {scInit = [], scUpdate = ["error('boom')"]})) {suShape = GameplayAlone}) $ \env → do
       held ← holdingUninterruptibly ["session starting"]
@@ -290,11 +307,16 @@ classes = describe "with the logger held at" $ do
     withSetup ((setup (roleScript printScript {scInit = [], scUpdate = ["error('boom')"]})) {suShape = GameplayAlone}) $ \env → do
       held ← holding ["role failed"]
       let world = seWorld env
-      outcome ← runHeld (loggedBy held env) noHarness $ \session returning → whileHeld held $ do
+      recorder ← newRecorder
+      holdAt recorder CuttingOff
+      outcome ← runHeld (loggedBy held env) (recordingHarness recorder noHarness) $ \session returning → whileHeld held $ do
         awaitPhase session Gameplay Running
         awaitRegistration world 1000
         nudge world 1000000
+        -- the call is about to cut the diagnostics off, and the writer is in the sink for the failure's note
+        awaitPoint recorder CuttingOff
         awaitEntered held "role failed"
+        releaseHold recorder CuttingOff
         void (awaitReturn returning)
         isHeld held `shouldReturn` True
       outcome `shouldSatisfy` ((== VerdictFailure) . outVerdict)
@@ -307,9 +329,14 @@ classes = describe "with the logger held at" $ do
       fatalSetup (setup (roleScript printScript {scPrelude = ["print('load')"]})) $ \env → do
         let world = seWorld env
         held ← holding ["session engine failure"]
+        recorder ← newRecorder
+        holdAt recorder CuttingOff
         failSinkOn world "load"
-        outcome ← runHeld (loggedBy held env) noHarness $ \_ returning → whileHeld held $ do
+        outcome ← runHeld (loggedBy held env) (recordingHarness recorder noHarness) $ \_ returning → whileHeld held $ do
+          -- the call is about to cut the diagnostics off, and the writer is in the sink for the engine failure's note
+          awaitPoint recorder CuttingOff
           awaitEntered held "session engine failure"
+          releaseHold recorder CuttingOff
           void (awaitReturn returning)
           isHeld held `shouldReturn` True
         outVerdict outcome `shouldBe` VerdictFailure

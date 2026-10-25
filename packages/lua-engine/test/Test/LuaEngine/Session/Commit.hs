@@ -197,6 +197,10 @@ effects = describe "the effects a commit owes" $ do
       outcome ← runScenario env' $ \session → do
         awaitPhase session Gameplay Running
         awaitPhase session Presentation Running
+        -- the writer has met the sink's failure before the session is stopped
+        bounded . atomically $ do
+          found ← sessionOutcomeNow session
+          when (deSinkFailures (outDiagnostics found) == 0) retry
         requestStop session StopQuit
         void (awaitRetired session)
       seen ← reverse <$> readTVarIO attempts

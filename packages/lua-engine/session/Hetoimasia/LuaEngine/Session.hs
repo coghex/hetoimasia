@@ -77,6 +77,7 @@ module Hetoimasia.LuaEngine.Session
   , roleWord
   , EngineEntry (..)
   , EngineReport (..)
+  , DiagEvidence (..)
   , History (..)
   , DiagState (..)
   , InstanceFact (..)

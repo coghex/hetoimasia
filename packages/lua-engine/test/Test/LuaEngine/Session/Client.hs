@@ -30,9 +30,10 @@ spec = describe "composition from outside the packages" $ do
         ByteString.writeFile (tree </> "root" </> "main.lua") entry
         (status, out, err) ← readCreateProcessWithExitCode (proc (clientDirectory outcome </> "client") [tree </> "root"]) ""
         (status, out) `shouldBe` (ExitSuccess, "init presentation\nshutdown presentation stopped\nVerdictSuccess\nretired: True\nfailures: 0\n")
-        -- the coordinator reports its lifecycle through the logger it was given, and nothing else is written
+        -- the coordinator reports its lifecycle through the logger it was given, and nothing else is written; the note of the
+        -- start was acknowledged before the session was stopped, and the last note ("session ended") may legally be left
+        -- undelivered when the session returns (D-87), so it is not required
         err `shouldContain` "msg=\"session starting\""
-        err `shouldContain` "msg=\"session ended\""
         err `shouldNotContain` "ERROR"
 
   it "keeps the handle's and the harness's fields out of a client's reach" $ do
@@ -118,6 +119,10 @@ composingClient =
     , "                case statusPresentation status of"
     , "                  Just role | rolePhase role == Running → pure ()"
     , "                  _ → retry"
+    , "              -- the note of the start is on the stream before the session is stopped: the call does not wait for the writer"
+    , "              atomically $ do"
+    , "                history ← sessionHistory session"
+    , "                if any ((== Text.pack \"session starting\") . fst) (historyDiagnostics history) then retry else pure ()"
     , "              requestStop session StopQuit"
     , "            putStrLn (show (outVerdict outcome))"
     , "            putStrLn (\"retired: \" <> show (outRetired outcome))"

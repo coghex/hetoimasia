@@ -451,6 +451,10 @@ callbacks = describe "the callback and the first diagnostic" $ do
       (ended, session) ← runCaught env' noHarness $ \_ session → do
         awaitPhase session Gameplay Running
         awaitPhase session Presentation Running
+        -- the writer has met the sink's failure before the session is stopped
+        bounded . atomically $ do
+          found ← sessionOutcomeNow session
+          when (deSinkFailures (outDiagnostics found) == 0) retry
         requestStop session StopQuit
         void (awaitRetired session)
       -- the failure is recorded, not raised, and it ended nothing: the writer is not the driver, so nothing waited for the
