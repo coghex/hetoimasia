@@ -573,7 +573,7 @@ as `test.glfw-wayland` does not: the compositor exists only on Linux, and no
 worker runs it elsewhere. `test.vulkan-native` is unchanged.
 
 `test.vulkan-lua-engine-native` is the Lua-first engine's graphics adapter on a
-real device with no window (LFE-17, #532). `tools/vulkan/run.sh native` runs one
+real device (LFE-17, #532; real windows, LFE-18, #533). `tools/vulkan/run.sh native` runs one
 component, and the window integration's suite is another component, so the
 adapter's real-device suite has a group of its own:
 
@@ -589,9 +589,13 @@ Hspec on another; the ambient Vulkan environment cleared; the diagnostic capture
 verdict after the last teardown; the run refuses to start without consent), with
 the consent, environment and qualified-loader checks reimplemented in the
 package because the repository forbids importing another component's spec
-helpers. It opens no window: its session is started without a surface, and on
-macOS the consent is the one the other native suites take, supplied on the run's
-own command. Its inputs name the adapter, the CPU Lua-engine closure it
+helpers. Its session is started without a surface, and its subgroup `window provider`
+(LFE-18) opens real visible windows on that session, so `--complete` opens windows: on
+Linux the runner starts its own isolated X11 display, and on macOS the consent is the
+one the other window-opening native suites take, supplied on the run's own command
+under the owner's standing approval; the windows appear on the desktop for the run.
+The 30-second watchdog is unchanged: the complete profile, windows included (eight
+examples), ran in about four seconds of wall time on the reference run. Its inputs name the adapter, the CPU Lua-engine closure it
 implements a port of (`packages/lua-engine/`, `packages/scripting-lua/`,
 `packages/content/`), the renderer, the window integration and the native
 backend, so a change to any of them selects it. `--complete` runs the whole

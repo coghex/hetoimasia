@@ -83,3 +83,25 @@ What a real coordinator cannot show here is a Lua role opening a window, because
 empty behavior, so a required-creation failure reaches the session through the provider's fatal endpoint, not through a role's
 required request (that record, `required_request` at stage `request`, is #527's policy for instances of its own VMs, and is
 asserted on the instance's failure in the composition examples, which carries `window_error`).
+
+## Round 3 and the owner's amendment
+
+Round 3 (head `3bc81fc0`) found three races, repaired: a request handed to the provider after its pump failed is recorded as
+terminal evidence (it would otherwise wait for a thread that is gone); the adoption recipe tolerates a window already taken
+apart and forgotten (the host may run a recipe it had claimed after the request settled); and a stop routing that raised is
+attempted once for that request (its number is recorded before the attempt). The fourth finding, a test where a session role's
+unread clean creation refusal produces the coordinator's `required_request`/`request` failure, cannot be written until LFE-21
+gives a role a way to call the window service: the delivered session installs its facade with no extra bindings or endpoints
+(`Session/Run.hs`, `installFacade facade [] [] base`). The owner deferred it to #536 (comments 6503374434 and 6503458006).
+
+Deferred to #536, by name: (a) the coordinator role-failure record (`required_request`, stage `request`) from a real session
+role, for an unread and for a caught clean creation refusal; (b) the startup-gate close case driven from such a role ("before
+root init returns", "while the startup gate is closed"); (c) the session escalation of a required creation failure from a real
+role. Proven here instead: a genuine native close routed to one idempotent session stop on a real `runSession`, with the
+records bank full, both while the setup is pending and after readiness; the take record and the instance-level required failure
+carrying `window_error` and attributed to the endpoint `window`; `cleanup_failure` and `host_failure` latched through the real
+coordinator; and the full race matrix over the gated port.
+
+Negative controls of round 3 (broken once, restored): adoption recipe throwing for an untracked window → 1 example failed;
+stop routing recorded after the attempt, and the late handoff recorded without terminal evidence → each hangs (the spin and the
+drain that wait forever are the defects), ended by the hard timeout; the unmutated code passes both in well under a second.
