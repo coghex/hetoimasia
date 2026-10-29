@@ -378,6 +378,9 @@ waits = describe "masking and waits" $ do
                 pumpUntil world (elem "init gameplay" <$> outLines world)
                 throwTo driver ThreadKilled
                 awaitPoint recorder (Awaiting Presentation)
+                -- the probe is told before the wait begins: the second cancellation is sent only once the driver is
+                -- observed parked in the wait itself (in its STM transaction, interruptibly or not)
+                awaitBlockedOnSTM driver
                 -- a second cancellation is sent while the wait is outstanding
                 thrower ← forkIO (throwTo driver ThreadKilled >> putMVar delivered ())
                 if interruptible
@@ -405,6 +408,8 @@ waits = describe "masking and waits" $ do
         pumpUntil world (elem "init gameplay" <$> outLines world)
         throwTo driver ThreadKilled
         awaitPoint recorder (Awaiting Presentation)
+        -- the probe is told before the wait begins: the driver is observed parked in the wait before it is interrupted
+        awaitBlockedOnSTM driver
         -- the wait is interrupted again and again, and is still the one outstanding wait: nothing of the held role is
         -- retired or released while its owner is held
         replicateM_ 3 (throwTo driver ThreadKilled)

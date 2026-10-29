@@ -75,8 +75,11 @@ holdingWith uninterruptibly messages = do
       sink entry = do
         atomically (modifyTVar' everything (entryMessage entry :))
         when (entryMessage entry `elem` messages) $ do
-          atomically (modifyTVar' entered (entryMessage entry :))
-          if uninterruptibly then uninterruptibleMask_ wait else wait
+          -- the signal is published from inside the region it announces: once an example has seen the entry, the writer
+          -- is already uninterruptibly masked (it cannot be cancelled before its gate wait begins)
+          (if uninterruptibly then uninterruptibleMask_ else id) $ do
+            atomically (modifyTVar' entered (entryMessage entry :))
+            wait
           failing' ← readTVarIO fails
           asynchronous ← readTVarIO asynchronously
           when failing' (if asynchronous then throwIO ThreadKilled else throwIO (userError "the sink failed"))
