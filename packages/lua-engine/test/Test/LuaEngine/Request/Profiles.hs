@@ -7,6 +7,7 @@ module Test.LuaEngine.Request.Profiles
   , bytesOf
   , smallestLegalSpec
   , smallestLegalProfile
+  , copiedLeast
   ) where
 
 import Data.Word (Word64)
@@ -46,6 +47,14 @@ smallestLegalSpec =
         Right duration → duration
         Left refused → error ("the least duration is not a duration: " <> show refused)
     }
+
+-- | The least the copied-value bound may be for a profile that keeps the fixed profile's failure bounds, given its
+-- bounds on an identity and on one @print@ or @warn@: the status record the failure bounds admit is what dominates.
+copiedLeast ∷ Int → Int → Word64
+copiedLeast idBytes printBytes =
+  fromIntegral (minimumCopiedValueBytes idBytes printBytes (failureTextBytes (bound MessageBytes) (bound TracebackBytes) idBytes (bound PathBytes) (bound RoleFailureRecordBytes)))
+  where
+    bound limit = let Bytes n = bytesLimit fixedM1Profile limit in fromIntegral n
 
 -- | The smallest legal profile, validated.
 smallestLegalProfile ∷ Profile

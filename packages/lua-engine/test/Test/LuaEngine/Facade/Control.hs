@@ -333,7 +333,7 @@ guardCalls = describe "state(...) and api.state(...)" $ do
       void (settledOf spawned)
       let who = Just (spId spawned)
       terminalsSeen world
-        >>= (`shouldBe` concat [[TerminalContext Gameplay stage (Just "modules-test") who, TerminalContext Gameplay stage (Just "modules-test") who] | stage ← [TerminalInit, TerminalUpdate, TerminalShutdown]])
+        >>= (`shouldBe` concat [[TerminalContext Gameplay stage (Just "modules-test") who Nothing, TerminalContext Gameplay stage (Just "modules-test") who Nothing] | stage ← [TerminalInit, TerminalUpdate, TerminalShutdown]])
       out ← outLines world
       out `shouldBe` [hook <> " " <> spelling <> " => false ; " <> phrase | hook ← ["init", "update", "shutdown"], spelling ← ["global", "api"]]
       -- one diagnostic is claimed across all six calls, and it is exactly the phrase
@@ -343,7 +343,7 @@ guardCalls = describe "state(...) and api.state(...)" $ do
       void (settledOf spawned)
       let who = Just (spId spawned)
       terminalsSeen world
-        >>= (`shouldBe` concat [[TerminalContext Presentation stage (Just "modules-test") who, TerminalContext Presentation stage (Just "modules-test") who] | stage ← [TerminalInit, TerminalShutdown]])
+        >>= (`shouldBe` concat [[TerminalContext Presentation stage (Just "modules-test") who Nothing, TerminalContext Presentation stage (Just "modules-test") who Nothing] | stage ← [TerminalInit, TerminalShutdown]])
       errLines world >>= (`shouldBe` [phrase])
   it "are reachable from an authored module's top level before any hook, with no instance invented, and from a module a hook has evaluated" $
     withWorld fixedM1Profile (Layout [("lua/main.lua", luaMain (tryPrelude <> topLevel)), ("lua/late.lua", luaMain (tryPrelude <> lateLevel))]) $ \world _ runtime →
@@ -352,7 +352,7 @@ guardCalls = describe "state(...) and api.state(...)" $ do
         awaitActive spawned
         -- the module the init asked for arrives on its own: wait for what it prints
         void (awaitOut world 3)
-        terminalsSeen world >>= (`shouldBe` [TerminalContext Presentation TerminalModule (Just "modules-test") Nothing, TerminalContext Presentation TerminalModule (Just "modules-test") Nothing])
+        terminalsSeen world >>= (`shouldBe` [TerminalContext Presentation TerminalModule (Just "modules-test") Nothing (Just "lua/main.lua"), TerminalContext Presentation TerminalModule (Just "modules-test") Nothing (Just "lua/late.lua")])
         outLines world >>= (`shouldBe` ["top state => false ; " <> phrase, "top is a function true", "late state => false ; " <> phrase])
         errLines world >>= (`shouldBe` [phrase])
   it "take precedence over every role, phase and arity rule, also through a facade another instance or a module kept and after a quit" $
@@ -365,10 +365,10 @@ guardCalls = describe "state(...) and api.state(...)" $ do
         out ← outLines world
         -- the second instance called the first one's facade: the guard is attributed to the instance that executed it
         terminalsSeen world
-          >>= (`shouldBe` [ TerminalContext Gameplay TerminalInit (Just "modules-test") (Just (spId first))
-                          , TerminalContext Gameplay TerminalInit (Just "modules-test") (Just (spId second))
-                          , TerminalContext Gameplay TerminalInit (Just "modules-test") (Just (spId second))
-                          , TerminalContext Gameplay TerminalModule (Just "modules-test") Nothing
+          >>= (`shouldBe` [ TerminalContext Gameplay TerminalInit (Just "modules-test") (Just (spId first)) Nothing
+                          , TerminalContext Gameplay TerminalInit (Just "modules-test") (Just (spId second)) Nothing
+                          , TerminalContext Gameplay TerminalInit (Just "modules-test") (Just (spId second)) Nothing
+                          , TerminalContext Gameplay TerminalModule (Just "modules-test") Nothing (Just "lua/late.lua")
                           ]
                       )
         out `shouldSatisfy` elem ("kept by the first, called by the second => false ; " <> phrase)
@@ -456,7 +456,7 @@ guardFailures = describe "the guard's latch and its diagnostic" $ do
           void (awaitEnded control fvm) `finally` (((,) <$> terminalsSeen world <*> readTVarIO (wSinkEntered world)) >>= writeIORef seen)
     (latched, handed) ← readIORef seen
     -- the terminal latch was asked for, once, before the sink was handed the line; the sink was handed it once; no retry
-    latched `shouldBe` [TerminalContext Presentation TerminalInit (Just "modules-test") (Just "inst-1")]
+    latched `shouldBe` [TerminalContext Presentation TerminalInit (Just "modules-test") (Just "inst-1") Nothing]
     handed `shouldBe` [phrase]
     Text.pack (show raised) `shouldSatisfy` Text.isInfixOf "OutputFailure"
   it "write nothing when the latch itself cannot be made: the failure is the host's and ends the owner whatever the script did with the stand-in error, and no diagnostic is claimed" $ do

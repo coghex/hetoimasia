@@ -231,19 +231,19 @@ bounds = describe "the bounds of a failure the coordinator publishes" $ do
 terminal ∷ Spec
 terminal = describe "the failure the unavailable-state guard latches" $ do
   it "carries code state_unavailable, the fixed message, the executing role and stage, and names a content and an instance only when an instance was running" $ do
-    terminalFailure (TerminalContext Presentation TerminalInit (Just "game") (Just "inst-2"))
+    terminalFailure (TerminalContext Presentation TerminalInit (Just "game") (Just "inst-2") Nothing)
       `shouldBe` (newRoleFailure StateUnavailable OnInit Presentation stateUnavailableMessage) {rfContent = Just "game", rfInstance = Just "inst-2"}
-    terminalFailure (TerminalContext Gameplay TerminalUpdate (Just "game") (Just "inst-1"))
+    terminalFailure (TerminalContext Gameplay TerminalUpdate (Just "game") (Just "inst-1") Nothing)
       `shouldBe` (newRoleFailure StateUnavailable OnUpdate Gameplay stateUnavailableMessage) {rfContent = Just "game", rfInstance = Just "inst-1"}
-    terminalFailure (TerminalContext Gameplay TerminalShutdown (Just "game") (Just "inst-1"))
+    terminalFailure (TerminalContext Gameplay TerminalShutdown (Just "game") (Just "inst-1") Nothing)
       `shouldBe` (newRoleFailure StateUnavailable OnShutdown Gameplay stateUnavailableMessage) {rfContent = Just "game", rfInstance = Just "inst-1"}
-  it "invents no instance for module-only work, and attributes nothing a facade did not know" $ do
-    terminalFailure (TerminalContext Gameplay TerminalModule (Just "game") Nothing)
-      `shouldBe` (newRoleFailure StateUnavailable OnModule Gameplay stateUnavailableMessage) {rfContent = Just "game"}
-    terminalFailure (TerminalContext Presentation TerminalModule Nothing Nothing)
+  it "invents no instance for module-only work, names the module's content and path when the loader knows them, and attributes nothing a facade did not know" $ do
+    terminalFailure (TerminalContext Gameplay TerminalModule (Just "game") Nothing (Just "lua/dep.lua"))
+      `shouldBe` (newRoleFailure StateUnavailable OnModule Gameplay stateUnavailableMessage) {rfContent = Just "game", rfPath = Just "lua/dep.lua"}
+    terminalFailure (TerminalContext Presentation TerminalModule Nothing Nothing Nothing)
       `shouldBe` newRoleFailure StateUnavailable OnModule Presentation stateUnavailableMessage
   it "is the fixed phrase, once spelled, and within every bound the state applies" $ do
     stateUnavailableMessage `shouldBe` "state service not available in this milestone"
-    let failure = terminalFailure (TerminalContext Presentation TerminalInit (Just "game") (Just "inst-2"))
+    let failure = terminalFailure (TerminalContext Presentation TerminalInit (Just "game") (Just "inst-2") Nothing)
     boundFailure (failureLimitsOf fixedM1Profile) failure `shouldBe` failure
     catMaybes [rfTraceback failure, rfPath failure] `shouldBe` []

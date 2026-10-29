@@ -43,7 +43,10 @@ import Control.Monad (when)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes)
 import Data.Text (Text)
+import qualified Data.Text.Encoding as Text
+import qualified Data.Text.Encoding.Error as Text
 import Data.Word (Word64)
+import Hetoimasia.Content.Identity (contentKeyPath, contentKeyRoot, logicalPathBytes, rootKeyBytes)
 import Hetoimasia.LuaEngine.Facade.Bindings
 import Hetoimasia.LuaEngine.Facade.Caller
   ( Calling (InInstance, InModule, Nowhere)
@@ -54,7 +57,9 @@ import Hetoimasia.LuaEngine.Facade.Caller
 import Hetoimasia.LuaEngine.Facade.Output (writeAuthored)
 import Hetoimasia.LuaEngine.Facade.Types
 import Hetoimasia.LuaEngine.Manifest (Role (..))
+import Hetoimasia.LuaEngine.Modules (identityKey)
 import Hetoimasia.Scripting.Lua.Instance (InstanceId (instanceLocal))
+import Hetoimasia.Scripting.Lua.Owner (ImportContext (importerIdentity), modulePhaseModule)
 import Hetoimasia.Scripting.Lua.Registration
   ( Binding
   , asynchronousNativeRequestIn
@@ -98,27 +103,45 @@ sessionBindings facade =
     -- the latch and the stop are already committed.
     unavailable context _ = do
       calling ← callingIn facade context
-      first ← endpointTerminal (fcSession facade) (terminalOf facade calling)
+      site ← terminalOf facade calling
+      first ← endpointTerminal (fcSession facade) site
       when first (writeAuthored (fcOutput facade) Stderr [stateUnavailableMessage])
       pure []
 
--- | What a guard call says about where it ran.
-terminalOf ∷ Facade → Calling → TerminalContext
+-- | What a guard call says about where it ran. An authored module's top level (an entry, or a dependency whose
+-- evaluation an import chain resumed) is named by the canonical identity the loader holds for the module whose code
+-- is running, never by the bounded label it prints: its root is the content and its path the source, with no
+-- instance. A hook names the instance and its content, and no path.
+terminalOf ∷ Facade → Calling → IO TerminalContext
 terminalOf facade = \case
   InInstance caller →
     let record = callerRecord caller
-     in TerminalContext
-          { terminalRole = recordRole record
-          , terminalStage = case callerStage caller of
-              StageInitializing → TerminalInit
-              StageServing → TerminalUpdate
-              StageEnding → TerminalShutdown
-          , terminalContent = Just (recordContent record)
-          , terminalInstance = Just (recordId record)
-          }
-  InModule _ → TerminalContext (fcRole facade) TerminalModule (soleRoot facade) Nothing
+     in pure
+          TerminalContext
+            { terminalRole = recordRole record
+            , terminalStage = case callerStage caller of
+                StageInitializing → TerminalInit
+                StageServing → TerminalUpdate
+                StageEnding → TerminalShutdown
+            , terminalContent = Just (recordContent record)
+            , terminalInstance = Just (recordId record)
+            , terminalPath = Nothing
+            }
+  InModule _ → do
+    running ← modulePhaseModule (fcPhase facade)
+    let key = running >>= identityKey (fcInventory facade) . importerIdentity
+    pure
+      TerminalContext
+        { terminalRole = fcRole facade
+        , terminalStage = TerminalModule
+        , terminalContent = maybe (soleRoot facade) (Just . lossy . rootKeyBytes . contentKeyRoot) key
+        , terminalInstance = Nothing
+        , terminalPath = lossy . logicalPathBytes . contentKeyPath <$> key
+        }
   -- A segment that is no instance's hook: the executing role's own serving code, with no instance to name.
-  Nowhere → TerminalContext (fcRole facade) TerminalUpdate (soleRoot facade) Nothing
+  Nowhere → pure (TerminalContext (fcRole facade) TerminalUpdate (soleRoot facade) Nothing Nothing)
+  where
+    lossy = Text.decodeUtf8With Text.lenientDecode
 
 -- | The content the VM serves when it serves exactly one (in M1 it always does).
 soleRoot ∷ Facade → Maybe Text

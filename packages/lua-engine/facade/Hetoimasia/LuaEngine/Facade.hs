@@ -181,13 +181,16 @@ import Hetoimasia.LuaEngine.Facade.Types
 import Hetoimasia.LuaEngine.Manifest (Role (..))
 import Hetoimasia.LuaEngine.Modules (Coordinator, ImportResolver, coordinatorEndpoint)
 import Hetoimasia.LuaEngine.Profile
-  ( ByteLimit (CopiedValueBytes, InstanceIdBytes, MessageBytes, PrintWarnBytes)
+  ( ByteLimit (CopiedValueBytes, InstanceIdBytes, MessageBytes, PathBytes, PrintWarnBytes, RoleFailureRecordBytes, TracebackBytes)
   , Bytes (Bytes)
   , Count (Count)
   , CountLimit (CopiedValueDepth, CopiedValueElements, InstancesPerVm, LuaIntegerMaximum)
   , Profile
   , bytesLimit
   , countLimit
+  , failureTextBytes
+  , minimumStatusDepth
+  , minimumStatusElements
   )
 import Hetoimasia.LuaEngine.Request (M1Requests, m1HandleType, m1Profile)
 import Hetoimasia.Scripting.Lua.Admission (callerInstance)
@@ -307,23 +310,35 @@ newFacade spec = case limits of
     machine name value
       | value <= fromIntegral (maxBound ∷ Int) = Right (fromIntegral value)
       | otherwise = Left (FacadeLimitNotRepresentable name)
-    -- The context record is also four elements and one level deep; the profile's own relations keep the element
-    -- bound at 12 or more (a scene of one sprite) and every bound positive, so neither can be below it.
     -- Every bound the facade formats with is checked against the least its own format needs, in this order,
     -- and the first that is below it is the refusal. A profile below one could not keep the format the facade
     -- promises (an identity that fits, a warning that names its writer on every line, a context the builder
-    -- can be handed), so no facade is made over it.
+    -- can be handed, a status record the host would not copy), so no facade is made over it. The profile's own
+    -- validation refuses each first ('LimitBelowMinimum'); this is the guard that no validated profile reaches.
     belowFormatting found =
       listToMaybe
         [ LimitBelowFormatting name given least
         | (name, given, least) ←
             [ ("InstanceIdBytes", limitInstanceIdBytes found, minimumInstanceIdBytes)
             , ("PrintWarnBytes", limitPrintBytes found, minimumPrintWarnBytes (limitInstanceIdBytes found))
-            , ("CopiedValueBytes", copiedBytes, minimumCopiedValueBytes (limitInstanceIdBytes found) (limitPrintBytes found))
+            , ("CopiedValueBytes", copiedBytes, minimumCopiedValueBytes (limitInstanceIdBytes found) (limitPrintBytes found) (failureTexts found))
+            , ("CopiedValueDepth", copiedDepth, minimumStatusDepth)
+            , ("CopiedValueElements", copiedElements, minimumStatusElements)
             ]
         , given < least
         ]
     copiedBytes = let Bytes n = bytesLimit profile CopiedValueBytes in fromIntegral (min n (fromIntegral (maxBound ∷ Int)))
+    copiedDepth = let Count n = countLimit profile CopiedValueDepth in fromIntegral (min n (fromIntegral (maxBound ∷ Int)))
+    copiedElements = let Count n = countLimit profile CopiedValueElements in fromIntegral (min n (fromIntegral (maxBound ∷ Int)))
+    -- the most text a failure in the status record can hold under this profile
+    failureTexts found =
+      failureTextBytes
+        (limitMessageBytes found)
+        (machineBytes TracebackBytes)
+        (limitInstanceIdBytes found)
+        (machineBytes PathBytes)
+        (machineBytes RoleFailureRecordBytes)
+    machineBytes limit = let Bytes n = bytesLimit profile limit in fromIntegral (min n (fromIntegral (maxBound ∷ Int)))
 
 -- | The VM's role.
 facadeRole ∷ Facade → Role

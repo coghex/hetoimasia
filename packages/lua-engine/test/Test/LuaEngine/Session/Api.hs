@@ -511,9 +511,24 @@ guardInSessions = describe "state(...) in a session" $ do
           rfMessage found `shouldBe` phrase
           rfInstance found `shouldBe` Nothing
           rfContent found `shouldBe` Just "modules-test"
+          -- the source is the entry module the guard ran in, as the loader's canonical identity names it
+          rfPath found `shouldBe` Just "lua/main.lua"
           rfTraceback found `shouldBe` Nothing
       out ← outLines (seWorld env)
       filter (Text.isPrefixOf "init ") out `shouldBe` []
+      errLines (seWorld env) `shouldReturn` [phrase]
+
+  it "from an imported dependency's top level names that dependency's path, not the entry that imported it" $
+    withSetup (addFile ("lua/dep.lua", luaMain ["pcall(state, 1)", "return {}"]) (setup (roleScript printScript {scPrelude = ["local dep = import('lua/dep.lua')"], scInit = [rolePrint "init"], scUpdate = [], scShutdown = []}))) $ \env → do
+      outcome ← runScenario env $ \session → void (awaitRetired session)
+      outVerdict outcome `shouldBe` VerdictFailure
+      case outTerminal outcome of
+        Nothing → expectationFailure "no terminal failure was latched"
+        Just found → do
+          rfStage found `shouldBe` OnModule
+          rfPath found `shouldBe` Just "lua/dep.lua"
+          rfContent found `shouldBe` Just "modules-test"
+          rfInstance found `shouldBe` Nothing
       errLines (seWorld env) `shouldReturn` [phrase]
 
   it "from an update, caught, ends the whole session after the segment that called it returns: no further update, no gateway for the logical role, one diagnostic, attributed to the presentation instance" $

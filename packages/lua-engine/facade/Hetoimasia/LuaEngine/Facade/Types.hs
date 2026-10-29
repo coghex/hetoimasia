@@ -163,12 +163,15 @@ data TerminalStage
   deriving (Eq, Show)
 
 -- | What the facade knows of a guard call, and all it says: the executing role and stage and, when an
--- instance was running, the content and the instance. A module-only call invents no instance.
+-- instance was running, the content and the instance; when an authored module's top level was running, the
+-- module's content and path, as the loader's canonical identity names them. A module-only call invents no
+-- instance, and a hook names no path (the failure of a hook has none).
 data TerminalContext = TerminalContext
   { terminalRole ∷ !Role
   , terminalStage ∷ !TerminalStage
   , terminalContent ∷ !(Maybe Text)
   , terminalInstance ∷ !(Maybe Text)
+  , terminalPath ∷ !(Maybe Text)
   }
   deriving (Eq, Show)
 

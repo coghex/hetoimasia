@@ -71,13 +71,15 @@ phaseWord = \case
   Retired → "retired"
 
 -- | The failure the unavailable-state guard latches, from where the guard ran: code @state_unavailable@, the
--- fixed message, the executing role and stage, and the content and instance only when an instance was
--- running. A module-only call names none, and no traceback is captured.
+-- fixed message, the executing role and stage, the content and instance when an instance was running, and the
+-- content and path of the module whose top level was running when one was. A module-only call names no instance,
+-- and no traceback is captured.
 terminalFailure ∷ TerminalContext → RoleFailure
 terminalFailure context =
   (newRoleFailure StateUnavailable stage (terminalRole context) stateUnavailableMessage)
     { rfContent = terminalContent context
     , rfInstance = terminalInstance context
+    , rfPath = terminalPath context
     }
   where
     stage = case terminalStage context of
