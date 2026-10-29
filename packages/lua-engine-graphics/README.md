@@ -210,6 +210,7 @@ content packages stay free of GLFW and Vulkan: everything here is this package's
 | `…Window.Provider` | The provider (`withWindowProvider`), the owner slots, the service, the endpoint, the state machine and its one pump, the main-thread step. |
 | `…Window.Host` | The production `Port`, over a running `VulkanHost`; yields `WindowTarget`, the right to publish a scene to one window's incarnation. |
 | `…Window.Configuration` | What the fixed two-window profile asks of the host (`configureWindows`, `checkWindowHost`). |
+| `…Window.Session` | `sessionWindowConfig`: the provider's stop and fatal endpoints as the real coordinator's (`requestStop … StopQuit`; `latchTerminalFailure` with `cleanup_failure` for a failure of retirement and `host_failure` otherwise, presentation role, engine stage). |
 
 ### Validation before anything is reserved
 
@@ -308,8 +309,12 @@ A synchronous failure of an effect the pump ran (an issue, a close, a stop routi
 acquisition is recorded as unretryable, exactly as a failed retirement is (evidence kept once, slot kept, drained through the
 protected host), and the fault is handed to the session once. An acquisition in that state is terminal for the pump, so the
 worker can stop; a fault latched during an otherwise orderly run is still raised by the scope's exit. When the host's command
-queue refuses an issue or a close, the progress baseline is sampled **before** the attempt, so a queue drained between the
-refusal and the wait is not waited on. `endWindows` is the session-stop action: it ends every window (adopted or not) and closes
+queue refuses an issue or a close, the acquisition waits on the queue's **room** (`portQueueRoom`, the capacity itself:
+`pending < capacity`), not on a change of it, so a queue that filled and drained between the refusal and the wait cannot be
+missed. A pump that itself fails (an observation that raises, an asynchronous interruption) closes admission and leaves every
+acquisition as retained terminal evidence, slot held and no retirement claimed, so the drain and the protected host's teardown
+proceed instead of waiting for a thread that is gone. An **interrupted or otherwise uncertain creation** (`CreateFatal`) is the
+same terminal evidence, never a retirement: it may have registered a window or failed its rollback. `endWindows` is the session-stop action: it ends every window (adopted or not) and closes
 admission, idempotently and without waiting; the scope exit runs it before its drain.
 
 ### Owners, threads, lifetimes
@@ -349,7 +354,10 @@ drives progress; a window held up in retirement never blocks the service of anot
 ### Tests
 
 * **`lua-engine-graphics-tests`** (group `test.vulkan-headless`), `window provider`: the pure rules, the host
-  configuration, and the provider over a gated fake port inside the real composition (real admission, real leases, a real
+  configuration, the provider's endpoints on a **real** `runSession` coordinator (a genuine close during pending setup with the
+  records bank full ends the session as a quit; a failed destruction and a fatal creation latch `cleanup_failure` and
+  `host_failure`; the roles run an empty behavior, because the Lua binding that opens a window is LFE-21's), and the provider
+  over a gated fake port inside the real composition (real admission, real leases, a real
   supervised Lua owner): admission and its banks, every stage held separately, cancellation at each stage and both
   settlement orders, instance end, retirement gated on graphics and native independently, close routing and its races,
   failures and pressure. The fake is injected evidence: it proves ordering, ownership and routing, never a window.
