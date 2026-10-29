@@ -80,7 +80,6 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Publish
   , graphicsPublishCommit
   , graphicsPublishBinding
   , graphicsPublishBindingWith
-  , PublishBindingRefused (..)
   ) where
 
 import Control.Concurrent.STM (STM, atomically)
@@ -114,7 +113,7 @@ import Hetoimasia.LuaEngine.Scene
   , prepareScene
   , refusalReasonText
   , sceneSchema
-  , sceneValueLimits
+  , scenePublishLimits
   , textureUses
   )
 import Hetoimasia.LuaEngine.Texture (TextureView (viewIdentity), withTextureOr)
@@ -127,17 +126,7 @@ import Hetoimasia.Scripting.Lua.Registration
   , withArgumentCheck
   , withArgumentLimits
   )
-import Hetoimasia.Scripting.Lua.Value
-  ( LimitsRefusal
-  , Schema (SCapability)
-  , Value (VCapability)
-  , capabilityKey
-  , capabilityTypeName
-  , limitBytes
-  , limitDepth
-  , limitElements
-  , valueLimits
-  )
+import Hetoimasia.Scripting.Lua.Value (Schema (SCapability), Value (VCapability), capabilityKey, capabilityTypeName)
 
 -- | What a publication reads of the session: the renderer registry that knows each texture's exact handle,
 -- the window provider whose admission a stop closes, and the two things a window's capability does.
@@ -335,30 +324,17 @@ graphicsPublishCommit hooks precondition publisher limits leases owner values =
                   Refused refusal → Just (publishRefusalText refusal)
       other → pure (Just (Text.pack ("publishing takes a window and a scene, not " <> show (length other) <> " arguments")))
 
--- | Why a publication binding could not be made.
-newtype PublishBindingRefused = PublishLimitsRefused LimitsRefusal
-  deriving (Eq, Show)
-
 -- | A binding that takes a window and a scene, refuses with an ordinary Lua error whatever can be known up to the
 -- commit, and otherwise publishes ('graphicsPublishCommit'). Answers nothing to the script.
 --
--- Its arguments cross together, so its limits are the scene's own widened by what the window handle beside the
--- scene adds to one crossing: one element and a capability's bytes ('windowArgumentAllowance'). Without that, the
--- largest legal scene (4,096 sprites) would be one element over the scene's bound.
-graphicsPublishBinding ∷ ∀ target. Typeable target ⇒ Text → ArgumentCheck → ScenePublisher target → SceneLimits → Leases → Either PublishBindingRefused Binding
+-- Its arguments cross together, so it reads them under the scene limits' call-level limits ('scenePublishLimits'):
+-- the scene's own widened by the window handle beside it, which the profile's validation guarantees room for.
+graphicsPublishBinding ∷ ∀ target. Typeable target ⇒ Text → ArgumentCheck → ScenePublisher target → SceneLimits → Leases → Binding
 graphicsPublishBinding = graphicsPublishBindingWith noPublishHooks
 
 -- | The same with the test seams of 'publishSceneWith'.
-graphicsPublishBindingWith ∷ ∀ target. Typeable target ⇒ PublishHooks → Text → ArgumentCheck → ScenePublisher target → SceneLimits → Leases → Either PublishBindingRefused Binding
-graphicsPublishBindingWith hooks name precondition publisher limits leases = do
-  let scene = sceneValueLimits limits
-  widened ← either (Left . PublishLimitsRefused) Right (valueLimits (limitBytes scene + windowArgumentAllowance) (limitDepth scene) (limitElements scene + 1))
-  Right $
-    withArgumentLimits widened $
-      withArgumentCheck (graphicsPublishCommit hooks precondition publisher limits leases) $
-        stateOperation name [SCapability windowHandleType, sceneSchema] [] (\_ → pure [])
-
--- | What a window capability adds to one crossing, in bytes: far more than its encoding, and far less than any
--- limit it is added to.
-windowArgumentAllowance ∷ Int
-windowArgumentAllowance = 64
+graphicsPublishBindingWith ∷ ∀ target. Typeable target ⇒ PublishHooks → Text → ArgumentCheck → ScenePublisher target → SceneLimits → Leases → Binding
+graphicsPublishBindingWith hooks name precondition publisher limits leases =
+  withArgumentLimits (scenePublishLimits limits) $
+    withArgumentCheck (graphicsPublishCommit hooks precondition publisher limits leases) $
+      stateOperation name [SCapability windowHandleType, sceneSchema] [] (\_ → pure [])

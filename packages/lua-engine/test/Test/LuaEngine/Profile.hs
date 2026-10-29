@@ -227,6 +227,30 @@ spec = describe "the M1 profile" $ do
       sceneElementBound fixedM1Profile `shouldBe` Count (6 + 6 * 4096)
       sceneElementBound fixedM1Profile `shouldSatisfy` (<= countLimit fixedM1Profile CopiedValueElements)
 
+    it "derives a maximal publishing call's elements, the window handle's one beside the scene's, within the copied-value ceiling" $ do
+      sceneCallExtraElements `shouldBe` 1
+      sceneCallElementBound fixedM1Profile `shouldBe` Count (6 + 6 * 4096 + 1)
+      sceneCallElementBound fixedM1Profile `shouldSatisfy` (<= countLimit fixedM1Profile CopiedValueElements)
+
+    it "keeps the least copied-value elements at the status record's 30, whatever the scene's term" $ do
+      -- The scene term is its fixed elements, one sprite's and the window handle's: 13, below the status record's 30.
+      sceneFixedElements + sceneElementsPerSprite + sceneCallExtraElements `shouldBe` 13
+      verdict (setLimit (LimitCount CopiedValueElements) 29 fixedSpec) `shouldBe` Left (LimitBelowMinimum (LimitCount CopiedValueElements) 29 30)
+      verdict (setLimit (LimitCount CopiedValueElements) 30 (setCount SceneSprites 2 fixedSpec)) `shouldBe` Right ()
+
+    it "refuses a copied-value element limit that holds the scene but not the call that carries it, and accepts one that holds both" $ do
+      -- Four sprites: the scene is 6 + 6 * 4 = 30 elements, the call 31. A limit of exactly the old scene-only bound
+      -- is now refused; one more is accepted.
+      let four = setCount SceneSprites 4 fixedSpec
+      sceneElementBound <$> validateProfile (setLimit (LimitCount CopiedValueElements) 31 four) `shouldBe` Right (Count 30)
+      verdict (setLimit (LimitCount CopiedValueElements) 30 four) `shouldBe` Left (RelationBroken SceneElementsWithinCopiedElements)
+      verdict (setLimit (LimitCount CopiedValueElements) 31 four) `shouldBe` Right ()
+
+    it "refuses a copied-value byte limit that holds the scene input but not the call that carries it, and accepts one that holds both" $ do
+      let edge limit = setLimit (LimitBytes CopiedValueBytes) limit . setLimit (LimitBytes SceneInputBytes) mib . setLimit (LimitBytes DataBytes) (mib `div` 2) $ fixedSpec
+      verdict (edge mib) `shouldBe` Left (RelationBroken SceneInputWithinCopiedValue)
+      verdict (edge (mib + sceneCallExtraBytes)) `shouldBe` Right ()
+
     it "records the two frame slots per window and does not store the derived six adopted revisions" $ do
       countLimit fixedM1Profile FrameSlotsPerWindow `shouldBe` Count 2
       -- The limit types are the whole vocabulary: nothing is named for adopted revisions.

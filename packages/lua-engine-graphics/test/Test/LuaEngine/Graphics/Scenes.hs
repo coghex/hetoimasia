@@ -23,6 +23,7 @@ import Hetoimasia.LuaEngine.Scene (initialContent)
 import Hetoimasia.LuaEngine.Texture.Backend (BackendTexture (..), RetirementState (..))
 import Numeric.Natural (Natural)
 import Test.HUnit.Lang (HUnitFailure (HUnitFailure))
+import Test.HUnit.Lang (assertFailure)
 import Test.Hspec
 import Test.LuaEngine.Graphics.Fake
 import Test.LuaEngine.Graphics.Rig
@@ -185,8 +186,16 @@ spec = describe "scene retention" $ do
         awaitBackend rig (elem "releasing" . readingTextureStages)
         eventCount fake "release attempted" `shouldReturn` 0
         pendingNow reading `shouldReturn` True
-        -- The second attachment adopts the retained scene and holds the texture again.
-        adoptFor model 1 2 `shouldReturn` Adopted 1
+        -- The second attachment is attached and the owner has recorded its adoption, but the lifecycle's hook has not run
+        -- and its watermark has not risen: the first attachment's must not be inherited, so the barrier is not met and
+        -- the request stays queued with the ledger still empty.
+        taken ← beginAdopt model 1 2
+        (revision, scene) ← either (\step → assertFailure ("expected an adoption, found " <> show step)) pure taken
+        awaitFake fake ((== 1) . readingReleasesQueued)
+        eventCount fake "release attempted" `shouldReturn` 0
+        atomically (ledgerHeld (fakeLedger fake) identity) `shouldReturn` False
+        -- The hook runs and the watermark rises: the barrier is met, and the action finds the hold.
+        finishAdopt model 1 2 revision scene
         awaitBackend rig (elem "held" . readingTextureStages)
         eventCount fake "release attempted" `shouldReturn` 0
         atomically (ledgerHeld (fakeLedger fake) identity) `shouldReturn` True

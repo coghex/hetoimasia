@@ -90,6 +90,7 @@ test-suite lua-engine-graphics-tests
         Test.LuaEngine.Graphics.Composition
         Test.LuaEngine.Graphics.Configuration
         Test.LuaEngine.Graphics.Fake
+        Test.LuaEngine.Graphics.FrameLog
         Test.LuaEngine.Graphics.Faults
         Test.LuaEngine.Graphics.Lifecycle
         Test.LuaEngine.Graphics.Png
@@ -166,6 +167,7 @@ test-suite lua-engine-graphics-native-tests
     hs-source-dirs: native-test test-common
     other-modules:
         Test.LuaEngine.Graphics.Composition
+        Test.LuaEngine.Graphics.FrameLog
         Test.LuaEngine.Graphics.Native.Consent
         Test.LuaEngine.Graphics.Native.Environment
         Test.LuaEngine.Graphics.Native.Frame

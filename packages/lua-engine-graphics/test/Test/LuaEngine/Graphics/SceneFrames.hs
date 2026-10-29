@@ -34,6 +34,7 @@ import Hetoimasia.Render.TwoD.Vulkan.Frame (snapshotTablesBound)
 import Hetoimasia.Render.TwoD.Vulkan.Textures (fromBackendHandle)
 import Test.HUnit.Lang (assertFailure)
 import Test.Hspec
+import Test.LuaEngine.Graphics.FrameLog (emptyFrameLog, eventsSince, frameLogLimit, frameLogMark, recordEvent)
 import qualified Test.LuaEngine.Graphics.Png as Png
 
 spec ∷ Spec
@@ -102,6 +103,18 @@ spec = describe "the frame of an adopted scene" $ do
       checkSceneHostConfig configured `shouldBe` []
       vulkanSceneMode configured `shouldBe` PerWindowScenes
       vulkanInitialSceneHoldsNothing configured `shouldBe` True
+
+  describe "the native examples' frame log" $
+    it "answers the events after a mark across a rollover of its bounded storage" $ do
+      let rolled = foldl' (flip recordEvent) emptyFrameLog [1 .. frameLogLimit + 10 ∷ Int]
+          newest = [frameLogLimit + 10, frameLogLimit + 9 .. 11]
+      -- A mark taken a few events ago still means "after that one", though the storage has dropped its oldest events.
+      eventsSince (frameLogMark rolled - 3) rolled `shouldBe` [frameLogLimit + 10, frameLogLimit + 9, frameLogLimit + 8]
+      -- A mark from before the rollover answers what is still retained, no more.
+      eventsSince 0 rolled `shouldBe` newest
+      -- A mark taken now answers nothing until something is recorded, however full the storage is.
+      eventsSince (frameLogMark rolled) rolled `shouldBe` []
+      eventsSince (frameLogMark rolled) (recordEvent 0 rolled) `shouldBe` [0]
 
   describe "the maximum legal scene" $ do
     it "fits the renderer's configured ring for every batch that can be in flight, and its tables fit the region window" $ do

@@ -289,9 +289,7 @@ bindings comp limits vm =
       openFrom values >>= \case
         Left why → pure (Just why)
         Right ask → windowArgumentCheck (vmWindow vm) (const ask) owner values
-    published =
-      either (error . ("the publication binding was refused: " <>) . show) id $
-        graphicsPublishBindingWith (hooksOf vm) "publish" (\_ _ → pure Nothing) (vmPublisher vm) limits (vmLeases vm)
+    published = graphicsPublishBindingWith (hooksOf vm) "publish" (\_ _ → pure Nothing) (vmPublisher vm) limits (vmLeases vm)
     -- A release that lands between the scene's preparation and the publication boundary, on the instance's own thread
     -- where a script's next statement could not: the preparation succeeds, the texture is released, and the
     -- operation is asked to publish the stale preparation. The answer is the operation's, as text.

@@ -38,6 +38,7 @@ module Hetoimasia.LuaEngine.Scene
   , SceneLimitsRefused (..)
   , sceneSpriteLimit
   , sceneValueLimits
+  , scenePublishLimits
   , sceneCoordinateLimit
   , sceneExtentLimit
 

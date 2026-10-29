@@ -121,7 +121,7 @@ checkDerived spec
   | otherwise = Right ()
   where
     output = toInteger rgba8BytesPerPixel * rawCount (specCounts spec PngPixels)
-    elements = toInteger sceneFixedElements + toInteger sceneElementsPerSprite * rawCount (specCounts spec SceneSprites)
+    elements = toInteger sceneFixedElements + toInteger sceneElementsPerSprite * rawCount (specCounts spec SceneSprites) + toInteger sceneCallExtraElements
 
 checkCeilings ∷ ProfileSpec → Either ProfileError ()
 checkCeilings spec = do
@@ -162,7 +162,7 @@ relations spec =
   , (RequestsPerInstanceWithinVm, count RequestsPerInstance <= count RequestsPerVm)
   , (DataWithinRetainedBank, bytes DataBytes <= bytes RetainedDataBytesPerVm)
   , (DataWithinCopiedValue, bytes DataBytes <= bytes CopiedValueBytes)
-  , (SceneInputWithinCopiedValue, bytes SceneInputBytes <= bytes CopiedValueBytes)
+  , (SceneInputWithinCopiedValue, bytes SceneInputBytes + toInteger sceneCallExtraBytes <= bytes CopiedValueBytes)
   , (SceneDepthWithinCopiedDepth, count SceneDepth <= count CopiedValueDepth)
   , (SceneElementsWithinCopiedElements, sceneElements <= count CopiedValueElements)
   , (FailureRecordHoldsMessageAndTraceback, bytes MessageBytes + bytes TracebackBytes <= bytes RoleFailureRecordBytes)
@@ -182,4 +182,4 @@ relations spec =
     bytes = rawBytes . specBytes spec
     count = rawCount . specCounts spec
     output = toInteger rgba8BytesPerPixel * count PngPixels
-    sceneElements = toInteger sceneFixedElements + toInteger sceneElementsPerSprite * count SceneSprites
+    sceneElements = toInteger sceneFixedElements + toInteger sceneElementsPerSprite * count SceneSprites + toInteger sceneCallExtraElements

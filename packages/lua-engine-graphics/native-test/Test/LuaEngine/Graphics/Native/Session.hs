@@ -46,6 +46,7 @@ import Hetoimasia.GLFW.Session (Backend, SessionConfig (..))
 import Hetoimasia.GLFW.Vulkan (withLoaderIntegration)
 import Hetoimasia.GPU.Model (Usage, usage)
 import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), DiagnosticVerdict, defaultCaptureConfig)
+import Test.LuaEngine.Graphics.FrameLog (FrameLog, emptyFrameLog, recordEvent)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( FrameEvent (..)
   , NativeObserver (..)
@@ -88,8 +89,8 @@ data Env = Env
     -- example has one.
   , envWindows ∷ !(IORef Int)
     -- ^ How many native windows the examples made, for the run's evidence and the checks that depend on it.
-  , envFrames ∷ !(TVar [FrameEvent])
-    -- ^ The host's frame events, newest first and bounded: what the owner reported of each frame's acquisition,
+  , envFrames ∷ !(TVar (FrameLog FrameEvent))
+    -- ^ The host's frame events, bounded, with a monotonic cursor: what the owner reported of each frame's acquisition,
     -- submission, presentation and observed completion, on its own thread.
   }
 
@@ -153,14 +154,14 @@ runSession complete backend features configuration examples = do
   verdictCell ← newIORef Nothing
   passedCell ← newIORef False
   windowCount ← newIORef 0
-  frames ← newTVarIO []
+  frames ← newTVarIO emptyFrameLog
   evidence ← newTVarIO []
   scenes ← newSceneSession
   let host = requestingBackend backend (defaultHostConfig [])
       base = vulkanHostConfig host defaultCaptureConfig {captureTextBudget = 16384} (configurationBudgets configuration) (scenesInitial scenes)
       config =
         (configureScenes scenes (configureWindows (configureHost configuration base)))
-          { vulkanFrameObserver = \event → atomically (modifyTVar' frames (take 4096 . (event :)))
+          { vulkanFrameObserver = \event → atomically (modifyTVar' frames (recordEvent event))
           , vulkanLayers = ["VK_LAYER_KHRONOS_validation"]
           , vulkanValidationFeatures = features
           , vulkanObserver = const (observer recorded)

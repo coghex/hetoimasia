@@ -33,6 +33,8 @@ module Test.LuaEngine.Graphics.SceneHost
   , Step (..)
   , adoptNow
   , adoptFor
+  , beginAdopt
+  , finishAdopt
   , beginUse
   , endUse
   , endTarget
@@ -73,8 +75,9 @@ data Win = Win
   , winLatest ∷ !(Maybe GraphicsScene)
   , winTarget ∷ !(Maybe Int)
     -- ^ The live target's attachment, if it has one.
-  , winWatermark ∷ !Natural
-    -- ^ The highest revision the live target has adopted and been notified of.
+  , winWatermark ∷ !(Map Int Natural)
+    -- ^ For each attachment, the highest revision it has adopted and been notified of: raised after the lifecycle's
+    -- hook, and never inherited by a later attachment.
   , winLastAdopted ∷ !(Map Int Natural)
   , winRecs ∷ ![Rec]
     -- ^ Oldest adoption first.
@@ -100,7 +103,7 @@ modelLedger = mLedger
 
 -- | The host holds a window with this number, at revision 0 with no target.
 modelWindow ∷ Model → Int → IO ()
-modelWindow model window = atomically (modifyTVar' (mWindows model) (Map.insert window (Win 0 Nothing Nothing 0 Map.empty [] True)))
+modelWindow model window = atomically (modifyTVar' (mWindows model) (Map.insert window (Win 0 Nothing Nothing Map.empty Map.empty [] True)))
 
 -- | The window's capability, as the window provider's port yields it: publish, and whether the incarnation is
 -- usable.
@@ -138,7 +141,7 @@ modelCapture model = do
   where
     met now (window, revision) = case Map.lookup window now of
       Nothing → True
-      Just found → winTarget found /= Nothing && winWatermark found >= revision
+      Just found → maybe False (\attached → maybe False (>= revision) (Map.lookup attached (winWatermark found))) (winTarget found)
 
 -- | What a step did.
 data Step = Adopted !Natural | Deferred | NothingNew | NoTarget
@@ -151,45 +154,44 @@ adoptNow model window = adoptFor model window 1
 -- | The window's target under this attachment takes the latest scene, if it should: newer than the last that
 -- attachment adopted, and below the retention limit. A target is attached the first time it adopts.
 adoptFor ∷ Model → Int → Int → IO Step
-adoptFor model window attachment = do
-  taken ← atomically $ do
+adoptFor model window attachment =
+  beginAdopt model window attachment >>= \case
+    Left step → pure step
+    Right (revision, scene) → finishAdopt model window attachment revision scene >> pure (Adopted revision)
+
+-- | The first half of an adoption: the ledger's record and the target, before the lifecycle's hook has run. A release
+-- barrier must not yet read the attachment as having adopted anything. An example holds the model here to read that.
+beginAdopt ∷ Model → Int → Int → IO (Either Step (Natural, GraphicsScene))
+beginAdopt model window attachment =
+  atomically $ do
     windows ← readTVar (mWindows model)
     case Map.lookup window windows of
-      Nothing → pure NoTarget'
+      Nothing → pure (Left NoTarget)
       Just found → do
         let revision = winPublished found
             scene = maybe (error "no scene") id (winLatest found)
-            last' = Map.lookup attachment (winLastAdopted found)
-            fresh = case last' of
-              Nothing → True
-              Just seen → revision > seen
             unreleased = length [() | rec ← winRecs found, recAttachment rec == attachment]
         case () of
           _
-            | revision == 0 → pure NoTarget'
-            | not fresh → pure Nothing'
-            | unreleased >= retentionLimit → pure Full'
+            | revision == 0 → pure (Left NoTarget)
+            | not (maybe True (revision >) (Map.lookup attachment (winLastAdopted found))) → pure (Left NothingNew)
+            | unreleased >= retentionLimit → pure (Left Deferred)
             | otherwise → do
                 let rec = Rec revision attachment 0 False
-                    adopted =
-                      found
-                        { winTarget = Just attachment
-                        , winLastAdopted = Map.insert attachment revision (winLastAdopted found)
-                        , winRecs = winRecs found <> [rec]
-                        }
-                writeTVar (mWindows model) (Map.insert window adopted windows)
-                pure (Took' revision scene)
-  case taken of
-    NoTarget' → pure NoTarget
-    Nothing' → pure NothingNew
-    Full' → pure Deferred
-    Took' revision scene → do
-      -- The hook runs, then the watermark rises: a barrier reads the watermark.
-      ledgerAdopted (mLedger model) window revision scene
-      atomically (modifyTVar' (mWindows model) (Map.adjust (\found → found {winWatermark = max revision (winWatermark found)}) window))
-      pure (Adopted revision)
+                writeTVar (mWindows model) . flip (Map.insert window) windows $
+                  found
+                    { winTarget = Just attachment
+                    , winLastAdopted = Map.insert attachment revision (winLastAdopted found)
+                    , winRecs = winRecs found <> [rec]
+                    }
+                pure (Right (revision, scene))
 
-data Taken = NoTarget' | Nothing' | Full' | Took' !Natural !GraphicsScene
+-- | The second half: the lifecycle's hook runs, and only then does the attachment's watermark rise, which is what a
+-- release barrier reads.
+finishAdopt ∷ Model → Int → Int → Natural → GraphicsScene → IO ()
+finishAdopt model window attachment revision scene = do
+  ledgerAdopted (mLedger model) window revision scene
+  atomically (modifyTVar' (mWindows model) (Map.adjust (\found → found {winWatermark = Map.insertWith max attachment revision (winWatermark found)}) window))
 
 -- | A frame recorded with this adopted revision begins: the revision cannot be released until it ends.
 beginUse ∷ Model → Int → Natural → Int → IO ()

@@ -40,6 +40,7 @@ import System.Timeout (timeout)
 import Test.HUnit.Lang (assertFailure)
 import Test.Hspec
 import qualified Test.LuaEngine.Graphics.Png as Png
+import Test.LuaEngine.Graphics.FrameLog (eventsSince, frameLogMark)
 import Test.LuaEngine.Graphics.Native.Session
 import Test.LuaEngine.Graphics.SceneComp
 
@@ -53,7 +54,7 @@ spec env = describe "scene retention" $ do
       admitScene comp vm "a"
       window ← openWindow env comp vm "a"
       loadTexture comp vm "a" "a" "a.png"
-      earlier ← length <$> readTVarIO (envFrames env)
+      earlier ← frameLogMark <$> readTVarIO (envFrames env)
       _ ← run comp vm "a" "publish" "a" (Just "a")
       -- The real owner adopts the published revision and records a frame with it.
       awaitAdopted env window 1
@@ -62,7 +63,7 @@ spec env = describe "scene retention" $ do
       released `shouldSatisfy` Text.isInfixOf "retiring"
       readingLive env >>= (`shouldBe` 1)
       -- A frame recorded after the release, with the same adopted scene: the texture was still drawable.
-      mark ← length <$> readTVarIO (envFrames env)
+      mark ← frameLogMark <$> readTVarIO (envFrames env)
       demandFrame env window
       awaitFrame env window 1 mark
       readingLive env >>= (`shouldBe` 1)
@@ -71,7 +72,7 @@ spec env = describe "scene retention" $ do
       refused `shouldSatisfy` Text.isInfixOf "error"
       published env window >>= (`shouldBe` Just 1)
       -- Replaced by an empty scene: once the frames that used revision 1 completed, the texture retires.
-      replaced ← length <$> readTVarIO (envFrames env)
+      replaced ← frameLogMark <$> readTVarIO (envFrames env)
       _ ← run comp vm "a" "publish" "a" Nothing
       awaitAdopted env window 2
       awaitFrame env window 2 replaced
@@ -105,7 +106,7 @@ spec env = describe "scene retention" $ do
       published env second >>= (`shouldBe` Just 1)
       held ← atomically (ledgerReading (graphicsLedger (envGraphics env)))
       length (readingHeld held) `shouldBe` 1
-      mark ← length <$> readTVarIO (envFrames env)
+      mark ← frameLogMark <$> readTVarIO (envFrames env)
       demandFrame env second
       awaitFrame env second 1 mark
       atomically (readTVar stops) >>= (`shouldBe` (0 ∷ Int))
@@ -119,7 +120,7 @@ spec env = describe "scene retention" $ do
       admitScene comp vm "a"
       window ← openWindow env comp vm "a"
       loadTexture comp vm "a" "a" "a.png"
-      earlier ← length <$> readTVarIO (envFrames env)
+      earlier ← frameLogMark <$> readTVarIO (envFrames env)
       _ ← run comp vm "a" "publish" "a" (Just (Text.intercalate "," (replicate 4096 "a")))
       awaitAdopted env window 1
       awaitFrame env window 1 earlier
@@ -200,8 +201,7 @@ published env window = do
 -- events: a frame the owner recorded and submitted with that scene.
 awaitFrame ∷ Env → WindowId → Natural → Int → IO ()
 awaitFrame env window revision mark = atomically $ do
-  seen ← readTVar (envFrames env)
-  let fresh = take (length seen - mark) seen
+  fresh ← eventsSince mark <$> readTVar (envFrames env)
   unless (or [attachmentWindow attachment == window && rendered == revision | FramePresentRequested attachment _ _ rendered ← fresh]) retry
 
 -- | Ask the window's target for another frame of what it holds.

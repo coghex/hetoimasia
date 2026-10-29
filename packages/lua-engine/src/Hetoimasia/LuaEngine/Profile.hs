@@ -91,6 +91,9 @@ module Hetoimasia.LuaEngine.Profile
   , sceneElementBound
   , sceneFixedElements
   , sceneElementsPerSprite
+  , sceneCallExtraElements
+  , sceneCallExtraBytes
+  , sceneCallElementBound
   ) where
 
 import Hetoimasia.LuaEngine.Profile.Limits

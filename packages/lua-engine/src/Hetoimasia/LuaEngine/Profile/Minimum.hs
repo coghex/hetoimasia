@@ -86,7 +86,7 @@ minimumBytes spec = \case
 -- shows a script (its depth and its elements).
 minimumCount ∷ ProfileSpec → CountLimit → Word64
 minimumCount _ = \case
-  CopiedValueElements → max (sceneFixedElements + sceneElementsPerSprite) (fromIntegral minimumStatusElements)
+  CopiedValueElements → max (sceneFixedElements + sceneElementsPerSprite + sceneCallExtraElements) (fromIntegral minimumStatusElements)
   CopiedValueDepth → fromIntegral minimumStatusDepth
   _ → 1
 

@@ -17,6 +17,7 @@ module Hetoimasia.LuaEngine.Scene.Limits
   , SceneLimitsRefused (..)
   , sceneSpriteLimit
   , sceneValueLimits
+  , scenePublishLimits
   , sceneCoordinateLimit
   , sceneExtentLimit
   ) where
@@ -31,6 +32,8 @@ import Hetoimasia.LuaEngine.Profile
   , Profile
   , bytesLimit
   , countLimit
+  , sceneCallExtraBytes
+  , sceneCallExtraElements
   , sceneElementBound
   )
 import Hetoimasia.Scripting.Lua.Value (LimitsRefusal, ValueLimits, valueLimits)
@@ -40,6 +43,11 @@ import Hetoimasia.Scripting.Lua.Value (LimitsRefusal, ValueLimits, valueLimits)
 data SceneLimits = SceneLimits
   { sceneSpriteLimit ∷ !Int
   , sceneValueLimits ∷ !ValueLimits
+  , scenePublishLimits ∷ !ValueLimits
+    -- ^ The crossing limits of a call that carries a window handle beside the scene: the scene's own, plus the
+    -- handle's one element and its bytes. A binding that takes the window and the scene reads its arguments under
+    -- these, because the reader keeps one counter for all the arguments of a call. A validated profile always has
+    -- room for them ('Hetoimasia.LuaEngine.Profile.sceneCallElementBound').
   , sceneCoordinateLimit ∷ !Int
   , sceneExtentLimit ∷ !Int
   }
@@ -63,7 +71,8 @@ sceneLimits profile = do
   coordinate ← machine "CoordinateMagnitude" (count CoordinateMagnitude)
   extent ← machine "SpriteExtentMaximum" (count SpriteExtentMaximum)
   limits ← either (Left . LimitsRefused) Right (valueLimits bytes depth elements)
-  Right (SceneLimits sprites limits coordinate extent)
+  publish ← either (Left . LimitsRefused) Right (valueLimits (bytes + fromIntegral sceneCallExtraBytes) depth (elements + fromIntegral sceneCallExtraElements))
+  Right (SceneLimits sprites limits publish coordinate extent)
   where
     count limit = let Count value = countLimit profile limit in value
     machine ∷ Text → Word64 → Either SceneLimitsRefused Int
