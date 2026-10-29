@@ -81,6 +81,7 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Publish
     -- * The binding
   , graphicsPublishCheck
   , graphicsPublishBinding
+  , graphicsPublishBindingWith
   , GraphicsPublishDefect (..)
   ) where
 
@@ -312,7 +313,11 @@ graphicsPublishCheck publisher limits leases owner values = case values of
 -- | A binding that takes a window and a scene, refuses with an ordinary Lua error whatever it can know
 -- before it has an effect, and otherwise publishes. Answers nothing to the script.
 graphicsPublishBinding ∷ ∀ target. Typeable target ⇒ Text → ScenePublisher target → SceneLimits → Leases → Binding
-graphicsPublishBinding name publisher limits leases =
+graphicsPublishBinding = graphicsPublishBindingWith noPublishHooks
+
+-- | The same with the test seams of 'publishSceneWith'.
+graphicsPublishBindingWith ∷ ∀ target. Typeable target ⇒ PublishHooks → Text → ScenePublisher target → SceneLimits → Leases → Binding
+graphicsPublishBindingWith hooks name publisher limits leases =
   withArgumentLimits (sceneValueLimits limits) $
     withArgumentCheck (graphicsPublishCheck publisher limits leases) $
       stateOperation name [SCapability windowHandleType, sceneSchema] [] $ \case
@@ -320,7 +325,7 @@ graphicsPublishBinding name publisher limits leases =
           prepareScene limits leases scene >>= \case
             Left refusal → throwIO (GraphicsPublishDefect (Text.pack (show refusal)))
             Right prepared →
-              publishScene publisher (capabilityKey window) prepared >>= \case
+              publishSceneWith hooks publisher (capabilityKey window) prepared >>= \case
                 Published → pure []
                 Refused refusal → closure refusal
         _ → throwIO (GraphicsPublishDefect "the host handed a scene publication other than a window and a scene")
