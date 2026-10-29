@@ -108,6 +108,7 @@ import Hetoimasia.Runtime.GLFW
   , graphicsAttachment
   , hostCommandPort
   , hostCommandStatistics
+  , publishGraphicsWindowScene
   , readGraphicsService
   , readOwnerFailure
   , readTargetStanding
@@ -123,6 +124,9 @@ data WindowTarget scene = WindowTarget
   , targetPublish ∷ Prepared scene → IO WindowScenePublication
     -- ^ Publish an owned scene to this window alone; it asks this window's target for a frame and no
     -- other's, and promises no displayed frame.
+  , targetPublishSTM ∷ Prepared scene → STM WindowScenePublication
+    -- ^ The same publication as a transaction, so that a caller's authority checks and the publication are one
+    -- atomic step: nothing that closes between them can be missed. It never waits.
   , targetUsable ∷ STM Bool
     -- ^ Whether this incarnation's target is still the admitted, attached one.
   }
@@ -303,6 +307,7 @@ target vulkan var token = do
               { targetWindow = madeWindow made
               , targetAttachment = graphicsAttachment service
               , targetPublish = publishVulkanWindowScene vulkan (madeWindow made)
+              , targetPublishSTM = publishGraphicsWindowScene (vulkanGraphicsOwner vulkan) (madeWindow made)
               , targetUsable = (== StandingUsable) <$> standing vulkan var token
               }
         _ → Nothing

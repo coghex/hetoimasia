@@ -149,9 +149,53 @@ spec = describe "scene retention" $ do
         atomically (ledgerHolds (fakeLedger fake) identity) `shouldReturn` 1
         pendingNow reading `shouldReturn` True
         eventCount fake "release attempted" `shouldReturn` 0
-        -- Attachment 2 ends: its adoption is released and the table is asked, once.
+        -- Attachment 2 ends: its adoption is released, but the window still retains revision 1 with no live target, so
+        -- the table is not asked until the window is gone.
         endTarget model 1 2
         releasePass model `shouldReturn` [(1, 1)]
+        awaitBackend rig (elem "releasing" . readingTextureStages)
+        eventCount fake "release attempted" `shouldReturn` 0
+        removeWindow model 1
+        awaitEvent fake "released"
+        atomically (reading >>= \case ProviderComplete → pure (); _ → retry)
+        eventCount fake "release attempted" `shouldReturn` 1
+
+  describe "a window that retains its published scene between two attachments" $
+    it "keeps the texture until the second attachment has adopted the scene, though the first adoption is fully released before it" $
+      sceneRig defaultFakeConfig $ \rig model → do
+        let fake = rigFake rig
+        modelWindow model 1
+        (texture, identity) ← deliverTexture rig
+        publishScene' model 1 (naming [identity])
+        adoptFor model 1 1 `shouldReturn` Adopted 1
+        reading ← textureRelease texture
+        awaitBackend rig (elem "held" . readingTextureStages)
+        -- The first attachment ends and its adoption is released whole before the second begins: the ledger holds
+        -- nothing, but the window still retains revision 1, which names the texture.
+        -- The owner is held while the pump asks again, so where the request waits can be read.
+        hold fake HoldOwner
+        endTarget model 1 1
+        releasePass model `shouldReturn` [(1, 1)]
+        atomically (ledgerHeld (fakeLedger fake) identity) `shouldReturn` False
+        -- The pump asks again through the barrier lane, which names the window and waits for a live target of it, and
+        -- not through the ordinary lane, which waits for nothing.
+        awaitFake fake ((== 1) . readingReleasesQueued)
+        atomically (readingActsQueued <$> readFake fake) `shouldReturn` 0
+        release fake HoldOwner
+        awaitBackend rig (elem "releasing" . readingTextureStages)
+        eventCount fake "release attempted" `shouldReturn` 0
+        pendingNow reading `shouldReturn` True
+        -- The second attachment adopts the retained scene and holds the texture again.
+        adoptFor model 1 2 `shouldReturn` Adopted 1
+        awaitBackend rig (elem "held" . readingTextureStages)
+        eventCount fake "release attempted" `shouldReturn` 0
+        atomically (ledgerHeld (fakeLedger fake) identity) `shouldReturn` True
+        -- Its end alone does not: the window still retains the scene with no live target. The window's end does.
+        endTarget model 1 2
+        releasePass model `shouldReturn` [(1, 1)]
+        awaitBackend rig (elem "releasing" . readingTextureStages)
+        eventCount fake "release attempted" `shouldReturn` 0
+        removeWindow model 1
         awaitEvent fake "released"
         atomically (reading >>= \case ProviderComplete → pure (); _ → retry)
         eventCount fake "release attempted" `shouldReturn` 1
@@ -285,7 +329,7 @@ spec = describe "scene retention" $ do
 
     publishScene' model window scene = do
       prepared ← prepare scene
-      answer ← fst (modelTarget model window) prepared
+      answer ← atomically (fst (modelTarget model window) prepared)
       answer `shouldBe` HostAccepted
 
     deliverTexture rig = do

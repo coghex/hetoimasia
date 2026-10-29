@@ -17,7 +17,7 @@ import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Graphics.Scene
 import Hetoimasia.LuaEngine.Scene (SceneContent (..), SceneRect (..), SceneSprite (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Port (Port (..), WindowToken (..))
-import Hetoimasia.LuaEngine.Graphics.Window.Provider (WindowConfig (..), endWindows)
+import Hetoimasia.LuaEngine.Graphics.Window.Provider (WindowConfig (..), closeWindowOwner, endWindows)
 import Hetoimasia.Render.TwoD.Vulkan.Textures (newTextures)
 import Test.HUnit.Lang (assertFailure)
 import Test.Hspec
@@ -134,45 +134,61 @@ spec = describe "scene publication" $ do
       publishedRevision (pubModel pub) winA `shouldReturn` 1
 
   describe "a fact that changes while the publication is in flight" $ do
-    it "leaves the previous scene when the window stops being the admitted one before the boundary is checked" $
-      withPublication $ \pub → do
-        ready pub "a"
-        loaded pub "a" "a" "a.png"
-        armGate (pubVm pub) "before-boundary"
-        held ← runHeld pub "a" "publish" "a" (Just "a")
-        awaitGate (pubVm pub) "before-boundary"
-        setUsable (pubModel pub) winA False
-        openGate (pubVm pub) "before-boundary"
-        _ ← held
-        publishedRevision (pubModel pub) winA `shouldReturn` 0
-
-    it "leaves the previous scene when the host closes after the final check and before the commit" $
-      withPublication $ \pub → do
-        ready pub "a"
-        loaded pub "a" "a" "a.png"
-        armGate (pubVm pub) "before-commit"
-        held ← runHeld pub "a" "publish" "a" (Just "a")
-        awaitGate (pubVm pub) "before-commit"
-        closeHost (pubModel pub)
-        openGate (pubVm pub) "before-commit"
-        _ ← held
-        publishedRevision (pubModel pub) winA `shouldReturn` 0
+    -- Each pauses the script inside the publication at a gate, changes one fact the commit reads, and lets it go:
+    -- the commit refuses the whole publication as an ordinary Lua error (pcall returns false) and the previous scene
+    -- stays.
+    let refusedAt gate expected change =
+          withPublication $ \pub → do
+            ready pub "a"
+            loaded pub "a" "a" "a.png"
+            armGate (pubVm pub) gate
+            held ← runHeld pub "a" "ppublish" "a" (Just "a")
+            awaitGate (pubVm pub) gate
+            () <$ change pub
+            openGate (pubVm pub) gate
+            line ← held
+            line `shouldSatisfy` Text.isInfixOf "error"
+            line `shouldSatisfy` Text.isInfixOf expected
+            publishedRevision (pubModel pub) winA `shouldReturn` 0
+    it "refuses when the window stops being the admitted incarnation before the authority is read" $
+      refusedAt "before-boundary" "not ready" $ \pub → setUsable (pubModel pub) winA False
+    it "refuses when the instance's window owner is closed between the borrows and the commit" $
+      refusedAt "before-commit" "ended" $ \pub → ownersOf (pubVm pub) "a" >>= closeWindowOwner . snd
+    it "refuses when the provider stops between the borrows and the commit" $
+      refusedAt "before-commit" "stopped" $ \pub → endWindows (scProvider (pubComp pub))
+    it "refuses when the attachment stops being usable between the borrows and the commit" $
+      refusedAt "before-commit" "not ready" $ \pub → setUsable (pubModel pub) winA False
+    it "refuses when the host closes between the borrows and the commit" $
+      refusedAt "before-commit" "ended" $ \pub → closeHost (pubModel pub)
 
     it "keeps an accepted scene when the provider stops, or the instance is asked to end, after the commit" $
       withPublication $ \pub → do
         ready pub "a"
         loaded pub "a" "a" "a.png"
         armGate (pubVm pub) "after-commit"
-        held ← runHeld pub "a" "publish" "a" (Just "a")
+        held ← runHeld pub "a" "ppublish" "a" (Just "a")
         awaitGate (pubVm pub) "after-commit"
         endWindows (scProvider (pubComp pub))
         stopScene (pubComp pub) (pubVm pub) "a"
         openGate (pubVm pub) "after-commit"
-        _ ← held
+        line ← held
+        line `shouldSatisfy` Text.isInfixOf "published"
         -- The scene is the window's, owned by the host from the commit, whatever came after it.
         publishedRevision (pubModel pub) winA `shouldReturn` 1
         scene ← latest pub winA
         Set.size (graphicsReferences scene) `shouldBe` 1
+
+  it "takes the largest legal scene through the binding: 4,096 sprites are accepted and one more is refused" $
+    withPublication $ \pub → do
+      ready pub "a"
+      loaded pub "a" "a" "a.png"
+      accepted ← run pub "a" "ppublish" "a" (Just (Text.intercalate "," (replicate 4096 "a")))
+      accepted `shouldSatisfy` Text.isInfixOf "published"
+      scene ← latest pub winA
+      length (sceneSprites (graphicsContent scene)) `shouldBe` 4096
+      refused ← run pub "a" "pbad" "a" (Just "many")
+      refused `shouldSatisfy` Text.isInfixOf "error"
+      publishedRevision (pubModel pub) winA `shouldReturn` 1
 
   it "keeps a released texture drawable after adoption, and retires it once the scene is replaced and its use is over" $
     withPublication $ \pub → do

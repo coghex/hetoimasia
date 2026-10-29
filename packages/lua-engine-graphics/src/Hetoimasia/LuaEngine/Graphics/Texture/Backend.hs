@@ -1087,14 +1087,16 @@ textureStep backend tid tex = do
           Just StepProgress <$ writeTVar (tStage tex) (TexFailed raised)
         Just (NotRun refusal) → Just StepProgress <$ failTexture (refusalText refusal)
     TexHeld → do
-      -- Read in this transaction, so the end of the last hold wakes the pump. The barrier already did its work
-      -- (every revision published before the release was adopted before the first action ran), so the ask
-      -- again needs none.
+      -- Read in this transaction, so the end of the last hold wakes the pump. The ask goes through the barrier lane
+      -- again, not the ordinary one: the last adoption may have ended with its window still retaining the revision
+      -- it adopted (a target that is replaced leaves the window's published scene for the next attachment), and
+      -- that publication names this texture. The barrier a request captures names every window that has published
+      -- and waits until a live target of it has adopted that revision, or the window is gone.
       holding ← portHeld (bPort backend) (registrationRef (tRegistration tex))
       if holding
         then pure Nothing
         else
-          portAct (bPort backend) (deliveredReleaseAction (tRegistration tex)) >>= \case
+          portRelease (bPort backend) (deliveredReleaseAction (tRegistration tex)) >>= \case
             Right sub → Just StepProgress <$ writeTVar (tStage tex) (TexReleasing sub)
             Left (PortEnded why) → do
               _ ← noteEnded backend why

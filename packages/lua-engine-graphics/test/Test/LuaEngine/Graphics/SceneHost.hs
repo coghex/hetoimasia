@@ -104,10 +104,10 @@ modelWindow model window = atomically (modifyTVar' (mWindows model) (Map.insert 
 
 -- | The window's capability, as the window provider's port yields it: publish, and whether the incarnation is
 -- usable.
-modelTarget ∷ Model → Int → (Prepared GraphicsScene → IO HostAnswer, STM Bool)
+modelTarget ∷ Model → Int → (Prepared GraphicsScene → STM HostAnswer, STM Bool)
 modelTarget model window = (publishing, usable)
   where
-    publishing scene = atomically $ do
+    publishing scene = do
       closed ← readTVar (mClosed model)
       windows ← readTVar (mWindows model)
       case Map.lookup window windows of

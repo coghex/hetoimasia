@@ -25,10 +25,10 @@
 --    member as in use), so no release of a texture the scene names can run between this check and the
 --    host holding the scene. A prepared identity of a texture that has since been released and replaced by
 --    another at the same index is not that texture;
--- 3. one transaction reads the instance's and the provider's admission (an ending instance or a stopped
---    provider is refused), the window's incarnation (it must still be the admitted, attached one), and the
---    renderer registry's own flag for each texture's exact handle (its generation included);
--- 4. the scene is made the window's latest value ('targetPublish'), inside the pins.
+-- 3. one transaction reads the instance's and the provider's admission (an ending instance or a stopped provider is
+--    refused), the window's incarnation (it must still be the admitted, attached one), and the renderer registry's own
+--    flag for each texture's exact handle, and, in the same transaction, makes the scene the window's latest value.
+--    Nothing that closes can land between the reads and the write.
 --
 -- The valid outcomes of a race are the two the specification names. If the publication wins, the whole scene
 -- is accepted, and a release that follows asks for a barrier that includes it: the release lane waits until
@@ -44,15 +44,12 @@
 --
 -- = Refusal, and what is fatal
 --
--- Everything the call can know before it has an effect is an ordinary Lua error from the binding's argument
--- check ('graphicsPublishCheck': the scene's own check, then the window's role, admission and readiness):
--- @pcall@ catches it, the previous scene stays, and the next valid call works. The operation then asks
--- again at the boundary. A refusal there ('Refused') can only be a fact that changed between the check and
--- the commit on this very thread, which only a concurrent stop, closure or end can do, so the binding does
--- not make an error of it: a closure is a publication that did not happen in a world that is ending (the call
--- returns, nothing is published), and anything else is the engine's defect ('GraphicsPublishDefect'), raised
--- as the application's failure. An exception from the host, the registry or a cancellation is raised, never
--- refused: nothing here downgrades a defect or clears a fatal latch.
+-- Every refusal, including the ones found at the commit, is an ordinary Lua error from the binding
+-- ('graphicsPublishCommit'): @pcall@ catches it, the previous scene stays, and the next valid call works. The host
+-- allows an ordinary error only before a binding's action, so the commit is made in the binding's argument check,
+-- which runs once per call on the calling thread; the action has nothing left to do. A defect of the host or the
+-- registry, an exception or a cancellation is raised, never refused: nothing here downgrades a defect or clears a
+-- fatal latch.
 --
 -- = Owned state, threads and lifetime
 --
@@ -80,14 +77,14 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Publish
   , publishSceneWith
 
     -- * The binding
-  , graphicsPublishCheck
+  , graphicsPublishCommit
   , graphicsPublishBinding
   , graphicsPublishBindingWith
-  , GraphicsPublishDefect (..)
+  , PublishBindingRefused (..)
   ) where
 
 import Control.Concurrent.STM (STM, atomically)
-import Control.Exception (Exception, throwIO)
+import Control.Monad (when)
 import qualified Data.ByteString as ByteString
 import Data.Functor ((<&>))
 import Data.Text (Text)
@@ -115,7 +112,7 @@ import Hetoimasia.LuaEngine.Scene
   , SceneLimits
   , TextureUse (..)
   , prepareScene
-  , sceneArgumentCheck
+  , refusalReasonText
   , sceneSchema
   , sceneValueLimits
   , textureUses
@@ -130,15 +127,26 @@ import Hetoimasia.Scripting.Lua.Registration
   , withArgumentCheck
   , withArgumentLimits
   )
-import Hetoimasia.Scripting.Lua.Value (Schema (SCapability), Value (VCapability), capabilityKey, capabilityTypeName)
+import Hetoimasia.Scripting.Lua.Value
+  ( LimitsRefusal
+  , Schema (SCapability)
+  , Value (VCapability)
+  , capabilityKey
+  , capabilityTypeName
+  , limitBytes
+  , limitDepth
+  , limitElements
+  , valueLimits
+  )
 
 -- | What a publication reads of the session: the renderer registry that knows each texture's exact handle,
 -- the window provider whose admission a stop closes, and the two things a window's capability does.
 data ScenePublisher target = ScenePublisher
   { publisherTextures ∷ !Textures
   , publisherTaking ∷ STM Bool
-  , publisherPublish ∷ target → Prepared GraphicsScene → IO HostAnswer
-    -- ^ Make the scene the window's latest value. Never waits.
+  , publisherPublish ∷ target → Prepared GraphicsScene → STM HostAnswer
+    -- ^ Make the scene the window's latest value, as a transaction: the authority checks and this are one atomic
+    -- step. Never waits.
   , publisherUsable ∷ target → STM Bool
     -- ^ Whether the capability's window incarnation is still the admitted, attached one.
   }
@@ -158,16 +166,16 @@ scenePublisher textures provider = scenePublisherOver textures provider targetAn
 
 -- | The host's answer to a publication through the production window capability, without the window identities
 -- its own answer carries.
-targetAnswer ∷ WindowTarget GraphicsScene → Prepared GraphicsScene → IO HostAnswer
+targetAnswer ∷ WindowTarget GraphicsScene → Prepared GraphicsScene → STM HostAnswer
 targetAnswer target scene =
-  targetPublish target scene <&> \case
+  targetPublishSTM target scene <&> \case
     WindowScenePublished _ _ → HostAccepted
     WindowSceneUnknown _ → HostAnsweredUnknown
     WindowSceneClosed _ → HostAnsweredClosed
     WindowScenesNotEnabled _ → HostAnsweredShared
 
 -- | The same over any window capability: the lifecycle suite's, which has no window identity to mint.
-scenePublisherOver ∷ Textures → WindowProvider target → (target → Prepared GraphicsScene → IO HostAnswer) → (target → STM Bool) → ScenePublisher target
+scenePublisherOver ∷ Textures → WindowProvider target → (target → Prepared GraphicsScene → STM HostAnswer) → (target → STM Bool) → ScenePublisher target
 scenePublisherOver textures provider = ScenePublisher textures (providerTaking provider)
 
 -- | What a publication came to. Success carries no revision and no receipt: the scene is the window's
@@ -247,19 +255,22 @@ publishSceneWith hooks publisher windowKey prepared = do
   hookBeforeBoundary hooks
   withWindowOr @target leases windowKey (pure . Refused . WindowRefused) $ \resource →
     pinned (zip [1 ..] (textureUses prepared)) $ do
-      final ← atomically (boundary publisher resource (zip [1 ..] (textureUses prepared)))
-      case final of
-        Just refusal → pure (Refused refusal)
-        Nothing → do
-          hookBeforeCommit hooks
-          scene ← prepare (graphicsScene prepared)
-          published ← publisherPublish publisher (resourceTarget resource) scene
-          hookAfterCommit hooks
-          pure $ case published of
-            HostAccepted → Published
-            HostAnsweredUnknown → Refused HostWindowUnknown
-            HostAnsweredClosed → Refused HostClosed
-            HostAnsweredShared → Refused HostNotPerWindow
+      hookBeforeCommit hooks
+      scene ← prepare (graphicsScene prepared)
+      -- One transaction: the authority is read and the scene is made the window's latest value in the same step, so
+      -- no closure of the instance, the provider or the window's incarnation can land between them. A refusal
+      -- writes nothing.
+      committed ← atomically $
+        boundary publisher resource (zip [1 ..] (textureUses prepared)) >>= \case
+          Just refusal → pure (Refused refusal)
+          Nothing →
+            publisherPublish publisher (resourceTarget resource) scene <&> \case
+              HostAccepted → Published
+              HostAnsweredUnknown → Refused HostWindowUnknown
+              HostAnsweredClosed → Refused HostClosed
+              HostAnsweredShared → Refused HostNotPerWindow
+      when (committed == Published) (hookAfterCommit hooks)
+      pure committed
   where
     leases = preparedOwner prepared
     -- Each distinct texture borrowed, in prepared order, and its prepared identity compared; the action runs
@@ -298,56 +309,56 @@ boundary publisher resource uses = do
 
 -- The binding -----------------------------------------------------------------------------------------
 
--- | The check of a publication binding's copied arguments, made before the action: first the facade's own
--- precondition (the UI-only role, the phase and the quit checks, which are the graphics facade's to name), then the
--- scene's own check ('sceneArgumentCheck') and the window handle's lease, role, admission and readiness. A refusal is
--- bounded text for an ordinary Lua error: nothing is published, held or changed, and a @pcall@ that catches it goes
--- on.
-graphicsPublishCheck ∷ ∀ target. Typeable target ⇒ ArgumentCheck → ScenePublisher target → SceneLimits → Leases → ArgumentCheck
-graphicsPublishCheck precondition publisher limits leases owner values =
+-- | The publication as the binding's argument check: the place the host lets a refusal be an ordinary Lua error.
+--
+-- A refusal the host makes after a binding's action is a typed fault of the call, which a @pcall@ cannot hide, and
+-- no public path raises an ordinary error from inside an action. Stop, closure and an ending instance are
+-- /expected/ refusals ("Scene publication after the stop latch is an ordinary Lua error"), and they can land between
+-- any earlier check and the commit. So the commit is made here, once per call, on the calling thread, after the
+-- facade's own precondition and the scene's own check ('prepareScene'), and its result is the check's: 'Nothing'
+-- when the scene was published, otherwise the bounded reason, which the host raises as an ordinary Lua error with the
+-- previous publication untouched. The binding's action then has nothing left to do. An exception (a defect of the
+-- host or the registry, a cancellation) is the application's failure, never a refusal.
+graphicsPublishCommit ∷ ∀ target. Typeable target ⇒ PublishHooks → ArgumentCheck → ScenePublisher target → SceneLimits → Leases → ArgumentCheck
+graphicsPublishCommit hooks precondition publisher limits leases owner values =
   precondition owner values >>= \case
     Just why → pure (Just why)
     Nothing → case values of
       [VCapability window, scene]
         | capabilityTypeName window /= windowHandleType → pure (Just "the first argument is not a window")
-        | otherwise → do
-            refused ← withWindowOr @target leases (capabilityKey window) (pure . Just . publishRefusalText . WindowRefused) $ \resource →
-              fmap (fmap publishRefusalText) (atomically (boundary publisher resource []))
-            case refused of
-              Just why → pure (Just why)
-              Nothing → sceneArgumentCheck limits leases owner [scene]
+        | otherwise →
+            prepareScene limits leases scene >>= \case
+              Left refusal → pure (Just (refusalReasonText refusal))
+              Right prepared →
+                publishSceneWith hooks publisher (capabilityKey window) prepared <&> \case
+                  Published → Nothing
+                  Refused refusal → Just (publishRefusalText refusal)
       other → pure (Just (Text.pack ("publishing takes a window and a scene, not " <> show (length other) <> " arguments")))
 
--- | A binding that takes a window and a scene, refuses with an ordinary Lua error whatever it can know
--- before it has an effect, and otherwise publishes. Answers nothing to the script.
-graphicsPublishBinding ∷ ∀ target. Typeable target ⇒ Text → ArgumentCheck → ScenePublisher target → SceneLimits → Leases → Binding
+-- | Why a publication binding could not be made.
+newtype PublishBindingRefused = PublishLimitsRefused LimitsRefusal
+  deriving (Eq, Show)
+
+-- | A binding that takes a window and a scene, refuses with an ordinary Lua error whatever can be known up to the
+-- commit, and otherwise publishes ('graphicsPublishCommit'). Answers nothing to the script.
+--
+-- Its arguments cross together, so its limits are the scene's own widened by what the window handle beside the
+-- scene adds to one crossing: one element and a capability's bytes ('windowArgumentAllowance'). Without that, the
+-- largest legal scene (4,096 sprites) would be one element over the scene's bound.
+graphicsPublishBinding ∷ ∀ target. Typeable target ⇒ Text → ArgumentCheck → ScenePublisher target → SceneLimits → Leases → Either PublishBindingRefused Binding
 graphicsPublishBinding = graphicsPublishBindingWith noPublishHooks
 
 -- | The same with the test seams of 'publishSceneWith'.
-graphicsPublishBindingWith ∷ ∀ target. Typeable target ⇒ PublishHooks → Text → ArgumentCheck → ScenePublisher target → SceneLimits → Leases → Binding
-graphicsPublishBindingWith hooks name precondition publisher limits leases =
-  withArgumentLimits (sceneValueLimits limits) $
-    withArgumentCheck (graphicsPublishCheck precondition publisher limits leases) $
-      stateOperation name [SCapability windowHandleType, sceneSchema] [] $ \case
-        [VCapability window, scene] →
-          prepareScene limits leases scene >>= \case
-            Left refusal → throwIO (GraphicsPublishDefect (Text.pack (show refusal)))
-            Right prepared →
-              publishSceneWith hooks publisher (capabilityKey window) prepared >>= \case
-                Published → pure []
-                Refused refusal → closure refusal
-        _ → throwIO (GraphicsPublishDefect "the host handed a scene publication other than a window and a scene")
-  where
-    -- A fact that changed between the check and the commit can only be the world ending.
-    closure refusal
-      | refusal `elem` [InstanceEnded, PublicationStopped, WindowNotReady, HostWindowUnknown, HostClosed] = pure []
-      | otherwise = throwIO (GraphicsPublishDefect (publishRefusalText refusal))
+graphicsPublishBindingWith ∷ ∀ target. Typeable target ⇒ PublishHooks → Text → ArgumentCheck → ScenePublisher target → SceneLimits → Leases → Either PublishBindingRefused Binding
+graphicsPublishBindingWith hooks name precondition publisher limits leases = do
+  let scene = sceneValueLimits limits
+  widened ← either (Left . PublishLimitsRefused) Right (valueLimits (limitBytes scene + windowArgumentAllowance) (limitDepth scene) (limitElements scene + 1))
+  Right $
+    withArgumentLimits widened $
+      withArgumentCheck (graphicsPublishCommit hooks precondition publisher limits leases) $
+        stateOperation name [SCapability windowHandleType, sceneSchema] [] (\_ → pure [])
 
--- | A scene its check accepted was refused at the boundary for a reason that cannot come from the script (the
--- value, the instance and its leases are the same and nothing runs between): the engine's failure, raised as
--- the application's and never recoverable.
-newtype GraphicsPublishDefect = GraphicsPublishDefect Text
-  deriving (Eq, Show)
-
-instance Exception GraphicsPublishDefect
-
+-- | What a window capability adds to one crossing, in bytes: far more than its encoding, and far less than any
+-- limit it is added to.
+windowArgumentAllowance ∷ Int
+windowArgumentAllowance = 64

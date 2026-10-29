@@ -120,7 +120,7 @@ spec env = describe "scene retention" $ do
       window ← openWindow env comp vm "a"
       loadTexture comp vm "a" "a" "a.png"
       earlier ← length <$> readTVarIO (envFrames env)
-      _ ← run comp vm "a" "publish_full" "a" Nothing
+      _ ← run comp vm "a" "publish" "a" (Just (Text.intercalate "," (replicate 4096 "a")))
       awaitAdopted env window 1
       awaitFrame env window 1 earlier
       held ← atomically (ledgerReading (graphicsLedger (envGraphics env)))
