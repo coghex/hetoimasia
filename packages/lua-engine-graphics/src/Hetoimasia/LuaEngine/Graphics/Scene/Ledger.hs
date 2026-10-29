@@ -50,6 +50,8 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Ledger
   , SceneLedger
   , newSceneLedger
   , ledgerLifecycle
+  , ledgerAdopted
+  , ledgerReleased
   , ledgerHeld
   , ledgerHolds
 
@@ -115,8 +117,8 @@ data Adoption = Adoption
   , adoptionHolds ∷ !(Set Word64)
   }
 
-data State = State
-  { stRecords ∷ !(Map (WindowId, Natural) Adoption)
+data State w = State
+  { stRecords ∷ !(Map (w, Natural) Adoption)
   , stAdopted ∷ !Natural
     -- ^ Adoptions notified, ever.
   , stReleased ∷ !Natural
@@ -125,23 +127,33 @@ data State = State
   , stFirstDefect ∷ !(Maybe Text)
   }
 
--- | The ledger of what the adopted revisions hold.
-newtype SceneLedger = SceneLedger (TVar State)
+-- | The ledger of what the adopted revisions hold, keyed by the window's identity. The key is the host's
+-- 'WindowId' in production ('ledgerLifecycle'); it is a parameter so that the lifecycle suite, which cannot
+-- mint a window identity, drives the same ledger with any ordered key.
+newtype SceneLedger w = SceneLedger (TVar (State w))
 
 -- | A ledger with nothing adopted.
-newSceneLedger ∷ IO SceneLedger
+newSceneLedger ∷ IO (SceneLedger w)
 newSceneLedger = SceneLedger <$> newTVarIO (State Map.empty 0 0 0 Nothing)
 
 -- | The two hooks the host is configured with. Both are one transaction over pure data on the owner's
 -- thread: neither waits, calls Lua or raises.
-ledgerLifecycle ∷ SceneLedger → SceneLifecycle GraphicsScene
-ledgerLifecycle (SceneLedger var) =
+ledgerLifecycle ∷ SceneLedger WindowId → SceneLifecycle GraphicsScene
+ledgerLifecycle ledger =
   SceneLifecycle
-    { sceneAdopted = \window revision scene → atomically (adopt var window revision (graphicsReferences scene))
-    , sceneReleased = \window revision → atomically (release var window revision)
+    { sceneAdopted = \window revision scene → ledgerAdopted ledger window revision scene
+    , sceneReleased = ledgerReleased ledger
     }
 
-adopt ∷ TVar State → WindowId → Natural → Set Word64 → STM ()
+-- | The owner adopted this revision of the window, with this scene: hold what it names, once more.
+ledgerAdopted ∷ (Ord w, Show w) ⇒ SceneLedger w → w → Natural → GraphicsScene → IO ()
+ledgerAdopted (SceneLedger var) window revision scene = atomically (adopt var window revision (graphicsReferences scene))
+
+-- | One adoption of this revision of the window has been released: hold what it names once less.
+ledgerReleased ∷ (Ord w, Show w) ⇒ SceneLedger w → w → Natural → IO ()
+ledgerReleased (SceneLedger var) window revision = atomically (release var window revision)
+
+adopt ∷ (Ord w, Show w) ⇒ TVar (State w) → w → Natural → Set Word64 → STM ()
 adopt var window revision holds = do
   st ← readTVar var
   let key = (window, revision)
@@ -156,7 +168,7 @@ adopt var window revision holds = do
             ("a revision was adopted again under a different scene: window " <> Text.pack (show window) <> ", revision " <> Text.pack (show revision))
             counted {stRecords = Map.insert key (Adoption (adoptionCount found + 1) (adoptionHolds found <> holds)) (stRecords st)}
 
-release ∷ TVar State → WindowId → Natural → STM ()
+release ∷ (Ord w, Show w) ⇒ TVar (State w) → w → Natural → STM ()
 release var window revision = do
   st ← readTVar var
   let key = (window, revision)
@@ -170,21 +182,21 @@ release var window revision = do
       | adoptionCount found > 1 → counted {stRecords = Map.insert key found {adoptionCount = adoptionCount found - 1} (stRecords st)}
       | otherwise → counted {stRecords = Map.delete key (stRecords st)}
 
-defect ∷ Text → State → State
+defect ∷ Text → State w → State w
 defect what st = st {stDefects = stDefects st + 1, stFirstDefect = Just (fromMaybe what (stFirstDefect st))}
 
 -- | Whether any adopted, unreleased revision holds this texture, by its complete identity.
-ledgerHeld ∷ SceneLedger → Word64 → STM Bool
+ledgerHeld ∷ SceneLedger w → Word64 → STM Bool
 ledgerHeld ledger identity = (> 0) <$> ledgerHolds ledger identity
 
 -- | How many adoptions hold this texture: for each window and revision, the count of its adoptions.
-ledgerHolds ∷ SceneLedger → Word64 → STM Int
+ledgerHolds ∷ SceneLedger w → Word64 → STM Int
 ledgerHolds (SceneLedger var) identity =
   sum . map adoptionCount . filter (Set.member identity . adoptionHolds) . Map.elems . stRecords <$> readTVar var
 
 -- | What the ledger holds now.
-data LedgerReading = LedgerReading
-  { readingRecords ∷ ![((WindowId, Natural), Int)]
+data LedgerReading w = LedgerReading
+  { readingRecords ∷ ![((w, Natural), Int)]
     -- ^ Each adopted, unreleased window and revision with its adoption count, in key order.
   , readingHeld ∷ !(Set Word64)
     -- ^ Every texture identity any adoption holds.
@@ -197,7 +209,7 @@ data LedgerReading = LedgerReading
   }
   deriving (Eq, Show)
 
-ledgerReading ∷ SceneLedger → STM LedgerReading
+ledgerReading ∷ SceneLedger w → STM (LedgerReading w)
 ledgerReading (SceneLedger var) = do
   st ← readTVar var
   pure

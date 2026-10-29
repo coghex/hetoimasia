@@ -96,6 +96,8 @@ test-suite lua-engine-graphics-tests
         Test.LuaEngine.Graphics.Pressure
         Test.LuaEngine.Graphics.Release
         Test.LuaEngine.Graphics.Rig
+        Test.LuaEngine.Graphics.SceneHost
+        Test.LuaEngine.Graphics.Scenes
         Test.LuaEngine.Graphics.Spec
         Test.LuaEngine.Graphics.Stages
         Test.LuaEngine.Graphics.Teardown
@@ -131,8 +133,11 @@ test-suite lua-engine-graphics-tests
         hetoimasia-lua-engine-graphics,
         hetoimasia-lua-engine:facade,
         hetoimasia-lua-engine:request,
+        hetoimasia-lua-engine:scene,
         hetoimasia-lua-engine:session,
         hetoimasia-lua-engine:texture,
+        hetoimasia-render-2d ==0.1.0.0,
+        hetoimasia-render-2d-vulkan ==0.1.0.0,
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-scripting-lua ==0.1.0.0,
         hetoimasia-scripting-lua:runtime-lua

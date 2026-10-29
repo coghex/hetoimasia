@@ -51,6 +51,7 @@ import Control.Exception (Exception, ExceptionWithContext, SomeException, throwI
 import Data.Word (Word64)
 import Hetoimasia.GPU.Vulkan.GLFW (Image, TextureHandle (..), UploadTicket, VulkanHost, VulkanHostConfig)
 import Hetoimasia.LuaEngine.Graphics.Scene.Configuration (SceneHostProblem, SceneSession (..), checkSceneHostConfig)
+import Hetoimasia.GLFW.Window (WindowId)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (SceneLedger)
 import Hetoimasia.LuaEngine.Graphics.Scene.Render (RenderSession (..), fillRenderSlot)
 import Hetoimasia.LuaEngine.Graphics.Texture.Backend
@@ -77,7 +78,7 @@ data TextureGraphics = TextureGraphics
     -- ^ The session's one renderer: the ring, the texture table, the storage table and the layout.
   , graphicsTextures ∷ !Textures
     -- ^ The session's one texture registry, whose handles the scene adapters name.
-  , graphicsLedger ∷ !SceneLedger
+  , graphicsLedger ∷ !(SceneLedger WindowId)
     -- ^ What the adopted scene revisions hold: the release of a delivered texture is gated on it.
   , graphicsConfiguration ∷ !TextureGraphicsConfiguration
   , graphicsPort ∷ !(Port Image UploadTicket)

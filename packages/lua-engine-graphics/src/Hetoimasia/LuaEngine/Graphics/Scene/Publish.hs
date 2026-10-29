@@ -66,6 +66,8 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Publish
   ( -- * The publisher
     ScenePublisher
   , scenePublisher
+  , scenePublisherOver
+  , HostAnswer (..)
 
     -- * Publishing
   , PublishResult (..)
@@ -85,11 +87,13 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Publish
 import Control.Concurrent.STM (STM, atomically)
 import Control.Exception (Exception, throwIO)
 import qualified Data.ByteString as ByteString
+import Data.Functor ((<&>))
 import Data.Text (Text)
+import Data.Typeable (Typeable)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Encoding
 import Data.Word (Word64)
-import Hetoimasia.Foundation.Messaging.Payload (prepare)
+import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
 import Hetoimasia.GPU.Vulkan.GLFW (TextureHandle (..), WindowScenePublication (..))
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene, graphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port (TextureRef (..), textureRefOf)
@@ -127,15 +131,39 @@ import Hetoimasia.Scripting.Lua.Registration
 import Hetoimasia.Scripting.Lua.Value (Schema (SCapability), Value (VCapability), capabilityKey, capabilityTypeName)
 
 -- | What a publication reads of the session: the renderer registry that knows each texture's exact handle,
--- and the window provider whose admission a stop closes.
-data ScenePublisher = ScenePublisher
+-- the window provider whose admission a stop closes, and the two things a window's capability does.
+data ScenePublisher target = ScenePublisher
   { publisherTextures ∷ !Textures
   , publisherTaking ∷ STM Bool
+  , publisherPublish ∷ target → Prepared GraphicsScene → IO HostAnswer
+    -- ^ Make the scene the window's latest value. Never waits.
+  , publisherUsable ∷ target → STM Bool
+    -- ^ Whether the capability's window incarnation is still the admitted, attached one.
   }
 
--- | A publisher over the session's registry and the window provider.
-scenePublisher ∷ Textures → WindowProvider (WindowTarget GraphicsScene) → ScenePublisher
-scenePublisher textures provider = ScenePublisher textures (providerTaking provider)
+-- | What the host answered a publication, without the window identities its own answer carries.
+data HostAnswer
+  = HostAccepted
+  | HostAnsweredUnknown
+  | HostAnsweredClosed
+  | HostAnsweredShared
+  deriving (Eq, Show)
+
+-- | A publisher over the session's registry and the window provider, publishing through the capability
+-- the production window port yields.
+scenePublisher ∷ Textures → WindowProvider (WindowTarget GraphicsScene) → ScenePublisher (WindowTarget GraphicsScene)
+scenePublisher textures provider = scenePublisherOver textures provider answer targetUsable
+  where
+    answer target scene =
+      targetPublish target scene <&> \case
+        WindowScenePublished _ _ → HostAccepted
+        WindowSceneUnknown _ → HostAnsweredUnknown
+        WindowSceneClosed _ → HostAnsweredClosed
+        WindowScenesNotEnabled _ → HostAnsweredShared
+
+-- | The same over any window capability: the lifecycle suite's, which has no window identity to mint.
+scenePublisherOver ∷ Textures → WindowProvider target → (target → Prepared GraphicsScene → IO HostAnswer) → (target → STM Bool) → ScenePublisher target
+scenePublisherOver textures provider = ScenePublisher textures (providerTaking provider)
 
 -- | What a publication came to. Success carries no revision and no receipt: the scene is the window's
 -- latest value, and nothing is promised about when, or whether, a frame shows it.
@@ -205,14 +233,14 @@ noPublishHooks ∷ PublishHooks
 noPublishHooks = PublishHooks (pure ()) (pure ()) (pure ())
 
 -- | Publish a prepared scene to the window the lease key names.
-publishScene ∷ ScenePublisher → Word64 → PreparedScene → IO PublishResult
+publishScene ∷ Typeable target ⇒ ScenePublisher target → Word64 → PreparedScene → IO PublishResult
 publishScene = publishSceneWith noPublishHooks
 
 -- | 'publishScene' with the test seams.
-publishSceneWith ∷ PublishHooks → ScenePublisher → Word64 → PreparedScene → IO PublishResult
+publishSceneWith ∷ ∀ target. Typeable target ⇒ PublishHooks → ScenePublisher target → Word64 → PreparedScene → IO PublishResult
 publishSceneWith hooks publisher windowKey prepared = do
   hookBeforeBoundary hooks
-  withWindowOr leases windowKey (pure . Refused . WindowRefused) $ \resource →
+  withWindowOr @target leases windowKey (pure . Refused . WindowRefused) $ \resource →
     pinned (zip [1 ..] (textureUses prepared)) $ do
       final ← atomically (boundary publisher resource (zip [1 ..] (textureUses prepared)))
       case final of
@@ -220,13 +248,13 @@ publishSceneWith hooks publisher windowKey prepared = do
         Nothing → do
           hookBeforeCommit hooks
           scene ← prepare (graphicsScene prepared)
-          published ← targetPublish (resourceTarget resource) scene
+          published ← publisherPublish publisher (resourceTarget resource) scene
           hookAfterCommit hooks
           pure $ case published of
-            WindowScenePublished _ _ → Published
-            WindowSceneUnknown _ → Refused HostWindowUnknown
-            WindowSceneClosed _ → Refused HostClosed
-            WindowScenesNotEnabled _ → Refused HostNotPerWindow
+            HostAccepted → Published
+            HostAnsweredUnknown → Refused HostWindowUnknown
+            HostAnsweredClosed → Refused HostClosed
+            HostAnsweredShared → Refused HostNotPerWindow
   where
     leases = preparedOwner prepared
     -- Each distinct texture borrowed, in prepared order, and its prepared identity compared; the action runs
@@ -240,11 +268,11 @@ publishSceneWith hooks publisher windowKey prepared = do
           else pinned rest inner
 
 -- | The facts a publication decides on, read in one transaction.
-boundary ∷ ScenePublisher → WindowResource (WindowTarget GraphicsScene) → [(Int, TextureUse)] → STM (Maybe PublishRefusal)
+boundary ∷ ScenePublisher target → WindowResource target → [(Int, TextureUse)] → STM (Maybe PublishRefusal)
 boundary publisher resource uses = do
   taking ← ownerTaking (resourceOwner resource)
   provider ← publisherTaking publisher
-  usable ← targetUsable (resourceTarget resource)
+  usable ← publisherUsable publisher (resourceTarget resource)
   released ← firstReleased uses
   pure $ case () of
     _
@@ -269,12 +297,12 @@ boundary publisher resource uses = do
 -- ('sceneArgumentCheck'), then the window handle's lease, role, admission and readiness. A refusal is
 -- bounded text for an ordinary Lua error: nothing is published, held or changed, and a @pcall@ that catches
 -- it goes on.
-graphicsPublishCheck ∷ ScenePublisher → SceneLimits → Leases → ArgumentCheck
+graphicsPublishCheck ∷ ∀ target. Typeable target ⇒ ScenePublisher target → SceneLimits → Leases → ArgumentCheck
 graphicsPublishCheck publisher limits leases owner values = case values of
   [VCapability window, scene]
     | capabilityTypeName window /= windowHandleType → pure (Just "the first argument is not a window")
     | otherwise → do
-        window' ← withWindowOr leases (capabilityKey window) (pure . Just . publishRefusalText . WindowRefused) $ \resource →
+        window' ← withWindowOr @target leases (capabilityKey window) (pure . Just . publishRefusalText . WindowRefused) $ \resource →
           fmap (fmap publishRefusalText) (atomically (boundary publisher resource []))
         case window' of
           Just why → pure (Just why)
@@ -283,7 +311,7 @@ graphicsPublishCheck publisher limits leases owner values = case values of
 
 -- | A binding that takes a window and a scene, refuses with an ordinary Lua error whatever it can know
 -- before it has an effect, and otherwise publishes. Answers nothing to the script.
-graphicsPublishBinding ∷ Text → ScenePublisher → SceneLimits → Leases → Binding
+graphicsPublishBinding ∷ ∀ target. Typeable target ⇒ Text → ScenePublisher target → SceneLimits → Leases → Binding
 graphicsPublishBinding name publisher limits leases =
   withArgumentLimits (sceneValueLimits limits) $
     withArgumentCheck (graphicsPublishCheck publisher limits leases) $
