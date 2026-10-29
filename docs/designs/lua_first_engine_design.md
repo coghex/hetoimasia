@@ -9250,6 +9250,12 @@ replace boundary tests, prove performance or establish confinement.
   frame or GPU completion is inferred from a CPU function returning.
 - **Owner/tests:** headless GPU/scene tests and focused native retention checks;
   preserve the six-revision policy and no unbounded publication FIFO.
+- **As delivered ([#535](https://github.com/coghex/hetoimasia/issues/535)):**
+  `packages/lua-engine-graphics`, [Scene publication](../../packages/lua-engine-graphics/README.md#scene-publication-lfe-20):
+  a per-window scene and a hold ledger counting adoptions, a publication boundary
+  that pins the window and every texture lease until the host holds the scene, a
+  table release gated on the ledger and retained (not failed) while held, and a
+  per-frame renderer that builds the view from the frame's own metrics.
 
 #### LFE-21. Expose the complete UI-only graphics facade
 

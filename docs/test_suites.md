@@ -165,3 +165,15 @@ cabal test hetoimasia-tests --test-show-details=direct
   (group `test.vulkan-headless`), a gated fake port inside the real request
   admission, leases and a Lua owner; the shared composition lives in the
   package's `test-common` directory, not in either suite's spec modules.
+  Its scene publication (LFE-20) has a second native subgroup, `scene retention`:
+  a published scene adopted by the real owner, its texture protected and recorded
+  again after Lua released it, a publication naming the released lease refused,
+  retirement only after the scene is replaced and the frames that used it
+  completed, a peer instance's scene kept adopted and recorded when the first
+  ends, and the largest legal scene recorded; the same consent and command, with
+  `-- --match 'scene retention'`. It reads the host's frame events and scene state
+  and captures no pixel. Its headless counterparts in `lua-engine-graphics-tests`
+  are `scene retention` (the production ledger and backend over the fake owner and
+  a model of the host's ledger rules, which is injected evidence), `scene
+  publication` (real Lua instances, leases, pipeline and window provider) and `the
+  frame of an adopted scene` (the pure adaptation against the render-2d oracle).

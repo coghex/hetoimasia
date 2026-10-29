@@ -207,7 +207,14 @@ them into the backend's validated model belongs to the graphics composition.
   The same value is reserved at texture admission.
 - `sceneElementBound` is 6 fixed elements plus 6 per sprite under the
   copied-value element counting (a table is one element, a key none): 24,582 at
-  4,096 sprites, within 65,536.
+  4,096 sprites, within 65,536. `sceneCallElementBound` adds the window handle a
+  publishing call carries beside the scene (`sceneCallExtraElements`, one element:
+  the reader keeps one counter for all the arguments of a call): 24,583 at 4,096
+  sprites. Validation relates the call's count, not the scene's alone, to
+  `CopiedValueElements`, and the call's bytes (`SceneInputBytes` plus
+  `sceneCallExtraBytes`, 64) to `CopiedValueBytes`, so a profile that validates
+  can always carry a publishing call; a profile whose limit is exactly the
+  scene-only bound is refused.
 - The **six adopted scene revisions per target** are not a limit here. The
   profile records the two frame slots per window; the graphics composition
   derives six from them (`2 * (slots + 1)`, owned by the Vulkan package, which
@@ -235,7 +242,7 @@ Most limits are **caps on what comes in** (a manifest, a module's source, a data
 | `InstanceIdBytes` | 6 (`minimumInstanceIdBytes`) | the first identity the session issues |
 | `PrintWarnBytes` | `minimumPrintWarnBytes` of the identity bound | a warning must be able to name its writer, end in the marker and a line end |
 | `CopiedValueBytes` | `minimumCopiedValueBytes` of the identity and print bounds and the most text a failure may hold (`failureTextBytes`) | what the facade itself makes cross the value boundary, the [status record](#the-session-controls-lfe-26) of two failed roles included (565 at the smallest bounds) |
-| `CopiedValueElements` | the larger of `sceneFixedElements + sceneElementsPerSprite` (12) and `minimumStatusElements` (30) | a scene of one sprite and the largest status record must be able to cross |
+| `CopiedValueElements` | the larger of `sceneFixedElements + sceneElementsPerSprite + sceneCallExtraElements` (13) and `minimumStatusElements` (30) | a publishing call of one sprite and the largest status record must be able to cross |
 | `CopiedValueDepth` | `minimumStatusDepth` (3) | the status record nests three deep: the record, a role, a failure |
 | `PngPipelineWorkspaceBytes`, `TextureBytesPerUiInstance`, `TextureBytesPerSession` | 4 (`rgba8BytesPerPixel`) | a texture holds at least one RGBA8 pixel |
 | every other byte, count and duration limit | 1 (1 ns) | a cap on what comes in, or on a text cut visibly to it; the relations then keep them consistent (the smallest legal profile, every limit at its least, satisfies all of them) |
@@ -248,7 +255,7 @@ The facade's own check of the first six (`LimitBelowFormatting`) is a guard that
 | `ActiveChainReserveHoldsModuleSource`, `ActiveChainReserveWithinSourceBank` | the active-chain reservation can hold one module's source and fits the bank |
 | `ChainDepthWithinIdentities`, `RequestsPerInstanceWithinVm` | an active chain is among the cache identities; an instance's requests are among its VM's |
 | `DataWithinRetainedBank`, `DataWithinCopiedValue` | a data result fits the VM's retained bytes and the crossing |
-| `SceneInputWithinCopiedValue`, `SceneDepthWithinCopiedDepth`, `SceneElementsWithinCopiedElements` | scene limits fit the copied-value ceilings |
+| `SceneInputWithinCopiedValue`, `SceneDepthWithinCopiedDepth`, `SceneElementsWithinCopiedElements` | scene limits fit the copied-value ceilings, the publishing call's window handle (one element, 64 bytes) included |
 | `FailureRecordHoldsMessageAndTraceback`, `FailureRecordHoldsInstanceId`, `SecondarySummariesWithinReport` | a failure record holds its parts; the secondary summaries fit the engine report |
 | `SegmentWithinPath`, `PathSegmentsWithinPathBytes` | a segment fits the path; each segment takes at least a byte |
 | `PixelsWithinAxes` | the pixel limit does not exceed the axis limit squared |
@@ -952,7 +959,7 @@ rounded, snapped or skipped: a numeric string, a boolean, a fractional channel, 
 
 The host reads the table raw under the scene's own limits (`sceneValueLimits`, applied with the binding's
 `withArgumentLimits`): **2 MiB** encoded, depth **4**, and the elements of a maximal scene (6 + 6 per sprite, so 4,096 sprites is 24,582),
-all inside the common 16 MiB, depth 8 and 65,536. The reader applies the smaller of the owner's and the binding's limit while it
+all inside the common 16 MiB, depth 8 and 65,536. A binding that takes a window handle beside the scene reads its arguments under `scenePublishLimits`: the same, plus the handle's one element and 64 bytes. The reader applies the smaller of the owner's and the binding's limit while it
 copies and stops at the first one it reaches, so a huge or sparse table is refused at a limit and never copied first and checked after;
 a metatable (an empty or protected one included), a cycle, a hole, a non-index key, a wrong type, a nil required value, a missing or
 extra field and a handle that is not a live texture handle of this VM are refused by the host's value rules, with no metamethod run. By
