@@ -260,6 +260,11 @@ data Submission = Submission
   , submissionCompletion ∷ !Completion
     -- ^ How the provider answers.
   , submissionInfo ∷ !RequestInfo
+  , submissionSettled ∷ STM Bool
+    -- ^ Whether the request has settled (or is gone), read-only and never blocking. A provider that
+    -- offered a resource reply and finds the request settled with the resource never built knows no
+    -- lease will ever own it: the work is reported over when the reply is accepted, so this is the one
+    -- way to learn that interest ended in between, without waiting for the settled result to be taken.
   }
 
 -- | What the engine holds of a provider's work on one request, so that interest in it can

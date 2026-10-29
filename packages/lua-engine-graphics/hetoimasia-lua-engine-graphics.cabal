@@ -39,6 +39,12 @@ library
         Hetoimasia.LuaEngine.Graphics.Texture.Configuration
         Hetoimasia.LuaEngine.Graphics.Texture.Host
         Hetoimasia.LuaEngine.Graphics.Texture.Port
+        Hetoimasia.LuaEngine.Graphics.Window.Configuration
+        Hetoimasia.LuaEngine.Graphics.Window.Host
+        Hetoimasia.LuaEngine.Graphics.Window.Port
+        Hetoimasia.LuaEngine.Graphics.Window.Provider
+        Hetoimasia.LuaEngine.Graphics.Window.Request
+        Hetoimasia.LuaEngine.Graphics.Window.Session
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
@@ -47,13 +53,18 @@ library
         text >=2.1 && <2.2,
         hetoimasia-asset ==0.1.0.0,
         hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-glfw ==0.1.0.0,
+        hetoimasia-glfw:runtime-glfw ==0.1.0.0,
         hetoimasia-gpu-vulkan-glfw ==0.1.0.0,
         hetoimasia-gpu-vulkan-model ==0.1.0.0,
         hetoimasia-gpu-vulkan-native ==0.1.0.0,
         hetoimasia-lua-engine ==0.1.0.0,
+        hetoimasia-lua-engine:request,
+        hetoimasia-lua-engine:session,
         hetoimasia-lua-engine:texture,
         hetoimasia-render-api ==0.1.0.0,
         hetoimasia-render-2d-vulkan ==0.1.0.0,
+        hetoimasia-scripting-lua ==0.1.0.0,
         hetoimasia-scripting-lua:runtime-lua
 
 -- The adapter's lifecycle contracts over an injected owner and completion boundary, registered with the
@@ -80,6 +91,12 @@ test-suite lua-engine-graphics-tests
         Test.LuaEngine.Graphics.Spec
         Test.LuaEngine.Graphics.Stages
         Test.LuaEngine.Graphics.Teardown
+        Test.LuaEngine.Graphics.Window.Coordinator
+        Test.LuaEngine.Graphics.Window.Fake
+        Test.LuaEngine.Graphics.Window.Request
+        Test.LuaEngine.Graphics.Window.Rig
+        Test.LuaEngine.Graphics.Window.Spec
+        Test.LuaEngine.Graphics.Windows
     build-depends:
         base >=4.22 && <4.23,
         array >=0.5 && <0.6,
@@ -104,7 +121,9 @@ test-suite lua-engine-graphics-tests
         hetoimasia-gpu-vulkan-native ==0.1.0.0,
         hetoimasia-lua-engine ==0.1.0.0,
         hetoimasia-lua-engine-graphics,
+        hetoimasia-lua-engine:facade,
         hetoimasia-lua-engine:request,
+        hetoimasia-lua-engine:session,
         hetoimasia-lua-engine:texture,
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-scripting-lua ==0.1.0.0,
@@ -133,7 +152,9 @@ test-suite lua-engine-graphics-native-tests
         Test.LuaEngine.Graphics.Native.Loader
         Test.LuaEngine.Graphics.Native.Session
         Test.LuaEngine.Graphics.Native.Spec
+        Test.LuaEngine.Graphics.Native.Windows
         Test.LuaEngine.Graphics.Png
+        Test.LuaEngine.Graphics.Windows
     c-sources: native-test/cbits/hetoimasia_lua_engine_graphics_native.c
     include-dirs: native-test/cbits
     install-includes: hetoimasia_lua_engine_graphics_native.h
@@ -159,6 +180,7 @@ test-suite lua-engine-graphics-native-tests
         hetoimasia-content ==0.1.0.0,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-glfw ==0.1.0.0,
+        hetoimasia-glfw:native-check ==0.1.0.0,
         hetoimasia-glfw:runtime-glfw ==0.1.0.0,
         hetoimasia-glfw:vulkan-interop ==0.1.0.0,
         hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,

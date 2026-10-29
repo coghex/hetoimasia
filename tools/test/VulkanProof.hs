@@ -185,7 +185,8 @@ headlessMains =
 -- | The four validation groups that run through the Vulkan project: the
 -- headless suites, the native suite's profile on an isolated X11 display
 -- and on the isolated headless Wayland compositor, and the Lua-first engine's
--- graphics adapter on a real device with no window.
+-- graphics adapter on a real device: a session started without a surface, and, as its subgroup `window provider`
+-- (LFE-18), real visible windows, which `--complete` includes.
 headlessGroup, nativeGroup, waylandGroup, luaEngineNativeGroup ∷ String
 headlessGroup = "test.vulkan-headless"
 nativeGroup = "test.vulkan-native"

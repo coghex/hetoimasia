@@ -10,6 +10,9 @@
 module Test.LuaEngine.Graphics.Native.Session
   ( Env (..)
   , Facts (..)
+  , onMain
+  , serveMain
+  , noteWindows
   , runSession
   , usageNow
   , awaitUsage
@@ -18,11 +21,12 @@ module Test.LuaEngine.Graphics.Native.Session
   ) where
 
 import Control.Concurrent (forkOS)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVarIO, retry)
-import Control.Exception (SomeException, displayException, throwIO, try)
-import Control.Monad (unless)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryReadMVar)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVarIO, retry, swapTVar)
+import Control.Exception (SomeException, displayException, finally, throwIO, try)
+import Control.Monad (join, unless)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -55,7 +59,9 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , withVulkanOwnerHost
   )
 import Hetoimasia.LuaEngine.Graphics.Texture
-import Hetoimasia.Runtime.GLFW (HostConfig (..), defaultHostConfig, runGraphicsOwnerApplication)
+import Hetoimasia.LuaEngine.Graphics.Window.Configuration (configureWindows)
+import Hetoimasia.GPU.Vulkan.GLFW (runVulkanOwnerLoop)
+import Hetoimasia.Runtime.GLFW (HostConfig (..), ScheduledStep (..), UpdateSchedule (NoUpdateDemand), defaultHostConfig, defaultScheduledHooks, runGraphicsOwnerApplication, wakeGraphicsHost)
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 
@@ -72,6 +78,13 @@ data Env = Env
     -- the session: set by the first example that draws, and the standard the later ones return to.
   , envEvidence ∷ !(TVar [Text])
     -- ^ Lines for the run's evidence record, oldest last.
+  , envJobs ∷ !(TVar [IO ()])
+    -- ^ Work for the process main thread's next turn of the owner loop (see 'onMain').
+  , envServe ∷ !(IORef (IO ()))
+    -- ^ The action the main thread does on every turn (see 'serveMain'): the window provider's step while an
+    -- example has one.
+  , envWindows ∷ !(IORef Int)
+    -- ^ How many native windows the examples made, for the run's evidence and the checks that depend on it.
   }
 
 -- | What the run saw, once the session is released.
@@ -82,7 +95,32 @@ data Facts = Facts
   , factsVerdict ∷ !(Maybe DiagnosticVerdict)
   , factsEvidence ∷ ![Text]
   , factsFailure ∷ !(Maybe Text)
+  , factsWindows ∷ !Int
+    -- ^ The native windows the examples made.
   }
+
+-- | Run an action on the process main thread, on the next turn of the owner loop it is serving, and answer what
+-- it returned or raised. GLFW's window and surface operations belong there; the examples run on a thread of their
+-- own so that one that blocks cannot starve the loop.
+onMain ∷ Env → IO a → IO a
+onMain env action = do
+  answer ← newEmptyMVar
+  atomically (modifyTVar' (envJobs env) (<> [try @SomeException action >>= putMVar answer]))
+  wakeGraphicsHost (vulkanGraphicsOwner (envHost env))
+  takeMVar answer >>= either throwIO pure
+
+-- | Install the action the main thread does on every turn for the duration of a scope, and wake the loop so
+-- it is not left waiting on its idle bound with something to do. The previous action is restored on every exit.
+serveMain ∷ Env → IO () → IO a → IO a
+serveMain env action body = do
+  previous ← readIORef (envServe env)
+  writeIORef (envServe env) action
+  wakeGraphicsHost (vulkanGraphicsOwner (envHost env))
+  body `finally` writeIORef (envServe env) previous
+
+-- | Record that an example made this many native windows.
+noteWindows ∷ Env → Int → IO ()
+noteWindows env count = atomicModifyIORef' (envWindows env) (\held → (held + count, ()))
 
 -- | The model's accounting now.
 usageNow ∷ Env → IO Usage
@@ -108,12 +146,13 @@ runSession complete backend features configuration examples = do
   recorded ← newIORef []
   verdictCell ← newIORef Nothing
   passedCell ← newIORef False
+  windowCount ← newIORef 0
   evidence ← newTVarIO []
   initial ← prepare ()
   let host = requestingBackend backend (defaultHostConfig [])
       base = vulkanHostConfig host defaultCaptureConfig {captureTextBudget = 16384} (configurationBudgets configuration) initial
       config =
-        (configureHost configuration base)
+        (configureWindows (configureHost configuration base))
           { vulkanLayers = ["VK_LAYER_KHRONOS_validation"]
           , vulkanValidationFeatures = features
           , vulkanObserver = const (observer recorded)
@@ -131,11 +170,12 @@ runSession complete backend features configuration examples = do
           )
           vulkanWindowHost
           (\vulkan _ → pure vulkan)
-          (\vulkan control → body vulkan control config evidence passedCell)
+          (\vulkan control → body vulkan control config evidence passedCell windowCount)
   calls ← reverse <$> readIORef recorded
   verdict ← readIORef verdictCell
   passed ← readIORef passedCell
   lines' ← reverse <$> readTVarIO evidence
+  windows ← readIORef windowCount
   pure
     Facts
       { factsPassed = passed && either (const False) (const True) outcome
@@ -143,9 +183,10 @@ runSession complete backend features configuration examples = do
       , factsVerdict = verdict
       , factsEvidence = lines'
       , factsFailure = either (Just . Text.pack . displayException) (const Nothing) outcome
+      , factsWindows = windows
       }
   where
-    body vulkan control config evidence passedCell = do
+    body vulkan control config evidence passedCell windowCount = do
       progressNote "the owner is starting"
       readiness ← atomically $
         readReadiness (vulkanController vulkan) >>= \case
@@ -164,7 +205,9 @@ runSession complete backend features configuration examples = do
         progressNote "the table is bound; running the examples"
         now ← usage <$> atomically (readVulkanModel (vulkanController vulkan))
         rest ← newIORef Nothing
-        let env = Env vulkan config graphics control now rest evidence
+        jobs ← newTVarIO []
+        serve ← newIORef (pure ())
+        let env = Env vulkan config graphics control now rest evidence jobs serve windowCount
         done ← newEmptyMVar
         _ ← forkOS $ do
           -- The complete profile is run with Hspec's configuration reading left out, so no argument,
@@ -177,6 +220,17 @@ runSession complete backend features configuration examples = do
                   specResultSuccess <$> runSpecForest forest cfg
                 else isSuccess <$> hspecWithResult defaultConfig {configFailOnEmpty = True} (examples env)
           putMVar done result
+          wakeGraphicsHost (vulkanGraphicsOwner vulkan)
+        -- The process main thread serves the owner loop until the examples are done: window creation, surfaces
+        -- and native events belong to it. A turn runs the jobs the examples handed it and the action they
+        -- installed, then asks to finish once Hspec has. The loop is woken for each, so none waits on the idle bound.
+        let update _ = do
+              pending ← atomically (swapTVar jobs [])
+              sequence_ pending
+              join (readIORef serve)
+              finished ← tryReadMVar done
+              pure (if isJust finished then FinishWith () else ContinueWith NoUpdateDemand)
+        runVulkanOwnerLoop vulkan control (defaultScheduledHooks quietLogger update)
         takeMVar done >>= \case
           Left failure → throwIO failure
           Right success → writeIORef passedCell success

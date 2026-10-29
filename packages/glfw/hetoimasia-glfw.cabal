@@ -266,6 +266,36 @@ library vulkan-interop
     else
         buildable: False
 
+-- The test-only genuine native close (LFE-18): the owner-thread request that makes the platform deliver
+-- a close to a window the host holds, over a driver argument, so the boundary is examined without GLFW.
+-- Private, because its type names the native window pointer.
+library native-check-core
+    import: language
+    visibility: private
+    hs-source-dirs: native-check-core
+    exposed-modules:
+        Hetoimasia.GLFW.Internal.NativeCheck
+    build-depends:
+        base >=4.22 && <4.23,
+        hetoimasia-glfw ==0.1.0.0,
+        hetoimasia-glfw:model,
+        hetoimasia-glfw:runtime-glfw
+
+-- The public face of the same: 'requestNativeClose' applies the production driver and exports no native
+-- handle and no ABI declaration. Only test suites depend on it; no production library does.
+library native-check
+    import: language
+    visibility: public
+    hs-source-dirs: native-check
+    exposed-modules:
+        Hetoimasia.GLFW.NativeCheck
+    build-depends:
+        base >=4.22 && <4.23,
+        hetoimasia-glfw ==0.1.0.0,
+        hetoimasia-glfw:native,
+        hetoimasia-glfw:native-check-core,
+        hetoimasia-glfw:runtime-glfw
+
 -- The private test seam: the real session model over a scripted native
 -- library, for CPU examples that must not initialize GLFW. It is public so the
 -- opacity examples' external clients can be given it; it exposes no native handle
@@ -377,6 +407,7 @@ test-suite glfw-tests
         hetoimasia-test-support ==0.1.0.0,
         hetoimasia-glfw,
         hetoimasia-glfw:model,
+        hetoimasia-glfw:native-check-core,
         hetoimasia-glfw:runtime-glfw,
         hetoimasia-glfw:runtime-glfw-core,
         hetoimasia-glfw:seam,
