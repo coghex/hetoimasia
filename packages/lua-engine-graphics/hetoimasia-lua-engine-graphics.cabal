@@ -96,6 +96,7 @@ test-suite lua-engine-graphics-tests
         Test.LuaEngine.Graphics.Pressure
         Test.LuaEngine.Graphics.Release
         Test.LuaEngine.Graphics.Rig
+        Test.LuaEngine.Graphics.SceneFrames
         Test.LuaEngine.Graphics.SceneHost
         Test.LuaEngine.Graphics.Scenes
         Test.LuaEngine.Graphics.Spec
@@ -121,6 +122,8 @@ test-suite lua-engine-graphics-tests
         text >=2.1 && <2.2,
         time >=1.15 && <1.16,
         zlib >=0.7.1 && <0.8,
+        hetoimasia-asset ==0.1.0.0,
+        hetoimasia-asset-image ==0.1.0.0,
         hetoimasia-content ==0.1.0.0,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-glfw ==0.1.0.0,
@@ -136,7 +139,9 @@ test-suite lua-engine-graphics-tests
         hetoimasia-lua-engine:scene,
         hetoimasia-lua-engine:session,
         hetoimasia-lua-engine:texture,
+        hetoimasia-math ==0.1.0.0,
         hetoimasia-render-2d ==0.1.0.0,
+        hetoimasia-render-2d-oracle ==0.1.0.0,
         hetoimasia-render-2d-vulkan ==0.1.0.0,
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-scripting-lua ==0.1.0.0,

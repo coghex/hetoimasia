@@ -9,6 +9,7 @@ import qualified Test.LuaEngine.Graphics.Faults as Faults
 import qualified Test.LuaEngine.Graphics.Lifecycle as Lifecycle
 import qualified Test.LuaEngine.Graphics.Pressure as Pressure
 import qualified Test.LuaEngine.Graphics.Release as Release
+import qualified Test.LuaEngine.Graphics.SceneFrames as SceneFrames
 import qualified Test.LuaEngine.Graphics.Scenes as Scenes
 import qualified Test.LuaEngine.Graphics.Stages as Stages
 import qualified Test.LuaEngine.Graphics.Teardown as Teardown
@@ -28,3 +29,4 @@ spec = do
   Composed.spec
   Window.spec
   Scenes.spec
+  SceneFrames.spec
