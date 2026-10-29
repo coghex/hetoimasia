@@ -105,3 +105,19 @@ coordinator; and the full race matrix over the gated port.
 Negative controls of round 3 (broken once, restored): adoption recipe throwing for an untracked window → 1 example failed;
 stop routing recorded after the attempt, and the late handoff recorded without terminal evidence → each hangs (the spin and the
 drain that wait forever are the defects), ended by the hard timeout; the unmutated code passes both in well under a second.
+
+## Round 4
+
+Four coverage findings, repaired: the claimed-adoption interleaving now runs through the real request and lease machinery (the
+adoption recipe is held after the owner claims it, the application advances the epoch, the provider takes the window apart,
+the recipe resumes over a window that is gone; no success is delivered, nothing fails, the slot is returned once and a fresh
+request succeeds); the exact bounded `take` record (code, message cut at 2 KiB, no root or path) is read by a script through an
+optional request, with the required request's latch asserted on its instance failure; the after-readiness close runs with the
+records bank asserted exhausted (the result is waited for, not taken); and an earlier primary failure survives a later failed
+destruction (the real session keeps one terminal failure and acknowledges a later one without replacing it; the provider
+retains the cleanup failure as its own evidence and closes the window once).
+
+Negative controls of round 4 (broken once, restored): adoption throwing for an untracked window → the real-machinery example and
+the direct one failed (2); the cut at 2 KiB widened to 4 KiB → the bounded-record example failed (1). The window group ran
+three more times in a row without a failure. The complete native profile (eight examples, windows included) ran in about
+four seconds of wall time, inside the group's 30-second watchdog.

@@ -303,6 +303,17 @@ close, so ending an instance neither synthesises a session quit nor ends a healt
 
 An outcome that fits none of these returns to the manager rather than being classified ad hoc.
 
+### Test seams (production uses none)
+
+`ProviderHooks` (`withWindowProviderWith`) holds a step at a precise place: `hookBeforeAdopt` runs inside the adoption recipe after
+the host claimed it, which is how the examples settle a request by a real epoch change while its claimed recipe is held. The
+recipe itself tolerates a window already taken apart and forgotten (the host may run a claimed recipe after the request
+settled): that is ordinary cancellation, built over the same window and released at once by the host, never a host failure.
+`windowServiceFor` chooses the request's necessity: a required request's failure ends its instance at the next safe boundary
+whether it is read or not, so only an optional request lets a script hand the examples the exact `take` record
+(`{status = "failure", error = {code = "window_error", message ≤ 2 KiB}}`, no root or path). The facade uses `windowService`
+(required); M1 offers no optional window to Lua.
+
 ### Failed effects and exit
 
 A synchronous failure of an effect the pump ran (an issue, a close, a stop routing, an answer) is never repeated: that
