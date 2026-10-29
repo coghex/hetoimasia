@@ -39,6 +39,7 @@ library
         Hetoimasia.LuaEngine.Graphics.Texture.Configuration
         Hetoimasia.LuaEngine.Graphics.Texture.Host
         Hetoimasia.LuaEngine.Graphics.Texture.Port
+        Hetoimasia.LuaEngine.Graphics.Window.Host
         Hetoimasia.LuaEngine.Graphics.Window.Port
         Hetoimasia.LuaEngine.Graphics.Window.Provider
         Hetoimasia.LuaEngine.Graphics.Window.Request
@@ -50,6 +51,8 @@ library
         text >=2.1 && <2.2,
         hetoimasia-asset ==0.1.0.0,
         hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-glfw ==0.1.0.0,
+        hetoimasia-glfw:runtime-glfw ==0.1.0.0,
         hetoimasia-gpu-vulkan-glfw ==0.1.0.0,
         hetoimasia-gpu-vulkan-model ==0.1.0.0,
         hetoimasia-gpu-vulkan-native ==0.1.0.0,
