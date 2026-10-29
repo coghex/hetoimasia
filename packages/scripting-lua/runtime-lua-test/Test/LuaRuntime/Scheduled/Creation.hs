@@ -4,15 +4,17 @@
 -- created and retired across cycles without an identity being issued twice.
 module Test.LuaRuntime.Scheduled.Creation (spec) where
 
-import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryTakeMVar)
-import Control.Exception (SomeException, fromException, try)
+import Control.Concurrent (forkIO, killThread, throwTo)
+import Control.Concurrent.MVar (isEmptyMVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryTakeMVar)
+import Control.Exception (AsyncException (ThreadKilled, UserInterrupt), SomeException, fromException, throwIO, try)
 import Control.Monad (forM, forM_, replicateM)
 import Data.ByteString (ByteString)
+import Data.List (isInfixOf)
 import Data.Maybe (isNothing)
 import qualified Data.Set as Set
 import qualified Data.Text.Encoding as Text
 import Data.Text (Text)
+import Hetoimasia.Foundation.Resource (cleanupFailures, displayCleanupFailure)
 import Hetoimasia.Scripting.Lua.Owner (ChunkName, chunkName)
 import Hetoimasia.Scripting.Lua.Runtime (ownerIdentity, retireOwner)
 import Hetoimasia.Scripting.Lua.Scheduled
@@ -54,6 +56,115 @@ spec = describe "creation, readiness and identity" $ do
       ticket ← admitTask' fixture bystander "echo" (request "echo" [VInteger 2] OrdinaryClass OneShot Nothing)
       outcomeOf ticket >>= (`shouldBe` Just [VInteger 2]) . taskReturned
       retireScheduled bystander
+
+  it "tells the application once that an abandoned start is being abandoned, after the worker was asked to stop and before the starter waits for it to end" $ bounded $ do
+    fixture ← newSFixture
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
+      told ← newEmptyMVar
+      let config =
+            (withChunks (initial "fx.block('init')") (scheduled fixture "abandoned" requiredPolicy defaultSchedulerBounds))
+              {scheduledOnStartAbandoned = putMVar told ()}
+      returned ← newEmptyMVar
+      starter ← forkIO (try @SomeException (startScheduledOwner runtime config) >>= putMVar returned . either (const ()) (const ()))
+      -- the initial chunk is running, held inside a binding: the start is in its readiness wait
+      awaitEntered fixture "init"
+      killThread starter
+      -- the application is told while the worker is still held, so the starter has not returned
+      takeMVar told
+      tryTakeMVar returned >>= (`shouldSatisfy` isNothing)
+      releaseGate fixture "init"
+      takeMVar returned
+
+  it "keeps what the hook raises as a failure of the host beside the failure of the start, never in place of it" $ bounded $ do
+    fixture ← newSFixture
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
+      hookRan ← newEmptyMVar
+      let config =
+            (withChunks (initial "fx.block('init')") (scheduled fixture "abandoned, hook raises" requiredPolicy defaultSchedulerBounds))
+              {scheduledOnStartAbandoned = putMVar hookRan () >> throwIO (userError "the hook failed")}
+      returned ← newEmptyMVar
+      starter ← forkIO (try @SomeException (startScheduledOwner runtime config) >>= putMVar returned)
+      awaitEntered fixture "init"
+      killThread starter
+      -- the hook has been called and raised, and the starter still waits for its worker: it has not returned while the
+      -- worker is held
+      takeMVar hookRan
+      isEmptyMVar returned >>= (`shouldBe` True)
+      releaseGate fixture "init"
+      takeMVar returned >>= \case
+        Left failure → do
+          -- the cancellation that abandoned the start is what is raised, as itself, with the hook's failure beside it
+          fromException failure `shouldBe` Just ThreadKilled
+          map displayCleanupFailure (cleanupFailures failure) `shouldSatisfy` any (isInfixOf "the hook failed")
+        Right _ → failExample "the start was cancelled and should not have returned an owner"
+
+  it "does not let an exception of an asynchronous type that the hook itself threw take the place of the failure that abandoned the start" $ bounded $ do
+    fixture ← newSFixture
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
+      let config =
+            (withChunks (initial "fx.block('init')") (scheduled fixture "abandoned, hook throws a kill" requiredPolicy defaultSchedulerBounds))
+              {scheduledOnStartAbandoned = throwIO ThreadKilled}
+      returned ← newEmptyMVar
+      starter ← forkIO (try @SomeException (startScheduledOwner runtime config) >>= putMVar returned)
+      awaitEntered fixture "init"
+      -- the start is abandoned by an interrupt delivered to the starter; the hook then throws a kill of its own
+      throwTo starter UserInterrupt
+      releaseGate fixture "init"
+      takeMVar returned >>= \case
+        Left failure → do
+          fromException failure `shouldBe` Just UserInterrupt
+          map displayCleanupFailure (cleanupFailures failure) `shouldSatisfy` any (isInfixOf "thread killed")
+        Right _ → failExample "the start was interrupted and should not have returned an owner"
+
+  it "abandons a start as it always did when the application says nothing: the cancellation is raised as itself once the worker has ended" $ bounded $ do
+    fixture ← newSFixture
+    withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
+      let config = withChunks (initial "fx.block('init')") (scheduled fixture "abandoned, default" requiredPolicy defaultSchedulerBounds)
+      returned ← newEmptyMVar
+      starter ← forkIO (try @SomeException (startScheduledOwner runtime config) >>= putMVar returned)
+      awaitEntered fixture "init"
+      killThread starter
+      releaseGate fixture "init"
+      takeMVar returned >>= \case
+        Left failure → do
+          fromException failure `shouldBe` Just ThreadKilled
+          map displayCleanupFailure (cleanupFailures failure) `shouldBe` []
+        Right _ → failExample "the start was cancelled and should not have returned an owner"
+
+  it "keeps what the worker itself ended with beside the failure that abandoned the start, whether or not the application is told" $ bounded $ do
+    mapM_
+      ( \(label, hook) → do
+          fixture ← newSFixture
+          returned ← newEmptyMVar
+          -- (the worker's failure is also latched by supervision, which the boundary raises when it closes: not what is
+          -- asserted, and what the boundary raises must not be mistaken for an assertion of this example)
+          _ ← try @SomeException $ withBoundaryOpening [openAllGates fixture] $ \_ runtime → do
+            let config =
+                  (withChunks (initial "fx.block('init'); error('init failed after the hold')") (scheduled fixture label requiredPolicy defaultSchedulerBounds))
+                    {scheduledOnStartAbandoned = hook}
+            starter ← forkIO (try @SomeException (startScheduledOwner runtime config) >>= putMVar returned)
+            awaitEntered fixture "init"
+            -- the start is abandoned while the initialization is held, and the initialization then fails
+            killThread starter
+            releaseGate fixture "init"
+            _ ← readMVar returned
+            pure ()
+          readMVar returned >>= \case
+            Left failure → do
+              fromException failure `shouldBe` Just ThreadKilled
+              map displayCleanupFailure (cleanupFailures failure) `shouldSatisfy` any (isInfixOf "init failed after the hold")
+            Right _ → failExample "the start was cancelled and should not have returned an owner"
+      )
+      [("worker failed, default hook", pure ()), ("worker failed, hook raised", throwIO (userError "the hook failed"))]
+
+  it "tells nobody of a start that is not abandoned, and by default nothing" $ bounded $ do
+    fixture ← newSFixture
+    withBoundary $ \_ runtime → do
+      told ← newEmptyMVar
+      let config = (scheduled fixture "kept" requiredPolicy defaultSchedulerBounds) {scheduledOnStartAbandoned = putMVar told ()}
+      owner ← startScheduled fixture runtime config
+      tryTakeMVar told >>= (`shouldSatisfy` isNothing)
+      retireScheduled owner
 
   it "refuses an invalid configuration before any worker starts, naming every violation" $ bounded $ do
     fixture ← newSFixture

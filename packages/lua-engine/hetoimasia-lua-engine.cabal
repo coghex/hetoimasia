@@ -55,6 +55,7 @@ library
         Hetoimasia.LuaEngine.Manifest.Types
         Hetoimasia.LuaEngine.Profile.Fixed
         Hetoimasia.LuaEngine.Profile.Limits
+        Hetoimasia.LuaEngine.Profile.Minimum
         Hetoimasia.LuaEngine.Profile.Validate
     build-depends:
         base >=4.22 && <4.23,
@@ -261,6 +262,66 @@ library scene
         hetoimasia-scripting-lua ==0.1.0.0,
         hetoimasia-scripting-lua:runtime-lua
 
+-- The M1 session coordinator (LFE-13): one or two roles' VMs composed into one session. It owns the
+-- startup gates (a dispatch gate that holds both roots' @init@s until every entry, export, hook and cadence
+-- is validated, and a start gate that holds the first logical tick until every selected @init@ has
+-- succeeded), the failure policy of D-42, the real-time tick clock over the Lua host's scheduler, the
+-- internal status, stop and terminal-failure endpoints LFE-26 consumes, and the drain through actual
+-- retirement. It is a sublibrary of its own, in a source directory of its own, for the reason the facade
+-- is: the library is the pure configuration boundary and imports nothing that performs IO, and this
+-- does. The state machine, the failure schema and the pacing arithmetic are pure modules, exposed so that
+-- the status vocabulary has one definition. It depends on the facade, the module coordinator and the
+-- data service it composes, on the request adapter, on the content package for the anchored root and the
+-- pool, and on the Lua host's public modules and supervision. It imports no module of a game, a window, a
+-- GPU, Vulkan, GLFW, the console, the texture pipeline or the scene schema, installs no signal handler,
+-- exits no process and adds no Lua binding.
+library session
+    import: language
+    visibility: public
+    default-extensions: OverloadedStrings
+    hs-source-dirs: session
+    exposed-modules:
+        Hetoimasia.LuaEngine.Session
+        Hetoimasia.LuaEngine.Session.Failure
+        Hetoimasia.LuaEngine.Session.Pacing
+        Hetoimasia.LuaEngine.Session.State
+    -- The driver and the construction, the timer and the handle, behind the facade.
+    other-modules:
+        Hetoimasia.LuaEngine.Session.Run
+        Hetoimasia.LuaEngine.Session.Timer
+        Hetoimasia.LuaEngine.Session.Types
+    build-depends:
+        base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
+        containers >=0.8 && <0.9,
+        stm >=2.5.3 && <2.6,
+        text >=2.1 && <2.2,
+        hetoimasia-content ==0.1.0.0,
+        hetoimasia-foundation ==0.1.0.0,
+        hetoimasia-lua-engine ==0.1.0.0,
+        hetoimasia-lua-engine:data,
+        hetoimasia-lua-engine:facade,
+        hetoimasia-lua-engine:modules,
+        hetoimasia-lua-engine:request,
+        hetoimasia-lua-engine:session-harness,
+        hetoimasia-runtime ==0.1.0.0,
+        hetoimasia-scripting-lua ==0.1.0.0,
+        hetoimasia-scripting-lua:runtime-lua
+
+-- The session coordinator's test seams, in a library no one outside this package can depend on: a probe that
+-- holds or fails a window, a second instance of a role, and a tick counter that starts near the Lua integer
+-- ceiling. The public session library shows the harness as an abstract type and 'noHarness'; the constructor
+-- and its fields are reachable from this package's own test suite alone.
+library session-harness
+    import: language
+    visibility: private
+    hs-source-dirs: session-harness
+    exposed-modules:
+        Hetoimasia.LuaEngine.Session.Harness
+    build-depends:
+        base >=4.22 && <4.23,
+        hetoimasia-lua-engine ==0.1.0.0
+
 -- This package's own contracts, registered as the CPU validation group
 -- `test.lua-engine`. Hspec is the suite's alone.
 test-suite lua-engine-tests
@@ -324,6 +385,19 @@ test-suite lua-engine-tests
         Test.LuaEngine.Scene.Schema
         Test.LuaEngine.Scene.Spec
         Test.LuaEngine.Scene.Support
+        Test.LuaEngine.Session.Client
+        Test.LuaEngine.Session.Commit
+        Test.LuaEngine.Session.Commit
+        Test.LuaEngine.Session.Clocks
+        Test.LuaEngine.Session.Construction
+        Test.LuaEngine.Session.Diagnostics
+        Test.LuaEngine.Session.Evidence
+        Test.LuaEngine.Session.Failures
+        Test.LuaEngine.Session.Model
+        Test.LuaEngine.Session.Spec
+        Test.LuaEngine.Session.Startup
+        Test.LuaEngine.Session.Stop
+        Test.LuaEngine.Session.Support
         Test.LuaEngine.Spec
         Test.LuaEngine.Support
         Test.LuaEngine.Texture.Cancellation
@@ -356,6 +430,8 @@ test-suite lua-engine-tests
         hetoimasia-lua-engine:modules,
         hetoimasia-lua-engine:request,
         hetoimasia-lua-engine:scene,
+        hetoimasia-lua-engine:session,
+        hetoimasia-lua-engine:session-harness,
         hetoimasia-lua-engine:texture,
         hetoimasia-math ==0.1.0.0,
         hetoimasia-render-2d ==0.1.0.0,

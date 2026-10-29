@@ -1,0 +1,1160 @@
+{-# LANGUAGE OverloadedStrings #-}
+
+-- | The session's pure model: the state machine every gate, phase and failure goes through, the failure
+-- schema's bounds and the pacing arithmetic. No VM, no thread and no clock: the transitions are applied
+-- to values, in every order the events can arrive, and the invariants the coordinator relies on are
+-- checked after every step of every sequence.
+module Test.LuaEngine.Session.Model (spec) where
+
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), toException)
+import Control.Exception.Context (emptyExceptionContext)
+import Control.Monad ((<=<))
+import Data.Foldable (toList)
+import Data.List (find)
+import qualified Data.Map.Strict as Map
+import Data.Maybe (isJust, listToMaybe)
+import qualified Data.Set as Set
+import Data.Text (Text)
+import qualified Data.Text as Text
+import Data.Word (Word64)
+import Hetoimasia.Foundation.Resource (cleanupFailureId, cleanupFailuresInContext, composeCleanup)
+import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero, RequirePositive), Instant, durationFromNanoseconds, scriptedInstant)
+import Hetoimasia.LuaEngine.Manifest (Role (..))
+import Hetoimasia.LuaEngine.Profile (ByteLimit (EngineReportBytes, RoleFailureRecordBytes, SecondarySummaryBytes), CountLimit (SecondarySummaries), Profile, codeWords, fixedM1Profile, roleWords, schemaWordsBytes, stageWords)
+import Hetoimasia.LuaEngine.Session.Failure
+import Hetoimasia.LuaEngine.Session.Pacing
+import Hetoimasia.LuaEngine.Session.State
+import Test.Hspec
+import Test.LuaEngine.Request.Profiles (bytesOf, smallestLegalProfile, smaller)
+
+spec ∷ Spec
+spec = describe "model" $ do
+  gates
+  startGate
+  policy
+  ranking
+  admission
+  teardown
+  mutants
+  invariants
+  failures
+  report
+  diagnosticEvidence
+  pacing
+
+-- Fixtures ---------------------------------------------------------------------------------------------
+
+limits ∷ FailureLimits
+limits = failureLimitsOf fixedM1Profile
+
+both ∷ SessionState
+both = newSessionState limits [(Gameplay, 1), (Presentation, 1)]
+
+gameplayOnly ∷ SessionState
+gameplayOnly = newSessionState limits [(Gameplay, 1)]
+
+presentationOnly ∷ SessionState
+presentationOnly = newSessionState limits [(Presentation, 1)]
+
+-- | A failure whose every text is far beyond every bound.
+everything ∷ RoleFailure
+everything =
+  (newRoleFailure LuaError OnUpdate Presentation (Text.replicate 30000 "m"))
+    { rfContent = Just (Text.replicate 20000 "c")
+    , rfInstance = Just (Text.replicate 20000 "i")
+    , rfPath = Just (Text.replicate 20000 "p")
+    , rfTraceback = Just (Text.replicate 30000 "t")
+    }
+
+-- | The text fields of the failure record: its name, how an example makes the field this text, how many bytes the record
+-- holds in it, and the bound it is cut to.
+fields ∷ [(String, Text → RoleFailure → RoleFailure, RoleFailure → Int, FailureLimits → Int)]
+fields =
+  [ ("message", \text record → record {rfMessage = text}, utf8Bytes . rfMessage, limitMessage)
+  , ("content identifier", \text record → record {rfContent = Just text}, maybe 0 utf8Bytes . rfContent, limitContent)
+  , ("instance identity", \text record → record {rfInstance = Just text}, maybe 0 utf8Bytes . rfInstance, limitInstance)
+  , ("path", \text record → record {rfPath = Just text}, maybe 0 utf8Bytes . rfPath, limitPath)
+  , ("traceback", \text record → record {rfTraceback = Just text}, maybe 0 utf8Bytes . rfTraceback, limitTraceback)
+  ]
+
+-- | An instance's @init@ succeeded when the injected clock read this many nanoseconds.
+initAt ∷ Integer → InstanceKey → Event
+initAt n key = InitSucceeded key (Just (instant n))
+
+initOk ∷ InstanceKey → Event
+initOk = initAt 0
+
+g0, p0 ∷ InstanceKey
+g0 = InstanceKey Gameplay 0
+p0 = InstanceKey Presentation 0
+
+-- | Apply events in order, keeping every effect reported and every answer.
+runAll ∷ [Event] → SessionState → (SessionState, [Answer], [Effect])
+runAll events initial = foldl' go (initial, [], []) events
+  where
+    go (state, answers, effects) event =
+      let (next, answer) = step event state
+          added = [role | role ← owedStops next, role `notElem` owedStops state]
+       in (next, answers <> [answer], effects <> [StopRoles added | not (null added)])
+
+-- | The stops a transition owed, as the examples read them: the owners to be asked, in the order they were recorded.
+newtype Effect = StopRoles [Role]
+  deriving (Eq, Show)
+
+applied ∷ [Event] → SessionState → SessionState
+applied events initial = let (state, _, _) = runAll events initial in state
+
+effectsOf ∷ [Event] → SessionState → [Effect]
+effectsOf events initial = let (_, _, effects) = runAll events initial in effects
+
+answersOf ∷ [Event] → SessionState → [Answer]
+answersOf events initial = let (_, answers, _) = runAll events initial in answers
+
+failure ∷ Role → FailureStage → Text → RoleFailure
+failure role stage = newRoleFailure LuaError stage role
+
+validated ∷ [Event]
+validated = [Validated g0, Validated p0, AdmissionComplete]
+
+phaseOfRole ∷ Role → SessionState → Maybe Phase
+phaseOfRole role state = rsPhase <$> Map.lookup role (stRoles state)
+
+-- The dispatch gate -----------------------------------------------------------------------------------
+
+gates ∷ Spec
+gates = describe "the dispatch gate" $ do
+  it "opens only when every first instance is validated and admission is complete, in any order" $
+    mapM_
+      ( \events → do
+          let state = applied events both
+          dispatchDecision state `shouldBe` Just True
+      )
+      (permutations' validated)
+
+  it "stays closed while any first instance is unvalidated or admission is incomplete" $ do
+    dispatchDecision (applied [Validated g0, AdmissionComplete] both) `shouldBe` Nothing
+    dispatchDecision (applied [Validated g0, Validated p0] both) `shouldBe` Nothing
+    dispatchDecision (applied [AdmissionComplete] both) `shouldBe` Nothing
+
+  it "waits for every instance of every role, a second instance included, before it opens" $ do
+    let two = newSessionState limits [(Gameplay, 2)]
+        g1 = InstanceKey Gameplay 1
+    dispatchDecision (applied [Validated g0, AdmissionComplete] two) `shouldBe` Nothing
+    dispatchDecision (applied [Validated g1, AdmissionComplete] two) `shouldBe` Nothing
+    mapM_
+      (\events → dispatchDecision (applied events two) `shouldBe` Just True)
+      (permutations' [Validated g0, Validated g1, AdmissionComplete])
+
+  it "is aborted for good by a stop or a failure, and a late validation cannot open it" $ do
+    let stopped = applied [Validated g0, Stop StopQuit] both
+    dispatchDecision stopped `shouldBe` Just False
+    dispatchDecision (applied [Validated p0, AdmissionComplete] stopped) `shouldBe` Just False
+    let failed = applied [LatchFailure Gameplay (failure Gameplay OnModule "bad cadence") []] both
+    dispatchDecision failed `shouldBe` Just False
+    dispatchDecision (applied validated failed) `shouldBe` Just False
+
+  it "needs only the one role's first instance in a one-role session" $ do
+    dispatchDecision (applied [Validated g0, AdmissionComplete] gameplayOnly) `shouldBe` Just True
+    dispatchDecision (applied [Validated p0, AdmissionComplete] presentationOnly) `shouldBe` Just True
+
+-- The start gate -----------------------------------------------------------------------------------------
+
+startGate ∷ Spec
+startGate = describe "the start gate and the phases" $ do
+  let opened = validated
+
+  it "starts presentation on its own success and gameplay waiting, ready, for the joint gate" $ do
+    let state = applied (opened <> [initOk p0]) both
+    phasesOf' state `shouldBe` (Just Starting, Just Running)
+    stStart state `shouldBe` StartClosed
+    let ready = applied (opened <> [initOk g0]) both
+    phasesOf' ready `shouldBe` (Just Ready, Just Starting)
+
+  it "opens, once, in the transaction of the last success, whichever order they come in" $ do
+    mapM_
+      ( \events → do
+          let (state, answers, _) = runAll (opened <> events) both
+          stStart state `shouldBe` StartOpen
+          phasesOf' state `shouldBe` (Just Running, Just Running)
+          length (filter (== Opened) answers) `shouldBe` 1
+      )
+      (permutations' [initOk g0, initOk p0])
+
+  it "needs only its own init in a one-role session" $ do
+    let (state, answers, _) = runAll (opened' gameplayOnly <> [initOk g0]) gameplayOnly
+    stStart state `shouldBe` StartOpen
+    answers `shouldSatisfy` elem Opened
+    phasesOf' state `shouldBe` (Just Running, Nothing)
+    let (state', answers', _) = runAll (opened' presentationOnly <> [initOk p0]) presentationOnly
+    stStart state' `shouldBe` StartOpen
+    answers' `shouldSatisfy` elem Opened
+    phasesOf' state' `shouldBe` (Nothing, Just Running)
+
+  it "does not open for a late success once the gate is shut, but remembers the success" $ do
+    let state = applied (opened <> [initOk p0, Stop StopQuit, initOk g0]) both
+    stStart state `shouldBe` StartShut
+    phasesOf' state `shouldBe` (Just Stopping, Just Stopping)
+    roleInitializedOf Gameplay state `shouldBe` Just True
+    roleInitializedOf Presentation state `shouldBe` Just True
+
+  it "takes the pacing origin from the transition that opens the start gate, whichever success it is, and never changes it" $ do
+    mapM_
+      ( \(events, origin) → do
+          let state = applied (opened <> events) both
+          stOrigin state `shouldBe` Just (instant origin)
+      )
+      [([initAt 10 g0, initAt 30 p0], 30), ([initAt 30 g0, initAt 10 p0], 10)]
+    -- a success after the gate opened, or one that arrives once the session stops, moves nothing
+    stOrigin (applied (opened <> [initAt 10 p0, initAt 30 g0, initAt 99 g0]) both) `shouldBe` Just (instant 30)
+    stOrigin (applied (opened <> [initAt 10 p0, Stop StopQuit, initAt 30 g0]) both) `shouldBe` Nothing
+
+  it "counts a role initialized only once every instance of it has succeeded" $ do
+    let two = newSessionState limits [(Gameplay, 2)]
+        state = applied [initOk g0] two
+    roleInitializedOf Gameplay state `shouldBe` Just False
+    stStart state `shouldBe` StartClosed
+    let done = applied [Validated g0, Validated (InstanceKey Gameplay 1), AdmissionComplete, initOk g0, initOk (InstanceKey Gameplay 1)] two
+    roleInitializedOf Gameplay done `shouldBe` Just True
+    stStart done `shouldBe` StartOpen
+  where
+    opened' state = [Validated k | k ← Set.toList (stExpected state)] <> [AdmissionComplete]
+
+phasesOf' ∷ SessionState → (Maybe Phase, Maybe Phase)
+phasesOf' state = (phaseOfRole Gameplay state, phaseOfRole Presentation state)
+
+roleInitializedOf ∷ Role → SessionState → Maybe Bool
+roleInitializedOf role state = case role of
+  Gameplay → roleInitialized <$> statusGameplay (statusOf state)
+  Presentation → roleInitialized <$> statusPresentation (statusOf state)
+
+-- The failure policy ---------------------------------------------------------------------------------------
+
+policy ∷ Spec
+policy = describe "the failure policy" $ do
+  let ready = validated <> [initOk g0, initOk p0]
+
+  it "makes a failure before the start gate opens a boot failure that stops both roles at once" $ do
+    let events = validated <> [initOk p0, LatchFailure Gameplay (failure Gameplay OnInit "init failed") []]
+        (state, answers, effects) = runAll events both
+    stStopping state `shouldBe` True
+    stStart state `shouldBe` StartShut
+    last answers `shouldBe` Latched True
+    effects `shouldBe` [StopRoles [Gameplay, Presentation]]
+    phasesOf' state `shouldBe` (Just Stopping, Just Stopping)
+
+  it "closes admission in the transition that reports the owners to stop" $ do
+    let (state, _, effects) = runAll [LatchFailure Presentation (failure Presentation OnInit "x") []] both
+    effects `shouldBe` [StopRoles [Gameplay, Presentation]]
+    mapM_ (\r → rsAdmit r `shouldBe` AdmitStopping) (Map.elems (stRoles state))
+
+  it "stops the logical role alone for a logical failure after boot, leaving a healthy presentation role running" $ do
+    let (state, answers, effects) = runAll (ready <> [LatchFailure Gameplay (failure Gameplay OnUpdate "boom") []]) both
+    stStopping state `shouldBe` False
+    last answers `shouldBe` Latched True
+    effects `shouldBe` [StopRoles [Gameplay]]
+    phasesOf' state `shouldBe` (Just Stopping, Just Running)
+    roleAdmit Gameplay state `shouldBe` AdmitStopping
+    roleAdmit Presentation state `shouldBe` AdmitOpen
+    statusStopping (statusOf state) `shouldBe` False
+
+  it "ends the whole session for a presentation failure, whenever it comes" $ do
+    let (state, _, effects) = runAll (ready <> [LatchFailure Presentation (failure Presentation OnUpdate "ui") []]) both
+    stStopping state `shouldBe` True
+    effects `shouldBe` [StopRoles [Gameplay, Presentation]]
+
+  it "ends the whole session for the failure of a session's only role" $ do
+    let events = [Validated g0, AdmissionComplete, initOk g0, LatchFailure Gameplay (failure Gameplay OnUpdate "boom") []]
+    stStopping (applied events gameplayOnly) `shouldBe` True
+    stStopping (applied [Validated p0, AdmissionComplete, initOk p0, LatchFailure Presentation (failure Presentation OnUpdate "ui") []] presentationOnly) `shouldBe` True
+
+  it "ends a previously healthy presentation role when the logical role's cleanup then fails" $ do
+    let (state, _, effects) =
+          runAll
+            ( ready
+                <> [ LatchFailure Gameplay (failure Gameplay OnUpdate "boom") []
+                   , EngineFault (Just Gameplay) (engineEntry CleanupFailure (Just Gameplay) OnCleanup "release failed")
+                   ]
+            )
+            both
+    stStopping state `shouldBe` True
+    -- the logical role was reported once; the second report names only the role not yet stopping
+    effects `shouldBe` [StopRoles [Gameplay], StopRoles [Presentation]]
+    phaseOfRole Presentation state `shouldBe` Just Stopping
+
+  it "never returns a failed role to ready or running, and keeps its first failure through every later event" $ do
+    let first = failure Gameplay OnInit "first"
+        state =
+          applied
+            ( validated
+                <> [ LatchFailure Gameplay first []
+                   , initOk g0
+                   , initOk p0
+                   , LatchFailure Gameplay (failure Gameplay OnShutdown "second") []
+                   , Stop StopInterrupt
+                   ]
+            )
+            both
+    roleFailure' Gameplay state `shouldBe` Just first
+    phaseOfRole Gameplay state `shouldBe` Just Stopping
+    phaseOfRole Presentation state `shouldBe` Just Stopping
+
+  it "answers whether a failure was the first of its role" $
+    answersOf
+      [ LatchFailure Gameplay (failure Gameplay OnInit "a") []
+      , LatchFailure Gameplay (failure Gameplay OnShutdown "b") []
+      ]
+      both
+      `shouldBe` [Latched True, Latched False]
+
+  it "accounts the failure and what else failed as it ended in the engine report, the first failure as its primary" $ do
+    let entry = engineEntry CleanupFailure (Just Gameplay) OnShutdown "shutdown failed"
+        state = applied [LatchFailure Gameplay (failure Gameplay OnUpdate "boom") [entry, entry]] both
+    reportAccounted (stEngine state) `shouldBe` 3
+    erPrimary (stEngine state) `shouldBe` Just (engineEntry LuaError (Just Gameplay) OnUpdate "boom")
+    erSecondary (stEngine state) `shouldBe` [entry, entry]
+
+  it "accounts a later failure of another role as a secondary, never replacing the primary" $ do
+    let state = applied [LatchFailure Gameplay (failure Gameplay OnInit "first") [], LatchFailure Presentation (failure Presentation OnInit "second") []] both
+    erPrimary (stEngine state) `shouldBe` Just (engineEntry LuaError (Just Gameplay) OnInit "first")
+    map eeMessage (erSecondary (stEngine state)) `shouldBe` ["second"]
+
+  it "accounts what else failed as an instance ended in the report without latching a second failure" $ do
+    let entry = engineEntry CleanupFailure (Just Gameplay) OnShutdown "shutdown failed"
+        told = [InstanceFailing "inst" Gameplay (failure Gameplay OnUpdate "boom") [], InstanceEscalated "inst" Gameplay (failure Gameplay OnUpdate "boom") [entry]]
+        state = applied told both
+    answersOf told both `shouldBe` [Latched True, Done]
+    erSecondary (stEngine state) `shouldBe` [entry]
+    reportAccounted (stEngine state) `shouldBe` 2
+    roleFailure' Gameplay state `shouldBe` Just (failure Gameplay OnUpdate "boom")
+
+  it "commits an owner's end once: the claim, every entry and every init its settlements prove, and a second commit adds nothing" $ do
+    let entries = [engineEntry CleanupFailure (Just Gameplay) OnCleanup "first", engineEntry CleanupFailure (Just Gameplay) OnCleanup "second"]
+        ended = OwnerFinalized Gameplay (map evidenceOf entries) [(g0, InstanceFact True FactShutdownRan EndedStopped)]
+        once = applied (validated <> [ended]) both
+        twice = applied (validated <> [ended, ended]) both
+    map eeMessage (erSecondary (stEngine once)) `shouldSatisfy` (\found → "second" `elem` found)
+    (rsOwnerEnded <$> Map.lookup Gameplay (stRoles once)) `shouldBe` Just True
+    reportAccounted (stEngine twice) `shouldBe` reportAccounted (stEngine once)
+    -- the init the settlement proves is recorded, with no clock, and opens nothing
+    roleInitializedOf Gameplay once `shouldBe` Just True
+    stStart once `shouldBe` StartShut
+
+  it "latches an instance's failure once, marking it told in the same step, whichever notice comes first" $ do
+    let failed = failure Gameplay OnUpdate "boom"
+        entry = engineEntry CleanupFailure (Just Gameplay) OnShutdown "shutdown failed"
+    -- told as the ending began, then settled: one latch, the settlement adds only what else failed
+    answersOf [InstanceFailing "i" Gameplay failed [], InstanceEscalated "i" Gameplay failed [entry]] both `shouldBe` [Latched True, Done]
+    -- settled without having been told early: latched then, and marked, so a repeat adds nothing
+    answersOf [InstanceEscalated "i" Gameplay failed [], InstanceEscalated "i" Gameplay failed [entry]] both `shouldBe` [Latched True, Done]
+    stEarly (applied [InstanceEscalated "i" Gameplay failed []] both) `shouldBe` Set.fromList ["i"]
+
+  it "accounts every engine fault, keeping the first as the primary, sixteen summaries and the count of the rest" $ do
+    let faults = [EngineFault (Just Gameplay) (engineEntry CleanupFailure (Just Gameplay) OnCleanup (Text.pack ("cleanup " <> show n))) | n ← [1 .. 40 ∷ Int]]
+        state = applied faults both
+        report' = stEngine state
+    fmap eeMessage (erPrimary report') `shouldBe` Just "cleanup 1"
+    length (erSecondary report') `shouldBe` 16
+    erOmitted report' `shouldBe` 23
+    reportAccounted report' `shouldBe` 40
+    stStopping state `shouldBe` True
+
+roleFailure' ∷ Role → SessionState → Maybe RoleFailure
+roleFailure' role state = rsFailure =<< Map.lookup role (stRoles state)
+
+-- The ranking of outcomes ----------------------------------------------------------------------------
+
+ranking ∷ Spec
+ranking = describe "the outcome" $ do
+  it "ranks failure over interruption over a normal quit over success, whatever the order" $ do
+    outVerdict (outcomeOf both) `shouldBe` VerdictSuccess
+    outVerdict (outcomeOf (applied [Stop StopQuit] both)) `shouldBe` VerdictSuccess
+    outVerdict (outcomeOf (applied [Stop StopInterrupt] both)) `shouldBe` VerdictInterrupted
+    outVerdict (outcomeOf (applied [Stop StopQuit, Stop StopInterrupt] both)) `shouldBe` VerdictInterrupted
+    outVerdict (outcomeOf (applied [Stop StopInterrupt, Stop StopQuit] both)) `shouldBe` VerdictInterrupted
+    let failed = LatchFailure Gameplay (failure Gameplay OnInit "x") []
+    outVerdict (outcomeOf (applied [failed, Stop StopQuit] both)) `shouldBe` VerdictFailure
+    outVerdict (outcomeOf (applied [Stop StopQuit, failed] both)) `shouldBe` VerdictFailure
+    outVerdict (outcomeOf (applied [Stop StopInterrupt, failed, Stop StopQuit] both)) `shouldBe` VerdictFailure
+
+  it "treats an engine failure and the terminal failure as failures that a later stop cannot erase" $ do
+    let engine = EngineFault Nothing (engineEntry HostFailure Nothing OnEngine "a provider failed")
+    outVerdict (outcomeOf (applied [engine, Stop StopQuit] both)) `shouldBe` VerdictFailure
+    let terminal = Terminal (newRoleFailure StateUnavailable OnUpdate Presentation "state is unavailable")
+    outVerdict (outcomeOf (applied [Stop StopInterrupt, terminal] both)) `shouldBe` VerdictFailure
+
+  it "latches the terminal failure once, stops the whole session and is not an ordinary role failure" $ do
+    let terminal = Terminal (newRoleFailure StateUnavailable OnUpdate Presentation "state is unavailable")
+        (state, answers, effects) = runAll [terminal, terminal] both
+    answers `shouldBe` [Latched True, Latched False]
+    effects `shouldBe` [StopRoles [Gameplay, Presentation]]
+    stStopping state `shouldBe` True
+    outFailures (outcomeOf state) `shouldBe` []
+    outTerminal (outcomeOf state) `shouldSatisfy` isJust
+
+  it "lists each failed role's first failure in the order they latched, the primary first" $ do
+    let g = failure Gameplay OnInit "g"
+        p = failure Presentation OnInit "p"
+    outFailures (outcomeOf (applied [LatchFailure Presentation p [], LatchFailure Gameplay g []] both)) `shouldBe` [p, g]
+
+  it "is idempotent: a second stop reports no owner again" $ do
+    effectsOf [Stop StopQuit, Stop StopQuit, Stop StopInterrupt] both `shouldBe` [StopRoles [Gameplay, Presentation]]
+
+  it "is not retired until every role has been reported retired, and each only by its own event" $ do
+    let stopped = applied [Stop StopQuit] both
+    outRetired (outcomeOf stopped) `shouldBe` False
+    outRetired (outcomeOf (applied [RoleRetired Gameplay] stopped)) `shouldBe` False
+    let done = applied [RoleRetired Gameplay, RoleRetired Presentation] stopped
+    outRetired (outcomeOf done) `shouldBe` True
+    phasesOf' done `shouldBe` (Just Retired, Just Retired)
+    roleAdmit Gameplay done `shouldBe` AdmitClosed
+
+  it "unwinds a composition without recording a quit or a failure" $ do
+    let (state, _, effects) = runAll [Unwind] both
+    effects `shouldBe` [StopRoles [Gameplay, Presentation]]
+    stQuit state `shouldBe` False
+    stInterrupt state `shouldBe` False
+    outVerdict (outcomeOf state) `shouldBe` VerdictSuccess
+    dispatchDecision state `shouldBe` Just False
+
+  it "publishes an absent role as absent, and failure beside stopping as separate facts" $ do
+    let status = statusOf gameplayOnly
+    statusPresentation status `shouldBe` Nothing
+    fmap rolePhase (statusGameplay status) `shouldBe` Just Starting
+    let failedOne = statusOf (applied (validated <> [initOk g0, initOk p0, LatchFailure Gameplay (failure Gameplay OnUpdate "x") []]) both)
+    statusStopping failedOne `shouldBe` False
+    fmap roleFailed (statusGameplay failedOne) `shouldBe` Just True
+    fmap roleFailed (statusPresentation failedOne) `shouldBe` Just False
+
+-- Admission accounting -----------------------------------------------------------------------------------------
+
+admission ∷ Spec
+admission = describe "admission" $ do
+  it "takes an intent for a role that takes work, and gives it back when tracked or abandoned" $ do
+    let (state, answers, _) = runAll [Intend Gameplay, Intend Gameplay, Tracked Gameplay, Abandoned Gameplay] both
+    answers `shouldBe` [Done, Done, Done, Done]
+    (rsIntents <$> Map.lookup Gameplay (stRoles state)) `shouldBe` Just 0
+
+  it "refuses an intent from a role that has stopped taking work, and from a stopped session" $ do
+    answersOf [Stop StopQuit, Intend Gameplay] both `shouldBe` [Done, Refused]
+    answersOf [LatchFailure Gameplay (failure Gameplay OnUpdate "x") [], Intend Gameplay, Intend Presentation] (applied (validated <> [initOk g0, initOk p0]) both)
+      `shouldBe` [Latched True, Refused, Done]
+
+  it "never lets the count of intents go below zero" $ do
+    let state = applied [Tracked Gameplay, Abandoned Gameplay] both
+    (rsIntents <$> Map.lookup Gameplay (stRoles state)) `shouldBe` Just 0
+
+-- Every order ------------------------------------------------------------------------------------------------------
+
+invariants ∷ Spec
+invariants = describe "every order of events" $ do
+  it "keeps the gates, the phases, the first failure and the ranking, after every step of every sequence of five events" $
+    [(events, broken) | events ← sequencesOf menu 5, let broken = violations events, not (null broken)] `shouldBe` []
+  it "reports each owner to be stopped at most once, whatever happens" $
+    mapM_
+      ( \events → do
+          let (_, _, effects) = runAll events both
+              reported = concat [roles | StopRoles roles ← effects]
+          reported `shouldBe` Set.toList (Set.fromList reported)
+      )
+      (sequencesOf menu 5)
+  where
+    menu =
+      [ Validated g0
+      , Validated p0
+      , AdmissionComplete
+      , initOk g0
+      , initOk p0
+      , LatchFailure Gameplay (failure Gameplay OnUpdate "g") []
+      , LatchFailure Presentation (failure Presentation OnUpdate "p") []
+      , Stop StopQuit
+      , Stop StopInterrupt
+      , StopHanded Gameplay
+      , StopHanded Presentation
+      , InstanceFailing "inst" Gameplay (failure Gameplay OnUpdate "g") []
+      , InstanceEscalated "inst" Gameplay (failure Gameplay OnUpdate "g") []
+      , OwnerFinalized Gameplay [evidenceOf (engineEntry CleanupFailure (Just Gameplay) OnCleanup "close failed")] [(g0, InstanceFact True FactShutdownRan EndedStopped)]
+      ]
+
+-- | Every sequence of up to this many events from a menu.
+sequencesOf ∷ [a] → Int → [[a]]
+sequencesOf menu n = concat [sequencesLength menu k | k ← [0 .. n]]
+  where
+    sequencesLength _ 0 = [[]]
+    sequencesLength items k = [item : rest | item ← items, rest ← sequencesLength items (k - 1)]
+
+-- | A transition function: the real one, or a mutant with one protection removed.
+type Stepper = Event → SessionState → (SessionState, Answer)
+
+-- | The invariants broken anywhere along one sequence: empty when it keeps them all.
+violations ∷ [Event] → [String]
+violations = violationsWith step
+
+-- | The same, over a transition function.
+violationsWith ∷ Stepper → [Event] → [String]
+violationsWith stepper = go both Set.empty
+  where
+    go _ _ [] = []
+    go state seen (event : rest) =
+      let (next, _) = stepper event state
+          seen' = seen `Set.union` Set.fromList (keysOf event)
+       in [show event <> ": " <> why | why ← check seen event state next] <> go next seen' rest
+    keysOf = \case
+      Account items → [identity | Evidence (Just identity) _ ← items]
+      OwnerFinalized _ items _ → [identity | Evidence (Just identity) _ ← items]
+      ReleasesDone _ items → [identity | Evidence (Just identity) _ ← items]
+      _ → []
+    check seen event prior afterwards =
+      concat
+        [ -- each gate is decided once
+          [ "the dispatch gate changed after it was decided" | stDispatch prior /= DispatchClosed, stDispatch afterwards /= stDispatch prior ]
+        , [ "the start gate changed after it was decided" | stStart prior /= StartClosed, stStart afterwards /= stStart prior ]
+        , -- a stopping session has a decided start gate and takes no work
+          [ "a stopping session left the start gate closed" | stStopping afterwards, stStart afterwards == StartClosed ]
+        , [ "a stopping session still takes work" | stStopping afterwards, any ((== AdmitOpen) . rsAdmit) (Map.elems (stRoles afterwards)) ]
+        , -- the start gate opens only for a session with nothing failed or stopped, and only after dispatch
+          [ "the start gate opened after a stop" | opening, stStopping prior ]
+        , [ "the start gate opened after a failure" | opening, any (isJust . rsFailure) (Map.elems (stRoles prior)) ]
+        , [ "the start gate opened prior the dispatch gate" | opening, stDispatch afterwards /= DispatchOpen ]
+        , -- a failed role is never ready or running, and keeps its first failure
+          [ "a failed role is ready or running" | found ← Map.elems (stRoles afterwards), isJust (rsFailure found), rsPhase found `elem` [Ready, Running] ]
+        , [ "a role's first failure changed" | role ← [Gameplay, Presentation], Just first ← [Map.lookup role (stRoles prior) >>= rsFailure], (Map.lookup role (stRoles afterwards) >>= rsFailure) /= Just first ]
+        , -- a stop is owed to a role that does not take work, and is dropped only when it is performed or the role has retired
+          [ "a stop is owed to a role that takes work" | role ← owedStops afterwards, roleAdmit role afterwards == AdmitOpen ]
+        , [ "an owed stop was dropped" | role ← owedStops prior, role `notElem` owedStops afterwards, not (performs event role) ]
+        , -- the claim that an owner was accounted, and the marker that an instance's failure was told, only grow
+          [ "the accounted claim was withdrawn" | role ← [Gameplay, Presentation], (rsOwnerEnded <$> Map.lookup role (stRoles prior)) == Just True, (rsOwnerEnded <$> Map.lookup role (stRoles afterwards)) /= Just True ]
+        , [ "the told marker was withdrawn" | not (stEarly prior `Set.isSubsetOf` stEarly afterwards) ]
+        , -- an owner's end, and what a settlement proves, open no gate
+          [ "an owner's end opened the start gate" | opening, isFinalized event ]
+        , -- the pacing origin is recorded by the transition that opens the start gate, once
+          [ "the origin changed after it was recorded" | isJust (stOrigin prior), stOrigin afterwards /= stOrigin prior ]
+        , [ "the origin was recorded without the gate opening" | stOrigin prior == Nothing, isJust (stOrigin afterwards), not opening ]
+        , [ "the gate opened without recording the origin" | opening, stOrigin afterwards == Nothing ]
+        , -- the ranking never goes down
+          [ "the verdict went down" | outVerdict (outcomeOf afterwards) < outVerdict (outcomeOf prior) ]
+        , -- a failure prior the start gate opened ends the whole session
+          [ "a failure prior the start gate opened did not stop the session" | any (isJust . rsFailure) (Map.elems (stRoles afterwards)), stStart afterwards /= StartOpen, not (stStopping afterwards) ]
+        , -- a stopping session owes a stop to every owner not yet asked, not accounted and not retired, once each
+          [ "a stopping session owes " <> show role <> " no stop" | stStopping afterwards, (role, found) ← Map.toList (stRoles afterwards), rsPhase found /= Retired, not (rsStopHanded found), not (rsOwnerEnded found), role `notElem` owedStops afterwards ]
+        , [ "a stop is owed twice" | owedStops afterwards /= Set.toList (Set.fromList (owedStops afterwards)) ]
+        , -- a role is retired only when retirement is proven
+          [ "a role retired without proof: " <> show role | (role, found) ← Map.toList (stRoles afterwards), rsPhase found == Retired, not (proven found) ]
+        , -- what a settlement proved is kept: an init that succeeded stays, a fact once written is not rewritten
+          [ "an init success was withdrawn" | (role, found) ← Map.toList (stRoles prior), Just later ← [Map.lookup role (stRoles afterwards)], not (rsInited found `Set.isSubsetOf` rsInited later) ]
+        , [ "a fact was rewritten" | (role, found) ← Map.toList (stRoles prior), Just later ← [Map.lookup role (stRoles afterwards)], (slot, fact) ← Map.toList (rsFacts found), Map.lookup slot (rsFacts later) /= Just fact ]
+        , -- evidence is counted by its identity: the identities only grow, and a repeated one adds nothing
+          [ "an evidence identity was withdrawn" | not (stEvidence prior `Set.isSubsetOf` stEvidence afterwards) ]
+        , [ "evidence already accounted was counted again" | Account items ← [event], not (null items), all (\item → maybe False (`Set.member` seen) (evKey item)) items, reportAccounted (stEngine afterwards) /= reportAccounted (stEngine prior) ]
+        ]
+      where
+        opening = stStart afterwards == StartOpen && stStart prior /= StartOpen
+        isFinalized = \case
+          OwnerFinalized {} → True
+          _ → False
+        performs by role = case by of
+          StopHanded done → done == role
+          OwnerFinalized done _ _ → done == role
+          RoleRetired done → done == role
+          _ → False
+        proven found =
+          rsAdmit found == AdmitClosed
+            && rsIntents found == 0
+            && (BuildOwner `Set.notMember` rsAcquired found || rsOwnerEnded found)
+            && (BuildCoordinator `Set.notMember` rsAcquired found || rsDrained found)
+            && (Set.null (rsAcquired found) || (rsReleased found && not (rsReleaseFailed found)))
+
+-- The teardown ----------------------------------------------------------------------------------------------------------
+
+-- | The ways a role's owner and coordinator are acquired, and the evidence it ends with.
+acquired ∷ [Event]
+acquired = [Acquired Gameplay built | built ← [BuildCoordinator, BuildData, BuildFacade, BuildOwner]]
+
+-- | Identities as the foundation issues them: each cleanup failure it retains is given a fresh one.
+freshKeys ∷ Int → IO [EvidenceKey]
+freshKeys n = do
+  let caught' message = ExceptionWithContext emptyExceptionContext (toException (userError message))
+  composed ← composeCleanup (Just (caught' "primary")) [("release", caught' "failed") | _ ← [1 .. n]]
+  pure (maybe [] (\(ExceptionWithContext carried _) → [evidenceKeyOf (cleanupFailureId item) | item ← cleanupFailuresInContext carried]) composed)
+
+factRan ∷ InstanceFact
+factRan = InstanceFact True FactShutdownRan EndedStopped
+
+teardown ∷ Spec
+teardown = describe "the teardown" $ do
+  it "publishes a retirement only once the owner is accounted, the coordinator drained and the releases attempted without a failure" $ do
+    let stopped = applied (acquired <> [Stop StopQuit]) gameplayOnly
+        retiredAfter events = phaseOfRole Gameplay (applied (events <> [RoleRetired Gameplay]) stopped)
+        ended = OwnerFinalized Gameplay [] [(g0, factRan)]
+    retiredAfter [] `shouldBe` Just Stopping
+    retiredAfter [ended] `shouldBe` Just Stopping
+    retiredAfter [ended, Drained Gameplay] `shouldBe` Just Stopping
+    retiredAfter [Drained Gameplay, ReleasesDone Gameplay []] `shouldBe` Just Stopping
+    retiredAfter [ended, Drained Gameplay, ReleasesDone Gameplay [evidenceOf (engineEntry CleanupFailure (Just Gameplay) OnCleanup "release failed")]] `shouldBe` Just Stopping
+    retiredAfter [ended, Drained Gameplay, ReleasesDone Gameplay []] `shouldBe` Just Retired
+    answersOf [RoleRetired Gameplay] stopped `shouldBe` [Refused]
+
+  it "refuses to publish the retirement of a role that still takes work, or has an admission outstanding" $ do
+    answersOf [RoleRetired Gameplay] gameplayOnly `shouldBe` [Refused]
+    answersOf [Intend Gameplay, Stop StopQuit, RoleRetired Gameplay] gameplayOnly `shouldBe` [Done, Done, Refused]
+
+  it "holds a role that acquired nothing retirable as soon as it is closed, since it holds nothing" $
+    phaseOfRole Gameplay (applied [Stop StopQuit, RoleRetired Gameplay] gameplayOnly) `shouldBe` Just Retired
+
+  it "keeps a release failure on the role: it is accounted, and the role is finished but never retired" $ do
+    let failed = ReleasesDone Gameplay [evidenceOf (engineEntry CleanupFailure (Just Gameplay) OnCleanup "release failed")]
+        state = applied (acquired <> [Stop StopQuit, OwnerFinalized Gameplay [] [(g0, factRan)], Drained Gameplay, failed, RoleRetired Gameplay]) gameplayOnly
+    phaseOfRole Gameplay state `shouldBe` Just Stopping
+    rolesFinished state `shouldBe` True
+    allRolesRetired state `shouldBe` False
+    outVerdict (outcomeOf state) `shouldBe` VerdictFailure
+
+  it "owes the stop of every owner not yet asked when a cleanup fault arrives during the logical role's retirement, before anything else" $ do
+    let logicalFailed = validated <> [initOk g0, initOk p0, LatchFailure Gameplay (failure Gameplay OnUpdate "boom") []]
+        state = applied (logicalFailed <> [StopHanded Gameplay, ReleasesDone Gameplay [evidenceOf (engineEntry CleanupFailure (Just Gameplay) OnCleanup "release failed")]]) both
+    owedStops state `shouldBe` [Presentation]
+    stStopping state `shouldBe` True
+
+  it "keeps a stop owed until it is handed over or the owner's completion makes it unnecessary, and owes it once" $ do
+    let stopped = applied [Stop StopQuit, Stop StopInterrupt, Unwind] both
+    owedStops stopped `shouldBe` [Gameplay, Presentation]
+    owedStops (applied [StopHanded Gameplay] stopped) `shouldBe` [Presentation]
+    -- a stop already handed over is not owed again by a later closure
+    owedStops (applied [StopHanded Gameplay, Unwind] stopped) `shouldBe` [Presentation]
+    -- the completion of an owner settles what was owed it, and a later closure owes it nothing
+    owedStops (applied [OwnerFinalized Presentation [] [], Unwind] stopped) `shouldBe` [Gameplay]
+
+  it "records a stop primitive that raised once, keeps the stop owed and never retries it in the model" $ do
+    let defect = StopDefect Gameplay (engineEntry HostFailure (Just Gameplay) OnEngine "the stop raised") []
+        state = applied [defect, defect] gameplayOnly
+    reportAccounted (stEngine state) `shouldBe` 1
+    owedStops state `shouldBe` [Gameplay]
+    stStopDefects state `shouldBe` Set.fromList [Gameplay]
+
+  it "ends the whole session when an owner ends that nobody asked to stop, and records neither a quit nor a failure of it" $ do
+    let state = applied (validated <> [OwnerFinalized Presentation [] []]) both
+    stStopping state `shouldBe` True
+    stQuit state `shouldBe` False
+    owedStops state `shouldBe` [Gameplay]
+
+  it "counts one failure for one identity however many times it is seen, and counts equal text with different identities twice" $ do
+    keys ← freshKeys 2
+    let entryNamed text = engineEntry CleanupFailure (Just Gameplay) OnCleanup text
+        distinct = [Evidence (Just identity) (entryNamed "same text") | identity ← keys]
+        first = take 1 distinct
+        once = applied [Account first] both
+        repeated = applied [Account first, Account first] both
+        twice = applied [Account distinct] both
+    reportAccounted (stEngine repeated) `shouldBe` reportAccounted (stEngine once)
+    reportAccounted (stEngine twice) `shouldBe` 2
+
+  it "writes each diagnostic under a stable identity that one caller alone can claim, and keeps it until it is done" $ do
+    let said = applied [Stop StopQuit] both
+        waiting = pendingDiagnostics said
+    map dgSay waiting `shouldSatisfy` any ((== "session stopping") . sayMessage)
+    let identity = maybe 0 dgId (listToMaybe waiting)
+    answersOf [DiagClaim identity, DiagClaim identity] said `shouldBe` [Done, Refused]
+    -- an interrupted attempt is kept as data, marked unfinished, and is not pending again
+    let interrupted = applied [DiagClaim identity, DiagInterrupt identity] said
+    pendingDiagnostics interrupted `shouldSatisfy` all ((/= identity) . dgId)
+    length (stDiags interrupted) `shouldBe` length (stDiags said)
+    length (stDiags (applied [DiagClaim identity, DiagDone identity] said)) `shouldBe` length (stDiags said) - 1
+
+  it "submits the same end again without duplicating its accounting, failure order or stops" $ do
+    let ended = OwnerFinalized Gameplay [evidenceOf (engineEntry CleanupFailure (Just Gameplay) OnCleanup "close failed")] [(g0, factRan)]
+        once = applied (validated <> [initOk g0, ended]) both
+        again = applied (validated <> [initOk g0, ended, ended, ended]) both
+    reportAccounted (stEngine again) `shouldBe` reportAccounted (stEngine once)
+    stFailureOrder again `shouldBe` stFailureOrder once
+    owedStops again `shouldBe` owedStops once
+
+  it "keeps every invariant, retirement and evidence included, after every step of every sequence of five events" $ do
+    keys ← freshKeys 1
+    let menu' =
+          [ Stop StopQuit
+          , Unwind
+          , OwnerFinalized Gameplay [evidenceOf (engineEntry CleanupFailure (Just Gameplay) OnCleanup "close failed")] [(g0, factRan)]
+          , Drained Gameplay
+          , ReleasesDone Gameplay []
+          , ReleasesDone Gameplay [evidenceOf (engineEntry CleanupFailure (Just Gameplay) OnCleanup "release failed")]
+          , RoleRetired Gameplay
+          , StopHanded Gameplay
+          , Account [Evidence (listToMaybe keys) (engineEntry CleanupFailure Nothing OnCleanup "carried")]
+          , StopDefect Gameplay (engineEntry HostFailure (Just Gameplay) OnEngine "the stop raised") []
+          ]
+        starting = acquired
+        broken = [(events, why) | events ← sequencesOf menu' 5, let why = violationsFrom starting events, not (null why)]
+    broken `shouldBe` []
+
+-- The mutants --------------------------------------------------------------------------------------------------------------
+
+-- | The same checks, from a state that has already acquired a role's components.
+violationsFrom ∷ [Event] → [Event] → [String]
+violationsFrom prefix events = violationsWith step (prefix <> events)
+
+-- | The invariants that tie a claim to its payload, checked along a stream of events.
+claimWithoutPayload ∷ [Event] → [String]
+claimWithoutPayload = go gameplayOnly
+  where
+    go _ [] = []
+    go state (event : rest) =
+      let (next, _) = step event state
+          claimed = (rsOwnerEnded <$> Map.lookup Gameplay (stRoles next)) == Just True
+          payload = Map.member 0 (maybe Map.empty rsFacts (Map.lookup Gameplay (stRoles next))) && reportAccounted (stEngine next) >= 1
+       in ["the owner is claimed accounted before its evidence and facts: " <> show event | claimed, not payload] <> go next rest
+
+mutants ∷ Spec
+mutants = describe "each protection removed, which the model's own checks detect (negative controls)" $ do
+  let bothClosed = [Stop StopQuit]
+      ended = OwnerFinalized Gameplay [evidenceOf (engineEntry CleanupFailure (Just Gameplay) OnCleanup "close failed")] [(g0, factRan)]
+
+  it "retires a role without proof when the eligibility is not required" $ do
+    let early event state = case event of
+          RoleRetired role → (adjustRole' role (\found → found {rsPhase = Retired, rsAdmit = AdmitClosed}) state, Done)
+          _ → step event state
+        stream = acquired <> bothClosed <> [RoleRetired Gameplay]
+    violationsWith step stream `shouldBe` []
+    violationsWith early stream `shouldSatisfy` any (isInfixOf' "retired without proof")
+
+  it "leaves the peer running when a cleanup fault does not widen the stop set" $ do
+    let narrow event state = case (event, step event state) of
+          (ReleasesDone {}, (next, answer)) → (next {stStops = stStops state}, answer)
+          (other, found) | isAccount other → let (next, answer) = found in (next {stStops = stStops state}, answer)
+          (_, found) → found
+        isAccount = \case
+          Account _ → True
+          _ → False
+        stream = validated <> [initOk g0, initOk p0, LatchFailure Gameplay (failure Gameplay OnUpdate "boom") [], StopHanded Gameplay, ReleasesDone Gameplay [evidenceOf (engineEntry CleanupFailure (Just Gameplay) OnCleanup "release failed")]]
+    violationsWith step stream `shouldBe` []
+    violationsWith narrow stream `shouldSatisfy` any (isInfixOf' "owes Presentation no stop")
+
+  it "forgets a stop that was never handed over when it is dropped without proof" $ do
+    let dropping event state = case event of
+          Stop kind → let (next, answer) = step (Stop kind) state in (next {stStops = mempty}, answer)
+          _ → step event state
+    violationsWith step bothClosed `shouldBe` []
+    violationsWith dropping bothClosed `shouldSatisfy` any (isInfixOf' "owes")
+
+  it "lets a late success reopen a shut gate when the closure is not remembered" $ do
+    let reopening event state = case (event, step event state) of
+          (InitSucceeded _ (Just origin), (next, answer)) | stStopping state → (next {stStart = StartOpen, stOrigin = Just origin}, answer)
+          (_, found) → found
+        stream = validated <> [initOk p0, Stop StopQuit, initOk g0]
+    violationsWith step stream `shouldBe` []
+    violationsWith reopening stream `shouldSatisfy` any (isInfixOf' "start gate")
+
+  it "claims an owner accounted before its evidence and its facts are in when the end is committed in pieces" $ do
+    let atomic = acquired <> [ended]
+        pieces = acquired <> [OwnerFinalized Gameplay [] [], Account [evidenceOf (engineEntry CleanupFailure (Just Gameplay) OnCleanup "close failed")], OwnerFinalized Gameplay [] [(g0, factRan)]]
+    claimWithoutPayload atomic `shouldBe` []
+    claimWithoutPayload pieces `shouldSatisfy` (not . null)
+
+  it "counts a failure again when its identity is not kept" $ do
+    keys ← freshKeys 1
+    let item = Evidence (listToMaybe keys) (engineEntry CleanupFailure Nothing OnCleanup "carried")
+        forgetting event state = case event of
+          Account items → step (Account [i {evKey = Nothing} | i ← items]) state
+          _ → step event state
+        stream = [Account [item], Account [item]]
+    violationsWith step stream `shouldBe` []
+    violationsWith forgetting stream `shouldSatisfy` any (isInfixOf' "counted again")
+
+  it "ranks an interruption over a failure when the ranking is inverted" $ do
+    let inverted found = if stInterrupt found then VerdictInterrupted else outVerdict (outcomeOf found)
+        ended' = applied [Stop StopInterrupt, EngineFault Nothing (engineEntry HostFailure Nothing OnEngine "failed")] both
+    outVerdict (outcomeOf ended') `shouldBe` VerdictFailure
+    inverted ended' `shouldBe` VerdictInterrupted
+  where
+    adjustRole' role change state = state {stRoles = Map.adjust change role (stRoles state)}
+    isInfixOf' needle haystack = Text.isInfixOf (Text.pack needle) (Text.pack haystack)
+
+-- The failure schema ---------------------------------------------------------------------------------------------------
+
+failures ∷ Spec
+failures = describe "the failure schema" $ do
+  it "cuts text at a code point, ends a cut in a visible marker, and never exceeds the bound" $ do
+    truncateText 10 "short" `shouldBe` "short"
+    truncateText 10 (Text.replicate 20 "a") `shouldBe` "aaaaaaa..."
+    -- a three-byte code point is kept while it fits before the marker, and cut whole when it does not
+    truncateText 8 "ab\x20AC\x20AC\x20AC" `shouldBe` "ab\x20AC..."
+    truncateText 7 "ab\x20AC\x20AC\x20AC" `shouldBe` "ab..."
+    utf8Bytes (truncateText 8 "ab\x20AC\x20AC\x20AC") `shouldSatisfy` (<= 8)
+    truncateText 3 "abcdef" `shouldBe` "..."
+    truncateText 2 "abcdef" `shouldBe` "ab"
+    truncateText 0 "abcdef" `shouldBe` ""
+
+  it "keeps every multibyte text within its bound at every length, never splitting a code point" $
+    mapM_
+      ( \bound → do
+          let cut = truncateText bound (Text.pack (concat (replicate 40 "a\x00E9\x20AC\x1F600")))
+          utf8Bytes cut `shouldSatisfy` (<= bound)
+          Text.unpack cut `shouldSatisfy` all (/= '\xFFFD')
+      )
+      [0 .. 64]
+
+  it "holds a whole record to the record bound by shortening the traceback, then the message, then the path" $ do
+    let big = Text.replicate 30000 "x"
+        record =
+          (newRoleFailure LuaError OnUpdate Gameplay big)
+            { rfContent = Just "game"
+            , rfInstance = Just (Text.replicate 400 "i")
+            , rfPath = Just (Text.replicate 4000 "p")
+            , rfTraceback = Just big
+            }
+        -- a record bound that holds the message and the traceback and nothing beside them, so the identity,
+        -- the path and the words must take their room from the traceback
+        tight = failureLimitsOf (bytesOf [(RoleFailureRecordBytes, 10240)])
+        bounded = boundFailure tight record
+    recordBytes (boundFailure limits record) `shouldSatisfy` (<= limitRecord limits)
+    recordBytes bounded `shouldSatisfy` (<= limitRecord tight)
+    utf8Bytes (rfMessage bounded) `shouldBe` limitMessage tight
+    maybe 0 utf8Bytes (rfTraceback bounded) `shouldSatisfy` (< limitTraceback tight)
+    maybe 0 utf8Bytes (rfInstance bounded) `shouldSatisfy` (<= limitInstance tight)
+    rfCode bounded `shouldBe` LuaError
+    rfRole bounded `shouldBe` Gameplay
+    rfStage bounded `shouldBe` OnUpdate
+    rfContent bounded `shouldBe` Just "game"
+    Text.isSuffixOf "..." (rfMessage bounded) `shouldBe` True
+
+  -- One example for each text field of the record: the field alone is far beyond every bound, and the record that comes
+  -- out is within the record's, with the field cut at its own bound and a visible marker, and nothing else touched.
+  mapM_
+    ( \(name, oversize, lengthOf, ownBound) →
+        it ("cuts the " <> name <> " to its own bound and holds the record to its bound when it alone is oversized") $ do
+          let huge = Text.replicate 30000 "x"
+              bounded' = boundFailure limits (oversize huge (newRoleFailure LuaError OnUpdate Gameplay "short"))
+          lengthOf bounded' `shouldSatisfy` (<= ownBound limits)
+          lengthOf bounded' `shouldSatisfy` (> 0)
+          recordBytes bounded' `shouldSatisfy` (<= limitRecord limits)
+          -- everything else the record said is as it was
+          rfCode bounded' `shouldBe` LuaError
+          rfRole bounded' `shouldBe` Gameplay
+          rfStage bounded' `shouldBe` OnUpdate
+    )
+    fields
+
+  -- The whole record counts every field, whichever it is that is large: with a record bound anywhere above the schema's own
+  -- words, the record that comes out is within it, and the fields give way in the order the schema names.
+  it "counts every field in the record bound, at every record bound, and shortens the content identifier last" $ do
+    let full =
+          (newRoleFailure LuaError OnUpdate Gameplay (Text.replicate 5000 "m"))
+            { rfContent = Just (Text.replicate 5000 "c")
+            , rfInstance = Just (Text.replicate 5000 "i")
+            , rfPath = Just (Text.replicate 9000 "p")
+            , rfTraceback = Just (Text.replicate 20000 "t")
+            }
+        wordsBytes = recordBytes (newRoleFailure LuaError OnUpdate Gameplay "")
+        records = [wordsBytes .. wordsBytes + 40] <> [wordsBytes + 41, wordsBytes + 48 .. limitRecord limits + 4000]
+    mapM_
+      ( \bound → do
+          let tight = limits {limitRecord = bound}
+              found = boundFailure tight full
+          recordBytes found `shouldSatisfy` (<= bound)
+      )
+      records
+    -- with room for all but a few bytes, only the last field to give way is touched
+    let nearly = limits {limitRecord = recordBytes (boundFailure limits full) - 1}
+        shortened = boundFailure nearly full
+    rfContent shortened `shouldBe` rfContent (boundFailure limits full)
+    recordBytes shortened `shouldSatisfy` (<= limitRecord nearly)
+
+  it "keeps a record that is within every bound as it was" $ do
+    let small =
+          (newRoleFailure ModuleError OnModule Presentation "no such module")
+            { rfContent = Just "game"
+            , rfInstance = Just "inst-3"
+            , rfPath = Just "lua/main.lua"
+            , rfTraceback = Just "stack traceback:\n\tmain.lua:1"
+            }
+    boundFailure limits small `shouldBe` small
+
+  -- The state bounds what an event carries, so no caller owes the bound and nothing it stores, publishes or says is longer.
+  mapM_
+    ( \(name, event, stored) →
+        it ("bounds the failure a " <> name <> " event carries before the state stores it") $ do
+          let (next, _) = step event both
+              kept = stored next
+          fmap recordBytes kept `shouldSatisfy` maybe False (<= limitRecord limits)
+          fmap (maybe 0 utf8Bytes . rfContent) kept `shouldSatisfy` maybe False (<= limitContent limits)
+          fmap (maybe 0 utf8Bytes . rfInstance) kept `shouldSatisfy` maybe False (<= limitInstance limits)
+          fmap (maybe 0 utf8Bytes . rfPath) kept `shouldSatisfy` maybe False (<= limitPath limits)
+          fmap (maybe 0 utf8Bytes . rfTraceback) kept `shouldSatisfy` maybe False (<= limitTraceback limits)
+          fmap (utf8Bytes . rfMessage) kept `shouldSatisfy` maybe False (<= limitMessage limits)
+          -- the engine report holds the failure's message, itself cut
+          maybe 0 (utf8Bytes . eeMessage) (erPrimary (stEngine next)) `shouldSatisfy` (<= limitRecord limits)
+    )
+    [ ("LatchFailure", LatchFailure Presentation everything [], rsFailure <=< Map.lookup Presentation . stRoles)
+    , ("InstanceFailing", InstanceFailing "host-1" Presentation everything [], rsFailure <=< Map.lookup Presentation . stRoles)
+    , ("InstanceEscalated", InstanceEscalated "host-1" Presentation everything [], rsFailure <=< Map.lookup Presentation . stRoles)
+    , ("Terminal", Terminal everything, stTerminal)
+    ]
+
+  -- Round 9's finding: a record bound the profile accepted could be below the schema's own words, which no cut can shorten.
+  -- Validation now refuses it (the least is the longest code, stage and role together), and the record is held to the
+  -- smallest bound it accepts for every code, stage and role.
+  it "has the schema's words in the profile as the session spells them, and the least record bound is exactly their longest together" $ do
+    codeWords `shouldBe` map codeWord [minBound .. maxBound]
+    stageWords `shouldBe` map stageWord [minBound .. maxBound]
+    roleWords `shouldBe` map roleWord [Gameplay, Presentation]
+    let words' = [recordBytes (newRoleFailure code stage role "") | code ← [minBound .. maxBound], stage ← [minBound .. maxBound], role ← [Gameplay, Presentation]]
+    maximum words' `shouldBe` schemaWordsBytes
+    limitRecord (failureLimitsOf smallestLegalProfile) `shouldBe` schemaWordsBytes
+
+  it "holds every record to the smallest record bound validation accepts, whatever its code, stage and role and however large its texts" $ do
+    let tightest = failureLimitsOf smallestLegalProfile
+        huge = Text.replicate 5000 "x"
+        loaded code stage role =
+          (newRoleFailure code stage role huge)
+            { rfContent = Just huge
+            , rfInstance = Just huge
+            , rfPath = Just huge
+            , rfTraceback = Just huge
+            }
+    mapM_
+      ( \(code, stage, role) → recordBytes (boundFailure tightest (loaded code stage role)) `shouldSatisfy` (<= limitRecord tightest)
+      )
+      [(code, stage, role) | code ← [minBound .. maxBound], stage ← [minBound .. maxBound], role ← [Gameplay, Presentation]]
+
+  it "spells the schema's codes, stages and roles as approved" $ do
+    map codeWord [minBound .. maxBound]
+      `shouldBe` ["lua_error", "module_error", "required_request", "host_failure", "cleanup_failure", "state_unavailable"]
+    map stageWord [minBound .. maxBound]
+      `shouldBe` ["module", "init", "update", "shutdown", "request", "cleanup", "engine"]
+    map roleWord [Gameplay, Presentation] `shouldBe` ["gameplay", "presentation"]
+
+-- The engine report ---------------------------------------------------------------------------------------------------------
+
+report ∷ Spec
+report = describe "the engine report" $ do
+  it "keeps the first failure as primary, at most sixteen secondary summaries, and counts the rest" $ do
+    let entries = [engineEntry CleanupFailure (Just Gameplay) OnCleanup (Text.pack ("cleanup " <> show n)) | n ← [1 .. 40 ∷ Int]]
+        built = foldl' (flip (noteEngine limits)) emptyReport entries
+    erPrimary built `shouldBe` listToMaybe entries
+    length (erSecondary built) `shouldBe` 16
+    erOmitted built `shouldBe` 23
+    reportAccounted built `shouldBe` 40
+    map eeMessage (erSecondary built) `shouldBe` map eeMessage (take 16 (drop 1 entries))
+
+  it "cuts a secondary summary to its bound and the primary so that the report stays within its own" $ do
+    let long = Text.replicate 10000 "z"
+        built = foldl' (flip (noteEngine limits)) emptyReport [engineEntry HostFailure Nothing OnEngine long | _ ← [1 .. 17 ∷ Int]]
+        total = maybe 0 (utf8Bytes . eeMessage) (erPrimary built) + sum (map (utf8Bytes . eeMessage) (erSecondary built))
+    total `shouldSatisfy` (<= limitReport limits)
+    mapM_ (\entry → utf8Bytes (eeMessage entry) `shouldSatisfy` (<= limitSummary limits)) (erSecondary built)
+    reportAccounted built `shouldBe` 17
+
+-- The diagnostics' evidence ---------------------------------------------------------------------------------------------
+
+diagnosticEvidence ∷ Spec
+diagnosticEvidence = describe "the diagnostics' evidence" $ do
+  let notes n = foldl' (\state i → fst (step (Note (Say SayInfo (Text.pack ("note " <> show i) <> Text.replicate 5000 "z") [])) state)) both [1 .. n ∷ Int]
+
+  it "records the diagnostics not delivered at the cut-off as an exact count and the first sixteen, each cut to a summary's bound, with the cause, and never as the session's failure" $ do
+    let said = notes 40
+        (cut, _) = step (DiagCutOff "the cause") said
+        evidence = stDiagEvidence cut
+    deUndelivered evidence `shouldBe` length (stDiags said)
+    length (deUndeliveredFirst evidence) `shouldBe` limitSecondary limits
+    map utf8Bytes (deUndeliveredFirst evidence) `shouldSatisfy` all (<= limitSummary limits)
+    -- the first ones, in the order they were meant
+    take 1 (deUndeliveredFirst evidence) `shouldSatisfy` all (Text.isPrefixOf "note 1")
+    deCause evidence `shouldBe` Just "the cause"
+    -- the queue is closed and empty, and the verdict, the failures and the report are untouched
+    stDiags cut `shouldBe` mempty
+    outVerdict (outcomeOf cut) `shouldBe` VerdictSuccess
+    erPrimary (outEngine (outcomeOf cut)) `shouldBe` Nothing
+    erSecondary (outEngine (outcomeOf cut)) `shouldBe` []
+    erOmitted (outEngine (outcomeOf cut)) `shouldBe` 0
+
+  it "cuts an undelivered message that is multibyte visibly, at a code point, within the bound" $ do
+    let multibyte = Text.replicate 3000 "\x20AC"
+        said = fst (step (Note (Say SayInfo multibyte [])) both)
+        evidence = stDiagEvidence (fst (step (DiagCutOff "the cause") said))
+    case deUndeliveredFirst evidence of
+      [kept] → do
+        utf8Bytes kept `shouldSatisfy` (<= limitSummary limits)
+        Text.isSuffixOf "..." kept `shouldBe` True
+        Text.all (`elem` ['\x20AC', '.']) kept `shouldBe` True
+      other → expectationFailure ("expected one undelivered message, found " <> show (length other))
+
+  it "counts a diagnostic meant after the cut-off directly, drops none, and lets a late acknowledgement or sink failure change nothing" $ do
+    let said = notes 3
+        (cut, _) = step (DiagCutOff "the cause") said
+        identity = 0
+        late = foldl' (\state event → fst (step event state)) cut [DiagClaim identity, DiagDone identity, DiagInterrupt identity, DiagFailedWrite identity "late", DiagSinkFailed "late"]
+        meant = fst (step (Note (Say SayInfo "after the cut-off" [])) cut)
+    deUndelivered (stDiagEvidence meant) `shouldBe` deUndelivered (stDiagEvidence cut) + 1
+    deUndeliveredFirst (stDiagEvidence meant) `shouldSatisfy` elem "after the cut-off"
+    stDiags meant `shouldBe` mempty
+    outcomeOf late `shouldBe` outcomeOf cut
+    historyOf late `shouldBe` historyOf cut
+    -- a second cut-off adds nothing
+    fst (step (DiagCutOff "again") cut) `shouldBe` cut
+
+  it "records a sink that failed as a count and the first eight, beside a failure the session already has, which stays the primary" $ do
+    let failed = fst (step (LatchFailure Gameplay (newRoleFailure LuaError OnUpdate Gameplay "boom") []) both)
+        sunk = foldl' (\state n → fst (step (DiagSinkFailed (Text.pack (show n) <> Text.replicate 5000 "s")) state)) failed [1 .. 40 ∷ Int]
+        evidence = stDiagEvidence sunk
+    deSinkFailures evidence `shouldBe` 40
+    length (deSinkFirst evidence) `shouldBe` limitSecondary limits `div` 2
+    map utf8Bytes (deSinkFirst evidence) `shouldSatisfy` all (<= limitSummary limits)
+    fmap eeCode (erPrimary (outEngine (outcomeOf sunk))) `shouldBe` Just LuaError
+    erSecondary (outEngine (outcomeOf sunk)) `shouldBe` erSecondary (outEngine (outcomeOf failed))
+    erOmitted (outEngine (outcomeOf sunk)) `shouldBe` 0
+    stStopping sunk `shouldBe` stStopping failed
+
+  it "keeps the whole record within the engine report's bound" $ do
+    let cut = fst (step (DiagCutOff (Text.replicate 5000 "c")) (notes 40))
+        sunk = foldl' (\state n → fst (step (DiagSinkFailed (Text.pack (show n) <> Text.replicate 5000 "s")) state)) cut [1 .. 40 ∷ Int]
+        evidence = stDiagEvidence sunk
+    sum (map utf8Bytes (deSinkFirst evidence <> deUndeliveredFirst evidence <> maybe [] pure (deCause evidence))) `shouldSatisfy` (<= limitReport limits)
+
+  it "keeps a diagnostic the sink raised for, failed, with the failure in one commit, and counts it as undelivered at the cut-off exactly once" $ do
+    let said = notes 3
+        identity = case toList (stDiags said) of
+          first : _ → dgId first
+          [] → 0
+        claimed = fst (step (DiagClaim identity) said)
+        failedWrite = fst (step (DiagFailedWrite identity "the sink raised") claimed)
+        (cut, _) = step (DiagCutOff "the cause") failedWrite
+    -- the failure is evidence and the entry is kept, no longer pending and not outstanding
+    deSinkFailures (stDiagEvidence failedWrite) `shouldBe` 1
+    fmap dgState (find ((== identity) . dgId) (toList (stDiags failedWrite))) `shouldBe` Just DiagFailed
+    length (pendingDiagnostics failedWrite) `shouldBe` length (stDiags said) - 1
+    -- at the cut-off every entry, the failed one included, is counted once
+    deUndelivered (stDiagEvidence cut) `shouldBe` length (stDiags said)
+    deSinkFailures (stDiagEvidence cut) `shouldBe` 1
+    -- a failure that arrives after the cut-off, or for an entry that is not in flight, changes nothing
+    fst (step (DiagFailedWrite identity "late") cut) `shouldBe` cut
+    fst (step (DiagFailedWrite identity "never claimed") said) `shouldBe` said
+
+  it "detects a cut-off that forgets the entries nobody had claimed (a mutant of the transition)" $ do
+    let said = notes 5
+        claimed = fst (step (DiagClaim 0) said)
+        counted = deUndelivered . stDiagEvidence . fst . step (DiagCutOff "the cause")
+        forgetful state = length [diag | diag ← toList (stDiags state), dgState diag /= DiagPending]
+    -- the transition counts all five, pending included; the mutant counts one
+    counted claimed `shouldBe` 5
+    forgetful claimed `shouldBe` 1
+
+  -- Every text the engine report and the diagnostics' evidence keep is paid for out of one bound, the profile's
+  -- EngineReportBytes, for every validated profile: the smallest legal one (every limit one) among them. One example for
+  -- each kind of text, each driven far past what it can keep, and one for all of them together.
+  mapM_
+    ( \(profileName, profile) →
+        mapM_
+          ( \(kind, events) →
+              it ("keeps every text of the report and the evidence within EngineReportBytes at " <> profileName <> ": " <> kind) $ do
+                let tight = failureLimitsOf profile
+                    drive = foldl' (\state event → fst (step event state)) (newSessionState tight [(Gameplay, 1), (Presentation, 1)])
+                    outcome = outcomeOf (drive (events tight))
+                    texts = reportTexts outcome
+                sum (map utf8Bytes texts) `shouldSatisfy` (<= limitReport tight)
+                -- the counts are exact whatever the texts could keep
+                deUndelivered (outDiagnostics outcome) `shouldBe` expectedUndelivered kind
+                deSinkFailures (outDiagnostics outcome) `shouldBe` expectedSinkFailures kind
+          )
+          kinds
+    )
+    evidenceProfiles
+
+  it "is not a failure of the session, and stops nothing, when a sink fails with nothing else wrong" $ do
+    let sunk = fst (step (DiagSinkFailed "the sink failed") both)
+    outVerdict (outcomeOf sunk) `shouldBe` VerdictSuccess
+    stStopping sunk `shouldBe` False
+    stStops sunk `shouldBe` stStops both
+
+-- | The texts of the engine report and of the diagnostics' evidence an outcome keeps.
+reportTexts ∷ SessionOutcome → [Text]
+reportTexts outcome =
+  maybe [] (pure . eeMessage) (erPrimary (outEngine outcome))
+    <> map eeMessage (erSecondary (outEngine outcome))
+    <> deSinkFirst (outDiagnostics outcome)
+    <> deUndeliveredFirst (outDiagnostics outcome)
+    <> maybe [] pure (deCause (outDiagnostics outcome))
+
+-- | Validated profiles whose report is smaller and smaller, down to the smallest legal one.
+evidenceProfiles ∷ [(String, Profile)]
+evidenceProfiles =
+  [ ("the fixed profile", fixedM1Profile)
+  , ("a report of 1 KiB with four summaries of 128 bytes", smaller [(SecondarySummaries, 4)] [(EngineReportBytes, 1024), (SecondarySummaryBytes, 128)])
+  , ("a report of 100 bytes with three summaries of 20", smaller [(SecondarySummaries, 3)] [(EngineReportBytes, 100), (SecondarySummaryBytes, 20)])
+  , ("a report of 64 bytes with one summary of 64", smaller [(SecondarySummaries, 1)] [(EngineReportBytes, 64), (SecondarySummaryBytes, 64)])
+  , ("the smallest legal profile: a report of 1 byte with one summary of 1", smaller [(SecondarySummaries, 1)] [(EngineReportBytes, 1), (SecondarySummaryBytes, 1)])
+  ]
+
+-- | Each kind of text, and the events that drive it far past what it can keep (more than any count, each text larger
+-- than any bound).
+kinds ∷ [(String, FailureLimits → [Event])]
+kinds =
+  [ ("the undelivered diagnostics and their cause (before and after the cut-off)", \_ → notes 40 <> [DiagCutOff huge] <> notes 40)
+  , ("the sink failures", \_ → [DiagSinkFailed huge | _ ← [1 .. 40 ∷ Int]])
+  , ("the cause alone", \_ → notes 1 <> [DiagCutOff huge])
+  , ("the first entry of the engine report", \_ → [EngineFault Nothing (engineEntry HostFailure Nothing OnEngine huge)])
+  , ("the cleanup entries of the engine report", \_ → [EngineFault (Just Gameplay) (engineEntry CleanupFailure (Just Gameplay) OnCleanup huge) | _ ← [1 .. 40 ∷ Int]])
+  , ("the secondary summaries of the engine report", \_ → LatchFailure Gameplay (newRoleFailure LuaError OnUpdate Gameplay huge) [engineEntry CleanupFailure (Just Gameplay) OnCleanup huge | _ ← [1 .. 40 ∷ Int]] : [])
+  , ("all of them together", \_ → LatchFailure Gameplay (newRoleFailure LuaError OnUpdate Gameplay huge) [engineEntry CleanupFailure (Just Gameplay) OnCleanup huge | _ ← [1 .. 40 ∷ Int]] : [DiagSinkFailed huge | _ ← [1 .. 40 ∷ Int]] <> notes 40 <> [DiagCutOff huge] <> notes 40 <> [DiagSinkFailed huge])
+  ]
+  where
+    huge = Text.replicate 5000 "x"
+    notes n = [Note (Say SayInfo (Text.pack ("note " <> show i) <> huge) []) | i ← [1 .. n ∷ Int]]
+
+-- | How many diagnostics a kind leaves undelivered, and how many sink failures it records, exactly.
+expectedUndelivered, expectedSinkFailures ∷ String → Int
+expectedUndelivered kind
+  | kind `elem` ["the undelivered diagnostics and their cause (before and after the cut-off)"] = 80
+  | kind == "the cause alone" = 1
+  | kind == "all of them together" = 80 + 2
+  | otherwise = 0
+expectedSinkFailures kind
+  | kind == "the sink failures" = 40
+  | kind == "all of them together" = 40
+  | otherwise = 0
+
+-- Pacing ---------------------------------------------------------------------------------------------------------------------
+
+pacing ∷ Spec
+pacing = describe "pacing" $ do
+  it "schedules tick n n tick durations after the origin, exactly, with no drift" $ do
+    let start = scheduleAt 0 1000 250
+        dues = take 5 (iterate' start)
+    map (scDue) dues `shouldBe` map instant [1250, 1500, 1750, 2000, 2250]
+    map scGranted dues `shouldBe` [0 .. 4]
+
+  it "numbers the ticks from one, and refuses the tick past the largest a Lua integer holds" $ do
+    nextTickNumber (scheduleAt 0 0 1) `shouldBe` Right 1
+    let nearly = scheduleAt (luaTickCeiling - 1) 0 1
+    nextTickNumber nearly `shouldBe` Right luaTickCeiling
+    (afterGrant nearly >>= nextTickNumber) `shouldBe` Left TickCeiling
+    nextTickNumber (scheduleAt luaTickCeiling 0 1) `shouldBe` Left TickCeiling
+
+  it "refuses a due time the clock cannot count, before and after the schedule starts, without wrapping" $ do
+    initialDeadline (instant (top - 5)) (duration 5) `shouldBe` Right (instant top)
+    initialDeadline (instant (top - 4)) (duration 5) `shouldBe` Left DeadlineOverflow
+    startSchedule 0 (instant (top - 4)) (duration 5) `shouldBe` Left DeadlineOverflow
+    let start = scheduleAt 0 (top - 9) 5
+    scDue start `shouldBe` instant (top - 4)
+    (afterGrant start >>= afterGrant) `shouldBe` Left DeadlineOverflow
+  where
+    iterate' schedule = schedule : either (const []) iterate' (afterGrant schedule)
+
+duration ∷ Integer → Duration
+duration n = either (error . show) id (durationFromNanoseconds RequirePositive n)
+
+instant ∷ Integer → Instant
+instant n = scriptedInstant (either (error . show) id (durationFromNanoseconds AllowZero n))
+
+-- | The largest instant the clock counts.
+top ∷ Integer
+top = toInteger (maxBound ∷ Word64)
+
+-- | A schedule that starts at this origin (nanoseconds) with this tick, from this base.
+scheduleAt ∷ Word64 → Integer → Integer → Schedule
+scheduleAt base origin tick = either (error . show) id (startSchedule base (instant origin) (duration tick))
+
+-- | A permutation of a short list, for the order-independence examples.
+permutations' ∷ [a] → [[a]]
+permutations' [] = [[]]
+permutations' xs = [x : rest | (x, others) ← picks xs, rest ← permutations' others]
+  where
+    picks [] = []
+    picks (y : ys) = (y, ys) : [(z, y : zs) | (z, zs) ← picks ys]

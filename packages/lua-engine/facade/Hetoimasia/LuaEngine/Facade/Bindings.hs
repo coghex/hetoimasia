@@ -40,6 +40,7 @@ import Hetoimasia.LuaEngine.Facade.Types
   , InstanceRecord (recordContent, recordId, recordRole)
   )
 import Hetoimasia.LuaEngine.Manifest (Role (..))
+import Hetoimasia.LuaEngine.Profile (contentLead, instanceLead, minimumContextBytes, minimumCopiedValueBytes, minimumInstanceIdBytes, minimumPrintWarnBytes, moduleLabelBytes, moduleLead, warnEnd, warnLead)
 import Hetoimasia.Scripting.Lua.Registration (ArgumentCheck, OwnerContexts (OwnerContexts), Precondition, RequestContext)
 import Hetoimasia.Scripting.Lua.Value (Value)
 
@@ -117,64 +118,7 @@ warnPrefix facade = \case
   InModule label → warnLead <> roleWord (fcRole facade) <> moduleLead <> maybe "?" (clipText moduleLabelBytes) label <> warnEnd
   Nowhere → warnLead <> roleWord (fcRole facade) <> warnEnd
 
--- The pieces of a warning's prefix. 'warnPrefix' is built from them and so is 'minimumPrintWarnBytes', so that
--- what the format takes and what the bound is checked against cannot drift apart.
-warnLead, contentLead, instanceLead, moduleLead, warnEnd ∷ Text
-warnLead = "lua warning role="
-contentLead = " content="
-instanceLead = " instance="
-moduleLead = " module="
-warnEnd = ": "
-
--- | The most bytes of a module's label a prefix names; the rest is cut. The host already gives every module a
--- label of at most 128 bytes (its own bound on a label in a diagnostic), so the cut is a guard and not a loss.
-moduleLabelBytes ∷ Int
-moduleLabelBytes = 128
-
--- | The most bytes of a content identifier (a root identifier is 1 to 64 ASCII characters).
-contentIdBytes ∷ Int
-contentIdBytes = 64
-
 roleWord ∷ Role → Text
 roleWord = \case
   Gameplay → "gameplay"
   Presentation → "presentation"
-
-bytesOfText ∷ Text → Int
-bytesOfText = ByteString.length . Text.encodeUtf8
-
--- | The fewest bytes the profile's bound on an instance identity may be: the first identity the session issues,
--- @inst-1@. A later identity that does not fit is refused when it is declared, never written.
-minimumInstanceIdBytes ∷ Int
-minimumInstanceIdBytes = bytesOfText "inst-1"
-
--- | The fewest bytes the profile's bound on one @print@ or @warn@ may be, given its bound on an identity: the
--- longest prefix a warning takes (an instance's, or a module's with its label cut), the truncation marker and a line
--- end, so that a call that is cut can still say so on a prefixed line. A smaller bound is refused when the facade is
--- made, because the format it promises cannot be kept in it.
-minimumPrintWarnBytes ∷ Int → Int
-minimumPrintWarnBytes idBytes = max instanceForm moduleForm + bytesOfText "..." + 1
-  where
-    longestRole = maximum (map (bytesOfText . roleWord) [Gameplay, Presentation])
-    instanceForm = bytesOfText warnLead + longestRole + bytesOfText contentLead + contentIdBytes + bytesOfText instanceLead + idBytes + bytesOfText warnEnd
-    moduleForm = bytesOfText warnLead + longestRole + bytesOfText moduleLead + moduleLabelBytes + bytesOfText warnEnd
-
--- | The fewest bytes the profile's bound on a copied value may be, given its bounds on an identity and on one
--- @print@ or @warn@: the largest of everything the facade itself makes cross the value boundary, each with the
--- header the host adds to it. These are the text of one call to @out@ or @err@ (at most the print bound, and a text
--- argument has a five-byte header), an identity handed to @check@ or @bind@ (a text, the same header), and the
--- context record the builder is handed ('minimumContextBytes'). What a script passes in as the path or the
--- options of a content request is the script's, and a value too large to cross is an ordinary error there.
-minimumCopiedValueBytes ∷ Int → Int → Int
-minimumCopiedValueBytes idBytes printBytes = maximum [minimumContextBytes idBytes, printBytes + 5, idBytes + 5]
-
--- | The fewest bytes the profile's bound on a copied value may be for the builder's context alone, given its
--- bound on an identity: the bytes the host counts for the context record the builder is handed (a record of five bytes and, for each of @role@,
--- @content_id@ and @instance_id@, a key of five bytes and its name and a text of five bytes and its length).
-minimumContextBytes ∷ Int → Int
-minimumContextBytes idBytes =
-  5
-    + sum [5 + bytesOfText key | key <- ["role", "content_id", "instance_id"]]
-    + sum [5 + n | n ← [longestRole, contentIdBytes, idBytes]]
-  where
-    longestRole = maximum (map (bytesOfText . roleWord) [Gameplay, Presentation])

@@ -29,7 +29,8 @@ spec = describe "limits" $ do
 -- | 64 bytes of data per file, 128 retained per VM; the copied-value ceiling leaves room for the
 -- record around a result.
 small ∷ Profile
-small = bytesOf [(DataBytes, 64), (RetainedDataBytesPerVm, 128), (CopiedValueBytes, 512), (SceneInputBytes, 256)]
+-- (the identity and print bounds at their least, so that the copied-value bound of 512 is above its own least, 176)
+small = bytesOf [(DataBytes, 64), (RetainedDataBytesPerVm, 128), (InstanceIdBytes, 6), (PrintWarnBytes, 171), (CopiedValueBytes, 512), (SceneInputBytes, 256)]
 
 files ∷ Layout
 files =

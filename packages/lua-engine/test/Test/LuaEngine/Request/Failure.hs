@@ -77,6 +77,8 @@ spec = describe "failure" $ do
           pure ()
         (fromException failure ∷ Maybe ProviderDefect) `shouldSatisfy` (/= Nothing)
   where
+    -- the least a copied value may be (a profile below it is refused): the identity and print bounds at their least too
+    tightCopied = bytesOf [(InstanceIdBytes, 6), (PrintWarnBytes, 171), (CopiedValueBytes, 176), (DataBytes, 64), (SceneInputBytes, 64)]
     defects =
       [ Defect "a failure whose code the service does not supply" "data" fixedM1Profile (ProviderExpected (ExpectedFailure "mystery" "m" Nothing Nothing))
       , Defect "a failure with no code" "data" fixedM1Profile (ProviderFailure "no code")
@@ -88,18 +90,18 @@ spec = describe "failure" $ do
       , Defect
           "a text over the copied-value byte bound"
           "text"
-          (bytesOf [(CopiedValueBytes, 64), (DataBytes, 64), (SceneInputBytes, 64)])
+          tightCopied
           (ProviderResult (VText (Text.replicate 200 "x")))
       , Defect
           "a list whose value fits the byte bound but whose complete success record does not"
           "ints"
-          (bytesOf [(CopiedValueBytes, 64), (DataBytes, 64), (SceneInputBytes, 64)])
-          (ProviderResult (VList [VInteger 1, VInteger 2]))
+          tightCopied
+          (ProviderResult (VList (replicate 17 (VInteger 1))))
       , Defect
           "a failure whose complete record passes the byte bound"
           "data"
-          (bytesOf [(CopiedValueBytes, 64), (DataBytes, 64), (SceneInputBytes, 64)])
-          (ProviderExpected (ExpectedFailure "not_found" "m" Nothing Nothing))
+          tightCopied
+          (ProviderExpected (ExpectedFailure "not_found" "m" Nothing (Just (Text.replicate 200 "p"))))
       , Defect
           "a list over the copied-value element bound"
           "ints"

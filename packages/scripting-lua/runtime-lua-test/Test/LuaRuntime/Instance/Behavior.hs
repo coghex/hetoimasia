@@ -10,7 +10,8 @@
 module Test.LuaRuntime.Instance.Behavior (spec) where
 
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), throwIO)
-import Control.Monad (forM_, void)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Monad (forM, forM_, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as Char8
@@ -19,7 +20,7 @@ import qualified Data.Text as Text
 import Data.IORef (atomicModifyIORef')
 import Data.Word (Word64)
 import qualified Data.Text.Encoding as Text
-import Hetoimasia.Runtime.Supervision (RuntimeControl)
+import Hetoimasia.Runtime.Supervision (RuntimeControl, WorkerStatus (WorkerStopped))
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Scheduled
@@ -98,6 +99,31 @@ withNotified exports body = do
   withBoundaryOpening [openAllGates fixture] $ \control runtime → do
     let told found = atomicModifyIORef' (sfLog (sf fixture)) (\held → (("segment " <> Text.pack (show (instanceLocal found))) : held, ()))
         config = (testConfig instanceBounds') {instanceOnSegment = told}
+        base = instanceSpec fixture "behavior" [] config requiredPolicy defaultSchedulerBounds
+        spec' = base {scheduledVm = (scheduledVm base) {vmExports = exports, vmExportLimits = defaultExportLimits}}
+    owner ← startWith fixture runtime spec'
+    body fixture control owner
+
+-- | An owner whose instances are held after their construction until the example releases them, telling the
+-- log which instance was held, over a body.
+withHolding ∷ [ExportSource] → (IFixture → RuntimeControl → ScheduledOwner → IO a) → IO a
+withHolding = withHoldingUsing (\_ → pure ())
+
+-- | The same, with something the owner's thread does in the callback after it has said it holds the instance and
+-- before it answers.
+withHoldingUsing ∷ (InstanceId → IO ()) → [ExportSource] → (IFixture → RuntimeControl → ScheduledOwner → IO a) → IO a
+withHoldingUsing = withHoldingAnswering True
+
+-- | The same, answering this: 'False' declines to hold.
+withHoldingAnswering ∷ Bool → (InstanceId → IO ()) → [ExportSource] → (IFixture → RuntimeControl → ScheduledOwner → IO a) → IO a
+withHoldingAnswering answered inCallback exports body = do
+  fixture ← newIFixture
+  withBoundaryOpening [openAllGates fixture] $ \control runtime → do
+    let held found = do
+          atomicModifyIORef' (sfLog (sf fixture)) (\entries → (("held " <> Text.pack (show (instanceLocal found))) : entries, ()))
+          inCallback found
+          pure answered
+        config = (testConfig instanceBounds') {instanceHoldInit = held}
         base = instanceSpec fixture "behavior" [] config requiredPolicy defaultSchedulerBounds
         spec' = base {scheduledVm = (scheduledVm base) {vmExports = exports, vmExportLimits = defaultExportLimits}}
     owner ← startWith fixture runtime spec'
@@ -330,6 +356,159 @@ spec = describe "M1 behavior instances" $ do
         awaitScheduledTerminal control owner
       raised `shouldSatisfy` brokenIs "notification"
       logged fixture >>= (`shouldBe` [])
+
+  describe "an instance held after its construction" $ do
+    let selfEditing =
+          exportOf
+            "selfediting"
+            [ "local behavior"
+            , "behavior = {"
+            , "  every_ticks = 1,"
+            , "  init = function(self, api)"
+            , "    " <> record <> "('init ' .. api.name)"
+            , "    behavior.every_ticks = 0"
+            , "  end,"
+            , "  update = function() end,"
+            , "}"
+            , "return { gameplay = behavior }"
+            ]
+    it "validates every instance it holds before any of them runs, then begins each when released, in the order the application chose" $ bounded $
+      withHolding [selfEditing] $ \fixture _ owner → do
+        a ← admitBehavior fixture owner "a" (requestFor "selfediting" "gameplay" (facadeNamed "alpha") logicalRule)
+        b ← admitBehavior fixture owner "b" (requestFor "selfediting" "gameplay" (facadeNamed "beta") logicalRule)
+        awaitEffect (sf fixture) "held 2"
+        -- Both were constructed and validated, and neither has run a line of its own.
+        logged fixture >>= (`shouldBe` ["held 1", "held 2"])
+        phaseOf fixture owner "a" >>= (`shouldBe` Just Initializing)
+        phaseOf fixture owner "b" >>= (`shouldBe` Just Initializing)
+        releaseHeldInstance a >>= (`shouldBe` True)
+        awaitPhase fixture owner "a" Active
+        -- The first one's init edits the behavior table; the one behind it captured it before that, so it is valid.
+        releaseHeldInstance b >>= (`shouldBe` True)
+        awaitPhase fixture owner "b" Active
+        logged fixture >>= (`shouldBe` ["held 1", "held 2", "init alpha", "init beta"])
+        -- Releasing again changes nothing.
+        releaseHeldInstance a >>= (`shouldBe` False)
+        logged fixture >>= (`shouldBe` ["held 1", "held 2", "init alpha", "init beta"])
+
+    it "settles an instance still held as stopped when its owner is stopped, with no init run and none of its hooks entered" $ bounded $
+      withHolding [selfEditing] $ \fixture control owner → do
+        _ ← admitBehavior fixture owner "a" (requestFor "selfediting" "gameplay" (facadeNamed "alpha") logicalRule)
+        awaitEffect (sf fixture) "held 1"
+        retireScheduled owner
+        awaitScheduledTerminal control owner >>= (`shouldSatisfy` \case WorkerStopped → True; _ → False)
+        settled ← awaitSettled fixture "a"
+        resultOutcome settled `shouldSatisfy` \case InstanceStopped → True; _ → False
+        terminationShutdown (resultTermination settled) `shouldBe` ShutdownSkippedNoInit
+        logged fixture >>= (`shouldBe` ["held 1"])
+
+    it "is released correctly by a release that arrives while the application is still being asked: the callback has said it holds the instance and has not answered" $ bounded $ do
+      answer ← newEmptyMVar
+      withHoldingUsing (\_ → takeMVar answer) [selfEditing] $ \fixture _ owner → do
+        a ← admitBehavior fixture owner "a" (requestFor "selfediting" "gameplay" (facadeNamed "alpha") logicalRule)
+        awaitEffect (sf fixture) "held 1"
+        -- the application has published that it is ready and releases before it has answered
+        releaseHeldInstance a >>= (`shouldBe` True)
+        logged fixture >>= (`shouldBe` ["held 1"])
+        putMVar answer ()
+        awaitPhase fixture owner "a" Active
+        logged fixture >>= (`shouldBe` ["held 1", "init alpha"])
+
+    it "queues one job however many releases are made while the owner cannot consume them, and runs the init once" $ bounded $ do
+      stuck ← newEmptyMVar
+      -- the owner's thread is inside the callback of the second instance while the first is released over and over
+      withHoldingUsing (\found → when (instanceLocal found == 2) (takeMVar stuck)) [selfEditing] $ \fixture _ owner → do
+        a ← admitBehavior fixture owner "a" (requestFor "selfediting" "gameplay" (facadeNamed "alpha") logicalRule)
+        _ ← admitBehavior fixture owner "b" (requestFor "selfediting" "gameplay" (facadeNamed "beta") logicalRule)
+        awaitEffect (sf fixture) "held 2"
+        answers ← forM [1 .. 200 ∷ Int] (const (releaseHeldInstance a))
+        filter id answers `shouldBe` [True]
+        putMVar stuck ()
+        awaitPhase fixture owner "a" Active
+        logCount fixture "init alpha" >>= (`shouldBe` 1)
+
+    it "ignores a release that arrives after the owner was stopped or the instance settled, and a stop that arrives while the application is being asked ends the instance without its init" $ bounded $ do
+      answer ← newEmptyMVar
+      withHoldingUsing (\_ → takeMVar answer) [selfEditing] $ \fixture control owner → do
+        a ← admitBehavior fixture owner "a" (requestFor "selfediting" "gameplay" (facadeNamed "alpha") logicalRule)
+        awaitEffect (sf fixture) "held 1"
+        -- the owner is asked to stop while it is inside the callback
+        retireScheduled owner
+        putMVar answer ()
+        awaitScheduledTerminal control owner >>= (`shouldSatisfy` \case WorkerStopped → True; _ → False)
+        settled ← awaitSettled fixture "a"
+        terminationShutdown (resultTermination settled) `shouldBe` ShutdownSkippedNoInit
+        releaseHeldInstance a >>= (`shouldBe` False)
+        logged fixture >>= (`shouldBe` ["held 1"])
+
+    it "begins the instance once when the application declines to hold it after a release arrived during the question" $ bounded $ do
+      answer ← newEmptyMVar
+      let plain = exportOf "plain" ["return { gameplay = { init = function() " <> record <> "('init plain') end } }"]
+      withHoldingAnswering False (\found → when (instanceLocal found == 1) (takeMVar answer)) [selfEditing, plain] $ \fixture _ owner → do
+        a ← admitBehavior fixture owner "a" (requestFor "selfediting" "gameplay" (facadeNamed "alpha") logicalRule)
+        awaitEffect (sf fixture) "held 1"
+        releaseHeldInstance a >>= (`shouldBe` True)
+        putMVar answer ()
+        awaitPhase fixture owner "a" Active
+        -- the job the release queued is ahead of the next instance's start, which has run when this line appears
+        _ ← admitBehavior fixture owner "b" (requestFor "plain" "gameplay" (facadeNamed "beta") logicalRule)
+        awaitEffect (sf fixture) "init plain"
+        logCount fixture "init alpha" >>= (`shouldBe` 1)
+
+    it "does not hold an instance by default: the instance begins as soon as it is constructed" $ bounded $
+      withDefaults [selfEditing] $ \fixture _ owner → do
+        _ ← admitBehavior fixture owner "a" (requestFor "selfediting" "gameplay" (facadeNamed "alpha") logicalRule)
+        awaitPhase fixture owner "a" Active
+        logged fixture >>= (`shouldBe` ["init alpha"])
+
+  describe "the protections of the hold, each removed in a model of it (negative controls)" $ do
+    -- The hold is a small state machine: the application is asked, may release at any time after the host registered
+    -- the rest of the start, and a stop settles the instance. The host's protections are three: it registers the
+    -- rest of the start before it asks, it queues one resume however many releases are made, and a stop wins over a
+    -- late release. The model below makes each transition twice, as the host does and with one protection removed,
+    -- and one oracle, applied to both, says whether the start was lost, run twice, run after a stop, or queued without
+    -- bound. What the host does is proved above, against the real owner; this shows that the proof can fail.
+    let ran = foldl (\held step -> step held) holdStart
+        ok held = holdBegun held == 1 && holdQueued held <= 1 && not (holdAfterStop held)
+        -- the host: registered before the question, a release coalesced, a stop wins
+        host =
+          HoldImpl
+            { implRegister = \held -> held {holdState = HoldRegistered}
+            , implRelease = \held -> case holdState held of
+                HoldRegistered | not (holdStopped held) -> held {holdState = HoldReleased, holdQueued = holdQueued held + 1}
+                _ -> held
+            , implConsume = \held -> case holdState held of
+                HoldReleased | not (holdStopped held) -> held {holdState = HoldNone, holdBegun = holdBegun held + 1, holdQueued = max 0 (holdQueued held - 1)}
+                HoldReleased -> held {holdState = HoldNone, holdQueued = max 0 (holdQueued held - 1)}
+                _ -> held
+            , implStop = \held -> held {holdStopped = True, holdState = HoldNone}
+            }
+        late = host {implRegister = id}
+        uncoalesced = host {implRelease = \held -> case holdState held of HoldRegistered -> held {holdState = HoldReleased, holdQueued = holdQueued held + 1}; HoldReleased -> held {holdQueued = holdQueued held + 1}; _ -> held}
+        stopLoses = host {implConsume = \held -> case holdState held of HoldReleased -> held {holdState = HoldNone, holdBegun = holdBegun held + 1, holdQueued = max 0 (holdQueued held - 1), holdAfterStop = holdStopped held}; _ -> held}
+        asked impl = [implRegister impl]
+    it "lose no release that arrives while the application is being asked, with the host's order, and lose it when the registration comes after the question" $ do
+      let scenario impl = ran (asked impl <> [implRelease impl, implConsume impl])
+          registeredAfterRelease impl = ran [implRelease impl, implRegister impl, implConsume impl]
+      ok (scenario host) `shouldBe` True
+      ok (registeredAfterRelease late) `shouldBe` False
+      holdBegun (registeredAfterRelease late) `shouldBe` 0
+
+    it "queue one resume however many releases are made, and queue one for each when releases are not coalesced" $ do
+      let scenario impl = ran (asked impl <> replicate 200 (implRelease impl))
+      holdQueued (scenario host) `shouldBe` 1
+      holdQueued (scenario uncoalesced) `shouldBe` 200
+      ok (ran (asked host <> replicate 200 (implRelease host) <> [implConsume host])) `shouldBe` True
+
+    it "begin nothing for a release that races a stop, and begin the instance after the stop when the stop does not win" $ do
+      let racing impl = ran [implRegister impl, implRelease impl, \held -> held {holdStopped = True}, implConsume impl]
+      -- the host: the stop wins, the queued resume finds an ended instance and does nothing
+      holdBegun (racing host) `shouldBe` 0
+      holdAfterStop (racing host) `shouldBe` False
+      -- without the protection the same interleaving begins the instance after it was stopped, which the oracle detects
+      holdBegun (racing stopLoses) `shouldBe` 1
+      holdAfterStop (racing stopLoses) `shouldBe` True
+      ok (racing stopLoses) `shouldBe` False
 
   describe "facades" $ do
     it "injects a facade whose closures are bound to its own instance, built per instance by an export module's function, the same table in init and self.api" $ bounded $
@@ -694,3 +873,28 @@ spec = describe "M1 behavior instances" $ do
           ErrorExportFailed fault → boundaryReason fault `shouldBe` ModuleRefused (SourceTooLarge 1048576)
           other → failExample ("not the oversized source: " <> show other)
         logged fixture >>= (`shouldBe` ["exact ran"])
+
+-- | The model of an instance's hold: where the rest of its start is, how many resumes are queued, how many times the
+-- start began, and whether a stop settled it.
+data HoldState = HoldNone | HoldRegistered | HoldReleased
+  deriving (Eq, Show)
+
+data Hold = Hold
+  { holdState :: HoldState
+  , holdQueued :: Int
+  , holdBegun :: Int
+  , holdStopped :: Bool
+  , holdAfterStop :: Bool
+  }
+  deriving (Eq, Show)
+
+holdStart :: Hold
+holdStart = Hold HoldNone 0 0 False False
+
+-- | The transitions of the hold, as one implementation makes them.
+data HoldImpl = HoldImpl
+  { implRegister :: Hold -> Hold
+  , implRelease :: Hold -> Hold
+  , implConsume :: Hold -> Hold
+  , implStop :: Hold -> Hold
+  }

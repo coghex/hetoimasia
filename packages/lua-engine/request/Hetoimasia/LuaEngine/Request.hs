@@ -46,6 +46,7 @@ module Hetoimasia.LuaEngine.Request
     M1Requests
   , M1RequestsRefused (..)
   , m1Requests
+  , withM1Gate
   , m1Profile
   , m1Handles
 
@@ -128,6 +129,10 @@ data M1Requests = M1Requests
   , m1ReplyLimits ∷ !ValueLimits
   , m1MessageBytes ∷ !Int
   , m1PathBytes ∷ !Int
+  , m1Gate ∷ !(Maybe Credit)
+  -- ^ The credit that reads whether the session still takes new work, in the transaction that admits a request, or
+  -- 'Nothing' for a policy that has no session. It is reserved first and raises 'CreditRefused' when the session takes
+  -- no new work: a final refusal, an ordinary Lua error, before any bank is asked.
   }
 
 -- | Why the profile could not be turned into the limits of requests.
@@ -161,6 +166,7 @@ m1Requests profile handles = do
       , m1ReplyLimits = limits
       , m1MessageBytes = message
       , m1PathBytes = path
+      , m1Gate = Nothing
       }
   where
     count limit = let Count value = countLimit profile limit in value
@@ -208,12 +214,19 @@ m1Admission m1 ask =
     , admitExpectedCodes = askCodes ask
     , admitMessageBytes = m1MessageBytes m1
     , admitPathBytes = m1PathBytes m1
-    , admitCredits = askCredits ask
+    , admitCredits = maybe id (:) (m1Gate m1) (askCredits ask)
     , admitLease = fst <$> askLease ask
     , admitCombine = snd <$> askLease ask
     , admitSuccessFrame = m1SuccessFrame
     , admitFailureFrame = m1FailureFrame
     }
+
+-- | The same policy under a session that decides whether new work is taken (D-82: the session's closure closes
+-- admission in the one transaction that records it). The credit is the session's: it reads the session's state inside
+-- the transaction that admits each request and holds nothing, so a request is accepted before a closure committed or
+-- refused for good by it, whatever has or has not yet been handed to the owner or the coordinator.
+withM1Gate ∷ Credit → M1Requests → M1Requests
+withM1Gate gate m1 = m1 {m1Gate = Just gate}
 
 -- | The record a script is handed for a success: @{status = "success", value = VALUE}@.
 m1SuccessFrame ∷ Value → [(Text, Value)]

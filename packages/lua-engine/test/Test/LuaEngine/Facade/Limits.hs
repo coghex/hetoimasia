@@ -1,9 +1,10 @@
 {-# LANGUAGE OverloadedStrings #-}
 
--- | The bounds the facade formats with (D-71, D-74): each is checked, when the facade is made, against the least
--- its own format needs, and a facade over a profile below it is refused. Every example is a pair of boundary
--- values: the least that is allowed, which keeps the format end to end on real Lua, and one below it, which is
--- refused with the name of the limit, the value given and the least.
+-- | The bounds the facade formats with (D-71, D-74): each is checked against the least its own format needs, and a
+-- profile below it is refused by the profile's own validation (round 10: the facade's second check is a guard that no
+-- validated profile reaches). Every example is a pair of boundary values: the least that is allowed, which keeps the
+-- format end to end on real Lua, and one below it, which is refused with the name of the limit, the value given and the
+-- least.
 module Test.LuaEngine.Facade.Limits (spec) where
 
 import Data.ByteString (ByteString)
@@ -11,7 +12,8 @@ import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as Char8
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
-import Hetoimasia.LuaEngine.Profile (ByteLimit (CopiedValueBytes, DataBytes, InstanceIdBytes, PrintWarnBytes, SceneInputBytes), CountLimit (InstancesPerVm, LuaIntegerMaximum), Profile)
+import Data.Word (Word64)
+import Hetoimasia.LuaEngine.Profile (AnyLimit (LimitBytes), ByteLimit (CopiedValueBytes, DataBytes, InstanceIdBytes, PrintWarnBytes, SceneInputBytes), Bytes (Bytes), CountLimit (InstancesPerVm, LuaIntegerMaximum), ProfileError (LimitBelowMinimum), ProfileSpec (..), fixedM1Profile, profileSpec, validateProfile)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Request.Profiles (bytesOf, counts)
@@ -19,16 +21,21 @@ import Test.LuaEngine.Request.Profiles (bytesOf, counts)
 files ∷ [(FilePath, ByteString)]
 files = [("data.bin", "xx")]
 
--- | What making a facade over this profile comes to.
-attempt ∷ Profile → IO (Either FacadeRefused ())
-attempt profile = withWorld profile (Layout files) $ \world _ runtime → attemptFvm world runtime gameplayShape
+-- | What the profile's own validation says of the fixed profile with these byte limits changed.
+validation ∷ [(ByteLimit, Word64)] → Either ProfileError ()
+validation changes = () <$ validateProfile base {specBytes = \limit → maybe (specBytes base limit) Bytes (lookup limit changes)}
+  where
+    base = profileSpec fixedM1Profile
 
 spec ∷ Spec
 spec = describe "the bounds the facade formats with" $ do
+  it "has the least of each bound it formats with, in the profile's own validation: the three the facade checks are the three validation enforces" $ do
+    validation [(InstanceIdBytes, fromIntegral minimumInstanceIdBytes)] `shouldBe` Right ()
+    validation [(InstanceIdBytes, fromIntegral minimumInstanceIdBytes), (PrintWarnBytes, fromIntegral (minimumPrintWarnBytes minimumInstanceIdBytes))] `shouldBe` Right ()
   describe "InstanceIdBytes" $ do
     it "is refused one below the first identity the session issues" $
-      attempt (bytesOf [(InstanceIdBytes, fromIntegral minimumInstanceIdBytes - 1)])
-        `shouldReturn` Left (LimitBelowFormatting "InstanceIdBytes" (minimumInstanceIdBytes - 1) minimumInstanceIdBytes)
+      validation [(InstanceIdBytes, fromIntegral minimumInstanceIdBytes - 1)]
+        `shouldBe` Left (LimitBelowMinimum (LimitBytes InstanceIdBytes) (fromIntegral minimumInstanceIdBytes - 1) (fromIntegral minimumInstanceIdBytes))
     it "at the least, makes a facade whose first instance is named inst-1, and refuses an identity that does not fit when it is declared" $ do
       minimumInstanceIdBytes `shouldBe` 6
       withOneIn Gameplay (bytesOf [(InstanceIdBytes, fromIntegral minimumInstanceIdBytes)]) script {scInit = ["print(api.instance_id)"]} files $ \world _ fvm _ → do
@@ -46,7 +53,8 @@ spec = describe "the bounds the facade formats with" $ do
         entry = "lua/" <> segment 'a' <> "/" <> segment 'b' <> ".lua"
         prefix = "lua warning role=presentation module=" <> Text.take 128 ("modules-test:" <> Text.pack entry) <> ": "
     it "is refused one below the longest prefix, the marker and a line end" $
-      attempt (profileAt (least - 1)) `shouldReturn` Left (LimitBelowFormatting "PrintWarnBytes" (least - 1) least)
+      validation [(InstanceIdBytes, fromIntegral minimumInstanceIdBytes), (PrintWarnBytes, fromIntegral least - 1)]
+        `shouldBe` Left (LimitBelowMinimum (LimitBytes PrintWarnBytes) (fromIntegral least - 1) (fromIntegral least))
     it "has a least that is the longest prefix a warning takes, the marker and a line end, and the profile's own bound holds it" $ do
       Text.length prefix + 4 `shouldBe` least
       least `shouldSatisfy` (<= 4096)
@@ -97,11 +105,12 @@ spec = describe "the bounds the facade formats with" $ do
       minimumContextBytes minimumInstanceIdBytes `shouldBe` 142
       minimumContextBytes 128 `shouldBe` 264
     it "is refused one below the largest crossing the facade makes" $
-      attempt (profileAt (least - 1)) `shouldReturn` Left (LimitBelowFormatting "CopiedValueBytes" (least - 1) least)
+      validation [(InstanceIdBytes, fromIntegral idBytes), (PrintWarnBytes, fromIntegral printBytes), (CopiedValueBytes, fromIntegral least - 1), (DataBytes, 64), (SceneInputBytes, 64)]
+        `shouldBe` Left (LimitBelowMinimum (LimitBytes CopiedValueBytes) (fromIntegral least - 1) (fromIntegral least))
     it "is refused one below the output a call may carry, at a bound where only that is short of the context record" $
       -- a record of 142 fits in 150; the longest print, at the smallest output bound, and its header does not
-      attempt (bytesOf [(InstanceIdBytes, fromIntegral idBytes), (PrintWarnBytes, fromIntegral printBytes), (CopiedValueBytes, 150), (DataBytes, 64), (SceneInputBytes, 64)])
-        `shouldReturn` Left (LimitBelowFormatting "CopiedValueBytes" 150 least)
+      validation [(InstanceIdBytes, fromIntegral idBytes), (PrintWarnBytes, fromIntegral printBytes), (CopiedValueBytes, 150), (DataBytes, 64), (SceneInputBytes, 64)]
+        `shouldBe` Left (LimitBelowMinimum (LimitBytes CopiedValueBytes) 150 (fromIntegral least))
     it "at the least, keeps every crossing inside it: the longest print and warn are cut and written, and what a script passes in that cannot cross is an ordinary error that leaves the instance well" $
       withOneIn Gameplay (profileAt least) script
         { scInit =

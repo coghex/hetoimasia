@@ -10,7 +10,9 @@
 -- 2. /Ceiling/: every limit is positive and no larger than its fixed M1
 --    value. An injected profile may only shrink the profile: it cannot widen a
 --    ceiling, a range or a count, and no value is clamped into place.
--- 3. /Relations/: the relationships the profile encodes, listed in
+-- 3. /Minimum/: every limit is at least the least that the engine's own schema, format and crossings need of it
+--    ("Hetoimasia.LuaEngine.Profile.Minimum").
+-- 4. /Relations/: the relationships the profile encodes, listed in
 --    'Relation', hold for the values given.
 --
 -- Independently bounded maxima (for example 16 requests per instance, 2
@@ -31,6 +33,7 @@ import Data.Word (Word64)
 import Hetoimasia.Foundation.Time (Duration, durationNanoseconds)
 import Hetoimasia.LuaEngine.Profile.Fixed (fixedBytes, fixedCount, fixedDuration, fixedM1Spec)
 import Hetoimasia.LuaEngine.Profile.Limits
+import Hetoimasia.LuaEngine.Profile.Minimum (minimumBytes, minimumCount, minimumDuration)
 
 -- | A value computed from limits rather than entered.
 data DerivedValue
@@ -76,6 +79,8 @@ data ProfileError
   | LimitAboveFixed !AnyLimit !Word64 !Word64
     -- ^ The limit, the value given and the fixed ceiling. Durations are in
     -- nanoseconds.
+  | LimitBelowMinimum !AnyLimit !Word64 !Word64
+    -- ^ The limit, the value given and the least it may be (see "Hetoimasia.LuaEngine.Profile.Minimum").
   | RelationBroken !Relation
   deriving (Eq, Show)
 
@@ -92,6 +97,7 @@ validateProfile ∷ ProfileSpec → Either ProfileError Profile
 validateProfile spec = do
   checkDerived spec
   checkCeilings spec
+  checkMinimums spec
   checkRelations spec
   Right (buildProfile spec)
 
@@ -126,6 +132,17 @@ checkCeilings spec = do
     within limit given ceiling'
       | given <= 0 = Left (LimitNotPositive limit)
       | given > ceiling' = Left (LimitAboveFixed limit (fromInteger given) (fromInteger ceiling'))
+      | otherwise = Right ()
+
+-- | Every limit is at least the least the engine's own schema, format and crossings need of it.
+checkMinimums ∷ ProfileSpec → Either ProfileError ()
+checkMinimums spec = do
+  mapM_ (\limit → atLeast (LimitBytes limit) (rawBytes (specBytes spec limit)) (minimumBytes spec limit)) [minBound .. maxBound]
+  mapM_ (\limit → atLeast (LimitCount limit) (rawCount (specCounts spec limit)) (minimumCount spec limit)) [minBound .. maxBound]
+  mapM_ (\limit → atLeast (LimitDuration limit) (rawDuration (specDurations spec limit)) (minimumDuration spec limit)) [minBound .. maxBound]
+  where
+    atLeast limit given least
+      | given < toInteger least = Left (LimitBelowMinimum limit (fromInteger given) least)
       | otherwise = Right ()
 
 checkRelations ∷ ProfileSpec → Either ProfileError ()

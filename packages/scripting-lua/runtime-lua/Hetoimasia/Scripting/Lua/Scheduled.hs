@@ -264,10 +264,14 @@ module Hetoimasia.Scripting.Lua.Scheduled
 
     -- * Time
   , grantScheduledStep
+  , grantScheduledStepSTM
   , TickWait (..)
   , awaitTicksComplete
   , AccountingWait (..)
   , awaitScheduledAccounting
+  , watchScheduledAccounting
+  , scheduledAccountingStep
+  , unwatchScheduledAccounting
   , scheduledTick
   , ticksOutstanding
 
@@ -373,7 +377,7 @@ import Hetoimasia.Scripting.Lua.Request (requestContextOf)
 import Hetoimasia.Scripting.Lua.Lending.Loan (Lending, bindLending, sameLending)
 import Hetoimasia.Scripting.Lua.Loading.State (LoaderEndpoint (LoaderEndpoint), LoaderHooks (hookObserved), LoaderPlan (planHooks), LoaderPlanRefused (LoaderPlanRefused), loadingConfig, newLoadingState, validatePlan)
 import Hetoimasia.Scripting.Lua.Scheduled.Run (runScheduledOwner)
-import Hetoimasia.Scripting.Lua.Scheduled.Shared (awaitWorkerEnded, propagateAll)
+import Hetoimasia.Scripting.Lua.Scheduled.Shared (awaitWorkerCompleted, propagateBeside, workerFailures)
 import Hetoimasia.Scripting.Lua.Scheduled.Types
 import Hetoimasia.Scripting.Lua.Scheduler
   ( AdmitAnswer (Admitted, AdmitRefused)
@@ -492,6 +496,14 @@ data ScheduledSpec = ScheduledSpec
     -- dependency's verified source and resume on the owner's thread. 'Nothing', the default, gives
     -- the owner none. It is the owner's loader, so the owner's VM configuration may not name one
     -- ('Hetoimasia.Scripting.Lua.Owner.vmLoader'). See "Hetoimasia.Scripting.Lua.Loading".
+  , scheduledOnStartAbandoned ∷ IO ()
+    -- ^ Told once, on the starter's thread, when a start that has not handed out an owner is
+    -- abandoned (its readiness wait failed or was cancelled, and the creator is about to be handed
+    -- the failure): after the worker was asked to stop and before the starter waits for that worker to
+    -- have ended, which a worker held in its initialization can make long. It is for an application
+    -- that owns other owners the failure must stop first. It runs masked, so it must be finite and
+    -- must not wait; what it raises is kept as a failure of the host beside the failure of the start.
+    -- The default does nothing.
   }
 
 -- | A configuration with the supplied defaults: the FIFO policy, the production
@@ -519,6 +531,7 @@ scheduledSpec config worker bounds =
     , scheduledRequestHandles = Nothing
     , scheduledSubscriptions = Nothing
     , scheduledLoader = Nothing
+    , scheduledOnStartAbandoned = pure ()
     }
 
 -- | How many live members an owner's collection holds by default.
@@ -711,8 +724,18 @@ startScheduledOwner runtime spec = do
           Right found → pure found
           Left failure → do
             stopSupervised worker
-            interruptions ← awaitWorkerEnded restore worker
-            propagateAll (failure : interruptions)
+            -- the application is told before the starter waits, so what it must stop first is stopped first
+            -- (a failure of the callback is a failure of the host kept beside the failure of the start: it never takes
+            -- its place, whatever its type, and it does not skip the wait for the worker)
+            told ← tryWithContext @SomeException (scheduledOnStartAbandoned spec)
+            (completion, interruptions) ← awaitWorkerCompleted restore worker
+            -- what the worker itself ended with (its initialization or its VM's cleanup failing, once it was let go on)
+            -- is a failure of what was acquired, and is kept beside the failure of the start, never in its place
+            propagateBeside
+              ( [("start abandoned callback", raised) | Left raised ← [told]]
+                  <> [("lua scheduled worker", terminal) | terminal ← workerFailures completion]
+              )
+              (failure : interruptions)
             rethrowIO failure
         case ready of
           Just held → do
@@ -947,7 +970,15 @@ forgetControl (ControlReceipt (ControlTicket _ _ forget)) = atomically forget
 
 -- | Grant a logical step. Never blocks, from any thread.
 grantScheduledStep ∷ ScheduledEndpoint → Duration → IO GrantAnswer
-grantScheduledStep (ScheduledEndpoint control) duration = atomically (grantStep (controlScheduler control) duration)
+grantScheduledStep endpoint = atomically . grantScheduledStepSTM endpoint
+
+-- | The same grant as a transaction, so that an application can decide to grant and grant in one atomic step with state
+-- of its own (D-85): the application's check and the scheduler's acceptance see one snapshot, and a closure of the
+-- application's committed before the transaction is seen by it, and one committed after it finds the grant accepted.
+-- It never retries and never blocks; what it answers is what 'grantScheduledStep' answers, which is this transaction
+-- run by itself.
+grantScheduledStepSTM ∷ ScheduledEndpoint → Duration → STM GrantAnswer
+grantScheduledStepSTM (ScheduledEndpoint control) = grantStep (controlScheduler control)
 
 -- | How a wait for tick completion ended.
 data TickWait
@@ -1085,30 +1116,45 @@ data AccountingWait
 awaitScheduledAccounting ∷ HasCallStack ⇒ RuntimeControl → ScheduledOwner → IO AccountingWait
 awaitScheduledAccounting supervision owner = do
   refuseCallbackWait "await-scheduled-accounting"
-  let control = ownerControl owner
   -- The snapshot is committed once, before the supervised wait, so a retry of the wait
   -- or the handling of an outcome inside it cannot move it. The watch is cleared however
   -- the wait ends, in the cleanup of the same masked region that registered it.
   mask $ \restore → do
-    atomically (watchAccounting control)
-    restore (awaitSupervised supervision (accounted control))
-      `finally` atomically (unwatchAccounting control)
-  where
-    -- Only the owner's termination ends the wait with 'AccountingOwnerEnded', and supervision
-    -- handles an owner's outcome, a fatal one rethrown, before this transaction runs: so an owner
-    -- that is exiting (stopped, or failing with an outcome not yet published) neither completes
-    -- the wait nor ends it. It waits for the exit. Completion is the owner's acknowledgement,
-    -- written by the owner's thread after it has kept every failure it caught: the wait decides
-    -- nothing about failures in flight.
-    accounted control = do
-      status ← workerStatus (ownerWorker owner)
-      case status of
-        WorkerLive → do
-          exiting ← (||) <$> schedulerClosed (controlScheduler control) <*> controlStopping control
-          if exiting
-            then retry
-            else accountingReady control >> pure AccountingComplete
-        _ → pure AccountingOwnerEnded
+    atomically (watchScheduledAccounting owner)
+    restore (awaitSupervised supervision (scheduledAccountingStep owner))
+      `finally` atomically (unwatchScheduledAccounting owner)
+
+-- | The three parts of 'awaitScheduledAccounting' as transactions (D-86), for an application that waits for
+-- several things in one supervised wait of its own and so cannot block in this one. 'watchScheduledAccounting' takes
+-- the snapshot of the grants accepted so far, once; the wait is 'scheduledAccountingStep' composed into the
+-- application's own transaction under 'awaitSupervised', which retries until the accounting is complete or the
+-- owner has ended, exactly as 'awaitScheduledAccounting' does; 'unwatchScheduledAccounting' clears the watch however
+-- the wait ends, and is harmless without one. 'awaitScheduledAccounting' is these three, in that order. The
+-- application keeps the single-pending rule of supervised waits: it makes the wait in its one supervised wait,
+-- and not from a Lua callback.
+watchScheduledAccounting ∷ ScheduledOwner → STM ()
+watchScheduledAccounting = watchAccounting . ownerControl
+
+-- | The wait itself: see 'watchScheduledAccounting'. Only the owner's termination ends it with
+-- 'AccountingOwnerEnded', and supervision handles an owner's outcome, a fatal one rethrown, before this transaction
+-- runs: so an owner that is exiting (stopped, or failing with an outcome not yet published) neither completes the
+-- wait nor ends it. It waits for the exit. Completion is the owner's acknowledgement, written by the owner's thread
+-- after it has kept every failure it caught: the wait decides nothing about failures in flight.
+scheduledAccountingStep ∷ ScheduledOwner → STM AccountingWait
+scheduledAccountingStep owner = do
+  let control = ownerControl owner
+  status ← workerStatus (ownerWorker owner)
+  case status of
+    WorkerLive → do
+      exiting ← (||) <$> schedulerClosed (controlScheduler control) <*> controlStopping control
+      if exiting
+        then retry
+        else accountingReady control >> pure AccountingComplete
+    _ → pure AccountingOwnerEnded
+
+-- | Clear the watch: see 'watchScheduledAccounting'.
+unwatchScheduledAccounting ∷ ScheduledOwner → STM ()
+unwatchScheduledAccounting = unwatchAccounting . ownerControl
 
 -- | The logical tick reached.
 scheduledTick ∷ ScheduledEndpoint → STM Word64

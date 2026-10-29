@@ -16,6 +16,7 @@ module Test.LuaEngine.Facade.Support
   ( -- * The world
     World (..)
   , withWorld
+  , withWorldUsing
   , fatalWorld
   , Layout (..)
   , Session (..)
@@ -38,9 +39,12 @@ module Test.LuaEngine.Facade.Support
   , failFlushes
   , awaitSinkEntered
   , awaitBlockedOnSTM
+  , worldClock
+  , worldTimer
   , FakeTimer
   , fireTimers
   , liveTimers
+  , liveRegistrations
   , awaitTimers
   , armedTimers
   , awaitArmed
@@ -109,7 +113,7 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Log (unsafeComponent)
-import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero, RequirePositive), durationFromNanoseconds, durationNanoseconds, scriptedInstant, scriptedSource)
+import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero, RequirePositive), MonotonicSource, durationFromNanoseconds, durationNanoseconds, scriptedInstant, scriptedSource)
 import Hetoimasia.LuaEngine.Behavior (behaviorRequest)
 import Hetoimasia.LuaEngine.Boot (ContentConfiguration (..), contentConfiguration)
 import Hetoimasia.LuaEngine.Data (dataService, newByteBankFor)
@@ -146,7 +150,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Scheduler (TimerBackend (..))
 import Test.HUnit.Lang (HUnitFailure, assertFailure)
 import Test.Hspec (expectationFailure)
-import Test.LuaEngine.Modules.Support (Layout (..), Session (..), key', realReader, withSessionLimits)
+import Test.LuaEngine.Modules.Support (Layout (..), ReaderOf, Session (..), key', realReader, withSessionLimits)
 import Test.Support.Bounded (bounded)
 
 -- The world ----------------------------------------------------------------------------------------
@@ -188,9 +192,14 @@ data World = World
 -- | Run an example over a world: a temporary content root with these files, scanned; the session's
 -- pool; recording sinks; real supervision. However it ends, every gate the session holds is open.
 withWorld ∷ Profile → Layout → (World → RuntimeControl → LuaRuntime → IO a) → IO a
-withWorld profile layout body = do
+withWorld = withWorldUsing realReader
+
+-- | The same over a pool whose reader is made by this function from the real one: an injected failure of the
+-- reader for the paths an example names.
+withWorldUsing ∷ ReaderOf → Profile → Layout → (World → RuntimeControl → LuaRuntime → IO a) → IO a
+withWorldUsing readerOf profile layout body = do
   configuration ← either (\refused → assertFailure ("the profile's content configuration was refused: " <> show refused)) pure (contentConfiguration profile)
-  withSessionLimits (Just (configContentLimits configuration, configInventoryLimits configuration)) profile (2, 12) realReader layout $ \session control runtime → do
+  withSessionLimits (Just (configContentLimits configuration, configInventoryLimits configuration)) profile (2, 12) readerOf layout $ \session control runtime → do
     linesVar ← newTVarIO []
     flushes ← newTVarIO 0
     admission ← newTVarIO AdmissionOpen
@@ -341,6 +350,14 @@ failReports world = writeIORef (wReportFails world) True
 setFacadeLag ∷ World → Word64 → IO ()
 setFacadeLag world = writeIORef (wFacadeLag world)
 
+-- | The injected clock as the monotonic source an owner, a facade or a session is configured with.
+worldClock ∷ World → MonotonicSource
+worldClock world = scriptedSource (scriptedInstant <$> clockDuration world)
+
+-- | The world's fake timer as the backend an owner or a session is configured with.
+worldTimer ∷ World → TimerBackend
+worldTimer = timerBackend . wTimer
+
 -- The fake timer -----------------------------------------------------------------------------------
 
 -- | A timer that fires only when the example says.
@@ -370,6 +387,14 @@ liveTimers world = do
   let FakeTimer registrations = wTimer world
   held ← readTVarIO registrations
   length . filter id <$> mapM (\(_, _, live) → readTVarIO live) held
+
+-- | The lengths, in microseconds, of the registrations that are still live, oldest first: what each armed
+-- timer was asked to sleep for.
+liveRegistrations ∷ World → IO [Int]
+liveRegistrations world = do
+  let FakeTimer registrations = wTimer world
+  held ← readTVarIO registrations
+  concat <$> mapM (\(micros, _, live) → (\armed → [micros | armed]) <$> readTVarIO live) held
 
 -- | Block until at least this many registrations are live: the owner has looked at its clock and
 -- armed its timer.

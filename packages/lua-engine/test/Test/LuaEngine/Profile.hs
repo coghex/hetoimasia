@@ -12,6 +12,7 @@ import Data.List (isInfixOf)
 import Hetoimasia.Foundation.Time (Duration, durationNanoseconds, maximumDuration, zeroDuration)
 import Hetoimasia.LuaEngine.Profile
 import Test.Hspec
+import Test.LuaEngine.Request.Profiles (smallestLegalSpec)
 import Test.LuaEngine.Support (nanoseconds)
 
 -- | KiB, MiB and GiB, written as powers of two rather than the implementation's
@@ -314,6 +315,45 @@ spec = describe "the M1 profile" $ do
         )
         relationCases
 
+  describe "the least each limit may be" $ do
+    it "accepts the smallest legal profile: every limit at its minimum, the relations kept" $
+      verdict smallestLegalSpec `shouldBe` Right ()
+
+    -- one pair of examples for each of the limits: at its minimum, and one below it
+    mapM_
+      ( \limit → do
+          it ("accepts " <> show limit <> " at its minimum, " <> show (minimumOfAny limit)) $
+            verdict (setLimit limit (minimumOfAny limit) smallestLegalSpec) `shouldBe` Right ()
+          it ("refuses " <> show limit <> " one below its minimum, " <> show (minimumOfAny limit)) $
+            verdict (below limit) `shouldBe` Left (refusalBelow limit)
+      )
+      allLimits
+
+    it "names the dependencies of the three bounds that depend on others: the print bound on the identity bound, the copied value's on both" $ do
+      minimumOfAny (LimitBytes InstanceIdBytes) `shouldBe` 6
+      minimumOfAny (LimitBytes PrintWarnBytes) `shouldBe` fromIntegral (minimumPrintWarnBytes 6)
+      minimumOfAny (LimitBytes CopiedValueBytes) `shouldBe` fromIntegral (minimumCopiedValueBytes 6 (minimumPrintWarnBytes 6))
+      -- a larger identity bound raises the least of the other two
+      minimumBytes (setBytes InstanceIdBytes 128 smallestLegalSpec) PrintWarnBytes `shouldBe` fromIntegral (minimumPrintWarnBytes 128)
+      minimumBytes (setBytes PrintWarnBytes 4096 (setBytes InstanceIdBytes 128 smallestLegalSpec)) CopiedValueBytes `shouldBe` fromIntegral (minimumCopiedValueBytes 128 4096)
+      -- the print bound one below its least for a larger identity bound (the copied value's own least is kept: it is first in order)
+      let larger = setBytes CopiedValueBytes (fromIntegral (minimumCopiedValueBytes 128 (minimumPrintWarnBytes 128))) (setBytes InstanceIdBytes 128 smallestLegalSpec)
+      verdict (setBytes PrintWarnBytes (fromIntegral (minimumPrintWarnBytes 128) - 1) larger)
+        `shouldBe` Left (LimitBelowMinimum (LimitBytes PrintWarnBytes) (fromIntegral (minimumPrintWarnBytes 128) - 1) (fromIntegral (minimumPrintWarnBytes 128)))
+
+    it "keeps the record's least at the schema's words: the longest code, stage and role together" $ do
+      schemaWordsBytes `shouldBe` 17 + 8 + 12
+      minimumOfAny (LimitBytes RoleFailureRecordBytes) `shouldBe` 37
+
+    it "refuses a minimum before a relation, and a ceiling and a zero before a minimum" $ do
+      -- the record bound below its words is the minimum's refusal, though the identity relation is broken too
+      verdict (setBytes RoleFailureRecordBytes 2 (setBytes MessageBytes 1 (setBytes TracebackBytes 1 (setBytes InstanceIdBytes 100 fixedSpec))))
+        `shouldBe` Left (LimitBelowMinimum (LimitBytes RoleFailureRecordBytes) 2 37)
+      -- a case the reviewer found in round 9: a record of two bytes over a message, a traceback and an identity of one
+      verdict (setBytes RoleFailureRecordBytes 2 (setBytes MessageBytes 1 (setBytes TracebackBytes 1 (setBytes InstanceIdBytes 1 fixedSpec))))
+        `shouldBe` Left (LimitBelowMinimum (LimitBytes RoleFailureRecordBytes) 2 37)
+      verdict (setBytes RoleFailureRecordBytes 0 fixedSpec) `shouldBe` Left (LimitNotPositive (LimitBytes RoleFailureRecordBytes))
+
     it "does not clamp: a refused profile yields no profile at all" $ do
       validateProfile (setBytes HashFileBytes 1 fixedSpec) `shouldSatisfy` either (const True) (const False)
       validateProfile (setCount PngPixels 0 fixedSpec) `shouldSatisfy` either (const True) (const False)
@@ -321,3 +361,14 @@ spec = describe "the M1 profile" $ do
     isDuration limit = case limit of
       LimitDuration _ → True
       _ → False
+    minimumOfAny limit = case limit of
+      LimitBytes l → minimumBytes smallestLegalSpec l
+      LimitCount l → minimumCount smallestLegalSpec l
+      LimitDuration l → minimumDuration smallestLegalSpec l
+    -- the smallest legal profile with this limit one below its minimum (zero when the minimum is one)
+    below limit = case limit of
+      LimitDuration l | minimumOfAny limit == 1 → setDuration l zeroDuration smallestLegalSpec
+      _ → setLimit limit (minimumOfAny limit - 1) smallestLegalSpec
+    refusalBelow limit
+      | minimumOfAny limit == 1 = LimitNotPositive limit
+      | otherwise = LimitBelowMinimum limit (minimumOfAny limit - 1) (minimumOfAny limit)

@@ -5,9 +5,12 @@ module Test.LuaEngine.Request.Profiles
   ( smaller
   , counts
   , bytesOf
+  , smallestLegalSpec
+  , smallestLegalProfile
   ) where
 
 import Data.Word (Word64)
+import Hetoimasia.Foundation.Time (DurationRequirement (RequirePositive), durationFromNanoseconds)
 import Hetoimasia.LuaEngine.Profile
 
 -- | The fixed profile with these counts and byte limits changed, validated.
@@ -30,3 +33,22 @@ counts changes = smaller changes []
 -- | Only byte limits changed.
 bytesOf ∷ [(ByteLimit, Word64)] → Profile
 bytesOf = smaller []
+
+-- | Every limit at the least validation allows it ('minimumBytes', 'minimumCount', 'minimumDuration'): the smallest legal
+-- profile. The minimum of a limit that depends on others (the print bound on the identity bound, the copied value's on
+-- both) is read from this specification itself.
+smallestLegalSpec ∷ ProfileSpec
+smallestLegalSpec =
+  ProfileSpec
+    { specBytes = \limit → Bytes (minimumBytes smallestLegalSpec limit)
+    , specCounts = \limit → Count (minimumCount smallestLegalSpec limit)
+    , specDurations = \limit → case durationFromNanoseconds RequirePositive (toInteger (minimumDuration smallestLegalSpec limit)) of
+        Right duration → duration
+        Left refused → error ("the least duration is not a duration: " <> show refused)
+    }
+
+-- | The smallest legal profile, validated.
+smallestLegalProfile ∷ Profile
+smallestLegalProfile = case validateProfile smallestLegalSpec of
+  Right profile → profile
+  Left refused → error ("the smallest legal profile is refused: " <> show refused)

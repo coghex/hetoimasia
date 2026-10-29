@@ -7,7 +7,7 @@
 -- package's public modules (and reads only through them), it exposes four
 -- modules, needs no GLFW, Vulkan, console, sample or game package, and is listed
 -- by the ordinary and CPU projects and not by the Vulkan project (LFE-22 wires
--- that). Its request, data, modules, texture, scene and facade sublibraries are each held to their own
+-- that). Its request, data, modules, texture, scene, facade and session sublibraries are each held to their own
 -- dependencies and public imports; the scene one imports no oracle, which is the suite's.
 module Test.LuaEngine.Boundary (spec) where
 
@@ -238,6 +238,86 @@ spec = describe "the package and import boundary" $ do
     [file <> ": " <> name | (file, name) ← imported, not (permittedFacade name)] `shouldBe` []
     [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
 
+  it "has a session sublibrary over the configuration boundary, the facade and the services it composes, the content package, the foundation, the runtime's supervision and the host's public modules, and nothing else" $ do
+    (sort <$> fieldEntries "library session" "build-depends:")
+      `shouldReturn` [ "base"
+                     , "bytestring"
+                     , "containers"
+                     , "hetoimasia-content"
+                     , "hetoimasia-foundation"
+                     , "hetoimasia-lua-engine"
+                     , "hetoimasia-lua-engine:data"
+                     , "hetoimasia-lua-engine:facade"
+                     , "hetoimasia-lua-engine:modules"
+                     , "hetoimasia-lua-engine:request"
+                     , "hetoimasia-lua-engine:session-harness"
+                     , "hetoimasia-runtime"
+                     , "hetoimasia-scripting-lua"
+                     , "hetoimasia-scripting-lua:runtime-lua"
+                     , "stm"
+                     , "text"
+                     ]
+    fieldEntries "library session" "exposed-modules:"
+      `shouldReturn` [ "Hetoimasia.LuaEngine.Session"
+                     , "Hetoimasia.LuaEngine.Session.Failure"
+                     , "Hetoimasia.LuaEngine.Session.Pacing"
+                     , "Hetoimasia.LuaEngine.Session.State"
+                     ]
+
+  it "keeps the session's test seams in a private sublibrary that no public library exposes, whose only dependencies are base and the configuration boundary" $ do
+    -- the stanza says it is private
+    stanza ← stanzaBody "library session-harness"
+    stanza `shouldSatisfy` any (\line → "visibility:" `isInfixOf` line && "private" `isInfixOf` line)
+    fieldEntries "library session-harness" "exposed-modules:" `shouldReturn` ["Hetoimasia.LuaEngine.Session.Harness"]
+    (sort <$> fieldEntries "library session-harness" "build-depends:") `shouldReturn` ["base", "hetoimasia-lua-engine"]
+    -- no public library lists the harness module, and the harness is a type the session shows abstractly
+    mapM_
+      ( \header → do
+          exposed ← fieldEntries header "exposed-modules:"
+          exposed `shouldSatisfy` notElem "Hetoimasia.LuaEngine.Session.Harness"
+      )
+      ["library session"]
+    sources ← sourcesUnder "session-harness"
+    imported ← importedBy sources
+    sort (nub [name | (_, name) ← imported, "Hetoimasia." `isPrefixOf` name]) `shouldBe` ["Hetoimasia.LuaEngine.Manifest"]
+
+  it "imports, in the session sublibrary, only the configuration boundary, the facade and the services it composes, the content package's, the foundation's and the runtime's public modules, the host's public modules and base libraries: no texture, scene, private module, window, GPU, GLFW, Vulkan, console, sample or game" $ do
+    sources ← sourcesUnder "session"
+    sources `shouldSatisfy` ((>= 7) . length)
+    imported ← importedBy sources
+    [file <> ": " <> name | (file, name) ← imported, not (permittedSession name)] `shouldBe` []
+    [file <> ": " <> name | (file, name) ← imported, ".Internal" `isInfixOf` name] `shouldBe` []
+
+  it "keeps the session's state machine, failure schema and pacing pure: they import no concurrency, no IO and no Lua host" $ do
+    sources ← sourcesUnder "session"
+    imported ← importedBy sources
+    let pure' = ["State.hs", "Failure.hs", "Pacing.hs"]
+        effectful name = any (`isPrefixOf` name) ["Control.Concurrent", "Control.Exception", "System.", "Hetoimasia.Runtime.", "Hetoimasia.Foundation.Log", "Hetoimasia.Foundation.Resource", "Hetoimasia.Foundation.Worker", "Hetoimasia.Content", "Hetoimasia.LuaEngine.Facade", "Hetoimasia.LuaEngine.Modules", "Hetoimasia.LuaEngine.Data"]
+    [file <> ": " <> name | (file, name) ← imported, file `elem` pure', effectful name] `shouldBe` []
+    -- the only host module the pure ones read is the instance failure's shape, which the failure schema classifies
+    sort (nub [name | (file, name) ← imported, file `elem` pure', "Hetoimasia.Scripting." `isPrefixOf` name])
+      `shouldBe` ["Hetoimasia.Scripting.Lua.Instance", "Hetoimasia.Scripting.Lua.Runtime"]
+
+  it "calls the session's logger in one place, the attempt to write one diagnostic, and reaches it by no other path in the session sublibrary" $ do
+    sources ← sourcesUnder "session"
+    contents ← mapM (\path → (,) (takeFileName path) <$> readFile path) sources
+    let mentions word =
+          sort
+            [ name
+            | (name, text) ← contents
+            , line ← lines text
+            , not ("--" `isPrefixOf` trim line)
+            , not ("import " `isPrefixOf` line)
+            , word `isInfixOf` line
+            ]
+    -- the sink is called by name on one line of one module (the attempt, which only the writer and the negative controls make)
+    mentions "logInfo" `shouldBe` ["Run.hs"]
+    mentions "logError" `shouldBe` ["Run.hs"]
+    -- the session's logger is a field and is read where that attempt is made; the specification's is handed on twice: to the
+    -- session record, and to the module coordinator, whose diagnostic is written on the owner's own thread
+    mentions "sessionLogger" `shouldBe` ["Run.hs", "Types.hs"]
+    mentions "sxLogger" `shouldBe` ["Run.hs", "Run.hs", "Types.hs"]
+
   it "lets only the behavior selection import the Lua host and runtime, and only their public modules" $ do
     sources ← sourcesUnder "src"
     imported ← importedBy sources
@@ -390,6 +470,30 @@ spec = describe "the package and import boundary" $ do
                  , "Hetoimasia.Foundation.Time"
                  ]
         || "Hetoimasia.Scripting.Lua." `isPrefixOf` name
+    permittedSession name =
+      "Data." `isPrefixOf` name
+        || "GHC." `isPrefixOf` name
+        || "Control." `isPrefixOf` name
+        || "Hetoimasia.LuaEngine.Session" `isPrefixOf` name
+        || name
+          `elem` [ "Hetoimasia.LuaEngine.Behavior"
+                 , "Hetoimasia.LuaEngine.Boot"
+                 , "Hetoimasia.LuaEngine.Data"
+                 , "Hetoimasia.LuaEngine.Facade"
+                 , "Hetoimasia.LuaEngine.Manifest"
+                 , "Hetoimasia.LuaEngine.Modules"
+                 , "Hetoimasia.LuaEngine.Profile"
+                 , "Hetoimasia.LuaEngine.Request"
+                 , "Hetoimasia.Content.Identity"
+                 , "Hetoimasia.Content.Inventory"
+                 , "Hetoimasia.Content.ReadPool"
+                 , "Hetoimasia.Foundation.Log"
+                 , "Hetoimasia.Foundation.Resource"
+                 , "Hetoimasia.Foundation.Time"
+                 , "Hetoimasia.Foundation.Worker"
+                 , "Hetoimasia.Runtime.Supervision"
+                 ]
+        || "Hetoimasia.Scripting.Lua." `isPrefixOf` name
     permittedSuite name =
       name
         `elem` [ "Hetoimasia.LuaEngine.Manifest"
@@ -400,6 +504,11 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.LuaEngine.Data"
                , "Hetoimasia.LuaEngine.Modules"
                , "Hetoimasia.LuaEngine.Facade"
+               , "Hetoimasia.LuaEngine.Session"
+               , "Hetoimasia.LuaEngine.Session.Failure"
+               , "Hetoimasia.LuaEngine.Session.Harness"
+               , "Hetoimasia.LuaEngine.Session.Pacing"
+               , "Hetoimasia.LuaEngine.Session.State"
                , "Hetoimasia.LuaEngine.Texture"
                , "Hetoimasia.LuaEngine.Scene"
                , "Hetoimasia.Asset.Image"
@@ -411,6 +520,7 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.Foundation.Time"
                , "Hetoimasia.Foundation.Log"
                , "Hetoimasia.Foundation.Resource"
+               , "Hetoimasia.Foundation.Worker"
                , "Hetoimasia.Runtime.Logging"
                , "Hetoimasia.Runtime.Supervision"
                , "Hetoimasia.Content"

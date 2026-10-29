@@ -474,6 +474,12 @@ drainBacklog ih restore = do
   where
     run = \case
       JobStart number → withCell ih number (startInstance ih)
+      JobResumeInit number → withCell ih number $ \cell → do
+        held ← atomically (swapTVar (icHeldInit cell) NotHeld)
+        state ← readTVarIO (icState cell)
+        case held of
+          ReleasedBegin begin | not (isStopped state) → begin
+          _ → pure ()
       JobDispatch number → withCell ih number $ \cell → do
         atomically (modifyTVar' (icState cell) (\state → state {isDispatchQueued = False}))
         dispatch ih cell
@@ -698,6 +704,22 @@ startBehavior ih cell behavior = do
       where
         shape = capturedShape capture
     initialize driver capture kind cadence = do
+      -- The application may hold an instance here, the behavior valid and nothing authored run, until it has
+      -- seen every instance it admitted come this far: the owner goes on to the instances behind it, and the
+      -- held one begins when it is released, in its turn among the jobs.
+      -- The rest of the start is registered before the application is asked, so that a release it makes while it is
+      -- still being asked (it may publish that it is ready, and release, before it answers) finds something to
+      -- release. An answer of no takes the registration back and runs the start at once; a release that
+      -- raced it queued a job that finds nothing and does nothing.
+      atomically (writeTVar (icHeldInit cell) (HeldBegin (begin driver capture kind cadence)))
+      held ← insHoldInit (ihInstances ih) (InstanceId (controlOwner (ihControl ih)) (icId cell))
+      unless held $ do
+        registered ← atomically (swapTVar (icHeldInit cell) NotHeld)
+        case registered of
+          HeldBegin start → start
+          ReleasedBegin start → start
+          NotHeld → pure ()
+    begin driver capture kind cadence = do
       let shape = capturedShape capture
       -- An instance's initialization begins here whether or not its behavior has an @init@, so the
       -- application is told once, here, and not when a hook is entered.
@@ -1612,8 +1634,14 @@ beginEnding' ih cell reason primary = mask_ $ do
     begun@(_, _, began) ← beginEnding cell <* stopCadence (scheduler' ih) (CadenceKey (icId cell))
     unless began (endingBegun (ihControl ih) (icId cell))
     pure begun
-  unless already $
+  unless already $ do
     modifyIORef' (ihEndings ih) (Map.insert (icId cell) (Ending reason primary connections unstarted 0 ShutdownUndecided))
+    -- The application is told of the failure as it begins, once: before the @shutdown@, before the release and
+    -- before the retirements the instance's providers owe it, which the settlement (and so the telling of
+    -- 'instanceEscalate') waits for. What it raises is a failure of the host.
+    case (reason, primary) of
+      (EndFailed, Just (Primary phase stage err)) → insOnFailing (ihInstances ih) (describeFailure ih cell phase stage err [])
+      _ → pure ()
 
 -- | Finish ending an instance: its @shutdown@ hook, once, the release of its
 -- record in the VM, and its settlement, once. The application is then told if it
@@ -1865,6 +1893,25 @@ recordShutdown ∷ InstanceHost → ICell → ShutdownRecord → IO ()
 recordShutdown ih cell record =
   modifyIORef' (ihEndings ih) (Map.adjust (\held → held {endShutdown = record}) (icId cell))
 
+-- | An instance's failure as the application is told of it: the primary failure, where it happened, and what
+-- else failed as the instance ended.
+describeFailure ∷ InstanceHost → ICell → InstancePhase → HookStage → InstanceError → [(HookStage, InstanceError)] → InstanceFailure
+describeFailure ih cell phase stage err secondary =
+  InstanceFailure
+    { failureInstance = InstanceId (controlOwner (ihControl ih)) (icId cell)
+    , failureOwner = controlLabel (ihControl ih)
+    , failureName = icName cell
+    , failureSource = icModule cell
+    , failurePhase = phase
+    , failureStage = stage
+    , failureError = err
+    , failureMessage = renderError err
+    , failureTraceback = case err of
+        ErrorFault (BoundaryFailed fault) → boundaryTraceback fault
+        _ → Nothing
+    , failureSecondary = secondary
+    }
+
 -- | Settle an instance from its ending, once, and tell the application if it failed.
 --
 -- This is the one place an ending is settled or reported, whether its hooks ran to
@@ -1921,21 +1968,7 @@ settleEnding ih cell = do
         (Nothing, Nothing) → case releases of
           [] → Nothing
           (stage, err) : rest → Just (describe Stopping stage err rest)
-      describe phase stage err secondary =
-        InstanceFailure
-          { failureInstance = InstanceId (controlOwner (ihControl ih)) (icId cell)
-          , failureOwner = controlLabel (ihControl ih)
-          , failureName = icName cell
-          , failureSource = icModule cell
-          , failurePhase = phase
-          , failureStage = stage
-          , failureError = err
-          , failureMessage = renderError err
-          , failureTraceback = case err of
-              ErrorFault (BoundaryFailed fault) → boundaryTraceback fault
-              _ → Nothing
-          , failureSecondary = secondary
-          }
+      describe = describeFailure ih cell
       (terminal, outcome) = case (failure, mode) of
         (Just failed, _) → (Failed, InstanceFailed failed)
         (Nothing, Unorderly _) → (Stopped, InstanceDiscarded (Discard exitKind reached))
