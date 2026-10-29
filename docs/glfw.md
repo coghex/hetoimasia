@@ -1447,6 +1447,28 @@ for the healthy-connection control and for requests left pending across a
 connection loss — and it is never evidence of a request the compositor
 generated.
 
+#### Qualifying a genuine close from another package
+
+`requestCloseForCheck` lives in the private `native` sublibrary, so a suite in another package cannot reach it.
+`Hetoimasia.GLFW.NativeCheck`, the public sublibrary `native-check` (LFE-18, #533), is the one narrow, test-only way to
+make the platform deliver a genuine close to a window the host holds:
+
+```haskell
+requestNativeClose ∷ WindowHost → WindowId → IO NativeCloseAnswer
+data NativeCloseAnswer = NativeCloseDelivered | NativeCloseUnavailable | NativeCloseWindowEnded
+```
+
+It is addressed by `WindowId` through the host and runs on the session's owner (main) thread, like every lending of a
+host window: any other thread is refused with `NotSessionOwner` before the driver is reached. `NativeCloseDelivered` means
+the platform accepted the request (Cocoa `performClose:`, an X11 `WM_DELETE_WINDOW` message that `XSendEvent` accepted);
+the window's own close callback then latches it and numbers it in the window's observations exactly as a user's close is
+numbered. `NativeCloseUnavailable` is the driver answering that this backend exposes no handle for it (Wayland), and
+`NativeCloseWindowEnded` is a window the host does not hold. It exports no native handle and no ABI declaration, only
+test suites depend on it (no production library does), and `injectCloseForCheck` is still the injected one. The boundary
+is covered in `glfw-tests` over a counting driver (the private `native-check-core` sublibrary takes the driver as an
+argument, which is why its type names the native window pointer): it reaches the driver for a held window on the owner
+thread, reports what the driver answered, and reaches it for no unserved window and from no other thread.
+
 ### Release
 
 | Order | Part | Release |
