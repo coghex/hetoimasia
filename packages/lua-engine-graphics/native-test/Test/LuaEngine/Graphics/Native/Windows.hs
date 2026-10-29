@@ -11,7 +11,7 @@
 -- texture examples of this suite assert that no window exists.
 module Test.LuaEngine.Graphics.Native.Windows (spec) where
 
-import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
 import Control.Monad (forM_, unless)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Text as Text
@@ -19,7 +19,7 @@ import qualified Data.Text.Read as Text
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.GLFW.NativeCheck (NativeCloseAnswer (..), requestNativeClose)
 import Hetoimasia.GPU.Vulkan.GLFW (VulkanHost (..))
-import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowTarget (..), hostPort)
+import Hetoimasia.LuaEngine.Graphics.Window.Host (PortReading (..), WindowTarget (..), newHostPort)
 import Hetoimasia.LuaEngine.Graphics.Window.Port (Fatal, Port (..), WindowToken (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Provider
 import Hetoimasia.Runtime.GLFW (TargetStanding (..), WindowScenePublication (..), hostWindowIdentities, readTargetStanding)
@@ -32,7 +32,7 @@ import Test.LuaEngine.Graphics.Windows
 spec ∷ Env → Spec
 spec env = describe "window provider" $ do
   it "creates two visible windows for two instances, verifies each admission and an empty scene, and ends one while the other stays usable" $
-    within 120 . withWindows env Nothing $ \comp vm stops fatals port → do
+    within 120 . withWindows env Nothing $ \comp vm stops fatals port _ → do
       admit comp vm PresentationRole "a"
       admit comp vm PresentationRole "b"
       commandOpen comp vm "a" "a" "native one" (320, 240)
@@ -61,7 +61,7 @@ spec env = describe "window provider" $ do
   it "retires a real creation that was cancelled before its result was collected, and lets the instance ask again" $
     within 120 $ do
       gate ← newTVarIO False
-      withWindows env (Just gate) $ \comp vm _ fatals _ → do
+      withWindows env (Just gate) $ \comp vm _ fatals _ reading → do
         admit comp vm PresentationRole "a"
         commandOpen comp vm "a" "a" "cancelled" (320, 240)
         _ ← awaitNoteContaining comp "a start a started"
@@ -86,9 +86,12 @@ spec env = describe "window provider" $ do
         stopInstance comp vm "a"
         awaitWindowCount env 0
         readTVarIO fatals >>= (`shouldBe` [])
+        -- The production port keeps nothing of windows that retired whole: two creations (one cancelled, one
+        -- ended) leave no ticket and no window record behind, though the identities are never reissued.
+        atomically (reading >>= \now → unless (now == PortReading 0 0) retry)
 
   it "routes a genuine native close request to one session stop, separately from the instance's own cleanup close" $
-    within 120 . withWindows env Nothing $ \comp vm stops fatals _ → do
+    within 120 . withWindows env Nothing $ \comp vm stops fatals _ _ → do
       admit comp vm PresentationRole "a"
       commandOpen comp vm "a" "a" "closing" (320, 240)
       command comp vm "a" "wait_take" "a"
@@ -133,12 +136,12 @@ publishesEmptyScene env comp vm port name = do
 withWindows
   ∷ Env
   → Maybe (TVar Bool)
-  → (WinComp (WindowTarget ()) → WinVm (WindowTarget ()) → TVar Int → TVar [Fatal] → Port (WindowTarget ()) → IO a)
+  → (WinComp (WindowTarget ()) → WinVm (WindowTarget ()) → TVar Int → TVar [Fatal] → Port (WindowTarget ()) → STM PortReading → IO a)
   → IO a
 withWindows env gate body = do
   stops ← newTVarIO 0
   fatals ← newTVarIO []
-  port ← hostPort (envHost env)
+  (port, reading) ← newHostPort (envHost env)
   provider ← newIORef (Nothing ∷ Maybe (IO ()))
   let gated = maybe port (gateCreation port) gate
       config = WindowConfig 2 (atomically (modifyTVar' stops (+ 1))) (\found → atomically (modifyTVar' fatals (found :)))
@@ -146,7 +149,7 @@ withWindows env gate body = do
     withWinComp config gated $ \comp _ runtime → do
       writeIORef provider (Just (windowMainStep (wcProvider comp)))
       vm ← startWinVm comp runtime "native-window-vm"
-      body comp vm stops fatals gated
+      body comp vm stops fatals gated reading
 
 -- | The production port with creation outcomes withheld until the gate opens: the adapter's coordinated seam
 -- for a cancellation that overtakes a real native creation.
