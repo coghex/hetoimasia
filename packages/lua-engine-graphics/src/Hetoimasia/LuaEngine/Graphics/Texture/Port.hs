@@ -38,6 +38,7 @@ module Hetoimasia.LuaEngine.Graphics.Texture.Port
   , Device (..)
   , Fault (..)
   , Registration (..)
+  , Disposal (..)
   , Level (..)
   , TextureRef (..)
   , textureIdentity
@@ -84,6 +85,10 @@ data Port image ticket = Port
   , portMarkReleased ∷ TextureRef → STM ()
     -- ^ The logical release, at once: a scene publication's check sees the texture released while
     -- the table release waits for the holds ('portRelease').
+  , portHeld ∷ TextureRef → STM Bool
+    -- ^ Whether an adopted scene revision still holds this texture (the scene ledger's reading, which the
+    -- owner's lifecycle hooks write). The wake for a release deferred by a hold: the backend waits in a
+    -- transaction that reads it, so the end of the last hold wakes the pump with no timer and no Lua call.
   }
 
 -- | Whether the owner can take work.
@@ -133,10 +138,23 @@ data Device image = Device
     -- otherwise) and that the registration resolves to the image's own slot.
   , deviceRelease ∷ Registration → IO (Either Fault ())
     -- ^ The table's release of a registered texture, on the owner's thread.
+  , deviceHeld ∷ Registration → IO Bool
+    -- ^ Whether an adopted scene revision holds this registration, read on the owner's thread. The lifecycle
+    -- hooks that write the holds run on the same thread, so a reading taken inside a release action cannot be
+    -- overtaken by an adoption: the check and the table release are one step of the owner.
   , deviceTable ∷ IO TableReading
     -- ^ The table as it stands. An action reads it at the start of one of the owner's steps, after the previous
     -- step's refresh, which is what makes a reading taken after a wake a reading of what the wake announced.
   }
+
+-- | What a delivered texture's release action did on the owner's thread.
+data Disposal
+  = -- | The table's handle was released: what remains is the table's own retirement.
+    Disposed
+  | -- | An adopted scene revision still holds the texture, so nothing was released. The release is
+    -- retained and made once the last hold has ended.
+    Deferred
+  deriving (Eq, Show)
 
 -- | The facts about the uploaded level a registration needs.
 data Level = Level

@@ -17,6 +17,7 @@ module Test.LuaEngine.Graphics.Fake
   , defaultFakeConfig
   , newFake
   , fakePort
+  , fakeLedger
   , withFakeOwner
 
     -- * Holds
@@ -73,6 +74,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32)
+import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (SceneLedger, ledgerHeld, newSceneLedger)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port
 
 -- | What the fake owner holds back. A held stage waits until the example releases it.
@@ -169,6 +171,9 @@ data Fake = Fake
   , fNextGeneration ∷ !(TVar Word32)
   , fGrants ∷ !(TVar Int)
     -- ^ Actions the owner may run although 'HoldOwner' is on: one at a time, for an example that counts them.
+  , fLedger ∷ !SceneLedger
+    -- ^ The production ledger of what adopted scene revisions hold, which the fake's release is gated on exactly as
+    -- the production port's is. The examples that adopt scenes drive its lifecycle hooks.
   }
 
 newFake ∷ FakeConfig → IO Fake
@@ -192,6 +197,11 @@ newFake cfg =
     <*> newTVarIO []
     <*> newTVarIO 1
     <*> newTVarIO 0
+    <*> newSceneLedger
+
+-- | The ledger the fake's port and device read: the production one.
+fakeLedger ∷ Fake → SceneLedger
+fakeLedger = fLedger
 
 -- Holds and injections ---------------------------------------------------------------------------------------
 
@@ -374,6 +384,7 @@ fakePort fake =
         raising ← takeInjection fake (\case RaiseMark → Just (); _ → Nothing)
         when (raising == Just ()) (throwSTM (userError "injected: marking the release raised"))
         modifyTVar' (fMarked fake) (Set.insert ref)
+    , portHeld = ledgerHeld (fLedger fake) . textureIdentity
     }
   where
     cfg = fConfig fake
@@ -480,6 +491,7 @@ deviceFor fake =
                   record fake ("registered " <> tshow image <> " slot " <> tshow slot <> " alpha " <> tshow (levelBinaryAlpha level))
                   bump fake
                   pure (Right (Registration (TextureRef slot generation) slot))
+    , deviceHeld = atomically . ledgerHeld (fLedger fake) . textureIdentity . registrationRef
     , deviceTable = do
         noteEvent fake "table read"
         raising ← atomically (takeInjection fake (\case RaiseTable → Just (); _ → Nothing))

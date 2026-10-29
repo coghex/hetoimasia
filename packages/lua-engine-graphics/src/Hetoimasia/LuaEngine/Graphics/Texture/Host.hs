@@ -16,10 +16,13 @@
 --   owner-action lane; the release of a /delivered/ texture runs in the release lane, which the owner runs
 --   only once every window has adopted the scene revision that was current when it was asked
 --   ('requestVulkanRelease'). That lane is the single hook through which the holds a published scene takes
---   gate the table release, sequenced the way the window adapter sequences them: the logical release is
---   marked at once ('markReleasedSTM', for publication's check), the table release runs on the owner's
---   thread once nothing adopted shows the handle ('releaseTextureNow'). Releasing the table's handle
---   directly beneath a hold is not possible through this module.
+--   gate the table release: the logical release is marked at once ('markReleasedSTM', for publication's
+--   check), the lane's barrier makes every scene published before the request adopted, and the release
+--   action then reads the scene ledger ('deviceHeld', on the owner's thread, where the lifecycle hooks
+--   that write it run) and releases the table's handle ('releaseTextureNow') only when no adopted
+--   revision holds it. A held release is retained by the backend and asked again when the last hold ends
+--   ('portHeld'). Releasing the table's handle directly beneath a hold is not possible through this
+--   module.
 --
 -- The host must have been built with the configuration of "Hetoimasia.LuaEngine.Graphics.Texture.Configuration"
 -- (uploads configured, the device started without a surface). One that was not fails here, at startup,
@@ -30,6 +33,7 @@ module Hetoimasia.LuaEngine.Graphics.Texture.Host
   , bootstrapHost
   , hostPort
   , hostBuilders
+  , renderBuilders
   ) where
 
 import Control.Concurrent.STM (STM, atomically, retry)
@@ -94,6 +98,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , awaitVulkanAction
   )
 import Hetoimasia.GPU.Vulkan.GLFW (Image)
+import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (SceneLedger, ledgerHeld)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
 import Hetoimasia.Render.TwoD.Vulkan.Builders (Builders (..))
@@ -109,10 +114,12 @@ import Hetoimasia.Render.TwoD.Vulkan.Textures
   , toBackendHandle
   )
 
--- | What the bootstrap made: the session's renderer and texture registry, and the table reading.
+-- | What the bootstrap made: the session's renderer and texture registry, and the ledger of what the
+-- adopted scene revisions hold, which the release of a delivered texture is gated on.
 data HostSession = HostSession
   { sessionRenderer ∷ !Render.Renderer
   , sessionTextures ∷ !Textures
+  , sessionLedger ∷ !SceneLedger
   }
 
 -- | Why the session could not be made. A structured startup failure, not a per-request one.
@@ -130,7 +137,18 @@ data BootstrapRefused
 -- | The renderer's constructions over a session's, with buffer uploads admitted through the host's own
 -- bounded admission.
 hostBuilders ∷ VulkanHost scene → Construction q inst msgr phys dev cmd → Builders q inst msgr phys dev cmd
-hostBuilders host construction =
+hostBuilders host construction = (renderBuilders construction) {uploadBuffer = hostUpload}
+  where
+    hostUpload buffer bytes =
+      submitVulkanUpload host (UploadBuffer buffer bytes) <&> \case
+        Right ticket → Right ticket
+        Left (VulkanUploadRefused refusal) → Left refusal
+        Left (VulkanUploadsUnavailable _) → Left UploadClosed
+
+-- | The same constructions for a frame's recording, which admits no buffer upload: the M1 scene retains no
+-- chunk, so nothing records into a chunk's buffer. A frame hook is given a 'Construction' and no host.
+renderBuilders ∷ Construction q inst msgr phys dev cmd → Builders q inst msgr phys dev cmd
+renderBuilders construction =
   Builders
     { buildRing = constructRingWith construction
     , buildStorageTable = constructStorageTable construction
@@ -144,19 +162,15 @@ hostBuilders host construction =
     , swapImage = swapConstructedTexture construction
     , releaseImage = releaseConstructedTexture construction
     , buildVertexBuffer = \bytes → constructBuffer construction (BufferDescription VertexBuffer bytes)
-    , uploadBuffer = \buffer bytes →
-        submitVulkanUpload host (UploadBuffer buffer bytes) <&> \case
-          Right ticket → Right ticket
-          Left (VulkanUploadRefused refusal) → Left refusal
-          Left (VulkanUploadsUnavailable _) → Left UploadClosed
+    , uploadBuffer = \_ _ → pure (Left UploadClosed)
     , releaseBuffer = releaseConstructed construction
     }
 
 -- | Make the session's renderer and registry on the owner's thread, once its startup has made the device.
 -- Waits (interruptibly, in STM) for the startup and for the one action to run: this is assembly, before any
 -- texture work is admitted.
-bootstrapHost ∷ Render.Configuration → VulkanHost scene → IO (Either BootstrapRefused HostSession)
-bootstrapHost configuration host = do
+bootstrapHost ∷ Render.Configuration → SceneLedger → VulkanHost scene → IO (Either BootstrapRefused HostSession)
+bootstrapHost configuration ledger host = do
   readiness ← atomically $
     readReadiness (vulkanController host) >>= \case
       RootsPending → retry
@@ -180,7 +194,7 @@ bootstrapHost configuration host = do
           Left refusal → pure (Left refusal)
           Right renderer → do
             textures ← newTextures
-            pure (Right (HostSession renderer textures))
+            pure (Right (HostSession renderer textures ledger))
 
 -- | The port over a host that was bootstrapped.
 hostPort ∷ ∀ scene. VulkanHost scene → HostSession → Port Image UploadTicket
@@ -211,6 +225,7 @@ hostPort host session =
         model ← readVulkanModel (vulkanController host)
         pure (readVulkanModel (vulkanController host) >>= \now → when (now == model) retry)
     , portMarkReleased = \ref → () <$ markReleasedSTM (sessionTextures session) (fromBackendHandle (TextureHandle (refIndex ref) (refGeneration ref)))
+    , portHeld = ledgerHeld (sessionLedger session) . textureIdentity
     }
   where
     controller = vulkanController host
@@ -264,6 +279,7 @@ deviceOf host session construction =
           _ → pure (Left FaultNotReady)
     , deviceRelease = \registration →
         releaseTextureNow builders textures (fromBackendHandle (nativeHandle (registrationRef registration))) <&> either (Left . faultOf) Right
+    , deviceHeld = atomically . ledgerHeld (sessionLedger session) . textureIdentity . registrationRef
     , deviceTable =
         readConstructedTable construction <&> \case
           Nothing → TableReading False Set.empty

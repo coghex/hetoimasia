@@ -19,6 +19,7 @@ import qualified Data.Text.Read as Text
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.GLFW.NativeCheck (NativeCloseAnswer (..), requestNativeClose)
 import Hetoimasia.GPU.Vulkan.GLFW (VulkanHost (..))
+import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene, initialGraphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Window.Host (PortReading (..), WindowTarget (..), newHostPort)
 import Hetoimasia.LuaEngine.Graphics.Window.Port (Fatal, Port (..), WindowToken (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Provider
@@ -113,7 +114,7 @@ spec env = describe "window provider" $ do
       readTVarIO fatals >>= (`shouldBe` [])
 
 -- | The scene a ready window can be published: empty, to its own incarnation, after the owner admitted it.
-publishesEmptyScene ∷ Env → WinComp (WindowTarget ()) → WinVm (WindowTarget ()) → Port (WindowTarget ()) → Text.Text → IO ()
+publishesEmptyScene ∷ Env → WinComp (WindowTarget GraphicsScene) → WinVm (WindowTarget GraphicsScene) → Port (WindowTarget GraphicsScene) → Text.Text → IO ()
 publishesEmptyScene env comp vm port name = do
   command comp vm name "use" "a"
   line ← awaitNoteContaining comp (name <> " use a")
@@ -124,7 +125,7 @@ publishesEmptyScene env comp vm port name = do
   target ← maybe (assertFailure "a ready window offered no scene publication") pure found
   atomically (targetUsable target) >>= (`shouldBe` True)
   readTargetStanding (vulkanGraphicsOwner (envHost env)) (targetAttachment target) `shouldReturnSTM` Just TargetUsable
-  scene ← prepare ()
+  scene ← prepare initialGraphicsScene
   targetPublish target scene >>= \case
     WindowScenePublished _ _ → pure ()
     other → assertFailure ("the scene was not accepted: " <> show other)
@@ -136,7 +137,7 @@ publishesEmptyScene env comp vm port name = do
 withWindows
   ∷ Env
   → Maybe (TVar Bool)
-  → (WinComp (WindowTarget ()) → WinVm (WindowTarget ()) → TVar Int → TVar [Fatal] → Port (WindowTarget ()) → STM PortReading → IO a)
+  → (WinComp (WindowTarget GraphicsScene) → WinVm (WindowTarget GraphicsScene) → TVar Int → TVar [Fatal] → Port (WindowTarget GraphicsScene) → STM PortReading → IO a)
   → IO a
 withWindows env gate body = do
   stops ← newTVarIO 0
