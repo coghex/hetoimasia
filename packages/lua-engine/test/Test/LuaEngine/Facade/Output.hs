@@ -216,7 +216,7 @@ spec = describe "authored output" $ do
         }
       files
       $ \world _ _ _ →
-        outLines world >>= (`shouldBe` ["content,content_id,instance_id,request,role,time", "nil\tnil\tnil\tnil\tnil\tnil\tnil\tnil\tnil\tnil\tnil"])
+        outLines world >>= (`shouldBe` ["content,content_id,instance_id,request,role,session,state,time", "nil\tnil\tnil\tnil\tnil\tnil\tnil\tnil\tnil\tnil\tnil"])
 
 -- | The lines between each pair of marker lines, per call.
 callsBetween ∷ Text → Text → [Text] → [[Text]]

@@ -23,6 +23,13 @@ module Hetoimasia.LuaEngine.Facade.Types
     AdmissionState (..)
   , EngineFailure (..)
   , FacadeEndpoints (..)
+  , SessionEndpoints (..)
+  , StatusSample (..)
+  , RoleSample (..)
+  , FailureSample (..)
+  , TerminalStage (..)
+  , TerminalContext (..)
+  , stateUnavailableMessage
   , OutputSink (..)
   , Output (..)
   , OutputState (..)
@@ -33,6 +40,7 @@ module Hetoimasia.LuaEngine.Facade.Types
   , InstanceRecord (..)
   , Registry (..)
   , TimeState (..)
+  , StatusState (..)
   , FacadeLimits (..)
   , engineNamespaceName
   , engineBuilderName
@@ -41,7 +49,7 @@ module Hetoimasia.LuaEngine.Facade.Types
   ) where
 
 import Control.Concurrent.MVar (MVar)
-import Control.Concurrent.STM (TVar)
+import Control.Concurrent.STM (STM, TVar)
 import Control.Exception (Exception, SomeException)
 import Data.Map.Strict (Map)
 import Data.Text (Text)
@@ -92,6 +100,86 @@ data FacadeEndpoints = FacadeEndpoints
   , endpointTick ∷ IO Word64
   -- ^ The logical tick a gameplay VM is at, read live. Used by a gameplay facade only.
   }
+
+-- | The narrow session-control endpoints a facade is injected with (LFE-26): the three facts and the two
+-- operations the status, quit and unavailable-state bindings need, and nothing else. The session
+-- coordinator (LFE-13) owns every answer; the facade only asks, copies and marshals. None is a service
+-- locator and none gives a script a handle: each is reached through a closure built over one facade.
+data SessionEndpoints = SessionEndpoints
+  { endpointStatus ∷ STM StatusSample
+  -- ^ One coherent, bounded, nonblocking read of the session's status. Read once at the entry of every
+  -- presentation hook and resumed segment, in the same transaction that stores it, and never when a
+  -- script calls @status@.
+  , endpointQuit ∷ IO ()
+  -- ^ Ask for a normal whole-session stop: idempotent, no slot, no result, closes new work and future
+  -- logical tick grants before it returns, and waits for nothing.
+  , endpointTerminal ∷ TerminalContext → IO Bool
+  -- ^ Latch the unavailable-state guard's terminal failure and end the whole session. Answers whether
+  -- this was the first such latch, which is when the diagnostic is claimed; the failure record is the
+  -- coordinator's to build and bound.
+  }
+
+-- | The session's status as a script may be shown it: the coordinator's facts, as plain data.
+data StatusSample = StatusSample
+  { sampleStopping ∷ !Bool
+  -- ^ Whole-session stop, not merely a failed logical role.
+  , sampleGameplay ∷ !(Maybe RoleSample)
+  -- ^ 'Nothing' for a role the session does not have.
+  , samplePresentation ∷ !(Maybe RoleSample)
+  }
+  deriving (Eq, Show)
+
+-- | One present role. A role is failed exactly when it has a failure.
+data RoleSample = RoleSample
+  { sampleInitialized ∷ !Bool
+  -- ^ Its own @init@ succeeded; historical.
+  , samplePhase ∷ !Text
+  -- ^ @starting@, @ready@, @running@, @stopping@ or @retired@.
+  , sampleFailure ∷ !(Maybe FailureSample)
+  }
+  deriving (Eq, Show)
+
+-- | A role's latched failure, every text already bounded by the coordinator. An unknown optional field
+-- is 'Nothing' and absent from what a script sees.
+data FailureSample = FailureSample
+  { sfCode ∷ !Text
+  , sfMessage ∷ !Text
+  , sfRole ∷ !Text
+  , sfStage ∷ !Text
+  , sfContentId ∷ !(Maybe Text)
+  , sfInstanceId ∷ !(Maybe Text)
+  , sfPath ∷ !(Maybe Text)
+  , sfTraceback ∷ !(Maybe Text)
+  }
+  deriving (Eq, Show)
+
+-- | Where the unavailable-state guard was called from: the context that was executing.
+data TerminalStage
+  = -- | An authored module's top level, including evaluation resumed from an import chain.
+    TerminalModule
+  | TerminalInit
+  | TerminalUpdate
+  | TerminalShutdown
+  deriving (Eq, Show)
+
+-- | What the facade knows of a guard call, and all it says: the executing role and stage and, when an
+-- instance was running, the content and the instance; when an authored module's top level was running, the
+-- module's content and path, as the loader's canonical identity names them. A module-only call invents no
+-- instance, and a hook names no path (the failure of a hook has none).
+data TerminalContext = TerminalContext
+  { terminalRole ∷ !Role
+  , terminalStage ∷ !TerminalStage
+  , terminalContent ∷ !(Maybe Text)
+  , terminalInstance ∷ !(Maybe Text)
+  , terminalPath ∷ !(Maybe Text)
+  }
+  deriving (Eq, Show)
+
+-- | The one fixed phrase of the unavailable-state guard: the failure's message, the line written to
+-- stderr when the guard is first claimed, and the text of the Lua error it raises. The same for either VM
+-- and either spelling.
+stateUnavailableMessage ∷ Text
+stateUnavailableMessage = "state service not available in this milestone"
 
 -- | One line sink of a stream, with the flush that follows each authored call. A sink that raises
 -- ends the owner; nothing retries it and nothing is reported through it.
@@ -145,6 +233,14 @@ data TimeState = TimeState
   , timeSamples ∷ !(TVar (Map Word64 Duration))
   }
 
+-- | Each presentation instance's capture of the session's status for the segment it is running, keyed by
+-- the host's local number of the instance. Written on the owner's thread at a segment's entry, read by
+-- the owner's thread; one entry per declared instance, removed with it. A capture is immutable data, so
+-- every read of a segment is the same value, and a script is only ever handed a fresh copy.
+newtype StatusState = StatusState
+  { statusSamples ∷ TVar (Map Word64 StatusSample)
+  }
+
 -- | One VM's facade.
 data Facade = Facade
   { fcRole ∷ !Role
@@ -162,6 +258,8 @@ data Facade = Facade
   , fcTickDuration ∷ !(Maybe Duration)
   , fcRegistry ∷ !Registry
   , fcTime ∷ !TimeState
+  , fcSession ∷ !SessionEndpoints
+  , fcStatus ∷ !StatusState
   }
 
 -- | The session's authored output: both streams, the lock one whole call is written under, and the

@@ -259,6 +259,7 @@ spec = describe "the package and import boundary" $ do
                      ]
     fieldEntries "library session" "exposed-modules:"
       `shouldReturn` [ "Hetoimasia.LuaEngine.Session"
+                     , "Hetoimasia.LuaEngine.Session.Control"
                      , "Hetoimasia.LuaEngine.Session.Failure"
                      , "Hetoimasia.LuaEngine.Session.Pacing"
                      , "Hetoimasia.LuaEngine.Session.State"
@@ -505,6 +506,7 @@ spec = describe "the package and import boundary" $ do
                , "Hetoimasia.LuaEngine.Modules"
                , "Hetoimasia.LuaEngine.Facade"
                , "Hetoimasia.LuaEngine.Session"
+               , "Hetoimasia.LuaEngine.Session.Control"
                , "Hetoimasia.LuaEngine.Session.Failure"
                , "Hetoimasia.LuaEngine.Session.Harness"
                , "Hetoimasia.LuaEngine.Session.Pacing"

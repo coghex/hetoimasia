@@ -25,6 +25,10 @@ module Test.LuaEngine.Facade.Support
   , awaitOut
   , awaitErr
   , setAdmission
+  , setStatus
+  , quitsSeen
+  , terminalsSeen
+  , failTerminals
   , failuresSeen
   , setClock
   , advanceClock
@@ -78,6 +82,7 @@ module Test.LuaEngine.Facade.Support
 
     -- * Authoring
   , luaMain
+  , dumpPrelude
   , tryPrelude
   , Script (..)
   , script
@@ -187,6 +192,14 @@ data World = World
   , wTimer ∷ !FakeTimer
   , wIds ∷ !InstanceIds
   , wControl ∷ !RuntimeControl
+  , wStatus ∷ !(TVar StatusSample)
+  -- ^ The status the injected session endpoints answer: what a presentation segment captures at its entry.
+  , wQuits ∷ !(TVar Int)
+  -- ^ How many times the facade asked the (injected) session for a normal stop.
+  , wTerminals ∷ !(TVar [TerminalContext])
+  -- ^ Every terminal latch the facade asked for, in order; the first is the one the session would claim.
+  , wTerminalFail ∷ !(IORef Bool)
+  -- ^ Whether the injected terminal latch raises, after recording that it was asked for.
   }
 
 -- | Run an example over a world: a temporary content root with these files, scanned; the session's
@@ -215,8 +228,12 @@ withWorldUsing readerOf profile layout body = do
     failOn ← newTVarIO Nothing
     flushFail ← newTVarIO False
     entered ← newTVarIO []
+    status ← newTVarIO (StatusSample False Nothing Nothing)
+    quits ← newTVarIO 0
+    terminals ← newTVarIO []
+    terminalFail ← newIORef False
     withOutput (recording Stdout linesVar flushes block failOn flushFail entered) (recording Stderr linesVar flushes block failOn flushFail entered) $ \output →
-      body (World session profile output linesVar flushes admission failures clock step block failOn flushFail entered override reportFails lag timer ids control) control runtime
+      body (World session profile output linesVar flushes admission failures clock step block failOn flushFail entered override reportFails lag timer ids control status quits terminals terminalFail) control runtime
   where
     recording stream linesVar flushes block failOn flushFail entered =
       OutputSink
@@ -271,6 +288,22 @@ awaitErr world wanted = atomically $ do
 -- | Change the session's admission state, as the session coordinator would.
 setAdmission ∷ World → AdmissionState → IO ()
 setAdmission world = atomically . writeTVar (wAdmission world)
+
+-- | Set the status the injected session endpoints answer from now on.
+setStatus ∷ World → StatusSample → IO ()
+setStatus world = atomically . writeTVar (wStatus world)
+
+-- | From now on the injected terminal latch raises, after recording that it was asked for.
+failTerminals ∷ World → IO ()
+failTerminals world = writeIORef (wTerminalFail world) True
+
+-- | How many normal stops the facade has asked the injected session for.
+quitsSeen ∷ World → IO Int
+quitsSeen = readTVarIO . wQuits
+
+-- | The terminal latches the facade has asked the injected session for, in order.
+terminalsSeen ∷ World → IO [TerminalContext]
+terminalsSeen = readTVarIO . wTerminals
 
 -- | The engine failures the facade reported through its boundary.
 failuresSeen ∷ World → IO [EngineFailure]
@@ -519,6 +552,20 @@ withFvmRefusing world runtime shape body = do
             , endpointClock = scriptedSource (scriptedInstant <$> laggingDuration world)
             , endpointTick = readIORef (wTickOverride world) >>= maybe (join (readIORef tickRef)) pure
             }
+        -- The injected session: a status an example sets, a counter of the quits and a log of the terminal latches.
+        injectedSession =
+          SessionEndpoints
+            { endpointStatus = readTVar (wStatus world)
+            , endpointQuit = atomically (modifyTVar' (wQuits world) (+ 1))
+            , endpointTerminal = \context → do
+                first ← atomically $ do
+                  before ← readTVar (wTerminals world)
+                  writeTVar (wTerminals world) (before <> [context])
+                  pure (null before)
+                failing ← readIORef (wTerminalFail world)
+                when failing (throwIO (userError "the terminal latch failed"))
+                pure first
+            }
     facade ←
       newFacade
         FacadeSpec
@@ -529,6 +576,7 @@ withFvmRefusing world runtime shape body = do
           , fsInventory = ssInventory session
           , fsOutput = wOutput world
           , fsEndpoints = endpoints
+          , fsSession = injectedSession
           , fsPhase = phase
           , fsRoots = shRoots shape
           , fsIds = wIds world
@@ -738,6 +786,22 @@ tryPrelude =
   , "  local out = {}"
   , "  for i = 1, results.n do out[#out + 1] = show(results[i]) end"
   , "  print(label .. ' => ' .. table.concat(out, ' ; '))"
+  , "end"
+  ]
+
+-- | Lua that defines @dump(v)@: a value as one line with every table's keys sorted and nested without a depth
+-- limit, strings in double quotes. The expectations of the status record are written against it.
+dumpPrelude ∷ [Text]
+dumpPrelude =
+  [ "local function dump(v)"
+  , "  if type(v) == 'string' then return '\"' .. (v:gsub('\\n', '\\\\n')) .. '\"' end"
+  , "  if type(v) ~= 'table' then return tostring(v) end"
+  , "  local keys = {}"
+  , "  for k in pairs(v) do keys[#keys + 1] = k end"
+  , "  table.sort(keys)"
+  , "  local parts = {}"
+  , "  for _, k in ipairs(keys) do parts[#parts + 1] = tostring(k) .. '=' .. dump(v[k]) end"
+  , "  return '{' .. table.concat(parts, ',') .. '}'"
   , "end"
   ]
 

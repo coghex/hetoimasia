@@ -42,8 +42,9 @@
 --
 -- It installs no signal handler, exits no process and writes nothing to a standard stream: its
 -- diagnostics are the logger's, and the bounded failure records are data for whoever composes it. It
--- adds no Lua binding (the status, quit and unavailable-state guard are LFE-26's, which consume the
--- endpoints below), no world, no progress channel and no event API.
+-- adds no Lua binding itself: the status, quit and unavailable-state guard (LFE-26) are the facade's, bound
+-- over the three narrow endpoints 'sessionEndpoints' hands it, and it adds no world, no progress channel and
+-- no event API.
 module Hetoimasia.LuaEngine.Session
   ( -- * Running a session
     runSession
@@ -60,6 +61,7 @@ module Hetoimasia.LuaEngine.Session
   , sessionDiagnosticsEnded
   , requestStop
   , latchTerminalFailure
+  , sessionEndpoints
 
     -- * What it publishes
   , StopKind (..)

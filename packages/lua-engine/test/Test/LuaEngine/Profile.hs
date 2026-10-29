@@ -177,7 +177,7 @@ relationCases =
   , (DataWithinRetainedBank, [(LimitBytes RetainedDataBytesPerVm, mib)])
   , (DataWithinCopiedValue, [(LimitBytes CopiedValueBytes, 4 * mib)])
   , (SceneInputWithinCopiedValue, [(LimitBytes DataBytes, mib `div` 2), (LimitBytes CopiedValueBytes, mib)])
-  , (SceneDepthWithinCopiedDepth, [(LimitCount CopiedValueDepth, 2)])
+  , (SceneDepthWithinCopiedDepth, [(LimitCount CopiedValueDepth, 3)])
   , (SceneElementsWithinCopiedElements, [(LimitCount CopiedValueElements, 1000)])
   , (FailureRecordHoldsMessageAndTraceback, [(LimitBytes RoleFailureRecordBytes, 8 * kib)])
   , (FailureRecordHoldsInstanceId, [(LimitBytes MessageBytes, 1), (LimitBytes TracebackBytes, 1), (LimitBytes RoleFailureRecordBytes, 64)])
@@ -329,15 +329,17 @@ spec = describe "the M1 profile" $ do
       )
       allLimits
 
-    it "names the dependencies of the three bounds that depend on others: the print bound on the identity bound, the copied value's on both" $ do
+    it "names the dependencies of the three bounds that depend on others: the print bound on the identity bound, the copied value's on the identity, print and failure-record bounds" $ do
       minimumOfAny (LimitBytes InstanceIdBytes) `shouldBe` 6
       minimumOfAny (LimitBytes PrintWarnBytes) `shouldBe` fromIntegral (minimumPrintWarnBytes 6)
-      minimumOfAny (LimitBytes CopiedValueBytes) `shouldBe` fromIntegral (minimumCopiedValueBytes 6 (minimumPrintWarnBytes 6))
+      -- at the smallest bounds a failure holds nothing but its schema's words (37 bytes), and the status record is the 565 bytes of two such failures
+      minimumOfAny (LimitBytes CopiedValueBytes) `shouldBe` fromIntegral (minimumCopiedValueBytes 6 (minimumPrintWarnBytes 6) 37)
+      minimumOfAny (LimitBytes CopiedValueBytes) `shouldBe` 565
       -- a larger identity bound raises the least of the other two
       minimumBytes (setBytes InstanceIdBytes 128 smallestLegalSpec) PrintWarnBytes `shouldBe` fromIntegral (minimumPrintWarnBytes 128)
-      minimumBytes (setBytes PrintWarnBytes 4096 (setBytes InstanceIdBytes 128 smallestLegalSpec)) CopiedValueBytes `shouldBe` fromIntegral (minimumCopiedValueBytes 128 4096)
+      minimumBytes (setBytes PrintWarnBytes 4096 (setBytes InstanceIdBytes 128 smallestLegalSpec)) CopiedValueBytes `shouldBe` fromIntegral (minimumCopiedValueBytes 128 4096 37)
       -- the print bound one below its least for a larger identity bound (the copied value's own least is kept: it is first in order)
-      let larger = setBytes CopiedValueBytes (fromIntegral (minimumCopiedValueBytes 128 (minimumPrintWarnBytes 128))) (setBytes InstanceIdBytes 128 smallestLegalSpec)
+      let larger = setBytes CopiedValueBytes (fromIntegral (minimumCopiedValueBytes 128 (minimumPrintWarnBytes 128) 37)) (setBytes InstanceIdBytes 128 smallestLegalSpec)
       verdict (setBytes PrintWarnBytes (fromIntegral (minimumPrintWarnBytes 128) - 1) larger)
         `shouldBe` Left (LimitBelowMinimum (LimitBytes PrintWarnBytes) (fromIntegral (minimumPrintWarnBytes 128) - 1) (fromIntegral (minimumPrintWarnBytes 128)))
 

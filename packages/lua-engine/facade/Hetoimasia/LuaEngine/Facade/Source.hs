@@ -30,7 +30,7 @@ import Data.ByteString (ByteString)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
-import Hetoimasia.LuaEngine.Facade.Types (engineBuilderName, engineNamespaceName)
+import Hetoimasia.LuaEngine.Facade.Types (engineBuilderName, engineNamespaceName, stateUnavailableMessage)
 import Hetoimasia.Scripting.Lua.Output (renderFunctionLinesWith)
 import Hetoimasia.Scripting.Lua.Owner (ChunkName, ExportIdentity (ExportIdentity), ExportSource (..), chunkName)
 
@@ -75,6 +75,18 @@ engineChunk limit = Text.encodeUtf8 (Text.unlines (prelude <> renderFunctionLine
       , "local prepare_ticks, wait_ticks = E.prepare_wait_ticks, E.wait_ticks"
       , "local prepare_seconds, wait_seconds = E.prepare_wait_seconds, E.wait_seconds"
       , "local yield = E.yield"
+      , "local session_status, session_quit, unavailable = E.session_status, E.session_quit, E.state_unavailable"
+      , "local error = error"
+      , -- The unavailable-state guard (LFE-26). It names no parameter and reads no argument: whatever a script
+        -- passes is dropped unread, and nothing it passes can run. The engine binding latches the whole
+        -- session's failure and stop first (and writes the one diagnostic); only then is the error raised, with
+        -- the fixed text and no position. It is a global before any authored module is evaluated, and the
+        -- same closure is every facade's @state@, so a captured facade grants it nothing it did not have.
+        "local function terminal(...)"
+      , "  unavailable()"
+      , "  error(\"" <> stateUnavailableMessage <> "\", 0)"
+      , "end"
+      , "state = terminal"
       , "local function build(ctx)"
       , "  local id = ctx.instance_id"
       , "  bind(id)"
@@ -111,6 +123,8 @@ engineChunk limit = Text.encodeUtf8 (Text.unlines (prelude <> renderFunctionLine
       , "      cancel = operation('cancel'),"
       , "      wait = operation('wait'),"
       , "    },"
+      , "    session = { status = guard(session_status), quit = guard(session_quit) },"
+      , "    state = terminal,"
       , "    time = {"
       , "      tick = guard(tick),"
       , "      tick_seconds = guard(tick_seconds),"
