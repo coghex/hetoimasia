@@ -5,6 +5,12 @@ module Test.LuaEngine.Graphics.Window.Spec (spec) where
 
 import Control.Concurrent.STM (atomically)
 import qualified Data.Text as Text
+import Hetoimasia.Foundation.Messaging.Payload (prepare)
+import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest, validateBudgets)
+import Hetoimasia.GPU.Vulkan.Diagnostics (defaultCaptureConfig)
+import Hetoimasia.GPU.Vulkan.GLFW (VulkanHostConfig (..), vulkanHostConfig)
+import Hetoimasia.LuaEngine.Graphics.Window.Configuration
+import Hetoimasia.Runtime.GLFW (HostConfig (..), defaultHostConfig)
 import Hetoimasia.LuaEngine.Graphics.Window.Port
 import Hetoimasia.LuaEngine.Graphics.Window.Provider
 import Test.Hspec
@@ -16,6 +22,7 @@ import Test.LuaEngine.Graphics.Windows
 spec ∷ Spec
 spec = describe "window provider" $ do
   Request.spec
+  configuration
   admission
   stages
   cancellation
@@ -351,3 +358,20 @@ pressure = describe "pressure" $ do
       line `shouldSatisfy` Text.isInfixOf "status=success"
       eventCount rig "issue create" >>= (`shouldBe` 1)
       atomically (readFake (wrFake rig)) >>= (`shouldBe` 1) . readingWindows
+
+-- Configuration -------------------------------------------------------------------------------------------
+
+configuration ∷ Spec
+configuration = describe "host configuration" $ do
+  it "refuses a single-window, shared-scene host as the sample configures it, and accepts the profile's" $ do
+    initial ← prepare ()
+    let plain = vulkanHostConfig (defaultHostConfig []) defaultCaptureConfig budgets initial
+        single = plain {vulkanHost = (vulkanHost plain) {hostWindowLimit = 1, hostCommandCapacity = 1}}
+    checkWindowHost single `shouldBe` [HostWindowLimitTooSmall 1, HostCommandCapacityTooSmall 1, HostScenesShared]
+    checkWindowHost (configureWindows single) `shouldBe` []
+    -- Configuring never shrinks a host that already carries more.
+    let larger = plain {vulkanHost = (vulkanHost plain) {hostWindowLimit = 8, hostCommandCapacity = 64}}
+    hostWindowLimit (vulkanHost (configureWindows larger)) `shouldBe` 8
+    hostCommandCapacity (vulkanHost (configureWindows larger)) `shouldBe` 64
+  where
+    budgets = either (error . show) id (validateBudgets defaultBudgetRequest)

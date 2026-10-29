@@ -39,6 +39,7 @@ library
         Hetoimasia.LuaEngine.Graphics.Texture.Configuration
         Hetoimasia.LuaEngine.Graphics.Texture.Host
         Hetoimasia.LuaEngine.Graphics.Texture.Port
+        Hetoimasia.LuaEngine.Graphics.Window.Configuration
         Hetoimasia.LuaEngine.Graphics.Window.Host
         Hetoimasia.LuaEngine.Graphics.Window.Port
         Hetoimasia.LuaEngine.Graphics.Window.Provider
