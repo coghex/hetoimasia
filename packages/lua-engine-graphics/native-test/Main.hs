@@ -41,6 +41,7 @@ import Test.LuaEngine.Graphics.Native.Environment (checkValidationFeatures, esta
 import Test.LuaEngine.Graphics.Native.Loader (checkLoader)
 import Test.LuaEngine.Graphics.Native.Session (Facts (..), runSession)
 import qualified Test.LuaEngine.Graphics.Native.Spec as Native
+import qualified Test.LuaEngine.Graphics.Native.Windows as Windows
 
 main ∷ IO ()
 main = do
@@ -57,7 +58,7 @@ main = do
   loader ← checkLoader >>= either (\why → stop ("the qualified loader: " <> why)) pure
   Text.putStrLn ("lua-engine-graphics-native-tests: the binding's loader is the recorded loader " <> Text.pack loader)
   configuration ← either (\refused → stop ("the profile could not be mapped: " <> Text.pack (show refused))) pure (configurationFor fixedM1Profile)
-  facts ← runSession (arguments == [completeFlag]) (consentBackend consent) validationFeatures configuration Native.spec
+  facts ← runSession (arguments == [completeFlag]) (consentBackend consent) validationFeatures configuration (\env → Native.spec env >> Windows.spec env)
   finished ← getCurrentTime
   let problems = checks facts
       seconds = realToFrac (diffUTCTime finished started) ∷ Double
@@ -103,7 +104,8 @@ checks facts =
               && lastOf "vkDestroyInstance" == Just (length names - 1)
           )
       ]
-        <> [ "the session created a swapchain although it has no window" | isJust (firstOf "vkCreateSwapchainKHR") ]
+        <> [ "the session created a swapchain although no example made a window" | factsWindows facts == 0, isJust (firstOf "vkCreateSwapchainKHR") ]
+        <> [ "the examples made " <> Text.pack (show (factsWindows facts)) <> " windows and the session created no swapchain for them" | factsWindows facts > 0, not (isJust (firstOf "vkCreateSwapchainKHR")) ]
     verdictProblems = case factsVerdict facts of
       Nothing → ["the session gave no diagnostic verdict"]
       Just verdict
@@ -133,7 +135,7 @@ evidenceRecord consent loader configuration facts problems seconds = do
     , field "driver manifest" (maybe "unset" Text.pack driver)
     , field "loader" (Text.pack loader)
     , field "consent" (describeConsent consent)
-    , field "windows" "0 (the session is started without a surface and no window is requested)"
+    , field "windows" (if factsWindows facts == 0 then "0 (the session is started without a surface and no window is requested)" else Text.pack (show (factsWindows facts)) <> " native windows made by the window provider examples, each destroyed before its example ended")
     , field "validation" ("synchronization validation, pinned features " <> maybe "unset" Text.pack features)
     , field "diagnostic verdict" (maybe "none" (\verdict → if null (verdictIssues verdict) then "clean, " <> Text.pack (show (verdictDelivered verdict)) <> " records delivered" else Text.pack (show (verdictIssues verdict))) (factsVerdict facts))
     , field "native calls" (Text.pack (show native))

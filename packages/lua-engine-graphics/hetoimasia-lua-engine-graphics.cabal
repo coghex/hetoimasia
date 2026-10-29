@@ -147,7 +147,9 @@ test-suite lua-engine-graphics-native-tests
         Test.LuaEngine.Graphics.Native.Loader
         Test.LuaEngine.Graphics.Native.Session
         Test.LuaEngine.Graphics.Native.Spec
+        Test.LuaEngine.Graphics.Native.Windows
         Test.LuaEngine.Graphics.Png
+        Test.LuaEngine.Graphics.Windows
     c-sources: native-test/cbits/hetoimasia_lua_engine_graphics_native.c
     include-dirs: native-test/cbits
     install-includes: hetoimasia_lua_engine_graphics_native.h
@@ -173,6 +175,7 @@ test-suite lua-engine-graphics-native-tests
         hetoimasia-content ==0.1.0.0,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-glfw ==0.1.0.0,
+        hetoimasia-glfw:native-check ==0.1.0.0,
         hetoimasia-glfw:runtime-glfw ==0.1.0.0,
         hetoimasia-glfw:vulkan-interop ==0.1.0.0,
         hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
