@@ -234,12 +234,13 @@ Most limits are **caps on what comes in** (a manifest, a module's source, a data
 | `RoleFailureRecordBytes` | 37 (`schemaWordsBytes`: the longest code `state_unavailable` 17, stage `shutdown` 8 and role `presentation` 12) | a failure record's schema words cannot be shortened; every text is cut away first, so the whole-record cap holds for every code, stage and role only from here up (round 9's finding: a bound of 2 was accepted) |
 | `InstanceIdBytes` | 6 (`minimumInstanceIdBytes`) | the first identity the session issues |
 | `PrintWarnBytes` | `minimumPrintWarnBytes` of the identity bound | a warning must be able to name its writer, end in the marker and a line end |
-| `CopiedValueBytes` | `minimumCopiedValueBytes` of the identity and print bounds | what the facade itself makes cross the value boundary |
-| `CopiedValueElements` | `sceneFixedElements + sceneElementsPerSprite` (12) | a scene of one sprite must be able to cross |
+| `CopiedValueBytes` | `minimumCopiedValueBytes` of the identity and print bounds and the most text a failure may hold (`failureTextBytes`) | what the facade itself makes cross the value boundary, the [status record](#the-session-controls-lfe-26) of two failed roles included (565 at the smallest bounds) |
+| `CopiedValueElements` | the larger of `sceneFixedElements + sceneElementsPerSprite` (12) and `minimumStatusElements` (30) | a scene of one sprite and the largest status record must be able to cross |
+| `CopiedValueDepth` | `minimumStatusDepth` (3) | the status record nests three deep: the record, a role, a failure |
 | `PngPipelineWorkspaceBytes`, `TextureBytesPerUiInstance`, `TextureBytesPerSession` | 4 (`rgba8BytesPerPixel`) | a texture holds at least one RGBA8 pixel |
 | every other byte, count and duration limit | 1 (1 ns) | a cap on what comes in, or on a text cut visibly to it; the relations then keep them consistent (the smallest legal profile, every limit at its least, satisfies all of them) |
 
-The facade's own check of the first four (`LimitBelowFormatting`) is a guard that no validated profile reaches; the other bounds the session and its services check (`NotRepresentable`: a value that does not fit a machine integer; the texture pipeline's job capacity and PNG limits; the scene limits) are unreachable for a validated profile because every ceiling is within the machine integers and every least is at least one. The examples (`Profile`, *the least each limit may be*) accept each limit at its least and refuse it one below, for every limit.
+The facade's own check of the first six (`LimitBelowFormatting`) is a guard that no validated profile reaches; the other bounds the session and its services check (`NotRepresentable`: a value that does not fit a machine integer; the texture pipeline's job capacity and PNG limits; the scene limits) are unreachable for a validated profile because every ceiling is within the machine integers and every least is at least one. The examples (`Profile`, *the least each limit may be*) accept each limit at its least and refuse it one below, for every limit.
 
 | Relation | Meaning |
 | --- | --- |
@@ -1043,9 +1044,10 @@ holds (the same table, also when the behavior has no `init`): fresh for each ins
 | `api.content.data(path [, options])` | `options` is `nil`, absent or a plain table with only `root`, `tick_offset` and `optional` |
 | `api.request.ready(r)`, `take(r)`, `wait(r)`, `cancel(r)` | the [common operations](#what-a-script-sees) of the request adapter, for module and data requests alike |
 | `api.time.tick()`, `tick_seconds()`, `seconds()`, `wait_ticks(n)`, `wait_seconds(seconds)`, `yield()` | the role clocks and the waits, below |
+| `api.session.status()`, `api.session.quit()`, `api.state(...)` | the [session controls](#the-session-controls-lfe-26) (LFE-26) |
 
-`print`, `warn` and `import(path [, root_id])` are globals. Nothing else is added: no logger, no file handle, no clock but
-these, no session control (`api.session`, `quit` and the unavailable-state `state` are LFE-26).
+`print`, `warn`, `import(path [, root_id])` and `state(...)` are globals. Nothing else is added: no logger, no file handle, no
+clock but these, no global `quit` or `status`, no session control beyond the [two functions and the guard](#the-session-controls-lfe-26).
 
 **Calls and validation.** Every call is a dot call with exactly its declared arguments, counted as Lua counts them (an
 explicit `nil` is an argument; `api.content.module(path, nil)` is a call with its options omitted, `api.time.tick(nil)` has
@@ -1199,8 +1201,8 @@ withOutput out err $ \output →                -- the sinks' scope: outermost
 | --- | --- | --- | --- |
 | `InstanceIdBytes` | 6 (`minimumInstanceIdBytes`: `inst-1`) | the first identity the session issues; a later identity that does not fit is refused when it is declared (`IdTooLong`), never written | 5 refused; 6 makes a facade whose first instance is `inst-1`, and the tenth identity is refused |
 | `PrintWarnBytes` | `minimumPrintWarnBytes idBytes`: the longest warning prefix, `...` and a line end (242 + 4 for `InstanceIdBytes` 128; 167 + 4 for 6) | every line of a cut warning keeps the whole prefix and the marker ends the last of them; the longest prefix is an instance's (`lua warning role=presentation content=` + 64 + ` instance=` + `InstanceIdBytes`) or a module's with its label (the host keeps at most 128 bytes of it) | one below refused; the least keeps the format end to end, from a hook and from a module at the longest label |
-| `CopiedValueBytes` | `minimumCopiedValueBytes idBytes printBytes`: the largest of everything the facade makes cross, each with the host's header: one `print`/`warn` text (`PrintWarnBytes + 5`), an identity (`InstanceIdBytes + 5`), and the builder's context record (`minimumContextBytes`: 142 for an identity bound of 6, 264 for 128) | a text or record crosses as its payload and a header; the longest `out`/`err` call is the output bound and five bytes | one below refused; the least cuts and writes the longest `print` and `warn`, builds an instance's `api`, and turns a path or `import` too large to cross into an ordinary, catchable error |
-| `CopiedValueElements`, `CopiedValueDepth` | 4 and 1 | the same record | not separately checked: the profile's scene relation already keeps the elements at 12 or more and every limit positive, so neither can be below |
+| `CopiedValueBytes` | `minimumCopiedValueBytes idBytes printBytes failureTexts`: the largest of everything the facade makes cross, each with the host's header: one `print`/`warn` text (`PrintWarnBytes + 5`), an identity (`InstanceIdBytes + 5`), the builder's context record (`minimumContextBytes`: 142 for an identity bound of 6, 264 for 128) and the largest status record (`minimumStatusBytes failureTexts`: 491 bytes and two failures' texts, where `failureTexts` is `failureTextBytes` of the message, traceback, identity, path and record bounds, at most the record bound) | a text or record crosses as its payload and a header; the longest `out`/`err` call is the output bound and five bytes | one below refused; the least cuts and writes the longest `print` and `warn`, builds an instance's `api`, and turns a path or `import` too large to cross into an ordinary, catchable error |
+| `CopiedValueElements`, `CopiedValueDepth` | `minimumStatusElements` (30) and `minimumStatusDepth` (3), the status record's (the elements are at least a scene of one sprite's 12 as well) | the largest status record: a record, `stopping`, and for each role its table, four fields and a failure of eight | one below each refused (`Facade.Limits`); at all three least values the host copies the largest status record the profile's bounds admit, whole |
 | `InstancesPerVm`, `LuaIntegerMaximum`, `MessageBytes` | 1 | positive suffices: a one-instance VM, a tick ceiling of 1 and the message bound the facade does not format with | the profile's own positivity check |
 
 `installFacade` registers the hidden namespace and the two request handle types, adds the initial chunk that rebinds `print`
@@ -1245,8 +1247,8 @@ VM from the pieces above (a [module coordinator](#the-module-coordinator-lfe-11)
 the [facade](#the-authoring-facade-lfe-12) and a supervised scheduled owner that hosts instances), evaluates the selected entries,
 admits the roots, runs the roots' `init`s and the clocks over the Lua host's own scheduler, applies the failure policy and tears
 down through one protected protocol that ends in actual retirement. It adds no scheduling, no world, no progress channel and no event API; it installs no signal handler,
-exits no process and writes nothing to a standard stream. The Lua status, quit and unavailable-state bindings are LFE-26's, which
-consume the endpoints below; the launcher that opens the content root, makes the checkpoint and maps an outcome to an exit status is LFE-22's.
+exits no process and writes nothing to a standard stream. The Lua status, quit and unavailable-state bindings are [LFE-26's](#the-session-controls-lfe-26), which
+consume the endpoints below (`sessionEndpoints` hands a facade exactly three of them); the launcher that opens the content root, makes the checkpoint and maps an outcome to an exit status is LFE-22's.
 [D-82](../../docs/designs/lua_first_engine_design.md) (the teardown protocol), D-83 (the first two host seams), D-84 (the third), D-85 (the fourth), D-86 (the fifth) and D-87 (diagnostics go through a session-owned writer that the session abandons, without waiting for it, once every role has retired) are normative for this section.
 
 ```haskell
@@ -1449,14 +1451,162 @@ Three of the five are hooks and opt-in, with a default of no notice and no hold 
 
 and the host's `Instance.Behavior` and `Instance.Failure` examples (group `test.scripting-lua-runtime`) for the first two seams: every instance validated before any runs, a release that races the callback's return, repeated releases coalesced into one resume, a stop that wins over a late release or a late success, a callback that throws as a failure of the host, the early notice once and before the shutdown, and defaults that change nothing; with a model of the hold's three protections removed one at a time. The lua-runtime-tests examples `Scheduled.Creation` prove the D-84 field (the callback told once, after the stop request and before the starter's wait; a raising or asynchronous-typed callback kept beside the start's failure; the worker's own terminal failure kept beside it; nothing told when the start is not abandoned; the default unchanged), and `Accounting.Waits` the D-86 parts (the step is the completion the wait returns, composes with a caller's own state in one supervised wait, and clearing the watch is harmless when repeated), and `Scheduled.Settlement` the D-85 export (it answers what the grant answers, composes with a caller's own state in one atomic step, undoes the caller's write with a refused grant, and serializes a closure with grants decided from it).
 
+## The session controls (LFE-26)
+
+The facade binds three things to the [session coordinator](#the-session-coordinator-lfe-13), over narrow endpoints the coordinator
+hands it and nothing wider: a copied status for the presentation role, a request for a normal whole-session stop, and the terminal
+unavailable-state guard. They add no coordinator, no store, no queue, no event and no alias: there is no global `quit` or `status`, no
+public lifecycle grant, restart, pause, per-instance stop, reason or exit code, and no change to the generic host or the runner.
+D-70 (status), D-72 (quit), D-76 and P-73 sections 4 and 5 are normative.
+
+```haskell
+data SessionEndpoints = SessionEndpoints
+  { endpointStatus   ∷ STM StatusSample                    -- one coherent, bounded, nonblocking read of the status
+  , endpointQuit     ∷ IO ()                               -- a normal stop: idempotent, no slot, no result, never waits
+  , endpointTerminal ∷ TerminalContext → IO Bool           -- the guard's latch; True the first time, which is when it writes
+  }
+sessionEndpoints ∷ Session → SessionEndpoints              -- requestStop session StopQuit, latchTerminalFailure, sessionStatus
+```
+
+A facade is given them in its `FacadeSpec` (`fsSession`); `Hetoimasia.LuaEngine.Session.Control` (pure) converts the coordinator's own
+records into the plain samples the facade marshals, so a record the running Lua might never read (a fatal one, a module's, a final phase)
+is converted and checked without a VM.
+
+### What a script sees
+
+| Spelling | Caller | Result |
+| --- | --- | --- |
+| `api.session.status()` | a **presentation** instance's `init`, update (any serving segment, a callback included) and `shutdown` | a fresh plain table, below |
+| `api.session.quit()` | either role's instance, in `init`, update and `shutdown` | no results |
+| `state(...)` and `api.state(...)` | anything, anywhere: a module's top level, every hook of both roles, after a quit, through any captured facade | raises the one fixed error, after latching the whole session's failure |
+
+`status` and `quit` are exact zero-argument dot calls. An extra argument (an explicit `nil` included), a mistaken colon call, the wrong
+role, a module's top level, and another instance's captured facade are **ordinary Lua errors** raised before the coordinator is observed
+or a stop is requested (`pcall` catches them, and a healthy session stays healthy); what the facade checks is the running instance the
+host names, never `api.role`, `api.content_id` or any field a script can overwrite. `state` is the explicit exception: it takes any
+arguments, inspects none (no `tostring`, no traversal, no metamethod of theirs runs; the closure drops them unread), and no role, phase or
+arity check stands before it. It is a global before any authored module is evaluated (the engine's initial chunk installs it) and the same
+closure is every facade's `api.state`. Rebinding a global (`state`, `print`, `warn`) changes nothing a retained closure does.
+
+### The status record
+
+```lua
+{
+  stopping = false,
+  gameplay = {present=true, initialized=true, phase="running", failed=false},
+  presentation = {present=true, initialized=true, phase="running", failed=false}
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `stopping` | the whole session is stopping (a quit, an interrupt, a boot failure, a presentation or engine failure, the guard): **not** a failed logical role |
+| `gameplay`, `presentation` | an absent role is exactly `{present=false}`; a present role always has `present=true`, `initialized`, `phase`, `failed` |
+| `initialized` | the role's own `init` succeeded (every instance of it); historical, it stays true through stopping and retirement |
+| `phase` | `"starting"`, `"ready"` (gameplay's `init` succeeded, the start gate is closed; **not** assets or game work), `"running"`, `"stopping"` or `"retired"` (published only after actual retirement under LFE-13) |
+| `failed`, `failure` | `failed` is true exactly when the role has a latched failure, and then `failure` is present: `code`, `message`, `role`, `stage` always; `content_id`, `instance_id`, `path`, `traceback` only when known |
+
+`code` is `lua_error`, `module_error`, `required_request`, `host_failure`, `cleanup_failure` or `state_unavailable`; `stage` is `module`,
+`init`, `update`, `shutdown`, `request`, `cleanup` or `engine`; `role` is `gameplay` or `presentation`. A failed role is never `ready` or `running`.
+No stack locals, authored payload, world, progress counter or recursive error graph is ever shown, and no instance is invented for module-only
+work. Every text is the coordinator's, already bounded when its state took the failure in (message 2 KiB, traceback 8 KiB, opaque instance
+identity 128 UTF-8 bytes, the whole record 16 KiB, each cut at a code point and ending in a visible `...`); the adapter rebuilds none of it, so
+the copied status stays within the 16 MiB, depth 8 and 65,536-element ceilings (three levels deep, a few dozen elements). The **first** failure
+of a role stays as the phase advances; a later cleanup error is in the engine report and can end the session, and the status shows no history.
+The guard's own terminal failure is the session's, not a role's: it shows as `stopping=true` and in the outcome (`outTerminal`).
+
+**The bounds the status needs are in the profile's own validation.** The status crosses to Lua under the profile's copied-value bounds like every
+result, so a bound below the largest status record the profile's other bounds admit would be a promise the engine cannot keep. The derived
+minimums count it (`minimumStatusBytes`, `minimumStatusDepth`, `minimumStatusElements`; see [the least each limit may be](#the-least-each-limit-may-be-hetoimasialuaengineprofileminimum)):
+at least 3 levels, 30 values, and the bytes of two failed roles (491 and two failures' texts, `failureTextBytes` of the message, traceback, identity,
+path and record bounds, never more than the record bound: 565 at the smallest bounds, 23,477 at the fixed profile's), so a validated profile refuses
+a copied-value bound below them (`LimitBelowMinimum`) and the facade keeps `LimitBelowFormatting` as a guard that none reaches. The fixed M1
+profile's numbers are unchanged (16 MiB, depth 8, 65,536 values).
+
+### Sample timing
+
+A presentation facade reads the status **once at the entry of every hook and every resumed segment**, in the same transaction that stores it
+(`captureStatus`, wired by `facadeInstanceConfig` beside the presentation clock's sample, so a finite `init` and `shutdown` have captures of
+their own, and a resumed update after a wait, a request wait or a yield has a new one, with its `dt` unchanged). A call to `status` never reads
+the coordinator: it returns a fresh Lua copy of the stored capture. So every read inside a segment describes the same moment however the
+coordinator changes meanwhile (**including a read after `quit()` in the same segment, which shows the entry's `stopping=false`**), editing
+a returned table, nested ones included, changes nothing another read or another instance sees, and a long segment may keep an old capture.
+Polling creates no subscription, wake, history or cross-VM synchronous call: an event-driven instance with no scheduled hook is not run
+because the status changed, intermediate phases may be missed, and nothing waits for a request, a readiness, a retirement or the logical
+owner. The gameplay facade never captures (logical Lua cannot read this wall-time-sensitive cross-role status).
+
+### Quit
+
+`quit()` calls the coordinator's idempotent normal-stop endpoint directly (`requestStop session StopQuit`): no task, request or result
+reservation, no handle, no busy answer, no hidden queue. The endpoint closes the whole session's admission and every future logical tick grant
+before the call returns, so a content request after it is an ordinary error (never `busy`) and a tick is never granted; release, cancel and
+authored output stay available under their existing rules. Statements after `quit()` still run until the segment returns or yields, nothing
+resumes after the stop is applied, a Lua error caught afterwards cannot cancel it, an uncaught error after it (or a shutdown or cleanup failure)
+still makes the outcome a failure, an `init` that quits cannot open the startup gate even if it succeeds, repeated calls (shutdown's included)
+reopen nothing and run no `shutdown` twice, and the caller never waits for the other role's owner, a held provider or any retirement.
+Either role's request ends the entire session; an individual instance is ended through Haskell, not this operation.
+
+### The unavailable-state guard
+
+`state(...)` and `api.state(...)` are one terminal boundary, not an ordinary role failure. In this order, on the calling owner's thread:
+
+1. **Latch.** `endpointTerminal` latches the whole session's failure and orderly stop (`latchTerminalFailure`): code `state_unavailable`,
+   message `state service not available in this milestone`, the executing role, and the stage of the context that was running: `module` for
+   any authored module's top level (evaluation resumed from an import chain included; no instance, and the content and **path** of the module whose code is running,
+   read from the loader's canonical identity for it, so a dependency's guard names the dependency's path and not the entry that imported it), otherwise the running hook's
+   `init`, `update` or `shutdown` with that instance's content and identity, and attributed to the executing instance even through another
+   instance's captured facade. Nothing is latched before this, and a failure here is the host's.
+2. **Claim and write, once.** Only the call whose latch answered *first* writes, through the session's own `Output` stderr sink (not the Lua
+   `print`/`warn`, which a script may have rebound): **exactly one line, the phrase and nothing else** (no engine prefix; the sink supplies the line
+   terminator), flushed under the output's lock like any authored call. The claim is the session's: one diagnostic across both VMs and both
+   spellings, no retry loop. A sink that fails is the output's failure, fatal to the owner and not retried, and cannot lose the latch, which
+   was committed first, or displace an earlier primary failure (an earlier failure stays the engine report's primary; the guard's is secondary). The authored write is interruptible, as every authored write is (a stuck sink must not make its writer uninterruptible): a hard
+   cancellation of the owner that lands between the latch and the write loses the line and nothing else, because the failure and the stop are the
+   session's and the outcome (`outTerminal`, the engine report) carries them.
+3. **Raise.** The Lua closure raises the **string** `state service not available in this milestone`, with no position, as an ordinary
+   catchable error. `pcall`/`xpcall` can catch it but cannot clear the latch, reopen admission, start a closed gate or turn the eventual
+   failure into success. It is the same text whichever VM, phase or spelling.
+
+A stronger host failure (the latch or the sink failing) takes the place of the Lua error. Signal installation, exit status 1 and the
+second-signal force exit remain LFE-22's assembly work; this slice proves the outcome (`VerdictFailure`, `outTerminal`) consumed there. No
+`state.create`, query, schema or store function exists.
+
+### State, owners and lifetimes
+
+| State | Owner and thread | Written by | Read by | Bound | Released when |
+| --- | --- | --- | --- | --- | --- |
+| a presentation instance's status capture (`StatusState`, one `TVar` map by host instance number) | the facade; STM | `captureStatus` on the owner's thread, at a hook's or resumed segment's entry, in the transaction that reads the coordinator | `status` on the owner's thread | one immutable sample per declared presentation instance | `forgetInstance`, or the facade's scope; a returned table is ordinary Lua with no obligation |
+| the session-control endpoints (`SessionEndpoints`) | the facade, from `fsSession`; closures over one session | the session (`sessionEndpoints`), once per role's VM | the bindings | three closures | the facade's scope; they own nothing |
+| the unavailable-state latch and its claim | the session's state (`stTerminal`) | `latchTerminalFailure` on any thread | the outcome, the report | one record, bounded by the state | the session; never reset |
+| the hidden namespace's three bindings and the closures built over them | the VM; Lua | the initial chunk (once), the builder (once per instance) | the hooks | one set per VM | the builder takes itself out of the globals when taken; the closures are collected with the facade table |
+
+### What proves it
+
+`Test.LuaEngine.Facade.Control` (group `test.lua-engine`) runs the bindings over **injected** endpoints on real Lua in real instances: the exact
+example and every phase, history fact, absent role and failure field and omission; the capture taken at entry (a change while the init is parked
+in its output is seen by no read of it, and shutdown has its own); a returned table edited without effect; every misuse refused before the
+coordinator is asked; the same refused for the wrong role, another instance's captured facade and a module's top level; quit from either role's
+every hook; the guard from a module's top level, every hook of both roles, through a kept facade and after a quit, attributed exactly, with
+cyclic and metatable-bearing arguments that no metamethod touches, with a rebound `print`/`warn`/`state`, with a failing sink (the latch is
+asked for first and the line handed once) and with a failing latch (no line); the surface (`api` has exactly the added fields; no helper
+namespace or global alias) and the bounds (`Facade.Limits`: the status record's least bytes, depth and values written out by hand and equal to the host's own
+count of the largest record the fixed profile admits, each refused one below by the profile's validation, and the largest record read whole at all three
+least values). `Test.LuaEngine.Session.Api` runs them over the **real coordinator**: the status at each hook of a session of the
+presentation role alone, with the logical init held, and when `ready`; an ordinary logical failure shown with `stopping=false` while a held
+provider keeps the role unretired and unchanged once it retires; a failure message cut at its bound; reads stable while a gated peer stops the
+session; a refresh on resumption with an unchanged `dt`; an event-driven instance that is not run; two instances' captures; quit from both roles'
+init, update and shutdown with every place taken, a held provider and a held peer (neither waited for nor falsely retired); and the guard caught
+at a module's top level and in an imported dependency (both VMs claim one line, the path is the running module's), an update, both inits, a shutdown and an update after a quit, preserving an earlier failure,
+with a held diagnostic (the latch precedes the write, and survives a cancelled caller) and a failing sink. `Test.LuaEngine.Session.Control`
+checks the pure conversions with no VM, with the bounds. The Boundary and Client examples keep the package and its public clients in step.
+
 ## Deferred, by design
 
 Not here, and not claimed: the CLI `run` dispatch and exit mapping (LFE-22), which will
 consume the boot checkpoint and retain the same anchored root;
 the concrete GPU upload and registration, native budgets, scene holds and the atomic publication of a prepared scene (LFE-17 to LFE-20), the public Lua graphics binding (LFE-21),
-the graphics and status service facades (the content, request, time and output surface is [the facade](#the-authoring-facade-lfe-12);
-the texture pipeline's typed endpoint is still its own), `api.session`, `quit` and the
-unavailable-state `state` guard (LFE-26), which consume [the session coordinator's](#the-session-coordinator-lfe-13) status, stop and terminal-failure endpoints,
+the graphics service facades (the content, request, time and output surface is [the facade](#the-authoring-facade-lfe-12), the status,
+quit and unavailable-state guard are [the session controls](#the-session-controls-lfe-26); the texture pipeline's typed endpoint is still its own),
 the launcher that opens the content root, makes the checkpoint, installs the signal handlers and maps the outcome to an exit status (LFE-22); live codec, texture and GPU budgets and their
 enforcement; real pacing; mods, metadata extensions, alternate manifest formats, defaults or relaxed parsing.
 
@@ -1478,4 +1628,4 @@ injected upload backend (see above). It covers the accepted
 examples, every syntax and schema refusal with the limits at their boundary and
 one past, the exact tick endpoints and forbidden forms, every fixed value against
 an independently written expectation, valid smaller profiles and refused ones,
-the behavior selection's cadence rules and numeric boundaries, the boot checkpoint (see above), the request adapter (see above), the raw-data provider (see above), the module coordinator (see above), the texture pipeline (see above), the scene schema (see above), the authoring facade (see above), the session coordinator (see above), and this package's dependency and import boundary.
+the behavior selection's cadence rules and numeric boundaries, the boot checkpoint (see above), the request adapter (see above), the raw-data provider (see above), the module coordinator (see above), the texture pipeline (see above), the scene schema (see above), the authoring facade (see above), the session coordinator (see above), the session controls (see above), and this package's dependency and import boundary.
