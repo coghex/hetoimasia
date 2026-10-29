@@ -31,7 +31,7 @@ import qualified Data.Text as Text
 import Data.Text (Text)
 import Hetoimasia.LuaEngine.Graphics.Window.Port (Fatal)
 import Hetoimasia.LuaEngine.Graphics.Window.Provider
-import Hetoimasia.Scripting.Lua.Provider (Completion (..), ProviderReply (..), ReplyAnswer (..), RequestEndpoint (..), Submission (..))
+import Hetoimasia.Scripting.Lua.Provider (Completion (..), ProviderReply (..), ProviderWork (..), ReplyAnswer (..), RequestEndpoint (..), Submission (..))
 import Test.HUnit.Lang (assertFailure)
 import Test.LuaEngine.Graphics.Rig (bounded)
 import Test.LuaEngine.Graphics.Window.Fake
@@ -59,7 +59,7 @@ withWRigWrapped wrap records holds body = do
   let config = WindowConfig records (atomically (modifyTVar' stops (+ 1))) (\found → atomically (modifyTVar' fatals (found :)))
   bounded . withWinComp config (fakePort fake) $ \comp _ runtime → do
     vm ← startWinVmWith wrap comp runtime "window-vm"
-    body (WRig fake comp vm stops fatals) `finally` releaseAll fake
+    body (WRig fake comp vm stops fatals) `finally` (releaseAll fake >> endWindows (wcProvider comp))
 
 -- | One bounded main-thread step.
 mainStep ∷ WRig → IO ()
@@ -143,7 +143,10 @@ swallowAdoption ∷ RequestEndpoint → RequestEndpoint
 swallowAdoption endpoint =
   endpoint
     { endpointSubmit = \submission →
-        endpointSubmit endpoint submission {submissionCompletion = Completion (swallowing (completeRequest (submissionCompletion submission)))}
+        -- The host never tells a provider whose reply it accepted to stop (that work is reported over), so the
+        -- cancel is not forwarded either: the provider must learn of the abandonment by itself.
+        (\work → work {workCancel = pure ()})
+          <$> endpointSubmit endpoint submission {submissionCompletion = Completion (swallowing (completeRequest (submissionCompletion submission)))}
     }
   where
     swallowing forward = \case

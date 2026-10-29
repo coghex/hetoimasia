@@ -67,6 +67,7 @@ module Hetoimasia.LuaEngine.Graphics.Window.Provider
   , WindowProvider
   , withWindowProvider
   , providerFatal
+  , endWindows
   , WindowDefect (..)
   , ProviderReading (..)
   , providerReading
@@ -1099,13 +1100,21 @@ withEvidence primary evidence = fromMaybe primary <$> composeCleanup (Just prima
 
 -- Close and drain --------------------------------------------------------------------------------------
 
-closeAndDrain ∷ WindowProvider target → IO ()
-closeAndDrain provider = do
+-- | Begin taking every window apart, adopted or not, and stop taking requests: what the session's stop and the
+-- provider's own scope exit do. Idempotent and nonblocking; the pump closes and retires each window, and the
+-- slots are returned at actual retirement as always. A harness calls it on every exit so a failed example
+-- cannot leave a teardown waiting on a window nobody will end.
+endWindows ∷ WindowProvider target → IO ()
+endWindows provider =
   atomically $ modifyState provider $ \st →
     st
       { psOpen = False
       , psAcqs = Map.map (\acq → acq {aEnd = Just (fromMaybe EndStopped (aEnd acq))}) (psAcqs st)
       }
+
+closeAndDrain ∷ WindowProvider target → IO ()
+closeAndDrain provider = do
+  endWindows provider
   remembered ← newIORef Nothing
   let keep caught = atomicModifyIORef' remembered (\held → (Just (fromMaybe caught held), ()))
       wait =
