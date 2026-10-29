@@ -4,9 +4,9 @@
 module Test.LuaEngine.Graphics.Window.Spec (spec) where
 
 import Control.Concurrent (throwTo)
-import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, retry)
+import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), finally)
-import Control.Monad (unless)
+import Control.Monad (unless, when)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest, validateBudgets)
@@ -16,6 +16,9 @@ import Hetoimasia.LuaEngine.Graphics.Window.Configuration
 import Hetoimasia.Runtime.GLFW (HostConfig (..), defaultHostConfig)
 import Hetoimasia.LuaEngine.Graphics.Window.Port
 import Hetoimasia.LuaEngine.Graphics.Window.Provider
+import Hetoimasia.Scripting.Lua.Admission (Necessity (OptionalRequest))
+import Hetoimasia.Scripting.Lua.Provider (advanceRequestEpoch)
+import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint)
 import Test.Hspec
 import qualified Test.LuaEngine.Graphics.Window.Coordinator as Coordinator
 import qualified Test.LuaEngine.Graphics.Window.Request as Request
@@ -392,6 +395,45 @@ abandonment = describe "abandonment and failed effects" $ do
             atomically (ownerSlotHeld ownerA) >>= (`shouldBe` True))
           `finally` (releaseAll fake >> atomically (modifyTVar' gate (const True)) >> endWindows (wcProvider comp))
 
+  it "survives an epoch change that settles a request after the host claimed its adoption: no success, no failure, one slot return, a fresh request succeeds" $ do
+    gate ← newTVarIO False
+    entered ← newTVarIO False
+    let hooks = ProviderHooks $ do
+          atomically (writeTVar entered True)
+          atomically (readTVar gate >>= \open → unless open retry)
+    withWRigHooked hooks id 2 [] $ \rig →
+      ( do
+          admit (wrComp rig) (wrVm rig) PresentationRole "a"
+          commandOpen (wrComp rig) (wrVm rig) "a" "a" "first" (640, 480)
+          _ ← awaitNoteContaining (wrComp rig) "a start a started"
+          attachNow rig
+          -- The owner claimed the recipe and holds it on its thread, before the provider's acquisition is looked at.
+          atomically (readTVar entered >>= \here → unless here retry)
+          -- The application advances the epoch: the request is cancelled, its claimed recipe preserved.
+          _ ← advanceRequestEpoch (scheduledEndpoint (vmOwner (wrVm rig)))
+          -- The provider sees an offered, never-adopted result whose request settled, and takes the window apart.
+          awaitProvider rig ((== 0) . readingAcquisitions)
+          slotHeld rig "a" >>= (`shouldBe` False)
+          eventCount rig "close w" >>= (`shouldBe` 1)
+          -- The recipe runs over a window that is gone: ordinary cancellation, not a failure of the host.
+          atomically (writeTVar gate True)
+          -- The instance is healthy: it asks again and succeeds; the slot was returned once (a second request is not
+          -- refused as occupied, and a third would be).
+          commandOpen (wrComp rig) (wrVm rig) "a" "b" "second" (640, 480)
+          _ ← awaitNoteContaining (wrComp rig) "a start b started"
+          attachNow rig
+          command (wrComp rig) (wrVm rig) "a" "wait_take" "b"
+          second ← awaitNoteContaining (wrComp rig) "a wait_take b"
+          second `shouldSatisfy` Text.isInfixOf "status=success"
+          -- The first request delivered no success.
+          command (wrComp rig) (wrVm rig) "a" "ptake" "a"
+          first ← awaitNoteContaining (wrComp rig) "a ptake a"
+          first `shouldSatisfy` (not . Text.isInfixOf "status=success")
+          fatalsNow rig >>= (`shouldBe` [])
+          slotHeld rig "a" >>= (`shouldBe` True)
+      )
+        `finally` atomically (writeTVar gate True)
+
   it "tolerates an adoption recipe that runs after the window was taken apart and forgotten" $ do
     fake ← newFake defaultFakeConfig
     withWindowProvider (WindowConfig 1 (pure ()) (\_ → pure ())) (fakePort fake) $ \provider → do
@@ -454,6 +496,28 @@ faults = describe "failures" $ do
       fmap snd (instanceFailure failure) `shouldSatisfy` maybe False (\why → "window_error" `Text.isInfixOf` why)
       fatalsNow rig >>= (`shouldBe` [])
       slotHeld rig "a" >>= (`shouldBe` False)
+
+  it "hands a clean creation refusal to a script that takes it as the exact bounded record (optional request), without failing it" $ do
+    fake ← newFake defaultFakeConfig
+    scriptCreate fake [CreateRefusedClean (Text.replicate 3000 "x")]
+    fatals ← newTVarIO []
+    let config = WindowConfig 2 (pure ()) (\found → atomically (modifyTVar' fatals (found :)))
+    bounded . withWinComp config (fakePort fake) $ \comp _ runtime → do
+      vm ← startWinVmFor OptionalRequest id comp runtime "vm"
+      admit comp vm PresentationRole "a"
+      commandOpen comp vm "a" "a" "t" (640, 480)
+      command comp vm "a" "wait_take" "a"
+      line ← awaitNoteContaining comp "a wait_take a"
+      -- The record the script is handed: a failure with the code and the message bounded to 2 KiB, and no root or path.
+      line `shouldSatisfy` Text.isInfixOf "status=failure"
+      line `shouldSatisfy` Text.isInfixOf "code=window_error"
+      line `shouldSatisfy` Text.isInfixOf ("message=" <> Text.replicate 2048 "x" <> "}")
+      line `shouldSatisfy` (not . Text.isInfixOf "root=")
+      line `shouldSatisfy` (not . Text.isInfixOf "path=")
+      -- An optional request's refusal is data: the slot is free again, nothing is latched, the instance goes on.
+      ownerA ← ownerOf vm "a"
+      atomically (ownerSlotHeld ownerA >>= \held → when held retry)
+      readTVarIO fatals >>= (`shouldBe` [])
 
   it "answers a target refused with a verified rollback as window_error, and still takes the window apart" $
     withWRig 2 [] $ \rig → do

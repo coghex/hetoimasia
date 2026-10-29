@@ -64,6 +64,9 @@
 module Hetoimasia.LuaEngine.Graphics.Window.Provider
   ( -- * The provider
     WindowConfig (..)
+  , ProviderHooks (..)
+  , noProviderHooks
+  , withWindowProviderWith
   , WindowProvider
   , withWindowProvider
   , providerFatal
@@ -84,6 +87,7 @@ module Hetoimasia.LuaEngine.Graphics.Window.Provider
     -- * The service
   , WindowService
   , windowService
+  , windowServiceFor
   , windowEndpointName
   , windowEndpoint
   , windowCodes
@@ -359,12 +363,25 @@ instance Exception WindowDefect
 -- window has retired or failed to. A cancellation delivered meanwhile is remembered and raised after
 -- the drain.
 withWindowProvider ∷ ∀ target a. Typeable target ⇒ WindowConfig → Port target → (WindowProvider target → IO a) → IO a
-withWindowProvider config port body
+withWindowProvider = withWindowProviderWith noProviderHooks
+
+-- | The coordination points the lifecycle examples use to hold a step at a precise place. Production uses 'noProviderHooks'.
+newtype ProviderHooks = ProviderHooks
+  { hookBeforeAdopt ∷ IO ()
+    -- ^ Run inside the adoption recipe, on the owner's thread, after the host claimed the recipe and before the provider
+    -- looks at its acquisition: the place a request that settles meanwhile (an epoch change) is observed.
+  }
+
+noProviderHooks ∷ ProviderHooks
+noProviderHooks = ProviderHooks (pure ())
+
+withWindowProviderWith ∷ ∀ target a. Typeable target ⇒ ProviderHooks → WindowConfig → Port target → (WindowProvider target → IO a) → IO a
+withWindowProviderWith hooks config port body
   | windowRecords config < 1 = throwIO (WindowDefect "a provider needs at least one work record")
   | otherwise = withWorkerGroup $ \group → do
       var ← newTVarIO (PState True 0 0 Map.empty Map.empty Nothing [] False Nothing 0)
       identity ← newUnique
-      let provider = WindowProvider config port var identity (adoptionFor var)
+      let provider = WindowProvider config port var identity (adoptionFor (hookBeforeAdopt hooks) var)
       result ← mask $ \restore → do
         outcome ← tryWithContext @SomeException $ restore $ do
           started ← startWorker group (workerDefinition "window-provider-pump" (\_ → pure ()) (\token () → pump provider token))
@@ -437,11 +454,21 @@ closeWindowOwner owner = atomically (writeTVar (ownerOpen owner) False)
 data WindowService target = WindowService
   { serviceRequests ∷ !M1Requests
   , serviceProvider ∷ !(WindowProvider target)
+  , serviceNecessity ∷ !Necessity
   }
 
 -- | The service over this request policy and provider.
+--
+-- Window acquisition is /required/: M1 has no optional window, and the graphics facade (LFE-21) builds its binding from
+-- this.
 windowService ∷ M1Requests → WindowProvider target → WindowService target
-windowService = WindowService
+windowService = windowServiceFor RequiredRequest
+
+-- | The same service with the necessity chosen. It exists for the examples that read a refusal's @take@ record: a required
+-- request's failure ends its instance at the next safe boundary whether it is read or not, so the record can only be handed to
+-- a script by an optional request. The facade uses 'windowService'; nothing in M1 offers an optional window to Lua.
+windowServiceFor ∷ Necessity → M1Requests → WindowProvider target → WindowService target
+windowServiceFor necessity requests provider = WindowService requests provider necessity
 
 -- | The endpoint's name in a grant.
 windowEndpointName ∷ Text
@@ -500,7 +527,7 @@ startWindow service ask context = mask $ \restore → do
     restore
       ( startM1
           (serviceRequests service)
-          (windowAsk provider prepared)
+          (windowAsk (serviceNecessity service) provider prepared)
           context
           windowEndpointName
           [VInteger (fromIntegral (prepToken prepared))]
@@ -540,7 +567,7 @@ windowArgumentCheck service askOf owner values = do
         | otherwise → Nothing
   case refusal of
     Just why → pure (Just why)
-    Nothing → m1ArgumentCheck (serviceRequests service) (const (windowBaseAsk (askedOwner ask))) owner values
+    Nothing → m1ArgumentCheck (serviceRequests service) (const (windowBaseAsk (serviceNecessity service))) owner values
 
 -- | The service's own permanent facts, in the order they are decided.
 refusalOf ∷ WindowProvider target → WindowOwner → Bool → Bool → Maybe Text
@@ -552,16 +579,16 @@ refusalOf provider owner open taking
   | otherwise = Nothing
 
 -- The ask without credits, for the permanent-refusal check that reserves nothing.
-windowBaseAsk ∷ WindowOwner → M1Ask
-windowBaseAsk _ =
-  (m1Ask RequiredRequest "window")
+windowBaseAsk ∷ Necessity → M1Ask
+windowBaseAsk necessity =
+  (m1Ask necessity "window")
     { askOffset = Nothing
     , askCodes = windowCodes
     , askLease = Just (InstanceOwned, composeWindow)
     }
 
-windowAsk ∷ WindowProvider target → Prepared → M1Ask
-windowAsk provider prepared = (windowBaseAsk (chargeOwner (prepCharge prepared))) {askCredits = requestCredits provider prepared}
+windowAsk ∷ Necessity → WindowProvider target → Prepared → M1Ask
+windowAsk necessity provider prepared = (windowBaseAsk necessity) {askCredits = requestCredits provider prepared}
 
 composeWindow ∷ Value → Word64 → Value
 composeWindow _ key = VCapability (capability windowHandleType key)
@@ -1022,13 +1049,13 @@ withLeaseOr' leases key refused use = withLeaseOr leases key refused use
 -- reserved. Adopting marks the acquisition the lease's; releasing it (the instance ended or released the
 -- lease) begins the close and hands the host the provider's own reading of the retirement. The slot is
 -- returned by the pump at actual retirement, never by this release.
-adoptionFor ∷ ∀ target. Typeable target ⇒ TVar PState → Word64 → WindowToken → target → WindowOwner → Adoption
-adoptionFor var key tok target owner =
+adoptionFor ∷ ∀ target. Typeable target ⇒ IO () → TVar PState → Word64 → WindowToken → target → WindowOwner → Adoption
+adoptionFor before var key tok target owner =
   Adoption $ \retirements →
     acquirePart
       "window"
       (releaseRank 0)
-      (adoptWindowIn var key tok target owner)
+      (before >> adoptWindowIn var key tok target owner)
       (releaseResource var key retirements)
 
 -- | Build the resource into the lease. The host may run a recipe it had already claimed after the request settled

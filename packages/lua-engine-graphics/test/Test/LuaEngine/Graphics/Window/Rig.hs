@@ -7,6 +7,7 @@ module Test.LuaEngine.Graphics.Window.Rig
   ( WRig (..)
   , withWRig
   , withWRigWrapped
+  , withWRigHooked
   , swallowAdoption
   , mainStep
   , attachNow
@@ -55,12 +56,16 @@ withWRig = withWRigWrapped id
 
 -- | The same with the window endpoint passed through a function (see 'swallowAdoption').
 withWRigWrapped ∷ (RequestEndpoint → RequestEndpoint) → Int → [Hold] → (WRig → IO a) → IO a
-withWRigWrapped wrap records holds body = do
+withWRigWrapped = withWRigHooked noProviderHooks
+
+-- | The same with the provider's hooks.
+withWRigHooked ∷ ProviderHooks → (RequestEndpoint → RequestEndpoint) → Int → [Hold] → (WRig → IO a) → IO a
+withWRigHooked hooks wrap records holds body = do
   fake ← newFake (FakeConfig holds)
   stops ← newTVarIO 0
   fatals ← newTVarIO []
   let config = WindowConfig records (atomically (modifyTVar' stops (+ 1))) (\found → atomically (modifyTVar' fatals (found :)))
-  bounded . withWinComp config (fakePort fake) $ \comp _ runtime → do
+  bounded . withWinCompWith hooks config (fakePort fake) $ \comp _ runtime → do
     vm ← startWinVmWith wrap comp runtime "window-vm"
     body (WRig fake comp vm stops fatals) `finally` (releaseAll fake >> endWindows (wcProvider comp))
 

@@ -10,11 +10,13 @@ module Test.LuaEngine.Graphics.Windows
   ( -- * The session
     WinComp (..)
   , withWinComp
+  , withWinCompWith
 
     -- * One VM
   , WinVm (..)
   , startWinVm
   , startWinVmWith
+  , startWinVmFor
   , admit
   , stopInstance
   , command
@@ -64,7 +66,7 @@ import Hetoimasia.Runtime.Supervision
   , withSupervision
   )
 import qualified Hetoimasia.Runtime.Supervision as Supervision
-import Hetoimasia.Scripting.Lua.Admission (admittedHandleType, newRequestHandles)
+import Hetoimasia.Scripting.Lua.Admission (Necessity (RequiredRequest), admittedHandleType, newRequestHandles)
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Lease (Leases, ScopeSummary, instanceLeases, leaseCapabilityType, newLeases)
 import Hetoimasia.Scripting.Lua.Lending (newLending)
@@ -90,8 +92,12 @@ compositionProfile = fixedM1Profile
 
 -- | Run a body over a provider of this port and configuration, real supervision and a Lua runtime.
 withWinComp ∷ Typeable target ⇒ WindowConfig → Port target → (WinComp target → RuntimeControl → LuaRuntime → IO a) → IO a
-withWinComp config port body =
-  withWindowProvider config port $ \provider → do
+withWinComp = withWinCompWith noProviderHooks
+
+-- | The same with the provider's hooks.
+withWinCompWith ∷ Typeable target ⇒ ProviderHooks → WindowConfig → Port target → (WinComp target → RuntimeControl → LuaRuntime → IO a) → IO a
+withWinCompWith hooks config port body =
+  withWindowProviderWith hooks config port $ \provider → do
     comp ← WinComp provider <$> newTVarIO [] <*> newIORef Map.empty <*> newIORef Map.empty
     withLoggingLifetime quietLogger $ \lifetime →
       withSupervision lifetime $ \control → do
@@ -132,10 +138,14 @@ startWinVm = startWinVmWith id
 -- | The same, with the window endpoint passed through this function: the lifecycle suite wraps it to swallow an
 -- adoption reply, so a cancellation can overtake the build the host never gets to run.
 startWinVmWith ∷ ∀ target. Typeable target ⇒ (RequestEndpoint → RequestEndpoint) → WinComp target → LuaRuntime → Text → IO (WinVm target)
-startWinVmWith wrap comp runtime label = do
+startWinVmWith = startWinVmFor RequiredRequest
+
+-- | The same with the service's necessity chosen (see 'windowServiceFor').
+startWinVmFor ∷ ∀ target. Typeable target ⇒ Necessity → (RequestEndpoint → RequestEndpoint) → WinComp target → LuaRuntime → Text → IO (WinVm target)
+startWinVmFor necessity wrap comp runtime label = do
   handles ← newRequestHandles
   requests ← either (\refused → assertFailure ("the profile was refused: " <> show refused)) pure (m1Requests compositionProfile handles)
-  let service = windowService requests (wcProvider comp)
+  let service = windowServiceFor necessity requests (wcProvider comp)
   lending ← newLending
   leases ← newLeases lending 16
   owners ← newIORef Map.empty
@@ -270,6 +280,9 @@ driverSource =
       , "    local r = request.take(self.hs[key])"
       , "    if r.status == 'success' then self.ws[key] = r.value end"
       , "    out = fmt(r)"
+      , "  elseif p.op == 'ptake' then"
+      , "    local ok, r = pcall(request.take, self.hs[key])"
+      , "    if ok then out = fmt(r) else out = 'error ' .. tostring(r) end"
       , "  elseif p.op == 'ready' then out = tostring(request.ready(self.hs[key]))"
       , "  elseif p.op == 'wait' then request.wait(self.hs[key]) out = 'waited'"
       , "  elseif p.op == 'cancel' then out = request.cancel(self.hs[key])"

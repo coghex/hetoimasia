@@ -29,6 +29,7 @@ import Hetoimasia.LuaEngine.Facade (OutputSink (..), withOutput)
 import Hetoimasia.LuaEngine.Graphics.Window.Port (CreateOutcome (..), Fatal (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Provider
 import Hetoimasia.LuaEngine.Graphics.Window.Session (sessionWindowConfig)
+import Hetoimasia.LuaEngine.Manifest (Role (Presentation))
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.LuaEngine.Session
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
@@ -76,10 +77,11 @@ spec = describe "on the real session coordinator" $ do
         admit comp vm PresentationRole "a"
         commandOpen comp vm "a" "a" "t" (640, 480)
         attachWhenReady comp
-        command comp vm "a" "wait_take" "a"
-        line ← awaitNoteContaining comp "a wait_take a"
-        line `shouldSatisfy` Text.isInfixOf "status=success"
-        -- Ready, and the one work record is still the request's: the ordinary capacity is full.
+        -- Wait for the settlement without taking the result: a taken result lets the host return the provider's work
+        -- record, and the bank must stay exhausted for this example.
+        command comp vm "a" "wait" "a"
+        _ ← awaitNoteContaining comp "a wait a waited"
+        atomically (providerReading (wcProvider comp)) >>= \found → readingRecords found `shouldBe` 1
         nativeClose fake 1
         atomically (sessionOutcomeNow session >>= \found → unless (outQuit found) retry)
         -- A newer request from the same window routes again; the endpoint is idempotent and the quit is unchanged.
@@ -88,6 +90,32 @@ spec = describe "on the real session coordinator" $ do
     outVerdict outcome `shouldBe` VerdictSuccess
     outQuit outcome `shouldBe` True
     outFailures outcome `shouldBe` []
+
+  it "keeps an earlier primary failure when a failed destruction follows it: the session's primary is unchanged, the provider retains the cleanup failure, and the window is closed once" $ do
+    outcome ← runWithSession $ \session → do
+      fake ← newFake defaultFakeConfig
+      raisesWindowDefect . withWinComp (sessionWindowConfig session 2) (fakePort fake) $ \comp _ runtime → do
+        vm ← startWinVm comp runtime "coordinator-vm"
+        admit comp vm PresentationRole "a"
+        commandOpen comp vm "a" "a" "t" (640, 480)
+        attachWhenReady comp
+        awaitFake fake ((== 1) . readingAttached)
+        -- A distinct primary failure is latched first; the window's destruction fails afterwards.
+        first ← latchTerminalFailure session (newRoleFailure HostFailure OnEngine Presentation "the earlier primary")
+        first `shouldBe` True
+        failNativeDisposal fake
+        endWindows (wcProvider comp)
+        -- The provider keeps the cleanup failure as its own evidence (the session takes one terminal failure and
+        -- acknowledges a later one without replacing the first).
+        retained ← atomically (providerFatal (wcProvider comp) >>= maybe retry pure)
+        retained `shouldSatisfy` \found → case found of
+          CleanupFatal _ → True
+          Fatal _ → False
+        events fake >>= \seen → length (filter (Text.isInfixOf "close w") seen) `shouldBe` 1
+    fmap eeMessage (erPrimary (outEngine outcome)) `shouldBe` Just "the earlier primary"
+    fmap eeCode (erPrimary (outEngine outcome)) `shouldBe` Just HostFailure
+    fmap rfMessage (outTerminal outcome) `shouldBe` Just "the earlier primary"
+    outVerdict outcome `shouldBe` VerdictFailure
 
   it "latches a failed native destruction as the session's cleanup_failure" $ do
     outcome ← runWithSession $ \session → do
