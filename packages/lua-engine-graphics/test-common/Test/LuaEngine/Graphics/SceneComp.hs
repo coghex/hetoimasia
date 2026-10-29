@@ -43,6 +43,7 @@ module Test.LuaEngine.Graphics.SceneComp
 
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
 import Control.Monad (unless, when)
+import Data.Functor ((<&>))
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -74,7 +75,7 @@ import Hetoimasia.LuaEngine.Profile
   , countLimit
   )
 import Hetoimasia.LuaEngine.Request
-import Hetoimasia.LuaEngine.Scene (SceneLimits, prepareScene, sceneLimits)
+import Hetoimasia.LuaEngine.Scene (SceneLimits, prepareScene, sceneLimits, sceneSchema)
 import Hetoimasia.LuaEngine.Texture hiding (PresentationRole)
 import qualified Hetoimasia.LuaEngine.Texture as Tex (TextureRole (PresentationRole))
 import Hetoimasia.Render.TwoD.Vulkan.Textures (Textures)
@@ -234,7 +235,7 @@ bindings comp limits vm =
   , namespace "wrq" (m1RequestBindings (M1Service windowRequests windowValueSchema))
   , namespace "tex" [loading, releasing]
   , namespace "win" [opening]
-  , namespace "scn" [graphicsPublishBindingWith (hooksOf vm) "publish" (vmPublisher vm) limits (vmLeases vm), fullScene]
+  , namespace "scn" [graphicsPublishBindingWith (hooksOf vm) "publish" (vmPublisher vm) limits (vmLeases vm), fullScene, raced]
   ]
   where
     log' = cpLog (scTexture comp)
@@ -303,6 +304,20 @@ bindings comp limits vm =
               publishScene (vmPublisher vm) (capabilityKey window) prepared >>= \case
                 Published → pure []
                 Refused refusal → ioError (userError (Text.unpack (publishRefusalText refusal)))
+        _ → pure []
+    -- A release that lands between the scene's preparation and the publication boundary, on the instance's own thread
+    -- where a script's next statement could not: the preparation succeeds, the texture is released, and the
+    -- operation is asked to publish the stale preparation. The answer is the operation's, as text.
+    raced =
+      stateOperation "publish_raced" [SCapability windowHandleType, sceneSchema, SCapability textureHandleType] [SText] $ \arguments → case arguments of
+        [VCapability window, scene, VCapability texture] →
+          prepareScene limits (vmLeases vm) scene >>= \case
+            Left refusal → ioError (userError (show refusal))
+            Right prepared → do
+              _ ← releaseTexture (vmLeases vm) (capabilityKey texture)
+              publishScene (vmPublisher vm) (capabilityKey window) prepared <&> \case
+                Published → [VText "published"]
+                Refused refusal → [VText ("refused: " <> publishRefusalText refusal)]
         _ → pure []
     loadFrom ∷ [Value] → IO (Either Text TextureRequest)
     loadFrom = \case
@@ -391,6 +406,8 @@ driverSource =
       , "    local ok, err = pcall(scn.publish, self.ws[key], s)"
       , "    out = ok and 'published' or ('error ' .. tostring(err))"
       , "  elseif p.op == 'publish_full' then scn.publish_full(self.ws[key], self.ts.a) out = 'published'"
+      , "  elseif p.op == 'praced' then"
+      , "    out = scn.publish_raced(self.ws[key], scene(self, p, self.ts), self.ts.a)"
       , "  elseif p.op == 'mutate' then"
       , "    local s = scene(self, p, self.ts)"
       , "    scn.publish(self.ws[key], s)"

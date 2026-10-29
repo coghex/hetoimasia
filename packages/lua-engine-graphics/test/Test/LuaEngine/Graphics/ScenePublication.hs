@@ -96,6 +96,18 @@ spec = describe "scene publication" $ do
       foreignWindow `shouldSatisfy` Text.isInfixOf "error"
       forM_ [winA, winC] $ \window → publishedRevision (pubModel pub) window `shouldReturn` 0
 
+  it "checks the texture again at the boundary: a release that lands after the preparation refuses the whole publication" $
+    withPublication $ \pub → do
+      ready pub "a"
+      loaded pub "a" "a" "a.png"
+      _ ← run pub "a" "publish" "a" (Just "a")
+      previous ← latest pub winA
+      -- The preparation succeeded; the texture is released before the boundary; the boundary refuses it whole.
+      line ← run pub "a" "praced" "a" (Just "a")
+      line `shouldSatisfy` Text.isInfixOf "refused: texture 1 refused"
+      publishedRevision (pubModel pub) winA `shouldReturn` 1
+      latest pub winA `shouldReturn` previous
+
   it "copies the scene it is given: later edits to the source tables change nothing" $
     withPublication $ \pub → do
       ready pub "a"
