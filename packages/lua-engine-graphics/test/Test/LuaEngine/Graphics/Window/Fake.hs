@@ -24,6 +24,8 @@ module Test.LuaEngine.Graphics.Window.Fake
   , setCloseFull
   , drainOnNextFull
   , raiseOnIssue
+  , raiseOnOutcome
+  , awaitIssueThread
   , IssueRaise (..)
 
     -- * Scripting
@@ -43,7 +45,9 @@ module Test.LuaEngine.Graphics.Window.Fake
   , awaitEvent
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
+import Control.Concurrent (ThreadId, myThreadId)
+import Control.Concurrent.STM (STM, TVar, atomically, newTVarIO, readTVar, readTVarIO, retry, throwSTM, writeTVar)
+import Control.Exception (ErrorCall (ErrorCall))
 import Control.Monad (unless, when)
 import qualified Data.Map.Strict as Map
 import Data.Map.Strict (Map)
@@ -63,6 +67,8 @@ data Hold
     HoldAttach
   | -- | The owner has not yet answered for the attachment (still constructing).
     HoldAdmit
+  | -- | The pump is held inside the issue of a creation command, where the example can interrupt its thread.
+    HoldIssue
   | -- | Graphics use and the attachment do not retire.
     HoldGraphics
   | -- | The native window is not destroyed.
@@ -91,6 +97,8 @@ data FS = FS
   , fsCloseFull ∷ !Bool
   , fsDrainOnFull ∷ !Bool
   , fsRaiseIssue ∷ !(Maybe IssueRaise)
+  , fsRaiseOutcome ∷ !Bool
+  , fsIssueThread ∷ !(Maybe ThreadId)
   , fsNext ∷ !Word64
   , fsCreates ∷ !(Map Word64 (Text, Int, Int, Maybe WindowToken))
   , fsWindows ∷ !(Map Word64 Win)
@@ -106,7 +114,7 @@ data FS = FS
 newtype Fake = Fake (TVar FS)
 
 newFake ∷ FakeConfig → IO Fake
-newFake cfg = Fake <$> newTVarIO (FS (Set.fromList (fcHolds cfg)) False False False Nothing 1 Map.empty Map.empty [] [] [] StandingUsable Nothing 0 0)
+newFake cfg = Fake <$> newTVarIO (FS (Set.fromList (fcHolds cfg)) False False False Nothing False Nothing 1 Map.empty Map.empty [] [] [] StandingUsable Nothing 0 0)
 
 modify ∷ Fake → (FS → FS) → STM ()
 modify (Fake var) change = readTVar var >>= \st → writeTVar var (change st) {fsVersion = fsVersion st + 1}
@@ -139,6 +147,14 @@ drainOnNextFull fake = atomically (modify fake (\st → st {fsDrainOnFull = True
 -- | Where the next creation issue raises.
 data IssueRaise = RaiseBeforeIssue | RaiseAfterIssue
   deriving (Eq, Show)
+
+-- | Reading a creation's outcome raises, as a faulty observation does.
+raiseOnOutcome ∷ Fake → IO ()
+raiseOnOutcome fake = atomically (modify fake (\st → st {fsRaiseOutcome = True}))
+
+-- | The thread the pump is held on inside the issue of a creation command (needs 'HoldIssue').
+awaitIssueThread ∷ Fake → IO ThreadId
+awaitIssueThread (Fake var) = atomically (readTVar var >>= maybe retry pure . fsIssueThread)
 
 raiseOnIssue ∷ Fake → IssueRaise → IO ()
 raiseOnIssue fake how = atomically (modify fake (\st → st {fsRaiseIssue = Just how}))
@@ -181,6 +197,11 @@ fakePort ∷ Fake → Port ()
 fakePort fake@(Fake var) =
   Port
     { portIssueCreate = \title width height → do
+       tid ← myThreadId
+       heldHere ← atomically $ do
+        st ← readTVar var
+        if Set.member HoldIssue (fsHolds st) then modify fake (\now → now {fsIssueThread = Just tid}) >> pure True else pure False
+       when heldHere (atomically (readTVar var >>= \st → when (Set.member HoldIssue (fsHolds st)) retry))
        attempt ← atomically $ do
         st ← readTVar var
         modify fake (note "attempt issue")
@@ -199,6 +220,7 @@ fakePort fake@(Fake var) =
        pure issued
     , portCreateOutcome = \(CreateToken number) → do
         st ← readTVar var
+        when (fsRaiseOutcome st) (throwSTM (ErrorCall "reading a creation's outcome raised"))
         case Map.lookup number (fsCreates st) of
           Nothing → pure (Just (CreateFatal (Fatal "unknown creation")))
           Just (title, width, height, made)
@@ -244,7 +266,9 @@ fakePort fake@(Fake var) =
     , portBeginClose = \(WindowToken key) → atomically $ do
         st ← readTVar var
         if fsCloseFull st
-          then pure CloseQueueFull
+          then do
+            when (fsDrainOnFull st) (modify fake (\now → now {fsCloseFull = False, fsDrainOnFull = False}))
+            pure CloseQueueFull
           else case Map.lookup key (fsWindows st) of
             Nothing → pure CloseGone
             Just win
@@ -272,11 +296,7 @@ fakePort fake@(Fake var) =
           Just win | winAttached win, not (winClosing win), fsStanding st == StandingUsable, not (Set.member HoldAdmit (fsHolds st)) → Just ()
           _ → Nothing
     , portOwnerFailure = fsOwnerFailure <$> readTVar var
-    , portProgress = do
-        before ← fsVersion <$> readTVar var
-        pure $ do
-          now ← fsVersion <$> readTVar var
-          when (now == before) retry
+    , portQueueRoom = (\st → not (fsCreateFull st || fsCloseFull st)) <$> readTVar var
     , portWakeMain = atomically (modify fake (\st → st {fsWakes = fsWakes st + 1}))
     }
   where

@@ -21,18 +21,19 @@ module Test.LuaEngine.Graphics.Window.Rig
   , openAndReady
   , openAndSettle
   , raisesWindowDefect
+  , raisesExpected
   , eventCount
   ) where
 
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
-import Control.Exception (finally, try)
+import Control.Exception (SomeException, finally, fromException, throwIO, try)
 import Control.Monad (unless)
 import qualified Data.Text as Text
 import Data.Text (Text)
 import Hetoimasia.LuaEngine.Graphics.Window.Port (Fatal)
 import Hetoimasia.LuaEngine.Graphics.Window.Provider
 import Hetoimasia.Scripting.Lua.Provider (Completion (..), ProviderReply (..), ProviderWork (..), ReplyAnswer (..), RequestEndpoint (..), Submission (..))
-import Test.HUnit.Lang (assertFailure)
+import Test.HUnit.Lang (HUnitFailure, assertFailure)
 import Test.LuaEngine.Graphics.Rig (bounded)
 import Test.LuaEngine.Graphics.Window.Fake
 import Test.LuaEngine.Graphics.Windows
@@ -152,3 +153,14 @@ swallowAdoption endpoint =
     swallowing forward = \case
       ProviderResource {} → pure ReplyAdoption
       other → forward other
+
+-- | Run an example whose scope is expected to raise /something/ at its exit (a pump that failed, whatever supervision
+-- then makes of the instances it left): an assertion failure of the example itself is never swallowed, and the
+-- scope returning normally is a failure.
+raisesExpected ∷ IO a → IO ()
+raisesExpected action =
+  try @SomeException action >>= \case
+    Left raised
+      | Just (failure ∷ HUnitFailure) ← fromException raised → throwIO failure
+      | otherwise → pure ()
+    Right _ → assertFailure "the scope returned although it was expected to raise"

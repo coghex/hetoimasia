@@ -26,8 +26,8 @@
 --
 -- A port never sleeps and never polls. Every fact the provider waits for is read in a transaction
 -- (a ticket's outcome, a standing, a window's own close observation, a retirement reading), so the
--- provider's one pump wakes when the variable it read changes. 'portProgress' covers a fact no
--- variable of the provider's own carries.
+-- provider's one pump wakes when the variable it read changes. 'portQueueRoom' is the capacity of the
+-- host's command queue, a state rather than a change.
 module Hetoimasia.LuaEngine.Graphics.Window.Port
   ( -- * The port
     Port (..)
@@ -105,9 +105,10 @@ data Port target = Port
     -- ^ The capability to publish a scene to this window's incarnation, once its target is usable.
   , portOwnerFailure ∷ STM (Maybe Fatal)
     -- ^ A terminal failure of the session's graphics or window owner, if one has latched.
-  , portProgress ∷ STM (STM ())
-    -- ^ A reading of the hosts' recorded progress, answering a transaction that does not return
-    -- until the progress has changed since: a retirement recorded, a disposal made.
+  , portQueueRoom ∷ STM Bool
+    -- ^ Whether the host's bounded command queue has room for a command now. A state, not a change: a queue
+    -- that filled and drained between a refusal and the reading cannot be missed, because the reading is of the
+    -- capacity itself. The provider waits on it, in the transaction that decides, for a command the queue refused.
   , portWakeMain ∷ IO ()
     -- ^ Ask the process main thread's owner loop for a turn, so 'portAttach' work is served without
     -- a Lua poll, a frame or a texture. Nonblocking.

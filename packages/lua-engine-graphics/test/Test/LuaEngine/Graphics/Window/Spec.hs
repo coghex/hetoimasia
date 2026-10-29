@@ -3,7 +3,9 @@
 -- the native suite's.
 module Test.LuaEngine.Graphics.Window.Spec (spec) where
 
+import Control.Concurrent (throwTo)
 import Control.Concurrent.STM (atomically)
+import Control.Exception (AsyncException (ThreadKilled))
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest, validateBudgets)
@@ -319,12 +321,13 @@ abandonment = describe "abandonment and failed effects" $ do
       line ← awaitNoteContaining (wrComp rig) "a wait_take a"
       line `shouldSatisfy` Text.isInfixOf "status=success"
       eventCount rig "issue create" >>= (`shouldBe` 1)
+      -- The close is refused for a full queue, and the queue drains in the same step, before any waiter could be
+      -- installed: the provider waits on the queue's room, not on a change of it, so it closes all the same.
       setCloseFull (wrFake rig) True
+      drainOnNextFull (wrFake rig)
       stopInstance (wrComp rig) (wrVm rig) "a"
-      -- Closing is refused for a full queue; opening the queue lets it through and the window retires.
-      awaitFake (wrFake rig) ((== 1) . readingWindows)
-      setCloseFull (wrFake rig) False
       awaitProvider rig ((== 0) . readingAcquisitions)
+      eventCount rig "close w" >>= (`shouldBe` 1)
 
   it "raises a retained retirement failure at a clean scope exit and lets the pump stop, with no earlier exception" $
     raisesWindowDefect . withWRig 2 [HoldAdmit] $ \rig → do
@@ -337,6 +340,25 @@ abandonment = describe "abandonment and failed effects" $ do
       _ ← awaitNoteContaining (wrComp rig) "a cancel a cancelled"
       awaitFatalCount rig 1
       slotHeld rig "a" >>= (`shouldBe` True)
+
+  it "makes a pump that failed reading an outcome leave its acquisitions as retained evidence, slots held, so the drain and teardown proceed" $
+    raisesExpected . withWRig 2 [] $ \rig → do
+      raiseOnOutcome (wrFake rig)
+      admit (wrComp rig) (wrVm rig) PresentationRole "a"
+      commandOpen (wrComp rig) (wrVm rig) "a" "a" "t" (640, 480)
+      awaitFatalCount rig 1
+      slotHeld rig "a" >>= (`shouldBe` True)
+      atomically (providerReading (wcProvider (wrComp rig))) >>= (`shouldSatisfy` (not . readingOpen))
+
+  it "does the same when the pump's thread is interrupted asynchronously" $
+    raisesExpected . withWRig 2 [HoldIssue] $ \rig → do
+      admit (wrComp rig) (wrVm rig) PresentationRole "a"
+      commandOpen (wrComp rig) (wrVm rig) "a" "a" "t" (640, 480)
+      pump ← awaitIssueThread (wrFake rig)
+      throwTo pump ThreadKilled
+      awaitFatalCount rig 1
+      slotHeld rig "a" >>= (`shouldBe` True)
+      atomically (providerReading (wcProvider (wrComp rig))) >>= (`shouldSatisfy` (not . readingOpen))
 
   it "never repeats a failed effect: an issue that raised is attempted once, before or after admission" $
     mapM_ raised [RaiseBeforeIssue, RaiseAfterIssue]
@@ -388,6 +410,10 @@ faults = describe "failures" $ do
       awaitFatalCount rig 1
       notes (wrComp rig) >>= \seen → filter (Text.isInfixOf "window_error") seen `shouldBe` []
       eventCount rig "issue create" >>= (`shouldBe` 1)
+      -- An interrupted creation may have registered a window: it is uncertain, not retired, so its slot stays held
+      -- and the acquisition stays as evidence for the host's teardown.
+      slotHeld rig "a" >>= (`shouldBe` True)
+      atomically (providerReading (wcProvider (wrComp rig))) >>= (`shouldSatisfy` ((== 1) . readingAcquisitions))
 
   it "latches an owner failure as fatal" $
     raisesWindowDefect . withWRig 2 [] $ \rig → do

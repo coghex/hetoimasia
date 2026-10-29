@@ -43,7 +43,6 @@ import Control.Concurrent.STM
   , atomically
   , newTVarIO
   , readTVar
-  , retry
   , writeTVar
   )
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask_)
@@ -63,6 +62,7 @@ import Hetoimasia.GLFW.Command
   , CompletionTicket
   , Disposition (..)
   , SubmitResult (..)
+  , CommandStatistics (..)
   , WindowClient
   , WindowCommandPort
   , clientObservations
@@ -186,11 +186,7 @@ newHostPort vulkan = do
       , portRetirement = retirement vulkan var
       , portTarget = target vulkan var
       , portOwnerFailure = ownerFailure vulkan
-      , portProgress = do
-          before ← hostCommandStatistics (vulkanWindowHost vulkan)
-          pure $ do
-            now ← hostCommandStatistics (vulkanWindowHost vulkan)
-            when (now == before) retry
+      , portQueueRoom = (\stats → commandsPending stats < commandsCapacity stats) <$> hostCommandStatistics (vulkanWindowHost vulkan)
       , portWakeMain = wakeGraphicsHost (vulkanGraphicsOwner vulkan)
       }
 

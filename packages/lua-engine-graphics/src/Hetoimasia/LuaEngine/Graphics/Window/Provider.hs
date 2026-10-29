@@ -112,7 +112,6 @@ import Control.Concurrent.STM
   , atomically
   , newTVar
   , newTVarIO
-  , orElse
   , readTVar
   , retry
   , throwSTM
@@ -309,10 +308,10 @@ data Acq = Acq
   , aSettled ∷ STM Bool
     -- ^ The host's read of whether the request has settled (or is gone): how an offered result that no lease
     -- will ever build is found without waiting for a settled result to be taken or discarded.
-  , aWait ∷ !(Maybe (STM ()))
-    -- ^ Until this returns, the acquisition waits on the hosts' bounded progress (a full command queue):
-    -- read in the pump's own transaction, so the pump wakes when the progress changes and no other
-    -- acquisition waits behind it.
+  , aWaiting ∷ !Bool
+    -- ^ The host's bounded command queue refused the last issue or close: the acquisition waits until the queue
+    -- has room, read in the pump's own transaction (the capacity itself, not a change of it), so the pump wakes
+    -- when room appears and no other acquisition waits behind it.
   }
 
 -- | A request admitted by the host, between its prepared holdings and its record.
@@ -705,7 +704,7 @@ accept provider token completion settled = do
                 , aRetired = False
                 , aRetireFailed = Nothing
                 , aSettled = settled
-                , aWait = Nothing
+                , aWaiting = False
                 }
         writeTVar (wpState provider) st {psAcqs = Map.insert token acq (psAcqs st)}
         pure True
@@ -763,8 +762,17 @@ pump provider token = mask $ \restore → do
   case outcome of
     Right () → pure ()
     Left caught → do
-      atomically (modifyState provider (\st → st {psPumpFailure = Just (fromMaybe caught (psPumpFailure st))}))
-      latchFatal provider (Fatal "the window provider's pump failed and advances nothing again")
+      -- The pump will advance nothing again. Admission closes and every acquisition becomes terminal evidence: no
+      -- retirement is claimed (a pump cannot prove what it did not observe), no slot is freed, and the drain, the
+      -- leases' readings and the protected host's teardown can proceed instead of waiting for a thread that is gone.
+      let found = Fatal "the window provider's pump failed and advances nothing again"
+      atomically . modifyState provider $ \st →
+        st
+          { psPumpFailure = Just (fromMaybe caught (psPumpFailure st))
+          , psOpen = False
+          , psAcqs = Map.map (\acq → acq {aRetireFailed = Just (fromMaybe found (aRetireFailed acq))}) (psAcqs st)
+          }
+      latchFatal provider found
       rethrowIO caught
   where
     loop = atomically (nextStep provider token) >>= \case
@@ -842,10 +850,11 @@ stepOf provider key acq
       Open tok progress → openStep tok progress
       Over → retireOver >> pure (Just StepProgress)
     -- A request held back by a full host queue waits for the queue's progress without holding up any other.
-    gated proceed = case aWait acq of
-      Nothing → proceed
-      Just waiting →
-        (waiting >> putAcq provider key acq {aWait = Nothing} >> pure (Just StepProgress)) `orElse` pure Nothing
+    gated proceed
+      | not (aWaiting acq) = proceed
+      | otherwise =
+          portQueueRoom port >>= \room →
+            if room then putAcq provider key acq {aWaiting = False} >> pure (Just StepProgress) else pure Nothing
     retireOver = putAcq provider key acq {aPhase = Over, aRetired = True}
     created = \case
       Created tok → do
@@ -857,7 +866,12 @@ stepOf provider key acq
             pure (StepIO (Just key) (answerFailure acq why))
         | otherwise → retireOver >> pure StepProgress
       CreateNotExecuted → retireOver >> pure StepProgress
-      CreateFatal found → latchSTM provider found >> retireOver >> pure StepProgress
+      -- Uncertain, not retired: an interrupted creation may have registered a window, and a rollback may have failed.
+      -- It stays as terminal evidence with its slot held, for the protected host's teardown to account for.
+      CreateFatal found → do
+        latchSTM provider found
+        putAcq provider key acq {aPhase = Over, aRetireFailed = Just found}
+        pure StepProgress
     openStep tok progress = do
       requested ← portCloseRequest port tok
       if requested > aRouted acq
@@ -916,15 +930,12 @@ issue provider key acq = mask_ $ do
   let request = aRequest acq
   -- Masked throughout: the port's issue is a nonblocking submission, and nothing may be delivered between the
   -- host queue taking the command and this record holding its token.
-  -- The baseline of the host queue's progress is taken before the attempt: a queue drained between a refusal and a
-  -- later sample would otherwise be waited on for a change that already happened.
-  baseline ← atomically (portProgress (wpPort provider))
   issued ← portIssueCreate (wpPort provider) (requestTitle request) (requestWidth request) (requestHeight request)
   case issued of
     CreateIssued ticket → atomically (updateAcq provider key (\current → current {aPhase = Issued ticket}))
     CreateQueueFull ->
       -- Pressure: the accepted request stays queued, bounded, and is issued again when the queue changes.
-      atomically (updateAcq provider key (\current → current {aWait = Just baseline}))
+      atomically (updateAcq provider key (\current → current {aWaiting = True}))
     CreateClosed → atomically (updateAcq provider key (\current → current {aEnd = Just (fromMaybe EndStopped (aEnd current))}))
     CreateFault found → do
       atomically (latchSTM provider found >> updateAcq provider key (\current → current {aEnd = Just EndFault}))
@@ -947,11 +958,10 @@ closeAdmission provider = modifyState provider $ \st → st {psOpen = False}
 -- | Begin the close of an open window, once.
 beginClose ∷ WindowProvider target → Word64 → WindowToken → IO ()
 beginClose provider key tok = do
-  baseline ← atomically (portProgress (wpPort provider))
   portBeginClose (wpPort provider) tok >>= \case
     CloseBegun → mark
     CloseGone → mark
-    CloseQueueFull → atomically (updateAcq provider key (\acq → acq {aWait = Just baseline}))
+    CloseQueueFull → atomically (updateAcq provider key (\acq → acq {aWaiting = True}))
     CloseFault found → atomically (latchSTM provider found) >> mark
   where
     mark = atomically (updateAcq provider key (\acq → acq {aBegun = True}))
