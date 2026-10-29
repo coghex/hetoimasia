@@ -179,7 +179,7 @@ startAdmitted context ask name arguments afterCompletion = do
             completion = Completion $ \reply → do
               checked ← checkReplyFor (psLimits service) (endpointResult endpoint) (Just ask) reply
               atomically (replyTo service (admittedIdentity found) checked)
-        handed ← guarded (restore (endpointSubmit endpoint (Submission arguments completion info)))
+        handed ← guarded (restore (endpointSubmit endpoint (Submission arguments completion info (settledNumber service (admittedNumber found)))))
         case handed of
           Left failure → do
             -- Taking the admission back runs the provider's credit releases: one that raises is

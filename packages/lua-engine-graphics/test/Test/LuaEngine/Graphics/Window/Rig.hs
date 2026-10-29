@@ -6,6 +6,8 @@
 module Test.LuaEngine.Graphics.Window.Rig
   ( WRig (..)
   , withWRig
+  , withWRigWrapped
+  , swallowAdoption
   , mainStep
   , attachNow
   , readyCount
@@ -29,6 +31,7 @@ import qualified Data.Text as Text
 import Data.Text (Text)
 import Hetoimasia.LuaEngine.Graphics.Window.Port (Fatal)
 import Hetoimasia.LuaEngine.Graphics.Window.Provider
+import Hetoimasia.Scripting.Lua.Provider (Completion (..), ProviderReply (..), ReplyAnswer (..), RequestEndpoint (..), Submission (..))
 import Test.HUnit.Lang (assertFailure)
 import Test.LuaEngine.Graphics.Rig (bounded)
 import Test.LuaEngine.Graphics.Window.Fake
@@ -45,13 +48,17 @@ data WRig = WRig
 
 -- | Run an example over a provider with this many work records and these holds in place.
 withWRig ∷ Int → [Hold] → (WRig → IO a) → IO a
-withWRig records holds body = do
+withWRig = withWRigWrapped id
+
+-- | The same with the window endpoint passed through a function (see 'swallowAdoption').
+withWRigWrapped ∷ (RequestEndpoint → RequestEndpoint) → Int → [Hold] → (WRig → IO a) → IO a
+withWRigWrapped wrap records holds body = do
   fake ← newFake (FakeConfig holds)
   stops ← newTVarIO 0
   fatals ← newTVarIO []
   let config = WindowConfig records (atomically (modifyTVar' stops (+ 1))) (\found → atomically (modifyTVar' fatals (found :)))
   bounded . withWinComp config (fakePort fake) $ \comp _ runtime → do
-    vm ← startWinVm comp runtime "window-vm"
+    vm ← startWinVmWith wrap comp runtime "window-vm"
     body (WRig fake comp vm stops fatals) `finally` releaseAll fake
 
 -- | One bounded main-thread step.
@@ -127,3 +134,18 @@ raisesWindowDefect action =
   try @WindowDefect action >>= \case
     Left _ → pure ()
     Right _ → assertFailure "the scope returned although a native release failed"
+
+-- | An endpoint that accepts the window's resource reply and never forwards it to the host: the provider is told
+-- the reply was accepted (so it holds an offered result), the host never builds the resource, and the example's
+-- cancellation then settles the request with the provider's work already reported over. Every other reply is
+-- forwarded.
+swallowAdoption ∷ RequestEndpoint → RequestEndpoint
+swallowAdoption endpoint =
+  endpoint
+    { endpointSubmit = \submission →
+        endpointSubmit endpoint submission {submissionCompletion = Completion (swallowing (completeRequest (submissionCompletion submission)))}
+    }
+  where
+    swallowing forward = \case
+      ProviderResource {} → pure ReplyAdoption
+      other → forward other

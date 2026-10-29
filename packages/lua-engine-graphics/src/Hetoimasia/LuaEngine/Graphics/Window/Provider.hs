@@ -305,6 +305,9 @@ data Acq = Acq
     -- ^ Graphics use and native destruction both observed.
   , aRetireFailed ∷ !(Maybe Fatal)
     -- ^ A retirement failure: recorded, fatal, never attempted twice, never frees the slot.
+  , aSettled ∷ STM Bool
+    -- ^ The host's read of whether the request has settled (or is gone): how an offered result that no lease
+    -- will ever build is found without waiting for a settled result to be taken or discarded.
   , aWait ∷ !(Maybe (STM ()))
     -- ^ Until this returns, the acquisition waits on the hosts' bounded progress (a full command queue):
     -- read in the pump's own transaction, so the pump wakes when the progress changes and no other
@@ -372,7 +375,12 @@ withWindowProvider config port body
         closed ← tryWithContext @SomeException (closeAndDrain provider)
         kept ← latchedEvidence provider
         case (outcome, closed) of
-          (Right value, Right ()) → pure (Right value)
+          -- A fault latched during an otherwise orderly run (a failed disposal, a failed owner, an interrupted
+          -- creation) is still the scope's failure: it was handed to the session when it happened, and it is
+          -- never swallowed because the body returned.
+          (Right value, Right ()) → case kept of
+            [] → pure (Right value)
+            (_, primary) : more → Left <$> withEvidence primary more
           (Right _, Left closing) → Left <$> withEvidence closing kept
           (Left primary, Right ()) → Left <$> withEvidence primary kept
           (Left primary, Left closing) → Left <$> withEvidence primary (("window provider close", closing) : kept)
@@ -669,11 +677,11 @@ windowEndpoint service =
     provider = serviceProvider service
     submit' ∷ Submission → IO ProviderWork
     submit' submission = case submissionArguments submission of
-      [VInteger token] | token >= 0 → accept provider (fromIntegral token) (submissionCompletion submission)
+      [VInteger token] | token >= 0 → accept provider (fromIntegral token) (submissionCompletion submission) (submissionSettled submission)
       other → throwIO (WindowDefect (Text.pack ("the window endpoint was handed arguments it does not take: " <> show (length other) <> " arguments")))
 
-accept ∷ WindowProvider target → Word64 → Completion → IO ProviderWork
-accept provider token completion = do
+accept ∷ WindowProvider target → Word64 → Completion → STM Bool → IO ProviderWork
+accept provider token completion settled = do
   placed ← atomically $ do
     st ← readTVar (wpState provider)
     case Map.lookup token (psPrepared st) of
@@ -695,6 +703,7 @@ accept provider token completion = do
                 , aRouted = 0
                 , aRetired = False
                 , aRetireFailed = Nothing
+                , aSettled = settled
                 , aWait = Nothing
                 }
         writeTVar (wpState provider) st {psAcqs = Map.insert token acq (psAcqs st)}
@@ -744,7 +753,8 @@ settledOrPending = \case
 data Step
   = StepDone
   | StepProgress
-  | StepIO (IO ())
+  | -- | An effect for one acquisition (or for none): if it raises, that acquisition is not retried.
+    StepIO !(Maybe Word64) (IO ())
 
 pump ∷ ∀ target. WindowProvider target → StopToken → IO ()
 pump provider token = mask $ \restore → do
@@ -759,13 +769,20 @@ pump provider token = mask $ \restore → do
     loop = atomically (nextStep provider token) >>= \case
       StepDone → pure ()
       StepProgress → loop
-      StepIO act → do
+      StepIO owner act → do
         outcome ← tryWithContext @SomeException act
         case outcome of
           Right () → loop
           Left caught@(ExceptionWithContext _ raised)
             | Just (SomeAsyncException _) ← fromException raised → rethrowIO caught
-            | otherwise → latchFatal provider (Fatal (Text.pack ("a window provider step failed: " <> show raised))) >> loop
+            | otherwise → do
+                -- A failed effect is never repeated: the acquisition's state did not advance, so choosing it
+                -- again would repeat native work, starve its peers and append duplicate evidence. It is recorded
+                -- as unretryable (like a failed retirement: evidence kept, slot kept, drained through the host).
+                let found = Fatal (Text.pack ("a window provider step failed: " <> show raised))
+                forM_ owner $ \key → atomically (updateAcq provider key (\acq → acq {aRetireFailed = Just (fromMaybe found (aRetireFailed acq))}))
+                latchFatal provider found
+                loop
 
 -- | The next thing for the pump, in one transaction: the first acquisition with something to do, or a
 -- wait on every variable read, or a stop once nothing is owed.
@@ -779,12 +796,14 @@ nextStep provider token = do
       -- A fatal fault is handed to the session once, by the pump, whoever recorded it and on whichever thread.
       | Just found ← psFatal st, not (psEscalated st) → do
           writeTVar (wpState provider) st {psEscalated = True}
-          pure (StepIO (windowFatal (wpConfig provider) found))
+          pure (StepIO Nothing (windowFatal (wpConfig provider) found))
       | otherwise → go st (Map.toAscList (psAcqs st))
   where
     go st [] = do
       stopping ← stopRequested token
-      if stopping && Map.null (psAcqs st) then pure StepDone else retry
+      -- Nothing more can happen to an acquisition that failed to retire: it is kept as evidence, so it does not
+      -- hold the pump up.
+      if stopping && all (isJust . aRetireFailed) (Map.elems (psAcqs st)) then pure StepDone else retry
     go st ((key, acq) : rest) =
       stepOf provider key acq >>= \case
         Just step → pure step
@@ -800,18 +819,27 @@ stepOf provider key acq
       modifyState provider $ \st → st {psAcqs = Map.delete key (psAcqs st)}
       pure (Just StepProgress)
   | isJust (aRetireFailed acq) = pure Nothing
-  | otherwise = case aPhase acq of
+  | otherwise = do
+      -- A result offered and never built whose request has settled: the host reported the provider's work
+      -- over when it accepted the reply, so no cancel will come, and the lease will never own the window.
+      -- Settled-and-not-adopted is read after the recipe could have run (it marks adoption before the request
+      -- settles), so a window the lease took is never mistaken for one it did not.
+      gone ← if aOffered acq && not (aAdopted acq) && isNothing (aEnd acq) then aSettled acq else pure False
+      if gone
+        then putAcq provider key acq {aEnd = Just EndCancelled, aOffered = False} >> pure (Just StepProgress)
+        else phased
+  where
+    port = wpPort provider
+    phased = case aPhase acq of
       Queued
         | isJust (aEnd acq) → retireOver >> pure (Just StepProgress)
-        | otherwise → gated (pure (Just (StepIO (issue provider key acq))))
+        | otherwise → gated (pure (Just (StepIO (Just key) (issue provider key acq))))
       Issued ticket →
         portCreateOutcome port ticket >>= \case
           Nothing → pure Nothing
           Just outcome → Just <$> created outcome
       Open tok progress → openStep tok progress
-      Over -> retireOver >> pure (Just StepProgress)
-  where
-    port = wpPort provider
+      Over → retireOver >> pure (Just StepProgress)
     -- A request held back by a full host queue waits for the queue's progress without holding up any other.
     gated proceed = case aWait acq of
       Nothing → proceed
@@ -821,24 +849,24 @@ stepOf provider key acq
     created = \case
       Created tok → do
         putAcq provider key acq {aPhase = Open tok ToAttach}
-        pure (StepIO (portWakeMain port))
+        pure (StepIO Nothing (portWakeMain port))
       CreateRefusedClean why
         | wanted acq && not (aAnswered acq) → do
             putAcq provider key acq {aPhase = Over, aAnswered = True, aRetired = True}
-            pure (StepIO (answerFailure acq why))
+            pure (StepIO (Just key) (answerFailure acq why))
         | otherwise → retireOver >> pure StepProgress
       CreateNotExecuted → retireOver >> pure StepProgress
       CreateFatal found → latchSTM provider found >> retireOver >> pure StepProgress
     openStep tok progress = do
       requested ← portCloseRequest port tok
       if requested > aRouted acq
-        then pure (Just (StepIO (route provider key requested)))
+        then pure (Just (StepIO (Just key) (route provider key requested)))
         else case aEnd acq of
           Just _ → closing tok
           Nothing → admitting tok progress
     -- Cleanup: begin the close once, then read the two retirement outcomes separately.
     closing tok
-      | not (aBegun acq) = gated (pure (Just (StepIO (beginClose provider key tok))))
+      | not (aBegun acq) = gated (pure (Just (StepIO (Just key) (beginClose provider key tok))))
       | otherwise =
           portRetirement port tok >>= \reading → case reading of
             Retirement (GraphicsRetireFailed found) _ → failRetire found
@@ -862,12 +890,12 @@ stepOf provider key acq
                   Nothing → pure Nothing
                   Just target → do
                     putAcq provider key acq {aAnswered = True, aOffered = True}
-                    pure (Just (StepIO (publish provider key tok target)))
+                    pure (Just (StepIO (Just key) (publish provider key tok target)))
           StandingRefusedClean why
             | aAnswered acq → ended EndRefused
             | otherwise → do
                 putAcq provider key acq {aAnswered = True, aEnd = Just EndRefused}
-                pure (Just (StepIO (answerFailure acq why)))
+                pure (Just (StepIO (Just key) (answerFailure acq why)))
           StandingEnded → ended EndStopped
           StandingFatal found → latchSTM provider found >> ended EndFault
     ended cause = do
@@ -887,13 +915,15 @@ issue provider key acq = mask_ $ do
   let request = aRequest acq
   -- Masked throughout: the port's issue is a nonblocking submission, and nothing may be delivered between the
   -- host queue taking the command and this record holding its token.
+  -- The baseline of the host queue's progress is taken before the attempt: a queue drained between a refusal and a
+  -- later sample would otherwise be waited on for a change that already happened.
+  baseline ← atomically (portProgress (wpPort provider))
   issued ← portIssueCreate (wpPort provider) (requestTitle request) (requestWidth request) (requestHeight request)
   case issued of
     CreateIssued ticket → atomically (updateAcq provider key (\current → current {aPhase = Issued ticket}))
-    CreateQueueFull -> do
+    CreateQueueFull ->
       -- Pressure: the accepted request stays queued, bounded, and is issued again when the queue changes.
-      wait ← atomically (portProgress (wpPort provider))
-      atomically (updateAcq provider key (\current → current {aWait = Just wait}))
+      atomically (updateAcq provider key (\current → current {aWait = Just baseline}))
     CreateClosed → atomically (updateAcq provider key (\current → current {aEnd = Just (fromMaybe EndStopped (aEnd current))}))
     CreateFault found → do
       atomically (latchSTM provider found >> updateAcq provider key (\current → current {aEnd = Just EndFault}))
@@ -915,13 +945,12 @@ closeAdmission provider = modifyState provider $ \st → st {psOpen = False}
 
 -- | Begin the close of an open window, once.
 beginClose ∷ WindowProvider target → Word64 → WindowToken → IO ()
-beginClose provider key tok =
+beginClose provider key tok = do
+  baseline ← atomically (portProgress (wpPort provider))
   portBeginClose (wpPort provider) tok >>= \case
     CloseBegun → mark
     CloseGone → mark
-    CloseQueueFull → do
-      wait ← atomically (portProgress (wpPort provider))
-      atomically (updateAcq provider key (\acq → acq {aWait = Just wait}))
+    CloseQueueFull → atomically (updateAcq provider key (\acq → acq {aWait = Just baseline}))
     CloseFault found → atomically (latchSTM provider found) >> mark
   where
     mark = atomically (updateAcq provider key (\acq → acq {aBegun = True}))

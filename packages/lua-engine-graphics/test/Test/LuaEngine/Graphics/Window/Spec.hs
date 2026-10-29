@@ -28,6 +28,7 @@ spec = describe "window provider" $ do
   cancellation
   retirement
   closing
+  abandonment
   faults
   pressure
 
@@ -287,6 +288,72 @@ closing = describe "close routing" $ do
       nativeClose (wrFake rig) 1
       awaitStops rig 1
 
+-- Abandoned offers and raised effects ---------------------------------------------------------------------
+
+abandonment ∷ Spec
+abandonment = describe "abandonment and failed effects" $ do
+  it "takes apart a window whose offered result was never built because the request was cancelled first, without the result being taken" $
+    withWRigWrapped swallowAdoption 2 [] $ \rig → do
+      admit (wrComp rig) (wrVm rig) PresentationRole "a"
+      commandOpen (wrComp rig) (wrVm rig) "a" "a" "t" (640, 480)
+      attachNow rig
+      -- The provider offered the result once the owner admitted the target; the host never builds it.
+      awaitFake (wrFake rig) ((== 1) . readingAttached)
+      eventCount rig "close w" >>= (`shouldBe` 0)
+      command (wrComp rig) (wrVm rig) "a" "cancel" "a"
+      line ← awaitNoteContaining (wrComp rig) "a cancel a"
+      line `shouldSatisfy` Text.isInfixOf "cancelled"
+      -- Nobody takes the cancelled result: the window is closed, retired and the slot freed all the same.
+      awaitProvider rig ((== 0) . readingAcquisitions)
+      slotHeld rig "a" >>= (`shouldBe` False)
+      eventCount rig "close w" >>= (`shouldBe` 1)
+
+  it "issues again when the host queue drained between the refusal and the waiter, and closes likewise" $
+    withWRig 2 [] $ \rig → do
+      setCreateFull (wrFake rig) True
+      drainOnNextFull (wrFake rig)
+      admit (wrComp rig) (wrVm rig) PresentationRole "a"
+      commandOpen (wrComp rig) (wrVm rig) "a" "a" "t" (640, 480)
+      attachNow rig
+      command (wrComp rig) (wrVm rig) "a" "wait_take" "a"
+      line ← awaitNoteContaining (wrComp rig) "a wait_take a"
+      line `shouldSatisfy` Text.isInfixOf "status=success"
+      eventCount rig "issue create" >>= (`shouldBe` 1)
+      setCloseFull (wrFake rig) True
+      stopInstance (wrComp rig) (wrVm rig) "a"
+      -- Closing is refused for a full queue; opening the queue lets it through and the window retires.
+      awaitFake (wrFake rig) ((== 1) . readingWindows)
+      setCloseFull (wrFake rig) False
+      awaitProvider rig ((== 0) . readingAcquisitions)
+
+  it "raises a retained retirement failure at a clean scope exit and lets the pump stop, with no earlier exception" $
+    raisesWindowDefect . withWRig 2 [HoldAdmit] $ \rig → do
+      admit (wrComp rig) (wrVm rig) PresentationRole "a"
+      commandOpen (wrComp rig) (wrVm rig) "a" "a" "t" (640, 480)
+      attachNow rig
+      awaitFake (wrFake rig) ((== 1) . readingAttached)
+      failNativeDisposal (wrFake rig)
+      command (wrComp rig) (wrVm rig) "a" "cancel" "a"
+      _ ← awaitNoteContaining (wrComp rig) "a cancel a cancelled"
+      awaitFatalCount rig 1
+      slotHeld rig "a" >>= (`shouldBe` True)
+
+  it "never repeats a failed effect: an issue that raised is attempted once, before or after admission" $
+    mapM_ raised [RaiseBeforeIssue, RaiseAfterIssue]
+  where
+    raised how = raisesWindowDefect . withWRig 2 [] $ \rig → do
+      raiseOnIssue (wrFake rig) how
+      admit (wrComp rig) (wrVm rig) PresentationRole "a"
+      commandOpen (wrComp rig) (wrVm rig) "a" "a" "t" (640, 480)
+      awaitFatalCount rig 1
+      -- Unrelated progress gives the pump every chance to choose the same acquisition again.
+      admit (wrComp rig) (wrVm rig) PresentationRole "b"
+      commandOpen (wrComp rig) (wrVm rig) "b" "a" "peer" (320, 240)
+      _ ← awaitNoteContaining (wrComp rig) "b start a started"
+      eventCount rig "attempt issue" >>= (`shouldSatisfy` (<= 2))
+      fatalsNow rig >>= \found → length found `shouldSatisfy` (<= 2)
+      slotHeld rig "a" >>= (`shouldBe` True)
+
 -- Faults ---------------------------------------------------------------------------------------------------
 
 faults ∷ Spec
@@ -314,7 +381,7 @@ faults = describe "failures" $ do
       fatalsNow rig >>= (`shouldBe` [])
 
   it "keeps a fatal creation fault out of window_error, busy and retries" $
-    withWRig 2 [] $ \rig → do
+    raisesWindowDefect . withWRig 2 [] $ \rig → do
       scriptCreate (wrFake rig) [CreateFatal (Fatal "the creation was interrupted")]
       admit (wrComp rig) (wrVm rig) PresentationRole "a"
       commandOpen (wrComp rig) (wrVm rig) "a" "a" "t" (640, 480)
@@ -323,7 +390,7 @@ faults = describe "failures" $ do
       eventCount rig "issue create" >>= (`shouldBe` 1)
 
   it "latches an owner failure as fatal" $
-    withWRig 2 [] $ \rig → do
+    raisesWindowDefect . withWRig 2 [] $ \rig → do
       failOwner (wrFake rig) (Fatal "the graphics owner failed")
       awaitFatalCount rig 1
 

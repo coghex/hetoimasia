@@ -14,6 +14,7 @@ module Test.LuaEngine.Graphics.Windows
     -- * One VM
   , WinVm (..)
   , startWinVm
+  , startWinVmWith
   , admit
   , stopInstance
   , command
@@ -126,7 +127,12 @@ requestHandleType = "wreq"
 -- | A VM over the composition's provider: its own lease scope and handle registry, one owner settling on
 -- arrival.
 startWinVm ∷ ∀ target. Typeable target ⇒ WinComp target → LuaRuntime → Text → IO (WinVm target)
-startWinVm comp runtime label = do
+startWinVm = startWinVmWith id
+
+-- | The same, with the window endpoint passed through this function: the lifecycle suite wraps it to swallow an
+-- adoption reply, so a cancellation can overtake the build the host never gets to run.
+startWinVmWith ∷ ∀ target. Typeable target ⇒ (RequestEndpoint → RequestEndpoint) → WinComp target → LuaRuntime → Text → IO (WinVm target)
+startWinVmWith wrap comp runtime label = do
   handles ← newRequestHandles
   requests ← either (\refused → assertFailure ("the profile was refused: " <> show refused)) pure (m1Requests compositionProfile handles)
   let service = windowService requests (wcProvider comp)
@@ -149,7 +155,7 @@ startWinVm comp runtime label = do
           , vmModules = [driverSource]
           , vmValueLimits = limits
           }
-      grant = RequestGrant [windowEndpoint service] 64 SettleOnArrival
+      grant = RequestGrant [wrap (windowEndpoint service)] 64 SettleOnArrival
       spec =
         (scheduledSpec vm requiredPolicy bounds)
           { scheduledInstances = Just (defaultInstanceConfig {instanceBounds = InstanceBounds 8 16 8 8, instanceSources = [commandSource]})

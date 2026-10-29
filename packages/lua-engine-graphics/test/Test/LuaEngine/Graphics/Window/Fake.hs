@@ -22,6 +22,9 @@ module Test.LuaEngine.Graphics.Window.Fake
   , releaseAll
   , setCreateFull
   , setCloseFull
+  , drainOnNextFull
+  , raiseOnIssue
+  , IssueRaise (..)
 
     -- * Scripting
   , scriptStanding
@@ -86,6 +89,8 @@ data FS = FS
   { fsHolds ∷ !(Set Hold)
   , fsCreateFull ∷ !Bool
   , fsCloseFull ∷ !Bool
+  , fsDrainOnFull ∷ !Bool
+  , fsRaiseIssue ∷ !(Maybe IssueRaise)
   , fsNext ∷ !Word64
   , fsCreates ∷ !(Map Word64 (Text, Int, Int, Maybe WindowToken))
   , fsWindows ∷ !(Map Word64 Win)
@@ -101,7 +106,7 @@ data FS = FS
 newtype Fake = Fake (TVar FS)
 
 newFake ∷ FakeConfig → IO Fake
-newFake cfg = Fake <$> newTVarIO (FS (Set.fromList (fcHolds cfg)) False False 1 Map.empty Map.empty [] [] [] StandingUsable Nothing 0 0)
+newFake cfg = Fake <$> newTVarIO (FS (Set.fromList (fcHolds cfg)) False False False Nothing 1 Map.empty Map.empty [] [] [] StandingUsable Nothing 0 0)
 
 modify ∷ Fake → (FS → FS) → STM ()
 modify (Fake var) change = readTVar var >>= \st → writeTVar var (change st) {fsVersion = fsVersion st + 1}
@@ -125,6 +130,18 @@ setCreateFull fake full = atomically (modify fake (\st → st {fsCreateFull = fu
 
 setCloseFull ∷ Fake → Bool → IO ()
 setCloseFull fake full = atomically (modify fake (\st → st {fsCloseFull = full}))
+
+-- | The next refusal for a full queue also drains the queue, in the same step: the queue is empty again before the
+-- provider can install a waiter for its change.
+drainOnNextFull ∷ Fake → IO ()
+drainOnNextFull fake = atomically (modify fake (\st → st {fsDrainOnFull = True}))
+
+-- | Where the next creation issue raises.
+data IssueRaise = RaiseBeforeIssue | RaiseAfterIssue
+  deriving (Eq, Show)
+
+raiseOnIssue ∷ Fake → IssueRaise → IO ()
+raiseOnIssue fake how = atomically (modify fake (\st → st {fsRaiseIssue = Just how}))
 
 -- Scripting --------------------------------------------------------------------------------------------
 
@@ -163,13 +180,23 @@ wakes (Fake var) = fsWakes <$> readTVarIO var
 fakePort ∷ Fake → Port ()
 fakePort fake@(Fake var) =
   Port
-    { portIssueCreate = \title width height → atomically $ do
+    { portIssueCreate = \title width height → do
+       attempt ← atomically $ do
+        st ← readTVar var
+        modify fake (note "attempt issue")
+        pure (fsRaiseIssue st)
+       when (attempt == Just RaiseBeforeIssue) (ioError (userError "the issue raised before it was admitted"))
+       issued ← atomically $ do
         st ← readTVar var
         if fsCreateFull st
-          then pure CreateQueueFull
+          then do
+            when (fsDrainOnFull st) (modify fake (\now → now {fsCreateFull = False, fsDrainOnFull = False}))
+            pure CreateQueueFull
           else do
             modify fake (note ("issue create " <> title <> " " <> tshow width <> "x" <> tshow height) . \now → now {fsNext = fsNext now + 1, fsCreates = Map.insert (fsNext st) (title, width, height, Nothing) (fsCreates now)})
             pure (CreateIssued (CreateToken (fsNext st)))
+       when (attempt == Just RaiseAfterIssue) (ioError (userError "the issue raised after it was admitted"))
+       pure issued
     , portCreateOutcome = \(CreateToken number) → do
         st ← readTVar var
         case Map.lookup number (fsCreates st) of

@@ -30,6 +30,8 @@
 module Hetoimasia.LuaEngine.Graphics.Window.Host
   ( -- * The port
     hostPort
+  , newHostPort
+  , PortReading (..)
 
     -- * The capability a ready window yields
   , WindowTarget (..)
@@ -137,19 +139,34 @@ data Made = Made
 data HostState = HostState
   { hsNext ∷ !Word64
   , hsCreates ∷ !(Map Word64 CompletionTicket)
-  , hsTokens ∷ !(Map Word64 WindowToken)
-    -- ^ The window made for each create token that has settled, so reading an outcome twice never makes
-    -- a second token.
+    -- ^ Creation tickets issued and not yet consumed: an entry goes when its outcome is read, in the same
+    -- transaction that records it, so the table is bounded by the commands in flight.
   , hsMade ∷ !(Map WindowToken Made)
+    -- ^ Windows made and not yet retired: an entry goes when both retirement outcomes were observed. A
+    -- window whose retirement failed stays, as evidence. Identities are never reissued.
   }
+
+-- | What the port holds now: the counts the bookkeeping must return to when every window has retired.
+data PortReading = PortReading
+  { readingTickets ∷ !Int
+  , readingWindows ∷ !Int
+  }
+  deriving (Eq, Show)
 
 -- | A port over this host. Create it once per session; it is read and written from the provider's pump
 -- and from the process main thread, by transactions.
 hostPort ∷ ∀ scene. VulkanHost scene → IO (Port (WindowTarget scene))
-hostPort vulkan = do
-  var ← newTVarIO (HostState 0 Map.empty Map.empty Map.empty)
+hostPort vulkan = fst <$> newHostPort vulkan
+
+-- | The same, with a reading of the port's own bookkeeping.
+newHostPort ∷ ∀ scene. VulkanHost scene → IO (Port (WindowTarget scene), STM PortReading)
+newHostPort vulkan = do
+  var ← newTVarIO (HostState 0 Map.empty Map.empty)
   let commands = hostCommandPort (vulkanWindowHost vulkan)
-  pure
+      reading = (\st → PortReading (Map.size (hsCreates st)) (Map.size (hsMade st))) <$> readTVar var
+  pure (port var commands, reading)
+  where
+   port var commands =
     Port
       { portIssueCreate = \title width height → mask_ $
           -- Masked: the host's queue takes the command and the port records its ticket in one step, so a
@@ -187,28 +204,25 @@ createOutcome var number = do
     Just ticket →
       pollCompletion ticket >>= \case
         Nothing → pure Nothing
-        Just disposition → case disposition of
-          Performed (WindowCreated window) → case Map.lookup number (hsTokens st) of
-            Just token → pure (Just (Created token))
-            Nothing →
+        Just disposition → do
+          -- The outcome is consumed by the transaction that reads it: the provider records it in the same
+          -- one, so the ticket is not read again and is not kept.
+          let consumed = st {hsCreates = Map.delete number (hsCreates st)}
+              settle outcome = writeTVar var consumed >> pure (Just outcome)
+          case disposition of
+            Performed (WindowCreated window) →
               pollWindowClient ticket >>= \case
-                Nothing → pure (Just (CreateFatal (Fatal "a window was created without its client")))
+                Nothing → settle (CreateFatal (Fatal "a window was created without its client"))
                 Just client → do
                   let token = WindowToken (hsNext st)
-                  writeTVar
-                    var
-                    st
-                      { hsNext = hsNext st + 1
-                      , hsTokens = Map.insert number token (hsTokens st)
-                      , hsMade = Map.insert token (Made window client Nothing Nothing) (hsMade st)
-                      }
+                  writeTVar var consumed {hsNext = hsNext st + 1, hsMade = Map.insert token (Made window client Nothing Nothing) (hsMade st)}
                   pure (Just (Created token))
-          -- Clean and verified: the host rolled back exactly what it acquired and consumed no capacity.
-          Rejected (WindowCreationFailed {}) → pure (Just (CreateRefusedClean "the window could not be created"))
-          NotExecuted → pure (Just CreateNotExecuted)
-          Rejected rejection → pure (Just (CreateFatal (Fatal (bounded ("a window creation was rejected: " <> Text.pack (show rejection))))))
-          Interrupted request → pure (Just (CreateFatal (Fatal (bounded ("a window creation was interrupted: " <> Text.pack (show request))))))
-          other → pure (Just (CreateFatal (Fatal (bounded ("a window creation settled unexpectedly: " <> Text.pack (show other))))))
+            -- Clean and verified: the host rolled back exactly what it acquired and consumed no capacity.
+            Rejected (WindowCreationFailed {}) → settle (CreateRefusedClean "the window could not be created")
+            NotExecuted → settle CreateNotExecuted
+            Rejected rejection → settle (CreateFatal (Fatal (bounded ("a window creation was rejected: " <> Text.pack (show rejection)))))
+            Interrupted request → settle (CreateFatal (Fatal (bounded ("a window creation was interrupted: " <> Text.pack (show request)))))
+            other → settle (CreateFatal (Fatal (bounded ("a window creation settled unexpectedly: " <> Text.pack (show other)))))
 
 -- Attachment (main thread) ---------------------------------------------------------------------------
 
@@ -352,9 +366,15 @@ retirement vulkan var token = do
           Just (Interrupted request) → Just (Fatal (bounded ("a window's close was interrupted: " <> Text.pack (show request))))
           Just (Rejected rejection) | fatalClose rejection → Just (Fatal (bounded ("a window's close was rejected: " <> Text.pack (show rejection))))
           _ → Nothing
-      pure $ case closeFault of
-        Just found' → Retirement (GraphicsRetireFailed found') native
-        Nothing → Retirement graphics native
+      let outcome = case closeFault of
+            Just found' → Retirement (GraphicsRetireFailed found') native
+            Nothing → Retirement graphics native
+      -- A window that retired whole is forgotten, in the transaction that reports it; one whose retirement
+      -- failed is kept as evidence.
+      when (retirementComplete outcome) $ do
+        st ← readTVar var
+        writeTVar var st {hsMade = Map.delete token (hsMade st)}
+      pure outcome
   where
     graphicsOf present = case (observedSlot present, observedDisposal present) of
       (SlotFree, _) → GraphicsRetired
