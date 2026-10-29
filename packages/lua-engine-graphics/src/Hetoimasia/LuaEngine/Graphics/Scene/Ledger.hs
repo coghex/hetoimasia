@@ -113,7 +113,7 @@ initialGraphicsScene = GraphicsScene initialContent Set.empty
 -- The ledger -----------------------------------------------------------------------------------------
 
 data Adoption = Adoption
-  { adoptionCount ∷ !Int
+  { adoptionCount ∷ !Natural
   , adoptionHolds ∷ !(Set Word64)
   }
 
@@ -189,14 +189,15 @@ defect what st = st {stDefects = stDefects st + 1, stFirstDefect = Just (fromMay
 ledgerHeld ∷ SceneLedger w → Word64 → STM Bool
 ledgerHeld ledger identity = (> 0) <$> ledgerHolds ledger identity
 
--- | How many adoptions hold this texture: for each window and revision, the count of its adoptions.
-ledgerHolds ∷ SceneLedger w → Word64 → STM Int
+-- | How many adoptions hold this texture: for each window and revision, the count of its adoptions. A count is a
+-- 'Natural', as a revision is: nothing here wraps, however many adoptions a long run makes.
+ledgerHolds ∷ SceneLedger w → Word64 → STM Natural
 ledgerHolds (SceneLedger var) identity =
   sum . map adoptionCount . filter (Set.member identity . adoptionHolds) . Map.elems . stRecords <$> readTVar var
 
 -- | What the ledger holds now.
 data LedgerReading w = LedgerReading
-  { readingRecords ∷ ![((w, Natural), Int)]
+  { readingRecords ∷ ![((w, Natural), Natural)]
     -- ^ Each adopted, unreleased window and revision with its adoption count, in key order.
   , readingHeld ∷ !(Set Word64)
     -- ^ Every texture identity any adoption holds.

@@ -298,32 +298,36 @@ boundary publisher resource uses = do
 
 -- The binding -----------------------------------------------------------------------------------------
 
--- | The check of a publication binding's copied arguments, made before the action: the scene's own check
--- ('sceneArgumentCheck'), then the window handle's lease, role, admission and readiness. A refusal is
--- bounded text for an ordinary Lua error: nothing is published, held or changed, and a @pcall@ that catches
--- it goes on.
-graphicsPublishCheck ∷ ∀ target. Typeable target ⇒ ScenePublisher target → SceneLimits → Leases → ArgumentCheck
-graphicsPublishCheck publisher limits leases owner values = case values of
-  [VCapability window, scene]
-    | capabilityTypeName window /= windowHandleType → pure (Just "the first argument is not a window")
-    | otherwise → do
-        window' ← withWindowOr @target leases (capabilityKey window) (pure . Just . publishRefusalText . WindowRefused) $ \resource →
-          fmap (fmap publishRefusalText) (atomically (boundary publisher resource []))
-        case window' of
-          Just why → pure (Just why)
-          Nothing → sceneArgumentCheck limits leases owner [scene]
-  other → pure (Just (Text.pack ("publishing takes a window and a scene, not " <> show (length other) <> " arguments")))
+-- | The check of a publication binding's copied arguments, made before the action: first the facade's own
+-- precondition (the UI-only role, the phase and the quit checks, which are the graphics facade's to name), then the
+-- scene's own check ('sceneArgumentCheck') and the window handle's lease, role, admission and readiness. A refusal is
+-- bounded text for an ordinary Lua error: nothing is published, held or changed, and a @pcall@ that catches it goes
+-- on.
+graphicsPublishCheck ∷ ∀ target. Typeable target ⇒ ArgumentCheck → ScenePublisher target → SceneLimits → Leases → ArgumentCheck
+graphicsPublishCheck precondition publisher limits leases owner values =
+  precondition owner values >>= \case
+    Just why → pure (Just why)
+    Nothing → case values of
+      [VCapability window, scene]
+        | capabilityTypeName window /= windowHandleType → pure (Just "the first argument is not a window")
+        | otherwise → do
+            refused ← withWindowOr @target leases (capabilityKey window) (pure . Just . publishRefusalText . WindowRefused) $ \resource →
+              fmap (fmap publishRefusalText) (atomically (boundary publisher resource []))
+            case refused of
+              Just why → pure (Just why)
+              Nothing → sceneArgumentCheck limits leases owner [scene]
+      other → pure (Just (Text.pack ("publishing takes a window and a scene, not " <> show (length other) <> " arguments")))
 
 -- | A binding that takes a window and a scene, refuses with an ordinary Lua error whatever it can know
 -- before it has an effect, and otherwise publishes. Answers nothing to the script.
-graphicsPublishBinding ∷ ∀ target. Typeable target ⇒ Text → ScenePublisher target → SceneLimits → Leases → Binding
+graphicsPublishBinding ∷ ∀ target. Typeable target ⇒ Text → ArgumentCheck → ScenePublisher target → SceneLimits → Leases → Binding
 graphicsPublishBinding = graphicsPublishBindingWith noPublishHooks
 
 -- | The same with the test seams of 'publishSceneWith'.
-graphicsPublishBindingWith ∷ ∀ target. Typeable target ⇒ PublishHooks → Text → ScenePublisher target → SceneLimits → Leases → Binding
-graphicsPublishBindingWith hooks name publisher limits leases =
+graphicsPublishBindingWith ∷ ∀ target. Typeable target ⇒ PublishHooks → Text → ArgumentCheck → ScenePublisher target → SceneLimits → Leases → Binding
+graphicsPublishBindingWith hooks name precondition publisher limits leases =
   withArgumentLimits (sceneValueLimits limits) $
-    withArgumentCheck (graphicsPublishCheck publisher limits leases) $
+    withArgumentCheck (graphicsPublishCheck precondition publisher limits leases) $
       stateOperation name [SCapability windowHandleType, sceneSchema] [] $ \case
         [VCapability window, scene] →
           prepareScene limits leases scene >>= \case

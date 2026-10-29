@@ -235,7 +235,7 @@ bindings comp limits vm =
   , namespace "wrq" (m1RequestBindings (M1Service windowRequests windowValueSchema))
   , namespace "tex" [loading, releasing]
   , namespace "win" [opening]
-  , namespace "scn" [graphicsPublishBindingWith (hooksOf vm) "publish" (vmPublisher vm) limits (vmLeases vm), fullScene, raced]
+  , namespace "scn" [graphicsPublishBindingWith (hooksOf vm) "publish" (\_ _ → pure Nothing) (vmPublisher vm) limits (vmLeases vm), fullScene, raced]
   ]
   where
     log' = cpLog (scTexture comp)
