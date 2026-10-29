@@ -68,6 +68,27 @@ spec = describe "on the real session coordinator" $ do
     outFailures outcome `shouldBe` []
     outRetired outcome `shouldBe` True
 
+  it "routes a genuine native close after readiness to the session's idempotent stop, with request capacity full, and again for a newer request" $ do
+    outcome ← runWithSession $ \session → do
+      fake ← newFake defaultFakeConfig
+      withWinComp (sessionWindowConfig session 1) (fakePort fake) $ \comp _ runtime → do
+        vm ← startWinVm comp runtime "coordinator-vm"
+        admit comp vm PresentationRole "a"
+        commandOpen comp vm "a" "a" "t" (640, 480)
+        attachWhenReady comp
+        command comp vm "a" "wait_take" "a"
+        line ← awaitNoteContaining comp "a wait_take a"
+        line `shouldSatisfy` Text.isInfixOf "status=success"
+        -- Ready, and the one work record is still the request's: the ordinary capacity is full.
+        nativeClose fake 1
+        atomically (sessionOutcomeNow session >>= \found → unless (outQuit found) retry)
+        -- A newer request from the same window routes again; the endpoint is idempotent and the quit is unchanged.
+        nativeClose fake 1
+        releaseAll fake
+    outVerdict outcome `shouldBe` VerdictSuccess
+    outQuit outcome `shouldBe` True
+    outFailures outcome `shouldBe` []
+
   it "latches a failed native destruction as the session's cleanup_failure" $ do
     outcome ← runWithSession $ \session → do
       fake ← newFake defaultFakeConfig
