@@ -309,10 +309,12 @@ An outcome that fits none of these returns to the manager rather than being clas
 the host claimed it, which is how the examples settle a request by a real epoch change while its claimed recipe is held. The
 recipe itself tolerates a window already taken apart and forgotten (the host may run a claimed recipe after the request
 settled): that is ordinary cancellation, built over the same window and released at once by the host, never a host failure.
-`windowServiceFor` chooses the request's necessity: a required request's failure ends its instance at the next safe boundary
-whether it is read or not, so only an optional request lets a script hand the examples the exact `take` record
-(`{status = "failure", error = {code = "window_error", message ≤ 2 KiB}}`, no root or path). The facade uses `windowService`
-(required); M1 offers no optional window to Lua.
+The window request is required, and the examples run it that way. A required request's failure ends its instance at the end of
+the invocation that is running when the request settles, whether the script read it or not. A script already inside that
+invocation can still take the result: the example holds one invocation at a gate of its own (`fx.block`), lets the provider
+settle a clean refusal meanwhile, then resumes, finds the request ready and takes the exact record
+(`{status = "failure", error = {code = "window_error", message ≤ 2 KiB}}`, no root or path), and the instance then fails,
+attributed to the `window` endpoint. M1 offers no optional window to Lua.
 
 ### Failed effects and exit
 
