@@ -40,8 +40,10 @@ Each mutation was applied to the provider, the headless `window provider` group 
 | a window counted retired once graphics retired, without the native window's destruction | 1 example failed: "closes a late native result once, and frees the slot only after native retirement" |
 | the genuine close not routed to the stop endpoint | 2 failed: the routing examples (pending setup with capacity full; the race with the cleanup close) |
 | the provider's own cleanup close routed to the stop endpoint | 3 failed: the late-result example, the peer-retirement example and "does not stop the session or a peer when only an instance's cleanup closes its window" |
+| (round 1) abandonment of an offered, never-built result removed (the swallowed-adoption wrapper also withholds `workCancel`, as the host does once a reply is accepted) | 1 failed: "takes apart a window whose offered result was never built because the request was cancelled first, without the result being taken" |
+| (round 1) the host queue's progress baseline sampled after the attempt instead of before | 1 failed: "issues again when the host queue drained between the refusal and the waiter, and closes likewise" |
 
-Each failed within its bound and unwound its cleanup (the rig opens every hold and the provider's scope drains).
+Each failed within its bound and unwound its cleanup (the rig opens every hold and calls `endWindows` on every exit, then the provider's scope drains). The first abandonment run, before `endWindows` existed in the rig, hung in teardown until the hard timeout (the instance's end waits for the provider, the provider's scope for the instance); that is why the rig ends windows itself.
 
 ## Same-shape sweep
 
@@ -57,3 +59,15 @@ Shapes fixed: *a native thing exists before the record that tracks it.*
 | `adoptionFor` | resource built into the lease → acquisition marked adopted | one transaction on the owner's thread |
 | `windowMainStep` | `portAttach` answered → phase recorded | a lost record repeats the attach, which the port turns into an announcement on the same attachment, never a second surface |
 | `route` | stop endpoint called → newest number recorded | idempotent endpoint: a repeat is safe, a lost record only repeats it |
+| any pump effect that raises | state unchanged → effect chosen again | closed in round 1: the acquisition is marked unretryable, once |
+| `Host.createOutcome`, `Host.retirement` | outcome read → port record kept | closed in round 1: consumed / forgotten in the reading transaction; failed retirements kept |
+
+## The one change outside the adapter's package
+
+`Submission.submissionSettled ∷ STM Bool` (`packages/scripting-lua`, `Provider/Types.hs`; set in `Admission.hs` and
+`Request.hs` from the existing `settledNumber`). Additive, read-only, non-blocking: no existing provider reads it and nothing
+in the host's behaviour, bounds or approved contracts changes (the manager classified it as not a contract change on
+`#het-lfsolve`). Without it a window whose request is cancelled between the host's acceptance of a resource reply and the
+build stays open until the settled result is taken or discarded, because the host reports that provider's work over at the
+reply and skips the cancel. Documented in `packages/scripting-lua/README.md`. All `scripting-lua` suites pass (`lua-host-tests` 631,
+`lua-runtime-tests` 1141, `lua-domains-tests` 403).

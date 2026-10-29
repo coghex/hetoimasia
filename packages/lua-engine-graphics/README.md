@@ -265,6 +265,12 @@ every Open state ──(cancel | instance end | session stop | refusal | fault)�
   reserved: the reserved capacity becomes real lease tracking in the same step that publishes the result. The resource is
   opaque and the instance's alone; it carries only the publication capability, no native control, input reader or
   disposal authority. It is valid whether or not Lua ever takes the request.
+* **An offered result nobody builds.** The host reports a provider's work over when it accepts a resource reply, so a
+  cancellation (or any end of the request) that wins before the lease builds the resource reaches no `workCancel`, and the
+  settled result may stay unread. The provider therefore reads `submissionSettled` (a narrow read-only STM field of the host's
+  `Submission`) for every acquisition it has offered and that no lease has adopted: settled and not adopted means no lease will
+  ever own it, so the pump ends it (close, retire, slot), independent of the result being taken or discarded. The adoption
+  marks the acquisition adopted before the request settles, so a window the lease took is never mistaken for one it did not.
 * **Cancellation** that wins withdraws interest and settles `cancelled` with no required-failure latch. If success settled
   first, `cancel` answers `already_settled` and cannot close the window. A late success is suppressed and every partial
   acquisition is retired safely; native work already issued is allowed to finish far enough to retire (a command ticket
@@ -296,6 +302,16 @@ close, so ending an instance neither synthesises a session quit nor ends a healt
 
 An outcome that fits none of these returns to the manager rather than being classified ad hoc.
 
+### Failed effects and exit
+
+A synchronous failure of an effect the pump ran (an issue, a close, a stop routing, an answer) is never repeated: that
+acquisition is recorded as unretryable, exactly as a failed retirement is (evidence kept once, slot kept, drained through the
+protected host), and the fault is handed to the session once. An acquisition in that state is terminal for the pump, so the
+worker can stop; a fault latched during an otherwise orderly run is still raised by the scope's exit. When the host's command
+queue refuses an issue or a close, the progress baseline is sampled **before** the attempt, so a queue drained between the
+refusal and the wait is not waited on. `endWindows` is the session-stop action: it ends every window (adopted or not) and closes
+admission, idempotently and without waiting; the scope exit runs it before its drain.
+
 ### Owners, threads, lifetimes
 
 | State | Owner | Writers | Readers | Thread | Lifetime / disposal |
@@ -305,7 +321,7 @@ An outcome that fits none of these returns to the manager rather than being clas
 | The window slot (`WindowOwner`) | one UI instance's bindings | admission (reserve), the pump (return) | admission, the argument check | STM | until the window's actual retirement |
 | The pump | the provider's worker group | — | — | one thread, never the main thread | started by the scope, stopped after the drain |
 | The main step (`windowMainStep`) | the application's owner loop | — | — | the process main thread | one bounded step per turn |
-| The production port's tables (creation tickets, windows, services, close tickets) | the port | the pump and the main step, by transactions | the pump | STM | one entry per window made; never reissued |
+| The production port's tables (creation tickets, windows, services, close tickets) | the port | the pump and the main step, by transactions | the pump | STM | a ticket is consumed by the transaction that reads its outcome; a window's record by the one that reports its retirement whole (a failed one is kept as evidence); identities are never reissued |
 | The window resource in the lease | the requesting instance | the adoption recipe | the later scene adapter, through the lease | owner's thread | until the lease releases it (instance end) |
 
 The pump waits only in STM, on the variables the next fact lives in (a creation ticket, a standing, a window's own close

@@ -3696,6 +3696,14 @@ reply (`ReplyAnswer`): settled, held for its tick, refused for its size or shape
 a duplicate, late or stale reply is evidence about the provider, is counted, overwrites nothing, and still retires
 the provider's work.
 
+`Submission` also carries `submissionSettled`, a read-only transaction that never blocks: whether the request has settled
+(or is gone). It is additive and changes nothing for a provider that does not read it. It exists for one named consumer, the
+window provider (LFE-18): a resource reply that is accepted (`ReplyAdoption`) reports the provider's work over at once, so
+a request that is then cancelled, or otherwise settles, before the owner builds the resource never reaches `workCancel`, and
+the credit that transfers is returned only when the settled result is taken or discarded. A provider that has offered a
+resource and finds the request settled with the resource never adopted (the recipe marks adoption before the request
+settles) knows no lease will own it, and retires what it holds without waiting for the result to be consumed.
+
 A reply is bounded before it is retained, against the owner's value limits and the endpoint's schema, and what is
 measured is the record a script is handed when it takes the result, not the bare value, so a result that is
 retained is a result that can be delivered. A result over the limits settles an unsettled request as a failure, its
