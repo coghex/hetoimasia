@@ -15,6 +15,8 @@
 -- > api.content.data(path [, {root=, tick_offset=, optional=}])
 -- > api.request.ready(r) / take(r) / wait(r) / cancel(r)
 -- > api.time.tick() / tick_seconds() / seconds() / wait_ticks(n) / wait_seconds(s) / yield()
+-- > api.session.status() / quit()    -- the session controls (LFE-26): a copied status, a returning normal stop
+-- > api.state(...)                   -- the unavailable-state guard (also the global @state(...)@)
 --
 -- Every call is a dot call with exactly its declared arguments: a mistaken colon call, an extra or
 -- missing argument (an explicit @nil@ counts as an argument), a value of the wrong type or a table
@@ -34,9 +36,13 @@
 -- * @time.tick@ and @time.tick_seconds@: a gameplay instance's, in @init@, an update and @shutdown@.
 -- * @time.seconds@: a presentation instance's, in @init@, an update and @shutdown@.
 -- * @time.wait_ticks@: a gameplay instance's update. @time.wait_seconds@: a presentation instance's update.
+-- * @session.status@: a presentation instance's, in @init@, an update and @shutdown@, answering the capture taken at the
+--   entry of the hook or resumed segment. @session.quit@: either role's instance, in any hook.
+-- * @state(...)@ and @api.state(...)@: anywhere, and with any arguments: they latch the whole session's failure and
+--   raise (see "Hetoimasia.LuaEngine.Facade.Session"); no role, phase or arity check stands before them.
 --
--- Every call is refused at a module's top level, through a captured facade included; the clocks and the waits
--- are also refused to the other role.
+-- Every call but the guard is refused at a module's top level, through a captured facade included; the clocks, the
+-- waits and the status are also refused to the other role.
 --
 -- A request is also refused (an ordinary error, never @busy@) when the session's admission is stopping or
 -- closed. @tick_offset@ is gameplay's alone (an integer from 1; the default is 1) and a presentation instance
@@ -70,7 +76,8 @@
 -- 'facadeInstanceConfig' on its instances' ('instanceOnSegment' is where the presentation clock is
 -- sampled); grant 'facadeRequestEndpoints' to the owner's request service; and for each instance
 -- 'declareInstance', which answers the facade source to put in the behavior's request, and 'forgetInstance'
--- once the instance has settled. The scopes nest as the owners need them: the output outside, then the
+-- once the instance has settled. The facade is injected with the session's narrow control endpoints
+-- ('SessionEndpoints', @fsSession@): the status read, the normal stop and the terminal latch. The scopes nest as the owners need them: the output outside, then the
 -- coordinator and the pool, then the owner, which is stopped first, so a shutdown hook that prints still
 -- finds its sink. Nothing here is global: a second VM has a second facade, and a facade cannot be reached
 -- from Lua.
