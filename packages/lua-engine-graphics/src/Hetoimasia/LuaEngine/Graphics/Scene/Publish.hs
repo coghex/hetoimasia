@@ -68,6 +68,7 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Publish
   , scenePublisher
   , scenePublisherOver
   , HostAnswer (..)
+  , targetAnswer
 
     -- * Publishing
   , PublishResult (..)
@@ -153,14 +154,17 @@ data HostAnswer
 -- | A publisher over the session's registry and the window provider, publishing through the capability
 -- the production window port yields.
 scenePublisher ∷ Textures → WindowProvider (WindowTarget GraphicsScene) → ScenePublisher (WindowTarget GraphicsScene)
-scenePublisher textures provider = scenePublisherOver textures provider answer targetUsable
-  where
-    answer target scene =
-      targetPublish target scene <&> \case
-        WindowScenePublished _ _ → HostAccepted
-        WindowSceneUnknown _ → HostAnsweredUnknown
-        WindowSceneClosed _ → HostAnsweredClosed
-        WindowScenesNotEnabled _ → HostAnsweredShared
+scenePublisher textures provider = scenePublisherOver textures provider targetAnswer targetUsable
+
+-- | The host's answer to a publication through the production window capability, without the window identities
+-- its own answer carries.
+targetAnswer ∷ WindowTarget GraphicsScene → Prepared GraphicsScene → IO HostAnswer
+targetAnswer target scene =
+  targetPublish target scene <&> \case
+    WindowScenePublished _ _ → HostAccepted
+    WindowSceneUnknown _ → HostAnsweredUnknown
+    WindowSceneClosed _ → HostAnsweredClosed
+    WindowScenesNotEnabled _ → HostAnsweredShared
 
 -- | The same over any window capability: the lifecycle suite's, which has no window identity to mint.
 scenePublisherOver ∷ Textures → WindowProvider target → (target → Prepared GraphicsScene → IO HostAnswer) → (target → STM Bool) → ScenePublisher target

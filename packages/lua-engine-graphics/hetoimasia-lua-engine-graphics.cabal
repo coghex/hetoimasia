@@ -170,10 +170,12 @@ test-suite lua-engine-graphics-native-tests
         Test.LuaEngine.Graphics.Native.Environment
         Test.LuaEngine.Graphics.Native.Frame
         Test.LuaEngine.Graphics.Native.Loader
+        Test.LuaEngine.Graphics.Native.Scenes
         Test.LuaEngine.Graphics.Native.Session
         Test.LuaEngine.Graphics.Native.Spec
         Test.LuaEngine.Graphics.Native.Windows
         Test.LuaEngine.Graphics.Png
+        Test.LuaEngine.Graphics.SceneComp
         Test.LuaEngine.Graphics.Windows
     c-sources: native-test/cbits/hetoimasia_lua_engine_graphics_native.c
     include-dirs: native-test/cbits
@@ -210,6 +212,7 @@ test-suite lua-engine-graphics-native-tests
         hetoimasia-lua-engine ==0.1.0.0,
         hetoimasia-lua-engine-graphics,
         hetoimasia-lua-engine:request,
+        hetoimasia-lua-engine:scene,
         hetoimasia-lua-engine:texture,
         hetoimasia-math ==0.1.0.0,
         hetoimasia-render-2d ==0.1.0.0,

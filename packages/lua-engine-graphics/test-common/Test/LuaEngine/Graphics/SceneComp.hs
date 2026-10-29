@@ -56,8 +56,11 @@ import Hetoimasia.LuaEngine.Graphics.Scene
   ( GraphicsScene
   , HostAnswer
   , PublishHooks (..)
+  , PublishResult (..)
   , ScenePublisher
   , graphicsPublishBindingWith
+  , publishRefusalText
+  , publishScene
   , scenePublisherOver
   )
 import Hetoimasia.LuaEngine.Graphics.Window.Port (Port)
@@ -71,7 +74,7 @@ import Hetoimasia.LuaEngine.Profile
   , countLimit
   )
 import Hetoimasia.LuaEngine.Request
-import Hetoimasia.LuaEngine.Scene (SceneLimits, sceneLimits)
+import Hetoimasia.LuaEngine.Scene (SceneLimits, prepareScene, sceneLimits)
 import Hetoimasia.LuaEngine.Texture hiding (PresentationRole)
 import qualified Hetoimasia.LuaEngine.Texture as Tex (TextureRole (PresentationRole))
 import Hetoimasia.Render.TwoD.Vulkan.Textures (Textures)
@@ -231,7 +234,7 @@ bindings comp limits vm =
   , namespace "wrq" (m1RequestBindings (M1Service windowRequests windowValueSchema))
   , namespace "tex" [loading, releasing]
   , namespace "win" [opening]
-  , namespace "scn" [graphicsPublishBindingWith (hooksOf vm) "publish" (vmPublisher vm) limits (vmLeases vm)]
+  , namespace "scn" [graphicsPublishBindingWith (hooksOf vm) "publish" (vmPublisher vm) limits (vmLeases vm), fullScene]
   ]
   where
     log' = cpLog (scTexture comp)
@@ -285,6 +288,22 @@ bindings comp limits vm =
       openFrom values >>= \case
         Left why → pure (Just why)
         Right ask → windowArgumentCheck (vmWindow vm) (const ask) owner values
+    -- The largest legal scene, 4,096 sprites of one texture, built in Haskell and prepared by the scene package's own
+    -- check, then published through the library's operation. The host's copied-value reader counts one value more
+    -- than the scene limits' element bound allows for 4,096 sprites, so the Lua binding takes at most 4,095 (the
+    -- finding is reported in the pull request); this binding bypasses only that reader's count.
+    fullScene =
+      stateOperation "publish_full" [SCapability windowHandleType, SCapability textureHandleType] [] $ \arguments → case arguments of
+        [VCapability window, texture] → do
+          let sprite index = VRecord [("texture", texture), ("x", VInteger (index `mod` 64)), ("y", VInteger (index `div` 64)), ("width", VInteger 1), ("height", VInteger 1)]
+              value = VRecord [("clear", VRecord [("r", VInteger 0), ("g", VInteger 0), ("b", VInteger 0)]), ("sprites", VList (map sprite [0 .. 4095]))]
+          prepareScene limits (vmLeases vm) value >>= \case
+            Left refusal → ioError (userError (show refusal))
+            Right prepared →
+              publishScene (vmPublisher vm) (capabilityKey window) prepared >>= \case
+                Published → pure []
+                Refused refusal → ioError (userError (Text.unpack (publishRefusalText refusal)))
+        _ → pure []
     loadFrom ∷ [Value] → IO (Either Text TextureRequest)
     loadFrom = \case
       [VText who, VText path] → do
@@ -371,6 +390,7 @@ driverSource =
       , "    elseif p.spec == 'nan' then s.sprites[1].x = 0/0 end"
       , "    local ok, err = pcall(scn.publish, self.ws[key], s)"
       , "    out = ok and 'published' or ('error ' .. tostring(err))"
+      , "  elseif p.op == 'publish_full' then scn.publish_full(self.ws[key], self.ts.a) out = 'published'"
       , "  elseif p.op == 'mutate' then"
       , "    local s = scene(self, p, self.ts)"
       , "    scn.publish(self.ws[key], s)"

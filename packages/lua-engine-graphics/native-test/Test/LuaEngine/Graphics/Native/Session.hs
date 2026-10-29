@@ -47,7 +47,8 @@ import Hetoimasia.GLFW.Vulkan (withLoaderIntegration)
 import Hetoimasia.GPU.Model (Usage, usage)
 import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), DiagnosticVerdict, defaultCaptureConfig)
 import Hetoimasia.GPU.Vulkan.GLFW
-  ( NativeObserver (..)
+  ( FrameEvent (..)
+  , NativeObserver (..)
   , Readiness (..)
   , ValidationFeature
   , VulkanHost (..)
@@ -87,6 +88,9 @@ data Env = Env
     -- example has one.
   , envWindows ∷ !(IORef Int)
     -- ^ How many native windows the examples made, for the run's evidence and the checks that depend on it.
+  , envFrames ∷ !(TVar [FrameEvent])
+    -- ^ The host's frame events, newest first and bounded: what the owner reported of each frame's acquisition,
+    -- submission, presentation and observed completion, on its own thread.
   }
 
 -- | What the run saw, once the session is released.
@@ -149,13 +153,15 @@ runSession complete backend features configuration examples = do
   verdictCell ← newIORef Nothing
   passedCell ← newIORef False
   windowCount ← newIORef 0
+  frames ← newTVarIO []
   evidence ← newTVarIO []
   scenes ← newSceneSession
   let host = requestingBackend backend (defaultHostConfig [])
       base = vulkanHostConfig host defaultCaptureConfig {captureTextBudget = 16384} (configurationBudgets configuration) (scenesInitial scenes)
       config =
         (configureScenes scenes (configureWindows (configureHost configuration base)))
-          { vulkanLayers = ["VK_LAYER_KHRONOS_validation"]
+          { vulkanFrameObserver = \event → atomically (modifyTVar' frames (take 4096 . (event :)))
+          , vulkanLayers = ["VK_LAYER_KHRONOS_validation"]
           , vulkanValidationFeatures = features
           , vulkanObserver = const (observer recorded)
           }
@@ -172,7 +178,7 @@ runSession complete backend features configuration examples = do
           )
           vulkanWindowHost
           (\vulkan _ → pure vulkan)
-          (\vulkan control → body scenes vulkan control config evidence passedCell windowCount)
+          (\vulkan control → body scenes vulkan control config evidence passedCell windowCount frames)
   calls ← reverse <$> readIORef recorded
   verdict ← readIORef verdictCell
   passed ← readIORef passedCell
@@ -188,7 +194,7 @@ runSession complete backend features configuration examples = do
       , factsWindows = windows
       }
   where
-    body scenes vulkan control config evidence passedCell windowCount = do
+    body scenes vulkan control config evidence passedCell windowCount frames = do
       progressNote "the owner is starting"
       readiness ← atomically $
         readReadiness (vulkanController vulkan) >>= \case
@@ -209,7 +215,7 @@ runSession complete backend features configuration examples = do
         rest ← newIORef Nothing
         jobs ← newTVarIO []
         serve ← newIORef (pure ())
-        let env = Env vulkan config scenes graphics control now rest evidence jobs serve windowCount
+        let env = Env vulkan config scenes graphics control now rest evidence jobs serve windowCount frames
         done ← newEmptyMVar
         _ ← forkOS $ do
           -- The complete profile is run with Hspec's configuration reading left out, so no argument,
