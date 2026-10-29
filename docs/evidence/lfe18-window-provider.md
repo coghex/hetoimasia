@@ -41,7 +41,7 @@ Each mutation was applied to the provider, the headless `window provider` group 
 | the genuine close not routed to the stop endpoint | 2 failed: the routing examples (pending setup with capacity full; the race with the cleanup close) |
 | the provider's own cleanup close routed to the stop endpoint | 3 failed: the late-result example, the peer-retirement example and "does not stop the session or a peer when only an instance's cleanup closes its window" |
 | (round 1) abandonment of an offered, never-built result removed (the swallowed-adoption wrapper also withholds `workCancel`, as the host does once a reply is accepted) | 1 failed: "takes apart a window whose offered result was never built because the request was cancelled first, without the result being taken" |
-| (round 1) the host queue's progress baseline sampled after the attempt instead of before | 1 failed: "issues again when the host queue drained between the refusal and the waiter, and closes likewise" |
+| (round 1) the host queue's progress baseline sampled after the attempt instead of before (replaced in round 2 by waiting on the queue's room, which has no baseline) | 1 failed: "issues again when the host queue drained between the refusal and the waiter, and closes likewise" |
 
 Each failed within its bound and unwound its cleanup (the rig opens every hold and calls `endWindows` on every exit, then the provider's scope drains). The first abandonment run, before `endWindows` existed in the rig, hung in teardown until the hard timeout (the instance's end waits for the provider, the provider's scope for the instance); that is why the rig ends windows itself.
 
@@ -71,3 +71,15 @@ in the host's behaviour, bounds or approved contracts changes (the manager class
 build stays open until the settled result is taken or discarded, because the host reports that provider's work over at the
 reply and skips the cancel. Documented in `packages/scripting-lua/README.md`. All `scripting-lua` suites pass (`lua-host-tests` 631,
 `lua-runtime-tests` 1141, `lua-domains-tests` 403).
+
+## Round 2
+
+Codex round 2 (head `d0e62866`) kept four blockers, all repaired: the queue wakeup now waits on the queue's capacity
+(`commandsPending < commandsCapacity`) rather than on equality of statistics, which a fill-and-drain cycle can restore; a
+pump failure (an outcome read that raises, an asynchronous interruption) leaves every acquisition as retained terminal
+evidence with its slot held; an interrupted creation (`CreateFatal`) is that same evidence rather than a retirement; and the
+provider's endpoints are exercised on a real `runSession` coordinator (`Test.LuaEngine.Graphics.Window.Coordinator`).
+What a real coordinator cannot show here is a Lua role opening a window, because that binding is LFE-21's; the roles run an
+empty behavior, so a required-creation failure reaches the session through the provider's fatal endpoint, not through a role's
+required request (that record, `required_request` at stage `request`, is #527's policy for instances of its own VMs, and is
+asserted on the instance's failure in the composition examples, which carries `window_error`).
