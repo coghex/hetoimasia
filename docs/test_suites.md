@@ -147,8 +147,21 @@ cabal test hetoimasia-tests --test-show-details=direct
   headless Wayland compositor. See [gpu_backend.md](gpu_backend.md#the-native-suite).
   The adapter's real-device suite `lua-engine-graphics-native-tests`
   (`packages/lua-engine-graphics`, group `test.vulkan-lua-engine-native`) enters
-  the same kind of session without opening a window: it starts the production
-  graphics owner with no surface, loads real PNGs through the texture pipeline and
-  the production backend, and reads the device's evidence back. It takes the same
-  consent, and is built in the group's preparation stage and run, unbuilt, by
-  `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete`.
+  the same kind of session: it starts the production graphics owner with no
+  surface, loads real PNGs through the texture pipeline and the production
+  backend, and reads the device's evidence back. Its subgroup `window provider`
+  (LFE-18) opens real windows: two instances' visible windows on one protected
+  host, an empty scene published to each after the owner's admission, one
+  instance ended with its window destroyed after retirement while the other's
+  stays usable, a cancelled real creation, and a genuine native close made through
+  `Hetoimasia.GLFW.NativeCheck`, routed to one session stop. It takes the same
+  desktop consent as `vulkan-native-tests`, under the same standing approval (on
+  macOS `HETOIMASIA_NATIVE_SESSION=desktop` on the one command; on Linux the
+  runner starts its own X11 display), and is built in the group's preparation
+  stage and run, unbuilt, by
+  `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete`;
+  the subgroup alone by the same command with `-- --match 'window provider'`. Its
+  headless counterpart is the `window provider` group of `lua-engine-graphics-tests`
+  (group `test.vulkan-headless`), a gated fake port inside the real request
+  admission, leases and a Lua owner; the shared composition lives in the
+  package's `test-common` directory, not in either suite's spec modules.

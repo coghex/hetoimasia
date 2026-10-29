@@ -1,7 +1,8 @@
 # Lua-first engine graphics adapter
 
 Buildable package: `hetoimasia-lua-engine-graphics`, in `packages/lua-engine-graphics`
-(LFE-17, [#532](https://github.com/coghex/hetoimasia/issues/532)).
+(LFE-17, [#532](https://github.com/coghex/hetoimasia/issues/532); the window provider, LFE-18,
+[#533](https://github.com/coghex/hetoimasia/issues/533), [below](#the-window-provider-lfe-18)).
 
 The concrete backend of the texture pipeline's port
 ([`packages/lua-engine/README.md`](../lua-engine/README.md#the-texture-pipeline-lfe-16)). A texture request
@@ -191,6 +192,158 @@ owner nor touches a peer's independent texture.
   The run writes `lua-engine-graphics-native.md` into `HETOIMASIA_VALIDATION_EVIDENCE` when set: revision, source
   digest, command, platform and driver manifest, validation outcome and the accounting each example measured. A run
   without consent refuses and exits non-zero; a skipped run is not a pass.
+
+## The window provider (LFE-18)
+
+`Hetoimasia.LuaEngine.Graphics.Window.*` answers a request for **one instance-owned window** asynchronously. It is a
+composable typed endpoint, not a Lua API: the eventual graphics facade (LFE-21) validates the Lua table with
+`askWindow`, builds its binding from `startWindow` beside `windowArgumentCheck`, registers the handle type `window` over
+its `Leases`, and binds nothing to release (M1 offers no independent close, reopen or release: the window lives until
+its instance ends or the session quits). The agreed call is `api.window.open({title = TEXT, width = INTEGER, height =
+INTEGER})`; every field is required; success is **the owned window handle itself**, not a table. The CPU Lua-engine and
+content packages stay free of GLFW and Vulkan: everything here is this package's, over the host's public modules.
+
+| Module | What it is |
+| --- | --- |
+| `…Window.Request` | Pure: the title and size rules (`windowRequest`) and their refusals. |
+| `…Window.Port` | The boundary to the hosts, as values: the seam the lifecycle suite injects. Opaque tokens, never reissued. |
+| `…Window.Provider` | The provider (`withWindowProvider`), the owner slots, the service, the endpoint, the state machine and its one pump, the main-thread step. |
+| `…Window.Host` | The production `Port`, over a running `VulkanHost`; yields `WindowTarget`, the right to publish a scene to one window's incarnation. |
+| `…Window.Configuration` | What the fixed two-window profile asks of the host (`configureWindows`, `checkWindowHost`). |
+
+### Validation before anything is reserved
+
+* **Title**: valid UTF-8, at most **512 encoded bytes**, and no Unicode general category `Cc` character (U+0000–U+001F,
+  U+007F, U+0080–U+009F), checked in that order. The empty title is allowed. The host itself refuses only NUL; the stricter
+  rule is the adapter's.
+* **Width and height**: whole values `1..4096` in native window screen-coordinate units, taken as the Lua integer subtype
+  (`Int64`; an integral float is refused by the binding). They are preferences, never observations of an actual logical
+  or framebuffer size. The range is checked before any narrowing to the host's `Int`, so a value beyond Int32 or Int64 is
+  refused whole, never wrapped or clamped.
+* **Role, phase, identity**: acquisition is presentation-instance hook work. A logical instance, a wrong phase, a
+  closed owner, a foreign owner and a stopping provider are ordinary Lua errors (`windowArgumentCheck`, then the
+  admission's own checks), decided before any bank is asked and with no native work.
+
+### Admission
+
+One atomic admission reserves, before the provider is handed anything: the request and result records and places (16
+per instance, 64 per VM, the host's), the result lease capacity, **the instance's one window slot**, and **one of the
+provider's bounded work records** (`windowRecords`; two for the fixed profile).
+
+| Credit | Full means | Returned |
+| --- | --- | --- |
+| window owner (nothing is reserved) | the owner or provider has ended: permanent refusal | n/a |
+| window slot | the instance already has a pending, live or retiring window: **permanent** error, decided first so a full temporary bank never turns it into busy | by the pump, at **actual retirement** (graphics and native), never by the host's return of a credit and never by a lease's release |
+| window records | busy (the host's answer, naming the bank): no command, no partial credit, no hidden retry | when the host returns the request's record |
+
+An already occupied slot stays the permanent second-window error even when the records bank is full; a busy answer
+leaves no latent failure and nothing issued. Once accepted, downstream pressure (the host's bounded command queue, a
+deferred announcement) keeps the accepted work pending and bounded: it is never a busy refusal and never an unbounded
+queue.
+
+### The state machine of an acquisition
+
+```
+Queued ──issue──▶ Issued ──created──▶ Open ToAttach ──main thread──▶ Open Attached ──standing usable──▶ offered ──▶ adopted by the lease
+   │                │                                                       │
+   │                └─ refused clean ▶ window_error                         └─ refused clean ▶ window_error, then close
+   └─ cancelled before issuance ▶ retired (no native work)
+every Open state ──(cancel | instance end | session stop | refusal | fault)──▶ close begun ──▶ graphics retired ∧ native disposed ──▶ retired
+```
+
+* **Create and attach before publishing readiness.** A visible, decorated, resizable, no-client-API window is created by a
+  command on the host's bounded queue (executed on the main thread by its owner loop). The creation token is tracked from
+  the moment the command is issued, so an uncollected ticket never makes an untracked window. The graphics handover
+  runs on the process main thread, from `windowMainStep` (the owner loop's turn), and a deferred announcement is repeated
+  on the **same attachment** by the same step: no second surface or window is ever built to retry an accepted stage.
+* **Readiness** is the graphics owner's own answer for the attachment (`readTargetStanding == TargetUsable`, with the
+  attachment still attached) and the capability to publish a scene to **that window's incarnation**
+  (`WindowTarget`), read in the transaction that decides to offer the result. `WindowCreated`, an attachment, a handover,
+  a deferred announcement and an allocated surface are not success. No texture, authored scene, acquired frame or
+  presentation is required; a minimized window may be ready while drawing is suspended.
+* **Publication.** The result is offered as a resource the host builds, on the owner's thread, into the lease the request
+  reserved: the reserved capacity becomes real lease tracking in the same step that publishes the result. The resource is
+  opaque and the instance's alone; it carries only the publication capability, no native control, input reader or
+  disposal authority. It is valid whether or not Lua ever takes the request.
+* **Cancellation** that wins withdraws interest and settles `cancelled` with no required-failure latch. If success settled
+  first, `cancel` answers `already_settled` and cannot close the window. A late success is suppressed and every partial
+  acquisition is retired safely; native work already issued is allowed to finish far enough to retire (a command ticket
+  cannot be retracted, and its future client capability is not discarded). A cancelled request's final result still
+  follows take-once consumption.
+* **Retirement** is two separately observed outcomes: graphics use and the attachment retired (`SlotFree`), and the native
+  window destroyed (`WindowReleased`). A close ticket, a cancellation acknowledgement, a worker exit, CPU scope exit or a
+  timeout is neither. A release that failed is recorded, fatal, never attempted twice and **never frees the slot**.
+
+### Close: user versus cleanup
+
+A **genuine** native close request is the newest `CloseRequest` in the window's **own** observations (a per-window
+increasing number latched only by the native close callback), observed from the window's creation until it retires: while
+the request is pending, before root `init` returns, with the startup gate closed, and while a cleanup close is racing it.
+It is routed to the session's idempotent, slot-free stop endpoint (`windowStop`), which closes admission before further
+work can escape. Lua cannot veto it. Per-window state is the newest number routed; the provider never clears a request
+(`rejectHostCloseRequest`) and never routes the same number twice. `WindowClosing`, `WindowEnded`, a native destruction
+notice and any close the provider itself begins (cancellation, instance end, a refusal, session stop) are **never** a user
+close, so ending an instance neither synthesises a session quit nor ends a healthy peer. Signals and exit codes are not here.
+
+### Error classification
+
+| Outcome | Becomes |
+| --- | --- |
+| `WindowCreationFailed` after a clean rollback; `VulkanHandoverRolledBack` with `RollbackSafe`; a target the owner rolled back with `TargetUnusable False` and a recorded surface rejection (`TargetSurfaceUnsupported`, a surface not created or unusable) | expected required failure `window_error` (message bounded to 2 KiB, no root or path), latched even if unread, at the next safe scheduler boundary; the session policy (#527) applies it. Its role failure is `required_request` at stage `request`. |
+| `VulkanRootsNotReady`, `VulkanAnnouncementDeferred` | bounded waiting on the same window and attachment |
+| `VulkanOwnerClosed`, `VulkanHandoverSuperseded`, `GraphicsAdmissionEnded`, `GraphicsWindowClosing`/`GraphicsWindowUnavailable`, a creation `NotExecuted`, `StandingEnded` | the cancellation, stop or cleanup path; never `window_error` |
+| `RollbackUnsafe`, an interrupted creation ticket, partial or unverified construction, `VulkanSessionFailed`, `VulkanDiagnosticPending`, `VulkanHandoverUnavailable`, `GraphicsSlotUnavailable`, `GraphicsWindowOccupied`, `GraphicsForeignSession`, `WindowCapacityReached`, `WindowCreationPoisoned`, `WindowConfigInvalid` after the adapter's validation, a failed disposal, a failed owner | **fatal**: latched once, handed to `windowFatal` (the session's terminal failure); never `window_error`, busy or a retry |
+
+An outcome that fits none of these returns to the manager rather than being classified ad hoc.
+
+### Owners, threads, lifetimes
+
+| State | Owner | Writers | Readers | Thread | Lifetime / disposal |
+| --- | --- | --- | --- | --- | --- |
+| Provider state (`PState`: acquisitions, prepared requests, records count, fatal latch) | the provider scope (`withWindowProvider`) | admission and credit returns (STM), the host's `workCancel`, the pump, the main step, the lease's adopt and release | any | STM | the scope; the drain waits until every window retired or failed to |
+| An acquisition | the provider | the same | the pump; the lease's retirement reading | STM | admission to the pump's return of its slot, which is its removal |
+| The window slot (`WindowOwner`) | one UI instance's bindings | admission (reserve), the pump (return) | admission, the argument check | STM | until the window's actual retirement |
+| The pump | the provider's worker group | — | — | one thread, never the main thread | started by the scope, stopped after the drain |
+| The main step (`windowMainStep`) | the application's owner loop | — | — | the process main thread | one bounded step per turn |
+| The production port's tables (creation tickets, windows, services, close tickets) | the port | the pump and the main step, by transactions | the pump | STM | one entry per window made; never reissued |
+| The window resource in the lease | the requesting instance | the adoption recipe | the later scene adapter, through the lease | owner's thread | until the lease releases it (instance end) |
+
+The pump waits only in STM, on the variables the next fact lives in (a creation ticket, a standing, a window's own close
+observation, a retirement reading, the host command queue's statistics for pressure). No timer, frame, Lua poll or peer
+drives progress; a window held up in retirement never blocks the service of another.
+
+### Invariants (the D-80 table)
+
+| Window | Owner / resource | Terminal authority | What makes it hold |
+| --- | --- | --- | --- |
+| admission → record | the credits | the pump (slot), the host (record) | all three credits are reserved in the host's one admission transaction or none is; a request the endpoint never received returns its slot in the credit release (no acquisition exists) |
+| accepted → issuance | nothing native | — | a request cancelled while `Queued` retires with no native call |
+| issuance → tracking | the creation token | the acquisition | the token is recorded in the same masked step that learns it; a full host queue is recorded as a wait on the queue's progress and re-issued, never lost |
+| creation → handover | the native window | the acquisition | the host registers the window before its ticket settles; the ticket's outcome is read and the window token recorded in one pump transaction |
+| handover → announcement | the attachment, its surface | the host (`announceVulkanTarget`) | a deferred announcement stays attached under bounded progress and is repeated on the same attachment |
+| announcement → admission | the owner's target | the owner | success reads the owner's standing, never the handover |
+| admission → publication | the target capability | the lease | the success is claimed in the transaction that reads standing and the capability; a cancellation after it suppresses nothing the lease owns, one before it wins and the window is taken apart |
+| publication → adoption | the offered resource | the lease or the provider | a build the host never ran leaves the window with the provider (`workCancel`, or the credit's release), which takes it apart |
+| cancellation | any phase | the acquisition | interest is withdrawn; the step in flight finishes; the window is closed once and retired |
+| close request | the window's observation | the stop endpoint | read in the transaction that decides what else the window needs; routed before cleanup continues; the newest number routed is remembered |
+| retirement | graphics, native | the pump | both observed separately; a failure is fatal and keeps the slot |
+| slot return | the owner's slot | the pump | at the transition to retired only, idempotent, never by a credit or a lease's release |
+| provider close | every acquisition | the drain | admission closes; every window, adopted or not, is taken apart; the drain waits in STM outside any uninterruptible release; a cancellation delivered meanwhile is remembered and raised after |
+
+### Tests
+
+* **`lua-engine-graphics-tests`** (group `test.vulkan-headless`), `window provider`: the pure rules, the host
+  configuration, and the provider over a gated fake port inside the real composition (real admission, real leases, a real
+  supervised Lua owner): admission and its banks, every stage held separately, cancellation at each stage and both
+  settlement orders, instance end, retirement gated on graphics and native independently, close routing and its races,
+  failures and pressure. The fake is injected evidence: it proves ordering, ownership and routing, never a window.
+* **`lua-engine-graphics-native-tests`** (group `test.vulkan-lua-engine-native`), subgroup **`window provider`**: two real
+  windows for two instances on one protected host, each success followed by the owner's admission and an empty scene, one
+  instance ended with the peer usable, a cancelled real creation with its late native result closed, and a genuine native
+  close made through the test-only driver `Hetoimasia.GLFW.NativeCheck`. Run it alone with
+  `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:lua-engine-graphics-native-tests -- --match 'window provider'`
+  (on macOS `HETOIMASIA_NATIVE_SESSION=desktop` on that command; on Linux the runner starts its own X11 display). It
+  claims no visual pixel and no completed GPU frame.
 
 ## Limits
 
