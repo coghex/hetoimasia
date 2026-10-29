@@ -124,6 +124,7 @@ import Control.Exception
   , SomeException
   , fromException
   , mask
+  , mask_
   , rethrowIO
   , throwIO
   , toException
@@ -882,9 +883,11 @@ putAcq provider key acq = modifyState provider $ \st → st {psAcqs = Map.insert
 -- | Issue the creation command, and track its token in the same masked step that learns it: an
 -- uncollected command ticket never becomes an untracked window.
 issue ∷ WindowProvider target → Word64 → Acq → IO ()
-issue provider key acq = mask $ \restore → do
+issue provider key acq = mask_ $ do
   let request = aRequest acq
-  issued ← restore (portIssueCreate (wpPort provider) (requestTitle request) (requestWidth request) (requestHeight request))
+  -- Masked throughout: the port's issue is a nonblocking submission, and nothing may be delivered between the
+  -- host queue taking the command and this record holding its token.
+  issued ← portIssueCreate (wpPort provider) (requestTitle request) (requestWidth request) (requestHeight request)
   case issued of
     CreateIssued ticket → atomically (updateAcq provider key (\current → current {aPhase = Issued ticket}))
     CreateQueueFull -> do

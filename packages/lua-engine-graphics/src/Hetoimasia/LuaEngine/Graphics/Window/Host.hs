@@ -44,7 +44,7 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask_)
 import Control.Monad (when)
 import Data.Functor ((<&>))
 import Data.Map.Strict (Map)
@@ -151,7 +151,9 @@ hostPort vulkan = do
   let commands = hostCommandPort (vulkanWindowHost vulkan)
   pure
     Port
-      { portIssueCreate = \title width height →
+      { portIssueCreate = \title width height → mask_ $
+          -- Masked: the host's queue takes the command and the port records its ticket in one step, so a
+          -- command that was admitted is never one nobody holds the ticket of.
           submitWindowCommand commands [("client", "lua-window")] (createWindowCommand (defaultWindowConfig title width height)) >>= \case
             SubmitAccepted ticket → atomically $ do
               st ← readTVar var
@@ -211,7 +213,10 @@ createOutcome var number = do
 -- Attachment (main thread) ---------------------------------------------------------------------------
 
 attach ∷ VulkanHost scene → TVar HostState → WindowToken → IO AttachOutcome
-attach vulkan var token = do
+attach vulkan var token = mask_ $ do
+  -- Masked: the handover, which creates the surface under the attachment and announces it, and the record
+  -- of the attachment's service are one step, so a window handed over is never one whose service is lost
+  -- (a second handover would meet an occupied slot, which is fatal). The handover is a short main-thread call.
   found ← atomically (Map.lookup token . hsMade <$> readTVar var)
   case found of
     Nothing → pure (AttachFault (Fatal "a window was attached that was never made"))
