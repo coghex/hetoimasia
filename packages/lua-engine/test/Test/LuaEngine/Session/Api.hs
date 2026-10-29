@@ -273,11 +273,15 @@ statusCapture = describe "the capture of a segment" $ do
         requestStop session StopQuit
         void (awaitRetired session)
       out ← outLines world
-      out
-        `shouldBe` [ "ui init " <> sessionDump False (roleDump False "starting") (roleDump False "starting")
-                   , "init gameplay"
-                   , "ui shutdown " <> sessionDump True (roleDump True "stopping") (roleDump True "stopping")
-                   ]
+      -- the presentation role's shutdown begins when the stop reaches its owner; the logical role, stopped at the same time, may
+      -- or may not have retired by then, and the capture says whichever it was
+      let shutdownWith gameplayPhase = "ui shutdown " <> sessionDump True (roleDump True gameplayPhase) (roleDump True "stopping")
+          expected gameplayPhase =
+            [ "ui init " <> sessionDump False (roleDump False "starting") (roleDump False "starting")
+            , "init gameplay"
+            , shutdownWith gameplayPhase
+            ]
+      out `shouldSatisfy` (`elem` [expected "stopping", expected "retired"])
 
   it "gives two instances of one VM captures of their own: editing one's result changes nothing another reads" $
     withSetup ((setup (roleScript twins)) {suShape = PresentationAlone, suHarness = noHarness {harnessSecond = [Presentation]}}) $ \env → do
