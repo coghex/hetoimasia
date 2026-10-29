@@ -121,3 +121,28 @@ Negative controls of round 4 (broken once, restored): adoption throwing for an u
 the direct one failed (2); the cut at 2 KiB widened to 4 KiB → the bounded-record example failed (1). The window group ran
 three more times in a row without a failure. The complete native profile (eight examples, windows included) ran in about
 four seconds of wall time, inside the group's 30-second watchdog.
+
+## Round 6
+
+Round 5 found that the exact `take` record was asserted through an optional request, which is not the request the facade
+uses, so the required request's handled case was not tested. The claim made in round 4, that a required request's record
+cannot be read before it fails the instance, was too strong: it cannot be read after the invocation that was running when the
+request settled has ended, but a script still inside that invocation can take it. The round-4 paragraph above is superseded by
+this one.
+
+Repair: the examples now run the real required request. A script command holds one invocation at a gate of its own
+(`fx.block`, opened only by the example, with every gate opened when the example ends). While it is held, the clean refusal
+settles (a creation refused, then a target refused with a verified rollback); the example waits until the window is taken apart
+and the slot is back, lets the script go, and it finds the request ready and takes the record: failure status, code
+`window_error`, the message cut at 2 KiB for the creation refusal, and no root or path. The instance then fails, attributed to
+the `window` endpoint, and no provider fault is latched. The optional seam (`windowServiceFor`, `startWinVmFor`) is removed,
+because nothing needs it any more; the window request is required everywhere.
+
+Sweep of the same shape: the other examples that mention `window_error` are the unread case (kept, the invocation ends without
+the script reading it), the fatal creation fault (which must never produce the record) and the coordinator examples (no role
+can open a window until LFE-21, deferred to #536 by the owner). No other example stands in an optional request for a required
+claim.
+
+Negative controls of round 6 (broken once, restored, never committed): the cut at 2 KiB widened to 4 KiB → the creation-refusal
+example failed (1); the window service made optional so that nothing latches → both handled examples failed (2), the instance
+never failing within the example's bound.
