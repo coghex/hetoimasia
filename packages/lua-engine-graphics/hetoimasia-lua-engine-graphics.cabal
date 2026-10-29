@@ -88,6 +88,11 @@ test-suite lua-engine-graphics-tests
         Test.LuaEngine.Graphics.Spec
         Test.LuaEngine.Graphics.Stages
         Test.LuaEngine.Graphics.Teardown
+        Test.LuaEngine.Graphics.Window.Fake
+        Test.LuaEngine.Graphics.Window.Request
+        Test.LuaEngine.Graphics.Window.Rig
+        Test.LuaEngine.Graphics.Window.Spec
+        Test.LuaEngine.Graphics.Windows
     build-depends:
         base >=4.22 && <4.23,
         array >=0.5 && <0.6,

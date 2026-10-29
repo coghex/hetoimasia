@@ -11,6 +11,7 @@ import qualified Test.LuaEngine.Graphics.Pressure as Pressure
 import qualified Test.LuaEngine.Graphics.Release as Release
 import qualified Test.LuaEngine.Graphics.Stages as Stages
 import qualified Test.LuaEngine.Graphics.Teardown as Teardown
+import qualified Test.LuaEngine.Graphics.Window.Spec as Window
 import Test.Hspec (Spec)
 
 spec ∷ Spec
@@ -24,3 +25,4 @@ spec = do
   Teardown.spec
   Lifecycle.spec
   Composed.spec
+  Window.spec

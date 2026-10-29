@@ -67,6 +67,7 @@ module Hetoimasia.LuaEngine.Graphics.Window.Provider
   , WindowProvider
   , withWindowProvider
   , providerFatal
+  , WindowDefect (..)
   , ProviderReading (..)
   , providerReading
 
@@ -632,10 +633,18 @@ returnRecord provider charge = do
 -- A slot whose request never reached the provider (an admission taken back, the endpoint never given the
 -- request) is returned here, since no acquisition will ever retire it. One that reached the provider is the
 -- pump's, at retirement.
+--
+-- The host returns a credit that transfers only for a request that did not end with a resource a lease built.
+-- So an acquisition that is still here and was never adopted is one the host dropped (its answer was cancelled
+-- or its build never ran): no lease will ever own the window, and the provider takes it apart.
 releaseSlotIfUnused ∷ WindowProvider target → Charge → Word64 → STM ()
 releaseSlotIfUnused provider charge token = do
   st ← readTVar (wpState provider)
-  unless (Map.member token (psAcqs st)) (returnSlot charge)
+  case Map.lookup token (psAcqs st) of
+    Nothing → returnSlot charge
+    Just acq
+      | aAdopted acq → pure ()
+      | otherwise → endAcq provider token EndCancelled
 
 returnSlot ∷ Charge → STM ()
 returnSlot charge = do
@@ -692,9 +701,13 @@ accept provider token completion = do
   unless placed $ throwIO (WindowDefect "the window endpoint was handed a request that was never prepared")
   pure
     ProviderWork
-      { workCancel = atomically (endAcq provider token EndCancelled)
+      { -- A window the lease owns is the lease's: interest in the request ending never closes a window the
+        -- instance holds. The lease's release, or the provider's close, ends it.
+        workCancel = atomically (leaseless >>= \ownedByLease → unless ownedByLease (endAcq provider token EndCancelled))
       , workRetirement = retirementOf provider token
       }
+  where
+    leaseless = maybe False aAdopted . Map.lookup token . psAcqs <$> readTVar (wpState provider)
 
 -- | Withdraw interest in an acquisition, or begin ending it: sets the cause once. Nothing native is done.
 endAcq ∷ WindowProvider target → Word64 → EndCause → STM ()
@@ -702,18 +715,28 @@ endAcq provider token cause = modifyState provider $ \st →
   st {psAcqs = Map.adjust (\acq → if isNothing (aEnd acq) then acq {aEnd = Just cause} else acq) token (psAcqs st)}
 
 -- | The provider's reading of where an acquisition's retirement stands: it only reads.
+--
+-- This is the /request's/ work: it is over once the window is retired or once the lease owns it (the lease's
+-- own release then carries the retirement, below).
 retirementOf ∷ WindowProvider target → Word64 → STM RetirementState
-retirementOf provider = retirementIn (wpState provider)
-
-retirementIn ∷ TVar PState → Word64 → STM RetirementState
-retirementIn var token = do
-  st ← readTVar var
+retirementOf provider token = do
+  st ← readTVar (wpState provider)
   pure $ case Map.lookup token (psAcqs st) of
-    Nothing → ProviderComplete
-    Just acq
-      | Just (Fatal why) ← aRetireFailed acq → ProviderFailed (toException (WindowDefect why))
-      | aAdopted acq || aRetired acq → ProviderComplete
-      | otherwise → ProviderPending
+    Just acq | aAdopted acq, isNothing (aRetireFailed acq) → ProviderComplete
+    _ → settledOrPending (Map.lookup token (psAcqs st))
+
+-- | The retirement itself: complete only when graphics use and the native window have both retired (or the
+-- acquisition is gone, which only retirement causes). Used by the lease, whose slot must wait for it.
+retirementIn ∷ TVar PState → Word64 → STM RetirementState
+retirementIn var token = settledOrPending . Map.lookup token . psAcqs <$> readTVar var
+
+settledOrPending ∷ Maybe Acq → RetirementState
+settledOrPending = \case
+  Nothing → ProviderComplete
+  Just acq
+    | Just (Fatal why) ← aRetireFailed acq → ProviderFailed (toException (WindowDefect why))
+    | aRetired acq → ProviderComplete
+    | otherwise → ProviderPending
 
 -- The pump ---------------------------------------------------------------------------------------------
 
@@ -751,7 +774,12 @@ nextStep provider token = do
   failure ← portOwnerFailure (wpPort provider)
   case failure of
     Just found | isNothing (psFatal st) → latchSTM provider found >> pure StepProgress
-    _ → go st (Map.toAscList (psAcqs st))
+    _
+      -- A fatal fault is handed to the session once, by the pump, whoever recorded it and on whichever thread.
+      | Just found ← psFatal st, not (psEscalated st) → do
+          writeTVar (wpState provider) st {psEscalated = True}
+          pure (StepIO (windowFatal (wpConfig provider) found))
+      | otherwise → go st (Map.toAscList (psAcqs st))
   where
     go st [] = do
       stopping ← stopRequested token
