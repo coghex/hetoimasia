@@ -4,6 +4,7 @@ module Test.LuaEngine.Facade.Spec (spec) where
 import qualified Test.LuaEngine.Facade.Authoring as Authoring
 import qualified Test.LuaEngine.Facade.Client as Client
 import qualified Test.LuaEngine.Facade.Clocks as Clocks
+import qualified Test.LuaEngine.Facade.Control as Control
 import qualified Test.LuaEngine.Facade.Imports as Imports
 import qualified Test.LuaEngine.Facade.Limits as Limits
 import qualified Test.LuaEngine.Facade.Output as Output
@@ -26,4 +27,5 @@ spec = describe "Facade" $ do
   Sinks.spec
   Client.spec
   Validation.spec
+  Control.spec
   Limits.spec

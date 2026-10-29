@@ -78,6 +78,16 @@ module Hetoimasia.LuaEngine.Facade
   ( -- * The services a facade is injected with
     AdmissionState (..)
   , FacadeEndpoints (..)
+  , SessionEndpoints (..)
+  , StatusSample (..)
+  , RoleSample (..)
+  , FailureSample (..)
+  , TerminalStage (..)
+  , TerminalContext (..)
+  , stateUnavailableMessage
+  , statusSchema
+  , statusValue
+  , failureValue
   , EngineFailure (..)
   , OutputSink (..)
   , Stream (..)
@@ -157,6 +167,7 @@ import Hetoimasia.LuaEngine.Facade.Caller
 import Hetoimasia.LuaEngine.Facade.Content (contentBindings, dataHandleName, lexicalResolver, moduleHandleName, validRootId)
 import Hetoimasia.LuaEngine.Facade.Output
 import Hetoimasia.LuaEngine.Facade.Request (requestBindings)
+import Hetoimasia.LuaEngine.Facade.Session (captureStatus, failureValue, forgetStatus, sessionBindings, statusSchema, statusValue)
 import Hetoimasia.LuaEngine.Facade.Source (builderIdentity, builderSource, engineChunk, engineChunkName)
 import Hetoimasia.LuaEngine.Facade.Time (forgetSamples, segmentStarted, timeBindings)
 import Hetoimasia.LuaEngine.Facade.Types
@@ -211,6 +222,8 @@ data FacadeSpec = FacadeSpec
   , fsOutput ∷ !Output
   -- ^ The session's authored output, shared by every VM.
   , fsEndpoints ∷ !FacadeEndpoints
+  , fsSession ∷ !SessionEndpoints
+  -- ^ The session's narrow control endpoints: the status capture, the normal stop and the terminal latch.
   , fsPhase ∷ !ModulePhase
   -- ^ The phase flag the coordinator's loader sets while a module's top level runs: the one the
   -- coordinator was made with.
@@ -249,6 +262,7 @@ newFacade spec = case limits of
         registry ← newRegistry
         origin ← newTVarIO Nothing
         samples ← newTVarIO Map.empty
+        captures ← newTVarIO Map.empty
         pure . Right $
           Facade
             { fcRole = fsRole spec
@@ -266,6 +280,8 @@ newFacade spec = case limits of
             , fcTickDuration = fsTickDuration spec
             , fcRegistry = registry
             , fcTime = TimeState origin samples
+            , fcSession = fsSession spec
+            , fcStatus = StatusState captures
             }
   where
     profile = m1Profile (fsRequests spec)
@@ -379,6 +395,7 @@ forgetInstance facade identity = do
     forgetRecord (fcRegistry facade) identity
     pure (held >>= recordNumber)
   mapM_ (forgetSamples facade) number
+  mapM_ (forgetStatus facade) number
 
 -- Installing ---------------------------------------------------------------------------------------
 
@@ -439,13 +456,14 @@ facadeNamespace facade =
         <> contentBindings facade
         <> requestBindings facade
         <> timeBindings facade
+        <> sessionBindings facade
     )
 
 -- | A configuration of a VM's instances that tells the facade whenever a hook begins or resumes, after
 -- whatever the configuration already did.
 facadeInstanceConfig ∷ Facade → InstanceConfig → InstanceConfig
 facadeInstanceConfig facade config =
-  config {instanceOnSegment = \found → segmentStarted facade found >> instanceOnSegment config found}
+  config {instanceOnSegment = \found → segmentStarted facade found >> captureStatus facade found >> instanceOnSegment config found}
 
 -- | What the application's 'scheduledRefusedWait' does for a facade: the scheduler refused a wait that the
 -- facade's own binding had checked and prepared, which can only be because the clock moved between the

@@ -1,9 +1,11 @@
 -- | The session coordinator's examples (LFE-13), composed under one @Session@ group.
 module Test.LuaEngine.Session.Spec (spec) where
 
+import qualified Test.LuaEngine.Session.Api as Api
 import qualified Test.LuaEngine.Session.Client as Client
 import qualified Test.LuaEngine.Session.Clocks as Clocks
 import qualified Test.LuaEngine.Session.Commit as Commit
+import qualified Test.LuaEngine.Session.Control as Control
 import qualified Test.LuaEngine.Session.Construction as Construction
 import qualified Test.LuaEngine.Session.Diagnostics as Diagnostics
 import qualified Test.LuaEngine.Session.Evidence as Evidence
@@ -24,4 +26,6 @@ spec = describe "Session" $ do
   Construction.spec
   Commit.spec
   Diagnostics.spec
+  Control.spec
+  Api.spec
   Client.spec

@@ -60,6 +60,7 @@ module Hetoimasia.LuaEngine.Session
   , sessionDiagnosticsEnded
   , requestStop
   , latchTerminalFailure
+  , sessionEndpoints
 
     -- * What it publishes
   , StopKind (..)
