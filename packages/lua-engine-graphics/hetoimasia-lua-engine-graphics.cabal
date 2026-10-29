@@ -39,6 +39,9 @@ library
         Hetoimasia.LuaEngine.Graphics.Texture.Configuration
         Hetoimasia.LuaEngine.Graphics.Texture.Host
         Hetoimasia.LuaEngine.Graphics.Texture.Port
+        Hetoimasia.LuaEngine.Graphics.Window.Port
+        Hetoimasia.LuaEngine.Graphics.Window.Provider
+        Hetoimasia.LuaEngine.Graphics.Window.Request
     build-depends:
         base >=4.22 && <4.23,
         bytestring >=0.12 && <0.13,
@@ -51,9 +54,11 @@ library
         hetoimasia-gpu-vulkan-model ==0.1.0.0,
         hetoimasia-gpu-vulkan-native ==0.1.0.0,
         hetoimasia-lua-engine ==0.1.0.0,
+        hetoimasia-lua-engine:request,
         hetoimasia-lua-engine:texture,
         hetoimasia-render-api ==0.1.0.0,
         hetoimasia-render-2d-vulkan ==0.1.0.0,
+        hetoimasia-scripting-lua ==0.1.0.0,
         hetoimasia-scripting-lua:runtime-lua
 
 -- The adapter's lifecycle contracts over an injected owner and completion boundary, registered with the
