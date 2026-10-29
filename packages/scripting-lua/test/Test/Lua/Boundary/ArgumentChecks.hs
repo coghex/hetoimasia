@@ -59,6 +59,9 @@ registrationOf fx = either (error . ("registration refused: " <>) . show) id (re
             stateOperation "ordered" [SInteger] [] (\_ → note fx "ordered" >> pure [])
         , withArgumentCheck (\_ _ → ioError (userError "the check failed")) (stateOperation "explodes" [SInteger] [] (\_ → note fx "explodes" >> pure []))
         , withArgumentCheck (\_ _ → pure (Just (Text.replicate (refusalReasonLimit + 1) "r"))) (stateOperation "wordy" [SInteger] [] (\_ → note fx "wordy" >> pure []))
+        , -- An ordinary refusal made from inside the action, before it has any effect: opted in, then not.
+          withArgumentCheck (\_ _ → pure Nothing) (stateOperation "closing" [SInteger] [] (\_ → note fx "closing" >> refuseOrdinarily "the world is ending"))
+        , stateOperation "plain" [SInteger] [] (\_ → note fx "plain" >> refuseOrdinarily "the world is ending")
         , withArgumentCheck (positive "ticket") (stateOperation "redeem" [SCapability "ticket"] [] (\_ → note fx "redeem" >> pure []))
         , snapshotQuery "ticket" [SInteger] [SCapability "ticket"] $ \arguments → case arguments of
             [VInteger key] → do
@@ -126,3 +129,15 @@ spec = describe "a check of the copied argument values" $ do
       fault ← runFault owned "pcall(checked.wordy, 1)"
       fmap refusalRule (refusal fault) `shouldSatisfy` (== Just (RuleBytesLimit refusalReasonLimit))
       logged fx >>= (`shouldBe` [])
+
+  it "lets an action refuse the call ordinarily before it has any effect: pcall catches it for an opted-in binding and the invocation succeeds" $
+    withFx $ \fx owned → do
+      run owned (caught "checked.closing(1)" "checked.closing: the world is ending")
+      -- The action ran, as the refusal is made from inside it; nothing else did.
+      logged fx >>= (`shouldBe` ["closing"])
+
+  it "is a fault of the call, whatever the script does, for a binding that did not opt in" $
+    withFx $ \fx owned → do
+      fault ← runFault owned "pcall(checked.plain, 1)"
+      fmap refusalRule (refusal fault) `shouldSatisfy` (/= Just (RuleBytesLimit refusalReasonLimit))
+      logged fx >>= (`shouldBe` ["plain"])
