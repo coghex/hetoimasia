@@ -287,7 +287,7 @@ fakePort fake@(Fake var) =
                     graphics = if graphicsDone then GraphicsRetired else GraphicsInUse
                     native
                       | not graphicsDone || Set.member HoldNative (fsHolds st) = NativePending
-                      | winNativeFails win = NativeDisposalFailed (Fatal "the native window's release failed")
+                      | winNativeFails win = NativeDisposalFailed (CleanupFatal "the native window's release failed")
                       | otherwise = NativeDisposed
                  in Retirement graphics native
     , portTarget = \(WindowToken key) → do

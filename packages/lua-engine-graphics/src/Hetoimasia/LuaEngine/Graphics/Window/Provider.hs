@@ -744,7 +744,7 @@ settledOrPending ∷ Maybe Acq → RetirementState
 settledOrPending = \case
   Nothing → ProviderComplete
   Just acq
-    | Just (Fatal why) ← aRetireFailed acq → ProviderFailed (toException (WindowDefect why))
+    | Just found ← aRetireFailed acq → ProviderFailed (toException (WindowDefect (fatalText found)))
     | aRetired acq → ProviderComplete
     | otherwise → ProviderPending
 
@@ -827,7 +827,12 @@ stepOf provider key acq
       returnSlot (aCharge acq)
       modifyState provider $ \st → st {psAcqs = Map.delete key (psAcqs st)}
       pure (Just StepProgress)
-  | isJust (aRetireFailed acq) = pure Nothing
+  | isJust (aRetireFailed acq) = case aPhase acq of
+      -- Retained as evidence, but a genuine close the user makes while it is held is still the session's to hear.
+      Open tok _ → do
+        requested ← portCloseRequest (wpPort provider) tok
+        pure (if requested > aRouted acq then Just (StepIO (Just key) (route provider key requested)) else Nothing)
+      _ → pure Nothing
   | otherwise = do
       -- A result offered and never built whose request has settled: the host reported the provider's work
       -- over when it accepted the reply, so no cancel will come, and the lease will never own the window.
@@ -1102,7 +1107,7 @@ latchFatal provider found = do
 latchedEvidence ∷ WindowProvider target → IO [(Text, ExceptionWithContext SomeException)]
 latchedEvidence provider = do
   st ← atomically (readTVar (wpState provider))
-  pure [("window provider fault", ExceptionWithContext mempty (toException (WindowDefect why))) | Fatal why ← maybe [] pure (psFatal st) <> psEvidence st]
+  pure [("window provider fault", ExceptionWithContext mempty (toException (WindowDefect (fatalText found)))) | found ← maybe [] pure (psFatal st) <> psEvidence st]
 
 withEvidence ∷ ExceptionWithContext SomeException → [(Text, ExceptionWithContext SomeException)] → IO (ExceptionWithContext SomeException)
 withEvidence primary [] = pure primary

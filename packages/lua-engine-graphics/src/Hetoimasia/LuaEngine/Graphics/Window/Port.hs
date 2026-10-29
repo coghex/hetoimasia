@@ -55,6 +55,7 @@ module Hetoimasia.LuaEngine.Graphics.Window.Port
 
     -- * Faults
   , Fatal (..)
+  , fatalText
   ) where
 
 import Control.Concurrent.STM (STM)
@@ -71,9 +72,18 @@ newtype WindowToken = WindowToken Word64
   deriving (Eq, Ord, Show)
 
 -- | A fault the provider treats as fatal to the whole session, with bounded evidence. It is never a
--- @window_error@, never busy and never a cancellation.
-newtype Fatal = Fatal Text
+-- @window_error@, never busy and never a cancellation. A fault of retirement (a disposal that failed, graphics that
+-- could not retire) is a cleanup failure; anything else is a failure of the host.
+data Fatal
+  = Fatal !Text
+  | CleanupFatal !Text
   deriving (Eq, Show)
+
+-- | The bounded evidence of a fault.
+fatalText ∷ Fatal → Text
+fatalText = \case
+  Fatal why → why
+  CleanupFatal why → why
 
 -- | Everything the provider asks of the hosts, over the capability @target@ a ready window yields to
 -- the later scene adapter (it is opaque here).

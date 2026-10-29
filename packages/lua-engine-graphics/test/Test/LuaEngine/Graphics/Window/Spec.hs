@@ -16,6 +16,7 @@ import Hetoimasia.Runtime.GLFW (HostConfig (..), defaultHostConfig)
 import Hetoimasia.LuaEngine.Graphics.Window.Port
 import Hetoimasia.LuaEngine.Graphics.Window.Provider
 import Test.Hspec
+import qualified Test.LuaEngine.Graphics.Window.Coordinator as Coordinator
 import qualified Test.LuaEngine.Graphics.Window.Request as Request
 import Test.LuaEngine.Graphics.Window.Fake
 import Test.LuaEngine.Graphics.Window.Rig
@@ -25,6 +26,7 @@ spec ∷ Spec
 spec = describe "window provider" $ do
   Request.spec
   configuration
+  Coordinator.spec
   admission
   stages
   cancellation
@@ -387,6 +389,8 @@ faults = describe "failures" $ do
       commandOpen (wrComp rig) (wrVm rig) "a" "a" "t" (640, 480)
       failure ← awaitFailure (wrComp rig) "a"
       fmap fst (instanceFailure failure) `shouldBe` Just "window"
+      -- The attributed request record carries the expected code and the bounded message, with no root or path.
+      fmap snd (instanceFailure failure) `shouldSatisfy` maybe False (\why → "window_error" `Text.isInfixOf` why)
       fatalsNow rig >>= (`shouldBe` [])
       slotHeld rig "a" >>= (`shouldBe` False)
 

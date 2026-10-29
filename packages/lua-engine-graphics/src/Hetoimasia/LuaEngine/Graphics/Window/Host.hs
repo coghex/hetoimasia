@@ -353,14 +353,14 @@ retirement vulkan var token = do
             _ → GraphicsRetired
       let native = case observedPhase observation of
             WindowReleased → NativeDisposed
-            WindowDisposalFailed → NativeDisposalFailed (Fatal "a window's disposal failed")
-            WindowReleaseUncertain → NativeDisposalFailed (Fatal "a window's release could not establish that it ended safely")
+            WindowDisposalFailed → NativeDisposalFailed (CleanupFatal "a window's disposal failed")
+            WindowReleaseUncertain → NativeDisposalFailed (CleanupFatal "a window's release could not establish that it ended safely")
             _ → NativePending
       closeFault ← case madeClose made of
         Nothing → pure Nothing
         Just ticket → pollCompletion ticket <&> \case
-          Just (Interrupted request) → Just (Fatal (bounded ("a window's close was interrupted: " <> Text.pack (show request))))
-          Just (Rejected rejection) | fatalClose rejection → Just (Fatal (bounded ("a window's close was rejected: " <> Text.pack (show rejection))))
+          Just (Interrupted request) → Just (CleanupFatal (bounded ("a window's close was interrupted: " <> Text.pack (show request))))
+          Just (Rejected rejection) | fatalClose rejection → Just (CleanupFatal (bounded ("a window's close was rejected: " <> Text.pack (show rejection))))
           _ → Nothing
       let outcome = case closeFault of
             Just found' → Retirement (GraphicsRetireFailed found') native
@@ -374,7 +374,7 @@ retirement vulkan var token = do
   where
     graphicsOf present = case (observedSlot present, observedDisposal present) of
       (SlotFree, _) → GraphicsRetired
-      (_, DisposalFailed) → GraphicsRetireFailed (Fatal "a window's graphics disposal failed")
+      (_, DisposalFailed) → GraphicsRetireFailed (CleanupFatal "a window's graphics disposal failed")
       _ → GraphicsInUse
     -- Beginning a close twice, a window already gone and a window already closing are the protocol's
     -- idempotent answers; anything else is the executor refusing a close it should have performed.
