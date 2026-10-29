@@ -68,6 +68,7 @@ module Hetoimasia.LuaEngine.Graphics.Window.Provider
   , withWindowProvider
   , providerFatal
   , endWindows
+  , adoptWindow
   , WindowDefect (..)
   , ProviderReading (..)
   , providerReading
@@ -340,7 +341,7 @@ data WindowProvider target = WindowProvider
   , wpPort ∷ !(Port target)
   , wpState ∷ !(TVar PState)
   , wpIdentity ∷ !Unique
-  , wpAdoption ∷ !(Word64 → WindowToken → target → Adoption)
+  , wpAdoption ∷ !(Word64 → WindowToken → target → WindowOwner → Adoption)
     -- ^ How a lease adopts a window, made where the target's type is known to be 'Typeable'.
   }
 
@@ -702,7 +703,9 @@ accept provider token completion settled = do
                 , aAdopted = False
                 , aRouted = 0
                 , aRetired = False
-                , aRetireFailed = Nothing
+                  -- A request handed over after the pump failed has no pump to advance it: it is recorded as the
+                  -- terminal evidence the failure left everything else as (slot held, nothing claimed retired).
+                , aRetireFailed = Fatal "the window provider's pump had failed before this request was handed to it" <$ psPumpFailure st
                 , aSettled = settled
                 , aWaiting = False
                 }
@@ -952,8 +955,11 @@ updateAcq provider key change = modifyState provider $ \st → st {psAcqs = Map.
 -- number routed. A request already routed is never routed twice, and one not yet routed is never lost.
 route ∷ WindowProvider target → Word64 → Natural → IO ()
 route provider key number = do
-  windowStop (wpConfig provider)
+  -- The number is recorded first: an endpoint that raises is attempted once for this request, never again (a newer
+  -- request, a new decision of the user, is a new attempt). The endpoint is idempotent, so a repeat of a successful
+  -- routing would be safe; a spin on a failing one would not.
   atomically (updateAcq provider key (\acq → acq {aRouted = max number (aRouted acq)}))
+  windowStop (wpConfig provider)
   -- The stop closes admission: every acquisition still wanted is the session's to end.
   atomically (closeAdmission provider)
 
@@ -984,7 +990,7 @@ publish provider key tok target = do
   case acq of
     Nothing → pure ()
     Just found → do
-      answer ← completeRequest (aCompletion found) (ProviderResource VNil (wpAdoption provider key tok target))
+      answer ← completeRequest (aCompletion found) (ProviderResource VNil (wpAdoption provider key tok target (aOwner found)))
       case answer of
         ReplyAdoption → pure ()
         ReplySettled → pure ()
@@ -1016,21 +1022,29 @@ withLeaseOr' leases key refused use = withLeaseOr leases key refused use
 -- reserved. Adopting marks the acquisition the lease's; releasing it (the instance ended or released the
 -- lease) begins the close and hands the host the provider's own reading of the retirement. The slot is
 -- returned by the pump at actual retirement, never by this release.
-adoptionFor ∷ ∀ target. Typeable target ⇒ TVar PState → Word64 → WindowToken → target → Adoption
-adoptionFor var key tok target =
+adoptionFor ∷ ∀ target. Typeable target ⇒ TVar PState → Word64 → WindowToken → target → WindowOwner → Adoption
+adoptionFor var key tok target owner =
   Adoption $ \retirements →
     acquirePart
       "window"
       (releaseRank 0)
-      ( atomically $ do
-          st ← readTVar var
-          case Map.lookup key (psAcqs st) of
-            Just acq → do
-              writeTVar var st {psAcqs = Map.insert key acq {aAdopted = True, aOffered = False} (psAcqs st)}
-              pure (WindowResource target tok (aOwner acq))
-            Nothing → throwSTM (WindowDefect "a window was adopted that the provider no longer tracks")
-      )
+      (adoptWindowIn var key tok target owner)
       (releaseResource var key retirements)
+
+-- | Build the resource into the lease. The host may run a recipe it had already claimed after the request settled
+-- (an epoch change cancels the request but preserves the claimed recipe), by which time the provider may have taken the
+-- window apart and forgotten the acquisition. That is ordinary cancellation, not a defect: the resource is built over
+-- the same window, the host releases it at once because interest ended, and its release finds nothing owed.
+adoptWindow ∷ WindowProvider target → Word64 → WindowToken → target → WindowOwner → IO (WindowResource target)
+adoptWindow provider = adoptWindowIn (wpState provider)
+
+adoptWindowIn ∷ TVar PState → Word64 → WindowToken → target → WindowOwner → IO (WindowResource target)
+adoptWindowIn var key tok target owner = atomically $ do
+  st ← readTVar var
+  case Map.lookup key (psAcqs st) of
+    Just acq → writeTVar var st {psAcqs = Map.insert key acq {aAdopted = True, aOffered = False} (psAcqs st)}
+    Nothing → pure ()
+  pure (WindowResource target tok owner)
 
 releaseResource ∷ TVar PState → Word64 → Retirements → WindowResource target → IO ()
 releaseResource var key retirements _ = do

@@ -22,12 +22,14 @@ module Test.LuaEngine.Graphics.Window.Rig
   , openAndSettle
   , raisesWindowDefect
   , raisesExpected
+  , gateSubmit
+  , awaitProvider'
   , eventCount
   ) where
 
-import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (SomeException, finally, fromException, throwIO, try)
-import Control.Monad (unless)
+import Control.Monad (unless, when)
 import qualified Data.Text as Text
 import Data.Text (Text)
 import Hetoimasia.LuaEngine.Graphics.Window.Port (Fatal)
@@ -164,3 +166,18 @@ raisesExpected action =
       | Just (failure ∷ HUnitFailure) ← fromException raised → throwIO failure
       | otherwise → pure ()
     Right _ → assertFailure "the scope returned although it was expected to raise"
+
+-- | An endpoint that blocks its first submission, after the admission reserved the request's credits and before the
+-- provider hears of it, until the gate opens; it records that it is blocked. Later submissions pass.
+gateSubmit ∷ TVar Bool → TVar Bool → RequestEndpoint → RequestEndpoint
+gateSubmit gate entered endpoint =
+  endpoint
+    { endpointSubmit = \submission → do
+        first ← atomically (readTVar entered >>= \here → writeTVar entered True >> pure (not here))
+        when first (atomically (readTVar gate >>= \open → unless open retry))
+        endpointSubmit endpoint submission
+    }
+
+-- | 'awaitProvider' over a composition rather than a rig.
+awaitProvider' ∷ WinComp target → (ProviderReading → Bool) → IO ()
+awaitProvider' comp wanted = atomically (providerReading (wcProvider comp) >>= \found → unless (wanted found) retry)

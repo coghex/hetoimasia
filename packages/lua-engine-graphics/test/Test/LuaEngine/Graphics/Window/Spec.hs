@@ -4,8 +4,9 @@
 module Test.LuaEngine.Graphics.Window.Spec (spec) where
 
 import Control.Concurrent (throwTo)
-import Control.Concurrent.STM (atomically)
-import Control.Exception (AsyncException (ThreadKilled))
+import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, retry)
+import Control.Exception (AsyncException (ThreadKilled), finally)
+import Control.Monad (unless)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.GPU.Model.Budget (defaultBudgetRequest, validateBudgets)
@@ -18,6 +19,7 @@ import Hetoimasia.LuaEngine.Graphics.Window.Provider
 import Test.Hspec
 import qualified Test.LuaEngine.Graphics.Window.Coordinator as Coordinator
 import qualified Test.LuaEngine.Graphics.Window.Request as Request
+import Test.LuaEngine.Graphics.Rig (bounded)
 import Test.LuaEngine.Graphics.Window.Fake
 import Test.LuaEngine.Graphics.Window.Rig
 import Test.LuaEngine.Graphics.Windows
@@ -361,6 +363,65 @@ abandonment = describe "abandonment and failed effects" $ do
       awaitFatalCount rig 1
       slotHeld rig "a" >>= (`shouldBe` True)
       atomically (providerReading (wcProvider (wrComp rig))) >>= (`shouldSatisfy` (not . readingOpen))
+
+  it "records a request handed over after the pump failed as terminal evidence, so teardown completes" $
+    raisesExpected $ do
+      fake ← newFake defaultFakeConfig
+      gate ← newTVarIO False
+      entered ← newTVarIO False
+      fatals ← newTVarIO []
+      let config = WindowConfig 2 (pure ()) (\found → atomically (modifyTVar' fatals (found :)))
+      bounded . withWinComp config (fakePort fake) $ \comp _ runtime → do
+        (do
+            -- One VM hands its request over only when the gate opens, after the admission has reserved its credits.
+            gated ← startWinVmWith (gateSubmit gate entered) comp runtime "vm-a"
+            open ← startWinVm comp runtime "vm-b"
+            admit comp gated PresentationRole "a"
+            admit comp open PresentationRole "b"
+            commandOpen comp gated "a" "a" "late" (640, 480)
+            atomically (readTVar entered >>= \here → unless here retry)
+            -- The pump fails reading the other instance's creation; the late request is still between its admission and
+            -- the provider.
+            raiseOnOutcome fake
+            commandOpen comp open "b" "a" "early" (320, 240)
+            atomically (readTVar fatals >>= \found → unless (not (null found)) retry)
+            atomically (modifyTVar' gate (const True))
+            ownerA ← ownerOf gated "a"
+            -- The late request arrives as terminal evidence: its slot stays held, and nothing waits for a pump that is gone.
+            awaitProvider' comp (\reading → readingAcquisitions reading == 2)
+            atomically (ownerSlotHeld ownerA) >>= (`shouldBe` True))
+          `finally` (releaseAll fake >> atomically (modifyTVar' gate (const True)) >> endWindows (wcProvider comp))
+
+  it "tolerates an adoption recipe that runs after the window was taken apart and forgotten" $ do
+    fake ← newFake defaultFakeConfig
+    withWindowProvider (WindowConfig 1 (pure ()) (\_ → pure ())) (fakePort fake) $ \provider → do
+      owner ← newWindowOwner provider PresentationRole
+      resource ← adoptWindow provider 987654 (WindowToken 7) () owner
+      resourceToken resource `shouldBe` WindowToken 7
+
+  it "attempts a stop routing that raised once, however much unrelated progress follows" $
+    raisesExpected $ do
+      fake ← newFake defaultFakeConfig
+      attempts ← newTVarIO (0 ∷ Int)
+      fatals ← newTVarIO []
+      let config = WindowConfig 2 (atomically (modifyTVar' attempts (+ 1)) >> ioError (userError "the stop endpoint raised")) (\found → atomically (modifyTVar' fatals (found :)))
+      bounded . withWinComp config (fakePort fake) $ \comp _ runtime → do
+        vm ← startWinVm comp runtime "vm"
+        (do
+            admit comp vm PresentationRole "a"
+            commandOpen comp vm "a" "a" "t" (640, 480)
+            atomically (windowMainReady (wcProvider comp) >>= \ready → unless ready retry)
+            windowMainStep (wcProvider comp)
+            awaitFake fake ((== 1) . readingAttached)
+            nativeClose fake 1
+            atomically (readTVar fatals >>= \found → unless (not (null found)) retry)
+            -- Unrelated progress follows: a second instance asks, is admitted and issued.
+            admit comp vm PresentationRole "b"
+            commandOpen comp vm "b" "a" "peer" (320, 240)
+            awaitEvent fake "issue create peer"
+            atomically (readTVar attempts) >>= (`shouldBe` 1)
+            atomically (readTVar fatals) >>= \found → length found `shouldSatisfy` (<= 2))
+          `finally` (releaseAll fake >> endWindows (wcProvider comp))
 
   it "never repeats a failed effect: an issue that raised is attempted once, before or after admission" $
     mapM_ raised [RaiseBeforeIssue, RaiseAfterIssue]
