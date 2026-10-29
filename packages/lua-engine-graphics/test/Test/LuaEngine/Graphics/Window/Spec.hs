@@ -16,7 +16,6 @@ import Hetoimasia.LuaEngine.Graphics.Window.Configuration
 import Hetoimasia.Runtime.GLFW (HostConfig (..), defaultHostConfig)
 import Hetoimasia.LuaEngine.Graphics.Window.Port
 import Hetoimasia.LuaEngine.Graphics.Window.Provider
-import Hetoimasia.Scripting.Lua.Admission (Necessity (OptionalRequest))
 import Hetoimasia.Scripting.Lua.Provider (advanceRequestEpoch)
 import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint)
 import Test.Hspec
@@ -497,27 +496,40 @@ faults = describe "failures" $ do
       fatalsNow rig >>= (`shouldBe` [])
       slotHeld rig "a" >>= (`shouldBe` False)
 
-  it "hands a clean creation refusal to a script that takes it as the exact bounded record (optional request), without failing it" $ do
-    fake ← newFake defaultFakeConfig
+  it "hands a clean creation refusal, settled while the invocation still runs, to a script that takes it as the exact bounded record, and then fails the instance at the window endpoint (required request)" $ do
+    fake ← newFake (FakeConfig [HoldCreate])
     scriptCreate fake [CreateRefusedClean (Text.replicate 3000 "x")]
     fatals ← newTVarIO []
     let config = WindowConfig 2 (pure ()) (\found → atomically (modifyTVar' fatals (found :)))
     bounded . withWinComp config (fakePort fake) $ \comp _ runtime → do
-      vm ← startWinVmFor OptionalRequest id comp runtime "vm"
-      admit comp vm PresentationRole "a"
-      commandOpen comp vm "a" "a" "t" (640, 480)
-      command comp vm "a" "wait_take" "a"
-      line ← awaitNoteContaining comp "a wait_take a"
-      -- The record the script is handed: a failure with the code and the message bounded to 2 KiB, and no root or path.
-      line `shouldSatisfy` Text.isInfixOf "status=failure"
-      line `shouldSatisfy` Text.isInfixOf "code=window_error"
-      line `shouldSatisfy` Text.isInfixOf ("message=" <> Text.replicate 2048 "x" <> "}")
-      line `shouldSatisfy` (not . Text.isInfixOf "root=")
-      line `shouldSatisfy` (not . Text.isInfixOf "path=")
-      -- An optional request's refusal is data: the slot is free again, nothing is latched, the instance goes on.
-      ownerA ← ownerOf vm "a"
-      atomically (ownerSlotHeld ownerA >>= \held → when held retry)
-      readTVarIO fatals >>= (`shouldBe` [])
+      vm ← startWinVm comp runtime "vm"
+      (do
+          admit comp vm PresentationRole "a"
+          commandOpen comp vm "a" "a" "t" (640, 480)
+          _ ← awaitNoteContaining comp "a start a started"
+          -- The script is inside one invocation, held by its own gate: the refusal settles while it runs.
+          command comp vm "a" "gated_take" "a"
+          awaitGate vm "a"
+          release fake HoldCreate
+          ownerA ← ownerOf vm "a"
+          atomically (ownerSlotHeld ownerA >>= \held → when held retry)
+          openGate vm "a"
+          line ← awaitNoteContaining comp "a gated_take a"
+          -- Already settled when the script looked, and the record it takes is exact: the code, the message bounded
+          -- to 2 KiB, and no root or path.
+          line `shouldSatisfy` Text.isInfixOf "a gated_take a true {"
+          line `shouldSatisfy` Text.isInfixOf "status=failure"
+          line `shouldSatisfy` Text.isInfixOf "code=window_error"
+          line `shouldSatisfy` Text.isInfixOf ("message=" <> Text.replicate 2048 "x" <> "}")
+          line `shouldSatisfy` (not . Text.isInfixOf "root=")
+          line `shouldSatisfy` (not . Text.isInfixOf "path=")
+          -- Taking it did not clear the latch: the instance fails at the end of that call, attributed to the window
+          -- endpoint, and the refusal was no provider fault.
+          failure ← awaitFailure comp "a"
+          fmap fst (instanceFailure failure) `shouldBe` Just "window"
+          fmap snd (instanceFailure failure) `shouldSatisfy` maybe False (Text.isInfixOf "window_error")
+          readTVarIO fatals >>= (`shouldBe` []))
+        `finally` (openAllGates vm >> releaseAll fake)
 
   it "answers a target refused with a verified rollback as window_error, and still takes the window apart" $
     withWRig 2 [] $ \rig → do
@@ -530,6 +542,29 @@ faults = describe "failures" $ do
       awaitProvider rig ((== 0) . readingAcquisitions)
       eventCount rig "close w" >>= (`shouldBe` 1)
       fatalsNow rig >>= (`shouldBe` [])
+
+  it "hands a target refused with a verified rollback, settled while the invocation still runs, to a script that takes it, and then fails the instance at the window endpoint (required request)" $
+    withWRig 2 [] $ \rig → do
+      scriptStanding (wrFake rig) (StandingRefusedClean "the surface cannot be presented to")
+      admit (wrComp rig) (wrVm rig) PresentationRole "a"
+      commandOpen (wrComp rig) (wrVm rig) "a" "a" "t" (640, 480)
+      _ ← awaitNoteContaining (wrComp rig) "a start a started"
+      (do
+          command (wrComp rig) (wrVm rig) "a" "gated_take" "a"
+          awaitGate (wrVm rig) "a"
+          -- The owner refuses the target while the script is held inside its call, and the window is taken apart.
+          attachNow rig
+          awaitProvider rig ((== 0) . readingAcquisitions)
+          openGate (wrVm rig) "a"
+          line ← awaitNoteContaining (wrComp rig) "a gated_take a"
+          line `shouldSatisfy` Text.isInfixOf "a gated_take a true {"
+          line `shouldSatisfy` Text.isInfixOf "code=window_error"
+          line `shouldSatisfy` Text.isInfixOf "message=the surface cannot be presented to"
+          failure ← awaitFailure (wrComp rig) "a"
+          fmap fst (instanceFailure failure) `shouldBe` Just "window"
+          fmap snd (instanceFailure failure) `shouldSatisfy` maybe False (Text.isInfixOf "window_error")
+          fatalsNow rig >>= (`shouldBe` []))
+        `finally` openAllGates (wrVm rig)
 
   it "keeps a fatal creation fault out of window_error, busy and retries" $
     raisesWindowDefect . withWRig 2 [] $ \rig → do

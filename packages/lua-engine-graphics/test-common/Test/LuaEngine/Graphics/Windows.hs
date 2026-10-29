@@ -16,12 +16,16 @@ module Test.LuaEngine.Graphics.Windows
   , WinVm (..)
   , startWinVm
   , startWinVmWith
-  , startWinVmFor
   , admit
   , stopInstance
   , command
   , commandOpen
   , ownerOf
+
+    -- * Gates inside a running invocation
+  , awaitGate
+  , openGate
+  , openAllGates
 
     -- * What scripts recorded
   , notes
@@ -66,7 +70,7 @@ import Hetoimasia.Runtime.Supervision
   , withSupervision
   )
 import qualified Hetoimasia.Runtime.Supervision as Supervision
-import Hetoimasia.Scripting.Lua.Admission (Necessity (RequiredRequest), admittedHandleType, newRequestHandles)
+import Hetoimasia.Scripting.Lua.Admission (admittedHandleType, newRequestHandles)
 import Hetoimasia.Scripting.Lua.Instance
 import Hetoimasia.Scripting.Lua.Lease (Leases, ScopeSummary, instanceLeases, leaseCapabilityType, newLeases)
 import Hetoimasia.Scripting.Lua.Lending (newLending)
@@ -122,6 +126,15 @@ data WinVm target = WinVm
   , vmLeases ∷ !Leases
   , vmOwners ∷ !(IORef (Map Text WindowOwner))
   , vmLog ∷ !(TVar [Text])
+  , vmGates ∷ !(TVar Gates)
+  }
+
+-- | The gates a script holds itself at with @fx.block(name)@: the names it has entered, the names let go, and
+-- whether every gate is let go for good (set when an example ends, however it ends).
+data Gates = Gates
+  { gatesEntered ∷ ![Text]
+  , gatesOpened ∷ ![Text]
+  , gatesAll ∷ !Bool
   }
 
 requiredPolicy ∷ WorkerPolicy
@@ -138,18 +151,15 @@ startWinVm = startWinVmWith id
 -- | The same, with the window endpoint passed through this function: the lifecycle suite wraps it to swallow an
 -- adoption reply, so a cancellation can overtake the build the host never gets to run.
 startWinVmWith ∷ ∀ target. Typeable target ⇒ (RequestEndpoint → RequestEndpoint) → WinComp target → LuaRuntime → Text → IO (WinVm target)
-startWinVmWith = startWinVmFor RequiredRequest
-
--- | The same with the service's necessity chosen (see 'windowServiceFor').
-startWinVmFor ∷ ∀ target. Typeable target ⇒ Necessity → (RequestEndpoint → RequestEndpoint) → WinComp target → LuaRuntime → Text → IO (WinVm target)
-startWinVmFor necessity wrap comp runtime label = do
+startWinVmWith wrap comp runtime label = do
   handles ← newRequestHandles
   requests ← either (\refused → assertFailure ("the profile was refused: " <> show refused)) pure (m1Requests compositionProfile handles)
-  let service = windowServiceFor necessity requests (wcProvider comp)
+  let service = windowService requests (wcProvider comp)
   lending ← newLending
   leases ← newLeases lending 16
   owners ← newIORef Map.empty
-  let vm' = WinVm (error "owner not started") service leases owners (wcLog comp)
+  gates ← newTVarIO (Gates [] [] False)
+  let vm' = WinVm (error "owner not started") service leases owners (wcLog comp) gates
       registered =
         either (error . ("registration refused: " <>) . show) id $
           registration [admittedHandleType handles requestHandleType, leaseCapabilityType leases windowHandleType] (bindings vm')
@@ -201,7 +211,7 @@ ownerOf vm name = (Map.! name) <$> readIORef (vmOwners vm)
 -- instance's owner in its binding. It is not an API of the engine.
 bindings ∷ ∀ target. Typeable target ⇒ WinVm target → [Namespace]
 bindings vm =
-  [ namespace "fx" [recording]
+  [ namespace "fx" [recording, blocking]
   , namespace "request" (m1RequestBindings (M1Service requestHandleType windowValueSchema))
   , namespace "win" [opening, using]
   ]
@@ -211,6 +221,19 @@ bindings vm =
       stateOperation "record" [SText] [] $ \arguments → do
         case arguments of
           [VText text] → atomically (modifyTVar' (vmLog vm) (text :))
+          _ → pure ()
+        pure []
+    -- Hold the running invocation here until the example lets this gate go: the invocation is still inside
+    -- its call while the rest of the system moves on.
+    blocking =
+      stateOperation "block" [SText] [] $ \arguments → do
+        case arguments of
+          [VText name] → do
+            -- Entered in its own transaction: a retry below would roll back a write made in the same one.
+            atomically (modifyTVar' (vmGates vm) (\held → held {gatesEntered = name : gatesEntered held}))
+            atomically $ do
+              held ← readTVar (vmGates vm)
+              unless (gatesAll held || name `elem` gatesOpened held) retry
           _ → pure ()
         pure []
     opening =
@@ -291,6 +314,11 @@ driverSource =
       , "    local r = request.take(self.hs[key])"
       , "    if r.status == 'success' then self.ws[key] = r.value end"
       , "    out = fmt(r)"
+      , "  elseif p.op == 'gated_take' then"
+      , "    fx.block(key)"
+      , "    local ready = tostring(request.ready(self.hs[key]))"
+      , "    local r = request.take(self.hs[key])"
+      , "    out = ready .. ' ' .. fmt(r)"
       , "  elseif p.op == 'use' then out = tostring(win.use(self.ws[key]))"
       , "  elseif p.op == 'puse' then"
       , "    local ok, r = pcall(win.use, self.ws[key])"
@@ -359,6 +387,18 @@ commandWith comp vm name op key asked = do
   deliverEvent (scheduledEndpoint (vmOwner vm)) identity "cmd" payload >>= \case
     DeliveryAccepted _ → pure ()
     other → assertFailure ("expected the command accepted, found " <> take 80 (show other))
+
+-- | Block until a script is inside the call that holds this gate.
+awaitGate ∷ WinVm target → Text → IO ()
+awaitGate vm name = atomically (readTVar (vmGates vm) >>= \held → unless (name `elem` gatesEntered held) retry)
+
+-- | Let the call that holds this gate go on.
+openGate ∷ WinVm target → Text → IO ()
+openGate vm name = atomically (modifyTVar' (vmGates vm) (\held → held {gatesOpened = name : gatesOpened held}))
+
+-- | Let every gate go, now and for good.
+openAllGates ∷ WinVm target → IO ()
+openAllGates vm = atomically (modifyTVar' (vmGates vm) (\held → held {gatesAll = True}))
 
 -- What scripts recorded -------------------------------------------------------------------------------------
 

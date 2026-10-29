@@ -87,7 +87,6 @@ module Hetoimasia.LuaEngine.Graphics.Window.Provider
     -- * The service
   , WindowService
   , windowService
-  , windowServiceFor
   , windowEndpointName
   , windowEndpoint
   , windowCodes
@@ -462,13 +461,7 @@ data WindowService target = WindowService
 -- Window acquisition is /required/: M1 has no optional window, and the graphics facade (LFE-21) builds its binding from
 -- this.
 windowService ∷ M1Requests → WindowProvider target → WindowService target
-windowService = windowServiceFor RequiredRequest
-
--- | The same service with the necessity chosen. It exists for the examples that read a refusal's @take@ record: a required
--- request's failure ends its instance at the next safe boundary whether it is read or not, so the record can only be handed to
--- a script by an optional request. The facade uses 'windowService'; nothing in M1 offers an optional window to Lua.
-windowServiceFor ∷ Necessity → M1Requests → WindowProvider target → WindowService target
-windowServiceFor necessity requests provider = WindowService requests provider necessity
+windowService requests provider = WindowService requests provider RequiredRequest
 
 -- | The endpoint's name in a grant.
 windowEndpointName ∷ Text
