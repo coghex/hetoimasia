@@ -171,6 +171,7 @@ library facade
         Hetoimasia.LuaEngine.Facade.Content
         Hetoimasia.LuaEngine.Facade.Output
         Hetoimasia.LuaEngine.Facade.Request
+        Hetoimasia.LuaEngine.Facade.Session
         Hetoimasia.LuaEngine.Facade.Source
         Hetoimasia.LuaEngine.Facade.Time
         Hetoimasia.LuaEngine.Facade.Types
@@ -282,6 +283,7 @@ library session
     hs-source-dirs: session
     exposed-modules:
         Hetoimasia.LuaEngine.Session
+        Hetoimasia.LuaEngine.Session.Control
         Hetoimasia.LuaEngine.Session.Failure
         Hetoimasia.LuaEngine.Session.Pacing
         Hetoimasia.LuaEngine.Session.State
@@ -342,6 +344,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Facade.Authoring
         Test.LuaEngine.Facade.Client
         Test.LuaEngine.Facade.Clocks
+        Test.LuaEngine.Facade.Control
         Test.LuaEngine.Facade.Spec
         Test.LuaEngine.Facade.Imports
         Test.LuaEngine.Facade.Limits
@@ -385,9 +388,11 @@ test-suite lua-engine-tests
         Test.LuaEngine.Scene.Schema
         Test.LuaEngine.Scene.Spec
         Test.LuaEngine.Scene.Support
+        Test.LuaEngine.Session.Api
         Test.LuaEngine.Session.Client
         Test.LuaEngine.Session.Commit
         Test.LuaEngine.Session.Commit
+        Test.LuaEngine.Session.Control
         Test.LuaEngine.Session.Clocks
         Test.LuaEngine.Session.Construction
         Test.LuaEngine.Session.Diagnostics

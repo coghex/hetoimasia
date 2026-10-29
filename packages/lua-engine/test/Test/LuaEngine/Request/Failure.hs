@@ -77,8 +77,19 @@ spec = describe "failure" $ do
           pure ()
         (fromException failure ∷ Maybe ProviderDefect) `shouldSatisfy` (/= Nothing)
   where
-    -- the least a copied value may be (a profile below it is refused): the identity and print bounds at their least too
-    tightCopied = bytesOf [(InstanceIdBytes, 6), (PrintWarnBytes, 171), (CopiedValueBytes, 176), (DataBytes, 64), (SceneInputBytes, 64)]
+    -- the least a copied value may be (a profile below it is refused): the identity and print bounds at their least too, and
+    -- the failure bounds at theirs, so that the status record the bounds admit is only 565 bytes
+    tightCopied =
+      bytesOf
+        [ (InstanceIdBytes, 6)
+        , (PrintWarnBytes, 171)
+        , (RoleFailureRecordBytes, 37)
+        , (MessageBytes, 16)
+        , (TracebackBytes, 16)
+        , (CopiedValueBytes, 565)
+        , (DataBytes, 64)
+        , (SceneInputBytes, 64)
+        ]
     defects =
       [ Defect "a failure whose code the service does not supply" "data" fixedM1Profile (ProviderExpected (ExpectedFailure "mystery" "m" Nothing Nothing))
       , Defect "a failure with no code" "data" fixedM1Profile (ProviderFailure "no code")
@@ -91,25 +102,26 @@ spec = describe "failure" $ do
           "a text over the copied-value byte bound"
           "text"
           tightCopied
-          (ProviderResult (VText (Text.replicate 200 "x")))
+          (ProviderResult (VText (Text.replicate 600 "x")))
       , Defect
           "a list whose value fits the byte bound but whose complete success record does not"
           "ints"
           tightCopied
-          (ProviderResult (VList (replicate 17 (VInteger 1))))
+          -- 31 integers are 563 bytes with their keys, within 565; the success record around them is 601
+          (ProviderResult (VList (replicate 31 (VInteger 1))))
       , Defect
           "a failure whose complete record passes the byte bound"
           "data"
           tightCopied
-          (ProviderExpected (ExpectedFailure "not_found" "m" Nothing (Just (Text.replicate 200 "p"))))
+          (ProviderExpected (ExpectedFailure "not_found" "m" Nothing (Just (Text.replicate 600 "p"))))
       , Defect
           "a list over the copied-value element bound"
           "ints"
-          (counts [(SceneSprites, 1), (CopiedValueElements, 12)])
-          (ProviderResult (VList (map VInteger [1 .. 30])))
+          (counts [(SceneSprites, 1), (CopiedValueElements, 30)])
+          (ProviderResult (VList (map VInteger [1 .. 40])))
       , Defect
           "a list nested past the copied-value depth bound"
           "nested"
-          (counts [(CopiedValueDepth, 1), (SceneDepth, 1)])
-          (ProviderResult (VList [VList [VInteger 1]]))
+          (counts [(CopiedValueDepth, 3), (SceneDepth, 3)])
+          (ProviderResult (VList [VList [VList [VInteger 1]]]))
       ]

@@ -29,15 +29,18 @@ spec = describe "composition from outside the packages" $ do
         ByteString.writeFile (tree </> "root" </> "hetoimasia.json") manifest
         ByteString.writeFile (tree </> "root" </> "main.lua") entry
         (status, out, err) ← readCreateProcessWithExitCode (proc (clientDirectory outcome </> "client") [tree </> "root"]) ""
-        (status, out) `shouldBe` (ExitSuccess, "init presentation\nshutdown presentation stopped\nVerdictSuccess\nretired: True\nfailures: 0\n")
+        (status, out) `shouldBe` (ExitSuccess, "init presentation\nstatus starting false\nshutdown presentation stopped\nVerdictSuccess\nretired: True\nfailures: 0\n")
         -- the coordinator reports its lifecycle through the logger it was given, and nothing else is written; the note of the
         -- start was acknowledged before the session was stopped, and the last note ("session ended") may legally be left
         -- undelivered when the session returns (D-87), so it is not required
         err `shouldContain` "msg=\"session starting\""
         err `shouldNotContain` "ERROR"
 
-  it "keeps the handle's and the harness's fields out of a client's reach" $ do
+  it "keeps the handle's and the harness's fields out of a client's reach, and the facade's own capture of a status with them" $ do
     withClient "Client.hs" handleClient $ \compile → do
+      outcome ← compile Typecheck
+      rejectedBecause outcome "GHC-10237"
+    withClient "Client.hs" facadeCaptureClient $ \compile → do
       outcome ← compile Typecheck
       rejectedBecause outcome "GHC-10237"
     withClient "Client.hs" harnessClient $ \compile → do
@@ -54,7 +57,7 @@ spec = describe "composition from outside the packages" $ do
   where
     withClient = withStorePackageClient ["base", "bytestring", "text", "stm", "hetoimasia-content-0.1.0.0-inplace", "hetoimasia-foundation-0.1.0.0-inplace", "hetoimasia-runtime-0.1.0.0-inplace", "hetoimasia-scripting-lua-0.1.0.0-inplace", "hetoimasia-scripting-lua-0.1.0.0-inplace-runtime-lua", "hetoimasia-lua-engine-0.1.0.0-inplace", "hetoimasia-lua-engine-0.1.0.0-inplace-facade", "hetoimasia-lua-engine-0.1.0.0-inplace-session"]
     manifest = "{\"format\":1,\"id\":\"client\",\"entry\":\"main.lua\",\"vms\":[{\"role\":\"presentation\",\"clock\":\"elapsed\"}]}"
-    entry = "return { presentation = { init = function(self, api) print('init ' .. api.role) end, shutdown = function(self, reason) print('shutdown ' .. self.api.role .. ' ' .. reason) end } }"
+    entry = "return { presentation = { init = function(self, api) print('init ' .. api.role) local status = api.session.status() print('status ' .. status.presentation.phase .. ' ' .. tostring(status.gameplay.present)) end, shutdown = function(self, reason) print('shutdown ' .. self.api.role .. ' ' .. reason) end } }"
 
 composingClient ∷ String
 composingClient =
@@ -127,6 +130,18 @@ composingClient =
     , "            putStrLn (show (outVerdict outcome))"
     , "            putStrLn (\"retired: \" <> show (outRetired outcome))"
     , "            putStrLn (\"failures: \" <> show (length (outFailures outcome)))"
+    ]
+
+-- | A client that asks the public facade module for the facade's own record, where its capture of a status is kept.
+facadeCaptureClient ∷ String
+facadeCaptureClient =
+  unlines
+    [ "module Client (reach) where"
+    , ""
+    , "import Hetoimasia.LuaEngine.Facade (Facade (fcStatus))"
+    , ""
+    , "reach ∷ Maybe Facade"
+    , "reach = Nothing"
     ]
 
 handleClient ∷ String

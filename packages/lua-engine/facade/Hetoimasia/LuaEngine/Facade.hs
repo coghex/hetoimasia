@@ -15,6 +15,8 @@
 -- > api.content.data(path [, {root=, tick_offset=, optional=}])
 -- > api.request.ready(r) / take(r) / wait(r) / cancel(r)
 -- > api.time.tick() / tick_seconds() / seconds() / wait_ticks(n) / wait_seconds(s) / yield()
+-- > api.session.status() / quit()    -- the session controls (LFE-26): a copied status, a returning normal stop
+-- > api.state(...)                   -- the unavailable-state guard (also the global @state(...)@)
 --
 -- Every call is a dot call with exactly its declared arguments: a mistaken colon call, an extra or
 -- missing argument (an explicit @nil@ counts as an argument), a value of the wrong type or a table
@@ -34,9 +36,13 @@
 -- * @time.tick@ and @time.tick_seconds@: a gameplay instance's, in @init@, an update and @shutdown@.
 -- * @time.seconds@: a presentation instance's, in @init@, an update and @shutdown@.
 -- * @time.wait_ticks@: a gameplay instance's update. @time.wait_seconds@: a presentation instance's update.
+-- * @session.status@: a presentation instance's, in @init@, an update and @shutdown@, answering the capture taken at the
+--   entry of the hook or resumed segment. @session.quit@: either role's instance, in any hook.
+-- * @state(...)@ and @api.state(...)@: anywhere, and with any arguments: they latch the whole session's failure and
+--   raise (see "Hetoimasia.LuaEngine.Facade.Session"); no role, phase or arity check stands before them.
 --
--- Every call is refused at a module's top level, through a captured facade included; the clocks and the waits
--- are also refused to the other role.
+-- Every call but the guard is refused at a module's top level, through a captured facade included; the clocks, the
+-- waits and the status are also refused to the other role.
 --
 -- A request is also refused (an ordinary error, never @busy@) when the session's admission is stopping or
 -- closed. @tick_offset@ is gameplay's alone (an integer from 1; the default is 1) and a presentation instance
@@ -70,7 +76,8 @@
 -- 'facadeInstanceConfig' on its instances' ('instanceOnSegment' is where the presentation clock is
 -- sampled); grant 'facadeRequestEndpoints' to the owner's request service; and for each instance
 -- 'declareInstance', which answers the facade source to put in the behavior's request, and 'forgetInstance'
--- once the instance has settled. The scopes nest as the owners need them: the output outside, then the
+-- once the instance has settled. The facade is injected with the session's narrow control endpoints
+-- ('SessionEndpoints', @fsSession@): the status read, the normal stop and the terminal latch. The scopes nest as the owners need them: the output outside, then the
 -- coordinator and the pool, then the owner, which is stopped first, so a shutdown hook that prints still
 -- finds its sink. Nothing here is global: a second VM has a second facade, and a facade cannot be reached
 -- from Lua.
@@ -78,6 +85,16 @@ module Hetoimasia.LuaEngine.Facade
   ( -- * The services a facade is injected with
     AdmissionState (..)
   , FacadeEndpoints (..)
+  , SessionEndpoints (..)
+  , StatusSample (..)
+  , RoleSample (..)
+  , FailureSample (..)
+  , TerminalStage (..)
+  , TerminalContext (..)
+  , stateUnavailableMessage
+  , statusSchema
+  , statusValue
+  , failureValue
   , EngineFailure (..)
   , OutputSink (..)
   , Stream (..)
@@ -157,19 +174,23 @@ import Hetoimasia.LuaEngine.Facade.Caller
 import Hetoimasia.LuaEngine.Facade.Content (contentBindings, dataHandleName, lexicalResolver, moduleHandleName, validRootId)
 import Hetoimasia.LuaEngine.Facade.Output
 import Hetoimasia.LuaEngine.Facade.Request (requestBindings)
+import Hetoimasia.LuaEngine.Facade.Session (captureStatus, failureValue, forgetStatus, sessionBindings, statusSchema, statusValue)
 import Hetoimasia.LuaEngine.Facade.Source (builderIdentity, builderSource, engineChunk, engineChunkName)
 import Hetoimasia.LuaEngine.Facade.Time (forgetSamples, segmentStarted, timeBindings)
 import Hetoimasia.LuaEngine.Facade.Types
 import Hetoimasia.LuaEngine.Manifest (Role (..))
 import Hetoimasia.LuaEngine.Modules (Coordinator, ImportResolver, coordinatorEndpoint)
 import Hetoimasia.LuaEngine.Profile
-  ( ByteLimit (CopiedValueBytes, InstanceIdBytes, MessageBytes, PrintWarnBytes)
+  ( ByteLimit (CopiedValueBytes, InstanceIdBytes, MessageBytes, PathBytes, PrintWarnBytes, RoleFailureRecordBytes, TracebackBytes)
   , Bytes (Bytes)
   , Count (Count)
   , CountLimit (CopiedValueDepth, CopiedValueElements, InstancesPerVm, LuaIntegerMaximum)
   , Profile
   , bytesLimit
   , countLimit
+  , failureTextBytes
+  , minimumStatusDepth
+  , minimumStatusElements
   )
 import Hetoimasia.LuaEngine.Request (M1Requests, m1HandleType, m1Profile)
 import Hetoimasia.Scripting.Lua.Admission (callerInstance)
@@ -211,6 +232,8 @@ data FacadeSpec = FacadeSpec
   , fsOutput ∷ !Output
   -- ^ The session's authored output, shared by every VM.
   , fsEndpoints ∷ !FacadeEndpoints
+  , fsSession ∷ !SessionEndpoints
+  -- ^ The session's narrow control endpoints: the status capture, the normal stop and the terminal latch.
   , fsPhase ∷ !ModulePhase
   -- ^ The phase flag the coordinator's loader sets while a module's top level runs: the one the
   -- coordinator was made with.
@@ -249,6 +272,7 @@ newFacade spec = case limits of
         registry ← newRegistry
         origin ← newTVarIO Nothing
         samples ← newTVarIO Map.empty
+        captures ← newTVarIO Map.empty
         pure . Right $
           Facade
             { fcRole = fsRole spec
@@ -266,6 +290,8 @@ newFacade spec = case limits of
             , fcTickDuration = fsTickDuration spec
             , fcRegistry = registry
             , fcTime = TimeState origin samples
+            , fcSession = fsSession spec
+            , fcStatus = StatusState captures
             }
   where
     profile = m1Profile (fsRequests spec)
@@ -284,23 +310,35 @@ newFacade spec = case limits of
     machine name value
       | value <= fromIntegral (maxBound ∷ Int) = Right (fromIntegral value)
       | otherwise = Left (FacadeLimitNotRepresentable name)
-    -- The context record is also four elements and one level deep; the profile's own relations keep the element
-    -- bound at 12 or more (a scene of one sprite) and every bound positive, so neither can be below it.
     -- Every bound the facade formats with is checked against the least its own format needs, in this order,
     -- and the first that is below it is the refusal. A profile below one could not keep the format the facade
     -- promises (an identity that fits, a warning that names its writer on every line, a context the builder
-    -- can be handed), so no facade is made over it.
+    -- can be handed, a status record the host would not copy), so no facade is made over it. The profile's own
+    -- validation refuses each first ('LimitBelowMinimum'); this is the guard that no validated profile reaches.
     belowFormatting found =
       listToMaybe
         [ LimitBelowFormatting name given least
         | (name, given, least) ←
             [ ("InstanceIdBytes", limitInstanceIdBytes found, minimumInstanceIdBytes)
             , ("PrintWarnBytes", limitPrintBytes found, minimumPrintWarnBytes (limitInstanceIdBytes found))
-            , ("CopiedValueBytes", copiedBytes, minimumCopiedValueBytes (limitInstanceIdBytes found) (limitPrintBytes found))
+            , ("CopiedValueBytes", copiedBytes, minimumCopiedValueBytes (limitInstanceIdBytes found) (limitPrintBytes found) (failureTexts found))
+            , ("CopiedValueDepth", copiedDepth, minimumStatusDepth)
+            , ("CopiedValueElements", copiedElements, minimumStatusElements)
             ]
         , given < least
         ]
     copiedBytes = let Bytes n = bytesLimit profile CopiedValueBytes in fromIntegral (min n (fromIntegral (maxBound ∷ Int)))
+    copiedDepth = let Count n = countLimit profile CopiedValueDepth in fromIntegral (min n (fromIntegral (maxBound ∷ Int)))
+    copiedElements = let Count n = countLimit profile CopiedValueElements in fromIntegral (min n (fromIntegral (maxBound ∷ Int)))
+    -- the most text a failure in the status record can hold under this profile
+    failureTexts found =
+      failureTextBytes
+        (limitMessageBytes found)
+        (machineBytes TracebackBytes)
+        (limitInstanceIdBytes found)
+        (machineBytes PathBytes)
+        (machineBytes RoleFailureRecordBytes)
+    machineBytes limit = let Bytes n = bytesLimit profile limit in fromIntegral (min n (fromIntegral (maxBound ∷ Int)))
 
 -- | The VM's role.
 facadeRole ∷ Facade → Role
@@ -379,6 +417,7 @@ forgetInstance facade identity = do
     forgetRecord (fcRegistry facade) identity
     pure (held >>= recordNumber)
   mapM_ (forgetSamples facade) number
+  mapM_ (forgetStatus facade) number
 
 -- Installing ---------------------------------------------------------------------------------------
 
@@ -439,13 +478,14 @@ facadeNamespace facade =
         <> contentBindings facade
         <> requestBindings facade
         <> timeBindings facade
+        <> sessionBindings facade
     )
 
 -- | A configuration of a VM's instances that tells the facade whenever a hook begins or resumes, after
 -- whatever the configuration already did.
 facadeInstanceConfig ∷ Facade → InstanceConfig → InstanceConfig
 facadeInstanceConfig facade config =
-  config {instanceOnSegment = \found → segmentStarted facade found >> instanceOnSegment config found}
+  config {instanceOnSegment = \found → segmentStarted facade found >> captureStatus facade found >> instanceOnSegment config found}
 
 -- | What the application's 'scheduledRefusedWait' does for a facade: the scheduler refused a wait that the
 -- facade's own binding had checked and prepared, which can only be because the clock moved between the

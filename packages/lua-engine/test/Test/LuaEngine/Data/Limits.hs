@@ -17,7 +17,7 @@ import Hetoimasia.Scripting.Lua.Admission (newRequestHandles)
 import Hetoimasia.Scripting.Lua.Provider (ProviderDiagnostics (..))
 import Test.Hspec
 import Test.LuaEngine.Data.Support
-import Test.LuaEngine.Request.Profiles (bytesOf)
+import Test.LuaEngine.Request.Profiles (bytesOf, copiedLeast)
 
 spec ∷ Spec
 spec = describe "limits" $ do
@@ -30,7 +30,7 @@ spec = describe "limits" $ do
 -- record around a result.
 small ∷ Profile
 -- (the identity and print bounds at their least, so that the copied-value bound of 512 is above its own least, 176)
-small = bytesOf [(DataBytes, 64), (RetainedDataBytesPerVm, 128), (InstanceIdBytes, 6), (PrintWarnBytes, 171), (CopiedValueBytes, 512), (SceneInputBytes, 256)]
+small = bytesOf [(DataBytes, 64), (RetainedDataBytesPerVm, 128), (InstanceIdBytes, 6), (PrintWarnBytes, 171), (CopiedValueBytes, copiedLeast 6 171), (SceneInputBytes, 256)]
 
 files ∷ Layout
 files =

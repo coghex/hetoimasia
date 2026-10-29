@@ -47,6 +47,10 @@ module Hetoimasia.LuaEngine.Profile
   , minimumPrintWarnBytes
   , minimumCopiedValueBytes
   , minimumContextBytes
+  , failureTextBytes
+  , minimumStatusBytes
+  , minimumStatusDepth
+  , minimumStatusElements
 
     -- * The facade's format
   , codeWords

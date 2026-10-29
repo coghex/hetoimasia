@@ -28,6 +28,10 @@ module Hetoimasia.LuaEngine.Profile.Minimum
   , minimumPrintWarnBytes
   , minimumCopiedValueBytes
   , minimumContextBytes
+  , failureTextBytes
+  , minimumStatusBytes
+  , minimumStatusDepth
+  , minimumStatusElements
 
     -- * The format's pieces
   , codeWords
@@ -58,8 +62,8 @@ minimumBytes spec = \case
   InstanceIdBytes → fromIntegral minimumInstanceIdBytes
   -- a warning's prefix, the truncation marker and a line end
   PrintWarnBytes → fromIntegral (minimumPrintWarnBytes identity)
-  -- the engine's own context record and texts that cross the value boundary
-  CopiedValueBytes → fromIntegral (minimumCopiedValueBytes identity (fromIntegral (rawOf (specBytes spec PrintWarnBytes))))
+  -- the engine's own context record, texts and status record that cross the value boundary
+  CopiedValueBytes → fromIntegral (minimumCopiedValueBytes identity (fromIntegral (rawOf (specBytes spec PrintWarnBytes))) texts)
   -- one RGBA8 pixel: the least output a texture has
   PngPipelineWorkspaceBytes → rgba8BytesPerPixel
   TextureBytesPerUiInstance → rgba8BytesPerPixel
@@ -68,13 +72,22 @@ minimumBytes spec = \case
   _ → 1
   where
     identity = fromIntegral (rawOf (specBytes spec InstanceIdBytes))
+    texts =
+      failureTextBytes
+        (fromIntegral (rawOf (specBytes spec MessageBytes)))
+        (fromIntegral (rawOf (specBytes spec TracebackBytes)))
+        identity
+        (fromIntegral (rawOf (specBytes spec PathBytes)))
+        (fromIntegral (rawOf (specBytes spec RoleFailureRecordBytes)))
     rawOf (Bytes value) = min value (fromIntegral (maxBound ∷ Int))
 
--- | The least a count limit may be: one, except that a scene of one sprite is its fixed elements and one sprite's, and a
--- copied value must be able to hold it.
+-- | The least a count limit may be: one, except that a scene of one sprite is its fixed elements and one sprite's, a
+-- copied value must be able to hold it, and a copied value must be able to hold the largest status record a session
+-- shows a script (its depth and its elements).
 minimumCount ∷ ProfileSpec → CountLimit → Word64
 minimumCount _ = \case
-  CopiedValueElements → sceneFixedElements + sceneElementsPerSprite
+  CopiedValueElements → max (sceneFixedElements + sceneElementsPerSprite) (fromIntegral minimumStatusElements)
+  CopiedValueDepth → fromIntegral minimumStatusDepth
   _ → 1
 
 -- | The least a duration limit may be, in nanoseconds: one.
@@ -138,14 +151,54 @@ minimumPrintWarnBytes idBytes = max instanceForm moduleForm + bytesOfText "..." 
     instanceForm = bytesOfText warnLead + longestRole + bytesOfText contentLead + contentIdBytes + bytesOfText instanceLead + idBytes + bytesOfText warnEnd
     moduleForm = bytesOfText warnLead + longestRole + bytesOfText moduleLead + moduleLabelBytes + bytesOfText warnEnd
 
--- | The fewest bytes the profile's bound on a copied value may be, given its bounds on an identity and on one @print@ or
--- @warn@: the largest of everything the facade itself makes cross the value boundary, each with the header the host adds
--- to it. These are the text of one call to @out@ or @err@ (at most the print bound, and a text argument has a five-byte
--- header), an identity handed to @check@ or @bind@ (a text, the same header), and the context record the builder is
--- handed ('minimumContextBytes'). What a script passes in as the path or the options of a content request is the script's,
--- and a value too large to cross is an ordinary error there.
-minimumCopiedValueBytes ∷ Int → Int → Int
-minimumCopiedValueBytes idBytes printBytes = maximum [minimumContextBytes idBytes, printBytes + 5, idBytes + 5]
+-- | The fewest bytes the profile's bound on a copied value may be, given its bounds on an identity, on one @print@ or
+-- @warn@ and on the texts a failure may hold ('failureTextBytes'): the largest of everything the facade itself makes cross
+-- the value boundary, each with the header the host adds to it. These are the text of one call to @out@ or @err@ (at most
+-- the print bound, and a text argument has a five-byte header), an identity handed to @check@ or @bind@ (a text, the same
+-- header), the context record the builder is handed ('minimumContextBytes') and the largest status record a session shows
+-- a presentation script ('minimumStatusBytes'). What a script passes in as the path or the options of a content request is
+-- the script's, and a value too large to cross is an ordinary error there.
+minimumCopiedValueBytes ∷ Int → Int → Int → Int
+minimumCopiedValueBytes idBytes printBytes failureTexts = maximum [minimumContextBytes idBytes, printBytes + 5, idBytes + 5, minimumStatusBytes failureTexts]
+
+-- | The most bytes of text one failure record may hold, given the profile's bounds on a message, a traceback, an
+-- instance identity, a path and the whole record: each text is cut to its own bound, the schema's words (the longest
+-- code, stage and role) and a content identifier cannot be cut, and the whole is held to the record bound. The status
+-- record shows a failure as the session holds it, so this is the most any failure in it can weigh in text.
+failureTextBytes ∷ Int → Int → Int → Int → Int → Int
+failureTextBytes messageBytes tracebackBytes idBytes pathBytes recordBytes =
+  min recordBytes (schemaWordsBytes + messageBytes + tracebackBytes + contentIdBytes + idBytes + pathBytes)
+
+-- | The bytes the host counts for the largest status record a session shows a script, given the most text a failure
+-- record may hold ('failureTextBytes'): both roles present and failed, every optional field of each failure present. The
+-- host counts a table as five bytes and its keys and values, a key or a text as five bytes and its length, and a boolean
+-- as one.
+minimumStatusBytes ∷ Int → Int
+minimumStatusBytes failureTexts = table (key "stopping" + 1 + key "gameplay" + role + key "presentation" + role)
+  where
+    table body = 5 + body
+    key name = 5 + bytesOfText name
+    text n = 5 + n
+    role = table (key "present" + 1 + key "initialized" + 1 + key "phase" + text longestPhase + key "failed" + 1 + key "failure" + failure)
+    failure = table (sum (map key statusFailureKeys) + length statusFailureKeys * 5 + failureTexts)
+    longestPhase = maximum (map bytesOfText statusPhaseWords)
+
+-- | How deep the largest status record nests: the record, a role, a failure.
+minimumStatusDepth ∷ Int
+minimumStatusDepth = 3
+
+-- | How many values the host counts in the largest status record: every table and every value in it, keys not counted.
+-- One for the record, one for @stopping@, and for each role the table, its four fields and the failure with its eight.
+minimumStatusElements ∷ Int
+minimumStatusElements = 1 + 1 + 2 * (1 + 4 + (1 + length statusFailureKeys))
+
+-- | The keys of a failure in the status record.
+statusFailureKeys ∷ [Text]
+statusFailureKeys = ["code", "message", "role", "stage", "content_id", "instance_id", "path", "traceback"]
+
+-- | The phases of a role, as the schema spells them.
+statusPhaseWords ∷ [Text]
+statusPhaseWords = ["starting", "ready", "running", "stopping", "retired"]
 
 -- | The fewest bytes the profile's bound on a copied value may be for the builder's context alone, given its bound on an
 -- identity: the bytes the host counts for the context record the builder is handed (a record of five bytes and, for each

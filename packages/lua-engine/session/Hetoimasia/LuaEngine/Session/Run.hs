@@ -96,6 +96,7 @@ module Hetoimasia.LuaEngine.Session.Run
   , sessionHistory
   , requestStop
   , latchTerminalFailure
+  , sessionEndpoints
   , sessionDiagnosticsEnded
   ) where
 
@@ -172,6 +173,7 @@ import Hetoimasia.LuaEngine.Facade
   , FacadeEndpoints (..)
   , FacadeSpec (..)
   , InstanceIds
+  , SessionEndpoints (..)
   , declareInstance
   , facadeInstanceConfig
   , facadeRefusedWait
@@ -210,6 +212,7 @@ import Hetoimasia.LuaEngine.Profile
   , countLimit
   )
 import Hetoimasia.LuaEngine.Request (m1Requests, withM1Gate)
+import Hetoimasia.LuaEngine.Session.Control (statusSample, terminalFailure)
 import Hetoimasia.LuaEngine.Session.Failure
 import Hetoimasia.LuaEngine.Session.Harness
 import Hetoimasia.LuaEngine.Session.Pacing
@@ -383,6 +386,18 @@ latchTerminalFailure session failure = do
   -- the state bounds the failure an event carries, whoever built it
   answer ← applyEvent session (Terminal failure)
   pure (answer == Latched True)
+
+-- | The narrow endpoints a facade is injected with for the Lua status, quit and unavailable-state bindings
+-- (LFE-26): the coordinator's own status, normal stop and terminal latch, nothing wider. A facade holds these
+-- three closures and no 'Session'; the status is read as one transaction, the stop is 'requestStop' (a returning
+-- request with no slot) and the latch is 'latchTerminalFailure', whose first answer is when the guard writes.
+sessionEndpoints ∷ Session → SessionEndpoints
+sessionEndpoints session =
+  SessionEndpoints
+    { endpointStatus = statusSample <$> sessionStatus session
+    , endpointQuit = requestStop session StopQuit
+    , endpointTerminal = latchTerminalFailure session . terminalFailure
+    }
 
 -- The environment -------------------------------------------------------------------------------------
 
@@ -925,6 +940,7 @@ withRoleVm env info body = do
                 , fsInventory = sxInventory spec
                 , fsOutput = sxOutput spec
                 , fsEndpoints = endpoints
+                , fsSession = sessionEndpoints (envSession env)
                 , fsPhase = phase
                 , fsRoots = [riContent info]
                 , fsIds = envIds env
