@@ -53,6 +53,7 @@ import Hetoimasia.Foundation.Time (Duration, DurationRequirement (AllowZero), du
 import Hetoimasia.Foundation.Worker (StopToken, WorkerDefinition, awaitStopRequest, workerDefinition)
 import qualified Hetoimasia.Foundation.Worker as Worker
 import Hetoimasia.GLFW.Command
+import Hetoimasia.GLFW.Internal.NativeCheck (NativeCloseAnswer (..), requestNativeCloseWith)
 import Hetoimasia.GLFW.Demand
 import Hetoimasia.GLFW.Internal.Demand (DemandHooks (..), noDemandHooks, publishDemandWith)
 import qualified Hetoimasia.GLFW.Input as Input
@@ -169,9 +170,11 @@ spec = describe "GLFW window host" $ do
     it "refreshes the monitor inventory after native events only when the monitor callback reported a change"
       (boundedExample testMonitorReconciliation)
 
-  describe "close requests" $
+  describe "close requests" $ do
     it "surfaces a close request once to application policy, destroying nothing and keeping the loop and workers running"
       (boundedExample testCloseRequest)
+    it "makes the test-only native close reach a held window only on the owner thread, and no other window"
+      (boundedExample testNativeCheck)
 
   describe "quiescence and shutdown" $ do
     it "closes admission and settles queued commands in one finite, idempotent transaction that executes nothing"
@@ -487,6 +490,43 @@ testObservationThroughLoop = do
               }
       )
   settled `shouldBe` Just (Performed (ObservationPublished window revision))
+
+-- | The test-only genuine native close (LFE-18), over a counting driver: it reaches the driver for a window the
+-- host holds, on the owner thread; reports what the driver answered; and reaches it for no other window and from
+-- no other thread. The production driver is the native suite's.
+testNativeCheck ∷ Expectation
+testNativeCheck = do
+  seam ← newSeam defaultScript
+  unserved ← unservedWindow
+  calls ← newIORef (0 ∷ Int)
+  answer ← newIORef True
+  let driver _ = atomicModifyIORef' calls (\n → (n + 1, ())) >> readIORef answer
+  (held, withdrawn, ended, offOwner, driven) ←
+    hosted seam (settings [windowNamed "owner"]) {hostCommandCapacity = 1} (\host _ → pure host) $ \host control →
+      runOwnerLoop host control $
+        LoopHooks
+          { loopLogger = quietLogger
+          , loopEvent = noApplicationEvents
+          , loopUpdate = \_ → do
+              window ← onlyWindow host
+              let identity = windowIdentity window
+              held ← requestNativeCloseWith driver host identity
+              writeIORef answer False
+              withdrawn ← requestNativeCloseWith driver host identity
+              writeIORef answer True
+              before ← readIORef calls
+              ended ← requestNativeCloseWith driver host unserved
+              (offOwner, _) ← onThread forkIO . caughtAs $ requestNativeCloseWith driver host identity
+              driven ← (,) before <$> readIORef calls
+              pure (Finish (held, withdrawn, ended, offOwner, driven))
+          }
+  held `shouldBe` NativeCloseDelivered
+  withdrawn `shouldBe` NativeCloseUnavailable
+  ended `shouldBe` NativeCloseWindowEnded
+  offOwner `shouldBe` NotSessionOwner
+  -- The window the host does not serve, and the thread that is not the owner's, never reached the driver.
+  fst driven `shouldBe` 2
+  readIORef calls >>= (`shouldBe` 2)
 
 testOwnerNeverWaits ∷ Expectation
 testOwnerNeverWaits = do
