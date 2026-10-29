@@ -67,6 +67,14 @@ awaitLine' world prefix = bounded . atomically $ do
   found ← readTVar (wLines world)
   when (not (any (\(stream, line) → stream == Stdout && prefix `Text.isPrefixOf` line) found)) retry
 
+-- | Hold these points of the session for the scenario, and always let them go when it ends: an example that fails
+-- unwinds at once instead of waiting on a hold of its own.
+scenarioHolding ∷ SessionEnv → Recorder → [Point] → (Session → IO ()) → IO SessionOutcome
+scenarioHolding env recorder points scenario = do
+  mapM_ (holdAt recorder) points
+  runScenarioWith env (recordingHarness recorder noHarness) $ \session →
+    scenario session `finally` mapM_ (releaseHold recorder) points
+
 g0, p0 ∷ InstanceKey
 g0 = InstanceKey Gameplay 0
 p0 = InstanceKey Presentation 0
@@ -109,8 +117,7 @@ statusAtEachHook = describe "api.session.status()" $ do
     withSetup (setup (roleScript uiScript)) $ \env → do
       let world = seWorld env
       recorder ← newRecorder
-      holdAt recorder (Dispatched g0)
-      void . runScenarioWith env (recordingHarness recorder noHarness) $ \session → do
+      void . scenarioHolding env recorder [Dispatched g0] $ \session → do
         awaitPoint recorder (Dispatched g0)
         awaitPhase session Presentation Running
         passTime world 1000000000 (any (Text.isPrefixOf "ui update") <$> outLines world)
@@ -124,8 +131,7 @@ statusAtEachHook = describe "api.session.status()" $ do
   it "shows ready, which is the logical role's own init and not the readiness of assets, to a presentation init that begins after it" $
     withSetup (setup (roleScript uiScript)) $ \env → do
       recorder ← newRecorder
-      holdAt recorder (Dispatched p0)
-      void . runScenarioWith env (recordingHarness recorder noHarness) $ \session → do
+      void . scenarioHolding env recorder [Dispatched p0] $ \session → do
         awaitPoint recorder (Dispatched p0)
         awaitPhase session Gameplay Ready
         releaseHold recorder (Dispatched p0)
@@ -231,10 +237,9 @@ statusCapture = describe "the capture of a segment" $ do
       let world = seWorld env
           probe = ssProbeOf env
       recorder ← newRecorder
-      holdAt recorder (Dispatched g0)
       -- the update waits on a read the pool's reader holds, so the resumption is placed by the example and not by a clock
       closeGate probe "lua/slow.bin"
-      void . runScenarioWith env (recordingHarness recorder noHarness) $ \session → do
+      void . scenarioHolding env recorder [Dispatched g0] $ \session → do
         awaitPoint recorder (Dispatched g0)
         awaitPhase session Presentation Running
         passTime world 1000000000 (any (Text.isPrefixOf "before ") <$> outLines world)
@@ -259,8 +264,7 @@ statusCapture = describe "the capture of a segment" $ do
     withSetup (setup eventDriven) $ \env → do
       let world = seWorld env
       recorder ← newRecorder
-      holdAt recorder (Dispatched g0)
-      void . runScenarioWith env (recordingHarness recorder noHarness) $ \session → do
+      void . scenarioHolding env recorder [Dispatched g0] $ \session → do
         awaitPoint recorder (Dispatched g0)
         awaitPhase session Presentation Running
         releaseHold recorder (Dispatched g0)
@@ -434,8 +438,7 @@ quitting = describe "api.session.quit()" $ do
     withSetup (setup (roleScript printScript {scInit = ["if api.role == 'presentation' then api.session.quit() print('quit returned') end"]})) $ \env → do
       let world = seWorld env
       recorder ← newRecorder
-      holdAt recorder (Dispatched g0)
-      outcome ← runScenarioWith env (recordingHarness recorder noHarness) $ \session → do
+      outcome ← scenarioHolding env recorder [Dispatched g0] $ \session → do
         awaitPoint recorder (Dispatched g0)
         awaitLine world "quit returned"
         status ← statusNow session

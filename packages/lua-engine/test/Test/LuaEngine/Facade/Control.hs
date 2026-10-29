@@ -139,9 +139,11 @@ capture = describe "the capture of a segment" $ do
         setStatus world bothRunning
         holdSink world "first read done"
         spawned ← admitOnly world fvm "modules-test" mainPath
-        awaitSinkEntered world "first read done"
-        -- the coordinator moves on while the init is parked in its output: the later reads still describe the entry
-        setStatus world (StatusSample True (Just (RoleSample True "stopping" Nothing)) (Just (RoleSample True "stopping" Nothing)))
+        -- (however the example ends, the sink is let go, so a failed assertion unwinds instead of waiting on the hold)
+        (`finally` releaseSink world) $ do
+          awaitSinkEntered world "first read done"
+          -- the coordinator moves on while the init is parked in its output: the later reads still describe the entry
+          setStatus world (StatusSample True (Just (RoleSample True "stopping" Nothing)) (Just (RoleSample True "stopping" Nothing)))
         releaseSink world
         awaitActive spawned
         let stoppedDump = "{gameplay={failed=false,initialized=true,phase=\"stopping\",present=true},presentation={failed=false,initialized=true,phase=\"stopping\",present=true},stopping=true}"
