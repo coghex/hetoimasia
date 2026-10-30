@@ -61,12 +61,12 @@ spec env = describe "scene retention" $ do
       awaitFrame env window 1 earlier
       released ← run comp vm "a" "release" "a" Nothing
       released `shouldSatisfy` Text.isInfixOf "retiring"
-      readingLive env >>= (`shouldBe` 1)
+      expectLive env 1
       -- A frame recorded after the release, with the same adopted scene: the texture was still drawable.
       mark ← frameLogMark <$> readTVarIO (envFrames env)
       demandFrame env window
       awaitFrame env window 1 mark
-      readingLive env >>= (`shouldBe` 1)
+      expectLive env 1
       -- A new publication naming the released lease is refused as an ordinary error and changes nothing.
       refused ← run comp vm "a" "ppublish" "a" (Just "a")
       refused `shouldSatisfy` Text.isInfixOf "error"
@@ -98,7 +98,7 @@ spec env = describe "scene retention" $ do
       -- it with the texture still alive.
       awaitAdopted env window 1
       awaitFrame env window 1 earlier
-      readingLive env >>= (`shouldBe` 1)
+      expectLive env 1
       held ← atomically (ledgerReading (graphicsLedger (envGraphics env)))
       length (readingHeld held) `shouldBe` 1
       -- A new publication naming the released lease is refused and changes nothing.
@@ -245,8 +245,21 @@ demandFrame env window =
     Nothing → assertFailure "the window has no client to publish demand to"
     Just client → () <$ publishDemand (clientDemandPublisher client) immediateDemand
 
-readingLive ∷ Env → IO Int
-readingLive env = readingLiveTextures <$> atomically (graphicsReading (envGraphics env))
+-- | The number of textures the backend has not proved retired is this, or the example fails naming where every one of
+-- them stands, what the ledger holds and what the host's scene state says, so that a failure on another machine carries
+-- the evidence of what the owner had done.
+expectLive ∷ Env → Int → IO ()
+expectLive env wanted = do
+  reading ← atomically (graphicsReading (envGraphics env))
+  unless (readingLiveTextures reading == wanted) $ do
+    ledger ← atomically (ledgerReading (graphicsLedger (envGraphics env)))
+    state ← atomically (readVulkanSceneState (envHost env))
+    assertFailure
+      ( "expected " <> show wanted <> " live texture(s), found " <> show (readingLiveTextures reading)
+          <> "; stages " <> show (readingTextureStages reading)
+          <> "; ledger " <> show ledger
+          <> "; scene state " <> show (Map.elems (sceneWindows state))
+      )
 
 awaitWindowCount ∷ Env → Int → IO ()
 awaitWindowCount env wanted = atomically $ do
