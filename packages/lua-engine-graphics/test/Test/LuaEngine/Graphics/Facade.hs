@@ -313,6 +313,20 @@ spec = describe "graphics facade" $ do
     map rfCode (take 1 (outFailures found)) `shouldBe` [LuaError]
     fmap eeCode (erPrimary (outEngine found)) `shouldBe` Just LuaError
 
+  it "raises the output failure after a texture handle was published to the script, with the texture the engine's, released exactly once, and no false retirement" $ do
+    -- The handle is the script's the moment it takes the result; the lease that owns the texture was registered in the host's
+    -- lease scope before that (Requirement 7's order), so the sink's failure, raised on the very line that prints it, finds the
+    -- texture owned and releases it once: one allocation, one release attempt, one release, and none for anything else.
+    (raised, logged) ←
+      runFacadeLogged ((defaultShape sinkFailsAfterTake) {shapeBoth = False, shapeSinkFails = True}) $ \fs →
+        atomically (sessionOutcomeNow (fsSession fs) >>= \found → unless (not (null (outFailures found))) retry)
+    case raised of
+      Left failure → fromException failure `shouldSatisfy` (\found → case found of Just OutputFailure {} → True; Nothing → False)
+      Right outcome → expectationFailure ("expected the output failure, found " <> show (outVerdict outcome))
+    length (filter (Text.isPrefixOf "allocated ") logged) `shouldBe` 1
+    length (filter (Text.isPrefixOf "release attempted") logged) `shouldBe` 1
+    length (filter (Text.isPrefixOf "released ") logged) `shouldBe` 1
+
   it "refuses a facade installation whose services break the registration, before any role starts, leaving the pipeline and the provider with nothing" $ do
     ref ← newIORef []
     raised ←
@@ -321,9 +335,10 @@ spec = describe "graphics facade" $ do
     case raised of
       Left failure → show failure `shouldSatisfy` Text.isInfixOf "installation" . Text.pack
       Right () → expectationFailure "expected the installation to be refused"
-    -- No request was ever made, so nothing native was.
+    -- No request was ever made, so nothing native was: no allocation, upload or registration, and no service owner released
+    -- (nothing was acquired to release).
     logged ← readIORef ref
-    filter (Text.isPrefixOf "allocated") logged `shouldBe` []
+    filter (\event → any (`Text.isPrefixOf` event) ["allocated", "upload", "registered", "release"]) logged `shouldBe` []
 
   it "settles a window request the provider's invalidation overtakes while the host holds its adoption: the window is closed once, retired, and nothing is left" $ do
     entered ← newEmptyMVar
@@ -827,6 +842,25 @@ sinkFails =
     , "      print('both started')"
     , "    end,"
     , "    update=function(self, dt) end"
+    ]
+
+-- | Both requests started; the texture's result is taken (its handle is the script's), and the first authored line, printed
+-- with it, raises in the sink.
+sinkFailsAfterTake ∷ ByteString
+sinkFailsAfterTake =
+  presentationOnly
+    [ "    init=function(self, api)"
+    , "      self.w = api.window.open({title='t', width=64, height=64})"
+    , "      self.t = api.content.texture('images/quad.png')"
+    , "    end,"
+    , "    update=function(self, dt)"
+    , "      local api = self.api"
+    , "      if not self.said and api.request.ready(self.t) then"
+    , "        self.said = true"
+    , "        local taken = api.request.take(self.t)"
+    , "        print('taken', taken.status, taken.value.texture ~= nil)"
+    , "      end"
+    , "    end"
     ]
 
 -- | A texture taken, and then the script's own error: the texture's lease is released when the instance ends, and that

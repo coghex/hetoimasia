@@ -13,11 +13,13 @@
 module Test.LuaEngine.Graphics.Peers (spec) where
 
 import Control.Concurrent (forkIO, killThread)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (finally)
 import Control.Monad (forM_, forever, unless, void)
 import Data.ByteString (ByteString)
+import Data.IORef (atomicModifyIORef', newIORef)
+import Data.Maybe (isJust)
 import qualified Data.Text as Text
 import Data.Text (Text)
 import qualified Data.Text.Encoding as Text
@@ -50,7 +52,7 @@ import qualified Hetoimasia.Runtime.Supervision as Supervision
 import Hetoimasia.Scripting.Lua.Admission (newRequestHandles)
 import Hetoimasia.Scripting.Lua.Instance hiding (forgetInstance)
 import Hetoimasia.Scripting.Lua.Owner
-import Hetoimasia.Scripting.Lua.Provider (RequestGrant (..), RequestTiming (SettleOnArrival))
+import Hetoimasia.Scripting.Lua.Provider (RequestGrant (..), RequestTiming (SettleOnArrival), advanceRequestEpoch)
 import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Scheduler (systemTimerBackend)
 import Data.Time.Calendar (fromGregorian)
@@ -76,6 +78,7 @@ data Peers = Peers
   -- ^ What the fake session's status says is stopping: the example's one-way word to the survivor.
   , peAdmit ∷ !(IO Spawned)
   , peFake ∷ !Fake.Fake
+  , peWindows ∷ !WF.Fake
   }
 
 -- | An instance admitted to the VM.
@@ -89,6 +92,7 @@ spec ∷ Spec
 spec = describe "graphics facade, two instances of one VM" $ do
   boundSpec
   evictedSpec
+  heldAdoptionSpec
   it "leaves a surviving instance's window and texture usable and publishable when its peer ends, cleans the owner map for the one that ended, and refuses the peer's handle, even once its texture has retired" $
     withPeers $ \peers → do
       first ← peAdmit peers
@@ -211,12 +215,59 @@ evictedSpec =
       stop peers second
       settle second
 
+-- | The host's own request invalidated while the provider holds its window's adoption: the epoch of the scheduled endpoint
+-- advances (the public operation that settles every outstanding request as cancelled by the epoch) after the window was
+-- created and attached and while the host's adoption recipe is held at 'hookBeforeAdopt'. The adoption then finds the
+-- request gone: no success reaches the script, the window is closed once and retired, and the provider's acquisition
+-- (the reservation) is returned only then, never before the window has retired.
+heldAdoptionSpec ∷ Spec
+heldAdoptionSpec = do
+  it "settles a window request whose host request is invalidated while the provider holds its adoption: no success is delivered, the window is closed once, and the reservation returns only after its retirement" $ do
+    entered ← newEmptyMVar
+    proceed ← newEmptyMVar
+    seen ← newIORef False
+    let hooks =
+          noProviderHooks
+            { hookBeforeAdopt = do
+                first ← atomicModifyIORef' seen (\held → (True, not held))
+                if first then putMVar entered () >> readMVar proceed else pure ()
+            }
+    withPeersHooked hooks heldEntry defaultIssuedMemory $ \peers → do
+      first ← peAdmit peers
+      -- The window is created and attached, the host claimed the adoption recipe and the example holds it there.
+      takeMVar entered
+      -- The reservation is held while the window is alive, and the window has not been closed.
+      atomically (providerReading (peProvider peers)) >>= \found → readingAcquisitions found `shouldBe` 1
+      length . filter (Text.isPrefixOf "close w") <$> WF.events (peWindows peers) >>= (`shouldBe` 0)
+      -- The host's request is invalidated through the public endpoint while the adoption is held.
+      advanceRequestEpoch (scheduledEndpoint (peOwner peers)) >>= (`shouldSatisfy` isJust)
+      atomically (providerReading (peProvider peers)) >>= \found → readingAcquisitions found `shouldBe` 1
+      putMVar proceed ()
+      -- Only after the window retired is the reservation back.
+      atomically (providerReading (peProvider peers) >>= \found → unless (readingAcquisitions found == 0) retry)
+      closes ← length . filter (Text.isPrefixOf "close w") <$> WF.events (peWindows peers)
+      closes `shouldBe` 1
+      -- What the script was told: the request settled, but never as a success, and no other window came into being.
+      awaitLinePrefix peers "window\t"
+      awaitLine peers "after\ttrue"
+      told ← readTVarIO (peOut peers)
+      [line | line ← told, Text.isPrefixOf "window\t" line] `shouldSatisfy` all (/= "window\tsuccess")
+      length (filter (Text.isPrefixOf "window\t") told) `shouldBe` 1
+      length . filter (Text.isPrefixOf "issue create") <$> WF.events (peWindows peers) >>= (`shouldBe` 1)
+      stop peers first
+      _ ← waitInstance (spTicket first)
+      forgetInstance (peFacade peers) (spIdentity first)
+
 withPeers ∷ (Peers → IO a) → IO a
 withPeers = withPeersWith peersEntry defaultIssuedMemory
 
 -- | The same composition with the given entry module and the given number of issued handles remembered.
 withPeersWith ∷ ByteString → Int → (Peers → IO a) → IO a
-withPeersWith entry issuedMemory body = bounded . withRig Fake.defaultFakeConfig $ \rig → do
+withPeersWith = withPeersHooked noProviderHooks
+
+-- | The same composition with the given window-provider hooks: the places an example holds a step of the provider.
+withPeersHooked ∷ ProviderHooks → ByteString → Int → (Peers → IO a) → IO a
+withPeersHooked hooks entry issuedMemory body = bounded . withRig Fake.defaultFakeConfig $ \rig → do
   let fake = rigFake rig
   model ← newModel (fakeLedger fake)
   setBarrier fake (modelCapture model)
@@ -226,7 +277,7 @@ withPeersWith entry issuedMemory body = bounded . withRig Fake.defaultFakeConfig
   let config = WindowConfig 2 (pure ()) (\_ → pure ())
       files = [("lua/main.lua", entry), ("lua/share.lua", "return {apis = {}, handles = {}}"), ("images/quad.png", Png.solid 2 2 (200, 100, 50, 255))]
   withComposition compositionProfile files (rigPort rig) $ \composition control runtime →
-    withWindowProvider config (retarget (WF.fakePort windows)) $ \provider →
+    withWindowProviderWith hooks config (retarget (WF.fakePort windows)) $ \provider →
       ( do
           let publisher = scenePublisherOver textures provider (\window scene → fst (modelTarget model window) scene) (\window → snd (modelTarget model window))
               injection = graphicsInjection (GraphicsFacade compositionProfile (cpPipeline composition) provider publisher noPublishHooks issuedMemory)
@@ -318,7 +369,7 @@ withPeersWith entry issuedMemory body = bounded . withRig Fake.defaultFakeConfig
                   admitBehaviorInstance (scheduledEndpoint owner) request >>= \case
                     InstanceAccepted identity ticket → pure (Spawned (declaredId declared) identity ticket)
                     other → assertFailure ("expected the instance accepted, found " <> take 100 (show other))
-            ( mainLoop provider (body (Peers facade owner model provider out signal admit fake))
+            ( mainLoop provider (body (Peers facade owner model provider out signal admit fake windows))
                 -- (however the body ended, the host model lets go of every adoption first, so that the instances' textures can retire)
                 `finally` (dissolve model >> WF.releaseAll windows >> retireAndAwait control owner)
               )
@@ -431,6 +482,33 @@ peersEntry =
     , "        local ok1, e1 = pcall(api.texture.release, share.handles[1])"
     , "        local ok2, e2 = pcall(share.apis[1].window.open, {title = 't', width = 1, height = 1})"
     , "        print('foreign', ok1, tostring(e1):find('belongs to another instance') ~= nil and tostring(e2):find('belongs to another instance') ~= nil)"
+    , "      end"
+    , "    end"
+    , "  }"
+    , "}"
+    ]
+
+-- | One instance that opens a window and does nothing with it until the host settles the request, then says how it
+-- settled, and loads a texture to show that the instance's request places are back.
+heldEntry ∷ ByteString
+heldEntry =
+  Text.encodeUtf8 . Text.unlines $
+    [ "return {"
+    , "  presentation = {"
+    , "    every_seconds = 0.02,"
+    , "    init = function(self, api)"
+    , "      self.w = api.window.open({title = 't', width = 64, height = 64})"
+    , "    end,"
+    , "    update = function(self, dt)"
+    , "      local api = self.api"
+    , "      if not self.said and api.request.ready(self.w) then"
+    , "        self.said = true"
+    , "        print('window', api.request.take(self.w).status)"
+    , "        self.t = api.content.texture('images/quad.png')"
+    , "      end"
+    , "      if self.t and not self.after and api.request.ready(self.t) then"
+    , "        self.after = true"
+    , "        print('after', api.request.take(self.t).status == 'success')"
     , "      end"
     , "    end"
     , "  }"
