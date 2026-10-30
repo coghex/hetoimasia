@@ -1098,7 +1098,7 @@ instance's call is an ordinary error of the binding, never a missing field.
 | `api.content.texture(path [, options])` | `options` is `nil`, absent or a plain table with only `root` and `optional` (a boolean, default `false`; `nil` omits, `false` is a value). `tick_offset` is refused, `1` included | `request, nil`; the taken value is `{texture=HANDLE, width=INTEGER, height=INTEGER}` |
 | `api.window.open({title=TEXT, width=INTEGER, height=INTEGER})` | exactly the three fields, all required; `width` and `height` are Lua integers (`1.0` and `"1"` are refused) | `request, nil`; the taken value is the window handle itself |
 | `api.scene.publish(window, scene)` | the instance's own ready window and a scene of [the scene schema](#the-scene-schema-lfe-19) | no results, once the whole publication is accepted |
-| `api.texture.release(texture)` | the instance's own texture, including one already released | `"done"`, `"retiring"` or `"already_released"` |
+| `api.texture.release(texture)` | the instance's own texture, including one already released. Another instance's texture is an ordinary error, with one exception below | `"done"`, `"retiring"` or `"already_released"` |
 
 Every call is a dot call with its exact arity (an explicit `nil` is an argument), a plain record and the host's raw reading: a
 colon call, a metatable, an unknown or missing field, a wrong type or subtype and a table that is not a plain record are
@@ -1106,6 +1106,15 @@ ordinary errors before any provider is asked, and no authored metamethod runs. T
 content identifier, not the defining module's; a root the session does not enable and an invalid path are refused with no
 filesystem action. The title is UTF-8, at most 512 bytes, with no control character (empty is allowed); the dimensions are
 `1..4096`; those rules, and the occupied window slot, are the adapter's checks, run after the facade's own.
+
+**A peer's texture handle.** A handle of another instance of the same VM is an ordinary error before any provider action whenever the
+host still holds its lease (live, released but retiring, or failed), and whenever the facade still remembers whose it was: the
+adapter keeps the issuing instance of the most recent texture issuances of each VM, 4,096 by default
+([the adapter's record](../lua-engine-graphics/README.md#the-graphics-facade-lfe-21)). The exception, by the owner's decision
+([#536](https://github.com/coghex/hetoimasia/issues/536#issuecomment-6523304300)): a foreign texture handle whose lease has retired
+and which has left that record answers `already_released`. Nothing is acquired, released or charged, and it aliases no newer
+resource (lease keys are never reissued and a script cannot forge a handle). The owner's own release is `done`, `retiring` and
+`already_released` as before, inside and outside the record; wrong-kind, wrong-VM, forged and never-issued handles stay errors.
 
 **Busy.** `content.texture` and `window.open` return `nil, {code="busy", message=TEXT}` when a temporary bank (the request
 places, the texture slots and bytes, the provider's records) has no room: two Lua values, no handle, no provider or native action.
