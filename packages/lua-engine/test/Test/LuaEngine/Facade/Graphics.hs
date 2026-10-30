@@ -92,7 +92,9 @@ injection gx = GraphicsInjection $ \vm → do
         , endpointSubmit = \submission → do
             retirement ← atomically (newTVar ProviderPending)
             atomically (modifyTVar' (gxHanded gx) (<> [(name, submissionCompletion submission, retirement)]))
-            pure ProviderWork {workCancel = note gx ("cancel " <> name), workRetirement = readTVar retirement}
+            -- A cancelled request's work is over at once, so that an example that fails unwinds instead of waiting for what
+            -- would never come.
+            pure ProviderWork {workCancel = note gx ("cancel " <> name) >> atomically (writeTVar retirement ProviderComplete), workRetirement = readTVar retirement}
         }
     start vm ctx name composed = do
       busy ← readIORef (gxBusy gx)
@@ -325,6 +327,20 @@ spec = describe "graphics calls" $ do
         countOf gx "start" `shouldReturn` 2
         countOf gx "publish" `shouldReturn` 0
         finishAll gx
+      )
+      `finally` finishAll gx
+
+  it "refuses acquisition in shutdown as an ordinary error, before any provider is asked" $ do
+    gx ← newGfx
+    let cases =
+          [ Case "shutdown texture" "api.content.texture('images/quad.png')" (Refused ["not available in shutdown"])
+          , Case "shutdown window" "api.window.open({title = 't', width = 2, height = 2})" (Refused ["not available in shutdown"])
+          ]
+    ( withOneGraphics (injection gx) Presentation script {scShutdown = map caseLua cases} files $ \world _ _ spawned → do
+        stopSpawned spawned
+        _ ← settledOf spawned
+        outLines world >>= checkCases cases
+        countOf gx "start" `shouldReturn` 0
       )
       `finally` finishAll gx
   where
