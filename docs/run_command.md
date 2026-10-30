@@ -107,7 +107,8 @@ as a Lua `quit`, including during startup. Closing a window for cleanup generate
 | --- | --- | --- | --- |
 | anchored root, inventory, checkpoint | the preparation scope | main | after the session and its pool |
 | read pool (2 workers), texture pipeline (1 decode worker, 2 lanes) | the session composition, once per session | their own workers | after the window provider, before the root |
-| graphics owner, texture adapter, GLFW | the native composition | main thread and the owner's thread | after the session has retired and the windows are destroyed |
+| GLFW, the device and the owner loop | the native owner application | the process main thread and the owner's thread | after the session has settled; if the loop is lost, the application's own exit destroys the windows first and the session is joined after |
+| texture adapter, pool, pipeline | the session thread | the session thread and its workers | before the session thread ends |
 | window provider | the session composition | its pump; the main step on the main thread | before the pipeline and the adapter drain |
 | session diagnostics writer | `runSession` | its own thread | joined by the command before the logger is released |
 | session, role VMs | `runSession` | the session thread | actual retirement of every role |
@@ -118,25 +119,33 @@ Neither CPU scope exit, a cancellation, a timeout nor a thread finishing proves 
 ## When something fails during shutdown
 
 Every wait of the launcher's shutdown follows the same rules (`Hetoimasia.Run.Settle`): it is never made uninterruptible; a
-cancellation delivered meanwhile is remembered and raised *after* the wait has finished, never instead of it; catching a failure to
-examine it never swallows a cancellation; and a diagnostic that cannot be written never replaces what it reports.
+cancellation delivered meanwhile is remembered across the *whole* sequence it belongs to and raised after it, with the failures
+that sequence found retained beside it, never instead of them; catching a failure to examine it never swallows a cancellation; and a
+diagnostic that cannot be written never replaces what it reports.
 
 * **Preparation** (`Boot.abortable`) runs on a thread of its own. A stop cancels and joins it before the root closes. The child's
   terminal outcome is read: a clean cancellation is an orderly stop (130), but a cleanup that failed under the cancellation is a failure
   (1). A cancellation of the caller, whether it arrives in the wait or while the cancellation is being sent, still cancels and joins the
   child first, and the child's cleanup evidence is retained beside it.
-* **The owner loop** (`Serve`): the session runs on a thread of its own while the process main thread serves the native owner. If the
-  loop fails, or the main thread is cancelled in it, the session is asked to stop and the owner is served *again* by a drain loop until the
-  session has settled, because the session's cleanup closes windows and waits for their native destruction, which only the main thread
-  performs. The drain makes its own supervision, since the application's may have latched the very failure that ended the loop; a
-  failing drain is run again a bounded number of times, after which the join is left to the session (a failed owner is something its
-  providers see and retire as failed). The loop's failure stays primary and the session's own failure, with its cleanup, is retained
-  beside it.
+* **Who owns what** (`Serve`): the *session thread* owns every scope the session uses (the texture adapter, the pool, the pipeline, the
+  window provider, the roles) and ends them itself. The *process main thread* owns only the native owner application (GLFW, the device and
+  the loop) and the root, and serves the loop.
+* **The owner loop failing** (or the main thread being cancelled in it): the session is asked to stop and the owner is served *again* by a
+  drain loop until the session has settled, because the session's cleanup closes windows and waits for their native destruction, which only
+  the main thread performs. The drain makes its own supervision, since the application's may have latched the very failure that ended the
+  loop. A failing drain is run again, three times in all.
+* **The owner lost for good** (the drain fails every time): the loop's failure is raised at once, *without* joining the session. That
+  hands the owner back to its application's own protected exit, which performs the verified destruction of the windows the loop could not.
+  The session, whose providers then see a finished owner, settles, and the command joins it *after* the application has torn down,
+  retaining the session's failure beside the loop's (once, however often it is asked).
 * **The session's diagnostics writer** may outlive `runSession` and borrows the logger, so it is joined before the logging lifetime
-  releases the logger, after every scope the session used has unwound, on a failure as well as a success.
-* **Reporting.** A failure raised inside the logging lifetime goes through it unchanged, so the lifetime applies its own rules (a failed
-  diagnostic is not followed by a final flush through the path that just failed). Boot and host failures are reported by one best-effort
-  line on stderr after every scope has unwound, carrying the cleanup failures retained beside the primary one, never through the logger.
+  releases the logger, after every scope the session used has unwound, on a failure as well as a success. A cancellation during that
+  join does not hide the failure of what was being run: both are raised together.
+* **Reporting.** A failure raised inside the logging lifetime goes through it unchanged, so the lifetime applies its own rules. Every
+  startup diagnostic is marked as the diagnostics' own, so a write that fails is not followed by a final flush through that path, and when
+  the diagnostic path is what failed the command writes no terminal line through it either (the status is the same). Otherwise boot and
+  host failures are reported by one best-effort line on stderr after every scope has unwound, carrying the cleanup failures retained beside
+  the primary one, never through the logger.
 
 ## Sizing
 
