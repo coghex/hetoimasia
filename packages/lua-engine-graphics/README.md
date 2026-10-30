@@ -571,7 +571,8 @@ reservation of its own: it composes theirs. What it adds are four checks, each m
 | calling instance | the facade asks the host which instance is running and the registry for its record; a captured facade, a module's top level and another instance's handle are refused before the action |
 | role, phase and admission | decided once, in the CPU facade, for acquisition and publication; release reads only the instance and its role |
 | owners | looked up by the instance identity the facade issued; an instance with none declared is an engine defect, not a Lua error |
-| lifecycle races after the check | `TextureRefused` and `WindowRefused` come back from the admission with nothing reserved and are raised with `refuseOrdinarily` |
+| lifecycle races after the check | `TextureRefused` and `WindowRefused` come back from the admission with nothing reserved and are raised with `refuseOrdinarily`; a publication reads the session's admission (`gvTakesWork`, folded into the publisher's own authority by `publisherGatedBy`) in the very transaction that commits it, so a stop that lands between the binding's check and the commit refuses the whole scene and leaves the previous one |
+| releasing a handle | the binding's argument check (`gsReleaseCheck`) refuses another instance's lease and a lease of another kind as an ordinary error before the release path; a lease that has already ended is the release path's own to answer (`already_released`) |
 | lease headroom | derived above; the capacity is a function of the profile, not a constant |
 
 ### Tests
