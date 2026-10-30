@@ -569,7 +569,7 @@ withFvmRefusing world runtime shape body = do
                 when failing (throwIO (userError "the terminal latch failed"))
                 pure first
             }
-    graphics ← traverse (\injection → injectGraphics injection (GraphicsVm (shRole shape) requests)) (shGraphics shape)
+    graphics ← traverse (\injection → injectGraphics injection (GraphicsVm (shRole shape) requests (pure True))) (shGraphics shape)
     facade ←
       newFacade
         FacadeSpec

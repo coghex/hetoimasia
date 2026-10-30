@@ -19,7 +19,7 @@ import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
 import Control.Exception (SomeException, finally, throwIO, try)
-import Control.Monad (unless, void)
+import Control.Monad (unless, void, when)
 import Data.ByteString (ByteString)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
@@ -30,24 +30,28 @@ import Hetoimasia.Foundation.Log (Logger, MetadataProviders (..), callbackSink, 
 import Hetoimasia.Foundation.Time (monotonicSource)
 import Hetoimasia.GLFW.Window (WindowId)
 import qualified Data.Map.Strict as Map
-import Hetoimasia.GPU.Vulkan.GLFW (VulkanHost (..), VulkanSceneState (..), WindowSceneStanding (..), readVulkanSceneState)
+import Hetoimasia.GPU.Vulkan.GLFW (VulkanHost (..), VulkanSceneState (..), readVulkanSceneState)
 import System.Timeout (timeout)
 import Hetoimasia.LuaEngine.Boot (bootCheckpoint)
 import Hetoimasia.LuaEngine.Facade (OutputSink (..), withOutput)
 import Hetoimasia.LuaEngine.Graphics.Facade (GraphicsFacade (..), graphicsInjection)
 import Hetoimasia.LuaEngine.Graphics.Scene
 import Hetoimasia.LuaEngine.Graphics.Texture
-import Hetoimasia.LuaEngine.Graphics.Window.Host (newHostPort)
+import Hetoimasia.LuaEngine.Graphics.Window.Host (newHostPort, targetUsable)
 import Hetoimasia.LuaEngine.Graphics.Window.Port (fatalText)
 import Hetoimasia.LuaEngine.Graphics.Window.Provider (WindowConfig (..), windowMainStep, withWindowProvider)
+import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.LuaEngine.Manifest (Role (Gameplay, Presentation))
+import Hetoimasia.LuaEngine.Scene (SceneContent (..), SceneRect (..), SceneSprite (..), TextureUse (..))
+import Hetoimasia.LuaEngine.Texture (TextureView (..))
+import Numeric.Natural (Natural)
 import Hetoimasia.LuaEngine.Session
 import Hetoimasia.Runtime.GLFW (hostWindowIdentities)
 import Hetoimasia.Scripting.Lua.Scheduler (systemTimerBackend)
 import Test.HUnit.Lang (assertFailure)
 import Test.Hspec
 import Test.LuaEngine.Graphics.Composition (Composition (..), compositionProfile, withComposition)
-import Test.LuaEngine.Graphics.FacadeScripts (failingLogicalExample, manifestFor, quadExample)
+import Test.LuaEngine.Graphics.FacadeScripts (failingLogicalExample, isClear, manifestFor, quadExample)
 import Test.LuaEngine.Graphics.FrameLog (frameLogMark)
 import qualified Test.LuaEngine.Graphics.Png as Png
 import Test.LuaEngine.Graphics.Native.Scenes hiding (spec)
@@ -56,10 +60,19 @@ import Test.LuaEngine.Graphics.Native.Session (Env (..), noteWindows, serveMain)
 spec ∷ Env → Spec
 spec env = describe "graphics facade" $ do
   it "runs the common-entry quad example from real Lua: the accepted scene is adopted, its texture stays held and recorded after Lua's immediate release, recording needs no further publish, and the texture retires after the window closes" $
-    within 180 . withFacadeSession env quadExample succeeded $ \_ window → do
+    within 180 . withFacadeSession env quadExample succeeded $ \_ accepted window → do
       earlier ← frameLogMark <$> readTVarIO (envFrames env)
       awaitAdopted env window 1
       awaitFrame env window 1 earlier
+      -- The scene the host accepted is exactly the example's: one sprite of the decoded texture and the clear colour.
+      atomically (readTVar accepted) >>= \seen → case seen of
+        [scene] → case sceneSprites (graphicsContent scene) of
+          [sprite] → do
+            spriteRect sprite `shouldBe` SceneRect 32 32 256 256
+            (viewWidth (useView (spriteTexture sprite)), viewHeight (useView (spriteTexture sprite))) `shouldBe` (8, 4)
+            sceneClear (graphicsContent scene) `shouldSatisfy` isClear 24 24 24
+          other → expectationFailure ("expected one sprite, found " <> show (length other))
+        other → expectationFailure ("expected one accepted publication, found " <> show (length other))
       -- Lua released the texture right after publishing: the adopted scene keeps it, held by the ledger.
       awaitHeld env
       expectHeld env
@@ -73,23 +86,25 @@ spec env = describe "graphics facade" $ do
       evidence env "graphics facade: the example's scene (revision 1) was adopted, recorded again after the immediate Lua release with its texture held by the ledger, and no second publication was made while recording continued"
 
   it "shows a logical update that raises after startup as the UI's failure status, and its exact empty red-clear scene published and adopted through the same bindings" $
-    within 180 . withFacadeSession env failingLogicalExample logicalFailed $ \errLines window → do
+    within 180 . withFacadeSession env failingLogicalExample logicalFailed $ \errLines accepted window → do
       started ← frameLogMark <$> readTVarIO (envFrames env)
       -- The UI warns with the failure's message and publishes the empty red clear once it reads the failure in its status:
       -- a scene it may have drawn first is superseded by it.
       step env "the UI's warning" $ atomically (readTVar errLines >>= \seen → unless (any (Text.isInfixOf "logical failure") seen) retry)
-      -- The red clear is the scene the owner has adopted, the latest published, and it holds no texture. A scene the UI
-      -- may have drawn before it read the failure is superseded by it, so this state is reached only by the red clear.
-      revision <- step env "the red clear adopted, holding nothing" . atomically $ do
-        state ← readVulkanSceneState (envHost env)
-        held ← ledgerReading (graphicsLedger (envGraphics env))
-        case Map.lookup window (sceneWindows state) of
-          Just standing
-            | Just latest ← windowPublished standing
-            , windowAdopted standing == Just latest
-            , null (readingHeld held) → pure latest
+      -- The scene the host accepted last is the exact empty red clear; its revision is the number of accepted publications
+      -- (a window's initial scene is revision 0 and is no publication). A scene the UI may have drawn first is superseded.
+      revision ← step env "the red clear accepted" . atomically $ do
+        seen ← readTVar accepted
+        case reverse seen of
+          scene : _
+            | null (sceneSprites (graphicsContent scene))
+            , isClear 96 0 0 (sceneClear (graphicsContent scene))
+            , null (graphicsReferences scene) → pure (fromIntegral (length seen) ∷ Natural)
           _ → retry
+      revision `shouldSatisfy` (>= 1)
+      step env "the adoption of the red clear" $ awaitAdopted env window revision
       step env "a frame recorded with the red clear" $ awaitFrame env window revision started
+      step env "the end of every hold" $ atomically (ledgerReading (graphicsLedger (envGraphics env)) >>= \held → unless (null (readingHeld held)) retry)
       published env window >>= (`shouldBe` Just revision)
       evidence env ("graphics facade: the logical update raised after startup; the UI warned with the failure message and published the empty red-clear scene (revision " <> Text.pack (show revision) <> "), which the owner adopted and recorded holding no texture")
 
@@ -118,7 +133,7 @@ step env label action =
 -- | Run the entry as the roles of a real session over the production host, hand the scenario the lines the roles
 -- warned and the identity of the one native window the example opens, and end the session by a normal stop once the
 -- scenario returned. The scenario's failures are raised here after the session has ended.
-withFacadeSession ∷ Env → ByteString → (SessionOutcome → Expectation) → (TVar [Text] → WindowId → IO ()) → IO ()
+withFacadeSession ∷ Env → ByteString → (SessionOutcome → Expectation) → (TVar [Text] → TVar [GraphicsScene] → WindowId → IO ()) → IO ()
 withFacadeSession env entry judge scenario = do
   earlier ← atomically (hostWindowIdentities (vulkanWindowHost (envHost env)))
   (port, _) ← newHostPort (envHost env)
@@ -139,8 +154,15 @@ withFacadeSession env entry judge scenario = do
     withComposition compositionProfile files (graphicsBackend (envGraphics env)) $ \composition control runtime →
       withWindowProvider config port $ \provider → do
         writeIORef providerStep (windowMainStep provider)
-        let publisher = scenePublisher (graphicsTextures (envGraphics env)) provider
-            injection = graphicsInjection (GraphicsFacade compositionProfile (cpPipeline composition) provider publisher)
+        -- The publisher is the production one, over the production window capability; the only addition is a tap that
+        -- records the exact scene of every publication the host accepted, in the transaction that accepts it.
+        accepted ← newTVarIO []
+        let tap target scene = do
+              answer ← targetAnswer target scene
+              when (answer == HostAccepted) (modifyTVar' accepted (<> [preparedValue scene]))
+              pure answer
+            publisher = scenePublisherOver (graphicsTextures (envGraphics env)) provider tap targetUsable
+            injection = graphicsInjection (GraphicsFacade compositionProfile (cpPipeline composition) provider publisher noPublishHooks)
         checkpoint ← bootCheckpoint compositionProfile (cpInventory composition) (\_ _ → pure (Right (manifestFor True))) >>= either (\refused → assertFailure ("boot refused: " <> show refused)) pure
         errLines ← newTVarIO []
         let outSink = OutputSink {sinkLine = \_ → pure (), sinkFlush = pure ()}
@@ -156,7 +178,7 @@ withFacadeSession env entry judge scenario = do
                 attempted ← try @SomeException $ do
                   window ← awaitNewWindow earlier
                   noteWindows env 1
-                  scenario errLines window
+                  scenario errLines accepted window
                 -- However the scenario ended, the session stops normally.
                 requestStop found StopQuit
                 putMVar result attempted

@@ -324,6 +324,9 @@ data GraphicsVm = GraphicsVm
   -- ^ The VM's role. A logical VM is given the same layout; every graphics call it makes is refused.
   , gvRequests ∷ !M1Requests
   -- ^ The VM's request policy, already gated on the session's admission: the one the services admit with.
+  , gvTakesWork ∷ !(STM Bool)
+  -- ^ Whether the session still takes new work for this role, as a transaction: the authority a publication reads in the
+  -- very transaction that commits it, so that a stop that wins between the check and the commit refuses the whole scene.
   }
 
 -- | How a composition injects graphics: a function from one VM to its services. The session coordinator holds it
@@ -354,6 +357,10 @@ data GraphicsServices = GraphicsServices
   , gsWindowStart ∷ Text → ByteString → Int64 → Int64 → RequestContext → IO GraphicsStart
   , gsPublish ∷ Text → ArgumentCheck → Binding
   -- ^ The scene publication binding of this name, given the facade's precondition.
+  , gsReleaseCheck ∷ Word64 → IO (Maybe Text)
+  -- ^ Whether this texture handle may be released by the calling instance: refused, as the text of an ordinary error and
+  -- before any provider is asked, for another instance's lease and a lease of another kind. A lease that has already
+  -- ended is not refused: releasing it again is the special release path's to answer.
   , gsRelease ∷ Word64 → IO Text
   -- ^ Release a texture lease by key through the host's special release path: @done@, @retiring@ or @already_released@.
   }

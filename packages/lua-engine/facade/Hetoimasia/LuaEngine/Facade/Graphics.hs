@@ -68,7 +68,8 @@ graphicsBindings facade services =
   , -- A release is allowed wherever an instance's finite hook runs, shutdown and after a quit included, so the
     -- session's admission is deliberately not read. It is a UI operation.
     withPrecondition (\owner → instanceRule owner (releaseRule)) $
-      recoverableRefusals (releaseOperation "texture_release" graphicsTextureType [SText] releaseAct)
+      withArgumentCheck releaseCheck $
+        recoverableRefusals (releaseOperation "texture_release" graphicsTextureType [SText] releaseAct)
   ]
   where
     textureOptions = [("root", SOptional SText), ("optional", SOptional SBoolean)]
@@ -150,6 +151,13 @@ graphicsBindings facade services =
             gsWindowStart services (identityOf caller) title width height context >>= \case
               GraphicsStarted started → pure (m1StartResults graphicsWindowRequestType started)
               GraphicsRefused why → refuseOrdinarily (clipText 200 why)
+
+    -- Another instance's handle and a handle of another kind are ordinary errors before any provider is asked; a handle that
+    -- has ended is the release path's own to answer.
+    releaseCheck ∷ ArgumentCheck
+    releaseCheck _ = \case
+      [VCapability handle] → fmap (clipText 200) <$> gsReleaseCheck services (capabilityKey handle)
+      _ → pure Nothing
 
     releaseAct = \case
       [VCapability handle] → (\word → [VText word]) <$> gsRelease services (capabilityKey handle)

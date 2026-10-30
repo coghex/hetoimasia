@@ -6,11 +6,13 @@ module Test.LuaEngine.Graphics.FacadeScripts
   ( manifestFor
   , quadExample
   , failingLogicalExample
+  , isClear
   ) where
 
 import Data.ByteString (ByteString)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
+import Hetoimasia.Render.TwoD.Snapshot (ClearColour (..))
 
 manifestFor ∷ Bool → ByteString
 manifestFor both =
@@ -103,3 +105,10 @@ quadExample =
 failingLogicalExample :: ByteString
 failingLogicalExample =
   Text.encodeUtf8 (Text.replace "update=function(self, dt_seconds) end" "update=function(self, dt_seconds) error(\"logical failure\") end" (Text.decodeUtf8 quadExample))
+
+-- | Whether a clear colour is the linear value of these sRGB bytes, opaque.
+isClear ∷ Double → Double → Double → ClearColour → Bool
+isClear r g b (ClearColour cr cg cb ca) = close r cr && close g cg && close b cb && ca == 1
+  where
+    close byte linear = abs (realToFrac linear - srgb (byte / 255)) < 1e-5
+    srgb c = if c <= 0.04045 then c / 12.92 else ((c + 0.055) / 1.055) ** 2.4

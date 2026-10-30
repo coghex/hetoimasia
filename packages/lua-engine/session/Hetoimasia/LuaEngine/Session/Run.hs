@@ -535,6 +535,10 @@ admissionOf env role = do
   when (found == AdmissionOpen) (probeAt env (RequestChecked role))
   pure found
 
+-- | Whether a role still takes new work, as the transaction a publication commits with.
+takesWork ∷ Env → Role → STM Bool
+takesWork env role = (\state → roleAdmit role state == AdmitOpen) <$> stateOf env
+
 -- | The credit a role's request policy reserves first: nothing to hold, and a final refusal (an ordinary Lua error, never
 -- busy) when the role takes no new work, read in the transaction that admits the request.
 sessionGate ∷ Env → Role → Credit
@@ -934,7 +938,7 @@ withRoleVm env info body = do
         -- The composition's graphics for this VM, if it injected any: made over this VM's own gated request policy, so
         -- a texture or window admission is refused once the session takes no new work. It acquires nothing that
         -- needs a release here: the pipeline and the provider it is made over are the assembly's.
-        graphics ← traverse (\injection → injectGraphics injection (GraphicsVm role requests)) (sxGraphics spec)
+        graphics ← traverse (\injection → injectGraphics injection (GraphicsVm role requests (takesWork env role))) (sxGraphics spec)
         probeAt env (Acquiring role BuildFacade)
         facade ← mask_ $ do
           made ←

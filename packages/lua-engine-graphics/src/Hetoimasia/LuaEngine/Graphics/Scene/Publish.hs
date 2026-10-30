@@ -73,6 +73,8 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Publish
   , HostAnswer (..)
   , targetAnswer
 
+  , publisherGatedBy
+
     -- * Publishing
   , PublishResult (..)
   , PublishRefusal (..)
@@ -151,6 +153,12 @@ data ScenePublisher target = ScenePublisher
   , publisherUsable ∷ target → STM Bool
     -- ^ Whether the capability's window incarnation is still the admitted, attached one.
   }
+
+-- | The same publisher with one more authority read in the publication's own transaction: the session's admission. A
+-- publication then commits only while the session still takes new work, and a stop that lands between the binding's
+-- check and the commit refuses the whole scene, leaving the previous one.
+publisherGatedBy ∷ STM Bool → ScenePublisher target → ScenePublisher target
+publisherGatedBy extra publisher = publisher {publisherTaking = (&&) <$> extra <*> publisherTaking publisher}
 
 -- | What the host answered a publication, without the window identities its own answer carries.
 data HostAnswer

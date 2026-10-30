@@ -20,7 +20,7 @@ import Hetoimasia.Foundation.Resource (Assembly, acquirePart, releaseRank)
 import Hetoimasia.LuaEngine.Request (M1Ask (..), M1Start (..), m1Ask, startM1)
 import Hetoimasia.LuaEngine.Scene (sceneSchema)
 import Hetoimasia.Scripting.Lua.Admission (Necessity (RequiredRequest))
-import Hetoimasia.Scripting.Lua.Lease (Ownership (InstanceOwned), ReleaseAnswer (..), leaseCapabilityType, newLeases, releaseLease)
+import Hetoimasia.Scripting.Lua.Lease (Ownership (InstanceOwned), ReleaseAnswer (..), leaseCapabilityType, newLeases, releaseLease, withLeaseOr)
 import Hetoimasia.Scripting.Lua.Lending (newLending)
 import Hetoimasia.Scripting.Lua.Provider
   ( Adoption (Adoption)
@@ -34,6 +34,7 @@ import Hetoimasia.Scripting.Lua.Provider
   )
 import Hetoimasia.Scripting.Lua.Registration (stateOperation, withArgumentCheck)
 import Hetoimasia.Scripting.Lua.Value (Schema (SCapability, SInteger, SNil, SRecord), Value (VCapability, VInteger, VNil, VRecord), capability)
+import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
 
@@ -76,6 +77,7 @@ injection gx = GraphicsInjection $ \vm → do
       , gsPublish = \name precondition →
           withArgumentCheck precondition $
             stateOperation name [SCapability graphicsWindowType, sceneSchema] [] $ \_ → note gx "publish" >> pure []
+      , gsReleaseCheck = \key → withLeaseOr leases key (\why → pure (if Text.isInfixOf "another" why then Just why else Nothing)) (\(_ ∷ Text) → pure Nothing)
       , gsRelease = \key → do
           note gx "release"
           word <$> releaseLease leases key
@@ -124,6 +126,14 @@ handed gx index = atomically $ do
     (name, completion, _) : _ → pure (name, completion)
     [] → retry
 
+-- | The provider's work for the nth request is over as it answers, so that an example that fails after the answer unwinds.
+finishOne ∷ Gfx → Int → IO ()
+finishOne gx index = atomically $ do
+  held ← readTVar (gxHanded gx)
+  case drop index held of
+    (_, _, retirement) : _ → writeTVar retirement ProviderComplete
+    [] → pure ()
+
 -- | The providers prove all their work over, so that an example's teardown does not wait for what is right to wait for.
 finishAll ∷ Gfx → IO ()
 finishAll gx = atomically $ do
@@ -133,11 +143,13 @@ finishAll gx = atomically $ do
 answerTexture ∷ Gfx → Int → IO ()
 answerTexture gx index = do
   (_, completion) ← handed gx index
+  finishOne gx index
   void (completeRequest completion (ProviderResource (VRecord [("width", VInteger 4), ("height", VInteger 2)]) (Adoption (\_ → resource "texture"))))
 
 answerWindow ∷ Gfx → Int → IO ()
 answerWindow gx index = do
   (_, completion) ← handed gx index
+  finishOne gx index
   void (completeRequest completion (ProviderResource VNil (Adoption (\_ → resource "window"))))
 
 resource ∷ Text → Assembly Text
@@ -149,7 +161,7 @@ files ∷ [(FilePath, ByteString)]
 files = [("images/quad.png", "png")]
 
 -- | A case: a label, the Lua expression run under @pcall@ and what it must have come to.
-data Verdict = Refused [Text] | Accepted
+data Verdict = Refused [Text] | Accepted | Holds
 
 data Case = Case Text Text Verdict
 
@@ -164,6 +176,10 @@ checkCases cases printed = mapM_ check cases
         Accepted
           | "true" `Text.isPrefixOf` seen → pure ()
           | otherwise → expectationFailure (show label <> " must be accepted, but: " <> Text.unpack seen)
+        -- A predicate: the call returned, and what it returned is true (not merely that nothing raised).
+        Holds
+          | "true ; true" `Text.isPrefixOf` seen → pure ()
+          | otherwise → expectationFailure (show label <> " must hold, but: " <> Text.unpack seen)
         Refused reasons
           | "false ; " `Text.isPrefixOf` seen && all (`Text.isInfixOf` seen) reasons → pure ()
           | otherwise → expectationFailure (show label <> " must be refused with " <> show reasons <> ", but: " <> Text.unpack seen)
@@ -251,17 +267,72 @@ spec = describe "graphics calls" $ do
       seen ← calls gx
       filter (\entry → any (`Text.isPrefixOf` entry) ["check", "start", "busy"]) seen `shouldBe` []
 
-  it "answers a busy bank with exactly nil and the busy record, no handle and no start, and an explicit retry then succeeds" $ do
+  it "answers a busy bank with exactly nil and the busy record, no handle and no start, and an explicit retry then succeeds once the bank has room" $ do
     gx ← newGfx
     writeIORef (gxBusy gx) True
     let cases =
-          [ Case "busy texture" "(function() local r, e = api.content.texture('images/quad.png') return r == nil and e.code == 'busy' and type(e.message) == 'string' and select('#', api.content.texture('images/quad.png')) == 2 end)()" Accepted
-          , Case "busy window" "(function() local r, e = api.window.open({title = 't', width = 2, height = 2}) return r == nil and e.code == 'busy' end)()" Accepted
+          [ Case "busy texture" "(function() local r, e = api.content.texture('images/quad.png') return r == nil and e.code == 'busy' and type(e.message) == 'string' and select('#', api.content.texture('images/quad.png')) == 2 end)()" Holds
+          , Case "busy window" "(function() local r, e = api.window.open({title = 't', width = 2, height = 2}) return r == nil and e.code == 'busy' end)()" Holds
           ]
-    ( withOneGraphics (injection gx) Presentation script {scInit = map caseLua cases} files $ \world _ _ _ → do
+        retrying =
+          [ "if self.ran then return end"
+          , "self.ran = true"
+          , "local r, e = api.content.texture('images/quad.png')"
+          , "print('retry', r ~= nil, e == nil)"
+          ]
+    ( withOneGraphics (injection gx) Presentation script {scInit = map caseLua cases, scUpdate = retrying} files $ \world _ _ _ → do
         outLines world >>= checkCases cases
         countOf gx "start" `shouldReturn` 0
+        -- The bank has room again: Lua alone retries, on a later update, and the request is accepted and started once.
+        writeIORef (gxBusy gx) False
+        advanceClock world 2000000000
+        pumpUntil world (elem "retry\ttrue\ttrue" <$> outLines world)
+        countOf gx "start texture" `shouldReturn` 1
         finishAll gx
+      )
+      `finally` finishAll gx
+
+  it "refuses another instance's facade and handle, and leaves a peer's graphics resources usable when one same-VM instance ends" $ do
+    gx ← newGfx
+    let cases =
+          [ Case "foreign facade window" "share.apis[1].window.open({title = 't', width = 1, height = 1})" (Refused ["belongs to another instance"])
+          , Case "foreign handle release" "api.texture.release(share.texs[1])" (Refused ["belongs to another instance"])
+          , Case "own release" "api.texture.release(self.tex) == 'done'" Holds
+          ]
+        prelude = ["local share = import('lua/share.lua')"]
+        initial = ["self.my = #share.apis + 1", "share.apis[self.my] = api", "self.t = api.content.texture('images/quad.png')"]
+        updating =
+          [ "if self.done then"
+          , "  if share.ended and not self.said then self.said = true print('peer', api.texture.release(self.tex)) end"
+          , "  return"
+          , "end"
+          , "if not self.tex then"
+          , "  if not api.request.ready(self.t) then return end"
+          , "  self.tex = api.request.take(self.t).value.texture"
+          , "  share.texs[self.my] = self.tex"
+          , "end"
+          , "if self.my == 2 and share.texs[1] then"
+          , "  self.done = true"
+          ]
+            <> map (("  " <>) . caseLua) cases
+            <> ["  print('b done')", "end"]
+        shared = ("lua/share.lua", luaMain ["return {apis = {}, texs = {}}"])
+    ( withWorld fixedM1Profile (Layout (("lua/main.lua", scriptSource script {scPrelude = prelude <> [], scInit = initial, scUpdate = updating, scShutdown = ["share.ended = true"]}) : shared : files)) $ \world _ runtime →
+        withFvm world runtime ((presentationShape) {shGraphics = Just (injection gx)}) $ \fvm → do
+          first ← spawn world fvm "modules-test" mainPath
+          _ ← spawn world fvm "modules-test" mainPath
+          awaitHanded gx 2
+          answerTexture gx 0
+          answerTexture gx 1
+          -- (the clock moves on with every look, so each instance's cadence comes round as often as it needs to)
+          pumpUntil world (advanceClock world 1100000000 >> (elem "b done" <$> outLines world))
+          outLines world >>= checkCases cases
+          -- The first instance ends; the second's own texture is still its to use, and releasing it again is
+          -- already_released, not an error about a lease that went with the peer.
+          stopSpawned first
+          _ ← settledOf first
+          pumpUntil world (advanceClock world 1100000000 >> (elem "peer\talready_released" <$> outLines world))
+          finishAll gx
       )
       `finally` finishAll gx
 
@@ -312,7 +383,7 @@ spec = describe "graphics calls" $ do
           [ Case "stopped texture" "api.content.texture('images/quad.png')" (Refused ["the session is stopping"])
           , Case "stopped window" "api.window.open({title = 't', width = 2, height = 2})" (Refused ["the session is stopping"])
           , Case "stopped publish" "api.scene.publish(self.win, {clear = {r = 0, g = 0, b = 0}, sprites = {}})" (Refused ["the session is stopping"])
-          , Case "stopped release" "api.texture.release(self.tex) == 'done'" Accepted
+          , Case "stopped release" "api.texture.release(self.tex) == 'done'" Holds
           ]
     ( withOneGraphics (injection gx) Presentation script {scInit = setup, scUpdate = step, scPrelude = []} files $ \world _ _ _ → do
         awaitHanded gx 2

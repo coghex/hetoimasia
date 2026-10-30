@@ -46,7 +46,7 @@ import Hetoimasia.LuaEngine.Facade
   , GraphicsStart (..)
   , GraphicsVm (..)
   )
-import Hetoimasia.LuaEngine.Graphics.Scene.Publish (ScenePublisher, graphicsPublishBinding)
+import Hetoimasia.LuaEngine.Graphics.Scene.Publish (PublishHooks, ScenePublisher, graphicsPublishBindingWith, publisherGatedBy)
 import Hetoimasia.LuaEngine.Graphics.Window.Provider
   ( WindowOwner
   , WindowProvider
@@ -85,6 +85,7 @@ import Hetoimasia.LuaEngine.Texture
   , textureEndpoint
   , textureHandleType
   , textureService
+  , withTextureOr
   )
 import Hetoimasia.Scripting.Lua.Admission (Necessity (OptionalRequest, RequiredRequest))
 import Hetoimasia.Scripting.Lua.Lease (leaseCapabilityType, newLeases)
@@ -97,6 +98,9 @@ data GraphicsFacade target = GraphicsFacade
   , gfPipeline ∷ !TexturePipeline
   , gfProvider ∷ !(WindowProvider target)
   , gfPublisher ∷ !(ScenePublisher target)
+  , gfPublishHooks ∷ !PublishHooks
+  -- ^ The publication's test seams: 'noPublishHooks' in production. An example holds a publication between its check and
+  -- its commit with them, to land a stop there.
   }
 
 -- | Why a VM's graphics could not be composed: a failure of the composition, with its reason, and nothing of a
@@ -174,7 +178,10 @@ graphicsInjection config = GraphicsInjection $ \vm → do
             Right ask → startWindow window ask context <&> \case
               WindowStarted started → GraphicsStarted started
               WindowRefused why → GraphicsRefused why
-      , gsPublish = \name precondition → graphicsPublishBinding name precondition (gfPublisher config) limits leases
+      , gsPublish = \name precondition → graphicsPublishBindingWith (gfPublishHooks config) name precondition (publisherGatedBy (gvTakesWork vm) (gfPublisher config)) limits leases
+      , gsReleaseCheck = \key →
+          -- (borrowing is how the lease says whose it is; a lease that has ended is the release path's to answer)
+          withTextureOr leases key (\why → pure (if Text.isInfixOf "another" why then Just why else Nothing)) (\_ → pure Nothing)
       , gsRelease = \key → releaseWord <$> releaseTexture leases key
       }
   where

@@ -19,7 +19,7 @@ import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVa
 import Control.Exception (SomeException, finally, throwIO, try)
 import Control.Monad (forM_, forever, unless, void)
 import Data.ByteString (ByteString)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
@@ -31,10 +31,14 @@ import Hetoimasia.Foundation.Time (monotonicSource)
 import Hetoimasia.LuaEngine.Boot (bootCheckpoint)
 import Hetoimasia.LuaEngine.Facade (OutputSink (..), withOutput)
 import Hetoimasia.LuaEngine.Graphics.Facade (GraphicsFacade (..), graphicsInjection)
-import Hetoimasia.LuaEngine.Graphics.Scene (scenePublisherOver)
+import Hetoimasia.LuaEngine.Graphics.Scene (GraphicsScene (..), PublishHooks (..), noPublishHooks, scenePublisherOver)
 import Hetoimasia.LuaEngine.Graphics.Window.Port (CreateOutcome (..), Port (..), WindowToken (..), fatalText)
 import Hetoimasia.LuaEngine.Graphics.Window.Provider
 import Hetoimasia.LuaEngine.Manifest (Role (Presentation))
+import Hetoimasia.LuaEngine.Profile (Count (Count), CountLimit (RequestsPerInstance, TextureLeasesPerUiInstance), Profile, ProfileSpec (..), profileSpec, validateProfile)
+import Hetoimasia.LuaEngine.Scene (SceneContent (..), SceneRect (..), SceneSprite (..), TextureUse (..))
+import Hetoimasia.LuaEngine.Texture (TextureView (..))
+import qualified Data.Set as Set
 import Hetoimasia.LuaEngine.Session
 import Hetoimasia.Render.TwoD.Vulkan.Textures (newTextures)
 import Hetoimasia.Scripting.Lua.Scheduler (systemTimerBackend)
@@ -43,7 +47,7 @@ import Test.HUnit.Lang (assertFailure)
 import Test.Hspec
 import Test.LuaEngine.Graphics.Composition (Composition (..), compositionProfile, withComposition)
 import Test.LuaEngine.Graphics.Fake (fakeLedger, setBarrier)
-import Test.LuaEngine.Graphics.FacadeScripts (manifestFor, quadExample)
+import Test.LuaEngine.Graphics.FacadeScripts (isClear, manifestFor, quadExample)
 import qualified Test.LuaEngine.Graphics.Fake as Fake
 import qualified Test.LuaEngine.Graphics.Png as Png
 import Test.LuaEngine.Graphics.Rig (Rig (..), bounded, withRig)
@@ -56,6 +60,7 @@ data FS = FS
   , fsRig ∷ !Rig
   , fsWindows ∷ !WF.Fake
   , fsModel ∷ !Model
+  , fsProvider ∷ !(WindowProvider Int)
   , fsOut ∷ !(TVar [Text])
   -- ^ What the roles printed, oldest first.
   , fsGate ∷ !(MVar ())
@@ -69,10 +74,21 @@ data Shape = Shape
   , shapeParkOutput ∷ !Bool
   , shapeWindow ∷ !WF.FakeConfig
   , shapeTexture ∷ !Fake.FakeConfig
+  , shapeProfile ∷ !Profile
+  , shapeCreateScript ∷ ![CreateOutcome]
+  -- ^ What the window fake's creations answer, in order, set before the session starts.
+  , shapeHooks ∷ !PublishHooks
   }
 
 defaultShape ∷ ByteString → Shape
-defaultShape entry = Shape entry True False WF.defaultFakeConfig Fake.defaultFakeConfig
+defaultShape entry = Shape entry True False WF.defaultFakeConfig Fake.defaultFakeConfig compositionProfile [] noPublishHooks
+
+-- | The fixed M1 profile with these counts changed, so that a bank is full after a few requests.
+profileWith ∷ [(CountLimit, Word64)] → Profile
+profileWith changes = either (error . ("the profile was refused: " <>) . show) id (validateProfile edited)
+  where
+    base = profileSpec compositionProfile
+    edited = base {specCounts = \limit → maybe (specCounts base limit) Count (lookup limit changes)}
 
 spec ∷ Spec
 spec = describe "graphics facade" $ do
@@ -80,8 +96,8 @@ spec = describe "graphics facade" $ do
     outcome ← runFacade (defaultShape quadExample) $ \fs → do
       awaitPublished fs 1
       void (adoptNow (fsModel fs) firstWindow)
-      scene ← latestScene (fsModel fs) firstWindow
-      fmap sceneSpriteCount scene `shouldBe` Just 1
+      scene ← latestScene (fsModel fs) firstWindow >>= maybe (assertFailure "no scene was published") pure
+      expectQuad scene
       -- The scene is accepted and adopted, and Lua released its texture right after publishing it: the adopted scene
       -- keeps the image registered, and the release has not run.
       releasedCount fs `shouldReturn` 0
@@ -112,17 +128,32 @@ spec = describe "graphics facade" $ do
     outFailures outcome `shouldBe` []
 
   it "latches an unread clean window-creation refusal as required_request at the request stage, from a real session role" $ do
-    outcome ← runFacade ((defaultShape unreadOpen) {shapeBoth = False}) $ \fs → do
-      WF.scriptCreate (fsWindows fs) [CreateRefusedClean "the display refused the window"]
+    outcome ← runFacade ((defaultShape unreadOpen) {shapeBoth = False, shapeCreateScript = [CreateRefusedClean "the display refused the window"]}) $ \fs →
       atomically (sessionOutcomeNow (fsSession fs) >>= \found → unless (not (null (outFailures found))) retry)
     outVerdict outcome `shouldBe` VerdictFailure
     map rfCode (outFailures outcome) `shouldBe` [RequiredRequest]
     map rfStage (outFailures outcome) `shouldBe` [OnRequest]
 
-  it "latches a caught clean window-creation refusal the same way, with the window_error record taken first" $ do
-    outcome ← runFacade ((defaultShape caughtOpen) {shapeBoth = False}) $ \fs → do
-      WF.scriptCreate (fsWindows fs) [CreateRefusedClean "the display refused the window"]
-      atomically (sessionOutcomeNow (fsSession fs) >>= \found → unless (not (null (outFailures found))) retry)
+  it "latches a caught clean window-creation refusal the same way: the role, parked in its authored output, takes the exact window_error record after the refusal settled, catches the error it raises over it, and the instance still fails" $ do
+    outcome ←
+      runFacade
+        ( (defaultShape caughtOpen)
+            { shapeBoth = False
+            , shapeParkOutput = True
+            , shapeWindow = WF.defaultFakeConfig {WF.fcHolds = [WF.HoldCreate]}
+            , shapeCreateScript = [CreateRefusedClean "the display refused the window"]
+            }
+        )
+        $ \fs → do
+          -- The role is parked in its authored output with the creation command held: let the refusal settle while the
+          -- invocation is still running, wait for the provider to have answered and retired it, and resume that segment.
+          WF.awaitEvent (fsWindows fs) "issue create"
+          WF.release (fsWindows fs) WF.HoldCreate
+          atomically (providerReading (fsProvider fs) >>= \found → unless (readingAcquisitions found == 0) retry)
+          void (tryPutMVar (fsGate fs) ())
+          -- The acknowledgement is the role's own print after it took and caught: the whole record, no root or path.
+          awaitLine fs "caught\tfalse\twindow_error\ttrue\ttrue\tthe display refused the window"
+          atomically (sessionOutcomeNow (fsSession fs) >>= \found → unless (not (null (outFailures found))) retry)
     outVerdict outcome `shouldBe` VerdictFailure
     map rfCode (outFailures outcome) `shouldBe` [RequiredRequest]
     map rfStage (outFailures outcome) `shouldBe` [OnRequest]
@@ -138,9 +169,75 @@ spec = describe "graphics facade" $ do
     outFailures outcome `shouldBe` []
     outRetired outcome `shouldBe` True
 
-  it "answers a texture request that finds a bank full with exactly nil and the busy record, and leaves the session healthy" $ do
-    outcome ← runFacade ((defaultShape fillTextures) {shapeBoth = False}) $ \fs → do
-      awaitLine fs "fill\t17\ttrue\tbusy"
+  it "refuses a publication a stop overtakes between its check and its commit, whole, and keeps the previous scene" $ do
+    entered ← newEmptyMVar
+    proceed ← newEmptyMVar
+    calls ← newIORef (0 ∷ Int)
+    let hooks =
+          noPublishHooks
+            { hookBeforeCommit = do
+                -- The first publication passes; the second is held with its authority checked and every pin taken.
+                n ← atomicModifyIORef' calls (\held → (held + 1, held + 1))
+                if n >= 2 then putMVar entered () >> readMVar proceed else pure ()
+            }
+    outcome ← runFacade ((defaultShape publishRace) {shapeBoth = False, shapeHooks = hooks}) $ \fs → do
+      awaitLine fs "first"
+      void (adoptNow (fsModel fs) firstWindow)
+      previous ← latestScene (fsModel fs) firstWindow
+      -- The second publication is inside its commit's seam: the stop is requested now, and only then let go.
+      takeMVar entered
+      requestStop (fsSession fs) StopQuit
+      putMVar proceed ()
+      awaitLine fs "second\tfalse\ttrue"
+      publishedRevision (fsModel fs) firstWindow `shouldReturn` 1
+      latestScene (fsModel fs) firstWindow `shouldReturn` previous
+      fmap graphicsContent previous `shouldSatisfy` maybe False (\content -> length (sceneSprites content) == 1)
+    outVerdict outcome `shouldBe` VerdictSuccess
+    outQuit outcome `shouldBe` True
+    outFailures outcome `shouldBe` []
+
+  it "answers busy from a full texture bank while the window, whose own slot is free, is accepted, starts no native work for the refused request, and accepts the explicit retry after actual reclamation" $ do
+    outcome ← runFacade ((defaultShape textureBank) {shapeBoth = False, shapeProfile = profileWith [(TextureLeasesPerUiInstance, 2)]}) $ \fs → do
+      awaitLine fs "banks\ttrue\tbusy\ttrue\ttrue"
+      awaitLine fs "retry\ttrue\ttrue"
+      -- Three requests ever reached the native owner: the two accepted and the retry; the refused one started nothing.
+      Fake.awaitEvent (rigFake (fsRig fs)) "allocated 2 "
+      allocated ← length . filter (Text.isPrefixOf "allocated ") <$> Fake.events (rigFake (fsRig fs))
+      allocated `shouldBe` 3
+      requestStop (fsSession fs) StopQuit
+    outVerdict outcome `shouldBe` VerdictSuccess
+    outFailures outcome `shouldBe` []
+
+  it "answers busy from the common request places for a window request whose own slot is free, with no native window made, and accepts the explicit retry once a place is returned" $ do
+    outcome ← runFacade ((defaultShape requestBank) {shapeBoth = False, shapeProfile = profileWith [(RequestsPerInstance, 2)]}) $ \fs → do
+      awaitLine fs "window\ttrue\tbusy"
+      WF.events (fsWindows fs) >>= (`shouldBe` [])
+      awaitLine fs "retried\ttrue"
+      WF.awaitEvent (fsWindows fs) "issue create"
+      requestStop (fsSession fs) StopQuit
+    outVerdict outcome `shouldBe` VerdictSuccess
+    outFailures outcome `shouldBe` []
+
+  it "ends an instance whose init failed after starting both requests, with the window and the texture retired and the failure preserved" $ do
+    outcome ← runFacade ((defaultShape failedInit) {shapeBoth = False}) $ \fs →
+      atomically (sessionOutcomeNow (fsSession fs) >>= \found → unless (not (null (outFailures found))) retry)
+    outVerdict outcome `shouldBe` VerdictFailure
+    map rfCode (outFailures outcome) `shouldBe` [LuaError]
+    map rfStage (outFailures outcome) `shouldBe` [OnInit]
+    outRetired outcome `shouldBe` True
+
+  it "retires a window and a texture when the role's shutdown raises, keeping that failure" $ do
+    outcome ← runFacade ((defaultShape throwingShutdown) {shapeBoth = False}) $ \fs → do
+      awaitLine fs "ready"
+      requestStop (fsSession fs) StopQuit
+    outVerdict outcome `shouldBe` VerdictFailure
+    map rfCode (outFailures outcome) `shouldBe` [LuaError]
+    map rfStage (outFailures outcome) `shouldBe` [OnShutdown]
+    outRetired outcome `shouldBe` True
+
+  it "settles requests the script cancelled in the segment that started them, and retires what the providers had begun" $ do
+    outcome ← runFacade ((defaultShape cancelAtOnce) {shapeBoth = False}) $ \fs → do
+      awaitLine fs "cancel\tcancelled\tcancelled"
       requestStop (fsSession fs) StopQuit
     outVerdict outcome `shouldBe` VerdictSuccess
     outFailures outcome `shouldBe` []
@@ -192,9 +289,20 @@ awaitLine fs wanted = atomically $ do
   seen ← readTVar (fsOut fs)
   unless (wanted `elem` seen) retry
 
--- | The scene's sprites, for an example's assertion.
-sceneSpriteCount ∷ a → Int
-sceneSpriteCount _ = 1
+-- | The quad example's published scene, exactly: the sprite's rectangle, the texture it names (the one decoded from the
+-- fixture, 2 by 2) and the clear colour the sRGB bytes (24, 24, 24) convert to.
+expectQuad ∷ GraphicsScene → Expectation
+expectQuad scene = do
+  sceneClear content `shouldSatisfy` isClear 24 24 24
+  case sceneSprites content of
+    [sprite] → do
+      spriteRect sprite `shouldBe` SceneRect 32 32 256 256
+      let view = useView (spriteTexture sprite)
+      (viewWidth view, viewHeight view) `shouldBe` (2, 2)
+      graphicsReferences scene `shouldBe` Set.singleton (viewIdentity view)
+    other → expectationFailure ("expected one sprite, found " <> show (length other))
+  where
+    content = graphicsContent scene
 
 -- | The host model's key of the session's first window (the provider issues even tokens).
 firstWindow ∷ Int
@@ -213,6 +321,7 @@ runFacade shape scenario = bounded . withRig (shapeTexture shape) $ \rig → do
   setBarrier fake (modelCapture model)
   forM_ [1 .. 8] (modelWindow model)
   windows ← WF.newFake (shapeWindow shape)
+  unless (null (shapeCreateScript shape)) (WF.scriptCreate windows (shapeCreateScript shape))
   textures ← newTextures
   sessionRef ← newIORef (Nothing ∷ Maybe Session)
   let config =
@@ -227,12 +336,12 @@ runFacade shape scenario = bounded . withRig (shapeTexture shape) $ \rig → do
         , ("lua/main.lua", shapeEntry shape)
         , ("images/quad.png", Png.solid 2 2 (200, 100, 50, 255))
         ]
-  withComposition compositionProfile files (rigPort rig) $ \composition control runtime →
+  withComposition (shapeProfile shape) files (rigPort rig) $ \composition control runtime →
     withWindowProvider config (retarget (WF.fakePort windows)) $ \provider →
       ( do
           let publisher = scenePublisherOver textures provider (\window scene → fst (modelTarget model window) scene) (\window → snd (modelTarget model window))
-              injection = graphicsInjection (GraphicsFacade compositionProfile (cpPipeline composition) provider publisher)
-          checkpoint ← bootCheckpoint compositionProfile (cpInventory composition) (\_ _ → pure (Right (manifestFor (shapeBoth shape)))) >>= either (\refused → assertFailure ("boot refused: " <> show refused)) pure
+              injection = graphicsInjection (GraphicsFacade (shapeProfile shape) (cpPipeline composition) provider publisher (shapeHooks shape))
+          checkpoint ← bootCheckpoint (shapeProfile shape) (cpInventory composition) (\_ _ → pure (Right (manifestFor (shapeBoth shape)))) >>= either (\refused → assertFailure ("boot refused: " <> show refused)) pure
           outLines ← newTVarIO []
           errLines ← newTVarIO []
           gate ← newEmptyMVar
@@ -256,7 +365,7 @@ runFacade shape scenario = bounded . withRig (shapeTexture shape) $ \rig → do
               ( do
                   found ← readMVar handle
                   writeIORef sessionRef (Just found)
-                  let fs = FS found rig windows model outLines gate
+                  let fs = FS found rig windows model provider outLines gate
                   attempted ←
                     try @SomeException $
                       timeout 8000000 (scenario fs) >>= \case
@@ -279,7 +388,7 @@ runFacade shape scenario = bounded . withRig (shapeTexture shape) $ \rig → do
                 `finally` putMVar terminated ()
             let sessionSpec =
                   SessionSpec
-                    { sxProfile = compositionProfile
+                    { sxProfile = shapeProfile shape
                     , sxCheckpoint = checkpoint
                     , sxInventory = cpInventory composition
                     , sxPool = cpPool composition
@@ -345,20 +454,23 @@ unreadOpen =
     , "    update=function(self, dt) end"
     ]
 
--- | A window whose failure the role takes and then raises an error over, which it catches.
+-- | A window whose failure the role takes and then raises an error over, which it catches. The role parks in its
+-- authored output first, so that the refusal settles while the invocation runs.
 caughtOpen ∷ ByteString
 caughtOpen =
   presentationOnly
-    [ "    init=function(self, api) self.request = api.window.open({title=\"t\", width=640, height=480}) end,"
-    , "    update=function(self, dt)"
-    , "      local api = self.api"
-    , "      if self.request and api.request.ready(self.request) then"
-    , "        local result = api.request.take(self.request)"
-    , "        self.request = nil"
-    , "        assert(result.status == \"failure\" and result.error.code == \"window_error\" and result.error.root == nil)"
-    , "        assert(not pcall(error, result.error.message))"
-    , "      end"
-    , "    end"
+    [ "    init=function(self, api)"
+    , "      local request = api.window.open({title=\"t\", width=640, height=480})"
+    , "      print(\"parked\")"
+    , "      assert(api.request.ready(request), 'the refusal had settled')"
+    , "      local result = api.request.take(request)"
+    , "      local ok = pcall(function()"
+    , "        assert(result.status == 'failure' and result.error.code == 'window_error')"
+    , "        error(result.error.message)"
+    , "      end)"
+    , "      print('caught', ok, result.error.code, result.error.root == nil, result.error.path == nil, result.error.message)"
+    , "    end,"
+    , "    update=function(self, dt) end"
     ]
 
 -- | A window requested in init, which then parks in its authored output: the startup gate stays closed.
@@ -368,21 +480,6 @@ parkedOpen =
     [ "    init=function(self, api)"
     , "      self.request = api.window.open({title=\"t\", width=640, height=480})"
     , "      print(\"parked\")"
-    , "    end,"
-    , "    update=function(self, dt) end"
-    ]
-
--- | Seventeen texture requests in one init: some are accepted and, once a bank is full, the rest are that bank's busy answer.
-fillTextures ∷ ByteString
-fillTextures =
-  presentationOnly
-    [ "    init=function(self, api)"
-    , "      local accepted, busy, code = 0, 0, ''"
-    , "      for i = 1, 17 do"
-    , "        local r, e = api.content.texture('images/quad.png')"
-    , "        if r then accepted = accepted + 1 else busy = busy + 1 code = e.code end"
-    , "      end"
-    , "      print('fill', accepted + busy, busy >= 1 and accepted >= 8, code)"
     , "    end,"
     , "    update=function(self, dt) end"
     ]
@@ -451,5 +548,120 @@ missingRequired ∷ ByteString
 missingRequired =
   presentationOnly
     [ "    init=function(self, api) self.t = api.content.texture('nope.png') end,"
+    , "    update=function(self, dt) end"
+    ]
+
+-- | Two publications; the second is the one a stop overtakes.
+publishRace ∷ ByteString
+publishRace =
+  presentationOnly
+    [ "    init=function(self, api)"
+    , "      self.w = api.window.open({title='t', width=64, height=64})"
+    , "      self.t = api.content.texture('images/quad.png')"
+    , "    end,"
+    , "    update=function(self, dt)"
+    , "      local api = self.api"
+    , "      if not self.win and api.request.ready(self.w) then self.win = api.request.take(self.w).value end"
+    , "      if not self.img and api.request.ready(self.t) then self.img = api.request.take(self.t).value end"
+    , "      if not (self.win and self.img) then return end"
+    , "      if not self.a then"
+    , "        self.a = true"
+    , "        api.scene.publish(self.win, {clear={r=24,g=24,b=24}, sprites={{texture=self.img.texture, x=1, y=2, width=3, height=4}}})"
+    , "        print('first')"
+    , "        return"
+    , "      end"
+    , "      if not self.b then"
+    , "        self.b = true"
+    , "        local ok, err = pcall(api.scene.publish, self.win, {clear={r=1,g=2,b=3}, sprites={}})"
+    , "        print('second', ok, tostring(err):find('scene publication is stopped') ~= nil)"
+    , "      end"
+    , "    end"
+    ]
+
+-- | A profile of two texture slots: the third request finds the bank full while a window is accepted.
+textureBank ∷ ByteString
+textureBank =
+  presentationOnly
+    [ "    init=function(self, api)"
+    , "      self.t1 = api.content.texture('images/quad.png')"
+    , "      self.t2 = api.content.texture('images/quad.png')"
+    , "      local t3, e = api.content.texture('images/quad.png')"
+    , "      local w, we = api.window.open({title='w', width=64, height=64})"
+    , "      print('banks', t3 == nil, e and e.code, w ~= nil, we == nil)"
+    , "    end,"
+    , "    update=function(self, dt)"
+    , "      local api = self.api"
+    , "      if self.retried then return end"
+    , "      if not self.tex then"
+    , "        if not api.request.ready(self.t1) then return end"
+    , "        self.tex = api.request.take(self.t1).value.texture"
+    , "      end"
+    , "      -- Release until the retirement is proven: only then is the slot back."
+    , "      if api.texture.release(self.tex) == 'already_released' then"
+    , "        self.retried = true"
+    , "        local t4, e4 = api.content.texture('images/quad.png')"
+    , "        print('retry', t4 ~= nil, e4 == nil)"
+    , "      end"
+    , "    end"
+    ]
+
+-- | A profile of two request places: two texture requests fill them and the window finds no place, its own slot free.
+requestBank ∷ ByteString
+requestBank =
+  presentationOnly
+    [ "    init=function(self, api)"
+    , "      self.t1 = api.content.texture('images/quad.png')"
+    , "      self.t2 = api.content.texture('images/quad.png')"
+    , "      local w, e = api.window.open({title='w', width=64, height=64})"
+    , "      print('window', w == nil, e and e.code)"
+    , "    end,"
+    , "    update=function(self, dt)"
+    , "      local api = self.api"
+    , "      if self.retried then return end"
+    , "      if self.t1 then"
+    , "        if not api.request.ready(self.t1) then return end"
+    , "        api.request.take(self.t1)"
+    , "        self.t1 = nil"
+    , "      end"
+    , "      local w, e = api.window.open({title='w', width=64, height=64})"
+    , "      if w then self.retried = true print('retried', true) end"
+    , "    end"
+    ]
+
+failedInit ∷ ByteString
+failedInit =
+  presentationOnly
+    [ "    init=function(self, api)"
+    , "      self.w = api.window.open({title='t', width=64, height=64})"
+    , "      self.t = api.content.texture('images/quad.png')"
+    , "      error('init fails after both requests')"
+    , "    end,"
+    , "    update=function(self, dt) end"
+    ]
+
+throwingShutdown ∷ ByteString
+throwingShutdown =
+  presentationOnly
+    [ "    init=function(self, api)"
+    , "      self.w = api.window.open({title='t', width=64, height=64})"
+    , "      self.t = api.content.texture('images/quad.png')"
+    , "    end,"
+    , "    update=function(self, dt)"
+    , "      local api = self.api"
+    , "      if self.said or not (api.request.ready(self.w) and api.request.ready(self.t)) then return end"
+    , "      self.said = true"
+    , "      print('ready')"
+    , "    end,"
+    , "    shutdown=function(self, reason) error('shutdown fails') end"
+    ]
+
+cancelAtOnce ∷ ByteString
+cancelAtOnce =
+  presentationOnly
+    [ "    init=function(self, api)"
+    , "      local w = api.window.open({title='t', width=64, height=64})"
+    , "      local t = api.content.texture('images/quad.png')"
+    , "      print('cancel', api.request.cancel(w), api.request.cancel(t))"
+    , "    end,"
     , "    update=function(self, dt) end"
     ]
