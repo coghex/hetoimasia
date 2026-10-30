@@ -44,7 +44,7 @@ import Hetoimasia.Foundation.Log (Logger)
 import Hetoimasia.Foundation.Time (MonotonicSource)
 import Hetoimasia.Foundation.Worker (Completion)
 import Hetoimasia.LuaEngine.Boot (Checkpoint)
-import Hetoimasia.LuaEngine.Facade (Output)
+import Hetoimasia.LuaEngine.Facade (GraphicsInjection, Output)
 import Hetoimasia.LuaEngine.Manifest (Role)
 import Hetoimasia.LuaEngine.Profile (Profile)
 import Hetoimasia.LuaEngine.Session.Harness (Harness, InstanceKey, Point, Protection, Release)
@@ -78,6 +78,10 @@ data SessionSpec = SessionSpec
   -- ^ The supervision control of the thread that drives the session.
   , sxHarness ∷ !Harness
   -- ^ The harness's seams: 'noHarness' for a real composition.
+  , sxGraphics ∷ !(Maybe GraphicsInjection)
+  -- ^ The graphics operations a composition injects (LFE-21): the abstract function that makes each role's VM its
+  -- graphics services, owned and borrowed by the assembly and never closed by the session. 'Nothing' for a
+  -- composition that injects none (every CPU-only caller): its facades have no graphics call, handle or request kind.
   }
 
 -- | The handle to a session, made before any VM exists.

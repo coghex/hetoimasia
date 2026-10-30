@@ -198,6 +198,7 @@ runWithSession scenario = bounded . withSystemTempDirectory "hetoimasia-window-c
                     , sxRuntime = runtime
                     , sxControl = control
                     , sxHarness = noHarness
+                    , sxGraphics = Nothing
                     }
             outcome ← runSession spec' (putMVar handle)
             takeMVar terminated

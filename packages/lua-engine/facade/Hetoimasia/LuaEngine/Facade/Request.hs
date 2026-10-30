@@ -22,7 +22,13 @@ import Data.Text (Text)
 import Hetoimasia.LuaEngine.Facade.Bindings (instanceCheck)
 import Hetoimasia.LuaEngine.Facade.Caller (Caller (..), Stage (..))
 import Hetoimasia.LuaEngine.Facade.Content (dataHandleName, moduleHandleName)
-import Hetoimasia.LuaEngine.Facade.Types (Facade)
+import Hetoimasia.LuaEngine.Facade.Types
+  ( Facade (fcGraphics)
+  , graphicsTextureRequestType
+  , graphicsTextureValueSchema
+  , graphicsWindowRequestType
+  , graphicsWindowValueSchema
+  )
 import Hetoimasia.LuaEngine.Request (m1TakeSchema, terminalRecord)
 import Hetoimasia.Scripting.Lua.Admission
   ( CancelResult (..)
@@ -47,7 +53,16 @@ import Hetoimasia.Scripting.Lua.Value
 
 -- | The operations for both kinds of request, named @ready_module@, @take_data@ and so on.
 requestBindings ∷ Facade → [Binding]
-requestBindings facade = operations facade "module" moduleHandleName SExportTable <> operations facade "data" dataHandleName SBytes
+requestBindings facade =
+  operations facade "module" moduleHandleName SExportTable
+    <> operations facade "data" dataHandleName SBytes
+    <> maybe [] (const graphicsOperations) (fcGraphics facade)
+  where
+    -- A texture request's value and a window request's are different things again, so the injected graphics add
+    -- their own pair of kinds (LFE-21); a facade with no graphics has no such operation and no such handle.
+    graphicsOperations =
+      operations facade "texture" graphicsTextureRequestType graphicsTextureValueSchema
+        <> operations facade "window" graphicsWindowRequestType graphicsWindowValueSchema
 
 operations ∷ Facade → Text → Text → Schema → [Binding]
 operations facade kind handleType value =

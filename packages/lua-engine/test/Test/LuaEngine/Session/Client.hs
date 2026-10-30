@@ -115,6 +115,7 @@ composingClient =
     , "                    , sxRuntime = runtime"
     , "                    , sxControl = control"
     , "                    , sxHarness = noHarness"
+    , "                    , sxGraphics = Nothing"
     , "                    }"
     , "            outcome ← runSession spec $ \\session → void . forkIO $ do"
     , "              atomically $ do"

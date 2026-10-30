@@ -169,6 +169,7 @@ library facade
         Hetoimasia.LuaEngine.Facade.Bindings
         Hetoimasia.LuaEngine.Facade.Caller
         Hetoimasia.LuaEngine.Facade.Content
+        Hetoimasia.LuaEngine.Facade.Graphics
         Hetoimasia.LuaEngine.Facade.Output
         Hetoimasia.LuaEngine.Facade.Request
         Hetoimasia.LuaEngine.Facade.Session

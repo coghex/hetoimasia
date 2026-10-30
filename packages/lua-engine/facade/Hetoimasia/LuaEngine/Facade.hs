@@ -83,7 +83,17 @@
 -- from Lua.
 module Hetoimasia.LuaEngine.Facade
   ( -- * The services a facade is injected with
-    AdmissionState (..)
+    GraphicsStart (..)
+  , GraphicsVm (..)
+  , GraphicsInjection (..)
+  , GraphicsServices (..)
+  , graphicsTextureType
+  , graphicsWindowType
+  , graphicsTextureRequestType
+  , graphicsWindowRequestType
+  , graphicsTextureValueSchema
+  , graphicsWindowValueSchema
+  , AdmissionState (..)
   , FacadeEndpoints (..)
   , SessionEndpoints (..)
   , StatusSample (..)
@@ -110,6 +120,7 @@ module Hetoimasia.LuaEngine.Facade
     -- * One VM's facade
   , FacadeSpec (..)
   , Facade
+  , facadeGraphics
   , FacadeRefused (..)
   , newFacade
   , facadeRole
@@ -143,7 +154,7 @@ module Hetoimasia.LuaEngine.Facade
 
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, writeTVar)
 import Data.List (nub)
-import Data.Maybe (listToMaybe)
+import Data.Maybe (isJust, listToMaybe)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -171,6 +182,7 @@ import Hetoimasia.LuaEngine.Facade.Caller
   , forgetRecord
   , newRegistry
   )
+import Hetoimasia.LuaEngine.Facade.Graphics (graphicsBindings, graphicsHandleTypes)
 import Hetoimasia.LuaEngine.Facade.Content (contentBindings, dataHandleName, lexicalResolver, moduleHandleName, validRootId)
 import Hetoimasia.LuaEngine.Facade.Output
 import Hetoimasia.LuaEngine.Facade.Request (requestBindings)
@@ -243,6 +255,9 @@ data FacadeSpec = FacadeSpec
   -- ^ The session's source of instance identities.
   , fsTickDuration ∷ !(Maybe Duration)
   -- ^ A gameplay VM's fixed tick duration, as the manifest gave it.
+  , fsGraphics ∷ !(Maybe GraphicsServices)
+  -- ^ The graphics operations of this VM, made by the composition's 'GraphicsInjection', or 'Nothing' for a
+  -- composition that injects none: the facade then has no graphics call, handle or request kind, exactly as before.
   }
 
 -- | Why a facade could not be made.
@@ -292,6 +307,7 @@ newFacade spec = case limits of
             , fcTime = TimeState origin samples
             , fcSession = fsSession spec
             , fcStatus = StatusState captures
+            , fcGraphics = fsGraphics spec
             }
   where
     profile = m1Profile (fsRequests spec)
@@ -339,6 +355,10 @@ newFacade spec = case limits of
         (machineBytes PathBytes)
         (machineBytes RoleFailureRecordBytes)
     machineBytes limit = let Bytes n = bytesLimit profile limit in fromIntegral (min n (fromIntegral (maxBound ∷ Int)))
+
+-- | The injected graphics operations of this facade, if any: the owner's lending and leases come from them.
+facadeGraphics ∷ Facade → Maybe GraphicsServices
+facadeGraphics = fcGraphics
 
 -- | The VM's role.
 facadeRole ∷ Facade → Role
@@ -392,10 +412,12 @@ declareInstance facade content
             then pure (Left (IdTooLong size))
             else do
               outcome ← atomically (declareRecord (fcLimits facade) (fcRegistry facade) (InstanceRecord identity (fcRole facade) content Nothing))
-              pure $ case outcome of
-                DeclareAccepted → Right (Declared identity (builderFacade identity))
-                DeclareDuplicate → Left IdsExhausted
-                DeclareFull bound → Left (TooManyInstances bound)
+              case outcome of
+                DeclareAccepted → do
+                  mapM_ (\graphics → gsDeclare graphics identity) (fcGraphics facade)
+                  pure (Right (Declared identity (builderFacade identity)))
+                DeclareDuplicate → pure (Left IdsExhausted)
+                DeclareFull bound → pure (Left (TooManyInstances bound))
   where
     builderFacade identity =
       FacadeBuilder
@@ -418,6 +440,7 @@ forgetInstance facade identity = do
     pure (held >>= recordNumber)
   mapM_ (forgetSamples facade) number
   mapM_ (forgetStatus facade) number
+  mapM_ (\graphics → gsForget graphics identity) (fcGraphics facade)
 
 -- Installing ---------------------------------------------------------------------------------------
 
@@ -449,13 +472,15 @@ installFacade facade others types config = do
     config
       { vmRegistration = registered
       , vmPolicy = nub (vmPolicy config <> [engineNamespaceName] <> [nameOf found | found ← others])
-      , vmInitialChunks = vmInitialChunks config <> [(engineChunkName, engineChunk (limitPrintBytes (fcLimits facade)))]
+      , vmInitialChunks = vmInitialChunks config <> [(engineChunkName, engineChunk (isJust (fcGraphics facade)) (limitPrintBytes (fcLimits facade)))]
       , vmExports = vmExports config <> [builderSource]
       , vmExportLimits = facadeExportLimits facade
       , vmValueLimits = limits
       }
   where
-    handleTypes = [m1HandleType (fcRequests facade) moduleHandleName, m1HandleType (fcRequests facade) dataHandleName]
+    handleTypes =
+      [m1HandleType (fcRequests facade) moduleHandleName, m1HandleType (fcRequests facade) dataHandleName]
+        <> maybe [] (\graphics → graphicsHandleTypes facade <> gsTypes graphics) (fcGraphics facade)
     nameOf = namespaceName
 
 -- | The copied-value ceilings of a profile as the limits on everything that crosses for an owner: 16 MiB
@@ -479,6 +504,7 @@ facadeNamespace facade =
         <> requestBindings facade
         <> timeBindings facade
         <> sessionBindings facade
+        <> maybe [] (graphicsBindings facade) (fcGraphics facade)
     )
 
 -- | A configuration of a VM's instances that tells the facade whenever a hook begins or resumes, after
@@ -500,7 +526,8 @@ facadeRefusedWait facade refusal =
 
 -- | The request endpoints to grant the owner: the module coordinator's and the data service's.
 facadeRequestEndpoints ∷ Facade → [RequestEndpoint]
-facadeRequestEndpoints facade = [coordinatorEndpoint (fcCoordinator facade), dataEndpoint (fcData facade)]
+facadeRequestEndpoints facade =
+  [coordinatorEndpoint (fcCoordinator facade), dataEndpoint (fcData facade)] <> maybe [] gsEndpoints (fcGraphics facade)
 
 -- | The lexical-root resolver over the session's inventory, for the coordinator's specification.
 inventoryResolver ∷ Inventory → [Text] → ImportResolver
