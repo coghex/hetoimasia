@@ -596,7 +596,12 @@ spec = describe "The Vulkan project boundary" $ do
     script ← map trim . lines <$> readFile runner
     let active = filter (not . ("#" `isPrefixOf`)) script
     active `shouldSatisfy` any ("HETOIMASIA_RUN_EXECUTABLE" `isInfixOf`)
-    active `shouldSatisfy` any ("hetoimasia:test:run-native-tests" `isInfixOf`)
+    -- The suite is recognized by the executable Cabal resolves for the component, so every spelling of the component
+    -- reaches it, and an inherited value is dropped so no other component can.
+    active `shouldSatisfy` any ("run_native_suite=" `isInfixOf`)
+    active `shouldSatisfy` any (\line → "\"$executable\" = \"$run_native_suite\"" `isInfixOf` line)
+    active `shouldSatisfy` any ("unset HETOIMASIA_RUN_EXECUTABLE" `isInfixOf`)
+    filter ("= \"hetoimasia:test:run-native-tests\"" `isInfixOf`) active `shouldBe` []
     present ← doesFileExist runNativeMain
     if not present
       then pendingWith siblingSourcesAbsent

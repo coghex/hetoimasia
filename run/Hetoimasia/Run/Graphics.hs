@@ -41,16 +41,13 @@ module Hetoimasia.Run.Graphics
   , noObservation
   ) where
 
-import Control.Concurrent (forkIOWithUnmask)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryReadMVar)
 import Control.Concurrent.STM (STM, atomically, retry)
-import Control.Exception (ExceptionWithContext, SomeException, displayException, finally, mask, rethrowIO, tryWithContext)
-import Control.Monad (join, unless, void)
-import Data.Maybe (isJust)
+import Control.Exception (finally)
+import Control.Monad (join, unless)
 import Data.List (partition)
-import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Text as Text
-import Hetoimasia.Foundation.Log (Component, Logger, logError, logWarning, unsafeComponent)
+import Hetoimasia.Foundation.Log (Component, Logger, logWarning, unsafeComponent)
 import Hetoimasia.GLFW.Vulkan (withLoaderIntegration)
 import Hetoimasia.GPU.Vulkan.Diagnostics
   ( CaptureConfig (..)
@@ -98,7 +95,8 @@ import Hetoimasia.LuaEngine.Session
   , StopKind (StopInterrupt, StopQuit)
   , newRoleFailure
   )
-import Hetoimasia.Run.Boot (Prepared (..), remembering)
+import Hetoimasia.Run.Boot (Prepared (..))
+import Hetoimasia.Run.Serve (Owner (..), serve)
 import Hetoimasia.Run.Output (reportText)
 import Hetoimasia.Run.Session
   ( Environment
@@ -106,7 +104,6 @@ import Hetoimasia.Run.Session
   , SessionLink
   , linkFailure
   , linkStop
-  , newSessionLink
   , runPrepared
   )
 import Hetoimasia.Runtime.GLFW
@@ -119,7 +116,7 @@ import Hetoimasia.Runtime.GLFW
   , wakeGraphicsHost
   )
 import Hetoimasia.Runtime.Logging (LoggingLifetime, lifetimeLogger)
-import Hetoimasia.Runtime.Supervision (RuntimeControl)
+import Hetoimasia.Runtime.Supervision (RuntimeControl, withSupervision)
 
 -- | What the native suite watches of the production composition, and nothing else it could change: the host's own
 -- frame events, and the composed host and adapter once they exist, with an action to run on every turn of the
@@ -134,14 +131,14 @@ noObservation ∷ Observation
 noObservation = Observation (\_ → pure ()) (\_ _ → pure (pure ()))
 
 -- | 'runNativeWith' 'noObservation': the command's own.
-runNative ∷ Environment → LoggingLifetime → STM Bool → Prepared → IO SessionOutcome
+runNative ∷ Environment → LoggingLifetime → STM Bool → SessionLink → Prepared → IO SessionOutcome
 runNative = runNativeWith noObservation
 
 -- | Run the prepared folder with the production native graphics, from the process main thread. Returns the
 -- session's outcome after every role has retired, the windows are destroyed, the textures proved retired and
 -- the owner application has torn down; raises what any of those raised, or an unclean diagnostic verdict.
-runNativeWith ∷ Observation → Environment → LoggingLifetime → STM Bool → Prepared → IO SessionOutcome
-runNativeWith observation environment lifetime stop prepared = do
+runNativeWith ∷ Observation → Environment → LoggingLifetime → STM Bool → SessionLink → Prepared → IO SessionOutcome
+runNativeWith observation environment lifetime stop link prepared = do
   textureConfiguration ← either (\refused → ioError (userError ("the profile cannot be mapped to the native graphics: " <> show refused))) pure (configurationFor (preparedProfile prepared))
   scenes ← newSceneSession
   -- The capture keeps 16 KiB of a message, as the native suites do, so a long driver message is not truncated.
@@ -173,7 +170,6 @@ runNativeWith observation environment lifetime stop prepared = do
       awaitReadiness vulkan
       _ ← superviseGraphicsOwner control (vulkanGraphicsOwner vulkan)
       withTextureGraphics scenes textureConfiguration config vulkan $ \graphics → do
-        link ← newSessionLink
         providerStep ← newIORef (pure ())
         (port, _) ← newHostPort vulkan
         let profile = preparedProfile prepared
@@ -188,7 +184,17 @@ runNativeWith observation environment lifetime stop prepared = do
                       continue injection `finally` writeIORef providerStep (pure ())
                 }
         observed ← observeComposed observation vulkan graphics
-        serve vulkan control logger link providerStep observed $
+        let finish over = over >>= \finished → pure (if finished then FinishWith () else ContinueWith NoUpdateDemand)
+            loop checkpoints turn' = runVulkanOwnerLoop vulkan checkpoints (defaultScheduledHooks logger turn')
+            owner =
+              Owner
+                { ownerServe = \turn over → loop control (\_ → turn >> finish over)
+                  -- The drain makes its own supervision: the application's may have latched the very failure that
+                  -- ended the ordinary loop, and its checkpoints would end the drain before it served anything.
+                , ownerDrain = \over → withSupervision lifetime $ \fresh → loop fresh (\_ → finish over)
+                , ownerWake = wakeGraphicsHost (vulkanGraphicsOwner vulkan)
+                }
+        serve logger owner (linkStop link StopInterrupt) (join (readIORef providerStep) >> observed) $
           runPrepared environment lifetime stop link prepared (Just production) (\_ → pure ())
 
 -- | The window provider's stop and fatal endpoints, through the link: a genuine native close is the session's
@@ -206,45 +212,6 @@ linkWindowConfig link =
     codeOf = \case
       CleanupFatal _ → CleanupFailure
       Fatal _ → HostFailure
-
--- | Run the session on a thread of its own and serve the owner's loop on this one until it has ended. The
--- session's failure is raised here, with the context it carries, after the loop has stopped.
---
--- If the loop itself fails (or this thread is cancelled in it) the session is asked to stop and the loop is
--- served /again/ until the session has settled: its cleanup closes windows and waits for their native
--- destruction, which only this thread's loop performs, so joining it without serving would deadlock. The loop's
--- failure stays primary and is raised with its context once the session has settled; a failure of the second
--- loop is logged and the join still completes. Every wait here remembers a cancellation delivered meanwhile
--- and raises it afterwards, never instead of the join.
-serve ∷ VulkanHost GraphicsScene → RuntimeControl → Logger → SessionLink → IORef (IO ()) → IO () → IO SessionOutcome → IO SessionOutcome
-serve vulkan control logger link providerStep observed session = mask $ \restore → do
-  done ← newEmptyMVar ∷ IO (MVar (Either (ExceptionWithContext SomeException) SessionOutcome))
-  -- The session thread exists from here on, so everything below is inside the guard that stops and joins it.
-  _ ← forkIOWithUnmask $ \unmask → do
-    result ← unmask (tryWithContext session)
-    putMVar done result
-    wakeGraphicsHost (vulkanGraphicsOwner vulkan)
-  let finished = isJust <$> tryReadMVar done
-      loop turn = runVulkanOwnerLoop vulkan control (defaultScheduledHooks logger turn)
-      update _ = do
-        join (readIORef providerStep)
-        observed
-        finished >>= \over → pure (if over then FinishWith () else ContinueWith NoUpdateDemand)
-      -- Serving only what retirement needs: no provider step, no observation, which may be what failed.
-      drainUpdate _ = finished >>= \over → pure (if over then FinishWith () else ContinueWith NoUpdateDemand)
-  tryWithContext (restore (loop update)) >>= \case
-    Right () → pure ()
-    Left failure → do
-      linkStop link StopInterrupt
-      remembering $
-        tryWithContext (loop drainUpdate) >>= \case
-          Right () → pure ()
-          Left (again ∷ ExceptionWithContext SomeException) →
-            logError logger component "the owner loop failed again while the session was draining" [("reason", reportText (Text.pack (displayException again)))]
-      remembering (void (readMVar done))
-      rethrowIO (failure ∷ ExceptionWithContext SomeException)
-  remembering (void (readMVar done))
-  readMVar done >>= either rethrowIO pure
 
 -- | Wait for the owner's startup, which creates the device with no surface.
 awaitReadiness ∷ VulkanHost scene → IO ()

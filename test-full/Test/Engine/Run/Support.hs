@@ -39,11 +39,13 @@ import Hetoimasia.LuaEngine.Facade (OutputSink (..))
 import Hetoimasia.LuaEngine.Session (SessionOutcome)
 import Hetoimasia.Run (Setup (..), runGame)
 import Hetoimasia.Run.Boot (BootHooks, Prepared, noBootHooks)
-import Hetoimasia.Run.Session (Environment (..), newSessionLink, productionEnvironment, runPrepared)
+import Hetoimasia.Run.Session (Environment (..), SessionLink, productionEnvironment, runPrepared)
 import Hetoimasia.Runtime.Logging (LoggingLifetime)
 import System.Directory (createDirectoryIfMissing)
 import System.Exit (ExitCode)
+import Data.Maybe (fromMaybe)
 import System.FilePath (takeDirectory, (</>))
+import System.IO (Handle, stderr)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Support.Bounded (bounded)
 
@@ -90,20 +92,20 @@ data Changes = Changes
   -- ^ Done to the folder after its files are written and before the command starts (a link, say).
   , changeBoot ∷ FilePath → BootHooks
   -- ^ The boot seam, given the folder: a step between the manifest's first read and the scan.
+  , changeDiagnostics ∷ Maybe Handle
+  -- ^ Where the logging lifetime writes, instead of stderr: a handle the example broke, say.
   }
 
 unchanged ∷ Changes
-unchanged = Changes id (\_ → pure ()) (\_ → noBootHooks)
+unchanged = Changes id (\_ → pure ()) (\_ → noBootHooks) Nothing
 
 -- | A filter that writes nothing, so a failing run does not fill the suite's own stderr.
 quietFilter ∷ LogFilter
 quietFilter = defaultLogFilter {filterEnabled = False}
 
 -- | The launch the suite substitutes for the native one: the real session over a prepared folder, no graphics.
-launchWithout ∷ Environment → LoggingLifetime → STM Bool → Prepared → IO SessionOutcome
-launchWithout environment lifetime stop prepared = do
-  link ← newSessionLink
-  runPrepared environment lifetime stop link prepared Nothing (\_ → pure ())
+launchWithout ∷ Environment → LoggingLifetime → STM Bool → SessionLink → Prepared → IO SessionOutcome
+launchWithout environment lifetime stop link prepared = runPrepared environment lifetime stop link prepared Nothing (\_ → pure ())
 
 -- | Run a game in this process and observe it.
 observe ∷ Files → (Probe → IO ()) → IO Observed
@@ -129,6 +131,7 @@ observeWith changes files scenario = withSystemTempDirectory "hetoimasia-run" $ 
           { setupForce = atomically (modifyTVar' forced (+ 1))
           , setupReady = putMVar coordinator
           , setupBoot = changeBoot changes folder
+          , setupDiagnostics = fromMaybe stderr (changeDiagnostics changes)
           , setupLaunch = launchWithout environment
           }
       probe =
@@ -140,7 +143,8 @@ observeWith changes files scenario = withSystemTempDirectory "hetoimasia-run" $ 
           }
   finished ← newEmptyMVar ∷ IO (MVar (Either SomeException ()))
   _ ← forkIO (try (scenario probe) >>= putMVar finished)
-  status ← bounded (runGame setup quietFilter folder)
+  -- A handle the example broke is the point of its example, so logging is on for it.
+  status ← bounded (runGame setup (maybe quietFilter (const defaultLogFilter) (changeDiagnostics changes)) folder)
   -- A scenario still waiting for a line the command never wrote fails its own bounded wait.
   bounded (readMVar finished) >>= either throwIO pure
   Observed status <$> readTVarIO out <*> readTVarIO err <*> readTVarIO forced

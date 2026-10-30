@@ -349,8 +349,13 @@ DIGEST
     # The launcher's native suite starts the built full-product command as a child. That executable is named here,
     # from this same project and build directory, so a `hetoimasia` of another profile that happens to be on PATH can
     # never be the one launched, and nothing is built during the timed execution: a command that was not built
-    # is refused.
-    if [ "${components[0]}" = "hetoimasia:test:run-native-tests" ]; then
+    # is refused. The suite is recognized by the executable Cabal resolves for the component asked for, not by how
+    # the component was spelled (`hetoimasia:test:run-native-tests`, `hetoimasia:run-native-tests`, `run-native-tests`
+    # and so on all resolve to it), and any value inherited from the caller is dropped first, so no other component
+    # and no stale environment can reach it.
+    unset HETOIMASIA_RUN_EXECUTABLE
+    run_native_suite="$(cabal list-bin -v0 "${cabal_flags[@]}" hetoimasia:test:run-native-tests 2>/dev/null || true)"
+    if [ -n "$run_native_suite" ] && [ "$executable" = "$run_native_suite" ]; then
       run_executable="$(cabal list-bin -v0 "${cabal_flags[@]}" hetoimasia:exe:hetoimasia)" \
         || refuse "Cabal could not name the full-product hetoimasia executable"
       [ -x "$run_executable" ] \

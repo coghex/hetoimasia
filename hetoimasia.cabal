@@ -137,7 +137,9 @@ library run
             Hetoimasia.Run.Graphics
             Hetoimasia.Run.Options
             Hetoimasia.Run.Output
+            Hetoimasia.Run.Serve
             Hetoimasia.Run.Session
+            Hetoimasia.Run.Settle
             Hetoimasia.Run.Signals
             Hetoimasia.Run.Status
         build-depends:
@@ -276,6 +278,7 @@ test-suite hetoimasia-tests
             Test.Engine.Run.Compose
             Test.Engine.Run.Options
             Test.Engine.Run.Process
+            Test.Engine.Run.Serve
             Test.Engine.Run.Spec
             Test.Engine.Run.Status
             Test.Engine.Run.Support

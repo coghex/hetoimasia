@@ -11,11 +11,12 @@ import Control.Exception
   , ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , finally
+  , fromException
   , tryWithContext
   , uninterruptibleMask_
   )
 import Control.Monad (forever, void)
-import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (ThreadBlocked), threadStatus)
+import GHC.Conc (BlockReason (BlockedOnException, BlockedOnSTM), ThreadStatus (ThreadBlocked), threadStatus)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, withResource)
 import Hetoimasia.Run.Boot (abortable)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
@@ -50,6 +51,46 @@ spec = describe "Abort" $ do
       Left (ExceptionWithContext context _) → length (cleanupFailuresInContext context) `shouldSatisfy` (>= 1)
       Right _ → expectationFailure "the child's failure was lost"
 
+  it "keeps the child's failed cleanup beside a cancellation of the caller that arrives while it waits" $ do
+    started ← newEmptyMVar
+    result ← newEmptyMVar
+    caller ← newEmptyMVar
+    let work = withResource (pure ()) (\_ → ioError (userError "preparation release failed")) (\_ → putMVar started () >> forever (threadDelay 1000000))
+    _ ← forkIO $ do
+      myThreadId >>= putMVar caller
+      tryWithContext @SomeException (abortable (pure False) work) >>= putMVar result
+    me ← takeMVar caller
+    takeMVar started
+    bounded (blockedFor BlockedOnSTM me)
+    throwTo me UserInterrupt
+    bounded (takeMVar result) >>= \case
+      Left (ExceptionWithContext context failure) → do
+        (fromException failure ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
+        length (cleanupFailuresInContext context) `shouldSatisfy` (>= 1)
+      Right _ → expectationFailure "the caller's cancellation was lost"
+
+  it "keeps the child's failed cleanup beside a cancellation of the caller that arrives while it sends its own" $ do
+    started ← newEmptyMVar
+    gate ← newEmptyMVar
+    result ← newEmptyMVar
+    caller ← newEmptyMVar
+    stopped ← newTVarIO False
+    let work = withResource (pure ()) (\_ → ioError (userError "preparation release failed")) (\_ → uninterruptibleMask_ (putMVar started () >> takeMVar gate))
+    _ ← forkIO $ do
+      myThreadId >>= putMVar caller
+      tryWithContext @SomeException (abortable (readTVar stopped) work) >>= putMVar result
+    me ← takeMVar caller
+    takeMVar started
+    atomically (writeTVar stopped True)
+    bounded (blockedSending me)
+    throwTo me UserInterrupt
+    putMVar gate ()
+    bounded (takeMVar result) >>= \case
+      Left (ExceptionWithContext context failure) → do
+        (fromException failure ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
+        length (cleanupFailuresInContext context) `shouldSatisfy` (>= 1)
+      Right _ → expectationFailure "the caller's cancellation was lost"
+
   it "raises a cancellation of the caller only after the child has actually ended, even when the child holds delivery off" $ do
     caller ← newEmptyMVar
     started ← newEmptyMVar
@@ -78,3 +119,8 @@ spec = describe "Abort" $ do
 blockedSending ∷ ThreadId → IO ()
 blockedSending thread = threadStatus thread >>= \status →
   if status == ThreadBlocked BlockedOnException then pure () else yield >> blockedSending thread
+
+-- | Wait until the thread is blocked for this reason.
+blockedFor ∷ BlockReason → ThreadId → IO ()
+blockedFor reason thread = threadStatus thread >>= \status →
+  if status == ThreadBlocked reason then pure () else yield >> blockedFor reason thread

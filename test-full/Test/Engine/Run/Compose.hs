@@ -18,6 +18,8 @@ import Hetoimasia.Foundation.Resource (withResource)
 import Hetoimasia.Run.Boot (BootHooks (..))
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
+import System.IO (hClose, hSetBuffering, BufferMode (NoBuffering))
+import System.Process (createPipe)
 import System.Posix.Files (createSymbolicLink)
 import Test.Engine.Run.Support
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldContain, shouldNotContain, shouldSatisfy)
@@ -235,6 +237,14 @@ stops = describe "stops and signals" $ do
     observed ← observeWith unchanged {changeBoot = failing} files $ \probe → do
       takeMVar started
       void (probeSignal probe)
+    observedStatus observed `shouldBe` ExitFailure 1
+    observedOut observed `shouldBe` []
+
+  it "is 1, reaching no authored Lua and raising nothing, when the diagnostic path itself fails at startup" $ do
+    (readEnd, broken) ← createPipe
+    hClose readEnd
+    hSetBuffering broken NoBuffering
+    observed ← observeWith unchanged {changeDiagnostics = Just broken} [("hetoimasia.json", commonManifest), ("main.lua", lua (entry (logic <> quittingUi)))] (\_ → pure ())
     observedStatus observed `shouldBe` ExitFailure 1
     observedOut observed `shouldBe` []
 

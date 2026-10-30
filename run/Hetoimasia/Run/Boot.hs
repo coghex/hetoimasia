@@ -40,7 +40,6 @@ module Hetoimasia.Run.Boot
   , withPrepared
   , withPreparedWith
   , abortable
-  , remembering
   ) where
 
 import Control.Concurrent (forkIO, killThread)
@@ -63,7 +62,6 @@ import Control.Exception
   , displayException
   , fromException
   , mask
-  , onException
   , rethrowIO
   , throwIO
   , toException
@@ -71,10 +69,8 @@ import Control.Exception
   , tryWithContext
   )
 import Control.Monad (void)
-import Data.Foldable (traverse_)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext)
 import Data.IORef (newIORef, readIORef, writeIORef)
-import Data.Maybe (fromMaybe)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.Text (Text)
@@ -106,6 +102,7 @@ import Hetoimasia.LuaEngine.Boot
 import Hetoimasia.LuaEngine.Manifest (Manifest (..), contentIdText, parseManifestWith)
 import Hetoimasia.LuaEngine.Profile (ByteLimit (ManifestBytes), Bytes (Bytes), Profile, bytesLimit)
 import Hetoimasia.Run.Output (reportText)
+import Hetoimasia.Run.Settle (combine, rememberingInterruption)
 
 -- | The folder, prepared: borrowed by the continuation.
 data Prepared = Prepared
@@ -236,36 +233,48 @@ readManifest profile limits root = case nativeName "hetoimasia.json" of
 --   result it had produced anyway stands; and any other failure, a synchronous one or a cleanup failure
 --   retained beside the cancellation, is raised with its context, because a failed cleanup is a failure of
 --   the run and not an orderly stop.
+-- * When the /caller/ is cancelled instead (in the wait, or while it is sending its cancellation), the child is
+--   still cancelled and joined first, and the child's evidence (a failed cleanup, a failure of its own) is
+--   retained beside the caller's cancellation, which is then raised: the cancellation is never lost and never
+--   hides what the child's cleanup raised.
 -- * Delivering the cancellation is itself an interruptible operation, so a cancellation of the caller is
---   remembered across the sending and the join together ('remembering') and raised only after the child has
---   actually ended. The wait is never made uninterruptible.
+--   remembered across the sending and the join together and raised only after the child has actually ended.
+--   The wait is never made uninterruptible.
 abortable ∷ ∀ a. STM Bool → IO a → IO (Maybe a)
 abortable stop action = mask $ \restore → do
   done ← newEmptyTMVarIO
   child ← forkIO (tryWithContext (restore action) >>= \result → atomically (putTMVar done (result ∷ Either (ExceptionWithContext SomeException) a)))
   let ended = atomically (readTMVar done)
-      cancelAndJoin = remembering (killThread child >> void ended)
-  waited ←
-    restore (atomically ((Right <$> readTMVar done) `orElse` (Left <$> (stop >>= check))))
-      `onException` cancelAndJoin
+      -- Send the cancellation and wait for the child to end, remembering an interruption of the caller meanwhile.
+      stopChild = rememberingInterruption (killThread child >> void ended)
+      -- What the child's end adds to a failure that is already being raised: nothing for a clean cancellation.
+      evidence outcome = [("the preparation worker", failure) | Left failure ← [outcome], not (expectedCancellation failure)]
+  waited ← tryWithContext @SomeException (restore (atomically ((Right <$> readTMVar done) `orElse` (Left <$> (stop >>= check)))))
   case waited of
-    Right outcome → either rethrowIO (pure . Just) outcome
-    Left () → do
-      cancelAndJoin
-      ended >>= \case
-        Right result → pure (Just result)
-        Left failure
-          | expectedCancellation failure → pure Nothing
-          | otherwise → rethrowIO (asFailure failure)
+    Right (Right outcome) → either rethrowIO (pure . Just) outcome
+    Right (Left ()) → do
+      interruption ← stopChild
+      outcome ← ended
+      case interruption of
+        Just interrupted → rethrowIO =<< combine interrupted (evidence outcome)
+        Nothing → case outcome of
+          Right result → pure (Just result)
+          Left failure
+            | expectedCancellation failure → pure Nothing
+            | otherwise → rethrowIO (asFailure failure)
+    Left callerFailure → do
+      interruption <- stopChild
+      outcome ← ended
+      rethrowIO =<< combine callerFailure (evidence outcome <> [("a further interruption while stopping the preparation worker", interrupted) | Just interrupted ← [interruption]])
   where
+    -- Only the bare cancellation we sent, with no cleanup failure retained beside it.
+    expectedCancellation (ExceptionWithContext context failure) =
+      (fromException failure ∷ Maybe AsyncException) == Just ThreadKilled && null (cleanupFailuresInContext context)
     -- The child's cancellation is asynchronous by type, but its cleanup having failed is a failure of this run: it
     -- is raised as an ordinary exception, with the child's context (and so its cleanup evidence) kept.
     asFailure (ExceptionWithContext context failure)
       | Just (_ ∷ SomeAsyncException) ← fromException failure = ExceptionWithContext context (toException (CancelledUncleanly (Text.pack (displayException failure))))
       | otherwise = ExceptionWithContext context failure
-    -- Only the bare cancellation we sent, with no cleanup failure retained beside it.
-    expectedCancellation (ExceptionWithContext context failure) =
-      (fromException failure ∷ Maybe AsyncException) == Just ThreadKilled && null (cleanupFailuresInContext context)
 
 -- | The preparation was cancelled by a stop and its cleanup then failed.
 newtype CancelledUncleanly = CancelledUncleanly Text
@@ -273,15 +282,3 @@ newtype CancelledUncleanly = CancelledUncleanly Text
 
 instance Exception CancelledUncleanly where
   displayException (CancelledUncleanly why) = "the preparation was stopped and its cleanup failed: " <> Text.unpack why
-
--- | Run an action to its end, remembering any asynchronous exception that interrupts it, running it again
--- until it completes undisturbed, and raising the first one remembered, with its context, afterwards. For
--- operations that must finish (sending a cancellation and joining what it cancels): an interruption is
--- delivered after them, never instead of them.
-remembering ∷ IO () → IO ()
-remembering act = go Nothing
-  where
-    go pending =
-      tryWithContext act >>= \case
-        Right () → traverse_ rethrowIO pending
-        Left (interruption ∷ ExceptionWithContext SomeAsyncException) → go (Just (fromMaybe interruption pending))

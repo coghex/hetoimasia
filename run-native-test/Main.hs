@@ -36,7 +36,7 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Exception (SomeException, throwIO, try)
+import Control.Exception (SomeException, mask_, throwIO, try)
 import Control.Monad (forM_, unless, when)
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import Data.Text (Text)
@@ -68,7 +68,7 @@ main = do
   evidenceLines ← newTVarIO []
   done ← newEmptyTMVarIO
   started ← getCurrentTime
-  let env = Env {envMain = onMain jobs, envEvidence = evidenceLines}
+  let env = Env {envStart = startMain jobs, envEvidence = evidenceLines}
   _ ← forkOS $ do
     result ←
       try @SomeException $
@@ -104,12 +104,12 @@ completeFlag = "--complete"
 examples ∷ Env → Spec
 examples env = Library.spec env >> Command.spec env
 
--- | Ask the main thread to run an action and wait for what it returned or raised.
-onMain ∷ TVar [IO ()] → IO a → IO a
-onMain jobs action = do
+-- | Hand an action to the main thread, in one step that nothing can interrupt, and answer the wait for its outcome.
+startMain ∷ TVar [IO ()] → IO a → IO (IO a)
+startMain jobs action = mask_ $ do
   answer ← newEmptyMVar
   atomically (modifyTVar' jobs (<> [try @SomeException action >>= putMVar answer]))
-  takeMVar answer >>= either throwIO pure
+  pure (takeMVar answer >>= either throwIO pure)
 
 -- | Serve the examples' actions, one at a time, until Hspec has finished, and answer how it did.
 serve ∷ TVar [IO ()] → TMVar (Either SomeException Bool) → IO (Either SomeException Bool)

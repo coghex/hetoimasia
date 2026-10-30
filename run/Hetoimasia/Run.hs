@@ -43,7 +43,7 @@ module Hetoimasia.Run
   ) where
 
 import Control.Concurrent.STM (STM, atomically)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, displayException, fromException, rethrowIO, toException, try, tryWithContext)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask, rethrowIO, try, tryWithContext)
 import Control.Monad (void)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
@@ -59,12 +59,13 @@ import Hetoimasia.Run.Boot (BootEnd (..), BootHooks, Prepared, noBootHooks, with
 import Hetoimasia.Run.Graphics (runNative)
 import Hetoimasia.Run.Options (RunParse (..), parseRun, problemReason, runHelp, runUsage)
 import Hetoimasia.Run.Output (reportText, utf8Streams)
-import Hetoimasia.Run.Session (productionEnvironment)
+import Hetoimasia.Run.Session (SessionLink, awaitDiagnostics, newSessionLink, productionEnvironment)
+import Hetoimasia.Run.Settle (isAsynchronous)
 import Hetoimasia.Run.Signals (forceExit, withRunSignals)
 import Hetoimasia.Run.Status (RunResult (..), bootFailed, exitStatus)
 import Hetoimasia.Runtime.Logging (LoggingLifetime, lifetimeLogger, withHandleLoggingLifetime)
 import System.Exit (ExitCode (ExitSuccess), exitWith)
-import System.IO (hFlush, stderr)
+import System.IO (Handle, hFlush, stderr)
 
 -- | What the command is composed with: the signals' force action and how a prepared folder is run. The
 -- production values are 'production'; the suite supplies a force action it can count and a launch that
@@ -75,13 +76,17 @@ data Setup = Setup
   -- ^ Told the signal coordinator as soon as it exists, before any boot work: the suite delivers a signal
   -- through the very 'deliver' the installed handlers call.
   , setupBoot ∷ BootHooks
-  , setupLaunch ∷ LoggingLifetime → STM Bool → Prepared → IO SessionOutcome
+  , setupDiagnostics ∷ Handle
+  -- ^ Where the logging lifetime writes: stderr. A suite gives it a handle it can break.
+  , setupLaunch ∷ LoggingLifetime → STM Bool → SessionLink → Prepared → IO SessionOutcome
+  -- ^ Run the prepared folder. The link is the command's: whatever session is bound to it is the one whose
+  -- diagnostics writer the command joins before the logger is released.
   }
 
 -- | The command as it ships: a second signal leaves the process at once with 130, and the folder is run with the
 -- production native graphics. No option, variable or fallback selects anything else.
 production ∷ Setup
-production = Setup forceExit (\_ → pure ()) noBootHooks (runNative productionEnvironment)
+production = Setup forceExit (\_ → pure ()) noBootHooks stderr (runNative productionEnvironment)
 
 -- | The entry in the top-level help text (full build only).
 runHelpEntry ∷ [Text]
@@ -105,29 +110,37 @@ runRun configuration arguments = case parseRun arguments of
 -- | Everything after a valid command line, answering the exit status rather than leaving the process.
 --
 -- /Reporting./ Boot and host failures are reported by one best-effort line each on stderr, written /after/ every
--- scope has unwound, from outside the logging lifetime. They are not written through the logger: the lifetime and the
--- graphics owner's application have their own terminal reporting and their own record of a diagnostic path that
+-- scope has unwound, from outside the logging lifetime. They are not written through the logger: the lifetime and
+-- the graphics owner's application have their own terminal reporting and their own record of a diagnostic path that
 -- already failed, and a second unguarded write through that path would retry a failed report and could replace the
 -- failure being reported with its own. The line is bounded and escaped, carries the cleanup failures retained
--- beside the primary one, and a failure to write it is ignored. A failure of the lifetime itself (its final flush)
--- after the run came to an end is added to what was held, never substituted for it.
+-- beside the primary one, and a failure to write it is ignored.
+--
+-- /Provenance./ A failure raised inside the logging lifetime is let go through it, as itself and with its context,
+-- so the lifetime sees where it came from: a failure of a diagnostic is not followed by a final flush through the
+-- path that just failed, and a failed report is recorded. It is caught only outside, and a failure of the lifetime
+-- itself (its final flush) after the run came to an end is added to what was held, never substituted for it.
+--
+-- /The session's writer./ The session lets its diagnostics writer outlive the call, and it borrows the logger, so it
+-- is joined, interruptibly and remembering a cancellation, before the lifetime releases the logger, after every
+-- scope the session used has unwound, and on a failure as well as a success.
 runGame ∷ Setup → LogFilter → FilePath → IO ExitCode
 runGame setup configuration path = do
   utf8Streams
+  link ← newSessionLink
   held ← newIORef Nothing
   outer ← tryWithContext $ withRunSignals (setupForce setup) $ \coordinator → do
     setupReady setup coordinator
-    withHandleLoggingLifetime configuration stderr $ \lifetime → do
+    withHandleLoggingLifetime configuration (setupDiagnostics setup) $ \lifetime → do
       let stop = stopRequested coordinator
           logger = lifetimeLogger lifetime
-      attempt ← tryWithContext (withPreparedWith (setupBoot setup) logger fixedM1Profile stop path (setupLaunch setup lifetime stop))
-      (outcome, reports) ← case attempt of
-        Left failure
-          | isCancellation failure → rethrowIO failure
-          | otherwise → let reason = failureReason failure in pure (RunResult Nothing Nothing [reason] False, ["run failed: " <> reason])
-        Right (Left (BootRefused reason)) → pure (bootFailed reason False, ["boot failed: " <> reason])
-        Right (Left BootStopped) → pure (RunResult Nothing Nothing [] True, [])
-        Right (Right session) → pure (RunResult (Just session) Nothing [] False, [])
+      attempt ←
+        withPreparedWith (setupBoot setup) logger fixedM1Profile stop path (setupLaunch setup lifetime stop link)
+          `afterwards` awaitDiagnostics link
+      let (outcome, reports) = case attempt of
+            Left (BootRefused reason) → (bootFailed reason False, ["boot failed: " <> reason])
+            Left BootStopped → (RunResult Nothing Nothing [] True, [])
+            Right session → (RunResult (Just session) Nothing [] False, [])
       stopped ← atomically stop
       let result = outcome {resultSignalled = resultSignalled outcome || stopped}
       writeIORef held (Just (result, reports))
@@ -135,7 +148,7 @@ runGame setup configuration path = do
   (result, reports) ← case outer of
     Right done → pure done
     Left failure
-      | isCancellation failure → rethrowIO failure
+      | isAsynchronous failure → rethrowIO failure
       | otherwise → do
           let reason = failureReason failure
           prior ← readIORef held
@@ -144,11 +157,15 @@ runGame setup configuration path = do
             Nothing → (RunResult Nothing Nothing [reason] False, ["run failed: " <> reason])
   mapM_ report reports
   pure (exitStatus result)
-  where
-    isCancellation failure = case fromException (toException' failure) of
-      Just (_ ∷ SomeAsyncException) → True
-      Nothing → False
-    toException' (ExceptionWithContext _ failure) = toException failure
+
+-- | Run an action and then another, whatever the first did: the failure of the first is raised with its context
+-- after the second has finished, and the second is interruptible with a cancellation remembered (so it is the
+-- caller's to write that way).
+afterwards ∷ IO a → IO () → IO a
+afterwards action after = mask $ \restore → do
+  outcome ← tryWithContext @SomeException (restore action)
+  after
+  either rethrowIO pure outcome
 
 -- | A failure as one bounded line: what it says, then each cleanup failure retained beside it.
 failureReason ∷ ExceptionWithContext SomeException → Text

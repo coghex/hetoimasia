@@ -47,7 +47,7 @@ childEntry =
       let configuration = defaultLogFilter {filterEnabled = True}
           setup = case mode of
             "orderly" → production {setupLaunch = launchWithout productionEnvironment}
-            "stuck" → production {setupLaunch = \_ stop _ → stuck stop}
+            "stuck" → production {setupLaunch = \_ stop _ _ → stuck stop}
             other → error ("an unknown child mode: " <> other)
       status ← runGame setup configuration game
       exitWith status

@@ -38,6 +38,8 @@ module Hetoimasia.Run.Session
   , newSessionLink
   , linkStop
   , linkFailure
+  , newSessionLinkEndingWith
+  , awaitDiagnostics
   , ioQueueSlots
   , textureJobs
   , runPrepared
@@ -54,7 +56,7 @@ import Control.Concurrent.STM
   , writeTVar
   )
 import Control.Exception (finally, mask_)
-import Control.Monad (forM_, void)
+import Control.Monad (forM_, join, void)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Hetoimasia.Content.ReadPool (poolSpec, withReadPool)
 import Hetoimasia.Foundation.Time (MonotonicSource, monotonicSource)
@@ -70,6 +72,7 @@ import Hetoimasia.LuaEngine.Session
   , noHarness
   , requestStop
   , runSession
+  , sessionDiagnosticsEnded
   )
 import Hetoimasia.LuaEngine.Texture
   ( TexturePipeline
@@ -80,6 +83,7 @@ import Hetoimasia.LuaEngine.Texture
 import Hetoimasia.LuaEngine.Texture.Backend (TextureBackend)
 import Hetoimasia.Run.Boot (Prepared (..))
 import Hetoimasia.Run.Output (authoredSinks)
+import Hetoimasia.Run.Settle (remembering)
 import Hetoimasia.Runtime.Logging (LoggingLifetime, lifetimeLogger)
 import Hetoimasia.Runtime.Supervision (withSupervision)
 import Hetoimasia.Scripting.Lua.Runtime (newLuaRuntime)
@@ -121,10 +125,23 @@ data SessionLink = SessionLink
   { linkSession ∷ !(TVar (Maybe Session))
   , linkPendingStop ∷ !(TVar (Maybe StopKind))
   , linkPendingFailures ∷ !(TVar [RoleFailure])
+  , linkEnded ∷ !(TVar (STM Bool))
+  -- ^ Whether the session's diagnostics writer (and the helper that cancels it) has ended: true while no session
+  -- is bound, because then nothing writes.
   }
 
 newSessionLink ∷ IO SessionLink
-newSessionLink = SessionLink <$> newTVarIO Nothing <*> newTVarIO Nothing <*> newTVarIO []
+newSessionLink = newSessionLinkEndingWith (pure True)
+
+-- | A link whose diagnostics writer's end is read from this, for a suite that gates it.
+newSessionLinkEndingWith ∷ STM Bool → IO SessionLink
+newSessionLinkEndingWith ended = SessionLink <$> newTVarIO Nothing <*> newTVarIO Nothing <*> newTVarIO [] <*> newTVarIO ended
+
+-- | Wait until the session's diagnostics writer has ended. The session permits it to outlive 'runSession', and it
+-- borrows the logger, so whoever owns the logger joins it before the logger is released. The wait is interruptible;
+-- a cancellation meanwhile is remembered and raised after the writer has ended.
+awaitDiagnostics ∷ SessionLink → IO ()
+awaitDiagnostics link = remembering (atomically (join (readTVar (linkEnded link)) >>= check))
 
 -- | Ask the session to stop; recorded and applied on binding when the session does not exist yet.
 linkStop ∷ SessionLink → StopKind → IO ()
@@ -156,6 +173,7 @@ bindLink ∷ SessionLink → Session → IO ()
 bindLink link session = do
   (stop, failures) ← atomically $ do
     writeTVar (linkSession link) (Just session)
+    writeTVar (linkEnded link) (sessionDiagnosticsEnded session)
     (,) <$> readTVar (linkPendingStop link) <*> readTVar (linkPendingFailures link)
   forM_ failures (void . latchTerminalFailure session)
   forM_ stop (requestStop session)
