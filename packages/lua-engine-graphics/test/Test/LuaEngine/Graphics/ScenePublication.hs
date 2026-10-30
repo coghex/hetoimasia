@@ -8,7 +8,7 @@
 module Test.LuaEngine.Graphics.ScenePublication (spec) where
 
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO)
-import Control.Exception (finally)
+import Control.Exception (SomeException, finally, fromException, try)
 import Control.Monad (forM_)
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -19,7 +19,7 @@ import Hetoimasia.LuaEngine.Scene (SceneContent (..), SceneRect (..), SceneSprit
 import Hetoimasia.LuaEngine.Graphics.Window.Port (Port (..), WindowToken (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Provider (WindowConfig (..), closeWindowOwner, endWindows)
 import Hetoimasia.Render.TwoD.Vulkan.Textures (newTextures)
-import Test.HUnit.Lang (assertFailure)
+import Test.HUnit.Lang (HUnitFailure (HUnitFailure), assertFailure)
 import Test.Hspec
 import Test.LuaEngine.Graphics.Fake (fakeLedger, setBarrier)
 import qualified Test.LuaEngine.Graphics.Png as Png
@@ -177,6 +177,31 @@ spec = describe "scene publication" $ do
         publishedRevision (pubModel pub) winA `shouldReturn` 1
         scene ← latest pub winA
         Set.size (graphicsReferences scene) `shouldBe` 1
+
+  it "cannot be refused by a later check once it has published: every check runs before the action" $
+    withPublication $ \pub → do
+      ready pub "a"
+      loaded pub "a" "a" "a.png"
+      line ← run pub "a" "plate" "a" (Just "a")
+      line `shouldSatisfy` Text.isInfixOf "a later check refused"
+      publishedRevision (pubModel pub) winA `shouldReturn` 0
+
+  it "keeps the accepted scene when the call fails after the commit, and the failure stays the application's" $ do
+    -- An exception out of the action is the application's failure and ends the owner; the scope then raises it. The
+    -- scene the host accepted before it stays the window's.
+    outcome ← try @SomeException . withPublication $ \pub → do
+      ready pub "a"
+      loaded pub "a" "a" "a.png"
+      armFailure (pubVm pub) "after-commit"
+      say pub "a" "publish" "a" (Just "a")
+      awaitRevision (pubModel pub) winA 1
+      scene ← latest pub winA
+      Set.size (graphicsReferences scene) `shouldBe` 1
+    case outcome of
+      Right () → expectationFailure "the scope returned although the application had failed"
+      Left failure
+        | Just (HUnitFailure _ _) ← fromException failure → expectationFailure ("the example failed instead of the scope: " <> show failure)
+        | otherwise → pure ()
 
   it "takes the largest legal scene through the binding: 4,096 sprites are accepted and one more is refused" $
     withPublication $ \pub → do

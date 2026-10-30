@@ -27,6 +27,7 @@ module Test.LuaEngine.Graphics.SceneComp
 
     -- * Gates inside a running invocation
   , armGate
+  , armFailure
   , awaitGate
   , openGate
   , openAllGates
@@ -142,7 +143,8 @@ data SceneVm target = SceneVm
   }
 
 data Gates = Gates
-  { gatesArmed ∷ ![Text]
+  { gatesFailing ∷ ![Text]
+  , gatesArmed ∷ ![Text]
   , gatesEntered ∷ ![Text]
   , gatesOpened ∷ ![Text]
   , gatesAll ∷ !Bool
@@ -174,7 +176,7 @@ startSceneVm comp runtime label = do
   leases ← newLeases lending 16
   textureOwners ← newIORef Map.empty
   windowOwners ← newIORef Map.empty
-  gates ← newTVarIO (Gates [] [] [] False)
+  gates ← newTVarIO (Gates [] [] [] [] False)
   let kit = scKit comp
       publisher = scenePublisherOver (kitTextures kit) (scProvider comp) (kitPublish kit) (kitUsable kit)
       vm' = SceneVm (error "owner not started") textureService' windowService' leases textureOwners windowOwners gates publisher
@@ -235,7 +237,7 @@ bindings comp limits vm =
   , namespace "wrq" (m1RequestBindings (M1Service windowRequests windowValueSchema))
   , namespace "tex" [loading, releasing]
   , namespace "win" [opening]
-  , namespace "scn" [published, raced]
+  , namespace "scn" [published, late, raced]
   ]
   where
     log' = cpLog (scTexture comp)
@@ -290,6 +292,9 @@ bindings comp limits vm =
         Left why → pure (Just why)
         Right ask → windowArgumentCheck (vmWindow vm) (const ask) owner values
     published = graphicsPublishBindingWith (hooksOf vm) "publish" (\_ _ → pure Nothing) (vmPublisher vm) limits (vmLeases vm)
+    -- The same binding with one more check after the library's: the host runs every check before the action, so a
+    -- refusal by it cannot come after the publication.
+    late = withArgumentCheck (\_ _ → pure (Just "a later check refused")) (graphicsPublishBindingWith (hooksOf vm) "publish_late" (\_ _ → pure Nothing) (vmPublisher vm) limits (vmLeases vm))
     -- A release that lands between the scene's preparation and the publication boundary, on the instance's own thread
     -- where a script's next statement could not: the preparation succeeds, the texture is released, and the
     -- operation is asked to publish the stale preparation. The answer is the operation's, as text.
@@ -329,12 +334,14 @@ hooksOf ∷ SceneVm target → PublishHooks
 hooksOf vm = PublishHooks (gate "before-boundary") (gate "before-commit") (gate "after-commit")
   where
     gate name = do
-      armed ← (name `elem`) . gatesArmed <$> readTVarIO (vmGates vm)
-      when armed $ do
-        atomically (modifyTVar' (vmGates vm) (\held → held {gatesEntered = name : gatesEntered held}))
+      held ← readTVarIO (vmGates vm)
+      when (name `elem` gatesArmed held) $ do
+        atomically (modifyTVar' (vmGates vm) (\now → now {gatesEntered = name : gatesEntered now}))
         atomically $ do
-          held ← readTVar (vmGates vm)
-          unless (gatesAll held || name `elem` gatesOpened held) retry
+          now ← readTVar (vmGates vm)
+          unless (gatesAll now || name `elem` gatesOpened now) retry
+      -- A seam that fails: the call raises here, as a defect of the host would.
+      when (name `elem` gatesFailing held) (ioError (userError ("injected: the call failed at " <> Text.unpack name)))
 
 -- | The Lua the commands run. A scene is described by the texture keys its sprites use, comma separated:
 -- @"a,b,a"@ is three sprites, the first and third of texture @a@.
@@ -389,6 +396,9 @@ driverSource =
       , "    elseif p.spec == 'meta' then setmetatable(s, {})"
       , "    elseif p.spec == 'nan' then s.sprites[1].x = 0/0 end"
       , "    local ok, err = pcall(scn.publish, self.ws[key], s)"
+      , "    out = ok and 'published' or ('error ' .. tostring(err))"
+      , "  elseif p.op == 'plate' then"
+      , "    local ok, err = pcall(scn.publish_late, self.ws[key], scene(self, p, self.ts))"
       , "    out = ok and 'published' or ('error ' .. tostring(err))"
       , "  elseif p.op == 'praced' then"
       , "    out = scn.publish_raced(self.ws[key], scene(self, p, self.ts), self.ts.a)"
@@ -463,6 +473,10 @@ command comp vm name op key spec = do
   deliverEvent (scheduledEndpoint (vmOwner vm)) identity "cmd" payload >>= \case
     DeliveryAccepted _ → pure ()
     other → assertFailure ("expected the command accepted, found " <> take 80 (show other))
+
+-- | Make the publication fail at this seam, as an exception out of the call would.
+armFailure ∷ SceneVm target → Text → IO ()
+armFailure vm name = atomically (modifyTVar' (vmGates vm) (\held → held {gatesFailing = name : gatesFailing held}))
 
 -- | Arm this gate: the next publication holds there.
 armGate ∷ SceneVm target → Text → IO ()

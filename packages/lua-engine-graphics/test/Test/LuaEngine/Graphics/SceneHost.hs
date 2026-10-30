@@ -42,15 +42,16 @@ module Test.LuaEngine.Graphics.SceneHost
   , releasePass
   , dissolve
   , publishedRevision
+  , awaitRevision
   , latestScene
   , adoptedRecords
   , retentionLimit
   ) where
 
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import Control.Monad (forM_)
+import Control.Monad (forM_, unless)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, preparedValue)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger
   ( GraphicsScene
@@ -265,6 +266,12 @@ releaseWindow model window = go []
 -- | The window's latest published revision.
 publishedRevision ∷ Model → Int → IO Natural
 publishedRevision model window = maybe 0 winPublished . Map.lookup window <$> readTVarIO (mWindows model)
+
+-- | Block until the window's latest published revision is at least this one.
+awaitRevision ∷ Model → Int → Natural → IO ()
+awaitRevision model window revision = atomically $ do
+  windows ← readTVar (mWindows model)
+  unless (maybe 0 winPublished (Map.lookup window windows) >= revision) retry
 
 -- | The window's latest published scene.
 latestScene ∷ Model → Int → IO (Maybe GraphicsScene)

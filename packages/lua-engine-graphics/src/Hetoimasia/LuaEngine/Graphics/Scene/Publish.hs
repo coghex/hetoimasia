@@ -44,12 +44,13 @@
 --
 -- = Refusal, and what is fatal
 --
--- Every refusal, including the ones found at the commit, is an ordinary Lua error from the binding
--- ('graphicsPublishCommit'): @pcall@ catches it, the previous scene stays, and the next valid call works. The host
--- allows an ordinary error only before a binding's action, so the commit is made in the binding's argument check,
--- which runs once per call on the calling thread; the action has nothing left to do. A defect of the host or the
--- registry, an exception or a cancellation is raised, never refused: nothing here downgrades a defect or clears a
--- fatal latch.
+-- Every refusal, including the ones found at the commit, is an ordinary Lua error from the binding: @pcall@ catches
+-- it, the previous scene stays, and the next valid call works. What can be known before an effect is refused by the
+-- binding's check ('graphicsPublishCheck'), which publishes nothing. The commit is made in the action; a refusal
+-- there (a stop, a closure or an ending instance that landed since the check) is raised from inside the action with
+-- 'refuseOrdinarily', before any effect, because the commit is one transaction that wrote nothing. A defect of the
+-- host or the registry, an exception or a cancellation after the commit is the application's failure: the scene
+-- stays the window's, and nothing here downgrades a defect or clears a fatal latch.
 --
 -- = Owned state, threads and lifetime
 --
@@ -77,7 +78,7 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Publish
   , publishSceneWith
 
     -- * The binding
-  , graphicsPublishCommit
+  , graphicsPublishCheck
   , graphicsPublishBinding
   , graphicsPublishBindingWith
   ) where
@@ -112,6 +113,7 @@ import Hetoimasia.LuaEngine.Scene
   , TextureUse (..)
   , prepareScene
   , refusalReasonText
+  , sceneArgumentCheck
   , sceneSchema
   , scenePublishLimits
   , textureUses
@@ -124,6 +126,7 @@ import Hetoimasia.Scripting.Lua.Registration
   , Binding
   , stateOperation
   , withArgumentCheck
+  , refuseOrdinarily
   , withArgumentLimits
   )
 import Hetoimasia.Scripting.Lua.Value (Schema (SCapability), Value (VCapability), capabilityKey, capabilityTypeName)
@@ -298,34 +301,32 @@ boundary publisher resource uses = do
 
 -- The binding -----------------------------------------------------------------------------------------
 
--- | The publication as the binding's argument check: the place the host lets a refusal be an ordinary Lua error.
---
--- A refusal the host makes after a binding's action is a typed fault of the call, which a @pcall@ cannot hide, and
--- no public path raises an ordinary error from inside an action. Stop, closure and an ending instance are
--- /expected/ refusals ("Scene publication after the stop latch is an ordinary Lua error"), and they can land between
--- any earlier check and the commit. So the commit is made here, once per call, on the calling thread, after the
--- facade's own precondition and the scene's own check ('prepareScene'), and its result is the check's: 'Nothing'
--- when the scene was published, otherwise the bounded reason, which the host raises as an ordinary Lua error with the
--- previous publication untouched. The binding's action then has nothing left to do. An exception (a defect of the
--- host or the registry, a cancellation) is the application's failure, never a refusal.
-graphicsPublishCommit ∷ ∀ target. Typeable target ⇒ PublishHooks → ArgumentCheck → ScenePublisher target → SceneLimits → Leases → ArgumentCheck
-graphicsPublishCommit hooks precondition publisher limits leases owner values =
+-- | The binding's check, made before the action and publishing nothing: the facade's own precondition, then the
+-- scene's own check ('prepareScene') and the window handle's lease, role, admission and readiness, all read-only. A
+-- refusal is bounded text for an ordinary Lua error: nothing is published, held or changed, and a @pcall@ that
+-- catches it goes on.
+graphicsPublishCheck ∷ ∀ target. Typeable target ⇒ ArgumentCheck → ScenePublisher target → SceneLimits → Leases → ArgumentCheck
+graphicsPublishCheck precondition publisher limits leases owner values =
   precondition owner values >>= \case
     Just why → pure (Just why)
     Nothing → case values of
       [VCapability window, scene]
         | capabilityTypeName window /= windowHandleType → pure (Just "the first argument is not a window")
-        | otherwise →
-            prepareScene limits leases scene >>= \case
-              Left refusal → pure (Just (refusalReasonText refusal))
-              Right prepared →
-                publishSceneWith hooks publisher (capabilityKey window) prepared <&> \case
-                  Published → Nothing
-                  Refused refusal → Just (publishRefusalText refusal)
+        | otherwise → do
+            refused ← withWindowOr @target leases (capabilityKey window) (pure . Just . publishRefusalText . WindowRefused) $ \resource →
+              fmap (fmap publishRefusalText) (atomically (boundary publisher resource []))
+            case refused of
+              Just why → pure (Just why)
+              Nothing → sceneArgumentCheck limits leases owner [scene]
       other → pure (Just (Text.pack ("publishing takes a window and a scene, not " <> show (length other) <> " arguments")))
 
--- | A binding that takes a window and a scene, refuses with an ordinary Lua error whatever can be known up to the
--- commit, and otherwise publishes ('graphicsPublishCommit'). Answers nothing to the script.
+-- | A binding that takes a window and a scene. Everything that can be known before an effect is refused by its
+-- check as an ordinary Lua error ('graphicsPublishCheck'); the action then publishes, and a refusal found at the
+-- commit (a stop, a closure or an ending instance that landed since the check) is refused ordinarily too, from
+-- inside the action and before any effect ('refuseOrdinarily'): the commit is one STM transaction that reads the
+-- authority and writes the host's snapshot together, so a refusal there changed nothing. An exception (a defect of
+-- the host or the registry, a cancellation) is the application's failure and is never refused. Answers nothing to
+-- the script.
 --
 -- Its arguments cross together, so it reads them under the scene limits' call-level limits ('scenePublishLimits'):
 -- the scene's own widened by the window handle beside it, which the profile's validation guarantees room for.
@@ -336,5 +337,13 @@ graphicsPublishBinding = graphicsPublishBindingWith noPublishHooks
 graphicsPublishBindingWith ∷ ∀ target. Typeable target ⇒ PublishHooks → Text → ArgumentCheck → ScenePublisher target → SceneLimits → Leases → Binding
 graphicsPublishBindingWith hooks name precondition publisher limits leases =
   withArgumentLimits (scenePublishLimits limits) $
-    withArgumentCheck (graphicsPublishCommit hooks precondition publisher limits leases) $
-      stateOperation name [SCapability windowHandleType, sceneSchema] [] (\_ → pure [])
+    withArgumentCheck (graphicsPublishCheck precondition publisher limits leases) $
+      stateOperation name [SCapability windowHandleType, sceneSchema] [] $ \case
+        [VCapability window, scene] →
+          prepareScene limits leases scene >>= \case
+            Left refusal → refuseOrdinarily (refusalReasonText refusal)
+            Right prepared →
+              publishSceneWith hooks publisher (capabilityKey window) prepared >>= \case
+                Published → pure []
+                Refused refusal → refuseOrdinarily (publishRefusalText refusal)
+        _ → refuseOrdinarily "publishing takes a window and a scene"
