@@ -572,7 +572,7 @@ reservation of its own: it composes theirs. What it adds are four checks, each m
 | role, phase and admission | decided once, in the CPU facade, for acquisition and publication; release reads only the instance and its role |
 | owners | looked up by the instance identity the facade issued; an instance with none declared is an engine defect, not a Lua error |
 | lifecycle races after the check | `TextureRefused` and `WindowRefused` come back from the admission with nothing reserved and are raised with `refuseOrdinarily`; a publication reads the session's admission (`gvTakesWork`, folded into the publisher's own authority by `publisherGatedBy`) in the very transaction that commits it, so a stop that lands between the binding's check and the commit refuses the whole scene and leaves the previous one |
-| releasing a handle | the binding's argument check (`gsReleaseCheck`) refuses another instance's lease and a lease of another kind as an ordinary error before the release path; a lease that has already ended is the release path's own to answer (`already_released`) |
+| releasing a handle | the binding's argument check (`gsReleaseCheck`) refuses, as an ordinary error before the release path, a handle another instance was issued (live, retiring or completely retired: the issuing instance is recorded by `gsIssued` when the texture is taken, because the collection deletes a retired lease's slot) and a lease of another kind; a handle of the calling instance that has already ended is the release path's own to answer (`already_released`). The record holds one entry for each texture the VM's instances were given, for the VM's lifetime |
 | lease headroom | derived above; the capacity is a function of the profile, not a constant |
 
 ### Tests
@@ -583,6 +583,7 @@ reservation of its own: it composes theirs. What it adds are four checks, each m
   common-entry example in both completion orders; the unread and the caught clean window-creation refusal (`required_request`, `request`);
   a genuine native close with the startup gate closed; a full bank answering busy; an occupied window slot; a repeated release; the
   segment after a quit; and an optional and a required missing texture.
+* `lua-engine-graphics-tests`, `graphics facade, two instances of one VM`: two presentation instances of one VM composed directly (the session harness's second instance is private) through `graphicsInjection`: one ends through Haskell, the survivor publishes again with its own window and texture, and the ended one's handle, even completely retired, and facade are refused to it.
 * `lua-engine-tests` (`test.lua-engine`), `graphics calls`: the CPU facade's rules over gated services.
 * `lua-engine-graphics-native-tests` (`test.vulkan-lua-engine-native`), subgroup `graphics facade`: the quad example and a failing-logical
   variant on the production host with real PNG decoding, GPU-ready textures, windows and publication, judged by the host's frame events and
