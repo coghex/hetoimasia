@@ -15,6 +15,7 @@ module Test.Engine.Console.Support
     -- * Children
   , Child
   , withChild
+  , withChildOf
   , awaitMarker
   , sendSignal
   , awaitExit
@@ -101,10 +102,15 @@ data Child = Child
 -- | Run the executable as a child with its stdout and stderr on pipes, and always, on every way out,
 -- kill it with @SIGKILL@ if it is still running and reap it.
 withChild ∷ [(String, String)] → [String] → (Child → IO a) → IO a
-withChild variables arguments = bracket start finish
+withChild = withChildOf consoleExecutable
+
+-- | 'withChild' of the executable this action names: the suite's own binary, for the examples that run the
+-- command's composition as a child of their own.
+withChildOf ∷ IO FilePath → [(String, String)] → [String] → (Child → IO a) → IO a
+withChildOf locate variables arguments = bracket start finish
   where
     start = do
-      executable ← consoleExecutable
+      executable ← locate
       controlled ← controlledEnvironment variables
       (_, out, errors, process) ←
         createProcess (proc executable arguments) {env = Just controlled, std_in = NoStream, std_out = CreatePipe, std_err = CreatePipe}

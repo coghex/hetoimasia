@@ -1,0 +1,6 @@
+{
+  "format": 1,
+  "id": "example_game",
+  "entry": "lua/main.lua",
+  "tick_seconds": "0.01"
+}

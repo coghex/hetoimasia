@@ -29,6 +29,10 @@ extra-source-files:
     test/lua-examples/looped.lua
     test/lua-examples/oneshot.lua
     test/lua-examples/watcher.lua
+    samples/lua-quad/content/hetoimasia.json
+    samples/lua-quad/content/lua/main.lua
+    samples/lua-quad/content/images/quad.png
+    samples/lua-quad/tools/generate_quad_png.py
     .github/workflows/ci-image.yml
     .github/workflows/review-gate.yml
     .github/workflows/validation.yml
@@ -79,6 +83,17 @@ source-repository head
     type: git
     location: https://github.com/coghex/hetoimasia.git
 
+-- Whether to build the full product: the generic `run GAME_ROOT` command, its private `run` library, the full
+-- build of the root suite and the `run-native-tests` component. Only `cabal.project.vulkan` turns it on. With it
+-- off (the default, and what `cabal.project` and `cabal.project.cpu` leave it) the `run` library is not
+-- buildable and contributes no dependency, the executable has no `run` command and no help entry for one, and
+-- nothing in the build resolves the Lua-first engine's graphics adapter, GLFW or Vulkan. This is build
+-- selection, not a runtime fallback: there is no second command, no fake provider and no option that picks one.
+flag full-product
+    description: Build the generic run command with its production native graphics
+    default: False
+    manual: True
+
 common language
     default-language: GHC2024
     default-extensions: UnicodeSyntax OverloadedStrings
@@ -107,11 +122,63 @@ library console
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-scripting-lua:runtime-lua
 
+-- The generic `run` command (LFE-22): its pure grammar and status rules, the preparation of the folder, the
+-- session composition and the production native graphics. Private, in a source directory of its own so no
+-- source file is shared between components, and buildable only in the full product, so a default or CPU build
+-- neither resolves nor links the graphics adapter, GLFW or Vulkan.
+library run
+    import: language
+    visibility: private
+    hs-source-dirs: run
+    if flag(full-product)
+        exposed-modules:
+            Hetoimasia.Run
+            Hetoimasia.Run.Boot
+            Hetoimasia.Run.Graphics
+            Hetoimasia.Run.Options
+            Hetoimasia.Run.Output
+            Hetoimasia.Run.Session
+            Hetoimasia.Run.Signals
+            Hetoimasia.Run.Status
+        build-depends:
+            base >=4.22 && <4.23,
+            bytestring >=0.12 && <0.13,
+            stm >=2.5.3 && <2.6,
+            text >=2.1 && <2.2,
+            unix >=2.8 && <2.9,
+            hetoimasia:console,
+            hetoimasia-content ==0.1.0.0,
+            hetoimasia-foundation ==0.1.0.0,
+            hetoimasia-glfw ==0.1.0.0,
+            hetoimasia-glfw:runtime-glfw ==0.1.0.0,
+            hetoimasia-glfw:vulkan-interop ==0.1.0.0,
+            hetoimasia-gpu-vulkan-diagnostics ==0.1.0.0,
+            hetoimasia-gpu-vulkan-glfw ==0.1.0.0,
+            hetoimasia-lua-engine ==0.1.0.0,
+            hetoimasia-lua-engine:facade,
+            hetoimasia-lua-engine:session,
+            hetoimasia-lua-engine:texture,
+            hetoimasia-lua-engine-graphics,
+            hetoimasia-runtime ==0.1.0.0,
+            hetoimasia-scripting-lua ==0.1.0.0,
+            hetoimasia-scripting-lua:runtime-lua
+    else
+        buildable: False
+
+-- The entry point. `app/` is the dispatch; the one module that differs between the two builds, which says
+-- whether `run` is a command and how it is run, is in the source directory of its own build: `app-full/` names
+-- the `run` library and `app-cpu/` names nothing, so the default build has the console command set it always had.
 executable hetoimasia
     import: language
     main-is: Main.hs
     hs-source-dirs: app
+    other-modules: Hetoimasia.App.Run
     ghc-options: -threaded -rtsopts
+    if flag(full-product)
+        hs-source-dirs: app-full
+        build-depends: hetoimasia:run
+    else
+        hs-source-dirs: app-cpu
     build-depends:
         base >=4.22 && <4.23,
         hetoimasia:console,
@@ -180,6 +247,11 @@ test-suite wayland-helper-tests
         process >=1.6 && <1.7,
         temporary >=1.3 && <1.4
 
+-- The root suite. Its source directories are `test/` (the console examples, in every build) and the one that
+-- belongs to the build: `test-cpu/` has nothing to add, and `test-full/` holds the examples of the `run` command
+-- (its grammar, its status and signal rules, the composition over real content, roles, failures and exits, and the
+-- built executable's usage and boot refusals), none of which acquires a native session. The full build of this
+-- suite is registered in a Vulkan-project group with the root console and the shipped content as inputs.
 test-suite hetoimasia-tests
     import: language
     type: exitcode-stdio-1.0
@@ -187,6 +259,7 @@ test-suite hetoimasia-tests
     hs-source-dirs: test
     other-modules:
         Test.Engine.Spec
+        Test.Engine.Variant
         Test.Engine.Console.Spec
         Test.Engine.Console.Support
         Test.Engine.Console.Lua.Options
@@ -195,6 +268,27 @@ test-suite hetoimasia-tests
         Test.Engine.Console.Lua.Status
     ghc-options: -threaded -rtsopts
     build-tool-depends: hetoimasia:hetoimasia
+    if flag(full-product)
+        hs-source-dirs: test-full
+        other-modules:
+            Test.Engine.Run.Child
+            Test.Engine.Run.Compose
+            Test.Engine.Run.Options
+            Test.Engine.Run.Process
+            Test.Engine.Run.Spec
+            Test.Engine.Run.Status
+            Test.Engine.Run.Support
+        build-depends:
+            bytestring >=0.12 && <0.13,
+            hetoimasia:run,
+            hetoimasia-content ==0.1.0.0,
+            hetoimasia-lua-engine ==0.1.0.0,
+            hetoimasia-lua-engine:facade,
+            hetoimasia-lua-engine:session,
+            hetoimasia-runtime ==0.1.0.0,
+            hetoimasia-scripting-lua ==0.1.0.0
+    else
+        hs-source-dirs: test-cpu
     build-depends:
         base >=4.22 && <4.23,
         directory >=1.3 && <1.4,
@@ -233,3 +327,49 @@ test-suite lua-forced-exit-probe
         unix >=2.8 && <2.9,
         hetoimasia-foundation ==0.1.0.0,
         hetoimasia-test-support ==0.1.0.0
+
+-- The generic run command on a real device, in the group `test.vulkan-run-native`: the command's production
+-- composition (real providers, real windows, finite temporary Lua fixtures and an unchanged copy of the shipped
+-- content) observed through the host's public lifecycle, with a genuine native close delivered through the platform;
+-- and, on Linux, the built full-product `hetoimasia run` command as a child of the suite, ended by one SIGTERM. It
+-- follows the native-suite rules (consent read once, GLFW on the process main thread with Hspec on another),
+-- reimplemented here because AGENTS.md forbids importing another component's spec helpers. Full product only: its
+-- executable and the full `hetoimasia` executable it launches are built in the group's preparation stage and run,
+-- without being built, by `tools/vulkan/run.sh native`, which names the executable in HETOIMASIA_RUN_EXECUTABLE.
+test-suite run-native-tests
+    import: language
+    type: exitcode-stdio-1.0
+    main-is: Main.hs
+    hs-source-dirs: run-native-test
+    ghc-options: -threaded -rtsopts
+    build-tool-depends: hetoimasia:hetoimasia
+    if flag(full-product)
+        other-modules:
+            Test.Run.Native.Command
+            Test.Run.Native.Consent
+            Test.Run.Native.Env
+            Test.Run.Native.Library
+        build-depends:
+            base >=4.22 && <4.23,
+            bytestring >=0.12 && <0.13,
+            containers >=0.8 && <0.9,
+            directory >=1.3 && <1.4,
+            filepath >=1.5 && <1.6,
+            hspec >=2.11 && <3,
+            process >=1.6 && <1.7,
+            stm >=2.5.3 && <2.6,
+            temporary >=1.3 && <1.4,
+            text >=2.1 && <2.2,
+            time >=1.15 && <1.16,
+            unix >=2.8 && <2.9,
+            hetoimasia:run,
+            hetoimasia-foundation ==0.1.0.0,
+            hetoimasia-glfw ==0.1.0.0,
+            hetoimasia-glfw:native-check ==0.1.0.0,
+            hetoimasia-glfw:runtime-glfw ==0.1.0.0,
+            hetoimasia-gpu-vulkan-glfw ==0.1.0.0,
+            hetoimasia-lua-engine ==0.1.0.0,
+            hetoimasia-lua-engine:facade,
+            hetoimasia-lua-engine-graphics
+    else
+        buildable: False

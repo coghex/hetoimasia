@@ -1,9 +1,11 @@
 -- The Vulkan project: the native backend package, the window integration
 -- package with its native suite, the 2D renderer's Vulkan recorder (R2D-7), the
 -- triangle sample (VK-17), the sprites sample (GRS-8), the scene3d sample
--- (GRS-10), the Lua-first engine's graphics adapter (LFE-17), and the GLFW
--- package with its Vulkan interop component enabled — the only project file
--- that names the first six or turns that component on.
+-- (GRS-10), the Lua-first engine's graphics adapter (LFE-17), the root package
+-- with its full-product flag on (LFE-22: the generic `run` command, its private
+-- `run` library and the `run-native-tests` component), and the GLFW package with
+-- its Vulkan interop component enabled — the only project file that names the
+-- first six, turns that component on or turns the full product on.
 --
 -- `cabal.project` and `cabal.project.cpu` deliberately do not list
 -- `packages/gpu-vulkan/native`, `packages/gpu-vulkan/glfw`,
@@ -40,6 +42,7 @@
 import: cabal.project.common
 
 packages:
+  .
   packages/gpu-vulkan/native
   packages/gpu-vulkan/glfw
   packages/render-2d-vulkan
@@ -73,6 +76,13 @@ packages:
 -- everywhere else.
 package hetoimasia-glfw
   flags: +vulkan-interop
+
+-- The root package's full product (LFE-22): the generic `run` command with the
+-- production native graphics, and the full build of the root suite. Off in
+-- `cabal.project` and `cabal.project.cpu`, whose console command set is
+-- unchanged and which resolve nothing of the graphics.
+package hetoimasia
+  flags: +full-product
 
 -- The flags docs/toolchain.md qualified, restated here because a constraint is
 -- what actually reaches the dependency: `safe-foreign-calls` so a Vulkan call

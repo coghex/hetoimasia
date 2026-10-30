@@ -4,6 +4,7 @@ import Control.Monad (void)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.IO as Text
+import Hetoimasia.App.Run (helpEntry, runCommand, usageAlternative)
 import Hetoimasia.Console.Exit (exitOnFailure)
 import Hetoimasia.Console.Lua (runLua)
 import Hetoimasia.Console.Usage (diagnosticText, usageFailure)
@@ -38,6 +39,8 @@ main = exitOnFailure $ do
     ["--resource-smoke"] → resourceSmokePath logFilter
     ["--help"] → Text.putStr help
     "lua" : rest → runLua logFilter rest
+    -- The command of the full-product build only; the default build has none, so there `run` is unknown.
+    "run" : rest | Just launch ← runCommand → launch logFilter rest
     argument : _ → usageError ("unknown argument '" <> Text.unpack (diagnosticText argument) <> "'")
 
 -- | The three variables this console application reads its logging
@@ -66,10 +69,10 @@ usageError reason = usageFailure "hetoimasia: " usage (Text.pack reason)
 -- stdout and stays visible at any configured threshold. The usage line is the
 -- one a usage error writes to stderr.
 usage ∷ Text
-usage = "Usage: hetoimasia [--smoke | --resource-smoke | --help | lua OPTIONS]"
+usage = "Usage: hetoimasia [--smoke | --resource-smoke | --help | lua OPTIONS" <> usageAlternative <> "]"
 
 help ∷ Text
-help = Text.unlines
+help = Text.unlines $
   [ usage
   , ""
   , "  --smoke           Log one entry through the runtime and exit."
@@ -90,7 +93,10 @@ help = Text.unlines
   , "                      --ticks N            stop after N ticks"
   , "                    See 'hetoimasia lua --help' and packages/scripting-lua/README.md,"
   , "                    The command line."
-  , ""
+  ]
+  <> helpEntry
+  <>
+  [ ""
   , "Exit status: 0 success, 1 failure, 2 invalid usage, 130 interrupted."
   , ""
   , "Logging is configured from the environment, read once at startup. An"
