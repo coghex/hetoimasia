@@ -347,6 +347,7 @@ test-suite lua-engine-tests
         Test.LuaEngine.Facade.Clocks
         Test.LuaEngine.Facade.Control
         Test.LuaEngine.Facade.Spec
+        Test.LuaEngine.Facade.Graphics
         Test.LuaEngine.Facade.Imports
         Test.LuaEngine.Facade.Limits
         Test.LuaEngine.Facade.Output

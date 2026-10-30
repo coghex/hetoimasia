@@ -15,7 +15,7 @@ module Test.LuaEngine.Graphics.Facade (spec) where
 
 import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
-import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVarIO, retry)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
 import Control.Exception (SomeException, finally, throwIO, try)
 import Control.Monad (forM_, forever, unless, void)
 import Data.ByteString (ByteString)
@@ -55,6 +55,8 @@ data FS = FS
   , fsRig ∷ !Rig
   , fsWindows ∷ !WF.Fake
   , fsModel ∷ !Model
+  , fsOut ∷ !(TVar [Text])
+  -- ^ What the roles printed, oldest first.
   , fsGate ∷ !(MVar ())
   -- ^ Held by the output sink's first line when the example asked for it: the authored output parks the role's @init@.
   }
@@ -81,7 +83,7 @@ spec = describe "graphics facade" $ do
       fmap sceneSpriteCount scene `shouldBe` Just 1
       -- The scene is accepted and adopted, and Lua released its texture right after publishing it: the adopted scene
       -- keeps the image registered, and the release has not run.
-      Fake.eventCount (rigFake (fsRig fs)) "released" `shouldReturn` 0
+      releasedCount fs `shouldReturn` 0
       requestStop (fsSession fs) StopQuit
     outVerdict outcome `shouldBe` VerdictSuccess
     outQuit outcome `shouldBe` True
@@ -134,6 +136,47 @@ spec = describe "graphics facade" $ do
     outQuit outcome `shouldBe` True
     outFailures outcome `shouldBe` []
     outRetired outcome `shouldBe` True
+
+  it "answers a texture request that finds a bank full with exactly nil and the busy record, and leaves the session healthy" $ do
+    outcome ← runFacade ((defaultShape fillTextures) {shapeBoth = False}) $ \fs → do
+      awaitLine fs "fill\t17\ttrue\tbusy"
+      requestStop (fsSession fs) StopQuit
+    outVerdict outcome `shouldBe` VerdictSuccess
+    outFailures outcome `shouldBe` []
+
+  it "refuses a second window request of an instance as an ordinary error, caught, with the first window unharmed" $ do
+    outcome ← runFacade ((defaultShape secondWindow) {shapeBoth = False}) $ \fs → do
+      awaitLine fs "second\tfalse\ttrue"
+      requestStop (fsSession fs) StopQuit
+    outVerdict outcome `shouldBe` VerdictSuccess
+    outFailures outcome `shouldBe` []
+
+  it "answers a repeated texture release retiring and then already_released, without repeating the cleanup" $ do
+    outcome ← runFacade ((defaultShape repeatedRelease) {shapeBoth = False, shapeTexture = Fake.defaultFakeConfig {Fake.fcInitialHolds = [Fake.HoldReclaim]}}) $ \fs → do
+      awaitLine fs "release\tretiring"
+      releasedCount fs >>= (`shouldSatisfy` (<= 1))
+      Fake.release (rigFake (fsRig fs)) Fake.HoldReclaim
+      awaitLine fs "release\talready_released"
+      releasedCount fs `shouldReturn` 1
+      requestStop (fsSession fs) StopQuit
+    outVerdict outcome `shouldBe` VerdictSuccess
+    outFailures outcome `shouldBe` []
+
+  it "refuses new acquisition after quit in the same segment while quit stays idempotent, and the session still ends as a quit" $ do
+    outcome ← runFacade ((defaultShape afterQuit) {shapeBoth = False}) $ \fs → awaitLine fs "after\tfalse\tfalse\ttrue\ttrue"
+    outVerdict outcome `shouldBe` VerdictSuccess
+    outQuit outcome `shouldBe` True
+    outFailures outcome `shouldBe` []
+
+-- | How many native releases of a table handle the texture owner ran.
+releasedCount ∷ FS → IO Int
+releasedCount fs = length . filter (Text.isPrefixOf "released ") <$> Fake.events (rigFake (fsRig fs))
+
+-- | Block until the roles printed exactly this line.
+awaitLine ∷ FS → Text → IO ()
+awaitLine fs wanted = atomically $ do
+  seen ← readTVar (fsOut fs)
+  unless (wanted `elem` seen) retry
 
 -- | The scene's sprites, for an example's assertion.
 sceneSpriteCount ∷ a → Int
@@ -199,7 +242,7 @@ runFacade shape scenario = bounded . withRig (shapeTexture shape) $ \rig → do
               ( do
                   found ← readMVar handle
                   writeIORef sessionRef (Just found)
-                  let fs = FS found rig windows model gate
+                  let fs = FS found rig windows model outLines gate
                   attempted ←
                     try @SomeException $
                       timeout 8000000 (scenario fs) >>= \case
@@ -399,4 +442,64 @@ parkedOpen =
     , "      print(\"parked\")"
     , "    end,"
     , "    update=function(self, dt) end"
+    ]
+
+-- | Seventeen texture requests in one init: some are accepted and, once a bank is full, the rest are that bank's busy answer.
+fillTextures ∷ ByteString
+fillTextures =
+  presentationOnly
+    [ "    init=function(self, api)"
+    , "      local accepted, busy, code = 0, 0, ''"
+    , "      for i = 1, 17 do"
+    , "        local r, e = api.content.texture('images/quad.png')"
+    , "        if r then accepted = accepted + 1 else busy = busy + 1 code = e.code end"
+    , "      end"
+    , "      print('fill', accepted + busy, busy >= 1 and accepted >= 8, code)"
+    , "    end,"
+    , "    update=function(self, dt) end"
+    ]
+
+-- | A second window request while the first is pending: an ordinary error a script catches.
+secondWindow ∷ ByteString
+secondWindow =
+  presentationOnly
+    [ "    init=function(self, api)"
+    , "      self.first = api.window.open({title='a', width=64, height=64})"
+    , "      local ok, err = pcall(api.window.open, {title='b', width=64, height=64})"
+    , "      print('second', ok, tostring(err):find('already has a window') ~= nil)"
+    , "    end,"
+    , "    update=function(self, dt) end"
+    ]
+
+-- | A texture taken and released on every update: the answer changes as the retirement proceeds.
+repeatedRelease ∷ ByteString
+repeatedRelease =
+  presentationOnly
+    [ "    init=function(self, api) self.t = api.content.texture('images/quad.png') end,"
+    , "    update=function(self, dt)"
+    , "      local api = self.api"
+    , "      if not self.tex then"
+    , "        if not api.request.ready(self.t) then return end"
+    , "        self.tex = api.request.take(self.t).value.texture"
+    , "      end"
+    , "      local answer = api.texture.release(self.tex)"
+    , "      if answer ~= self.last then self.last = answer print('release', answer) end"
+    , "    end"
+    ]
+
+-- | Quit, then statements in the same segment: acquisition is refused as ordinary errors, a second quit changes nothing.
+afterQuit ∷ ByteString
+afterQuit =
+  presentationOnly
+    [ "    init=function(self, api) end,"
+    , "    update=function(self, dt)"
+    , "      local api = self.api"
+    , "      if self.done then return end"
+    , "      self.done = true"
+    , "      api.session.quit()"
+    , "      api.session.quit()"
+    , "      local ok1, e1 = pcall(api.content.texture, 'images/quad.png')"
+    , "      local ok2, e2 = pcall(api.window.open, {title='t', width=1, height=1})"
+    , "      print('after', ok1, ok2, tostring(e1):find('stopping') ~= nil, tostring(e2):find('stopping') ~= nil)"
+    , "    end"
     ]
