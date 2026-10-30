@@ -14,7 +14,7 @@ module Test.LuaEngine.Graphics.Peers (spec) where
 
 import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, retry, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (finally)
 import Control.Monad (forM_, forever, unless, void)
 import Data.ByteString (ByteString)
@@ -75,6 +75,7 @@ data Peers = Peers
   , peSignal ∷ !(TVar Bool)
   -- ^ What the fake session's status says is stopping: the example's one-way word to the survivor.
   , peAdmit ∷ !(IO Spawned)
+  , peFake ∷ !Fake.Fake
   }
 
 -- | An instance admitted to the VM.
@@ -85,7 +86,9 @@ data Spawned = Spawned
   }
 
 spec ∷ Spec
-spec = describe "graphics facade, two instances of one VM" $
+spec = describe "graphics facade, two instances of one VM" $ do
+  boundSpec
+  evictedSpec
   it "leaves a surviving instance's window and texture usable and publishable when its peer ends, cleans the owner map for the one that ended, and refuses the peer's handle, even once its texture has retired" $
     withPeers $ \peers → do
       first ← peAdmit peers
@@ -117,8 +120,103 @@ spec = describe "graphics facade, two instances of one VM" $
       forgetInstance (peFacade peers) (spIdentity second)
       atomically (providerReading (peProvider peers) >>= \found → unless (readingAcquisitions found == 0) retry)
 
+-- | The most recent handles a VM remembers the issuing instance of, exceeded through the production injection: the memory
+-- here is three ('gfIssuedMemory', the field the production composition sets to 'defaultIssuedMemory'), and the survivor
+-- issues six textures in all. Inside the record a peer's retired handle is an ordinary error; once it has left the record
+-- it answers @already_released@ with no provider action and no effect on a live texture; the owner's own releases answer
+-- the same on both sides of the bound.
+boundSpec ∷ Spec
+boundSpec =
+  it "refuses a peer's retired handle while it is remembered and answers already_released once it has left the record, with no provider action and no alias, and releases an instance's own handles alike on both sides of the bound" $
+    withPeersWith boundEntry 3 $ \peers → do
+      first ← peAdmit peers
+      second ← peAdmit peers
+      awaitLine peers "issued\t1"
+      awaitLine peers "issued\t2"
+      -- The first instance ends and is forgotten; its texture retires completely (the fake has released it), so that its
+      -- lease is gone from the host and only the record can tell whose handle it was.
+      stop peers first
+      _ ← waitInstance (spTicket first)
+      forgetInstance (peFacade peers) (spIdentity first)
+      Fake.awaitEvent (peFake peers) "released "
+      atomically (writeTVar (peSignal peers) True)
+      awaitLine peers "finished"
+      seen ← readTVarIO (peOut peers)
+      let answers label = [Text.splitOn "\t" line | line ← seen, Just _ ← [Text.stripPrefix (label <> "\t") line]]
+      -- inside the record (the first's handle and the survivor's own are both remembered): the peer's handle is refused
+      answers "inside" `shouldBe` [["inside", "false", "true"]]
+      -- the survivor's own handle, inside the record, answers its release and then already_released
+      map (!! 2) (answers "own_inside") `shouldBe` ["already_released"]
+      map (!! 1) (answers "own_inside") `shouldSatisfy` all (`elem` ["done", "retiring"])
+      -- six textures were issued and three are remembered: the peer's handle (the oldest) has left the record
+      answers "outside" `shouldBe` [["outside", "true", "already_released"]]
+      -- the survivor's own handles outside the record: a retired one answers already_released at once, and a live one is
+      -- still live (the answer for the peer's handle aliased nothing) and is released once
+      answers "own_outside_retired" `shouldBe` [["own_outside_retired", "already_released", "already_released"]]
+      map (!! 1) (answers "own_outside_live") `shouldSatisfy` all (`elem` ["done", "retiring"])
+      map (!! 2) (answers "own_outside_live") `shouldBe` ["already_released"]
+      -- six textures, each released by the provider exactly once: neither the peer's handle nor any repeated release of
+      -- an instance's own reached the provider
+      fakeEvents ← Fake.events (peFake peers)
+      length (filter (Text.isPrefixOf "released ") fakeEvents) `shouldBe` 6
+      stop peers second
+      _ ← waitInstance (spTicket second)
+      forgetInstance (peFacade peers) (spIdentity second)
+
+-- | A handle that has left the record is not thereby retired: the host's own record of the lease decides while it holds one.
+-- A peer's texture that is live, and then released but held by the host's adopted scene (retiring), is still refused to
+-- the other instance once more than the memory of later textures have been issued, as an ordinary error with no provider
+-- action; the peer stays healthy; and the owner's first release of that texture, out of the record, answers @retiring@,
+-- revokes its authority for new scenes and leaves the provider's release for when the scene lets go.
+evictedSpec ∷ Spec
+evictedSpec =
+  it "refuses a peer's live and scene-held texture after its issuance has left the record, with no provider action, and answers the owner's first release outside the record as a release" $
+    withPeersWith evictedEntry 3 $ \peers → do
+      first ← peAdmit peers
+      second ← peAdmit peers
+      awaitLine peers "published\t1"
+      awaitRevision (peModel peers) 2 1
+      -- The host adopts the scene that holds the texture, so that its release can only retire when the scene lets go.
+      _ ← adoptNow (peModel peers) 2
+      atomically (writeTVar (peSignal peers) True)
+      awaitLine peers "finished"
+      seen ← readTVarIO (peOut peers)
+      let answers label = [Text.splitOn "\t" line | line ← seen, Just _ ← [Text.stripPrefix (label <> "\t") line]]
+      -- the texture is live and four later ones were issued: the peer's call is refused, an ordinary error
+      answers "evicted_live" `shouldBe` [["evicted_live", "false", "true"]]
+      -- the owner's first release, outside the record: a release (the scene holds the texture, so retiring), and its
+      -- authority for a new scene is gone
+      answers "owner_first" `shouldBe` [["owner_first", "retiring"]]
+      answers "revoked" `shouldBe` [["revoked", "false"]]
+      -- released but held, and outside the record: still the host's lease, and still refused to the peer; and the peer
+      -- goes on (its next texture loaded and released)
+      answers "evicted_held" `shouldBe` [["evicted_held", "false", "true"]]
+      map (!! 2) (answers "healthy") `shouldBe` ["already_released"]
+      -- five textures were released by the provider (the peer's four and its next), and none for the peer's calls: the held
+      -- texture is not among them, and neither refusal reached the provider
+      fakeEvents ← Fake.events (peFake peers)
+      length (filter (Text.isPrefixOf "released ") fakeEvents) `shouldBe` 5
+      -- the held texture retires when the scene lets go
+      dissolve (peModel peers)
+      let settle found = do
+            settled ← waitInstance (spTicket found)
+            case resultOutcome settled of
+              InstanceStopped → pure ()
+              other → assertFailure ("expected the instance stopped, found " <> take 200 (show other))
+            leasesFailed (resultLeases settled) `shouldBe` 0
+            forgetInstance (peFacade peers) (spIdentity found)
+      stop peers first
+      removeWindow (peModel peers) 2
+      settle first
+      stop peers second
+      settle second
+
 withPeers ∷ (Peers → IO a) → IO a
-withPeers body = bounded . withRig Fake.defaultFakeConfig $ \rig → do
+withPeers = withPeersWith peersEntry defaultIssuedMemory
+
+-- | The same composition with the given entry module and the given number of issued handles remembered.
+withPeersWith ∷ ByteString → Int → (Peers → IO a) → IO a
+withPeersWith entry issuedMemory body = bounded . withRig Fake.defaultFakeConfig $ \rig → do
   let fake = rigFake rig
   model ← newModel (fakeLedger fake)
   setBarrier fake (modelCapture model)
@@ -126,12 +224,12 @@ withPeers body = bounded . withRig Fake.defaultFakeConfig $ \rig → do
   windows ← WF.newFake WF.defaultFakeConfig
   textures ← newTextures
   let config = WindowConfig 2 (pure ()) (\_ → pure ())
-      files = [("lua/main.lua", peersEntry), ("lua/share.lua", "return {apis = {}, handles = {}}"), ("images/quad.png", Png.solid 2 2 (200, 100, 50, 255))]
+      files = [("lua/main.lua", entry), ("lua/share.lua", "return {apis = {}, handles = {}}"), ("images/quad.png", Png.solid 2 2 (200, 100, 50, 255))]
   withComposition compositionProfile files (rigPort rig) $ \composition control runtime →
     withWindowProvider config (retarget (WF.fakePort windows)) $ \provider →
       ( do
           let publisher = scenePublisherOver textures provider (\window scene → fst (modelTarget model window) scene) (\window → snd (modelTarget model window))
-              injection = graphicsInjection (GraphicsFacade compositionProfile (cpPipeline composition) provider publisher noPublishHooks defaultIssuedMemory)
+              injection = graphicsInjection (GraphicsFacade compositionProfile (cpPipeline composition) provider publisher noPublishHooks issuedMemory)
               profile = compositionProfile
               inventory = cpInventory composition
           handles ← newRequestHandles
@@ -220,7 +318,7 @@ withPeers body = bounded . withRig Fake.defaultFakeConfig $ \rig → do
                   admitBehaviorInstance (scheduledEndpoint owner) request >>= \case
                     InstanceAccepted identity ticket → pure (Spawned (declaredId declared) identity ticket)
                     other → assertFailure ("expected the instance accepted, found " <> take 100 (show other))
-            ( mainLoop provider (body (Peers facade owner model provider out signal admit))
+            ( mainLoop provider (body (Peers facade owner model provider out signal admit fake))
                 -- (however the body ended, the host model lets go of every adoption first, so that the instances' textures can retire)
                 `finally` (dissolve model >> WF.releaseAll windows >> retireAndAwait control owner)
               )
@@ -338,3 +436,154 @@ peersEntry =
     , "  }"
     , "}"
     ]
+
+-- | One entry for both instances, for the bounded record: the first loads a texture and exports its handle; the second
+-- (once it has the handle) loads its own, waits for the example's word that the first is gone, tries the first's handle
+-- (the record still holds it), releases its own, loads and releases three more so that six handles were issued in all,
+-- tries the first's handle again (it has left the record), and releases its own handles that are retired and live.
+boundEntry ∷ ByteString
+boundEntry =
+  Text.encodeUtf8 . Text.unlines $
+    planHelpers
+      <>
+    [ "add(function(self, api) return share.handles[1] ~= nil end)"
+    , "load('t2')"
+    , "add(function(self, api) print('issued', 2); return true end)"
+    , "add(function(self, api) return api.session.status().stopping end)"
+    , "add(function(self, api)"
+    , "  local ok, e = pcall(api.texture.release, share.handles[1])"
+    , "  print('inside', ok, tostring(e):find('belongs to another instance') ~= nil)"
+    , "  return true"
+    , "end)"
+    , "drain('t2', 'own_inside')"
+    , "load('t3')"
+    , "load('t4'); drain('t4', 'churn')"
+    , "load('t5'); drain('t5', 'churn')"
+    , "load('t6'); drain('t6', 'churn')"
+    , "add(function(self, api)"
+    , "  local ok, answer = pcall(api.texture.release, share.handles[1])"
+    , "  print('outside', ok, answer)"
+    , "  return true"
+    , "end)"
+    , "drain('t2', 'own_outside_retired')"
+    , "drain('t3', 'own_outside_live')"
+    , "add(function(self, api) print('finished'); return true end)"
+    , "return {"
+    , "  presentation = {"
+    , "    every_seconds = 0.02,"
+    , "    init = function(self, api)"
+    , "      self.my = #share.apis + 1"
+    , "      share.apis[self.my] = api"
+    , "      self.n = 1"
+    , "      if self.my == 1 then self.q = api.content.texture(PATH) end"
+    , "    end,"
+    , "    update = function(self, dt)"
+    , "      local api = self.api"
+    , "      if self.my == 1 then"
+    , "        if not self.done and api.request.ready(self.q) then"
+    , "          self.done = true"
+    , "          share.handles[1] = api.request.take(self.q).value.texture"
+    , "          print('issued', 1)"
+    , "        end"
+    , "        return"
+    , "      end"
+    , "      local step = plan[self.n]"
+    , "      if step and step(self, api) then self.n = self.n + 1 end"
+    , "    end"
+    , "  }"
+    , "}"
+    ]
+
+-- | The Lua the bounded-record entries share: a plan of steps the second instance runs one a time, one per update, a step
+-- being done when it answers true. @load@ takes a texture into the instance; @drain@ releases a handle, one call to an
+-- update, until the answer is already_released, and prints the label, the first answer and the last.
+planHelpers ∷ [Text]
+planHelpers =
+  [ "local share = import('lua/share.lua')"
+  , "local PATH = 'images/quad.png'"
+  , "local plan = {}"
+  , "local function add(f) plan[#plan + 1] = f end"
+  , "local function load(name)"
+  , "  add(function(self, api) self.q = api.content.texture(PATH); return true end)"
+  , "  add(function(self, api)"
+  , "    if not api.request.ready(self.q) then return false end"
+  , "    self[name] = api.request.take(self.q).value.texture"
+  , "    return true"
+  , "  end)"
+  , "end"
+  , "local function drain(name, label)"
+  , "  add(function(self, api)"
+  , "    local answer = api.texture.release(self[name])"
+  , "    self.firsts = self.firsts or {}"
+  , "    self.firsts[label] = self.firsts[label] or answer"
+  , "    if answer ~= 'already_released' then return false end"
+  , "    print(label, self.firsts[label], answer)"
+  , "    return true"
+  , "  end)"
+  , "end"
+  ]
+
+-- | One entry for both instances, for the handles that are out of the record yet still the host's: the first opens a
+-- window and publishes a scene with its texture, which the example's host adopts, then releases the texture on the
+-- second's word (the scene holds it, so it retires only later) and tries to use it again; the second, once the host has
+-- adopted the scene, loads and releases four textures (so that the first's has left a record of three), tries the first's
+-- texture while it is live, tells the first to release it, tries it again while it is released and held, and loads and
+-- releases one more to show it is well.
+evictedEntry ∷ ByteString
+evictedEntry =
+  Text.encodeUtf8 . Text.unlines $
+    planHelpers
+      <> [ "add(function(self, api) return share.handles[1] ~= nil and api.session.status().stopping end)"
+         , "for i = 1, 4 do load('c' .. i); drain('c' .. i, 'churn') end"
+         , "add(function(self, api)"
+         , "  local ok, e = pcall(api.texture.release, share.handles[1])"
+         , "  print('evicted_live', ok, tostring(e):find('belongs to another instance') ~= nil)"
+         , "  share.go = true"
+         , "  return true"
+         , "end)"
+         , "add(function(self, api)"
+         , "  if not share.released then return false end"
+         , "  local ok, e = pcall(api.texture.release, share.handles[1])"
+         , "  print('evicted_held', ok, tostring(e):find('belongs to another instance') ~= nil)"
+         , "  return true"
+         , "end)"
+         , "load('h'); drain('h', 'healthy')"
+         , "add(function(self, api) print('finished'); return true end)"
+         , "return {"
+         , "  presentation = {"
+         , "    every_seconds = 0.02,"
+         , "    init = function(self, api)"
+         , "      self.my = #share.apis + 1"
+         , "      share.apis[self.my] = api"
+         , "      self.n = 1"
+         , "      if self.my == 1 then"
+         , "        self.w = api.window.open({title = 't', width = 64, height = 64})"
+         , "        self.q = api.content.texture(PATH)"
+         , "      end"
+         , "    end,"
+         , "    update = function(self, dt)"
+         , "      local api = self.api"
+         , "      if self.my == 1 then"
+         , "        if not self.win and api.request.ready(self.w) then self.win = api.request.take(self.w).value end"
+         , "        if not self.img and api.request.ready(self.q) then self.img = api.request.take(self.q).value end"
+         , "        if not (self.win and self.img) then return end"
+         , "        local scene = {clear = {r = 1, g = 0, b = 0}, sprites = {{texture = self.img.texture, x = 0, y = 0, width = 2, height = 2}}}"
+         , "        if not self.published then"
+         , "          self.published = true"
+         , "          api.scene.publish(self.win, scene)"
+         , "          share.handles[1] = self.img.texture"
+         , "          print('published', 1)"
+         , "        elseif share.go and not self.released then"
+         , "          self.released = true"
+         , "          print('owner_first', api.texture.release(self.img.texture))"
+         , "          print('revoked', (pcall(api.scene.publish, self.win, scene)))"
+         , "          share.released = true"
+         , "        end"
+         , "        return"
+         , "      end"
+         , "      local step = plan[self.n]"
+         , "      if step and step(self, api) then self.n = self.n + 1 end"
+         , "    end"
+         , "  }"
+         , "}"
+         ]

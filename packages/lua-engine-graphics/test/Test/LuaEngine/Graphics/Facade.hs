@@ -112,6 +112,12 @@ spec = describe "graphics facade" $ do
     issuerOf 99997 issued `shouldBe` Just "inst-1"
     issuerOf 99996 issued `shouldBe` Nothing
     issuedSize (rememberIssued defaultIssuedMemory 7 "inst-2" emptyIssued) `shouldBe` 1
+    -- the documented default
+    defaultIssuedMemory `shouldBe` 4096
+    let full = foldl' (\held key → rememberIssued defaultIssuedMemory key "inst-1" held) emptyIssued [1 .. 10000]
+    issuedSize full `shouldBe` 4096
+    issuerOf 5904 full `shouldBe` Nothing
+    issuerOf 5905 full `shouldBe` Just "inst-1"
 
   it "runs the common-entry quad example through the production injection, taking each request once and publishing then releasing" $ do
     outcome ← runFacade (defaultShape quadExample) $ \fs → do
