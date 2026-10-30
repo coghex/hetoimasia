@@ -28,6 +28,12 @@
 -- Nothing here enters Lua, waits, or keeps a registry that outlives the VM it was made for.
 module Hetoimasia.LuaEngine.Graphics.Facade
   ( GraphicsFacade (..)
+  , defaultIssuedMemory
+  , Issued
+  , emptyIssued
+  , rememberIssued
+  , issuerOf
+  , issuedSize
   , graphicsInjection
   , GraphicsCompositionRefused (..)
   , facadeLeaseCapacity
@@ -102,6 +108,8 @@ data GraphicsFacade target = GraphicsFacade
   , gfPublishHooks ∷ !PublishHooks
   -- ^ The publication's test seams: 'noPublishHooks' in production. An example holds a publication between its check and
   -- its commit with them, to land a stop there.
+  , gfIssuedMemory ∷ !Int
+  -- ^ How many of the most recently issued texture handles a VM remembers the issuing instance of ('defaultIssuedMemory').
   }
 
 -- | Why a VM's graphics could not be composed: a failure of the composition, with its reason, and nothing of a
@@ -117,6 +125,35 @@ facadeLeaseCapacity profile = number TextureLeasesPerUiInstance + number WindowS
   where
     number limit = let Count n = countLimit profile limit in fromIntegral n
 
+-- | The issuing instance of the most recently issued texture handles, for the refusal of a peer's handle after its lease's
+-- slot is gone. The lease keys are issued in increasing order and never reused, so the smallest key is the oldest: when the
+-- record is full the oldest is forgotten. A forgotten handle is a retired texture's, which can alias nothing (its key is never
+-- reissued); the host's release path answers it @already_released@ whoever asks. The record is therefore bounded however many
+-- textures a VM's instances load and release.
+newtype Issued = Issued (Map Word64 Text)
+
+emptyIssued ∷ Issued
+emptyIssued = Issued Map.empty
+
+-- | Remember an issuance, forgetting the oldest while more than this many are held.
+rememberIssued ∷ Int → Word64 → Text → Issued → Issued
+rememberIssued bound key identity (Issued held) = Issued (trim (Map.insert key identity held))
+  where
+    trim found
+      | Map.size found > max 1 bound = trim (Map.deleteMin found)
+      | otherwise = found
+
+-- | The instance a handle was issued to, while it is remembered.
+issuerOf ∷ Word64 → Issued → Maybe Text
+issuerOf key (Issued held) = Map.lookup key held
+
+issuedSize ∷ Issued → Int
+issuedSize (Issued held) = Map.size held
+
+-- | Four thousand and ninety-six handles: tens of kilobytes, far above the sixteen an instance holds at once.
+defaultIssuedMemory ∷ Int
+defaultIssuedMemory = 4096
+
 -- | One instance's two owners.
 data Owners = Owners !TextureOwner !WindowOwner
 
@@ -131,8 +168,8 @@ graphicsInjection config = GraphicsInjection $ \vm → do
   lending ← newLending
   leases ← newLeases lending (facadeLeaseCapacity profile)
   owners ← newTVarIO (Map.empty ∷ Map Text Owners)
-  -- The instance each texture handle was issued to, for the VM's lifetime: bounded by the textures the VM's instances were given.
-  issued ← newTVarIO (Map.empty ∷ Map Word64 Text)
+  -- The instance each recent texture handle was issued to: bounded ('gfIssuedMemory').
+  issued ← newTVarIO emptyIssued
   let window = windowService requests (gfProvider config)
       textureRole = case gvRole vm of
         Gameplay → LogicalRole
@@ -182,9 +219,9 @@ graphicsInjection config = GraphicsInjection $ \vm → do
               WindowStarted started → GraphicsStarted started
               WindowRefused why → GraphicsRefused why
       , gsPublish = \name precondition → graphicsPublishBindingWith (gfPublishHooks config) name precondition (publisherGatedBy (gvTakesWork vm) (gfPublisher config)) limits leases
-      , gsIssued = \identity key → atomically (modifyTVar' issued (Map.insert key identity))
+      , gsIssued = \identity key → atomically (modifyTVar' issued (rememberIssued (gfIssuedMemory config) key identity))
       , gsReleaseCheck = \identity key → do
-          owner ← Map.lookup key <$> readTVarIO issued
+          owner ← issuerOf key <$> readTVarIO issued
           case owner of
             -- The handle was issued to another instance: refused whether its texture is live, retiring or completely retired
             -- (the lease's own slot is gone by then, which is why the issuing instance is recorded here).

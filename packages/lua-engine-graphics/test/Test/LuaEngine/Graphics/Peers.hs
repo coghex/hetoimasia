@@ -14,7 +14,7 @@ module Test.LuaEngine.Graphics.Peers (spec) where
 
 import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, retry)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, retry, writeTVar)
 import Control.Exception (finally)
 import Control.Monad (forM_, forever, unless, void)
 import Data.ByteString (ByteString)
@@ -28,7 +28,7 @@ import Hetoimasia.Foundation.Time (monotonicSource)
 import Hetoimasia.LuaEngine.Behavior (behaviorRequest)
 import Hetoimasia.LuaEngine.Data (dataService, newByteBankFor)
 import Hetoimasia.LuaEngine.Facade
-import Hetoimasia.LuaEngine.Graphics.Facade (GraphicsFacade (..), graphicsInjection)
+import Hetoimasia.LuaEngine.Graphics.Facade (GraphicsFacade (..), defaultIssuedMemory, graphicsInjection)
 import Hetoimasia.LuaEngine.Graphics.Scene (noPublishHooks, scenePublisherOver)
 import Hetoimasia.LuaEngine.Graphics.Window.Port (Port (..), WindowToken (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Provider
@@ -72,6 +72,8 @@ data Peers = Peers
   , peModel ∷ !Model
   , peProvider ∷ !(WindowProvider Int)
   , peOut ∷ !(TVar [Text])
+  , peSignal ∷ !(TVar Bool)
+  -- ^ What the fake session's status says is stopping: the example's one-way word to the survivor.
   , peAdmit ∷ !(IO Spawned)
   }
 
@@ -88,29 +90,32 @@ spec = describe "graphics facade, two instances of one VM" $
     withPeers $ \peers → do
       first ← peAdmit peers
       second ← peAdmit peers
-      -- Each instance opened a window and loaded a texture, took them and published a scene to its own window.
+      -- Each instance opened a window and loaded a texture, took them and published a scene to its own window; the second
+      -- keeps its window and texture live and waits for the example's word.
       awaitLine peers "published\t1"
       awaitLine peers "published\t2"
       forM_ [2, 4] $ \window → awaitRevision (peModel peers) window 1 >> void (adoptNow (peModel peers) window)
       atomically (providerReading (peProvider peers)) >>= \found → readingAcquisitions found `shouldBe` 2
-      -- The first instance ends through Haskell, and the facade is told, as the session tells it once the settlement is seen.
+      -- The first instance ends through Haskell: its window's target ends with it (the host releases what its adopted scene
+      -- held), its texture retires completely, and the facade is told, as the session tells it once the settlement is seen.
       stop peers first
-      -- Its window's target ends with it: the host releases what its adopted scene held, so its texture can retire.
       removeWindow (peModel peers) 2
       _ ← waitInstance (spTicket first)
       forgetInstance (peFacade peers) (spIdentity first)
-      -- Its window retires; the survivor's stays, and the survivor publishes again to it and releases its texture.
+      -- Its window retires; only now is the survivor let go on, with its own window and texture still live.
       atomically (providerReading (peProvider peers) >>= \found → unless (readingAcquisitions found == 1) retry)
+      atomically (writeTVar (peSignal peers) True)
       awaitLinePrefix peers "republished\t2\t"
       awaitRevision (peModel peers) 4 2
-      -- Its handle, kept in the shared export, is refused to the survivor, as is its facade, and the refusal is an
-      -- ordinary error (the survivor goes on).
+      -- Its handle, kept in the shared export, and its facade are refused to the survivor as ordinary errors, though its
+      -- texture has retired completely and its owners are gone.
       awaitLine peers "foreign\tfalse\ttrue"
       -- The survivor's published scene is released by the host (its target ends), so its texture can retire with it.
       dissolve (peModel peers)
       stop peers second
       _ ← waitInstance (spTicket second)
       forgetInstance (peFacade peers) (spIdentity second)
+      atomically (providerReading (peProvider peers) >>= \found → unless (readingAcquisitions found == 0) retry)
 
 withPeers ∷ (Peers → IO a) → IO a
 withPeers body = bounded . withRig Fake.defaultFakeConfig $ \rig → do
@@ -126,13 +131,14 @@ withPeers body = bounded . withRig Fake.defaultFakeConfig $ \rig → do
     withWindowProvider config (retarget (WF.fakePort windows)) $ \provider →
       ( do
           let publisher = scenePublisherOver textures provider (\window scene → fst (modelTarget model window) scene) (\window → snd (modelTarget model window))
-              injection = graphicsInjection (GraphicsFacade compositionProfile (cpPipeline composition) provider publisher noPublishHooks)
+              injection = graphicsInjection (GraphicsFacade compositionProfile (cpPipeline composition) provider publisher noPublishHooks defaultIssuedMemory)
               profile = compositionProfile
               inventory = cpInventory composition
           handles ← newRequestHandles
           requests ← either (\refused → assertFailure ("the request policy was refused: " <> show refused)) pure (m1Requests profile handles)
           phase ← newModulePhase
           out ← newTVarIO []
+          signal ← newTVarIO False
           let moduleSpec =
                 ModuleSpec
                   { specRequests = requests
@@ -160,7 +166,7 @@ withPeers body = bounded . withRig Fake.defaultFakeConfig $ \rig → do
                     }
                 session =
                   SessionEndpoints
-                    { endpointStatus = pure (StatusSample False Nothing (Just (RoleSample True "running" Nothing)))
+                    { endpointStatus = (\stopping → StatusSample stopping Nothing (Just (RoleSample True "running" Nothing))) <$> readTVar signal
                     , endpointQuit = pure ()
                     , endpointTerminal = \_ → pure False
                     }
@@ -214,7 +220,7 @@ withPeers body = bounded . withRig Fake.defaultFakeConfig $ \rig → do
                   admitBehaviorInstance (scheduledEndpoint owner) request >>= \case
                     InstanceAccepted identity ticket → pure (Spawned (declaredId declared) identity ticket)
                     other → assertFailure ("expected the instance accepted, found " <> take 100 (show other))
-            ( mainLoop provider (body (Peers facade owner model provider out admit))
+            ( mainLoop provider (body (Peers facade owner model provider out signal admit))
                 -- (however the body ended, the host model lets go of every adoption first, so that the instances' textures can retire)
                 `finally` (dissolve model >> WF.releaseAll windows >> retireAndAwait control owner)
               )
@@ -310,13 +316,17 @@ peersEntry =
     , "        share.handles[self.my] = self.img.texture"
     , "      end"
     , "      if not (self.win and self.img) then return end"
+    , "      -- the second instance goes on only once the first has handed over its texture, so that it has one to try"
+    , "      if self.my == 2 and not share.handles[1] then return end"
     , "      if not self.a then"
     , "        self.a = true"
     , "        api.scene.publish(self.win, {clear = {r = self.my, g = 0, b = 0}, sprites = {{texture = self.img.texture, x = 0, y = 0, width = 2, height = 2}}})"
     , "        print('published', self.my)"
     , "        return"
     , "      end"
-    , "      if self.my == 2 and share.ended and not self.b then"
+    , "      -- The example flips the session's status when the first instance has settled and been forgotten: the survivor reads"
+    , "      -- it at the entry of this very update (a status is captured at each hook's entry) and goes on."
+    , "      if self.my == 2 and not self.b and api.session.status().stopping then"
     , "        self.b = true"
     , "        api.scene.publish(self.win, {clear = {r = 9, g = 0, b = 0}, sprites = {{texture = self.img.texture, x = 0, y = 0, width = 2, height = 2}}})"
     , "        print('republished', self.my, api.texture.release(self.img.texture))"
@@ -324,9 +334,7 @@ peersEntry =
     , "        local ok2, e2 = pcall(share.apis[1].window.open, {title = 't', width = 1, height = 1})"
     , "        print('foreign', ok1, tostring(e1):find('belongs to another instance') ~= nil and tostring(e2):find('belongs to another instance') ~= nil)"
     , "      end"
-    , "    end,"
-    , "    shutdown = function(self, reason) if self.my == 1 then share.ended = true end end"
+    , "    end"
     , "  }"
     , "}"
     ]
-

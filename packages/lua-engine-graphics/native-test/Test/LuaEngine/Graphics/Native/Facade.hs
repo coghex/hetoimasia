@@ -34,7 +34,7 @@ import Hetoimasia.GPU.Vulkan.GLFW (VulkanHost (..), VulkanSceneState (..), readV
 import System.Timeout (timeout)
 import Hetoimasia.LuaEngine.Boot (bootCheckpoint)
 import Hetoimasia.LuaEngine.Facade (OutputSink (..), withOutput)
-import Hetoimasia.LuaEngine.Graphics.Facade (GraphicsFacade (..), graphicsInjection)
+import Hetoimasia.LuaEngine.Graphics.Facade (GraphicsFacade (..), defaultIssuedMemory, graphicsInjection)
 import Hetoimasia.LuaEngine.Graphics.Scene
 import Hetoimasia.LuaEngine.Graphics.Texture
 import Hetoimasia.LuaEngine.Graphics.Window.Host (newHostPort, targetUsable)
@@ -162,7 +162,7 @@ withFacadeSession env entry judge scenario = do
               when (answer == HostAccepted) (modifyTVar' accepted (<> [preparedValue scene]))
               pure answer
             publisher = scenePublisherOver (graphicsTextures (envGraphics env)) provider tap targetUsable
-            injection = graphicsInjection (GraphicsFacade compositionProfile (cpPipeline composition) provider publisher noPublishHooks)
+            injection = graphicsInjection (GraphicsFacade compositionProfile (cpPipeline composition) provider publisher noPublishHooks defaultIssuedMemory)
         checkpoint ← bootCheckpoint compositionProfile (cpInventory composition) (\_ _ → pure (Right (manifestFor True))) >>= either (\refused → assertFailure ("boot refused: " <> show refused)) pure
         errLines ← newTVarIO []
         let outSink = OutputSink {sinkLine = \_ → pure (), sinkFlush = pure ()}

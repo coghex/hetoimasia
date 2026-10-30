@@ -16,10 +16,10 @@ module Test.LuaEngine.Graphics.Facade (spec) where
 import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
-import Control.Exception (SomeException, finally, throwIO, try)
+import Control.Exception (SomeException, finally, fromException, throwIO, try)
 import Control.Monad (forM_, forever, unless, void)
 import Data.ByteString (ByteString)
-import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
@@ -30,8 +30,9 @@ import Hetoimasia.Foundation.Log (Logger, MetadataProviders (..), callbackSink, 
 import Hetoimasia.Foundation.Time (monotonicSource)
 import Hetoimasia.LuaEngine.Boot (bootCheckpoint)
 import Hetoimasia.LuaEngine.Facade (OutputFailure (..), OutputSink (..), withOutput)
-import Hetoimasia.LuaEngine.Graphics.Facade (GraphicsFacade (..), graphicsInjection)
+import Hetoimasia.LuaEngine.Graphics.Facade (GraphicsFacade (..), defaultIssuedMemory, emptyIssued, graphicsInjection, issuedSize, issuerOf, rememberIssued)
 import Hetoimasia.LuaEngine.Graphics.Scene (GraphicsScene (..), PublishHooks (..), noPublishHooks, scenePublisherOver)
+import Hetoimasia.LuaEngine.Graphics.Texture.Port (Fault (FaultFatal))
 import Hetoimasia.LuaEngine.Graphics.Window.Port (CreateOutcome (..), Port (..), WindowToken (..), fatalText)
 import Hetoimasia.LuaEngine.Graphics.Window.Provider
 import Hetoimasia.LuaEngine.Manifest (Role (Presentation))
@@ -80,10 +81,15 @@ data Shape = Shape
   , shapeHooks ∷ !PublishHooks
   , shapeSinkFails ∷ !Bool
   -- ^ The authored output sink raises on its first line.
+  , shapeProviderHooks ∷ !ProviderHooks
+  , shapeRecord ∷ !(Maybe (IORef [Text]))
+  -- ^ Where the fake texture owner's log is left when the run ends, for an example whose rig raises on its way out.
+  , shapeInject ∷ ![Fake.Injection]
+  -- ^ Faults the fake texture owner injects, taken by the next calls of their kinds.
   }
 
 defaultShape ∷ ByteString → Shape
-defaultShape entry = Shape entry True False WF.defaultFakeConfig Fake.defaultFakeConfig compositionProfile [] noPublishHooks False
+defaultShape entry = Shape entry True False WF.defaultFakeConfig Fake.defaultFakeConfig compositionProfile [] noPublishHooks False noProviderHooks Nothing []
 
 -- | The fixed M1 profile with these counts changed, so that a bank is full after a few requests.
 profileWith ∷ [(CountLimit, Word64)] → Profile
@@ -94,6 +100,14 @@ profileWith changes = either (error . ("the profile was refused: " <>) . show) i
 
 spec ∷ Spec
 spec = describe "graphics facade" $ do
+  it "remembers the issuing instance of only the most recent handles, however many textures are loaded and released" $ do
+    let issued = foldl' (\held key → rememberIssued 4 key "inst-1" held) emptyIssued [1 .. 100000]
+    issuedSize issued `shouldBe` 4
+    issuerOf 100000 issued `shouldBe` Just "inst-1"
+    issuerOf 99997 issued `shouldBe` Just "inst-1"
+    issuerOf 99996 issued `shouldBe` Nothing
+    issuedSize (rememberIssued defaultIssuedMemory 7 "inst-2" emptyIssued) `shouldBe` 1
+
   it "runs the common-entry quad example through the production injection, taking each request once and publishing then releasing" $ do
     outcome ← runFacade (defaultShape quadExample) $ \fs → do
       awaitPublished fs 1
@@ -259,14 +273,39 @@ spec = describe "graphics facade" $ do
     outVerdict outcome `shouldBe` VerdictSuccess
     outFailures outcome `shouldBe` []
 
-  it "raises the output failure only after the window and the texture are retired, when the authored output sink raises after both requests started" $
-    -- The session's call raises the sink's failure once every role has retired and every release has run: the provider's and
-    -- the pipeline's scopes drain (and the rig checks no native work is left) before the exception leaves.
-    ( void $
-        runFacade ((defaultShape sinkFails) {shapeBoth = False, shapeSinkFails = True}) $ \fs →
+  it "raises the output failure only after the window and the texture are retired, when the authored output sink raises after both requests started, with no native work left" $ do
+    -- The session's call raises the sink's failure once every role has retired and every release has run; the rig then checks,
+    -- as the example returns, that no native image, registration or upload is left.
+    raised ←
+      runFacadeEither ((defaultShape sinkFails) {shapeBoth = False, shapeSinkFails = True}) $ \fs →
+        atomically (sessionOutcomeNow (fsSession fs) >>= \found → unless (not (null (outFailures found))) retry)
+    case raised of
+      Left failure → fromException failure `shouldSatisfy` (\found → case found of Just OutputFailure {} → True; Nothing → False)
+      Right outcome → expectationFailure ("expected the output failure, found " <> show (outVerdict outcome))
+
+  it "raises a failed texture cleanup as the fatal failure it is, once, after the session's roles retired, and runs the native cleanup once" $ do
+    ref ← newIORef []
+    raised ←
+      try @SomeException . void $
+        runFacade ((defaultShape releaseFails) {shapeBoth = False, shapeRecord = Just ref, shapeInject = [Fake.FailRelease (FaultFatal "the table release failed")]}) $ \fs →
           atomically (sessionOutcomeNow (fsSession fs) >>= \found → unless (not (null (outFailures found))) retry)
-    )
-      `shouldThrow` (\failure → case failure of OutputFailure {} → True)
+    -- The script raised first and the cleanup failed after it: the fatal cleanup failure is raised on the way out of the
+    -- backend's scope, with what it retained, and nothing ran the native release a second time.
+    case raised of
+      Left failure → show failure `shouldSatisfy` Text.isInfixOf "the table release failed" . Text.pack
+      Right () → expectationFailure "expected the cleanup failure to be raised"
+    logged ← readIORef ref
+    length (filter (Text.isPrefixOf "release attempted") logged) `shouldBe` 1
+
+  it "raises the device's fault as an engine failure, never a content failure, with the window retired and no native work left" $ do
+    (raised, logged) ←
+      runFacadeLogged ((defaultShape twoRequests) {shapeBoth = False, shapeInject = [Fake.FailAllocate (FaultFatal "the device was lost")]}) $ \fs →
+        atomically (sessionOutcomeNow (fsSession fs) >>= \found → unless (not (null (outFailures found))) retry)
+    case raised of
+      Left failure → show failure `shouldSatisfy` Text.isInfixOf "ProviderDefect" . Text.pack
+      Right outcome → expectationFailure ("expected the engine failure to be raised, found " <> show (outVerdict outcome))
+    -- Nothing was allocated for the failed request.
+    length (filter (Text.isPrefixOf "allocated") logged) `shouldBe` 0
 
   it "refuses a second window request of an instance as an ordinary error, caught, with the first window unharmed" $ do
     outcome ← runFacade ((defaultShape secondWindow) {shapeBoth = False}) $ \fs → do
@@ -341,8 +380,25 @@ awaitPublished fs revision = awaitRevision (fsModel fs) firstWindow (fromIntegra
 -- scenario raises it stops the session, and the exception is raised here once the session has ended and the scenario's
 -- thread has terminated: a failed assertion in it is never swallowed.
 runFacade ∷ Shape → (FS → IO ()) → IO SessionOutcome
-runFacade shape scenario = bounded . withRig (shapeTexture shape) $ \rig → do
+runFacade shape scenario = runFacadeEither shape scenario >>= either throwIO pure
+
+-- | The same, answering what the example raised (the session's call, or a scope it ran in) instead of raising it, so that the rig's
+-- check that no native work was left runs before the example sees the exception.
+runFacadeEither ∷ Shape → (FS → IO ()) → IO (Either SomeException SessionOutcome)
+runFacadeEither shape scenario = fst <$> runFacadeLogged shape scenario
+
+-- | The same, with what the fake texture owner recorded.
+runFacadeLogged ∷ Shape → (FS → IO ()) → IO (Either SomeException SessionOutcome, [Text])
+runFacadeLogged shape scenario = bounded . withRig (shapeTexture shape) $ \rig → do
+  result ← try @SomeException (runCore rig shape scenario)
+  logged ← Fake.events (rigFake rig)
+  forM_ (shapeRecord shape) (\ref → writeIORef ref logged)
+  pure (result, logged)
+
+runCore ∷ Rig → Shape → (FS → IO ()) → IO SessionOutcome
+runCore rig shape scenario = do
   let fake = rigFake rig
+  forM_ (shapeInject shape) (Fake.inject fake)
   model ← newModel (fakeLedger fake)
   setBarrier fake (modelCapture model)
   forM_ [1 .. 8] (modelWindow model)
@@ -363,10 +419,10 @@ runFacade shape scenario = bounded . withRig (shapeTexture shape) $ \rig → do
         , ("images/quad.png", Png.solid 2 2 (200, 100, 50, 255))
         ]
   withComposition (shapeProfile shape) files (rigPort rig) $ \composition control runtime →
-    withWindowProvider config (retarget (WF.fakePort windows)) $ \provider →
+    withWindowProviderWith (shapeProviderHooks shape) config (retarget (WF.fakePort windows)) $ \provider →
       ( do
           let publisher = scenePublisherOver textures provider (\window scene → fst (modelTarget model window) scene) (\window → snd (modelTarget model window))
-              injection = graphicsInjection (GraphicsFacade (shapeProfile shape) (cpPipeline composition) provider publisher (shapeHooks shape))
+              injection = graphicsInjection (GraphicsFacade (shapeProfile shape) (cpPipeline composition) provider publisher (shapeHooks shape) defaultIssuedMemory)
           checkpoint ← bootCheckpoint (shapeProfile shape) (cpInventory composition) (\_ _ → pure (Right (manifestFor (shapeBoth shape)))) >>= either (\refused → assertFailure ("boot refused: " <> show refused)) pure
           outLines ← newTVarIO []
           errLines ← newTVarIO []
@@ -714,6 +770,30 @@ sinkFails =
     , "      self.w = api.window.open({title='t', width=64, height=64})"
     , "      self.t = api.content.texture('images/quad.png')"
     , "      print('both started')"
+    , "    end,"
+    , "    update=function(self, dt) end"
+    ]
+
+-- | A texture taken, released (its cleanup is made to fail), and then the script's own error.
+releaseFails ∷ ByteString
+releaseFails =
+  presentationOnly
+    [ "    init=function(self, api) self.t = api.content.texture('images/quad.png') end,"
+    , "    update=function(self, dt)"
+    , "      local api = self.api"
+    , "      if not api.request.ready(self.t) then return end"
+    , "      local tex = api.request.take(self.t).value.texture"
+    , "      pcall(api.texture.release, tex)"
+    , "      error('the script failed first')"
+    , "    end"
+    ]
+
+twoRequests ∷ ByteString
+twoRequests =
+  presentationOnly
+    [ "    init=function(self, api)"
+    , "      self.w = api.window.open({title='t', width=64, height=64})"
+    , "      self.t = api.content.texture('images/quad.png')"
     , "    end,"
     , "    update=function(self, dt) end"
     ]
