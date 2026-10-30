@@ -52,9 +52,10 @@ builderSource =
     , exportText = Text.encodeUtf8 ("return { build = " <> engineBuilderName <> "() }")
     }
 
--- | The initial chunk, for a call that writes at most this many bytes.
-engineChunk ∷ Int → ByteString
-engineChunk limit = Text.encodeUtf8 (Text.unlines (prelude <> renderFunctionLinesWith limit <> body))
+-- | The initial chunk, for a call that writes at most this many bytes, with the graphics layout (the texture
+-- request, the window request, the scene publication and the texture release) when a composition injected one.
+engineChunk ∷ Bool → Int → ByteString
+engineChunk graphics limit = Text.encodeUtf8 (Text.unlines (prelude <> renderFunctionLinesWith limit <> body))
   where
     ns = engineNamespaceName
     prelude =
@@ -77,7 +78,32 @@ engineChunk limit = Text.encodeUtf8 (Text.unlines (prelude <> renderFunctionLine
       , "local yield = E.yield"
       , "local session_status, session_quit, unavailable = E.session_status, E.session_quit, E.state_unavailable"
       , "local error = error"
-      , -- The unavailable-state guard (LFE-26). It names no parameter and reads no argument: whatever a script
+      ]
+        <> graphicsLocals
+        <> bodyTail
+    -- The graphics layout (LFE-21): the same in either role, so that a logical instance's call is an ordinary error of
+    -- the binding rather than a missing field. The window and the texture calls take exactly their declared arguments
+    -- and pass them unchanged, so the host's arity is the call's.
+    textureMember = if graphics then ", texture = starter(content_texture, texture_ops)" else ""
+    graphicsMembers ∷ [Text]
+    graphicsMembers
+      | graphics =
+          [ "    window = { open = starter1(window_open, window_ops) },"
+          , "    scene = { publish = guard(scene_publish) },"
+          , "    texture = { release = guard(texture_release) },"
+          ]
+      | otherwise = []
+    graphicsLocals ∷ [Text]
+    graphicsLocals
+      | graphics =
+          [ "local content_texture, window_open, scene_publish, texture_release = E.content_texture, E.window_open, E.scene_publish, E.texture_release"
+          , "local texture_ops = { ready = E.ready_texture, take = E.take_texture, cancel = E.cancel_texture, wait = E.wait_texture }"
+          , "local window_ops = { ready = E.ready_window, take = E.take_window, cancel = E.cancel_window, wait = E.wait_window }"
+          ]
+      | otherwise = []
+    bodyTail ∷ [Text]
+    bodyTail =
+      [ -- The unavailable-state guard (LFE-26). It names no parameter and reads no argument: whatever a script
         -- passes is dropped unread, and nothing it passes can run. The engine binding latches the whole
         -- session's failure and stop first (and writes the one diagnostic); only then is the error raised, with
         -- the fixed text and no position. It is a global before any authored module is evaluated, and the
@@ -106,6 +132,14 @@ engineChunk limit = Text.encodeUtf8 (Text.unlines (prelude <> renderFunctionLine
       , "      return request, refusal"
       , "    end"
       , "  end"
+      , "  local function starter1(f, ops)"
+      , "    return function(...)"
+      , "      check(id)"
+      , "      local request, refusal = f(...)"
+      , "      if request ~= nil then kinds[request] = ops end"
+      , "      return request, refusal"
+      , "    end"
+      , "  end"
       , "  local function operation(name)"
       , "    return function(...)"
       , "      check(id)"
@@ -116,7 +150,7 @@ engineChunk limit = Text.encodeUtf8 (Text.unlines (prelude <> renderFunctionLine
       , "    role = ctx.role,"
       , "    content_id = ctx.content_id,"
       , "    instance_id = id,"
-      , "    content = { module = starter(content_module, module_ops), data = starter(content_data, data_ops) },"
+      , "    content = { module = starter(content_module, module_ops), data = starter(content_data, data_ops)" <> textureMember <> " },"
       , "    request = {"
       , "      ready = operation('ready'),"
       , "      take = operation('take'),"
@@ -124,7 +158,9 @@ engineChunk limit = Text.encodeUtf8 (Text.unlines (prelude <> renderFunctionLine
       , "      wait = operation('wait'),"
       , "    },"
       , "    session = { status = guard(session_status), quit = guard(session_quit) },"
-      , "    state = terminal,"
+      ]
+        <> graphicsMembers
+        <> [ "    state = terminal,"
       , "    time = {"
       , "      tick = guard(tick),"
       , "      tick_seconds = guard(tick_seconds),"

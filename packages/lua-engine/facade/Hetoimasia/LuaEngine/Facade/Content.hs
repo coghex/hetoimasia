@@ -35,6 +35,8 @@ module Hetoimasia.LuaEngine.Facade.Content
   , validRootId
   , moduleHandleName
   , dataHandleName
+  , checkRoot
+  , describeRefusal
   ) where
 
 import qualified Data.ByteString as ByteString

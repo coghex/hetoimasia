@@ -12,7 +12,18 @@
 -- awaits release) is the evidence. Offscreen pixel proof is LFE-24's and visible output qualification LFE-25's.
 --
 -- The windows open on whatever the run's consent selected, and every example ends with its windows destroyed.
-module Test.LuaEngine.Graphics.Native.Scenes (spec) where
+module Test.LuaEngine.Graphics.Native.Scenes
+  ( spec
+  , awaitAdopted
+  , awaitFrame
+  , demandFrame
+  , published
+  , expectHeld
+  , awaitHeld
+  , awaitWindowCount
+  , evidence
+  , within
+  ) where
 
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
 import Control.Monad (unless)

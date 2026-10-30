@@ -42,6 +42,17 @@ module Hetoimasia.LuaEngine.Facade.Types
   , TimeState (..)
   , StatusState (..)
   , FacadeLimits (..)
+    -- * Injected graphics
+  , GraphicsStart (..)
+  , GraphicsVm (..)
+  , GraphicsInjection (..)
+  , GraphicsServices (..)
+  , graphicsTextureType
+  , graphicsWindowType
+  , graphicsTextureRequestType
+  , graphicsWindowRequestType
+  , graphicsTextureValueSchema
+  , graphicsWindowValueSchema
   , engineNamespaceName
   , engineBuilderName
     -- * Failures
@@ -51,17 +62,25 @@ module Hetoimasia.LuaEngine.Facade.Types
 import Control.Concurrent.MVar (MVar)
 import Control.Concurrent.STM (STM, TVar)
 import Control.Exception (Exception, SomeException)
+import Data.ByteString (ByteString)
+import Data.Int (Int64)
 import Data.Map.Strict (Map)
 import Data.Text (Text)
 import Data.Word (Word64)
+import Hetoimasia.Content.Identity (ContentKey)
 import Hetoimasia.Content.Inventory (Inventory)
 import Hetoimasia.Foundation.Time (Duration, Instant, MonotonicSource)
 import Hetoimasia.LuaEngine.Data (DataService)
 import Hetoimasia.LuaEngine.Manifest (Role)
 import Hetoimasia.LuaEngine.Modules (Coordinator)
 import Hetoimasia.LuaEngine.Profile (Profile)
-import Hetoimasia.LuaEngine.Request (M1Requests)
+import Hetoimasia.LuaEngine.Request (M1Requests, M1Start)
+import Hetoimasia.Scripting.Lua.Lease (Leases)
+import Hetoimasia.Scripting.Lua.Lending (Lending)
 import Hetoimasia.Scripting.Lua.Owner (ModulePhase)
+import Hetoimasia.Scripting.Lua.Provider (RequestEndpoint)
+import Hetoimasia.Scripting.Lua.Registration (ArgumentCheck, Binding, CapabilityType, RequestContext)
+import Hetoimasia.Scripting.Lua.Value (Schema (SCapability, SInteger, SRecord))
 
 -- Services injected from outside -------------------------------------------------------------------
 
@@ -260,6 +279,94 @@ data Facade = Facade
   , fcTime ∷ !TimeState
   , fcSession ∷ !SessionEndpoints
   , fcStatus ∷ !StatusState
+  , fcGraphics ∷ !(Maybe GraphicsServices)
+  -- ^ The graphics operations of this VM, when the composition injected any. 'Nothing' keeps every call of the
+  -- facade as it was and adds none.
+  }
+
+-- Injected graphics ---------------------------------------------------------------------------------
+
+-- | The name of the capability type of a texture lease's handle. The graphics adapter's own spelling is
+-- checked equal to this by its tests; the CPU facade names it here because it imports neither the texture
+-- pipeline nor the window provider.
+graphicsTextureType ∷ Text
+graphicsTextureType = "texture"
+
+-- | The name of the capability type of a window lease's handle.
+graphicsWindowType ∷ Text
+graphicsWindowType = "window"
+
+-- | The request handle types of a texture request and of a window request.
+graphicsTextureRequestType, graphicsWindowRequestType ∷ Text
+graphicsTextureRequestType = "texture_request"
+graphicsWindowRequestType = "window_request"
+
+-- | What @take@ hands as the success value of a texture request: @{texture = HANDLE, width = INTEGER, height = INTEGER}@.
+graphicsTextureValueSchema ∷ Schema
+graphicsTextureValueSchema = SRecord [("texture", SCapability graphicsTextureType), ("width", SInteger), ("height", SInteger)]
+
+-- | What @take@ hands as the success value of a window request: the window handle itself.
+graphicsWindowValueSchema ∷ Schema
+graphicsWindowValueSchema = SCapability graphicsWindowType
+
+-- | What a request-producing graphics service answered once the facade's checks passed.
+data GraphicsStart
+  = -- | The host's answer: the request, or busy with nothing reserved.
+    GraphicsStarted !M1Start
+  | -- | A permanent refusal that reached the admission after the check passed (an owner that ended, a stopping
+    -- provider): nothing was reserved. The facade raises it as the ordinary error it is.
+    GraphicsRefused !Text
+  deriving (Eq, Show)
+
+-- | What the composition is told of the VM it makes graphics services for.
+data GraphicsVm = GraphicsVm
+  { gvRole ∷ !Role
+  -- ^ The VM's role. A logical VM is given the same layout; every graphics call it makes is refused.
+  , gvRequests ∷ !M1Requests
+  -- ^ The VM's request policy, already gated on the session's admission: the one the services admit with.
+  , gvTakesWork ∷ !(STM Bool)
+  -- ^ Whether the session still takes new work for this role, as a transaction: the authority a publication reads in the
+  -- very transaction that commits it, so that a stop that wins between the check and the commit refuses the whole scene.
+  }
+
+-- | How a composition injects graphics: a function from one VM to its services. The session coordinator holds it
+-- as an abstract value and calls it once for each role's VM; it reaches no global and no registry.
+newtype GraphicsInjection = GraphicsInjection {injectGraphics ∷ GraphicsVm → IO GraphicsServices}
+
+-- | The narrow graphics operations of one VM, supplied by a composition. The CPU facade validates the
+-- caller, role, phase, session admission, arity and every argument's shape and decides which Lua error a
+-- refusal is; these do what only the providers can: check the provider's own facts, start the request and
+-- release. Every operation names the calling instance by the identity the facade issued it.
+data GraphicsServices = GraphicsServices
+  { gsLending ∷ !Lending
+  -- ^ The VM's lending, which its owner is configured with.
+  , gsLeases ∷ !Leases
+  -- ^ The VM's lease scope, which its owner is configured with: capacity above every texture and window the
+  -- instance's M1 reservations let coexist.
+  , gsTypes ∷ ![CapabilityType]
+  -- ^ The lease handle types (@texture@, @window@) over 'gsLeases'.
+  , gsEndpoints ∷ ![RequestEndpoint]
+  -- ^ The texture and window endpoints of the owner's request grant.
+  , gsDeclare ∷ Text → IO ()
+  -- ^ An instance was declared: make its owners.
+  , gsForget ∷ Text → IO ()
+  -- ^ An instance was forgotten, once its settlement was observed: end its owners.
+  , gsTextureCheck ∷ Text → ContentKey → Bool → ArgumentCheck
+  , gsTextureStart ∷ Text → ContentKey → Bool → RequestContext → IO GraphicsStart
+  , gsWindowCheck ∷ Text → ByteString → Int64 → Int64 → ArgumentCheck
+  , gsWindowStart ∷ Text → ByteString → Int64 → Int64 → RequestContext → IO GraphicsStart
+  , gsPublish ∷ Text → ArgumentCheck → Binding
+  -- ^ The scene publication binding of this name, given the facade's precondition.
+  , gsIssued ∷ Text → Word64 → IO ()
+  -- ^ A texture handle was taken by this instance, recorded before the script is handed it: the issuing instance of a
+  -- handle outlives the lease's slot, which is deleted when the texture has retired.
+  , gsReleaseCheck ∷ Text → Word64 → IO (Maybe Text)
+  -- ^ Whether this instance may release this texture handle: refused, as the text of an ordinary error and before any
+  -- provider is asked, for a handle another instance was issued (alive, retiring or completely retired) and a lease of
+  -- another kind. A lease of the calling instance that has already ended is not refused: releasing it again is the
+  -- special release path's to answer.
+  , gsRelease ∷ Word64 → IO Text
+  -- ^ Release a texture lease by key through the host's special release path: @done@, @retiring@ or @already_released@.
   }
 
 -- | The session's authored output: both streams, the lock one whole call is written under, and the

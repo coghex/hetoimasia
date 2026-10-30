@@ -59,6 +59,7 @@ module Test.LuaEngine.Facade.Support
   , Fvm (..)
   , VmShape (..)
   , gameplayShape
+  , withOneGraphics
   , presentationShape
   , withFvm
   , ownerTick
@@ -135,7 +136,7 @@ import Hetoimasia.LuaEngine.Modules
   , moduleIdentity
   , withModuleCoordinator
   )
-import Hetoimasia.LuaEngine.Profile (Profile)
+import Hetoimasia.LuaEngine.Profile (Profile, fixedM1Profile)
 import Hetoimasia.LuaEngine.Request (m1Requests)
 import Hetoimasia.Runtime.Supervision
   ( Recognition (Unrecognized)
@@ -477,15 +478,17 @@ data VmShape = VmShape
   -- ^ A gameplay VM's fixed tick duration.
   , shRoots ∷ ![Text]
   -- ^ The enabled content roots.
+  , shGraphics ∷ !(Maybe GraphicsInjection)
+  -- ^ The graphics a composition injects into the VM, if any (LFE-21).
   }
 
 -- | A gameplay VM whose tick is a millisecond, enabling the session's root.
 gameplayShape ∷ VmShape
-gameplayShape = VmShape Gameplay 1000000 ["modules-test"]
+gameplayShape = VmShape Gameplay 1000000 ["modules-test"] Nothing
 
 -- | A presentation VM enabling the session's root.
 presentationShape ∷ VmShape
-presentationShape = VmShape Presentation 0 ["modules-test"]
+presentationShape = VmShape Presentation 0 ["modules-test"] Nothing
 
 -- | One VM: its owner, coordinator, facade and loader endpoint.
 data Fvm = Fvm
@@ -566,6 +569,7 @@ withFvmRefusing world runtime shape body = do
                 when failing (throwIO (userError "the terminal latch failed"))
                 pure first
             }
+    graphics ← traverse (\injection → injectGraphics injection (GraphicsVm (shRole shape) requests (pure True))) (shGraphics shape)
     facade ←
       newFacade
         FacadeSpec
@@ -581,6 +585,7 @@ withFvmRefusing world runtime shape body = do
           , fsRoots = shRoots shape
           , fsIds = wIds world
           , fsTickDuration = tickDuration
+          , fsGraphics = graphics
           }
         >>= either (throwIO . RefusedFacade) pure
     let base = (vmProfileConfig LibraryProfileM1) {vmOwnerName = "facade-" <> roleText}
@@ -591,6 +596,8 @@ withFvmRefusing world runtime shape body = do
           (scheduledSpec config requiredPolicy bounds)
             { scheduledInstances = Just instances
             , scheduledRequestHandles = Just handles
+            , scheduledLending = gsLending <$> graphics
+            , scheduledLeases = gsLeases <$> graphics
             , scheduledRequests = Just grant
             , scheduledLoader = Just (coordinatorPlan coordinator)
             , scheduledClock = scriptedSource (scriptedInstant <$> clockDuration world)
@@ -855,5 +862,13 @@ withOneIn ∷ Role → Profile → Script → [(FilePath, ByteString)] → (Worl
 withOneIn role profile found more body =
   withWorld profile (Layout (("lua/main.lua", scriptSource found) : more)) $ \world control runtime →
     withFvm world runtime (if role == Gameplay then gameplayShape else presentationShape) $ \fvm → do
+      spawned ← spawn world fvm "modules-test" mainPath
+      body world control fvm spawned
+
+-- | One presentation or gameplay instance over a VM with these graphics injected.
+withOneGraphics ∷ GraphicsInjection → Role → Script → [(FilePath, ByteString)] → (World → RuntimeControl → Fvm → Spawned → IO a) → IO a
+withOneGraphics injection role found more body =
+  withWorld fixedM1Profile (Layout (("lua/main.lua", scriptSource found) : more)) $ \world control runtime →
+    withFvm world runtime ((if role == Gameplay then gameplayShape else presentationShape) {shGraphics = Just injection}) $ \fvm → do
       spawned ← spawn world fvm "modules-test" mainPath
       body world control fvm spawned

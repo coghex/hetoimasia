@@ -34,6 +34,7 @@ library
     import: language
     hs-source-dirs: src
     exposed-modules:
+        Hetoimasia.LuaEngine.Graphics.Facade
         Hetoimasia.LuaEngine.Graphics.Scene
         Hetoimasia.LuaEngine.Graphics.Scene.Configuration
         Hetoimasia.LuaEngine.Graphics.Scene.Ledger
@@ -65,6 +66,7 @@ library
         hetoimasia-gpu-vulkan-model ==0.1.0.0,
         hetoimasia-gpu-vulkan-native ==0.1.0.0,
         hetoimasia-lua-engine ==0.1.0.0,
+        hetoimasia-lua-engine:facade,
         hetoimasia-lua-engine:request,
         hetoimasia-lua-engine:scene,
         hetoimasia-lua-engine:session,
@@ -91,8 +93,11 @@ test-suite lua-engine-graphics-tests
         Test.LuaEngine.Graphics.Configuration
         Test.LuaEngine.Graphics.Fake
         Test.LuaEngine.Graphics.FrameLog
+        Test.LuaEngine.Graphics.Facade
+        Test.LuaEngine.Graphics.FacadeScripts
         Test.LuaEngine.Graphics.Faults
         Test.LuaEngine.Graphics.Lifecycle
+        Test.LuaEngine.Graphics.Peers
         Test.LuaEngine.Graphics.Png
         Test.LuaEngine.Graphics.Pressure
         Test.LuaEngine.Graphics.Release
@@ -137,7 +142,9 @@ test-suite lua-engine-graphics-tests
         hetoimasia-gpu-vulkan-native ==0.1.0.0,
         hetoimasia-lua-engine ==0.1.0.0,
         hetoimasia-lua-engine-graphics,
+        hetoimasia-lua-engine:data,
         hetoimasia-lua-engine:facade,
+        hetoimasia-lua-engine:modules,
         hetoimasia-lua-engine:request,
         hetoimasia-lua-engine:scene,
         hetoimasia-lua-engine:session,
@@ -167,9 +174,11 @@ test-suite lua-engine-graphics-native-tests
     hs-source-dirs: native-test test-common
     other-modules:
         Test.LuaEngine.Graphics.Composition
+        Test.LuaEngine.Graphics.FacadeScripts
         Test.LuaEngine.Graphics.FrameLog
         Test.LuaEngine.Graphics.Native.Consent
         Test.LuaEngine.Graphics.Native.Environment
+        Test.LuaEngine.Graphics.Native.Facade
         Test.LuaEngine.Graphics.Native.Frame
         Test.LuaEngine.Graphics.Native.Loader
         Test.LuaEngine.Graphics.Native.Scenes
@@ -213,8 +222,10 @@ test-suite lua-engine-graphics-native-tests
         hetoimasia-gpu-vulkan-native ==0.1.0.0,
         hetoimasia-lua-engine ==0.1.0.0,
         hetoimasia-lua-engine-graphics,
+        hetoimasia-lua-engine:facade,
         hetoimasia-lua-engine:request,
         hetoimasia-lua-engine:scene,
+        hetoimasia-lua-engine:session,
         hetoimasia-lua-engine:texture,
         hetoimasia-math ==0.1.0.0,
         hetoimasia-render-2d ==0.1.0.0,

@@ -172,6 +172,9 @@ import Hetoimasia.LuaEngine.Facade
   , EngineFailure (..)
   , FacadeEndpoints (..)
   , FacadeSpec (..)
+  , GraphicsInjection (..)
+  , GraphicsServices (..)
+  , GraphicsVm (..)
   , InstanceIds
   , SessionEndpoints (..)
   , declareInstance
@@ -531,6 +534,10 @@ admissionOf env role = do
   -- admits the request, so a closure that commits after this read refuses the request for good)
   when (found == AdmissionOpen) (probeAt env (RequestChecked role))
   pure found
+
+-- | Whether a role still takes new work, as the transaction a publication commits with.
+takesWork ∷ Env → Role → STM Bool
+takesWork env role = (\state → roleAdmit role state == AdmitOpen) <$> stateOf env
 
 -- | The credit a role's request policy reserves first: nothing to hold, and a final refusal (an ordinary Lua error, never
 -- busy) when the role takes no new work, read in the transaction that admits the request.
@@ -928,6 +935,10 @@ withRoleVm env info body = do
                 , endpointClock = sxClock spec
                 , endpointTick = readTVarIO holder >>= maybe (pure (harnessTickBase harness)) (\found → (+ harnessTickBase harness) <$> atomically (scheduledTick found))
                 }
+        -- The composition's graphics for this VM, if it injected any: made over this VM's own gated request policy, so
+        -- a texture or window admission is refused once the session takes no new work. It acquires nothing that
+        -- needs a release here: the pipeline and the provider it is made over are the assembly's.
+        graphics ← traverse (\injection → injectGraphics injection (GraphicsVm role requests (takesWork env role))) (sxGraphics spec)
         probeAt env (Acquiring role BuildFacade)
         facade ← mask_ $ do
           made ←
@@ -945,6 +956,7 @@ withRoleVm env info body = do
                 , fsRoots = [riContent info]
                 , fsIds = envIds env
                 , fsTickDuration = riTick info
+                , fsGraphics = graphics
                 }
               >>= either (refuse "the facade" . Text.pack . show) pure
           register env role BuildFacade (\registered → registered {regReleases = buildRelease env role BuildFacade : regReleases registered})
@@ -978,6 +990,8 @@ withRoleVm env info body = do
               (scheduledSpec config ownerPolicy schedulerBounds)
                 { scheduledInstances = Just instances
                 , scheduledRequestHandles = Just handles
+                , scheduledLending = gsLending <$> graphics
+                , scheduledLeases = gsLeases <$> graphics
                 , scheduledRequests = Just (RequestGrant (facadeRequestEndpoints facade) (fromIntegral perVm) timing)
                 , scheduledLoader = Just (coordinatorPlan coordinator)
                 , scheduledClock = sxClock spec

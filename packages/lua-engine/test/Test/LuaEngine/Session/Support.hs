@@ -207,6 +207,7 @@ withSetup found body =
               , sxRuntime = runtime
               , sxControl = control
               , sxHarness = suHarness found
+              , sxGraphics = Nothing
               }
         }
   where
