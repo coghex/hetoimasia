@@ -31,7 +31,7 @@ component's test module is imported.
 ## Composition and ownership
 
 ```haskell
-withTextureGraphics ∷ TextureGraphicsConfiguration → VulkanHostConfig scene → VulkanHost scene → (TextureGraphics → IO r) → IO r
+withTextureGraphics ∷ SceneSession → TextureGraphicsConfiguration → VulkanHostConfig scene → VulkanHost scene → (TextureGraphics → IO r) → IO r
 ```
 
 * The **host and its owner** are the assembler's; the scope borrows them and unwinds inside them. The host must have
@@ -150,9 +150,15 @@ Every site that reserves, tracks, transfers, settles or publishes, and what make
 
 A delivered texture's `textureRelease` (called at most once by the lease) marks the logical release in the registry at
 once, for a publication's check, and asks the table to release through `requestVulkanRelease`: the owner runs it only
-once every window has adopted the scene revision that was current when it was asked. **That lane is the single hook
-through which the holds a published scene takes gate the table release**; LFE-20's publication marks and releases
-through the same registry. The release is nonblocking and distinguishes *requested* from *retired*: the reading
+once every window has adopted the scene revision that was current when it was asked. **That lane, with the scene
+ledger, is the single hook through which the holds a published scene takes gate the table release**: the release action
+reads the ledger on the owner's thread (`deviceHeld`), where the lifecycle hooks that write it run, and releases the
+table's handle only when no adopted revision holds the texture. A held release is not a failure and not a retirement:
+the texture stays `held` (released for new use, charges kept) and the backend asks again, through the ordinary action
+lane, when the last hold ends (`portHeld`, read in the transaction that decides, so the end of the last hold wakes the
+pump). The ask goes through the barrier lane again, not the ordinary one: the last adoption can end with its window still
+retaining the revision it adopted (a replaced target leaves the published scene for the next attachment), and a request's
+barrier waits for a live target of every window that has published. The release is nonblocking and distinguishes *requested* from *retired*: the reading
 answers `ProviderComplete` only when the release ran on the owner's thread **and** an owner action read the table with the
 texture's slot no longer retiring (no live version a batch holds maps it). A request, an acknowledgement, a dropped
 reference, a worker exit or the end of a CPU scope is none of these.
@@ -382,8 +388,157 @@ drives progress; a window held up in retirement never blocks the service of anot
   (on macOS `HETOIMASIA_NATIVE_SESSION=desktop` on that command; on Linux the runner starts its own X11 display). It
   claims no visual pixel and no completed GPU frame.
 
+## Scene publication (LFE-20)
+
+`Hetoimasia.LuaEngine.Graphics.Scene.*` publishes a prepared scene (LFE-19) to the caller's ready window, keeps the
+textures it names alive through the owner's adoption and every frame that used them, and records each frame with that
+frame's own metrics. It adds no Lua API: the facade (LFE-21) installs `api.scene.publish` over `graphicsPublishBinding`.
+
+| Module | What it is |
+| --- | --- |
+| `…Scene.Ledger` | `GraphicsScene` (the host's per-window scene), `SceneLedger` and the lifecycle hooks (`ledgerLifecycle`): what the adopted revisions hold, with the adoption count of each window and revision. |
+| `…Scene.Publish` | The publication boundary (`publishScene`), its refusals, and the binding (`graphicsPublishCheck`, `graphicsPublishBinding`). |
+| `…Scene.Render` | The pure frame of an adopted scene for a frame's own metrics (`frameCandidate`) and the `VulkanRenderer` that records it. |
+| `…Scene.Configuration` | The scene part of the host's configuration (`configureScenes`), `SceneSession`, and the maximum-legal-scene check (`sceneCapacity`). |
+
+`withTextureGraphics` takes the `SceneSession` (made before the host is built) and fills the renderer's slot with the
+session's renderer and registry. The assembler builds the host with `configureHost`, `configureWindows` and
+`configureScenes`; none reads the others' fields.
+
+### The commit point, authority and lock protocol
+
+`publishScene windowKey prepared` is the one place authority is checked and a scene becomes the host's. In order, all
+inside the borrows:
+
+1. the window lease is borrowed (`withWindowOr`): ended, another instance's or another kind of handle is refused;
+2. every distinct texture the scene names is borrowed through the instance's own lease (`withTextureOr`) and its
+   identity and dimensions compared with the prepared ones. **The borrow is the pin**: a borrowed member cannot be
+   retired (the collection answers a retirement as in use), so no release of a texture the scene names can run between
+   this check and the host holding the scene. A prepared identity of a released texture, even one whose index was reused
+   under a newer generation, is not that texture;
+3. one transaction reads the instance's and the provider's admission, the window's incarnation (`targetUsable`) and the
+   renderer registry's own flag for each texture's exact handle and, **in the same transaction**, makes the scene the
+   window's latest value (`targetPublishSTM`; it never waits). A stop, closure or ending instance that lands before
+   that transaction refuses the whole publication; one that lands after it finds the scene already the host's.
+
+**Acceptance is step 3's write.** Before it the call has changed nothing; after it the scene is the window's, owned by the host
+until it is adopted and then by the ledger until it is released, whatever happens to the caller. The two valid race
+outcomes are the specification's: if the publication wins, the whole scene is accepted and a later release or end honors
+its uses; if a release, end or closure wins, the whole new publication is refused and the previous scene stays. A
+released handle is never usable again because an older scene holds its image.
+
+Lock order: the collection's borrows (window, then each texture in prepared order) outside, the host's snapshot
+transaction innermost. No lock of this package is held across a GPU wait, native teardown or a callback into Lua.
+
+### Accepted, adopted and in-flight
+
+| Stage | Protected by | Ends |
+| --- | --- | --- |
+| accepted, not adopted | the host's release barrier: a release request waits until every window has adopted the revision published before it | the revision is adopted, or superseded (then it is never adopted and never held), or its window goes |
+| adopted | the ledger: the lifecycle hooks record the exact adopted scene, one count per adoption; each distinct texture once per adoption however many sprites name it | `sceneReleased`: the revision is superseded or its target ended, **and** every frame recorded with it completed (never a frame's submission, abandonment, a refused presentation, a timeout or a CPU return) |
+| released by Lua | the same two, and the registry's logical release (new publications naming the lease are refused) | the table release runs once no adoption holds the texture; retirement is then the table's reading |
+
+The same window revision can be adopted under more than one attachment; the hooks carry no attachment, so the ledger
+counts adoptions of each window and revision and drops the revision's holds on the last release.
+
+### Budget and pressure
+
+* Six unreleased adopted revisions for each target (`2 * (frame slots + 1)`) is the host's. At the limit the owner defers
+  adoption and the window keeps one latest value; nothing here grows an overflow queue, drops a live hold or makes Lua
+  wait. Each window has one latest snapshot and one draft (the call's own value); there is no FIFO of scene copies.
+* The release lane and the action lane are separate banks. A full release lane refuses a request as pressure
+  (`PortFull`), which is not a Lua error or a cleanup failure: the backend's pump keeps the texture released and
+  pending, waits in STM on the lane's room, and asks again, **once**: it asks only when no request of its own is
+  admitted (`TexReleaseRequested`), so re-admission never queues a duplicate. That wake is the lane's change; no Lua call,
+  publication, adoption or frame is needed, and the assembly (LFE-22) calls nothing for it.
+* `sceneCapacity` shows the largest legal scene (4,096 sprites, 64 encoded bytes each, claimed in 16-byte steps) fits the
+  configured 4 MiB ring for every batch that can be in flight, twice over; transient in-flight pressure is the native
+  backend's backpressure (the frame is skipped and retried) and is distinguishable from this fixed size.
+
+### Frames and metrics
+
+A frame is built from the adopted scene and the frame's own observations (`FrameFacts`: the generation's framebuffer
+extent and the window's latest logical extent and content scale). The view is the whole framebuffer; authored rectangles
+stay fixed top-left logical pixels, UI scale 1, no snapping, nearest full-image sampling, ordered alpha blending over the
+explicit clear. A resize clips without stretching or recentring and needs no new publication; a zero framebuffer suspends
+drawing, not the scene, its holds or retirement. A window that has reported no logical extent or content scale, or
+unusable metrics, skips the frame; nothing is invented.
+
+### Exit paths
+
+* Instance, window or session end closes publication first (the owner's `ownerOpen`, the provider's admission) and then
+  withdraws normal work. A scene accepted before stays with the host and is released through the ledger as its target ends.
+* Ending one instance releases its own textures and window; the peer's latest scene stays adopted, held and recorded, and
+  nothing synthesises a session quit.
+* A genuine release failure stays fatal for its texture and is never retried; a hold ending does not retry a failed
+  cleanup.
+
+### Owners, threads, lifetimes
+
+| State | Owner | Writers | Readers | Thread | Lifetime / disposal |
+| --- | --- | --- | --- | --- | --- |
+| The ledger's records | the `SceneSession` | the two lifecycle hooks | the backend's release (`portHeld`, `deviceHeld`), tests | owner's thread (hooks); STM | made before the host; a record goes with its last release |
+| A window's latest scene | the host | `targetPublish` | the owner's step | STM | until replaced or the window ends |
+| The call's draft | the calling instance | the call | the call | the instance's thread | the call |
+| The renderer slot | the `SceneSession` | `withTextureGraphics`, once | the renderer hook | owner's thread | the session |
+| A held texture's release | the backend | the pump | the pump | one pump thread | until retired or failed |
+
+### Invariants (the D-80 table)
+
+The D-80 table covering every reservation, publication, settlement and cancellation window of this slice is in the pull
+request body of [#535](https://github.com/coghex/hetoimasia/issues/535)'s change.
+
+### Refusals are ordinary Lua errors, including the commit's
+
+The binding's **check** (`graphicsPublishCheck`) publishes nothing and refuses what is knowable before an effect as an
+ordinary error. The **commit is made in the action**, atomically (one transaction reads the authority and writes the host's
+snapshot). A stop, closure, ending instance or ended texture lease that landed between the check and the action is an
+expected lifecycle refusal: the action raises it with `refuseOrdinarily` (`Hetoimasia.Scripting.Lua.Registration`, D-88),
+which `pcall` catches, with the previous scene and its revision untouched. Two rules keep that sound:
+
+* **Nothing is outstanding when it is raised.** `publishSceneWith` returns only after every pin and borrow it took has been
+  released, and the refusal is raised after that and before the host holds the scene. It is never raised after the host
+  holds the scene: a failure after the commit is the application's own and the scene stays the window's, with no rollback
+  claimed.
+* **Only lifecycle changes are ordinary.** A texture-authority refusal, a window or instance refusal is expected. A schema or
+  geometry refusal of the same copied value the check accepted cannot be explained by a lifecycle change and is a
+  `SceneDefect`, the engine's failure.
+
+The reason is at most 160 bytes (`publishRefusalText`), inside the export's 256-byte bound. The binding is built from the
+scene package's public pieces (`prepareScene`, `textureUses`, `sceneSchema`, `sceneLimits`), not from `scenePublishBinding`,
+which takes one argument. Its reader limits are the scene's own plus **the window handle at the reader's exact charge**
+(one element and `sceneCallWindowBytes` = 21 bytes), because the reader keeps one counter across all of a call's arguments;
+the scene therefore keeps exactly its element and byte bounds. (The profile's validation reserves a larger 64-byte
+allowance for the call; that reserve is never added to the binding's limits.)
+
+### One release path
+
+Each M1 texture is released by exactly one path: this package's texture backend (`Texture.Backend`), never also through
+`render-2d-vulkan`'s `release2DTexture`. Its logical release (the registry mark, one STM write) is ordered with the
+publication by the same transaction that publishes: the publication's final authority check reads the registry flag and
+writes the host's snapshot together, and the mark can only be made after the lease release, which the publication's pin
+prevents while it is in flight. A release asked after the publication therefore asks for a barrier that names the
+publication; one asked before refuses it. The release action reads the adoption holds on the owner's thread; a held
+texture stays pending (`held`), neither failed nor retired, and is asked again through the barrier lane when the last hold
+ends, with at most one admitted request per texture.
+
+### Tests
+
+* `lua-engine-graphics-tests` (group `test.vulkan-headless`): `scene retention` (the production ledger and backend over
+  the fake owner and a model of the host's ledger rules), `scene publication` (real Lua instances, leases, pipeline
+  and window provider with the library's binding), and `the frame of an adopted scene` (the pure adaptation against the
+  render-2d oracle, the host configuration, the maximum legal scene). The model is injected evidence and says so.
+* `lua-engine-graphics-native-tests` (group `test.vulkan-lua-engine-native`), subgroup **`scene retention`**: the
+  production host with real windows and uploads. Run it alone with
+  `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:lua-engine-graphics-native-tests -- --match 'scene retention'`
+  (on macOS `HETOIMASIA_NATIVE_SESSION=desktop` on that command). It reads the host's own frame events and scene state; it
+  captures and reads back no pixel.
+
 ## Limits
 
 * The completion wake is the GPU model's change: the adapter assumes the only uploads in the session are its own and the
   table's placeholder, as in M1. A completion that changes no model state would not wake a waiting job.
 * The real-device suite is the one device claim: Linux execution is CI's.
+* A texture an adopted scene holds retires only when that scene is released, which for a static scene is its window's
+  end or a replacement. The backend's scope drains until every texture is retired, so the window provider's scope (which
+  ends every window) must exit before the backend's; the assembly (LFE-22) nests them that way.

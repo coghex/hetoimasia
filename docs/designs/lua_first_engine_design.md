@@ -9286,7 +9286,13 @@ replace boundary tests, prove performance or establish confinement.
   a per-window scene and a hold ledger counting adoptions, a publication boundary
   that pins the window and every texture lease until the host holds the scene, a
   table release gated on the ledger and retained (not failed) while held, and a
-  per-frame renderer that builds the view from the frame's own metrics.
+  per-frame renderer that builds the view from the frame's own metrics. The
+  publication binding commits atomically in its action and refuses a lifecycle
+  change that landed after its check through D-88's `refuseOrdinarily` (reason
+  bounded to 256 UTF-8 bytes), after every pin is released and never after the
+  host holds the scene; it reads the window handle at the reader's exact charge
+  (21 bytes, one element) and each M1 texture has the one release path of the
+  texture backend.
 
 #### LFE-21. Expose the complete UI-only graphics facade
 
