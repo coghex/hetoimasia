@@ -30,6 +30,7 @@ import Hetoimasia.Foundation.Log (Logger, MetadataProviders (..), callbackSink, 
 import Hetoimasia.Foundation.Time (monotonicSource)
 import Hetoimasia.LuaEngine.Boot (bootCheckpoint)
 import Hetoimasia.LuaEngine.Facade (OutputFailure (..), OutputSink (..), withOutput)
+import Hetoimasia.LuaEngine.Facade (GraphicsInjection (..), GraphicsServices (..))
 import Hetoimasia.LuaEngine.Graphics.Facade (GraphicsFacade (..), defaultIssuedMemory, emptyIssued, graphicsInjection, issuedSize, issuerOf, rememberIssued)
 import Hetoimasia.LuaEngine.Graphics.Scene (GraphicsScene (..), PublishHooks (..), noPublishHooks, scenePublisherOver)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port (Fault (FaultFatal))
@@ -82,6 +83,10 @@ data Shape = Shape
   , shapeSinkFails ∷ !Bool
   -- ^ The authored output sink raises on its first line.
   , shapeProviderHooks ∷ !ProviderHooks
+  , shapeSession ∷ !(Maybe (IORef (Maybe Session)))
+  -- ^ Where the session's handle is left, to be read after the session's call raised (the record outlives the call).
+  , shapeAlter ∷ !(GraphicsServices → GraphicsServices)
+  -- ^ A fault injected into the services the composition makes (a registration that is refused).
   , shapeRecord ∷ !(Maybe (IORef [Text]))
   -- ^ Where the fake texture owner's log is left when the run ends, for an example whose rig raises on its way out.
   , shapeInject ∷ ![Fake.Injection]
@@ -89,7 +94,7 @@ data Shape = Shape
   }
 
 defaultShape ∷ ByteString → Shape
-defaultShape entry = Shape entry True False WF.defaultFakeConfig Fake.defaultFakeConfig compositionProfile [] noPublishHooks False noProviderHooks Nothing []
+defaultShape entry = Shape entry True False WF.defaultFakeConfig Fake.defaultFakeConfig compositionProfile [] noPublishHooks False noProviderHooks Nothing id Nothing []
 
 -- | The fixed M1 profile with these counts changed, so that a bank is full after a few requests.
 profileWith ∷ [(CountLimit, Word64)] → Profile
@@ -283,19 +288,58 @@ spec = describe "graphics facade" $ do
       Left failure → fromException failure `shouldSatisfy` (\found → case found of Just OutputFailure {} → True; Nothing → False)
       Right outcome → expectationFailure ("expected the output failure, found " <> show (outVerdict outcome))
 
-  it "raises a failed texture cleanup as the fatal failure it is, once, after the session's roles retired, and runs the native cleanup once" $ do
+  it "keeps the script's failure primary and the failed texture cleanup beside it as evidence, the cleanup arriving after the primary, run once and raised once" $ do
     ref ← newIORef []
+    sessionRef ← newIORef Nothing
     raised ←
       try @SomeException . void $
-        runFacade ((defaultShape releaseFails) {shapeBoth = False, shapeRecord = Just ref, shapeInject = [Fake.FailRelease (FaultFatal "the table release failed")]}) $ \fs →
+        runFacade ((defaultShape releaseFails) {shapeBoth = False, shapeRecord = Just ref, shapeSession = Just sessionRef, shapeInject = [Fake.FailRelease (FaultFatal "the table release failed")]}) $ \fs → do
+          -- The primary failure (the script's own error) is observed first: the cleanup is the lease's release when the instance ends.
           atomically (sessionOutcomeNow (fsSession fs) >>= \found → unless (not (null (outFailures found))) retry)
-    -- The script raised first and the cleanup failed after it: the fatal cleanup failure is raised on the way out of the
-    -- backend's scope, with what it retained, and nothing ran the native release a second time.
+    -- The fatal cleanup failure is raised on the way out, once, with what the backend retained...
     case raised of
       Left failure → show failure `shouldSatisfy` Text.isInfixOf "the table release failed" . Text.pack
       Right () → expectationFailure "expected the cleanup failure to be raised"
     logged ← readIORef ref
     length (filter (Text.isPrefixOf "release attempted") logged) `shouldBe` 1
+    -- ...and the session's record, still readable, holds the script's failure as the primary.
+    found ← readIORef sessionRef >>= maybe (assertFailure "the session handle was not left") (atomically . sessionOutcomeNow)
+    map rfCode (take 1 (outFailures found)) `shouldBe` [LuaError]
+    fmap eeCode (erPrimary (outEngine found)) `shouldBe` Just LuaError
+
+  it "refuses a facade installation whose services break the registration, before any role starts, leaving the pipeline and the provider with nothing" $ do
+    ref ← newIORef []
+    raised ←
+      try @SomeException . void $
+        runFacade ((defaultShape twoRequests) {shapeBoth = False, shapeRecord = Just ref, shapeAlter = \services → services {gsTypes = gsTypes services <> gsTypes services}}) $ \_ → pure ()
+    case raised of
+      Left failure → show failure `shouldSatisfy` Text.isInfixOf "installation" . Text.pack
+      Right () → expectationFailure "expected the installation to be refused"
+    -- No request was ever made, so nothing native was.
+    logged ← readIORef ref
+    filter (Text.isPrefixOf "allocated") logged `shouldBe` []
+
+  it "settles a window request the provider's invalidation overtakes while the host holds its adoption: the window is closed once, retired, and nothing is left" $ do
+    entered ← newEmptyMVar
+    proceed ← newEmptyMVar
+    seen ← newIORef False
+    let hooks =
+          noProviderHooks
+            { hookBeforeAdopt = do
+                first ← atomicModifyIORef' seen (\held → (True, not held))
+                if first then putMVar entered () >> readMVar proceed else pure ()
+            }
+    outcome ← runFacade ((defaultShape cancelClaimed) {shapeBoth = False, shapeProviderHooks = hooks}) $ \fs → do
+      -- The window is created and attached, the host claimed the adoption recipe and the example holds it there. The provider
+      -- is invalidated meanwhile (the session-stop action ends every window), and then the recipe is let go.
+      takeMVar entered
+      endWindows (fsProvider fs)
+      putMVar proceed ()
+      atomically (providerReading (fsProvider fs) >>= \found → unless (readingAcquisitions found == 0) retry)
+      closes ← length . filter (Text.isPrefixOf "close w") <$> WF.events (fsWindows fs)
+      closes `shouldBe` 1
+      requestStop (fsSession fs) StopQuit
+    outRetired outcome `shouldBe` True
 
   it "raises the device's fault as an engine failure, never a content failure, with the window retired and no native work left" $ do
     (raised, logged) ←
@@ -369,6 +413,10 @@ expectQuad scene = do
   where
     content = graphicsContent scene
 
+-- | The same injection with its services altered.
+alterInjection ∷ (GraphicsServices → GraphicsServices) → GraphicsInjection → GraphicsInjection
+alterInjection change (GraphicsInjection make) = GraphicsInjection (fmap change . make)
+
 -- | The host model's key of the session's first window (the provider issues even tokens).
 firstWindow ∷ Int
 firstWindow = 2
@@ -422,7 +470,7 @@ runCore rig shape scenario = do
     withWindowProviderWith (shapeProviderHooks shape) config (retarget (WF.fakePort windows)) $ \provider →
       ( do
           let publisher = scenePublisherOver textures provider (\window scene → fst (modelTarget model window) scene) (\window → snd (modelTarget model window))
-              injection = graphicsInjection (GraphicsFacade (shapeProfile shape) (cpPipeline composition) provider publisher (shapeHooks shape) defaultIssuedMemory)
+              injection = alterInjection (shapeAlter shape) (graphicsInjection (GraphicsFacade (shapeProfile shape) (cpPipeline composition) provider publisher (shapeHooks shape) defaultIssuedMemory))
           checkpoint ← bootCheckpoint (shapeProfile shape) (cpInventory composition) (\_ _ → pure (Right (manifestFor (shapeBoth shape)))) >>= either (\refused → assertFailure ("boot refused: " <> show refused)) pure
           outLines ← newTVarIO []
           errLines ← newTVarIO []
@@ -448,6 +496,7 @@ runCore rig shape scenario = do
               ( do
                   found ← readMVar handle
                   writeIORef sessionRef (Just found)
+                  forM_ (shapeSession shape) (\ref → writeIORef ref (Just found))
                   let fs = FS found rig windows model provider outLines gate
                   attempted ←
                     try @SomeException $
@@ -774,7 +823,8 @@ sinkFails =
     , "    update=function(self, dt) end"
     ]
 
--- | A texture taken, released (its cleanup is made to fail), and then the script's own error.
+-- | A texture taken, and then the script's own error: the texture's lease is released when the instance ends, and that
+-- cleanup is made to fail, after the primary failure.
 releaseFails ∷ ByteString
 releaseFails =
   presentationOnly
@@ -783,7 +833,6 @@ releaseFails =
     , "      local api = self.api"
     , "      if not api.request.ready(self.t) then return end"
     , "      local tex = api.request.take(self.t).value.texture"
-    , "      pcall(api.texture.release, tex)"
     , "      error('the script failed first')"
     , "    end"
     ]
@@ -795,5 +844,13 @@ twoRequests =
     , "      self.w = api.window.open({title='t', width=64, height=64})"
     , "      self.t = api.content.texture('images/quad.png')"
     , "    end,"
+    , "    update=function(self, dt) end"
+    ]
+
+-- | A window opened and never looked at again: the host's adoption of it is what the example holds.
+cancelClaimed ∷ ByteString
+cancelClaimed =
+  presentationOnly
+    [ "    init=function(self, api) self.w = api.window.open({title='t', width=64, height=64}) end,"
     , "    update=function(self, dt) end"
     ]
