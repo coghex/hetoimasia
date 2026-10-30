@@ -85,6 +85,40 @@ spec env = describe "scene retention" $ do
       stopScene comp vm "a"
       awaitWindowCount env 0
 
+  it "keeps the texture of a scene released straight after it was published, before the owner adopted it: adopted, recorded, refused for a new publication, retired only after replacement" $
+    within 180 . withScenes env $ \comp vm _ → do
+      admitScene comp vm "a"
+      window ← openWindow env comp vm "a"
+      loadTexture comp vm "a" "a" "a.png"
+      earlier ← frameLogMark <$> readTVarIO (envFrames env)
+      -- One command, no wait between: the scene is accepted and the lease released before any adoption or frame.
+      released ← run comp vm "a" "prelease" "a" (Just "a")
+      released `shouldSatisfy` Text.isInfixOf "retiring"
+      -- The release waited behind the host's barrier for the accepted revision; the owner then adopts it and records
+      -- it with the texture still alive.
+      awaitAdopted env window 1
+      awaitFrame env window 1 earlier
+      readingLive env >>= (`shouldBe` 1)
+      held ← atomically (ledgerReading (graphicsLedger (envGraphics env)))
+      length (readingHeld held) `shouldBe` 1
+      -- A new publication naming the released lease is refused and changes nothing.
+      refused ← run comp vm "a" "ppublish" "a" (Just "a")
+      refused `shouldSatisfy` Text.isInfixOf "error"
+      published env window >>= (`shouldBe` Just 1)
+      -- Replaced by an empty scene: once the frames that used revision 1 completed, the texture retires.
+      replaced ← frameLogMark <$> readTVarIO (envFrames env)
+      _ ← run comp vm "a" "publish" "a" Nothing
+      awaitAdopted env window 2
+      awaitFrame env window 2 replaced
+      atomically (graphicsReading (envGraphics env) >>= \reading → unless (readingLiveTextures reading == 0) retry)
+      atomically (readVulkanSceneState (envHost env) >>= \state → unless (all (null . windowAwaitingRelease) (Map.elems (sceneWindows state))) retry)
+      remaining ← atomically (ledgerReading (graphicsLedger (envGraphics env)))
+      readingHeld remaining `shouldSatisfy` null
+      readingDefects remaining `shouldBe` 0
+      evidence env "a scene released straight after publication, before adoption: the owner adopted revision 1 and recorded it with the texture alive, a publication naming the released lease was refused, and the texture retired only after replacement and the frames of revision 1 completed"
+      stopScene comp vm "a"
+      awaitWindowCount env 0
+
   it "ends one instance with its scene outstanding and leaves its peer's scene adopted, retained and recorded, with no session stop" $
     within 180 . withScenes env $ \comp vm stops → do
       admitScene comp vm "a"
