@@ -40,6 +40,7 @@ module Hetoimasia.Run.Session
   , linkFailure
   , newSessionLinkEndingWith
   , awaitDiagnostics
+  , joinDiagnostics
   , ioQueueSlots
   , textureJobs
   , runPrepared
@@ -55,8 +56,9 @@ import Control.Concurrent.STM
   , readTVar
   , writeTVar
   )
-import Control.Exception (finally, mask_)
+import Control.Exception (ExceptionWithContext, SomeException, finally, mask_, rethrowIO)
 import Control.Monad (forM_, join, void)
+import Data.Foldable (traverse_)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Hetoimasia.Content.ReadPool (poolSpec, withReadPool)
 import Hetoimasia.Foundation.Time (MonotonicSource, monotonicSource)
@@ -83,7 +85,7 @@ import Hetoimasia.LuaEngine.Texture
 import Hetoimasia.LuaEngine.Texture.Backend (TextureBackend)
 import Hetoimasia.Run.Boot (Prepared (..))
 import Hetoimasia.Run.Output (authoredSinks)
-import Hetoimasia.Run.Settle (remembering)
+import Hetoimasia.Run.Settle (rememberingInterruption)
 import Hetoimasia.Runtime.Logging (LoggingLifetime, lifetimeLogger)
 import Hetoimasia.Runtime.Supervision (withSupervision)
 import Hetoimasia.Scripting.Lua.Runtime (newLuaRuntime)
@@ -141,7 +143,12 @@ newSessionLinkEndingWith ended = SessionLink <$> newTVarIO Nothing <*> newTVarIO
 -- borrows the logger, so whoever owns the logger joins it before the logger is released. The wait is interruptible;
 -- a cancellation meanwhile is remembered and raised after the writer has ended.
 awaitDiagnostics ∷ SessionLink → IO ()
-awaitDiagnostics link = remembering (atomically (join (readTVar (linkEnded link)) >>= check))
+awaitDiagnostics link = joinDiagnostics link >>= traverse_ rethrowIO
+
+-- | 'awaitDiagnostics' that /answers/ a remembered cancellation instead of raising it, for a caller that has a failure
+-- of its own to keep beside it before it raises either.
+joinDiagnostics ∷ SessionLink → IO (Maybe (ExceptionWithContext SomeException))
+joinDiagnostics link = rememberingInterruption (atomically (join (readTVar (linkEnded link)) >>= check))
 
 -- | Ask the session to stop; recorded and applied on binding when the session does not exist yet.
 linkStop ∷ SessionLink → StopKind → IO ()

@@ -16,7 +16,7 @@
 -- callback latches it and the session stops in order: exit 0.
 module Test.Run.Native.Library (spec, shippedContent, copyTree) where
 
-import Control.Concurrent (forkIO, forkIOWithUnmask, killThread, myThreadId, throwTo)
+import Control.Concurrent (ThreadId, forkIO, forkIOWithUnmask, killThread, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryReadMVar)
 import Control.Concurrent.STM
   ( TVar
@@ -33,16 +33,24 @@ import Control.Concurrent.STM
   , retry
   , swapTVar
   )
-import Control.Exception (AsyncException (UserInterrupt), SomeException, finally, mask, onException, throwIO, try)
+import Control.Exception (AsyncException (UserInterrupt), ExceptionWithContext, SomeException, finally, mask, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
+import Control.Applicative ((<|>))
 import Control.Monad (forM_, unless, void, when)
+import Data.Foldable (traverse_)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.List (isPrefixOf)
+import Data.Maybe (fromMaybe, isJust)
+import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (ThreadBlocked), threadStatus)
 import qualified Data.ByteString as ByteString
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Hetoimasia.Console.Lua.Signals (deliver)
-import Hetoimasia.Run.Settle (remembering)
-import Hetoimasia.Foundation.Log (LogFilter (..), defaultLogFilter)
+import Hetoimasia.Run.Session (newSessionLink)
+import Hetoimasia.Run.Settle (combine, rememberingInterruption)
+import Hetoimasia.Runtime.Logging (withLoggingLifetime)
+import Hetoimasia.Foundation.Log (LogFilter (..), Logger, callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.GLFW.NativeCheck (NativeCloseAnswer (..), requestNativeClose)
 import Hetoimasia.GLFW.Command (clientDemandPublisher)
 import Hetoimasia.GLFW.Demand (immediateDemand, publishDemand)
@@ -65,11 +73,10 @@ import Hetoimasia.Runtime.GLFW (attachmentWindow, hostWindowClient, hostWindowId
 import Numeric.Natural (Natural)
 import System.Directory (createDirectoryIfMissing, doesDirectoryExist, listDirectory)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
-import System.IO (stderr)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Timeout (timeout)
-import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldNotBe)
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldNotBe, shouldSatisfy)
 import Test.Run.Native.Env (Env (..), evidence)
 
 -- | The shipped content's folder, from the repository root the runner starts the suite in.
@@ -91,6 +98,8 @@ data Watch = Watch
   , watchJobs ∷ !(TVar [IO ()])
   , watchFail ∷ !(TVar Bool)
   -- ^ When set, the main thread's next turn raises: the owner loop's own failure, made on demand.
+  , watchDrainFail ∷ !(TVar Bool)
+  -- ^ When set, every turn of the drain loop raises too: a loop that cannot be served any more.
   }
 
 -- | A run's result: its status, what the scripts printed, and the host and adapter to read afterwards.
@@ -206,6 +215,43 @@ spec env = describe "the command's production composition" $ do
         tryReadMVar ended >>= (`shouldBe` Just ())
         evidence env "live cancellation: an example cancelled with the shipped content's window up stopped the run by the orderly request, waited for the main thread without a bound and raised the cancellation afterwards"
 
+  it "settles a run whose owner loop is lost for good with a window live: the application's own exit destroys what the loop could not" $
+    within 120 $
+      withSystemTempDirectory "hetoimasia-run-native" $ \folder → do
+        copyTree shippedContent folder
+        ran ← runWith env folder $ \watch host _ → do
+          window ← awaitWindow host
+          step "the adoption of the example's scene" (awaitAdopted host window 1)
+          atomically (writeTVar (watchFail watch) True >> writeTVar (watchDrainFail watch) True)
+        ranStatus ran `shouldBe` ExitFailure 1
+        retired ran
+        evidence env "lost owner loop: the main thread's loop and every drain of it were made to raise while the shipped content's window was live; the drain gave up, the application's own protected exit destroyed the window, the session was joined after the application had torn down, and the command exited 1 with nothing live"
+
+  it "keeps the scenario owned until it has finished when the example is cancelled after the command has ended" $
+    within 120 $
+      withSystemTempDirectory "hetoimasia-run-native" $ \folder → do
+        copyTree shippedContent folder
+        ended <- newEmptyMVar
+        gate <- newEmptyMVar
+        order <- newIORef ([] :: [String])
+        caller <- myThreadId
+        let note line = atomicModifyIORef' order (\l -> (l <> [line], ()))
+        -- After the command has ended, and once the caller is blocked sending its end to the held scenario, cancel it.
+        _ <- forkIO $ do
+          readMVar ended
+          blockedSending caller
+          throwTo caller UserInterrupt
+          putMVar gate ()
+        outcome <- try @SomeException $ runWithEnding env folder ended (pure ()) $ \watch host _ -> do
+          _ <- awaitWindow host
+          atomically (writeTVar (watchFail watch) True)
+          -- Held where an end cannot reach it until the example lets it go.
+          uninterruptibleMask_ (takeMVar gate) `finally` note "scenario ended"
+        note "runWith left"
+        either (\failure -> show failure) (const "no failure") outcome `shouldSatisfy` isPrefixOf "user interrupt"
+        readIORef order >>= (`shouldBe` ["scenario ended", "runWith left"])
+        evidence env "cancelled after the command ended: with the scenario held where an end could not reach it, the example was cancelled while the harness was ending it; the scenario finished first, then the cancellation was raised"
+
   it "exits 1 when a required texture cannot be read, cleaning up the window it had and every resource" $
     within 120 $
       withSystemTempDirectory "hetoimasia-run-native" $ \folder → do
@@ -246,12 +292,14 @@ runWithEnding env folder ended beforePublishing scenario = mask $ \restore → d
   frames ← newTVarIO (0, [])
   jobs ← newTVarIO []
   failNow ← newTVarIO False
+  drainFailNow ← newTVarIO False
   out ← newTVarIO []
   err ← newTVarIO []
   coordinator ← newEmptyMVar
   wanted ← newTVarIO False
   delivered ← newTVarIO False
-  let watch = Watch frames jobs failNow
+  killedByUs ← newIORef False
+  let watch = Watch frames jobs failNow drainFailNow
       record ref = OutputSink {sinkLine = \line → atomically (modifyTVar' ref (<> [line])), sinkFlush = pure ()}
       environment = productionEnvironment {envStdout = record out, envStderr = record err}
       observation =
@@ -262,6 +310,7 @@ runWithEnding env folder ended beforePublishing scenario = mask $ \restore → d
               pure $ do
                 atomically (swapTVar jobs []) >>= sequence_
                 readTVarIO failNow >>= \poisoned → when poisoned (ioError (userError "the owner loop was made to fail"))
+          , observeDrain = readTVarIO drainFailNow >>= \poisoned → when poisoned (ioError (userError "the drain loop was made to fail too"))
           }
       deliverOnce coord = do
         first ← atomically (readTVar delivered >>= \done → writeTVar delivered True >> pure (not done))
@@ -274,29 +323,48 @@ runWithEnding env folder ended beforePublishing scenario = mask $ \restore → d
         beforePublishing
         putMVar coordinator coord
         readTVarIO wanted >>= \asked → when asked (deliverOnce coord)
-      setup = Setup {setupForce = pure (), setupReady = publish, setupBoot = noBootHooks, setupDiagnostics = stderr, setupLaunch = runNativeWith observation environment}
-  finished ← newEmptyMVar ∷ IO (MVar (Either SomeException ()))
+      setup =
+        Setup
+          { setupForce = pure ()
+          , setupReady = publish
+          , setupBoot = noBootHooks
+          , setupLifetime = \_ → withLoggingLifetime silentLogger
+          , setupLink = newSessionLink
+          , setupReport = \_ → pure ()
+          , setupLaunch = runNativeWith observation environment
+          }
+  finished ← newEmptyMVar ∷ IO (MVar (Either (ExceptionWithContext SomeException) ()))
   scenarioThread ← forkIOWithUnmask $ \unmask → do
-    result ← try (unmask (do (host, graphics) ← atomically (readTMVar composed); scenario watch host graphics))
+    result ← tryWithContext (unmask (do (host, graphics) ← atomically (readTMVar composed); scenario watch host graphics))
     either (const stopRun) pure result
-    putMVar finished result
+    -- A scenario this function ended is not a scenario that failed.
+    killed ← readIORef killedByUs
+    putMVar finished (if killed then Right () else result)
   let run = runGame setup defaultLogFilter {filterEnabled = False} folder `finally` putMVar ended ()
-      -- Both activities finished: the command (waited for with no bound) and the scenario (killed first if the
-      -- command ended before there was anything for it to observe).
+      -- Both activities finished: the command (waited for with no bound), and then the scenario, which can no longer
+      -- progress once the command has ended (nothing serves a main-thread job or a frame any more), so it is ended
+      -- and joined. Every cancellation meanwhile is remembered, across the whole sequence, and answered.
       settle = do
         stopRun
-        remembering (void (readMVar ended))
-        atomically (tryReadTMVar composed) >>= maybe (killThread scenarioThread) (const (pure ()))
-        remembering (void (readMVar finished))
+        first ← rememberingInterruption (void (readMVar ended))
+        scenarioDone ← isJust <$> tryReadMVar finished
+        unless scenarioDone (writeIORef killedByUs True)
+        second ← rememberingInterruption (killThread scenarioThread >> void (readMVar finished))
+        pure (first <|> second)
   waitMain ← envStart env run
-  status ← restore waitMain `onException` settle
-  atomically (tryReadTMVar composed) >>= \case
-    Nothing → settle >> expectationFailure "the command ended before the adapter was composed" >> error "unreachable"
-    Just _ → pure ()
-  -- A scenario still waiting is bounded by its own waits.
-  restore (readMVar finished) >>= either throwIO pure
-  (host, graphics) ← atomically (readTMVar composed)
-  Ran status <$> readTVarIO out <*> pure host <*> pure graphics
+  statusOutcome ← tryWithContext @SomeException (restore waitMain)
+  interruption ← settle
+  scenarioOutcome ← readMVar finished
+  let scenarioEvidence = [("the scenario", failure) | Left failure ← [scenarioOutcome]]
+  case statusOutcome of
+    Left failure → rethrowIO =<< combine (fromMaybe failure interruption) ([("the command's run", failure) | isJust interruption] <> scenarioEvidence)
+    Right status → do
+      traverse_ (\interrupted → rethrowIO =<< combine interrupted scenarioEvidence) interruption
+      -- A scenario that failed on its own is the example's failure.
+      either rethrowIO pure scenarioOutcome
+      atomically (tryReadTMVar composed) >>= \case
+        Nothing → expectationFailure "the command ended before the adapter was composed" >> error "unreachable"
+        Just (host, graphics) → Ran status <$> readTVarIO out <*> pure host <*> pure graphics
 
 -- | Nothing the run made is left: no native window, no live texture, no hold.
 retired ∷ Ran → IO ()
@@ -441,3 +509,12 @@ capacityScript =
     , "  }"
     , "}"
     ]
+
+-- | Wait until the thread is blocked in a @throwTo@ (an end being sent that has not yet been received).
+blockedSending :: ThreadId -> IO ()
+blockedSending thread = threadStatus thread >>= \status ->
+  if status == ThreadBlocked BlockedOnException then pure () else yield >> blockedSending thread
+
+-- | A logger that writes nothing: the run's diagnostics are not what these examples observe.
+silentLogger :: Logger
+silentLogger = mkLogger defaultLogFilter {filterEnabled = False} (callbackSink (\_ -> pure ()))

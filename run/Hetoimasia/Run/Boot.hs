@@ -102,7 +102,7 @@ import Hetoimasia.LuaEngine.Boot
 import Hetoimasia.LuaEngine.Manifest (Manifest (..), contentIdText, parseManifestWith)
 import Hetoimasia.LuaEngine.Profile (ByteLimit (ManifestBytes), Bytes (Bytes), Profile, bytesLimit)
 import Hetoimasia.Run.Output (reportText)
-import Hetoimasia.Run.Settle (combine, rememberingInterruption)
+import Hetoimasia.Run.Settle (combine, diagnostic, rememberingInterruption)
 
 -- | The folder, prepared: borrowed by the continuation.
 data Prepared = Prepared
@@ -190,7 +190,7 @@ withPreparedWith hooks logger profile stop path continuation = case contentConfi
 -- diagnostic that can be stale; the identity is what names the directory.
 reportRoot ∷ Logger → RootReport → IO ()
 reportRoot logger report =
-  logInfo
+  diagnostic $ logInfo
     logger
     component
     "content root resolved"

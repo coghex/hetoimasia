@@ -21,31 +21,35 @@ module Test.Engine.Run.Support
   , observeWith
   , launchWithout
   , quietFilter
+  , silentLogger
+  , withFolder
+  , blockedFor
   ) where
 
-import Control.Concurrent (forkIO)
+import Control.Concurrent (ThreadId, forkIO, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar)
 import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO)
 import Control.Exception (SomeException, throwIO, try)
-import Control.Monad (forM_)
+import Control.Monad (forM_, unless)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Hetoimasia.Console.Lua.Signals (Delivery, deliver)
-import Hetoimasia.Foundation.Log (LogFilter (..), defaultLogFilter)
+import GHC.Conc (BlockReason, ThreadStatus (ThreadBlocked), threadStatus)
+import Hetoimasia.Foundation.Log (LogFilter (..), Logger, callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.LuaEngine.Facade (OutputSink (..))
 import Hetoimasia.LuaEngine.Session (SessionOutcome)
 import Hetoimasia.Run (Setup (..), runGame)
 import Hetoimasia.Run.Boot (BootHooks, Prepared, noBootHooks)
-import Hetoimasia.Run.Session (Environment (..), SessionLink, productionEnvironment, runPrepared)
-import Hetoimasia.Runtime.Logging (LoggingLifetime)
+import Hetoimasia.Run.Session (Environment (..), SessionLink, newSessionLink, productionEnvironment, runPrepared)
+import Hetoimasia.Runtime.Logging (LoggingLifetime, withHandleLoggingLifetime, withLoggingLifetime)
 import System.Directory (createDirectoryIfMissing)
 import System.Exit (ExitCode)
 import Data.Maybe (fromMaybe)
 import System.FilePath (takeDirectory, (</>))
-import System.IO (Handle, stderr)
+import System.IO (stderr)
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Support.Bounded (bounded)
 
@@ -82,6 +86,8 @@ data Observed = Observed
   , observedOut ∷ [Text]
   , observedErr ∷ [Text]
   , observedForced ∷ Int
+  , observedReports ∷ [Text]
+  -- ^ The terminal lines the command wrote for a failure.
   }
   deriving (Show)
 
@@ -92,16 +98,37 @@ data Changes = Changes
   -- ^ Done to the folder after its files are written and before the command starts (a link, say).
   , changeBoot ∷ FilePath → BootHooks
   -- ^ The boot seam, given the folder: a step between the manifest's first read and the scan.
-  , changeDiagnostics ∷ Maybe Handle
-  -- ^ Where the logging lifetime writes, instead of stderr: a handle the example broke, say.
+  , changeLogger ∷ Maybe Logger
+  -- ^ The logger the logging lifetime is made over, instead of stderr's: one the example counts and breaks.
+  , changeLink ∷ Maybe (IO SessionLink)
+  -- ^ How the command makes its link to the session: one whose diagnostics writer the example holds.
   }
 
 unchanged ∷ Changes
-unchanged = Changes id (\_ → pure ()) (\_ → noBootHooks) Nothing
+unchanged = Changes id (\_ → pure ()) (\_ → noBootHooks) Nothing Nothing
 
 -- | A filter that writes nothing, so a failing run does not fill the suite's own stderr.
 quietFilter ∷ LogFilter
 quietFilter = defaultLogFilter {filterEnabled = False}
+
+-- | These files written into a temporary folder, which the body is given.
+withFolder ∷ Files → (FilePath → IO a) → IO a
+withFolder files body = withSystemTempDirectory "hetoimasia-run" $ \folder → do
+  forM_ files $ \(path, bytes) → do
+    createDirectoryIfMissing True (takeDirectory (folder </> path))
+    ByteString.writeFile (folder </> path) bytes
+  body folder
+
+-- | A logger that writes nothing.
+silentLogger ∷ Logger
+silentLogger = mkLogger quietFilter (callbackSink (\_ → pure ()))
+
+-- | Wait until a thread is blocked for this reason, by asking the runtime: coordination on what the thread is doing,
+-- not a wait for time to pass.
+blockedFor ∷ BlockReason → ThreadId → IO ()
+blockedFor reason thread = bounded loop
+  where
+    loop = threadStatus thread >>= \status → unless (status == ThreadBlocked reason) (yield >> loop)
 
 -- | The launch the suite substitutes for the native one: the real session over a prepared folder, no graphics.
 launchWithout ∷ Environment → LoggingLifetime → STM Bool → SessionLink → Prepared → IO SessionOutcome
@@ -114,14 +141,12 @@ observe = observeWith unchanged
 -- | 'observe' with these changes. The folder is written first, the command is run with every wait of the
 -- scenario bounded, and a failure of the scenario is raised after the command has returned and unwound.
 observeWith ∷ Changes → Files → (Probe → IO ()) → IO Observed
-observeWith changes files scenario = withSystemTempDirectory "hetoimasia-run" $ \folder → do
-  forM_ files $ \(path, bytes) → do
-    createDirectoryIfMissing True (takeDirectory (folder </> path))
-    ByteString.writeFile (folder </> path) bytes
+observeWith changes files scenario = withFolder files $ \folder → do
   changePrepare changes folder
   out ← newTVarIO []
   err ← newTVarIO []
   forced ← newTVarIO 0
+  reports ← newTVarIO []
   coordinator ← newEmptyMVar
   let record ref = OutputSink {sinkLine = \line → atomically (modifyTVar' ref (<> [line])), sinkFlush = pure ()}
       (stdoutSink, stderrSink) = changeSinks changes (record out, record err)
@@ -131,7 +156,11 @@ observeWith changes files scenario = withSystemTempDirectory "hetoimasia-run" $ 
           { setupForce = atomically (modifyTVar' forced (+ 1))
           , setupReady = putMVar coordinator
           , setupBoot = changeBoot changes folder
-          , setupDiagnostics = fromMaybe stderr (changeDiagnostics changes)
+          , setupLifetime = \configuration -> case changeLogger changes of
+              Just logger -> withLoggingLifetime logger
+              Nothing -> withHandleLoggingLifetime configuration stderr
+          , setupLink = fromMaybe newSessionLink (changeLink changes)
+          , setupReport = \line -> atomically (modifyTVar' reports (<> [line]))
           , setupLaunch = launchWithout environment
           }
       probe =
@@ -143,11 +172,10 @@ observeWith changes files scenario = withSystemTempDirectory "hetoimasia-run" $ 
           }
   finished ← newEmptyMVar ∷ IO (MVar (Either SomeException ()))
   _ ← forkIO (try (scenario probe) >>= putMVar finished)
-  -- A handle the example broke is the point of its example, so logging is on for it.
-  status ← bounded (runGame setup (maybe quietFilter (const defaultLogFilter) (changeDiagnostics changes)) folder)
+  status ← bounded (runGame setup quietFilter folder)
   -- A scenario still waiting for a line the command never wrote fails its own bounded wait.
   bounded (readMVar finished) >>= either throwIO pure
-  Observed status <$> readTVarIO out <*> readTVarIO err <*> readTVarIO forced
+  Observed status <$> readTVarIO out <*> readTVarIO err <*> readTVarIO forced <*> readTVarIO reports
   where
     awaitIn ∷ TVar [Text] → (Text → Bool) → IO ()
     awaitIn ref matches = atomically (readTVar ref >>= check . any matches)

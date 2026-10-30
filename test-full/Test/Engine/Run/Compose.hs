@@ -6,7 +6,7 @@
 -- would print, and the line is absent. Nothing sleeps.
 module Test.Engine.Run.Compose (spec) where
 
-import Control.Concurrent (threadDelay)
+import Control.Concurrent (forkIO, myThreadId, threadDelay, throwTo)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Monad (forever, void)
 import qualified Data.ByteString as ByteString
@@ -14,15 +14,23 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Console.Lua.Signals (Delivery (..))
 import Hetoimasia.LuaEngine.Facade (OutputSink (..))
-import Hetoimasia.Foundation.Resource (withResource)
-import Hetoimasia.Run.Boot (BootHooks (..))
+import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Exception (AsyncException (UserInterrupt), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, tryWithContext)
+import Data.List (isInfixOf)
+import GHC.Conc (BlockReason (BlockedOnSTM))
+import Hetoimasia.Foundation.Log (callbackSinkWith, defaultLogFilter, mkLogger)
+import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, displayCleanupFailure, withResource)
+import Hetoimasia.LuaEngine.Session (SessionOutcome)
+import Hetoimasia.Run (Setup (..), runGame)
+import Hetoimasia.Run.Session (newSessionLinkEndingWith)
+import Hetoimasia.Runtime.Logging (withLoggingLifetime)
+import Hetoimasia.Run.Boot (BootHooks (..), noBootHooks)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
-import System.IO (hClose, hSetBuffering, BufferMode (NoBuffering))
-import System.Process (createPipe)
 import System.Posix.Files (createSymbolicLink)
 import Test.Engine.Run.Support
-import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldContain, shouldNotContain, shouldSatisfy)
+import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldNotContain, shouldSatisfy)
+import Test.Support.Bounded (bounded)
 
 -- | Every one of these lines was printed, in any order: the roles' inits are dispatched together.
 shouldInclude ∷ [Text] → [Text] → Expectation
@@ -240,13 +248,68 @@ stops = describe "stops and signals" $ do
     observedStatus observed `shouldBe` ExitFailure 1
     observedOut observed `shouldBe` []
 
-  it "is 1, reaching no authored Lua and raising nothing, when the diagnostic path itself fails at startup" $ do
-    (readEnd, broken) ← createPipe
-    hClose readEnd
-    hSetBuffering broken NoBuffering
-    observed ← observeWith unchanged {changeDiagnostics = Just broken} [("hetoimasia.json", commonManifest), ("main.lua", lua (entry (logic <> quittingUi)))] (\_ → pure ())
+  it "is 1, reaching no authored Lua, with no flush through the failed path and no line written to it, when a startup diagnostic fails" $ do
+    writes ← newTVarIO (0 ∷ Int)
+    flushes ← newTVarIO (0 ∷ Int)
+    let sink =
+          callbackSinkWith
+            (\_ → atomically (modifyTVar' writes (+ 1)) >> ioError (userError "the diagnostic sink is broken"))
+            (atomically (modifyTVar' flushes (+ 1)))
+        logger = mkLogger defaultLogFilter sink
+    observed ← observeWith unchanged {changeLogger = Just logger} [("hetoimasia.json", commonManifest), ("main.lua", lua (entry (logic <> quittingUi)))] (\_ → pure ())
     observedStatus observed `shouldBe` ExitFailure 1
     observedOut observed `shouldBe` []
+    -- The failed write is marked as the diagnostics' own, so the lifetime does not flush through that sink, and the
+    -- command writes no terminal line through the path that just failed.
+    readTVarIO writes >>= (`shouldBe` 1)
+    readTVarIO flushes >>= (`shouldBe` 0)
+    observedReports observed `shouldBe` []
+
+  it "writes one terminal line, and flushes once, for an ordinary failure with a working diagnostic path" $ do
+    flushes ← newTVarIO (0 ∷ Int)
+    let sink = callbackSinkWith (\_ → pure ()) (atomically (modifyTVar' flushes (+ 1)))
+        logger = mkLogger defaultLogFilter sink
+    observed ← observeWith unchanged {changeLogger = Just logger} [("main.lua", lua "return {}")] (\_ → pure ())
+    observedStatus observed `shouldBe` ExitFailure 1
+    length (observedReports observed) `shouldBe` 1
+    readTVarIO flushes >>= (`shouldSatisfy` (>= 1))
+
+  it "keeps the launch failure, with its cleanup evidence, when a cancellation arrives while the session's diagnostics writer is joined" $ do
+    ended ← newTVarIO False
+    started ← newEmptyMVar
+    result ← newEmptyMVar
+    caller ← newEmptyMVar
+    let held = newSessionLinkEndingWith (readTVar ended)
+        launching =
+          withResource (pure ()) (\_ → ioError (userError "launch cleanup failed")) $ \_ → do
+            putMVar started ()
+            ioError (userError "launch failed") ∷ IO SessionOutcome
+        setup =
+          Setup
+            { setupForce = pure ()
+            , setupReady = \_ → pure ()
+            , setupBoot = noBootHooks
+            , setupLifetime = \_ → withLoggingLifetime silentLogger
+            , setupLink = held
+            , setupReport = \_ → pure ()
+            , setupLaunch = \_ _ _ _ → launching
+            }
+    _ ← forkIO $ do
+      myThreadId >>= putMVar caller
+      outcome ← withFolder [("hetoimasia.json", commonManifest), ("main.lua", lua (entry logic))] $ \folder →
+        tryWithContext @SomeException (runGame setup quietFilter folder)
+      putMVar result outcome
+    me ← takeMVar caller
+    takeMVar started
+    -- The launch failed, and the command is now joining the writer, which is held: interrupt it there.
+    blockedFor BlockedOnSTM me
+    throwTo me UserInterrupt
+    atomically (writeTVar ended True)
+    bounded (takeMVar result) >>= \case
+      Left (ExceptionWithContext context failure) → do
+        (fromException failure ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
+        concatMap displayCleanupFailure (cleanupFailuresInContext context) `shouldSatisfy` isInfixOf "launch"
+      Right _ → expectationFailure "the cancellation was lost"
 
   it "abandons the boot work on a signal, runs nothing authored, and is 130" $ do
     gate ← newEmptyMVar

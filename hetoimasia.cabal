@@ -375,6 +375,7 @@ test-suite run-native-tests
             hetoimasia-gpu-vulkan-glfw ==0.1.0.0,
             hetoimasia-lua-engine ==0.1.0.0,
             hetoimasia-lua-engine:facade,
-            hetoimasia-lua-engine-graphics
+            hetoimasia-lua-engine-graphics,
+            hetoimasia-runtime ==0.1.0.0
     else
         buildable: False

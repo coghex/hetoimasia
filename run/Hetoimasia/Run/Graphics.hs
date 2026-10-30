@@ -42,10 +42,10 @@ module Hetoimasia.Run.Graphics
   ) where
 
 import Control.Concurrent.STM (STM, atomically, retry)
-import Control.Exception (finally)
+import Control.Exception (SomeException, finally, mask, rethrowIO, tryWithContext)
 import Control.Monad (join, unless)
 import Data.List (partition)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Log (Component, Logger, logWarning, unsafeComponent)
 import Hetoimasia.GLFW.Vulkan (withLoaderIntegration)
@@ -96,7 +96,8 @@ import Hetoimasia.LuaEngine.Session
   , newRoleFailure
   )
 import Hetoimasia.Run.Boot (Prepared (..))
-import Hetoimasia.Run.Serve (Owner (..), serve)
+import Hetoimasia.Run.Serve (Owner (..), Spawned, joinFailure, serve, spawn)
+import Hetoimasia.Run.Settle (diagnostic)
 import Hetoimasia.Run.Output (reportText)
 import Hetoimasia.Run.Session
   ( Environment
@@ -125,10 +126,13 @@ import Hetoimasia.Runtime.Supervision (RuntimeControl, withSupervision)
 data Observation = Observation
   { observeFrame ∷ FrameEvent → IO ()
   , observeComposed ∷ VulkanHost GraphicsScene → TextureGraphics → IO (IO ())
+  , observeDrain ∷ IO ()
+  -- ^ Run on every turn of the drain loop that serves the owner after its ordinary loop failed: where an example makes
+  -- that loop fail too.
   }
 
 noObservation ∷ Observation
-noObservation = Observation (\_ → pure ()) (\_ _ → pure (pure ()))
+noObservation = Observation (\_ → pure ()) (\_ _ → pure (pure ())) (pure ())
 
 -- | 'runNativeWith' 'noObservation': the command's own.
 runNative ∷ Environment → LoggingLifetime → STM Bool → SessionLink → Prepared → IO SessionOutcome
@@ -146,56 +150,73 @@ runNativeWith observation environment lifetime stop link prepared = do
       base = vulkanHostConfig (defaultHostConfig []) capture (configurationBudgets textureConfiguration) (scenesInitial scenes)
       config = (configureScenes scenes (configureWindows (configureHost textureConfiguration base))) {vulkanFrameObserver = observeFrame observation}
   verdictCell ← newIORef Nothing
-  outcome ←
-    withLoaderIntegration $ \integration →
-      runGraphicsOwnerApplication
-        ($ lifetime)
-        "hetoimasia"
-        ( \_ use → do
-            (result, verdict) ← withVulkanOwnerHost logger integration config use
-            writeIORef verdictCell (Just verdict)
-            pure result
-        )
-        vulkanWindowHost
-        (\vulkan _ → pure vulkan)
-        (\vulkan control → body scenes textureConfiguration config vulkan control)
-  verdict ← readIORef verdictCell
-  checkVerdict logger verdict
-  pure outcome
+  slot ← newIORef Nothing
+  result ←
+    tryWithContext @SomeException $
+      withLoaderIntegration $ \integration →
+        runGraphicsOwnerApplication
+          ($ lifetime)
+          "hetoimasia"
+          ( \_ use → do
+              (answer, verdict) ← withVulkanOwnerHost logger integration config use
+              writeIORef verdictCell (Just verdict)
+              pure answer
+          )
+          vulkanWindowHost
+          (\vulkan _ → pure vulkan)
+          (\vulkan control → body slot scenes textureConfiguration config vulkan control)
+  -- The owner application and the device are torn down now, whatever the way out. If the loop was lost the session
+  -- was left to settle against that teardown, and it is joined here, with its failure kept beside the loop's.
+  case result of
+    Right outcome → do
+      verdict ← readIORef verdictCell
+      checkVerdict logger verdict
+      pure outcome
+    Left failure → do
+      spawned ← readIORef slot
+      rethrowIO =<< maybe (pure failure) (\session → joinFailure session Nothing failure) spawned
   where
     logger = lifetimeLogger lifetime
 
-    body ∷ SceneSession → TextureGraphicsConfiguration → VulkanHostConfig GraphicsScene → VulkanHost GraphicsScene → RuntimeControl → IO SessionOutcome
-    body scenes textureConfiguration config vulkan control = do
+    body ∷ IORef (Maybe (Spawned SessionOutcome)) → SceneSession → TextureGraphicsConfiguration → VulkanHostConfig GraphicsScene → VulkanHost GraphicsScene → RuntimeControl → IO SessionOutcome
+    body slot scenes textureConfiguration config vulkan control = do
       awaitReadiness vulkan
       _ ← superviseGraphicsOwner control (vulkanGraphicsOwner vulkan)
-      withTextureGraphics scenes textureConfiguration config vulkan $ \graphics → do
-        providerStep ← newIORef (pure ())
-        (port, _) ← newHostPort vulkan
-        let profile = preparedProfile prepared
-            production =
-              Graphics
-                { graphicsTextureBackend = graphicsBackend graphics
-                , graphicsMount = \pipeline link' continue →
-                    withWindowProvider (linkWindowConfig link') port $ \provider → do
-                      writeIORef providerStep (windowMainStep provider)
-                      let publisher = scenePublisher (graphicsTextures graphics) provider
-                          injection = graphicsInjection (GraphicsFacade profile pipeline provider publisher noPublishHooks defaultIssuedMemory)
-                      continue injection `finally` writeIORef providerStep (pure ())
-                }
-        observed ← observeComposed observation vulkan graphics
-        let finish over = over >>= \finished → pure (if finished then FinishWith () else ContinueWith NoUpdateDemand)
-            loop checkpoints turn' = runVulkanOwnerLoop vulkan checkpoints (defaultScheduledHooks logger turn')
-            owner =
-              Owner
-                { ownerServe = \turn over → loop control (\_ → turn >> finish over)
-                  -- The drain makes its own supervision: the application's may have latched the very failure that
-                  -- ended the ordinary loop, and its checkpoints would end the drain before it served anything.
-                , ownerDrain = \over → withSupervision lifetime $ \fresh → loop fresh (\_ → finish over)
-                , ownerWake = wakeGraphicsHost (vulkanGraphicsOwner vulkan)
-                }
-        serve logger owner (linkStop link StopInterrupt) (join (readIORef providerStep) >> observed) $
-          runPrepared environment lifetime stop link prepared (Just production) (\_ → pure ())
+      providerStep ← newIORef (pure ())
+      observedStep ← newIORef (pure ())
+      let profile = preparedProfile prepared
+          finish over = over >>= \finished → pure (if finished then FinishWith () else ContinueWith NoUpdateDemand)
+          loop checkpoints turn' = runVulkanOwnerLoop vulkan checkpoints (defaultScheduledHooks logger turn')
+          owner =
+            Owner
+              { ownerServe = \turn over → loop control (\_ → turn >> finish over)
+                -- The drain makes its own supervision: the application's may have latched the very failure that
+                -- ended the ordinary loop, and its checkpoints would end the drain before it served anything.
+              , ownerDrain = \over → withSupervision lifetime $ \fresh → loop fresh (\_ → observeDrain observation >> finish over)
+              , ownerWake = wakeGraphicsHost (vulkanGraphicsOwner vulkan)
+              }
+          -- Everything the session uses is the session thread's own: the texture adapter, the pipeline, the window
+          -- provider and the roles. The main thread keeps the native owner and serves it.
+          session = withTextureGraphics scenes textureConfiguration config vulkan $ \graphics → do
+            (port, _) ← newHostPort vulkan
+            observed ← observeComposed observation vulkan graphics
+            writeIORef observedStep observed
+            let production =
+                  Graphics
+                    { graphicsTextureBackend = graphicsBackend graphics
+                    , graphicsMount = \pipeline link' continue →
+                        withWindowProvider (linkWindowConfig link') port $ \provider → do
+                          writeIORef providerStep (windowMainStep provider)
+                          let publisher = scenePublisher (graphicsTextures graphics) provider
+                              injection = graphicsInjection (GraphicsFacade profile pipeline provider publisher noPublishHooks defaultIssuedMemory)
+                          continue injection `finally` writeIORef providerStep (pure ())
+                    }
+            runPrepared environment lifetime stop link prepared (Just production) (\_ → pure ())
+              `finally` writeIORef observedStep (pure ())
+      mask $ \restore → do
+        spawned ← spawn owner session
+        writeIORef slot (Just spawned)
+        restore (serve logger owner (linkStop link StopInterrupt) (join (readIORef providerStep) >> join (readIORef observedStep)) spawned)
 
 -- | The window provider's stop and fatal endpoints, through the link: a genuine native close is the session's
 -- idempotent normal stop, a failure of retirement a @cleanup_failure@ and any other fatal fault a
@@ -237,7 +258,7 @@ checkVerdict logger = \case
   Just verdict → do
     let (fatal, lost) = partition fatalIssue (verdictIssues verdict)
     unless (null lost) $
-      logWarning logger component "diagnostic records were lost" [("issues", reportText (Text.pack (show lost)))]
+      diagnostic $ logWarning logger component "diagnostic records were lost" [("issues", reportText (Text.pack (show lost)))]
     unless (null fatal) $
       ioError (userError (Text.unpack (reportText ("the diagnostic capture was not clean: " <> Text.pack (show fatal)))))
 
