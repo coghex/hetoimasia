@@ -6,13 +6,15 @@
 -- would print, and the line is absent. Nothing sleeps.
 module Test.Engine.Run.Compose (spec) where
 
-import Control.Concurrent.MVar (newEmptyMVar, takeMVar)
-import Control.Monad (void)
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Monad (forever, void)
 import qualified Data.ByteString as ByteString
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Console.Lua.Signals (Delivery (..))
 import Hetoimasia.LuaEngine.Facade (OutputSink (..))
+import Hetoimasia.Foundation.Resource (withResource)
 import Hetoimasia.Run.Boot (BootHooks (..))
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
@@ -224,6 +226,17 @@ stops = describe "stops and signals" $ do
       probeAwaitOut probe "ui ready"
       void (probeSignal probe)
     observedStatus observed `shouldBe` ExitFailure 1
+
+  it "is 1, not 130, when the abandoned preparation's cleanup failed" $ do
+    started ← newEmptyMVar
+    let failing _ =
+          BootHooks . withResource (pure ()) (\_ → ioError (userError "preparation release failed")) $ \_ →
+            putMVar started () >> forever (threadDelay 100000000)
+    observed ← observeWith unchanged {changeBoot = failing} files $ \probe → do
+      takeMVar started
+      void (probeSignal probe)
+    observedStatus observed `shouldBe` ExitFailure 1
+    observedOut observed `shouldBe` []
 
   it "abandons the boot work on a signal, runs nothing authored, and is 130" $ do
     gate ← newEmptyMVar

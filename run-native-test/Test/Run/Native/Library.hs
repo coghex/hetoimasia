@@ -16,8 +16,8 @@
 -- callback latches it and the session stops in order: exit 0.
 module Test.Run.Native.Library (spec, shippedContent, copyTree) where
 
-import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar)
+import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryReadMVar)
 import Control.Concurrent.STM
   ( TVar
   , atomically
@@ -26,18 +26,21 @@ import Control.Concurrent.STM
   , newTVarIO
   , putTMVar
   , readTMVar
+  , tryReadTMVar
+  , writeTVar
   , readTVar
   , readTVarIO
   , retry
   , swapTVar
   )
-import Control.Exception (SomeException, throwIO, try)
-import Control.Monad (forM_, unless)
+import Control.Exception (SomeException, finally, onException, throwIO, try)
+import Control.Monad (forM_, unless, void, when)
 import qualified Data.ByteString as ByteString
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
+import Hetoimasia.Console.Lua.Signals (deliver)
 import Hetoimasia.Foundation.Log (LogFilter (..), defaultLogFilter)
 import Hetoimasia.GLFW.NativeCheck (NativeCloseAnswer (..), requestNativeClose)
 import Hetoimasia.GLFW.Command (clientDemandPublisher)
@@ -84,6 +87,8 @@ copyTree from to = do
 data Watch = Watch
   { watchFrames ∷ !(TVar (Int, [FrameEvent]))
   , watchJobs ∷ !(TVar [IO ()])
+  , watchFail ∷ !(TVar Bool)
+  -- ^ When set, the main thread's next turn raises: the owner loop's own failure, made on demand.
   }
 
 -- | A run's result: its status, what the scripts printed, and the host and adapter to read afterwards.
@@ -147,6 +152,28 @@ spec env = describe "the command's production composition" $ do
         retired ran
         evidence env "capacity: through the production facade, 8 texture requests (the instance's 128 MiB nominal bytes) and 8 data requests filled the instance's 16 request records; the window request with its own slot free answered busy, a nonfatal data answer with no host fault; after the results were taken and the textures released an explicit retry was accepted; a second window request was the ordinary error; the session exited 0 and everything retired"
 
+  it "serves the owner's retirement while it unwinds an owner loop that failed with a window live, and exits 1 with everything retired" $
+    within 120 $
+      withSystemTempDirectory "hetoimasia-run-native" $ \folder → do
+        copyTree shippedContent folder
+        ran ← runWith env folder $ \watch host _ → do
+          window ← awaitWindow host
+          step "the adoption of the example's scene" (awaitAdopted host window 1)
+          atomically (writeTVar (watchFail watch) True)
+        ranStatus ran `shouldBe` ExitFailure 1
+        retired ran
+        evidence env "owner loop failure: the main thread's loop was made to raise while the shipped content's window was live; the session was asked to stop, the loop was served again until the window was destroyed and the texture proved retired, and the command exited 1"
+
+  it "stops and joins the run by itself when the observing scenario fails, and raises the scenario's failure" $
+    within 120 $
+      withSystemTempDirectory "hetoimasia-run-native" $ \folder → do
+        copyTree shippedContent folder
+        outcome ← try @SomeException $ runWith env folder $ \_ host _ → do
+          _ ← awaitWindow host
+          ioError (userError "the observation failed on purpose")
+        either (\failure → show failure) (const "no failure") outcome `shouldBe` "user error (the observation failed on purpose)"
+        evidence env "failed observation: a scenario that failed with the shipped content's window live stopped the run by the orderly request, the run unwound by itself, and the scenario's failure was raised afterwards"
+
   it "exits 1 when a required texture cannot be read, cleaning up the window it had and every resource" $
     within 120 $
       withSystemTempDirectory "hetoimasia-run-native" $ \folder → do
@@ -173,22 +200,39 @@ runWith env folder scenario = do
   composed ← newEmptyTMVarIO
   frames ← newTVarIO (0, [])
   jobs ← newTVarIO []
+  failNow ← newTVarIO False
   out ← newTVarIO []
-  let watch = Watch frames jobs
-      record ref = OutputSink {sinkLine = \line → atomically (modifyTVar' ref (<> [line])), sinkFlush = pure ()}
   err ← newTVarIO []
-  let environment = productionEnvironment {envStdout = record out, envStderr = record err}
+  coordinator ← newEmptyMVar
+  let watch = Watch frames jobs failNow
+      record ref = OutputSink {sinkLine = \line → atomically (modifyTVar' ref (<> [line])), sinkFlush = pure ()}
+      environment = productionEnvironment {envStdout = record out, envStderr = record err}
       observation =
         Observation
           { observeFrame = \event → atomically (modifyTVar' frames (\(count, events) → (count + 1, take 4096 (event : events))))
           , observeComposed = \host graphics → do
               atomically (putTMVar composed (host, graphics))
-              pure (atomically (swapTVar jobs []) >>= sequence_)
+              pure $ do
+                atomically (swapTVar jobs []) >>= sequence_
+                readTVarIO failNow >>= \poisoned → when poisoned (ioError (userError "the owner loop was made to fail"))
           }
-      setup = Setup {setupForce = pure (), setupReady = \_ → pure (), setupBoot = noBootHooks, setupLaunch = runNativeWith observation environment}
+      setup = Setup {setupForce = pure (), setupReady = putMVar coordinator, setupBoot = noBootHooks, setupLaunch = runNativeWith observation environment}
+      -- The orderly stop an observation that failed, or an example that was cancelled, owes the run it started: the
+      -- same first-signal request the installed handlers make. Without it the command, which never quits by itself,
+      -- would keep running until an external watchdog.
+      stopRun = tryReadMVar coordinator >>= mapM_ (void . deliver)
   finished ← newEmptyMVar ∷ IO (MVar (Either SomeException ()))
-  _ ← forkIO $ try (do (host, graphics) ← atomically (readTMVar composed); scenario watch host graphics) >>= putMVar finished
-  status ← envMain env (runGame setup defaultLogFilter {filterEnabled = False} folder)
+  ended ← newEmptyMVar ∷ IO (MVar ())
+  scenarioThread ← forkIO $ do
+    result ← try (do (host, graphics) ← atomically (readTMVar composed); scenario watch host graphics)
+    either (const stopRun) pure result
+    putMVar finished result
+  let run = runGame setup defaultLogFilter {filterEnabled = False} folder `finally` putMVar ended ()
+  -- A cancelled example stops the run and waits for the main thread to finish with it, so nothing native outlives it.
+  status ← envMain env run `onException` (stopRun >> void (timeout (60 * 1000000) (readMVar ended)))
+  atomically (tryReadTMVar composed) >>= \case
+    Nothing → killThread scenarioThread >> expectationFailure "the command ended before the adapter was composed" >> error "unreachable"
+    Just _ → pure ()
   -- A scenario still waiting is bounded by its own waits.
   readMVar finished >>= either throwIO pure
   (host, graphics) ← atomically (readTMVar composed)

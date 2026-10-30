@@ -44,12 +44,13 @@ module Hetoimasia.Run.Graphics
 import Control.Concurrent (forkIOWithUnmask)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryReadMVar)
 import Control.Concurrent.STM (STM, atomically, retry)
-import Control.Exception (SomeException, finally, mask, onException, throwIO, try)
-import Control.Monad (join, unless)
+import Control.Exception (ExceptionWithContext, SomeException, displayException, finally, mask, rethrowIO, tryWithContext)
+import Control.Monad (join, unless, void)
+import Data.Maybe (isJust)
 import Data.List (partition)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import qualified Data.Text as Text
-import Hetoimasia.Foundation.Log (Component, Logger, logWarning, unsafeComponent)
+import Hetoimasia.Foundation.Log (Component, Logger, logError, logWarning, unsafeComponent)
 import Hetoimasia.GLFW.Vulkan (withLoaderIntegration)
 import Hetoimasia.GPU.Vulkan.Diagnostics
   ( CaptureConfig (..)
@@ -97,7 +98,7 @@ import Hetoimasia.LuaEngine.Session
   , StopKind (StopInterrupt, StopQuit)
   , newRoleFailure
   )
-import Hetoimasia.Run.Boot (Prepared (..))
+import Hetoimasia.Run.Boot (Prepared (..), remembering)
 import Hetoimasia.Run.Output (reportText)
 import Hetoimasia.Run.Session
   ( Environment
@@ -207,24 +208,43 @@ linkWindowConfig link =
       Fatal _ → HostFailure
 
 -- | Run the session on a thread of its own and serve the owner's loop on this one until it has ended. The
--- session's failure is raised here, after the loop has stopped; a failure of the loop asks the session to stop
--- and waits for it, so nothing the session borrows unwinds under it.
+-- session's failure is raised here, with the context it carries, after the loop has stopped.
+--
+-- If the loop itself fails (or this thread is cancelled in it) the session is asked to stop and the loop is
+-- served /again/ until the session has settled: its cleanup closes windows and waits for their native
+-- destruction, which only this thread's loop performs, so joining it without serving would deadlock. The loop's
+-- failure stays primary and is raised with its context once the session has settled; a failure of the second
+-- loop is logged and the join still completes. Every wait here remembers a cancellation delivered meanwhile
+-- and raises it afterwards, never instead of the join.
 serve ∷ VulkanHost GraphicsScene → RuntimeControl → Logger → SessionLink → IORef (IO ()) → IO () → IO SessionOutcome → IO SessionOutcome
 serve vulkan control logger link providerStep observed session = mask $ \restore → do
-  done ← newEmptyMVar ∷ IO (MVar (Either SomeException SessionOutcome))
+  done ← newEmptyMVar ∷ IO (MVar (Either (ExceptionWithContext SomeException) SessionOutcome))
   -- The session thread exists from here on, so everything below is inside the guard that stops and joins it.
   _ ← forkIOWithUnmask $ \unmask → do
-    result ← unmask (try session)
+    result ← unmask (tryWithContext session)
     putMVar done result
     wakeGraphicsHost (vulkanGraphicsOwner vulkan)
-  let update _ = do
+  let finished = isJust <$> tryReadMVar done
+      loop turn = runVulkanOwnerLoop vulkan control (defaultScheduledHooks logger turn)
+      update _ = do
         join (readIORef providerStep)
         observed
-        finished ← tryReadMVar done
-        pure (maybe (ContinueWith NoUpdateDemand) (const (FinishWith ())) finished)
-  restore (runVulkanOwnerLoop vulkan control (defaultScheduledHooks logger update))
-    `onException` (linkStop link StopInterrupt >> readMVar done >> pure ())
-  readMVar done >>= either throwIO pure
+        finished >>= \over → pure (if over then FinishWith () else ContinueWith NoUpdateDemand)
+      -- Serving only what retirement needs: no provider step, no observation, which may be what failed.
+      drainUpdate _ = finished >>= \over → pure (if over then FinishWith () else ContinueWith NoUpdateDemand)
+  tryWithContext (restore (loop update)) >>= \case
+    Right () → pure ()
+    Left failure → do
+      linkStop link StopInterrupt
+      remembering $
+        tryWithContext (loop drainUpdate) >>= \case
+          Right () → pure ()
+          Left (again ∷ ExceptionWithContext SomeException) →
+            logError logger component "the owner loop failed again while the session was draining" [("reason", reportText (Text.pack (displayException again)))]
+      remembering (void (readMVar done))
+      rethrowIO (failure ∷ ExceptionWithContext SomeException)
+  remembering (void (readMVar done))
+  readMVar done >>= either rethrowIO pure
 
 -- | Wait for the owner's startup, which creates the device with no surface.
 awaitReadiness ∷ VulkanHost scene → IO ()

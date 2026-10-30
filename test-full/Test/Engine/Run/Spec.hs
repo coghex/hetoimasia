@@ -3,6 +3,7 @@
 -- None acquires a native session; the native launcher is @run-native-tests@'s.
 module Test.Engine.Run.Spec (spec) where
 
+import qualified Test.Engine.Run.Abort as Abort
 import qualified Test.Engine.Run.Compose as Compose
 import qualified Test.Engine.Run.Options as Options
 import qualified Test.Engine.Run.Process as Process
@@ -13,5 +14,6 @@ spec ∷ Spec
 spec = describe "Run" $ do
   Options.spec
   Status.spec
+  Abort.spec
   Compose.spec
   Process.spec

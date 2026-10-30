@@ -271,6 +271,7 @@ test-suite hetoimasia-tests
     if flag(full-product)
         hs-source-dirs: test-full
         other-modules:
+            Test.Engine.Run.Abort
             Test.Engine.Run.Child
             Test.Engine.Run.Compose
             Test.Engine.Run.Options
@@ -362,6 +363,7 @@ test-suite run-native-tests
             text >=2.1 && <2.2,
             time >=1.15 && <1.16,
             unix >=2.8 && <2.9,
+            hetoimasia:console,
             hetoimasia:run,
             hetoimasia-foundation ==0.1.0.0,
             hetoimasia-glfw ==0.1.0.0,

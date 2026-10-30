@@ -40,6 +40,7 @@ module Hetoimasia.Run.Boot
   , withPrepared
   , withPreparedWith
   , abortable
+  , remembering
   ) where
 
 import Control.Concurrent (forkIO, killThread)
@@ -53,17 +54,25 @@ import Control.Concurrent.STM
   , readTMVar
   )
 import Control.Exception
-  ( SomeAsyncException
+  ( AsyncException (ThreadKilled)
+  , ExceptionWithContext (ExceptionWithContext)
+  , Exception
+  , SomeAsyncException
   , SomeException
   , catch
   , displayException
+  , fromException
   , mask
   , onException
+  , rethrowIO
   , throwIO
   , toException
   , try
+  , tryWithContext
   )
+import Control.Monad (void)
 import Data.Foldable (traverse_)
+import Hetoimasia.Foundation.Resource (cleanupFailuresInContext)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.ByteString (ByteString)
@@ -219,31 +228,60 @@ readManifest profile limits root = case nativeName "hetoimasia.json" of
           next ← readChunk reader (min chunk (ceiling' - held))
           if ByteString.null next then pure (ByteString.concat (reverse acc)) else go (next : acc) reader
 
--- | Run an action on a thread of its own and wait for it in STM beside a stop request. When the action ends
--- first its result (or its failure) is the caller's. When the stop arrives first the action is cancelled and
--- joined, so whatever it borrowed has unwound before this returns, and the answer is 'Nothing'. A
--- cancellation of the caller while it joins is remembered and raised after the join, never instead of it.
+-- | Run an action on a thread of its own and wait for it in STM beside a stop request.
+--
+-- * When the action ends first its result, or its failure with the context it carries, is the caller's.
+-- * When the stop arrives first the action is cancelled and /joined/, so whatever it borrowed has unwound before
+--   this returns. The child's terminal outcome is then read: a clean expected cancellation is 'Nothing'; a
+--   result it had produced anyway stands; and any other failure, a synchronous one or a cleanup failure
+--   retained beside the cancellation, is raised with its context, because a failed cleanup is a failure of
+--   the run and not an orderly stop.
+-- * Delivering the cancellation is itself an interruptible operation, so a cancellation of the caller is
+--   remembered across the sending and the join together ('remembering') and raised only after the child has
+--   actually ended. The wait is never made uninterruptible.
 abortable ∷ ∀ a. STM Bool → IO a → IO (Maybe a)
 abortable stop action = mask $ \restore → do
   done ← newEmptyTMVarIO
-  child ← forkIO (try (restore action) >>= \result → atomically (putTMVar done (result ∷ Either SomeException a)))
-  let join' = joinChild (atomically (readTMVar done) >> pure ())
+  child ← forkIO (tryWithContext (restore action) >>= \result → atomically (putTMVar done (result ∷ Either (ExceptionWithContext SomeException) a)))
+  let ended = atomically (readTMVar done)
+      cancelAndJoin = remembering (killThread child >> void ended)
   waited ←
     restore (atomically ((Right <$> readTMVar done) `orElse` (Left <$> (stop >>= check))))
-      `onException` (killThread child >> join')
+      `onException` cancelAndJoin
   case waited of
-    Right (Right result) → pure (Just result)
-    Right (Left failure) → throwIO failure
+    Right outcome → either rethrowIO (pure . Just) outcome
     Left () → do
-      killThread child
-      join'
-      pure Nothing
+      cancelAndJoin
+      ended >>= \case
+        Right result → pure (Just result)
+        Left failure
+          | expectedCancellation failure → pure Nothing
+          | otherwise → rethrowIO (asFailure failure)
+  where
+    -- The child's cancellation is asynchronous by type, but its cleanup having failed is a failure of this run: it
+    -- is raised as an ordinary exception, with the child's context (and so its cleanup evidence) kept.
+    asFailure (ExceptionWithContext context failure)
+      | Just (_ ∷ SomeAsyncException) ← fromException failure = ExceptionWithContext context (toException (CancelledUncleanly (Text.pack (displayException failure))))
+      | otherwise = ExceptionWithContext context failure
+    -- Only the bare cancellation we sent, with no cleanup failure retained beside it.
+    expectedCancellation (ExceptionWithContext context failure) =
+      (fromException failure ∷ Maybe AsyncException) == Just ThreadKilled && null (cleanupFailuresInContext context)
 
--- | Wait for an action that must finish, remembering a cancellation delivered meanwhile and raising it after.
-joinChild ∷ IO () → IO ()
-joinChild wait = go Nothing
+-- | The preparation was cancelled by a stop and its cleanup then failed.
+newtype CancelledUncleanly = CancelledUncleanly Text
+  deriving (Show)
+
+instance Exception CancelledUncleanly where
+  displayException (CancelledUncleanly why) = "the preparation was stopped and its cleanup failed: " <> Text.unpack why
+
+-- | Run an action to its end, remembering any asynchronous exception that interrupts it, running it again
+-- until it completes undisturbed, and raising the first one remembered, with its context, afterwards. For
+-- operations that must finish (sending a cancellation and joining what it cancels): an interruption is
+-- delivered after them, never instead of them.
+remembering ∷ IO () → IO ()
+remembering act = go Nothing
   where
     go pending =
-      try wait >>= \case
-        Right () → traverse_ throwIO pending
-        Left (interruption ∷ SomeAsyncException) → go (Just (fromMaybe (toException interruption) pending))
+      tryWithContext act >>= \case
+        Right () → traverse_ rethrowIO pending
+        Left (interruption ∷ ExceptionWithContext SomeAsyncException) → go (Just (fromMaybe interruption pending))

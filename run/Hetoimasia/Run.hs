@@ -43,13 +43,16 @@ module Hetoimasia.Run
   ) where
 
 import Control.Concurrent.STM (STM, atomically)
-import Control.Exception (SomeAsyncException, displayException, fromException, throwIO, try)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, displayException, fromException, rethrowIO, toException, try, tryWithContext)
+import Control.Monad (void)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.IO as Text
 import Hetoimasia.Console.Lua.Signals (Coordinator, stopRequested)
 import Hetoimasia.Console.Usage (usageFailure)
-import Hetoimasia.Foundation.Log (Component, LogFilter, logError, unsafeComponent)
+import Hetoimasia.Foundation.Log (LogFilter)
+import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, displayCleanupFailure)
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.LuaEngine.Session (SessionOutcome)
 import Hetoimasia.Run.Boot (BootEnd (..), BootHooks, Prepared, noBootHooks, withPreparedWith)
@@ -61,7 +64,7 @@ import Hetoimasia.Run.Signals (forceExit, withRunSignals)
 import Hetoimasia.Run.Status (RunResult (..), bootFailed, exitStatus)
 import Hetoimasia.Runtime.Logging (LoggingLifetime, lifetimeLogger, withHandleLoggingLifetime)
 import System.Exit (ExitCode (ExitSuccess), exitWith)
-import System.IO (stderr)
+import System.IO (hFlush, stderr)
 
 -- | What the command is composed with: the signals' force action and how a prepared folder is run. The
 -- production values are 'production'; the suite supplies a force action it can count and a launch that
@@ -99,35 +102,60 @@ runRun configuration arguments = case parseRun arguments of
       ExitSuccess → pure ()
       failure → exitWith failure
 
-component ∷ Component
-component = unsafeComponent "run"
-
 -- | Everything after a valid command line, answering the exit status rather than leaving the process.
+--
+-- /Reporting./ Boot and host failures are reported by one best-effort line each on stderr, written /after/ every
+-- scope has unwound, from outside the logging lifetime. They are not written through the logger: the lifetime and the
+-- graphics owner's application have their own terminal reporting and their own record of a diagnostic path that
+-- already failed, and a second unguarded write through that path would retry a failed report and could replace the
+-- failure being reported with its own. The line is bounded and escaped, carries the cleanup failures retained
+-- beside the primary one, and a failure to write it is ignored. A failure of the lifetime itself (its final flush)
+-- after the run came to an end is added to what was held, never substituted for it.
 runGame ∷ Setup → LogFilter → FilePath → IO ExitCode
 runGame setup configuration path = do
   utf8Streams
-  result ← withRunSignals (setupForce setup) $ \coordinator → do
+  held ← newIORef Nothing
+  outer ← tryWithContext $ withRunSignals (setupForce setup) $ \coordinator → do
     setupReady setup coordinator
     withHandleLoggingLifetime configuration stderr $ \lifetime → do
       let stop = stopRequested coordinator
           logger = lifetimeLogger lifetime
-      attempt ← try (withPreparedWith (setupBoot setup) logger fixedM1Profile stop path (setupLaunch setup lifetime stop))
-      outcome ← case attempt of
+      attempt ← tryWithContext (withPreparedWith (setupBoot setup) logger fixedM1Profile stop path (setupLaunch setup lifetime stop))
+      (outcome, reports) ← case attempt of
         Left failure
-          | isCancellation failure → throwIO failure
-          | otherwise → do
-              let reason = reportText (Text.pack (displayException failure))
-              logError logger component "run failed" [("reason", reason)]
-              pure (RunResult Nothing Nothing [reason] False)
-        Right (Left (BootRefused reason)) → do
-          logError logger component "boot failed" [("reason", reason)]
-          pure (bootFailed reason False)
-        Right (Left BootStopped) → pure (RunResult Nothing Nothing [] True)
-        Right (Right session) → pure (RunResult (Just session) Nothing [] False)
+          | isCancellation failure → rethrowIO failure
+          | otherwise → let reason = failureReason failure in pure (RunResult Nothing Nothing [reason] False, ["run failed: " <> reason])
+        Right (Left (BootRefused reason)) → pure (bootFailed reason False, ["boot failed: " <> reason])
+        Right (Left BootStopped) → pure (RunResult Nothing Nothing [] True, [])
+        Right (Right session) → pure (RunResult (Just session) Nothing [] False, [])
       stopped ← atomically stop
-      pure outcome {resultSignalled = resultSignalled outcome || stopped}
+      let result = outcome {resultSignalled = resultSignalled outcome || stopped}
+      writeIORef held (Just (result, reports))
+      pure (result, reports)
+  (result, reports) ← case outer of
+    Right done → pure done
+    Left failure
+      | isCancellation failure → rethrowIO failure
+      | otherwise → do
+          let reason = failureReason failure
+          prior ← readIORef held
+          pure $ case prior of
+            Just (result, reports) → (result {resultHostFailures = resultHostFailures result <> [reason]}, reports <> ["cleanup failed: " <> reason])
+            Nothing → (RunResult Nothing Nothing [reason] False, ["run failed: " <> reason])
+  mapM_ report reports
   pure (exitStatus result)
   where
-    isCancellation failure = case fromException failure of
+    isCancellation failure = case fromException (toException' failure) of
       Just (_ ∷ SomeAsyncException) → True
       Nothing → False
+    toException' (ExceptionWithContext _ failure) = toException failure
+
+-- | A failure as one bounded line: what it says, then each cleanup failure retained beside it.
+failureReason ∷ ExceptionWithContext SomeException → Text
+failureReason (ExceptionWithContext context failure) =
+  reportText . Text.intercalate "; " $
+    Text.pack (displayException failure) : ["cleanup: " <> Text.pack (displayCleanupFailure retained) | retained ← cleanupFailuresInContext context]
+
+-- | One line on stderr, best effort and once: a failure to write it changes nothing.
+report ∷ Text → IO ()
+report line = void (try (Text.hPutStrLn stderr ("hetoimasia run: " <> line) >> hFlush stderr) ∷ IO (Either SomeException ()))
