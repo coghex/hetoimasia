@@ -3057,6 +3057,37 @@ evidence, never the session's primary failure. Lifecycle (stop, accounting,
 retirement, the session's return) never waits on the sink. D-82's other rules
 are unchanged.
 
+### D-88. Export an ordinary refusal for engine-owned binding actions
+
+**Delivery:** LFE-20 / #535 / PR #572; extends D-83-D-86's cross-package scope.
+
+Owner answer, **2026-10-30 01:19 UTC**, directly to `het-manager`, verbatim
+choice:
+
+> Approve the export (Recommended)
+
+Authenticated relay: `het-manager`, message `g7xfw3a67eah9fjra2ttkdxz46` in `#het-lfsolve`.
+
+Context: #535 requires an expected publication refusal to be an ordinary,
+bounded Lua error. That covers a stop, a closure or an ending instance that
+lands between the binding's check and its commit. `hetoimasia-scripting-lua`
+offers an ordinary error only from a binding's argument check, whose contract
+says it runs no provider or native action and publishes nothing. It offers
+nothing from inside an action, because `OrdinaryCallRefusal` lives in the
+hidden `Provider.Call` module. PR #572's round 1 required the commit-time
+refusal to be ordinary. Round 2 rejected committing inside the argument check.
+
+Accept one purely additive export from `Hetoimasia.Scripting.Lua.Registration`:
+`refuseOrdinarily :: Text -> IO a`, which throws `OrdinaryCallRefusal`. It is
+for engine-owned bindings only, and only before the action takes any effect.
+For a binding that opted into ordinary refusals it becomes an ordinary, bounded
+Lua error. Otherwise it is a call fault, as an unexpected exception is today.
+No existing behavior or caller changes. Contract tests in the
+`hetoimasia-scripting-lua` suites prove both outcomes. It is documented in
+`packages/scripting-lua/README.md`. #535's publication binding commits
+atomically in its action and uses it for refusals found before the commit.
+This records scope only, not implementation correctness or readiness.
+
 ## Proposals
 
 **Scope precedence:** D-41 supersedes the original state-store agenda. Accepted
