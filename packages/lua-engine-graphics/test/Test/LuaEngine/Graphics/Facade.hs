@@ -29,7 +29,7 @@ import Data.Time.Clock (UTCTime (UTCTime), secondsToDiffTime)
 import Hetoimasia.Foundation.Log (Logger, MetadataProviders (..), callbackSink, defaultLogFilter, mkLoggerWith)
 import Hetoimasia.Foundation.Time (monotonicSource)
 import Hetoimasia.LuaEngine.Boot (bootCheckpoint)
-import Hetoimasia.LuaEngine.Facade (OutputSink (..), withOutput)
+import Hetoimasia.LuaEngine.Facade (OutputFailure (..), OutputSink (..), withOutput)
 import Hetoimasia.LuaEngine.Graphics.Facade (GraphicsFacade (..), graphicsInjection)
 import Hetoimasia.LuaEngine.Graphics.Scene (GraphicsScene (..), PublishHooks (..), noPublishHooks, scenePublisherOver)
 import Hetoimasia.LuaEngine.Graphics.Window.Port (CreateOutcome (..), Port (..), WindowToken (..), fatalText)
@@ -78,10 +78,12 @@ data Shape = Shape
   , shapeCreateScript ∷ ![CreateOutcome]
   -- ^ What the window fake's creations answer, in order, set before the session starts.
   , shapeHooks ∷ !PublishHooks
+  , shapeSinkFails ∷ !Bool
+  -- ^ The authored output sink raises on its first line.
   }
 
 defaultShape ∷ ByteString → Shape
-defaultShape entry = Shape entry True False WF.defaultFakeConfig Fake.defaultFakeConfig compositionProfile [] noPublishHooks
+defaultShape entry = Shape entry True False WF.defaultFakeConfig Fake.defaultFakeConfig compositionProfile [] noPublishHooks False
 
 -- | The fixed M1 profile with these counts changed, so that a bank is full after a few requests.
 profileWith ∷ [(CountLimit, Word64)] → Profile
@@ -209,9 +211,13 @@ spec = describe "graphics facade" $ do
     outFailures outcome `shouldBe` []
 
   it "answers busy from the common request places for a window request whose own slot is free, with no native window made, and accepts the explicit retry once a place is returned" $ do
-    outcome ← runFacade ((defaultShape requestBank) {shapeBoth = False, shapeProfile = profileWith [(RequestsPerInstance, 2)]}) $ \fs → do
+    outcome ← runFacade ((defaultShape requestBank) {shapeBoth = False, shapeParkOutput = True, shapeProfile = profileWith [(RequestsPerInstance, 2)]}) $ \fs → do
+      -- The role is parked in its authored output at the busy acknowledgement, so nothing can retry yet: no native
+      -- window was made for the refused request.
       awaitLine fs "window\ttrue\tbusy"
       WF.events (fsWindows fs) >>= (`shouldBe` [])
+      -- Resumed, it takes a texture result (returning a request place) and retries the window request.
+      void (tryPutMVar (fsGate fs) ())
       awaitLine fs "retried\ttrue"
       WF.awaitEvent (fsWindows fs) "issue create"
       requestStop (fsSession fs) StopQuit
@@ -241,6 +247,26 @@ spec = describe "graphics facade" $ do
       requestStop (fsSession fs) StopQuit
     outVerdict outcome `shouldBe` VerdictSuccess
     outFailures outcome `shouldBe` []
+
+  it "settles a window request the script cancelled while the provider held its acceptance, retires the window once, and leaves the instance healthy" $ do
+    outcome ← runFacade ((defaultShape cancelHeld) {shapeBoth = False, shapeWindow = WF.defaultFakeConfig {WF.fcHolds = [WF.HoldAdmit]}}) $ \fs → do
+      awaitLine fs "cancel\tcancelled\tcancelled"
+      WF.release (fsWindows fs) WF.HoldAdmit
+      atomically (providerReading (fsProvider fs) >>= \found → unless (readingAcquisitions found == 0) retry)
+      closes ← length . filter (Text.isPrefixOf "close w") <$> WF.events (fsWindows fs)
+      closes `shouldBe` 1
+      requestStop (fsSession fs) StopQuit
+    outVerdict outcome `shouldBe` VerdictSuccess
+    outFailures outcome `shouldBe` []
+
+  it "raises the output failure only after the window and the texture are retired, when the authored output sink raises after both requests started" $
+    -- The session's call raises the sink's failure once every role has retired and every release has run: the provider's and
+    -- the pipeline's scopes drain (and the rig checks no native work is left) before the exception leaves.
+    ( void $
+        runFacade ((defaultShape sinkFails) {shapeBoth = False, shapeSinkFails = True}) $ \fs →
+          atomically (sessionOutcomeNow (fsSession fs) >>= \found → unless (not (null (outFailures found))) retry)
+    )
+      `shouldThrow` (\failure → case failure of OutputFailure {} → True)
 
   it "refuses a second window request of an instance as an ordinary error, caught, with the first window unharmed" $ do
     outcome ← runFacade ((defaultShape secondWindow) {shapeBoth = False}) $ \fs → do
@@ -352,6 +378,7 @@ runFacade shape scenario = bounded . withRig (shapeTexture shape) $ \rig → do
                       atomically (modifyTVar' outLines (<> [line]))
                       first ← readIORef firstLine
                       writeIORef firstLine False
+                      if first && shapeSinkFails shape then ioError (userError "the authored output sink failed") else pure ()
                       if first && shapeParkOutput shape then readMVar gate else pure ()
                   , sinkFlush = pure ()
                   }
@@ -662,6 +689,31 @@ cancelAtOnce =
     , "      local w = api.window.open({title='t', width=64, height=64})"
     , "      local t = api.content.texture('images/quad.png')"
     , "      print('cancel', api.request.cancel(w), api.request.cancel(t))"
+    , "    end,"
+    , "    update=function(self, dt) end"
+    ]
+
+-- | A window request cancelled in an update while the provider holds its acceptance.
+cancelHeld ∷ ByteString
+cancelHeld =
+  presentationOnly
+    [ "    init=function(self, api) self.w = api.window.open({title='t', width=64, height=64}) end,"
+    , "    update=function(self, dt)"
+    , "      local api = self.api"
+    , "      if self.said then return end"
+    , "      self.said = true"
+    , "      print('cancel', api.request.cancel(self.w), api.request.take(self.w).status)"
+    , "    end"
+    ]
+
+-- | Both requests started, then the first authored line raises in the sink.
+sinkFails ∷ ByteString
+sinkFails =
+  presentationOnly
+    [ "    init=function(self, api)"
+    , "      self.w = api.window.open({title='t', width=64, height=64})"
+    , "      self.t = api.content.texture('images/quad.png')"
+    , "      print('both started')"
     , "    end,"
     , "    update=function(self, dt) end"
     ]

@@ -357,10 +357,14 @@ data GraphicsServices = GraphicsServices
   , gsWindowStart ∷ Text → ByteString → Int64 → Int64 → RequestContext → IO GraphicsStart
   , gsPublish ∷ Text → ArgumentCheck → Binding
   -- ^ The scene publication binding of this name, given the facade's precondition.
-  , gsReleaseCheck ∷ Word64 → IO (Maybe Text)
-  -- ^ Whether this texture handle may be released by the calling instance: refused, as the text of an ordinary error and
-  -- before any provider is asked, for another instance's lease and a lease of another kind. A lease that has already
-  -- ended is not refused: releasing it again is the special release path's to answer.
+  , gsIssued ∷ Text → Word64 → IO ()
+  -- ^ A texture handle was taken by this instance, recorded before the script is handed it: the issuing instance of a
+  -- handle outlives the lease's slot, which is deleted when the texture has retired.
+  , gsReleaseCheck ∷ Text → Word64 → IO (Maybe Text)
+  -- ^ Whether this instance may release this texture handle: refused, as the text of an ordinary error and before any
+  -- provider is asked, for a handle another instance was issued (alive, retiring or completely retired) and a lease of
+  -- another kind. A lease of the calling instance that has already ended is not refused: releasing it again is the
+  -- special release path's to answer.
   , gsRelease ∷ Word64 → IO Text
   -- ^ Release a texture lease by key through the host's special release path: @done@, @retiring@ or @already_released@.
   }

@@ -8,6 +8,7 @@ import qualified Test.LuaEngine.Graphics.Configuration as Configuration
 import qualified Test.LuaEngine.Graphics.Facade as Facade
 import qualified Test.LuaEngine.Graphics.Faults as Faults
 import qualified Test.LuaEngine.Graphics.Lifecycle as Lifecycle
+import qualified Test.LuaEngine.Graphics.Peers as Peers
 import qualified Test.LuaEngine.Graphics.Pressure as Pressure
 import qualified Test.LuaEngine.Graphics.Release as Release
 import qualified Test.LuaEngine.Graphics.SceneFrames as SceneFrames
@@ -34,3 +35,4 @@ spec = do
   SceneFrames.spec
   ScenePublication.spec
   Facade.spec
+  Peers.spec

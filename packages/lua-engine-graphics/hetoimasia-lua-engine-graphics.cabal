@@ -97,6 +97,7 @@ test-suite lua-engine-graphics-tests
         Test.LuaEngine.Graphics.FacadeScripts
         Test.LuaEngine.Graphics.Faults
         Test.LuaEngine.Graphics.Lifecycle
+        Test.LuaEngine.Graphics.Peers
         Test.LuaEngine.Graphics.Png
         Test.LuaEngine.Graphics.Pressure
         Test.LuaEngine.Graphics.Release
@@ -141,7 +142,9 @@ test-suite lua-engine-graphics-tests
         hetoimasia-gpu-vulkan-native ==0.1.0.0,
         hetoimasia-lua-engine ==0.1.0.0,
         hetoimasia-lua-engine-graphics,
+        hetoimasia-lua-engine:data,
         hetoimasia-lua-engine:facade,
+        hetoimasia-lua-engine:modules,
         hetoimasia-lua-engine:request,
         hetoimasia-lua-engine:scene,
         hetoimasia-lua-engine:session,

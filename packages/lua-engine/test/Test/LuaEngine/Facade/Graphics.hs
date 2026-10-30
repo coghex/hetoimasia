@@ -9,12 +9,14 @@
 -- windows are the graphics adapter's suites; nothing here is evidence of them.
 module Test.LuaEngine.Facade.Graphics (spec) where
 
-import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, retry, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVar, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (finally)
 import Control.Monad (void)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import qualified Data.Map.Strict as Map
 import Data.Text (Text)
+import Data.Word (Word64)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Resource (Assembly, acquirePart, releaseRank)
 import Hetoimasia.LuaEngine.Request (M1Ask (..), M1Start (..), m1Ask, startM1)
@@ -43,10 +45,11 @@ data Gfx = Gfx
   { gxCalls ∷ !(IORef [Text])
   , gxBusy ∷ !(IORef Bool)
   , gxHanded ∷ !(TVar [(Text, Completion, TVar RetirementState)])
+  , gxIssued ∷ !(TVar (Map.Map Word64 Text))
   }
 
 newGfx ∷ IO Gfx
-newGfx = Gfx <$> newIORef [] <*> newIORef False <*> newTVarIO []
+newGfx = Gfx <$> newIORef [] <*> newIORef False <*> newTVarIO [] <*> newTVarIO Map.empty
 
 calls ∷ Gfx → IO [Text]
 calls = fmap reverse . readIORef . gxCalls
@@ -77,7 +80,12 @@ injection gx = GraphicsInjection $ \vm → do
       , gsPublish = \name precondition →
           withArgumentCheck precondition $
             stateOperation name [SCapability graphicsWindowType, sceneSchema] [] $ \_ → note gx "publish" >> pure []
-      , gsReleaseCheck = \key → withLeaseOr leases key (\why → pure (if Text.isInfixOf "another" why then Just why else Nothing)) (\(_ ∷ Text) → pure Nothing)
+      , gsIssued = \identity key → atomically (modifyTVar' (gxIssued gx) (Map.insert key identity))
+      , gsReleaseCheck = \identity key → do
+          owner ← Map.lookup key <$> readTVarIO (gxIssued gx)
+          case owner of
+            Just other | other /= identity → pure (Just "the texture belongs to another instance")
+            _ → withLeaseOr leases key (\why → pure (if Text.isInfixOf "another" why then Just why else Nothing)) (\(_ ∷ Text) → pure Nothing)
       , gsRelease = \key → do
           note gx "release"
           word <$> releaseLease leases key
@@ -294,11 +302,15 @@ spec = describe "graphics calls" $ do
 
   it "refuses another instance's facade and handle, and leaves a peer's graphics resources usable when one same-VM instance ends" $ do
     gx ← newGfx
-    let cases =
+    let live =
           [ Case "foreign facade window" "share.apis[1].window.open({title = 't', width = 1, height = 1})" (Refused ["belongs to another instance"])
-          , Case "foreign handle release" "api.texture.release(share.texs[1])" (Refused ["belongs to another instance"])
+          , Case "foreign handle, live" "api.texture.release(share.texs[1])" (Refused ["belongs to another instance"])
+          ]
+        retired =
+          [ Case "foreign handle, retired" "api.texture.release(share.texs[1])" (Refused ["belongs to another instance"])
           , Case "own release" "api.texture.release(self.tex) == 'done'" Holds
           ]
+        cases = live <> retired
         prelude = ["local share = import('lua/share.lua')"]
         initial = ["self.my = #share.apis + 1", "share.apis[self.my] = api", "self.t = api.content.texture('images/quad.png')"]
         updating =
@@ -311,10 +323,22 @@ spec = describe "graphics calls" $ do
           , "  self.tex = api.request.take(self.t).value.texture"
           , "  share.texs[self.my] = self.tex"
           , "end"
-          , "if self.my == 2 and share.texs[1] then"
-          , "  self.done = true"
+          , "if self.my == 1 then"
+          , -- the first instance releases its own texture once the second has tried the live one: it retires completely
+            "  if share.b1 and not self.rel then self.rel = true print('a released', api.texture.release(self.tex)) share.a_done = true end"
+          , "  return"
+          , "end"
+          , "if not share.texs[1] then return end"
+          , "if not share.b1 then"
+          , "  share.b1 = true"
           ]
-            <> map (("  " <>) . caseLua) cases
+            <> map (("  " <>) . caseLua) live
+            <> [ "  return"
+               , "end"
+               , "if share.a_done then"
+               , "  self.done = true"
+               ]
+            <> map (("  " <>) . caseLua) retired
             <> ["  print('b done')", "end"]
         shared = ("lua/share.lua", luaMain ["return {apis = {}, texs = {}}"])
     ( withWorld fixedM1Profile (Layout (("lua/main.lua", scriptSource script {scPrelude = prelude <> [], scInit = initial, scUpdate = updating, scShutdown = ["share.ended = true"]}) : shared : files)) $ \world _ runtime →

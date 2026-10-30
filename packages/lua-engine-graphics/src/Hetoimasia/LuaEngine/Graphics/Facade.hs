@@ -40,6 +40,7 @@ import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Typeable (Typeable)
+import Data.Word (Word64)
 import Hetoimasia.LuaEngine.Facade
   ( GraphicsInjection (..)
   , GraphicsServices (..)
@@ -130,6 +131,8 @@ graphicsInjection config = GraphicsInjection $ \vm → do
   lending ← newLending
   leases ← newLeases lending (facadeLeaseCapacity profile)
   owners ← newTVarIO (Map.empty ∷ Map Text Owners)
+  -- The instance each texture handle was issued to, for the VM's lifetime: bounded by the textures the VM's instances were given.
+  issued ← newTVarIO (Map.empty ∷ Map Word64 Text)
   let window = windowService requests (gfProvider config)
       textureRole = case gvRole vm of
         Gameplay → LogicalRole
@@ -179,9 +182,15 @@ graphicsInjection config = GraphicsInjection $ \vm → do
               WindowStarted started → GraphicsStarted started
               WindowRefused why → GraphicsRefused why
       , gsPublish = \name precondition → graphicsPublishBindingWith (gfPublishHooks config) name precondition (publisherGatedBy (gvTakesWork vm) (gfPublisher config)) limits leases
-      , gsReleaseCheck = \key →
-          -- (borrowing is how the lease says whose it is; a lease that has ended is the release path's to answer)
-          withTextureOr leases key (\why → pure (if Text.isInfixOf "another" why then Just why else Nothing)) (\_ → pure Nothing)
+      , gsIssued = \identity key → atomically (modifyTVar' issued (Map.insert key identity))
+      , gsReleaseCheck = \identity key → do
+          owner ← Map.lookup key <$> readTVarIO issued
+          case owner of
+            -- The handle was issued to another instance: refused whether its texture is live, retiring or completely retired
+            -- (the lease's own slot is gone by then, which is why the issuing instance is recorded here).
+            Just other | other /= identity → pure (Just "the texture belongs to another instance")
+            -- Otherwise the lease says: borrowing refuses a lease of another kind; one that has ended is the release path's.
+            _ → withTextureOr leases key (\why → pure (if Text.isInfixOf "another" why then Just why else Nothing)) (\_ → pure Nothing)
       , gsRelease = \key → releaseWord <$> releaseTexture leases key
       }
   where

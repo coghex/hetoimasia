@@ -19,11 +19,14 @@ module Hetoimasia.LuaEngine.Facade.Request
   ) where
 
 import Data.Text (Text)
-import Hetoimasia.LuaEngine.Facade.Bindings (instanceCheck)
-import Hetoimasia.LuaEngine.Facade.Caller (Caller (..), Stage (..))
+import Control.Monad (forM_)
+import Hetoimasia.LuaEngine.Facade.Bindings (callingIn, instanceCheck)
+import Hetoimasia.LuaEngine.Facade.Caller (Caller (..), Calling (InInstance), Stage (..))
 import Hetoimasia.LuaEngine.Facade.Content (dataHandleName, moduleHandleName)
 import Hetoimasia.LuaEngine.Facade.Types
   ( Facade (fcGraphics)
+  , InstanceRecord (recordId)
+  , GraphicsServices (gsIssued)
   , graphicsTextureRequestType
   , graphicsTextureValueSchema
   , graphicsWindowRequestType
@@ -33,6 +36,7 @@ import Hetoimasia.LuaEngine.Request (m1TakeSchema, terminalRecord)
 import Hetoimasia.Scripting.Lua.Admission
   ( CancelResult (..)
   , Taken (..)
+  , Terminal (TerminalSuccess)
   , cancelAdmitted
   , readyAdmitted
   , takeAdmitted
@@ -83,7 +87,9 @@ operations facade kind handleType value =
       [VCapability found] →
         takeAdmitted context (capabilityKey found) >>= \case
           TakenPending → pure [VRecord [("status", VText "pending")]]
-          Taken terminal → pure [terminalRecord terminal]
+          Taken terminal → do
+            recordIssued context terminal
+            pure [terminalRecord terminal]
       _ → pure []
     cancelled context = \case
       [VCapability found] →
@@ -91,6 +97,18 @@ operations facade kind handleType value =
           CancelWon → pure [VText "cancelled"]
           CancelAlreadySettled → pure [VText "already_settled"]
       _ → pure []
+    -- A texture handle is recorded against its instance before the script is handed it: the issuing instance must
+    -- outlive the lease's slot, which the collection deletes once the texture has retired, so that another instance
+    -- holding the handle is still refused when it releases it.
+    recordIssued context = \case
+      TerminalSuccess (VRecord fields)
+        | kind == "texture"
+        , Just services ← fcGraphics facade →
+            forM_ [capabilityKey issued | ("texture", VCapability issued) ← fields] $ \key →
+              callingIn facade context >>= \case
+                InInstance caller → gsIssued services (recordId (callerRecord caller)) key
+                _ → pure ()
+      _ → pure ()
     serving caller = case callerStage caller of
       StageServing → Nothing
       StageInitializing → Just "wait is not available in init"

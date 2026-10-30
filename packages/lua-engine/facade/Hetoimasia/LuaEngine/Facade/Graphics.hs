@@ -155,8 +155,12 @@ graphicsBindings facade services =
     -- Another instance's handle and a handle of another kind are ordinary errors before any provider is asked; a handle that
     -- has ended is the release path's own to answer.
     releaseCheck ∷ ArgumentCheck
-    releaseCheck _ = \case
-      [VCapability handle] → fmap (clipText 200) <$> gsReleaseCheck services (capabilityKey handle)
+    releaseCheck owner = \case
+      [VCapability handle] → do
+        calling ← whoIsCalling facade owner
+        case requireInstance calling of
+          Left why → pure (refuseText why)
+          Right caller → fmap (clipText 200) <$> gsReleaseCheck services (identityOf caller) (capabilityKey handle)
       _ → pure Nothing
 
     releaseAct = \case
