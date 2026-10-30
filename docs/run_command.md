@@ -139,4 +139,19 @@ Output and flush failure is fatal. The launcher adds at most one bounded, escape
   on that command).
 
 These establish launch and lifetime, **not visible output**: no pixel is captured or read back (LFE-24's matrix and LFE-25's platform
-qualification are separate). The supervised close of the actual command on macOS, and its native close on Linux, are LFE-25's.
+qualification are separate).
+
+The actual command's native close is covered per platform, and the split is part of the acceptance:
+
+* **macOS, supervised** (required, run by the owner at the head under review): the launch and lifetime smoke of the real command. A
+  person closes its window and the exit status must be 0.
+
+  ```sh
+  HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia:exe:hetoimasia -- run samples/lua-quad/content
+  ```
+
+  It is not a catalog example and not an unattended routine test: nothing in this repository closes another process's window.
+  The command, the clean revision, the platform and the exit status are recorded with the pull request.
+* **Linux**: the library-composed `run-native-tests` case delivers a real in-process `WM_DELETE_WINDOW` through the existing native close
+  driver (exit 0), and the built command is started on the isolated X11 display and sent exactly one SIGTERM (exit 130). The actual
+  command's native close on Linux needs cross-process tooling that does not exist and is **LFE-25's**; none is added here.
