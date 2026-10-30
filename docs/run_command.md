@@ -109,10 +109,34 @@ as a Lua `quit`, including during startup. Closing a window for cleanup generate
 | read pool (2 workers), texture pipeline (1 decode worker, 2 lanes) | the session composition, once per session | their own workers | after the window provider, before the root |
 | graphics owner, texture adapter, GLFW | the native composition | main thread and the owner's thread | after the session has retired and the windows are destroyed |
 | window provider | the session composition | its pump; the main step on the main thread | before the pipeline and the adapter drain |
+| session diagnostics writer | `runSession` | its own thread | joined by the command before the logger is released |
 | session, role VMs | `runSession` | the session thread | actual retirement of every role |
 | signal handlers, coordinator | the run scope | a handler thread per delivery | the end of the run |
 
 Neither CPU scope exit, a cancellation, a timeout nor a thread finishing proves GPU retirement; retirement is read from the owners.
+
+## When something fails during shutdown
+
+Every wait of the launcher's shutdown follows the same rules (`Hetoimasia.Run.Settle`): it is never made uninterruptible; a
+cancellation delivered meanwhile is remembered and raised *after* the wait has finished, never instead of it; catching a failure to
+examine it never swallows a cancellation; and a diagnostic that cannot be written never replaces what it reports.
+
+* **Preparation** (`Boot.abortable`) runs on a thread of its own. A stop cancels and joins it before the root closes. The child's
+  terminal outcome is read: a clean cancellation is an orderly stop (130), but a cleanup that failed under the cancellation is a failure
+  (1). A cancellation of the caller, whether it arrives in the wait or while the cancellation is being sent, still cancels and joins the
+  child first, and the child's cleanup evidence is retained beside it.
+* **The owner loop** (`Serve`): the session runs on a thread of its own while the process main thread serves the native owner. If the
+  loop fails, or the main thread is cancelled in it, the session is asked to stop and the owner is served *again* by a drain loop until the
+  session has settled, because the session's cleanup closes windows and waits for their native destruction, which only the main thread
+  performs. The drain makes its own supervision, since the application's may have latched the very failure that ended the loop; a
+  failing drain is run again a bounded number of times, after which the join is left to the session (a failed owner is something its
+  providers see and retire as failed). The loop's failure stays primary and the session's own failure, with its cleanup, is retained
+  beside it.
+* **The session's diagnostics writer** may outlive `runSession` and borrows the logger, so it is joined before the logging lifetime
+  releases the logger, after every scope the session used has unwound, on a failure as well as a success.
+* **Reporting.** A failure raised inside the logging lifetime goes through it unchanged, so the lifetime applies its own rules (a failed
+  diagnostic is not followed by a final flush through the path that just failed). Boot and host failures are reported by one best-effort
+  line on stderr after every scope has unwound, carrying the cleanup failures retained beside the primary one, never through the logger.
 
 ## Sizing
 
