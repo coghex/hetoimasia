@@ -94,6 +94,7 @@ test-suite lua-engine-graphics-tests
         Test.LuaEngine.Graphics.Fake
         Test.LuaEngine.Graphics.FrameLog
         Test.LuaEngine.Graphics.Facade
+        Test.LuaEngine.Graphics.FacadeScripts
         Test.LuaEngine.Graphics.Faults
         Test.LuaEngine.Graphics.Lifecycle
         Test.LuaEngine.Graphics.Png
@@ -170,9 +171,11 @@ test-suite lua-engine-graphics-native-tests
     hs-source-dirs: native-test test-common
     other-modules:
         Test.LuaEngine.Graphics.Composition
+        Test.LuaEngine.Graphics.FacadeScripts
         Test.LuaEngine.Graphics.FrameLog
         Test.LuaEngine.Graphics.Native.Consent
         Test.LuaEngine.Graphics.Native.Environment
+        Test.LuaEngine.Graphics.Native.Facade
         Test.LuaEngine.Graphics.Native.Frame
         Test.LuaEngine.Graphics.Native.Loader
         Test.LuaEngine.Graphics.Native.Scenes
@@ -216,8 +219,10 @@ test-suite lua-engine-graphics-native-tests
         hetoimasia-gpu-vulkan-native ==0.1.0.0,
         hetoimasia-lua-engine ==0.1.0.0,
         hetoimasia-lua-engine-graphics,
+        hetoimasia-lua-engine:facade,
         hetoimasia-lua-engine:request,
         hetoimasia-lua-engine:scene,
+        hetoimasia-lua-engine:session,
         hetoimasia-lua-engine:texture,
         hetoimasia-math ==0.1.0.0,
         hetoimasia-render-2d ==0.1.0.0,

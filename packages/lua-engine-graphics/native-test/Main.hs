@@ -41,6 +41,7 @@ import Test.LuaEngine.Graphics.Native.Environment (checkValidationFeatures, esta
 import Test.LuaEngine.Graphics.Native.Loader (checkLoader)
 import Test.LuaEngine.Graphics.Native.Session (Facts (..), runSession)
 import qualified Test.LuaEngine.Graphics.Native.Spec as Native
+import qualified Test.LuaEngine.Graphics.Native.Facade as Facade
 import qualified Test.LuaEngine.Graphics.Native.Scenes as Scenes
 import qualified Test.LuaEngine.Graphics.Native.Windows as Windows
 
@@ -59,7 +60,7 @@ main = do
   loader ← checkLoader >>= either (\why → stop ("the qualified loader: " <> why)) pure
   Text.putStrLn ("lua-engine-graphics-native-tests: the binding's loader is the recorded loader " <> Text.pack loader)
   configuration ← either (\refused → stop ("the profile could not be mapped: " <> Text.pack (show refused))) pure (configurationFor fixedM1Profile)
-  facts ← runSession (arguments == [completeFlag]) (consentBackend consent) validationFeatures configuration (\env → Native.spec env >> Windows.spec env >> Scenes.spec env)
+  facts ← runSession (arguments == [completeFlag]) (consentBackend consent) validationFeatures configuration (\env → Native.spec env >> Windows.spec env >> Scenes.spec env >> Facade.spec env)
   finished ← getCurrentTime
   let problems = checks facts
       seconds = realToFrac (diffUTCTime finished started) ∷ Double
