@@ -35,6 +35,10 @@ library depends on a sample, and nothing routine launches one.
   its executable (`scene3d/app`, `hetoimasia-scene3d`) writes the same evidence
   (`--evidence`), launched by hand. Its windowed mode arrives with windowed
   depth (GRS-13).
+- [`lua-quad/`](lua-quad/README.md) — LFE-22's shipped content for `hetoimasia run`: the accepted P-73
+  textured-quad example as a plain folder (a manifest, a Lua entry and a technical PNG), with no Haskell of its own. The
+  generic command in the root application runs it and any other folder; see
+  [the run command](../docs/run_command.md). It is launched by hand and is no engine dependency.
 - [`lua-domains/`](lua-domains/README.md) — LUA-29's two-domain Lua consumer: a UI
   VM owner and a gameplay VM owner composed side by side from the Lua package's
   public modules, headless. Gameplay's Haskell-owned world is committed once per
