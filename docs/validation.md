@@ -169,6 +169,7 @@ the audited suite inventory, and which optional probes are local-only.
 | `test.vulkan-native` | `bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete` | no | no | any |
 | `test.vulkan-wayland` | `bash tools/display/wayland.sh -- bash tools/vulkan/run.sh native hetoimasia-gpu-vulkan-glfw:test:vulkan-native-tests -- --complete` | no | no | any |
 | `test.vulkan-lua-engine-native` | `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete` | no | no | any |
+| `test.vulkan-run-native` | `bash tools/vulkan/run.sh native hetoimasia:test:run-native-tests -- --complete` | no | no | any |
 
 *Platforms* is the group's `platforms` declaration: *any* is the ordinary group,
 which declares nothing and is applicable everywhere. A plan taken on a platform
@@ -608,6 +609,37 @@ directory. The CPU Lua-engine, content and codec packages stay free of Vulkan an
 GLFW dependencies: the group, like the headless group's
 `lua-engine-graphics-tests`, is reached through `cabal.project.vulkan` alone.
 
+`test.vulkan-run-native` is the generic `hetoimasia run GAME_ROOT` command on a real device (LFE-22,
+[#537](https://github.com/coghex/hetoimasia/issues/537)); [run_command.md](run_command.md) describes the command. It is the root package's
+`run-native-tests` component, which exists only in the full-product build (the root package's manual flag `full-product`, set by
+`cabal.project.vulkan` alone), so its group is reached through the Vulkan project:
+
+```json
+"command": ["bash", "tools/vulkan/run.sh", "native", "hetoimasia:test:run-native-tests", "--", "--complete"],
+"preparation": {"command": ["bash", "tools/vulkan/run.sh", "build", "hetoimasia:exe:hetoimasia", "hetoimasia:test:run-native-tests"], "timeout_seconds": 3600},
+"runner": "display",
+"timeout_seconds": 30
+```
+
+The preparation builds the suite and the full-product executable it launches (`build-tool-depends: hetoimasia:hetoimasia`); the timed
+execution builds nothing. `tools/vulkan/run.sh native` names that executable, from the same project and build directory, in
+`HETOIMASIA_RUN_EXECUTABLE` for this component, and refuses to run if it was not built, so a `hetoimasia` of another profile on `PATH` can never be the
+one launched. The suite follows the native-suite rules (consent read once, GLFW on the process main thread with Hspec on another, a
+nonzero selected count) and reimplements the consent check in its own source directory. The production `run` command itself neither reads nor requires
+`HETOIMASIA_NATIVE_SESSION`: consent gates native test suites, never the user's command. On Linux the runner starts an isolated X11 display;
+on macOS the desktop opt-in is on the run's own command, under the owner's standing approval.
+
+Its examples are the command's production composition run in the process with the real providers and real windows (the shipped content, an
+unchanged copy, adopted and recorded again after Lua's release with a genuine native close delivered through `Hetoimasia.GLFW.NativeCheck`, exit 0,
+everything retired; a script that quits; a required texture that cannot be read, exit 1; the assembled facade's request, texture and window
+capacity: busy as a nonfatal answer, the explicit retry after reclamation, the second own-window request an ordinary error) and the built command
+as a child of the suite stopped by exactly one SIGTERM after the existing resolved-root diagnostic (exit 130, no error entry, the child killed and
+reaped on every way out). It is a launch and lifetime smoke check: it captures no screen and reads no window back, and the supervised macOS close of
+the actual command is a local run. The run writes its evidence record, `run-native.md`, into the group's evidence directory. The
+runner's source digest names the root package's real inputs one by one (`app/`, `app-cpu/`, `app-full/`, `console/`, `run/`, `test/`,
+`test-cpu/`, `test-full/`, `run-native-test/`, `samples/lua-quad/` and `hetoimasia.cabal`) and never the root directory itself, which would hash
+`dist-vulkan` and every other generated output. The root package's full build of `hetoimasia-tests` runs in `test.vulkan-headless`.
+
 Every validation-enabled instance either group creates enables the Khronos
 layer's **synchronization validation** through its own create info
 (`VkValidationFeaturesEXT`), and nothing else decides it: the native suite
@@ -1013,7 +1045,7 @@ python3 tools/validation/plan.py --base origin/master --head HEAD \
   --worker haskell-engine=cpu:build.all,test.engine,test.foundation,test.runtime,test.glfw,test.scripting-lua,test.scripting-lua-runtime,test.lua-engine,test.vulkan,test.vulkan-diagnostics,test.math,test.content,test.asset-image,test.render-api,test.render-2d,test.render-2d-oracle,smoke.console \
   --worker haskell-workflow=cpu:test.workflow \
   --worker glfw-native=display:test.glfw-native,test.glfw-wayland \
-  --worker vulkan=cpu+display:test.vulkan-headless,test.vulkan-native,test.vulkan-wayland,test.vulkan-lua-engine-native
+  --worker vulkan=cpu+display:test.vulkan-headless,test.vulkan-native,test.vulkan-wayland,test.vulkan-lua-engine-native,test.vulkan-run-native
 ```
 
 Before producing a plan, the planner refuses — naming every problem — a worker
@@ -1178,7 +1210,7 @@ class to every execution:
 | `haskell-engine` | `cpu` | `build.all`, `test.engine`, `test.foundation`, `test.runtime`, `test.glfw`, `test.scripting-lua`, `test.scripting-lua-runtime`, `test.lua-engine`, `test.vulkan`, `test.vulkan-diagnostics`, `test.math`, `test.content`, `test.asset-image`, `test.render-api`, `test.render-2d`, `smoke.console` |
 | `haskell-workflow` | `cpu` | `test.workflow` |
 | `glfw-native` | `display` | `test.glfw-native`, `test.glfw-wayland` |
-| `vulkan` | `cpu`, `display` | `test.vulkan-headless`, `test.vulkan-native`, `test.vulkan-wayland`, `test.vulkan-lua-engine-native` |
+| `vulkan` | `cpu`, `display` | `test.vulkan-headless`, `test.vulkan-native`, `test.vulkan-wayland`, `test.vulkan-lua-engine-native`, `test.vulkan-run-native` |
 
 A worker runs every group it still has to execute and continues past a failure,
 so the aggregate sees a receipt for each of them rather than inferring the rest

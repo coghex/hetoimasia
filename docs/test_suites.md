@@ -59,9 +59,16 @@ cabal test hetoimasia-tests --test-show-details=direct
   `Test.GLFW.Spec`: the session, window, command, control, host, dynamic
   window, monitor, input, and mode examples over the test seam, the link
   declarations, and the external-client opacity examples; it initializes no
-  GLFW and needs no display. Root `hetoimasia-tests` (`test/`) owns only
-  `Console` (the executable's startup and exit mapping, run as a child
-  process), composed by `Test.Engine.Spec`, and depends on no GLFW package. A
+  GLFW and needs no display. Root `hetoimasia-tests` (`test/`, composed by
+  `Test.Engine.Spec`) is **profile-dependent**. In the default and CPU builds it owns only
+  `Console` (the executable's startup and exit mapping, run as a child process) and depends on
+  no GLFW package; its second source directory is `test-cpu/` and adds nothing. In the
+  full-product build (the Vulkan project, flag `full-product`; group `test.vulkan-headless`) it
+  also owns `Run` (`test-full/`): the `hetoimasia run` command's grammar, the exit status as a
+  pure function, the composition over real temporary content with no graphics (roles, failures,
+  boot refusals, stops), the built executable's usage and boot refusals, and the suite's own
+  binary as a child under real signals. None acquires a native session, reads consent or opens a
+  window. A
   new runtime example belongs in `runtime-tests`, beside that component's own
   helpers; a headless GLFW example belongs in `glfw-tests`, and one that needs a
   real native session in `glfw-native-tests`; a console example belongs in root
@@ -139,12 +146,24 @@ cabal test hetoimasia-tests --test-show-details=direct
   `bash tools/vulkan/run.sh`. Its test mode runs their headless suites
   (`native-tests`, `shader-tests`, `integration-tests`, `triangle-tests`,
   `sprites-tests`, `image2d-tests`, `scene3d-tests`, `render-2d-vulkan-tests`,
-  and the Lua-first engine's graphics adapter's `lua-engine-graphics-tests`) — the
-  group `test.vulkan-headless` — and needs no consent. The native suite `vulkan-native-tests` (`test.vulkan-native`) opens
+  the Lua-first engine's graphics adapter's `lua-engine-graphics-tests`, and the root package's
+  full-product `hetoimasia-tests`) — the group `test.vulkan-headless` — and needs no consent. The native suite `vulkan-native-tests` (`test.vulkan-native`) opens
   windows and presents on macOS, so it takes the same desktop opt-in, under the
   same standing approval, as `glfw-native-tests`; on Linux its runner starts an
   isolated X11 display, and `test.vulkan-wayland` runs it on the isolated
   headless Wayland compositor. See [gpu_backend.md](gpu_backend.md#the-native-suite).
+  The generic run command's real-device suite `run-native-tests` (the root package, `run-native-test/`,
+  full-product build only, group `test.vulkan-run-native`) takes the same desktop consent as the other
+  window-opening native suites, under the same standing approval, and the runner starts an isolated X11
+  display on Linux. It runs the command's production composition with real windows (the shipped
+  content's scene adopted and a genuine native close delivered through
+  `Hetoimasia.GLFW.NativeCheck`, a script that quits, a required texture that cannot be read, and the
+  assembled facade's capacity behavior), and starts the built full-product `hetoimasia run` as a child
+  of the suite, named by the runner in `HETOIMASIA_RUN_EXECUTABLE`, for exactly one SIGTERM and exit
+  130. It is built, with the executable it launches, in the group's preparation stage
+  (`bash tools/vulkan/run.sh build hetoimasia:exe:hetoimasia hetoimasia:test:run-native-tests`) and run,
+  unbuilt, by `bash tools/vulkan/run.sh native hetoimasia:test:run-native-tests -- --complete`. It
+  captures no pixel and reads no window back. See [run_command.md](run_command.md).
   The adapter's real-device suite `lua-engine-graphics-native-tests`
   (`packages/lua-engine-graphics`, group `test.vulkan-lua-engine-native`) enters
   the same kind of session: it starts the production graphics owner with no
