@@ -169,6 +169,19 @@ spec = describe "graphics facade" $ do
     outQuit outcome `shouldBe` True
     outFailures outcome `shouldBe` []
 
+  it "delivers an optional missing texture as structured data with its root and path, and leaves the instance healthy" $ do
+    outcome ← runFacade ((defaultShape missingOptional) {shapeBoth = False}) $ \fs → do
+      awaitLine fs "missing\tfailure\tnot_found\tgraphics-test\tnope.png\ttrue"
+      requestStop (fsSession fs) StopQuit
+    outVerdict outcome `shouldBe` VerdictSuccess
+    outFailures outcome `shouldBe` []
+
+  it "latches a required missing texture as required_request even though the script never polls it" $ do
+    outcome ← runFacade ((defaultShape missingRequired) {shapeBoth = False}) $ \fs →
+      atomically (sessionOutcomeNow (fsSession fs) >>= \found → unless (not (null (outFailures found))) retry)
+    outVerdict outcome `shouldBe` VerdictFailure
+    map rfCode (outFailures outcome) `shouldBe` [RequiredRequest]
+
 -- | How many native releases of a table handle the texture owner ran.
 releasedCount ∷ FS → IO Int
 releasedCount fs = length . filter (Text.isPrefixOf "released ") <$> Fake.events (rigFake (fsRig fs))
@@ -417,4 +430,26 @@ afterQuit =
     , "      local ok2, e2 = pcall(api.window.open, {title='t', width=1, height=1})"
     , "      print('after', ok1, ok2, tostring(e1):find('stopping') ~= nil, tostring(e2):find('stopping') ~= nil)"
     , "    end"
+    ]
+
+-- | An optional texture the content does not hold: its failure is data.
+missingOptional ∷ ByteString
+missingOptional =
+  presentationOnly
+    [ "    init=function(self, api) self.t = api.content.texture('nope.png', {optional = true}) end,"
+    , "    update=function(self, dt)"
+    , "      local api = self.api"
+    , "      if self.done or not api.request.ready(self.t) then return end"
+    , "      self.done = true"
+    , "      local r = api.request.take(self.t)"
+    , "      print('missing', r.status, r.error.code, r.error.root, r.error.path, r.value == nil)"
+    , "    end"
+    ]
+
+-- | A required texture the content does not hold, which the script never reads.
+missingRequired ∷ ByteString
+missingRequired =
+  presentationOnly
+    [ "    init=function(self, api) self.t = api.content.texture('nope.png') end,"
+    , "    update=function(self, dt) end"
     ]
