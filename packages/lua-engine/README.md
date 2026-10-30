@@ -1083,6 +1083,51 @@ temporary bank cannot hold is not an error but data: the call returns exactly `r
 left in a shared export as well. A content request is also refused, as an ordinary error and never as `busy`, when the
 session's admission is stopping or closed: busy is a capacity answer, and a stopping session will have no more room later.
 
+### The graphics calls (LFE-21)
+
+A composition that injects graphics (`FacadeSpec.fsGraphics`, made by a `GraphicsInjection`; see
+[the session](#what-a-composition-injects)) adds four calls and one request kind to the facade. The CPU facade owns every
+Lua-visible rule of them and imports no texture, scene, window, GPU, GLFW or Vulkan module: it is handed `GraphicsServices`,
+abstract operations, and the concrete composition over the real providers is
+[the graphics adapter's](../lua-engine-graphics/README.md#the-graphics-facade-lfe-21). A facade with no graphics has none of the
+fields below, no handle type and no request kind, exactly as before. The layout is the same in both roles: a logical
+instance's call is an ordinary error of the binding, never a missing field.
+
+| Call | Arguments | Successful result |
+| --- | --- | --- |
+| `api.content.texture(path [, options])` | `options` is `nil`, absent or a plain table with only `root` and `optional` (a boolean, default `false`; `nil` omits, `false` is a value). `tick_offset` is refused, `1` included | `request, nil`; the taken value is `{texture=HANDLE, width=INTEGER, height=INTEGER}` |
+| `api.window.open({title=TEXT, width=INTEGER, height=INTEGER})` | exactly the three fields, all required; `width` and `height` are Lua integers (`1.0` and `"1"` are refused) | `request, nil`; the taken value is the window handle itself |
+| `api.scene.publish(window, scene)` | the instance's own ready window and a scene of [the scene schema](#the-scene-schema-lfe-19) | no results, once the whole publication is accepted |
+| `api.texture.release(texture)` | the instance's own texture, including one already released | `"done"`, `"retiring"` or `"already_released"` |
+
+Every call is a dot call with its exact arity (an explicit `nil` is an argument), a plain record and the host's raw reading: a
+colon call, a metatable, an unknown or missing field, a wrong type or subtype and a table that is not a plain record are
+ordinary errors before any provider is asked, and no authored metamethod runs. The root defaults to the requesting instance's
+content identifier, not the defining module's; a root the session does not enable and an invalid path are refused with no
+filesystem action. The title is UTF-8, at most 512 bytes, with no control character (empty is allowed); the dimensions are
+`1..4096`; those rules, and the occupied window slot, are the adapter's checks, run after the facade's own.
+
+**Busy.** `content.texture` and `window.open` return `nil, {code="busy", message=TEXT}` when a temporary bank (the request
+places, the texture slots and bytes, the provider's records) has no room: two Lua values, no handle, no provider or native action.
+Busy comes only from the atomic M1 reservations the admission makes before it acquires a lease or starts a request. A second window
+while the instance already has a pending, live or retiring one is the permanent ordinary error `this instance already has a window`,
+decided before any temporary bank, so a full bank never turns it into busy. The host's own lease and request capacity refusals are
+faults; the lease scope of a VM is therefore made with room above every texture and window the instance's reservations can hold
+(16 + 1, see the adapter's derivation), so no accepted M1 admission can reach them.
+
+| Call | Module top level | `init` | update | `shutdown` | After the stop latch |
+| --- | --- | --- | --- | --- | --- |
+| `content.texture`, `window.open`, `scene.publish` | refused | presentation | presentation | refused | refused (an ordinary error, never busy) |
+| `texture.release` | refused | presentation | presentation | presentation | allowed |
+| `request.ready`, `take`, `cancel` | refused | yes | yes | yes | yes |
+| `request.wait` | refused | refused | yes | refused | yes |
+
+The stop latch is the session's admission, read through the endpoint the facade already has; `quit()` closes it before it returns,
+so later statements of the same segment can release, cancel, print and warn but cannot open, load or publish. A module evaluated as
+part of a hook-started load is a module: it does not borrow the hook's authority. The window and texture requests are read, taken,
+cancelled and waited for through the common `api.request` operations; a window failure is `{status="failure",
+error={code="window_error", message=TEXT}}` with no root or path, a texture failure carries both.
+
 ### Content roots
 
 Two calls name content, and their default roots are different on purpose.
@@ -1287,6 +1332,7 @@ uninterruptibly masked is refused before anything is acquired: the protocol's wa
 | `sxClock`, `sxTimer` | the monotonic clock the owners, the facades and the pacing share, and what sleeps (the threaded runtime's timer manager in production, a hand-fired one in a test). The backend's arm and cancel run under the repository's uninterruptible discipline, so they must be finite and non-waiting, like a release; what either raises, of whatever type, is raised by the timer as a failure of that cleanup (or of the host, for an arm) and never mistaken for a cancellation of the caller |
 | `sxRuntime`, `sxControl` | the Lua runtime the owners start on, and the supervision control of the driving thread |
 | `sxHarness` | `noHarness` for a real composition; see [the harness](#the-harness) |
+| `sxGraphics` | the graphics a composition injects (LFE-21): `Nothing` for every CPU-only caller, whose facades are exactly as before, or a `GraphicsInjection`, the abstract function the session calls once for each role's VM, over that VM's own request policy (already gated on the session's admission), to make its `GraphicsServices` (its lending and lease scope, its handle types, its request endpoints and the four operations). The pipeline, the window provider and everything under them are the assembly's, made before the session and closed after it; the session never closes them. The concrete injection is [the graphics adapter's](../lua-engine-graphics/README.md#the-graphics-facade-lfe-21) |
 
 The pool, the anchored root and the output belong to the assembly outside `runSession`, which closes and drains the actual pool before it releases the inventory and the root, and closes the output last, after the producers have stopped. A pool shutdown failure after `runSession` returns is the assembly's evidence and makes the eventual exit fail. A session-local `retired` does not claim that these shared services were destroyed.
 
@@ -1611,7 +1657,7 @@ checks the pure conversions with no VM, with the bounds. The Boundary and Client
 
 Not here, and not claimed: the CLI `run` dispatch and exit mapping (LFE-22), which will
 consume the boot checkpoint and retain the same anchored root;
-the concrete GPU upload and registration, native budgets, scene holds and the atomic publication of a prepared scene (LFE-17 to LFE-20), the public Lua graphics binding (LFE-21),
+the concrete GPU upload and registration, native budgets, scene holds and the atomic publication of a prepared scene (LFE-17 to LFE-20), the public Lua graphics binding (LFE-21, [the graphics calls](#the-graphics-calls-lfe-21)),
 the graphics service facades (the content, request, time and output surface is [the facade](#the-authoring-facade-lfe-12), the status,
 quit and unavailable-state guard are [the session controls](#the-session-controls-lfe-26); the texture pipeline's typed endpoint is still its own),
 the launcher that opens the content root, makes the checkpoint, installs the signal handlers and maps the outcome to an exit status (LFE-22); live codec, texture and GPU budgets and their

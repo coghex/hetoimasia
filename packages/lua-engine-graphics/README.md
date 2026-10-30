@@ -534,6 +534,61 @@ ends, with at most one admitted request per texture.
   (on macOS `HETOIMASIA_NATIVE_SESSION=desktop` on that command). It reads the host's own frame events and scene state; it
   captures and reads back no pixel.
 
+## The graphics facade (LFE-21)
+
+`Hetoimasia.LuaEngine.Graphics.Facade` is the concrete composition of the CPU facade's graphics operations
+([the calls](../lua-engine/README.md#the-graphics-calls-lfe-21)) over this package's providers. `graphicsInjection` takes the session's
+services it borrows (`GraphicsFacade`: the validated profile, the texture pipeline, the window provider and the scene publisher) and
+answers the `GraphicsInjection` a session is composed with (`sxGraphics`); the session calls it once for each role's VM. Nothing here
+enters Lua, waits or keeps a registry that outlives the VM it was made for.
+
+| What | Built from | Notes |
+| --- | --- | --- |
+| `api.content.texture` | `textureArgumentCheck`, `startTexture` | required unless `optional=true`; a content failure keeps its root and path |
+| `api.window.open` | `askWindow`, `windowArgumentCheck`, `startWindow` | always required; a clean refusal is `window_error`, latched even if unread (`required_request` at the `request` stage) |
+| `api.scene.publish` | `graphicsPublishBinding` | the facade's precondition first; the commit is one transaction |
+| `api.texture.release` | `releaseTexture` over the host's special release path | `done`, `retiring`, `already_released`; repeated release repeats no cleanup |
+
+**Lease headroom (the derivation).** A VM's lease scope has room for `TextureLeasesPerUiInstance + WindowSlotsPerUiInstance` leases for
+each instance: 16 + 1 = 17 under the fixed M1 profile (`facadeLeaseCapacity`). Every texture a UI instance can hold, pending, live or
+retiring, takes one of its 16 texture slots, and its window takes the one window slot; both are charged by the providers' banks in the
+same atomic admission as the host's lease charge, and answer `busy` when full. The most leases that can coexist are therefore 17, and the
+host's lease capacity, which would fault the invocation, cannot be the first bank to answer. No authored M1 ceiling is increased.
+
+**Owners.** A UI instance's texture owner and window owner are made when the facade declares the instance and closed when it forgets the
+instance (its settlement observed). They are held in one STM map per VM, written by the declaring thread and read by the instance's owner
+thread. The pipeline, the provider and the publisher are the assembly's and outlive the session; a session that stops closes new work first
+(the request policy's gate and the facade's admission read), and the lease releases and the providers' own retirements run as before.
+
+### Invariants (the D-80 table)
+
+The table covering every reservation, publication, settlement and cancellation window of this slice is in the pull request body of
+[#536](https://github.com/coghex/hetoimasia/issues/536)'s change; the providers' own tables above are unchanged and this slice adds no
+reservation of its own: it composes theirs. What it adds are four checks, each made before the provider is asked, and one routing.
+
+| Window | What makes it hold |
+| --- | --- |
+| calling instance | the facade asks the host which instance is running and the registry for its record; a captured facade, a module's top level and another instance's handle are refused before the action |
+| role, phase and admission | decided once, in the CPU facade, for acquisition and publication; release reads only the instance and its role |
+| owners | looked up by the instance identity the facade issued; an instance with none declared is an engine defect, not a Lua error |
+| lifecycle races after the check | `TextureRefused` and `WindowRefused` come back from the admission with nothing reserved and are raised with `refuseOrdinarily` |
+| lease headroom | derived above; the capacity is a function of the profile, not a constant |
+
+### Tests
+
+* `lua-engine-graphics-tests` (`test.vulkan-headless`), `graphics facade`: a real `runSession` with `noHarness` and the production
+  injection, over a real content root, manifest, checkpoint, read pool, supervised owners, request admission, leases, pipeline and window
+  provider. The texture owner and the windows are the fakes' and the host's ledger a model (injected evidence). It runs the accepted
+  common-entry example in both completion orders; the unread and the caught clean window-creation refusal (`required_request`, `request`);
+  a genuine native close with the startup gate closed; a full bank answering busy; an occupied window slot; a repeated release; the
+  segment after a quit; and an optional and a required missing texture.
+* `lua-engine-tests` (`test.lua-engine`), `graphics calls`: the CPU facade's rules over gated services.
+* `lua-engine-graphics-native-tests` (`test.vulkan-lua-engine-native`), subgroup `graphics facade`: the quad example and a failing-logical
+  variant on the production host with real PNG decoding, GPU-ready textures, windows and publication, judged by the host's frame events and
+  scene state, with no pixel captured. Run it with
+  `HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:lua-engine-graphics-native-tests -- --match 'graphics facade'`
+  (on Linux the runner starts its own display).
+
 ## Limits
 
 * The completion wake is the GPU model's change: the adapter assumes the only uploads in the session are its own and the
