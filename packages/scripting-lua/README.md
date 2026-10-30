@@ -1035,7 +1035,27 @@ for it.
 One refusal is ordinary though it is made after the action began: a credit of a request admission that says it is full for good
 ([`CreditRefused`](#what-asking-reserves)). The engine raises it from inside `startAdmitted`, before it has any effect, as
 `OrdinaryCallRefusal`; an opted-in binding's handler answers it with the same ordinary error (`binding: request refused: WHY`),
-and a binding that is not opted in keeps the fault of the call. Nothing else the action does becomes recoverable.
+and a binding that is not opted in keeps the fault of the call. Nothing else the action does becomes recoverable
+except through the one export below.
+
+**`refuseOrdinarily :: Text -> IO a`** (`Hetoimasia.Scripting.Lua.Registration`, owner decision D-88) is for an
+**engine-owned** binding's action that finds, **before it has had any effect**, a fact that makes the call final but is not
+a fault: a state that changed after every check the host makes before the action (a stop, a closure, an instance ending).
+It throws the refusal the handler answers. The caller's contract:
+
+- The action releases every temporary obligation it took (a pin, a borrow, a draft) **before** it raises this, and never
+  raises it after its effect has been committed to a host: a failure after that point is the application's own and
+  claims no rollback.
+- For a binding opted in to ordinary refusals (`recoverableRefusals`, `withPrecondition`, `withArgumentCheck`) the script
+  sees the same ordinary Lua error as a pre-action refusal, `binding: reason`, that `pcall` catches; the invocation goes
+  on and records nothing on the VM. For any other binding it is the fault of the call, `BindingRefused reason`.
+- The reason has the bound of a precondition's, `refusalReasonLimit` = 256 bytes of UTF-8. One longer is not truncated: it
+  is a defect of the application and a typed `BoundaryFault` of the call (`ValueRefused`, `RuleBytesLimit 256`), whether or
+  not the binding is opted in. The engine's own credit refusal (`CreditRefused`) is a separate exception and keeps its behavior.
+- **It counts as an action run.** The action began, so the action counter of the examples includes it, unlike the
+  refusals made before the action above, which never run it.
+- It is not for application code that is not an engine-owned binding, and not for the application's failures: any other
+  exception from an action is the application's own failure and ends the owner.
 
 **No action.** A refused call never ran its action: no provider or native work, no
 request accepted, no resource published, and the action counter of the examples stays at
