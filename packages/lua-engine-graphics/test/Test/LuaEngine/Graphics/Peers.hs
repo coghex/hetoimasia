@@ -13,7 +13,7 @@
 module Test.LuaEngine.Graphics.Peers (spec) where
 
 import Control.Concurrent (forkIO, killThread)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (finally)
 import Control.Monad (forM_, forever, unless, void)
@@ -217,9 +217,11 @@ evictedSpec =
 
 -- | The host's own request invalidated while the provider holds its window's adoption: the epoch of the scheduled endpoint
 -- advances (the public operation that settles every outstanding request as cancelled by the epoch) after the window was
--- created and attached and while the host's adoption recipe is held at 'hookBeforeAdopt'. The adoption then finds the
--- request gone: no success reaches the script, the window is closed once and retired, and the provider's acquisition
--- (the reservation) is returned only then, never before the window has retired.
+-- created and attached and while the host's adoption recipe is held at 'hookBeforeAdopt'. The request being settled, the
+-- provider closes the window it never handed over (the example holds the native window's destruction, so retirement is its
+-- to release): the acquisition (the reservation) stays charged while the window has not retired, whether the adoption is
+-- still parked or has run, and is returned only when the window retires. No success reaches the script, and the window is
+-- closed once. The adoption gate and the retirement hold are let go on every exit, before the owner is torn down.
 heldAdoptionSpec ∷ Spec
 heldAdoptionSpec = do
   it "settles a window request whose host request is invalidated while the provider holds its adoption: no success is delivered, the window is closed once, and the reservation returns only after its retirement" $ do
@@ -232,47 +234,60 @@ heldAdoptionSpec = do
                 first ← atomicModifyIORef' seen (\held → (True, not held))
                 if first then putMVar entered () >> readMVar proceed else pure ()
             }
-    withPeersHooked hooks heldEntry defaultIssuedMemory $ \peers → do
-      first ← peAdmit peers
-      -- The window is created and attached, the host claimed the adoption recipe and the example holds it there.
-      takeMVar entered
-      -- The reservation is held while the window is alive, and the window has not been closed.
-      atomically (providerReading (peProvider peers)) >>= \found → readingAcquisitions found `shouldBe` 1
-      length . filter (Text.isPrefixOf "close w") <$> WF.events (peWindows peers) >>= (`shouldBe` 0)
-      -- The host's request is invalidated through the public endpoint while the adoption is held.
-      advanceRequestEpoch (scheduledEndpoint (peOwner peers)) >>= (`shouldSatisfy` isJust)
-      atomically (providerReading (peProvider peers)) >>= \found → readingAcquisitions found `shouldBe` 1
-      putMVar proceed ()
-      -- Only after the window retired is the reservation back.
-      atomically (providerReading (peProvider peers) >>= \found → unless (readingAcquisitions found == 0) retry)
-      closes ← length . filter (Text.isPrefixOf "close w") <$> WF.events (peWindows peers)
-      closes `shouldBe` 1
-      -- What the script was told: the request settled, but never as a success, and no other window came into being.
-      awaitLinePrefix peers "window\t"
-      awaitLine peers "after\ttrue"
-      told ← readTVarIO (peOut peers)
-      [line | line ← told, Text.isPrefixOf "window\t" line] `shouldSatisfy` all (/= "window\tsuccess")
-      length (filter (Text.isPrefixOf "window\t") told) `shouldBe` 1
-      length . filter (Text.isPrefixOf "issue create") <$> WF.events (peWindows peers) >>= (`shouldBe` 1)
-      stop peers first
-      _ ← waitInstance (spTicket first)
-      forgetInstance (peFacade peers) (spIdentity first)
+    -- The native window is held at its destruction, so that its retirement is the example's to release.
+    withPeersHooked hooks (WF.defaultFakeConfig {WF.fcHolds = [WF.HoldNative]}) heldEntry defaultIssuedMemory $ \peers → do
+      -- However the example ends, the adoption is let go before the owner is torn down.
+      let acquisitions = atomically (providerReading (peProvider peers)) >>= pure . readingAcquisitions
+          closes = length . filter (Text.isPrefixOf "close w") <$> WF.events (peWindows peers)
+      ( do
+          first ← peAdmit peers
+          -- The window is created and attached, the host claimed the adoption recipe and the example holds it there.
+          takeMVar entered
+          acquisitions >>= (`shouldBe` 1)
+          closes >>= (`shouldBe` 0)
+          -- The host's request is invalidated through the public endpoint while the adoption is held. The request being
+          -- settled, the provider closes the window it never handed over, while the adoption is still parked.
+          advanceRequestEpoch (scheduledEndpoint (peOwner peers)) >>= (`shouldSatisfy` isJust)
+          WF.awaitEvent (peWindows peers) "close w"
+          closes >>= (`shouldBe` 1)
+          -- Retirement is held: the reservation is charged for as long as the window has not retired, whether the
+          -- adoption is still parked or has since run.
+          acquisitions >>= (`shouldBe` 1)
+          void (tryPutMVar proceed ())
+          awaitLinePrefix peers "window\t"
+          acquisitions >>= (`shouldBe` 1)
+          -- Only when the window retires is the reservation back.
+          WF.release (peWindows peers) WF.HoldNative
+          atomically (providerReading (peProvider peers) >>= \found → unless (readingAcquisitions found == 0) retry)
+          closes >>= (`shouldBe` 1)
+          -- What the script was told: the request settled, but never as a success, and no other window came into being.
+          awaitLine peers "after\ttrue"
+          told ← readTVarIO (peOut peers)
+          [line | line ← told, Text.isPrefixOf "window\t" line] `shouldSatisfy` all (/= "window\tsuccess")
+          length (filter (Text.isPrefixOf "window\t") told) `shouldBe` 1
+          length . filter (Text.isPrefixOf "issue create") <$> WF.events (peWindows peers) >>= (`shouldBe` 1)
+          stop peers first
+          _ ← waitInstance (spTicket first)
+          forgetInstance (peFacade peers) (spIdentity first)
+        )
+        `finally` (void (tryPutMVar proceed ()) >> WF.release (peWindows peers) WF.HoldNative)
 
 withPeers ∷ (Peers → IO a) → IO a
 withPeers = withPeersWith peersEntry defaultIssuedMemory
 
 -- | The same composition with the given entry module and the given number of issued handles remembered.
 withPeersWith ∷ ByteString → Int → (Peers → IO a) → IO a
-withPeersWith = withPeersHooked noProviderHooks
+withPeersWith = withPeersHooked noProviderHooks WF.defaultFakeConfig
 
--- | The same composition with the given window-provider hooks: the places an example holds a step of the provider.
-withPeersHooked ∷ ProviderHooks → ByteString → Int → (Peers → IO a) → IO a
-withPeersHooked hooks entry issuedMemory body = bounded . withRig Fake.defaultFakeConfig $ \rig → do
+-- | The same composition with the given window-provider hooks and window fake: the places an example holds a step of the
+-- provider, and the stages of the fake windows it holds back.
+withPeersHooked ∷ ProviderHooks → WF.FakeConfig → ByteString → Int → (Peers → IO a) → IO a
+withPeersHooked hooks windowConfig entry issuedMemory body = bounded . withRig Fake.defaultFakeConfig $ \rig → do
   let fake = rigFake rig
   model ← newModel (fakeLedger fake)
   setBarrier fake (modelCapture model)
   forM_ [1 .. 8] (modelWindow model)
-  windows ← WF.newFake WF.defaultFakeConfig
+  windows ← WF.newFake windowConfig
   textures ← newTextures
   let config = WindowConfig 2 (pure ()) (\_ → pure ())
       files = [("lua/main.lua", entry), ("lua/share.lua", "return {apis = {}, handles = {}}"), ("images/quad.png", Png.solid 2 2 (200, 100, 50, 255))]
