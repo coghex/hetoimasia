@@ -35,6 +35,7 @@ module Hetoimasia.Scripting.Lua.Internal.Fault
   , raisedByApplication
   , CallRefusal (..)
   , OrdinaryCallRefusal (..)
+  , BoundedOrdinaryRefusal (..)
     -- * Reading what a failed call left
   , classify
   , renderFailure
@@ -129,7 +130,8 @@ raisedByApplication context = not (null (getExceptionAnnotations context ∷ [Ra
 -- operation raises it whatever the script does with the error it sees, and never
 -- marked as a failure of application code. It is not exported by the public
 -- library, so application code cannot raise it; only an engine API that checks
--- the condition itself, before it has any effect, does.
+-- the condition itself, before it has any effect, does. (The public
+-- @refuseOrdinarily@ raises the ordinary refusal, not this one.)
 newtype CallRefusal = CallRefusal
   { refusalReason ∷ Text
   }
@@ -146,13 +148,28 @@ instance Exception CallRefusal
 -- answers it as an ordinary Lua error with a bounded message, @binding: reason@, that @pcall@ catches
 -- and an invocation that caught it can go on from, recording nothing on the VM; for a binding that
 -- is not opted in it is a fault of the call, exactly as 'CallRefusal' is. Not exported by the public
--- library, so application code cannot raise it.
+-- library: the engine's request admission raises it, and the public raiser of an ordinary refusal is
+-- 'BoundedOrdinaryRefusal', whose reason is bounded.
 newtype OrdinaryCallRefusal = OrdinaryCallRefusal
   { ordinaryReason ∷ Text
   }
   deriving (Eq, Show)
 
 instance Exception OrdinaryCallRefusal
+
+-- | An ordinary refusal made by an engine-owned binding's own action through the public
+-- 'Hetoimasia.Scripting.Lua.Registration.refuseOrdinarily', whose reason is the engine's to bound.
+--
+-- It differs from 'OrdinaryCallRefusal' only in the bound: the handler lets its reason reach Lua as an
+-- ordinary error only when it fits the refusal bound a precondition's reason has, and answers a longer one
+-- as that precondition does, a typed fault of the call whether or not the binding is opted in. The
+-- engine's own credit refusal keeps 'OrdinaryCallRefusal', and so keeps its behavior.
+newtype BoundedOrdinaryRefusal = BoundedOrdinaryRefusal
+  { boundedReason ∷ Text
+  }
+  deriving (Eq, Show)
+
+instance Exception BoundedOrdinaryRefusal
 
 -- | How many bytes of a Lua error value are reported.
 --

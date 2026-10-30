@@ -15,7 +15,16 @@ import Data.Text (Text)
 import Data.Word (Word64)
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Graphics.Scene
-import Hetoimasia.LuaEngine.Scene (SceneContent (..), SceneRect (..), SceneSprite (..))
+import Hetoimasia.LuaEngine.Profile
+  ( ByteLimit (SceneInputBytes)
+  , Bytes (Bytes)
+  , ProfileSpec (..)
+  , fixedM1Profile
+  , profileSpec
+  , validateProfile
+  )
+import Hetoimasia.LuaEngine.Scene (SceneContent (..), SceneLimits, SceneRect (..), SceneSprite (..), sceneCallWindowBytes, sceneLimits, sceneValueLimits, scenePublishLimits)
+import Hetoimasia.Scripting.Lua.Value (limitBytes, limitElements)
 import Hetoimasia.LuaEngine.Graphics.Window.Port (Port (..), WindowToken (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Provider (WindowConfig (..), closeWindowOwner, endWindows)
 import Hetoimasia.Render.TwoD.Vulkan.Textures (newTextures)
@@ -141,15 +150,19 @@ spec = describe "scene publication" $ do
           withPublication $ \pub → do
             ready pub "a"
             loaded pub "a" "a" "a.png"
+            _ ← run pub "a" "publish" "a" (Just "a")
+            previous ← latest pub winA
             armGate (pubVm pub) gate
-            held ← runHeld pub "a" "ppublish" "a" (Just "a")
+            held ← runHeld pub "a" "ppublish" "a" (Just "a,a")
             awaitGate (pubVm pub) gate
             () <$ change pub
             openGate (pubVm pub) gate
             line ← held
             line `shouldSatisfy` Text.isInfixOf "error"
             line `shouldSatisfy` Text.isInfixOf expected
-            publishedRevision (pubModel pub) winA `shouldReturn` 0
+            -- The previous scene and its revision are untouched.
+            publishedRevision (pubModel pub) winA `shouldReturn` 1
+            latest pub winA `shouldReturn` previous
     it "refuses when the window stops being the admitted incarnation before the authority is read" $
       refusedAt "before-boundary" "not ready" $ \pub → setUsable (pubModel pub) winA False
     it "refuses when the instance's window owner is closed between the borrows and the commit" $
@@ -160,6 +173,39 @@ spec = describe "scene publication" $ do
       refusedAt "before-commit" "not ready" $ \pub → setUsable (pubModel pub) winA False
     it "refuses when the host closes between the borrows and the commit" $
       refusedAt "before-commit" "ended" $ \pub → closeHost (pubModel pub)
+    it "refuses a texture released between the check and the action's preparation as an ordinary error, the previous scene unchanged" $
+      withPublication $ \pub → do
+        ready pub "a"
+        loaded pub "a" "a" "a.png"
+        loaded pub "a" "b" "b.png"
+        _ ← run pub "a" "publish" "a" (Just "a")
+        previous ← latest pub winA
+        -- The check accepted the call; the texture is released at the first seam, where the action then finds its
+        -- lease ended: an expected lifecycle refusal, ordinary and caught, and not the engine's defect.
+        line ← run pub "a" "pearly" "a" (Just "b")
+        line `shouldSatisfy` Text.isInfixOf "error"
+        line `shouldSatisfy` Text.isInfixOf "texture refused"
+        publishedRevision (pubModel pub) winA `shouldReturn` 1
+        latest pub winA `shouldReturn` previous
+        -- The instance is healthy and the next valid publication works.
+        again ← run pub "a" "ppublish" "a" (Just "a")
+        again `shouldSatisfy` Text.isInfixOf "published"
+
+    it "leaves nothing borrowed or charged when the commit refuses: the texture is then released at once, and a later publication works" $
+      withPublication $ \pub → do
+        ready pub "a"
+        loaded pub "a" "a" "a.png"
+        armGate (pubVm pub) "before-commit"
+        held ← runHeld pub "a" "ppublish" "a" (Just "a")
+        awaitGate (pubVm pub) "before-commit"
+        closeHost (pubModel pub)
+        openGate (pubVm pub) "before-commit"
+        line ← held
+        line `shouldSatisfy` Text.isInfixOf "error"
+        publishedRevision (pubModel pub) winA `shouldReturn` 0
+        -- A borrow left behind by the refused draft would answer the release as in use; none was.
+        released ← run pub "a" "release" "a" Nothing
+        released `shouldSatisfy` Text.isInfixOf "retiring"
 
     it "keeps an accepted scene when the provider stops, or the instance is asked to end, after the commit" $
       withPublication $ \pub → do
@@ -202,6 +248,45 @@ spec = describe "scene publication" $ do
       Left failure
         | Just (HUnitFailure _ _) ← fromException failure → expectationFailure ("the example failed instead of the scope: " <> show failure)
         | otherwise → pure ()
+
+  describe "the window handle beside the scene in the reader's limits" $ do
+    it "is allowed exactly the reader's charge for a capability: one element and 21 bytes, so the scene keeps its own bound" $ do
+      limits ← limitsOf Nothing
+      sceneCallWindowBytes `shouldBe` 21
+      limitBytes (scenePublishLimits limits) `shouldBe` limitBytes (sceneValueLimits limits) + sceneCallWindowBytes
+      limitElements (scenePublishLimits limits) `shouldBe` limitElements (sceneValueLimits limits) + 1
+
+    it "refuses the maximum scene one element past its bound, as an ordinary error with the previous scene unchanged" $
+      withPublication $ \pub → do
+        ready pub "a"
+        loaded pub "a" "a" "a.png"
+        _ ← run pub "a" "publish" "a" (Just "a")
+        previous ← latest pub winA
+        -- 4,096 sprites and one more key: the call's 24,584th element, past the exact 24,583 of the window and the scene.
+        line ← run pub "a" "pbad" "a" (Just "fullextra")
+        line `shouldSatisfy` Text.isInfixOf "error"
+        line `shouldSatisfy` Text.isInfixOf "more than 24583 values"
+        publishedRevision (pubModel pub) winA `shouldReturn` 1
+        latest pub winA `shouldReturn` previous
+
+    it "accepts a scene exactly at the scene input bytes and refuses one a byte past, as an ordinary error with the previous scene unchanged" $ do
+      -- One sprite encodes in 198 bytes: the scene table 5; "clear" 10 and its table 5 + 3 * (6 + 9); "sprites" 12 and its
+      -- list 5 + the key 9 + the sprite table 5 + 12 + 21 + 15 + 15 + 15 + 20 (the rules of 'Hetoimasia.Scripting.Lua.Value').
+      let atBound = 198
+      limitsAt ← limitsOf (Just atBound)
+      withPublicationAt limitsAt $ \pub → do
+        ready pub "a"
+        loaded pub "a" "a" "a.png"
+        accepted ← run pub "a" "ppublish" "a" (Just "a")
+        accepted `shouldSatisfy` Text.isInfixOf "published"
+        publishedRevision (pubModel pub) winA `shouldReturn` 1
+      limitsPast ← limitsOf (Just (atBound - 1))
+      withPublicationAt limitsPast $ \pub → do
+        ready pub "a"
+        loaded pub "a" "a" "a.png"
+        refused ← run pub "a" "ppublish" "a" (Just "a")
+        refused `shouldSatisfy` Text.isInfixOf "error"
+        publishedRevision (pubModel pub) winA `shouldReturn` 0
 
   it "takes the largest legal scene through the binding: 4,096 sprites are accepted and one more is refused" $
     withPublication $ \pub → do
@@ -250,7 +335,23 @@ winC = 4
 -- backend's drain, which waits for every texture a scene holds to retire, is not left waiting for a scene that
 -- nobody will release.
 withPublication ∷ (Pub → IO a) → IO a
-withPublication body =
+withPublication body = limitsOf Nothing >>= \limits → withPublicationAt limits body
+
+-- | The scene limits of the fixed M1 profile, or of that profile with the scene input bytes set to a value, so that a
+-- scene can reach the limit's own edge.
+limitsOf ∷ Maybe Word64 → IO SceneLimits
+limitsOf bytes =
+  either (\refused → assertFailure ("the scene limits were refused: " <> refused)) pure $ do
+    let base = profileSpec fixedM1Profile
+        edited = case bytes of
+          Nothing → base
+          Just n → base {specBytes = \limit → if limit == SceneInputBytes then Bytes n else specBytes base limit}
+    profile ← either (Left . show) Right (validateProfile edited)
+    either (Left . show) Right (sceneLimits profile)
+
+-- | 'withPublication' under the scene limits of the example.
+withPublicationAt ∷ SceneLimits → (Pub → IO a) → IO a
+withPublicationAt limits body =
   withRig Fake.defaultFakeConfig $ \rig → do
     let fake = rigFake rig
     model ← newModel (fakeLedger fake)
@@ -269,7 +370,7 @@ withPublication body =
             }
         files = [("a.png", Png.solid 2 2 (200, 100, 50, 255)), ("b.png", Png.solid 2 2 (20, 100, 250, 255))]
     withSceneComp kit config files (rigPort rig) $ \comp _ runtime → do
-      vm ← startSceneVm comp runtime "scene-vm"
+      vm ← startSceneVmWith limits comp runtime "scene-vm"
       body (Pub comp vm model rig)
         `finally` (openAllGates vm >> WF.releaseAll windows >> dissolve model >> endWindows (scProvider comp))
 

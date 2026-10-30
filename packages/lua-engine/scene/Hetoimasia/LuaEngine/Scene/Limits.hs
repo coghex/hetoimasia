@@ -18,6 +18,7 @@ module Hetoimasia.LuaEngine.Scene.Limits
   , sceneSpriteLimit
   , sceneValueLimits
   , scenePublishLimits
+  , sceneCallWindowBytes
   , sceneCoordinateLimit
   , sceneExtentLimit
   ) where
@@ -32,7 +33,6 @@ import Hetoimasia.LuaEngine.Profile
   , Profile
   , bytesLimit
   , countLimit
-  , sceneCallExtraBytes
   , sceneCallExtraElements
   , sceneElementBound
   )
@@ -45,13 +45,21 @@ data SceneLimits = SceneLimits
   , sceneValueLimits ∷ !ValueLimits
   , scenePublishLimits ∷ !ValueLimits
     -- ^ The crossing limits of a call that carries a window handle beside the scene: the scene's own, plus the
-    -- handle's one element and its bytes. A binding that takes the window and the scene reads its arguments under
-    -- these, because the reader keeps one counter for all the arguments of a call. A validated profile always has
-    -- room for them ('Hetoimasia.LuaEngine.Profile.sceneCallElementBound').
+    -- handle's one element and exactly the bytes the reader charges a capability ('sceneCallWindowBytes'). A binding
+    -- that takes the window and the scene reads its arguments under these, because the reader keeps one counter for
+    -- all the arguments of a call; the scene's own bytes and elements are then exactly its bound, no more. A
+    -- validated profile always has room for them ('Hetoimasia.LuaEngine.Profile.sceneCallElementBound'; its
+    -- byte allowance, 'Hetoimasia.LuaEngine.Profile.sceneCallExtraBytes', is the larger figure validation reserves).
   , sceneCoordinateLimit ∷ !Int
   , sceneExtentLimit ∷ !Int
   }
   deriving (Eq, Show)
+
+-- | The bytes the value reader charges for a capability, and so for the window handle beside the scene: 21 (one
+-- element). The binding's allowance for the handle is this charge exactly, never the profile validation's larger
+-- reserve, which would let a scene encode more than 'SceneInputBytes'.
+sceneCallWindowBytes ∷ Int
+sceneCallWindowBytes = 21
 
 -- | Why a profile cannot be turned into scene limits.
 data SceneLimitsRefused
@@ -71,7 +79,7 @@ sceneLimits profile = do
   coordinate ← machine "CoordinateMagnitude" (count CoordinateMagnitude)
   extent ← machine "SpriteExtentMaximum" (count SpriteExtentMaximum)
   limits ← either (Left . LimitsRefused) Right (valueLimits bytes depth elements)
-  publish ← either (Left . LimitsRefused) Right (valueLimits (bytes + fromIntegral sceneCallExtraBytes) depth (elements + fromIntegral sceneCallExtraElements))
+  publish ← either (Left . LimitsRefused) Right (valueLimits (bytes + sceneCallWindowBytes) depth (elements + fromIntegral sceneCallExtraElements))
   Right (SceneLimits sprites limits publish coordinate extent)
   where
     count limit = let Count value = countLimit profile limit in value

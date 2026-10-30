@@ -44,13 +44,18 @@
 --
 -- = Refusal, and what is fatal
 --
--- Every refusal, including the ones found at the commit, is an ordinary Lua error from the binding: @pcall@ catches
--- it, the previous scene stays, and the next valid call works. What can be known before an effect is refused by the
--- binding's check ('graphicsPublishCheck'), which publishes nothing. The commit is made in the action; a refusal
--- there (a stop, a closure or an ending instance that landed since the check) is raised from inside the action with
--- 'refuseOrdinarily', before any effect, because the commit is one transaction that wrote nothing. A defect of the
--- host or the registry, an exception or a cancellation after the commit is the application's failure: the scene
--- stays the window's, and nothing here downgrades a defect or clears a fatal latch.
+-- Every expected refusal is an ordinary, bounded Lua error from the binding: @pcall@ catches it, the previous scene
+-- and its revision stay untouched, and the next valid call works. What can be known before an effect is refused by
+-- the binding's check ('graphicsPublishCheck'), which publishes nothing. The commit is made in the action, atomically:
+-- one transaction reads the authority and writes the host's snapshot. A lifecycle change that landed after the check (a
+-- stop, a closure, an ending instance, a texture's lease that ended) is found by the action before the commit and
+-- raised with 'refuseOrdinarily' (the host's export for engine-owned actions), and only after
+-- 'publishSceneWith' has returned, that is after every pin and borrow the call took has been released: nothing of
+-- the refused draft stays borrowed or charged. It is never raised after the host holds the scene. What no lifecycle
+-- change can explain (a schema or geometry refusal of the same copied value the check accepted) is a
+-- 'SceneDefect', the engine's failure. A defect of the host or the registry, an exception or a cancellation after the
+-- commit is the application's failure: the scene stays the window's, and nothing here downgrades a defect, claims a
+-- rollback or clears a fatal latch.
 --
 -- = Owned state, threads and lifetime
 --
@@ -84,6 +89,7 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Publish
   ) where
 
 import Control.Concurrent.STM (STM, atomically)
+import Control.Exception (throwIO)
 import Control.Monad (when)
 import qualified Data.ByteString as ByteString
 import Data.Functor ((<&>))
@@ -109,7 +115,10 @@ import Hetoimasia.LuaEngine.Graphics.Window.Provider
   )
 import Hetoimasia.LuaEngine.Scene
   ( PreparedScene (preparedOwner)
+  , SceneDefect (..)
   , SceneLimits
+  , SceneReason (TextureAuthorityRefused)
+  , SceneRefusal (..)
   , TextureUse (..)
   , prepareScene
   , refusalReasonText
@@ -226,7 +235,10 @@ publishRefusalText refusal = clip $ case refusal of
 
 -- | Where a test may hold the publication at a precise place. Production uses none of them.
 data PublishHooks = PublishHooks
-  { hookBeforeBoundary ∷ IO ()
+  { hookBeforePrepare ∷ IO ()
+    -- ^ At the start of the binding's action, after the host's checks and the binding's check, before the action
+    -- prepares the copied value again.
+  , hookBeforeBoundary ∷ IO ()
     -- ^ After the caller's preparation, before any authority is checked at the boundary.
   , hookBeforeCommit ∷ IO ()
     -- ^ After the final check, with every lease borrowed, before the host is handed the scene.
@@ -235,7 +247,7 @@ data PublishHooks = PublishHooks
   }
 
 noPublishHooks ∷ PublishHooks
-noPublishHooks = PublishHooks (pure ()) (pure ()) (pure ())
+noPublishHooks = PublishHooks (pure ()) (pure ()) (pure ()) (pure ())
 
 -- | Publish a prepared scene to the window the lease key names.
 publishScene ∷ Typeable target ⇒ ScenePublisher target → Word64 → PreparedScene → IO PublishResult
@@ -339,11 +351,20 @@ graphicsPublishBindingWith hooks name precondition publisher limits leases =
   withArgumentLimits (scenePublishLimits limits) $
     withArgumentCheck (graphicsPublishCheck precondition publisher limits leases) $
       stateOperation name [SCapability windowHandleType, sceneSchema] [] $ \case
-        [VCapability window, scene] →
+        [VCapability window, scene] → do
+          hookBeforePrepare hooks
           prepareScene limits leases scene >>= \case
-            Left refusal → refuseOrdinarily (refusalReasonText refusal)
+            -- A texture's lease that ended, or that is another instance's, is a lifecycle change that landed
+            -- after the check: expected, and before any obligation is taken, so it is refused ordinarily.
+            Left refusal@(SceneRefusal _ (TextureAuthorityRefused _)) → refuseOrdinarily (refusalReasonText refusal)
+            -- Any other refusal is of the same copied value the check accepted, which no lifecycle change can
+            -- explain: the engine's defect, never recoverable.
+            Left refusal → throwIO (SceneDefect (refusalReasonText refusal))
             Right prepared →
+              -- 'publishSceneWith' returns only when every pin it took has been released, so a refusal it
+              -- reports is raised here with no obligation of this call outstanding: the previous scene and its
+              -- revision are untouched and nothing of the refused draft stays borrowed or charged.
               publishSceneWith hooks publisher (capabilityKey window) prepared >>= \case
                 Published → pure []
                 Refused refusal → refuseOrdinarily (publishRefusalText refusal)
-        _ → refuseOrdinarily "publishing takes a window and a scene"
+        _ → throwIO (SceneDefect "the host handed a publication other than a window and a scene")

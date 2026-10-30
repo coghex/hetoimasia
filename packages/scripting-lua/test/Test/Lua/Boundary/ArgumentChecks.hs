@@ -18,7 +18,7 @@ import Hetoimasia.Scripting.Lua.Owner
 import Hetoimasia.Scripting.Lua.Registration
 import Hetoimasia.Scripting.Lua.Value
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
-import Test.Lua.Boundary.Support (refusal, run, runFault, withOwnerOf)
+import Test.Lua.Boundary.Support (reasonOf, refusal, run, runFault, withOwnerOf)
 
 -- | What the bindings observe.
 data Fx = Fx
@@ -61,7 +61,11 @@ registrationOf fx = either (error . ("registration refused: " <>) . show) id (re
         , withArgumentCheck (\_ _ → pure (Just (Text.replicate (refusalReasonLimit + 1) "r"))) (stateOperation "wordy" [SInteger] [] (\_ → note fx "wordy" >> pure []))
         , -- An ordinary refusal made from inside the action, before it has any effect: opted in, then not.
           withArgumentCheck (\_ _ → pure Nothing) (stateOperation "closing" [SInteger] [] (\_ → note fx "closing" >> refuseOrdinarily "the world is ending"))
+        , -- The reason's bound: exactly at it, then one byte past it, opted in and not.
+          withArgumentCheck (\_ _ → pure Nothing) (stateOperation "closing_at" [SInteger] [] (\_ → note fx "closing_at" >> refuseOrdinarily (Text.replicate refusalReasonLimit "r")))
+        , withArgumentCheck (\_ _ → pure Nothing) (stateOperation "closing_past" [SInteger] [] (\_ → note fx "closing_past" >> refuseOrdinarily (Text.replicate (refusalReasonLimit + 1) "r")))
         , stateOperation "plain" [SInteger] [] (\_ → note fx "plain" >> refuseOrdinarily "the world is ending")
+        , stateOperation "plain_past" [SInteger] [] (\_ → note fx "plain_past" >> refuseOrdinarily (Text.replicate (refusalReasonLimit + 1) "r"))
         , withArgumentCheck (positive "ticket") (stateOperation "redeem" [SCapability "ticket"] [] (\_ → note fx "redeem" >> pure []))
         , snapshotQuery "ticket" [SInteger] [SCapability "ticket"] $ \arguments → case arguments of
             [VInteger key] → do
@@ -139,5 +143,15 @@ spec = describe "a check of the copied argument values" $ do
   it "is a fault of the call, whatever the script does, for a binding that did not opt in" $
     withFx $ \fx owned → do
       fault ← runFault owned "pcall(checked.plain, 1)"
-      fmap refusalRule (refusal fault) `shouldSatisfy` (/= Just (RuleBytesLimit refusalReasonLimit))
+      reasonOf fault `shouldBe` BindingRefused "the world is ending"
       logged fx >>= (`shouldBe` ["plain"])
+
+  it "carries a reason exactly at the bound as the ordinary error, and one byte past it as the typed fault of the call, opted in or not" $
+    withFx $ \fx owned → do
+      run owned (caught "checked.closing_at(1)" ("checked.closing_at: " <> Text.replicate refusalReasonLimit "r"))
+      past ← runFault owned "pcall(checked.closing_past, 1)"
+      fmap refusalRule (refusal past) `shouldSatisfy` (== Just (RuleBytesLimit refusalReasonLimit))
+      plain ← runFault owned "pcall(checked.plain_past, 1)"
+      fmap refusalRule (refusal plain) `shouldSatisfy` (== Just (RuleBytesLimit refusalReasonLimit))
+      -- Each action ran, as the refusal is made from inside it: an action-time refusal counts as an action run.
+      logged fx >>= (`shouldBe` ["closing_at", "closing_past", "plain_past"])

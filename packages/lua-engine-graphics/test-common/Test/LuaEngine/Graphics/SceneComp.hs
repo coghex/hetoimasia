@@ -19,6 +19,7 @@ module Test.LuaEngine.Graphics.SceneComp
     -- * One VM
   , SceneVm (..)
   , startSceneVm
+  , startSceneVmWith
   , admitScene
   , stopScene
   , command
@@ -43,9 +44,10 @@ module Test.LuaEngine.Graphics.SceneComp
   ) where
 
 import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
-import Control.Monad (unless, when)
+import Control.Monad (unless, void, when)
 import Data.Functor ((<&>))
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.Word (Word64)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
@@ -140,6 +142,9 @@ data SceneVm target = SceneVm
   , vmWindowOwners ∷ !(IORef (Map Text WindowOwner))
   , vmGates ∷ !(TVar Gates)
   , vmPublisher ∷ !(ScenePublisher target)
+  , vmEarly ∷ !(IORef (Maybe Word64))
+    -- ^ The texture the next publication releases at its first seam, after the binding's check and before the
+    -- action prepares the value again: a release landing where a script's next statement could not.
   }
 
 data Gates = Gates
@@ -166,20 +171,27 @@ publisherOf = vmPublisher
 
 -- | A VM over the composition: its own lease scope and handle registry, one owner settling on arrival.
 startSceneVm ∷ ∀ target. Typeable target ⇒ SceneComp target → LuaRuntime → Text → IO (SceneVm target)
-startSceneVm comp runtime label = do
+startSceneVm comp runtime label =
+  either (\refused → assertFailure ("the scene limits were refused: " <> show refused)) pure (sceneLimits compositionProfile)
+    >>= \limits' → startSceneVmWith limits' comp runtime label
+
+-- | The same under the scene limits of an example: one derived from another profile, so that the limits' own edges
+-- can be reached by a scene.
+startSceneVmWith ∷ ∀ target. Typeable target ⇒ SceneLimits → SceneComp target → LuaRuntime → Text → IO (SceneVm target)
+startSceneVmWith limits' comp runtime label = do
   handles ← newRequestHandles
   requests ← either (\refused → assertFailure ("the profile was refused: " <> show refused)) pure (m1Requests compositionProfile handles)
   textureService' ← either (\refused → assertFailure ("the texture service was refused: " <> show refused)) pure (textureService requests (cpPipeline (scTexture comp)))
   let windowService' = windowService requests (scProvider comp)
-  limits' ← either (\refused → assertFailure ("the scene limits were refused: " <> show refused)) pure (sceneLimits compositionProfile)
   lending ← newLending
   leases ← newLeases lending 16
   textureOwners ← newIORef Map.empty
   windowOwners ← newIORef Map.empty
   gates ← newTVarIO (Gates [] [] [] [] False)
+  early ← newIORef Nothing
   let kit = scKit comp
       publisher = scenePublisherOver (kitTextures kit) (scProvider comp) (kitPublish kit) (kitUsable kit)
-      vm' = SceneVm (error "owner not started") textureService' windowService' leases textureOwners windowOwners gates publisher
+      vm' = SceneVm (error "owner not started") textureService' windowService' leases textureOwners windowOwners gates publisher early
       registered =
         either (error . ("registration refused: " <>) . show) id $
           registration
@@ -237,7 +249,7 @@ bindings comp limits vm =
   , namespace "wrq" (m1RequestBindings (M1Service windowRequests windowValueSchema))
   , namespace "tex" [loading, releasing]
   , namespace "win" [opening]
-  , namespace "scn" [published, late, raced]
+  , namespace "scn" [published, early, arming, late, raced]
   ]
   where
     log' = cpLog (scTexture comp)
@@ -295,6 +307,14 @@ bindings comp limits vm =
     -- The same binding with one more check after the library's: the host runs every check before the action, so a
     -- refusal by it cannot come after the publication.
     late = withArgumentCheck (\_ _ → pure (Just "a later check refused")) (graphicsPublishBindingWith (hooksOf vm) "publish_late" (\_ _ → pure Nothing) (vmPublisher vm) limits (vmLeases vm))
+    -- A texture is released at the publication's first seam, after the check has accepted the call and before the
+    -- action prepares the value again: the action finds the texture's lease ended.
+    arming =
+      stateOperation "arm_early" [SCapability textureHandleType] [] $ \case
+        [VCapability texture] → [] <$ writeIORef (vmEarly vm) (Just (capabilityKey texture))
+        _ → pure []
+    early = graphicsPublishBindingWith ((hooksOf vm) {hookBeforePrepare = releaseEarly >> hookBeforePrepare (hooksOf vm)}) "publish_early" (\_ _ → pure Nothing) (vmPublisher vm) limits (vmLeases vm)
+    releaseEarly = readIORef (vmEarly vm) >>= mapM_ (void . releaseTexture (vmLeases vm))
     -- A release that lands between the scene's preparation and the publication boundary, on the instance's own thread
     -- where a script's next statement could not: the preparation succeeds, the texture is released, and the
     -- operation is asked to publish the stale preparation. The answer is the operation's, as text.
@@ -331,7 +351,7 @@ bindings comp limits vm =
 -- | The publication's seams, each a gate the example arms: an armed gate holds the script's invocation inside the
 -- publication until the example lets it go, with the rest of the system free to move meanwhile.
 hooksOf ∷ SceneVm target → PublishHooks
-hooksOf vm = PublishHooks (gate "before-boundary") (gate "before-commit") (gate "after-commit")
+hooksOf vm = PublishHooks (gate "before-prepare") (gate "before-boundary") (gate "before-commit") (gate "after-commit")
   where
     gate name = do
       held ← readTVarIO (vmGates vm)
@@ -392,6 +412,7 @@ driverSource =
       , "    local s = scene(self, {spec = 'a'}, self.ts)"
       , "    if p.spec == 'extra' then s.extra = 1"
       , "    elseif p.spec == 'hole' then s.sprites[2] = nil s.sprites[3] = s.sprites[1]"
+      , "    elseif p.spec == 'fullextra' then for i = 1, 4096 do s.sprites[i] = {texture = self.ts.a, x = 0, y = 0, width = 1, height = 1} end s.extra = 1"
       , "    elseif p.spec == 'many' then for i = 1, 4097 do s.sprites[i] = {texture = self.ts.a, x = 0, y = 0, width = 1, height = 1} end"
       , "    elseif p.spec == 'meta' then setmetatable(s, {})"
       , "    elseif p.spec == 'nan' then s.sprites[1].x = 0/0 end"
@@ -399,6 +420,10 @@ driverSource =
       , "    out = ok and 'published' or ('error ' .. tostring(err))"
       , "  elseif p.op == 'plate' then"
       , "    local ok, err = pcall(scn.publish_late, self.ws[key], scene(self, p, self.ts))"
+      , "    out = ok and 'published' or ('error ' .. tostring(err))"
+      , "  elseif p.op == 'pearly' then"
+      , "    scn.arm_early(self.ts[p.spec])"
+      , "    local ok, err = pcall(scn.publish_early, self.ws[key], scene(self, p, self.ts))"
       , "    out = ok and 'published' or ('error ' .. tostring(err))"
       , "  elseif p.op == 'praced' then"
       , "    out = scn.publish_raced(self.ws[key], scene(self, p, self.ts), self.ts.a)"

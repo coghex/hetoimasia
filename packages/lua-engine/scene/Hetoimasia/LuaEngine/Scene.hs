@@ -39,6 +39,7 @@ module Hetoimasia.LuaEngine.Scene
   , sceneSpriteLimit
   , sceneValueLimits
   , scenePublishLimits
+  , sceneCallWindowBytes
   , sceneCoordinateLimit
   , sceneExtentLimit
 
