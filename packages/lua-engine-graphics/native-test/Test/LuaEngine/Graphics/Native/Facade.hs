@@ -49,7 +49,7 @@ import Test.LuaEngine.Graphics.FacadeScripts (failingLogicalExample, manifestFor
 import Test.LuaEngine.Graphics.FrameLog (frameLogMark)
 import qualified Test.LuaEngine.Graphics.Png as Png
 import Test.LuaEngine.Graphics.Native.Scenes hiding (spec)
-import Test.LuaEngine.Graphics.Native.Session (Env (..), serveMain)
+import Test.LuaEngine.Graphics.Native.Session (Env (..), noteWindows, serveMain)
 
 spec ∷ Env → Spec
 spec env = describe "graphics facade" $ do
@@ -72,13 +72,19 @@ spec env = describe "graphics facade" $ do
 
   it "shows a logical update that raises after startup as the UI's failure status, and its exact empty red-clear scene published and adopted through the same bindings" $
     within 180 . withFacadeSession env failingLogicalExample $ \errLines window → do
-      awaitAdopted env window 1
-      published env window >>= (`shouldBe` Just 1)
+      -- The UI warns with the failure's message and publishes the empty red clear once it reads the failure in its status:
+      -- a scene it may have drawn first is superseded by it.
       atomically (readTVar errLines >>= \seen → unless (any (Text.isInfixOf "logical failure") seen) retry)
-      -- The scene holds no texture: it is the empty red clear.
-      held ← atomically (ledgerReading (graphicsLedger (envGraphics env)))
-      readingHeld held `shouldSatisfy` null
-      evidence env "graphics facade: the logical update raised after startup; the UI warned with the failure message and published the empty red-clear scene (revision 1), which the owner adopted holding no texture"
+      latest ← published env window
+      revision ← maybe (assertFailure "nothing was published") pure latest
+      awaitAdopted env window revision
+      -- Once the red clear is the adopted scene, nothing it names is held: it is the empty scene.
+      mark ← frameLogMark <$> readTVarIO (envFrames env)
+      demandFrame env window
+      awaitFrame env window revision mark
+      atomically (ledgerReading (graphicsLedger (envGraphics env)) >>= \held → unless (null (readingHeld held)) retry)
+      published env window >>= (`shouldBe` Just revision)
+      evidence env ("graphics facade: the logical update raised after startup; the UI warned with the failure message and published the empty red-clear scene (revision " <> Text.pack (show revision) <> "), which the owner adopted and recorded holding no texture")
 
 -- | Run the entry as the roles of a real session over the production host, hand the scenario the lines the roles
 -- warned and the identity of the one native window the example opens, and end the session by a normal stop once the
@@ -120,6 +126,7 @@ withFacadeSession env entry scenario = do
                 writeIORef sessionRef (Just found)
                 attempted ← try @SomeException $ do
                   window ← awaitNewWindow earlier
+                  noteWindows env 1
                   scenario errLines window
                 -- However the scenario ended, the session stops normally.
                 requestStop found StopQuit
