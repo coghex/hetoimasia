@@ -17,6 +17,8 @@ module Test.LuaEngine.Graphics.Fake
   , defaultFakeConfig
   , newFake
   , fakePort
+  , fakeLedger
+  , setBarrier
   , withFakeOwner
 
     -- * Holds
@@ -73,6 +75,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word32)
+import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (SceneLedger, ledgerHeld, newSceneLedger)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port
 
 -- | What the fake owner holds back. A held stage waits until the example releases it.
@@ -140,6 +143,9 @@ data ImageState
 data Pending = Pending
   { pendingRun ∷ Device Int → IO ()
   , pendingRefuse ∷ PortRefusal → STM ()
+  , pendingGate ∷ STM Bool
+    -- ^ The release lane's barrier as it stood when the request was admitted: the owner runs the action only once
+    -- it reads true. An action in the other lane waits for nothing.
   }
 
 data Upload = Upload
@@ -169,6 +175,12 @@ data Fake = Fake
   , fNextGeneration ∷ !(TVar Word32)
   , fGrants ∷ !(TVar Int)
     -- ^ Actions the owner may run although 'HoldOwner' is on: one at a time, for an example that counts them.
+  , fBarrier ∷ !(TVar (STM (STM Bool)))
+    -- ^ What a release request captures when it is admitted (see 'setBarrier'): by default nothing, so the lane waits for
+    -- 'HoldAdoption' alone.
+  , fLedger ∷ !(SceneLedger Int)
+    -- ^ The production ledger of what adopted scene revisions hold, which the fake's release is gated on exactly as
+    -- the production port's is. The examples that adopt scenes drive its lifecycle hooks.
   }
 
 newFake ∷ FakeConfig → IO Fake
@@ -192,6 +204,18 @@ newFake cfg =
     <*> newTVarIO []
     <*> newTVarIO 1
     <*> newTVarIO 0
+    <*> newTVarIO (pure (pure True))
+    <*> newSceneLedger
+
+-- | Install what a release request captures at its admission: a transaction that reads the scene host's state and
+-- answers the gate the owner waits on. The scene host model (the lifecycle suite's stand-in for the host's
+-- ledger) installs it.
+setBarrier ∷ Fake → STM (STM Bool) → IO ()
+setBarrier fake capture = atomically (writeTVar (fBarrier fake) capture >> bump fake)
+
+-- | The ledger the fake's port and device read: the production one.
+fakeLedger ∷ Fake → SceneLedger Int
+fakeLedger = fLedger
 
 -- Holds and injections ---------------------------------------------------------------------------------------
 
@@ -353,7 +377,7 @@ fakePort fake =
   Port
     { portStanding = readTVar (fStanding fake)
     , portAct = admit (fActs fake) (fcActCapacity cfg)
-    , portRelease = admit (fReleases fake) (fcReleaseCapacity cfg)
+    , portRelease = admitGated (fReleases fake) (fcReleaseCapacity cfg)
     , portUpload = admitUpload fake
     , portTicket = \ticket → readTVar . upState . (Map.! ticket) =<< readTVar (fUploads fake)
     , portCancel = \ticket → do
@@ -374,11 +398,18 @@ fakePort fake =
         raising ← takeInjection fake (\case RaiseMark → Just (); _ → Nothing)
         when (raising == Just ()) (throwSTM (userError "injected: marking the release raised"))
         modifyTVar' (fMarked fake) (Set.insert ref)
+    , portHeld = ledgerHeld (fLedger fake) . textureIdentity
     }
   where
     cfg = fConfig fake
     admit ∷ ∀ a. TVar [Pending] → Int → (Device Int → IO a) → STM (Either PortRefusal (Submitted a))
-    admit lane capacity body =
+    admit lane capacity = admitWith (pure (pure True)) lane capacity
+    admitGated ∷ ∀ a. TVar [Pending] → Int → (Device Int → IO a) → STM (Either PortRefusal (Submitted a))
+    admitGated lane capacity body = do
+      capture ← readTVar (fBarrier fake)
+      admitWith capture lane capacity body
+    admitWith ∷ ∀ a. STM (STM Bool) → TVar [Pending] → Int → (Device Int → IO a) → STM (Either PortRefusal (Submitted a))
+    admitWith capture lane capacity body =
       readTVar (fStanding fake) >>= \case
         Ended why → pure (Left (PortEnded why))
         Starting → pure (Left PortNotStarted)
@@ -387,6 +418,7 @@ fakePort fake =
           if length queued >= capacity
             then pure (Left PortFull)
             else do
+              gate ← capture
               cell ← newTVar Nothing
               -- Queueing an action and answering it are not progress of the owner's model (the real port's wake is the
               -- model's change, and the model does not hold its action queue): a wait that woke on its own ask's
@@ -399,6 +431,7 @@ fakePort fake =
                           atomically (held fake HoldOutcome >>= \on → when on retry)
                           atomically (finish (either Raised Returned (outcome ∷ Either SomeException a)))
                       , pendingRefuse = finish . NotRun
+                      , pendingGate = gate
                       }
               writeTVar lane (queued <> [pending])
               pure (Right (Submitted (readTVar cell)))
@@ -480,6 +513,7 @@ deviceFor fake =
                   record fake ("registered " <> tshow image <> " slot " <> tshow slot <> " alpha " <> tshow (levelBinaryAlpha level))
                   bump fake
                   pure (Right (Registration (TextureRef slot generation) slot))
+    , deviceHeld = atomically . ledgerHeld (fLedger fake) . textureIdentity . registrationRef
     , deviceTable = do
         noteEvent fake "table read"
         raising ← atomically (takeInjection fake (\case RaiseTable → Just (); _ → Nothing))
@@ -540,6 +574,10 @@ ownerLoop fake = do
       holders ← readTVar (fHolders fake)
       grants ← readTVar (fGrants fake)
       states ← traverse (\(ticket, upload) → (,) (ticket, upload) <$> readTVar (upState upload)) (Map.toList uploads)
+      gated ← traverse (\pending → (,) pending <$> pendingGate pending) releases
+      let readyRelease = case break snd gated of
+            (before, (pending, _) : after) → ([pending], map fst before <> map fst after)
+            (_, []) → ([], map fst gated)
       let canRun = standing == Running && (not (on HoldOwner) || grants > 0)
           spendGrant = when (on HoldOwner) (writeTVar (fGrants fake) (grants - 1))
       case () of
@@ -548,7 +586,7 @@ ownerLoop fake = do
               writeTVar (fActs fake) rest
               spendGrant
               pure (pendingRun pending (deviceFor fake))
-          | canRun, not (on HoldAdoption), pending : rest ← releases → do
+          | canRun, not (on HoldAdoption), (pending : _, rest) ← readyRelease → do
               writeTVar (fReleases fake) rest
               spendGrant
               pure (pendingRun pending (deviceFor fake))

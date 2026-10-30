@@ -43,6 +43,9 @@ module Hetoimasia.LuaEngine.Profile.Limits
   , sceneElementBound
   , sceneFixedElements
   , sceneElementsPerSprite
+  , sceneCallExtraElements
+  , sceneCallExtraBytes
+  , sceneCallElementBound
   ) where
 
 import Data.Array (Array, Ix, listArray, (!))
@@ -295,6 +298,23 @@ sceneElementBound profile =
   Count (sceneFixedElements + sceneElementsPerSprite * sprites)
   where
     Count sprites = countLimit profile SceneSprites
+
+-- | What a scene-publishing call carries beside the scene: the window handle, which the copied-value reader counts
+-- with the scene because it keeps one counter for all the arguments of a call. The handle is one element.
+sceneCallExtraElements ∷ Word64
+sceneCallExtraElements = 1
+
+-- | The bytes the window handle adds to the call's crossing, allowed for generously: far more than its encoding, and
+-- far less than any limit it is added to.
+sceneCallExtraBytes ∷ Word64
+sceneCallExtraBytes = 64
+
+-- | The element count of a maximal publishing call, which is what a profile must let one crossing hold: the scene's
+-- ('sceneElementBound') and the window handle's. Validation has shown it fits 64 bits.
+sceneCallElementBound ∷ Profile → Count
+sceneCallElementBound profile = Count (sceneElementBound' + sceneCallExtraElements)
+  where
+    Count sceneElementBound' = sceneElementBound profile
 
 -- | Bytes of one RGBA8 pixel.
 rgba8BytesPerPixel ∷ Word64

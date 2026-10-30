@@ -42,13 +42,14 @@ import Hetoimasia.Foundation.Log
   , callbackSink
   , mkLogger
   )
-import Hetoimasia.Foundation.Messaging.Payload (prepare)
 import Hetoimasia.GLFW.Session (Backend, SessionConfig (..))
 import Hetoimasia.GLFW.Vulkan (withLoaderIntegration)
 import Hetoimasia.GPU.Model (Usage, usage)
 import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), DiagnosticVerdict, defaultCaptureConfig)
+import Test.LuaEngine.Graphics.FrameLog (FrameLog, emptyFrameLog, recordEvent)
 import Hetoimasia.GPU.Vulkan.GLFW
-  ( NativeObserver (..)
+  ( FrameEvent (..)
+  , NativeObserver (..)
   , Readiness (..)
   , ValidationFeature
   , VulkanHost (..)
@@ -58,6 +59,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , vulkanHostConfig
   , withVulkanOwnerHost
   )
+import Hetoimasia.LuaEngine.Graphics.Scene
 import Hetoimasia.LuaEngine.Graphics.Texture
 import Hetoimasia.LuaEngine.Graphics.Window.Configuration (configureWindows)
 import Hetoimasia.GPU.Vulkan.GLFW (runVulkanOwnerLoop)
@@ -67,8 +69,10 @@ import Hetoimasia.Runtime.Supervision (RuntimeControl)
 
 -- | What an example is given.
 data Env = Env
-  { envHost ∷ !(VulkanHost ())
-  , envHostConfig ∷ !(VulkanHostConfig ())
+  { envHost ∷ !(VulkanHost GraphicsScene)
+  , envHostConfig ∷ !(VulkanHostConfig GraphicsScene)
+  , envScenes ∷ !SceneSession
+    -- ^ The scene part of the session: the ledger the texture release is gated on, and the renderer's slot.
   , envGraphics ∷ !TextureGraphics
   , envControl ∷ !RuntimeControl
   , envBaseline ∷ !Usage
@@ -85,6 +89,9 @@ data Env = Env
     -- example has one.
   , envWindows ∷ !(IORef Int)
     -- ^ How many native windows the examples made, for the run's evidence and the checks that depend on it.
+  , envFrames ∷ !(TVar (FrameLog FrameEvent))
+    -- ^ The host's frame events, bounded, with a monotonic cursor: what the owner reported of each frame's acquisition,
+    -- submission, presentation and observed completion, on its own thread.
   }
 
 -- | What the run saw, once the session is released.
@@ -147,13 +154,15 @@ runSession complete backend features configuration examples = do
   verdictCell ← newIORef Nothing
   passedCell ← newIORef False
   windowCount ← newIORef 0
+  frames ← newTVarIO emptyFrameLog
   evidence ← newTVarIO []
-  initial ← prepare ()
+  scenes ← newSceneSession
   let host = requestingBackend backend (defaultHostConfig [])
-      base = vulkanHostConfig host defaultCaptureConfig {captureTextBudget = 16384} (configurationBudgets configuration) initial
+      base = vulkanHostConfig host defaultCaptureConfig {captureTextBudget = 16384} (configurationBudgets configuration) (scenesInitial scenes)
       config =
-        (configureWindows (configureHost configuration base))
-          { vulkanLayers = ["VK_LAYER_KHRONOS_validation"]
+        (configureScenes scenes (configureWindows (configureHost configuration base)))
+          { vulkanFrameObserver = \event → atomically (modifyTVar' frames (recordEvent event))
+          , vulkanLayers = ["VK_LAYER_KHRONOS_validation"]
           , vulkanValidationFeatures = features
           , vulkanObserver = const (observer recorded)
           }
@@ -170,7 +179,7 @@ runSession complete backend features configuration examples = do
           )
           vulkanWindowHost
           (\vulkan _ → pure vulkan)
-          (\vulkan control → body vulkan control config evidence passedCell windowCount)
+          (\vulkan control → body scenes vulkan control config evidence passedCell windowCount frames)
   calls ← reverse <$> readIORef recorded
   verdict ← readIORef verdictCell
   passed ← readIORef passedCell
@@ -186,7 +195,7 @@ runSession complete backend features configuration examples = do
       , factsWindows = windows
       }
   where
-    body vulkan control config evidence passedCell windowCount = do
+    body scenes vulkan control config evidence passedCell windowCount frames = do
       progressNote "the owner is starting"
       readiness ← atomically $
         readReadiness (vulkanController vulkan) >>= \case
@@ -196,7 +205,7 @@ runSession complete backend features configuration examples = do
         RootsFailed why → ioError (userError ("the owner's startup failed: " <> Text.unpack why))
         _ → pure ()
       progressNote "the owner is ready; composing the adapter"
-      withTextureGraphics configuration config vulkan $ \graphics → do
+      withTextureGraphics scenes configuration config vulkan $ \graphics → do
         progressNote "the adapter is composed; waiting for the table to bind"
         -- The adapter is composed; wait for the table to bind, so the baseline is the session at rest.
         atomically $ do
@@ -207,7 +216,7 @@ runSession complete backend features configuration examples = do
         rest ← newIORef Nothing
         jobs ← newTVarIO []
         serve ← newIORef (pure ())
-        let env = Env vulkan config graphics control now rest evidence jobs serve windowCount
+        let env = Env vulkan config scenes graphics control now rest evidence jobs serve windowCount frames
         done ← newEmptyMVar
         _ ← forkOS $ do
           -- The complete profile is run with Hspec's configuration reading left out, so no argument,

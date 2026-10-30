@@ -50,6 +50,10 @@ import Control.Concurrent.STM (STM)
 import Control.Exception (Exception, ExceptionWithContext, SomeException, throwIO)
 import Data.Word (Word64)
 import Hetoimasia.GPU.Vulkan.GLFW (Image, TextureHandle (..), UploadTicket, VulkanHost, VulkanHostConfig)
+import Hetoimasia.LuaEngine.Graphics.Scene.Configuration (SceneHostProblem, SceneSession (..), checkSceneHostConfig)
+import Hetoimasia.GLFW.Window (WindowId)
+import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (SceneLedger)
+import Hetoimasia.LuaEngine.Graphics.Scene.Render (RenderSession (..), fillRenderSlot)
 import Hetoimasia.LuaEngine.Graphics.Texture.Backend
   ( BackendReading (..)
   , awaitBackendFailure
@@ -74,6 +78,8 @@ data TextureGraphics = TextureGraphics
     -- ^ The session's one renderer: the ring, the texture table, the storage table and the layout.
   , graphicsTextures ∷ !Textures
     -- ^ The session's one texture registry, whose handles the scene adapters name.
+  , graphicsLedger ∷ !(SceneLedger WindowId)
+    -- ^ What the adopted scene revisions hold: the release of a delivered texture is gated on it.
   , graphicsConfiguration ∷ !TextureGraphicsConfiguration
   , graphicsPort ∷ !(Port Image UploadTicket)
     -- ^ The adapter seam: the port the backend runs over, for a client that composes a further backend over
@@ -88,6 +94,8 @@ data TextureGraphics = TextureGraphics
 data TextureGraphicsRefused
   = -- | The host was not built with the configuration the profile maps to.
     HostConfigurationWrong ![HostProblem]
+  | -- | The host was not built for per-window scenes ('configureScenes').
+    SceneHostConfigurationWrong ![SceneHostProblem]
   | -- | The session could not be made on the host.
     SessionRefused !BootstrapRefused
   deriving (Eq, Show)
@@ -97,15 +105,18 @@ instance Exception TextureGraphicsRefused
 -- | Compose the adapter over a borrowed host and run the body. On every exit the backend drains: every
 -- accepted upload answers its terminal event and every texture it delivered is proved retired (or failed
 -- to be) before the scope returns, and the host's own scopes may unwind only after.
-withTextureGraphics ∷ TextureGraphicsConfiguration → VulkanHostConfig scene → VulkanHost scene → (TextureGraphics → IO r) → IO r
-withTextureGraphics configuration hostConfig host body =
-  case checkHostConfig configuration hostConfig of
-    problems@(_ : _) → throwIO (HostConfigurationWrong problems)
-    [] →
-      bootstrapHost (configurationRenderer configuration) host >>= \case
+withTextureGraphics ∷ SceneSession → TextureGraphicsConfiguration → VulkanHostConfig scene → VulkanHost scene → (TextureGraphics → IO r) → IO r
+withTextureGraphics scenes configuration hostConfig host body =
+  case (checkHostConfig configuration hostConfig, checkSceneHostConfig hostConfig) of
+    (problems@(_ : _), _) → throwIO (HostConfigurationWrong problems)
+    (_, problems@(_ : _)) → throwIO (SceneHostConfigurationWrong problems)
+    ([], []) →
+      bootstrapHost (configurationRenderer configuration) (scenesLedger scenes) host >>= \case
         Left refusal → throwIO (SessionRefused refusal)
         Right session →
           withBackend (hostPort host session) $ \backend → do
+            -- The renderer hook finds the session's renderer here, filled before any window can exist.
+            fillRenderSlot (scenesSlot scenes) (RenderSession (sessionRenderer session) (sessionTextures session))
             -- Composition ends when the table's placeholder is bound: texture work needs it, so it is
             -- asked for and waited for here, where a failure of the owner ends the assembly.
             awaitBound backend
@@ -114,6 +125,7 @@ withTextureGraphics configuration hostConfig host body =
                 { graphicsBackend = textureBackend backend
                 , graphicsRenderer = sessionRenderer session
                 , graphicsTextures = sessionTextures session
+                , graphicsLedger = sessionLedger session
                 , graphicsConfiguration = configuration
                 , graphicsPort = hostPort host session
                 , graphicsReading = readBackend backend

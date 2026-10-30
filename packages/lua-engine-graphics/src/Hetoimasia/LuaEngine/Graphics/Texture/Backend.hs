@@ -236,7 +236,11 @@ data TexStage
     TexOfferedReleased
   | TexLive
   | TexReleaseRequested
-  | TexReleasing !(Submitted (Maybe Fault))
+  | TexReleasing !(Submitted (Either Fault Disposal))
+  | -- | The release action ran and an adopted scene revision still held the texture: it waits, in STM, for
+    -- the last hold to end, and then asks again. The texture stays released for new use and keeps its
+    -- charges: nothing here is retirement.
+    TexHeld
   | TexRetiring !(Maybe (STM ()))
   | TexChecking !(STM ()) !(Submitted TableReading)
   | TexRetired
@@ -424,6 +428,7 @@ stageName = \case
   TexLive → "live"
   TexReleaseRequested → "release-requested"
   TexReleasing _ → "releasing"
+  TexHeld → "held"
   TexRetiring _ → "retiring"
   TexChecking _ _ → "retiring"
   TexRetired → "retired"
@@ -911,6 +916,16 @@ discardAction image device = deviceDiscard device image <&> either Just (const N
 releaseAction ∷ Registration → Device image → IO (Maybe Fault)
 releaseAction registration device = deviceRelease device registration <&> either Just (const Nothing)
 
+-- | The release of a /delivered/ texture, on the owner's thread: held back, not failed, while an adopted scene
+-- revision holds it. The read and the table release are one step of the owner, and the lifecycle hooks that
+-- write the holds run on the owner's thread, so an adoption cannot land between them; a scene that named the
+-- texture was adopted before this ran (the release lane's barrier), and none can name it again.
+deliveredReleaseAction ∷ Registration → Device image → IO (Either Fault Disposal)
+deliveredReleaseAction registration device =
+  deviceHeld device registration >>= \case
+    True → pure (Right Deferred)
+    False → deviceRelease device registration <&> fmap (const Disposed)
+
 -- The pump's IO steps ---------------------------------------------------------------------------------------
 
 -- | Tell the pipeline it may stop charging the borrowed level to its lane.
@@ -1055,7 +1070,7 @@ textureStep backend tid tex = do
   stage ← readTVar (tStage tex)
   case stage of
     TexReleaseRequested →
-      portRelease (bPort backend) (releaseAction (tRegistration tex)) >>= \case
+      portRelease (bPort backend) (deliveredReleaseAction (tRegistration tex)) >>= \case
         Right sub → Just StepProgress <$ writeTVar (tStage tex) (TexReleasing sub)
         Left (PortEnded why) → do
           _ ← noteEnded backend why
@@ -1064,12 +1079,29 @@ textureStep backend tid tex = do
     TexReleasing sub →
       submittedOutcome sub >>= \case
         Nothing → pure Nothing
-        Just (Returned Nothing) → Just StepProgress <$ writeTVar (tStage tex) (TexRetiring Nothing)
-        Just (Returned (Just fault)) → Just StepProgress <$ failTexture ("the table's release failed: " <> faultText fault)
+        Just (Returned (Right Disposed)) → Just StepProgress <$ writeTVar (tStage tex) (TexRetiring Nothing)
+        Just (Returned (Right Deferred)) → Just StepProgress <$ writeTVar (tStage tex) TexHeld
+        Just (Returned (Left fault)) → Just StepProgress <$ failTexture ("the table's release failed: " <> faultText fault)
         Just (Raised raised) → do
           latchSTM backend "releasing a texture" (plain raised)
           Just StepProgress <$ writeTVar (tStage tex) (TexFailed raised)
         Just (NotRun refusal) → Just StepProgress <$ failTexture (refusalText refusal)
+    TexHeld → do
+      -- Read in this transaction, so the end of the last hold wakes the pump. The ask goes through the barrier lane
+      -- again, not the ordinary one: the last adoption may have ended with its window still retaining the revision
+      -- it adopted (a target that is replaced leaves the window's published scene for the next attachment), and
+      -- that publication names this texture. The barrier a request captures names every window that has published
+      -- and waits until a live target of it has adopted that revision, or the window is gone.
+      holding ← portHeld (bPort backend) (registrationRef (tRegistration tex))
+      if holding
+        then pure Nothing
+        else
+          portRelease (bPort backend) (deliveredReleaseAction (tRegistration tex)) >>= \case
+            Right sub → Just StepProgress <$ writeTVar (tStage tex) (TexReleasing sub)
+            Left (PortEnded why) → do
+              _ ← noteEnded backend why
+              Just StepProgress <$ failTexture ("the graphics owner ended before the held release ran: " <> why)
+            Left _ → pure Nothing
     TexRetiring wake → do
       waiting ← case wake of
         Nothing → pure False

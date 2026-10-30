@@ -86,7 +86,7 @@ import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure, withOp
 import Hetoimasia.Scripting.Lua.Internal.Boundary
 import Hetoimasia.Scripting.Lua.Internal.Call (reportFault)
 import Hetoimasia.Scripting.Lua.Internal.Callback (Handler, failedResults, installBinding)
-import Hetoimasia.Scripting.Lua.Internal.Fault (CallRefusal (CallRefusal), OrdinaryCallRefusal (OrdinaryCallRefusal), classify, fromApplication, luaComponent, raisedByApplication, renderFailure)
+import Hetoimasia.Scripting.Lua.Internal.Fault (CallRefusal (CallRefusal), BoundedOrdinaryRefusal (BoundedOrdinaryRefusal), OrdinaryCallRefusal (OrdinaryCallRefusal), classify, fromApplication, luaComponent, raisedByApplication, renderFailure)
 import Hetoimasia.Scripting.Lua.Internal.Marshal
 import Hetoimasia.Scripting.Lua.Internal.Registration
 import Hetoimasia.Scripting.Lua.Internal.Value
@@ -370,6 +370,15 @@ valueHandler boundary vm space binding state restore = do
                                 , -- The refusal that is final and not a fault: an ordinary Lua error for a binding
                                   -- opted in to them, the fault of the call for any other.
                                   Exception.Handler (\(OrdinaryCallRefusal why) → if ordinary then pure (Left why) else faulted (BindingRefused why) BindingRan)
+                                , -- The same refusal made through the public export, whose reason has the bound a
+                                  -- precondition's has: one past it is a defect of the application, a typed fault of
+                                  -- the call whether or not the binding is opted in.
+                                  Exception.Handler
+                                    ( \(BoundedOrdinaryRefusal why) →
+                                        if lengthWord8 why > refusalReasonLimit
+                                          then faulted (ValueRefused (ValueRefusal Results 1 [] (RuleBytesLimit refusalReasonLimit) 0)) BindingRan
+                                          else if ordinary then pure (Left why) else faulted (BindingRefused why) BindingRan
+                                    )
                                 ]
                   case outcome of
                     Left why → raiseOrdinary why

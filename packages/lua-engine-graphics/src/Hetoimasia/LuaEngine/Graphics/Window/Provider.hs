@@ -83,6 +83,9 @@ module Hetoimasia.LuaEngine.Graphics.Window.Provider
   , closeWindowOwner
   , ownerSlotHeld
   , ownerNumber
+  , ownerRole
+  , ownerTaking
+  , providerTaking
 
     -- * The service
   , WindowService
@@ -244,6 +247,16 @@ instance Eq WindowOwner where
 -- | Whether the owner's one window slot is occupied: pending, live or retiring.
 ownerSlotHeld ∷ WindowOwner → STM Bool
 ownerSlotHeld = readTVar . ownerHeld
+
+-- | Whether the owner still takes new work: it has not ended. The scene publication (LFE-20) reads it with
+-- the provider's, in the transaction that decides to publish.
+ownerTaking ∷ WindowOwner → STM Bool
+ownerTaking = readTVar . ownerOpen
+
+-- | Whether the provider still takes new work: its admission has not closed (a session stop, or the end of
+-- the provider's scope, closes it before anything else).
+providerTaking ∷ WindowProvider target → STM Bool
+providerTaking provider = psOpen <$> readTVar (wpState provider)
 
 -- | The request's holdings: its owner's slot and its provider record, each held at most once.
 data Charge = Charge

@@ -141,6 +141,7 @@ module Hetoimasia.Scripting.Lua.Registration
   , withArgumentCheck
   , withArgumentLimits
   , ArgumentCheck
+  , refuseOrdinarily
   , OwnerContexts (..)
   , refusalReasonLimit
   , bindingRecoverable
@@ -176,6 +177,7 @@ module Hetoimasia.Scripting.Lua.Registration
   , standardGlobals
   ) where
 
+import Control.Exception (throwIO)
 import Data.Text (Text)
 import Hetoimasia.Scripting.Lua.Internal.Registration hiding
   ( bindingArguments
@@ -195,6 +197,7 @@ import Hetoimasia.Scripting.Lua.Internal.Registration hiding
   , registrationCapabilityTypes
   , registrationNamespaces
   )
+import Hetoimasia.Scripting.Lua.Internal.Fault (BoundedOrdinaryRefusal (BoundedOrdinaryRefusal))
 import qualified Hetoimasia.Scripting.Lua.Internal.Registration as Internal
 import Hetoimasia.Scripting.Lua.Value (Schema, ValueLimits)
 
@@ -260,3 +263,24 @@ bindingArgumentLimits = Internal.bindingArgumentLimits
 -- before its action ('recoverableRefusals', 'withPrecondition').
 bindingRecoverable ∷ Binding → Bool
 bindingRecoverable = Internal.bindingRecoverable
+
+-- | Refuse the call in progress from inside a binding's action, as an ordinary Lua error with this reason.
+--
+-- For an engine-owned binding whose action finds, /before it has had any effect/, a fact that makes the call
+-- final but not a fault: a state that changed after every check the host makes before the action (a stop, a
+-- closure, an instance ending). The action releases whatever temporary obligation it took before it raises
+-- this; it never raises it after its effect has been committed. For a binding opted in to ordinary refusals
+-- ('recoverableRefusals', 'withPrecondition', 'withArgumentCheck') the script sees an ordinary error,
+-- @binding: reason@; @pcall@ catches it and the invocation goes on, recording nothing on the VM. For any other
+-- binding it is the fault of the call 'Hetoimasia.Scripting.Lua.Owner.BindingRefused' names.
+--
+-- The reason has the bound of a precondition's, 'refusalReasonLimit' bytes of UTF-8. One longer is not
+-- truncated: it is a defect of the application and a typed fault of the call ('ValueRefused' with
+-- 'RuleBytesLimit' 'refusalReasonLimit'), whether or not the binding is opted in. The action has run, so the
+-- refusal counts as an action run, unlike the refusals made before it.
+--
+-- It is not for the application's failures: an exception that is not this one is the application's own failure
+-- and ends the owner, and a refusal raised after the action has had an effect cannot be undone by it. The action
+-- is the application's code, so the contract is the caller's to keep.
+refuseOrdinarily ∷ Text → IO a
+refuseOrdinarily = throwIO . BoundedOrdinaryRefusal
