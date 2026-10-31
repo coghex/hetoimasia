@@ -14,6 +14,7 @@ module Test.LuaEngine.Integrated.Support
   , awaitPhaseOf
   , awaitErrLines
   , awaitStartedPath
+  , awaitDiagnosticAbout
   , awaitFinishedPath
   , shareModule
   ) where
@@ -27,7 +28,7 @@ import qualified Data.Text as Text
 import System.IO (hPutStrLn, stderr)
 import Hetoimasia.Scripting.Lua.Instance (InstancePhase)
 import Test.LuaEngine.Facade.Support
-import Test.LuaEngine.Modules.Support (Probe, finishedPaths, startedPaths)
+import Test.LuaEngine.Modules.Support (Probe, diagnostics, finishedPaths, startedPaths)
 import Test.Support.Bounded (bounded)
 
 -- | The lines an example printed that start with this label and a space, without them.
@@ -62,6 +63,13 @@ awaitStartedPath ∷ Probe → ByteString → IO ()
 awaitStartedPath probe path = bounded loop
   where
     loop = startedPaths probe >>= \found → unless (path `elem` found) (yield >> loop)
+
+-- | Wait until the session's logger has recorded a diagnostic that mentions this text: the one the example is about, not
+-- merely some diagnostic.
+awaitDiagnosticAbout ∷ World -> Session -> Text -> IO ()
+awaitDiagnosticAbout _ session wanted = bounded loop
+  where
+    loop = diagnostics session >>= \found → unless (any (wanted `Text.isInfixOf`) found) (yield >> loop)
 
 -- | Wait until the pool's reader has finished a read of this path.
 awaitFinishedPath ∷ Probe → ByteString → IO ()

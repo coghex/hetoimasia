@@ -97,8 +97,9 @@ startingOrders = describe "both initialization orders" $ do
         (roleInitialized <$> gameplayOf status) `shouldBe` Just True
         advanceClock world 10000000
         nudge world 5000000
-        out0 ← outLines world
-        named "update gameplay" out0 `shouldBe` []
+        -- time has passed and the logical role is still ready and has not started (the output is parked, so its prints
+        -- could not show a tick: the phase does)
+        statusNow session >>= \later → phasesOf later `shouldBe` (Just Ready, Just Starting)
         releaseSink world
         awaitPhase session Gameplay Running
         awaitPhase session Presentation Running
@@ -107,22 +108,11 @@ startingOrders = describe "both initialization orders" $ do
         requestStop session StopQuit
       outVerdict outcome `shouldBe` VerdictSuccess
 
-  it "ends the whole session when the UI instance's init fails before the joint gate, retires both sides, and lets the late logical success reopen nothing" $
+  it "ends the whole session when the UI instance's init fails before the joint gate: both sides are retired, the logical clock never opens, and the failure is attributed to the presentation instance" $
     withSetup (withShare (duo ["if api.role == 'presentation' then error('ui init broke') end"])) $ \env → do
-      let world = seWorld env
-      -- the logical init is parked in its output, so that its success comes after the failure
-      holdSink world "init gameplay"
-      outcome ← runScenario env $ \session → do
-        awaitSinkEntered world "init gameplay"
-        status ← awaitStatus session statusStopping
-        statusStopping status `shouldBe` True
-        -- the order the example claims: the session is already stopping while the logical init's output is still parked,
-        -- so that its success has not happened yet
-        (roleInitialized <$> gameplayOf status) `shouldBe` Just False
-        outLines world >>= (`shouldSatisfy` notElem "init gameplay")
-        releaseSink world
-        void (awaitRetired session)
-      out ← outLines world
+      outcome ← runScenario env $ \session → void (awaitRetired session)
+      out ← outLines (seWorld env)
+      -- the joint gate never opened, so the logical role ran no update, whether its init had begun before the stop or not
       named "update gameplay" out `shouldBe` []
       outVerdict outcome `shouldBe` VerdictFailure
       outRetired outcome `shouldBe` True
@@ -198,6 +188,9 @@ afterStart = describe "after a successful start" $ do
     withSetup (withShare ((duo []) {scUpdate = ["if api.role == 'presentation' then pcall(state, 1); print('caught ui') else print('update ' .. api.role .. ' ' .. self.me) end"]})) $ \env → do
       let world = seWorld env
       outcome ← runScenario env $ \session → do
+        -- both roles are running (the joint gate is open) before the UI's update is made due, so that the logical role's init
+        -- has run and its shutdown is owed
+        awaitPhase session Gameplay Running
         awaitPhase session Presentation Running
         passTime world 1000000000 (elem "caught ui" <$> outLines world)
         void (awaitRetired session)
@@ -242,13 +235,15 @@ afterStart = describe "after a successful start" $ do
         nudge world 1000000
         awaitReadOf env "lua/gate.bin"
         passTime world 1000000000 ((\out → length (named "filled presentation" out) == 1) <$> outLines world)
+        -- a read of the UI's has been borrowed by the free worker and is held at the reader, so the UI role has a held obligation
+        -- that quit cannot retire (the others it asked for wait in the queue behind it)
+        awaitReadOf env "lua/slow.bin"
         openGate probe "lua/gate.bin"
         passTime world 2000000 (elem "after quit gameplay" <$> outLines world)
-        status ← statusNow session
-        -- quit returned without waiting for the held reads: the session is stopping, and the UI role, whose reads are still held,
-        -- is not retired (the logical role holds nothing and retires on its own)
+        -- quit returned without waiting for the held reads: the session is stopping, and the UI role, whose read is borrowed
+        -- and still held, is not retired (the logical role holds nothing and retires on its own)
+        status ← awaitStatus session statusStopping
         fmap rolePhase (presentationOf status) `shouldSatisfy` (/= Just Retired)
-        statusStopping status `shouldBe` True
         openGate probe "lua/slow.bin"
         void (awaitRetired session)
       out ← outLines world

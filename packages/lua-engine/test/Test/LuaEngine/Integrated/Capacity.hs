@@ -21,7 +21,8 @@ import Hetoimasia.Scripting.Lua.Instance (InstanceOutcome (InstanceStopped), Ins
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Integrated.Support
-import Test.LuaEngine.Modules.Support (Probe, closeGate, finishedPaths, openGate, startedPaths)
+import Hetoimasia.Content.ReadPool (PoolStatus (statusActive))
+import Test.LuaEngine.Modules.Support (Probe, awaitPool, closeGate, finishedPaths, openGate, startedPaths)
 
 spec ∷ Spec
 spec = describe "M1 integrated capacity, one-shot results and cancellation" $ do
@@ -43,6 +44,9 @@ creditSpec =
         dumpOnFailure world [x] $ do
           awaitLine world ("filled " <> Text.pack (show reachable) <> " busy")
           awaitStartedPath probe "slow.bin"
+          -- both workers hold a read: the two oldest requests (the pool serves its one queue in admission order), so that the
+          -- request cancelled below is one a worker holds
+          awaitPool (wSession world) (\found → statusActive found >= 2)
           -- the refused ask took nothing: no handle came back and no read of the refused file started
           startedPaths probe >>= \started → length (filter (== "done.bin") started) `shouldBe` 0
           -- cancelling a read that a worker holds does not give its place back: the next ask is still busy

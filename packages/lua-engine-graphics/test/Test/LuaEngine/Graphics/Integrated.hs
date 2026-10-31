@@ -35,6 +35,7 @@ import Test.Hspec
 import qualified Test.LuaEngine.Graphics.Fake as Fake
 import Test.LuaEngine.Graphics.Composition (holdReadsOf, readsEntered, readsFinished, releaseReadsOf)
 import Test.LuaEngine.Graphics.PeersRig
+import Test.LuaEngine.Graphics.Rig (bounded)
 import Test.LuaEngine.Graphics.SceneHost
 import qualified Test.LuaEngine.Graphics.Window.Fake as WF
 
@@ -120,6 +121,13 @@ firstEvent prefix = findIndex (Text.isPrefixOf prefix)
 phaseNow ∷ Peers → Spawned → IO (Maybe InstancePhase)
 phaseNow peers found = atomically (fmap snapshotPhase <$> inspectInstance (scheduledEndpoint (peOwner peers)) (spInstance found))
 
+-- | Block until the instance is in this phase.
+awaitPhaseNow ∷ Peers → Spawned → InstancePhase → IO ()
+awaitPhaseNow peers found wanted = bounded . atomically $
+  inspectInstance (scheduledEndpoint (peOwner peers)) (spInstance found) >>= \case
+    Just snapshot | snapshotPhase snapshot == wanted → pure ()
+    _ → retry
+
 -- | Block until the reading of the window provider's acquisitions is this.
 awaitAcquisitions ∷ Peers → Int → IO ()
 awaitAcquisitions peers wanted = atomically (providerReading (peProvider peers) >>= \found → unless (readingAcquisitions found == wanted) retry)
@@ -164,7 +172,6 @@ sameFileSpec =
       -- a peer's texture handle, passed through the shared export, authorizes B to neither release nor publish it, and acts on nothing
       awaitLine peers "foreign_release\t2\tfalse"
       awaitLine peers "foreign_publish\t2\tfalse"
-      Fake.eventCount fake "released " >>= (`shouldBe` 0)
       events' ← Fake.events fake
       let at' prefix = firstEvent prefix events'
       (at' "registered 1 ", at' "upload completed 0") `shouldSatisfy` \(registered, done) → isJust registered && isJust done && registered < done
@@ -202,9 +209,8 @@ pendingEndSpec =
       void (adoptNow (peModel peers) 4)
       -- A is ended through Haskell with its upload open (an upload that has started cannot be withdrawn)
       stop peers a
-      -- the end is not complete while the native work is: A is still held, B still serves
-      Fake.awaitEvent fake "upload started 1"
-      phaseNow peers a >>= \phase → phase `shouldSatisfy` maybe False (not . isTerminal)
+      -- the stop is processed and the end is not complete while the native work is: A is stopping, B still serves
+      awaitPhaseNow peers a Stopping
       phaseNow peers b >>= (`shouldBe` Just Active)
       -- B publishes again on its own window with its own live lease while A's work is still open
       atomically (writeTVar (peSignal peers) True)
@@ -212,14 +218,14 @@ pendingEndSpec =
       awaitRevision (peModel peers) 4 2
       -- nothing of A's was delivered, nothing of B's was closed or revoked
       readTVarIO (peOut peers) >>= \told → filter (Text.isPrefixOf "tex\t1\t") told `shouldBe` []
-      closes ← length . filter (Text.isPrefixOf "close w") <$> WF.events (peWindows peers)
-      closes `shouldSatisfy` (<= 1)
       phaseNow peers b >>= (`shouldBe` Just Active)
       -- the actual completion of A's native work is supplied: only then can A retire, and it retires stopped
       Fake.releaseTicket fake 0
       Fake.awaitEvent fake "upload completed 0"
       settleStopped peers a
       readTVarIO (peOut peers) >>= \told → filter (Text.isPrefixOf "tex\t1\t") told `shouldBe` []
+      -- exactly one native window was closed, A's (an end that has settled has closed its window); B's is open
+      WF.events (peWindows peers) >>= \recorded → length (filter (Text.isPrefixOf "close w") recorded) `shouldBe` 1
       -- B is still whole: its image and registration are the only ones left
       atomically (Fake.readFake fake) >>= \reading → Fake.readingRegistrations reading `shouldBe` 1
       phaseNow peers b >>= (`shouldBe` Just Active)

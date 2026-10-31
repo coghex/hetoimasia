@@ -23,8 +23,8 @@ import Hetoimasia.Scripting.Lua.Scheduled (retireScheduled)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Integrated.Support
-import Hetoimasia.Content.ReadPool (PoolStatus (statusQueued))
-import Test.LuaEngine.Modules.Support (awaitDiagnostics, awaitPool, closeGate, diagnostics, finishedPaths, openGate, startedPaths)
+import Hetoimasia.Content.ReadPool (PoolStatus (statusActive, statusQueued))
+import Test.LuaEngine.Modules.Support (awaitPool, closeGate, finishedPaths, openGate, poolReading, startedPaths)
 
 spec ∷ Spec
 spec = describe "M1 integrated shared jobs and assigned results" $ do
@@ -219,6 +219,9 @@ waitersSpec =
           started0 ← startedPaths probe
           length (filter (== "lua/m.lua") started0) `shouldBe` 1
           length (filter (== "lua/n.lua") started0) `shouldBe` 1
+          -- and nothing else is waiting for a worker: a second job for either module would be queued behind the two held reads,
+          -- where the started list cannot show it, but the pool's own reading does
+          poolReading (wSession world) >>= \found → (statusQueued found, statusActive found) `shouldBe` (0, 2)
           -- one waiter ends (Haskell-controlled): both jobs and the peer's interest survive
           stopSpawned y
           settlement ← settledOf y
@@ -241,13 +244,12 @@ waitersSpec =
           awaitLine world "X bad_cancel cancelled"
           openGate probe "lua/bad.lua"
           awaitFinishedPath probe "lua/bad.lua"
-          awaitDiagnostics (wSession world) 1
+          awaitDiagnosticAbout world (wSession world) "lua/bad.lua"
           err ← errLines world
           length [line | line ← err, "eval m" `Text.isSuffixOf` line] `shouldBe` 1
           length [line | line ← err, "eval n" `Text.isSuffixOf` line] `shouldBe` 1
           started ← startedPaths probe
           length (filter (== "lua/n.lua") started) `shouldBe` 1
-          diagnostics (wSession world) >>= \found → found `shouldSatisfy` any ("lua/bad.lua" `Text.isInfixOf`)
           -- the failure was nobody's: the surviving instance is untouched
           phaseOf x >>= (`shouldBe` Just Active)
         stopSpawned x
@@ -327,4 +329,5 @@ vmStopSpec =
       -- the scope is left: the borrowed read returned to the pool, and nothing evaluated the module. (That a session
       -- retires a role only after its coordinator has drained is the session's, in the session examples.)
       awaitFinishedPath probe "lua/m.lua"
+      -- (The owner, the only thing that evaluates a module, had ended before the read was let go, which is what establishes this.)
       errLines world >>= \err → length [line | line ← err, "eval m" `Text.isSuffixOf` line] `shouldBe` 0
