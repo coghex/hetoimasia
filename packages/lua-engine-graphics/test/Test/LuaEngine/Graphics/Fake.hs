@@ -26,6 +26,9 @@ module Test.LuaEngine.Graphics.Fake
   , hold
   , release
   , holdBarrier
+  , holdTicket
+  , releaseTicket
+  , releaseAllTickets
 
     -- * Injections
   , Injection (..)
@@ -178,6 +181,9 @@ data Fake = Fake
   , fBarrier ∷ !(TVar (STM (STM Bool)))
     -- ^ What a release request captures when it is admitted (see 'setBarrier'): by default nothing, so the lane waits for
     -- 'HoldAdoption' alone.
+  , fTicketHolds ∷ !(TVar (Set Int))
+    -- ^ Upload tickets whose completion is held one at a time, beside the stage-wide 'HoldUploadFinish': the owner
+    -- completes the other open uploads, in ticket order, and leaves these until they are let go.
   , fLedger ∷ !(SceneLedger Int)
     -- ^ The production ledger of what adopted scene revisions hold, which the fake's release is gated on exactly as
     -- the production port's is. The examples that adopt scenes drive its lifecycle hooks.
@@ -205,6 +211,7 @@ newFake cfg =
     <*> newTVarIO 1
     <*> newTVarIO 0
     <*> newTVarIO (pure (pure True))
+    <*> newTVarIO Set.empty
     <*> newSceneLedger
 
 -- | Install what a release request captures at its admission: a transaction that reads the scene host's state and
@@ -224,6 +231,20 @@ hold fake which = atomically (modifyTVar' (fHolds fake) (Set.insert which))
 
 release ∷ Fake → Hold → IO ()
 release fake which = atomically (modifyTVar' (fHolds fake) (Set.delete which) >> bump fake)
+
+-- | Hold the completion of one upload (by the ticket its start event names) while the others complete: how an example
+-- completes two open uploads in the reverse of the order they started.
+holdTicket ∷ Fake → Int → IO ()
+holdTicket fake ticket = atomically (modifyTVar' (fTicketHolds fake) (Set.insert ticket))
+
+-- | Let one held upload complete.
+releaseTicket ∷ Fake → Int → IO ()
+releaseTicket fake ticket = atomically (modifyTVar' (fTicketHolds fake) (Set.delete ticket) >> bump fake)
+
+-- | Let every held upload complete: what an example's scope does on every way out, so that a failing example never waits
+-- on an upload it held.
+releaseAllTickets ∷ Fake → IO ()
+releaseAllTickets fake = atomically (writeTVar (fTicketHolds fake) Set.empty >> bump fake)
 
 holdBarrier ∷ Fake → IO ()
 holdBarrier fake = hold fake HoldAdoption
@@ -573,6 +594,7 @@ ownerLoop fake = do
       retiring ← readTVar (fRetiring fake)
       holders ← readTVar (fHolders fake)
       grants ← readTVar (fGrants fake)
+      ticketHolds ← readTVar (fTicketHolds fake)
       states ← traverse (\(ticket, upload) → (,) (ticket, upload) <$> readTVar (upState upload)) (Map.toList uploads)
       gated ← traverse (\pending → (,) pending <$> pendingGate pending) releases
       let readyRelease = case break snd gated of
@@ -594,7 +616,7 @@ ownerLoop fake = do
               writeTVar (upState upload) TicketUploading
               record fake ("upload started " <> tshow ticket)
               bump fake
-          | not (on HoldUploadFinish), Just (ticket, upload) ← find' TicketUploading states → pure . atomically $ do
+          | not (on HoldUploadFinish), Just (ticket, upload) ← findFree ticketHolds TicketUploading states → pure . atomically $ do
               lost ← readTVar (fInjected fake)
               _ <- pure lost
               writeTVar (upState upload) TicketComplete
@@ -612,6 +634,9 @@ ownerLoop fake = do
               record fake ("reclaimed " <> Text.intercalate "," (map tshow (Set.toList retiring)))
               bump fake
           | otherwise → retry
+    findFree blocked wanted states = case [(ticket, upload) | ((ticket, upload), state) ← states, state == wanted, ticket `Set.notMember` blocked] of
+      first : _ → Just first
+      [] → Nothing
     find' wanted states = case [(ticket, upload) | ((ticket, upload), state) ← states, state == wanted] of
       first : _ → Just first
       [] → Nothing
