@@ -9343,6 +9343,13 @@ replace boundary tests, prove performance or establish confinement.
 - **Owner/tests:** package/root composition Hspec tests with explicit gates
   and production loader/VM paths; fake native edges isolate races, while the
   following two slices establish pixels and desktop resource use.
+- **As delivered ([#538](https://github.com/coghex/hetoimasia/issues/538)):**
+  [the evidence record](../evidence/lfe23-integrated-qualification.md) maps every scenario to its example, its real services, its
+  injected boundary, its assertions and its contract. `Test.LuaEngine.Integrated.*` in `lua-engine-tests` (CPU),
+  `Test.LuaEngine.Graphics.Integrated` in `lua-engine-graphics-tests` and `Test.Engine.Run.Integrated` in the root full-product
+  `hetoimasia-tests`, all headless; the second instance of a role is the session harness's second slot or `declareInstance` and
+  `admitBehaviorInstance`, ended by `requestInstanceControl`. The windows that cannot be gated at this boundary without a private
+  import are listed there with the owning slice's test. No production code changed.
 
 #### LFE-24. Verify Lua-authored output through offscreen pixels
 
