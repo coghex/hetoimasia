@@ -5,6 +5,7 @@ module Test.Engine.Run.Spec (spec) where
 
 import qualified Test.Engine.Run.Abort as Abort
 import qualified Test.Engine.Run.Compose as Compose
+import qualified Test.Engine.Run.Integrated as Integrated
 import qualified Test.Engine.Run.Options as Options
 import qualified Test.Engine.Run.Process as Process
 import qualified Test.Engine.Run.Serve as Serve
@@ -18,4 +19,5 @@ spec = describe "Run" $ do
   Abort.spec
   Serve.spec
   Compose.spec
+  Integrated.spec
   Process.spec

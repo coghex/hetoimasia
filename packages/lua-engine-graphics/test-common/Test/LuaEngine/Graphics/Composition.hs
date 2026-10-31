@@ -12,6 +12,11 @@ module Test.LuaEngine.Graphics.Composition
   , Files
   , withComposition
   , compositionProfile
+  , holdReadsOf
+  , releaseReadsOf
+  , releaseAllReads
+  , readsEntered
+  , readsFinished
 
     -- * One VM
   , Vm (..)
@@ -33,12 +38,15 @@ module Test.LuaEngine.Graphics.Composition
   , awaitLeases
   ) where
 
-import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
-import Control.Monad (forM_, unless)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
+import Control.Exception (finally)
+import Control.Monad (forM_, unless, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
+import Data.Set (Set)
 import Data.Map.Strict (Map)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -51,7 +59,7 @@ import Hetoimasia.Content.Inventory
   , readVerified
   , scanInventory
   )
-import Hetoimasia.Content.Identity (rootKey)
+import Hetoimasia.Content.Identity (contentKeyPath, logicalPathBytes, rootKey)
 import Hetoimasia.Content.ReadPool (ReadPool, poolSpec, withReadPoolUsing)
 import Hetoimasia.Foundation.Log (Logger, MetadataProviders (..), callbackSink, defaultLogFilter, mkLoggerWith)
 import Hetoimasia.LuaEngine.Profile
@@ -107,6 +115,13 @@ data Composition = Composition
   , cpLog ∷ !(TVar [Text])
   , cpIds ∷ !(IORef (Map Text InstanceId))
   , cpTickets ∷ !(IORef (Map Text InstanceTicket))
+  , cpEnteredReads ∷ !(TVar [ByteString])
+  -- ^ The paths whose reads have reached the pool's reader, in the order they did (injected evidence: a worker borrowed the read).
+  , cpFinishedReads ∷ !(TVar [ByteString])
+  -- ^ The paths whose reads have returned from the pool's reader, in the order they did.
+  , cpHeldReads ∷ !(TVar (Set ByteString))
+  -- ^ The paths whose reads wait at the pool's reader until they are let go (injected evidence: a gated read still opens
+  -- and hashes a real file once its gate opens). Empty unless an example holds one.
   }
 
 -- | The profile the compositions run under: the fixed M1 profile.
@@ -140,13 +155,42 @@ withComposition profile files backend body =
     pool ← either (\refused → assertFailure ("pool refused: " <> show refused)) pure (uncurry poolSpec (2, 16))
     withContentRoot defaultContentLimits tree $ \root → do
       inventory ← scanInventory limits root' root >>= either (\refused → assertFailure ("scan refused: " <> show refused)) pure
-      withReadPoolUsing pool (readVerified inventory root) $ \readPool →
+      held ← newTVarIO Set.empty
+      entered ← newTVarIO []
+      finished ← newTVarIO []
+      let gated key allowance = do
+            atomically (modifyTVar' entered (<> [logicalPathBytes (contentKeyPath key)]))
+            atomically (readTVar held >>= \paths → when (logicalPathBytes (contentKeyPath key) `Set.member` paths) retry)
+            readVerified inventory root key allowance
+              `finally` atomically (modifyTVar' finished (<> [logicalPathBytes (contentKeyPath key)]))
+      withReadPoolUsing pool gated $ \readPool →
         withTexturePipeline spec backend readPool inventory $ \pipeline → do
-          composition ← Composition tree inventory readPool pipeline <$> newTVarIO [] <*> newIORef Map.empty <*> newIORef Map.empty
+          composition ← Composition tree inventory readPool pipeline <$> newTVarIO [] <*> newIORef Map.empty <*> newIORef Map.empty <*> pure entered <*> pure finished <*> pure held
           withLoggingLifetime quietLogger $ \lifetime →
             withSupervision lifetime $ \control → do
               runtime ← newLuaRuntime control
-              body composition control runtime
+              -- however the body ends, every read it held is let go before the pipeline drains
+              body composition control runtime `finally` atomically (writeTVar held Set.empty)
+
+-- | Hold every read of this path at the pool's reader: it starts, and waits there.
+holdReadsOf ∷ Composition → ByteString → IO ()
+holdReadsOf composition path = atomically (modifyTVar' (cpHeldReads composition) (Set.insert path))
+
+-- | Block until this many reads of this path have reached the pool's reader: a worker has borrowed each (a held one waits there).
+readsEntered ∷ Composition → ByteString → Int → IO ()
+readsEntered composition path wanted = atomically (readTVar (cpEnteredReads composition) >>= \seen → unless (length (filter (== path) seen) >= wanted) retry)
+
+-- | Block until this many reads of this path have returned from the pool's reader.
+readsFinished ∷ Composition → ByteString → Int → IO ()
+readsFinished composition path wanted = atomically (readTVar (cpFinishedReads composition) >>= \seen → unless (length (filter (== path) seen) >= wanted) retry)
+
+-- | Let every held read go: what an example's scope does on every way out, so that a failing example never waits on a read it held.
+releaseAllReads ∷ Composition → IO ()
+releaseAllReads composition = atomically (writeTVar (cpHeldReads composition) Set.empty)
+
+-- | Let the reads of this path go.
+releaseReadsOf ∷ Composition → ByteString → IO ()
+releaseReadsOf composition path = atomically (modifyTVar' (cpHeldReads composition) (Set.delete path))
 
 quietLogger ∷ Logger
 quietLogger = mkLoggerWith defaultLogFilter metadata (callbackSink (\_ → pure ()))

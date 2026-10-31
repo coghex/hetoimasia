@@ -276,6 +276,7 @@ test-suite hetoimasia-tests
             Test.Engine.Run.Abort
             Test.Engine.Run.Child
             Test.Engine.Run.Compose
+            Test.Engine.Run.Integrated
             Test.Engine.Run.Options
             Test.Engine.Run.Process
             Test.Engine.Run.Serve

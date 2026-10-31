@@ -96,8 +96,10 @@ test-suite lua-engine-graphics-tests
         Test.LuaEngine.Graphics.Facade
         Test.LuaEngine.Graphics.FacadeScripts
         Test.LuaEngine.Graphics.Faults
+        Test.LuaEngine.Graphics.Integrated
         Test.LuaEngine.Graphics.Lifecycle
         Test.LuaEngine.Graphics.Peers
+        Test.LuaEngine.Graphics.PeersRig
         Test.LuaEngine.Graphics.Png
         Test.LuaEngine.Graphics.Pressure
         Test.LuaEngine.Graphics.Release
