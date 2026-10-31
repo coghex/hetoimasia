@@ -11,7 +11,6 @@
 -- wrote; none is computed by the code under test. A scenario that raises stops the session and is raised again.
 module Test.LuaEngine.Integrated.Roles (spec) where
 
-import Control.Exception (finally)
 import Control.Monad (forM_, void, when)
 import Data.List (sort)
 import Data.Text (Text)
@@ -25,10 +24,6 @@ spec ∷ Spec
 spec = describe "M1 integrated role failure, status and outcome" $ do
   startingOrders
   afterStart
-
--- | The harness's second presentation instance.
-p1 ∷ InstanceKey
-p1 = InstanceKey Presentation 1
 
 -- | Two presentation instances beside the logical owner, over the content that names the shared module.
 twoUi ∷ Script → Setup
@@ -52,6 +47,13 @@ duo extraInit =
         [ "if api.role == 'gameplay' then print('update gameplay ' .. api.time.tick()) else print('update ui ' .. self.me) end"
         ]
     , scShutdown = ["print('shutdown ' .. api.role .. ' ' .. self.me .. ' ' .. tostring(reason))"]
+    }
+
+-- | The second UI instance prints a line in its init, which an example can park in the sink; nothing else prints in an init.
+heldSecond ∷ Script
+heldSecond =
+  (duo [])
+    { scInit = ["share.n = share.n + 1; self.me = share.n", "if api.role == 'presentation' and self.me == 2 then print('init ui 2 held') end"]
     }
 
 -- Both initialization orders --------------------------------------------------------------------------------------
@@ -84,12 +86,13 @@ startingOrders = describe "both initialization orders" $ do
       outRetired outcome `shouldBe` True
 
   it "holds the logical role ready, with no tick, when its init finishes first, until the second UI instance's init has succeeded" $
-    withSetup (twoUi (duo [])) $ \env → do
+    withSetup (twoUi heldSecond) $ \env → do
       let world = seWorld env
-      recorder ← newRecorder
-      holdAt recorder (Dispatched p1)
-      outcome ← runScenarioWith env (recordingHarness recorder (suHarness (twoUi (duo [])))) $ \session → (`finally` releaseHold recorder (Dispatched p1)) $ do
-        awaitPoint recorder (Dispatched p1)
+      -- the second UI instance's init is parked in its authored output (the logical init prints nothing, so it does not wait
+      -- behind it): a controlled, finite gate the example opens
+      holdSink world "init ui 2 held"
+      outcome ← runScenario env $ \session → do
+        awaitSinkEntered world "init ui 2 held"
         awaitPhase session Gameplay Ready
         status ← statusNow session
         (roleInitialized <$> gameplayOf status) `shouldBe` Just True
@@ -97,7 +100,7 @@ startingOrders = describe "both initialization orders" $ do
         nudge world 5000000
         out0 ← outLines world
         named "update gameplay" out0 `shouldBe` []
-        releaseHold recorder (Dispatched p1)
+        releaseSink world
         awaitPhase session Gameplay Running
         awaitPhase session Presentation Running
         awaitRegistration world 1000
@@ -248,22 +251,21 @@ afterStart = describe "after a successful start" $ do
       errLines (seWorld env) >>= \err → filter (not . ("share evaluated" `Text.isSuffixOf`)) err `shouldBe` [guardPhrase]
 
   it "quits from the logical role while both UI instances hold every request place: the call returns at once, admission closes as an ordinary error and never busy, cancel and output stay usable, and the role retires only after the held reads have" $
-    withSetup (addFile ("lua/slow.bin", "slow") (twoUi saturating)) $ \env → do
+    withSetup (addFile ("lua/gate.bin", "gg") (addFile ("lua/slow.bin", "slow") (twoUi saturating))) $ \env → do
       let world = seWorld env
           probe = ssProbeOf env
       closeGate probe "lua/slow.bin"
-      recorder ← newRecorder
-      holdAt recorder (GrantIntent 1)
-      outcome ← runScenarioWith env (recordingHarness recorder (suHarness (twoUi saturating))) $ \session → (`finally` releaseHold recorder (GrantIntent 1)) . dumpOnFailure world [] $ do
-        -- the logical role has started and asked for one read in its init; its first tick is held, so that it cannot quit
-        -- before both UI instances have filled their places
+      closeGate probe "lua/gate.bin"
+      outcome ← runScenario env $ \session → dumpOnFailure world [] $ do
+        -- the logical role's first update asks for a read the reader holds and waits for it, so that it cannot quit before
+        -- both UI instances have filled their places
         awaitPhase session Gameplay Running
         awaitRegistration world 1000
         nudge world 1000000
-        awaitPoint recorder (GrantIntent 1)
+        awaitReadOf env "lua/gate.bin"
         passTime world 1000000000 ((\out → length (named "filled presentation" out) == 2) <$> outLines world)
-        releaseHold recorder (GrantIntent 1)
-        passTime world 1000000 (elem "after quit gameplay" <$> outLines world)
+        openGate probe "lua/gate.bin"
+        passTime world 2000000 (elem "after quit gameplay" <$> outLines world)
         status ← statusNow session
         -- quit returned without waiting for the held reads: both roles are stopping and neither is retired
         fmap rolePhase (gameplayOf status) `shouldSatisfy` (/= Just Retired)
@@ -273,11 +275,11 @@ afterStart = describe "after a successful start" $ do
         void (awaitRetired session)
       out ← outLines world
       -- The compact boundary here is the read pool this example injects: twelve slots, of which each of the two VM
-      -- coordinators holds four for its life, so four reads can be held in all, wherever they were asked (the logical init took one), and every ask
-      -- beyond them was answered busy with nothing reserved. (The profile's 16 places per instance are not reachable
-      -- before the pool is full; the facade's examples cover that bound.)
+      -- coordinators holds four for its life, so four reads can be held in all, wherever they were asked (the logical role's
+      -- own gated read took one), and every ask beyond them was answered busy with nothing reserved. (The profile's 16 places
+      -- per instance are not reachable before the pool is full; the facade's examples cover that bound.)
       let filled = [(role, count, busy) | line ← named "filled" out, [role, _, count, busy] ← [Text.words line]]
-      sum [read (Text.unpack count) | (_, count, _) ← filled] `shouldBe` (3 ∷ Int) -- (the logical init holds the fourth)
+      sum [read (Text.unpack count) | (_, count, _) ← filled] `shouldBe` (3 ∷ Int)
       map (\(role, _, busy) → (role, busy)) (sort filled) `shouldBe` [("gameplay", "busy"), ("presentation", "busy"), ("presentation", "busy")]
       named "closed" out `shouldBe` ["false string"]
       named "cancel" out `shouldSatisfy` any (`elem` ["cancelled", "already_settled"])
@@ -286,16 +288,22 @@ afterStart = describe "after a successful start" $ do
       outQuit outcome `shouldBe` True
 
   it "reads a status that is one coherent copy within a UI segment, edits of it reaching nobody, and refreshed when the instance resumes after a wait: the logical failure stays latched while its phase advances" $
-    withSetup (addFile ("lua/slow.bin", "slow") (twoUi statusReading)) $ \env → do
+    withSetup (addFile ("lua/hold.bin", "hold") (addFile ("lua/slow.bin", "slow") (twoUi statusReading))) $ \env → do
       let world = seWorld env
           probe = ssProbeOf env
-      -- the first UI instance waits on a read the pool's reader holds, so its resumption is placed by the example and not by a clock
+      -- the first UI instance waits on a read the pool's reader holds, so its resumption is placed by the example and not by a
+      -- clock; the logical role's failure waits on another, so that it cannot come before the instance has taken its first sample
       closeGate probe "lua/slow.bin"
+      closeGate probe "lua/hold.bin"
       outcome ← runScenario env $ \session → do
         awaitPhase session Gameplay Running
         awaitPhase session Presentation Running
+        awaitRegistration world 1000
+        nudge world 1000000
         passTime world 1000000000 (elem "segment waiting" <$> outLines world)
-        -- while the instance waits, the logical role fails at its second tick and retires
+        -- the logical role is let go: it fails at its second tick and retires, while the instance still waits
+        openGate probe "lua/hold.bin"
+        passTime world 2000000 ((maybe False roleFailed . gameplayOf <$> statusNow session))
         void (awaitStatus session (maybe False roleFailed . gameplayOf))
         awaitPhase session Gameplay Retired
         -- the read is let go: the instance resumes and reads the new state; its first reads were untouched by the edits and the change
@@ -353,7 +361,8 @@ afterStart = describe "after a successful start" $ do
             [ "if api.role == 'gameplay' then"
             , "  local t = api.time.tick()"
             , "  print('update gameplay ' .. t)"
-            , "  if t == 2 then error('logic broke at ' .. t) end"
+            , "  if t == 1 then api.request.wait((api.content.data('lua/hold.bin'))) end"
+            , "  if t > 1 then error('logic broke at ' .. t) end"
             , "  return"
             , "end"
             , "if self.me ~= 1 or self.done then return end"
@@ -371,9 +380,13 @@ afterStart = describe "after a successful start" $ do
             ]
         }
     saturating =
-      (duo ["if api.role == 'gameplay' then self.first = api.content.data('lua/slow.bin', {tick_offset = 1000}) end"])
+      (duo [])
         { scUpdate =
             [ "if self.reqs then return end"
+            , "if api.role == 'gameplay' then"
+            , "  self.first = api.content.data('lua/gate.bin')"
+            , "  api.request.wait(self.first)"
+            , "end"
             , "self.reqs = {}"
             , "local busy"
             , "for i = 1, 40 do"

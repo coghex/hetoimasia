@@ -19,6 +19,11 @@ module Test.LuaEngine.Graphics.PeersRig
   , awaitLine
   , awaitLinePrefix
   , retarget
+  , Logical (..)
+  , withLogical
+  , tickLogical
+  , grantLogical
+  , awaitLogicalTick
   , quietLogger
   ) where
 
@@ -27,14 +32,16 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
 import Control.Exception (finally, onException)
 import System.IO (hPutStrLn, stderr)
-import Control.Monad (forM_, forever, unless)
+import Control.Monad (forM_, forever, join, unless, void)
 import Data.ByteString (ByteString)
+import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.Word (Word64)
 import qualified Data.Text as Text
 import Data.Text (Text)
 import Hetoimasia.Content.Identity (parseReference)
 import Hetoimasia.Content.Inventory (inventoryIdentityLimits, inventoryLimitsOf, inventoryRootKey)
 import Hetoimasia.Foundation.Log (Logger, MetadataProviders (..), callbackSink, defaultLogFilter, mkLoggerWith, unsafeComponent)
-import Hetoimasia.Foundation.Time (monotonicSource)
+import Hetoimasia.Foundation.Time (DurationRequirement (RequirePositive), durationFromNanoseconds, monotonicSource)
 import Hetoimasia.LuaEngine.Behavior (behaviorRequest)
 import Hetoimasia.LuaEngine.Data (dataService, newByteBankFor)
 import Hetoimasia.LuaEngine.Facade
@@ -42,7 +49,7 @@ import Hetoimasia.LuaEngine.Graphics.Facade (GraphicsFacade (..), graphicsInject
 import Hetoimasia.LuaEngine.Graphics.Scene (noPublishHooks, scenePublisherOver)
 import Hetoimasia.LuaEngine.Graphics.Window.Port (Port (..), WindowToken (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Provider
-import Hetoimasia.LuaEngine.Manifest (Role (Presentation))
+import Hetoimasia.LuaEngine.Manifest (Role (Gameplay, Presentation))
 import Hetoimasia.LuaEngine.Modules
   ( BootOutcome (BootReady)
   , ModuleSpec (..)
@@ -60,8 +67,9 @@ import qualified Hetoimasia.Runtime.Supervision as Supervision
 import Hetoimasia.Scripting.Lua.Admission (newRequestHandles)
 import Hetoimasia.Scripting.Lua.Instance hiding (forgetInstance)
 import Hetoimasia.Scripting.Lua.Owner
-import Hetoimasia.Scripting.Lua.Provider (RequestGrant (..), RequestTiming (SettleOnArrival))
+import Hetoimasia.Scripting.Lua.Provider (RequestGrant (..), RequestTiming (SettleAtAssignedTick, SettleOnArrival))
 import Hetoimasia.Scripting.Lua.Scheduled
+import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduler (systemTimerBackend)
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (UTCTime (UTCTime), secondsToDiffTime)
@@ -87,6 +95,9 @@ data Peers = Peers
   , peFake ∷ !Fake.Fake
   , peWindows ∷ !WF.Fake
   , peComposition ∷ !Composition
+  , peControl ∷ !RuntimeControl
+  , peRuntime ∷ !LuaRuntime
+  , peOutput ∷ !Output
   }
 
 -- | An instance admitted to the VM.
@@ -115,7 +126,17 @@ withPeersConfigured fakeConfig hooks windowConfig entry issuedMemory body = boun
   windows ← WF.newFake windowConfig
   textures ← newTextures
   let config = WindowConfig 2 (pure ()) (\_ → pure ())
-      files = [("lua/main.lua", entry), ("lua/share.lua", "return {apis = {}, handles = {}}"), ("images/quad.png", Png.solid 2 2 (200, 100, 50, 255))]
+      files =
+        [ ("lua/main.lua", entry)
+        , ("lua/share.lua", "return {apis = {}, handles = {}}")
+        , ("images/quad.png", Png.solid 2 2 (200, 100, 50, 255))
+        , ("lua/late.lua", "local dep = import('lua/dep.lua') return {id = 'late', dep = dep}")
+        , ("lua/dep.lua", "return {id = 'dep'}")
+        , ("lua/extra.lua", "local dep2 = import('lua/dep2.lua') return {id = 'extra', dep = dep2}")
+        , ("lua/dep2.lua", "return {id = 'dep2'}")
+        , ("data.bin", "dd")
+        , ("early.bin", "ee")
+        ]
   withComposition compositionProfile files (rigPort rig) $ \composition control runtime →
     withWindowProviderWith hooks config (retarget (WF.fakePort windows)) $ \provider →
       ( do
@@ -209,7 +230,7 @@ withPeersConfigured fakeConfig hooks windowConfig entry issuedMemory body = boun
                   admitBehaviorInstance (scheduledEndpoint owner) request >>= \case
                     InstanceAccepted identity ticket → pure (Spawned (declaredId declared) identity ticket)
                     other → assertFailure ("expected the instance accepted, found " <> take 100 (show other))
-            ( mainLoop provider (body (Peers facade owner model provider out signal admit fake windows composition))
+            ( mainLoop provider (body (Peers facade owner model provider out signal admit fake windows composition control runtime output))
                 -- (however the body ended, the host model lets go of every adoption first, so that the instances' textures can retire)
                 `finally` (openEveryHold fake >> releaseAllReads composition >> dissolve model >> WF.releaseAll windows >> retireAndAwait control owner)
               )
@@ -287,3 +308,127 @@ quietLogger = mkLoggerWith defaultLogFilter metadata (callbackSink (\_ → pure 
         , metadataThread = pure "1"
         }
 
+
+-- | A logical (gameplay) VM beside the peers' UI VM, over the same composition: the same content root, inventory, read pool
+-- and texture pipeline's workers, its own module coordinator, data service, facade and scheduled owner. It has no graphics
+-- (the graphics calls are UI-only), takes ticks only when the example grants them, and settles its requests at their assigned
+-- tick. Its output goes to the peers' sink.
+data Logical = Logical
+  { lgOwner ∷ !ScheduledOwner
+  , lgAdmit ∷ !(IO Spawned)
+  }
+
+-- | Run a body over a logical VM, started and stopped here. The owner is retired, and waited for, however the body ends.
+withLogical ∷ Peers → (Logical → IO a) → IO a
+withLogical peers body = do
+  let composition = peComposition peers
+      profile = compositionProfile
+      inventory = cpInventory composition
+  handles ← newRequestHandles
+  requests ← either (\refused → assertFailure ("the request policy was refused: " <> show refused)) pure (m1Requests profile handles)
+  phase ← newModulePhase
+  tickRef ← newIORef (pure 0 ∷ IO Word64)
+  tickDuration ← either (\refused → assertFailure (show refused)) pure (durationFromNanoseconds RequirePositive 1000000)
+  let moduleSpec =
+        ModuleSpec
+          { specRequests = requests
+          , specInventory = inventory
+          , specPool = cpPool composition
+          , specResolve = inventoryResolver inventory ["graphics-test"]
+          , specLogger = quietLogger
+          , specRole = "gameplay"
+          , specSlots = 4
+          , specBootWaiters = 2
+          , specPhase = Just phase
+          }
+  withModuleCoordinator moduleSpec $ \coordinator → do
+    bank ← newByteBankFor profile
+    service ← either (\refused → assertFailure ("the data service was refused: " <> show refused)) pure (dataService requests inventory (cpPool composition) bank)
+    ids ← newInstanceIds
+    let endpoints =
+          FacadeEndpoints
+            { endpointAdmission = pure AdmissionOpen
+            , endpointFailure = \_ → pure ()
+            , endpointClock = monotonicSource
+            , endpointTick = join (readIORef tickRef)
+            }
+        session = SessionEndpoints {endpointStatus = pure (StatusSample False Nothing Nothing), endpointQuit = pure (), endpointTerminal = \_ → pure False}
+    facade ←
+      newFacade
+        FacadeSpec
+          { fsRole = Gameplay
+          , fsRequests = requests
+          , fsCoordinator = coordinator
+          , fsData = service
+          , fsInventory = inventory
+          , fsOutput = peOutput peers
+          , fsEndpoints = endpoints
+          , fsSession = session
+          , fsPhase = phase
+          , fsRoots = ["graphics-test"]
+          , fsIds = ids
+          , fsTickDuration = Just tickDuration
+          , fsGraphics = Nothing
+          }
+        >>= either (\refused → assertFailure ("the facade was refused: " <> show refused)) pure
+    let base = (vmProfileConfig LibraryProfileM1) {vmOwnerName = "peers-logical"}
+    installed ← either (\refused → assertFailure ("the facade was not installed: " <> show refused)) pure (installFacade facade [] [] base)
+    let instances = facadeInstanceConfig facade (defaultInstanceConfig {instanceBounds = InstanceBounds 8 16 8 8, instanceTickDuration = Just tickDuration})
+        owned =
+          (scheduledSpec installed logicalPolicy logicalBounds)
+            { scheduledInstances = Just instances
+            , scheduledRequestHandles = Just handles
+            , scheduledRequests = Just (RequestGrant (facadeRequestEndpoints facade) 64 (SettleAtAssignedTick Nothing))
+            , scheduledLoader = Just (coordinatorPlan coordinator)
+            , scheduledClock = monotonicSource
+            , scheduledTimer = systemTimerBackend
+            , scheduledRefusedWait = facadeRefusedWait facade
+            }
+    started ← startScheduledOwner (peRuntime peers) owned
+    owner ← case started of
+      ScheduledStarted found → pure found
+      _ → assertFailure "the logical owner did not start"
+    endpoint ← maybe (assertFailure "the logical owner has no loader endpoint") pure (scheduledLoaderEndpoint owner)
+    attachLoader coordinator endpoint
+    writeIORef tickRef (atomically (scheduledTick (scheduledEndpoint owner)))
+    let key = either (error . show) id (parseReference (inventoryIdentityLimits (inventoryLimitsOf inventory)) (inventoryRootKey inventory) "lua/main.lua")
+        admit = do
+          booted ← bootModule coordinator key >>= either (\refused → assertFailure ("the logical boot load was refused: " <> show refused)) pure
+          atomically (awaitBoot booted) >>= \outcome → case outcome of
+            BootReady → pure ()
+            other → assertFailure ("the logical entry module did not evaluate: " <> show other)
+          declared ← declareInstance facade "graphics-test" >>= either (\refused → assertFailure ("declaring was refused: " <> show refused)) pure
+          let request = behaviorRequest Gameplay (moduleIdentity key) "lua/main.lua" (declaredFacade declared) (Just (declaredId declared)) OrdinaryClass
+          admitBehaviorInstance (scheduledEndpoint owner) request >>= \case
+            InstanceAccepted identity ticket → pure (Spawned (declaredId declared) identity ticket)
+            other → assertFailure ("expected the logical instance accepted, found " <> take 100 (show other))
+    body (Logical owner admit) `finally` retireAndAwait (peControl peers) owner
+  where
+    logicalPolicy = WorkerPolicy Supervision.Service Supervision.Required (unsafeComponent "test.luaengine.graphics.peers.logical") (\_ → pure Unrecognized)
+    logicalBounds =
+      SchedulerBounds
+        { boundActiveTasks = 16
+        , boundQueuedAdmissions = 16
+        , boundRetainedResults = 32
+        , boundQuanta = Quanta (Quantum 4) (Quantum 4) (Quantum 4)
+        , boundOutstandingGrants = 4
+        , boundControlRequests = 8
+        , boundServiceBudget = Nothing
+        }
+
+-- | Grant this many logical ticks, one at a time, waiting for each to complete.
+tickLogical ∷ Peers → Logical → Int → IO ()
+tickLogical peers logical count = forM_ [1 .. count] $ \_ → do
+  one ← either (\refused → assertFailure (show refused)) pure (durationFromNanoseconds RequirePositive 1)
+  void (grantScheduledStep (scheduledEndpoint (lgOwner logical)) one)
+  void (awaitTicksComplete (peControl peers) (lgOwner logical))
+
+-- | Grant one logical tick without waiting for it to complete.
+grantLogical ∷ Logical → IO ()
+grantLogical logical = do
+  one ← either (\refused → assertFailure (show refused)) pure (durationFromNanoseconds RequirePositive 1)
+  void (grantScheduledStep (scheduledEndpoint (lgOwner logical)) one)
+
+-- | Wait, under supervision, for the granted ticks to complete.
+awaitLogicalTick ∷ Peers → Logical → IO ()
+awaitLogicalTick peers logical = void (awaitTicksComplete (peControl peers) (lgOwner logical))

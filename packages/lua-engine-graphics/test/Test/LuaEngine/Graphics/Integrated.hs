@@ -18,7 +18,7 @@
 -- Nothing sleeps. An example learns what happened from what the Lua printed, from the fake's recorded events, or from STM.
 module Test.LuaEngine.Graphics.Integrated (spec) where
 
-import Control.Concurrent.STM (atomically, readTVarIO, retry, writeTVar)
+import Control.Concurrent.STM (atomically, readTVar, readTVarIO, retry, writeTVar)
 import Control.Monad (forM_, unless, void)
 import Data.ByteString (ByteString)
 import Data.List (findIndex)
@@ -29,11 +29,11 @@ import qualified Data.Text.Encoding as Text
 import Hetoimasia.LuaEngine.Facade (forgetInstance)
 import Hetoimasia.LuaEngine.Graphics.Window.Provider (noProviderHooks, providerReading, readingAcquisitions)
 import Hetoimasia.Scripting.Lua.Instance hiding (forgetInstance)
-import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint)
+import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint, scheduledTick)
 import Test.HUnit.Lang (assertFailure)
 import Test.Hspec
 import qualified Test.LuaEngine.Graphics.Fake as Fake
-import Test.LuaEngine.Graphics.Composition (holdReadsOf, releaseReadsOf)
+import Test.LuaEngine.Graphics.Composition (holdReadsOf, readsEntered, readsFinished, releaseReadsOf)
 import Test.LuaEngine.Graphics.PeersRig
 import Test.LuaEngine.Graphics.SceneHost
 import qualified Test.LuaEngine.Graphics.Window.Fake as WF
@@ -234,7 +234,9 @@ retainedEndSpec =
   it "ends A after both instances published and released: A's retained use stays live until its native completion is supplied, B's accepted scene and window survive, a new publication on B's released lease is refused, and an empty scene or B's end lets B retire" $
     withPair Fake.defaultFakeConfig (entryWith True) $ \peers → do
       let fake = peFake peers
+      -- A's texture has been allocated, uploaded and registered before B is admitted, so that native image 0 is A's
       a ← peAdmit peers
+      awaitLine peers "tex\t1\tsuccess"
       b ← peAdmit peers
       awaitLine peers "released\t1\tretiring"
       awaitLine peers "released\t2\tretiring"
@@ -287,6 +289,9 @@ saturationSpec =
       awaitLine peers "filled\t1\t8\tbusy"
       b ← peAdmit peers
       awaitLine peers "asked\t2\ttrue"
+      -- both pool workers have borrowed a read of the picture and hold it at the reader: the two oldest requests of A (the pool
+      -- starts reads in the order they were admitted); the rest, and B's, are queued
+      readsEntered (peComposition peers) "images/quad.png" 2
       -- A cancels the request a worker holds: the read must drain, so its reservation stays and a new ask is still busy;
       -- then it cancels a request still queued, which is withdrawn without any read, so that exactly one place comes back
       -- while the reads are still held: the next ask is accepted and the one after it is busy again
@@ -363,42 +368,87 @@ saturationSpec =
         , "}"
         ]
 
--- | Texture work open at the native owner while unrelated reads go through the same pool.
+-- | A logical owner's assigned results and a UI peer's uncached import, beside a texture whose upload is open.
+--
+-- A's picture has been read and decoded and its upload is open at the stand-in owner, so the texture holds its slot and lane
+-- but no worker. The logical owner asked for a module due at tick three and for data due at tick five; the module's read is
+-- held at the pool's reader, so one of the two workers is busy. B imports a module it alone asked for (a chain of two files
+-- nobody had read) and reads data, and both finish through the other worker, while the held read keeps tick three from
+-- completing, however long the UI goes on.
 sharedPipelineSpec ∷ Spec
 sharedPipelineSpec =
-  it "serves another instance's data and module reads while a texture's upload is open at the owner: workers release their slots at handoff and never wait for the native stage" $
+  it "serves a UI peer's uncached import and data read through the free worker while a texture's upload is open and a logical module read holds its tick, and settles the logical results at exactly their assigned ticks" $
     withPair holdingUploads sharing $ \peers → do
       let fake = peFake peers
-      a ← peAdmit peers
-      Fake.awaitEvent fake "upload started 0"
-      b ← peAdmit peers
-      -- B's reads (a data file and a module) complete through the shared pool while A's upload is still open
-      awaitLine peers "data\t2\tsuccess"
-      awaitLine peers "module\t2\tsuccess"
-      Fake.eventCount fake "upload completed 0" >>= (`shouldBe` 0)
-      readTVarIO (peOut peers) >>= \told → filter (Text.isPrefixOf "tex\t1\t") told `shouldBe` []
-      Fake.release fake Fake.HoldUploadFinish
-      awaitLine peers "tex\t1\tsuccess"
-      stop peers a
-      stop peers b
-      dissolve (peModel peers)
-      settleStopped peers a
-      settleStopped peers b
+          composition = peComposition peers
+      holdReadsOf composition "lua/late.lua"
+      withLogical peers $ \logical → do
+        l ← lgAdmit logical
+        a ← peAdmit peers
+        -- the texture's read and decode are done: it waits for its upload at the native owner, holding no worker
+        Fake.awaitEvent fake "upload started 0"
+        readsEntered composition "lua/late.lua" 1
+        b ← peAdmit peers
+        -- the UI's reads finish through the worker the held read leaves free
+        awaitLine peers "module\t2\tsuccess"
+        awaitLine peers "data\t2\tsuccess"
+        Fake.eventCount fake "upload completed 0" >>= (`shouldBe` 0)
+        -- ticks one and two: neither result is visible; the early data has been read long since, and only its position keeps it back
+        tickLogical peers logical 2
+        readsFinished composition "early.bin" 1
+        readTVarIO (peOut peers) >>= \told → logicalLines told `shouldBe` ["1\tfalse\tfalse", "2\tfalse\tfalse"]
+        -- tick three is granted and the module's source is held: the tick does not complete, though the UI goes on
+        grantLogical logical
+        marked ← beats peers
+        awaitBeats peers (marked + 3)
+        atomically (scheduledTick (scheduledEndpoint (lgOwner logical))) >>= (`shouldBe` 2)
+        readTVarIO (peOut peers) >>= \told → logicalLines told `shouldBe` ["1\tfalse\tfalse", "2\tfalse\tfalse"]
+        -- the source arrives: tick three completes with the module visible; the data is visible at tick five and not before
+        releaseReadsOf composition "lua/late.lua"
+        awaitLogicalTick peers logical
+        tickLogical peers logical 2
+        readTVarIO (peOut peers) >>= \told →
+          logicalLines told `shouldBe` ["1\tfalse\tfalse", "2\tfalse\tfalse", "3\ttrue\tfalse", "4\ttrue\tfalse", "5\ttrue\ttrue"]
+        -- the texture's upload was open throughout; letting it complete delivers it to A alone
+        readTVarIO (peOut peers) >>= \told → filter (Text.isPrefixOf "tex\t1\t") told `shouldBe` []
+        Fake.release fake Fake.HoldUploadFinish
+        awaitLine peers "tex\t1\tsuccess"
+        stop peers a
+        stop peers b
+        settleStopped peers a
+        settleStopped peers b
+        void (pure l)
   where
+    logicalLines told = [Text.drop 2 line | line ← told, "L\t" `Text.isPrefixOf` line]
+    beats peers = length . filter (Text.isPrefixOf "beat\t2\t") <$> readTVarIO (peOut peers)
+    awaitBeats peers wanted = atomically (readTVar (peOut peers) >>= \told → unless (length (filter (Text.isPrefixOf "beat\t2\t") told) >= wanted) retry)
     sharing =
       Text.encodeUtf8 . Text.unlines $
         [ "local share = import('lua/share.lua')"
         , "return {"
+        , "  gameplay = {"
+        , "    every_ticks = 1,"
+        , "    init = function(self, api)"
+        , "      self.keep = api"
+        , "      self.late = api.content.module('lua/late.lua', {tick_offset = 3})"
+        , "      self.early = api.content.data('early.bin', {tick_offset = 5})"
+        , "    end,"
+        , "    update = function(self, dt)"
+        , "      local api = self.keep"
+        , "      print('L', api.time.tick(), tostring(api.request.ready(self.late)), tostring(api.request.ready(self.early)))"
+        , "    end"
+        , "  },"
         , "  presentation = {"
         , "    every_seconds = 0.02,"
         , "    init = function(self, api)"
         , "      self.my = #share.apis + 1"
         , "      share.apis[self.my] = api"
         , "      self.keep = api"
+        , "      self.beats = 0"
         , "      if self.my == 1 then self.t = api.content.texture('images/quad.png')"
         , "      else"
-        , "        self.d = api.content.data('images/quad.png')"
-        , "        self.m = api.content.module('lua/share.lua')"
+        , "        self.m = api.content.module('lua/extra.lua')"
+        , "        self.d = api.content.data('data.bin')"
         , "      end"
         , "    end,"
         , "    update = function(self, dt)"
@@ -406,6 +456,7 @@ sharedPipelineSpec =
         , "      if self.t and api.request.ready(self.t) then print('tex', self.my, api.request.take(self.t).status) self.t = nil end"
         , "      if self.d and api.request.ready(self.d) then print('data', self.my, api.request.take(self.d).status) self.d = nil end"
         , "      if self.m and api.request.ready(self.m) then print('module', self.my, api.request.take(self.m).status) self.m = nil end"
+        , "      if self.my == 2 then self.beats = self.beats + 1 print('beat', self.my, self.beats) end"
         , "    end"
         , "  }"
         , "}"
