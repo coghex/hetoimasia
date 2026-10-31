@@ -134,6 +134,11 @@ diagnostic that cannot be written never replaces what it reports.
   drain loop until the session has settled, because the session's cleanup closes windows and waits for their native destruction, which only
   the main thread performs. The drain makes its own supervision, since the application's may have latched the very failure that ended the
   loop. A failing drain is run again, three times in all.
+* **The session thread, the handle and the loop's guard are one masked step** (`serveSpawned`): the thread is created, its handle recorded
+  where the join will find it, and the loop entered inside the guard before asynchronous exceptions are enabled at all, so a cancellation
+  already pending when the loop is entered lands inside the guard and stops the session like any other failure of the loop. After the
+  application has torn down, the session is told to stop again before it is joined, so the join never depends on the loop's guard having
+  run.
 * **The owner lost for good** (the drain fails every time): the loop's failure is raised at once, *without* joining the session. That
   hands the owner back to its application's own protected exit, which performs the verified destruction of the windows the loop could not.
   The session, whose providers then see a finished owner, settles, and the command joins it *after* the application has torn down,
@@ -146,6 +151,11 @@ diagnostic that cannot be written never replaces what it reports.
   the diagnostic path is what failed the command writes no terminal line through it either (the status is the same). Otherwise boot and
   host failures are reported by one best-effort line on stderr after every scope has unwound, carrying the cleanup failures retained beside
   the primary one, never through the logger.
+* **A diagnostic write that fails while something else unwinds is recorded, not dropped.** The drain's report, the verdict's warning and
+  the session's own sink failures (the session's writer counts the writes its sink refused and returns them as data in the outcome, raising
+  nothing) are written through, or carried into, the logging lifetime as a failed report (`reportDiagnostic`, `notePathFailure`,
+  `noteSessionDiagnostics`). The first failure is kept as evidence beside the primary failure, nothing more is written through that path
+  by the launcher, and the lifetime makes no final flush through it. The status is not changed by it.
 
 ## Sizing
 
