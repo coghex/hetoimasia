@@ -1662,6 +1662,25 @@ at a module's top level and in an imported dependency (both VMs claim one line, 
 with a held diagnostic (the latch precedes the write, and survives a cancelled caller) and a failing sink. `Test.LuaEngine.Session.Control`
 checks the pure conversions with no VM, with the bounds. The Boundary and Client examples keep the package and its public clients in step.
 
+## Integrated qualification (LFE-23)
+
+`Test.LuaEngine.Integrated.*` (group `test.lua-engine`, `--match Integrated`) qualify the assembled M1 services across instance, VM
+and role boundaries, with real Lua on the production composition and only the clock, timer, sinks and read gates injected. They
+add no production code, no command, no provider switch and no public Lua capability; they use the public composition points
+(`declareInstance`, `admitBehaviorInstance`, `requestInstanceControl`, `runSession`) and, for the session's second instance of a
+role, the harness of this package's own suite. The acceptance map, what each example injects and the windows that are not
+reachable at this boundary are in [the evidence record](../../docs/evidence/lfe23-integrated-qualification.md).
+
+| Family | What it proves |
+| --- | --- |
+| `Instances` | two UI instances and a logical owner: distinct identities and capabilities, one export table inside the UI VM and a separate evaluation in the logical VM, a peer's facade and handle refused with no read, first-in first-out with a yield and no interleaving, an instance ended with a read in flight |
+| `Jobs` | a logical result held at its assigned tick while the UI is served, a late read holding its tick, an importer at tick ten with its dependency requested for twelve, the chain's dependency read ahead of queued prefetch, module waiters leaving, a no-waiter failure that fails nobody, a VM stop with a borrowed read |
+| `Roles` | both initialization orders around the joint gate, a UI instance's init failing before it, a logical failure beside two healthy UI instances, a UI instance failing, a cleanup fault, the caught guard, a quit with every place held, one-role sessions, every assembly shape, a status that is one copy per segment |
+| `Capacity` | busy answered atomically, a place freed only at the work's actual boundary, an ended instance's room returned once |
+
+The graphics-linked families (`M1 integrated texture, window and scene ownership across two instances`) are in
+`lua-engine-graphics-tests`, and the application-composition ones (`Integrated endings (LFE-23)`) in the root `hetoimasia-tests`.
+
 ## Deferred, by design
 
 Not here, and not claimed: the CLI `run` dispatch and exit mapping (LFE-22), which will
