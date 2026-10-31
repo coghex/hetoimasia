@@ -20,7 +20,7 @@
 module Main (main) where
 
 import Control.Concurrent (forkOS)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, takeMVar)
 import Control.Concurrent.STM
   ( TMVar
   , TVar
