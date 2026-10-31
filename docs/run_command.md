@@ -154,19 +154,18 @@ diagnostic that cannot be written never replaces what it reports.
   the diagnostic path is what failed the command writes no terminal line through it either (the status is the same). Otherwise boot and
   host failures are reported by one best-effort line on stderr after every scope has unwound, carrying the cleanup failures retained beside
   the primary one, never through the logger.
-* **A diagnostic write that fails while something else unwinds is recorded, not dropped.** The drain's report, the verdict's warning and
-  the session's own sink failures (the session's writer counts the writes its sink refused and returns them as data in the outcome, raising
-  nothing) are written through, or carried into, the logging lifetime as a failed report (`reportDiagnostic`, `notePathFailure`,
-  `noteSessionDiagnostics`). The session's refusals are recorded at their source: in `runPrepared`,
-  from the session handle bound to the link (`noteLinkedDiagnostics`), when `runSession` ends, on a return and on an exception alike and
-  while every scope the session used is still open; and once more after the writer has been joined, for a refusal in its tail. Nothing
-  depends on `runSession` having answered, so neither a failure it raises nor a cleanup that fails afterwards can report or flush before
-  the record exists.
+* **A refused diagnostic is recorded where it occurs.** The logging lifetime the command runs in is made over a sink that records its own
+  refusals (`withRecordingLifetime`): the first write or flush the sink refuses is recorded on the lifetime as a failed report at that
+  moment, from inside the sink, whichever component, thread or scope made it (the session's diagnostics writer, a boot diagnostic, the
+  drain's report, the verdict's warning, a reporting boundary of the native application), and every later write or flush is refused without
+  touching the sink. So any enclosing boundary that runs at any later point already sees the path as failed, the lifetime makes no final
+  flush through it, and the command writes no terminal line through it; the first failure is kept as evidence beside the primary failure and
+  the status is not changed by it. No snapshot of the session, finalizer or join is the source of that fact, and nothing waits for one. The
+  refusal is still raised to the writer that met it (the session counts it in its own evidence), and a cancellation is never recorded as one.
 * **Typed failures are never reduced to the first of several.** The content layer keeps a failure beside another (a descriptor that would
   not close after a read failed) in the exception's context. Wherever the launcher turns such a failure into text (the root refusal and
   the manifest read in `Boot`, the final failure line in `Run`), it does so from the failure *with its context* (`withEvidence`), so the
-  bounded line names the retained cleanup failures too. The first failure is kept as evidence beside the primary failure, nothing more is written through that path
-  by the launcher, and the lifetime makes no final flush through it. The status is not changed by it.
+  bounded line names the retained cleanup failures too.
 
 ## Sizing
 
