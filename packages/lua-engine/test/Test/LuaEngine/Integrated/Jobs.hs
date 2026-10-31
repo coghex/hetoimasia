@@ -23,7 +23,8 @@ import Hetoimasia.Scripting.Lua.Scheduled (retireScheduled)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
 import Test.LuaEngine.Integrated.Support
-import Test.LuaEngine.Modules.Support (awaitDiagnostics, closeGate, diagnostics, finishedPaths, openGate, startedPaths)
+import Hetoimasia.Content.ReadPool (PoolStatus (statusQueued))
+import Test.LuaEngine.Modules.Support (awaitDiagnostics, awaitPool, closeGate, diagnostics, finishedPaths, openGate, startedPaths)
 
 spec ∷ Spec
 spec = describe "M1 integrated shared jobs and assigned results" $ do
@@ -135,6 +136,9 @@ importChainSpec =
           grantTick logical
           awaitErrLines world 2
           ownerTick logical >>= (`shouldBe` 9)
+          -- the chain's dependency is queued beside the prefetch that was queued earlier (both wait for a worker) before a worker is
+          -- freed, so that the order the pool serves them in is the priority and not an accident of arrival
+          awaitPool (wSession world) (\found → statusQueued found >= 2)
           openGate probe "pre2.bin"
           awaitFinishedPath probe "lua/c.lua"
           awaitTickDone control logical

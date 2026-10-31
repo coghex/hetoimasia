@@ -2,12 +2,12 @@
 
 -- | LFE-23, M1 integrated role failure and status/outcome: the whole session coordinator over a real content root, a
 -- real manifest and boot checkpoint, real filtered Lua VMs on real supervised owners, the real module and data
--- services, the facade, and two ordinary presentation instances (the session harness's second slot, admitted and
--- validated like the first) beside an independent logical owner.
+-- services and the facade, with a presentation role beside an independent logical owner. Only the public `runSession` composition
+-- is used (`noHarness`): a second instance of a role inside a running session is the session harness's, which these groups do not
+-- use; the two-instance cases are in the facade-level groups (`Instances`, `Jobs`, `Capacity`) and in the graphics suite.
 --
 -- __Injected__: the monotonic clock and timer, the recording sinks, the facade-side status/quit/terminal endpoints
--- are the session's own (not substituted), and the harness's probe points, which a test holds or makes raise to place
--- a stop or a failure in an exact window. Every verdict is stated from D-26/D-42/D-76 and the Lua each example
+-- are the session's own (not substituted). Every verdict is stated from D-26/D-42/D-76 and the Lua each example
 -- wrote; none is computed by the code under test. A scenario that raises stops the session and is raised again.
 module Test.LuaEngine.Integrated.Roles (spec) where
 
@@ -25,10 +25,9 @@ spec = describe "M1 integrated role failure, status and outcome" $ do
   startingOrders
   afterStart
 
--- | Two presentation instances beside the logical owner, over the content that names the shared module.
-twoUi ∷ Script → Setup
-twoUi found =
-  addFile ("lua/share.lua", shareFile) (setup (roleScript found)) {suHarness = noHarness {harnessSecond = [Presentation]}}
+-- | Both roles over the content that names the shared module.
+withShare ∷ Script → Setup
+withShare found = addFile ("lua/share.lua", shareFile) (setup (roleScript found))
   where
     shareFile = shareModule
 
@@ -49,19 +48,19 @@ duo extraInit =
     , scShutdown = ["print('shutdown ' .. api.role .. ' ' .. self.me .. ' ' .. tostring(reason))"]
     }
 
--- | The second UI instance prints a line in its init, which an example can park in the sink; nothing else prints in an init.
+-- | The UI instance prints a line in its init, which an example can park in the sink; nothing else prints in an init.
 heldSecond ∷ Script
 heldSecond =
   (duo [])
-    { scInit = ["share.n = share.n + 1; self.me = share.n", "if api.role == 'presentation' and self.me == 2 then print('init ui 2 held') end"]
+    { scInit = ["share.n = share.n + 1; self.me = share.n", "if api.role == 'presentation' then print('init ui held') end"]
     }
 
 -- Both initialization orders --------------------------------------------------------------------------------------
 
 startingOrders ∷ Spec
 startingOrders = describe "both initialization orders" $ do
-  it "runs both UI instances from their own init successes while the logical init is held, and opens the logical clock only at the joint gate" $
-    withSetup (twoUi (duo [])) $ \env → do
+  it "runs the UI instance from its own init success while the logical init is held, and opens the logical clock only at the joint gate" $
+    withSetup (withShare (duo [])) $ \env → do
       let world = seWorld env
       holdSink world "init gameplay"
       outcome ← runScenario env $ \session → do
@@ -70,29 +69,29 @@ startingOrders = describe "both initialization orders" $ do
         status ← statusNow session
         phasesOf status `shouldBe` (Just Starting, Just Running)
         (roleInitialized <$> gameplayOf status) `shouldBe` Just False
-        -- both UI instances have started and armed their cadence while the logical init is parked in its output (all
+        -- the UI instance has started and armed its cadence while the logical init is parked in its output (all
         -- authored output goes through one sink, so what they print waits behind it)
         awaitRegistration world 1000000
         releaseSink world
         awaitPhase session Gameplay Running
         awaitRegistration world 1000
         passTime world 1000000 (elem "update gameplay 1" <$> outLines world)
-        passTime world 1000000000 ((\out → "update ui 1" `elem` out && "update ui 2" `elem` out) <$> outLines world)
-        -- the logical role's first tick came only after the joint gate opened, which was after both UI inits
+        passTime world 1000000000 (elem "update ui 1" <$> outLines world)
+        -- the logical role's first tick came only after the joint gate opened, which was after the UI init
         out ← outLines world
         named "update gameplay" out `shouldSatisfy` (not . null)
         requestStop session StopQuit
       outVerdict outcome `shouldBe` VerdictSuccess
       outRetired outcome `shouldBe` True
 
-  it "holds the logical role ready, with no tick, when its init finishes first, until the second UI instance's init has succeeded" $
-    withSetup (twoUi heldSecond) $ \env → do
+  it "holds the logical role ready, with no tick, when its init finishes first, until the UI instance's init has succeeded" $
+    withSetup (withShare heldSecond) $ \env → do
       let world = seWorld env
-      -- the second UI instance's init is parked in its authored output (the logical init prints nothing, so it does not wait
+      -- the UI instance's init is parked in its authored output (the logical init prints nothing, so it does not wait
       -- behind it): a controlled, finite gate the example opens
-      holdSink world "init ui 2 held"
+      holdSink world "init ui held"
       outcome ← runScenario env $ \session → do
-        awaitSinkEntered world "init ui 2 held"
+        awaitSinkEntered world "init ui held"
         awaitPhase session Gameplay Ready
         status ← statusNow session
         (roleInitialized <$> gameplayOf status) `shouldBe` Just True
@@ -108,8 +107,8 @@ startingOrders = describe "both initialization orders" $ do
         requestStop session StopQuit
       outVerdict outcome `shouldBe` VerdictSuccess
 
-  it "ends the whole session when the second UI instance's init fails before the joint gate, retires both sides, and lets the late logical success reopen nothing" $
-    withSetup (twoUi (duo ["if api.role == 'presentation' and self.me == 2 then error('second ui init broke') end"])) $ \env → do
+  it "ends the whole session when the UI instance's init fails before the joint gate, retires both sides, and lets the late logical success reopen nothing" $
+    withSetup (withShare (duo ["if api.role == 'presentation' then error('ui init broke') end"])) $ \env → do
       let world = seWorld env
       -- the logical init is parked in its output, so that its success comes after the failure
       holdSink world "init gameplay"
@@ -131,7 +130,7 @@ startingOrders = describe "both initialization orders" $ do
         [found] → do
           rfRole found `shouldBe` Presentation
           rfStage found `shouldBe` OnInit
-          rfMessage found `shouldSatisfy` Text.isInfixOf "second ui init broke"
+          rfMessage found `shouldSatisfy` Text.isInfixOf "ui init broke"
           rfInstance found `shouldSatisfy` (/= Nothing)
         other → expectationFailure ("expected one failure, found " <> show other)
 
@@ -139,8 +138,8 @@ startingOrders = describe "both initialization orders" $ do
 
 afterStart ∷ Spec
 afterStart = describe "after a successful start" $ do
-  it "stops the logical role alone on its ordinary failure and leaves both UI instances running, the failure latched and attributed while the phase advances, and a later UI stop still ends in a failure" $
-    withSetup (twoUi failingLogic) $ \env → do
+  it "stops the logical role alone on its ordinary failure and leaves the UI instance running, the failure latched and attributed while the phase advances, and a later UI stop still ends in a failure" $
+    withSetup (withShare failingLogic) $ \env → do
       let world = seWorld env
       outcome ← runScenario env $ \session → do
         awaitPhase session Gameplay Running
@@ -160,14 +159,13 @@ afterStart = describe "after a successful start" $ do
         -- the failure stays latched, the same record, as the phase advanced to retired
         retired ← statusNow session
         (gameplayOf retired >>= roleFailure) `shouldBe` published
-        -- both UI instances go on serving meanwhile
-        passTime world 1000000000 ((\out → "update ui 1" `elem` out && "update ui 2" `elem` out) <$> outLines world)
+        -- the UI instance goes on serving meanwhile
+        passTime world 1000000000 (elem "update ui 1" <$> outLines world)
         requestStop session StopQuit
       out ← outLines world
       -- the logical role was granted nothing after its failing tick
       named "update gameplay" out `shouldBe` ["1", "2"]
       out `shouldSatisfy` elem "shutdown presentation 1 stopped"
-      out `shouldSatisfy` elem "shutdown presentation 2 stopped"
       -- stopping the surviving UI later still maps to a failure, never to a success
       outVerdict outcome `shouldBe` VerdictFailure
       outQuit outcome `shouldBe` True
@@ -175,12 +173,12 @@ afterStart = describe "after a successful start" $ do
       outRetired outcome `shouldBe` True
 
   it "ends the whole session when a UI instance fails after the start: both sides are retired through their own shutdowns and the failure names the instance" $
-    withSetup (twoUi (duo [] `withUpdate` ["if api.role == 'presentation' and self.me == 2 then error('second ui broke') end"])) $ \env → do
+    withSetup (withShare (duo [] `withUpdate` ["if api.role == 'presentation' then error('ui broke') end"])) $ \env → do
       let world = seWorld env
       outcome ← runScenario env $ \session → do
         awaitPhase session Gameplay Running
         awaitPhase session Presentation Running
-        passTime world 1000000000 (elem "update ui 2" <$> outLines world)
+        passTime world 1000000000 (elem "update ui 1" <$> outLines world)
         void (awaitRetired session)
       out ← outLines world
       outVerdict outcome `shouldBe` VerdictFailure
@@ -189,39 +187,19 @@ afterStart = describe "after a successful start" $ do
         found : _ → do
           rfRole found `shouldBe` Presentation
           rfStage found `shouldBe` OnUpdate
-          rfMessage found `shouldSatisfy` Text.isInfixOf "second ui broke"
+          rfMessage found `shouldSatisfy` Text.isInfixOf "ui broke"
           rfInstance found `shouldSatisfy` (/= Nothing)
         [] → expectationFailure "no failure was published"
       -- every instance that was running was shut down once, the failed one as failed
-      length (named "shutdown" out) `shouldBe` 3
-      named "shutdown" out `shouldSatisfy` any ("presentation 2 failed" `Text.isPrefixOf`)
+      length (named "shutdown" out) `shouldBe` 2
+      named "shutdown" out `shouldSatisfy` any ("presentation 1 failed" `Text.isPrefixOf`)
 
-  it "ends a healthy UI at once when the failed logical role's cleanup then fails, and keeps the primary failure with the bounded secondary evidence" $ do
-    _ ←
-      fatalSetup
-        (twoUi closingLogic) {suHarness = noHarness {harnessSecond = [Gameplay, Presentation]}}
-        $ \env → do
-          let world = seWorld env
-          outcome ← runScenario env $ \session → do
-            awaitPhase session Gameplay Running
-            awaitPhase session Presentation Running
-            awaitRegistration world 1000
-            nudge world 2000000
-            void (awaitRetired session)
-          out ← outLines world
-          out `shouldSatisfy` any ("shutdown presentation" `Text.isPrefixOf`)
-          outVerdict outcome `shouldBe` VerdictFailure
-          fmap rfRole (outFailures outcome) `shouldSatisfy` (Gameplay `elem`)
-          fmap eeCode (erPrimary (outEngine outcome)) `shouldBe` Just LuaError
-          fmap eeCode (erSecondary (outEngine outcome)) `shouldSatisfy` (CleanupFailure `elem`)
-    pure ()
-
-  it "keeps the unavailable-state guard terminal when a second UI instance catches it in an update: one diagnostic, the whole session fails after the segment returns, every instance is shut down once, and no role is blamed" $
-    withSetup (twoUi ((duo []) {scUpdate = ["if api.role == 'presentation' and self.me == 2 then pcall(state, 1); print('caught ui 2') else print('update ' .. api.role .. ' ' .. self.me) end"]})) $ \env → do
+  it "keeps the unavailable-state guard terminal when the UI instance catches it in an update: one diagnostic, the whole session fails after the segment returns, every instance is shut down once, and no role is blamed" $
+    withSetup (withShare ((duo []) {scUpdate = ["if api.role == 'presentation' then pcall(state, 1); print('caught ui') else print('update ' .. api.role .. ' ' .. self.me) end"]})) $ \env → do
       let world = seWorld env
       outcome ← runScenario env $ \session → do
         awaitPhase session Presentation Running
-        passTime world 1000000000 (elem "caught ui 2" <$> outLines world)
+        passTime world 1000000000 (elem "caught ui" <$> outLines world)
         void (awaitRetired session)
       out ← outLines world
       outVerdict outcome `shouldBe` VerdictFailure
@@ -236,10 +214,10 @@ afterStart = describe "after a successful start" $ do
         Nothing → expectationFailure "no terminal failure was latched"
       errLines world >>= \err → filter (not . ("share evaluated" `Text.isSuffixOf`)) err `shouldBe` [guardPhrase]
       -- protected cleanup: each instance that was admitted ran its shutdown exactly once
-      length (named "shutdown" out) `shouldBe` 3
+      length (named "shutdown" out) `shouldBe` 2
 
   it "keeps the guard terminal when a shared module's top level catches it in both VMs: one diagnostic, no init in any instance, the failure the session's and no role's" $
-    withSetup ((twoUi (duo [])) {suFiles = [("lua/main.lua", roleScript (duo [])), ("lua/share.lua", luaMain ["pcall(state, 1)", "return {n = 0}"])]}) $ \env → do
+    withSetup ((withShare (duo [])) {suFiles = [("lua/main.lua", roleScript (duo [])), ("lua/share.lua", luaMain ["pcall(state, 1)", "return {n = 0}"])]}) $ \env → do
       outcome ← runScenario env $ \session → void (awaitRetired session)
       out ← outLines (seWorld env)
       outVerdict outcome `shouldBe` VerdictFailure
@@ -250,25 +228,25 @@ afterStart = describe "after a successful start" $ do
       out `shouldBe` []
       errLines (seWorld env) >>= \err → filter (not . ("share evaluated" `Text.isSuffixOf`)) err `shouldBe` [guardPhrase]
 
-  it "quits from the logical role while both UI instances hold every request place: the call returns at once, admission closes as an ordinary error and never busy, cancel and output stay usable, and the role retires only after the held reads have" $
-    withSetup (addFile ("lua/gate.bin", "gg") (addFile ("lua/slow.bin", "slow") (twoUi saturating))) $ \env → do
+  it "quits from the logical role while the UI instance holds every request place it can: the call returns at once, admission closes as an ordinary error and never busy, cancel and output stay usable, and the role that holds reads retires only after they have returned" $
+    withSetup (addFile ("lua/gate.bin", "gg") (addFile ("lua/slow.bin", "slow") (withShare saturating))) $ \env → do
       let world = seWorld env
           probe = ssProbeOf env
       closeGate probe "lua/slow.bin"
       closeGate probe "lua/gate.bin"
       outcome ← runScenario env $ \session → dumpOnFailure world [] $ do
         -- the logical role's first update asks for a read the reader holds and waits for it, so that it cannot quit before
-        -- both UI instances have filled their places
+        -- the UI instance has filled its places
         awaitPhase session Gameplay Running
         awaitRegistration world 1000
         nudge world 1000000
         awaitReadOf env "lua/gate.bin"
-        passTime world 1000000000 ((\out → length (named "filled presentation" out) == 2) <$> outLines world)
+        passTime world 1000000000 ((\out → length (named "filled presentation" out) == 1) <$> outLines world)
         openGate probe "lua/gate.bin"
         passTime world 2000000 (elem "after quit gameplay" <$> outLines world)
         status ← statusNow session
-        -- quit returned without waiting for the held reads: both roles are stopping and neither is retired
-        fmap rolePhase (gameplayOf status) `shouldSatisfy` (/= Just Retired)
+        -- quit returned without waiting for the held reads: the session is stopping, and the UI role, whose reads are still held,
+        -- is not retired (the logical role holds nothing and retires on its own)
         fmap rolePhase (presentationOf status) `shouldSatisfy` (/= Just Retired)
         statusStopping status `shouldBe` True
         openGate probe "lua/slow.bin"
@@ -280,7 +258,7 @@ afterStart = describe "after a successful start" $ do
       -- per instance are not reachable before the pool is full; the facade's examples cover that bound.)
       let filled = [(role, count, busy) | line ← named "filled" out, [role, _, count, busy] ← [Text.words line]]
       sum [read (Text.unpack count) | (_, count, _) ← filled] `shouldBe` (3 ∷ Int)
-      map (\(role, _, busy) → (role, busy)) (sort filled) `shouldBe` [("gameplay", "busy"), ("presentation", "busy"), ("presentation", "busy")]
+      map (\(role, _, busy) → (role, busy)) (sort filled) `shouldBe` [("gameplay", "busy"), ("presentation", "busy")]
       named "closed" out `shouldBe` ["false string"]
       named "cancel" out `shouldSatisfy` any (`elem` ["cancelled", "already_settled"])
       errLines world >>= \err → err `shouldSatisfy` any (Text.isSuffixOf "written after quit")
@@ -288,7 +266,7 @@ afterStart = describe "after a successful start" $ do
       outQuit outcome `shouldBe` True
 
   it "reads a status that is one coherent copy within a UI segment, edits of it reaching nobody, and refreshed when the instance resumes after a wait: the logical failure stays latched while its phase advances" $
-    withSetup (addFile ("lua/hold.bin", "hold") (addFile ("lua/slow.bin", "slow") (twoUi statusReading))) $ \env → do
+    withSetup (addFile ("lua/hold.bin", "hold") (addFile ("lua/slow.bin", "slow") (withShare statusReading))) $ \env → do
       let world = seWorld env
           probe = ssProbeOf env
       -- the first UI instance waits on a read the pool's reader holds, so its resumption is placed by the example and not by a
@@ -415,19 +393,6 @@ afterStart = describe "after a successful start" $ do
             , "  if t == 2 then error('boom at ' .. t) end"
             , "else"
             , "  print('update ui ' .. self.me)"
-            , "end"
-            ]
-        }
-    closingLogic =
-      (duo [])
-        { scUpdate =
-            [ "if api.role == 'gameplay' then"
-            , "  if self.me == 1 then"
-            , "    if api.time.tick() == 2 then error('boom') end"
-            , "  else"
-            , "    local guard <close> = setmetatable({}, {__close = function() error('close failed') end})"
-            , "    api.time.wait_ticks(100)"
-            , "  end"
             , "end"
             ]
         }
