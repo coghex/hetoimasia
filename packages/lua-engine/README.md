@@ -1675,7 +1675,7 @@ reachable at this boundary are in [the evidence record](../../docs/evidence/lfe2
 | --- | --- |
 | `Instances` | two UI instances and a logical owner: distinct identities and capabilities, one export table inside the UI VM and a separate evaluation in the logical VM, a peer's facade and handle refused with no read, first-in first-out with a yield and no interleaving, an instance ended with a read in flight |
 | `Jobs` | a logical result held at its assigned tick while the UI is served, a late read holding its tick, an importer at tick ten with its dependency requested for twelve, the chain's dependency read ahead of queued prefetch, module waiters leaving, a no-waiter failure that fails nobody, a VM stop with a borrowed read |
-| `Roles` | both initialization orders around the joint gate, a UI instance's init failing before it, a logical failure beside two healthy UI instances, a UI instance failing, a cleanup fault, the caught guard, a quit with every place held, one-role sessions, every assembly shape, a status that is one copy per segment |
+| `Roles` | through the public `runSession` composition alone: both initialization orders around the joint gate, a UI instance's init failing before it, a logical failure beside a healthy UI instance, a UI instance failing, the caught guard, a quit with every place held, one-role sessions, every assembly shape, a status that is one copy per segment |
 | `Capacity` | busy answered atomically, a place freed only at the work's actual boundary, an ended instance's room returned once |
 
 The graphics-linked families (`M1 integrated texture, window and scene ownership across two instances`) are in
