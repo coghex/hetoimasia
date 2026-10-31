@@ -15,16 +15,17 @@ import Control.Exception
   , SomeException
   , finally
   , fromException
-  , mask
   , tryWithContext
   )
 import Control.Monad (unless, void)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (isInfixOf)
-import GHC.Conc (BlockReason (BlockedOnMVar, BlockedOnSTM))
+import GHC.Conc (BlockReason (BlockedOnException, BlockedOnMVar, BlockedOnSTM))
+import Hetoimasia.Foundation.Log (callbackSinkWith, defaultLogFilter, mkLogger)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, displayCleanupFailure, withResource)
-import Hetoimasia.Run.Serve (Owner (..), drainAttempts, joinFailure, serve, spawn)
+import Hetoimasia.Run.Serve (Owner (..), drainAttempts, joinFailure, serveSpawned)
 import Hetoimasia.Run.Session (awaitDiagnostics, newSessionLinkEndingWith)
+import Hetoimasia.Runtime.Logging (failedReportsInContext, withLoggingLifetime)
 import Test.Engine.Run.Support (blockedFor, silentLogger)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 import Test.Support.Bounded (bounded)
@@ -74,11 +75,10 @@ noted ref count = bounded loop
 failureText ∷ ExceptionWithContext SomeException → String
 failureText (ExceptionWithContext _ failure) = show failure
 
--- | Spawn the session and serve it, in the one masked step the caller owes.
+-- | Start the session and serve it, as the command does, over a logging lifetime on a logger that writes nothing.
 run ∷ Fake → Owner → IO () → IO a → IO a
-run _ owner stopSession session = mask $ \restore → do
-  spawned ← spawn owner session
-  restore (serve silentLogger owner stopSession quiet spawned)
+run _ owner stopSession session =
+  withLoggingLifetime silentLogger $ \lifetime → serveSpawned lifetime owner (\_ → pure ()) stopSession quiet session
 
 spec ∷ Spec
 spec = describe "Serve" $ do
@@ -119,10 +119,8 @@ spec = describe "Serve" $ do
     let session = atomically (readTVar (fakeExited fake) >>= check) >> ioError (userError "session settled against the exit")
         owner = ownerWith fake (Just "the owner loop failed") (ioError (userError "the drain failed too"))
     spawnedRef ← newEmptyMVar
-    outcome ← bounded $ mask $ \restore → do
-      spawned ← spawn owner session
-      putMVar spawnedRef spawned
-      tryWithContext @SomeException (restore (serve silentLogger owner quiet quiet spawned))
+    outcome ← bounded $ tryWithContext @SomeException $ withLoggingLifetime silentLogger $ \lifetime →
+      serveSpawned lifetime owner (putMVar spawnedRef) quiet quiet session
     -- Raised at once: every attempt was made, nothing was served, and the session is still unsettled.
     case outcome of
       Left failure → failureText failure `shouldBe` "user error (the owner loop failed)"
@@ -140,6 +138,66 @@ spec = describe "Serve" $ do
     -- And only once, however often it is asked.
     again ← joinFailure spawned Nothing joined
     length (cleanupFailuresInContext (let ExceptionWithContext c _ = again in c)) `shouldBe` length (cleanupFailuresInContext context)
+
+  it "stops the session when a cancellation is already pending at the moment the loop is entered" $ do
+    fake ← newFake
+    stopped ← newTVarIO False
+    armed ← newEmptyMVar
+    result ← newEmptyMVar
+    caller ← newEmptyMVar
+    thrower ← newEmptyMVar
+    let stop = atomically (writeTVar stopped True)
+        -- A session that ends only when it is told to stop.
+        session = atomically (readTVar stopped >>= check)
+        -- Run masked, after the session exists and before the loop is entered: the cancellation is queued against
+        -- this thread (its sender blocked until it can be received), so it can only land when asynchronous
+        -- exceptions are first enabled.
+        queued _ = do
+          -- The sender exists before anything is queued: it throws only once told to, so nothing blocks here with a
+          -- cancellation outstanding.
+          sender ← takeMVar thrower
+          putMVar armed ()
+          blockedFor BlockedOnException sender
+    _ ← forkIO $ do
+      myThreadId >>= putMVar caller
+      outcome ← tryWithContext @SomeException $ withLoggingLifetime silentLogger $ \lifetime →
+        serveSpawned lifetime (ownerWith fake Nothing quiet) queued stop quiet session
+      putMVar result outcome
+    me ← takeMVar caller
+    sender ← forkIO (takeMVar armed >> throwTo me UserInterrupt)
+    putMVar thrower sender
+    bounded (takeMVar result) >>= \case
+      Left (ExceptionWithContext _ failure) → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
+      Right _ → expectationFailure "the cancellation was lost"
+    -- The session was told to stop, and has ended: nothing outlives the call.
+    readTVarIO stopped >>= (`shouldBe` True)
+
+  it "records a failed diagnostic write on the lifetime, writes nothing more through that path and flushes nothing, however long the drain keeps failing" $ do
+    fake ← newFake
+    writes ← newTVarIO (0 ∷ Int)
+    flushes ← newTVarIO (0 ∷ Int)
+    spawnedRef ← newEmptyMVar
+    let sink =
+          callbackSinkWith
+            (\_ → atomically (modifyTVar' writes (+ 1)) >> ioError (userError "the diagnostic sink is broken"))
+            (atomically (modifyTVar' flushes (+ 1)))
+        logger = mkLogger defaultLogFilter sink
+        owner = ownerWith fake (Just "the owner loop failed") (ioError (userError "the drain failed too"))
+        session = atomically (readTVar (fakeExited fake) >>= check)
+    outcome ← bounded $ tryWithContext @SomeException $ withLoggingLifetime logger $ \lifetime →
+      serveSpawned lifetime owner (putMVar spawnedRef) quiet quiet session
+    -- Let the session go, as the application's exit does, and wait for it: nothing outlives the example.
+    atomically (writeTVar (fakeExited fake) True)
+    spawned ← takeMVar spawnedRef
+    Left original ← pure outcome
+    _ ← bounded (joinFailure spawned Nothing original)
+    readTVarIO (fakeDrains fake) >>= (`shouldBe` drainAttempts)
+    -- Every drain failed, and only the first of the reports was written: the path was recorded as failed.
+    readTVarIO writes >>= (`shouldBe` 1)
+    readTVarIO flushes >>= (`shouldBe` 0)
+    let ExceptionWithContext context failure = original
+    show failure `shouldBe` "user error (the owner loop failed)"
+    length (failedReportsInContext context) `shouldBe` 1
 
   it "remembers a cancellation during the drain and raises it, after the session has settled, with both failures kept beside it" $ do
     fake ← newFake

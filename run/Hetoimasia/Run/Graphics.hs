@@ -42,12 +42,12 @@ module Hetoimasia.Run.Graphics
   ) where
 
 import Control.Concurrent.STM (STM, atomically, retry)
-import Control.Exception (SomeException, finally, mask, rethrowIO, tryWithContext)
-import Control.Monad (join, unless)
+import Control.Exception (SomeException, finally, rethrowIO, tryWithContext)
+import Control.Monad (forM_, join, unless, void)
 import Data.List (partition)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import qualified Data.Text as Text
-import Hetoimasia.Foundation.Log (Component, Logger, logWarning, unsafeComponent)
+import Hetoimasia.Foundation.Log (Component, logWarning, unsafeComponent)
 import Hetoimasia.GLFW.Vulkan (withLoaderIntegration)
 import Hetoimasia.GPU.Vulkan.Diagnostics
   ( CaptureConfig (..)
@@ -96,8 +96,8 @@ import Hetoimasia.LuaEngine.Session
   , newRoleFailure
   )
 import Hetoimasia.Run.Boot (Prepared (..))
-import Hetoimasia.Run.Serve (Owner (..), Spawned, joinFailure, serve, spawn)
-import Hetoimasia.Run.Settle (diagnostic)
+import Hetoimasia.Run.Serve (Owner (..), Spawned, joinFailure, serveSpawned)
+import Hetoimasia.Run.Settle (attemptSync, reportDiagnostic)
 import Hetoimasia.Run.Output (reportText)
 import Hetoimasia.Run.Session
   ( Environment
@@ -105,6 +105,7 @@ import Hetoimasia.Run.Session
   , SessionLink
   , linkFailure
   , linkStop
+  , noteSessionDiagnostics
   , runPrepared
   )
 import Hetoimasia.Runtime.GLFW
@@ -170,10 +171,14 @@ runNativeWith observation environment lifetime stop link prepared = do
   case result of
     Right outcome → do
       verdict ← readIORef verdictCell
-      checkVerdict logger verdict
+      noteSessionDiagnostics lifetime outcome
+      checkVerdict lifetime verdict
       pure outcome
     Left failure → do
       spawned ← readIORef slot
+      -- Whatever ended the application, the session is told to stop before it is waited for: the join never depends
+      -- on the loop's own guard having run.
+      forM_ spawned $ \_ → void (attemptSync (linkStop link StopInterrupt))
       rethrowIO =<< maybe (pure failure) (\session → joinFailure session Nothing failure) spawned
   where
     logger = lifetimeLogger lifetime
@@ -213,10 +218,9 @@ runNativeWith observation environment lifetime stop link prepared = do
                     }
             runPrepared environment lifetime stop link prepared (Just production) (\_ → pure ())
               `finally` writeIORef observedStep (pure ())
-      mask $ \restore → do
-        spawned ← spawn owner session
-        writeIORef slot (Just spawned)
-        restore (serve logger owner (linkStop link StopInterrupt) (join (readIORef providerStep) >> join (readIORef observedStep)) spawned)
+      -- The session is started, recorded and served in one masked step, so nothing between the thread's creation and
+      -- the loop's guard can be cancelled.
+      serveSpawned lifetime owner (writeIORef slot . Just) (linkStop link StopInterrupt) (join (readIORef providerStep) >> join (readIORef observedStep)) session
 
 -- | The window provider's stop and fatal endpoints, through the link: a genuine native close is the session's
 -- idempotent normal stop, a failure of retirement a @cleanup_failure@ and any other fatal fault a
@@ -252,13 +256,13 @@ awaitReadiness vulkan = do
 -- trusted. Diagnostics that were only lost (dropped, truncated, undelivered or unaccounted records) are evidence
 -- that some message did not reach the log, not a fault of the run: they are reported as a warning, at once and
 -- once, and fail nothing.
-checkVerdict ∷ Logger → Maybe DiagnosticVerdict → IO ()
-checkVerdict logger = \case
+checkVerdict ∷ LoggingLifetime → Maybe DiagnosticVerdict → IO ()
+checkVerdict lifetime = \case
   Nothing → ioError (userError "no diagnostic verdict was reached")
   Just verdict → do
     let (fatal, lost) = partition fatalIssue (verdictIssues verdict)
     unless (null lost) $
-      diagnostic $ logWarning logger component "diagnostic records were lost" [("issues", reportText (Text.pack (show lost)))]
+      reportDiagnostic lifetime (logWarning (lifetimeLogger lifetime) component "diagnostic records were lost" [("issues", reportText (Text.pack (show lost)))])
     unless (null fatal) $
       ioError (userError (Text.unpack (reportText ("the diagnostic capture was not clean: " <> Text.pack (show fatal)))))
 

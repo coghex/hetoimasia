@@ -41,6 +41,7 @@ module Hetoimasia.Run.Session
   , newSessionLinkEndingWith
   , awaitDiagnostics
   , joinDiagnostics
+  , noteSessionDiagnostics
   , ioQueueSlots
   , textureJobs
   , runPrepared
@@ -56,8 +57,9 @@ import Control.Concurrent.STM
   , readTVar
   , writeTVar
   )
-import Control.Exception (ExceptionWithContext, SomeException, finally, mask_, rethrowIO)
-import Control.Monad (forM_, join, void)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, mask_, rethrowIO, toException)
+import Control.Exception.Context (emptyExceptionContext)
+import Control.Monad (forM_, join, void, when)
 import Data.Foldable (traverse_)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Hetoimasia.Content.ReadPool (poolSpec, withReadPool)
@@ -65,9 +67,10 @@ import Hetoimasia.Foundation.Time (MonotonicSource, monotonicSource)
 import Hetoimasia.LuaEngine.Facade (GraphicsInjection, OutputSink, withOutput)
 import Hetoimasia.LuaEngine.Profile (Count (Count), CountLimit (IoWorkers), countLimit)
 import Hetoimasia.LuaEngine.Session
-  ( RoleFailure
+  ( DiagEvidence (..)
+  , RoleFailure
   , Session
-  , SessionOutcome
+  , SessionOutcome (outDiagnostics)
   , SessionSpec (..)
   , StopKind (StopInterrupt)
   , latchTerminalFailure
@@ -85,7 +88,9 @@ import Hetoimasia.LuaEngine.Texture
 import Hetoimasia.LuaEngine.Texture.Backend (TextureBackend)
 import Hetoimasia.Run.Boot (Prepared (..))
 import Hetoimasia.Run.Output (authoredSinks)
-import Hetoimasia.Run.Settle (rememberingInterruption)
+import qualified Data.Text as Text
+import Hetoimasia.Run.Output (reportText)
+import Hetoimasia.Run.Settle (notePathFailure, rememberingInterruption)
 import Hetoimasia.Runtime.Logging (LoggingLifetime, lifetimeLogger)
 import Hetoimasia.Runtime.Supervision (withSupervision)
 import Hetoimasia.Scripting.Lua.Runtime (newLuaRuntime)
@@ -253,3 +258,15 @@ runPrepared environment lifetime stop link prepared graphics hook =
                   writeIORef forwarder (Just thread)
               endForwarder = readIORef forwarder >>= mapM_ killThread
           runSession spec callback `finally` endForwarder
+
+-- | Carry the session's own diagnostic-sink failures into the logging lifetime. The session's writer counts the
+-- writes its sink refused and returns them as data in the outcome; they raise nothing. Left there, the lifetime
+-- would finish normally and flush the very sink that failed. Recording the first of them as a failed report makes
+-- the lifetime skip that flush and the launcher write nothing more through the path. A session that lost nothing
+-- records nothing.
+noteSessionDiagnostics ∷ LoggingLifetime → SessionOutcome → IO ()
+noteSessionDiagnostics lifetime outcome = do
+  let evidence = outDiagnostics outcome
+  when (deSinkFailures evidence > 0) $
+    notePathFailure lifetime . ExceptionWithContext emptyExceptionContext . toException . userError . Text.unpack . reportText $
+      "the session's diagnostics could not be written (" <> Text.pack (show (deSinkFailures evidence)) <> " refused): " <> Text.intercalate "; " (deSinkFirst evidence)

@@ -59,7 +59,7 @@ import Hetoimasia.Run.Boot (BootEnd (..), BootHooks, Prepared, noBootHooks, with
 import Hetoimasia.Run.Graphics (runNative)
 import Hetoimasia.Run.Options (RunParse (..), parseRun, problemReason, runHelp, runUsage)
 import Hetoimasia.Run.Output (reportText, utf8Streams)
-import Hetoimasia.Run.Session (SessionLink, joinDiagnostics, newSessionLink, productionEnvironment)
+import Hetoimasia.Run.Session (SessionLink, joinDiagnostics, newSessionLink, noteSessionDiagnostics, productionEnvironment)
 import Hetoimasia.Run.Settle (combine, isAsynchronous)
 import Hetoimasia.Run.Signals (forceExit, withRunSignals)
 import Hetoimasia.Run.Status (RunResult (..), bootFailed, exitStatus)
@@ -147,6 +147,8 @@ runGame setup configuration path = do
             Left (BootRefused reason) → (bootFailed reason False, ["boot failed: " <> reason])
             Left BootStopped → (RunResult Nothing Nothing [] True, [])
             Right session → (RunResult (Just session) Nothing [] False, [])
+      -- A diagnostic the session's sink refused is a failed diagnostic path, though it raised nothing.
+      mapM_ (noteSessionDiagnostics lifetime) (either (const Nothing) Just attempt)
       stopped ← atomically stop
       let result = outcome {resultSignalled = resultSignalled outcome || stopped}
       writeIORef held (Just (result, reports))

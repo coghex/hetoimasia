@@ -12,7 +12,11 @@
 --
 -- = The rules
 --
--- * 'spawn' is called, and its handle recorded where the caller's join will find it, in one masked step.
+-- * The session is started, its handle recorded where the caller's join will find it, and the loop entered, in
+--   /one/ masked step ('serveSpawned'): the loop's guard is installed before asynchronous exceptions are enabled
+--   at all, so a cancellation already pending when the loop is entered lands inside the guard and stops the
+--   session like any other failure of the loop. There is no point between the thread's creation and that guard
+--   at which a cancellation can escape.
 -- * When the loop ends because the session ended, the session's own result (or failure, with its context) is the
 --   answer.
 -- * When the loop /fails/ (or the main thread is cancelled in it), the session is asked to stop and the owner is
@@ -29,8 +33,7 @@
 module Hetoimasia.Run.Serve
   ( Owner (..)
   , Spawned
-  , spawn
-  , serve
+  , serveSpawned
   , joinFailure
   , drainAttempts
   ) where
@@ -43,9 +46,10 @@ import Control.Monad (unless, void)
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
 import Data.Maybe (isJust)
 import qualified Data.Text as Text
-import Hetoimasia.Foundation.Log (Component, Logger, logError, unsafeComponent)
+import Hetoimasia.Foundation.Log (Component, logError, unsafeComponent)
 import Hetoimasia.Run.Output (reportText)
-import Hetoimasia.Run.Settle (attemptSync, bestEffort, combine, diagnostic, rememberingInterruption)
+import Hetoimasia.Run.Settle (attemptSync, combine, reportDiagnostic, rememberingInterruption)
+import Hetoimasia.Runtime.Logging (LoggingLifetime, lifetimeLogger)
 
 -- | What the main thread serves.
 data Owner = Owner
@@ -73,9 +77,8 @@ component = unsafeComponent "run.serve"
 drainAttempts ∷ Int
 drainAttempts = 3
 
--- | Start the session on a thread of its own, which wakes the owner's loop when it ends. Call it with
--- asynchronous exceptions masked and record the handle before unmasking, so a cancellation can never leave the
--- thread running with nothing to join it.
+-- | Start the session on a thread of its own, which wakes the owner's loop when it ends. Only called with
+-- asynchronous exceptions masked.
 spawn ∷ Owner → IO a → IO (Spawned a)
 spawn owner session = do
   done ← newEmptyMVar
@@ -86,9 +89,19 @@ spawn owner session = do
     ownerWake owner
   pure (Spawned done attached)
 
--- | Serve the owner on this thread until the session has ended; see the module header for the failure rules.
-serve ∷ ∀ a. Logger → Owner → IO () → IO () → Spawned a → IO a
-serve logger owner stopSession turn spawned = mask $ \restore → do
+-- | Start the session, hand its handle to the recorder, and serve the owner on this thread until the session has
+-- ended, all in one masked step; see the module header for the failure rules. The recorder runs masked and before the
+-- loop's guard exists, so it must neither block nor throw.
+serveSpawned ∷ ∀ a. LoggingLifetime → Owner → (Spawned a → IO ()) → IO () → IO () → IO a → IO a
+serveSpawned lifetime owner record stopSession turn session = mask $ \restore → do
+  spawned ← spawn owner session
+  record spawned
+  serve restore lifetime owner stopSession turn spawned
+
+-- | The loop and its failure rules. Called inside the mask of 'serveSpawned', with that mask's @restore@, which is
+-- the only place asynchronous exceptions are enabled, and then only inside the guard.
+serve ∷ ∀ a. (∀ x. IO x → IO x) → LoggingLifetime → Owner → IO () → IO () → Spawned a → IO a
+serve restore lifetime owner stopSession turn spawned = do
   let over = isJust <$> tryReadMVar (spawnedDone spawned)
   tryWithContext (restore (ownerServe owner turn over)) >>= \case
     Right () → do
@@ -121,7 +134,8 @@ serve logger owner stopSession turn spawned = mask $ \restore → do
                   attemptSync (ownerDrain owner over) >>= \case
                     Right () → pure ()
                     Left again → do
-                      bestEffort (diagnostic (logError logger component "the owner loop failed while the session was draining" [("reason", reportText (Text.pack (displayException again)))]))
+                      -- A failed write is recorded on the lifetime (and ends further writes through that path), never dropped.
+                      reportDiagnostic lifetime (logError (lifetimeLogger lifetime) component "the owner loop failed while the session was draining" [("reason", reportText (Text.pack (displayException again)))])
                       go (attempt + 1 ∷ Int)
 
 -- | Join the session, waiting without a bound and remembering a cancellation meanwhile, and answer the failure that

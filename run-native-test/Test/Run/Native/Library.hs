@@ -33,12 +33,12 @@ import Control.Concurrent.STM
   , retry
   , swapTVar
   )
-import Control.Exception (AsyncException (UserInterrupt), ExceptionWithContext, SomeException, finally, mask, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
+import Control.Exception (AsyncException (UserInterrupt), ExceptionWithContext, catch, SomeException, finally, mask, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
 import Control.Applicative ((<|>))
 import Control.Monad (forM_, unless, void, when)
 import Data.Foldable (traverse_)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef, writeIORef)
-import Data.List (isPrefixOf)
+import Data.List (isInfixOf, isPrefixOf)
 import Data.Maybe (fromMaybe, isJust)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (ThreadBlocked), threadStatus)
 import qualified Data.ByteString as ByteString
@@ -48,7 +48,7 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Hetoimasia.Console.Lua.Signals (deliver)
 import Hetoimasia.Run.Session (newSessionLink)
-import Hetoimasia.Run.Settle (combine, rememberingInterruption)
+import Hetoimasia.Run.Settle (combine, isAsynchronous, rememberingInterruption)
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Foundation.Log (LogFilter (..), Logger, callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.GLFW.NativeCheck (NativeCloseAnswer (..), requestNativeClose)
@@ -145,6 +145,34 @@ spec env = describe "the command's production composition" $ do
         ranStatus ran `shouldBe` ExitSuccess
         retired ran
         evidence env "quit: a script that quits right after publishing and releasing ended the session with exit 0; the window was destroyed and the texture proved retired"
+
+  it "fails the example, and does not pass it, when the command exits 0 before the scenario has made its observations" $
+    within 120 $
+      withSystemTempDirectory "hetoimasia-run-native" $ \folder → do
+        copyTree shippedContent folder
+        quitting folder (\script → Text.replace "api.texture.release(self.image.texture)" "api.texture.release(self.image.texture)\n        api.session.quit()" script)
+        -- An observation that cannot be made once the command is gone: held on a cell nothing will ever set (kept
+        -- reachable below, so the runtime does not end the wait itself).
+        never ← newTVarIO False
+        outcome ← try @SomeException $ runWith env folder $ \_ _ _ → atomically (readTVar never >>= \set → unless set retry)
+        readTVarIO never >>= (`shouldBe` False)
+        either (\failure → show failure) (const "no failure") outcome `shouldSatisfy` isInfixOf "the command ended successfully before the scenario had finished its observations"
+        evidence env "outrun scenario: a command that exited 0 before the scenario's observation could be made failed the example (it was not ended and counted as passed)"
+
+  it "keeps a scenario's own assertion failure when the end of the run races with it, rather than counting the scenario as ended" $
+    within 120 $
+      withSystemTempDirectory "hetoimasia-run-native" $ \folder → do
+        copyTree shippedContent folder
+        quitting folder (\script → Text.replace "api.texture.release(self.image.texture)" "api.texture.release(self.image.texture)\n        api.session.quit()" script)
+        never ← newTVarIO False
+        -- Held until the harness ends it, and then failing on its own account: its assertion is not the end's.
+        outcome ← try @SomeException $
+          runWith env folder $ \_ _ _ →
+            atomically (readTVar never >>= \set → unless set retry)
+              `catch` \(_ ∷ AsyncException) → expectationFailure "the assertion raised while the run was ending"
+        readTVarIO never >>= (`shouldBe` False)
+        either (\failure → show failure) (const "no failure") outcome `shouldSatisfy` isInfixOf "the assertion raised while the run was ending"
+        evidence env "assertion kept: a scenario assertion that failed while the harness was ending it was raised as the example's failure, not replaced by the end"
 
   it "answers busy, nonfatally and with no host capacity fault, when the reachable request and texture reservations are full while the window slot is free, accepts the explicit retry after reclamation, and keeps a second own-window request an ordinary error" $
     within 120 $
@@ -337,23 +365,43 @@ runWithEnding env folder ended beforePublishing scenario = mask $ \restore → d
   scenarioThread ← forkIOWithUnmask $ \unmask → do
     result ← tryWithContext (unmask (do (host, graphics) ← atomically (readTMVar composed); scenario watch host graphics))
     either (const stopRun) pure result
-    -- A scenario this function ended is not a scenario that failed.
+    -- A scenario this function ended before it finished is not a scenario that failed (the cancellation it was
+    -- ended with is not its failure), but its own failure, an assertion above all, is kept even if the end raced
+    -- with it. A scenario that returned is complete: an exception is only delivered while it runs.
     killed ← readIORef killedByUs
-    putMVar finished (if killed then Right () else result)
+    putMVar finished $ case result of
+      Left failure | killed, isAsynchronous failure → Right ()
+      other → other
   let run = runGame setup defaultLogFilter {filterEnabled = False} folder `finally` putMVar ended ()
-      -- Both activities finished: the command (waited for with no bound), and then the scenario, which can no longer
-      -- progress once the command has ended (nothing serves a main-thread job or a frame any more), so it is ended
-      -- and joined. Every cancellation meanwhile is remembered, across the whole sequence, and answered.
-      settle = do
+      -- Both activities finished: the command (waited for with no bound), and then the scenario.
+      --
+      -- A command that ended in success has not ended the scenario: the scenario's last steps (an assertion on
+      -- what the close answered, a read of what was retired) may still be running. So the scenario is given that
+      -- end: it is waited for until it has finished or is blocked, which the runtime reports (nothing serves a
+      -- main-thread job, a frame or a host state any more, so a blocked scenario cannot progress). One that is
+      -- still unfinished then is a command that outran it, and that is a failure of the example, not a pass. A
+      -- command that ended otherwise is not held to this: an unfinished scenario is ended and joined. Every
+      -- cancellation meanwhile is remembered, across the whole sequence, and answered.
+      settle succeeded = do
         stopRun
         first ← rememberingInterruption (void (readMVar ended))
+        when succeeded awaitFinishedOrBlocked
         scenarioDone ← isJust <$> tryReadMVar finished
         unless scenarioDone (writeIORef killedByUs True)
         second ← rememberingInterruption (killThread scenarioThread >> void (readMVar finished))
-        pure (first <|> second)
+        pure (first <|> second, succeeded && not scenarioDone)
+      awaitFinishedOrBlocked = do
+        finishedNow ← isJust <$> tryReadMVar finished
+        status ← threadStatus scenarioThread
+        unless (finishedNow || blocked status) (yield >> awaitFinishedOrBlocked)
+      blocked = \case
+        ThreadBlocked _ → True
+        _ → False
   waitMain ← envStart env run
   statusOutcome ← tryWithContext @SomeException (restore waitMain)
-  interruption ← settle
+  (interruption, outrun) ← settle $ case statusOutcome of
+    Right ExitSuccess → True
+    _ → False
   scenarioOutcome ← readMVar finished
   let scenarioEvidence = [("the scenario", failure) | Left failure ← [scenarioOutcome]]
   case statusOutcome of
@@ -362,6 +410,8 @@ runWithEnding env folder ended beforePublishing scenario = mask $ \restore → d
       traverse_ (\interrupted → rethrowIO =<< combine interrupted scenarioEvidence) interruption
       -- A scenario that failed on its own is the example's failure.
       either rethrowIO pure scenarioOutcome
+      -- And so is a command that ended in success while the scenario still had observations to make.
+      when outrun $ expectationFailure "the command ended successfully before the scenario had finished its observations"
       atomically (tryReadTMVar composed) >>= \case
         Nothing → expectationFailure "the command ended before the adapter was composed" >> error "unreachable"
         Just (host, graphics) → Ran status <$> readTVarIO out <*> pure host <*> pure graphics

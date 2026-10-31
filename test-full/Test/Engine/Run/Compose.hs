@@ -8,13 +8,13 @@ module Test.Engine.Run.Compose (spec) where
 
 import Control.Concurrent (forkIO, myThreadId, threadDelay, throwTo)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Monad (forever, void)
+import Control.Monad (forever, void, when)
 import qualified Data.ByteString as ByteString
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Console.Lua.Signals (Delivery (..))
 import Hetoimasia.LuaEngine.Facade (OutputSink (..))
-import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
 import Control.Exception (AsyncException (UserInterrupt), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, tryWithContext)
 import Data.List (isInfixOf)
 import GHC.Conc (BlockReason (BlockedOnSTM))
@@ -262,6 +262,25 @@ stops = describe "stops and signals" $ do
     -- The failed write is marked as the diagnostics' own, so the lifetime does not flush through that sink, and the
     -- command writes no terminal line through the path that just failed.
     readTVarIO writes >>= (`shouldBe` 1)
+    readTVarIO flushes >>= (`shouldBe` 0)
+    observedReports observed `shouldBe` []
+
+  it "flushes nothing and writes no terminal line, and keeps the session's own status, when the session's sink refuses a diagnostic after a clean start" $ do
+    writes <- newTVarIO (0 :: Int)
+    flushes <- newTVarIO (0 :: Int)
+    -- The resolved-root diagnostic (the first write) is accepted; every later one is refused. The session's writer
+    -- counts the refusals and returns them as data: nothing it does raises.
+    let sink =
+          callbackSinkWith
+            ( \_ -> do
+                written <- atomically (stateTVar writes (\n -> (n, n + 1)))
+                when (written >= 1) (ioError (userError "the diagnostic sink broke after its first write"))
+            )
+            (atomically (modifyTVar' flushes (+ 1)))
+        logger = mkLogger defaultLogFilter sink
+    observed <- observeWith unchanged {changeLogger = Just logger} [("hetoimasia.json", commonManifest), ("main.lua", lua (entry (logic <> quittingUi)))] (\_ -> pure ())
+    observedStatus observed `shouldBe` ExitSuccess
+    -- The lifetime was told the path had failed, so it did not flush through it.
     readTVarIO flushes >>= (`shouldBe` 0)
     observedReports observed `shouldBe` []
 

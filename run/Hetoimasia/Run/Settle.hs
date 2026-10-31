@@ -7,6 +7,9 @@
 --   failures, with their context, and lets an asynchronous exception go on ('isAsynchronous').
 -- * A diagnostic that cannot be written must not replace what it reports ('bestEffort'), and its failure is marked
 --   as the diagnostics' own ('diagnostic').
+-- * A write to the diagnostic path that fails while something else is being unwound is /recorded on the logging
+--   lifetime/ ('reportDiagnostic'), never dropped: the lifetime then knows that path has failed, flushes nothing
+--   through it, and the launcher writes nothing more through it ('pathFailed').
 -- * Several failures that belong together are combined with the cleanup machinery's own evidence, so none
 --   is lost ('combine').
 module Hetoimasia.Run.Settle
@@ -16,6 +19,9 @@ module Hetoimasia.Run.Settle
   , isAsynchronous
   , bestEffort
   , diagnostic
+  , reportDiagnostic
+  , notePathFailure
+  , pathFailed
   , combine
   ) where
 
@@ -27,11 +33,13 @@ import Control.Exception
   , rethrowIO
   , tryWithContext
   )
+import Control.Monad (unless)
 import Data.Foldable (traverse_)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Hetoimasia.Foundation.Resource (composeCleanup)
-import Hetoimasia.Runtime.Reporting (markDiagnostic)
+import Hetoimasia.Runtime.Logging (LoggingLifetime, recordReport, recordedReports)
+import Hetoimasia.Runtime.Reporting (ReportResult (ReportFailed), markDiagnostic)
 
 -- | Whether a caught failure is an asynchronous exception (a cancellation).
 isAsynchronous ∷ ExceptionWithContext SomeException → Bool
@@ -71,6 +79,28 @@ bestEffort action = () <$ attemptSync action
 -- lifetime that sees it knows that path has failed and does not flush through it again.
 diagnostic ∷ IO a → IO a
 diagnostic = markDiagnostic
+
+-- | Whether a write to the lifetime's diagnostic path has already failed.
+pathFailed ∷ LoggingLifetime → IO Bool
+pathFailed lifetime = any failed <$> recordedReports lifetime
+  where
+    failed = \case
+      ReportFailed _ → True
+      _ → False
+
+-- | Record that the diagnostic path has failed, once: the first failure is the evidence the lifetime keeps.
+notePathFailure ∷ LoggingLifetime → ExceptionWithContext SomeException → IO ()
+notePathFailure lifetime failure = do
+  already ← pathFailed lifetime
+  unless already (recordReport lifetime (ReportFailed failure))
+
+-- | A write to the diagnostic path, made while a failure is being unwound and so not allowed to replace it: skipped
+-- when the path has already failed; otherwise run, marked, and when it fails synchronously the failure is recorded
+-- on the lifetime instead of being raised. A cancellation still goes on.
+reportDiagnostic ∷ LoggingLifetime → IO () → IO ()
+reportDiagnostic lifetime write = do
+  already ← pathFailed lifetime
+  unless already (attemptSync (markDiagnostic write) >>= either (notePathFailure lifetime) pure)
 
 -- | A primary failure with these further failures retained beside it, each under its label, as the cleanup
 -- machinery retains evidence: none is lost, and the primary keeps its type, value and context.
