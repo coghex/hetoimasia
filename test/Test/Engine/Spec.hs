@@ -9,10 +9,14 @@
 -- @hetoimasia-foundation:foundation-tests@, the runtime's by
 -- @hetoimasia-runtime:runtime-tests@, and GLFW's headless examples by
 -- @hetoimasia-glfw:glfw-tests@, not here.
+--
+-- The full-product build adds the @Run@ group ('Test.Engine.Variant.variantSpec'); the default and CPU builds
+-- add nothing, so the console examples are the same in every build.
 module Test.Engine.Spec (spec) where
 
 import qualified Test.Engine.Console.Spec as Console
+import qualified Test.Engine.Variant as Variant
 import Test.Hspec (Spec)
 
 spec ∷ Spec
-spec = Console.spec
+spec = Console.spec >> Variant.variantSpec

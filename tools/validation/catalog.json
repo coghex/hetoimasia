@@ -436,7 +436,7 @@
     },
     {
       "id": "test.vulkan-headless",
-      "description": "Vulkan-linked headless Hspec contracts, executed rather than only built, through cabal.project.vulkan against the provisioned native prefix: the native backend's profile and roots decisions over a stand-in native layer (native-tests), its shader contract against the provisioned compiler (shader-tests), the window integration's controller over the GLFW package's scripted seam (integration-tests), the triangle sample's pipeline cache over stand-in builders (triangle-tests), the sprites sample's scene, probe oracle, fixtures and PNG writer (sprites-tests), the scene3d sample's scene, cameras built with the math package, independent probe oracle and PNG writer (scene3d-tests), the Lua-first engine's graphics adapter over an injected owner and completion boundary (lua-engine-graphics-tests): every stage of a texture request withheld in turn, cancellation and instance end at each boundary, faults that keep their severity, native pressure, release and retirement, the end of its scope, the native configuration the fixed M1 profile maps to and the composition with the real read pool, decoder, pipeline and a real Lua owner, and its window provider (LFE-18) over a gated port in the same composition: the title and size rules, admission and its banks, creation, attachment and the owner's admission held separately, cancellation, instance end, close routing and failures, none of which opens a window, and its scene publication (LFE-20) over the same composition: the hold ledger and its adoption multiplicity, the hold-gated release of a published texture, the six-revision limit, the release lane's pressure, the windows a release barrier names, the publication boundary's authority, refusals and gates through real Lua instances, and the frame of an adopted scene built from the frame's own metrics against the render-2d oracle, and the 2D renderer's Vulkan recorder over a stand-in native layer (render-2d-vulkan-tests): the scissor rule against viewportContains, the push-constant packing, the attribute descriptions against the 64-byte instance layout, the sampler-choice mapping, the pure frame work of targets, metrics, mappings and scissors, and the recorded command order, the drawing-order instance bytes at their ring offsets, mixed samplers in one draw, empty scissors recording no draw, pipelines per format, and the refusals of an unknown target, invalid or disagreeing metrics, an unmappable view and a full ring, none of which records a clear or a draw. None acquires a display, a GLFW session, or a device, and none reads desktop consent; the headers and loader are build and link prerequisites only.",
+      "description": "Vulkan-linked headless Hspec contracts, executed rather than only built, through cabal.project.vulkan against the provisioned native prefix: the native backend's profile and roots decisions over a stand-in native layer (native-tests), its shader contract against the provisioned compiler (shader-tests), the window integration's controller over the GLFW package's scripted seam (integration-tests), the triangle sample's pipeline cache over stand-in builders (triangle-tests), the sprites sample's scene, probe oracle, fixtures and PNG writer (sprites-tests), the scene3d sample's scene, cameras built with the math package, independent probe oracle and PNG writer (scene3d-tests), the Lua-first engine's graphics adapter over an injected owner and completion boundary (lua-engine-graphics-tests): every stage of a texture request withheld in turn, cancellation and instance end at each boundary, faults that keep their severity, native pressure, release and retirement, the end of its scope, the native configuration the fixed M1 profile maps to and the composition with the real read pool, decoder, pipeline and a real Lua owner, and its window provider (LFE-18) over a gated port in the same composition: the title and size rules, admission and its banks, creation, attachment and the owner's admission held separately, cancellation, instance end, close routing and failures, none of which opens a window, and its scene publication (LFE-20) over the same composition: the hold ledger and its adoption multiplicity, the hold-gated release of a published texture, the six-revision limit, the release lane's pressure, the windows a release barrier names, the publication boundary's authority, refusals and gates through real Lua instances, and the frame of an adopted scene built from the frame's own metrics against the render-2d oracle, and the 2D renderer's Vulkan recorder over a stand-in native layer (render-2d-vulkan-tests): the scissor rule against viewportContains, the push-constant packing, the attribute descriptions against the 64-byte instance layout, the sampler-choice mapping, the pure frame work of targets, metrics, mappings and scissors, and the recorded command order, the drawing-order instance bytes at their ring offsets, mixed samplers in one draw, empty scissors recording no draw, pipelines per format, and the refusals of an unknown target, invalid or disagreeing metrics, an unmappable view and a full ring, none of which records a clear or a draw. None acquires a display, a GLFW session, or a device, and none reads desktop consent; the headers and loader are build and link prerequisites only., and the root package's full-product suite (hetoimasia-tests, LFE-22) through the same project: the console examples the default build runs, and the Run group of the generic `hetoimasia run GAME_ROOT` command, none of which acquires a native session: the command grammar as direct examples of a pure function (the folder as typed, the separator taking the next argument literally, --help alone, every missing, extra and unknown-option form with its escaped one-line reason), the exit status as a pure function of what the run came to (a failure outranking an interruption outranking a normal end in every combination), the composition over real temporary folders with real content, filtered Lua VMs, the module and data services, the read pool and the session coordinator and no graphics (the default pair on a common entry, explicit separate entries in the reverse order, each one-role variant, an invalid second behavior starting neither init, an init that raises, an error after a quit, the unavailable-state guard, an ordinary logical failure leaving a healthy UI running with its later quit still 1, a failing output sink, and every boot refusal with a script that would have printed and did not: a missing or malformed manifest, an unknown field, a missing or invalid declared entry, a symbolic link in the scanned folder and a manifest changed between its read and the scan), one signal stopping in order and exiting 130, the force action called at most once however many signals arrive, a failure after the stop outranking it, and a signal abandoning the boot work with nothing authored run; the signal handlers' scope restoring what was in force; the built executable's usage errors (2, with nothing on stdout), its help, its boot refusals (1, reaching no graphics) and the fatal logging configuration ahead of the dispatch; and the suite's own binary as a child running the command's real composition under real SIGTERM and SIGINT (orderly stop with the scripts' shutdown output, exit 130) and a second signal of either kind leaving at once with 130 while a stuck cleanup never runs. The shipped content and the root application's sources are among its inputs.",
       "command": [
         "bash",
         "tools/vulkan/run.sh",
@@ -449,7 +449,8 @@
         "hetoimasia-sample-image2d:test:image2d-tests",
         "hetoimasia-sample-scene3d:test:scene3d-tests",
         "hetoimasia-render-2d-vulkan:test:render-2d-vulkan-tests",
-        "hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests"
+        "hetoimasia-lua-engine-graphics:test:lua-engine-graphics-tests",
+        "hetoimasia:test:hetoimasia-tests"
       ],
       "component": "hetoimasia-gpu-vulkan-glfw:test:integration-tests",
       "inputs": [
@@ -476,7 +477,22 @@
         "tools/native/",
         "tools/toolchain/binding.pin",
         "tools/test-support/",
-        "tools/vulkan/"
+        "tools/vulkan/",
+        "hetoimasia.cabal",
+        "app/",
+        "app-cpu/",
+        "app-full/",
+        "console/",
+        "run/",
+        "test/",
+        "test-cpu/",
+        "test-full/",
+        "samples/lua-quad/",
+        "packages/runtime/",
+        "packages/foundation/",
+        "packages/gpu-vulkan/glfw/",
+        "packages/gpu-vulkan/diagnostics/",
+        "packages/gpu-vulkan/model/"
       ],
       "framework": "hspec",
       "runner": "cpu",
@@ -631,6 +647,70 @@
       "optional": false
     },
     {
+      "id": "test.vulkan-run-native",
+      "description": "The generic `hetoimasia run GAME_ROOT` command on a real device with real windows (LFE-22): the command's production composition, run through `Hetoimasia.Run.runGame` over the production native graphics with an observation that only reads, on the main thread's owner loop with Hspec on another thread, over an unchanged copy of the shipped `samples/lua-quad/content` and finite temporary variants of it. The shipped content's accepted scene is adopted by the owner, recorded again after Lua's immediate release with its texture held by the adopted scene and with no second publication, and a genuine native close, delivered on the main thread through the platform by the test-only driver (a real WM_DELETE_WINDOW on X11, performClose: on macOS), stops the session in order: exit 0, the window destroyed and the texture proved retired; a script that quits right after publishing and releasing also exits 0 with everything retired; a required texture that cannot be read exits 1 with the window it had been given destroyed and nothing live. And the built full-product `hetoimasia run` command, named by the runner in HETOIMASIA_RUN_EXECUTABLE so an executable of another profile on PATH is never launched, is started as a child of the suite against an unchanged owned copy of the shipped content and, after the existing resolved-root diagnostic has been observed (a concrete startup barrier after the signal handlers are installed, bounded rather than slept), sent exactly one SIGTERM to that child's pid: it must leave by itself within the bound with exit 130 and no error entry, a session that had started reporting failures=0 and VerdictInterrupted; a watchdog rescue, a second signal, a forced termination or missing cleanup is a failure. The child is killed and reaped on every way out. This is a launch and lifetime smoke check: no screen is captured and no window is read back, so it does not show the quad displayed. The supervised native close of the actual command (exit 0) is the local macOS run and its Linux native close is LFE-25's; offscreen pixels are LFE-24's. The suite reads the run's consent once, before anything native, refuses without it, and runs a nonzero number of examples (an empty selection fails). It writes its evidence record into the group's evidence directory. Its executable and the full `hetoimasia` executable are built in a separate preparation stage; its native execution is measured alone under a 30-second watchdog. On Linux the command starts its own isolated X11 display; on macOS it needs the desktop opt-in on its own command, given under the owner's standing approval for runs an issue or pull request needs, and its windows appear on the desktop for the length of the run.",
+      "command": [
+        "bash",
+        "tools/vulkan/run.sh",
+        "native",
+        "hetoimasia:test:run-native-tests",
+        "--",
+        "--complete"
+      ],
+      "preparation": {
+        "command": [
+          "bash",
+          "tools/vulkan/run.sh",
+          "build",
+          "hetoimasia:exe:hetoimasia",
+          "hetoimasia:test:run-native-tests"
+        ],
+        "timeout_seconds": 3600
+      },
+      "component": "hetoimasia:test:run-native-tests",
+      "inputs": [
+        "cabal.project.common",
+        "cabal.project.vulkan",
+        "packages/lua-engine-graphics/",
+        "packages/lua-engine/",
+        "packages/scripting-lua/",
+        "packages/content/",
+        "packages/asset/",
+        "packages/asset-image/",
+        "packages/render-2d-vulkan/",
+        "packages/render-2d/",
+        "packages/render-2d-oracle/",
+        "packages/render-api/",
+        "packages/math/",
+        "packages/gpu-vulkan/native/",
+        "packages/gpu-vulkan/glfw/",
+        "packages/gpu-vulkan/model/",
+        "packages/gpu-vulkan/diagnostics/",
+        "packages/glfw/",
+        "packages/runtime/",
+        "packages/foundation/",
+        "tools/ci-image/",
+        "tools/display/",
+        "tools/native/",
+        "tools/toolchain/binding.pin",
+        "tools/test-support/",
+        "tools/vulkan/",
+        "hetoimasia.cabal",
+        "app/",
+        "app-cpu/",
+        "app-full/",
+        "console/",
+        "run/",
+        "run-native-test/",
+        "samples/lua-quad/"
+      ],
+      "framework": "hspec",
+      "runner": "display",
+      "timeout_seconds": 30,
+      "category": "test",
+      "optional": false
+    },
+    {
       "id": "test.workflow",
       "description": "Hspec examples driving the documentation landing helper, this planner and runner, the CI image builder, and the native recipe helper against temporary Git repositories; the quruntul adapter's agreement with this catalog; and the boundary that keeps the Vulkan project out of the mandatory floor, holds its three groups to their commands and routing, and holds the compatibility summary to the retained records it quotes.",
       "command": [
@@ -677,7 +757,10 @@
         "packages/render-2d-vulkan/test/Main.hs",
         "packages/lua-engine-graphics/hetoimasia-lua-engine-graphics.cabal",
         "packages/lua-engine-graphics/test/Main.hs",
-        "packages/lua-engine-graphics/native-test/Test/LuaEngine/Graphics/Native/Session.hs"
+        "packages/lua-engine-graphics/native-test/Test/LuaEngine/Graphics/Native/Session.hs",
+        "test/Main.hs",
+        "run-native-test/Main.hs",
+        "hetoimasia.cabal"
       ],
       "framework": "hspec",
       "runner": "cpu",

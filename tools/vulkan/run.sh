@@ -11,8 +11,8 @@
 # the window integration package, or turns the GLFW package's Vulkan interop
 # component on — so an ordinary `cabal build all`, with either of the other two
 # project files, neither resolves nor links the Vulkan binding. The validation
-# groups `test.vulkan-headless`, `test.vulkan-native`, `test.vulkan-wayland` and
-# `test.vulkan-lua-engine-native` run through it.
+# groups `test.vulkan-headless`, `test.vulkan-native`, `test.vulkan-wayland`,
+# `test.vulkan-lua-engine-native` and `test.vulkan-run-native` run through it.
 #
 # `build` compiles the named components, and nothing else. `test.vulkan-native`
 # and `test.vulkan-wayland` run it as their preparation stage, so the
@@ -23,7 +23,8 @@
 # native backend's `native-tests` and `shader-tests`, the window integration's
 # `integration-tests`, the samples' suites and the 2D renderer's recorder's
 # `render-2d-vulkan-tests` and the Lua-first engine's graphics adapter's
-# `lua-engine-graphics-tests` through it: none of them opens a window,
+# `lua-engine-graphics-tests` through it, and the root package's full-product `hetoimasia-tests` (the `run`
+# command's grammar, composition and boot refusals, none of which starts a native session): none of them opens a window,
 # acquires a display or a session, or creates a device, and none reads consent.
 # Every argument after `--` reaches every suite as a test option.
 #
@@ -293,8 +294,13 @@ roots = ["tools/vulkan", "tools/native", "tools/display",
          "packages/render-2d-vulkan", "packages/render-2d", "packages/render-api",
          "packages/render-2d-oracle", "packages/asset", "packages/asset-image",
          "packages/lua-engine-graphics", "packages/lua-engine", "packages/scripting-lua",
-         "packages/content"]
-files = ["cabal.project.vulkan", "cabal.project.common",
+         "packages/content",
+         # The root package's own inputs, named one by one: the root directory itself is never a root here,
+         # because it would hash dist-vulkan and every other generated output. These are the entry point, its
+         # two build variants, the private console and run libraries, the root suites and the shipped content.
+         "app", "app-cpu", "app-full", "console", "run", "test", "test-cpu", "test-full",
+         "run-native-test", "samples/lua-quad"]
+files = ["cabal.project.vulkan", "cabal.project.common", "hetoimasia.cabal",
          "tools/toolchain/binding.pin", "tools/ci-image/toolchain.pin"]
 
 def carried(path):
@@ -339,6 +345,24 @@ DIGEST
       || refuse "Cabal could not name the executable of ${components[0]}"
     [ -x "$executable" ] \
       || refuse "${components[0]} has not been built; prepare it with: bash tools/vulkan/run.sh build ${components[0]}"
+
+    # The launcher's native suite starts the built full-product command as a child. That executable is named here,
+    # from this same project and build directory, so a `hetoimasia` of another profile that happens to be on PATH can
+    # never be the one launched, and nothing is built during the timed execution: a command that was not built
+    # is refused. The suite is recognized by the executable Cabal resolves for the component asked for, not by how
+    # the component was spelled (`hetoimasia:test:run-native-tests`, `hetoimasia:run-native-tests`, `run-native-tests`
+    # and so on all resolve to it), and any value inherited from the caller is dropped first, so no other component
+    # and no stale environment can reach it.
+    unset HETOIMASIA_RUN_EXECUTABLE
+    run_native_suite="$(cabal list-bin -v0 "${cabal_flags[@]}" hetoimasia:test:run-native-tests 2>/dev/null || true)"
+    if [ -n "$run_native_suite" ] && [ "$executable" = "$run_native_suite" ]; then
+      run_executable="$(cabal list-bin -v0 "${cabal_flags[@]}" hetoimasia:exe:hetoimasia)" \
+        || refuse "Cabal could not name the full-product hetoimasia executable"
+      [ -x "$run_executable" ] \
+        || refuse "the full-product hetoimasia executable has not been built; prepare it with: bash tools/vulkan/run.sh build hetoimasia:exe:hetoimasia hetoimasia:test:run-native-tests"
+      export HETOIMASIA_RUN_EXECUTABLE="$run_executable"
+      echo "vulkan: launched executable $HETOIMASIA_RUN_EXECUTABLE"
+    fi
 
     if [ -z "${HETOIMASIA_NATIVE_SESSION:-}" ] && [ "$(uname -s)" = "Linux" ]; then
       # No consent of its own on Linux: the isolated display is started for
