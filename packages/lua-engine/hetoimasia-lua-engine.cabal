@@ -357,6 +357,12 @@ test-suite lua-engine-tests
         Test.LuaEngine.Facade.Support
         Test.LuaEngine.Facade.Validation
         Test.LuaEngine.Facade.Waits
+        Test.LuaEngine.Integrated.Capacity
+        Test.LuaEngine.Integrated.Instances
+        Test.LuaEngine.Integrated.Jobs
+        Test.LuaEngine.Integrated.Roles
+        Test.LuaEngine.Integrated.Spec
+        Test.LuaEngine.Integrated.Support
         Test.LuaEngine.Loader
         Test.LuaEngine.Manifest.Examples
         Test.LuaEngine.Manifest.Schema
