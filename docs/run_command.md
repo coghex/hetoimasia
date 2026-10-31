@@ -162,7 +162,10 @@ diagnostic that cannot be written never replaces what it reports.
   flush through it, and the command writes no terminal line through it; the first failure is kept as evidence beside the primary failure and
   the status is not changed by it. No snapshot of the session, finalizer or join is the source of that fact, and nothing waits for one. The
   refusal is still raised to the writer that met it (the session counts it in its own evidence), and a cancellation is never recorded as one.
-  The capture of a refusal and its recording are one masked step (only the sink operation itself runs with the caller's interruptibility), so
+  Every write and flush goes through one serialization point shared by all writers (the session's diagnostics writer, a drain, a
+  terminal reporter, the finalizer): the check of the path, the sink operation and the recording of a refusal are a single step per writer,
+  so a writer that queued behind a failing write finds the path failed when its turn comes and never touches the sink; the wait and the
+  write stay interruptible. The capture of a refusal and its recording are one masked step (only the sink operation itself runs with the caller's interruptibility), so
   a cancellation queued while the sink was throwing cannot land before the record exists.
 * **The launcher's rule for a caught failure.** Wherever a failure is caught and something is owed after it (recording, joining, releasing,
   answering a waiter, reporting), the capture and the handling are one masked step and the continuation does not resume unmasked; only the
@@ -203,8 +206,9 @@ qualification are separate).
 
 The actual command's native close is covered per platform, and the split is part of the acceptance:
 
-* **macOS, supervised** (required, run by the owner at the head under review): the launch and lifetime smoke of the real command. A
-  person closes its window and the exit status must be 0.
+* **macOS, supervised** (required once, at the head the review approves, before the merge; owner amendment
+  https://github.com/coghex/hetoimasia/issues/537#issuecomment-6547003833): the launch and lifetime smoke of the real command. A person
+  closes its window and the exit status must be 0.
 
   ```sh
   HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia:exe:hetoimasia -- run samples/lua-quad/content
