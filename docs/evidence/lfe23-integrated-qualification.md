@@ -44,7 +44,7 @@ spawning", D-77) and which the approving review names as a prerequisite capabili
 that package's own test suite alone and reachable from no manifest, Lua or other package. These groups use nothing else of the
 harness: they place no probe point (`Dispatched`, `GrantIntent` and the rest), set no tick base and remove no protection; every
 gate they hold is a Lua-side wait on a gated read at the pool's reader, a parked line of authored output, or a clock they move.
-If a reader holds that even `harnessSecond` is out of bounds for this slice, the examples that use it (twelve of the
+If a reader holds that even `harnessSecond` is out of bounds for this slice, the examples that use it (ten of the
 `Roles` group) reduce to one UI instance, and the second-instance session scenarios become a window recorded here and
 reported to the manager; the facade-level two-instance groups are unaffected.
 
