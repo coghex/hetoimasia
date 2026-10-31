@@ -41,7 +41,7 @@ import Control.Exception
   , try
   , tryWithContext
   )
-import Control.Concurrent.MVar (MVar, putMVar)
+import Control.Concurrent.MVar (MVar, newMVar, putMVar, withMVar)
 import Control.Monad (unless, when)
 import Data.Foldable (traverse_)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
@@ -129,20 +129,28 @@ reportDiagnostic = bestEffort . diagnostic
 withRecordingLifetime ∷ LogFilter → LogSink → (LoggingLifetime → IO r) → IO r
 withRecordingLifetime configuration sink use = do
   held ← newIORef Nothing
-  withLoggingLifetime (mkLogger configuration (recordingSink held sink)) $ \lifetime → do
+  lock ← newMVar ()
+  withLoggingLifetime (mkLogger configuration (recordingSink lock held sink)) $ \lifetime → do
     writeIORef held (Just lifetime)
     use lifetime
 
 -- | A sink that records its first refusal on the lifetime in the cell, once there is one, and refuses everything
 -- after it. See 'withRecordingLifetime'.
-recordingSink ∷ IORef (Maybe LoggingLifetime) → LogSink → LogSink
-recordingSink held sink = callbackSinkWith (guarded . writeEntry sink) (guarded (flushSink sink))
+recordingSink ∷ MVar () → IORef (Maybe LoggingLifetime) → LogSink → LogSink
+recordingSink lock held sink = callbackSinkWith (guarded . writeEntry sink) (guarded (flushSink sink))
   where
+    -- /One serialization point for every writer/: the check of the path, the sink operation and the recording of its
+    -- refusal are a single step per writer, taken under one lock shared by every write and flush of the sink. A
+    -- writer that queued behind another one finds, when its turn comes, what the one before it found: a path that
+    -- failed is never touched again, whoever the writer is (the session's diagnostics writer, a drain, a terminal
+    -- reporter, the finalizer). The wait for the lock and the sink operation itself stay interruptible; a
+    -- cancellation while waiting records nothing, since nothing was attempted, and the lock is released on every
+    -- exit ('withMVar').
     -- One masked step from the capture of the refusal to its recording: only the sink operation itself runs with
     -- the caller's interruptibility restored. A caught failure's continuation does not resume unmasked, so a
     -- cancellation queued while the sink was throwing cannot land before the refusal has been recorded; it is
     -- delivered after, when the step ends.
-    guarded action = mask $ \restore → do
+    guarded action = withMVar lock $ \_ → mask $ \restore → do
       lifetime ← readIORef held
       already ← maybe (pure False) pathFailed lifetime
       when already (ioError (userError "the diagnostic path has already failed"))

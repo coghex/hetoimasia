@@ -363,3 +363,37 @@ spec = describe "Serve" $ do
     bounded (takeMVar result) >>= \case
       Left (ExceptionWithContext _ failure) → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
       Right () → expectationFailure "the cancellation was swallowed"
+
+  it "refuses a writer that queued behind a failing write without touching the sink or flushing it" $ do
+    calls ← newTVarIO (0 ∷ Int)
+    flushes ← newTVarIO (0 ∷ Int)
+    inside ← newEmptyMVar
+    release ← newEmptyMVar
+    doneA ← newEmptyMVar
+    doneB ← newEmptyMVar
+    let component = unsafeComponent "run.test"
+        write _ = do
+          firstCall ← atomically (stateTVar calls (\n → (n == 0, n + 1)))
+          -- The first write is held inside the sink, and then fails; any other call would succeed.
+          when firstCall $ do
+            putMVar inside ()
+            takeMVar release
+            ioError (userError "the diagnostic sink broke")
+        sink = callbackSinkWith write (atomically (modifyTVar' flushes (+ 1)))
+    recorded ← withRecordingLifetime defaultLogFilter sink $ \lifetime → do
+      let say name = tryWithContext @SomeException (logInfo (lifetimeLogger lifetime) component name [])
+      writerA ← forkIO (say "a" >>= putMVar doneA)
+      takeMVar inside
+      -- A second writer arrives while the first is inside the sink: it must wait its turn, not pass the check.
+      writerB ← forkIO (say "b" >>= putMVar doneB)
+      blockedFor BlockedOnMVar writerB
+      putMVar release ()
+      void (bounded (takeMVar doneA))
+      refused ← bounded (takeMVar doneB)
+      -- It found the path failed when its turn came: refused, without a call.
+      either (const (pure ())) (const (expectationFailure "the queued writer's write was accepted")) refused
+      _ ← pure writerA
+      pathFailed lifetime
+    recorded `shouldBe` True
+    readTVarIO calls >>= (`shouldBe` 1)
+    readTVarIO flushes >>= (`shouldBe` 0)
