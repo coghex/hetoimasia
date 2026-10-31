@@ -162,6 +162,13 @@ diagnostic that cannot be written never replaces what it reports.
   flush through it, and the command writes no terminal line through it; the first failure is kept as evidence beside the primary failure and
   the status is not changed by it. No snapshot of the session, finalizer or join is the source of that fact, and nothing waits for one. The
   refusal is still raised to the writer that met it (the session counts it in its own evidence), and a cancellation is never recorded as one.
+  The capture of a refusal and its recording are one masked step (only the sink operation itself runs with the caller's interruptibility), so
+  a cancellation queued while the sink was throwing cannot land before the record exists.
+* **The launcher's rule for a caught failure.** Wherever a failure is caught and something is owed after it (recording, joining, releasing,
+  answering a waiter, reporting), the capture and the handling are one masked step and the continuation does not resume unmasked; only the
+  guarded operation runs with the caller's interruptibility restored, and a cancellation is remembered or handed on, never swallowed. Every
+  such site in `run/` and in the native harness was audited against this (the list is in the pull request), and a best-effort write ignores
+  a failure to write but not a cancellation.
 * **Typed failures are never reduced to the first of several.** The content layer keeps a failure beside another (a descriptor that would
   not close after a read failed) in the exception's context. Wherever the launcher turns such a failure into text (the root refusal and
   the manifest read in `Boot`, the final failure line in `Run`), it does so from the failure *with its context* (`withEvidence`), so the
