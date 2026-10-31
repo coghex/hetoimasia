@@ -215,7 +215,11 @@ The actual command's native close is covered per platform, and the split is part
   ```
 
   It is not a catalog example and not an unattended routine test: nothing in this repository closes another process's window.
-  The command, the clean revision, the platform and the exit status are recorded with the pull request.
+  The record, in the pull request body once the review has approved the head and before the merge, carries: the command, the platform,
+  the exit status, the runner's `repository revision` and `source digest` lines (clean, with no dirty suffix) for that approved head, and the
+  existing `session stopping` and `session ended` stderr diagnostics quoted from the run (`quit=true`, `failures=0`,
+  `verdict=VerdictSuccess`). All of the suite's other requirements (the `run-native-tests` examples, the Linux SIGTERM/130 run, the macOS
+  native suite and green CI) stand beside it.
 * **Linux**: the library-composed `run-native-tests` case delivers a real in-process `WM_DELETE_WINDOW` through the existing native close
   driver (exit 0), and the built command is started on the isolated X11 display and sent exactly one SIGTERM (exit 130). The actual
   command's native close on Linux needs cross-process tooling that does not exist and is **LFE-25's**; none is added here.
