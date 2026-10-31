@@ -284,6 +284,28 @@ stops = describe "stops and signals" $ do
     readTVarIO flushes >>= (`shouldBe` 0)
     observedReports observed `shouldBe` []
 
+  it "flushes nothing and writes no terminal line when the session's sink refused a diagnostic and a cleanup around the session then fails" $ do
+    writes <- newTVarIO (0 :: Int)
+    flushes <- newTVarIO (0 :: Int)
+    let sink =
+          callbackSinkWith
+            ( \_ -> do
+                written <- atomically (stateTVar writes (\n -> (n, n + 1)))
+                when (written >= 1) (ioError (userError "the diagnostic sink broke after its first write"))
+            )
+            (atomically (modifyTVar' flushes (+ 1)))
+        logger = mkLogger defaultLogFilter sink
+    -- The session returned an outcome that carries the refusal, and a scope around it then fails to clean up: the
+    -- refusal was recorded where the outcome was produced, before that cleanup could report or flush.
+    observed <-
+      observeWith
+        unchanged {changeLogger = Just logger, changeAfterLaunch = ioError (userError "a cleanup around the session failed")}
+        [("hetoimasia.json", commonManifest), ("main.lua", lua (entry (logic <> quittingUi)))]
+        (\_ -> pure ())
+    observedStatus observed `shouldBe` ExitFailure 1
+    readTVarIO flushes >>= (`shouldBe` 0)
+    observedReports observed `shouldBe` []
+
   it "writes one terminal line, and flushes once, for an ordinary failure with a working diagnostic path" $ do
     flushes ← newTVarIO (0 ∷ Int)
     let sink = callbackSinkWith (\_ → pure ()) (atomically (modifyTVar' flushes (+ 1)))

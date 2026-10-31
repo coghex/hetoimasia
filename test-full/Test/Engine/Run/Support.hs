@@ -102,10 +102,13 @@ data Changes = Changes
   -- ^ The logger the logging lifetime is made over, instead of stderr's: one the example counts and breaks.
   , changeLink ∷ Maybe (IO SessionLink)
   -- ^ How the command makes its link to the session: one whose diagnostics writer the example holds.
+  , changeAfterLaunch ∷ IO ()
+  -- ^ Done once the session has returned its outcome and before the launch itself returns: where a cleanup of the
+  -- scopes around the session fails, made on demand.
   }
 
 unchanged ∷ Changes
-unchanged = Changes id (\_ → pure ()) (\_ → noBootHooks) Nothing Nothing
+unchanged = Changes id (\_ → pure ()) (\_ → noBootHooks) Nothing Nothing (pure ())
 
 -- | A filter that writes nothing, so a failing run does not fill the suite's own stderr.
 quietFilter ∷ LogFilter
@@ -161,7 +164,7 @@ observeWith changes files scenario = withFolder files $ \folder → do
               Nothing -> withHandleLoggingLifetime configuration stderr
           , setupLink = fromMaybe newSessionLink (changeLink changes)
           , setupReport = \line -> atomically (modifyTVar' reports (<> [line]))
-          , setupLaunch = launchWithout environment
+          , setupLaunch = \lifetime stop link prepared → launchWithout environment lifetime stop link prepared <* changeAfterLaunch changes
           }
       probe =
         Probe

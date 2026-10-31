@@ -41,7 +41,6 @@ module Hetoimasia.Run.Session
   , newSessionLinkEndingWith
   , awaitDiagnostics
   , joinDiagnostics
-  , noteSessionDiagnostics
   , ioQueueSlots
   , textureJobs
   , runPrepared
@@ -257,9 +256,13 @@ runPrepared environment lifetime stop link prepared graphics hook =
                   thread ← forkIO (atomically (stop >>= check) >> requestStop session StopInterrupt)
                   writeIORef forwarder (Just thread)
               endForwarder = readIORef forwarder >>= mapM_ killThread
-          runSession spec callback `finally` endForwarder
+          -- The session's refused diagnostics are recorded here, where they are produced: the outcome is in hand
+          -- while every scope the session used is still open, so no cleanup that fails later can come first.
+          outcome ← runSession spec callback `finally` endForwarder
+          noteSessionDiagnostics lifetime outcome
+          pure outcome
 
--- | Carry the session's own diagnostic-sink failures into the logging lifetime. The session's writer counts the
+-- | Carry the session's own diagnostic-sink failures into the logging lifetime, at the point the outcome exists. The session's writer counts the
 -- writes its sink refused and returns them as data in the outcome; they raise nothing. Left there, the lifetime
 -- would finish normally and flush the very sink that failed. Recording the first of them as a failed report makes
 -- the lifetime skip that flush and the launcher write nothing more through the path. A session that lost nothing

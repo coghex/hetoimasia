@@ -17,6 +17,10 @@
 --   at all, so a cancellation already pending when the loop is entered lands inside the guard and stops the
 --   session like any other failure of the loop. There is no point between the thread's creation and that guard
 --   at which a cancellation can escape.
+-- * The application that owns the loop is itself run in one masked step ('runOwned'): whatever ends it, the
+--   capture of its failure, the stop of the session, the join and the evidence are one sequence in which a
+--   cancellation is only /remembered/, never allowed to leave the sequence. A caught failure's continuation does
+--   not resume unmasked.
 -- * When the loop ends because the session ended, the session's own result (or failure, with its context) is the
 --   answer.
 -- * When the loop /fails/ (or the main thread is cancelled in it), the session is asked to stop and the owner is
@@ -34,6 +38,7 @@ module Hetoimasia.Run.Serve
   ( Owner (..)
   , Spawned
   , serveSpawned
+  , runOwned
   , joinFailure
   , drainAttempts
   ) where
@@ -43,12 +48,12 @@ import Control.Concurrent (forkIOWithUnmask)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryReadMVar)
 import Control.Exception (ExceptionWithContext, SomeException, displayException, mask, rethrowIO, tryWithContext)
 import Control.Monad (unless, void)
-import Data.IORef (IORef, atomicModifyIORef', newIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Maybe (isJust)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Log (Component, logError, unsafeComponent)
 import Hetoimasia.Run.Output (reportText)
-import Hetoimasia.Run.Settle (attemptSync, combine, reportDiagnostic, rememberingInterruption)
+import Hetoimasia.Run.Settle (attemptSync, bestEffort, combine, reportDiagnostic, rememberingInterruption)
 import Hetoimasia.Runtime.Logging (LoggingLifetime, lifetimeLogger)
 
 -- | What the main thread serves.
@@ -115,8 +120,9 @@ serve restore lifetime owner stopSession turn spawned = do
           atomicModifyIORef' (spawnedAttached spawned) (const (True, ()))
           either rethrowIO pure outcome
     Left failure → do
-      stopSession
-      drained ← rememberingInterruption (drain over)
+      stopped ← stopRemembering stopSession
+      drainedSo ← rememberingInterruption (drain over)
+      let drained = stopped <|> drainedSo
       settled ← over
       if settled
         then rethrowIO =<< joinFailure spawned drained failure
@@ -137,6 +143,36 @@ serve restore lifetime owner stopSession turn spawned = do
                       -- A failed write is recorded on the lifetime (and ends further writes through that path), never dropped.
                       reportDiagnostic lifetime (logError (lifetimeLogger lifetime) component "the owner loop failed while the session was draining" [("reason", reportText (Text.pack (displayException again)))])
                       go (attempt + 1 ∷ Int)
+
+-- | Ask the session to stop, once, remembering a cancellation that arrives meanwhile (the request is made again
+-- until it has been made undisturbed) and ignoring a synchronous failure of it: the stop is idempotent, and the
+-- join that follows never depends on it having succeeded.
+stopRemembering ∷ IO () → IO (Maybe (ExceptionWithContext SomeException))
+stopRemembering stopSession = rememberingInterruption (bestEffort stopSession)
+
+-- | Run the owner's application, which runs the session through 'serveSpawned' (recording its handle in the slot),
+-- and settle the session after it, whatever the way out.
+--
+-- /The whole sequence is one masked step./ The application alone runs with asynchronous exceptions enabled. What
+-- follows its failure (reading the slot, stopping the session, joining it, combining the evidence) is the
+-- application's own continuation, and a caught failure's continuation would otherwise resume unmasked: a
+-- cancellation queued while the failure was being caught would land before the stop, skip the join and let the
+-- scopes the session borrows be released under it. Here every wait is made with the cancellation remembered
+-- ('stopRemembering', 'joinFailure'), and the cancellation, if one arrived, is raised last as the primary failure
+-- with the application's failure and the session's retained beside it.
+--
+-- A success is the application's result unchanged: 'serveSpawned' has already joined the session on that path.
+runOwned ∷ ∀ a b. IORef (Maybe (Spawned a)) → IO () → IO b → IO b
+runOwned slot stopSession application = mask $ \restore → do
+  result ← tryWithContext (restore application)
+  case result of
+    Right value → pure value
+    Left failure →
+      readIORef slot >>= \case
+        Nothing → rethrowIO failure
+        Just session → do
+          stopped ← stopRemembering stopSession
+          rethrowIO =<< joinFailure session stopped failure
 
 -- | Join the session, waiting without a bound and remembering a cancellation meanwhile, and answer the failure that
 -- is being raised with the session's own failure retained beside it (and with an interruption, if one was

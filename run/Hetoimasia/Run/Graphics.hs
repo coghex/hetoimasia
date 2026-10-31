@@ -42,8 +42,8 @@ module Hetoimasia.Run.Graphics
   ) where
 
 import Control.Concurrent.STM (STM, atomically, retry)
-import Control.Exception (SomeException, finally, rethrowIO, tryWithContext)
-import Control.Monad (forM_, join, unless, void)
+import Control.Exception (finally)
+import Control.Monad (join, unless)
 import Data.List (partition)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import qualified Data.Text as Text
@@ -96,8 +96,8 @@ import Hetoimasia.LuaEngine.Session
   , newRoleFailure
   )
 import Hetoimasia.Run.Boot (Prepared (..))
-import Hetoimasia.Run.Serve (Owner (..), Spawned, joinFailure, serveSpawned)
-import Hetoimasia.Run.Settle (attemptSync, reportDiagnostic)
+import Hetoimasia.Run.Serve (Owner (..), Spawned, runOwned, serveSpawned)
+import Hetoimasia.Run.Settle (reportDiagnostic)
 import Hetoimasia.Run.Output (reportText)
 import Hetoimasia.Run.Session
   ( Environment
@@ -105,7 +105,6 @@ import Hetoimasia.Run.Session
   , SessionLink
   , linkFailure
   , linkStop
-  , noteSessionDiagnostics
   , runPrepared
   )
 import Hetoimasia.Runtime.GLFW
@@ -152,8 +151,11 @@ runNativeWith observation environment lifetime stop link prepared = do
       config = (configureScenes scenes (configureWindows (configureHost textureConfiguration base))) {vulkanFrameObserver = observeFrame observation}
   verdictCell ← newIORef Nothing
   slot ← newIORef Nothing
-  result ←
-    tryWithContext @SomeException $
+  -- The application, the capture of whatever ends it, the stop of the session and its join are one masked sequence
+  -- ('runOwned'): the application and the device are torn down by the time it answers, whatever the way out, and a
+  -- session left to settle against that teardown has been joined, its failure kept beside the application's.
+  outcome ←
+    runOwned slot (linkStop link StopInterrupt) $
       withLoaderIntegration $ \integration →
         runGraphicsOwnerApplication
           ($ lifetime)
@@ -166,20 +168,9 @@ runNativeWith observation environment lifetime stop link prepared = do
           vulkanWindowHost
           (\vulkan _ → pure vulkan)
           (\vulkan control → body slot scenes textureConfiguration config vulkan control)
-  -- The owner application and the device are torn down now, whatever the way out. If the loop was lost the session
-  -- was left to settle against that teardown, and it is joined here, with its failure kept beside the loop's.
-  case result of
-    Right outcome → do
-      verdict ← readIORef verdictCell
-      noteSessionDiagnostics lifetime outcome
-      checkVerdict lifetime verdict
-      pure outcome
-    Left failure → do
-      spawned ← readIORef slot
-      -- Whatever ended the application, the session is told to stop before it is waited for: the join never depends
-      -- on the loop's own guard having run.
-      forM_ spawned $ \_ → void (attemptSync (linkStop link StopInterrupt))
-      rethrowIO =<< maybe (pure failure) (\session → joinFailure session Nothing failure) spawned
+  verdict ← readIORef verdictCell
+  checkVerdict lifetime verdict
+  pure outcome
   where
     logger = lifetimeLogger lifetime
 

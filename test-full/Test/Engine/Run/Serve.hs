@@ -13,17 +13,20 @@ import Control.Exception
   ( AsyncException (UserInterrupt)
   , ExceptionWithContext (ExceptionWithContext)
   , SomeException
+  , catch
   , finally
   , fromException
+  , mask_
+  , throwIO
   , tryWithContext
   )
 import Control.Monad (unless, void)
-import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf)
 import GHC.Conc (BlockReason (BlockedOnException, BlockedOnMVar, BlockedOnSTM))
 import Hetoimasia.Foundation.Log (callbackSinkWith, defaultLogFilter, mkLogger)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, displayCleanupFailure, withResource)
-import Hetoimasia.Run.Serve (Owner (..), drainAttempts, joinFailure, serveSpawned)
+import Hetoimasia.Run.Serve (Owner (..), drainAttempts, joinFailure, runOwned, serveSpawned)
 import Hetoimasia.Run.Session (awaitDiagnostics, newSessionLinkEndingWith)
 import Hetoimasia.Runtime.Logging (failedReportsInContext, withLoggingLifetime)
 import Test.Engine.Run.Support (blockedFor, silentLogger)
@@ -171,6 +174,44 @@ spec = describe "Serve" $ do
       Right _ → expectationFailure "the cancellation was lost"
     -- The session was told to stop, and has ended: nothing outlives the call.
     readTVarIO stopped >>= (`shouldBe` True)
+
+  it "joins the session, keeping its failure beside the cancellation, when a cancellation is already queued as the application's failure is caught" $ do
+    fake ← newFake
+    slot ← newIORef Nothing
+    stops ← newIORef (0 ∷ Int)
+    thrower ← newEmptyMVar
+    armed ← newEmptyMVar
+    caller ← newEmptyMVar
+    result ← newEmptyMVar
+    let stop = atomicModifyIORef' stops (\n → (n + 1, ()))
+        owner = ownerWith fake (Just "the owner loop failed") (ioError (userError "the drain failed too"))
+        -- Unsettled when the loop is given up on, and ended only by the application's teardown.
+        session = atomically (readTVar (fakeExited fake) >>= check) >> ioError (userError "session settled against the exit")
+        application =
+          withLoggingLifetime silentLogger (\lifetime → serveSpawned lifetime owner (\spawned → writeIORef slot (Just spawned)) stop quiet session)
+            `catch` \failure → mask_ $ do
+              -- Caught: the application's own teardown. A cancellation is queued against this thread while it is
+              -- masked, so it can only land when the failure's continuation first runs unmasked, if it ever does.
+              sender ← takeMVar thrower
+              putMVar armed ()
+              blockedFor BlockedOnException sender
+              atomically (writeTVar (fakeExited fake) True)
+              throwIO (failure ∷ SomeException)
+    _ ← forkIO $ do
+      myThreadId >>= putMVar caller
+      outcome ← tryWithContext @SomeException (runOwned slot stop application)
+      putMVar result outcome
+    me ← takeMVar caller
+    sender ← forkIO (takeMVar armed >> throwTo me UserInterrupt)
+    putMVar thrower sender
+    bounded (takeMVar result) >>= \case
+      Left (ExceptionWithContext context failure) → do
+        (fromException failure ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
+        let kept = map displayCleanupFailure (cleanupFailuresInContext context)
+        kept `shouldSatisfy` any ("the owner loop failed" `isInfixOf`)
+        kept `shouldSatisfy` any ("session settled against the exit" `isInfixOf`)
+      Right _ → expectationFailure "the cancellation was lost"
+    readIORef stops >>= (`shouldSatisfy` (>= 1))
 
   it "records a failed diagnostic write on the lifetime, writes nothing more through that path and flushes nothing, however long the drain keeps failing" $ do
     fake ← newFake
