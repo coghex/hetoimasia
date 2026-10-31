@@ -136,9 +136,12 @@ diagnostic that cannot be written never replaces what it reports.
   loop. A failing drain is run again, three times in all.
 * **The session thread, the handle and the loop's guard are one masked step** (`serveSpawned`): the thread is created, its handle recorded
   where the join will find it, and the loop entered inside the guard before asynchronous exceptions are enabled at all, so a cancellation
-  already pending when the loop is entered lands inside the guard and stops the session like any other failure of the loop. After the
-  application has torn down, the session is told to stop again before it is joined, so the join never depends on the loop's guard having
-  run.
+  already pending when the loop is entered lands inside the guard and stops the session like any other failure of the loop. The
+  application that owns the loop is itself run in one masked step (`runOwned`): only the application runs with asynchronous exceptions
+  enabled, and capturing whatever ended it, stopping the session, joining it (so its failure is kept beside the application's) and
+  combining the evidence are one sequence in which a cancellation is only remembered and is raised last as the primary failure. A caught
+  failure's continuation never resumes unmasked, so no cancellation can land between the application's teardown and the join, and the
+  join never depends on the loop's guard having run.
 * **The owner lost for good** (the drain fails every time): the loop's failure is raised at once, *without* joining the session. That
   hands the owner back to its application's own protected exit, which performs the verified destruction of the windows the loop could not.
   The session, whose providers then see a finished owner, settles, and the command joins it *after* the application has torn down,
@@ -154,7 +157,9 @@ diagnostic that cannot be written never replaces what it reports.
 * **A diagnostic write that fails while something else unwinds is recorded, not dropped.** The drain's report, the verdict's warning and
   the session's own sink failures (the session's writer counts the writes its sink refused and returns them as data in the outcome, raising
   nothing) are written through, or carried into, the logging lifetime as a failed report (`reportDiagnostic`, `notePathFailure`,
-  `noteSessionDiagnostics`). The first failure is kept as evidence beside the primary failure, nothing more is written through that path
+  `noteSessionDiagnostics`). The session's refusals are recorded at their source, in `runPrepared` the moment the outcome exists and
+  while every scope the session used is still open, never at a later site that only a successful return reaches, so a cleanup that fails
+  after the outcome cannot report or flush before they are recorded. The first failure is kept as evidence beside the primary failure, nothing more is written through that path
   by the launcher, and the lifetime makes no final flush through it. The status is not changed by it.
 
 ## Sizing
