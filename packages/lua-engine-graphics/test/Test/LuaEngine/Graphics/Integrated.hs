@@ -289,8 +289,9 @@ saturationSpec =
       awaitLine peers "filled\t1\t8\tbusy"
       b ← peAdmit peers
       awaitLine peers "asked\t2\ttrue"
-      -- both pool workers have borrowed a read of the picture and hold it at the reader: the two oldest requests of A (the pool
-      -- starts reads in the order they were admitted); the rest, and B's, are queued
+      -- both pool workers have borrowed a read of the picture and hold it at the reader. The pipeline has two lanes and starts
+      -- jobs in the order they were admitted (`jOrder`), all of A's in one Lua call, so those are A's two oldest requests; the
+      -- rest, and B's, are admitted and wait for a lane without having read anything
       readsEntered (peComposition peers) "images/quad.png" 2
       -- A cancels the request a worker holds: the read must drain, so its reservation stays and a new ask is still busy;
       -- then it cancels a request still queued, which is withdrawn without any read, so that exactly one place comes back
