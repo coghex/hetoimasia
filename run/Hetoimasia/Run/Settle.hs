@@ -15,6 +15,7 @@
 module Hetoimasia.Run.Settle
   ( remembering
   , rememberingInterruption
+  , answering
   , attemptSync
   , isAsynchronous
   , bestEffort
@@ -34,9 +35,13 @@ import Control.Exception
   , SomeException
   , displayException
   , fromException
+  , mask
   , rethrowIO
+  , throwIO
+  , try
   , tryWithContext
   )
+import Control.Concurrent.MVar (MVar, putMVar)
 import Control.Monad (unless, when)
 import Data.Foldable (traverse_)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
@@ -64,6 +69,10 @@ attemptSync action =
 
 -- | Run an action that must finish, running it again whenever an asynchronous exception interrupts it, and answer
 -- the first such interruption (with its context) once the action has completed undisturbed.
+--
+-- /Called with asynchronous exceptions masked/ (every caller in the launcher is: a @mask@ body, a cleanup, the
+-- finalizer of 'Hetoimasia.Run.finalizing'), which is what makes the loop's own continuation safe between two
+-- runs of the action.
 rememberingInterruption ∷ IO () → IO (Maybe (ExceptionWithContext SomeException))
 rememberingInterruption act = go Nothing
   where
@@ -129,11 +138,15 @@ withRecordingLifetime configuration sink use = do
 recordingSink ∷ IORef (Maybe LoggingLifetime) → LogSink → LogSink
 recordingSink held sink = callbackSinkWith (guarded . writeEntry sink) (guarded (flushSink sink))
   where
-    guarded action = do
+    -- One masked step from the capture of the refusal to its recording: only the sink operation itself runs with
+    -- the caller's interruptibility restored. A caught failure's continuation does not resume unmasked, so a
+    -- cancellation queued while the sink was throwing cannot land before the refusal has been recorded; it is
+    -- delivered after, when the step ends.
+    guarded action = mask $ \restore → do
       lifetime ← readIORef held
       already ← maybe (pure False) pathFailed lifetime
       when already (ioError (userError "the diagnostic path has already failed"))
-      tryWithContext action >>= \case
+      tryWithContext (restore action) >>= \case
         Right () → pure ()
         Left failure
           | isAsynchronous failure → rethrowIO failure
@@ -152,3 +165,15 @@ withEvidence ∷ Exception e ⇒ ExceptionWithContext e → Text
 withEvidence (ExceptionWithContext context failure) =
   Text.intercalate "; " $
     Text.pack (displayException failure) : ["cleanup: " <> Text.pack (displayCleanupFailure retained) | retained ← cleanupFailuresInContext context]
+
+-- | Hand the outcome of an action to a waiter, always. For work that is posted to another thread and waited for
+-- there (a job for the process main thread): the outcome, a failure included, is put in the answer in one masked
+-- step with its capture, so a cancellation of the running thread cannot land between the two and leave the waiter
+-- blocked for ever; and a cancellation is not swallowed on the way, it is handed to the waiter and then goes on.
+answering ∷ MVar (Either SomeException a) → IO a → IO ()
+answering answer action = mask $ \restore → do
+  outcome ← try (restore action)
+  putMVar answer outcome
+  case outcome of
+    Left failure | Just (_ ∷ SomeAsyncException) ← fromException failure → throwIO failure
+    _ → pure ()

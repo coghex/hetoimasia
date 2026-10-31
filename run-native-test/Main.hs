@@ -50,6 +50,7 @@ import System.IO (BufferMode (LineBuffering), hPutStrLn, hSetBuffering, stderr, 
 import System.Info (arch, compilerName, compilerVersion, os)
 import Test.Hspec (Spec)
 import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, evalSpec, hspecWithResult, isSuccess, runSpecForest, specResultSuccess)
+import Hetoimasia.Run.Settle (answering)
 import Test.Run.Native.Command (executableVariable)
 import qualified Test.Run.Native.Command as Command
 import Test.Run.Native.Consent (Consent, describeConsent, readConsent, refusalMessage)
@@ -108,7 +109,7 @@ examples env = Library.spec env >> Command.spec env
 startMain ∷ TVar [IO ()] → IO a → IO (IO a)
 startMain jobs action = mask_ $ do
   answer ← newEmptyMVar
-  atomically (modifyTVar' jobs (<> [try @SomeException action >>= putMVar answer]))
+  atomically (modifyTVar' jobs (<> [answering answer action]))
   pure (takeMVar answer >>= either throwIO pure)
 
 -- | Serve the examples' actions, one at a time, until Hspec has finished, and answer how it did.

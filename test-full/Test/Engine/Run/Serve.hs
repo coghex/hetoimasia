@@ -8,7 +8,7 @@ module Test.Engine.Run.Serve (spec) where
 
 import Control.Concurrent (forkIO, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
+import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
 import Control.Exception
   ( AsyncException (UserInterrupt)
   , ExceptionWithContext (ExceptionWithContext)
@@ -16,20 +16,21 @@ import Control.Exception
   , catch
   , finally
   , fromException
+  , mask
   , mask_
   , throwIO
   , tryWithContext
   )
-import Control.Monad (unless, void)
+import Control.Monad (unless, void, when)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf)
 import GHC.Conc (BlockReason (BlockedOnException, BlockedOnMVar, BlockedOnSTM))
-import Hetoimasia.Foundation.Log (callbackSinkWith, defaultLogFilter)
-import Hetoimasia.Run.Settle (withRecordingLifetime)
+import Hetoimasia.Foundation.Log (callbackSinkWith, defaultLogFilter, logInfo, unsafeComponent)
+import Hetoimasia.Run.Settle (answering, bestEffort, pathFailed, withRecordingLifetime)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, displayCleanupFailure, withResource)
 import Hetoimasia.Run.Serve (Owner (..), drainAttempts, joinFailure, runOwned, serveSpawned)
 import Hetoimasia.Run.Session (awaitDiagnostics, newSessionLinkEndingWith)
-import Hetoimasia.Runtime.Logging (failedReportsInContext, withLoggingLifetime)
+import Hetoimasia.Runtime.Logging (failedReportsInContext, lifetimeLogger, withLoggingLifetime)
 import Test.Engine.Run.Support (blockedFor, silentLogger)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 import Test.Support.Bounded (bounded)
@@ -285,3 +286,80 @@ spec = describe "Serve" $ do
     atomically (writeTVar ended True)
     noted order 2 >>= (`shouldBe` ["writer ended", "join returned"])
 
+  it "records a sink's refusal even when a cancellation is queued while the sink throws, so nothing is written or flushed through it afterwards" $ do
+    calls ← newTVarIO (0 ∷ Int)
+    flushes ← newTVarIO (0 ∷ Int)
+    thrower ← newEmptyMVar
+    armed ← newEmptyMVar
+    caller ← newEmptyMVar
+    result ← newEmptyMVar
+    let component = unsafeComponent "run.test"
+        write _ = do
+          firstCall ← atomically (stateTVar calls (\n → (n == 0, n + 1)))
+          when firstCall . mask_ $ do
+            -- Inside the sink's own masked region (as a handle's write is) a cancellation is queued against the
+            -- writer, and the sink then fails: the cancellation can only land once that region is left.
+            sender ← takeMVar thrower
+            putMVar armed ()
+            blockedFor BlockedOnException sender
+            ioError (userError "the diagnostic sink broke")
+        sink = callbackSinkWith write (atomically (modifyTVar' flushes (+ 1)))
+    _ ← forkIO $ do
+      myThreadId >>= putMVar caller
+      void . tryWithContext @SomeException . withRecordingLifetime defaultLogFilter sink $ \lifetime → mask $ \restore → do
+        _ ← tryWithContext @SomeException (restore (logInfo (lifetimeLogger lifetime) component "one" []))
+        recorded ← pathFailed lifetime
+        -- Another report through the same lifetime, as an enclosing boundary would make.
+        _ ← tryWithContext @SomeException (logInfo (lifetimeLogger lifetime) component "two" [])
+        -- Take the queued cancellation here, so the lifetime ends normally and its own finalization is observed.
+        _ ← tryWithContext @SomeException (restore (pure ()))
+        putMVar result recorded
+    me ← takeMVar caller
+    sender ← forkIO (takeMVar armed >> throwTo me UserInterrupt)
+    putMVar thrower sender
+    bounded (takeMVar result) >>= (`shouldBe` True)
+    readTVarIO calls >>= (`shouldBe` 1)
+    readTVarIO flushes >>= (`shouldBe` 0)
+
+  it "hands the outcome of a job to its waiter even when a cancellation is queued as the job fails, and lets the cancellation go on" $ do
+    answer ← newEmptyMVar
+    thrower ← newEmptyMVar
+    armed ← newEmptyMVar
+    caller ← newEmptyMVar
+    result ← newEmptyMVar
+    let job = mask_ $ do
+          sender ← takeMVar thrower
+          putMVar armed ()
+          blockedFor BlockedOnException sender
+          ioError (userError "the job failed") ∷ IO ()
+    _ ← forkIO $ do
+      myThreadId >>= putMVar caller
+      putMVar result =<< tryWithContext @SomeException (answering answer job)
+    me ← takeMVar caller
+    sender ← forkIO (takeMVar armed >> throwTo me UserInterrupt)
+    putMVar thrower sender
+    -- The waiter has its answer, and it is the job's own failure: it is not left waiting.
+    bounded (takeMVar answer) >>= \case
+      Left failure → show failure `shouldBe` "user error (the job failed)"
+      Right () → expectationFailure "the job's failure was lost"
+    -- And the cancellation that was queued against the runner was not swallowed.
+    bounded (takeMVar result) >>= \case
+      Left (ExceptionWithContext _ failure) → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
+      Right () → expectationFailure "the cancellation was swallowed"
+
+  it "ignores a failure to write a best-effort line but lets a cancellation go on" $ do
+    bestEffort (ioError (userError "the line could not be written"))
+    gate ← newEmptyMVar
+    caller ← newEmptyMVar
+    started ← newEmptyMVar
+    result ← newEmptyMVar
+    _ ← forkIO $ do
+      myThreadId >>= putMVar caller
+      putMVar result =<< tryWithContext @SomeException (bestEffort (putMVar started () >> takeMVar gate))
+    me ← takeMVar caller
+    takeMVar started
+    blockedFor BlockedOnMVar me
+    throwTo me UserInterrupt
+    bounded (takeMVar result) >>= \case
+      Left (ExceptionWithContext _ failure) → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
+      Right () → expectationFailure "the cancellation was swallowed"

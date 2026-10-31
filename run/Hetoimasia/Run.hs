@@ -43,8 +43,8 @@ module Hetoimasia.Run
   ) where
 
 import Control.Concurrent.STM (STM, atomically)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, mask, rethrowIO, try, tryWithContext)
-import Control.Monad (unless, void)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, mask, rethrowIO, tryWithContext)
+import Control.Monad (unless)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text.IO as Text
@@ -58,7 +58,7 @@ import Hetoimasia.Run.Graphics (runNative)
 import Hetoimasia.Run.Options (RunParse (..), parseRun, problemReason, runHelp, runUsage)
 import Hetoimasia.Run.Output (reportText, utf8Streams)
 import Hetoimasia.Run.Session (SessionLink, joinDiagnostics, newSessionLink, productionEnvironment)
-import Hetoimasia.Run.Settle (combine, isAsynchronous, withEvidence, withRecordingLifetime)
+import Hetoimasia.Run.Settle (bestEffort, combine, isAsynchronous, withEvidence, withRecordingLifetime)
 import Hetoimasia.Run.Signals (forceExit, withRunSignals)
 import Hetoimasia.Run.Status (RunResult (..), bootFailed, exitStatus)
 import Hetoimasia.Runtime.Logging (LoggingLifetime, failedReportsInContext, flushFailuresInContext, lifetimeLogger)
@@ -188,6 +188,7 @@ diagnosticPathFailed = \case
 failureReason ∷ ExceptionWithContext SomeException → Text
 failureReason = reportText . withEvidence
 
--- | One line on stderr, best effort and once: a failure to write it changes nothing.
+-- | One line on stderr, best effort and once: a failure to write it changes nothing. A cancellation is not a failure
+-- to write: it goes on.
 report ∷ Text → IO ()
-report line = void (try (Text.hPutStrLn stderr ("hetoimasia run: " <> line) >> hFlush stderr) ∷ IO (Either SomeException ()))
+report line = bestEffort (Text.hPutStrLn stderr ("hetoimasia run: " <> line) >> hFlush stderr)

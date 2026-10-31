@@ -48,7 +48,7 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Hetoimasia.Console.Lua.Signals (deliver)
 import Hetoimasia.Run.Session (newSessionLink)
-import Hetoimasia.Run.Settle (combine, isAsynchronous, rememberingInterruption)
+import Hetoimasia.Run.Settle (answering, combine, isAsynchronous, rememberingInterruption)
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Foundation.Log (LogFilter (..), Logger, callbackSink, defaultLogFilter, mkLogger)
 import Hetoimasia.GLFW.NativeCheck (NativeCloseAnswer (..), requestNativeClose)
@@ -428,7 +428,7 @@ retired ran = do
 onMainTurn ∷ Watch → IO a → IO a
 onMainTurn watch action = do
   answer ← newEmptyMVar
-  atomically (modifyTVar' (watchJobs watch) (<> [try action >>= putMVar answer]))
+  atomically (modifyTVar' (watchJobs watch) (<> [answering answer action]))
   takeMVar answer >>= either (\e → throwIO (e ∷ SomeException)) pure
 
 -- | The identity of the one native window the example opens.
