@@ -43,24 +43,22 @@ module Hetoimasia.Run
   ) where
 
 import Control.Concurrent.STM (STM, atomically)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask, rethrowIO, try, tryWithContext)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, mask, rethrowIO, try, tryWithContext)
 import Control.Monad (unless, void)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
-import qualified Data.Text as Text
 import qualified Data.Text.IO as Text
 import Hetoimasia.Console.Lua.Signals (Coordinator, stopRequested)
 import Hetoimasia.Console.Usage (usageFailure)
 import Hetoimasia.Foundation.Log (LogFilter)
-import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, displayCleanupFailure)
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.LuaEngine.Session (SessionOutcome)
 import Hetoimasia.Run.Boot (BootEnd (..), BootHooks, Prepared, noBootHooks, withPreparedWith)
 import Hetoimasia.Run.Graphics (runNative)
 import Hetoimasia.Run.Options (RunParse (..), parseRun, problemReason, runHelp, runUsage)
 import Hetoimasia.Run.Output (reportText, utf8Streams)
-import Hetoimasia.Run.Session (SessionLink, joinDiagnostics, newSessionLink, productionEnvironment)
-import Hetoimasia.Run.Settle (combine, isAsynchronous)
+import Hetoimasia.Run.Session (SessionLink, joinDiagnostics, newSessionLink, noteLinkedDiagnostics, productionEnvironment)
+import Hetoimasia.Run.Settle (combine, isAsynchronous, withEvidence)
 import Hetoimasia.Run.Signals (forceExit, withRunSignals)
 import Hetoimasia.Run.Status (RunResult (..), bootFailed, exitStatus)
 import Hetoimasia.Runtime.Logging (LoggingLifetime, failedReportsInContext, flushFailuresInContext, lifetimeLogger, withHandleLoggingLifetime)
@@ -142,7 +140,8 @@ runGame setup configuration path = do
           logger = lifetimeLogger lifetime
       attempt ←
         withPreparedWith (setupBoot setup) logger fixedM1Profile stop path (setupLaunch setup lifetime stop link)
-          `finalizing` joinDiagnostics link
+          -- The writer's tail is recorded too, once it has ended: a refusal after the session's last answer.
+          `finalizing` (joinDiagnostics link <* noteLinkedDiagnostics lifetime link)
       let (outcome, reports) = case attempt of
             Left (BootRefused reason) → (bootFailed reason False, ["boot failed: " <> reason])
             Left BootStopped → (RunResult Nothing Nothing [] True, [])
@@ -188,9 +187,7 @@ diagnosticPathFailed = \case
 
 -- | A failure as one bounded line: what it says, then each cleanup failure retained beside it.
 failureReason ∷ ExceptionWithContext SomeException → Text
-failureReason (ExceptionWithContext context failure) =
-  reportText . Text.intercalate "; " $
-    Text.pack (displayException failure) : ["cleanup: " <> Text.pack (displayCleanupFailure retained) | retained ← cleanupFailuresInContext context]
+failureReason = reportText . withEvidence
 
 -- | One line on stderr, best effort and once: a failure to write it changes nothing.
 report ∷ Text → IO ()

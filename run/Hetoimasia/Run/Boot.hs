@@ -58,14 +58,11 @@ import Control.Exception
   , Exception
   , SomeAsyncException
   , SomeException
-  , catch
   , displayException
   , fromException
   , mask
   , rethrowIO
-  , throwIO
   , toException
-  , try
   , tryWithContext
   )
 import Control.Monad (void)
@@ -102,7 +99,7 @@ import Hetoimasia.LuaEngine.Boot
 import Hetoimasia.LuaEngine.Manifest (Manifest (..), contentIdText, parseManifestWith)
 import Hetoimasia.LuaEngine.Profile (ByteLimit (ManifestBytes), Bytes (Bytes), Profile, bytesLimit)
 import Hetoimasia.Run.Output (reportText)
-import Hetoimasia.Run.Settle (combine, diagnostic, rememberingInterruption)
+import Hetoimasia.Run.Settle (combine, diagnostic, rememberingInterruption, withEvidence)
 
 -- | The folder, prepared: borrowed by the continuation.
 data Prepared = Prepared
@@ -146,12 +143,12 @@ withPreparedWith hooks logger profile stop path continuation = case contentConfi
     -- Only a failure of /opening/ the root is a refusal: once the continuation has begun, what it raises is its own
     -- (the session's, a cleanup's) and passes through untouched.
     began ← newIORef False
-    let refused ∷ ContentFailure → IO (Either BootEnd a)
+    let refused ∷ ExceptionWithContext ContentFailure → IO (Either BootEnd a)
         refused failure =
           readIORef began >>= \started →
             if started
-              then throwIO failure
-              else pure (Left (BootRefused (reportText ("the root could not be opened: " <> Text.pack (displayException failure)))))
+              then rethrowIO failure
+              else pure (Left (BootRefused (reportText ("the root could not be opened: " <> withEvidence failure))))
         opened =
           withContentRoot (configContentLimits configuration) path $ \root → do
             reportRoot logger (rootReport root)
@@ -162,7 +159,7 @@ withPreparedWith hooks logger profile stop path continuation = case contentConfi
               Just (Right (inventory, checkpoint, contentId)) → do
                 writeIORef began True
                 Right <$> continuation (Prepared profile root inventory checkpoint contentId)
-    opened `catch` refused
+    tryWithContext @ContentFailure opened >>= either refused pure
   where
     prepare configuration root = do
       read' ← readManifest profile (configContentLimits configuration) root
@@ -209,9 +206,9 @@ readManifest ∷ Profile → ContentLimits → ContentRoot → IO (Either Text B
 readManifest profile limits root = case nativeName "hetoimasia.json" of
   Left refusal → pure (Left ("the manifest name was refused: " <> Text.pack (show refusal)))
   Right name → do
-    outcome ← try (withFile root [name] (go []))
+    outcome ← tryWithContext @ContentFailure (withFile root [name] (go []))
     pure $ case outcome of
-      Left failure → Left ("hetoimasia.json could not be read: " <> Text.pack (displayException (failure ∷ ContentFailure)))
+      Left failure → Left ("hetoimasia.json could not be read: " <> withEvidence failure)
       Right bytes → Right bytes
   where
     Bytes limit = bytesLimit profile ManifestBytes

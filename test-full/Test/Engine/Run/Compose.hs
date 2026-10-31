@@ -20,7 +20,13 @@ import Data.List (isInfixOf)
 import GHC.Conc (BlockReason (BlockedOnSTM))
 import Hetoimasia.Foundation.Log (callbackSinkWith, defaultLogFilter, mkLogger)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, displayCleanupFailure, withResource)
+import Hetoimasia.Content (ContentFailure, withContentRoot)
+import Hetoimasia.LuaEngine.Boot (ContentConfiguration (..), contentConfiguration)
+import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
+import Hetoimasia.Foundation.Time (readInstant, scriptedSource)
 import Hetoimasia.LuaEngine.Session (SessionOutcome)
+import Hetoimasia.Run.Session (Environment (..))
+import Hetoimasia.Run.Settle (withEvidence)
 import Hetoimasia.Run (Setup (..), runGame)
 import Hetoimasia.Run.Session (newSessionLinkEndingWith)
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
@@ -175,6 +181,18 @@ bootRefusals = describe "boot refusals, before any authored Lua" $ do
         observed ← observe files (\_ → pure ())
         observedStatus observed `shouldBe` ExitFailure 1
         observedOut observed `shouldNotContain` ["authored Lua ran"]
+  it "keeps a failed cleanup beside the content failure it reports, rather than reducing it to the first" $ do
+    configuration <- either (\refusal -> expectationFailure (show refusal) >> error "unreachable") pure (contentConfiguration fixedM1Profile)
+    outcome <-
+      tryWithContext @ContentFailure $
+        withResource (pure ()) (\_ -> ioError (userError "the descriptor would not close")) $ \_ ->
+          withContentRoot (configContentLimits configuration) "/nonexistent/hetoimasia-run-root" (\_ -> pure ())
+    case outcome of
+      Left failure -> do
+        withEvidence failure `shouldSatisfy` Text.isInfixOf "the descriptor would not close"
+        withEvidence failure `shouldSatisfy` Text.isInfixOf "cleanup:"
+      Right _ -> expectationFailure "the root opened"
+
   it "refuses a missing manifest" $ refused [("main.lua", marker)]
   it "refuses a malformed manifest" $ refused [("hetoimasia.json", lua "{\"format\":1,"), ("main.lua", marker)]
   it "refuses a manifest with an unknown field" $ refused [("hetoimasia.json", manifestWith ["\"entry\":\"main.lua\"", "\"tick_seconds\":\"0.01\"", "\"mods\":[]"]), ("main.lua", marker)]
@@ -300,6 +318,35 @@ stops = describe "stops and signals" $ do
     observed <-
       observeWith
         unchanged {changeLogger = Just logger, changeAfterLaunch = ioError (userError "a cleanup around the session failed")}
+        [("hetoimasia.json", commonManifest), ("main.lua", lua (entry (logic <> quittingUi)))]
+        (\_ -> pure ())
+    observedStatus observed `shouldBe` ExitFailure 1
+    readTVarIO flushes >>= (`shouldBe` 0)
+    observedReports observed `shouldBe` []
+
+  it "flushes nothing and writes no terminal line when the session's sink refused a diagnostic and 'runSession' then raises" $ do
+    writes <- newTVarIO (0 :: Int)
+    flushes <- newTVarIO (0 :: Int)
+    let sink =
+          callbackSinkWith
+            ( \_ -> do
+                written <- atomically (stateTVar writes (\n -> (n, n + 1)))
+                when (written >= 1) (ioError (userError "the diagnostic sink broke after its first write"))
+            )
+            (atomically (modifyTVar' flushes (+ 1)))
+        logger = mkLogger defaultLogFilter sink
+        -- A clock that fails once the sink has refused a write: the session raises it from inside 'runSession' and
+        -- no outcome is returned.
+        failing environment =
+          environment
+            { envClock = scriptedSource $ do
+                refused <- readTVarIO writes
+                when (refused >= 2) (ioError (userError "the session's clock failed"))
+                readInstant (envClock environment)
+            }
+    observed <-
+      observeWith
+        unchanged {changeLogger = Just logger, changeEnvironment = failing}
         [("hetoimasia.json", commonManifest), ("main.lua", lua (entry (logic <> quittingUi)))]
         (\_ -> pure ())
     observedStatus observed `shouldBe` ExitFailure 1

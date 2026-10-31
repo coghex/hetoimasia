@@ -41,6 +41,7 @@ module Hetoimasia.Run.Session
   , newSessionLinkEndingWith
   , awaitDiagnostics
   , joinDiagnostics
+  , noteLinkedDiagnostics
   , ioQueueSlots
   , textureJobs
   , runPrepared
@@ -77,6 +78,7 @@ import Hetoimasia.LuaEngine.Session
   , requestStop
   , runSession
   , sessionDiagnosticsEnded
+  , sessionOutcomeNow
   )
 import Hetoimasia.LuaEngine.Texture
   ( TexturePipeline
@@ -256,13 +258,20 @@ runPrepared environment lifetime stop link prepared graphics hook =
                   thread ← forkIO (atomically (stop >>= check) >> requestStop session StopInterrupt)
                   writeIORef forwarder (Just thread)
               endForwarder = readIORef forwarder >>= mapM_ killThread
-          -- The session's refused diagnostics are recorded here, where they are produced: the outcome is in hand
-          -- while every scope the session used is still open, so no cleanup that fails later can come first.
-          outcome ← runSession spec callback `finally` endForwarder
-          noteSessionDiagnostics lifetime outcome
-          pure outcome
+          -- The session's refused diagnostics are recorded here, on a return and on an exception alike, while every
+          -- scope the session used is still open: the handle was bound to the link before any VM existed, and its
+          -- state holds what its writer has counted, whether or not 'runSession' answered. No cleanup that fails
+          -- later, and no failure that 'runSession' itself raises, can come before the record.
+          runSession spec callback `finally` (noteLinkedDiagnostics lifetime link >> endForwarder)
 
--- | Carry the session's own diagnostic-sink failures into the logging lifetime, at the point the outcome exists. The session's writer counts the
+-- | Record what the linked session's diagnostics writer has refused so far, if a session is bound: nonblocking, and
+-- it answers whether or not the session ended well. Safe to call from a protected finalization.
+noteLinkedDiagnostics ∷ LoggingLifetime → SessionLink → IO ()
+noteLinkedDiagnostics lifetime link =
+  atomically (readTVar (linkSession link) >>= traverse sessionOutcomeNow)
+    >>= traverse_ (noteSessionDiagnostics lifetime)
+
+-- | Carry the session's own diagnostic-sink failures into the logging lifetime. The session's writer counts the
 -- writes its sink refused and returns them as data in the outcome; they raise nothing. Left there, the lifetime
 -- would finish normally and flush the very sink that failed. Recording the first of them as a failed report makes
 -- the lifetime skip that flush and the launcher write nothing more through the path. A session that lost nothing

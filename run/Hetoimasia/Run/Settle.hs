@@ -23,12 +23,15 @@ module Hetoimasia.Run.Settle
   , notePathFailure
   , pathFailed
   , combine
+  , withEvidence
   ) where
 
 import Control.Exception
-  ( ExceptionWithContext (ExceptionWithContext)
+  ( Exception
+  , ExceptionWithContext (ExceptionWithContext)
   , SomeAsyncException
   , SomeException
+  , displayException
   , fromException
   , rethrowIO
   , tryWithContext
@@ -37,7 +40,8 @@ import Control.Monad (unless)
 import Data.Foldable (traverse_)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
-import Hetoimasia.Foundation.Resource (composeCleanup)
+import qualified Data.Text as Text
+import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, composeCleanup, displayCleanupFailure)
 import Hetoimasia.Runtime.Logging (LoggingLifetime, recordReport, recordedReports)
 import Hetoimasia.Runtime.Reporting (ReportResult (ReportFailed), markDiagnostic)
 
@@ -106,3 +110,12 @@ reportDiagnostic lifetime write = do
 -- machinery retains evidence: none is lost, and the primary keeps its type, value and context.
 combine ∷ ExceptionWithContext SomeException → [(Text, ExceptionWithContext SomeException)] → IO (ExceptionWithContext SomeException)
 combine primary others = fromMaybe primary <$> composeCleanup (Just primary) others
+
+-- | A failure as one line of text for a report: what it says, then each cleanup failure retained beside it in its
+-- context. Turning a typed failure into text anywhere in the launcher goes through here with the context in hand,
+-- so a failure that the layer below deliberately kept beside another (a descriptor that would not close after a
+-- read failed) is never reduced to the primary one alone. The caller bounds and escapes the line.
+withEvidence ∷ Exception e ⇒ ExceptionWithContext e → Text
+withEvidence (ExceptionWithContext context failure) =
+  Text.intercalate "; " $
+    Text.pack (displayException failure) : ["cleanup: " <> Text.pack (displayCleanupFailure retained) | retained ← cleanupFailuresInContext context]
