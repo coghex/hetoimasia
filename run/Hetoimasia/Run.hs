@@ -50,18 +50,18 @@ import Data.Text (Text)
 import qualified Data.Text.IO as Text
 import Hetoimasia.Console.Lua.Signals (Coordinator, stopRequested)
 import Hetoimasia.Console.Usage (usageFailure)
-import Hetoimasia.Foundation.Log (LogFilter)
+import Hetoimasia.Foundation.Log (LogFilter, newHandleSink)
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.LuaEngine.Session (SessionOutcome)
 import Hetoimasia.Run.Boot (BootEnd (..), BootHooks, Prepared, noBootHooks, withPreparedWith)
 import Hetoimasia.Run.Graphics (runNative)
 import Hetoimasia.Run.Options (RunParse (..), parseRun, problemReason, runHelp, runUsage)
 import Hetoimasia.Run.Output (reportText, utf8Streams)
-import Hetoimasia.Run.Session (SessionLink, joinDiagnostics, newSessionLink, noteLinkedDiagnostics, productionEnvironment)
-import Hetoimasia.Run.Settle (combine, isAsynchronous, withEvidence)
+import Hetoimasia.Run.Session (SessionLink, joinDiagnostics, newSessionLink, productionEnvironment)
+import Hetoimasia.Run.Settle (combine, isAsynchronous, withEvidence, withRecordingLifetime)
 import Hetoimasia.Run.Signals (forceExit, withRunSignals)
 import Hetoimasia.Run.Status (RunResult (..), bootFailed, exitStatus)
-import Hetoimasia.Runtime.Logging (LoggingLifetime, failedReportsInContext, flushFailuresInContext, lifetimeLogger, withHandleLoggingLifetime)
+import Hetoimasia.Runtime.Logging (LoggingLifetime, failedReportsInContext, flushFailuresInContext, lifetimeLogger)
 import Hetoimasia.Runtime.Reporting (raisedByDiagnostic)
 import System.Exit (ExitCode (ExitSuccess), exitWith)
 import System.IO (hFlush, stderr)
@@ -90,7 +90,7 @@ data Setup = Setup
 -- | The command as it ships: a second signal leaves the process at once with 130, and the folder is run with the
 -- production native graphics. No option, variable or fallback selects anything else.
 production ∷ Setup
-production = Setup forceExit (\_ → pure ()) noBootHooks (\configuration → withHandleLoggingLifetime configuration stderr) newSessionLink report (runNative productionEnvironment)
+production = Setup forceExit (\_ → pure ()) noBootHooks (\configuration use → newHandleSink stderr >>= \sink → withRecordingLifetime configuration sink use) newSessionLink report (runNative productionEnvironment)
 
 -- | The entry in the top-level help text (full build only).
 runHelpEntry ∷ [Text]
@@ -140,8 +140,7 @@ runGame setup configuration path = do
           logger = lifetimeLogger lifetime
       attempt ←
         withPreparedWith (setupBoot setup) logger fixedM1Profile stop path (setupLaunch setup lifetime stop link)
-          -- The writer's tail is recorded too, once it has ended: a refusal after the session's last answer.
-          `finalizing` (joinDiagnostics link <* noteLinkedDiagnostics lifetime link)
+          `finalizing` joinDiagnostics link
       let (outcome, reports) = case attempt of
             Left (BootRefused reason) → (bootFailed reason False, ["boot failed: " <> reason])
             Left BootStopped → (RunResult Nothing Nothing [] True, [])

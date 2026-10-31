@@ -38,13 +38,14 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import Hetoimasia.Console.Lua.Signals (Delivery, deliver)
 import GHC.Conc (BlockReason, ThreadStatus (ThreadBlocked), threadStatus)
-import Hetoimasia.Foundation.Log (LogFilter (..), Logger, callbackSink, defaultLogFilter, mkLogger)
+import Hetoimasia.Foundation.Log (LogFilter (..), LogSink, Logger, callbackSink, defaultLogFilter, mkLogger)
+import Hetoimasia.Run.Settle (withRecordingLifetime)
 import Hetoimasia.LuaEngine.Facade (OutputSink (..))
 import Hetoimasia.LuaEngine.Session (SessionOutcome)
 import Hetoimasia.Run (Setup (..), runGame)
 import Hetoimasia.Run.Boot (BootHooks, Prepared, noBootHooks)
 import Hetoimasia.Run.Session (Environment (..), SessionLink, newSessionLink, productionEnvironment, runPrepared)
-import Hetoimasia.Runtime.Logging (LoggingLifetime, withHandleLoggingLifetime, withLoggingLifetime)
+import Hetoimasia.Runtime.Logging (LoggingLifetime, withHandleLoggingLifetime)
 import System.Directory (createDirectoryIfMissing)
 import System.Exit (ExitCode)
 import Data.Maybe (fromMaybe)
@@ -98,19 +99,20 @@ data Changes = Changes
   -- ^ Done to the folder after its files are written and before the command starts (a link, say).
   , changeBoot ∷ FilePath → BootHooks
   -- ^ The boot seam, given the folder: a step between the manifest's first read and the scan.
-  , changeLogger ∷ Maybe Logger
-  -- ^ The logger the logging lifetime is made over, instead of stderr's: one the example counts and breaks.
+  , changeSink ∷ Maybe LogSink
+  -- ^ The sink the logging lifetime is made over, instead of stderr's: one the example counts and breaks. The lifetime
+  -- records its refusals where they occur, as the command's own does.
   , changeLink ∷ Maybe (IO SessionLink)
   -- ^ How the command makes its link to the session: one whose diagnostics writer the example holds.
   , changeEnvironment ∷ Environment → Environment
   -- ^ The session's environment: a clock that fails, say, from inside 'runSession'.
-  , changeAfterLaunch ∷ IO ()
+  , changeAfterLaunch ∷ LoggingLifetime → IO ()
   -- ^ Done once the session has returned its outcome and before the launch itself returns: where a cleanup of the
   -- scopes around the session fails, made on demand.
   }
 
 unchanged ∷ Changes
-unchanged = Changes id (\_ → pure ()) (\_ → noBootHooks) Nothing Nothing id (pure ())
+unchanged = Changes id (\_ → pure ()) (\_ → noBootHooks) Nothing Nothing id (\_ → pure ())
 
 -- | A filter that writes nothing, so a failing run does not fill the suite's own stderr.
 quietFilter ∷ LogFilter
@@ -161,12 +163,12 @@ observeWith changes files scenario = withFolder files $ \folder → do
           { setupForce = atomically (modifyTVar' forced (+ 1))
           , setupReady = putMVar coordinator
           , setupBoot = changeBoot changes folder
-          , setupLifetime = \configuration -> case changeLogger changes of
-              Just logger -> withLoggingLifetime logger
+          , setupLifetime = \configuration -> case changeSink changes of
+              Just sink -> withRecordingLifetime defaultLogFilter sink
               Nothing -> withHandleLoggingLifetime configuration stderr
           , setupLink = fromMaybe newSessionLink (changeLink changes)
           , setupReport = \line -> atomically (modifyTVar' reports (<> [line]))
-          , setupLaunch = \lifetime stop link prepared → runPrepared (changeEnvironment changes environment) lifetime stop link prepared Nothing (\_ → pure ()) <* changeAfterLaunch changes
+          , setupLaunch = \lifetime stop link prepared → runPrepared (changeEnvironment changes environment) lifetime stop link prepared Nothing (\_ → pure ()) <* changeAfterLaunch changes lifetime
           }
       probe =
         Probe

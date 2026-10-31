@@ -253,7 +253,7 @@ checkVerdict lifetime = \case
   Just verdict → do
     let (fatal, lost) = partition fatalIssue (verdictIssues verdict)
     unless (null lost) $
-      reportDiagnostic lifetime (logWarning (lifetimeLogger lifetime) component "diagnostic records were lost" [("issues", reportText (Text.pack (show lost)))])
+      reportDiagnostic (logWarning (lifetimeLogger lifetime) component "diagnostic records were lost" [("issues", reportText (Text.pack (show lost)))])
     unless (null fatal) $
       ioError (userError (Text.unpack (reportText ("the diagnostic capture was not clean: " <> Text.pack (show fatal)))))
 

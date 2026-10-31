@@ -7,9 +7,9 @@
 --   failures, with their context, and lets an asynchronous exception go on ('isAsynchronous').
 -- * A diagnostic that cannot be written must not replace what it reports ('bestEffort'), and its failure is marked
 --   as the diagnostics' own ('diagnostic').
--- * A write to the diagnostic path that fails while something else is being unwound is /recorded on the logging
---   lifetime/ ('reportDiagnostic'), never dropped: the lifetime then knows that path has failed, flushes nothing
---   through it, and the launcher writes nothing more through it ('pathFailed').
+-- * A write to the diagnostic path that fails is /recorded on the logging lifetime where it occurs/, from inside
+--   the sink ('withRecordingLifetime'): the lifetime then knows that path has failed, flushes nothing through it,
+--   and nothing writes through it again, whoever asks and whenever they run.
 -- * Several failures that belong together are combined with the cleanup machinery's own evidence, so none
 --   is lost ('combine').
 module Hetoimasia.Run.Settle
@@ -20,6 +20,7 @@ module Hetoimasia.Run.Settle
   , bestEffort
   , diagnostic
   , reportDiagnostic
+  , withRecordingLifetime
   , notePathFailure
   , pathFailed
   , combine
@@ -36,13 +37,15 @@ import Control.Exception
   , rethrowIO
   , tryWithContext
   )
-import Control.Monad (unless)
+import Control.Monad (unless, when)
 import Data.Foldable (traverse_)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as Text
+import Hetoimasia.Foundation.Log (LogFilter, LogSink, callbackSinkWith, flushSink, mkLogger, writeEntry)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, composeCleanup, displayCleanupFailure)
-import Hetoimasia.Runtime.Logging (LoggingLifetime, recordReport, recordedReports)
+import Hetoimasia.Runtime.Logging (LoggingLifetime, recordReport, recordedReports, withLoggingLifetime)
 import Hetoimasia.Runtime.Reporting (ReportResult (ReportFailed), markDiagnostic)
 
 -- | Whether a caught failure is an asynchronous exception (a cancellation).
@@ -98,13 +101,43 @@ notePathFailure lifetime failure = do
   already ← pathFailed lifetime
   unless already (recordReport lifetime (ReportFailed failure))
 
--- | A write to the diagnostic path, made while a failure is being unwound and so not allowed to replace it: skipped
--- when the path has already failed; otherwise run, marked, and when it fails synchronously the failure is recorded
--- on the lifetime instead of being raised. A cancellation still goes on.
-reportDiagnostic ∷ LoggingLifetime → IO () → IO ()
-reportDiagnostic lifetime write = do
-  already ← pathFailed lifetime
-  unless already (attemptSync (markDiagnostic write) >>= either (notePathFailure lifetime) pure)
+-- | A write to the diagnostic path, made while a failure is being unwound and so not allowed to replace it: a
+-- synchronous failure of it is marked as the diagnostics' own and ignored. That the path has failed is already on
+-- the lifetime: the sink records it where it happens ('recordingSink'). A cancellation still goes on.
+reportDiagnostic ∷ IO () → IO ()
+reportDiagnostic = bestEffort . diagnostic
+
+-- | The lifetime a run is entered in, over a sink that /records its own refusals where they occur/.
+--
+-- The first write or flush the sink refuses is recorded on the lifetime as a failed report, at that moment and
+-- from inside the sink, whichever component, thread or scope made it: the session's diagnostics writer, a boot
+-- diagnostic, a drain's report, the verdict's warning, and a reporting boundary of the native application
+-- alike. Every later write or flush is refused without touching the sink. So any enclosing boundary that runs at
+-- any later point already sees the path as failed, and the lifetime makes no final flush through it; no
+-- snapshot, finalizer or join is the source of truth, and nothing waits for any of them. The refusal is still
+-- raised to the writer that met it (the session counts it in its own evidence), and a cancellation is never
+-- recorded as a refusal.
+withRecordingLifetime ∷ LogFilter → LogSink → (LoggingLifetime → IO r) → IO r
+withRecordingLifetime configuration sink use = do
+  held ← newIORef Nothing
+  withLoggingLifetime (mkLogger configuration (recordingSink held sink)) $ \lifetime → do
+    writeIORef held (Just lifetime)
+    use lifetime
+
+-- | A sink that records its first refusal on the lifetime in the cell, once there is one, and refuses everything
+-- after it. See 'withRecordingLifetime'.
+recordingSink ∷ IORef (Maybe LoggingLifetime) → LogSink → LogSink
+recordingSink held sink = callbackSinkWith (guarded . writeEntry sink) (guarded (flushSink sink))
+  where
+    guarded action = do
+      lifetime ← readIORef held
+      already ← maybe (pure False) pathFailed lifetime
+      when already (ioError (userError "the diagnostic path has already failed"))
+      tryWithContext action >>= \case
+        Right () → pure ()
+        Left failure
+          | isAsynchronous failure → rethrowIO failure
+          | otherwise → traverse_ (`notePathFailure` failure) lifetime >> rethrowIO failure
 
 -- | A primary failure with these further failures retained beside it, each under its label, as the cleanup
 -- machinery retains evidence: none is lost, and the primary keeps its type, value and context.

@@ -24,7 +24,8 @@ import Control.Monad (unless, void)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf)
 import GHC.Conc (BlockReason (BlockedOnException, BlockedOnMVar, BlockedOnSTM))
-import Hetoimasia.Foundation.Log (callbackSinkWith, defaultLogFilter, mkLogger)
+import Hetoimasia.Foundation.Log (callbackSinkWith, defaultLogFilter)
+import Hetoimasia.Run.Settle (withRecordingLifetime)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, displayCleanupFailure, withResource)
 import Hetoimasia.Run.Serve (Owner (..), drainAttempts, joinFailure, runOwned, serveSpawned)
 import Hetoimasia.Run.Session (awaitDiagnostics, newSessionLinkEndingWith)
@@ -222,10 +223,9 @@ spec = describe "Serve" $ do
           callbackSinkWith
             (\_ → atomically (modifyTVar' writes (+ 1)) >> ioError (userError "the diagnostic sink is broken"))
             (atomically (modifyTVar' flushes (+ 1)))
-        logger = mkLogger defaultLogFilter sink
         owner = ownerWith fake (Just "the owner loop failed") (ioError (userError "the drain failed too"))
         session = atomically (readTVar (fakeExited fake) >>= check)
-    outcome ← bounded $ tryWithContext @SomeException $ withLoggingLifetime logger $ \lifetime →
+    outcome ← bounded $ tryWithContext @SomeException $ withRecordingLifetime defaultLogFilter sink $ \lifetime →
       serveSpawned lifetime owner (putMVar spawnedRef) quiet quiet session
     -- Let the session go, as the application's exit does, and wait for it: nothing outlives the example.
     atomically (writeTVar (fakeExited fake) True)

@@ -15,10 +15,10 @@ import qualified Data.Text as Text
 import Hetoimasia.Console.Lua.Signals (Delivery (..))
 import Hetoimasia.LuaEngine.Facade (OutputSink (..))
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
-import Control.Exception (AsyncException (UserInterrupt), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, tryWithContext)
+import Control.Exception (AsyncException (UserInterrupt), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, rethrowIO, tryWithContext)
 import Data.List (isInfixOf)
 import GHC.Conc (BlockReason (BlockedOnSTM))
-import Hetoimasia.Foundation.Log (callbackSinkWith, defaultLogFilter, mkLogger)
+import Hetoimasia.Foundation.Log (callbackSinkWith, logInfo, unsafeComponent)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext, displayCleanupFailure, withResource)
 import Hetoimasia.Content (ContentFailure, withContentRoot)
 import Hetoimasia.LuaEngine.Boot (ContentConfiguration (..), contentConfiguration)
@@ -26,10 +26,11 @@ import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.Foundation.Time (readInstant, scriptedSource)
 import Hetoimasia.LuaEngine.Session (SessionOutcome)
 import Hetoimasia.Run.Session (Environment (..))
-import Hetoimasia.Run.Settle (withEvidence)
+import Hetoimasia.Run.Settle (attemptSync, withEvidence)
+import Hetoimasia.Runtime.Reporting (reportTerminalFailureWith)
 import Hetoimasia.Run (Setup (..), runGame)
 import Hetoimasia.Run.Session (newSessionLinkEndingWith)
-import Hetoimasia.Runtime.Logging (withLoggingLifetime)
+import Hetoimasia.Runtime.Logging (lifetimeLogger, recordReport, withLoggingLifetime)
 import Hetoimasia.Run.Boot (BootHooks (..), noBootHooks)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
@@ -273,8 +274,7 @@ stops = describe "stops and signals" $ do
           callbackSinkWith
             (\_ → atomically (modifyTVar' writes (+ 1)) >> ioError (userError "the diagnostic sink is broken"))
             (atomically (modifyTVar' flushes (+ 1)))
-        logger = mkLogger defaultLogFilter sink
-    observed ← observeWith unchanged {changeLogger = Just logger} [("hetoimasia.json", commonManifest), ("main.lua", lua (entry (logic <> quittingUi)))] (\_ → pure ())
+    observed ← observeWith unchanged {changeSink = Just sink} [("hetoimasia.json", commonManifest), ("main.lua", lua (entry (logic <> quittingUi)))] (\_ → pure ())
     observedStatus observed `shouldBe` ExitFailure 1
     observedOut observed `shouldBe` []
     -- The failed write is marked as the diagnostics' own, so the lifetime does not flush through that sink, and the
@@ -295,8 +295,7 @@ stops = describe "stops and signals" $ do
                 when (written >= 1) (ioError (userError "the diagnostic sink broke after its first write"))
             )
             (atomically (modifyTVar' flushes (+ 1)))
-        logger = mkLogger defaultLogFilter sink
-    observed <- observeWith unchanged {changeLogger = Just logger} [("hetoimasia.json", commonManifest), ("main.lua", lua (entry (logic <> quittingUi)))] (\_ -> pure ())
+    observed <- observeWith unchanged {changeSink = Just sink} [("hetoimasia.json", commonManifest), ("main.lua", lua (entry (logic <> quittingUi)))] (\_ -> pure ())
     observedStatus observed `shouldBe` ExitSuccess
     -- The lifetime was told the path had failed, so it did not flush through it.
     readTVarIO flushes >>= (`shouldBe` 0)
@@ -312,12 +311,11 @@ stops = describe "stops and signals" $ do
                 when (written >= 1) (ioError (userError "the diagnostic sink broke after its first write"))
             )
             (atomically (modifyTVar' flushes (+ 1)))
-        logger = mkLogger defaultLogFilter sink
     -- The session returned an outcome that carries the refusal, and a scope around it then fails to clean up: the
     -- refusal was recorded where the outcome was produced, before that cleanup could report or flush.
     observed <-
       observeWith
-        unchanged {changeLogger = Just logger, changeAfterLaunch = ioError (userError "a cleanup around the session failed")}
+        unchanged {changeSink = Just sink, changeAfterLaunch = \_ -> ioError (userError "a cleanup around the session failed")}
         [("hetoimasia.json", commonManifest), ("main.lua", lua (entry (logic <> quittingUi)))]
         (\_ -> pure ())
     observedStatus observed `shouldBe` ExitFailure 1
@@ -334,7 +332,6 @@ stops = describe "stops and signals" $ do
                 when (written >= 1) (ioError (userError "the diagnostic sink broke after its first write"))
             )
             (atomically (modifyTVar' flushes (+ 1)))
-        logger = mkLogger defaultLogFilter sink
         -- A clock that fails once the sink has refused a write: the session raises it from inside 'runSession' and
         -- no outcome is returned.
         failing environment =
@@ -346,18 +343,54 @@ stops = describe "stops and signals" $ do
             }
     observed <-
       observeWith
-        unchanged {changeLogger = Just logger, changeEnvironment = failing}
+        unchanged {changeSink = Just sink, changeEnvironment = failing}
         [("hetoimasia.json", commonManifest), ("main.lua", lua (entry (logic <> quittingUi)))]
         (\_ -> pure ())
     observedStatus observed `shouldBe` ExitFailure 1
     readTVarIO flushes >>= (`shouldBe` 0)
     observedReports observed `shouldBe` []
 
+  it "writes nothing more through a sink that refused a diagnostic after the session's last answer, when a teardown then fails and its terminal report is written" $ do
+    broken <- newTVarIO False
+    calls <- newTVarIO (0 :: Int)
+    flushes <- newTVarIO (0 :: Int)
+    delta <- newTVarIO (-1 :: Int)
+    let sink =
+          callbackSinkWith
+            ( \_ -> do
+                atomically (modifyTVar' calls (+ 1))
+                refused <- readTVarIO broken
+                when refused (ioError (userError "the diagnostic sink broke after the session ended"))
+            )
+            (atomically (modifyTVar' flushes (+ 1)))
+        teardown lifetime = do
+          -- The writer's tail: a diagnostic written after the session's last answer, which the sink refuses. Nothing
+          -- is snapshotted or joined: the sink records the refusal where it happens.
+          atomically (writeTVar broken True)
+          void (attemptSync (logInfo (lifetimeLogger lifetime) (unsafeComponent "run.test") "a late diagnostic" []))
+          before <- readTVarIO calls
+          -- The teardown then fails, and the managed terminal report of that failure is written.
+          outcome <-
+            tryWithContext @SomeException $
+              reportTerminalFailureWith (recordReport lifetime) (lifetimeLogger lifetime) (unsafeComponent "run.test") "the teardown failed" (pure []) $
+                ioError (userError "the teardown failed")
+          after <- readTVarIO calls
+          atomically (writeTVar delta (after - before))
+          either rethrowIO pure outcome
+    observed <-
+      observeWith
+        unchanged {changeSink = Just sink, changeAfterLaunch = teardown}
+        [("hetoimasia.json", commonManifest), ("main.lua", lua (entry (logic <> quittingUi)))]
+        (\_ -> pure ())
+    observedStatus observed `shouldBe` ExitFailure 1
+    -- The report was refused without touching the sink, and nothing was flushed through it.
+    readTVarIO delta >>= (`shouldBe` 0)
+    readTVarIO flushes >>= (`shouldBe` 0)
+
   it "writes one terminal line, and flushes once, for an ordinary failure with a working diagnostic path" $ do
     flushes ← newTVarIO (0 ∷ Int)
     let sink = callbackSinkWith (\_ → pure ()) (atomically (modifyTVar' flushes (+ 1)))
-        logger = mkLogger defaultLogFilter sink
-    observed ← observeWith unchanged {changeLogger = Just logger} [("main.lua", lua "return {}")] (\_ → pure ())
+    observed ← observeWith unchanged {changeSink = Just sink} [("main.lua", lua "return {}")] (\_ → pure ())
     observedStatus observed `shouldBe` ExitFailure 1
     length (observedReports observed) `shouldBe` 1
     readTVarIO flushes >>= (`shouldSatisfy` (>= 1))

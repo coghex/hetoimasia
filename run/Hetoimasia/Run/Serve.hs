@@ -140,8 +140,8 @@ serve restore lifetime owner stopSession turn spawned = do
                   attemptSync (ownerDrain owner over) >>= \case
                     Right () → pure ()
                     Left again → do
-                      -- A failed write is recorded on the lifetime (and ends further writes through that path), never dropped.
-                      reportDiagnostic lifetime (logError (lifetimeLogger lifetime) component "the owner loop failed while the session was draining" [("reason", reportText (Text.pack (displayException again)))])
+                      -- A failed write has been recorded on the lifetime by the sink that refused it.
+                      reportDiagnostic (logError (lifetimeLogger lifetime) component "the owner loop failed while the session was draining" [("reason", reportText (Text.pack (displayException again)))])
                       go (attempt + 1 ∷ Int)
 
 -- | Ask the session to stop, once, remembering a cancellation that arrives meanwhile (the request is made again
