@@ -63,6 +63,13 @@
 -- |                     |               | samples write; the         |             |                     | final value retained in  |
 -- |                     |               | observation publishes it   |             |                     | the closed snapshot      |
 -- +---------------------+---------------+----------------------------+-------------+---------------------+--------------------------+
+-- | Visible follow-up   | The window    | Reconciliation arms or     | Owner       | The window          | Idle at creation; every  |
+-- | phase               |               | stops it with the iconify  |             |                     | stop returns it to idle  |
+-- |                     |               | capture it consumes; a     |             |                     |                          |
+-- |                     |               | re-read advances it; a     |             |                     |                          |
+-- |                     |               | hide control stops it; the |             |                     |                          |
+-- |                     |               | host turn reads it         |             |                     |                          |
+-- +---------------------+---------------+----------------------------+-------------+---------------------+--------------------------+
 --
 -- None of this is application state.
 --
@@ -122,6 +129,7 @@ import Hetoimasia.GLFW.Internal.Mode (NativeConstraints (..))
 import Hetoimasia.GLFW.Internal.Session (NativeWindow, Session)
 import Hetoimasia.GLFW.Internal.Window.Identity (WindowId, windowLocalIdentity)
 import Hetoimasia.GLFW.Internal.Window.Observation (WindowObservation)
+import Hetoimasia.GLFW.Internal.Window.Revisit (Revisit)
 import Numeric.Natural (Natural)
 
 -- | A scoped window. Its representation is private to this package.
@@ -133,6 +141,9 @@ data Window = Window
   , windowCaptures ∷ !(IORef Captures)
   , windowOwnerState ∷ !(IORef OwnerState)
   , windowControl ∷ !(IORef ControlState)
+  , windowRevisit ∷ !(IORef Revisit)
+    -- ^ The follow-up of the visible attribute after an iconify transition; see
+    -- "Hetoimasia.GLFW.Internal.Window.Revisit". Owner thread only.
   , windowPublisher ∷ !(SnapshotPublisher WindowObservation)
   , windowFeed ∷ !(IORef (Maybe InputFeed))
   , windowBeforeHide ∷ !(IO ())

@@ -74,8 +74,11 @@ data HostConfig = HostConfig
     -- positive 'Duration' that never exceeds the seconds configured.
   , hostClock ∷ !MonotonicSource
     -- ^ The monotonic source 'runScheduledOwnerLoop' samples, and the clock
-    -- domain every deadline it is given belongs to. 'runOwnerLoop' never reads
-    -- it. A seam example configures a 'Hetoimasia.Foundation.Time.scriptedSource'
+    -- domain every deadline it is given belongs to. 'runOwnerLoop' reads it
+    -- only for the visible follow-up of a window that is in its slow phase or
+    -- is spending its quick bound (at most once a turn, and never for any other
+    -- window); 'runScheduledOwnerLoop' takes its two readings a turn as before
+    -- and reuses the second for that follow-up. A seam example configures a 'Hetoimasia.Foundation.Time.scriptedSource'
     -- here and scripts every reading exactly.
   }
 

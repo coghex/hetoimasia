@@ -44,6 +44,7 @@ import qualified Test.GLFW.Opacity as Opacity
 import qualified Test.GLFW.Owner as Owner
 import qualified Test.GLFW.Protected as Protected
 import qualified Test.GLFW.Render as Render
+import qualified Test.GLFW.Revisit as Revisit
 import qualified Test.GLFW.Scheduled as Scheduled
 import qualified Test.GLFW.Session as Session
 import qualified Test.GLFW.Surface as Surface
@@ -68,6 +69,7 @@ spec = describe "GLFW" $ do
   Scheduled.spec
   Trace.spec
   Render.spec
+  Revisit.spec
   Dynamic.spec
   Monitor.spec
   Input.spec

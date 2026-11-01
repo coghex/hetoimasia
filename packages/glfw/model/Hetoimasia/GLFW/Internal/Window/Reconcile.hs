@@ -48,6 +48,7 @@ module Hetoimasia.GLFW.Internal.Window.Reconcile
   , reconcileWindow
   , reconcileWith
   , reconcileAdjusted
+  , reconcileFollowing
   , commitObservation
   , raiseLatchedFault
   ) where
@@ -71,6 +72,7 @@ import Hetoimasia.GLFW.Internal.Session (currentSessionMonitors, liveMonitors, s
 import Hetoimasia.GLFW.Internal.Window.Callbacks (rethrowFault)
 import Hetoimasia.GLFW.Internal.Window.Identity (WindowId, windowLocalIdentity)
 import Hetoimasia.GLFW.Internal.Window.Observation (CloseRequest (..), WindowObservation (..))
+import Hetoimasia.GLFW.Internal.Window.Revisit (Revisit, armedBy)
 import Hetoimasia.GLFW.Internal.Window.Sample (Sample (..))
 import Hetoimasia.GLFW.Internal.Window.State
   ( Captures (..)
@@ -148,7 +150,16 @@ reconcileWith forced = reconcileAdjusted forced id
 -- compared and prepared: how a transition publishes its mode record beside the
 -- sample it was reconciled with.
 reconcileAdjusted ∷ Bool → (WindowObservation → WindowObservation) → IO () → Window → Maybe Sample → IO ()
-reconcileAdjusted forced adjust interruption window sample = do
+reconcileAdjusted forced = reconcileFollowing forced id
+
+-- | 'reconcileAdjusted', also moving the window's visible follow-up phase in
+-- the commit's one masked step, beside the capture clearing and the
+-- publication, so nothing can separate them: @settle@ is the phase change the
+-- caller's own work owes, and the iconify capture this fold consumed then
+-- arms or stops the follow-up over it. An iconify transition is thereby seen
+-- by whichever boundary consumes its capture, exactly once.
+reconcileFollowing ∷ Bool → (Revisit → Revisit) → (WindowObservation → WindowObservation) → IO () → Window → Maybe Sample → IO ()
+reconcileFollowing forced settle adjust interruption window sample = do
   pending ← readIORef (windowCaptures window)
   derived ← case sample of
     Just taken → presentationFrom window taken
@@ -177,12 +188,13 @@ reconcileAdjusted forced adjust interruption window sample = do
         else (latched, False)
     when cleared $ do
       forM_ prepared (commitObservation window next issued')
+      atomicModifyIORef' (windowRevisit window) (\phase → (armedBy (capturedIconified pending) (settle phase), ()))
       -- Publication is bounded STM and evaluation. It stays uninterruptible
       -- so a cancellation cannot admit a prefix and drop the rest.
       uninterruptibleMask_ (publishCapturedInput window pending)
     interruption
     pure cleared
-  unless committed (reconcileAdjusted forced adjust interruption window sample)
+  unless committed (reconcileFollowing forced settle adjust interruption window sample)
 
 -- | Settle a window's monitor claims with a full sample, and answer how its
 -- applied mode changes: derived from the sample against the current monitors.
