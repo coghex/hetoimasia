@@ -257,10 +257,26 @@ generate_fingerprint() {
   done
 }
 
+# The Linux receipt of the launcher's native suite captures and closes its windows through an external helper
+# (tools/display/x11_window.py, LFE-25). Its preparation is that it loads libX11 with every entry point it uses; it
+# needs no display, so the build stage can prove it, and the timed execution proves it again. A helper that is not ready
+# refuses the run: a requested native group is blocked, never skipped.
+prepare_x11_helper() {
+  [ "$(uname -s)" = "Linux" ] || return 0
+  python3 -I "$root/tools/display/x11_window.py" prepare >/dev/null \
+    || refuse "the X11 evidence helper is not ready: python3 -I tools/display/x11_window.py prepare failed"
+  echo "vulkan: X11 evidence helper ready"
+}
+
 case "$mode" in
   build)
     generate_fingerprint
     cabal build "${cabal_flags[@]}" "${components[@]}"
+    for component in "${components[@]}"; do
+      case "$component" in
+        *run-native-tests) prepare_x11_helper ;;
+      esac
+    done
     ;;
   test)
     generate_fingerprint
@@ -362,6 +378,7 @@ DIGEST
         || refuse "the full-product hetoimasia executable has not been built; prepare it with: bash tools/vulkan/run.sh build hetoimasia:exe:hetoimasia hetoimasia:test:run-native-tests"
       export HETOIMASIA_RUN_EXECUTABLE="$run_executable"
       echo "vulkan: launched executable $HETOIMASIA_RUN_EXECUTABLE"
+      prepare_x11_helper
     fi
 
     if [ -z "${HETOIMASIA_NATIVE_SESSION:-}" ] && [ "$(uname -s)" = "Linux" ]; then

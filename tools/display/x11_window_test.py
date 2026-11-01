@@ -359,6 +359,16 @@ class CommandLine(unittest.TestCase):
         status, report = self.call(display, "check")
         self.assertEqual((status, report["outcome"]), (0, "ready"))
 
+    def test_prepare_needs_no_display_and_names_the_library_or_fails_as_unsafe_display(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = x.main(["prepare"], environment={})
+        report = json.loads(out.getvalue())
+        if status == 0:
+            self.assertEqual(report["outcome"], "prepared")
+        else:
+            self.assertEqual((report["ok"], report["outcome"]), (False, "unsafe_display"))
+
     def test_a_usage_error_exits_two_before_any_display_is_touched(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
             x.main(["close", "--pid", "1"], backend=FakeDisplay(), environment={})

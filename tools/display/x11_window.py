@@ -448,19 +448,37 @@ def close_window(backend: Backend, pid: int, window: int, expect_size: Optional[
 # --- The real display --------------------------------------------------------------------------------------------------------
 
 
+REQUIRED_SYMBOLS = (
+    "XOpenDisplay", "XCloseDisplay", "XDefaultRootWindow", "XInternAtom", "XGetAtomName", "XFree", "XQueryTree",
+    "XGetWindowAttributes", "XTranslateCoordinates", "XGetWindowProperty", "XGetImage", "XSendEvent", "XSync", "XSetErrorHandler",
+)
+
+
+def load_library():
+    """libX11, with every entry point this helper uses resolved. A missing library or symbol is ``unsafe_display``: the
+    qualification tooling is not ready, and nothing later may run as if it were."""
+    import ctypes
+    import ctypes.util
+
+    name = ctypes.util.find_library("X11") or "libX11.so.6"
+    try:
+        library = ctypes.CDLL(name)
+    except OSError as error:
+        raise UnsafeDisplay("libX11 could not be loaded (%s): %s" % (name, error))
+    for symbol in REQUIRED_SYMBOLS:
+        if not hasattr(library, symbol):
+            raise UnsafeDisplay("libX11 (%s) lacks %s" % (name, symbol))
+    return library, name
+
+
 class X11Backend(Backend):
     """libX11 through ctypes, on the display named by DISPLAY."""
 
     def __init__(self):
         import ctypes
-        import ctypes.util
 
         self.c = ctypes
-        name = ctypes.util.find_library("X11") or "libX11.so.6"
-        try:
-            self.x = ctypes.CDLL(name)
-        except OSError as error:
-            raise UnsafeDisplay("libX11 could not be loaded (%s): %s" % (name, error))
+        self.x, _ = load_library()
         c = ctypes
         Display, Window, Atom = c.c_void_p, c.c_ulong, c.c_ulong
 
@@ -726,6 +744,7 @@ def _point(text: str) -> Tuple[int, int]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="x11_window.py", description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("prepare", help="prove libX11 loads with every entry point this helper uses; needs no display")
     sub.add_parser("check", help="prove libX11 loads and the display is the isolated one")
     for name in ("candidates", "identify", "geometry", "capture", "close"):
         action = sub.add_parser(name)
@@ -742,6 +761,9 @@ def build_parser() -> argparse.ArgumentParser:
 def run(arguments: argparse.Namespace, backend: Backend) -> dict:
     if arguments.command == "check":
         return {"ok": True, "outcome": "ready", "display": backend.display_name()}
+    if arguments.command == "prepare":
+        _, name = load_library()
+        return {"ok": True, "outcome": "prepared", "library": name}
     pid = arguments.pid
     if arguments.command == "candidates":
         return {"ok": True, "outcome": "candidates", "pid": pid, "candidates": [c.report() for c in candidates(backend, pid)]}
@@ -761,7 +783,7 @@ def run(arguments: argparse.Namespace, backend: Backend) -> dict:
 def main(argv: Optional[Sequence[str]] = None, backend: Optional[Backend] = None, environment: Optional[Dict[str, str]] = None) -> int:
     environment = dict(os.environ) if environment is None else environment
     arguments = build_parser().parse_args(argv)
-    owned = backend is None
+    owned = backend is None and arguments.command != "prepare"
     try:
         if owned:
             require_isolated_display(environment)
