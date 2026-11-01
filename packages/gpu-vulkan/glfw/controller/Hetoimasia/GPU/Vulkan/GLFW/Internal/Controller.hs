@@ -416,6 +416,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Targets
   , Targets
   , adoptedScene
   , hasRetiring
+  , markDeferred
   , newTargets
   , pendingIds
   , pendingScenes
@@ -1004,8 +1005,9 @@ controllerOperations (VulkanController state) renderer lifecycle offscreen =
         -- and a release request it held back is no longer held.
         _ ← atomically (takeRetiring offscreen (stateScenes state))
         waitingTargets ← atomically (pendingScenes offscreen)
-        answeredTargets ← traverse (\(identity, scene, revision) → (,) identity <$> adoptScene (stateScenes state) (adoptingInto offscreen lifecycle) limit (TargetAdopter identity) scene revision) waitingTargets
-        let pressedTargets = [identity | (identity, AtLimit) ← answeredTargets]
+        answeredTargets ← traverse (\(identity, scene, revision) → (,,) identity revision <$> adoptScene (stateScenes state) (adoptingInto offscreen lifecycle) limit (TargetAdopter identity) scene revision) waitingTargets
+        let pressedTargets = [(identity, revision) | (identity, revision, AtLimit) ← answeredTargets]
+        atomically (markDeferred offscreen pressedTargets)
         -- A target at its retention limit adopted nothing: this step renders
         -- nothing for it and asks nothing of it, so its demand and the window's
         -- newer publication are still owed when a release has made room.
@@ -1100,8 +1102,10 @@ targetsWake state targets = do
   retiring ← hasRetiring targets
   pending ← pendingIds targets
   limit ← retentionLimit . frameSlotLimit . modelBudgets <$> readRootsModel (stateRoots state)
-  room ← traverse (fmap not . adopterAtLimit (stateScenes state) limit . TargetAdopter) pending
-  pure (retiring || or room)
+  -- A pending revision asks for a round until the owner has noted that it found no room for it, and then only
+  -- once a release has made room.
+  asks ← traverse (\(identity, noted) → if noted then not <$> adopterAtLimit (stateScenes state) limit (TargetAdopter identity) else pure True) pending
+  pure (retiring || or asks)
 
 -- | The lifecycle the owner adopts an offscreen target's scene through: the
 -- host's own, and then, in the same uninterruptible transition, the exact

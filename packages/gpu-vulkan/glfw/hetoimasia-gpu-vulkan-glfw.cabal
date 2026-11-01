@@ -106,6 +106,7 @@ test-suite integration-tests
         Test.GPU.Vulkan.GLFW.Rescue
         Test.GPU.Vulkan.GLFW.Scenes
         Test.GPU.Vulkan.GLFW.StandIn
+        Test.GPU.Vulkan.GLFW.Targets
     ghc-options: -threaded -rtsopts
     build-depends:
         base >=4.22 && <4.23,

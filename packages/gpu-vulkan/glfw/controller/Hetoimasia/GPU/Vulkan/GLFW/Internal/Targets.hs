@@ -48,9 +48,11 @@
 -- uninterruptible transition as the ledger's record and the hook
 -- ('recordAdopted'), so the scene a batch is recorded against is the scene the
 -- ledger accounts for. A target at its retention limit adopts nothing newer
--- and the owner asks no round for it until a release makes room, which the
--- wake the controller composes reads from the ledger itself
--- ('pendingIds'); its publication never waits.
+-- and the owner asks no round for it, once it has noted the deferral for that
+-- revision ('markDeferred'), until a release makes room, which the wake the
+-- controller composes reads from the ledger itself ('pendingIds'); a newer
+-- publication is a new revision and is noted afresh. Its publication never
+-- waits.
 --
 -- = Unregistration
 --
@@ -89,6 +91,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Targets
     -- * The owner's step
   , pendingScenes
   , pendingIds
+  , markDeferred
   , recordAdopted
   , adoptedScene
   , takeRetiring
@@ -143,6 +146,9 @@ data Cell scene = Cell
     -- ^ Its revision: 0 for the initial scene.
   , cellAdopted ∷ !(Maybe (Natural, scene))
     -- ^ The revision the owner adopted last, with the exact scene it took.
+  , cellDeferredAt ∷ !(Maybe Natural)
+    -- ^ The revision whose adoption the owner found no room for and has noted,
+    -- so it asks no further round for that revision while there is still none.
   }
 
 data Standing scene = Standing
@@ -188,7 +194,7 @@ registerTarget targets scenes gate deviceExists =
                 (targetsStanding targets)
                 standing
                   { standingNext = standingNext standing + 1
-                  , standingLive = Map.insert identity (Cell (targetsInitial targets) 0 Nothing) (standingLive standing)
+                  , standingLive = Map.insert identity (Cell (targetsInitial targets) 0 Nothing Nothing) (standingLive standing)
                   }
               registerSceneTarget scenes (TargetAdopter identity)
               pure (Right identity)
@@ -260,10 +266,23 @@ recordAdopted targets identity revision scene =
 adoptedScene ∷ Targets scene → OffscreenTargetId → STM (Maybe (Maybe (Natural, scene)))
 adoptedScene targets identity = fmap cellAdopted . Map.lookup identity . standingLive <$> readTVar (targetsStanding targets)
 
--- | The registered targets with a scene to adopt: a newer revision than the one
--- adopted, or none adopted yet.
-pendingIds ∷ Targets scene → STM [OffscreenTargetId]
-pendingIds targets = map (\(identity, _, _) → identity) <$> pendingScenes targets
+-- | The registered targets with a scene to adopt — a newer revision than the one
+-- adopted, or none adopted yet — each with whether the owner has already noted
+-- that it found no room for that revision.
+pendingIds ∷ Targets scene → STM [(OffscreenTargetId, Bool)]
+pendingIds targets = do
+  standing ← readTVar (targetsStanding targets)
+  pure
+    [ (identity, cellDeferredAt cell == Just (cellRevision cell))
+    | (identity, cell) ← Map.toList (standingLive standing)
+    , maybe True ((< cellRevision cell) . fst) (cellAdopted cell)
+    ]
+
+-- | The owner found no room to adopt these revisions: it notes each once.
+markDeferred ∷ Targets scene → [(OffscreenTargetId, Natural)] → STM ()
+markDeferred targets deferred =
+  modifyTVar' (targetsStanding targets) $ \standing →
+    standing {standingLive = foldr (\(identity, revision) → Map.adjust (\cell → cell {cellDeferredAt = Just revision}) identity) (standingLive standing) deferred}
 
 -- | End, in the ledger and in the same transaction, every target that was
 -- unregistered, and forget its entry: its adopted revisions stay until

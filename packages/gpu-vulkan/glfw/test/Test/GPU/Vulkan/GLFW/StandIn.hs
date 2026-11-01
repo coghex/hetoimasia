@@ -86,6 +86,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , presentRounds
   , awaitPresents
   , retireNextPresentations
+  , completeNextSubmissions
 
     -- * Consumer construction and capture (VK-19)
   , Creation (..)
@@ -942,6 +943,10 @@ data Rendering = Rendering
     -- ^ Where the graphics owner is cancelled, once, from another thread.
   , renderingCancelled ∷ !(TVar Bool)
     -- ^ Whether that cancellation has been thrown.
+  , renderingSubmissionCount ∷ !(TVar (Maybe Int))
+    -- ^ When set, how many more submission fences may answer signalled, whatever
+    -- 'submissionsComplete' says: how an example completes one submission and
+    -- leaves another pending.
   }
 
 -- | Where a rig cancels the graphics owner.
@@ -1015,6 +1020,7 @@ newRendering =
     <*> newTVarIO False
     <*> newTVarIO Nothing
     <*> newTVarIO False
+    <*> newTVarIO Nothing
 
 -- | Whether a submission's fence answers signalled when it is next asked.
 submissionsComplete ∷ Rig → Bool → IO ()
@@ -1161,6 +1167,13 @@ presentsNow rig attachment = length . filter presented <$> readTVar (rigFrameEve
 retireNextPresentations ∷ Rig → Maybe Int → IO ()
 retireNextPresentations rig = atomically . writeTVar (renderingRetireCount (rigRendering rig))
 
+-- | Let only the next this many submission fences asked answer signalled, and no
+-- more ('Nothing' is no limit), while 'submissionsComplete' is on: how an example
+-- completes one batch and leaves another pending, whichever the owner asks about
+-- first.
+completeNextSubmissions ∷ Rig → Maybe Int → IO ()
+completeNextSubmissions rig = atomically . writeTVar (renderingSubmissionCount (rigRendering rig))
+
 -- | The device's allocator: one host-visible, coherent and cached memory
 -- type and one device-local type, and every allocation dedicated, so a
 -- placement in held memory is never placed and an allocating call opens
@@ -1283,13 +1296,17 @@ renderingLayers rescued events rendering clock =
               submissions ← readTVar (renderingSubmissions rendering)
               presentations ← readTVar (renderingPresentations rendering)
               counted ← readTVar (renderingRetireCount rendering)
+              submissionsLeft ← readTVar (renderingSubmissionCount rendering)
               kept ← readTVar (renderingKept rendering)
               presentedTo ← fmap fst . Map.lookup handle <$> readTVar (renderingPresented rendering)
               rescuedNow ← rescued
               let keeping = maybe False (`Set.member` kept) presentedTo
               case kind of
                 Just FenceDone → pure True
-                Just FenceSubmission | submissions || rescuedNow → True <$ modifyTVar' (renderingFences rendering) (Map.insert handle FenceDone)
+                Just FenceSubmission | rescuedNow || (submissions && maybe True (> 0) submissionsLeft) → do
+                  writeTVar (renderingSubmissionCount rendering) (subtract 1 <$> submissionsLeft)
+                  modifyTVar' (renderingFences rendering) (Map.insert handle FenceDone)
+                  pure True
                 Just FencePresent | rescuedNow || (presentations && not keeping && maybe True (> 0) counted) → do
                   writeTVar (renderingRetireCount rendering) (subtract 1 <$> counted)
                   modifyTVar' (renderingFences rendering) (Map.insert handle FenceDone)
