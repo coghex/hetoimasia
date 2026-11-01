@@ -1845,7 +1845,11 @@ retireOwner state retiring = do
   now ← readInstant (stateClock state)
   _ ← settleSceneReleases state
   endCaptures (stateRendering state)
-  retireRendering (stateRendering state) now
+  -- The recording's drain can establish completions (a frame-less batch's ticket, a frame's submission) that end the
+  -- last uses of revisions the owner adopted. They are settled after the drain however it ends — including a drain
+  -- that completed some batches and then failed — as an unmasked failure of the drain must not lose them; a use whose
+  -- completion was not established (pending, or lost) keeps its revision, as it always has.
+  retireRendering (stateRendering state) now `finally` void (settleSceneReleases state)
   device ← retireRoots (stateRoots state)
   pure . ownerRetired $
     (if orphaned > 0 then "destroyed " <> plural orphaned "surface" <> " no target held; " else "") <> device

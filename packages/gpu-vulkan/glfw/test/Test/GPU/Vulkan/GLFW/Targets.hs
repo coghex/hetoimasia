@@ -88,6 +88,7 @@ spec = describe "Offscreen scene targets (LFE-27)" $ do
     itBounded "settles a held release request and keeps a superseded revision's record when the target is unregistered after supersession, until the batch it waits for completes" testUnregisterAfterSupersession
     itBounded "retains the records of a target whose session failed, releasing nothing on a batch whose completion was never observed" testSessionFailureRetains
     itBounded "ends every target with the owner, leaving a pending use unreleased and a refused request never run" testOwnerExitEndsTargets
+    itBounded "releases the revision of a batch whose completion the owner's own shutdown drain established, once, though the owner ended its targets first" testExitDrainCompletesBatch
     itBounded "discards a batch whose recording the owner's cancellation interrupted before its ticket reached the caller, and releases the revision it read" testCancelledRecording
     itBounded "completes an adoption's record, notification and watermark, and a release's removal and notifications, for an offscreen target whatever cancels the thread meanwhile" testLedgerCancellation
 
@@ -746,6 +747,32 @@ testOwnerExitEndsTargets = do
   events ← readTVarIO (rigSceneEvents rig)
   adoptedOf events target `shouldBe` [(0, 0)]
   releasedOf events target `shouldBe` [0]
+
+testExitDrainCompletesBatch ∷ IO ()
+testExitDrainCompletesBatch = do
+  rig ← surfaceFreeRig 0
+  submissionsComplete rig False
+  (hostAfter, target, ticket) ← runRig rig $ \host _ → do
+    awaitReady host
+    target ← registered host
+    awaitTargetStanding host target ((== Just 0) . windowAdopted)
+    _ ← publishNow host target 1
+    awaitTargetStanding host target ((== Just 1) . windowAdopted)
+    (batch, _) ← recordFor host target
+    -- The batch is pending as the body returns. Its completion is let through only once the owner's exit has begun,
+    -- which the host's own admission says in a transaction: the owner's shutdown drain, not an ordinary step, is what
+    -- observes it.
+    void . forkIO $ do
+      atomically (targetEventsOpen (ownerHandoff (vulkanGraphicsOwner host)) >>= check . not)
+      submissionsComplete rig True
+    pure (host, target, batch)
+  ticketNow ticket >>= (`shouldBe` TicketComplete)
+  events ← readTVarIO (rigSceneEvents rig)
+  -- Each adoption is released exactly once, in adoption order: revision 1 on the drain's own evidence.
+  adoptedOf events target `shouldBe` [(0, 0), (1, 1)]
+  releasedOf events target `shouldBe` [0, 1]
+  state ← atomically (readVulkanSceneState (vulkanController hostAfter))
+  maybe [] windowAwaitingRelease (Map.lookup (KeyOffscreen target) (sceneWindows state)) `shouldBe` []
 
 testCancelledRecording ∷ IO ()
 testCancelledRecording = do
