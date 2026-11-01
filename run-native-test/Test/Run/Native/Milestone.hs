@@ -18,7 +18,8 @@ import Control.Concurrent.STM (atomically, readTVar, readTVarIO, retry)
 import Control.Exception (onException, try)
 import Data.List (isInfixOf)
 import Test.HUnit.Lang (HUnitFailure (..))
-import Control.Monad (forM_, unless)
+import Control.Monad (forM, forM_, unless)
+import Data.Text (Text)
 import System.IO (hPutStrLn, stderr)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -34,6 +35,7 @@ import Test.Run.Native.Env (Env (..), evidence)
 import Test.Run.Native.Library (copyTree, shippedContent)
 import Hetoimasia.GLFW.Window (WindowId)
 import Test.Run.Native.Capture (Bound (..), bindNew, snap, viewableNow)
+import Test.Run.Native.Checkpoint (checkpoint)
 import Test.Run.Native.Observe
 import Hetoimasia.GLFW.Command (Disposition (Performed), observeWindowCommand)
 import Test.Run.Native.Peers
@@ -41,7 +43,7 @@ import Test.Run.Native.Peers
 spec ∷ Env → Spec
 spec env = describe "Lua native milestone" $ do
   it "loads the same PNG for two instances independently, ends one while its accepted scene still holds its released texture, and keeps the other updating with its texture and window" $
-    within 120 . withOwnedContent $ \folder →
+    withinCase env 120 . withOwnedContent $ \folder →
       withPeers (envStart env) folder $ \peers → do
         -- A's window is created first and B's second: with creation outcomes withheld from the provider, each new
         -- native window is the only one that appeared since the instance was admitted, so it is that instance's.
@@ -52,6 +54,7 @@ spec env = describe "Lua native milestone" $ do
         forM_ [windowA, windowB] $ \window → awaitAdopted peers window 1
         snap env peers "two-instances--a-quad" boundA
         snap env peers "two-instances--b-quad" boundB
+        checkpoint env "two-instances-quads" "the owner confirms the textured quad is visible in both windows, the same picture in each" =<< factsFor peers [("A", windowA), ("B", windowB)]
         -- Two textures were allocated, uploaded and registered: the same path was never coalesced.
         awaitLiveTextures peers 2
         -- Ending A through its public lifecycle control closes only its window, and is never a user close.
@@ -69,6 +72,7 @@ spec env = describe "Lua native milestone" $ do
         publishedRevisionOf peers windowB >>= (`shouldBe` Just 1)
         -- B's quad is still right on the display, and its texture was never reloaded (one live texture throughout).
         snap env peers "two-instances--b-after-a-ended" boundB
+        checkpoint env "peer-survival" "the owner confirms A's window is gone and B's window still shows the correct quad, never reloaded" =<< factsFor peers [("B", windowB)]
         stopUi peers b
         awaitWindowCount peers 0
         awaitLiveTextures peers 0
@@ -77,7 +81,7 @@ spec env = describe "Lua native milestone" $ do
         evidence env (Text.pack ("two instances: instances " <> show (spIdentity a, spIdentity b) <> ", windows " <> show (windowA, windowB) <> "; ended A with B live; no user close; validation layer and synchronization validation enabled on this host"))
 
   it "ends one instance while its texture read is held at the pool's reader: the peer keeps updating, the ended instance settles stopped only after the read returns and delivers nothing, and a later instance loads the same path" $
-    within 120 . withOwnedContent $ \folder →
+    withinCase env 120 . withOwnedContent $ \folder →
       withPeers (envStart env) folder $ \peers → do
         holdNextReads peers quadPath 1
         known0 ← viewableNow env
@@ -117,7 +121,7 @@ spec env = describe "Lua native milestone" $ do
         evidence env (Text.pack ("pending read: A=" <> show (spIdentity a) <> " ended with its read held (Stopping), B=" <> show (spIdentity b) <> " kept updating, A settled Stopped only after the read was released, no user close, C=" <> show (spIdentity c) <> " then loaded the same path; windows " <> show (windowA, windowB, windowC)))
 
   it "ends one instance while its window creation outcome is withheld from the provider: the host's window stays tracked until the late result is closed and destroyed, the peer is unaffected and no orphan window or texture remains" $
-    within 120 . withOwnedContent $ \folder →
+    withinCase env 120 . withOwnedContent $ \folder →
       withPeers (envStart env) folder $ \peers → do
         withholdNextCreations peers 1
         known0 ← viewableNow env
@@ -151,7 +155,7 @@ spec env = describe "Lua native milestone" $ do
 
 
   it "keeps an unchanged published scene while the window is made smaller, larger, minimized and restored, and records what the platform reported rather than what was requested" $
-    within 120 . withOwnedContent $ \folder →
+    withinCase env 120 . withOwnedContent $ \folder →
       withPeers (envStart env) folder $ \peers → do
         (a, windowA, boundA, b, windowB, _boundB) ← startTwo env peers
         forM_ [windowA, windowB] $ \window → awaitAdopted peers window 1
@@ -173,6 +177,7 @@ spec env = describe "Lua native milestone" $ do
               reached ← awaitMetrics peers windowA (label <> " to be reported") (\m → metricsLogical m == Just (width, height) || (metricsLogical m /= metricsLogical initial && metricsRevision m > metricsRevision initial))
               renders label
               snap env peers ("view--" <> Text.pack label) boundA
+              checkpoint env (Text.pack ("resize-" <> label)) (Text.pack ("the owner confirms, in the " <> label <> " window, that the quad keeps its size and its top-left position (clipped where the window is too small, never stretched or re-centred)")) =<< factsFor peers [("subject", windowA)]
               pure reached
         smaller ← resizeTo "smaller" (320, 240)
         larger ← resizeTo "larger" (800, 600)
@@ -206,6 +211,7 @@ spec env = describe "Lua native milestone" $ do
         back ← awaitMetrics peers windowA "a drawable sample after the restore" (\m → metricsRevision m > metricsRevision reported && metricsIconified m == Just False && metricsVisible m /= Just False && maybe True (\(w, h) → w * h > 0) (metricsFramebuffer m))
         renders "restored"
         snap env peers "view--restored" boundA
+        checkpoint env "restore" "the owner confirms the restored window shows the quad again" =<< factsFor peers [("subject", windowA)]
         awaitLiveTextures peers 2
         readTVarIO (peFatals peers) >>= (`shouldBe` [])
         atomically (readTVar (peStops peers)) >>= (`shouldBe` 0)
@@ -233,7 +239,7 @@ spec env = describe "Lua native milestone" $ do
 
 
   it "unwinds by itself, and raises its own failure unchanged, when the scenario fails with a read held, a creation withheld and a window live" $
-    within 120 . withOwnedContent $ \folder → do
+    withinCase env 120 . withOwnedContent $ \folder → do
       -- Only the scenario's own assertion failure is expected here, and it is matched by its type and its words: any
       -- other exception, or a hang in the unwinding (a gate left closed), fails this example.
       outcome ← try @HUnitFailure . withPeers (envStart env) folder $ \peers → do
@@ -250,7 +256,7 @@ spec env = describe "Lua native milestone" $ do
 
   forM_ [("the first", 0 ∷ Int), ("the second", 1)] $ \(which, index) →
     it ("routes a user close of " <> which <> " live window to one whole-session quit request, which retires both instances and windows, unlike ending one instance") $
-      within 120 . withOwnedContent $ \folder →
+      withinCase env 120 . withOwnedContent $ \folder →
         withPeers (envStart env) folder $ \peers → do
           (a, windowA, boundA, b, windowB, boundB) ← startTwo env peers
           forM_ [windowA, windowB] $ \window → awaitAdopted peers window 1
@@ -271,6 +277,18 @@ spec env = describe "Lua native milestone" $ do
           readTVarIO (peFatals peers) >>= (`shouldBe` [])
           evidence env (Text.pack ("user close of " <> which <> " window (" <> show closed <> "), a genuine platform-delivered close (native-check), not an injected one: exactly one stop request; both windows stayed until the instances were ended, then both retired and the textures were proved retired"))
 
+
+-- | The case bound: the receipt's, or, in the supervised run that holds for the owner's confirmations, a long one.
+withinCase ∷ Env → Int → IO a → IO a
+withinCase env seconds = within (maybe seconds (const 3600) (envHold env))
+
+-- | The windows' identities and the metrics the platform last reported, for a checkpoint's record.
+factsFor ∷ Peers → [(Text, WindowId)] → IO Text
+factsFor peers named = do
+  facts ← forM named $ \(label, window) → do
+    metrics ← windowMetrics peers window
+    pure (label <> " window " <> Text.pack (show window) <> " " <> Text.pack (show metrics))
+  pure (Text.intercalate "; " facts)
 
 -- | Admit two instances so that each new native window is unambiguously its instance's: with the next two creation
 -- outcomes withheld from the provider, the window that appears after A is admitted is A's and the one that appears
