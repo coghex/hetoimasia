@@ -128,11 +128,12 @@ snapWith env name bound landmarksFor metrics = do
         let judged = judge (capturedProbes shot) (landmarksFor (capturedWidth shot, capturedHeight shot))
         if all judgedPassed judged
           then pure (n, shot, judged, True)
-          else
-            if n >= 200
+          else do
+            when (n `mod` 8 == 1) $ note ("capture " <> Text.unpack name <> " attempt " <> show n <> ": " <> describeFailures judged)
+            if n >= attemptsAllowed
               then pure (n, shot, judged, False)
-              else threadDelay 200000 >> loop (n + 1) [stage n]
-  outcome ← timeout (40 * 1000000) (loop 1 [])
+              else threadDelay 250000 >> loop (n + 1) [stage n]
+  outcome ← timeout (25 * 1000000) (loop 1 [])
   (attempts, shot, judged, passed) ← case outcome of
     Just done → pure done
     Nothing → expectationFailure ("the capture " <> Text.unpack name <> " never showed the scene's landmarks within 40 seconds") >> error "unreachable"
@@ -159,7 +160,7 @@ snapWith env name bound landmarksFor metrics = do
           ]
   writeFile (envCaptureDir env </> Text.unpack name <> ".json") (render record <> "\n")
   unless scaleOk $ expectationFailure ("the host reports content scale " <> show scale <> " on the X display; this receipt's landmarks assume scale 1")
-  unless passed $ expectationFailure ("a landmark failed in capture " <> Text.unpack name <> ": " <> show [lmName (judgedLandmark j) | j ← judged, not (judgedPassed j)])
+  unless passed $ expectationFailure ("a landmark failed in capture " <> Text.unpack name <> " after " <> show attempts <> " attempts (the last image is retained as " <> Text.unpack name <> ".png): " <> describeFailures judged)
   evidence env ("capture " <> name <> ": X window " <> Text.pack (show (boundX bound)) <> " of pid " <> Text.pack (show (boundPid bound)) <> ", client area " <> Text.pack (show (capturedWidth shot, capturedHeight shot)) <> ", sha256 " <> capturedSha256 shot <> ", " <> Text.pack (show (length judged)) <> " landmarks passed within " <> Text.pack (show tolerance) <> " per channel after " <> Text.pack (show attempts) <> " capture(s); a capture is what the window presented, not GPU retirement evidence")
   where
     extentJson = \case
@@ -178,6 +179,15 @@ snapWith env name bound landmarksFor metrics = do
       Just (a, b, c) → JArray (map (JNumber . fromIntegral) [a, b, c])
       Nothing → JNull
     removeIfPresent path = doesFileExist path >>= \there → when there (removeFile path)
+
+-- | How many captures one step makes while the external presentation catches up (about twelve seconds).
+attemptsAllowed ∷ Int
+attemptsAllowed = 45
+
+-- | Each failing landmark with what was expected and what was captured.
+describeFailures ∷ [Judgement] → String
+describeFailures judged =
+  unlines ["  " <> Text.unpack (lmName (judgedLandmark j)) <> " at " <> show (lmPoint (judgedLandmark j)) <> ": expected " <> show (lmExpected (judgedLandmark j)) <> ", captured " <> show (judgedActual j) | j ← judged, not (judgedPassed j)]
 
 -- | Deliver a genuine @WM_DELETE_WINDOW@ request to the bound window through the helper (delivery only).
 closeBound ∷ Maybe Bound → IO ()
