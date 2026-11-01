@@ -25,7 +25,7 @@ module Test.Run.Native.Capture
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (try)
-import Control.Monad (forM_, unless, when)
+import Control.Monad (unless, when)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Text as Text
 import Data.Text (Text)
@@ -38,9 +38,9 @@ import Test.Hspec (expectationFailure)
 import Test.Run.Native.Env (Env (..), evidence)
 import Test.Run.Native.Json
 import Test.Run.Native.Landmarks
-import Test.Run.Native.Observe (Metrics (..), note, requestPosition, windowMetrics, windowsNow)
+import Test.Run.Native.Observe (Metrics (..), note, windowMetrics)
 import Test.Run.Native.Peers (Peers)
-import Test.Run.Native.X11 (Candidate (..), Captured (..), Refused (..), X11, candidates, capture, geometry, requestClose, viewableCandidates)
+import Test.Run.Native.X11 (Candidate (..), Captured (..), Refused (..), X11, candidates, capture, geometry, raiseWindow, requestClose, viewableCandidates)
 
 -- | A native window bound to the instance that made it, with the process that owns it.
 data Bound = Bound
@@ -110,21 +110,8 @@ bindChild env pid = case envX11 env of
 snap ∷ Env → Peers → Text → Maybe Bound → IO ()
 snap _ _ _ Nothing = pure ()
 snap env peers name (Just bound) = do
-  forM_ (boundWindow bound) (isolate peers)
   metrics ← traverse (windowMetrics peers) (boundWindow bound)
   snapWith env name bound quadLandmarks metrics
-
--- | Make the subject the only window on its part of the display: an X server without a compositor answers a capture with
--- whatever is on top of the subject's pixels (another window, or a window manager's frame), and two 640 x 480 windows with
--- their frames do not both fit on the isolated 1280 x 1024 display. So the subject is moved to a fixed place and every
--- other window of the process is parked below and to the right, where the subject (even enlarged to 800 x 600) is not.
--- Both are the public, window-system mediated position commands; the capture then waits for the display to show the
--- subject's own pixels, and a landmark that is still wrong after that is a failure.
-isolate ∷ Peers → WindowId → IO ()
-isolate peers subject = do
-  others ← filter (/= subject) <$> windowsNow peers
-  forM_ others $ \other → () <$ requestPosition peers other (700, 720)
-  () <$ requestPosition peers subject (10, 40)
 
 -- | Capture the bound window's client area, require every landmark, retain the capture and its record under the given
 -- name, and say what was presented. The client area is whatever the X server reports now and the landmarks follow its
@@ -134,6 +121,10 @@ snapWith env name bound landmarksFor metrics = do
   let final = envCaptureDir env </> Text.unpack name <> ".png"
       stage n = envCaptureDir env </> Text.unpack name <> ".attempt" <> show (n ∷ Int) <> ".png"
       loop n previous = do
+        -- An X server without a compositor answers a capture with whatever is on top of the subject's pixels (another
+        -- window, or a window manager's frame), so the window manager is asked, identity-checked, to raise the subject
+        -- first, and again while the display still disagrees.
+        when (n `mod` 8 == 1) $ () <$ required "raise request" (try (raiseWindow (boundHelper bound) (boundPid bound) (boundX bound)))
         now ← required "geometry" (try (geometry (boundHelper bound) (boundPid bound) (boundX bound)))
         let size = (candWidth now, candHeight now)
         shot ← required "capture" (try (capture (boundHelper bound) (boundPid bound) (boundX bound) (stage n) [lmPoint l | l ← landmarksFor size] Nothing))

@@ -21,6 +21,9 @@ What it does, and only this:
 * ``capture``: the presented client area of exactly that window (``XGetImage`` of the window, never the root or
   the desktop) as an unaltered lossless 8-bit RGB PNG, its bounds, the pixel format's masks, a SHA-256 of the
   file, and the colours at any requested client-area probe points taken from the same image.
+* ``raise``: ask the window manager to activate and raise exactly that window (an EWMH ``_NET_ACTIVE_WINDOW`` request from
+  the root, source ``pager``), so that a capture shows the window's own pixels and not another window's that happens to be
+  on top of it. It is a request: what the display then shows is what a later capture reports.
 * ``close``: a genuine ``WM_DELETE_WINDOW`` ``ClientMessage`` to exactly that window, only when the window
   advertises that protocol and only if ``XSendEvent`` accepted it. It never signals a process, and the answer
   ``sent`` is delivery of the request, never proof the window or the process ended.
@@ -98,6 +101,10 @@ class CloseRefused(Refusal):
     outcome = "close_refused"
 
 
+class RaiseRefused(Refusal):
+    outcome = "raise_refused"
+
+
 class CaptureFailed(Refusal):
     outcome = "capture_failed"
 
@@ -166,6 +173,10 @@ class Backend:
 
     def send_delete(self, window: int) -> bool:
         """Whether the server accepted the ``WM_DELETE_WINDOW`` message; raises ``Vanished``."""
+        raise NotImplementedError
+
+    def send_raise(self, window: int) -> bool:
+        """Whether the server accepted the window manager request to activate and raise this window; raises ``Vanished``."""
         raise NotImplementedError
 
     def close(self) -> None:
@@ -445,6 +456,23 @@ def close_window(backend: Backend, pid: int, window: int, expect_size: Optional[
     return identity
 
 
+# --- Raise -------------------------------------------------------------------------------------------------------------------
+
+
+def raise_window(backend: Backend, pid: int, window: int, expect_size: Optional[Tuple[int, int]] = None) -> Identity:
+    """Ask the window manager to raise exactly this window. Delivery of the request is the answer, never proof of the stacking."""
+    identity = verify(backend, pid, window, expect_size)
+    if identity.map_state != IS_VIEWABLE:
+        raise RaiseRefused("window %d is not viewable (map state %d), so there is nothing to raise" % (window, identity.map_state), window=window, pid=pid)
+    try:
+        accepted = backend.send_raise(window)
+    except Vanished:
+        raise Vanished("window %d vanished before the raise request was delivered" % window, window=window, pid=pid)
+    if not accepted:
+        raise RaiseRefused("the server refused the raise request for window %d" % window, window=window, pid=pid)
+    return identity
+
+
 # --- The real display --------------------------------------------------------------------------------------------------------
 
 
@@ -710,6 +738,22 @@ class X11Backend(Backend):
         self._sync_vanished(window)
         return status != 0
 
+    def send_raise(self, window: int) -> bool:
+        c = self.c
+        event = self.XEvent()
+        event.xclient.type = 33  # ClientMessage
+        event.xclient.window = window
+        event.xclient.message_type = self._atom("_NET_ACTIVE_WINDOW")
+        event.xclient.format = 32
+        event.xclient.data[0] = 2  # source indication: a pager (a pager's request is honoured as the user's)
+        event.xclient.data[1] = 0  # CurrentTime
+        event.xclient.data[2] = 0
+        self.errors = []
+        # SubstructureRedirectMask | SubstructureNotifyMask on the root, which is where the window manager listens
+        status = self.x.XSendEvent(self.display, self.root, 0, (1 << 20) | (1 << 19), c.byref(event))
+        self._sync_vanished(window)
+        return status != 0
+
     def close(self) -> None:
         if self.display:
             self.x.XCloseDisplay(self.display)
@@ -746,7 +790,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("prepare", help="prove libX11 loads with every entry point this helper uses; needs no display")
     sub.add_parser("check", help="prove libX11 loads and the display is the isolated one")
-    for name in ("candidates", "identify", "geometry", "capture", "close"):
+    for name in ("candidates", "identify", "geometry", "capture", "close", "raise"):
         action = sub.add_parser(name)
         action.add_argument("--pid", type=int, required=True)
         if name != "candidates":
@@ -777,6 +821,9 @@ def run(arguments: argparse.Namespace, backend: Backend) -> dict:
     if arguments.command == "close":
         identity = close_window(backend, pid, arguments.window, expect)
         return {"ok": True, "outcome": "sent", "identity": identity.report()}
+    if arguments.command == "raise":
+        identity = raise_window(backend, pid, arguments.window, expect)
+        return {"ok": True, "outcome": "raise_requested", "identity": identity.report()}
     raise AssertionError(arguments.command)
 
 

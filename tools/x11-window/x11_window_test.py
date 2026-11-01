@@ -23,7 +23,7 @@ import x11_window as x  # noqa: E402
 
 class FakeWindow:
     def __init__(self, pid=None, window_class=x.INPUT_OUTPUT, map_state=x.IS_VIEWABLE, size=(64, 48), position=(10, 20),
-                 protocols=(x.DELETE_WINDOW,), cls=("lua", "Hetoimasia"), pixels=None, accept_close=True):
+                 protocols=(x.DELETE_WINDOW,), cls=("lua", "Hetoimasia"), pixels=None, accept_close=True, accept_raise=True):
         self.pid = pid
         self.window_class = window_class
         self.map_state = map_state
@@ -36,6 +36,8 @@ class FakeWindow:
         self.delivered = 0
         self.vanish_on_image = False
         self.vanish_on_send = False
+        self.raised = 0
+        self.accept_raise = accept_raise
 
 
 class FakeDisplay(x.Backend):
@@ -96,6 +98,16 @@ class FakeDisplay(x.Backend):
         if not w.accept_close:
             return False
         w.delivered += 1
+        return True
+
+    def send_raise(self, window):
+        w = self._get(window)
+        if w.vanish_on_send:
+            del self.table[window]
+            raise x.Vanished("window %d vanished before the raise" % window)
+        if not w.accept_raise:
+            return False
+        w.raised += 1
         return True
 
     def close(self):
@@ -320,6 +332,29 @@ class Close(unittest.TestCase):
         with self.assertRaises(x.IdentityMismatch):
             x.close_window(display, PID, 1)
         self.assertEqual(display.table[1].delivered, 0)
+
+
+class Raise(unittest.TestCase):
+    def test_raises_exactly_the_named_window_after_re_verifying_it(self):
+        display = FakeDisplay({1: FakeWindow(pid=PID), 2: FakeWindow(pid=PID)})
+        x.raise_window(display, PID, 2)
+        self.assertEqual((display.table[1].raised, display.table[2].raised), (0, 1))
+        display.table[1].pid = PID + 1
+        with self.assertRaises(x.IdentityMismatch):
+            x.raise_window(display, PID, 1)
+        self.assertEqual(display.table[1].raised, 0)
+
+    def test_an_unviewable_a_vanished_and_a_refused_window_are_diagnostics(self):
+        display = FakeDisplay({1: FakeWindow(pid=PID, map_state=x.IS_UNMAPPED), 2: FakeWindow(pid=PID, accept_raise=False), 3: FakeWindow(pid=PID)})
+        with self.assertRaises(x.RaiseRefused):
+            x.raise_window(display, PID, 1)
+        with self.assertRaises(x.RaiseRefused):
+            x.raise_window(display, PID, 2)
+        with self.assertRaises(x.Vanished):
+            x.raise_window(display, PID, 9)
+        display.table[3].vanish_on_send = True
+        with self.assertRaises(x.Vanished):
+            x.raise_window(display, PID, 3)
 
 
 class Isolation(unittest.TestCase):

@@ -182,7 +182,7 @@ spec env = describe "Lua native milestone" $ do
       withPeers (envStart env) folder $ \peers → do
         (a, windowA, boundA, b, windowB, _boundB) ← startTwo env peers
         forM_ [windowA, windowB] $ \window → awaitAdopted peers window 1
-        parkWindow env peers windowB
+        parkWindow peers windowB
         initial ← windowMetrics peers windowA
         snap env peers "view--initial" boundA
         -- The scene is the one accepted publication, and nothing below republishes: its revision is the evidence.
@@ -358,10 +358,10 @@ placeWindow env peers window slot = case envX11 env of
     -- On the isolated display the capture itself isolates its subject ('snap'), so nothing is placed here.
     position = (20 + 660 * slot, 60)
 
--- | Park a window out of the way, partly beyond the screen, when only its peer is looked at.
-parkWindow ∷ Env → Peers → WindowId → IO ()
-parkWindow env peers window = do
-  disposition ← requestPosition peers window (case envX11 env of Just _ → (700, 720); Nothing → (1000, 500))
+-- | Park a window out of the way (macOS: where the owner looks at its peer alone).
+parkWindow ∷ Peers → WindowId → IO ()
+parkWindow peers window = do
+  disposition ← requestPosition peers window (1000, 500)
   (window, attempted disposition) `shouldBe` (window, True)
 
 -- | Admit two instances so that each new native window is unambiguously its instance's: with the next two creation
