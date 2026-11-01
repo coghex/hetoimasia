@@ -85,6 +85,7 @@ spec = describe "Offscreen scene targets (LFE-27)" $ do
 
   describe "teardown" $ do
     itBounded "retains an unregistered target's unresolved records in the observation, counted against capacity, until every batch has completed" testUnregisterRetainsRecords
+    itBounded "settles a held release request and keeps a superseded revision's record when the target is unregistered after supersession, until the batch it waits for completes" testUnregisterAfterSupersession
     itBounded "retains the records of a target whose session failed, releasing nothing on a batch whose completion was never observed" testSessionFailureRetains
     itBounded "ends every target with the owner, leaving a pending use unreleased and a refused request never run" testOwnerExitEndsTargets
     itBounded "discards a batch whose recording the owner's cancellation interrupted before its ticket reached the caller, and releases the revision it read" testCancelledRecording
@@ -635,6 +636,44 @@ testUnregisterRetainsRecords = do
   whileHeld `shouldBe` Left (TargetCapacityReached 1)
   afterEnd `shouldBe` TargetSceneUnknown target
   reused `shouldSatisfy` (/= target)
+
+testUnregisterAfterSupersession ∷ IO ()
+testUnregisterAfterSupersession = do
+  rig ← surfaceFreeRig 0
+  submissionsComplete rig False
+  (target, ranAt, retained, events) ← runRig rig $ \host _ → do
+    awaitReady host
+    target ← registered host
+    awaitTargetStanding host target ((== Just 0) . windowAdopted)
+    _ ← publishNow host target 1
+    awaitTargetStanding host target ((== Just 1) . windowAdopted)
+    (ticket, _) ← recordFor host target
+    _ ← publishNow host target 2
+    awaitTargetStanding host target ((== Just 2) . windowAdopted)
+    -- Revision 1 is superseded and waits for its batch. A request is made after a third revision was accepted, and
+    -- the target ends before the owner can adopt it.
+    queued ← holdingOwner host $ \release → do
+      scene ← prepare 3
+      (_, held) ← atomically ((,) <$> publishVulkanTargetScene host target scene <*> requestVulkanRelease (vulkanController host) (VulkanAction (\_ → readTVarIO (rigSceneEvents rig))))
+      ticketOfRequest ← either (\refusal → failWith ("refused: " <> show refusal)) pure held
+      ended ← atomically (unregisterVulkanSceneTarget host target)
+      ended `shouldBe` True
+      release
+      pure ticketOfRequest
+    seen ← awaitRan queued
+    -- The request ran; the target's records are still there, in order, because revision 1's batch is pending.
+    awaitTargetStanding host target (\standing → windowAwaitingRelease standing == [1, 2])
+    retained ← currentStanding host target
+    submissionsComplete rig True
+    ticketIs ticket TicketComplete
+    awaitEvents rig ((== [0, 1, 2]) . (`releasedOf` target))
+    events ← readTVarIO (rigSceneEvents rig)
+    pure (target, seen, retained, events)
+  adoptedOf ranAt target `shouldBe` [(0, 0), (1, 1), (2, 2)]
+  fmap windowAwaitingRelease retained `shouldBe` Just [1, 2]
+  -- Revision 3 was never adopted, and each adoption was released once, in adoption order.
+  adoptedOf events target `shouldBe` [(0, 0), (1, 1), (2, 2)]
+  releasedOf events target `shouldBe` [0, 1, 2]
 
 testSessionFailureRetains ∷ IO ()
 testSessionFailureRetains = do
