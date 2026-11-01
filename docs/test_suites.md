@@ -173,7 +173,22 @@ cabal test hetoimasia-tests --test-show-details=direct
   cannot be confirmed reaped or drained, the body's failure preserved), run against `/bin/sh` children with no native session. It is built, with the executable it launches, in the group's preparation stage
   (`bash tools/vulkan/run.sh build hetoimasia:exe:hetoimasia hetoimasia:test:run-native-tests`) and run,
   unbuilt, by `bash tools/vulkan/run.sh native hetoimasia:test:run-native-tests -- --complete`. It
-  captures no pixel and reads no window back. See [run_command.md](run_command.md).
+  captures no pixel and reads no window back in its smoke cases. See [run_command.md](run_command.md).
+  Its `Lua native milestone` subgroup (LFE-25, [#540](https://github.com/coghex/hetoimasia/issues/540), selectable alone with
+  `--match 'Lua native milestone'` and part of `--complete`) is the final qualification of native windows: a two-instance harness composed through
+  the public Haskell interfaces over a host the suite composes with the validation layer and synchronization validation (one UI VM with two
+  engine-owned instances of the shipped content, an independent logical owner, one PNG path requested by both) whose diagnostic verdict fails on any
+  issue; one instance ended while its accepted scene holds its released texture, with its texture read held at the pool's reader and with its
+  window creation outcome withheld, each with the peer kept live; resize, minimize and restore through the public window commands with the metrics
+  actually reported and the published revision unchanged (the restore is the regression check for #581); a genuine platform-delivered user close
+  of either window as one whole-session quit; a labelled injected clean refusal; the unwinding of a failing scenario; and the actual built command with
+  `--vulkan-validation` as an owned child (a genuine `WM_DELETE_WINDOW` close with exit 0, a logical failure leaving the UI on the exact red clear until a
+  close with exit 1, a Lua quit with exit 0). On the isolated X11 display each window is captured through the external helper
+  `tools/x11-window/x11_window.py` (identity-checked, lossless, judged against landmarks written from the fixture) and the captures are
+  retained with records and checksums in [the evidence](evidence/lua_first_native/README.md); its device-free examples run in `test.workflow`, and
+  its preparation (`prepare`) fails rather than skips. macOS has no OS capture: the unattended receipt (`--complete`) records the owner's visual
+  confirmations as pending and never holds, and the supervised run (the desktop consent with the narrower `--match` selection) holds at each
+  checkpoint for the operator's line on standard input, bounded.
   The adapter's real-device suite `lua-engine-graphics-native-tests`
   (`packages/lua-engine-graphics`, group `test.vulkan-lua-engine-native`) enters
   the same kind of session: it starts the production graphics owner with no
