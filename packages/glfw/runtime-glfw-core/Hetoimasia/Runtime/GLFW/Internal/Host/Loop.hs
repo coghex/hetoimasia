@@ -108,7 +108,7 @@ runOwnerLoop host control hooks =
       -- budget leaves unserved, so an idle turn beside them is idle.
       let waited = idle && queued == 0 && not (retirementImmediate retiring)
       processEvents host number (if waited then AwaitEventsFor (hostIdleWait settings) else ProcessPending)
-      work ← turnWork host control (loopLogger hooks) (loopEvent hooks)
+      work ← turnWork host control (loopLogger hooks) Nothing (loopEvent hooks)
       step ← loopUpdate hooks (turnSummary number waited work)
       checkRuntime control
       case step of
@@ -243,7 +243,7 @@ runScheduledOwnerLoop host control hooks =
       -- The instant the update is given, so a deadline the wait itself reached
       -- is due now rather than on the turn after.
       sampled ← readInstant (hostClock settings)
-      work ← turnWork host control logger (scheduledEvent hooks)
+      work ← turnWork host control logger (Just sampled) (scheduledEvent hooks)
       step ←
         scheduledUpdate
           hooks

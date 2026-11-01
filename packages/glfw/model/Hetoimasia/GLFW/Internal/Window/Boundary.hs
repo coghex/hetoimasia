@@ -21,6 +21,7 @@ module Hetoimasia.GLFW.Internal.Window.Boundary
   ( -- * Owner boundaries
     atBoundary
   , synchronizeWindow
+  , revisitVisible
   , windowStep
   , windowStepWith
 
@@ -38,6 +39,8 @@ import Control.Concurrent.STM (STM, atomically)
 import Control.Exception (mask_)
 import Control.Monad (void, when)
 import Data.IORef (readIORef, writeIORef)
+import Hetoimasia.Foundation.Time (Duration, Instant)
+import Hetoimasia.GLFW.Internal.Attribute (Attribute (..))
 import Foreign.Ptr (Ptr)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Failure (Operation, operation)
@@ -59,12 +62,14 @@ import Hetoimasia.GLFW.Internal.Session
   )
 import Hetoimasia.GLFW.Internal.Trace (PumpMode (..), recordingPump)
 import Hetoimasia.GLFW.Internal.Window.Observation (CloseRequest, WindowObservation (..), WindowPhase (..))
-import Hetoimasia.GLFW.Internal.Window.Reconcile (commitObservation, raiseLatchedFault, reconcileWindow)
-import Hetoimasia.GLFW.Internal.Window.Sample (sampleAll)
+import Hetoimasia.GLFW.Internal.Window.Reconcile (commitObservation, raiseLatchedFault, reconcileFollowing, reconcileWindow)
+import Hetoimasia.GLFW.Internal.Window.Revisit (Revisit (..), afterReread, rereadDue, stampsAfterFalse)
+import Hetoimasia.GLFW.Internal.Window.Sample (sampleAll, sampleVisibility)
 import Hetoimasia.GLFW.Internal.Window.State (OwnerState (..), Window (..), WindowResult (..), windowIdentifiers)
 
-synchronizeOperation ∷ Operation
+synchronizeOperation, revisitOperation ∷ Operation
 synchronizeOperation = operation "synchronize window"
+revisitOperation = operation "re-read window visibility"
 
 -- | Run owner work at a boundary: answer 'WindowEnded' without a native call
 -- once the window has ended, check the owner and liveness, run the work, then
@@ -92,6 +97,60 @@ synchronizeWindow window =
    raiseLatchedFault window
    OwnerState current _ ← readIORef (windowOwnerState window)
    pure current
+
+-- | Offer a window its visible follow-up on this owner turn: re-read the
+-- visible attribute if the window owes one, and publish a revision only if the
+-- value changed. A window that owes none ('RevisitIdle') is not touched, and
+-- makes no native call, no clock reading and no boundary.
+--
+-- @interval@ is the host's idle wait and @clock@ reads the host's clock; the
+-- clock is read only when the window is in the slow phase, or this re-read
+-- reported @False@ and spends the quick bound. A slow re-read is due on the
+-- first turn whose reading is at least one interval after the previous
+-- re-read, and at most one re-read is made per call.
+--
+-- The follow-up stops, without a native call, when the window is no longer
+-- open, is iconified, or does not read @Observed False@ for visible. The read
+-- goes through the capability gate and error bracket of 'sampleAll': an
+-- unavailable report preserves 'Unavailable' (and stops), any other report
+-- fails with 'NativeFailure' and publishes and advances nothing. The value
+-- read and the phase it moves to are committed together with the capture
+-- clearing, so an iconify transition folded by this very boundary still
+-- restarts the quick phase.
+revisitVisible ∷ Duration → IO Instant → Window → IO (WindowResult ())
+revisitVisible interval clock window =
+  readIORef (windowRevisit window) >>= \case
+    RevisitIdle → pure (WindowAvailable ())
+    _ → atBoundary (pure ()) window revisitOperation $ do
+      -- What the callbacks captured is folded first, so the phase and the
+      -- observation judged below include any iconify transition they carry.
+      reconcileWindow (pure ()) window Nothing
+      raiseLatchedFault window
+      phase ← readIORef (windowRevisit window)
+      OwnerState current _ ← readIORef (windowOwnerState window)
+      let owed =
+            obsPhase current == WindowOpen
+              && obsIconified current /= Observed True
+              && obsVisible current == Observed False
+      if not owed
+        then writeIORef (windowRevisit window) RevisitIdle
+        else case phase of
+          RevisitIdle → pure ()
+          RevisitQuick _ → reread phase Nothing
+          RevisitSlow previous → do
+            now ← clock
+            when (rereadDue interval previous now) (reread phase (Just now))
+  where
+    reread phase reading = do
+      reported ← sampleVisibility (windowSession window) (windowIdentifiers (windowId window)) (windowHandle window)
+      stamp ←
+        case reading of
+          Just now → pure (Just now)
+          Nothing
+            | reported == Observed False && stampsAfterFalse phase → Just <$> clock
+            | otherwise → pure Nothing
+      mask_ $
+        reconcileFollowing False (afterReread reported stamp) (\observation → observation {obsVisible = reported}) (pure ()) window Nothing
 
 -- | Run one callback-producing native step at an owner boundary: the private
 -- driver setters, polls, and tests use. Errors reported during the step fail

@@ -115,6 +115,7 @@ module Hetoimasia.GLFW.Internal.Window
   , EventProcessing (..)
   , processWindowEvents
   , reconcileWindowEvents
+  , revisitVisible
 
     -- * Private owner-boundary drivers
   , windowStep
@@ -137,6 +138,7 @@ import Hetoimasia.GLFW.Internal.Window.Boundary
   , processWindowEvents
   , reconcileWindowEvents
   , rejectCloseRequest
+  , revisitVisible
   , synchronizeWindow
   , windowStep
   , windowStepWith
