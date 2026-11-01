@@ -35,49 +35,28 @@
 -- logged before the session is started and so before its first window. An absent record, or a child whose stderr
 -- ended first, fails the case with what the child wrote.
 --
--- = The child, and what makes each state hold
+-- = The child
 --
--- * /Owner/: this module's 'withChild', the only place a child is created or reaped.
--- * /Admission to tracking/: the process, both pipe readers and their end flags are created in one masked step; a
---   failure after the process exists and before the caller has the 'Child' kills and reaps it there.
--- * /Intent to issuance/: the one SIGTERM is decided after the barrier and issued by one 'signalProcess' call; a
---   child that is already gone when it is decided is a failure of the case, not a skipped signal.
--- * /Terminal evidence/: the exit code from a bounded 'waitForProcess' and both pipes' end flags, each read from the
---   reader that saw the end; everything the child wrote is read only once both have ended.
--- * /Cleanup/: on every way out the child is killed if it has not exited, reaped within a bound, and its readers are
---   waited for within a bound. A child that cannot be confirmed reaped and drained fails the case.
+-- Created, observed and reaped by "Test.Run.Native.Child", whose module header says what makes each state hold and whose
+-- failure paths "Test.Run.Native.ChildSpec" exercises.
 module Test.Run.Native.Command (spec, executableVariable) where
 
-import Control.Concurrent (forkIOWithUnmask)
-import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, writeTVar)
-import Control.Exception (ExceptionWithContext, IOException, SomeException, finally, mask, onException, rethrowIO, throwIO, try, tryWithContext)
-import Control.Monad (forM_, unless, void)
-import Data.IORef (newIORef, readIORef, writeIORef)
+import Control.Concurrent.STM (atomically, check, orElse, readTVar, readTVarIO)
+import Control.Monad (forM_, unless)
 import Data.List (isPrefixOf)
 import Data.Maybe (isJust)
 import qualified Data.Text as Text
 import System.Environment (getEnvironment, lookupEnv)
 import System.Exit (ExitCode (ExitFailure))
-import System.IO (Handle, hClose, hGetLine, hPutStrLn, hSetEncoding, stderr, utf8)
-import System.IO.Error (isEOFError)
 import System.IO.Temp (withSystemTempDirectory)
-import System.Posix.Signals (sigKILL, sigTERM, signalProcess)
-import System.Process
-  ( CreateProcess (std_err, std_in, std_out)
-  , ProcessHandle
-  , StdStream (CreatePipe, NoStream)
-  , createProcess
-  , getPid
-  , getProcessExitCode
-  , proc
-  , waitForProcess
-  )
-import qualified System.Process as Process (CreateProcess (env))
+import System.Posix.Signals (sigTERM, signalProcess)
+import System.Process (getPid, waitForProcess)
 import System.Timeout (timeout)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
-import Hetoimasia.Run.Settle (combine, rememberingInterruption)
+import Test.Run.Native.Child (Child (..), withChild)
 import Test.Run.Native.Env (Env, evidence)
 import Test.Run.Native.Library (copyTree, shippedContent)
+import Control.Exception (throwIO)
 
 -- | The variable the runner sets to the built full-product executable.
 executableVariable ∷ String
@@ -212,98 +191,3 @@ waitStderr ∷ Child → Int → ([Text.Text] → Bool) → IO Awaited
 waitStderr child bound condition = do
   result ← timeout bound . atomically $ (readTVar (childErr child) >>= check . condition >> pure Barrier) `orElse` (readTVar (childErrEnded child) >>= check >> pure BarrierEnded)
   pure (maybe BarrierTimedOut id result)
-
-data Child = Child
-  { childProcess ∷ ProcessHandle
-  , childErr ∷ TVar [Text.Text]
-  , childOutEnded ∷ TVar Bool
-  , childErrEnded ∷ TVar Bool
-  -- ^ Set by each pipe's reader when it has seen its end, which is when everything the child wrote has been read.
-  , childReaderFailures ∷ TVar [String]
-  -- ^ A reader that stopped for any reason other than the end of its stream, recorded where it happened.
-  }
-
--- | Start the child, run the body, and on every way out kill it if it has not exited, reap it and wait for its readers,
--- each within a bound. The body's own failure, an assertion included, is raised as it is; a child that cannot be confirmed
--- reaped and drained fails an otherwise passing case.
---
--- The whole of it after the body runs masked: the body's failure is captured, the child is released, and only then is
--- anything raised. A cancellation that arrives in the release's bounded waits is remembered across the whole release
--- and raised after it, with the body's failure retained beside it, so a child is never abandoned half-released.
-withChild ∷ FilePath → [String] → [(String, String)] → (Child → IO a) → IO a
-withChild executable arguments environment body = mask $ \restore → do
-  child ← start executable arguments environment
-  outcome ← tryWithContext @SomeException (restore (body child))
-  (problems, interruption) ← release child
-  forM_ problems $ \problem → hPutStrLn stderr ("run-native-tests: the command's cleanup was not confirmed: " <> problem)
-  case (interruption, outcome) of
-    (Just interrupted, Left failure) → rethrowIO =<< combine interrupted [("the failure of what was being run", failure)]
-    (Just interrupted, Right _) → rethrowIO interrupted
-    (Nothing, Left failure) → rethrowIO failure
-    (Nothing, Right result) → do
-      unless (null problems) $ expectationFailure ("the command's cleanup was not confirmed: " <> unwords problems)
-      pure result
-
--- | Create the process and its readers in one masked step. A failure after the process exists kills and reaps it here, because
--- the caller has no 'Child' to release yet.
-start ∷ FilePath → [String] → [(String, String)] → IO Child
-start executable arguments environment = do
-  (_, out, err, process) ← createProcess (proc executable arguments) {Process.env = Just environment, std_in = NoStream, std_out = CreatePipe, std_err = CreatePipe}
-  (do
-      (output, diagnostics) ← case (out, err) of
-        (Just output, Just diagnostics) → pure (output, diagnostics)
-        _ → fail "the child's pipes were not created"
-      outLines ← newTVarIO []
-      errLines ← newTVarIO []
-      outEnded ← newTVarIO False
-      errEnded ← newTVarIO False
-      failures ← newTVarIO []
-      reader "stdout" output outLines outEnded failures
-      reader "stderr" diagnostics errLines errEnded failures
-      pure (Child process errLines outEnded errEnded failures))
-    `onException` abandon process out err
-  where
-    abandon process out err = do
-      getPid process >>= mapM_ (\pid → try @IOException (signalProcess sigKILL pid))
-      void (waitForProcess process)
-      forM_ out closeQuietly
-      forM_ err closeQuietly
-
--- | Read lines until the stream ends, then mark it ended. The loop runs unmasked; the end is marked however it stopped.
--- Only the end of the stream is silent: any other failure of the read is recorded for the case to assert on.
-reader ∷ String → Handle → TVar [Text.Text] → TVar Bool → TVar [String] → IO ()
-reader name handle ref ended failures =
-  void (forkIOWithUnmask (\unmask → (hSetEncoding handle utf8 >> unmask loop) `finally` (closeQuietly handle >> atomically (writeTVar ended True))))
-  where
-    loop = do
-      line ← try @IOException (hGetLine handle)
-      case line of
-        Right text → atomically (modifyTVar' ref (<> [Text.pack text])) >> loop
-        Left failure
-          | isEOFError failure → pure ()
-          | otherwise → atomically (modifyTVar' failures (<> [name <> ": " <> show failure]))
-
-closeQuietly ∷ Handle → IO ()
-closeQuietly handle = void (try @IOException (hClose handle))
-
--- | Kill the child if it has not exited, reap it and wait for both readers, each bounded; answer what could not be
--- confirmed, and the first cancellation that interrupted the waits (they are run again until they complete).
-release ∷ Child → IO ([String], Maybe (ExceptionWithContext SomeException))
-release child = do
-  exited ← getProcessExitCode (childProcess child)
-  case exited of
-    Just _ → pure ()
-    Nothing → do
-      target ← getPid (childProcess child)
-      -- The child may leave between the check and the kill; the reap below is the authority, so a failed kill is no verdict.
-      forM_ target $ \pid → try @IOException (signalProcess sigKILL pid)
-  reaped ← newIORef False
-  drained ← newIORef False
-  interruption ← rememberingInterruption $ do
-    reapedNow ← timeout (10 * 1000000) (waitForProcess (childProcess child))
-    writeIORef reaped (isJust reapedNow)
-    drainedNow ← timeout (10 * 1000000) (atomically (readTVar (childOutEnded child) >>= check >> readTVar (childErrEnded child) >>= check))
-    writeIORef drained (isJust drainedNow)
-  wasReaped ← readIORef reaped
-  wasDrained ← readIORef drained
-  pure (["the child was not reaped within 10 seconds of the kill" | not wasReaped] <> ["the child's pipes did not end within 10 seconds" | not wasDrained], interruption)

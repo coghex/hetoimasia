@@ -354,6 +354,8 @@ test-suite run-native-tests
     build-tool-depends: hetoimasia:hetoimasia
     if flag(full-product)
         other-modules:
+            Test.Run.Native.Child
+            Test.Run.Native.ChildSpec
             Test.Run.Native.Command
             Test.Run.Native.Consent
             Test.Run.Native.Env
