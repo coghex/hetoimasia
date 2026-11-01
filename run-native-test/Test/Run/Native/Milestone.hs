@@ -201,9 +201,12 @@ spec env = describe "Lua native milestone" $ do
               awaitFrame peers windowA 1 mark `onException` (windowMetrics peers windowA >>= \m → hPutStrLn stderr ("no frame after " <> label <> "; the window reports " <> show m))
               unchanged label
             resizeTo label (width, height) = do
+              -- What the window reported before this step: a new reading is one the step itself produced, either the
+              -- size that was asked for or a different one published after it.
+              before ← windowMetrics peers windowA
               disposition ← requestSize peers windowA (width, height)
               (label, attempted disposition) `shouldBe` (label, True)
-              reached ← awaitMetrics peers windowA (label <> " to be reported") (\m → metricsLogical m == Just (width, height) || (metricsLogical m /= metricsLogical initial && metricsRevision m > metricsRevision initial))
+              reached ← awaitMetrics peers windowA (label <> " to be reported") (\m → metricsLogical m == Just (width, height) || (metricsLogical m /= metricsLogical before && metricsRevision m > metricsRevision before))
               renders label
               snap env peers ("view--" <> Text.pack label) boundA
               checkpoint env (Text.pack ("resize-" <> label)) (Text.pack ("the owner confirms, in the " <> label <> " window, that the quad keeps its size and its top-left position (clipped where the window is too small, never stretched or re-centred)")) =<< factsFor peers [("subject", windowA)]

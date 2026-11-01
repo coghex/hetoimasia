@@ -121,6 +121,7 @@ snap env peers name (Just bound) = do
 -- size; the host's own metrics, when there are any (a harness window), are recorded beside it and cross-checked.
 snapWith ∷ Env → Text → Bound → ((Int, Int) → [Landmark]) → Maybe Metrics → IO () → IO ()
 snapWith env name bound landmarksFor metrics beforeAttempt = do
+  firstFailure ← newIORef ""
   let final = envCaptureDir env </> Text.unpack name <> ".png"
       stage n = envCaptureDir env </> Text.unpack name <> ".attempt" <> show (n ∷ Int) <> ".png"
       loop n previous = do
@@ -134,6 +135,7 @@ snapWith env name bound landmarksFor metrics beforeAttempt = do
           then pure (n, shot, judged, True)
           else do
             when (n `mod` 8 == 1) $ note ("capture " <> Text.unpack name <> " attempt " <> show n <> ": " <> describeFailures judged)
+            when (n == 1) $ writeIORef firstFailure (describeFailures judged)
             if n >= attemptsAllowed
               then pure (n, shot, judged, False)
               else threadDelay 250000 >> loop (n + 1) [stage n]
@@ -142,6 +144,7 @@ snapWith env name bound landmarksFor metrics beforeAttempt = do
     Just done → pure done
     Nothing → expectationFailure ("the capture " <> Text.unpack name <> " never showed the scene's landmarks within 40 seconds") >> error "unreachable"
   renameFile (capturedPath shot) final
+  earlier ← readIORef firstFailure
   let scale = metrics >>= metricsScale
       scaleOk = scale `elem` [Just (1, 1), Nothing]
       record =
@@ -157,6 +160,7 @@ snapWith env name bound landmarksFor metrics beforeAttempt = do
           , ("host_content_scale", case scale of Just (x, y) → JString (Text.pack (show (x, y))); Nothing → JNull)
           , ("host_metrics_available", JBool (maybe False (const True) metrics))
           , ("attempts", JNumber (fromIntegral attempts))
+          , ("first_attempt_failures", JString (Text.pack earlier))
           , ("tolerance_per_channel", JNumber (fromIntegral tolerance))
           , ("colour_handling", JString "Xvfb TrueColor display, no colour management; presented through an sRGB target by the software rasteriser; landmark expectations are the fixture's byte values (samples/lua-quad), never a first-run capture")
           , ("landmarks", JArray (map judgementJson judged))
@@ -165,7 +169,7 @@ snapWith env name bound landmarksFor metrics beforeAttempt = do
   writeFile (envCaptureDir env </> Text.unpack name <> ".json") (render record <> "\n")
   unless scaleOk $ expectationFailure ("the host reports content scale " <> show scale <> " on the X display; this receipt's landmarks assume scale 1")
   unless passed $ expectationFailure ("a landmark failed in capture " <> Text.unpack name <> " after " <> show attempts <> " attempts (the last image is retained as " <> Text.unpack name <> ".png): " <> describeFailures judged)
-  evidence env ("capture " <> name <> ": X window " <> Text.pack (show (boundX bound)) <> " of pid " <> Text.pack (show (boundPid bound)) <> ", client area " <> Text.pack (show (capturedWidth shot, capturedHeight shot)) <> ", sha256 " <> capturedSha256 shot <> ", " <> Text.pack (show (length judged)) <> " landmarks passed within " <> Text.pack (show tolerance) <> " per channel after " <> Text.pack (show attempts) <> " capture(s); a capture is what the window presented, not GPU retirement evidence")
+  evidence env ("capture " <> name <> ": X window " <> Text.pack (show (boundX bound)) <> " of pid " <> Text.pack (show (boundPid bound)) <> ", client area " <> Text.pack (show (capturedWidth shot, capturedHeight shot)) <> ", sha256 " <> capturedSha256 shot <> ", " <> Text.pack (show (length judged)) <> " landmarks passed within " <> Text.pack (show tolerance) <> " per channel after " <> Text.pack (show attempts) <> " capture(s)" <> (if null earlier then "" else "; the first capture failed: " <> Text.pack (filter (/= '\n') earlier)) <> "; a capture is what the window presented, not GPU retirement evidence")
   where
     extentJson = \case
       Just (w, h) → JArray [JNumber (fromIntegral w), JNumber (fromIntegral h)]
