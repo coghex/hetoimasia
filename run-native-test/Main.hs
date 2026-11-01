@@ -19,7 +19,7 @@
 -- persistently.
 module Main (main) where
 
-import Control.Concurrent (forkIO, forkOS)
+import Control.Concurrent (forkOS)
 import Control.Concurrent.MVar (newEmptyMVar, takeMVar)
 import Control.Concurrent.STM
   ( TMVar
@@ -60,6 +60,7 @@ import Test.Run.Native.Command (executableVariable)
 import qualified Test.Run.Native.Command as Command
 import Test.Run.Native.Consent (Consent (..), describeConsent, readConsent, refusalMessage)
 import Test.Run.Native.Env (Env (..), Hold (..))
+import Test.Run.Native.Owned (withOwnedThread)
 import Test.Run.Native.X11 (defaultX11)
 import qualified Test.Run.Native.Library as Library
 import qualified Test.Run.Native.Milestone as Milestone
@@ -89,53 +90,57 @@ main = do
   -- The supervised run is told apart from the catalog's unattended receipt by inputs the suite already reads: the
   -- desktop consent with a selection narrower than the complete profile. Only it holds, and only on the operator's
   -- acknowledgment on standard input.
-  hold ← case consent of
-    Desktop | arguments /= [completeFlag] → do
-      input ← newTQueueIO
-      _ ← forkIO $ do
-        let loop = do
-              next ← try @SomeException (Text.getLine)
-              case next of
-                Right line → atomically (writeTQueue input (Just line)) >> loop
-                Left _ → atomically (writeTQueue input Nothing)
-        loop
-      pure (Just (Hold input (20 * 60)))
-    _ → pure Nothing
-  let env =
-        Env
-          { envStart = startMain jobs
-          , envEvidence = evidenceLines
-          , envX11 = case consent of IsolatedX11 _ → Just defaultX11; _ → Nothing
-          , envHold = hold
-          , envCaptureDir = captureDirectory
-          }
-  _ ← forkOS $ do
-    result ←
-      try @SomeException $
-        if arguments == [completeFlag]
-          then do
-            (cfg, forest) ← evalSpec defaultConfig {configFailOnEmpty = True} (examples env)
-            specResultSuccess <$> runSpecForest forest cfg
-          else isSuccess <$> hspecWithResult defaultConfig {configFailOnEmpty = True} (examples env)
-    atomically (putTMVar done result)
-  -- The process main thread serves the examples' runs until Hspec is done.
-  outcome ← serve jobs done
-  finished ← getCurrentTime
-  lines' ← reverse <$> readTVarIO evidenceLines
-  let passed = either (const False) id outcome
-      problems =
-        [ "an example failed" | not passed ]
-          <> [ "the suite raised: " <> Text.pack (show failure) | Left failure ← [outcome] ]
-  record ← evidenceRecord consent passed problems (realToFrac (diffUTCTime finished started)) lines'
-  Text.putStrLn record
-  forM_ evidenceDirectory $ \place → do
-    createDirectoryIfMissing True place
-    Text.writeFile (place </> "run-native.md") record
-  when scratch (removeDirectoryRecursive captureDirectory)
-  forM_ problems (hPutStrLn stderr . ("run-native-tests: " <>) . Text.unpack)
-  unless (null problems) exitFailure
+  withHold consent arguments $ \hold → do
+    let env =
+          Env
+            { envStart = startMain jobs
+            , envEvidence = evidenceLines
+            , envX11 = case consent of IsolatedX11 _ → Just defaultX11; _ → Nothing
+            , envHold = hold
+            , envCaptureDir = captureDirectory
+            }
+    _ ← forkOS $ do
+      result ←
+        try @SomeException $
+          if arguments == [completeFlag]
+            then do
+              (cfg, forest) ← evalSpec defaultConfig {configFailOnEmpty = True} (examples env)
+              specResultSuccess <$> runSpecForest forest cfg
+            else isSuccess <$> hspecWithResult defaultConfig {configFailOnEmpty = True} (examples env)
+      atomically (putTMVar done result)
+    -- The process main thread serves the examples' runs until Hspec is done.
+    outcome ← serve jobs done
+    finished ← getCurrentTime
+    lines' ← reverse <$> readTVarIO evidenceLines
+    let passed = either (const False) id outcome
+        problems =
+          [ "an example failed" | not passed ]
+            <> [ "the suite raised: " <> Text.pack (show failure) | Left failure ← [outcome] ]
+    record ← evidenceRecord consent passed problems (realToFrac (diffUTCTime finished started)) lines'
+    Text.putStrLn record
+    forM_ evidenceDirectory $ \place → do
+      createDirectoryIfMissing True place
+      Text.writeFile (place </> "run-native.md") record
+    when scratch (removeDirectoryRecursive captureDirectory)
+    forM_ problems (hPutStrLn stderr . ("run-native-tests: " <>) . Text.unpack)
+    unless (null problems) exitFailure
   where
     refuse refusal = hPutStrLn stderr ("run-native-tests: " <> Text.unpack (refusalMessage refusal)) >> exitWith (ExitFailure 3)
+
+-- | The operator's acknowledgments, for the length of the run: the supervised run (the desktop consent with a selection narrower
+-- than the complete profile) reads standard input on a thread of its own, which is owned: stopped and joined however the run ends.
+-- The catalog's unattended receipt reads nothing and holds nowhere.
+withHold ∷ Consent → [String] → (Maybe Hold → IO a) → IO a
+withHold consent arguments body = case consent of
+  Desktop | arguments /= [completeFlag] → do
+    input ← newTQueueIO
+    let reader = do
+          next ← try @SomeException (Text.getLine)
+          case next of
+            Right line → atomically (writeTQueue input (Just line)) >> reader
+            Left _ → atomically (writeTQueue input Nothing)
+    withOwnedThread reader $ \_ _ → body (Just (Hold input (20 * 60)))
+  _ → body Nothing
 
 -- | Runs the whole profile with nothing an environment could narrow, which the catalog group passes.
 completeFlag ∷ String

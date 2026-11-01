@@ -15,7 +15,7 @@
 module Test.Run.Native.Milestone (spec) where
 
 import Control.Concurrent.STM (atomically, readTVar, readTVarIO, retry)
-import Control.Concurrent (forkIO, myThreadId, throwTo)
+import Control.Concurrent (myThreadId, throwTo)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (newTVarIO)
 import Control.Exception (AsyncException (UserInterrupt), ExceptionWithContext (..), SomeException, finally, fromException, onException, tryWithContext, uninterruptibleMask_)
@@ -48,6 +48,7 @@ import Test.Run.Native.Lifecycle (Disposal (..), awaitDisposal, disposalFollowed
 import qualified Test.Run.Native.X11 as X11
 import Test.Run.Native.Checkpoint (checkpoint)
 import Test.Run.Native.Observe
+import Test.Run.Native.Owned (withOwnedThread)
 import Test.Run.Native.Peers
 
 spec ∷ Env → Spec
@@ -435,9 +436,9 @@ spec env = describe "Lua native milestone" $ do
       held ← newEmptyMVar
       never ← newTVarIO False
       caller ← myThreadId
-      -- The cancellation is delivered once the gates are really held: an event, not a delay.
-      _ ← forkIO (takeMVar held >> throwTo caller UserInterrupt)
-      outcome ← tryWithContext @SomeException . withPeers (envStart env) folder $ \peers → do
+      -- The cancellation is delivered once the gates are really held: an event, not a delay. The thread that delivers it is
+      -- owned: stopped and joined however the example ends, so it cannot outlive this scope waiting for an event.
+      outcome ← withOwnedThread (takeMVar held >> throwTo caller UserInterrupt) $ \_ _ → tryWithContext @SomeException . withPeers (envStart env) folder $ \peers → do
         holdNextReads peers quadPath 1
         withholdNextCreations peers 1
         _ ← admitUi peers
@@ -475,15 +476,17 @@ spec env = describe "Lua native milestone" $ do
       -- The scenario cannot receive the stop (it is in an uninterruptible region), so its delivery blocks; the caller is
       -- cancelled again at that point. Each step waits for the event before it: the scenario being in the region, the stop
       -- being started; the scenario is released however the chain ends, so a failure here fails the example and does not hang it.
-      _ ←
-        forkIO $
-          ( takeMVar inRegion
+      -- The delivering thread is owned (stopped and joined however the example ends).
+      outcome ←
+       withOwnedThread
+        ( ( takeMVar inRegion
               >> throwTo caller UserInterrupt
               >> takeMVar stopStarted
               >> throwTo caller UserInterrupt
           )
             `finally` tryPutMVar release ()
-      outcome ← tryWithContext @SomeException . withPeersUsing noPeersHooks {hookStopping = () <$ tryPutMVar stopStarted ()} (envStart env) folder $ \peers → do
+        )
+        $ \_ _ → tryWithContext @SomeException . withPeersUsing noPeersHooks {hookStopping = () <$ tryPutMVar stopStarted ()} (envStart env) folder $ \peers → do
         holdNextReads peers quadPath 1
         withholdNextCreations peers 1
         _ ← admitUi peers

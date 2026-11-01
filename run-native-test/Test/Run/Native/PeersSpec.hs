@@ -10,8 +10,7 @@
 -- non-empty, and only a clean attached verdict with nothing beside it does not.
 module Test.Run.Native.PeersSpec (spec) where
 
-import Control.Concurrent (forkFinally, killThread, threadDelay)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (killThread, threadDelay)
 import Control.Exception (bracket_)
 import Control.Monad (forM_, forever)
 import Data.IORef (atomicModifyIORef', newIORef, readIORef)
@@ -23,6 +22,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   , DiagnosticVerdict (..)
   )
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
+import Test.Run.Native.Owned (withOwnedThread)
 import Test.Run.Native.Peers (judgeCancellation, judgeTeardown, withOwnedLoop)
 
 clean ∷ DiagnosticVerdict
@@ -75,12 +75,16 @@ spec = describe "the harness's judgement of a failed teardown" $ do
     it "has ended and been joined whenever the call returns, whenever the caller is cancelled, including right after the loop thread is acquired" $
       forM_ [1 .. 100 :: Int] $ \_ -> do
         alive <- newIORef (0 :: Int)
-        finishedCall <- newEmptyMVar
-        -- forkFinally installs its handler in the same masked step as the fork, so the answer is given however early the kill lands.
-        caller <- forkFinally (withOwnedLoop (bracket_ (bump alive 1) (threadDelay 3000 >> bump alive (-1)) (forever (threadDelay 100))) (forever (threadDelay 1000))) (putMVar finishedCall)
-        killThread caller
-        _ <- takeMVar finishedCall
-        -- The call returned: the loop it owned is not running, whether or not it ever got to start.
-        readIORef alive >>= (`shouldBe` 0)
+        -- The caller runs on an owned thread too; its end is awaited, and it is killed and joined however the example ends.
+        withOwnedThread
+          ( -- The loop counts itself live and not live in one masked bracket, so the count cannot be left odd by the way it ends;
+            -- its wind-down takes a moment, as a real loop's does, so a call that did not wait for it would return while it is live.
+            withOwnedLoop (bracket_ (bump alive 1) (threadDelay 3000 >> bump alive (-1)) (forever (threadDelay 100))) (forever (threadDelay 1000))
+          )
+          $ \caller awaitEnd -> do
+            killThread caller
+            awaitEnd
+            -- The call returned: the loop it owned is not running, whether or not it ever got to start.
+            readIORef alive >>= (`shouldBe` 0)
   where
     bump counter by = atomicModifyIORef' counter (\n -> (n + by, ()))

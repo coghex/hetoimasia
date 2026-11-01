@@ -373,6 +373,7 @@ test-suite run-native-tests
             Test.Run.Native.Milestone
             Test.Run.Native.Observe
             Test.Run.Native.Peers
+            Test.Run.Native.Owned
             Test.Run.Native.PeersSpec
             Test.Run.Native.X11Spec
             Test.Run.Native.X11

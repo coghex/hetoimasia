@@ -73,9 +73,9 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Concurrent (forkIOWithUnmask, killThread, myThreadId, threadDelay, throwTo)
+import Control.Concurrent (myThreadId, threadDelay, throwTo)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
-import Control.Exception (Exception, ExceptionWithContext (..), SomeException, finally, fromException, mask, onException, rethrowIO, throwIO, tryWithContext, uninterruptibleMask_)
+import Control.Exception (Exception, ExceptionWithContext (..), SomeException, finally, fromException, mask, onException, rethrowIO, throwIO, tryWithContext)
 import System.IO (hPutStrLn, stderr)
 import System.Timeout (timeout)
 import Control.Monad (forM_, forever, join, unless, void, when)
@@ -154,6 +154,7 @@ import Hetoimasia.LuaEngine.Texture (specIoWorkers, textureSpec, withTexturePipe
 import Hetoimasia.Run.Boot (Prepared (..), withPrepared)
 import Hetoimasia.Run.Serve (Owner (..), serveSpawned, runOwned)
 import Hetoimasia.Run.Settle (answering, combine, isAsynchronous)
+import Test.Run.Native.Owned (withOwnedThread)
 import Hetoimasia.Runtime.GLFW
   ( ScheduledStep (..)
   , UpdateSchedule (NoUpdateDemand)
@@ -775,10 +776,7 @@ withTickPump control owner tick = withOwnedLoop (forever (grantScheduledStep (sc
 -- interruptibility restored; the stop and the join of the loop are not interruptible, so no way out of the body returns
 -- before the loop has ended. The loop runs unmasked and its end is announced however it ended.
 withOwnedLoop ∷ IO () → IO a → IO a
-withOwnedLoop loop body = mask $ \restore → do
-  done ← newEmptyMVar
-  thread ← forkIOWithUnmask $ \unmask → unmask loop `finally` putMVar done ()
-  restore body `finally` uninterruptibleMask_ (killThread thread >> takeMVar done)
+withOwnedLoop loop body = withOwnedThread loop (\_ _ → body)
 
 -- | Ask the owner to retire and wait, under supervision, until it is no longer live.
 retireAndAwait ∷ RuntimeControl → ScheduledOwner → IO ()
