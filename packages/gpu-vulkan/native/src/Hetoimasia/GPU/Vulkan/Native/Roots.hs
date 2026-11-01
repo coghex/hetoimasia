@@ -162,6 +162,7 @@ module Hetoimasia.GPU.Vulkan.Native.Roots
 
     -- * Startup
   , startRoots
+  , startRootsResolving
   , RootsAlreadyStarted (..)
   , startRootsDevice
   , DeviceAlreadyStarted (..)
@@ -314,8 +315,11 @@ import Hetoimasia.GPU.Vulkan.Native.Profile
   , InstancePlan (..)
   , InstanceRequest
   , TargetRejection (..)
+  , ValidationChoice (..)
+  , ValidationResolution
   , debugUtilsExtension
   , planInstance
+  , resolveValidation
   , selectDevice
   , selectSurfaceFreeDevice
   , InstanceOffer
@@ -688,11 +692,33 @@ instance Exception RootsRetained where
 -- before anything is created. Each handle is recorded as it is created; a
 -- failure after the instance leaves it recorded for retirement to destroy.
 startRoots ∷ Roots q inst msgr phys dev → InstanceRequest → IO InstancePlan
-startRoots roots request = do
+startRoots roots request = startRootsResolving roots request ValidationOff (\_ → pure ())
+
+-- | 'startRoots' with an optional validation request resolved against the
+-- loader's offer (LFE-28).
+--
+-- The offer is read once. 'resolveValidation' then adds to the strict request
+-- only what that offer contains, and the resolution is handed to the publisher
+-- before the plan is checked and before anything is created, so a startup
+-- that fails afterwards (a refusal for something the request asked for
+-- explicitly, a creation failure) has still recorded what was resolved. The
+-- publisher runs on the calling thread, once, and must not block. A
+-- 'ValidationOff' choice changes nothing: the plan is the strict plan of the
+-- request, and the publisher is told so.
+--
+-- A gap in the offer never fails the start: an item the loader does not offer
+-- is dropped and recorded. What does fail it keeps its authority: the
+-- strict refusals for what the request itself asked, an instance or messenger
+-- that cannot be created, and the diagnostic capture. There is no retry
+-- without validation.
+startRootsResolving ∷ Roots q inst msgr phys dev → InstanceRequest → ValidationChoice → (ValidationResolution → IO ()) → IO InstancePlan
+startRootsResolving roots request choice publish = do
   begun ← atomically (standingOf <$> readTVar (rootsInstance roots))
   unless (begun == RootAbsent) (throwIO RootsAlreadyStarted)
   offer ← opsInstanceOffer ops
-  plan ← either throwIO pure (planInstance request offer)
+  let (resolved, resolution) = resolveValidation choice request offer
+  publish resolution
+  plan ← either throwIO pure (planInstance resolved offer)
   created ← creating (rootsInstance roots) (opsCreateInstance ops plan)
   atomically (writeTVar (rootsDebugUtils roots) (debugUtilsExtension `elem` planInstanceExtensions plan))
   _ ← creating (rootsMessenger roots) (opsCreateMessenger ops created)

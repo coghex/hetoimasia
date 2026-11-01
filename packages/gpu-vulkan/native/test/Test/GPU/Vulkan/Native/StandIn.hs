@@ -19,6 +19,8 @@ module Test.GPU.Vulkan.Native.StandIn
   , Scripted (..)
   , script
   , standInDevice
+  , offerLayers'
+  , plansCreated
   , StandInFailure (..)
   , StandInLoss (..)
   , StandInResult (..)
@@ -209,6 +211,12 @@ data StandIn = StandIn
     -- ^ Kinds whose next naming runs out of memory, once each.
   , standAllocator ∷ !AllocatorStandIn
     -- ^ The allocator every device of this stand-in is given.
+  , standLayers ∷ !(TVar ([ByteString], [(ByteString, [ByteString])]))
+    -- ^ The layers the loader offers, and the instance extensions each provides: the Khronos validation layer and its
+    -- validation-features extension until an example changes it ('offerLayers'').
+  , standPlans ∷ !(TVar [InstancePlan])
+    -- ^ Every plan an instance creation was attempted with, newest first, recorded whether or not the creation
+    -- succeeded ('plansCreated').
   }
 
 newStandIn ∷ IO StandIn
@@ -225,6 +233,8 @@ newStandIn = do
     <*> newTVarIO []
     <*> newTVarIO []
     <*> newAllocatorStandIn
+    <*> newTVarIO (["VK_LAYER_KHRONOS_validation"], [("VK_LAYER_KHRONOS_validation", [validationFeaturesExtension])])
+    <*> newTVarIO []
 
 -- | A surface that supplies a concrete 640 by 480 extent and offers the
 -- profile's BGRA sRGB format, FIFO, color attachment and opaque composition,
@@ -366,6 +376,14 @@ step standIn at call = do
     Just (AnswersOnceAfter _ result) → throwIO (StandInResult (Text.pack (show at)) result)
     Just (AnswersOnceThen result _) → throwIO (StandInResult (Text.pack (show at)) result)
 
+-- | Change what the loader offers in layers, and the instance extensions each provides, from now on.
+offerLayers' ∷ StandIn → [ByteString] → [(ByteString, [ByteString])] → IO ()
+offerLayers' standIn layers layerExtensions = atomically (writeTVar (standLayers standIn) (layers, layerExtensions))
+
+-- | Every plan an instance creation was attempted with, oldest first.
+plansCreated ∷ StandIn → IO [InstancePlan]
+plansCreated standIn = reverse <$> readTVarIO (standPlans standIn)
+
 -- | The stand-in's native layer. Handles are numbers: the instance is 1, the
 -- messenger 2 and the device 3; a surface is whatever number it was made with.
 standInOps ∷ StandIn → RootOps () Int Int Text Int
@@ -373,6 +391,7 @@ standInOps standIn =
   RootOps
     { opsInstanceOffer = do
         record standIn OfferedInstance
+        (layers, layerExtensions) ← readTVarIO (standLayers standIn)
         pure
           InstanceOffer
             { offerLoaderVersion = standLoaderVersion standIn
@@ -384,10 +403,11 @@ standInOps standIn =
                 , surfaceMaintenance1Extension
                 , portabilityEnumerationExtension
                 ]
-            , offerLayers = ["VK_LAYER_KHRONOS_validation"]
-            , offerLayerExtensions = [("VK_LAYER_KHRONOS_validation", [validationFeaturesExtension])]
+            , offerLayers = layers
+            , offerLayerExtensions = layerExtensions
             }
     , opsCreateInstance = \plan → do
+        atomically (modifyTVar' (standPlans standIn) (plan :))
         step standIn AtCreateInstance (CreatedInstance (map decode (planInstanceExtensions plan)))
         pure 1
     , opsCreateMessenger = \_ → 2 <$ step standIn AtCreateMessenger CreatedMessenger

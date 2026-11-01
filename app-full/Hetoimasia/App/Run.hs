@@ -17,7 +17,7 @@ runCommand = Just runRun
 
 -- | What the top-level usage line adds for the command.
 usageAlternative ∷ Text
-usageAlternative = " | run [--] GAME_ROOT"
+usageAlternative = " | run [--vulkan-validation] [--] GAME_ROOT"
 
 -- | The command's lines in the top-level help text.
 helpEntry ∷ [Text]

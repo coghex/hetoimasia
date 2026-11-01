@@ -40,6 +40,8 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , Scripted (..)
   , scriptNative
   , declareUnsupported
+  , offerNativeLayers
+  , instancePlans
   , StandInFailure (..)
   , StandInLoss (..)
   , StandInNotPresented (..)
@@ -257,7 +259,9 @@ import Hetoimasia.GPU.Vulkan.Native.Profile
   , allBindlessFeatures
   , DevicePlan (..)
   , InstanceOffer (..)
+  , InstancePlan
   , QueueFamilyOffer (..)
+  , ValidationChoice (..)
   , debugUtilsExtension
   , getSurfaceCapabilities2Extension
   , packApiVersion
@@ -488,7 +492,19 @@ data Native = Native
     -- ^ Whether the device offers naming, read when it is created.
   , nativeNamingFails ∷ !(TVar (Set NativeObjectKind))
     -- ^ The kinds of object whose naming raises from now on.
+  , nativeLayers ∷ !(TVar ([ByteString], [(ByteString, [ByteString])]))
+    -- ^ The layers the loader offers and the instance extensions each provides: none until an example offers some.
+  , nativePlans ∷ !(TVar [InstancePlan])
+    -- ^ Every plan an instance creation was attempted with, oldest first.
   }
+
+-- | Change the layers the loader offers, and the instance extensions each provides, before the host starts.
+offerNativeLayers ∷ Rig → [ByteString] → [(ByteString, [ByteString])] → IO ()
+offerNativeLayers rig layers layerExtensions = atomically (writeTVar (nativeLayers (rigNative rig)) (layers, layerExtensions))
+
+-- | Every plan the instance creation was attempted with, oldest first.
+instancePlans ∷ Rig → IO [InstancePlan]
+instancePlans rig = readTVarIO (nativePlans (rigNative rig))
 
 -- | Wait until a call is holding at this step.
 awaitHeld ∷ Rig → Step → IO ()
@@ -614,15 +630,18 @@ nativeLayer rescued events native allocator capture =
   RootOps
     { opsInstanceOffer = do
         atomically (writeTVar (nativeCapture native) (Just capture))
+        (layers, layerExtensions) ← readTVarIO (nativeLayers native)
         pure
           InstanceOffer
             { offerLoaderVersion = packApiVersion 1 3 296
             , offerInstanceExtensions =
                 ["VK_KHR_surface", "VK_KHR_wayland_surface", debugUtilsExtension, getSurfaceCapabilities2Extension, surfaceMaintenance1Extension]
-            , offerLayers = []
-            , offerLayerExtensions = []
+            , offerLayers = layers
+            , offerLayerExtensions = layerExtensions
             }
-    , opsCreateInstance = \_ → 1 <$ step events native AtCreateInstance InstanceCreated
+    , opsCreateInstance = \plan → do
+        atomically (modifyTVar' (nativePlans native) (<> [plan]))
+        1 <$ step events native AtCreateInstance InstanceCreated
     , opsCreateMessenger = \_ → 2 <$ step events native AtCreateMessenger MessengerCreated
     , opsDestroyMessenger = \_ _ → step events native AtDestroyMessenger MessengerDestroyed
     , -- The destruction's return is the capture's quiescence evidence, as the
@@ -1488,6 +1507,8 @@ data Rig = Rig
     -- the round that reported it is the next one.
   , rigTargetCapacity ∷ !Natural
     -- ^ How many offscreen scene targets the host accounts for at once.
+  , rigValidation ∷ !ValidationChoice
+    -- ^ The optional validation the host is configured with: off unless an example says otherwise.
   }
 
 -- | Make the capture's sink raise on every record it is given from now on.
@@ -1758,7 +1779,7 @@ newRigClocked visible windows clock = do
             ShowWindow key → atomically (modifyTVar' hidden (Set.delete key)) >> record events (WindowShown key)
             _ → pure ()
         }
-  native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO 500 <*> newTVarIO Nothing <*> newTVarIO Nothing <*> newTVarIO Set.empty <*> newTVarIO imageUsageColorAttachment <*> newTVarIO False <*> newTVarIO Set.empty
+  native ← Native <$> newTVarIO Map.empty <*> newTVarIO Set.empty <*> newTVarIO 500 <*> newTVarIO Nothing <*> newTVarIO Nothing <*> newTVarIO Set.empty <*> newTVarIO imageUsageColorAttachment <*> newTVarIO False <*> newTVarIO Set.empty <*> newTVarIO ([], []) <*> newTVarIO []
   renderer ← newTVarIO Nothing
   frameHook ← newTVarIO (\_ → pure ())
   bridge ← Bridge <$> newTVarIO Map.empty <*> newTVarIO Nothing <*> newTVarIO 100 <*> newTVarIO []
@@ -1818,6 +1839,7 @@ newRigClocked visible windows clock = do
       , rigSceneMode = SharedScene
       , rigSceneEvents = sceneLog
       , rigSceneRounds = sceneRoundLog
+      , rigValidation = ValidationOff
       }
 
 -- | Run a whole Vulkan graphics host under the application runner, on a bound
@@ -1857,6 +1879,7 @@ runRigHere rig body = myThreadId >>= \self → withBoundThread (rigBound rig) se
           , vulkanUploads = rigUploads rig
           , vulkanWindowDepth = rigWindowDepth rig
           , vulkanSceneMode = rigSceneMode rig
+          , vulkanOptionalValidation = rigValidation rig
           , vulkanSceneLifecycle =
               SceneLifecycle
                 { sceneAdopted = \key revision adopted → reportScene (case key of KeyWindow window → SceneAdopted window revision adopted; KeyOffscreen target → TargetAdopted target revision adopted)

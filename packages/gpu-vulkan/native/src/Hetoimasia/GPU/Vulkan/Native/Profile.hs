@@ -68,6 +68,13 @@ module Hetoimasia.GPU.Vulkan.Native.Profile
   , InstanceRefusal (..)
   , planInstance
 
+    -- * Optional validation
+  , khronosValidationLayer
+  , ValidationChoice (..)
+  , ValidationDisposition (..)
+  , ValidationResolution (..)
+  , resolveValidation
+
     -- * The device
   , BindlessFeatures (..)
   , allBindlessFeatures
@@ -274,6 +281,90 @@ planInstance request offer
         )
     missingExtensions = filter (`notElem` offered) required
     missingLayers = filter (`notElem` offerLayers offer) (nub (requestLayers request))
+
+-- ---------------------------------------------------------------------------
+-- Optional validation
+
+-- | The one validation layer the optional request names.
+khronosValidationLayer ∷ ByteString
+khronosValidationLayer = "VK_LAYER_KHRONOS_validation"
+
+-- | Whether a caller asks for validation /if the loader offers it/ — LFE-28.
+--
+-- This is a different request from the layers and features of an
+-- 'InstanceRequest', which stay strict: a layer or feature asked for there that the
+-- loader lacks is a refusal ('InstanceRefusal'), because a sample or a native
+-- suite must never silently validate less than it claims. 'ValidationOn' asks
+-- for the Khronos layer and synchronization validation, each only as far as the
+-- loader's offer reaches ('resolveValidation'), and a gap is a dropped item
+-- and never a refusal. It is a plain value, so the command line, an
+-- in-process caller and a test build the same one.
+data ValidationChoice
+  = -- | Nothing optional is requested: the instance is planned from the
+    -- 'InstanceRequest' alone, exactly as before this choice existed.
+    ValidationOff
+  | ValidationOn
+  deriving (Eq, Ord, Show, Bounded, Enum)
+
+-- | What became of one optional item.
+data ValidationDisposition
+  = -- | Validation was not requested, so neither item was.
+    DispositionNotRequested
+  | -- | Selected into the instance's create info. This is what was /asked of
+    -- the loader/, not proof that the loader kept the layer in its chain or
+    -- that it is active (@docs/vulkan_compatibility_record.md@, "Zero
+    -- validation errors is a claim about coverage").
+    DispositionEnabled
+  | -- | Requested, and not enabled because the loader does not offer it (the
+    -- layer), or because no enabled layer offers the extension that carries it
+    -- (the feature). The instance is created without it.
+    DispositionDropped
+  deriving (Eq, Ord, Show, Bounded, Enum)
+
+-- | The typed record of requested versus resolved, for each optional item.
+data ValidationResolution = ValidationResolution
+  { resolvedLayer ∷ !ValidationDisposition
+    -- ^ 'khronosValidationLayer'.
+  , resolvedFeature ∷ !ValidationDisposition
+    -- ^ 'SynchronizationValidation', the only feature the model has.
+  }
+  deriving (Eq, Show)
+
+-- | Resolve an optional validation request against what the loader offers,
+-- adding to the strict request only what the offer contains.
+--
+-- * 'ValidationOff': the request is returned unchanged and both items are
+--   'DispositionNotRequested'.
+-- * 'ValidationOn': the Khronos layer is added iff the loader lists it, and
+--   'SynchronizationValidation' iff an /enabled/ layer — the request's own or
+--   the one just added — lists @VK_EXT_validation_features@ among its
+--   extensions. An extension listed only globally, or by a layer that is not
+--   enabled, enables nothing. A layer the loader lacks takes the feature with
+--   it unless another enabled layer offers the extension.
+--
+-- It never refuses and never reads anything but its arguments. The request's
+-- own layers and features are kept as they are, so 'planInstance' still
+-- refuses what a caller asked for explicitly and the loader lacks.
+resolveValidation ∷ ValidationChoice → InstanceRequest → InstanceOffer → (InstanceRequest, ValidationResolution)
+resolveValidation choice request offer = case choice of
+  ValidationOff → (request, ValidationResolution DispositionNotRequested DispositionNotRequested)
+  ValidationOn →
+    ( request
+        { requestLayers = enabledLayers
+        , requestValidationFeatures = nub (requestValidationFeatures request <> [SynchronizationValidation | featureOffered])
+        }
+    , ValidationResolution (settled layerOffered) (settled featureOffered)
+    )
+  where
+    settled offered = if offered then DispositionEnabled else DispositionDropped
+    layerOffered = khronosValidationLayer `elem` offerLayers offer
+    enabledLayers = nub (requestLayers request <> [khronosValidationLayer | layerOffered])
+    featureOffered =
+      or
+        [ validationFeaturesExtension `elem` extensions
+        | (layer, extensions) ← offerLayerExtensions offer
+        , layer `elem` enabledLayers
+        ]
 
 -- ---------------------------------------------------------------------------
 -- The device

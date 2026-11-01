@@ -63,21 +63,37 @@ handlers = describe "the signal handlers' scope" $ do
 usage ∷ Spec
 usage = describe "the command line" $ do
   it "exits 2 with the usage line and a reason on stderr and nothing on stdout, for each usage error" $
-    forM_ [[], ["--"], ["-x"], ["a", "b"], ["--", "a", "b"], ["--help", "a"], ["--mod", "x"]] $ \arguments → do
+    forM_ usageErrors $ \(arguments, reason) → do
       outcome ← runToCompletion [] ("run" : arguments)
       (arguments, outcomeCode outcome, outcomeOut outcome) `shouldBe` (arguments, ExitFailure 2, "")
-      outcomeErr outcome `shouldContain` "Usage: hetoimasia run [--] GAME_ROOT"
-      outcomeErr outcome `shouldContain` "hetoimasia run: "
+      outcomeErr outcome `shouldContain` "Usage: hetoimasia run [--vulkan-validation] [--] GAME_ROOT"
+      outcomeErr outcome `shouldContain` ("hetoimasia run: " <> reason)
+      length (lines (outcomeErr outcome)) `shouldBe` 2
+
+  it "accepts --vulkan-validation before a folder that is not there, which is a boot failure and not a usage error" $
+    forM_ [["--vulkan-validation", "/no/such/folder"], ["--vulkan-validation", "--", "/no/such/folder"]] $ \arguments → do
+      outcome ← runToCompletion [] ("run" : arguments)
+      (arguments, outcomeCode outcome, outcomeOut outcome) `shouldBe` (arguments, ExitFailure 1, "")
+      outcomeErr outcome `shouldContain` "boot failed"
+      outcomeErr outcome `shouldNotContain` "Usage:"
+
+  it "reads --vulkan-validation and --help after the separator as the folder, with or without the option before it" $
+    forM_ [["--", "--vulkan-validation"], ["--vulkan-validation", "--", "--vulkan-validation"], ["--vulkan-validation", "--", "--help"]] $ \arguments → do
+      outcome ← runToCompletion [] ("run" : arguments)
+      (arguments, outcomeCode outcome, outcomeOut outcome) `shouldBe` (arguments, ExitFailure 1, "")
+      outcomeErr outcome `shouldContain` "boot failed"
+      outcomeErr outcome `shouldNotContain` "Usage:"
 
   it "prints the command's help to stdout alone and exits 0" $ do
     outcome ← runToCompletion [] ["run", "--help"]
     outcomeCode outcome `shouldBe` ExitSuccess
-    outcomeOut outcome `shouldContain` "Usage: hetoimasia run [--] GAME_ROOT"
+    outcomeOut outcome `shouldContain` "Usage: hetoimasia run [--vulkan-validation] [--] GAME_ROOT"
+    outcomeOut outcome `shouldContain` "--vulkan-validation"
     outcomeErr outcome `shouldBe` ""
 
   it "names the command in the top-level usage and help of this build" $ do
     outcome ← runToCompletion [] ["--help"]
-    outcomeOut outcome `shouldContain` "run [--] GAME_ROOT"
+    outcomeOut outcome `shouldContain` "run [--vulkan-validation] [--] GAME_ROOT"
 
   it "reads a folder named --help after the separator, which is a boot failure and not a usage error" $ do
     outcome ← runToCompletion [] ["run", "--", "--help"]
@@ -85,11 +101,33 @@ usage = describe "the command line" $ do
     outcomeErr outcome `shouldContain` "boot failed"
 
   it "keeps the fatal logging configuration ahead of the dispatch, for help and malformed arguments alike" $
-    forM_ [["run", "--help"], ["run"], ["run", "x"]] $ \arguments → do
+    forM_ [["run", "--help"], ["run"], ["run", "x"], ["run", "--vulkan-validation", "x"], ["run", "--vulkan-validation"], ["run", "x", "--vulkan-validation"]] $ \arguments → do
       outcome ← runToCompletion [("HETOIMASIA_LOG_LEVEL", "nope")] arguments
       (arguments, outcomeCode outcome) `shouldBe` (arguments, ExitFailure 1)
       outcomeOut outcome `shouldBe` ""
       outcomeErr outcome `shouldContain` "HETOIMASIA_LOG_LEVEL"
+
+-- | Each usage error of the grammar, with the reason its one line carries.
+usageErrors ∷ [([String], String)]
+usageErrors =
+  [ ([], "missing GAME_ROOT")
+  , (["--"], "missing GAME_ROOT")
+  , (["-x"], "unknown option '-x'")
+  , (["a", "b"], "exactly one GAME_ROOT is accepted")
+  , (["--", "a", "b"], "exactly one GAME_ROOT is accepted")
+  , (["--help", "a"], "--help takes no other argument")
+  , (["--mod", "x"], "unknown option '--mod'")
+  , (["--vulkan-validation"], "missing GAME_ROOT")
+  , (["--vulkan-validation", "--"], "missing GAME_ROOT")
+  , (["a", "--vulkan-validation"], "--vulkan-validation must come before GAME_ROOT")
+  , (["--vulkan-validation", "a", "--vulkan-validation"], "--vulkan-validation must come before GAME_ROOT")
+  , (["--", "a", "--vulkan-validation"], "exactly one GAME_ROOT is accepted")
+  , (["--vulkan-validation", "--vulkan-validation", "a"], "--vulkan-validation is given more than once")
+  , (["--vulkan-validation", "--help"], "--help takes no other argument")
+  , (["--help", "--vulkan-validation"], "--help takes no other argument")
+  , (["--vulkan-validation", "--mod", "a"], "unknown option '--mod'")
+  , (["--validation", "a"], "unknown option '--validation'")
+  ]
 
 boot ∷ Spec
 boot = describe "boot refusals of the built executable" $ do

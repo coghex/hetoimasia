@@ -10,11 +10,13 @@ import qualified Test.Engine.Run.Options as Options
 import qualified Test.Engine.Run.Process as Process
 import qualified Test.Engine.Run.Serve as Serve
 import qualified Test.Engine.Run.Status as Status
+import qualified Test.Engine.Run.Validation as Validation
 import Test.Hspec (Spec, describe)
 
 spec ∷ Spec
 spec = describe "Run" $ do
   Options.spec
+  Validation.spec
   Status.spec
   Abort.spec
   Serve.spec

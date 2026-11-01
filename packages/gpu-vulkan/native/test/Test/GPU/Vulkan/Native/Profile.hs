@@ -109,6 +109,92 @@ spec = describe "Profile" $ do
       planValidationFeatures plan `shouldBe` []
       planInstanceExtensions plan `shouldSatisfy` notElem validationFeaturesExtension
 
+  describe "optional validation (LFE-28)" $ do
+    let offered layerOffered extensionOffered =
+          (offer everything)
+            { offerLayers = [validation | layerOffered]
+            , offerLayerExtensions = [(validation, [validationFeaturesExtension | extensionOffered] <> ["VK_EXT_debug_utils"]) | layerOffered]
+            }
+        combinations = [(layerOffered, extensionOffered) | layerOffered ← [True, False], extensionOffered ← [True, False]]
+        resolutionOf choice layerOffered extensionOffered = snd (resolveValidation choice request (offered layerOffered extensionOffered))
+
+    it "names the Khronos layer exactly as the samples and the native suites do" $
+      khronosValidationLayer `shouldBe` validation
+
+    it "requests nothing and changes nothing when validation is not requested, whatever the loader offers" $
+      for_ combinations $ \(layerOffered, extensionOffered) →
+        resolveValidation ValidationOff request (offered layerOffered extensionOffered)
+          `shouldBe` (request, ValidationResolution DispositionNotRequested DispositionNotRequested)
+
+    it "plans the same instance as before the choice existed when validation is not requested" $
+      for_ combinations $ \(layerOffered, extensionOffered) → do
+        let (resolved, _) = resolveValidation ValidationOff request (offered layerOffered extensionOffered)
+        planInstance resolved (offered layerOffered extensionOffered) `shouldBe` planInstance request (offered layerOffered extensionOffered)
+        fmap planLayers (planInstance resolved (offered layerOffered extensionOffered)) `shouldBe` Right []
+
+    it "enables the layer and synchronization validation when the loader offers the layer and the layer offers the extension" $ do
+      let (resolved, resolution) = resolveValidation ValidationOn request (offered True True)
+      resolution `shouldBe` ValidationResolution DispositionEnabled DispositionEnabled
+      (requestLayers resolved, requestValidationFeatures resolved) `shouldBe` ([validation], [SynchronizationValidation])
+      plan ← rightOf (planInstance resolved (offered True True))
+      (planLayers plan, planValidationFeatures plan) `shouldBe` ([validation], [SynchronizationValidation])
+      planInstanceExtensions plan `shouldSatisfy` elem validationFeaturesExtension
+
+    it "keeps the layer and drops the feature when the layer does not offer the extension" $ do
+      let (resolved, resolution) = resolveValidation ValidationOn request (offered True False)
+      resolution `shouldBe` ValidationResolution DispositionEnabled DispositionDropped
+      (requestLayers resolved, requestValidationFeatures resolved) `shouldBe` ([validation], [])
+      plan ← rightOf (planInstance resolved (offered True False))
+      (planLayers plan, planValidationFeatures plan) `shouldBe` ([validation], [])
+      planInstanceExtensions plan `shouldSatisfy` notElem validationFeaturesExtension
+
+    it "enables neither when the loader does not offer the layer, even if an extension is listed for it" $
+      for_ [False, True] $ \extensionOffered → do
+        let loader = (offered False extensionOffered) {offerLayerExtensions = [(validation, [validationFeaturesExtension])]}
+            (resolved, resolution) = resolveValidation ValidationOn request loader
+        resolution `shouldBe` ValidationResolution DispositionDropped DispositionDropped
+        (requestLayers resolved, requestValidationFeatures resolved) `shouldBe` ([], [])
+        plan ← rightOf (planInstance resolved loader)
+        (planLayers plan, planValidationFeatures plan) `shouldBe` ([], [])
+
+    it "never enables a feature on the strength of an extension listed globally or by a layer that is not enabled" $ do
+      let globally = (offered True False) {offerInstanceExtensions = validationFeaturesExtension : offerInstanceExtensions (offered True False)}
+          elsewhere = (offered True False) {offerLayers = [validation, "VK_LAYER_other"], offerLayerExtensions = [(validation, []), ("VK_LAYER_other", [validationFeaturesExtension])]}
+      for_ [globally, elsewhere] $ \loader → do
+        let (resolved, resolution) = resolveValidation ValidationOn request loader
+        resolution `shouldBe` ValidationResolution DispositionEnabled DispositionDropped
+        requestValidationFeatures resolved `shouldBe` []
+        fmap planValidationFeatures (planInstance resolved loader) `shouldBe` Right []
+
+    it "resolves to a plan for every combination of what is offered, so a gap never refuses" $
+      for_ combinations $ \(layerOffered, extensionOffered) → do
+        let loader = offered layerOffered extensionOffered
+            (resolved, resolution) = resolveValidation ValidationOn request loader
+        plan ← rightOf (planInstance resolved loader)
+        (planLayers plan, planValidationFeatures plan, resolution)
+          `shouldBe` case (layerOffered, extensionOffered) of
+            (True, True) → ([validation], [SynchronizationValidation], ValidationResolution DispositionEnabled DispositionEnabled)
+            (True, False) → ([validation], [], ValidationResolution DispositionEnabled DispositionDropped)
+            (False, _) → ([], [], ValidationResolution DispositionDropped DispositionDropped)
+
+    it "is the same resolution whenever it is asked of the same offer" $
+      for_ combinations $ \(layerOffered, extensionOffered) →
+        resolutionOf ValidationOn layerOffered extensionOffered `shouldBe` resolutionOf ValidationOn layerOffered extensionOffered
+
+    it "leaves the strict request strict: a layer or feature asked for explicitly that the loader lacks still refuses" $ do
+      let lacking = offered False False
+      planInstance (fst (resolveValidation ValidationOn request {requestLayers = ["VK_LAYER_missing"]} lacking)) lacking
+        `shouldBe` Left (InstanceLayersUnavailable ["VK_LAYER_missing"])
+      planInstance (fst (resolveValidation ValidationOff validating lacking)) lacking
+        `shouldBe` Left (InstanceLayersUnavailable [validation])
+      planInstance (fst (resolveValidation ValidationOff validating (offered True False))) (offered True False)
+        `shouldBe` Left (ValidationFeaturesUnavailable [validation])
+
+    it "keeps the request's own layers and features beside the optional ones" $ do
+      let (resolved, _) = resolveValidation ValidationOn request {requestLayers = ["VK_LAYER_other"]} ((offered True True) {offerLayers = [validation, "VK_LAYER_other"]})
+      requestLayers resolved `shouldBe` ["VK_LAYER_other", validation]
+      requestValidationFeatures resolved `shouldBe` [SynchronizationValidation]
+
   describe "the device" $ do
     it "takes the first device satisfying the whole profile, with one family for graphics and presentation" $ do
       let other = standInDevice {offerDevice = "second", offerDeviceName = "second"}

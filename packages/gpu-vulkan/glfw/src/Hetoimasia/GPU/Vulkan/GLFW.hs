@@ -100,6 +100,9 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , defaultActionCapacity
   , defaultReleaseCapacity
   , ValidationFeature (..)
+  , ValidationChoice (..)
+  , ValidationDisposition (..)
+  , ValidationResolution (..)
   , VulkanHost (..)
   , NativeObserver (..)
   , noObserver
@@ -321,6 +324,7 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , VulkanController
   , Readiness (..)
   , readReadiness
+  , readValidationResolution
   , VulkanRejection (..)
   , readTargetRejection
   , rejectionsRetained
@@ -446,6 +450,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , noFrameObserver
   , FrameStorageRefused (..)
   , readReadiness
+  , readValidationResolution
   , readVulkanUnavailability
   , unavailabilitiesRetained
   , readTargetRejection
@@ -537,7 +542,7 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , ticketBatch
   , transitionResource
   )
-import Hetoimasia.GPU.Vulkan.Native.Profile (ValidationFeature (..))
+import Hetoimasia.GPU.Vulkan.Native.Profile (ValidationChoice (..), ValidationDisposition (..), ValidationFeature (..), ValidationResolution (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering (UploadsUnavailable (..))
 import Hetoimasia.GPU.Vulkan.Native.TextureTable
   ( LookupEntry (..)

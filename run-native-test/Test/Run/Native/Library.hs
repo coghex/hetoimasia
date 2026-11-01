@@ -66,7 +66,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
 import Hetoimasia.LuaEngine.Facade (OutputSink (..))
 import Hetoimasia.LuaEngine.Graphics.Scene (GraphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Texture (BackendReading (..), TextureGraphics (..))
-import Hetoimasia.Run (Setup (..), runGame)
+import Hetoimasia.Run (Setup (..), ValidationChoice (..), runGame)
 import Hetoimasia.Run.Boot (noBootHooks)
 import Hetoimasia.Run.Graphics (Observation (..), runNativeWith)
 import Hetoimasia.Run.Session (Environment (..), productionEnvironment)
@@ -360,7 +360,7 @@ runWithEnding env folder ended beforePublishing scenario = mask $ \restore → d
           , setupLifetime = \_ → withLoggingLifetime silentLogger
           , setupLink = newSessionLink
           , setupReport = \_ → pure ()
-          , setupLaunch = runNativeWith observation environment
+          , setupLaunch = runNativeWith observation environment ValidationOff
           }
   finished ← newEmptyMVar ∷ IO (MVar (Either (ExceptionWithContext SomeException) ()))
   scenarioThread ← forkIOWithUnmask $ \unmask → do
