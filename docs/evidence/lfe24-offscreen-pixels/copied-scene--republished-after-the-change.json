@@ -1,0 +1,21 @@
+{
+  "case": "copied-scene",
+  "image": "republished after the change",
+  "specification": "copied scene, republished after the change",
+  "revision": 2,
+  "target": {"format": "R8G8B8A8_SRGB", "framebuffer": [64, 48], "logical": [64, 48], "scale": 1.0},
+  "textureIdentities": [34359738368],
+  "completion": "the batch's ticket reported complete before the readback was read",
+  "copyChecked": true,
+  "copyFaults": 0,
+  "determinatePixels": 3072,
+  "failedPixels": 0,
+  "unevaluablePixels": 0,
+  "indeterminatePixels": {},
+  "oracleTolerance": "the oracle's exactness rule: 0 or 1 per channel",
+  "namedProbes": 4,
+  "namedTolerances": [1],
+  "faults": 0,
+  "readbackSha256": "27482d9c7d050160eb4e83ad3744f6f5b25df991ab5405051b10f915db3abc28",
+  "pngSha256": "54d2678a18b54bd9f3c90cdff618b6db3f80b152d3d8d25a9f07b9291daeb8bc"
+}
