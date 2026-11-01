@@ -12,6 +12,8 @@
 module Test.LuaEngine.Graphics.Native.Frame
   ( Shot (..)
   , shoot
+  , shootWith
+  , Recording
   , sideWidth
   , sideHeight
   ) where
@@ -30,9 +32,11 @@ import Hetoimasia.Asset.Image (DecodedImage (..))
 import Hetoimasia.GPU.Vulkan.GLFW
   ( ActionOutcome (..)
   , BatchTicket
+  , Construction
   , ImageDescription (..)
   , ImageFormat (Rgba8Srgb)
   , ImageKind (ColorTarget)
+  , Recorder
   , Refusal (..)
   , ResourceUse (..)
   , TicketState (..)
@@ -99,9 +103,18 @@ metrics = TargetMetrics (PixelExtent (fromIntegral sideWidth) (fromIntegral side
 target ∷ Target
 target = OffscreenTarget (targetRef 1 1)
 
--- | Draw this texture one texel to a pixel at the middle of the target and read the target back.
+-- | How a frame-less batch is recorded: the session's own, or one bound to the scene an offscreen target adopted.
+type Recording = ∀ q inst msgr phys dev cmd a. Construction q inst msgr phys dev cmd → (Recorder q inst msgr phys dev cmd → IO a) → IO (Either Refusal (BatchTicket, a))
+
+-- | Draw this texture one texel to a pixel at the middle of the target and read the target back, recording the
+-- batch as the session's own.
 shoot ∷ ∀ scene. VulkanHost scene → Render.Renderer → Api.TextureHandle → DecodedImage → (Int → Int → (Word8, Word8, Word8, Word8)) → IO (Either Text Shot)
-shoot host renderer handle decoded straight =
+shoot host = shootWith host constructFramelessBatch (pure ())
+
+-- | 'shoot', recording the batch the way the caller says and running an action once the batch has been recorded and
+-- before its completion is awaited.
+shootWith ∷ ∀ scene. VulkanHost scene → Recording → IO () → Render.Renderer → Api.TextureHandle → DecodedImage → (Int → Int → (Word8, Word8, Word8, Word8)) → IO (Either Text Shot)
+shootWith host record between renderer handle decoded straight =
   case validateSnapshot snapshot of
     Left refused → pure (Left ("the snapshot was refused: " <> tshow refused))
     Right valid → do
@@ -129,7 +142,7 @@ shoot host renderer handle decoded straight =
             Render.prepareSnapshot (hostBuilders host construction) renderer input >>= \case
               Left refusal → pure (Left (RefusedIllegal (tshow refusal)))
               Right recording →
-                constructFramelessBatch construction (\recorder →
+                record construction (\recorder →
                   recording recorder >>= \case
                     Left refusal → pure (Left (RefusedIllegal (tshow refusal)))
                     Right () →
@@ -145,6 +158,7 @@ shoot host renderer handle decoded straight =
           case batch of
             Left failure → pure (Left failure)
             Right ticket → do
+              between
               done ← awaitBatch ticket
               if not done
                 then pure (Left "the batch did not complete")

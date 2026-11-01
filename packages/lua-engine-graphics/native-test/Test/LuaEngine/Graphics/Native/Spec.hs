@@ -10,7 +10,7 @@
 --
 -- A skipped run is not a pass: the executable refuses to start without consent, and the examples have no
 -- pending branch.
-module Test.LuaEngine.Graphics.Native.Spec (spec) where
+module Test.LuaEngine.Graphics.Native.Spec (spec, within, withLoaded, load, decoded') where
 
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, retry, writeTVar)
 import Control.Monad (unless)
