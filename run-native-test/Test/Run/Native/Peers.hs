@@ -28,18 +28,23 @@ module Test.Run.Native.Peers
   ( Peers (..)
   , Spawned (..)
   , PeerFailure (..)
+  , CreationHold (..)
   , withPeers
   , onMain
   , admitUi
   , stopUi
+  , instanceStoppedCleanly
+  , forgetEnded
+  , instancePhaseOf
   , awaitLine
   , awaitLinePrefix
   , readsHeld
-  , holdReadsOf
+  , holdNextReads
   , releaseReadsOf
   , readsEntered
-  , withheldCreations
+  , withholdNextCreations
   , releaseCreations
+  , creationsWithheld
   , verdictCleanOrFail
   ) where
 
@@ -58,10 +63,11 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (Exception, SomeException, finally, onException, throwIO, try)
 import System.IO (hPutStrLn, stderr)
 import System.Timeout (timeout)
-import Control.Monad (join, unless, when)
+import Control.Monad (forM_, join, unless, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (partition)
+import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Set (Set)
 import Data.Text (Text)
@@ -105,7 +111,7 @@ import Hetoimasia.LuaEngine.Graphics.Texture
   )
 import Hetoimasia.LuaEngine.Graphics.Window.Configuration (configureWindows, windowSlots)
 import Hetoimasia.LuaEngine.Graphics.Window.Host (PortReading, newHostPort)
-import Hetoimasia.LuaEngine.Graphics.Window.Port (Fatal, Port (..))
+import Hetoimasia.LuaEngine.Graphics.Window.Port (CreateIssue (..), CreateToken, Fatal, Port (..))
 import Hetoimasia.LuaEngine.Graphics.Window.Provider (WindowConfig (..), windowMainStep, withWindowProvider)
 import Hetoimasia.LuaEngine.Manifest (Role (Presentation))
 import Hetoimasia.LuaEngine.Modules
@@ -170,9 +176,12 @@ data Peers = Peers
   , peFrames ∷ !(TVar (Int, [FrameEvent]))
   -- ^ The host's frame events, newest first, bounded, with the total count.
   , peReading ∷ !(STM PortReading)
-  , peCreationGate ∷ !(TVar Bool)
-  -- ^ False while window creation outcomes are withheld from the provider.
-  , peReadHold ∷ !(TVar (Set ByteString))
+  , peCreationHold ∷ !(TVar CreationHold)
+  -- ^ Which window creation outcomes are withheld from the provider.
+  , peReadHold ∷ !(TVar (Map.Map ByteString Int))
+  -- ^ How many of the next reads of each path the pool's reader holds.
+  , peReadsHeldNow ∷ !(TVar [(Int, ByteString)])
+  -- ^ The reads held at the reader now, by their order of arrival.
   , peReadsEntered ∷ !(TVar [ByteString])
   , peReadsFinished ∷ !(TVar [ByteString])
   , peJobs ∷ !(TVar [IO ()])
@@ -275,12 +284,13 @@ compose lifetime folder graphics vulkan frames jobs providerStep scenario = do
   fatals ← newTVarIO []
   quits ← newTVarIO 0
   out ← newTVarIO []
-  creationGate ← newTVarIO True
-  held ← newTVarIO Set.empty
+  creationHold ← newTVarIO (CreationHold 0 Set.empty)
+  toHold ← newTVarIO Map.empty
+  heldNow ← newTVarIO []
   entered ← newTVarIO []
   finished ← newTVarIO []
   (port0, reading) ← newHostPort vulkan
-  let port = gateCreation port0 creationGate
+  let port = gateCreation port0 creationHold
       profile = fixedM1Profile
       Count ioWorkerCount = countLimit profile IoWorkers
       ioWorkers = fromIntegral ioWorkerCount
@@ -293,8 +303,19 @@ compose lifetime folder graphics vulkan frames jobs providerStep scenario = do
           root = preparedRoot prepared
           gated key allowance = do
             let path = logicalPathBytes (contentKeyPath key)
-            atomically (modifyTVar' entered (<> [path]))
-            atomically (readTVar held >>= \paths → when (path `Set.member` paths) retry)
+            -- Arrival and the decision to hold this read are one transaction, so the order of arrival is the order
+            -- the holds are given in.
+            serial ← atomically $ do
+              seen ← readTVar entered
+              modifyTVar' entered (<> [path])
+              holds ← readTVar toHold
+              case Map.lookup path holds of
+                Just n | n > 0 → do
+                  writeTVar toHold (Map.insert path (n - 1) holds)
+                  modifyTVar' heldNow ((length seen, path) :)
+                  pure (Just (length seen))
+                _ → pure Nothing
+            forM_ serial $ \mine → atomically (readTVar heldNow >>= \now → when (mine `elem` map fst now) retry)
             readVerified inventory root key allowance
               `finally` atomically (modifyTVar' finished (<> [path]))
       withReadPoolUsing pool gated $ \readPool →
@@ -329,8 +350,9 @@ compose lifetime folder graphics vulkan frames jobs providerStep scenario = do
                               , peQuits = quits
                               , peFrames = frames
                               , peReading = reading
-                              , peCreationGate = creationGate
-                              , peReadHold = held
+                              , peCreationHold = creationHold
+                              , peReadHold = toHold
+                              , peReadsHeldNow = heldNow
                               , peReadsEntered = entered
                               , peReadsFinished = finished
                               , peJobs = jobs
@@ -340,49 +362,69 @@ compose lifetime folder graphics vulkan frames jobs providerStep scenario = do
                     )
                     -- However the scenario ended, every gate it closed is opened first: a held read or a withheld
                     -- creation is a handoff the unwinding below waits for.
-                    `finally` ( atomically (writeTVar creationGate True >> writeTVar held Set.empty)
+                    `finally` ( atomically (writeTVar creationHold (CreationHold 0 Set.empty) >> writeTVar toHold Map.empty >> writeTVar heldNow [])
                                   `finally` writeIORef providerStep (pure ())
                               )
   case prepared' of
     Left refused → ioError (userError ("the shipped content was not prepared: " <> show refused))
     Right value → pure value
 
--- | Withhold nothing from the provider again: the gate on creation outcomes opens.
+-- | Which creations the production port withholds from the provider: how many of the next ones to withhold, and the
+-- tokens already withheld.
+data CreationHold = CreationHold
+  { holdRemaining ∷ !Int
+  , holdTokens ∷ !(Set CreateToken)
+  }
+
+-- | Withhold the outcomes of the next @n@ window creations from the provider until 'releaseCreations'. The native
+-- windows are still created by the host (so they exist and are tracked); only the provider's collection of the
+-- result waits, which is the public handoff the pending-work cases need.
+withholdNextCreations ∷ Peers → Int → IO ()
+withholdNextCreations peers n = atomically (modifyTVar' (peCreationHold peers) (\held → held {holdRemaining = holdRemaining held + n}))
+
+-- | Let every withheld creation outcome through, and withhold no more.
 releaseCreations ∷ Peers → IO ()
-releaseCreations peers = atomically (writeTVar (peCreationGate peers) True)
+releaseCreations peers = atomically (writeTVar (peCreationHold peers) (CreationHold 0 Set.empty))
 
--- | Withhold window creation outcomes from the provider until 'releaseCreations'.
-withheldCreations ∷ Peers → IO ()
-withheldCreations peers = atomically (writeTVar (peCreationGate peers) False)
+-- | How many creation outcomes are withheld now.
+creationsWithheld ∷ Peers → STM Int
+creationsWithheld peers = Set.size . holdTokens <$> readTVar (peCreationHold peers)
 
--- | The production port with creation outcomes withheld while the gate is closed: the public handoff between the
--- host's real creation and the provider's collection of its result.
-gateCreation ∷ Port target → TVar Bool → Port target
-gateCreation port gate =
+-- | The production port with the chosen creation outcomes withheld: the public handoff between the host's real
+-- creation and the provider's collection of its result. The token is recorded before the provider ever sees it.
+gateCreation ∷ Port target → TVar CreationHold → Port target
+gateCreation port hold =
   port
-    { portCreateOutcome = \token → do
-        open ← readTVar gate
-        if open then portCreateOutcome port token else pure Nothing
+    { portIssueCreate = \title width height → do
+        issued ← portIssueCreate port title width height
+        case issued of
+          CreateIssued token →
+            atomically . modifyTVar' hold $ \held →
+              if holdRemaining held > 0 then held {holdRemaining = holdRemaining held - 1, holdTokens = Set.insert token (holdTokens held)} else held
+          _ → pure ()
+        pure issued
+    , portCreateOutcome = \token → do
+        held ← readTVar hold
+        if token `Set.member` holdTokens held then pure Nothing else portCreateOutcome port token
     }
 
--- | Hold every read of this path at the pool's reader (a held read starts and waits there).
-holdReadsOf ∷ Peers → ByteString → IO ()
-holdReadsOf peers path = atomically (modifyTVar' (peReadHold peers) (Set.insert path))
+-- | Hold the next @n@ reads of this path at the pool's reader (a held read starts and waits there).
+holdNextReads ∷ Peers → ByteString → Int → IO ()
+holdNextReads peers path n = atomically (modifyTVar' (peReadHold peers) (Map.insertWith (+) path n))
 
--- | Let the reads of this path go.
+-- | Let the reads of this path go, and hold no more of them.
 releaseReadsOf ∷ Peers → ByteString → IO ()
-releaseReadsOf peers path = atomically (modifyTVar' (peReadHold peers) (Set.delete path))
+releaseReadsOf peers path = atomically $ do
+  modifyTVar' (peReadHold peers) (Map.delete path)
+  modifyTVar' (peReadsHeldNow peers) (filter ((/= path) . snd))
 
 -- | Block until this many reads of this path have reached the pool's reader.
 readsEntered ∷ Peers → ByteString → Int → IO ()
 readsEntered peers path wanted = atomically (readTVar (peReadsEntered peers) >>= \seen → unless (length (filter (== path) seen) >= wanted) retry)
 
--- | How many reads of this path are at the reader and have not returned.
+-- | How many reads of this path are held at the reader now.
 readsHeld ∷ Peers → ByteString → STM Int
-readsHeld peers path = do
-  entered ← readTVar (peReadsEntered peers)
-  finished ← readTVar (peReadsFinished peers)
-  pure (length (filter (== path) entered) - length (filter (== path) finished))
+readsHeld peers path = length . filter ((== path) . snd) <$> readTVar (peReadsHeldNow peers)
 
 -- | What the pieces of one VM need from the composition.
 data VmContext = VmContext
@@ -529,6 +571,22 @@ stopUi peers found =
   requestInstanceControl (scheduledEndpoint (peOwner peers)) (spInstance found) InstanceStop >>= \case
     InstanceControlAccepted _ → pure ()
     other → ioError (userError ("expected the stop accepted, found " <> take 100 (show other)))
+
+-- | Wait for the instance's settlement and answer whether it ended as stopped, its shutdown not failed.
+instanceStoppedCleanly ∷ Spawned → IO Bool
+instanceStoppedCleanly found =
+  waitInstance (spTicket found) >>= \settlement → pure $ case resultOutcome settlement of
+    InstanceStopped → True
+    _ → False
+
+-- | Tell the facade an instance has settled, as the session does once it has seen the settlement, so its place is
+-- free for the next declaration.
+forgetEnded ∷ Peers → Spawned → IO ()
+forgetEnded peers found = forgetInstance (peFacade peers) (spIdentity found)
+
+-- | The phase the instance is in now, or 'Nothing' once it is no longer inspectable.
+instancePhaseOf ∷ Peers → Spawned → STM (Maybe InstancePhase)
+instancePhaseOf peers found = fmap snapshotPhase <$> inspectInstance (scheduledEndpoint (peOwner peers)) (spInstance found)
 
 -- | Run an action on the process main thread's next turn of the owner loop, and answer what it returned or raised.
 onMain ∷ Peers → IO b → IO b
