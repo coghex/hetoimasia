@@ -20,6 +20,7 @@ module Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Frameless
     FramelessScope
   , withFramelessScope
   , recordFramelessIn
+  , recordFramelessInWith
 
     -- * Submission
   , submitFrameless
@@ -184,11 +185,25 @@ recordFramelessIn
   ∷ FramelessScope q inst msgr phys dev cmd
   → (Recorder q inst msgr phys dev cmd → IO a)
   → IO (Either Refusal (BatchTicket, a))
-recordFramelessIn scope consumer =
+recordFramelessIn scope = recordFramelessInWith scope (\_ → pure ())
+
+-- | 'recordFramelessIn', announcing the batch's ticket to the caller the moment
+-- the batch exists: after the scope has recorded it as opened, in the same
+-- masked step that admitted it and before the consumer runs, so no failure or
+-- cancellation of the recording can end it without the caller having seen the
+-- ticket. The announcement must neither wait nor raise; one that raises ends
+-- the recording like a failure of the consumer's own, and the scope discards
+-- the batch it had already recorded as opened.
+recordFramelessInWith
+  ∷ FramelessScope q inst msgr phys dev cmd
+  → (BatchTicket → IO ())
+  → (Recorder q inst msgr phys dev cmd → IO a)
+  → IO (Either Refusal (BatchTicket, a))
+recordFramelessInWith scope announce consumer =
   readIORef (scopeOpen scope) >>= \case
     False → pure (Left RefusedRecorderClosed)
     True → do
-      recorded ← recordFrameless (framesRecording (scopeFrames scope)) (\ticket → modifyIORef' (scopeOpened scope) (ticketBatch ticket :)) consumer
+      recorded ← recordFrameless (framesRecording (scopeFrames scope)) (\ticket → modifyIORef' (scopeOpened scope) (ticketBatch ticket :) >> announce ticket) consumer
       for_ recorded $ \(ticket, _) → modifyIORef' (scopeSealed scope) (ticketBatch ticket :)
       pure recorded
 

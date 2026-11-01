@@ -110,6 +110,7 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , surfaceFreeRig
   , withActionCapacity
   , withReleaseCapacity
+  , withTargetCapacity
   , withInitialSceneHoldsNothing
   , withUploads
   , withWindowDepth
@@ -240,8 +241,11 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , ControllerHooks (..)
   , VulkanDeviceStart (..)
   , SceneLifecycle (..)
+  , SceneTargetKey (..)
+  , OffscreenTargetId
   , defaultActionCapacity
   , defaultReleaseCapacity
+  , defaultTargetCapacity
   , handOverVulkanTarget
   , readReadiness
   , vulkanHostConfig
@@ -1370,6 +1374,9 @@ type Scene = Int
 data SceneEvent
   = SceneAdopted !WindowId !Natural !Scene
   | SceneReleased !WindowId !Natural
+  | TargetAdopted !OffscreenTargetId !Natural !Scene
+    -- ^ An offscreen target's adoption (LFE-27): the window events above are exactly what they always were.
+  | TargetReleased !OffscreenTargetId !Natural
   deriving (Eq, Show)
 
 -- | Everything an example needs to run one Vulkan graphics host.
@@ -1462,6 +1469,8 @@ data Rig = Rig
   , rigSceneRounds ∷ !(TVar [Natural])
     -- ^ For each of them, the owner's completed rounds when it was reported:
     -- the round that reported it is the next one.
+  , rigTargetCapacity ∷ !Natural
+    -- ^ How many offscreen scene targets the host accounts for at once.
   }
 
 -- | Make the capture's sink raise on every record it is given from now on.
@@ -1496,6 +1505,10 @@ withActionCapacity capacity rig = rig {rigActionCapacity = capacity}
 -- | The same rig with this many release requests queued at once.
 withReleaseCapacity ∷ Natural → Rig → Rig
 withReleaseCapacity capacity rig = rig {rigReleaseCapacity = capacity}
+
+-- | A rig whose host accounts for at most this many offscreen scene targets.
+withTargetCapacity ∷ Natural → Rig → Rig
+withTargetCapacity capacity rig = rig {rigTargetCapacity = capacity}
 
 -- | The same rig whose host declares its initial scene references nothing a
 -- release request releases, so a never-published window is not waited for.
@@ -1780,6 +1793,7 @@ newRigClocked visible windows clock = do
       , rigDeviceStart = DeviceAtFirstSurface
       , rigActionCapacity = defaultActionCapacity
       , rigReleaseCapacity = defaultReleaseCapacity
+      , rigTargetCapacity = defaultTargetCapacity
       , rigInitialSceneHoldsNothing = False
       , rigUploads = Nothing
       , rigWindowDepth = False
@@ -1821,14 +1835,15 @@ runRigHere rig body = myThreadId >>= \self → withBoundThread (rigBound rig) se
           , vulkanDeviceStart = rigDeviceStart rig
           , vulkanActionCapacity = rigActionCapacity rig
           , vulkanReleaseCapacity = rigReleaseCapacity rig
+          , vulkanTargetCapacity = rigTargetCapacity rig
           , vulkanInitialSceneHoldsNothing = rigInitialSceneHoldsNothing rig
           , vulkanUploads = rigUploads rig
           , vulkanWindowDepth = rigWindowDepth rig
           , vulkanSceneMode = rigSceneMode rig
           , vulkanSceneLifecycle =
               SceneLifecycle
-                { sceneAdopted = \window revision adopted → reportScene (SceneAdopted window revision adopted)
-                , sceneReleased = \window revision → reportScene (SceneReleased window revision)
+                { sceneAdopted = \key revision adopted → reportScene (case key of KeyWindow window → SceneAdopted window revision adopted; KeyOffscreen target → TargetAdopted target revision adopted)
+                , sceneReleased = \key revision → reportScene (case key of KeyWindow window → SceneReleased window revision; KeyOffscreen target → TargetReleased target revision)
                 }
           , vulkanFrameObserver = \event → do
               atomically $ do

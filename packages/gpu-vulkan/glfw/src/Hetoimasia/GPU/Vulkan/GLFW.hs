@@ -41,6 +41,18 @@
 -- is not held by a window that has never published; 'readVulkanSceneState'
 -- reads it all. A shared host, the default, is unchanged.
 --
+-- One scene-target key (LFE-27): the lifecycle, the release barrier and the
+-- observation are keyed by 'SceneTargetKey', which is either a window or an
+-- offscreen target, so a surface-free target takes part in the same ownership a
+-- window has. 'registerVulkanSceneTarget' registers one with the running host
+-- (it needs no window and opens none); 'publishVulkanTargetScene' is its
+-- latest-value publication, a transaction that never waits;
+-- 'recordVulkanTargetBatch' is the recording boundary that binds the exact
+-- scene the host adopted to the batch's own ticket, so its revision is
+-- released only after every batch recorded with it was discarded or has
+-- completed; 'unregisterVulkanSceneTarget' ends it. 'WindowId' is neither
+-- widened nor minted: an offscreen target is never a window.
+--
 -- The renderer is the consumer's (VK-19). Each frame's 'FrameRequest' names
 -- its target, slot and image and the image's extent and color format before
 -- the renderer records anything, and the renderer is lent the session's
@@ -107,6 +119,18 @@ module Hetoimasia.GPU.Vulkan.GLFW
   , readVulkanSceneState
   , VulkanSceneState (..)
   , WindowSceneStanding (..)
+
+    -- * Offscreen scene targets (LFE-27)
+  , SceneTargetKey (..)
+  , OffscreenTargetId
+  , SceneTargetRefusal (..)
+  , registerVulkanSceneTarget
+  , unregisterVulkanSceneTarget
+  , publishVulkanTargetScene
+  , TargetScenePublication (..)
+  , recordVulkanTargetBatch
+  , TargetBatchRefusal (..)
+  , defaultTargetCapacity
 
     -- * Rendering
   , VulkanRenderer (..)
@@ -353,6 +377,16 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , VulkanDeviceStart (..)
   , VulkanSceneState (..)
   , WindowSceneStanding (..)
+  , SceneTargetKey (..)
+  , OffscreenTargetId
+  , SceneTargetRefusal (..)
+  , TargetBatchRefusal (..)
+  , TargetScenePublication (..)
+  , defaultTargetCapacity
+  , publishVulkanTargetScene
+  , recordVulkanTargetBatch
+  , registerVulkanSceneTarget
+  , unregisterVulkanSceneTarget
   , awaitVulkanAction
   , noSceneLifecycle
   , defaultActionCapacity

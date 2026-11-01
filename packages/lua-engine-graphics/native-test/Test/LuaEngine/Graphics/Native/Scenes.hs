@@ -36,6 +36,7 @@ import Hetoimasia.GLFW.Demand (immediateDemand, publishDemand)
 import Hetoimasia.GLFW.Window (WindowId)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( FrameEvent (..)
+  , SceneTargetKey (..)
   , VulkanHost (..)
   , VulkanSceneState (..)
   , WindowSceneStanding (..)
@@ -233,7 +234,7 @@ run comp vm name op key described = do
 awaitAdopted ∷ Env → WindowId → Natural → IO ()
 awaitAdopted env window revision = atomically $ do
   state ← readVulkanSceneState (envHost env)
-  case Map.lookup window (sceneWindows state) >>= windowAdopted of
+  case Map.lookup (KeyWindow window) (sceneWindows state) >>= windowAdopted of
     Just adopted | adopted >= revision → pure ()
     _ → retry
 
@@ -241,7 +242,7 @@ awaitAdopted env window revision = atomically $ do
 published ∷ Env → WindowId → IO (Maybe Natural)
 published env window = do
   state ← atomically (readVulkanSceneState (envHost env))
-  pure (Map.lookup window (sceneWindows state) >>= windowPublished)
+  pure (Map.lookup (KeyWindow window) (sceneWindows state) >>= windowPublished)
 
 -- | Block until a frame was asked to be presented for this window with this revision after the first @mark@
 -- events: a frame the owner recorded and submitted with that scene.

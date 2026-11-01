@@ -75,6 +75,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , Readiness (..)
   , SceneLifecycle (..)
   , SceneMode (..)
+  , SceneTargetKey (..)
   , VulkanAction (..)
   , VulkanHandover (..)
   , VulkanHost (..)
@@ -192,8 +193,12 @@ runWindowScenes backend journal = do
           , vulkanSceneMode = PerWindowScenes
           , vulkanSceneLifecycle =
               SceneLifecycle
-                { sceneAdopted = \at revision scene → keep (Adopted at revision scene)
-                , sceneReleased = \at revision → keep (Released at revision)
+                { sceneAdopted = \key revision scene → case key of
+                    KeyWindow at → keep (Adopted at revision scene)
+                    KeyOffscreen _ → pure ()
+                , sceneReleased = \key revision → case key of
+                    KeyWindow at → keep (Released at revision)
+                    KeyOffscreen _ → pure ()
                 }
           , -- A frame is cleared to the colour of the scene its window was
             -- handed, whichever window it is.

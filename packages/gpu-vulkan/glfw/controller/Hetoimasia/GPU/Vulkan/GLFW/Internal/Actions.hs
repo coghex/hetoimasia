@@ -34,7 +34,8 @@
 -- = Release requests
 --
 -- A release request is an action that also waits for a 'Barrier': the scene
--- revisions the windows it names must have been adopted by the owner before it
+-- revisions the scene targets it names — windows, and the offscreen targets
+-- registered with the host — must have been adopted by the owner before it
 -- runs (D-28). It is admitted exactly as an action is — one transaction that
 -- never waits, refused at once for a failed session, a closed owner, a missing
 -- device or a full queue, and settled as refused if it is still queued when the
@@ -96,10 +97,10 @@ import Data.Map.Strict (Map)
 import Data.Maybe (isJust)
 import Data.Sequence (Seq, ViewL (..), viewl, (|>))
 import qualified Data.Sequence as Seq
-import Hetoimasia.GLFW.Window (WindowId)
 import Numeric.Natural (Natural)
 
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering (Construction)
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Target (SceneTargetKey)
 import Hetoimasia.GPU.Vulkan.Native.Roots (TerminalCause)
 
 -- | Bounded work for the graphics owner's thread, given the session's managed
@@ -186,10 +187,10 @@ awaitActionTicket ticket = readActionTicket ticket >>= maybe retry pure
 -- ---------------------------------------------------------------------------
 -- The queue
 
--- | The scene revisions a release request waits for: each window it names
--- must have adopted that revision or a later one, unless the window has
--- ended.
-type Barrier = Map WindowId Natural
+-- | The scene revisions a release request waits for: each scene target it
+-- names, a window or a registered offscreen target, must have adopted that
+-- revision or a later one, unless the host no longer holds it.
+type Barrier = Map SceneTargetKey Natural
 
 -- | One queued action, with its ticket's standing and, for a release request,
 -- the barrier it waits for.

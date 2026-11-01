@@ -57,6 +57,7 @@ import Hetoimasia.GLFW.Demand (immediateDemand, publishDemand)
 import Hetoimasia.GLFW.Window (WindowId)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( FrameEvent (..)
+  , SceneTargetKey (..)
   , VulkanHost (..)
   , VulkanSceneState (..)
   , WindowSceneStanding (..)
@@ -443,7 +444,7 @@ awaitWindow host = step "the example's window" . atomically $ do
 awaitAdopted ∷ VulkanHost GraphicsScene → WindowId → Natural → IO ()
 awaitAdopted host window revision = atomically $ do
   state ← readVulkanSceneState host
-  case Map.lookup window (sceneWindows state) >>= windowAdopted of
+  case Map.lookup (KeyWindow window) (sceneWindows state) >>= windowAdopted of
     Just adopted | adopted >= revision → pure ()
     _ → retry
 
@@ -451,7 +452,7 @@ awaitAdopted host window revision = atomically $ do
 published ∷ VulkanHost GraphicsScene → WindowId → IO (Maybe Natural)
 published host window = do
   state ← atomically (readVulkanSceneState host)
-  pure (Map.lookup window (sceneWindows state) >>= windowPublished)
+  pure (Map.lookup (KeyWindow window) (sceneWindows state) >>= windowPublished)
 
 frameMark ∷ Watch → IO Int
 frameMark watch = fst <$> readTVarIO (watchFrames watch)

@@ -46,9 +46,8 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Configuration
   ) where
 
 import Data.Word (Word64)
-import Hetoimasia.GLFW.Window (WindowId)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
-import Hetoimasia.GPU.Vulkan.GLFW (SceneMode (PerWindowScenes), VulkanHostConfig (..))
+import Hetoimasia.GPU.Vulkan.GLFW (SceneMode (PerWindowScenes), SceneTargetKey, VulkanHostConfig (..))
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger
   ( GraphicsScene
   , SceneLedger
@@ -63,7 +62,7 @@ import Hetoimasia.Render.TwoD.Vulkan.Layout (instanceStride)
 
 -- | What the scene part of a session is made of, made before the host is built.
 data SceneSession = SceneSession
-  { scenesLedger ∷ !(SceneLedger WindowId)
+  { scenesLedger ∷ !(SceneLedger SceneTargetKey)
     -- ^ What the adopted revisions hold: the texture backend's release is gated on it.
   , scenesSlot ∷ !RenderSlot
     -- ^ Where the renderer hook finds the session's renderer; the composition fills it.

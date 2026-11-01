@@ -95,6 +95,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , Refusal
   , SceneLifecycle (..)
   , SceneMode (..)
+  , SceneTargetKey (..)
   , TicketState (..)
   , UploadConfig
   , UploadState (..)
@@ -289,12 +290,17 @@ runImage2d backend journal = do
           , vulkanDeviceStart = DeviceSurfaceFree
           , vulkanSceneLifecycle =
               SceneLifecycle
-                { sceneAdopted = \at revision scene → do
-                    keep (Adopted at revision (sceneReferences scene))
-                    readTVarIO adapterSlot >>= maybe (pure ()) (\adapter → adapterAdopted adapter at revision scene)
-                , sceneReleased = \at revision → do
-                    keep (Released at revision)
-                    readTVarIO adapterSlot >>= maybe (pure ()) (\adapter → adapterReleased adapter at revision)
+                { -- The session registers no offscreen target, so every key is a window's.
+                  sceneAdopted = \key revision scene → case key of
+                    KeyWindow at → do
+                      keep (Adopted at revision (sceneReferences scene))
+                      readTVarIO adapterSlot >>= maybe (pure ()) (\adapter → adapterAdopted adapter at revision scene)
+                    KeyOffscreen _ → pure ()
+                , sceneReleased = \key revision → case key of
+                    KeyWindow at → do
+                      keep (Released at revision)
+                      readTVarIO adapterSlot >>= maybe (pure ()) (\adapter → adapterReleased adapter at revision)
+                    KeyOffscreen _ → pure ()
                 }
           , vulkanRenderer = VulkanRenderer $ \scene request construction recorder → do
               keep (Rendered (requestSceneRevision request) (sceneReferences scene))

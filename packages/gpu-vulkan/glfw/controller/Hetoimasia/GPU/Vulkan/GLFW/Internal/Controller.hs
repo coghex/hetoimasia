@@ -202,6 +202,18 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
   , VulkanSceneState (..)
   , WindowSceneStanding (..)
 
+    -- * Offscreen scene targets (LFE-27)
+  , SceneTargetKey (..)
+  , OffscreenTargetId
+  , SceneTargetRefusal (..)
+  , TargetScenePublication (..)
+  , TargetBatchRefusal (..)
+  , registerVulkanSceneTarget
+  , unregisterVulkanSceneTarget
+  , publishVulkanTargetScene
+  , recordVulkanTargetBatch
+  , defaultTargetCapacity
+
     -- * Uploads (GRS-6)
   , VulkanUploadRefusal (..)
   , submitVulkanUpload
@@ -383,6 +395,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes
   , VulkanSceneState (..)
   , WindowSceneStanding (..)
   , Adopting (..)
+  , adopterAtLimit
   , adoptScene
   , endSceneTarget
   , forgetSceneTarget
@@ -395,6 +408,25 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes
   , retentionLimit
   , sceneBarrier
   , sceneBarrierMet
+  )
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Target (Adopter (..), OffscreenTargetId, SceneTargetKey (..))
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Targets
+  ( SceneTargetRefusal (..)
+  , TargetScenePublication (..)
+  , Targets
+  , adoptedScene
+  , hasRetiring
+  , newTargets
+  , pendingIds
+  , pendingScenes
+  , publishTarget
+  , recordAdopted
+  , registerTarget
+  , retireAllTargets
+  , takeRetiring
+  , targetsHeld
+  , targetsRevisions
+  , unregisterTarget
   )
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
   ( CaptureMode (..)
@@ -416,7 +448,7 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
   )
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
 import Hetoimasia.GPU.Vulkan.Native.Frames (FrameOps (..))
-import Hetoimasia.GPU.Vulkan.Native.Recording (ClearColor (..), RecordingOps (..))
+import Hetoimasia.GPU.Vulkan.Native.Recording (BatchTicket, ClearColor (..), Recorder, RecordingOps (..), Refusal)
 import Hetoimasia.GPU.Vulkan.Native.Uploads
   ( CancelRefusal
   , UploadConfig
@@ -633,7 +665,7 @@ data State inst msgr phys dev cmd lease obligation = State
     -- ^ The revision of its scene each target has adopted, which revisions are
     -- awaiting release, and what a release request waits for
     -- ("Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes").
-  , stateSceneReleased ∷ !(TVar (WindowId → Natural → IO ()))
+  , stateSceneReleased ∷ !(TVar (SceneTargetKey → Natural → IO ()))
     -- ^ The lifecycle's release hook, which the owner's teardown runs as well
     -- as its step. The composition installs the host's own; it does nothing
     -- until then.
@@ -887,8 +919,8 @@ readReadiness (VulkanController state) =
 -- rendering does: a frame wanted now, an acquisition's retry, a demand deadline
 -- ahead. A target's retirement is owed until its frames and presentations have
 -- gone on their own evidence.
-controllerOperations ∷ VulkanController → VulkanRenderer scene → SceneLifecycle scene → GraphicsOperations scene
-controllerOperations (VulkanController state) renderer lifecycle =
+controllerOperations ∷ VulkanController → VulkanRenderer scene → SceneLifecycle scene → Targets scene → GraphicsOperations scene
+controllerOperations (VulkanController state) renderer lifecycle offscreen =
   GraphicsOperations
     { graphicsStartOwner = \_ → startOwner state
     , graphicsConstructTarget = constructTarget state
@@ -915,13 +947,21 @@ controllerOperations (VulkanController state) renderer lifecycle =
             [ join (readTVar (stateWake state))
             , capturesRequested (stateCaptures state)
             , (&&) <$> actionsWaiting (stateActions state) <*> (not <$> readTVar (stateDiagnosticPending state))
+            , -- An offscreen target with a scene to adopt, and room to adopt
+              -- it, or one to end, asks for the round that does (LFE-27).
+              targetsWake state offscreen
             , -- An admitted upload with copies to record asks for the round
               -- that records them, as an admitted action does (GRS-6).
               (&&) <$> renderingUploadsWaiting (stateRendering state) <*> (not <$> readTVar (stateDiagnosticPending state))
             ]
     , graphicsPrepareRetirement = \retiring → retaining state (prepareRetirement state retiring)
     , graphicsRetireTarget = \retiring → retaining state (retireTarget state retiring)
-    , graphicsRetireOwner = settlingSwaps state . retaining state . retireOwner state
+    , graphicsRetireOwner = \retiring →
+        settlingSwaps state . retaining state $ do
+          -- Every offscreen target ends with the owner, in the ledger and in
+          -- one transaction, before the release the retirement settles.
+          atomically (retireAllTargets offscreen (stateScenes state))
+          retireOwner state retiring
     , graphicsDestroyOwner = \_ → settlingSwaps state (retaining state (destroyOwner state))
     }
   where
@@ -958,7 +998,14 @@ controllerOperations (VulkanController state) renderer lifecycle =
         -- adopted and a release request the adoption satisfies runs in this
         -- same step.
         limit ← retentionLimit . frameSlotLimit . modelBudgets <$> atomically (readRootsModel (stateRoots state))
-        answered ← traverse (\(attachment, (scene, revision)) → (,) attachment <$> adoptScene (stateScenes state) lifecycle limit attachment scene revision) (Map.toList scenes)
+        answered ← traverse (\(attachment, (scene, revision)) → (,) attachment <$> adoptScene (stateScenes state) lifecycle limit (AttachmentAdopter attachment) scene revision) (Map.toList scenes)
+        -- The offscreen targets adopt in the same step, before any action runs:
+        -- an unregistered one is ended first, so what it adopted is superseded
+        -- and a release request it held back is no longer held.
+        _ ← atomically (takeRetiring offscreen (stateScenes state))
+        waitingTargets ← atomically (pendingScenes offscreen)
+        answeredTargets ← traverse (\(identity, scene, revision) → (,) identity <$> adoptScene (stateScenes state) (adoptingInto offscreen lifecycle) limit (TargetAdopter identity) scene revision) waitingTargets
+        let pressedTargets = [identity | (identity, AtLimit) ← answeredTargets]
         -- A target at its retention limit adopted nothing: this step renders
         -- nothing for it and asks nothing of it, so its demand and the window's
         -- newer publication are still owed when a release has made room.
@@ -1041,7 +1088,116 @@ controllerOperations (VulkanController state) renderer lifecycle =
         let report = if served || uploaded || settled || summaryAdvanced summary || asked || replaced || presented || captured then noStepWork {stepAdvanced = True} else noStepWork
         -- A release made room for a target that was at its limit: it adopts in
         -- the next round, which is owed at once.
-        pure report {stepImmediateWork = released && not (null pressed)}
+        pure report {stepImmediateWork = released && not (null pressed && null pressedTargets)}
+
+-- | Whether an offscreen target has something for the owner: a scene to adopt
+-- that it has room to adopt, or an unregistered target to end. A target at its
+-- retention limit asks for nothing until a release, which the ledger records,
+-- makes room, so a pending publication behind a pending batch never spins the
+-- owner.
+targetsWake ∷ State inst msgr phys dev cmd lease obligation → Targets scene → STM Bool
+targetsWake state targets = do
+  retiring ← hasRetiring targets
+  pending ← pendingIds targets
+  limit ← retentionLimit . frameSlotLimit . modelBudgets <$> readRootsModel (stateRoots state)
+  room ← traverse (fmap not . adopterAtLimit (stateScenes state) limit . TargetAdopter) pending
+  pure (retiring || or room)
+
+-- | The lifecycle the owner adopts an offscreen target's scene through: the
+-- host's own, and then, in the same uninterruptible transition, the exact
+-- scene recorded with the target, which is the scene a batch recorded for the
+-- target is handed.
+adoptingInto ∷ Targets scene → SceneLifecycle scene → SceneLifecycle scene
+adoptingInto targets lifecycle =
+  lifecycle
+    { sceneAdopted = \key revision scene → do
+        sceneAdopted lifecycle key revision scene
+        case key of
+          KeyOffscreen identity → atomically (recordAdopted targets identity revision scene)
+          KeyWindow _ → pure ()
+    }
+
+-- | The default bound on the offscreen targets a host accounts for at once:
+-- those registered, and those unregistered whose adopted revisions are not yet
+-- released. It is apart from the windows' bound.
+defaultTargetCapacity ∷ Natural
+defaultTargetCapacity = 8
+
+-- | Register a surface-free offscreen scene target with the running host
+-- (LFE-27), as one transaction that never waits. The host holds the
+-- registration and gives the target its scene-target key, a
+-- 'KeyOffscreen' of the returned identity; it needs no window and opens none.
+-- It is refused, with a typed reason, once the session has failed
+-- ('TargetSessionFailed'), once the owner's exit has begun
+-- ('TargetOwnerClosed'), while no device exists ('TargetDeviceNotReady'), and
+-- when the host already accounts for 'vulkanTargetCapacity' targets
+-- ('TargetCapacityReached'), in that order. The target starts at the initial
+-- scene's revision 0, which the owner adopts in its next step; a release
+-- request made before that adoption waits for it as it does for a window,
+-- unless the host declared its initial scene holds nothing
+-- ('vulkanInitialSceneHoldsNothing').
+registerVulkanSceneTarget ∷ VulkanHost scene → STM (Either SceneTargetRefusal OffscreenTargetId)
+registerVulkanSceneTarget host = case vulkanController host of
+  VulkanController state →
+    registerTarget (vulkanTargets host) (stateScenes state) (actionGate (stateRoots state) (stateOwnerOpen state)) (isJust <$> readRootsDevice (stateRoots state))
+
+-- | Unregister an offscreen target: answers whether it was registered. From
+-- this transaction nothing can be published to it or recorded against it, and
+-- no release request is held for it; the owner ends it in the ledger in its
+-- next step. What it adopted is released only once every batch recorded with it
+-- has been discarded or has completed, and stays in 'readVulkanSceneState'
+-- until then.
+unregisterVulkanSceneTarget ∷ VulkanHost scene → OffscreenTargetId → STM Bool
+unregisterVulkanSceneTarget host = unregisterTarget (vulkanTargets host)
+
+-- | Publish a prepared scene to an offscreen target, as one transaction that
+-- never waits for GPU work, adopted capacity or a displayed frame: the
+-- target's latest value, at the next revision the host holds, replacing a
+-- scene the owner has not yet taken. Being a transaction it composes with the
+-- caller's own authority checks, so the target's liveness, the acceptance and
+-- the revision are one fact. A target the host does not hold — unregistered,
+-- another registration's or another host's — is answered naming it
+-- ('TargetSceneUnknown'), and one the session's failure or the owner's exit
+-- has closed 'TargetSceneClosed'; neither changes anything.
+publishVulkanTargetScene ∷ VulkanHost scene → OffscreenTargetId → Prepared scene → STM TargetScenePublication
+publishVulkanTargetScene host = case vulkanController host of
+  VulkanController state → publishTarget (vulkanTargets host) (actionGate (stateRoots state) (stateOwnerOpen state))
+
+-- | Why a batch was not recorded for an offscreen target.
+data TargetBatchRefusal
+  = TargetBatchUnknown !OffscreenTargetId
+    -- ^ The host holds no such target.
+  | TargetBatchNotAdopted !OffscreenTargetId
+    -- ^ The target is registered and the owner has adopted nothing for it yet.
+  | TargetBatchRefused !Refusal
+    -- ^ The construction refused it, as 'constructFramelessBatch' does.
+  deriving (Show)
+
+-- | Record one frame-less batch that reads the scene an offscreen target has
+-- adopted, inside an owner-thread action (LFE-27): the production recording
+-- boundary of a surface-free target. The consumer is handed the exact scene the
+-- host adopted and its revision, and the batch's use of that revision is
+-- bound to the batch's own ticket before anything is recorded, so no failure
+-- or cancellation of the recording can leave a batch that read the scene
+-- untracked. The revision is released only once the ticket of every batch
+-- recorded with it says the batch was discarded or completed — never on
+-- submission, acceptance, a callback, a timeout, an abandoned wait or the
+-- scope's exit — and a ticket the device's loss settled as lost keeps it, as an
+-- uncertain one does. The consumer cannot discharge a use, and another batch's
+-- completion never does. Refused for a target the host does not hold, which
+-- includes one unregistered since the action was admitted.
+recordVulkanTargetBatch
+  ∷ VulkanHost scene
+  → OffscreenTargetId
+  → Construction q inst msgr phys dev cmd
+  → (scene → Natural → Recorder q inst msgr phys dev cmd → IO a)
+  → IO (Either TargetBatchRefusal (BatchTicket, a))
+recordVulkanTargetBatch host identity construction consumer =
+  atomically (adoptedScene (vulkanTargets host) identity) >>= \case
+    Nothing → pure (Left (TargetBatchUnknown identity))
+    Just Nothing → pure (Left (TargetBatchNotAdopted identity))
+    Just (Just (revision, scene)) →
+      either (Left . TargetBatchRefused) Right <$> constructTargetBatch construction identity revision (consumer scene revision)
 
 -- | Why an upload was not admitted through the controller (GRS-6).
 data VulkanUploadRefusal
@@ -1206,7 +1362,7 @@ prepareRetirement state retiring =
       atomically (closeCaptures (stateCaptures state) (retiringTarget retiring))
       -- It adopts no scene from here on, and what it adopted is superseded:
       -- released once the frames recorded with it are over.
-      atomically (endSceneTarget (stateScenes state) (retiringTarget retiring))
+      atomically (endSceneTarget (stateScenes state) (AttachmentAdopter (retiringTarget retiring)))
       now ← readInstant (stateClock state)
       (owed, wanted) ← prepareTargetRetirement (stateRendering state) now target
       _ ← askReplacements state wanted
@@ -1528,7 +1684,7 @@ constructTarget state start = do
         answer ← admitRootTarget (stateRoots state) classification (TargetSurface (handleOf obligation) (destruction bridge obligation))
         for_ answer $ \target → atomically $ do
           modifyTVar' (stateTargets state) (Map.insert attachment target)
-          registerSceneTarget (stateScenes state) attachment
+          registerSceneTarget (stateScenes state) (AttachmentAdopter attachment)
           trackTarget (stateGenerations state) target classification (handleOf obligation)
         pure answer
       case admitted of
@@ -1602,7 +1758,7 @@ retireTarget state retiring = do
       -- Nothing of the target is recorded or in flight any more: what it
       -- adopted is released, if every use of it is over.
       _ ← settleSceneReleases state
-      atomically (forgetSceneTarget (stateScenes state) attachment)
+      atomically (forgetSceneTarget (stateScenes state) (AttachmentAdopter attachment))
       retireTargetGenerations (stateGenerations state) now target
       -- Raises, and keeps the record and this mapping, if the destruction was
       -- uncertain: the owner then never offers this again.
@@ -2050,7 +2206,11 @@ readVulkanSceneState (VulkanController state) = readSceneState (stateScenes stat
 settleSceneReleases ∷ State inst msgr phys dev cmd lease obligation → IO Bool
 settleSceneReleases state = do
   hook ← readTVarIO (stateSceneReleased state)
-  releaseScenes (stateScenes state) hook (sceneUsed (stateRendering state))
+  released ← releaseScenes (stateScenes state) hook (sceneUsed (stateRendering state))
+  -- The target uses whose own tickets say they are over are forgotten, so the
+  -- table holds only the batches in flight and the uncertain.
+  atomically (reconcileTargetUses (stateRendering state))
+  pure released
 
 -- | An action's outcome, once it has one: what it returned, what it raised,
 -- or that it was refused before it started — the owner's exit or the
@@ -2402,6 +2562,13 @@ data VulkanHostConfig scene = VulkanHostConfig
     -- before, and what 'readVulkanSceneState' reports is unchanged. The
     -- declaration is the host's to make true: a host whose initial scene
     -- references something a release may free must leave it 'False'.
+  , vulkanTargetCapacity ∷ !Natural
+    -- ^ How many offscreen scene targets ('registerVulkanSceneTarget') the host
+    -- accounts for at once: those registered, and those unregistered whose
+    -- adopted revisions the ledger has not yet released. One more registration
+    -- is refused ('TargetCapacityReached'), never waited for. It is apart from
+    -- the windows' bound and never reduces it; zero refuses every
+    -- registration. 'defaultTargetCapacity' by default.
   }
 
 -- | When the session's one device is selected and created.
@@ -2435,13 +2602,15 @@ defaultReleaseCapacity = 64
 -- initial scene holds nothing.
 vulkanHostConfig ∷ HostConfig → CaptureConfig → Budgets → Prepared scene → VulkanHostConfig scene
 vulkanHostConfig host capture budgets scene =
-  VulkanHostConfig host capture [] [] budgets scene id (const noObserver) (clearRenderer (\_ _ → ClearColor 0 0 0 1)) noFrameObserver DeviceAtFirstSurface defaultActionCapacity defaultReleaseCapacity Nothing SharedScene noSceneLifecycle False False
+  VulkanHostConfig host capture [] [] budgets scene id (const noObserver) (clearRenderer (\_ _ → ClearColor 0 0 0 1)) noFrameObserver DeviceAtFirstSurface defaultActionCapacity defaultReleaseCapacity Nothing SharedScene noSceneLifecycle False False defaultTargetCapacity
 
 -- | A running Vulkan graphics host.
 data VulkanHost scene = VulkanHost
   { vulkanWindowHost ∷ !WindowHost
   , vulkanGraphicsOwner ∷ !(GraphicsOwner scene)
   , vulkanController ∷ !VulkanController
+  , vulkanTargets ∷ !(Targets scene)
+    -- ^ The offscreen scene targets registered with the host (LFE-27).
   }
 
 -- | The whole composition, over a native layer and a surface bridge:
@@ -2516,6 +2685,7 @@ withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge 
     -- every failure of the owner's own is ordered by the capture's first-failure
     -- cell; and a sink failure the worker records while the owner is idle wakes
     -- it for that checkpoint.
+    targets ← newTargets (vulkanTargetCapacity config) (vulkanScene config)
     atomically $ do
       watchRootsDiagnosticsOrdered (stateRoots state) (DiagnosticWatch (diagnosticAlarms capture) (diagnosticOrder capture))
       writeTVar (stateWake state) (failureOwed state capture)
@@ -2525,7 +2695,7 @@ withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge 
           liftIO (atomically (supplyInstanceExtensions controller copied))
           pure entered
         owner =
-          (vulkanOwner config (graphicsOwnerConfig (controllerOperations controller (vulkanRenderer config) (vulkanSceneLifecycle config)) (vulkanScene config)))
+          (vulkanOwner config (graphicsOwnerConfig (controllerOperations controller (vulkanRenderer config) (vulkanSceneLifecycle config) targets) (vulkanScene config)))
             {ownerSceneMode = vulkanSceneMode config}
     outcome ←
       tryWithContext $
@@ -2542,11 +2712,11 @@ withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge 
               (stateScenes state)
               SceneSource
                 { sourceMode = vulkanSceneMode config
-                , sourceWindows = hostWindowIdentities windows
-                , sourceRevisions = readGraphicsSceneRevisions graphics
+                , sourceHeld = (\held offscreen → map KeyWindow held <> offscreen) <$> hostWindowIdentities windows <*> targetsHeld targets
+                , sourceRevisions = Map.union . Map.mapKeysMonotonic KeyWindow <$> readGraphicsSceneRevisions graphics <*> targetsRevisions targets
                 }
             writeTVar (stateSceneReleased state) (sceneReleased (vulkanSceneLifecycle config))
-          use (VulkanHost windows graphics controller)
+          use (VulkanHost windows graphics controller targets)
     -- However the host ended, an instance it did not destroy may still have
     -- a messenger naming the capture, so the capture's storage is kept rather
     -- than freed under it. Only an independent publication of the owner's
