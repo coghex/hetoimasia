@@ -13,9 +13,9 @@
   "unevaluablePixels": 0,
   "indeterminatePixels": {},
   "oracleTolerance": "the oracle's exactness rule: 0 or 1 per channel",
-  "namedProbes": 38,
+  "namedProbes": 40,
   "namedTolerances": [1],
   "faults": 0,
-  "readbackSha256": "7f0b675689fc06daca98bea02d37c9712106017221d4fcd199c5856479e4b47d",
-  "pngSha256": "f8030fa0453ed76e1ea70751f2c1c39beafb0d275955876a9aa955d65cf66947"
+  "readbackSha256": "8e82c7cd29fdd79b431a3b549c09246f7940d9c79688060a8592f757bb3110e2",
+  "pngSha256": "9f26ce1abe7ed64bc162a9de8493d36a7dd40d71dba1b126d5d8be4c7560f1d9"
 }
