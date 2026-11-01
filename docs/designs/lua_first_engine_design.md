@@ -9388,6 +9388,18 @@ replace boundary tests, prove performance or establish confinement.
 - **Owner/tests:** `gpu-vulkan/glfw` (the host's scene state) and
   `lua-engine-graphics` (the ledger instantiation), headless Hspec plus one
   real-Vulkan native case that opens no rendered window.
+- **As delivered ([#576](https://github.com/coghex/hetoimasia/issues/576), PR [#577](https://github.com/coghex/hetoimasia/pull/577)):**
+  one scene-target key, `SceneTargetKey` (`KeyWindow WindowId | KeyOffscreen OffscreenTargetId`), keys the host's release barrier,
+  scene lifecycle and observation and lua-engine-graphics' hold ledger; `WindowId` is neither widened nor minted. A surface-free
+  target registers with the running host (`registerVulkanSceneTarget`, STM, typed refusals, finite `vulkanTargetCapacity`),
+  publishes a latest value with a host-held rising revision (`publishVulkanTargetScene`, STM), is adopted by the owner's step
+  through the window's ledger, and its adopted revisions are released only on the own tickets of the batches recorded with them
+  through `recordVulkanTargetBatch` (complete or discarded; pending and lost keep them). The contract is
+  [gpu_backend.md](../gpu_backend.md#offscreen-scene-targets); the headless examples are
+  `Test.GPU.Vulkan.GLFW.Targets` and the native case is `an offscreen scene target on a real device (LFE-27)`. The adapter's
+  suites cannot compose the production release lane over a stand-in host (its host is private), so over the real hold
+  ledger that lane is proved by the native case. One additive export of the native package, `recordFramelessInWith`, binds a
+  use to a batch's ticket when the batch is admitted. #539's display adapter and pixel work are not here.
 
 #### LFE-24. Verify Lua-authored output through offscreen pixels
 
