@@ -584,8 +584,8 @@ testRestoredWindowResumes shared = do
             settled ticket =
               atomically (pollCompletion ticket) >>= \case
                 Nothing → pure False
-                Just (Performed _) → pure True
-                Just other → failed ("the command did not settle as performed: " <> show other)
+                Just (Attempted (ControlAttempt _ ControlReturned (PostCallRevision _))) → pure True
+                Just other → failed ("the command did not settle as a returned control: " <> show other)
             within number started stage =
               when (number >= started + turnBound) (failed ("the window did not complete the " <> stage <> " within the turn bound"))
         runOwnerLoop host control $
