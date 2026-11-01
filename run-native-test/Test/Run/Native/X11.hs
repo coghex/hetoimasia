@@ -22,7 +22,6 @@ module Test.Run.Native.X11
   , geometry
   , capture
   , requestClose
-  , raiseWindow
   ) where
 
 import Control.Exception (Exception, throwIO)
@@ -176,9 +175,3 @@ requestClose ∷ X11 → Int → Integer → IO Candidate
 requestClose helper pid window = do
   json ← run helper ["close", "--pid", show pid, "--window", show window]
   maybe (throwIO (Refused "unreadable" "close answered no identity")) pure (field "identity" json >>= windowOf)
-
--- | Ask the window manager to raise exactly this window, so a capture shows its own pixels. A request only.
-raiseWindow ∷ X11 → Int → Integer → IO Candidate
-raiseWindow helper pid window = do
-  json ← run helper ["raise", "--pid", show pid, "--window", show window]
-  maybe (throwIO (Refused "unreadable" "raise answered no identity")) pure (field "identity" json >>= windowOf)

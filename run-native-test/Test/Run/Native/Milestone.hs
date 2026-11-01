@@ -19,6 +19,7 @@ import Control.Exception (onException, try)
 import Data.List (isInfixOf)
 import Test.HUnit.Lang (HUnitFailure (..))
 import Control.Monad (forM, forM_, unless)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import System.IO (hPutStrLn, stderr)
 import Data.ByteString (ByteString)
@@ -59,12 +60,11 @@ spec env = describe "Lua native milestone" $ do
       withPeers (envStart env) folder $ \peers → do
         -- A's window is created first and B's second: with creation outcomes withheld from the provider, each new
         -- native window is the only one that appeared since the instance was admitted, so it is that instance's.
-        (a, windowA, boundA, b, windowB, boundB) ← startTwo env peers
+        (a, windowA, _boundA, b, windowB, boundB) ← startTwo env peers (\_ bound → snap env peers "two-instances--a-quad" bound)
         spIdentity a `shouldNotBe` spIdentity b
         spInstance a `shouldNotBe` spInstance b
         windowA `shouldNotBe` windowB
-        forM_ [windowA, windowB] $ \window → awaitAdopted peers window 1
-        snap env peers "two-instances--a-quad" boundA
+        awaitAdopted peers windowB 1
         snap env peers "two-instances--b-quad" boundB
         checkpoint env "two-instances-quads" "the owner confirms the textured quad is visible in both windows, the same picture in each" =<< factsFor peers [("A", windowA), ("B", windowB)]
         -- Two textures were allocated, uploaded and registered: the same path was never coalesced.
@@ -180,9 +180,15 @@ spec env = describe "Lua native milestone" $ do
   it "keeps an unchanged published scene while the window is made smaller, larger, minimized and restored, and records what the platform reported rather than what was requested" $
     withinCase env 120 . withOwnedContent $ \folder →
       withPeers (envStart env) folder $ \peers → do
-        (a, windowA, boundA, b, windowB, _boundB) ← startTwo env peers
-        forM_ [windowA, windowB] $ \window → awaitAdopted peers window 1
-        parkWindow peers windowB
+        known0 ← viewableNow env
+        withholdNextCreations peers 1
+        a ← admitUi peers
+        windowA ← awaitNewWindow peers []
+        boundA ← bindNew env peers windowA known0
+        releaseCreations peers
+        awaitAdopted peers windowA 1
+        -- The subject is the only window until, if ever, a peer is needed to pace a native zero-area framebuffer.
+        pacemaker ← newIORef Nothing
         initial ← windowMetrics peers windowA
         snap env peers "view--initial" boundA
         -- The scene is the one accepted publication, and nothing below republishes: its revision is the evidence.
@@ -211,8 +217,13 @@ spec env = describe "Lua native milestone" $ do
         let area = maybe Nothing (\(w, h) → Just (w * h)) . metricsFramebuffer
         zeroNative ← case area iconified of
           Just 0 → do
-            -- A native zero-area framebuffer: drawing is suspended for this window while the peer, which keeps its
-            -- size, is still presented and its presentations still retire; no frame of this window's is requested.
+            -- A native zero-area framebuffer: drawing is suspended for this window while a peer, admitted now to pace it
+            -- and keeping its size, is still presented and its presentations still retire; no frame of this window's
+            -- is requested.
+            peer ← admitUi peers
+            windowB ← awaitNewWindow peers [windowA]
+            awaitAdopted peers windowB 1
+            writeIORef pacemaker (Just peer)
             mark ← frameMark peers
             demandFrame peers windowA
             demandFrame peers windowB
@@ -236,10 +247,11 @@ spec env = describe "Lua native milestone" $ do
         renders "restored"
         snap env peers "view--restored" boundA
         checkpoint env "restore" "the owner confirms the restored window shows the quad again" =<< factsFor peers [("subject", windowA)]
-        awaitLiveTextures peers 2
+        paced ← readIORef pacemaker
+        awaitLiveTextures peers (maybe 1 (const 2) paced)
         readTVarIO (peFatals peers) >>= (`shouldBe` [])
         atomically (readTVar (peStops peers)) >>= (`shouldBe` 0)
-        mapM_ (stopUi peers) [a, b]
+        mapM_ (stopUi peers) (a : maybe [] pure paced)
         awaitWindowCount peers 0
         awaitLiveTextures peers 0
         -- Every cleanup close has happened by now: none of them was a user close.
@@ -313,9 +325,8 @@ spec env = describe "Lua native milestone" $ do
     it ("routes a user close of " <> which <> " live window to one whole-session quit request, which retires both instances and windows, unlike ending one instance") $
       withinCase env 120 . withOwnedContent $ \folder →
         withPeers (envStart env) folder $ \peers → do
-          (a, windowA, boundA, b, windowB, boundB) ← startTwo env peers
-          forM_ [windowA, windowB] $ \window → awaitAdopted peers window 1
-          snap env peers (Text.pack ("user-close-" <> show index <> "--a-quad")) boundA
+          (a, windowA, _boundA, b, windowB, boundB) ← startTwo env peers (\_ bound → snap env peers (Text.pack ("user-close-" <> show index <> "--a-quad")) bound)
+          awaitAdopted peers windowB 1
           snap env peers (Text.pack ("user-close-" <> show index <> "--b-quad")) boundB
           let closed = [windowA, windowB] !! index
           atomically (readTVar (peStops peers)) >>= (`shouldBe` 0)
@@ -358,34 +369,34 @@ placeWindow env peers window slot = case envX11 env of
     -- On the isolated display the capture itself isolates its subject ('snap'), so nothing is placed here.
     position = (20 + 660 * slot, 60)
 
--- | Park a window out of the way (macOS: where the owner looks at its peer alone).
-parkWindow ∷ Peers → WindowId → IO ()
-parkWindow peers window = do
-  disposition ← requestPosition peers window (1000, 500)
-  (window, attempted disposition) `shouldBe` (window, True)
-
--- | Admit two instances so that each new native window is unambiguously its instance's: with the next two creation
--- outcomes withheld from the provider, the window that appears after A is admitted is A's and the one that appears
--- after B is admitted is B's (and, on the isolated X11 display, the one new viewable X window each time is bound to
--- it). The gate is released before the cases go on.
-startTwo ∷ Env → Peers → IO (Spawned, WindowId, Maybe Bound, Spawned, WindowId, Maybe Bound)
-startTwo env peers = do
-  note "startTwo: withholding two creations"
-  withholdNextCreations peers 2
+-- | Admit two instances, one after the other, so that each new native window is unambiguously its instance's: with the
+-- next creation outcome withheld from the provider, the window that appears after an instance is admitted is that
+-- instance's (and, on the isolated X11 display, the one new viewable X window is bound to it). The gate is released
+-- before the cases go on. The first instance is looked at /alone/: @whileAlone@ runs once its scene is adopted and
+-- before the second instance exists, because an X server without a compositor answers a capture with whatever window is
+-- on top, and the window created last is. Both are then placed side by side where an owner can see them.
+startTwo ∷ Env → Peers → (WindowId → Maybe Bound → IO ()) → IO (Spawned, WindowId, Maybe Bound, Spawned, WindowId, Maybe Bound)
+startTwo env peers whileAlone = do
+  note "startTwo: admitting A"
   known0 ← viewableNow env
-  note ("startTwo: admitting A; X windows known: " <> show known0)
+  withholdNextCreations peers 1
   a ← admitUi peers
   windowA ← awaitNewWindow peers []
   note ("startTwo: host window for A: " <> show windowA)
   boundA ← bindNew env peers windowA known0
-  placeWindow env peers windowA 0
+  releaseCreations peers
+  awaitAdopted peers windowA 1
+  whileAlone windowA boundA
+  note "startTwo: admitting B"
+  withholdNextCreations peers 1
   b ← admitUi peers
   windowB ← awaitNewWindow peers [windowA]
   note ("startTwo: host window for B: " <> show windowB)
   boundB ← bindNew env peers windowB (known0 <> map boundX (maybe [] pure boundA))
-  placeWindow env peers windowB 1
   releaseCreations peers
-  note "startTwo: creations released"
+  placeWindow env peers windowA 0
+  placeWindow env peers windowB 1
+  note "startTwo: both windows are up"
   pure (a, windowA, boundA, b, windowB, boundB)
 
 quadPath ∷ ByteString

@@ -40,7 +40,7 @@ import Test.Run.Native.Json
 import Test.Run.Native.Landmarks
 import Test.Run.Native.Observe (Metrics (..), note, windowMetrics)
 import Test.Run.Native.Peers (Peers)
-import Test.Run.Native.X11 (Candidate (..), Captured (..), Refused (..), X11, candidates, capture, geometry, raiseWindow, requestClose, viewableCandidates)
+import Test.Run.Native.X11 (Candidate (..), Captured (..), Refused (..), X11, candidates, capture, geometry, requestClose, viewableCandidates)
 
 -- | A native window bound to the instance that made it, with the process that owns it.
 data Bound = Bound
@@ -121,10 +121,6 @@ snapWith env name bound landmarksFor metrics = do
   let final = envCaptureDir env </> Text.unpack name <> ".png"
       stage n = envCaptureDir env </> Text.unpack name <> ".attempt" <> show (n ∷ Int) <> ".png"
       loop n previous = do
-        -- An X server without a compositor answers a capture with whatever is on top of the subject's pixels (another
-        -- window, or a window manager's frame), so the window manager is asked, identity-checked, to raise the subject
-        -- first, and again while the display still disagrees.
-        when (n `mod` 8 == 1) $ () <$ required "raise request" (try (raiseWindow (boundHelper bound) (boundPid bound) (boundX bound)))
         now ← required "geometry" (try (geometry (boundHelper bound) (boundPid bound) (boundX bound)))
         let size = (candWidth now, candHeight now)
         shot ← required "capture" (try (capture (boundHelper bound) (boundPid bound) (boundX bound) (stage n) [lmPoint l | l ← landmarksFor size] Nothing))
