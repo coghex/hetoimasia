@@ -59,8 +59,8 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (Exception, SomeException, finally, onException, throwIO, try)
+import Control.Concurrent.MVar (newEmptyMVar, takeMVar)
+import Control.Exception (Exception, SomeException, finally, onException, throwIO)
 import System.IO (hPutStrLn, stderr)
 import System.Timeout (timeout)
 import Control.Monad (forM_, join, unless, when)
@@ -128,6 +128,7 @@ import Hetoimasia.LuaEngine.Request (m1Requests)
 import Hetoimasia.LuaEngine.Texture (specIoWorkers, textureSpec, withTexturePipeline)
 import Hetoimasia.Run.Boot (Prepared (..), withPrepared)
 import Hetoimasia.Run.Serve (Owner (..), serveSpawned, runOwned)
+import Hetoimasia.Run.Settle (answering)
 import Hetoimasia.Runtime.GLFW
   ( ScheduledStep (..)
   , UpdateSchedule (NoUpdateDemand)
@@ -591,9 +592,11 @@ instancePhaseOf peers found = fmap snapshotPhase <$> inspectInstance (scheduledE
 onMain ∷ Peers → IO b → IO b
 onMain peers action = do
   answer ← newEmptyMVar
-  atomically (modifyTVar' (peJobs peers) (<> [try @SomeException action >>= putMVar answer]))
+  -- The capture of the outcome and its answer are one masked step ('answering'), so a cancellation of the main thread
+  -- cannot land between them and leave this waiter blocked.
+  atomically (modifyTVar' (peJobs peers) (<> [answering answer action]))
   wakeGraphicsHost (vulkanGraphicsOwner (peHost peers))
-  takeMVar answer >>= either throwIO pure
+  takeMVar answer >>= either (\failure → throwIO (failure ∷ SomeException)) pure
 
 -- | Block until a script printed exactly this line; a line that never comes fails with what was printed.
 awaitLine ∷ Peers → Text → IO ()
