@@ -18,7 +18,7 @@ import Control.Concurrent.STM (atomically, readTVar, readTVarIO, retry)
 import Control.Concurrent (forkIO, myThreadId, throwTo)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (newTVarIO)
-import Control.Exception (AsyncException (UserInterrupt), ExceptionWithContext (..), SomeException, finally, onException, try, tryWithContext)
+import Control.Exception (AsyncException (UserInterrupt), ExceptionWithContext (..), SomeException, finally, fromException, onException, tryWithContext)
 import Data.List (isInfixOf)
 import Test.HUnit.Lang (HUnitFailure (..))
 import Control.Monad (forM, forM_, unless)
@@ -43,7 +43,7 @@ import Hetoimasia.GLFW.Window (WindowId)
 import Test.Run.Native.Capture (Bound (..), bindNew, ownPid, snap, snapAs, viewableNow)
 import Test.Run.Native.Json (Json (..))
 import Test.Run.Native.Landmarks (blackLandmarks)
-import Test.Run.Native.Lifecycle (awaitSettled, lifecycleRecord, outstanding, heldTextures, writeLifecycle, Obligations (..))
+import Test.Run.Native.Lifecycle (Disposal (..), awaitDisposal, disposalFollowedObligations, disposalRecord, disposalsSoFar, heldTextures, writeLifecycle)
 import qualified Test.Run.Native.X11 as X11
 import Test.Run.Native.Checkpoint (checkpoint)
 import Test.Run.Native.Observe
@@ -88,6 +88,7 @@ spec env = describe "Lua native milestone" $ do
         -- The independent logical owner is alive and ticking on its own clock beside both.
         ticksBefore ← logicalAdvances peers
         -- Ending A through its public lifecycle control closes only its window, and is never a user close.
+        beforeA ← disposalsSoFar peers
         stopUi peers a
         awaitWindowCount peers 1
         remaining ← windowsNow peers
@@ -95,11 +96,12 @@ spec env = describe "Lua native milestone" $ do
         atomically (readTVar (peStops peers)) >>= (`shouldBe` 0)
         readTVarIO (peFatals peers) >>= (`shouldBe` [])
         awaitLiveTextures peers 1
-        -- A's disposal followed what A asked of the GPU: every submission its frames made completed, every presentation
-        -- retired, read from the host's own events and not inferred from the count falling.
-        obligationsA ← awaitSettled peers windowA
-        outstanding obligationsA `shouldBe` ([], [])
-        null (obSubmitted obligationsA) `shouldBe` False
+        -- A's disposal followed what A asked of the GPU: at every native disposal call that ended A's graphics, in the order
+        -- the host made them among its frame events, every submission A's frames had made had completed and every
+        -- presentation had retired. Read from the order recorded as the calls happened, not from what finished after.
+        disposalA ← awaitDisposal peers windowA beforeA
+        disposalFollowedObligations disposalA `shouldBe` True
+        dsSurfaceDestroyed disposalA `shouldBe` True
         afterEnd ← heldTextures peers
         afterEnd `shouldBe` idsB
         -- B continues: another frame of what it holds, with the same revision, and nothing reloaded: the identity it
@@ -113,11 +115,13 @@ spec env = describe "Lua native milestone" $ do
         -- B's quad is still right on the display.
         snap env peers "two-instances--b-after-a-ended" boundB
         checkpoint env "peer-survival" "the owner confirms A's window is gone and B's window still shows the correct quad, never reloaded" =<< factsFor peers [("B", windowB)]
+        beforeB ← disposalsSoFar peers
         stopUi peers b
         awaitWindowCount peers 0
         awaitLiveTextures peers 0
-        obligationsB ← awaitSettled peers windowB
-        outstanding obligationsB `shouldBe` ([], [])
+        disposalB ← awaitDisposal peers windowB beforeB
+        disposalFollowedObligations disposalB `shouldBe` True
+        dsSurfaceDestroyed disposalB `shouldBe` True
         heldEnd ← heldTextures peers
         Set.null heldEnd `shouldBe` True
         ticksAfter ← logicalAdvances peers
@@ -133,8 +137,8 @@ spec env = describe "Lua native milestone" $ do
           , ("texture_identity_b", JArray (map (JNumber . fromIntegral) (Set.toList idsB)))
           , ("texture_identities_held_after_a_ended", JArray (map (JNumber . fromIntegral) (Set.toList afterEnd)))
           , ("texture_identities_held_after_b_frame", JArray (map (JNumber . fromIntegral) (Set.toList afterFrame)))
-          , ("a_obligations_at_disposal", lifecycleRecord "A" obligationsA)
-          , ("b_obligations_at_end", lifecycleRecord "B" obligationsB)
+          , ("a_disposal", disposalRecord "A" disposalA)
+          , ("b_disposal", disposalRecord "B" disposalB)
           , ("logical_owner_tick_while_both_live", JNumber (fromIntegral ticksBefore))
           , ("logical_owner_tick_at_end", JNumber (fromIntegral ticksAfter))
           , ("user_close_requests", JNumber 0)
@@ -161,6 +165,7 @@ spec env = describe "Lua native milestone" $ do
         idsB0 ← heldTextures peers
         Set.size idsB0 `shouldBe` 1
         -- A is ended with its read borrowed by a worker: it cannot settle until the read returns.
+        beforeA ← disposalsSoFar peers
         stopUi peers a
         step "A's phase to become Stopping" . atomically $ instancePhaseOf peers a >>= \phase → unless (phase == Just Stopping) retry
         mark ← frameMark peers
@@ -177,8 +182,8 @@ spec env = describe "Lua native milestone" $ do
         awaitLiveTextures peers 1
         -- A's late result was discarded, never delivered to its ended Lua and never adopted: no new identity appeared, B's
         -- is the one still held, and everything A asked of the GPU has finished.
-        obligationsAPending ← awaitSettled peers windowA
-        outstanding obligationsAPending `shouldBe` ([], [])
+        disposalAPending ← awaitDisposal peers windowA beforeA
+        disposalFollowedObligations disposalAPending `shouldBe` True
         heldAfterRelease ← heldTextures peers
         heldAfterRelease `shouldBe` idsB0
         writeLifecycle env "pending-read"
@@ -186,7 +191,7 @@ spec env = describe "Lua native milestone" $ do
           , ("peer_instance", JString (spIdentity b))
           , ("peer_texture_identity", JArray (map (JNumber . fromIntegral) (Set.toList idsB0)))
           , ("texture_identities_held_after_the_late_result", JArray (map (JNumber . fromIntegral) (Set.toList heldAfterRelease)))
-          , ("ended_window_obligations", lifecycleRecord "A" obligationsAPending)
+          , ("ended_window_disposal", disposalRecord "A" disposalAPending)
           ]
         readTVarIO (peFatals peers) >>= (`shouldBe` [])
         -- The reservation came back exactly: a later instance loads the same path and shows its quad.
@@ -218,6 +223,7 @@ spec env = describe "Lua native milestone" $ do
         awaitAdopted peers windowB 1
         idsBeforeEnd ← heldTextures peers
         atomically (creationsWithheld peers) >>= (`shouldBe` 1)
+        beforeA ← disposalsSoFar peers
         stopUi peers a
         -- A's accepted window work is still pending: its native window is tracked until the provider collects the
         -- outcome and retires it, and the peer neither notices nor stops.
@@ -231,8 +237,8 @@ spec env = describe "Lua native milestone" $ do
         instanceStoppedCleanly a >>= (`shouldBe` True)
         awaitWindowCount peers 1
         windowsNow peers >>= (`shouldBe` [windowB])
-        obligationsAWithheld ← awaitSettled peers windowA
-        outstanding obligationsAWithheld `shouldBe` ([], [])
+        disposalAWithheld ← awaitDisposal peers windowA beforeA
+        disposalFollowedObligations disposalAWithheld `shouldBe` True
         heldAfterWindowRetired ← heldTextures peers
         heldAfterWindowRetired `shouldBe` idsBeforeEnd
         writeLifecycle env "pending-window"
@@ -240,7 +246,7 @@ spec env = describe "Lua native milestone" $ do
           , ("peer_instance", JString (spIdentity b))
           , ("texture_identities_before", JArray (map (JNumber . fromIntegral) (Set.toList idsBeforeEnd)))
           , ("texture_identities_after_the_withheld_outcome_was_released", JArray (map (JNumber . fromIntegral) (Set.toList heldAfterWindowRetired)))
-          , ("ended_window_obligations", lifecycleRecord "A" obligationsAWithheld)
+          , ("ended_window_disposal", disposalRecord "A" disposalAWithheld)
           ]
         awaitLiveTextures peers 1
         readTVarIO (peFatals peers) >>= (`shouldBe` [])
@@ -284,11 +290,13 @@ spec env = describe "Lua native milestone" $ do
         loadedHeld ← heldTextures peers
         Set.size loadedHeld `shouldBe` 1
         snap env peers "initial-empty--a-quad" boundA
+        beforeA ← disposalsSoFar peers
         stopUi peers a
         awaitWindowCount peers 0
         awaitLiveTextures peers 0
-        obligations ← awaitSettled peers windowA
-        outstanding obligations `shouldBe` ([], [])
+        disposalA ← awaitDisposal peers windowA beforeA
+        disposalFollowedObligations disposalA `shouldBe` True
+        dsSurfaceDestroyed disposalA `shouldBe` True
         atomically (readTVar (peStops peers)) >>= (`shouldBe` 0)
         writeLifecycle env "initial-empty"
           [ ("instance", JString (spIdentity a))
@@ -296,7 +304,7 @@ spec env = describe "Lua native milestone" $ do
           , ("adopted_revision_while_the_read_was_held", JNumber 0)
           , ("texture_identities_held_while_the_read_was_held", JArray [])
           , ("texture_identity_after_release", JArray (map (JNumber . fromIntegral) (Set.toList loadedHeld)))
-          , ("window_obligations_at_end", lifecycleRecord "A" obligations)
+          , ("window_disposal", disposalRecord "A" disposalA)
           ]
         evidence env (Text.pack ("initial empty window: instance " <> show (spIdentity a) <> " window " <> show windowA <> " showed its initial empty scene (revision 0, no texture identity held) while its texture read was held at the pool's reader, then the same window adopted the textured scene (revision 1, texture identity " <> show (Set.toList loadedHeld) <> ") once the gate was released; the instance was never ended in between"))
 
@@ -428,17 +436,28 @@ spec env = describe "Lua native milestone" $ do
       caller ← myThreadId
       -- The cancellation is delivered once the gates are really held: an event, not a delay.
       _ ← forkIO (takeMVar held >> throwTo caller UserInterrupt)
-      outcome ← try @SomeException . withPeers (envStart env) folder $ \peers → do
+      outcome ← tryWithContext @SomeException . withPeers (envStart env) folder $ \peers → do
         holdNextReads peers quadPath 1
         withholdNextCreations peers 1
         _ ← admitUi peers
         _ ← awaitNewWindow peers []
         readsEntered peers quadPath 1
-        putMVar held ()
-        -- Nothing ends this wait but the cancellation; the scenario's own scopes must release and retire on the way out.
-        (atomically (readTVar never >>= \set → unless set retry)) `finally` writeIORef unwound True
+        -- The finalizer is installed before the cancellation can be requested: it protects the readiness publication and
+        -- the wait, so a cancellation that lands the moment the sender is released still finds it.
+        ( do
+            putMVar held ()
+            -- Nothing ends this wait but the cancellation; the scenario's own scopes must release and retire on the way out.
+            atomically (readTVar never >>= \set → unless set retry)
+          )
+          `finally` writeIORef unwound True
       -- The call returned only after the application ended: the scenario's cleanup ran first, and the folder it borrowed is still here.
-      either (\failure → show failure) (const "no failure") outcome `shouldSatisfy` isInfixOf "user interrupt"
+      -- What it raises is the caller's own cancellation, with the application's end retained beside it: the scenario's
+      -- cancellation, a clean diagnostic verdict attached to it and no cleanup failure of its own.
+      case outcome of
+        Left failure@(ExceptionWithContext _ cancelled) → do
+          (fromException cancelled ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
+          cancellationProblems failure `shouldBe` []
+        Right () → expectationFailure "the cancelled call returned normally"
       readIORef unwound >>= (`shouldBe` True)
       doesDirectoryExist folder >>= (`shouldBe` True)
       readTVarIO never >>= (`shouldBe` False)

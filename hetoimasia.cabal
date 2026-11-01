@@ -374,6 +374,7 @@ test-suite run-native-tests
             Test.Run.Native.Observe
             Test.Run.Native.Peers
             Test.Run.Native.PeersSpec
+            Test.Run.Native.X11Spec
             Test.Run.Native.X11
         build-depends:
             base >=4.22 && <4.23,

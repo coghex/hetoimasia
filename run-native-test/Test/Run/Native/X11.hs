@@ -16,6 +16,7 @@ module Test.Run.Native.X11
   , Captured (..)
   , Refused (..)
   , defaultX11
+  , runBounded
   , prepare
   , candidates
   , viewableCandidates
@@ -24,6 +25,7 @@ module Test.Run.Native.X11
   , requestClose
   ) where
 
+import Control.Concurrent.STM (atomically, check, readTVar, readTVarIO)
 import Control.Exception (Exception, throwIO)
 import Control.Monad (when)
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
@@ -32,8 +34,10 @@ import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import System.Exit (ExitCode (..))
-import System.Process (proc, readCreateProcessWithExitCode)
+import System.Environment (getEnvironment)
+import System.Process (waitForProcess)
 import System.Timeout (timeout)
+import Test.Run.Native.Child (Child (..), withChild)
 import Test.Run.Native.Json
 
 -- | Where the helper is and how to run it.
@@ -82,9 +86,25 @@ data Captured = Captured
 
 -- | Run one helper operation: bounded, reaped, and answered as the helper's own JSON.
 run ∷ X11 → [String] → IO Json
-run helper arguments = do
+run = runBounded (30 * 1000000)
+
+-- | The same under a stated bound, in microseconds. The helper process is the suite's owned child
+-- ('Test.Run.Native.Child.withChild'): on every way out, a timeout and a cancellation included, it is killed if it has not
+-- exited and reaped before this returns (a process that could not be confirmed reaped fails the call), and its pipes are
+-- drained. The library's own cleanup of a timed-out process reaps it in a background thread, which would let a capture race a
+-- helper still writing its files.
+runBounded ∷ Int → X11 → [String] → IO Json
+runBounded bound helper arguments = do
   started ← getCurrentTime
-  outcome ← timeout (30 * 1000000) (readCreateProcessWithExitCode (proc (x11Python helper) ("-I" : x11Script helper : arguments)) "")
+  environment ← getEnvironment
+  outcome ←
+    withChild (x11Python helper) ("-I" : x11Script helper : arguments) environment $ \child →
+      timeout bound $ do
+        code ← waitForProcess (childProcess child)
+        atomically (readTVar (childOutEnded child) >>= check >> readTVar (childErrEnded child) >>= check)
+        out ← readTVarIO (childOut child)
+        err ← readTVarIO (childErr child)
+        pure (code, Text.unpack (Text.unlines out), Text.unpack (Text.unlines err))
   finished ← getCurrentTime
   -- A slow or failed operation says so where it happened, so a run that runs out of budget names the step.
   let seconds = realToFrac (diffUTCTime finished started) ∷ Double

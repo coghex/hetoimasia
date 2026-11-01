@@ -51,6 +51,10 @@ module Test.Run.Native.Peers
   , verdictCleanOrFail
   , teardownProblems
   , judgeTeardown
+  , cancellationProblems
+  , judgeCancellation
+  , applicationLabel
+  , withOwnedLoop
   ) where
 
 import Control.Concurrent.STM
@@ -66,13 +70,13 @@ import Control.Concurrent.STM
   )
 import Control.Concurrent (forkIOWithUnmask, killThread, myThreadId, threadDelay, throwTo)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryReadMVar)
-import Control.Exception (Exception, ExceptionWithContext (..), SomeException, finally, mask, onException, rethrowIO, throwIO, tryWithContext)
+import Control.Exception (Exception, ExceptionWithContext (..), SomeException, finally, fromException, mask, onException, rethrowIO, throwIO, tryWithContext, uninterruptibleMask_)
 import System.IO (hPutStrLn, stderr)
 import System.Timeout (timeout)
 import Control.Monad (forM_, forever, join, unless, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Data.Maybe (isNothing)
+import Data.Maybe (isJust, isNothing)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Set (Set)
@@ -82,7 +86,7 @@ import Hetoimasia.Content.Identity (contentKeyPath, logicalPathBytes, parseRefer
 import Hetoimasia.Content.Inventory (inventoryIdentityLimits, inventoryLimitsOf, inventoryRootKey, readVerified)
 import Hetoimasia.Content.ReadPool (ReadPool, poolSpec, withReadPoolUsing)
 import Hetoimasia.Foundation.Log (LogFilter (..), Logger, callbackSink, defaultLogFilter, mkLogger, unsafeComponent)
-import Hetoimasia.Foundation.Resource (cleanupFailuresInContext)
+import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailureLabel, cleanupFailuresInContext)
 import Hetoimasia.Foundation.Time (Duration, DurationRequirement (RequirePositive), durationFromNanoseconds, monotonicSource)
 import Hetoimasia.GLFW.Vulkan (withLoaderIntegration)
 import Hetoimasia.GPU.Vulkan.Diagnostics
@@ -95,6 +99,7 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
   )
 import Hetoimasia.GPU.Vulkan.GLFW
   ( FrameEvent
+  , NativeObserver (..)
   , Readiness (..)
   , ValidationFeature (SynchronizationValidation)
   , VulkanHost (..)
@@ -190,6 +195,10 @@ data Peers = Peers
   -- ^ How many times a script asked to quit through the facade's quit endpoint.
   , peFrames ∷ !(TVar (Int, [FrameEvent]))
   -- ^ The host's frame events, newest first, bounded, with the total count.
+  , peDisposals ∷ !(TVar [(Text, Int)])
+  -- ^ The native disposals the host's observer saw, oldest first: the call's Vulkan name and how many frame events had
+  -- been recorded when the call began. Both are written on the graphics owner's thread, the frame events' own, so the
+  -- position is the call's place in the events' order.
   , peReading ∷ !(STM PortReading)
   , peCreationHold ∷ !(TVar CreationHold)
   -- ^ Which window creation outcomes are withheld from the provider.
@@ -228,6 +237,10 @@ newtype PeerFailure = PeerFailure Text
 
 instance Exception PeerFailure
 
+-- | The label under which 'withPeers' retains the end of the application beside a cancellation.
+applicationLabel ∷ Text
+applicationLabel = "the harness application, which had to be stopped and joined"
+
 -- | Compose the two-instance harness over a real host for the length of the scenario.
 --
 -- The scenario runs on the session thread; whatever it raises is raised here, with its context (the diagnostic verdict
@@ -245,6 +258,7 @@ withPeers start folder scenario = mask $ \restore → do
   textureConfiguration ← either (\refused → ioError (userError ("the profile cannot be mapped to the native graphics: " <> show refused))) pure (configurationFor fixedM1Profile)
   scenes ← newSceneSession
   frames ← newTVarIO (0, [])
+  disposals ← newTVarIO []
   jobs ← newTVarIO []
   abort ← newTVarIO False
   sessionThread ← newIORef Nothing
@@ -256,6 +270,7 @@ withPeers start folder scenario = mask $ \restore → do
       config =
         (configureScenes scenes (configureWindows (configureHost textureConfiguration base)))
           { vulkanFrameObserver = \event → atomically (modifyTVar' frames (\(count, events) → (count + 1, take 4096 (event : events))))
+          , vulkanObserver = \diagnostics → tracingDisposals frames disposals (vulkanObserver base diagnostics)
           , vulkanLayers = ["VK_LAYER_KHRONOS_validation"]
           , vulkanValidationFeatures = [SynchronizationValidation]
           }
@@ -287,7 +302,7 @@ withPeers start folder scenario = mask $ \restore → do
                 )
                 vulkanWindowHost
                 (\vulkan _ → pure vulkan)
-                (\vulkan control → body lifetime slot cancelScenario abort sessionThread scenes textureConfiguration config vulkan control frames jobs)
+                (\vulkan control → body lifetime slot cancelScenario abort sessionThread scenes textureConfiguration config vulkan control frames disposals jobs)
         verdict ← readIORef verdictCell
         verdictCleanOrFail verdict
         pure outcome
@@ -311,11 +326,11 @@ withPeers start folder scenario = mask $ \restore → do
           rethrowIO
             =<< combine
               (maybe primary id interruption)
-              ([("the harness application, which had to be stopped and joined", failure) | failure ← ended'] <> [("the wait that was interrupted", primary) | Just _ ← [interruption]])
+              ([(applicationLabel, failure) | failure ← ended'] <> [("the wait that was interrupted", primary) | Just _ ← [interruption]])
         Right (Left failure) → rethrowIO failure
         Right (Right value) → maybe (pure value) rethrowIO interruption
   where
-    body lifetime slot cancelScenario abort sessionThread scenes textureConfiguration config vulkan control frames jobs = do
+    body lifetime slot cancelScenario abort sessionThread scenes textureConfiguration config vulkan control frames disposals jobs = do
       awaitReadiness vulkan
       _ ← superviseGraphicsOwner control (vulkanGraphicsOwner vulkan)
       providerStep ← newIORef (pure ())
@@ -336,7 +351,7 @@ withPeers start folder scenario = mask $ \restore → do
             myThreadId >>= writeIORef sessionThread . Just
             readTVarIO abort >>= \stopped → when stopped (throwIO ScenarioCancelled)
             withTextureGraphics scenes textureConfiguration config vulkan $ \graphics →
-              compose lifetime folder graphics vulkan frames jobs providerStep scenario
+              compose lifetime folder graphics vulkan frames disposals jobs providerStep scenario
       serveSpawned
         lifetime
         owner
@@ -344,6 +359,17 @@ withPeers start folder scenario = mask $ \restore → do
         cancelScenario
         (turnJobs >> join (readIORef providerStep))
         session
+
+-- | The host's native-call observer with the disposals of a window's graphics recorded in the order of the frame events:
+-- the call's place among them is read, on the graphics owner's thread that makes both, just before the call runs. The
+-- call itself is the configured observer's, run exactly once, so the diagnostic capture sees it as before.
+tracingDisposals ∷ TVar (Int, [FrameEvent]) → TVar [(Text, Int)] → NativeObserver → NativeObserver
+tracingDisposals frames disposals (NativeObserver observe) =
+  NativeObserver $ \name call → do
+    when (name `elem` ["vkDestroySwapchainKHR", "vkDestroyImageView", "vkDestroySurfaceKHR"]) . atomically $ do
+      (count, _) ← readTVar frames
+      modifyTVar' disposals (<> [(name, count)])
+    observe name call
 
 -- | The composition on the session thread, inside the texture adapter.
 compose
@@ -353,11 +379,12 @@ compose
   → TextureGraphics
   → VulkanHost GraphicsScene
   → TVar (Int, [FrameEvent])
+  → TVar [(Text, Int)]
   → TVar [IO ()]
   → IORef (IO ())
   → (Peers → IO a)
   → IO a
-compose lifetime folder graphics vulkan frames jobs providerStep scenario = do
+compose lifetime folder graphics vulkan frames disposals jobs providerStep scenario = do
   stops ← newTVarIO 0
   fatals ← newTVarIO []
   quits ← newTVarIO 0
@@ -458,6 +485,7 @@ compose lifetime folder graphics vulkan frames jobs providerStep scenario = do
                             , peFatals = fatals
                             , peQuits = quits
                             , peFrames = frames
+                            , peDisposals = disposals
                             , peReading = reading
                             , peCreationHold = creationHold
                             , peReadHold = toHold
@@ -700,12 +728,17 @@ withVm context role injection tick body = do
 -- | Grant the logical owner exact ticks, one after the previous has been accounted for, paced by the system clock, for the
 -- length of the body. The thread is owned here: it is ended and joined on every way out, before the caller goes on.
 withTickPump ∷ RuntimeControl → ScheduledOwner → Duration → IO a → IO a
-withTickPump control owner tick body = do
+withTickPump control owner tick = withOwnedLoop (forever (grantScheduledStep (scheduledEndpoint owner) tick >> awaitTicksComplete control owner >> threadDelay 10000))
+
+-- | Run a loop on its own thread for the length of the body. Acquiring the thread and registering its stop and join are
+-- one masked step, so a cancellation cannot land between the two and abandon the loop; the body runs with the caller's
+-- interruptibility restored; the stop and the join of the loop are not interruptible, so no way out of the body returns
+-- before the loop has ended. The loop runs unmasked and its end is announced however it ended.
+withOwnedLoop ∷ IO () → IO a → IO a
+withOwnedLoop loop body = mask $ \restore → do
   done ← newEmptyMVar
-  thread ← forkIOWithUnmask $ \unmask →
-    unmask (forever (grantScheduledStep (scheduledEndpoint owner) tick >> awaitTicksComplete control owner >> threadDelay 10000))
-      `finally` putMVar done ()
-  body `finally` (killThread thread >> takeMVar done)
+  thread ← forkIOWithUnmask $ \unmask → unmask loop `finally` putMVar done ()
+  restore body `finally` uninterruptibleMask_ (killThread thread >> takeMVar done)
 
 -- | Ask the owner to retire and wait, under supervision, until it is no longer live.
 retireAndAwait ∷ RuntimeControl → ScheduledOwner → IO ()
@@ -805,6 +838,26 @@ verdictCleanOrFail = \case
 -- | What a failed run's teardown left to say, from the exception the failure reached the caller as: nothing when the
 -- capture's verdict is attached and clean and no scope retained a cleanup failure or a finalization observation beside
 -- the failure. A failure with no verdict attached is reported too: the host's teardown must have spoken.
+-- | What a caller cancelled while it waited for the harness should find beside the cancellation: the application's own end
+-- retained under 'applicationLabel' (and at most the interrupted wait itself besides), that end being the scenario's
+-- cancellation with a clean attached verdict and no cleanup failure of its own.
+cancellationProblems ∷ ExceptionWithContext e → [String]
+cancellationProblems (ExceptionWithContext context _) =
+  let retained = cleanupFailuresInContext context
+      ends = [cleanupFailureException failure | failure ← retained, cleanupFailureLabel failure == applicationLabel]
+   in judgeCancellation (length retained) [(teardownProblems end, isScenarioCancelled end) | end ← ends]
+  where
+    isScenarioCancelled (ExceptionWithContext _ failure) = isJust (fromException failure ∷ Maybe ScenarioCancelled)
+
+-- | The judgement itself over what was found: how many failures were retained beside the cancellation, and for each end of
+-- the application retained under its label, what its teardown said and whether it ended by the scenario's cancellation.
+judgeCancellation ∷ Int → [([String], Bool)] → [String]
+judgeCancellation retained ends =
+  ["the application's end is not retained beside the cancellation" | null ends]
+    <> ["the application's end is retained more than once" | length ends > 1]
+    <> concat [["the application's teardown: " <> problem | problem ← problems] <> ["the application did not end by the scenario's cancellation" | not cancelled] | (problems, cancelled) ← ends]
+    <> ["an unexpected failure is retained beside the cancellation" | retained > length ends + 1]
+
 teardownProblems ∷ ExceptionWithContext e → [String]
 teardownProblems (ExceptionWithContext context _) =
   judgeTeardown (diagnosticVerdictInContext context) (length (cleanupFailuresInContext context)) (maybe False (const True) (finalizationEvidenceInContext context))
