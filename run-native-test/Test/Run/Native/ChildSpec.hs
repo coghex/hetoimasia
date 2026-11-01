@@ -13,6 +13,8 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf)
 import Hetoimasia.Foundation.Resource (cleanupFailuresInContext)
 import System.Environment (getEnvironment)
+import System.Exit (ExitCode (ExitFailure))
+import System.Posix.Signals (sigKILL)
 import System.Process (ProcessHandle, getProcessExitCode, waitForProcess)
 import System.Timeout (timeout)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldSatisfy, shouldThrow)
@@ -49,8 +51,9 @@ spec = describe "the child helper" $ do
       seen ← newIORef Nothing
       run defaultBounds {boundReap = 0} noHooks (\child → writeIORef seen (Just (childProcess child)))
         `shouldThrow` mentions "cleanup was not confirmed"
-      -- The helper killed it before giving up on the wait; the example reaps it so nothing is left behind.
-      reapedAfter seen
+      -- The helper killed it and then gave up at once (a zero bound), so whether the kill has taken effect is the kernel's
+      -- schedule, not the helper's: the example reaps it itself, within a bound, and requires it to have died of the kill.
+      killedAfter seen
 
     it "fails an otherwise passing body when its pipes did not end within their bound" $ do
       seen ← newIORef Nothing
@@ -62,7 +65,7 @@ spec = describe "the child helper" $ do
       seen ← newIORef Nothing
       run defaultBounds {boundReap = 0, boundDrain = 0} noHooks (\child → writeIORef seen (Just (childProcess child)) >> throwIO BodyFailed)
         `shouldThrow` (== BodyFailed)
-      reapedAfter seen
+      killedAfter seen
 
   describe "a failure part-way through the acquisition" $ do
     it "kills and reaps the process that already exists and raises the failure" $ do
@@ -129,16 +132,29 @@ cancellation = either (\(ExceptionWithContext _ failure) → fromException failu
 mentions ∷ String → SomeException → Bool
 mentions needle failure = needle `isInfixOf` show failure
 
--- | The process was started, and the helper left it reaped: its exit code is known without waiting for anything.
+-- | The process was started, and the helper left it reaped: its exit code is known without waiting for anything. For a case in
+-- which the helper was expected to confirm the reap; the cases that bound the wait at zero use 'killedAfter'.
 reapedAfter ∷ IORef (Maybe ProcessHandle) → IO ()
 reapedAfter seen =
   readIORef seen >>= \case
     Nothing → expectationFailure "the example never saw the process"
     Just process → do
-      -- A child the helper left running (a leak) is reaped here so it cannot outlive the example, and fails it.
       code ← getProcessExitCode process
       case code of
         Just _ → pure ()
         Nothing → do
+          -- A child the helper left running (a leak) is reaped here so it cannot outlive the example, and fails it.
           void (timeout (10 * 1000000) (waitForProcess process))
           expectationFailure "the helper left the child running"
+
+-- | The process was started, and the helper, which was told not to wait for it, had killed it: the example performs the reap
+-- itself, bounded, and requires the child to have died of SIGKILL (a leaked child would still be sleeping and the bounded
+-- wait would end without a status). Nothing assumes when the kill takes effect.
+killedAfter ∷ IORef (Maybe ProcessHandle) → IO ()
+killedAfter seen =
+  readIORef seen >>= \case
+    Nothing → expectationFailure "the example never saw the process"
+    Just process →
+      timeout (10 * 1000000) (waitForProcess process) >>= \case
+        Just (ExitFailure code) | code == negate (fromIntegral sigKILL) → pure ()
+        other → expectationFailure ("the helper did not kill the child: reaped as " <> show other)
