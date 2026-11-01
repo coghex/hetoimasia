@@ -66,7 +66,6 @@ import System.Timeout (timeout)
 import Control.Monad (forM_, join, unless, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Data.List (partition)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Set (Set)
@@ -78,7 +77,7 @@ import Hetoimasia.Content.ReadPool (ReadPool, poolSpec, withReadPoolUsing)
 import Hetoimasia.Foundation.Log (LogFilter (..), Logger, callbackSink, defaultLogFilter, mkLogger, unsafeComponent)
 import Hetoimasia.Foundation.Time (monotonicSource)
 import Hetoimasia.GLFW.Vulkan (withLoaderIntegration)
-import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), DiagnosticVerdict, VerdictIssue (..), defaultCaptureConfig, verdictIssues)
+import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), DiagnosticVerdict, defaultCaptureConfig, verdictIssues)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( FrameEvent
   , Readiness (..)
@@ -626,29 +625,16 @@ awaitReadiness vulkan = do
     RootsFailed reason → ioError (userError ("the graphics owner did not start: " <> Text.unpack reason))
     _ → pure ()
 
--- | The diagnostic verdict after the owner application's last teardown must exist and be clean of every fatal issue
--- (a validation or driver error, a failed or unproven capture, an untrustworthy consumer or counter). Diagnostics that
--- were only lost are not a fault of the run; they are the case's to report if it wants to.
+-- | The diagnostic verdict after the owner application's last teardown must exist and carry no issue at all: a
+-- validation or driver error, a failed or unproven capture, an untrustworthy consumer or counter, and also dropped,
+-- truncated, undelivered or unaccounted records. The production composition only warns about lost records; this
+-- receipt does not (LFE-25, amendment 6558851696): a run that lost diagnostics is not evidence the layer was heard.
 verdictCleanOrFail ∷ Maybe DiagnosticVerdict → IO ()
 verdictCleanOrFail = \case
   Nothing → ioError (userError "no diagnostic verdict was reached")
   Just verdict → do
-    let (fatal, _lost) = partition fatalIssue (verdictIssues verdict)
-    unless (null fatal) $ ioError (userError ("the diagnostic capture was not clean: " <> show fatal))
-
-fatalIssue ∷ VerdictIssue → Bool
-fatalIssue = \case
-  ErrorLatched → True
-  CaptureFailureLatched → True
-  CaptureFailures _ → True
-  CounterSaturated → True
-  ConsumerUnsuccessful → True
-  QuiescenceUnproven → True
-  StorageRetained → True
-  RecordsDropped _ → False
-  RecordsTruncated _ → False
-  RecordsUndelivered _ → False
-  RecordsUnaccounted _ _ → False
+    let issues = verdictIssues verdict
+    unless (null issues) $ ioError (userError ("the diagnostic capture was not clean: " <> show issues))
 
 quietLogger ∷ Logger
 quietLogger = mkLogger defaultLogFilter {filterEnabled = False} (callbackSink (\_ → pure ()))

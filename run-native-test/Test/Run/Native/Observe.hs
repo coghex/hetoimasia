@@ -23,6 +23,8 @@ module Test.Run.Native.Observe
   , publishedRevisionOf
   , frameMark
   , awaitFrame
+  , freshEvents
+  , attempted
   , demandFrame
   , awaitLiveTextures
   , step
@@ -35,7 +37,7 @@ import qualified Data.Map.Strict as Map
 import Hetoimasia.Foundation.Messaging.Payload (preparedValue)
 import Hetoimasia.Foundation.Messaging.Snapshot (observedValue, readSnapshot)
 import Hetoimasia.GLFW.Command
-  ( Disposition
+  ( Disposition (..)
   , SubmitResult (..)
   , WindowClient
   , awaitCompletion
@@ -187,6 +189,18 @@ awaitFrame peers window revision mark = step ("a frame of revision " <> show rev
   (count, events) ← readTVar (peFrames peers)
   let fresh = take (max 0 (count - mark)) events
   unless (or [attachmentWindow attachment == window && rendered == revision | FramePresentRequested attachment _ _ rendered ← fresh]) retry
+
+-- | The frame events seen after the first @mark@ events, oldest first.
+freshEvents ∷ Peers → Int → IO [FrameEvent]
+freshEvents peers mark = do
+  (count, events) ← atomically (readTVar (peFrames peers))
+  pure (reverse (take (max 0 (count - mark)) events))
+
+-- | Whether a window control's native calls were made (and so what the window reached is for the next observation).
+attempted ∷ Disposition → Bool
+attempted = \case
+  Attempted _ → True
+  _ → False
 
 -- | Ask the window's target for another frame of what it holds.
 demandFrame ∷ Peers → WindowId → IO ()
