@@ -13,8 +13,8 @@ record](macos-owner-confirmations.md)). What each completion condition and slice
 | | |
 | --- | --- |
 | Producer | the group `test.vulkan-run-native`, command `bash tools/vulkan/run.sh native hetoimasia:test:run-native-tests -- --complete`, prepared by `bash tools/vulkan/run.sh build hetoimasia:exe:hetoimasia hetoimasia:test:run-native-tests` (the `Lua native milestone` subgroup is selectable alone with `--match 'Lua native milestone'`) |
-| Receipt | [`receipts/test.vulkan-run-native.json` of the pull request's CI run](https://github.com/coghex/hetoimasia/actions/runs/41340499682/attempts/1), outcome `passed`, 15.553 s of its 30 s budget; 54 examples, 0 failures ([the run's own record](linux/run-native.md)) |
-| Code | pull request head `523e32090d9fddd96ea200911ba3943da282736e`, executed as the merged candidate commit `85021198e4cb4e6f28622472c6164877ef2dff98` (tree `63468feffa58b0b1a227d3ecff4b49f108fc5131`) |
+| Receipt | [`receipts/test.vulkan-run-native.json` of the pull request's CI run](https://github.com/coghex/hetoimasia/actions/runs/41343138137/attempts/1), outcome `passed`, 16.053 s of its 30 s budget; 54 examples, 0 failures ([the run's own record](linux/run-native.md)) |
+| Code | pull request head `8a159fe7b68bc561fe616868dea44fb302fca74e`, executed as the merged candidate commit `6a3963ccde1be4ca7ee6beb0df8b7b1f82428e81` (tree `5a4784e3f1591135103df66fe14505d65d7bc0e2`) |
 | Runner | Linux X64, runner class `display`; CI image `sha256:71ef73f2fd6432b1b70bc96dc0ab7ded728091ad76232309c7e4ec58858603cb` |
 | Display | an isolated Xvfb (1280 x 1024 x 24) with the Openbox window manager that `tools/display/x11.sh` starts for the one command; no compositor; no colour management |
 | Device, loader, layer | software Vulkan `lvp 1.4.318 9d69cae2004b`, loader `1.3.275 e833b010f814`, `VK_LAYER_KHRONOS_validation 1.3.275 1d486283e4ce +synchronization` |
