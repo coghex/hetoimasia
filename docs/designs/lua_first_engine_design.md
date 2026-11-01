@@ -9488,11 +9488,13 @@ replace boundary tests, prove performance or establish confinement.
   the named `Lua native milestone` subgroup of the root `run-native-tests` suite (catalog group `test.vulkan-run-native`, selectable with
   `--match 'Lua native milestone'` and part of `--complete`). A two-instance harness is composed through the public Haskell interfaces over a
   host the suite composes with the validation layer and synchronization validation (one UI VM, two engine-owned instances of the shipped
-  content requesting one PNG path, an independent logical owner; every diagnostic-verdict issue, lost records included, fails). It
+  content requesting one PNG path, an independent logical owner with its own VM and an owned exact-tick pump; every diagnostic-verdict issue, lost
+  records included, fails, on a failing scenario too). It
   establishes independent identities and textures; one instance ended with its accepted scene referencing a released texture, with its texture
   read held at the pool's reader and with its window creation outcome withheld, each with the peer kept live; resize, minimize and restore with
   the metrics actually reported and an unchanged published revision; a genuine platform-delivered user close of either window as one session quit;
-  and a labelled injected clean refusal. The built command runs with `--vulkan-validation` as an owned child: on the isolated X11 display a
+  a labelled injected clean refusal; the initial empty window observed while its read is held and then the quad in the same window; and lifecycle
+  records (texture identities, submission and presentation completion) asserted at each disposal. The built command runs with `--vulkan-validation` as an owned child: on the isolated X11 display a
   genuine `WM_DELETE_WINDOW` to its exact window ends it with exit 0, an ordinary logical failure leaves the UI on the exact red clear until a close
   (exit 1), and a Lua quit exits 0. The Linux windows are captured through the test-only helper `tools/x11-window/x11_window.py` and judged against
   landmarks written from the fixture; the captures, records and checksums are in
