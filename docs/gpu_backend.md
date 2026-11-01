@@ -4254,6 +4254,11 @@ application give each window a scene of its own. It is a generic extension of
 the window host and knows nothing of `render-2d`: what a snapshot references,
 and holding it, are the adapter's that renders it.
 
+A window is one kind of scene target. Since LFE-27 the lifecycle, the barrier and
+the observation are keyed by `SceneTargetKey`, a window or an offscreen target
+registered with the host ([Offscreen scene targets](#offscreen-scene-targets)); a
+host that registers no target behaves exactly as this section describes.
+
 **The mode.** `vulkanSceneMode` chooses, once, how the owner carries the
 scene, and `vulkanScene` is the initial scene either way.
 
@@ -4477,6 +4482,135 @@ failure and after the owner's exit, and wake an idle owner only when one can
 run. The native
 suite's `r2d14-window-scenes` runs the production host over two windows
 ([The native suite](#the-native-suite)).
+
+### Offscreen scene targets
+
+LFE-27 ([#576](https://github.com/coghex/hetoimasia/issues/576); owner decision
+2026-11-01, variant B) gives a scene target that has no window the protection a
+window has. It is the host's, with the host's one ownership policy: a surface-free
+scene target registered with the running host takes part in the same scene
+barrier, ledger identity and adopt/release lifecycle as a window, and no consumer
+needs a second key space or a second lifecycle.
+
+**One key.** The release barrier (`Barrier`), the scene lifecycle
+(`SceneLifecycle`'s `sceneAdopted` and `sceneReleased`), the observation
+(`VulkanSceneState`'s `sceneWindows` and `sceneRequests`) and a consumer's hold
+ledger are keyed by `SceneTargetKey`: `KeyWindow WindowId` or `KeyOffscreen
+OffscreenTargetId`. An offscreen target is never a window, and `WindowId` is
+neither widened nor minted: it stays the session-issued identity of a real window.
+An `OffscreenTargetId` is issued only by the host that registered the target, from
+the host's own identity and a registration incarnation that rises and is never
+reused, and the public interface exports it without its constructors, so a stale
+registration, a foreign host's identity and a forged one are never equal to a live
+one: none can publish to, unregister, or satisfy the barrier of another
+registration. The fields of the observation keep their names (`windowPublished`,
+`windowAdopted`, `windowDeferrals`, `windowAwaitingRelease`); for an offscreen
+target they read the same facts.
+
+**Registration.** `registerVulkanSceneTarget host` is one transaction that never
+waits. It needs no window and opens none. It issues the target's identity, starts
+it at the initial scene's revision 0 and registers it with the scene ledger, and is
+refused with a typed reason (`SceneTargetRefusal`) in this order: the session has
+failed (`TargetSessionFailed`, with its primary), the owner's exit has begun
+(`TargetOwnerClosed`), no device exists yet (`TargetDeviceNotReady` — a host that
+starts its device at the first window has none until one is admitted; a
+`DeviceSurfaceFree` host has one from its startup), or the host already accounts
+for `vulkanTargetCapacity` targets (`TargetCapacityReached`).
+`unregisterVulkanSceneTarget host target` answers whether the target was
+registered. From that transaction nothing can be published to it or recorded
+against it and no release request is held for it; the owner ends it in the ledger
+in its next step.
+
+**Capacity.** The host accounts for at most `vulkanTargetCapacity`
+(`defaultTargetCapacity`, 8) offscreen targets at once, and the count includes a
+target that was unregistered while a record of it is still unreleased, so
+repeated registration cannot grow the retained bookkeeping. It is apart from the
+windows' bound and never reduces it; a capacity of zero refuses every
+registration and leaves the windows as they were.
+
+**Publication.** `publishVulkanTargetScene host target scene` is one transaction
+that never waits for GPU work, adopted capacity or a displayed frame: the scene is
+the target's latest value at the next revision the host holds, replacing a scene
+the owner has not yet taken, in execution order. Because it is a transaction it
+composes with a consumer's own authority checks, so the target's liveness, the
+acceptance and the revision are one fact. A target the host does not hold is
+answered `TargetSceneUnknown`, naming it, and a host whose session has failed or
+whose owner's exit has begun `TargetSceneClosed`; neither changes anything. A
+window's publication is untouched.
+
+**Barrier.** A release request made after the target accepted revision R and
+before the target adopted it waits for R exactly as it waits for a window: its
+barrier names the target at R, it runs once the target has adopted R or a later
+revision, or the target is unregistered, in the same order and under the same
+bounded release queue (`ReleaseQueueFull`), and a host that declared its initial
+scene holds nothing leaves a target at revision 0 out of the barrier. A request
+still queued when the session fails or the owner's exit begins is refused, never
+run. A registered target with a publication and no adoption holds later requests
+until it is resolved, and `readVulkanSceneState` shows it.
+
+**Adoption and release.** The owner's step adopts for every registered target, in
+the same step and before any owner-thread action runs, exactly as for a window:
+the revision is newer than the one the target holds, or the target has adopted
+nothing (the initial scene, as revision 0, in the first step after registration).
+The ledger's record, the lifecycle's `sceneAdopted` with the exact scene, the
+exact scene recorded with the target, and the watermark are one uninterruptible
+transition. A target holds at most `retentionLimit` unreleased revisions (the
+window's limit, derived from the frame-slot budget); at the limit an adoption is
+deferred, noted once for that revision (`windowDeferrals`), the owner asks no
+further round for it until a release makes room, and the publication never waits.
+An adopted revision is released — `sceneReleased`, once, in adoption order — only
+after it is superseded or the target has ended and every batch recorded with it
+has been discarded or has completed *according to that batch's own ticket*.
+
+**The recording boundary.** `recordVulkanTargetBatch host target construction
+consumer`, inside an owner-thread action, records one frame-less batch that reads
+the scene the host adopted for the target: the consumer is handed that exact scene
+and revision. The batch's use of the revision is bound to the batch's own ticket
+in the step that admits the batch, before anything is recorded, so no failure or
+cancellation of the recording can leave a batch that read the scene untracked, and
+a cancellation before the ticket reaches the caller leaves the discarded batch's
+use ended by its discard. A use ends only on its ticket's evidence: complete
+(its submission's fence observed signalled and recorded with the model) or
+discarded. Submission, acceptance, a callback, a timeout, an abandoned wait and the
+scope's exit end nothing; a ticket settled as lost by the device's loss, and one
+still pending, end nothing either, so the use and the revision it names stay on
+the ledger, visible in the observation, and are not released on a guess; the
+consumer cannot discharge a use, several batches of one revision each keep it, and
+another batch's or another target's completion discharges nothing. A call for a
+target the host does not hold, unregistered since the action was admitted
+included, is refused (`TargetBatchUnknown`); one before the owner has adopted
+anything for it `TargetBatchNotAdopted`.
+
+**Teardown.** Unregistering at any point leaves the registration gone and no hold
+stranded without a real completion: before any publication; after acceptance and
+before adoption (the revision is never adopted, and a request held for it runs);
+after adoption with batches in flight (the records stay in the observation, are
+counted against the capacity, and are released as the batches complete); after
+supersession with a pending request. The session's failure, the owner's exit and a
+cancellation by asynchronous exception at each transition leave the same: the
+owner's retirement ends every target in the ledger in one transaction before it
+settles releases, refuses the queued requests, and retains what it could not
+verify. A device lost, or a completion never observed, does not manufacture a
+release and does not require an empty ledger at shutdown.
+
+| State | Owner | Readers and writers | Thread | Lifetime | Reset or disposal |
+| --- | --- | --- | --- | --- | --- |
+| The offscreen target registry: each target's latest scene and revision, the scene the owner adopted, the unregistered targets awaiting the owner | The host (`Internal.Targets`) | Any thread registers, publishes and unregisters; the owner's step records what it adopted and takes the retired | Any, in `STM` | The host's | A target is removed by its unregistration or the owner's retirement; the incarnation counter never resets |
+| The target uses: each batch recorded for a target, with its revision and its own ticket | Rendering (`Internal.Rendering`) | The owner's action opens a use when its batch is admitted; the scene ledger reads; settlement forgets | Owner | A batch's recording until its ticket is complete or discarded | Removed on that evidence; kept, uncertain, otherwise |
+
+The headless examples (`Test.GPU.Vulkan.GLFW.Targets`) cover registration and its
+refusals; the bound on targets; the barrier for an accepted-but-unadopted revision
+and its end by adoption, by unregistration, by the session's failure and by the
+owner's exit; release only on the batch's own ticket, with the completion
+withheld, with one batch of several completed, and with a discarded batch; the
+retention limit and the deferral; teardown after supersession, with batches in
+flight, at a device loss, at the owner's exit and under a cancellation before the
+ticket reached the caller; and a host with a window and a target. The native case
+(`an offscreen scene target on a real device (LFE-27)` in the Lua graphics
+adapter's native suite) holds the owner on a gate, accepts a scene naming a
+texture, releases the texture through the production lane before the owner has
+adopted it, draws and reads back the texture after that release, and frees it only
+after the recording completed, with no window and the diagnostic capture clean.
 
 ### Rendering a frame
 
