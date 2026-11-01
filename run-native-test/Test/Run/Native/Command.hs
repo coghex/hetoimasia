@@ -39,7 +39,18 @@
 --
 -- Created, observed and reaped by "Test.Run.Native.Child", whose module header says what makes each state hold and whose
 -- failure paths "Test.Run.Native.ChildSpec" exercises.
-module Test.Run.Native.Command (spec, executableVariable) where
+module Test.Run.Native.Command
+  ( spec
+  , executableVariable
+    -- * What the milestone's actual-command cases share with the smoke cases
+  , Awaited (..)
+  , waitStderr
+  , reachedBarrier
+  , permittingEnvironment
+  , failWith
+  , barrierSeconds
+  , exitSeconds
+  ) where
 
 import Control.Concurrent.STM (atomically, check, orElse, readTVar, readTVarIO)
 import Control.Monad (forM_, unless)

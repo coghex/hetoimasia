@@ -363,6 +363,7 @@ test-suite run-native-tests
             Test.Run.Native.Command
             Test.Run.Native.Consent
             Test.Run.Native.Env
+            Test.Run.Native.Actual
             Test.Run.Native.Capture
             Test.Run.Native.Checkpoint
             Test.Run.Native.Json

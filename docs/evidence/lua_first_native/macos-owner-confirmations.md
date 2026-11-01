@@ -41,4 +41,4 @@ owning process id and the native window identity, the metrics actually reported,
   reported with zero area); the controlled zero-metrics coverage belongs to its owning prerequisites and is not claimed as native.
 * A restored window is not drawn again on macOS until something samples it again: the callback-driven observation can
   keep reporting `visible=False` after the restore. The harness takes the public explicit sample and records both
-  readings. This is a defect of the observation owner, filed separately; an unprompted restore does not resume drawing on macOS.
+  readings. This is a defect of the observation owner, filed as [#581](https://github.com/coghex/hetoimasia/issues/581); an unprompted restore does not resume drawing on macOS.

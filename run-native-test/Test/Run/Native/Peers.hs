@@ -45,6 +45,8 @@ module Test.Run.Native.Peers
   , withholdNextCreations
   , releaseCreations
   , creationsWithheld
+  , refuseNextStandings
+  , instanceFailureText
   , verdictCleanOrFail
   ) where
 
@@ -110,7 +112,7 @@ import Hetoimasia.LuaEngine.Graphics.Texture
   )
 import Hetoimasia.LuaEngine.Graphics.Window.Configuration (configureWindows, windowSlots)
 import Hetoimasia.LuaEngine.Graphics.Window.Host (PortReading, newHostPort)
-import Hetoimasia.LuaEngine.Graphics.Window.Port (CreateIssue (..), CreateToken, Fatal, Port (..))
+import Hetoimasia.LuaEngine.Graphics.Window.Port (CreateIssue (..), CreateOutcome (..), CreateToken, Fatal, Port (..), Standing (..), WindowToken)
 import Hetoimasia.LuaEngine.Graphics.Window.Provider (WindowConfig (..), windowMainStep, withWindowProvider)
 import Hetoimasia.LuaEngine.Manifest (Role (Presentation))
 import Hetoimasia.LuaEngine.Modules
@@ -284,7 +286,7 @@ compose lifetime folder graphics vulkan frames jobs providerStep scenario = do
   fatals ← newTVarIO []
   quits ← newTVarIO 0
   out ← newTVarIO []
-  creationHold ← newTVarIO (CreationHold 0 Set.empty)
+  creationHold ← newTVarIO noHold
   toHold ← newTVarIO Map.empty
   heldNow ← newTVarIO []
   entered ← newTVarIO []
@@ -362,7 +364,7 @@ compose lifetime folder graphics vulkan frames jobs providerStep scenario = do
                     )
                     -- However the scenario ended, every gate it closed is opened first: a held read or a withheld
                     -- creation is a handoff the unwinding below waits for.
-                    `finally` ( atomically (writeTVar creationHold (CreationHold 0 Set.empty) >> writeTVar toHold Map.empty >> writeTVar heldNow [])
+                    `finally` ( atomically (writeTVar creationHold noHold >> writeTVar toHold Map.empty >> writeTVar heldNow [])
                                   `finally` writeIORef providerStep (pure ())
                               )
   case prepared' of
@@ -374,7 +376,13 @@ compose lifetime folder graphics vulkan frames jobs providerStep scenario = do
 data CreationHold = CreationHold
   { holdRemaining ∷ !Int
   , holdTokens ∷ !(Set CreateToken)
+  , holdRefuse ∷ !Int
+  -- ^ How many of the next created windows have their standing refused (an injected clean refusal).
+  , holdRefused ∷ !(Set WindowToken)
   }
+
+noHold ∷ CreationHold
+noHold = CreationHold 0 Set.empty 0 Set.empty
 
 -- | Withhold the outcomes of the next @n@ window creations from the provider until 'releaseCreations'. The native
 -- windows are still created by the host (so they exist and are tracked); only the provider's collection of the
@@ -384,7 +392,15 @@ withholdNextCreations peers n = atomically (modifyTVar' (peCreationHold peers) (
 
 -- | Let every withheld creation outcome through, and withhold no more.
 releaseCreations ∷ Peers → IO ()
-releaseCreations peers = atomically (writeTVar (peCreationHold peers) (CreationHold 0 Set.empty))
+releaseCreations peers = atomically (modifyTVar' (peCreationHold peers) (\held → held {holdRemaining = 0, holdTokens = Set.empty}))
+
+-- | INJECTED: have the production port answer the graphics owner's standing of each of the next @n@ created windows as a
+-- clean, verified refusal (the owner's own rollback evidence, which is what a @window_error@ is), instead of the
+-- owner's real answer. The window the host really created is then closed and destroyed by the provider's ordinary
+-- retirement, which is the cleanup this injection exists to exercise; no real refusal is claimed, and the exit status of
+-- a session that meets one is the owning tests' (the session's failure policy), not observable here.
+refuseNextStandings ∷ Peers → Int → IO ()
+refuseNextStandings peers n = atomically (modifyTVar' (peCreationHold peers) (\held → held {holdRefuse = holdRefuse held + n}))
 
 -- | How many creation outcomes are withheld now.
 creationsWithheld ∷ Peers → STM Int
@@ -405,7 +421,20 @@ gateCreation port hold =
         pure issued
     , portCreateOutcome = \token → do
         held ← readTVar hold
-        if token `Set.member` holdTokens held then pure Nothing else portCreateOutcome port token
+        if token `Set.member` holdTokens held
+          then pure Nothing
+          else do
+            outcome ← portCreateOutcome port token
+            case outcome of
+              Just (Created window) | holdRefuse held > 0 →
+                writeTVar hold held {holdRefuse = holdRefuse held - 1, holdRefused = Set.insert window (holdRefused held)}
+              _ → pure ()
+            pure outcome
+    , portStanding = \window → do
+        held ← readTVar hold
+        if window `Set.member` holdRefused held
+          then pure (StandingRefusedClean "injected clean refusal (LFE-25 native milestone)")
+          else portStanding port window
     }
 
 -- | Hold the next @n@ reads of this path at the pool's reader (a held read starts and waits there).
@@ -583,6 +612,13 @@ instanceStoppedCleanly found =
 -- free for the next declaration.
 forgetEnded ∷ Peers → Spawned → IO ()
 forgetEnded peers found = forgetInstance (peFacade peers) (spIdentity found)
+
+-- | How the instance failed, as text, when it did; 'Nothing' when it did not fail.
+instanceFailureText ∷ Spawned → IO (Maybe String)
+instanceFailureText found =
+  waitInstance (spTicket found) >>= \settlement → pure $ case resultOutcome settlement of
+    InstanceFailed failure → Just (show (failureError failure))
+    _ → Nothing
 
 -- | The phase the instance is in now, or 'Nothing' once it is no longer inspectable.
 instancePhaseOf ∷ Peers → Spawned → STM (Maybe InstancePhase)

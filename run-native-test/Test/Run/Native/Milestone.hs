@@ -231,7 +231,7 @@ spec env = describe "Lua native milestone" $ do
             <> show iconified
             <> "; restored: the callbacks reported "
             <> show reported
-            <> (if metricsVisible reported == Just False then " (visible still False: the callback-driven observation was stale and the window stayed ineligible to draw until the explicit sample; reported to the manager as a finding)" else "")
+            <> (if metricsVisible reported == Just False then " (visible still False: the callback-driven observation was stale and the window stayed ineligible to draw until the explicit sample; filed as issue #581)" else "")
             <> ", the explicit sample "
             <> show back
             <> "; native zero-area framebuffer "
@@ -253,6 +253,33 @@ spec env = describe "Lua native milestone" $ do
         Left (HUnitFailure _ reason) → show reason `shouldSatisfy` isInfixOf "the scenario failed on purpose"
         Right () → expectationFailure "the scenario's failure was swallowed"
       evidence env "unwinding control: a scenario that failed while a read was held at the pool's reader, a window creation was withheld and a native window was live raised its own failure after the gates were released and the instance, window and texture were retired within the bound"
+
+
+  it "answers an INJECTED clean refusal of one window's standing as that instance's required window failure, retires the window the host really made and the instance's texture, and leaves the live peer unaffected" $
+    withinCase env 120 . withOwnedContent $ \folder →
+      withPeers (envStart env) folder $ \peers → do
+        -- The peer is fully live first, so what happens to the refused instance can only be seen not to reach it.
+        b ← admitUi peers
+        windowB ← awaitNewWindow peers []
+        awaitAdopted peers windowB 1
+        refuseNextStandings peers 1
+        a ← admitUi peers
+        windowA ← awaitNewWindow peers [windowB]
+        failure ← instanceFailureText a
+        failure `shouldSatisfy` maybe False (isInfixOf "window_error")
+        -- The real native window the host made for A is closed and destroyed; A's texture request is retired with it.
+        awaitWindowCount peers 1
+        windowsNow peers >>= (`shouldBe` [windowB])
+        awaitLiveTextures peers 1
+        mark ← frameMark peers
+        demandFrame peers windowB
+        awaitFrame peers windowB 1 mark
+        atomically (readTVar (peStops peers)) >>= (`shouldBe` 0)
+        readTVarIO (peFatals peers) >>= (`shouldBe` [])
+        stopUi peers b
+        awaitWindowCount peers 0
+        awaitLiveTextures peers 0
+        evidence env (Text.pack ("INJECTED clean refusal: the production port answered window " <> show windowA <> "'s standing as a clean refusal (a window_error, a required failure); instance " <> show (spIdentity a) <> " failed with " <> show failure <> ", its real window was destroyed and its texture retired; the live peer " <> show (spIdentity b) <> " (window " <> show windowB <> ") kept its window and texture and no session stop was requested. The exit status 1 of a session that meets this is the owning tests' (LFE-23 'Integrated endings', the session's failure policy), not claimed here"))
 
   forM_ [("the first", 0 ∷ Int), ("the second", 1)] $ \(which, index) →
     it ("routes a user close of " <> which <> " live window to one whole-session quit request, which retires both instances and windows, unlike ending one instance") $
