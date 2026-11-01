@@ -46,6 +46,8 @@ extra-source-files:
     tools/docs_land.sh
     tools/display/wayland.sh
     tools/display/x11.sh
+    tools/display/x11_window.py
+    tools/display/x11_window_test.py
     tools/toolchain/binding.pin
     tools/toolchain/capture-build.sh
     tools/toolchain/qualify-binding.sh
@@ -213,6 +215,7 @@ test-suite workflow-tests
         TimingStep
         Validation
         VulkanProof
+        X11Window
     build-depends:
         base >=4.22 && <4.23,
         directory >=1.3 && <1.4,
