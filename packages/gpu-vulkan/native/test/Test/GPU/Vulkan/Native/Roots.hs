@@ -192,8 +192,7 @@ spec = describe "Roots" $ do
       (standIn, roots) ← fresh
       script standIn AtCreateInstance Fails
       published ← newIORef []
-      outcome ← try @SomeException (startRootsResolving roots standardRequest ValidationOn (\resolution → modifyIORef' published (resolution :)))
-      outcome `shouldSatisfy` either (isJust . fromException @StandInFailure) (const False)
+      raised @StandInFailure (startRootsResolving roots standardRequest ValidationOn (\resolution → modifyIORef' published (resolution :))) `shouldReturn` True
       readIORef published `shouldReturn` [enabled]
       plans ← plansCreated standIn
       map planLayers plans `shouldBe` [[khronos]]

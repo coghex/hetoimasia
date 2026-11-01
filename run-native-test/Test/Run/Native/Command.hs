@@ -42,8 +42,9 @@ module Test.Run.Native.Command (spec, executableVariable) where
 
 import Control.Concurrent (forkIOWithUnmask)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, writeTVar)
-import Control.Exception (IOException, SomeException, finally, mask, onException, throwIO, try)
+import Control.Exception (ExceptionWithContext, IOException, SomeException, finally, mask, onException, rethrowIO, throwIO, try, tryWithContext)
 import Control.Monad (forM_, unless, void)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (isPrefixOf)
 import Data.Maybe (isJust)
 import qualified Data.Text as Text
@@ -66,6 +67,7 @@ import System.Process
 import qualified System.Process as Process (CreateProcess (env))
 import System.Timeout (timeout)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
+import Hetoimasia.Run.Settle (combine, rememberingInterruption)
 import Test.Run.Native.Env (Env, evidence)
 import Test.Run.Native.Library (copyTree, shippedContent)
 
@@ -92,20 +94,20 @@ commandCase env variant = do
     copyTree shippedContent folder
     let arguments = ["run"] <> ["--vulkan-validation" | variant == Requested] <> [folder]
     withChild executable arguments environment $ \child → do
-      barrier ← waitStderr child (30 * 1000000) reachedBarrier
+      barrier ← waitStderr child barrierSeconds reachedBarrier
       case barrier of
         Barrier → pure ()
         BarrierEnded → failWith child "the command's stderr ended before the validation record and the session's start gate were both logged"
-        BarrierTimedOut → failWith child "the validation record and the session's start gate were not both logged within 30 seconds"
+        BarrierTimedOut → failWith child ("the validation record and the session's start gate were not both logged within " <> show (barrierSeconds `div` 1000000) <> " seconds")
       -- The barrier holds, so the session is running and the one signal is decided; it is issued once, to a child that
       -- must still be there.
       pid ← getPid (childProcess child)
       case pid of
         Nothing → failWith child "the command had already exited when the one SIGTERM was due"
         Just target → signalProcess sigTERM target
-      code ← timeout (25 * 1000000) (waitForProcess (childProcess child))
+      code ← timeout (exitSeconds * 1000000) (waitForProcess (childProcess child))
       case code of
-        Nothing → failWith child "the command did not leave within 25 seconds of one SIGTERM; it was killed, which is a failure and not an exit 130"
+        Nothing → failWith child ("the command did not leave within " <> show exitSeconds <> " seconds of one SIGTERM; it was killed, which is a failure and not an exit 130")
         Just status → status `shouldBe` ExitFailure 130
       drained ← timeout (10 * 1000000) (atomically (readTVar (childOutEnded child) >>= check >> readTVar (childErrEnded child) >>= check))
       drained `shouldSatisfy` isJust
@@ -158,6 +160,14 @@ commandCase env variant = do
              )
           <> "; a launch and lifetime smoke check, not proof of displayed output"
 
+-- | How long the child may take to log the barrier (microseconds), and to leave after the one SIGTERM (seconds). Bounded, never
+-- slept; the group's watchdog is the outer limit.
+barrierSeconds ∷ Int
+barrierSeconds = 30 * 1000000
+
+exitSeconds ∷ Int
+exitSeconds = 25
+
 -- | The child's environment with the logging variables removed, so its logging is the defaults (Info for every
 -- component, no overrides) whatever the runner's own environment says. Nothing else is changed: the loader environment
 -- the runner established is the child's too.
@@ -202,16 +212,21 @@ data Child = Child
 -- | Start the child, run the body, and on every way out kill it if it has not exited, reap it and wait for its readers,
 -- each within a bound. The body's own failure, an assertion included, is raised as it is; a child that cannot be confirmed
 -- reaped and drained fails an otherwise passing case.
+--
+-- The whole of it after the body runs masked: the body's failure is captured, the child is released, and only then is
+-- anything raised. A cancellation that arrives in the release's bounded waits is remembered across the whole release
+-- and raised after it, with the body's failure retained beside it, so a child is never abandoned half-released.
 withChild ∷ FilePath → [String] → [(String, String)] → (Child → IO a) → IO a
 withChild executable arguments environment body = mask $ \restore → do
   child ← start executable arguments environment
-  outcome ← try @SomeException (restore (body child))
-  problems ← release child
-  case outcome of
-    Left failure → do
-      forM_ problems $ \problem → hPutStrLn stderr ("run-native-tests: the command's cleanup was not confirmed: " <> problem)
-      throwIO failure
-    Right result → do
+  outcome ← tryWithContext @SomeException (restore (body child))
+  (problems, interruption) ← release child
+  forM_ problems $ \problem → hPutStrLn stderr ("run-native-tests: the command's cleanup was not confirmed: " <> problem)
+  case (interruption, outcome) of
+    (Just interrupted, Left failure) → rethrowIO =<< combine interrupted [("the failure of what was being run", failure)]
+    (Just interrupted, Right _) → rethrowIO interrupted
+    (Nothing, Left failure) → rethrowIO failure
+    (Nothing, Right result) → do
       unless (null problems) $ expectationFailure ("the command's cleanup was not confirmed: " <> unwords problems)
       pure result
 
@@ -257,8 +272,9 @@ reader name handle ref ended failures =
 closeQuietly ∷ Handle → IO ()
 closeQuietly handle = void (try @IOException (hClose handle))
 
--- | Kill the child if it has not exited, reap it and wait for both readers, each bounded; answer what could not be confirmed.
-release ∷ Child → IO [String]
+-- | Kill the child if it has not exited, reap it and wait for both readers, each bounded; answer what could not be
+-- confirmed, and the first cancellation that interrupted the waits (they are run again until they complete).
+release ∷ Child → IO ([String], Maybe (ExceptionWithContext SomeException))
 release child = do
   exited ← getProcessExitCode (childProcess child)
   case exited of
@@ -267,6 +283,13 @@ release child = do
       target ← getPid (childProcess child)
       -- The child may leave between the check and the kill; the reap below is the authority, so a failed kill is no verdict.
       forM_ target $ \pid → try @IOException (signalProcess sigKILL pid)
-  reaped ← timeout (10 * 1000000) (waitForProcess (childProcess child))
-  drained ← timeout (10 * 1000000) (atomically (readTVar (childOutEnded child) >>= check >> readTVar (childErrEnded child) >>= check))
-  pure (["the child was not reaped within 10 seconds of the kill" | reaped == Nothing] <> ["the child's pipes did not end within 10 seconds" | drained == Nothing])
+  reaped ← newIORef False
+  drained ← newIORef False
+  interruption ← rememberingInterruption $ do
+    reapedNow ← timeout (10 * 1000000) (waitForProcess (childProcess child))
+    writeIORef reaped (isJust reapedNow)
+    drainedNow ← timeout (10 * 1000000) (atomically (readTVar (childOutEnded child) >>= check >> readTVar (childErrEnded child) >>= check))
+    writeIORef drained (isJust drainedNow)
+  wasReaped ← readIORef reaped
+  wasDrained ← readIORef drained
+  pure (["the child was not reaped within 10 seconds of the kill" | not wasReaped] <> ["the child's pipes did not end within 10 seconds" | not wasDrained], interruption)
