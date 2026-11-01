@@ -51,7 +51,7 @@ import Data.Map.Strict (Map)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
-import Hetoimasia.Content (defaultContentLimits, withContentRoot)
+import Hetoimasia.Content (ContentRoot, defaultContentLimits, withContentRoot)
 import Hetoimasia.Content.Inventory
   ( Inventory
   , InventorySpec (..)
@@ -109,6 +109,8 @@ type Files = [(FilePath, ByteString)]
 -- | Everything an example shares.
 data Composition = Composition
   { cpTree ∷ !FilePath
+  , cpRoot ∷ !ContentRoot
+  -- ^ The opened content root the inventory was scanned from: the boot checkpoint reads through it, verified.
   , cpInventory ∷ !Inventory
   , cpPool ∷ !ReadPool
   , cpPipeline ∷ !TexturePipeline
@@ -165,7 +167,7 @@ withComposition profile files backend body =
               `finally` atomically (modifyTVar' finished (<> [logicalPathBytes (contentKeyPath key)]))
       withReadPoolUsing pool gated $ \readPool →
         withTexturePipeline spec backend readPool inventory $ \pipeline → do
-          composition ← Composition tree inventory readPool pipeline <$> newTVarIO [] <*> newIORef Map.empty <*> newIORef Map.empty <*> pure entered <*> pure finished <*> pure held
+          composition ← Composition tree root inventory readPool pipeline <$> newTVarIO [] <*> newIORef Map.empty <*> newIORef Map.empty <*> pure entered <*> pure finished <*> pure held
           withLoggingLifetime quietLogger $ \lifetime →
             withSupervision lifetime $ \control → do
               runtime ← newLuaRuntime control
