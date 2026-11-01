@@ -12,12 +12,18 @@
 -- = What the validated case proves, and what it does not
 --
 -- The record the command logs says what the instance's create info was /asked for/: the Khronos layer and
--- synchronization validation are @enabled@. Together with a clean diagnostic verdict through teardown (an error-severity
--- validation report latches and fails the run, which then leaves with 1 and not 130, and writes an @ERROR@ entry), that
--- is the whole claim: /enabled and clean/. It is not proof that the loader kept the layer in its chain or that it ran
--- (@docs/vulkan_compatibility_record.md@, "Zero validation errors is a claim about coverage"): a stronger attestation
--- through the command's public interfaces does not exist (see @docs/run_command.md@, "Validation"). The deliberate
--- hazard that shows the layer active is @synchronization-hazard@ in @vulkan-native-tests@, in-process.
+-- synchronization validation are @enabled@. That alone is not proof that the loader kept the layer in its chain
+-- (@docs/vulkan_compatibility_record.md@, "Zero validation errors is a claim about coverage"), so the validated case
+-- also requires the layer's own announcement. The child runs with @HETOIMASIA_DEBUG=gpu.vulkan.diagnostics@, the
+-- documented logging selection (@docs/logging.md@), which lets the diagnostic capture's Debug entries reach stderr; the
+-- Khronos layer, once it is running in the instance's chain, reports to the capture's messenger at @vkCreateInstance@
+-- "Khronos Validation Layer Active" with the features it was enabled with. That record is the layer speaking, not the
+-- command's, so it shows the layer was loaded and ran and that synchronization validation was enabled in it; it needs
+-- no hook, only the command's own stderr. The not-requested case must not carry it.
+--
+-- Beyond that, a clean diagnostic verdict through teardown is the rest of the claim: an error-severity validation
+-- report latches and fails the run, which then leaves with 1 and not 130 and writes an @ERROR@ entry. A deliberate
+-- hazard that shows the layer catching something is @synchronization-hazard@ in @vulkan-native-tests@, in-process.
 --
 -- = The barrier
 --
@@ -119,6 +125,8 @@ commandCase env variant = do
           explain = "the child's stderr was:\n" <> Text.unpack joined
           require what condition = unless condition (expectationFailure (what <> "\n" <> explain))
           record = [line | line ← diagnostics, "msg=\"vulkan validation resolved\"" `Text.isInfixOf` line]
+          -- The layer's own announcement, made to the diagnostic capture at vkCreateInstance and logged by it.
+          announced = [line | line ← diagnostics, "gpu.vulkan.diagnostics" `Text.isInfixOf` line, "Khronos Validation Layer Active" `Text.isInfixOf` line]
           dropped = [line | line ← diagnostics, "msg=\"vulkan validation item dropped\"" `Text.isInfixOf` line]
           field name value line = (name <> "=" <> value) `elem` Text.words line
       -- No error entry whatever the stage, and nothing of a failed run, of a failed cleanup or of an unclean diagnostic
@@ -138,9 +146,12 @@ commandCase env variant = do
         NotRequested → do
           require "validation was not requested, and the record does not say so" (field "requested" "false" line && field "layer" "not-requested" line && field "feature" "not-requested" line)
           require "validation was not requested, and an item was dropped" (null dropped)
+          require "validation was not requested, and the Khronos layer announced itself" (null announced)
         Requested → do
           require "the layer and synchronization validation were requested, and the record does not say both were enabled (a layer missing from the provisioned prefix fails the case)" (field "requested" "true" line && field "layer" "enabled" line && field "feature" "enabled" line)
           require "validation was requested and enabled, and an item was dropped" (null dropped)
+          require "the layer did not announce itself exactly once to the diagnostic capture (the command's stderr carries no `Khronos Validation Layer Active` record): the loader did not keep it in the chain, or the Debug entries did not reach stderr" (length announced == 1)
+          require "the layer announced itself without synchronization validation among its enables" (all ("VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT" `Text.isInfixOf`) announced)
       let at needle = [index | (index, text) ← zip [0 ∷ Int ..] diagnostics, needle `Text.isInfixOf` text]
       require "the validation record was not logged after the content root resolved and before the session's start gate" $
         case (at "content root resolved", at "msg=\"vulkan validation resolved\"", at "start gate opened") of
@@ -156,7 +167,7 @@ commandCase env variant = do
           <> ">, exactly one SIGTERM sent to the child after the resolved-root diagnostic, the validation record and the session's start gate, exit 130, no error entry; the session ended with failures=0 verdict=VerdictInterrupted; "
           <> ( case variant of
                  NotRequested → "validation was recorded as not requested (requested=false layer=not-requested feature=not-requested) and nothing was dropped"
-                 Requested → "validation was recorded as requested and enabled (requested=true layer=enabled feature=enabled: selected into the instance's create info, not proof the loader kept the layer in its chain) and nothing was dropped, with a clean diagnostic verdict through teardown"
+                 Requested → "validation was recorded as requested and enabled (requested=true layer=enabled feature=enabled: selected into the instance's create info) and nothing was dropped; the Khronos layer announced itself once to the diagnostic capture with synchronization validation among its enables (it was loaded and ran), with a clean diagnostic verdict through teardown"
              )
           <> "; a launch and lifetime smoke check, not proof of displayed output"
 
@@ -168,11 +179,12 @@ barrierSeconds = 30 * 1000000
 exitSeconds ∷ Int
 exitSeconds = 25
 
--- | The child's environment with the logging variables removed, so its logging is the defaults (Info for every
--- component, no overrides) whatever the runner's own environment says. Nothing else is changed: the loader environment
--- the runner established is the child's too.
+-- | The child's environment with the logging variables replaced, so its logging is the defaults (Info for every
+-- component, no overrides) whatever the runner's own environment says, plus the Debug entries of the diagnostic capture
+-- alone (the selection that carries the layer's own announcement). Nothing else is changed: the loader environment the
+-- runner established is the child's too.
 permittingEnvironment ∷ IO [(String, String)]
-permittingEnvironment = filter (not . logging . fst) <$> getEnvironment
+permittingEnvironment = (<> [("HETOIMASIA_DEBUG", "gpu.vulkan.diagnostics")]) . filter (not . logging . fst) <$> getEnvironment
   where
     logging name = "HETOIMASIA_LOG_" `isPrefixOf` name || name == "HETOIMASIA_DEBUG"
 
