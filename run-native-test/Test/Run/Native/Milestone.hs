@@ -39,7 +39,6 @@ import Test.Run.Native.Capture (Bound (..), bindNew, ownPid, snap, viewableNow)
 import qualified Test.Run.Native.X11 as X11
 import Test.Run.Native.Checkpoint (checkpoint)
 import Test.Run.Native.Observe
-import Hetoimasia.GLFW.Command (Disposition (Performed), observeWindowCommand)
 import Test.Run.Native.Peers
 
 spec ∷ Env → Spec
@@ -237,13 +236,11 @@ spec env = describe "Lua native milestone" $ do
           _ → pure False
         restored ← requestRestore peers windowA
         attempted restored `shouldBe` True
-        -- What the platform's own callbacks reported once the restore took effect, before anything samples again.
+        -- What the platform's own callbacks reported once the restore took effect. A restored window could once stay
+        -- ineligible to draw until something sampled it again (#581); that is fixed, so nothing here samples it: it must
+        -- report itself drawable by itself, and that is the regression check.
         reported ← awaitMetrics peers windowA "the restore to be reported" (\m → metricsIconified m == Just False)
-        -- Eligibility to draw is the observation exactly (docs/glfw.md), so the case does not assume the callback's
-        -- reading is the window's state: it takes the public explicit sample and requires that one to be drawable.
-        sampled ← controlWindow peers windowA (observeWindowCommand windowA)
-        (case sampled of Performed _ → True; _ → False) `shouldBe` True
-        back ← awaitMetrics peers windowA "a drawable sample after the restore" (\m → metricsRevision m > metricsRevision reported && metricsIconified m == Just False && metricsVisible m /= Just False && maybe True (\(w, h) → w * h > 0) (metricsFramebuffer m))
+        back ← awaitMetrics peers windowA "the restored window to report itself drawable without a further sample" (\m → metricsIconified m == Just False && metricsVisible m /= Just False && maybe True (\(w, h) → w * h > 0) (metricsFramebuffer m))
         renders "restored"
         snap env peers "view--restored" boundA
         checkpoint env "restore" "the owner confirms the restored window shows the quad again" =<< factsFor peers [("subject", windowA)]
@@ -269,8 +266,8 @@ spec env = describe "Lua native milestone" $ do
             <> show iconified
             <> "; restored: the callbacks reported "
             <> show reported
-            <> (if metricsVisible reported == Just False then " (visible still False: the callback-driven observation was stale and the window stayed ineligible to draw until the explicit sample; filed as issue #581)" else "")
-            <> ", the explicit sample "
+            <> (if metricsVisible reported == Just False then " (visible still False at that moment: the stale reading #581 fixed, and the window recovered by itself)" else " (drawable at once)")
+            <> ", then, with no further sample, "
             <> show back
             <> "; native zero-area framebuffer "
             <> (if zeroNative then "OBSERVED: drawing was suspended and resumed after restore" else "UNEXERCISED on this platform (the framebuffer was never reported with zero area): the controlled zero-metrics coverage is the owning prerequisites' (LFE-18, LFE-20 and the host's suspended-target cases), not claimed as native")

@@ -39,6 +39,7 @@ owning process id and the native window identity, the metrics actually reported,
 
 * The native zero-area framebuffer row is **unexercised** on macOS (the framebuffer of a minimized window was never
   reported with zero area); the controlled zero-metrics coverage belongs to its owning prerequisites and is not claimed as native.
-* A restored window is not drawn again on macOS until something samples it again: the callback-driven observation can
-  keep reporting `visible=False` after the restore. The harness takes the public explicit sample and records both
-  readings. This is a defect of the observation owner, filed as [#581](https://github.com/coghex/hetoimasia/issues/581); an unprompted restore does not resume drawing on macOS.
+* A restored window used to stay ineligible to draw on macOS until something sampled it again
+  ([#581](https://github.com/coghex/hetoimasia/issues/581), fixed in `bb163cfa`). The restore case now takes no explicit
+  sample and requires the restored window to report itself drawable by itself; the earlier explicit-sample readings (revision 8
+  `visible=False`, revision 9 `visible=True` after a sample) are history, kept in the receipts' evidence of that earlier head.
