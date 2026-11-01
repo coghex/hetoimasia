@@ -34,7 +34,8 @@ import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldNotBe
 import Test.Run.Native.Env (Env (..), evidence)
 import Test.Run.Native.Library (copyTree, shippedContent)
 import Hetoimasia.GLFW.Window (WindowId)
-import Test.Run.Native.Capture (Bound (..), bindNew, snap, viewableNow)
+import Test.Run.Native.Capture (Bound (..), bindNew, ownPid, snap, viewableNow)
+import qualified Test.Run.Native.X11 as X11
 import Test.Run.Native.Checkpoint (checkpoint)
 import Test.Run.Native.Observe
 import Hetoimasia.GLFW.Command (Disposition (Performed), observeWindowCommand)
@@ -42,6 +43,17 @@ import Test.Run.Native.Peers
 
 spec ∷ Env → Spec
 spec env = describe "Lua native milestone" $ do
+  it "has the isolated-X11 evidence helper ready and seeing the display before any window exists (Linux), and says so elsewhere" $
+    case envX11 env of
+      Nothing → evidence env "X11 evidence helper: not applicable in this session (macOS has no OS capture; the owner's confirmations are pending); no isolated-X11 consent"
+      Just helper → do
+        pid ← ownPid
+        note ("preflight: the helper looks for windows of pid " <> show pid)
+        X11.prepare helper
+        none ← X11.candidates helper pid
+        note ("preflight: the helper answered " <> show (length none) <> " windows")
+        none `shouldBe` []
+        evidence env "X11 evidence helper: libX11 and every entry point loaded, the display is the isolated one, and the suite's process owned no window before the first case"
   it "loads the same PNG for two instances independently, ends one while its accepted scene still holds its released texture, and keeps the other updating with its texture and window" $
     withinCase env 120 . withOwnedContent $ \folder →
       withPeers (envStart env) folder $ \peers → do
@@ -76,6 +88,8 @@ spec env = describe "Lua native milestone" $ do
         stopUi peers b
         awaitWindowCount peers 0
         awaitLiveTextures peers 0
+        -- Every cleanup close has happened by now: none of them was a user close.
+        atomically (readTVar (peStops peers)) >>= (`shouldBe` 0)
         reading ← atomically (graphicsReading (peGraphics peers))
         readingLiveTextures reading `shouldBe` 0
         evidence env (Text.pack ("two instances: instances " <> show (spIdentity a, spIdentity b) <> ", windows " <> show (windowA, windowB) <> "; ended A with B live; no user close; validation layer and synchronization validation enabled on this host"))
@@ -118,6 +132,8 @@ spec env = describe "Lua native milestone" $ do
         mapM_ (stopUi peers) [b, c]
         awaitWindowCount peers 0
         awaitLiveTextures peers 0
+        -- Every cleanup close has happened by now: none of them was a user close.
+        atomically (readTVar (peStops peers)) >>= (`shouldBe` 0)
         evidence env (Text.pack ("pending read: A=" <> show (spIdentity a) <> " ended with its read held (Stopping), B=" <> show (spIdentity b) <> " kept updating, A settled Stopped only after the read was released, no user close, C=" <> show (spIdentity c) <> " then loaded the same path; windows " <> show (windowA, windowB, windowC)))
 
   it "ends one instance while its window creation outcome is withheld from the provider: the host's window stays tracked until the late result is closed and destroyed, the peer is unaffected and no orphan window or texture remains" $
@@ -151,6 +167,8 @@ spec env = describe "Lua native milestone" $ do
         stopUi peers b
         awaitWindowCount peers 0
         awaitLiveTextures peers 0
+        -- Every cleanup close has happened by now: none of them was a user close.
+        atomically (readTVar (peStops peers)) >>= (`shouldBe` 0)
         evidence env (Text.pack ("pending window: A=" <> show (spIdentity a) <> " ended while its creation outcome (window " <> show windowA <> ") was withheld; it stayed tracked until the outcome was released and then retired, B=" <> show (spIdentity b) <> " (window " <> show windowB <> ") unaffected, no user close"))
 
 
@@ -218,6 +236,8 @@ spec env = describe "Lua native milestone" $ do
         mapM_ (stopUi peers) [a, b]
         awaitWindowCount peers 0
         awaitLiveTextures peers 0
+        -- Every cleanup close has happened by now: none of them was a user close.
+        atomically (readTVar (peStops peers)) >>= (`shouldBe` 0)
         evidence env . Text.pack $
           "view adaptation (window "
             <> show windowA
@@ -279,6 +299,8 @@ spec env = describe "Lua native milestone" $ do
         stopUi peers b
         awaitWindowCount peers 0
         awaitLiveTextures peers 0
+        -- Every cleanup close has happened by now: none of them was a user close.
+        atomically (readTVar (peStops peers)) >>= (`shouldBe` 0)
         evidence env (Text.pack ("INJECTED clean refusal: the production port answered window " <> show windowA <> "'s standing as a clean refusal (a window_error, a required failure); instance " <> show (spIdentity a) <> " failed with " <> show failure <> ", its real window was destroyed and its texture retired; the live peer " <> show (spIdentity b) <> " (window " <> show windowB <> ") kept its window and texture and no session stop was requested. The exit status 1 of a session that meets this is the owning tests' (LFE-23 'Integrated endings', the session's failure policy), not claimed here"))
 
   forM_ [("the first", 0 ∷ Int), ("the second", 1)] $ \(which, index) →
@@ -323,15 +345,20 @@ factsFor peers named = do
 -- it). The gate is released before the cases go on.
 startTwo ∷ Env → Peers → IO (Spawned, WindowId, Maybe Bound, Spawned, WindowId, Maybe Bound)
 startTwo env peers = do
+  note "startTwo: withholding two creations"
   withholdNextCreations peers 2
   known0 ← viewableNow env
+  note ("startTwo: admitting A; X windows known: " <> show known0)
   a ← admitUi peers
   windowA ← awaitNewWindow peers []
+  note ("startTwo: host window for A: " <> show windowA)
   boundA ← bindNew env peers windowA known0
   b ← admitUi peers
   windowB ← awaitNewWindow peers [windowA]
+  note ("startTwo: host window for B: " <> show windowB)
   boundB ← bindNew env peers windowB (known0 <> map boundX (maybe [] pure boundA))
   releaseCreations peers
+  note "startTwo: creations released"
   pure (a, windowA, boundA, b, windowB, boundB)
 
 quadPath ∷ ByteString

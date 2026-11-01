@@ -29,6 +29,7 @@ module Test.Run.Native.Observe
   , awaitLiveTextures
   , step
   , within
+  , note
   ) where
 
 import Control.Concurrent.STM (STM, atomically, readTVar, retry)
@@ -74,6 +75,9 @@ import Hetoimasia.GPU.Vulkan.GLFW
 import Hetoimasia.LuaEngine.Graphics.Texture (BackendReading (..), TextureGraphics (..))
 import Hetoimasia.Runtime.GLFW (attachmentWindow, hostWindowClient, hostWindowIdentities)
 import Numeric.Natural (Natural)
+import Data.Time.Clock (getCurrentTime)
+import Data.Time.Format (defaultTimeLocale, formatTime)
+import System.IO (hPutStrLn, stderr)
 import System.Timeout (timeout)
 import Test.Hspec (expectationFailure)
 import Test.Run.Native.Peers (Peers (..))
@@ -213,6 +217,12 @@ awaitLiveTextures ∷ Peers → Int → IO ()
 awaitLiveTextures peers wanted = step (show wanted <> " live textures") . atomically $ do
   reading ← graphicsReading (peGraphics peers)
   unless (readingLiveTextures reading == wanted) retry
+
+-- | A timestamped line of progress on stderr, so a run that stops says where it stopped.
+note ∷ String → IO ()
+note line = do
+  now ← getCurrentTime
+  hPutStrLn stderr ("run-native-tests " <> formatTime defaultTimeLocale "%H:%M:%S%Q" now <> ": " <> line)
 
 -- | A wait that names itself when it does not end.
 step ∷ String → IO a → IO a

@@ -25,6 +25,9 @@ module Test.Run.Native.X11
   ) where
 
 import Control.Exception (Exception, throwIO)
+import Control.Monad (when)
+import Data.Time.Clock (diffUTCTime, getCurrentTime)
+import System.IO (hPutStrLn, stderr)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -80,7 +83,13 @@ data Captured = Captured
 -- | Run one helper operation: bounded, reaped, and answered as the helper's own JSON.
 run ∷ X11 → [String] → IO Json
 run helper arguments = do
+  started ← getCurrentTime
   outcome ← timeout (30 * 1000000) (readCreateProcessWithExitCode (proc (x11Python helper) ("-I" : x11Script helper : arguments)) "")
+  finished ← getCurrentTime
+  -- A slow or failed operation says so where it happened, so a run that runs out of budget names the step.
+  let seconds = realToFrac (diffUTCTime finished started) ∷ Double
+  when (seconds > 2 || maybe True (\(code, _, _) → code /= ExitSuccess) outcome) $
+    hPutStrLn stderr ("run-native-tests: x11 helper " <> unwords (take 2 arguments) <> " took " <> show seconds <> "s" <> maybe ", timed out" (\(code, _, _) → ", " <> show code) outcome)
   case outcome of
     Nothing → throwIO (Refused "timeout" "the helper did not answer within 30 seconds; it was ended and reaped")
     Just (code, out, err) → case parseJson out of

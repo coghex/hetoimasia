@@ -26,6 +26,7 @@ module Test.Run.Native.Capture
 import Control.Concurrent (threadDelay)
 import Control.Exception (try)
 import Control.Monad (unless, when)
+import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Text as Text
 import Data.Text (Text)
 import Hetoimasia.GLFW.Window (WindowId)
@@ -37,9 +38,9 @@ import Test.Hspec (expectationFailure)
 import Test.Run.Native.Env (Env (..), evidence)
 import Test.Run.Native.Json
 import Test.Run.Native.Landmarks
-import Test.Run.Native.Observe (Metrics (..), windowMetrics)
+import Test.Run.Native.Observe (Metrics (..), note, windowMetrics)
 import Test.Run.Native.Peers (Peers)
-import Test.Run.Native.X11 (Candidate (..), Captured (..), Refused (..), X11, capture, geometry, requestClose, viewableCandidates)
+import Test.Run.Native.X11 (Candidate (..), Captured (..), Refused (..), X11, candidates, capture, geometry, requestClose, viewableCandidates)
 
 -- | A native window bound to the instance that made it, with the process that owns it.
 data Bound = Bound
@@ -71,8 +72,12 @@ bindNew env peers window known = case envX11 env of
   Nothing → pure Nothing
   Just helper → do
     pid ← ownPid
-    found ← pollFor "the new window to be viewable on the X display" $ do
-      now ← viewableCandidates helper pid
+    seen ← newIORef ("nothing was seen yet" ∷ String)
+    note ("binding host window " <> show window <> " (pid " <> show pid <> "), known X windows " <> show known)
+    found ← pollFor "the new window to be viewable on the X display" (readIORef seen) $ do
+      everything ← candidates helper pid
+      writeIORef seen ("the process owns these InputOutput windows: " <> show [(candWindow c, candMapState c, candWidth c, candHeight c) | c ← everything])
+      let now = filter ((== 2) . candMapState) everything
       case filter ((`notElem` known) . candWindow) now of
         [] → pure Nothing
         [one] → pure (Just (Right one))
@@ -91,7 +96,7 @@ bindChild ∷ Env → Int → IO (Maybe Bound)
 bindChild env pid = case envX11 env of
   Nothing → pure Nothing
   Just helper → do
-    found ← pollFor "the command's window to be viewable on the X display" $ do
+    found ← pollFor "the command's window to be viewable on the X display" (pure ("pid " <> show pid)) $ do
       now ← viewableCandidates helper pid
       case now of
         [] → pure Nothing
@@ -187,10 +192,14 @@ required what action =
     Left (Refused outcome detail) → expectationFailure ("the X11 helper refused the " <> what <> " (" <> Text.unpack outcome <> "): " <> Text.unpack detail) >> error "unreachable"
 
 -- | Poll an external fact under a bound; the first answer is returned. A refusal in the poll is the case's failure.
-pollFor ∷ String → IO (Maybe a) → IO a
-pollFor label probe = do
+pollFor ∷ String → IO String → IO (Maybe a) → IO a
+pollFor label lastSeen probe = do
   outcome ← timeout (40 * 1000000) loop
-  maybe (expectationFailure ("no " <> label <> " within 40 seconds") >> error "unreachable") pure outcome
+  case outcome of
+    Just answer → pure answer
+    Nothing → do
+      seen ← lastSeen
+      expectationFailure ("no " <> label <> " within 40 seconds; " <> seen) >> error "unreachable"
   where
     loop =
       probe >>= \case
