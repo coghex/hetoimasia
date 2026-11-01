@@ -13,6 +13,7 @@ module Test.Run.Native.Observe
   , awaitMetrics
   , controlWindow
   , requestSize
+  , requestPosition
   , requestMinimize
   , requestRestore
   , awaitWindowCount
@@ -47,6 +48,7 @@ import Hetoimasia.GLFW.Command
   , clientObservations
   , minimizeWindowCommand
   , restoreWindowCommand
+  , setWindowPositionCommand
   , setWindowSizeCommand
   , submitWindowCommand
   , WindowCommand
@@ -56,6 +58,7 @@ import Hetoimasia.GLFW.Window
   ( Attribute (..)
   , ContentScale (..)
   , Extent (..)
+  , Placement (..)
   , WindowId
   , observedContentScale
   , observedFramebufferExtent
@@ -142,6 +145,11 @@ controlWindow peers window command = do
 
 requestSize ∷ Peers → WindowId → (Int, Int) → IO Disposition
 requestSize peers window (width, height) = controlWindow peers window (setWindowSizeCommand window (Extent width height))
+
+-- | Place the window's client area at a position of the desktop (a public, window-system mediated command; what the window
+-- reached is what its next observation reports).
+requestPosition ∷ Peers → WindowId → (Int, Int) → IO Disposition
+requestPosition peers window (x, y) = controlWindow peers window (setWindowPositionCommand window (Placement x y))
 
 requestMinimize, requestRestore ∷ Peers → WindowId → IO Disposition
 requestMinimize peers window = controlWindow peers window (minimizeWindowCommand window)

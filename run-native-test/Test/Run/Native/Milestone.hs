@@ -102,10 +102,12 @@ spec env = describe "Lua native milestone" $ do
         a ← admitUi peers
         windowA ← awaitNewWindow peers []
         boundA ← bindNew env peers windowA known0
+        placeWindow env peers windowA 0
         readsEntered peers quadPath 1
         b ← admitUi peers
         windowB ← awaitNewWindow peers [windowA]
         boundB ← bindNew env peers windowB (known0 <> map boundX (maybe [] pure boundA))
+        placeWindow env peers windowB 1
         awaitAdopted peers windowB 1
         atomically (readsHeld peers quadPath) >>= (`shouldBe` 1)
         -- A is ended with its read borrowed by a worker: it cannot settle until the read returns.
@@ -127,6 +129,7 @@ spec env = describe "Lua native milestone" $ do
         -- The reservation came back exactly: a later instance loads the same path and shows its quad.
         c ← admitUi peers
         windowC ← awaitNewWindow peers [windowB]
+        placeWindow env peers windowC 0
         awaitAdopted peers windowC 1
         awaitLiveTextures peers 2
         mapM_ (stopUi peers) [b, c]
@@ -144,9 +147,11 @@ spec env = describe "Lua native milestone" $ do
         a ← admitUi peers
         windowA ← awaitNewWindow peers []
         boundA ← bindNew env peers windowA known0
+        placeWindow env peers windowA 0
         b ← admitUi peers
         windowB ← awaitNewWindow peers [windowA]
         boundB ← bindNew env peers windowB (known0 <> map boundX (maybe [] pure boundA))
+        placeWindow env peers windowB 1
         awaitAdopted peers windowB 1
         atomically (creationsWithheld peers) >>= (`shouldBe` 1)
         stopUi peers a
@@ -177,6 +182,7 @@ spec env = describe "Lua native milestone" $ do
       withPeers (envStart env) folder $ \peers → do
         (a, windowA, boundA, b, windowB, _boundB) ← startTwo env peers
         forM_ [windowA, windowB] $ \window → awaitAdopted peers window 1
+        parkWindow env peers windowB
         initial ← windowMetrics peers windowA
         snap env peers "view--initial" boundA
         -- The scene is the one accepted publication, and nothing below republishes: its revision is the evidence.
@@ -339,6 +345,24 @@ factsFor peers named = do
     pure (label <> " window " <> Text.pack (show window) <> " " <> Text.pack (show metrics))
   pure (Text.intercalate "; " facts)
 
+-- | Place a harness window in a slot of the desktop where no other harness window overlaps it, so that what is captured
+-- or looked at is that window's own pixels. On the isolated X11 display (1280 x 1024) the slots are stacked down the
+-- left edge; elsewhere they are side by side. The position is asked through the public window command.
+placeWindow ∷ Env → Peers → WindowId → Int → IO ()
+placeWindow env peers window slot = do
+  disposition ← requestPosition peers window position
+  (window, attempted disposition) `shouldBe` (window, True)
+  where
+    position = case envX11 env of
+      Just _ → (10, 40 + 490 * slot)
+      Nothing → (20 + 660 * slot, 60)
+
+-- | Park a window out of the way, partly beyond the screen, when only its peer is looked at.
+parkWindow ∷ Env → Peers → WindowId → IO ()
+parkWindow env peers window = do
+  disposition ← requestPosition peers window (case envX11 env of Just _ → (700, 700); Nothing → (1000, 500))
+  (window, attempted disposition) `shouldBe` (window, True)
+
 -- | Admit two instances so that each new native window is unambiguously its instance's: with the next two creation
 -- outcomes withheld from the provider, the window that appears after A is admitted is A's and the one that appears
 -- after B is admitted is B's (and, on the isolated X11 display, the one new viewable X window each time is bound to
@@ -353,10 +377,12 @@ startTwo env peers = do
   windowA ← awaitNewWindow peers []
   note ("startTwo: host window for A: " <> show windowA)
   boundA ← bindNew env peers windowA known0
+  placeWindow env peers windowA 0
   b ← admitUi peers
   windowB ← awaitNewWindow peers [windowA]
   note ("startTwo: host window for B: " <> show windowB)
   boundB ← bindNew env peers windowB (known0 <> map boundX (maybe [] pure boundA))
+  placeWindow env peers windowB 1
   releaseCreations peers
   note "startTwo: creations released"
   pure (a, windowA, boundA, b, windowB, boundB)
