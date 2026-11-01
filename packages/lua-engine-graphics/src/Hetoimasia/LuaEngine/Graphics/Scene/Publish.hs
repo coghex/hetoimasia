@@ -72,6 +72,7 @@ module Hetoimasia.LuaEngine.Graphics.Scene.Publish
   , scenePublisherOver
   , HostAnswer (..)
   , targetAnswer
+  , offscreenTargetAnswer
 
   , publisherGatedBy
 
@@ -101,7 +102,7 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Encoding
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Messaging.Payload (Prepared, prepare)
-import Hetoimasia.GPU.Vulkan.GLFW (TextureHandle (..), WindowScenePublication (..))
+import Hetoimasia.GPU.Vulkan.GLFW (OffscreenTargetId, TargetScenePublication (..), TextureHandle (..), VulkanHost, WindowScenePublication (..), publishVulkanTargetScene)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (GraphicsScene, graphicsScene)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port (TextureRef (..), textureRefOf)
 import Hetoimasia.LuaEngine.Graphics.Window.Host (WindowTarget (..))
@@ -182,6 +183,18 @@ targetAnswer target scene =
     WindowSceneUnknown _ → HostAnsweredUnknown
     WindowSceneClosed _ → HostAnsweredClosed
     WindowScenesNotEnabled _ → HostAnsweredShared
+
+-- | The host's answer to a publication to a surface-free offscreen target registered with it (LFE-27): the
+-- host's own transaction, which reads the target's liveness, accepts the scene and takes its revision in one
+-- step, so a target-side port composes it with 'publisherGatedBy' and the authority checks exactly as the
+-- window capability's is. An offscreen target is the host's, with the host's one ownership policy: nothing here
+-- decides what a release waits for.
+offscreenTargetAnswer ∷ VulkanHost GraphicsScene → OffscreenTargetId → Prepared GraphicsScene → STM HostAnswer
+offscreenTargetAnswer host target scene =
+  publishVulkanTargetScene host target scene <&> \case
+    TargetScenePublished _ _ → HostAccepted
+    TargetSceneUnknown _ → HostAnsweredUnknown
+    TargetSceneClosed _ → HostAnsweredClosed
 
 -- | The same over any window capability: the lifecycle suite's, which has no window identity to mint.
 scenePublisherOver ∷ Textures → WindowProvider target → (target → Prepared GraphicsScene → STM HostAnswer) → (target → STM Bool) → ScenePublisher target

@@ -36,6 +36,7 @@ import Hetoimasia.GPU.Model (TargetPhase (..), TargetView (..), targetView)
 import Hetoimasia.GPU.Model.Identity (TargetClass (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Loop (publishVulkanScene, publishVulkanWindowScene, runVulkanOwnerLoop)
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Target (Adopter (..))
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes (adoptScene, endSceneTarget, newScenes, readSceneState, registerSceneTarget, releaseScenes, retentionLimit)
 import Hetoimasia.GPU.Vulkan.Native.Generations (GenerationView (..), SwapchainResult (..), TargetCondition (..), TargetGenerationsView (..))
 import Hetoimasia.GPU.Vulkan.Native.Recording (ClearColor (..))
@@ -512,11 +513,11 @@ testRequestWaitsForAdoption = do
   published `shouldBe` WindowScenePublished b 2
   case sceneRequests adoptedAtRequest of
     [named] → do
-      Map.lookup b named `shouldBe` Just 2
-      Map.lookup a named `shouldBe` Just 0
+      Map.lookup (KeyWindow b) named `shouldBe` Just 2
+      Map.lookup (KeyWindow a) named `shouldBe` Just 0
     other → failWith ("expected one pending request, saw " <> show other)
-  fmap windowPublished (Map.lookup b (sceneWindows state)) `shouldBe` Just (Just 2)
-  fmap windowAdopted (Map.lookup b (sceneWindows state)) `shouldBe` Just (Just 1)
+  fmap windowPublished (Map.lookup (KeyWindow b) (sceneWindows state)) `shouldBe` Just (Just 2)
+  fmap windowAdopted (Map.lookup (KeyWindow b) (sceneWindows state)) `shouldBe` Just (Just 1)
   -- It ran only after B had adopted revision 2.
   adoptedBy seenAtRun b `shouldBe` [(0, 0), (1, 91), (2, 92)]
   sceneRequests after `shouldBe` []
@@ -564,7 +565,7 @@ testRequestOrderAndWindowEnd = do
   whileHeld `shouldBe` ["plain"]
   length requests `shouldBe` 2
   forM_' requests $ \named →
-    named `shouldBe` Map.fromList [(a, 0), (b, 0), (c, 1)]
+    named `shouldBe` Map.fromList [(KeyWindow a, 0), (KeyWindow b, 0), (KeyWindow c, 1)]
   -- The window's end released them, in the order they were made.
   finished `shouldBe` ["plain", "first", "second"]
 
@@ -596,7 +597,7 @@ testTargetlessWindowHolds = do
       afterEnd ← readTVarIO ran
       pure ((a, b, c, sceneRequests state), whileHeld, afterEnd)
     let (a, b, c, requests) = named
-    requests `shouldBe` [Map.fromList [(a, expected), (b, expected), (c, expected)]]
+    requests `shouldBe` [Map.fromList [(KeyWindow a, expected), (KeyWindow b, expected), (KeyWindow c, expected)]]
     whileHeld `shouldBe` ["plain"]
     afterEnd `shouldBe` ["plain", "request"]
 
@@ -644,7 +645,7 @@ testNeverPublishedWindowLeavesBarrier =
       pure ((a, b, c, beforeRun), (afterPublish, whileHeld), finished)
     let (a, b, c, beforeRun) = unpublished
     -- Observed unfiltered: C's published revision is still 0.
-    (label, fmap windowPublished (Map.lookup c (sceneWindows beforeRun))) `shouldBe` (label, Just (Just 0))
+    (label, fmap windowPublished (Map.lookup (KeyWindow c) (sceneWindows beforeRun))) `shouldBe` (label, Just (Just 0))
     (label, sceneRequests beforeRun) `shouldBe` (label, [Map.empty])
     let (published, whileHeld) = afterPublish
     -- The request made after C published names it, at its revision, and the
@@ -652,7 +653,7 @@ testNeverPublishedWindowLeavesBarrier =
     -- In a shared host the one scene is every window's, so the others are
     -- named at its revision too; in a per-window host only C is.
     (label, sceneRequests published)
-      `shouldBe` (label, [Map.fromList ([(c, 1)] <> [(window, 1) | sharedHost label, window ← [a, b]])])
+      `shouldBe` (label, [Map.fromList ([(KeyWindow c, 1)] <> [(KeyWindow window, 1) | sharedHost label, window ← [a, b]])])
     (label, whileHeld) `shouldBe` (label, ["never published", "plain"])
     (label, order) `shouldBe` (label, ["never published", "plain", "published"])
   where
@@ -691,7 +692,7 @@ testRequestIgnoresLaterWindow = do
     composedUntil rig host control "the request's run" ((== ["request"]) <$> readTVarIO ran)
     pure (sceneRequests state, late, ())
   case requests of
-    [named] → Map.member created named `shouldBe` False
+    [named] → Map.member (KeyWindow created) named `shouldBe` False
     other → failWith ("expected one pending request, saw " <> show other)
   finished `shouldBe` ()
 
@@ -716,7 +717,7 @@ testRequestSharedMode = do
     pure (sceneRequests state, (a, b), seen)
   let (a, b) = windows
   -- The shared scene's revision is every window's.
-  named `shouldBe` [Map.fromList [(a, 1), (b, 1)]]
+  named `shouldBe` [Map.fromList [(KeyWindow a, 1), (KeyWindow b, 1)]]
   adoptedBy seenAtRun a `shouldBe` [(0, 0), (1, 31)]
   adoptedBy seenAtRun b `shouldBe` [(0, 0), (1, 31)]
 
@@ -926,7 +927,7 @@ testRetentionBound = do
     baseline ← presentsOf rig (graphicsAttachment service)
     _ ← publishTo host window 1
     composedUntil rig host control "the first revision's frame" ((> baseline) <$> presentsOf rig (graphicsAttachment service))
-    let standingOf = (Map.lookup window . sceneWindows) <$> atomically (readVulkanSceneState (vulkanController host))
+    let standingOf = (Map.lookup (KeyWindow window) . sceneWindows) <$> atomically (readVulkanSceneState (vulkanController host))
         adoptedAt = maybe Nothing windowAdopted <$> standingOf
     -- One submission has not completed, so no revision adopted after the first
     -- is released: each adoption the target may make, it makes, until its
@@ -970,7 +971,7 @@ testLedgerCancellation = do
     service ← attach host window
     let attachment = graphicsAttachment service
     scenes ← newScenes False
-    atomically (registerSceneTarget scenes attachment)
+    atomically (registerSceneTarget scenes (AttachmentAdopter attachment))
     hooks ← newTVarIO ([] ∷ [String])
     entered ← newEmptyMVar
     proceed ← newEmptyMVar
@@ -995,14 +996,14 @@ testLedgerCancellation = do
           putMVar proceed ()
           takeMVar finished
     -- An adoption cancelled while its hook runs.
-    _ ← cancelDuring (adoptScene scenes lifecycle 100 attachment (5 ∷ Scene) 3)
+    _ ← cancelDuring (adoptScene scenes lifecycle 100 (AttachmentAdopter attachment) (5 ∷ Scene) 3)
     standing ← atomically (readSceneState scenes (pure []))
     -- A second revision, then the target ends: two records are due, and the
     -- release is cancelled while the first one's hook runs.
-    _ ← cancelDuring (adoptScene scenes lifecycle 100 attachment (6 ∷ Scene) 4)
+    _ ← cancelDuring (adoptScene scenes lifecycle 100 (AttachmentAdopter attachment) (6 ∷ Scene) 4)
     -- Take the second adoption's own cancellation out of the way: the thread
     -- it ran on is gone, and nothing is waiting on 'proceed'.
-    atomically (endSceneTarget scenes attachment)
+    atomically (endSceneTarget scenes (AttachmentAdopter attachment))
     finished ← newEmptyMVar
     thread ← forkIO (try @SomeException (releaseScenes scenes (sceneReleased lifecycle) (\_ _ → pure False)) >>= putMVar finished)
     takeMVar entered
@@ -1015,7 +1016,7 @@ testLedgerCancellation = do
     _ ← takeMVar finished
     after ← atomically (readSceneState scenes (pure []))
     done ← readTVarIO hooks
-    pure (fmap windowAdopted (Map.lookup window (sceneWindows standing)), Just (maybe [] windowAwaitingRelease (Map.lookup window (sceneWindows after))), done)
+    pure (fmap windowAdopted (Map.lookup (KeyWindow window) (sceneWindows standing)), Just (maybe [] windowAwaitingRelease (Map.lookup (KeyWindow window) (sceneWindows after))), done)
   adoptedBeforeCancel `shouldBe` Just (Just 3)
   adoptedAfter `shouldBe` Just []
   releasedAll `shouldBe` ["adopted 3", "adopted 4", "released 3", "released 4"]

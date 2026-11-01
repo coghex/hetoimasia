@@ -64,6 +64,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , Refusal
   , SceneLifecycle (..)
   , SceneMode (..)
+  , SceneTargetKey (..)
   , TicketState (..)
   , UploadConfig
   , UploadState (..)
@@ -230,8 +231,13 @@ run mode validation = do
               WindowedMode _ → PerWindowScenes
           , vulkanSceneLifecycle =
               SceneLifecycle
-                { sceneAdopted = \window revision scene → readTVarIO adapterSlot >>= maybe (pure ()) (\adapter → adapterAdopted adapter window revision scene)
-                , sceneReleased = \window revision → readTVarIO adapterSlot >>= maybe (pure ()) (\adapter → adapterReleased adapter window revision)
+                { -- The sample registers no offscreen target, so every key is a window's.
+                  sceneAdopted = \key revision scene → case key of
+                    KeyWindow window → readTVarIO adapterSlot >>= maybe (pure ()) (\adapter → adapterAdopted adapter window revision scene)
+                    KeyOffscreen _ → pure ()
+                , sceneReleased = \key revision → case key of
+                    KeyWindow window → readTVarIO adapterSlot >>= maybe (pure ()) (\adapter → adapterReleased adapter window revision)
+                    KeyOffscreen _ → pure ()
                 }
           }
   verdictHeld ← newTVarIO Nothing

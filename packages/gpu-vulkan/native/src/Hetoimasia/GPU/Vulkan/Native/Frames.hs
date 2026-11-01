@@ -233,6 +233,7 @@ module Hetoimasia.GPU.Vulkan.Native.Frames
   , FramelessScope
   , withFramelessScope
   , recordFramelessIn
+  , recordFramelessInWith
   , retireFrameless
   , FramelessSync (..)
   , FramelessSlotView (..)
@@ -278,7 +279,7 @@ import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Abandonment
   , skipFrame
   )
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Acquisition (tryAcquireFrame)
-import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Frameless (FramelessScope, recordFramelessIn, retireFrameless, withFramelessScope)
+import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Frameless (FramelessScope, recordFramelessIn, recordFramelessInWith, retireFrameless, withFramelessScope)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Loss (releaseFramesToDeviceLoss)
 import Hetoimasia.GPU.Vulkan.Native.Internal.Frames.Layer
   ( AcquireResult (..)

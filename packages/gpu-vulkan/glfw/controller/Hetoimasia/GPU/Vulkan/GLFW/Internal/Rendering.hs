@@ -89,6 +89,11 @@
 -- |                     |           | completed by the step; read by the |        | discarded or its submission  | its submission completed;    |
 -- |                     |           | scene ledger                       |        | has completed                | kept, uncertain, otherwise   |
 -- +---------------------+-----------+------------------------------------+--------+------------------------------+------------------------------+
+-- | The target uses     | This      | Opened when a frame-less batch is  | Owner  | A batch's recording until    | Removed when the batch's     |
+-- |                     | module    | recorded for an offscreen target,  |        | its ticket is complete or    | ticket is complete or        |
+-- |                     |           | before anything is recorded; read  |        | discarded                    | discarded; kept, uncertain,  |
+-- |                     |           | by the scene ledger                |        |                              | otherwise                    |
+-- +---------------------+-----------+------------------------------------+--------+------------------------------+------------------------------+
 -- | The construction's  | This      | 'confined' keeps the first escaped | Owner  | The owner's run              | Cleared each time the        |
 -- | escape record       | module    | failure; an owner-thread action's  |        |                              | construction is lent         |
 -- |                     |           | runner reads it                    |        |                              |                              |
@@ -123,6 +128,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , constructImage
   , releaseConstructed
   , constructFramelessBatch
+  , constructTargetBatch
   , constructReadback
   , readConstructedReadback
   , constructTextureTable
@@ -152,6 +158,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Rendering
   , planStep
   , requestPublished
   , sceneUsed
+  , reconcileTargetUses
   , renderDue
   , WindowView
   , settleCaptures
@@ -198,6 +205,7 @@ import Control.Monad (forM, forM_, unless, void, when)
 import Data.Bits ((.&.))
 import qualified Data.ByteString as ByteString
 import Data.Foldable (for_)
+import Data.Functor ((<&>))
 import Data.List (find)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Map.Strict (Map)
@@ -225,7 +233,7 @@ import Hetoimasia.GPU.Model
   , targetView
   )
 import Hetoimasia.GPU.Model.Budget (backoffSchedule, frameSlotLimit)
-import Hetoimasia.GPU.Model.Identity (FrameSlotId, GenerationId, HoldSubject (..), ImageId, PresentationId, SubmissionId, TargetId, imageGeneration, presentationTarget, frameTarget)
+import Hetoimasia.GPU.Model.Identity (BatchId, FrameSlotId, GenerationId, HoldSubject (..), ImageId, PresentationId, SubmissionId, TargetId, imageGeneration, presentationTarget, frameTarget)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Capture
   ( CaptureOutcome (..)
   , CapturedFrame (..)
@@ -260,6 +268,7 @@ import Hetoimasia.GPU.Vulkan.Native.Frames
   , newFrames
   , readFramelessSubmissions
   , recordFramelessIn
+  , recordFramelessInWith
   , retireFrameless
   , withFramelessScope
   , presentFrame
@@ -303,6 +312,9 @@ import Hetoimasia.GPU.Vulkan.Native.Recording
   , StorageWindow
   , VertexInput
   , BatchTicket
+  , TicketState (..)
+  , ticketBatch
+  , readTicket
   , Readback
   , Recorder
   , Recording
@@ -390,6 +402,7 @@ import Hetoimasia.GPU.Vulkan.Native.Uploads
   , submitUploadGated
   , uploadsWaiting
   )
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Target (Adopter (..), OffscreenTargetId)
 import Hetoimasia.Runtime.GLFW (AttachmentId, OwnerDemand (..))
 
 -- ---------------------------------------------------------------------------
@@ -524,6 +537,9 @@ data Construction q inst msgr phys dev cmd = Construction
   , constructionUploads ∷ !(TVar (UploadsStanding q inst msgr phys dev cmd))
     -- ^ The session's uploads, which the texture table's placeholder is
     -- uploaded through (GRS-7).
+  , constructionTargetUses ∷ !(TVar (Map BatchId TargetUse))
+    -- ^ The session's uses of the scenes its offscreen targets adopted, which
+    -- 'constructTargetBatch' opens one of for each batch it records.
   }
 
 -- | What the renderer can release: the handles it can construct.
@@ -755,6 +771,36 @@ constructFramelessBatch construction consumer = case constructionFrameless const
       CheckpointPending → pure (Left RefusedDiagnosticPending)
       CheckpointClear → recordFramelessIn scope consumer
 
+-- | Record one frame-less batch that reads the scene revision an offscreen
+-- target adopted: 'constructFramelessBatch', with the batch's use of that
+-- revision opened with the batch itself.
+--
+-- The use is bound to the batch's own ticket in the step that admits the
+-- batch, before the consumer runs, so no failure and no cancellation of the
+-- recording, and no refusal that hides the ticket from the caller, can leave a
+-- batch that read the scene untracked. The revision is released only once that
+-- ticket is complete or the batch was discarded; the caller reports nothing
+-- and cannot discharge the use, and another batch's completion never does.
+-- The revision must be the one the host adopted for the target
+-- ('Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller.recordVulkanTargetBatch'
+-- reads it and hands it to the consumer, which is the only caller).
+constructTargetBatch
+  ∷ Construction q inst msgr phys dev cmd
+  → OffscreenTargetId
+  → Natural
+  → (Recorder q inst msgr phys dev cmd → IO a)
+  → IO (Either Refusal (BatchTicket, a))
+constructTargetBatch construction target revision consumer = case constructionFrameless construction of
+  Nothing → pure (Left (RefusedUnsupported "a frame-less batch outside an owner-thread action"))
+  Just scope →
+    checkpointRoots (constructionRoots construction) >>= \case
+      CheckpointFailed primary → pure (Left (RefusedSessionFailed primary))
+      CheckpointPending → pure (Left RefusedDiagnosticPending)
+      CheckpointClear → recordFramelessInWith scope announce consumer
+  where
+    uses = constructionTargetUses construction
+    announce ticket = atomically (modifyTVar' uses (Map.insert (ticketBatch ticket) (TargetUse target revision ticket)))
+
 -- | Run one construction behind the session's checkpoint, answering a
 -- synchronous failure that left nothing as the refusal it is. Only a failure
 -- that committed no new generation, and that the checkpoint finds nothing
@@ -807,7 +853,7 @@ lendConstruction rendering =
 
 -- | The construction over the session's recording.
 construct ∷ Rendering q inst msgr phys dev cmd → Live q inst msgr phys dev cmd → Construction q inst msgr phys dev cmd
-construct rendering made = Construction (liveRecording made) (renderingRoots rendering) (renderingEscape rendering) Nothing (renderingUploads rendering)
+construct rendering made = Construction (liveRecording made) (renderingRoots rendering) (renderingEscape rendering) Nothing (renderingUploads rendering) (renderingTargetUses rendering)
 
 -- | Run an owner-thread action's body with the construction it was lent and a
 -- frame-less scope over the session's frames (GRS-12): the frame-less batches
@@ -922,6 +968,11 @@ data Rendering q inst msgr phys dev cmd = Rendering
     -- been discarded and whose submission has not yet completed, by the serial
     -- the use was opened under.
   , renderingUseSerial ∷ !(TVar Natural)
+    -- ^ The serial the next use of either kind is opened under.
+  , renderingTargetUses ∷ !(TVar (Map BatchId TargetUse))
+    -- ^ Every frame-less batch recorded with the scene revision an offscreen
+    -- target adopted whose ticket is neither complete nor discarded, by the
+    -- batch.
   }
 
 -- | One frame's recorded use of a scene revision: what keeps that revision from
@@ -945,6 +996,32 @@ data SceneUse = SceneUse
   , useRecorded ∷ !Bool
     -- ^ Whether the frame's recording has ended, however it did.
   }
+
+-- | One frame-less batch's recorded use of the scene revision an offscreen
+-- target adopted: what keeps that revision from being released.
+--
+-- It is opened when the batch is, before anything is recorded into it, and it
+-- ends only with the batch's own evidence, read from its own ticket: the batch
+-- was discarded without being submitted, or its submission's fence was
+-- observed signalled and recorded with the model. Submission, acceptance, a
+-- timeout, a wait that was abandoned, the caller's scope ending and another
+-- batch's completion end nothing. A ticket the device's loss settled as lost,
+-- and one still pending, end nothing either, so the use and the revision it
+-- names stay, uncertain, and are never released on a guess.
+data TargetUse = TargetUse
+  { useTarget ∷ !OffscreenTargetId
+  , useTargetRevision ∷ !Natural
+  , useTicket ∷ !BatchTicket
+  }
+
+-- | Whether the batch's own ticket says its use is over.
+targetUseOver ∷ TargetUse → STM Bool
+targetUseOver use =
+  readTicket (useTicket use) <&> \case
+    TicketComplete → True
+    TicketDiscarded → True
+    TicketPending → False
+    TicketLost → False
 
 -- | Where the session's uploads stand.
 data UploadsStanding q inst msgr phys dev cmd
@@ -980,6 +1057,7 @@ newRendering roots generations ops observer captures uploads windowDepth =
     <*> pure windowDepth
     <*> newTVarIO Map.empty
     <*> newTVarIO 0
+    <*> newTVarIO Map.empty
 
 -- | The recording and the frames, made the first time they are needed once
 -- the device exists, on the owner's thread, which is what makes it their
@@ -1203,10 +1281,26 @@ pollDue now model = case progressDeadline model of
 -- recording has ended and the recording holds no unsubmitted batch of its
 -- frame — the batch was reset and dropped — and the device has not been lost,
 -- since after the loss a skip lets a recording go without resetting anything.
-sceneUsed ∷ Rendering q inst msgr phys dev cmd → AttachmentId → Natural → STM Bool
-sceneUsed rendering attachment revision = do
-  over ← useEvidence rendering
-  any (\use → useAttachment use == attachment && useRevision use == revision && not (over use)) . Map.elems <$> readTVar (renderingUses rendering)
+--
+-- An offscreen target's adoption is used while any frame-less batch recorded
+-- with its revision through 'constructTargetBatch' has a ticket that is
+-- neither complete nor discarded ('TargetUse').
+sceneUsed ∷ Rendering q inst msgr phys dev cmd → Adopter → Natural → STM Bool
+sceneUsed rendering adopter revision = case adopter of
+  AttachmentAdopter attachment → do
+    over ← useEvidence rendering
+    any (\use → useAttachment use == attachment && useRevision use == revision && not (over use)) . Map.elems <$> readTVar (renderingUses rendering)
+  TargetAdopter target → do
+    uses ← Map.elems <$> readTVar (renderingTargetUses rendering)
+    or <$> traverse (\use → if useTarget use == target && useTargetRevision use == revision then not <$> targetUseOver use else pure False) uses
+
+-- | Forget the target uses their own tickets say are over, so the table holds
+-- no more than the batches in flight and the uses that are uncertain.
+reconcileTargetUses ∷ Rendering q inst msgr phys dev cmd → STM ()
+reconcileTargetUses rendering = do
+  uses ← readTVar (renderingTargetUses rendering)
+  settled ← traverse (\(batch, use) → (,) batch <$> targetUseOver use) (Map.toList uses)
+  writeTVar (renderingTargetUses rendering) (foldr (Map.delete . fst) uses (filter snd settled))
 
 -- | Which uses the layers' durable evidence says are over.
 useEvidence ∷ Rendering q inst msgr phys dev cmd → STM (SceneUse → Bool)

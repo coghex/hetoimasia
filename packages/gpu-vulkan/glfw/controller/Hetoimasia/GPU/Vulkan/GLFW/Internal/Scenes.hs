@@ -2,6 +2,17 @@
 -- adopted, when an adopted revision may be released, and what a release
 -- request waits for.
 --
+-- Everything here is keyed by 'SceneTargetKey' (LFE-27): a window, or an
+-- offscreen target registered with the host
+-- ("Hetoimasia.GPU.Vulkan.GLFW.Internal.Targets"). The ledger's records are
+-- kept by what adopted them, an 'Adopter' — one window attachment, or the one
+-- offscreen target — so a window reattached under a new attachment still adopts
+-- again and each adoption is accounted on its own, while the barrier, the
+-- lifecycle and the observation speak of the key. Wherever the text below says
+-- /window/ of a barrier, a revision or a release, it holds for an offscreen
+-- target in the same words: an offscreen target is a scene target with no
+-- window.
+--
 -- This module owns the ledger and the decisions made from it, and nothing
 -- native. The controller ("Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller")
 -- adopts a scene for each target at the start of its step, reconciles releases
@@ -99,7 +110,10 @@
 -- +------------------+-------------+------------------------------------+--------+-----------------------+---------------------------+
 --
 -- The ledger is bounded: a target holds at most 'retentionLimit' records, and
--- the host's windows bound the targets.
+-- the host's windows and the registered offscreen targets bound the targets:
+-- 'scenesOccupants' counts a registered target and a retired one that still has
+-- an unreleased record alike, so the host can refuse a registration once their
+-- number reaches its finite capacity without touching the windows'.
 module Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes
   ( -- * The lifecycle
     SceneLifecycle (..)
@@ -111,6 +125,8 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Scenes
   , SceneSource (..)
   , installSceneSource
   , registerSceneTarget
+  , scenesOccupants
+  , adopterAtLimit
   , Adopting (..)
   , retentionLimit
   , adoptScene
@@ -138,9 +154,9 @@ import Data.Maybe (fromMaybe)
 import qualified Data.Set as Set
 import Numeric.Natural (Natural)
 
-import Hetoimasia.GLFW.Window (WindowId)
 import Hetoimasia.GPU.Vulkan.GLFW.Internal.Actions (Barrier)
-import Hetoimasia.Runtime.GLFW (AttachmentId, SceneMode (..), attachmentWindow)
+import Hetoimasia.GPU.Vulkan.GLFW.Internal.Target (Adopter (..), OffscreenTargetId, SceneTargetKey (..), adopterKey)
+import Hetoimasia.Runtime.GLFW (SceneMode (..))
 
 -- ---------------------------------------------------------------------------
 -- The lifecycle
@@ -151,20 +167,21 @@ import Hetoimasia.Runtime.GLFW (AttachmentId, SceneMode (..), attachmentWindow)
 -- Neither hook may raise or wait: both run between native calls, and a hook
 -- that raises ends the owner's run. Every adopted revision is announced once
 -- by 'sceneAdopted' and released once by 'sceneReleased', and the two are
--- paired by window and revision. A revision can be adopted more than once —
+-- paired by scene target and revision. A revision can be adopted more than once —
 -- once by each target that takes it, a window reattached under a new
 -- attachment adopts the revision its predecessor held — and each adoption is
 -- released on its own.
 data SceneLifecycle scene = SceneLifecycle
-  { sceneAdopted ∷ WindowId → Natural → scene → IO ()
-    -- ^ A target of this window has adopted this revision, with the exact
-    -- scene the owner took, which may already have been replaced by a newer
-    -- publication. The owner holds what the scene references from here until
-    -- the revision is released.
-  , sceneReleased ∷ WindowId → Natural → IO ()
-    -- ^ A revision adopted for this window has been superseded, or its target
-    -- has ended, and every frame recorded with it is over: nothing the owner
-    -- does will read what it references again.
+  { sceneAdopted ∷ SceneTargetKey → Natural → scene → IO ()
+    -- ^ A target of this window, or this offscreen target, has adopted this
+    -- revision, with the exact scene the owner took, which may already have
+    -- been replaced by a newer publication. The owner holds what the scene
+    -- references from here until the revision is released.
+  , sceneReleased ∷ SceneTargetKey → Natural → IO ()
+    -- ^ A revision adopted for this window or offscreen target has been
+    -- superseded, or its target has ended, and every frame or batch recorded
+    -- with it is over: nothing the owner does will read what it references
+    -- again.
   }
 
 -- | A lifecycle that does nothing, which is what a host has unless it supplies
@@ -179,10 +196,11 @@ noSceneLifecycle = SceneLifecycle (\_ _ _ → pure ()) (\_ _ → pure ())
 -- from: installed once the owner exists.
 data SceneSource = SceneSource
   { sourceMode ∷ !SceneMode
-  , sourceWindows ∷ STM [WindowId]
-    -- ^ The windows the host holds.
-  , sourceRevisions ∷ STM (Map WindowId Natural)
-    -- ^ The latest published revision of every window the host holds.
+  , sourceHeld ∷ STM [SceneTargetKey]
+    -- ^ The scene targets the host holds: its windows, and the offscreen
+    -- targets registered with it.
+  , sourceRevisions ∷ STM (Map SceneTargetKey Natural)
+    -- ^ The latest published revision of every scene target the host holds.
   }
 
 data TargetScene = TargetScene
@@ -198,18 +216,18 @@ data TargetScene = TargetScene
 
 -- | One adopted revision that has not been released.
 data Adoption = Adoption
-  { adoptionAttachment ∷ !AttachmentId
+  { adoptionAdopter ∷ !Adopter
   , adoptionRevision ∷ !Natural
   , adoptionSuperseded ∷ !Bool
   }
 
 data Ledger = Ledger
-  { ledgerTargets ∷ !(Map AttachmentId TargetScene)
+  { ledgerTargets ∷ !(Map Adopter TargetScene)
   , ledgerRecords ∷ ![Adoption]
     -- ^ Every adopted revision not yet released, oldest adoption first.
-  , ledgerDeferred ∷ !(Map WindowId Natural)
-    -- ^ For each window, how many adoptions a target of it deferred at its
-    -- retention limit.
+  , ledgerDeferred ∷ !(Map SceneTargetKey Natural)
+    -- ^ For each scene target, how many adoptions a target of it deferred at
+    -- its retention limit.
   }
 
 data Scenes = Scenes
@@ -232,11 +250,22 @@ newScenes initialEmpty = (\ledger source → Scenes ledger source initialEmpty) 
 installSceneSource ∷ Scenes → SceneSource → STM ()
 installSceneSource scenes = writeTVar (scenesSource scenes) . Just
 
--- | A target the roots admitted, which will adopt the scenes of its window.
-registerSceneTarget ∷ Scenes → AttachmentId → STM ()
-registerSceneTarget scenes attachment =
+-- | A target the roots admitted, which will adopt the scenes of its window, or
+-- an offscreen target the host registered, which will adopt its own.
+registerSceneTarget ∷ Scenes → Adopter → STM ()
+registerSceneTarget scenes adopter =
   modifyTVar' (scenesLedger scenes) $ \ledger →
-    ledger {ledgerTargets = Map.insertWith (\_ held → held) attachment (TargetScene Nothing Nothing False) (ledgerTargets ledger)}
+    ledger {ledgerTargets = Map.insertWith (\_ held → held) adopter (TargetScene Nothing Nothing False) (ledgerTargets ledger)}
+
+-- | The offscreen targets the ledger still accounts for: those it holds a
+-- target entry for, and those with an adopted revision not yet released, so a
+-- retired target whose last use is uncertain counts until it is released.
+scenesOccupants ∷ Scenes → STM (Set.Set OffscreenTargetId)
+scenesOccupants scenes = do
+  ledger ← readTVar (scenesLedger scenes)
+  pure . Set.fromList $
+    [target | TargetAdopter target ← Map.keys (ledgerTargets ledger)]
+      <> [target | record ← ledgerRecords ledger, TargetAdopter target ← [adoptionAdopter record]]
 
 -- | What adopting a scene for a target came to.
 data Adopting
@@ -258,69 +287,76 @@ data Adopting
 retentionLimit ∷ Natural → Natural
 retentionLimit slots = 2 * (slots + 1)
 
+-- | Whether this adopter holds as many unreleased revisions as the limit allows,
+-- so that it adopts nothing newer until a release makes room.
+adopterAtLimit ∷ Scenes → Natural → Adopter → STM Bool
+adopterAtLimit scenes limit adopter = do
+  ledger ← readTVar (scenesLedger scenes)
+  pure (fromIntegral (length (filter ((== adopter) . adoptionAdopter) (ledgerRecords ledger))) >= limit)
+
 -- | Adopt this scene, at this revision, for this target, when it is newer than
 -- what the target holds and the target is below its retention limit.
 --
 -- The ledger's record, the hook and the watermark are one uninterruptible
 -- transition; the hook has run, and the bookkeeping is complete, before the
 -- revision counts as held for a barrier.
-adoptScene ∷ Scenes → SceneLifecycle scene → Natural → AttachmentId → scene → Natural → IO Adopting
-adoptScene scenes lifecycle limit attachment scene revision = uninterruptibleMask_ $ do
+adoptScene ∷ Scenes → SceneLifecycle scene → Natural → Adopter → scene → Natural → IO Adopting
+adoptScene scenes lifecycle limit adopter scene revision = uninterruptibleMask_ $ do
   answer ← atomically $ do
     ledger ← readTVar (scenesLedger scenes)
-    case Map.lookup attachment (ledgerTargets ledger) of
+    case Map.lookup adopter (ledgerTargets ledger) of
       Just target
         | not (targetEnded target)
         , maybe True (< revision) (targetAdopted target) →
-            if fromIntegral (length (filter ((== attachment) . adoptionAttachment) (ledgerRecords ledger))) >= limit
+            if fromIntegral (length (filter ((== adopter) . adoptionAdopter) (ledgerRecords ledger))) >= limit
               then do
-                writeTVar (scenesLedger scenes) ledger {ledgerDeferred = Map.insertWith (+) window 1 (ledgerDeferred ledger)}
+                writeTVar (scenesLedger scenes) ledger {ledgerDeferred = Map.insertWith (+) key 1 (ledgerDeferred ledger)}
                 pure AtLimit
               else do
                 writeTVar (scenesLedger scenes) $
                   ledger
-                    { ledgerTargets = Map.insert attachment target {targetAdopted = Just revision} (ledgerTargets ledger)
-                    , ledgerRecords = map (supersede attachment) (ledgerRecords ledger) <> [Adoption attachment revision False]
+                    { ledgerTargets = Map.insert adopter target {targetAdopted = Just revision} (ledgerTargets ledger)
+                    , ledgerRecords = map (supersede adopter) (ledgerRecords ledger) <> [Adoption adopter revision False]
                     }
                 pure Adopted
       _ → pure AlreadyHeld
   case answer of
     Adopted → do
-      sceneAdopted lifecycle window revision scene
+      sceneAdopted lifecycle key revision scene
       atomically $ do
-        held ← readTVar (scenesSource scenes) >>= maybe (pure Nothing) (fmap Just . sourceWindows)
+        held ← readTVar (scenesSource scenes) >>= maybe (pure Nothing) (fmap Just . sourceHeld)
         modifyTVar' (scenesLedger scenes) $ \ledger →
           ledger
             { -- Only now does the target hold the revision for a barrier.
-              ledgerTargets = Map.adjust (\target → target {targetHeld = Just revision}) attachment (ledgerTargets ledger)
+              ledgerTargets = Map.adjust (\target → target {targetHeld = Just revision}) adopter (ledgerTargets ledger)
             , ledgerDeferred = maybe id (\windows → Map.filterWithKey (\at _ → at `elem` windows)) held (ledgerDeferred ledger)
             }
     _ → pure ()
   pure answer
   where
-    window = attachmentWindow attachment
+    key = adopterKey adopter
 
-supersede ∷ AttachmentId → Adoption → Adoption
-supersede attachment record
-  | adoptionAttachment record == attachment = record {adoptionSuperseded = True}
+supersede ∷ Adopter → Adoption → Adoption
+supersede adopter record
+  | adoptionAdopter record == adopter = record {adoptionSuperseded = True}
   | otherwise = record
 
 -- | The target has ended: it adopts nothing more, and what it adopted is
 -- superseded.
-endSceneTarget ∷ Scenes → AttachmentId → STM ()
-endSceneTarget scenes attachment =
+endSceneTarget ∷ Scenes → Adopter → STM ()
+endSceneTarget scenes adopter =
   modifyTVar' (scenesLedger scenes) $ \ledger →
     ledger
-      { ledgerTargets = Map.adjust (\target → target {targetEnded = True}) attachment (ledgerTargets ledger)
-      , ledgerRecords = map (supersede attachment) (ledgerRecords ledger)
+      { ledgerTargets = Map.adjust (\target → target {targetEnded = True}) adopter (ledgerTargets ledger)
+      , ledgerRecords = map (supersede adopter) (ledgerRecords ledger)
       }
 
 -- | The target's retirement is complete. Its adopted revisions stay in the
 -- ledger until they are released.
-forgetSceneTarget ∷ Scenes → AttachmentId → STM ()
-forgetSceneTarget scenes attachment =
-  modifyTVar' (scenesLedger scenes) $ \ledger ->
-    ledger {ledgerTargets = Map.delete attachment (ledgerTargets ledger)}
+forgetSceneTarget ∷ Scenes → Adopter → STM ()
+forgetSceneTarget scenes adopter =
+  modifyTVar' (scenesLedger scenes) $ \ledger →
+    ledger {ledgerTargets = Map.delete adopter (ledgerTargets ledger)}
 
 -- | Release every adopted revision that may be, in adoption order for each
 -- window, and answer whether any was.
@@ -329,22 +365,22 @@ forgetSceneTarget scenes attachment =
 -- predicate, and every revision adopted before it for its window has been
 -- released. Each is removed from the ledger in one transaction with the
 -- others, before the hook is run for any of them.
-releaseScenes ∷ Scenes → (WindowId → Natural → IO ()) → (AttachmentId → Natural → STM Bool) → IO Bool
+releaseScenes ∷ Scenes → (SceneTargetKey → Natural → IO ()) → (Adopter → Natural → STM Bool) → IO Bool
 releaseScenes scenes released used = uninterruptibleMask_ $ do
   due ← atomically $ do
     ledger ← readTVar (scenesLedger scenes)
-    ready ← filterM (\record → if adoptionSuperseded record then not <$> used (adoptionAttachment record) (adoptionRevision record) else pure False) (ledgerRecords ledger)
-    let readyKeys = Set.fromList [(adoptionAttachment record, adoptionRevision record) | record ← ready]
+    ready ← filterM (\record → if adoptionSuperseded record then not <$> used (adoptionAdopter record) (adoptionRevision record) else pure False) (ledgerRecords ledger)
+    let readyKeys = Set.fromList [(adoptionAdopter record, adoptionRevision record) | record ← ready]
         step (blocked, out, kept) record
-          | window `Set.member` blocked = (blocked, out, kept <> [record])
-          | (adoptionAttachment record, adoptionRevision record) `Set.member` readyKeys = (blocked, out <> [record], kept)
-          | otherwise = (Set.insert window blocked, out, kept <> [record])
+          | key `Set.member` blocked = (blocked, out, kept <> [record])
+          | (adoptionAdopter record, adoptionRevision record) `Set.member` readyKeys = (blocked, out <> [record], kept)
+          | otherwise = (Set.insert key blocked, out, kept <> [record])
           where
-            window = attachmentWindow (adoptionAttachment record)
+            key = adopterKey (adoptionAdopter record)
         (_, due', kept') = foldl' step (Set.empty, [], []) (ledgerRecords ledger)
     writeTVar (scenesLedger scenes) ledger {ledgerRecords = kept'}
     pure due'
-  forM_ due $ \record → released (attachmentWindow (adoptionAttachment record)) (adoptionRevision record)
+  forM_ due $ \record → released (adopterKey (adoptionAdopter record)) (adoptionRevision record)
   pure (not (null due))
 
 -- ---------------------------------------------------------------------------
@@ -368,12 +404,12 @@ sceneBarrier scenes =
 -- has no hold until another adoption replaces it, however long ago its
 -- revision was adopted, since the revision it published is one a later target
 -- will adopt.
-liveWatermark ∷ Ledger → Map WindowId Natural
+liveWatermark ∷ Ledger → Map SceneTargetKey Natural
 liveWatermark ledger =
   Map.fromListWith
     max
-    [ (attachmentWindow attachment, revision)
-    | (attachment, target) ← Map.toList (ledgerTargets ledger)
+    [ (adopterKey adopter, revision)
+    | (adopter, target) ← Map.toList (ledgerTargets ledger)
     , not (targetEnded target)
     , Just revision ← [targetHeld target]
     ]
@@ -385,11 +421,11 @@ sceneBarrierMet scenes barrier =
   readTVar (scenesSource scenes) >>= \case
     Nothing → pure True
     Just source → do
-      held ← sourceWindows source
+      held ← sourceHeld source
       adopted ← liveWatermark <$> readTVar (scenesLedger scenes)
       pure $
         all
-          (\(window, revision) → window `notElem` held || maybe False (>= revision) (Map.lookup window adopted))
+          (\(key, revision) → key `notElem` held || maybe False (>= revision) (Map.lookup key adopted))
           (Map.toList barrier)
 
 -- ---------------------------------------------------------------------------
@@ -419,8 +455,12 @@ data WindowSceneStanding = WindowSceneStanding
 
 -- | The owner's scene state, as any thread may read it.
 data VulkanSceneState = VulkanSceneState
-  { sceneWindows ∷ !(Map WindowId WindowSceneStanding)
-  , sceneRequests ∷ ![Map WindowId Natural]
+  { sceneWindows ∷ !(Map SceneTargetKey WindowSceneStanding)
+    -- ^ For each scene target — each window, and each offscreen target
+    -- registered with the host — what the owner holds of its scenes. The
+    -- names say /window/ for the contract they have always had; an offscreen
+    -- target reads the same fields.
+  , sceneRequests ∷ ![Map SceneTargetKey Natural]
     -- ^ The release requests still queued, in the order they were made, each
     -- with the revision it awaits from each window.
   }
@@ -433,7 +473,7 @@ readSceneState scenes pending = do
   ledger ← readTVar (scenesLedger scenes)
   published ← readTVar (scenesSource scenes) >>= maybe (pure Map.empty) sourceRevisions
   requests ← pending
-  let awaiting = Map.fromListWith (flip (<>)) [(attachmentWindow (adoptionAttachment record), [adoptionRevision record]) | record ← ledgerRecords ledger, adoptionSuperseded record]
+  let awaiting = Map.fromListWith (flip (<>)) [(adopterKey (adoptionAdopter record), [adoptionRevision record]) | record ← ledgerRecords ledger, adoptionSuperseded record]
       holding = liveWatermark ledger
       windows = Set.unions [Map.keysSet published, Map.keysSet holding, Map.keysSet awaiting, Map.keysSet (ledgerDeferred ledger)]
       standing window =

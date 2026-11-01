@@ -97,8 +97,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , swapConstructedTexture
   , awaitVulkanAction
   )
-import Hetoimasia.GPU.Vulkan.GLFW (Image)
-import Hetoimasia.GLFW.Window (WindowId)
+import Hetoimasia.GPU.Vulkan.GLFW (Image, SceneTargetKey)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (SceneLedger, ledgerHeld)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port
 import qualified Hetoimasia.Render.TwoD.Vulkan as Render
@@ -120,7 +119,7 @@ import Hetoimasia.Render.TwoD.Vulkan.Textures
 data HostSession = HostSession
   { sessionRenderer ∷ !Render.Renderer
   , sessionTextures ∷ !Textures
-  , sessionLedger ∷ !(SceneLedger WindowId)
+  , sessionLedger ∷ !(SceneLedger SceneTargetKey)
   }
 
 -- | Why the session could not be made. A structured startup failure, not a per-request one.
@@ -170,7 +169,7 @@ renderBuilders construction =
 -- | Make the session's renderer and registry on the owner's thread, once its startup has made the device.
 -- Waits (interruptibly, in STM) for the startup and for the one action to run: this is assembly, before any
 -- texture work is admitted.
-bootstrapHost ∷ Render.Configuration → SceneLedger WindowId → VulkanHost scene → IO (Either BootstrapRefused HostSession)
+bootstrapHost ∷ Render.Configuration → SceneLedger SceneTargetKey → VulkanHost scene → IO (Either BootstrapRefused HostSession)
 bootstrapHost configuration ledger host = do
   readiness ← atomically $
     readReadiness (vulkanController host) >>= \case

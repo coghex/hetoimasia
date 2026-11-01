@@ -70,8 +70,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
-import Hetoimasia.GLFW.Window (WindowId)
-import Hetoimasia.GPU.Vulkan.GLFW (SceneLifecycle (..))
+import Hetoimasia.GPU.Vulkan.GLFW (SceneLifecycle (..), SceneTargetKey)
 import Hetoimasia.LuaEngine.Scene
   ( PreparedScene (preparedContent)
   , SceneContent (sceneSprites)
@@ -128,7 +127,8 @@ data State w = State
   }
 
 -- | The ledger of what the adopted revisions hold, keyed by the window's identity. The key is the host's
--- 'WindowId' in production ('ledgerLifecycle'); it is a parameter so that the lifecycle suite, which cannot
+-- 'SceneTargetKey' in production ('ledgerLifecycle'): a window or an offscreen target, in one key space; it is a
+-- parameter so that the lifecycle suite, which cannot
 -- mint a window identity, drives the same ledger with any ordered key.
 newtype SceneLedger w = SceneLedger (TVar (State w))
 
@@ -138,7 +138,7 @@ newSceneLedger = SceneLedger <$> newTVarIO (State Map.empty 0 0 0 Nothing)
 
 -- | The two hooks the host is configured with. Both are one transaction over pure data on the owner's
 -- thread: neither waits, calls Lua or raises.
-ledgerLifecycle ∷ SceneLedger WindowId → SceneLifecycle GraphicsScene
+ledgerLifecycle ∷ SceneLedger SceneTargetKey → SceneLifecycle GraphicsScene
 ledgerLifecycle ledger =
   SceneLifecycle
     { sceneAdopted = \window revision scene → ledgerAdopted ledger window revision scene

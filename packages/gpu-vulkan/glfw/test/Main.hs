@@ -6,7 +6,8 @@
 -- "Test.GPU.Vulkan.GLFW.Consumer"; and for GRS-15's surface-free sessions and
 -- owner-thread actions, "Test.GPU.Vulkan.GLFW.Actions"; and for the
 -- fixture-aware example bound they all run under,
--- "Test.GPU.Vulkan.GLFW.Rescue". This module declares none of its own. 'configFailOnEmpty' makes a selection that
+-- "Test.GPU.Vulkan.GLFW.Rescue"; and for LFE-27's offscreen scene targets,
+-- "Test.GPU.Vulkan.GLFW.Targets". This module declares none of its own. 'configFailOnEmpty' makes a selection that
 -- matches no example a failure rather than a silent pass.
 --
 -- @tools/vulkan/run.sh test@ is what builds and runs this suite, as part of
@@ -19,7 +20,8 @@ import qualified Test.GPU.Vulkan.GLFW.Controller as Controller
 import qualified Test.GPU.Vulkan.GLFW.Loop as Loop
 import qualified Test.GPU.Vulkan.GLFW.Rescue as Rescue
 import qualified Test.GPU.Vulkan.GLFW.Scenes as Scenes
+import qualified Test.GPU.Vulkan.GLFW.Targets as Targets
 import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWith)
 
 main ∷ IO ()
-main = hspecWith defaultConfig {configFailOnEmpty = True} (Controller.spec >> Loop.spec >> Consumer.spec >> Actions.spec >> Scenes.spec >> Rescue.spec)
+main = hspecWith defaultConfig {configFailOnEmpty = True} (Controller.spec >> Loop.spec >> Consumer.spec >> Actions.spec >> Scenes.spec >> Targets.spec >> Rescue.spec)
