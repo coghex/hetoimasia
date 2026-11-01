@@ -13,8 +13,8 @@ record](macos-owner-confirmations.md)). What each completion condition and slice
 | | |
 | --- | --- |
 | Producer | the group `test.vulkan-run-native`, command `bash tools/vulkan/run.sh native hetoimasia:test:run-native-tests -- --complete`, prepared by `bash tools/vulkan/run.sh build hetoimasia:exe:hetoimasia hetoimasia:test:run-native-tests` (the `Lua native milestone` subgroup is selectable alone with `--match 'Lua native milestone'`) |
-| Receipt | [`receipts/test.vulkan-run-native.json` of the pull request's CI run](https://github.com/coghex/hetoimasia/actions/runs/41333406184/attempts/1), outcome `passed`, 12.442 s of its 30 s budget; 43 examples, 0 failures ([the run's own record](linux/run-native.md)) |
-| Code | pull request head `98b1ff08f2daff2cf160a28ccffa115e63bc885e`, executed as the merged candidate commit `909a6b1ed3d7fbcceb5d4d56e49e19740eb5aec1` (tree `785f020de8243337149ea9a8b6156c8d3574f7e6`) |
+| Receipt | [`receipts/test.vulkan-run-native.json` of the pull request's CI run](https://github.com/coghex/hetoimasia/actions/runs/41337689618/attempts/2), outcome `passed`, 15.148 s of its 30 s budget; 52 examples, 0 failures ([the run's own record](linux/run-native.md)) |
+| Code | pull request head `e50c36c4aad738e288d3ee4b7c308163fbdc92ee`, executed as the merged candidate commit `36d42efbd864c1d86f442976d47b536d8f3db9b9` (tree `3c741ceb69714276f92568ea78c0da3b9b32a7a9`) |
 | Runner | Linux X64, runner class `display`; CI image `sha256:71ef73f2fd6432b1b70bc96dc0ab7ded728091ad76232309c7e4ec58858603cb` |
 | Display | an isolated Xvfb (1280 x 1024 x 24) with the Openbox window manager that `tools/display/x11.sh` starts for the one command; no compositor; no colour management |
 | Device, loader, layer | software Vulkan `lvp 1.4.318 9d69cae2004b`, loader `1.3.275 e833b010f814`, `VK_LAYER_KHRONOS_validation 1.3.275 1d486283e4ce +synchronization` |
@@ -67,17 +67,21 @@ is captured **alone**, before the second exists, and the second (created last) i
 
 ## Lifecycle records
 
-Each record lists, per window, the attachment, every submission with its completion and every presentation with its retirement as the host's own
-events reported them (`FrameSubmitted`/`SubmissionCompleted`, `FramePresented`/`PresentationRetired`), what is still outstanding (always empty where the
-case asserts it: a texture identity is released only after its window's obligations finished), and the texture identities the scene ledger held at the
-points the case reads them. A texture is the same texture across time when the same identity is held; a reload would show as a new one.
+Each record states what the host's own records said about a window's disposal, read where it was made. The host's native-call observer reports each
+disposal of a window's graphics (`vkDestroySwapchainKHR`, `vkDestroyImageView`, `vkDestroySurfaceKHR`) on the graphics owner's thread, the thread that also
+reports the frame events; the harness takes each call's place among those events as it begins. For every such disposal the record lists the window's
+attachments, the submissions its frames had made and which had a `SubmissionCompleted`, the presentations and which had a `PresentationRetired`, **among the
+events before that place**: the cases assert nothing is outstanding there, so a disposal that preceded its completions fails the case, and a completion
+that arrives afterwards does not rescue it. A window that never attached (an instance ended before its window presented, as in the two pending-work cases)
+has no graphics to dispose and the record says so (`"attached": false`). The records also carry the texture identities the scene ledger held where the
+case reads them: a texture is the same texture across time when the same identity is held, and a reload would show as a new one.
 
 | File | What it records |
 | --- | --- |
-| [`lifecycle--initial-empty.json`](linux/lifecycle--initial-empty.json) | no texture identity held while the read was held, one after it was released, the instance never ended, the window's obligations finished at the end |
-| [`lifecycle--pending-read.json`](linux/lifecycle--pending-read.json) | A ended with its read held: the peer's identity unchanged after the late result was discarded, A's obligations finished |
-| [`lifecycle--pending-window.json`](linux/lifecycle--pending-window.json) | A ended with its creation outcome withheld: the peer's identity unchanged after the late result was retired, A's obligations finished |
-| [`lifecycle--two-instances.json`](linux/lifecycle--two-instances.json) | two instances, one path: the two texture identities the scene ledger held, A's frames' submissions and presentations all completed and retired at its disposal, B holding the same identity after A ended and after a further frame, the logical owner's tick from the middle to the end of the case (it advanced), no user close |
+| [`lifecycle--initial-empty.json`](linux/lifecycle--initial-empty.json) | no texture identity held while the read was held, one after it was released, the instance never ended, the window's ordered disposal after its ended instance |
+| [`lifecycle--pending-read.json`](linux/lifecycle--pending-read.json) | A ended with its read held: the peer's identity unchanged after the late result was discarded; A's window never attached, so it had nothing to dispose |
+| [`lifecycle--pending-window.json`](linux/lifecycle--pending-window.json) | A ended with its creation outcome withheld: the peer's identity unchanged after the late result was retired; A's window never attached |
+| [`lifecycle--two-instances.json`](linux/lifecycle--two-instances.json) | two instances, one path: the two texture identities the scene ledger held, A's ordered disposal and B's, B holding the same identity after A ended and after a further frame, the logical owner's tick from the middle to the end of the case (it advanced), no user close |
 
 ## What the cases establish, and what they do not
 
@@ -106,7 +110,7 @@ points the case reads them. A texture is the same texture across time when the s
 
 ## macOS
 
-The unattended macOS receipt (the catalog's `--complete` profile under the desktop consent, which never holds) passes all 43 examples; it
+The unattended macOS receipt (the catalog's `--complete` profile under the desktop consent, which never holds) passes all 52 examples; it
 records each owner-confirmation checkpoint as pending. The supervised run and the actual command's quad and close are the owner's, once, at the approved head,
 through the manager; their record supersedes [the pending file](macos-owner-confirmations.md). The restore case is the
 regression check for [#581](https://github.com/coghex/hetoimasia/issues/581): a restored window must report itself drawable with no further sample.

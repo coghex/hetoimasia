@@ -75,8 +75,8 @@ before LFE-25). Merged prerequisites are separate from this pull request.
   by a diagnostic verdict that fails on any issue; instance ended with its accepted scene referencing a released texture; ended
   with its texture read held and with its window creation outcome withheld; peer kept live and correct; user close of either window is one
   session quit; an injected (labelled) clean refusal beside a live peer; the initial empty window observed while its read is held and then
-  the quad in the same window; and machine-readable lifecycle records (texture identities from the scene ledger, submission and presentation completion
-  from the host's events) asserted at each disposal.
+  the quad in the same window; and machine-readable lifecycle records (texture identities from the scene ledger; each disposal of a window's graphics placed among the host's frame events and
+  judged against the submissions and presentations that preceded it) asserted at each disposal.
 * The **actual command** (`run --vulkan-validation`) as an owned child: native close by `WM_DELETE_WINDOW` to its exact window (exit 0),
   the logical-failure red clear (exit 1), Lua quit (exit 0), each judging the validation record, the layer's announcement and the
   absence of lost-records warnings.
