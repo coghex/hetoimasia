@@ -71,10 +71,12 @@ before LFE-25). Merged prerequisites are separate from this pull request.
   catalog group's `--complete` profile (`test.vulkan-run-native`), with a test-only isolated-X11 window helper
   (`tools/x11-window/x11_window.py`, no product interface, no VK-19 change) whose device-free examples run in `test.workflow`.
 * Real-device **two-instance** cases (one UI VM, two engine-owned instances of the shipped content, an independent logical
-  owner, one PNG path requested by both) over a host the suite composes with the validation layer and synchronization validation, judged
+  owner with its own VM and an owned exact-tick pump whose status the UI reads from its real instance, one PNG path requested by both) over a host the suite composes with the validation layer and synchronization validation, judged
   by a diagnostic verdict that fails on any issue; instance ended with its accepted scene referencing a released texture; ended
   with its texture read held and with its window creation outcome withheld; peer kept live and correct; user close of either window is one
-  session quit; an injected (labelled) clean refusal beside a live peer.
+  session quit; an injected (labelled) clean refusal beside a live peer; the initial empty window observed while its read is held and then
+  the quad in the same window; and machine-readable lifecycle records (texture identities from the scene ledger, submission and presentation completion
+  from the host's events) asserted at each disposal.
 * The **actual command** (`run --vulkan-validation`) as an owned child: native close by `WM_DELETE_WINDOW` to its exact window (exit 0),
   the logical-failure red clear (exit 1), Lua quit (exit 0), each judging the validation record, the layer's announcement and the
   absence of lost-records warnings.
