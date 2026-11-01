@@ -215,3 +215,22 @@ cabal test hetoimasia-tests --test-show-details=direct
   adapter's suites (its host is private), so the lane's behaviour under a key is the
   `scene retention` group's model, which is generic in the key and injected evidence, and
   the native group above.
+  Its pixel evidence (LFE-24) is the fourth native group, `Lua offscreen pixels`, which also opens
+  no window and renders no screen: the shipped `samples/lua-quad/content` unchanged and small
+  purpose-built Lua programs with committed technical PNG fixtures run as the roles of a real
+  `runSession` over the production host, facade, scene publisher, hold ledger and release barrier,
+  with only the display target substituted (a surface-free offscreen scene target registered
+  through LFE-27's interface, recorded only through the host's recording boundary into a managed
+  RGBA8 sRGB colour target and read back after the batch's own ticket completed). Every
+  determinate pixel is judged by the render-2d oracle, and independently by hand-stated colours
+  and the oracle over the specification. It writes lossless PNG readbacks and a machine-readable
+  record per image under `HETOIMASIA_VALIDATION_EVIDENCE`. The same consent and command, with
+  `-- --match 'Lua offscreen pixels'`; an empty selection fails; its record reports `windows: 0`.
+  Its device-free half is the `Lua offscreen pixels comparator` group of `lua-engine-graphics-tests`
+  (group `test.vulkan-headless`): the committed fixtures against their SHA-256 and the decoder, the
+  hand-stated numbers against the oracle, and the comparator rejecting the representative defects
+  on synthetic readbacks. The design's wording for the owner of these tests is "the Vulkan headless
+  runner"; that lane (`run.sh test`) creates no device by contract, so the real-pixel group is in the
+  native lane, as R2D-7's offscreen pixels are. See
+  [the adapter's README](../packages/lua-engine-graphics/README.md#lua-offscreen-pixels-lfe-24) and
+  [the evidence](evidence/lfe24-offscreen-pixels/README.md).

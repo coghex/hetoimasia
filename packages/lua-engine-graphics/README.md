@@ -199,6 +199,10 @@ owner nor touches a peer's independent texture.
   digest, command, platform and driver manifest, validation outcome and the accounting each example measured. A run
   without consent refuses and exits non-zero; a skipped run is not a pass.
 
+  Its `Lua offscreen pixels` group (LFE-24) draws what Lua authored into a managed offscreen colour target with no window and
+  judges every pixel; see [Lua offscreen pixels (LFE-24)](#lua-offscreen-pixels-lfe-24). Its device-free half, the `Lua
+  offscreen pixels comparator` group, is in `lua-engine-graphics-tests`.
+
 ## The window provider (LFE-18)
 
 `Hetoimasia.LuaEngine.Graphics.Window.*` answers a request for **one instance-owned window** asynchronously. It is a
@@ -596,6 +600,119 @@ reservation of its own: it composes theirs. What it adds are four checks, each m
   scene state, with no pixel captured. Run it with
   `HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:lua-engine-graphics-native-tests -- --match 'graphics facade'`
   (on Linux the runner starts its own display).
+
+## Lua offscreen pixels (LFE-24)
+
+LFE-24 supplies the pixel evidence for the Lua-first quad: what Lua authored, as pixels read from a real managed colour
+target after the work that drew it completed. It adds no production code, no Lua API and no capture API (VK-19 window
+capture stays private to the Vulkan GLFW package); it is tests and technical fixtures. It does not show a native window,
+resize, zero-framebuffer behaviour or independent window retirement (LFE-25), and it makes no performance claim.
+
+### What runs for real, and the one thing that is replaced
+
+Run as the roles of a real `runSession`, from content copied to an owned temporary root before boot: the filtered Lua VMs,
+the manifest checkpoint, the anchored inventory and verified reads, module evaluation, instance and role construction
+(the logical stub runs beside the UI Lua), request ready/take, the bounded PNG decoder, texture upload and registration
+through the session's one table, the graphics facade (`graphicsInjection`), scene preparation and publication through the
+production publisher, the host's adoption, hold ledger and release barrier, and `frameCandidate`. The shipped
+`samples/lua-quad/content` runs unchanged.
+
+Only the display target is replaced. The test-only display adapter (`Test.LuaEngine.Graphics.Native.Display`) answers the
+window provider's `Port` with a surface-free offscreen scene target registered through LFE-27's public interface. The
+interfaces that form the boundary:
+
+| Interface | What the display does with it |
+| --- | --- |
+| `registerVulkanSceneTarget` | **The substitution.** A creation the provider issues becomes a registered target; no window exists or opens. |
+| `unregisterVulkanSceneTarget` | The port's close. |
+| `offscreenTargetAnswer` (over `publishVulkanTargetScene`) with `scenePublisherOver` | Lua's publication: the host's transaction, composed with the publisher's authority check and lease binding as a window's is. |
+| `recordVulkanTargetBatch` | The only way the adapter records an adopted scene: the batch is bound to the host's adopted scene and to its own ticket before anything is recorded. |
+| `readVulkanSceneState`, `SceneTargetKey` (`KeyOffscreen`) | Observation only: the revision published and adopted, the requests waiting behind the target's barrier. |
+| `withWindowProvider`, the window `Port target`, `GraphicsFacade` | Already polymorphic in the target; they carry the offscreen target through unchanged. |
+
+The adapter keeps no hold, no barrier, no ledger and no lifecycle of its own, and never calls the ledger's adopt or release
+hooks. What it stores is the identity bookkeeping the provider's port needs: which creation issued which target and which
+it has closed.
+
+### A rendering
+
+The production renderer builds a frame with `frameCandidate` and records it into a window's swapchain image, which a
+frame-less batch cannot supply. So, inside `recordVulkanTargetBatch` on the graphics owner, the adapter takes the
+`frameCandidate` output for the scene the host adopted and the target's own `FrameFacts` (the framebuffer extent, the
+logical extent and the content scale; this is the delivered operation that adapts an unchanged scene to a target's
+metrics), retargets it **in its pass target alone** to an offscreen reference that `frameTarget` resolves to the managed
+RGBA8 sRGB colour target, records it with the public `prepareSnapshot`, and copies the target to a managed readback buffer
+through checked transfer transitions. Each rendering asserts, through `validSnapshot`, that the copy equals the
+production candidate in every other value. The bytes are read only after the batch's own ticket reports completion; the
+target and the readback are released after that ticket has settled, on every way out.
+
+### Judging an image
+
+Three judges, none of them the code under test (`Test.LuaEngine.Graphics.Pixels`):
+
+1. **Hand-stated expectations**: named positions and the colours the fixture's specification puts there, worked out by hand
+   from the committed texel tables and the rectangles the case authors, with the arithmetic in a comment.
+2. **The render-2d oracle over the specification**: a snapshot written out from the same specification, with the texture
+   tables premultiplied in linear light by the test's own transfer function, not by the decoder.
+3. **The render-2d oracle over the published window-pass scene** (the `frameCandidate` output), with the managed target's
+   own `TargetSpec` as its window, judging every pixel of the readback. Indeterminate pixels are counted by reason and
+   count for no success; an unevaluable pixel or an image with no determinate pixel fails.
+
+The published scene is also compared with the specification's snapshot, ignoring only which texture handle each sprite
+names, and the oracle's expectation is required to agree with every hand-stated one. A readback that matches all of them
+cannot have come from a translator or decoder that is wrong in the ways those expectations are sensitive to (a flipped Y,
+a reversed list order, linear sampling, straight alpha, a byte 128 taken as linear light).
+
+### Pacing without sleeping
+
+A program's steps are gated on texture requests the example holds at the read pool's reader (`holdReadsOf`). The gate
+file is not a PNG and its request is optional, so letting its read go ends the request with an ordinary decode failure
+and **no upload**: Lua is paced by the example even while the example holds the graphics owner, which a texture that has
+to be uploaded could not be. The example learns that a publication was accepted from the host's own scene state.
+
+### Cases
+
+Each case is one session and one or more images; `retain` writes a lossless PNG and a machine-readable record per image
+when `HETOIMASIA_VALIDATION_EVIDENCE` names a directory.
+
+| Case | What it shows |
+| --- | --- |
+| shipped Lua quad | the unchanged content's PNG at its declared rectangle over its clear (304 × 304 target) |
+| top-left, full image, nearest | the initial scene read opaque black first; then twelve distinct texels, eight pixels to a texel, every texel at its place, nothing between neighbours |
+| ordered transparency | two partly transparent sprites over opaque black, in both list orders (separate publications), with the premultiplied overlap |
+| sRGB byte clear | a clear of byte 128 reads 128 (not 188), an opaque 128 texel reads 128, the output is opaque |
+| fractional, negative, clipping | no snapping at 0.25 and 0.75; rectangles across the left, top, right and bottom edges; a texture cropped by the top edge, neither recentred nor stretched |
+| target metrics | one accepted revision viewed at 64 × 48, 128 × 96 (scale 2), 80 × 60 and 40 × 30, with no new publication |
+| empty scene | an empty sprite list clears the earlier grid to the authored opaque colour |
+| copied scene | the script changes its table after publishing; the pixels do not change until it publishes again |
+| refused publication | a malformed scene and a publication naming a released texture are refused; the revision and the pixels are the last accepted |
+| release after publish | the owner held on a gate; the texture released straight after acceptance and before adoption; adopted, drawn twice after the release, refused for a new publication, freed only after the old batches completed |
+
+### Invariants (the D-80 table)
+
+| State | Owner | Resource | Admission and tracking | Final authority | Cancellation window | Terminal evidence | Cleanup |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| The display's scene target | the host (registry, ledger, barrier); the display holds its identity | one of `vulkanTargetCapacity` slots | `registerVulkanSceneTarget` and the display's record in one transaction | the host's `publishVulkanTargetScene`, composed with the publisher's authority | none between registration and record (one transaction); a close racing a publication is answered `TargetSceneUnknown` | the target's record absent from `readVulkanSceneState` | the port's close unregisters; the owner releases the records as their tickets complete |
+| A scene revision | the host | the textures it names, held in the ledger | accepted by the transaction, adopted by the owner | the release request's barrier, then the ticket of every batch recorded with it | a release before adoption waits behind the barrier | `readingLiveTextures` and the ledger's holds at zero | released only on tickets complete or discarded |
+| The managed target and readback, one pair per rendering | the graphics owner | an image and a buffer | an owner-thread action | `releaseConstructed` | between making and recording: released in `finally` | the release's result | after the batch's ticket settled |
+| The recording batch | the host's boundary | a frame-less batch | `recordVulkanTargetBatch`: bound to the revision and the ticket before recording | the ticket | the example's timeout | `TicketComplete` | the cleanup waits for the ticket to settle |
+| The readback bytes | the example | host-visible memory | read once | completion | not read unless complete | the bytes' SHA-256 in the record | released with the target |
+| The owner gate (release case) | the example | the owner's thread | an owner-thread action | the example's `tryPutMVar` | the surrounding `finally` | the host's scene state | opened on every exit |
+| Held reads | the composition | pool workers | `holdReadsOf` | `releaseReadsOf` | the thread handler and the composition's `finally` release all | the request's result | none left held |
+| The scenario thread | the example | a thread | `forkFinally` | its outcome | killed and waited on every exit | the outcome | the stop and the outcome are put under a masked `finally` |
+
+### Tests and evidence
+
+* The device-free half is the `Lua offscreen pixels comparator` group of `lua-engine-graphics-tests`: the committed
+  fixtures against their SHA-256 and the production decoder's texels, every hand-stated number against the oracle, the
+  comparator rejecting the defects above on synthetic readbacks (which say so), and the retargeted copy.
+* The real-device half is the `Lua offscreen pixels` group of `lua-engine-graphics-native-tests`, selected by
+  `-- --match 'Lua offscreen pixels'`; a selection that matches nothing fails.
+* Why the native lane: the design's wording is "the Vulkan headless runner", but `tools/vulkan/run.sh test` creates no
+  device by contract, so a group that draws real pixels belongs to the native lane (as R2D-7's offscreen pixels do). The
+  group opens no window and reports `windows: 0`.
+* The committed fixtures, their generator, texel tables and SHA-256 are in
+  [`test-common/fixtures/pixels/`](test-common/fixtures/pixels/README.md): technical test assets, not production art.
 
 ## Limits
 
