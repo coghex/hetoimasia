@@ -168,7 +168,9 @@ cabal test hetoimasia-tests --test-show-details=direct
   with `HETOIMASIA_DEBUG=gpu.vulkan.diagnostics`) with synchronization validation among its enables, and
   the diagnostic verdict must be clean through teardown. Each case sends the
   signal only after the resolved root, the validation record and the session's start gate, and requires
-  `failures=0 verdict=VerdictInterrupted`. It is built, with the executable it launches, in the group's preparation stage
+  `failures=0 verdict=VerdictInterrupted`. The suite's child helper (`Test.Run.Native.Child`) has its own harness examples first
+  (`Test.Run.Native.ChildSpec`: a failure part-way through acquisition, a cancellation during the release, a child that
+  cannot be confirmed reaped or drained, the body's failure preserved), run against `/bin/sh` children with no native session. It is built, with the executable it launches, in the group's preparation stage
   (`bash tools/vulkan/run.sh build hetoimasia:exe:hetoimasia hetoimasia:test:run-native-tests`) and run,
   unbuilt, by `bash tools/vulkan/run.sh native hetoimasia:test:run-native-tests -- --complete`. It
   captures no pixel and reads no window back. See [run_command.md](run_command.md).
