@@ -93,6 +93,7 @@ concrete precondition
 - [x] LFE-23. Qualify integrated failure and two-instance ownership headlessly — [#538]
 - [x] LFE-27. Give a surface-free scene target the host's scene barrier, ledger identity and adopt/release lifecycle — [#576]
 - [x] LFE-24. Verify Lua-authored output through offscreen pixels — [#539]
+- [x] LFE-28. Select optional Vulkan validation for `hetoimasia run` and record what actually loaded — [#579]
 - [x] LFE-25. Qualify native windows, independent retirement and quit — [#540]
 
 The twenty-six LFE slices below have manager process signoff under D-80;
@@ -101,7 +102,9 @@ by D-79; the manager owns the #145 tracker mutation. Ledger revision D-80
 inserts new LFE-26 after LFE-13, preserving LFE-14–LFE-25 IDs and their order.
 LFE-27 (#576) was added on 2026-11-01 as a prerequisite of LFE-24 (see its entry);
 the next free number after LFE-26 was used, and it sits before LFE-24 in the list
-because LFE-24 depends on it. LFE-14–LFE-26 IDs are unchanged.
+because LFE-24 depends on it. LFE-28 (#579) was added on 2026-11-01 as a prerequisite of
+LFE-25's validated receipts (see its entry); the next free number after LFE-27 was used, and it
+sits before LFE-25 in the list because LFE-25 depends on it. LFE-14–LFE-27 IDs are unchanged.
 
 ## Epic contract
 
@@ -9432,9 +9435,32 @@ replace boundary tests, prove performance or establish confinement.
   pixels are in the native lane, which opens no window for this group. No production code, Lua API
   or capture API was added; no performance or new platform-support claim is made.
 
+#### LFE-28. Select optional Vulkan validation for `hetoimasia run` and record what actually loaded
+
+- **Depends on:** LFE-24 (#539) and LFE-27 (#576), both merged. Blocks LFE-25's validated receipts.
+- **Origin:** LFE-25's solver found (`#het-lfsolve`, msgid `v9gxvt5jhzu76p9fvcwxbkmkns`) that the production composition loads
+  no validation layer: `run/Hetoimasia/Run/Graphics.hs` builds `vulkanHostConfig (defaultHostConfig [])` with empty
+  `vulkanLayers`/`vulkanValidationFeatures`, and `hetoimasia run` takes no option. Owner decision 2026-11-01 (manager pane),
+  verbatim: "we should have optional validation, but im not sure that a switch or a field in hooks is better. pick the better
+  option and make a new issue to bring vulkan validation layers in as an option, they can be useful, but i know that they may
+  not all work right on molten, so check how synarchy does it, and see if we cant mirror that implementation". Manager signoff
+  of the draft, 2026-11-01 (`#het-lfsolve`, request user-het-lfsolve-20261022-1413).
+- **Boundary:** a run-time `--vulkan-validation` option of `hetoimasia run` (off by default) and a plain in-process
+  configuration field, resolved best-effort against what the loader offers (the layer, then the synchronization-validation
+  feature only through an enabled layer that offers it), a missing layer or feature a warning and never a failure, a typed
+  requested-versus-resolved record logged once. Mirrors Synarchy's pure `planVulkanInstance`, but the decision lives where the
+  loader's offer is known (the owner's instance startup), because Hetoimasia's `planInstance` is strict and stays so for the
+  samples and native suites. The pinned macOS debug-messenger naming crash stays unreachable. Run time, not a build flag, so
+  the actual command child can be validated.
+- **Decisions relied on:** D-74 (the run grammar), D-80 (invariant table and same-shape sweep); `docs/gpu_backend.md` names and
+  labels (the messenger is never named).
+- **Acceptance:** see [#579](https://github.com/coghex/hetoimasia/issues/579).
+- **Owner/tests:** `run` (grammar, composition), `gpu-vulkan/native` (the pure resolution) and `gpu-vulkan/glfw`; headless Hspec plus
+  one native case of the actual command per platform route in `run-native-tests`.
+
 #### LFE-25. Qualify native windows, independent retirement and quit
 
-- **Depends on:** LFE-24.
+- **Depends on:** LFE-24, LFE-28 (#579; validated receipts).
 - **Boundary:** final full-product Linux X11 and local macOS qualification using
   the approved native harness/consent rules. Exercise the actual command and
   a public-composition two-instance harness with the same content path. Existing
@@ -9464,6 +9490,7 @@ replace boundary tests, prove performance or establish confinement.
 | Window/texture/scene calls and per-instance ownership | LFE-16–LFE-21 |
 | Concurrent boot, role status, guard/quit/output/exit | LFE-12, LFE-13, LFE-26, LFE-22, LFE-23 |
 | Two-instance qualification, actual pixel/native output | LFE-23–LFE-25, LFE-27 |
+| Optional Vulkan validation in the production command | LFE-28 |
 
 The plan has twenty-seven slices (LFE-27 added 2026-11-01) and no unassigned approved M1 service family.
 That coverage statement is a design mapping, not proof that implementation
