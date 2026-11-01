@@ -50,7 +50,7 @@ before LFE-25). Merged prerequisites are separate from this pull request.
 | LFE-27 | Give a surface-free scene target the host's scene barrier, ledger identity and adopt/release lifecycle | #576 | PR #577 `941f0e88` | headless host cases, and one real-device case that renders no window |
 | LFE-24 | Verify Lua-authored output through offscreen pixels | #539 | PR #578 `b7822bbd` | **offscreen**: real pixels read back from a managed target on a real device (`test.vulkan-lua-engine-native`); no window |
 | LFE-28 | Select optional Vulkan validation for `hetoimasia run` and record what actually loaded | #579 | PR #580 `7597eb5f` | device-free plan examples, and native cases of the built command (`test.vulkan-run-native`) |
-| LFE-25 | Qualify native windows, independent retirement and quit | #540 | **this pull request, pending merge** | **native**: Linux isolated-X11 captures and the actual command's close (CI receipt); macOS unattended receipt; macOS owner confirmations **pending** |
+| LFE-25 | Qualify native windows, independent retirement and quit | #540 | **merged** (#582, `4f5c3b40`) | **native**: Linux isolated-X11 captures and the actual command's close (CI receipt); macOS unattended receipt; macOS owner confirmations **confirmed** ([record](macos-owner-confirmations-record.md)) |
 
 ## The completion conditions of #514 (Required M1 behavior)
 
@@ -85,8 +85,8 @@ before LFE-25). Merged prerequisites are separate from this pull request.
 ## Still owed, and limits
 
 * **macOS owner visual confirmations** (the quad in both windows, resize clipping, peer survival, the actual command's quad and
-  close) are **pending**: the manager runs them once at the approved head with the owner present. The pull request carries
-  [the pending entries](macos-owner-confirmations.md); a record landed with `docs-push` after the merge supersedes it.
+  close) are **confirmed** (all six, once, at the approved head `f7ffd77a`, run by the manager with the owner present). The pull request
+  carried [the pending entries](macos-owner-confirmations.md); [the confirmation record](macos-owner-confirmations-record.md) supersedes them.
 * The **native zero-area framebuffer row is unexercised** on both receipts' platforms (a minimized window's framebuffer was not reported with zero area); the controlled zero-metrics coverage belongs to LFE-18, LFE-20 and the host's suspended-target cases and is not
   claimed here as native.
 * A restored window once stayed undrawn on macOS until something sampled it again ([#581](https://github.com/coghex/hetoimasia/issues/581), fixed in `bb163cfa`); the restore case is now its regression check.

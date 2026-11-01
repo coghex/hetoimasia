@@ -5,8 +5,8 @@ windows presented on the isolated Linux X11 display for the shipped `samples/lua
 through the two-instance harness composed over the public interfaces, with an independent logical owner. **The images are technical
 test assets (the 8 x 8 technical fixture of `samples/lua-quad`), not production art.** A capture is what a window presented; it is never
 evidence of GPU retirement, which these cases establish only through the host's and the adapter's own records (the lifecycle records
-below). The macOS entries are **pending**: there is no OS capture on macOS, and the owner's visual confirmations are owed ([the pending
-record](macos-owner-confirmations.md)). What each completion condition and slice of the epic rests on is in [the coverage document](coverage.md).
+below). The macOS entries are **owner-confirmed** (all six, at the approved head `f7ffd77a`; there is no OS capture on macOS, so these are the owner's
+own answers: [the confirmation record](macos-owner-confirmations-record.md), which supersedes [the pending file](macos-owner-confirmations.md)). What each completion condition and slice of the epic rests on is in [the coverage document](coverage.md).
 
 ## Identities (Linux)
 
@@ -112,5 +112,5 @@ case reads them: a texture is the same texture across time when the same identit
 
 The unattended macOS receipt (the catalog's `--complete` profile under the desktop consent, which never holds) passes all 54 examples; it
 records each owner-confirmation checkpoint as pending. The supervised run and the actual command's quad and close are the owner's, once, at the approved head,
-through the manager; their record supersedes [the pending file](macos-owner-confirmations.md). The restore case is the
+through the manager; [their record](macos-owner-confirmations-record.md) supersedes [the pending file](macos-owner-confirmations.md) and reads all six CONFIRMED. The restore case is the
 regression check for [#581](https://github.com/coghex/hetoimasia/issues/581): a restored window must report itself drawable with no further sample.
