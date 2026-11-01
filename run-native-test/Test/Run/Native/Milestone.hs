@@ -16,10 +16,11 @@ module Test.Run.Native.Milestone (spec) where
 
 import Control.Concurrent.STM (atomically, readTVar, readTVarIO, retry)
 import Control.Concurrent (forkIO, myThreadId, throwTo)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (newTVarIO)
-import Control.Exception (AsyncException (UserInterrupt), ExceptionWithContext (..), SomeException, finally, fromException, onException, tryWithContext)
+import Control.Exception (AsyncException (UserInterrupt), ExceptionWithContext (..), SomeException, finally, fromException, onException, tryWithContext, uninterruptibleMask_)
 import Data.List (isInfixOf)
+import Data.Maybe (isJust)
 import Test.HUnit.Lang (HUnitFailure (..))
 import Control.Monad (forM, forM_, unless)
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -462,6 +463,65 @@ spec env = describe "Lua native milestone" $ do
       doesDirectoryExist folder >>= (`shouldBe` True)
       readTVarIO never >>= (`shouldBe` False)
       evidence env "cancellation control: a caller cancelled while its scenario held a read at the pool's reader and a window creation outcome had the scenario stopped, its gates released and its instance, window and texture retired before the call returned, and the folder it borrowed was still there"
+
+  it "keeps stopping its scenario and retains the interruption, when its caller is cancelled a second time while the stop is being delivered to a scenario that cannot receive it yet" $
+    withinCase env 120 . withOwnedContent $ \folder → do
+      unwound ← newIORef False
+      inRegion ← newEmptyMVar
+      stopStarted ← newEmptyMVar
+      release ← newEmptyMVar
+      never ← newTVarIO False
+      caller ← myThreadId
+      -- The scenario cannot receive the stop (it is in an uninterruptible region), so its delivery blocks; the caller is
+      -- cancelled again at that point. Each step waits for the event before it: the scenario being in the region, the stop
+      -- being started; the scenario is released however the chain ends, so a failure here fails the example and does not hang it.
+      _ ←
+        forkIO $
+          ( takeMVar inRegion
+              >> throwTo caller UserInterrupt
+              >> takeMVar stopStarted
+              >> throwTo caller UserInterrupt
+          )
+            `finally` tryPutMVar release ()
+      outcome ← tryWithContext @SomeException . withPeersUsing noPeersHooks {hookStopping = () <$ tryPutMVar stopStarted ()} (envStart env) folder $ \peers → do
+        holdNextReads peers quadPath 1
+        withholdNextCreations peers 1
+        _ ← admitUi peers
+        _ ← awaitNewWindow peers []
+        readsEntered peers quadPath 1
+        ( do
+            putMVar inRegion ()
+            uninterruptibleMask_ (takeMVar release)
+            atomically (readTVar never >>= \set → unless set retry)
+          )
+          `finally` writeIORef unwound True
+      case outcome of
+        Left failure@(ExceptionWithContext _ cancelled) → do
+          (fromException cancelled ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
+          cancellationProblems failure `shouldBe` []
+          -- The second cancellation is kept beside the first, not lost.
+          retainedLabels failure `shouldSatisfy` elem "a further interruption while the scenario was being stopped"
+        Right () → expectationFailure "the cancelled call returned normally"
+      readIORef unwound >>= (`shouldBe` True)
+      doesDirectoryExist folder >>= (`shouldBe` True)
+      evidence env "cancellation control, second cancellation: a caller cancelled again while the stop was being delivered to a scenario in an uninterruptible region kept stopping it, joined the application, retained the further interruption beside the first and the application's end (the scenario's cancellation, a clean attached verdict, no cleanup failure), and the folder it borrowed was still there"
+
+  it "retains the application's terminal failure and its clean diagnostic verdict when its caller is cancelled as the application ends, before the result is published" $
+    withinCase env 120 . withOwnedContent $ \folder → do
+      caller ← myThreadId
+      -- The cancellation is delivered from the main thread after the application has ended and before its result reaches the caller.
+      outcome ← tryWithContext @SomeException . withPeersUsing noPeersHooks {hookBeforeResult = throwTo caller UserInterrupt} (envStart env) folder $ \_ →
+        expectationFailure "the scenario failed on purpose"
+      case outcome of
+        Left failure@(ExceptionWithContext _ cancelled) → do
+          (fromException cancelled ∷ Maybe AsyncException) `shouldBe` Just UserInterrupt
+          case applicationEnds failure of
+            [end@(ExceptionWithContext _ ended)] → do
+              teardownProblems end `shouldBe` []
+              (fromException ended ∷ Maybe HUnitFailure) `shouldSatisfy` isJust
+            other → expectationFailure ("the application's end was retained " <> show (length other) <> " times, not once")
+        Right () → expectationFailure "the cancelled call returned normally"
+      evidence env "cancellation control, completion race: a caller cancelled after the application had ended and before its result was published still collected the application's terminal failure with its clean diagnostic verdict, retained beside the cancellation"
 
   it "answers an INJECTED clean refusal of one window's standing as that instance's required window failure, retires the window the host really made and the instance's texture, and leaves the live peer unaffected" $
     withinCase env 120 . withOwnedContent $ \folder →

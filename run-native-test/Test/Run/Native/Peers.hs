@@ -52,9 +52,14 @@ module Test.Run.Native.Peers
   , teardownProblems
   , judgeTeardown
   , cancellationProblems
+  , applicationEnds
+  , retainedLabels
   , judgeCancellation
   , applicationLabel
   , withOwnedLoop
+  , PeersHooks (..)
+  , noPeersHooks
+  , withPeersUsing
   ) where
 
 import Control.Concurrent.STM
@@ -69,14 +74,14 @@ import Control.Concurrent.STM
   , writeTVar
   )
 import Control.Concurrent (forkIOWithUnmask, killThread, myThreadId, threadDelay, throwTo)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryReadMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Exception (Exception, ExceptionWithContext (..), SomeException, finally, fromException, mask, onException, rethrowIO, throwIO, tryWithContext, uninterruptibleMask_)
 import System.IO (hPutStrLn, stderr)
 import System.Timeout (timeout)
-import Control.Monad (forM_, forever, join, unless, when)
+import Control.Monad (forM_, forever, join, unless, void, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
-import Data.Maybe (isJust, isNothing)
+import Data.Maybe (isJust)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Set (Set)
@@ -148,7 +153,7 @@ import Hetoimasia.LuaEngine.Request (m1Requests)
 import Hetoimasia.LuaEngine.Texture (specIoWorkers, textureSpec, withTexturePipeline)
 import Hetoimasia.Run.Boot (Prepared (..), withPrepared)
 import Hetoimasia.Run.Serve (Owner (..), serveSpawned, runOwned)
-import Hetoimasia.Run.Settle (answering, combine, isAsynchronous, rememberingInterruption)
+import Hetoimasia.Run.Settle (answering, combine, isAsynchronous)
 import Hetoimasia.Runtime.GLFW
   ( ScheduledStep (..)
   , UpdateSchedule (NoUpdateDemand)
@@ -248,13 +253,31 @@ applicationLabel = "the harness application, which had to be stopped and joined"
 -- scenario across a cancellation of its caller too: the application is run on the process main thread (queued through
 -- @start@), so a caller that is cancelled while it waits (an example's bound expiring, say) cannot simply walk away.
 -- It then stops the scenario (a cancellation delivered to the session thread, which releases every gate and retires
--- everything on its way out), waits without a bound for the application to have ended, and only then raises the
--- cancellation, with the application's own failure (and its verdict and cleanup failures) retained beside it. The
+-- everything on its way out), waits without a bound for the application's terminal result (kept where the caller can always
+-- read it, so a result published at the moment of the cancellation is not missed), and only then raises the cancellation,
+-- with the application's own failure (and its verdict and cleanup failures) retained beside it. The stop and the wait are
+-- not interruptible by a further cancellation: each further one is retained beside the first. The
 -- folder the caller prepared is therefore never removed under a scenario that still borrows it.
 --
 -- The folder is the owned copy of the content the caller prepared.
 withPeers ∷ (∀ x. IO x → IO (IO x)) → FilePath → (Peers → IO a) → IO a
-withPeers start folder scenario = mask $ \restore → do
+withPeers = withPeersUsing noPeersHooks
+
+-- | The seams the cancellation examples reach 'withPeers' through, so that an interruption can be delivered at an exact
+-- point with explicit synchronization. The harness's users have none.
+data PeersHooks = PeersHooks
+  { hookStopping ∷ IO ()
+  -- ^ Run, by the caller, each time it is about to deliver the scenario's stop (before the delivery, which can block).
+  , hookBeforeResult ∷ IO ()
+  -- ^ Run on the main thread once the application has ended and before its result is published to the caller.
+  }
+
+noPeersHooks ∷ PeersHooks
+noPeersHooks = PeersHooks (pure ()) (pure ())
+
+-- | 'withPeers' with the examples' seams.
+withPeersUsing ∷ ∀ a. PeersHooks → (∀ x. IO x → IO (IO x)) → FilePath → (Peers → IO a) → IO a
+withPeersUsing hooks start folder scenario = mask $ \restore → do
   textureConfiguration ← either (\refused → ioError (userError ("the profile cannot be mapped to the native graphics: " <> show refused))) pure (configurationFor fixedM1Profile)
   scenes ← newSceneSession
   frames ← newTVarIO (0, [])
@@ -262,7 +285,8 @@ withPeers start folder scenario = mask $ \restore → do
   jobs ← newTVarIO []
   abort ← newTVarIO False
   sessionThread ← newIORef Nothing
-  ended ← newEmptyMVar
+  resultVar ← newEmptyMVar
+  stopDelivered ← newIORef False
   verdictCell ← newIORef Nothing
   slot ← newIORef Nothing
   let capture = defaultCaptureConfig {captureTextBudget = 16384}
@@ -276,18 +300,28 @@ withPeers start folder scenario = mask $ \restore → do
           }
       -- Stop the scenario: latch the request first, then deliver it to the session thread if that already exists; a
       -- session that starts later reads the latch before it runs the scenario. Either order reaches it.
+      -- Once delivered it is not delivered again (a second delivery would reach the scenario while it unwinds); a delivery that
+      -- was interrupted before it happened is made again by the next call. The delivery can block while the scenario is masked.
       cancelScenario = do
         atomically (writeTVar abort True)
-        readIORef sessionThread >>= mapM_ (\thread → throwTo thread ScenarioCancelled)
+        delivered ← readIORef stopDelivered
+        unless delivered $ do
+          hookStopping hooks
+          readIORef sessionThread >>= mapM_ (\thread → throwTo thread ScenarioCancelled)
+          writeIORef stopDelivered True
       -- The application's outcome travels as /data/, context included. The suite's own plumbing for a main-thread job
       -- re-throws a failure as a fresh exception, which would drop the capture's verdict and the cleanup evidence it
       -- attached; a failure that is data is raised again by 'rethrowIO' in the caller with all of it. A cancellation of the
       -- main thread itself is still raised on it.
-      run = (`finally` putMVar ended ()) $ do
-        result ← tryWithContext @SomeException application
+      -- It is stored here, where the caller can always read it, and not only handed over by the job helper after the fact:
+      -- the application's end and the availability of its result are one step.
+      run = mask $ \restoreRun → do
+        result ← tryWithContext @SomeException (restoreRun application)
+        hookBeforeResult hooks
+        putMVar resultVar result
         case result of
           Left failure | isAsynchronous failure → rethrowIO failure
-          _ → pure result
+          _ → pure ()
       application = withLoggingLifetime quietLogger $ \lifetime → do
         outcome ←
           runOwned slot cancelScenario $
@@ -306,29 +340,23 @@ withPeers start folder scenario = mask $ \restore → do
         verdict ← readIORef verdictCell
         verdictCleanOrFail verdict
         pure outcome
-  waitMain ← start run
-  outcome ← tryWithContext @SomeException (restore waitMain)
-  stillRunning ← isNothing <$> tryReadMVar ended
-  if not stillRunning
-    then either rethrowIO (either rethrowIO pure) outcome
-    else do
-      -- The wait was interrupted before the application ended: it still owns the scenario, the gates, the windows and
-      -- the borrowed folder. Stop it, join it, and keep what it ends with beside the interruption.
-      cancelScenario
-      interruption ← rememberingInterruption (readMVar ended)
-      applicationEnd ← tryWithContext @SomeException waitMain
-      let ended' = case applicationEnd of
-            Left failure → [failure]
-            Right (Left failure) → [failure]
-            Right (Right _) → []
-      case outcome of
-        Left primary →
-          rethrowIO
-            =<< combine
-              (maybe primary id interruption)
-              ([(applicationLabel, failure) | failure ← ended'] <> [("the wait that was interrupted", primary) | Just _ ← [interruption]])
-        Right (Left failure) → rethrowIO failure
-        Right (Right value) → maybe (pure value) rethrowIO interruption
+  _ ← start run
+  waited ← tryWithContext @SomeException (restore (readMVar resultVar))
+  case waited of
+    Right result → either rethrowIO pure result
+    Left primary → do
+      -- The wait was interrupted. The application still owns the scenario, the gates, the windows and the borrowed folder
+      -- whether or not it has ended, and its result may be published at any moment: stop it, wait for its terminal result
+      -- without a bound, and keep what it ends with beside the interruption. No further interruption leaves this sequence;
+      -- each is retained.
+      further ← retainingInterruptions (cancelScenario >> void (readMVar resultVar))
+      result ← readMVar resultVar
+      rethrowIO
+        =<< combine
+          primary
+          ( [(applicationLabel, failure) | Left failure ← [result]]
+              <> [("a further interruption while the scenario was being stopped", interruption) | interruption ← further]
+          )
   where
     body lifetime slot cancelScenario abort sessionThread scenes textureConfiguration config vulkan control frames disposals jobs = do
       awaitReadiness vulkan
@@ -725,6 +753,18 @@ withVm context role injection tick body = do
         , boundServiceBudget = Nothing
         }
 
+-- | Run an action that must finish, running it again whenever an asynchronous exception interrupts it, and answer every such
+-- interruption, in order, once it has completed undisturbed. Called with asynchronous exceptions masked.
+retainingInterruptions ∷ IO () → IO [ExceptionWithContext SomeException]
+retainingInterruptions act = go []
+  where
+    go seen =
+      tryWithContext act >>= \case
+        Right () → pure (reverse seen)
+        Left interruption
+          | isAsynchronous interruption → go (interruption : seen)
+          | otherwise → rethrowIO interruption
+
 -- | Grant the logical owner exact ticks, one after the previous has been accounted for, paced by the system clock, for the
 -- length of the body. The thread is owned here: it is ended and joined on every way out, before the caller goes on.
 withTickPump ∷ RuntimeControl → ScheduledOwner → Duration → IO a → IO a
@@ -842,12 +882,19 @@ verdictCleanOrFail = \case
 -- retained under 'applicationLabel' (and at most the interrupted wait itself besides), that end being the scenario's
 -- cancellation with a clean attached verdict and no cleanup failure of its own.
 cancellationProblems ∷ ExceptionWithContext e → [String]
-cancellationProblems (ExceptionWithContext context _) =
-  let retained = cleanupFailuresInContext context
-      ends = [cleanupFailureException failure | failure ← retained, cleanupFailureLabel failure == applicationLabel]
-   in judgeCancellation (length retained) [(teardownProblems end, isScenarioCancelled end) | end ← ends]
+cancellationProblems failure@(ExceptionWithContext context _) =
+  judgeCancellation (length (cleanupFailuresInContext context)) [(teardownProblems end, isScenarioCancelled end) | end ← applicationEnds failure]
   where
-    isScenarioCancelled (ExceptionWithContext _ failure) = isJust (fromException failure ∷ Maybe ScenarioCancelled)
+    isScenarioCancelled (ExceptionWithContext _ inner) = isJust (fromException inner ∷ Maybe ScenarioCancelled)
+
+-- | The application's end(s) a failure retains beside it, under 'applicationLabel'.
+applicationEnds ∷ ExceptionWithContext e → [ExceptionWithContext SomeException]
+applicationEnds (ExceptionWithContext context _) =
+  [cleanupFailureException failure | failure ← cleanupFailuresInContext context, cleanupFailureLabel failure == applicationLabel]
+
+-- | The labels of the failures retained beside a failure.
+retainedLabels ∷ ExceptionWithContext e → [Text]
+retainedLabels (ExceptionWithContext context _) = map cleanupFailureLabel (cleanupFailuresInContext context)
 
 -- | The judgement itself over what was found: how many failures were retained beside the cancellation, and for each end of
 -- the application retained under its label, what its teardown said and whether it ended by the scenario's cancellation.
