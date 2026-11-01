@@ -144,7 +144,8 @@ requested layer; see
 [the compatibility record](vulkan_compatibility_record.md#zero-validation-errors-is-a-claim-about-coverage-not-just-about-count)).
 The stronger evidence is the layer's own: once it is running in the chain, the Khronos layer reports to the diagnostic capture's
 messenger at `vkCreateInstance` `Khronos Validation Layer Active`, with the features it was enabled with (for example
-`Current Enables: VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT`). The capture hands that record to the logger as a
+`Current Enables: VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT` on the macOS profile's layer 1.3.296; the Linux
+profile's 1.3.275 spells it without `_EXT`, so the case keys on the common prefix). The capture hands that record to the logger as a
 `Debug` entry of `gpu.vulkan.diagnostics`, which the command's stderr carries under the documented selection
 `HETOIMASIA_DEBUG=gpu.vulkan.diagnostics` ([logging](logging.md)); no hook is involved. The validated native case requires it exactly
 once with synchronization validation among the enables, and the case without the option requires its absence. A validation error
