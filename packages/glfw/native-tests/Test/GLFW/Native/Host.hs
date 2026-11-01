@@ -35,9 +35,11 @@ import Hetoimasia.Foundation.Time
 import Hetoimasia.GLFW.Command
 import qualified Hetoimasia.GLFW.Input as Input
 import Hetoimasia.GLFW.Internal.Native
-  ( noteProgressForCheck
+  ( WindowStateForCheck (..)
+  , noteProgressForCheck
   , takeLastWaitForCheck
   , takeWaitNotedForCheck
+  , windowStateForCheck
   )
 import Hetoimasia.GLFW.Internal.Window (windowNativeHandle)
 import Hetoimasia.GLFW.Window
@@ -118,6 +120,9 @@ spec shared = describe "window host" $ do
                   }
           )
     waits `shouldSatisfy` (>= 1)
+
+  it "resumes a restored window's rendering through the production owner turn alone, with no sample, observation request, control or mode request after the restore" $
+    testRestoredWindowResumes shared
 
   it "runs the scheduled path on the real session, progressing deadline-driven updates with no native input delivered and still waiting when it has no demand" $
     testScheduledDeadlines shared
@@ -536,6 +541,104 @@ phasesAtRelease held journal =
     "phases at release"
     (\_ → allocResource (pure ()) (\() → readIORef held >>= mapM readerPhase >>= atomically . writeTVar journal . Just))
     (\token () → untilStopped token)
+
+-- | Where the restored-window example is in its script.
+data Restoration
+  = ShowSubmitted !Natural !CompletionTicket
+    -- ^ The turn it was submitted on, and its ticket.
+  | MinimizeSubmitted !Natural !CompletionTicket
+  | RestoreSubmitted !Natural !CompletionTicket
+    -- ^ From here only the owner turn runs.
+
+-- | A window is shown, minimized and restored through the host's own command
+-- port, and then nothing but the production owner loop acts on it: no
+-- @synchronizeWindow@, no @observeWindowCommand@, no control and no mode request
+-- follow the restore, so only native event processing and the owner turn's
+-- reconciliations and follow-ups can correct a stale visible reading (#581).
+-- The hook only reads the published snapshot and, on the owner thread, the
+-- platform's own answer.
+--
+-- It runs until the whole restored-state assertion holds — iconified
+-- @Observed False@, visible @Observed True@ agreeing with the platform's own
+-- answer, and 'RenderEligible' — and never stops at the first turn that
+-- iconified reads False, because visible may legitimately turn true on a later
+-- turn. Its own budget is 'turnBound' turns of the configured 0.1-second idle
+-- wait, which covers the quick re-reads and many slow re-checks; it is this
+-- example's bound, not a production deadline. It never asserts a transient
+-- visible value; it prints how many turns the window spent restored but
+-- reading not visible, as evidence of whether the platform showed the stale
+-- reading.
+testRestoredWindowResumes ∷ Shared → Expectation
+testRestoredWindowResumes shared = do
+  stale ←
+    owned shared $ \session → do
+      script ← newIORef Nothing
+      staleTurns ← newIORef (0 ∷ Int)
+      runWindowApplication lifetime "native host" (allocWindowHostIn (pure session) (settings "restored")) id (\host _ → pure host) $ \host control → do
+        window ← onlyWindow host
+        let target = windowIdentity window
+            submit command =
+              submitWindowCommand (hostCommandPort host) [("client", "native restoration")] command >>= \case
+                SubmitAccepted ticket → pure ticket
+                other → failed ("the host's port did not admit the command: " <> show other)
+            settled ticket =
+              atomically (pollCompletion ticket) >>= \case
+                Nothing → pure False
+                Just (Performed _) → pure True
+                Just other → failed ("the command did not settle as performed: " <> show other)
+            within number started stage =
+              when (number >= started + turnBound) (failed ("the window did not complete the " <> stage <> " within the turn bound"))
+        runOwnerLoop host control $
+          LoopHooks
+            { loopLogger = quietLogger
+            , loopEvent = noApplicationEvents
+            , loopUpdate = \turn → do
+                let number = turnNumber turn
+                observation ← currentObservation window
+                readIORef script >>= \case
+                  Nothing → do
+                    ticket ← submit (showWindowCommand target)
+                    writeIORef script (Just (ShowSubmitted number ticket))
+                    pure Continue
+                  Just (ShowSubmitted started ticket) → do
+                    done ← settled ticket
+                    if done && observedVisible observation == Observed True
+                      then do
+                        minimized ← submit (minimizeWindowCommand target)
+                        writeIORef script (Just (MinimizeSubmitted number minimized))
+                      else within number started "show"
+                    pure Continue
+                  Just (MinimizeSubmitted started ticket) → do
+                    done ← settled ticket
+                    if done && observedIconified observation == Observed True
+                      then do
+                        restored ← submit (restoreWindowCommand target)
+                        writeIORef script (Just (RestoreSubmitted number restored))
+                      else within number started "minimize"
+                    pure Continue
+                  Just (RestoreSubmitted started ticket) → do
+                    done ← settled ticket
+                    if not done
+                      then within number started "restore" >> pure Continue
+                      else do
+                        platform ← windowStateForCheck (windowNativeHandle window)
+                        let restored = observedIconified observation == Observed False
+                            agrees = observedVisible observation == Observed (checkVisible platform)
+                            complete =
+                              restored
+                                && observedVisible observation == Observed True
+                                && agrees
+                                && not (checkIconified platform)
+                                && windowRenderEligibility observation == RenderEligible
+                        when (restored && observedVisible observation == Observed False) $
+                          modifyIORef' staleTurns (+ 1)
+                        if complete
+                          then Finish <$> readIORef staleTurns
+                          else do
+                            within number started "restored state"
+                            pure Continue
+            }
+  putStrLn ("glfw-native-tests restore: " <> show stale <> " owner turn(s) saw the restored window reading not visible before the loop corrected it")
 
 -- | A worker's request ended before it settled.
 newtype Stopped = Stopped String
