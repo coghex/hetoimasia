@@ -43,6 +43,9 @@
 --   "Hetoimasia.GLFW.Internal.Window.Boundary": the reconciliation protocol,
 --   and the owner boundaries, drivers, close requests, and event pump built on
 --   it.
+-- * "Hetoimasia.GLFW.Internal.Window.Revisit": the pure state of the visible
+--   follow-up after an iconify transition, which reconciliation arms and the
+--   boundary's 'revisitVisible' performs.
 -- * "Hetoimasia.GLFW.Internal.Window.Controls",
 --   "Hetoimasia.GLFW.Internal.Window.ModeAttempt" and
 --   "Hetoimasia.GLFW.Internal.Window.ModeTransition": ordinary controls and
