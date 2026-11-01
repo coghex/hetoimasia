@@ -524,10 +524,11 @@ spec = describe "The Vulkan project boundary" $ do
     filter ("tools/display/" `isInfixOf`) active `shouldBe` []
     active `shouldSatisfy` any ("--runner-class display" `isInfixOf`)
 
-  it "prepares the Lua-first engine's adapter suite apart from its execution, watches that execution for thirty seconds, and runs it with the complete profile's rules" $ do
+  it "prepares the Lua-first engine's adapter suite apart from its execution, watches that execution for sixty seconds, and runs it with the complete profile's rules" $ do
     group ← catalogGroup luaEngineNativeGroup
     (group >>= field "runner" >>= asString) `shouldBe` Just "display"
-    (group >>= field "timeout_seconds") `shouldBe` Just (JNumber 30)
+    -- Sixty: the whole profile took three seconds until the pixel group (LFE-24), which adds about twenty on the CI runner.
+    (group >>= field "timeout_seconds") `shouldBe` Just (JNumber 60)
     (group >>= stringsAt "command")
       `shouldBe` Just ["bash", runner, "native", "hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests", "--", "--complete"]
     (group >>= field "preparation" >>= stringsAt "command")
