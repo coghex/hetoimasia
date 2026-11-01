@@ -1,4 +1,4 @@
--- | @hetoimasia run GAME_ROOT@: the generic launcher (LFE-22, P-71).
+-- | @hetoimasia run [--vulkan-validation] GAME_ROOT@: the generic launcher (LFE-22, P-71).
 --
 -- The executable knows how to assemble the engine's services, not what game or scene to run. Everything a game
 -- is lives in the folder it is given: the manifest, the Lua and the content.
@@ -7,7 +7,9 @@
 --
 -- 1. The arguments are validated as a pure function ("Hetoimasia.Run.Options"). A refusal exits 2 before the
 --    folder is looked at, any signal handler is installed, a worker is started or native graphics is touched.
---    @run --help@ alone prints the help and exits 0.
+--    @run --help@ alone prints the help and exits 0. The one option, @--vulkan-validation@, is a value of that
+--    parse and reaches the graphics as the plain 'Hetoimasia.GPU.Vulkan.GLFW.ValidationChoice' of the 'production'
+--    setup (LFE-28); nothing else selects it.
 -- 2. SIGINT and SIGTERM handlers sharing one coordinator are installed for the scope of the run
 --    ("Hetoimasia.Run.Signals"), before any boot work, and put back when it ends.
 -- 3. The logging lifetime over stderr is entered; it is left last and makes the one final flush.
@@ -40,6 +42,7 @@ module Hetoimasia.Run
   , Setup (..)
   , production
   , runGame
+  , ValidationChoice (..)
   ) where
 
 import Control.Concurrent.STM (STM, atomically)
@@ -51,6 +54,7 @@ import qualified Data.Text.IO as Text
 import Hetoimasia.Console.Lua.Signals (Coordinator, stopRequested)
 import Hetoimasia.Console.Usage (usageFailure)
 import Hetoimasia.Foundation.Log (LogFilter, newHandleSink)
+import Hetoimasia.GPU.Vulkan.GLFW (ValidationChoice (..))
 import Hetoimasia.LuaEngine.Profile (fixedM1Profile)
 import Hetoimasia.LuaEngine.Session (SessionOutcome)
 import Hetoimasia.Run.Boot (BootEnd (..), BootHooks, Prepared, noBootHooks, withPreparedWith)
@@ -88,14 +92,16 @@ data Setup = Setup
   }
 
 -- | The command as it ships: a second signal leaves the process at once with 130, and the folder is run with the
--- production native graphics. No option, variable or fallback selects anything else.
-production ∷ Setup
-production = Setup forceExit (\_ → pure ()) noBootHooks (\configuration use → newHandleSink stderr >>= \sink → withRecordingLifetime configuration sink use) newSessionLink report (runNative productionEnvironment)
+-- production native graphics, asking for Vulkan validation as far as the loader offers it exactly when the choice
+-- says so ('ValidationOff' requests none). No variable, manifest field, build flag or fallback selects anything else.
+production ∷ ValidationChoice → Setup
+production choice = Setup forceExit (\_ → pure ()) noBootHooks (\configuration use → newHandleSink stderr >>= \sink → withRecordingLifetime configuration sink use) newSessionLink report (runNative productionEnvironment choice)
 
 -- | The entry in the top-level help text (full build only).
 runHelpEntry ∷ [Text]
 runHelpEntry =
-  [ "  run [--] GAME_ROOT   Run a game folder in a window (the full-product build)."
+  [ "  run [--vulkan-validation] [--] GAME_ROOT"
+  , "                       Run a game folder in a window (the full-product build)."
   , "                       See 'hetoimasia run --help'."
   ]
 
@@ -105,8 +111,8 @@ runRun ∷ LogFilter → [String] → IO ()
 runRun configuration arguments = case parseRun arguments of
   Left problem → usageFailure "hetoimasia run: " runUsage (problemReason problem)
   Right RunHelp → Text.putStr runHelp
-  Right (RunRoot path) → do
-    status ← runGame production configuration path
+  Right (RunRoot choice path) → do
+    status ← runGame (production choice) configuration path
     case status of
       ExitSuccess → pure ()
       failure → exitWith failure

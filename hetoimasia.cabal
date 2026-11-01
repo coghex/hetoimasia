@@ -283,13 +283,17 @@ test-suite hetoimasia-tests
             Test.Engine.Run.Spec
             Test.Engine.Run.Status
             Test.Engine.Run.Support
+            Test.Engine.Run.Validation
         build-depends:
             bytestring >=0.12 && <0.13,
+            containers >=0.8 && <0.9,
             hetoimasia:run,
             hetoimasia-content ==0.1.0.0,
+            hetoimasia-gpu-vulkan-glfw ==0.1.0.0,
             hetoimasia-lua-engine ==0.1.0.0,
             hetoimasia-lua-engine:facade,
             hetoimasia-lua-engine:session,
+            hetoimasia-lua-engine-graphics,
             hetoimasia-runtime ==0.1.0.0,
             hetoimasia-scripting-lua ==0.1.0.0
     else
@@ -350,6 +354,8 @@ test-suite run-native-tests
     build-tool-depends: hetoimasia:hetoimasia
     if flag(full-product)
         other-modules:
+            Test.Run.Native.Child
+            Test.Run.Native.ChildSpec
             Test.Run.Native.Command
             Test.Run.Native.Consent
             Test.Run.Native.Env

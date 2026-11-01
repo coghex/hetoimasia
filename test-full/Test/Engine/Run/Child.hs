@@ -22,7 +22,7 @@ import Control.Concurrent.STM (atomically, check)
 import Control.Exception (finally)
 import Control.Monad (forever)
 import Hetoimasia.Foundation.Log (LogFilter (..), defaultLogFilter)
-import Hetoimasia.Run (Setup (..), production, runGame)
+import Hetoimasia.Run (Setup (..), ValidationChoice (..), production, runGame)
 import Hetoimasia.Run.Session (productionEnvironment)
 import System.Environment (lookupEnv)
 import System.Exit (exitWith)
@@ -46,8 +46,8 @@ childEntry =
       game ← lookupEnv gameVariable >>= maybe (fail "no game folder was named") pure
       let configuration = defaultLogFilter {filterEnabled = True}
           setup = case mode of
-            "orderly" → production {setupLaunch = launchWithout productionEnvironment}
-            "stuck" → production {setupLaunch = \_ stop _ _ → stuck stop}
+            "orderly" → (production ValidationOff) {setupLaunch = launchWithout productionEnvironment}
+            "stuck" → (production ValidationOff) {setupLaunch = \_ stop _ _ → stuck stop}
             other → error ("an unknown child mode: " <> other)
       status ← runGame setup configuration game
       exitWith status

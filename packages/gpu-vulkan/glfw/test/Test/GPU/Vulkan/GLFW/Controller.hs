@@ -36,7 +36,8 @@ import Data.Word (Word64)
 import Numeric.Natural (Natural)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Hetoimasia.GPU.Vulkan.Native.Presentation (Suspension (..))
-import Hetoimasia.GPU.Vulkan.Native.Profile (NoCompatibleDevice (..), TargetRejection (..))
+import Data.ByteString (ByteString)
+import Hetoimasia.GPU.Vulkan.Native.Profile (InstancePlan (..), NoCompatibleDevice (..), TargetRejection (..), ValidationChoice (..), ValidationDisposition (..), ValidationFeature (..), ValidationResolution (..), validationFeaturesExtension)
 import Hetoimasia.GPU.Vulkan.Native.Roots (GraphicsDeviceLost (..), GraphicsSessionFailed (..), RootStanding (..), RootTargetView (..), RootsView (..), SurfaceDestructionFailed (..), TeardownEvidence (..), TerminalCause (..), TerminalReport (..))
 import Hetoimasia.Runtime.GLFW
   ( CloseStart (..)
@@ -90,6 +91,13 @@ spec = describe "Vulkan controller" $ do
     itBounded "rejects a surface the session's queue family cannot present to, leaving the device and the other target as they were" testIncompatible
     itBounded "destroys an unusable surface on the owner's thread and rolls its target back" testUnusable
     itBounded "rolls back a target whose surface was never created, destroying nothing" testNotCreated
+
+  describe "optional validation (LFE-28)" $ do
+    itBounded "records validation as not requested, and creates the instance with no layer and no feature, when it is off" (testOptionalValidation ValidationOff (["VK_LAYER_KHRONOS_validation"], [("VK_LAYER_KHRONOS_validation", [validationFeaturesExtension])]) (ValidationResolution DispositionNotRequested DispositionNotRequested) ([], []))
+    itBounded "creates the instance with the layer and synchronization validation, and records both enabled, when it is on and offered" (testOptionalValidation ValidationOn (["VK_LAYER_KHRONOS_validation"], [("VK_LAYER_KHRONOS_validation", [validationFeaturesExtension])]) (ValidationResolution DispositionEnabled DispositionEnabled) (["VK_LAYER_KHRONOS_validation"], [SynchronizationValidation]))
+    itBounded "creates the instance with the layer alone when the layer does not offer the extension, and records the feature dropped" (testOptionalValidation ValidationOn (["VK_LAYER_KHRONOS_validation"], [("VK_LAYER_KHRONOS_validation", [])]) (ValidationResolution DispositionEnabled DispositionDropped) (["VK_LAYER_KHRONOS_validation"], []))
+    itBounded "starts the host with neither, and records both dropped, when the loader does not offer the layer" (testOptionalValidation ValidationOn ([], []) (ValidationResolution DispositionDropped DispositionDropped) ([], []))
+    itBounded "keeps the resolution when the instance cannot be created afterwards, and does not retry without validation" testOptionalValidationFails
 
   describe "construction rollback" $ do
     itBounded "at the instance: destroys nothing" (testStartupFails AtCreateInstance [])
@@ -218,6 +226,46 @@ testSharedDevice = do
       DeviceCreated → True
       SupportQueried _ → True
       DeviceDestroyed → True
+      _ → False
+
+-- | A host configured with the choice, over a loader that offers these layers: it reaches readiness, its record says
+-- what was resolved, and its one instance creation was asked for exactly these layers and features.
+testOptionalValidation ∷ ValidationChoice → ([ByteString], [(ByteString, [ByteString])]) → ValidationResolution → ([ByteString], [ValidationFeature]) → IO ()
+testOptionalValidation choice (layers, layerExtensions) expectedResolution (expectedLayers, expectedFeatures) = do
+  rig ← (\fresh → fresh {rigValidation = choice}) <$> newRig
+  offerNativeLayers rig layers layerExtensions
+  (readiness, resolution) ← runRig rig $ \host _ → atomically $ do
+    readiness ← readReadiness (vulkanController host) >>= \case
+      RootsPending → retry
+      other → pure other
+    resolution ← readValidationResolution (vulkanController host)
+    pure (readiness, resolution)
+  readiness `shouldBe` RootsReady
+  resolution `shouldBe` Just expectedResolution
+  plans ← instancePlans rig
+  map (\plan → (planLayers plan, planValidationFeatures plan)) plans `shouldBe` [(expectedLayers, expectedFeatures)]
+  forM_ plans $ \plan → (validationFeaturesExtension `elem` planInstanceExtensions plan) `shouldBe` not (null expectedFeatures)
+
+testOptionalValidationFails ∷ IO ()
+testOptionalValidationFails = do
+  rig ← (\fresh → fresh {rigValidation = ValidationOn}) <$> newRig
+  offerNativeLayers rig ["VK_LAYER_KHRONOS_validation"] [("VK_LAYER_KHRONOS_validation", [validationFeaturesExtension])]
+  scriptNative rig AtCreateInstance Fails
+  seen ← newTVarIO Nothing
+  outcome ← runRigCaught rig $ \host _ → do
+    recorded ← atomically (readReadiness (vulkanController host) >>= check . failed >> readValidationResolution (vulkanController host))
+    atomically (writeTVar seen (Just recorded))
+    ownerEnded host
+  failure ← raisedAs @StandInFailure outcome
+  failure `shouldBe` StandInFailure (showText AtCreateInstance)
+  -- The startup failed, and what it had resolved was recorded before it did.
+  atomically (readTVar seen) >>= (`shouldBe` Just (Just (ValidationResolution DispositionEnabled DispositionEnabled)))
+  plans ← instancePlans rig
+  -- Exactly one attempt, with the layer: nothing was retried without validation.
+  map planLayers plans `shouldBe` [["VK_LAYER_KHRONOS_validation"]]
+  where
+    failed = \case
+      RootsFailed _ → True
       _ → False
 
 testNotReady ∷ IO ()

@@ -11,9 +11,11 @@ import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (STM, atomically, newTVarIO, writeTVar)
 import Control.Exception (AsyncException, Exception, SomeException, fromException, try)
 import Control.Monad (void)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import qualified Data.ByteString as ByteString
 import Data.Either (isRight)
 import Data.Maybe (isJust)
+import qualified Data.Text.Encoding as Encoding
 import Data.Word (Word64)
 import Hetoimasia.GPU.Model (SessionFailureCause (DeviceLost), SessionState (..), sessionState)
 import Hetoimasia.GPU.Model.Budget (BudgetKind (TargetRecordBudget))
@@ -24,10 +26,18 @@ import Hetoimasia.GPU.Vulkan.Native.Profile
   , DevicePlan (..)
   , DeviceRejection (..)
   , NoCompatibleDevice (..)
+  , InstancePlan (..)
+  , InstanceRefusal (..)
+  , InstanceRequest (..)
   , QueueFamilyOffer (..)
   , TargetRejection (..)
+  , ValidationDisposition (..)
+  , ValidationChoice (..)
+  , ValidationFeature (..)
+  , ValidationResolution (..)
   , selectDevice
   , selectSurfaceFreeDevice
+  , validationFeaturesExtension
   )
 import Hetoimasia.GPU.Vulkan.Native.Roots
 import Test.GPU.Vulkan.Native.StandIn
@@ -115,6 +125,77 @@ spec = describe "Roots" $ do
       _ ← retireRoots roots
       _ ← destroyRoots roots
       reverse . take 2 . reverse <$> calls standIn `shouldReturn` [DestroyedMessenger, DestroyedInstance]
+
+  describe "optional validation (LFE-28)" $ do
+    let khronos = "VK_LAYER_KHRONOS_validation"
+        startWith standIn roots choice = do
+          published ← newIORef []
+          plan ← startRootsResolving roots standardRequest choice $ \resolution → do
+            -- What the native layer had been asked for when the record was handed over: the offer only.
+            before ← calls standIn
+            modifyIORef' published ((resolution, before) :)
+          (,) plan . reverse <$> readIORef published
+        enabled = ValidationResolution DispositionEnabled DispositionEnabled
+        absent = ValidationResolution DispositionNotRequested DispositionNotRequested
+
+    it "creates the instance with the layer and synchronization validation, handing the record over once and before creation" $ do
+      (standIn, roots) ← fresh
+      (plan, published) ← startWith standIn roots ValidationOn
+      published `shouldBe` [(enabled, [OfferedInstance])]
+      (planLayers plan, planValidationFeatures plan) `shouldBe` ([khronos], [SynchronizationValidation])
+      plansCreated standIn `shouldReturn` [plan]
+      calls standIn `shouldReturn` [OfferedInstance, CreatedInstance (map Encoding.decodeUtf8Lenient (planInstanceExtensions plan)), CreatedMessenger]
+
+    it "creates the instance with the layer only when the layer does not offer the extension, and drops the feature" $ do
+      (standIn, roots) ← fresh
+      offerLayers' standIn [khronos] [(khronos, [])]
+      (plan, published) ← startWith standIn roots ValidationOn
+      map fst published `shouldBe` [ValidationResolution DispositionEnabled DispositionDropped]
+      (planLayers plan, planValidationFeatures plan) `shouldBe` ([khronos], [])
+      planInstanceExtensions plan `shouldSatisfy` notElem validationFeaturesExtension
+
+    it "creates the instance with neither, and the whole startup succeeds, when the loader does not offer the layer" $ do
+      (standIn, roots) ← fresh
+      offerLayers' standIn [] []
+      (plan, published) ← startWith standIn roots ValidationOn
+      map fst published `shouldBe` [ValidationResolution DispositionDropped DispositionDropped]
+      (planLayers plan, planValidationFeatures plan) `shouldBe` ([], [])
+      plansCreated standIn `shouldReturn` [plan]
+      -- The instance and the messenger exist, and the device can still be admitted on top of them.
+      answer ← admitRootTarget roots RequiredTarget (surfaceNumbered standIn 10)
+      answer `shouldSatisfy` isRight
+
+    it "plans exactly what it planned before the choice existed when validation is not requested, whatever is offered" $ do
+      (before, beforeRoots) ← fresh
+      expected ← startRoots beforeRoots standardRequest
+      (standIn, roots) ← fresh
+      (plan, published) ← startWith standIn roots ValidationOff
+      plan `shouldBe` expected
+      (planLayers plan, planValidationFeatures plan) `shouldBe` ([], [])
+      map fst published `shouldBe` [absent]
+      plansCreated before `shouldReturn` [expected]
+      expectedCalls ← calls before
+      calls standIn `shouldReturn` expectedCalls
+
+    it "keeps the strict refusal for a layer the request names itself, after handing over what it resolved" $ do
+      (standIn, roots) ← fresh
+      offerLayers' standIn [] []
+      published ← newIORef []
+      outcome ← try @InstanceRefusal (startRootsResolving roots standardRequest {requestLayers = [khronos]} ValidationOn (\resolution → modifyIORef' published (resolution :)))
+      outcome `shouldBe` Left (InstanceLayersUnavailable [khronos])
+      readIORef published `shouldReturn` [ValidationResolution DispositionDropped DispositionDropped]
+      -- Nothing was created, and the roots are as they were before the refusal.
+      calls standIn `shouldReturn` [OfferedInstance]
+      plansCreated standIn `shouldReturn` []
+
+    it "does not retry without validation when the instance cannot be created, and keeps what it resolved" $ do
+      (standIn, roots) ← fresh
+      script standIn AtCreateInstance Fails
+      published ← newIORef []
+      raised @StandInFailure (startRootsResolving roots standardRequest ValidationOn (\resolution → modifyIORef' published (resolution :))) `shouldReturn` True
+      readIORef published `shouldReturn` [enabled]
+      plans ← plansCreated standIn
+      map planLayers plans `shouldBe` [[khronos]]
 
   describe "surface-free bootstrap" $ do
     it "selects and creates the device with no surface, asking no family about presentation" $ do
