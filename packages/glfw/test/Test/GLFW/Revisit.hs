@@ -97,16 +97,20 @@ spec = describe "GLFW visible follow-up" $ do
         (testQuickBound kind)
       it "recovers on the slow re-check after the quick bound is spent, never more often than once per idle wait"
         (testSlowRecovery kind)
-      it "keeps a window that is really hidden after a restore not visible and suspended, re-reading at the slow pace and publishing nothing"
-        (testGenuinelyHidden kind)
+      it "keeps a window that is really hidden after a restore not visible and suspended, publishing no revision"
+        (testHiddenStays kind)
+      it "re-reads a window that is really hidden at the slow pace, once per idle wait"
+        (testHiddenPace kind)
       it "stops the re-reads when a hide control settles during the slow phase"
         (testHideStops kind)
       it "stops the re-reads when the window begins closing, and when it is iconified again, and restarts the quick phase on the next restore"
         (testClosingAndIconifyAgain kind)
       it "never re-reads a window that is visible, hidden by a command, or minimized, however many turns and clock advances pass"
         (testNoOtherStateReads kind)
-      it "leaves a visible that reads unavailable unavailable, and decides from the other fields"
+      it "leaves a visible that is unavailable unavailable, and decides from the other fields"
         (testUnavailable kind)
+      it "keeps a visible that stops being reported unavailable, and stops re-reading"
+        (testBecomesUnavailable kind)
       it "keeps a restore that leaves a zero framebuffer extent suspended"
         (testZeroFramebuffer kind)
   describe "the re-read itself" $ do
@@ -420,10 +424,24 @@ testSlowRecovery kind = do
       | otherwise = RenderSuspended
 
 -- | A window that is genuinely hidden after the restore stays not visible and
--- suspended however long it is followed, is re-read exactly when each idle
--- wait has passed, and publishes no revision for a read that changed nothing.
-testGenuinelyHidden ∷ LoopKind → Expectation
-testGenuinelyHidden kind = do
+-- suspended however long it is followed, and publishes no revision beyond the
+-- one that folded the callback. Nothing here depends on the follow-up existing.
+testHiddenStays ∷ LoopKind → Expectation
+testHiddenStays kind = do
+  platform ← newPlatform
+  (turned, _) ← play kind platform 40 (minimizeAndRestore (Reports False))
+  let afterRestore = drop 2 turned
+  map (observedVisible . turnedObservation) afterRestore `shouldBe` replicate (length afterRestore) (Observed False)
+  map eligibility afterRestore `shouldBe` replicate (length afterRestore) RenderSuspended
+  -- The one revision is the one that folded the callback.
+  map (observedRevision . turnedObservation) afterRestore
+    `shouldBe` replicate (length afterRestore) (observedRevision (turnedObservation (turned !! 2)))
+
+-- | A window that is genuinely hidden after the restore is re-read exactly when
+-- each idle wait has passed once the quick bound is spent: no oftener, and on
+-- the first turn the clock allows.
+testHiddenPace ∷ LoopKind → Expectation
+testHiddenPace kind = do
   platform ← newPlatform
   (turned, _) ← play kind platform 40 (minimizeAndRestore (Reports False))
   let spentAt = 2 + fromIntegral quickBound ∷ Natural
@@ -431,14 +449,9 @@ testGenuinelyHidden kind = do
       slow = slowTurns stamp (drop (fromIntegral spentAt) turned)
   length slow `shouldSatisfy` (>= 3)
   readTurns turned `shouldBe` [3 .. spentAt] <> slow
-  let afterRestore = drop 2 turned
-  map (observedVisible . turnedObservation) afterRestore `shouldBe` replicate (length afterRestore) (Observed False)
-  map eligibility afterRestore `shouldBe` replicate (length afterRestore) RenderSuspended
-  -- The one revision is the one that folded the callback.
-  map (observedRevision . turnedObservation) afterRestore
-    `shouldBe` replicate (length afterRestore) (observedRevision (turnedObservation (turned !! 2)))
-  -- Two idle waits never pass between two re-reads without one being taken.
-  all id [b - a <= 3 | (a, b) ← zip slow (drop 1 slow)] `shouldBe` True
+  -- With the clock a tenth of a second a turn and an idle wait of a quarter,
+  -- a re-read is due every third turn.
+  all id [b - a == 3 | (a, b) ← zip slow (drop 1 slow)] `shouldBe` True
 
 -- ---------------------------------------------------------------------------
 -- Stops
@@ -532,9 +545,8 @@ testNoOtherStateReads kind = do
 -- What the platform may report
 
 -- | A platform with no visible attribute: the transition arms the follow-up,
--- which finds nothing to follow and makes no native call. Where visible is
--- observed false and then reports unavailable, the field becomes unavailable
--- and stops, never fabricated. Either way the other fields decide.
+-- which finds nothing to follow and makes no native call, and the other fields
+-- decide eligibility.
 testUnavailable ∷ LoopKind → Expectation
 testUnavailable kind = do
   silent ← newPlatform
@@ -547,12 +559,17 @@ testUnavailable kind = do
   map eligibility (drop 2 quiet) `shouldBe` replicate 8 RenderEligible
   map turnedReads quiet `shouldBe` replicate 10 (maybe 0 turnedReads (listToMaybe quiet))
 
+-- | A visible observed false whose re-read reports the feature unavailable
+-- becomes unavailable and is never fabricated; the re-reads stop there.
+testBecomesUnavailable ∷ LoopKind → Expectation
+testBecomesUnavailable kind = do
   vanishing ← newPlatform
   (lost, _) ← play kind vanishing 10 $ \number rig → do
     when (number == 1) (minimize rig)
     when (number == 2) (catchTransient rig (Reports False) >> unminimize rig)
     when (number == 3) (sayVisible rig Missing)
     advance rig (millis 300)
+  -- Turn 2's record precedes the title control, whose own sample read once.
   let base = turnedReads (lost !! 1) + 1
   map (observedVisible . turnedObservation) (drop 2 lost) `shouldBe` Observed False : replicate 7 Unavailable
   map (subtract base . turnedReads) (drop 2 lost) `shouldBe` 1 : replicate 7 2
@@ -574,7 +591,7 @@ testZeroFramebuffer kind = do
       unminimize rig
     _ → pure ()
   map (observedFramebufferExtent . snd) notes `shouldBe` [Observed (Extent 0 0)]
-  map (observedVisible . turnedObservation) (drop 2 turned) `shouldBe` replicate 6 (Observed True)
+  -- Whatever visible reads, the extent keeps the window suspended.
   map eligibility (drop 2 turned) `shouldBe` replicate 6 RenderSuspended
 
 -- ---------------------------------------------------------------------------
