@@ -15,7 +15,9 @@
 module Test.Run.Native.Milestone (spec) where
 
 import Control.Concurrent.STM (atomically, readTVar, readTVarIO, retry)
-import Control.Exception (onException)
+import Control.Exception (onException, try)
+import Data.List (isInfixOf)
+import Test.HUnit.Lang (HUnitFailure (..))
 import Control.Monad (forM_, unless)
 import System.IO (hPutStrLn, stderr)
 import Data.ByteString (ByteString)
@@ -27,7 +29,7 @@ import Hetoimasia.Scripting.Lua.Instance (InstancePhase (..))
 import qualified Data.Text as Text
 import Hetoimasia.LuaEngine.Graphics.Texture (BackendReading (..), TextureGraphics (..))
 import System.IO.Temp (withSystemTempDirectory)
-import Test.Hspec (Spec, describe, it, shouldBe, shouldNotBe)
+import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldNotBe, shouldSatisfy)
 import Test.Run.Native.Env (Env (..), evidence)
 import Test.Run.Native.Library (copyTree, shippedContent)
 import Hetoimasia.GLFW.Window (WindowId)
@@ -228,6 +230,23 @@ spec env = describe "Lua native milestone" $ do
             <> show back
             <> "; native zero-area framebuffer "
             <> (if zeroNative then "OBSERVED: drawing was suspended and resumed after restore" else "UNEXERCISED on this platform (the framebuffer was never reported with zero area): the controlled zero-metrics coverage is the owning prerequisites' (LFE-18, LFE-20 and the host's suspended-target cases), not claimed as native")
+
+
+  it "unwinds by itself, and raises its own failure unchanged, when the scenario fails with a read held, a creation withheld and a window live" $
+    within 120 . withOwnedContent $ \folder → do
+      -- Only the scenario's own assertion failure is expected here, and it is matched by its type and its words: any
+      -- other exception, or a hang in the unwinding (a gate left closed), fails this example.
+      outcome ← try @HUnitFailure . withPeers (envStart env) folder $ \peers → do
+        holdNextReads peers quadPath 1
+        withholdNextCreations peers 1
+        _ ← admitUi peers
+        _ ← awaitNewWindow peers []
+        readsEntered peers quadPath 1
+        expectationFailure "the scenario failed on purpose"
+      case outcome of
+        Left (HUnitFailure _ reason) → show reason `shouldSatisfy` isInfixOf "the scenario failed on purpose"
+        Right () → expectationFailure "the scenario's failure was swallowed"
+      evidence env "unwinding control: a scenario that failed while a read was held at the pool's reader, a window creation was withheld and a native window was live raised its own failure after the gates were released and the instance, window and texture were retired within the bound"
 
   forM_ [("the first", 0 ∷ Int), ("the second", 1)] $ \(which, index) →
     it ("routes a user close of " <> which <> " live window to one whole-session quit request, which retires both instances and windows, unlike ending one instance") $

@@ -367,6 +367,7 @@ test-suite run-native-tests
             Test.Run.Native.X11
         build-depends:
             base >=4.22 && <4.23,
+            HUnit >=1.6 && <1.7,
             bytestring >=0.12 && <0.13,
             containers >=0.8 && <0.9,
             directory >=1.3 && <1.4,
