@@ -108,6 +108,23 @@
 -- deadline comes — completion polls, the disposal of released resources, and
 -- owner-thread actions — and records no frame.
 --
+-- = Offscreen scene targets
+--
+-- A surface-free scene target registers with the running host
+-- ('registerVulkanSceneTarget') and takes part in the same scene ownership a
+-- window has, under one key ('SceneTargetKey'): the release barrier, the
+-- lifecycle, the observation and a consumer's hold ledger do not tell a window
+-- from an offscreen target. The registry
+-- ("Hetoimasia.GPU.Vulkan.GLFW.Internal.Targets") is the host's and any thread
+-- registers, publishes ('publishVulkanTargetScene') and unregisters in a
+-- transaction; the owner's step adopts what a target published, through the
+-- same ledger and in the same step as a window's, and ends an unregistered
+-- target there; the recording boundary ('recordVulkanTargetBatch') binds the
+-- scene the owner adopted to every batch that reads it, so a revision is
+-- released only on its batches' own tickets. The owner's retirement ends every
+-- target in one transaction before it settles releases. A host that registers
+-- none is exactly what it was.
+--
 -- = Owner-thread actions
 --
 -- A consumer on any thread can hand the owner a bounded action
