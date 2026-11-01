@@ -54,13 +54,13 @@ spec env = describe "Lua native milestone: the actual command" $ do
   it "shows the shipped quad in the real command's window, then ends on a genuine WM_DELETE_WINDOW delivered to that exact window: exit 0 with a clean validated teardown (isolated X11)" $
     onX11 env "native close" $
       runChild env "actual-command" True (\_ → pure ()) (Expect ExitSuccess "VerdictSuccess" (Just "0") False) $ \pid found → forM_ found $ \bound → do
-        snapWith env "actual-command--quad" bound quadLandmarks Nothing
+        snapWith env "actual-command--quad" bound quadLandmarks Nothing (pure ())
         closeBound (Just bound)
         evidence env ("actual command: pid " <> Text.pack (show pid) <> ", native window " <> Text.pack (show (boundX bound)) <> " closed by a genuine WM_DELETE_WINDOW (the helper reported delivery; the exit below is the command's own); no signal was sent")
   it "leaves the healthy UI active with the exact red clear after an ordinary logical failure, and ends on a native close with exit 1 (isolated X11), or on a later Lua quit with exit 1 (elsewhere)" $
     let x11 = isJust (envX11 env)
      in runChild env "logical-failure" True (failing x11) (Expect (ExitFailure 1) "VerdictFailure" Nothing True) $ \pid found → forM_ found $ \bound → do
-          snapWith env "actual-command--logical-failure-red-clear" bound redClearLandmarks Nothing
+          snapWith env "actual-command--logical-failure-red-clear" bound redClearLandmarks Nothing (pure ())
           closeBound (Just bound)
           evidence env ("logical failure: pid " <> Text.pack (show pid) <> ", the UI stayed active and showed the exact empty red clear, a native close then ended the session with exit 1 (the failure outranks the normal stop)")
   it "ends on a Lua quit with exit 0 and a clean validated teardown" $

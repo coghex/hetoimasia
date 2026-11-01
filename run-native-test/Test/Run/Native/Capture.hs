@@ -25,7 +25,7 @@ module Test.Run.Native.Capture
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (try)
-import Control.Monad (unless, when)
+import Control.Monad (forM_, unless, when)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Text as Text
 import Data.Text (Text)
@@ -38,7 +38,7 @@ import Test.Hspec (expectationFailure)
 import Test.Run.Native.Env (Env (..), evidence)
 import Test.Run.Native.Json
 import Test.Run.Native.Landmarks
-import Test.Run.Native.Observe (Metrics (..), note, windowMetrics)
+import Test.Run.Native.Observe (Metrics (..), demandFrame, note, windowMetrics)
 import Test.Run.Native.Peers (Peers)
 import Test.Run.Native.X11 (Candidate (..), Captured (..), Refused (..), X11, candidates, capture, geometry, requestClose, viewableCandidates)
 
@@ -111,16 +111,20 @@ snap ∷ Env → Peers → Text → Maybe Bound → IO ()
 snap _ _ _ Nothing = pure ()
 snap env peers name (Just bound) = do
   metrics ← traverse (windowMetrics peers) (boundWindow bound)
-  snapWith env name bound quadLandmarks metrics
+  -- Each attempt first asks the window's target for another frame of what it holds (the public client demand the cases
+  -- already use; no scene is published): a window the X server cleared when it was unmapped, an iconify and restore, is
+  -- repainted only by a frame presented once it is mapped again.
+  snapWith env name bound quadLandmarks metrics (forM_ (boundWindow bound) (demandFrame peers))
 
 -- | Capture the bound window's client area, require every landmark, retain the capture and its record under the given
 -- name, and say what was presented. The client area is whatever the X server reports now and the landmarks follow its
 -- size; the host's own metrics, when there are any (a harness window), are recorded beside it and cross-checked.
-snapWith ∷ Env → Text → Bound → ((Int, Int) → [Landmark]) → Maybe Metrics → IO ()
-snapWith env name bound landmarksFor metrics = do
+snapWith ∷ Env → Text → Bound → ((Int, Int) → [Landmark]) → Maybe Metrics → IO () → IO ()
+snapWith env name bound landmarksFor metrics beforeAttempt = do
   let final = envCaptureDir env </> Text.unpack name <> ".png"
       stage n = envCaptureDir env </> Text.unpack name <> ".attempt" <> show (n ∷ Int) <> ".png"
       loop n previous = do
+        beforeAttempt
         now ← required "geometry" (try (geometry (boundHelper bound) (boundPid bound) (boundX bound)))
         let size = (candWidth now, candHeight now)
         shot ← required "capture" (try (capture (boundHelper bound) (boundPid bound) (boundX bound) (stage n) [lmPoint l | l ← landmarksFor size] Nothing))
