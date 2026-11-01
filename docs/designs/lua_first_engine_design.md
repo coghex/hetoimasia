@@ -9484,6 +9484,22 @@ replace boundary tests, prove performance or establish confinement.
   suites, narrowly routed by the validation catalog. Final arc accounting
   links all required receipts and deferrals; completion needs the actual quad
   and independent-instance evidence, not only green headless tests.
+- **As delivered ([#540](https://github.com/coghex/hetoimasia/issues/540), PR [#582](https://github.com/coghex/hetoimasia/pull/582)):**
+  the named `Lua native milestone` subgroup of the root `run-native-tests` suite (catalog group `test.vulkan-run-native`, selectable with
+  `--match 'Lua native milestone'` and part of `--complete`). A two-instance harness is composed through the public Haskell interfaces over a
+  host the suite composes with the validation layer and synchronization validation (one UI VM, two engine-owned instances of the shipped
+  content requesting one PNG path, an independent logical owner; every diagnostic-verdict issue, lost records included, fails). It
+  establishes independent identities and textures; one instance ended with its accepted scene referencing a released texture, with its texture
+  read held at the pool's reader and with its window creation outcome withheld, each with the peer kept live; resize, minimize and restore with
+  the metrics actually reported and an unchanged published revision; a genuine platform-delivered user close of either window as one session quit;
+  and a labelled injected clean refusal. The built command runs with `--vulkan-validation` as an owned child: on the isolated X11 display a
+  genuine `WM_DELETE_WINDOW` to its exact window ends it with exit 0, an ordinary logical failure leaves the UI on the exact red clear until a close
+  (exit 1), and a Lua quit exits 0. The Linux windows are captured through the test-only helper `tools/x11-window/x11_window.py` and judged against
+  landmarks written from the fixture; the captures, records and checksums are in
+  [the evidence](../evidence/lua_first_native/README.md), and what each slice and completion condition rests on is in
+  [the coverage document](../evidence/lua_first_native/coverage.md). macOS has no OS capture: the owner's visual confirmations are recorded as
+  pending in the pull request and supersede by a record landed after the merge. The native zero-area framebuffer row is unexercised on both
+  platforms. No product code, Lua API or capture API was added.
 
 ### Coverage and handoff checks
 
@@ -9501,7 +9517,7 @@ replace boundary tests, prove performance or establish confinement.
 | Two-instance qualification, actual pixel/native output | LFE-23–LFE-25, LFE-27 |
 | Optional Vulkan validation in the production command | LFE-28 |
 
-The plan has twenty-seven slices (LFE-27 added 2026-11-01) and no unassigned approved M1 service family.
+The plan has twenty-eight slices (LFE-27 and LFE-28 added 2026-11-01) and no unassigned approved M1 service family.
 That coverage statement is a design mapping, not proof that implementation
 is feasible without further engineering. Concrete dependency/codec/native
 obstacles must be investigated within the owning slice; if resolution would

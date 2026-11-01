@@ -634,10 +634,11 @@ unchanged copy, adopted and recorded again after Lua's release with a genuine na
 everything retired; a script that quits; a required texture that cannot be read, exit 1; the assembled facade's request, texture and window
 capacity: busy as a nonfatal answer, the explicit retry after reclamation, the second own-window request an ordinary error) and the built command
 as a child of the suite stopped by exactly one SIGTERM after the existing resolved-root diagnostic (exit 130, no error entry, the child killed and
-reaped on every way out). It is a launch and lifetime smoke check: it captures no screen and reads no window back, and the supervised macOS close of
-the actual command is a local run. The run writes its evidence record, `run-native.md`, into the group's evidence directory. The
+reaped on every way out). The smoke cases are launch and lifetime checks; the `Lua native milestone` subgroup (LFE-25) adds the real-device two-instance harness and the
+actual command's window captured and closed through the helper `tools/x11-window/x11_window.py` on the isolated X11 display ([the evidence](evidence/lua_first_native/README.md)),
+and the supervised macOS close of the actual command is a local run the owner confirms. The run writes its evidence record, `run-native.md`, into the group's evidence directory. The
 runner's source digest names the root package's real inputs one by one (`app/`, `app-cpu/`, `app-full/`, `console/`, `run/`, `test/`,
-`test-cpu/`, `test-full/`, `run-native-test/`, `samples/lua-quad/` and `hetoimasia.cabal`) and never the root directory itself, which would hash
+`test-cpu/`, `test-full/`, `run-native-test/`, `samples/lua-quad/`, `tools/x11-window/` and `hetoimasia.cabal`) and never the root directory itself, which would hash
 `dist-vulkan` and every other generated output. The root package's full build of `hetoimasia-tests` runs in `test.vulkan-headless`.
 
 Every validation-enabled instance either group creates enables the Khronos

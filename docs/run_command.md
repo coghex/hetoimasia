@@ -275,8 +275,9 @@ Output and flush failure is fatal. The launcher adds at most one bounded, escape
   `bash tools/vulkan/run.sh native hetoimasia:test:run-native-tests -- --complete` (macOS: with `HETOIMASIA_NATIVE_SESSION=desktop`
   on that command).
 
-These establish launch and lifetime, **not visible output**: no pixel is captured or read back (LFE-24's matrix and LFE-25's platform
-qualification are separate).
+These smoke cases establish launch and lifetime, **not visible output**: no pixel is captured or read back in them (LFE-24's matrix
+is offscreen; LFE-25's `Lua native milestone` subgroup captures the windows' presented output on the isolated X11 display, see
+[its evidence](evidence/lua_first_native/README.md).
 
 The actual command's native close is covered per platform, and the split is part of the acceptance:
 
@@ -296,4 +297,5 @@ The actual command's native close is covered per platform, and the split is part
   native suite and green CI) stand beside it.
 * **Linux**: the library-composed `run-native-tests` case delivers a real in-process `WM_DELETE_WINDOW` through the existing native close
   driver (exit 0), and the built command is started on the isolated X11 display and sent exactly one SIGTERM (exit 130). The actual
-  command's native close on Linux needs cross-process tooling that does not exist and is **LFE-25's**; none is added here.
+  command's native close on Linux is LFE-25's: its `Lua native milestone` cases start the built command with `--vulkan-validation`, capture its
+  window through the test-only helper `tools/x11-window/x11_window.py`, and deliver a genuine `WM_DELETE_WINDOW` to that exact window (exit 0).
