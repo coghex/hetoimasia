@@ -17,7 +17,9 @@
 -- also requires the layer's own announcement. The child runs with @HETOIMASIA_DEBUG=gpu.vulkan.diagnostics@, the
 -- documented logging selection (@docs/logging.md@), which lets the diagnostic capture's Debug entries reach stderr; the
 -- Khronos layer, once it is running in the instance's chain, reports to the capture's messenger at @vkCreateInstance@
--- "Khronos Validation Layer Active" with the features it was enabled with. That record is the layer speaking, not the
+-- "Khronos Validation Layer Active" with the features it was enabled with (the enable is spelled
+-- @VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION@ by the Linux profile's layer and with an @_EXT@ suffix by the macOS
+-- one, so the case keys on the common prefix). That record is the layer speaking, not the
 -- command's, so it shows the layer was loaded and ran and that synchronization validation was enabled in it; it needs
 -- no hook, only the command's own stderr. The not-requested case must not carry it.
 --
@@ -151,7 +153,7 @@ commandCase env variant = do
           require "the layer and synchronization validation were requested, and the record does not say both were enabled (a layer missing from the provisioned prefix fails the case)" (field "requested" "true" line && field "layer" "enabled" line && field "feature" "enabled" line)
           require "validation was requested and enabled, and an item was dropped" (null dropped)
           require "the layer did not announce itself exactly once to the diagnostic capture (the command's stderr carries no `Khronos Validation Layer Active` record): the loader did not keep it in the chain, or the Debug entries did not reach stderr" (length announced == 1)
-          require "the layer announced itself without synchronization validation among its enables" (all ("VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT" `Text.isInfixOf`) announced)
+          require "the layer announced itself without synchronization validation among its enables" (all ("Current Enables: VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION" `Text.isInfixOf`) announced)
       let at needle = [index | (index, text) ← zip [0 ∷ Int ..] diagnostics, needle `Text.isInfixOf` text]
       require "the validation record was not logged after the content root resolved and before the session's start gate" $
         case (at "content root resolved", at "msg=\"vulkan validation resolved\"", at "start gate opened") of
