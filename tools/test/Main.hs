@@ -21,6 +21,7 @@ import qualified Timings
 import qualified TimingStep
 import qualified Validation
 import qualified VulkanProof
+import qualified X11Window
 
 data Repository = Repository
   { primary ∷ FilePath
@@ -88,6 +89,7 @@ main = hspec $ do
   ApprovalProvenance.spec
   CiImage.spec
   VulkanProof.spec
+  X11Window.spec
   Packaging.spec
 
 withRepository ∷ Bool → (Repository → IO a) → IO a

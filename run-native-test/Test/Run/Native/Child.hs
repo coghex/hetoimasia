@@ -55,6 +55,8 @@ import Test.Hspec (expectationFailure)
 
 data Child = Child
   { childProcess ∷ ProcessHandle
+  , childOut ∷ TVar [Text.Text]
+  -- ^ What the child wrote to its standard output, line by line, as the reader saw it.
   , childErr ∷ TVar [Text.Text]
   , childOutEnded ∷ TVar Bool
   , childErrEnded ∷ TVar Bool
@@ -120,16 +122,16 @@ conclude bounds hooks child outcome = do
 start ∷ Bounds → Hooks → FilePath → [String] → [(String, String)] → IO Child
 start bounds hooks executable arguments environment = do
   (_, out, err, process) ← createProcess (proc executable arguments) {Process.env = Just environment, std_in = NoStream, std_out = CreatePipe, std_err = CreatePipe}
+  outLines ← newTVarIO []
   errLines ← newTVarIO []
   outEnded ← newTVarIO True
   errEnded ← newTVarIO True
   failures ← newTVarIO []
-  let child = Child process errLines outEnded errEnded failures
+  let child = Child process outLines errLines outEnded errEnded failures
   acquired ← tryWithContext @SomeException $ do
     (output, diagnostics) ← case (out, err) of
       (Just output, Just diagnostics) → pure (output, diagnostics)
       _ → fail "the child's pipes were not created"
-    outLines ← newTVarIO []
     reader "stdout" output outLines outEnded failures
     reader "stderr" diagnostics errLines errEnded failures
     hookSpawned hooks process
