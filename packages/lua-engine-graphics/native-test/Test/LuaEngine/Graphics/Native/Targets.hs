@@ -17,7 +17,8 @@
 -- recording's readback. Pixel semantics for Lua-authored output are LFE-24's.
 module Test.LuaEngine.Graphics.Native.Targets (spec) where
 
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
+import Control.Exception (finally)
 import Control.Concurrent.STM (atomically, check, modifyTVar', retry)
 import Control.Monad (void)
 import qualified Data.Map.Strict as Map
@@ -63,67 +64,73 @@ spec env = describe "an offscreen scene target on a real device (LFE-27)" $
       decoded ← decoded' (Png.asymmetric 8 4)
       atomically (hostWindowIdentities (vulkanWindowHost host)) `shouldReturn` []
       target ← atomically (registerVulkanSceneTarget host) >>= either (\refusal → assertFailure ("the target was refused: " <> show refusal)) pure
-      -- The owner adopts the initial scene as revision 0 on its own.
-      awaitTarget host target ((== Just 0) . windowAdopted)
-      -- Hold the owner inside an action, until the example lets it go.
+      -- The owner's gate and the target are released however the example ends — an assertion, the example's own
+      -- timeout — before the surrounding composition drains: otherwise a failure leaves the owner blocked and the
+      -- target holding the texture, and the drain waits for work that cannot finish.
       entered ← newEmptyMVar
       proceed ← newEmptyMVar
-      gate ←
-        atomically (submitVulkanAction host (VulkanAction (\_ → putMVar entered () >> takeMVar proceed)))
-          >>= either (\refusal → assertFailure ("the holding action was refused: " <> show refusal)) pure
-      takeMVar entered
-      -- The target accepts a scene naming the texture, which the owner has not adopted.
-      scene ← prepare (initialGraphicsScene {graphicsReferences = Set.singleton (fromIntegral identity)})
-      accepted ← atomically (publishVulkanTargetScene host target scene)
-      accepted `shouldBe` TargetScenePublished target 1
-      held ← atomically (readVulkanSceneState host)
-      (windowPublished <$> Map.lookup (KeyOffscreen target) (sceneWindows held), windowAdopted <$> Map.lookup (KeyOffscreen target) (sceneWindows held)) `shouldBe` (Just (Just 1), Just (Just 0))
-      -- Released through the production lane right after acceptance: the request waits behind a barrier that names
-      -- the target at the accepted revision, and the texture is still live.
-      command comp vm "a" "release" "k"
-      _ ← awaitNoteContaining comp "a release k"
-      atomically $ do
-        state ← readVulkanSceneState host
-        check (any ((== Just 1) . Map.lookup (KeyOffscreen target)) (sceneRequests state))
-      live ← atomically (graphicsReading (envGraphics env))
-      readingLiveTextures live `shouldSatisfy` (> 0)
-      -- The owner is let go: it adopts revision 1, which the ledger then holds the texture for.
-      putMVar proceed ()
-      void (atomically (awaitVulkanAction gate))
-      awaitTarget host target ((== Just 1) . windowAdopted)
-      atomically (ledgerReading ledger >>= \reading → check (not (Set.null (readingHeld reading))))
-      -- A recording that reads that scene, made after the Lua release: the texture is drawn, read back and judged.
-      -- The target's next scene is accepted before the recording's completion is awaited, so revision 1 is
-      -- superseded while that recording may still be in flight, and what releases it is the recording's own ticket.
-      empty ← prepare initialGraphicsScene
-      shot ←
-        shootWith
-          host
-          (recordBound host target)
-          (void (atomically (publishVulkanTargetScene host target empty)))
-          (graphicsRenderer (envGraphics env))
-          (textureHandleOf (fromIntegral identity))
-          decoded
-          (Png.asymmetricTexel 8 4)
-          >>= either (\failure → assertFailure ("the recording failed: " <> Text.unpack failure)) pure
-      shotFailed shot `shouldBe` []
-      shotDeterminate shot `shouldSatisfy` (> 20)
-      -- Revision 2 is adopted, revision 1's recording has completed, and the texture is freed on that evidence.
-      awaitTarget host target ((== Just 2) . windowAdopted)
-      atomically $ do
-        reading ← graphicsReading (envGraphics env)
-        check (readingLiveTextures reading == 0)
-      atomically $ do
-        reading ← ledgerReading ledger
-        check (Set.null (readingHeld reading))
-        state ← readVulkanSceneState host
-        check (all (null . windowAwaitingRelease) (Map.elems (sceneWindows state)))
-      final ← atomically (ledgerReading ledger)
-      readingDefects final `shouldBe` 0
-      ended ← atomically (unregisterVulkanSceneTarget host target)
-      ended `shouldBe` True
-      atomically (hostWindowIdentities (vulkanWindowHost host)) `shouldReturn` []
-      evidence env ("an offscreen scene target: the texture released straight after acceptance and before adoption was retained, drawn after the Lua release (" <> tshow (shotDeterminate shot) <> " pixels judged), and freed after the recording completed; no window opened")
+      let release = void (tryPutMVar proceed ())
+          cleanup = release >> void (atomically (unregisterVulkanSceneTarget host target))
+      flip finally cleanup $ do
+        -- The owner adopts the initial scene as revision 0 on its own.
+        awaitTarget host target ((== Just 0) . windowAdopted)
+        -- Hold the owner inside an action, until the example lets it go.
+        gate ←
+          atomically (submitVulkanAction host (VulkanAction (\_ → putMVar entered () >> takeMVar proceed)))
+            >>= either (\refusal → assertFailure ("the holding action was refused: " <> show refusal)) pure
+        takeMVar entered
+        -- The target accepts a scene naming the texture, which the owner has not adopted.
+        scene ← prepare (initialGraphicsScene {graphicsReferences = Set.singleton (fromIntegral identity)})
+        accepted ← atomically (publishVulkanTargetScene host target scene)
+        accepted `shouldBe` TargetScenePublished target 1
+        held ← atomically (readVulkanSceneState host)
+        (windowPublished <$> Map.lookup (KeyOffscreen target) (sceneWindows held), windowAdopted <$> Map.lookup (KeyOffscreen target) (sceneWindows held)) `shouldBe` (Just (Just 1), Just (Just 0))
+        -- Released through the production lane right after acceptance: the request waits behind a barrier that names
+        -- the target at the accepted revision, and the texture is still live.
+        command comp vm "a" "release" "k"
+        _ ← awaitNoteContaining comp "a release k"
+        atomically $ do
+          state ← readVulkanSceneState host
+          check (any ((== Just 1) . Map.lookup (KeyOffscreen target)) (sceneRequests state))
+        live ← atomically (graphicsReading (envGraphics env))
+        readingLiveTextures live `shouldSatisfy` (> 0)
+        -- The owner is let go: it adopts revision 1, which the ledger then holds the texture for.
+        release
+        void (atomically (awaitVulkanAction gate))
+        awaitTarget host target ((== Just 1) . windowAdopted)
+        atomically (ledgerReading ledger >>= \reading → check (not (Set.null (readingHeld reading))))
+        -- A recording that reads that scene, made after the Lua release: the texture is drawn, read back and judged.
+        -- The target's next scene is accepted before the recording's completion is awaited, so revision 1 is
+        -- superseded while that recording may still be in flight, and what releases it is the recording's own ticket.
+        empty ← prepare initialGraphicsScene
+        shot ←
+          shootWith
+            host
+            (recordBound host target)
+            (void (atomically (publishVulkanTargetScene host target empty)))
+            (graphicsRenderer (envGraphics env))
+            (textureHandleOf (fromIntegral identity))
+            decoded
+            (Png.asymmetricTexel 8 4)
+            >>= either (\failure → assertFailure ("the recording failed: " <> Text.unpack failure)) pure
+        shotFailed shot `shouldBe` []
+        shotDeterminate shot `shouldSatisfy` (> 20)
+        -- Revision 2 is adopted, revision 1's recording has completed, and the texture is freed on that evidence.
+        awaitTarget host target ((== Just 2) . windowAdopted)
+        atomically $ do
+          reading ← graphicsReading (envGraphics env)
+          check (readingLiveTextures reading == 0)
+        atomically $ do
+          reading ← ledgerReading ledger
+          check (Set.null (readingHeld reading))
+          state ← readVulkanSceneState host
+          check (all (null . windowAwaitingRelease) (Map.elems (sceneWindows state)))
+        final ← atomically (ledgerReading ledger)
+        readingDefects final `shouldBe` 0
+        ended ← atomically (unregisterVulkanSceneTarget host target)
+        ended `shouldBe` True
+        atomically (hostWindowIdentities (vulkanWindowHost host)) `shouldReturn` []
+        evidence env ("an offscreen scene target: the texture released straight after acceptance and before adoption was retained, drawn after the Lua release (" <> tshow (shotDeterminate shot) <> " pixels judged), and freed after the recording completed; no window opened")
 
 -- | A line for the run's evidence record.
 evidence ∷ Env → Text.Text → IO ()
