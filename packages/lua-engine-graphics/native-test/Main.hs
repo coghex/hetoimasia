@@ -42,6 +42,7 @@ import Test.LuaEngine.Graphics.Native.Loader (checkLoader)
 import Test.LuaEngine.Graphics.Native.Session (Facts (..), runSession)
 import qualified Test.LuaEngine.Graphics.Native.Spec as Native
 import qualified Test.LuaEngine.Graphics.Native.Facade as Facade
+import qualified Test.LuaEngine.Graphics.Native.Pixels as Pixels
 import qualified Test.LuaEngine.Graphics.Native.Scenes as Scenes
 import qualified Test.LuaEngine.Graphics.Native.Targets as Targets
 import qualified Test.LuaEngine.Graphics.Native.Windows as Windows
@@ -61,7 +62,7 @@ main = do
   loader ← checkLoader >>= either (\why → stop ("the qualified loader: " <> why)) pure
   Text.putStrLn ("lua-engine-graphics-native-tests: the binding's loader is the recorded loader " <> Text.pack loader)
   configuration ← either (\refused → stop ("the profile could not be mapped: " <> Text.pack (show refused))) pure (configurationFor fixedM1Profile)
-  facts ← runSession (arguments == [completeFlag]) (consentBackend consent) validationFeatures configuration (\env → Native.spec env >> Windows.spec env >> Scenes.spec env >> Targets.spec env >> Facade.spec env)
+  facts ← runSession (arguments == [completeFlag]) (consentBackend consent) validationFeatures configuration (\env → Native.spec env >> Windows.spec env >> Scenes.spec env >> Targets.spec env >> Pixels.spec env >> Facade.spec env)
   finished ← getCurrentTime
   let problems = checks facts
       seconds = realToFrac (diffUTCTime finished started) ∷ Double
@@ -135,6 +136,7 @@ evidenceRecord consent loader configuration facts problems seconds = do
     , field "source digest" (maybe "unknown" Text.pack digest)
     , field "command" (Text.pack (unwords (program : arguments)) <> " (through tools/vulkan/run.sh native)")
     , field "platform" (Text.pack (os <> "/" <> arch <> ", " <> compilerName <> " " <> show compilerVersion))
+    , field "device" (maybe "unknown" id (factsDevice facts))
     , field "driver manifest" (maybe "unset" Text.pack driver)
     , field "loader" (Text.pack loader)
     , field "consent" (describeConsent consent)

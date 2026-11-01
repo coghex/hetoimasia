@@ -100,6 +100,8 @@ test-suite lua-engine-graphics-tests
         Test.LuaEngine.Graphics.Lifecycle
         Test.LuaEngine.Graphics.Peers
         Test.LuaEngine.Graphics.PeersRig
+        Test.LuaEngine.Graphics.PixelComparator
+        Test.LuaEngine.Graphics.Pixels
         Test.LuaEngine.Graphics.Png
         Test.LuaEngine.Graphics.Pressure
         Test.LuaEngine.Graphics.Release
@@ -123,6 +125,7 @@ test-suite lua-engine-graphics-tests
         array >=0.5 && <0.6,
         bytestring >=0.12 && <0.13,
         containers >=0.8 && <0.9,
+        cryptohash-sha256 >=0.11.102 && <0.12,
         directory >=1.3 && <1.4,
         filepath >=1.5 && <1.6,
         hspec >=2.11 && <3,
@@ -155,6 +158,7 @@ test-suite lua-engine-graphics-tests
         hetoimasia-render-2d ==0.1.0.0,
         hetoimasia-render-2d-oracle ==0.1.0.0,
         hetoimasia-render-2d-vulkan ==0.1.0.0,
+        hetoimasia-render-api ==0.1.0.0,
         hetoimasia-runtime ==0.1.0.0,
         hetoimasia-scripting-lua ==0.1.0.0,
         hetoimasia-scripting-lua:runtime-lua
@@ -179,15 +183,18 @@ test-suite lua-engine-graphics-native-tests
         Test.LuaEngine.Graphics.FacadeScripts
         Test.LuaEngine.Graphics.FrameLog
         Test.LuaEngine.Graphics.Native.Consent
+        Test.LuaEngine.Graphics.Native.Display
         Test.LuaEngine.Graphics.Native.Environment
         Test.LuaEngine.Graphics.Native.Facade
         Test.LuaEngine.Graphics.Native.Frame
         Test.LuaEngine.Graphics.Native.Loader
+        Test.LuaEngine.Graphics.Native.Pixels
         Test.LuaEngine.Graphics.Native.Scenes
         Test.LuaEngine.Graphics.Native.Session
         Test.LuaEngine.Graphics.Native.Spec
         Test.LuaEngine.Graphics.Native.Targets
         Test.LuaEngine.Graphics.Native.Windows
+        Test.LuaEngine.Graphics.Pixels
         Test.LuaEngine.Graphics.Png
         Test.LuaEngine.Graphics.SceneComp
         Test.LuaEngine.Graphics.Windows
@@ -201,6 +208,7 @@ test-suite lua-engine-graphics-native-tests
         array >=0.5 && <0.6,
         bytestring >=0.12 && <0.13,
         containers >=0.8 && <0.9,
+        cryptohash-sha256 >=0.11.102 && <0.12,
         directory >=1.3 && <1.4,
         filepath >=1.5 && <1.6,
         hspec >=2.11 && <3,

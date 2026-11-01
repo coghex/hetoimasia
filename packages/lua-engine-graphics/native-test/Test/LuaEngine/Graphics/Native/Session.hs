@@ -46,6 +46,7 @@ import Hetoimasia.GLFW.Session (Backend, SessionConfig (..))
 import Hetoimasia.GLFW.Vulkan (withLoaderIntegration)
 import Hetoimasia.GPU.Model (Usage, usage)
 import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), DiagnosticVerdict, defaultCaptureConfig)
+import Hetoimasia.GPU.Vulkan.Native.Roots (RootsView (..))
 import Test.LuaEngine.Graphics.FrameLog (FrameLog, emptyFrameLog, recordEvent)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( FrameEvent (..)
@@ -55,6 +56,7 @@ import Hetoimasia.GPU.Vulkan.GLFW
   , VulkanHost (..)
   , VulkanHostConfig (..)
   , readReadiness
+  , readVulkanRoots
   , readVulkanModel
   , vulkanHostConfig
   , withVulkanOwnerHost
@@ -104,6 +106,8 @@ data Facts = Facts
   , factsFailure ∷ !(Maybe Text)
   , factsWindows ∷ !Int
     -- ^ The native windows the examples made.
+  , factsDevice ∷ !(Maybe Text)
+    -- ^ The physical device the owner selected, as the roots report it.
   }
 
 -- | Run an action on the process main thread, on the next turn of the owner loop it is serving, and answer what
@@ -154,6 +158,7 @@ runSession complete backend features configuration examples = do
   verdictCell ← newIORef Nothing
   passedCell ← newIORef False
   windowCount ← newIORef 0
+  deviceCell ← newIORef Nothing
   frames ← newTVarIO emptyFrameLog
   evidence ← newTVarIO []
   scenes ← newSceneSession
@@ -179,12 +184,13 @@ runSession complete backend features configuration examples = do
           )
           vulkanWindowHost
           (\vulkan _ → pure vulkan)
-          (\vulkan control → body scenes vulkan control config evidence passedCell windowCount frames)
+          (\vulkan control → body scenes vulkan control config evidence passedCell windowCount deviceCell frames)
   calls ← reverse <$> readIORef recorded
   verdict ← readIORef verdictCell
   passed ← readIORef passedCell
   lines' ← reverse <$> readTVarIO evidence
   windows ← readIORef windowCount
+  device ← readIORef deviceCell
   pure
     Facts
       { factsPassed = passed && either (const False) (const True) outcome
@@ -193,9 +199,10 @@ runSession complete backend features configuration examples = do
       , factsEvidence = lines'
       , factsFailure = either (Just . Text.pack . displayException) (const Nothing) outcome
       , factsWindows = windows
+      , factsDevice = device
       }
   where
-    body scenes vulkan control config evidence passedCell windowCount frames = do
+    body scenes vulkan control config evidence passedCell windowCount deviceCell frames = do
       progressNote "the owner is starting"
       readiness ← atomically $
         readReadiness (vulkanController vulkan) >>= \case
@@ -204,6 +211,7 @@ runSession complete backend features configuration examples = do
       case readiness of
         RootsFailed why → ioError (userError ("the owner's startup failed: " <> Text.unpack why))
         _ → pure ()
+      atomically (readVulkanRoots (vulkanController vulkan)) >>= writeIORef deviceCell . viewDeviceName
       progressNote "the owner is ready; composing the adapter"
       withTextureGraphics scenes configuration config vulkan $ \graphics → do
         progressNote "the adapter is composed; waiting for the table to bind"
