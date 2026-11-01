@@ -1,0 +1,21 @@
+{
+  "case": "srgb-byte-clear",
+  "image": "texel 128",
+  "specification": "sRGB byte texel",
+  "revision": 2,
+  "target": {"format": "R8G8B8A8_SRGB", "framebuffer": [64, 48], "logical": [64, 48], "scale": 1.0},
+  "textureIdentities": [17179869184],
+  "completion": "the batch's ticket reported complete before the readback was read",
+  "copyChecked": true,
+  "copyFaults": 0,
+  "determinatePixels": 3072,
+  "failedPixels": 0,
+  "unevaluablePixels": 0,
+  "indeterminatePixels": {},
+  "oracleTolerance": "the oracle's exactness rule: 0 or 1 per channel",
+  "namedProbes": 6,
+  "namedTolerances": [1],
+  "faults": 0,
+  "readbackSha256": "6ae47fac823fcb32ba8e2c868371e56cbb2ef3c75c7825ff200e17ed98937e52",
+  "pngSha256": "f931f1c96f7763f6f4c50fcc7210db14a248b014b62e37b2fd9f6afac29d56a9"
+}

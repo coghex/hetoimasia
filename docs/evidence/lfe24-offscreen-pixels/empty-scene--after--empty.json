@@ -1,0 +1,21 @@
+{
+  "case": "empty-scene",
+  "image": "after: empty",
+  "specification": "empty scene",
+  "revision": 2,
+  "target": {"format": "R8G8B8A8_SRGB", "framebuffer": [64, 48], "logical": [64, 48], "scale": 1.0},
+  "textureIdentities": [],
+  "completion": "the batch's ticket reported complete before the readback was read",
+  "copyChecked": true,
+  "copyFaults": 0,
+  "determinatePixels": 3072,
+  "failedPixels": 0,
+  "unevaluablePixels": 0,
+  "indeterminatePixels": {},
+  "oracleTolerance": "the oracle's exactness rule: 0 or 1 per channel",
+  "namedProbes": 5,
+  "namedTolerances": [1],
+  "faults": 0,
+  "readbackSha256": "36886190b85084672ce009c1e717bb3f0f6c034218d33e1c552e9a826ff91f94",
+  "pngSha256": "4e5920a9e1418c5e73f0d9073f44f06822076fdb5a873725683d0cf7f6d49875"
+}

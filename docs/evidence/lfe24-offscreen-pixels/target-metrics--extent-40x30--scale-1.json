@@ -1,0 +1,21 @@
+{
+  "case": "target-metrics",
+  "image": "extent 40x30, scale 1",
+  "specification": "grid 40x30 s1",
+  "revision": 1,
+  "target": {"format": "R8G8B8A8_SRGB", "framebuffer": [40, 30], "logical": [40, 30], "scale": 1.0},
+  "textureIdentities": [25769803776],
+  "completion": "the batch's ticket reported complete before the readback was read",
+  "copyChecked": true,
+  "copyFaults": 0,
+  "determinatePixels": 972,
+  "failedPixels": 0,
+  "unevaluablePixels": 0,
+  "indeterminatePixels": {"NearTexelBoundary": 228},
+  "oracleTolerance": "the oracle's exactness rule: 0 or 1 per channel",
+  "namedProbes": 24,
+  "namedTolerances": [1],
+  "faults": 0,
+  "readbackSha256": "2e9c1650e310d337ceb754323ca811afbca24e43bef993e72b44a7d7ab900546",
+  "pngSha256": "d9fea5f19d349cf0e4b3f8179d07246bd1856edeb6efcc584c0c6f8ab497c05f"
+}
