@@ -27,7 +27,10 @@
 -- deadline and at most the configured fallback bound. 'runOwnerLoop',
 -- 'LoopHooks', 'Turn', and 'TurnStep' are unchanged by it — same turn order,
 -- same idle-or-active choice, same fixed 'hostIdleWait' — and an application
--- using them never reads a clock. See \"The scheduled owner turn\" below.
+-- using them reads a clock only for the visible follow-up of a window that is
+-- in its slow phase or spending its quick bound (see \"The owner turn\" below);
+-- an application whose windows are never iconified never reads one. See
+-- \"The scheduled owner turn\" below.
 --
 -- 'renderTurn' is the CPU-only helper beside that path, and the one place where
 -- an application's simulation demand, a window's captured demand, and the
@@ -50,7 +53,19 @@
 --    its callback reported a change, then the retirement of every closing
 --    window no borrow defers, then every window, the collection of close
 --    requests not yet surfaced for windows that are not closing, and each
---    window's overflow warning claim and input resumption;
+--    window's overflow warning claim and input resumption. Between the close
+--    requests and the feeds, each window that owes one gets its visible
+--    follow-up: after an iconify transition the window's visible attribute is
+--    re-read on its next turns until it reads true or eight re-reads are
+--    spent, and a window still reading not visible is then re-read on the
+--    first turn whose clock reading is at least one 'hostIdleWait' after its
+--    previous re-read, for as long as it stays open, not iconified and
+--    suspended on a not-visible reading. At most one re-read per window per
+--    turn; a window owing none costs no native call and no clock reading. The
+--    clock is read at most once a turn, only when a window is in its slow
+--    phase or spends its quick bound, and 'runScheduledOwnerLoop' reuses the
+--    instant it already sampled after the native step rather than reading
+--    again;
 -- 4. a control check;
 -- 5. bounded command work: at most 'hostCommandBudget' commands claimed and
 --    settled, across every port;

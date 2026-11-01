@@ -19,10 +19,12 @@ module Hetoimasia.Runtime.GLFW.Internal.Host.Turn
 import Control.Concurrent.STM (atomically, readTVarIO, writeTVar)
 import Control.Exception (finally, mask)
 import Control.Monad (forM, forM_, unless, void)
-import Data.IORef (modifyIORef', readIORef)
+import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes)
+import Hetoimasia.Foundation.Failure (Operation, operation, throwFailure)
 import Hetoimasia.Foundation.Log (Logger)
+import Hetoimasia.Foundation.Time (Instant, readInstant)
 import Hetoimasia.GLFW.Internal.Input (attemptOverflowWarning, resumeInput)
 import Hetoimasia.GLFW.Internal.Session (reconcileMonitorEvents, sessionTrace)
 import Hetoimasia.GLFW.Internal.Trace (TraceEvent (TurnBegan), recordTrace)
@@ -31,10 +33,11 @@ import Hetoimasia.GLFW.Internal.Window
   , processWindowEvents
   , reconcileWindowEvents
   , reconcileWindowMode
+  , revisitVisible
   )
 import Hetoimasia.GLFW.Window (CloseRequest, WindowResult (..))
 import Hetoimasia.Runtime.GLFW.Internal.Host.Commands (dispatchCommands)
-import Hetoimasia.Runtime.GLFW.Internal.Host.Config (HostConfig (..))
+import Hetoimasia.Runtime.GLFW.Internal.Host.Config (HostConfig (..), HostConfigRejected (IdleWaitRejected), hostComponent, idleWaitDuration)
 import Hetoimasia.Runtime.GLFW.Internal.Host.Progress (advanceHostRetirements)
 import Hetoimasia.Runtime.GLFW.Internal.Host.State (HostActivity (..), HostEntry (..), WindowHost (..))
 import Hetoimasia.Runtime.GLFW.Internal.Host.Wake (hostNotifier, markedDegradationAttempt, promptAttempt, retainingReport)
@@ -79,11 +82,15 @@ data TurnWork = TurnWork
   }
 
 -- | The work of one turn after its native event processing, in the one order
--- both loops use: reconciliation and feed recovery, a check, bounded command
--- work and recovery again, a check, bounded application event work, and a
--- check.
-turnWork ∷ WindowHost → RuntimeControl → Logger → IO Bool → IO TurnWork
-turnWork host control logger event = do
+-- both loops use: reconciliation, the visible follow-ups, and feed recovery, a
+-- check, bounded command work and recovery again, a check, bounded application
+-- event work, and a check.
+--
+-- @sampled@ is an instant the loop already read for this turn, which the
+-- visible follow-up of 'revisitVisibility' uses instead of reading the clock
+-- again; the unscheduled loop, which reads no clock, passes 'Nothing'.
+turnWork ∷ WindowHost → RuntimeControl → Logger → Maybe Instant → IO Bool → IO TurnWork
+turnWork host control logger sampled event = do
   reconcileMonitorEvents (hostSession host)
   reconcileWindowModes host
   -- Before the retirement retry below, so an attachment this turn's own bounded
@@ -91,6 +98,7 @@ turnWork host control logger event = do
   advanceHostRetirements host
   retirePending host
   closes ← surfaceCloseRequests host
+  revisitVisibility host sampled
   recoverFeeds logger host
   void (mask (\restore → markedDegradationAttempt restore logger (hostNotifier host)))
   checkRuntime control
@@ -137,6 +145,42 @@ reconcileWindowModes host = do
   entries ← readTVarIO (hostEntries host)
   forM_ (Map.toAscList entries) $ \(target, entry) →
     if entryClosing entry then pure () else void (borrowWindow host target entry reconcileWindowMode)
+
+revisitOperation ∷ Operation
+revisitOperation = operation "revisit window visibility"
+
+-- | Offer every window the host holds that is not closing its visible
+-- follow-up, in registration order, after the turn's captures were reconciled:
+-- the one place the quick and slow re-reads of
+-- 'Hetoimasia.GLFW.Internal.Window.revisitVisible' run, at most one per window
+-- per turn.
+--
+-- The clock is read lazily, at most once per turn and shared by every window,
+-- and only when a window in the slow phase, or one spending the quick bound,
+-- asks for it; a turn that offers no such window reads none, so a host with no
+-- window in either phase reads exactly the clock it read before. A reading the
+-- loop already took for the turn is reused. A failing native read, or clock,
+-- ends the turn as any owner-turn failure does.
+revisitVisibility ∷ WindowHost → Maybe Instant → IO ()
+revisitVisibility host sampled = do
+  interval ← either rejectedBound pure (idleWaitDuration settings)
+  reading ← newIORef sampled
+  let clock =
+        readIORef reading >>= \case
+          Just known → pure known
+          Nothing → do
+            now ← readInstant (hostClock settings)
+            writeIORef reading (Just now)
+            pure now
+  entries ← readTVarIO (hostEntries host)
+  forM_ (Map.toAscList entries) $ \(target, entry) →
+    unless (entryClosing entry) $
+      void (borrowWindow host target entry (revisitVisible interval clock))
+  where
+    settings = hostSettings host
+    -- Unreachable for a host the construction accepted, which validated these
+    -- seconds as a positive duration.
+    rejectedBound _ = throwFailure hostComponent revisitOperation [] (IdleWaitRejected (hostIdleWait settings))
 
 -- | Claim each open feed's overflow warning and resume any acknowledged
 -- reset, at a safe owner boundary after callbacks have been reconciled.

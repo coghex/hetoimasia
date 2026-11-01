@@ -48,7 +48,7 @@ module Hetoimasia.GLFW.Internal.Window.Controls
   ) where
 
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), tryWithContext)
-import Data.IORef (readIORef)
+import Data.IORef (atomicWriteIORef, readIORef)
 import Hetoimasia.Foundation.Failure (Operation, operation)
 import Hetoimasia.GLFW.Internal.Attribute (Extent (..))
 import Hetoimasia.GLFW.Internal.Capture (hasReports)
@@ -77,6 +77,7 @@ import Hetoimasia.GLFW.Internal.Session (Native (..), NativeFailure (..), sessio
 import Hetoimasia.GLFW.Internal.Window.Boundary (atBoundary)
 import Hetoimasia.GLFW.Internal.Window.Observation (WindowObservation (..), WindowPhase (..))
 import Hetoimasia.GLFW.Internal.Window.Reconcile (raiseLatchedFault, reconcileWindow, reconcileWith)
+import Hetoimasia.GLFW.Internal.Window.Revisit (Revisit (..))
 import Hetoimasia.GLFW.Internal.Window.Sample (reportsDuring, sampleAll)
 import Hetoimasia.GLFW.Internal.Window.State
   ( ControlState (..)
@@ -115,6 +116,12 @@ controlWindow window control =
          pure (ControlRefused rejected)
      | otherwise = do
          outcome ← applyControl window control
+         -- A hide that returned settles the window's visibility as the
+         -- application's own: the follow-up of an earlier restore stops here,
+         -- before the post-call sample, and the last sampled value stands.
+         case (control, outcome) of
+           (HideControl, ControlReturned) → atomicWriteIORef (windowRevisit window) RevisitIdle
+           _ → pure ()
          ControlAttempted outcome <$> postCallObservation window
 
 -- | Make a validated control's native calls.

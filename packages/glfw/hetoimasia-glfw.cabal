@@ -86,6 +86,7 @@ library model
         Hetoimasia.GLFW.Internal.Window.ModeTransition
         Hetoimasia.GLFW.Internal.Window.Observation
         Hetoimasia.GLFW.Internal.Window.Reconcile
+        Hetoimasia.GLFW.Internal.Window.Revisit
         Hetoimasia.GLFW.Internal.Window.Sample
         Hetoimasia.GLFW.Internal.Window.State
         Hetoimasia.GLFW.Internal.Command
@@ -383,6 +384,7 @@ test-suite glfw-tests
         Test.GLFW.Owner.Scenes
         Test.GLFW.Protected
         Test.GLFW.Render
+        Test.GLFW.Revisit
         Test.GLFW.Scheduled
         Test.GLFW.Session
         Test.GLFW.Spec

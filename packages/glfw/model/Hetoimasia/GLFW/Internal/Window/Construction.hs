@@ -123,6 +123,7 @@ import Hetoimasia.GLFW.Internal.Window.Identity (WindowId, issuedWindowId)
 import Hetoimasia.GLFW.Internal.Window.ModeTransition (startWindowMode)
 import Hetoimasia.GLFW.Internal.Window.Observation (WindowObservation (..), WindowPhase (..))
 import Hetoimasia.GLFW.Internal.Window.Reconcile (reconciled)
+import Hetoimasia.GLFW.Internal.Window.Revisit (Revisit (..))
 import Hetoimasia.GLFW.Internal.Window.Sample (Sample (..), sampleAll, sampleOperation)
 import Hetoimasia.GLFW.Internal.Window.State
   ( Captures (..)
@@ -155,6 +156,7 @@ windowAssembly session config = do
   captures ← restoredStep (newIORef noCaptures)
   feed ← restoredStep (newIORef Nothing)
   control ← restoredStep (newIORef (ControlState (ConstraintsKnown Nothing) NativeFollowsWindowed False))
+  revisit ← restoredStep (newIORef RevisitIdle)
   certain ← restoredStep (newIORef True)
   failed ← restoredStep (newIORef False)
   storage ←
@@ -208,6 +210,7 @@ windowAssembly session config = do
           , windowCaptures = captures
           , windowOwnerState = ownerState
           , windowControl = control
+          , windowRevisit = revisit
           , windowPublisher = publisher
           , windowFeed = feed
           , windowBeforeHide = pure ()
