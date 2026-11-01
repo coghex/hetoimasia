@@ -39,6 +39,10 @@ module Hetoimasia.Run.Graphics
   , runNativeWith
   , Observation (..)
   , noObservation
+  , hostConfiguration
+  , reportResolution
+  , validationFields
+  , droppedItems
   ) where
 
 import Control.Concurrent.STM (STM, atomically, retry)
@@ -47,7 +51,7 @@ import Control.Monad (join, unless)
 import Data.List (partition)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import qualified Data.Text as Text
-import Hetoimasia.Foundation.Log (Component, logWarning, unsafeComponent)
+import Hetoimasia.Foundation.Log (Component, logInfo, logWarning, unsafeComponent)
 import Hetoimasia.GLFW.Vulkan (withLoaderIntegration)
 import Hetoimasia.GPU.Vulkan.Diagnostics
   ( CaptureConfig (..)
@@ -59,9 +63,13 @@ import Hetoimasia.GPU.Vulkan.Diagnostics
 import Hetoimasia.GPU.Vulkan.GLFW
   ( FrameEvent
   , Readiness (..)
+  , ValidationChoice
+  , ValidationDisposition (..)
+  , ValidationResolution (..)
   , VulkanHost (..)
   , VulkanHostConfig (..)
   , readReadiness
+  , readValidationResolution
   , runVulkanOwnerLoop
   , vulkanHostConfig
   , withVulkanOwnerHost
@@ -97,7 +105,7 @@ import Hetoimasia.LuaEngine.Session
   )
 import Hetoimasia.Run.Boot (Prepared (..))
 import Hetoimasia.Run.Serve (Owner (..), Spawned, runOwned, serveSpawned)
-import Hetoimasia.Run.Settle (reportDiagnostic)
+import Hetoimasia.Run.Settle (diagnostic, reportDiagnostic)
 import Hetoimasia.Run.Output (reportText)
 import Hetoimasia.Run.Session
   ( Environment
@@ -135,20 +143,25 @@ noObservation ∷ Observation
 noObservation = Observation (\_ → pure ()) (\_ _ → pure (pure ())) (pure ())
 
 -- | 'runNativeWith' 'noObservation': the command's own.
-runNative ∷ Environment → LoggingLifetime → STM Bool → SessionLink → Prepared → IO SessionOutcome
+runNative ∷ Environment → ValidationChoice → LoggingLifetime → STM Bool → SessionLink → Prepared → IO SessionOutcome
 runNative = runNativeWith noObservation
 
 -- | Run the prepared folder with the production native graphics, from the process main thread. Returns the
 -- session's outcome after every role has retired, the windows are destroyed, the textures proved retired and
 -- the owner application has torn down; raises what any of those raised, or an unclean diagnostic verdict.
-runNativeWith ∷ Observation → Environment → LoggingLifetime → STM Bool → SessionLink → Prepared → IO SessionOutcome
-runNativeWith observation environment lifetime stop link prepared = do
+--
+-- /Optional validation (LFE-28)./ The choice is a plain value ('ValidationOff' requests nothing and leaves the
+-- instance exactly as it was). It reaches the host's configuration as 'vulkanOptionalValidation' and is resolved
+-- in the owner's startup, where the loader's offer is known, so the strict layers and features of the
+-- configuration, which stay empty here, are untouched. The typed resolution is written by that startup the moment
+-- it is known and is logged once, by the main thread, as soon as the owner reports its startup finished or failed
+-- and before the session (and so any window) exists ('awaitReadiness'). A run that never reaches the loader's
+-- offer (a usage error, a boot refusal) has no record: none is made up.
+runNativeWith ∷ Observation → Environment → ValidationChoice → LoggingLifetime → STM Bool → SessionLink → Prepared → IO SessionOutcome
+runNativeWith observation environment choice lifetime stop link prepared = do
   textureConfiguration ← either (\refused → ioError (userError ("the profile cannot be mapped to the native graphics: " <> show refused))) pure (configurationFor (preparedProfile prepared))
   scenes ← newSceneSession
-  -- The capture keeps 16 KiB of a message, as the native suites do, so a long driver message is not truncated.
-  let capture = defaultCaptureConfig {captureTextBudget = 16384}
-      base = vulkanHostConfig (defaultHostConfig []) capture (configurationBudgets textureConfiguration) (scenesInitial scenes)
-      config = (configureScenes scenes (configureWindows (configureHost textureConfiguration base))) {vulkanFrameObserver = observeFrame observation}
+  let config = hostConfiguration observation choice textureConfiguration scenes
   verdictCell ← newIORef Nothing
   slot ← newIORef Nothing
   -- The application, the capture of whatever ends it, the stop of the session and its join are one masked sequence
@@ -176,7 +189,7 @@ runNativeWith observation environment lifetime stop link prepared = do
 
     body ∷ IORef (Maybe (Spawned SessionOutcome)) → SceneSession → TextureGraphicsConfiguration → VulkanHostConfig GraphicsScene → VulkanHost GraphicsScene → RuntimeControl → IO SessionOutcome
     body slot scenes textureConfiguration config vulkan control = do
-      awaitReadiness vulkan
+      awaitReadiness lifetime vulkan
       _ ← superviseGraphicsOwner control (vulkanGraphicsOwner vulkan)
       providerStep ← newIORef (pure ())
       observedStep ← newIORef (pure ())
@@ -213,6 +226,21 @@ runNativeWith observation environment lifetime stop link prepared = do
       -- the loop's guard can be cancelled.
       serveSpawned lifetime owner (writeIORef slot . Just) (linkStop link StopInterrupt) (join (readIORef providerStep) >> join (readIORef observedStep)) session
 
+-- | The production host's configuration: the strict layers and features stay empty, so nothing is asked of the
+-- loader as a requirement, and the optional validation is the choice and nothing else. A pure function of its
+-- arguments, so the request of an unvalidated run is an example's subject and not a reading of the code.
+--
+-- The capture keeps 16 KiB of a message, as the native suites do, so a long driver message is not truncated.
+hostConfiguration ∷ Observation → ValidationChoice → TextureGraphicsConfiguration → SceneSession → VulkanHostConfig GraphicsScene
+hostConfiguration observation choice textureConfiguration scenes =
+  (configureScenes scenes (configureWindows (configureHost textureConfiguration base)))
+    { vulkanFrameObserver = observeFrame observation
+    , vulkanOptionalValidation = choice
+    }
+  where
+    capture = defaultCaptureConfig {captureTextBudget = 16384}
+    base = vulkanHostConfig (defaultHostConfig []) capture (configurationBudgets textureConfiguration) (scenesInitial scenes)
+
 -- | The window provider's stop and fatal endpoints, through the link: a genuine native close is the session's
 -- idempotent normal stop, a failure of retirement a @cleanup_failure@ and any other fatal fault a
 -- @host_failure@, both of the presentation role at the engine stage. A close or a fault that arrives before the
@@ -229,16 +257,58 @@ linkWindowConfig link =
       CleanupFatal _ → CleanupFailure
       Fatal _ → HostFailure
 
--- | Wait for the owner's startup, which creates the device with no surface.
-awaitReadiness ∷ VulkanHost scene → IO ()
-awaitReadiness vulkan = do
+-- | Wait for the owner's startup, which creates the device with no surface, and report what the optional validation
+-- resolved to.
+--
+-- The record is read after the startup has finished or failed, so it is whole: it is written by the startup on the
+-- owner's thread before the plan is checked, which precedes both outcomes. It is reported here, on the main thread,
+-- once and before the session starts, so before any window; on a failed startup it is reported best effort ahead of
+-- the failure, which stays the failure of the run. A startup that never reached the loader's offer has none.
+awaitReadiness ∷ LoggingLifetime → VulkanHost scene → IO ()
+awaitReadiness lifetime vulkan = do
   readiness ← atomically $
     readReadiness (vulkanController vulkan) >>= \case
       RootsPending → retry
       other → pure other
+  resolution ← atomically (readValidationResolution (vulkanController vulkan))
   case readiness of
-    RootsFailed reason → ioError (userError ("the graphics owner did not start: " <> Text.unpack reason))
-    _ → pure ()
+    RootsFailed reason → do
+      mapM_ (reportDiagnostic . reportResolution lifetime) resolution
+      ioError (userError ("the graphics owner did not start: " <> Text.unpack reason))
+    _ → mapM_ (diagnostic . reportResolution lifetime) resolution
+
+-- | The one record of requested versus resolved optional validation, then a warning for each item dropped. The
+-- record says what was selected into the instance's create info, not that the loader kept the layer or that it is
+-- active.
+reportResolution ∷ LoggingLifetime → ValidationResolution → IO ()
+reportResolution lifetime resolution = do
+  logInfo logger component "vulkan validation resolved" (validationFields resolution)
+  mapM_ dropped (droppedItems resolution)
+  where
+    logger = lifetimeLogger lifetime
+    dropped (item, reason) = logWarning logger component "vulkan validation item dropped" [("item", item), ("reason", reason)]
+
+-- | The fields of the one record: whether validation was requested, and what became of the layer and of the feature.
+-- Each is @not-requested@, @enabled@ (selected into the instance's create info) or @dropped@ (requested, and not
+-- offered).
+validationFields ∷ ValidationResolution → [(Text.Text, Text.Text)]
+validationFields resolution =
+  [ ("requested", if requested then "true" else "false")
+  , ("layer", dispositionText (resolvedLayer resolution))
+  , ("feature", dispositionText (resolvedFeature resolution))
+  ]
+  where
+    requested = resolvedLayer resolution /= DispositionNotRequested || resolvedFeature resolution /= DispositionNotRequested
+    dispositionText = \case
+      DispositionNotRequested → "not-requested"
+      DispositionEnabled → "enabled"
+      DispositionDropped → "dropped"
+
+-- | Each dropped item with the reason, which is what the warning says.
+droppedItems ∷ ValidationResolution → [(Text.Text, Text.Text)]
+droppedItems resolution =
+  [("VK_LAYER_KHRONOS_validation", "the loader does not offer the layer") | resolvedLayer resolution == DispositionDropped]
+    <> [("synchronization-validation", "no enabled layer offers VK_EXT_validation_features") | resolvedFeature resolution == DispositionDropped]
 
 -- | The diagnostic capture's verdict after the last teardown.
 --

@@ -17,6 +17,8 @@ module Test.Run.Native.Capture
   , viewableNow
   , bindNew
   , snap
+  , snapWith
+  , bindChild
   , ownPid
   , closeBound
   ) where
@@ -37,13 +39,14 @@ import Test.Run.Native.Json
 import Test.Run.Native.Landmarks
 import Test.Run.Native.Observe (Metrics (..), windowMetrics)
 import Test.Run.Native.Peers (Peers)
-import Test.Run.Native.X11 (Candidate (..), Captured (..), Refused (..), X11, capture, requestClose, viewableCandidates)
+import Test.Run.Native.X11 (Candidate (..), Captured (..), Refused (..), X11, capture, geometry, requestClose, viewableCandidates)
 
 -- | A native window bound to the instance that made it, with the process that owns it.
 data Bound = Bound
   { boundHelper ∷ !X11
   , boundPid ∷ !Int
-  , boundWindow ∷ !WindowId
+  , boundWindow ∷ !(Maybe WindowId)
+  -- ^ The host's window identity for a harness window; none for the actual command's, which is another process.
   , boundX ∷ !Integer
   }
 
@@ -80,27 +83,44 @@ bindNew env peers window known = case envX11 env of
         metrics ← windowMetrics peers window
         when (metricsLogical metrics /= Just (candWidth one, candHeight one)) $
           expectationFailure ("the host observed " <> show (metricsLogical metrics) <> " for window " <> show window <> " but the bound X window " <> show (candWindow one) <> " is " <> show (candWidth one, candHeight one))
-        pure (Just (Bound helper pid window (candWindow one)))
+        pure (Just (Bound helper pid (Just window) (candWindow one)))
 
--- | Capture the bound window's client area, require every landmark of the quad scene, retain the capture and its record
--- under the given name, and say what was presented. @expectQuad@ is False for a window that should show only the clear
--- colour (before the scene is adopted).
+-- | Bind the actual command's native window: the one viewable window its process owns, within the bound. Zero or several
+-- viewable windows is a failure; the helper never picks.
+bindChild ∷ Env → Int → IO (Maybe Bound)
+bindChild env pid = case envX11 env of
+  Nothing → pure Nothing
+  Just helper → do
+    found ← pollFor "the command's window to be viewable on the X display" $ do
+      now ← viewableCandidates helper pid
+      case now of
+        [] → pure Nothing
+        [one] → pure (Just (Right one))
+        several → pure (Just (Left several))
+    case found of
+      Left several → expectationFailure ("the command (pid " <> show pid <> ") owns several viewable windows: " <> show (map candWindow several)) >> pure Nothing
+      Right one → pure (Just (Bound helper pid Nothing (candWindow one)))
+
+-- | Capture a harness window and require the quad scene's landmarks: 'snapWith' with the host's own metrics beside it.
 snap ∷ Env → Peers → Text → Maybe Bound → IO ()
 snap _ _ _ Nothing = pure ()
 snap env peers name (Just bound) = do
-  metrics ← windowMetrics peers (boundWindow bound)
+  metrics ← traverse (windowMetrics peers) (boundWindow bound)
+  snapWith env name bound quadLandmarks metrics
+
+-- | Capture the bound window's client area, require every landmark, retain the capture and its record under the given
+-- name, and say what was presented. The client area is whatever the X server reports now and the landmarks follow its
+-- size; the host's own metrics, when there are any (a harness window), are recorded beside it and cross-checked.
+snapWith ∷ Env → Text → Bound → ((Int, Int) → [Landmark]) → Maybe Metrics → IO ()
+snapWith env name bound landmarksFor metrics = do
   let final = envCaptureDir env </> Text.unpack name <> ".png"
       stage n = envCaptureDir env </> Text.unpack name <> ".attempt" <> show (n ∷ Int) <> ".png"
-      attemptFrom n previous = do
-        shot ← required "capture" (try (capture (boundHelper bound) (boundPid bound) (boundX bound) (stage n) probesFor Nothing))
-        mapM_ (\earlier → removeIfPresent earlier) previous
-        pure shot
-      -- the client area is whatever the X server reports now; landmarks follow its size
-      probesFor = [lmPoint l | l ← quadLandmarks (maybe (640, 480) id (metricsLogical metrics))]
       loop n previous = do
-        shot ← attemptFrom n previous
-        let landmarks = quadLandmarks (capturedWidth shot, capturedHeight shot)
-            judged = judge (capturedProbes shot) landmarks
+        now ← required "geometry" (try (geometry (boundHelper bound) (boundPid bound) (boundX bound)))
+        let size = (candWidth now, candHeight now)
+        shot ← required "capture" (try (capture (boundHelper bound) (boundPid bound) (boundX bound) (stage n) [lmPoint l | l ← landmarksFor size] Nothing))
+        mapM_ removeIfPresent previous
+        let judged = judge (capturedProbes shot) (landmarksFor (capturedWidth shot, capturedHeight shot))
         if all judgedPassed judged
           then pure (n, shot, judged, True)
           else
@@ -112,7 +132,8 @@ snap env peers name (Just bound) = do
     Just done → pure done
     Nothing → expectationFailure ("the capture " <> Text.unpack name <> " never showed the scene's landmarks within 40 seconds") >> error "unreachable"
   renameFile (capturedPath shot) final
-  let scaleOk = metricsScale metrics `elem` [Just (1, 1), Nothing]
+  let scale = metrics >>= metricsScale
+      scaleOk = scale `elem` [Just (1, 1), Nothing]
       record =
         JObject
           [ ("name", JString name)
@@ -121,9 +142,10 @@ snap env peers name (Just bound) = do
           , ("pid", JNumber (fromIntegral (boundPid bound)))
           , ("x_window", JNumber (boundX bound))
           , ("client_area", JArray [JNumber (fromIntegral (capturedWidth shot)), JNumber (fromIntegral (capturedHeight shot))])
-          , ("host_logical_extent", extentJson (metricsLogical metrics))
-          , ("host_framebuffer_extent", extentJson (metricsFramebuffer metrics))
-          , ("host_content_scale", case metricsScale metrics of Just (x, y) → JString (Text.pack (show (x, y))); Nothing → JNull)
+          , ("host_logical_extent", extentJson (metrics >>= metricsLogical))
+          , ("host_framebuffer_extent", extentJson (metrics >>= metricsFramebuffer))
+          , ("host_content_scale", case scale of Just (x, y) → JString (Text.pack (show (x, y))); Nothing → JNull)
+          , ("host_metrics_available", JBool (maybe False (const True) metrics))
           , ("attempts", JNumber (fromIntegral attempts))
           , ("tolerance_per_channel", JNumber (fromIntegral tolerance))
           , ("colour_handling", JString "Xvfb TrueColor display, no colour management; presented through an sRGB target by the software rasteriser; landmark expectations are the fixture's byte values (samples/lua-quad), never a first-run capture")
@@ -131,7 +153,7 @@ snap env peers name (Just bound) = do
           , ("passed", JBool (passed && scaleOk))
           ]
   writeFile (envCaptureDir env </> Text.unpack name <> ".json") (render record <> "\n")
-  unless scaleOk $ expectationFailure ("the host reports content scale " <> show (metricsScale metrics) <> " on the X display; this receipt's landmarks assume scale 1")
+  unless scaleOk $ expectationFailure ("the host reports content scale " <> show scale <> " on the X display; this receipt's landmarks assume scale 1")
   unless passed $ expectationFailure ("a landmark failed in capture " <> Text.unpack name <> ": " <> show [lmName (judgedLandmark j) | j ← judged, not (judgedPassed j)])
   evidence env ("capture " <> name <> ": X window " <> Text.pack (show (boundX bound)) <> " of pid " <> Text.pack (show (boundPid bound)) <> ", client area " <> Text.pack (show (capturedWidth shot, capturedHeight shot)) <> ", sha256 " <> capturedSha256 shot <> ", " <> Text.pack (show (length judged)) <> " landmarks passed within " <> Text.pack (show tolerance) <> " per channel after " <> Text.pack (show attempts) <> " capture(s); a capture is what the window presented, not GPU retirement evidence")
   where

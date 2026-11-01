@@ -17,6 +17,7 @@ module Test.Run.Native.Landmarks
   ( Landmark (..)
   , tolerance
   , quadLandmarks
+  , redClearLandmarks
   , judge
   , Judgement (..)
   ) where
@@ -61,6 +62,19 @@ quadLandmarks (width, height) = filter inside (quad <> background)
       , Landmark "clear, below the quad" (150, 300) clear
       , Landmark "clear, far corner" (width - 8, height - 8) clear
       ]
+
+-- | Landmarks of the scene the shipped content publishes when the logical role has failed: the exact empty red clear
+-- (96, 0, 0) and no sprite (samples/lua-quad content/lua/main.lua), so every point is the clear colour.
+redClearLandmarks ∷ (Int, Int) → [Landmark]
+redClearLandmarks (width, height) =
+  [ Landmark ("red clear at " <> label) point (96, 0, 0)
+  | (label, point) ←
+      [ ("the top-left corner area", (8, 8))
+      , ("where the quad would be", (112, 112))
+      , ("the centre", (width `div` 2, height `div` 2))
+      , ("the far corner", (width - 8, height - 8))
+      ]
+  ]
 
 -- | What a capture said at a landmark.
 data Judgement = Judgement

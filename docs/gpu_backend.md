@@ -342,6 +342,24 @@ caller's layers. A loader below 1.3, a missing extension or a missing layer is
 that fails part-way leaves what it created recorded, and the owner's drain
 retires and destroys it.
 
+That request is **strict**: a layer or a validation feature the caller names
+in the host configuration (`vulkanLayers`, `vulkanValidationFeatures`) that the
+loader lacks is a refusal (`InstanceLayersUnavailable`,
+`ValidationFeaturesUnavailable`), never a silent fall back to validating less.
+The samples and the native suites rely on it. Beside it, `vulkanOptionalValidation`
+(LFE-28; `hetoimasia run --vulkan-validation`) is a **best-effort** request:
+`resolveValidation` is a pure function of the choice, the strict request and the
+loader's offer that adds the Khronos layer only if the loader lists it and
+synchronization validation only if an *enabled* layer lists
+`VK_EXT_validation_features`, and drops what is not offered rather than
+refusing. The decision is taken in the owner's startup (`startRootsResolving`),
+the one place the offer is known, and the typed resolution (requested, enabled
+or dropped for each of the two) is written there before the plan is checked and
+read with `readValidationResolution`. It never loosens the strict request, never
+retries a failed creation without validation, and adds no object naming (the
+messenger is still never named). See
+[the run command's Validation section](run_command.md#validation).
+
 ## Admitting targets
 
 `handOverVulkanTarget` runs on the main thread. It attaches the window with a

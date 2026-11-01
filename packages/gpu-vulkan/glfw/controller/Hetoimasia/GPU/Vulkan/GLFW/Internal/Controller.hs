@@ -164,6 +164,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Controller
     -- * Readiness
   , Readiness (..)
   , readReadiness
+  , readValidationResolution
 
     -- * Handing targets over
   , VulkanHandover (..)
@@ -500,7 +501,7 @@ import Hetoimasia.GPU.Vulkan.Native.Generations
 import Hetoimasia.GPU.Vulkan.Native.Naming (Instrumentation (..))
 import Hetoimasia.GPU.Vulkan.Native.Presentation (SurfaceExtent (..))
 import qualified Hetoimasia.GPU.Vulkan.Native.Presentation as Presentation
-import Hetoimasia.GPU.Vulkan.Native.Profile (InstancePlan (..), InstanceRequest (..), TargetRejection (..), ValidationFeature)
+import Hetoimasia.GPU.Vulkan.Native.Profile (InstancePlan (..), InstanceRequest (..), TargetRejection (..), ValidationChoice (..), ValidationFeature, ValidationResolution)
 import Hetoimasia.GPU.Vulkan.Native.Roots
   ( DiagnosticAlarm (..)
   , GenerationOps (..)
@@ -538,7 +539,7 @@ import Hetoimasia.GPU.Vulkan.Native.Roots
   , readRootsView
   , retireRootTarget
   , retireRoots
-  , startRoots
+  , startRootsResolving
   , startRootsDevice
   )
 import Hetoimasia.Runtime.GLFW
@@ -619,8 +620,20 @@ data State inst msgr phys dev cmd lease obligation = State
   , stateBridge ∷ !(SurfaceBridge lease obligation)
   , stateLayers ∷ ![ByteString]
   , stateValidation ∷ ![ValidationFeature]
+  , stateChoice ∷ !ValidationChoice
+    -- ^ The optional validation the instance is started with (LFE-28): fixed at
+    -- construction from the host configuration, and read only by the owner's
+    -- startup, beside the strict layers and features above.
   , stateRequest ∷ !(TVar (Maybe InstanceRequest))
     -- ^ Supplied on the main thread from the session, before the owner starts.
+  , stateResolution ∷ !(TVar (Maybe ValidationResolution))
+    -- ^ What the optional request resolved to against the loader's offer:
+    -- written once, by the owner's startup, on its own thread, at the moment it
+    -- is known — before the plan is checked and before the instance is created,
+    -- so a startup that fails afterwards still has it. 'Nothing' until startup
+    -- reaches the loader's offer, and for good if it never does (no instance
+    -- extensions were supplied, or the offer could not be read). Read by
+    -- 'readValidationResolution', never written elsewhere.
   , stateLease ∷ !(TVar (Lease lease))
   , stateDeposits ∷ !(TVar (Map AttachmentId (Deposit obligation)))
     -- ^ Written by a construction step on the main thread; taken by the
@@ -754,6 +767,7 @@ newVulkanController
   → SurfaceBridge lease obligation
   → [ByteString]
   → [ValidationFeature]
+  → ValidationChoice
   → Budgets
   → MonotonicSource
   → Duration
@@ -777,11 +791,12 @@ newVulkanControllerWith
   → SurfaceBridge lease obligation
   → [ByteString]
   → [ValidationFeature]
+  → ValidationChoice
   → Budgets
   → MonotonicSource
   → Duration
   → IO VulkanController
-newVulkanControllerWith hooks capture deviceStart capacity releaseCapacity initialEmpty uploads windowDepth ops rendering observer pointer bridge layers validation budgets clock poll = do
+newVulkanControllerWith hooks capture deviceStart capacity releaseCapacity initialEmpty uploads windowDepth ops rendering observer pointer bridge layers validation choice budgets clock poll = do
   roots ← newRoots ops budgets clock
   ownerOpen ← newTVarIO (pure True)
   scenes ← newScenes initialEmpty
@@ -797,8 +812,9 @@ newVulkanControllerWith hooks capture deviceStart capacity releaseCapacity initi
   captures ← newCaptures capture
   rendered ← newRendering roots generations rendering observer captures uploads windowDepth
   fmap VulkanController $
-    State roots generations rendered pointer bridge layers validation
+    State roots generations rendered pointer bridge layers validation choice
       <$> newTVarIO Nothing
+      <*> newTVarIO Nothing
       <*> newTVarIO LeasePending
       <*> newTVarIO Map.empty
       <*> newTVarIO Map.empty
@@ -900,6 +916,16 @@ data Readiness
   | RootsFailed !Text
     -- ^ The owner's startup failed with this; it retires what it created.
   deriving (Eq, Show)
+
+-- | What the optional validation request resolved to against the loader's offer
+-- ('Nothing' until the owner's startup has read the offer, and for good when it
+-- never does). It is the typed record of requested versus resolved (LFE-28), the
+-- same value whether validation was requested or not: a 'ValidationOff' host
+-- resolves to two 'DispositionNotRequested' items. Written once; a reader that
+-- has seen 'RootsReady' or 'RootsFailed' sees whether one exists. 'Enabled' means
+-- selected into the instance's create info, not proven loaded.
+readValidationResolution ∷ VulkanController → STM (Maybe ValidationResolution)
+readValidationResolution (VulkanController state) = readTVar (stateResolution state)
 
 readReadiness ∷ VulkanController → STM Readiness
 readReadiness (VulkanController state) =
@@ -1657,7 +1683,7 @@ startOwner ∷ State inst msgr phys dev cmd lease obligation → IO OwnerReady
 startOwner state = do
   attempted ← tryWithContext $ do
     request ← readTVarIO (stateRequest state) >>= maybe (throwIO InstanceExtensionsMissing) pure
-    plan ← startRoots roots request
+    plan ← startRootsResolving roots request (stateChoice state) (atomically . writeTVar (stateResolution state) . Just)
     created ← atomically (readRootsInstance roots) >>= maybe (throwIO RootsNotStarted) pure
     -- A surface-free session's device exists before any window can be handed
     -- over, so readiness means a device to act on.
@@ -2527,6 +2553,12 @@ data VulkanHostConfig scene = VulkanHostConfig
     -- ^ Validation features the instance's create info enables through those
     -- layers, such as synchronization validation. Empty by default; any at
     -- all refuses the instance unless an enabled layer offers them.
+  , vulkanOptionalValidation ∷ !ValidationChoice
+    -- ^ Validation asked for only as far as the loader's offer reaches (LFE-28):
+    -- 'ValidationOff' by default. Beside the strict fields above, which it never
+    -- loosens: a missing layer or feature is dropped and recorded
+    -- ('readValidationResolution'), never a failure. The decision is taken where
+    -- the offer is known, in the owner's startup.
   , vulkanBudgets ∷ !Budgets
   , vulkanScene ∷ !(Prepared scene)
   , vulkanOwner ∷ GraphicsOwnerConfig scene → GraphicsOwnerConfig scene
@@ -2628,7 +2660,7 @@ defaultReleaseCapacity ∷ Natural
 defaultReleaseCapacity = 64
 
 -- | A configuration with the given capture configuration and budgets, no
--- layers or validation features, the owner's defaults, no observer, a
+-- layers or validation features, optional validation off, the owner's defaults, no observer, a
 -- renderer that clears every frame to opaque black, the device created at the
 -- first window's admission, 'defaultActionCapacity' and
 -- 'defaultReleaseCapacity', no uploads, one scene shared by every window with a
@@ -2636,7 +2668,7 @@ defaultReleaseCapacity = 64
 -- initial scene holds nothing.
 vulkanHostConfig ∷ HostConfig → CaptureConfig → Budgets → Prepared scene → VulkanHostConfig scene
 vulkanHostConfig host capture budgets scene =
-  VulkanHostConfig host capture [] [] budgets scene id (const noObserver) (clearRenderer (\_ _ → ClearColor 0 0 0 1)) noFrameObserver DeviceAtFirstSurface defaultActionCapacity defaultReleaseCapacity Nothing SharedScene noSceneLifecycle False False defaultTargetCapacity
+  VulkanHostConfig host capture [] [] ValidationOff budgets scene id (const noObserver) (clearRenderer (\_ _ → ClearColor 0 0 0 1)) noFrameObserver DeviceAtFirstSurface defaultActionCapacity defaultReleaseCapacity Nothing SharedScene noSceneLifecycle False False defaultTargetCapacity
 
 -- | A running Vulkan graphics host.
 data VulkanHost scene = VulkanHost
@@ -2711,6 +2743,7 @@ withVulkanOwnerHostHooked hooks capturing logger layer rendering pointer bridge 
         (observeBridge observer bridge)
         (vulkanLayers config)
         (vulkanValidationFeatures config)
+        (vulkanOptionalValidation config)
         (vulkanBudgets config)
         (hostClock host)
         (either (const fallbackPoll) convertedDuration (durationFromSeconds RequirePositive (hostIdleWait host)))
