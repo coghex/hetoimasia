@@ -54,12 +54,13 @@ import Control.Concurrent.STM
   ( STM
   , TVar
   , atomically
+  , modifyTVar'
   , newTVarIO
   , readTVar
   , retry
   , writeTVar
   )
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, finally)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, displayException, mask, onException)
 import Control.Monad (void)
 import Data.Functor ((<&>))
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -68,6 +69,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Numeric.Natural (Natural)
+import System.IO (hPutStrLn, stderr)
 
 import qualified Hetoimasia.GPU.Vulkan.GLFW as G
 import Hetoimasia.GPU.Vulkan.GLFW
@@ -292,15 +294,29 @@ renderTarget env target facts between =
                         pure (bytes >>= \found → Right (finish info metrics (Readback (fromIntegral width) (fromIntegral height) found) "the batch's ticket reported complete before the readback was read"))
                       other → pure (Left ("the batch did not complete: its ticket read " <> tshow other))
               -- Run on every way out, masked: the batch's ticket has settled before the target and the readback are
-              -- released, and a release that fails is recorded where it fails, not dropped.
+              -- released, and every release that fails is recorded where it fails (both releases are attempted and
+              -- both refusals kept), not dropped.
               cleanup = do
                 readIORef ticketRef >>= mapM_ (void . awaitSettled)
                 released ← act "releasing the target and the readback" $ VulkanAction $ \construction → do
                   first ← releaseConstructed construction image
                   second ← releaseConstructed construction readback
-                  pure (first *> second)
-                either (writeIORef cleanupRef . Just) pure released
-          outcome ← body `finally` cleanup
+                  pure (Right [what <> ": " <> tshow refusal | (what, Left refusal) ← [("the target", first), ("the readback", second)]])
+                case released of
+                  Left why → writeIORef cleanupRef (Just why)
+                  Right [] → pure ()
+                  Right whys → writeIORef cleanupRef (Just (Text.intercalate "; " whys))
+              -- When the body raises (the example's own timeout, the action it was given), the exception goes on, and a
+              -- cleanup failure that happened with it is not lost: it is written to the run's evidence and to stderr.
+              noteCleanup = do
+                cleanup
+                readIORef cleanupRef >>= mapM_ (\why → do
+                  atomically (modifyTVar' (envEvidence env) (("a rendering raised and its cleanup failed too: " <> why) :))
+                  hPutStrLn stderr ("lua-engine-graphics-native-tests: a rendering raised and its cleanup failed too: " <> Text.unpack why))
+          outcome ← mask $ \restore → do
+            result ← restore body `onException` noteCleanup
+            cleanup
+            pure result
           cleaned ← readIORef cleanupRef
           pure $ case (outcome, cleaned) of
             (_, Nothing) → outcome

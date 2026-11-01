@@ -629,11 +629,16 @@ greySpriteSpec =
     ]
 
 -- | Fractional, negative and clipped placements over an opaque dark green clear (16, 48, 16), on a 64 x 48 target. The
--- target samples at pixel centres (k + 0.5), so a rectangle covers the pixels whose centre lies inside it:
+-- target samples at pixel centres (k + 0.5), so a rectangle covers the pixels whose centre lies inside it. A and B have
+-- fractional sizes as well as origins, chosen so that rounding the origin to the nearest integer (what a snapping renderer
+-- would do) moves an edge across a pixel centre and changes a covered pixel; every edge is at least 0.1 pixel from a centre,
+-- so none is within the oracle's 1/16 pixel of indeterminacy:
 --
--- * A, magenta at (10.25, 6.25) size 8 x 6: centres from 10.5 (10.25 <= k + 0.5) to 17.5 (< 18.25): x 10..17; y 6..11.
--- * B, magenta at (24.75, 6.75) size 8 x 6: x from 25 (24.75 <= k + 0.5 gives k >= 24.25) to 32; y 7..12. A rectangle
---   snapped down to 24 would cover pixel 24 and one snapped to 25 and 7 differs from neither: pixel 24 is the witness.
+-- * A, magenta at (10.4, 6.4) size 8.35 x 6.35: right edge 18.75, bottom 12.75, so x 10..18 and y 6..12. Snapped to (10, 6) its
+--   edges are 18.35 and 12.35: x 10..17, y 6..11. Pixel (18, 8) tells the two apart.
+-- * B, magenta at (24.7, 6.7) size 8.6 x 6.6: left 24.7 and top 6.7 (first pixels 25 and 7), right edge 33.3, bottom 13.3, so
+--   x 25..32 and y 7..12. Snapped to (25, 7) its edges are 33.6 and 13.6: x 25..33, y 7..13. Pixels (33, 8) and (28, 13) tell
+--   the two apart.
 -- * C, magenta at (-5, -3) size 12 x 10, across the left and top edges: x 0..6, y 0..6.
 -- * D, magenta at (60, 44) size 12 x 10, across the right and bottom edges: x 60..63, y 44..47.
 -- * E, magenta at (-6, 20) size 10 x 8, across the left edge alone: x 0..3, y 20..27.
@@ -642,8 +647,8 @@ greySpriteSpec =
 placementSpec ∷ CaseSpec
 placementSpec =
   CaseSpec "fractional, negative and clipped placement" (16, 48, 16)
-    [ Placement magentaFixture (10.25, 6.25, 8, 6)
-    , Placement magentaFixture (24.75, 6.75, 8, 6)
+    [ Placement magentaFixture (10.4, 6.4, 8.35, 6.35)
+    , Placement magentaFixture (24.7, 6.7, 8.6, 6.6)
     , Placement magentaFixture (-5, -3, 12, 10)
     , Placement magentaFixture (60, 44, 12, 10)
     , Placement magentaFixture (-6, 20, 10, 8)
@@ -653,21 +658,23 @@ placementSpec =
     ( [ Named ("A " <> what) x y want exact
       | (what, x, y, want) ←
           [ ("covers its first pixel", 10, 6, magenta)
-          , ("covers its last pixel", 17, 11, magenta)
-          , ("leaves the pixel to its left", 9, 6, clear)
-          , ("leaves the pixel to its right", 18, 6, clear)
+          , ("covers its last pixel", 18, 12, magenta)
+          , ("covers x 18, which a snapped origin would leave", 18, 8, magenta)
+          , ("covers y 12, which a snapped origin would leave", 12, 12, magenta)
+          , ("leaves x 19", 19, 8, clear)
+          , ("leaves the pixel to its left", 9, 8, clear)
           , ("leaves the pixel above", 10, 5, clear)
-          , ("leaves the pixel below", 10, 12, clear)
+          , ("leaves the pixel below", 10, 13, clear)
           ]
       ]
         <> [ Named ("B " <> what) x y want exact
            | (what, x, y, want) ←
                [ ("covers its first pixel", 25, 7, magenta)
                , ("covers its last pixel", 32, 12, magenta)
-               , ("leaves pixel 24, so it was not snapped down", 24, 7, clear)
-               , ("leaves the pixel to its right", 33, 7, clear)
+               , ("leaves x 33, which a snapped origin would cover", 33, 8, clear)
+               , ("leaves y 13, which a snapped origin would cover", 28, 13, clear)
+               , ("leaves pixel 24", 24, 8, clear)
                , ("leaves the row above", 25, 6, clear)
-               , ("leaves the row below", 25, 13, clear)
                ]
            ]
         <> [ Named ("C " <> what) x y want exact

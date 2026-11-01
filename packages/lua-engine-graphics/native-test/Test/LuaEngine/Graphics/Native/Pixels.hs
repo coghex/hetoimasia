@@ -38,11 +38,12 @@ module Test.LuaEngine.Graphics.Native.Pixels (spec) where
 import Control.Concurrent (forkFinally, killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
-import Control.Exception (displayException, finally, onException, throwIO)
+import Control.Exception (AsyncException (ThreadKilled), displayException, finally, fromException)
 import Control.Monad (forM_, unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.IORef (newIORef, readIORef, writeIORef)
+import Data.List (isInfixOf)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -80,7 +81,7 @@ import System.Directory (createDirectoryIfMissing)
 import System.Environment (lookupEnv)
 import System.Timeout (timeout)
 import System.FilePath ((</>))
-import Test.HUnit.Lang (assertFailure)
+import Test.HUnit.Lang (HUnitFailure (..), assertFailure)
 import Test.Hspec
 import Test.LuaEngine.Graphics.Composition (Composition (..), Files, compositionProfile, holdReadsOf, releaseAllReads, releaseReadsOf, withComposition)
 import Test.LuaEngine.Graphics.FacadeScripts (manifestFor)
@@ -102,6 +103,16 @@ spec env = describe "Lua offscreen pixels" $ do
         awaitAdopted live 1
         _ ← checkImage env live "shipped quad" quadSpec 1 (pure ())
         publishedNow live >>= (`shouldBe` Just 1)
+
+  it "a Lua failure before any window exists ends the example with the roles' failure, with the scenario joined and nothing left behind" $
+    -- Well inside the scenario's own 60-second bound: the session has already returned, so nothing may wait for that bound.
+    within 30 $ do
+      let files = [("hetoimasia.json", manifestFor True), ("lua/main.lua", failingBeforeWindow)]
+          roleFailed (HUnitFailure _ reason) = "boom before any window" `isInfixOf` show reason
+      -- The scenario never gets a target (no window is ever opened), so it waits in its startup; the session returns an
+      -- unsuccessful outcome, and the example must end with that failure rather than wait on the scenario.
+      withLiveSession env "failure-before-window" files [] (\_ → pure ()) `shouldThrow` roleFailed
+      awaitGone env
 
   it "top-left, full image, nearest: an asymmetric twelve-colour texture, enlarged eight to a texel, shows every texel at its place with no colour between neighbours, after the initial scene read opaque black" $
     within 120 $
@@ -265,6 +276,20 @@ spec env = describe "Lua offscreen pixels" $ do
         _ ← checkImage env live "the empty replacement" emptySpec 2 (pure ())
         publishedNow live >>= (`shouldBe` Just 2)
         evidence env "Lua offscreen pixels: a texture released straight after acceptance and before adoption was drawn after the release (two batches), refused for a new publication, and retired only after the replacement and the old batches' tickets completed"
+
+-- | A program whose presentation role fails in its first hook, before it can open a window.
+failingBeforeWindow ∷ ByteString
+failingBeforeWindow =
+  Text.encodeUtf8 . Text.unlines $
+    [ "return {"
+    , "  gameplay = {every_ticks=1, update=function(self, dt_seconds) end},"
+    , "  presentation = {"
+    , "    every_seconds=0.02,"
+    , "    init=function(self, api) error(\"boom before any window\") end,"
+    , "    update=function(self, dt_seconds) end"
+    , "  }"
+    , "}"
+    ]
 
 -- | The metrics rows: the grid scene viewed at other extents and scales, all of revision 1.
 metricsSpecs ∷ [(Text, CaseSpec)]
@@ -533,16 +558,13 @@ withLiveSession env name files held scenario = do
           result ← newEmptyMVar
           scenarioThread ←
             forkFinally
-              ( do
-                  found ← readMVar handle
-                  writeIORef sessionRef (Just found)
-                  target ← atomically (displayTargets display >>= \case [one] → pure one; _ → retry)
-                  -- Bounded, and naming what the roles said when it is not met: a wait that nothing is left to end.
-                  timeout (60 * 1000000) (scenario (Live name composition target warns env)) >>= \case
-                    Just () → pure ()
-                    Nothing → do
-                      said ← readTVarIO warns
-                      assertFailure ("the scenario did not finish within 60 seconds; the roles warned " <> show said)
+              -- The whole of the scenario's thread is bounded, its startup waits included (the session's handle, the
+              -- display's target), and names what the roles said when the bound is not met.
+              ( timeout (60 * 1000000) (readMVar handle >>= \found → writeIORef sessionRef (Just found) >> atomically (displayTargets display >>= \case [one] → pure one; _ → retry) >>= \target → scenario (Live name composition target warns env)) >>= \case
+                  Just () → pure ()
+                  Nothing → do
+                    said ← readTVarIO warns
+                    assertFailure ("the scenario did not finish within 60 seconds; the roles warned " <> show said)
               )
               ( \outcome →
                   -- Masked by 'forkFinally': however the scenario ended, every read it held is let go and the session
@@ -565,19 +587,26 @@ withLiveSession env name files held scenario = do
                   , sxHarness = noHarness
                   , sxGraphics = Just injection
                   }
-          -- However the session ends, the scenario's thread has ended before this scope does.
-          outcome ← runSession sessionSpec (putMVar handle) `onException` (killThread scenarioThread >> void (readMVar result))
+          -- However the session ends (normally, with the roles' failure returned before any window existed, or by an
+          -- exception), the scenario's thread has ended and been joined before this scope does: it is told to end
+          -- unconditionally and its masked handler's outcome is waited for.
+          outcome ← runSession sessionSpec (putMVar handle) `finally` (killThread scenarioThread >> void (readMVar result))
           scenarioOutcome ← readMVar result
           case scenarioOutcome of
             Right () → pure ()
-            Left raised →
-              if null (outFailures outcome)
-                then throwIO raised
-                else assertFailure (displayException raised <> "; the roles failed: " <> show (outFailures outcome))
+            Left raised
+              | Just ThreadKilled ← fromException raised →
+                  assertFailure ("the session ended before the scenario finished; the verdict was " <> show (outVerdict outcome) <> "; the roles failed: " <> show (outFailures outcome))
+              | otherwise →
+                  assertFailure (displayException raised <> "; the verdict was " <> show (outVerdict outcome) <> "; the roles failed: " <> show (outFailures outcome))
           outVerdict outcome `shouldBe` VerdictSuccess
           outFailures outcome `shouldBe` []
           outRetired outcome `shouldBe` True
-  -- Everything the session made is gone: the target is unregistered and its record released, the textures are retired.
+  awaitGone env
+
+-- | Everything a session made is gone: its target is unregistered and its record released, its textures retired.
+awaitGone ∷ Env → IO ()
+awaitGone env = do
   atomically $ do
     state ← readVulkanSceneState (envHost env)
     check (not (any isOffscreen (Map.keys (sceneWindows state))))

@@ -206,11 +206,19 @@ comparatorSpec = describe "the comparator" $ do
     let transparent = filled emptySpec (40, 80, 120, 200)
     judgementOk (judged emptySpec transparent) `shouldBe` False
     checkNamed transparent (specNamed emptySpec) `shouldSatisfy` (not . null)
-  it "rejects a placement that was snapped, clipped by recentring or stretched, at the named positions" $ do
-    let snappedDown = recolourAt placementSpec 24 7 (210, 40, 170, 255)
-    checkNamed snappedDown (specNamed placementSpec) `shouldSatisfy` (not . null)
+  it "rejects a placement whose origin was snapped to the nearest integer, and one recentred or flipped, in the whole image and at the named positions" $ do
+    -- What a snapping renderer draws: the same sprites with each origin rounded to the nearest integer, sizes kept.
+    let roundOrigin (Placement fixture (x, y, w, h)) = Placement fixture (fromIntegral (floor (x + 0.5) ∷ Int), fromIntegral (floor (y + 0.5) ∷ Int), w, h)
+        snappedSpec = placementSpec {specPlacements = map roundOrigin (specPlacements placementSpec)}
+        snapped = perfect snappedSpec
+        witnesses = map mismatchName (checkNamed snapped (specNamed placementSpec))
+    judgementOk (judged placementSpec snapped) `shouldBe` False
+    -- Both fractional sprites are told apart from their snapped selves: A (origin rounds down) and B (rounds up).
+    witnesses `shouldSatisfy` any (Text.isPrefixOf "A ")
+    witnesses `shouldSatisfy` any (Text.isPrefixOf "B ")
     let recentred = flipY (perfect placementSpec)
     checkNamed recentred (specNamed placementSpec) `shouldSatisfy` (not . null)
+    judgementOk (judged placementSpec recentred) `shouldBe` False
 
 filled ∷ CaseSpec → Texel → Readback
 filled s (r, g, b, a) =
@@ -223,12 +231,6 @@ recolour s from to =
       pixels = [ByteString.take 4 (ByteString.drop (4 * i) bytes) | i ← [0 .. w * h - 1]]
       pack (r, g, b, a) = ByteString.pack [r, g, b, a]
    in Readback w h (ByteString.concat [if p == pack from then pack to else p | p ← pixels])
-
-recolourAt ∷ CaseSpec → Int → Int → Texel → Readback
-recolourAt s x y (r, g, b, a) =
-  let Readback w h bytes = perfect s
-      at = (y * w + x) * 4
-   in Readback w h (ByteString.take at bytes <> ByteString.pack [r, g, b, a] <> ByteString.drop (at + 4) bytes)
 
 -- | The readback a bilinear sampler would produce for the grid scene: each pixel the mean of the correct pixel and its
 -- left and right neighbours inside the image. It differs from the nearest readback only beside a texel boundary.
