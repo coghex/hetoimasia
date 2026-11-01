@@ -196,3 +196,22 @@ cabal test hetoimasia-tests --test-show-details=direct
   a model of the host's ledger rules, which is injected evidence), `scene
   publication` (real Lua instances, leases, pipeline and window provider) and `the
   frame of an adopted scene` (the pure adaptation against the render-2d oracle).
+  Its surface-free scene target (LFE-27) has a third native group, `an offscreen scene
+  target on a real device (LFE-27)`, which opens no window: with the owner held on a
+  gate it makes a scene naming a texture the target's latest value, releases the
+  texture through the production lane before the owner has adopted it (the host's own
+  scene state shows the revision published, the revision adopted and the release request
+  queued behind a barrier naming the target), lets the owner adopt, draws and reads back
+  the texture after the Lua release, and sees it freed only after that recording's own
+  ticket completed; the same consent and command, with `-- --match 'an offscreen scene
+  target on a real device'`, and an empty selection fails. Its headless counterpart is
+  the `Offscreen scene targets (LFE-27)` group of the window integration's
+  `integration-tests` (`Test.GPU.Vulkan.GLFW.Targets`, group `test.vulkan-headless`):
+  registration and its refusals, the bound on targets, the barrier, adoption and release
+  driven only by a batch's own ticket (completion withheld, one of several batches
+  completed, a batch discarded), the retention limit and its deferral, teardown at every
+  exit, and a host with a window and a target, over the stand-in native layers. The
+  production texture release lane cannot be composed over those stand-ins from the
+  adapter's suites (its host is private), so the lane's behaviour under a key is the
+  `scene retention` group's model, which is generic in the key and injected evidence, and
+  the native group above.

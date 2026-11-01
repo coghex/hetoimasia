@@ -54,6 +54,23 @@ and the suites' verification capture.
   to resolve and which `readVulkanSceneState` shows. It reads each window's
   published and adopted revisions, those awaiting release, and the requests
   still queued ([A scene for each window](../../../docs/gpu_backend.md#a-scene-for-each-window)).
+- One scene-target key (LFE-27): the scene lifecycle (`SceneLifecycle`), the release
+  barrier, the observation (`VulkanSceneState`) and a consumer's hold ledger are keyed
+  by `SceneTargetKey`, `KeyWindow WindowId` or `KeyOffscreen OffscreenTargetId`, so a
+  surface-free offscreen target takes part in the same ownership a window has.
+  `registerVulkanSceneTarget` registers one with the running host in a transaction
+  (no window, none opened; refused with a typed reason once the session failed, the
+  owner's exit began, no device exists or `vulkanTargetCapacity` targets are
+  accounted for) and `unregisterVulkanSceneTarget` ends it. `publishVulkanTargetScene`
+  is its latest-value publication, a transaction that never waits and answers a target
+  the host does not hold naming it. A release request waits for the target's
+  accepted revision as for a window's. `recordVulkanTargetBatch` is the production
+  recording boundary: inside an owner-thread action it records a frame-less batch
+  with the exact scene the host adopted for the target, binds the batch's use of the
+  revision to its own ticket before anything is recorded, and the revision is
+  released only after every such batch was discarded or completed. `WindowId` is not
+  widened or minted: an offscreen target is never a window
+  ([Offscreen scene targets](../../../docs/gpu_backend.md#offscreen-scene-targets)).
 - The renderer is the consumer's (VK-19). Each frame's `FrameRequest` names
   its target, slot and image and the image's extent and color format before
   anything of the renderer's is recorded, and the renderer is lent the

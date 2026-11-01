@@ -150,7 +150,7 @@ Every site that reserves, tracks, transfers, settles or publishes, and what make
 
 A delivered texture's `textureRelease` (called at most once by the lease) marks the logical release in the registry at
 once, for a publication's check, and asks the table to release through `requestVulkanRelease`: the owner runs it only
-once every window has adopted the scene revision that was current when it was asked. **That lane, with the scene
+once every scene target — each window, and each offscreen target registered with the host (LFE-27) — has adopted the scene revision that was current when it was asked. **That lane, with the scene
 ledger, is the single hook through which the holds a published scene takes gate the table release**: the release action
 reads the ledger on the owner's thread (`deviceHeld`), where the lifecycle hooks that write it run, and releases the
 table's handle only when no adopted revision holds the texture. A held release is not a failure and not a retirement:
@@ -396,8 +396,8 @@ frame's own metrics. It adds no Lua API: the facade (LFE-21) installs `api.scene
 
 | Module | What it is |
 | --- | --- |
-| `…Scene.Ledger` | `GraphicsScene` (the host's per-window scene), `SceneLedger` and the lifecycle hooks (`ledgerLifecycle`): what the adopted revisions hold, with the adoption count of each window and revision. |
-| `…Scene.Publish` | The publication boundary (`publishScene`), its refusals, and the binding (`graphicsPublishCheck`, `graphicsPublishBinding`). |
+| `…Scene.Ledger` | `GraphicsScene` (the host's per-window scene), `SceneLedger` and the lifecycle hooks (`ledgerLifecycle`): what the adopted revisions hold, with the adoption count of each scene target and revision. The ledger is keyed by the host's `SceneTargetKey` (LFE-27): a window, or an offscreen target registered with the host, in one key space. |
+| `…Scene.Publish` | The publication boundary (`publishScene`), its refusals, and the binding (`graphicsPublishCheck`, `graphicsPublishBinding`). `offscreenTargetAnswer` is the host's answer to a publication to a registered surface-free offscreen target, for a target-side port to compose with `scenePublisherOver` (LFE-27). |
 | `…Scene.Render` | The pure frame of an adopted scene for a frame's own metrics (`frameCandidate`) and the `VulkanRenderer` that records it. |
 | `…Scene.Configuration` | The scene part of the host's configuration (`configureScenes`), `SceneSession`, and the maximum-legal-scene check (`sceneCapacity`). |
 
