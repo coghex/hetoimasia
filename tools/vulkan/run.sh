@@ -258,13 +258,13 @@ generate_fingerprint() {
 }
 
 # The Linux receipt of the launcher's native suite captures and closes its windows through an external helper
-# (tools/display/x11_window.py, LFE-25). Its preparation is that it loads libX11 with every entry point it uses; it
+# (tools/x11-window/x11_window.py, LFE-25). Its preparation is that it loads libX11 with every entry point it uses; it
 # needs no display, so the build stage can prove it, and the timed execution proves it again. A helper that is not ready
 # refuses the run: a requested native group is blocked, never skipped.
 prepare_x11_helper() {
   [ "$(uname -s)" = "Linux" ] || return 0
-  python3 -I "$root/tools/display/x11_window.py" prepare >/dev/null \
-    || refuse "the X11 evidence helper is not ready: python3 -I tools/display/x11_window.py prepare failed"
+  python3 -I "$root/tools/x11-window/x11_window.py" prepare >/dev/null \
+    || refuse "the X11 evidence helper is not ready: python3 -I tools/x11-window/x11_window.py prepare failed"
   echo "vulkan: X11 evidence helper ready"
 }
 
@@ -315,7 +315,7 @@ roots = ["tools/vulkan", "tools/native", "tools/display",
          # because it would hash dist-vulkan and every other generated output. These are the entry point, its
          # two build variants, the private console and run libraries, the root suites and the shipped content.
          "app", "app-cpu", "app-full", "console", "run", "test", "test-cpu", "test-full",
-         "run-native-test", "samples/lua-quad"]
+         "run-native-test", "samples/lua-quad", "tools/x11-window"]
 files = ["cabal.project.vulkan", "cabal.project.common", "hetoimasia.cabal",
          "tools/toolchain/binding.pin", "tools/ci-image/toolchain.pin"]
 

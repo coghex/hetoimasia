@@ -31,7 +31,7 @@ that disappears between two steps is the diagnostic outcome ``vanished``, never 
 never a fallback to another window. Output is one JSON object on stdout; the exit status is 0 for ``ok`` and 1
 for any refusal or diagnostic (2 for a usage error). Everything that can differ between an honest tool and a
 broken one is behind the ``Backend`` interface, so the identity, ambiguity, vanished-target, refused-close and
-malformed-capture logic is tested without any display (tools/display/x11_window_test.py).
+malformed-capture logic is tested without any display (tools/x11-window/x11_window_test.py).
 
 The helper refuses to run unless ``HETOIMASIA_NATIVE_SESSION`` is ``isolated-x11:DISPLAY`` for the very display
 it is connected to: no desktop, no ambient X server and no CI display it was not given.

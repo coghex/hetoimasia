@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Device-free tests of tools/display/x11_window.py (LFE-25, #540).
+"""Device-free tests of tools/x11-window/x11_window.py (LFE-25, #540).
 
 They run the helper's identity, ambiguity, vanished-target, refused-close, malformed-capture and cleanup logic over an
 in-memory display. They open no display, load no X library and control no desktop, so they run anywhere the

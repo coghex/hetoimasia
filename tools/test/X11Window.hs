@@ -1,9 +1,9 @@
 -- | Hspec coverage for the isolated-X11 window helper (LFE-25, #540).
 --
--- @tools/display/x11_window.py@ identifies, observes, captures and closes one suite-owned native window on the
+-- @tools/x11-window/x11_window.py@ identifies, observes, captures and closes one suite-owned native window on the
 -- isolated X11 display. Its logic (identity, ambiguity between windows that share one pid, vanished targets, a
 -- refused close, a malformed capture and the cleanup of a failed one) is tested over an in-memory display by
--- @tools/display/x11_window_test.py@, which opens no display, loads no X library and controls no desktop. This
+-- @tools/x11-window/x11_window_test.py@, which opens no display, loads no X library and controls no desktop. This
 -- example runs that file in the mandatory workflow floor and requires that it ran a nonzero number of examples
 -- and that all passed, so an emptied or skipped file cannot go green.
 module X11Window (spec) where
@@ -26,7 +26,7 @@ spec = describe "X11 window helper" $
         (("PYTHONDONTWRITEBYTECODE", "1") : settings)
         checkout
         "python3"
-        ["-I", "-W", "error", checkout </> "tools/display/x11_window_test.py"]
+        ["-I", "-W", "error", checkout </> "tools/x11-window/x11_window_test.py"]
     result `shouldBe` ExitSuccess
     case [count | line ← lines errors, Just rest ← [stripPrefix "Ran " line], let count = takeWhile isDigit rest, not (null count)] of
       [count] | read count >= (20 ∷ Int) → pure ()

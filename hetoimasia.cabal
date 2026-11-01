@@ -46,8 +46,8 @@ extra-source-files:
     tools/docs_land.sh
     tools/display/wayland.sh
     tools/display/x11.sh
-    tools/display/x11_window.py
-    tools/display/x11_window_test.py
+    tools/x11-window/x11_window.py
+    tools/x11-window/x11_window_test.py
     tools/toolchain/binding.pin
     tools/toolchain/capture-build.sh
     tools/toolchain/qualify-binding.sh

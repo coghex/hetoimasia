@@ -1,6 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
--- | The client of tools/display/x11_window.py: external operating-system evidence for the owned native windows on the
+-- | The client of tools/x11-window/x11_window.py: external operating-system evidence for the owned native windows on the
 -- isolated X11 display (LFE-25, #540).
 --
 -- Each operation is one owned subprocess of the helper that is waited for under a bound and reaped on every way out
@@ -41,7 +41,7 @@ data X11 = X11
 
 -- | The helper in the repository, from the repository root the runner starts the suite in.
 defaultX11 ∷ X11
-defaultX11 = X11 "python3" "tools/display/x11_window.py"
+defaultX11 = X11 "python3" "tools/x11-window/x11_window.py"
 
 -- | The helper refused, or could not answer.
 data Refused = Refused
