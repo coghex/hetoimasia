@@ -56,6 +56,7 @@ import qualified Test.Run.Native.Command as Command
 import Test.Run.Native.Consent (Consent, describeConsent, readConsent, refusalMessage)
 import Test.Run.Native.Env (Env (..))
 import qualified Test.Run.Native.Library as Library
+import qualified Test.Run.Native.Milestone as Milestone
 
 main ∷ IO ()
 main = do
@@ -103,7 +104,7 @@ completeFlag ∷ String
 completeFlag = "--complete"
 
 examples ∷ Env → Spec
-examples env = Library.spec env >> Command.spec env
+examples env = Library.spec env >> Command.spec env >> Milestone.spec env
 
 -- | Hand an action to the main thread, in one step that nothing can interrupt, and answer the wait for its outcome.
 startMain ∷ TVar [IO ()] → IO a → IO (IO a)
