@@ -9457,6 +9457,15 @@ replace boundary tests, prove performance or establish confinement.
 - **Acceptance:** see [#579](https://github.com/coghex/hetoimasia/issues/579).
 - **Owner/tests:** `run` (grammar, composition), `gpu-vulkan/native` (the pure resolution) and `gpu-vulkan/glfw`; headless Hspec plus
   one native case of the actual command per platform route in `run-native-tests`.
+- **As delivered ([#580](https://github.com/coghex/hetoimasia/pull/580)):** `hetoimasia run [--vulkan-validation] [--] GAME_ROOT`;
+  the choice is a plain `ValidationChoice` (`ValidationOff` by default) that reaches `VulkanHostConfig.vulkanOptionalValidation`
+  through `production`, `runNative` and `runNativeWith`. `Profile.resolveValidation` is the pure, device-free decision; the owner's
+  startup (`Roots.startRootsResolving`) takes it where the offer is known, publishes the typed record before the plan is checked,
+  and `Run.Graphics.awaitReadiness` logs it once before the session (`vulkan validation resolved`, a warning per dropped item).
+  The strict `InstanceRequest` path is unchanged. The two native cases start the built command (not requested; requested), wait for
+  the resolved root, the record and `start gate opened`, and the validated one also requires the Khronos layer's own
+  `Khronos Validation Layer Active` announcement (visible under `HETOIMASIA_DEBUG=gpu.vulkan.diagnostics`), which attests that the
+  layer was loaded and ran and had synchronization validation enabled. See [the run command](../run_command.md#validation).
 
 #### LFE-25. Qualify native windows, independent retirement and quit
 

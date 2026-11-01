@@ -65,9 +65,11 @@ cabal test hetoimasia-tests --test-show-details=direct
   no GLFW package; its second source directory is `test-cpu/` and adds nothing. In the
   full-product build (the Vulkan project, flag `full-product`; group `test.vulkan-headless`) it
   also owns `Run` (`test-full/`): the `hetoimasia run` command's grammar, the exit status as a
-  pure function, the composition over real temporary content with no graphics (roles, failures,
-  boot refusals, stops), the built executable's usage and boot refusals, and the suite's own
-  binary as a child under real signals. None acquires a native session, reads consent or opens a
+  pure function (including `--vulkan-validation`: accepted before the folder, a literal root after
+  `--`, and each usage error), the exit status as a pure function, the production host's empty
+  request and the optional validation's record, the composition over real temporary content with no
+  graphics (roles, failures, boot refusals, stops), the built executable's usage, help and boot
+  refusals, and the suite's own binary as a child under real signals. None acquires a native session, reads consent or opens a
   window. A
   new runtime example belongs in `runtime-tests`, beside that component's own
   helpers; a headless GLFW example belongs in `glfw-tests`, and one that needs a
@@ -160,7 +162,13 @@ cabal test hetoimasia-tests --test-show-details=direct
   `Hetoimasia.GLFW.NativeCheck`, a script that quits, a required texture that cannot be read, and the
   assembled facade's capacity behavior), and starts the built full-product `hetoimasia run` as a child
   of the suite, named by the runner in `HETOIMASIA_RUN_EXECUTABLE`, for exactly one SIGTERM and exit
-  130. It is built, with the executable it launches, in the group's preparation stage
+  130, twice: with Vulkan validation not requested, and with `--vulkan-validation` (LFE-28), where the
+  layer and synchronization validation must be recorded as requested and enabled (a layer missing from
+  the prefix fails the case), the layer must announce itself to the diagnostic capture (the child runs
+  with `HETOIMASIA_DEBUG=gpu.vulkan.diagnostics`) with synchronization validation among its enables, and
+  the diagnostic verdict must be clean through teardown. Each case sends the
+  signal only after the resolved root, the validation record and the session's start gate, and requires
+  `failures=0 verdict=VerdictInterrupted`. It is built, with the executable it launches, in the group's preparation stage
   (`bash tools/vulkan/run.sh build hetoimasia:exe:hetoimasia hetoimasia:test:run-native-tests`) and run,
   unbuilt, by `bash tools/vulkan/run.sh native hetoimasia:test:run-native-tests -- --complete`. It
   captures no pixel and reads no window back. See [run_command.md](run_command.md).

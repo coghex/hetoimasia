@@ -1,6 +1,7 @@
 # The generic `run` command
 
-`hetoimasia run GAME_ROOT` is the Lua-first engine's launcher (LFE-22, [#537](https://github.com/coghex/hetoimasia/issues/537)).
+`hetoimasia run [--vulkan-validation] GAME_ROOT` is the Lua-first engine's launcher (LFE-22, [#537](https://github.com/coghex/hetoimasia/issues/537);
+the option is LFE-28, [#579](https://github.com/coghex/hetoimasia/issues/579)).
 It knows how to assemble the engine's services, not what game or scene to run: everything a game is lives in the folder
 it is given. The design is [the Lua-first engine design](designs/lua_first_engine_design.md) (P-71, P-73, P-74, D-74 to D-77
 and D-80); this document is what the command does today.
@@ -33,21 +34,27 @@ windows; the `run` command itself ignores it. On Linux the runner starts an isol
 ## Grammar
 
 ```text
-hetoimasia run GAME_ROOT
-hetoimasia run -- GAME_ROOT
+hetoimasia run [--vulkan-validation] [--] GAME_ROOT
 hetoimasia run --help
 ```
 
-Exactly one folder. Without `--`, an argument that starts with a hyphen is an unknown option; after it the next argument is
-literal, `--help` included. `run --help` alone prints the help on stdout and exits 0. A missing or extra argument and every other
-option is a usage error: the usage line and a one-line, escaped reason on stderr, nothing on stdout, exit 2, decided by a pure
-function before the folder, a handler, a worker or native graphics is touched. The fatal logging configuration is still resolved first, so a
-bad `HETOIMASIA_LOG_LEVEL` fails even `run --help`. There is no default root, parent search, entry override, mod flag, seed,
-cadence or window option, and no forwarding of arguments to a script.
+Exactly one folder. Without `--`, an argument that starts with a hyphen is an unknown option, except the one option below; after
+`--` the next argument is literal, `--help` and `--vulkan-validation` included. `run --help` alone prints the help on stdout and
+exits 0.
+
+`--vulkan-validation` asks for Vulkan validation, as far as the loader offers it ([Validation](#validation)). It is accepted only
+before GAME_ROOT, with or without `--` after it, and at most once. After GAME_ROOT (`run GAME_ROOT --vulkan-validation`), given
+twice, with no folder, or beside `--help` it is a usage error.
+
+A missing or extra argument and every other option is a usage error: the usage line and a one-line, escaped reason on stderr,
+nothing on stdout, exit 2, decided by a pure function before the folder, a handler, a worker or native graphics is touched. The
+fatal logging configuration is still resolved first, so a bad `HETOIMASIA_LOG_LEVEL` fails even `run --help`. There is no default
+root, parent search, entry override, mod flag, seed, cadence or window option, and no forwarding of arguments to a script. The one
+option is a value of the parse; no environment variable, manifest field, build flag or game content selects it.
 
 ## What `run` does, in order
 
-1. Validate the arguments (above).
+1. Validate the arguments (above), which also settles whether validation was asked for.
 2. Install SIGINT and SIGTERM handlers sharing one coordinator, for the scope of the run; put the previous handlers back when it ends.
 3. Enter the logging lifetime over stderr (left last; it makes the one final flush).
 4. **Prepare the folder** (`Hetoimasia.Run.Boot`): open it once, anchored (the launch pathname is never opened again), and log
@@ -59,7 +66,9 @@ cadence or window option, and no forwarding of arguments to a script.
    has run. A first signal here abandons the work, which is cancelled and joined before the root closes.
 5. **Start the native owners** on the process main thread (`Hetoimasia.Run.Graphics`): the loader integration, the graphics owner
    (the device starts *without a surface*, so a texture can be GPU-ready before any window exists), the texture adapter and, inside the
-   session, the window provider.
+   session, the window provider. The owner's startup resolves the validation request against the loader's offer and creates the
+   instance; the record of what it resolved is logged once, as soon as that startup has finished or failed and before the session,
+   so before any window ([Validation](#validation)).
 6. **Run one session** (`Hetoimasia.Run.Session`) on a thread of its own: two read workers, one decode worker and two texture
    lanes, made once; each selected role's VM evaluates its entry (a common entry runs separately in each); both selected behaviors
    validate before either `init`; the `init`s are dispatched concurrently; the logical clock opens through the joint start gate.
@@ -101,6 +110,66 @@ promise for trusted Lua.
 A genuine native close request (the window's own, never a close the provider itself began) is the same whole-session normal stop
 as a Lua `quit`, including during startup. Closing a window for cleanup generates no user quit.
 
+## Validation
+
+`--vulkan-validation` (LFE-28) asks for the Khronos validation layer (`VK_LAYER_KHRONOS_validation`) and for synchronization
+validation, each **only as far as the loader offers it**. It is a run-time option, not a build flag, so the command that
+`run-native-tests` starts can be validated by the same suite, and the loader's offer decides at the moment it is known: in the
+owner's instance startup, after the host configuration is fixed. Off, the default, requests no layer and no validation feature and
+the instance is created exactly as it was before the option existed.
+
+| The loader offers | Enabled | Recorded |
+| --- | --- | --- |
+| the layer, and the layer lists `VK_EXT_validation_features` | the layer and synchronization validation | `layer=enabled feature=enabled` |
+| the layer, not the extension | the layer only | `layer=enabled feature=dropped` |
+| not the layer | neither | `layer=dropped feature=dropped` |
+| (not requested) | neither, whatever is offered | `requested=false layer=not-requested feature=not-requested` |
+
+Synchronization validation is enabled only through an *enabled* layer that lists the extension: an extension listed globally, or by a
+layer that is not enabled, enables nothing. The decision is `Hetoimasia.GPU.Vulkan.Native.Profile.resolveValidation`, a pure,
+device-free function. The strict path is unchanged and is not this option: a layer or feature that a caller names in the host
+configuration itself (the four samples' `--validation` and the native suites' fixtures) that the loader lacks is still an
+`InstanceRefusal` before anything is created, because those callers must never silently validate less than they claim.
+
+**What is recorded.** Once per run, at `Info`, under the `run.graphics` component, on stderr (never stdout):
+`vulkan validation resolved` with the fields `requested`, `layer` and `feature`, then one `Warning`, `vulkan validation item
+dropped`, for each item dropped. It is written when the owner's startup has reached the loader's offer, which is before the session
+and so before any window; a usage error or a boot refusal reaches no offer and has no record, and none is made up. Normal logging
+filters apply (a threshold above `Info` hides the record, not the warnings), and a failure to write it is a diagnostic failure like any
+other. In process the same record is data: `readValidationResolution` on the host's controller.
+
+**What "enabled" means, and what is stronger.** The record says the layer and the feature were *selected into the instance's create
+info*. That alone is not proof that the loader kept the layer in its chain or that it ran (`VK_LOADER_LAYERS_DISABLE` can drop a
+requested layer; see
+[the compatibility record](vulkan_compatibility_record.md#zero-validation-errors-is-a-claim-about-coverage-not-just-about-count)).
+The stronger evidence is the layer's own: once it is running in the chain, the Khronos layer reports to the diagnostic capture's
+messenger at `vkCreateInstance` `Khronos Validation Layer Active`, with the features it was enabled with (for example
+`Current Enables: VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT`). The capture hands that record to the logger as a
+`Debug` entry of `gpu.vulkan.diagnostics`, which the command's stderr carries under the documented selection
+`HETOIMASIA_DEBUG=gpu.vulkan.diagnostics` ([logging](logging.md)); no hook is involved. The validated native case requires it exactly
+once with synchronization validation among the enables, and the case without the option requires its absence. A validation error
+still latches and fails the run (exit 1), so the cases assert *enabled, loaded and clean*. A layer or feature is dropped only when
+the loader does not advertise it; advertised is not proven runnable, so a failure to create the instance or device, and every
+validation error, keep their ordinary failure authority and nothing retries without validation.
+
+**What the pinned macOS profile offers.** The provisioned prefix pins loader and layer 1.3.296 and MoltenVK 1.4.2
+(`tools/native/vulkan.pin`); the compatibility and crash evidence below was gathered on MoltenVK 1.4.0, which the pin moved on from
+only in the library. `VK_LAYER_KHRONOS_validation` 1.3.296 is present in the loaded chain with zero error records
+([the proved profile](vulkan_compatibility_record.md#the-proved-profile)); every native instance the suites create enables
+synchronization validation through its own create info, and [gpu_backend.md](gpu_backend.md#the-native-suite) records those runs
+clean; the first run of the Lua-first adapter's native suite with the layer and synchronization validation ended with a clean
+verdict ([the LFE-24 evidence](evidence/lfe24-offscreen-pixels/README.md)); and `synchronization-hazard` in `vulkan-native-tests` shows
+the layer active by capturing a deliberate hazard. Nothing in the repository records a validation feature this profile cannot run;
+the model has exactly one feature.
+
+**The messenger crash stays unreachable.** Naming a `VkDebugUtilsMessengerEXT` segfaults on the pinned loader and MoltenVK
+([the crash evidence](vulkan/macos-debug-utils-naming.md); [Names and labels](gpu_backend.md#names-and-labels)). The option adds no
+naming call and does not change the messenger's creation, ownership or its never-named rule on either profile; the messenger is
+always created, validation or not.
+
+**In process.** `runNativeWith`, `runNative` and `Setup` take the choice (`ValidationChoice`, `ValidationOff` by default) as an
+ordinary value, the one the option parses to: `production ValidationOn`. There is no global, no environment read and no test-only hook.
+
 ## Ownership
 
 | State | Owner | Thread | Ends |
@@ -108,6 +177,7 @@ as a Lua `quit`, including during startup. Closing a window for cleanup generate
 | anchored root, inventory, checkpoint | the preparation scope | main | after the session and its pool |
 | read pool (2 workers), texture pipeline (1 decode worker, 2 lanes) | the session composition, once per session | their own workers | after the window provider, before the root |
 | GLFW, the device and the owner loop | the native owner application | the process main thread and the owner's thread | after the session has settled; if the loop is lost, the application's own exit destroys the windows first and the session is joined after |
+| the instance's validation request and its resolution record | the graphics owner's startup (written once); read by the process main thread | the owner's thread; read on the main thread | the host's end |
 | texture adapter, pool, pipeline | the session thread | the session thread and its workers | before the session thread ends |
 | window provider | the session composition | its pump; the main step on the main thread | before the pipeline and the adapter drain |
 | session diagnostics writer | `runSession` | its own thread | joined by the command before the logger is released |
@@ -196,7 +266,10 @@ Output and flush failure is fatal. The launcher adds at most one bounded, escape
   content with no graphics (roles, failures, boot refusals with a script that must not run, stops), the built executable's usage
   and boot refusals, and the suite's own binary as a child under real signals. See [test_suites.md](test_suites.md).
 * `run-native-tests` (`test.vulkan-run-native`): the command's production composition on a real device with real windows, a genuine
-  native close, the assembled facade's capacity behavior, and the built command stopped by one SIGTERM.
+  native close, the assembled facade's capacity behavior, and the built command stopped by one SIGTERM, twice: with validation not
+  requested (recorded as such) and with `--vulkan-validation` (recorded as requested and enabled, clean through teardown). Each waits
+  for the resolved root, the validation record and the session's `start gate opened` before the one signal, and requires the session
+  to have ended with `failures=0 verdict=VerdictInterrupted`.
   `bash tools/vulkan/run.sh build hetoimasia:exe:hetoimasia hetoimasia:test:run-native-tests`, then
   `bash tools/vulkan/run.sh native hetoimasia:test:run-native-tests -- --complete` (macOS: with `HETOIMASIA_NATIVE_SESSION=desktop`
   on that command).
