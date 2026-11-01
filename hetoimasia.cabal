@@ -357,10 +357,14 @@ test-suite run-native-tests
             Test.Run.Native.Command
             Test.Run.Native.Consent
             Test.Run.Native.Env
+            Test.Run.Native.Capture
+            Test.Run.Native.Json
+            Test.Run.Native.Landmarks
             Test.Run.Native.Library
             Test.Run.Native.Milestone
             Test.Run.Native.Observe
             Test.Run.Native.Peers
+            Test.Run.Native.X11
         build-depends:
             base >=4.22 && <4.23,
             bytestring >=0.12 && <0.13,

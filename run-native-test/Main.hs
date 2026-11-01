@@ -42,7 +42,8 @@ import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.IO as Text
-import System.Directory (createDirectoryIfMissing)
+import System.Directory (createDirectoryIfMissing, removeDirectoryRecursive)
+import System.IO.Temp (createTempDirectory, getCanonicalTemporaryDirectory)
 import System.Environment (getArgs, getProgName, lookupEnv)
 import System.Exit (ExitCode (ExitFailure), exitFailure, exitWith)
 import System.FilePath ((</>))
@@ -53,8 +54,9 @@ import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, evalSpec, h
 import Hetoimasia.Run.Settle (answering)
 import Test.Run.Native.Command (executableVariable)
 import qualified Test.Run.Native.Command as Command
-import Test.Run.Native.Consent (Consent, describeConsent, readConsent, refusalMessage)
+import Test.Run.Native.Consent (Consent (..), describeConsent, readConsent, refusalMessage)
 import Test.Run.Native.Env (Env (..))
+import Test.Run.Native.X11 (defaultX11)
 import qualified Test.Run.Native.Library as Library
 import qualified Test.Run.Native.Milestone as Milestone
 
@@ -70,7 +72,21 @@ main = do
   evidenceLines ← newTVarIO []
   done ← newEmptyTMVarIO
   started ← getCurrentTime
-  let env = Env {envStart = startMain jobs, envEvidence = evidenceLines}
+  evidenceDirectory ← lookupEnv "HETOIMASIA_VALIDATION_EVIDENCE"
+  (captureDirectory, scratch) ← case evidenceDirectory of
+    Just place → pure (place </> "lua_first_native", False)
+    Nothing → do
+      temporary ← getCanonicalTemporaryDirectory
+      made ← createTempDirectory temporary "hetoimasia-native-captures"
+      pure (made, True)
+  createDirectoryIfMissing True captureDirectory
+  let env =
+        Env
+          { envStart = startMain jobs
+          , envEvidence = evidenceLines
+          , envX11 = case consent of IsolatedX11 _ → Just defaultX11; _ → Nothing
+          , envCaptureDir = captureDirectory
+          }
   _ ← forkOS $ do
     result ←
       try @SomeException $
@@ -90,10 +106,10 @@ main = do
           <> [ "the suite raised: " <> Text.pack (show failure) | Left failure ← [outcome] ]
   record ← evidenceRecord consent passed problems (realToFrac (diffUTCTime finished started)) lines'
   Text.putStrLn record
-  directory ← lookupEnv "HETOIMASIA_VALIDATION_EVIDENCE"
-  forM_ directory $ \place → do
+  forM_ evidenceDirectory $ \place → do
     createDirectoryIfMissing True place
     Text.writeFile (place </> "run-native.md") record
+  when scratch (removeDirectoryRecursive captureDirectory)
   forM_ problems (hPutStrLn stderr . ("run-native-tests: " <>) . Text.unpack)
   unless (null problems) exitFailure
   where

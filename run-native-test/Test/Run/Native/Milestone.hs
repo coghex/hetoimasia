@@ -30,6 +30,8 @@ import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldNotBe)
 import Test.Run.Native.Env (Env (..), evidence)
 import Test.Run.Native.Library (copyTree, shippedContent)
+import Hetoimasia.GLFW.Window (WindowId)
+import Test.Run.Native.Capture (Bound (..), bindNew, snap, viewableNow)
 import Test.Run.Native.Observe
 import Hetoimasia.GLFW.Command (Disposition (Performed), observeWindowCommand)
 import Test.Run.Native.Peers
@@ -41,16 +43,13 @@ spec env = describe "Lua native milestone" $ do
       withPeers (envStart env) folder $ \peers → do
         -- A's window is created first and B's second: with creation outcomes withheld from the provider, each new
         -- native window is the only one that appeared since the instance was admitted, so it is that instance's.
-        withholdNextCreations peers 2
-        a ← admitUi peers
-        windowA ← awaitNewWindow peers []
-        b ← admitUi peers
-        windowB ← awaitNewWindow peers [windowA]
-        releaseCreations peers
+        (a, windowA, boundA, b, windowB, boundB) ← startTwo env peers
         spIdentity a `shouldNotBe` spIdentity b
         spInstance a `shouldNotBe` spInstance b
         windowA `shouldNotBe` windowB
         forM_ [windowA, windowB] $ \window → awaitAdopted peers window 1
+        snap env peers "two-instances--a-quad" boundA
+        snap env peers "two-instances--b-quad" boundB
         -- Two textures were allocated, uploaded and registered: the same path was never coalesced.
         awaitLiveTextures peers 2
         -- Ending A through its public lifecycle control closes only its window, and is never a user close.
@@ -66,6 +65,8 @@ spec env = describe "Lua native milestone" $ do
         awaitFrame peers windowB 1 mark
         awaitLiveTextures peers 1
         publishedRevisionOf peers windowB >>= (`shouldBe` Just 1)
+        -- B's quad is still right on the display, and its texture was never reloaded (one live texture throughout).
+        snap env peers "two-instances--b-after-a-ended" boundB
         stopUi peers b
         awaitWindowCount peers 0
         awaitLiveTextures peers 0
@@ -77,11 +78,14 @@ spec env = describe "Lua native milestone" $ do
     within 120 . withOwnedContent $ \folder →
       withPeers (envStart env) folder $ \peers → do
         holdNextReads peers quadPath 1
+        known0 ← viewableNow env
         a ← admitUi peers
         windowA ← awaitNewWindow peers []
+        boundA ← bindNew env peers windowA known0
         readsEntered peers quadPath 1
         b ← admitUi peers
         windowB ← awaitNewWindow peers [windowA]
+        boundB ← bindNew env peers windowB (known0 <> map boundX (maybe [] pure boundA))
         awaitAdopted peers windowB 1
         atomically (readsHeld peers quadPath) >>= (`shouldBe` 1)
         -- A is ended with its read borrowed by a worker: it cannot settle until the read returns.
@@ -90,6 +94,7 @@ spec env = describe "Lua native milestone" $ do
         mark ← frameMark peers
         demandFrame peers windowB
         awaitFrame peers windowB 1 mark
+        snap env peers "pending-read--b-while-a-stopping" boundB
         atomically (readsHeld peers quadPath) >>= (`shouldBe` 1)
         atomically (readTVar (peStops peers)) >>= (`shouldBe` 0)
         -- Only now is the read let go; whatever it produces belongs to nobody.
@@ -113,10 +118,13 @@ spec env = describe "Lua native milestone" $ do
     within 120 . withOwnedContent $ \folder →
       withPeers (envStart env) folder $ \peers → do
         withholdNextCreations peers 1
+        known0 ← viewableNow env
         a ← admitUi peers
         windowA ← awaitNewWindow peers []
+        boundA ← bindNew env peers windowA known0
         b ← admitUi peers
         windowB ← awaitNewWindow peers [windowA]
+        boundB ← bindNew env peers windowB (known0 <> map boundX (maybe [] pure boundA))
         awaitAdopted peers windowB 1
         atomically (creationsWithheld peers) >>= (`shouldBe` 1)
         stopUi peers a
@@ -125,6 +133,7 @@ spec env = describe "Lua native milestone" $ do
         mark ← frameMark peers
         demandFrame peers windowB
         awaitFrame peers windowB 1 mark
+        snap env peers "pending-window--b-while-a-pending" boundB
         windowsNow peers >>= (`shouldBe` [windowA, windowB])
         atomically (readTVar (peStops peers)) >>= (`shouldBe` 0)
         releaseCreations peers
@@ -142,14 +151,10 @@ spec env = describe "Lua native milestone" $ do
   it "keeps an unchanged published scene while the window is made smaller, larger, minimized and restored, and records what the platform reported rather than what was requested" $
     within 120 . withOwnedContent $ \folder →
       withPeers (envStart env) folder $ \peers → do
-        withholdNextCreations peers 2
-        a ← admitUi peers
-        windowA ← awaitNewWindow peers []
-        b ← admitUi peers
-        windowB ← awaitNewWindow peers [windowA]
-        releaseCreations peers
+        (a, windowA, boundA, b, windowB, _boundB) ← startTwo env peers
         forM_ [windowA, windowB] $ \window → awaitAdopted peers window 1
         initial ← windowMetrics peers windowA
+        snap env peers "view--initial" boundA
         -- The scene is the one accepted publication, and nothing below republishes: its revision is the evidence.
         let unchanged label = do
               published ← publishedRevisionOf peers windowA
@@ -165,6 +170,7 @@ spec env = describe "Lua native milestone" $ do
               (label, attempted disposition) `shouldBe` (label, True)
               reached ← awaitMetrics peers windowA (label <> " to be reported") (\m → metricsLogical m == Just (width, height) || (metricsLogical m /= metricsLogical initial && metricsRevision m > metricsRevision initial))
               renders label
+              snap env peers ("view--" <> Text.pack label) boundA
               pure reached
         smaller ← resizeTo "smaller" (320, 240)
         larger ← resizeTo "larger" (800, 600)
@@ -197,6 +203,7 @@ spec env = describe "Lua native milestone" $ do
         (case sampled of Performed _ → True; _ → False) `shouldBe` True
         back ← awaitMetrics peers windowA "a drawable sample after the restore" (\m → metricsRevision m > metricsRevision reported && metricsIconified m == Just False && metricsVisible m /= Just False && maybe True (\(w, h) → w * h > 0) (metricsFramebuffer m))
         renders "restored"
+        snap env peers "view--restored" boundA
         awaitLiveTextures peers 2
         readTVarIO (peFatals peers) >>= (`shouldBe` [])
         atomically (readTVar (peStops peers)) >>= (`shouldBe` 0)
@@ -226,13 +233,10 @@ spec env = describe "Lua native milestone" $ do
     it ("routes a user close of " <> which <> " live window to one whole-session quit request, which retires both instances and windows, unlike ending one instance") $
       within 120 . withOwnedContent $ \folder →
         withPeers (envStart env) folder $ \peers → do
-          withholdNextCreations peers 2
-          a ← admitUi peers
-          windowA ← awaitNewWindow peers []
-          b ← admitUi peers
-          windowB ← awaitNewWindow peers [windowA]
-          releaseCreations peers
+          (a, windowA, boundA, b, windowB, boundB) ← startTwo env peers
           forM_ [windowA, windowB] $ \window → awaitAdopted peers window 1
+          snap env peers (Text.pack ("user-close-" <> show index <> "--a-quad")) boundA
+          snap env peers (Text.pack ("user-close-" <> show index <> "--b-quad")) boundB
           let closed = [windowA, windowB] !! index
           atomically (readTVar (peStops peers)) >>= (`shouldBe` 0)
           answer ← onMain peers (requestNativeClose (vulkanWindowHost (peHost peers)) closed)
@@ -248,6 +252,23 @@ spec env = describe "Lua native milestone" $ do
           readTVarIO (peFatals peers) >>= (`shouldBe` [])
           evidence env (Text.pack ("user close of " <> which <> " window (" <> show closed <> "), a genuine platform-delivered close (native-check), not an injected one: exactly one stop request; both windows stayed until the instances were ended, then both retired and the textures were proved retired"))
 
+
+-- | Admit two instances so that each new native window is unambiguously its instance's: with the next two creation
+-- outcomes withheld from the provider, the window that appears after A is admitted is A's and the one that appears
+-- after B is admitted is B's (and, on the isolated X11 display, the one new viewable X window each time is bound to
+-- it). The gate is released before the cases go on.
+startTwo ∷ Env → Peers → IO (Spawned, WindowId, Maybe Bound, Spawned, WindowId, Maybe Bound)
+startTwo env peers = do
+  withholdNextCreations peers 2
+  known0 ← viewableNow env
+  a ← admitUi peers
+  windowA ← awaitNewWindow peers []
+  boundA ← bindNew env peers windowA known0
+  b ← admitUi peers
+  windowB ← awaitNewWindow peers [windowA]
+  boundB ← bindNew env peers windowB (known0 <> map boundX (maybe [] pure boundA))
+  releaseCreations peers
+  pure (a, windowA, boundA, b, windowB, boundB)
 
 quadPath ∷ ByteString
 quadPath = "images/quad.png"
