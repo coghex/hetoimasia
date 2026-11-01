@@ -91,6 +91,7 @@ concrete precondition
 - [x] LFE-21. Expose the complete UI-only graphics facade — [#536]
 - [x] LFE-22. Assemble the generic run command and Lua quad content — [#537]
 - [x] LFE-23. Qualify integrated failure and two-instance ownership headlessly — [#538]
+- [x] LFE-27. Give a surface-free scene target the host's scene barrier, ledger identity and adopt/release lifecycle — [#576]
 - [x] LFE-24. Verify Lua-authored output through offscreen pixels — [#539]
 - [x] LFE-25. Qualify native windows, independent retirement and quit — [#540]
 
@@ -98,6 +99,9 @@ The twenty-six LFE slices below have manager process signoff under D-80;
 they are not approved issues or implementation authorization. Q-8 is confirmed
 by D-79; the manager owns the #145 tracker mutation. Ledger revision D-80
 inserts new LFE-26 after LFE-13, preserving LFE-14–LFE-25 IDs and their order.
+LFE-27 (#576) was added on 2026-11-01 as a prerequisite of LFE-24 (see its entry);
+the next free number after LFE-26 was used, and it sits before LFE-24 in the list
+because LFE-24 depends on it. LFE-14–LFE-26 IDs are unchanged.
 
 ## Epic contract
 
@@ -9351,9 +9355,43 @@ replace boundary tests, prove performance or establish confinement.
   `admitBehaviorInstance`, ended by `requestInstanceControl`. The windows that cannot be gated at this boundary without a private
   import are listed there with the owning slice's test. No production code changed.
 
+#### LFE-27. Give a surface-free scene target the host's scene barrier, ledger identity and adopt/release lifecycle
+
+- **Depends on:** LFE-23 (#538) and its prerequisites, which include LFE-20, LFE-21 and LFE-22. Blocks LFE-24.
+- **Origin:** LFE-24's own missing-seam stop (#539, het-solver-79, `#het-lfsolve`
+  msgid `qsbpcn9erpujsfw4mr9e4qrx7n`): LFE-20's delivered retention path is the
+  host's `PerWindowScenes` barrier and a ledger keyed by `WindowId`, which a
+  target with no window can neither join nor mint. Owner decision 2026-10-31
+  (manager pane): a production slice first, then LFE-24 as specified.
+- **Owner decision 2026-11-01 (relayed by `het-manager` in `#het-lfsolve`), variant B,
+  verbatim:** "B: wider target key: scene state, barrier and texture ledger take a
+  scene target key that is either a window or an offscreen target". An offscreen
+  target is never called a window and `WindowId` stays unforgeable. Manager
+  signoff within B: one key space; the existing window-keyed scene types are
+  generalized to it and every in-repo consumer updated, with no parallel
+  lifecycle or key path.
+- **Boundary:** a surface-free scene target (a managed offscreen colour target in
+  a surface-free graphics session) registers with the host and takes part in the
+  same ownership a window has: a scene-target key, a scene-barrier entry, and
+  scene adopt/release driven by actual batch-ticket completion. A texture
+  release behind an accepted-but-unadopted scene of such a target waits exactly
+  as it does for a window. Window behaviour and semantics are unchanged; a public
+  type's key may change only as that generalization. No capture API, no
+  Lua-visible setting, no second ownership policy, no test-only hook.
+- **Decisions relied on:** D-46; LFE-20 as delivered; LFE-24's boundary
+  ("not ... ownership"); D-80 (invariant table and same-shape sweep);
+  [render_2d_design.md](render_2d_design.md) D-18 and D-28 (worded for windows;
+  extended to the target by the owner decision above); the archived
+  [GPU resource services design](../archive/designs/gpu_resource_services_design.md)
+  D-28, D-12 and D-6 (history, cited for the decisions only).
+- **Acceptance:** see [#576](https://github.com/coghex/hetoimasia/issues/576).
+- **Owner/tests:** `gpu-vulkan/glfw` (the host's scene state) and
+  `lua-engine-graphics` (the ledger instantiation), headless Hspec plus one
+  real-Vulkan native case that opens no rendered window.
+
 #### LFE-24. Verify Lua-authored output through offscreen pixels
 
-- **Depends on:** LFE-22, LFE-23.
+- **Depends on:** LFE-22, LFE-23, LFE-27.
 - **Boundary:** drive real content/module/PNG/request/scene bindings into managed
   offscreen rendering using the existing capture/oracle facilities. The test
   adapter replaces only the display target, not decoder, scene preparation,
@@ -9397,9 +9435,9 @@ replace boundary tests, prove performance or establish confinement.
 | PNG profile and pre-allocation/workspace bounds | LFE-14, LFE-15, LFE-16 |
 | Window/texture/scene calls and per-instance ownership | LFE-16–LFE-21 |
 | Concurrent boot, role status, guard/quit/output/exit | LFE-12, LFE-13, LFE-26, LFE-22, LFE-23 |
-| Two-instance qualification, actual pixel/native output | LFE-23–LFE-25 |
+| Two-instance qualification, actual pixel/native output | LFE-23–LFE-25, LFE-27 |
 
-The plan has twenty-six slices and no unassigned approved M1 service family.
+The plan has twenty-seven slices (LFE-27 added 2026-11-01) and no unassigned approved M1 service family.
 That coverage statement is a design mapping, not proof that implementation
 is feasible without further engineering. Concrete dependency/codec/native
 obstacles must be investigated within the owning slice; if resolution would
