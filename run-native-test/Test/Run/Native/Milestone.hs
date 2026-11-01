@@ -345,22 +345,23 @@ factsFor peers named = do
     pure (label <> " window " <> Text.pack (show window) <> " " <> Text.pack (show metrics))
   pure (Text.intercalate "; " facts)
 
--- | Place a harness window in a slot of the desktop where no other harness window overlaps it, so that what is captured
--- or looked at is that window's own pixels. On the isolated X11 display (1280 x 1024) the slots are stacked down the
--- left edge; elsewhere they are side by side. The position is asked through the public window command.
+-- | Place a harness window in a slot of the desktop where no other harness window overlaps it, so that what the owner
+-- looks at is that window's own pixels: side by side, through the public window command. (On the isolated X11 display a
+-- capture isolates its own subject instead.)
 placeWindow ∷ Env → Peers → WindowId → Int → IO ()
-placeWindow env peers window slot = do
-  disposition ← requestPosition peers window position
-  (window, attempted disposition) `shouldBe` (window, True)
+placeWindow env peers window slot = case envX11 env of
+  Just _ → pure ()
+  Nothing → do
+    disposition ← requestPosition peers window position
+    (window, attempted disposition) `shouldBe` (window, True)
   where
-    position = case envX11 env of
-      Just _ → (10, 40 + 490 * slot)
-      Nothing → (20 + 660 * slot, 60)
+    -- On the isolated display the capture itself isolates its subject ('snap'), so nothing is placed here.
+    position = (20 + 660 * slot, 60)
 
 -- | Park a window out of the way, partly beyond the screen, when only its peer is looked at.
 parkWindow ∷ Env → Peers → WindowId → IO ()
 parkWindow env peers window = do
-  disposition ← requestPosition peers window (case envX11 env of Just _ → (700, 700); Nothing → (1000, 500))
+  disposition ← requestPosition peers window (case envX11 env of Just _ → (700, 720); Nothing → (1000, 500))
   (window, attempted disposition) `shouldBe` (window, True)
 
 -- | Admit two instances so that each new native window is unambiguously its instance's: with the next two creation
