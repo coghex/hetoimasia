@@ -64,7 +64,7 @@ There is no default close policy or rendering operation.
 | `hetoimasia-glfw:vulkan-interop` | public, flag-gated | `Hetoimasia.GLFW.Vulkan` and `Hetoimasia.GLFW.Vulkan.Provenance`: the loader integration capability made from the Vulkan binding's own loader entry point, the instance-extension query, and the surface bridge's production operations, over `vulkan-interop/cbits`, the one translation unit in the package that includes the Vulkan headers. Built only with the manual `vulkan-interop` flag, which only `cabal.project.vulkan` sets; see [Vulkan interop](#vulkan-interop). |
 | `hetoimasia-glfw:seam` | public, test-only | `Hetoimasia.GLFW.Seam`: the real models over a scripted native library, for CPU examples. Links no GLFW. Exports no window driver. |
 | `hetoimasia-glfw:seam-core` | private | `Hetoimasia.GLFW.Internal.Seam`: the seam's implementation, including the window drivers that deliver scripted callbacks, queue them for the next poll or wait, and change close intent, the monitor drivers that change the scripted monitors and deliver or queue monitor callbacks, and the private window command executor |
-| `glfw-tests` | test suite | The headless suite: the session, session wake, and admission-wake and demand examples over the seam, the window model, window command, window control, window host, dynamic window, monitor inventory, input feed, and window mode examples that use those drivers, that executor, the private input producer, and scripted input callbacks, the scheduled owner turn and render demand examples over a scripted clock, the window attachment model examples, the supervised graphics owner examples over injected fake backend operations, the link-declaration check, and the external-client opacity examples, over the fixtures every component spec shares through the suite's own non-spec `Test.GLFW.Support`. Initializes no GLFW and needs no display. |
+| `glfw-tests` | test suite | The headless suite: the session, session wake, and admission-wake and demand examples over the seam, the window model, window command, window control, window host, dynamic window, monitor inventory, input feed, and window mode examples that use those drivers, that executor, the private input producer, and scripted input callbacks, the scheduled owner turn, render demand and visible follow-up examples over a scripted clock, the window attachment model examples, the supervised graphics owner examples over injected fake backend operations, the link-declaration check, and the external-client opacity examples, over the fixtures every component spec shares through the suite's own non-spec `Test.GLFW.Support`. Initializes no GLFW and needs no display. |
 | `glfw-native-tests` | test suite | The shared native fixture, and real session, thread, monitor inventory, window, window control, window host, and native input-callback examples on the platform it runs on, with the test-only Wayland synchronization helpers its own C source carries |
 
 The main library and the `model`, `native`, `seam`, and `seam-core`
@@ -1322,7 +1322,7 @@ attributes:
 | Content scale | `glfwGetWindowContentScale`, content scale callback |
 | Placement | `glfwGetWindowPos`, position callback; desktop screen coordinates |
 | Focused, iconified, maximized | `glfwGetWindowAttrib`, their callbacks |
-| Visible | `glfwGetWindowAttrib` |
+| Visible | `glfwGetWindowAttrib`; sampled only, and re-read after an iconify transition ([below](#visible-after-an-iconify-transition)) |
 | Close request | close callback |
 | Cursor position | cursor position callback; coalesced, never sampled |
 | Cursor inside | cursor enter/leave callback; coalesced |
@@ -1337,6 +1337,83 @@ extent, as an iconified window reports, is an ordinary nondrawable observation.
 Getters sampled together are an engine observation, not an atomic snapshot of
 the OS. Geometry and attributes coalesce to their latest values; a snapshot
 preserves no event history.
+
+#### Visible after an iconify transition
+
+Visible has no GLFW callback, so the observation holds it only from a sample,
+and the samples are the window's construction, the post-call sample of a
+control, `synchronizeWindow` (and so `observeWindowCommand`), a mode attempt,
+the owner turn's mode recovery when it resamples an indeterminate applied mode
+or a lost monitor, and the follow-up described here. On Cocoa a restore
+completes asynchronously: the restore control's own sample can read
+iconified `True` and visible `False`, and `windowDidDeminiaturize` then reports
+the restore through the iconify callback, which only records into the capture
+latch. Nothing would read visible again, and
+[eligibility](#render-demand), which reads `Observed False` for visible as
+suspended, would keep the restored window undrawn (#581). The iconify
+callback therefore starts a follow-up of the visible attribute. It is owned by
+the window, written only on the owner thread, and runs identically for a
+restore made by `restoreWindowCommand` and one made by the user or the
+platform:
+
+- **Trigger.** An iconify transition: the callback's capture, folded at
+  whichever owner boundary consumes it (the turn's mode reconciliation can do
+  so before `reconcileWindowEvents`). A callback that iconifies the window
+  stops the follow-up; one that restores it starts the *quick phase* afresh.
+- **Quick re-reads.** On each following owner turn, after the turn's captures
+  are reconciled, visible is re-read once, until a read reports `Observed True`
+  or `visibleQuickReads` reads are spent. The bound is **eight reads**, one per
+  owner turn and never a time: on the default 0.1-second idle wait eight idle
+  turns span about 0.8 seconds, enough for a platform's restore to finish
+  reporting the window visible, while a window that really is hidden after the
+  restore costs at most eight native reads before the slow phase takes over.
+  Turns that find events pending are faster than idle ones, so the bound is
+  not a duration; recovery does not depend on it.
+- **Slow re-check.** A window still `Observed False` for visible after the
+  quick bound is re-read on the first owner turn whose `hostClock` reading is
+  at least one `hostIdleWait` after its previous re-read, for as long as it
+  stays open, not iconified, and suspended on that reading. It is at most one
+  re-read per window per turn, and it never shortens the loop's wait. While the
+  owner loop keeps running, a restored window is therefore recovered within
+  under two idle waits plus one turn's work after the platform reports it
+  visible: a re-read at instant `T` may read just before the change, the next
+  is allowed no earlier than `T + hostIdleWait`, and an early wake can land a
+  turn just short of it. The accepted cost is one native visibility query per
+  idle wait for each such window, including one that is genuinely hidden after
+  a restore; a window in no other state is ever re-read.
+- **Stops.** The re-reads stop when a read reports `Observed True` or the
+  field becomes `Unavailable` (which asserts nothing), when a hide control that
+  returned settles on the window, when the window is iconified again, and when
+  it begins closing or ends. The last sampled value then stands: no value is
+  forced or inferred, and a visible that reads `Observed False` genuinely stays
+  `Observed False` and suspended.
+- **Clock reads.** `runOwnerLoop` reads `hostClock` only for a window in the
+  slow phase, or one whose re-read spends the quick bound, at most once a turn
+  however many windows ask. `runScheduledOwnerLoop` still takes exactly two
+  readings a turn and reuses the post-native one. A host with no such window
+  reads exactly what it read before.
+- **Constraints.** Each re-read is one visible query, through the same
+  capability gate and error bracket as a full sample: an unavailable feature is
+  `Unavailable`, any other report fails the turn with `NativeFailure` and
+  publishes nothing, and the phase does not advance. A re-read that reads what
+  the observation already holds publishes no revision. The phase moves in the
+  same masked step as the capture clearing and the publication.
+
+Eligibility is unchanged: no rule reads native state behind the observation.
+
+The other attributes with no callback refresh as follows, and none needs the
+same guarantee. *Decorated* is the window's own flag, which GLFW changes only
+for a `glfwSetWindowAttrib` call, so only a command or a mode attempt can move
+it and every such path samples afterwards. *Monitor* is `window->monitor`,
+which GLFW changes only for `glfwSetWindowMonitor` or a monitor disconnect;
+the first is a command or mode attempt, which samples afterwards, and the
+second is the owner turn's mode recovery, which resamples. The *applied mode*
+is derived from those two and the placement at each sample, and a borderless
+window's is re-derived from the placement callback's value; a windowed or
+fullscreen mode depends on no placement, so a move cannot change it. A stale
+visible that reads `True` while the window is hidden by the platform, for
+example by an application-wide hide, only renders into an invisible window and
+suspends nothing.
 
 ### Callbacks and the reconciliation boundary
 
@@ -2626,7 +2703,8 @@ calls it on the process main thread — and refuses any other thread with
    when its callback captured a change, then the retirement of every closing
    window no borrow defers, then every window's captured callbacks, collecting
    the close requests not yet surfaced for windows that are not closing, then
-   each open feed's overflow warning claim and resumption;
+   the [visible follow-up](#visible-after-an-iconify-transition) of each window
+   that owes one, then each open feed's overflow warning claim and resumption;
 4. `checkRuntime`;
 5. command work: at most `hostCommandBudget` queued commands claimed, executed,
    and settled, across every port, then warning claim and resumption again,
@@ -2724,7 +2802,10 @@ itself by absolute deadlines. It is a second entry point beside `runOwnerLoop`,
 not a change to it: `runOwnerLoop`, `LoopHooks`, `Turn`, and `TurnStep` keep the
 behaviour [The owner turn](#the-owner-turn) and [Idle waits](#idle-waits)
 describe exactly, including that loop's initial poll, and an application that
-uses them sees nothing new.
+uses them sees nothing new. The one clock reading `runOwnerLoop` can make is the
+[visible follow-up's](#visible-after-an-iconify-transition) for a window in its
+slow phase or spending its quick bound; an application none of whose windows is
+iconified never reads one.
 
 Time enters only through the injected `MonotonicSource` on the host's
 `hostClock`. The loop reads no wall clock, starts no timer thread, and sleeps
@@ -2760,7 +2841,9 @@ Each scheduled turn performs, in order:
 8. `checkRuntime`, before a `FinishWith` result is returned or the next turn
    begins.
 
-A turn therefore reads the clock exactly twice. The pre-native sample chooses
+A turn therefore reads the clock exactly twice, and the
+[visible follow-up](#visible-after-an-iconify-transition) of step 6 reuses the
+post-native reading rather than taking a third. The pre-native sample chooses
 the wait; the post-native sample is what the update sees, so a deadline the wait
 itself reached is due in that same turn rather than the one after. Deadlines
 stay absolute and the next turn samples again, so reconciliation, dispatch, and
@@ -5688,7 +5771,8 @@ The native examples cover:
   the observation reporting the platform's actual size — clamped into the limits
   where the platform clamps programmatic resizes, or the unclamped request on
   Cocoa, whose content limits bound only the user's resizing; minimize, maximize, and restore each followed by
-  an observation matching what the platform reports; focus and attention
+  an observation matching what the platform reports, each synchronized, so that
+  example samples for the very thing the window-host example below tests; focus and attention
   requests settling by their native call outcome without asserting that either
   was granted; and post-call revisions ordered while the latest snapshot has
   advanced beyond them. Each example waits for native events between
@@ -5715,6 +5799,18 @@ The native examples cover:
 - a window host over the shared session running a whole application on the
   process main thread: a supervised worker's observation request executed by
   the real owner loop and settled with a published revision;
+- a restored window resuming through the production owner loop alone (#581):
+  a hidden test window shown, minimized and restored through the host's own
+  command port, after which nothing but native event processing and the owner
+  turn acts on it, with no `synchronizeWindow`, `observeWindowCommand`, control
+  or mode request. It runs until iconified `Observed False`, visible
+  `Observed True` agreeing with the platform's own answer, and `RenderEligible`
+  all hold, never stopping when iconified first reads false, within 300 turns
+  of the example's 0.1-second idle wait; the bound is the example's, not a
+  production deadline. It asserts no transient visible value, and prints how
+  many turns saw the restored window reading not visible, as evidence of
+  whether the platform showed the stale reading. It fails on the code before
+  #581 on Cocoa, and runs on the isolated X11 display;
 - the scheduled owner turn on that session, counted rather than timed: with the
   window's input feed admitted before the loop, at least five update
   opportunities paced by an absolute deadline 20 ms out, and no native input
