@@ -1,7 +1,7 @@
 # The graphics adapter on a real device
 
-- revision: ba158d8a1299284c8731a4c71147970afdccaca1
-- source digest: e8229f183a2de1a42abcf0820f814c776cc44e467cc787b894602f0fb8d34b7c
+- revision: 4760bb503a4cf81a7f89fc3e2729a494fbd435d3
+- source digest: ffebe38127a14967a2e0b638c2dd971a3bad13786c991e218449f522f26e108c
 - command: lua-engine-graphics-native-tests --match Lua offscreen pixels (through tools/vulkan/run.sh native)
 - platform: darwin/aarch64, ghc Version {versionBranch = [9,14], versionTags = []}
 - device: Apple M3 Max
@@ -14,7 +14,7 @@
 - native calls: 427
 - destruction: vkDestroyFence, vkDestroyFence, vkDestroyPipeline, vkDestroyCommandPool, vkDestroyCommandPool, vkDestroyDescriptorPool, vkDestroyDescriptorPool, vkDestroyDescriptorPool, vkDestroyDescriptorSetLayout, vkDestroyDescriptorSetLayout, vkDestroyDescriptorSetLayout, vkDestroySampler, vkDestroySampler, vkDestroySampler, vkDestroySampler, vkDestroyPipelineLayout, vkDestroyDevice, vkDestroyDebugUtilsMessengerEXT, vkDestroyInstance
 - configuration: staging 33554432 bytes, table capacity 33, versions 10, native bytes budgeted 306186832 bytes of 2147483648 bytes
-- seconds: 10.502556
+- seconds: 10.702617
 - result: every check passed
 
 ## What the examples measured
@@ -26,7 +26,7 @@
 - Lua offscreen pixels / ordered-transparency / blue then red: revision 2, (64,48), 3072 determinate pixels judged, 0 indeterminate, 6 named probes, no fault, png sha256 e75f1ec4c99625d09eedbbd1bb0ca27b182bfd3cfdab21c4114325b26fee0d2f
 - Lua offscreen pixels / srgb-byte-clear / clear 128: revision 1, (64,48), 3072 determinate pixels judged, 0 indeterminate, 3 named probes, no fault, png sha256 979f29b8da966e89e406718611d7733899cba54310b7f0e8c7f10aa6b53ad7ef
 - Lua offscreen pixels / srgb-byte-clear / texel 128: revision 2, (64,48), 3072 determinate pixels judged, 0 indeterminate, 6 named probes, no fault, png sha256 f931f1c96f7763f6f4c50fcc7210db14a248b014b62e37b2fd9f6afac29d56a9
-- Lua offscreen pixels / fractional-negative-clipping / placement: revision 1, (64,48), 3072 determinate pixels judged, 0 indeterminate, 38 named probes, no fault, png sha256 f8030fa0453ed76e1ea70751f2c1c39beafb0d275955876a9aa955d65cf66947
+- Lua offscreen pixels / fractional-negative-clipping / placement: revision 1, (64,48), 3072 determinate pixels judged, 0 indeterminate, 40 named probes, no fault, png sha256 9f26ce1abe7ed64bc162a9de8493d36a7dd40d71dba1b126d5d8be4c7560f1d9
 - Lua offscreen pixels / target-metrics / extent 64x48, scale 1: revision 1, (64,48), 2824 determinate pixels judged, 248 indeterminate, 29 named probes, no fault, png sha256 438376d98dd4fd34f1cb56fd8f51ee17cba3d31913339cdd031258aa1677ca28
 - Lua offscreen pixels / target-metrics / extent 128x96 for logical 64x48, scale 2: revision 1, (128,96), 11768 determinate pixels judged, 520 indeterminate, 29 named probes, no fault, png sha256 4cc3246590379cfcfc30e528638cfa6b8f1fea46f95e76b89ffe09963c9a57df
 - Lua offscreen pixels / target-metrics / extent 80x60, scale 1: revision 1, (80,60), 4552 determinate pixels judged, 248 indeterminate, 29 named probes, no fault, png sha256 c746da3a69e60e35d0119ec862972b536ed6b24421fa20b11771adffda157641

@@ -672,7 +672,7 @@ to be uploaded could not be. The example learns that a publication was accepted 
 
 ### Cases
 
-Each case is one session and one or more images; `retain` writes a lossless PNG and a machine-readable record per image
+Each case is one session (plus a regression that a Lua failure before any window ends the example) and one or more images; `retain` writes a lossless PNG and a machine-readable record per image
 when `HETOIMASIA_VALIDATION_EVIDENCE` names a directory.
 
 | Case | What it shows |
@@ -681,7 +681,7 @@ when `HETOIMASIA_VALIDATION_EVIDENCE` names a directory.
 | top-left, full image, nearest | the initial scene read opaque black first; then twelve distinct texels, eight pixels to a texel, every texel at its place, nothing between neighbours |
 | ordered transparency | two partly transparent sprites over opaque black, in both list orders (separate publications), with the premultiplied overlap |
 | sRGB byte clear | a clear of byte 128 reads 128 (not 188), an opaque 128 texel reads 128, the output is opaque |
-| fractional, negative, clipping | no snapping at 0.25 and 0.75; rectangles across the left, top, right and bottom edges; a texture cropped by the top edge, neither recentred nor stretched |
+| fractional, negative, clipping | fractional origins and sizes chosen so that rounding an origin would change a covered pixel; rectangles across the left, top, right and bottom edges; a texture cropped by the top edge, neither recentred nor stretched |
 | target metrics | one accepted revision viewed at 64 × 48, 128 × 96 (scale 2), 80 × 60 and 40 × 30, with no new publication |
 | empty scene | an empty sprite list clears the earlier grid to the authored opaque colour |
 | copied scene | the script changes its table after publishing; the pixels do not change until it publishes again |

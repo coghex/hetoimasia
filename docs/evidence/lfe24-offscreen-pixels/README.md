@@ -16,12 +16,12 @@ technical test assets, not production art.**
 | --- | --- |
 | Producer | `lua-engine-graphics-native-tests`, the group `Lua offscreen pixels`, run locally with `HETOIMASIA_VALIDATION_EVIDENCE` set (the files below are what it wrote) |
 | Command | `HETOIMASIA_NATIVE_SESSION=desktop bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --match 'Lua offscreen pixels'`, after `bash tools/vulkan/run.sh build hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests` |
-| Revision run | `ba158d8a1299284c8731a4c71147970afdccaca1`, a clean tree (the pull request's head after merging master) |
-| Native source digest | `e8229f183a2de1a42abcf0820f814c776cc44e467cc787b894602f0fb8d34b7c` (`tools/vulkan/run.sh` roots, which include `packages/lua-engine-graphics`, `packages/lua-engine`, `packages/scripting-lua`, `packages/content` and `samples/lua-quad`, so every Lua, content, adapter, fixture and renderer input) |
+| Revision run | `4760bb503a4cf81a7f89fc3e2729a494fbd435d3`, a clean tree (the pull request's head after repairing review round 1) |
+| Native source digest | `ffebe38127a14967a2e0b638c2dd971a3bad13786c991e218449f522f26e108c` (`tools/vulkan/run.sh` roots, which include `packages/lua-engine-graphics`, `packages/lua-engine`, `packages/scripting-lua`, `packages/content` and `samples/lua-quad`, so every Lua, content, adapter, fixture and renderer input) |
 | Platform | macOS, Apple M3 Max, arm64; GHC 9.14.1, Cabal 3.18.1.0 |
 | Device and driver | Apple M3 Max through MoltenVK (`VK_DRIVER_FILES` the provisioned prefix's `MoltenVK_icd.json`), the provisioned loader `libvulkan.1.dylib` (held to the recorded one) |
 | Validation | `VK_LAYER_KHRONOS_validation` with synchronization validation; the diagnostic verdict, computed after the last teardown callback, is clean (64 records delivered) |
-| Result | 10 examples, 0 failures; `every check passed` ([the run's record](lua-engine-graphics-native.md)) |
+| Result | 11 examples, 0 failures (ten cases and the regression for a Lua failure before any window); `every check passed` ([the run's record](lua-engine-graphics-native.md)) |
 | Consent | the desktop opt-in on that one command, under the owner's standing approval (AGENTS.md); the group opened no window |
 
 The Linux receipts (the isolated X11 display, software Vulkan) are the pull request's CI receipts for
@@ -59,7 +59,7 @@ evidence, the counts, the tolerances and the SHA-256 of the readback bytes and o
 | [`ordered-transparency--red-then-blue.png`](ordered-transparency--red-then-blue.png) | ordered-transparency / red then blue | 1 | 64x48, scale 1 | 3072 | 0 (none) | 13 | `7d5eac401fd0b5a4eb778075c099a1e24fd33a9f0cb111403faa47d1c2e703ee` |
 | [`srgb-byte-clear--clear-128.png`](srgb-byte-clear--clear-128.png) | srgb-byte-clear / clear 128 | 1 | 64x48, scale 1 | 3072 | 0 (none) | 3 | `979f29b8da966e89e406718611d7733899cba54310b7f0e8c7f10aa6b53ad7ef` |
 | [`srgb-byte-clear--texel-128.png`](srgb-byte-clear--texel-128.png) | srgb-byte-clear / texel 128 | 2 | 64x48, scale 1 | 3072 | 0 (none) | 6 | `f931f1c96f7763f6f4c50fcc7210db14a248b014b62e37b2fd9f6afac29d56a9` |
-| [`fractional-negative-clipping--placement.png`](fractional-negative-clipping--placement.png) | fractional-negative-clipping / placement | 1 | 64x48, scale 1 | 3072 | 0 (none) | 38 | `f8030fa0453ed76e1ea70751f2c1c39beafb0d275955876a9aa955d65cf66947` |
+| [`fractional-negative-clipping--placement.png`](fractional-negative-clipping--placement.png) | fractional-negative-clipping / placement | 1 | 64x48, scale 1 | 3072 | 0 (none) | 40 | `9f26ce1abe7ed64bc162a9de8493d36a7dd40d71dba1b126d5d8be4c7560f1d9` |
 | [`target-metrics--extent-128x96-for-logical-64x48--scale-2.png`](target-metrics--extent-128x96-for-logical-64x48--scale-2.png) | target-metrics / extent 128x96 for logical 64x48, scale 2 | 1 | 128x96, scale 2 | 11768 | 520 (NearTexelBoundary 520) | 29 | `4cc3246590379cfcfc30e528638cfa6b8f1fea46f95e76b89ffe09963c9a57df` |
 | [`target-metrics--extent-40x30--scale-1.png`](target-metrics--extent-40x30--scale-1.png) | target-metrics / extent 40x30, scale 1 | 1 | 40x30, scale 1 | 972 | 228 (NearTexelBoundary 228) | 24 | `d9fea5f19d349cf0e4b3f8179d07246bd1856edeb6efcc584c0c6f8ab497c05f` |
 | [`target-metrics--extent-64x48--scale-1.png`](target-metrics--extent-64x48--scale-1.png) | target-metrics / extent 64x48, scale 1 | 1 | 64x48, scale 1 | 2824 | 248 (NearTexelBoundary 248) | 29 | `438376d98dd4fd34f1cb56fd8f51ee17cba3d31913339cdd031258aa1677ca28` |
@@ -87,7 +87,7 @@ evidence, the counts, the tolerances and the SHA-256 of the readback bytes and o
   when the red is.
 * **sRGB byte clear**: `clear 128` reads 128 everywhere (a byte 128 taken as linear light would read 188); `texel 128` is
   an opaque 128 texel over black.
-* **Fractional, negative, clipping**: A and B are placed at x 10.25 and 24.75 with no snapping; C, D and E cross the left and
+* **Fractional, negative, clipping**: A and B have fractional origins and sizes (10.4, 6.4, 8.35 x 6.35 and 24.7, 6.7, 8.6 x 6.6), chosen so that rounding an origin to the nearest integer would change a covered pixel; C, D and E cross the left and
   top, right and bottom, and left edges; the grid is cropped by the top edge (its first row is above the target).
 * **Target metrics**: four images of the same accepted revision (1), with no new publication, at 64 × 48, 128 × 96 for a
   logical 64 × 48 at content scale 2, 80 × 60 and 40 × 30.
@@ -104,5 +104,5 @@ evidence, the counts, the tolerances and the SHA-256 of the readback bytes and o
 
 ## Negative controls
 
-Each new negative control was broken once locally and failed as it must; the mutation was not committed. The eleven are
+Each new negative control was broken once locally and failed as it must; the mutation was not committed. The fifteen are
 recorded in the pull request.
