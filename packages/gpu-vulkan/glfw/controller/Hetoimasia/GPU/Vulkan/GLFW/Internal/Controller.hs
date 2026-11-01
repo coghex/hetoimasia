@@ -435,7 +435,6 @@ import Hetoimasia.GPU.Vulkan.GLFW.Internal.Targets
   , hasRetiring
   , markDeferred
   , newTargets
-  , pendingIds
   , pendingScenes
   , publishTarget
   , recordAdopted
@@ -974,13 +973,8 @@ controllerOperations (VulkanController state) renderer lifecycle offscreen =
             ]
     , graphicsPrepareRetirement = \retiring → retaining state (prepareRetirement state retiring)
     , graphicsRetireTarget = \retiring → retaining state (retireTarget state retiring)
-    , graphicsRetireOwner = \retiring →
-        settlingSwaps state . retaining state $ do
-          -- Every offscreen target ends with the owner, in the ledger and in
-          -- one transaction, before the release the retirement settles.
-          atomically (retireAllTargets offscreen (stateScenes state))
-          retireOwner state retiring
-    , graphicsDestroyOwner = \_ → settlingSwaps state (retaining state (destroyOwner state))
+    , graphicsRetireOwner = \retiring → endingScenes state offscreen (settlingSwaps state (retaining state (retireOwner state retiring)))
+    , graphicsDestroyOwner = \_ → endingScenes state offscreen (settlingSwaps state (retaining state (destroyOwner state)))
     }
   where
     progress step = do
@@ -1021,7 +1015,7 @@ controllerOperations (VulkanController state) renderer lifecycle offscreen =
         -- an unregistered one is ended first, so what it adopted is superseded
         -- and a release request it held back is no longer held.
         _ ← atomically (takeRetiring offscreen (stateScenes state))
-        waitingTargets ← atomically (pendingScenes offscreen)
+        waitingTargets ← atomically (pendingScenes offscreen (targetRoom state limit))
         answeredTargets ← traverse (\(identity, scene, revision) → (,,) identity revision <$> adoptScene (stateScenes state) (adoptingInto offscreen lifecycle) limit (TargetAdopter identity) scene revision) waitingTargets
         let pressedTargets = [(identity, revision) | (identity, revision, AtLimit) ← answeredTargets]
         atomically (markDeferred offscreen pressedTargets)
@@ -1117,12 +1111,30 @@ controllerOperations (VulkanController state) renderer lifecycle offscreen =
 targetsWake ∷ State inst msgr phys dev cmd lease obligation → Targets scene → STM Bool
 targetsWake state targets = do
   retiring ← hasRetiring targets
-  pending ← pendingIds targets
   limit ← retentionLimit . frameSlotLimit . modelBudgets <$> readRootsModel (stateRoots state)
-  -- A pending revision asks for a round until the owner has noted that it found no room for it, and then only
-  -- once a release has made room.
-  asks ← traverse (\(identity, noted) → if noted then not <$> adopterAtLimit (stateScenes state) limit (TargetAdopter identity) else pure True) pending
-  pure (retiring || or asks)
+  -- The same pending set the step adopts from: a revision the owner has noted it found no room for asks nothing
+  -- until a release makes room.
+  pending ← pendingScenes targets (targetRoom state limit)
+  pure (retiring || not (null pending))
+
+-- | Whether this offscreen target holds fewer unreleased revisions than the limit allows. The one question the
+-- step's adoption and the owner's wake both put to a target whose deferral was noted, so a revision the owner has
+-- already counted a deferral for is neither attempted nor counted again, in any round, until a release makes room.
+targetRoom ∷ State inst msgr phys dev cmd lease obligation → Natural → OffscreenTargetId → STM Bool
+targetRoom state limit identity = not <$> adopterAtLimit (stateScenes state) limit (TargetAdopter identity)
+
+-- | However the owner ends, every offscreen target is ended in the ledger, in one transaction, before the hook runs,
+-- and every adopted revision whose uses are over is released once the hook has ended — whatever way it ended: a
+-- normal retirement, a failure of any step of it, a cancellation, or the owner's destruction without a retirement
+-- that completed. The owner has two ways to end, its retirement and its destruction
+-- ('graphicsRetireOwner', 'graphicsDestroyOwner'), and each passes through here, so no exit settles by its own
+-- call site: the settlement is the handler of a 'finally', which runs masked, and it is idempotent (a record is
+-- removed before its hook, a target ended twice is ended once). A use that was not established over — a ticket
+-- that is pending, or that the device's loss settled as lost — keeps its revision, as it always does.
+endingScenes ∷ State inst msgr phys dev cmd lease obligation → Targets scene → IO a → IO a
+endingScenes state targets action = (ending >> action) `finally` (ending >> void (settleSceneReleases state))
+  where
+    ending = atomically (retireAllTargets targets (stateScenes state))
 
 -- | The lifecycle the owner adopts an offscreen target's scene through: the
 -- host's own, and then, in the same uninterruptible transition, the exact
@@ -1845,11 +1857,8 @@ retireOwner state retiring = do
   now ← readInstant (stateClock state)
   _ ← settleSceneReleases state
   endCaptures (stateRendering state)
-  -- The recording's drain can establish completions (a frame-less batch's ticket, a frame's submission) that end the
-  -- last uses of revisions the owner adopted. They are settled after the drain however it ends — including a drain
-  -- that completed some batches and then failed — as an unmasked failure of the drain must not lose them; a use whose
-  -- completion was not established (pending, or lost) keeps its revision, as it always has.
-  retireRendering (stateRendering state) now `finally` void (settleSceneReleases state)
+  -- What the drain establishes is settled by 'endingScenes', which every way the owner ends passes through.
+  retireRendering (stateRendering state) now
   device ← retireRoots (stateRoots state)
   pure . ownerRetired $
     (if orphaned > 0 then "destroyed " <> plural orphaned "surface" <> " no target held; " else "") <> device

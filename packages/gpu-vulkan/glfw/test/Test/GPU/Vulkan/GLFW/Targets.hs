@@ -25,7 +25,7 @@ import Control.Concurrent (ThreadId, forkIO, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, check, newTVarIO, readTVar, readTVarIO, retry, writeTVar, modifyTVar')
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (..), Exception, ExceptionWithContext (..), SomeException, catch, finally, fromException, throwIO, try)
-import Control.Monad (void)
+import Control.Monad (replicateM_, void)
 import Data.Foldable (for_)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
 import qualified Data.Map.Strict as Map
@@ -45,14 +45,19 @@ import Hetoimasia.GPU.Vulkan.Native.Recording (BatchTicket, TicketState (..), re
 import Hetoimasia.Runtime.GLFW
   ( OwnerPhase (..)
   , OwnerStatus (..)
+  , Stage (..)
   , ScheduledStep (..)
   , ScheduledTurn (..)
   , TargetStanding (..)
   , Turn (..)
   , UpdateSchedule (..)
   , WindowScenePublication (..)
+  , custodyOf
   , defaultScheduledHooks
+  , graphicsAttachment
+  , ownerDestroyed
   , ownerHandoff
+  , publishOwnerDestruction
   , publishGraphicsWindowScene
   , readOwnerFailure
   , readOwnerStatusNow
@@ -89,6 +94,7 @@ spec = describe "Offscreen scene targets (LFE-27)" $ do
     itBounded "retains the records of a target whose session failed, releasing nothing on a batch whose completion was never observed" testSessionFailureRetains
     itBounded "ends every target with the owner, leaving a pending use unreleased and a refused request never run" testOwnerExitEndsTargets
     itBounded "releases the revision of a batch whose completion the owner's own shutdown drain established, once, though the owner ended its targets first" testExitDrainCompletesBatch
+    itBounded "releases what a target adopted when the owner's retirement failed at its first step, before it settled anything" testExitFailureStillSettles
     itBounded "discards a batch whose recording the owner's cancellation interrupted before its ticket reached the caller, and releases the revision it read" testCancelledRecording
     itBounded "completes an adoption's record, notification and watermark, and a release's removal and notifications, for an offscreen target whatever cancels the thread meanwhile" testLedgerCancellation
 
@@ -578,6 +584,9 @@ testRetentionLimit = do
     overflow ← publishNow host target 99
     overflow `shouldBe` TargetScenePublished target (limit + 1)
     awaitTargetStanding host target ((>= 1) . windowDeferrals)
+    -- Rounds the owner takes for other reasons — each an owner-thread action's step, and the pending batch's fence is
+    -- polled throughout — neither attempt the blocked revision again nor count its deferral again.
+    replicateM_ 3 (roundTrip host)
     atLimit ← currentStanding host target
     -- A request made after that publication waits for a revision the target cannot adopt yet.
     queued ← requestRecording host rig
@@ -772,6 +781,51 @@ testExitDrainCompletesBatch = do
   adoptedOf events target `shouldBe` [(0, 0), (1, 1)]
   releasedOf events target `shouldBe` [0, 1]
   state ← atomically (readVulkanSceneState (vulkanController hostAfter))
+  maybe [] windowAwaitingRelease (Map.lookup (KeyOffscreen target) (sceneWindows state)) `shouldBe` []
+
+testExitFailureStillSettles ∷ IO ()
+testExitFailureStillSettles = do
+  base ← surfaceFreeRig 3
+  let rig = base {rigPortCapacity = Just 1}
+  -- A window handed over whose announcement the owner's full port deferred is an orphan when the owner retires, and
+  -- its destruction fails: the owner's retirement raises at its first step, before it reaches the recording's drain or
+  -- the device. What the target adopted needs no batch to end, so the exit alone must release it.
+  scriptSurface rig 102 DestroyFails
+  observed ← newTVarIO Nothing
+  outcome ← runRigCaught rig $ \host control → do
+    let owner = vulkanGraphicsOwner host
+        windows = vulkanWindowHost host
+    _ ← superviseGraphicsOwner control owner
+    awaitReady host
+    gate ← newTVarIO False
+    scriptNative rig AtSupport (HoldsUntil gate)
+    [first, second, third] ← windowsOf host
+    one ← handedOver host first RequiredTarget
+    -- The owner has taken the first announcement and is inside its construction, so its port is empty and stays so.
+    atomically (custodyOf owner (graphicsAttachment one) >>= check . (== Just CustodyOwned))
+    _ ← handedOver host second RequiredTarget
+    _ ←
+      handOverVulkanTarget (vulkanController host) windows owner third RequiredTarget >>= \case
+        VulkanAnnouncementDeferred service → pure service
+        other → failWith ("the third window was not deferred: " <> show other)
+    atomically (writeTVar gate True)
+    target ← registered host
+    awaitTargetStanding host target ((== Just 0) . windowAdopted)
+    _ ← publishNow host target 1
+    awaitTargetStanding host target ((== Just 1) . windowAdopted)
+    atomically (writeTVar observed (Just (host, target)))
+    -- The uncertain orphan retains the instance, so the owner can produce no destruction evidence of its own: the
+    -- exit finishes on independent evidence, published once the owner's retirement has failed.
+    void . forkIO $ do
+      atomically (readOwnerFailure owner >>= check . isJust)
+      publishOwnerDestruction owner (ownerDestroyed "published independently by the example")
+    checkRuntime control
+  (host, target) ← readTVarIO observed >>= maybe (failWith ("the exit example did not reach its observation: " <> either show (const "it returned") outcome)) pure
+  events ← readTVarIO (rigSceneEvents rig)
+  adoptedOf events target `shouldBe` [(0, 0), (1, 1)]
+  -- Both adoptions are released, once each, in order, though the retirement failed before it settled anything.
+  releasedOf events target `shouldBe` [0, 1]
+  state ← atomically (readVulkanSceneState (vulkanController host))
   maybe [] windowAwaitingRelease (Map.lookup (KeyOffscreen target) (sceneWindows state)) `shouldBe` []
 
 testCancelledRecording ∷ IO ()

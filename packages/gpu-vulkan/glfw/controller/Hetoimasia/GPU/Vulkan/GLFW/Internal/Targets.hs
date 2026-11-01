@@ -48,11 +48,11 @@
 -- uninterruptible transition as the ledger's record and the hook
 -- ('recordAdopted'), so the scene a batch is recorded against is the scene the
 -- ledger accounts for. A target at its retention limit adopts nothing newer
--- and the owner asks no round for it, once it has noted the deferral for that
--- revision ('markDeferred'), until a release makes room, which the wake the
--- controller composes reads from the ledger itself ('pendingIds'); a newer
--- publication is a new revision and is noted afresh. Its publication never
--- waits.
+-- and the owner neither attempts it again nor asks a round for it, once it has
+-- noted the deferral for that revision ('markDeferred'), until a release makes
+-- room: the step's adoption and the wake read the one pending set
+-- ('pendingScenes'), with the ledger's own answer on room. A newer publication
+-- is a new revision and is noted afresh. Its publication never waits.
 --
 -- = Unregistration
 --
@@ -90,7 +90,6 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Targets
 
     -- * The owner's step
   , pendingScenes
-  , pendingIds
   , markDeferred
   , recordAdopted
   , adoptedScene
@@ -100,7 +99,7 @@ module Hetoimasia.GPU.Vulkan.GLFW.Internal.Targets
   ) where
 
 import Control.Concurrent.STM (STM, TVar, modifyTVar', newTVarIO, readTVar, writeTVar)
-import Control.Monad (forM_)
+import Control.Monad (forM, forM_)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
@@ -242,16 +241,20 @@ targetsRevisions ∷ Targets scene → STM (Map SceneTargetKey Natural)
 targetsRevisions targets =
   Map.fromList . map (\(identity, cell) → (KeyOffscreen identity, cellRevision cell)) . Map.toList . standingLive <$> readTVar (targetsStanding targets)
 
--- | The scene the owner has to adopt for each registered target whose latest
--- revision is newer than the one it adopted, or that has adopted nothing.
-pendingScenes ∷ Targets scene → STM [(OffscreenTargetId, scene, Natural)]
-pendingScenes targets = do
+-- | The scene the owner has to adopt for each registered target whose latest revision is newer than the one it
+-- adopted, or that has adopted nothing — except a target whose current revision the owner has already noted it found
+-- no room for, while the given question still answers that it has none. That one definition is what the owner's step
+-- adopts from and what its wake reads, so a revision whose deferral was counted is not attempted, and not counted
+-- again, by any later round until a release makes room.
+pendingScenes ∷ Targets scene → (OffscreenTargetId → STM Bool) → STM [(OffscreenTargetId, scene, Natural)]
+pendingScenes targets hasRoom = do
   standing ← readTVar (targetsStanding targets)
-  pure
-    [ (identity, preparedValue (cellLatest cell), cellRevision cell)
-    | (identity, cell) ← Map.toList (standingLive standing)
-    , maybe True ((< cellRevision cell) . fst) (cellAdopted cell)
-    ]
+  fmap concat . forM (Map.toList (standingLive standing)) $ \(identity, cell) →
+    if maybe True ((< cellRevision cell) . fst) (cellAdopted cell)
+      then do
+        room ← if cellDeferredAt cell == Just (cellRevision cell) then hasRoom identity else pure True
+        pure [(identity, preparedValue (cellLatest cell), cellRevision cell) | room]
+      else pure []
 
 -- | Record the exact scene the owner adopted for a target, in the adoption's
 -- own transition. A target that was unregistered meanwhile records nothing.
@@ -265,18 +268,6 @@ recordAdopted targets identity revision scene =
 -- nothing yet.
 adoptedScene ∷ Targets scene → OffscreenTargetId → STM (Maybe (Maybe (Natural, scene)))
 adoptedScene targets identity = fmap cellAdopted . Map.lookup identity . standingLive <$> readTVar (targetsStanding targets)
-
--- | The registered targets with a scene to adopt — a newer revision than the one
--- adopted, or none adopted yet — each with whether the owner has already noted
--- that it found no room for that revision.
-pendingIds ∷ Targets scene → STM [(OffscreenTargetId, Bool)]
-pendingIds targets = do
-  standing ← readTVar (targetsStanding targets)
-  pure
-    [ (identity, cellDeferredAt cell == Just (cellRevision cell))
-    | (identity, cell) ← Map.toList (standingLive standing)
-    , maybe True ((< cellRevision cell) . fst) (cellAdopted cell)
-    ]
 
 -- | The owner found no room to adopt these revisions: it notes each once.
 markDeferred ∷ Targets scene → [(OffscreenTargetId, Natural)] → STM ()
