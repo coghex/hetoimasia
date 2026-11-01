@@ -9415,6 +9415,22 @@ replace boundary tests, prove performance or establish confinement.
   exact source/command/profile and explicitly labeled technical assets.
 - **Owner/tests:** graphics acceptance suite through the Vulkan headless runner.
   This establishes pixel semantics, not native window behavior or performance.
+- **As delivered ([#539](https://github.com/coghex/hetoimasia/issues/539)):** the
+  `Lua offscreen pixels` group of the graphics adapter's native suite
+  (`lua-engine-graphics-native-tests`, catalog group `test.vulkan-lua-engine-native`) and its
+  device-free counterpart, the `Lua offscreen pixels comparator` group of
+  `lua-engine-graphics-tests`. Only the display target is replaced: a test-only display adapter
+  answers the window provider's port with a surface-free offscreen scene target registered through
+  LFE-27, publication is the production publisher over the host's transaction for such a target, and
+  the adapter records an adopted scene only through `recordVulkanTargetBatch` (the production
+  `frameCandidate` output retargeted in its pass target alone, checked equal in every other value),
+  reading the managed RGBA8 sRGB target back after the batch's own ticket completed. Ten cases are
+  judged by the render-2d oracle over every pixel and by independently hand-stated colours; the
+  committed technical fixtures, their provenance and the retained PNGs and records are in
+  [the evidence](../evidence/lfe24-offscreen-pixels/README.md). The routing differs from this
+  entry's wording: the "Vulkan headless runner" lane creates no device by contract, so the real
+  pixels are in the native lane, which opens no window for this group. No production code, Lua API
+  or capture API was added; no performance or new platform-support claim is made.
 
 #### LFE-25. Qualify native windows, independent retirement and quit
 
