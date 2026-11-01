@@ -53,18 +53,18 @@ spec ∷ Env → Spec
 spec env = describe "Lua native milestone: the actual command" $ do
   it "shows the shipped quad in the real command's window, then ends on a genuine WM_DELETE_WINDOW delivered to that exact window: exit 0 with a clean validated teardown (isolated X11)" $
     onX11 env "native close" $
-      runChild env "actual-command" (\_ → pure ()) (Expect ExitSuccess "VerdictSuccess" (Just "0") False) $ \pid found → forM_ found $ \bound → do
+      runChild env "actual-command" True (\_ → pure ()) (Expect ExitSuccess "VerdictSuccess" (Just "0") False) $ \pid found → forM_ found $ \bound → do
         snapWith env "actual-command--quad" bound quadLandmarks Nothing
         closeBound (Just bound)
         evidence env ("actual command: pid " <> Text.pack (show pid) <> ", native window " <> Text.pack (show (boundX bound)) <> " closed by a genuine WM_DELETE_WINDOW (the helper reported delivery; the exit below is the command's own); no signal was sent")
   it "leaves the healthy UI active with the exact red clear after an ordinary logical failure, and ends on a native close with exit 1 (isolated X11), or on a later Lua quit with exit 1 (elsewhere)" $
     let x11 = isJust (envX11 env)
-     in runChild env "logical-failure" (failing x11) (Expect (ExitFailure 1) "VerdictFailure" Nothing True) $ \pid found → forM_ found $ \bound → do
+     in runChild env "logical-failure" True (failing x11) (Expect (ExitFailure 1) "VerdictFailure" Nothing True) $ \pid found → forM_ found $ \bound → do
           snapWith env "actual-command--logical-failure-red-clear" bound redClearLandmarks Nothing
           closeBound (Just bound)
           evidence env ("logical failure: pid " <> Text.pack (show pid) <> ", the UI stayed active and showed the exact empty red clear, a native close then ended the session with exit 1 (the failure outranks the normal stop)")
   it "ends on a Lua quit with exit 0 and a clean validated teardown" $
-    runChild env "lua-quit" quitting (Expect ExitSuccess "VerdictSuccess" (Just "0") False) $ \_ _ → pure ()
+    runChild env "lua-quit" False quitting (Expect ExitSuccess "VerdictSuccess" (Just "0") False) $ \_ _ → pure ()
 
 -- | Run a case that needs the external helper only where the run carries one; elsewhere it records itself as not
 -- applicable (the macOS actual command is the supervised run's, and no Wayland claim is made).
@@ -95,8 +95,8 @@ edit folder change = do
 -- | Start the built command with @--vulkan-validation@ on an owned copy of the content (changed by the fixture), wait for
 -- the barrier (the resolved root, the validation record, the session's start gate), let the case act, wait for the
 -- child's own exit within a bound and judge its stderr.
-runChild ∷ Env → Text → (FilePath → IO ()) → Expect → (Int → Maybe Bound → IO ()) → IO ()
-runChild env name fixture expectation act = do
+runChild ∷ Env → Text → Bool → (FilePath → IO ()) → Expect → (Int → Maybe Bound → IO ()) → IO ()
+runChild env name wantWindow fixture expectation act = do
   executable ← lookupEnv executableVariable >>= maybe (fail (executableVariable <> " is not set: run this suite through tools/vulkan/run.sh native")) pure
   environment ← permittingEnvironment
   withSystemTempDirectory "hetoimasia-native-actual" $ \folder → do
@@ -109,7 +109,8 @@ runChild env name fixture expectation act = do
         BarrierEnded → failWith child "the command's stderr ended before the validation record and the session's start gate were both logged"
         BarrierTimedOut → failWith child "the validation record and the session's start gate were not both logged in time"
       pid ← getPid (childProcess child) >>= maybe (failWith child "the command had already exited") (pure . fromIntegral)
-      bound ← bindChild env pid
+      -- Only a case that looks at the window binds it: a child that ends by itself leaves no window to wait for.
+      bound ← if wantWindow then bindChild env pid else pure Nothing
       act pid bound
       code ← timeout (30 * 1000000) (waitForProcess (childProcess child))
       case code of
