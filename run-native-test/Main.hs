@@ -63,6 +63,7 @@ import Test.Run.Native.Env (Env (..), Hold (..))
 import Test.Run.Native.X11 (defaultX11)
 import qualified Test.Run.Native.Library as Library
 import qualified Test.Run.Native.Milestone as Milestone
+import qualified Test.Run.Native.PeersSpec as PeersSpec
 
 main ∷ IO ()
 main = do
@@ -140,7 +141,7 @@ completeFlag ∷ String
 completeFlag = "--complete"
 
 examples ∷ Env → Spec
-examples env = ChildSpec.spec >> Library.spec env >> Command.spec env >> Milestone.spec env >> Actual.spec env
+examples env = ChildSpec.spec >> PeersSpec.spec >> Library.spec env >> Command.spec env >> Milestone.spec env >> Actual.spec env
 
 -- | Hand an action to the main thread, in one step that nothing can interrupt, and answer the wait for its outcome.
 startMain ∷ TVar [IO ()] → IO a → IO (IO a)

@@ -18,6 +18,7 @@ module Test.Run.Native.Landmarks
   , tolerance
   , quadLandmarks
   , redClearLandmarks
+  , blackLandmarks
   , judge
   , Judgement (..)
   ) where
@@ -71,6 +72,19 @@ redClearLandmarks (width, height) =
   | (label, point) ←
       [ ("the top-left corner area", (8, 8))
       , ("where the quad would be", (112, 112))
+      , ("the centre", (width `div` 2, height `div` 2))
+      , ("the far corner", (width - 8, height - 8))
+      ]
+  ]
+
+-- | Landmarks of a window that has only its initial scene: the host's initial scene is an opaque black clear and nothing
+-- else, so every point is black. (A window that has adopted nothing else yet is allowed to look like this.)
+blackLandmarks ∷ (Int, Int) → [Landmark]
+blackLandmarks (width, height) =
+  [ Landmark ("initial black at " <> label) point (0, 0, 0)
+  | (label, point) ←
+      [ ("the top-left corner area", (8, 8))
+      , ("where the quad will be", (112, 112))
       , ("the centre", (width `div` 2, height `div` 2))
       , ("the far corner", (width - 8, height - 8))
       ]

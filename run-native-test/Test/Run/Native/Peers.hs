@@ -28,6 +28,7 @@ module Test.Run.Native.Peers
   ( Peers (..)
   , Spawned (..)
   , PeerFailure (..)
+  , ScenarioCancelled (..)
   , CreationHold (..)
   , withPeers
   , onMain
@@ -48,6 +49,8 @@ module Test.Run.Native.Peers
   , refuseNextStandings
   , instanceFailureText
   , verdictCleanOrFail
+  , teardownProblems
+  , judgeTeardown
   ) where
 
 import Control.Concurrent.STM
@@ -61,13 +64,15 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Concurrent.MVar (newEmptyMVar, takeMVar)
-import Control.Exception (Exception, SomeException, finally, onException, throwIO)
+import Control.Concurrent (forkIOWithUnmask, killThread, myThreadId, threadDelay, throwTo)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryReadMVar)
+import Control.Exception (Exception, ExceptionWithContext (..), SomeException, finally, mask, onException, rethrowIO, throwIO, tryWithContext)
 import System.IO (hPutStrLn, stderr)
 import System.Timeout (timeout)
-import Control.Monad (forM_, join, unless, when)
+import Control.Monad (forM_, forever, join, unless, when)
 import Data.ByteString (ByteString)
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
+import Data.Maybe (isNothing)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Set (Set)
@@ -77,9 +82,17 @@ import Hetoimasia.Content.Identity (contentKeyPath, logicalPathBytes, parseRefer
 import Hetoimasia.Content.Inventory (inventoryIdentityLimits, inventoryLimitsOf, inventoryRootKey, readVerified)
 import Hetoimasia.Content.ReadPool (ReadPool, poolSpec, withReadPoolUsing)
 import Hetoimasia.Foundation.Log (LogFilter (..), Logger, callbackSink, defaultLogFilter, mkLogger, unsafeComponent)
-import Hetoimasia.Foundation.Time (monotonicSource)
+import Hetoimasia.Foundation.Resource (cleanupFailuresInContext)
+import Hetoimasia.Foundation.Time (Duration, DurationRequirement (RequirePositive), durationFromNanoseconds, monotonicSource)
 import Hetoimasia.GLFW.Vulkan (withLoaderIntegration)
-import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), DiagnosticVerdict, defaultCaptureConfig, verdictIssues)
+import Hetoimasia.GPU.Vulkan.Diagnostics
+  ( CaptureConfig (..)
+  , DiagnosticVerdict
+  , defaultCaptureConfig
+  , diagnosticVerdictInContext
+  , finalizationEvidenceInContext
+  , verdictIssues
+  )
 import Hetoimasia.GPU.Vulkan.GLFW
   ( FrameEvent
   , Readiness (..)
@@ -114,7 +127,7 @@ import Hetoimasia.LuaEngine.Graphics.Window.Configuration (configureWindows, win
 import Hetoimasia.LuaEngine.Graphics.Window.Host (PortReading, newHostPort)
 import Hetoimasia.LuaEngine.Graphics.Window.Port (CreateIssue (..), CreateOutcome (..), CreateToken, Fatal, Port (..), Standing (..), WindowToken)
 import Hetoimasia.LuaEngine.Graphics.Window.Provider (WindowConfig (..), windowMainStep, withWindowProvider)
-import Hetoimasia.LuaEngine.Manifest (Role (Presentation))
+import Hetoimasia.LuaEngine.Manifest (Role (Gameplay, Presentation))
 import Hetoimasia.LuaEngine.Modules
   ( BootOutcome (BootReady)
   , ModuleSpec (..)
@@ -130,7 +143,7 @@ import Hetoimasia.LuaEngine.Request (m1Requests)
 import Hetoimasia.LuaEngine.Texture (specIoWorkers, textureSpec, withTexturePipeline)
 import Hetoimasia.Run.Boot (Prepared (..), withPrepared)
 import Hetoimasia.Run.Serve (Owner (..), serveSpawned, runOwned)
-import Hetoimasia.Run.Settle (answering)
+import Hetoimasia.Run.Settle (answering, combine, isAsynchronous, rememberingInterruption)
 import Hetoimasia.Runtime.GLFW
   ( ScheduledStep (..)
   , UpdateSchedule (NoUpdateDemand)
@@ -153,7 +166,7 @@ import qualified Hetoimasia.Runtime.Supervision as Supervision
 import Hetoimasia.Scripting.Lua.Admission (newRequestHandles)
 import Hetoimasia.Scripting.Lua.Instance hiding (forgetInstance)
 import Hetoimasia.Scripting.Lua.Owner
-import Hetoimasia.Scripting.Lua.Provider (RequestGrant (..), RequestTiming (SettleOnArrival))
+import Hetoimasia.Scripting.Lua.Provider (RequestGrant (..), RequestTiming (SettleAtAssignedTick, SettleOnArrival))
 import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime, newLuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Scheduler (systemTimerBackend)
@@ -188,6 +201,10 @@ data Peers = Peers
   , peReadsFinished ∷ !(TVar [ByteString])
   , peJobs ∷ !(TVar [IO ()])
   , peAdmit ∷ !(IO Spawned)
+  , peLogicalOwner ∷ !ScheduledOwner
+  -- ^ The independent logical owner: its own VM, scheduled on its own timer, running the shipped gameplay behavior.
+  , peLogical ∷ !Spawned
+  -- ^ Its one instance, admitted before any UI instance and alive for the length of the scenario.
   }
 
 -- | An instance admitted to the UI VM.
@@ -197,6 +214,14 @@ data Spawned = Spawned
   , spTicket ∷ !InstanceTicket
   }
 
+-- | The scenario was stopped from outside (its caller was cancelled, or the owner loop failed). An ordinary exception,
+-- not an asynchronous-typed one: it ends the scenario's thread through its own scopes, and the application's failure it
+-- becomes is a failure like any other, so the production job helper does not take it for a cancellation of the main thread.
+data ScenarioCancelled = ScenarioCancelled
+  deriving (Show)
+
+instance Exception ScenarioCancelled
+
 -- | Why a harness could not even be set up.
 newtype PeerFailure = PeerFailure Text
   deriving (Show)
@@ -205,15 +230,25 @@ instance Exception PeerFailure
 
 -- | Compose the two-instance harness over a real host for the length of the scenario.
 --
--- The scenario runs on the session thread; whatever it raises is raised here after everything has unwound, and the
--- diagnostic capture's verdict must then be clean. The folder is the owned copy of the content the caller prepared.
+-- The scenario runs on the session thread; whatever it raises is raised here, with its context (the diagnostic verdict
+-- the capture attached, the cleanup failures the scopes retained), after everything has unwound. This function owns the
+-- scenario across a cancellation of its caller too: the application is run on the process main thread (queued through
+-- @start@), so a caller that is cancelled while it waits (an example's bound expiring, say) cannot simply walk away.
+-- It then stops the scenario (a cancellation delivered to the session thread, which releases every gate and retires
+-- everything on its way out), waits without a bound for the application to have ended, and only then raises the
+-- cancellation, with the application's own failure (and its verdict and cleanup failures) retained beside it. The
+-- folder the caller prepared is therefore never removed under a scenario that still borrows it.
+--
+-- The folder is the owned copy of the content the caller prepared.
 withPeers ∷ (∀ x. IO x → IO (IO x)) → FilePath → (Peers → IO a) → IO a
-withPeers start folder scenario = do
+withPeers start folder scenario = mask $ \restore → do
   textureConfiguration ← either (\refused → ioError (userError ("the profile cannot be mapped to the native graphics: " <> show refused))) pure (configurationFor fixedM1Profile)
   scenes ← newSceneSession
   frames ← newTVarIO (0, [])
   jobs ← newTVarIO []
   abort ← newTVarIO False
+  sessionThread ← newIORef Nothing
+  ended ← newEmptyMVar
   verdictCell ← newIORef Nothing
   slot ← newIORef Nothing
   let capture = defaultCaptureConfig {captureTextBudget = 16384}
@@ -224,9 +259,23 @@ withPeers start folder scenario = do
           , vulkanLayers = ["VK_LAYER_KHRONOS_validation"]
           , vulkanValidationFeatures = [SynchronizationValidation]
           }
-      run = withLoggingLifetime quietLogger $ \lifetime → do
+      -- Stop the scenario: latch the request first, then deliver it to the session thread if that already exists; a
+      -- session that starts later reads the latch before it runs the scenario. Either order reaches it.
+      cancelScenario = do
+        atomically (writeTVar abort True)
+        readIORef sessionThread >>= mapM_ (\thread → throwTo thread ScenarioCancelled)
+      -- The application's outcome travels as /data/, context included. The suite's own plumbing for a main-thread job
+      -- re-throws a failure as a fresh exception, which would drop the capture's verdict and the cleanup evidence it
+      -- attached; a failure that is data is raised again by 'rethrowIO' in the caller with all of it. A cancellation of the
+      -- main thread itself is still raised on it.
+      run = (`finally` putMVar ended ()) $ do
+        result ← tryWithContext @SomeException application
+        case result of
+          Left failure | isAsynchronous failure → rethrowIO failure
+          _ → pure result
+      application = withLoggingLifetime quietLogger $ \lifetime → do
         outcome ←
-          runOwned slot (atomically (writeTVar abort True)) $
+          runOwned slot cancelScenario $
             withLoaderIntegration $ \integration →
               runGraphicsOwnerApplication
                 ($ lifetime)
@@ -238,13 +287,35 @@ withPeers start folder scenario = do
                 )
                 vulkanWindowHost
                 (\vulkan _ → pure vulkan)
-                (\vulkan control → body lifetime slot abort scenes textureConfiguration config vulkan control frames jobs)
+                (\vulkan control → body lifetime slot cancelScenario abort sessionThread scenes textureConfiguration config vulkan control frames jobs)
         verdict ← readIORef verdictCell
         verdictCleanOrFail verdict
         pure outcome
-  join (start run)
+  waitMain ← start run
+  outcome ← tryWithContext @SomeException (restore waitMain)
+  stillRunning ← isNothing <$> tryReadMVar ended
+  if not stillRunning
+    then either rethrowIO (either rethrowIO pure) outcome
+    else do
+      -- The wait was interrupted before the application ended: it still owns the scenario, the gates, the windows and
+      -- the borrowed folder. Stop it, join it, and keep what it ends with beside the interruption.
+      cancelScenario
+      interruption ← rememberingInterruption (readMVar ended)
+      applicationEnd ← tryWithContext @SomeException waitMain
+      let ended' = case applicationEnd of
+            Left failure → [failure]
+            Right (Left failure) → [failure]
+            Right (Right _) → []
+      case outcome of
+        Left primary →
+          rethrowIO
+            =<< combine
+              (maybe primary id interruption)
+              ([("the harness application, which had to be stopped and joined", failure) | failure ← ended'] <> [("the wait that was interrupted", primary) | Just _ ← [interruption]])
+        Right (Left failure) → rethrowIO failure
+        Right (Right value) → maybe (pure value) rethrowIO interruption
   where
-    body lifetime slot abort scenes textureConfiguration config vulkan control frames jobs = do
+    body lifetime slot cancelScenario abort sessionThread scenes textureConfiguration config vulkan control frames jobs = do
       awaitReadiness vulkan
       _ ← superviseGraphicsOwner control (vulkanGraphicsOwner vulkan)
       providerStep ← newIORef (pure ())
@@ -259,13 +330,18 @@ withPeers start folder scenario = do
               , ownerDrain = \over → withSupervision lifetime $ \fresh → loop fresh (\_ → finish over)
               , ownerWake = wakeGraphicsHost (vulkanGraphicsOwner vulkan)
               }
-          session = withTextureGraphics scenes textureConfiguration config vulkan $ \graphics →
-            compose lifetime folder graphics vulkan frames jobs providerStep scenario
+          session = do
+            -- Registered before the latch is read, so a cancellation latched earlier is seen here and one delivered
+            -- later reaches this thread.
+            myThreadId >>= writeIORef sessionThread . Just
+            readTVarIO abort >>= \stopped → when stopped (throwIO ScenarioCancelled)
+            withTextureGraphics scenes textureConfiguration config vulkan $ \graphics →
+              compose lifetime folder graphics vulkan frames jobs providerStep scenario
       serveSpawned
         lifetime
         owner
         (writeIORef slot . Just)
-        (atomically (writeTVar abort True))
+        cancelScenario
         (turnJobs >> join (readIORef providerStep))
         session
 
@@ -335,38 +411,78 @@ compose lifetime folder graphics vulkan frames jobs providerStep scenario = do
               writeIORef providerStep (windowMainStep provider)
               let publisher = scenePublisher (graphicsTextures graphics) provider
                   injection = graphicsInjection (GraphicsFacade profile pipeline provider publisher noPublishHooks defaultIssuedMemory)
-              withOutput sink sink $ \output →
-                withVm (VmContext prepared readPool control runtime output quits) Presentation (Just injection) $ \ui →
-                  ( do
-                      let peers =
-                            Peers
-                              { peHost = vulkan
-                              , peGraphics = graphics
-                              , peFacade = vmFacade ui
-                              , peOwner = vmOwner ui
-                              , pePrepared = prepared
-                              , peControl = control
-                              , peOut = out
-                              , peStops = stops
-                              , peFatals = fatals
-                              , peQuits = quits
-                              , peFrames = frames
-                              , peReading = reading
-                              , peCreationHold = creationHold
-                              , peReadHold = toHold
-                              , peReadsHeldNow = heldNow
-                              , peReadsEntered = entered
-                              , peReadsFinished = finished
-                              , peJobs = jobs
-                              , peAdmit = vmAdmit ui
-                              }
-                      scenario peers
-                    )
+              statusRef ← newTVarIO (pure (StatusSample False Nothing Nothing))
+              tickDuration ← either (\refused → ioError (userError ("the tick duration was refused: " <> show refused))) pure (durationFromNanoseconds RequirePositive 10000000)
+              let status = join (readTVar statusRef)
+              withOutput sink sink $ \output → do
+                let context = VmContext prepared readPool control runtime output quits status
+                -- The independent logical owner: its own VM, ticking on its own timer from the shipped manifest's
+                -- 10 ms, running the shipped gameplay behavior. It is admitted first and kept alive for the whole
+                -- scenario; the UI's status is read from its real instance, never fabricated.
+                withVm context Gameplay Nothing (Just tickDuration) $ \logical → do
+                  logicalInstance ← vmAdmit logical
+                  -- The session's own pacing driver is not part of the public composition, so the harness grants the
+                  -- logical owner exact manifest ticks itself, one after the previous is accounted for, paced by the
+                  -- system clock; the pump is owned here and ended and joined before the instance is stopped.
+                  value ← withTickPump control (vmOwner logical) tickDuration $
+                   withVm context Presentation (Just injection) Nothing $ \ui → do
+                    let roleSample endpoint identity = do
+                          found ← inspectInstance endpoint identity
+                          pure $ case snapshotPhase <$> found of
+                            Nothing → Nothing
+                            Just Initializing → Just (RoleSample False "starting" Nothing)
+                            Just Active → Just (RoleSample True "running" Nothing)
+                            Just Paused → Just (RoleSample True "running" Nothing)
+                            Just Stopping → Just (RoleSample True "stopping" Nothing)
+                            Just _ → Just (RoleSample True "retired" Nothing)
+                        presentationSample = do
+                          live ← scheduledStatus (vmOwner ui)
+                          pure $ case live of
+                            WorkerLive → Just (RoleSample True "running" Nothing)
+                            _ → Just (RoleSample True "retired" Nothing)
+                    atomically . writeTVar statusRef $ do
+                      gameplay ← roleSample (scheduledEndpoint (vmOwner logical)) (spInstance logicalInstance)
+                      presentation ← presentationSample
+                      stopping ← (>= 1) <$> readTVar stops
+                      pure (StatusSample stopping gameplay presentation)
+                    let peers =
+                          Peers
+                            { peHost = vulkan
+                            , peGraphics = graphics
+                            , peFacade = vmFacade ui
+                            , peOwner = vmOwner ui
+                            , pePrepared = prepared
+                            , peControl = control
+                            , peOut = out
+                            , peStops = stops
+                            , peFatals = fatals
+                            , peQuits = quits
+                            , peFrames = frames
+                            , peReading = reading
+                            , peCreationHold = creationHold
+                            , peReadHold = toHold
+                            , peReadsHeldNow = heldNow
+                            , peReadsEntered = entered
+                            , peReadsFinished = finished
+                            , peJobs = jobs
+                            , peAdmit = vmAdmit ui
+                            , peLogicalOwner = vmOwner logical
+                            , peLogical = logicalInstance
+                            }
                     -- However the scenario ended, every gate it closed is opened first: a held read or a withheld
                     -- creation is a handoff the unwinding below waits for.
-                    `finally` ( atomically (writeTVar creationHold noHold >> writeTVar toHold Map.empty >> writeTVar heldNow [])
-                                  `finally` writeIORef providerStep (pure ())
-                              )
+                    scenario peers
+                      `finally` ( atomically (writeTVar creationHold noHold >> writeTVar toHold Map.empty >> writeTVar heldNow [])
+                                    `finally` writeIORef providerStep (pure ())
+                                )
+                  -- The scenario returned and the pump has ended: the logical owner's instance retires in order, after
+                  -- every UI instance and window has gone, and says it stopped cleanly.
+                  requestInstanceControl (scheduledEndpoint (vmOwner logical)) (spInstance logicalInstance) InstanceStop >>= \case
+                    InstanceControlAccepted _ → pure ()
+                    other → ioError (userError ("the logical instance's stop was not accepted: " <> take 100 (show other)))
+                  cleanly ← instanceStoppedCleanly logicalInstance
+                  unless cleanly (ioError (userError "the logical instance did not retire as stopped"))
+                  pure value
   case prepared' of
     Left refused → ioError (userError ("the shipped content was not prepared: " <> show refused))
     Right value → pure value
@@ -463,6 +579,8 @@ data VmContext = VmContext
   , vcRuntime ∷ !LuaRuntime
   , vcOutput ∷ !Output
   , vcQuits ∷ !(TVar Int)
+  , vcStatus ∷ !(STM StatusSample)
+  -- ^ What the facade's status endpoint answers: derived from the real instances, never fixed.
   }
 
 -- | One role's VM: its facade, its scheduled owner and the way to admit an instance of the content's behavior.
@@ -474,8 +592,8 @@ data Vm = Vm
 
 -- | A VM for a role over the composition's pool: a module coordinator, the data service, a facade made with the
 -- injection's services (UI only), a supervised scheduled owner. Retired, and waited for, however the body ends.
-withVm ∷ ∀ a. VmContext → Role → Maybe GraphicsInjection → (Vm → IO a) → IO a
-withVm context role injection body = do
+withVm ∷ ∀ a. VmContext → Role → Maybe GraphicsInjection → Maybe Duration → (Vm → IO a) → IO a
+withVm context role injection tick body = do
   let prepared = vcPrepared context
       inventory = preparedInventory prepared
       contentId = preparedContentId prepared
@@ -508,10 +626,9 @@ withVm context role injection body = do
             , endpointClock = monotonicSource
             , endpointTick = join (readIORef holder)
             }
-        running = Just (RoleSample True "running" Nothing)
         session =
           SessionEndpoints
-            { endpointStatus = pure (StatusSample False running running)
+            { endpointStatus = vcStatus context
             , endpointQuit = atomically (modifyTVar' (vcQuits context) (+ 1))
             , endpointTerminal = \_ → pure False
             }
@@ -529,20 +646,20 @@ withVm context role injection body = do
           , fsPhase = phase
           , fsRoots = [contentId]
           , fsIds = ids
-          , fsTickDuration = Nothing
+          , fsTickDuration = tick
           , fsGraphics = services
           }
         >>= either (\refused → ioError (userError ("the facade was refused: " <> show refused))) pure
     let base = (vmProfileConfig LibraryProfileM1) {vmOwnerName = "native-milestone-" <> Text.pack (show role)}
     installed ← either (\refused → ioError (userError ("the facade was not installed: " <> show refused))) pure (installFacade facade [] [] base)
-    let instances = facadeInstanceConfig facade (defaultInstanceConfig {instanceBounds = InstanceBounds 8 16 8 8})
+    let instances = facadeInstanceConfig facade (defaultInstanceConfig {instanceBounds = InstanceBounds 8 16 8 8, instanceTickDuration = tick})
         owned =
           (scheduledSpec installed policy bounds)
             { scheduledInstances = Just instances
             , scheduledRequestHandles = Just handles
             , scheduledLending = gsLending <$> services
             , scheduledLeases = gsLeases <$> services
-            , scheduledRequests = Just (RequestGrant (facadeRequestEndpoints facade) 64 SettleOnArrival)
+            , scheduledRequests = Just (RequestGrant (facadeRequestEndpoints facade) 64 (if role == Gameplay then SettleAtAssignedTick Nothing else SettleOnArrival))
             , scheduledLoader = Just (coordinatorPlan coordinator)
             , scheduledClock = monotonicSource
             , scheduledTimer = systemTimerBackend
@@ -579,6 +696,16 @@ withVm context role injection body = do
         , boundControlRequests = 8
         , boundServiceBudget = Nothing
         }
+
+-- | Grant the logical owner exact ticks, one after the previous has been accounted for, paced by the system clock, for the
+-- length of the body. The thread is owned here: it is ended and joined on every way out, before the caller goes on.
+withTickPump ∷ RuntimeControl → ScheduledOwner → Duration → IO a → IO a
+withTickPump control owner tick body = do
+  done ← newEmptyMVar
+  thread ← forkIOWithUnmask $ \unmask →
+    unmask (forever (grantScheduledStep (scheduledEndpoint owner) tick >> awaitTicksComplete control owner >> threadDelay 10000))
+      `finally` putMVar done ()
+  body `finally` (killThread thread >> takeMVar done)
 
 -- | Ask the owner to retire and wait, under supervision, until it is no longer live.
 retireAndAwait ∷ RuntimeControl → ScheduledOwner → IO ()
@@ -674,6 +801,20 @@ verdictCleanOrFail = \case
   Just verdict → do
     let issues = verdictIssues verdict
     unless (null issues) $ ioError (userError ("the diagnostic capture was not clean: " <> show issues))
+
+-- | What a failed run's teardown left to say, from the exception the failure reached the caller as: nothing when the
+-- capture's verdict is attached and clean and no scope retained a cleanup failure or a finalization observation beside
+-- the failure. A failure with no verdict attached is reported too: the host's teardown must have spoken.
+teardownProblems ∷ ExceptionWithContext e → [String]
+teardownProblems (ExceptionWithContext context _) =
+  judgeTeardown (diagnosticVerdictInContext context) (length (cleanupFailuresInContext context)) (maybe False (const True) (finalizationEvidenceInContext context))
+
+-- | The judgement itself, over what the accessors found, so that it can be examined without a device.
+judgeTeardown ∷ Maybe DiagnosticVerdict → Int → Bool → [String]
+judgeTeardown verdict cleanupFailures finalizationObserved =
+  maybe ["no diagnostic verdict is attached to the failure: the host's teardown did not report"] (\attached → ["the attached verdict has an issue: " <> show issue | issue ← verdictIssues attached]) verdict
+    <> ["a cleanup failure was retained beside the failure (" <> show cleanupFailures <> ")" | cleanupFailures > 0]
+    <> ["the capture's finalization observed a cancellation or a group-closing failure beside the failure" | finalizationObserved]
 
 quietLogger ∷ Logger
 quietLogger = mkLogger defaultLogFilter {filterEnabled = False} (callbackSink (\_ → pure ()))

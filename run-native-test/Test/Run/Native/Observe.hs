@@ -28,6 +28,7 @@ module Test.Run.Native.Observe
   , attempted
   , demandFrame
   , awaitLiveTextures
+  , logicalAdvances
   , step
   , within
   , note
@@ -77,6 +78,8 @@ import Hetoimasia.GPU.Vulkan.GLFW
   )
 import Hetoimasia.LuaEngine.Graphics.Texture (BackendReading (..), TextureGraphics (..))
 import Hetoimasia.Runtime.GLFW (attachmentWindow, hostWindowClient, hostWindowIdentities)
+import Data.Word (Word64)
+import Hetoimasia.Scripting.Lua.Scheduled (scheduledEndpoint, scheduledTick)
 import Numeric.Natural (Natural)
 import Data.Time.Clock (getCurrentTime)
 import Data.Time.Format (defaultTimeLocale, formatTime)
@@ -225,6 +228,16 @@ awaitLiveTextures ∷ Peers → Int → IO ()
 awaitLiveTextures peers wanted = step (show wanted <> " live textures") . atomically $ do
   reading ← graphicsReading (peGraphics peers)
   unless (readingLiveTextures reading == wanted) retry
+
+-- | The independent logical owner is alive and ticking on its own clock: read its tick now, then wait (as an STM fact, not
+-- a sleep) until it has advanced by at least two more, and answer the tick it reached.
+logicalAdvances ∷ Peers → IO Word64
+logicalAdvances peers = do
+  let endpoint = scheduledEndpoint (peLogicalOwner peers)
+  now ← atomically (scheduledTick endpoint)
+  step ("the logical owner to advance from tick " <> show now) . atomically $ do
+    reached ← scheduledTick endpoint
+    if reached >= now + 2 then pure reached else retry
 
 -- | A timestamped line of progress on stderr, so a run that stops says where it stopped.
 note ∷ String → IO ()

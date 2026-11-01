@@ -15,11 +15,16 @@
 module Test.Run.Native.Milestone (spec) where
 
 import Control.Concurrent.STM (atomically, readTVar, readTVarIO, retry)
-import Control.Exception (onException, try)
+import Control.Concurrent (forkIO, myThreadId, throwTo)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.STM (newTVarIO)
+import Control.Exception (AsyncException (UserInterrupt), ExceptionWithContext (..), SomeException, finally, onException, try, tryWithContext)
 import Data.List (isInfixOf)
 import Test.HUnit.Lang (HUnitFailure (..))
 import Control.Monad (forM, forM_, unless)
 import Data.IORef (newIORef, readIORef, writeIORef)
+import qualified Data.Set as Set
+import System.Directory (doesDirectoryExist)
 import Data.Text (Text)
 import System.IO (hPutStrLn, stderr)
 import Data.ByteString (ByteString)
@@ -35,7 +40,10 @@ import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldNotBe
 import Test.Run.Native.Env (Env (..), evidence)
 import Test.Run.Native.Library (copyTree, shippedContent)
 import Hetoimasia.GLFW.Window (WindowId)
-import Test.Run.Native.Capture (Bound (..), bindNew, ownPid, snap, viewableNow)
+import Test.Run.Native.Capture (Bound (..), bindNew, ownPid, snap, snapAs, viewableNow)
+import Test.Run.Native.Json (Json (..))
+import Test.Run.Native.Landmarks (blackLandmarks)
+import Test.Run.Native.Lifecycle (awaitSettled, lifecycleRecord, outstanding, heldTextures, writeLifecycle, Obligations (..))
 import qualified Test.Run.Native.X11 as X11
 import Test.Run.Native.Checkpoint (checkpoint)
 import Test.Run.Native.Observe
@@ -54,20 +62,31 @@ spec env = describe "Lua native milestone" $ do
         note ("preflight: the helper answered " <> show (length none) <> " windows")
         none `shouldBe` []
         evidence env "X11 evidence helper: libX11 and every entry point loaded, the display is the isolated one, and the suite's process owned no window before the first case"
-  it "loads the same PNG for two instances independently, ends one while its accepted scene still holds its released texture, and keeps the other updating with its texture and window" $
+  it "loads the same PNG for two instances independently, ends one while its accepted scene still holds its released texture, and keeps the other updating with the same texture and window" $
     withinCase env 120 . withOwnedContent $ \folder →
       withPeers (envStart env) folder $ \peers → do
         -- A's window is created first and B's second: with creation outcomes withheld from the provider, each new
         -- native window is the only one that appeared since the instance was admitted, so it is that instance's.
-        (a, windowA, _boundA, b, windowB, boundB) ← startTwo env peers (\_ bound → snap env peers "two-instances--a-quad" bound)
+        heldAlone ← newIORef Set.empty
+        (a, windowA, _boundA, b, windowB, boundB) ← startTwo env peers $ \_ bound → do
+          snap env peers "two-instances--a-quad" bound
+          heldTextures peers >>= writeIORef heldAlone
         spIdentity a `shouldNotBe` spIdentity b
         spInstance a `shouldNotBe` spInstance b
         windowA `shouldNotBe` windowB
         awaitAdopted peers windowB 1
         snap env peers "two-instances--b-quad" boundB
         checkpoint env "two-instances-quads" "the owner confirms the textured quad is visible in both windows, the same picture in each" =<< factsFor peers [("A", windowA), ("B", windowB)]
-        -- Two textures were allocated, uploaded and registered: the same path was never coalesced.
+        -- Two textures were allocated, uploaded and registered: the same path was never coalesced. The ledger names them.
         awaitLiveTextures peers 2
+        idsA ← readIORef heldAlone
+        both ← heldTextures peers
+        Set.size idsA `shouldBe` 1
+        Set.size both `shouldBe` 2
+        (idsA `Set.isSubsetOf` both) `shouldBe` True
+        let idsB = both `Set.difference` idsA
+        -- The independent logical owner is alive and ticking on its own clock beside both.
+        ticksBefore ← logicalAdvances peers
         -- Ending A through its public lifecycle control closes only its window, and is never a user close.
         stopUi peers a
         awaitWindowCount peers 1
@@ -75,23 +94,52 @@ spec env = describe "Lua native milestone" $ do
         remaining `shouldBe` [windowB]
         atomically (readTVar (peStops peers)) >>= (`shouldBe` 0)
         readTVarIO (peFatals peers) >>= (`shouldBe` [])
-        -- B continues: another frame of what it holds, with the same revision, and nothing reloaded.
+        awaitLiveTextures peers 1
+        -- A's disposal followed what A asked of the GPU: every submission its frames made completed, every presentation
+        -- retired, read from the host's own events and not inferred from the count falling.
+        obligationsA ← awaitSettled peers windowA
+        outstanding obligationsA `shouldBe` ([], [])
+        null (obSubmitted obligationsA) `shouldBe` False
+        afterEnd ← heldTextures peers
+        afterEnd `shouldBe` idsB
+        -- B continues: another frame of what it holds, with the same revision, and nothing reloaded: the identity it
+        -- holds is the one it held with A beside it.
         mark ← frameMark peers
         demandFrame peers windowB
         awaitFrame peers windowB 1 mark
-        awaitLiveTextures peers 1
         publishedRevisionOf peers windowB >>= (`shouldBe` Just 1)
-        -- B's quad is still right on the display, and its texture was never reloaded (one live texture throughout).
+        afterFrame ← heldTextures peers
+        afterFrame `shouldBe` idsB
+        -- B's quad is still right on the display.
         snap env peers "two-instances--b-after-a-ended" boundB
         checkpoint env "peer-survival" "the owner confirms A's window is gone and B's window still shows the correct quad, never reloaded" =<< factsFor peers [("B", windowB)]
         stopUi peers b
         awaitWindowCount peers 0
         awaitLiveTextures peers 0
+        obligationsB ← awaitSettled peers windowB
+        outstanding obligationsB `shouldBe` ([], [])
+        heldEnd ← heldTextures peers
+        Set.null heldEnd `shouldBe` True
+        ticksAfter ← logicalAdvances peers
+        (ticksAfter > ticksBefore) `shouldBe` True
         -- Every cleanup close has happened by now: none of them was a user close.
         atomically (readTVar (peStops peers)) >>= (`shouldBe` 0)
         reading ← atomically (graphicsReading (peGraphics peers))
         readingLiveTextures reading `shouldBe` 0
-        evidence env (Text.pack ("two instances: instances " <> show (spIdentity a, spIdentity b) <> ", windows " <> show (windowA, windowB) <> "; ended A with B live; no user close; validation layer and synchronization validation enabled on this host"))
+        writeLifecycle env "two-instances"
+          [ ("instances", JArray [JString (spIdentity a), JString (spIdentity b)])
+          , ("windows", JArray [JString (Text.pack (show windowA)), JString (Text.pack (show windowB))])
+          , ("texture_identity_a", JArray (map (JNumber . fromIntegral) (Set.toList idsA)))
+          , ("texture_identity_b", JArray (map (JNumber . fromIntegral) (Set.toList idsB)))
+          , ("texture_identities_held_after_a_ended", JArray (map (JNumber . fromIntegral) (Set.toList afterEnd)))
+          , ("texture_identities_held_after_b_frame", JArray (map (JNumber . fromIntegral) (Set.toList afterFrame)))
+          , ("a_obligations_at_disposal", lifecycleRecord "A" obligationsA)
+          , ("b_obligations_at_end", lifecycleRecord "B" obligationsB)
+          , ("logical_owner_tick_while_both_live", JNumber (fromIntegral ticksBefore))
+          , ("logical_owner_tick_at_end", JNumber (fromIntegral ticksAfter))
+          , ("user_close_requests", JNumber 0)
+          ]
+        evidence env (Text.pack ("two instances: instances " <> show (spIdentity a, spIdentity b) <> ", windows " <> show (windowA, windowB) <> ", texture identities " <> show (Set.toList idsA, Set.toList idsB) <> "; ended A with B live: A's submissions and presentations had completed and retired at its disposal, B held the same identity throughout (nothing reloaded), the logical owner ticked from " <> show ticksBefore <> " to " <> show ticksAfter <> " and retired in order; no user close; validation layer and synchronization validation enabled on this host"))
 
   it "ends one instance while its texture read is held at the pool's reader: the peer keeps updating, the ended instance settles stopped only after the read returns and delivers nothing, and a later instance loads the same path" $
     withinCase env 120 . withOwnedContent $ \folder →
@@ -109,6 +157,9 @@ spec env = describe "Lua native milestone" $ do
         placeWindow env peers windowB 1
         awaitAdopted peers windowB 1
         atomically (readsHeld peers quadPath) >>= (`shouldBe` 1)
+        -- B's texture is the only identity any scene holds: A's read is still held, so A has no texture yet.
+        idsB0 ← heldTextures peers
+        Set.size idsB0 `shouldBe` 1
         -- A is ended with its read borrowed by a worker: it cannot settle until the read returns.
         stopUi peers a
         step "A's phase to become Stopping" . atomically $ instancePhaseOf peers a >>= \phase → unless (phase == Just Stopping) retry
@@ -124,6 +175,19 @@ spec env = describe "Lua native milestone" $ do
         forgetEnded peers a
         awaitWindowCount peers 1
         awaitLiveTextures peers 1
+        -- A's late result was discarded, never delivered to its ended Lua and never adopted: no new identity appeared, B's
+        -- is the one still held, and everything A asked of the GPU has finished.
+        obligationsAPending ← awaitSettled peers windowA
+        outstanding obligationsAPending `shouldBe` ([], [])
+        heldAfterRelease ← heldTextures peers
+        heldAfterRelease `shouldBe` idsB0
+        writeLifecycle env "pending-read"
+          [ ("ended_instance", JString (spIdentity a))
+          , ("peer_instance", JString (spIdentity b))
+          , ("peer_texture_identity", JArray (map (JNumber . fromIntegral) (Set.toList idsB0)))
+          , ("texture_identities_held_after_the_late_result", JArray (map (JNumber . fromIntegral) (Set.toList heldAfterRelease)))
+          , ("ended_window_obligations", lifecycleRecord "A" obligationsAPending)
+          ]
         readTVarIO (peFatals peers) >>= (`shouldBe` [])
         -- The reservation came back exactly: a later instance loads the same path and shows its quad.
         c ← admitUi peers
@@ -152,6 +216,7 @@ spec env = describe "Lua native milestone" $ do
         boundB ← bindNew env peers windowB (known0 <> map boundX (maybe [] pure boundA))
         placeWindow env peers windowB 1
         awaitAdopted peers windowB 1
+        idsBeforeEnd ← heldTextures peers
         atomically (creationsWithheld peers) >>= (`shouldBe` 1)
         stopUi peers a
         -- A's accepted window work is still pending: its native window is tracked until the provider collects the
@@ -166,6 +231,17 @@ spec env = describe "Lua native milestone" $ do
         instanceStoppedCleanly a >>= (`shouldBe` True)
         awaitWindowCount peers 1
         windowsNow peers >>= (`shouldBe` [windowB])
+        obligationsAWithheld ← awaitSettled peers windowA
+        outstanding obligationsAWithheld `shouldBe` ([], [])
+        heldAfterWindowRetired ← heldTextures peers
+        heldAfterWindowRetired `shouldBe` idsBeforeEnd
+        writeLifecycle env "pending-window"
+          [ ("ended_instance", JString (spIdentity a))
+          , ("peer_instance", JString (spIdentity b))
+          , ("texture_identities_before", JArray (map (JNumber . fromIntegral) (Set.toList idsBeforeEnd)))
+          , ("texture_identities_after_the_withheld_outcome_was_released", JArray (map (JNumber . fromIntegral) (Set.toList heldAfterWindowRetired)))
+          , ("ended_window_obligations", lifecycleRecord "A" obligationsAWithheld)
+          ]
         awaitLiveTextures peers 1
         readTVarIO (peFatals peers) >>= (`shouldBe` [])
         stopUi peers b
@@ -175,6 +251,54 @@ spec env = describe "Lua native milestone" $ do
         atomically (readTVar (peStops peers)) >>= (`shouldBe` 0)
         evidence env (Text.pack ("pending window: A=" <> show (spIdentity a) <> " ended while its creation outcome (window " <> show windowA <> ") was withheld; it stayed tracked until the outcome was released and then retired, B=" <> show (spIdentity b) <> " (window " <> show windowB <> ") unaffected, no user close"))
 
+
+  it "shows the initial empty window while its texture read is held, then the textured quad in the same window once the gate is released, with the instance never ended" $
+    withinCase env 120 . withOwnedContent $ \folder →
+      withPeers (envStart env) folder $ \peers → do
+        known0 ← viewableNow env
+        holdNextReads peers quadPath 1
+        withholdNextCreations peers 1
+        a ← admitUi peers
+        windowA ← awaitNewWindow peers []
+        boundA ← bindNew env peers windowA known0
+        releaseCreations peers
+        readsEntered peers quadPath 1
+        -- Initial output: the window is ready and the owner adopted its initial empty scene (revision 0) while the
+        -- instance's texture read is borrowed and held: nothing is published and no texture identity is held.
+        awaitAdopted peers windowA 0
+        atomically (readsHeld peers quadPath) >>= (`shouldBe` 1)
+        publishedRevisionOf peers windowA >>= (`shouldSatisfy` maybe True (< 1))
+        mark ← frameMark peers
+        demandFrame peers windowA
+        awaitFrame peers windowA 0 mark
+        initialHeld ← heldTextures peers
+        Set.null initialHeld `shouldBe` True
+        awaitLiveTextures peers 0
+        snapAs env peers "initial-empty--a-black" blackLandmarks boundA
+        -- The gate is released and the instance goes on: the same window is adopted with the textured scene.
+        releaseReadsOf peers quadPath
+        awaitAdopted peers windowA 1
+        windowsNow peers >>= (`shouldBe` [windowA])
+        atomically (instancePhaseOf peers a) >>= (`shouldBe` Just Active)
+        awaitLiveTextures peers 1
+        loadedHeld ← heldTextures peers
+        Set.size loadedHeld `shouldBe` 1
+        snap env peers "initial-empty--a-quad" boundA
+        stopUi peers a
+        awaitWindowCount peers 0
+        awaitLiveTextures peers 0
+        obligations ← awaitSettled peers windowA
+        outstanding obligations `shouldBe` ([], [])
+        atomically (readTVar (peStops peers)) >>= (`shouldBe` 0)
+        writeLifecycle env "initial-empty"
+          [ ("instance", JString (spIdentity a))
+          , ("window", JString (Text.pack (show windowA)))
+          , ("adopted_revision_while_the_read_was_held", JNumber 0)
+          , ("texture_identities_held_while_the_read_was_held", JArray [])
+          , ("texture_identity_after_release", JArray (map (JNumber . fromIntegral) (Set.toList loadedHeld)))
+          , ("window_obligations_at_end", lifecycleRecord "A" obligations)
+          ]
+        evidence env (Text.pack ("initial empty window: instance " <> show (spIdentity a) <> " window " <> show windowA <> " showed its initial empty scene (revision 0, no texture identity held) while its texture read was held at the pool's reader, then the same window adopted the textured scene (revision 1, texture identity " <> show (Set.toList loadedHeld) <> ") once the gate was released; the instance was never ended in between"))
 
   it "keeps an unchanged published scene while the window is made smaller, larger, minimized and restored, and records what the platform reported rather than what was requested" $
     withinCase env 120 . withOwnedContent $ \folder →
@@ -188,6 +312,7 @@ spec env = describe "Lua native milestone" $ do
         awaitAdopted peers windowA 1
         -- The subject is the only window until, if ever, a peer is needed to pace a native zero-area framebuffer.
         pacemaker ← newIORef Nothing
+        _ ← logicalAdvances peers
         initial ← windowMetrics peers windowA
         snap env peers "view--initial" boundA
         -- The scene is the one accepted publication, and nothing below republishes: its revision is the evidence.
@@ -276,11 +401,12 @@ spec env = describe "Lua native milestone" $ do
             <> (if zeroNative then "OBSERVED: drawing was suspended and resumed after restore" else "UNEXERCISED on this platform (the framebuffer was never reported with zero area): the controlled zero-metrics coverage is the owning prerequisites' (LFE-18, LFE-20 and the host's suspended-target cases), not claimed as native")
 
 
-  it "unwinds by itself, and raises its own failure unchanged, when the scenario fails with a read held, a creation withheld and a window live" $
+  it "unwinds by itself, and raises its own failure with a clean teardown attached, when the scenario fails with a read held, a creation withheld and a window live" $
     withinCase env 120 . withOwnedContent $ \folder → do
-      -- Only the scenario's own assertion failure is expected here, and it is matched by its type and its words: any
-      -- other exception, or a hang in the unwinding (a gate left closed), fails this example.
-      outcome ← try @HUnitFailure . withPeers (envStart env) folder $ \peers → do
+      -- Only the scenario's own assertion failure is expected, matched by its type and its words, and its context is kept: the
+      -- capture's verdict must be attached and clean and no scope may have retained a cleanup failure beside it. Any other
+      -- exception, a hang in the unwinding (a gate left closed) or a failed teardown fails this example.
+      outcome ← tryWithContext @HUnitFailure . withPeers (envStart env) folder $ \peers → do
         holdNextReads peers quadPath 1
         withholdNextCreations peers 1
         _ ← admitUi peers
@@ -288,10 +414,35 @@ spec env = describe "Lua native milestone" $ do
         readsEntered peers quadPath 1
         expectationFailure "the scenario failed on purpose"
       case outcome of
-        Left (HUnitFailure _ reason) → show reason `shouldSatisfy` isInfixOf "the scenario failed on purpose"
+        Left failure@(ExceptionWithContext _ (HUnitFailure _ reason)) → do
+          show reason `shouldSatisfy` isInfixOf "the scenario failed on purpose"
+          teardownProblems failure `shouldBe` []
         Right () → expectationFailure "the scenario's failure was swallowed"
-      evidence env "unwinding control: a scenario that failed while a read was held at the pool's reader, a window creation was withheld and a native window was live raised its own failure after the gates were released and the instance, window and texture were retired within the bound"
+      evidence env "unwinding control: a scenario that failed while a read was held at the pool's reader, a window creation was withheld and a native window was live raised its own failure after the gates were released and the instance, window and texture were retired within the bound, with the capture's diagnostic verdict attached and clean and no cleanup failure retained"
 
+  it "stops its scenario, releases its gates and waits for the retirement before it returns, when its caller is cancelled with a read held and a creation withheld" $
+    withinCase env 120 . withOwnedContent $ \folder → do
+      unwound ← newIORef False
+      held ← newEmptyMVar
+      never ← newTVarIO False
+      caller ← myThreadId
+      -- The cancellation is delivered once the gates are really held: an event, not a delay.
+      _ ← forkIO (takeMVar held >> throwTo caller UserInterrupt)
+      outcome ← try @SomeException . withPeers (envStart env) folder $ \peers → do
+        holdNextReads peers quadPath 1
+        withholdNextCreations peers 1
+        _ ← admitUi peers
+        _ ← awaitNewWindow peers []
+        readsEntered peers quadPath 1
+        putMVar held ()
+        -- Nothing ends this wait but the cancellation; the scenario's own scopes must release and retire on the way out.
+        (atomically (readTVar never >>= \set → unless set retry)) `finally` writeIORef unwound True
+      -- The call returned only after the application ended: the scenario's cleanup ran first, and the folder it borrowed is still here.
+      either (\failure → show failure) (const "no failure") outcome `shouldSatisfy` isInfixOf "user interrupt"
+      readIORef unwound >>= (`shouldBe` True)
+      doesDirectoryExist folder >>= (`shouldBe` True)
+      readTVarIO never >>= (`shouldBe` False)
+      evidence env "cancellation control: a caller cancelled while its scenario held a read at the pool's reader and a window creation outcome had the scenario stopped, its gates released and its instance, window and texture retired before the call returned, and the folder it borrowed was still there"
 
   it "answers an INJECTED clean refusal of one window's standing as that instance's required window failure, retires the window the host really made and the instance's texture, and leaves the live peer unaffected" $
     withinCase env 120 . withOwnedContent $ \folder →
@@ -300,9 +451,14 @@ spec env = describe "Lua native milestone" $ do
         b ← admitUi peers
         windowB ← awaitNewWindow peers []
         awaitAdopted peers windowB 1
+        -- A's creation outcome is withheld before A is admitted, so the real window it is given is observed and recorded
+        -- while it is held, and only then released to meet the refusal: the refusal cannot destroy it first.
+        withholdNextCreations peers 1
         refuseNextStandings peers 1
         a ← admitUi peers
         windowA ← awaitNewWindow peers [windowB]
+        windowsNow peers >>= (`shouldBe` [windowB, windowA])
+        releaseCreations peers
         failure ← instanceFailureText a
         failure `shouldSatisfy` maybe False (isInfixOf "window_error")
         -- The real native window the host made for A is closed and destroyed; A's texture request is retired with it.
@@ -328,6 +484,7 @@ spec env = describe "Lua native milestone" $ do
           (a, windowA, _boundA, b, windowB, boundB) ← startTwo env peers (\_ bound → snap env peers (Text.pack ("user-close-" <> show index <> "--a-quad")) bound)
           awaitAdopted peers windowB 1
           snap env peers (Text.pack ("user-close-" <> show index <> "--b-quad")) boundB
+          _ ← logicalAdvances peers
           let closed = [windowA, windowB] !! index
           atomically (readTVar (peStops peers)) >>= (`shouldBe` 0)
           answer ← onMain peers (requestNativeClose (vulkanWindowHost (peHost peers)) closed)

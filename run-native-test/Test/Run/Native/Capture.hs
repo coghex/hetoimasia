@@ -17,6 +17,7 @@ module Test.Run.Native.Capture
   , viewableNow
   , bindNew
   , snap
+  , snapAs
   , snapWith
   , bindChild
   , ownPid
@@ -24,7 +25,7 @@ module Test.Run.Native.Capture
   ) where
 
 import Control.Concurrent (threadDelay)
-import Control.Exception (try)
+import Control.Exception (onException, try)
 import Control.Monad (forM_, unless, when)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Text as Text
@@ -106,15 +107,19 @@ bindChild env pid = case envX11 env of
       Left several → expectationFailure ("the command (pid " <> show pid <> ") owns several viewable windows: " <> show (map candWindow several)) >> pure Nothing
       Right one → pure (Just (Bound helper pid Nothing (candWindow one)))
 
--- | Capture a harness window and require the quad scene's landmarks: 'snapWith' with the host's own metrics beside it.
+-- | Capture a harness window and require the quad scene's landmarks: 'snapAs' with them.
 snap ∷ Env → Peers → Text → Maybe Bound → IO ()
-snap _ _ _ Nothing = pure ()
-snap env peers name (Just bound) = do
+snap env peers name = snapAs env peers name quadLandmarks
+
+-- | Capture a harness window and require these landmarks, with the host's own metrics beside the capture.
+snapAs ∷ Env → Peers → Text → ((Int, Int) → [Landmark]) → Maybe Bound → IO ()
+snapAs _ _ _ _ Nothing = pure ()
+snapAs env peers name landmarks (Just bound) = do
   metrics ← traverse (windowMetrics peers) (boundWindow bound)
   -- Each attempt first asks the window's target for another frame of what it holds (the public client demand the cases
   -- already use; no scene is published): a window the X server cleared when it was unmapped, an iconify and restore, is
   -- repainted only by a frame presented once it is mapped again.
-  snapWith env name bound quadLandmarks metrics (forM_ (boundWindow bound) (demandFrame peers))
+  snapWith env name bound landmarks metrics (forM_ (boundWindow bound) (demandFrame peers))
 
 -- | Capture the bound window's client area, require every landmark, retain the capture and its record under the given
 -- name, and say what was presented. The client area is whatever the X server reports now and the landmarks follow its
@@ -139,7 +144,10 @@ snapWith env name bound landmarksFor metrics beforeAttempt = do
             if n >= attemptsAllowed
               then pure (n, shot, judged, False)
               else threadDelay 250000 >> loop (n + 1) [stage n]
-  outcome ← timeout (25 * 1000000) (loop 1 [])
+  -- However the loop ends (its bound, a failure, a cancellation), no attempt file or half-written one is left in the retained
+  -- evidence: the final file is the only survivor, and it is made below, after the loop.
+  let leftovers = concat [[stage k, stage k <> ".partial"] | k ← [1 .. attemptsAllowed]]
+  outcome ← timeout (25 * 1000000) (loop 1 []) `onException` mapM_ removeIfPresent leftovers
   (attempts, shot, judged, passed) ← case outcome of
     Just done → pure done
     Nothing → expectationFailure ("the capture " <> Text.unpack name <> " never showed the scene's landmarks within 40 seconds") >> error "unreachable"
