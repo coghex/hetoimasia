@@ -11,7 +11,7 @@
 -- Nothing here creates a Vulkan object, and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.WindowDepth (spec) where
 
-import Control.Concurrent (forkIO, killThread, myThreadId)
+import Control.Concurrent (killThread, myThreadId)
 import Control.Concurrent.MVar (putMVar, newEmptyMVar, takeMVar)
 import Control.Concurrent.STM (atomically, check, newTVarIO, readTVar)
 import qualified Data.ByteString as ByteString
@@ -22,6 +22,7 @@ import Data.Maybe (isJust)
 import Data.Text (Text)
 import Data.Word (Word32, Word64)
 import Numeric.Natural (Natural)
+import Test.Support.Owned (withOwnedThread)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 
 import Hetoimasia.GPU.Model (DeviceLossRelease (..), SessionFailureCause (CleanupFailed), SessionState (..), TargetPhase (..), TargetView (..), closeTarget, sessionState, usage, usageObjects)
@@ -371,30 +372,30 @@ spec = describe "Windowed depth (GRS-13)" $ do
       -- which blocks interruptibly: whether it made the view is unknown.
       onceAt (rigRecordingStandIn rig) AtCreateView (putMVar began () >> atomically (readTVar gate >>= check))
       owner ← myThreadId
-      _ ← forkIO (takeMVar began >> killThread owner)
-      outcome ← try @SomeException (stepAt rig 0 640 480)
-      either (\failure → fromException failure `shouldBe` Just ThreadKilled) (const (expectationFailure "the step was not cancelled")) outcome
-      [generation] ← viewGenerations <$> generationsOf rig
-      viewStanding generation `shouldSatisfy` \case
-        GenerationUncertain _ → True
-        _ → False
-      sessionState <$> modelOf rig `shouldReturn` SessionFailed CleanupFailed
-      viewAdmitting <$> atomically (readRootsView (rigRoots rig)) `shouldReturn` False
-      -- Nothing of it is destroyed or retried, and its teardown is refused.
-      stepAt rig 1 640 480
-      stepAt rig 200 640 480
-      recorded ← Roots'.calls (rigRootsStandIn rig)
-      [() | Roots'.DestroyedSwapchain _ ← recorded] `shouldBe` []
-      [() | Roots'.DestroyedView _ ← recorded] `shouldBe` []
-      length [() | Roots'.CreatedSwapchain {} ← recorded] `shouldBe` 1
-      -- Nor is the depth image, whose view's outcome is unknown, destroyed or
-      -- its allocation freed — at the cancellation or by any teardown.
-      allocated ← allocatorCalls (standAllocator (rigRootsStandIn rig))
-      length [() | MadeImage {} ← allocated] `shouldBe` 1
-      [() | DestroyedImage _ ← allocated] `shouldBe` []
-      [() | FreedAllocation _ ← allocated] `shouldBe` []
-      depthManaged rig `shouldReturn` []
-      retireTargetGenerations (rigGenerations rig) (at 300) (rigTarget rig) `raises` \(GenerationsRetained _ remaining) → remaining == [viewGeneration generation]
+      withOwnedThread (takeMVar began >> killThread owner) $ \_ _ → do
+        outcome ← try @SomeException (stepAt rig 0 640 480)
+        either (\failure → fromException failure `shouldBe` Just ThreadKilled) (const (expectationFailure "the step was not cancelled")) outcome
+        [generation] ← viewGenerations <$> generationsOf rig
+        viewStanding generation `shouldSatisfy` \case
+          GenerationUncertain _ → True
+          _ → False
+        sessionState <$> modelOf rig `shouldReturn` SessionFailed CleanupFailed
+        viewAdmitting <$> atomically (readRootsView (rigRoots rig)) `shouldReturn` False
+        -- Nothing of it is destroyed or retried, and its teardown is refused.
+        stepAt rig 1 640 480
+        stepAt rig 200 640 480
+        recorded ← Roots'.calls (rigRootsStandIn rig)
+        [() | Roots'.DestroyedSwapchain _ ← recorded] `shouldBe` []
+        [() | Roots'.DestroyedView _ ← recorded] `shouldBe` []
+        length [() | Roots'.CreatedSwapchain {} ← recorded] `shouldBe` 1
+        -- Nor is the depth image, whose view's outcome is unknown, destroyed or
+        -- its allocation freed — at the cancellation or by any teardown.
+        allocated ← allocatorCalls (standAllocator (rigRootsStandIn rig))
+        length [() | MadeImage {} ← allocated] `shouldBe` 1
+        [() | DestroyedImage _ ← allocated] `shouldBe` []
+        [() | FreedAllocation _ ← allocated] `shouldBe` []
+        depthManaged rig `shouldReturn` []
+        retireTargetGenerations (rigGenerations rig) (at 300) (rigTarget rig) `raises` \(GenerationsRetained _ remaining) → remaining == [viewGeneration generation]
 
     it "releases the depth of a candidate the close superseded after the depth was made, and never publishes it" $ do
       rig ← newRigWindowDepth WindowedDepthPending

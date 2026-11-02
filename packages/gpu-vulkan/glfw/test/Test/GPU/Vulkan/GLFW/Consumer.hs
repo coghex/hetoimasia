@@ -14,7 +14,6 @@
 -- rounds that asked a fence and were answered no.
 module Test.GPU.Vulkan.GLFW.Consumer (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, writeTVar)
 import Control.Exception (Exception (..), SomeException, throwIO, toException)
 import Control.Monad (void)
@@ -903,7 +902,15 @@ testCaptureTerminal = do
   presentationsRetire rig False
   controller ← newIORef Nothing
   ticketHeld ← newIORef Nothing
-  outcome ← runRigCaught rig $ \host control → do
+  outcome ←
+    withRunHelper
+      (pure ())
+      ( \host → do
+          atomically (readOwnerStatusNow (vulkanGraphicsOwner host) >>= check . (== OwnerRetiring) . statusPhase)
+          submissionsComplete rig True
+          presentationsRetire rig True
+      )
+      $ \supply → runRigCaught rig $ \host control → do
     _ ← superviseGraphicsOwner control (vulkanGraphicsOwner host)
     [window] ← windowsOf host
     service ← handedOver host window RequiredTarget
@@ -915,10 +922,7 @@ testCaptureTerminal = do
     -- The batch completes only once the owner's run has failed and its drain
     -- has begun: its bytes are then exposed by the evidence, and must still
     -- not be delivered.
-    _ ← forkIO $ do
-      atomically (readOwnerStatusNow (vulkanGraphicsOwner host) >>= check . (== OwnerRetiring) . statusPhase)
-      submissionsComplete rig True
-      presentationsRetire rig True
+    supply host
     reportErrorNow rig "an error while the captured frame's batch is in flight"
     demandFrame host window
     untilOwnerFailed rig host control

@@ -140,6 +140,13 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , creationsBegun
   , runRig
   , runRigCaught
+  , withRunHelper
+  , onOtherThread
+  , ProceedGate
+  , newProceedGate
+  , allowOne
+  , openProceed
+  , awaitProceed
   , quietLogger
   , pumpUntil
   , handedOver
@@ -148,7 +155,8 @@ module Test.GPU.Vulkan.GLFW.StandIn
   , awaitTerminal
   ) where
 
-import Control.Concurrent (ThreadId, forkIO, myThreadId, throwTo, yield)
+import Control.Concurrent (ThreadId, myThreadId, throwTo, yield)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
 import Control.Concurrent.STM
   ( STM
@@ -165,8 +173,8 @@ import Control.Concurrent.STM
   , stateTVar
   , writeTVar
   )
-import Control.Exception (ErrorCall (ErrorCall), Exception, ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, fromException, mask, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
-import Control.Monad (void, when)
+import Control.Exception (ErrorCall (ErrorCall), Exception, ExceptionWithContext (ExceptionWithContext), SomeAsyncException, SomeException, bracket_, fromException, mask, rethrowIO, throwIO, try, tryWithContext, uninterruptibleMask_)
+import Control.Monad (forever, void, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -318,6 +326,7 @@ import Hetoimasia.Runtime.GLFW
 import Hetoimasia.Runtime.Logging (withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import Test.GPU.Vulkan.GLFW.Bound (BoundScope, boundRescuing, currentBound, isBoundExpiry, withBoundThread)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 -- ---------------------------------------------------------------------------
 -- The journal
@@ -966,6 +975,14 @@ data Rendering = Rendering
     -- ^ When set, how many more submission fences may answer signalled, whatever
     -- 'submissionsComplete' says: how an example completes one submission and
     -- leaves another pending.
+  , renderingThrowRequests ∷ !(TVar [ThreadId])
+    -- ^ The threads a cancellation is to be thrown at, oldest first: the run's canceller takes them one at a time.
+  , renderingThrowsAsked ∷ !(TVar Int)
+    -- ^ How many cancellations have been asked for.
+  , renderingThrowsDelivered ∷ !(TVar Int)
+    -- ^ How many the canceller has delivered.
+  , renderingCanceller ∷ !(TVar (Maybe ThreadId))
+    -- ^ The thread of the run now under way that throws them, owned by the run.
   }
 
 -- | Where a rig cancels the graphics owner.
@@ -990,15 +1007,87 @@ cancelAt rendering point = do
 cancelOwnerNow ∷ Rendering → IO ()
 cancelOwnerNow rendering = do
   owner ← myThreadId
-  thrower ← forkIO (throwTo owner (ErrorCall "the owner was cancelled"))
+  -- The cancellation is thrown by the run's canceller ('withCanceller'), not by a thread started here: this runs inside a
+  -- masked step of the owner, which the thrower outlives, so a scope that joined it here would wait for a delivery the
+  -- owner cannot take until the scope returns.
+  (asked, thrower) ← atomically $ do
+    modifyTVar' (renderingThrowRequests rendering) (<> [owner])
+    count ← readTVar (renderingThrowsAsked rendering)
+    writeTVar (renderingThrowsAsked rendering) (count + 1)
+    thrower ← readTVar (renderingCanceller rendering) >>= maybe retry pure
+    pure (count, thrower)
   atomically (writeTVar (renderingCancelled rendering) True)
   let settled =
         threadStatus thrower >>= \case
           ThreadBlocked BlockedOnException → pure ()
           ThreadFinished → pure ()
           ThreadDied → pure ()
-          _ → yield >> settled
+          _ →
+            readTVarIO (renderingThrowsDelivered rendering) >>= \delivered →
+              if delivered > asked then pure () else yield >> settled
   settled
+
+-- | The thread that throws the run's cancellations ('cancelOwnerNow'), owned by the run: it is started before anything the
+-- run does can ask for one and is stopped and joined after the run's exit, when nothing can be waiting on a delivery.
+withCanceller ∷ Rendering → IO a → IO a
+withCanceller rendering run =
+  withOwnedThread cancellations $ \thread _ →
+    bracket_
+      (atomically (writeTVar (renderingCanceller rendering) (Just thread)))
+      (atomically (writeTVar (renderingCanceller rendering) Nothing))
+      run
+  where
+    cancellations = forever $ do
+      target ← atomically $ readTVar (renderingThrowRequests rendering) >>= \case
+        [] → retry
+        next : rest → next <$ writeTVar (renderingThrowRequests rendering) rest
+      throwTo target (ErrorCall "the owner was cancelled")
+      atomically (modifyTVar' (renderingThrowsDelivered rendering) (+ 1))
+
+-- | The hold a hook waits at until the example lets it go. The example lets one hook go with 'allowOne', and its scope lets
+-- every hook go, now and from then on, with 'openProceed': a hook held where nothing can interrupt it (a scene transition
+-- runs uninterruptibly) is let go by the release of the scope that owns the thread running it, before that thread is
+-- stopped and joined, however many hooks it still has to run.
+data ProceedGate = ProceedGate !(TVar Int) !(TVar Bool)
+
+newProceedGate ∷ IO ProceedGate
+newProceedGate = ProceedGate <$> newTVarIO 0 <*> newTVarIO False
+
+-- | Let one hook go: the one waiting, or the next to arrive.
+allowOne ∷ ProceedGate → IO ()
+allowOne (ProceedGate permits _) = atomically (modifyTVar' permits (+ 1))
+
+-- | Let every hook go, now and from then on. It does not block and is safe to run twice.
+openProceed ∷ ProceedGate → IO ()
+openProceed (ProceedGate _ opened) = atomically (writeTVar opened True)
+
+-- | The hook's wait: until it is allowed, or the gate is opened.
+awaitProceed ∷ ProceedGate → IO ()
+awaitProceed (ProceedGate permits opened) = atomically $
+  readTVar opened >>= \case
+    True → pure ()
+    False → do
+      available ← readTVar permits
+      check (available > 0)
+      writeTVar permits (available - 1)
+
+-- | Run the action on a thread of its own, wait for its answer, and answer it; the thread has ended, and been joined, when
+-- this returns, however the wait ended.
+onOtherThread ∷ IO a → IO a
+onOtherThread action = do
+  answer ← newEmptyMVar
+  withOwnedThread (action >>= putMVar answer) (\_ _ → takeMVar answer)
+
+-- | Run a helper beside a run, for the length of the whole run and its exit: the helper waits for what the run's body hands
+-- it, then acts. Where a helper supplies evidence, a hold's release or a cancellation that the run's exit needs, its scope
+-- must enclose the exit, so it cannot be started and joined inside the body; it is started here, before the run, and
+-- parked until the body hands it what it needs, and ended and joined after the exit however the run ended. The opening, if
+-- any, is run first by the release (it must not block and must be safe to run twice), for a helper held at a gate.
+withRunHelper ∷ IO () → (a → IO ()) → ((a → IO ()) → IO r) → IO r
+withRunHelper open act body = do
+  cell ← newTVarIO Nothing
+  withOwnedThreadOpening open (atomically (readTVar cell >>= maybe retry pure) >>= act) $ \_ _ →
+    body (atomically . writeTVar cell . Just)
 
 -- | A managed object the recording's layer creates, or the recording's layer
 -- itself, made from the session's physical device when the recording is first
@@ -1039,6 +1128,10 @@ newRendering =
     <*> newTVarIO False
     <*> newTVarIO Nothing
     <*> newTVarIO False
+    <*> newTVarIO Nothing
+    <*> newTVarIO []
+    <*> newTVarIO 0
+    <*> newTVarIO 0
     <*> newTVarIO Nothing
 
 -- | Whether a submission's fence answers signalled when it is next asked.
@@ -1858,7 +1951,10 @@ runRigCaught ∷ Rig → (VulkanHost Scene → RuntimeControl → IO a) → IO (
 runRigCaught rig body = asProcessMainThread (rigSeam rig) (try (runRigHere rig body))
 
 runRigHere ∷ Rig → (VulkanHost Scene → RuntimeControl → IO a) → IO a
-runRigHere rig body = myThreadId >>= \self → withBoundThread (rigBound rig) self $ do
+runRigHere rig body = withCanceller (rigRendering rig) (runRigOwned rig body)
+
+runRigOwned ∷ Rig → (VulkanHost Scene → RuntimeControl → IO a) → IO a
+runRigOwned rig body = myThreadId >>= \self → withBoundThread (rigBound rig) self $ do
   integration ← seamIntegration (rigSeam rig) defaultIntegrationScript
   scene ← prepare 0
   budgets ← either (throwIO . StandInFailure . Text.pack . show) pure (validateBudgets (rigBudgets rig))

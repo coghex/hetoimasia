@@ -14,8 +14,9 @@
 -- Nothing here creates a Vulkan object.
 module Test.GPU.Vulkan.Native.Table (spec) where
 
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
-import Control.Concurrent (forkIO, killThread, myThreadId)
+import Control.Concurrent (killThread, myThreadId)
 import Control.Exception (AsyncException (ThreadKilled), ErrorCall (..), SomeException, fromException, throwIO, try)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Control.Monad (when)
@@ -28,6 +29,7 @@ import Numeric.Natural (Natural)
 import Vulkan.Core10 (PhysicalDeviceLimits (..))
 import Vulkan.Core12 (PhysicalDeviceVulkan12Properties (..))
 import Vulkan.Zero (zero)
+import Test.Support.Owned (withOwnedThread)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 
 import Hetoimasia.GPU.Model.Access (ResourceKind (InstanceResource))
@@ -1363,19 +1365,19 @@ spec = describe "Texture table" $ do
       owner ← myThreadId
       -- Aimed at the owner from inside the first sampler's creation, which
       -- runs masked: it can be delivered only once that creation returns.
-      onceAt (rigRecordingStandIn rig) AtCreateSampler $ do
-        killer ← forkIO (killThread owner)
-        awaitThrowing killer
-      outcome ← try @SomeException (createTextureTable (rigRecording rig) uploads (tableConfig 16 4 2))
-      fmap (const ()) outcome `shouldSatisfy` either ((== Just ThreadKilled) . fromException) (const False)
-      published ← atomically (readTable (rigRecording rig))
-      standings ← samplerStandings rig
-      calls ← recordingCalls (rigRecordingStandIn rig)
-      length [() | CreatedSampler {} ← calls] `shouldSatisfy` (>= 1)
-      length standings `shouldBe` length [() | CreatedSampler {} ← calls]
-      case published of
-        Nothing → standings `shouldSatisfy` all (== ManagedReleased)
-        Just _ → standings `shouldSatisfy` all (== ManagedLive)
+      armed ← newEmptyMVar
+      withOwnedThread (takeMVar armed >> killThread owner) $ \killer _ → do
+        onceAt (rigRecordingStandIn rig) AtCreateSampler (putMVar armed () >> awaitThrowing killer)
+        outcome ← try @SomeException (createTextureTable (rigRecording rig) uploads (tableConfig 16 4 2))
+        fmap (const ()) outcome `shouldSatisfy` either ((== Just ThreadKilled) . fromException) (const False)
+        published ← atomically (readTable (rigRecording rig))
+        standings ← samplerStandings rig
+        calls ← recordingCalls (rigRecordingStandIn rig)
+        length [() | CreatedSampler {} ← calls] `shouldSatisfy` (>= 1)
+        length standings `shouldBe` length [() | CreatedSampler {} ← calls]
+        case published of
+          Nothing → standings `shouldSatisfy` all (== ManagedReleased)
+          Just _ → standings `shouldSatisfy` all (== ManagedLive)
 
     it "never strands a reclaimed image when a cancellation arrives during the refresh that reclaims it: it is released, or still retiring for the next refresh" $ do
       (rig, uploads, kit) ← tableRig 4 2
@@ -1391,19 +1393,19 @@ spec = describe "Texture table" $ do
       _ ← registered rig second
       settle rig uploads
       owner ← myThreadId
-      onceAt (rigRecordingStandIn rig) AtWriteDescriptors $ do
-        killer ← forkIO (killThread owner)
-        awaitThrowing killer
-      outcome ← try @SomeException (refreshTextureTable (rigRecording rig))
-      fmap (const ()) outcome `shouldSatisfy` either ((== Just ThreadKilled) . fromException) (const False)
-      Just view ← atomically (readTable (rigRecording rig))
-      standing rig first >>= \case
-        Just ManagedReleased → tableViewRetiring view `shouldBe` []
-        _ → tableViewRetiring view `shouldBe` [1]
-      -- Either way the next refresh leaves nothing stranded.
-      ok (refreshTextureTable (rigRecording rig))
-      standing rig first `shouldReturn` Just ManagedReleased
-      clean rig
+      armed ← newEmptyMVar
+      withOwnedThread (takeMVar armed >> killThread owner) $ \killer _ → do
+        onceAt (rigRecordingStandIn rig) AtWriteDescriptors (putMVar armed () >> awaitThrowing killer)
+        outcome ← try @SomeException (refreshTextureTable (rigRecording rig))
+        fmap (const ()) outcome `shouldSatisfy` either ((== Just ThreadKilled) . fromException) (const False)
+        Just view ← atomically (readTable (rigRecording rig))
+        standing rig first >>= \case
+          Just ManagedReleased → tableViewRetiring view `shouldBe` []
+          _ → tableViewRetiring view `shouldBe` [1]
+        -- Either way the next refresh leaves nothing stranded.
+        ok (refreshTextureTable (rigRecording rig))
+        standing rig first `shouldReturn` Just ManagedReleased
+        clean rig
 
   describe "handles" $ do
     it "undoes a registration whose refresh raises or is cancelled before its handle is handed out, into a slot an earlier, bound and released texture left: nothing stays registered, and registering again succeeds" $ do
@@ -1433,17 +1435,17 @@ spec = describe "Texture table" $ do
       succeedAt standIn AtWriteDescriptors
       -- A cancellation aimed at the owner from inside that write.
       owner ← myThreadId
-      onceAt standIn AtWriteDescriptors $ do
-        killer ← forkIO (killThread owner)
-        awaitThrowing killer
-      interrupted ← try @SomeException (registerTexture (rigRecording rig) texture)
-      fmap (const ()) interrupted `shouldSatisfy` either ((== Just ThreadKilled) . fromException) (const False)
-      unregistered
-      -- The caller still owns the image, and registers it again.
-      handle ← registered rig texture
-      Just view ← atomically (readTable (rigRecording rig))
-      resolveHandle 4 (tableViewMapping view) handle `shouldSatisfy` (/= 0)
-      clean rig
+      armed ← newEmptyMVar
+      withOwnedThread (takeMVar armed >> killThread owner) $ \killer _ → do
+        onceAt standIn AtWriteDescriptors (putMVar armed () >> awaitThrowing killer)
+        interrupted ← try @SomeException (registerTexture (rigRecording rig) texture)
+        fmap (const ()) interrupted `shouldSatisfy` either ((== Just ThreadKilled) . fromException) (const False)
+        unregistered
+        -- The caller still owns the image, and registers it again.
+        handle ← registered rig texture
+        Just view ← atomically (readTable (rigRecording rig))
+        resolveHandle 4 (tableViewMapping view) handle `shouldSatisfy` (/= 0)
+        clean rig
 
     it "refuses a released handle wherever it is used, and issues its index again only under a new generation" $ do
       (rig, uploads, _) ← tableRig 4 2

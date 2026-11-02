@@ -14,12 +14,11 @@
 -- and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.Frames (spec) where
 
-import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (ErrorCall (ErrorCall), throwIO, try)
 import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.List.NonEmpty (NonEmpty ((:|)))
+import Test.GPU.Vulkan.Native.Threads (onOtherThread)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 
 import Hetoimasia.GPU.Model
@@ -129,9 +128,7 @@ spec = describe "Frames" $ do
       rig ← newRig
       other ← newRig
       tryAcquireFrame (rigFrames rig) (rigTarget other) `shouldReturn` Left (RefusedMisuse (ForeignIdentity TargetIdentity))
-      done ← newEmptyMVar
-      _ ← forkIO (tryAcquireFrame (rigFrames rig) (rigTarget rig) >>= putMVar done)
-      takeMVar done `shouldReturn` Left RefusedNotOwner
+      onOtherThread (tryAcquireFrame (rigFrames rig) (rigTarget rig)) `shouldReturn` Left RefusedNotOwner
       frameCalls (rigStandIn rig) `shouldReturn` []
       clean rig
 

@@ -106,7 +106,9 @@ test-suite integration-tests
         Test.GPU.Vulkan.GLFW.Rescue
         Test.GPU.Vulkan.GLFW.Scenes
         Test.GPU.Vulkan.GLFW.StandIn
+        Test.GPU.Vulkan.GLFW.OwnedThreads
         Test.GPU.Vulkan.GLFW.Targets
+        Test.GPU.Vulkan.GLFW.Unowned
     ghc-options: -threaded -rtsopts
     build-depends:
         base >=4.22 && <4.23,
@@ -125,6 +127,7 @@ test-suite integration-tests
         hetoimasia-gpu-vulkan-model ==0.1.0.0,
         hetoimasia-gpu-vulkan-native ==0.1.0.0,
         hetoimasia-gpu-vulkan-glfw:controller,
+        hetoimasia-test-support ==0.1.0.0,
         bytestring >=0.12 && <0.13,
         vector >=0.13 && <0.14,
         vulkan >=3.27 && <3.28

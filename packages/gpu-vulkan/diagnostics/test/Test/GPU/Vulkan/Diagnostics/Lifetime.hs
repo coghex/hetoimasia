@@ -10,7 +10,7 @@
 -- sees delivered came from an explicit wake-up or from the final drain.
 module Test.GPU.Vulkan.Diagnostics.Lifetime (spec) where
 
-import Control.Concurrent (forkIO, killThread, throwTo, yield)
+import Control.Concurrent (killThread, throwTo, yield)
 import Control.Monad (forM_, replicateM_, when)
 import Data.Word (Word64)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
@@ -28,10 +28,13 @@ import Control.Exception
   , try
   )
 import Control.Exception.Context (getExceptionAnnotations)
+import Data.Foldable (for_)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isNothing)
 import qualified Data.Text as Text
+import Test.GPU.Vulkan.Diagnostics.Unowned
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 import Test.Hspec
   ( Spec
   , describe
@@ -479,30 +482,31 @@ spec = describe "Lifetime" $ do
       (logger, recorded) ← gatedLogger gate
       handle ← newEmptyMVar
       done ← newEmptyMVar
-      _ ← forkIO $ do
-        result ←
-          try @SomeException $
-            withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → quiescent capture =<< do
-              putMVar handle capture
-              offerTo capture (plainOffer SeverityInfo "blocked")
-        putMVar done result
-      capture ← readMVar handle
-      awaitEntered gate 1
-      awaitPhase capture PhaseClosed
-      -- The worker is inside the sink; nothing after its join can have run.
-      atomically (capturePhase capture) `shouldReturn` PhaseClosed
-      countAdmitted . statusCounters <$> captureStatus capture `shouldReturn` 1
-      -- A report arriving now is after admission closed. It is still
-      -- counted, because the storage is still there to count it in.
-      offerTo capture (plainOffer SeverityWarning "after admission closed")
-      openGate gate
-      result ← bounded (readMVar done)
-      atomically (capturePhase capture) `shouldReturn` PhaseReleased
-      length <$> recordedEntries recorded `shouldReturn` 1
-      case result of
-        Left failure → expectationFailure ("the lifetime failed: " <> show failure)
-        Right ((), verdict) →
-          verdictIssues verdict `shouldBe` [CaptureFailureLatched, CaptureFailures 1]
+      let worker = do
+            result ←
+              try @SomeException $
+                withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → quiescent capture =<< do
+                  putMVar handle capture
+                  offerTo capture (plainOffer SeverityInfo "blocked")
+            putMVar done result
+      withOwnedThreadOpening (openGate gate) worker $ \_ _ → do
+        capture ← readMVar handle
+        awaitEntered gate 1
+        awaitPhase capture PhaseClosed
+        -- The worker is inside the sink; nothing after its join can have run.
+        atomically (capturePhase capture) `shouldReturn` PhaseClosed
+        countAdmitted . statusCounters <$> captureStatus capture `shouldReturn` 1
+        -- A report arriving now is after admission closed. It is still
+        -- counted, because the storage is still there to count it in.
+        offerTo capture (plainOffer SeverityWarning "after admission closed")
+        openGate gate
+        result ← bounded (readMVar done)
+        atomically (capturePhase capture) `shouldReturn` PhaseReleased
+        length <$> recordedEntries recorded `shouldReturn` 1
+        case result of
+          Left failure → expectationFailure ("the lifetime failed: " <> show failure)
+          Right ((), verdict) →
+            verdictIssues verdict `shouldBe` [CaptureFailureLatched, CaptureFailures 1]
 
     it "answers its status from a snapshot once the storage is released" $ do
       (logger, _) ← recordingLogger everythingFilter
@@ -525,75 +529,77 @@ spec = describe "Lifetime" $ do
       (logger, _) ← gatedLogger gate
       handle ← newEmptyMVar
       done ← newEmptyMVar
-      thread ← forkIO $ do
-        result ←
-          try @SomeException $
-            withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → quiescent capture =<< do
-              putMVar handle capture
-              offerTo capture (plainOffer SeverityInfo "never delivered")
-              offerTo capture (plainOffer SeverityInfo "queued behind it")
-        putMVar done result
-      capture ← readMVar handle
-      awaitEntered gate 1
-      awaitPhase capture PhaseClosed
-      killThread thread
-      result ← bounded (readMVar done)
-      atomically (capturePhase capture) `shouldReturn` PhaseReleased
-      case result of
-        Right _ → expectationFailure "the cancellation was lost"
-        Left failure → do
-          fromException failure `shouldBe` Just ThreadKilled
-          -- The body succeeded, so the cancellation is the failure itself, not
-          -- evidence beside another.
-          finalizationEvidence failure `shouldSatisfy` isNothing
-          case diagnosticVerdict failure of
-            Nothing → expectationFailure "the cancellation carries no verdict"
-            Just verdict → do
-              consumerName (verdictConsumer verdict) `shouldBe` "cancelled"
-              -- Both admitted records: the one the worker had taken and was
-              -- delivering when it was cancelled, and the one still queued.
-              verdictUndelivered verdict `shouldBe` 2
-              verdictIssues verdict `shouldBe` [RecordsUndelivered 2, ConsumerUnsuccessful]
+      let worker = do
+            result ←
+              try @SomeException $
+                withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → quiescent capture =<< do
+                  putMVar handle capture
+                  offerTo capture (plainOffer SeverityInfo "never delivered")
+                  offerTo capture (plainOffer SeverityInfo "queued behind it")
+            putMVar done result
+      withOwnedThreadOpening (openGate gate) worker $ \thread _ → do
+        capture ← readMVar handle
+        awaitEntered gate 1
+        awaitPhase capture PhaseClosed
+        killThread thread
+        result ← bounded (readMVar done)
+        atomically (capturePhase capture) `shouldReturn` PhaseReleased
+        case result of
+          Right _ → expectationFailure "the cancellation was lost"
+          Left failure → do
+            fromException failure `shouldBe` Just ThreadKilled
+            -- The body succeeded, so the cancellation is the failure itself, not
+            -- evidence beside another.
+            finalizationEvidence failure `shouldSatisfy` isNothing
+            case diagnosticVerdict failure of
+              Nothing → expectationFailure "the cancellation carries no verdict"
+              Just verdict → do
+                consumerName (verdictConsumer verdict) `shouldBe` "cancelled"
+                -- Both admitted records: the one the worker had taken and was
+                -- delivering when it was cancelled, and the one still queued.
+                verdictUndelivered verdict `shouldBe` 2
+                verdictIssues verdict `shouldBe` [RecordsUndelivered 2, ConsumerUnsuccessful]
 
     it "keeps a failed body's own failure when cancelled while finalizing, with the cancellation beside it" $ do
       gate ← newGate
       (logger, _) ← gatedLogger gate
       handle ← newEmptyMVar
       done ← newEmptyMVar
-      thread ← forkIO $ do
-        result ←
-          try @SomeException $
-            withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → do
-              putMVar handle capture
-              offerTo capture (plainOffer SeverityInfo "never delivered")
-              awaitInSink capture gate
-              _ ← afterLastCallback capture (pure ())
-              annotateIO (BodyMarker "the body's own context") (throwIO (TaggedFailure 42))
-        putMVar done result
-      ( do
-          capture ← readMVar handle
-          -- The body has failed and the worker is still inside the sink.
-          awaitPhase capture PhaseClosed
-          killThread thread
-          result ← bounded (readMVar done)
-          atomically (capturePhase capture) `shouldReturn` PhaseReleased
-          case result of
-            Right _ → expectationFailure "the body's failure was lost"
-            Left failure → do
-              fromException failure `shouldBe` Just (TaggedFailure 42)
-              getExceptionAnnotations (someExceptionContext failure)
-                `shouldBe` [BodyMarker "the body's own context"]
-              fmap evidenceOf (finalizationEvidence failure)
-                `shouldBe` Just (Just ThreadKilled, False)
-              case diagnosticVerdict failure of
-                Nothing → expectationFailure "the failure carries no verdict"
-                Just verdict → do
-                  consumerName (verdictConsumer verdict) `shouldBe` "cancelled"
-                  verdictUndelivered verdict `shouldBe` 1
-                  verdictStorageRetained verdict `shouldBe` False
-                  verdictIssues verdict `shouldBe` [RecordsUndelivered 1, ConsumerUnsuccessful]
-        )
-        `finally` openGate gate
+      let worker = do
+            result ←
+              try @SomeException $
+                withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → do
+                  putMVar handle capture
+                  offerTo capture (plainOffer SeverityInfo "never delivered")
+                  awaitInSink capture gate
+                  _ ← afterLastCallback capture (pure ())
+                  annotateIO (BodyMarker "the body's own context") (throwIO (TaggedFailure 42))
+            putMVar done result
+      withOwnedThreadOpening (openGate gate) worker $ \thread _ → do
+        ( do
+            capture ← readMVar handle
+            -- The body has failed and the worker is still inside the sink.
+            awaitPhase capture PhaseClosed
+            killThread thread
+            result ← bounded (readMVar done)
+            atomically (capturePhase capture) `shouldReturn` PhaseReleased
+            case result of
+              Right _ → expectationFailure "the body's failure was lost"
+              Left failure → do
+                fromException failure `shouldBe` Just (TaggedFailure 42)
+                getExceptionAnnotations (someExceptionContext failure)
+                  `shouldBe` [BodyMarker "the body's own context"]
+                fmap evidenceOf (finalizationEvidence failure)
+                  `shouldBe` Just (Just ThreadKilled, False)
+                case diagnosticVerdict failure of
+                  Nothing → expectationFailure "the failure carries no verdict"
+                  Just verdict → do
+                    consumerName (verdictConsumer verdict) `shouldBe` "cancelled"
+                    verdictUndelivered verdict `shouldBe` 1
+                    verdictStorageRetained verdict `shouldBe` False
+                    verdictIssues verdict `shouldBe` [RecordsUndelivered 1, ConsumerUnsuccessful]
+          )
+          `finally` openGate gate
 
     it "keeps a body's own cancellation when a different one arrives while finalizing" $ do
       gate ← newGate
@@ -601,62 +607,64 @@ spec = describe "Lifetime" $ do
       handle ← newEmptyMVar
       done ← newEmptyMVar
       never ← newTVarIO False
-      thread ← forkIO $ do
-        result ←
-          try @SomeException $
-            withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → do
-              offerTo capture (plainOffer SeverityInfo "never delivered")
-              awaitInSink capture gate
-              _ ← afterLastCallback capture (pure ())
-              putMVar handle capture
-              atomically (readTVar never >>= check)
-              quiescent capture ()
-        putMVar done result
-      ( do
-          capture ← readMVar handle
-          killThread thread
-          -- The body was cancelled and the worker is still inside the sink.
-          awaitPhase capture PhaseClosed
-          throwTo thread UserInterrupt
-          result ← bounded (readMVar done)
-          -- Still referenced here, so the body's wait was never provably endless.
-          atomically (writeTVar never True)
-          atomically (capturePhase capture) `shouldReturn` PhaseReleased
-          case result of
-            Right _ → expectationFailure "the body's cancellation was lost"
-            Left failure → do
-              fromException failure `shouldBe` Just ThreadKilled
-              fmap evidenceOf (finalizationEvidence failure)
-                `shouldBe` Just (Just UserInterrupt, False)
-              fmap (consumerName . verdictConsumer) (diagnosticVerdict failure)
-                `shouldBe` Just "cancelled"
-        )
-        `finally` openGate gate
+      let worker = do
+            result ←
+              try @SomeException $
+                withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → do
+                  offerTo capture (plainOffer SeverityInfo "never delivered")
+                  awaitInSink capture gate
+                  _ ← afterLastCallback capture (pure ())
+                  putMVar handle capture
+                  atomically (readTVar never >>= check)
+                  quiescent capture ()
+            putMVar done result
+      withOwnedThreadOpening (openGate gate) worker $ \thread _ → do
+        ( do
+            capture ← readMVar handle
+            killThread thread
+            -- The body was cancelled and the worker is still inside the sink.
+            awaitPhase capture PhaseClosed
+            throwTo thread UserInterrupt
+            result ← bounded (readMVar done)
+            -- Still referenced here, so the body's wait was never provably endless.
+            atomically (writeTVar never True)
+            atomically (capturePhase capture) `shouldReturn` PhaseReleased
+            case result of
+              Right _ → expectationFailure "the body's cancellation was lost"
+              Left failure → do
+                fromException failure `shouldBe` Just ThreadKilled
+                fmap evidenceOf (finalizationEvidence failure)
+                  `shouldBe` Just (Just UserInterrupt, False)
+                fmap (consumerName . verdictConsumer) (diagnosticVerdict failure)
+                  `shouldBe` Just "cancelled"
+          )
+          `finally` openGate gate
 
     it "finalizes a body that is cancelled, then rethrows the cancellation" $ do
       (logger, recorded) ← recordingLogger everythingFilter
       started ← newEmptyMVar
       done ← newEmptyMVar
       never ← newTVarIO False
-      thread ← forkIO $ do
-        result ←
-          try @SomeException $
-            withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → quiescent capture =<< do
-              offerTo capture (plainOffer SeverityWarning "before the cancellation")
-              putMVar started ()
-              atomically (readTVar never >>= check)
-        putMVar done result
-      readMVar started
-      killThread thread
-      result ← bounded (readMVar done)
-      -- Still referenced here, so the body's wait was never provably endless.
-      atomically (writeTVar never True)
-      case result of
-        Right _ → expectationFailure "the cancellation was lost"
-        Left failure → do
-          fromException failure `shouldBe` Just ThreadKilled
-          fmap verdictDelivered (diagnosticVerdict failure) `shouldBe` Just 1
-      length <$> recordedEntries recorded `shouldReturn` 1
+      let worker = do
+            result ←
+              try @SomeException $
+                withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → quiescent capture =<< do
+                  offerTo capture (plainOffer SeverityWarning "before the cancellation")
+                  putMVar started ()
+                  atomically (readTVar never >>= check)
+            putMVar done result
+      withOwnedThread worker $ \thread _ → do
+        readMVar started
+        killThread thread
+        result ← bounded (readMVar done)
+        -- Still referenced here, so the body's wait was never provably endless.
+        atomically (writeTVar never True)
+        case result of
+          Right _ → expectationFailure "the cancellation was lost"
+          Left failure → do
+            fromException failure `shouldBe` Just ThreadKilled
+            fmap verdictDelivered (diagnosticVerdict failure) `shouldBe` Just 1
+        length <$> recordedEntries recorded `shouldReturn` 1
 
     it "answers status reads racing the release without failing" $ do
       (logger, _) ← recordingLogger everythingFilter
@@ -664,21 +672,22 @@ spec = describe "Lifetime" $ do
       reader ← newEmptyMVar
       -- A reader that starts while the body runs and keeps reading until it
       -- has seen the lifetime end, so some of its reads overlap the release.
-      _ ← forkIO $ do
-        capture ← readMVar handle
-        let loop seen = do
-              phase ← atomically (capturePhase capture)
-              _ ← captureStatus capture
-              if phase == PhaseReleased then pure (seen + 1) else loop (seen + 1 ∷ Int)
-        result ← try @SomeException (loop 0)
-        putMVar reader result
-      ((), verdict) ←
-        capturing logger $ \capture → do
-          putMVar handle capture
-          offerTo capture (plainOffer SeverityWarning "while reading")
-      result ← bounded (readMVar reader)
-      either (Left . show) (const (Right ())) result `shouldBe` Right ()
-      verdictClean verdict `shouldBe` True
+      let worker = do
+            capture ← readMVar handle
+            let loop seen = do
+                  phase ← atomically (capturePhase capture)
+                  _ ← captureStatus capture
+                  if phase == PhaseReleased then pure (seen + 1) else loop (seen + 1 ∷ Int)
+            result ← try @SomeException (loop 0)
+            putMVar reader result
+      withOwnedThread worker $ \_ _ → do
+        ((), verdict) ←
+          capturing logger $ \capture → do
+            putMVar handle capture
+            offerTo capture (plainOffer SeverityWarning "while reading")
+        result ← bounded (readMVar reader)
+        either (Left . show) (const (Right ())) result `shouldBe` Right ()
+        verdictClean verdict `shouldBe` True
 
     it "includes in its verdict a producer that had announced itself when the body returned" $ do
       (logger, _) ← recordingLogger everythingFilter
@@ -686,54 +695,71 @@ spec = describe "Lifetime" $ do
       done ← newEmptyMVar
       lifetime ← newEmptyMVar
       handle ← newEmptyMVar
-      _ ← forkIO $ do
-        result ←
-          try @SomeException $
-            withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → quiescent capture =<< do
-              _ ← forkIO (offerAnnounced (captureUserData capture) hold SeverityWarning "announced" >> putMVar done ())
-              bounded (untilM (holdArrived hold))
-              putMVar handle capture
-        putMVar lifetime result
-      capture ← readMVar handle
-      -- Release the producer only once closing has shut this capture's
-      -- admission and is waiting for it. The body may return at any time after
-      -- publishing the handle, so nothing else orders the release after that.
-      bounded (untilM ((== Just True) <$> slotClosed (captureUserData capture)))
-      -- The lifetime cannot get past closing while the producer is announced.
-      atomically (capturePhase capture) `shouldReturn` PhaseCapturing
-      releaseHold hold
-      bounded (readMVar done)
-      result ← bounded (readMVar lifetime)
-      case result of
-        Left failure → expectationFailure ("the lifetime failed: " <> show failure)
-        Right ((), verdict) →
-          -- Closing had begun, so it counted itself as refused, and the verdict
-          -- saw it.
-          verdictIssues verdict `shouldBe` [CaptureFailureLatched, CaptureFailures 1]
+      capCell ← newEmptyMVar
+      let producer = do
+            capture ← readMVar capCell
+            offerAnnounced (captureUserData capture) hold SeverityWarning "announced" >> putMVar done ()
+          worker = do
+            result ←
+              try @SomeException $
+                withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → quiescent capture =<< do
+                  putMVar capCell capture
+                  bounded (untilM (holdArrived hold))
+                  putMVar handle capture
+            putMVar lifetime result
+      withOwnedThreadOpening (releaseHold hold) producer $ \_ _ →
+        withOwnedThreadOpening (releaseHold hold) worker $ \_ _ → do
+          capture ← readMVar handle
+          -- Release the producer only once closing has shut this capture's
+          -- admission and is waiting for it. The body may return at any time after
+          -- publishing the handle, so nothing else orders the release after that.
+          bounded (untilM ((== Just True) <$> slotClosed (captureUserData capture)))
+          -- The lifetime cannot get past closing while the producer is announced.
+          atomically (capturePhase capture) `shouldReturn` PhaseCapturing
+          releaseHold hold
+          bounded (readMVar done)
+          result ← bounded (readMVar lifetime)
+          case result of
+            Left failure → expectationFailure ("the lifetime failed: " <> show failure)
+            Right ((), verdict) →
+              -- Closing had begun, so it counted itself as refused, and the verdict
+              -- saw it.
+              verdictIssues verdict `shouldBe` [CaptureFailureLatched, CaptureFailures 1]
+
+    describe "the producer held after announcing itself, and the lifetime closing around it, are owned (#595)" $
+      for_ endings $ \(label, ending) → do
+        it ("have ended and been joined when the scope returns because " <> label) $
+          producerInHold ending ownedScope >>= (`shouldBe` True)
+        it ("negative control: unowned starts leave both when the scope returns because " <> label) $ do
+          cleanups ← newCleanups
+          -- The judgement is recorded first; only then is the hold released and the producer and the lifetime stopped and joined.
+          (producerInHold ending (unownedScope cleanups) >>= (`shouldBe` False)) `finally` runCleanups cleanups
 
     it "counts a report not yet begun when the lifetime ends, in memory that is still live" $ do
       (logger, _) ← recordingLogger everythingFilter
       hold ← newHold
       done ← newEmptyMVar
       saved ← newIORef Nothing
-      ((), verdict) ←
-        capturing logger $ \capture → do
-          writeIORef saved (Just capture)
-          _ ← forkIO (offerHeld (captureUserData capture) hold SeverityWarning "late" >> putMVar done ())
-          bounded (untilM (holdArrived hold))
-      -- The body returned before the report began — a Vulkan call still running
-      -- after the body, which the lifetime's contract rules out. The verdict
-      -- cannot have seen it; the storage's slot counts it.
-      verdictClean verdict `shouldBe` True
-      releaseHold hold
-      bounded (readMVar done)
-      readIORef saved >>= \case
-        Nothing → expectationFailure "the body never ran"
-        Just capture → do
-          atomically (capturePhase capture) `shouldReturn` PhaseReleased
-          status ← captureStatus capture
-          countCaptureFailed (statusCounters status) `shouldBe` 1
-          statusCaptureFailureLatched status `shouldBe` True
+      capCell ← newEmptyMVar
+      withOwnedThreadOpening (releaseHold hold) (readMVar capCell >>= \capture → offerHeld (captureUserData capture) hold SeverityWarning "late" >> putMVar done ()) $ \_ _ → do
+        ((), verdict) ←
+          capturing logger $ \capture → do
+            writeIORef saved (Just capture)
+            putMVar capCell capture
+            bounded (untilM (holdArrived hold))
+        -- The body returned before the report began — a Vulkan call still running
+        -- after the body, which the lifetime's contract rules out. The verdict
+        -- cannot have seen it; the storage's slot counts it.
+        verdictClean verdict `shouldBe` True
+        releaseHold hold
+        bounded (readMVar done)
+        readIORef saved >>= \case
+          Nothing → expectationFailure "the body never ran"
+          Just capture → do
+            atomically (capturePhase capture) `shouldReturn` PhaseReleased
+            status ← captureStatus capture
+            countCaptureFailed (statusCounters status) `shouldBe` 1
+            statusCaptureFailureLatched status `shouldBe` True
 
     it "counts every delivery the sink received, however a cancellation lands" $ do
       -- Delivering and counting are one step, so the verdict's delivered
@@ -749,26 +775,27 @@ spec = describe "Lifetime" $ do
             logger = mkLogger everythingFilter sink
         done ← newEmptyMVar
         started ← newEmptyMVar
-        thread ← forkIO $ do
-          result ←
-            try @SomeException $
-              withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → quiescent capture =<< do
-                mapM_ (\n → offerTo capture (plainOffer SeverityInfo n)) ["1", "2", "3", "4"]
-                putMVar started ()
-          putMVar done result
-        readMVar started
-        -- Vary where the cancellation lands relative to the final drain.
-        replicateM_ (attempt `mod` 7) yield
-        killThread thread
-        result ← bounded (readMVar done)
-        sunk ← readTVarIO received
-        let verdictOf = either diagnosticVerdict (Just . snd) result
-        case verdictOf of
-          Nothing → either (\failure → fromException failure `shouldBe` Just ThreadKilled) (const (pure ())) result
-          Just verdict → do
-            when (either (const True) (const False) result) (modifyIORef' cancelled (+ 1))
-            (attempt, verdictDelivered verdict) `shouldBe` (attempt, sunk)
-            (attempt, verdictDelivered verdict + verdictUndelivered verdict) `shouldBe` (attempt, 4)
+        let worker = do
+              result ←
+                try @SomeException $
+                  withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → quiescent capture =<< do
+                    mapM_ (\n → offerTo capture (plainOffer SeverityInfo n)) ["1", "2", "3", "4"]
+                    putMVar started ()
+              putMVar done result
+        withOwnedThread worker $ \thread _ → do
+          readMVar started
+          -- Vary where the cancellation lands relative to the final drain.
+          replicateM_ (attempt `mod` 7) yield
+          killThread thread
+          result ← bounded (readMVar done)
+          sunk ← readTVarIO received
+          let verdictOf = either diagnosticVerdict (Just . snd) result
+          case verdictOf of
+            Nothing → either (\failure → fromException failure `shouldBe` Just ThreadKilled) (const (pure ())) result
+            Just verdict → do
+              when (either (const True) (const False) result) (modifyIORef' cancelled (+ 1))
+              (attempt, verdictDelivered verdict) `shouldBe` (attempt, sunk)
+              (attempt, verdictDelivered verdict + verdictUndelivered verdict) `shouldBe` (attempt, 4)
       -- Locally about one round in eight is cancelled mid-lifetime; none at all
       -- would mean the example had stopped exercising what it is for.
       readIORef cancelled `shouldNotReturn` 0
@@ -848,3 +875,41 @@ spec = describe "Lifetime" $ do
       ( fromException failure
       , fmap (consumerName . verdictConsumer) (diagnosticVerdict failure)
       )
+
+-- | The arrangement of "includes in its verdict a producer that had announced itself when the body returned", ended the way
+-- the ending says in place of its own steps: the producer (started in this kind of scope, with the hold's release as the scope's
+-- opening) is held after announcing itself, the lifetime around it has begun closing and waits for it, and the scope ends there.
+-- The answer is whether, when the scope has returned, both have ended and been joined.
+producerInHold ∷ Ending → Scope → IO Bool
+producerInHold ending scope = do
+  (logger, _) ← recordingLogger everythingFilter
+  hold ← newHold
+  done ← newEmptyMVar
+  lifetime ← newEmptyMVar
+  handle ← newEmptyMVar
+  capCell ← newEmptyMVar
+  seenThreads ← newIORef []
+  let producer = do
+        capture ← readMVar capCell
+        offerAnnounced (captureUserData capture) hold SeverityWarning "announced" >> putMVar done ()
+      worker = do
+        result ←
+          try @SomeException $
+            withDiagnosticCapture (quietConfig smallConfig) logger $ \capture → quiescent capture =<< do
+              putMVar capCell capture
+              bounded (waitUntil (holdArrived hold))
+              putMVar handle capture
+        putMVar lifetime result
+  runEnding ending $ \end →
+    scope (releaseHold hold) producer $ \announced _ →
+      scope (releaseHold hold) worker $ \closing _ → do
+        capture ← readMVar handle
+        bounded (waitUntil ((== Just True) <$> slotClosed (captureUserData capture)))
+        writeIORef seenThreads [announced, closing]
+        end (pure ())
+  readIORef seenThreads >>= \threads → case threads of
+    [] → pure False
+    _ → and <$> mapM hasEnded threads
+  where
+    waitUntil condition = condition >>= \ok → if ok then pure () else yield >> waitUntil condition
+

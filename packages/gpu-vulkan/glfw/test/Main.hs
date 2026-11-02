@@ -18,10 +18,11 @@ import qualified Test.GPU.Vulkan.GLFW.Actions as Actions
 import qualified Test.GPU.Vulkan.GLFW.Consumer as Consumer
 import qualified Test.GPU.Vulkan.GLFW.Controller as Controller
 import qualified Test.GPU.Vulkan.GLFW.Loop as Loop
+import qualified Test.GPU.Vulkan.GLFW.OwnedThreads as OwnedThreads
 import qualified Test.GPU.Vulkan.GLFW.Rescue as Rescue
 import qualified Test.GPU.Vulkan.GLFW.Scenes as Scenes
 import qualified Test.GPU.Vulkan.GLFW.Targets as Targets
 import Test.Hspec.Runner (Config (configFailOnEmpty), defaultConfig, hspecWith)
 
 main ∷ IO ()
-main = hspecWith defaultConfig {configFailOnEmpty = True} (Controller.spec >> Loop.spec >> Consumer.spec >> Actions.spec >> Scenes.spec >> Targets.spec >> Rescue.spec)
+main = hspecWith defaultConfig {configFailOnEmpty = True} (Controller.spec >> Loop.spec >> Consumer.spec >> Actions.spec >> Scenes.spec >> Targets.spec >> Rescue.spec >> OwnedThreads.spec)
