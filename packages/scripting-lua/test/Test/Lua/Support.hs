@@ -331,6 +331,11 @@ withProducers actions body = go actions []
 detached ∷ IO a → IO a
 detached body = do
   outcome ← newEmptyMVar
+  -- DEFERRED (#598): this start stays unowned, and in the ownership guard's baseline. It runs inside the owner that
+  -- 'detached' detaches: a thread trapped in a @safe@ foreign call cannot be joined or cancelled, and Reentry.hs:9-12 requires
+  -- the examples to fail within their bound when a missing refusal traps the owner there (bridge/.../Internal/Vm.hs:31-37
+  -- explains why cancelling that owner cannot end the wait). Joining it would hang the example the bound exists to fail. A
+  -- separately scoped delivery handles it; no containment strategy is chosen here.
   _ ← mask $ \restore → forkIO (tryWithContext @SomeException (restore body) >>= putMVar outcome)
   bounded (takeMVar outcome) >>= either rethrowIO pure
 
