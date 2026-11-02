@@ -96,6 +96,50 @@ does.
   `bytestring`, `stm`, `text` and `unix`, a small C file for the non-reaping look
   at a child, and the bounded wait for a group's end is the one place it polls.
 
+- `Test.Support.Subprocess.Host` is the hosted subprocess (#608), the one thing the
+  single-child scopes cannot do: a child whose process group is *not* ended when the
+  call that ran it returns. The display-helper suites run a helper whose stub servers
+  and clients sit in the helper's group, and assert afterwards that the helper stopped
+  what it owned and left alone what it did not start; a one-shot owned call ends the
+  group on return and the example could not look. `withHost` opens a scope,
+  `hosted` (and `hostedCaptured`, which answers the triple `runCaptured` does) runs a
+  child on it under the facility's rules unchanged, and the host ends and reaps every
+  child, latest first, when its scope ends. It is a state machine; its owner, readers
+  and writers, thread, lifetime and disposal are in the module header. The scopes of
+  the children are nested on one owned worker, so they unwind latest first; the stop is
+  a cell of its own that no full slot can hide; a submitter cleans up its own unclaimed
+  request, the worker its claimed one, the caller a request whose body was entered.
+  Hosted bodies must be cancellable (the precondition of `docs/workers.md` and of
+  `Test.Support.Owned`): a body that ignores its cancellation holds the scope's join
+  until it lets go, and the host reports nothing ended or reaped that is not.
+
+  | State \\ Operation | Submit | Bound passes, or the submitter is cancelled | Stop | Owner fails or is cancelled | The worker ends by itself |
+  |---|---|---|---|---|---|
+  | **Starting** | one request accepted into the slot, a further submitter waits within its bound, refused (answered at once) if the host stops or ends | expiry: abandoned, fails naming the command and bound, never started, handles closed; cancellation: the same with its own cancellation unchanged | nothing served, queued request answered "stopped", never started, handles closed | as Stop, then the owner's failure or cancellation as itself | Ended; queued request answered "ended", never started, handles closed; a failure that is not a cancellation is raised once by the scope |
+  | **Idle** | accepted, served at once | not applicable: nothing waits in Idle | worker ends, children ended latest first, scope returns after every reap is confirmed | as Stop, then the owner's | Ended with its children already reaped; later submissions refused |
+  | **Serving, slot empty** | accepted into the slot without blocking | expiry: body cut at its bound, submitter fails naming command and bound, child stays hosted; cancellation: the submitter sees its own cancellation, the body is not cancelled | running body cancelled (not waited for), submitter answered "stopped", child ended and reaped | as Stop, then the owner's | running submitter answered "ended"; Ended |
+  | **Serving, one queued** | the submitter waits within its bound, woken and refused if the host stops or ends | queued: abandoned, never started, handles closed, slot free; running: as above, the queued request then served | the stop is recorded though the slot is full; running body cancelled, queued request never started, "stopped", handles closed | as Stop, then the owner's | both answered "ended"; queued never started, handles closed |
+  | **Stopping** | refused at once, whatever the slot holds | a waiting submitter is answered "stopped" at once, not at its bound | idempotent | idempotent; a second cancellation is remembered, the cleanup finished, then raised with the owner's failure retained | Ended once the worker has finished; a cleanup that was not confirmed is raised once after every reap |
+  | **Ended** | refused at once, whatever the slot held | not applicable: every waiter was answered, every later submission is refused without waiting | idempotent: no child ended twice | idempotent: raised once, as itself | not applicable: Ended is final |
+
+  | Cause | Outcome |
+  |---|---|
+  | normal end | every child ended and reaped latest first, the body of a running request cancelled first; the owner's result if every cleanup was confirmed, otherwise the unconfirmed-cleanup failure after the others were ended |
+  | a child fails to start | only that submitter is told (the failure of starting), its handles closed, the host stays Idle and serves the next, however many fail in a row |
+  | a body fails | its submitter receives it as itself; the host goes on, earlier children untouched |
+  | a body is cancelled (the host's stop, or the worker) | the submitter is answered; the host is Ended; later submissions refused; the scope raises a cancellation only if it was the owner's own |
+  | the owner fails or is cancelled | the host stops as in the table; every child ended and reaped; the owner's own failure raised as itself, with any cleanup failure retained beside it |
+
+  Every cell and every row has its example in `tools/test/OwnedHost.hs`, named
+  `<State> × <Operation>: …` or `Cause: …`; a cell that specifies two outcomes has one
+  example for each, and a "not applicable" cell has an example of the invariant that
+  makes the operation unreachable. The same file holds the three races of a request's
+  handles with the worker (taking it, acquiring the child, entering the body), a
+  cancellation delivered into each cleanup the host adds, the limit of a body that is
+  not cancellable, and the captured run the display-helper suites use. A handle a
+  request supplies is closed exactly once by whoever owns it at that moment, before the
+  call returns or raises, until its body is entered, and never by the host after.
+
 ## What belongs here
 
 A utility belongs here only when it is already used by examples that will be
