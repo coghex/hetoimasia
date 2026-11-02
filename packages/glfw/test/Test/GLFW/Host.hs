@@ -13,7 +13,7 @@
 -- sleep; a seam wait that must block blocks on a transaction.
 module Test.GLFW.Host (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, forkOS, killThread, myThreadId, throwTo, yield)
+import Control.Concurrent (ThreadId, killThread, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception
@@ -135,8 +135,11 @@ import Test.GLFW.Support
   , sinkMarks
   , traced
   , unexpected
+  , withDeferredThread
+  , withDeferredThreadOpening
   )
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.Support.Owned (withOwnedBoundThread, withOwnedBoundThreadOpening, withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "GLFW window host" $ do
@@ -791,12 +794,12 @@ wakePlatformScript platform script =
         scriptWaitEvents script seconds reporter
     }
 
--- | Run an action once the owner has entered its finite wait.
+-- | An action that waits until the owner has entered its finite wait and then runs the given one. An example runs it on an owned
+-- thread of its own ('withOwnedThread', #593) around the loop it serves.
 duringTheWait ∷ WakePlatform → IO () → IO ()
-duringTheWait platform action =
-  void . forkIO $ do
-    atomically (readTVar (platformWaiting platform) >>= check)
-    action
+duringTheWait platform action = do
+  atomically (readTVar (platformWaiting platform) >>= check)
+  action
 
 -- | The disposition a ticket settled to, read twice so a settled cell is shown
 -- to be written once and never written again.
@@ -828,21 +831,24 @@ testCommandWakesIdleWait = do
       window ← onlyWindow host
       summaries ← newIORef []
       ticket ← newEmptyMVar
-      duringTheWait
-        platform
-        (submitWindowCommand (hostCommandPort host) [] (observeOf window) >>= admitted >>= putMVar ticket)
-      runOwnerLoop host control $
-        LoopHooks
-          { loopLogger = quietLogger
-          , loopEvent = noApplicationEvents
-          , loopUpdate = \turn → do
-              modifyIORef' summaries (<> [summary turn])
-              if turnNumber turn == 3
-                then do
-                  settled ← takeMVar ticket >>= settledExactlyOnce
-                  Finish . (,) settled <$> readIORef summaries
-                else pure Continue
-          }
+      withOwnedThread
+        ( duringTheWait
+            platform
+            (submitWindowCommand (hostCommandPort host) [] (observeOf window) >>= admitted >>= putMVar ticket)
+        )
+        $ \_ _ →
+        runOwnerLoop host control $
+          LoopHooks
+            { loopLogger = quietLogger
+            , loopEvent = noApplicationEvents
+            , loopUpdate = \turn → do
+                modifyIORef' summaries (<> [summary turn])
+                if turnNumber turn == 3
+                  then do
+                    settled ← takeMVar ticket >>= settledExactlyOnce
+                    Finish . (,) settled <$> readIORef summaries
+                  else pure Continue
+            }
   -- The second turn's wait ended only because the admission woke the owner, so
   -- that turn's own command work served the command instead of the wait running
   -- to its bound.
@@ -862,22 +868,22 @@ testDemandWakesIdleWait = do
     hosted seam (settings []) (\host _ → pure host) $ \host control → do
       summaries ← newIORef []
       taken ← newIORef Nothing
-      duringTheWait platform (void (publishDemand (hostDemandPublisher host) immediateDemand))
-      runOwnerLoop host control $
-        LoopHooks
-          { loopLogger = quietLogger
-          , loopEvent = noApplicationEvents
-          , loopUpdate = \turn → do
-              modifyIORef' summaries (<> [summary turn])
-              if turnWaited turn
-                then do
-                  writeIORef taken =<< captureHostDemand host
-                  again ← captureHostDemand host
-                  finished ← readIORef summaries
-                  captured ← readIORef taken
-                  pure (Finish (finished, captured, again))
-                else pure Continue
-          }
+      withOwnedThread (duringTheWait platform (void (publishDemand (hostDemandPublisher host) immediateDemand))) $ \_ _ →
+        runOwnerLoop host control $
+          LoopHooks
+            { loopLogger = quietLogger
+            , loopEvent = noApplicationEvents
+            , loopUpdate = \turn → do
+                modifyIORef' summaries (<> [summary turn])
+                if turnWaited turn
+                  then do
+                    writeIORef taken =<< captureHostDemand host
+                    again ← captureHostDemand host
+                    finished ← readIORef summaries
+                    captured ← readIORef taken
+                    pure (Finish (finished, captured, again))
+                  else pure Continue
+            }
   -- The wait ended on the publication's wake, and the update of that same turn
   -- captured what had been published.
   turns `shouldBe` [(1, False, 0, 0), (2, True, 0, 0)]
@@ -931,25 +937,28 @@ testCreationRacingQuiescence = do
         submitWindowCommand (hostCommandPort host) [] (createWindowCommand (windowNamed "late")) >>= admitted
       -- Quiescence commits while the creation is claimed and inside its native
       -- call, so the window is registered after admission has already ended.
-      void . forkIO $ do
-        takeMVar claimed
-        atomically (quiesceWindowHost host)
-        putMVar release ()
-      runOwnerLoop host control $
-        LoopHooks
-          { loopLogger = quietLogger
-          , loopEvent = noApplicationEvents
-          , loopUpdate = \_ → do
-              disposition ← atomically (pollCompletion ticket)
-              client ← atomically (pollWindowClient ticket)
-              case (disposition, client) of
-                (Just settled, Just capabilities) → do
-                  submission ← submitWindowCommand (clientCommandPort capabilities) [] (observeWindowCommand (clientWindow capabilities))
-                  publication ← publishDemand (clientDemandPublisher capabilities) immediateDemand
-                  identities ← atomically (hostWindowIdentities host)
-                  pure (Finish (settled, submission, publication, identities))
-                _ → pure Continue
-          }
+      withOwnedThreadOpening (void (tryPutMVar release ()))
+        ( do
+            takeMVar claimed
+            atomically (quiesceWindowHost host)
+            putMVar release ()
+        )
+        $ \_ _ → do
+        runOwnerLoop host control $
+          LoopHooks
+            { loopLogger = quietLogger
+            , loopEvent = noApplicationEvents
+            , loopUpdate = \_ → do
+                disposition ← atomically (pollCompletion ticket)
+                client ← atomically (pollWindowClient ticket)
+                case (disposition, client) of
+                  (Just settled, Just capabilities) → do
+                    submission ← submitWindowCommand (clientCommandPort capabilities) [] (observeWindowCommand (clientWindow capabilities))
+                    publication ← publishDemand (clientDemandPublisher capabilities) immediateDemand
+                    identities ← atomically (hostWindowIdentities host)
+                    pure (Finish (settled, submission, publication, identities))
+                  _ → pure Continue
+            }
   disposition `shouldSatisfy` \case
     Performed (WindowCreated _) → True
     _ → False
@@ -1027,26 +1036,31 @@ testDegradationInFlightAtExit = do
         }
   warnings ← newIORef ([] ∷ [LogEntry])
   let capturing = recordingLogger warnings
+  submitted ← newEmptyMVar
+  -- The worker is left inside its failing post and the releaser lets it leave only once the owner waits at the runner's
+  -- boundary, after the body that hands them what they act on has returned: both are owned by the example (#593), and the
+  -- releaser's gate is opened by the scope as well, so the worker is never joined while still held.
   (duringUpdate, admitted') ←
-    hostedLogging capturing seam (settings [windowNamed "in flight"]) (\host _ → pure host) $ \host control → do
-      window ← onlyWindow host
-      owner ← myThreadId
-      submitted ← newEmptyMVar
-      runOwnerLoop host control $
-        LoopHooks
-          { loopLogger = capturing
-          , loopEvent = noApplicationEvents
-          , loopUpdate = \_ → do
-              -- A worker admits during the final update and is left inside its
-              -- failing post.
-              _ ← forkIO (submitWindowCommand (hostCommandPort host) [] (observeOf window) >>= putMVar submitted)
-              takeMVar held
-              duringUpdate ← readIORef warnings
-              -- The post is released only once the owner is waiting for it at
-              -- the runner's own boundary, after quiescence and the drain.
-              _ ← forkIO (awaitBlockedOnSTM owner >> putMVar release ())
-              pure (Finish (duringUpdate, submitted))
-          }
+    withDeferredThread (\(host, window) → submitWindowCommand (hostCommandPort host) [] (observeOf window) >>= putMVar submitted) $ \_ handOverWorker →
+      withDeferredThreadOpening (void (tryPutMVar release ())) (\owner → awaitBlockedOnSTM owner >> putMVar release ()) $ \_ handOverReleaser →
+        hostedLogging capturing seam (settings [windowNamed "in flight"]) (\host _ → pure host) $ \host control → do
+          window ← onlyWindow host
+          owner ← myThreadId
+          runOwnerLoop host control $
+            LoopHooks
+              { loopLogger = capturing
+              , loopEvent = noApplicationEvents
+              , loopUpdate = \_ → do
+                  -- A worker admits during the final update and is left inside its
+                  -- failing post.
+                  handOverWorker (host, window)
+                  takeMVar held
+                  duringUpdate ← readIORef warnings
+                  -- The post is released only once the owner is waiting for it at
+                  -- the runner's own boundary, after quiescence and the drain.
+                  handOverReleaser owner
+                  pure (Finish (duringUpdate, submitted))
+              }
   -- Nothing was written while the notification was still in flight.
   duringUpdate `shouldBe` []
   written ← readIORef warnings
@@ -1123,31 +1137,37 @@ testObligationHeldAfterCommit operation = do
   warnings ← newIORef ([] ∷ [LogEntry])
   committed ← newEmptyMVar
   release ← newEmptyMVar
+  -- The worker stays inside its hook until the releaser lets it leave, which happens only once the owner waits at the runner's
+  -- boundary, after the body returned: both are owned by the example (#593) and the body hands them what they act on. The
+  -- releaser's gate is opened by the scope as well, so the worker is never joined while still held.
+  let worker (host, window) = case operation of
+        AdmittedCommand → do
+          let hooks = noAdmissionHooks {afterAdmission = putMVar committed () >> takeMVar release}
+          void (submitWith hooks (hostCommandPort host) [] (observeOf window))
+        PublishedDemand → do
+          let hooks = noDemandHooks {afterPublication = putMVar committed () >> takeMVar release}
+          void (publishDemandWith hooks (hostDemandPublisher host) immediateDemand)
   (outstanding, duringAction) ←
-    hostedLogging (recordingLogger warnings) seam (settings [windowNamed "held"]) (\host _ → pure host) $
-      \host control → do
-        window ← onlyWindow host
-        runOwnerLoop host control $
-          LoopHooks
-            { loopLogger = quietLogger
-            , loopEvent = noApplicationEvents
-            , loopUpdate = \_ → pure (Finish ())
-            }
-        owner ← myThreadId
-        _ ← forkIO $ case operation of
-          AdmittedCommand → do
-            let hooks = noAdmissionHooks {afterAdmission = putMVar committed () >> takeMVar release}
-            void (submitWith hooks (hostCommandPort host) [] (observeOf window))
-          PublishedDemand → do
-            let hooks = noDemandHooks {afterPublication = putMVar committed () >> takeMVar release}
-            void (publishDemandWith hooks (hostDemandPublisher host) immediateDemand)
-        takeMVar committed
-        -- Committed, so the obligation is registered; the wake has not been
-        -- made, so nothing has degraded and nothing has been written.
-        outstanding ← atomically (hostNotificationsInFlight host)
-        duringAction ← readIORef warnings
-        _ ← forkIO (awaitBlockedOnSTM owner >> putMVar release ())
-        pure (outstanding, duringAction)
+    withDeferredThread worker $ \_ handOverWorker →
+      withDeferredThreadOpening (void (tryPutMVar release ())) (\owner → awaitBlockedOnSTM owner >> putMVar release ()) $ \_ handOverReleaser →
+        hostedLogging (recordingLogger warnings) seam (settings [windowNamed "held"]) (\host _ → pure host) $
+          \host control → do
+            window ← onlyWindow host
+            runOwnerLoop host control $
+              LoopHooks
+                { loopLogger = quietLogger
+                , loopEvent = noApplicationEvents
+                , loopUpdate = \_ → pure (Finish ())
+                }
+            owner ← myThreadId
+            handOverWorker (host, window)
+            takeMVar committed
+            -- Committed, so the obligation is registered; the wake has not been
+            -- made, so nothing has degraded and nothing has been written.
+            outstanding ← atomically (hostNotificationsInFlight host)
+            duringAction ← readIORef warnings
+            handOverReleaser owner
+            pure (outstanding, duringAction)
   outstanding `shouldBe` 1
   duringAction `shouldBe` []
   warningComponents warnings `shouldReturn` ["glfw.wake"]
@@ -1186,22 +1206,23 @@ testReportsOnEveryExit = do
   cancelledWarnings ← newIORef ([] ∷ [LogEntry])
   degraded ← newEmptyMVar
   never ← newEmptyMVar
-  (runner, finished) ←
-    onMainThread cancelledSeam $
-      runWindowApplication
+  withMainThread cancelledSeam (pure ())
+    ( runWindowApplication
         (withLoggingLifetime (recordingLogger cancelledWarnings))
         "host-example"
         (hostOver cancelledSeam (settings [windowNamed "cancelled"]))
         id
         (\host _ → pure host)
         (\host _ → degradeWakePath host >> putMVar degraded () >> takeMVar never)
-  takeMVar degraded
-  killThread runner
-  cancelled ← takeMVar finished
-  either (Just . fromException) (const Nothing) cancelled `shouldBe` Just (Just ThreadKilled)
-  -- A cancelled run makes no terminal report, and the wake path's own is still
-  -- written.
-  warningComponents cancelledWarnings `shouldReturn` ["glfw.wake"]
+    )
+    $ \runner finished → do
+    takeMVar degraded
+    killThread runner
+    cancelled ← takeMVar finished
+    either (Just . fromException) (const Nothing) cancelled `shouldBe` Just (Just ThreadKilled)
+    -- A cancelled run makes no terminal report, and the wake path's own is still
+    -- written.
+    warningComponents cancelledWarnings `shouldReturn` ["glfw.wake"]
 
 -- | A worker that publishes demand until its stop request arrives, so
 -- obligations keep being registered for as long as the application runs.
@@ -1244,9 +1265,8 @@ testPublisherUntilStopped = do
   turning ← newEmptyMVar
   never ← newEmptyMVar
   publishedAgain ← newEmptyMVar
-  (runner, finished) ←
-    onMainThread cancelledSeam $
-      runWindowApplication
+  withMainThread cancelledSeam (pure ())
+    ( runWindowApplication
         (withLoggingLifetime (recordingLogger cancelledWarnings))
         "host-example"
         (hostOver cancelledSeam (settings [windowNamed "publishing"]))
@@ -1262,11 +1282,13 @@ testPublisherUntilStopped = do
             putMVar turning ()
             takeMVar never
         )
-  takeMVar turning
-  killThread runner
-  cancelled ← takeMVar finished
-  either (Just . fromException) (const Nothing) cancelled `shouldBe` Just (Just ThreadKilled)
-  warningComponents cancelledWarnings `shouldReturn` ["glfw.wake"]
+    )
+    $ \runner finished → do
+    takeMVar turning
+    killThread runner
+    cancelled ← takeMVar finished
+    either (Just . fromException) (const Nothing) cancelled `shouldBe` Just (Just ThreadKilled)
+    warningComponents cancelledWarnings `shouldReturn` ["glfw.wake"]
 
 -- | Turn until the numbered turn, then finish, writing through the given
 -- logger. Which boundary claims the wake path's report depends on when the
@@ -1299,31 +1321,33 @@ testCancelledDuringTheFinalWait = do
             when first (putMVar inside () >> takeMVar release)
         }
   warnings ← newIORef ([] ∷ [LogEntry])
-  (runner, finished) ←
-    onMainThread seam $
-      runWindowApplication
-        (withLoggingLifetime (recordingLogger warnings))
-        "host-example"
-        (hostOver seam (settings [windowNamed "cancelled wait"]))
-        id
-        (\host _ → pure host)
-        ( \host _ → do
-            window ← onlyWindow host
-            -- A worker's admission commits, registering its obligation, and
-            -- stays inside its failing post. The action then returns, so the
-            -- runner's boundary waits for that obligation.
-            _ ← forkIO (void (submitWindowCommand (hostCommandPort host) [] (observeOf window)))
-            takeMVar inside
-        )
-  -- The boundary is waiting for the obligation; cancel it there.
-  awaitBlockedOnSTM runner
-  duringWait ← readIORef warnings
-  killThread runner
-  putMVar release ()
-  cancelled ← takeMVar finished
-  duringWait `shouldBe` []
-  either (Just . fromException) (const Nothing) cancelled `shouldBe` Just (Just ThreadKilled)
-  warningComponents warnings `shouldReturn` ["glfw.wake"]
+  withDeferredThread (\(host, window) → void (submitWindowCommand (hostCommandPort host) [] (observeOf window))) $ \_ handOverWorker →
+    withMainThread seam (void (tryPutMVar release ()))
+      ( runWindowApplication
+          (withLoggingLifetime (recordingLogger warnings))
+          "host-example"
+          (hostOver seam (settings [windowNamed "cancelled wait"]))
+          id
+          (\host _ → pure host)
+          ( \host _ → do
+              window ← onlyWindow host
+              -- A worker's admission commits, registering its obligation, and
+              -- stays inside its failing post. The action then returns, so the
+              -- runner's boundary waits for that obligation.
+              handOverWorker (host, window)
+              takeMVar inside
+          )
+      )
+      $ \runner finished → do
+      -- The boundary is waiting for the obligation; cancel it there.
+      awaitBlockedOnSTM runner
+      duringWait ← readIORef warnings
+      killThread runner
+      putMVar release ()
+      cancelled ← takeMVar finished
+      duringWait `shouldBe` []
+      either (Just . fromException) (const Nothing) cancelled `shouldBe` Just (Just ThreadKilled)
+      warningComponents warnings `shouldReturn` ["glfw.wake"]
 
 -- | A cancellation requested at the instant the action returns. It lands in the
 -- tail of the action, in the handoff to the reporting attempt, inside the
@@ -1342,22 +1366,23 @@ testCancelledAsTheActionReturns = do
       seam ← newSeam (failingPostScript "scripted wake failure")
       warnings ← newIORef ([] ∷ [LogEntry])
       returning ← newEmptyMVar
-      (runner, finished) ←
-        onMainThread seam $
-          runWindowApplication
+      withMainThread seam (pure ())
+        ( runWindowApplication
             (withLoggingLifetime (recordingLogger warnings))
             "host-example"
             (hostOver seam (settings [windowNamed "returning"]))
             id
             (\host _ → pure host)
             (\host _ → degradeWakePath host >> putMVar returning ())
-      -- Requested as the action's last act, so its delivery races the handoff.
-      takeMVar returning
-      _ ← forkIO (throwTo runner ThreadKilled)
-      outcome ← takeMVar finished
-      recorded ← warningComponents warnings
-      -- Cancelled, or finished before the cancellation could land; nothing else.
-      pure (either (\caught → fromException caught == Just ThreadKilled) (const True) outcome, recorded)
+        )
+        $ \runner finished → do
+          -- Requested as the action's last act, so its delivery races the handoff.
+          takeMVar returning
+          withOwnedThread (throwTo runner ThreadKilled) $ \_ _ → do
+            outcome ← takeMVar finished
+            recorded ← warningComponents warnings
+            -- Cancelled, or finished before the cancellation could land; nothing else.
+            pure (either (\caught → fromException caught == Just ThreadKilled) (const True) outcome, recorded)
 
 -- | An application that owns its own shutdown and calls
 -- 'reportHostWakeDegradation' itself: a cancellation at that boundary's wait
@@ -1377,30 +1402,32 @@ testCancelledDuringACustomShutdown = do
         }
   warnings ← newIORef ([] ∷ [LogEntry])
   let capturing = recordingLogger warnings
-  (runner, finished) ←
-    onMainThread seam $
-      runWindowApplication
-        (withLoggingLifetime quietLogger)
-        "host-example"
-        (hostOver seam (settings [windowNamed "custom"]))
-        id
-        (\host _ → pure host)
-        ( \host _ → do
-            window ← onlyWindow host
-            _ ← forkIO (void (submitWindowCommand (hostCommandPort host) [] (observeOf window)))
-            takeMVar inside
-            -- The application's own boundary, with the obligation still in its
-            -- post: this call waits for it.
-            void (reportHostWakeDegradation capturing host)
-        )
-  awaitBlockedOnSTM runner
-  duringWait ← readIORef warnings
-  killThread runner
-  putMVar release ()
-  cancelled ← takeMVar finished
-  duringWait `shouldBe` []
-  either (Just . fromException) (const Nothing) cancelled `shouldBe` Just (Just ThreadKilled)
-  warningComponents warnings `shouldReturn` ["glfw.wake"]
+  withDeferredThread (\(host, window) → void (submitWindowCommand (hostCommandPort host) [] (observeOf window))) $ \_ handOverWorker →
+    withMainThread seam (void (tryPutMVar release ()))
+      ( runWindowApplication
+          (withLoggingLifetime quietLogger)
+          "host-example"
+          (hostOver seam (settings [windowNamed "custom"]))
+          id
+          (\host _ → pure host)
+          ( \host _ → do
+              window ← onlyWindow host
+              handOverWorker (host, window)
+              takeMVar inside
+              -- The application's own boundary, with the obligation still in its
+              -- post: this call waits for it.
+              void (reportHostWakeDegradation capturing host)
+          )
+      )
+      $ \runner finished → do
+      awaitBlockedOnSTM runner
+      duringWait ← readIORef warnings
+      killThread runner
+      putMVar release ()
+      cancelled ← takeMVar finished
+      duringWait `shouldBe` []
+      either (Just . fromException) (const Nothing) cancelled `shouldBe` Just (Just ThreadKilled)
+      warningComponents warnings `shouldReturn` ["glfw.wake"]
 
 -- | Admit one command, whose wake fails and degrades the session's wake path.
 degradeWakePath ∷ WindowHost → IO ()
@@ -1422,22 +1449,23 @@ testReportingIsInterruptible = do
           modifyIORef' attempts (+ 1)
           putMVar reached ()
           takeMVar never
-  (runner, finished) ←
-    onMainThread seam $
-      runWindowApplication
+  withMainThread seam (pure ())
+    ( runWindowApplication
         (withLoggingLifetime holding)
         "host-example"
         (hostOver seam (settings [windowNamed "interruptible"]))
         id
         (\host _ → pure host)
         (\host _ → degradeWakePath host)
-  -- The run has ended its action; the boundary's attempt is inside the sink.
-  takeMVar reached
-  killThread runner
-  cancelled ← takeMVar finished
-  either (Just . fromException) (const Nothing) cancelled `shouldBe` Just (Just ThreadKilled)
-  -- One attempt, spent by the cancellation and never retried.
-  readIORef attempts `shouldReturn` 1
+    )
+    $ \runner finished → do
+    -- The run has ended its action; the boundary's attempt is inside the sink.
+    takeMVar reached
+    killThread runner
+    cancelled ← takeMVar finished
+    either (Just . fromException) (const Nothing) cancelled `shouldBe` Just (Just ThreadKilled)
+    -- One attempt, spent by the cancellation and never retried.
+    readIORef attempts `shouldReturn` 1
 
 -- | A degradation begun after the loop returned, while admission is still open:
 -- the loop cannot claim it, and the application's own boundary after quiescence
@@ -1628,20 +1656,20 @@ testSettledBeforeDrain exit = do
               ActionCancelled → putMVar inside () >> awaitSupervised control retry
               _ → pure ()
           )
-  (runner, finished) ← onMainThread seam run
-  when (exit == ActionCancelled) $ do
-    takeMVar inside
-    awaitBlockedOnSTM runner
-    killThread runner
-  outcome ← takeMVar finished
-  case (exit, outcome) of
-    (ActionReturns, Right ()) → pure ()
-    (ActionCancelled, Left caught) | fromException caught == Just ThreadKilled → pure ()
-    (StartupFails, Left caught) | fromException caught == Just (Broken "startup failed") → pure ()
-    (ActionFails, Left caught) | fromException caught == Just (Broken "action failed") → pure ()
-    _ → unexpected ("the run ended with " <> either displayException (const "its result") outcome)
-  readTVarIO journal `shouldReturn` ["released with NotExecuted while its window was live"]
-  heldWindow held >>= windowEnded >>= (`shouldBe` True)
+  withMainThread seam (pure ()) run $ \runner finished → do
+    when (exit == ActionCancelled) $ do
+      takeMVar inside
+      awaitBlockedOnSTM runner
+      killThread runner
+    outcome ← takeMVar finished
+    case (exit, outcome) of
+      (ActionReturns, Right ()) → pure ()
+      (ActionCancelled, Left caught) | fromException caught == Just ThreadKilled → pure ()
+      (StartupFails, Left caught) | fromException caught == Just (Broken "startup failed") → pure ()
+      (ActionFails, Left caught) | fromException caught == Just (Broken "action failed") → pure ()
+      _ → unexpected ("the run ended with " <> either displayException (const "its result") outcome)
+    readTVarIO journal `shouldReturn` ["released with NotExecuted while its window was live"]
+    heldWindow held >>= windowEnded >>= (`shouldBe` True)
 
 testSupervisorDetectedFailure ∷ Expectation
 testSupervisorDetectedFailure = do
@@ -1718,18 +1746,18 @@ testAbandonedStartup = do
               void (startSupervised control (required Service) stalled)
           )
           (\() _ → pure ())
-  (runner, finished) ← onMainThread seam run
-  takeMVar inside
-  awaitBlockedOnSTM runner
-  killThread runner
-  takeMVar finished >>= \case
-    Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
-    Right () → unexpected "the cancelled application returned"
-  readTVarIO journal
-    `shouldReturn` [ "released the stalled startup with the requester's command unsettled"
-                   , "released with NotExecuted while its window was live"
-                   ]
-  heldWindow held >>= windowEnded >>= (`shouldBe` True)
+  withMainThread seam (pure ()) run $ \runner finished → do
+    takeMVar inside
+    awaitBlockedOnSTM runner
+    killThread runner
+    takeMVar finished >>= \case
+      Left caught → (fromException caught ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+      Right () → unexpected "the cancelled application returned"
+    readTVarIO journal
+      `shouldReturn` [ "released the stalled startup with the requester's command unsettled"
+                     , "released with NotExecuted while its window was live"
+                     ]
+    heldWindow held >>= windowEnded >>= (`shouldBe` True)
 
 -- ---------------------------------------------------------------------------
 -- Failed wake warnings
@@ -1754,14 +1782,14 @@ hostedFailure logger seam config startup action = do
       runWindowApplication (withLoggingLifetime logger) "host-example" (hostOver seam config) id startup action
   either pure (\_ → unexpected "the run returned instead of failing") outcome
 
--- | 'onMainThread' keeping the context of whatever the run raised, for the same
--- reason.
-onMainThreadKeepingContext
-  ∷ ∀ a. Seam → IO a → IO (ThreadId, MVar (Either (ExceptionWithContext SomeException) a))
-onMainThreadKeepingContext seam action = do
+-- | 'withMainThread' keeping the context of whatever the run raised, for the same reason.
+withMainThreadKeepingContext
+  ∷ ∀ a r. Seam → IO a → (ThreadId → MVar (Either (ExceptionWithContext SomeException) a) → IO r) → IO r
+withMainThreadKeepingContext seam action body = do
   finished ← newEmptyMVar
-  runner ← forkOS (designateProcessMainThread seam >> tryWithContext action >>= putMVar finished)
-  pure (runner, finished)
+  withOwnedBoundThread
+    (designateProcessMainThread seam >> tryWithContext action >>= putMVar finished)
+    (\runner _ → body runner finished)
 
 -- | Whether a native call released something the wake report must not have
 -- outlived: the host's window, or the session itself.
@@ -1870,26 +1898,27 @@ testWakeWarningCancelledAtItsSink = do
   never ← newEmptyMVar
   let holding =
         failingSink defaultLogFilter "glfw.wake" (\_ → putMVar reached () >> takeMVar never) trace
-  (runner, finished) ←
-    onMainThreadKeepingContext seam $
-      runWindowApplication
+  withMainThreadKeepingContext seam
+    ( runWindowApplication
         (withLoggingLifetime holding)
         "host-example"
         (hostOver seam (settings [windowNamed "cancelled"]))
         id
         (\host _ → pure host)
         (\host _ → degradeWakePath host)
-  -- The action has ended; the boundary's one attempt is inside the sink.
-  takeMVar reached
-  killThread runner
-  cancelled ← takeMVar finished
-  (failure, context) ← either raisedWith (\_ → unexpected "the cancelled run returned") cancelled
-  failure `shouldBe` ThreadKilled
-  diagnosticMarks context `shouldBe` []
-  null (Logging.failedReportsInContext context) `shouldBe` True
-  -- The attempt was spent, and the cancellation stopped it before it returned.
-  traced trace `shouldReturn` ["glfw.wake"]
-  flushed trace `shouldReturn` 0
+    )
+    $ \runner finished → do
+    -- The action has ended; the boundary's one attempt is inside the sink.
+    takeMVar reached
+    killThread runner
+    cancelled ← takeMVar finished
+    (failure, context) ← either raisedWith (\_ → unexpected "the cancelled run returned") cancelled
+    failure `shouldBe` ThreadKilled
+    diagnosticMarks context `shouldBe` []
+    null (Logging.failedReportsInContext context) `shouldBe` True
+    -- The attempt was spent, and the cancellation stopped it before it returned.
+    traced trace `shouldReturn` ["glfw.wake"]
+    flushed trace `shouldReturn` 0
 
 -- | A warning the filter drops spends the attempt without reaching the sink, so
 -- nothing failed and the lifetime's ordinary final flush still happens.
@@ -1961,13 +1990,18 @@ warningComponents entries = map (componentText . entryComponent) <$> readIORef e
 wakeWarnings ∷ IORef [LogEntry] → IO [Text]
 wakeWarnings entries = filter (== "glfw.wake") <$> warningComponents entries
 
--- | Run an action on a new bound thread designated as the process main thread,
--- so an example can cancel it.
-onMainThread ∷ ∀ a. Seam → IO a → IO (ThreadId, MVar (Either SomeException a))
-onMainThread seam action = do
+-- | Run an action on an owned bound thread designated as the process main thread, so an example can cancel it (#593). The body
+-- is given the thread and the cell its outcome is put into, and waits for it itself; however the body ends, the thread has
+-- ended and been joined before this returns. The designation is this helper's own and happens on the bound thread before the
+-- action. The first argument opens whatever the run may be held at, in the uninterruptible release and before the thread is
+-- killed (a run held at a gate only the example opens would otherwise hold the join).
+withMainThread ∷ ∀ a r. Seam → IO () → IO a → (ThreadId → MVar (Either SomeException a) → IO r) → IO r
+withMainThread seam open action body = do
   finished ← newEmptyMVar
-  runner ← forkOS (designateProcessMainThread seam >> (try action ∷ IO (Either SomeException a)) >>= putMVar finished)
-  pure (runner, finished)
+  withOwnedBoundThreadOpening
+    open
+    (designateProcessMainThread seam >> (try action ∷ IO (Either SomeException a)) >>= putMVar finished)
+    (\runner _ → body runner finished)
 
 settings ∷ [WindowConfig] → HostConfig
 settings windows =
