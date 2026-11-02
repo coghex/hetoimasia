@@ -227,10 +227,21 @@ cabal test hetoimasia-tests --test-show-details=direct
   (group `test.vulkan-run-native`, selected with `--match 'the child helper'`).
   A test that starts a thread starts it through `Test.Support.Owned`, and one that
   starts a subprocess through `Test.Support.Subprocess` (#588 converted the
-  subprocess sites the baseline listed). `glfw-tests` was converted in #593: every
-  thread it starts is owned (`Test.GLFW.Support`'s `onThread`, `onBoundThread`,
-  `withDeferredThread`, `withMainThread` and the scoped helpers beside the specs
-  that use them), and its baseline entries are gone. The examples that hold the
+  subprocess sites the baseline listed). `glfw-tests` was converted in #593, narrowed by
+  the owner (2026-11-02): every thread it starts is owned (`Test.GLFW.Support`'s
+  `onThread`, `onBoundThread`, `withDeferredThread`, `withMainThread` and the
+  scoped helpers beside the specs that use them) except one, the harassing
+  `forkIO` of `testRetirementRecordSurvivesCancellation` in
+  `Owner/Failure/Interruption.hs`, whose baseline entry (count 1) is kept. Seven
+  examples are left as before #593 and belong to a follow-up: that one, and the
+  six that hold the graphics owner inside its startup
+  (`Owner/Port.hs` `testPortFullReported` and `testFullPortDoesNotBlockExit`,
+  `Owner/Exit/Settlement.hs` `testUnannouncedDirectAttachSettles` and
+  `testUnannouncedClosedSettles`, `Owner/Handover.hs` `testHandoffOrder` and
+  `testHandoverRecovery`); the six start no thread and carry no baseline entry,
+  but their startup gate cannot be armed later than the owner's creation, so a
+  cancellation before the body's first step is not covered for them. The
+  `glfw-tests` subprocess starts (`Linking.hs`, `Opacity.hs`) are #588's. The examples that hold the
   conversion to account run in `glfw-tests` (`--match '#593'`), each as an owned
   example and a negative control: the start-and-wait helper, the bound
   main-thread helper and the bound start in a session, a deferred thread, a
