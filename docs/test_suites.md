@@ -147,7 +147,15 @@ cabal test hetoimasia-tests --test-show-details=direct
   (`OwnedThread`: every way a scope can end with a thread parked at a gate, each
   with a negative control that applies the same judgement to a deliberately
   unowned start and must fail; the thread that ended on its own; the
-  uninterruptible release; the interruptibility the body runs with; the
+  uninterruptible release; the interruptibility the body runs with; since #593 the
+  owned bound start (`withOwnedBoundThread`: every ending again, with a plain
+  `forkOS` start as the negative control; the thread is bound and the unbound
+  start is not; the gate the scope opens for a thread that keeps waiting after a
+  kill; the interruptibility the body and the thread run with; and a cancellation
+  already pending when the start returns from its acquisition) and the rescue of
+  the negative controls themselves (a worker registered even when a cancellation
+  is pending as the control starts it, and a stop-and-join that a pending
+  cancellation does not abandon); the
   cancellation helpers behind the two `Library.hs` helpers and the parked-release
   orchestration behind `ChildSpec`, with their former unowned forms as controls)
   `the shared subprocess facility` (`OwnedSubprocess`: a command run to completion
@@ -181,8 +189,19 @@ cabal test hetoimasia-tests --test-show-details=direct
   (group `test.vulkan-run-native`, selected with `--match 'the child helper'`).
   A test that starts a thread starts it through `Test.Support.Owned`, and one that
   starts a subprocess through `Test.Support.Subprocess` (#588 converted the
-  subprocess sites the baseline listed); the thread sites that existed when the
-  guard was introduced are a known-debt baseline to be removed by follow-up
+  subprocess sites the baseline listed). `glfw-tests` was converted in #593: every
+  thread it starts is owned (`Test.GLFW.Support`'s `onThread`, `onBoundThread`,
+  `withDeferredThread`, `withMainThread` and the scoped helpers beside the specs
+  that use them), and its baseline entries are gone. The examples that hold the
+  conversion to account run in `glfw-tests` (`--match '#593'`), each as an owned
+  example and a negative control: the start-and-wait helper, the bound
+  main-thread helper and the bound start in a session, a deferred thread, a
+  submitter, a waiting admission and a publication parked in an admission or
+  demand hook with its gate closed (`GLFW admission helper threads`), an injector
+  and the helper it never reaches, a runner parked in its construction whose
+  rollback waits at a second gate, and an evidence supplier waiting for an owner
+  that never exists (`GLFW protected host`, `the drain`). The thread sites that
+  remain in other suites are a known-debt baseline to be removed by follow-up
   changes, not to be extended.
 
 ## Vulkan suites
