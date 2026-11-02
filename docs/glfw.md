@@ -5584,7 +5584,14 @@ own on Linux, or the desktop opt-in on a real desktop.
   started from a callback outlives the callback and is stopped and joined when the
   example ends. An example that holds a thread at a gate only it can open registers
   the gate's opening with the thread, so the join never waits for a gate the
-  failed example left closed. An
+  failed example left closed. A rig fixture that scripts a failing or gated
+  backend arms it inside the body's first masked step, after the release that
+  undoes it is registered (`Rig.armedBody`, `armedFinally`), and the protected
+  fixtures' rescue is sticky once a cleanup has begun; both are exercised at each
+  cut by `Test.GLFW.Support.cutExamples`. Seven examples were left out of that
+  conversion (see `docs/test_suites.md`): the six that hold the graphics owner
+  inside its startup, and `testRetirementRecordSurvivesCancellation`, whose
+  harassing `forkIO` keeps its baseline entry. An
   example that must initialize GLFW, open a real window, or observe the platform
   belongs in `glfw-native-tests` and its shared fixture.
 - **The session wake examples** (`--match "GLFW session wake"`) use only the
