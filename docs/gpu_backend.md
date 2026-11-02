@@ -5661,6 +5661,17 @@ VK-18's D-33 order and releases nothing early.
   was, the built pipeline reused for every later frame of its format, nothing
   held after a refused layout, and one layout and one pipeline per color format.
 
+Every helper thread of the headless suites is an owned thread (#595,
+`Test.Support.Owned`): the stepper and killer of the generation examples, the
+producers and closers of the diagnostics lifetimes, the off-owner refusal checks
+(`onOtherThread`), and the integration suite's evidence suppliers, which publish what a
+run's exit needs in order to finish and so are started before the run and joined after
+its exit (`withRunHelper`), never inside the body that hands them their arguments. The
+cancellation thrown at the owner from inside a masked native step comes from a canceller
+the run owns (`withCanceller`), because a thread joined inside that step would wait for a
+delivery the step itself holds off. The one start not converted is the example bound's own,
+`Bound.hs`, audited in `tools/validation/owned_starts.json`.
+
 Every `integration-tests` example runs under a fixture-aware bound
 (`Test.GPU.Vulkan.GLFW.Bound`): a minute, or thirty seconds for those under
 `Vulkan controller`, for the whole example rather than for each rig run. A

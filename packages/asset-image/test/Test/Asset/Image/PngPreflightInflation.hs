@@ -16,8 +16,8 @@
 -- after inflation, or a compressed-size limit would not tell these apart.
 module Test.Asset.Image.PngPreflightInflation (spec) where
 
-import Control.Concurrent (forkFinally, newEmptyMVar, putMVar, readMVar, takeMVar, throwTo, tryPutMVar)
-import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), SomeAsyncException, evaluate, fromException, try)
+import Control.Concurrent (newEmptyMVar, putMVar, readMVar, takeMVar, throwTo, tryPutMVar)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), SomeAsyncException, evaluate, fromException, mask, try)
 import Control.Monad (forM, forM_, replicateM_, void)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Internal as ByteString (toForeignPtr)
@@ -35,6 +35,7 @@ import System.IO.Unsafe (unsafePerformIO)
 import Test.Asset.Image.PngBuilder
 import Test.Asset.Image.PreflightSupport
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = describe "PngPreflight inflation and ownership" $ do
@@ -294,13 +295,16 @@ faultSpec = describe "faults and asynchronous exceptions" $ do
         answer = preflightPng m1PngLimits gated "not a PNG"
     -- The child announces itself too once it has an answer, so a library that
     -- never blocks here fails the example instead of hanging it.
-    child ← forkFinally (evaluate answer >> void (tryPutMVar entered ())) (putMVar finished)
-    takeMVar entered
-    throwTo child ThreadKilled
-    outcome ← takeMVar finished
-    case outcome of
-      Left failure → (fromException failure ∷ Maybe SomeAsyncException) `shouldSatisfy` isJust
-      Right _ → expectationFailure "an asynchronous exception became a result"
+    -- The child is owned by the example: if the example fails before the cancellation is delivered, the child (parked at the gate,
+    -- an interruptible wait) is killed and joined with it rather than left for the rest of the process. It publishes what it
+    -- ended with, and ends, as it did under @forkFinally@; the example's own wait for that outcome is kept.
+    withOwnedThread (mask (\restore → try (restore (evaluate answer >> void (tryPutMVar entered ()))) >>= putMVar finished)) $ \child _ → do
+      takeMVar entered
+      throwTo child ThreadKilled
+      outcome ← takeMVar finished
+      case outcome of
+        Left failure → (fromException failure ∷ Maybe SomeAsyncException) `shouldSatisfy` isJust
+        Right _ → expectationFailure "an asynchronous exception became a result"
     -- The same value, demanded again once the gate opens, is the normal
     -- refusal: the interrupted evaluation was resumed, not cached as an answer.
     putMVar gate ()

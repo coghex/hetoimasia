@@ -12,7 +12,7 @@
 -- "Test.Foundation.Messaging.Visibility". All are composed into this group, so @--match Messaging@ selects all of them.
 module Test.Foundation.Messaging.Spec (spec) where
 
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (killThread)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.DeepSeq (NFData (rnf))
 import Control.Exception
@@ -60,6 +60,7 @@ import Test.Hspec
   , shouldBe
   , shouldReturn
   )
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = describe "Messaging" $ do
@@ -242,19 +243,22 @@ testCancelledPreparation = do
   entered ← newEmptyMVar
   release ← newEmptyMVar
   result ← newEmptyMVar
-  producer ← forkIO $ do
-    outcome ←
-      tryWithContext @SomeException $
-        withOperationContext messages publishFrame [] $
-          void (prepare (Gated entered release))
-    putMVar result outcome
-  takeMVar entered
-  killThread producer
-  outcome ← takeMVar result
-  -- Keeps the gate reachable until the cancellation was observed.
-  void (tryPutMVar release ())
-  case outcome of
-    Left (ExceptionWithContext context cancellation) → do
-      fromException cancellation `shouldBe` Just ThreadKilled
-      failureEvidenceInContext context `shouldBe` FailureEvidence NativeCause []
-    Right () → expectationFailure "expected the preparation to be cancelled"
+  withOwnedThread
+    ( do
+        outcome ←
+          tryWithContext @SomeException $
+            withOperationContext messages publishFrame [] $
+              void (prepare (Gated entered release))
+        putMVar result outcome
+    )
+    $ \producer _ → do
+      takeMVar entered
+      killThread producer
+      outcome ← takeMVar result
+      -- Keeps the gate reachable until the cancellation was observed.
+      void (tryPutMVar release ())
+      case outcome of
+        Left (ExceptionWithContext context cancellation) → do
+          fromException cancellation `shouldBe` Just ThreadKilled
+          failureEvidenceInContext context `shouldBe` FailureEvidence NativeCause []
+        Right () → expectationFailure "expected the preparation to be cancelled"

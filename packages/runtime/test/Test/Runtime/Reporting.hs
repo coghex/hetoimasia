@@ -10,7 +10,7 @@
 -- stops an example that has already hung.
 module Test.Runtime.Reporting (spec) where
 
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (killThread)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception
   ( AsyncException (ThreadKilled)
@@ -97,6 +97,7 @@ import Test.Hspec
   , shouldReturn
   , shouldSatisfy
   )
+import Test.Support.Owned (withOwnedThread)
 import Test.Support.Bounded (bounded)
 
 spec ∷ Spec
@@ -617,19 +618,20 @@ testCancelledWhileReporting = do
       work =
         withScoped (allocResource (pure ()) (\_ → note trace "released")) $ \_ →
           failAttempt 1 ∷ IO ()
-  runner ←
-    forkIO $
-      try (reportTerminalFailure logger reporting "Widget load failed" (pure []) work)
+  withOwnedThread
+    ( try (reportTerminalFailure logger reporting "Widget load failed" (pure []) work)
         >>= putMVar outcome
-  takeMVar entered
-  killThread runner
-  result ← takeMVar outcome
-  case result of
-    Right () → expectationFailure "the cancelled boundary returned"
-    Left failure → do
-      -- The cancellation, not the failure being reported.
-      (fromException failure ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
-      widgetOf failure `shouldBe` Nothing
+    )
+    $ \runner _ → do
+      takeMVar entered
+      killThread runner
+      result ← takeMVar outcome
+      case result of
+        Right () → expectationFailure "the cancelled boundary returned"
+        Left failure → do
+          -- The cancellation, not the failure being reported.
+          (fromException failure ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+          widgetOf failure `shouldBe` Nothing
   readIORef trace `shouldReturn` ["released"]
 
 testCancellationFromOutcomeReport ∷ Expectation

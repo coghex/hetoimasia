@@ -15,7 +15,7 @@
 -- only stops an example that has already hung.
 module Test.Runtime.ResourceSmoke (spec) where
 
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (killThread)
 import Control.Concurrent.MVar
   ( MVar
   , modifyMVar
@@ -95,6 +95,7 @@ import Test.Hspec
   , shouldContain
   , shouldReturn
   )
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = describe "Console resource smoke" $ do
@@ -204,10 +205,10 @@ cancelledSmokeOutcome
   ∷ Logger → ReleaseOutcomes → SmokeWork → MVar () → IO (Either SomeException Int)
 cancelledSmokeOutcome logger outcomes work entered = do
   outcome ← newEmptyMVar
-  runner ← forkIO $ try (resourceSmoke logger outcomes work) >>= putMVar outcome
-  takeMVar entered
-  killThread runner
-  takeMVar outcome
+  withOwnedThread (try (resourceSmoke logger outcomes work) >>= putMVar outcome) $ \runner _ → do
+    takeMVar entered
+    killThread runner
+    takeMVar outcome
 
 -- | Signals that it has arrived, then blocks on an 'MVar' the example holds and
 -- never fills. That retained reference is what makes this an interruptible

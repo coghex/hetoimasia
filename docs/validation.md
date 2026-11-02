@@ -697,17 +697,24 @@ any other way, and its message names the facility that fits the kind of start.
   header are not code, so they are not sites; qualified calls are.
 - **A per-file count ratchet.** `tools/validation/owned_starts_baseline.json`
   records, per file, how many unowned starts it had when the guard was introduced
-  (491 in 156 files: the 552 found when the guard was introduced plus the three
+  (382 in 124 files: the 552 found when the guard was introduced plus the three
   starts `tools/test/RunnerIdentity.hs` brought, written by
-  `owned_starts.py bootstrap`, less the 64 that #588 removed: its 57 subprocess
-  starts, the three of `RunnerIdentity.hs`, which have the same shape, and the four
-  thread starts that existed only to serve them), and less the 24 thread starts of the
+  `owned_starts.py bootstrap`, less the 24 thread starts of the
   root run and console suites and the `lua-domains` sample that #600 converted (the `Run`
   examples of `test-full/`, the console's signal and exit examples, and the sample's
   `Test.Domains.Support` helpers and `Accounting` reaper), and less the 87 thread
   starts of the foundation, runtime and asset-image suites that #597 converted (those
   suites keep baseline entries only for the subprocess starts of their `*Opacity.hs`
-  and `*Client.hs` sources, which are #588's). Each file's count
+  and `*Client.hs` sources, which are #588's), and less the 62 that #588 removed: its
+  subprocess starts, the three of `RunnerIdentity.hs`, which have the same shape, and the
+  four thread starts that existed only to serve them. #588 left two files in the
+  baseline on purpose: the display-helper suites, `tools/x11-test/Main.hs` and
+  `tools/wayland-test/Main.hs`, whose subprocess starts need a hosted-subprocess helper
+  that its owner decision of 2026-11-02 moved to a separate issue). #595 then removed the 105
+  thread starts of the headless Vulkan suites it converted (`diagnostics-tests`, `native-tests`,
+  `integration-tests`, `render-2d-vulkan-tests` and the `allocator-parity-probe`), and the three
+  starts of the integration suite's example bound, `Bound.hs`, left the baseline as audited
+  helpers (below). Each file's count
   must equal its baseline: a count above it is a new unowned start; a count below
   it is a stale entry, so the baseline stays honest and can only shrink. The
   baseline is a known-debt list classified mechanically, not a list of proven
@@ -745,6 +752,20 @@ any other way, and its message names the facility that fits the kind of start.
   recorded in the control's rescue list in the same masked step that starts it, and
   a rescue registered before the control exposes any thread lets it go, stops it and
   joins it on every way out. A converted helper is never exempt.
+  The negative controls of the headless Vulkan suites (#595) keep one deliberately unowned
+  start each, in the one binding `startUnowned` of `Test.GPU.Vulkan.Native.Unowned`,
+  `Test.GPU.Vulkan.Diagnostics.Unowned` and `Test.GPU.Vulkan.GLFW.Unowned`, stopped and joined
+  independently by the control that made it. The three audited starts of the integration
+  suite's example bound are exempt by binding, one start each: `runBounded` (the example's
+  thread, forked masked inside a scope that runs its whole lifetime masked: expiry, an
+  interruption and a rig run still outstanding pass through `rescue`, which rescues the rigs
+  before it cancels, since the graphics owner's protected exit absorbs cancellation until a
+  rig has been let go, and then cancels the thread and waits for its end; a completed result
+  with no run outstanding returns without `rescue`, the thread already past its last act),
+  `started` (every canceller and the watchdog: forked masked with a done cell that `rescue`
+  joins uninterruptibly) and `terminateProcess` (writes one line, waited for a second at
+  most, after which its caller ends the whole process with `_Exit`, so it is not joined by
+  design). A new raw start in `Bound.hs` is counted as any other.
 - **Selection.** The guard's inputs are every scanned source directory and every
   package description, listed as inputs of `test.workflow` in the catalog, beside
   `tools/validation/` (the script, its configuration and its baseline). An

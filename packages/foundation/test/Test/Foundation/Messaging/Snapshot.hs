@@ -12,7 +12,7 @@
 -- group, in "Test.Runtime.Messaging".
 module Test.Foundation.Messaging.Snapshot (spec) where
 
-import Control.Concurrent (forkIO, myThreadId)
+import Control.Concurrent (myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (STM, atomically, orElse, retry, throwSTM)
 import Control.DeepSeq (NFData (rnf))
@@ -51,8 +51,9 @@ import Hetoimasia.Foundation.Worker
   , workerDefinition
   )
 import System.IO.Unsafe (unsafePerformIO)
-import Test.Foundation.Messaging.Support (awaitBlockedOnSTM, boundedExample, newGate, openGate)
+import Test.Foundation.Messaging.Support (awaitBlockedOnSTM, boundedExample, newGate, openGate, withOwnedThreads)
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = do
@@ -128,16 +129,18 @@ updateText = \case
 immediate ∷ SnapshotReader Int → SnapshotCursor Int → IO String
 immediate reader cursor = atomically ((updateText <$> awaitSnapshot reader cursor) `orElse` pure "retried")
 
--- | Run a wait on its own thread, perform the wake once that thread has parked
--- in its transaction, and return both results.
+-- | Run a wait on a thread of its own, perform the wake once that thread has parked
+-- in its transaction, and return both results. The waiter is owned by this call: if the wake or the wait for the
+-- result fails, or the example is cancelled, the waiter (parked in its transaction, an interruptible wait) is killed and
+-- joined before this returns.
 blockedUntil ∷ STM r → STM w → IO (r, w)
 blockedUntil wait wake = do
   result ← newEmptyMVar
-  waiter ← forkIO (atomically wait >>= putMVar result)
-  awaitBlockedOnSTM waiter
-  woke ← atomically wake
-  waited ← takeMVar result
-  pure (waited, woke)
+  withOwnedThread (atomically wait >>= putMVar result) $ \waiter _ → do
+    awaitBlockedOnSTM waiter
+    woke ← atomically wake
+    waited ← takeMVar result
+    pure (waited, woke)
 
 -- Publication ----------------------------------------------------------------
 
@@ -171,28 +174,28 @@ testIndependentReaders = do
   start ← observedCursor <$> atomically (readSnapshot reader)
   first ← newEmptyMVar
   second ← newEmptyMVar
-  firstThread ← forkIO (atomically (awaitSnapshot reader start) >>= putMVar first)
-  secondThread ← forkIO (atomically (awaitSnapshot reader start) >>= putMVar second)
-  awaitBlockedOnSTM firstThread
-  awaitBlockedOnSTM secondThread
-  publishInt publisher 1 `shouldReturn` Published
-  firstUpdate ← takeMVar first
-  secondUpdate ← takeMVar second
-  updateText firstUpdate `shouldBe` "value 1 at 1"
-  updateText secondUpdate `shouldBe` "value 1 at 1"
-  -- Neither reader acknowledged anything for the other or for a later reader:
-  -- the original cursor still sees the publication.
-  immediate reader start `shouldReturn` "value 1 at 1"
+  withOwnedThread (atomically (awaitSnapshot reader start) >>= putMVar first) $ \firstThread _ → do
+    withOwnedThread (atomically (awaitSnapshot reader start) >>= putMVar second) $ \secondThread _ → do
+      awaitBlockedOnSTM firstThread
+      awaitBlockedOnSTM secondThread
+      publishInt publisher 1 `shouldReturn` Published
+      firstUpdate ← takeMVar first
+      secondUpdate ← takeMVar second
+      updateText firstUpdate `shouldBe` "value 1 at 1"
+      updateText secondUpdate `shouldBe` "value 1 at 1"
+      -- Neither reader acknowledged anything for the other or for a later reader:
+      -- the original cursor still sees the publication.
+      immediate reader start `shouldReturn` "value 1 at 1"
 
-  -- The first reader advances its own cursor and misses nothing but the
-  -- intermediate publications, which it never receives.
-  advanced ← case firstUpdate of
-    Updated observation → pure (observedCursor observation)
-    EndOfStream → throwIO (userError "expected an update")
-  immediate reader advanced `shouldReturn` "retried"
-  forM_ [2, 3, 4] $ \value → publishInt publisher value `shouldReturn` Published
-  immediate reader advanced `shouldReturn` "value 4 at 4"
-  immediate reader start `shouldReturn` "value 4 at 4"
+      -- The first reader advances its own cursor and misses nothing but the
+      -- intermediate publications, which it never receives.
+      advanced ← case firstUpdate of
+        Updated observation → pure (observedCursor observation)
+        EndOfStream → throwIO (userError "expected an update")
+      immediate reader advanced `shouldReturn` "retried"
+      forM_ [2, 3, 4] $ \value → publishInt publisher value `shouldReturn` Published
+      immediate reader advanced `shouldReturn` "value 4 at 4"
+      immediate reader start `shouldReturn` "value 4 at 4"
 
 testCoherentPairs ∷ Expectation
 testCoherentPairs = do
@@ -206,30 +209,31 @@ testCoherentPairs = do
   -- has something newer to receive.
   initial ← observedCursor <$> atomically (readSnapshot reader)
   start ← newGate
-  let checkedReader waiting = do
-        done ← newEmptyMVar
-        _ ← forkIO $ do
-          outcome ← try @SomeException $ do
-            readMVar start
-            let loop cursor = do
-                  observation ←
-                    if waiting
-                      then
-                        atomically (awaitSnapshot reader cursor) >>= \case
-                          Updated observation → pure observation
-                          EndOfStream → throwIO (userError "ended before the last publication")
-                      else atomically (readSnapshot reader)
-                  let (value, revision) = pairOf observation
-                  unless (toInteger value == revision) $
-                    throwIO (userError ("value " <> show value <> " paired with revision " <> show revision))
-                  unless (value == count) (loop (observedCursor observation))
-            loop initial
-          putMVar done outcome
-        pure done
-  readers ← forM [True, True, False, False] checkedReader
-  openGate start
-  forM_ [1 .. count] $ \value → publishInt publisher value `shouldReturn` Published
-  traverse_ (\done → takeMVar done >>= either throwIO pure) readers
+  let checkedReader waiting done = do
+        outcome ← try @SomeException $ do
+          readMVar start
+          let loop cursor = do
+                observation ←
+                  if waiting
+                    then
+                      atomically (awaitSnapshot reader cursor) >>= \case
+                        Updated observation → pure observation
+                        EndOfStream → throwIO (userError "ended before the last publication")
+                    else atomically (readSnapshot reader)
+                let (value, revision) = pairOf observation
+                unless (toInteger value == revision) $
+                  throwIO (userError ("value " <> show value <> " paired with revision " <> show revision))
+                unless (value == count) (loop (observedCursor observation))
+          loop initial
+        putMVar done outcome
+      modes = [True, True, False, False]
+  readers ← forM modes $ \_ → newEmptyMVar
+  -- Every reader is owned by the example: each waits at the gate or in a waiting read (both interruptible), so it is killed
+  -- and joined however the example ends.
+  withOwnedThreads (zipWith checkedReader modes readers) $ do
+    openGate start
+    forM_ [1 .. count] $ \value → publishInt publisher value `shouldReturn` Published
+    traverse_ (\done → takeMVar done >>= either throwIO pure) readers
   current reader `shouldReturn` (count, toInteger count)
 
 testRollback ∷ Expectation
