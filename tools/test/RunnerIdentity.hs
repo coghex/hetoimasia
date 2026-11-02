@@ -24,7 +24,7 @@
 module RunnerIdentity (runnerIdentitySpec) where
 
 import Control.Concurrent (threadDelay)
-import Control.Exception (finally)
+import Control.Exception (bracket, onException)
 import Control.Monad (forM, forM_, void, when)
 import Data.Char (isHexDigit)
 import Data.List (isInfixOf, isPrefixOf, isSuffixOf, sort)
@@ -45,7 +45,7 @@ import System.Directory
   )
 import System.Exit (ExitCode (..))
 import System.FilePath (takeDirectory, takeFileName, (</>))
-import System.IO (IOMode (WriteMode), withFile)
+import System.IO (Handle, IOMode (WriteMode), withFile)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Process (CreateProcess (..), StdStream (UseHandle), createProcess, getPid, proc, readCreateProcessWithExitCode, waitForProcess)
 import System.Timeout (timeout)
@@ -207,7 +207,7 @@ standInBody =
 -- executable, a file whose bytes follow the source file (the full-product
 -- command's follow only @FIXTURE_BUILD_TAG@), and @list-bin@ names it; a library
 -- or a package names no single executable. @FIXTURE_BUILD@ chooses how a build
--- ends: @fail@, @block@ until signalled, or @edits@ the source while compiling;
+-- ends: @fail@ after writing, @failfirst@ before writing anything, @block@ until signalled, or @edits@ the source while compiling;
 -- @FIXTURE_FAIL_ON@ fails the build right after the named executable is written.
 standInCabal ∷ String
 standInCabal =
@@ -255,6 +255,7 @@ standInCabal =
     , "  exit 0"
     , "fi"
     , "if [ \"$command\" = build ]; then"
+    , "  if [ \"$FIXTURE_BUILD\" = failfirst ]; then echo 'cabal: the build failed before it wrote anything' >&2; exit 1; fi"
     , "  for target in $targets; do"
     , "    name=\"$(resolve \"$target\")\""
     , "    [ -n \"$name\" ] || continue"
@@ -638,6 +639,21 @@ failedBuildSpec = describe "a build that does not complete" $ do
       outcome ← runNative native [] suite
       refusedBeforeAnythingStarts native outcome [suite, "bash tools/vulkan/run.sh build " ++ suite]
 
+  it "does not make the earlier executable's identity describe the edited tree when the build fails before it writes anything" $
+    withNative $ \native → do
+      built native [] [suite]
+      setSource native edited
+      failed ← build native [("FIXTURE_BUILD", "failfirst")] [suite]
+      outcomeStatus failed `shouldBe` ExitFailure 1
+      fingerprintsRemoved native
+      -- The executable is the one built from the original tree, and its record says so.
+      outcome ← runNative native [] suite
+      refusedBeforeAnythingStarts native outcome [suite, "bash tools/vulkan/run.sh build " ++ suite, "source digest"]
+      setSource native original
+      revision ← headRevision native
+      restored ← runNative native [] suite
+      void $ ranWith native restored "vulkan-native-tests" revision
+
   it "leaves no stamp at all when the first build fails" $
     withNative $ \native → do
       failed ← build native [("FIXTURE_BUILD", "fail")] [suite]
@@ -696,9 +712,17 @@ failedBuildSpec = describe "a build that does not complete" $ do
 interruptedBuild ∷ Native → [String] → IO ()
 interruptedBuild native targets = do
   let root = nativeRoot native
-  withFile (root </> "interrupted.log") WriteMode $ \logHandle → do
-    (_, _, _, handle) ←
-      createProcess
+      logPath = root </> "interrupted.log"
+  -- The checkout is removed when the example ends, so a failure prints what the runner said first.
+  withFile logPath WriteMode (\logHandle → interruptedBuildWith native targets logHandle)
+    `onException` (readStrict logPath >>= \text → putStrLn ("the signalled runner's output:\n" ++ text))
+
+interruptedBuildWith ∷ Native → [String] → Handle → IO ()
+interruptedBuildWith native targets logHandle =
+  -- Started under mask with its cleanup registered in the same step: whatever happens to the
+  -- example, the runner's whole process group is killed and the runner waited for.
+  bracket
+    ( createProcess
         (proc "bash" ((root </> runScript) : "build" : targets))
           { cwd = Just root
           , env = Just (withSettings native [("FIXTURE_BUILD", "block")])
@@ -706,18 +730,23 @@ interruptedBuild native targets = do
           , std_out = UseHandle logHandle
           , std_err = UseHandle logHandle
           }
-    pid ← getPid handle >>= maybe (fail "the runner has no process id") pure
-    let signalGroup = do
-          (delivered, _, errors) ← run [] root "bash" ["-c", "kill -TERM -- -\"$0\"", show pid]
-          (delivered, errors) `shouldBe` (ExitSuccess, "")
-        endGroup = run [] root "bash" ["-c", "kill -KILL -- -\"$0\" 2>/dev/null || true", show pid]
-    ( do
+    )
+    ( \(_, _, _, handle) → do
+        pid ← getPid handle
+        forM_ pid $ \started → void (run [] root "bash" ["-c", "kill -KILL -- -\"$0\" 2>/dev/null || true", show started])
+        void (waitForProcess handle)
+    )
+    ( \(_, _, _, handle) → do
+        pid ← getPid handle >>= maybe (fail "the runner has no process id") pure
         awaitFile (root </> "build-started")
-        signalGroup
+        -- As the validation runner signals every member of a stage's session at its expiry.
+        (delivered, _, errors) ← run [] root "bash" ["-c", "kill -TERM -- -\"$0\"", show pid]
+        (delivered, errors) `shouldBe` (ExitSuccess, "")
         finished ← timeout (60 * 1000 * 1000) (waitForProcess handle)
         when (finished == Nothing) $ expectationFailure "the signalled build did not end within a minute"
-      )
-      `finally` (void endGroup >> void (waitForProcess handle))
+    )
+  where
+    root = nativeRoot native
 
 launcherSpec ∷ Spec
 launcherSpec = describe "the launcher and the full-product command it starts" $ do
