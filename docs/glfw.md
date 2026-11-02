@@ -5588,12 +5588,15 @@ own on Linux, or the desktop opt-in on a real desktop.
   backend arms it inside the body's first masked step, after the release that
   undoes it is registered (`Rig.armedBody`, `armedFinally`), and the protected
   fixtures' rescue is sticky once a cleanup has begun; both are exercised at each
-  cut by `Test.GLFW.Support.cutExamples`. Eight examples were left out of that
+  cut by `Test.GLFW.Support.cutExamples`. Nine examples were left out of that
   conversion (see `docs/test_suites.md`): the six that hold the graphics owner
   inside its startup, `testCoherentDestructionSnapshot`, whose destruction hook
-  waits for an owner handle only the consumer callback publishes, and
-  `testRetirementRecordSurvivesCancellation`, whose harassing `forkIO` keeps its
-  baseline entry. An
+  waits for an owner handle only the consumer callback publishes,
+  `testStallWarningCancelledAtItsSink`, whose cleanup kill can land before any
+  rescue of the protected drain exists (so the drain blocks in the stall
+  diagnostic's sink), and `testRetirementRecordSurvivesCancellation`; three
+  thread references remain unowned with baseline entries (two in
+  `Protected.hs`, one in `Owner/Failure/Interruption.hs`). An
   example that must initialize GLFW, open a real window, or observe the platform
   belongs in `glfw-native-tests` and its shared fixture.
 - **The session wake examples** (`--match "GLFW session wake"`) use only the
