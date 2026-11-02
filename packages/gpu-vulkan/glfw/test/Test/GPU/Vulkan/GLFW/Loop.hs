@@ -948,17 +948,25 @@ testStalledMainThread = do
     served ← newTVarIO False
     rendered ← newTVarIO 0
     servedWhileHeld ← newTVarIO Nothing
+    -- The command thread starts on the publishing thread's say-so, a latch that stays set, and says in turn, by another
+    -- that stays set, that the command was admitted: the publishing thread publishes only after that, so the command is
+    -- admitted while the pump is held whatever the threads' scheduling, as it was when the publishing thread forked the
+    -- command thread after it had seen the hold. The pump itself is a flag that the publishing thread clears.
+    commanderGo ← newTVarIO False
+    admitted ← newTVarIO False
     -- The test's own thread: once the main thread is held inside its native
     -- event call, it publishes scenes — which is what an application thread
     -- other than the main one does — and submits a window command.
     let commander = do
-          atomically (pumpHeld rig >>= check)
+          atomically (readTVar commanderGo >>= check)
           -- Admitted at once, and executed only by the main thread's pump.
           awaitSubmitWindowCommand (hostCommandPort (vulkanWindowHost host)) [("client", "integration-tests")] (setWindowSizeCommand window (Extent 80 60)) >>= \case
-            WaitAccepted ticket → awaitCompletion ticket >> atomically (writeTVar served True)
-            WaitClosed → pure ()
+            WaitAccepted ticket → atomically (writeTVar admitted True) >> awaitCompletion ticket >> atomically (writeTVar served True)
+            WaitClosed → atomically (writeTVar admitted True)
         primary = do
           atomically (pumpHeld rig >>= check)
+          atomically (writeTVar commanderGo True)
+          atomically (readTVar admitted >>= check)
           before ← presentsOf rig (graphicsAttachment service)
           forM_ [1 .. 3 ∷ Int] $ \count → do
             scene ← prepare 0

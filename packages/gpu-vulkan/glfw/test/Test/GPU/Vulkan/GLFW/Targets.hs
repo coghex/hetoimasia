@@ -893,8 +893,9 @@ testLedgerCancellation = do
   atomically (registerSceneTarget scenes (TargetAdopter identity))
   hooks ← newTVarIO ([] ∷ [String])
   entered ← newProceedGate
-  proceed ← newProceedGate
-  let lifecycle =
+  -- Each transition has a hold of its own: the scope that runs it opens that hold, for every callback of the transition,
+  -- when it ends, so a later transition is never left with a hold already open.
+  let lifecycleOf proceed =
         SceneLifecycle
           { sceneAdopted = \_ revision _ → do
               atomically (modifyTVar' hooks (<> ["adopted " <> show revision]))
@@ -905,29 +906,31 @@ testLedgerCancellation = do
               allowOne entered
               awaitProceed proceed
           }
-      cancelDuring action = do
+      cancelDuring transition = do
         finished ← newEmptyMVar
-        withOwnedThreadOpening (openProceed proceed) (try @SomeException (void action) >>= putMVar finished) $ \thread _ → do
+        proceed ← newProceedGate
+        withOwnedThreadOpening (openProceed proceed) (try @SomeException (void (transition (lifecycleOf proceed))) >>= putMVar finished) $ \thread _ → do
           awaitProceed entered
           -- The cancellation is delivered once the transition ends, never in it: the thrower is blocked until then,
           -- and only then is the hook let go.
           withOwnedThread (throwTo thread (ErrorCall "cancelled")) $ \cancelled _ → do
-            awaitSettled cancelled
+            awaitHeldOff cancelled
             allowOne proceed
             takeMVar finished
       standingOf = Map.lookup (KeyOffscreen identity) . sceneWindows
   -- An adoption cancelled while its hook runs.
-  _ ← cancelDuring (adoptScene scenes lifecycle 100 (TargetAdopter identity) (5 ∷ Scene) 3)
+  _ ← cancelDuring (\lifecycle → adoptScene scenes lifecycle 100 (TargetAdopter identity) (5 ∷ Scene) 3)
   standing ← atomically (readSceneState scenes (pure []))
   -- A second revision, then the target ends: two records are due, and the release is cancelled while the first
   -- one's hook runs.
-  _ ← cancelDuring (adoptScene scenes lifecycle 100 (TargetAdopter identity) (6 ∷ Scene) 4)
+  _ ← cancelDuring (\lifecycle → adoptScene scenes lifecycle 100 (TargetAdopter identity) (6 ∷ Scene) 4)
   atomically (endSceneTarget scenes (TargetAdopter identity))
   finished ← newEmptyMVar
-  withOwnedThreadOpening (openProceed proceed) (try @SomeException (releaseScenes scenes (sceneReleased lifecycle) (\_ _ → pure False)) >>= putMVar finished) $ \thread _ → do
+  proceed ← newProceedGate
+  withOwnedThreadOpening (openProceed proceed) (try @SomeException (releaseScenes scenes (sceneReleased (lifecycleOf proceed)) (\_ _ → pure False)) >>= putMVar finished) $ \thread _ → do
     awaitProceed entered
     withOwnedThread (throwTo thread (ErrorCall "cancelled")) $ \cancelled _ → do
-      awaitSettled cancelled
+      awaitHeldOff cancelled
       allowOne proceed
       -- The second record's hook runs as well, though the first was cancelled.
       awaitProceed entered
@@ -939,14 +942,16 @@ testLedgerCancellation = do
       maybe [] windowAwaitingRelease (standingOf after) `shouldBe` []
       done `shouldBe` ["adopted 3", "adopted 4", "released 3", "released 4"]
 
--- | Wait until a thread that was thrown to is blocked on the delivery or has finished.
-awaitSettled ∷ ThreadId → IO ()
-awaitSettled thread =
+-- | Wait until a thread that was thrown to is blocked on the delivery: the transition it is in holds the cancellation off.
+-- A thrower that has already finished delivered it at once, so the hook was not held and the example would not exercise a
+-- transition under cancellation: that fails the example instead of passing it.
+awaitHeldOff ∷ ThreadId → IO ()
+awaitHeldOff thread =
   threadStatus thread >>= \case
     ThreadBlocked BlockedOnException → pure ()
-    ThreadFinished → pure ()
-    ThreadDied → pure ()
-    _ → yield >> awaitSettled thread
+    ThreadFinished → failWith "the cancellation was delivered at once: the transition's hook was not held"
+    ThreadDied → failWith "the cancellation's thrower died before it was held off"
+    _ → yield >> awaitHeldOff thread
 
 -- ---------------------------------------------------------------------------
 -- Windows and targets
@@ -1028,7 +1033,7 @@ adoptionCancelled ending scope = do
     scope (openProceed proceed) (void (try @SomeException (adoptScene scenes lifecycle 100 (TargetAdopter identity) (5 ∷ Scene) 3))) $ \adopting _ → do
       awaitProceed entered
       scope (pure ()) (throwTo adopting (ErrorCall "cancelled")) $ \thrower _ → do
-        awaitSettled thrower
+        awaitHeldOff thrower
         writeIORef seenThreads [adopting, thrower]
         end (pure ())
   readIORef seenThreads >>= \threads → case threads of
