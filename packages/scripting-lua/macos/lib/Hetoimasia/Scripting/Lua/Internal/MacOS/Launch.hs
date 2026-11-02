@@ -233,21 +233,24 @@ withLaunch request body
         reports ← newTVarIO []
         finished ← newTVarIO False
         done ← newEmptyMVar
+        -- The stream's cleanup (the finished flag, the handle) is installed before the thread is let go of the mask, so a stop
+        -- that reaches the thread at its first unmasked instruction still finishes the stream (review round 1 of #598).
         reader ←
-          forkIOWithUnmask (\unmask → unmask (drain handle reports finished) `finally` putMVar done ())
+          forkIOWithUnmask
+            ( \unmask →
+                unmask (drain handle reports)
+                  `finally` (atomically (writeTVar finished True) >> void (try @IOException (hClose handle)) >> putMVar done ())
+            )
             `onException` hClose handle
         restore (body (Right (Launched pid reports finished reader)))
           `finally` uninterruptibleMask_ (killThread reader >> readMVar done)
 
   -- One reader thread owns the pipe end for the helper's whole life. It stops
-  -- at end of file or at the first read failure, and marks the stream finished
-  -- exactly once, so a waiter never blocks on a helper that has already gone.
-  drain handle reports finished =
-    (loop `catch` \(_ ∷ IOException) → pure ())
-      `finally` ( do
-                    atomically (writeTVar finished True)
-                    void (try @IOException (hClose handle))
-                )
+  -- at end of file or at the first read failure; the finally around it (in the
+  -- thread's start) marks the stream finished exactly once and closes the handle,
+  -- however the thread ends, so a waiter never blocks on a helper that has already gone.
+  drain handle reports =
+    loop `catch` \(_ ∷ IOException) → pure ()
    where
     loop = do
       done ← hIsEOF handle

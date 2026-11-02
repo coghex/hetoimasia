@@ -15,7 +15,7 @@
 -- hanging the run.
 module Test.Lua.Ownership (spec) where
 
-import Control.Concurrent (ThreadId, myThreadId, yield)
+import Control.Concurrent (ThreadId, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Exception (AsyncException (UserInterrupt), Exception, finally, throwIO, try)
 import Control.Monad (forM_, void)
@@ -112,6 +112,18 @@ leakedAfterScope probe =
     -- The scope under test returns here, leaving the worker parked.
     endedAfter probe
 
+-- | The previous, unowned shape of a scope that fails: it raises while its worker is parked and leaves without stopping it. The
+-- failure is raised and caught inside the owned outer scope, and the judgement is made as it leaves.
+leakedFailingScope ∷ Probe → IO Bool
+leakedFailingScope probe =
+  withOwnedThread (parkedWorker probe) $ \thread _ → do
+    recordThread probe thread
+    readMVar (probeParked probe)
+    raised ← try @Boom (throwIO Boom ∷ IO ())
+    verdict ← endedAfter probe
+    raised `shouldBe` Left Boom
+    pure verdict
+
 spec ∷ Spec
 spec = describe "the threads this suite's own helpers start (#598)" $ do
   describe "a start-and-wait helper (inThread)" $ do
@@ -123,6 +135,16 @@ spec = describe "the threads this suite's own helpers start (#598)" $ do
       outcome `shouldBe` Left UserInterrupt
       judged probe 1
       endedAfter probe `shouldReturn` True
+    it "ends and joins its thread when the example waiting for it fails while the thread is parked" $ bounded $ do
+      probe ← newProbe
+      caller ← myThreadId
+      outcome ←
+        try @Boom $
+          withOwnedThread (readMVar (probeParked probe) >> throwTo caller Boom) $ \_ _ →
+            inThread (myThreadId >>= recordThread probe >> parkedWorker probe)
+      outcome `shouldBe` Left Boom
+      judged probe 1
+      endedAfter probe `shouldReturn` True
     it "ends and joins its thread when the thread fails, raising the failure here" $ bounded $ do
       probe ← newProbe
       outcome ← try @Boom (inThread (myThreadId >>= recordThread probe >> throwIO Boom ∷ IO ()))
@@ -132,6 +154,10 @@ spec = describe "the threads this suite's own helpers start (#598)" $ do
     it "is judged a leak when a scope returns without stopping the thread it started (the previous, unowned shape)" $ bounded $ do
       probe ← newProbe
       verdict ← leakedAfterScope probe
+      verdict `shouldBe` False
+    it "is judged a leak when a failing scope returns without stopping the parked thread it started (the previous, unowned shape)" $ bounded $ do
+      probe ← newProbe
+      verdict ← leakedFailingScope probe
       verdict `shouldBe` False
 
   describe "closers parked in a finalizer" $ do

@@ -174,6 +174,20 @@ spec = describe "the threads the probe library owns itself (#598)" $ do
                 finished `shouldBe` True
       )
       endings
+    it "finishes the stream and joins the reader when the scope is left before the reader has run anything" $ \fixture →
+      -- Left at once, so the stop can reach the reader at its first unmasked instruction: the stream's cleanup is installed
+      -- before that, so the flag is set and the pipe closed however early the reader is stopped (review round 1 of #598).
+      mapM_
+        ( \_ → do
+            kept ← newIORef Nothing
+            withHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "hold" 0 (writeIORef kept . Just)
+            readIORef kept >>= \case
+              Nothing → expectationFailure "no helper was launched"
+              Just launched → do
+                (joined (launchedReader launched) `shouldReturn` True) `finally` endQuietly launched
+                readTVarIO (launchedFinished launched) `shouldReturn` True
+        )
+        [1 .. 5 ∷ Int]
     it "is judged a leak when a scope returns without stopping the thread it started (the previous, unowned shape)" $ \_ → do
       verdict ← leakedAfterScope
       verdict `shouldBe` False

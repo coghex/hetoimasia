@@ -8,7 +8,7 @@
 module Test.Lua.Boundary.Bindings (spec) where
 
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (SomeException, fromException, try)
+import Control.Exception (SomeException, fromException, throwIO, try)
 import GHC.Conc (getAllocationCounter)
 import Data.IORef (readIORef, writeIORef)
 import qualified Data.Map.Strict as Map
@@ -455,20 +455,26 @@ spec = describe "bindings called from Lua" $ do
       fixture ← newFixture
       ready ← newEmptyMVar
       release ← newEmptyMVar
+      -- The other owner's outcome is captured and rethrown here, so a teardown that fails after it published `ready` still
+      -- fails the example; the ownership join does not stand in for that check (#598).
+      other ← newEmptyMVar
       withOwnedThreadOpening
         (void (tryPutMVar release ()))
-        ( withOwner fixture [] $ \other → do
-            writeIORef (fixtureOther fixture) (Just other)
-            putMVar ready ()
-            takeMVar release
+        ( try @SomeException
+            ( withOwner fixture [] $ \owner' → do
+                writeIORef (fixtureOther fixture) (Just owner')
+                putMVar ready ()
+                takeMVar release
+            )
+            >>= putMVar other
         )
-        $ \_ finished → do
+        $ \_ _ → do
           takeMVar ready
           withOwner fixture ["sample"] $ \owned → do
             run owned "sample.trespass()"
             readIORef (fixtureAttempt fixture) >>= (`shouldBe` Just "not owned")
           putMVar release ()
-          finished
+          takeMVar other >>= either throwIO pure
 
     it "re-raises a Haskell failure from the action at the owner's boundary with its own type, under pcall too" $ do
       fixture ← newFixture

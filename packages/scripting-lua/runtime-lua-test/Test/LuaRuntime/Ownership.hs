@@ -18,13 +18,15 @@ module Test.LuaRuntime.Ownership (spec) where
 
 import Control.Concurrent (ThreadId, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar)
-import Control.Exception (AsyncException (ThreadKilled, UserInterrupt), Exception, SomeException, finally, throwIO, try, uninterruptibleMask_)
+import Control.Exception (AsyncException (ThreadKilled, UserInterrupt), Exception, SomeException, fromException, finally, throwIO, try, uninterruptibleMask_)
 import Control.Monad (forM_, void)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import GHC.Conc (ThreadStatus (ThreadDied, ThreadFinished), threadStatus)
-import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldReturn)
+import Data.List (isInfixOf)
+import Test.HUnit.Lang (FailureReason (Reason), HUnitFailure (HUnitFailure))
+import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Scheduler.Support (awaitDelivered)
-import Test.LuaRuntime.Support (Broken (Broken), alongsideOpeningObserving, bounded, boundedAfterObserving, withProducers)
+import Test.LuaRuntime.Support (Broken (Broken), alongsideOpeningObserving, bounded, boundExpiredMessage, boundedAfterObserving, withProducers)
 import Test.Support.Cancel (withCancellationAfter)
 import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
@@ -128,10 +130,15 @@ spec = describe "the threads this suite's own helpers start (#598)" $ do
         it ("has ended and joined its watchdog and its interrupter when it returns, for " <> label) $ bounded $ do
           probe ← newProbe
           outcome ← try @SomeException (boundedAfterObserving (\watching interrupting → recordThread probe watching >> recordThread probe interrupting) 100000 100000 example)
+          -- the example must have ended the way its label says, so an unrelated exception cannot satisfy the regression
           case (label, outcome) of
-            ("an example that finished", Left failure) → expectationFailure ("a finished example was failed: " <> show failure)
-            ("an example whose bound expired", Right ()) → expectationFailure "an example held past its bound was not failed"
-            _ → pure ()
+            ("an example that finished", Right ()) → pure ()
+            ("an example that failed", Left failure) → fromException failure `shouldBe` Just (Broken "its own failure")
+            ("an example whose bound expired", Left failure) →
+              case fromException failure of
+                Just (HUnitFailure _ (Reason message)) → message `shouldSatisfy` isInfixOf boundExpiredMessage
+                _ → expectationFailure ("the bound did not fail the example with its expiry: " <> show failure)
+            _ → expectationFailure ("the example ended another way than " <> label <> ": " <> show outcome)
           judged probe 2
           endedAfter probe `shouldReturn` True
     it "is judged a leak when a scope returns without stopping the thread it started (the previous, unowned shape)" $ bounded $ do
