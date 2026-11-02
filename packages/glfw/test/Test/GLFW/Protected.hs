@@ -233,7 +233,7 @@ spec = before_ clearRegistered $ describe "GLFW protected host" $ do
         boundedExample (ownedEnds ending parkedConstructionScenario True)
       it ("negative control: a plain forkOS start leaves the runner parked in its construction when the example body " <> label) $
         boundedExample (unownedLeaks ending parkedConstructionScenario True)
-      it ("finishes the exit when the example body " <> label <> " before the runner has registered its owner, which then registers and attaches after the cleanup began (#593)") $
+      it ("finishes the exit when the example body " <> label <> " before the runner has registered its owner, which then registers and attaches after the cleanup began, one that may be absorbed (#593)") $
         boundedExample (ownedEnds ending runnerBeforeRegistrationScenario True)
       it ("finishes the exit when the example body " <> label <> " while the runner's owner is registered and under construction, and attached after the cleanup began (#593)") $
         boundedExample (ownedEnds ending runnerDuringConstructionScenario True)
@@ -244,6 +244,10 @@ spec = before_ clearRegistered $ describe "GLFW protected host" $ do
         boundedExample (ownedEnds ending supplierScenario False)
       it ("negative control: an unowned start leaves the evidence supplier waiting for an owner that never exists when the example body " <> label) $
         boundedExample (unownedLeaks ending supplierScenario False)
+    it "releases an owner the runner registers after the cleanup began, before it built its host (#593)"
+      (boundedExample (stickyRegistration False))
+    it "releases an owner the runner registers after the cleanup began, after the snapshot that cleanup took (#593)"
+      (boundedExample (stickyRegistration True))
     it "contains a declaration that fails after acquisition, retiring on independent evidence before it settles"
       (boundedExample testMetadataFailsInDrain)
     it "retains a stalled diagnostic's own failure without unwinding anything it is holding"
@@ -1300,6 +1304,39 @@ runnerPartialScenario scope atParked = do
         (\_ _ → pure ())
     )
     $ \_ _ → takeMVar attached >> atParked
+
+-- | The sticky rescue, without a cancellation (#593): the cleanup begins while the runner has not yet registered the owner that
+-- decides how the drain ends, and the runner then registers and attaches it. Nothing is killed; the only thing that can finish the
+-- drain is the registering code releasing the owner itself, because the cleanup's one pass has already been made. With @after@ false
+-- the cleanup begins before the runner builds its host (the registry must not be reset by the host); with it true, after the
+-- runner attached a first owner and before it attaches a second, so the second is not in the snapshot the cleanup took.
+stickyRegistration ∷ Bool → Expectation
+stickyRegistration after = do
+  journal ← newTVarIO []
+  seam ← journallingSeam journal
+  attached ← newEmptyMVar
+  go ← newEmptyMVar
+  let pending name = (ownerNamed name) {scriptPlan = [Await, Await] <> map Certify allRetirementFacts}
+      callback host
+        | after = do
+            (alpha, beta) ← twoWindows host
+            void (establishedOwner journal host alpha (pending "alpha"))
+            putMVar attached () >> takeMVar go
+            void (establishedOwner journal host beta (pending "beta"))
+        | otherwise = do
+            window ← onlyWindow host
+            void (establishedOwner journal host window (pending "alpha"))
+      windows = if after then ["alpha", "beta"] else ["alpha"]
+  withMainThread seam (pure ())
+    ( do
+        unless after (takeMVar go)
+        protectedRunHere seam quietLogger (settings (map windowNamed windows)) callback (\_ _ → pure ()) (\() _ → pure ())
+    )
+    $ \_ finished → do
+    when after (takeMVar attached)
+    rescueNow
+    putMVar go ()
+    takeMVar finished >>= either throwIO pure
 
 -- | The runner of 'testRepeatedCancellation' held before it has registered its owner (#593), with the example body ended the way the
 -- ending says: the scope's opening begins the cleanup while the runner has registered nothing, then lets it go on, so the owner is
