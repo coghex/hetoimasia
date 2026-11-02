@@ -783,12 +783,13 @@ testExitDrainCompletesBatch = do
     _ ← publishNow host target 1
     awaitTargetStanding host target ((== Just 1) . windowAdopted)
     (batch, _) ← recordFor host target
-    -- The batch is pending as the body returns. Its completion is let through only once the owner's exit has begun,
-    -- which the host's own admission says: the fence query reads that admission in its own transaction, so the first
-    -- query made after the exit began finds the batch complete, whichever thread and capability makes it. The owner's
-    -- shutdown drain, not an ordinary step, is what observes it, and nothing has to be scheduled between the exit's
-    -- beginning and the drain's bounded steps.
-    submissionsCompleteWhen rig (not <$> targetEventsOpen (ownerHandoff (vulkanGraphicsOwner host)))
+    -- The batch is pending as the body returns, and an ordinary owner step cannot complete it. Its completion is let
+    -- through only once the owner is in its drain: the fence query reads the owner's own phase in its transaction, and
+    -- the owner writes 'OwnerRetiring' as the first thing its drain does, so only the shutdown drain (and the
+    -- retirement and destruction after it) can observe a completion, on whatever capability the exit runs. A closed
+    -- admission is not enough: the owner's ordinary step in flight when the exit begins would still be running.
+    submissionsCompleteWhen rig ((>= OwnerRetiring) . statusPhase <$> readOwnerStatusNow (vulkanGraphicsOwner host))
+    ticketNow batch >>= (`shouldBe` TicketPending)
     pure (host, target, batch)
   ticketNow ticket >>= (`shouldBe` TicketComplete)
   events ← readTVarIO (rigSceneEvents rig)
