@@ -316,6 +316,15 @@ int hetoimasia_macos_listen_unix(const char *path)
     close(endpoint);
     return -failure;
   }
+  /* The backlog thread waits for a connection through the Haskell runtime, where the wait can be ended by killing the thread
+   * (#598), and so never blocks in accept itself: a blocked accept is a foreign call that no exception reaches, and nothing
+   * shown on this system ends it from outside. */
+  int status_flags = fcntl(endpoint, F_GETFL);
+  if (status_flags < 0 || fcntl(endpoint, F_SETFL, status_flags | O_NONBLOCK) != 0) {
+    int failure = errno != 0 ? errno : EPERM;
+    close(endpoint);
+    return -failure;
+  }
   unlink(path);
   if (bind(endpoint, (struct sockaddr *)&address, (socklen_t)sizeof address) != 0) {
     int failure = errno != 0 ? errno : EPERM;
@@ -339,7 +348,8 @@ int hetoimasia_macos_accept_and_close(int fd)
    * from a confined helper is indistinguishable from a sandbox denial -- which
    * would turn the isolation proof into an accident of how many helpers had
    * connected before it. Nothing is ever read or written: the connection is
-   * accepted and dropped. */
+   * accepted and dropped. The descriptor is non-blocking, so this returns at
+   * once: 0 for a connection taken, 1 when none was waiting, -1 on failure. */
   for (;;) {
     int accepted = accept(fd, NULL, NULL);
     if (accepted >= 0) {
@@ -348,6 +358,9 @@ int hetoimasia_macos_accept_and_close(int fd)
     }
     if (errno == EINTR) {
       continue;
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+      return 1;
     }
     return -1;
   }

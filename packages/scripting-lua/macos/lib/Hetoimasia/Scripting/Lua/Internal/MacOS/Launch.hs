@@ -13,6 +13,9 @@ module Hetoimasia.Scripting.Lua.Internal.MacOS.Launch
   ( -- * Endpoints
     Endpoint (..)
   , withEndpoint
+  , EndpointSeams (..)
+  , noEndpointSeams
+  , withEndpointSeamed
 
     -- * Launching
   , LaunchRequest (..)
@@ -20,7 +23,8 @@ module Hetoimasia.Scripting.Lua.Internal.MacOS.Launch
   , LaunchFailure (..)
   , jetsamAvailable
   , jetsamFlags
-  , launch
+  , withLaunch
+  , withLaunchSeamed
 
     -- * Watching
   , awaitReport
@@ -43,7 +47,8 @@ module Hetoimasia.Scripting.Lua.Internal.MacOS.Launch
   , admitted
   ) where
 
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar)
 import Control.Concurrent.STM
   ( TVar
   , atomically
@@ -54,7 +59,7 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Exception (IOException, bracket, catch, finally, try)
+import Control.Exception (IOException, bracket, catch, finally, mask, onException, try, uninterruptibleMask_)
 import Control.Monad (void, when)
 import Data.List (find)
 import Data.Map.Strict (Map)
@@ -68,12 +73,13 @@ import Foreign.Marshal.Array (withArray0)
 import Foreign.Marshal.Utils (with)
 import Foreign.Ptr (Ptr, nullPtr)
 import Foreign.Storable (peek)
+import GHC.Conc (threadWaitRead)
 import System.Exit (ExitCode (..))
 import System.IO (hClose, hIsEOF, hSetEncoding, utf8)
 import System.Posix.IO (closeFd, createPipe, fdToHandle)
 import System.Posix.Process (ProcessStatus (..), getProcessStatus)
 import System.Posix.Signals (Signal, nullSignal, signalProcess)
-import System.Posix.Types (ProcessID)
+import System.Posix.Types (Fd (..), ProcessID)
 import System.Timeout (timeout)
 
 import Hetoimasia.Scripting.Lua.Internal.MacOS.Report (Report (..), parseReport)
@@ -86,27 +92,59 @@ import Hetoimasia.Scripting.Lua.Internal.MacOS.Report (Report (..), parseReport)
 newtype Endpoint = Endpoint {endpointPath ∷ FilePath}
   deriving (Eq, Show)
 
+-- | What a regression example observes of an endpoint (#598). The production endpoint passes none ('noEndpointSeams').
+data EndpointSeams = EndpointSeams
+  { seamReaper ∷ ThreadId → IO ()
+  -- ^ Told the backlog thread, in the masked step that starts it.
+  , seamBeforeClose ∷ IO ()
+  -- ^ Run in the release after the backlog thread has been joined and before the descriptor is closed.
+  }
+
+noEndpointSeams ∷ EndpointSeams
+noEndpointSeams = EndpointSeams (\_ → pure ()) (pure ())
+
 -- | Bind an endpoint for the duration of an action.
 withEndpoint ∷ FilePath → (Endpoint → IO a) → IO a
-withEndpoint path action =
-  bracket acquire release (\_ → action (Endpoint path))
+withEndpoint = withEndpointSeamed noEndpointSeams
+
+-- | 'withEndpoint' with the seams of the regression examples.
+--
+-- /Ownership (#598)./ The backlog thread is started in the same masked step that registers its stop-and-join, with @base@ alone
+-- (this is the probe library, not a test suite, and may not use the test-support facility). However the action ends (a return,
+-- an exception, a cancellation), the release ends the thread, waits for its end without being interruptible, and only then
+-- shuts the socket down and closes the descriptor: the descriptor is retained until the thread that waits on it has ended.
+--
+-- The thread waits for a connection through the runtime ('threadWaitRead') on a non-blocking socket, so killing it ends the
+-- wait. A thread parked in a blocking @accept@ is in a foreign call that no exception reaches, and that shutting the socket
+-- down ends it on this system is not shown by anything here, which is why the wait is not one.
+--
+-- State owner: the thread owns nothing but its wait; the endpoint owns the descriptor. Thread: one backlog thread per
+-- endpoint, started and joined by it. Lifetime: the action's. Disposal: the release.
+withEndpointSeamed ∷ EndpointSeams → FilePath → (Endpoint → IO a) → IO a
+withEndpointSeamed seams path action =
+  bracket acquire (\descriptor → uninterruptibleMask_ (c_shutdown_fd descriptor >> c_close_fd descriptor)) $ \descriptor →
+    mask $ \restore → do
+      done ← newEmptyMVar
+      -- One thread keeps the backlog empty for the endpoint's whole life. Without
+      -- it the eighth connection is refused, and a refused connection reads
+      -- exactly like a sandbox denial.
+      reaper ← forkIOWithUnmask (\unmask → unmask (drainBacklog descriptor) `finally` putMVar done ())
+      seamReaper seams reaper `onException` stop reaper done
+      restore (action (Endpoint path)) `finally` stop reaper done
  where
   acquire = do
     descriptor ← withCString path c_listen_unix
     when (descriptor < 0) $
       ioError (userError ("cannot listen on " <> path <> ": errno " <> show (negate descriptor)))
-    -- One thread keeps the backlog empty for the endpoint's whole life. Without
-    -- it the eighth connection is refused, and a refused connection reads
-    -- exactly like a sandbox denial.
-    reaper ← forkIO (drainBacklog descriptor)
-    pure (descriptor, reaper)
-  release (descriptor, reaper) = do
-    -- Shut the socket down before closing it, so the thread parked in accept
-    -- returns instead of outliving the endpoint.
-    c_shutdown_fd descriptor
-    c_close_fd descriptor
+    pure descriptor
+  -- Not interruptible: ends the thread and waits for its end. The socket is shut down and closed in the bracket's own release,
+  -- which runs after this scope has returned.
+  stop reaper done = uninterruptibleMask_ $ do
     killThread reaper
+    readMVar done
+    seamBeforeClose seams
   drainBacklog descriptor = do
+    threadWaitRead (Fd descriptor)
     taken ← c_accept_and_close descriptor
     when (taken >= 0) (drainBacklog descriptor)
 
@@ -134,7 +172,10 @@ data Launched = Launched
   , launchedReports ∷ TVar [Report]
   -- ^ In arrival order. Written by the reader thread, read by the examples.
   , launchedFinished ∷ TVar Bool
-  -- ^ The helper's output reached end of file.
+  -- ^ The helper's output reached end of file. That the stream is finished is not proof that the reader has been joined: the
+  -- scope that launched the helper joins it ('withLaunch').
+  , launchedReader ∷ ThreadId
+  -- ^ The thread that reads the helper's output, owned by the scope of 'withLaunch'.
   }
 
 -- | Is the spawn-time memory-limit mechanism present on this system?
@@ -145,17 +186,33 @@ jetsamAvailable = (/= 0) <$> c_jetsam_available
 jetsamFlags ∷ IO Int
 jetsamFlags = fromIntegral <$> c_jetsam_flags
 
--- | Spawn a helper, with its memory limit installed before it runs.
+-- | Spawn a helper for the length of an action, with its memory limit installed before it runs, and own the thread that reads
+-- its output (#598).
 --
--- A limit that cannot be installed is a refused launch, not an unlimited child.
-launch ∷ LaunchRequest → IO (Either LaunchFailure Launched)
-launch request
+-- A limit that cannot be installed is a refused launch, not an unlimited child; the action is then told so and no thread
+-- exists. When the helper is launched, the reader thread is started in the same masked step that registers its stop-and-join
+-- (with @base@ alone: this is the probe library, not a test suite), and on every way out of the action (a return, an exception,
+-- a cancellation) the thread has ended and been joined, without being interruptible, before this returns. The scope ends the
+-- reader when the caller is done with the helper: a caller that wants the complete set of reports waits for 'awaitStreamEnd'
+-- before it leaves, as the examples do after reaping the helper. The scope does not end the helper: the caller does, and
+-- observes that it ended.
+--
+-- State owner: the reader owns the pipe end and the reports it appends; the launcher owns the helper process. Thread: one
+-- reader per helper, started and joined by this scope. Lifetime: the action's. Disposal: the release.
+withLaunch ∷ LaunchRequest → (Either LaunchFailure Launched → IO a) → IO a
+withLaunch = withLaunchSeamed (\_ → pure ())
+
+-- | 'withLaunch' with a test-side seam (#598): told the launched helper (and so its reader's thread) once the reader is started, in the masked step that starts it
+-- and before the body is let go of the mask, so an example can queue a cancellation against the caller exactly at the
+-- handoff. The production launch passes none.
+withLaunchSeamed ∷ (Launched → IO ()) → LaunchRequest → (Either LaunchFailure Launched → IO a) → IO a
+withLaunchSeamed seam request body
   | requestMemoryLimitMiB request > 0 = do
       available ← jetsamAvailable
-      if available then spawnIt else pure (Left MemoryLimitUnavailable)
+      if available then spawnIt else body (Left MemoryLimitUnavailable)
   | otherwise = spawnIt
  where
-  spawnIt = do
+  spawnIt = mask $ \restore → do
     (readEnd, writeEnd) ← createPipe
     result ←
       withCString (requestExecutable request) $ \path →
@@ -176,24 +233,35 @@ launch request
     case result of
       Left code → do
         closeFd readEnd
-        pure (Left (LaunchRejected code))
+        restore (body (Left (LaunchRejected code)))
       Right pid → do
         handle ← fdToHandle readEnd
         hSetEncoding handle utf8
         reports ← newTVarIO []
         finished ← newTVarIO False
-        void (forkIO (drain handle reports finished))
-        pure (Right (Launched pid reports finished))
+        done ← newEmptyMVar
+        -- The stream's cleanup (the finished flag, the handle) is installed before the thread is let go of the mask, so a stop
+        -- that reaches the thread at its first unmasked instruction still finishes the stream (review round 1 of #598).
+        reader ←
+          forkIOWithUnmask
+            ( \unmask →
+                unmask (drain handle reports)
+                  `finally` (atomically (writeTVar finished True) >> void (try @IOException (hClose handle)) >> putMVar done ())
+            )
+            `onException` hClose handle
+        let launched = Launched pid reports finished reader
+        seam launched `onException` stopReader reader done
+        restore (body (Right launched))
+          `finally` stopReader reader done
+
+  stopReader reader done = uninterruptibleMask_ (killThread reader >> readMVar done)
 
   -- One reader thread owns the pipe end for the helper's whole life. It stops
-  -- at end of file or at the first read failure, and marks the stream finished
-  -- exactly once, so a waiter never blocks on a helper that has already gone.
-  drain handle reports finished =
-    (loop `catch` \(_ ∷ IOException) → pure ())
-      `finally` ( do
-                    atomically (writeTVar finished True)
-                    void (try @IOException (hClose handle))
-                )
+  -- at end of file or at the first read failure; the finally around it (in the
+  -- thread's start) marks the stream finished exactly once and closes the handle,
+  -- however the thread ends, so a waiter never blocks on a helper that has already gone.
+  drain handle reports =
+    loop `catch` \(_ ∷ IOException) → pure ()
    where
     loop = do
       done ← hIsEOF handle

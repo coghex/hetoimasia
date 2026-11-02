@@ -15,7 +15,7 @@
 -- afterwards with the close's failures retained on it as cleanup evidence.
 module Test.Lua.Owner.Cancellation (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, throwTo, yield)
+import Control.Concurrent (ThreadId, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception
   ( AsyncException (UserInterrupt)
@@ -23,13 +23,11 @@ import Control.Exception
   , WhileHandling (WhileHandling)
   , annotateIO
   , fromException
-  , mask_
   , someExceptionContext
   , throwIO
   , try
   )
 import Control.Exception.Context (getExceptionAnnotations)
-import Control.Monad (replicateM)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import qualified Data.Set as Set
 import Data.Text (Text)
@@ -46,8 +44,13 @@ import Hetoimasia.Scripting.Lua.Internal.Owner
 import Hetoimasia.Scripting.Lua.Internal.Vm (Phase (Closed), vmPhase)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 import Test.Lua.Owner.Support
-import Test.Lua.Support (Settled (settledOperation), awaitSettled, cancelling, observedCancellation, settling)
+import Test.Lua.Support (Settled (settledOperation), awaitSettled, cancelling, observedCancellation)
 import Test.Support.Bounded (bounded)
+import Control.Concurrent.MVar (tryPutMVar)
+import Control.Monad (void)
+import Test.Lua.Support (withProducerThread, withProducerThreads, withSettling)
+import Test.Support.Owned (withOwnedThread)
+import Control.Exception (mask)
 
 -- | A callback Lua can call that blocks the owner's thread in Lua until the
 -- example lets it return.
@@ -118,11 +121,21 @@ spec = describe "cancellation" $ do
     result ← newEmptyMVar
     finalizing ← newFinalizing
     let config = (finalizingConfig finalizing) {ownerAfterLibraries = \_ → writeIORef constructed True}
-    -- Forked masked, so the thread's own handler is in place before the
+    -- The thread masks itself before it says it is ready, so its own handler is in place before the
     -- cancellation can reach it; it is interruptible at the wait for the start.
-    owner ← mask_ (forkIO (try @SomeException (takeMVar started >> withOwnedVm config (\_ → pure ())) >>= putMVar result))
-    throwTo owner UserInterrupt
-    outcome ← bounded (takeMVar result)
+    installed ← newEmptyMVar
+    outcome ←
+      withOwnedThread
+        ( mask $ \restore → do
+            putMVar installed ()
+            try @SomeException (restore (takeMVar started >> withOwnedVm config (\_ → pure ()))) >>= putMVar result
+        )
+        $ \owner _ → do
+          -- The thread says its handler is in place before the example cancels it (#598): the cancellation then reaches the wait
+          -- for the start, as it did when the thread was forked masked.
+          takeMVar installed
+          throwTo owner UserInterrupt
+          bounded (takeMVar result)
     either (\raised → fromException raised) (const Nothing) outcome `shouldBe` Just UserInterrupt
     readIORef constructed >>= (`shouldBe` False)
     events (finalizingEvents finalizing) >>= (`shouldBe` [])
@@ -133,105 +146,112 @@ spec = describe "cancellation" $ do
     bodyRan ← newIORef False
     let base = holdCallback finalizing hold (finalizingConfig finalizing)
         config = base {ownerChunks = ownerChunks base <> [(chunkName "holding", "hold()")]}
-    runner ← settling (withOwnedVm config (\_ → writeIORef bodyRan True))
-    bounded (takeMVar (holdEntered hold))
-    cancelling runner UserInterrupt (putMVar (holdRelease hold) ())
-    settled ← awaitSettled runner
-    observedCancellation settled `shouldBe` Just UserInterrupt
-    readIORef bodyRan >>= (`shouldBe` False)
-    -- The VM was closed on the way out, its finalizer reached with the
-    -- dependency live, and nothing failed in the close.
-    events (finalizingEvents finalizing)
-      >>= (`shouldBe` ["hold: waiting", "hold: left", "finalizer: dependency live", "release"])
-    evidenceIn settled `shouldBe` []
+    withSettling
+      (void (tryPutMVar (holdRelease hold) ()))
+      (withOwnedVm config (\_ → writeIORef bodyRan True))
+      $ \runner → do
+        bounded (takeMVar (holdEntered hold))
+        cancelling runner UserInterrupt (putMVar (holdRelease hold) ())
+        settled ← awaitSettled runner
+        observedCancellation settled `shouldBe` Just UserInterrupt
+        readIORef bodyRan >>= (`shouldBe` False)
+        -- The VM was closed on the way out, its finalizer reached with the
+        -- dependency live, and nothing failed in the close.
+        events (finalizingEvents finalizing)
+          >>= (`shouldBe` ["hold: waiting", "hold: left", "finalizer: dependency live", "release"])
+        evidenceIn settled `shouldBe` []
 
   it "ends the body when cancelled inside a chunk it runs, closing the VM before the cancellation is raised" $ do
     finalizing ← newFinalizing
     hold ← newHold
     afterwards ← newIORef False
     let config = holdCallback finalizing hold (finalizingConfig finalizing)
-    runner ←
-      settling $
-        withOwnedVm config $ \owned → do
-          evalOwned owned (chunkName "holding") "hold()"
-          writeIORef afterwards True
-    bounded (takeMVar (holdEntered hold))
-    cancelling runner UserInterrupt (putMVar (holdRelease hold) ())
-    settled ← awaitSettled runner
-    observedCancellation settled `shouldBe` Just UserInterrupt
-    readIORef afterwards >>= (`shouldBe` False)
-    events (finalizingEvents finalizing)
-      >>= (`shouldBe` ["hold: waiting", "hold: left", "finalizer: dependency live", "release"])
-    evidenceIn settled `shouldBe` []
+    withSettling
+      (void (tryPutMVar (holdRelease hold) ()))
+      (         withOwnedVm config $ \owned → do
+        evalOwned owned (chunkName "holding") "hold()"
+        writeIORef afterwards True
+      )
+      $ \runner → do
+        bounded (takeMVar (holdEntered hold))
+        cancelling runner UserInterrupt (putMVar (holdRelease hold) ())
+        settled ← awaitSettled runner
+        observedCancellation settled `shouldBe` Just UserInterrupt
+        readIORef afterwards >>= (`shouldBe` False)
+        events (finalizingEvents finalizing)
+          >>= (`shouldBe` ["hold: waiting", "hold: left", "finalizer: dependency live", "release"])
+        evidenceIn settled `shouldBe` []
 
   it "defers a cancellation that arrives during the close, releases dependencies only after it, and raises the cancellation with the close's failure as cleanup evidence" $ do
     finalizing ← newFinalizing
     hold ← newHold
     vmRef ← newCaptured
     let config = holdingGuard (holdCallback finalizing hold (failingReleaseConfig finalizing))
-    runner ← settling (withOwnedVm config (\owned → capture vmRef (ownedInternalVm owned)))
-    -- The body has returned and the close is running its finalizers: the owner is
-    -- inside the one that holds.
-    bounded (takeMVar (holdEntered hold))
-    cancelling runner UserInterrupt (putMVar (holdRelease hold) ())
-    settled ← awaitSettled runner
-    observedCancellation settled `shouldBe` Just UserInterrupt
-    -- The finalizer waited for the release rather than being cancelled out of the
-    -- close, and the dependency was released only once it had left.
-    logged ← events (finalizingEvents finalizing)
-    logged `shouldSatisfy` before "hold: waiting" "hold: left"
-    logged `shouldSatisfy` before "hold: left" "release"
-    length (filter (== "release") logged) `shouldBe` 1
-    length (filter (== "finalizer: dependency live") logged) `shouldBe` 1
-    -- The cancellation is primary, and the failed release is cleanup evidence on
-    -- it, as a supervisor reads it.
-    evidenceIn settled `shouldBe` ["lua release"]
-    cancelledOutcome settled `shouldBe` True
-    captured vmRef >>= \case
-      Nothing → expectationFailure "the body did not run"
-      Just vm → vmPhase vm >>= (`shouldBe` Closed)
+    withSettling
+      (void (tryPutMVar (holdRelease hold) ()))
+      (withOwnedVm config (\owned → capture vmRef (ownedInternalVm owned)))
+      $ \runner → do
+        -- The body has returned and the close is running its finalizers: the owner is
+        -- inside the one that holds.
+        bounded (takeMVar (holdEntered hold))
+        cancelling runner UserInterrupt (putMVar (holdRelease hold) ())
+        settled ← awaitSettled runner
+        observedCancellation settled `shouldBe` Just UserInterrupt
+        -- The finalizer waited for the release rather than being cancelled out of the
+        -- close, and the dependency was released only once it had left.
+        logged ← events (finalizingEvents finalizing)
+        logged `shouldSatisfy` before "hold: waiting" "hold: left"
+        logged `shouldSatisfy` before "hold: left" "release"
+        length (filter (== "release") logged) `shouldBe` 1
+        length (filter (== "finalizer: dependency live") logged) `shouldBe` 1
+        -- The cancellation is primary, and the failed release is cleanup evidence on
+        -- it, as a supervisor reads it.
+        evidenceIn settled `shouldBe` ["lua release"]
+        cancelledOutcome settled `shouldBe` True
+        captured vmRef >>= \case
+          Nothing → expectationFailure "the body did not run"
+          Just vm → vmPhase vm >>= (`shouldBe` Closed)
 
   it "raises a cancellation during a close that also fails with every close failure retained, each with its own context" $ do
     finalizing ← newFinalizing
     hold ← newHold
     let config = holdingGuard (holdCallback finalizing hold (failingCloseConfig finalizing))
-    runner ← settling (withOwnedVm config (\_ → pure ()))
-    bounded (takeMVar (holdEntered hold))
-    cancelling runner UserInterrupt (putMVar (holdRelease hold) ())
-    settled ← awaitSettled runner
-    observedCancellation settled `shouldBe` Just UserInterrupt
-    evidenceIn settled `shouldBe` ["lua finalizer", "lua release"]
-    case settledOperation settled of
-      Right () → expectationFailure "the cancellation was lost"
-      Left raised → map cleanupFailureLabel (cleanupFailures raised) `shouldBe` ["lua finalizer", "lua release"]
+    withSettling
+      (void (tryPutMVar (holdRelease hold) ()))
+      (withOwnedVm config (\_ → pure ()))
+      $ \runner → do
+        bounded (takeMVar (holdEntered hold))
+        cancelling runner UserInterrupt (putMVar (holdRelease hold) ())
+        settled ← awaitSettled runner
+        observedCancellation settled `shouldBe` Just UserInterrupt
+        evidenceIn settled `shouldBe` ["lua finalizer", "lua release"]
+        case settledOperation settled of
+          Right () → expectationFailure "the cancellation was lost"
+          Left raised → map cleanupFailureLabel (cleanupFailures raised) `shouldBe` ["lua finalizer", "lua release"]
 
   it "survives repeated cancellation of the closing owner: no early release, no second close, and the evidence still on what it raises" $ do
     finalizing ← newFinalizing
     hold ← newHold
     let config = holdingGuard (holdCallback finalizing hold (failingReleaseConfig finalizing))
-    (owner, slot) ← ownerThread config (\_ → pure ())
-    bounded (takeMVar (holdEntered hold))
-    senders ←
-      replicateM 4 $ do
-        done ← newEmptyMVar
-        sender ← forkIO (throwTo owner UserInterrupt >> putMVar done ())
-        pure (sender, done)
-    -- Every one of the four cancellations is queued against the owner, which is
-    -- inside Lua and cannot take any of them yet.
-    mapM_ (bounded . awaitBlockedOnException . fst) senders
-    -- Nothing has been released while it waits, and the dependency is live.
-    events (finalizingEvents finalizing) >>= (`shouldSatisfy` notElem "release")
-    putMVar (holdRelease hold) ()
-    outcome ← bounded (takeMVar slot)
-    mapM_ (bounded . takeMVar . snd) senders
-    case outcome of
-      Right () → expectationFailure "the cancellation was lost"
-      Left failure → do
-        causeOf failure `shouldBe` Just UserInterrupt
-        asyncCancellation failure `shouldBe` True
-        -- None of the later cancellations superseded the one that carries the
-        -- close's failure.
-        evidenceLabels failure `shouldBe` ["lua release"]
+    withOwnerThread (void (tryPutMVar (holdRelease hold) ())) config (\_ → pure ()) $ \(owner, slot) → do
+      bounded (takeMVar (holdEntered hold))
+      withProducerThreads (replicate 4 (throwTo owner UserInterrupt)) $ \senders → do
+        -- Every one of the four cancellations is queued against the owner, which is
+        -- inside Lua and cannot take any of them yet.
+        mapM_ (bounded . awaitBlockedOnException . fst) senders
+        -- Nothing has been released while it waits, and the dependency is live.
+        events (finalizingEvents finalizing) >>= (`shouldSatisfy` notElem "release")
+        putMVar (holdRelease hold) ()
+        outcome ← bounded (takeMVar slot)
+        mapM_ (bounded . takeMVar . snd) senders
+        case outcome of
+          Right () → expectationFailure "the cancellation was lost"
+          Left failure → do
+            causeOf failure `shouldBe` Just UserInterrupt
+            asyncCancellation failure `shouldBe` True
+            -- None of the later cancellations superseded the one that carries the
+            -- close's failure.
+            evidenceLabels failure `shouldBe` ["lua release"]
     logged ← events (finalizingEvents finalizing)
     length (filter (== "release") logged) `shouldBe` 1
     length (filter (== "finalizer: dependency live") logged) `shouldBe` 1
@@ -243,75 +263,73 @@ spec = describe "cancellation" $ do
     hold ← newHold
     let config = holdingGuard (holdCallback finalizing hold (failingReleaseConfig finalizing))
         queued = 1500
-    (owner, slot) ← ownerThread config (\_ → pure ())
-    bounded (takeMVar (holdEntered hold))
-    senders ←
-      replicateM queued $ do
-        done ← newEmptyMVar
-        sender ← forkIO (throwTo owner UserInterrupt >> putMVar done ())
-        pure (sender, done)
-    mapM_ (bounded . awaitBlockedOnException . fst) senders
-    putMVar (holdRelease hold) ()
-    outcome ← bounded (takeMVar slot)
-    mapM_ (bounded . takeMVar . snd) senders
-    case outcome of
-      Right () → expectationFailure "the cancellation was lost"
-      Left failure → do
-        causeOf failure `shouldBe` Just UserInterrupt
-        -- Not one of the queued cancellations was left to supersede the
-        -- exception that carries the close's failure.
-        evidenceLabels failure `shouldBe` ["lua release"]
+    withOwnerThread (void (tryPutMVar (holdRelease hold) ())) config (\_ → pure ()) $ \(owner, slot) → do
+      bounded (takeMVar (holdEntered hold))
+      withProducerThreads (replicate queued (throwTo owner UserInterrupt)) $ \senders → do
+        mapM_ (bounded . awaitBlockedOnException . fst) senders
+        putMVar (holdRelease hold) ()
+        outcome ← bounded (takeMVar slot)
+        mapM_ (bounded . takeMVar . snd) senders
+        case outcome of
+          Right () → expectationFailure "the cancellation was lost"
+          Left failure → do
+            causeOf failure `shouldBe` Just UserInterrupt
+            -- Not one of the queued cancellations was left to supersede the
+            -- exception that carries the close's failure.
+            evidenceLabels failure `shouldBe` ["lua release"]
 
   it "does not take a cancellation that arrives while a retained release blocks for that release's failure, and raises it ahead of an earlier close failure" $ do
     finalizing ← newFinalizing
     hold ← newHold
     let config = slowRelease finalizing hold (failingFinalizerConfig finalizing)
-    (owner, slot) ← ownerThread config (\_ → pure ())
-    -- The close has run its finalizers, one of which failed, and is releasing: the
-    -- owner is inside the retained release, and is observed blocked on its wait.
-    -- That wait is a blocking operation of Haskell's own, which a cancellation
-    -- could interrupt if the release were interruptible, so the example waits
-    -- until the owner is in it rather than assuming it is.
-    bounded (takeMVar (holdEntered hold))
-    bounded (awaitBlockedOnMVar owner)
-    done ← newEmptyMVar
-    sender ← forkIO (throwTo owner UserInterrupt >> putMVar done ())
-    -- Uninterruptible, the release cannot take the cancellation: it stays queued
-    -- against the owner, with the sender blocked delivering it. An interruptible
-    -- release would take it at once and the sender would finish, which this wait
-    -- would never see.
-    bounded (awaitBlockedOnException sender)
-    putMVar (holdRelease hold) ()
-    outcome ← bounded (takeMVar slot)
-    bounded (takeMVar done)
-    -- The release was not interrupted: it waited, and it left.
-    logged ← events (finalizingEvents finalizing)
-    logged `shouldSatisfy` before "slow release: waiting" "slow release: left"
-    -- The cancellation is the primary failure, with the finalizer's failure as
-    -- cleanup evidence, and is not itself an entry of that evidence.
-    case outcome of
-      Right () → expectationFailure "the cancellation was lost"
-      Left failure → do
-        causeOf failure `shouldBe` Just UserInterrupt
-        asyncCancellation failure `shouldBe` True
-        evidenceLabels failure `shouldBe` ["lua finalizer"]
+    withOwnerThread (void (tryPutMVar (holdRelease hold) ())) config (\_ → pure ()) $ \(owner, slot) → do
+      -- The close has run its finalizers, one of which failed, and is releasing: the
+      -- owner is inside the retained release, and is observed blocked on its wait.
+      -- That wait is a blocking operation of Haskell's own, which a cancellation
+      -- could interrupt if the release were interruptible, so the example waits
+      -- until the owner is in it rather than assuming it is.
+      bounded (takeMVar (holdEntered hold))
+      bounded (awaitBlockedOnMVar owner)
+      outcome ←
+        withProducerThread (throwTo owner UserInterrupt) $ \sender done → do
+          -- Uninterruptible, the release cannot take the cancellation: it stays queued
+          -- against the owner, with the sender blocked delivering it. An interruptible
+          -- release would take it at once and the sender would finish, which this wait
+          -- would never see.
+          bounded (awaitBlockedOnException sender)
+          putMVar (holdRelease hold) ()
+          outcome ← bounded (takeMVar slot)
+          bounded (takeMVar done)
+          pure outcome
+      -- The release was not interrupted: it waited, and it left.
+      logged ← events (finalizingEvents finalizing)
+      logged `shouldSatisfy` before "slow release: waiting" "slow release: left"
+      -- The cancellation is the primary failure, with the finalizer's failure as
+      -- cleanup evidence, and is not itself an entry of that evidence.
+      case outcome of
+        Right () → expectationFailure "the cancellation was lost"
+        Left failure → do
+          causeOf failure `shouldBe` Just UserInterrupt
+          asyncCancellation failure `shouldBe` True
+          evidenceLabels failure `shouldBe` ["lua finalizer"]
 
   it "raises a cancellation that arrives during the close ahead of the body's failure, leaving that failure reachable beside it" $ do
     finalizing ← newFinalizing
     hold ← newHold
     let config = holdingGuard (holdCallback finalizing hold (finalizingConfig finalizing))
-    runner ←
-      settling
-        (withOwnedVm config (\_ → annotateIO (Marker "body context") (throwIO (BodyBroke "body")) ∷ IO ()))
-    bounded (takeMVar (holdEntered hold))
-    cancelling runner UserInterrupt (putMVar (holdRelease hold) ())
-    settled ← awaitSettled runner
-    observedCancellation settled `shouldBe` Just UserInterrupt
-    case settledOperation settled of
-      Right () → expectationFailure "the cancellation was lost"
-      Left raised → do
-        let handled = [inner | WhileHandling inner ← getExceptionAnnotations (someExceptionContext raised)]
-        [fromException inner | inner ← handled] `shouldBe` [Just (BodyBroke "body")]
+    withSettling
+      (void (tryPutMVar (holdRelease hold) ()))
+      (        (withOwnedVm config (\_ → annotateIO (Marker "body context") (throwIO (BodyBroke "body")) ∷ IO ())))
+      $ \runner → do
+        bounded (takeMVar (holdEntered hold))
+        cancelling runner UserInterrupt (putMVar (holdRelease hold) ())
+        settled ← awaitSettled runner
+        observedCancellation settled `shouldBe` Just UserInterrupt
+        case settledOperation settled of
+          Right () → expectationFailure "the cancellation was lost"
+          Left raised → do
+            let handled = [inner | WhileHandling inner ← getExceptionAnnotations (someExceptionContext raised)]
+            [fromException inner | inner ← handled] `shouldBe` [Just (BodyBroke "body")]
 
 -- | The labels of the cleanup evidence on how an owner's operation ended.
 evidenceIn ∷ Settled a → [Text]

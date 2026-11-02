@@ -2,8 +2,8 @@
 -- preparation on the producer's side.
 module Test.LuaRuntime.Submission (spec) where
 
-import Control.Concurrent (forkIO, yield)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (yield)
+import Control.Concurrent.MVar (takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (ErrorCall (ErrorCall), evaluate, try)
 import Data.IORef (newIORef, readIORef)
@@ -76,9 +76,7 @@ spec = describe "submission" $ do
         replacement ← submit endpoint "echo" [VInteger 3] >>= accepted
         full "after the place was taken again"
         -- Observing it again, from several threads at once, gives back nothing more.
-        done ← newEmptyMVar
-        forM_ [1 .. 16 ∷ Int] $ \_ → forkIO (replicateM_ 50 (pollCall holder) >> putMVar done ())
-        replicateM_ 16 (takeMVar done)
+        withProducers (replicate 16 (replicateM_ 50 (pollCall holder))) (mapM_ takeMVar)
         full "after repeated and concurrent observation"
         -- Observing the later call proves the earlier one settled, and leaves it
         -- settled and unobserved.

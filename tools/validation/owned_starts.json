@@ -178,6 +178,18 @@
       "reason": "the negative controls' deliberately unowned start, which exists to be judged as a leak: the thread is recorded in the control's rescue list in the same masked step that starts it, and the rescue (registered before any thread is exposed) lets it go, stops it and joins it on every way out"
     },
     {
+      "file": "packages/scripting-lua/macos/lib/Hetoimasia/Scripting/Lua/Internal/MacOS/Launch.hs",
+      "binding": "withEndpointSeamed",
+      "sites": 1,
+      "reason": "the endpoint's backlog thread: started in the masked step that registers its stop-and-join, waits through the runtime so the kill ends it, and is joined (not interruptibly) before the descriptor it waits on is closed, on a return, an exception and a cancellation, with base alone because this is the probe library and not a test suite (#598)"
+    },
+    {
+      "file": "packages/scripting-lua/macos/lib/Hetoimasia/Scripting/Lua/Internal/MacOS/Launch.hs",
+      "binding": "withLaunchSeamed",
+      "sites": 1,
+      "reason": "the launched helper's pipe reader: started in the masked step that registers its stop-and-join and joined (not interruptibly) before the launch's scope returns, on a return, an exception and a cancellation, with base alone because this is the probe library and not a test suite (#598)"
+    },
+    {
       "file": "packages/gpu-vulkan/glfw/test/Test/GPU/Vulkan/GLFW/Bound.hs",
       "binding": "runBounded",
       "sites": 1,

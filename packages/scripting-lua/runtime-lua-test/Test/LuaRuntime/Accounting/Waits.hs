@@ -88,15 +88,15 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
         awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
         grant owner 1
         grant owner 1
-        waiting ← beginWait control owner
-        awaitEntered fixture "a"
-        -- The first grant woke the task, which is inside its segment: nothing it captured is finished.
-        awaitPending waiting
-        isPending waiting >>= (`shouldBe` True)
-        releaseGate fixture "a"
-        answer waiting >>= (`shouldBe` AccountingComplete)
-        atomically (ticksOutstanding (scheduledEndpoint owner)) >>= (`shouldBe` 0)
-        retireScheduled owner
+        withWait control owner $ \waiting → do
+          awaitEntered fixture "a"
+          -- The first grant woke the task, which is inside its segment: nothing it captured is finished.
+          awaitPending waiting
+          isPending waiting >>= (`shouldBe` True)
+          releaseGate fixture "a"
+          answer waiting >>= (`shouldBe` AccountingComplete)
+          atomically (ticksOutstanding (scheduledEndpoint owner)) >>= (`shouldBe` 0)
+          retireScheduled owner
 
     it "does not wait for a grant accepted after the ones it captured, which is not even finished" $ bounded $ do
       fixture ← newSFixture
@@ -107,21 +107,26 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
         awaitDiagnostics owner (\counts → diagWaiting counts >= 2)
         -- The owner is held in a segment, so the first grant is not applied while the wait takes its
         -- snapshot, and the second is accepted after it.
-        waiting ←
-          holdingSafely fixture owner $ do
-            grant owner 1
-            captured ← beginWait control owner
-            awaitPending captured
-            grant owner 1
-            pure captured
-        answer waiting >>= (`shouldBe` AccountingComplete)
-        -- The second grant woke B, which is inside its segment: that grant is unfinished, and the global
-        -- condition of tick completion is not met, though the wait returned.
-        awaitEntered fixture "b"
-        atomically (ticksOutstanding (scheduledEndpoint owner)) >>= (`shouldBe` 1)
-        releaseGate fixture "b"
-        awaitTicksComplete control owner >>= (`shouldBe` TicksCompleted)
-        retireScheduled owner
+        holdingSafelyScoped
+          fixture
+          owner
+          ( \continue → do
+              grant owner 1
+              withWait control owner $ \captured → do
+                awaitPending captured
+                grant owner 1
+                continue captured
+          )
+          ( \waiting → do
+              answer waiting >>= (`shouldBe` AccountingComplete)
+              -- The second grant woke B, which is inside its segment: that grant is unfinished, and the global
+              -- condition of tick completion is not met, though the wait returned.
+              awaitEntered fixture "b"
+              atomically (ticksOutstanding (scheduledEndpoint owner)) >>= (`shouldBe` 1)
+              releaseGate fixture "b"
+              awaitTicksComplete control owner >>= (`shouldBe` TicksCompleted)
+              retireScheduled owner
+          )
 
     it "keeps the snapshot it took across a supervised outcome handled while it waits" $ bounded $ do
       fixture ← newSFixture
@@ -133,23 +138,28 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
         _ ← admitTask' fixture owner "A" (request "wait_ticks" [VText "A", VInteger 1] OrdinaryClass OneShot (Just "A"))
         _ ← admitTask' fixture owner "B" (blockAfterTicks "b" 2)
         awaitDiagnostics owner (\counts → diagWaiting counts >= 2)
-        waiting ←
-          holdingSafely fixture owner $ do
-            grant owner 1
-            captured ← beginWait control owner
-            awaitPending captured
-            -- A grant accepted after the snapshot, and then an outcome supervision handles while
-            -- the wait is pending: a wait that took its snapshot again would take this grant in.
-            grant owner 1
-            _ ← admitTask' fixture bystander "bang" (request "host_fail" [VText "bang"] OrdinaryClass OneShot Nothing)
-            atomically (scheduledStatus bystander >>= \status → case status of WorkerLive → retry; _ → pure ())
-            awaitGateEntered handled
-            pure captured
-        answer waiting >>= (`shouldBe` AccountingComplete)
-        awaitEntered fixture "b"
-        atomically (ticksOutstanding (scheduledEndpoint owner)) >>= (`shouldBe` 1)
-        releaseGate fixture "b"
-        retireScheduled owner
+        holdingSafelyScoped
+          fixture
+          owner
+          ( \continue → do
+              grant owner 1
+              withWait control owner $ \captured → do
+                awaitPending captured
+                -- A grant accepted after the snapshot, and then an outcome supervision handles while
+                -- the wait is pending: a wait that took its snapshot again would take this grant in.
+                grant owner 1
+                _ ← admitTask' fixture bystander "bang" (request "host_fail" [VText "bang"] OrdinaryClass OneShot Nothing)
+                atomically (scheduledStatus bystander >>= \status → case status of WorkerLive → retry; _ → pure ())
+                awaitGateEntered handled
+                continue captured
+          )
+          ( \waiting → do
+              answer waiting >>= (`shouldBe` AccountingComplete)
+              awaitEntered fixture "b"
+              atomically (ticksOutstanding (scheduledEndpoint owner)) >>= (`shouldBe` 1)
+              releaseGate fixture "b"
+              retireScheduled owner
+          )
 
   describe "what it costs the owner" $ do
     it "needs no task, control or result slot, and works with every bound exhausted" $ bounded $ do
@@ -167,31 +177,36 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
         let endpoint = scheduledEndpoint owner
         a ← admitTask' fixture owner "A" (request "wait_ticks" [VText "A", VInteger 1] OrdinaryClass OneShot (Just "A"))
         awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
-        waiting ←
-          holdingSafely fixture owner $ do
-            -- The holder and A hold both active places; B takes the one queued place; C finds none.
-            _ ← admitTask' fixture owner "B" (request "once" [VText "B"] OrdinaryClass OneShot (Just "B"))
-            admitScheduledTask endpoint (request "once" [VText "C"] OrdinaryClass OneShot (Just "C")) >>= \case
-              TaskQueueFull → pure ()
-              other → failExample ("expected the queue full, found " <> show other)
-            -- One control place, taken and never given back.
-            requestTaskControl endpoint (ticketTask a) RequestResume >>= \case
-              TaskControlAccepted _ → pure ()
-              other → failExample ("expected the control accepted, found " <> show other)
-            requestTaskControl endpoint (ticketTask a) RequestPause >>= \case
-              TaskControlFull → pure ()
-              other → failExample ("expected the control full, found " <> show other)
-            -- Two outstanding grants, and a third is refused.
-            grant owner 1
-            grant owner 1
-            grantScheduledStep endpoint (nanoseconds 1) >>= \case
-              GrantFull → pure ()
-              other → failExample ("expected the grants full, found " <> show other)
-            captured ← beginWait control owner
-            awaitPending captured
-            pure captured
-        answer waiting >>= (`shouldBe` AccountingComplete)
-        retireScheduled owner
+        holdingSafelyScoped
+          fixture
+          owner
+          ( \continue → do
+              -- The holder and A hold both active places; B takes the one queued place; C finds none.
+              _ ← admitTask' fixture owner "B" (request "once" [VText "B"] OrdinaryClass OneShot (Just "B"))
+              admitScheduledTask endpoint (request "once" [VText "C"] OrdinaryClass OneShot (Just "C")) >>= \case
+                TaskQueueFull → pure ()
+                other → failExample ("expected the queue full, found " <> show other)
+              -- One control place, taken and never given back.
+              requestTaskControl endpoint (ticketTask a) RequestResume >>= \case
+                TaskControlAccepted _ → pure ()
+                other → failExample ("expected the control accepted, found " <> show other)
+              requestTaskControl endpoint (ticketTask a) RequestPause >>= \case
+                TaskControlFull → pure ()
+                other → failExample ("expected the control full, found " <> show other)
+              -- Two outstanding grants, and a third is refused.
+              grant owner 1
+              grant owner 1
+              grantScheduledStep endpoint (nanoseconds 1) >>= \case
+                GrantFull → pure ()
+                other → failExample ("expected the grants full, found " <> show other)
+              withWait control owner $ \captured → do
+                awaitPending captured
+                continue captured
+          )
+          ( \waiting → do
+              answer waiting >>= (`shouldBe` AccountingComplete)
+              retireScheduled owner
+          )
 
     it "can be made more times than any bound allows, one after another, leaving the owner's counters as they were" $ bounded $ do
       fixture ← newSFixture
@@ -217,23 +232,28 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
         bystander ← startPlain fixture runtime "bystander" (classifying classifying') defaultSchedulerBounds
         _ ← admitTask' fixture owner "A" (request "wait_ticks" [VText "A", VInteger 1] OrdinaryClass OneShot (Just "A"))
         awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
-        later ←
-          holdingSafely fixture owner $ do
-            grant owner 1
-            -- Parked.
-            parked ← beginWait control owner
-            awaitPending parked
-            cancelWait parked
-            -- Inside the classifier of an outcome a wait is handling.
-            handling ← beginWait control owner
-            awaitPending handling
-            _ ← admitTask' fixture bystander "bang" (request "host_fail" [VText "bang"] OrdinaryClass OneShot Nothing)
-            awaitGateEntered classifying'
-            cancelWait handling
-            -- A wait begun afterwards captures the grant, and nothing the cancelled ones did stands in its way.
-            beginWait control owner
-        openGate classifying'
-        answer later >>= (`shouldBe` AccountingComplete)
+        holdingSafelyScoped
+          fixture
+          owner
+          ( \continue → do
+              grant owner 1
+              -- Parked.
+              withWait control owner $ \parked → do
+                awaitPending parked
+                cancelWait parked
+                -- Inside the classifier of an outcome a wait is handling.
+                withWait control owner $ \handling → do
+                  awaitPending handling
+                  _ ← admitTask' fixture bystander "bang" (request "host_fail" [VText "bang"] OrdinaryClass OneShot Nothing)
+                  awaitGateEntered classifying'
+                  cancelWait handling
+                  -- A wait begun afterwards captures the grant, and nothing the cancelled ones did stands in its way.
+                  withWait control owner continue
+          )
+          ( \later → do
+              openGate classifying'
+              answer later >>= (`shouldBe` AccountingComplete)
+          )
         retireScheduled owner
 
   describe "when its owner ends" $ do
@@ -243,14 +263,19 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
         owner ← startPlain fixture runtime "stopped" requiredPolicy defaultSchedulerBounds
         _ ← admitTask' fixture owner "w" (request "wait_ticks" [VText "w", VInteger 1] OrdinaryClass OneShot (Just "w"))
         awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
-        waiting ←
-          holdingSafely fixture owner $ do
-            grant owner 5
-            captured ← beginWait control owner
-            awaitPending captured
-            retireScheduled owner
-            pure captured
-        answer waiting >>= (`shouldBe` AccountingOwnerEnded)
+        holdingSafelyScoped
+          fixture
+          owner
+          ( \continue → do
+              grant owner 5
+              withWait control owner $ \captured → do
+                awaitPending captured
+                retireScheduled owner
+                continue captured
+          )
+          ( \waiting → do
+              answer waiting >>= (`shouldBe` AccountingOwnerEnded)
+          )
 
     it "ends with a cancelled owner, and with one that had ended before the wait began" $ bounded $ do
       fixture ← newSFixture
@@ -258,16 +283,21 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
         owner ← startPlain fixture runtime "cancelled owner" requiredPolicy defaultSchedulerBounds
         _ ← admitTask' fixture owner "w" (request "wait_ticks" [VText "w", VInteger 1] OrdinaryClass OneShot (Just "w"))
         awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
-        waiting ←
-          holdingSafely fixture owner $ do
-            grant owner 5
-            captured ← beginWait control owner
-            awaitPending captured
-            cancelQueued owner
-            pure captured
-        answer waiting >>= (`shouldBe` AccountingOwnerEnded)
-        _ ← awaitScheduledTerminal control owner
-        awaitScheduledAccounting control owner >>= (`shouldBe` AccountingOwnerEnded)
+        holdingSafelyScoped
+          fixture
+          owner
+          ( \continue → do
+              grant owner 5
+              withWait control owner $ \captured → do
+                awaitPending captured
+                cancelQueued owner
+                continue captured
+          )
+          ( \waiting → do
+              answer waiting >>= (`shouldBe` AccountingOwnerEnded)
+              _ ← awaitScheduledTerminal control owner
+              awaitScheduledAccounting control owner >>= (`shouldBe` AccountingOwnerEnded)
+          )
 
     it "rethrows a fatal failure of supervision that arrives while it waits, and ends with nothing else" $ bounded $ do
       fixture ← newSFixture
@@ -307,13 +337,20 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
         -- but the owner's next acknowledgement, and the boundary that applies the stops must not write one.
         -- A ready task is queued behind them, so that the owner is still serving, parked at its own gate,
         -- after the boundary that applied the stops: only the owner's acknowledgement could answer the wait.
-        let go begin = do
-              waiting ← holdingSafely fixture owner $ do
-                void (admitTask' fixture owner "B" (request "block_in" [VText "blk"] OrdinaryClass OneShot Nothing))
-                stop failing >> stop gated >> begin
-              awaitEntered fixture "y"
-              releaseGate fixture "y"
-              pure waiting
+        let go begin continue =
+              holdingSafelyScoped
+                fixture
+                owner
+                ( \held → do
+                    void (admitTask' fixture owner "B" (request "block_in" [VText "blk"] OrdinaryClass OneShot Nothing))
+                    stop failing >> stop gated
+                    begin held
+                )
+                ( \waiting → do
+                    awaitEntered fixture "y"
+                    releaseGate fixture "y"
+                    continue waiting
+                )
         pure (owner, go)
 
     it "rethrows a fatal failure that is already published when it is called, ahead of a completion that is ready" $ bounded $ do
@@ -356,13 +393,16 @@ spec = describe "waiting for a scheduled owner's accounting" $ do
         victim ← startPlain fixture runtime "victim" (optionalPolicy (brokenIs "bang")) defaultSchedulerBounds
         _ ← admitTask' fixture victim "bang" (request "tick_then_fail" [VText "bang"] OrdinaryClass OneShot Nothing)
         awaitDiagnostics victim (\counts → diagWaiting counts >= 1)
-        waiting ←
-          holdingSafely fixture victim $ do
-            grant victim 5
-            captured ← beginWait control victim
-            awaitPending captured
-            pure captured
-        answer waiting >>= (`shouldBe` AccountingOwnerEnded)
+        holdingSafelyScoped
+          fixture
+          victim
+          ( \continue → do
+              grant victim 5
+              withWait control victim $ \captured → do
+                awaitPending captured
+                continue captured
+          )
+          (\waiting → answer waiting >>= (`shouldBe` AccountingOwnerEnded))
 
   describe "from a Lua callback" $ do
     it "is refused, like every other wait, naming its operation" $ bounded $ do
@@ -420,15 +460,12 @@ observe strategy = do
     awaitDiagnostics owner (\counts → diagWaiting counts >= 3)
     let step n = do
           _ ← grantScheduledStep endpoint (nanoseconds n)
-          during ← case strategy of
-            Just WaitDuring → Just <$> beginWait control owner
-            Just CancelDuring → Nothing <$ (beginWait control owner >>= cancelWait)
-            _ → pure Nothing
-          awaitTicksComplete control owner >>= (`shouldBe` TicksCompleted)
-          case (strategy, during) of
-            (Just WaitEach, _) → awaitScheduledAccounting control owner >>= (`shouldBe` AccountingComplete)
-            (_, Just waiting) → answer waiting >>= (`shouldBe` AccountingComplete)
-            _ → pure ()
+          let completes = awaitTicksComplete control owner >>= (`shouldBe` TicksCompleted)
+          case strategy of
+            Just WaitDuring → withWait control owner $ \waiting → completes >> answer waiting >>= (`shouldBe` AccountingComplete)
+            Just CancelDuring → withWait control owner cancelWait >> completes
+            Just WaitEach → completes >> awaitScheduledAccounting control owner >>= (`shouldBe` AccountingComplete)
+            _ → completes
     mapM_ step [3, 5, 8, 13, 21, 2]
     case strategy of
       Just WaitAtEnd → awaitScheduledAccounting control owner >>= (`shouldBe` AccountingComplete)

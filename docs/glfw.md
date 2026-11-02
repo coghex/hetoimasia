@@ -5588,10 +5588,12 @@ own on Linux, or the desktop opt-in on a real desktop.
   backend arms it inside the body's first masked step, after the release that
   undoes it is registered (`Rig.armedBody`, `armedFinally`), and the protected
   fixtures' rescue is sticky once a cleanup has begun; both are exercised at each
-  cut by `Test.GLFW.Support.cutExamples`. Seven examples were left out of that
+  cut by `Test.GLFW.Support.cutExamples`. Eight examples were left out of that
   conversion (see `docs/test_suites.md`): the six that hold the graphics owner
-  inside its startup, and `testRetirementRecordSurvivesCancellation`, whose
-  harassing `forkIO` keeps its baseline entry. An
+  inside its startup, `testCoherentDestructionSnapshot`, whose destruction hook
+  waits for an owner handle only the consumer callback publishes, and
+  `testRetirementRecordSurvivesCancellation`, whose harassing `forkIO` keeps its
+  baseline entry. An
   example that must initialize GLFW, open a real window, or observe the platform
   belongs in `glfw-native-tests` and its shared fixture.
 - **The session wake examples** (`--match "GLFW session wake"`) use only the

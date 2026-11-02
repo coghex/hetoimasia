@@ -5,8 +5,7 @@
 -- them raised as cleanup evidence beside the primary outcome.
 module Test.LuaRuntime.Scheduled.Failures (spec) where
 
-import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), fromException, throwIO)
 import Control.Monad (forM, forM_, void, when)
@@ -21,7 +20,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (FakeTimer (ftOnCancel), nanoseconds)
-import Test.LuaRuntime.Support (bounded, Broken (Broken), brokenIs, expectFatal, expectFatalOpening, failExample, Gated (..), optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, Broken (Broken), brokenIs, expectFatal, expectFatalOpening, failExample, Gated (..), optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening, withProducer)
 
 blockThenFail ∷ Value → Value → TaskRequest
 blockThenFail name kind = request "block_then_fail" [name, kind] OrdinaryClass OneShot Nothing
@@ -57,17 +56,20 @@ spec = describe "host failures, failure and cancellation" $ do
       let endpoint = scheduledEndpoint victim
       _ ← admitTask' fixture victim "bang" (request "block_then_fail" [VText "r", VText "bang"] OrdinaryClass OneShot Nothing)
       awaitEntered fixture "r"
-      done ← newEmptyMVar
-      _ ← forkIO $ do
-        -- Admitting as fast as it can, from the moment the owner is let go, until
-        -- admission closes.
-        let go held = admitScheduledTask endpoint (request "echo" [VInteger 1] OrdinaryClass OneShot Nothing) >>= \case
-              TaskAccepted _ ticket → go (ticket : held)
-              TaskQueueFull → go held
-              TaskAdmissionClosed → pure held
-        go [] >>= putMVar done
-      releaseGate fixture "r"
-      tickets ← takeMVar done
+      tickets ←
+        withProducer
+          ( do
+              -- Admitting as fast as it can, from the moment the owner is let go, until
+              -- admission closes.
+              let go held = admitScheduledTask endpoint (request "echo" [VInteger 1] OrdinaryClass OneShot Nothing) >>= \case
+                    TaskAccepted _ ticket → go (ticket : held)
+                    TaskQueueFull → go held
+                    TaskAdmissionClosed → pure held
+              go []
+          )
+          $ \done → do
+            releaseGate fixture "r"
+            takeMVar done
       _ ← awaitScheduledTerminal control victim
       -- Every task the owner accepted settled: none was accepted too late to be.
       forM_ tickets $ \ticket → outcomeOf ticket >>= (`shouldSatisfy` \case SettledDiscarded _ → True; SettledReturned _ → True; _ → False)

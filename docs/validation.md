@@ -776,7 +776,7 @@ any other way, and its message names the facility that fits the kind of start.
   one start each (#598): `withEndpointSeamed` (an endpoint's backlog thread, started in the
   masked step that registers its stop-and-join, waiting through the runtime on a non-blocking
   socket so that the kill ends the wait, and joined, not interruptibly, before the descriptor
-  it waits on is closed) and `withLaunch` (a launched helper's output reader, started in the
+  it waits on is closed) and `withLaunchSeamed` (a launched helper's output reader, started in the
   masked step that registers its stop-and-join and joined, not interruptibly, before the
   launch's scope returns). Their regression examples are `Test.MacOS.Ownership`, in
   `macos-confinement-probe`, which runs where the library builds. A new raw start in

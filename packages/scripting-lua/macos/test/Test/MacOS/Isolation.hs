@@ -4,7 +4,6 @@
 -- sleeps for a duration and then assumes something happened.
 module Test.MacOS.Isolation (spec) where
 
-import Control.Exception (bracket)
 import Test.Hspec
 
 import Hetoimasia.Scripting.Lua.Internal.MacOS.Confine
@@ -28,7 +27,7 @@ import Test.MacOS.Driver
 spec ∷ SpecWith Fixture
 spec = describe "two-instance isolation" $
   it "gives two simultaneous helpers distinct processes and storage, neither reaching the other, each endable alone" $ \fixture →
-    withPair fixture $ \(first, second) → do
+    withHelperPair fixture $ \(first, second) → do
       -- Both are admitted and have their mod source resident before anything
       -- is asserted about either.
       readyFirst ← awaitReady first guardMicroseconds
@@ -78,15 +77,6 @@ spec = describe "two-instance isolation" $
             <> ") left the second running"
         )
  where
-  withPair fixture =
-    bracket
-      ( do
-          first ← launchHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "hold" 0
-          second ← launchHelper fixture (fixtureSecond fixture) (fixtureFirst fixture) "hold" 0
-          pure (first, second)
-      )
-      (\(first, second) → mapM_ endQuietly [first, second])
-
   isFootprint = \case
     Footprint _ _ → True
     _ → False

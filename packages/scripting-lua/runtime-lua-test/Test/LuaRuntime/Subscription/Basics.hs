@@ -8,9 +8,8 @@
 -- path ends it; and deliveries to a paused instance are retained, in order.
 module Test.LuaRuntime.Subscription.Basics (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Exception (evaluate)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (takeMVar)
 import Control.Monad (forM, forM_, void, when)
 import Data.List (elemIndex, sort)
 import Data.Maybe (fromMaybe)
@@ -33,7 +32,7 @@ import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Request.Support (awaitLine, linesOf, refusalOf)
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfObserver), awaitEntered, blockOn, releaseGate)
 import Test.LuaRuntime.Subscription.Support
-import Test.LuaRuntime.Support (bounded, failExample, Gated (..), requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, failExample, Gated (..), requiredPolicy, withBoundary, withBoundaryOpening, withProducers)
 
 -- | An owner of subscribers on elapsed time, granted both endpoints.
 elapsedOwner ∷ IFixture → FakeEvents → LuaRuntime → Text → [ModuleSource] → IO ScheduledOwner
@@ -46,14 +45,9 @@ subscribeTo' fixture owner name key endpoint mode = do
   commandWith fixture owner name "subscribe" key (Just endpoint) mode
   awaitLine fixture ("cmd subscribe " <> key <> " ok")
 
--- | Run these on threads of their own and wait for every answer, in the order given.
+-- | Run these on owned threads of their own (#598) and wait for every answer, in the order given.
 onThreads ∷ [IO a] → IO [a]
-onThreads actions = do
-  boxes ← forM actions $ \action → do
-    box ← newEmptyMVar
-    _ ← forkIO (action >>= putMVar box)
-    pure box
-  mapM takeMVar boxes
+onThreads actions = withProducers actions (mapM takeMVar)
 
 spec ∷ Spec
 spec = describe "on an owner on elapsed time" $ do

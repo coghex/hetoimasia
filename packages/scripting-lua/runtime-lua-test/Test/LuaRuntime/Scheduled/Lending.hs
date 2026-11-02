@@ -10,8 +10,8 @@
 -- owner's retirement does with the collection however the owner ends.
 module Test.LuaRuntime.Scheduled.Lending (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, myThreadId)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
+import Control.Concurrent (ThreadId, myThreadId)
+import Control.Concurrent.MVar (MVar, readMVar, takeMVar, tryPutMVar)
 import Control.Exception
   ( ExceptionWithContext (ExceptionWithContext)
   , SomeException
@@ -45,7 +45,7 @@ import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduled.Support
-import Test.LuaRuntime.Support (bounded, Broken (Broken), brokenIs, expectFatal, failExample, Gated (..), gateIn, openGatesIn, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, Broken (Broken), brokenIs, expectFatal, failExample, Gated (..), gateIn, openGatesIn, optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening, withProducer)
 
 -- The fixture ------------------------------------------------------------------
 
@@ -206,15 +206,14 @@ lendRegistration fixture handle =
           stateOperation "child" [SText] [] $ \arguments →
             for1 arguments $ \name → do
               lent ← lentToCallback handle
-              finished ← newEmptyMVar
-              _ ←
-                forkIO $ do
-                  attemptNoting fixture "child acquire given" (void (acquireLent lent (tracked fixture name)))
-                  attemptNoting fixture "child acquire asked" $ do
-                    asked ← lentToCallback handle
-                    void (acquireLent asked (tracked fixture name))
-                  putMVar finished ()
-              takeMVar finished
+              withProducer
+                ( do
+                    attemptNoting fixture "child acquire given" (void (acquireLent lent (tracked fixture name)))
+                    attemptNoting fixture "child acquire asked" $ do
+                      asked ← lentToCallback handle
+                      void (acquireLent asked (tracked fixture name))
+                )
+                takeMVar
               -- The refusals did not invalidate this callback's own access.
               attemptNoting fixture "after child" (acquireLent lent (tracked fixture "legit") >>= remember fixture "legit")
         , -- Keeps this callback's loan and holds the callback open until the gate

@@ -232,9 +232,13 @@ cabal test hetoimasia-tests --test-show-details=direct
   `onThread`, `onBoundThread`, `withDeferredThread`, `withMainThread` and the
   scoped helpers beside the specs that use them) except one, the harassing
   `forkIO` of `testRetirementRecordSurvivesCancellation` in
-  `Owner/Failure/Interruption.hs`, whose baseline entry (count 1) is kept. Seven
-  examples are left as before #593 and belong to a follow-up: that one, and the
-  six that hold the graphics owner inside its startup
+  `Owner/Failure/Interruption.hs`, whose baseline entry (count 1) is kept. Eight
+  examples are left as before #593 and belong to a follow-up: that one,
+  `Owner/Exit/Settlement.hs` `testCoherentDestructionSnapshot` (it has no raw
+  thread start and no baseline entry; its destruction hook waits for an owner
+  handle that only the consumer callback publishes, which an early cancellation
+  can prevent, and its scenario and assertions are unchanged), and the six that
+  hold the graphics owner inside its startup
   (`Owner/Port.hs` `testPortFullReported` and `testFullPortDoesNotBlockExit`,
   `Owner/Exit/Settlement.hs` `testUnannouncedDirectAttachSettles` and
   `testUnannouncedClosedSettles`, `Owner/Handover.hs` `testHandoffOrder` and
