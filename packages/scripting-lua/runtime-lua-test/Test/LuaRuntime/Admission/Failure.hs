@@ -11,7 +11,8 @@ module Test.LuaRuntime.Admission.Failure (spec) where
 
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException, throwIO, toException)
 import Control.Monad (forM_)
-import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -56,22 +57,34 @@ requestFailure' failure = case failureError failure of
 
 -- | What the application was told as an instance's failure began (once, the primary alone) and as it settled.
 data Told = Told
-  { toldEarly ∷ IORef [InstanceFailure]
-  , toldSettled ∷ IORef [InstanceFailure]
+  { toldEarly ∷ TVar [InstanceFailure]
+  , toldSettled ∷ TVar [InstanceFailure]
   }
 
 -- | A configuration that records both tellings, newest first.
 recording ∷ IO (Told, InstanceConfig)
 recording = do
-  early ← newIORef []
-  settled ← newIORef []
+  early ← newTVarIO []
+  settled ← newTVarIO []
   pure
     ( Told early settled
     , aConfig
-        { instanceOnFailing = \failure → modifyIORef' early (failure :)
-        , instanceEscalate = \failure → modifyIORef' settled (failure :) >> pure Isolate
+        { instanceOnFailing = \failure → atomically (modifyTVar' early (failure :))
+        , instanceEscalate = \failure → atomically (modifyTVar' settled (failure :)) >> pure Isolate
         }
     )
+
+-- | What the application was told of the settled failure, once it has been told: the instance's settlement is
+-- published before 'instanceEscalate' runs on the owner's thread, so a reading taken the moment the settlement is
+-- visible can be empty. Blocks, without sleeping, until the telling is recorded.
+awaitToldSettled ∷ Told → IO [InstanceFailure]
+awaitToldSettled told = atomically $ do
+  held ← readTVar (toldSettled told)
+  if null held then retry else pure held
+
+-- | The earlier notices: told on the owner's thread as the ending begins, which is before the instance can settle.
+toldBefore ∷ Told → IO [InstanceFailure]
+toldBefore = readTVarIO . toldEarly
 
 -- | The message an uncaught script error carried, when the error is a script error of a call.
 scriptMessage ∷ InstanceError → Maybe Text
@@ -220,13 +233,13 @@ spec = describe "failure" $ do
             fmap (Text.isInfixOf "error") (faultTraceback err) `shouldBe` Just True
           other → fail ("expected the script's error as the only secondary, found " <> show (length other))
         -- The earlier notice carries the same primary alone, and the settled record the same primary.
-        early ← readIORef (toldEarly told)
+        early ← toldBefore told
         case early of
           [first] → do
             primaryIsTheRequest first
             failureSecondary first `shouldSatisfy` null
           other → fail ("expected one earlier notice, found " <> show (length other))
-        settled ← readIORef (toldSettled told)
+        settled ← awaitToldSettled told
         case settled of
           [first] → do
             primaryIsTheRequest first
@@ -258,9 +271,9 @@ spec = describe "failure" $ do
         failureSecondary failure `shouldSatisfy` null
         seen ← history fixture
         seen `shouldSatisfy` notElem "late_raise a running"
-        early ← readIORef (toldEarly told)
+        early ← toldBefore told
         map failureError early `shouldSatisfy` \case [ErrorRequest "path" why] → why == attributed; _ → False
-        settled ← readIORef (toldSettled told)
+        settled ← awaitToldSettled told
         map failureStage settled `shouldBe` [StageRequest "path"]
 
     it "keeps an uncaught script error as the primary when no required failure had been latched when it was recorded" $ bounded $ do
@@ -285,10 +298,10 @@ spec = describe "failure" $ do
         failureSecondary failure `shouldSatisfy` null
         d ← diagnostics owner
         rdLatched d `shouldBe` 0
-        early ← readIORef (toldEarly told)
+        early ← toldBefore told
         map failureStage early `shouldBe` [StageEvent "cmd"]
         map (isJust . failureTraceback) early `shouldBe` [True]
-        map failureStage <$> readIORef (toldSettled told) >>= (`shouldBe` [StageEvent "cmd"])
+        map failureStage <$> awaitToldSettled told >>= (`shouldBe` [StageEvent "cmd"])
 
   describe "an optional request's expected failure" $ do
     it "is a result for the script, whole, and fails nobody" $ bounded $ do
