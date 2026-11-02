@@ -78,15 +78,15 @@ spec = do
 -- has been entered and then waits, and the example throws to the owner's own
 -- thread while it is there.
 testCancellationAtEachBackendCall ∷ IO ()
-testCancellationAtEachBackendCall = cancellationAtEachBackendCall (\_ → pure ())
+testCancellationAtEachBackendCall = cancellationAtEachBackendCall False (\_ → pure ())
 
 -- | The same fixture with the example ended at the cut (#593): before the scripted backend behaviour is armed, or after it and its
 -- release are registered.
 backendCallScenario ∷ Int → Scope → IO () → IO ()
-backendCallScenario cutAt _ atParked = cancellationAtEachBackendCall (\armedNow → when (armedNow == cutAt) atParked)
+backendCallScenario cutAt _ atParked = cancellationAtEachBackendCall True (\armedNow → when (armedNow == cutAt) atParked)
 
-cancellationAtEachBackendCall ∷ (Int → IO ()) → IO ()
-cancellationAtEachBackendCall cut =
+cancellationAtEachBackendCall ∷ Bool → (Int → IO ()) → IO ()
+cancellationAtEachBackendCall scenario cut =
   forM_ [BackendConstruct, BackendRetireTarget, BackendDestroy] $ \at' → do
     rig ← newRig
     inside ← newTVarIO False
@@ -134,7 +134,9 @@ cancellationAtEachBackendCall cut =
           atomically (writeTVar release True)
     -- The helper drives the owner through the gate it is held at and opens that gate itself, so it is owned by the example and
     -- outlives the host body (#593); the scope opens the gate as well, whatever ended it.
-    withOwnedThreadOpening (atomically (writeTVar release True)) deliver $ \_ _ → do
+    -- In a scenario the example's own ending releases the gate, so the cancellations are not delivered: they would race the release
+    -- and could land on a call that already returned, which is not what the cut examples ask.
+    withOwnedThreadOpening (atomically (writeTVar release True)) (unless scenario deliver) $ \_ _ → do
       ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → armedBody cut arm (atomically (writeTVar release True)) $ do
         window ← theWindow host
         service ← handedOver host owner window
