@@ -19,13 +19,13 @@
 -- hanging the run.
 module Test.MacOS.Ownership (spec) where
 
-import Control.Concurrent (ThreadId, myThreadId, yield)
+import Control.Concurrent (ThreadId, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar)
 import Control.Concurrent.STM (readTVarIO)
-import Control.Exception (AsyncException (UserInterrupt), Exception, finally, throwIO, try)
+import Control.Exception (AsyncException (UserInterrupt), Exception, allowInterrupt, finally, mask_, throwIO, try)
 import Control.Monad (void)
 import Data.IORef (newIORef, readIORef, writeIORef)
-import GHC.Conc (ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
+import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
 import System.FilePath ((</>))
 import System.IO.Temp (withTempDirectory)
 import Test.Hspec
@@ -34,10 +34,11 @@ import Hetoimasia.Scripting.Lua.Internal.MacOS.Launch
   ( EndpointSeams (..)
   , Launched (..)
   , awaitReport
+  , processGone
   , withEndpointSeamed
   )
 import Hetoimasia.Scripting.Lua.Internal.MacOS.Report (Report (..))
-import Test.MacOS.Driver (Fixture (..), endQuietly, endWithEscalation, guardMicroseconds, withHelper)
+import Test.MacOS.Driver (Fixture (..), endQuietly, endWithEscalation, guardMicroseconds, withHelper, withHelperPair)
 import Test.Support.Bounded (bounded)
 import Test.Support.Cancel (withCancellationAfter)
 import Test.Support.Owned (withOwnedThread)
@@ -188,10 +189,32 @@ spec = describe "the threads the probe library owns itself (#598)" $ do
                 readTVarIO (launchedFinished launched) `shouldReturn` True
         )
         [1 .. 5 ∷ Int]
+    it "ends and reaps both helpers of a pair when a cancellation is already pending as its body begins" $ \fixture → do
+      kept ← newIORef Nothing
+      caller ← myThreadId
+      -- The example is masked and a cancellation is queued against it, blocked in throwTo: the first point the pair's body
+      -- can take it is `allowInterrupt`, which is after the cleanup is installed (review round 2 of #598).
+      outcome ←
+        try @AsyncException . bounded . mask_ $
+          withOwnedThread (throwTo caller UserInterrupt) $ \thrower _ → do
+            awaitBlockedThrower thrower
+            withHelperPair fixture $ \pair → writeIORef kept (Just pair) >> allowInterrupt
+      outcome `shouldBe` Left UserInterrupt
+      readIORef kept >>= \case
+        Nothing → expectationFailure "the pair's body never began"
+        Just (first, second) → do
+          mapM_ (\launched → processGone (launchedPid launched) `shouldReturn` True) [first, second]
+          mapM_ (\launched → joined (launchedReader launched) `shouldReturn` True) [first, second]
     it "is judged a leak when a scope returns without stopping the thread it started (the previous, unowned shape)" $ \_ → do
       verdict ← leakedAfterScope
       verdict `shouldBe` False
  where
+  awaitBlockedThrower thrower =
+    threadStatus thrower >>= \case
+      ThreadBlocked BlockedOnException → pure ()
+      ThreadFinished → expectationFailure "the cancellation was delivered before the body began"
+      ThreadDied → expectationFailure "the thrower died"
+      _ → yield >> awaitBlockedThrower thrower
   isFootprint = \case
     Footprint _ _ → True
     _ → False

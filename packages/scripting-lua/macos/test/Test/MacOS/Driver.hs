@@ -21,6 +21,7 @@ module Test.MacOS.Driver
   , helperArguments
   , withHelper
   , withLaunched
+  , withHelperPair
   , accessesFrom
   , outcomeOf
   , mechanismOf
@@ -36,7 +37,7 @@ module Test.MacOS.Driver
   , enforceExecutionBudget
   ) where
 
-import Control.Exception (ErrorCall (ErrorCall), IOException, bracket_, throwIO, try)
+import Control.Exception (ErrorCall (ErrorCall), IOException, bracket_, finally, mask, throwIO, try)
 import Control.Monad (forM, unless, void)
 import Data.List (find)
 import Data.Text (Text)
@@ -206,6 +207,16 @@ withHelper fixture self peer mode memoryLimitMiB =
       , requestArguments = helperArguments fixture self peer mode
       , requestMemoryLimitMiB = memoryLimitMiB
       }
+
+-- | Two simultaneous helpers for the length of the body, each ended inside the scope of its own launch, before the thread that
+-- reads its output is joined (#598). Acquisition and the registration of the cleanup are one masked step: both launches and the
+-- @finally@ that ends the helpers run masked, and the body alone is restored to the caller's interruptibility after the
+-- cleanup is installed, so a cancellation pending as the body begins still ends and reaps both helpers.
+withHelperPair ∷ Fixture → ((Launched, Launched) → IO a) → IO a
+withHelperPair fixture body = mask $ \restore →
+  withHelper fixture (fixtureFirst fixture) (fixtureSecond fixture) "hold" 0 $ \first →
+    withHelper fixture (fixtureSecond fixture) (fixtureFirst fixture) "hold" 0 $ \second →
+      restore (body (first, second)) `finally` mapM_ endQuietly [first, second]
 
 -- | 'withLaunch' for an example that needs the helper and fails when it cannot be launched.
 withLaunched ∷ LaunchRequest → (Launched → IO a) → IO a
