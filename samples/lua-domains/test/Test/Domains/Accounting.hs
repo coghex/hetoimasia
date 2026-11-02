@@ -146,6 +146,24 @@ childrenOfScope ending = do
       end (awaitEntered fx "registered" >> awaitEntered fx "spawned")
   allJoined 2 seen
 
+-- | A spawned thread that failed and was never collected, and a registered one held in a finalizer, in a scope of their own;
+-- a reaper (not registered, owned by the example) is cancelled while it waits for the held one, which is the newest, so the
+-- failed one has not been looked at. The scope still raises its failure when it ends.
+reapCancelledKeepsFailure ∷ IO ()
+reapCancelledKeepsFailure = do
+  fx ← newFx
+  withReleased fx ["body", "finalizer"] . withForks $ do
+    _ ← spawn (throwIO (userError "an uncollected failure") ∷ IO ())
+    -- Only the failed thread is registered, and it has ended.
+    awaitForkedEnded
+    _ ← forkRegistered (holdAt fx "body" `finally` holdAt fx "finalizer")
+    awaitEntered fx "body"
+    withOwnedThread reapForked $ \reaper reaperEnded → do
+      awaitEntered fx "finalizer"
+      killThread reaper
+      reaperEnded
+    releaseGate fx "finalizer"
+
 -- | A worker started in this kind of scope and parked at a gate, with the scope ended the way the ending says: the judgement
 -- the facility makes true, and the controls' unowned start does not.
 parkedWorker ∷ Ending → Scope → IO Bool
@@ -442,6 +460,9 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
       childCancelsItsCreator >>= (`shouldBe` True)
     it "a cancellation that arrives while the threads are being reaped leaves the ones not yet reached owned by the scope" $
       reapCancelledMidway >>= (`shouldBe` True)
+    it "the failure of a thread an example spawned and never collected is still raised by the scope when an earlier reap was cancelled" $ do
+      raised ← try @SomeException reapCancelledKeepsFailure
+      raised `shouldSatisfy` \case Left failure → show failure == show (userError "an uncollected failure"); Right _ → False
 
   describe "a failure belongs to the tick whose accounting cutoff covers it, or to the first tick not yet committed (D-48)" $ do
     let functionsHere =
