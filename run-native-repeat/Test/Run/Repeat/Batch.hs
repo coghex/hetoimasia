@@ -34,7 +34,7 @@ module Test.Run.Repeat.Batch
   ) where
 
 import Control.Concurrent (threadDelay)
-import Control.Exception (SomeException, mask, onException, try, uninterruptibleMask_)
+import Control.Exception (IOException, mask, onException, try, uninterruptibleMask_)
 import Control.Monad (filterM, forM, unless, void)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf, nub)
@@ -238,7 +238,8 @@ readFileOrEmpty path = do
       length contents `seq` pure contents
     else pure ""
 
--- | One bounded @sample@ of a process: the line that says what came of it, and whether the sampler (and anything it
+-- | One bounded @sample@ of a process (a failure to start the sampler is an @IOException@ and is recorded; nothing else is caught,
+-- so a cancellation propagates after the sampler's own cleanup): the line that says what came of it, and whether the sampler (and anything it
 -- started) is gone. The sampler is owned like any other process: when its bound passes it is stopped by pid, escalated after
 -- the grace, and reaped before the trial goes on.
 takeSample ∷ IORef Bool → Trial → FilePath → CPid → IO [(String, Bool)]
@@ -250,7 +251,7 @@ takeSample reclaimedRef trial stem pid = do
       handleOut ← openBinaryFile (file <> ".log") WriteMode
       handleErr ← openBinaryFile (file <> ".err") WriteMode
       attempt ←
-        try @SomeException $
+        try @IOException $
           runOwned WholeTree command (trialDirectory trial) handleOut handleErr (trialSampleBoundSeconds trial) (trialStopGraceSeconds trial) reclaimedRef (const (pure ()))
       pure . pure $ case attempt of
         Left failure → (show pid <> ": sampling failed: " <> show failure, False)
@@ -282,7 +283,7 @@ ownedProcesses root = do
   pure (filter (/= root) (nub (below root <> grouped)))
 
 isAlive ∷ CPid → IO Bool
-isAlive pid = either (const False) (const True) <$> try @SomeException (signalProcess nullSignal pid)
+isAlive pid = either (const False) (const True) <$> try @IOException (signalProcess nullSignal pid)
 
 -- | Stop what a root owns, by pid, and answer whether everything is gone. Every sweep re-enumerates what the root owns (its
 -- tree and its process group) and what was known before, so a process started during the shutdown (a TERM handler that
@@ -313,7 +314,7 @@ stopOwned scope grace root handle = do
       living ← filterM isAlive (nub (found <> known <> [root]))
       modifyIORef' seen (\before → nub (before <> living))
       let fresh = [pid | pid ← living, pid `notElem` signalled]
-      mapM_ (\pid → try @SomeException (signalProcess signal pid)) fresh
+      mapM_ (\pid → try @IOException (signalProcess signal pid)) fresh
       now ← getMonotonicTime
       unless (null living || now - start >= fromIntegral grace) $
         threadDelay 20_000 >> loop seen signal start (signalled <> fresh)

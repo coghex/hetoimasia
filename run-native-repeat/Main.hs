@@ -184,6 +184,25 @@ machinery = do
         Nothing → expectationFailure ("no late child pid: " <> late)
         Just pid → isAlive pid `shouldReturn` False
 
+  it "propagates a cancellation that lands while a sample is being taken, without starting another sampler, and keeps the real cleanup result" $
+    withSystemTempDirectory "repeat-probe" $ \directory → do
+      let started = directory </> "samplers.txt"
+          sampler = ["/bin/sh", "-c", "echo $$ >> " <> started <> "; sleep 3600"]
+          trial = (stub directory 1 "sleep 3600") {trialSample = \_ _ → sampler, trialSampleBoundSeconds = 6, trialStopGraceSeconds = 2}
+          render outcomes = show (map (\o → (outcomeVerdict o, outcomeReclaimed o)) outcomes)
+      -- The run exceeds its 1 s bound and its first sampler starts; the cancellation at 2.2 s lands while that sampler is
+      -- being waited for (its own bound is 6 s). It must not turn into a failed sample and go on to the next process.
+      abandoned ← timeout 2_200_000 (runBatch trial directory 2 False render (\_ _ → pure ()))
+      abandoned `shouldSatisfy` maybe True (const False)
+      length . lines <$> readFile started >>= (`shouldBe` 1)
+      report ← readFile (directory </> "report.md")
+      report `shouldSatisfy` ("interrupted" `isInfixOf`)
+      report `shouldSatisfy` ("True)" `isInfixOf`)
+      firstSampler ← takeWhile (/= '\n') <$> readFile started
+      case readMaybe firstSampler of
+        Nothing → expectationFailure ("no sampler pid: " <> firstSampler)
+        Just pid → isAlive pid `shouldReturn` False
+
   it "persists the partial report, with the interrupted attempt recorded as a failure, when a batch is cancelled" $
     withSystemTempDirectory "repeat-probe" $ \directory → do
       let render outcomes = show (length outcomes) <> " attempts, " <> show (map outcomeVerdict outcomes)
