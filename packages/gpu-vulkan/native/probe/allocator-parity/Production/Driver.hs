@@ -57,7 +57,8 @@ module Production.Driver
   , callbacksFor
   ) where
 
-import Control.Concurrent (forkIO, killThread, threadDelay)
+import Control.Concurrent (threadDelay)
+import Test.Support.Owned (withOwnedThread)
 import Control.Exception (bracket, try)
 import Control.Monad (forM, forM_, unless, when)
 import Data.Bits (shiftL, testBit, (.&.), (.|.))
@@ -423,14 +424,13 @@ detectCallSafety session geometry = do
   c_detectReset
   outcome ←
     withAllocator session cDetectOnAllocate nullFunPtr nullPtr $ \allocator → do
-      watcher ← forkIO watch
-      created ← try (Vma.createBuffer allocator (bufferInfo (64 * 1024) (specUsage (classSpec geometry))) (allocationInfo geometry 0))
-      killThread watcher
-      case created of
-        Left (VulkanException result) → pure (Left ("the call-safety check's buffer failed with " <> show result))
-        Right (buffer, allocation, _) → do
-          Vma.destroyBuffer allocator buffer allocation
-          Right <$> c_detectResult
+      withOwnedThread watch $ \_ _ → do
+        created ← try (Vma.createBuffer allocator (bufferInfo (64 * 1024) (specUsage (classSpec geometry))) (allocationInfo geometry 0))
+        case created of
+          Left (VulkanException result) → pure (Left ("the call-safety check's buffer failed with " <> show result))
+          Right (buffer, allocation, _) → do
+            Vma.destroyBuffer allocator buffer allocation
+            Right <$> c_detectResult
   pure $ case outcome of
     Left problem → Left problem
     Right 1 → Right SafeCalls

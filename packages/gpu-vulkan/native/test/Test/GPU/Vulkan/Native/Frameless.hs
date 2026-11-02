@@ -10,8 +10,6 @@
 -- Nothing here creates a Vulkan object, and nothing waits on a clock.
 module Test.GPU.Vulkan.Native.Frameless (spec) where
 
-import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception (ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, fromException, throwIO, try)
 import Data.ByteString (ByteString)
@@ -22,6 +20,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Numeric.Natural (Natural)
+import Test.GPU.Vulkan.Native.Threads (onOtherThread)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 
 import Hetoimasia.Foundation.Resource (cleanupFailureException, cleanupFailureLabel, cleanupFailures)
@@ -226,15 +225,11 @@ spec = describe "Frame-less batches" $ do
       rig ← newRig
       ticket ← scoped rig sealedIn
       awaitTicket ticket (milliseconds 1) `shouldReturn` Left RefusedOwnerWait
-      waited ← newEmptyMVar
-      _ ← forkIO (awaitTicket ticket (milliseconds 1) >>= putMVar waited)
-      takeMVar waited `shouldReturn` Right TicketPending
+      onOtherThread (awaitTicket ticket (milliseconds 1)) `shouldReturn` Right TicketPending
       atomically (readTicket ticket) `shouldReturn` TicketPending
       completeAll (rigStandIn rig)
       _ ← progress rig
-      later ← newEmptyMVar
-      _ ← forkIO (awaitTicket ticket (milliseconds 60000) >>= putMVar later)
-      takeMVar later `shouldReturn` Right TicketComplete
+      onOtherThread (awaitTicket ticket (milliseconds 60000)) `shouldReturn` Right TicketComplete
       clean rig
 
     it "reports a pending ticket lost on device loss, and leaves a complete one complete" $ do

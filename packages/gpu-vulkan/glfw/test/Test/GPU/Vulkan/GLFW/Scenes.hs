@@ -12,7 +12,7 @@
 -- read it from.
 module Test.GPU.Vulkan.GLFW.Scenes (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, throwTo, yield)
+import Control.Concurrent (ThreadId, throwTo, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, stateTVar, writeTVar)
 import Control.Exception (ErrorCall (..), SomeException, throwIO, toException, try)
@@ -68,6 +68,7 @@ import Hetoimasia.Runtime.GLFW
   )
 import Hetoimasia.Runtime.GLFW (UpdateSchedule (..))
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 import Test.GPU.Vulkan.GLFW.Bound (boundOf, boundedIt)
 import Test.GPU.Vulkan.GLFW.StandIn
 import Test.Hspec (Spec, describe, expectationFailure, shouldBe, shouldSatisfy)
@@ -342,15 +343,15 @@ testAdoption = do
     initialFrames ← (+) <$> presentsOf rig (graphicsAttachment sa) <*> presentsOf rig (graphicsAttachment sb)
     -- Hide the windows: the targets are suspended.
     hidden ← newTVarIO False
-    forkAndSet (setVisible rig host a False) hidden
-    composedUntil rig host control "the suspension" ((&&) <$> readTVarIO hidden <*> targetSuspended host sa)
-    before ← presentsOf rig (graphicsAttachment sa)
-    _ ← publishTo host a 77
-    composedUntil rig host control "the suspended window's adoption" (isJust . lookup 1 . flip adoptedBy a <$> sceneEvents rig)
-    settleOwner rig host
-    after ← presentsOf rig (graphicsAttachment sa)
-    events ← sceneEvents rig
-    pure (events, initial, after - before, initialFrames)
+    withSetAfter (setVisible rig host a False) hidden $ do
+      composedUntil rig host control "the suspension" ((&&) <$> readTVarIO hidden <*> targetSuspended host sa)
+      before ← presentsOf rig (graphicsAttachment sa)
+      _ ← publishTo host a 77
+      composedUntil rig host control "the suspended window's adoption" (isJust . lookup 1 . flip adoptedBy a <$> sceneEvents rig)
+      settleOwner rig host
+      after ← presentsOf rig (graphicsAttachment sa)
+      events ← sceneEvents rig
+      pure (events, initial, after - before, initialFrames)
   -- Both targets adopted the initial scene, as revision 0, with no
   -- publication behind it, and asked for no frame by it.
   [(revision, scene) | SceneAdopted _ revision scene ← suspendedAdopted] `shouldBe` [(0, 0), (0, 0)]
@@ -359,9 +360,10 @@ testAdoption = do
   presentedWhileSuspended `shouldBe` 0
   length [() | SceneAdopted _ 1 77 ← events] `shouldBe` 1
 
--- | Run an action on another thread, and set the flag once it has returned.
-forkAndSet ∷ IO () → TVar Bool → IO ()
-forkAndSet action flag = void (forkIO (action >> atomically (writeTVar flag True)))
+-- | Run an action on another thread for the length of the body, and set the flag once it has returned. The thread is
+-- owned: it has ended, and been joined, when the body is over, however it ended.
+withSetAfter ∷ IO () → TVar Bool → IO a → IO a
+withSetAfter action flag body = withOwnedThread (action >> atomically (writeTVar flag True)) (\_ _ → body)
 
 -- | Every adoption and release the host's lifecycle reported, once the host
 -- has ended.
@@ -680,17 +682,17 @@ testRequestIgnoresLaterWindow = do
     -- A window created after the request, with a publication nothing will
     -- adopt: it is not named, and delays nothing once C ends.
     submitted ← newTVarIO False
-    forkAndSet (void (awaitSubmitWindowCommand (hostCommandPort (vulkanWindowHost host)) [("client", "integration-tests")] (createWindowCommand (hiddenTestWindowConfig "created later" 64 48)))) submitted
-    composedUntil rig host control "the created window" ((== 4) . length <$> windowsOf host)
-    later ← filter (`notElem` windows) <$> windowsOf host
-    late ← case later of
-      [one] → pure one
-      other → failWith ("expected one new window, saw " <> show other)
-    published ← publishTo host late 9
-    published `shouldBe` WindowScenePublished late 1
-    CloseStarted ← closeHostWindow (vulkanWindowHost host) c
-    composedUntil rig host control "the request's run" ((== ["request"]) <$> readTVarIO ran)
-    pure (sceneRequests state, late, ())
+    withSetAfter (void (awaitSubmitWindowCommand (hostCommandPort (vulkanWindowHost host)) [("client", "integration-tests")] (createWindowCommand (hiddenTestWindowConfig "created later" 64 48)))) submitted $ do
+      composedUntil rig host control "the created window" ((== 4) . length <$> windowsOf host)
+      later ← filter (`notElem` windows) <$> windowsOf host
+      late ← case later of
+        [one] → pure one
+        other → failWith ("expected one new window, saw " <> show other)
+      published ← publishTo host late 9
+      published `shouldBe` WindowScenePublished late 1
+      CloseStarted ← closeHostWindow (vulkanWindowHost host) c
+      composedUntil rig host control "the request's run" ((== ["request"]) <$> readTVarIO ran)
+      pure (sceneRequests state, late, ())
   case requests of
     [named] → Map.member (KeyWindow created) named `shouldBe` False
     other → failWith ("expected one pending request, saw " <> show other)
@@ -973,50 +975,53 @@ testLedgerCancellation = do
     scenes ← newScenes False
     atomically (registerSceneTarget scenes (AttachmentAdopter attachment))
     hooks ← newTVarIO ([] ∷ [String])
-    entered ← newEmptyMVar
-    proceed ← newEmptyMVar
-    let lifecycle = SceneLifecycle
+    entered ← newProceedGate
+    -- Each transition has a hold of its own: the scope that runs it opens that hold, for every callback of the transition,
+    -- when it ends, so a later transition is never left with a hold already open.
+    let lifecycleOf proceed = SceneLifecycle
           { sceneAdopted = \_ revision _ → do
               atomically (modifyTVar' hooks (<> ["adopted " <> show revision]))
-              putMVar entered ()
-              takeMVar proceed
+              allowOne entered
+              awaitProceed proceed
           , sceneReleased = \_ revision → do
               atomically (modifyTVar' hooks (<> ["released " <> show revision]))
-              putMVar entered ()
-              takeMVar proceed
+              allowOne entered
+              awaitProceed proceed
           }
-        cancelDuring action = do
+        cancelDuring transition = do
           finished ← newEmptyMVar
-          thread ← forkIO (try @SomeException (void action) >>= putMVar finished)
-          takeMVar entered
-          -- The cancellation is delivered once the transition ends, never in it:
-          -- the thrower is blocked until then, and only then is the hook let go.
-          cancelled ← forkIO (throwTo thread (ErrorCall "cancelled"))
-          awaitSettled cancelled
-          putMVar proceed ()
-          takeMVar finished
+          proceed ← newProceedGate
+          withOwnedThreadOpening (openProceed proceed) (try @SomeException (void (transition (lifecycleOf proceed))) >>= putMVar finished) $ \thread _ → do
+            awaitProceed entered
+            -- The cancellation is delivered once the transition ends, never in it: the thrower is blocked until then,
+            -- and only then is the hook let go.
+            withOwnedThread (throwTo thread (ErrorCall "cancelled")) $ \cancelled _ → do
+              awaitHeldOff cancelled
+              allowOne proceed
+              takeMVar finished
     -- An adoption cancelled while its hook runs.
-    _ ← cancelDuring (adoptScene scenes lifecycle 100 (AttachmentAdopter attachment) (5 ∷ Scene) 3)
+    _ ← cancelDuring (\lifecycle → adoptScene scenes lifecycle 100 (AttachmentAdopter attachment) (5 ∷ Scene) 3)
     standing ← atomically (readSceneState scenes (pure []))
     -- A second revision, then the target ends: two records are due, and the
     -- release is cancelled while the first one's hook runs.
-    _ ← cancelDuring (adoptScene scenes lifecycle 100 (AttachmentAdopter attachment) (6 ∷ Scene) 4)
+    _ ← cancelDuring (\lifecycle → adoptScene scenes lifecycle 100 (AttachmentAdopter attachment) (6 ∷ Scene) 4)
     -- Take the second adoption's own cancellation out of the way: the thread
     -- it ran on is gone, and nothing is waiting on 'proceed'.
     atomically (endSceneTarget scenes (AttachmentAdopter attachment))
     finished ← newEmptyMVar
-    thread ← forkIO (try @SomeException (releaseScenes scenes (sceneReleased lifecycle) (\_ _ → pure False)) >>= putMVar finished)
-    takeMVar entered
-    cancelled ← forkIO (throwTo thread (ErrorCall "cancelled"))
-    awaitSettled cancelled
-    putMVar proceed ()
-    -- The second record's hook runs as well, though the first was cancelled.
-    takeMVar entered
-    putMVar proceed ()
-    _ ← takeMVar finished
-    after ← atomically (readSceneState scenes (pure []))
-    done ← readTVarIO hooks
-    pure (fmap windowAdopted (Map.lookup (KeyWindow window) (sceneWindows standing)), Just (maybe [] windowAwaitingRelease (Map.lookup (KeyWindow window) (sceneWindows after))), done)
+    proceed ← newProceedGate
+    withOwnedThreadOpening (openProceed proceed) (try @SomeException (releaseScenes scenes (sceneReleased (lifecycleOf proceed)) (\_ _ → pure False)) >>= putMVar finished) $ \thread _ → do
+      awaitProceed entered
+      withOwnedThread (throwTo thread (ErrorCall "cancelled")) $ \cancelled _ → do
+        awaitHeldOff cancelled
+        allowOne proceed
+        -- The second record's hook runs as well, though the first was cancelled.
+        awaitProceed entered
+        allowOne proceed
+        _ ← takeMVar finished
+        after ← atomically (readSceneState scenes (pure []))
+        done ← readTVarIO hooks
+        pure (fmap windowAdopted (Map.lookup (KeyWindow window) (sceneWindows standing)), Just (maybe [] windowAwaitingRelease (Map.lookup (KeyWindow window) (sceneWindows after))), done)
   adoptedBeforeCancel `shouldBe` Just (Just 3)
   adoptedAfter `shouldBe` Just []
   releasedAll `shouldBe` ["adopted 3", "adopted 4", "released 3", "released 4"]
@@ -1047,15 +1052,16 @@ testTeardownDiscard = do
   adoptedBy events window `shouldBe` [(0, 0), (1, 77)]
   releasedBy events window `shouldBe` [0, 1]
 
--- | Wait until a thread throwing an exception to another is blocked on its
--- delivery, or has delivered it.
-awaitSettled ∷ ThreadId → IO ()
-awaitSettled thread =
+-- | Wait until a thread that was thrown to is blocked on the delivery: the transition it is in holds the cancellation off.
+-- A thrower that has already finished delivered it at once, so the hook was not held and the example would not exercise a
+-- transition under cancellation: that fails the example instead of passing it.
+awaitHeldOff ∷ ThreadId → IO ()
+awaitHeldOff thread =
   threadStatus thread >>= \case
     ThreadBlocked BlockedOnException → pure ()
-    ThreadFinished → pure ()
-    ThreadDied → pure ()
-    _ → yield >> awaitSettled thread
+    ThreadFinished → failWith "the cancellation was delivered at once: the transition's hook was not held"
+    ThreadDied → failWith "the cancellation's thrower died before it was held off"
+    _ → yield >> awaitHeldOff thread
 
 testLossKeepsRevision ∷ IO ()
 testLossKeepsRevision = do

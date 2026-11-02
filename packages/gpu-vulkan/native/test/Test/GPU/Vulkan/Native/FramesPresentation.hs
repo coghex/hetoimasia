@@ -16,14 +16,13 @@
 -- clock.
 module Test.GPU.Vulkan.Native.FramesPresentation (spec) where
 
-import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (STM, atomically)
 import Control.Exception (ErrorCall (ErrorCall), SomeException, toException, try)
 import Control.Monad (forM, forM_, replicateM, void)
 import Data.List (sort)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.Word (Word32, Word64)
+import Test.GPU.Vulkan.Native.Threads (onOtherThread)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldNotBe, shouldReturn, shouldSatisfy)
 
 import Hetoimasia.Foundation.Time (DurationRequirement (AllowZero), durationFromNanoseconds, durationNanoseconds)
@@ -618,11 +617,6 @@ presentationImageOf rig presentation = presentationImage presentation <$> modelO
 failRootsSessionOf ∷ Rig → STM ()
 failRootsSessionOf rig = failRootsSession (rigRoots rig) CleanupFailed
 
-onOtherThread ∷ IO a → IO a
-onOtherThread action = do
-  done ← newEmptyMVar
-  _ ← forkIO (action >>= putMVar done)
-  takeMVar done
 
 -- | Every surface reports this extent now; every target publishes it at this
 -- instant and again once it has settled, 16 ms later.
