@@ -26,7 +26,7 @@ module Test.GPU.Vulkan.Native.Compositor
   ) where
 
 import Control.Concurrent (threadDelay)
-import Control.Exception (SomeException, try)
+import Control.Exception (SomeException, bracket, try)
 import Control.Monad (forM_)
 import System.Directory (getTemporaryDirectory, removeDirectoryRecursive)
 import System.Environment (getEnvironment, setEnv, unsetEnv)

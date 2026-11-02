@@ -218,7 +218,7 @@ holdUntilEnded = newEmptyMVar >>= \hold → readMVar hold `finally` void (tryPut
 -- The ways a scope that started a child can end
 
 -- | How a scope that started a child is made to end.
-data Ending = Returns | Raises | TimesOut | Cancelled | AcquisitionFails | ReleaseParked
+data Ending = Returns | Raises | TimesOut | Cancelled | CancelledStarting | AcquisitionFails | ReleaseParked
   deriving (Eq, Show)
 
 endings ∷ [(String, Ending)]
@@ -227,6 +227,7 @@ endings =
   , ("raises from its body", Raises)
   , ("passes its run bound", TimesOut)
   , ("is cancelled in its body", Cancelled)
+  , ("is cancelled while the child is being started", CancelledStarting)
   , ("fails after the child exists", AcquisitionFails)
   , ("is cancelled while its release is parked", ReleaseParked)
   ]
@@ -264,6 +265,11 @@ facilityScope script withDescendant directory probe ending = do
     Cancelled → do
       outcome ← try @AsyncException (bounded (withCancellationAfter (readMVar (probeReady probe)) (pure ()) (scoped hangCatcher noSeams (\child → body child >> holdUntilEnded))))
       outcome `shouldBe` Left UserInterrupt
+    CancelledStarting → do
+      -- Delivered in the masked acquisition, after the child exists and before the body is entered.
+      let seams = noSeams {seamSpawned = \handle → getPid handle >>= maybe (pure ()) (remember probe) >> throwIO UserInterrupt}
+      outcome ← try @AsyncException (scoped hangCatcher seams (\_ → pure ()))
+      outcome `shouldBe` Left UserInterrupt
     AcquisitionFails → do
       let seams = noSeams {seamSpawned = \handle → getPid handle >>= maybe (pure ()) (remember probe) >> boom}
       outcome ← try @Boom (scoped hangCatcher seams (\_ → pure ()))
@@ -297,6 +303,9 @@ libraryScope script withDescendant directory probe ending = do
       outcome `shouldBe` Nothing
     Cancelled → do
       outcome ← try @AsyncException (bounded (withCancellationAfter (readMVar (probeReady probe)) (pure ()) (scoped (\a b c d → body (a, b, c, d) >> holdUntilEnded))))
+      outcome `shouldBe` Left UserInterrupt
+    CancelledStarting → do
+      outcome ← try @AsyncException (unownedStart process (\a b c d → body (a, b, c, d) >> (throwIO UserInterrupt ∷ IO ())))
       outcome `shouldBe` Left UserInterrupt
     AcquisitionFails → do
       -- The shape of a start that is not released: the child exists and the step after it fails.
@@ -602,6 +611,32 @@ spec = describe "the shared subprocess facility (Test.Support.Subprocess)" $ do
     it "gives a child with a standard input of its own an open one" $ do
       Completed _ out _ _ ← runToCompletion hangCatcher (shell "(exec 3<&0) 2>/dev/null && echo open || echo closed" []) ""
       out `shouldBe` "open\n"
+
+  describe "what the body reads of a piped stream" $ do
+    it "takes the lines as they arrive, then the unterminated last one, then reports the end" $
+      withScopedChild (childSpec hangCatcher (shell "printf 'one\\ntwo'" [])) $ \child → do
+        nextLine child Stdout (30 * 1000000) >>= (`shouldBe` Line "one")
+        nextLine child Stdout (30 * 1000000) >>= (`shouldBe` Line "two")
+        nextLine child Stdout (30 * 1000000) >>= (`shouldBe` EndOfStream)
+        nextLine child Stderr (30 * 1000000) >>= (`shouldBe` EndOfStream)
+
+    it "reports a bound that expired while the stream was still open and quiet" $
+      withScopedChild (childSpec hangCatcher (shell obedientAlone [])) $ \child → do
+        awaitReady child
+        nextLine child Stdout 0 >>= (`shouldBe` TimedOut)
+
+    it "answers what was not taken as lines, to the stream's end, and everything it delivered" $
+      withScopedChild (childSpec hangCatcher (shell "printf 'a\\nb\\nc\\n'" [])) $ \child → do
+        nextLine child Stdout (30 * 1000000) >>= (`shouldBe` Line "a")
+        restOfOutput child Stdout (30 * 1000000) >>= (`shouldBe` Just "b\nc\n")
+        captured child Stdout >>= (`shouldBe` "a\nb\nc\n")
+        outputFailure child Stdout >>= (`shouldBe` Nothing)
+
+    it "has nothing to read of a stream that was not piped" $
+      withScopedChild (childSpec hangCatcher (shell "exit 0" [])) {specStdout = Absent} $ \child → do
+        nextLine child Stdout (30 * 1000000) >>= (`shouldBe` EndOfStream)
+        captured child Stdout >>= (`shouldBe` "")
+        restOfOutput child Stdout (30 * 1000000) >>= (`shouldBe` Just "")
 
   describe "a handle the caller opened" $ do
     it "is closed by the facility when the start fails" $

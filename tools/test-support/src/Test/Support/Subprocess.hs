@@ -677,6 +677,9 @@ drainForRelease env = do
     result ← awaitDrain (envChild env)
     when (result == DrainGivenUp) $
       noteProblem env ("the child's pipes did not end within " <> describeBound (Within (boundDrain (envBounds env))) <> " of the end of the child")
+  -- A stream that stopped for a reason other than reaching its end lost output the body may have relied on: it is evidence, not silence.
+  forM_ [(Stdout, "standard output"), (Stderr, "standard error")] $ \(output, name) →
+    outputFailure (envChild env) output >>= mapM_ (\failure → noteProblem env ("the child's " <> name <> " stopped before its end: " <> failure))
 
 -- --------------------------------------------------------------------------
 -- What the body can do
