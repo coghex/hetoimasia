@@ -47,7 +47,7 @@ import System.Directory (canonicalizePath, doesFileExist)
 import System.Environment (getEnvironment, getExecutablePath)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
-import System.IO (Handle, IOMode (ReadWriteMode, WriteMode), hClose, hFlush, hGetLine, hIsOpen, openFile, stdout)
+import System.IO (Handle, IOMode (ReadWriteMode, WriteMode), hClose, hFlush, hPutStr, hGetLine, hIsOpen, openFile, stdout)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.IO (OpenFileFlags (nonBlock), OpenMode (ReadWrite), defaultFileFlags, fdToHandle, openFd)
 import System.Posix.Files (createNamedPipe, ownerModes)
@@ -58,6 +58,7 @@ import System.Process
   ( CreateProcess (cwd, env, std_err, std_in, std_out)
   , StdStream (CreatePipe, NoStream)
   , ProcessHandle
+  , createPipe
   , createProcess
   , getPid
   , proc
@@ -658,6 +659,49 @@ spec = describe "the shared subprocess facility (Test.Support.Subprocess)" $ do
         Left (SubprocessFailure message) → (message `shouldContain` "run bound of 1 s") >> (message `shouldContain` "not reaped")
         Right () → expectationFailure "a run bound that passed with an unconfirmed reap passed"
       readIORef seen >>= mapM_ (\child → awaitUnreapedExit child (30 * 1000000) >> waitForProcess (childProcess child))
+
+    it "ends a call within its bounds when a holder outside the group keeps the unread input pipe open after the body wrote more than it holds, and says the input was discarded" $
+      withTemp $ \directory → do
+        let file = directory </> "holder.pid"
+            script =
+              unlines
+                [ "perl -MPOSIX -e 'POSIX::setsid(); open(F, \">$ARGV[0].t\"); print F $$; close F; rename(\"$ARGV[0].t\", $ARGV[0]); sleep 300' \"$1\" <&0 >/dev/null 2>&1 &"
+                , "while [ ! -e \"$1\" ]; do :; done"
+                , "echo ready"
+                , "sleep 300"
+                ]
+        held ← newIORef []
+        stdinHandle ← newIORef Nothing
+        (do
+            outcome ←
+              try @SubprocessFailure . bounded $
+                withScopedChildUsing quick {boundReap = 300000} noSeams (childSpec (Within 2000000) (shell script [file])) {specStdin = Piped} $ \child → do
+                  awaitReady child
+                  descendantPid file >>= \pid → atomicModifyIORef' held (\old → (pid : old, ()))
+                  writeIORef stdinHandle (childStdin child)
+                  -- More than the pipe holds, to a reader that never reads: the write blocks until the run bound ends the body.
+                  forM_ (childStdin child) (\input → hPutStr input (replicate 1000000 'x'))
+            case outcome of
+              Left (SubprocessFailure message) → (message `shouldContain` "run bound of 2 s") >> (message `shouldContain` "standard input could not be flushed")
+              Right () → expectationFailure "a call whose input could not be flushed passed"
+            -- The call has completed while the holder, which would end the flush, is still there: nothing waited for it.
+            readIORef held >>= mapM goneAndReaped >>= (`shouldBe` [False])
+            readIORef stdinHandle >>= mapM_ (\input → hIsOpen input >>= (`shouldBe` False)))
+          `finally` (readIORef held >>= rescue)
+
+    it "closes a caller's handle within the reap bound when what it buffered cannot be flushed, and still raises the start's failure" $ do
+      (reading, writing) ← createPipe
+      -- Fill the pipe and leave the rest of the write in the handle's buffer: the write is cut off part-way by its own bound.
+      void (timeout 300000 (hPutStr writing (replicate 1000000 'y')))
+      outcome ←
+        timeout (10 * 1000000) . try @IOException $
+          withScopedChildUsing quick {boundReap = 300000} noSeams (childSpec hangCatcher (proc "/nonexistent/hetoimasia-command" [])) {specStdout = CallerHandle writing} (\_ → pure ())
+      hClose reading
+      case outcome of
+        Just (Left _) → pure ()
+        Just (Right ()) → expectationFailure "a start that could not happen passed"
+        Nothing → expectationFailure "closing the caller's handle did not end within its bound"
+      hIsOpen writing >>= (`shouldBe` False)
 
     it "raises the body's own failure, not the unconfirmed cleanup, when the body failed" $ do
       let seams = noSeams {seamPoll = \_ → pure Nothing, seamWait = \_ _ → pure Nothing}

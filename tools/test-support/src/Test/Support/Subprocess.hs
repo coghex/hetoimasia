@@ -350,20 +350,26 @@ withScopedChild = withScopedChildUsing defaultBounds noSeams
 -- ends the body when it expires and fails the call naming the command and the bound.
 withScopedChildUsing ∷ Bounds → Seams → ChildSpec → (Child → IO a) → IO a
 withScopedChildUsing bounds seams spec body =
-  withPipes spec $ \entered pipes →
+  withPipes bounds spec $ \entered pipes →
     withReader (pipesOutRead pipes) $ \outReader →
       withReader (pipesErrRead pipes) $ \errReader →
         withProcess bounds seams spec entered pipes outReader errReader body
 
 -- | Create the pipes and own them (and the caller's handles until the body is entered). A step that fails closes what exists.
-withPipes ∷ ChildSpec → (IORef Bool → Pipes → IO a) → IO a
-withPipes spec use = mask $ \restore → do
+--
+-- Nothing here can block while uninterruptible. The only close that can wait on the other end of a pipe is a write end holding
+-- unflushed bytes: the child's standard input, closed by the release in a bounded, interruptible step ('disposeStdin') before the
+-- uninterruptible close below finds it already closed; and a caller's handle, which the facility closes only when the call ends before
+-- the body is entered, bounded by the reap bound ('closeCallerHandles'). The other handles closed here are read ends, whose readers
+-- were joined first, and the child's ends, which the facility never wrote to.
+withPipes ∷ Bounds → ChildSpec → (IORef Bool → Pipes → IO a) → IO a
+withPipes bounds spec use = mask $ \restore → do
   entered ← newIORef False
-  pipes ← createPipes spec `onException` closeCallerHandles spec
-  let cleanup = uninterruptibleMask_ $ do
-        closePipes pipes
+  pipes ← createPipes spec `onException` closeCallerHandles bounds spec
+  let cleanup = do
+        uninterruptibleMask_ (closePipes pipes)
         wasEntered ← readIORef entered
-        unless wasEntered (closeCallerHandles spec)
+        unless wasEntered (closeCallerHandles bounds spec)
   restore (use entered pipes) `finally` cleanup
 
 createPipes ∷ ChildSpec → IO Pipes
@@ -408,10 +414,20 @@ closePipes pipes =
         [pipesOutRead pipes, pipesErrRead pipes, pipesInWrite pipes, pipesInRead pipes, pipesOutWrite pipes, pipesErrWrite pipes]
     )
 
-closeCallerHandles ∷ ChildSpec → IO ()
-closeCallerHandles spec = forM_ [specStdin spec, specStdout spec, specStderr spec] $ \case
-  CallerHandle handle → closeQuietly handle
-  _ → pure ()
+-- | Close the handles the caller opened, each within the reap bound. A close interrupted by the bound or by a cancellation still closes
+-- the descriptor (the handle's own close does that even when its flush is interrupted), discarding what could not be flushed. A
+-- cancellation that arrives is remembered, the other handles are closed, and it is raised after them.
+closeCallerHandles ∷ Bounds → ChildSpec → IO ()
+closeCallerHandles bounds spec = do
+  remembered ← newIORef Nothing
+  forM_ [specStdin spec, specStdout spec, specStderr spec] $ \case
+    CallerHandle handle →
+      tryWithContext @SomeException (timeout (max 0 (boundReap bounds)) (hClose handle)) >>= \case
+        Left interruption@(ExceptionWithContext _ failure)
+          | isJust (fromException failure ∷ Maybe SomeAsyncException) → atomicModifyIORef' remembered (\known → (Just (fromMaybe interruption known), ()))
+        _ → pure ()
+    _ → pure ()
+  readIORef remembered >>= mapM_ rethrowIO
 
 closeQuietly ∷ Handle → IO ()
 closeQuietly handle = void (try (hClose handle) ∷ IO (Either IOException ()))
@@ -579,6 +595,7 @@ release env = do
   interruption ← rememberingInterruption $ do
     seamReleasing (envSeams env)
     endChild env
+    disposeStdin env
     drainForRelease env
   problems ← readIORef (envProblems env)
   pure (reverse problems, interruption)
@@ -717,6 +734,17 @@ groupGone remains pgid microseconds = do
             now ← getMonotonicTimeNSec
             if now - start >= limit then pure False else threadDelay 2000 >> loop
   loop
+
+-- | Close the piped standard input, within the reap bound and where a cancellation can reach it. Closing flushes what the body left
+-- buffered, and that waits for whoever holds the read end: a descendant outside the group that does not read it keeps the flush
+-- waiting for ever. Interrupted by the bound the close still closes the descriptor and drops the buffer (the handle's own close does
+-- that), and the bound passing is a cleanup that was not confirmed, said beside whatever else the call raises.
+disposeStdin ∷ Env → IO ()
+disposeStdin env = forM_ (childStdin (envChild env)) $ \handle → do
+  let bound = boundReap (envBounds env)
+  closed ← timeout (max 0 bound) (try (hClose handle) ∷ IO (Either IOException ()))
+  when (isNothing closed) $
+    noteProblem env ("the child's standard input could not be flushed and closed within " <> describeBound (Within bound) <> ": a holder of its read end outside the child's group is not reading it, so the unflushed input was discarded")
 
 -- | Wait for the pipes to end, once the child and its group have been ended, and say so when they did not. A call that has already
 -- given its own account of the drain ('awaitDrain') is not failed for it again.
