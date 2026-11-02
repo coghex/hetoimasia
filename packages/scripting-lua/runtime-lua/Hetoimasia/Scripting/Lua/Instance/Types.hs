@@ -76,6 +76,7 @@ module Hetoimasia.Scripting.Lua.Instance.Types
   , cellCadence
   , cellKind
   , IState (..)
+  , LatchSource (..)
   , UpdateSlot (..)
   , pendingEvents
   , runOwed
@@ -532,13 +533,19 @@ data InstanceFailure = InstanceFailure
     -- ^ The phase it was in when the primary failure happened.
   , failureStage ∷ !HookStage
   , failureError ∷ !InstanceError
-    -- ^ The primary failure. A later one never replaces it.
+    -- ^ The primary failure. A later one never replaces it, with one exception owed to a required request's
+    -- expected failure (D-52): when the instance's invocation in flight raises an uncaught script error
+    -- while that failure is latched, the latched failure is the primary and the script's error is a
+    -- secondary, whichever of the two the owner records first. A script error recorded before the failure
+    -- was latched stays primary.
   , failureMessage ∷ !Text
     -- ^ The error, rendered, at most 'failureTextLimit' characters.
   , failureTraceback ∷ !(Maybe Text)
   , failureSecondary ∷ ![(HookStage, InstanceError)]
-    -- ^ What else failed while the instance ended: the error its @shutdown@ raised,
-    -- when it was not the primary one.
+    -- ^ What else failed while the instance ended: the uncaught script error an invocation raised and a
+    -- latched required request's failure displaced as the primary, with its own stage and traceback; the
+    -- error its @shutdown@ raised, when it was not the primary one; a latched required failure the instance
+    -- ended without applying; and what its release failed.
   }
   deriving (Show)
 
@@ -706,8 +713,9 @@ data InstanceConfig = InstanceConfig
     -- retirements its providers owe it complete. 'instanceEscalate' is told when the instance has settled,
     -- which waits for those retirements; this is the earlier notice, for an application whose policy must act
     -- on a failure at once (close its admission, stop granting ticks) whatever a provider is slow to retire.
-    -- The record is the primary failure alone: 'failureSecondary' is empty, because nothing else has failed
-    -- yet, and the settled record 'instanceEscalate' is told carries what else did. An instance whose
+    -- The record is the primary failure alone, by contract: 'failureSecondary' is empty here even when an
+    -- uncaught script error was displaced as the primary by a latched required request's failure, and the
+    -- settled record 'instanceEscalate' is told carries everything else that failed. An instance whose
     -- failure arises only as it settles (a @shutdown@ that raises after a stop, a release that fails) is not
     -- told here, and is told to 'instanceEscalate' alone. The default does nothing; what it raises is a
     -- failure of the host.
@@ -910,11 +918,24 @@ data IState = IState
   , isDeliveryFailure ∷ !(Maybe (Text, Text))
     -- ^ The endpoint and why: a provider surfaced that it could not preserve an authoritative event of one of this
     -- instance's subscriptions: the owner fails the instance with it, once.
-  , isRequestFailure ∷ !(Maybe (Text, Text))
-    -- ^ The endpoint and the attributed failure of a required request that reached its eligible
-    -- settlement: latched there, whatever the script does or does not read, and applied by the
-    -- owner at its next safe boundary, once. The first one latched is the one the instance fails with.
+  , isRequestFailure ∷ !(Maybe (LatchSource, Text, Text))
+    -- ^ Where the failure came from, the endpoint and the attributed failure of a required request that
+    -- reached its eligible settlement: latched there, whatever the script does or does not read, and applied
+    -- by the owner at its next safe boundary, once. The first one latched is the one the instance fails with.
+    --
+    -- A latched required /request/ failure is also the instance's primary failure over the uncaught script
+    -- error an invocation in flight raises while it is latched, whichever of the two the owner records first
+    -- ('LatchedRequest'); the script's error is kept as a secondary. A failure latched from a required
+    -- module's lookup ('LatchedModule') is never promoted over an invocation's own fault.
   }
+
+-- | Where a latched failure of an instance came from.
+data LatchSource
+  = -- | A required request of the instance settled with its expected failure (D-52).
+    LatchedRequest
+  | -- | A required module the running code looked up failed outside any module's evaluation.
+    LatchedModule
+  deriving (Eq, Show)
 
 -- | Where an instance's periodic update is.
 data UpdateSlot

@@ -152,6 +152,7 @@ import Hetoimasia.Foundation.Failure (operation, throwFailure)
 import Hetoimasia.Scripting.Lua.Instance.Types
   ( ICell (icId, icState)
   , IState (isDispatchQueued, isPhase, isRequestFailure, isStopped)
+  , LatchSource (LatchedRequest)
   , InstanceBounds (boundInvocationQueue)
   , InstancePhase (Initializing)
   , Instances (insBounds, insCells, insInbox, insRunning)
@@ -1408,7 +1409,7 @@ latchRequired service record = case (recAdmission record, recFailure record, rec
           state ← readTVar (icState cell)
           unless (isStopped state || isTerminal (isPhase state) || isJust (isRequestFailure state)) $ do
             writeTVar (icState cell) state
-              { isRequestFailure = Just (recEndpoint record, attributed ask failure)
+              { isRequestFailure = Just (LatchedRequest, recEndpoint record, attributed ask failure)
               , isDispatchQueued = True
               }
             unless (isDispatchQueued state) $

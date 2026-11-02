@@ -2,23 +2,30 @@
 -- instance at the owner's next safe boundary whether or not the script ever reads it, and nothing the
 -- script does afterwards clears that; an optional one is a result to read; a cancellation that wins
 -- prevents it; and an engine, provider or cleanup defect is fatal for both, never data.
+--
+-- When a script that is already running takes the refused result and raises it uncaught, the instance
+-- fails with the request's failure whichever of the two the owner reaches first, and the script's error
+-- is kept beside it as a secondary, with its own stage and traceback; an error recorded before the
+-- failure was latched stays primary. Every ordering below is forced by explicit gates: nothing sleeps.
 module Test.LuaRuntime.Admission.Failure (spec) where
 
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException, throwIO, toException)
 import Control.Monad (forM_)
-import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.Maybe (isJust)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Scripting.Lua.Admission
 import Hetoimasia.Scripting.Lua.Instance
+import Hetoimasia.Scripting.Lua.Owner (BoundaryFault (boundaryReason, boundaryTraceback), ErrorValue (ErrorMessage), FaultKind (CallFailed), FaultReason (ScriptFailed))
 import Hetoimasia.Scripting.Lua.Provider
-import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
+import Hetoimasia.Scripting.Lua.Runtime (CallFault (BoundaryFailed), LuaRuntime)
 import Hetoimasia.Scripting.Lua.Scheduled
 import Hetoimasia.Scripting.Lua.Value (Value (VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Admission.Support
 import Test.LuaRuntime.Instance.Support (awaitPhase, awaitSettled, failureOf', grantOne, sf)
-import Test.LuaRuntime.Request.Support (answerWith, awaitCancelled, diagnostics, failWorkWith, onSubmit)
+import Test.LuaRuntime.Request.Support (answerWith, awaitCancelled, diagnostics, failWorkWith, finishWork, onSubmit)
 import Test.LuaRuntime.Scheduled.Support (awaitEntered, awaitScheduledTerminal, releaseGate)
 import Test.LuaRuntime.Support (Broken (Broken), bounded, brokenIs, expectFatal, requiredPolicy, withBoundary)
 
@@ -45,6 +52,37 @@ requestFailure settlement = do
 requestFailure' ∷ InstanceFailure → Maybe (Text, Text)
 requestFailure' failure = case failureError failure of
   ErrorRequest endpoint why → Just (endpoint, why)
+  _ → Nothing
+
+-- | What the application was told as an instance's failure began (once, the primary alone) and as it settled.
+data Told = Told
+  { toldEarly ∷ IORef [InstanceFailure]
+  , toldSettled ∷ IORef [InstanceFailure]
+  }
+
+-- | A configuration that records both tellings, newest first.
+recording ∷ IO (Told, InstanceConfig)
+recording = do
+  early ← newIORef []
+  settled ← newIORef []
+  pure
+    ( Told early settled
+    , aConfig
+        { instanceOnFailing = \failure → modifyIORef' early (failure :)
+        , instanceEscalate = \failure → modifyIORef' settled (failure :) >> pure Isolate
+        }
+    )
+
+-- | The message an uncaught script error carried, when the error is a script error of a call.
+scriptMessage ∷ InstanceError → Maybe Text
+scriptMessage = \case
+  ErrorFault (BoundaryFailed fault) | ScriptFailed CallFailed (ErrorMessage message _) ← boundaryReason fault → Just message
+  _ → Nothing
+
+-- | Whether the failure's traceback was captured on the fault itself.
+faultTraceback ∷ InstanceError → Maybe Text
+faultTraceback = \case
+  ErrorFault (BoundaryFailed fault) → boundaryTraceback fault
   _ → Nothing
 
 spec ∷ Spec
@@ -147,6 +185,110 @@ spec = describe "failure" $ do
         d ← diagnostics owner
         rdLatched d `shouldBe` 0
         awaitPhase (afBase fixture) owner "i" Active
+
+  describe "a required request's expected failure and the uncaught script error of the invocation that was running when it settled" $ do
+    let attributed = "(the title screen) not_found: detail of not_found"
+        -- What every ordering must agree on: the settled failure and the early notice name the request's failure.
+        primaryIsTheRequest failure = do
+          failureError failure `shouldSatisfy` \case ErrorRequest "path" why → why == attributed; _ → False
+          failureStage failure `shouldBe` StageRequest "path"
+          failureTraceback failure `shouldBe` Nothing
+
+    it "fails the instance with the request's failure when the running invocation took the refused result and raised it uncaught, and keeps the script's error beside it" $ bounded $ do
+      fixture ← newAFix 4
+      setPolicy fixture (\held → held {polSource = "the title screen"})
+      (told, config) ← recording
+      withBoundary $ \_ runtime → settleAll fixture $ do
+        owner ← startAdmitting fixture runtime "raised" [admitter] config (admissionGrant fixture 8 SettleOnArrival) requiredPolicy
+        admitAdmitter fixture owner "i" "admitter"
+        acommand fixture owner "i" "start" "a"
+        awaitNote fixture "cmd start a started"
+        -- The script is held inside its callback while the provider answers: the failure settles and is
+        -- latched while the invocation runs, and the dispatch boundary cannot be reached before it ends.
+        acommand fixture owner "i" "late_raise" "a"
+        awaitEntered (sf (afBase fixture)) "a"
+        answerExpected fixture 0 "not_found" >>= (`shouldBe` ReplySettled)
+        releaseGate (sf (afBase fixture)) "a"
+        settlement ← awaitSettled (afBase fixture) "i"
+        failure ← maybe (fail ("the instance did not fail: " <> show (resultOutcome settlement))) pure (failureOf' settlement)
+        primaryIsTheRequest failure
+        -- The script's error is the one secondary, once, with the stage it was raised in and its own traceback.
+        case failureSecondary failure of
+          [(stage, err)] → do
+            stage `shouldBe` StageEvent "cmd"
+            fmap (Text.isInfixOf "detail of not_found") (scriptMessage err) `shouldBe` Just True
+            fmap (Text.isInfixOf "error") (faultTraceback err) `shouldBe` Just True
+          other → fail ("expected the script's error as the only secondary, found " <> show (length other))
+        -- The earlier notice carries the same primary alone, and the settled record the same primary.
+        early ← readIORef (toldEarly told)
+        case early of
+          [first] → do
+            primaryIsTheRequest first
+            failureSecondary first `shouldSatisfy` null
+          other → fail ("expected one earlier notice, found " <> show (length other))
+        settled ← readIORef (toldSettled told)
+        case settled of
+          [first] → do
+            primaryIsTheRequest first
+            length (failureSecondary first) `shouldBe` 1
+          other → fail ("expected one settled telling, found " <> show (length other))
+        d ← diagnostics owner
+        rdLatched d `shouldBe` 1
+
+    it "fails the instance with the same primary and no secondary when the dispatch boundary applies the latch first: the script never raises" $ bounded $ do
+      fixture ← newAFix 4
+      setPolicy fixture (\held → held {polSource = "the title screen"})
+      (told, config) ← recording
+      withBoundary $ \_ runtime → settleAll fixture $ do
+        owner ← startAdmitting fixture runtime "applied first" [admitter] config (admissionGrant fixture 8 SettleOnArrival) requiredPolicy
+        admitAdmitter fixture owner "i" "admitter"
+        acommand fixture owner "i" "start" "a"
+        awaitNote fixture "cmd start a started"
+        -- A callback is held in flight, and the raising one is queued behind it: the failure settles and is
+        -- latched, and the first callback ends, so the boundary the owner reaches next is the dispatch that
+        -- applies the latch, before the queued callback is admitted.
+        acommand fixture owner "i" "block" "g"
+        awaitEntered (sf (afBase fixture)) "g"
+        acommand fixture owner "i" "late_raise" "a"
+        answerExpected fixture 0 "not_found" >>= (`shouldBe` ReplySettled)
+        releaseGate (sf (afBase fixture)) "g"
+        settlement ← awaitSettled (afBase fixture) "i"
+        failure ← maybe (fail ("the instance did not fail: " <> show (resultOutcome settlement))) pure (failureOf' settlement)
+        primaryIsTheRequest failure
+        failureSecondary failure `shouldSatisfy` null
+        seen ← history fixture
+        seen `shouldSatisfy` notElem "late_raise a running"
+        early ← readIORef (toldEarly told)
+        map failureError early `shouldSatisfy` \case [ErrorRequest "path" why] → why == attributed; _ → False
+        settled ← readIORef (toldSettled told)
+        map failureStage settled `shouldBe` [StageRequest "path"]
+
+    it "keeps an uncaught script error as the primary when no required failure had been latched when it was recorded" $ bounded $ do
+      fixture ← newAFix 4
+      setPolicy fixture (\held → held {polSource = "the title screen"})
+      (told, config) ← recording
+      withBoundary $ \_ runtime → settleAll fixture $ do
+        owner ← startAdmitting fixture runtime "script first" [admitter] config (admissionGrant fixture 8 SettleOnArrival) requiredPolicy
+        admitAdmitter fixture owner "i" "admitter"
+        acommand fixture owner "i" "start" "a"
+        awaitNote fixture "cmd start a started"
+        -- A request is outstanding and unanswered: nothing is latched when the script raises.
+        acommand fixture owner "i" "boom" "a"
+        -- The ending waits for the provider to prove the unanswered request's work over: it does, and the
+        -- instance settles with what it failed with first.
+        finishWork (afFake fixture) 0
+        settlement ← awaitSettled (afBase fixture) "i"
+        failure ← maybe (fail ("the instance did not fail: " <> show (resultOutcome settlement))) pure (failureOf' settlement)
+        failureStage failure `shouldBe` StageEvent "cmd"
+        fmap (Text.isInfixOf "script boom") (scriptMessage (failureError failure)) `shouldBe` Just True
+        fmap (Text.isInfixOf "error") (failureTraceback failure) `shouldBe` Just True
+        failureSecondary failure `shouldSatisfy` null
+        d ← diagnostics owner
+        rdLatched d `shouldBe` 0
+        early ← readIORef (toldEarly told)
+        map failureStage early `shouldBe` [StageEvent "cmd"]
+        map (isJust . failureTraceback) early `shouldBe` [True]
+        map failureStage <$> readIORef (toldSettled told) >>= (`shouldBe` [StageEvent "cmd"])
 
   describe "an optional request's expected failure" $ do
     it "is a result for the script, whole, and fails nobody" $ bounded $ do
