@@ -5,8 +5,9 @@
 module Test.LuaRuntime.Scheduler.Elapsed (spec) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Concurrent (forkIO, throwTo)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (throwTo)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
+import Control.Monad (void)
 import Control.Exception (AsyncException (ThreadKilled), MaskingState (Unmasked), SomeException, getMaskingState, try)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
 import Hetoimasia.Foundation.Time (monotonicSource)
@@ -14,6 +15,7 @@ import Hetoimasia.Scripting.Lua.Scheduler
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduler.Support
 import Test.LuaRuntime.Support (bounded, failExample)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 microsecondsOf ∷ Rig → IO [Int]
 microsecondsOf rig = map regMicroseconds <$> liveRegs (rigTimer rig)
@@ -181,18 +183,21 @@ spec = describe "elapsed time and the owned timer" $ do
       gate ← newEmptyMVar
       writeIORef (ftOnArm (rigTimer rig)) (putMVar entered () >> takeMVar gate)
       finished ← newEmptyMVar
-      driver ← forkIO (try @SomeException (turn rig) >>= putMVar finished)
-      takeMVar entered
-      -- The backend is blocked inside the arming. The interruption cannot be taken
-      -- there: it waits behind the registration, and arrives once the timer holds
-      -- the way to cancel it.
-      thrower ← forkIO (throwTo driver ThreadKilled)
-      awaitDelivered thrower
-      putMVar gate ()
-      _ ← takeMVar finished
-      writeIORef (ftOnArm (rigTimer rig)) (pure ())
-      _ ← stopScheduler (rigScheduler rig) (rigHost rig)
-      liveRegs (rigTimer rig) >>= (`shouldSatisfy` null)
+      withOwnedThreadOpening
+        (void (tryPutMVar gate ()))
+        (try @SomeException (turn rig) >>= putMVar finished)
+        $ \driver _ → do
+          takeMVar entered
+          -- The backend is blocked inside the arming. The interruption cannot be taken
+          -- there: it waits behind the registration, and arrives once the timer holds
+          -- the way to cancel it.
+          withOwnedThread (throwTo driver ThreadKilled) $ \thrower _ → do
+            awaitDelivered thrower
+            putMVar gate ()
+            void (takeMVar finished)
+          writeIORef (ftOnArm (rigTimer rig)) (pure ())
+          _ ← stopScheduler (rigScheduler rig) (rigHost rig)
+          liveRegs (rigTimer rig) >>= (`shouldSatisfy` null)
 
     it "finishes cancelling a registration through an interruption, so a stop that was interrupted still leaves none live" $ do
       rig ← newRig
@@ -204,17 +209,20 @@ spec = describe "elapsed time and the owned timer" $ do
       gate <- newEmptyMVar
       writeIORef (ftOnCancel (rigTimer rig)) (putMVar entered () >> takeMVar gate)
       finished ← newEmptyMVar
-      stopper ← forkIO (try @SomeException (stopScheduler (rigScheduler rig) (rigHost rig)) >>= putMVar finished)
-      takeMVar entered
-      thrower ← forkIO (throwTo stopper ThreadKilled)
-      awaitDelivered thrower
-      putMVar gate ()
-      _ ← takeMVar finished
-      atomically (schedulerClosed (rigScheduler rig)) >>= (`shouldBe` True)
-      liveRegs (rigTimer rig) >>= (`shouldSatisfy` null)
-      writeIORef (ftOnCancel (rigTimer rig)) (pure ())
-      _ ← stopScheduler (rigScheduler rig) (rigHost rig)
-      liveRegs (rigTimer rig) >>= (`shouldSatisfy` null)
+      withOwnedThreadOpening
+        (void (tryPutMVar gate ()))
+        (try @SomeException (stopScheduler (rigScheduler rig) (rigHost rig)) >>= putMVar finished)
+        $ \stopper _ → do
+          takeMVar entered
+          withOwnedThread (throwTo stopper ThreadKilled) $ \thrower _ → do
+            awaitDelivered thrower
+            putMVar gate ()
+            void (takeMVar finished)
+          atomically (schedulerClosed (rigScheduler rig)) >>= (`shouldBe` True)
+          liveRegs (rigTimer rig) >>= (`shouldSatisfy` null)
+          writeIORef (ftOnCancel (rigTimer rig)) (pure ())
+          _ ← stopScheduler (rigScheduler rig) (rigHost rig)
+          liveRegs (rigTimer rig) >>= (`shouldSatisfy` null)
 
     it "is armed with the system timer and wakes the owner when its time comes, with no sleep in the example" $ bounded $ do
       -- The production seam: the threaded runtime's timer manager and the real

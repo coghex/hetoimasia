@@ -20,7 +20,6 @@
 -- the call released the capability, so an @unsafe@ import would make it fail.
 module Test.Lua.Independence (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, finally, try)
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -36,6 +35,7 @@ import Hetoimasia.Scripting.Lua.Internal.Callback
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe)
 import Test.Lua.Support (newRecorder, recorded, recordingCallback, withVm)
 import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "independence" $ do
@@ -73,37 +73,42 @@ spec = describe "independence" $ do
           "keep_going"
           (BooleanResult . not <$> readIORef release)
           (pure ())
-        _ ←
-          forkIO $ do
-            ran ←
-              try @SomeException
-                ( evalChunk
-                    busy
-                    (chunkName "busy")
-                    ( "started()\n"
-                        <> "local total = 0\n"
-                        <> "repeat\n"
-                        <> "  for index = 1, 100000 do total = total + index end\n"
-                        <> "until not keep_going()\n"
-                    )
+        -- The thread is owned (#598), and the stop lets the first VM go: it holds that VM's gate until its chunk returns, which
+        -- only the release flag ends, so the join could not otherwise complete when the example fails.
+        withOwnedThreadOpening
+          (writeIORef release True)
+          ( do
+              ran ←
+                try @SomeException
+                  ( evalChunk
+                      busy
+                      (chunkName "busy")
+                      ( "started()\n"
+                          <> "local total = 0\n"
+                          <> "repeat\n"
+                          <> "  for index = 1, 100000 do total = total + index end\n"
+                          <> "until not keep_going()\n"
+                      )
+                  )
+              writeIORef busyFinished True
+              putMVar outcome ran
+          )
+          $ \_ _ → do
+            bounded (takeMVar started)
+            -- Whatever happens below, the first VM has to be let go: it holds that
+            -- VM's gate until its chunk returns, and a failed assertion must not
+            -- leave it running for the rest of the suite.
+            flip finally (writeIORef release True) $ do
+              evalChunk
+                other
+                (chunkName "other")
+                ( "second_vm_total = 0\n"
+                    <> "for index = 1, 1000 do second_vm_total = second_vm_total + index end\n"
+                    <> "second_vm_ran()\n"
                 )
-            writeIORef busyFinished True
-            putMVar outcome ran
-        bounded (takeMVar started)
-        -- Whatever happens below, the first VM has to be let go: it holds that
-        -- VM's gate until its chunk returns, and a failed assertion must not
-        -- leave it running for the rest of the suite.
-        flip finally (writeIORef release True) $ do
-          evalChunk
-            other
-            (chunkName "other")
-            ( "second_vm_total = 0\n"
-                <> "for index = 1, 1000 do second_vm_total = second_vm_total + index end\n"
-                <> "second_vm_ran()\n"
-            )
-          recorded otherTrace >>= (`shouldBe` ["second_vm_ran"])
-          readIORef busyFinished >>= (`shouldBe` False)
-        ran ← bounded (takeMVar outcome)
-        case ran of
-          Left thrown → expectationFailure ("the first VM failed: " <> show thrown)
-          Right () → pure ()
+              recorded otherTrace >>= (`shouldBe` ["second_vm_ran"])
+              readIORef busyFinished >>= (`shouldBe` False)
+            ran ← bounded (takeMVar outcome)
+            case ran of
+              Left thrown → expectationFailure ("the first VM failed: " <> show thrown)
+              Right () → pure ()

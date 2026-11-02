@@ -33,14 +33,14 @@ module Test.Lua.Owner.Support
   , failingFinalizerConfig
   , failingCloseConfig
     -- * Running an owner on its own thread
-  , ownerThread
+  , withOwnerThread
   , Captured
   , newCaptured
   , capture
   , captured
   ) where
 
-import Control.Concurrent (ThreadId, forkIO)
+import Control.Concurrent (ThreadId)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar)
 import Control.Exception
   ( Exception
@@ -72,6 +72,7 @@ import Hetoimasia.Scripting.Lua.Internal.Owner
   , defaultOwnerConfig
   , withOwnedVm
   )
+import Test.Support.Owned (withOwnedThreadOpening)
 
 -- | The failure an example's body raises.
 newtype BodyBroke = BodyBroke String
@@ -242,14 +243,20 @@ failingCloseConfig finalizing =
               (annotateIO (Marker "release context") (throwIO (CloseBroke "release")))
         }
 
--- | Run an owner on a thread of its own, forked masked so that it is masked from
--- its first instruction, and publish how it ended once.
-ownerThread ∷ OwnerConfig → (OwnedVm → IO a) → IO (ThreadId, MVar (Outcome a))
-ownerThread config body = do
+-- | Run an owner on a thread of its own for the length of the continuation, which is given the thread and the slot the thread
+-- publishes how it ended in, once (#598). The thread is owned: however the continuation ends (a return, an exception, a
+-- cancellation) it has ended and been joined before this returns. The first argument lets go whatever the owner may be held
+-- at that only the example opens (a hold inside Lua, a gate of the body): it runs in the release, before the thread is killed,
+-- and must not block.
+--
+-- The owner masks its own publication, and only the owner's lifetime is unmasked.
+withOwnerThread ∷ IO () → OwnerConfig → (OwnedVm → IO a) → ((ThreadId, MVar (Outcome a)) → IO b) → IO b
+withOwnerThread open config body continue = do
   slot ← newEmptyMVar
-  thread ← mask $ \restore →
-    forkIO (restore (runOwner config body) >>= putMVar slot)
-  pure (thread, slot)
+  withOwnedThreadOpening
+    open
+    (mask $ \restore → restore (runOwner config body) >>= putMVar slot)
+    (\thread _ → continue (thread, slot))
 
 -- | A value an example's body publishes for the example to read.
 newtype Captured a = Captured (IORef (Maybe a))

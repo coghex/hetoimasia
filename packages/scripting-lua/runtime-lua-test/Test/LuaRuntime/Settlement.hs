@@ -2,7 +2,6 @@
 -- every accepted call settles exactly once, a fault of the call as data.
 module Test.LuaRuntime.Settlement (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Monad (forM, forM_)
@@ -81,16 +80,17 @@ spec = describe "dispatch and settlement" $ do
       holder ← submit endpoint "block_call" [VText "hold"] >>= accepted
       awaitEntered fixture "hold"
       halfway ← newEmptyMVar
-      finished ← newEmptyMVar
-      _ ← forkIO $ do
-        answers ← forM [1 .. 999 ∷ Int] $ \n → do
-          when' (n == 300) (putMVar halfway ())
-          submit endpoint "echo" [VInteger (fromIntegral n)]
-        putMVar finished answers
-      takeMVar halfway
-      -- The stop races the submissions that remain.
-      retireOwner owner
-      answers ← takeMVar finished
+      answers ←
+        withProducer
+          ( forM [1 .. 999 ∷ Int] $ \n → do
+              when' (n == 300) (putMVar halfway ())
+              submit endpoint "echo" [VInteger (fromIntegral n)]
+          )
+          $ \finished → do
+            takeMVar halfway
+            -- The stop races the submissions that remain.
+            retireOwner owner
+            takeMVar finished
       let tickets = [ticket | CallAccepted ticket ← answers]
           closed = length [() | CallClosed ← answers]
           full = length [() | CallFull ← answers]

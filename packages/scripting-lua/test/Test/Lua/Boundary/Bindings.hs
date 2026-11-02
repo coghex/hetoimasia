@@ -7,7 +7,6 @@
 -- contains.
 module Test.Lua.Boundary.Bindings (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, fromException, try)
 import GHC.Conc (getAllocationCounter)
@@ -26,6 +25,9 @@ import Hetoimasia.Scripting.Lua.Registration (BindingKind (..), commandReasonLim
 import Hetoimasia.Scripting.Lua.Value
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
 import Test.Lua.Boundary.Support
+import Control.Concurrent.MVar (tryPutMVar)
+import Control.Monad (void)
+import Test.Support.Owned (withOwnedThreadOpening)
 
 -- | An owner of the sample registration granted @sample@ whose crossings are
 -- bounded by these limits.
@@ -453,19 +455,20 @@ spec = describe "bindings called from Lua" $ do
       fixture ← newFixture
       ready ← newEmptyMVar
       release ← newEmptyMVar
-      finished ← newEmptyMVar
-      _ ← forkIO $ do
-        withOwner fixture [] $ \other → do
-          writeIORef (fixtureOther fixture) (Just other)
-          putMVar ready ()
-          takeMVar release
-        putMVar finished ()
-      takeMVar ready
-      withOwner fixture ["sample"] $ \owned → do
-        run owned "sample.trespass()"
-        readIORef (fixtureAttempt fixture) >>= (`shouldBe` Just "not owned")
-      putMVar release ()
-      takeMVar finished
+      withOwnedThreadOpening
+        (void (tryPutMVar release ()))
+        ( withOwner fixture [] $ \other → do
+            writeIORef (fixtureOther fixture) (Just other)
+            putMVar ready ()
+            takeMVar release
+        )
+        $ \_ finished → do
+          takeMVar ready
+          withOwner fixture ["sample"] $ \owned → do
+            run owned "sample.trespass()"
+            readIORef (fixtureAttempt fixture) >>= (`shouldBe` Just "not owned")
+          putMVar release ()
+          finished
 
     it "re-raises a Haskell failure from the action at the owner's boundary with its own type, under pcall too" $ do
       fixture ← newFixture

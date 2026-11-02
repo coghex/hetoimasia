@@ -4,7 +4,6 @@
 -- for tick completion ends when the owner exits, without completing the tick.
 module Test.LuaRuntime.Scheduled.Callbacks (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Monad (forM_, void)
 import Data.IORef (modifyIORef', readIORef, writeIORef)
@@ -14,6 +13,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VBoolean, VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
+import Test.Support.Owned (withOwnedThreadOpening)
 import Test.LuaRuntime.Support (bounded, brokenIs, failExample, Gated (..), optionalPolicy, requiredPolicy, withBoundary, withBoundaryOpening)
 
 spec ∷ Spec
@@ -51,16 +51,23 @@ spec = describe "waits from callbacks and tick completion" $ do
         _ ← admitTask' fixture owner "w" (request "wait_ticks" [VText "w", VInteger 1] OrdinaryClass OneShot (Just "w"))
         awaitDiagnostics owner (\counts → diagWaiting counts >= 1)
         result ← newEmptyMVar
-        _ ←
-          holding fixture owner $ do
-            -- A grant the owner has not applied, because it is held in a segment, and
-            -- a stop that is requested before it is let go. The grant is applied at
-            -- the next boundary and wakes the task, which the stop is then noticed
-            -- before: the tick is not finished when the owner exits.
-            _ ← grantScheduledStep (scheduledEndpoint owner) (nanoseconds 5)
-            _ ← forkIO (awaitTicksComplete control owner >>= putMVar result)
+        -- 'holding', spelled out: the waiter below ends only with the owner, which is let go when the holding ends, so the
+        -- waiter's owned scope has to enclose that release and the wait for its answer (#598).
+        holder ← admitTask' fixture owner "holder" (request "block_in" [VText "holder"] ControlClass OneShot Nothing)
+        awaitEntered fixture "holder"
+        -- A grant the owner has not applied, because it is held in a segment, and
+        -- a stop that is requested before it is let go. The grant is applied at
+        -- the next boundary and wakes the task, which the stop is then noticed
+        -- before: the tick is not finished when the owner exits.
+        _ ← grantScheduledStep (scheduledEndpoint owner) (nanoseconds 5)
+        withOwnedThreadOpening
+          (openAllGates fixture)
+          (awaitTicksComplete control owner >>= putMVar result)
+          $ \_ _ → do
             retireScheduled owner
-        takeMVar result >>= (`shouldBe` TickOwnerEnded)
+            releaseGate fixture "holder"
+            _ ← waitTask holder
+            takeMVar result >>= (`shouldBe` TickOwnerEnded)
 
     it "ends with an owner that failed recognizably with a tick outstanding, the other owner untouched" $ bounded $ do
       fixture ← newSFixture

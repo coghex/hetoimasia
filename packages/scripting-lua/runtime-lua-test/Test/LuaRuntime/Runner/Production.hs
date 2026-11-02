@@ -2,7 +2,7 @@
 -- does with every answer, against feeds that answer as the example says.
 module Test.LuaRuntime.Runner.Production (spec) where
 
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryReadMVar)
 import Control.Concurrent.STM (atomically, retry)
 import Control.Exception (try)
@@ -26,6 +26,7 @@ import Hetoimasia.Scripting.Lua.Runner.Internal
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Runner.Support
 import Test.LuaRuntime.Support (bounded, failExample, withBoundary)
+import Test.Support.Owned (withOwnedThread)
 
 -- | A real instance's identity, which a subscription needs: from a run of one script.
 anInstanceId ∷ IO InstanceId
@@ -150,10 +151,10 @@ spec = describe "producing events" $ do
   describe "the gate the owner parks at while an instance is admitted" $ do
     let parkedNow gate = atomically (gateParked gate)
         awaitParked gate wanted = atomically (gateParked gate >>= \now → if now == wanted then pure () else retry)
-        waiter gate = do
+        -- The owner parked at the gate, on an owned thread (#598): ended and joined however the example ends.
+        withWaiter gate body = do
           done ← newEmptyMVar
-          thread ← forkIO (gateWait gate >> putMVar done ())
-          pure (done, thread)
+          withOwnedThread (gateWait gate >> putMVar done ()) (\thread _ → body (done, thread))
     it "lets the owner through at once while it is not held" $ bounded $ do
       gate ← newGate
       gateWait gate
@@ -161,36 +162,36 @@ spec = describe "producing events" $ do
     it "parks the owner where the runner can see it, until the gate is opened, and then no longer" $ bounded $ do
       gate ← newGate
       atomically (holdGate gate)
-      (done, _) ← waiter gate
-      awaitParked gate True
-      tryReadMVar done `shouldReturn` Nothing
-      atomically (freeGate gate)
-      takeMVar done
-      parkedNow gate `shouldReturn` False
-      -- Opened for good: a later segment passes.
-      gateWait gate
+      withWaiter gate $ \(done, _) → do
+        awaitParked gate True
+        tryReadMVar done `shouldReturn` Nothing
+        atomically (freeGate gate)
+        takeMVar done
+        parkedNow gate `shouldReturn` False
+        -- Opened for good: a later segment passes.
+        gateWait gate
     it "lets one segment through for one permit, however often it is given while the owner is on its way, and parks it again" $ bounded $ do
       gate ← newGate
       atomically (holdGate gate)
-      (done, _) ← waiter gate
-      awaitParked gate True
-      -- Both asks in one transaction, so the owner cannot take the permit between them.
-      (first, second) ← atomically ((,) <$> permitOne gate <*> permitOne gate)
-      (first, second) `shouldBe` (True, False)
-      takeMVar done
-      awaitParked gate False
-      (again, _) ← waiter gate
-      awaitParked gate True
-      tryReadMVar again `shouldReturn` Nothing
-      atomically (freeGate gate)
-      takeMVar again
+      withWaiter gate $ \(done, _) → do
+        awaitParked gate True
+        -- Both asks in one transaction, so the owner cannot take the permit between them.
+        (first, second) ← atomically ((,) <$> permitOne gate <*> permitOne gate)
+        (first, second) `shouldBe` (True, False)
+        takeMVar done
+        awaitParked gate False
+        withWaiter gate $ \(again, _) → do
+          awaitParked gate True
+          tryReadMVar again `shouldReturn` Nothing
+          atomically (freeGate gate)
+          takeMVar again
     it "no longer reads as parked when the parked owner is cancelled" $ bounded $ do
       gate ← newGate
       atomically (holdGate gate)
-      (_, thread) ← waiter gate
-      awaitParked gate True
-      killThread thread
-      awaitParked gate False
+      withWaiter gate $ \(_, thread) → do
+        awaitParked gate True
+        killThread thread
+        awaitParked gate False
   where
     isComplete = \case
       ProviderComplete → True

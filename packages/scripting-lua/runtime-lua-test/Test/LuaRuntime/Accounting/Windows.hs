@@ -8,7 +8,6 @@
 -- after the grant finished the example shows tick completion has returned meanwhile.
 module Test.LuaRuntime.Accounting.Windows (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryReadMVar)
 import Control.Concurrent.STM (atomically, newTVarIO, orElse, readTVar, retry, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException, throwIO)
@@ -23,6 +22,7 @@ import Hetoimasia.Scripting.Lua.Lease
 import Hetoimasia.Scripting.Lua.Scheduled
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Accounting.Support
+import Test.Support.Owned (withOwnedThread)
 import Test.LuaRuntime.Instance.Lease.Support
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (awaitDiagnostics, awaitEffect, awaitEntered, awaitIdle, awaitScheduledTerminal, blockOn, defaultSchedulerBounds, releaseGate, setClockHook)
@@ -50,23 +50,20 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         awaitDiagnosticsWaiting owner
         -- The grant and the stop are both accepted while the owner is held, so the same boundary
         -- finishes the grant, which woke nothing, and applies the stop.
-        waiting ←
-          do
-            holdOwner fixture owner
-            grant owner 1
-            _ ← expectControl fixture owner "c" InstanceStop
-            captured ← beginWait control owner
-            awaitPending captured
-            releaseOwner fixture
-            pure captured
-        awaitEntered (sf fixture) "close"
-        awaitTicksComplete control owner >>= (`shouldBe` TicksCompleted)
-        isPending waiting >>= (`shouldBe` True)
-        releaseGate (sf fixture) "close"
-        answer waiting >>= (`shouldBe` AccountingComplete)
-        settled ← awaitSettled fixture "c"
-        resultOutcome settled `shouldSatisfy` \case InstanceStopped → True; _ → False
-        retireScheduled owner
+        holdOwner fixture owner
+        grant owner 1
+        _ ← expectControl fixture owner "c" InstanceStop
+        withWait control owner $ \waiting → do
+          awaitPending waiting
+          releaseOwner fixture
+          awaitEntered (sf fixture) "close"
+          awaitTicksComplete control owner >>= (`shouldBe` TicksCompleted)
+          isPending waiting >>= (`shouldBe` True)
+          releaseGate (sf fixture) "close"
+          answer waiting >>= (`shouldBe` AccountingComplete)
+          settled ← awaitSettled fixture "c"
+          resultOutcome settled `shouldSatisfy` \case InstanceStopped → True; _ → False
+          retireScheduled owner
 
     it "does not return while the owner closes the coroutine of a refused wait" $ bounded $ do
       fixture ← newIFixture
@@ -77,14 +74,14 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         expectDelivered fixture owner "r" 1
         awaitDiagnosticsWaiting owner
         grant owner 1
-        waiting ← beginWait control owner
-        awaitEntered (sf fixture) "close"
-        awaitPending waiting
-        releaseGate (sf fixture) "close"
-        answer waiting >>= (`shouldBe` AccountingComplete)
-        settled ← awaitSettled fixture "r"
-        resultPhase settled `shouldBe` Failed
-        retireScheduled owner
+        withWait control owner $ \waiting → do
+          awaitEntered (sf fixture) "close"
+          awaitPending waiting
+          releaseGate (sf fixture) "close"
+          answer waiting >>= (`shouldBe` AccountingComplete)
+          settled ← awaitSettled fixture "r"
+          resultPhase settled `shouldBe` Failed
+          retireScheduled owner
 
     it "does not return while the instance's shutdown runs, which is after tick completion has returned" $ bounded $ do
       fixture ← newIFixture
@@ -95,17 +92,17 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         expectDelivered fixture owner "s" 1
         awaitDiagnosticsWaiting owner
         grant owner 1
-        waiting ← beginWait control owner
-        awaitEntered (sf fixture) "shutdown"
-        -- The grant has finished and the owner is inside the hook.
-        awaitTicksComplete control owner >>= (`shouldBe` TicksCompleted)
-        awaitPending waiting
-        isPending waiting >>= (`shouldBe` True)
-        releaseGate (sf fixture) "shutdown"
-        answer waiting >>= (`shouldBe` AccountingComplete)
-        settled ← awaitSettled fixture "s"
-        resultPhase settled `shouldBe` Failed
-        retireScheduled owner
+        withWait control owner $ \waiting → do
+          awaitEntered (sf fixture) "shutdown"
+          -- The grant has finished and the owner is inside the hook.
+          awaitTicksComplete control owner >>= (`shouldBe` TicksCompleted)
+          awaitPending waiting
+          isPending waiting >>= (`shouldBe` True)
+          releaseGate (sf fixture) "shutdown"
+          answer waiting >>= (`shouldBe` AccountingComplete)
+          settled ← awaitSettled fixture "s"
+          resultPhase settled `shouldBe` Failed
+          retireScheduled owner
 
     it "does not return while a provider owes a retirement, and returns when it completes with nothing else happening" $ bounded $ do
       fixture ← newLFix 4
@@ -122,14 +119,14 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         awaitSummary fixture "r" ((== 1) . summaryPending)
         awaitTicksComplete control owner >>= (`shouldBe` TicksCompleted)
         awaitIdle (sf base)
-        waiting ← beginWait control owner
-        awaitPending waiting
-        tickOf base "r" >>= pollInstance >>= (`shouldSatisfy` \case Nothing → True; Just _ → False)
-        completeRetirement fixture "async-res"
-        answer waiting >>= (`shouldBe` AccountingComplete)
-        settled ← awaitSettled base "r"
-        resultPhase settled `shouldBe` Failed
-        retireScheduled owner
+        withWait control owner $ \waiting → do
+          awaitPending waiting
+          tickOf base "r" >>= pollInstance >>= (`shouldSatisfy` \case Nothing → True; Just _ → False)
+          completeRetirement fixture "async-res"
+          answer waiting >>= (`shouldBe` AccountingComplete)
+          settled ← awaitSettled base "r"
+          resultPhase settled `shouldBe` Failed
+          retireScheduled owner
 
     it "gives a caller's own alternative the one supervised wait while a provider owes a retirement, and the step answers only once it completes (D-86)" $ bounded $ do
       fixture ← newLFix 4
@@ -156,16 +153,16 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         atomically (writeTVar wanted False)
         answered ← newEmptyMVar
         atomically (watchScheduledAccounting owner)
-        waiter ← forkIO (awaitSupervised control parts >>= putMVar answered)
-        -- the wait is parked in its transaction, and has not answered: the retirement is still owed
-        bounded (awaitBlockedOnSTM waiter)
-        tryReadMVar answered >>= (`shouldBe` Nothing)
-        completeRetirement fixture "async-res"
-        takeMVar answered >>= (`shouldBe` Right AccountingComplete)
-        atomically (unwatchScheduledAccounting owner)
-        settled ← awaitSettled base "r"
-        resultPhase settled `shouldBe` Failed
-        retireScheduled owner
+        withOwnedThread (awaitSupervised control parts >>= putMVar answered) $ \waiter _ → do
+          -- the wait is parked in its transaction, and has not answered: the retirement is still owed
+          bounded (awaitBlockedOnSTM waiter)
+          tryReadMVar answered >>= (`shouldBe` Nothing)
+          completeRetirement fixture "async-res"
+          takeMVar answered >>= (`shouldBe` Right AccountingComplete)
+          atomically (unwatchScheduledAccounting owner)
+          settled ← awaitSettled base "r"
+          resultPhase settled `shouldBe` Failed
+          retireScheduled owner
 
     it "returns when a retirement completes after the turn's final boundary, before the owner settles what that turn ended" $ bounded $ do
       fixture ← newLFix 4
@@ -193,18 +190,18 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
               when parked (blockOn (sf base) "clk2")
         grant owner 1
         awaitEntered (sf base) "clk1"
-        waiting ← beginWait control owner
-        awaitPending waiting
-        releaseGate (sf base) "clk1"
-        awaitEntered (sf base) "clk2"
-        -- The provider completes after the last boundary that could have taken the retirement, and before
-        -- the owner settles what the turn ended: nothing else is left for the owner to do.
-        completeRetirement fixture "async-res"
-        releaseGate (sf base) "clk2"
-        answer waiting >>= (`shouldBe` AccountingComplete)
-        settled ← awaitSettled base "r"
-        resultPhase settled `shouldBe` Failed
-        retireScheduled owner
+        withWait control owner $ \waiting → do
+          awaitPending waiting
+          releaseGate (sf base) "clk1"
+          awaitEntered (sf base) "clk2"
+          -- The provider completes after the last boundary that could have taken the retirement, and before
+          -- the owner settles what the turn ended: nothing else is left for the owner to do.
+          completeRetirement fixture "async-res"
+          releaseGate (sf base) "clk2"
+          answer waiting >>= (`shouldBe` AccountingComplete)
+          settled ← awaitSettled base "r"
+          resultPhase settled `shouldBe` Failed
+          retireScheduled owner
 
     it "does not return while the application's escalation runs, though the instance's settlement can be read" $ bounded $ do
       fixture ← newIFixture
@@ -216,17 +213,17 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         expectDelivered fixture owner "e" 1
         awaitDiagnosticsWaiting owner
         grant owner 1
-        waiting ← beginWait control owner
-        awaitGateEntered escalation
-        awaitTicksComplete control owner >>= (`shouldBe` TicksCompleted)
-        -- Settled, and readable, while the application is still being told.
-        settled ← awaitSettled fixture "e"
-        resultPhase settled `shouldBe` Failed
-        awaitPending waiting
-        isPending waiting >>= (`shouldBe` True)
-        openGate escalation
-        answer waiting >>= (`shouldBe` AccountingComplete)
-        retireScheduled owner
+        withWait control owner $ \waiting → do
+          awaitGateEntered escalation
+          awaitTicksComplete control owner >>= (`shouldBe` TicksCompleted)
+          -- Settled, and readable, while the application is still being told.
+          settled ← awaitSettled fixture "e"
+          resultPhase settled `shouldBe` Failed
+          awaitPending waiting
+          isPending waiting >>= (`shouldBe` True)
+          openGate escalation
+          answer waiting >>= (`shouldBe` AccountingComplete)
+          retireScheduled owner
 
     it "covers the endings already begun when no grant is outstanding, and returns once the application has been told of a failure" $ bounded $ do
       fixture ← newIFixture
@@ -239,14 +236,14 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         awaitGateEntered escalation
         settled ← awaitSettled fixture "f"
         resultPhase settled `shouldBe` Failed
-        waiting ← beginWait control owner
-        awaitPending waiting
-        isPending waiting >>= (`shouldBe` True)
-        openGate escalation
-        answer waiting >>= (`shouldBe` AccountingComplete)
-        -- With every instance ended and told of, a wait returns at once.
-        awaitScheduledAccounting control owner >>= (`shouldBe` AccountingComplete)
-        retireScheduled owner
+        withWait control owner $ \waiting → do
+          awaitPending waiting
+          isPending waiting >>= (`shouldBe` True)
+          openGate escalation
+          answer waiting >>= (`shouldBe` AccountingComplete)
+          -- With every instance ended and told of, a wait returns at once.
+          awaitScheduledAccounting control owner >>= (`shouldBe` AccountingComplete)
+          retireScheduled owner
 
   describe "after the instances have ended" $ do
     it "returns once every instance has been stopped and awaited, on an owner that was granted nothing" $ bounded $ do
@@ -302,26 +299,26 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         -- keeps the grant unfinished. The wait captures it, and a second grant is accepted after.
         _ ← grantScheduledStep (endpoint owner) (nanoseconds maxBound)
         awaitEntered (sf base) "b"
-        waiting ← beginWait control owner
-        awaitPending waiting
-        grant owner 1
-        -- When the blocker finishes, the same boundary finishes the first grant and applies the second,
-        -- which the victim's wait cannot take: the instance fails, in the final boundary, and parks on
-        -- the retirement of what it held.
-        releaseGate (sf base) "b"
-        awaitSummary fixture "v" ((== 1) . summaryPending)
-        awaitIdle (sf base)
-        awaitTicksComplete control owner >>= (`shouldBe` TicksCompleted)
-        isPending waiting >>= (`shouldBe` True)
-        completeRetirement fixture "async-res"
-        -- Settled, and the application is being told: still owed.
-        awaitGateEntered escalation
-        isPending waiting >>= (`shouldBe` True)
-        openGate escalation
-        answer waiting >>= (`shouldBe` AccountingComplete)
-        settled ← awaitSettled base "v"
-        resultPhase settled `shouldBe` Failed
-        retireScheduled owner
+        withWait control owner $ \waiting → do
+          awaitPending waiting
+          grant owner 1
+          -- When the blocker finishes, the same boundary finishes the first grant and applies the second,
+          -- which the victim's wait cannot take: the instance fails, in the final boundary, and parks on
+          -- the retirement of what it held.
+          releaseGate (sf base) "b"
+          awaitSummary fixture "v" ((== 1) . summaryPending)
+          awaitIdle (sf base)
+          awaitTicksComplete control owner >>= (`shouldBe` TicksCompleted)
+          isPending waiting >>= (`shouldBe` True)
+          completeRetirement fixture "async-res"
+          -- Settled, and the application is being told: still owed.
+          awaitGateEntered escalation
+          isPending waiting >>= (`shouldBe` True)
+          openGate escalation
+          answer waiting >>= (`shouldBe` AccountingComplete)
+          settled ← awaitSettled base "v"
+          resultPhase settled `shouldBe` Failed
+          retireScheduled owner
 
   describe "when its owner ends with an ending owed" $ do
     forM_ [("stopped", retireScheduled), ("cancelled", cancelScheduled)] $ \(label, end) →
@@ -337,17 +334,17 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
           awaitEffect (sf base) "again Retiring"
           settleControl base owner "a" InstanceStop >>= (`shouldBe` ControlApplied)
           awaitPhase base owner "a" Stopping
-          waiting ← beginWait control owner
-          awaitPending waiting
-          end owner
-          -- The owner stays live until the provider has proved its work over, and a stopping owner
-          -- neither completes the wait nor ends it: the ending it owes is not accounted for, and it
-          -- has not ended.
-          isPending waiting >>= (`shouldBe` True)
-          completeRetirement fixture "async-res"
-          answer waiting >>= (`shouldBe` AccountingOwnerEnded)
-          void (awaitScheduledTerminal control owner)
-          awaitScheduledAccounting control owner >>= (`shouldBe` AccountingOwnerEnded)
+          withWait control owner $ \waiting → do
+            awaitPending waiting
+            end owner
+            -- The owner stays live until the provider has proved its work over, and a stopping owner
+            -- neither completes the wait nor ends it: the ending it owes is not accounted for, and it
+            -- has not ended.
+            isPending waiting >>= (`shouldBe` True)
+            completeRetirement fixture "async-res"
+            answer waiting >>= (`shouldBe` AccountingOwnerEnded)
+            void (awaitScheduledTerminal control owner)
+            awaitScheduledAccounting control owner >>= (`shouldBe` AccountingOwnerEnded)
 
     it "does not complete while the failure of closing a stopped instance's coroutine is held, and ends with that failure" $ bounded $ do
       fixture ← newIFixture
@@ -366,15 +363,15 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         admitScheduledTask (scheduledEndpoint owner) (TaskRequest (moduleNamed "tasks") "holds" [VText "blk"] OrdinaryClass OneShot Nothing) >>= \case
           TaskAccepted _ _ → pure ()
           other → failExample ("expected the task accepted, found " <> show other)
-        waiting ← beginWait control owner
-        awaitPending waiting
-        releaseOwner fixture
-        awaitEntered (sf fixture) "blk"
-        _ ← awaitSettled fixture "c"
-        awaitTicksComplete control owner >>= (`shouldBe` TicksCompleted)
-        awaitPending waiting
-        releaseGate (sf fixture) "blk"
-        resultOf waiting >>= putMVar outcome
+        withWait control owner $ \waiting → do
+          awaitPending waiting
+          releaseOwner fixture
+          awaitEntered (sf fixture) "blk"
+          _ ← awaitSettled fixture "c"
+          awaitTicksComplete control owner >>= (`shouldBe` TicksCompleted)
+          awaitPending waiting
+          releaseGate (sf fixture) "blk"
+          resultOf waiting >>= putMVar outcome
       -- The boundary may end with the failure the wait carried; a failed assertion of the example, or a
       -- timeout of its bound, is not that failure, and is raised as itself ('tryExpected').
       tryReadMVar outcome >>= \case
@@ -403,25 +400,25 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
         -- The ending the wait covers: the second instance's, stopped and parked on its retirement.
         _ ← settleControl base owner "a" InstanceStop >>= \result → result `shouldBe` ControlApplied
         awaitSummary fixture "a" ((== 1) . summaryPending)
-        waiting ← beginWait control owner
-        awaitPending waiting
-        -- An ending the wait does not cover: the first instance fails and is parked on its own retirement.
-        expectDelivered base owner "b" 1
-        expectDelivered base owner "c" 1
-        awaitSummary fixture "b" ((== 1) . summaryPending)
-        awaitSummary fixture "c" ((== 1) . summaryPending)
-        isPending waiting >>= (`shouldBe` True)
-        -- Every provider finishes in one step, so the owner settles the first instance, whose callback
-        -- raises, then the second, the ending the wait covers, and then the third, whose callback the
-        -- example holds: the covered ending is accounted for, and the owner is held inside a callback,
-        -- while a failure that will end it is already caught.
-        retirements ← mapM (provided fixture) ["res-stop", "res-fail", "res-fail-last"]
-        atomically (forM_ (reverse retirements) (`writeTVar` ProviderComplete))
-        awaitGateEntered lastTold
-        stabilize waiting
-        awaitPending waiting
-        openGate lastTold
-        resultOf waiting >>= putMVar outcome
+        withWait control owner $ \waiting → do
+          awaitPending waiting
+          -- An ending the wait does not cover: the first instance fails and is parked on its own retirement.
+          expectDelivered base owner "b" 1
+          expectDelivered base owner "c" 1
+          awaitSummary fixture "b" ((== 1) . summaryPending)
+          awaitSummary fixture "c" ((== 1) . summaryPending)
+          isPending waiting >>= (`shouldBe` True)
+          -- Every provider finishes in one step, so the owner settles the first instance, whose callback
+          -- raises, then the second, the ending the wait covers, and then the third, whose callback the
+          -- example holds: the covered ending is accounted for, and the owner is held inside a callback,
+          -- while a failure that will end it is already caught.
+          retirements ← mapM (provided fixture) ["res-stop", "res-fail", "res-fail-last"]
+          atomically (forM_ (reverse retirements) (`writeTVar` ProviderComplete))
+          awaitGateEntered lastTold
+          stabilize waiting
+          awaitPending waiting
+          openGate lastTold
+          resultOf waiting >>= putMVar outcome
       tryReadMVar outcome >>= \case
         Nothing → failExample "the example recorded no outcome for the wait"
         Just result → either (const (pure ())) (\answered → failExample ("the wait answered " <> show answered)) result
@@ -451,6 +448,6 @@ spec = describe "waiting for a scheduled owner's accounting of the instances it 
           expectDelivered fixture owner "e" 1
           awaitDiagnosticsWaiting owner
           grant owner 1
-          waiting ← beginWait control owner
-          answer waiting >>= (`shouldBe` AccountingOwnerEnded)
-          awaitScheduledTerminal control owner >>= (`shouldSatisfy` \case WorkerUnavailable _ → True; _ → False)
+          withWait control owner $ \waiting → do
+            answer waiting >>= (`shouldBe` AccountingOwnerEnded)
+            awaitScheduledTerminal control owner >>= (`shouldSatisfy` \case WorkerUnavailable _ → True; _ → False)

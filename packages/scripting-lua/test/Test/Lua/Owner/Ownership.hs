@@ -10,7 +10,6 @@
 -- owner goes on as if nothing had been tried.
 module Test.Lua.Owner.Ownership (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (SomeException, fromException, try)
 import Data.Either (isRight)
@@ -32,6 +31,9 @@ import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe)
 import Test.Lua.Owner.Support
 import Test.Lua.Support (newRecorder, recorded, recordingCallback)
 import Test.Support.Bounded (bounded)
+import Control.Concurrent.MVar (tryPutMVar)
+import Control.Monad (void)
+import Test.Lua.Support (withProducer)
 
 -- | How a refused attempt ended: the operation the refusal names.
 refusedAs ∷ Either SomeException a → Either String String
@@ -51,9 +53,7 @@ spec = describe "exactly one owner per VM" $ do
             { ownerAfterLibraries = \vm → recordingCallback vm trace "touch" >> recordingCallback vm trace "untouched"
             }
     outcome ← runOwner config $ \owned → do
-      attempted ← newEmptyMVar
-      _ ← forkIO (try @SomeException (evalOwned owned (chunkName "foreign") "touched = true touch()") >>= putMVar attempted)
-      attempt ← bounded (takeMVar attempted)
+      attempt ← withProducer (try @SomeException (evalOwned owned (chunkName "foreign") "touched = true touch()")) (bounded . takeMVar)
       -- The rightful owner is unaffected, and finds nothing the attempt did.
       evalOwned owned (chunkName "owner") "if touched == nil then untouched() end"
       pure (refusedAs attempt)
@@ -62,9 +62,7 @@ spec = describe "exactly one owner per VM" $ do
 
   it "refuses a close asked by another thread, leaving the VM open and the one close to its owner" $ do
     outcome ← runOwner (defaultOwnerConfig [LibraryBase]) $ \owned → do
-      attempted ← newEmptyMVar
-      _ ← forkIO (try @SomeException (closeVm (ownedInternalVm owned)) >>= putMVar attempted)
-      attempt ← bounded (takeMVar attempted)
+      attempt ← withProducer (try @SomeException (closeVm (ownedInternalVm owned))) (bounded . takeMVar)
       phase ← vmPhase (ownedInternalVm owned)
       evalOwned owned (chunkName "after") "after_the_attempt = true"
       pure (refusedAs attempt, phase)
@@ -78,23 +76,33 @@ spec = describe "exactly one owner per VM" $ do
           (defaultOwnerConfig [LibraryBase])
             { ownerAfterLibraries = \vm → recordingCallback vm trace "first_still_works"
             }
-    (_, firstSlot) ← ownerThread first $ \owned → do
-      putMVar shared owned
-      -- The second owner has made both attempts by now.
-      bounded (takeMVar attempted)
-      evalOwned owned (chunkName "first") "first_still_works()"
-    (_, secondSlot) ← ownerThread (defaultOwnerConfig [LibraryBase]) $ \_ → do
-      handed ← bounded (takeMVar shared)
-      used ← try @SomeException (evalOwned (handed ∷ OwnedVm) (chunkName "other") "stolen = true")
-      closed ← try @SomeException (closeVm (ownedInternalVm handed))
-      putMVar attempted ()
-      pure (refusedAs used, refusedAs closed)
-    secondOutcome ← bounded (takeMVar secondSlot)
-    either (const Nothing) Just secondOutcome
-      `shouldBe` Just (Right "not owned: \"eval-chunk\"", Right "not owned: \"close-vm\"")
-    firstOutcome ← bounded (takeMVar firstSlot)
-    isRight firstOutcome `shouldBe` True
-    recorded trace >>= (`shouldBe` ["first_still_works"])
+    withOwnerThread
+      (void (tryPutMVar attempted ()))
+      first
+      ( \owned → do
+          putMVar shared owned
+          -- The second owner has made both attempts by now.
+          bounded (takeMVar attempted)
+          evalOwned owned (chunkName "first") "first_still_works()"
+      )
+      $ \(_, firstSlot) →
+        withOwnerThread
+          (pure ())
+          (defaultOwnerConfig [LibraryBase])
+          ( \_ → do
+              handed ← bounded (takeMVar shared)
+              used ← try @SomeException (evalOwned (handed ∷ OwnedVm) (chunkName "other") "stolen = true")
+              closed ← try @SomeException (closeVm (ownedInternalVm handed))
+              putMVar attempted ()
+              pure (refusedAs used, refusedAs closed)
+          )
+          $ \(_, secondSlot) → do
+            secondOutcome ← bounded (takeMVar secondSlot)
+            either (const Nothing) Just secondOutcome
+              `shouldBe` Just (Right "not owned: \"eval-chunk\"", Right "not owned: \"close-vm\"")
+            firstOutcome ← bounded (takeMVar firstSlot)
+            isRight firstOutcome `shouldBe` True
+            recorded trace >>= (`shouldBe` ["first_still_works"])
 
   it "refuses every use of a reference that outlived the lifetime with VmClosed, from any thread" $ do
     escaped ← runOwner (defaultOwnerConfig [LibraryBase]) pure
@@ -104,9 +112,7 @@ spec = describe "exactly one owner per VM" $ do
         vmPhase (ownedInternalVm owned) >>= (`shouldBe` Closed)
         here ← try @SomeException (evalOwned owned (chunkName "late") "late = true")
         refusedAs here `shouldBe` Right "closed: \"eval-chunk\""
-        there ← newEmptyMVar
-        _ ← forkIO (try @SomeException (evalOwned owned (chunkName "late") "late = true") >>= putMVar there)
-        elsewhere ← bounded (takeMVar there)
+        elsewhere ← withProducer (try @SomeException (evalOwned owned (chunkName "late") "late = true")) (bounded . takeMVar)
         refusedAs elsewhere `shouldBe` Right "closed: \"eval-chunk\""
         -- A close of a closed VM is no close at all, from any thread.
         closeVm (ownedInternalVm owned)

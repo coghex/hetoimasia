@@ -555,7 +555,8 @@ test-suite lua-runtime-tests
         hetoimasia-scripting-lua,
         hetoimasia-scripting-lua:bridge,
         hetoimasia-scripting-lua:model,
-        hetoimasia-scripting-lua:runtime-lua
+        hetoimasia-scripting-lua:runtime-lua,
+        hetoimasia-test-support ==0.1.0.0
 
 -- Deliberate nontermination is optional evidence, separate from lua-host-tests.
 test-suite lua-hazard-probes

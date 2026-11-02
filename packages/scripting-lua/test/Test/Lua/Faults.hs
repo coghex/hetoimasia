@@ -78,10 +78,12 @@ import Test.Lua.Support
   , recorded
   , recordingCallback
   , referenceSlot
-  , settling
   , withVm
   )
 import Test.Support.Bounded (bounded)
+import Control.Concurrent.MVar (tryPutMVar)
+import Control.Monad (void)
+import Test.Lua.Support (withSettling)
 
 -- | The failure a callback raises when an example wants one.
 newtype CallbackBroke = CallbackBroke String
@@ -152,26 +154,29 @@ spec = describe "faults" $ do
         (putMVar entered () >> takeMVar released >> pure NoResult)
         (pure ())
       recordingCallback vm trace "finished"
-      runner ←
-        settling $ do
+      withSettling
+        (void (tryPutMVar released ()))
+        ( do
           evalChunk vm (chunkName "cancel") "wait() finished()"
           -- The cancellation is owed to this thread. It is delivered when the
           -- native call it was aimed across has returned, so the example waits
           -- for it here instead of assuming when it lands. Nothing ever fills
           -- this slot.
           takeMVar unreachable
-      bounded (takeMVar entered)
-      -- Pending against the owner before the call is released, and taken by
-      -- the runner before this returns: the owner is inside the native call,
-      -- so the request waits for it there.
-      cancelling runner UserInterrupt (putMVar released ())
-      settled ← awaitSettled runner
-      case settledOperation settled of
-        Right () → expectationFailure "the thread was never cancelled"
-        Left thrown → fromException thrown `shouldBe` Just UserInterrupt
-      -- The chunk ran to its end. The cancellation did not become an error Lua
-      -- could see, catch, or be stopped by.
-      recorded trace >>= (`shouldBe` ["finished"])
+        )
+        $ \runner → do
+          bounded (takeMVar entered)
+          -- Pending against the owner before the call is released, and taken by
+          -- the runner before this returns: the owner is inside the native call,
+          -- so the request waits for it there.
+          cancelling runner UserInterrupt (putMVar released ())
+          settled ← awaitSettled runner
+          case settledOperation settled of
+            Right () → expectationFailure "the thread was never cancelled"
+            Left thrown → fromException thrown `shouldBe` Just UserInterrupt
+          -- The chunk ran to its end. The cancellation did not become an error Lua
+          -- could see, catch, or be stopped by.
+          recorded trace >>= (`shouldBe` ["finished"])
 
   it "keeps the first callback failure when a later call fails differently" $
     withVm [LibraryBase] $ \vm → do
@@ -261,19 +266,22 @@ spec = describe "faults" $ do
     -- against it by then, so it can only be delivered after that exception
     -- has been caught and before a runner that publishes unprotected would
     -- have stored anything -- the gap a bare @forkIO@ and @try@ leave open.
-    runner ←
-      settling . mask_ $ do
+    withSettling
+      (void (tryPutMVar released ()))
+      ( mask_ $ do
         putMVar entered ()
         uninterruptibleMask_ (takeMVar released)
         throwIO (CallbackBroke "the operation failed")
-    bounded (takeMVar entered)
-    cancelling runner UserInterrupt (putMVar released ())
-    -- One result, and both handoffs complete: the runner has ended and nothing
-    -- else was stored, so a second publication left blocked would fail here.
-    settled ← awaitSettled runner
-    either fromException (const Nothing) (settledOperation settled)
-      `shouldBe` Just (CallbackBroke "the operation failed")
-    (settledAfter settled >>= fromException) `shouldBe` Just UserInterrupt
+      )
+      $ \runner → do
+        bounded (takeMVar entered)
+        cancelling runner UserInterrupt (putMVar released ())
+        -- One result, and both handoffs complete: the runner has ended and nothing
+        -- else was stored, so a second publication left blocked would fail here.
+        settled ← awaitSettled runner
+        either fromException (const Nothing) (settledOperation settled)
+          `shouldBe` Just (CallbackBroke "the operation failed")
+        (settledAfter settled >>= fromException) `shouldBe` Just UserInterrupt
 
   it "keeps a cancellation from stranding the stack of a call that faulted" $
     withVm [LibraryBase] $ \vm → do
@@ -285,29 +293,32 @@ spec = describe "faults" $ do
         (putMVar entered () >> takeMVar released >> pure NoResult)
         (pure ())
       before ← stackDepth vm
-      runner ← settling (evalChunk vm (chunkName "fault") "wait() error('boom')")
-      bounded (takeMVar entered)
-      cancelling runner UserInterrupt (putMVar released ())
-      settled ← awaitSettled runner
-      case settledOperation settled of
-        Right () → expectationFailure "the chunk succeeded"
-        -- Two failures are owed to this thread at once: the chunk's, and the
-        -- cancellation. Which of them it ends up carrying is the runtime's to
-        -- decide, and this example is not about that -- it is about what the VM
-        -- looks like afterwards, which is the same either way.
-        Left thrown → case (fromException thrown, fromException thrown) of
-          (Just UserInterrupt, _) → pure ()
-          (_, Just (_ ∷ LuaFault)) → pure ()
-          _ → expectationFailure ("the operation failed with " <> show thrown)
-      -- The cancellation was pending before the call was released, and the
-      -- runner saw it, inside the operation or after it. The VM delivers it
-      -- only once its own bookkeeping is done, and exactly where it then lands
-      -- is not something this example relies on: only that, wherever it did,
-      -- the stack is back where it started.
-      observedCancellation settled `shouldBe` Just UserInterrupt
-      stackDepth vm >>= (`shouldBe` before)
-      evalChunk vm (chunkName "after") "local ignored = 1"
-      stackDepth vm >>= (`shouldBe` before)
+      withSettling
+        (void (tryPutMVar released ()))
+        (evalChunk vm (chunkName "fault") "wait() error('boom')")
+        $ \runner → do
+          bounded (takeMVar entered)
+          cancelling runner UserInterrupt (putMVar released ())
+          settled ← awaitSettled runner
+          case settledOperation settled of
+            Right () → expectationFailure "the chunk succeeded"
+            -- Two failures are owed to this thread at once: the chunk's, and the
+            -- cancellation. Which of them it ends up carrying is the runtime's to
+            -- decide, and this example is not about that -- it is about what the VM
+            -- looks like afterwards, which is the same either way.
+            Left thrown → case (fromException thrown, fromException thrown) of
+              (Just UserInterrupt, _) → pure ()
+              (_, Just (_ ∷ LuaFault)) → pure ()
+              _ → expectationFailure ("the operation failed with " <> show thrown)
+          -- The cancellation was pending before the call was released, and the
+          -- runner saw it, inside the operation or after it. The VM delivers it
+          -- only once its own bookkeeping is done, and exactly where it then lands
+          -- is not something this example relies on: only that, wherever it did,
+          -- the stack is back where it started.
+          observedCancellation settled `shouldBe` Just UserInterrupt
+          stackDepth vm >>= (`shouldBe` before)
+          evalChunk vm (chunkName "after") "local ignored = 1"
+          stackDepth vm >>= (`shouldBe` before)
 
   it "keeps a cancellation from leaving a callback's failure for the next call" $
     withVm [LibraryBase] $ \vm → do
@@ -319,19 +330,22 @@ spec = describe "faults" $ do
         "wait"
         (putMVar entered () >> takeMVar released >> pure NoResult)
         (pure ())
-      runner ← settling (evalChunk vm (chunkName "strand") "pcall(boom) wait()")
-      bounded (takeMVar entered)
-      cancelling runner UserInterrupt (putMVar released ())
-      settled ← awaitSettled runner
-      case settledOperation settled of
-        Right () → expectationFailure "the operation reported success"
-        Left _ → pure ()
-      -- The cancellation was injected and the runner saw it: this is not an
-      -- operation that ended before anything was aimed at it.
-      observedCancellation settled `shouldBe` Just UserInterrupt
-      -- Whichever of the two the cancelled operation raised, it took the
-      -- recorded failure with it. The next chunk is unrelated and succeeds.
-      evalChunk vm (chunkName "after") "local ignored = 1"
+      withSettling
+        (void (tryPutMVar released ()))
+        (evalChunk vm (chunkName "strand") "pcall(boom) wait()")
+        $ \runner → do
+          bounded (takeMVar entered)
+          cancelling runner UserInterrupt (putMVar released ())
+          settled ← awaitSettled runner
+          case settledOperation settled of
+            Right () → expectationFailure "the operation reported success"
+            Left _ → pure ()
+          -- The cancellation was injected and the runner saw it: this is not an
+          -- operation that ended before anything was aimed at it.
+          observedCancellation settled `shouldBe` Just UserInterrupt
+          -- Whichever of the two the cancelled operation raised, it took the
+          -- recorded failure with it. The next chunk is unrelated and succeeds.
+          evalChunk vm (chunkName "after") "local ignored = 1"
 
   it "retains a cancelled operation's borrowed dependencies until the close" $ do
     vm ← acquireVm [LibraryBase]
@@ -343,19 +357,22 @@ spec = describe "faults" $ do
       "wait"
       (putMVar entered () >> takeMVar released >> pure NoResult)
       (modifyMVar_ releases (pure . succ))
-    runner ← settling (evalChunk vm (chunkName "cancel") "wait()")
-    bounded (takeMVar entered)
-    cancelling runner UserInterrupt (putMVar released ())
-    settled ← awaitSettled runner
-    -- However the operation ended, it was cancelled: a cancellation that never
-    -- arrived would leave nothing here to retain.
-    observedCancellation settled `shouldBe` Just UserInterrupt
-    -- Cancelling the owner does not retire what its callbacks borrowed. Lua can
-    -- still call them, right up to the close.
-    readMVar releases >>= (`shouldBe` 0)
-    evalChunk vm (chunkName "again") "local ignored = 1"
-    closeVm vm
-    readMVar releases >>= (`shouldBe` 1)
+    withSettling
+      (void (tryPutMVar released ()))
+      (evalChunk vm (chunkName "cancel") "wait()")
+      $ \runner → do
+        bounded (takeMVar entered)
+        cancelling runner UserInterrupt (putMVar released ())
+        settled ← awaitSettled runner
+        -- However the operation ended, it was cancelled: a cancellation that never
+        -- arrived would leave nothing here to retain.
+        observedCancellation settled `shouldBe` Just UserInterrupt
+        -- Cancelling the owner does not retire what its callbacks borrowed. Lua can
+        -- still call them, right up to the close.
+        readMVar releases >>= (`shouldBe` 0)
+        evalChunk vm (chunkName "again") "local ignored = 1"
+        closeVm vm
+        readMVar releases >>= (`shouldBe` 1)
 
   it "reports a callback that failed inside a globals metamethod as that failure" $
     withVm [LibraryBase] $ \vm → do

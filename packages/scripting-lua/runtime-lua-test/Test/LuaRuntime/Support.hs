@@ -20,6 +20,8 @@ module Test.LuaRuntime.Support
   , tryExpected
   , failExample
   , alongsideOpening
+  , withProducers
+  , withProducer
   , expectFatalOpening
   , bounded
   , boundedAfter
@@ -73,7 +75,7 @@ module Test.LuaRuntime.Support
   , isDiscard
   ) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, throwTo, yield)
+import Control.Concurrent (ThreadId, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, newMVar, putMVar, readMVar, tryPutMVar, tryReadMVar, tryTakeMVar)
 import Control.Concurrent.STM (retry)
 import Control.Exception
@@ -135,6 +137,7 @@ import System.Timeout (Timeout, timeout)
 import GHC.Stack (HasCallStack)
 import Test.HUnit.Lang (FailureReason (Reason), HUnitFailure (HUnitFailure), assertFailure)
 import Test.Hspec (Expectation, expectationFailure)
+import Test.Support.Owned (withOwnedThread)
 
 -- Failures ---------------------------------------------------------------------
 
@@ -263,18 +266,40 @@ alongsideOpening ∷ [IO ()] → IO () → IO a → IO a
 alongsideOpening openers helper main' = do
   example ← myThreadId
   failed ← newEmptyMVar
-  thread ← forkIO $
-    try @SomeException helper >>= \case
-      Left failure | fromException failure /= Just ThreadKilled → do
-        putMVar failed failure
-        sequence_ openers
-        throwTo example failure
-      _ → pure ()
-  outcome ← try @SomeException main'
-  killThread thread
+  -- The helper is owned (#598): when the other action is over, however it ended, the helper is stopped and joined before this
+  -- returns. The scope's body is masked except for the other action itself, so a failure the helper raises at the example
+  -- cannot land outside it; a helper still delivering one when the other action is over is ended by the release's kill, which
+  -- reaches a thread blocked in 'throwTo'.
+  outcome ← mask $ \restore →
+    withOwnedThread (helperAction example failed) $ \_ _ → try @SomeException (restore main')
   tryTakeMVar failed >>= \case
     Just failure → throwIO failure
     Nothing → either throwIO pure outcome
+  where
+    helperAction example failed =
+      try @SomeException helper >>= \case
+        Left failure | fromException failure /= Just ThreadKilled → do
+          putMVar failed failure
+          sequence_ openers
+          throwTo example failure
+        _ → pure ()
+
+-- | Run each action on a thread of its own, owned for the length of the body, and hand the body a wait for each one's answer in
+-- the order given. However the body ends (a return, an exception, a cancellation) every thread has ended and been joined before
+-- this returns (#598). An action that raises hands over no answer, as a thread that died never did.
+withProducers ∷ [IO a] → ([MVar a] → IO b) → IO b
+withProducers actions body = go actions []
+  where
+    go [] boxes = body (reverse boxes)
+    go (action : rest) boxes = do
+      box ← newEmptyMVar
+      withOwnedThread (action >>= putMVar box) (\_ _ → go rest (box : boxes))
+
+-- | 'withProducers' for one action.
+withProducer ∷ IO a → (MVar a → IO b) → IO b
+withProducer action body = do
+  box ← newEmptyMVar
+  withOwnedThread (action >>= putMVar box) (\_ _ → body box)
 
 -- | Raised in the thread of an example whose bound has expired. It is the bound's own
 -- interruption: an example takes no failure of its own for it, and 'tryExpected' raises it as
@@ -308,17 +333,21 @@ bounded = boundedAfter exampleBound exampleBound
 -- interrupted at, so that the examples of the helper itself can have the gates opened first
 -- or last.
 boundedAfter ∷ Int → Int → Expectation → Expectation
-boundedAfter openAfter limit action = mask $ \restore → do
+boundedAfter openAfter limit action = do
   example ← myThreadId
   finished ← newEmptyMVar
   expired ← newIORef False
-  _ ← forkIO (timeout openAfter (readMVar finished) >>= maybe (atomicWriteIORef expired True >> openAtBound example) pure)
-  interrupting ← forkIO (interruptUntil finished expired example limit regrace)
-  outcome ← try @SomeException (restore action)
-  -- Whatever the interrupting thread is doing, it ends before the example does: it may be
-  -- waiting to deliver an interruption to a thread that is masked now.
-  putMVar finished ()
-  killThread interrupting
+  -- The bound's two threads are owned (#598): both have ended and been joined before the verdict is read, on every way out of
+  -- the scope. The stop never waits on the example this bound bounds: 'finished' lets both end by themselves, and the release's
+  -- kill reaches a thread blocked delivering an interruption to a thread that is masked now (the example, in the release).
+  -- The two schedules stay independent: gates may be opened before or after the first interruption.
+  outcome ← mask $ \restore →
+    withOwnedThread (watchdog example finished expired) $ \_ _ →
+      withOwnedThread (interruptUntil finished expired example limit regrace) $ \_ _ → do
+        result ← try @SomeException (restore action)
+        -- Whatever the interrupting thread is doing, it ends before the example does.
+        putMVar finished ()
+        pure result
   opened ← readIORef expired
   case outcome of
     Right () | not opened → pure ()
@@ -328,6 +357,8 @@ boundedAfter openAfter limit action = mask $ \restore → do
       | opened → expectationFailure (boundExpiredMessage <> "\nThe example had failed with: " <> describeFailure failure)
       | otherwise → throwIO failure
   where
+    watchdog example finished expired =
+      timeout openAfter (readMVar finished) >>= maybe (atomicWriteIORef expired True >> openAtBound example) pure
     openAtBound example = do
       held ← readIORef openersAtBound
       sequence_ (concat [openers | (thread, _, openers) ← held, thread == example])

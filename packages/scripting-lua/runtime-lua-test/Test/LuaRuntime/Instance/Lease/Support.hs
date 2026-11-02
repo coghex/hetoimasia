@@ -75,8 +75,7 @@ module Test.LuaRuntime.Instance.Lease.Support
   , liveFor
   ) where
 
-import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, retry, throwSTM, writeTVar)
 import Control.Exception (SomeException, finally, throw, throwIO, toException, try)
 import Control.Monad (forM_, void)
@@ -109,7 +108,7 @@ import Test.LuaRuntime.Instance.Support
   , startWith
   )
 import Test.LuaRuntime.Scheduled.Support (SFixture (sfLog), defaultSchedulerBounds)
-import Test.LuaRuntime.Support (Broken (Broken), Gated (..))
+import Test.LuaRuntime.Support (Broken (Broken), Gated (..), withProducer)
 
 -- The fixture ---------------------------------------------------------------------
 
@@ -394,11 +393,7 @@ leaseNamespace fixture =
     , -- Acquires from a thread the callback started, which is not the callback.
       stateOperation "open_elsewhere" [SText] [SText] $ \arguments → case arguments of
         [VText name] → do
-          done ← newEmptyMVar
-          _ ← forkIO $ do
-            outcome ← try @SomeException (acquireOwned (lfLeases fixture) (\_ → twoParts fixture name))
-            putMVar done outcome
-          outcome ← takeMVar done
+          outcome ← withProducer (try @SomeException (acquireOwned (lfLeases fixture) (\_ → twoParts fixture name))) takeMVar
           pure [VText (either (const "refused") (const "acquired") outcome)]
         _ → pure []
     , stateOperation "use" [SCapability "res"] [SText] $ \arguments → case arguments of
