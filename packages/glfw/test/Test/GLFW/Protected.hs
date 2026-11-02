@@ -163,7 +163,7 @@ import Test.GLFW.Support
   , withMainThreadKeepingContext
   )
 import Test.Hspec (Expectation, Spec, before_, describe, it, shouldBe, shouldReturn, shouldSatisfy)
-import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
+import Test.Support.Owned (withOwnedBoundThreadOpening, withOwnedThread, withOwnedThreadOpening)
 import Data.Foldable (for_)
 
 spec ∷ Spec
@@ -244,6 +244,10 @@ spec = before_ clearRegistered $ describe "GLFW protected host" $ do
         boundedExample (ownedEnds ending supplierScenario False)
       it ("negative control: an unowned start leaves the evidence supplier waiting for an owner that never exists when the example body " <> label) $
         boundedExample (unownedLeaks ending supplierScenario False)
+    for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
+      for_ [("after its first owner attached", True), ("while the runner is parked before its host", False)] $ \(where', after) →
+        it ("finishes the exit when the example body " <> label <> " " <> where' <> ", before the explicit rescue (#593)") $
+          boundedExample (ownedEnds ending (stickyBeforeRescueScenario after) True)
     it "releases an owner the runner registers after the cleanup began, before it built its host (#593)"
       (boundedExample (stickyRegistration False))
     it "releases an owner the runner registers after the cleanup began, after the snapshot that cleanup took (#593)"
@@ -1315,7 +1319,16 @@ runnerPartialScenario scope atParked = do
 -- the cleanup begins before the runner builds its host (the registry must not be reset by the host); with it true, after the
 -- runner attached a first owner and before it attaches a second, so the second is not in the snapshot the cleanup took.
 stickyRegistration ∷ Bool → Expectation
-stickyRegistration after = do
+stickyRegistration after = stickyRegistrationFixture after withOwnedBoundThreadOpening (pure ())
+
+-- | The same fixture ended before its own explicit @rescueNow@ (#593): the example body fails or is cancelled while the runner has
+-- attached its first owner (or, with @after@ false, while it is parked before its host), so the cleanup that follows is the owning
+-- scope's own, whose opening calls @rescueNow@ before the kill.
+stickyBeforeRescueScenario ∷ Bool → Scope → IO () → IO ()
+stickyBeforeRescueScenario after scope atParked = stickyRegistrationFixture after scope atParked
+
+stickyRegistrationFixture ∷ Bool → Scope → IO () → Expectation
+stickyRegistrationFixture after scope beforeRescue = do
   journal ← newTVarIO []
   seam ← journallingSeam journal
   attached ← newEmptyMVar
@@ -1331,13 +1344,15 @@ stickyRegistration after = do
             window ← onlyWindow host
             void (establishedOwner journal host window (pending "alpha"))
       windows = if after then ["alpha", "beta"] else ["alpha"]
-  withMainThread seam (pure ())
+  -- The scope's opening begins the cleanup before it kills the runner, and lets go of the runner's gate, however the example ended.
+  withMainThreadVia scope seam (rescueNow >> void (tryPutMVar go ()))
     ( do
         unless after (takeMVar go)
         protectedRunHere seam quietLogger (settings (map windowNamed windows)) callback (\_ _ → pure ()) (\() _ → pure ())
     )
     $ \_ finished → do
     when after (takeMVar attached)
+    beforeRescue
     rescueNow
     putMVar go ()
     takeMVar finished >>= either throwIO pure
