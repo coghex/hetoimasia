@@ -14,8 +14,7 @@
 -- already hung.
 module Test.GLFW.Session (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, forkOS, isCurrentThreadBound)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (isCurrentThreadBound)
 import Control.Exception
   ( ErrorCall (ErrorCall)
   , Exception
@@ -60,6 +59,7 @@ import Test.Hspec
   , shouldNotBe
   , shouldReturn
   )
+import Test.GLFW.Support (onBoundThread, onThread)
 
 spec ∷ Spec
 spec = do
@@ -136,7 +136,7 @@ testEnterTwice = do
 testBoundWorkerRejected ∷ Expectation
 testBoundWorkerRejected = do
   seam ← newSeam defaultScript
-  (bound, (misuse, caught)) ← onThread forkOS $ do
+  (bound, (misuse, caught)) ← onBoundThread $ do
     bound ← isCurrentThreadBound
     rejected ← caughtAs (entered seam defaultSessionConfig (\_ → pure ()))
     pure (bound, rejected)
@@ -148,7 +148,7 @@ testBoundWorkerRejected = do
 testUnboundThreadRejected ∷ Expectation
 testUnboundThreadRejected = do
   seam ← newSeam defaultScript
-  (bound, (misuse, _)) ← onThread forkIO $ do
+  (bound, (misuse, _)) ← onThread $ do
     designateProcessMainThread seam
     bound ← isCurrentThreadBound
     rejected ← caughtAs (entered seam defaultSessionConfig (\_ → pure ()))
@@ -169,7 +169,7 @@ testConcurrentEntryRejected ∷ Expectation
 testConcurrentEntryRejected = do
   seam ← newSeam defaultScript
   misuse ← asProcessMainThread seam $ entered seam defaultSessionConfig $ \_ →
-    onThread forkOS $ do
+    onBoundThread $ do
       designateProcessMainThread seam
       fst <$> caughtAs (entered seam defaultSessionConfig (\_ → pure ()))
   misuse `shouldBe` SessionAlreadyActive
@@ -585,8 +585,8 @@ testOwnerOnlyOperations = do
   let config = hiddenTestWindowConfig "elsewhere" 64 48
   (reportsElsewhere, windowElsewhere, afterEnd) ← asProcessMainThread seam $ do
     (reportsElsewhere, windowElsewhere, session) ← entered seam defaultSessionConfig $ \session → do
-      reportsElsewhere ← onThread forkOS (fst <$> caughtAs (takeAsynchronousReports session))
-      windowElsewhere ← onThread forkOS (fst <$> caughtAs (withWindow session config (\_ → pure ())))
+      reportsElsewhere ← onBoundThread (fst <$> caughtAs (takeAsynchronousReports session))
+      windowElsewhere ← onBoundThread (fst <$> caughtAs (withWindow session config (\_ → pure ())))
       pure (reportsElsewhere, windowElsewhere, session)
     -- Deliberate misuse: the session escaped its scope to prove it is refused.
     (afterEnd, _) ← caughtAs (takeAsynchronousReports session)
@@ -651,14 +651,6 @@ firstTimeOnly ∷ IO (IO Bool)
 firstTimeOnly = do
   flag ← newIORef True
   pure (atomicModifyIORef' flag (\first → (False, first)))
-
--- | Run an action on a new thread and wait for its outcome.
-onThread ∷ (IO () → IO ThreadId) → IO a → IO a
-onThread fork action = do
-  finished ← newEmptyMVar
-  _ ← fork (try action >>= putMVar finished)
-  outcome ← takeMVar finished
-  either (throwIO ∷ SomeException → IO a) pure outcome
 
 -- | The typed failure an action raised, beside the exception as caught.
 caughtAs ∷ Exception e ⇒ IO a → IO (e, SomeException)

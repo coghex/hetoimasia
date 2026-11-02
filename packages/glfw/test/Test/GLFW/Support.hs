@@ -19,6 +19,8 @@ module Test.GLFW.Support
 
     -- * Threads, failures, and bounds
   , onThread
+  , onBoundThread
+  , withDeferredThread
   , caughtAs
   , unexpected
   , originOf
@@ -58,7 +60,7 @@ module Test.GLFW.Support
   ) where
 
 import Control.Concurrent (ThreadId)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception
   ( Exception
@@ -72,7 +74,7 @@ import Control.Exception
   )
 import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
 import Control.Exception.Context (ExceptionContext, getExceptionAnnotations)
-import Control.Monad (when)
+import Control.Monad (void, when)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import Hetoimasia.Foundation.Failure
@@ -132,6 +134,7 @@ import Hetoimasia.Runtime.Reporting (DiagnosticFailure, raisedByDiagnostic)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import System.Timeout (timeout)
 import Test.Hspec (Expectation, expectationFailure)
+import Test.Support.Owned (withOwnedBoundThread, withOwnedThread)
 
 -- ---------------------------------------------------------------------------
 -- Sessions and windows
@@ -148,13 +151,32 @@ stashed stash = readIORef stash >>= maybe (unexpected "no window was stashed") p
 -- ---------------------------------------------------------------------------
 -- Threads, failures, and bounds
 
--- | Run an action on a new thread and wait for its outcome.
-onThread ∷ (IO () → IO ThreadId) → IO a → IO a
-onThread fork action = do
+-- | Run an action on a new owned thread and wait for its outcome (#593). However the wait ends (a return, an exception, a
+-- timeout of the example, a cancellation), the thread has ended and been joined before this returns, and there is no way to
+-- hand it an unowned start. Ownership adds that guarantee; the wait for the outcome is still the example's own.
+onThread ∷ IO a → IO a
+onThread = onOwnedThread withOwnedThread
+
+-- | 'onThread' on an OS-bound thread, for an example that asserts what a bound caller may or may not do.
+onBoundThread ∷ IO a → IO a
+onBoundThread = onOwnedThread withOwnedBoundThread
+
+onOwnedThread ∷ (IO () → (ThreadId → IO () → IO a) → IO a) → IO a → IO a
+onOwnedThread scope action = do
   finished ← newEmptyMVar
-  _ ← fork (try action >>= putMVar finished)
-  outcome ← takeMVar finished
-  either (throwIO ∷ SomeException → IO a) pure outcome
+  scope (try action >>= putMVar finished) $ \_ _ → do
+    outcome ← takeMVar finished
+    either (throwIO ∷ SomeException → IO a) pure outcome
+
+-- | An owned thread that does its one piece of work only once it is handed what the work acts on: the scope starts the thread
+-- and gives the body the thread and the handing-over. For an injector whose target is known only inside a callback (a hook
+-- that runs masked on the owner): started from the callback, its scope would end, and kill it, while it was still waiting to
+-- deliver to a target that stays masked; started here, around the whole run, it lives until its exception has been delivered
+-- and is stopped and joined when the scope ends, delivered or not. The handing-over never blocks.
+withDeferredThread ∷ (a → IO ()) → (ThreadId → (a → IO ()) → IO r) → IO r
+withDeferredThread work body = do
+  handed ← newEmptyMVar
+  withOwnedThread (takeMVar handed >>= work) $ \thread _ → body thread (void . tryPutMVar handed)
 
 -- | The typed failure an action raised, beside the exception as caught.
 caughtAs ∷ Exception e ⇒ IO a → IO (e, SomeException)

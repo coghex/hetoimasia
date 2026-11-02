@@ -12,7 +12,7 @@
 -- sleep.
 module Test.GLFW.Dynamic (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, yield)
+import Control.Concurrent (ThreadId, killThread, myThreadId, yield)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVarIO)
 import Control.Exception (AsyncException (ThreadKilled), Exception, SomeException, throwIO, try)
 import Control.Monad (forM, forM_, replicateM, unless, void, when)
@@ -49,7 +49,7 @@ import Hetoimasia.Runtime.Logging (LoggingLifetime, withLoggingLifetime)
 import Hetoimasia.Runtime.Supervision (Recognition (..), Role (..), RuntimeControl, SupervisedStart (..), WorkerPolicy (..), startSupervised)
 import qualified Hetoimasia.Runtime.Supervision as Supervision
 import Numeric.Natural (Natural)
-import Test.GLFW.Support (boundedExample, caughtAs, unexpected)
+import Test.GLFW.Support (boundedExample, caughtAs, unexpected, withDeferredThread)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 
 spec ∷ Spec
@@ -300,47 +300,48 @@ testCancelledConstruction = do
   -- owner's own masking state, so it is delivered inside the sample; had
   -- construction been masked, the cancelling thread would block instead, which
   -- fails the example.
-  seam ←
-    newSeam
-      defaultScript
-        { scriptWindowSize = \_ → do
-            now ← killing
-            when now $ do
-              target ← slot owner
-              killer ← forkIO (killThread target)
-              awaitDelivery killer
-            pure (800, 600)
-        }
-  requested ← newIORef Nothing
-  enumerated ← newIORef Nothing
-  (cancelled, _) ←
-    caughtAs $
-      hosted seam (settings [windowNamed "kept"]) (\host _ → pure host) $ \host control → do
-        myThreadId >>= writeIORef owner . Just
-        outcome ←
-          try . looping host control $ \turn → case turnNumber turn of
-            1 → do
-              arm
-              submit (hostCommandPort host) (createWindowCommand (windowNamed "cancelled")) >>= writeIORef requested . Just
-              pure Continue
-            _ → pure (Continue ∷ TurnStep ())
-        case outcome of
-          Right () → unexpected "the loop finished"
-          Left (caught ∷ SomeException) → do
-            listed ← identities host
-            kept ← hostBookkeeping host
-            writeIORef enumerated (Just (length listed, bookkeepingMembers kept))
-            throwIO caught
-  cancelled `shouldBe` ThreadKilled
-  ticket ← slot requested
-  disposition ticket >>= (`shouldSatisfy` interrupted)
-  atomically (pollWindowClient ticket) >>= (`shouldSatisfy` isNothing)
-  (listed, members) ← slot enumerated
-  -- Rolled back before the loop saw the cancellation: no registry entry, and its
-  -- capacity reclaimed.
-  (listed, members) `shouldBe` (1, 1)
-  destroyed seam `shouldReturn` [2, 1]
-  seamLiveWindowCallbacks seam `shouldReturn` 0
+  withDeferredThread killThread $ \killer inject → do
+    seam ←
+      newSeam
+        defaultScript
+          { scriptWindowSize = \_ → do
+              now ← killing
+              when now $ do
+                target ← slot owner
+                inject target
+                awaitDelivery killer
+              pure (800, 600)
+          }
+    requested ← newIORef Nothing
+    enumerated ← newIORef Nothing
+    (cancelled, _) ←
+      caughtAs $
+        hosted seam (settings [windowNamed "kept"]) (\host _ → pure host) $ \host control → do
+          myThreadId >>= writeIORef owner . Just
+          outcome ←
+            try . looping host control $ \turn → case turnNumber turn of
+              1 → do
+                arm
+                submit (hostCommandPort host) (createWindowCommand (windowNamed "cancelled")) >>= writeIORef requested . Just
+                pure Continue
+              _ → pure (Continue ∷ TurnStep ())
+          case outcome of
+            Right () → unexpected "the loop finished"
+            Left (caught ∷ SomeException) → do
+              listed ← identities host
+              kept ← hostBookkeeping host
+              writeIORef enumerated (Just (length listed, bookkeepingMembers kept))
+              throwIO caught
+    cancelled `shouldBe` ThreadKilled
+    ticket ← slot requested
+    disposition ticket >>= (`shouldSatisfy` interrupted)
+    atomically (pollWindowClient ticket) >>= (`shouldSatisfy` isNothing)
+    (listed, members) ← slot enumerated
+    -- Rolled back before the loop saw the cancellation: no registry entry, and its
+    -- capacity reclaimed.
+    (listed, members) `shouldBe` (1, 1)
+    destroyed seam `shouldReturn` [2, 1]
+    seamLiveWindowCallbacks seam `shouldReturn` 0
 
 testCancelledPublication ∷ Expectation
 testCancelledPublication = do
@@ -350,44 +351,45 @@ testCancelledPublication = do
   -- masked. It asks another thread to cancel the owner and returns once that
   -- cancellation is pending, so it lands after both registrations and before the
   -- creation's result is published.
-  let hooks =
-        noHostHooks
-          { afterRegistration = do
-              now ← killing
-              when now $ do
-                target ← slot owner
-                killer ← forkIO (killThread target)
-                awaitThrowPending killer
-          }
-  seam ← newSeam defaultScript
-  requested ← newIORef Nothing
-  enumerated ← newIORef Nothing
-  (cancelled, _) ←
-    caughtAs $
-      hostedWith hooks seam (settings [windowNamed "kept"]) (\host _ → pure host) $ \host control → do
-        myThreadId >>= writeIORef owner . Just
-        outcome ←
-          try . looping host control $ \turn → case turnNumber turn of
-            1 → do
-              arm
-              submit (hostCommandPort host) (createWindowCommand (windowNamed "published")) >>= writeIORef requested . Just
-              pure Continue
-            _ → pure (Continue ∷ TurnStep ())
-        case outcome of
-          Right () → unexpected "the loop finished"
-          Left (caught ∷ SomeException) → do
-            listed ← identities host
-            observations ← forM listed (fmap clientObservations . clientOf host)
-            writeIORef enumerated (Just (length listed, observations))
-            throwIO caught
-  cancelled `shouldBe` ThreadKilled
-  ticket ← slot requested
-  disposition ticket >>= (`shouldSatisfy` interrupted)
-  atomically (pollWindowClient ticket) >>= (`shouldSatisfy` isNothing)
-  (count, observations) ← slot enumerated
-  count `shouldBe` 2
-  mapM (fmap observedPhase . latest) observations `shouldReturn` [WindowReleased, WindowReleased]
-  destroyed seam `shouldReturn` [2, 1]
+  withDeferredThread killThread $ \killer inject → do
+    let hooks =
+          noHostHooks
+            { afterRegistration = do
+                now ← killing
+                when now $ do
+                  target ← slot owner
+                  inject target
+                  awaitThrowPending killer
+            }
+    seam ← newSeam defaultScript
+    requested ← newIORef Nothing
+    enumerated ← newIORef Nothing
+    (cancelled, _) ←
+      caughtAs $
+        hostedWith hooks seam (settings [windowNamed "kept"]) (\host _ → pure host) $ \host control → do
+          myThreadId >>= writeIORef owner . Just
+          outcome ←
+            try . looping host control $ \turn → case turnNumber turn of
+              1 → do
+                arm
+                submit (hostCommandPort host) (createWindowCommand (windowNamed "published")) >>= writeIORef requested . Just
+                pure Continue
+              _ → pure (Continue ∷ TurnStep ())
+          case outcome of
+            Right () → unexpected "the loop finished"
+            Left (caught ∷ SomeException) → do
+              listed ← identities host
+              observations ← forM listed (fmap clientObservations . clientOf host)
+              writeIORef enumerated (Just (length listed, observations))
+              throwIO caught
+    cancelled `shouldBe` ThreadKilled
+    ticket ← slot requested
+    disposition ticket >>= (`shouldSatisfy` interrupted)
+    atomically (pollWindowClient ticket) >>= (`shouldSatisfy` isNothing)
+    (count, observations) ← slot enumerated
+    count `shouldBe` 2
+    mapM (fmap observedPhase . latest) observations `shouldReturn` [WindowReleased, WindowReleased]
+    destroyed seam `shouldReturn` [2, 1]
 
 -- ---------------------------------------------------------------------------
 -- The close protocol

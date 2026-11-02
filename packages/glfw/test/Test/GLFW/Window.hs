@@ -18,7 +18,6 @@
 -- Threads are coordinated with 'MVar's, never with a sleep.
 module Test.GLFW.Window (spec) where
 
-import Control.Concurrent (forkOS)
 import Control.Concurrent.STM (STM, atomically, newTVarIO, readTVar, writeTVar)
 import Control.Exception
   ( AsyncException (ThreadKilled)
@@ -57,7 +56,7 @@ import Test.GLFW.Support
   , current
   , entered
   , contextsOf
-  , onThread
+  , onBoundThread
   , operationOf
   , originOf
   , stashed
@@ -519,8 +518,8 @@ testOwnerOnly = do
   (synchronizing, driving, callsBefore, callsAfter) ← asProcessMainThread seam $ entered seam $ \session →
     withWindow session (hiddenTestWindowConfig "owned" 64 48) $ \window → do
       callsBefore ← length <$> seamCalls seam
-      synchronizing ← onThread forkOS (fst <$> caughtAs (synchronizeWindow window))
-      driving ← onThread forkOS (fst <$> caughtAs (seamDrive seam window DuringSetter [RefreshRequested]))
+      synchronizing ← onBoundThread (fst <$> caughtAs (synchronizeWindow window))
+      driving ← onBoundThread (fst <$> caughtAs (seamDrive seam window DuringSetter [RefreshRequested]))
       callsAfter ← length <$> seamCalls seam
       pure (synchronizing, driving, callsBefore, callsAfter)
   synchronizing `shouldBe` NotSessionOwner

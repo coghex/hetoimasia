@@ -516,7 +516,7 @@ testNativeCheck = do
               writeIORef answer True
               before ← readIORef calls
               ended ← requestNativeCloseWith driver host unserved
-              (offOwner, _) ← onThread forkIO . caughtAs $ requestNativeCloseWith driver host identity
+              (offOwner, _) ← onThread . caughtAs $ requestNativeCloseWith driver host identity
               driven ← (,) before <$> readIORef calls
               pure (Finish (held, withdrawn, ended, offOwner, driven))
           }
@@ -544,7 +544,7 @@ testOwnerNeverWaits = do
               (awaitMisuse, _) ← caughtAs (awaitCompletion ticket)
               (submitMisuse, _) ← caughtAs (awaitSubmitWindowCommand port [] (observeOf window))
               (offOwner, _) ←
-                onThread forkIO . caughtAs $
+                onThread . caughtAs $
                   runOwnerLoop host control (LoopHooks quietLogger noApplicationEvents (\_ → pure (Finish ())))
               pure (Finish (awaitMisuse, submitMisuse, offOwner))
           }

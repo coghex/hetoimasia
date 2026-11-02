@@ -10,7 +10,7 @@
 -- 'MVar's, STM, and the runtime's own report of what a thread is blocked on.
 module Test.GLFW.Notify (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, throwTo, yield)
+import Control.Concurrent (ThreadId, killThread, throwTo, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
   ( TVar
@@ -52,9 +52,10 @@ import Hetoimasia.GLFW.Internal.Session (sessionWakePath)
 import Hetoimasia.GLFW.Internal.Window (EventProcessing (..), processWindowEvents)
 import Hetoimasia.GLFW.Session
 import Hetoimasia.GLFW.Window
-import Test.GLFW.Support (boundedExample, caughtAs, entered, unexpected)
+import Test.GLFW.Support (boundedExample, caughtAs, entered, onThread, unexpected)
 import Numeric.Natural (Natural)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = do
@@ -127,11 +128,14 @@ testAdmissionWakesAroundWait = do
         -- and the wait returns on that post.
         around DuringTheWait operation kind = do
           admitted' ← newEmptyMVar
-          _ ← forkIO $ do
-            atomically (readTVar (platformWaiting platform) >>= check)
-            try (admit operation kind) >>= putMVar admitted'
-          processWindowEvents session (AwaitEventsFor 1)
-          takeMVar admitted' >>= either (throwIO ∷ SomeException → IO a) pure
+          withOwnedThread
+            ( do
+                atomically (readTVar (platformWaiting platform) >>= check)
+                try (admit operation kind) >>= putMVar admitted'
+            )
+            $ \_ _ → do
+            processWindowEvents session (AwaitEventsFor 1)
+            takeMVar admitted' >>= either (throwIO ∷ SomeException → IO a) pure
         -- Outside any wait, each still posts.
         around AfterTheWait operation kind = onWorker (admit operation kind)
 
@@ -202,15 +206,18 @@ testCancelledBeforeCommit = do
     held ← newEmptyMVar
     entered' ← newEmptyMVar
     outcome ← newEmptyMVar
-    submitter ← forkIO $ do
-      let hooks = noAdmissionHooks {beforeAdmission = putMVar entered' () >> takeMVar held}
-      try (submitWith hooks (windowCommandPort hostCommands) [] (observeOf window)) >>= putMVar outcome
-    takeMVar entered'
-    killThread submitter
-    cancelled ← takeMVar outcome
-    cancelled `shouldSatisfy` cancellation
-    settleHost hostCommands
-    posts seam `shouldReturn` 0
+    withOwnedThread
+      ( do
+          let hooks = noAdmissionHooks {beforeAdmission = putMVar entered' () >> takeMVar held}
+          try (submitWith hooks (windowCommandPort hostCommands) [] (observeOf window)) >>= putMVar outcome
+      )
+      $ \submitter _ → do
+      takeMVar entered'
+      killThread submitter
+      cancelled ← takeMVar outcome
+      cancelled `shouldSatisfy` cancellation
+      settleHost hostCommands
+      posts seam `shouldReturn` 0
 
 testCancelledAfterCommit ∷ Expectation
 testCancelledAfterCommit = do
@@ -222,28 +229,31 @@ testCancelledAfterCommit = do
     -- The hook runs inside the protection the admission owes its wake, so the
     -- cancellation requested while it is held cannot be delivered until the
     -- wake has been posted.
-    submitter ← forkIO $ do
-      let hooks = noAdmissionHooks {afterAdmission = putMVar committed () >> takeMVar release}
-      try (submitWith hooks (windowCommandPort hostCommands) [] (observeOf window)) >>= putMVar outcome
-    takeMVar committed
-    _ ← forkIO (throwTo submitter ThreadKilled)
-    queuedWhileHeld ← atomically (commandsQueued <$> commandStatistics hostCommands)
-    postsWhileHeld ← countPosts seam
-    putMVar release ()
-    cancelled ← takeMVar outcome
-    cancelled `shouldSatisfy` cancellation
-    queuedWhileHeld `shouldBe` 1
-    postsWhileHeld `shouldBe` 0
-    -- The wake happened after the cancellation was requested, and the command,
-    -- whose ticket its submitter never received, still settles exactly once.
-    posts seam `shouldReturn` 1
-    step ← seamExecuteNext seam hostCommands [window]
-    step `shouldSatisfy` \case
-      Executed _ (Performed (ObservationPublished _ _)) → True
-      _ → False
-    again ← seamExecuteNext seam hostCommands [window]
-    again `shouldBe` NothingQueued
-    settleHost hostCommands
+    withOwnedThread
+      ( do
+          let hooks = noAdmissionHooks {afterAdmission = putMVar committed () >> takeMVar release}
+          try (submitWith hooks (windowCommandPort hostCommands) [] (observeOf window)) >>= putMVar outcome
+      )
+      $ \submitter _ → do
+      takeMVar committed
+      withOwnedThread (throwTo submitter ThreadKilled) $ \_ _ → do
+        queuedWhileHeld ← atomically (commandsQueued <$> commandStatistics hostCommands)
+        postsWhileHeld ← countPosts seam
+        putMVar release ()
+        cancelled ← takeMVar outcome
+        cancelled `shouldSatisfy` cancellation
+        queuedWhileHeld `shouldBe` 1
+        postsWhileHeld `shouldBe` 0
+        -- The wake happened after the cancellation was requested, and the command,
+        -- whose ticket its submitter never received, still settles exactly once.
+        posts seam `shouldReturn` 1
+        step ← seamExecuteNext seam hostCommands [window]
+        step `shouldSatisfy` \case
+          Executed _ (Performed (ObservationPublished _ _)) → True
+          _ → False
+        again ← seamExecuteNext seam hostCommands [window]
+        again `shouldBe` NothingQueued
+        settleHost hostCommands
 
 -- | The waiting admission owes its wake from its commit onward exactly as the
 -- immediate one does, and its own wait for capacity stays cancellable.
@@ -254,21 +264,24 @@ testWaitedAdmissionCancelledAfterCommit = do
     committed ← newEmptyMVar
     release ← newEmptyMVar
     outcome ← newEmptyMVar
-    submitter ← forkIO $ do
-      let hooks = noAdmissionHooks {afterAdmission = putMVar committed () >> takeMVar release}
-      try (awaitSubmitWith hooks (windowCommandPort windowCommands) [] (observeOf window)) >>= putMVar outcome
-    takeMVar committed
-    _ ← forkIO (throwTo submitter ThreadKilled)
-    postsWhileHeld ← countPosts seam
-    putMVar release ()
-    takeMVar outcome >>= (`shouldSatisfy` cancellation)
-    postsWhileHeld `shouldBe` 0
-    posts seam `shouldReturn` 1
-    step ← seamExecuteNext seam windowCommands [window]
-    step `shouldSatisfy` \case
-      Executed _ (Performed (ObservationPublished _ _)) → True
-      _ → False
-    settleHost windowCommands
+    withOwnedThread
+      ( do
+          let hooks = noAdmissionHooks {afterAdmission = putMVar committed () >> takeMVar release}
+          try (awaitSubmitWith hooks (windowCommandPort windowCommands) [] (observeOf window)) >>= putMVar outcome
+      )
+      $ \submitter _ → do
+      takeMVar committed
+      withOwnedThread (throwTo submitter ThreadKilled) $ \_ _ → do
+        postsWhileHeld ← countPosts seam
+        putMVar release ()
+        takeMVar outcome >>= (`shouldSatisfy` cancellation)
+        postsWhileHeld `shouldBe` 0
+        posts seam `shouldReturn` 1
+        step ← seamExecuteNext seam windowCommands [window]
+        step `shouldSatisfy` \case
+          Executed _ (Performed (ObservationPublished _ _)) → True
+          _ → False
+        settleHost windowCommands
 
 -- | A cancellation delivered while a waiter is blocked for capacity, racing the
 -- capacity that would admit it. Both outcomes are correct; what must hold either
@@ -285,31 +298,31 @@ testCancellationRacesCapacity = do
           -- One command fills the capacity, so the next waiter blocks.
           _ ← submitWindowCommand port [] command >>= accepted
           outcome ← newEmptyMVar
-          waiter ← forkIO (try (awaitSubmitWindowCommand port [] command) >>= putMVar outcome)
-          awaitBlockedOnSTM waiter
-          before ← countPosts seam
-          -- The cancellation and the capacity that would admit the waiter are
-          -- requested together, so neither order is scripted.
-          _ ← forkIO (throwTo waiter ThreadKilled)
-          _ ← seamExecuteNext seam hostCommands [window]
-          settled ← takeMVar outcome
-          after ← countPosts seam
-          -- Whether the admission committed is the host's bookkeeping, not the
-          -- waiter's answer: a cancellation delivered as the masked admission
-          -- returns keeps its command and its wake while the caller still sees
-          -- the cancellation.
-          statistics ← atomically (commandStatistics hostCommands)
-          let admitted = commandsPending statistics > 0
-          after `shouldBe` before + (if admitted then 1 else 0)
-          case settled of
-            Right (WaitAccepted _) → admitted `shouldBe` True
-            Right WaitClosed → unexpected "the port closed unexpectedly"
-            Left caught
-              | fromException caught == Just ThreadKilled → pure ()
-            Left caught → unexpected ("the waiter failed with " <> show caught)
-          -- Leave the port empty for the next round.
-          drainCommands seam hostCommands window
-          pure admitted
+          withOwnedThread (try (awaitSubmitWindowCommand port [] command) >>= putMVar outcome) $ \waiter _ → do
+            awaitBlockedOnSTM waiter
+            before ← countPosts seam
+            -- The cancellation and the capacity that would admit the waiter are
+            -- requested together, so neither order is scripted.
+            withOwnedThread (throwTo waiter ThreadKilled) $ \_ _ → do
+              _ ← seamExecuteNext seam hostCommands [window]
+              settled ← takeMVar outcome
+              after ← countPosts seam
+              -- Whether the admission committed is the host's bookkeeping, not the
+              -- waiter's answer: a cancellation delivered as the masked admission
+              -- returns keeps its command and its wake while the caller still sees
+              -- the cancellation.
+              statistics ← atomically (commandStatistics hostCommands)
+              let admitted = commandsPending statistics > 0
+              after `shouldBe` before + (if admitted then 1 else 0)
+              case settled of
+                Right (WaitAccepted _) → admitted `shouldBe` True
+                Right WaitClosed → unexpected "the port closed unexpectedly"
+                Left caught
+                  | fromException caught == Just ThreadKilled → pure ()
+                Left caught → unexpected ("the waiter failed with " <> show caught)
+              -- Leave the port empty for the next round.
+              drainCommands seam hostCommands window
+              pure admitted
 
     rounds ← mapM (const oneRound) [1 .. 20 ∷ Int]
     -- Whatever the split between the two outcomes, every round held the
@@ -397,30 +410,33 @@ testCaptureRacesPublication = do
     reached ← newEmptyMVar
     resume ← newEmptyMVar
     finished ← newEmptyMVar
-    _ ← forkIO $ do
-      outcomes ← forM [1 .. rounds] $ \index → do
-        outcome ← publishDemand publisher (deadlineDemand (instantAt index))
-        when (index == half) (putMVar reached () >> takeMVar resume)
-        pure outcome
-      putMVar finished outcomes
-    -- Publication before capture: half the revisions are pending, and half are
-    -- still to be published.
-    takeMVar reached
-    halfway ← atomically (captureDemand slot)
-    -- Capture before publication: the slot it just cleared is empty, and the
-    -- publisher is still holding its next publication.
-    emptyAfterCapture ← atomically (captureDemand slot)
-    putMVar resume ()
-    let capture taken
-          | any ((== fromIntegral rounds) . capturedRevision) taken = pure (reverse taken)
-          | otherwise =
-              atomically (captureDemand slot) >>= \case
-                Just captured → capture (captured : taken)
-                Nothing → yield >> capture taken
-    rest ← capture []
-    published ← takeMVar finished
-    afterwards ← atomically (captureDemand slot)
-    pure (published, halfway, emptyAfterCapture, rest, afterwards)
+    withOwnedThread
+      ( do
+          outcomes ← forM [1 .. rounds] $ \index → do
+            outcome ← publishDemand publisher (deadlineDemand (instantAt index))
+            when (index == half) (putMVar reached () >> takeMVar resume)
+            pure outcome
+          putMVar finished outcomes
+      )
+      $ \_ _ → do
+      -- Publication before capture: half the revisions are pending, and half are
+      -- still to be published.
+      takeMVar reached
+      halfway ← atomically (captureDemand slot)
+      -- Capture before publication: the slot it just cleared is empty, and the
+      -- publisher is still holding its next publication.
+      emptyAfterCapture ← atomically (captureDemand slot)
+      putMVar resume ()
+      let capture taken
+            | any ((== fromIntegral rounds) . capturedRevision) taken = pure (reverse taken)
+            | otherwise =
+                atomically (captureDemand slot) >>= \case
+                  Just captured → capture (captured : taken)
+                  Nothing → yield >> capture taken
+      rest ← capture []
+      published ← takeMVar finished
+      afterwards ← atomically (captureDemand slot)
+      pure (published, halfway, emptyAfterCapture, rest, afterwards)
   map acceptedRevision published `shouldBe` [1 .. 50]
   -- The first capture took the twenty-five revisions published so far,
   -- coalesced, with the earliest deadline among them.
@@ -464,35 +480,41 @@ testPublicationCancellation = do
     entered' ← newEmptyMVar
     held ← newEmptyMVar
     beforeOutcome ← newEmptyMVar
-    early ← forkIO $ do
-      let hooks = noDemandHooks {beforePublication = putMVar entered' () >> takeMVar held}
-      try (publishDemandWith hooks publisher immediateDemand) >>= putMVar beforeOutcome
-    takeMVar entered'
-    killThread early
-    takeMVar beforeOutcome >>= (`shouldSatisfy` cancellation)
-    atomically (demandStatus slot) >>= \status → statusPending status `shouldBe` Nothing
-    posts seam `shouldReturn` 0
+    withOwnedThread
+      ( do
+          let hooks = noDemandHooks {beforePublication = putMVar entered' () >> takeMVar held}
+          try (publishDemandWith hooks publisher immediateDemand) >>= putMVar beforeOutcome
+      )
+      $ \early _ → do
+      takeMVar entered'
+      killThread early
+      takeMVar beforeOutcome >>= (`shouldSatisfy` cancellation)
+      atomically (demandStatus slot) >>= \status → statusPending status `shouldBe` Nothing
+      posts seam `shouldReturn` 0
 
-    -- Cancelled after the commit: the request stays pending and is woken.
-    committed ← newEmptyMVar
-    release ← newEmptyMVar
-    afterOutcome ← newEmptyMVar
-    late ← forkIO $ do
-      let hooks = noDemandHooks {afterPublication = putMVar committed () >> takeMVar release}
-      try (publishDemandWith hooks publisher (deadlineDemand (instantAt 42))) >>= putMVar afterOutcome
-    takeMVar committed
-    _ ← forkIO (throwTo late ThreadKilled)
-    heldStatus ← atomically (demandStatus slot)
-    postsWhileHeld ← countPosts seam
-    putMVar release ()
-    takeMVar afterOutcome >>= (`shouldSatisfy` cancellation)
-    statusPending heldStatus `shouldSatisfy` \case
-      Just request → demandDeadline request == Just (instantAt 42)
-      Nothing → False
-    postsWhileHeld `shouldBe` 0
-    posts seam `shouldReturn` 1
-    captured ← atomically (captureDemand slot)
-    fmap capturedRevision captured `shouldBe` Just 1
+      -- Cancelled after the commit: the request stays pending and is woken.
+      committed ← newEmptyMVar
+      release ← newEmptyMVar
+      afterOutcome ← newEmptyMVar
+      withOwnedThread
+        ( do
+            let hooks = noDemandHooks {afterPublication = putMVar committed () >> takeMVar release}
+            try (publishDemandWith hooks publisher (deadlineDemand (instantAt 42))) >>= putMVar afterOutcome
+        )
+        $ \late _ → do
+        takeMVar committed
+        withOwnedThread (throwTo late ThreadKilled) $ \_ _ → do
+          heldStatus ← atomically (demandStatus slot)
+          postsWhileHeld ← countPosts seam
+          putMVar release ()
+          takeMVar afterOutcome >>= (`shouldSatisfy` cancellation)
+          statusPending heldStatus `shouldSatisfy` \case
+            Just request → demandDeadline request == Just (instantAt 42)
+            Nothing → False
+          postsWhileHeld `shouldBe` 0
+          posts seam `shouldReturn` 1
+          captured ← atomically (captureDemand slot)
+          fmap capturedRevision captured `shouldBe` Just 1
 
 -- ---------------------------------------------------------------------------
 -- Degradation
@@ -654,18 +676,18 @@ testOverlappingFailuresDegradeOnce = do
   (submissions, path, first, second, afterwards) ← withPorts seam $ \session hostCommands _ window → do
     let port = windowCommandPort hostCommands
         command = observeOf window
-    outcomes ← mapM (const (forkResult (submitWindowCommand port [] command))) [1 .. 2 ∷ Int]
-    atomically (readTVar inside >>= check . (== 2))
-    atomically (writeTVar released True)
-    submissions ← mapM awaitResult outcomes
-    path ← readTVarIO (sessionWakePath session)
-    let notifier = commandHostNotifier hostCommands
-    first ← attemptDegradationReport (recording entries) notifier
-    second ← attemptDegradationReport (recording entries) notifier
-    -- A third admission over the degraded path enters nothing.
-    afterwards ← submitWindowCommand port [] command
-    settleHost hostCommands
-    pure (submissions, path, first, second, afterwards)
+    withForkResults (replicate 2 (submitWindowCommand port [] command)) $ \outcomes → do
+      atomically (readTVar inside >>= check . (== 2))
+      atomically (writeTVar released True)
+      submissions ← mapM awaitResult outcomes
+      path ← readTVarIO (sessionWakePath session)
+      let notifier = commandHostNotifier hostCommands
+      first ← attemptDegradationReport (recording entries) notifier
+      second ← attemptDegradationReport (recording entries) notifier
+      -- A third admission over the degraded path enters nothing.
+      afterwards ← submitWindowCommand port [] command
+      settleHost hostCommands
+      pure (submissions, path, first, second, afterwards)
   map accepting submissions `shouldBe` [True, True]
   accepting afterwards `shouldBe` True
   -- Both calls entered the library, and exactly one degradation was recorded,
@@ -759,27 +781,35 @@ admittedWaited other = unexpected ("the waiting submission was not admitted: " <
 
 -- | Start every action on its own unbound thread, hold them at one gate, and
 -- release them together, so they run concurrently rather than in sequence.
+--
+-- Every thread is owned (#593): however the scope ends, a thread still held at the gate or in its action has been stopped and
+-- joined before it returns. The wait for the outcomes is still the example's own.
 concurrently ∷ [IO a] → IO [a]
 concurrently actions = do
   gate ← newTVarIO False
   ready ← newTVarIO (0 ∷ Int)
-  waiting ← forM actions $ \action → do
-    outcome ← newEmptyMVar
-    _ ← forkIO $ do
-      atomically (modifyTVar' ready (+ 1))
-      atomically (readTVar gate >>= check)
-      try action >>= putMVar outcome
-    pure outcome
-  atomically (readTVar ready >>= check . (== length actions))
-  atomically (writeTVar gate True)
-  mapM awaitResult waiting
+  let start [] waiting = do
+        atomically (readTVar ready >>= check . (== length actions))
+        atomically (writeTVar gate True)
+        mapM awaitResult (reverse waiting)
+      start (action : rest) waiting = do
+        outcome ← newEmptyMVar
+        withOwnedThread
+          ( do
+              atomically (modifyTVar' ready (+ 1))
+              atomically (readTVar gate >>= check)
+              try action >>= putMVar outcome
+          )
+          $ \_ _ → start rest (outcome : waiting)
+  start actions []
 
--- | Run an action on a new, unbound thread and hand back its outcome.
-forkResult ∷ IO a → IO (MVar (Either SomeException a))
-forkResult action = do
+-- | Run each action on its own new, unbound, owned thread and hand the body the cells their outcomes are put into (#593). The
+-- body waits for them itself; however it ends, every thread has been stopped and joined before this returns.
+withForkResults ∷ [IO a] → ([MVar (Either SomeException a)] → IO r) → IO r
+withForkResults [] body = body []
+withForkResults (action : rest) body = do
   outcome ← newEmptyMVar
-  _ ← forkIO (try action >>= putMVar outcome)
-  pure outcome
+  withOwnedThread (try action >>= putMVar outcome) $ \_ _ → withForkResults rest (\others → body (outcome : others))
 
 awaitResult ∷ MVar (Either SomeException a) → IO a
 awaitResult outcome = takeMVar outcome >>= either (throwIO ∷ SomeException → IO a) pure
@@ -823,13 +853,9 @@ settleHost host = do
   statistics ← atomically (commandStatistics host)
   (commandsQueued statistics, commandsPending statistics) `shouldBe` (0, 0)
 
--- | Run an action on a new, unbound thread, which is never the owner, and wait
--- for its outcome.
+-- | Run an action on a new, unbound, owned thread, which is never the owner, and wait for its outcome.
 onWorker ∷ IO a → IO a
-onWorker action = do
-  finished ← newEmptyMVar
-  _ ← forkIO (try action >>= putMVar finished)
-  takeMVar finished >>= either (throwIO ∷ SomeException → IO a) pure
+onWorker = onThread
 
 cancellation ∷ Either SomeException a → Bool
 cancellation (Left caught) = fromException caught == Just ThreadKilled
