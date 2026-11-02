@@ -17,7 +17,7 @@
 # `build` compiles the named components, and nothing else, then records the
 # build identity of each executable they resolve to: the source digest and the
 # revision of the tree the build started from, in the form `native` prints, in
-# `native-identity/` inside the build directory (tools/vulkan/build_identity.py).
+# `native-identity/` inside the build directory (`build_identity`, below).
 # The record is bound to the executable by its content, path and variant, and is
 # not among the digest's inputs. Building `run-native-tests` also records the
 # full-product `hetoimasia` executable it launches, even when only the suite is
@@ -43,7 +43,8 @@
 # `source digest`) and exports for the executable to record is the identity the
 # executable's own build recorded, never the tree as it is now: it refuses, with
 # status 2 and the command that prepares the component, an executable whose
-# record is missing, malformed, made for another executable or variant, or built
+# record is missing, malformed, made for another executable (or the same one in
+# the other build directory), or built
 # from a tree whose digest is not the current one, and a caller-set
 # `HETOIMASIA_VULKAN_REVISION` that disagrees with the record. For
 # `run-native-tests` the `hetoimasia` executable it launches must satisfy the same
@@ -358,13 +359,189 @@ source_revision() {
   printf '%s\n' "$revision"
 }
 
+# The build identity `tools/vulkan/run.sh build` stamps and `run.sh native` reads.
+#
+# An executable built earlier is run later, by a command that builds nothing. What
+# that run reports as its provenance must describe the executable, not the source
+# tree at run time, so the build records, beside the executable, the revision and
+# source digest of the tree it built from, and the run reads them back.
+#
+# A stamp is bound to the executable it was made for by that executable's own
+# content (SHA-256) and its path, which names the component and the build directory
+# (each build variant has its own), so it is refused rather than trusted when it is
+# missing, incomplete, malformed, copied from another build or another component,
+# or left behind by an executable that has since been replaced.
+#
+#     build_identity record --directory DIR --executable PATH
+#                              --revision TEXT --digest HEX
+#     build_identity verify --directory DIR --executable PATH
+#
+# `record` writes the stamp atomically (a temporary file in DIR renamed over the
+# stamp), and exits 1 with a one-line diagnostic when it cannot. `verify` prints
+# the recorded revision and digest, one per line, and exits 0; otherwise it prints
+# one line saying why the identity cannot be trusted and exits 1. Neither reads
+# the source tree: the digest is computed by `run.sh`, which compares it.
+#
+# Ownership: a stamp is written by `run.sh build` in the build directory's
+# `native-identity` directory, read by `run.sh native`, and removed with the build
+# directory it lives in. Nothing else writes it, and no state outlives one call.
+build_identity() {
+  python3 -I - "$@" <<'IDENTITY'
+import argparse
+import hashlib
+import os
+import re
+import sys
+import tempfile
+
+FORMAT = "hetoimasia-native-identity 1"
+HEX = re.compile(r"[0-9a-f]{64}\Z")
+# A commit id, optionally dirty, or the word the runner uses outside a checkout.
+REVISION = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})(?: \(dirty\))?\Z|unknown\Z")
+CHUNK = 1 << 20
+
+
+def sha256_of(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(CHUNK)
+            if not block:
+                return digest.hexdigest()
+            digest.update(block)
+
+
+def stamp_path(directory, executable):
+    """One stamp per executable path, named so two components never share one."""
+    key = hashlib.sha256(executable.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(directory, os.path.basename(executable) + "-" + key + ".stamp")
+
+
+def render(executable, executable_sha256, revision, digest):
+    return "\n".join([
+        FORMAT,
+        "executable " + executable,
+        "sha256 " + executable_sha256,
+        "revision " + revision,
+        "digest " + digest,
+        "end",
+    ]) + "\n"
+
+
+def parse(text):
+    """The stamp's fields, or the reason it is not a complete, well-formed one."""
+    if not text.endswith("\n"):
+        return None, "it is truncated"
+    lines = text[:-1].split("\n")
+    expected = ["", "executable ", "sha256 ", "revision ", "digest ", "end"]
+    if lines[:1] != [FORMAT]:
+        return None, "it is not a build identity of this format"
+    if len(lines) != len(expected):
+        return None, "it is incomplete or has extra lines"
+    values = {}
+    for line, prefix in zip(lines[1:], expected[1:]):
+        if prefix == "end":
+            if line != "end":
+                return None, "it has no end marker"
+            continue
+        if not line.startswith(prefix) or len(line) == len(prefix):
+            return None, "its '%s' field is absent or empty" % prefix.strip()
+        values[prefix.strip()] = line[len(prefix):]
+    if not HEX.match(values["sha256"]):
+        return None, "its executable hash is malformed"
+    if not REVISION.match(values["revision"]):
+        return None, "its revision is malformed"
+    if not HEX.match(values["digest"]):
+        return None, "its source digest is malformed"
+    return values, None
+
+
+def record(arguments):
+    executable = os.path.abspath(arguments.executable)
+    if not os.path.isfile(executable):
+        return fail("%s is not a file" % executable)
+    if "\n" in executable:
+        return fail("the executable's path contains a newline")
+    if not REVISION.match(arguments.revision):
+        return fail("revision %r is malformed" % arguments.revision)
+    if not HEX.match(arguments.digest):
+        return fail("source digest %r is malformed" % arguments.digest)
+    text = render(executable, sha256_of(executable), arguments.revision, arguments.digest)
+    target = stamp_path(arguments.directory, executable)
+    descriptor, temporary = tempfile.mkstemp(dir=arguments.directory, prefix=".stamp-")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(temporary, target)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    return 0
+
+
+def verify(arguments):
+    executable = os.path.abspath(arguments.executable)
+    target = stamp_path(arguments.directory, executable)
+    try:
+        with open(target, "r", encoding="utf-8", errors="strict", newline="") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        return fail("it has no recorded build identity")
+    except (OSError, UnicodeDecodeError) as error:
+        return fail("its recorded build identity cannot be read (%s)" % error)
+    values, reason = parse(text)
+    if values is None:
+        return fail("its recorded build identity is unusable: %s" % reason)
+    if values["executable"] != executable:
+        return fail("its recorded build identity was made for %s" % values["executable"])
+    try:
+        actual = sha256_of(executable)
+    except OSError as error:
+        return fail("the executable cannot be read (%s)" % error)
+    if values["sha256"] != actual:
+        return fail("the executable is not the one its recorded build identity was made for (it was replaced after that build)")
+    sys.stdout.write(values["revision"] + "\n" + values["digest"] + "\n")
+    return 0
+
+
+def fail(message):
+    sys.stdout.write(message + "\n")
+    return 1
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="run.sh build identity")
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("record", "verify"):
+        command = commands.add_parser(name)
+        command.add_argument("--directory", required=True)
+        command.add_argument("--executable", required=True)
+        if name == "record":
+            command.add_argument("--revision", required=True)
+            command.add_argument("--digest", required=True)
+    arguments = parser.parse_args(argv)
+    if arguments.command == "record":
+        try:
+            os.makedirs(arguments.directory, exist_ok=True)
+            return record(arguments)
+        except OSError as error:
+            return fail(str(error))
+    return verify(arguments)
+
+
+sys.exit(main(sys.argv[1:]))
+IDENTITY
+}
+
 # The build identity of each executable `build` produces, recorded where
-# `native` reads it back (tools/vulkan/build_identity.py). It lives in the build
+# `native` reads it back (`build_identity`). It lives in the build
 # directory — `dist-vulkan/` is a declared generated path and is ignored by Git,
 # so the validation runner and `git status` see nothing new — and it is not
 # among the source digest's inputs.
 identity_directory="$build_directory/native-identity"
-identity_tool="$root/tools/vulkan/build_identity.py"
 
 # The command that prepares a component, for a refusal to name: with the
 # variant's choice when it is not the default.
@@ -423,8 +600,8 @@ stamp_build() {
     index=$((index + 1))
     case "$seen" in *" $path "*) continue ;; esac
     seen="$seen$path "
-    if ! recorded="$(python3 -I "$identity_tool" record --directory "$identity_directory" --executable "$path" \
-      --variant "$vma_calls" --revision "$started_revision" --digest "$started_digest")"; then
+    if ! recorded="$(build_identity record --directory "$identity_directory" --executable "$path" \
+      --revision "$started_revision" --digest "$started_digest")"; then
       echo "vulkan: cannot record the build identity of $label: $recorded" >&2
       status=1
     fi
@@ -438,7 +615,7 @@ stamp_build() {
 # the tree as it is now.
 read_identity() {
   local label="$1" path="$2" prepare="$3" verified status=0
-  verified="$(python3 -I "$identity_tool" verify --directory "$identity_directory" --executable "$path" --variant "$vma_calls")" || status=$?
+  verified="$(build_identity verify --directory "$identity_directory" --executable "$path")" || status=$?
   [ "$status" -eq 0 ] \
     || refuse "$label cannot be run: ${verified:-its recorded build identity could not be read}; prepare it with: $prepare"
   recorded_revision="${verified%%$'\n'*}"

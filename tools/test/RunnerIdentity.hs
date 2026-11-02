@@ -4,7 +4,7 @@
 -- @native@ runs an executable that was built earlier and builds nothing, so the
 -- provenance it prints, and exports for the executable to record, must describe
 -- that executable and not the source tree at run time. These examples run the
--- real @run.sh@ and @build_identity.py@ in a checkout of their own, with
+-- real @run.sh@ in a checkout of their own, with
 -- stand-ins for what they call: @cabal@ (@build@ writes executables whose bytes
 -- follow the source, @list-bin@ names them), @uname@, the isolated display, the
 -- X11 evidence helper, the prefix discovery and the toolchain. The checkout is a
@@ -113,7 +113,7 @@ data Outcome = Outcome
   , outcomeErr ∷ String
   }
 
--- | A Git checkout holding the real runner and its helper, and stand-ins for
+-- | A Git checkout holding the real runner, and stand-ins for
 -- everything else, with one commit.
 withNative ∷ (Native → IO a) → IO a
 withNative action = do
@@ -128,8 +128,7 @@ withNative action = do
           permissions ← getPermissions (root </> relative)
           setPermissions (root </> relative) (setOwnerExecutable True permissions)
     createDirectoryIfMissing True (root </> "tools/vulkan")
-    forM_ ["run.sh", "build_identity.py"] $ \file →
-      copyFile (checkout </> "tools/vulkan" </> file) (root </> "tools/vulkan" </> file)
+    copyFile (checkout </> runScript) (root </> runScript)
     put "tools/ci-image/toolchain.pin" "GHC_VERSION=9.14.1\nCABAL_VERSION=3.18.1.0\n"
     put "tools/toolchain/binding.pin" "VULKAN_FLAG_SAFE_FOREIGN_CALLS=on\nVULKAN_FLAG_DARWIN_LIB_DIRS=off\n"
     put "cabal.project.vulkan" "constraints:\n    vulkan +safe-foreign-calls,\n    vulkan -darwin-lib-dirs\n"
@@ -597,6 +596,16 @@ refusalSpec = describe "a recorded identity that cannot be trusted" $ do
       -- The component the stamp was copied from is still good.
       other ← runNative native [] otherSuite
       outcomeStatus other `shouldBe` ExitFailure 7
+
+  it "is refused when the stamp and the executable were both copied from another component, so that only the path the stamp was made for tells them apart" $
+    withNative $ \native → do
+      built native [] [suite, otherSuite]
+      mine ← stampOf native "dist-vulkan" "vulkan-native-tests"
+      theirs ← stampOf native "dist-vulkan" "lua-engine-graphics-native-tests"
+      copyFile theirs mine
+      copyFile (nativeRoot native </> "dist-vulkan/bin/lua-engine-graphics-native-tests") (nativeRoot native </> "dist-vulkan/bin/vulkan-native-tests")
+      outcome ← runNative native [] suite
+      refusedBeforeAnythingStarts native outcome [suite, "bash tools/vulkan/run.sh build " ++ suite, "was made for"]
 
   it "is refused when the stamp was copied from the build of the same component in the other build directory, and the reverse" $
     withNative $ \native → do

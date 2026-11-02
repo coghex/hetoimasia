@@ -121,7 +121,6 @@ readByTheseExamples =
   , "tools/toolchain/binding.pin"
   , "tools/validation/catalog.json"
   , runner
-  , "tools/vulkan/build_identity.py"
   , retiredProof </> "README.md"
   , nativePackage </> "hetoimasia-gpu-vulkan-native.cabal"
   , integrationPackage </> "hetoimasia-gpu-vulkan-glfw.cabal"
