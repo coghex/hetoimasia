@@ -10,7 +10,7 @@
 -- 'boundedExample' only stops an example that has already hung.
 module Test.Foundation.Recovery.Spec (spec) where
 
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Exception
   ( AsyncException (ThreadKilled)
@@ -76,6 +76,7 @@ import Test.Hspec
   , shouldBe
   , shouldReturn
   )
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = describe "Recovery" $ do
@@ -253,15 +254,15 @@ cancelledScenario scenario = do
   never ← newEmptyMVar
   result ← newEmptyMVar
   let blocked = annotateIO (Marker "blocked") (putMVar entered () >> takeMVar never)
-  worker ← forkIO (tryWithContext (scenario blocked) >>= putMVar result)
-  takeMVar entered
-  killThread worker
-  outcome ← takeMVar result
-  -- Keeps the blocking slot reachable until the cancellation was observed.
-  void (tryPutMVar never ())
-  case outcome of
-    Left caught → pure caught
-    Right _ → fail "expected the scenario to be cancelled, but it returned"
+  withOwnedThread (tryWithContext (scenario blocked) >>= putMVar result) $ \worker _ → do
+    takeMVar entered
+    killThread worker
+    outcome ← takeMVar result
+    -- Keeps the blocking slot reachable until the cancellation was observed.
+    void (tryPutMVar never ())
+    case outcome of
+      Left caught → pure caught
+      Right _ → fail "expected the scenario to be cancelled, but it returned"
 
 -- | What every escaped cancellation must look like: itself, with its delivery
 -- context, and with nothing recovery-related added.

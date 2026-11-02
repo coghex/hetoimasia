@@ -10,7 +10,7 @@
 -- stops an example that has already hung.
 module Test.Runtime.Lifetime (spec) where
 
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (killThread)
 import Control.Concurrent.MVar
   ( MVar
   , modifyMVar_
@@ -114,6 +114,7 @@ import Test.Hspec
   , shouldBe
   , shouldReturn
   )
+import Test.Support.Owned (withOwnedThread)
 import Test.Support.Bounded (bounded)
 
 spec ∷ Spec
@@ -218,10 +219,10 @@ blockedAt entered held = do
 cancelledLifetime ∷ Logger → (LoggingLifetime → IO ()) → MVar () → IO (Either SomeException ())
 cancelledLifetime logger callback entered = do
   outcome ← newEmptyMVar
-  runner ← forkIO $ try (withLoggingLifetime logger callback) >>= putMVar outcome
-  takeMVar entered
-  killThread runner
-  takeMVar outcome
+  withOwnedThread (try (withLoggingLifetime logger callback) >>= putMVar outcome) $ \runner _ → do
+    takeMVar entered
+    killThread runner
+    takeMVar outcome
 
 cancelled ∷ Either SomeException () → Expectation
 cancelled (Right ()) = expectationFailure "the cancelled lifetime returned"
@@ -415,10 +416,10 @@ testOrdering = do
         (pure [])
         (withScoped resource $ \() → do
           joined ← newEmptyMVar
-          _ ← forkIO (logInfo scoped lifetimeComponent "produced" [] `finally` putMVar joined ())
-          takeMVar joined
-          note trace "producer joined"
-          throwIO workFailure)
+          withOwnedThread (logInfo scoped lifetimeComponent "produced" [] `finally` putMVar joined ()) $ \_ _ → do
+            takeMVar joined
+            note trace "producer joined"
+            throwIO workFailure)
         `finally` note trace "callback finished"
   (fromException propagated ∷ Maybe ErrorCall) `shouldBe` Just workFailure
   -- The flush follows the producer, the release, and the report, and no step

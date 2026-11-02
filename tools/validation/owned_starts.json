@@ -141,6 +141,18 @@
       "reason": "the repeated-run probe's one process start: created in one masked step, its owned set (the root, its tree and process group) taken once and stopped by pid (TERM, a grace, KILL) and reaped on a normal end, a bound and a cancellation, with its output in files"
     },
     {
+      "file": "packages/foundation/test/Test/Foundation/OwnedControl.hs",
+      "binding": "startUnowned",
+      "sites": 1,
+      "reason": "the negative controls' deliberately unowned start, which exists to be judged as a leak: the thread is recorded in the control's rescue list in the same masked step that starts it, and the rescue (registered before any thread is exposed) lets it go, stops it and joins it on every way out"
+    },
+    {
+      "file": "packages/runtime/test/Test/Runtime/OwnedControl.hs",
+      "binding": "startUnowned",
+      "sites": 1,
+      "reason": "the negative controls' deliberately unowned start, which exists to be judged as a leak: the thread is recorded in the control's rescue list in the same masked step that starts it, and the rescue (registered before any thread is exposed) lets it go, stops it and joins it on every way out"
+    },
+    {
       "file": "packages/gpu-vulkan/glfw/test/Test/GPU/Vulkan/GLFW/Bound.hs",
       "binding": "runBounded",
       "sites": 1,

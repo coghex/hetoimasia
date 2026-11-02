@@ -15,7 +15,7 @@
 -- a sleep. 'boundedExample' only stops an example that has already hung.
 module Test.Foundation.Resources.Spec (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, throwTo, yield)
+import Control.Concurrent (ThreadId, killThread, throwTo, yield)
 import Control.Concurrent.MVar
   ( MVar
   , modifyMVar_
@@ -24,6 +24,7 @@ import Control.Concurrent.MVar
   , putMVar
   , readMVar
   , takeMVar
+  , tryPutMVar
   )
 import Control.Exception
   ( AsyncException (ThreadKilled)
@@ -46,6 +47,7 @@ import Control.Exception
 import Control.Exception.Annotation (ExceptionAnnotation)
 import Control.Exception.Context (ExceptionContext, getExceptionAnnotations)
 import Control.Monad (void)
+import Data.Foldable (for_)
 import Control.Monad.IO.Class (liftIO)
 import Data.Text (Text)
 import GHC.Conc (BlockReason (BlockedOnException), ThreadStatus (..), threadStatus)
@@ -107,6 +109,18 @@ import Test.Hspec
   , shouldBe
   , shouldReturn
   )
+import Test.Foundation.OwnedControl
+  ( Probe (..)
+  , Scope
+  , endedAfterScope
+  , endings
+  , newProbe
+  , recordSelf
+  , runEnding
+  , unownedScope
+  , withRescue
+  )
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "Resources" $ do
@@ -287,6 +301,30 @@ spec = describe "Resources" $ do
   -- observable only by measuring, so its examples group separately.
   Cost.spec
 
+  -- The thread the examples above run a production scope on (#597): however the example that needed it ends, the thread has
+  -- ended and been joined, and with it the scope's release has run.
+  describe "The runner of a production scope (withOwnedThread around withResource)" $
+    for_ endings $ \(label, ending) → do
+      it ("has ended and been joined, its scope released, when the example " <> label) $ do
+        probe ← newProbe
+        releases ← newTrail
+        runEnding ownedRunner (scopeRunner releases) probe ending
+        endedAfterScope probe >>= (`shouldBe` True)
+        trail releases `shouldReturn` ["release"]
+
+      it ("negative control: the previous unowned start leaves the runner parked, its scope unreleased, when the example " <> label) $ do
+        probe ← newProbe
+        releases ← newTrail
+        withRescue $ \started → do
+          runEnding (unownedScope started) (scopeRunner releases) probe ending
+          -- The failed judgement is recorded before anything independent touches the runner.
+          judgement ← endedAfterScope probe
+          judgement `shouldBe` False
+          trail releases `shouldReturn` []
+        -- The rescue stopped and joined it, and its scope unwound.
+        endedAfterScope probe >>= (`shouldBe` True)
+        trail releases `shouldReturn` ["release"]
+
   -- The facade's opacity is a property of what the package exports rather than
   -- of a value, so it is asserted by compiling clients outside the package.
   Opacity.spec
@@ -296,6 +334,19 @@ spec = describe "Resources" $ do
   Visibility.spec
 
 -- Fixtures -------------------------------------------------------------------
+
+-- | The runner of a production scope the examples run on a thread: it says which thread it is, enters the scope, parks in its body
+-- at the probe's gate, and leaves with whatever the scope raised.
+scopeRunner ∷ Trail → Probe → IO ()
+scopeRunner releases probe = do
+  recordSelf probe
+  void . try @SomeException $
+    withResource (pure ()) (\_ → record releases "release") $ \_ →
+      putMVar (probeParked probe) () *> readMVar (probeGate probe)
+
+-- | 'withOwnedThread' as the scope the runner examples run: the body is given the runner's thread.
+ownedRunner ∷ Scope
+ownedRunner action body = withOwnedThread action (\thread _ → body thread)
 
 -- | A caller's own annotation, used to prove that an annotation attached below
 -- a scope is still directly reachable above it.
@@ -427,22 +478,25 @@ testCancellationPropagates = do
   entered ← newEmptyMVar
   blocker ← newEmptyMVar
   outcome ← newEmptyMVar
-  runner ← forkIO $ do
-    captured ←
-      try $
-        withResource
-          (pure ())
-          (\_ → record releases "release")
-          (\_ → putMVar entered () *> takeMVar blocker)
-    putMVar outcome (captured ∷ Either SomeException ())
-  takeMVar entered
-  killThread runner
-  captured ← takeMVar outcome
-  case captured of
-    Right () → expectationFailure "expected the cancellation to propagate"
-    Left propagated → do
-      asyncException propagated `shouldBe` Just ThreadKilled
-      trail releases `shouldReturn` ["release"]
+  withOwnedThread
+    ( do
+        captured ←
+          try $
+            withResource
+              (pure ())
+              (\_ → record releases "release")
+              (\_ → putMVar entered () *> takeMVar blocker)
+        putMVar outcome (captured ∷ Either SomeException ())
+    )
+    $ \runner _ → do
+      takeMVar entered
+      killThread runner
+      captured ← takeMVar outcome
+      case captured of
+        Right () → expectationFailure "expected the cancellation to propagate"
+        Left propagated → do
+          asyncException propagated `shouldBe` Just ThreadKilled
+          trail releases `shouldReturn` ["release"]
 
 testCleanupOnlyFailure ∷ Expectation
 testCleanupOnlyFailure = do
@@ -580,24 +634,27 @@ testAcquisitionCancellable = do
   reached ← newEmptyMVar
   blocker ← newEmptyMVar
   outcome ← newEmptyMVar
-  runner ← forkIO $ do
-    captured ←
-      try $
-        withResource
-          (putMVar reached () *> takeMVar blocker ∷ IO ())
-          (\_ → record releases "release")
-          (\_ → record bodies "body")
-    putMVar outcome (captured ∷ Either SomeException ())
-  takeMVar reached
-  killThread runner
-  captured ← takeMVar outcome
-  case captured of
-    Right () → expectationFailure "expected the blocked acquisition to be cancelled"
-    Left propagated → do
-      asyncException propagated `shouldBe` Just ThreadKilled
-      -- No value existed, so no release was invoked.
-      trail releases `shouldReturn` []
-      trail bodies `shouldReturn` []
+  withOwnedThread
+    ( do
+        captured ←
+          try $
+            withResource
+              (putMVar reached () *> takeMVar blocker ∷ IO ())
+              (\_ → record releases "release")
+              (\_ → record bodies "body")
+        putMVar outcome (captured ∷ Either SomeException ())
+    )
+    $ \runner _ → do
+      takeMVar reached
+      killThread runner
+      captured ← takeMVar outcome
+      case captured of
+        Right () → expectationFailure "expected the blocked acquisition to be cancelled"
+        Left propagated → do
+          asyncException propagated `shouldBe` Just ThreadKilled
+          -- No value existed, so no release was invoked.
+          trail releases `shouldReturn` []
+          trail bodies `shouldReturn` []
 
 testCancellationAfterAcquisition ∷ Expectation
 testCancellationAfterAcquisition = do
@@ -605,22 +662,25 @@ testCancellationAfterAcquisition = do
   acquired ← newEmptyMVar
   blocker ← newEmptyMVar
   outcome ← newEmptyMVar
-  runner ← forkIO $ do
-    captured ←
-      try $
-        withResource
-          (pure ())
-          (\_ → record releases "release")
-          (\_ → putMVar acquired () *> takeMVar blocker)
-    putMVar outcome (captured ∷ Either SomeException ())
-  takeMVar acquired
-  killThread runner
-  captured ← takeMVar outcome
-  case captured of
-    Right () → expectationFailure "expected the cancellation to propagate"
-    Left propagated → do
-      asyncException propagated `shouldBe` Just ThreadKilled
-      trail releases `shouldReturn` ["release"]
+  withOwnedThread
+    ( do
+        captured ←
+          try $
+            withResource
+              (pure ())
+              (\_ → record releases "release")
+              (\_ → putMVar acquired () *> takeMVar blocker)
+        putMVar outcome (captured ∷ Either SomeException ())
+    )
+    $ \runner _ → do
+      takeMVar acquired
+      killThread runner
+      captured ← takeMVar outcome
+      case captured of
+        Right () → expectationFailure "expected the cancellation to propagate"
+        Left propagated → do
+          asyncException propagated `shouldBe` Just ThreadKilled
+          trail releases `shouldReturn` ["release"]
 
 -- | An inner scope that completes normally hands control back to an enclosing
 -- body running with the caller's masking state, so a cancellation requested
@@ -632,25 +692,28 @@ testMaskingRestoredAfterInnerScope = do
   innerDone ← newEmptyMVar
   blocker ← newEmptyMVar
   outcome ← newEmptyMVar
-  runner ← forkIO $ do
-    captured ←
-      try $
-        withResourceLabelled "outer" (pure ()) (\_ → record releases "outer") $ \_ → do
-          withResourceLabelled "inner" (pure ()) (\_ → record releases "inner") $ \_ →
-            record releases "inner body"
-          putMVar innerDone ()
-          takeMVar blocker
-    putMVar outcome (captured ∷ Either SomeException ())
-  takeMVar innerDone
-  killThread runner
-  captured ← takeMVar outcome
-  case captured of
-    Right () → expectationFailure "expected the cancellation to propagate"
-    Left propagated → do
-      asyncException propagated `shouldBe` Just ThreadKilled
-      trail releases `shouldReturn` ["inner body", "inner", "outer"]
-      -- The inner release had already run, so it is not retried on this unwind.
-      length (cleanupFailures propagated) `shouldBe` 0
+  withOwnedThread
+    ( do
+        captured ←
+          try $
+            withResourceLabelled "outer" (pure ()) (\_ → record releases "outer") $ \_ → do
+              withResourceLabelled "inner" (pure ()) (\_ → record releases "inner") $ \_ →
+                record releases "inner body"
+              putMVar innerDone ()
+              takeMVar blocker
+        putMVar outcome (captured ∷ Either SomeException ())
+    )
+    $ \runner _ → do
+      takeMVar innerDone
+      killThread runner
+      captured ← takeMVar outcome
+      case captured of
+        Right () → expectationFailure "expected the cancellation to propagate"
+        Left propagated → do
+          asyncException propagated `shouldBe` Just ThreadKilled
+          trail releases `shouldReturn` ["inner body", "inner", "outer"]
+          -- The inner release had already run, so it is not retried on this unwind.
+          length (cleanupFailures propagated) `shouldBe` 0
 
 -- | A cancellation aimed at a thread that is already inside a release waits
 -- for that release and for every remaining release of the same unwind.
@@ -661,31 +724,33 @@ testDeferredDeliveryDuringRelease = do
   killerSlot ← newEmptyMVar
   killerStatus ← newEmptyMVar
   killerDone ← newEmptyMVar
-  runner ← forkIO $
-    void . try @SomeException $
-      withResourceLabelled "outer" (pure ()) (\_ → do
-        record releases "outer start"
-        record releases "outer end")
-        $ \_ →
-          withResourceLabelled "inner" (pure ()) (\_ → do
-            record releases "inner start"
-            putMVar insideRelease ()
-            killer ← readMVar killerSlot
-            status ← awaitPendingThrow killer
-            putMVar killerStatus status
-            record releases "inner end")
-            $ \_ → throwIO (ErrorCall "body failed")
-  -- The inner release has started, so the thread is uninterruptibly masked.
-  takeMVar insideRelease
-  killer ← forkIO (throwTo runner ThreadKilled *> putMVar killerDone ())
-  putMVar killerSlot killer
-  -- The cancellation was delivered, which cannot happen before cleanup ends.
-  takeMVar killerDone
-  -- While the release was still running, the sender was still waiting on it.
-  observed ← takeMVar killerStatus
-  observed `shouldBe` ThreadBlocked BlockedOnException
-  trail releases
-    `shouldReturn` ["inner start", "inner end", "outer start", "outer end"]
+  withOwnedThreadOpening (void (tryPutMVar killerSlot Nothing))
+    ( void . try @SomeException $
+        withResourceLabelled "outer" (pure ()) (\_ → do
+          record releases "outer start"
+          record releases "outer end")
+          $ \_ →
+            withResourceLabelled "inner" (pure ()) (\_ → do
+              record releases "inner start"
+              putMVar insideRelease ()
+              -- Released with no killer when the scope ended first: the status is then not an observation, and nothing reads it.
+              status ← readMVar killerSlot >>= maybe (pure ThreadFinished) awaitPendingThrow
+              putMVar killerStatus status
+              record releases "inner end")
+              $ \_ → throwIO (ErrorCall "body failed")
+    )
+    $ \runner _ → do
+      -- The inner release has started, so the thread is uninterruptibly masked.
+      takeMVar insideRelease
+      withOwnedThread (throwTo runner ThreadKilled *> putMVar killerDone ()) $ \killer _ → do
+        putMVar killerSlot (Just killer)
+        -- The cancellation was delivered, which cannot happen before cleanup ends.
+        takeMVar killerDone
+        -- While the release was still running, the sender was still waiting on it.
+        observed ← takeMVar killerStatus
+        observed `shouldBe` ThreadBlocked BlockedOnException
+        trail releases
+          `shouldReturn` ["inner start", "inner end", "outer start", "outer end"]
 
 -- | A release that raises an asynchronous-exception type explicitly is a
 -- cleanup failure, not an interruption of the masked cleanup.
@@ -1331,35 +1396,38 @@ testCancelledInRestoredStep = do
   reached ← newEmptyMVar
   blocker ← newEmptyMVar
   outcome ← newEmptyMVar
-  runner ← forkIO $ do
-    captured ←
-      try $
-        withComposite
-          ( do
-              acquirePart
-                "first"
-                (releaseRank 0)
-                (record releases "acquire first")
-                (\_ → record releases "first")
-              restoredStep (putMVar reached () *> takeMVar blocker ∷ IO ())
-              acquirePart
-                "second"
-                (releaseRank 1)
-                (record releases "acquire second")
-                (\_ → record releases "second")
-          )
-          (\_ → record releases "body")
-    putMVar outcome (captured ∷ Either SomeException ())
-  takeMVar reached
-  killThread runner
-  captured ← takeMVar outcome
-  case captured of
-    Right () → expectationFailure "expected the cancellation to propagate"
-    Left propagated → do
-      asyncException propagated `shouldBe` Just ThreadKilled
-      -- Only the part acquired before the restored step was rolled back.
-      trail releases `shouldReturn` ["acquire first", "first"]
-      length (cleanupFailures propagated) `shouldBe` 0
+  withOwnedThread
+    ( do
+        captured ←
+          try $
+            withComposite
+              ( do
+                  acquirePart
+                    "first"
+                    (releaseRank 0)
+                    (record releases "acquire first")
+                    (\_ → record releases "first")
+                  restoredStep (putMVar reached () *> takeMVar blocker ∷ IO ())
+                  acquirePart
+                    "second"
+                    (releaseRank 1)
+                    (record releases "acquire second")
+                    (\_ → record releases "second")
+              )
+              (\_ → record releases "body")
+        putMVar outcome (captured ∷ Either SomeException ())
+    )
+    $ \runner _ → do
+      takeMVar reached
+      killThread runner
+      captured ← takeMVar outcome
+      case captured of
+        Right () → expectationFailure "expected the cancellation to propagate"
+        Left propagated → do
+          asyncException propagated `shouldBe` Just ThreadKilled
+          -- Only the part acquired before the restored step was rolled back.
+          trail releases `shouldReturn` ["acquire first", "first"]
+          length (cleanupFailures propagated) `shouldBe` 0
 
 testCancelledInAcquisition ∷ Expectation
 testCancelledInAcquisition = do
@@ -1367,34 +1435,37 @@ testCancelledInAcquisition = do
   reached ← newEmptyMVar
   blocker ← newEmptyMVar
   outcome ← newEmptyMVar
-  runner ← forkIO $ do
-    captured ←
-      try $
-        withComposite
-          ( do
-              acquirePart
-                "first"
-                (releaseRank 0)
-                (record releases "acquire first")
-                (\_ → record releases "first")
-              acquirePart
-                "second"
-                (releaseRank 1)
-                (putMVar reached () *> takeMVar blocker ∷ IO ())
-                (\_ → record releases "second")
-          )
-          (\_ → record releases "body")
-    putMVar outcome (captured ∷ Either SomeException ())
-  takeMVar reached
-  killThread runner
-  captured ← takeMVar outcome
-  case captured of
-    Right () → expectationFailure "expected the cancellation to propagate"
-    Left propagated → do
-      asyncException propagated `shouldBe` Just ThreadKilled
-      -- The second part was never acquired, so its release never ran, and the
-      -- first was not stranded.
-      trail releases `shouldReturn` ["acquire first", "first"]
+  withOwnedThread
+    ( do
+        captured ←
+          try $
+            withComposite
+              ( do
+                  acquirePart
+                    "first"
+                    (releaseRank 0)
+                    (record releases "acquire first")
+                    (\_ → record releases "first")
+                  acquirePart
+                    "second"
+                    (releaseRank 1)
+                    (putMVar reached () *> takeMVar blocker ∷ IO ())
+                    (\_ → record releases "second")
+              )
+              (\_ → record releases "body")
+        putMVar outcome (captured ∷ Either SomeException ())
+    )
+    $ \runner _ → do
+      takeMVar reached
+      killThread runner
+      captured ← takeMVar outcome
+      case captured of
+        Right () → expectationFailure "expected the cancellation to propagate"
+        Left propagated → do
+          asyncException propagated `shouldBe` Just ThreadKilled
+          -- The second part was never acquired, so its release never ran, and the
+          -- first was not stranded.
+          trail releases `shouldReturn` ["acquire first", "first"]
 
 -- | A cancellation aimed at a thread that is already rolling a composite back
 -- waits for every release of that rollback, in the declared order.
@@ -1405,35 +1476,37 @@ testCancellationDeferredDuringRollback = do
   killerSlot ← newEmptyMVar
   killerStatus ← newEmptyMVar
   killerDone ← newEmptyMVar
-  runner ← forkIO $
-    void . try @SomeException $
-      withComposite
-        ( do
-            acquirePart "first" (releaseRank 0) (record releases "acquire first") $ \_ → do
-              record releases "first start"
-              putMVar insideRelease ()
-              killer ← readMVar killerSlot
-              status ← awaitPendingThrow killer
-              putMVar killerStatus status
-              record releases "first end"
-            acquirePart
-              "second"
-              (releaseRank 1)
-              (record releases "acquire second")
-              (\_ → record releases "second")
-            restoredStep (throwIO (ErrorCall "stage failed"))
-        )
-        (\_ → record releases "body")
-  -- The rollback has started, so the thread is uninterruptibly masked.
-  takeMVar insideRelease
-  killer ← forkIO (throwTo runner ThreadKilled *> putMVar killerDone ())
-  putMVar killerSlot killer
-  takeMVar killerDone
-  observed ← takeMVar killerStatus
-  observed `shouldBe` ThreadBlocked BlockedOnException
-  trail releases
-    `shouldReturn`
-      ["acquire first", "acquire second", "first start", "first end", "second"]
+  withOwnedThreadOpening (void (tryPutMVar killerSlot Nothing))
+    ( void . try @SomeException $
+        withComposite
+          ( do
+              acquirePart "first" (releaseRank 0) (record releases "acquire first") $ \_ → do
+                record releases "first start"
+                putMVar insideRelease ()
+                -- Released with no killer when the scope ended first: the status is then not an observation, and nothing reads it.
+                status ← readMVar killerSlot >>= maybe (pure ThreadFinished) awaitPendingThrow
+                putMVar killerStatus status
+                record releases "first end"
+              acquirePart
+                "second"
+                (releaseRank 1)
+                (record releases "acquire second")
+                (\_ → record releases "second")
+              restoredStep (throwIO (ErrorCall "stage failed"))
+          )
+          (\_ → record releases "body")
+    )
+    $ \runner _ → do
+      -- The rollback has started, so the thread is uninterruptibly masked.
+      takeMVar insideRelease
+      withOwnedThread (throwTo runner ThreadKilled *> putMVar killerDone ()) $ \killer _ → do
+        putMVar killerSlot (Just killer)
+        takeMVar killerDone
+        observed ← takeMVar killerStatus
+        observed `shouldBe` ThreadBlocked BlockedOnException
+        trail releases
+          `shouldReturn`
+            ["acquire first", "acquire second", "first start", "first end", "second"]
 
 -- Composite construction inside a scope ---------------------------------------
 
@@ -1535,48 +1608,50 @@ testCancellationPendingWhenAcquisitionReturns = do
   killerDone ← newEmptyMVar
   neverFilled ← newEmptyMVar
   outcome ← newEmptyMVar
-  runner ← forkIO $ do
-    captured ←
-      try $
-        withComposite
-          ( do
-              acquirePart
-                "first"
-                (releaseRank 0)
-                ( uninterruptibleMask_ $ do
-                    record releases "acquire first"
-                    putMVar acquiring ()
-                    killer ← readMVar killerSlot
-                    void (awaitPendingThrow killer)
-                )
-                (\_ → record releases "first")
-              -- The first interruptible operation after the rollback exists.
-              restoredStep (takeMVar neverFilled ∷ IO ())
-              acquirePart
-                "second"
-                (releaseRank 1)
-                (record releases "acquire second")
-                (\_ → record releases "second")
-          )
-          (\_ → record bodies "body")
-    putMVar outcome (captured ∷ Either SomeException ())
-  takeMVar acquiring
-  killer ← forkIO (throwTo runner ThreadKilled *> putMVar killerDone ())
-  putMVar killerSlot killer
-  -- The cancellation was delivered, so the construction has unwound.
-  takeMVar killerDone
-  captured ← takeMVar outcome
-  case captured of
-    Right () → expectationFailure "expected the cancellation to propagate"
-    Left propagated → do
-      asyncException propagated `shouldBe` Just ThreadKilled
-      performed ← trail releases
-      -- The part acquired with the cancellation already pending was rolled
-      -- back; no later stage ran, so nothing else was acquired.
-      performed `shouldBe` ["acquire first", "first"]
-      occurrences "first" performed `shouldBe` 1
-      trail bodies `shouldReturn` []
-      length (cleanupFailures propagated) `shouldBe` 0
+  withOwnedThreadOpening (void (tryPutMVar killerSlot Nothing))
+    ( do
+        captured ←
+          try $
+            withComposite
+              ( do
+                  acquirePart
+                    "first"
+                    (releaseRank 0)
+                    ( uninterruptibleMask_ $ do
+                        record releases "acquire first"
+                        putMVar acquiring ()
+                        readMVar killerSlot >>= maybe (pure ()) (void . awaitPendingThrow)
+                    )
+                    (\_ → record releases "first")
+                  -- The first interruptible operation after the rollback exists.
+                  restoredStep (takeMVar neverFilled ∷ IO ())
+                  acquirePart
+                    "second"
+                    (releaseRank 1)
+                    (record releases "acquire second")
+                    (\_ → record releases "second")
+              )
+              (\_ → record bodies "body")
+        putMVar outcome (captured ∷ Either SomeException ())
+    )
+    $ \runner _ → do
+      takeMVar acquiring
+      withOwnedThread (throwTo runner ThreadKilled *> putMVar killerDone ()) $ \killer _ → do
+        putMVar killerSlot (Just killer)
+        -- The cancellation was delivered, so the construction has unwound.
+        takeMVar killerDone
+        captured ← takeMVar outcome
+        case captured of
+          Right () → expectationFailure "expected the cancellation to propagate"
+          Left propagated → do
+            asyncException propagated `shouldBe` Just ThreadKilled
+            performed ← trail releases
+            -- The part acquired with the cancellation already pending was rolled
+            -- back; no later stage ran, so nothing else was acquired.
+            performed `shouldBe` ["acquire first", "first"]
+            occurrences "first" performed `shouldBe` 1
+            trail bodies `shouldReturn` []
+            length (cleanupFailures propagated) `shouldBe` 0
 
 -- Continuation facade -------------------------------------------------------
 
@@ -1647,25 +1722,28 @@ testFacadeReverseOrderOnCancellation = do
   entered ← newEmptyMVar
   blocker ← newEmptyMVar
   outcome ← newEmptyMVar
-  runner ← forkIO $ do
-    captured ←
-      try $
-        withScoped
-          ( do
-              _ ← allocResource (pure ()) (\_ → record releases "first")
-              _ ← allocResource (pure ()) (\_ → record releases "second")
-              liftIO (putMVar entered () *> takeMVar blocker)
-          )
-          pure
-    putMVar outcome (captured ∷ Either SomeException ())
-  takeMVar entered
-  killThread runner
-  captured ← takeMVar outcome
-  case captured of
-    Right () → expectationFailure "expected the cancellation to propagate"
-    Left propagated → do
-      asyncException propagated `shouldBe` Just ThreadKilled
-      trail releases `shouldReturn` ["second", "first"]
+  withOwnedThread
+    ( do
+        captured ←
+          try $
+            withScoped
+              ( do
+                  _ ← allocResource (pure ()) (\_ → record releases "first")
+                  _ ← allocResource (pure ()) (\_ → record releases "second")
+                  liftIO (putMVar entered () *> takeMVar blocker)
+              )
+              pure
+        putMVar outcome (captured ∷ Either SomeException ())
+    )
+    $ \runner _ → do
+      takeMVar entered
+      killThread runner
+      captured ← takeMVar outcome
+      case captured of
+        Right () → expectationFailure "expected the cancellation to propagate"
+        Left propagated → do
+          asyncException propagated `shouldBe` Just ThreadKilled
+          trail releases `shouldReturn` ["second", "first"]
 
 testFacadeEarlierFailureStopsAcquisition ∷ Expectation
 testFacadeEarlierFailureStopsAcquisition = do

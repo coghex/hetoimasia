@@ -11,7 +11,7 @@
 -- @--match Time@ selects all of them.
 module Test.Foundation.Time.Spec (spec) where
 
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception
   ( AsyncException (ThreadKilled)
@@ -42,6 +42,7 @@ import Hetoimasia.Foundation.Time
 import qualified Test.Foundation.Time.Opacity as Opacity
 import qualified Test.Foundation.Time.Visibility as Visibility
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
+import Test.Support.Owned (withOwnedThread)
 import Test.Support.Bounded (bounded)
 
 spec ∷ Spec
@@ -353,14 +354,17 @@ testDeliveredCancellation = bounded $ do
   never ← newEmptyMVar
   finished ← newEmptyMVar
   let source = scriptedSource (putMVar entered () >> takeMVar never)
-  worker ← forkIO $ do
-    outcome ← tryWithContext @SomeException (readInstant source)
-    putMVar finished outcome
-  takeMVar entered
-  killThread worker
-  outcome ← takeMVar finished
-  case outcome of
-    Right instant → expectationFailure ("expected cancellation, but read " <> show instant)
-    Left (ExceptionWithContext context failure) → do
-      fromException failure `shouldBe` Just ThreadKilled
-      failureEvidenceInContext context `shouldBe` FailureEvidence NativeCause []
+  withOwnedThread
+    ( do
+        outcome ← tryWithContext @SomeException (readInstant source)
+        putMVar finished outcome
+    )
+    $ \worker _ → do
+      takeMVar entered
+      killThread worker
+      outcome ← takeMVar finished
+      case outcome of
+        Right instant → expectationFailure ("expected cancellation, but read " <> show instant)
+        Left (ExceptionWithContext context failure) → do
+          fromException failure `shouldBe` Just ThreadKilled
+          failureEvidenceInContext context `shouldBe` FailureEvidence NativeCause []
