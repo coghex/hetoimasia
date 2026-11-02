@@ -4,7 +4,7 @@
 -- drained, and the main thread's housekeeping served while it waits.
 module Test.GLFW.Owner.Exit.Retirement (spec) where
 
-import Control.Concurrent (forkIO, myThreadId)
+import Control.Concurrent (myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
   ( atomically
@@ -43,6 +43,7 @@ import Test.GLFW.Owner.Fixture.Fake (Fake (..), ScriptedTimer (..), fireTimer, s
 import Test.GLFW.Owner.Fixture.Journal (Note (..), journalled, ordered)
 import Test.GLFW.Owner.Fixture.Rig
   ( Rig (..)
+  , armedBody
   , countingClock
   , newRig
   , newRigWith
@@ -51,8 +52,9 @@ import Test.GLFW.Owner.Fixture.Rig
   , ownedHostHooked
   , ownerSettings
   )
-import Test.GLFW.Support (at, boundedExample, millis, quietLogger, unexpected, windowNamed)
+import Test.GLFW.Support (Scope, at, boundedExample, cutExamples, millis, quietLogger, unexpected, windowNamed)
 import Test.Hspec (Spec, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = do
@@ -62,6 +64,7 @@ spec = do
     (boundedExample testIndividualRelease)
   it "asks again on a later round for a released target whose retirement is owed, certifying nothing meanwhile"
     (boundedExample testOwedRetirementRetried)
+  cutExamples "the owed retirement fixture" [0, 1, 2] owedRetiredScenario
   it "waits in its exit drain for a retirement still owed, and retires the target before the owner"
     (boundedExample testOwedRetirementDrained)
   it "hands its exit drain's timer the backend's deadline, or its fallback interval after the drain's own reading"
@@ -137,18 +140,29 @@ testIndividualRelease = do
 -- yet is asked again on a later round, and nothing is retired or certified
 -- until it can be.
 testOwedRetirementRetried ∷ IO ()
-testOwedRetirementRetried = do
+testOwedRetirementRetried = owedRetirementRetried (\_ → pure ())
+
+-- | The same fixture ended at the cut (#593): before the retirement is held owed, or after it is and the release that makes it ready is
+-- registered.
+owedRetiredScenario ∷ Int → Scope → IO () → IO ()
+owedRetiredScenario cutAt _ atParked = owedRetirementRetried (\armedNow → when (armedNow == cutAt) atParked)
+
+owedRetirementRetried ∷ (Int → IO ()) → IO ()
+owedRetirementRetried cut = do
   rig ← newRig
   asked ← newTVarIO (0 ∷ Int)
   ready ← newTVarIO False
-  script (fakePrepare (rigFake rig)) $ \_ → atomically $ do
-    modifyTVar' asked (+ 1)
-    open ← readTVar ready
-    pure (if open then RetirementReady else RetirementOwed (Text.pack "a present fence is pending"))
+  -- Owed until the body says otherwise; armed only inside the body's first masked step, after the release that makes it ready on
+  -- any exit is registered (#593).
+  let arm = script (fakePrepare (rigFake rig)) $ \_ → atomically $ do
+        modifyTVar' asked (+ 1)
+        open ← readTVar ready
+        pure (if open then RetirementReady else RetirementOwed (Text.pack "a present fence is pending"))
   (whileOwed, certifiedWhileOwed, askedInAll, retiredOnce) ←
-    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → armedBody cut arm (atomically (writeTVar ready True)) $ do
       window ← theWindow host
       service ← handedOver host owner window
+      cut 2
       awaitConstructed rig (Text.pack (show window))
       _ ← releaseGraphicsTarget host owner service
       atomically (readTVar asked >>= check . (>= 1))
@@ -185,30 +199,34 @@ testOwedRetirementDrained = do
     when draining (modifyTVar' asked (+ 1))
     count ← readTVar asked
     pure (if draining && count > 1 then RetirementReady else RetirementOwed (Text.pack "a present fence is pending"))
-  ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
-    atomically (writeTVar ownerCell (Just owner))
-    window ← theWindow host
-    _ ← handedOver host owner window
-    awaitConstructed rig (Text.pack (show window))
-    -- The drain's wait is the backend's: this one names no deadline, so the
-    -- drain arms its fallback, and this fires it once it has.
-    _ ← forkIO $ do
-      atomically (readTVar (timerArmings (rigTimer rig)) >>= check . not . null)
-      fireTimer (rigTimer rig)
-    pure ()
-  notes ← journalled (rigJournal rig)
-  ordered
-    notes
-    [ OwnerStartup
-    , Constructed (Text.pack "WindowId 1")
-    , TargetRetirement (Text.pack "WindowId 1")
-    , OwnerRetirement
-    , OwnerDestruction
-    , WindowGone 1
-    ]
-  readTVarIO asked `shouldReturn` 2
-  armings ← readTVarIO (timerArmings (rigTimer rig))
-  armings `shouldSatisfy` (not . null)
+  -- The drain's wait is the backend's: this one names no deadline, so the drain arms its fallback, and this helper fires it
+  -- once it has. It supplies the evidence the exit's drain needs, so it is owned by the example and outlives the host body
+  -- (#593).
+  withOwnedThread
+    ( do
+        atomically (readTVar (timerArmings (rigTimer rig)) >>= check . not . null)
+        fireTimer (rigTimer rig)
+    )
+    $ \_ _ → do
+    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+      atomically (writeTVar ownerCell (Just owner))
+      window ← theWindow host
+      _ ← handedOver host owner window
+      awaitConstructed rig (Text.pack (show window))
+      pure ()
+    notes ← journalled (rigJournal rig)
+    ordered
+      notes
+      [ OwnerStartup
+      , Constructed (Text.pack "WindowId 1")
+      , TargetRetirement (Text.pack "WindowId 1")
+      , OwnerRetirement
+      , OwnerDestruction
+      , WindowGone 1
+      ]
+    readTVarIO asked `shouldReturn` 2
+    armings ← readTVarIO (timerArmings (rigTimer rig))
+    armings `shouldSatisfy` (not . null)
 
 -- | The exit drain gives its timer the deadline the backend asked for, and,
 -- when the backend names none, the instant 'Private.owedRetirementFallback'
@@ -237,24 +255,27 @@ testDrainTimerGivenDeadline = do
     when inDrain (modifyTVar' deadlines (+ 1))
     count ← readTVar deadlines
     pure (if inDrain && count == 1 then OwnerDeadline asked else NoOwnerDemand)
-  ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
-    atomically (writeTVar ownerCell (Just owner))
-    window ← theWindow host
-    _ ← handedOver host owner window
-    awaitConstructed rig (Text.pack (show window))
-    _ ← forkIO $ do
-      atomically (readTVar (timerArmings (rigTimer rig)) >>= check . (>= 1) . length)
-      fireTimer (rigTimer rig)
-      atomically (readTVar (timerArmings (rigTimer rig)) >>= check . (>= 2) . length)
-      fireTimer (rigTimer rig)
-    pure ()
-  readTVarIO prepared `shouldReturn` 3
-  armings ← readTVarIO (timerArmings (rigTimer rig))
-  let fallback = either (error . show) id (addDuration reading Private.owedRetirementFallback)
-  armings
-    `shouldBe` [ (asked, elapsedBetween reading asked)
-               , (fallback, Private.owedRetirementFallback)
-               ]
+  withOwnedThread
+    ( do
+        atomically (readTVar (timerArmings (rigTimer rig)) >>= check . (>= 1) . length)
+        fireTimer (rigTimer rig)
+        atomically (readTVar (timerArmings (rigTimer rig)) >>= check . (>= 2) . length)
+        fireTimer (rigTimer rig)
+    )
+    $ \_ _ → do
+    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+      atomically (writeTVar ownerCell (Just owner))
+      window ← theWindow host
+      _ ← handedOver host owner window
+      awaitConstructed rig (Text.pack (show window))
+      pure ()
+    readTVarIO prepared `shouldReturn` 3
+    armings ← readTVarIO (timerArmings (rigTimer rig))
+    let fallback = either (error . show) id (addDuration reading Private.owedRetirementFallback)
+    armings
+      `shouldBe` [ (asked, elapsedBetween reading asked)
+                 , (fallback, Private.owedRetirementFallback)
+                 ]
 
 -- | A cancellation delivered inside a retirement's preparation ends the
 -- owner's run as any cancellation does, but it is not a failed retirement:
@@ -369,24 +390,27 @@ testHousekeepingDuringDrain = do
     atomically (readTVar release >>= check)
     pure (ownerDestroyed (Text.pack "destroyed late"))
   mainThread ← newTVarIO Nothing
-  ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
-    window ← theWindow host
-    _ ← handedOver host owner window
-    awaitConstructed rig (Text.pack (show window))
-    caller ← myThreadId
-    atomically (writeTVar mainThread (Just caller))
-    _ ← forkIO $ do
-      takeMVar entered
-      -- The main thread is inside the exit's own wait for the owner. It keeps
-      -- pumping, and this releases the owner once it has.
-      atomically . check . (> 0) . length . housekeeping =<< readTVarIO (rigNative rig)
-      atomically (writeTVar release True)
-    pure ()
-  calls ← readTVarIO (rigNative rig)
-  owner ← readTVarIO mainThread
-  housekeeping calls `shouldSatisfy` (not . null)
-  -- Whatever pumped, pumped on the main thread.
-  maybe True (\main → all ((== main) . fst) (filter (isPump . snd) calls)) owner `shouldBe` True
+  -- The helper supplies the evidence the exit's wait for the owner needs, so it is owned by the example and outlives the host
+  -- body that precedes the exit (#593); the gate it opens is opened by the scope as well, so the owner is never joined held.
+  let releasing = do
+        takeMVar entered
+        -- The main thread is inside the exit's own wait for the owner. It keeps
+        -- pumping, and this releases the owner once it has.
+        atomically . check . (> 0) . length . housekeeping =<< readTVarIO (rigNative rig)
+        atomically (writeTVar release True)
+  withOwnedThreadOpening (atomically (writeTVar release True)) releasing $ \_ _ → do
+    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+      window ← theWindow host
+      _ ← handedOver host owner window
+      awaitConstructed rig (Text.pack (show window))
+      caller ← myThreadId
+      atomically (writeTVar mainThread (Just caller))
+      pure ()
+    calls ← readTVarIO (rigNative rig)
+    owner ← readTVarIO mainThread
+    housekeeping calls `shouldSatisfy` (not . null)
+    -- Whatever pumped, pumped on the main thread.
+    maybe True (\main → all ((== main) . fst) (filter (isPump . snd) calls)) owner `shouldBe` True
   where
     housekeeping = filter (isPump . snd)
 
