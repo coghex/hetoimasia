@@ -673,11 +673,18 @@ starts in test sources (#584), `tools/validation/owned_starts.py`, through the
 Hspec examples in `tools/test/OwnedStarts.hs`. A test that starts a thread or a
 subprocess must own it: acquire it under mask, register its stop-and-join in the
 same step, and stop and join it on every exit. The shared facility is
-`Test.Support.Owned` in `tools/test-support`; the guard fails a test source that
+`Test.Support.Owned` in `tools/test-support` for a thread (`withOwnedThread` for an
+unbound one, `withOwnedBoundThread` for an OS-bound one, #593, each with an
+`Opening` variant for a thread held at a gate only the scope can open) and
+`Test.Support.Subprocess` in the same library for a subprocess (#588:
+`runToCompletion` and `runCaptured` for a command run to completion,
+`withScopedChild` for a child lent to a body; the child is ended and reaped, its
+process group with it, on every exit); the guard fails a test source that
 calls `forkIO`, `forkOS`, `forkOn`, `forkIOWithUnmask`, `forkFinally`,
-`createProcess`, `withCreateProcess`, `spawnProcess`, `spawnCommand`,
-`callProcess`, `callCommand`, `readProcess`, `readProcessWithExitCode`,
-`readCreateProcess` or `readCreateProcessWithExitCode` any other way.
+`createProcess`, `createProcess_`, `withCreateProcess`, `spawnProcess`,
+`spawnCommand`, `callProcess`, `callCommand`, `readProcess`,
+`readProcessWithExitCode`, `readCreateProcess` or `readCreateProcessWithExitCode`
+any other way, and its message names the facility that fits the kind of start.
 
 - **Scope is derived.** It scans the source directories of every `test-suite` in
   the package descriptions `cabal.project` and `cabal.project.vulkan` list, read
@@ -690,8 +697,11 @@ calls `forkIO`, `forkOS`, `forkOn`, `forkIOWithUnmask`, `forkFinally`,
   header are not code, so they are not sites; qualified calls are.
 - **A per-file count ratchet.** `tools/validation/owned_starts_baseline.json`
   records, per file, how many unowned starts it had when the guard was introduced
-  (555 in 193 files, written by `owned_starts.py bootstrap`: the 552 found when the
-  guard was introduced plus the three starts `tools/test/RunnerIdentity.hs` brought). Each file's count
+  (491 in 156 files: the 552 found when the guard was introduced plus the three
+  starts `tools/test/RunnerIdentity.hs` brought, written by
+  `owned_starts.py bootstrap`, less the 64 that #588 removed: its 57 subprocess
+  starts, the three of `RunnerIdentity.hs`, which have the same shape, and the four
+  thread starts that existed only to serve them). Each file's count
   must equal its baseline: a count above it is a new unowned start; a count below
   it is a stale entry, so the baseline stays honest and can only shrink. The
   baseline is a known-debt list classified mechanically, not a list of proven
@@ -717,8 +727,9 @@ calls `forkIO`, `forkOS`, `forkOn`, `forkIOWithUnmask`, `forkFinally`,
   reviewed. The initial exemptions are those #540 audited, narrowed: sites found
   not to be provably owned (`Test.Content.Support.spawn`, which `withRootVia`
   calls outside `withChild`; the `forkOS` runner of `run-native-test/Main.hs`;
-  `Compositor.hs`, whose `stopProcess` can time out unconfirmed) remain in the
-  baseline.
+  `Compositor.hs`, whose `stopProcess` could time out unconfirmed) remained in the
+  baseline until #588 moved those subprocess starts onto the shared subprocess
+  facility, which ends and reaps them.
 - **Selection.** The guard's inputs are every scanned source directory and every
   package description, listed as inputs of `test.workflow` in the catalog, beside
   `tools/validation/` (the script, its configuration and its baseline). An
