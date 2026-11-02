@@ -20,7 +20,7 @@
 -- session holding its output open, or the launch was interrupted.
 module Test.GLFW.Native.Guard (spec) where
 
-import Control.Concurrent (forkIO, newEmptyMVar, putMVar, takeMVar, throwTo)
+import Control.Concurrent (newEmptyMVar, putMVar, takeMVar, throwTo)
 import Control.Concurrent.STM (atomically, check)
 import Control.Exception (annotateIO, someExceptionContext, ErrorCall (..), IOException, SomeException, bracket, displayException, finally, fromException, throwIO, try)
 import Control.Exception.Annotation (ExceptionAnnotation)
@@ -73,6 +73,7 @@ import Test.GLFW.Native.Support
   , sharedSessionOwner
   , threadChecks
   )
+import Test.GLFW.Native.Threads (Boundness (Unbound), startOwned)
 import Test.Hspec (Spec, describe, expectationFailure, it, shouldBe, shouldContain, shouldReturn, shouldSatisfy)
 import Test.Hspec.Core.Formatters.V2 (formatterToFormat, silent)
 import Test.Hspec.Runner
@@ -222,8 +223,9 @@ spec = describe "the native opt-in" $ do
           result ←
             runNested id . consented gate . it "forks an operation and waits for it" $ do
               writeIORef ran True
-              _ ← forkIO (gated gate fixture (\value → putMVar started () >> pure value) >>= \_ → pure ())
-              takeMVar started
+              -- Owned (#594): were the body ever to run, the operation is stopped and joined when the example ends.
+              startOwned Unbound (void (gated gate fixture (\value → putMVar started () >> pure value))) $ \_ _ →
+                takeMVar started
           pure (length (specResultItems result), length (filter resultItemIsFailure (specResultItems result)))
       either throwIO pure outcome `shouldReturn` (1, 1)
       readIORef ran `shouldReturn` False
@@ -393,19 +395,21 @@ spec = describe "the native opt-in" $ do
     it "owns no reader or pipe handle when an interruption reaches the launch, and propagates the interruption" $ do
       acquired ← newEmptyMVar
       result ← newEmptyMVar
-      launcher ← forkIO (try (Child.launchCommandObserved (putMVar acquired) Child.terminationGrace Nothing 300 "sh" ["-c", "sleep 300"]) >>= putMVar result)
-      owned ← takeMVar acquired
-      -- Whatever the child does next, it is ended with its group on the way out.
-      ( do
-          throwTo launcher (ErrorCall "the launch was interrupted")
-          outcome ← bounded (takeMVar result)
-          case outcome of
-            Left failure → fmap (\(ErrorCall message) → message) (fromException failure) `shouldBe` Just "the launch was interrupted"
-            Right (_ ∷ Child.Launched) → expectationFailure "the interrupted launch returned"
-          reclaimed owned
-          try (signalProcess nullSignal (Child.ownedPid owned)) >>= (`shouldSatisfy` either (\(_ ∷ IOException) → True) (const False))
-        )
-        `finally` void (try (signalProcessGroup sigKILL (Child.ownedPid owned)) ∷ IO (Either IOException ()))
+      -- The launcher thread is owned (#594): however the example ends, it has been stopped and joined, and the launch
+      -- it was running has ended its child and reclaimed its readers and handles on the way out, before this returns.
+      startOwned Unbound (try (Child.launchCommandObserved (putMVar acquired) Child.terminationGrace Nothing 300 "sh" ["-c", "sleep 300"]) >>= putMVar result) $ \launcher _ → do
+        owned ← takeMVar acquired
+        -- Whatever the child does next, it is ended with its group on the way out.
+        ( do
+            throwTo launcher (ErrorCall "the launch was interrupted")
+            outcome ← bounded (takeMVar result)
+            case outcome of
+              Left failure → fmap (\(ErrorCall message) → message) (fromException failure) `shouldBe` Just "the launch was interrupted"
+              Right (_ ∷ Child.Launched) → expectationFailure "the interrupted launch returned"
+            reclaimed owned
+            try (signalProcess nullSignal (Child.ownedPid owned)) >>= (`shouldSatisfy` either (\(_ ∷ IOException) → True) (const False))
+          )
+          `finally` void (try (signalProcessGroup sigKILL (Child.ownedPid owned)) ∷ IO (Either IOException ()))
 
     it "returns the status and output of every short-lived child, however soon it is reaped" $
       -- The identifier is read before anything waits on the child, so no child can be

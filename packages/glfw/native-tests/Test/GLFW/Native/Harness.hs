@@ -18,11 +18,10 @@
 --
 -- Coordination is explicit throughout: gates, the fixture's queue count, and
 -- thread outcomes. Nothing waits on time.
-module Test.GLFW.Native.Harness (spec) where
+module Test.GLFW.Native.Harness (spec, withForkedIn) where
 
 import Control.Concurrent
   ( ThreadId
-  , forkFinally
   , killThread
   , myThreadId
   , newEmptyMVar
@@ -32,7 +31,7 @@ import Control.Concurrent
   , throwTo
   , yield
   )
-import Control.Concurrent.MVar (MVar)
+import Control.Concurrent.MVar (MVar, tryPutMVar, tryReadMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVarIO)
 import Control.Exception
   ( AsyncException (ThreadKilled)
@@ -41,6 +40,7 @@ import Control.Exception
   , SomeException
   , asyncExceptionFromException
   , asyncExceptionToException
+  , toException
   , displayException
   , throwIO
   , try
@@ -73,6 +73,7 @@ import Test.GLFW.Native.Fixture
   , runOwned
   )
 import Test.GLFW.Native.Support (Shared (..), acquisitions, consented, failed, owned, sharedBackend)
+import Test.GLFW.Native.Threads (Boundness (Unbound), Scope, ownedScope, startIn)
 import Test.Hspec (Spec, describe, it, shouldBe, shouldNotBe, shouldReturn)
 import Test.Hspec.Core.Formatters.V2 (formatterToFormat, silent)
 import Test.Hspec.Runner
@@ -170,24 +171,28 @@ spec shared = describe "the shared fixture" $ do
       started ← newEmptyMVar
       ranQueued ← newIORef False
       (outcome, report) ←
-        runOwned (scripted script) $ \fixture → do
-          (inFlight, inFlightOutcome) ←
-            forked . dispatch fixture $ \value → do
-              putMVar started ()
-              takeMVar gate
-              note script "in-flight operation finished"
-              pure value
-          takeMVar started
-          (queued, queuedOutcome) ← forked . dispatch fixture $ \value → writeIORef ranQueued True >> pure value
-          awaitQueued fixture 2
-          killThread queued
-          killThread inFlight
-          cancelledQueued ← queuedOutcome
-          cancelledInFlight ← inFlightOutcome
-          putMVar gate ()
-          after ← dispatch fixture pure
-          note script "borrower finished"
-          pure (killed cancelledQueued, killed cancelledInFlight, after)
+        runOwned (scripted script) $ \fixture →
+          -- The gate holds the owner's in-flight operation, so a scope that ends before the example opens it opens it itself.
+          withForkedOpening
+            (void (tryPutMVar gate ()))
+            ( dispatch fixture $ \value → do
+                putMVar started ()
+                takeMVar gate
+                note script "in-flight operation finished"
+                pure value
+            )
+            $ \inFlight inFlightOutcome → do
+              takeMVar started
+              withForked (dispatch fixture $ \value → writeIORef ranQueued True >> pure value) $ \queued queuedOutcome → do
+                awaitQueued fixture 2
+                killThread queued
+                killThread inFlight
+                cancelledQueued ← queuedOutcome
+                cancelledInFlight ← inFlightOutcome
+                putMVar gate ()
+                after ← dispatch fixture pure
+                note script "borrower finished"
+                pure (killed cancelledQueued, killed cancelledInFlight, after)
       either throwIO pure outcome `shouldReturn` (True, True, 7)
       readIORef ranQueued `shouldReturn` False
       reportServed report `shouldBe` 2
@@ -201,14 +206,14 @@ spec shared = describe "the shared fixture" $ do
       gate ← newEmptyMVar ∷ IO (MVar ())
       started ← newEmptyMVar
       (outcome, report) ←
-        runOwned (scripted script) $ \fixture → do
-          (_, waited) ← forked . dispatch fixture $ \_ → putMVar started () >> takeMVar gate
-          takeMVar started
-          throwTo (ownerThread fixture) OwnerKilled
-          woken ← waited
-          note script "borrower finished"
-          refused ← try (dispatch fixture pure)
-          pure (woken, refused)
+        runOwned (scripted script) $ \fixture →
+          withForked (dispatch fixture $ \_ → putMVar started () >> takeMVar gate) $ \_ waited → do
+            takeMVar started
+            throwTo (ownerThread fixture) OwnerKilled
+            woken ← waited
+            note script "borrower finished"
+            refused ← try (dispatch fixture pure)
+            pure (woken, refused)
       (woken, refused) ← either throwIO pure outcome
       failedWith OwnerKilled woken `shouldBe` True
       failedWith OwnerKilled refused `shouldBe` True
@@ -223,18 +228,18 @@ spec shared = describe "the shared fixture" $ do
       started ← newEmptyMVar
       never ← newEmptyMVar ∷ IO (MVar ())
       (outcome, report) ←
-        runOwned (scripted script) $ \fixture → do
-          (_, waited) ← forked . dispatch fixture $ \value → putMVar started () >> takeMVar never >> pure value
-          takeMVar started
-          throwTo (ownerThread fixture) OwnerKilled
-          woken ← waited
-          -- The owner is settling the first cancellation, waiting for this
-          -- borrower. A second cancellation is delivered to that wait — the
-          -- throwTo returns — while the borrower has not finished.
-          (_, cancelledAgain) ← forked (throwTo (ownerThread fixture) OwnerKilledAgain)
-          delivered ← cancelledAgain
-          note script "borrower finished"
-          pure (woken, delivered)
+        runOwned (scripted script) $ \fixture →
+          withForked (dispatch fixture $ \value → putMVar started () >> takeMVar never >> pure value) $ \_ waited → do
+            takeMVar started
+            throwTo (ownerThread fixture) OwnerKilled
+            woken ← waited
+            -- The owner is settling the first cancellation, waiting for this
+            -- borrower. A second cancellation is delivered to that wait — the
+            -- throwTo returns — while the borrower has not finished.
+            withForked (throwTo (ownerThread fixture) OwnerKilledAgain) $ \_ cancelledAgain → do
+              delivered ← cancelledAgain
+              note script "borrower finished"
+              pure (woken, delivered)
       (woken, delivered) ← either throwIO pure outcome
       failedWith OwnerKilled woken `shouldBe` True
       either throwIO pure delivered
@@ -250,15 +255,15 @@ spec shared = describe "the shared fixture" $ do
       started ← newEmptyMVar
       never ← newEmptyMVar ∷ IO (MVar ())
       (outcome, report) ←
-        runOwned (scripted script) $ \fixture → do
-          (_, waited) ← forked . dispatch fixture $ \value → putMVar started () >> takeMVar never >> pure value
-          takeMVar started
-          throwTo (ownerThread fixture) OwnerKilled
-          woken ← waited
-          (_, cancelledAgain) ← forked (throwTo (ownerThread fixture) OwnerKilledAgain)
-          delivered ← cancelledAgain
-          note script "borrower finished"
-          pure (woken, delivered)
+        runOwned (scripted script) $ \fixture →
+          withForked (dispatch fixture $ \value → putMVar started () >> takeMVar never >> pure value) $ \_ waited → do
+            takeMVar started
+            throwTo (ownerThread fixture) OwnerKilled
+            woken ← waited
+            withForked (throwTo (ownerThread fixture) OwnerKilledAgain) $ \_ cancelledAgain → do
+              delivered ← cancelledAgain
+              note script "borrower finished"
+              pure (woken, delivered)
       (woken, delivered) ← either throwIO pure outcome
       failedWith OwnerKilled woken `shouldBe` True
       either throwIO pure delivered
@@ -271,45 +276,47 @@ spec shared = describe "the shared fixture" $ do
 
     it "keeps the initiating failure primary when a later cancellation is deferred through the release" $ do
       (script, enteredRelease, releaseGate) ← newScriptBlockingRelease True
-      (outcome, report) ←
-        runOwned (scripted script) $ \fixture → do
-          served ← dispatch fixture pure
-          throwTo (ownerThread fixture) OwnerKilled
-          -- Once the release begins, a further cancellation is aimed at the
-          -- owner; the release is uninterruptible, so it is delivered only
-          -- after the release finishes. The gate is opened only once the
-          -- cancellation is observed pending, so the deferral is certain.
-          (canceller, cancelled) ← forked $ do
-            readMVar enteredRelease
-            throwTo (ownerThread fixture) OwnerKilledAgain
-          (_, opened) ← forked $ do
-            readMVar enteredRelease
-            awaitThrowing canceller
-            putMVar releaseGate ()
-          note script "borrower finished"
-          pure (served, cancelled, opened)
-      (served, cancelled, opened) ← either throwIO pure outcome
-      served `shouldBe` 7
-      cancelled >>= either throwIO pure
-      opened >>= either throwIO pure
-      events script `shouldReturn` ["acquired", "borrower finished", "released"]
-      reportAcquisitions report `shouldBe` 1
-      failure ← maybe (failed "the owner reported no failure") pure (reportFailure report)
-      fromException failure `shouldBe` Just OwnerKilled
-      let retained = [inner | ExceptionWithContext _ inner ← map cleanupFailureException (cleanupFailures failure)]
-      map fromException retained `shouldBe` [Just ReleaseFailed]
+      owner ← myThreadId
+      -- Once the release begins, a further cancellation is aimed at the owner;
+      -- the release is uninterruptible, so it is delivered only after the
+      -- release finishes. The gate is opened only once the cancellation is
+      -- observed pending, so the deferral is certain. Both workers act during
+      -- the release, after the borrower has returned, so their scopes enclose
+      -- the whole run; the release's gate is also opened by the scope that
+      -- owns its opener, whatever way that scope ends.
+      withForked (readMVar enteredRelease >> throwTo owner OwnerKilledAgain) $ \canceller cancelled →
+        withForkedOpening
+          (void (tryPutMVar releaseGate ()))
+          (readMVar enteredRelease >> awaitThrowing canceller >> putMVar releaseGate ())
+          $ \_ opened → do
+            (outcome, report) ←
+              runOwned (scripted script) $ \fixture → do
+                served ← dispatch fixture pure
+                throwTo (ownerThread fixture) OwnerKilled
+                note script "borrower finished"
+                pure served
+            served ← either throwIO pure outcome
+            served `shouldBe` 7
+            cancelled >>= either throwIO pure
+            opened >>= either throwIO pure
+            events script `shouldReturn` ["acquired", "borrower finished", "released"]
+            reportAcquisitions report `shouldBe` 1
+            failure ← maybe (failed "the owner reported no failure") pure (reportFailure report)
+            fromException failure `shouldBe` Just OwnerKilled
+            let retained = [inner | ExceptionWithContext _ inner ← map cleanupFailureException (cleanupFailures failure)]
+            map fromException retained `shouldBe` [Just ReleaseFailed]
 
     it "settles a cancellation pending at the acquisition handoff, and a later one deferred through the release" $ do
       (script, enteredRelease, releaseGate) ← newScriptBlockingRelease True
       owner ← myThreadId
-      throwerWait ← newEmptyMVar ∷ IO (MVar (IO (Either SomeException ())))
+      acquiring ← newEmptyMVar ∷ IO (MVar ())
       let -- The acquisition pends a cancellation on the owner and returns with
           -- it pending, so the delivery lands exactly at the handoff to the
-          -- borrower.
-          acquire = do
-            (thrower, thrown) ← forked (throwTo owner OwnerKilled)
+          -- borrower. The thrower waits for the acquisition to begin, which
+          -- is while the owner is masked, so its throw stays pending.
+          acquire thrower = do
+            putMVar acquiring ()
             uninterruptibleMask_ (awaitThrowing thrower)
-            putMVar throwerWait thrown
             note script "acquired"
             pure (7 ∷ Int)
           release _ = do
@@ -317,45 +324,45 @@ spec shared = describe "the shared fixture" $ do
             takeMVar releaseGate
             note script "released"
             throwIO ReleaseFailed
-          pendingOwner = Owner (allocResource acquire release) (note script "owner settled")
-      (outcome, report) ←
-        runOwned pendingOwner $ \fixture → do
-          woken ← try (dispatch fixture pure)
-          (canceller, cancelled) ← forked $ do
-            readMVar enteredRelease
-            throwTo (ownerThread fixture) OwnerKilledAgain
-          (_, opened) ← forked $ do
-            readMVar enteredRelease
-            awaitThrowing canceller
-            putMVar releaseGate ()
-          note script "borrower finished"
-          pure (woken, cancelled, opened)
-      (woken, cancelled, opened) ← either throwIO pure outcome
-      failedWith OwnerKilled woken `shouldBe` True
-      cancelled >>= either throwIO pure
-      opened >>= either throwIO pure
-      thrown ← takeMVar throwerWait
-      thrown >>= either throwIO pure
-      events script `shouldReturn` ["acquired", "borrower finished", "released"]
-      reportAcquisitions report `shouldBe` 1
-      failure ← maybe (failed "the owner reported no failure") pure (reportFailure report)
-      fromException failure `shouldBe` Just OwnerKilled
-      let retained = [inner | ExceptionWithContext _ inner ← map cleanupFailureException (cleanupFailures failure)]
-      map fromException retained `shouldBe` [Just ReleaseFailed]
+      -- The thrower, the canceller and the opener all act around the owner's
+      -- acquisition and release, so their scopes enclose the whole run.
+      withForked (readMVar acquiring >> throwTo owner OwnerKilled) $ \thrower thrown →
+        withForked (readMVar enteredRelease >> throwTo owner OwnerKilledAgain) $ \canceller cancelled →
+          withForkedOpening
+            (void (tryPutMVar releaseGate ()))
+            (readMVar enteredRelease >> awaitThrowing canceller >> putMVar releaseGate ())
+            $ \_ opened → do
+              let pendingOwner = Owner (allocResource (acquire thrower) release) (note script "owner settled")
+              (outcome, report) ←
+                runOwned pendingOwner $ \fixture → do
+                  woken ← try (dispatch fixture pure)
+                  note script "borrower finished"
+                  pure woken
+              woken ← either throwIO pure outcome
+              failedWith OwnerKilled woken `shouldBe` True
+              cancelled >>= either throwIO pure
+              opened >>= either throwIO pure
+              thrown >>= either throwIO pure
+              events script `shouldReturn` ["acquired", "borrower finished", "released"]
+              reportAcquisitions report `shouldBe` 1
+              failure ← maybe (failed "the owner reported no failure") pure (reportFailure report)
+              fromException failure `shouldBe` Just OwnerKilled
+              let retained = [inner | ExceptionWithContext _ inner ← map cleanupFailureException (cleanupFailures failure)]
+              map fromException retained `shouldBe` [Just ReleaseFailed]
 
     it "interrupts a blocked acquisition with a cancellation, answering the waiter with it" $ do
       (script, enteredAcquire, _acquireGate) ← newScriptBlockingAcquire
       (outcome, report) ←
-        runOwned (scripted script) $ \fixture → do
-          (_, waited) ← forked (dispatch fixture pure)
-          readMVar enteredAcquire
-          -- Delivered while the owner blocks in the acquisition: the throwTo
-          -- returning proves the delivery, so the acquisition stayed
-          -- interruptible.
-          throwTo (ownerThread fixture) OwnerKilled
-          woken ← waited
-          note script "borrower finished"
-          pure woken
+        runOwned (scripted script) $ \fixture →
+          withForked (dispatch fixture pure) $ \_ waited → do
+            readMVar enteredAcquire
+            -- Delivered while the owner blocks in the acquisition: the throwTo
+            -- returning proves the delivery, so the acquisition stayed
+            -- interruptible.
+            throwTo (ownerThread fixture) OwnerKilled
+            woken ← waited
+            note script "borrower finished"
+            pure woken
       woken ← either throwIO pure outcome
       failedWith OwnerKilled woken `shouldBe` True
       events script `shouldReturn` ["borrower finished"]
@@ -396,25 +403,29 @@ spec shared = describe "the shared fixture" $ do
       started ← newEmptyMVar
       ranQueued ← newIORef False
       finishedInFlight ← newIORef False
-      (inFlight, inFlightOutcome) ←
-        forked . owned shared $ \session → do
-          putMVar started ()
-          takeMVar gate
-          writeIORef finishedInFlight True
-          pure (sessionBackend session)
-      takeMVar started
-      before ← queuedCount (sharedFixture shared)
-      (queued, queuedOutcome) ← forked . owned shared $ \session → writeIORef ranQueued True >> pure (sessionBackend session)
-      awaitQueued (sharedFixture shared) (before + 1)
-      killThread queued
-      killThread inFlight
-      queuedOutcome >>= (`shouldBe` True) . killed
-      inFlightOutcome >>= (`shouldBe` True) . killed
-      putMVar gate ()
-      owned shared (pure . sessionBackend) `shouldReturn` sharedBackend (sharedGate shared)
-      readIORef finishedInFlight `shouldReturn` True
-      readIORef ranQueued `shouldReturn` False
-      acquisitions shared `shouldReturn` 1
+      -- The gate holds the owner's in-flight operation, so a scope that ends before the example opens it opens it itself.
+      withForkedOpening
+        (void (tryPutMVar gate ()))
+        ( owned shared $ \session → do
+            putMVar started ()
+            takeMVar gate
+            writeIORef finishedInFlight True
+            pure (sessionBackend session)
+        )
+        $ \inFlight inFlightOutcome → do
+          takeMVar started
+          before ← queuedCount (sharedFixture shared)
+          withForked (owned shared $ \session → writeIORef ranQueued True >> pure (sessionBackend session)) $ \queued queuedOutcome → do
+            awaitQueued (sharedFixture shared) (before + 1)
+            killThread queued
+            killThread inFlight
+            queuedOutcome >>= (`shouldBe` True) . killed
+            inFlightOutcome >>= (`shouldBe` True) . killed
+            putMVar gate ()
+            owned shared (pure . sessionBackend) `shouldReturn` sharedBackend (sharedGate shared)
+            readIORef finishedInFlight `shouldReturn` True
+            readIORef ranQueued `shouldReturn` False
+            acquisitions shared `shouldReturn` 1
 
 -- ---------------------------------------------------------------------------
 -- A scripted owner
@@ -504,13 +515,26 @@ scripted script =
 -- ---------------------------------------------------------------------------
 -- Helpers
 
--- | Start an action on a thread of its own; the second value waits for its
--- outcome, which is recorded even when the thread is killed before it runs.
-forked ∷ IO a → IO (ThreadId, IO (Either SomeException a))
-forked action = do
+-- | Run an action on an owned thread for the length of the body, which is given the thread and a wait for its outcome (#594).
+-- However the scope ends, a return, a failure, a timeout of the example or a cancellation, the thread has ended and been
+-- joined before it returns: the start is "Test.Support.Owned"'s, and the stop-and-join is not interruptible. The outcome is
+-- the action's own, and a thread killed before it first ran has the outcome of being killed, as @forkFinally@ recorded it. The
+-- wait ends when the thread does, so a body that waits for a thread nothing will end waits for ever, as it always did.
+withForked ∷ IO a → (ThreadId → IO (Either SomeException a) → IO b) → IO b
+withForked = withForkedOpening (pure ())
+
+-- | 'withForked' for a thread held at a gate only the scope can open: the first argument is run, idempotently and without
+-- blocking, in the uninterruptible release and before the kill, so a gate left closed by a failed example never holds the
+-- join, a cancellation delivered as the scope begins included.
+withForkedOpening ∷ IO () → IO a → (ThreadId → IO (Either SomeException a) → IO b) → IO b
+withForkedOpening = withForkedIn ownedScope
+
+-- | 'withForkedOpening' in a chosen kind of scope, for the ownership regressions' negative controls.
+withForkedIn ∷ Scope → IO () → IO a → (ThreadId → IO (Either SomeException a) → IO b) → IO b
+withForkedIn scope open action body = do
   finished ← newEmptyMVar
-  thread ← forkFinally action (putMVar finished)
-  pure (thread, readMVar finished)
+  startIn scope Unbound open (try action >>= putMVar finished) $ \thread ended →
+    body thread (ended >> tryReadMVar finished >>= maybe (pure (Left (toException ThreadKilled))) pure)
 
 -- | Wait until the thread is blocked delivering an exception, so a
 -- cancellation aimed at an uninterruptible owner is known to be pending before

@@ -451,6 +451,7 @@ test-suite glfw-native-tests
         Test.GLFW.Native.Session
         Test.GLFW.Native.Spec
         Test.GLFW.Native.Support
+        Test.GLFW.Native.Threads
         Test.GLFW.Native.Wake
         Test.GLFW.Native.Wayland
         Test.GLFW.Native.WaylandScenarios
