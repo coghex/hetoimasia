@@ -2795,7 +2795,7 @@ happens to run in. [#585](https://github.com/coghex/hetoimasia/issues/585) close
 - **Recording.** `run.sh build` records, for every named target that resolves to exactly one executable, the identity of the tree the
   build started from: the source digest over the same roots and files as before, and the repository revision (` (dirty)` when tracked
   files differ). Building `hetoimasia:test:run-native-tests`, however it is spelled and even alone, also records
-  `hetoimasia:exe:hetoimasia`, which it launches. A library or a whole package builds as before and records nothing. A build that fails,
+  `hetoimasia:exe:hetoimasia`, which it launches. A library or a whole package builds as before and records nothing. `build` takes component names only: an option such as `--dry-run`, which Cabal answers without compiling, is refused with status 2 before anything runs, since a record made after it would describe an executable that was not built. A build that fails,
   is interrupted, or sees the tree change while it compiles records nothing; one that compiled but could not record exits 1 naming the
   component. The record lives in `native-identity/` inside the build directory (`dist-vulkan/`, or `dist-vulkan-vma-safe/` for the
   `safe` variant, so the variants never touch each other's), a declared generated path that Git ignores; it is not one of the digest's
