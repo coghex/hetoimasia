@@ -94,7 +94,7 @@ spec = do
     it ("finishes the exit when the example body " <> label <> " during the run's startup, before the rescue is registered (#593)") $
       boundedExample (ownedEnds ending completionStartupScenario False)
   for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
-    for_ [0 .. 2] $ \k →
+    for_ [-1 .. 2] $ \k →
       it ("finishes the exit on the supplier's evidence when the example body " <> label <> " at setup step " <> show k <> " of the completion fixture (#593)") $
         boundedExample (ownedEnds ending (completionSetupScenario k) False)
   it "retains terminal facts the completion publisher refused, and transports them at the next opportunity"
@@ -212,7 +212,9 @@ completionEndedEarlyScenario scope atParked = completionWithoutEvidence scope (p
 completionStartupScenario ∷ Scope → IO () → IO ()
 completionStartupScenario scope atParked = completionWithoutEvidence scope atParked (Just (\_ → pure ()))
 
--- | The same fixture ended at the boundary before setup step @k@ (#593): 0 is the body's start (the host exists), 1 follows the
+-- | The same fixture ended at the boundary before setup step @k@ (#593): -1 is the body's first statement, with the owner created
+-- and the rescue not yet registered (the backend's failing behaviour is armed only by the registration step, so there is nothing
+-- for the exit to wait for), 0 is the first statement after the registration (the host exists), 1 follows the
 -- window lookup, 2 follows the target handover and the supplier's hand-over, which are one uninterruptible step (an attachment
 -- never exists without the supplier holding what it publishes with). Between any two steps the fixture is partially built.
 completionSetupScenario ∷ Int → Scope → IO () → IO ()
@@ -273,7 +275,9 @@ completionWithoutEvidence scope beforeBody endEarly = do
         restore body `finally` void (tryPutMVar bodyDone ())
   withDeferredThreadVia scope (pure ()) supplier $ \_ handOver → case endEarly of
    Just step →
-    ownedHostBeforeBody beforeBody recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control →
+    ownedHostBeforeBody beforeBody recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+      -- Step -1: the owner exists and the body has begun, but the rescue is not yet registered and nothing fails yet.
+      step (-1)
       guarded handOver host owner $ do
         step 0
         window ← theWindow host

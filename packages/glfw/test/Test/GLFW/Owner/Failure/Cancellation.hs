@@ -14,7 +14,7 @@ import Control.Concurrent.STM
   , writeTVar
   )
 import Control.Exception (AsyncException (ThreadKilled), mask_, throwTo)
-import Control.Monad (forM_, void)
+import Control.Monad (forM_, unless, void, when)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as Text
 import Hetoimasia.Runtime.GLFW
@@ -55,6 +55,9 @@ spec = do
   for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
     it ("finishes the exit on the interrupter's evidence when the example body " <> label <> " right after the interrupter was handed the owner (#593)") $
       boundedExample (ownedEnds ending escapedDestructionEndedEarlyScenario False)
+  for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
+    it ("finishes the exit when the example body " <> label <> " at the body's first statement, before the rescue is registered (#593)") $
+      boundedExample (ownedEnds ending escapedDestructionBeforeRegistrationScenario False)
   for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
     it ("finishes the exit when the example body " <> label <> " during the run's startup, before the rescue is registered (#593)") $
       boundedExample (ownedEnds ending escapedDestructionStartupScenario False)
@@ -261,13 +264,18 @@ testEscapedDestructionCancellation = escapedDestruction withOwnedThreadOpening (
 -- been handed the owner (#593): the exit's drain must still finish on the evidence the interrupter publishes, which the exit
 -- waits for before the scope around the host could stop it.
 escapedDestructionEndedEarlyScenario ∷ Scope → IO () → IO ()
-escapedDestructionEndedEarlyScenario scope atParked = escapedDestruction scope (pure ()) (Just atParked)
+escapedDestructionEndedEarlyScenario scope atParked = escapedDestruction scope (pure ()) (Just (\registered → when registered atParked))
+
+-- | The same fixture ended at the body's first statement, with the owner created and the rescue not yet registered (#593): the
+-- destruction's blocking behaviour is armed only by the registration step, so there is nothing for the exit to wait for.
+escapedDestructionBeforeRegistrationScenario ∷ Scope → IO () → IO ()
+escapedDestructionBeforeRegistrationScenario scope atParked = escapedDestruction scope (pure ()) (Just (\registered → unless registered atParked))
 
 -- | The same fixture ended during the run's startup (#593), after the host is built and before the body's first statement.
 escapedDestructionStartupScenario ∷ Scope → IO () → IO ()
-escapedDestructionStartupScenario scope atParked = escapedDestruction scope atParked (Just (pure ()))
+escapedDestructionStartupScenario scope atParked = escapedDestruction scope atParked (Just (\_ → pure ()))
 
-escapedDestruction ∷ Scope → IO () → Maybe (IO ()) → IO ()
+escapedDestruction ∷ Scope → IO () → Maybe (Bool → IO ()) → IO ()
 escapedDestruction scope beforeBody endEarly = do
   rig ← newRig
   inside ← newTVarIO False
@@ -294,10 +302,11 @@ escapedDestruction scope beforeBody endEarly = do
         atomically (writeTVar releasedEarly (Just (filter released notes)))
         publishOwnerDestruction owner (ownerDestroyed (Text.pack "destroyed independently"))
   withDeferredThreadVia scope (pure ()) interrupter $ \_ handOver → case endEarly of
-   Just atParked →
+   Just step →
     ownedHostBeforeBody beforeBody recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _ → do
+      step False
       mask_ (handOver owner >> arm)
-      atParked
+      step True
    Nothing → do
     (unverified, _) ← caughtAs @OwnerDestructionUnverified $
       ownedHostBeforeBody beforeBody recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
