@@ -5,7 +5,7 @@
 module Test.GLFW.Owner.Handover (spec) where
 
 import Control.Concurrent (myThreadId)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, takeMVar)
 import Control.Concurrent.STM
   ( atomically
   , check
@@ -48,6 +48,7 @@ import Test.GLFW.Owner.Fixture.Rig
   , newRig
   , newRigWith
   , ownedHost
+  , ownedHostHeldStart
   , ownedHostHooked
   , ownerSettings
   )
@@ -66,6 +67,8 @@ spec ∷ Spec
 spec = do
   it "registers the attachment, tells the owner, and only then constructs the backend's target"
     (boundedExample testHandoffOrder)
+  cutExamples "the handoff order fixture" [0, 1] handoffOrderScenario
+  cutExamples "the handover recovery fixture" [0, 1] handoverRecoveryScenario
   it "refuses an observation whose revision does not advance, and one for an incarnation the slot moved past"
     (boundedExample testRevisionMonotonicity)
   it "retains a partially constructed target and retires it, publishing nothing usable"
@@ -89,18 +92,22 @@ spec = do
 -- backend construct anything. Nothing the backend builds can precede the
 -- window's exclusive slot being reserved.
 testHandoffOrder ∷ IO ()
-testHandoffOrder = do
+testHandoffOrder = handoffOrderFixture (\_ → pure ())
+
+-- | The same fixture ended at the cut (#593): 0 in the startup hook before the owner is held in its startup, 1 once the release of that
+-- hold is registered.
+handoffOrderScenario ∷ Int → Scope → IO () → IO ()
+handoffOrderScenario k _ atParked = handoffOrderFixture (\i → when (i == k) atParked)
+
+handoffOrderFixture ∷ (Int → IO ()) → IO ()
+handoffOrderFixture cut = do
   rig ← newRig
   gate ← newTVarIO False
   entered ← newEmptyMVar
   -- The owner is held inside its startup, so it can have drained no lifetime
   -- event and constructed nothing while the main thread reserves the slot.
-  script (fakeStart (rigFake rig)) $ \_ → do
-    putMVar entered ()
-    atomically (readTVar gate >>= check)
-    pure (ownerReady (Text.pack "started"))
   (pendingBeforeConstruction, notesBefore, views) ←
-    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+    ownedHostHeldStart cut rig (rigHostConfig rig) gate entered (ownerReady (Text.pack "started")) $ \host owner _control → do
       takeMVar entered
       window ← theWindow host
       service ← handedOver host owner window
@@ -268,7 +275,15 @@ testVerifiedRollback = do
 -- | A refused handover spends no reservation, and an attachment whose answer
 -- was lost is still announced.
 testHandoverRecovery ∷ IO ()
-testHandoverRecovery = do
+testHandoverRecovery = handoverRecoveryFixture (\_ → pure ())
+
+-- | The same fixture ended at the cut (#593): 0 in the startup hook before the owner is held in its startup, 1 once the release of that
+-- hold is registered.
+handoverRecoveryScenario ∷ Int → Scope → IO () → IO ()
+handoverRecoveryScenario k _ atParked = handoverRecoveryFixture (\i → when (i == k) atParked)
+
+handoverRecoveryFixture ∷ (Int → IO ()) → IO ()
+handoverRecoveryFixture cut = do
   -- One event of room, so a leaked reservation makes the next handover fail.
   rig ← newRigWith (\config → config {ownerEventCapacity = 1})
   clock ← countingClock
@@ -280,11 +295,7 @@ testHandoverRecovery = do
   entered ← newEmptyMVar
   -- The owner is held inside its startup, so it drains no event: the one slot
   -- has to be given back by each refusal for the last handover to fit at all.
-  script (fakeStart (rigFake rig)) $ \_ → do
-    putMVar entered ()
-    atomically (readTVar gate >>= check)
-    pure (ownerReady (Text.pack "late"))
-  (refusals, announced, owned) ← ownedHost (rigSeam rig) config (rigOwnerConfig rig) $ \host owner _control → do
+  (refusals, announced, owned) ← ownedHostHeldStart cut rig config gate entered (ownerReady (Text.pack "late")) $ \host owner _control → do
     takeMVar entered
     windows ← atomically (hostWindowIdentities host)
     case windows of

@@ -44,6 +44,7 @@ import Test.GLFW.Owner.Fixture.Rig
   , newRig
   , newRigWith
   , ownedHost
+  , ownedHostHeldStart
   , ownedHostHooked
   , ownerSettings
   )
@@ -52,6 +53,7 @@ import Test.GLFW.Support
   ( Ending (..)
   , Scope
   , boundedExample
+  , cutExamples
   , exitFinishes
   , newSinkTrace
   , quietLogger
@@ -68,6 +70,8 @@ spec = do
     (boundedExample testNormalStopClosesPublications)
   it "settles a direct attachment whose announcement was refused, rather than reporting a release"
     (boundedExample testUnannouncedDirectAttachSettles)
+  cutExamples "the unannounced direct attachment fixture" [0, 1] unannouncedDirectAttachSettlesScenario
+  cutExamples "the unannounced closed fixture" [0, 1] unannouncedClosedSettlesScenario
   it "settles one whose window is then closed, with no release of its own"
     (boundedExample testUnannouncedClosedSettles)
   it "settles a published attachment whose answer was lost while the owner was closing"
@@ -129,20 +133,24 @@ testNormalStopClosesPublications = do
 -- answered 'ReleaseBegun' would be claiming an evidence path that does not
 -- exist, and the host drain would wait on it forever.
 testUnannouncedDirectAttachSettles ∷ IO ()
-testUnannouncedDirectAttachSettles = do
+testUnannouncedDirectAttachSettles = unannouncedDirectAttachSettlesFixture (\_ → pure ())
+
+-- | The same fixture ended at the cut (#593): 0 in the startup hook before the owner is held in its startup, 1 once the release of that
+-- hold is registered.
+unannouncedDirectAttachSettlesScenario ∷ Int → Scope → IO () → IO ()
+unannouncedDirectAttachSettlesScenario k _ atParked = unannouncedDirectAttachSettlesFixture (\i → when (i == k) atParked)
+
+unannouncedDirectAttachSettlesFixture ∷ (Int → IO ()) → IO ()
+unannouncedDirectAttachSettlesFixture cut = do
   rig ← newRigWith (\config → config {ownerEventCapacity = 1})
   gate ← newTVarIO False
   entered ← newEmptyMVar
-  script (fakeStart (rigFake rig)) $ \_ → do
-    putMVar entered ()
-    atomically (readTVar gate >>= check)
-    pure (ownerReady (Text.pack "late"))
   clock ← countingClock
   let config =
         (ownerSettings clock)
           { hostWindowConfigs = [windowNamed (Text.pack "first"), windowNamed (Text.pack "second")]
           }
-  (admitted, answer, stage, pending) ← ownedHost (rigSeam rig) config (rigOwnerConfig rig) $ \host owner _control → do
+  (admitted, answer, stage, pending) ← ownedHostHeldStart cut rig config gate entered (ownerReady (Text.pack "late")) $ \host owner _control → do
     takeMVar entered
     windows ← atomically (hostWindowIdentities host)
     case windows of
@@ -188,20 +196,24 @@ describeRelease = \case
 -- which is the backstop every path that begins a retirement without a
 -- release arrives at.
 testUnannouncedClosedSettles ∷ IO ()
-testUnannouncedClosedSettles = do
+testUnannouncedClosedSettles = unannouncedClosedSettlesFixture (\_ → pure ())
+
+-- | The same fixture ended at the cut (#593): 0 in the startup hook before the owner is held in its startup, 1 once the release of that
+-- hold is registered.
+unannouncedClosedSettlesScenario ∷ Int → Scope → IO () → IO ()
+unannouncedClosedSettlesScenario k _ atParked = unannouncedClosedSettlesFixture (\i → when (i == k) atParked)
+
+unannouncedClosedSettlesFixture ∷ (Int → IO ()) → IO ()
+unannouncedClosedSettlesFixture cut = do
   rig ← newRigWith (\config → config {ownerEventCapacity = 1})
   gate ← newTVarIO False
   entered ← newEmptyMVar
-  script (fakeStart (rigFake rig)) $ \_ → do
-    putMVar entered ()
-    atomically (readTVar gate >>= check)
-    pure (ownerReady (Text.pack "late"))
   clock ← countingClock
   let config =
         (ownerSettings clock)
           { hostWindowConfigs = [windowNamed (Text.pack "first"), windowNamed (Text.pack "second")]
           }
-  (admitted, stage, retirements) ← ownedHost (rigSeam rig) config (rigOwnerConfig rig) $ \host owner control → do
+  (admitted, stage, retirements) ← ownedHostHeldStart cut rig config gate entered (ownerReady (Text.pack "late")) $ \host owner control → do
     takeMVar entered
     windows ← atomically (hostWindowIdentities host)
     case windows of
