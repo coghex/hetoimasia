@@ -3,7 +3,6 @@
 -- or retaining exactly what that call may have left behind.
 module Test.GLFW.Owner.Failure.Cancellation (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.STM
   ( TVar
   , atomically
@@ -39,6 +38,8 @@ import Test.GLFW.Support
   , unexpected
   )
 import Test.Hspec (Spec, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.GLFW.Support (withDeferredThread)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = do
@@ -103,28 +104,30 @@ testCancellationAtEachBackendCall =
           notes ← journalled (rigJournal rig)
           atomically (writeTVar releasedEarly (Just (filter released notes)))
           atomically (writeTVar release True)
-    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
-      window ← theWindow host
-      void (forkIO deliver)
-      service ← handedOver host owner window
-      -- The body must not return before a call that happens during the run
-      -- has been entered and interrupted, or the exit would stop the owner
-      -- first and the gate would never be reached at all. The destruction is
-      -- the exception: it is only ever entered during the exit.
-      case at' of
-        BackendConstruct → atomically (readTVar release >>= check)
-        BackendRetireTarget → do
-          void (awaitStanding owner service)
-          _ ← releaseGraphicsTarget host owner service
-          atomically (readTVar release >>= check)
-          _ ← awaitTerminal owner service
-          pumpUntilRetired host control
-        BackendDestroy → void (awaitStanding owner service)
-    readTVarIO releasedEarly >>= \seen → (show at', seen) `shouldBe` (show at', Just [])
-    readTVarIO absorbed >>= \count → count `shouldSatisfy` (>= 2)
-    -- And the exit still completed in dependency order.
-    notes ← journalled (rigJournal rig)
-    ordered notes [OwnerRetirement, OwnerDestruction, SessionEnded]
+    -- The helper drives the owner through the gate it is held at and opens that gate itself, so it is owned by the example and
+    -- outlives the host body (#593); the scope opens the gate as well, whatever ended it.
+    withOwnedThreadOpening (atomically (writeTVar release True)) deliver $ \_ _ → do
+      ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+        window ← theWindow host
+        service ← handedOver host owner window
+        -- The body must not return before a call that happens during the run
+        -- has been entered and interrupted, or the exit would stop the owner
+        -- first and the gate would never be reached at all. The destruction is
+        -- the exception: it is only ever entered during the exit.
+        case at' of
+          BackendConstruct → atomically (readTVar release >>= check)
+          BackendRetireTarget → do
+            void (awaitStanding owner service)
+            _ ← releaseGraphicsTarget host owner service
+            atomically (readTVar release >>= check)
+            _ ← awaitTerminal owner service
+            pumpUntilRetired host control
+          BackendDestroy → void (awaitStanding owner service)
+      readTVarIO releasedEarly >>= \seen → (show at', seen) `shouldBe` (show at', Just [])
+      readTVarIO absorbed >>= \count → count `shouldSatisfy` (>= 2)
+      -- And the exit still completed in dependency order.
+      notes ← journalled (rigJournal rig)
+      ordered notes [OwnerRetirement, OwnerDestruction, SessionEnded]
   where
     released = \case
       WindowGone _ → True
@@ -166,33 +169,33 @@ testEscapedConstructionCancellation = do
   script (fakeRetireTarget (rigFake rig)) $ \retire → do
     atomically (readTVar gate >>= check)
     pure (targetRetired (Text.pack (show (retiringWindow retire))))
-  (raised, _) ← caughtAs @AsyncException $
-    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
-      window ← theWindow host
-      void (forkIO (killInside rig inside))
-      service ← handedOver host owner window
-      -- Neither accepted nor verifiably rolled back: the owner records what
-      -- it knows, which is that it may own whatever the call had built.
-      standing ← awaitStanding owner service
-      atomically (writeTVar observedStanding (Just standing))
-      atomically (writeTVar gate True)
-      _ ← releaseGraphicsTarget host owner service
-      _ ← awaitTerminal owner service
-      pumpUntilRetired host control
-  raised `shouldBe` ThreadKilled
-  readTVarIO observedStanding `shouldReturn` Just (TargetUnusable True)
-  -- Retired as an unconstructed target, and the whole exit kept its order.
-  retirements ← readTVarIO (fakeRetirements (rigFake rig))
-  map retiringConstructed retirements `shouldBe` [False]
-  notes ← journalled (rigJournal rig)
-  ordered
-    notes
-    [ TargetRetirement (Text.pack "WindowId 1")
-    , OwnerRetirement
-    , OwnerDestruction
-    , WindowGone 1
-    , SessionEnded
-    ]
+  withOwnedThread (killInside rig inside) $ \_ _ → do
+    (raised, _) ← caughtAs @AsyncException $
+      ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+        window ← theWindow host
+        service ← handedOver host owner window
+        -- Neither accepted nor verifiably rolled back: the owner records what
+        -- it knows, which is that it may own whatever the call had built.
+        standing ← awaitStanding owner service
+        atomically (writeTVar observedStanding (Just standing))
+        atomically (writeTVar gate True)
+        _ ← releaseGraphicsTarget host owner service
+        _ ← awaitTerminal owner service
+        pumpUntilRetired host control
+    raised `shouldBe` ThreadKilled
+    readTVarIO observedStanding `shouldReturn` Just (TargetUnusable True)
+    -- Retired as an unconstructed target, and the whole exit kept its order.
+    retirements ← readTVarIO (fakeRetirements (rigFake rig))
+    map retiringConstructed retirements `shouldBe` [False]
+    notes ← journalled (rigJournal rig)
+    ordered
+      notes
+      [ TargetRetirement (Text.pack "WindowId 1")
+      , OwnerRetirement
+      , OwnerDestruction
+      , WindowGone 1
+      , SessionEnded
+      ]
 
 -- | A target retirement the cancellation escaped manufactures no evidence and
 -- is never offered again — not by a later round, and not by the drain.
@@ -211,35 +214,35 @@ testEscapedRetirementCancellation = do
     unexpected "the interrupted target retirement returned"
   observedTargets ← newTVarIO []
   observedRecords ← newTVarIO []
-  (raised, _) ← caughtAs @AsyncException $
-    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
-      window ← theWindow host
-      service ← handedOver host owner window
-      awaitStanding owner service `shouldReturn` TargetUsable
-      void (forkIO (killInside rig inside))
-      _ ← releaseGraphicsTarget host owner service
-      -- The run has ended and its drain has finished, so nothing is still to
-      -- come that could offer the operation a second time.
-      atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
-      atomically . writeTVar observedRecords . Map.keys =<< atomically (readTargetTerminalsNow owner)
-      atomically . writeTVar observedTargets =<< atomically (readOwnerTargets owner)
-      -- Independent evidence is the only thing that can retire it now, which
-      -- is what lets this example's own exit finish.
-      publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
-      acknowledgement ←
-        atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
-          >>= maybe (unexpected "the attachment kept no acknowledgement") pure
-      forM_ allRetirementFacts $ \fact →
-        void (publishCompletion publisher (completionNotice (graphicsAttachment service) acknowledgement fact))
-      pumpUntilRetired host control
-  raised `shouldBe` ThreadKilled
-  -- No acknowledgement was manufactured for a call whose outcome is unknown.
-  readTVarIO observedRecords `shouldReturn` []
-  -- The target stays the owner's, explicitly unverified.
-  readTVarIO observedTargets >>= \held → length held `shouldBe` 1
-  -- And it was offered exactly once, over the whole run and its drain.
-  notes ← journalled (rigJournal rig)
-  length [() | TargetRetirement _ ← notes] `shouldBe` 1
+  withOwnedThread (killInside rig inside) $ \_ _ → do
+    (raised, _) ← caughtAs @AsyncException $
+      ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+        window ← theWindow host
+        service ← handedOver host owner window
+        awaitStanding owner service `shouldReturn` TargetUsable
+        _ ← releaseGraphicsTarget host owner service
+        -- The run has ended and its drain has finished, so nothing is still to
+        -- come that could offer the operation a second time.
+        atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
+        atomically . writeTVar observedRecords . Map.keys =<< atomically (readTargetTerminalsNow owner)
+        atomically . writeTVar observedTargets =<< atomically (readOwnerTargets owner)
+        -- Independent evidence is the only thing that can retire it now, which
+        -- is what lets this example's own exit finish.
+        publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
+        acknowledgement ←
+          atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
+            >>= maybe (unexpected "the attachment kept no acknowledgement") pure
+        forM_ allRetirementFacts $ \fact →
+          void (publishCompletion publisher (completionNotice (graphicsAttachment service) acknowledgement fact))
+        pumpUntilRetired host control
+    raised `shouldBe` ThreadKilled
+    -- No acknowledgement was manufactured for a call whose outcome is unknown.
+    readTVarIO observedRecords `shouldReturn` []
+    -- The target stays the owner's, explicitly unverified.
+    readTVarIO observedTargets >>= \held → length held `shouldBe` 1
+    -- And it was offered exactly once, over the whole run and its drain.
+    notes ← journalled (rigJournal rig)
+    length [() | TargetRetirement _ ← notes] `shouldBe` 1
 
 -- | A destruction the cancellation escaped establishes nothing, so the host,
 -- its windows, its session and every parent stay retained until independent
@@ -256,18 +259,10 @@ testEscapedDestructionCancellation = do
     atomically (readTVar never >>= check)
     unexpected "the interrupted destruction returned"
   releasedEarly ← newTVarIO Nothing
-  (unverified, _) ← caughtAs @OwnerDestructionUnverified $
-    ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
-      window ← theWindow host
-      service ← handedOver host owner window
-      awaitStanding owner service `shouldReturn` TargetUsable
-      _ ← releaseGraphicsTarget host owner service
-      _ ← awaitTerminal owner service
-      pumpUntilRetired host control
-      -- The destruction is only ever entered during the exit, when the main
-      -- thread is no longer in the body, so both the interruption and the
-      -- independent evidence come from a thread of the example's own.
-      void . forkIO $ do
+  -- The destruction is only ever entered during the exit, when the main thread is no longer in the body, so both the
+  -- interruption and the independent evidence come from a thread of the example's own. The evidence is what ends the exit's
+  -- wait, so the thread outlives the body: the example owns it, and the body only hands it the owner (#593).
+  let interrupter owner = do
         killInside rig inside
         -- The owner's run has ended with nothing established, and the exit
         -- has said once what it is retaining for the want of it.
@@ -276,18 +271,28 @@ testEscapedDestructionCancellation = do
         notes ← journalled (rigJournal rig)
         atomically (writeTVar releasedEarly (Just (filter released notes)))
         publishOwnerDestruction owner (ownerDestroyed (Text.pack "destroyed independently"))
-  -- Nothing was released for a destruction that established nothing: the
-  -- windows and the session both outlast the whole retained wait.
-  readTVarIO releasedEarly `shouldReturn` Just []
-  -- The owner retired; only its destruction is unverified, and no target is.
-  unverifiedRetired unverified `shouldBe` True
-  unverifiedTargets unverified `shouldBe` 0
-  -- The destruction raised and was offered exactly once: an operation whose
-  -- outcome is unknown is not repeated, and no evidence was manufactured for
-  -- it. Only the independent publication ended the wait.
-  notes ← journalled (rigJournal rig)
-  length [() | OwnerDestruction ← notes] `shouldBe` 1
-  length [() | DestroyRaised _ ← notes] `shouldBe` 1
+  withDeferredThread interrupter $ \_ handOver → do
+    (unverified, _) ← caughtAs @OwnerDestructionUnverified $
+      ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+        window ← theWindow host
+        service ← handedOver host owner window
+        awaitStanding owner service `shouldReturn` TargetUsable
+        _ ← releaseGraphicsTarget host owner service
+        _ ← awaitTerminal owner service
+        pumpUntilRetired host control
+        handOver owner
+    -- Nothing was released for a destruction that established nothing: the
+    -- windows and the session both outlast the whole retained wait.
+    readTVarIO releasedEarly `shouldReturn` Just []
+    -- The owner retired; only its destruction is unverified, and no target is.
+    unverifiedRetired unverified `shouldBe` True
+    unverifiedTargets unverified `shouldBe` 0
+    -- The destruction raised and was offered exactly once: an operation whose
+    -- outcome is unknown is not repeated, and no evidence was manufactured for
+    -- it. Only the independent publication ended the wait.
+    notes ← journalled (rigJournal rig)
+    length [() | OwnerDestruction ← notes] `shouldBe` 1
+    length [() | DestroyRaised _ ← notes] `shouldBe` 1
   where
     released = \case
       WindowGone _ → True

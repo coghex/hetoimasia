@@ -4,7 +4,6 @@
 -- destruction is retained rather than disposed of.
 module Test.GLFW.Owner.Failure.Evidence (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
   ( stateTVar
@@ -70,6 +69,7 @@ import Test.GLFW.Support
   , windowNamed
   )
 import Test.Hspec (Spec, it, shouldBe, shouldContain, shouldReturn, shouldSatisfy)
+import Test.GLFW.Support (withDeferredThread)
 
 spec ∷ Spec
 spec = do
@@ -195,32 +195,9 @@ testCompletionWithoutEvidence = do
   script (fakeRetireTarget (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire target")))
   script (fakeRetireOwner (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "retire owner")))
   script (fakeDestroy (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "destroy")))
-  (unverified, _) ← caughtAs @OwnerDestructionUnverified $
-    ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
-      window ← theWindow host
-      service ← handedOver host owner window
-      -- The owner's run has ended and it established nothing.
-      atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
-      records ← atomically (readTargetTerminalsNow owner)
-      Map.keys records `shouldBe` []
-      held ← atomically (readOwnerTargets owner)
-      length held `shouldBe` 1
-      -- The window's slot is still occupied and every fact is still owed: the
-      -- worker's completion changed none of that.
-      observation ← atomically (readGraphicsService service)
-      observedMissing observation `shouldBe` allRetirementFacts
-      pending ← atomically (hostPendingAttachments host)
-      length pending `shouldBe` 1
-      -- Independent evidence, from a thread that is not the main one, is the
-      -- only thing that can retire any of this — the attachment's facts, and
-      -- then the owner's own destruction. Without both, the boundary retains
-      -- the window, the session and every parent for good, which is the whole
-      -- point; with them, this example's exit can finish.
-      publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
-      acknowledgement ←
-        atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
-          >>= maybe (unexpected "the attachment kept no acknowledgement") pure
-      void . forkIO $ do
+  -- The thread supplies the independent evidence that lets the exit finish, so it is owned by the example and outlives the host
+  -- body that hands it what it publishes with (#593).
+  let supplier (host, owner, service, publisher, acknowledgement) = do
         -- The attachment is still the main thread's and is only retiring once
         -- the exit's quiescence has begun it, so the facts are published into
         -- a model that can record them rather than refuse them.
@@ -233,11 +210,38 @@ testCompletionWithoutEvidence = do
         atomically (check . null =<< hostPendingAttachments host)
         awaitDiagnostic trace
         publishOwnerDestruction owner (ownerDestroyed (Text.pack "destroyed independently"))
-  unverifiedRetired unverified `shouldBe` False
-  unverifiedTargets unverified `shouldBe` 1
-  -- Said exactly once, whatever the wait then had to do.
-  components ← traced trace
-  length (filter (== Text.pack "glfw.graphics-owner") components) `shouldBe` 1
+  withDeferredThread supplier $ \_ handOver → do
+    (unverified, _) ← caughtAs @OwnerDestructionUnverified $
+      ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+        window ← theWindow host
+        service ← handedOver host owner window
+        -- The owner's run has ended and it established nothing.
+        atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
+        records ← atomically (readTargetTerminalsNow owner)
+        Map.keys records `shouldBe` []
+        held ← atomically (readOwnerTargets owner)
+        length held `shouldBe` 1
+        -- The window's slot is still occupied and every fact is still owed: the
+        -- worker's completion changed none of that.
+        observation ← atomically (readGraphicsService service)
+        observedMissing observation `shouldBe` allRetirementFacts
+        pending ← atomically (hostPendingAttachments host)
+        length pending `shouldBe` 1
+        -- Independent evidence, from a thread that is not the main one, is the
+        -- only thing that can retire any of this — the attachment's facts, and
+        -- then the owner's own destruction. Without both, the boundary retains
+        -- the window, the session and every parent for good, which is the whole
+        -- point; with them, this example's exit can finish.
+        publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
+        acknowledgement ←
+          atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
+            >>= maybe (unexpected "the attachment kept no acknowledgement") pure
+        handOver (host, owner, service, publisher, acknowledgement)
+    unverifiedRetired unverified `shouldBe` False
+    unverifiedTargets unverified `shouldBe` 1
+    -- Said exactly once, whatever the wait then had to do.
+    components ← traced trace
+    length (filter (== Text.pack "glfw.graphics-owner") components) `shouldBe` 1
 
 -- | A terminal fact the completion publisher could not carry stays owed, and
 -- nothing loses it.
@@ -299,23 +303,29 @@ testRequiredFailureClosesAdmission = do
     pure (ownerRetired (Text.pack "retired"))
   observedRefusal ← newTVarIO Nothing
   observedPhase ← newTVarIO OwnerStarting
-  (raised, _) ← caughtAs @Scripted $
-    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
-      window ← theWindow host
-      takeMVar retiring
-      -- The owner is already retiring and its admission is already closed, so
-      -- a handover now leaves nothing attached at all.
-      answer ← handOverGraphicsTarget host owner window
-      pending ← atomically (hostPendingAttachments host)
-      length pending `shouldBe` 0
-      status ← atomically (readOwnerStatusNow owner)
-      atomically $ do
-        writeTVar observedRefusal (Just (describeHandover answer))
-        writeTVar observedPhase (statusPhase status)
-      void (forkIO (atomically (writeTVar release True)))
-  raised `shouldBe` Scripted (Text.pack "fatal step")
-  readTVarIO observedRefusal `shouldReturn` Just "owner closed"
-  readTVarIO observedPhase `shouldReturn` OwnerRetiring
+  -- The helper opens the gate the retiring owner is held at once the body has made its observations, so the exit can finish.
+  -- It is owned by the example (#593), and the body hands it the go-ahead whether or not its assertions held, so a failed
+  -- assertion is reported rather than leaving the exit waiting at the gate.
+  withDeferredThread (\() → atomically (writeTVar release True)) $ \_ handOver → do
+    (raised, _) ← caughtAs @Scripted $
+      ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+        window ← theWindow host
+        takeMVar retiring
+        ( do
+            -- The owner is already retiring and its admission is already closed, so
+            -- a handover now leaves nothing attached at all.
+            answer ← handOverGraphicsTarget host owner window
+            pending ← atomically (hostPendingAttachments host)
+            length pending `shouldBe` 0
+            status ← atomically (readOwnerStatusNow owner)
+            atomically $ do
+              writeTVar observedRefusal (Just (describeHandover answer))
+              writeTVar observedPhase (statusPhase status)
+          )
+          `finally` handOver ()
+    raised `shouldBe` Scripted (Text.pack "fatal step")
+    readTVarIO observedRefusal `shouldReturn` Just "owner closed"
+    readTVarIO observedPhase `shouldReturn` OwnerRetiring
 
 -- | Whole-owner destruction that produced no evidence retains everything the
 -- owner borrowed, with no target involved at all.
@@ -326,26 +336,29 @@ testUnverifiedDestructionRetains = do
   let recording = sinkFailingOn (Text.pack "never") trace
   script (fakeDestroy (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "destroy")))
   releasedWhileRetained ← newTVarIO Nothing
-  (unverified, _) ← caughtAs @OwnerDestructionUnverified $
-    ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
-      _ ← awaitRound owner 0
-      -- From another thread: wait until the exit has said, once, what it is
-      -- retaining and why — which it does before it settles into the wait —
-      -- then record what has been released, and only then supply the
-      -- independent evidence that lets the boundary finish.
-      void . forkIO $ do
+  -- From another thread: wait until the exit has said, once, what it is retaining and why — which it does before it settles
+  -- into the wait — then record what has been released, and only then supply the independent evidence that lets the boundary
+  -- finish. That evidence is what ends the exit's wait, so the thread is owned by the example and outlives the host body that
+  -- hands it the owner (#593).
+  let supplier owner = do
         atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
         awaitDiagnostic trace
         notes ← journalled (rigJournal rig)
         atomically (writeTVar releasedWhileRetained (Just (filter released notes)))
         publishOwnerDestruction owner (ownerDestroyed (Text.pack "destroyed independently"))
-  unverifiedRetired unverified `shouldBe` True
-  unverifiedTargets unverified `shouldBe` 0
-  -- Nothing of the host's was released while the evidence was missing.
-  readTVarIO releasedWhileRetained `shouldReturn` Just []
-  -- And it was released in the end, after the evidence existed.
-  notes ← journalled (rigJournal rig)
-  notes `shouldContain` [SessionEnded]
+  withDeferredThread supplier $ \_ handOver → do
+    (unverified, _) ← caughtAs @OwnerDestructionUnverified $
+      ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
+        handOver owner
+        _ ← awaitRound owner 0
+        pure ()
+    unverifiedRetired unverified `shouldBe` True
+    unverifiedTargets unverified `shouldBe` 0
+    -- Nothing of the host's was released while the evidence was missing.
+    readTVarIO releasedWhileRetained `shouldReturn` Just []
+    -- And it was released in the end, after the evidence existed.
+    notes ← journalled (rigJournal rig)
+    notes `shouldContain` [SessionEnded]
   where
     released = \case
       WindowGone _ → True

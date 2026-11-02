@@ -3,7 +3,7 @@
 -- point after it, and the join waits for a terminal group report.
 module Test.GLFW.Owner.Failure.Interruption (spec) where
 
-import Control.Concurrent (forkIO, myThreadId)
+import Control.Concurrent (myThreadId)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
   ( atomically
@@ -19,6 +19,7 @@ import Control.Exception
   ( AsyncException (ThreadKilled)
   , MaskingState (MaskedInterruptible)
   , IOException
+  , finally
   , getMaskingState
   , throwTo
   )
@@ -42,6 +43,8 @@ import Test.GLFW.Owner.Fixture.Journal (Note (..), journalled)
 import Test.GLFW.Owner.Fixture.Rig (Rig (..), newRig, ownedHost, ownedHostCaught, ownedHostHooked)
 import Test.GLFW.Support (boundedExample, caughtAs, quietLogger, unexpected)
 import Test.Hspec (Spec, it, shouldBe, shouldContain, shouldReturn, shouldSatisfy)
+import Test.GLFW.Support (withDeferredThreadOpening)
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = do
@@ -80,35 +83,35 @@ testRetirementRecordSurvivesCancellation = do
             thread : _ → pure thread
             [] → retry
         forM_ [1 ∷ Int .. 20] (\_ → throwTo ownerThread ThreadKilled)
-  outcome ← ownedHostCaught (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
-    window ← theWindow host
-    service ← handedOver host owner window
-    awaitStanding owner service `shouldReturn` TargetUsable
-    void (forkIO harry)
-    _ ← releaseGraphicsTarget host owner service
-    atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
-    -- Independent evidence, so this exit finishes whichever way the
-    -- retirement settled.
-    publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
-    acknowledgement ←
-      atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
-        >>= maybe (unexpected "the attachment kept no acknowledgement") pure
-    forM_ allRetirementFacts $ \fact →
-      void (publishCompletion publisher (completionNotice (graphicsAttachment service) acknowledgement fact))
-    pumpUntilRetired host control
-    -- Captured here rather than returned: the run itself raises the
-    -- cancellation at its exit, so the body's value never reaches the caller.
-    atomically . writeTVar recorded . Map.keys =<< atomically (readTargetTerminalsNow owner)
-  -- However it ended, it ended by raising the cancellation rather than
-  -- swallowing it.
-  void (raisedBy outcome)
-  -- Offered exactly once, over the whole run and its drain, however many
-  -- cancellations arrived.
-  readTVarIO attempts `shouldReturn` 1
-  -- And because it returned, its record exists: a retirement the owner
-  -- performed is never one the owner then forgets, and never one the drain
-  -- performs a second time.
-  readTVarIO recorded >>= \terminals → length terminals `shouldBe` 1
+  withOwnedThread harry $ \_ _ → do
+    outcome ← ownedHostCaught (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+      window ← theWindow host
+      service ← handedOver host owner window
+      awaitStanding owner service `shouldReturn` TargetUsable
+      _ ← releaseGraphicsTarget host owner service
+      atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
+      -- Independent evidence, so this exit finishes whichever way the
+      -- retirement settled.
+      publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
+      acknowledgement ←
+        atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
+          >>= maybe (unexpected "the attachment kept no acknowledgement") pure
+      forM_ allRetirementFacts $ \fact →
+        void (publishCompletion publisher (completionNotice (graphicsAttachment service) acknowledgement fact))
+      pumpUntilRetired host control
+      -- Captured here rather than returned: the run itself raises the
+      -- cancellation at its exit, so the body's value never reaches the caller.
+      atomically . writeTVar recorded . Map.keys =<< atomically (readTargetTerminalsNow owner)
+    -- However it ended, it ended by raising the cancellation rather than
+    -- swallowing it.
+    void (raisedBy outcome)
+    -- Offered exactly once, over the whole run and its drain, however many
+    -- cancellations arrived.
+    readTVarIO attempts `shouldReturn` 1
+    -- And because it returned, its record exists: a retirement the owner
+    -- performed is never one the owner then forgets, and never one the drain
+    -- performs a second time.
+    readTVarIO recorded >>= \terminals → length terminals `shouldBe` 1
 
 -- | Every injected operation's answer is committed with no interruption
 -- point between the two.
@@ -165,25 +168,32 @@ testJoinAwaitsTerminalReport = do
     atomically (readTVar release >>= check)
     pure (ownerDestroyed (Text.pack "destroyed"))
   released ← newTVarIO Nothing
-  (raised, _) ← caughtAs @IOException $
-    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
-      main ← myThreadId
-      void . forkIO $ do
-        takeMVar joining
-        -- The owner's destruction evidence exists, so the exit leaves its
-        -- wait and enters the join; the owner is still inside the call.
-        publishOwnerDestruction owner (ownerDestroyed (Text.pack "published early"))
-        atomically (readOwnerTerminalNow owner >>= check . isJust . ownerDestroyedEvidence)
-        throwTo main (userError "delivered during the join")
-        -- Nothing of the host's may be released while the owner is unjoined.
-        notes ← journalled (rigJournal rig)
-        atomically (writeTVar released (Just (filter ended notes)))
-        atomically (writeTVar release True)
-      void (awaitRound owner 0)
-  show raised `shouldContain` "delivered during the join"
-  readTVarIO released `shouldReturn` Just []
-  notes ← journalled (rigJournal rig)
-  notes `shouldContain` [SessionEnded]
+  -- The helper supplies the evidence the exit's join waits for and opens the gate the owner is held at, so it must outlive the
+  -- host's exit that it unblocks: it is owned by the example, not by the host body that hands it the owner (#593). Whatever
+  -- ends it, the gate is opened, so the owner it holds is never joined while still held.
+  let helper (owner, main) =
+        ( do
+            takeMVar joining
+            -- The owner's destruction evidence exists, so the exit leaves its
+            -- wait and enters the join; the owner is still inside the call.
+            publishOwnerDestruction owner (ownerDestroyed (Text.pack "published early"))
+            atomically (readOwnerTerminalNow owner >>= check . isJust . ownerDestroyedEvidence)
+            throwTo main (userError "delivered during the join")
+            -- Nothing of the host's may be released while the owner is unjoined.
+            notes ← journalled (rigJournal rig)
+            atomically (writeTVar released (Just (filter ended notes)))
+        )
+          `finally` atomically (writeTVar release True)
+  withDeferredThreadOpening (atomically (writeTVar release True)) helper $ \_ handOver → do
+    (raised, _) ← caughtAs @IOException $
+      ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
+        main ← myThreadId
+        handOver (owner, main)
+        void (awaitRound owner 0)
+    show raised `shouldContain` "delivered during the join"
+    readTVarIO released `shouldReturn` Just []
+    notes ← journalled (rigJournal rig)
+    notes `shouldContain` [SessionEnded]
   where
     ended = \case
       WindowGone _ → True

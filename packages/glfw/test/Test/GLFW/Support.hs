@@ -21,6 +21,7 @@ module Test.GLFW.Support
   , onThread
   , onBoundThread
   , withDeferredThread
+  , withDeferredThreadOpening
   , caughtAs
   , unexpected
   , originOf
@@ -134,7 +135,7 @@ import Hetoimasia.Runtime.Reporting (DiagnosticFailure, raisedByDiagnostic)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import System.Timeout (timeout)
 import Test.Hspec (Expectation, expectationFailure)
-import Test.Support.Owned (withOwnedBoundThread, withOwnedThread)
+import Test.Support.Owned (withOwnedBoundThread, withOwnedThread, withOwnedThreadOpening)
 
 -- ---------------------------------------------------------------------------
 -- Sessions and windows
@@ -174,9 +175,15 @@ onOwnedThread scope action = do
 -- deliver to a target that stays masked; started here, around the whole run, it lives until its exception has been delivered
 -- and is stopped and joined when the scope ends, delivered or not. The handing-over never blocks.
 withDeferredThread ∷ (a → IO ()) → (ThreadId → (a → IO ()) → IO r) → IO r
-withDeferredThread work body = do
+withDeferredThread = withDeferredThreadOpening (pure ())
+
+-- | 'withDeferredThread' for a thread that may be held at something only the scope can open: the first argument is run, in the
+-- uninterruptible release and before the kill, however the scope ended. It must not block and must be safe to run when what it
+-- opens is already open.
+withDeferredThreadOpening ∷ IO () → (a → IO ()) → (ThreadId → (a → IO ()) → IO r) → IO r
+withDeferredThreadOpening open work body = do
   handed ← newEmptyMVar
-  withOwnedThread (takeMVar handed >>= work) $ \thread _ → body thread (void . tryPutMVar handed)
+  withOwnedThreadOpening open (takeMVar handed >>= work) $ \thread _ → body thread (void . tryPutMVar handed)
 
 -- | The typed failure an action raised, beside the exception as caught.
 caughtAs ∷ Exception e ⇒ IO a → IO (e, SomeException)
