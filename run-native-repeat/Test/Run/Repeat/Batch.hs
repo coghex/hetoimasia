@@ -6,12 +6,16 @@
 -- the output even when the enclosing suite reports only a generic failure), is 'Hung'; anything else is 'Failed'. A
 -- hang is never a pass, so the batch proves the prevention and not the backstop.
 --
--- /Ownership./ Every process a trial starts is this module's: the trial's own process, and the @sample@ it takes of a
--- hung one. A trial that exceeds its bound is sampled once (each sample is itself bounded, and an unsuccessful sample
--- is recorded), then every process in the tree under the trial's root is stopped by pid, with the signal escalated
--- only after a grace; the root is reaped; and the trial answers whether anything it started is still alive. The same
--- stop runs if the trial is cancelled. Output goes to files kept with the batch, so nothing is read back through a
--- pipe that a stuck process could hold open.
+-- /Ownership./ Every process this module starts (a trial, the sample it takes of a hung one, a preparation) runs through
+-- 'runOwned', which starts it in a process group of its own and owns everything that group, or the tree under its root,
+-- contains: while the root lives, after it has ended on its own (a run that passed and left a child behind) and after
+-- the bound passed. A process that outlives its root is found by its group, not by its parent. On every exit, including
+-- cancellation, the owned set is taken once, before any signal, stopped by pid (TERM, a grace, then KILL, each only to
+-- a pid still alive), and the answer says whether everything is gone. Output goes to files kept with the batch, so
+-- nothing is read back through a pipe that a stuck process could hold open.
+--
+-- /Persistence./ 'runBatch' writes the batch report after every trial and again when a trial is cancelled, with the
+-- interrupted attempt recorded as a failure, so a batch that is cut short leaves its partial result.
 module Test.Run.Repeat.Batch
   ( Trial (..)
   , Verdict (..)
@@ -19,28 +23,31 @@ module Test.Run.Repeat.Batch
   , Counts (..)
   , confidenceAt
   , runTrial
+  , runBatch
+  , continues
   , runPreparation
   , judge
   , tally
-  , descendantsOf
+  , ownedProcesses
   , isAlive
   ) where
 
 import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, mask, onException, try)
 import Control.Monad (filterM, forM, unless, void)
-import Data.List (isInfixOf)
+import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.List (isInfixOf, nub)
 import GHC.Clock (getMonotonicTime)
 import System.Directory (doesFileExist)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
-import System.IO (IOMode (WriteMode), openBinaryFile)
+import System.IO (Handle, IOMode (WriteMode), openBinaryFile)
 import System.Posix.Signals (Signal, nullSignal, sigKILL, sigTERM, signalProcess)
 import System.Posix.Types (CPid)
 import System.Process
   ( CreateProcess (..)
   , ProcessHandle
-  , StdStream (UseHandle)
+  , StdStream (NoStream, UseHandle)
   , createProcess
   , getPid
   , proc
@@ -76,7 +83,9 @@ data Outcome = Outcome
   , outcomeSamples ∷ [String]
     -- ^ One line for each process of a trial stopped at its bound: its sample file, or why none could be taken.
   , outcomeReclaimed ∷ Bool
-    -- ^ Nothing the trial started is alive.
+    -- ^ Nothing the trial started (the run, its samplers) is alive.
+  , outcomeOrphans ∷ Int
+    -- ^ How many processes were still alive in the trial's group after its root had ended on its own, and were stopped.
   }
   deriving (Show)
 
@@ -121,6 +130,44 @@ judge expected status out err
     summary (n : "examples," : f : "failures," : _) = (,) <$> readMaybe n <*> readMaybe f
     summary _ = Nothing
 
+-- | How a command run by 'runOwned' ended: its root's status, 'Nothing' when it had to be stopped, whether everything it
+-- started is gone, and how many processes were still alive in its group after the root had ended on its own.
+data Ended = Ended {endedStatus ∷ Maybe ExitCode, endedReclaimed ∷ Bool, endedOrphans ∷ Int}
+
+-- | Run a command to completion or to its bound, with its output written to the handles (which the process library
+-- closes in this process once the child holds them). When the bound passes, the owned processes are handed to
+-- @atBound@, one at a time (to be sampled), before they are stopped; its answers are returned. A cancellation anywhere stops the owned
+-- processes before it propagates.
+runOwned ∷ [String] → FilePath → Handle → Handle → Int → Int → (CPid → IO a) → IO (Ended, [a])
+runOwned command directory handleOut handleErr boundSeconds graceSeconds atBound = do
+  (program, arguments) ← case command of
+    [] → ioError (userError "a command is needed")
+    first : rest → pure (first, rest)
+  mask $ \restore → do
+    (_, _, _, handle) ←
+      createProcess
+        (proc program arguments)
+          { cwd = Just directory
+          , std_in = NoStream
+          , std_out = UseHandle handleOut
+          , std_err = UseHandle handleErr
+          , create_group = True
+          }
+    root ← getPid handle >>= maybe (ioError (userError "the command ended before its pid was read")) pure
+    let stop = stopOwned graceSeconds root handle
+    outcome ← restore (timeout (boundSeconds * 1_000_000) (waitForProcess handle)) `onException` stop
+    case outcome of
+      Just code → do
+        -- The root ended on its own. Whatever it left in its group is still this command's.
+        left ← filter (/= root) <$> ownedProcesses root
+        reclaimed ← if null left then pure True else stop
+        pure (Ended (Just code) reclaimed (length left), [])
+      Nothing → do
+        pids ← (<> [root]) <$> ownedProcesses root
+        answers ← restore (forM pids atBound) `onException` stop
+        reclaimed ← stop
+        pure (Ended Nothing reclaimed 0, answers)
+
 -- | Run one trial, writing @run-NNN.out@, @run-NNN.err@ and the samples under the directory, and answer its outcome.
 runTrial ∷ Trial → FilePath → Int → IO Outcome
 runTrial trial directory index = do
@@ -130,69 +177,33 @@ runTrial trial directory index = do
   started ← getMonotonicTime
   handleOut ← openBinaryFile outFile WriteMode
   handleErr ← openBinaryFile errFile WriteMode
-  (command, arguments) ← case trialCommand trial of
-    [] → ioError (userError "a trial needs a command")
-    first : rest → pure (first, rest)
-  mask $ \restore → do
-    -- The handles are closed by createProcess, in the parent, once the child holds them.
-    (_, _, _, handle) ←
-      createProcess
-        (proc command arguments)
-          { cwd = Just (trialDirectory trial)
-          , std_out = UseHandle handleOut
-          , std_err = UseHandle handleErr
-          , create_group = True
-          }
-    root ← getPid handle >>= maybe (ioError (userError "the trial ended before its pid was read")) pure
-    let stop = stopTree (trialStopGraceSeconds trial) root handle
-    -- Cancellation anywhere below stops what this trial started.
-    outcome ← restore (timeout (trialBoundSeconds trial * 1_000_000) (waitForProcess handle)) `onException` stop
-    (status, samples, reclaimed) ← case outcome of
-      Just code → pure (Just code, [], True)
-      Nothing → do
-        pids ← (root :) <$> descendantsOf root
-        samples ← restore (forM pids (takeSample trial stem)) `onException` stop
-        reclaimed ← stop
-        pure (Nothing, samples, reclaimed)
-    finished ← getMonotonicTime
-    out ← readFileOrEmpty outFile
-    err ← readFileOrEmpty errFile
-    let verdict = case status of
-          Nothing → Hung (printf "no end within %d seconds" (trialBoundSeconds trial))
-          Just code → judge (trialExpectedExamples trial) code out err
-    pure
-      Outcome
-        { outcomeVerdict = verdict
-        , outcomeStatus = status
-        , outcomeSeconds = finished - started
-        , outcomeSamples = samples
-        , outcomeReclaimed = reclaimed
-        }
+  (ended, sampled) ←
+    runOwned (trialCommand trial) (trialDirectory trial) handleOut handleErr (trialBoundSeconds trial) (trialStopGraceSeconds trial) (takeSample trial stem)
+  finished ← getMonotonicTime
+  out ← readFileOrEmpty outFile
+  err ← readFileOrEmpty errFile
+  let samples = concat sampled
+      verdict = case endedStatus ended of
+        Nothing → Hung (printf "no end within %d seconds" (trialBoundSeconds trial))
+        Just code → judge (trialExpectedExamples trial) code out err
+  pure
+    Outcome
+      { outcomeVerdict = verdict
+      , outcomeStatus = endedStatus ended
+      , outcomeSeconds = finished - started
+      , outcomeSamples = map fst samples
+      , outcomeReclaimed = endedReclaimed ended && all snd samples
+      , outcomeOrphans = endedOrphans ended
+      }
 
--- | Run a preparation command to completion under a bound, its output kept in a file. A preparation that exceeds the bound, or
--- is cancelled, is stopped by pid with everything it started, exactly as a trial is. Answers how it ended: 'Nothing' when it
--- had to be stopped.
+-- | Run a preparation command to completion under a bound, its output kept in a file. A preparation that exceeds the
+-- bound, or is cancelled, is stopped by pid with everything it started, exactly as a trial is. Answers how it ended:
+-- 'Nothing' when it had to be stopped.
 runPreparation ∷ [String] → FilePath → FilePath → Int → Int → IO (Maybe ExitCode)
 runPreparation command directory outFile boundSeconds graceSeconds = do
   handleOut ← openBinaryFile outFile WriteMode
-  (program, arguments) ← case command of
-    [] → ioError (userError "a preparation needs a command")
-    first : rest → pure (first, rest)
-  mask $ \restore → do
-    (_, _, _, handle) ←
-      createProcess
-        (proc program arguments)
-          { cwd = Just directory
-          , std_out = UseHandle handleOut
-          , std_err = UseHandle handleOut
-          , create_group = True
-          }
-    root ← getPid handle >>= maybe (ioError (userError "the preparation ended before its pid was read")) pure
-    let stop = void (stopTree graceSeconds root handle)
-    outcome ← restore (timeout (boundSeconds * 1_000_000) (waitForProcess handle)) `onException` stop
-    case outcome of
-      Nothing → stop >> pure Nothing
-      Just code → pure (Just code)
+  (ended, _) ← runOwned command directory handleOut handleOut boundSeconds graceSeconds (const (pure ()))
+  pure (endedStatus ended)
 
 readFileOrEmpty ∷ FilePath → IO String
 readFileOrEmpty path = do
@@ -203,41 +214,48 @@ readFileOrEmpty path = do
       length contents `seq` pure contents
     else pure ""
 
--- | One bounded @sample@ of a process: the file it wrote, or the reason there is none. The sampling process is
--- stopped by the process library if the bound abandons it.
-takeSample ∷ Trial → FilePath → CPid → IO String
+-- | One bounded @sample@ of a process: the line that says what came of it, and whether the sampler (and anything it
+-- started) is gone. The sampler is owned like any other process: when its bound passes it is stopped by pid, escalated after
+-- the grace, and reaped before the trial goes on.
+takeSample ∷ Trial → FilePath → CPid → IO [(String, Bool)]
 takeSample trial stem pid = do
   let file = stem <> "." <> show pid <> ".sample.txt"
   case trialSample trial pid file of
-    [] → pure (show pid <> ": no sampler")
-    command : arguments → do
+    [] → pure [(show pid <> ": no sampler", True)]
+    command → do
+      handleOut ← openBinaryFile (file <> ".log") WriteMode
+      handleErr ← openBinaryFile (file <> ".err") WriteMode
       attempt ←
-        try @SomeException . timeout (trialSampleBoundSeconds trial * 1_000_000) $
-          readCreateProcessWithExitCode (proc command arguments) ""
-      pure $ case attempt of
-        Left failure → show pid <> ": sampling failed: " <> show failure
-        Right Nothing → show pid <> ": sampling exceeded its bound of " <> show (trialSampleBoundSeconds trial) <> " seconds"
-        Right (Just (ExitSuccess, _, _)) → show pid <> ": " <> file
-        Right (Just (code, _, err)) → show pid <> ": sampling exited " <> show code <> ": " <> take 200 err
+        try @SomeException $
+          runOwned command (trialDirectory trial) handleOut handleErr (trialSampleBoundSeconds trial) (trialStopGraceSeconds trial) (const (pure ()))
+      pure . pure $ case attempt of
+        Left failure → (show pid <> ": sampling failed: " <> show failure, False)
+        Right (ended, _) → case endedStatus ended of
+          Nothing → (show pid <> ": sampling exceeded its bound of " <> show (trialSampleBoundSeconds trial) <> " seconds and the sampler was stopped", endedReclaimed ended)
+          Just ExitSuccess → (show pid <> ": " <> file, endedReclaimed ended)
+          Just code → (show pid <> ": sampling exited " <> show code <> " (see " <> file <> ".err)", endedReclaimed ended)
 
--- | The pids below a root, from the process table, children before their parents.
-descendantsOf ∷ CPid → IO [CPid]
-descendantsOf root = do
-  (_, table, _) ← readCreateProcessWithExitCode (proc "ps" ["-axo", "pid=,ppid="]) ""
-  let pairs = [(child, up) | line ← lines table, [a, b] ← [words line], Just child ← [readMaybe a], Just up ← [readMaybe b]]
-      below parent = concat [below child <> [child] | (child, up) ← pairs, up == parent]
-  pure (below root)
+-- | The pids a root owns: everything below it by parentage, and everything in its process group (the root started the
+-- group, so a process that outlived its parent is still found). Children before their parents, no pid twice, the root
+-- itself not included.
+ownedProcesses ∷ CPid → IO [CPid]
+ownedProcesses root = do
+  (_, table, _) ← readCreateProcessWithExitCode (proc "ps" ["-axo", "pid=,ppid=,pgid="]) ""
+  let rows = [(pid, up, group) | line ← lines table, [a, b, c] ← [words line], Just pid ← [readMaybe a], Just up ← [readMaybe b], Just group ← [readMaybe c]]
+      below parent = concat [below child <> [child] | (child, up, _) ← rows, up == parent]
+      grouped = [pid | (pid, _, group) ← rows, group == root]
+  pure (filter (/= root) (nub (below root <> grouped)))
 
 isAlive ∷ CPid → IO Bool
 isAlive pid = either (const False) (const True) <$> try @SomeException (signalProcess nullSignal pid)
 
--- | Stop the tree under the root by pid. The set of pids is taken once, before any signal, from the process table:
--- the root and everything below it, which are the processes this trial started. TERM goes to each that is alive; the
--- root is reaped within the grace and the rest are polled (they are not this process's children, so there is nothing
--- to wait on) for the same grace; KILL then goes to whatever is still alive. Answers whether all of them are gone.
-stopTree ∷ Int → CPid → ProcessHandle → IO Bool
-stopTree grace root handle = do
-  below ← descendantsOf root
+-- | Stop what a root owns, by pid. The set is taken once, before any signal: the root and its owned processes. TERM goes to
+-- each that is alive; the root is reaped within the grace and the rest are polled (they are not this process's children,
+-- so there is nothing to wait on) for the same grace; KILL then goes to whatever is still alive. Answers whether all of
+-- them are gone.
+stopOwned ∷ Int → CPid → ProcessHandle → IO Bool
+stopOwned grace root handle = do
+  below ← ownedProcesses root
   let owned = below <> [root]
   signalAll sigTERM owned
   _ ← timeout (grace * 1_000_000) (waitForProcess handle)
@@ -250,10 +268,52 @@ stopTree grace root handle = do
   not . or <$> forM owned isAlive
   where
     signalAll ∷ Signal → [CPid] → IO ()
-    signalAll signal = mapM_ (\pid → try @SomeException (signalProcess signal pid))
+    signalAll signal pids = mapM_ (\pid → try @SomeException (signalProcess signal pid)) pids
     -- A bounded poll: the processes below the root are not children of this one.
     goneWithin pids = void . timeout (grace * 1_000_000) $ do
       let loop = do
             living ← filterM isAlive pids
             unless (null living) (threadDelay 20_000 >> loop)
       loop
+
+-- | Whether a batch goes on after an outcome: not past its size, not after the first hang when it stops at one, and not
+-- after a trial whose processes could not all be stopped (another trial would start beside them).
+continues ∷ Int → Int → Bool → Outcome → Bool
+continues runs index untilHang outcome =
+  index < runs
+    && outcomeReclaimed outcome
+    && not (untilHang && isHung (outcomeVerdict outcome))
+  where
+    isHung (Hung _) = True
+    isHung _ = False
+
+-- | Run a batch of up to @runs@ trials, one at a time, writing @report.md@ under the directory (rendered from the
+-- outcomes so far) after every trial. A trial that is cancelled is recorded as an interrupted failure, the partial report
+-- is written, and the cancellation propagates. Answers every outcome, in order.
+runBatch ∷ Trial → FilePath → Int → Bool → ([Outcome] → String) → (Int → Outcome → IO ()) → IO [Outcome]
+runBatch trial directory runs untilHang render announce = do
+  seen ← newIORef []
+  let write = readIORef seen >>= \outcomes → writeFile (directory </> "report.md") (render (reverse outcomes))
+      go index = do
+        started ← getMonotonicTime
+        outcome ←
+          runTrial trial directory index `onException` do
+            now ← getMonotonicTime
+            modifyIORef' seen (interrupted (now - started) :)
+            write
+        modifyIORef' seen (outcome :)
+        write
+        announce index outcome
+        if continues runs index untilHang outcome then go (index + 1) else pure ()
+  go 1
+  reverse <$> readIORef seen
+  where
+    interrupted seconds =
+      Outcome
+        { outcomeVerdict = Failed "interrupted: the attempt was cancelled before it ended"
+        , outcomeStatus = Nothing
+        , outcomeSeconds = seconds
+        , outcomeSamples = []
+        , outcomeReclaimed = True
+        , outcomeOrphans = 0
+        }

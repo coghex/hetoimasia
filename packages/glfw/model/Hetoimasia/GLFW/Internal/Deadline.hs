@@ -58,19 +58,13 @@ module Hetoimasia.GLFW.Internal.Deadline
   , guardInitializationWithin
   ) where
 
-import Control.Concurrent (forkIO, forkIOWithUnmask)
+import Control.Concurrent (forkIO, forkIOWithUnmask, killThread, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Concurrent.STM
-  ( atomically
-  , check
-  , newTVarIO
-  , readTVar
-  , registerDelay
-  , writeTVar
-  )
-import Control.Exception (SomeException, finally, mask, throwIO, try, uninterruptibleMask_)
+import Control.Concurrent.STM (atomically, check, newTVarIO, readTVar, writeTVar)
+import Control.Exception (SomeException, finally, mask, rethrowIO, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (void, when)
 import Data.Text (Text)
+import System.Timeout (timeout)
 
 -- | What the application asks for: how long native initialization may take
 -- before the process is ended, and what is reported when it does.
@@ -153,44 +147,40 @@ guardInitializationWithin _ _ _ Nothing call = call
 guardInitializationWithin grace exit backend (Just deadline) call = mask $ \restore → do
   phase ← newTVarIO Pending
   finished ← newEmptyMVar
-  -- Started masked, with the join registered in the same step as the start.
-  _ ←
+  -- Started masked, with the join registered in the same step as the start. The thread sleeps in 'threadDelay', so the
+  -- timer it waits on is its own and is unregistered when the thread is stopped.
+  watcher ←
     forkIOWithUnmask $ \unmask →
       unmask (watch phase) `finally` putMVar finished ()
-  outcome ← try @SomeException (restore call)
-  settle phase finished
-  either throwIO pure outcome
+  -- The call's exception keeps whatever context was attached to it, and is rethrown with it.
+  outcome ← tryWithContext @SomeException (restore call)
+  settle phase finished watcher
+  either rethrowIO pure outcome
   where
-    -- Retire the timer if it has not expired, then wait for its thread. The
-    -- wait is bounded: a retired thread ends at once, and an expired one ends
-    -- within 'reportGrace' (or the process ends).
-    settle phase finished = uninterruptibleMask_ $ do
-      atomically $ do
-        current ← readTVar phase
-        when (current == Pending) (writeTVar phase Retired)
+    -- Retire the timer if it has not expired, stop its thread so that its timer is cancelled with it, then wait for the
+    -- thread. The wait is bounded: a stopped thread ends at once, and an expired one ends within the grace (or the
+    -- process ends).
+    settle phase finished watcher = uninterruptibleMask_ $ do
+      retired ← atomically $
+        readTVar phase >>= \case
+          Pending → writeTVar phase Retired >> pure True
+          _ → pure False
+      when retired (killThread watcher)
       takeMVar finished
 
     watch phase = do
-      delay ← registerDelay (deadlineBoundMicroseconds deadline)
-      expired ← atomically $ do
-        current ← readTVar phase
-        case current of
-          Pending → do
-            elapsed ← readTVar delay
-            check elapsed
-            writeTVar phase Expired
-            pure True
+      threadDelay (deadlineBoundMicroseconds deadline)
+      expired ← atomically $
+        readTVar phase >>= \case
+          Pending → writeTVar phase Expired >> pure True
           _ → pure False
       when expired $ do
         reported ← newTVarIO False
         void . forkIO $ do
           _ ← try @SomeException (deadlineReport deadline expiry)
           atomically (writeTVar reported True)
-        graceOver ← registerDelay grace
-        atomically $ do
-          done ← readTVar reported
-          over ← readTVar graceOver
-          check (done || over)
+        -- Waits for the report, but not past the grace; 'timeout' cancels its own timer when the wait ends first.
+        _ ← timeout grace (atomically (readTVar reported >>= check))
         exit initializationTimeoutStatus
 
     expiry =

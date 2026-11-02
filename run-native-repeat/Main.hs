@@ -28,7 +28,6 @@
 module Main (main) where
 
 import Control.Monad (unless, when)
-import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.List (isInfixOf)
 import qualified Data.Text as Text
 import qualified Data.Text.IO as Text
@@ -133,6 +132,56 @@ machinery = do
         Nothing → expectationFailure ("no grandchild pid: " <> grandchild)
         Just pid → isAlive pid `shouldReturn` False
 
+  it "stops a child a passing run left behind, counts it, and does not report the run as clean" $
+    withSystemTempDirectory "repeat-probe" $ \directory → do
+      let pidFile = directory </> "orphan.pid"
+      outcome ← runTrial (stub directory 30 ("sleep 3600 & echo $! > " <> pidFile <> "; echo '54 examples, 0 failures'")) directory 1
+      outcomeVerdict outcome `shouldBe` Passed
+      outcomeOrphans outcome `shouldSatisfy` (>= 1)
+      outcomeReclaimed outcome `shouldBe` True
+      orphan ← readFile pidFile
+      case readMaybe orphan of
+        Nothing → expectationFailure ("no orphan pid: " <> orphan)
+        Just pid → isAlive pid `shouldReturn` False
+
+  it "stops a sampler that ignores TERM and has outlived its bound, and reaps it before the run goes on" $
+    withSystemTempDirectory "repeat-probe" $ \directory → do
+      let pidFile = directory </> "sampler.pid"
+          sampler = ["/bin/sh", "-c", "trap '' TERM; echo $$ > " <> pidFile <> "; while :; do sleep 1; done"]
+          trial = (stub directory 2 "sleep 3600") {trialSample = \_ _ → sampler, trialSampleBoundSeconds = 1, trialStopGraceSeconds = 2}
+      outcome ← runTrial trial directory 1
+      outcomeVerdict outcome `shouldSatisfy` isHung
+      outcomeSamples outcome `shouldSatisfy` all ("sampler was stopped" `isInfixOf`)
+      outcomeReclaimed outcome `shouldBe` True
+      sampler' ← readFile pidFile
+      case readMaybe sampler' of
+        Nothing → expectationFailure ("no sampler pid: " <> sampler')
+        Just pid → isAlive pid `shouldReturn` False
+
+  it "persists the partial report, with the interrupted attempt recorded as a failure, when a batch is cancelled" $
+    withSystemTempDirectory "repeat-probe" $ \directory → do
+      let render outcomes = show (length outcomes) <> " attempts, " <> show (map outcomeVerdict outcomes)
+          trial = stub directory 600 "sleep 3600"
+      abandoned ← timeout 1_500_000 (runBatch trial directory 3 False render (\_ _ → pure ()))
+      abandoned `shouldSatisfy` maybe True (const False)
+      report ← readFile (directory </> "report.md")
+      report `shouldSatisfy` ("1 attempts" `isInfixOf`)
+      report `shouldSatisfy` ("interrupted" `isInfixOf`)
+
+  it "writes the report after every trial and stops a batch exactly when it should" $
+    withSystemTempDirectory "repeat-probe" $ \directory → do
+      outcomes ← runBatch (stub directory 30 "echo '54 examples, 0 failures'") directory 3 False (show . map outcomeVerdict) (\_ _ → pure ())
+      length outcomes `shouldBe` 3
+      readFile (directory </> "report.md") >>= (`shouldBe` show [Passed, Passed, Passed])
+      let clean = Outcome Passed (Just ExitSuccess) 0 [] True 0
+          unreclaimed = clean {outcomeReclaimed = False}
+          hangs = clean {outcomeVerdict = Hung "x"}
+      continues 3 1 False clean `shouldBe` True
+      continues 3 3 False clean `shouldBe` False
+      continues 3 1 True hangs `shouldBe` False
+      continues 3 1 False hangs `shouldBe` True
+      continues 3 1 False unreclaimed `shouldBe` False
+
   it "runs a preparation to completion with its output kept, and answers how it ended" $
     withSystemTempDirectory "repeat-probe" $ \directory → do
       ended ← runPreparation ["/bin/sh", "-c", "echo built; echo warned >&2; exit 3"] directory (directory </> "prepare.out") 30 5
@@ -152,7 +201,7 @@ machinery = do
   it "states the confidence of a batch from its size" $ do
     confidenceAt 0.05 59 `shouldSatisfy` (\c → abs (c - 0.9515) < 0.0001)
     confidenceAt 0.05 58 `shouldSatisfy` (< 0.95)
-    tally [Outcome Passed Nothing 0 [] True, Outcome (Hung "x") Nothing 0 [] True, Outcome (Failed "y") Nothing 0 [] True]
+    tally [Outcome Passed Nothing 0 [] True 0, Outcome (Hung "x") Nothing 0 [] True 0, Outcome (Failed "y") Nothing 0 [] True 0]
       `shouldBe` Counts {passed = 1, hung = 1, failed = 1}
   where
     isFailed (Failed _) = True
@@ -197,21 +246,16 @@ realBatch = do
           , trialSampleBoundSeconds = 30
           , trialStopGraceSeconds = 10
           }
-  seen ← newIORef []
-  let go index = do
-        outcome ← runTrial trial output index
-        modifyIORef' seen (outcome :)
-        Text.putStrLn . Text.pack $
-          (printf "run %d/%d: %s in %.1f s%s" index runs (verdictWord (outcomeVerdict outcome)) (outcomeSeconds outcome) (reasonOf outcome) ∷ String)
-        let stopHere = untilHang && isHangOutcome outcome
-        unless (index >= runs || stopHere) (go (index + 1))
-  go 1
-  outcomes ← reverse <$> readIORef seen
+  outcomes ←
+    runBatch trial output runs untilHang (Text.unpack . reportOf runs untilHang revision checkout output) $ \index outcome →
+      Text.putStrLn . Text.pack $
+        (printf "run %d/%d: %s in %.1f s%s" index runs (verdictWord (outcomeVerdict outcome)) (outcomeSeconds outcome) (reasonOf outcome) ∷ String)
   let counts = tally outcomes
       attempted = length outcomes
-      report = reportOf runs attempted untilHang counts revision checkout output outcomes
+      report = reportOf runs untilHang revision checkout output outcomes
   Text.putStrLn report
-  Text.writeFile (output </> "report.md") report
+  unless (all outcomeReclaimed outcomes) $
+    expectationFailure "a run's processes could not all be stopped; the batch stopped there rather than start another beside them"
   if untilHang
     then hung counts `shouldSatisfy` (>= 1)
     else do
@@ -234,12 +278,9 @@ realBatch = do
       Passed → ""
       Hung why → " (" <> why <> ")"
       Failed why → " (" <> why <> ")"
-    isHangOutcome outcome = case outcomeVerdict outcome of
-      Hung _ → True
-      _ → False
 
-reportOf ∷ Int → Int → Bool → Counts → String → FilePath → FilePath → [Outcome] → Text.Text
-reportOf runs attempted untilHang counts revision checkout output outcomes =
+reportOf ∷ Int → Bool → String → FilePath → FilePath → [Outcome] → Text.Text
+reportOf runs untilHang revision checkout output outcomes =
   Text.pack . unlines $
     [ "# Repeated complete run-native-tests profile (#586)"
     , ""
@@ -247,12 +288,12 @@ reportOf runs attempted untilHang counts revision checkout output outcomes =
     , "- checkout: " <> checkout
     , "- output: " <> output
     , "- mode: " <> (if untilHang then "until the first hang (unfixed revision)" else "N consecutive runs (fixed revision)")
-    , printf "- N: %d planned, %d attempted" runs attempted
+    , printf "- N: %d planned, %d attempted" runs (length outcomes)
     , printf
         "- confidence: N = %d independent runs at an unchanged 5%% per-run failure probability would have shown at least one failure with probability %.2f%% (1 - 0.95^N); this is detection power, not proof that the program cannot hang"
         runs
         (100 * confidenceAt 0.05 runs)
-    , printf "- passed: %d, hung: %d, failed: %d" (passed counts) (hung counts) (failed counts)
+    , printf "- passed: %d, hung: %d, failed: %d (an interrupted attempt counts as a failure)" (passed counts) (hung counts) (failed counts)
     , "- a run the initialization deadline ended counts as a hang, not a pass"
     , ""
     , "## Hangs"
@@ -261,3 +302,15 @@ reportOf runs attempted untilHang counts revision checkout output outcomes =
          | (index, outcome) ← zip [1 ..] outcomes
          , Hung why ← [outcomeVerdict outcome]
          ]
+      <> ["", "## Failures"]
+      <> [ printf "- run %d: %s" (index ∷ Int) why
+         | (index, outcome) ← zip [1 ..] outcomes
+         , Failed why ← [outcomeVerdict outcome]
+         ]
+      <> ["", "## Processes left behind by a run that ended on its own"]
+      <> [ printf "- run %d: %d, stopped" (index ∷ Int) (outcomeOrphans outcome)
+         | (index, outcome) ← zip [1 ..] outcomes
+         , outcomeOrphans outcome > 0
+         ]
+  where
+    counts = tally outcomes

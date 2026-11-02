@@ -13,9 +13,11 @@
 -- call, and bounds the child from outside ('childSpec').
 module Test.GLFW.Deadline (spec, runChild, childVariable) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread)
+import Control.Concurrent (ThreadId, forkIO, killThread, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, tryPutMVar, tryReadMVar)
-import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), SomeException, fromException, throwIO, try)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, annotateIO, fromException, throwIO, try, tryWithContext)
+import Control.Exception.Annotation (ExceptionAnnotation)
+import Control.Exception.Context (getExceptionAnnotations)
 import Control.Monad (void, when)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (isInfixOf)
@@ -44,6 +46,10 @@ spec = do
       (bounded testFalseReturn)
     it "propagates a call's exception, with no exit and no thread left"
       (bounded testRaises)
+    it "keeps the annotations attached to a call's exception, as it would without a deadline"
+      (bounded testKeepsContext)
+    it "leaves no thread alive after many successful guarded calls under a very long bound"
+      (bounded testManyCalls)
     it "retires and joins its thread when the call is cancelled"
       (bounded testCancelled)
     it "reports an expired bound, then ends the process with the documented status, once"
@@ -109,13 +115,19 @@ alive = do
   statuses ← traverse threadStatus threads
   pure [thread | (thread, status) ← zip threads statuses, status `notElem` [ThreadFinished, ThreadDied]]
 
--- | Run an action and answer the threads it left alive.
+-- | Run an action and answer the threads it left alive. A thread whose last act was to announce its end may not yet read
+-- as finished, so a new thread is given a bounded number of yields to finish before it counts as left behind.
 leaving ∷ IO a → IO (a, [ThreadId])
 leaving action = do
   before ← alive
   result ← action
-  after ← alive
-  pure (result, [thread | thread ← after, thread `notElem` before])
+  let settle ∷ Int → IO [ThreadId]
+      settle attempts = do
+        after ← alive
+        let new = [thread | thread ← after, thread `notElem` before]
+        if null new || attempts == 0 then pure new else yield >> settle (attempts - 1)
+  left ← settle 100_000
+  pure (result, left)
 
 testNoDeadline ∷ Expectation
 testNoDeadline = do
@@ -151,6 +163,34 @@ testRaises = do
     leaving . try @SomeException $
       guardInitialization (recordExit rig) "cocoa" (deadlineOf neverPasses (recordReport rig)) (throwIO (ErrorCall "native raised") ∷ IO ())
   fmap (fromException @ErrorCall) (either Just (const Nothing) outcome) `shouldBe` Just (Just (ErrorCall "native raised"))
+  left `shouldBe` []
+  readIORef (rigExits rig) `shouldReturn` []
+
+-- | An annotation the call attaches to its own exception.
+newtype Mark = Mark String
+  deriving (Eq, Show)
+
+instance ExceptionAnnotation Mark
+
+testKeepsContext ∷ Expectation
+testKeepsContext = do
+  rig ← newRig
+  let annotated = annotateIO (Mark "native") (throwIO (ErrorCall "boom") ∷ IO ())
+  bare ← tryWithContext @ErrorCall annotated
+  guarded ← tryWithContext @ErrorCall (guardInitialization (recordExit rig) "cocoa" (deadlineOf neverPasses (recordReport rig)) annotated)
+  let marks ∷ Either (ExceptionWithContext ErrorCall) () → [Mark]
+      marks outcome = case outcome of
+        Left (ExceptionWithContext context _) → getExceptionAnnotations context
+        Right () → []
+  marks bare `shouldBe` [Mark "native"]
+  marks guarded `shouldBe` marks bare
+  readIORef (rigExits rig) `shouldReturn` []
+
+testManyCalls ∷ Expectation
+testManyCalls = do
+  rig ← newRig
+  (_, left) ←
+    leaving . mapM_ (const (guardInitialization (recordExit rig) "cocoa" (deadlineOf neverPasses (recordReport rig)) (pure ()))) $ [1 ∷ Int .. 500]
   left `shouldBe` []
   readIORef (rigExits rig) `shouldReturn` []
 
