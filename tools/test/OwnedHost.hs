@@ -1463,9 +1463,9 @@ cancellabilitySpec = describe "A body outside the cancellability precondition (r
     finished <- newIORef False
     let body child = do
           awaitReady child
-          atomically (putTMVar entered (childPid child))
-          -- Outside the precondition: an uninterruptible wait, with no opening registered for the scope.
-          uninterruptibleMask_ (readMVar stubborn >> writeIORef finished True)
+          -- Outside the precondition: an uninterruptible wait, with no opening registered for the scope. It says it is in it from
+          -- inside it, so the owner cannot end the scope before the body has stopped being cancellable.
+          uninterruptibleMask_ (atomically (putTMVar entered (childPid child)) >> readMVar stubborn >> writeIORef finished True)
           pure (childPid child)
     withLateSubmission hostVar (readyChild Unbounded "a" nowhere) body $ \a -> do
       let observe = do

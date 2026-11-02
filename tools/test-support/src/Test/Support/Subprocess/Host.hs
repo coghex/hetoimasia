@@ -507,7 +507,8 @@ refusalFor host command = \case
 -- A submission made after the stop or the end is refused at once, and a submitter already waiting when either is recorded is
 -- answered 'HostStopped' or 'HostEnded' at once, not at its bound; neither is ever started and its handles are closed. The call
 -- raises the body's own failure as itself, the failure of starting the child as itself, a failure naming the command and the bound
--- when the bound passes, and the submitter's own cancellation unchanged.
+-- when the bound passes, and the submitter's own cancellation unchanged. A body must not submit to its own host: the worker, which
+-- runs it, is the only server.
 hosted ∷ ∀ a. Host → ChildSpec → (Child → IO a) → IO a
 hosted host spec body = mask $ \restore → do
   deadline ← deadlineFor (specBound spec)
