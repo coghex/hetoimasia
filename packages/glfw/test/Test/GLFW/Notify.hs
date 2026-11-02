@@ -11,7 +11,7 @@
 module Test.GLFW.Notify (spec) where
 
 import Control.Concurrent (ThreadId, killThread, throwTo, yield)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM
   ( TVar
   , atomically
@@ -52,10 +52,22 @@ import Hetoimasia.GLFW.Internal.Session (sessionWakePath)
 import Hetoimasia.GLFW.Internal.Window (EventProcessing (..), processWindowEvents)
 import Hetoimasia.GLFW.Session
 import Hetoimasia.GLFW.Window
-import Test.GLFW.Support (boundedExample, caughtAs, entered, onThread, unexpected)
+import Test.GLFW.Support
+  ( Ending (..)
+  , Scope
+  , awaitParked
+  , boundedExample
+  , caughtAs
+  , entered
+  , onThread
+  , ownedEnds
+  , unexpected
+  , unownedLeaks
+  )
 import Numeric.Natural (Natural)
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
-import Test.Support.Owned (withOwnedThread)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
+import Data.Foldable (for_)
 
 spec ∷ Spec
 spec = do
@@ -72,6 +84,17 @@ spec = do
       (boundedExample testWaitedAdmissionCancelledAfterCommit)
     it "leaves every command a cancelled waiter admitted with its own wake, whichever side of the commit the cancellation lands"
       (boundedExample testCancellationRacesCapacity)
+
+  describe "GLFW admission helper threads (#593)" $
+    for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) → do
+      it ("has ended and joined a submitter parked in the admission hook when the example body " <> label) $
+        boundedExample (ownedEnds ending parkedSubmitterScenario False)
+      it ("negative control: an unowned start leaves the submitter parked in the hook when the example body " <> label) $
+        boundedExample (unownedLeaks ending parkedSubmitterScenario False)
+      it ("has ended and joined an injector, and the submitter it never reached, when the example body " <> label) $
+        boundedExample (ownedEnds ending injectedSubmitterScenario False)
+      it ("negative control: an unowned start leaves the injector and the submitter it never reached when the example body " <> label) $
+        boundedExample (unownedLeaks ending injectedSubmitterScenario False)
 
   describe "GLFW demand publication and wake" $ do
     it "combines concurrent immediate and deadline demand, keeping the earliest deadline, and wakes once for each"
@@ -202,40 +225,60 @@ testRefusedAdmissionWakesNothing = do
 testCancelledBeforeCommit ∷ Expectation
 testCancelledBeforeCommit = do
   seam ← newSeam defaultScript
-  withPorts seam $ \_ hostCommands _ window → do
-    held ← newEmptyMVar
-    entered' ← newEmptyMVar
-    outcome ← newEmptyMVar
-    withOwnedThread
-      ( do
-          let hooks = noAdmissionHooks {beforeAdmission = putMVar entered' () >> takeMVar held}
-          try (submitWith hooks (windowCommandPort hostCommands) [] (observeOf window)) >>= putMVar outcome
-      )
-      $ \submitter _ → do
-      takeMVar entered'
+  withPorts seam $ \_ hostCommands _ window →
+    withSubmitterBeforeCommit withOwnedThreadOpening hostCommands window $ \submitter outcome → do
       killThread submitter
       cancelled ← takeMVar outcome
       cancelled `shouldSatisfy` cancellation
       settleHost hostCommands
       posts seam `shouldReturn` 0
 
+-- | The scenario of 'testCancelledBeforeCommit' up to the moment its submitter is parked in the hook, ended by the example body
+-- the way the ending says: the scope must then have stopped and joined the submitter.
+parkedSubmitterScenario ∷ Scope → IO () → IO ()
+parkedSubmitterScenario scope atParked = do
+  seam ← newSeam defaultScript
+  withPorts seam $ \_ hostCommands _ window →
+    withSubmitterBeforeCommit scope hostCommands window $ \submitter _ → awaitParked submitter >> atParked
+
+-- | The scenario of 'testCancelledAfterCommit' up to the moment its injector is parked delivering a cancellation to a submitter
+-- that cannot receive it: the example body then ends without the target ever being reached, and the scope must have stopped and
+-- joined both the injector and the submitter.
+injectedSubmitterScenario ∷ Scope → IO () → IO ()
+injectedSubmitterScenario scope atParked = do
+  seam ← newSeam defaultScript
+  withPorts seam $ \_ hostCommands _ window →
+    withSubmitterAfterCommit scope hostCommands window $ \submitter _ _ →
+      scope (pure ()) (throwTo submitter ThreadKilled) $ \injector _ → awaitParked injector >> atParked
+
+-- | A submitter parked in the admission hook before the commit, started through the given scope (#593): the example, or the
+-- negative control that starts it without ownership. The body is given the submitter once it is inside the hook, and the cell
+-- its outcome is put into.
+withSubmitterBeforeCommit
+  ∷ Scope
+  → WindowCommandHost
+  → Window
+  → (ThreadId → MVar (Either SomeException SubmitResult) → IO r)
+  → IO r
+withSubmitterBeforeCommit scope hostCommands window body = do
+  held ← newEmptyMVar
+  entered' ← newEmptyMVar
+  outcome ← newEmptyMVar
+  scope
+    (pure ())
+    ( do
+        let hooks = noAdmissionHooks {beforeAdmission = putMVar entered' () >> takeMVar held}
+        try (submitWith hooks (windowCommandPort hostCommands) [] (observeOf window)) >>= putMVar outcome
+    )
+    $ \submitter _ → do
+      takeMVar entered'
+      body submitter outcome
+
 testCancelledAfterCommit ∷ Expectation
 testCancelledAfterCommit = do
   seam ← newSeam defaultScript
-  withPorts seam $ \_ hostCommands _ window → do
-    committed ← newEmptyMVar
-    release ← newEmptyMVar
-    outcome ← newEmptyMVar
-    -- The hook runs inside the protection the admission owes its wake, so the
-    -- cancellation requested while it is held cannot be delivered until the
-    -- wake has been posted.
-    withOwnedThread
-      ( do
-          let hooks = noAdmissionHooks {afterAdmission = putMVar committed () >> takeMVar release}
-          try (submitWith hooks (windowCommandPort hostCommands) [] (observeOf window)) >>= putMVar outcome
-      )
-      $ \submitter _ → do
-      takeMVar committed
+  withPorts seam $ \_ hostCommands _ window →
+    withSubmitterAfterCommit withOwnedThreadOpening hostCommands window $ \submitter outcome release →
       withOwnedThread (throwTo submitter ThreadKilled) $ \_ _ → do
         queuedWhileHeld ← atomically (commandsQueued <$> commandStatistics hostCommands)
         postsWhileHeld ← countPosts seam
@@ -254,6 +297,30 @@ testCancelledAfterCommit = do
         again ← seamExecuteNext seam hostCommands [window]
         again `shouldBe` NothingQueued
         settleHost hostCommands
+
+-- | A submitter held in the admission hook after the commit, started through the given scope (#593). The hook runs inside the
+-- protection the admission owes its wake, so a cancellation requested while it is held cannot be delivered until the wake has
+-- been posted: whatever sends one is parked delivering it, and is an injector the example must own too. The body is given the
+-- submitter once it is inside the hook, the cell its outcome is put into, and the gate that lets it leave.
+withSubmitterAfterCommit
+  ∷ Scope
+  → WindowCommandHost
+  → Window
+  → (ThreadId → MVar (Either SomeException SubmitResult) → MVar () → IO r)
+  → IO r
+withSubmitterAfterCommit scope hostCommands window body = do
+  committed ← newEmptyMVar
+  release ← newEmptyMVar
+  outcome ← newEmptyMVar
+  scope
+    (void (tryPutMVar release ()))
+    ( do
+        let hooks = noAdmissionHooks {afterAdmission = putMVar committed () >> takeMVar release}
+        try (submitWith hooks (windowCommandPort hostCommands) [] (observeOf window)) >>= putMVar outcome
+    )
+    $ \submitter _ → do
+      takeMVar committed
+      body submitter outcome release
 
 -- | The waiting admission owes its wake from its commit onward exactly as the
 -- immediate one does, and its own wait for capacity stays cancellable.

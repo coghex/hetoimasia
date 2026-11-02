@@ -15,6 +15,7 @@
 module Test.GLFW.Session (spec) where
 
 import Control.Concurrent (isCurrentThreadBound)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Exception
   ( ErrorCall (ErrorCall)
   , Exception
@@ -27,7 +28,7 @@ import Control.Exception
   )
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as Char8
-import Data.IORef (atomicModifyIORef', newIORef)
+import Data.IORef (atomicModifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Failure
@@ -59,7 +60,24 @@ import Test.Hspec
   , shouldNotBe
   , shouldReturn
   )
-import Test.GLFW.Support (onBoundThread, onThread)
+import Test.GLFW.Support
+  ( Boom (..)
+  , Ending (..)
+  , Scope
+  , awaitParked
+  , holdForever
+  , onBoundThread
+  , onThread
+  , onThreadVia
+  , ownedEnds
+  , recordingThreads
+  , unownedLeaks
+  , withDeferredThreadVia
+  , withMainThread
+  , withMainThreadVia
+  )
+import Test.Support.Owned (withOwnedBoundThreadOpening, withOwnedThreadOpening)
+import Data.Foldable (for_)
 
 spec ∷ Spec
 spec = do
@@ -118,6 +136,27 @@ spec = do
   describe "GLFW owner-only operations" $ do
     it "rejects use from another thread and after the session ended, before any native call"
       (boundedExample testOwnerOnlyOperations)
+
+  describe "GLFW suite thread helpers (#593)" $ do
+    it "runs an owned start-and-wait helper on an unbound thread, and an owned bound one on a bound thread"
+      (boundedExample testHelperBoundness)
+    it "rethrows what the action raised on the helper's thread, which has ended and been joined"
+      (boundedExample testHelperRethrows)
+    it "runs the main-thread helper on a bound thread designated as the process main thread, before its action, and joins it"
+      (boundedExample testMainThreadHelper)
+    it "has ended and joined the thread of a start-and-wait helper whose caller is cancelled while it is parked"
+      (boundedExample (ownedEnds WaiterCancelled startAndWaitScenario False))
+    it "negative control: an unowned start leaves the start-and-wait helper's thread parked when its caller is cancelled"
+      (boundedExample (unownedLeaks WaiterCancelled startAndWaitScenario False))
+    for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) → do
+      it ("has ended and joined the bound main-thread helper's thread, parked in a session, when the example body " <> label) $
+        boundedExample (ownedEnds ending mainThreadScenario True)
+      it ("negative control: a plain forkOS start leaves the bound thread parked in a session when the example body " <> label) $
+        boundedExample (unownedLeaks ending mainThreadScenario True)
+      it ("has ended and joined a deferred thread nothing was ever handed to when the example body " <> label) $
+        boundedExample (ownedEnds ending deferredScenario False)
+      it ("negative control: an unowned start leaves the deferred thread waiting for its work when the example body " <> label) $
+        boundedExample (unownedLeaks ending deferredScenario False)
 
 -- ---------------------------------------------------------------------------
 -- Entry
@@ -595,6 +634,65 @@ testOwnerOnlyOperations = do
   windowElsewhere `shouldBe` NotSessionOwner
   afterEnd `shouldBe` SessionEnded
   seamCalls seam `shouldReturn` entryCalls <> exitCalls
+
+-- ---------------------------------------------------------------------------
+-- The suite's thread helpers (#593)
+
+testHelperBoundness ∷ Expectation
+testHelperBoundness = do
+  onThread isCurrentThreadBound `shouldReturn` False
+  onBoundThread isCurrentThreadBound `shouldReturn` True
+
+testHelperRethrows ∷ Expectation
+testHelperRethrows = do
+  recorded ← newIORef []
+  outcome ← try @Boom (onThreadVia (recordingThreads recorded withOwnedThreadOpening) (throwIO Boom ∷ IO ()))
+  outcome `shouldBe` Left Boom
+  -- The thread ended on its own failure, and the scope joined it.
+  threads ← readIORef recorded
+  length threads `shouldBe` 1
+
+testMainThreadHelper ∷ Expectation
+testMainThreadHelper = do
+  seam ← newSeam defaultScript
+  seen ← newEmptyMVar
+  -- On the helper's thread: it is bound, and a session is entered on it, which only the designated process main thread may do.
+  withMainThread
+    seam
+    (pure ())
+    ( do
+        bound ← isCurrentThreadBound
+        backend ← entered seam defaultSessionConfig (pure . sessionBackend)
+        putMVar seen (bound, backend)
+    )
+    $ \_ finished → takeMVar finished >>= either throwIO pure
+  readMVar seen `shouldReturn` (True, X11)
+  -- The same thread, undesignated, is refused: the designation is the helper's and not the bound start's.
+  refused ← newEmptyMVar
+  seamForRefusal ← newSeam defaultScript
+  withOwnedBoundThreadOpening
+    (pure ())
+    (caughtAs (entered seamForRefusal defaultSessionConfig (\_ → pure ())) >>= putMVar refused . fst)
+    (\_ awaitEnd → awaitEnd)
+  readMVar refused `shouldReturn` NotProcessMainThread
+
+-- | The start-and-wait helper whose thread parks, with the example thread cancelled while it waits: the helper says when it is
+-- parked by calling the action it is given.
+startAndWaitScenario ∷ Scope → IO () → IO ()
+startAndWaitScenario scope atParked = onThreadVia scope atParked
+
+-- | The main-thread helper whose bound thread is parked inside a session, with the example body ended the way the ending says.
+mainThreadScenario ∷ Scope → IO () → IO ()
+mainThreadScenario scope atParked = do
+  seam ← newSeam defaultScript
+  withMainThreadVia scope seam (pure ()) (entered seam defaultSessionConfig (\_ → holdForever)) $ \runner _ →
+    awaitParked runner >> atParked
+
+-- | A deferred thread that is started and waits for work nothing ever hands it, with the example body ended the way the ending
+-- says: the thread is parked in its wait for the hand-over.
+deferredScenario ∷ Scope → IO () → IO ()
+deferredScenario scope atParked =
+  withDeferredThreadVia scope (pure ()) (\() → pure ()) $ \thread _ → awaitParked thread >> atParked
 
 -- ---------------------------------------------------------------------------
 -- Support

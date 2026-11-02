@@ -51,6 +51,18 @@
       "reason": "the negative control's deliberately unowned bound start (a plain forkOS), which exists to be judged as a leak and is stopped and joined independently by the control that made it"
     },
     {
+      "file": "packages/glfw/test/Test/GLFW/Support.hs",
+      "binding": "startUnowned",
+      "sites": 1,
+      "reason": "the glfw-tests negative controls' deliberately unowned start (#593), which exists to be judged as a leak and is stopped and joined independently by the control that made it"
+    },
+    {
+      "file": "packages/glfw/test/Test/GLFW/Support.hs",
+      "binding": "startUnownedBound",
+      "sites": 1,
+      "reason": "the glfw-tests negative controls' deliberately unowned bound start, a plain forkOS (#593), stopped and joined independently by the control that made it"
+    },
+    {
       "file": "tools/test/OwnedThread.hs",
       "binding": "startUnowned",
       "sites": 1,

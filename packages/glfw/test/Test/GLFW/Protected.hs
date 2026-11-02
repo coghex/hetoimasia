@@ -133,14 +133,18 @@ import Hetoimasia.Runtime.Supervision
   )
 import qualified Hetoimasia.Runtime.Supervision as Supervision
 import Test.GLFW.Support
-  ( SinkFailed (..)
+  ( Ending (..)
+  , Scope
+  , SinkFailed (..)
   , SinkMark (..)
+  , awaitParked
   , boundedExample
   , caughtAs
   , diagnosticMarks
   , failingSink
   , flushed
   , newSinkTrace
+  , ownedEnds
   , raisedWith
   , retainedAs
   , retainedDiagnostics
@@ -148,11 +152,13 @@ import Test.GLFW.Support
   , sinkMarks
   , traced
   , unexpected
+  , unownedLeaks
   , withMainThread
   , withMainThreadKeepingContext
   )
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
-import Test.Support.Owned (withOwnedThread)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
+import Data.Foldable (for_)
 
 spec ∷ Spec
 spec = describe "GLFW protected host" $ do
@@ -207,6 +213,11 @@ spec = describe "GLFW protected host" $ do
       (boundedExample testIndependentChains)
     it "keeps a stalled attachment and its window until independent evidence arrives, reporting the stall once"
       (boundedExample testStalledThenEvidence)
+    for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) → do
+      it ("has ended and joined an evidence supplier waiting for an owner that never exists when the example body " <> label) $
+        boundedExample (ownedEnds ending supplierScenario False)
+      it ("negative control: an unowned start leaves the evidence supplier waiting for an owner that never exists when the example body " <> label) $
+        boundedExample (unownedLeaks ending supplierScenario False)
     it "contains a declaration that fails after acquisition, retiring on independent evidence before it settles"
       (boundedExample testMetadataFailsInDrain)
     it "retains a stalled diagnostic's own failure without unwinding anything it is holding"
@@ -1234,7 +1245,7 @@ testStalledThenEvidence = do
   seam ← journallingSeam journal
   owned ← newTVarIO Nothing
   hostHeld ← newTVarIO Nothing
-  withOwnedThread (supplyEvidence journal hostHeld owned afterStall allRetirementFacts) $ \helper _ → do
+  withEvidenceSupplier withOwnedThreadOpening journal hostHeld owned $ \helper → do
     let logger = recordingLogger entries
     asProcessMainThread seam $
       runProtectedWindowApplication
@@ -1254,6 +1265,28 @@ testStalledThenEvidence = do
     void (pure helper)
     readTVarIO journal `shouldReturn` (retiring "alpha" <> [WindowGone 1, SessionEnded])
     stallReports entries `shouldReturn` 1
+
+-- | The evidence supplier of the stalled-owner examples, started through the given scope (#593): the example, or the negative
+-- control that starts it without ownership. It waits for the owner and the host the example's run publishes, so an example that
+-- fails before the run publishes them leaves it parked for ever unless the scope stops it.
+withEvidenceSupplier
+  ∷ Scope
+  → TVar [Flag]
+  → TVar (Maybe WindowHost)
+  → TVar (Maybe Owner)
+  → (ThreadId → IO r)
+  → IO r
+withEvidenceSupplier scope journal hostHeld owned body =
+  scope (pure ()) (supplyEvidence journal hostHeld owned afterStall allRetirementFacts) (\helper _ → body helper)
+
+-- | The scenario of 'testStalledThenEvidence' for an example that fails before the run ever publishes the owner the supplier
+-- waits for: the supplier is parked, waiting for an owner that never exists, and the example body ends the way the ending says.
+supplierScenario ∷ Scope → IO () → IO ()
+supplierScenario scope atParked = do
+  journal ← newTVarIO []
+  owned ← newTVarIO Nothing
+  hostHeld ← newTVarIO Nothing
+  withEvidenceSupplier scope journal hostHeld owned $ \helper → awaitParked helper >> atParked
 
 -- | A declaration of the protocol that raises while the drain demands it is
 -- contained, exactly as a failed step is.
