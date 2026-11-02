@@ -140,8 +140,9 @@ cabal test hetoimasia-tests --test-show-details=direct
   and on `glfw-tests` the GLFW group names, such as `--match 'GLFW session'`,
   select what they selected at root or in the removed window-examples executable.
 - `workflow-tests` (`tools/test/`, group `test.workflow`) owns the contracts of
-  the workflow tooling and, since #584, the shared owned-thread facility and the
-  guard that keeps test sources using it. Select them with
+  the workflow tooling and, since #584 and #588, the shared owned-thread and
+  owned-subprocess facilities and the guard that keeps test sources using them.
+  Select them with
   `--test-options='--match <name>'`: `the shared owned-thread facility`
   (`OwnedThread`: every way a scope can end with a thread parked at a gate, each
   with a negative control that applies the same judgement to a deliberately
@@ -149,7 +150,27 @@ cabal test hetoimasia-tests --test-show-details=direct
   uninterruptible release; the interruptibility the body runs with; the
   cancellation helpers behind the two `Library.hs` helpers and the parked-release
   orchestration behind `ChildSpec`, with their former unowned forms as controls)
-  and `The unowned-start guard` (`OwnedStarts`: fixture trees for a new unowned
+  `the shared subprocess facility` (`OwnedSubprocess`: a command run to completion
+  (status, both streams beyond a pipe buffer, environment, working directory and
+  input, a descendant holding a pipe open past the drain bound, a run bound that
+  expires on a child that ignores SIGTERM, a cancelled call, and a converted
+  helper that suites call, `Sandbox.run`); a scoped child ended whichever way its
+  scope ends (a return, an exception, the run bound, a cancellation in the body,
+  a failure after the child exists, a cancellation delivered while the release is
+  parked) with its descendant in the group; a leader that exits on SIGTERM or by
+  itself while a descendant ignores it; the escalation (SIGTERM then SIGKILL to
+  the group, no SIGKILL to a child that obeys, nothing to a child that left no
+  member); a reap or a group's end that is not confirmed, injected through the
+  facility's test-side seams; the stream choices and the handles the caller
+  opened; a child that has exited and not been reaped; where a child is placed (a
+  group of its own in the caller's session, or the caller's group with only its
+  identifier signalled); a call that states no bound and is unbounded; the
+  hosts the display helper examples run their helpers on; and a test-owner
+  process, this very executable re-run with `HETOIMASIA_SUBPROCESS_OWNER` set,
+  whose process group is ended from outside while its body is parked. Each
+  ownership and timeout example has a negative control that applies the same
+  judgement to the library call the converted sites used and must fail) and
+  `The unowned-start guard` (`OwnedStarts`: fixture trees for a new unowned
   start, an owned start, a baselined start, a stale or shrunken baseline entry, a
   count raised with its baseline, a new start in a file that has an exempt helper,
   and the three sites the issue named; then this repository: the guard passes,
@@ -158,9 +179,11 @@ cabal test hetoimasia-tests --test-show-details=direct
   `workflow-tests` and `run-native-tests` depend on; the real child helper runs
   under the same parked-release orchestration in `Test.Run.Native.ChildSpec`
   (group `test.vulkan-run-native`, selected with `--match 'the child helper'`).
-  A test that starts a thread or subprocess starts it through
-  `Test.Support.Owned`; the sites that existed when the guard was introduced are a
-  known-debt baseline to be removed by follow-up changes, not to be extended.
+  A test that starts a thread starts it through `Test.Support.Owned`, and one that
+  starts a subprocess through `Test.Support.Subprocess` (#588 converted the
+  subprocess sites the baseline listed); the thread sites that existed when the
+  guard was introduced are a known-debt baseline to be removed by follow-up
+  changes, not to be extended.
 
 ## Vulkan suites
 
