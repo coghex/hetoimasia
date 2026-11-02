@@ -4,11 +4,10 @@
 -- instance ends before it is applied, and a failure whose fields throw when looked at.
 module Test.LuaRuntime.Admission.Races (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, readTVar, throwSTM, writeTVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), fromException, throwIO, toException)
-import Control.Monad (forM, void)
+import Control.Monad (void)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -25,7 +24,7 @@ import Test.LuaRuntime.Admission.Support
 import Test.LuaRuntime.Instance.Support (admitWith, awaitSettled, expectControl, failureOf', idOf, moduleNamed, sf)
 import Test.LuaRuntime.Request.Support (Submitted (..), answerResult, answerWith, awaitDiagnostic, diagnostics, finishWork, fakeEndpoint, fakeEndpointOf, failWorkWith, onCancel, onSubmit, submissionAt)
 import Test.LuaRuntime.Scheduled.Support (awaitEntered, awaitScheduledTerminal, releaseGate)
-import Test.LuaRuntime.Support (Broken (Broken), bounded, brokenIs, expectFatal, requiredPolicy, tryExpected, withBoundary)
+import Test.LuaRuntime.Support (Broken (Broken), bounded, brokenIs, expectFatal, requiredPolicy, tryExpected, withBoundary, withProducers)
 
 -- | An owner of admitters on elapsed time.
 arrival ∷ AFix → LuaRuntime → Text → IO ScheduledOwner
@@ -266,14 +265,12 @@ spec = describe "races" $ do
       fixture ← newAFix 4
       withBoundary $ \_ runtime → settleAll fixture $ do
         let attempts = 16 ∷ Int
-        results ← forM [1 .. attempts] $ \n → do
-          done ← newEmptyMVar
-          _ ←
-            forkIO $
-              tryExpected (startScheduledOwner runtime (admissionSpec fixture ("claim " <> Text.pack (show n)) [admitter] aConfig (admissionGrant fixture 8 SettleOnArrival) requiredPolicy))
-                >>= putMVar done
-          pure done
-        outcomes ← mapM takeMVar results
+        outcomes ←
+          withProducers
+            [ tryExpected (startScheduledOwner runtime (admissionSpec fixture ("claim " <> Text.pack (show n)) [admitter] aConfig (admissionGrant fixture 8 SettleOnArrival) requiredPolicy))
+            | n ← [1 .. attempts]
+            ]
+            (mapM takeMVar)
         let started = [owner | Right (ScheduledStarted owner) ← outcomes]
             refused = [rendered | Left failure ← outcomes, let rendered = show failure, "the registry already serves an owner" `Text.isInfixOf` Text.pack rendered]
         (length started, length refused) `shouldBe` (1, attempts - 1)

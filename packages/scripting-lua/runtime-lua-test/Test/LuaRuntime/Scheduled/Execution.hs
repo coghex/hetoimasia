@@ -8,7 +8,7 @@
 module Test.LuaRuntime.Scheduled.Execution (spec) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Concurrent (forkIO, killThread, yield)
+import Control.Concurrent (yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryReadMVar)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), finally, throwIO)
 import Control.Monad (forM_, replicateM_, void, when)
@@ -22,6 +22,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (fireReg, liveRegs, nanoseconds)
+import Test.Support.Owned (withOwnedThread)
 import Test.LuaRuntime.Support (bounded, Broken (Broken), brokenIs, expectFatal, failExample, Gated (..), requiredPolicy, withBoundary, withBoundaryOpening)
 
 -- | A task of the module's @spin@ entry, which records a label and a number and
@@ -216,8 +217,6 @@ spec = describe "tasks run as coroutines on a scheduled owner" $ do
       withBoundaryOpening [openAllGates fixture] $ \control runtime → do
         setClock fixture 18446744073709551615
         owner ← startScheduled fixture runtime ((scheduled fixture "acknowledges" requiredPolicy defaultSchedulerBounds) {scheduledRefusedWait = \_ → blockOn fixture "refusal"})
-        -- the waiter is a thread of the example's own: it is killed however the example ends
-        waiterRef ← newIORef Nothing
         ( do
           -- the owner is held at the start of the refused task's segment, after the boundary that came before it
           writeIORef (sfObserver fixture) $ \context → when (contextName context == Just "a") (blockOn fixture "segment")
@@ -226,24 +225,23 @@ spec = describe "tasks run as coroutines on a scheduled owner" $ do
           -- a wait that begins here needs an acknowledgement written after it began: the first is the one at the
           -- boundary that follows the refused segment
           accounted ← newEmptyMVar
-          waiter ← forkIO (awaitScheduledAccounting control owner >>= putMVar accounted)
-          writeIORef waiterRef (Just waiter)
-          let parked = threadStatus waiter >>= \case
-                ThreadBlocked BlockedOnSTM → pure True
-                ThreadFinished → pure False
-                ThreadDied → pure False
-                _ → yield >> parked
-          parked >>= (`shouldBe` True)
-          releaseGate fixture "segment"
-          awaitEntered fixture "refusal"
-          -- the owner is in the application's answer at that boundary: it has written no acknowledgement yet
-          replicateM_ 500 yield
-          tryReadMVar accounted >>= (`shouldBe` Nothing)
-          releaseGate fixture "refusal"
-          takeMVar accounted >>= (`shouldBe` AccountingComplete)
-          void (outcomeOf ticket)
+          withOwnedThread (awaitScheduledAccounting control owner >>= putMVar accounted) $ \waiter _ → do
+            let parked = threadStatus waiter >>= \case
+                  ThreadBlocked BlockedOnSTM → pure True
+                  ThreadFinished → pure False
+                  ThreadDied → pure False
+                  _ → yield >> parked
+            parked >>= (`shouldBe` True)
+            releaseGate fixture "segment"
+            awaitEntered fixture "refusal"
+            -- the owner is in the application's answer at that boundary: it has written no acknowledgement yet
+            replicateM_ 500 yield
+            tryReadMVar accounted >>= (`shouldBe` Nothing)
+            releaseGate fixture "refusal"
+            takeMVar accounted >>= (`shouldBe` AccountingComplete)
+            void (outcomeOf ticket)
           )
-          `finally` (readIORef waiterRef >>= mapM_ killThread >> openAllGates fixture >> retireScheduled owner)
+          `finally` (openAllGates fixture >> retireScheduled owner)
     it "tells the application before the refused task's own close handlers run: a handler cannot keep the refusal from being reported" $ bounded $ do
       fixture ← newSFixture
       withBoundaryOpening [openAllGates fixture] $ \_ runtime → do

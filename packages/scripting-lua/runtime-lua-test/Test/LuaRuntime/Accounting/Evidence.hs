@@ -41,13 +41,13 @@ spec = describe "cleanup evidence the owner retains" $ do
         -- wait is begun there, before the failure exists, and the next boundary end after it is the one that
         -- follows the first task's refused wait and the failure of closing its coroutine: it must write no
         -- acknowledgement, and the second task then holds the owner at its own gate.
-        let go begin = do
+        let go begin continue = do
               void (admitTask' fixture owner "R" (refusedClosing' "r"))
               awaitEntered fixture "r"
               void (admitTask' fixture owner "B" (request "block_in" [VText "blk"] OrdinaryClass OneShot Nothing))
-              waiting ← begin
-              releaseGate fixture "r"
-              pure waiting
+              begin $ \waiting → do
+                releaseGate fixture "r"
+                continue waiting
         pure (owner, go)
 
   describe "the owner's own" $ do
@@ -70,34 +70,34 @@ spec = describe "cleanup evidence the owner retains" $ do
         -- A ready task is queued behind it, so that the owner is still serving, parked at its own gate, after
         -- the boundary that closed the stopped task's coroutine.
         void (admitTask' fixture owner "B" (request "block_in" [VText "blk"] OrdinaryClass OneShot Nothing))
-        let go begin = do
-              w ← begin
-              releaseGate fixture "obs"
-              awaitEntered fixture "y"
-              releaseGate fixture "y"
-              pure w
+        let go begin continue =
+              begin $ \w → do
+                releaseGate fixture "obs"
+                awaitEntered fixture "y"
+                releaseGate fixture "y"
+                continue w
         pure (owner, go)
 
     it "ends the wait with a lease's failed retirement" $ bounded $ do
       fixture ← newLFix 4
       let base = lfBase fixture
-      failingWait (sf base) [] $ \control runtime → providersFinish fixture $ do
+      failingWait (sf base) [] $ \control runtime finish → providersFinish fixture $ do
         owner ← startLeased fixture runtime "retirement failed" [retiresOnStop] leaseConfig requiredPolicy
         _ ← admit base owner "a" (moduleNamed "retiresonstop")
         awaitPhase base owner "a" Active
         liveFor fixture "a" 1
         settleControl base owner "a" InstanceStop >>= (`shouldBe` ControlApplied)
         awaitSummary fixture "a" ((== 1) . summaryPending)
-        waiting ← beginWait control owner
-        awaitPending waiting
-        failRetirement fixture "res-stop"
-        pure waiting
+        withWait control owner $ \waiting → do
+          awaitPending waiting
+          failRetirement fixture "res-stop"
+          finish waiting
 
     it "ends the wait with the failure of draining what an instance held" $ bounded $ do
       fixture ← newLFix 4
       let base = lfBase fixture
       breakRelease fixture "drain-res"
-      failingWait (sf base) [] $ \control runtime → providersFinish fixture $ do
+      failingWait (sf base) [] $ \control runtime finish → providersFinish fixture $ do
         owner ← startLeased fixture runtime "drain failed" [drainsBroken] leaseConfig requiredPolicy
         _ ← admit base owner "a" (moduleNamed "drainsbroken")
         awaitPhase base owner "a" Active
@@ -106,15 +106,15 @@ spec = describe "cleanup evidence the owner retains" $ do
         -- The ending has begun, held in the instance's shutdown, and is the wait's; letting it go drains what
         -- the instance held, whose release fails.
         awaitEntered (sf base) "shutdown"
-        waiting ← beginWait control owner
-        awaitPending waiting
-        releaseGate (sf base) "shutdown"
-        pure waiting
+        withWait control owner $ \waiting → do
+          awaitPending waiting
+          releaseGate (sf base) "shutdown"
+          finish waiting
 
     it "does not complete while the owner is between two disposals, the first having raised, though no instance is ending" $ bounded $ do
       fixture ← newLFix 4
       let base = lfBase fixture
-      failingWait (sf base) [] $ \control runtime → (`finally` proceedRelease fixture) . providersFinish fixture $ do
+      failingWait (sf base) [] $ \control runtime finish → (`finally` proceedRelease fixture) . providersFinish fixture $ do
         owner ← startLeased fixture runtime "two disposals" [dependentTwoHolder] leaseConfig requiredPolicy
         _ ← admit base owner "a" (moduleNamed "dependenttwoholder")
         awaitPhase base owner "a" Active
@@ -125,17 +125,17 @@ spec = describe "cleanup evidence the owner retains" $ do
         -- which waits at the release gate with the first failure caught and not yet kept.
         completeRetirement fixture "dep2-res"
         awaitReleaseEntered fixture
-        waiting ← beginWait control owner
-        stabilize waiting
-        awaitPending waiting
-        proceedRelease fixture
-        pure waiting
+        withWait control owner $ \waiting → do
+          stabilize waiting
+          awaitPending waiting
+          proceedRelease fixture
+          finish waiting
 
     it "ends the wait with the failure of disposing what a retirement needed" $ bounded $ do
       fixture ← newLFix 4
       let base = lfBase fixture
       breakRelease fixture "dep-res.device"
-      failingWait (sf base) [] $ \control runtime → providersFinish fixture $ do
+      failingWait (sf base) [] $ \control runtime finish → providersFinish fixture $ do
         owner ← startLeased fixture runtime "disposal failed" [dependentHolder] leaseConfig requiredPolicy
         _ ← admit base owner "a" (moduleNamed "dependentholder")
         awaitPhase base owner "a" Active
@@ -143,17 +143,17 @@ spec = describe "cleanup evidence the owner retains" $ do
         awaitEffect (sf base) "release Retiring"
         _ ← expectControl base owner "a" InstanceStop
         awaitPhase base owner "a" Stopping
-        waiting ← beginWait control owner
-        awaitPending waiting
-        completeRetirement fixture "dep-res"
-        pure waiting
+        withWait control owner $ \waiting → do
+          awaitPending waiting
+          completeRetirement fixture "dep-res"
+          finish waiting
 
     it "does not complete while providers are being told, the first having raised, though no instance is ending" $ bounded $ do
       fixture ← newIFixture
       fake ← Request.newFake
       told ← newGate
       Request.onCancel fake (\index → if index == 0 then throwIO (Broken "cancel 0") else passGate told)
-      failingWait (sf fixture) [told] $ \control runtime → Request.providersFinish fake $ do
+      failingWait (sf fixture) [told] $ \control runtime finish → Request.providersFinish fake $ do
         owner ← Request.startRequester fixture runtime "told in a batch" [Request.asker] Request.cmdConfig (Request.grantOf fake 4) requiredPolicy
         Request.admitAsker fixture owner "i" "asker"
         Request.command fixture owner "i" "start" "a"
@@ -165,13 +165,13 @@ spec = describe "cleanup evidence the owner retains" $ do
         -- active, so no ending is owed.
         _ ← advanceRequestEpoch (scheduledEndpoint owner)
         awaitGateEntered told
-        waiting ← beginWait control owner
-        stabilize waiting
-        awaitPending waiting
-        openGate told
-        Request.finishWork fake 0
-        Request.finishWork fake 1
-        pure waiting
+        withWait control owner $ \waiting → do
+          stabilize waiting
+          awaitPending waiting
+          openGate told
+          Request.finishWork fake 0
+          Request.finishWork fake 1
+          finish waiting
 
     it "does not complete while a provider is told, the only one failing, and the exception unwinds the owner's iteration" $ bounded $ do
       fixture ← newIFixture
@@ -180,32 +180,32 @@ spec = describe "cleanup evidence the owner retains" $ do
       -- The one provider told holds the owner at a gate and then raises: nothing is kept for the batch
       -- (it has no other failure), and the exception leaves the owner's loop and ends it.
       Request.onCancel fake (\_ → passGate told >> throwIO (Broken "cancel"))
-      failingWait (sf fixture) [told] $ \control runtime → Request.providersFinish fake $ do
+      failingWait (sf fixture) [told] $ \control runtime finish → Request.providersFinish fake $ do
         owner ← Request.startRequester fixture runtime "told alone" [Request.asker] Request.cmdConfig (Request.grantOf fake 4) requiredPolicy
         Request.admitAsker fixture owner "i" "asker"
         Request.command fixture owner "i" "start" "a"
         Request.awaitLine fixture "cmd start a started"
         _ ← advanceRequestEpoch (scheduledEndpoint owner)
         awaitGateEntered told
-        waiting ← beginWait control owner
-        stabilize waiting
-        awaitPending waiting
-        openGate told
-        Request.finishWork fake 0
-        pure waiting
+        withWait control owner $ \waiting → do
+          stabilize waiting
+          awaitPending waiting
+          openGate told
+          Request.finishWork fake 0
+          finish waiting
 
     it "ends the wait with a request provider that raises when told its interest was withdrawn" $ bounded $ do
       fixture ← newIFixture
       fake ← Request.newFake
       Request.onCancel fake (\_ → throwIO (Broken "cancel"))
-      failingWait (sf fixture) [] $ \control runtime → Request.providersFinish fake $ do
+      failingWait (sf fixture) [] $ \control runtime finish → Request.providersFinish fake $ do
         owner ← Request.startRequester fixture runtime "request told" [Request.asker] Request.cmdConfig (Request.grantOf fake 4) requiredPolicy
         Request.admitAsker fixture owner "i" "asker"
         Request.command fixture owner "i" "start" "a"
         Request.awaitLine fixture "cmd start a started"
         _ ← expectControl fixture owner "i" InstanceStop
         awaitPhase fixture owner "i" Stopping
-        waiting ← beginWait control owner
-        Request.awaitCancelled fake 1
-        Request.finishWork fake 0
-        pure waiting
+        withWait control owner $ \waiting → do
+          Request.awaitCancelled fake 1
+          Request.finishWork fake 0
+          finish waiting

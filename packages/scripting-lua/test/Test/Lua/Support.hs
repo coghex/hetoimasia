@@ -30,10 +30,15 @@ module Test.Lua.Support
     -- * Cancelling an owner
   , Runner
   , Settled (..)
-  , settling
+  , withSettling
   , cancelling
   , awaitSettled
   , observedCancellation
+    -- * Threads of their own
+  , withProducer
+  , withProducers
+  , withProducerThread
+  , withProducerThreads
     -- * Observing an owner that may never return
   , detached
     -- * Bridge bookkeeping
@@ -89,6 +94,7 @@ import Hetoimasia.Scripting.Lua.Internal.Callback
 import Hetoimasia.Scripting.Lua.Internal.Vm (probeReferenceSlot)
 import System.IO.Unsafe (unsafePerformIO)
 import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 -- | How many interpreters this suite's fixture has constructed.
 --
@@ -163,7 +169,7 @@ recordingCallback vm (Recorder slot) name =
     (pure ())
 
 -- | A VM's execution owner, running an example's operation on a thread of its
--- own so that the example can cancel it. See 'settling'.
+-- own so that the example can cancel it. See 'withSettling'.
 data Runner a = Runner !ThreadId !(MVar (Settled a))
 
 -- | What a runner published: how its operation ended, and what was waiting for
@@ -180,28 +186,34 @@ data Settled a = Settled
 -- | Run an operation as a VM's owner on a thread of its own, and make every way
 -- it can end a result that is stored once.
 --
--- The operation runs with the masking state of the caller. That is the
--- exposure it has anywhere else: the VM masks its own operations, and a
--- cancellation that is aimed at the thread is delivered when the VM's
--- protected region has been left, which this runner does not change.
+-- The runner is owned (#598): it lives for the length of the continuation, and however that ends (a return, an exception, a
+-- cancellation) it has ended and been joined before this returns. The first argument lets go whatever only the example opens
+-- (the native hold the operation may be parked in, which the example later hands to 'cancelling' as its release): it runs in
+-- the stop, before the kill, and must not block.
+--
+-- The operation runs unmasked, as an example's thread does. That is the exposure it has anywhere else: the VM masks its own
+-- operations, and a cancellation that is aimed at the thread is delivered when the VM's protected region has been left,
+-- which this runner does not change.
 --
 -- What it does change is the handoff after the operation, which a bare
 -- @forkIO@ leaves open. A cancellation delivered at the moment the operation's
 -- own exception has been caught is raised outside the catcher, and a runner
--- that publishes afterwards is killed before it does. So the runner is forked
--- masked, catches the operation's outcome masked, and publishes masked. A
+-- that publishes afterwards is killed before it does. So the runner catches the
+-- operation's outcome masked, and publishes masked. A
 -- cancellation that has still not been delivered by then is taken at
 -- 'allowInterrupt', inside a catcher of its own, so it is observed rather than
 -- lost: the result records it as 'settledAfter'. Whichever way the operation
 -- ends, one 'Settled' is stored.
-settling ∷ IO a → IO (Runner a)
-settling operation = do
+withSettling ∷ IO () → IO a → (Runner a → IO b) → IO b
+withSettling open operation body = do
   slot ← newEmptyMVar
-  thread ← mask $ \restore → forkIO $ do
-    ended ← try @SomeException (restore operation)
-    pending ← try @SomeException allowInterrupt
-    putMVar slot (Settled ended (either Just (const Nothing) pending))
-  pure (Runner thread slot)
+  withOwnedThreadOpening open (runner slot) (\thread _ → body (Runner thread slot))
+  where
+    -- Masked from the operation's start to the publication, and the operation alone is let go of the mask.
+    runner slot = mask $ \restore → do
+      ended ← try @SomeException (restore operation)
+      pending ← try @SomeException allowInterrupt
+      putMVar slot (Settled ended (either Just (const Nothing) pending))
 
 -- | Cancel a runner with its request pending against it before it is let go,
 -- and do not go on until the request has been taken.
@@ -220,17 +232,19 @@ settling operation = do
 -- What it does not guarantee is where the request is delivered afterwards. The
 -- VM defers delivery through its own bookkeeping, and it lands wherever the
 -- runner first allows it: inside the operation, or, once the operation has
--- ended, at 'settling''s own allowance. This returns when the sender's
+-- ended, at 'withSettling''s own allowance. This returns when the sender's
 -- @throwTo@ has returned, which is when the request has been taken by the
 -- runner, or the runner has ended. 'awaitSettled' and 'observedCancellation'
 -- are what show that the runner observed it.
 cancelling ∷ Exception e ⇒ Runner a → e → IO () → IO ()
 cancelling (Runner owner _) exception release = do
   sent ← newEmptyMVar
-  sender ← forkIO (throwTo owner exception >> putMVar sent ())
-  bounded (awaitPending sender)
-  release
-  bounded (takeMVar sent)
+  -- The sender is owned (#598): when the example fails before the request is taken, the sender, blocked delivering it, is ended
+  -- and joined with the scope instead of being left aimed at the owner.
+  withOwnedThread (throwTo owner exception >> putMVar sent ()) $ \sender _ → do
+    bounded (awaitPending sender)
+    release
+    bounded (takeMVar sent)
 
 -- | Wait until a sender is blocked delivering its exception to a thread that
 -- cannot take it yet.
@@ -275,6 +289,38 @@ observedCancellation settled =
   either fromException (const Nothing) (settledOperation settled)
     <|> (settledAfter settled >>= fromException)
 
+-- | Run the action on a thread of its own, owned for the length of the body (#598), which is given the box the action's answer
+-- is put in. However the body ends (a return, an exception, a cancellation) the thread has ended and been joined before this
+-- returns. An action that raises hands over no answer.
+withProducer ∷ IO a → (MVar a → IO b) → IO b
+withProducer action body = do
+  box ← newEmptyMVar
+  withOwnedThread (action >>= putMVar box) (\_ _ → body box)
+
+-- | 'withProducer' that also hands the body the thread, for an example that watches it (blocked delivering an exception, say).
+withProducerThread ∷ IO a → (ThreadId → MVar a → IO b) → IO b
+withProducerThread action body = do
+  box ← newEmptyMVar
+  withOwnedThread (action >>= putMVar box) (\thread _ → body thread box)
+
+-- | 'withProducers' that also hands the body each thread, for an example that watches the threads (blocked delivering an
+-- exception, say).
+withProducerThreads ∷ [IO a] → ([(ThreadId, MVar a)] → IO b) → IO b
+withProducerThreads actions body = go actions []
+  where
+    go [] started = body (reverse started)
+    go (action : rest) started = do
+      box ← newEmptyMVar
+      withOwnedThread (action >>= putMVar box) (\thread _ → go rest ((thread, box) : started))
+
+-- | 'withProducer' for several actions, started in the order given, each on a thread of its own; the body is given their boxes
+-- in that order.
+withProducers ∷ [IO a] → ([MVar a] → IO b) → IO b
+withProducers actions body = go actions []
+  where
+    go [] boxes = body (reverse boxes)
+    go (action : rest) boxes = withProducer action (\box → go rest (box : boxes))
+
 -- | Run a body as a VM's owner on a thread of its own, and wait for it under a
 -- bound.
 --
@@ -289,6 +335,11 @@ observedCancellation settled =
 detached ∷ IO a → IO a
 detached body = do
   outcome ← newEmptyMVar
+  -- DEFERRED (#598): this start stays unowned, and in the ownership guard's baseline. It runs inside the owner that
+  -- 'detached' detaches: a thread trapped in a @safe@ foreign call cannot be joined or cancelled, and Reentry.hs:9-12 requires
+  -- the examples to fail within their bound when a missing refusal traps the owner there (bridge/.../Internal/Vm.hs:31-37
+  -- explains why cancelling that owner cannot end the wait). Joining it would hang the example the bound exists to fail. A
+  -- separately scoped delivery handles it; no containment strategy is chosen here.
   _ ← mask $ \restore → forkIO (tryWithContext @SomeException (restore body) >>= putMVar outcome)
   bounded (takeMVar outcome) >>= either rethrowIO pure
 

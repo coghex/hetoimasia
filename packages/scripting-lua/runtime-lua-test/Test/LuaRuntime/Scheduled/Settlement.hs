@@ -4,8 +4,8 @@
 -- reclamation of a ticket's reservation.
 module Test.LuaRuntime.Scheduled.Settlement (spec) where
 
-import Control.Concurrent (forkIO, yield)
-import Control.Concurrent.MVar (modifyMVar_, newEmptyMVar, newMVar, putMVar, readMVar, takeMVar)
+import Control.Concurrent (yield)
+import Control.Concurrent.MVar (modifyMVar_, newMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (atomically, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, retry, writeTVar)
 import Control.Monad (forM, forM_, replicateM, replicateM_, void)
 import Data.List (nub)
@@ -24,7 +24,7 @@ import Hetoimasia.Scripting.Lua.Value (Value (VInteger, VText))
 import Test.Hspec (Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
 import Test.LuaRuntime.Scheduled.Support
 import Test.LuaRuntime.Scheduler.Support (nanoseconds)
-import Test.LuaRuntime.Support (bounded, failExample, Gated (..), requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, failExample, Gated (..), requiredPolicy, withBoundary, withBoundaryOpening, withProducer, withProducers)
 
 -- | Keep asking until the admission is accepted: for the moment between a
 -- reservation being forgotten and the owner's next sweep giving it back.
@@ -230,26 +230,28 @@ spec = describe "admission and settlement" $ do
         takesGrants ← newTVarIO True
         accepted' ← newTVarIO (0 ∷ Int)
         acceptedAtClose ← newTVarIO Nothing
-        answers ← forM [1 .. 64 ∷ Int] $ \_ → do
-          done ← newEmptyMVar
-          _ ← forkIO $ do
-            results ← replicateM 16 $ atomically $ do
-              takes ← readTVar takesGrants
-              if takes
-                then
-                  grantScheduledStepSTM endpoint (nanoseconds 5) >>= \case
-                    GrantAccepted found → modifyTVar' accepted' (+ 1) >> pure (Just found)
-                    _ → pure Nothing
-                else pure Nothing
-            putMVar done results
-          pure done
-        closer ← newEmptyMVar
-        _ ← forkIO $ do
-          yield
-          atomically (writeTVar takesGrants False >> readTVar accepted' >>= writeTVar acceptedAtClose . Just)
-          putMVar closer ()
-        found ← concat <$> mapM takeMVar answers
-        takeMVar closer
+        found ←
+          withProducers
+            [ replicateM 16 $ atomically $ do
+                takes ← readTVar takesGrants
+                if takes
+                  then
+                    grantScheduledStepSTM endpoint (nanoseconds 5) >>= \case
+                      GrantAccepted found → modifyTVar' accepted' (+ 1) >> pure (Just found)
+                      _ → pure Nothing
+                  else pure Nothing
+            | _ ← [1 .. 64 ∷ Int]
+            ]
+            $ \answers →
+              withProducer
+                ( do
+                    yield
+                    atomically (writeTVar takesGrants False >> readTVar accepted' >>= writeTVar acceptedAtClose . Just)
+                )
+                $ \closer → do
+                  found ← concat <$> mapM takeMVar answers
+                  takeMVar closer
+                  pure found
         total ← readTVarIO accepted'
         atClose ← readTVarIO acceptedAtClose
         -- nothing was accepted after the closure committed, and the scheduler issued exactly those grants, once each
@@ -272,27 +274,24 @@ spec = describe "admission and settlement" $ do
               admitScheduledTask endpoint (echoing 1) >>= \case
                 TaskAccepted identity ticket → modifyMVar_ accepted' (pure . ((identity, ticket) :))
                 _ → pure ()
-        producersDone ← forM [1 .. 4 ∷ Int] $ \_ → do
-          done ← newEmptyMVar
-          _ ← forkIO (producer >> putMVar done ())
-          pure done
-        controllerDone ← newEmptyMVar
-        _ ← forkIO $ do
-          forM_ [1 .. 600 ∷ Int] $ \n → do
-            held ← readMVar accepted'
-            case drop (n `mod` 50) held of
-              (identity, _) : _ →
-                requestTaskControl endpoint identity (if even n then RequestStop else RequestPause) >>= \case
-                  TaskControlAccepted receipt → forgetControl receipt
-                  _ → yield
-              [] → yield
-          putMVar controllerDone ()
-        -- The stop comes once a thousand tasks have been accepted, whatever the
-        -- producers and the controller are then doing.
-        awaitDiagnostics owner (\counts → diagAdmitted counts >= 1000)
-        retireScheduled owner
-        mapM_ takeMVar producersDone
-        takeMVar controllerDone
+        withProducers (replicate 4 producer) $ \producersDone →
+          withProducer
+            ( forM_ [1 .. 600 ∷ Int] $ \n → do
+                held ← readMVar accepted'
+                case drop (n `mod` 50) held of
+                  (identity, _) : _ →
+                    requestTaskControl endpoint identity (if even n then RequestStop else RequestPause) >>= \case
+                      TaskControlAccepted receipt → forgetControl receipt
+                      _ → yield
+                  [] → yield
+            )
+            $ \controllerDone → do
+              -- The stop comes once a thousand tasks have been accepted, whatever the
+              -- producers and the controller are then doing.
+              awaitDiagnostics owner (\counts → diagAdmitted counts >= 1000)
+              retireScheduled owner
+              mapM_ takeMVar producersDone
+              takeMVar controllerDone
         _ ← awaitScheduledTerminal control owner
         tickets ← map snd <$> readMVar accepted'
         length tickets `shouldSatisfy` (>= 1000)
@@ -335,11 +334,9 @@ spec = describe "admission and settlement" $ do
         admitScheduledTask endpoint (echoing 4) >>= (`shouldSatisfy` (not . isAccepted))
         -- Two threads looking at once see one outcome and free one reservation.
         results ← newMVar []
-        dones ← forM [1 .. 2 ∷ Int] $ \_ → do
-          done ← newEmptyMVar
-          _ ← forkIO (waitTask second >>= \settled → modifyMVar_ results (pure . (taskReturned (settledOutcome settled) :)) >> putMVar done ())
-          pure done
-        mapM_ takeMVar dones
+        withProducers
+          (replicate 2 (waitTask second >>= \settled → modifyMVar_ results (pure . (taskReturned (settledOutcome settled) :))))
+          (mapM_ takeMVar)
         readMVar results >>= (`shouldBe` [Just [VInteger 2], Just [VInteger 2]])
         _ ← untilAccepted endpoint (echoing 5)
         admitScheduledTask endpoint (echoing 6) >>= (`shouldSatisfy` (not . isAccepted))

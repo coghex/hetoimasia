@@ -10,6 +10,7 @@ import qualified Test.Lua.Hazard
 import qualified Test.Lua.Independence
 import qualified Test.Lua.Libraries
 import qualified Test.Lua.Opacity
+import qualified Test.Lua.Ownership
 import qualified Test.Lua.Owner.Spec
 import qualified Test.Lua.Protocol.Spec
 import qualified Test.Lua.Reentry
@@ -19,6 +20,7 @@ spec = describe "Lua" $ do
   Test.Lua.Faults.spec
   Test.Lua.Discipline.spec
   Test.Lua.Close.spec
+  Test.Lua.Ownership.spec
   Test.Lua.Reentry.spec
   Test.Lua.Independence.spec
   Test.Lua.Libraries.spec

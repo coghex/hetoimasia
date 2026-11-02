@@ -3,8 +3,7 @@
 -- accepted event keeps.
 module Test.LuaRuntime.Instance.Events (spec) where
 
-import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (takeMVar)
 import Control.Monad (forM, forM_)
 import Data.List (sort)
 import Data.Maybe (mapMaybe)
@@ -15,7 +14,7 @@ import Hetoimasia.Scripting.Lua.Value (Schema (SInteger, SList), Value (VInteger
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Instance.Support
 import Test.LuaRuntime.Scheduled.Support (awaitEffect, awaitEntered, defaultSchedulerBounds, releaseGate)
-import Test.LuaRuntime.Support (bounded, failExample, Gated (..), requiredPolicy, withBoundary, withBoundaryOpening)
+import Test.LuaRuntime.Support (bounded, failExample, Gated (..), requiredPolicy, withBoundary, withBoundaryOpening, withProducers)
 
 spec ∷ Spec
 spec = describe "events" $ do
@@ -194,13 +193,12 @@ spec = describe "events" $ do
       awaitPhase fixture owner "a" Active
       identity ← idOf fixture "a"
       let endpoint = scheduledEndpoint owner
-      done ← forM [1 .. 4 ∷ Int] $ \producer → do
-        finished ← newEmptyMVar
-        _ ← forkIO $ do
-          answers ← forM [1 .. 5 ∷ Int] $ \n → deliverEvent endpoint identity "tick" (tickEvent (producer * 10 + n))
-          putMVar finished answers
-        pure finished
-      answers ← concat <$> forM done takeMVar
+      answers ←
+        withProducers
+          [ forM [1 .. 5 ∷ Int] $ \n → deliverEvent endpoint identity "tick" (tickEvent (producer * 10 + n))
+          | producer ← [1 .. 4 ∷ Int]
+          ]
+          (fmap concat . mapM takeMVar)
       let sequences = mapMaybe (\case DeliveryAccepted n → Just n; _ → Nothing) answers
       sort sequences `shouldBe` [0 .. 19]
       awaitCount fixture 21

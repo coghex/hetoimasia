@@ -30,7 +30,7 @@ helpers =
   , ("expectFatalOpening", void . expectFatalOpening [])
   , ("tryBoundaryOpening", void . tryBoundaryOpening [])
   , ("tryExpected over a boundary", \body → void (tryExpected (withBoundary body)))
-  , ("failingWait", \body → newSFixture >>= \fixture → failingWait fixture [] (\control runtime → body control runtime >> failExample "the scenario returned"))
+  , ("failingWait", \body → newSFixture >>= \fixture → failingWait fixture [] (\control runtime _ → body control runtime >> failExample "the scenario returned"))
   ]
 
 -- | A helper that answers the failure it expected, as a function of the body it runs in a boundary.

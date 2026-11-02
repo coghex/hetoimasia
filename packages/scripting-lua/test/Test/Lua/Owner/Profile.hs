@@ -68,6 +68,8 @@ import Test.Lua.Boundary.Support (logged, newFixture, sampleConfig)
 import Test.Lua.Owner.Support
 import Test.Lua.Support (Recorder, newRecorder, recorded, recordingCallback, withVm)
 import Test.Support.Bounded (bounded)
+import Control.Concurrent.MVar (tryPutMVar)
+import Control.Monad (void)
 
 -- | The libraries the profile owns, as an explicit list: what a general owner
 -- over the same libraries opens, with nothing removed.
@@ -356,17 +358,17 @@ spec = describe "the M1 library profile" $ do
   describe "independent owners" $
     forM_ [(True, "the general owner closes first"), (False, "the profiled owner closes first")] $ \(generalFirst, label) →
       it ("do not change each other's surface while both are live and after either closes: " <> label) $ do
-        generalSide ← startSide True
-        profiledSide ← startSide False
-        forM_ [generalSide, profiledSide] (bounded . takeMVar . sideReady)
-        let order = if generalFirst then [generalSide, profiledSide] else [profiledSide, generalSide]
-        forM_ order $ \side → do
-          putMVar (sideGo side) ()
-          outcome ← bounded (takeMVar (sideOutcome side))
-          either (const (expectationFailure "an owner failed")) pure outcome
-        -- Each owner checked its own surface before the other closed and after.
-        recorded (sideChecks generalSide) >>= (`shouldBe` ["ok", "ok"])
-        recorded (sideChecks profiledSide) >>= (`shouldBe` ["ok", "ok"])
+        withSide True $ \generalSide → do
+          withSide False $ \profiledSide → do
+            forM_ [generalSide, profiledSide] (bounded . takeMVar . sideReady)
+            let order = if generalFirst then [generalSide, profiledSide] else [profiledSide, generalSide]
+            forM_ order $ \side → do
+              putMVar (sideGo side) ()
+              outcome ← bounded (takeMVar (sideOutcome side))
+              either (const (expectationFailure "an owner failed")) pure outcome
+            -- Each owner checked its own surface before the other closed and after.
+            recorded (sideChecks generalSide) >>= (`shouldBe` ["ok", "ok"])
+            recorded (sideChecks profiledSide) >>= (`shouldBe` ["ok", "ok"])
 
   describe "selecting a profile with an explicit library list" $ do
     it "is refused at construction through the public owner, naming both" $ do
@@ -446,8 +448,8 @@ data Side = Side
 -- | Start an owner on a thread of its own, general or profiled. It checks its own
 -- surface once its construction is done and again when it is released, and notes
 -- each result with the callback that reports it.
-startSide ∷ Bool → IO Side
-startSide isGeneral = do
+withSide ∷ Bool → (Side → IO a) → IO a
+withSide isGeneral continue = do
   checks ← newRecorder
   ready ← newEmptyMVar
   go ← newEmptyMVar
@@ -467,9 +469,14 @@ startSide isGeneral = do
                 )
               ]
           }
-  (_, outcome) ← ownerThread config $ \owned → do
-    evalOwned owned (chunkName "before") "check()"
-    putMVar ready ()
-    takeMVar go
-    evalOwned owned (chunkName "after") "check()"
-  pure (Side checks ready go outcome)
+  -- The owner is owned (#598): it waits at `go` until its example ends it, so the stop lets it go before it is joined.
+  withOwnerThread
+    (void (tryPutMVar go ()))
+    config
+    ( \owned → do
+        evalOwned owned (chunkName "before") "check()"
+        putMVar ready ()
+        takeMVar go
+        evalOwned owned (chunkName "after") "check()"
+    )
+    $ \(_, outcome) → continue (Side checks ready go outcome)

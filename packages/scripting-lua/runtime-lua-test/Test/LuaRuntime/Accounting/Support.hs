@@ -9,7 +9,7 @@
 module Test.LuaRuntime.Accounting.Support
   ( -- * A wait on a thread of its own
     PendingWait
-  , beginWait
+  , withWait
   , awaitPending
   , isPending
   , resultOf
@@ -44,6 +44,7 @@ module Test.LuaRuntime.Accounting.Support
   , grant
     -- * Holding the owner
   , holdingSafely
+  , holdingSafelyScoped
   , releasing
     -- * Owners
   , startPlain
@@ -52,12 +53,13 @@ module Test.LuaRuntime.Accounting.Support
   , retainedFailure
   ) where
 
-import Control.Concurrent (ThreadId, forkIOWithUnmask, killThread, yield)
+import Control.Concurrent (ThreadId, killThread, yield)
 import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (ThreadBlocked), threadStatus)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar, tryReadMVar)
 import Hetoimasia.Scripting.Lua.Runtime (LuaRuntime)
 import Test.LuaRuntime.Support (failExample, tryExpected, withBoundary)
-import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, mask_, onException, try)
+import Test.Support.Owned (withOwnedThread)
+import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, mask, onException, try)
 import Control.Monad (forM_)
 import Data.Word (Word64)
 import Hetoimasia.Runtime.Supervision (RuntimeControl, WorkerPolicy)
@@ -77,17 +79,22 @@ import Test.LuaRuntime.Scheduled.Support (SFixture, admitTask', awaitEntered, re
 data PendingWait = PendingWait
   { waitingThread ∷ !ThreadId
   , waitingResult ∷ !(MVar (Either SomeException AccountingWait))
+  , waitingEnded ∷ !(IO ())
+  -- ^ Waits for the thread's end, which the scope of the wait announces however it ended.
   }
 
--- | Begin a wait on a thread of its own. Its snapshot is taken when that thread runs,
--- so an example that needs the snapshot before something else happens waits for the
--- wait to be pending first.
-beginWait ∷ RuntimeControl → ScheduledOwner → IO PendingWait
-beginWait control owner = do
+-- | Begin a wait on a thread of its own, owned for the length of the body (#598): however the body ends (a return, an
+-- exception, a cancellation) the thread has ended and been joined before this returns. Its snapshot is taken when that thread
+-- runs, so an example that needs the snapshot before something else happens waits for the wait to be pending first.
+--
+-- A thread cancelled before it has entered the wait ends without an answer, which is why 'cancelWait' waits for the thread's
+-- end and not for its answer.
+withWait ∷ RuntimeControl → ScheduledOwner → (PendingWait → IO a) → IO a
+withWait control owner body = do
   result ← newEmptyMVar
-  -- Masked until the wait runs, so that a cancellation which arrives first still ends in a result.
-  thread ← mask_ (forkIOWithUnmask (\unmask → try (unmask (awaitScheduledAccounting control owner)) >>= putMVar result))
-  pure (PendingWait thread result)
+  withOwnedThread
+    (mask $ \restore → try (restore (awaitScheduledAccounting control owner)) >>= putMVar result)
+    (\thread ended → body (PendingWait thread result ended))
 
 -- | Block until the wait is parked in STM. Its snapshot has been taken by then, and it
 -- has not returned: a thread parked in a transaction is a wait that did not find its
@@ -113,9 +120,9 @@ isPending waiting = maybe True (const False) <$> tryReadMVar (waitingResult wait
 resultOf ∷ PendingWait → IO (Either SomeException AccountingWait)
 resultOf = readMVar . waitingResult
 
--- | Cancel the wait, as an asynchronous exception on its thread, and wait until it has ended.
+-- | Cancel the wait, as an asynchronous exception on its thread, and wait until the thread has ended.
 cancelWait ∷ PendingWait → IO ()
-cancelWait waiting = killThread (waitingThread waiting) >> () <$ resultOf waiting
+cancelWait waiting = killThread (waitingThread waiting) >> waitingEnded waiting
 
 -- Gates --------------------------------------------------------------------------------
 
@@ -411,6 +418,22 @@ holdingSafely fixture owner body = do
   _ ← waitTask ticket
   pure result
 
+-- | 'holdingSafely' for a body that begins a wait with 'withWait' and must still have it when the owner is let go: the body is
+-- given the continuation to call from inside its scope, and the owner is let go (and the holding task awaited) before the
+-- continuation's own step runs, all inside the wait's scope (#598). The owner is let go if the body raises, as 'holdingSafely'
+-- does.
+holdingSafelyScoped ∷ SFixture → ScheduledOwner → ((a → IO ()) → IO ()) → (a → IO ()) → IO ()
+holdingSafelyScoped fixture owner body continue = do
+  ticket ← admitTask' fixture owner "holder" (request "block_in" [VText "holder"] ControlClass OneShot Nothing)
+  awaitEntered fixture "holder"
+  body
+    ( \held → do
+        releaseGate fixture "holder"
+        _ ← waitTask ticket
+        continue held
+    )
+    `onException` releaseGate fixture "holder"
+
 -- | Run this, and however it ends open every gate an example parks the owner at (the gate of a
 -- hook, of a closing handler, of a task, of the application's own callback), so that an example
 -- that fails fails, and does not leave a protected exit waiting on an owner nothing can wake.
@@ -436,12 +459,14 @@ startPlain fixture runtime label policy bounds =
 -- The boundary's own end may carry the failure; a failed assertion of the scenario, or a timeout of the
 -- example's bound, is not that failure and is raised as itself ('tryExpected'), and the outcome is read
 -- without blocking.
-failingWait ∷ SFixture → [Gate] → (RuntimeControl → LuaRuntime → IO PendingWait) → IO ()
+--
+-- The scenario begins the wait with 'withWait' and ends with the continuation it is given, which reads the wait's outcome
+-- while the wait's thread is still owned by the scenario's scope (#598).
+failingWait ∷ SFixture → [Gate] → (RuntimeControl → LuaRuntime → (PendingWait → IO ()) → IO ()) → IO ()
 failingWait fixture gates scenario = do
   outcome ← newEmptyMVar
-  stalled ← tryExpected . withBoundary $ \control runtime → releasing fixture gates $ do
-    waiting ← scenario control runtime
-    resultOf waiting >>= putMVar outcome
+  stalled ← tryExpected . withBoundary $ \control runtime → releasing fixture gates $
+    scenario control runtime (\waiting → resultOf waiting >>= putMVar outcome)
   tryReadMVar outcome >>= \case
     Nothing → failExample ("the example recorded no outcome for the wait" <> either (\(ExceptionWithContext _ raised) → ": " <> show raised) (const "") stalled)
     Just (Right answered) → failExample ("the wait answered " <> show answered)
@@ -453,12 +478,12 @@ failingWait fixture gates scenario = do
 -- would answer it if the owner wrongly wrote one; it must stay parked while the owner is parked, and end
 -- with the failure once the gate is opened. The scenario returns the owner and what lets it go on, which is
 -- handed the action that begins the wait and calls it, while the owner is held, before it lets the owner go.
-retainedFailure ∷ SFixture → [Gate] → Text.Text → (RuntimeControl → LuaRuntime → IO (ScheduledOwner, IO PendingWait → IO PendingWait)) → IO ()
-retainedFailure fixture gates gate' scenario = failingWait fixture gates $ \control runtime → do
+retainedFailure ∷ SFixture → [Gate] → Text.Text → (RuntimeControl → LuaRuntime → IO (ScheduledOwner, ((PendingWait → IO ()) → IO ()) → (PendingWait → IO ()) → IO ())) → IO ()
+retainedFailure fixture gates gate' scenario = failingWait fixture gates $ \control runtime finish → do
   (owner, go) ← scenario control runtime
-  waiting ← go (do w ← beginWait control owner; awaitPending w; pure w)
-  awaitEntered fixture gate'
-  stabilize waiting
-  awaitPending waiting
-  releaseGate fixture gate'
-  pure waiting
+  go (\continue → withWait control owner $ \w → awaitPending w >> continue w) $ \waiting → do
+    awaitEntered fixture gate'
+    stabilize waiting
+    awaitPending waiting
+    releaseGate fixture gate'
+    finish waiting

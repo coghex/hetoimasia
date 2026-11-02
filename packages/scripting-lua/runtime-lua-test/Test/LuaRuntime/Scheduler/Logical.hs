@@ -4,8 +4,7 @@
 -- 'awaitSupervised'.
 module Test.LuaRuntime.Scheduler.Logical (spec) where
 
-import Control.Concurrent (forkIO, killThread)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.MVar (takeMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Monad (forM_, forever, void)
 import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
@@ -15,7 +14,8 @@ import Hetoimasia.Runtime.Supervision (awaitSupervised)
 import Hetoimasia.Scripting.Lua.Scheduler
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduler.Support
-import Test.LuaRuntime.Support (bounded, failExample, withBoundary)
+import Test.LuaRuntime.Support (bounded, failExample, withBoundary, withProducer)
+import Test.Support.Owned (withOwnedThread)
 
 tick ∷ Rig → IO Word64
 tick = atomically . readTick . rigScheduler
@@ -224,12 +224,9 @@ spec = describe "logical time" $ do
     _ ← granted rig 6
     outstanding rig >>= (`shouldBe` 2)
     withBoundary $ \control _ → do
-      done ← newEmptyMVar
       -- The owner's thread: sleep until there is work, then serve it.
-      owner ← forkIO (forever (atomically (awaitWork (rigScheduler rig)) >> turn rig))
-      void (forkIO (awaitSupervised control (awaitStepsComplete (rigScheduler rig)) >>= putMVar done))
-      takeMVar done
-      killThread owner
+      withOwnedThread (forever (atomically (awaitWork (rigScheduler rig)) >> turn rig)) $ \_ _ →
+        void (withProducer (awaitSupervised control (awaitStepsComplete (rigScheduler rig))) takeMVar)
     tick rig >>= (`shouldBe` 2)
     outstanding rig >>= (`shouldBe` 0)
     handed rig >>= (`shouldBe` [("waiter", 0, Nothing), ("waiter", 1, Just (ResumedLogical 2 (nanoseconds 11)))])

@@ -20,7 +20,6 @@ import Hetoimasia.Scripting.Lua.Internal.MacOS.Confine
 import Hetoimasia.Scripting.Lua.Internal.MacOS.Launch
   ( Exit (..)
   , LaunchRequest (..)
-  , launch
   )
 import Hetoimasia.Scripting.Lua.Internal.MacOS.Report
   ( Origin (..)
@@ -106,15 +105,14 @@ spec = describe "confinement" $ do
     let arguments =
           replaceProfile "/nonexistent/hetoimasia-macos-probe.sb" $
             helperArguments fixture (fixtureFirst fixture) (fixtureSecond fixture) "report"
-    launched ←
-      either (fail . show) pure
-        =<< launch
-          LaunchRequest
-            { requestExecutable = fixtureHelper fixture
-            , requestArguments = arguments
-            , requestMemoryLimitMiB = 0
-            }
-    (reports, status) ← observeExit launched
+    (reports, status) ←
+      withLaunched
+        LaunchRequest
+          { requestExecutable = fixtureHelper fixture
+          , requestArguments = arguments
+          , requestMemoryLimitMiB = 0
+          }
+        observeExit
     let refusals = [(refusal, detail) | Refused refusal detail ← reports]
     map fst refusals `shouldBe` [ConfinementUnavailable]
     status `shouldBe` ExitedWith (refusalExitCode ConfinementUnavailable)

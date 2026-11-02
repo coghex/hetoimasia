@@ -4,16 +4,17 @@
 module Test.LuaRuntime.Scheduler.Stop (spec) where
 
 import Control.Concurrent.STM (atomically)
-import Control.Concurrent (forkIO, throwTo)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent (throwTo)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Exception (AsyncException (ThreadKilled), SomeException, fromException, toException, try)
-import Control.Monad (when)
+import Control.Monad (void, when)
 import Data.IORef (atomicModifyIORef', modifyIORef', newIORef, writeIORef)
 import qualified Data.Map.Strict as Map
 import Hetoimasia.Scripting.Lua.Scheduler
 import Test.Hspec (Spec, describe, it, shouldBe, shouldSatisfy)
 import Test.LuaRuntime.Scheduler.Support
 import Test.LuaRuntime.Support (failExample)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 request ∷ Rig → TaskId → ControlRequest → IO ControlTicket
 request rig identity what =
@@ -89,21 +90,24 @@ spec = describe "stopping the scheduler, admission and diagnostics" $ do
       writeIORef (rigCloseHook rig) $ \identity →
         when (identity == taskIdAt 0) (putMVar entered () >> takeMVar gate)
       finished ← newEmptyMVar
-      stopper ← forkIO (try @SomeException (stopScheduler (rigScheduler rig) (rigHost rig)) >>= putMVar finished)
-      takeMVar entered
-      -- The first close is blocked, interruptibly, inside the host.
-      throwTo stopper ThreadKilled
-      outcome ← takeMVar finished
-      case outcome of
-        Left failure → fromException failure `shouldBe` Just ThreadKilled
-        Right _ → failExample "the interruption should have been raised after the stop completed"
-      map fst <$> closedTasks rig >>= (`shouldBe` [taskIdAt 0, taskIdAt 1, taskIdAt 2])
-      atomically (schedulerClosed (rigScheduler rig)) >>= (`shouldBe` True)
-      -- The stop is complete and its record keeps the interruption as evidence;
-      -- asking again closes nothing.
-      again ← stopScheduler (rigScheduler rig) (rigHost rig)
-      map fst (stopCloseFailures again) `shouldBe` [taskIdAt 0]
-      length <$> closedTasks rig >>= (`shouldBe` 3)
+      withOwnedThreadOpening
+        (void (tryPutMVar gate ()))
+        (try @SomeException (stopScheduler (rigScheduler rig) (rigHost rig)) >>= putMVar finished)
+        $ \stopper _ → do
+          takeMVar entered
+          -- The first close is blocked, interruptibly, inside the host.
+          throwTo stopper ThreadKilled
+          outcome ← takeMVar finished
+          case outcome of
+            Left failure → fromException failure `shouldBe` Just ThreadKilled
+            Right _ → failExample "the interruption should have been raised after the stop completed"
+          map fst <$> closedTasks rig >>= (`shouldBe` [taskIdAt 0, taskIdAt 1, taskIdAt 2])
+          atomically (schedulerClosed (rigScheduler rig)) >>= (`shouldBe` True)
+          -- The stop is complete and its record keeps the interruption as evidence;
+          -- asking again closes nothing.
+          again ← stopScheduler (rigScheduler rig) (rigHost rig)
+          map fst (stopCloseFailures again) `shouldBe` [taskIdAt 0]
+          length <$> closedTasks rig >>= (`shouldBe` 3)
 
   describe "a timer whose cancellation throws" $ do
     it "does not stop the stop: every close runs, the control requests settle, the failure is raised after, and the report is answered again" $ do
@@ -142,15 +146,18 @@ spec = describe "stopping the scheduler, admission and diagnostics" $ do
       writeIORef (rigCloseHook rig) $ \identity →
         when (identity == taskIdAt 0) (putMVar entered () >> takeMVar gate)
       finished ← newEmptyMVar
-      stopper ← forkIO (try @SomeException (stopScheduler (rigScheduler rig) (rigHost rig)) >>= putMVar finished)
-      takeMVar entered
-      throwTo stopper ThreadKilled
-      takeMVar finished >>= \case
-        Left failure → fromException failure `shouldBe` Just ThreadKilled
-        Right _ → failExample "the interruption should have been raised after the stop completed"
-      again ← stopScheduler (rigScheduler rig) (rigHost rig)
-      fmap show (stopTimerFailure again) `shouldBe` Just (show (userError "cancel failed"))
-      map fst (stopCloseFailures again) `shouldBe` [taskIdAt 0]
+      withOwnedThreadOpening
+        (void (tryPutMVar gate ()))
+        (try @SomeException (stopScheduler (rigScheduler rig) (rigHost rig)) >>= putMVar finished)
+        $ \stopper _ → do
+          takeMVar entered
+          throwTo stopper ThreadKilled
+          takeMVar finished >>= \case
+            Left failure → fromException failure `shouldBe` Just ThreadKilled
+            Right _ → failExample "the interruption should have been raised after the stop completed"
+          again ← stopScheduler (rigScheduler rig) (rigHost rig)
+          fmap show (stopTimerFailure again) `shouldBe` Just (show (userError "cancel failed"))
+          map fst (stopCloseFailures again) `shouldBe` [taskIdAt 0]
 
   describe "close failures that a turn that ended exceptionally had met" $ do
     let setup = do
@@ -210,15 +217,18 @@ spec = describe "stopping the scheduler, admission and diagnostics" $ do
       gate ← newEmptyMVar
       writeIORef (ftOnArm (rigTimer rig)) (putMVar entered () >> takeMVar gate)
       finished ← newEmptyMVar
-      driver ← forkIO (try @SomeException (turn rig) >>= putMVar finished)
-      takeMVar entered
-      thrower ← forkIO (throwTo driver ThreadKilled)
-      awaitDelivered thrower
-      putMVar gate ()
-      _ ← takeMVar finished
-      writeIORef (ftOnArm (rigTimer rig)) (pure ())
-      next ← turn rig
-      map fst (turnCloseFailures next) `shouldBe` [refused]
+      withOwnedThreadOpening
+        (void (tryPutMVar gate ()))
+        (try @SomeException (turn rig) >>= putMVar finished)
+        $ \driver _ → do
+          takeMVar entered
+          withOwnedThread (throwTo driver ThreadKilled) $ \thrower _ → do
+            awaitDelivered thrower
+            putMVar gate ()
+            void (takeMVar finished)
+          writeIORef (ftOnArm (rigTimer rig)) (pure ())
+          next ← turn rig
+          map fst (turnCloseFailures next) `shouldBe` [refused]
 
     it "are not lost to a report that never arrived: a report is acknowledged by the next turn, and until then the stop reports it again" $ do
       (rig, refused) ← refusedWithElapsedWaiter
