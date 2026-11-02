@@ -13,6 +13,7 @@ import qualified Test.MacOS.Confinement as Confinement
 import qualified Test.MacOS.Isolation as Isolation
 import qualified Test.MacOS.Lifetime as Lifetime
 import qualified Test.MacOS.Limits as Limits
+import qualified Test.MacOS.Ownership as Ownership
 import Test.MacOS.Driver (withFixture)
 
 spec ∷ Spec
@@ -21,3 +22,4 @@ spec = describe "MacOS" $ aroundAll withFixture $ do
   Isolation.spec
   Limits.spec
   Lifetime.spec
+  Ownership.spec
