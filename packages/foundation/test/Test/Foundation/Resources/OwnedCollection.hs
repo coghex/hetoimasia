@@ -1330,7 +1330,8 @@ refusedWhileBusy
   → IO ([Maybe OwnedCollectionError], a)
 refusedWhileBusy events collection existing inside proceed busy = do
   finished ← newEmptyMVar
-  withOwnedThread (try busy >>= putMVar finished) $ \_ _ → do
+  -- The busy operation can be held uninterruptibly at @proceed@ (a release that waits there), so the stop opens it first.
+  withOwnedThreadOpening (void (tryPutMVar proceed ())) (try busy >>= putMVar finished) $ \_ _ → do
     takeMVar inside
     refused ← refusedOperations events collection existing
     putMVar proceed ()

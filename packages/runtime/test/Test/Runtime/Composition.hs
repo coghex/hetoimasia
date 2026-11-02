@@ -117,6 +117,7 @@ import Test.Runtime.Supervision.Support
   , owned
   , record
   , required
+  , runOwnedScope
   , serviceUntilStopped
   , traced
   )
@@ -1325,46 +1326,50 @@ drainRun observe = do
   harness ← newHarness ignoreWrites (pure ())
   let trace = harnessTrace harness
   hub ← newHub trace
-  caller ← myThreadId
   handed ← newEmptyMVar
   release ← newEmptyMVar
   readings ← newEmptyMVar
-  withOwnedThreadOpening (void (tryPutMVar release ()))
-    ( do
-        control ← readMVar handed
-        let observed = do
-              atomically (readTVar (hubQuiesced hub) >>= \quiesced → if quiesced then pure () else retry)
-              -- Quiescence precedes supervision's exit, so the caller's next STM
-              -- wait is the protected drain.
-              awaitBlockedOnSTM caller
-              if observe
-                then do
-                  first ← atomically (workerGroupStatus control)
-                  awaitBlockedOnSTM caller
-                  second ← atomically (workerGroupStatus control)
-                  pure [first, second]
-                else pure []
-        (observed >>= putMVar readings) `finally` void (tryPutMVar release ())
-    )
-    $ \_ _ → do
-      let startup h control = do
-            record trace "startup"
-            expectLive h
-            _ ←
-              startSupervised control (required Service)
-                (workerDefinition "held" (\_ → owned trace "held") (\_ () → uninterruptibleMask_ (readMVar release)))
-                >>= expectStarted
-            putMVar handed control
-            pure h
-          action h _ = hubAction h >> throwIO (Broken "action failed")
-      failure ← expectFailure (runManagedIn harness (managedHub hub plainHub) quiesceHub startup action)
-      control ← readMVar handed
-      DrainRun (brokenIs "action failed" failure)
-        <$> traced trace
-        <*> (map entryMessage <$> errorEntries harness)
-        <*> flushes harness
-        <*> takeMVar readings
-        <*> atomically (workerGroupStatus control)
+  let letGo = void (tryPutMVar release ())
+      startup h control = do
+        record trace "startup"
+        expectLive h
+        _ ←
+          startSupervised control (required Service)
+            (workerDefinition "held" (\_ → owned trace "held") (\_ () → uninterruptibleMask_ (readMVar release)))
+            >>= expectStarted
+        putMVar handed control
+        pure h
+      action h _ = hubAction h >> throwIO (Broken "action failed")
+  -- The managed run is drained uninterruptibly behind the held service, so it runs on a thread the example owns, whose stop opens
+  -- the release first: an example that fails or is cancelled at any point of the startup (before the control is handed over,
+  -- before quiescence) cannot leave the drain waiting on the thread that would have to open it. The observer serves the drain and
+  -- watches that thread, so it is owned inside it, around the run.
+  failure ← runOwnedScope letGo $ do
+    caller ← myThreadId
+    let observer = do
+          control ← readMVar handed
+          let observed = do
+                atomically (readTVar (hubQuiesced hub) >>= \quiesced → if quiesced then pure () else retry)
+                -- Quiescence precedes supervision's exit, so the caller's next STM
+                -- wait is the protected drain.
+                awaitBlockedOnSTM caller
+                if observe
+                  then do
+                    first ← atomically (workerGroupStatus control)
+                    awaitBlockedOnSTM caller
+                    second ← atomically (workerGroupStatus control)
+                    pure [first, second]
+                  else pure []
+          (observed >>= putMVar readings) `finally` letGo
+    withOwnedThreadOpening letGo observer $ \_ _ →
+      expectFailure (runManagedIn harness (managedHub hub plainHub) quiesceHub startup action)
+  control ← readMVar handed
+  DrainRun (brokenIs "action failed" failure)
+    <$> traced trace
+    <*> (map entryMessage <$> errorEntries harness)
+    <*> flushes harness
+    <*> takeMVar readings
+    <*> atomically (workerGroupStatus control)
 
 testStatusDuringManagedDrain ∷ Expectation
 testStatusDuringManagedDrain = boundedSupervision $ do

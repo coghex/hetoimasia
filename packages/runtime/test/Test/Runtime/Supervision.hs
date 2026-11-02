@@ -14,8 +14,8 @@
 -- 'boundedSupervision' only stops an example that has already hung.
 module Test.Runtime.Supervision (spec) where
 
-import Control.Concurrent (killThread, myThreadId, throwTo)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
+import Control.Concurrent (ThreadId, killThread, myThreadId, throwTo)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (STM, atomically, check, newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception
   ( AsyncException (ThreadKilled)
@@ -24,6 +24,7 @@ import Control.Exception
   , SomeException
   , WhileHandling (WhileHandling)
   , fromException
+  , onException
   , rethrowIO
   , someExceptionContext
   , throwIO
@@ -33,9 +34,10 @@ import Control.Exception
   )
 import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
 import Control.Exception.Context (addExceptionAnnotation, emptyExceptionContext, getExceptionAnnotations)
-import Control.Monad (when)
+import Control.Monad (void, when)
+import Data.Foldable (for_)
 import Control.Monad.IO.Class (liftIO)
-import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import Hetoimasia.Foundation.Log (LogEntry (..), LogLevel (..))
 import Hetoimasia.Foundation.Resource (allocResource, cleanupFailuresInContext)
@@ -59,7 +61,20 @@ import Hetoimasia.Runtime.Supervision
 import Test.Runtime.Supervision.Support
 import qualified Test.Runtime.Supervision.Startup as Startup
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
-import Test.Support.Owned (withOwnedThread)
+import Test.Runtime.OwnedControl
+  ( ControlProbe (..)
+  , Scope
+  , Unowned
+  , endedAfterScope
+  , endings
+  , holdUntilTimedOut
+  , newControlProbe
+  , recordSelf
+  , runEnding
+  , startUnowned
+  , withRescue
+  )
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "Supervision" $ do
@@ -130,6 +145,28 @@ spec = describe "Supervision" $ do
       (boundedSupervision testFinalObservation)
     it "returns after an expected owner-requested cancellation and rejects a later start"
       (boundedSupervision testExpectedCancellationAndRejectedStart)
+  -- The supervision of the example runs on a thread of its own (#597): however the example ends while a worker's cleanup is held
+  -- at a gate only the example opens, the thread has ended and been joined, which needs the gate opened first.
+  describe "The runner of a supervision whose worker is held (runOwnedScope)" $
+    for_ endings $ \(label, ending) → do
+      it ("has ended and been joined, the held cleanup released, when the example " <> label) $ do
+        closing ← newClosing
+        ready ← newEmptyMVar
+        probe ← newControlProbe
+        runEnding (ownedHeldSupervision closing ready probe) (heldSupervision closing ready) probe ending
+        endedAfterScope probe >>= (`shouldBe` True)
+
+      it ("negative control: the previous unowned start leaves the runner held when the example " <> label) $ do
+        closing ← newClosing
+        ready ← newEmptyMVar
+        probe ← newControlProbe
+        withRescue $ \started → do
+          runEnding (unownedHeldSupervision started closing ready probe) (heldSupervision closing ready) probe ending
+          -- The failed judgement is recorded before anything independent touches the runner.
+          judgement ← endedAfterScope probe
+          judgement `shouldBe` False
+        -- The rescue opened the release, then stopped and joined it.
+        endedAfterScope probe >>= (`shouldBe` True)
 
 -- Helpers ----------------------------------------------------------------------
 
@@ -607,40 +644,101 @@ testCancelledClassification = do
 
 -- Closing ----------------------------------------------------------------------
 
-testExitBeforeStopSurvivesClosing ∷ Expectation
-testExitBeforeStopSurvivesClosing = do
-  trace ← newTrace
-  gate ← newGate
-  inRelease ← newGate
-  releaseGate ← newGate
-  handles ← newIORef []
-  application ← myThreadId
-  -- The opener serves the exit of the supervision (the close waits for the release the gate holds), so it is started outside it,
-  -- parked, and let go at the point the example reached the fork before; it is ended and joined after the close, never before.
-  go ← newEmptyMVar
-  failure@(ExceptionWithContext _ raised) ← withOwnedThread (readMVar go >> awaitBlockedOnSTM application >> openGate releaseGate) $ \_ _ →
-    expectFailure $ withCollectedLifetime ignoreWrites $ \collected →
-      withSupervision (collectedLifetime collected) $ \control → do
+-- | The gates and records of the closing arrangement: a watcher whose cleanup is held at 'closingRelease', the signal that lets its
+-- opener go, and the handles the example reads at the end.
+data Closing = Closing
+  { closingTrace ∷ Trace
+  , closingGate ∷ Gate
+  , closingInRelease ∷ Gate
+  , closingRelease ∷ Gate
+  , closingGo ∷ MVar ()
+  , closingHandles ∷ IORef [SupervisedWorker ()]
+  }
+
+newClosing ∷ IO Closing
+newClosing = Closing <$> newTrace <*> newGate <*> newGate <*> newGate <*> newEmptyMVar <*> newIORef []
+
+-- | What the body registers before it starts any worker, so that however it ends the supervision's close can finish: the
+-- opener is let go (it serves the close, and waits for the signal the normal path gives last) and the release is opened itself.
+-- Idempotent and non-blocking, as an opening must be.
+rescueClosing ∷ Closing → IO ()
+rescueClosing closing = void (tryPutMVar (closingGo closing) ()) >> openGate (closingRelease closing)
+
+-- | The opener that serves the close: it waits to be let go, then for the application to park in the drain, then opens the
+-- release.
+closingOpener ∷ ThreadId → Closing → IO ()
+closingOpener application closing = readMVar (closingGo closing) >> awaitBlockedOnSTM application >> openGate (closingRelease closing)
+
+-- | The supervision of the example. @hook@ runs once the watcher's cleanup is running and before the opener is signalled; the
+-- normal path does nothing there. With @rescued@ the body registers 'rescueClosing' first (before any worker exists, so no
+-- window leaves a worker held without it).
+runClosing ∷ Bool → Closing → IO () → IO ()
+runClosing rescued closing hook =
+  withCollectedLifetime ignoreWrites $ \collected →
+    withSupervision (collectedLifetime collected) $ \control →
+      guarded $ do
         let watcher =
               workerDefinition
                 "watcher"
-                (\_ → allocResource (pure ()) (\() → openGate inRelease >> readMVar releaseGate >> record trace "release watcher"))
-                (\_ () → readMVar gate)
+                ( \_ →
+                    allocResource
+                      (pure ())
+                      (\() → openGate (closingInRelease closing) >> readMVar (closingRelease closing) >> record (closingTrace closing) "release watcher")
+                )
+                (\_ () → readMVar (closingGate closing))
         watching ← expectStarted =<< startSupervised control (required Service) watcher
-        listening ← expectStarted =<< startSupervised control (required Service) (serviceUntilStopped trace "listener")
-        writeIORef handles [watching, listening]
-        openGate gate
+        listening ← expectStarted =<< startSupervised control (required Service) (serviceUntilStopped (closingTrace closing) "listener")
+        writeIORef (closingHandles closing) [watching, listening]
+        openGate (closingGate closing)
         -- The run action has exited and its cleanup is still running when the
         -- body returns and closing requests every stop.
-        readMVar inRelease
-        putMVar go ()
-        pure ()
+        readMVar (closingInRelease closing)
+        hook
+        putMVar (closingGo closing) ()
+  where
+    guarded act = if rescued then act `onException` rescueClosing closing else act
+
+testExitBeforeStopSurvivesClosing ∷ Expectation
+testExitBeforeStopSurvivesClosing = do
+  closing ← newClosing
+  -- The supervision runs on a thread the example owns, whose stop opens the release (and lets the opener go), so an example that
+  -- fails or is cancelled while the watcher's cleanup is held cannot leave the close waiting on a thread that is itself in it. The
+  -- opener serves the close and watches that thread, so it is owned inside it, around the supervision: it is ended and joined after
+  -- the close, never before. The body also registers the same rescue before it starts any worker, for a failure inside it.
+  failure@(ExceptionWithContext _ raised) ←
+    runOwnedScope (rescueClosing closing) $ do
+      runner ← myThreadId
+      withOwnedThreadOpening (openGate (closingRelease closing)) (closingOpener runner closing) $ \_ _ →
+        expectFailure (runClosing True closing (pure ()))
   case fromException raised of
     Just (UnexpectedServiceExit summary) → do
       completionLabel summary `shouldBe` "watcher"
       completionExit summary `shouldBe` RunExited RunReturned NothingRequested
     Nothing → expectationFailure ("expected an unexpected service exit, found " <> show failure)
-  readIORef handles >>= traverse statusOf >>= (`shouldBe` ["fatal", "stopped"])
+  readIORef (closingHandles closing) >>= traverse statusOf >>= (`shouldBe` ["fatal", "stopped"])
+
+-- | The supervision of the closing arrangement as the runner the held-supervision examples start: it says which thread it is,
+-- starts the watcher whose cleanup is held at the release, and parks in the body (signalling @ready@) with the close still ahead.
+heldSupervision ∷ Closing → MVar () → ControlProbe → IO ()
+heldSupervision closing ready probe = do
+  recordSelf probe
+  void (try @SomeException (runClosing False closing (putMVar ready () >> holdUntilTimedOut)))
+
+-- | The runner owned with the release as its opening, as the scope the endings run.
+ownedHeldSupervision ∷ Closing → MVar () → ControlProbe → Scope
+ownedHeldSupervision closing ready probe action body =
+  withOwnedThreadOpening (rescueClosing closing) action $ \runner _ → do
+    readMVar ready
+    putMVar (controlParked probe) ()
+    body runner
+
+-- | The previous start of the same runner: nothing opens the release when the example ends.
+unownedHeldSupervision ∷ IORef [Unowned] → Closing → MVar () → ControlProbe → Scope
+unownedHeldSupervision started closing ready probe action body = do
+  runner ← startUnowned started (rescueClosing closing) action
+  readMVar ready
+  putMVar (controlParked probe) ()
+  body runner
 
 testFinalObservation ∷ Expectation
 testFinalObservation = do

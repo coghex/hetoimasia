@@ -194,7 +194,8 @@ testFatalSibling policy = do
   trace ← newTrace
   gate ← newGate
   held ← newHeld
-  failure ← expectFailure $ withCollectedLifetime ignoreWrites $ \collected →
+  -- The supervision runs on a thread the example owns, whose stop releases the held worker first (see 'runOwnedScope').
+  failure ← runOwnedScope (openGate (heldRelease held)) $ expectFailure $ withCollectedLifetime ignoreWrites $ \collected →
     withSupervision (collectedLifetime collected) $ \control → do
       sibling ← expectStarted =<< startSupervised control policy (failingAfter trace "audio" gate (Broken "audio"))
       withObserving held
@@ -228,7 +229,8 @@ testToleratedSibling = do
   trace ← newTrace
   gate ← newGate
   held ← newHeld
-  (observed, warnings, newStatus, afterwards) ← withCollectedLifetime ignoreWrites $ \collected →
+  -- The supervision runs on a thread the example owns, whose stop releases the held worker first (see 'runOwnedScope').
+  (observed, warnings, newStatus, afterwards) ← runOwnedScope (openGate (heldRelease held)) $ withCollectedLifetime ignoreWrites $ \collected →
     withSupervision (collectedLifetime collected) $ \control → do
       sibling ← expectStarted =<< startSupervised control (optional Service) (failingAfter trace "telemetry" gate (Broken "telemetry"))
       withObserving held

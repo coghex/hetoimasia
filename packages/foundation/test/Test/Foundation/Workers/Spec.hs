@@ -47,6 +47,7 @@ import Control.Exception
   , ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , fromException
+  , rethrowIO
   , throwIO
   , try
   , tryWithContext
@@ -321,6 +322,17 @@ withOwnerOpening ∷ IO () → IO a → (ThreadId → MVar (Either (ExceptionWit
 withOwnerOpening open action body = do
   done ← newEmptyMVar
   withOwnedThreadOpening open (tryWithContext action >>= putMVar done) (\thread _ → body thread done)
+
+-- | Run a production scope on a thread the example owns, and wait for its outcome (its result, or the failure it raised, with its
+-- context). A scope that holds a worker behind a gate only the example opens is drained uninterruptibly, so on the example's own
+-- thread an example that fails or is cancelled meanwhile would wait there for ever: the opening that would end the wait is
+-- registered by the scope that is itself waiting. On an owned thread the example's thread is never the one held, and the first
+-- argument opens the gate (idempotently, without blocking) in the owned thread's release, before the kill.
+runOwnedScope ∷ IO () → IO a → IO a
+runOwnedScope open scope = do
+  outcome ← newEmptyMVar
+  withOwnedThreadOpening open (tryWithContext @SomeException scope >>= putMVar outcome) $ \_ _ →
+    takeMVar outcome >>= either rethrowIO pure
 
 -- | 'withOwner' for several owners, the first outermost.
 withOwners
@@ -668,7 +680,8 @@ testMultipleReaders ∷ Expectation
 testMultipleReaders = do
   trace ← newTrace
   releaseGate ← newEmptyMVar
-  withWorkerGroup $ \group → do
+  -- The group runs on a thread the example owns, whose stop opens the gate the held release waits at first (see 'runOwnedScope').
+  runOwnedScope (void (tryPutMVar releaseGate ())) $ withWorkerGroup $ \group → do
     let releaseBuffer () = uninterruptibleMask_ (takeMVar releaseGate) >> record trace "release worker buffer"
     worker ←
       expectStarted
@@ -754,7 +767,8 @@ testExitBeforeStopDuringCleanup ∷ Expectation
 testExitBeforeStopDuringCleanup = do
   inCleanup ← newEmptyMVar
   proceed ← newEmptyMVar
-  report ← withWorkerGroup $ \group → do
+  -- The group runs on a thread the example owns, whose stop opens the gate the held cleanup waits at first (see 'runOwnedScope').
+  report ← runOwnedScope (void (tryPutMVar proceed ())) $ withWorkerGroup $ \group → do
     let cleanup () = uninterruptibleMask_ (putMVar inCleanup () >> takeMVar proceed)
     early ←
       expectStarted

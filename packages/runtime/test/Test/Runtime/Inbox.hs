@@ -13,18 +13,20 @@
 module Test.Runtime.Inbox (spec) where
 
 import Control.Concurrent (killThread, myThreadId, throwTo)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception
   ( AsyncException (ThreadKilled)
   , ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , fromException
+  , onException
   , throwIO
   , try
   , tryWithContext
   )
 import Control.Exception.Context (getExceptionAnnotations)
+import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
 import Data.Foldable (traverse_)
 import Data.IORef (newIORef, readIORef, writeIORef)
@@ -59,7 +61,7 @@ import Test.Runtime.Supervision.Support
   , withCollectedLifetime
   )
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
-import Test.Support.Owned (withOwnedThread)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "Inbox services" $ do
@@ -251,17 +253,23 @@ testGroupTriggeredStop = do
   -- The opener serves the exit of the supervision (the close waits for the handler the gate holds), so it is started outside it,
   -- parked, and let go at the point the example reached the fork before; it is ended and joined after the close, never before.
   go ← newEmptyMVar
-  started ← withOwnedThread (readMVar go >> awaitBlockedOnSTM application >> openGate gate) $ \_ _ →
+  -- The body registers, before it starts anything, the action that lets the opener go and opens the gate itself if it ends
+  -- first: the signal the normal path gives last must not be the only way the close can finish.
+  let rescue = void (tryPutMVar go ()) >> openGate gate
+  started ← withOwnedThreadOpening (openGate gate) (readMVar go >> awaitBlockedOnSTM application >> openGate gate) $ \_ _ →
     withCollectedLifetime ignoreWrites $ \collected →
-      withSupervision (collectedLifetime collected) $ \control → do
-        started ← startedWith probe =<< startInboxService control requiredInbox (inbox trace probe 3 (holdingFirst entered gate))
-        _ ← offer started 1
-        takeMVar entered
-        traverse_ (offer started) [2, 3, 4]
-        -- The handler is released only once closing has asked for the stop and
-        -- the application is waiting in the drain.
-        putMVar go ()
-        pure started
+      withSupervision (collectedLifetime collected) $ \control →
+        ( do
+            started ← startedWith probe =<< startInboxService control requiredInbox (inbox trace probe 3 (holdingFirst entered gate))
+            _ ← offer started 1
+            takeMVar entered
+            traverse_ (offer started) [2, 3, 4]
+            -- The handler is released only once closing has asked for the stop and
+            -- the application is waiting in the drain.
+            putMVar go ()
+            pure started
+        )
+          `onException` rescue
   first ← atomically (inboxCompletion started)
   second ← atomically (inboxCompletion started)
   (exitOf <$> first) `shouldBe` Just (Just 3)

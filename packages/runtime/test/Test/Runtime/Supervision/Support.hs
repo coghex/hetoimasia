@@ -34,6 +34,7 @@ module Test.Runtime.Supervision.Support
   , awaitBlockedOnSTM
   , awaitTerminal
   , boundedSupervision
+  , runOwnedScope
   , expectFailure
   , expectStarted
   , Trace
@@ -43,13 +44,14 @@ module Test.Runtime.Supervision.Support
   ) where
 
 import Control.Concurrent (ThreadId, yield)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, readMVar, tryPutMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception
   ( Exception
   , ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , fromException
+  , rethrowIO
   , throwIO
   , tryWithContext
   )
@@ -57,6 +59,7 @@ import Control.Monad (void)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import GHC.Conc (BlockReason (BlockedOnSTM), ThreadStatus (ThreadBlocked), threadStatus)
+import Test.Support.Owned (withOwnedThreadOpening)
 import Hetoimasia.Foundation.Log
   ( Component
   , LogEntry (..)
@@ -214,3 +217,17 @@ expectStarted ∷ SupervisedStart r → IO (SupervisedWorker r)
 expectStarted (WorkerStarted worker) = pure worker
 expectStarted (WorkerStartUnavailable _ _) = throwIO (userError "expected a start, found an unavailable worker")
 expectStarted WorkerStartRejected = throwIO (userError "expected a start, found a rejection")
+
+-- | Run a production scope on a thread the example owns, and wait for its outcome: its result, or the failure it raised, with its
+-- context.
+--
+-- A scope that holds a worker behind a gate only the example opens is drained uninterruptibly, so the thread it runs on cannot
+-- run any release of its own while the drain waits. Run on the example's thread, an example that fails or is cancelled while
+-- the scope is held would wait there for ever, because the opening that would end the wait is registered by the scope that is
+-- itself waiting. Run on an owned thread, the example's thread is never the one that is held: the first argument opens the
+-- gate (idempotently, without blocking) in the owned thread's release, before the kill, however the example ended.
+runOwnedScope ∷ IO () → IO a → IO a
+runOwnedScope open scope = do
+  outcome ← newEmptyMVar
+  withOwnedThreadOpening open (tryWithContext @SomeException scope >>= putMVar outcome) $ \_ _ →
+    takeMVar outcome >>= either rethrowIO pure
