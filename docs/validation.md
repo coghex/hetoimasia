@@ -710,7 +710,11 @@ any other way, and its message names the facility that fits the kind of start.
   four thread starts that existed only to serve them. #588 left two files in the
   baseline on purpose: the display-helper suites, `tools/x11-test/Main.hs` and
   `tools/wayland-test/Main.hs`, whose subprocess starts need a hosted-subprocess helper
-  that its owner decision of 2026-11-02 moved to a separate issue). Each file's count
+  that its owner decision of 2026-11-02 moved to a separate issue). #595 then removed the 105
+  thread starts of the headless Vulkan suites it converted (`diagnostics-tests`, `native-tests`,
+  `integration-tests`, `render-2d-vulkan-tests` and the `allocator-parity-probe`), and the three
+  starts of the integration suite's example bound, `Bound.hs`, left the baseline as audited
+  helpers (below). Each file's count
   must equal its baseline: a count above it is a new unowned start; a count below
   it is a stale entry, so the baseline stays honest and can only shrink. The
   baseline is a known-debt list classified mechanically, not a list of proven
@@ -748,6 +752,20 @@ any other way, and its message names the facility that fits the kind of start.
   recorded in the control's rescue list in the same masked step that starts it, and
   a rescue registered before the control exposes any thread lets it go, stops it and
   joins it on every way out. A converted helper is never exempt.
+  The negative controls of the headless Vulkan suites (#595) keep one deliberately unowned
+  start each, in the one binding `startUnowned` of `Test.GPU.Vulkan.Native.Unowned`,
+  `Test.GPU.Vulkan.Diagnostics.Unowned` and `Test.GPU.Vulkan.GLFW.Unowned`, stopped and joined
+  independently by the control that made it. The three audited starts of the integration
+  suite's example bound are exempt by binding, one start each: `runBounded` (the example's
+  thread, forked masked inside a scope that runs its whole lifetime masked: expiry, an
+  interruption and a rig run still outstanding pass through `rescue`, which rescues the rigs
+  before it cancels, since the graphics owner's protected exit absorbs cancellation until a
+  rig has been let go, and then cancels the thread and waits for its end; a completed result
+  with no run outstanding returns without `rescue`, the thread already past its last act),
+  `started` (every canceller and the watchdog: forked masked with a done cell that `rescue`
+  joins uninterruptibly) and `terminateProcess` (writes one line, waited for a second at
+  most, after which its caller ends the whole process with `_Exit`, so it is not joined by
+  design). A new raw start in `Bound.hs` is counted as any other.
 - **Selection.** The guard's inputs are every scanned source directory and every
   package description, listed as inputs of `test.workflow` in the catalog, beside
   `tools/validation/` (the script, its configuration and its baseline). An
