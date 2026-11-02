@@ -19,6 +19,7 @@ module Test.Run.Repeat.Batch
   , Counts (..)
   , confidenceAt
   , runTrial
+  , runPreparation
   , judge
   , tally
   , descendantsOf
@@ -167,6 +168,31 @@ runTrial trial directory index = do
         , outcomeSamples = samples
         , outcomeReclaimed = reclaimed
         }
+
+-- | Run a preparation command to completion under a bound, its output kept in a file. A preparation that exceeds the bound, or
+-- is cancelled, is stopped by pid with everything it started, exactly as a trial is. Answers how it ended: 'Nothing' when it
+-- had to be stopped.
+runPreparation ∷ [String] → FilePath → FilePath → Int → Int → IO (Maybe ExitCode)
+runPreparation command directory outFile boundSeconds graceSeconds = do
+  handleOut ← openBinaryFile outFile WriteMode
+  (program, arguments) ← case command of
+    [] → ioError (userError "a preparation needs a command")
+    first : rest → pure (first, rest)
+  mask $ \restore → do
+    (_, _, _, handle) ←
+      createProcess
+        (proc program arguments)
+          { cwd = Just directory
+          , std_out = UseHandle handleOut
+          , std_err = UseHandle handleOut
+          , create_group = True
+          }
+    root ← getPid handle >>= maybe (ioError (userError "the preparation ended before its pid was read")) pure
+    let stop = void (stopTree graceSeconds root handle)
+    outcome ← restore (timeout (boundSeconds * 1_000_000) (waitForProcess handle)) `onException` stop
+    case outcome of
+      Nothing → stop >> pure Nothing
+      Just code → pure (Just code)
 
 readFileOrEmpty ∷ FilePath → IO String
 readFileOrEmpty path = do

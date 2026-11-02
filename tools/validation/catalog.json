@@ -935,23 +935,13 @@
     },
     {
       "id": "test.run-native-repeat",
-      "description": "Local-only optional macOS probe of the `glfwInit` hang (#586): the complete `run-native-tests` profile (test.vulkan-run-native) run N times, one at a time, each under a 45-second bound; a run that exceeds it is sampled once (the sample itself bounded, an unsuccessful one recorded), then stopped by pid with everything it started, and counts as a hang, as does a run the initialization deadline ended (its diagnostic is recognized in the run's output even when the enclosing suite reports only a generic failure; no live sample is then possible). A run counts only if it ran every example of the profile and passed; the report states N (default 59), the confidence that N independent runs at an unchanged 5% per-run failure probability would have shown at least one failure (1 - 0.95^N = 95.15% at 59; detection power, not proof), and how many runs passed, hung and failed, and every run's output and samples are kept. Its device-free examples exercise that machinery with /bin/sh children. The batch needs HETOIMASIA_NATIVE_SESSION=desktop on its own command (AGENTS.md, standing approval), opens windows on the desktop for its whole length, and runs a checkout whose suite and product executable were built beforehand (the preparation). Darwin-only and optional: never selected by affected inputs, routed to no CI worker, and its own suite beside run-native-tests, never folded into it.",
+      "description": "Local-only optional macOS probe of the `glfwInit` hang (#586): the complete `run-native-tests` profile (test.vulkan-run-native) run N times, one at a time, each under a 45-second bound; a run that exceeds it is sampled once (the sample itself bounded, an unsuccessful one recorded), then stopped by pid with everything it started, and counts as a hang, as does a run the initialization deadline ended (its diagnostic is recognized in the run's output even when the enclosing suite reports only a generic failure; no live sample is then possible). A run counts only if it ran every example of the profile and passed; the report states N (default 59), the confidence that N independent runs at an unchanged 5% per-run failure probability would have shown at least one failure (1 - 0.95^N = 95.15% at 59; detection power, not proof), and how many runs passed, hung and failed, and every run's output and samples are kept. Its device-free examples exercise that machinery with /bin/sh children. The batch needs HETOIMASIA_NATIVE_SESSION=desktop on its own command (AGENTS.md, standing approval), opens windows on the desktop for its whole length, and first builds the suite and the product executable of the checkout it runs, keeping the build's output, so a stale binary is never measured as the revision. Darwin-only and optional: never selected by affected inputs, routed to no CI worker, and its own suite beside run-native-tests, never folded into it.",
       "command": [
         "cabal",
         "test",
         "hetoimasia:run-native-repeat-probe",
         "--test-show-details=direct"
       ],
-      "preparation": {
-        "command": [
-          "bash",
-          "tools/vulkan/run.sh",
-          "build",
-          "hetoimasia:exe:hetoimasia",
-          "hetoimasia:test:run-native-tests"
-        ],
-        "timeout_seconds": 3600
-      },
       "component": "hetoimasia:test:run-native-repeat-probe",
       "inputs": [
         "cabal.project.common",

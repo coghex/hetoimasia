@@ -34,7 +34,7 @@ import qualified Data.Text as Text
 import qualified Data.Text.IO as Text
 import System.Directory (createDirectoryIfMissing, getCurrentDirectory)
 import System.Environment (lookupEnv)
-import System.Exit (ExitCode (ExitSuccess))
+import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
 import System.IO.Temp (createTempDirectory, getCanonicalTemporaryDirectory, withSystemTempDirectory)
 import System.Info (os)
@@ -133,6 +133,22 @@ machinery = do
         Nothing → expectationFailure ("no grandchild pid: " <> grandchild)
         Just pid → isAlive pid `shouldReturn` False
 
+  it "runs a preparation to completion with its output kept, and answers how it ended" $
+    withSystemTempDirectory "repeat-probe" $ \directory → do
+      ended ← runPreparation ["/bin/sh", "-c", "echo built; echo warned >&2; exit 3"] directory (directory </> "prepare.out") 30 5
+      ended `shouldBe` Just (ExitFailure 3)
+      readFile (directory </> "prepare.out") >>= (`shouldSatisfy` \kept → "built" `isInfixOf` kept && "warned" `isInfixOf` kept)
+
+  it "stops a preparation that exceeds its bound, and everything it started" $
+    withSystemTempDirectory "repeat-probe" $ \directory → do
+      let pidFile = directory </> "grandchild.pid"
+      ended ← runPreparation ["/bin/sh", "-c", "sleep 3600 & echo $! > " <> pidFile <> "; wait"] directory (directory </> "prepare.out") 2 5
+      ended `shouldBe` Nothing
+      grandchild ← readFile pidFile
+      case readMaybe grandchild of
+        Nothing → expectationFailure ("no grandchild pid: " <> grandchild)
+        Just pid → isAlive pid `shouldReturn` False
+
   it "states the confidence of a batch from its size" $ do
     confidenceAt 0.05 59 `shouldSatisfy` (\c → abs (c - 0.9515) < 0.0001)
     confidenceAt 0.05 58 `shouldSatisfy` (< 0.95)
@@ -160,6 +176,17 @@ realBatch = do
   output ← lookupEnv "HETOIMASIA_REPEAT_OUTPUT" >>= maybe fresh pure
   createDirectoryIfMissing True output
   revision ← command checkout "git rev-parse HEAD"
+  -- Both the suite and the product executable are built for this revision before its batch: the runner reports checkout
+  -- provenance and checks that the binaries exist, and does not rebuild them, so a stale binary would otherwise be measured as
+  -- this revision. The build's output is kept beside the runs'.
+  prepared ←
+    runPreparation
+      ["bash", "tools/vulkan/run.sh", "build", "hetoimasia:exe:hetoimasia", "hetoimasia:test:run-native-tests"]
+      checkout
+      (output </> "prepare.out")
+      3600
+      10
+  prepared `shouldBe` Just ExitSuccess
   let trial =
         Trial
           { trialCommand = ["bash", "tools/vulkan/run.sh", "native", "hetoimasia:test:run-native-tests", "--", "--complete"]
