@@ -209,7 +209,9 @@ testReportThrows = do
   released ← newEmptyMVar
   let exit status = recordExit rig status >> putMVar released ()
       report _ = throwIO (ErrorCall "the logger failed")
-  void (guardInitialization exit "cocoa" (deadlineOf passed report) (takeMVar released))
+  -- The grace is an hour: the exit comes at once only because a report that throws has finished, as far as the guard
+  -- is concerned; were its failure waited out, the example's own bound would fail it long before.
+  void (guardInitializationWithin neverPasses exit "cocoa" (deadlineOf passed report) (takeMVar released))
   readIORef (rigExits rig) `shouldReturn` [initializationTimeoutStatus]
 
 testCompetingCompletionAndExpiry ∷ Expectation
