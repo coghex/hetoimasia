@@ -237,8 +237,8 @@ newHeld = Held <$> newEmptyTMVarIO <*> newEmptyMVar <*> newIORef False
 heldBody :: Held -> Child -> IO ProcessID
 heldBody held child = do
   awaitReady child
-  atomically (putTMVar (heldEntered held) (childPid child))
-  readMVar (heldRelease held) `onException` writeIORef (heldCancelled held) True
+  -- The handler covers the signal too, so a cancellation sent the moment the example has seen it is recorded.
+  (atomically (putTMVar (heldEntered held) (childPid child)) >> readMVar (heldRelease held)) `onException` writeIORef (heldCancelled held) True
   pure (childPid child)
 
 -- | Wait until the held body is running, and answer its child's identifier.
