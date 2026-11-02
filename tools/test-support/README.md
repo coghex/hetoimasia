@@ -32,6 +32,19 @@ does.
   `withOwnedThreadOpening open`, whose idempotent, non-blocking `open` the same
   release runs first; a `finally` inside the body is too late for a cancellation
   delivered as the body begins. It sleeps nowhere and needs `base` alone.
+  A test that asserts boundness (a seam that rejects entry from a bound worker and
+  from an unbound thread, a thread designated as the process main thread) starts
+  its thread with `withOwnedBoundThread action body`, or
+  `withOwnedBoundThreadOpening open action body`: the same ownership, on an
+  OS-bound thread (`isCurrentThreadBound` holds on it), and no unowned `forkOS` to
+  reach for (#593). The start differs in one place. `forkOS` waits, interruptibly
+  even under `mask`, for the new OS thread to report itself, so a cancellation
+  delivered there would abandon a thread that already exists; the start is made
+  uninterruptibly instead, a wait for the operating system and for nothing the
+  example controls, and the thread still begins masked and unmasks only inside the
+  step that announces its end. The facility is generic: it designates nothing, and
+  a suite that must designate the thread (GLFW's process main thread) does so as
+  the first step of the action it passes.
   `Test.Support.Cancel` builds on it the cancellation delivered to the example at
   a chosen moment (`withCancellationAfter`, `withCancellationWhenBlocked`), and
   `Test.Support.Parked` the parked-release orchestration of the native suite's

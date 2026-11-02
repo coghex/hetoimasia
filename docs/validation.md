@@ -673,8 +673,10 @@ starts in test sources (#584), `tools/validation/owned_starts.py`, through the
 Hspec examples in `tools/test/OwnedStarts.hs`. A test that starts a thread or a
 subprocess must own it: acquire it under mask, register its stop-and-join in the
 same step, and stop and join it on every exit. The shared facility is
-`Test.Support.Owned` in `tools/test-support`; the guard fails a test source that
-calls `forkIO`, `forkOS`, `forkOn`, `forkIOWithUnmask`, `forkFinally`,
+`Test.Support.Owned` in `tools/test-support` (`withOwnedThread` for an unbound
+thread, `withOwnedBoundThread` for an OS-bound one, each with an `Opening`
+variant for a thread held at a gate only the scope can open); the guard fails a
+test source that calls `forkIO`, `forkOS`, `forkOn`, `forkIOWithUnmask`, `forkFinally`,
 `createProcess`, `withCreateProcess`, `spawnProcess`, `spawnCommand`,
 `callProcess`, `callCommand`, `readProcess`, `readProcessWithExitCode`,
 `readCreateProcess` or `readCreateProcessWithExitCode` any other way.
