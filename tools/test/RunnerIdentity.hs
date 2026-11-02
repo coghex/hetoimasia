@@ -209,6 +209,7 @@ standInBody =
 -- or a package names no single executable. @FIXTURE_BUILD@ chooses how a build
 -- ends: @fail@ after writing, @failfirst@ before writing anything, @block@ until signalled, or @edits@ the source while compiling;
 -- @FIXTURE_FAIL_ON@ fails the build right after the named executable is written.
+-- Like the real one, a build asked only to plan or fetch (@--dry-run@, @--only-download@, @--only-configure@, @--only-dependencies@) succeeds without compiling anything.
 standInCabal ∷ String
 standInCabal =
   unlines
@@ -255,6 +256,9 @@ standInCabal =
     , "  exit 0"
     , "fi"
     , "if [ \"$command\" = build ]; then"
+    , "  for argument in \"$@\"; do"
+    , "    case \"$argument\" in --dry-run|--only-download|--only-configure|--only-dependencies) exit 0 ;; esac"
+    , "  done"
     , "  if [ \"$FIXTURE_BUILD\" = failfirst ]; then echo 'cabal: the build failed before it wrote anything' >&2; exit 1; fi"
     , "  for target in $targets; do"
     , "    name=\"$(resolve \"$target\")\""
@@ -653,6 +657,18 @@ failedBuildSpec = describe "a build that does not complete" $ do
       revision ← headRevision native
       restored ← runNative native [] suite
       void $ ranWith native restored "vulkan-native-tests" revision
+
+  it "refuses an option, so a build that compiles nothing cannot make a stale executable runnable" $
+    withNative $ \native → do
+      built native [] [suite]
+      setSource native edited
+      forM_ ["--dry-run", "--only-download", "--only-configure", "--only-dependencies"] $ \option → do
+        refused ← build native [] [suite, option]
+        outcomeStatus refused `shouldBe` ExitFailure 2
+        outcomeErr refused `shouldContain` option
+        fingerprintsRemoved native
+        outcome ← runNative native [] suite
+        refusedBeforeAnythingStarts native outcome [suite, "bash tools/vulkan/run.sh build " ++ suite, "source digest"]
 
   it "leaves no stamp at all when the first build fails" $
     withNative $ \native → do

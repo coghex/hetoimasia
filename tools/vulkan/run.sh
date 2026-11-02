@@ -21,7 +21,9 @@
 # The record is bound to the executable by its content, path and variant, and is
 # not among the digest's inputs. Building `run-native-tests` also records the
 # full-product `hetoimasia` executable it launches, even when only the suite is
-# named. A target that is not one executable (a library, a whole package) builds
+# named. It takes component names only: an option such as `--dry-run`, which
+# Cabal answers without compiling, is refused (status 2) before anything runs.
+# A target that is not one executable (a library, a whole package) builds
 # as before and records nothing. A build that fails, is interrupted, or sees the
 # source change while it compiles records nothing; one that compiles but cannot
 # record exits 1 naming the component. `test.vulkan-native` and
@@ -132,7 +134,18 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 case "$mode" in
-  build) [ "${#arguments[@]}" -eq 0 ] || refuse "build takes no options after --" ;;
+  build)
+    [ "${#arguments[@]}" -eq 0 ] || refuse "build takes no options after --"
+    # A component is a name, never an option. Cabal's own non-building modes
+    # (`--dry-run`, `--only-download`, `--only-configure`, ...) succeed without
+    # compiling, and the identity recorded afterwards would then describe an
+    # executable this command never built.
+    for component in "${components[@]}"; do
+      case "$component" in
+        -*) refuse "build takes component names only, not the option $component; it records the build identity of what it compiled" ;;
+      esac
+    done
+    ;;
   test) ;;
   native) [ "${#components[@]}" -eq 1 ] || refuse "native runs exactly one component" ;;
   *) refuse "$usage" ;;
