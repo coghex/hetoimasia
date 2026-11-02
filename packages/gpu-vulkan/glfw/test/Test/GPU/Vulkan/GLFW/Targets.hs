@@ -789,6 +789,9 @@ testExitDrainCompletesBatch = do
     -- retirement and destruction after it) can observe a completion, on whatever capability the exit runs. A closed
     -- admission is not enough: the owner's ordinary step in flight when the exit begins would still be running.
     submissionsCompleteWhen rig ((>= OwnerRetiring) . statusPhase <$> readOwnerStatusNow (vulkanGraphicsOwner host))
+    -- Two owner-thread actions in a row: the second runs in a step after the first step has ended, polls included, so
+    -- at least one whole ordinary step has run with the gate installed and the batch must still be pending.
+    replicateM_ 2 (void (act host (VulkanAction (\_ → pure ()))))
     ticketNow batch >>= (`shouldBe` TicketPending)
     pure (host, target, batch)
   ticketNow ticket >>= (`shouldBe` TicketComplete)
