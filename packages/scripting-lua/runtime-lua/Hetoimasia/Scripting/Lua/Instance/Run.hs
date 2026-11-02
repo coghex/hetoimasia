@@ -124,11 +124,13 @@ import Hetoimasia.Scripting.Lua.Internal.Task (startTaskCaptured, startTaskVia)
 import Hetoimasia.Scripting.Lua.Instance.Behavior (behaviorDriverRef, behaviorInit, behaviorShutdown, behaviorUpdate)
 import Hetoimasia.Scripting.Lua.Owner
   ( BehaviorShape (shapeInit, shapeShutdown, shapeUpdate)
-  , BoundaryFault (boundaryTraceback)
+  , BoundaryFault (boundaryReason, boundaryTraceback)
   , CallResult (Returned)
   , Captured (capturedHandle, capturedShape)
   , ExportIdentity (ExportIdentity)
   , ExportOutcome (ExportFailed, ExportReady)
+  , FaultKind (CallFailed)
+  , FaultReason (ScriptFailed)
   , FacadeSource (FacadeBuilt, FacadeField, FacadeValue)
   , Hook (HookInit, HookShutdown, HookUpdate)
   , ModuleRef (moduleRefName)
@@ -254,6 +256,11 @@ data Ending = Ending
     -- can still be settled with what it did.
   , endShutdown ∷ !ShutdownRecord
     -- ^ What became of the @shutdown@ hook, recorded when it was decided.
+  , endAlso ∷ ![(HookStage, InstanceError)]
+    -- ^ What failed before the ending began and is kept beside its primary failure: the uncaught script error an
+    -- invocation raised, displaced as the primary by the required request's failure that was latched when it
+    -- was recorded ('invocationFailed'). Empty for every other ending. Written with the ending and never
+    -- changed, so the early notice (the primary alone) and the settled record read the same primary.
   }
 
 -- | What became of an instance's @shutdown@, recorded once, when it is decided, and read
@@ -898,7 +905,7 @@ takeRequestFailure cell = do
     -- Read and not cleared: the latch is the instance's until its failure is recorded, and recording it
     -- marks the instance as ending, which is what keeps the latch from being applied twice. A cancellation
     -- between this reading and that recording leaves it where the next boundary, or the settlement, finds it.
-    Just (endpoint, reason) → Just (endpoint, reason, isPhase state)
+    Just (_, endpoint, reason) → Just (endpoint, reason, isPhase state)
 
 -- | Admit the instance's next invocation as a task, if it has one and may start it.
 admitNext ∷ InstanceHost → ICell → IO ()
@@ -1137,11 +1144,34 @@ invocationCompleted ih cell stage = do
     _ → dispatch ih cell
 
 -- | An invocation failed: the instance fails with it, and ends.
+--
+-- The one exception to "the first failure recorded is the primary" is a required request's expected failure
+-- (D-52): when the failure is an uncaught script error and a required /request's/ failure is already latched
+-- on the instance and not yet applied, the latched failure is the primary and the script's error, with its
+-- own stage and traceback, is kept beside it ('endAlso'). A script that was already running when the request
+-- settled can take the refused result and raise it, and whether that raise or the owner's dispatch boundary
+-- reaches the instance first is a race; this makes the instance's failure the same in both orders. The latch
+-- is read here, as the failure is recorded: an error recorded before the failure was latched stays primary,
+-- and a latch from a required module's lookup, a fault that is not a script error, and an instance that is
+-- already ending (which records nothing) are untouched.
 invocationFailed ∷ InstanceHost → ICell → HookStage → InstanceError → IO ()
 invocationFailed ih cell stage failure = do
-  phase ← isPhase <$> readTVarIO (icState cell)
-  atomically (modifyTVar' (icState cell) (\state → state {isActive = Nothing}))
-  beginStop ih cell EndFailed (Just (Primary phase stage failure))
+  state ← readTVarIO (icState cell)
+  let phase = isPhase state
+      (primary, also) = case isRequestFailure state of
+        Just (LatchedRequest, endpoint, why) | uncaughtScriptError failure → (Primary phase (StageRequest endpoint) (ErrorRequest endpoint why), [(stage, failure)])
+        _ → (Primary phase stage failure, [])
+  atomically (modifyTVar' (icState cell) (\current → current {isActive = Nothing}))
+  beginEndingAlso ih cell EndFailed (Just primary) also
+  continueStop ih cell
+
+-- | Whether an invocation's failure is an uncaught script error: Lua's own error call (or a raised error
+-- value) escaping the invocation's coroutine, as a script's @error@ does. A refused value, a missing
+-- entry, an exhausted memory limit, a cadence fault or a host fault is not one.
+uncaughtScriptError ∷ InstanceError → Bool
+uncaughtScriptError = \case
+  ErrorFault (BoundaryFailed fault) | ScriptFailed CallFailed _ ← boundaryReason fault → True
+  _ → False
 
 -- | A coroutine of the scheduler was closed: by a stop, by the owner's own, or
 -- because its task ended while it was suspended, as a task whose wait the scheduler
@@ -1622,7 +1652,12 @@ pauseInvocation ih cell task = do
 
 -- | Record how an instance is ending, once, and close what it accepts.
 beginEnding' ∷ InstanceHost → ICell → EndReason → Maybe Primary → IO ()
-beginEnding' ih cell reason primary = mask_ $ do
+beginEnding' ih cell reason primary = beginEndingAlso ih cell reason primary []
+
+-- | 'beginEnding'', recording beside the primary failure what failed before the ending began and is kept as
+-- its secondary (see 'endAlso').
+beginEndingAlso ∷ InstanceHost → ICell → EndReason → Maybe Primary → [(HookStage, InstanceError)] → IO ()
+beginEndingAlso ih cell reason primary also = mask_ $ do
   -- Closing admission and recording what that revoked and discarded are one step: a
   -- cancellation cannot land between them and leave the counts unwritten. The
   -- instance's periodic demand is cancelled with it, and a tick its due update held is
@@ -1635,7 +1670,7 @@ beginEnding' ih cell reason primary = mask_ $ do
     unless began (endingBegun (ihControl ih) (icId cell))
     pure begun
   unless already $ do
-    modifyIORef' (ihEndings ih) (Map.insert (icId cell) (Ending reason primary connections unstarted 0 ShutdownUndecided))
+    modifyIORef' (ihEndings ih) (Map.insert (icId cell) (Ending reason primary connections unstarted 0 ShutdownUndecided also))
     -- The application is told of the failure as it begins, once: before the @shutdown@, before the release and
     -- before the retirements the instance's providers owe it, which the settlement (and so the telling of
     -- 'instanceEscalate') waits for. What it raises is a failure of the host.
@@ -1656,8 +1691,8 @@ finishEnding ih cell closed = do
   -- An ending parked for a provider's retirement has done everything but settle.
   parked ← Set.member (icId cell) <$> readIORef (ihParked ih)
   unless (settled || parked) $ do
-    modifyIORef' (ihEndings ih) . Map.alter (Just . maybe (Ending EndStopped Nothing 0 0 closed ShutdownUndecided) (\held → held {endClosed = max (endClosed held) closed})) $ icId cell
-    ending ← Map.findWithDefault (Ending EndStopped Nothing 0 0 closed ShutdownUndecided) (icId cell) <$> readIORef (ihEndings ih)
+    modifyIORef' (ihEndings ih) . Map.alter (Just . maybe (Ending EndStopped Nothing 0 0 closed ShutdownUndecided []) (\held → held {endClosed = max (endClosed held) closed})) $ icId cell
+    ending ← Map.findWithDefault (Ending EndStopped Nothing 0 0 closed ShutdownUndecided []) (icId cell) <$> readIORef (ihEndings ih)
     state ← readTVarIO (icState cell)
     mode ← readIORef (ihMode ih)
     handles ← readIORef (ihHandles ih)
@@ -1930,7 +1965,7 @@ settleEnding ih cell = do
   scope ← case ihLeases ih of
     Nothing → pure Nothing
     Just lh → atomically (readScope (lhLeases lh) (icId cell))
-  let ending = fromMaybe (Ending EndStopped Nothing 0 0 0 ShutdownUndecided) held
+  let ending = fromMaybe (Ending EndStopped Nothing 0 0 0 ShutdownUndecided []) held
       -- A release or a retirement that failed is kept beside the primary failure, and
       -- is the failure when there is none: it fails the instance as a hook's does.
       releases = [(StageRelease, ErrorRelease note) | note ← maybe [] scopeNotes scope]
@@ -1953,7 +1988,7 @@ settleEnding ih cell = do
       -- something is.
       latched =
         [ (StageRequest endpoint, ErrorRequest endpoint why)
-        | Just (endpoint, why) ← [isRequestFailure state]
+        | Just (_, endpoint, why) ← [isRequestFailure state]
         , not (appliedAsPrimary endpoint why)
         ]
       -- The failure the instance already ended with is the latched one, applied by the dispatch: it is
@@ -1962,7 +1997,7 @@ settleEnding ih cell = do
         Just (Primary _ _ (ErrorRequest appliedEndpoint appliedWhy)) → appliedEndpoint == endpoint && appliedWhy == why
         _ → False
       failure = case (endPrimary ending, shutdownFailure) of
-        (Just (Primary phase stage err), secondary) → Just (describe phase stage err ([(StageShutdown, e) | Just e ← [secondary]] <> latched <> releases))
+        (Just (Primary phase stage err), secondary) → Just (describe phase stage err (endAlso ending <> [(StageShutdown, e) | Just e ← [secondary]] <> latched <> releases))
         (Nothing, secondary) | (stage, err) : rest ← latched → Just (describe (isPhase state) stage err ([(StageShutdown, e) | Just e ← [secondary]] <> rest <> releases))
         (Nothing, Just err) → Just (describe Stopping StageShutdown err releases)
         (Nothing, Nothing) → case releases of
