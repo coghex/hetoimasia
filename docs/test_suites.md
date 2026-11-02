@@ -230,22 +230,28 @@ cabal test hetoimasia-tests --test-show-details=direct
   subprocess sites the baseline listed). `glfw-tests` was converted in #593, narrowed by
   the owner (2026-11-02): every thread it starts is owned (`Test.GLFW.Support`'s
   `onThread`, `onBoundThread`, `withDeferredThread`, `withMainThread` and the
-  scoped helpers beside the specs that use them) except one, the harassing
-  `forkIO` of `testRetirementRecordSurvivesCancellation` in
-  `Owner/Failure/Interruption.hs`, whose baseline entry (count 1) is kept. Eight
-  examples are left as before #593 and belong to a follow-up: that one,
-  `Owner/Exit/Settlement.hs` `testCoherentDestructionSnapshot` (it has no raw
-  thread start and no baseline entry; its destruction hook waits for an owner
-  handle that only the consumer callback publishes, which an early cancellation
-  can prevent, and its scenario and assertions are unchanged), and the six that
-  hold the graphics owner inside its startup
+  scoped helpers beside the specs that use them) except three references that keep
+  their baseline entries: the evidence supplier (`forkIO`) and the dedicated bound
+  runner (`onMainThreadKeepingContext`, `forkOS`) of `Protected.hs`
+  `testStallWarningCancelledAtItsSink` (that file's entry went from 21 to 2), and
+  the harassing `forkIO` of `testRetirementRecordSurvivesCancellation` in
+  `Owner/Failure/Interruption.hs` (from 2 to 1). That removes 130 of the 133
+  references the suite had. Nine examples are left as before #593 and belong to
+  follow-ups, because an early cancellation can leave a protected drain waiting
+  for ever and test code cannot rescue it: those two;
+  `testStallWarningCancelledAtItsSink`, whose cleanup kill can land before any
+  rescue of the protected drain exists, so the drain enters the stall diagnostic's
+  sink and blocks there (the only caller of its dedicated runner helper; the
+  exception covers no other main-thread runner); `Owner/Exit/Settlement.hs`
+  `testCoherentDestructionSnapshot` (no raw thread start and no baseline entry;
+  its destruction hook waits for an owner handle that only the consumer callback
+  publishes, which an early cancellation can prevent; scenario and assertions
+  unchanged); and the six that hold the graphics owner inside its startup
   (`Owner/Port.hs` `testPortFullReported` and `testFullPortDoesNotBlockExit`,
   `Owner/Exit/Settlement.hs` `testUnannouncedDirectAttachSettles` and
   `testUnannouncedClosedSettles`, `Owner/Handover.hs` `testHandoffOrder` and
-  `testHandoverRecovery`); the six start no thread and carry no baseline entry,
-  but their startup gate cannot be armed later than the owner's creation, so a
-  cancellation before the body's first step is not covered for them. The
-  `glfw-tests` subprocess starts (`Linking.hs`, `Opacity.hs`) are #588's. The examples that hold the
+  `testHandoverRecovery`; these start no thread and carry no baseline entry, but
+  their startup gate cannot be armed later than the owner's creation). The examples that hold the
   conversion to account run in `glfw-tests` (`--match '#593'`), each as an owned
   example and a negative control: the start-and-wait helper, the bound
   main-thread helper and the bound start in a session, a deferred thread, a

@@ -20,10 +20,11 @@ import qualified Data.ByteString.Char8 as BC
 import System.Directory (createDirectory)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
-import System.Process (proc, readCreateProcessWithExitCode)
+import System.Process (proc)
 import Test.Content.Support (withTree, writeBytes)
 import Test.Hspec
-import Test.Support.ExternalClient (Client (..), Mode (..), rejectedBecause, withStorePackageClient)
+import Test.Support.ExternalClient (Client (..), Mode (..), clientRunBound, rejectedBecause, withStorePackageClient)
+import Test.Support.Subprocess (runCaptured)
 
 spec ∷ Spec
 spec = describe "Content package boundary" $ do
@@ -93,7 +94,7 @@ spec = describe "Content package boundary" $ do
               ("the supported client must compile, but the compiler exited with " <> show status <> ":\n" <> clientOutput outcome)
         createDirectory (tree </> "root")
         writeBytes (tree </> "root" </> "data.txt") (BC.pack "read through the public API")
-        (status, out, err) ← readCreateProcessWithExitCode (proc (clientDirectory outcome </> "client") [tree </> "root"]) ""
+        (status, out, err) ← runCaptured clientRunBound (proc (clientDirectory outcome </> "client") [tree </> "root"]) ""
         (status, out, err) `shouldBe` (ExitSuccess, "read through the public API", "")
 
 withClient ∷ String → String → ((Mode → IO Client) → IO ()) → IO ()

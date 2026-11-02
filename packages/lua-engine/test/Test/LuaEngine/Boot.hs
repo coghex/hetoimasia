@@ -37,10 +37,11 @@ import System.Directory (createDirectory, createDirectoryIfMissing, removeFile)
 import System.FilePath (takeDirectory, (</>))
 import System.IO.Temp (withSystemTempDirectory)
 import System.Exit (ExitCode (ExitSuccess))
-import System.Process (proc, readCreateProcessWithExitCode)
+import System.Process (proc)
 import Test.Hspec
 import Test.Support.Bounded (bounded)
-import Test.Support.ExternalClient (Client (..), Mode (..), withStorePackageClient)
+import Test.Support.ExternalClient (Client (..), Mode (..), clientRunBound, withStorePackageClient)
+import Test.Support.Subprocess (runCaptured)
 
 -- | A smaller profile that keeps every relation, with a tiny manifest, a tiny
 -- inventory and tiny hashing bounds.
@@ -341,7 +342,7 @@ spec = describe "the boot checkpoint" $ do
           createDirectory (tree </> "root")
           ByteString.writeFile (tree </> "root" </> "hetoimasia.json") both
           ByteString.writeFile (tree </> "root" </> "main.lua") "-- not evaluated"
-          (status, out, err) ← readCreateProcessWithExitCode (proc (clientDirectory outcome </> "client") [tree </> "root"]) ""
+          (status, out, err) ← runCaptured clientRunBound (proc (clientDirectory outcome </> "client") [tree </> "root"]) ""
           (status, out, err) `shouldBe` (ExitSuccess, "Gameplay\nPresentation\n", "")
 
   describe "two folders" $ do

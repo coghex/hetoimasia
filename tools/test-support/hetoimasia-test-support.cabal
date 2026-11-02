@@ -18,6 +18,7 @@ category: Testing
 build-type: Simple
 tested-with: GHC ==9.14.1
 extra-doc-files: README.md
+extra-source-files: cbits/hetoimasia_test_support_process.h
 
 source-repository head
     type: git
@@ -31,15 +32,22 @@ library
         Test.Support.ExternalClient
         Test.Support.Owned
         Test.Support.Parked
+        Test.Support.Subprocess
     hs-source-dirs: src
+    c-sources: cbits/hetoimasia_test_support_process.c
+    include-dirs: cbits
+    install-includes: hetoimasia_test_support_process.h
     default-language: GHC2024
     default-extensions: UnicodeSyntax
     ghc-options: -Wall -Wcompat -Wincomplete-uni-patterns -Wincomplete-record-updates
     build-depends:
         base >=4.22 && <4.23,
+        bytestring >=0.12 && <0.13,
         directory >=1.3 && <1.4,
         filepath >=1.5 && <1.6,
         hspec >=2.11 && <3,
         process >=1.6 && <1.7,
         stm >=2.5.3 && <2.6,
-        temporary >=1.3 && <1.4
+        temporary >=1.3 && <1.4,
+        text >=2.1 && <2.2,
+        unix >=2.8 && <2.9

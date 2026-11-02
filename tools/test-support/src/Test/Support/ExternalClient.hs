@@ -18,6 +18,7 @@ module Test.Support.ExternalClient
   , withStorePackageClient
   , storeDatabases
   , rejectedBecause
+  , clientRunBound
   ) where
 
 import Control.Monad (filterM)
@@ -30,8 +31,15 @@ import System.FilePath (takeDirectory, (</>))
 import System.IO (IOMode (WriteMode), hPutStr, withFile)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Info (fullCompilerVersion)
-import System.Process (CreateProcess (cwd), proc, readCreateProcessWithExitCode)
+import System.Process (CreateProcess (cwd), proc)
 import Test.Hspec (expectationFailure, shouldContain, shouldNotContain)
+import Test.Support.Subprocess (RunBound (Within), runCaptured)
+
+-- | The run bound of every subprocess this harness starts, and of the compiled client a suite runs through it: the 30-minute budget
+-- of the validation groups that compile and run clients. It is a hang-catcher, never a timing assumption, and no shorter than the
+-- group's own budget that already ends the run (#588).
+clientRunBound ∷ RunBound
+clientRunBound = Within (1800 * 1000000)
 
 -- | A compiled client: how the compiler exited, everything it said, and the
 -- directory the client was compiled in.
@@ -125,7 +133,7 @@ clientWith wantStore packages name source use = do
     (Just ghc, Just packageDatabase) →
       withSystemTempDirectory "hetoimasia-opacity" $ \directory → do
         withFile (directory </> name) WriteMode (`hPutStr` source)
-        expected ← readCreateProcessWithExitCode (proc ghc ["--numeric-version"]) ""
+        expected ← runCaptured clientRunBound (proc ghc ["--numeric-version"]) ""
         case expected of
           (ExitSuccess, reported, _)
             | filter (/= '\n') reported /= showVersion fullCompilerVersion →
@@ -143,7 +151,8 @@ clientWith wantStore packages name source use = do
             stores ← if wantStore then storeDatabases directory else pure []
             use $ \mode → do
               (status, out, err) ←
-                readCreateProcessWithExitCode
+                runCaptured
+                  clientRunBound
                   (proc ghc (arguments packages mode (stores <> [packageDatabase]) name))
                     { cwd = Just directory }
                   ""
@@ -217,7 +226,8 @@ storeDatabases directory = do
       -- Nothing about the store depends on the project, so nothing here reads
       -- one.
       reported ←
-        readCreateProcessWithExitCode
+        runCaptured
+          clientRunBound
           (proc executable ["path", "--ignore-project", "--store-dir"]) { cwd = Just directory }
           ""
       case reported of

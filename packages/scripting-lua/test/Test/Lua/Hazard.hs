@@ -25,14 +25,7 @@ module Test.Lua.Hazard (spec) where
 
 import System.Directory (findExecutable)
 import System.Exit (ExitCode (ExitSuccess))
-import System.IO (BufferMode (LineBuffering), hGetLine, hSetBuffering)
-import System.Process
-  ( CreateProcess (env, std_out)
-  , StdStream (CreatePipe)
-  , proc
-  , waitForProcess
-  , withCreateProcess
-  )
+import System.Process (CreateProcess (env), proc)
 import Test.Hspec
   ( Expectation
   , Spec
@@ -42,7 +35,9 @@ import Test.Hspec
   , shouldBe
   , shouldContain
   )
-import Test.Support.Bounded (bounded)
+import Test.Support.Bounded (boundMicroseconds)
+import Test.Support.Subprocess
+  ( Line (..), Output (Stdout), RunBound (Within), Stream (Inherited), ChildSpec (specStderr, specStdin), childSpec, nextLine, waitChild, withScopedChild )
 
 spec ∷ Spec
 spec = describe "hazard" $ do
@@ -132,13 +127,14 @@ withHazard arguments check = do
       -- settings, and its report must not be buffered away.
       let started =
             (proc executable arguments)
-              { std_out = CreatePipe
-              , env = Just [("PATH", "/usr/bin:/bin")]
+              { env = Just [("PATH", "/usr/bin:/bin")]
               }
-      withCreateProcess started $ \_ out _ handle → case out of
-        Nothing → expectationFailure "the hazard runner was given no stdout"
-        Just reading → do
-          hSetBuffering reading LineBuffering
-          reported ← bounded (hGetLine reading)
-          status ← bounded (waitForProcess handle)
-          check reported status
+          -- Standard input and error stay inherited, as they were. The 30-minute run bound is the budget of the group that runs
+          -- this suite; each read and wait below keeps its own 10-second bound.
+          child = (childSpec (Within (1800 * 1000000)) started) {specStdin = Inherited, specStderr = Inherited}
+      withScopedChild child $ \hazard → do
+        reported ← nextLine hazard Stdout boundMicroseconds >>= \case
+          Line text → pure text
+          other → expectationFailure ("the hazard runner reported nothing: " <> show other) >> pure ""
+        status ← waitChild hazard boundMicroseconds >>= maybe (expectationFailure "a bounded test call never returned" >> pure ExitSuccess) pure
+        check reported status

@@ -26,7 +26,7 @@ config testOnly excluded exempt =
   unlines
     [ "{"
     , "  \"schema_version\": 1,"
-    , "  \"primitives\": [\"forkIO\", \"forkOS\", \"forkOn\", \"forkIOWithUnmask\", \"forkFinally\", \"createProcess\", \"withCreateProcess\", \"spawnProcess\", \"spawnCommand\", \"callProcess\", \"callCommand\", \"readProcess\", \"readProcessWithExitCode\", \"readCreateProcess\", \"readCreateProcessWithExitCode\"],"
+    , "  \"primitives\": [\"forkIO\", \"forkOS\", \"forkOn\", \"forkIOWithUnmask\", \"forkFinally\", \"createProcess\", \"createProcess_\", \"withCreateProcess\", \"spawnProcess\", \"spawnCommand\", \"callProcess\", \"callCommand\", \"readProcess\", \"readProcessWithExitCode\", \"readCreateProcess\", \"readCreateProcessWithExitCode\"],"
     , "  \"test_only_components\": [" <> testOnly <> "],"
     , "  \"excluded_components\": [" <> excluded <> "],"
     , "  \"exempt\": [" <> exempt <> "]"
@@ -115,6 +115,39 @@ spec = describe "The unowned-start guard (tools/validation/owned_starts.py)" $ d
       (passed, errors) ←
         checked (tree plainConfig [("pkg/test/Main.hs", 1)] [("pkg/test/Main.hs", source ["main :: IO ()", "main = forkIO (pure ()) >> pure ()"])])
       (passed, errors) `shouldBe` (True, "")
+
+    it "passes a tree whose only subprocess is started through the shared subprocess facility" $ do
+      (passed, errors) ←
+        checked
+          ( tree
+              plainConfig
+              []
+              [("pkg/test/Main.hs", source ["main :: IO ()", "main = runCaptured (Within 1000000) (proc \"true\" []) \"\" >> withScopedChild (childSpec Unbounded (proc \"true\" [])) (\\_ -> pure ())"])]
+          )
+      (passed, errors) `shouldBe` (True, "")
+
+    it "fails a new unowned subprocess start, naming the file and the subprocess facility to use" $ do
+      (passed, errors) ←
+        checked (tree plainConfig [] [("pkg/test/Main.hs", source ["main :: IO ()", "main = readCreateProcessWithExitCode (proc \"true\" []) \"\" >> pure ()"])])
+      passed `shouldBe` False
+      errors `shouldContain` "pkg/test/Main.hs"
+      errors `shouldContain` "1 unowned thread or process start(s) where the baseline allows 0"
+      errors `shouldContain` "Test.Support.Subprocess"
+      errors `shouldContain` "tools/test-support/src/Test/Support/Subprocess.hs"
+      errors `shouldContain` "withScopedChild"
+      -- A file that starts no thread is not told to use the thread facility.
+      errors `shouldNotContain` "Test.Support.Owned"
+
+    it "passes a baselined subprocess start" $ do
+      (passed, errors) ←
+        checked (tree plainConfig [("pkg/test/Main.hs", 1)] [("pkg/test/Main.hs", source ["main :: IO ()", "main = readProcess \"true\" [] \"\" >> pure ()"])])
+      (passed, errors) `shouldBe` (True, "")
+
+    it "counts a start made with createProcess_, which does not close the handles it is given, as a subprocess start" $ do
+      (passed, errors) ←
+        checked (tree plainConfig [] [("pkg/test/Main.hs", source ["main :: IO ()", "main = createProcess_ \"x\" (proc \"true\" []) >> pure ()"])])
+      passed `shouldBe` False
+      errors `shouldContain` "createProcess_@"
 
     it "fails a start beyond the baseline's count in the same file" $ do
       (passed, errors) ←
@@ -496,6 +529,15 @@ spec = describe "The unowned-start guard (tools/validation/owned_starts.py)" $ d
       text `shouldNotContain` "run-native-test/Test/Run/Native/Library.hs"
       text `shouldNotContain` "run-native-test/Test/Run/Native/ChildSpec.hs"
 
+    it "no longer lists, in the baseline, the files whose only starts were subprocess starts that the shared subprocess facility now owns (#588)" $ inCheckout $ \checkout → do
+      text ← readFile (checkout </> "tools/validation/owned_starts_baseline.json")
+      forM_ converted $ \path → text `shouldNotContain` path
+
+    it "keeps the two display-helper suites' baseline entries, which #588's owner decision moved to a separate issue with the hosted-subprocess helper they need" $ inCheckout $ \checkout → do
+      text ← readFile (checkout </> "tools/validation/owned_starts_baseline.json")
+      text `shouldContain` "tools/x11-test/Main.hs"
+      text `shouldContain` "tools/wayland-test/Main.hs"
+
     it "has not grown its baseline relative to the review base" $ inCheckout $ \checkout → do
       settings ← sanitizedEnvironment
       (resolved, _, _) ← run settings checkout "git" ["rev-parse", "--verify", "--quiet", "origin/master^{commit}"]
@@ -590,3 +632,44 @@ withRatchet initialBaseline action = withSystemTempDirectory "hetoimasia-owned-r
   void $ git settings directory ["commit", "-q", "-m", "base"]
   base ← takeWhile (/= '\n') <$> git settings directory ["rev-parse", "HEAD"]
   action directory base
+
+-- | The files whose every baselined start was a subprocess start (or a thread that existed only to serve one), converted in #588: none
+-- of them has a baseline entry any more.
+converted ∷ [FilePath]
+converted =
+      [ "packages/asset-image/test/Test/Asset/Image/Bc7Opacity.hs",
+      "packages/asset-image/test/Test/Asset/Image/PngDecodeClient.hs",
+      "packages/asset-image/test/Test/Asset/Image/PngPreflightClient.hs",
+      "packages/content/test/Test/Content/Identity/Boundary.hs",
+      "packages/content/test/Test/Content/Inventory/Boundary.hs",
+      "packages/content/test/Test/Content/Opacity.hs",
+      "packages/content/test/Test/Content/ReadPool/Boundary.hs",
+      "packages/foundation/test/Test/Foundation/Messaging/Opacity.hs",
+      "packages/foundation/test/Test/Foundation/Resources/Opacity.hs",
+      "packages/foundation/test/Test/Foundation/Time/Opacity.hs",
+      "packages/foundation/test/Test/Foundation/Workers/Opacity.hs",
+      "packages/glfw/native-tests/Test/GLFW/Native/Presence.hs",
+      "packages/glfw/test/Test/GLFW/Linking.hs",
+      "packages/glfw/test/Test/GLFW/Opacity.hs",
+      "packages/gpu-vulkan/glfw/native-test/Test/GPU/Vulkan/Native/Compositor.hs",
+      "packages/gpu-vulkan/model/test/Test/GPU/Model/Opacity.hs",
+      "packages/gpu-vulkan/native/probe/allocator-parity/Main.hs",
+      "packages/gpu-vulkan/native/probe/allocator-parity/Production.hs",
+      "packages/lua-engine/test/Test/LuaEngine/Facade/Client.hs",
+      "packages/lua-engine/test/Test/LuaEngine/Modules/Client.hs",
+      "packages/lua-engine/test/Test/LuaEngine/Scene/Client.hs",
+      "packages/lua-engine/test/Test/LuaEngine/Session/Client.hs",
+      "packages/lua-engine/test/Test/LuaEngine/Texture/Client.hs",
+      "packages/runtime/test/Test/Runtime/Opacity.hs",
+      "packages/scripting-lua/hazard-test/Main.hs",
+      "packages/scripting-lua/macos/test/Test/MacOS/Driver.hs",
+      "packages/scripting-lua/test/Test/Lua/Hazard.hs",
+      "packages/scripting-lua/test/Test/Lua/Opacity.hs",
+      "samples/lua-domains/test/Test/Domains/Options.hs",
+      "samples/lua-domains/test/Test/Domains/Process.hs",
+      "test/Test/Engine/Console/Support.hs",
+      "tools/test-support/src/Test/Support/ExternalClient.hs",
+      "tools/test/RunnerIdentity.hs",
+      "tools/test/Sandbox.hs",
+      "tools/test/VulkanProof.hs"
+      ]
