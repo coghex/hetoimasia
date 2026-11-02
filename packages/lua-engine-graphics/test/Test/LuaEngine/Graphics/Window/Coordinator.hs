@@ -9,7 +9,6 @@
 -- fake port is injected evidence and says so.
 module Test.LuaEngine.Graphics.Window.Coordinator (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (atomically, retry)
 import Control.Exception (SomeException, finally, throwIO, try)
@@ -47,6 +46,7 @@ import Test.LuaEngine.Graphics.Rig (bounded)
 import Test.LuaEngine.Graphics.Window.Fake
 import Test.LuaEngine.Graphics.Window.Rig (raisesWindowDefect)
 import Test.LuaEngine.Graphics.Windows
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = describe "on the real session coordinator" $ do
@@ -174,17 +174,13 @@ runWithSession scenario = bounded . withSystemTempDirectory "hetoimasia-window-c
             runtime ← newLuaRuntime control
             handle ← newEmptyMVar
             result ← newEmptyMVar
-            terminated ← newEmptyMVar
-            _ ← forkIO $
-              ( do
+            let scenarioAction = do
                   session ← readMVar handle
                   found ← try @SomeException (scenario session)
                   case found of
                     Left _ → requestStop session StopQuit
                     Right () → pure ()
                   putMVar result found
-              )
-                `finally` putMVar terminated ()
             let spec' =
                   SessionSpec
                     { sxProfile = fixedM1Profile
@@ -200,9 +196,12 @@ runWithSession scenario = bounded . withSystemTempDirectory "hetoimasia-window-c
                     , sxHarness = noHarness
                     , sxGraphics = Nothing
                     }
-            outcome ← runSession spec' (putMVar handle)
-            takeMVar terminated
-            takeMVar result >>= either throwIO (const (pure outcome))
+            -- The scenario's thread is owned by the call (#599): ended and joined however the session's run ends, a cancellation
+            -- delivered before the scenario started included.
+            withOwnedThread scenarioAction $ \_ terminated → do
+              outcome ← runSession spec' (putMVar handle)
+              terminated
+              takeMVar result >>= either throwIO (const (pure outcome))
 
 manifest ∷ ByteString
 manifest = Text.encodeUtf8 "{\"format\":1,\"id\":\"window-coordinator\",\"entry\":\"lua/main.lua\",\"vms\":[{\"role\":\"presentation\",\"clock\":\"elapsed\"}]}"

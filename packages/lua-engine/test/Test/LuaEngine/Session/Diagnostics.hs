@@ -18,8 +18,8 @@
 -- writer, as it did).
 module Test.LuaEngine.Session.Diagnostics (spec) where
 
-import Control.Concurrent (forkIO, killThread, myThreadId, throwTo, yield)
-import Control.Concurrent.MVar (MVar, isEmptyMVar, newEmptyMVar, putMVar, readMVar, takeMVar)
+import Control.Concurrent (myThreadId, throwTo, yield)
+import Control.Concurrent.MVar (MVar, isEmptyMVar, newEmptyMVar, putMVar, readMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), SomeException, displayException, finally, fromException, mask, onException, throwIO, toException, try, tryWithContext, uninterruptibleMask_)
 import Control.Monad (void, when)
@@ -29,10 +29,11 @@ import GHC.Conc (getUncaughtExceptionHandler, setUncaughtExceptionHandler)
 import Hetoimasia.Foundation.Log (LogEntry (entryMessage), Logger, callbackSink, defaultLogFilter, mkLogger)
 import Test.Hspec
 import Hetoimasia.LuaEngine.Profile (ByteLimit (EngineReportBytes, SecondarySummaryBytes), CountLimit (SecondarySummaries))
-import Test.LuaEngine.Modules.Support (closeGate, openEverything, openGate)
+import Test.LuaEngine.Modules.Support (closeGate, openGate)
 import Test.LuaEngine.Request.Profiles (smaller)
 import Test.LuaEngine.Session.Support
 import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "diagnostics" $ do
@@ -145,24 +146,21 @@ runHeld env harness scenario = do
   handleVar ← newEmptyMVar
   returned ← newEmptyMVar ∷ IO (MVar SessionOutcome)
   resultVar ← newEmptyMVar
-  terminated ← newEmptyMVar
-  thread ← mask $ \restore →
-    forkIO $
-      ( do
-          session ← readMVar handleVar
-          result ← try (restore (scenario session (Returning (bounded (readMVar returned)) (not <$> isEmptyMVar returned))))
-          case result of
-            Left (failure ∷ SomeException) → requestStop session StopQuit >> putMVar resultVar (Left failure)
-            Right () → putMVar resultVar (Right ())
-          releaseSink (seWorld env)
-          openEverything (wSession (seWorld env))
-      )
-        `finally` putMVar terminated ()
-  outcome ← runSession (scenarioSpec env harness) (putMVar handleVar) `onException` (killThread thread >> takeMVar terminated)
-  putMVar returned outcome
-  result ← bounded (readMVar resultVar)
-  takeMVar terminated
-  either throwIO (const (pure outcome)) result
+  -- Owned by the call (#599): ended and joined however the call ends, with the held sink and the reader's gates let go first.
+  withOwnedThreadOpening (letScenarioGo env) (scenarioThread handleVar returned resultVar) $ \_ terminated → do
+    outcome ← runSession (scenarioSpec env harness) (putMVar handleVar)
+    putMVar returned outcome
+    result ← bounded (readMVar resultVar)
+    terminated
+    either throwIO (const (pure outcome)) result
+  where
+    scenarioThread handleVar returned resultVar = mask $ \restore → do
+      session ← readMVar handleVar
+      result ← try (restore (scenario session (Returning (bounded (readMVar returned)) (not <$> isEmptyMVar returned))))
+      case result of
+        Left (failure ∷ SomeException) → requestStop session StopQuit >> putMVar resultVar (Left failure)
+        Right () → putMVar resultVar (Right ())
+      letScenarioGo env
 
 -- | The messages the outcome records as not delivered.
 undelivered ∷ SessionOutcome → [Text]
@@ -540,14 +538,20 @@ construction = describe "the writer's start" $ do
       recorder ← newRecorder
       holdAt recorder WriterStarted
       driver ← myThreadId
-      _ ← forkIO $ do
-        awaitPoint recorder WriterStarted
-        throwTo driver ThreadKilled
-        releaseHold recorder WriterStarted
-      result ← tryWithContext @SomeException (runSession (scenarioSpec (loggedBy held env) (recordingHarness recorder noHarness)) (\_ → pure ()))
-      case result of
-        Left (ExceptionWithContext _ raised) → fromException raised `shouldBe` Just ThreadKilled
-        Right _ → expectationFailure "the cancellation was lost"
+      -- Owned by the example (#599): the hold it releases is what the session's unwinding may wait for, so the thread outlives
+      -- the call, and the hold is let go first however the example ends.
+      withOwnedThreadOpening
+        (releaseHold recorder WriterStarted)
+        ( do
+            awaitPoint recorder WriterStarted
+            throwTo driver ThreadKilled
+            releaseHold recorder WriterStarted
+        )
+        $ \_ _ → do
+          result ← tryWithContext @SomeException (runSession (scenarioSpec (loggedBy held env) (recordingHarness recorder noHarness)) (\_ → pure ()))
+          case result of
+            Left (ExceptionWithContext _ raised) → fromException raised `shouldBe` Just ThreadKilled
+            Right _ → expectationFailure "the cancellation was lost"
       points ← recorded recorder
       [point | point ← points, isBuilding point] `shouldBe` []
       readTVarIO (heldAll held) >>= \attempted → attempted `shouldSatisfy` all (`notElem` ["start gate opened"])

@@ -248,6 +248,42 @@
       "binding": "startUnownedBound",
       "sites": 1,
       "reason": "the glfw-tests negative controls' deliberately unowned bound start, a plain forkOS (#593), stopped and joined independently by the control that made it"
+    },
+    {
+      "file": "packages/lua-engine/test/Test/LuaEngine/Unowned.hs",
+      "binding": "startUnowned",
+      "sites": 1,
+      "reason": "the lua-engine-tests ownership regressions' negative controls' deliberately unowned start (#599), which exists to be judged as a leak and is stopped and joined independently by the control that made it"
+    },
+    {
+      "file": "packages/lua-engine-graphics/test/Test/LuaEngine/Graphics/Unowned.hs",
+      "binding": "startUnowned",
+      "sites": 1,
+      "reason": "the lua-engine-graphics-tests ownership regressions' negative controls' deliberately unowned start (#599), which exists to be judged as a leak and is stopped and joined independently by the control that made it"
+    },
+    {
+      "file": "packages/lua-engine/test/Test/LuaEngine/Owned.hs",
+      "binding": "previousRunScenario",
+      "sites": 1,
+      "reason": "the negative controls' scenario runner as the suite had it before #599 (the scenario's thread forked under mask, its cleanup registered after the start returned), which exists to be judged as a leak at the two places it left the thread; the control that ran it stops and joins what it left independently"
+    },
+    {
+      "file": "packages/lua-engine-graphics/test/Test/LuaEngine/Graphics/Owned.hs",
+      "binding": "previousWithFakeOwner",
+      "sites": 1,
+      "reason": "the negative control's fake-owner helper as it was before #599 (the thread forked, its stop-and-join installed after the fork returned), which exists to be judged as a leak when the body is cancelled between the two; the control that ran it stops and joins what it left independently"
+    },
+    {
+      "file": "packages/lua-engine-graphics/test/Test/LuaEngine/Graphics/Owned.hs",
+      "binding": "previousMainLoop",
+      "sites": 1,
+      "reason": "the negative control's main-step loop helper as it was before #599 (the thread forked, its stop-and-join installed after the fork returned), which exists to be judged as a leak when the body is cancelled between the two; the control that ran it stops and joins what it left independently"
+    },
+    {
+      "file": "packages/lua-engine-graphics/test/Test/LuaEngine/Graphics/Owned.hs",
+      "binding": "previousForkScope",
+      "sites": 1,
+      "reason": "the negative control's scope-on-a-thread helper as it was before #599 (the thread forked, nothing stopping or joining it), which exists to be judged as a leak while its scope is held in a drain; the control that ran it lets the hold go, then stops and joins what it left independently"
     }
   ]
 }

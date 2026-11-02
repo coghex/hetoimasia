@@ -20,7 +20,6 @@ module Test.LuaEngine.Graphics.Native.Session
   , markRest
   ) where
 
-import Control.Concurrent (forkOS)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryReadMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVarIO, retry, swapTVar)
 import Control.Exception (SomeException, displayException, finally, throwIO, try)
@@ -48,6 +47,7 @@ import Hetoimasia.GPU.Model (Usage, usage)
 import Hetoimasia.GPU.Vulkan.Diagnostics (CaptureConfig (..), DiagnosticVerdict, defaultCaptureConfig)
 import Hetoimasia.GPU.Vulkan.Native.Roots (RootsView (..))
 import Test.LuaEngine.Graphics.FrameLog (FrameLog, emptyFrameLog, recordEvent)
+import Test.Support.Owned (withOwnedBoundThread)
 import Hetoimasia.GPU.Vulkan.GLFW
   ( FrameEvent (..)
   , NativeObserver (..)
@@ -226,31 +226,35 @@ runSession complete backend features configuration examples = do
         serve ← newIORef (pure ())
         let env = Env vulkan config scenes graphics control now rest evidence jobs serve windowCount frames
         done ← newEmptyMVar
-        _ ← forkOS $ do
-          -- The complete profile is run with Hspec's configuration reading left out, so no argument,
-          -- @~/.hspec@, @./.hspec@ or @HSPEC_*@ can narrow what the catalog group's receipt speaks for.
-          result ←
-            try @SomeException $
-              if complete
-                then do
-                  (cfg, forest) ← evalSpec defaultConfig {configFailOnEmpty = True} (examples env)
-                  specResultSuccess <$> runSpecForest forest cfg
-                else isSuccess <$> hspecWithResult defaultConfig {configFailOnEmpty = True} (examples env)
-          putMVar done result
-          wakeGraphicsHost (vulkanGraphicsOwner vulkan)
-        -- The process main thread serves the owner loop until the examples are done: window creation, surfaces
-        -- and native events belong to it. A turn runs the jobs the examples handed it and the action they
-        -- installed, then asks to finish once Hspec has. The loop is woken for each, so none waits on the idle bound.
-        let update _ = do
-              pending ← atomically (swapTVar jobs [])
-              sequence_ pending
-              join (readIORef serve)
-              finished ← tryReadMVar done
-              pure (if isJust finished then FinishWith () else ContinueWith NoUpdateDemand)
-        runVulkanOwnerLoop vulkan control (defaultScheduledHooks quietLogger update)
-        takeMVar done >>= \case
-          Left failure → throwIO failure
-          Right success → writeIORef passedCell success
+        let profile = do
+              -- The complete profile is run with Hspec's configuration reading left out, so no argument,
+              -- @~/.hspec@, @./.hspec@ or @HSPEC_*@ can narrow what the catalog group's receipt speaks for.
+              result ←
+                try @SomeException $
+                  if complete
+                    then do
+                      (cfg, forest) ← evalSpec defaultConfig {configFailOnEmpty = True} (examples env)
+                      specResultSuccess <$> runSpecForest forest cfg
+                    else isSuccess <$> hspecWithResult defaultConfig {configFailOnEmpty = True} (examples env)
+              putMVar done result
+              wakeGraphicsHost (vulkanGraphicsOwner vulkan)
+        -- The bound OS thread that runs the complete profile is owned by the call (#599), started by the facility's bound
+        -- start (#593): window creation, surfaces and native events belong to the process main thread, which serves the
+        -- owner loop below, and the thread is ended and joined before this loop's scope returns however it ended.
+        withOwnedBoundThread profile $ \_ _ → do
+          -- The process main thread serves the owner loop until the examples are done: window creation, surfaces
+          -- and native events belong to it. A turn runs the jobs the examples handed it and the action they
+          -- installed, then asks to finish once Hspec has. The loop is woken for each, so none waits on the idle bound.
+          let update _ = do
+                pending ← atomically (swapTVar jobs [])
+                sequence_ pending
+                join (readIORef serve)
+                finished ← tryReadMVar done
+                pure (if isJust finished then FinishWith () else ContinueWith NoUpdateDemand)
+          runVulkanOwnerLoop vulkan control (defaultScheduledHooks quietLogger update)
+          takeMVar done >>= \case
+            Left failure → throwIO failure
+            Right success → writeIORef passedCell success
 
 -- | A line on stderr as the session reaches each stage, so a run that stops says where.
 progressNote ∷ String → IO ()

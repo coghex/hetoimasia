@@ -15,7 +15,6 @@
 -- through the same bindings. Both end through the session's quit path.
 module Test.LuaEngine.Graphics.Native.Facade (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry)
 import Control.Exception (SomeException, finally, throwIO, try)
@@ -56,6 +55,7 @@ import Test.LuaEngine.Graphics.FrameLog (frameLogMark)
 import qualified Test.LuaEngine.Graphics.Png as Png
 import Test.LuaEngine.Graphics.Native.Scenes hiding (spec)
 import Test.LuaEngine.Graphics.Native.Session (Env (..), noteWindows, serveMain)
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Env → Spec
 spec env = describe "graphics facade" $ do
@@ -170,9 +170,7 @@ withFacadeSession env entry judge scenario = do
         withOutput outSink errSink $ \output → do
           handle ← newEmptyMVar
           result ← newEmptyMVar
-          terminated ← newEmptyMVar
-          _ ← forkIO $
-            ( do
+          let scenarioAction = do
                 found ← readMVar handle
                 writeIORef sessionRef (Just found)
                 attempted ← try @SomeException $ do
@@ -182,8 +180,6 @@ withFacadeSession env entry judge scenario = do
                 -- However the scenario ended, the session stops normally.
                 requestStop found StopQuit
                 putMVar result attempted
-            )
-              `finally` putMVar terminated ()
           let sessionSpec =
                 SessionSpec
                   { sxProfile = compositionProfile
@@ -199,9 +195,14 @@ withFacadeSession env entry judge scenario = do
                   , sxHarness = noHarness
                   , sxGraphics = Just injection
                   }
-          outcome ← runSession sessionSpec (putMVar handle)
-          takeMVar terminated
-          takeMVar result >>= either throwIO pure
+          -- The scenario's thread is owned by the call (#599): ended and joined however the session's run ends, a cancellation
+          -- delivered before the scenario started included.
+          outcome ←
+            withOwnedThread scenarioAction $ \_ terminated → do
+              ran ← runSession sessionSpec (putMVar handle)
+              terminated
+              takeMVar result >>= either throwIO pure
+              pure ran
           judge outcome
           outRetired outcome `shouldBe` True
   -- Everything the session made is gone: the window is destroyed and the texture retired on the table's own evidence.

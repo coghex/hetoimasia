@@ -9,7 +9,7 @@
 -- started, the scopes unwound, the workers waited for.
 module Test.LuaEngine.Session.Construction (spec) where
 
-import Control.Concurrent (forkIO, myThreadId, throwTo)
+import Control.Concurrent (myThreadId, throwTo)
 import Control.Concurrent.MVar (isEmptyMVar, newEmptyMVar, putMVar, readMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, writeTVar)
 import Control.Exception (AsyncException (ThreadKilled), SomeException, fromException, throwIO, toException, try)
@@ -23,6 +23,7 @@ import Test.Hspec
 import Test.LuaEngine.Modules.Support (closeGate, openGate)
 import Test.LuaEngine.Session.Support
 import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "construction" $ do
@@ -121,18 +122,24 @@ cancellation = describe "cancellation of the calling thread" $
             holdAt recorder point
             self ← myThreadId
             handle ← newEmptyMVar
-            _ ← forkIO $ do
-              session ← readMVar handle
-              awaitPoint recorder point
-              throwTo self ThreadKilled
-              -- the unwinding closes the gates; only then is a point on an owner's thread let go, which that owner
-              -- needs in order to end
-              void (awaitStatus session (\status → statusStopping status))
-              releaseHold recorder point
-            result ← try (runSession (scenarioSpec env (recordingHarness recorder (sxHarness (seSpec env)))) (putMVar handle))
-            case result of
-              Left (found ∷ SomeException) → fromException found `shouldBe` Just ThreadKilled
-              Right _ → expectationFailure "the cancellation was lost"
+            -- the canceller supplies the hold the unwinding needs to end, so it outlives the call; it is owned by the example
+            -- (#599), and the hold is let go first however the example ends
+            withOwnedThreadOpening
+              (releaseHold recorder point)
+              ( do
+                  session ← readMVar handle
+                  awaitPoint recorder point
+                  throwTo self ThreadKilled
+                  -- the unwinding closes the gates; only then is a point on an owner's thread let go, which that owner
+                  -- needs in order to end
+                  void (awaitStatus session (\status → statusStopping status))
+                  releaseHold recorder point
+              )
+              $ \_ _ → do
+                result ← try (runSession (scenarioSpec env (recordingHarness recorder (sxHarness (seSpec env)))) (putMVar handle))
+                case result of
+                  Left (found ∷ SomeException) → fromException found `shouldBe` Just ThreadKilled
+                  Right _ → expectationFailure "the cancellation was lost"
             points ← recorded recorder
             -- each owner that was built ended before its step was released, and every built step was released once
             let built = [(role, built') | Built role built' ← points]
@@ -164,20 +171,26 @@ drainage = describe "the coordinator's drainage on an exceptional exit" $
       handle ← newEmptyMVar
       observed ← newEmptyMVar
       released ← newEmptyMVar
-      _ ← forkIO $ do
-        session ← readMVar handle
-        awaitReadOf env path
-        throwTo self ThreadKilled
-        -- the unwinding has ended the owner and is waiting for the held read: the role is still not retired
-        awaitPoint recorder (Draining Gameplay)
-        status ← statusNow session
-        putMVar observed (fmap rolePhase (gameplayOf status))
-        putMVar released ()
-        openGate (ssProbeOf env) path
-      result ← try (runSession (scenarioSpec env (recordingHarness recorder (sxHarness (seSpec env)))) (putMVar handle))
-      case result of
-        Left (found ∷ SomeException) → fromException found `shouldBe` Just ThreadKilled
-        Right _ → expectationFailure "the cancellation was lost"
+      -- the canceller opens the read the unwinding waits for, so it outlives the call; owned by the example (#599), with the read
+      -- let go first however the example ends
+      withOwnedThreadOpening
+        (openGate (ssProbeOf env) path)
+        ( do
+            session ← readMVar handle
+            awaitReadOf env path
+            throwTo self ThreadKilled
+            -- the unwinding has ended the owner and is waiting for the held read: the role is still not retired
+            awaitPoint recorder (Draining Gameplay)
+            status ← statusNow session
+            putMVar observed (fmap rolePhase (gameplayOf status))
+            putMVar released ()
+            openGate (ssProbeOf env) path
+        )
+        $ \_ _ → do
+          result ← try (runSession (scenarioSpec env (recordingHarness recorder (sxHarness (seSpec env)))) (putMVar handle))
+          case result of
+            Left (found ∷ SomeException) → fromException found `shouldBe` Just ThreadKilled
+            Right _ → expectationFailure "the cancellation was lost"
       -- the call did not return until the read had been let go
       isEmptyMVar released `shouldReturn` False
       takeMVar observed `shouldReturn` Just Stopping
@@ -430,11 +443,12 @@ callbacks = describe "the callback and the first diagnostic" $ do
     withSetup (setup (roleScript printScript)) $ \env → do
       handle ← newEmptyMVar
       driver ← myThreadId
-      _ ← forkIO (readMVar handle >> throwTo driver ThreadKilled)
-      result ← try (runSession (scenarioSpec env noHarness) (\session → putMVar handle session >> blockForever))
-      case result of
-        Left (raised ∷ SomeException) → fromException raised `shouldBe` Just ThreadKilled
-        Right _ → expectationFailure "the cancellation was lost"
+      -- the canceller is owned by the example (#599): it waits for the handle, and ends with the example if the handle never comes
+      withOwnedThread (readMVar handle >> throwTo driver ThreadKilled) $ \_ _ → do
+        result ← try (runSession (scenarioSpec env noHarness) (\session → putMVar handle session >> blockForever))
+        case result of
+          Left (raised ∷ SomeException) → fromException raised `shouldBe` Just ThreadKilled
+          Right _ → expectationFailure "the cancellation was lost"
       session ← readMVar handle
       outcome ← outcomeNow session
       outVerdict outcome `shouldBe` VerdictSuccess
@@ -477,15 +491,19 @@ callbacks = describe "the callback and the first diagnostic" $ do
           env' = env {seSpec = (seSpec env) {sxLogger = logger}}
       handle ← newEmptyMVar
       driver ← myThreadId
-      _ ← forkIO $ do
-        _ ← readMVar handle
-        -- the writer is inside the sink: the caller is cancelled while it is
-        bounded (atomically (readTVar written >>= \n → when (n == 0) retry))
-        throwTo driver ThreadKilled
-      result ← try (runSession (scenarioSpec env' noHarness) (putMVar handle))
-      case result of
-        Left (raised ∷ SomeException) → fromException raised `shouldBe` Just ThreadKilled
-        Right _ → expectationFailure "the cancellation was lost"
+      -- the canceller is owned by the example (#599)
+      withOwnedThread
+        ( do
+            _ ← readMVar handle
+            -- the writer is inside the sink: the caller is cancelled while it is
+            bounded (atomically (readTVar written >>= \n → when (n == 0) retry))
+            throwTo driver ThreadKilled
+        )
+        $ \_ _ → do
+          result ← try (runSession (scenarioSpec env' noHarness) (putMVar handle))
+          case result of
+            Left (raised ∷ SomeException) → fromException raised `shouldBe` Just ThreadKilled
+            Right _ → expectationFailure "the cancellation was lost"
       session ← readMVar handle
       -- the call returned with the sink still holding the note, and every role retired
       readTVarIO blocked `shouldReturn` True

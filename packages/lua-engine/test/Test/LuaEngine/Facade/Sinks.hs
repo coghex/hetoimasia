@@ -6,7 +6,7 @@
 -- owns the sinks outliving the owners that write to them, and what a half-made facade leaves behind.
 module Test.LuaEngine.Facade.Sinks (spec) where
 
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (killThread)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
 import Control.Concurrent.STM (atomically, readTVarIO, retry)
 import Control.Exception (ExceptionWithContext (ExceptionWithContext), SomeException, finally, fromException, throwIO, try, tryWithContext)
@@ -22,6 +22,7 @@ import Hetoimasia.Scripting.Lua.Registration (namespace)
 import Test.Hspec
 import Test.LuaEngine.Facade.Support
 import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThreadOpening)
 
 files ∷ [(FilePath, ByteString)]
 files = [("data.bin", "xx")]
@@ -91,10 +92,11 @@ spec = describe "authored output under contention and failure" $ do
       withOutput sink sink $ \output → do
         resultA ← newEmptyMVar
         resultB ← newEmptyMVar
-        ( do
-            _ ← forkIO (tryWithContext @SomeException (writeAuthored output Stdout ["a"]) >>= putMVar resultA)
-            bounded (takeMVar entered)
-            _ ← forkIO (tryWithContext @SomeException (writeAuthored output Stdout ["b"]) >>= putMVar resultB)
+        -- both writers are owned by the example (#599), and the gate they may be held at is let go first however it ends
+        let letGo = void (tryPutMVar gate ())
+        withOwnedThreadOpening letGo (tryWithContext @SomeException (writeAuthored output Stdout ["a"]) >>= putMVar resultA) $ \_ _ → do
+          bounded (takeMVar entered)
+          withOwnedThreadOpening letGo (tryWithContext @SomeException (writeAuthored output Stdout ["b"]) >>= putMVar resultB) $ \_ _ → do
             -- the second writer is counted, so it has passed the check that preceded the failure
             bounded (atomically (outputInFlight output >>= \n → when (n < 2) retry))
             putMVar gate ()
@@ -102,8 +104,6 @@ spec = describe "authored output under contention and failure" $ do
             second ← bounded (takeMVar resultB)
             either (Text.pack . show) (const "written") first `shouldSatisfy` Text.isInfixOf "OutputFailure"
             either (Text.pack . show) (const "written") second `shouldSatisfy` Text.isInfixOf "OutputFailure"
-          )
-          `finally` void (tryPutMVar gate ())
       -- the sink was handed the line that failed, and the writer behind it never reached it
       readIORef seen >>= (`shouldBe` ["a"])
     it "keeps the cleanup failures of what the scope encloses, beside the body's failure, and raises the body's failure as itself" $ do
@@ -154,19 +154,26 @@ spec = describe "authored output under contention and failure" $ do
               }
           -- the gate is opened however the example ends, so the writer and the scope always unwind
           release = tryPutMVar gate () >> pure ()
-      scope ← forkIO $ do
-        withOutput sink sink $ \output → do
-          void (forkIO (writeAuthored output Stdout ["held"] `finally` putMVar written ()))
-          bounded (takeMVar entered)
-        putMVar finished ()
-      ( do
-          awaitBlockedOnSTM scope
-          -- the scope's body returned and it is waiting for the call in the sink
-          tryReadMVar finished >>= (`shouldBe` Nothing)
-        )
-        `finally` release
-      bounded (takeMVar finished)
-      bounded (takeMVar written)
+      -- The writer is started outside the scope that owns the sinks, because it is the call the scope's end waits for (#599): the
+      -- scope hands it the output once it exists, and the writer, owned by the example, outlives the scope's exit. The gate is
+      -- let go first however the example ends, so the join of neither thread waits on a call parked in the sink.
+      outputVar ← newEmptyMVar
+      withOwnedThreadOpening release (readMVar outputVar >>= \output → writeAuthored output Stdout ["held"] `finally` putMVar written ()) $ \_ _ →
+        withOwnedThreadOpening
+          release
+          ( do
+              withOutput sink sink $ \output → do
+                putMVar outputVar output
+                bounded (takeMVar entered)
+              putMVar finished ()
+          )
+          $ \scope _ → do
+            awaitBlockedOnSTM scope
+            -- the scope's body returned and it is waiting for the call in the sink
+            tryReadMVar finished >>= (`shouldBe` Nothing)
+            release
+            bounded (takeMVar finished)
+            bounded (takeMVar written)
     it "does not take an interruption of a call inside a sink for a failure of the sink: later calls are still written" $ do
       entered ← newEmptyMVar
       gate ← newEmptyMVar
@@ -178,13 +185,11 @@ spec = describe "authored output under contention and failure" $ do
               }
       withOutput sink sink $ \output → do
         done ← newEmptyMVar
-        writer ← forkIO (writeAuthored output Stdout ["first"] `finally` putMVar done ())
-        ( do
-            bounded (takeMVar entered)
-            killThread writer
-            bounded (takeMVar done)
-          )
-          `finally` void (tryPutMVar gate ())
+        -- the writer is owned by the example (#599), and the gate it is held at is let go first however the example ends
+        withOwnedThreadOpening (void (tryPutMVar gate ())) (writeAuthored output Stdout ["first"] `finally` putMVar done ()) $ \writer _ → do
+          bounded (takeMVar entered)
+          killThread writer
+          bounded (takeMVar done)
         writeAuthored output Stdout ["second"]
         atomically (outputFailure output) >>= (`shouldSatisfy` isNothing)
       readIORef seen >>= (`shouldBe` ["second", "first"])

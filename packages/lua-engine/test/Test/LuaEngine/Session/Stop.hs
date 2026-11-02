@@ -4,7 +4,7 @@
 -- cancellation and release still possible, and a role retired only when what it holds has actually retired.
 module Test.LuaEngine.Session.Stop (spec) where
 
-import Control.Concurrent (forkIO, killThread, throwTo)
+import Control.Concurrent (killThread, throwTo)
 import Control.Concurrent.MVar (isEmptyMVar, newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (AsyncException (ThreadKilled), ExceptionWithContext (ExceptionWithContext), MaskingState (MaskedUninterruptible), fromException, getMaskingState, toException, try, uninterruptibleMask_)
 import Control.Monad (replicateM_, void)
@@ -15,6 +15,7 @@ import Test.Hspec
 import Test.LuaEngine.Modules.Support (closeGate, openGate)
 import Test.LuaEngine.Session.Support
 import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = describe "stop and drain" $ do
@@ -49,11 +50,11 @@ fullCapacity = describe "with every place taken" $ do
           nudgeArmed world 1000000 1000000000
           awaitSinkEntered world "second"
           done ← newEmptyMVar
-          replicateM_ 4 . forkIO $ do
-            requestStop session StopQuit
-            requestStop session StopInterrupt
-            putMVar done ()
-          replicateM_ 4 (bounded (takeMVar done))
+          -- four stoppers, each owned by the scenario (#599): the sink they may be parked behind is let go first
+          withOwnedThreadsOpening
+            (releaseSink world)
+            (replicate 4 (requestStop session StopQuit >> requestStop session StopInterrupt >> putMVar done ()))
+            $ \_ → replicateM_ 4 (bounded (takeMVar done))
           status ← statusNow session
           statusStopping status `shouldBe` True
           fmap rolePhase (presentationOf status) `shouldBe` Just Stopping
@@ -382,15 +383,16 @@ waits = describe "masking and waits" $ do
                 -- observed parked in the wait itself (in its STM transaction, interruptibly or not)
                 awaitBlockedOnSTM driver
                 -- a second cancellation is sent while the wait is outstanding
-                thrower ← forkIO (throwTo driver ThreadKilled >> putMVar delivered ())
-                if interruptible
-                  then bounded (takeMVar delivered)
-                  else do
-                    -- the wait is uninterruptible: the thrower is blocked in its throw and nothing was delivered
-                    awaitBlockedOnException thrower
-                    isEmptyMVar delivered `shouldReturn` True
-                    -- withdraw the throw that cannot land, so that it does not land after the example
-                    killThread thrower
+                -- the thrower is owned by the scenario (#599); the example withdraws the throw that cannot land itself
+                withOwnedThread (throwTo driver ThreadKilled >> putMVar delivered ()) $ \thrower _ →
+                  if interruptible
+                    then bounded (takeMVar delivered)
+                    else do
+                      -- the wait is uninterruptible: the thrower is blocked in its throw and nothing was delivered
+                      awaitBlockedOnException thrower
+                      isEmptyMVar delivered `shouldReturn` True
+                      -- withdraw the throw that cannot land, so that it does not land after the example
+                      killThread thrower
                 releaseHold recorder (Dispatched (InstanceKey Presentation 0))
               raisedKilled ended `shouldBe` True
       )

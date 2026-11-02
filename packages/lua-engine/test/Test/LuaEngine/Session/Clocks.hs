@@ -6,7 +6,6 @@
 -- the example says it is.
 module Test.LuaEngine.Session.Clocks (spec) where
 
-import Control.Concurrent (forkIO)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Control.Concurrent.STM (atomically, newTVarIO, readTVar, retry, writeTVar)
 import Control.Exception (finally)
@@ -18,6 +17,7 @@ import Hetoimasia.Foundation.Log (LogEntry (entryMessage), callbackSink, default
 import Hetoimasia.LuaEngine.Session.Pacing (luaTickCeiling)
 import Test.Hspec
 import Test.LuaEngine.Session.Support
+import Test.Support.Owned (withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "clocks" $ do
@@ -140,17 +140,19 @@ grantAcrossClosure removedProtections held expectIssued =
       -- the first tick is due and the driver is about to grant it
       nudge world 1000000
       awaitPoint recorder held
-      -- the closure commits while the driver is held; the closing thread owes the owner its stop and has not handed it
-      void (forkIO (requestStop session StopQuit))
-      awaitPoint recorder (Committed "Stop")
-      found ← historyNow session
-      historyStopped found `shouldBe` []
-      releaseHold recorder held
-      -- a grant that is wrongly accepted is accepted while the closing thread is still held: wait for it, so that the
-      -- closing thread cannot get ahead of the driver
-      when expectIssued (awaitPoint recorder (GrantIssued 1))
-      releaseHold recorder (Committed "Stop")
-      void (awaitRetired session)
+      -- the closure commits while the driver is held; the closing thread owes the owner its stop and has not handed it. The
+      -- closing thread is owned by the scenario (#599): the holds it can be parked at are let go first however the scenario
+      -- ends, and it outlives the wait for the retirement it supplies the owner's stop for.
+      withOwnedThreadOpening (releaseHold recorder held >> releaseHold recorder (Committed "Stop")) (requestStop session StopQuit) $ \_ _ → do
+        awaitPoint recorder (Committed "Stop")
+        found ← historyNow session
+        historyStopped found `shouldBe` []
+        releaseHold recorder held
+        -- a grant that is wrongly accepted is accepted while the closing thread is still held: wait for it, so that the
+        -- closing thread cannot get ahead of the driver
+        when expectIssued (awaitPoint recorder (GrantIssued 1))
+        releaseHold recorder (Committed "Stop")
+        void (awaitRetired session)
     grantsIssued recorder
 
 grantClosure ∷ Spec
@@ -182,18 +184,20 @@ requestAcrossClosure removedProtections =
       -- the first tick is running its request and the driver, which would pay a stop, is held
       awaitPoint recorder (GrantIssued 1)
       awaitPoint recorder (RequestChecked Gameplay)
-      void (forkIO (requestStop session StopQuit))
-      awaitPoint recorder (Committed "Stop")
-      found ← historyNow session
-      historyStopped found `shouldBe` []
-      releaseHold recorder (RequestChecked Gameplay)
-      pumpUntil world (any ("request " `Text.isPrefixOf`) <$> outLines world)
-      outLines world >>= writeIORef seen . filter ("request " `Text.isPrefixOf`)
-      releaseHold recorder (Committed "Stop")
-      releaseHold recorder (GrantIssued 1)
-      void (awaitRetired session)
+      -- the closing thread is owned by the scenario (#599), and the holds it or the driver can be parked at are let go first
+      withOwnedThreadOpening (releaseAllHeld recorder) (requestStop session StopQuit) $ \_ _ → do
+        awaitPoint recorder (Committed "Stop")
+        found ← historyNow session
+        historyStopped found `shouldBe` []
+        releaseHold recorder (RequestChecked Gameplay)
+        pumpUntil world (any ("request " `Text.isPrefixOf`) <$> outLines world)
+        outLines world >>= writeIORef seen . filter ("request " `Text.isPrefixOf`)
+        releaseHold recorder (Committed "Stop")
+        releaseHold recorder (GrantIssued 1)
+        void (awaitRetired session)
     readIORef seen
   where
+    releaseAllHeld recorder = mapM_ (releaseHold recorder) [GrantIssued 1, RequestChecked Gameplay, Committed "Stop"]
     requesting =
       printScript
         { scInit = []

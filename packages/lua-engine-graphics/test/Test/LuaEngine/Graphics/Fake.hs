@@ -20,6 +20,8 @@ module Test.LuaEngine.Graphics.Fake
   , fakeLedger
   , setBarrier
   , withFakeOwner
+  , withFakeOwnerAs
+  , ownerLoop
 
     -- * Holds
   , Hold (..)
@@ -53,8 +55,6 @@ module Test.LuaEngine.Graphics.Fake
   , ImageState (..)
   ) where
 
-import Control.Concurrent (forkIO, killThread)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM
   ( STM
   , TVar
@@ -80,6 +80,8 @@ import qualified Data.Text as Text
 import Data.Word (Word32)
 import Hetoimasia.LuaEngine.Graphics.Scene.Ledger (SceneLedger, ledgerHeld, newSceneLedger)
 import Hetoimasia.LuaEngine.Graphics.Texture.Port
+import Test.Support.Owned (withOwnedThread)
+import Control.Concurrent (ThreadId)
 
 -- | What the fake owner holds back. A held stage waits until the example releases it.
 data Hold
@@ -569,12 +571,18 @@ deviceFor fake =
 -- The owner's thread -------------------------------------------------------------------------------------------
 
 -- | Run the fake owner for the body: one thread that does what no hold forbids — runs a queued action,
--- starts and completes uploads, binds the table, reclaims released slots — and nothing else.
+-- starts and completes uploads, binds the table, reclaims released slots — and nothing else. The thread is owned by the call
+-- (#599): started and registered for its stop-and-join in one masked step, and ended and joined however the body ended, a
+-- cancellation delivered between the thread's start and the body's first step included. It waits only in STM, so the kill ends
+-- it wherever it is.
 withFakeOwner ∷ Fake → IO a → IO a
-withFakeOwner fake body = do
-  done ← newEmptyMVar
-  thread ← forkIO (ownerLoop fake `finally` putMVar done ())
-  body `finally` (killThread thread >> takeMVar done)
+withFakeOwner = withFakeOwnerAs (\_ → pure ())
+
+-- | 'withFakeOwner' with a test-side seam: the action runs on the calling thread, inside the scope and before the body's first
+-- step, and is given the owner's thread. It lets an example learn the thread and place a cancellation exactly there. No example
+-- of the suite passes anything else.
+withFakeOwnerAs ∷ (ThreadId → IO ()) → Fake → IO a → IO a
+withFakeOwnerAs seam fake body = withOwnedThread (ownerLoop fake) (\thread _ → seam thread >> body)
 
 ownerLoop ∷ Fake → IO ()
 ownerLoop fake = do
