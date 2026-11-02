@@ -892,23 +892,23 @@ testLedgerCancellation = do
   scenes ← newScenes False
   atomically (registerSceneTarget scenes (TargetAdopter identity))
   hooks ← newTVarIO ([] ∷ [String])
-  entered ← newEmptyMVar
+  entered ← newProceedGate
   proceed ← newProceedGate
   let lifecycle =
         SceneLifecycle
           { sceneAdopted = \_ revision _ → do
               atomically (modifyTVar' hooks (<> ["adopted " <> show revision]))
-              void (tryPutMVar entered ())
+              allowOne entered
               awaitProceed proceed
           , sceneReleased = \_ revision → do
               atomically (modifyTVar' hooks (<> ["released " <> show revision]))
-              void (tryPutMVar entered ())
+              allowOne entered
               awaitProceed proceed
           }
       cancelDuring action = do
         finished ← newEmptyMVar
         withOwnedThreadOpening (openProceed proceed) (try @SomeException (void action) >>= putMVar finished) $ \thread _ → do
-          takeMVar entered
+          awaitProceed entered
           -- The cancellation is delivered once the transition ends, never in it: the thrower is blocked until then,
           -- and only then is the hook let go.
           withOwnedThread (throwTo thread (ErrorCall "cancelled")) $ \cancelled _ → do
@@ -925,12 +925,12 @@ testLedgerCancellation = do
   atomically (endSceneTarget scenes (TargetAdopter identity))
   finished ← newEmptyMVar
   withOwnedThreadOpening (openProceed proceed) (try @SomeException (releaseScenes scenes (sceneReleased lifecycle) (\_ _ → pure False)) >>= putMVar finished) $ \thread _ → do
-    takeMVar entered
+    awaitProceed entered
     withOwnedThread (throwTo thread (ErrorCall "cancelled")) $ \cancelled _ → do
       awaitSettled cancelled
       allowOne proceed
       -- The second record's hook runs as well, though the first was cancelled.
-      takeMVar entered
+      awaitProceed entered
       allowOne proceed
       _ ← takeMVar finished
       after ← atomically (readSceneState scenes (pure []))
@@ -1016,17 +1016,17 @@ adoptionCancelled ending scope = do
   identity ← OffscreenTargetId <$> newUnique <*> pure 0
   scenes ← newScenes False
   atomically (registerSceneTarget scenes (TargetAdopter identity))
-  entered ← newEmptyMVar
+  entered ← newProceedGate
   proceed ← newProceedGate
   seenThreads ← newIORef []
   let lifecycle =
         SceneLifecycle
-          { sceneAdopted = \_ _ _ → void (tryPutMVar entered ()) >> awaitProceed proceed
+          { sceneAdopted = \_ _ _ → allowOne entered >> awaitProceed proceed
           , sceneReleased = \_ _ → pure ()
           }
   runEnding ending $ \end →
     scope (openProceed proceed) (void (try @SomeException (adoptScene scenes lifecycle 100 (TargetAdopter identity) (5 ∷ Scene) 3))) $ \adopting _ → do
-      takeMVar entered
+      awaitProceed entered
       scope (pure ()) (throwTo adopting (ErrorCall "cancelled")) $ \thrower _ → do
         awaitSettled thrower
         writeIORef seenThreads [adopting, thrower]

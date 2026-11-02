@@ -13,7 +13,7 @@
 module Test.GPU.Vulkan.GLFW.Scenes (spec) where
 
 import Control.Concurrent (ThreadId, throwTo, yield)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, orElse, readTVar, readTVarIO, registerDelay, stateTVar, writeTVar)
 import Control.Exception (ErrorCall (..), SomeException, throwIO, toException, try)
 import Control.Monad (void, when)
@@ -975,22 +975,22 @@ testLedgerCancellation = do
     scenes ← newScenes False
     atomically (registerSceneTarget scenes (AttachmentAdopter attachment))
     hooks ← newTVarIO ([] ∷ [String])
-    entered ← newEmptyMVar
+    entered ← newProceedGate
     proceed ← newProceedGate
     let lifecycle = SceneLifecycle
           { sceneAdopted = \_ revision _ → do
               atomically (modifyTVar' hooks (<> ["adopted " <> show revision]))
-              void (tryPutMVar entered ())
+              allowOne entered
               awaitProceed proceed
           , sceneReleased = \_ revision → do
               atomically (modifyTVar' hooks (<> ["released " <> show revision]))
-              void (tryPutMVar entered ())
+              allowOne entered
               awaitProceed proceed
           }
         cancelDuring action = do
           finished ← newEmptyMVar
           withOwnedThreadOpening (openProceed proceed) (try @SomeException (void action) >>= putMVar finished) $ \thread _ → do
-            takeMVar entered
+            awaitProceed entered
             -- The cancellation is delivered once the transition ends, never in it: the thrower is blocked until then,
             -- and only then is the hook let go.
             withOwnedThread (throwTo thread (ErrorCall "cancelled")) $ \cancelled _ → do
@@ -1008,12 +1008,12 @@ testLedgerCancellation = do
     atomically (endSceneTarget scenes (AttachmentAdopter attachment))
     finished ← newEmptyMVar
     withOwnedThreadOpening (openProceed proceed) (try @SomeException (releaseScenes scenes (sceneReleased lifecycle) (\_ _ → pure False)) >>= putMVar finished) $ \thread _ → do
-      takeMVar entered
+      awaitProceed entered
       withOwnedThread (throwTo thread (ErrorCall "cancelled")) $ \cancelled _ → do
         awaitSettled cancelled
         allowOne proceed
         -- The second record's hook runs as well, though the first was cancelled.
-        takeMVar entered
+        awaitProceed entered
         allowOne proceed
         _ ← takeMVar finished
         after ← atomically (readSceneState scenes (pure []))
