@@ -66,6 +66,7 @@ module Test.Support.Subprocess
   , defaultBounds
   , Seams (..)
   , SignalTarget (..)
+  , CleanupStep (..)
   , noSeams
     -- * Failures
   , SubprocessFailure (..)
@@ -125,12 +126,13 @@ import Control.Exception
   , uninterruptibleMask_
   )
 import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
-import Control.Exception.Context (addExceptionAnnotation)
+import Control.Exception.Context (addExceptionAnnotation, getExceptionAnnotations)
 import Control.Applicative ((<|>))
 import Control.Monad (forM_, unless, void, when)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
+import Data.List (isInfixOf)
 import Data.Maybe (fromMaybe, isJust, isNothing)
 import qualified Data.Text as Text
 import Data.Text.Encoding (decodeUtf8Lenient)
@@ -151,7 +153,6 @@ import System.Process
   , createProcess_
   , getPid
   , getProcessExitCode
-  , terminateProcess
   , waitForProcess
   )
 import System.Timeout (timeout)
@@ -202,11 +203,39 @@ data Seams = Seams
   , seamDiagnostic ∷ String → IO ()
   -- ^ Where the release writes the cleanup it could not confirm, beside annotating the raised failure with it. A failure of the write
   -- itself is ignored: a diagnostic never replaces the failure being raised.
+  , seamPiped ∷ IO ()
+  -- ^ Run in the masked creation of the pipes, once they exist: what an example raises from to make the creation fail part-way, so that
+  -- its rollback runs.
+  , seamCleaning ∷ CleanupStep → IO ()
+  -- ^ Run where each cleanup step begins, in a state a cancellation can reach: where an example parks that step to deliver a
+  -- cancellation into it while a failure is being unwound.
   , seamSignalled ∷ SignalTarget → Signal → IO ()
   -- ^ Run just before the release sends a signal: what an example reads to say which signals were sent and to what, so that a child
   -- that obeys SIGTERM is shown not to have been sent SIGKILL, and a child that stays in the caller's group is shown to have been
   -- signalled by process identifier only.
   }
+
+-- | The cleanup steps, each a block that releases something while a failure may already be unwinding (the audit in the module header).
+data CleanupStep
+  = -- | Closing the pipes created so far when creating them failed.
+    RollbackPipes
+  | -- | Closing the caller's handles when creating the pipes failed.
+    RollbackHandles
+  | -- | Closing the pipes at the end of the call (uninterruptible: none of them can wait on a peer).
+    ClosePipes
+  | -- | Closing the caller's handles when the call ended before the body was entered.
+    CloseCallerHandles
+  | -- | Signalling the child, waiting out the grace, killing it, confirming its reap.
+    EndChild
+  | -- | Observing that no member of the child's group remains, and ending those that do.
+    ObserveGroup
+  | -- | Closing the piped standard input, which flushes.
+    DisposeStdin
+  | -- | Waiting for the pipes to end.
+    AwaitDrain
+  | -- | Writing the cleanup diagnostics.
+    ReportCleanup
+  deriving (Eq, Show)
 
 -- | What a signal of the release is sent to.
 data SignalTarget = ToProcess | ToGroup
@@ -221,6 +250,8 @@ noSeams =
     , seamWait = \handle bound → timeout (max 0 bound) (waitForProcess handle)
     , seamGroupRemains = probeGroup
     , seamDiagnostic = hPutStrLn stderr
+    , seamPiped = pure ()
+    , seamCleaning = \_ → pure ()
     , seamSignalled = \_ _ → pure ()
     }
 
@@ -350,31 +381,62 @@ withScopedChild = withScopedChildUsing defaultBounds noSeams
 -- ends the body when it expires and fails the call naming the command and the bound.
 withScopedChildUsing ∷ Bounds → Seams → ChildSpec → (Child → IO a) → IO a
 withScopedChildUsing bounds seams spec body =
-  withPipes bounds spec $ \entered pipes →
+  withPipes bounds seams spec $ \entered pipes →
     withReader (pipesOutRead pipes) $ \outReader →
       withReader (pipesErrRead pipes) $ \errReader →
         withProcess bounds seams spec entered pipes outReader errReader body
 
 -- | Create the pipes and own them (and the caller's handles until the body is entered). A step that fails closes what exists.
 --
--- Nothing here can block while uninterruptible. The only close that can wait on the other end of a pipe is a write end holding
--- unflushed bytes: the child's standard input, closed by the release in a bounded, interruptible step ('disposeStdin') before the
--- uninterruptible close below finds it already closed; and a caller's handle, which the facility closes only when the call ends before
--- the body is entered, bounded by the reap bound ('closeCallerHandles'). The other handles closed here are read ends, whose readers
--- were joined first, and the child's ends, which the facility never wrote to.
-withPipes ∷ Bounds → ChildSpec → (IORef Bool → Pipes → IO a) → IO a
-withPipes bounds spec use = mask $ \restore → do
+-- Every release here is outcome-aware ('settle'): the failure that is unwinding (the creation's, or the call's own) is kept, a
+-- cancellation that lands in the release is remembered, the release is run again, and the cancellation is raised afterwards with the
+-- failure and every cleanup diagnostic retained beside it. Nothing here can block while uninterruptible. The only close that can wait
+-- on the other end of a pipe is a write end holding unflushed bytes: the child's standard input, closed by the release in a bounded,
+-- interruptible step ('disposeStdin') before the uninterruptible close below finds it already closed; and a caller's handle, which the
+-- facility closes only when the call ends before the body is entered, bounded by the reap bound ('closeCallerHandles'). The other
+-- handles closed here are read ends, whose readers were joined first, and the child's ends, which the facility never wrote to.
+withPipes ∷ Bounds → Seams → ChildSpec → (IORef Bool → Pipes → IO a) → IO a
+withPipes bounds seams spec use = mask $ \restore → do
   entered ← newIORef False
-  pipes ← createPipes spec `onException` closeCallerHandles bounds spec
-  let cleanup = do
+  problems ← newIORef []
+  created ← newIORef []
+  made ← tryWithContext @SomeException (createPipes seams spec created)
+  case made of
+    Left failure →
+      settle problems (Left failure) $ do
+        seamCleaning seams RollbackPipes
+        readIORef created >>= mapM_ closeQuietly
+        seamCleaning seams RollbackHandles
+        closeCallerHandles bounds problems spec
+    Right pipes → do
+      outcome ← tryWithContext @SomeException (restore (use entered pipes))
+      settle problems outcome $ do
+        seamCleaning seams ClosePipes
         uninterruptibleMask_ (closePipes pipes)
         wasEntered ← readIORef entered
-        unless wasEntered (closeCallerHandles bounds spec)
-  restore (use entered pipes) `finally` cleanup
+        unless wasEntered $ do
+          seamCleaning seams CloseCallerHandles
+          closeCallerHandles bounds problems spec
 
-createPipes ∷ ChildSpec → IO Pipes
-createPipes spec = do
-  created ← newIORef ([] ∷ [Handle])
+-- | Run a cleanup after an outcome, keeping everything: the cleanup runs where a cancellation can reach it, a cancellation that lands
+-- is remembered and the cleanup run again (its steps are idempotent), and what is raised afterwards keeps the primary failure and
+-- every cleanup diagnostic beside it, a cancellation included (the cancellation is what is raised, the failure retained). A cleanup
+-- diagnostic with no failure to sit beside fails an otherwise passing outcome.
+settle ∷ IORef [String] → Either (ExceptionWithContext SomeException) a → IO () → IO a
+settle diagnostics outcome cleanup = do
+  interruption ← rememberingInterruption cleanup
+  problems ← reverse <$> readIORef diagnostics
+  let retained primary = foldl (\acc text → annotate (RetainedFailure "the cleanup was not confirmed" text) acc) primary problems
+  case (outcome, interruption) of
+    (Left failure, Just interrupted) → rethrowIO (retained (retain "the failure of what was being run" failure interrupted))
+    (Right _, Just interrupted) → rethrowIO (retained interrupted)
+    (Left failure, Nothing) → rethrowIO (retained failure)
+    (Right result, Nothing) → do
+      unless (null problems) $ throwIO (SubprocessFailure ("a cleanup was not confirmed: " <> foldr1 (\a b → a <> "; " <> b) problems))
+      pure result
+
+createPipes ∷ Seams → ChildSpec → IORef [Handle] → IO Pipes
+createPipes seams spec created = do
   let remember handles = atomicModifyIORef' created (\known → (handles <> known, ()))
       -- Output is read as bytes and decoded by the reader; standard input is text, written as the library calls wrote it.
       pipeFor binaryReadEnd stream = case stream of
@@ -389,21 +451,19 @@ createPipes spec = do
           when binaryReadEnd (hSetBinaryMode readEnd True)
           pure (Just (readEnd, writeEnd))
         _ → pure Nothing
-  ( do
-      input ← pipeFor False (specStdin spec)
-      output ← pipeFor True (specStdout spec)
-      failures ← pipeFor True (specStderr spec)
-      pure
-        Pipes
-          { pipesOutRead = fst <$> output
-          , pipesErrRead = fst <$> failures
-          , pipesInWrite = snd <$> input
-          , pipesInRead = fst <$> input
-          , pipesOutWrite = snd <$> output
-          , pipesErrWrite = snd <$> failures
-          }
-    )
-    `onException` (readIORef created >>= mapM_ closeQuietly)
+  input ← pipeFor False (specStdin spec)
+  output ← pipeFor True (specStdout spec)
+  failures ← pipeFor True (specStderr spec)
+  seamPiped seams
+  pure
+    Pipes
+      { pipesOutRead = fst <$> output
+      , pipesErrRead = fst <$> failures
+      , pipesInWrite = snd <$> input
+      , pipesInRead = fst <$> input
+      , pipesOutWrite = snd <$> output
+      , pipesErrWrite = snd <$> failures
+      }
 
 closePipes ∷ Pipes → IO ()
 closePipes pipes =
@@ -415,19 +475,17 @@ closePipes pipes =
     )
 
 -- | Close the handles the caller opened, each within the reap bound. A close interrupted by the bound or by a cancellation still closes
--- the descriptor (the handle's own close does that even when its flush is interrupted), discarding what could not be flushed. A
--- cancellation that arrives is remembered, the other handles are closed, and it is raised after them.
-closeCallerHandles ∷ Bounds → ChildSpec → IO ()
-closeCallerHandles bounds spec = do
-  remembered ← newIORef Nothing
+-- the descriptor (the handle's own close does that even when its flush is interrupted), discarding what could not be flushed; the
+-- bound passing is a cleanup diagnostic. A cancellation propagates to the caller of this function, which ('settle') remembers it, runs
+-- this again for the handles not yet closed, and raises it afterwards.
+closeCallerHandles ∷ Bounds → IORef [String] → ChildSpec → IO ()
+closeCallerHandles bounds diagnostics spec =
   forM_ [specStdin spec, specStdout spec, specStderr spec] $ \case
-    CallerHandle handle →
-      tryWithContext @SomeException (timeout (max 0 (boundReap bounds)) (hClose handle)) >>= \case
-        Left interruption@(ExceptionWithContext _ failure)
-          | isJust (fromException failure ∷ Maybe SomeAsyncException) → atomicModifyIORef' remembered (\known → (Just (fromMaybe interruption known), ()))
-        _ → pure ()
+    CallerHandle handle → do
+      closed ← timeout (max 0 (boundReap bounds)) (try (hClose handle) ∷ IO (Either IOException ()))
+      when (isNothing closed) $
+        atomicModifyIORef' diagnostics (\known → (known <> ["a handle the caller opened could not be flushed and closed within " <> describeBound (Within (boundReap bounds)) <> ": its peer is not reading it, so what it still buffered was discarded" | not (any (isInfixOf "handle the caller opened") known)], ()))
     _ → pure ()
-  readIORef remembered >>= mapM_ rethrowIO
 
 closeQuietly ∷ Handle → IO ()
 closeQuietly handle = void (try (hClose handle) ∷ IO (Either IOException ()))
@@ -522,10 +580,8 @@ spawn spec pipes = do
         }
   getPid handle >>= \case
     Just pid → pure (handle, pid)
-    Nothing → do
-      terminateProcess handle
-      void (waitForProcess handle)
-      ioError (userError ("the child " <> describeCommand (specProcess spec) <> " had been reaped before its identifier was read"))
+    -- A process the library no longer knows by identifier has already been reaped: there is nothing left to end.
+    Nothing → ioError (userError ("the child " <> describeCommand (specProcess spec) <> " had been reaped before its identifier was read"))
 
 -- | The same directory spelled so that the @process@ library can start a child there. On a platform without @execvpe@ (macOS), a child
 -- that is given an environment, a process group of its own and the working directory @\"/\"@ spelled exactly so fails in the library
@@ -550,6 +606,7 @@ conclude env outcome = do
         readIORef remaining >>= \case
           [] → pure ()
           text : rest → do
+            seamCleaning (envSeams env) ReportCleanup
             void
               ( timeout
                   (max 0 (boundReap (envBounds env)))
@@ -563,7 +620,16 @@ conclude env outcome = do
       retainProblems primary = foldl (\acc text → annotate (RetainedFailure "the cleanup was not confirmed" text) acc) primary problems
   case (interruption, outcome) of
     (Just interrupted, Left failure) → rethrowIO (retainProblems (retain "the failure of what was being run" failure interrupted))
-    (Just interrupted, Right _) → rethrowIO (retainProblems interrupted)
+    -- The run bound that passed is a failure of the call too: a cancellation raised in its place keeps it beside itself.
+    (Just interrupted, Right Nothing) →
+      rethrowIO
+        ( retainProblems
+            ( annotate
+                (RetainedFailure "the run bound" (command <> " did not finish within its run bound of " <> describeBound (specBound (envSpec env)) <> "; it was ended"))
+                interrupted
+            )
+        )
+    (Just interrupted, Right (Just _)) → rethrowIO (retainProblems interrupted)
     (Nothing, Left failure) → rethrowIO (retainProblems failure)
     (Nothing, Right Nothing) →
       throwIO
@@ -585,8 +651,11 @@ conclude env outcome = do
 annotate ∷ RetainedFailure → ExceptionWithContext SomeException → ExceptionWithContext SomeException
 annotate retained (ExceptionWithContext context failure) = ExceptionWithContext (addExceptionAnnotation retained context) failure
 
+-- | The failure that was unwinding, kept beside the exception that replaces it: its own text under the label, and every failure it
+-- was already retaining (a cleanup the facility could not confirm), so that raising a cancellation instead loses none of them.
 retain ∷ String → ExceptionWithContext SomeException → ExceptionWithContext SomeException → ExceptionWithContext SomeException
-retain label (ExceptionWithContext _ inner) = annotate (RetainedFailure label (displayException inner))
+retain label (ExceptionWithContext context inner) replacement =
+  foldl (flip annotate) (annotate (RetainedFailure label (displayException inner)) replacement) (getExceptionAnnotations context)
 
 -- | End the child, observe the group, wait for the pipes; answer what could not be confirmed and the first cancellation that
 -- interrupted the waits (the steps are run again until they complete).
@@ -620,7 +689,7 @@ once flag act = do
 
 -- | End the child: SIGTERM, wait out the grace, SIGKILL, confirm the reap; and for a child in a group of its own, the group.
 endChild ∷ Env → IO ()
-endChild env = case specPlacement (envSpec env) of
+endChild env = seamCleaning (envSeams env) EndChild >> case specPlacement (envSpec env) of
   OwnGroup → endGroup env
   CallersGroup → endPid env
 
@@ -685,6 +754,7 @@ endGroup env = do
       unless confirmed $ noteProblem env ("the child was not reaped within " <> describeBound (Within (boundReap bounds)) <> " of SIGKILL")
   confirmedReaped ← readIORef (envLeaderReaped env)
   when confirmedReaped $ do
+    seamCleaning (envSeams env) ObserveGroup
     stillThere ← remains pid
     when stillThere $ do
       killed ← readIORef (envKillSent env)
@@ -741,6 +811,7 @@ groupGone remains pgid microseconds = do
 -- that), and the bound passing is a cleanup that was not confirmed, said beside whatever else the call raises.
 disposeStdin ∷ Env → IO ()
 disposeStdin env = forM_ (childStdin (envChild env)) $ \handle → do
+  seamCleaning (envSeams env) DisposeStdin
   let bound = boundReap (envBounds env)
   closed ← timeout (max 0 bound) (try (hClose handle) ∷ IO (Either IOException ()))
   when (isNothing closed) $
@@ -750,6 +821,7 @@ disposeStdin env = forM_ (childStdin (envChild env)) $ \handle → do
 -- given its own account of the drain ('awaitDrain') is not failed for it again.
 drainForRelease ∷ Env → IO ()
 drainForRelease env = do
+  seamCleaning (envSeams env) AwaitDrain
   accounted ← readIORef (childDrainAccounted (envChild env))
   unless accounted $ do
     result ← awaitDrain (envChild env)

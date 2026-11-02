@@ -20,6 +20,7 @@
 module OwnedSubprocess (spec, ownerMain, ownerVariable) where
 
 import Control.Concurrent (myThreadId, threadDelay, throwTo, yield)
+import GHC.Conc (ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, tryPutMVar)
 import Control.Exception
   ( AsyncException (UserInterrupt)
@@ -919,6 +920,104 @@ spec = describe "the shared subprocess facility (Test.Support.Subprocess)" $ do
           atomicModifyIORef' known (\old → (child : old, ()))
           goneAndReaped child >>= (`shouldBe` False))
         `finally` (readIORef known >>= \pids → forM_ pids (\pid → void (try (signalProcessGroup sigKILL pid) ∷ IO (Either IOException ()))) >> rescue pids)
+
+  -- The audit of every cleanup block in the facility (the table in the pull request): each is cancelled, with a failure already
+  -- unwinding and a cleanup diagnostic already recorded where the block has one, and the cancellation that is raised must keep both.
+  describe "every cleanup step, cancelled while a failure is unwinding" $ do
+    let lied = noSeams {seamPoll = \_ → pure Nothing, seamWait = \_ _ → pure Nothing}
+        unwinding seen seams = seams {seamSpawned = \handle → writeIORef seen (Just handle)}
+        finish seen = readIORef seen >>= mapM_ (\handle → void (timeout (30 * 1000000) (waitForProcess handle)))
+        survives outcome = do
+          outcome `shouldSatisfy` cancellation
+          outcome `shouldSatisfy` retainsBodyFailure
+        -- Park the release at the step, cancel it there, and require the cancellation to carry the body's failure (and, where the
+        -- example made the reap unconfirmed, that too).
+        childRow label step reaped seams spec' =
+          it label $ do
+            seen ← newIORef Nothing
+            outcome ←
+              parkedRelease defaultParkBounds $ \park →
+                withScopedChildUsing quick {boundReap = 100000} (unwinding seen seams) {seamCleaning = \reached → when (reached == step) park} spec' (\child → awaitReady child >> boom)
+            survives outcome
+            when reaped (outcome `shouldSatisfy` either retainsUnconfirmedReap (const False))
+            finish seen
+    childRow "ending the child (signals, grace, kill, reap) keeps the body's failure and the unconfirmed reap" EndChild True lied (childSpec hangCatcher (shell obedientAlone []))
+    childRow "observing the child's group keeps the body's failure" ObserveGroup False noSeams (childSpec hangCatcher (shell obedientAlone []))
+    childRow "closing the piped standard input keeps the body's failure and the unconfirmed reap" DisposeStdin True lied (childSpec hangCatcher (shell obedientAlone [])) {specStdin = Piped}
+    childRow "waiting for the pipes to end keeps the body's failure and the unconfirmed reap" AwaitDrain True lied (childSpec hangCatcher (shell obedientAlone []))
+    childRow "writing the cleanup diagnostics keeps the body's failure and the unconfirmed reap" ReportCleanup True lied (childSpec hangCatcher (shell obedientAlone []))
+    childRow "closing the pipes at the end of the call keeps the body's failure" ClosePipes False noSeams (childSpec hangCatcher (shell obedientAlone [])) {specStdin = Piped}
+
+    it "rolling back the pipes when creating them failed keeps the creation's failure" $ do
+      outcome ←
+        parkedRelease defaultParkBounds $ \park →
+          withScopedChildUsing quick noSeams {seamPiped = boom, seamCleaning = \reached → when (reached == RollbackPipes) park} (childSpec hangCatcher (shell "exit 0" [])) {specStdin = Piped} (\_ → pure ())
+      survives outcome
+
+    it "closing the caller's handles when creating the pipes failed keeps the creation's failure, and closes them" $
+      withTemp $ \directory → do
+        handle ← openFile (directory </> "log") WriteMode
+        outcome ←
+          parkedRelease defaultParkBounds $ \park →
+            withScopedChildUsing quick noSeams {seamPiped = boom, seamCleaning = \reached → when (reached == RollbackHandles) park} (childSpec hangCatcher (shell "exit 0" [])) {specStdout = CallerHandle handle} (\_ → pure ())
+        survives outcome
+        hIsOpen handle >>= (`shouldBe` False)
+
+    it "closing the caller's handles when the call ended before the body keeps the acquisition's failure and the unconfirmed reap, and closes them" $
+      withTemp $ \directory → do
+        handle ← openFile (directory </> "log") WriteMode
+        seen ← newIORef Nothing
+        outcome ←
+          parkedRelease defaultParkBounds $ \park →
+            withScopedChildUsing
+              quick {boundReap = 100000}
+              (unwinding seen lied) {seamSpawned = \spawned → writeIORef seen (Just spawned) >> boom, seamCleaning = \reached → when (reached == CloseCallerHandles) park}
+              (childSpec hangCatcher (shell obedientAlone [])) {specStdout = CallerHandle handle}
+              (\_ → pure ())
+        survives outcome
+        outcome `shouldSatisfy` either retainsUnconfirmedReap (const False)
+        hIsOpen handle >>= (`shouldBe` False)
+        finish seen
+
+    it "a run bound that passed is kept beside a cancellation that lands in the cleanup" $ do
+      seen ← newIORef Nothing
+      outcome ←
+        parkedRelease defaultParkBounds $ \park →
+          withScopedChildUsing
+            quick {boundReap = 100000}
+            (unwinding seen lied) {seamCleaning = \reached → when (reached == DisposeStdin) park}
+            (childSpec (Within 300000) (shell obedientAlone [])) {specStdin = Piped}
+            (\child → awaitReady child >> holdUntilEnded)
+      outcome `shouldSatisfy` cancellation
+      outcome `shouldSatisfy` either retainsUnconfirmedReap (const False)
+      outcome `shouldSatisfy` \case
+        Left (ExceptionWithContext context _) -> any (\(RetainedFailure label text) -> label == "the run bound" && "run bound of" `isInfixOf` text) (getExceptionAnnotations context)
+        Right () -> False
+      finish seen
+
+    it "a cancellation delivered while a caller's handle cannot be flushed keeps the acquisition's failure and the unconfirmed reap, and closes the handle" $ do
+      (reading, writing) ← createPipe
+      void (timeout 300000 (hPutStr writing (replicate 1000000 'y')))
+      seen ← newIORef Nothing
+      reached ← newEmptyMVar
+      caller ← myThreadId
+      let seams = (unwinding seen lied) {seamSpawned = \spawned → writeIORef seen (Just spawned) >> boom, seamCleaning = \step → when (step == CloseCallerHandles) (void (tryPutMVar reached ()))}
+          awaitBlocked =
+            threadStatus caller >>= \case
+              ThreadBlocked _ → pure ()
+              ThreadFinished → expectationFailure "the call ended before it was cancelled"
+              ThreadDied → expectationFailure "the call died before it was cancelled"
+              _ → yield >> awaitBlocked
+      outcome ←
+        bounded . tryWithContext @SomeException $
+          withOwnedThread (readMVar reached >> awaitBlocked >> throwTo caller UserInterrupt) $ \_ _ →
+            withScopedChildUsing quick {boundReap = 10 * 1000000} seams (childSpec hangCatcher (shell obedientAlone [])) {specStdout = CallerHandle writing} (\_ → pure ())
+      hClose reading
+      outcome `shouldSatisfy` cancellation
+      outcome `shouldSatisfy` retainsBodyFailure
+      outcome `shouldSatisfy` either retainsUnconfirmedReap (const False)
+      hIsOpen writing >>= (`shouldBe` False)
+      finish seen
 
   describe "its definition" $
     it "polls in one place only, the observation that a process group is gone, and sleeps nowhere else" $ do
