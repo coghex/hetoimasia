@@ -28,7 +28,7 @@ import Control.Exception
   , tryWithContext
   , uninterruptibleMask_
   )
-import Control.Monad (unless, void, when)
+import Control.Monad (replicateM_, unless, void, when)
 import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf)
@@ -95,6 +95,11 @@ failureText (ExceptionWithContext _ failure) = show failure
 run ∷ Fake → Owner → IO () → IO a → IO a
 run _ owner stopSession session =
   withLoggingLifetime silentLogger $ \lifetime → serveSpawned lifetime owner (\_ → pure ()) stopSession quiet session
+
+-- | The end of a session that takes many scheduling steps (a count of yields, never a duration), so that a caller that did not
+-- join it would return long before it ended.
+slowly ∷ IO ()
+slowly = replicateM_ 2000 yield
 
 -- | Join the production session a caller started, if it started one, without being interruptible. The session is a thread of
 -- the production scope, not the example's: when a caller is ended inside the queued callback the loop's failure handling,
@@ -185,7 +190,7 @@ spec = describe "Serve" $ do
     sessionEnded ← newEmptyMVar
     let stop = atomically (writeTVar stopped True)
         -- A session that ends only when it is told to stop.
-        session = atomically (readTVar stopped >>= check) `finally` void (tryPutMVar sessionEnded ())
+        session = atomically (readTVar stopped >>= check) `finally` (slowly >> void (tryPutMVar sessionEnded ()))
         -- Run masked, after the session exists and before the loop is entered: the cancellation is queued against
         -- this thread (its sender blocked until it can be received), so it can only land when asynchronous
         -- exceptions are first enabled.
@@ -235,7 +240,7 @@ spec = describe "Serve" $ do
     let stop = atomicModifyIORef' stops (\n → (n + 1, ()))
         owner = ownerWith fake (Just "the owner loop failed") (ioError (userError "the drain failed too"))
         -- Unsettled when the loop is given up on, and ended only by the application's teardown.
-        session = (atomically (readTVar (fakeExited fake) >>= check) >> ioError (userError "session settled against the exit")) `finally` void (tryPutMVar sessionEnded ())
+        session = (atomically (readTVar (fakeExited fake) >>= check) >> ioError (userError "session settled against the exit")) `finally` (slowly >> void (tryPutMVar sessionEnded ()))
         application =
           withLoggingLifetime silentLogger (\lifetime → serveSpawned lifetime owner (\spawned → writeIORef slot (Just spawned) >> void (tryPutMVar reached ())) stop quiet session)
             `catch` \failure → mask_ $ do
@@ -454,7 +459,7 @@ callerBeforeArmed ending cleanups scope = do
   reached ← newEmptyMVar
   seen ← newIORef []
   let stop = atomically (writeTVar stopped True)
-      session = atomically (readTVar stopped >>= check) `finally` void (tryPutMVar sessionEnded ())
+      session = atomically (readTVar stopped >>= check) `finally` (slowly >> void (tryPutMVar sessionEnded ()))
       queued _ = do
         -- The session has been started: the callback runs after it, and the caller is parked at the take below.
         putMVar reached ()
