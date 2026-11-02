@@ -565,6 +565,24 @@ spec = describe "the shared subprocess facility (Test.Support.Subprocess)" $ do
             mapM awaitGone pids >>= (`shouldBe` [True, True])
           [] → expectationFailure "the body never ran"
 
+    it "fails an otherwise passing call and says the pipes did not end when a holder outside the group keeps them open" $ do
+      -- A holder that left the child's session (and so its process group) keeps the output open after the child is gone and its
+      -- group is ended: no group signal reaches it, so the pipes cannot end.
+      held ← newIORef []
+      (do
+          outcome ←
+            try @SubprocessFailure $
+              withScopedChildUsing quick {boundDrain = 300000} noSeams (childSpec hangCatcher (shell "perl -MPOSIX -e 'POSIX::setsid(); $| = 1; print \"ready $$\\n\"; sleep 300' &\nwhile :; do :; done" [])) $ \child → do
+                line ← nextLine child Stdout (30 * 1000000)
+                case line of
+                  Line text → atomicModifyIORef' held (\old → (readPid text : old, ()))
+                  other → expectationFailure ("the holder did not say it was ready: " <> show other)
+          case outcome of
+            Left (SubprocessFailure message) → message `shouldContain` "pipes did not end"
+            Right () → expectationFailure "pipes held open outside the group passed"
+          readIORef held >>= mapM goneAndReaped >>= (`shouldBe` [False]))
+        `finally` (readIORef held >>= rescue)
+
     it "raises the body's own failure, not the unconfirmed cleanup, when the body failed" $ do
       let seams = noSeams {seamPoll = \_ → pure Nothing, seamWait = \_ _ → pure Nothing}
       seen ← newIORef Nothing
