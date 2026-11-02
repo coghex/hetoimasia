@@ -24,7 +24,6 @@ import Control.Exception
   , displayException
   , fromException
   , throwIO
-  , try
   , tryWithContext
   )
 import Control.Monad (forM, join, replicateM, unless, void, when)
@@ -68,7 +67,6 @@ import Hetoimasia.GLFW.Internal.Seam
   , WindowEvent (CharEventAt, CloseRequested, FocusChanged)
   , asProcessMainThread
   , defaultScript
-  , designateProcessMainThread
   , AdmissionHooks (..)
   , newSeam
   , noAdmissionHooks
@@ -137,9 +135,11 @@ import Test.GLFW.Support
   , unexpected
   , withDeferredThread
   , withDeferredThreadOpening
+  , withMainThread
+  , withMainThreadKeepingContext
   )
 import Test.Hspec (Expectation, Spec, describe, it, shouldBe, shouldReturn, shouldSatisfy)
-import Test.Support.Owned (withOwnedBoundThread, withOwnedBoundThreadOpening, withOwnedThread, withOwnedThreadOpening)
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = describe "GLFW window host" $ do
@@ -1782,15 +1782,6 @@ hostedFailure logger seam config startup action = do
       runWindowApplication (withLoggingLifetime logger) "host-example" (hostOver seam config) id startup action
   either pure (\_ → unexpected "the run returned instead of failing") outcome
 
--- | 'withMainThread' keeping the context of whatever the run raised, for the same reason.
-withMainThreadKeepingContext
-  ∷ ∀ a r. Seam → IO a → (ThreadId → MVar (Either (ExceptionWithContext SomeException) a) → IO r) → IO r
-withMainThreadKeepingContext seam action body = do
-  finished ← newEmptyMVar
-  withOwnedBoundThread
-    (designateProcessMainThread seam >> tryWithContext action >>= putMVar finished)
-    (\runner _ → body runner finished)
-
 -- | Whether a native call released something the wake report must not have
 -- outlived: the host's window, or the session itself.
 releasing ∷ NativeCall → Bool
@@ -1898,7 +1889,7 @@ testWakeWarningCancelledAtItsSink = do
   never ← newEmptyMVar
   let holding =
         failingSink defaultLogFilter "glfw.wake" (\_ → putMVar reached () >> takeMVar never) trace
-  withMainThreadKeepingContext seam
+  withMainThreadKeepingContext seam (pure ())
     ( runWindowApplication
         (withLoggingLifetime holding)
         "host-example"
@@ -1989,19 +1980,6 @@ warningComponents entries = map (componentText . entryComponent) <$> readIORef e
 -- whatever else a failing run's terminal report writes through the same logger.
 wakeWarnings ∷ IORef [LogEntry] → IO [Text]
 wakeWarnings entries = filter (== "glfw.wake") <$> warningComponents entries
-
--- | Run an action on an owned bound thread designated as the process main thread, so an example can cancel it (#593). The body
--- is given the thread and the cell its outcome is put into, and waits for it itself; however the body ends, the thread has
--- ended and been joined before this returns. The designation is this helper's own and happens on the bound thread before the
--- action. The first argument opens whatever the run may be held at, in the uninterruptible release and before the thread is
--- killed (a run held at a gate only the example opens would otherwise hold the join).
-withMainThread ∷ ∀ a r. Seam → IO () → IO a → (ThreadId → MVar (Either SomeException a) → IO r) → IO r
-withMainThread seam open action body = do
-  finished ← newEmptyMVar
-  withOwnedBoundThreadOpening
-    open
-    (designateProcessMainThread seam >> (try action ∷ IO (Either SomeException a)) >>= putMVar finished)
-    (\runner _ → body runner finished)
 
 settings ∷ [WindowConfig] → HostConfig
 settings windows =

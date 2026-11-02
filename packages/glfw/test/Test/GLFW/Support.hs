@@ -22,6 +22,8 @@ module Test.GLFW.Support
   , onBoundThread
   , withDeferredThread
   , withDeferredThreadOpening
+  , withMainThread
+  , withMainThreadKeepingContext
   , caughtAs
   , unexpected
   , originOf
@@ -61,7 +63,7 @@ module Test.GLFW.Support
   ) where
 
 import Control.Concurrent (ThreadId)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar, tryPutMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, tryPutMVar)
 import Control.Concurrent.STM (atomically)
 import Control.Exception
   ( Exception
@@ -72,6 +74,7 @@ import Control.Exception
   , fromException
   , throwIO
   , try
+  , tryWithContext
   )
 import Control.Exception.Annotation (ExceptionAnnotation (displayExceptionAnnotation))
 import Control.Exception.Context (ExceptionContext, getExceptionAnnotations)
@@ -114,7 +117,7 @@ import Hetoimasia.Foundation.Time
   , scriptedInstant
   , scriptedSource
   )
-import Hetoimasia.GLFW.Internal.Seam (NativeCall (..), Seam, asProcessMainThread, seamCalls, seamSession)
+import Hetoimasia.GLFW.Internal.Seam (NativeCall (..), Seam, asProcessMainThread, designateProcessMainThread, seamCalls, seamSession)
 import Hetoimasia.GLFW.Session (Session, defaultSessionConfig)
 import Hetoimasia.GLFW.Window
   ( Window
@@ -135,7 +138,7 @@ import Hetoimasia.Runtime.Reporting (DiagnosticFailure, raisedByDiagnostic)
 import Hetoimasia.Runtime.Supervision (RuntimeControl)
 import System.Timeout (timeout)
 import Test.Hspec (Expectation, expectationFailure)
-import Test.Support.Owned (withOwnedBoundThread, withOwnedThread, withOwnedThreadOpening)
+import Test.Support.Owned (withOwnedBoundThreadOpening, withOwnedThread, withOwnedThreadOpening)
 
 -- ---------------------------------------------------------------------------
 -- Sessions and windows
@@ -160,7 +163,7 @@ onThread = onOwnedThread withOwnedThread
 
 -- | 'onThread' on an OS-bound thread, for an example that asserts what a bound caller may or may not do.
 onBoundThread ∷ IO a → IO a
-onBoundThread = onOwnedThread withOwnedBoundThread
+onBoundThread = onOwnedThread (withOwnedBoundThreadOpening (pure ()))
 
 onOwnedThread ∷ (IO () → (ThreadId → IO () → IO a) → IO a) → IO a → IO a
 onOwnedThread scope action = do
@@ -168,6 +171,31 @@ onOwnedThread scope action = do
   scope (try action >>= putMVar finished) $ \_ _ → do
     outcome ← takeMVar finished
     either (throwIO ∷ SomeException → IO a) pure outcome
+
+-- | Run an action on an owned bound thread designated as the process main thread, so an example can cancel it (#593). The body is
+-- given the thread and the cell its outcome is put into, and waits for it itself; however the body ends, the thread has ended
+-- and been joined before this returns. The designation is this helper's own (the generic bound start designates nothing) and
+-- happens on the bound thread before the action. The first argument opens whatever the run may be held at, in the
+-- uninterruptible release and before the thread is killed: a run held at a gate only the example opens, or draining for
+-- evidence only the example supplies, would otherwise hold the join for ever when the example failed first. It must not block.
+withMainThread ∷ ∀ a r. Seam → IO () → IO a → (ThreadId → MVar (Either SomeException a) → IO r) → IO r
+withMainThread seam open action body = do
+  finished ← newEmptyMVar
+  withOwnedBoundThreadOpening
+    open
+    (designateProcessMainThread seam >> (try action ∷ IO (Either SomeException a)) >>= putMVar finished)
+    (\runner _ → body runner finished)
+
+-- | 'withMainThread' keeping the context of whatever the run raised, for an example whose assertions are about the evidence the
+-- exception carries.
+withMainThreadKeepingContext
+  ∷ ∀ a r. Seam → IO () → IO a → (ThreadId → MVar (Either (ExceptionWithContext SomeException) a) → IO r) → IO r
+withMainThreadKeepingContext seam open action body = do
+  finished ← newEmptyMVar
+  withOwnedBoundThreadOpening
+    open
+    (designateProcessMainThread seam >> tryWithContext action >>= putMVar finished)
+    (\runner _ → body runner finished)
 
 -- | An owned thread that does its one piece of work only once it is handed what the work acts on: the scope starts the thread
 -- and gives the body the thread and the handing-over. For an injector whose target is known only inside a callback (a hook
