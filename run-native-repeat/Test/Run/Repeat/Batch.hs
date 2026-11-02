@@ -26,6 +26,7 @@ module Test.Run.Repeat.Batch
   , runBatch
   , continues
   , runPreparation
+  , runCaptured
   , judge
   , tally
   , ownedProcesses
@@ -41,7 +42,8 @@ import GHC.Clock (getMonotonicTime)
 import System.Directory (doesFileExist)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
-import System.IO (Handle, IOMode (WriteMode), openBinaryFile)
+import System.IO.Temp (withSystemTempFile)
+import System.IO (Handle, IOMode (WriteMode), hClose, openBinaryFile)
 import System.Posix.Signals (Signal, nullSignal, sigKILL, sigTERM, signalProcess)
 import System.Posix.Types (CPid)
 import System.Process
@@ -51,7 +53,6 @@ import System.Process
   , createProcess
   , getPid
   , proc
-  , readCreateProcessWithExitCode
   , waitForProcess
   )
 import System.Timeout (timeout)
@@ -130,6 +131,10 @@ judge expected status out err
     summary (n : "examples," : f : "failures," : _) = (,) <$> readMaybe n <*> readMaybe f
     summary _ = Nothing
 
+-- | What 'runOwned' owns besides the command's root: the whole tree and process group under it, or the root alone (for a
+-- leaf such as @ps@, which starts nothing, and which 'ownedProcesses' itself runs).
+data Scope = WholeTree | RootOnly
+
 -- | How a command run by 'runOwned' ended: its root's status, 'Nothing' when it had to be stopped, whether everything it
 -- started is gone, and how many processes were still alive in its group after the root had ended on its own.
 data Ended = Ended {endedStatus ∷ Maybe ExitCode, endedReclaimed ∷ Bool, endedOrphans ∷ Int}
@@ -138,8 +143,8 @@ data Ended = Ended {endedStatus ∷ Maybe ExitCode, endedReclaimed ∷ Bool, end
 -- closes in this process once the child holds them). When the bound passes, the owned processes are handed to
 -- @atBound@, one at a time (to be sampled), before they are stopped; its answers are returned. A cancellation anywhere stops the owned
 -- processes before it propagates.
-runOwned ∷ [String] → FilePath → Handle → Handle → Int → Int → (CPid → IO a) → IO (Ended, [a])
-runOwned command directory handleOut handleErr boundSeconds graceSeconds atBound = do
+runOwned ∷ Scope → [String] → FilePath → Handle → Handle → Int → Int → (CPid → IO a) → IO (Ended, [a])
+runOwned scope command directory handleOut handleErr boundSeconds graceSeconds atBound = do
   (program, arguments) ← case command of
     [] → ioError (userError "a command is needed")
     first : rest → pure (first, rest)
@@ -154,19 +159,23 @@ runOwned command directory handleOut handleErr boundSeconds graceSeconds atBound
           , create_group = True
           }
     root ← getPid handle >>= maybe (ioError (userError "the command ended before its pid was read")) pure
-    let stop = stopOwned graceSeconds root handle
+    let stop = stopOwned scope graceSeconds root handle
     outcome ← restore (timeout (boundSeconds * 1_000_000) (waitForProcess handle)) `onException` stop
     case outcome of
       Just code → do
         -- The root ended on its own. Whatever it left in its group is still this command's.
-        left ← filter (/= root) <$> ownedProcesses root
+        left ← filter (/= root) <$> ownedIn scope root
         reclaimed ← if null left then pure True else stop
         pure (Ended (Just code) reclaimed (length left), [])
       Nothing → do
-        pids ← (<> [root]) <$> ownedProcesses root
+        pids ← (<> [root]) <$> ownedIn scope root
         answers ← restore (forM pids atBound) `onException` stop
         reclaimed ← stop
         pure (Ended Nothing reclaimed 0, answers)
+
+ownedIn ∷ Scope → CPid → IO [CPid]
+ownedIn WholeTree root = ownedProcesses root
+ownedIn RootOnly _ = pure []
 
 -- | Run one trial, writing @run-NNN.out@, @run-NNN.err@ and the samples under the directory, and answer its outcome.
 runTrial ∷ Trial → FilePath → Int → IO Outcome
@@ -178,7 +187,7 @@ runTrial trial directory index = do
   handleOut ← openBinaryFile outFile WriteMode
   handleErr ← openBinaryFile errFile WriteMode
   (ended, sampled) ←
-    runOwned (trialCommand trial) (trialDirectory trial) handleOut handleErr (trialBoundSeconds trial) (trialStopGraceSeconds trial) (takeSample trial stem)
+    runOwned WholeTree (trialCommand trial) (trialDirectory trial) handleOut handleErr (trialBoundSeconds trial) (trialStopGraceSeconds trial) (takeSample trial stem)
   finished ← getMonotonicTime
   out ← readFileOrEmpty outFile
   err ← readFileOrEmpty errFile
@@ -202,7 +211,7 @@ runTrial trial directory index = do
 runPreparation ∷ [String] → FilePath → FilePath → Int → Int → IO (Maybe ExitCode)
 runPreparation command directory outFile boundSeconds graceSeconds = do
   handleOut ← openBinaryFile outFile WriteMode
-  (ended, _) ← runOwned command directory handleOut handleOut boundSeconds graceSeconds (const (pure ()))
+  (ended, _) ← runOwned WholeTree command directory handleOut handleOut boundSeconds graceSeconds (const (pure ()))
   pure (endedStatus ended)
 
 readFileOrEmpty ∷ FilePath → IO String
@@ -227,7 +236,7 @@ takeSample trial stem pid = do
       handleErr ← openBinaryFile (file <> ".err") WriteMode
       attempt ←
         try @SomeException $
-          runOwned command (trialDirectory trial) handleOut handleErr (trialSampleBoundSeconds trial) (trialStopGraceSeconds trial) (const (pure ()))
+          runOwned WholeTree command (trialDirectory trial) handleOut handleErr (trialSampleBoundSeconds trial) (trialStopGraceSeconds trial) (const (pure ()))
       pure . pure $ case attempt of
         Left failure → (show pid <> ": sampling failed: " <> show failure, False)
         Right (ended, _) → case endedStatus ended of
@@ -235,12 +244,22 @@ takeSample trial stem pid = do
           Just ExitSuccess → (show pid <> ": " <> file, endedReclaimed ended)
           Just code → (show pid <> ": sampling exited " <> show code <> " (see " <> file <> ".err)", endedReclaimed ended)
 
+-- | Run a leaf command (one that starts nothing) under a bound through 'runOwned', and answer how it ended and what it wrote
+-- to standard output (standard error goes to the same place). Nothing is read back through a pipe.
+runCaptured ∷ [String] → FilePath → Int → IO (Maybe ExitCode, String)
+runCaptured command directory boundSeconds =
+  withSystemTempFile "captured" $ \path handle → do
+    (ended, _) ← runOwned RootOnly command directory handle handle boundSeconds 5 (const (pure ()))
+    hClose handle
+    output ← readFileOrEmpty path
+    pure (endedStatus ended, output)
+
 -- | The pids a root owns: everything below it by parentage, and everything in its process group (the root started the
 -- group, so a process that outlived its parent is still found). Children before their parents, no pid twice, the root
 -- itself not included.
 ownedProcesses ∷ CPid → IO [CPid]
 ownedProcesses root = do
-  (_, table, _) ← readCreateProcessWithExitCode (proc "ps" ["-axo", "pid=,ppid=,pgid="]) ""
+  (_, table) ← runCaptured ["ps", "-axo", "pid=,ppid=,pgid="] "/" 30
   let rows = [(pid, up, group) | line ← lines table, [a, b, c] ← [words line], Just pid ← [readMaybe a], Just up ← [readMaybe b], Just group ← [readMaybe c]]
       below parent = concat [below child <> [child] | (child, up, _) ← rows, up == parent]
       grouped = [pid | (pid, _, group) ← rows, group == root]
@@ -253,9 +272,9 @@ isAlive pid = either (const False) (const True) <$> try @SomeException (signalPr
 -- each that is alive; the root is reaped within the grace and the rest are polled (they are not this process's children,
 -- so there is nothing to wait on) for the same grace; KILL then goes to whatever is still alive. Answers whether all of
 -- them are gone.
-stopOwned ∷ Int → CPid → ProcessHandle → IO Bool
-stopOwned grace root handle = do
-  below ← ownedProcesses root
+stopOwned ∷ Scope → Int → CPid → ProcessHandle → IO Bool
+stopOwned scope grace root handle = do
+  below ← ownedIn scope root
   let owned = below <> [root]
   signalAll sigTERM owned
   _ ← timeout (grace * 1_000_000) (waitForProcess handle)

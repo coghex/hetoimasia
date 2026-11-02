@@ -39,7 +39,6 @@ import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
 import System.IO.Temp (createTempDirectory, getCanonicalTemporaryDirectory, withSystemTempDirectory)
 import System.Info (os)
-import System.Process (CreateProcess (cwd), readCreateProcessWithExitCode, shell)
 import System.Timeout (timeout)
 import Test.Hspec
 import Test.Run.Repeat.Batch
@@ -270,7 +269,7 @@ realBatch = do
       createTempDirectory temporary "hetoimasia-repeat-"
     command ∷ FilePath → String → IO String
     command directory line = do
-      (_, out, _) ← readCreateProcessWithExitCode ((shell line) {cwd = Just directory}) ""
+      (_, out) ← runCaptured ["/bin/sh", "-c", line] directory 30
       pure (filter (/= '\n') out)
     verdictWord ∷ Verdict → String
     verdictWord Passed = "passed"

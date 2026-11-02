@@ -115,6 +115,18 @@
       "binding": "withOutsider",
       "sites": 1,
       "reason": "a control process acquired and released by bracket: terminated and reaped whether or not the example held"
+    },
+    {
+      "file": "packages/glfw/test/Test/GLFW/Deadline.hs",
+      "binding": "ownedChild",
+      "sites": 1,
+      "reason": "the child of the real-process deadline example: created and its stop registered in one masked step, stopped (TERM, a grace, KILL) and reaped on a normal end, a timeout and a cancellation, with its output in files"
+    },
+    {
+      "file": "run-native-repeat/Test/Run/Repeat/Batch.hs",
+      "binding": "runOwned",
+      "sites": 1,
+      "reason": "the repeated-run probe's one process start: created in one masked step, its owned set (the root, its tree and process group) taken once and stopped by pid (TERM, a grace, KILL) and reaped on a normal end, a bound and a cancellation, with its output in files"
     }
   ]
 }

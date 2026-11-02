@@ -13,12 +13,12 @@
 -- call, and bounds the child from outside ('childSpec').
 module Test.GLFW.Deadline (spec, runChild, childVariable) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, yield)
+import Control.Concurrent (ThreadId, killThread, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar, tryPutMVar, tryReadMVar)
-import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, annotateIO, fromException, throwIO, try, tryWithContext)
+import Control.Exception (AsyncException (ThreadKilled), ErrorCall (ErrorCall), ExceptionWithContext (ExceptionWithContext), SomeException, annotateIO, fromException, mask, onException, throwIO, try, tryWithContext)
 import Control.Exception.Annotation (ExceptionAnnotation)
 import Control.Exception.Context (getExceptionAnnotations)
-import Control.Monad (void, when)
+import Control.Monad (forM, void, when)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.List (isInfixOf)
 import qualified Data.Text as Text
@@ -30,8 +30,12 @@ import Hetoimasia.GLFW.Seam
 import Hetoimasia.GLFW.Session
 import System.Environment (getEnvironment, getExecutablePath)
 import System.Exit (ExitCode (ExitFailure, ExitSuccess))
-import System.IO (hFlush, hPutStrLn, stderr, stdout)
-import System.Process (CreateProcess (env), proc, readCreateProcessWithExitCode)
+import System.FilePath ((</>))
+import System.IO (IOMode (WriteMode), hFlush, hPutStrLn, openFile, stderr, stdout)
+import System.IO.Temp (withSystemTempDirectory)
+import System.Posix.Signals (sigKILL, signalProcess)
+import System.Process (CreateProcess (env, std_err, std_in, std_out), StdStream (NoStream, UseHandle), createProcess, getPid, proc, terminateProcess, waitForProcess)
+import Test.Support.Owned (withOwnedThread)
 import System.Timeout (timeout)
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 
@@ -201,15 +205,14 @@ testCancelled = do
   gate ← newEmptyMVar ∷ IO (MVar ())
   done ← newEmptyMVar
   before ← alive
-  worker ←
-    forkIO $
-      (try @SomeException (guardInitialization (recordExit rig) "cocoa" (deadlineOf neverPasses (recordReport rig)) (putMVar inside () >> takeMVar gate)) >>= putMVar done)
-  takeMVar inside
-  killThread worker
-  outcome ← takeMVar done
+  let guarded = try @SomeException (guardInitialization (recordExit rig) "cocoa" (deadlineOf neverPasses (recordReport rig)) (putMVar inside () >> takeMVar gate)) >>= putMVar done
+  outcome ← withOwnedThread guarded $ \worker _ → do
+    takeMVar inside
+    killThread worker
+    takeMVar done
   either (\failure → fromException failure == Just ThreadKilled) (const False) outcome `shouldBe` True
   after ← alive
-  [thread | thread ← after, thread `notElem` before, thread /= worker] `shouldBe` []
+  [thread | thread ← after, thread `notElem` before] `shouldBe` []
   readIORef (rigExits rig) `shouldReturn` []
 
 testExpires ∷ Expectation
@@ -260,18 +263,18 @@ testCompetingCompletionAndExpiry = do
   reporting ← newEmptyMVar
   finishReport ← newEmptyMVar
   callReturns ← newEmptyMVar
-  let report expiry = recordReport rig expiry >> putMVar reporting () >> takeMVar finishReport
   worker ← newEmptyMVar
-  void . forkIO $
-    guardInitialization (recordExit rig) "cocoa" (deadlineOf passed report) (takeMVar callReturns >> pure ()) >>= putMVar worker
-  -- The bound passes and the report starts while the call is still blocked; the
-  -- call then returns. The guard has already decided: expired.
-  takeMVar reporting
-  readIORef (rigExits rig) `shouldReturn` []
-  putMVar callReturns ()
-  tryReadMVar worker `shouldReturn` Nothing
-  putMVar finishReport ()
-  takeMVar worker
+  let report expiry = recordReport rig expiry >> putMVar reporting () >> takeMVar finishReport
+      guarded = guardInitialization (recordExit rig) "cocoa" (deadlineOf passed report) (takeMVar callReturns >> pure ()) >>= putMVar worker
+  withOwnedThread guarded $ \_ _ → do
+    -- The bound passes and the report starts while the call is still blocked; the call then returns. The guard has
+    -- already decided: expired.
+    takeMVar reporting
+    readIORef (rigExits rig) `shouldReturn` []
+    putMVar callReturns ()
+    tryReadMVar worker `shouldReturn` Nothing
+    putMVar finishReport ()
+    takeMVar worker
   readIORef (rigExits rig) `shouldReturn` [initializationTimeoutStatus]
   length <$> readIORef (rigReports rig) `shouldReturn` 1
 
@@ -399,18 +402,47 @@ runChild scenario = do
       void (guardInitialization exit "cocoa" (deadlineOf neverPasses report) (c_sleep 0))
       hPutStrLn stdout "returned" >> hFlush stdout
 
--- | Run this executable as the child and judge what it did. The child is
--- bounded from outside: if it has not ended in thirty seconds the guard did not
--- work, and the process library stops it when the bound abandons the call.
+-- | Run this executable as the child and judge what it did. The child is bounded from outside: if it has not ended in thirty
+-- seconds the guard did not work, and the child is stopped by pid ('ownedChild').
 childSpec ∷ String → (ExitCode → String → String → Expectation) → Expectation
-childSpec scenario judge = do
-  self ← getExecutablePath
-  environment ← getEnvironment
-  let process = (proc self []) {env = Just ((childVariable, scenario) : filter ((/= childVariable) . fst) environment)}
-  outcome ← timeout 30_000_000 (readCreateProcessWithExitCode process "")
-  case outcome of
+childSpec scenario judge =
+  ownedChild scenario >>= \case
     Nothing → expectationFailure "the child did not end within its bound"
     Just (code, out, err) → judge code out err
+
+-- | Start this executable as the child of a scenario, wait for it for thirty seconds, and answer how it ended and what it
+-- wrote, or 'Nothing' when it had to be stopped. Acquisition is one masked step: the process is created and its stop is
+-- registered together. The stop is TERM, a grace of five seconds, then KILL, and the child is reaped before this returns, on a
+-- normal end, a timeout and a cancellation alike. Output goes to files, so no pipe can be held open by a stuck child.
+ownedChild ∷ String → IO (Maybe (ExitCode, String, String))
+ownedChild scenario = do
+  self ← getExecutablePath
+  environment ← getEnvironment
+  withSystemTempDirectory "glfw-deadline-child" $ \directory → do
+    let outFile = directory </> "out"
+        errFile = directory </> "err"
+    handleOut ← openFile outFile WriteMode
+    handleErr ← openFile errFile WriteMode
+    ended ← mask $ \restore → do
+      (_, _, _, handle) ←
+        createProcess
+          (proc self [])
+            { env = Just ((childVariable, scenario) : filter ((/= childVariable) . fst) environment)
+            , std_in = NoStream
+            , std_out = UseHandle handleOut
+            , std_err = UseHandle handleErr
+            }
+      let stop = do
+            terminateProcess handle
+            reaped ← timeout 5_000_000 (waitForProcess handle)
+            when (reaped == Nothing) $ do
+              pid ← getPid handle
+              mapM_ (signalProcess sigKILL) pid
+              void (waitForProcess handle)
+      outcome ← restore (timeout 30_000_000 (waitForProcess handle)) `onException` stop
+      when (outcome == Nothing) stop
+      pure outcome
+    forM ended $ \code → (,,) code <$> readFile outFile <*> readFile errFile
 
 childExpires ∷ ExitCode → String → String → Expectation
 childExpires code out err = do

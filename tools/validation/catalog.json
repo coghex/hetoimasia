@@ -793,6 +793,7 @@
         "packages/scripting-lua/test/",
         "probe/",
         "run-native-test/",
+        "run-native-repeat/",
         "samples/image2d/renderer/test/",
         "samples/lua-domains/fixtures/",
         "samples/lua-domains/profile/",
