@@ -297,12 +297,24 @@ boundedExample action = do
     Just () → pure ()
     Nothing → expectationFailure "the example did not finish within its bound"
 
--- | Wait until @target@ has stopped making progress towards its 'throwTo'.
+-- | Wait until @sender@ is blocked delivering an exception (or has ended, because it will never block again), and then until
+-- that exception is pending against the caller when the caller is the thread it is aimed at (#610).
+--
+-- A sender in 'BlockedOnException' has sent its exception; the target has not necessarily received it. With one capability the
+-- sender queues the exception on the target synchronously. Under @+RTS -N2@ they run on different capabilities and the
+-- exception travels as a message that the target's capability takes in only when the thread running on it returns to its
+-- scheduler: until then the sender already reports 'BlockedOnException' while the running target has nothing pending, and it
+-- can leave its uninterruptible step, restore its masking state and run its next effect before the exception is raised in it.
+-- The contract allows that (@docs/resources.md@: a cancellation delivered at the handoff /may/ preempt the first effect), so an
+-- example that asserts the preemption must wait for the exception to be pending, not merely sent. One 'yield' after the
+-- sender is seen blocked returns the caller to its scheduler, which takes the message in first; the exception is then queued
+-- on the caller and raised the moment it restores its masking state. The yield is a scheduler hand-over, not a delay, and
+-- matters only to a caller that is the target; to any other caller it is harmless. Nothing here sleeps or retries.
 awaitPendingThrow ∷ ThreadId → IO ()
 awaitPendingThrow target = do
   status ← threadStatus target
   case status of
-    ThreadBlocked BlockedOnException → pure ()
+    ThreadBlocked BlockedOnException → yield
     ThreadFinished → pure ()
     ThreadDied → pure ()
     _ → yield *> awaitPendingThrow target

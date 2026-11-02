@@ -432,15 +432,17 @@ boundedExample action = do
 exampleBoundMicroseconds ∷ Int
 exampleBoundMicroseconds = 30 * 1000 * 1000
 
--- | Wait until @target@ has stopped making progress towards its 'throwTo',
--- so an example knows a cancellation is pending without guessing at a delay.
--- The status it settled on is returned, so an example can assert that the
--- cancellation really was still undelivered.
+-- | The same wait, for the same reason, as 'Test.Foundation.Resources.Collection''s @awaitPendingThrow@ (#610): wait until
+-- @sender@ is blocked delivering an exception (or has ended), then yield once so that the exception is pending against the
+-- caller when the caller is the thread it is aimed at. Under @+RTS -N2@ a sender reports 'BlockedOnException' as soon as its
+-- exception is /sent/; the target's capability takes it in only when the running target returns to its scheduler, so without
+-- the yield the target can run its next effect before the cancellation is raised in it.
+-- The status it settled on is returned, so an example can assert that the cancellation really was still undelivered.
 awaitPendingThrow ∷ ThreadId → IO ThreadStatus
 awaitPendingThrow target = do
   status ← threadStatus target
   case status of
-    ThreadBlocked BlockedOnException → pure status
+    ThreadBlocked BlockedOnException → yield *> pure status
     ThreadFinished → pure status
     ThreadDied → pure status
     _ → yield *> awaitPendingThrow target

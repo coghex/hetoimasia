@@ -378,12 +378,16 @@ boundedExample action = do
     Just () → pure ()
     Nothing → expectationFailure "the example did not finish within its bound"
 
--- | Wait until @target@ has stopped making progress towards its 'throwTo'.
+-- | The same wait, for the same reason, as 'Test.Foundation.Resources.Collection''s @awaitPendingThrow@ (#610): wait until
+-- @sender@ is blocked delivering an exception (or has ended), then yield once so that the exception is pending against the
+-- caller when the caller is the thread it is aimed at. Under @+RTS -N2@ a sender reports 'BlockedOnException' as soon as its
+-- exception is /sent/; the target's capability takes it in only when the running target returns to its scheduler, so without
+-- the yield the target can run its next effect before the cancellation is raised in it.
 awaitPendingThrow ∷ ThreadId → IO ()
 awaitPendingThrow target = do
   status ← threadStatus target
   case status of
-    ThreadBlocked BlockedOnException → pure ()
+    ThreadBlocked BlockedOnException → yield
     ThreadFinished → pure ()
     ThreadDied → pure ()
     _ → yield *> awaitPendingThrow target

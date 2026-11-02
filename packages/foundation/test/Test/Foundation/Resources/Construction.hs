@@ -24,6 +24,7 @@ import Control.Exception
   , WhileHandling (WhileHandling)
   , annotateIO
   , evaluate
+  , finally
   , fromException
   , mask_
   , someExceptionContext
@@ -388,12 +389,17 @@ boundedExample action = do
     Just () → pure ()
     Nothing → expectationFailure "the example did not finish within its bound"
 
--- | Wait until a thread is blocked delivering an exception, or has finished.
+-- | The same wait, for the same reason, as 'Test.Foundation.Resources.Collection''s @awaitPendingThrow@ (#610): wait until
+-- @sender@ is blocked delivering an exception (or has ended), then yield once so that the exception is pending against the
+-- caller when the caller is the thread it is aimed at. Under @+RTS -N2@ a sender reports 'BlockedOnException' as soon as its
+-- exception is /sent/; the target's capability takes it in only when the running target returns to its scheduler, so without
+-- the yield the target can run its next effect before the cancellation is raised in it.
+-- The status it settled on is returned, so an example can assert that the cancellation really was still undelivered.
 awaitPendingThrow ∷ ThreadId → IO ThreadStatus
 awaitPendingThrow target = do
   status ← threadStatus target
   case status of
-    ThreadBlocked BlockedOnException → pure status
+    ThreadBlocked BlockedOnException → yield *> pure status
     ThreadFinished → pure status
     ThreadDied → pure status
     _ → yield *> awaitPendingThrow target
@@ -867,8 +873,10 @@ testCancelAtHandoff = do
         self ← myThreadId
         -- The delivery and the announcement that follows it are one masked step: the runner's scope ends the killer as soon as
         -- the runner has left the construction, which can be before the killer has announced, and the example waits for
-        -- that announcement. The delivery itself stays interruptible, so a killer still blocked is ended by the scope.
-        withOwnedThread (readMVar startKiller >> mask_ (throwTo self ThreadKilled *> putMVar killerDone ())) $ \killer _ → do
+        -- that announcement. The delivery itself stays interruptible, so a killer still blocked is ended by the scope; the
+        -- announcement is made however the delivery ends (@finally@), so a delivery the scope cut short is a failed
+        -- assertion about the outcome below and not an example waiting for ever on a signal nothing will give.
+        withOwnedThread (readMVar startKiller >> mask_ (throwTo self ThreadKilled `finally` putMVar killerDone ())) $ \killer _ → do
           putMVar killerSlot killer
           tryWithContext
             ( withScoped
