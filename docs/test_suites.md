@@ -193,8 +193,9 @@ cabal test hetoimasia-tests --test-show-details=direct
   `failures=0 verdict=VerdictInterrupted`. The suite's child helper (`Test.Run.Native.Child`) has its own harness examples first
   (`Test.Run.Native.ChildSpec`: a failure part-way through acquisition, a cancellation during the release, a child that
   cannot be confirmed reaped or drained, the body's failure preserved), run against `/bin/sh` children with no native session. It is built, with the executable it launches, in the group's preparation stage
-  (`bash tools/vulkan/run.sh build hetoimasia:exe:hetoimasia hetoimasia:test:run-native-tests`) and run,
-  unbuilt, by `bash tools/vulkan/run.sh native hetoimasia:test:run-native-tests -- --complete`. It
+  (`bash tools/vulkan/run.sh build hetoimasia:exe:hetoimasia hetoimasia:test:run-native-tests`) and run by
+  `bash tools/vulkan/run.sh native hetoimasia:test:run-native-tests -- --complete`, which builds nothing and presents the
+  build identity the preparation recorded (see [validation.md](validation.md#a-native-runs-build-identity)). It
   captures no pixel and reads no window back in its smoke cases. See [run_command.md](run_command.md).
   Its `Lua native milestone` subgroup (LFE-25, [#540](https://github.com/coghex/hetoimasia/issues/540), selectable alone with
   `--match 'Lua native milestone'` and part of `--complete`) is the final qualification of native windows: a two-instance harness composed through
@@ -224,8 +225,9 @@ cabal test hetoimasia-tests --test-show-details=direct
   desktop consent as `vulkan-native-tests`, under the same standing approval (on
   macOS `HETOIMASIA_NATIVE_SESSION=desktop` on the one command; on Linux the
   runner starts its own X11 display), and is built in the group's preparation
-  stage and run, unbuilt, by
-  `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete`;
+  stage and run by
+  `bash tools/vulkan/run.sh native hetoimasia-lua-engine-graphics:test:lua-engine-graphics-native-tests -- --complete`, which builds
+  nothing and refuses an executable whose recorded build identity is missing or stale;
   the subgroup alone by the same command with `-- --match 'window provider'`. Its
   headless counterpart is the `window provider` group of `lua-engine-graphics-tests`
   (group `test.vulkan-headless`), a gated fake port inside the real request
