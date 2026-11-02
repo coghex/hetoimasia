@@ -4,7 +4,7 @@
 -- here verbatim so the guide and the behaviour these cases assert cannot drift.
 module Test.Foundation.Logging.Worker (spec) where
 
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (killThread)
 import Control.Concurrent.MVar
   ( MVar
   , modifyMVar_
@@ -24,7 +24,6 @@ import Control.Exception
   , throwIO
   , try
   )
-import Control.Monad (void)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust, mapMaybe)
 import Data.Text (Text)
@@ -43,6 +42,7 @@ import Test.Hspec
   , shouldReturn
   )
 import Test.Support.Bounded (bounded)
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = describe "Worker reporting boundary" $ do
@@ -95,8 +95,8 @@ uploadFailure = ErrorCall "upload queue exploded"
 workerOutcome ∷ Logger → (Logger → IO Int) → IO (Either SomeException ())
 workerOutcome logger work = do
   outcome ← newEmptyMVar
-  void . forkIO $ try (uploaderWorker logger 7 work) >>= putMVar outcome
-  bounded (takeMVar outcome)
+  withOwnedThread (try (uploaderWorker logger 7 work) >>= putMVar outcome) $ \_ _ →
+    bounded (takeMVar outcome)
 
 -- | The same, killed once the gate proves the worker has parked at an
 -- interruptible point. The gate is the coordination: nothing here sleeps.
@@ -104,10 +104,10 @@ cancelledWorkerOutcome
   ∷ Logger → MVar () → (Logger → IO Int) → IO (Either SomeException ())
 cancelledWorkerOutcome logger entered work = do
   outcome ← newEmptyMVar
-  worker ← forkIO $ try (uploaderWorker logger 7 work) >>= putMVar outcome
-  bounded (takeMVar entered)
-  bounded (killThread worker)
-  bounded (takeMVar outcome)
+  withOwnedThread (try (uploaderWorker logger 7 work) >>= putMVar outcome) $ \worker _ → do
+    bounded (takeMVar entered)
+    bounded (killThread worker)
+    bounded (takeMVar outcome)
 
 -- | Signals that it has arrived, then blocks on an `MVar` the test holds and
 -- never fills. That retained reference is what makes this an interruptible

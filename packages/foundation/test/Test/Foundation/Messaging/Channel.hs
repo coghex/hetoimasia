@@ -12,9 +12,9 @@
 -- group, in "Test.Runtime.Messaging".
 module Test.Foundation.Messaging.Channel (spec) where
 
-import Control.Concurrent (forkIO, myThreadId)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, takeMVar)
-import Control.Concurrent.STM (STM, atomically, catchSTM, orElse, retry, throwSTM)
+import Control.Concurrent (ThreadId, myThreadId)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
+import Control.Concurrent.STM (STM, TVar, atomically, catchSTM, check, newTVarIO, orElse, readTVar, retry, throwSTM)
 import Control.DeepSeq (NFData (rnf))
 import Control.Exception
   ( Exception
@@ -25,7 +25,7 @@ import Control.Exception
   , tryWithContext
   )
 import Control.Monad (forM, forM_, replicateM, void, when)
-import Data.Foldable (traverse_)
+import Data.Foldable (for_, traverse_)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -51,8 +51,20 @@ import Hetoimasia.Foundation.Worker
   , workerDefinition
   )
 import System.IO.Unsafe (unsafePerformIO)
-import Test.Foundation.Messaging.Support (awaitBlockedOnSTM, boundedExample, newGate, openGate)
+import Test.Foundation.Messaging.Support (awaitBlockedOnSTM, boundedExample, newGate, openGate, withOwnedThreads)
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
+import Test.Foundation.OwnedControl
+  ( Probe (..)
+  , Scope
+  , endedAfterScope
+  , endings
+  , newProbe
+  , recordSelf
+  , runEnding
+  , unownedScope
+  , withRescue
+  )
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = do
@@ -94,7 +106,45 @@ spec = do
     it "leaves a blocked waiting receive through a worker's stop request with the channel unchanged"
       (boundedExample testStopDuringReceive)
 
+  -- The waiter the blocking examples start (#597): however the example that needed it ends, a waiter parked in its transaction
+  -- has been killed and joined before the example is left.
+  describe "The waiter helper (withWaiter)" $
+    for_ endings $ \(label, ending) → do
+      it ("has ended and been joined when the scope " <> label) $ do
+        probe ← newProbe
+        flag ← newTVarIO False
+        runEnding (ownedWaiter probe flag) (const (pure ())) probe ending
+        endedAfterScope probe >>= (`shouldBe` True)
+
+      it ("negative control: the previous unowned start leaves the waiter parked when the scope " <> label) $ do
+        probe ← newProbe
+        flag ← newTVarIO False
+        withRescue $ \started → do
+          runEnding (unownedScope started) (parkedInTransaction flag) probe ending
+          -- The failed judgement is recorded before anything independent touches the waiter.
+          judgement ← endedAfterScope probe
+          judgement `shouldBe` False
+        -- The rescue stopped and joined it.
+        endedAfterScope probe >>= (`shouldBe` True)
+
 -- Fixtures -------------------------------------------------------------------
+
+-- | The helper under test, as the scope the endings run: a wait that nothing completes, parked in its transaction, and then the
+-- body. The worker the endings pass is not used: the waiter is the helper's own thread.
+ownedWaiter ∷ Probe → TVar Bool → Scope
+ownedWaiter probe flag _ body =
+  withWaiter (readTVar flag >>= check) $ \waiter _ → do
+    void (tryPutMVar (probeThread probe) waiter)
+    awaitBlockedOnSTM waiter
+    putMVar (probeParked probe) ()
+    body waiter
+
+-- | The previous start's waiter: the same wait, on a thread nothing ends.
+parkedInTransaction ∷ TVar Bool → Probe → IO ()
+parkedInTransaction flag probe = do
+  recordSelf probe
+  putMVar (probeParked probe) ()
+  atomically (readTVar flag >>= check)
 
 data Boom = Boom
   deriving (Eq, Show)
@@ -149,35 +199,43 @@ expectConserved statistics = do
   statisticsHighWater statistics `shouldSatisfy` (<= statisticsCapacity statistics)
   statisticsDepth statistics `shouldSatisfy` (<= statisticsHighWater statistics)
 
--- | Run a wait on its own thread, perform the wake once that thread has parked
--- in its transaction, and return both results.
-blockedUntil ∷ STM r → STM w → IO (r, w)
-blockedUntil wait wake = do
+-- | Run a wait on a thread the scope owns: the body is given the waiter's thread and the slot its result is written to. However
+-- the body ends (a return, a failed assertion, a timeout, a cancellation) the waiter, parked in its transaction (an
+-- interruptible wait), has been killed and joined before this returns.
+withWaiter ∷ STM r → (ThreadId → MVar r → IO a) → IO a
+withWaiter wait body = do
   result ← newEmptyMVar
-  waiter ← forkIO (atomically wait >>= putMVar result)
-  awaitBlockedOnSTM waiter
-  woke ← atomically wake
-  waited ← takeMVar result
-  pure (waited, woke)
+  withOwnedThread (atomically wait >>= putMVar result) (\waiter _ → body waiter result)
 
--- | Start producers from one gate. Each sends its own numbered entries with a
--- waiting send, and the returned action waits for all of them to finish.
-produce ∷ Sender (Int, Int) → [Int] → Int → IO (IO ())
-produce sender producers count = do
+-- | Run a wait on a thread of its own, perform the wake once that thread has parked
+-- in its transaction, and return both results. The waiter is owned by this call: if the wake or the wait for the
+-- result fails, or the example is cancelled, it is killed and joined before this returns.
+blockedUntil ∷ STM r → STM w → IO (r, w)
+blockedUntil wait wake =
+  withWaiter wait $ \waiter result → do
+    awaitBlockedOnSTM waiter
+    woke ← atomically wake
+    waited ← takeMVar result
+    pure (waited, woke)
+
+-- | Start producers from one gate for the length of the body. Each sends its own numbered entries with a
+-- waiting send; the body is given an action that waits for all of them to finish. Every producer is owned by this call: it
+-- waits at the gate or in a waiting send (both interruptible), so it is killed and joined however the body ends.
+withProducers ∷ Sender (Int, Int) → [Int] → Int → (IO () → IO a) → IO a
+withProducers sender producers count body = do
   start ← newGate
-  finished ← forM producers $ \producer → do
-    done ← newEmptyMVar
-    _ ← forkIO $ do
-      outcome ← try @SomeException $ do
-        readMVar start
-        forM_ [1 .. count] $ \sequenceNumber → do
-          payload ← prepare (producer, sequenceNumber)
-          admission ← atomically (awaitSend sender payload)
-          when (admission /= Admitted) (throwIO (userError ("producer saw " <> show admission)))
-      putMVar done outcome
-    pure done
-  openGate start
-  pure (traverse_ (\done → takeMVar done >>= either throwIO pure) finished)
+  finished ← forM producers $ \_ → newEmptyMVar
+  let produceFor producer done = do
+        outcome ← try @SomeException $ do
+          readMVar start
+          forM_ [1 .. count] $ \sequenceNumber → do
+            payload ← prepare (producer, sequenceNumber)
+            admission ← atomically (awaitSend sender payload)
+            when (admission /= Admitted) (throwIO (userError ("producer saw " <> show admission)))
+        putMVar done outcome
+  withOwnedThreads (zipWith produceFor producers finished) $ do
+    openGate start
+    body (traverse_ (\done → takeMVar done >>= either throwIO pure) finished)
 
 receiveTagged ∷ Receiver (Int, Int) → Int → IO [(Int, Int)]
 receiveTagged receiver count =
@@ -234,15 +292,15 @@ testConcurrentProducers = do
   control ← newChannel @(Int, Int) 4
   let producers = [1, 2, 3]
       count = 50
-  finished ← produce (channelSender control) producers count
-  received ← receiveTagged (channelReceiver control) (length producers * count)
-  finished
-  forM_ producers $ \producer →
-    [sequenceNumber | (tag, sequenceNumber) ← received, tag == producer] `shouldBe` [1 .. count]
-  statistics ← statisticsOf control
-  expectConserved statistics
-  (statisticsAccepted statistics, statisticsDequeued statistics, statisticsDepth statistics)
-    `shouldBe` (150, 150, 0)
+  withProducers (channelSender control) producers count $ \finished → do
+    received ← receiveTagged (channelReceiver control) (length producers * count)
+    finished
+    forM_ producers $ \producer →
+      [sequenceNumber | (tag, sequenceNumber) ← received, tag == producer] `shouldBe` [1 .. count]
+    statistics ← statisticsOf control
+    expectConserved statistics
+    (statisticsAccepted statistics, statisticsDequeued statistics, statisticsDepth statistics)
+      `shouldBe` (150, 150, 0)
 
 testFullLeavesUnchanged ∷ Expectation
 testFullLeavesUnchanged = do
@@ -393,29 +451,29 @@ testConservation = do
 
   -- Contention: two producers against one consumer at a small capacity.
   tagged ← newChannel @(Int, Int) 3
-  finished ← produce (channelSender tagged) [1, 2] 10
-  _ ← receiveTagged (channelReceiver tagged) 20
-  finished
-  contended ← statisticsOf tagged
-  expectConserved contended
-  (statisticsAccepted contended, statisticsDequeued contended, statisticsDepth contended)
-    `shouldBe` (20, 20, 0)
+  withProducers (channelSender tagged) [1, 2] 10 $ \finished → do
+    _ ← receiveTagged (channelReceiver tagged) 20
+    finished
+    contended ← statisticsOf tagged
+    expectConserved contended
+    (statisticsAccepted contended, statisticsDequeued contended, statisticsDepth contended)
+      `shouldBe` (20, 20, 0)
 
-  -- Failed admission.
-  sendAll sender [1, 2, 3, 4] `shouldReturn` [Accepted, Accepted, Accepted, Full]
-  checkpoint `shouldReturn` ChannelStatistics 3 3 3 3 0 0
+    -- Failed admission.
+    sendAll sender [1, 2, 3, 4] `shouldReturn` [Accepted, Accepted, Accepted, Full]
+    checkpoint `shouldReturn` ChannelStatistics 3 3 3 3 0 0
 
-  -- Drain, before and after close.
-  receiveText receiver `shouldReturn` "item 1"
-  checkpoint `shouldReturn` ChannelStatistics 3 2 3 3 1 0
-  atomically (closeChannel control)
-  sendAll sender [5] `shouldReturn` [Closed]
-  receiveText receiver `shouldReturn` "item 2"
-  checkpoint `shouldReturn` ChannelStatistics 3 1 3 3 2 0
+    -- Drain, before and after close.
+    receiveText receiver `shouldReturn` "item 1"
+    checkpoint `shouldReturn` ChannelStatistics 3 2 3 3 1 0
+    atomically (closeChannel control)
+    sendAll sender [5] `shouldReturn` [Closed]
+    receiveText receiver `shouldReturn` "item 2"
+    checkpoint `shouldReturn` ChannelStatistics 3 1 3 3 2 0
 
-  -- Abort.
-  atomically (abortChannel control) `shouldReturn` 1
-  checkpoint `shouldReturn` ChannelStatistics 3 0 3 3 2 1
+    -- Abort.
+    atomically (abortChannel control) `shouldReturn` 1
+    checkpoint `shouldReturn` ChannelStatistics 3 0 3 3 2 1
 
 testRollbackNeverReappears ∷ Expectation
 testRollbackNeverReappears = do

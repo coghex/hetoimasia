@@ -4,7 +4,7 @@
 -- stops a call that has already hung, and never decides an assertion.
 module Test.Foundation.Logging.Sink (spec) where
 
-import Control.Concurrent (forkIO, killThread)
+import Control.Concurrent (killThread)
 import Control.Concurrent.MVar
   ( MVar
   , modifyMVar
@@ -71,6 +71,7 @@ import Test.Hspec
   , shouldThrow
   )
 import Test.Support.Bounded (boundMicroseconds, bounded)
+import Test.Support.Owned (withOwnedThread)
 import Text.Read (readMaybe)
 
 spec ∷ Spec
@@ -141,6 +142,11 @@ testHandleRecordTerminator = withLogHandle LineBuffering $ \path handle → do
   TextIO.readFile path
     `shouldReturn` "2026-09-10T12:00:00.000Z INFO test thread=3 msg=terminated\n"
 
+-- | Run each action on a thread the scope owns, the first outermost, for the length of the body.
+withOwnedThreads ∷ [IO ()] → IO a → IO a
+withOwnedThreads [] body = body
+withOwnedThreads (action : more) body = withOwnedThread action (\_ _ → withOwnedThreads more body)
+
 testHandleConcurrentRecords ∷ IO ()
 testHandleConcurrentRecords = withLogHandle (BlockBuffering (Just 4096)) $ \path handle → do
   sink ← newHandleSink handle
@@ -149,18 +155,19 @@ testHandleConcurrentRecords = withLogHandle (BlockBuffering (Just 4096)) $ \path
       names = ["one", "two", "three", "four"]
       perWorker = 25 ∷ Int
   gate ← newEmptyMVar
-  dones ← forM names $ \name → do
-    done ← newEmptyMVar
-    void . forkIO $ do
-      -- Released together, joined by completion; no sleep decides anything.
-      readMVar gate
-      let worker = withBreadcrumb "worker" (withFields [("worker", name)] root)
-      forM_ [1 .. perWorker] $ \index →
-        logInfo worker testComponent "tick" [("seq", Text.pack (show index))]
-      putMVar done ()
-    pure (done ∷ MVar ())
-  putMVar gate ()
-  forM_ dones takeMVar
+  dones ← forM names $ \_ → newEmptyMVar ∷ IO (MVar ())
+  let producer name done = do
+        -- Released together, joined by completion; no sleep decides anything.
+        readMVar gate
+        let worker = withBreadcrumb "worker" (withFields [("worker", name)] root)
+        forM_ [1 .. perWorker] $ \index →
+          logInfo worker testComponent "tick" [("seq", Text.pack (show index))]
+        putMVar done ()
+  -- The producers are owned by the example: each waits at the gate (an interruptible wait) until the example opens it, and
+  -- is killed and joined with the example however it ends.
+  withOwnedThreads (zipWith producer names dones) $ do
+    putMVar gate ()
+    forM_ dones takeMVar
   flushLogger root
   hClose handle
   recorded ← recordedLines path
@@ -274,32 +281,34 @@ testHandleInterruption = do
       blocked = withFields [("producer", "blocked")] root
       other = withFields [("producer", "other")] root
   outcome ← newEmptyMVar
-  writer ← forkIO $ do
-    result ← try (logInfo blocked testComponent (Text.replicate 200000 "abcde") [])
-    putMVar outcome (result ∷ Either SomeException ())
-  -- Nothing drains the pipe yet, so this chunk can only come from a writer
-  -- that is still far from finished with a record the pipe cannot hold.
-  bounded (replicateM_ 4096 (void (hGetChar readEnd)))
-  bounded (killThread writer)
-  interrupted ← bounded (takeMVar outcome)
-  case interrupted of
-    Right () → expectationFailure "the interrupted write reported success"
-    Left failure → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
-  -- Draining again from here, so the only thing a sharing logger could wait on
-  -- is serialization state the interruption should have released.
-  drainer ← forkIO . void $
-    (try (hGetContents readEnd >>= void . evaluate . length) ∷ IO (Either SomeException ()))
-  proceeded ← timeout boundMicroseconds (try (logInfo other testComponent "after" []))
-  -- The caller's handle still holds whatever the interrupted write left
-  -- buffered, so it is closed while the drainer is still reading.
-  void (bounded (try (hClose writeEnd) ∷ IO (Either SomeException ())))
-  killThread drainer
-  hClose readEnd
-  -- Completing or reporting the handle's own failure are both fine; waiting
-  -- on serialization state the interruption should have released is not.
-  case proceeded ∷ Maybe (Either SomeException ()) of
-    Nothing → expectationFailure "a sharing logger never returned after the interruption"
-    Just _ → pure ()
+  withOwnedThread
+    ( do
+        result ← try (logInfo blocked testComponent (Text.replicate 200000 "abcde") [])
+        putMVar outcome (result ∷ Either SomeException ())
+    )
+    $ \writer _ → do
+      -- Nothing drains the pipe yet, so this chunk can only come from a writer
+      -- that is still far from finished with a record the pipe cannot hold.
+      bounded (replicateM_ 4096 (void (hGetChar readEnd)))
+      bounded (killThread writer)
+      interrupted ← bounded (takeMVar outcome)
+      case interrupted of
+        Right () → expectationFailure "the interrupted write reported success"
+        Left failure → (fromException failure ∷ Maybe AsyncException) `shouldBe` Just ThreadKilled
+      -- Draining again from here, so the only thing a sharing logger could wait on
+      -- is serialization state the interruption should have released.
+      withOwnedThread (void (try (hGetContents readEnd >>= void . evaluate . length) ∷ IO (Either SomeException ()))) $ \drainer _ → do
+        proceeded ← timeout boundMicroseconds (try (logInfo other testComponent "after" []))
+        -- The caller's handle still holds whatever the interrupted write left
+        -- buffered, so it is closed while the drainer is still reading.
+        void (bounded (try (hClose writeEnd) ∷ IO (Either SomeException ())))
+        killThread drainer
+        hClose readEnd
+        -- Completing or reporting the handle's own failure are both fine; waiting
+        -- on serialization state the interruption should have released is not.
+        case proceeded ∷ Maybe (Either SomeException ()) of
+          Nothing → expectationFailure "a sharing logger never returned after the interruption"
+          Just _ → pure ()
 
 testCallbackFlush ∷ IO ()
 testCallbackFlush = do

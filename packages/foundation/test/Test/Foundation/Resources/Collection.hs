@@ -14,7 +14,7 @@
 -- still reachable, through weak references to it that the example holds.
 module Test.Foundation.Resources.Collection (spec) where
 
-import Control.Concurrent (ThreadId, forkIO, killThread, throwTo, yield)
+import Control.Concurrent (ThreadId, killThread, throwTo, yield)
 import Control.Concurrent.MVar
   ( MVar
   , modifyMVar_
@@ -23,6 +23,7 @@ import Control.Concurrent.MVar
   , putMVar
   , readMVar
   , takeMVar
+  , tryPutMVar
   )
 import Control.Exception
   ( AsyncException (ThreadKilled)
@@ -84,6 +85,7 @@ import Test.Hspec
   , shouldBe
   , shouldReturn
   )
+import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = do
@@ -305,13 +307,20 @@ awaitPendingThrow target = do
     ThreadDied → pure ()
     _ → yield *> awaitPendingThrow target
 
--- | Run an owner body on a thread of its own, returning that thread and a
--- slot the scope's outcome is written to.
-forkOwner ∷ IO () → IO (ThreadId, MVar (Either SomeException ()))
-forkOwner body = do
+-- | Run an owner body on a thread the example owns, and give the example that thread and the slot the scope's outcome is
+-- written to. However the example ends (a return, a failed assertion, a timeout, a cancellation) the thread has been killed
+-- and joined before 'withOwner' returns, so an owner an example gave up on does not outlive it. The owner publishes whatever
+-- it ended with, a cancellation included, and ends; the example's own wait on the slot is unchanged.
+withOwner ∷ IO () → (ThreadId → MVar (Either SomeException ()) → IO a) → IO a
+withOwner = withOwnerOpening (pure ())
+
+-- | 'withOwner' for an owner that can be held, uninterruptibly, at a gate only the example opens: the first argument opens it
+-- (idempotently, without blocking) in the same uninterruptible release and before the kill, so a join cannot wait for ever on
+-- an owner whose killer was never started.
+withOwnerOpening ∷ IO () → IO () → (ThreadId → MVar (Either SomeException ()) → IO a) → IO a
+withOwnerOpening open body continue = do
   outcome ← newEmptyMVar
-  owner ← forkIO (try body >>= putMVar outcome)
-  pure (owner, outcome)
+  withOwnedThreadOpening open (try body >>= putMVar outcome) (\owner _ → continue owner outcome)
 
 -- Admission ------------------------------------------------------------------
 
@@ -369,26 +378,28 @@ testCancelledDuringAssembly = do
   events ← newTrail
   reached ← newEmptyMVar
   blocker ← newEmptyMVar
-  (owner, outcome) ← forkOwner $
-    withScoped (allocCollection 2) $ \collection → do
-      _ ← acquireMember collection (tracked events "earlier")
-      void . acquireMember collection $ do
-        _ ← tracked events "cancelled"
-        restoredStep (putMVar reached () *> takeMVar blocker ∷ IO ())
-  takeMVar reached
-  killThread owner
-  takeMVar outcome >>= \case
-    Right () → expectationFailure "expected the cancellation to propagate"
-    Left propagated → do
-      fromException propagated `shouldBe` Just ThreadKilled
-      -- The cancelled member was rolled back at once; the earlier member was
-      -- released at the collection's exit.
-      trail events
-        `shouldReturn` [ "acquire earlier"
-                       , "acquire cancelled"
-                       , "release cancelled"
-                       , "release earlier"
-                       ]
+  withOwner
+    ( withScoped (allocCollection 2) $ \collection → do
+        _ ← acquireMember collection (tracked events "earlier")
+        void . acquireMember collection $ do
+          _ ← tracked events "cancelled"
+          restoredStep (putMVar reached () *> takeMVar blocker ∷ IO ())
+    )
+    $ \owner outcome → do
+      takeMVar reached
+      killThread owner
+      takeMVar outcome >>= \case
+        Right () → expectationFailure "expected the cancellation to propagate"
+        Left propagated → do
+          fromException propagated `shouldBe` Just ThreadKilled
+          -- The cancelled member was rolled back at once; the earlier member was
+          -- released at the collection's exit.
+          trail events
+            `shouldReturn` [ "acquire earlier"
+                           , "acquire cancelled"
+                           , "release cancelled"
+                           , "release earlier"
+                           ]
 
 testCancellationPendingAtRegistration ∷ Expectation
 testCancellationPendingAtRegistration = do
@@ -396,69 +407,73 @@ testCancellationPendingAtRegistration = do
   acquiring ← newEmptyMVar
   killerSlot ← newEmptyMVar
   neverFilled ← newEmptyMVar
-  (owner, outcome) ← forkOwner $
-    withScoped (allocCollection 2) $ \collection → do
-      _ ← acquireMember collection (tracked events "earlier")
-      _ ←
-        acquireMember collection $
-          acquirePart
-            "pending"
-            (releaseRank 0)
-            ( uninterruptibleMask_ $ do
-                record events "acquire pending"
-                putMVar acquiring ()
-                readMVar killerSlot >>= awaitPendingThrow
-            )
-            (\_ → record events "release pending")
-      -- Not reached: the pending cancellation is delivered as soon as the
-      -- acquisition restores the caller's masking state.
-      record events "body resumed"
-      takeMVar neverFilled
-  takeMVar acquiring
-  killer ← forkIO (throwTo owner ThreadKilled)
-  putMVar killerSlot killer
-  takeMVar outcome >>= \case
-    Right () → expectationFailure "expected the cancellation to propagate"
-    Left propagated → do
-      fromException propagated `shouldBe` Just ThreadKilled
-      performed ← trail events
-      -- Registered before the cancellation was delivered, so released exactly
-      -- once, by the exit, newest first.
-      performed
-        `shouldBe` [ "acquire earlier"
-                   , "acquire pending"
-                   , "release pending"
-                   , "release earlier"
-                   ]
-      occurrences "release pending" performed `shouldBe` 1
+  withOwnerOpening (void (tryPutMVar killerSlot Nothing))
+    ( withScoped (allocCollection 2) $ \collection → do
+        _ ← acquireMember collection (tracked events "earlier")
+        _ ←
+          acquireMember collection $
+            acquirePart
+              "pending"
+              (releaseRank 0)
+              ( uninterruptibleMask_ $ do
+                  record events "acquire pending"
+                  putMVar acquiring ()
+                  readMVar killerSlot >>= maybe (pure ()) awaitPendingThrow
+              )
+              (\_ → record events "release pending")
+        -- Not reached: the pending cancellation is delivered as soon as the
+        -- acquisition restores the caller's masking state.
+        record events "body resumed"
+        takeMVar neverFilled
+    )
+    $ \owner outcome → do
+      takeMVar acquiring
+      withOwnedThread (throwTo owner ThreadKilled) $ \killer _ → do
+        putMVar killerSlot (Just killer)
+        takeMVar outcome >>= \case
+          Right () → expectationFailure "expected the cancellation to propagate"
+          Left propagated → do
+            fromException propagated `shouldBe` Just ThreadKilled
+            performed ← trail events
+            -- Registered before the cancellation was delivered, so released exactly
+            -- once, by the exit, newest first.
+            performed
+              `shouldBe` [ "acquire earlier"
+                         , "acquire pending"
+                         , "release pending"
+                         , "release earlier"
+                         ]
+            occurrences "release pending" performed `shouldBe` 1
 
 testHandoffCancelledDuringAssembly ∷ Expectation
 testHandoffCancelledDuringAssembly = do
   events ← newTrail
   reached ← newEmptyMVar
   blocker ← newEmptyMVar
-  (owner, outcome) ← forkOwner $
-    withScoped (allocCollection 2) $ \collection → do
-      _ ← acquireMember collection (tracked events "earlier")
-      acquireMemberThen
-        collection
-        ( do
-            _ ← tracked events "cancelled"
-            restoredStep (putMVar reached () *> takeMVar blocker ∷ IO ())
-        )
-        (\_ → record events "handoff")
-  takeMVar reached
-  killThread owner
-  takeMVar outcome >>= \case
-    Right () → expectationFailure "expected the cancellation to propagate"
-    Left propagated → do
-      fromException propagated `shouldBe` Just ThreadKilled
-      trail events
-        `shouldReturn` [ "acquire earlier"
-                       , "acquire cancelled"
-                       , "release cancelled"
-                       , "release earlier"
-                       ]
+  withOwner
+    ( withScoped (allocCollection 2) $ \collection → do
+        _ ← acquireMember collection (tracked events "earlier")
+        acquireMemberThen
+          collection
+          ( do
+              _ ← tracked events "cancelled"
+              restoredStep (putMVar reached () *> takeMVar blocker ∷ IO ())
+          )
+          (\_ → record events "handoff")
+    )
+    $ \owner outcome → do
+      takeMVar reached
+      killThread owner
+      takeMVar outcome >>= \case
+        Right () → expectationFailure "expected the cancellation to propagate"
+        Left propagated → do
+          fromException propagated `shouldBe` Just ThreadKilled
+          trail events
+            `shouldReturn` [ "acquire earlier"
+                           , "acquire cancelled"
+                           , "release cancelled"
+                           , "release earlier"
+                           ]
 
 testHandoffBeforePendingCancellation ∷ Expectation
 testHandoffBeforePendingCancellation = do
@@ -467,37 +482,39 @@ testHandoffBeforePendingCancellation = do
   killerSlot ← newEmptyMVar
   neverFilled ← newEmptyMVar
   masking ← newEmptyMVar
-  (owner, outcome) ← forkOwner $
-    withScoped (allocCollection 2) $ \collection → do
-      _ ←
-        acquireMemberThen collection (tracked events "pending") $ \member → do
-          getMaskingState >>= putMVar masking
-          record events "handoff"
-          putMVar handing ()
-          -- Waiting for the killer is itself uninterruptible; the check that its
-          -- cancellation is pending is not a blocking operation.
-          uninterruptibleMask_ (readMVar killerSlot) >>= awaitPendingThrow
-          liveMemberCount collection >>= record events . ("handoff saw " <>) . Text.pack . show
-          withMember collection member (record events . ("handoff borrowed " <>))
-      -- Not reached: the pending cancellation is delivered once the handoff
-      -- returns and the acquisition restores the caller's masking state.
-      record events "body resumed"
-      takeMVar neverFilled
-  takeMVar handing
-  killer ← forkIO (throwTo owner ThreadKilled)
-  putMVar killerSlot killer
-  takeMVar outcome >>= \case
-    Right () → expectationFailure "expected the cancellation to propagate"
-    Left propagated → do
-      fromException propagated `shouldBe` Just ThreadKilled
-      takeMVar masking `shouldReturn` MaskedInterruptible
-      trail events
-        `shouldReturn` [ "acquire pending"
-                       , "handoff"
-                       , "handoff saw 1"
-                       , "handoff borrowed pending"
-                       , "release pending"
-                       ]
+  withOwnerOpening (void (tryPutMVar killerSlot Nothing))
+    ( withScoped (allocCollection 2) $ \collection → do
+        _ ←
+          acquireMemberThen collection (tracked events "pending") $ \member → do
+            getMaskingState >>= putMVar masking
+            record events "handoff"
+            putMVar handing ()
+            -- Waiting for the killer is itself uninterruptible; the check that its
+            -- cancellation is pending is not a blocking operation.
+            uninterruptibleMask_ (readMVar killerSlot) >>= maybe (pure ()) awaitPendingThrow
+            liveMemberCount collection >>= record events . ("handoff saw " <>) . Text.pack . show
+            withMember collection member (record events . ("handoff borrowed " <>))
+        -- Not reached: the pending cancellation is delivered once the handoff
+        -- returns and the acquisition restores the caller's masking state.
+        record events "body resumed"
+        takeMVar neverFilled
+    )
+    $ \owner outcome → do
+      takeMVar handing
+      withOwnedThread (throwTo owner ThreadKilled) $ \killer _ → do
+        putMVar killerSlot (Just killer)
+        takeMVar outcome >>= \case
+          Right () → expectationFailure "expected the cancellation to propagate"
+          Left propagated → do
+            fromException propagated `shouldBe` Just ThreadKilled
+            takeMVar masking `shouldReturn` MaskedInterruptible
+            trail events
+              `shouldReturn` [ "acquire pending"
+                             , "handoff"
+                             , "handoff saw 1"
+                             , "handoff borrowed pending"
+                             , "release pending"
+                             ]
 
 testHandoffFailure ∷ Expectation
 testHandoffFailure = do
@@ -623,22 +640,24 @@ testBorrowDroppedOnCancellation = do
   borrowing ← newEmptyMVar
   neverFilled ← newEmptyMVar
   retired ← newEmptyMVar
-  (owner, outcome) ← forkOwner $
-    withScoped (allocCollection 1) $ \collection → do
-      member ← acquireMember collection (tracked events "member")
-      cancelled ←
-        try (withMember collection member (\_ → putMVar borrowing () *> takeMVar neverFilled))
-      case cancelled of
-        Left ThreadKilled → pure ()
-        Left other → throwIO other
-        Right () → fail "the borrow was not cancelled"
-      retireMember collection member >>= putMVar retired
-  takeMVar borrowing
-  -- Returns once the cancellation has been delivered inside the callback.
-  killThread owner
-  takeMVar retired `shouldReturn` Retired
-  takeMVar outcome >>= either throwIO pure
-  trail events `shouldReturn` ["acquire member", "release member"]
+  withOwner
+    ( withScoped (allocCollection 1) $ \collection → do
+        member ← acquireMember collection (tracked events "member")
+        cancelled ←
+          try (withMember collection member (\_ → putMVar borrowing () *> takeMVar neverFilled))
+        case cancelled of
+          Left ThreadKilled → pure ()
+          Left other → throwIO other
+          Right () → fail "the borrow was not cancelled"
+        retireMember collection member >>= putMVar retired
+    )
+    $ \owner outcome → do
+      takeMVar borrowing
+      -- Returns once the cancellation has been delivered inside the callback.
+      killThread owner
+      takeMVar retired `shouldReturn` Retired
+      takeMVar outcome >>= either throwIO pure
+      trail events `shouldReturn` ["acquire member", "release member"]
 
 -- Misuse ---------------------------------------------------------------------
 
@@ -648,22 +667,25 @@ testWrongThread = do
   withScoped (allocCollection 2) $ \collection → do
     member ← acquireMember collection (tracked events "member")
     results ← newEmptyMVar
-    _ ← forkIO $ do
-      observed ←
-        try $
-          sequence
-            [ rejection (acquireMember collection (tracked events "foreign"))
-            , rejection (withMember collection member (\_ → record events "borrowed"))
-            , rejection (retireMember collection member)
-            , rejection (liveMemberCount collection)
-            ]
-      putMVar results (observed ∷ Either SomeException [Maybe CollectionError])
-    takeMVar results >>= \case
-      Left unexpected → expectationFailure ("unexpected failure: " <> show unexpected)
-      Right observed → observed `shouldBe` replicate 4 (Just NotOwnerThread)
-    trail events `shouldReturn` ["acquire member"]
-    liveMemberCount collection `shouldReturn` 1
-    isLive <$> memberStatus member `shouldReturn` True
+    withOwnedThread
+      ( do
+          observed ←
+            try $
+              sequence
+                [ rejection (acquireMember collection (tracked events "foreign"))
+                , rejection (withMember collection member (\_ → record events "borrowed"))
+                , rejection (retireMember collection member)
+                , rejection (liveMemberCount collection)
+                ]
+          putMVar results (observed ∷ Either SomeException [Maybe CollectionError])
+      )
+      $ \_ _ → do
+        takeMVar results >>= \case
+          Left unexpected → expectationFailure ("unexpected failure: " <> show unexpected)
+          Right observed → observed `shouldBe` replicate 4 (Just NotOwnerThread)
+        trail events `shouldReturn` ["acquire member"]
+        liveMemberCount collection `shouldReturn` 1
+        isLive <$> memberStatus member `shouldReturn` True
 
 testForeignMember ∷ Expectation
 testForeignMember = do
@@ -938,22 +960,24 @@ testCancelledBodyStaysPrimary = do
   events ← newTrail
   waiting ← newEmptyMVar
   neverFilled ← newEmptyMVar
-  (owner, outcome) ← forkOwner $
-    withScoped (allocCollection 2) $ \collection → do
-      _ ← acquireMember collection (tracked events "first")
-      early ← acquireMember collection (failing events "early")
-      void (expectFailure (retireMember collection early))
-      putMVar waiting ()
-      takeMVar neverFilled
-  takeMVar waiting
-  killThread owner
-  takeMVar outcome >>= \case
-    Right () → expectationFailure "expected the cancellation to propagate"
-    Left propagated → do
-      fromException propagated `shouldBe` Just ThreadKilled
-      labelsOf (cleanupFailures propagated) `shouldBe` ["early"]
-      trail events
-        `shouldReturn` ["acquire first", "acquire early", "release early", "release first"]
+  withOwner
+    ( withScoped (allocCollection 2) $ \collection → do
+        _ ← acquireMember collection (tracked events "first")
+        early ← acquireMember collection (failing events "early")
+        void (expectFailure (retireMember collection early))
+        putMVar waiting ()
+        takeMVar neverFilled
+    )
+    $ \owner outcome → do
+      takeMVar waiting
+      killThread owner
+      takeMVar outcome >>= \case
+        Right () → expectationFailure "expected the cancellation to propagate"
+        Left propagated → do
+          fromException propagated `shouldBe` Just ThreadKilled
+          labelsOf (cleanupFailures propagated) `shouldBe` ["early"]
+          trail events
+            `shouldReturn` ["acquire first", "acquire early", "release early", "release first"]
 
 -- | An assembly whose only part's release throws, followed by a failing stage.
 failingRollback ∷ Trail → Assembly Text

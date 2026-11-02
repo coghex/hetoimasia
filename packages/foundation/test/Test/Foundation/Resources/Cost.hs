@@ -18,7 +18,6 @@
 -- because it is stable across machines and load.
 module Test.Foundation.Resources.Cost (spec) where
 
-import Control.Concurrent (forkIO)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception
   ( AllocationLimitExceeded
@@ -44,6 +43,7 @@ import Hetoimasia.Foundation.Resource
   )
 import System.Mem (performGC)
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe)
+import Test.Support.Owned (withOwnedThread)
 
 spec ∷ Spec
 spec = describe "Resource evidence inspection cost" $ do
@@ -189,16 +189,23 @@ measureAllocation action = do
   done ← newEmptyMVar
   performGC
   before ← allocatedBytes
-  _ ← forkIO $ do
-    outcome ← try @SomeException $ do
-      setAllocationCounter (fromIntegral measurementBound)
-      enableAllocationLimit
-      result ← action
-      disableAllocationLimit
-      pure result
-    disableAllocationLimit
-    putMVar done outcome
-  outcome ← takeMVar done
+  -- The thread is owned by the measurement: it has ended, and been joined, before the interval closes, however the example
+  -- ends. Its start and its release are inside the interval, as the start always was; they allocate a few hundred bytes
+  -- against budgets of mebibytes, and the limit is set and cleared by the thread itself, so the inspection is the only
+  -- thing that runs under it.
+  outcome ←
+    withOwnedThread
+      ( do
+          outcome ← try @SomeException $ do
+            setAllocationCounter (fromIntegral measurementBound)
+            enableAllocationLimit
+            result ← action
+            disableAllocationLimit
+            pure result
+          disableAllocationLimit
+          putMVar done outcome
+      )
+      (\_ _ → takeMVar done)
   performGC
   after ← allocatedBytes
   case outcome of
