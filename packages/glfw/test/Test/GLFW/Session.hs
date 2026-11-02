@@ -188,7 +188,7 @@ testLinuxBackendSelection = do
   -- The same platform, asked for Wayland: admitted at resolution, hinted, and
   -- verified as the backend GLFW actually selected.
   requested ← newSeam defaultScript
-  asProcessMainThread requested (entered requested (SessionConfig (Just Wayland)) (pure . sessionBackend))
+  asProcessMainThread requested (entered requested (defaultSessionConfig {requestedBackend = Just Wayland}) (pure . sessionBackend))
     `shouldReturn` Wayland
   seamCalls requested
     `shouldReturn` [ QueryPlatformSupported Wayland
@@ -211,7 +211,7 @@ testUnadmittedBackendsUnsupported ∷ Expectation
 testUnadmittedBackendsUnsupported = do
   linux ← newSeam defaultScript
   (cocoaOnLinux, caught) ←
-    asProcessMainThread linux (caughtAs (entered linux (SessionConfig (Just Cocoa)) (\_ → pure ())))
+    asProcessMainThread linux (caughtAs (entered linux (defaultSessionConfig {requestedBackend = Just Cocoa}) (\_ → pure ())))
   cocoaOnLinux `shouldBe` UnsupportedBackend (Just Cocoa) (Just X11)
   originOf caught `shouldBe` Just ("glfw", "enter session", [("backend", "cocoa")])
   seamCalls linux `shouldReturn` []
@@ -220,7 +220,7 @@ testUnadmittedBackendsUnsupported = do
     ( \(wanted, named) → do
         darwin ← newSeam darwinScript
         (refused, raised) ←
-          asProcessMainThread darwin (caughtAs (entered darwin (SessionConfig (Just wanted)) (\_ → pure ())))
+          asProcessMainThread darwin (caughtAs (entered darwin (defaultSessionConfig {requestedBackend = Just wanted}) (\_ → pure ())))
         refused `shouldBe` UnsupportedBackend (Just wanted) (Just Cocoa)
         originOf raised `shouldBe` Just ("glfw", "enter session", [("backend", named)])
         seamCalls darwin `shouldReturn` []
@@ -238,8 +238,8 @@ testBackendNotCompiledUnsupported ∷ Expectation
 testBackendNotCompiledUnsupported = do
   waylandMissing ← newSeam defaultScript {scriptPlatformSupported = (/= Wayland)}
   refusals ← asProcessMainThread waylandMissing $ do
-    (first, _) ← caughtAs (entered waylandMissing (SessionConfig (Just Wayland)) (\_ → pure ()))
-    (second, _) ← caughtAs (entered waylandMissing (SessionConfig (Just Wayland)) (\_ → pure ()))
+    (first, _) ← caughtAs (entered waylandMissing (defaultSessionConfig {requestedBackend = Just Wayland}) (\_ → pure ()))
+    (second, _) ← caughtAs (entered waylandMissing (defaultSessionConfig {requestedBackend = Just Wayland}) (\_ → pure ()))
     pure [first, second]
   -- The second refusal is the same answer, not SessionAlreadyActive: the
   -- first released the guard it had claimed.
@@ -318,7 +318,7 @@ testWaylandHintAnsweredWithX11 ∷ Expectation
 testWaylandHintAnsweredWithX11 = do
   seam ← newSeam defaultScript {scriptReportedPlatform = const (Just X11)}
   (mismatch, caught) ←
-    asProcessMainThread seam (caughtAs (entered seam (SessionConfig (Just Wayland)) (\_ → pure ())))
+    asProcessMainThread seam (caughtAs (entered seam (defaultSessionConfig {requestedBackend = Just Wayland}) (\_ → pure ())))
   mismatch `shouldBe` BackendNotSelected Wayland (Just X11)
   originOf caught `shouldBe` Just ("glfw", "verify backend", [("backend", "wayland")])
   seamCalls seam
@@ -353,7 +353,7 @@ testDisplayUnreachableReported = do
       initializationFailure request script = do
         seam ← newSeam script
         (failure, caught) ←
-          asProcessMainThread seam (caughtAs (entered seam (SessionConfig (Just request)) (\_ → pure ())))
+          asProcessMainThread seam (caughtAs (entered seam (defaultSessionConfig {requestedBackend = Just request}) (\_ → pure ())))
         nativeOutcome failure `shouldBe` NativeCallFailed
         pure (map errorSummary (reportedErrors (nativeReports failure)), caught, seam)
 

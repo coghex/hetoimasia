@@ -26,6 +26,9 @@
  * pull in the Wayland client headers for one pointer the shim never
  * dereferences: glfwGetWaylandDisplay is declared below with an incomplete
  * struct type, exactly as GLFW's own header declares it.
+ *
+ * The initializer wrapper is production code, and the one production path here
+ * that changes how GLFW initializes. See hetoimasia_glfw_init below.
  */
 #if defined(__linux__)
 #define _GNU_SOURCE
@@ -40,16 +43,87 @@
 static void record_waiting_thread(void);
 static int waiting_thread_blocked(void);
 
+/* Per platform, around glfwInit: prepare_initialization runs immediately before
+ * it and answers a token, and settle_initialization runs immediately after with
+ * the token and whether glfwInit returned GLFW_TRUE. Both run on the calling
+ * (process main) thread. */
+static unsigned prepare_initialization(void);
+static void settle_initialization(unsigned token, int initialized);
+
 #if defined(__APPLE__)
 #define GLFW_EXPOSE_NATIVE_COCOA
 #include <GLFW/glfw3native.h>
 #include <mach/mach.h>
+#include <dispatch/dispatch.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <pthread.h>
 #include <float.h>
+#include <stdint.h>
 
 static atomic_uint waiting_thread = MACH_PORT_NULL;
+
+/* Cocoa: a re-initialization must never wait for a launch that already happened.
+ *
+ * GLFW 3.4's _glfwInitCocoa calls [NSApp run] whenever
+ * -[NSRunningApplication isFinishedLaunching] answers NO, and that run returns
+ * only when applicationDidFinishLaunching: stops it. NSApplication sends that
+ * notification once per process. After an earlier initialization in this
+ * process has returned, a NO answer is therefore a stale read of LaunchServices'
+ * view of the process, and the run it leads to can never be stopped by the
+ * notification: the process main thread blocks in glfwInit for good (#586).
+ *
+ * So, from the second initialization on, a block is queued on the main queue
+ * before glfwInit. If glfwInit enters that run, the run loop services the main
+ * queue and the block stops the run and posts the event that wakes it, as
+ * GLFW's own delegate does at a real launch. If glfwInit does not enter it, the
+ * main queue is not serviced and nothing happens; a block that runs later finds
+ * its generation closed and does nothing. The first initialization of a process
+ * is untouched: its launch is real and its notification arrives. Nothing here
+ * changes the activation policy, the menu bar or the Dock. */
+static atomic_uint open_generation = 0;
+static atomic_uint next_generation = 0;
+static atomic_int launch_completed = 0;
+
+enum { NS_EVENT_TYPE_APPLICATION_DEFINED = 15 };
+
+typedef struct { double x; double y; } event_point;
+
+static void stop_redundant_launch_wait(void* context)
+{
+    unsigned generation = (unsigned) (uintptr_t) context;
+    if (atomic_load(&open_generation) != generation)
+        return;
+    id app = ((id (*)(id, SEL)) objc_msgSend)((id) objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
+    if (app == nil)
+        return;
+    ((void (*)(id, SEL, id)) objc_msgSend)(app, sel_registerName("stop:"), nil);
+    id event = ((id (*)(id, SEL, unsigned long, event_point, unsigned long, double, long, id, short, long, long)) objc_msgSend)(
+        (id) objc_getClass("NSEvent"),
+        sel_registerName("otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:"),
+        NS_EVENT_TYPE_APPLICATION_DEFINED, (event_point) {0, 0}, 0, 0.0, 0, nil, 0, 0, 0);
+    if (event != nil)
+        ((void (*)(id, SEL, id, BOOL)) objc_msgSend)(app, sel_registerName("postEvent:atStart:"), event, YES);
+}
+
+static unsigned prepare_initialization(void)
+{
+    unsigned generation;
+    if (!atomic_load(&launch_completed))
+        return 0;
+    generation = atomic_fetch_add(&next_generation, 1) + 1;
+    atomic_store(&open_generation, generation);
+    dispatch_async_f(dispatch_get_main_queue(), (void*) (uintptr_t) generation, stop_redundant_launch_wait);
+    return generation;
+}
+
+static void settle_initialization(unsigned token, int initialized)
+{
+    if (token != 0)
+        atomic_store(&open_generation, 0);
+    if (initialized)
+        atomic_store(&launch_completed, 1);
+}
 
 static void record_waiting_thread(void)
 {
@@ -139,6 +213,17 @@ struct wl_display;
 GLFWAPI struct wl_display* glfwGetWaylandDisplay(void);
 
 static atomic_int waiting_thread = 0;
+
+static unsigned prepare_initialization(void)
+{
+    return 0;
+}
+
+static void settle_initialization(unsigned token, int initialized)
+{
+    (void) token;
+    (void) initialized;
+}
 
 static void record_waiting_thread(void)
 {
@@ -365,6 +450,17 @@ int hetoimasia_glfw_is_process_main_thread(void)
     return 0;
 }
 
+static unsigned prepare_initialization(void)
+{
+    return 0;
+}
+
+static void settle_initialization(unsigned token, int initialized)
+{
+    (void) token;
+    (void) initialized;
+}
+
 static void record_waiting_thread(void)
 {
 }
@@ -400,6 +496,18 @@ int hetoimasia_glfw_wayland_connection_status(int* reason, int* error)
 }
 
 #endif
+
+/* glfwInit, bracketed by the platform's own preparation and settlement. It is
+ * called with GLFW's init hints set, on the process main thread, and answers
+ * exactly what glfwInit answers. On Cocoa it is the prevention of #586
+ * described above; elsewhere it is glfwInit itself. */
+int hetoimasia_glfw_init(void)
+{
+    unsigned token = prepare_initialization();
+    int initialized = glfwInit();
+    settle_initialization(token, initialized == GLFW_TRUE);
+    return initialized;
+}
 
 void** hetoimasia_glfw_monitors(int* count)
 {
