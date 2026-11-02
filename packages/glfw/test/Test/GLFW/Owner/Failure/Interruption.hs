@@ -21,9 +21,13 @@ import Control.Exception
   , IOException
   , finally
   , getMaskingState
+  , mask
+  , onException
+  , throwIO
   , throwTo
   )
-import Control.Monad (forM_, void)
+import Control.Monad (forM_, void, when)
+import Data.IORef (newIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
 import qualified Data.Text as Text
@@ -35,13 +39,15 @@ import Test.GLFW.Owner.Fixture.Drive
   , awaitTerminal
   , handedOver
   , pumpUntilRetired
+  , rescuePublishing
+  , trackedHandedOver
   , raisedBy
   , theWindow
   )
 import Test.GLFW.Owner.Fixture.Fake (Fake (..), script)
 import Test.GLFW.Owner.Fixture.Journal (Note (..), journalled)
-import Test.GLFW.Owner.Fixture.Rig (Rig (..), newRig, ownedHost, ownedHostCaught, ownedHostHooked)
-import Test.GLFW.Support (boundedExample, caughtAs, quietLogger, unexpected)
+import Test.GLFW.Owner.Fixture.Rig (Rig (..), armedBody, newRig, ownedHost, ownedHostCaught, ownedHostHooked)
+import Test.GLFW.Support (Scope, boundedExample, caughtAsUnless, cutExamples, quietLogger, unexpected)
 import Test.Hspec (Spec, it, shouldBe, shouldContain, shouldReturn, shouldSatisfy)
 import Test.GLFW.Support (withDeferredThreadOpening)
 import Test.Support.Owned (withOwnedThread)
@@ -54,6 +60,8 @@ spec = do
     (boundedExample testOperationAnswersCommitUninterrupted)
   it "waits for a terminal group report however the join is interrupted"
     (boundedExample testJoinAwaitsTerminalReport)
+  cutExamples "the record fixture" retirementRecordScenario
+  cutExamples "the join fixture" joinScenario
 
 -- | A target retirement that returned is recorded, whatever is delivered to
 -- the owner as it returns — so it is never offered a second time.
@@ -64,15 +72,26 @@ spec = do
 -- target would be neither retired nor marked, and the drain would offer the
 -- operation again, disposing a second time what the backend already disposed.
 testRetirementRecordSurvivesCancellation ∷ IO ()
-testRetirementRecordSurvivesCancellation = do
+testRetirementRecordSurvivesCancellation = retirementRecordSurvives False (\_ → pure ())
+
+-- | The same fixture ended at the cut (#593): before the retirement is armed, or after it and the rescue that publishes the evidence
+-- its exit waits for are registered.
+retirementRecordScenario ∷ Bool → Scope → IO () → IO ()
+retirementRecordScenario cutAt _ atParked = retirementRecordSurvives True (\armedNow → when (armedNow == cutAt) atParked)
+
+retirementRecordSurvives ∷ Bool → (Bool → IO ()) → IO ()
+retirementRecordSurvives scenario cut = do
   rig ← newRig
   entered ← newTVarIO False
   attempts ← newTVarIO (0 ∷ Int)
   recorded ← newTVarIO []
-  script (fakeRetireTarget (rigFake rig)) $ \retire → do
-    atomically (modifyTVar' attempts (+ 1))
-    atomically (writeTVar entered True)
-    pure (targetRetired (Text.pack (show (retiringWindow retire))))
+  tracked ← newIORef []
+  -- Armed inside the body's first masked step, which also registers the rescue that publishes the independent evidence the exit
+  -- waits for if the body ends before it publishes it itself (#593).
+  let arm = script (fakeRetireTarget (rigFake rig)) $ \retire → do
+        atomically (modifyTVar' attempts (+ 1))
+        atomically (writeTVar entered True)
+        pure (targetRetired (Text.pack (show (retiringWindow retire))))
   -- Delivered again and again from the instant the call is entered, so one of
   -- them lands wherever the owner is least protected — inside the call, on
   -- its way out, or after the record.
@@ -84,9 +103,9 @@ testRetirementRecordSurvivesCancellation = do
             [] → retry
         forM_ [1 ∷ Int .. 20] (\_ → throwTo ownerThread ThreadKilled)
   withOwnedThread harry $ \_ _ → do
-    outcome ← ownedHostCaught (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+    outcome ← ownedHostCaught (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → armedBody cut arm (rescuePublishing tracked host owner) $ do
       window ← theWindow host
-      service ← handedOver host owner window
+      service ← trackedHandedOver tracked host owner window
       awaitStanding owner service `shouldReturn` TargetUsable
       _ ← releaseGraphicsTarget host owner service
       atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
@@ -102,6 +121,8 @@ testRetirementRecordSurvivesCancellation = do
       -- Captured here rather than returned: the run itself raises the
       -- cancellation at its exit, so the body's value never reaches the caller.
       atomically . writeTVar recorded . Map.keys =<< atomically (readTargetTerminalsNow owner)
+    -- In a scenario the ending the example was given is the point, and propagates.
+    when scenario (either throwIO (\_ → pure ()) outcome)
     -- However it ended, it ended by raising the cancellation rather than
     -- swallowing it.
     void (raisedBy outcome)
@@ -159,14 +180,24 @@ testOperationAnswersCommitUninterrupted = do
 -- then stays inside its backend call, so the exit is certainly in the join
 -- and not in the wait before it.
 testJoinAwaitsTerminalReport ∷ IO ()
-testJoinAwaitsTerminalReport = do
+testJoinAwaitsTerminalReport = joinAwaitsTerminalReport False (\_ → pure ())
+
+-- | The same fixture ended at the cut (#593): before the destruction is held and the helper handed the owner, or after both, in one
+-- masked step.
+joinScenario ∷ Bool → Scope → IO () → IO ()
+joinScenario cutAt _ atParked = joinAwaitsTerminalReport True (\armedNow → when (armedNow == cutAt) atParked)
+
+joinAwaitsTerminalReport ∷ Bool → (Bool → IO ()) → IO ()
+joinAwaitsTerminalReport scenario cut = do
   rig ← newRig
   release ← newTVarIO False
   joining ← newEmptyMVar
-  script (fakeDestroy (rigFake rig)) $ \_ → do
-    putMVar joining ()
-    atomically (readTVar release >>= check)
-    pure (ownerDestroyed (Text.pack "destroyed"))
+  -- The destruction is held at its gate only from the body's first masked step, which hands the helper the owner (and so what it
+  -- opens the gate with) in the same step (#593): the exit never meets a held destruction nobody can release.
+  let arm = script (fakeDestroy (rigFake rig)) $ \_ → do
+        putMVar joining ()
+        atomically (readTVar release >>= check)
+        pure (ownerDestroyed (Text.pack "destroyed"))
   released ← newTVarIO Nothing
   -- The helper supplies the evidence the exit's join waits for and opens the gate the owner is held at, so it must outlive the
   -- host's exit that it unblocks: it is owned by the example, not by the host body that hands it the owner (#593). Whatever
@@ -185,11 +216,14 @@ testJoinAwaitsTerminalReport = do
         )
           `finally` atomically (writeTVar release True)
   withDeferredThreadOpening (atomically (writeTVar release True)) helper $ \_ handOver → do
-    (raised, _) ← caughtAs @IOException $
+    (raised, _) ← caughtAsUnless @IOException scenario $
       ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
         main ← myThreadId
-        handOver (owner, main)
-        void (awaitRound owner 0)
+        cut False
+        mask $ \restore → do
+          handOver (owner, main)
+          arm
+          restore (cut True >> void (awaitRound owner 0)) `onException` atomically (writeTVar release True)
     show raised `shouldContain` "delivered during the join"
     readTVarIO released `shouldReturn` Just []
     notes ← journalled (rigJournal rig)

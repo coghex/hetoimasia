@@ -21,7 +21,7 @@ import Control.Exception
   , throwTo
   , try
   )
-import Control.Monad (forM, forM_, void)
+import Control.Monad (forM, forM_, void, when)
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as Text
 import Hetoimasia.Runtime.GLFW
@@ -43,6 +43,7 @@ import Test.GLFW.Owner.Fixture.Fake (Fake (..), script)
 import Test.GLFW.Owner.Fixture.Journal (Note (..), Scripted (..), journalled, ordered)
 import Test.GLFW.Owner.Fixture.Rig
   ( Rig (..)
+  , armedBody
   , countingClock
   , newRig
   , newRigWith
@@ -51,8 +52,10 @@ import Test.GLFW.Owner.Fixture.Rig
   , ownerSettings
   )
 import Test.GLFW.Support
-  ( boundedExample
-  , caughtAs
+  ( Scope
+  , boundedExample
+  , caughtAsUnless
+  , cutExamples
   , quietLogger
   , unexpected
   , windowNamed
@@ -69,6 +72,7 @@ spec = do
     (boundedExample testPartialConstruction)
   it "keeps a construction that was interrupted as unverified, and retires that too"
     (boundedExample testCancelledConstruction)
+  cutExamples "the cancelled construction fixture" cancelledConstructionScenario
   it "certifies a verified rollback's facts without a retirement of its own"
     (boundedExample testVerifiedRollback)
   it "leaks no port reservation when a handover is refused, and tells the owner about an attachment whose answer was lost"
@@ -193,23 +197,32 @@ accountedFor record = terminalPublished record <> terminalOwed record
 -- | A construction whose failure the backend did not verify a rollback for
 -- leaves the owner owning something, so the owner retires it.
 testCancelledConstruction ∷ IO ()
-testCancelledConstruction = do
+testCancelledConstruction = cancelledConstruction False (\_ → pure ())
+
+-- | The same fixture ended at the cut (#593): before the failing construction and the gated retirement are armed, or after they and the
+-- release of the gate are registered.
+cancelledConstructionScenario ∷ Bool → Scope → IO () → IO ()
+cancelledConstructionScenario cutAt _ atParked = cancelledConstruction True (\armedNow → when (armedNow == cutAt) atParked)
+
+cancelledConstruction ∷ Bool → (Bool → IO ()) → IO ()
+cancelledConstruction scenario cut = do
   rig ← newRig
-  script (fakeConstruct (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "transfer")))
   observedStanding ← newTVarIO Nothing
   observedRecord ← newTVarIO Nothing
   -- Its retirement is held until the example has read the standing, because
   -- a required failure takes the owner into its drain at once and the drain
   -- retires the target it kept.
   gate ← newTVarIO False
-  script (fakeRetireTarget (rigFake rig)) $ \retire → do
-    atomically (readTVar gate >>= check)
-    pure (targetRetired (Text.pack (show (retiringWindow retire))))
+  let arm = do
+        script (fakeConstruct (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "transfer")))
+        script (fakeRetireTarget (rigFake rig)) $ \retire → do
+          atomically (readTVar gate >>= check)
+          pure (targetRetired (Text.pack (show (retiringWindow retire))))
   -- The owner's disposition is required, so the failure it kept is terminal
   -- and the whole run reports it. What the example asserts is what the owner
   -- did with the target /before/ that: it kept it, and it retired it.
-  (raised, _) ← caughtAs @Scripted $
-    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+  (raised, _) ← caughtAsUnless scenario $
+    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → armedBody cut arm (atomically (writeTVar gate True)) $ do
       window ← theWindow host
       service ← handedOver host owner window
       standing ← awaitStanding owner service

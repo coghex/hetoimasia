@@ -43,6 +43,7 @@ import Test.GLFW.Owner.Fixture.Fake (Fake (..), ScriptedTimer (..), fireTimer, s
 import Test.GLFW.Owner.Fixture.Journal (Note (..), journalled, ordered)
 import Test.GLFW.Owner.Fixture.Rig
   ( Rig (..)
+  , armedBody
   , countingClock
   , newRig
   , newRigWith
@@ -51,7 +52,7 @@ import Test.GLFW.Owner.Fixture.Rig
   , ownedHostHooked
   , ownerSettings
   )
-import Test.GLFW.Support (at, boundedExample, millis, quietLogger, unexpected, windowNamed)
+import Test.GLFW.Support (Scope, at, boundedExample, cutExamples, millis, quietLogger, unexpected, windowNamed)
 import Test.Hspec (Spec, it, shouldBe, shouldReturn, shouldSatisfy)
 import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
@@ -63,6 +64,7 @@ spec = do
     (boundedExample testIndividualRelease)
   it "asks again on a later round for a released target whose retirement is owed, certifying nothing meanwhile"
     (boundedExample testOwedRetirementRetried)
+  cutExamples "the owed retirement fixture" owedRetiredScenario
   it "waits in its exit drain for a retirement still owed, and retires the target before the owner"
     (boundedExample testOwedRetirementDrained)
   it "hands its exit drain's timer the backend's deadline, or its fallback interval after the drain's own reading"
@@ -138,16 +140,26 @@ testIndividualRelease = do
 -- yet is asked again on a later round, and nothing is retired or certified
 -- until it can be.
 testOwedRetirementRetried ∷ IO ()
-testOwedRetirementRetried = do
+testOwedRetirementRetried = owedRetirementRetried (\_ → pure ())
+
+-- | The same fixture ended at the cut (#593): before the retirement is held owed, or after it is and the release that makes it ready is
+-- registered.
+owedRetiredScenario ∷ Bool → Scope → IO () → IO ()
+owedRetiredScenario cutAt _ atParked = owedRetirementRetried (\armedNow → when (armedNow == cutAt) atParked)
+
+owedRetirementRetried ∷ (Bool → IO ()) → IO ()
+owedRetirementRetried cut = do
   rig ← newRig
   asked ← newTVarIO (0 ∷ Int)
   ready ← newTVarIO False
-  script (fakePrepare (rigFake rig)) $ \_ → atomically $ do
-    modifyTVar' asked (+ 1)
-    open ← readTVar ready
-    pure (if open then RetirementReady else RetirementOwed (Text.pack "a present fence is pending"))
+  -- Owed until the body says otherwise; armed only inside the body's first masked step, after the release that makes it ready on
+  -- any exit is registered (#593).
+  let arm = script (fakePrepare (rigFake rig)) $ \_ → atomically $ do
+        modifyTVar' asked (+ 1)
+        open ← readTVar ready
+        pure (if open then RetirementReady else RetirementOwed (Text.pack "a present fence is pending"))
   (whileOwed, certifiedWhileOwed, askedInAll, retiredOnce) ←
-    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+    ownedHost (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → armedBody cut arm (atomically (writeTVar ready True)) $ do
       window ← theWindow host
       service ← handedOver host owner window
       awaitConstructed rig (Text.pack (show window))

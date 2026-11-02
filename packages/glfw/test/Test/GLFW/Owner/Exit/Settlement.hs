@@ -16,8 +16,8 @@ import Control.Concurrent.STM
   , retry
   , writeTVar
   )
-import Control.Exception (SomeException, throwIO, try)
-import Control.Monad (forM, void, when)
+import Control.Exception (SomeException, finally, onException, throwIO, try)
+import Control.Monad (forM, forM_, void, when)
 import Data.Maybe (isJust)
 import qualified Data.Text as Text
 import Hetoimasia.Foundation.Messaging.Payload (prepare)
@@ -47,8 +47,12 @@ import Test.GLFW.Owner.Fixture.Rig
   , ownedHostHooked
   , ownerSettings
   )
+import Data.Foldable (for_)
 import Test.GLFW.Support
-  ( boundedExample
+  ( Ending (..)
+  , Scope
+  , boundedExample
+  , exitFinishes
   , newSinkTrace
   , quietLogger
   , sinkFailingOn
@@ -76,6 +80,10 @@ spec = do
     (boundedExample testWholeOwnerAfterLastTarget)
   it "reads a destruction and completion that both land inside its wait as verified, declaring nothing"
     (boundedExample testCoherentDestructionSnapshot)
+  for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
+    for_ [(0 ∷ Int, "during the run's startup"), (1, "at the body's first statement")] $ \(k, where') →
+      it ("finishes the exit when the example body " <> label <> " " <> where' <> ", before the owner was published to the exit's hook (#593)") $
+        boundedExample (exitFinishes ending (coherentSnapshotScenario k))
 
 -- | An ordinary public stop closes every publication, and an announcement
 -- admitted just before it is still drained.
@@ -332,8 +340,19 @@ testWholeOwnerAfterLastTarget = do
 -- destroyed everything: one that decides from the snapshot alone only waits,
 -- and its next turn finds the evidence.
 testCoherentDestructionSnapshot ∷ IO ()
-testCoherentDestructionSnapshot = do
+testCoherentDestructionSnapshot = coherentDestructionSnapshot False (pure ()) (pure ())
+
+-- | The same fixture ended during the run's startup (@0@, before the body) or at the body's first statement (@1@), before the owner
+-- was published to the exit's hook (#593): the hook must not wait for ever for an owner the body never published.
+coherentSnapshotScenario ∷ Int → Scope → IO () → IO ()
+coherentSnapshotScenario k _ atParked =
+  coherentDestructionSnapshot True (when (k == 0) atParked) (when (k == 1) atParked)
+
+coherentDestructionSnapshot ∷ Bool → IO () → IO () → IO ()
+coherentDestructionSnapshot scenario startupCut bodyCut = do
   rig ← newRig
+  -- Set when the body ended without publishing the owner, however it ended (#593).
+  gone ← newTVarIO False
   trace ← newSinkTrace
   let recording = sinkFailingOn (Text.pack "never") trace
   held ← newTVarIO Nothing
@@ -348,18 +367,28 @@ testCoherentDestructionSnapshot = do
           { Private.afterDestructionSnapshot = do
               first ← atomically (stateTVar turns (\n → (n == 0, n + 1)))
               when first $ do
-                owner ← atomically (readTVar held >>= maybe retry pure)
+                published ← atomically $
+                  readTVar held >>= \case
+                    Just owner → pure (Just owner)
+                    Nothing → readTVar gone >>= \abandoned → if abandoned then pure Nothing else retry
                 atomically (writeTVar snapshotRead True)
-                atomically $ do
-                  terminal ← readOwnerTerminalNow owner
-                  check (isJust (ownerDestroyedEvidence terminal) && ownerRunEnded terminal)
-                notes ← journalled (rigJournal rig)
-                atomically (writeTVar releasedWhileHeld (Just (filter released notes)))
+                forM_ published $ \owner → do
+                  atomically $ do
+                    terminal ← readOwnerTerminalNow owner
+                    check (isJust (ownerDestroyedEvidence terminal) && ownerRunEnded terminal)
+                  notes ← journalled (rigJournal rig)
+                  atomically (writeTVar releasedWhileHeld (Just (filter released notes)))
+          , Private.beforeConsumer = \_ → startupCut `onException` atomically (writeTVar gone True)
           }
   outcome ← try @SomeException $
-    ownedHostHooked hooks recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control → do
-      atomically (writeTVar held (Just owner))
-      void (awaitRound owner 0)
+    ownedHostHooked hooks recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _control →
+      ( do
+          bodyCut
+          atomically (writeTVar held (Just owner))
+          void (awaitRound owner 0)
+      )
+        `finally` atomically (writeTVar gone True)
+  when scenario (either throwIO (\_ → pure ()) outcome)
   case outcome of
     Right () → pure ()
     Left failure → unexpected ("the exit failed after a successful teardown: " <> show failure)
