@@ -34,9 +34,9 @@ module Test.Run.Repeat.Batch
   ) where
 
 import Control.Concurrent (threadDelay)
-import Control.Exception (SomeException, mask, onException, try)
+import Control.Exception (SomeException, mask, onException, try, uninterruptibleMask_)
 import Control.Monad (filterM, forM, unless, void)
-import Data.IORef (modifyIORef', newIORef, readIORef)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf, nub)
 import GHC.Clock (getMonotonicTime)
 import System.Directory (doesFileExist)
@@ -44,7 +44,7 @@ import System.Exit (ExitCode (ExitFailure, ExitSuccess))
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempFile)
 import System.IO (Handle, IOMode (WriteMode), hClose, openBinaryFile)
-import System.Posix.Signals (Signal, nullSignal, sigKILL, sigTERM, signalProcess)
+import System.Posix.Signals (nullSignal, sigKILL, sigTERM, signalProcess)
 import System.Posix.Types (CPid)
 import System.Process
   ( CreateProcess (..)
@@ -53,9 +53,8 @@ import System.Process
   , createProcess
   , getPid
   , proc
-  , waitForProcess
+  , getProcessExitCode
   )
-import System.Timeout (timeout)
 import Text.Printf (printf)
 import Text.Read (readMaybe)
 
@@ -141,10 +140,15 @@ data Ended = Ended {endedStatus ∷ Maybe ExitCode, endedReclaimed ∷ Bool, end
 
 -- | Run a command to completion or to its bound, with its output written to the handles (which the process library
 -- closes in this process once the child holds them). When the bound passes, the owned processes are handed to
--- @atBound@, one at a time (to be sampled), before they are stopped; its answers are returned. A cancellation anywhere stops the owned
--- processes before it propagates.
-runOwned ∷ Scope → [String] → FilePath → Handle → Handle → Int → Int → (CPid → IO a) → IO (Ended, [a])
-runOwned scope command directory handleOut handleErr boundSeconds graceSeconds atBound = do
+-- @atBound@, one at a time (to be sampled), before they are stopped; its answers are returned.
+--
+-- /Cleanup is not interruptible./ Everything after the process exists that finds or stops owned processes runs under
+-- 'uninterruptibleMask_': it is bounded (a grace for TERM, a grace for KILL, a poll of 20 ms, each by the clock and not
+-- by 'timeout', which cannot fire in an uninterruptible region), so a cancellation that arrives during it is delivered
+-- after the processes are gone and not in the middle of stopping them. What the cleanup found is written to the
+-- reference, so a cancelled trial still says whether everything was reclaimed.
+runOwned ∷ Scope → [String] → FilePath → Handle → Handle → Int → Int → IORef Bool → (CPid → IO a) → IO (Ended, [a])
+runOwned scope command directory handleOut handleErr boundSeconds graceSeconds reclaimedRef atBound = do
   (program, arguments) ← case command of
     [] → ioError (userError "a command is needed")
     first : rest → pure (first, rest)
@@ -159,16 +163,21 @@ runOwned scope command directory handleOut handleErr boundSeconds graceSeconds a
           , create_group = True
           }
     root ← getPid handle >>= maybe (ioError (userError "the command ended before its pid was read")) pure
-    let stop = stopOwned scope graceSeconds root handle
-    outcome ← restore (timeout (boundSeconds * 1_000_000) (waitForProcess handle)) `onException` stop
+    let stop = uninterruptibleMask_ $ do
+          reclaimed ← stopOwned scope graceSeconds root handle
+          unless reclaimed (writeIORef reclaimedRef False)
+          pure reclaimed
+    outcome ← restore (waitBounded boundSeconds handle) `onException` stop
     case outcome of
       Just code → do
         -- The root ended on its own. Whatever it left in its group is still this command's.
-        left ← filter (/= root) <$> ownedIn scope root
-        reclaimed ← if null left then pure True else stop
+        (left, reclaimed) ← uninterruptibleMask_ $ do
+          left ← filter (/= root) <$> ownedIn scope root
+          reclaimed ← if null left then pure True else stop
+          pure (left, reclaimed)
         pure (Ended (Just code) reclaimed (length left), [])
       Nothing → do
-        pids ← (<> [root]) <$> ownedIn scope root
+        pids ← uninterruptibleMask_ ((<> [root]) <$> ownedIn scope root)
         answers ← restore (forM pids atBound) `onException` stop
         reclaimed ← stop
         pure (Ended Nothing reclaimed 0, answers)
@@ -179,7 +188,12 @@ ownedIn RootOnly _ = pure []
 
 -- | Run one trial, writing @run-NNN.out@, @run-NNN.err@ and the samples under the directory, and answer its outcome.
 runTrial ∷ Trial → FilePath → Int → IO Outcome
-runTrial trial directory index = do
+runTrial trial directory index = newIORef True >>= \reclaimedRef → runTrialRecording reclaimedRef trial directory index
+
+-- | 'runTrial', recording in the reference whether the cleanup of everything the trial started found it all gone, so that a
+-- trial that is cancelled still says so.
+runTrialRecording ∷ IORef Bool → Trial → FilePath → Int → IO Outcome
+runTrialRecording reclaimedRef trial directory index = do
   let stem = directory </> printf "run-%03d" index
       outFile = stem <> ".out"
       errFile = stem <> ".err"
@@ -187,7 +201,7 @@ runTrial trial directory index = do
   handleOut ← openBinaryFile outFile WriteMode
   handleErr ← openBinaryFile errFile WriteMode
   (ended, sampled) ←
-    runOwned WholeTree (trialCommand trial) (trialDirectory trial) handleOut handleErr (trialBoundSeconds trial) (trialStopGraceSeconds trial) (takeSample trial stem)
+    runOwned WholeTree (trialCommand trial) (trialDirectory trial) handleOut handleErr (trialBoundSeconds trial) (trialStopGraceSeconds trial) reclaimedRef (takeSample reclaimedRef trial stem)
   finished ← getMonotonicTime
   out ← readFileOrEmpty outFile
   err ← readFileOrEmpty errFile
@@ -211,7 +225,8 @@ runTrial trial directory index = do
 runPreparation ∷ [String] → FilePath → FilePath → Int → Int → IO (Maybe ExitCode)
 runPreparation command directory outFile boundSeconds graceSeconds = do
   handleOut ← openBinaryFile outFile WriteMode
-  (ended, _) ← runOwned WholeTree command directory handleOut handleOut boundSeconds graceSeconds (const (pure ()))
+  reclaimedRef ← newIORef True
+  (ended, _) ← runOwned WholeTree command directory handleOut handleOut boundSeconds graceSeconds reclaimedRef (const (pure ()))
   pure (endedStatus ended)
 
 readFileOrEmpty ∷ FilePath → IO String
@@ -226,8 +241,8 @@ readFileOrEmpty path = do
 -- | One bounded @sample@ of a process: the line that says what came of it, and whether the sampler (and anything it
 -- started) is gone. The sampler is owned like any other process: when its bound passes it is stopped by pid, escalated after
 -- the grace, and reaped before the trial goes on.
-takeSample ∷ Trial → FilePath → CPid → IO [(String, Bool)]
-takeSample trial stem pid = do
+takeSample ∷ IORef Bool → Trial → FilePath → CPid → IO [(String, Bool)]
+takeSample reclaimedRef trial stem pid = do
   let file = stem <> "." <> show pid <> ".sample.txt"
   case trialSample trial pid file of
     [] → pure [(show pid <> ": no sampler", True)]
@@ -236,7 +251,7 @@ takeSample trial stem pid = do
       handleErr ← openBinaryFile (file <> ".err") WriteMode
       attempt ←
         try @SomeException $
-          runOwned WholeTree command (trialDirectory trial) handleOut handleErr (trialSampleBoundSeconds trial) (trialStopGraceSeconds trial) (const (pure ()))
+          runOwned WholeTree command (trialDirectory trial) handleOut handleErr (trialSampleBoundSeconds trial) (trialStopGraceSeconds trial) reclaimedRef (const (pure ()))
       pure . pure $ case attempt of
         Left failure → (show pid <> ": sampling failed: " <> show failure, False)
         Right (ended, _) → case endedStatus ended of
@@ -249,7 +264,8 @@ takeSample trial stem pid = do
 runCaptured ∷ [String] → FilePath → Int → IO (Maybe ExitCode, String)
 runCaptured command directory boundSeconds =
   withSystemTempFile "captured" $ \path handle → do
-    (ended, _) ← runOwned RootOnly command directory handle handle boundSeconds 5 (const (pure ()))
+    reclaimedRef ← newIORef True
+    (ended, _) ← runOwned RootOnly command directory handle handle boundSeconds 5 reclaimedRef (const (pure ()))
     hClose handle
     output ← readFileOrEmpty path
     pure (endedStatus ended, output)
@@ -268,32 +284,52 @@ ownedProcesses root = do
 isAlive ∷ CPid → IO Bool
 isAlive pid = either (const False) (const True) <$> try @SomeException (signalProcess nullSignal pid)
 
--- | Stop what a root owns, by pid. The set is taken once, before any signal: the root and its owned processes. TERM goes to
--- each that is alive; the root is reaped within the grace and the rest are polled (they are not this process's children,
--- so there is nothing to wait on) for the same grace; KILL then goes to whatever is still alive. Answers whether all of
--- them are gone.
+-- | Stop what a root owns, by pid, and answer whether everything is gone. Every sweep re-enumerates what the root owns (its
+-- tree and its process group) and what was known before, so a process started during the shutdown (a TERM handler that
+-- starts a child and exits) is found and signalled like the rest. TERM goes to each owned pid that is alive and has not
+-- been sent it, until none is alive or the grace is over; then KILL, the same way, for a second grace. The root is reaped
+-- on every sweep. The last word is a fresh enumeration: reclaimed means that nothing it found is alive.
 stopOwned ∷ Scope → Int → CPid → ProcessHandle → IO Bool
 stopOwned scope grace root handle = do
-  below ← ownedIn scope root
-  let owned = below <> [root]
-  signalAll sigTERM owned
-  _ ← timeout (grace * 1_000_000) (waitForProcess handle)
-  goneWithin owned
-  survivors ← filterM isAlive owned
-  unless (null survivors) $ do
-    signalAll sigKILL survivors
-    _ ← timeout (grace * 1_000_000) (waitForProcess handle)
-    goneWithin survivors
-  not . or <$> forM owned isAlive
+  seen ← newIORef []
+  phase seen sigTERM
+  survivors ← readIORef seen >>= filterM isAlive
+  unless (null survivors) (phase seen sigKILL)
+  void (getProcessExitCode handle)
+  known ← readIORef seen
+  found ← ownedIn scope root
+  living ← filterM isAlive (nub (found <> known <> [root]))
+  pure (null living)
   where
-    signalAll ∷ Signal → [CPid] → IO ()
-    signalAll signal pids = mapM_ (\pid → try @SomeException (signalProcess signal pid)) pids
-    -- A bounded poll: the processes below the root are not children of this one.
-    goneWithin pids = void . timeout (grace * 1_000_000) $ do
-      let loop = do
-            living ← filterM isAlive pids
-            unless (null living) (threadDelay 20_000 >> loop)
-      loop
+    -- Signal each owned, living pid not yet signalled in this phase, again and again, until nothing is alive or the grace is
+    -- over, by the clock. Every pid seen is kept, even when the grace ends the loop.
+    phase seen signal = do
+      start ← getMonotonicTime
+      loop seen signal start []
+    loop seen signal start signalled = do
+      void (getProcessExitCode handle)
+      found ← ownedIn scope root
+      known ← readIORef seen
+      living ← filterM isAlive (nub (found <> known <> [root]))
+      modifyIORef' seen (\before → nub (before <> living))
+      let fresh = [pid | pid ← living, pid `notElem` signalled]
+      mapM_ (\pid → try @SomeException (signalProcess signal pid)) fresh
+      now ← getMonotonicTime
+      unless (null living || now - start >= fromIntegral grace) $
+        threadDelay 20_000 >> loop seen signal start (signalled <> fresh)
+
+-- | Wait for a process for at most this many seconds, by polling its status against the clock, so the bound holds in any
+-- masking state. 'Nothing' when it is still running.
+waitBounded ∷ Int → ProcessHandle → IO (Maybe ExitCode)
+waitBounded seconds handle = do
+  start ← getMonotonicTime
+  let loop =
+        getProcessExitCode handle >>= \case
+          Just code → pure (Just code)
+          Nothing → do
+            now ← getMonotonicTime
+            if now - start >= fromIntegral seconds then pure Nothing else threadDelay 20_000 >> loop
+  loop
 
 -- | Whether a batch goes on after an outcome: not past its size, not after the first hang when it stops at one, and not
 -- after a trial whose processes could not all be stopped (another trial would start beside them).
@@ -315,10 +351,12 @@ runBatch trial directory runs untilHang render announce = do
   let write = readIORef seen >>= \outcomes → writeFile (directory </> "report.md") (render (reverse outcomes))
       go index = do
         started ← getMonotonicTime
+        reclaimedRef ← newIORef True
         outcome ←
-          runTrial trial directory index `onException` do
+          runTrialRecording reclaimedRef trial directory index `onException` do
             now ← getMonotonicTime
-            modifyIORef' seen (interrupted (now - started) :)
+            reclaimed ← readIORef reclaimedRef
+            modifyIORef' seen (interrupted (now - started) reclaimed :)
             write
         modifyIORef' seen (outcome :)
         write
@@ -327,12 +365,12 @@ runBatch trial directory runs untilHang render announce = do
   go 1
   reverse <$> readIORef seen
   where
-    interrupted seconds =
+    interrupted seconds reclaimed =
       Outcome
         { outcomeVerdict = Failed "interrupted: the attempt was cancelled before it ended"
         , outcomeStatus = Nothing
         , outcomeSeconds = seconds
         , outcomeSamples = []
-        , outcomeReclaimed = True
+        , outcomeReclaimed = reclaimed
         , outcomeOrphans = 0
         }

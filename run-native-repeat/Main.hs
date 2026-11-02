@@ -159,6 +159,31 @@ machinery = do
         Nothing → expectationFailure ("no sampler pid: " <> sampler')
         Just pid → isAlive pid `shouldReturn` False
 
+  it "stops a TERM-ignoring child a passing run left, even when the batch is cancelled during that cleanup" $
+    withSystemTempDirectory "repeat-probe" $ \directory → do
+      let pidFile = directory </> "stubborn.pid"
+          script = "(trap '' TERM; exec sleep 3600) & echo $! > " <> pidFile <> "; echo '54 examples, 0 failures'"
+          trial = (stub directory 30 script) {trialStopGraceSeconds = 2}
+      -- The run is over at once and its cleanup waits a grace for the child, which ignores TERM: the cancellation lands there.
+      abandoned ← timeout 700_000 (runTrial trial directory 1)
+      abandoned `shouldSatisfy` maybe True (const False)
+      stubborn ← readFile pidFile
+      case readMaybe stubborn of
+        Nothing → expectationFailure ("no child pid: " <> stubborn)
+        Just pid → isAlive pid `shouldReturn` False
+
+  it "stops a child that a run's TERM handler starts during the shutdown, and does not report the run as reclaimed before it is gone" $
+    withSystemTempDirectory "repeat-probe" $ \directory → do
+      let pidFile = directory </> "late.pid"
+          script = "trap 'sleep 3600 & echo $! > " <> pidFile <> "; exit 0' TERM; sleep 3600 & wait"
+      outcome ← runTrial (stub directory 1 script) directory 1
+      outcomeVerdict outcome `shouldSatisfy` isHung
+      outcomeReclaimed outcome `shouldBe` True
+      late ← readFile pidFile
+      case readMaybe late of
+        Nothing → expectationFailure ("no late child pid: " <> late)
+        Just pid → isAlive pid `shouldReturn` False
+
   it "persists the partial report, with the interrupted attempt recorded as a failure, when a batch is cancelled" $
     withSystemTempDirectory "repeat-probe" $ \directory → do
       let render outcomes = show (length outcomes) <> " attempts, " <> show (map outcomeVerdict outcomes)
