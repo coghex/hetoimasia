@@ -92,10 +92,7 @@ does.
   keeps a pipe open past the drain is given up on and the answer says so
   (`DrainGivenUp`). `Bounds` and `Seams` are explicit arguments for the facility's
   own examples (a shorter grace, a failed acquisition, a parked release, a wait
-  that does not observe the exit); production use is `noSeams`. `withHost` and
-  `hosted` keep a scoped child's scope open past the call that ran it, until the
-  host's own scope ends, for the display helper examples, which look at what the
-  helper left in its process group before anything ends it. It needs `base`,
+  that does not observe the exit); production use is `noSeams`. It needs `base`,
   `bytestring`, `stm`, `text` and `unix`, a small C file for the non-reaping look
   at a child, and the bounded wait for a group's end is the one place it polls.
 
