@@ -12,13 +12,15 @@ checks merged work and changed issues against it and resumes from
 
 ## Where things stand
 
-- Lua: the trusted foundation ([runtime design](docs/lua_runtime_design.md)) is
+- Lua: the trusted foundation ([runtime design](docs/archive/designs/lua_runtime_design.md)) is
   delivered and owner-accepted 2026-10-21 (#500); #145 closed under its revised
   trusted scope. Confinement (LUA-9 to LUA-13, LUA-16, LUA-17) is deferred outside
-  active delivery, not implemented. The [Lua-first engine design](docs/designs/lua_first_engine_design.md)
-  defines M1, a Lua-driven textured quad in a window with a real logical VM and
-  no gameplay state store or mod activation; it records its own readiness and
-  next steps, and its questions go to `#het-luafirst`.
+  active delivery, not implemented. The [Lua-first engine design](docs/archive/designs/lua_first_engine_design.md)
+  defined M1, a Lua-driven textured quad in a window with a real logical VM and
+  no gameplay state store or mod activation. M1 is delivered: epic #514 closed
+  2026-11-01 with all 28 slices merged. The next arc, engine-held gameplay state
+  that Lua defines, is in design in
+  [gameplay_state_design.md](docs/designs/gameplay_state_design.md).
 - Rendering: the [2D renderer design](docs/designs/render_2d_design.md) is delivered
   except deferred #446; [GPU backend contract](docs/gpu_backend.md);
   [samples](samples/README.md).
@@ -35,14 +37,14 @@ checks merged work and changed issues against it and resumes from
   dedicated type modules, module types under the owning module's directory
   (`Camera/Types.hs`), `Base`/`Types` under about 600 lines. `packages/math`
   imports no other local or graphics package.
-- 2026-10-21, [Lua-first design](docs/designs/lua_first_engine_design.md) D-2/D-5
+- 2026-10-21, [Lua-first design](docs/archive/designs/lua_first_engine_design.md) D-2/D-5
   and [V-9](docs/vision.md): game and mod Lua alike are trusted, in-process code
   with one filtered standard library and no OS functionality. Filtering is not
   containment: trusted Lua can hang its VM or exhaust memory. This supersedes the
   2026-09-22 entry's "mods keep confined processes".
 - 2026-09-22: first-party game scripts are trusted and run in-process in the UI
   and gameplay VM owners
-  ([Lua D-12](docs/lua_runtime_design.md#d-12-run-first-party-scripts-trusted-and-in-process));
+  ([Lua D-12](docs/archive/designs/lua_runtime_design.md#d-12-run-first-party-scripts-trusted-and-in-process));
   mods keep confined processes, and both share one registration layer. D-13/D-14:
   trusted slices proceed independently of Q-5.
 - 2026-09-22: quit may be bounded by an application-level watchdog that names the
