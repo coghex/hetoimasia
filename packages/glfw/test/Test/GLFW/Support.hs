@@ -21,6 +21,7 @@ module Test.GLFW.Support
   , onThread
   , onBoundThread
   , onThreadVia
+  , rescuing
   , withDeferredThread
   , withDeferredThreadOpening
   , withDeferredThreadVia
@@ -236,6 +237,13 @@ withMainThreadKeepingContext seam open action body = do
     open
     (designateProcessMainThread seam >> tryWithContext action >>= putMVar finished)
     (\runner _ → body runner finished)
+
+-- | Run the action, and whatever way it ends hand the rescue to the thread that is waiting for it (#593): the evidence a
+-- protected host's exit drain waits for must reach its supplier even when the example fails or is cancelled before the point it
+-- would have been handed over, because the drain begins before the scope around the host can stop the supplier. The rescue is
+-- idempotent (a hand-over already made wins), so the normal path is unchanged.
+rescuing ∷ IO () → IO a → IO a
+rescuing rescue action = action `finally` rescue
 
 -- | An owned thread that does its one piece of work only once it is handed what the work acts on: the scope starts the thread
 -- and gives the body the thread and the handing-over. For an injector whose target is known only inside a callback (a hook

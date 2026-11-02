@@ -23,6 +23,7 @@ import Control.Exception
   , ExceptionWithContext (ExceptionWithContext)
   , SomeException
   , displayException
+  , finally
   , fromException
   , mask_
   , throwIO
@@ -692,29 +693,36 @@ testRescueRegistersBoundWorker = do
   started ← newIORef []
   recorded ← newIORef []
   caller ← myThreadId
-  outcome ← try @AsyncException . bounded . mask_ $
-    withOwnedThread (throwTo caller UserInterrupt) $ \sender _ → do
-      awaitParked sender
-      recordingThreads recorded (unownedBoundScope started) (pure ()) holdForever (\_ _ → holdForever)
-  outcome `shouldBe` Left UserInterrupt
-  reapUnowned started
-  endedAndJoined recorded >>= (`shouldBe` True)
+  -- The example's own rescue is independent of the rescue under test and runs on every way out of the example.
+  ( do
+      outcome ← try @AsyncException . bounded . mask_ $
+        withOwnedThread (throwTo caller UserInterrupt) $ \sender _ → do
+          awaitParked sender
+          recordingThreads recorded (unownedBoundScope started) (pure ()) holdForever (\_ _ → holdForever)
+      outcome `shouldBe` Left UserInterrupt
+      reapUnowned started
+      endedAndJoined recorded >>= (`shouldBe` True)
+    )
+    `finally` reapUnowned started
 
 testRescueIsUninterruptible ∷ Expectation
 testRescueIsUninterruptible = do
   started ← newIORef []
   recorded ← newIORef []
-  recordingThreads recorded (unownedScope started) (pure ()) holdForever (\_ _ → pure ())
   caller ← myThreadId
   rescued ← newIORef False
-  _ ← try @AsyncException . bounded . mask_ $
-    withOwnedThread (throwTo caller UserInterrupt) $ \sender _ → do
-      awaitParked sender
-      reapUnowned started
-      endedAndJoined recorded >>= writeIORef rescued
-  -- The scope's release ends the sender, so the cancellation need not be delivered at all; what matters is that it was pending
-  -- while the rescue ran and did not abandon it.
-  readIORef rescued >>= (`shouldBe` True)
+  ( do
+      recordingThreads recorded (unownedScope started) (pure ()) holdForever (\_ _ → pure ())
+      _ ← try @AsyncException . bounded . mask_ $
+        withOwnedThread (throwTo caller UserInterrupt) $ \sender _ → do
+          awaitParked sender
+          reapUnowned started
+          endedAndJoined recorded >>= writeIORef rescued
+      -- The scope's release ends the sender, so the cancellation need not be delivered at all; what matters is that it was
+      -- pending while the rescue ran and did not abandon it.
+      readIORef rescued >>= (`shouldBe` True)
+    )
+    `finally` reapUnowned started
 
 -- | The start-and-wait helper whose thread parks, with the example thread cancelled while it waits: the helper says when it is
 -- parked by calling the action it is given.

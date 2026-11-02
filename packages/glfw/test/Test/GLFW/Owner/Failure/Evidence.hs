@@ -69,7 +69,9 @@ import Test.GLFW.Support
   , windowNamed
   )
 import Test.Hspec (Spec, it, shouldBe, shouldContain, shouldReturn, shouldSatisfy)
-import Test.GLFW.Support (withDeferredThread)
+import Test.GLFW.Support (Ending (..), Scope, ownedEnds, withDeferredThread, withDeferredThreadVia)
+import Data.Foldable (for_)
+import Test.Support.Owned (withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = do
@@ -81,6 +83,9 @@ spec = do
     (boundedExample testEarlyFatalWhileRetiring)
   it "retains an unexpected completion without retirement evidence, and disposes nothing on it"
     (boundedExample testCompletionWithoutEvidence)
+  for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
+    it ("finishes the exit on the supplier's evidence when the example body " <> label <> " right after the supplier was handed its host (#593)") $
+      boundedExample (ownedEnds ending completionEndedEarlyScenario False)
   it "retains terminal facts the completion publisher refused, and transports them at the next opportunity"
     (boundedExample testRefusedNoticeRetained)
   it "closes the owner's admission and begins its retirement as soon as a required failure is latched"
@@ -182,7 +187,16 @@ testEarlyFatalWhileRetiring = do
 -- | An owner that ended without retirement evidence retains its dependencies,
 -- and its completion is never permission to dispose them.
 testCompletionWithoutEvidence ∷ IO ()
-testCompletionWithoutEvidence = do
+testCompletionWithoutEvidence = completionWithoutEvidence withOwnedThreadOpening Nothing
+
+-- | The scenario of 'testCompletionWithoutEvidence' for an example that fails or is cancelled right after the supplier has been
+-- handed what it publishes with (#593): the body ends the way the ending says, and the exit's drain must still finish on the
+-- evidence the supplier publishes, which the exit waits for before the scope around the host could stop the supplier.
+completionEndedEarlyScenario ∷ Scope → IO () → IO ()
+completionEndedEarlyScenario scope atParked = completionWithoutEvidence scope (Just atParked)
+
+completionWithoutEvidence ∷ Scope → Maybe (IO ()) → IO ()
+completionWithoutEvidence scope endEarly = do
   rig ← newRig
   trace ← newSinkTrace
   let recording = sinkFailingOn (Text.pack "never") trace
@@ -197,7 +211,11 @@ testCompletionWithoutEvidence = do
   script (fakeDestroy (rigFake rig)) (\_ → throwIO (Scripted (Text.pack "destroy")))
   -- The thread supplies the independent evidence that lets the exit finish, so it is owned by the example and outlives the host
   -- body that hands it what it publishes with (#593).
-  let supplier (host, owner, service, publisher, acknowledgement) = do
+  let supplier (host, owner, service) = do
+        publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
+        acknowledgement ←
+          atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
+            >>= maybe (unexpected "the attachment kept no acknowledgement") pure
         -- The attachment is still the main thread's and is only retiring once
         -- the exit's quiescence has begun it, so the facts are published into
         -- a model that can record them rather than refuse them.
@@ -210,11 +228,21 @@ testCompletionWithoutEvidence = do
         atomically (check . null =<< hostPendingAttachments host)
         awaitDiagnostic trace
         publishOwnerDestruction owner (ownerDestroyed (Text.pack "destroyed independently"))
-  withDeferredThread supplier $ \_ handOver → do
+  withDeferredThreadVia scope (pure ()) supplier $ \_ handOver → case endEarly of
+   Just atParked →
+    ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
+      window ← theWindow host
+      service ← handedOver host owner window
+      handOver (host, owner, service)
+      atParked
+   Nothing → do
     (unverified, _) ← caughtAs @OwnerDestructionUnverified $
       ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner _control → do
         window ← theWindow host
         service ← handedOver host owner window
+        -- Handed over at once: the supplier waits for the exit's own quiescence, so it acts at the same moment as before, and an
+        -- example that fails or is cancelled before here can never leave the exit's drain waiting for evidence nobody supplies.
+        handOver (host, owner, service)
         -- The owner's run has ended and it established nothing.
         atomically (readOwnerTerminalNow owner >>= check . ownerRunEnded)
         records ← atomically (readTargetTerminalsNow owner)
@@ -232,11 +260,6 @@ testCompletionWithoutEvidence = do
         -- then the owner's own destruction. Without both, the boundary retains
         -- the window, the session and every parent for good, which is the whole
         -- point; with them, this example's exit can finish.
-        publisher ← maybe (unexpected "the host publishes no completions") pure (hostGraphicsPublisher host)
-        acknowledgement ←
-          atomically (ownerTargetAcknowledgement owner (graphicsAttachment service))
-            >>= maybe (unexpected "the attachment kept no acknowledgement") pure
-        handOver (host, owner, service, publisher, acknowledgement)
     unverifiedRetired unverified `shouldBe` False
     unverifiedTargets unverified `shouldBe` 1
     -- Said exactly once, whatever the wait then had to do.

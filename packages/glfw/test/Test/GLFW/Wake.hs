@@ -27,7 +27,7 @@ import Control.Exception
   , throwIO
   , try
   )
-import Control.Monad (when)
+import Control.Monad (void, when)
 import qualified Data.ByteString.Char8 as Char8
 import Data.Either (isLeft)
 import Data.IORef (IORef, atomicModifyIORef', modifyIORef', newIORef, readIORef, writeIORef)
@@ -43,7 +43,7 @@ import Hetoimasia.GLFW.Session
 import System.Timeout (timeout)
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldReturn, shouldSatisfy)
 import Test.GLFW.Support (onBoundThread, onThread, withDeferredThread)
-import Test.Support.Owned (withOwnedBoundThread, withOwnedThread)
+import Test.Support.Owned (withOwnedBoundThreadOpening, withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
 spec = do
@@ -199,8 +199,8 @@ testOverlappingAttribution = do
     unbound ← newEmptyMVar
     bound ← newEmptyMVar
     let results = [unbound, bound]
-    withOwnedThread (waker "unbound waker" unbound) $ \_ _ →
-      withOwnedBoundThread (waker "bound waker" bound) $ \_ _ → do
+    withOwnedThreadOpening (atomically (writeTVar opened True)) (waker "unbound waker" unbound) $ \_ _ →
+      withOwnedBoundThreadOpening (atomically (writeTVar opened True)) (waker "bound waker" bound) $ \_ _ → do
         -- Both wake calls are inside their native calls, and each has reported.
         atomically (readTVar inside >>= check . (== 2))
         reporter ← readMVar captured
@@ -280,7 +280,7 @@ testAdmittedWakeDrainsBeforeTerminate = do
   withOwner seam $ \owner → do
     wake ← sessionWake <$> readMVar (ownerSession owner)
     waker ← newEmptyMVar
-    withOwnedThread (try (wakeSession wake) >>= putMVar waker) $ \_ _ → do
+    withOwnedThreadOpening (void (tryPutMVar (heldRelease held) ())) (try (wakeSession wake) >>= putMVar waker) $ \_ _ → do
       takeMVar (heldEntered held)
       putMVar (ownerRelease owner) ()
       -- The owner has closed the gate and is waiting for the admitted call.
@@ -384,7 +384,7 @@ testCancelledInsideCall = do
   (cancelled, later, asynchronous) ← asProcessMainThread seam $ entered seam $ \session → do
     let wake = sessionWake session
     result ← newEmptyMVar
-    withOwnedThread (try (wakeSession wake) >>= putMVar result) $ \waker _ → do
+    withOwnedThreadOpening (void (tryPutMVar (heldRelease held) ())) (try (wakeSession wake) >>= putMVar result) $ \waker _ → do
       takeMVar (heldEntered held)
       killThread waker
       cancelled ← takeMVar result
@@ -432,7 +432,7 @@ testOwnerCancelledDuringDrain = do
   withOwner seam $ \owner → do
     wake ← sessionWake <$> readMVar (ownerSession owner)
     waker ← newEmptyMVar
-    withOwnedThread (try (wakeSession wake) >>= putMVar waker) $ \_ _ → do
+    withOwnedThreadOpening (void (tryPutMVar (heldRelease held) ())) (try (wakeSession wake) >>= putMVar waker) $ \_ _ → do
       takeMVar (heldEntered held)
       putMVar (ownerRelease owner) ()
       awaitBlocked (ownerThread owner) (== BlockedOnSTM)

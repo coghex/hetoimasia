@@ -286,28 +286,35 @@ spec = describe "the shared owned-thread facility (Test.Support.Owned)" $ do
       started ← newIORef []
       probe ← newProbe
       caller ← myThreadId
-      outcome ← try @AsyncException . bounded . mask_ $
-        withOwnedThread (throwTo caller UserInterrupt) $ \sender _ → do
-          bounded (awaitBlockedSending sender) >>= (`shouldBe` True)
-          unownedBoundScope started (parkedWorker probe) (\_ _ → readMVar (probeParked probe) >> holdUntilTimedOut)
-      outcome `shouldBe` Left UserInterrupt
-      reapUnowned started
-      endedAfterScope probe >>= (`shouldBe` True)
+      -- The example's own rescue is independent of the rescue under test and runs on every way out of the example.
+      ( do
+          outcome ← try @AsyncException . bounded . mask_ $
+            withOwnedThread (throwTo caller UserInterrupt) $ \sender _ → do
+              bounded (awaitBlockedSending sender) >>= (`shouldBe` True)
+              unownedBoundScope started (parkedWorker probe) (\_ _ → readMVar (probeParked probe) >> holdUntilTimedOut)
+          outcome `shouldBe` Left UserInterrupt
+          reapUnowned started
+          endedAfterScope probe >>= (`shouldBe` True)
+        )
+        `finally` (reapUnowned started >> void (tryPutMVar (probeGate probe) ()))
 
     it "completes the rescue's stop-and-join when a cancellation is pending while it runs" $ do
       started ← newIORef []
       probe ← newProbe
-      unownedScope started (parkedWorker probe) (\_ _ → readMVar (probeParked probe))
       caller ← myThreadId
       rescued ← newIORef False
-      _ ← try @AsyncException . bounded . mask_ $
-        withOwnedThread (throwTo caller UserInterrupt) $ \sender _ → do
-          bounded (awaitBlockedSending sender) >>= (`shouldBe` True)
-          reapUnowned started
-          endedAfterScope probe >>= writeIORef rescued
-      -- The scope's release ends the sender, so the cancellation need not be delivered at all; what matters is that it was pending
-      -- while the rescue ran and did not abandon it.
-      readIORef rescued >>= (`shouldBe` True)
+      ( do
+          unownedScope started (parkedWorker probe) (\_ _ → readMVar (probeParked probe))
+          _ ← try @AsyncException . bounded . mask_ $
+            withOwnedThread (throwTo caller UserInterrupt) $ \sender _ → do
+              bounded (awaitBlockedSending sender) >>= (`shouldBe` True)
+              reapUnowned started
+              endedAfterScope probe >>= writeIORef rescued
+          -- The scope's release ends the sender, so the cancellation need not be delivered at all; what matters is that it was
+          -- pending while the rescue ran and did not abandon it.
+          readIORef rescued >>= (`shouldBe` True)
+        )
+        `finally` (reapUnowned started >> void (tryPutMVar (probeGate probe) ()))
 
   describe "a thread that ended on its own" $ do
     it "is joined harmlessly, the body may begin after it finished, and the wait can be repeated" $ do

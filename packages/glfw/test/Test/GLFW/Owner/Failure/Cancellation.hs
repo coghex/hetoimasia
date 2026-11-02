@@ -38,8 +38,9 @@ import Test.GLFW.Support
   , unexpected
   )
 import Test.Hspec (Spec, it, shouldBe, shouldReturn, shouldSatisfy)
-import Test.GLFW.Support (withDeferredThread)
+import Test.GLFW.Support (Ending (..), Scope, ownedEnds, withDeferredThreadVia)
 import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
+import Data.Foldable (for_)
 
 spec ∷ Spec
 spec = do
@@ -51,6 +52,9 @@ spec = do
     (boundedExample testEscapedRetirementCancellation)
   it "retains everything until independent evidence when the cancellation escaped the destruction"
     (boundedExample testEscapedDestructionCancellation)
+  for_ [("fails", BodyFails), ("is cancelled", BodyCancelled)] $ \(label, ending) →
+    it ("finishes the exit on the interrupter's evidence when the example body " <> label <> " right after the interrupter was handed the owner (#593)") $
+      boundedExample (ownedEnds ending escapedDestructionEndedEarlyScenario False)
 
 -- | Cancellation is honoured inside each backend call in turn, and releases
 -- nothing early in any of them.
@@ -248,7 +252,16 @@ testEscapedRetirementCancellation = do
 -- its windows, its session and every parent stay retained until independent
 -- evidence arrives — and nothing is released early on the way there.
 testEscapedDestructionCancellation ∷ IO ()
-testEscapedDestructionCancellation = do
+testEscapedDestructionCancellation = escapedDestruction withOwnedThreadOpening Nothing
+
+-- | The scenario of 'testEscapedDestructionCancellation' for an example that fails or is cancelled right after the interrupter has
+-- been handed the owner (#593): the exit's drain must still finish on the evidence the interrupter publishes, which the exit
+-- waits for before the scope around the host could stop it.
+escapedDestructionEndedEarlyScenario ∷ Scope → IO () → IO ()
+escapedDestructionEndedEarlyScenario scope atParked = escapedDestruction scope (Just atParked)
+
+escapedDestruction ∷ Scope → Maybe (IO ()) → IO ()
+escapedDestruction scope endEarly = do
   rig ← newRig
   inside ← newTVarIO False
   never ← newTVarIO False
@@ -271,16 +284,24 @@ testEscapedDestructionCancellation = do
         notes ← journalled (rigJournal rig)
         atomically (writeTVar releasedEarly (Just (filter released notes)))
         publishOwnerDestruction owner (ownerDestroyed (Text.pack "destroyed independently"))
-  withDeferredThread interrupter $ \_ handOver → do
+  withDeferredThreadVia scope (pure ()) interrupter $ \_ handOver → case endEarly of
+   Just atParked →
+    ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \_ owner _ → do
+      handOver owner
+      atParked
+   Nothing → do
     (unverified, _) ← caughtAs @OwnerDestructionUnverified $
       ownedHostWith recording (rigSeam rig) (rigHostConfig rig) (rigOwnerConfig rig) $ \host owner control → do
+        -- Handed over at once: the interrupter waits for the destruction to be entered, which happens only during the exit, so it
+        -- acts at the same moment as before, and an example that fails or is cancelled before the run ends can never leave the
+        -- exit waiting for the evidence it supplies.
+        handOver owner
         window ← theWindow host
         service ← handedOver host owner window
         awaitStanding owner service `shouldReturn` TargetUsable
         _ ← releaseGraphicsTarget host owner service
         _ ← awaitTerminal owner service
         pumpUntilRetired host control
-        handOver owner
     -- Nothing was released for a destruction that established nothing: the
     -- windows and the session both outlast the whole retained wait.
     readTVarIO releasedEarly `shouldReturn` Just []

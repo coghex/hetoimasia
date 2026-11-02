@@ -95,6 +95,11 @@ spec = do
         boundedExample (ownedEnds ending injectedSubmitterScenario False)
       it ("negative control: an unowned start leaves the injector and the submitter it never reached when the example body " <> label) $
         boundedExample (unownedLeaks ending injectedSubmitterScenario False)
+      it ("has ended and joined two workers held in their posts at a closed gate when the example body " <> label) $
+        boundedExample (ownedEnds ending overlappingWorkersScenario False)
+      -- There is no unowned control for the two workers: left held in their posts they keep the session's teardown waiting for the
+      -- notifications in flight, so the scenario cannot end without something opening the gate (the missing release IS the defect;
+      -- a mutation that drops the opening makes the example above wait for ever instead).
       it ("has ended and joined a waiting admission, held in its hook with the gate closed, and its injector when the example body " <> label) $
         boundedExample (ownedEnds ending injectedWaitedScenario False)
       it ("negative control: an unowned start leaves the waiting admission and its injector when the example body " <> label) $
@@ -240,6 +245,26 @@ testCancelledBeforeCommit = do
       cancelled `shouldSatisfy` cancellation
       settleHost hostCommands
       posts seam `shouldReturn` 0
+
+-- | The scenario of 'testOverlappingFailuresDegradeOnce' up to the moment both workers are inside their posts, held at a gate
+-- that only the example opens, under the admission's uninterruptible mask; the example body then ends the way the ending says,
+-- and the scope must open the gate and stop and join both workers.
+overlappingWorkersScenario ∷ Scope → IO () → IO ()
+overlappingWorkersScenario scope atParked = do
+  inside ← newTVarIO (0 ∷ Int)
+  released ← newTVarIO False
+  seam ←
+    newSeam
+      defaultScript
+        { scriptPostEmptyEvent = \reporter → do
+            reportError reporter platformErrorCode "overlapping failure"
+            atomically (modifyTVar' inside (+ 1))
+            atomically (readTVar released >>= check)
+        }
+  withPorts seam $ \_ hostCommands _ window →
+    withForkResultsVia scope (atomically (writeTVar released True)) (replicate 2 (submitWindowCommand (windowCommandPort hostCommands) [] (observeOf window))) $ \_ → do
+      atomically (readTVar inside >>= check . (== 2))
+      atParked
 
 -- | The scenario of 'testCancelledBeforeCommit' up to the moment its submitter is parked in the hook, ended by the example body
 -- the way the ending says: the scope must then have stopped and joined the submitter.
@@ -753,7 +778,7 @@ testOverlappingFailuresDegradeOnce = do
   (submissions, path, first, second, afterwards) ← withPorts seam $ \session hostCommands _ window → do
     let port = windowCommandPort hostCommands
         command = observeOf window
-    withForkResults (replicate 2 (submitWindowCommand port [] command)) $ \outcomes → do
+    withForkResults (atomically (writeTVar released True)) (replicate 2 (submitWindowCommand port [] command)) $ \outcomes → do
       atomically (readTVar inside >>= check . (== 2))
       atomically (writeTVar released True)
       submissions ← mapM awaitResult outcomes
@@ -882,11 +907,19 @@ concurrently actions = do
 
 -- | Run each action on its own new, unbound, owned thread and hand the body the cells their outcomes are put into (#593). The
 -- body waits for them itself; however it ends, every thread has been stopped and joined before this returns.
-withForkResults ∷ [IO a] → ([MVar (Either SomeException a)] → IO r) → IO r
-withForkResults [] body = body []
-withForkResults (action : rest) body = do
+--
+-- A worker may be held in a post that runs under the admission's uninterruptible mask, where a kill cannot reach it: the first
+-- argument opens the gate it is held at, idempotently, in each worker's release and before the kill, so an example that ends
+-- while the gate is closed does not wait for ever.
+withForkResults ∷ IO () → [IO a] → ([MVar (Either SomeException a)] → IO r) → IO r
+withForkResults = withForkResultsVia withOwnedThreadOpening
+
+withForkResultsVia ∷ Scope → IO () → [IO a] → ([MVar (Either SomeException a)] → IO r) → IO r
+withForkResultsVia _ _ [] body = body []
+withForkResultsVia scope open (action : rest) body = do
   outcome ← newEmptyMVar
-  withOwnedThread (try action >>= putMVar outcome) $ \_ _ → withForkResults rest (\others → body (outcome : others))
+  scope open (try action >>= putMVar outcome) $ \_ _ →
+    withForkResultsVia scope open rest (\others → body (outcome : others))
 
 awaitResult ∷ MVar (Either SomeException a) → IO a
 awaitResult outcome = takeMVar outcome >>= either (throwIO ∷ SomeException → IO a) pure
