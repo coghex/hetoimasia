@@ -33,7 +33,8 @@ import Control.Exception
   )
 import Control.Monad (void, when)
 import Control.Monad.IO.Class (liftIO)
-import Data.IORef (atomicModifyIORef', newIORef, readIORef)
+import Data.Foldable (for_)
+import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
 import Data.Text (Text)
 import Hetoimasia.Foundation.Log (LogEntry (..), LogLevel (..))
 import Hetoimasia.Foundation.Worker
@@ -47,7 +48,19 @@ import Hetoimasia.Foundation.Worker
 import Hetoimasia.Runtime.Supervision
 import System.Timeout (timeout)
 import Test.Hspec (Expectation, Spec, describe, expectationFailure, it, shouldBe, shouldSatisfy)
-import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
+import Test.Runtime.OwnedControl
+  ( ControlProbe (..)
+  , Scope
+  , Unowned
+  , endedAfterScope
+  , endings
+  , newControlProbe
+  , recordSelf
+  , runEnding
+  , startUnowned
+  , withRescue
+  )
+import Test.Support.Owned (withOwnedThreadOpening)
 import Test.Runtime.Supervision.Support
 
 spec ∷ Spec
@@ -64,6 +77,28 @@ spec = describe "A sibling's failure while a start is in progress" $ do
       (boundedSupervision testCancelledDuringClassification)
     it "after a tolerated sibling was committed and the start went back to waiting"
       (boundedSupervision testCancelledAfterTolerated)
+  -- The owners above run a start whose drain waits for a worker held uninterruptibly; the held worker's release is part of the
+  -- owner's own start, so it is open however the example ends, including before the observer exists (#597).
+  describe "The owner of a start that holds a worker (withOwnedThreadOpening)" $
+    for_ endings $ \(label, ending) → do
+      it ("has ended and been joined, the held worker released, when the example " <> label) $ do
+        probe ← newControlProbe
+        held ← newHeld
+        trace ← newTrace
+        runEnding (ownedHeldStart held probe) (const (heldStart trace held probe)) probe ending
+        endedAfterScope probe >>= (`shouldBe` True)
+
+      it ("negative control: the previous unowned start leaves the owner held when the example " <> label) $ do
+        probe ← newControlProbe
+        held ← newHeld
+        trace ← newTrace
+        withRescue $ \started → do
+          runEnding (unownedHeldStart started held probe) (const (heldStart trace held probe)) probe ending
+          -- The failed judgement is recorded before anything independent touches the owner.
+          judgement ← endedAfterScope probe
+          judgement `shouldBe` False
+        -- The rescue released the held worker, then stopped and joined the owner.
+        endedAfterScope probe >>= (`shouldBe` True)
 
 -- Fixtures ----------------------------------------------------------------------
 
@@ -237,7 +272,8 @@ testCancelledDuringClassification = do
         void (tryPutMVar classifying ())
         readMVar classifyGate
         pure Unrecognized
-  withOwnedThread
+  withOwnedThreadOpening
+    (openGate (heldRelease held))
     ( do
         outcome ← attempt $ withCollectedLifetime ignoreWrites $ \collected →
           withSupervision (collectedLifetime collected) $ \control → do
@@ -293,7 +329,8 @@ testCancelledAfterTolerated = do
         atomicModifyIORef' videoClassified (\count → (count + 1, ()))
         pure Unrecognized
       onWrite entry = when (entryLevel entry == Warning) (void (tryPutMVar warned ()))
-  withOwnedThread
+  withOwnedThreadOpening
+    (openGate (heldRelease held))
     ( do
         outcome ← attempt $ withCollectedLifetime onWrite $ \collected →
           withSupervision (collectedLifetime collected) $ \control → do
@@ -335,6 +372,32 @@ testCancelledAfterTolerated = do
           closing ← takeMVar ended
           either (brokenIs "video") (const False) closing `shouldBe` True
           traced trace >>= (`shouldSatisfy` elem "release streaming")
+
+-- | An owner whose start is held: it starts a worker that waits uninterruptibly for the example to release it, so its drain
+-- cannot finish until then.
+heldStart ∷ Trace → Held → ControlProbe → IO ()
+heldStart trace held probe = do
+  recordSelf probe
+  void . attempt $
+    withCollectedLifetime ignoreWrites $ \collected →
+      withSupervision (collectedLifetime collected) $ \control →
+        void (startSupervised control (required Service) (heldService trace "streaming" False held))
+
+-- | The owner is held once the worker has entered its hold: the signal the endings wait for.
+ownedHeldStart ∷ Held → ControlProbe → Scope
+ownedHeldStart held probe action body =
+  withOwnedThreadOpening (openGate (heldRelease held)) action $ \owner _ → do
+    readMVar (heldEntered held)
+    putMVar (controlParked probe) ()
+    body owner
+
+-- | The previous start of the same owner: nothing releases the held worker when the example ends.
+unownedHeldStart ∷ IORef [Unowned] → Held → ControlProbe → Scope
+unownedHeldStart started held probe action body = do
+  owner ← startUnowned started (openGate (heldRelease held)) action
+  readMVar (heldEntered held)
+  putMVar (controlParked probe) ()
+  body owner
 
 -- Helpers ----------------------------------------------------------------------
 

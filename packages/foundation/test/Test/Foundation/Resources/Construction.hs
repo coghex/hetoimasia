@@ -199,10 +199,12 @@ data MaskedHold = MaskedHold
   , maskedSlot ∷ !(MVar (Maybe ThreadId))
   , maskedHold ∷ !(MVar ())
   , maskedKiller ∷ !(MVar ThreadId)
+  , maskedEntered ∷ !(MVar ())
+  -- ^ Filled by the runner once it is inside the uninterruptible release: the runner's readiness, which is not the fixture's.
   }
 
 newMaskedHold ∷ IO MaskedHold
-newMaskedHold = MaskedHold <$> newProbe <*> newEmptyMVar <*> newEmptyMVar <*> newEmptyMVar
+newMaskedHold = MaskedHold <$> newProbe <*> newEmptyMVar <*> newEmptyMVar <*> newEmptyMVar <*> newEmptyMVar
 
 -- | The cases: the killer is started and published, so it is blocked delivering to the runner; or the scope ends before the
 -- killer is started or its identifier published, so the release waits for a publication that never comes.
@@ -216,7 +218,7 @@ maskedRunner ∷ MaskedHold → Probe → IO ()
 maskedRunner held probe = do
   recordSelf probe
   uninterruptibleMask_ $ do
-    putMVar (probeParked probe) ()
+    putMVar (maskedEntered held) ()
     readMVar (maskedSlot held) >>= maybe (pure ()) (void . awaitPendingThrow)
     readMVar (maskedHold held)
 
@@ -224,28 +226,42 @@ maskedRunner held probe = do
 letGoMasked ∷ MaskedHold → IO ()
 letGoMasked held = void (tryPutMVar (maskedSlot held) Nothing) >> void (tryPutMVar (maskedHold held) ())
 
+-- | The unowned control's counterpart of the sequence in 'ownedMasked'. The fixture is ready when the runner is inside the release and, when there is a killer, the killer is started, published and
+-- blocked delivering to the runner: only then is the ending's trigger (the probe's parked signal) allowed, so a failure or a
+-- cancellation never lands before the arrangement it is meant to end exists, and the killer never reaches a runner that has
+-- not yet entered its mask.
+readyMasked ∷ MaskedHold → Bool → ThreadId → (IO () → IO ThreadId) → IO ()
+readyMasked held publishes runner startKiller = do
+  readMVar (maskedEntered held)
+  if publishes
+    then do
+      killer ← startKiller (throwTo runner ThreadKilled)
+      putMVar (maskedKiller held) killer
+      putMVar (maskedSlot held) (Just killer)
+      void (awaitPendingThrow killer)
+    else pure ()
+  putMVar (probeParked (maskedProbe held)) ()
+
 -- | The helpers under test, as the scope the endings run: the runner is owned with its release opening, and the killer, when
 -- there is one, is owned inside it, so it is ended first.
 ownedMasked ∷ MaskedHold → Bool → Scope
 ownedMasked held publishes action body =
-  withOwnedThreadOpening (letGoMasked held) action $ \runner _ →
+  withOwnedThreadOpening (letGoMasked held) action $ \runner _ → do
+    readMVar (maskedEntered held)
     if publishes
       then withOwnedThread (throwTo runner ThreadKilled) $ \killer _ → do
         putMVar (maskedKiller held) killer
         putMVar (maskedSlot held) (Just killer)
+        void (awaitPendingThrow killer)
+        putMVar (probeParked (maskedProbe held)) ()
         body runner
-      else body runner
+      else putMVar (probeParked (maskedProbe held)) () >> body runner
 
--- | The same arrangement with the previous, unowned starts.
+-- | The same arrangement with the previous, unowned starts, and the same readiness.
 unownedMasked ∷ IORef [Unowned] → MaskedHold → Bool → Scope
 unownedMasked started held publishes action body = do
   runner ← startUnowned started (letGoMasked held) action
-  if publishes
-    then do
-      killer ← startUnowned started (pure ()) (throwTo runner ThreadKilled)
-      putMVar (maskedKiller held) killer
-      putMVar (maskedSlot held) (Just killer)
-    else pure ()
+  readyMasked held publishes runner (startUnowned started (pure ()))
   body runner
 
 -- | The judgement for both threads: the runner ended and been joined, and so has the killer when there was one.

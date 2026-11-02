@@ -21,7 +21,7 @@ module Test.Runtime.Composition (spec) where
 
 import Control.Concurrent (ThreadId, killThread, myThreadId, yield)
 import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
-import Control.Concurrent.STM (STM, TVar, atomically, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, throwSTM, writeTVar)
+import Control.Concurrent.STM (STM, TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, retry, throwSTM, writeTVar)
 import Control.Exception
   ( AsyncException (ThreadKilled)
   , ExceptionWithContext (ExceptionWithContext)
@@ -130,6 +130,18 @@ import Test.Hspec
   , shouldReturn
   , shouldSatisfy
   )
+import Test.Runtime.OwnedControl
+  ( ControlProbe (..)
+  , Scope
+  , Unowned
+  , endedAfterScope
+  , endings
+  , newControlProbe
+  , recordSelf
+  , runEnding
+  , startUnowned
+  , withRescue
+  )
 import Test.Support.Owned (withOwnedThread, withOwnedThreadOpening)
 
 spec ∷ Spec
@@ -210,6 +222,51 @@ spec = describe "Application lifecycle" $ do
   describe "Drain status" $ do
     it "lets a thread outside supervision read a held worker while the managed run drains, changing nothing"
       testStatusDuringManagedDrain
+  -- The runner these examples cancel is held uninterruptibly on gates only the example opens (a hub acquisition, a drain, the
+  -- quiescence wait), so the scope's stop must open every one of them before it kills and joins (#597).
+  describe "The cancelled-run helper (cancelledRun)" $
+    for_ endings $ \(label, ending) → do
+      it ("lets a runner held on the quiescence gate go, and has ended and joined it, when the scope " <> label) $ do
+        probe ← newControlProbe
+        opened ← newTVarIO False
+        entered ← newEmptyMVar
+        runEnding (ownedHeldRun probe opened entered) (const (pure ())) probe ending
+        endedAfterScope probe >>= (`shouldBe` True)
+
+      it ("negative control: the previous unowned start leaves the runner held on the quiescence gate when the scope " <> label) $ do
+        probe ← newControlProbe
+        opened ← newTVarIO False
+        entered ← newEmptyMVar
+        withRescue $ \started → do
+          runEnding (unownedHeldRun started probe opened entered) (const (pure ())) probe ending
+          -- The failed judgement is recorded before anything independent touches the runner.
+          judgement ← endedAfterScope probe
+          judgement `shouldBe` False
+        -- The rescue opened the gate, then stopped and joined it.
+        endedAfterScope probe >>= (`shouldBe` True)
+
+-- | A run held uninterruptibly on the quiescence gate: no cancellation reaches it until the gate is opened.
+heldOnQuiescence ∷ ControlProbe → TVar Bool → MVar () → IO ()
+heldOnQuiescence probe opened entered = do
+  recordSelf probe
+  uninterruptibleMask_ (putMVar entered () >> atomically (readTVar opened >>= check))
+
+-- | 'cancelledRun' as the scope the endings run, with the quiescence gate part of its opening; the ending is the arrangement.
+ownedHeldRun ∷ ControlProbe → TVar Bool → MVar () → Scope
+ownedHeldRun probe opened entered _ body =
+  void $
+    cancelledRun
+      (atomically (writeTVar opened True))
+      (\runner _ → readMVar entered >> putMVar (controlParked probe) () >> body runner)
+      (heldOnQuiescence probe opened entered)
+
+-- | The previous start of the same run: nothing opens the gate when the scope ends.
+unownedHeldRun ∷ IORef [Unowned] → ControlProbe → TVar Bool → MVar () → Scope
+unownedHeldRun started probe opened entered _ body = do
+  runner ← startUnowned started (atomically (writeTVar opened True)) (heldOnQuiescence probe opened entered)
+  readMVar entered
+  putMVar (controlParked probe) ()
+  body runner
 
 -- Harness ----------------------------------------------------------------------
 
@@ -1152,7 +1209,7 @@ testManagedCancellation handoff = boundedSupervision $ do
             cancel
             atomically (writeTVar opened True)
           _ → cancel >> openGate gate
-  propagated ← cancelledRun (openGate gate) arrange (runManagedIn harness (managedHub hub script) quiesce startup action)
+  propagated ← cancelledRun (openGate gate >> atomically (writeTVar opened True)) arrange (runManagedIn harness (managedHub hub script) quiesce startup action)
   propagated `shouldSatisfy` isThreadKilled
   traced trace `shouldReturn` case handoff of
     AtConsumerEntry → ["acquire parent", "acquire hub", "drain hub", "release parent"]

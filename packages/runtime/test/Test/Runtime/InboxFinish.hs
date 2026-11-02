@@ -88,6 +88,7 @@ import Test.Runtime.OwnedControl
   , Scope
   , endedAfterScope
   , endings
+  , joined
   , newControlProbe
   , recordSelf
   , runEnding
@@ -179,7 +180,7 @@ spec = describe "Inbox finish" $ do
       -- The mis-scoped arrangement: the opener's scope closes before the exit it serves, which is the order the supplier must
       -- never have. Its judgement is that the opener is still there when the exit begins.
       opener ← withOwnedThread (awaitBlockedOnSTM application >> openGate gate) (\thread _ → pure thread)
-      ended ← hasEnded opener
+      ended ← joined opener
       (not ended) `shouldBe` False
 
 -- Reading outcomes -------------------------------------------------------------

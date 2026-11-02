@@ -51,7 +51,7 @@ import Control.Exception
   )
 import Control.Monad (forM_, void)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef)
-import GHC.Conc (ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
+import GHC.Conc (BlockReason (BlockedOnBlackHole), ThreadStatus (ThreadBlocked, ThreadDied, ThreadFinished), threadStatus)
 import Test.Hspec (shouldBe)
 import Test.Support.Bounded (bounded)
 import Test.Support.Cancel (withCancellationAfter)
@@ -130,6 +130,9 @@ joined thread = go (100000 ∷ Int)
       threadStatus thread >>= \case
         ThreadFinished → pure True
         ThreadDied → pure True
+        -- A thread that has announced its end can still be blocked, for an instant, on a thunk another thread is evaluating while
+        -- it leaves; that is not a wait on anything the example controls, so the poll yields through it like any running state.
+        ThreadBlocked BlockedOnBlackHole → yield >> go (remaining - 1)
         ThreadBlocked _ → pure False
         _ → yield >> go (remaining - 1)
 
