@@ -6,6 +6,8 @@ not authorize implementation or tracker creation.
 
 Design state: `exploring`
 
+Paused by owner 2026-11-02 until the current reliability work completes; Q-1 and Q-2 remain open.
+
 Status legend: `[ ]` unprocessed · `[#N]` linked to issue N · `[no-issue]`
 reviewed and deliberately not tracked separately · `[deferred]` blocked on a
 concrete precondition
