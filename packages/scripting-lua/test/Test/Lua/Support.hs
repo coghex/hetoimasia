@@ -186,10 +186,14 @@ data Settled a = Settled
 -- | Run an operation as a VM's owner on a thread of its own, and make every way
 -- it can end a result that is stored once.
 --
--- The operation runs with the masking state of the caller. That is the
--- exposure it has anywhere else: the VM masks its own operations, and a
--- cancellation that is aimed at the thread is delivered when the VM's
--- protected region has been left, which this runner does not change.
+-- The runner is owned (#598): it lives for the length of the continuation, and however that ends (a return, an exception, a
+-- cancellation) it has ended and been joined before this returns. The first argument lets go whatever only the example opens
+-- (the native hold the operation may be parked in, which the example later hands to 'cancelling' as its release): it runs in
+-- the stop, before the kill, and must not block.
+--
+-- The operation runs unmasked, as an example's thread does. That is the exposure it has anywhere else: the VM masks its own
+-- operations, and a cancellation that is aimed at the thread is delivered when the VM's protected region has been left,
+-- which this runner does not change.
 --
 -- What it does change is the handoff after the operation, which a bare
 -- @forkIO@ leaves open. A cancellation delivered at the moment the operation's
