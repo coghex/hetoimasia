@@ -445,7 +445,9 @@ spawn action = do
         case failed of
           Just (Left failure) | not seen, fromException failure /= Just ThreadKilled → throwIO (failure ∷ SomeException)
           _ → pure ()
-  _ ← startChild (try action >>= putMVar result) unseen
+  -- The outcome is recorded masked, as it always was: only the action itself is open to a cancellation, so one that is
+  -- pending when the action ends cannot land between its failure and the record of it.
+  _ ← startChild (mask $ \restore → try @SomeException (restore action) >>= putMVar result) unseen
   pure (writeIORef collected True >> bounded (readMVar result >>= either (\failure → throwIO (failure ∷ SomeException)) pure))
 
 -- | Fork a thread of an example's own, registered so that however the example ends, the thread does not outlive it.
@@ -472,15 +474,20 @@ reapIn forks = do
   consult
   where
     end child = killThread (registeredThread child) >> bounded (registeredEnded child)
-    -- Oldest first, as the failures have always been reported. A child that has not ended yet (one forked meanwhile by
-    -- another thread) is ended first.
+    -- Oldest first, as the failures have always been reported. A child stays registered until it has ended: one forked
+    -- meanwhile by another thread, or by a finalizer, is ended here too, and a cancellation that arrives while it is
+    -- awaited leaves it registered, so its failure is still looked at when the scope ends. It leaves the registry and its
+    -- failure is looked at as one step that nothing can interrupt, so a failure is never dropped between the two.
     consult = do
-      oldest ← atomicModifyIORef' (forksChildren forks) $ \held → case reverse held of
-        [] → (held, Nothing)
-        child : rest → (reverse rest, Just child)
-      case oldest of
-        Nothing → pure ()
-        Just child → end child >> registeredUnseen child >> consult
+      held ← readIORef (forksChildren forks)
+      case reverse held of
+        [] → pure ()
+        child : _ → do
+          end child
+          mask_ $ do
+            atomicModifyIORef' (forksChildren forks) (\now → (filter ((/= registeredThread child) . registeredThread) now, ()))
+            registeredUnseen child
+          consult
 
 -- | Run a body, and open these gates however it ends, so a segment an example held never keeps
 -- the owner, and with it the session's retirement, waiting.
@@ -608,8 +615,9 @@ alongside side main = mask $ \restore → do
   me ← myThreadId
   open ← newMVar True
   sideResult ← newEmptyMVar
-  let sideAction = do
-        outcome ← try @SomeException side
+  let sideAction = mask $ \unmaskSide → do
+        -- Only the side itself is open to a cancellation; what is done with its outcome is not (as before the side was owned).
+        outcome ← try @SomeException (unmaskSide side)
         case outcome of
           Left failure → withMVar open (\delivering → when delivering (throwTo me (SideFailed failure))) `finally` putMVar sideResult (Left failure)
           Right () → putMVar sideResult (Right ())
@@ -664,8 +672,10 @@ cancelWhen trigger action = mask $ \restore → do
   me ← myThreadId
   armed ← newMVar True
   triggerFailure ← newEmptyMVar
-  let cancellerAction = do
-        reached ← try @SomeException trigger
+  let cancellerAction = mask $ \unmaskTrigger → do
+        -- Only the trigger is open to a cancellation; its failure is recorded before any cancellation can land (as before the
+        -- thread was owned), so a kill pending while the trigger fails cannot turn the failure into a success.
+        reached ← try @SomeException (unmaskTrigger trigger)
         case reached of
           -- This thread's own cancellation, when the call is over, is not the trigger's failure.
           Left failure | Just ThreadKilled ← fromException failure → pure ()

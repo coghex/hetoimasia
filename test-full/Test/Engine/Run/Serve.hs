@@ -13,7 +13,7 @@
 module Test.Engine.Run.Serve (spec) where
 
 import Control.Concurrent (ThreadId, throwTo, yield)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, readMVar, takeMVar, tryPutMVar, tryReadMVar)
 import Control.Concurrent.STM (TVar, atomically, check, modifyTVar', newTVarIO, readTVar, readTVarIO, stateTVar, writeTVar)
 import Control.Exception
   ( AsyncException (UserInterrupt)
@@ -26,11 +26,13 @@ import Control.Exception
   , mask_
   , throwIO
   , tryWithContext
+  , uninterruptibleMask_
   )
 import Control.Monad (unless, void, when)
 import Data.Foldable (for_)
 import Data.IORef (IORef, atomicModifyIORef', newIORef, readIORef, writeIORef)
 import Data.List (isInfixOf)
+import Data.Maybe (isJust)
 import GHC.Conc (BlockReason (BlockedOnException, BlockedOnMVar, BlockedOnSTM))
 import Hetoimasia.Foundation.Log (callbackSinkWith, defaultLogFilter, logInfo, unsafeComponent)
 import Hetoimasia.Run.Settle (answering, bestEffort, pathFailed, withRecordingLifetime)
@@ -93,6 +95,15 @@ failureText (ExceptionWithContext _ failure) = show failure
 run ∷ Fake → Owner → IO () → IO a → IO a
 run _ owner stopSession session =
   withLoggingLifetime silentLogger $ \lifetime → serveSpawned lifetime owner (\_ → pure ()) stopSession quiet session
+
+-- | Join the production session a caller started, if it started one, without being interruptible. The session is a thread of
+-- the production scope, not the example's: when a caller is ended inside the queued callback the loop's failure handling,
+-- which would stop and join it, is never entered, so the caller's own end is made to include the session's. The callback says
+-- (@reached@) that the session exists, which it does from the moment the callback runs, because the callback is the
+-- recorder of the masked step that starts it; the session says (@ended@) that it has ended. The caller's opening has stopped
+-- the session before this runs, so the wait ends.
+joinSession ∷ MVar () → MVar () → IO ()
+joinSession reached ended = uninterruptibleMask_ (tryReadMVar reached >>= \started → when (isJust started) (readMVar ended))
 
 -- | A caller that runs the action, and a sender that interrupts it with a cancellation once it is armed, both in scopes of the
 -- given kind (#600). The sender supplies what the caller's wait needs (the blocked sending it waits for), so its scope
@@ -170,22 +181,28 @@ spec = describe "Serve" $ do
     armed ← newEmptyMVar
     result ← newEmptyMVar
     thrower ← newEmptyMVar
+    reached ← newEmptyMVar
+    sessionEnded ← newEmptyMVar
     let stop = atomically (writeTVar stopped True)
         -- A session that ends only when it is told to stop.
-        session = atomically (readTVar stopped >>= check)
+        session = atomically (readTVar stopped >>= check) `finally` void (tryPutMVar sessionEnded ())
         -- Run masked, after the session exists and before the loop is entered: the cancellation is queued against
         -- this thread (its sender blocked until it can be received), so it can only land when asynchronous
         -- exceptions are first enabled.
         queued _ = do
+          void (tryPutMVar reached ())
           -- The sender exists before anything is queued: it throws only once told to, so nothing blocks here with a
           -- cancellation outstanding.
           sender ← takeMVar thrower
           putMVar armed ()
           blockedFor BlockedOnException sender
-        caller = do
-          outcome ← tryWithContext @SomeException $ withLoggingLifetime silentLogger $ \lifetime →
-            serveSpawned lifetime (ownerWith fake Nothing quiet) queued stop quiet session
-          putMVar result outcome
+        caller =
+          ( do
+              outcome ← tryWithContext @SomeException $ withLoggingLifetime silentLogger $ \lifetime →
+                serveSpawned lifetime (ownerWith fake Nothing quiet) queued stop quiet session
+              putMVar result outcome
+          )
+            `finally` joinSession reached sessionEnded
     withInterruptedCaller ownedScope stop armed caller $ \_ sender → do
       putMVar thrower sender
       bounded (takeMVar result) >>= \case
@@ -193,6 +210,8 @@ spec = describe "Serve" $ do
         Right _ → expectationFailure "the cancellation was lost"
       -- The session was told to stop, and has ended: nothing outlives the call.
       readTVarIO stopped >>= (`shouldBe` True)
+    -- And it had already ended when the scope returned: the caller's end included the session's.
+    tryReadMVar sessionEnded >>= (`shouldBe` Just ())
 
   describe "a caller parked in the queued callback before it is armed, with its sender, is owned (#600)" $
     for_ endings $ \(label, ending) → do
@@ -211,12 +230,14 @@ spec = describe "Serve" $ do
     thrower ← newEmptyMVar
     armed ← newEmptyMVar
     result ← newEmptyMVar
+    reached ← newEmptyMVar
+    sessionEnded ← newEmptyMVar
     let stop = atomicModifyIORef' stops (\n → (n + 1, ()))
         owner = ownerWith fake (Just "the owner loop failed") (ioError (userError "the drain failed too"))
         -- Unsettled when the loop is given up on, and ended only by the application's teardown.
-        session = atomically (readTVar (fakeExited fake) >>= check) >> ioError (userError "session settled against the exit")
+        session = (atomically (readTVar (fakeExited fake) >>= check) >> ioError (userError "session settled against the exit")) `finally` void (tryPutMVar sessionEnded ())
         application =
-          withLoggingLifetime silentLogger (\lifetime → serveSpawned lifetime owner (\spawned → writeIORef slot (Just spawned)) stop quiet session)
+          withLoggingLifetime silentLogger (\lifetime → serveSpawned lifetime owner (\spawned → writeIORef slot (Just spawned) >> void (tryPutMVar reached ())) stop quiet session)
             `catch` \failure → mask_ $ do
               -- Caught: the application's own teardown. A cancellation is queued against this thread while it is
               -- masked, so it can only land when the failure's continuation first runs unmasked, if it ever does.
@@ -225,10 +246,14 @@ spec = describe "Serve" $ do
               blockedFor BlockedOnException sender
               atomically (writeTVar (fakeExited fake) True)
               throwIO (failure ∷ SomeException)
-        caller = do
-          outcome ← tryWithContext @SomeException (runOwned slot stop application)
-          putMVar result outcome
-    -- The session is ended by the application's exit, which a caller ended early never reaches: the scope makes it.
+        caller =
+          ( do
+              outcome ← tryWithContext @SomeException (runOwned slot stop application)
+              putMVar result outcome
+          )
+            `finally` joinSession reached sessionEnded
+    -- The session is ended by the application's exit, which a caller ended early never reaches: the scope makes it, and the
+    -- caller's end includes the session's.
     withInterruptedCaller ownedScope (atomically (writeTVar (fakeExited fake) True)) armed caller $ \_ sender → do
       putMVar thrower sender
       bounded (takeMVar result) >>= \case
@@ -239,6 +264,7 @@ spec = describe "Serve" $ do
           kept `shouldSatisfy` any ("session settled against the exit" `isInfixOf`)
         Right _ → expectationFailure "the cancellation was lost"
       readIORef stops >>= (`shouldSatisfy` (>= 1))
+    tryReadMVar sessionEnded >>= (`shouldBe` Just ())
 
   it "records a failed diagnostic write on the lifetime, writes nothing more through that path and flushes nothing, however long the drain keeps failing" $ do
     fake ← newFake
@@ -435,10 +461,13 @@ callerBeforeArmed ending cleanups scope = do
         sender ← takeMVar thrower
         putMVar armed ()
         blockedFor BlockedOnException sender
-      caller = do
-        outcome ← tryWithContext @SomeException $ withLoggingLifetime silentLogger $ \lifetime →
-          serveSpawned lifetime (ownerWith fake Nothing quiet) queued stop quiet session
-        putMVar result outcome
+      caller =
+        ( do
+            outcome ← tryWithContext @SomeException $ withLoggingLifetime silentLogger $ \lifetime →
+              serveSpawned lifetime (ownerWith fake Nothing quiet) queued stop quiet session
+            putMVar result outcome
+        )
+          `finally` joinSession reached sessionEnded
   -- A control that left the caller parked also leaves the session running; its end is awaited last, once it is stopped.
   cleanupLater cleanups (bounded (readMVar sessionEnded))
   runEnding ending $ \end →
@@ -447,5 +476,7 @@ callerBeforeArmed ending cleanups scope = do
       end (readMVar reached >> blockedFor BlockedOnMVar me)
   threads ← readIORef seen
   ended ← and <$> mapM hasEnded threads
-  -- The session is a thread of the production scope, not of this example's, so its end is the production scope's to announce.
-  if ended then bounded (readMVar sessionEnded) >> pure True else pure False
+  -- The session is a thread of the production scope, not of this example's. The caller's end included its end, so it has
+  -- already ended when the scope has returned: nothing is waited for here.
+  sessionDone ← isJust <$> tryReadMVar sessionEnded
+  pure (ended && sessionDone)

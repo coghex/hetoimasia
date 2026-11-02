@@ -8,7 +8,7 @@ module Test.Domains.Accounting (spec) where
 import Control.Concurrent (ThreadId, killThread, myThreadId, throwTo, yield)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, readMVar, tryReadMVar)
 import Control.Concurrent.STM (atomically, readTVar, readTVarIO, retry)
-import Control.Exception (AsyncException (ThreadKilled, UserInterrupt), SomeException, finally, fromException, throwIO, try)
+import Control.Exception (AsyncException (ThreadKilled, UserInterrupt), SomeException, finally, fromException, mask_, throwIO, try)
 import Control.Monad (forM, forM_, replicateM_, unless, void, when)
 import Data.Foldable (for_)
 import Data.ByteString (ByteString)
@@ -68,6 +68,7 @@ import Test.Domains.Support
 import Test.Domains.Unowned (Ending, Scope, endings, holdUntilCancelled, hasEnded, newCleanups, ownedScope, runCleanups, runEnding, unownedScope)
 import Test.Hspec
 import Test.Support.Bounded (bounded)
+import Test.Support.Cancel (awaitBlockedSending)
 import Test.Support.Owned (withOwnedThread)
 
 evidenceOf ∷ GameSnapshot → Maybe FailureEvidence
@@ -163,6 +164,39 @@ reapCancelledKeepsFailure = do
       killThread reaper
       reaperEnded
     releaseGate fx "finalizer"
+
+-- | A registered thread whose finalizer forks a second one (as a hosted worker's cleanup can) and waits until it is parked; the
+-- reaper (not registered, owned by the example) ends the first, then the second, whose finalizer is held and then fails, and is
+-- cancelled while it waits for that second. The second was forked after the reap began, so it was not in the first sweep:
+-- it must stay registered until it has ended and its failure has been looked at, and the scope raises that failure.
+reapCancelledDuringConsult ∷ IO ()
+reapCancelledDuringConsult = do
+  fx ← newFx
+  let late = holdAt fx "late body" `finally` (holdAt fx "late finalizer" >> throwIO (userError "a late failure"))
+  withReleased fx ["first body", "late body", "late finalizer"] . withForks $ do
+    _ ← forkRegistered (holdAt fx "first body" `finally` (void (spawn late) >> awaitEntered fx "late body"))
+    awaitEntered fx "first body"
+    withOwnedThread reapForked $ \reaper reaperEnded → do
+      -- The reaper has ended the first thread and is waiting for the late one, which its kill has sent to its held finalizer.
+      awaitEntered fx "late finalizer"
+      killThread reaper
+      reaperEnded
+    releaseGate fx "late finalizer"
+
+-- | A trigger that holds itself masked, and then, once the example is over and its thread is blocked sending the kill that ends the
+-- trigger's thread, fails. The kill is pending against the trigger's thread as the trigger fails, and must not turn the failure
+-- into a success: the failure is recorded before any cancellation can land. The action waits until the trigger is masked, so
+-- the kill cannot arrive before the trigger is.
+triggerFailsWithKillPending ∷ IO ()
+triggerFailsWithKillPending = do
+  callingThread ← myThreadId
+  masked ← newEmptyMVar
+  let trigger = mask_ $ do
+        putMVar masked ()
+        -- Masked, so the kill waits; the example's thread blocks in the send.
+        _ ← awaitBlockedSending callingThread
+        throwIO (userError "the trigger failed")
+  void (cancelWhen trigger (bounded (readMVar masked)))
 
 -- | A worker started in this kind of scope and parked at a gate, with the scope ended the way the ending says: the judgement
 -- the facility makes true, and the controls' unowned start does not.
@@ -460,6 +494,12 @@ spec = describe "the owner's accounting, and what the sample's own bookkeeping s
       childCancelsItsCreator >>= (`shouldBe` True)
     it "a cancellation that arrives while the threads are being reaped leaves the ones not yet reached owned by the scope" $
       reapCancelledMidway >>= (`shouldBe` True)
+    it "the failure of a thread forked during the reap is still raised by the scope when the reap was cancelled while it waited for that thread" $ do
+      raised ← try @SomeException reapCancelledDuringConsult
+      raised `shouldSatisfy` \case Left failure → show failure == show (userError "a late failure"); Right _ → False
+    it "the failure of a trigger is raised, not lost, when a cancellation of its thread is pending as the trigger fails" $ do
+      raised ← try @SomeException triggerFailsWithKillPending
+      raised `shouldSatisfy` \case Left failure → show failure == show (userError "the trigger failed"); Right _ → False
     it "the failure of a thread an example spawned and never collected is still raised by the scope when an earlier reap was cancelled" $ do
       raised ← try @SomeException reapCancelledKeepsFailure
       raised `shouldSatisfy` \case Left failure → show failure == show (userError "an uncollected failure"); Right _ → False
