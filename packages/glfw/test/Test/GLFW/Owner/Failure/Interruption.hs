@@ -26,7 +26,7 @@ import Control.Exception
   , throwIO
   , throwTo
   )
-import Control.Monad (forM_, void, when)
+import Control.Monad (forM_, unless, void, when)
 import Data.IORef (newIORef)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (isJust)
@@ -209,7 +209,9 @@ joinAwaitsTerminalReport scenario cut = do
             -- wait and enters the join; the owner is still inside the call.
             publishOwnerDestruction owner (ownerDestroyed (Text.pack "published early"))
             atomically (readOwnerTerminalNow owner >>= check . isJust . ownerDestroyedEvidence)
-            throwTo main (userError "delivered during the join")
+            -- In a scenario the example's own ending is the exit's primary failure, so the delivery (the subject of the full
+            -- example) is left out and cannot win a race with it.
+            unless scenario (throwTo main (userError "delivered during the join"))
             -- Nothing of the host's may be released while the owner is unjoined.
             notes ← journalled (rigJournal rig)
             atomically (writeTVar released (Just (filter ended notes)))
